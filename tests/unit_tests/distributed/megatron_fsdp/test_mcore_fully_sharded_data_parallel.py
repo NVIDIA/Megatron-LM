@@ -17,7 +17,6 @@ from megatron.core.optimizer.distrib_optimizer import DistributedOptimizer
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.transformer import TransformerConfig
 from megatron.core.utils import is_torch_min_version
-from tests.unit_tests.a2a_overlap.utils import deterministic_mode
 from tests.unit_tests.distributed.megatron_fsdp.utils import (
     make_gpt_mock_data_iterator,
     make_moe_args_model_and_optimizer,
@@ -536,7 +535,6 @@ class TestMegatronFSDPE2E:
                 - expert_model_parallel_size (int): Expert model parallel size for MoE. Default: 1.
                 - expert_tensor_parallel_size (int): Expert tensor parallel size for MoE. Default: 1.
                 - num_distributed_optimizer_instances (int): Number of distributed optimizer instances. Default: 1.
-                - deterministic_mode (bool): If True, enter deterministic_mode context to force deterministic ops.
         Returns:
             list: A list of length train_iters containing the per-step language-model loss values
             (the value appended from output[-1] each iteration). Loss objects are returned as produced
@@ -544,7 +542,6 @@ class TestMegatronFSDPE2E:
         Side effects:
             - Calls Utils.initialize_model_parallel(...) and Utils.destroy_model_parallel().
             - Sets global RNG state via set_manual_seed(seed).
-            - Optionally enters/exits deterministic_mode() context.
             - Constructs models/optimizers via make_moe_args_model_and_optimizer and a data iterator
               via make_gpt_mock_data_iterator.
             - Runs optimizer.zero_grad(), pretrain_forward_backward(...), and optim.step() repeatedly.
@@ -576,11 +573,6 @@ class TestMegatronFSDPE2E:
             num_distributed_optimizer_instances=OUTER_DP,
         )
         DP_GROUP = mpu.get_data_parallel_group()
-
-        # Deterministic mode context manager
-        if kwargs.get("deterministic_mode"):
-            deterministic_mode_ctx_mgr = deterministic_mode()
-            deterministic_mode_ctx_mgr.__enter__()
 
         # Set manual seed for reproducibility
         set_manual_seed(seed)
@@ -629,9 +621,6 @@ class TestMegatronFSDPE2E:
 
         Utils.destroy_model_parallel()
 
-        if kwargs.get("deterministic_mode"):
-            deterministic_mode_ctx_mgr.__exit__(None, None, None)
-
         return outputs
 
     @pytest.mark.skipif(
@@ -645,10 +634,6 @@ class TestMegatronFSDPE2E:
             pytest.param({"OUTER_DP": 2, "EP": 2}, id="OUTER_DP2_EP2"),
         ],
     )
-    @pytest.mark.parametrize(
-        "fsdp_sharding_strategy", ["optim_grads_params", "optim_grads", "optim"]
-    )
-    @pytest.mark.parametrize("use_double_buffer", [False, True])
     @pytest.mark.parametrize(
         ("fsdp_sharding_strategy", "use_double_buffer"),
         [
@@ -664,12 +649,10 @@ class TestMegatronFSDPE2E:
         nd_topology_str = "_".join([f"{k}{v}" for k, v in nd_topology.items()])
         if nd_topology_str not in ref_cache:
             ref_cache[nd_topology_str] = TestMegatronFSDPE2E._training_loop(
-                deterministic_mode=True, attention_backend="fused", use_distributed_optimizer=True
+                use_distributed_optimizer=True
             )
 
         outputs = TestMegatronFSDPE2E._training_loop(
-            deterministic_mode=True,
-            attention_backend="fused",
             use_megatron_fsdp=True,
             data_parallel_sharding_strategy=fsdp_sharding_strategy,
             init_model_with_meta_device=True,
