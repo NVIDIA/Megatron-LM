@@ -645,8 +645,13 @@ class FixedPoolAllocator(TemporaryBucketAllocator):
     deallocation of temporary buffers during FSDP operations.
     """
 
-    def __init__(self, name: str, fsdp_param_groups: List["ParameterGroup"], size: int = 2, 
-                 fallback_to_persistent_buffer: bool = False):
+    def __init__(
+        self,
+        name: str,
+        fsdp_param_groups: List["ParameterGroup"],
+        size: int = 2,
+        fallback_to_persistent_buffer: bool = False,
+    ):
         self.name = name
         self.fsdp_param_groups = fsdp_param_groups
         self.size = size  # Number of buffers in the pool (default is 2 for double buffering)
@@ -681,17 +686,24 @@ class FixedPoolAllocator(TemporaryBucketAllocator):
 
         if torch.distributed.get_rank() == 0:
             for bucket_id, param_group in enumerate(fsdp_param_groups):
-                if (param_group.fsdp_unit_id == -1 or param_group.fsdp_unit_id is None or 
-                    param_group.fsdp_unit_id not in self.fsdp_double_buffer_units):
-                    logging.info(f"FSDP unit (id={param_group.fsdp_unit_id}) does not fit in FixedPoolAllcator")
+                if (
+                    param_group.fsdp_unit_id == -1
+                    or param_group.fsdp_unit_id is None
+                    or param_group.fsdp_unit_id not in self.fsdp_double_buffer_units
+                ):
+                    logging.info(
+                        f"FSDP unit (id={param_group.fsdp_unit_id}) does not fit in FixedPoolAllcator"
+                    )
                     if fallback_to_persistent_buffer is False:
-                        logging.info("It will fall back to dynamic memory allocator, NCCL user buffer is not supported")
+                        logging.info(
+                            "It will fall back to dynamic memory allocator, NCCL user buffer is not supported"
+                        )
                     else:
                         logging.info(
                             "It will be allocated a persistent buffer. If the memory budget is tight, "
                             "set trainer.strategy.ddp.fsdp_db_use_persist_buf_on_alloc_fail to False."
                         )
-        
+
         # Initialize buffer group status.
         # Each buffer group represents a set of buffers associated with an FSDP unit's bucket group.
         self.idle_buffer = []  # List of available (buf_group_id, offset) tuples.
@@ -767,7 +779,7 @@ class FixedPoolAllocator(TemporaryBucketAllocator):
             return self.backup_allocator.allocate(
                 bucket_id=bucket_id, size=size, dtype=dtype, device=device
             )
-        
+
         # Use buffer_name to get memory from global memory.
         if mem_alloc_context is not None and mem_alloc_context != nullcontext:
             # Check if a new buffer allocation is required
@@ -1854,12 +1866,16 @@ class ParamAndGradBuffer:
         if self.ddp_config.fsdp_double_buffer and len(self.bucketing_policy.fsdp_unit_modules) > 0:
             UB_BUFFER_NUM = 2
             self.weight_alloc = FixedPoolAllocator(
-                name="fsdp_params", fsdp_param_groups=self.parameter_groups, size=UB_BUFFER_NUM, 
-                fallback_to_persistent_buffer = self.ddp_config.fsdp_db_use_persist_buf_on_alloc_fail
+                name="fsdp_params",
+                fsdp_param_groups=self.parameter_groups,
+                size=UB_BUFFER_NUM,
+                fallback_to_persistent_buffer=self.ddp_config.fsdp_db_use_persist_buf_on_alloc_fail,
             )
             self.main_grad_alloc = FixedPoolAllocator(
-                name="fsdp_grads", fsdp_param_groups=self.parameter_groups, size=UB_BUFFER_NUM,
-                fallback_to_persistent_buffer = self.ddp_config.fsdp_db_use_persist_buf_on_alloc_fail
+                name="fsdp_grads",
+                fsdp_param_groups=self.parameter_groups,
+                size=UB_BUFFER_NUM,
+                fallback_to_persistent_buffer=self.ddp_config.fsdp_db_use_persist_buf_on_alloc_fail,
             )
             self.double_buf_units = self.weight_alloc.fsdp_double_buffer_units
         else:

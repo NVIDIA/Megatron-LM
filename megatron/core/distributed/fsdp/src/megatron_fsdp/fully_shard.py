@@ -581,7 +581,7 @@ def fully_shard(
         keep_fp8_transpose_cache=keep_fp8_transpose_cache,
         nccl_ub=nccl_ub,
         fsdp_double_buffer=fsdp_double_buffer,
-        fsdp_db_use_persist_buf_on_alloc_fail = fsdp_db_use_persist_buf_on_alloc_fail,
+        fsdp_db_use_persist_buf_on_alloc_fail=fsdp_db_use_persist_buf_on_alloc_fail,
         disable_symmetric_registration=disable_symmetric_registration,
     )
 
