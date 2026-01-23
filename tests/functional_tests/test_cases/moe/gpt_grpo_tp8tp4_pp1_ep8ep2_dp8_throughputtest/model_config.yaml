@@ -3,6 +3,7 @@ ENV_VARS:
   NVTE_ALLOW_NONDETERMINISTIC_ALGO: 0
   NCCL_ALGO: Ring
   CUBLAS_WORKSPACE_CONFIG: :4096:8
+  N_REPEAT: 1
 TEST_TYPE: frozen-start
 MODE: rl
 MODEL_ARGS:
@@ -16,7 +17,7 @@ MODEL_ARGS:
   --timing-log-level: 1
   --timing-log-option: minmax
   --tensorboard-log-interval: 1
-  
+
   # Model loading
   --load: ${CHECKPOINT_LOAD_PATH}/model/deepseek_16b_pyt/dcp/mcore-v1_bf16/checkpoints
   --tokenizer-model: ${CHECKPOINT_LOAD_PATH}/model/deepseek_16b_pyt/dcp/mcore-v1_bf16/multiMixV8.gpt4o_nc_sd.500000.128k.vocab.json
@@ -30,7 +31,7 @@ MODEL_ARGS:
   --ckpt-fully-parallel-load: true
   --ckpt-assume-constant-structure: true
   --dist-ckpt-strictness: log_unexpected
-  
+
   # Parallelism - Training: TP=1, EP=4 (4 GPUs model, DP=2 on 8 GPUs)
   --sequence-parallel: true
   --tensor-model-parallel-size: 8
@@ -41,7 +42,7 @@ MODEL_ARGS:
   --rl-inference-tensor-model-parallel-size: 4
   --rl-inference-expert-model-parallel-size: 2
   --rl-inference-expert-tensor-model-parallel-size: 1
-  
+
   # MoE configuration
   --use-mcore-models: true
   --moe-token-dispatcher-type: alltoall
@@ -52,7 +53,7 @@ MODEL_ARGS:
   --moe-router-load-balancing-type: seq_aux_loss
   --moe-aux-loss-coeff: 1e-3
   --moe-router-score-function: sigmoid
-  
+
   # Model architecture
   --untie-embeddings-and-output-weights: true
   --disable-bias-linear: true
@@ -73,7 +74,7 @@ MODEL_ARGS:
   --hidden-dropout: 0.0
   --seq-length: 256
   --max-position-embeddings: 256
-  
+
   # Training settings
   --distributed-backend: nccl
   --transformer-impl: transformer_engine
@@ -83,7 +84,7 @@ MODEL_ARGS:
   --num-workers: 8
   --deterministic-mode: true
   --seed: 42
-  
+
   # RL / GRPO settings
   --mock-data: true
   --max-tokens-to-oom: 3600000
@@ -112,12 +113,12 @@ MODEL_ARGS:
   --rl-offload-inference-model-weights-when-idle: true
   --inference-dynamic-batching-buffer-size-gb: 20
   --inference-dynamic-batching-num-cuda-graphs: 4
-  
+
   # Optimizer
   --lr: 0.000001
   --lr-warmup-samples: 0
   --clip-grad: 1.0
-  
+
   # Run control
   --train-samples: 48828125
   --exit-interval: 5
