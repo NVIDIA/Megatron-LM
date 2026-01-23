@@ -1180,15 +1180,16 @@ class Attention(MegatronModule, ABC):
                     inference_context.is_decode_only(),
                 )
                 core_attn_out = rearrange(core_attn_out, 's b h d -> s b (h d)')
-            if self.offload_core_attention and self.training:
-                core_attn_out = off_interface.group_commit(
-                    core_attn_out, name="core_attn", forced_released_tensors=[query, key, value]
-                )
 
                 # Clear the outputs for padding tokens when using quantization scales
                 # to avoid corrupting amax calculations
                 if is_using_quantization_scales(self.config):
                     core_attn_out[inference_context.padding_slice] = 0.0
+
+            if self.offload_core_attention and self.training:
+                core_attn_out = off_interface.group_commit(
+                    core_attn_out, name="core_attn", forced_released_tensors=[query, key, value]
+                )
 
             if self.offload_core_attention and self.training:
                 core_attn_out = off_interface.group_commit(

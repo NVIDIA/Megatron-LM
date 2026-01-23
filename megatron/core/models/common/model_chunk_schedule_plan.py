@@ -14,6 +14,7 @@ from megatron.core.pipeline_parallel.utils import (
     get_comm_stream,
     get_comp_stream,
 )
+from megatron.core.transformer.enums import CudaGraphScope
 
 
 class ModelChunkState:
