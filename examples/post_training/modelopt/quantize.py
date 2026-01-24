@@ -52,6 +52,8 @@ from model_provider import model_provider
 
 warnings.filterwarnings("ignore")
 
+QUANT_CFG_CHOICES = {}
+
 # Auto-load all quant configs by full name
 for k in mtq.config.choices:
     QUANT_CFG_CHOICES[k] = getattr(mtq, k)
