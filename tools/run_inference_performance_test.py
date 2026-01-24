@@ -10,8 +10,7 @@ import torch
 
 from gpt_builders import gpt_builder
 from mamba_builders import mamba_builder
-from megatron.inference.utils import get_dynamic_inference_engine
-from megatron.core.inference.contexts import DynamicInferenceContext, StaticInferenceContext
+from megatron.core.inference.contexts import StaticInferenceContext
 from megatron.core.inference.engines import DynamicInferenceEngine, StaticInferenceEngine
 from megatron.core.inference.engines.abstract_engine import AbstractEngine
 from megatron.core.inference.inference_request import InferenceRequest
@@ -23,16 +22,15 @@ from megatron.core.inference.text_generation_controllers.text_generation_control
     TextGenerationController,
 )
 from megatron.core.transformer.module import MegatronModule
-from megatron.core.utils import get_mamba_inference_state_config_from_model
+from megatron.inference.utils import get_dynamic_inference_engine
 from model_provider import model_provider
 
 sys.path.append(
     os.path.abspath(os.path.join(os.path.dirname(__file__), os.path.pardir, os.path.pardir))
 )
 
-import asyncio
 from functools import partial
-from typing import List, Union
+from typing import List
 
 from examples.inference.gpt.utils import add_common_inference_args
 from megatron.core import mpu
@@ -71,9 +69,9 @@ def get_inference_engine(args: argparse.Namespace, model: MegatronModule) -> Abs
     Returns:
         AbstractBackend: The chosen backend
     """
-    tokenizer = get_tokenizer()
 
     if args.engine_type == "static":
+        tokenizer = get_tokenizer()
         context = StaticInferenceContext(
             args.inference_max_requests, args.inference_max_sequence_length
         )
@@ -150,8 +148,6 @@ def generate_dynamic(
 def main():
     """Main program."""
 
-    # Note: The default args passed here can be overwritten by using appropriate params (check arguments.py file)
-    # Micro batch size is not needed to be set by user. (It is calculated based on inference-batch-times-seqlen-threshold argument)
     initialize_megatron(
         extra_args_provider=add_inference_benchmarking_args,
         args_defaults={
