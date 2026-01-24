@@ -628,6 +628,9 @@ class BridgeCommunicator:
                 dist.broadcast(
                     shape_tensor, src=self.current_rank, group=self.src_grid_broadcast_pg
                 )
+                dist.broadcast(
+                    shape_tensor, src=self.current_rank, group=self.src_grid_broadcast_pg
+                )
 
                 # Broadcast the tensors to all ranks in the group
                 dist.broadcast(
