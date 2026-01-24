@@ -3,6 +3,7 @@
 import json
 import logging
 from statistics import median
+
 import yaml
 
 logging.basicConfig(level=logging.INFO)
