@@ -100,4 +100,3 @@ METRICS:
   - "mem-max-allocated-bytes"
   - "lm-loss"
   - "num-zeros"
-  - "iteration-time"
