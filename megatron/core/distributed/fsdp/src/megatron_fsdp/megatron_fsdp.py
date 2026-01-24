@@ -1105,7 +1105,7 @@ class MegatronFSDP(torch.nn.Module):
         """
         self.param_and_grad_buffer.update_main_grads()
 
-    def finish_grad_sync(self):
+    def finish_grad_sync(self, force_all_reduce: Optional[bool] = False):
         """
         Finishes grad sync (all-reduce or reduce-scatter) communication operations
         for all model gradients. Call prior to the optimization step to resolve
@@ -1114,6 +1114,9 @@ class MegatronFSDP(torch.nn.Module):
         When overlap_grad_reduce is set to True, waits for asynchronous communication
         calls to complete. When overlap_grad_reduce is set to False, calls synchronous
         communication ops.
+
+        NOTE: force_all_reduce is included as an argument to maintain API compatibility
+        with DDP.force_grad_sync.
         """
         # Synchronize gradient reduce-scatter operations for all model gradients.
         self.synchronize_gradient_reduce()
