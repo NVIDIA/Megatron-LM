@@ -3,14 +3,18 @@ ENV_VARS:
   NVTE_ALLOW_NONDETERMINISTIC_ALGO: 0
   NCCL_ALGO: Ring
   CUBLAS_WORKSPACE_CONFIG: :4096:8
+  N_REPEAT: 1
 TEST_TYPE: frozen-start
 MODE: rl
 MODEL_ARGS:
+  --tensor-model-parallel-size: 4
+  --inference-dynamic-batching-num-cuda-graphs: 1
+  --inference-dynamic-batching-unified-memory-level: 1
+  --inference-dynamic-batching-buffer-size-gb: 20
   --ckpt-format: torch_dist
   --seq-length: 1024
   --inference-max-seq-length: 1024
-  --inference-max-batch-size: 256
-  --load: ${CHECKPOINT_LOAD_PATH}/model/gpt/qwen3-8b-dist
+  --load: /mnt/artifacts/model/qwen3-8b-dist
   --untie-embeddings-and-output-weights: true
   --num-layers: 36
   --hidden-size: 4096
@@ -34,9 +38,9 @@ MODEL_ARGS:
   --no-masked-softmax-fusion: true
   --attention-softmax-in-fp32: true
   --tokenizer-type: HuggingFaceTokenizer
-  --tokenizer-model: ${CHECKPOINT_LOAD_PATH}/model/gpt/qwen3-8b-dist/tokenizer
+  --tokenizer-model: /mnt/artifacts/model/qwen3-8b-dist/tokenizer
   --langrl-inference-server-type: inplace_megatron_chat
-  --langrl-inference-server-conversation-template: ${CHECKPOINT_LOAD_PATH}/model/gpt/qwen3-8b-dist/tokenizer
+  --langrl-inference-server-conversation-template: /mnt/artifacts/model/qwen3-8b-dist/tokenizer
   --vocab-size: 151936
   --make-vocab-size-divisible-by: 128
   --optimizer: adam
@@ -48,7 +52,7 @@ MODEL_ARGS:
   --lr-warmup-samples: 0
   --clip-grad: 1.0
   --weight-decay: 0.01
-  --use-deterministic-mode: true
+  --deterministic-mode: true
   --use-mcore-models: true
   --bf16: true
   --log-memory-to-tensorboard: true
@@ -70,22 +74,22 @@ MODEL_ARGS:
   --log-timers-to-tensorboard: true
   --cuda-graph-impl: local
   --micro-batch-size: 1
-  --global-batch-size: 16
+  --global-batch-size: 4
   --grpo-group-size: 2
-  --grpo-prompts-per-step: 8
+  --grpo-prompts-per-step: 2
   --grpo-iterations: 1
   --grpo-clamp-eps-lower: 0.2
   --grpo-clamp-eps-upper: 0.2
   --grpo-kl-beta: 0.0
   --grpo-entropy-term-weight: 0.0
-  --langrl-env-config: tests/functional_tests/test_cases/gpt/gpt_grpo_tp1_pp1_dp8_8b_correctness_and_throughput/env_config.yaml
+  --langrl-env-config: tests/functional_tests/test_cases/gpt/gpt_grpo_tp4_pp1_dp2_8b_correctness_and_throughput_github/env_config.yaml
   --rl-partial-rollouts: true
   --use-checkpoint-args: true
   --dist-ckpt-strictness: log_unexpected
   --perform-rl-step: true
   --train-samples: 48828125
-  --exit-interval: 50
-  --tensorboard-dir: ${TENSORBOARD_PATH}
+  --exit-interval: 5
+  --tensorboard-dir: /opt/megatron-lm/runs/a6662803-1490-4412-a612-07bb1653033c/1/generations_dev_dgx_h100.json
   --save-interval: 1000000
   --eval-interval: 1000000
   --finetune: true

@@ -92,3 +92,45 @@ def test_grpo_training_loop(golden_values_path: str, test_values_path: str) -> N
         )
 
         output_groundtruth.pop('num-zeros')
+
+    if "mem-allocated-bytes" in output_groundtruth.keys():
+
+        mem_allocated_bytes_sampled = median(
+            [l for l in output_current["mem-allocated-bytes"]['values'].values()][1:]
+        )
+        mem_allocated_bytes_golden = median(
+            [l for l in output_groundtruth["mem-allocated-bytes"]['values'].values()][1:]
+        )
+
+        # 10% variance is accepted.
+        assert (
+            0.9 * mem_allocated_bytes_golden <= mem_allocated_bytes_sampled <= 1.1 * mem_allocated_bytes_golden
+        ), (
+            f"Mem allocated bytes {mem_allocated_bytes_sampled} bytes not within 10% below or 20% above "
+            f"golden value ~{mem_allocated_bytes_golden} bytes. "
+            f"Sampled: {output_current['mem-allocated-bytes']} bytes. "
+            f"Please update golden values in the functional tests if this is expected."
+        )
+
+        output_groundtruth.pop('mem-allocated-bytes')
+
+    if "mem-max-allocated-bytes" in output_groundtruth.keys():
+
+        mem_max_allocated_bytes_sampled = median(
+            [l for l in output_current["mem-max-allocated-bytes"]['values'].values()][1:]
+        )
+        mem_max_allocated_bytes_golden = median(
+            [l for l in output_groundtruth["mem-max-allocated-bytes"]['values'].values()][1:]
+        )
+
+        # 10% variance is accepted.
+        assert (
+            0.9 * mem_max_allocated_bytes_golden <= mem_max_allocated_bytes_sampled <= 1.1 * mem_max_allocated_bytes_golden
+        ), (
+            f"Mem max allocated bytes {mem_max_allocated_bytes_sampled} bytes not within 10% below or 20% above "
+            f"golden value ~{mem_max_allocated_bytes_golden} bytes. "
+            f"Sampled: {output_current['mem-max-allocated-bytes']} bytes. "
+            f"Please update golden values in the functional tests if this is expected."
+        )
+
+        output_groundtruth.pop('mem-max-allocated-bytes')
