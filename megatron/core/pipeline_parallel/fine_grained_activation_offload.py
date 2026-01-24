@@ -5,6 +5,7 @@ from contextlib import nullcontext
 from typing import Any, Dict, Tuple
 
 import torch
+from torch.autograd.graph import saved_tensors_hooks
 
 # CPU offload implementation for pipeline parallelism
 DEBUG = False
@@ -436,6 +437,9 @@ class PipelineOffloadManager:
         self._delayed_offload_groups = []
         self.reset()
 
+        self._saved_tensors_hooks = saved_tensors_hooks(
+            self.on_save_for_backward, self.on_get_saved_tensor)
+
     @property
     def d2h_stream(self):
         """Get the device-to-host (GPU to CPU) transfer stream."""
@@ -717,10 +721,8 @@ class PipelineOffloadManager:
         else:
             raise RuntimeError("TE CPU offload is not available")
         self.inside_context = True
+        self._saved_tensors_hooks.__enter__()
 
-        torch._C._autograd._push_saved_tensors_default_hooks(
-            self.on_save_for_backward, self.on_get_saved_tensor
-        )
 
     def __exit__(self, *args: Any):
         """Exit context manager and restore original tensor saving behavior."""
@@ -734,7 +736,8 @@ class PipelineOffloadManager:
         else:
             raise RuntimeError("TE CPU offload is not available")
         self.inside_context = False
-        torch._C._autograd._pop_saved_tensors_default_hooks()
+        # torch._C._autograd._pop_saved_tensors_default_hooks()
+        self._saved_tensors_hooks.__exit__()
 
     def on_save_for_backward(self, tensor: torch.Tensor) -> Any:
         """
@@ -917,7 +920,6 @@ class ChunkOffloadHandler:
         """offload a group of tensors recorded in tensor_push()."""
         debug_rank("------bulk_offload_group")
         torch.cuda.nvtx.range_push("activation offloading " + group_to_offload._name)
-        released_tensors = []
         with torch.cuda.stream(self.d2h_stream):
             for tensor_tag, tensor_on_device in group_to_offload._tensors.items():
                 if self.tensor_need_offloading_checker(tensor_on_device):
@@ -929,11 +931,7 @@ class ChunkOffloadHandler:
                     if state[3] is None:
                         tensor_on_device.record_stream(self.d2h_stream)
                     group_to_offload.push_tensor(tensor_tag, state)
-                    released_tensors.append(tensor_on_device)
             group_to_offload.record_offload_event(self.d2h_stream)
-        # for tensor in released_tensors:
-        #     tensor.record_stream(torch.cuda.current_stream())
-        #     tensor.untyped_storage().resize_(0)
         torch.cuda.nvtx.range_pop()
 
     def get_max_deduplicated_groups(self):
