@@ -12,7 +12,6 @@ from megatron.core.fp4_utils import get_fp4_align_size
 from megatron.core.fp8_utils import get_fp8_align_size
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.tensor_parallel import get_cuda_rng_tracker, get_expert_parallel_rng_tracker_name
-from megatron.core.tensor_parallel.mappings import reduce_from_tensor_model_parallel_region
 from megatron.core.transformer.cuda_graphs import is_graph_capturing
 from megatron.core.transformer.enums import CudaGraphScope
 from megatron.core.transformer.transformer_config import TransformerConfig
@@ -50,7 +49,6 @@ def switch_load_balancing_loss_func(
     num_experts: int,
     moe_aux_loss_coeff: float,
     fused: bool = False,
-    padding_mask: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     """Calculate the auxiliary loss for load balancing.
     Refer to the Switch Transformer (https://arxiv.org/abs/2101.03961)
@@ -102,19 +100,10 @@ def switch_load_balancing_loss_func(
         num_experts (int): The number of experts.
         moe_aux_loss_coeff (float): The coefficient for the auxiliary loss.
         fused (bool): Whether to use the fused version of the auxiliary loss.
-        padding_mask (torch.Tensor, optional): Boolean mask indicating non-padding tokens.
-                                               Shape in [num_tokens]. True for valid tokens,
-                                               False for padding tokens. Defaults to None.
 
     Returns:
         torch.Tensor: The auxiliary loss for load balancing.
     """
-    # Apply padding mask to probs if provided
-    if padding_mask is not None:
-        # padding_mask: [num_tokens], probs: [num_tokens, num_experts]
-        mask_expanded = padding_mask.unsqueeze(-1)
-        probs = probs * mask_expanded
-
     if fused:
         if not HAVE_TE or fused_moe_aux_loss is None:
             raise ValueError("fused_moe_aux_loss is not available. Please install TE >= 2.7.0.")
@@ -134,35 +123,19 @@ def switch_load_balancing_loss_func(
     return aux_loss
 
 
-def z_loss_func(
-    logits: torch.Tensor, z_loss_coeff: float, padding_mask: Optional[torch.Tensor] = None
-) -> torch.Tensor:
+def z_loss_func(logits: torch.Tensor, z_loss_coeff: float) -> torch.Tensor:
     """Encourages the router's logits to remain small to enhance stability.
     Please refer to the ST-MoE paper (https://arxiv.org/pdf/2202.08906.pdf) for details.
 
     Args:
         logits (torch.Tensor): The logits of the router.
         z_loss_coeff (float): The coefficient for the z-loss.
-        padding_mask (torch.Tensor, optional): Boolean mask indicating padding positions.
-                                               Shape [num_tokens]. True = padding (exclude),
-                                               False = valid (include). Defaults to None.
 
     Returns:
         torch.Tensor: The logits after applying the z-loss.
     """
-    logsum = torch.logsumexp(logits, dim=-1)
-    z_loss_values = torch.square(logsum)
 
-    if padding_mask is not None:
-        # Invert padding_mask: True (padding) -> 0, False (valid) -> 1
-        valid_mask = ~padding_mask
-        # Only compute z_loss for valid (non-padding) tokens
-        z_loss_values = z_loss_values * valid_mask
-        # Compute mean over valid tokens only
-        num_valid_tokens = valid_mask.sum()
-        z_loss = z_loss_values.sum() / torch.clamp(num_valid_tokens, min=1.0) * z_loss_coeff
-    else:
-        z_loss = torch.mean(z_loss_values) * z_loss_coeff
+    z_loss = torch.mean(torch.square(torch.logsumexp(logits, dim=-1))) * z_loss_coeff
     return z_loss
 
 
@@ -210,28 +183,6 @@ def get_capacity(
     if min_capacity is not None and capacity < min_capacity:
         capacity = min_capacity
     return capacity
-
-
-def get_tokens_per_expert_and_token_count(
-    routing_map: torch.Tensor,
-    reduce_group: torch.distributed.ProcessGroup,
-    topk: int = None,
-    with_padding_mask: bool = False,
-) -> torch.Tensor:
-    """
-    Compute global_tokens_per_expert, local_num_tokens and total_num_tokens with padding mask.
-    """
-    local_tokens_per_expert = routing_map.sum(dim=0)
-    global_tokens_per_expert = reduce_from_tensor_model_parallel_region(
-        local_tokens_per_expert, reduce_group
-    )
-    if with_padding_mask:
-        local_num_tokens = local_tokens_per_expert.sum() / topk
-        total_num_tokens = global_tokens_per_expert.sum() / topk
-    else:
-        local_num_tokens = routing_map.shape[0]
-        total_num_tokens = local_num_tokens * reduce_group.size()
-    return global_tokens_per_expert, local_num_tokens, total_num_tokens
 
 
 class MoEAuxLossAutoScaler(torch.autograd.Function):
@@ -733,11 +684,7 @@ def topk_routing_with_score_function(
 
 
 def compute_routing_scores_for_aux_loss(
-    logits: torch.Tensor,
-    topk: int,
-    score_function: str,
-    fused: bool = False,
-    padding_mask: Optional[torch.Tensor] = None,
+    logits: torch.Tensor, topk: int, score_function: str, fused: bool = False
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """Compute routing scores based on the score function.
 
@@ -746,9 +693,6 @@ def compute_routing_scores_for_aux_loss(
         topk (int): The number of top-k indices to compute.
         score_function (str): The score function to use. Can be either "softmax" or "sigmoid".
         fused (bool, optional): Whether to use the fused version. Defaults to False.
-        padding_mask (torch.Tensor, optional): Boolean mask indicating non-padding tokens.
-                                               Shape in [num_tokens]. True for valid tokens,
-                                               False for padding tokens. Defaults to None.
 
     Returns:
         Tuple[torch.Tensor, torch.Tensor]: The routing map and the normalized routing scores.
@@ -758,27 +702,20 @@ def compute_routing_scores_for_aux_loss(
             raise ValueError(
                 "fused_compute_score_for_moe_aux_loss is not available. Please install TE >= 2.6.0."
             )
-        routing_map, scores = fused_compute_score_for_moe_aux_loss(
+        return fused_compute_score_for_moe_aux_loss(
             logits=logits, topk=topk, score_function=score_function
         )
+
+    if score_function == "softmax":
+        scores = torch.softmax(logits, dim=-1, dtype=torch.float32)
+    elif score_function == "sigmoid":
+        scores = torch.sigmoid(logits)
+        scores = scores / (scores.sum(dim=-1, keepdim=True) + 1e-20)
     else:
-        if score_function == "softmax":
-            scores = torch.softmax(logits, dim=-1, dtype=torch.float32)
-        elif score_function == "sigmoid":
-            scores = torch.sigmoid(logits)
-            scores = scores / (scores.sum(dim=-1, keepdim=True) + 1e-20)
-        else:
-            raise ValueError(f"Invalid score_function: {score_function}")
+        raise ValueError(f"Invalid score_function: {score_function}")
 
-        _, top_indices = torch.topk(scores, k=topk, dim=1)
-        routing_map = torch.zeros_like(logits).int().scatter(1, top_indices, 1).bool()
-
-    # Apply padding mask to scores if provided
-    if padding_mask is not None:
-        # Invert padding_mask and make True indicates valid tokens
-        valid_mask = (~padding_mask).unsqueeze(-1)
-        routing_map = routing_map * valid_mask
-        scores = scores * valid_mask
+    _, top_indices = torch.topk(scores, k=topk, dim=1)
+    routing_map = torch.zeros_like(logits).int().scatter(1, top_indices, 1).bool()
     return routing_map, scores
 
 
