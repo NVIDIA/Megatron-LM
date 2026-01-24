@@ -1589,8 +1589,8 @@ class ParamAndGradBuffer:
         module: torch.nn.Module,
         bucketing_policy: BucketingPolicy,
         dist_index: FSDPDistributedIndex,
-        main_params_dtype: Optional[torch.dtype] = None,
-        main_grads_dtype: Optional[torch.dtype] = None,
+        main_params_dtype: Optional[torch.dtype] = torch.float32,
+        main_grads_dtype: Optional[torch.dtype] = torch.float32,
         gradient_scaling_factor: Optional[float] = None,
         expert_gradient_scaling_factor: Optional[float] = None,
         device: torch.device = torch.device("cuda"),
@@ -1993,13 +1993,16 @@ class ParamAndGradBuffer:
                 or meta_device_init_fp8_params.get(self.param_to_name[one_param], (False, False))[0]
             )
 
-            # Designate compute data-types for parameters and gradients.
+            # Designate buffer data-types for compute parameters and main gradients.
             if is_dtype_float8:
                 param_dtype = torch.uint8
-                grad_dtype = torch.bfloat16
+                main_grad_dtype = torch.bfloat16
             else:
                 param_dtype = group.params[0].dtype
-                grad_dtype = param_dtype
+                main_grad_dtype = param_dtype
+            # Use a custom main gradient data-type.
+            if self.ddp_config.main_grads_dtype is not None:
+                main_grad_dtype = self.ddp_config.main_grads_dtype
 
             # Check if the parameter group needs a transpose buffer for model weights.
             # Currently, only mxfp8 needs it.
@@ -2056,9 +2059,7 @@ class ParamAndGradBuffer:
 
             # Initialize the main weight buffer if a main weight data-type is specified.
             # Otherwise, don't create this buffer, and use the model compute weight buffer instead.
-            if should_create_grad_buffer_or_main_weight_buffer and isinstance(
-                main_params_dtype, torch.dtype
-            ):
+            if should_create_grad_buffer_or_main_weight_buffer and main_params_dtype is not None:
                 group.main_weight_buffer = DataParallelBuffer(
                     self.ddp_config,
                     group.params,
@@ -2066,9 +2067,6 @@ class ParamAndGradBuffer:
                     and main_buf_dp_group.size() > 1,
                     dtype=main_params_dtype,
                     device=self.device,
-                    # Note: This will be DP-Outer + DP-Shard when sharding
-                    # the optimizer state in HFSDP, else just DP-Shard.
-                    # Needs to match the sharding group of wbuf!
                     data_parallel_group=main_buf_dp_group,
                     bucket_id=group_id,
                     chunk_size_factor=group.chunk_size_factor,
@@ -2078,26 +2076,20 @@ class ParamAndGradBuffer:
 
             # Initialize the main grad buffer.
             if should_create_grad_buffer_or_main_weight_buffer:
-                # If the main_grads_dtype is specified, then customize the gradient buffer dtype.
-                # Otherwise, default to the original gradient dtype, which is equivalent to the
-                # model compute parameter datatype (except when using FP8, FP4, etc.)
-                main_gradient_buffer_dtype = (
-                    main_grads_dtype if isinstance(main_grads_dtype, torch.dtype) else grad_dtype
-                )
                 assert (
                     # Make sure the main gradient buffer is not quantized.
                     # This dtype will be used for reduction and accumulation
-                    # if grad_accum_dtype is not specified, and in general
-                    # non-Float gradients are not supported in Torch.
-                    main_gradient_buffer_dtype.is_floating_point
-                ), f"Main gradient dtype ({main_gradient_buffer_dtype}) must be Float."
+                    # if grad_accum_dtype is not specified, and non-Float
+                    # gradients are not supported in Torch.
+                    main_grad_dtype.is_floating_point
+                ), f"Main gradient dtype ({main_grad_dtype}) must be Float."
                 group.main_grad_buffer = DataParallelBuffer(
                     self.ddp_config,
                     # Proxy because the number of gradient parameters is the same
                     # as the number of model parameters.
                     group.params,
                     is_data_distributed=is_grad_buffer_distributed and main_buf_dp_group.size() > 1,
-                    dtype=main_gradient_buffer_dtype,
+                    dtype=main_grad_dtype,
                     device=self.device,
                     data_parallel_group=main_buf_dp_group,
                     is_transpose_buffer=False,
@@ -2121,11 +2113,8 @@ class ParamAndGradBuffer:
                     group.params,
                     is_data_distributed=is_main_weight_buffer_distributed
                     and hsdp_buf_dp_group.size() > 1,
-                    # Matches the model compute weight buffer in type.
                     dtype=wbuf.dtype,
                     device=wbuf.device,
-                    # Intermediate sharding buffer on DP-Shard when using
-                    # HFSDP (HSDP + fully-sharded optimizer state).
                     data_parallel_group=hsdp_buf_dp_group,
                     is_transpose_buffer=False,
                     temporary_bucket_allocator=self.weight_alloc,
@@ -2160,11 +2149,8 @@ class ParamAndGradBuffer:
                         group.params,
                         is_data_distributed=is_grad_buffer_distributed
                         and hsdp_buf_dp_group.size() > 1,
-                        # Matches the main gradient buffer in type.
                         dtype=gbuf.dtype,
                         device=gbuf.device,
-                        # Intermediate sharding buffer on DP-Shard when using
-                        # HFSDP (HSDP + fully-sharded optimizer state).
                         data_parallel_group=hsdp_buf_dp_group,
                         is_transpose_buffer=False,
                         temporary_bucket_allocator=self.main_grad_alloc,
@@ -2230,14 +2216,12 @@ class ParamAndGradBuffer:
                         # weights (self.dist_main_weight) and gradients (self.dist_main_grad) will
                         # be sharded persistently upon initialization.
                         hsdp_wbuf = group.hsdp_wbuf
-                        # DP-Shard
                         hsdp_wbuf.init_data(
                             torch.empty(
                                 hsdp_wbuf.data_size, dtype=hsdp_wbuf.dtype, device=self.device
                             )
                         )
                         outer_fsdp_group = self.dist_index.get_outer_fsdp_group()
-                        # DP-Outer + DP-Shard
                         wbuf_data = hsdp_wbuf.data[
                             # Requires FSDP sharding for (DP-Shard, DP-Outer) to cover DP-Shard.
                             wbuf.data_size
@@ -2471,10 +2455,8 @@ class ParamAndGradBuffer:
                     # weights (self.dist_main_weight) and gradients (self.dist_main_grad) will
                     # be sharded persistently upon initialization.
                     hsdp_gbuf = group.hsdp_gbuf
-                    # DP-Shard
                     hsdp_gbuf.init_data(_alloc(hsdp_gbuf.dtype, hsdp_gbuf.data_size))
                     outer_fsdp_group = self.dist_index.get_outer_fsdp_group()
-                    # DP-Outer + DP-Shard
                     gbuf_data = hsdp_gbuf.data[
                         # Requires FSDP sharding for (DP-Shard, DP-Outer) to cover DP-Shard.
                         gbuf.data_size
@@ -3383,15 +3365,9 @@ class GradReducePipeline:
                     self.bucket_status[bucket_id] = BucketStatus.COMMUNICATING
 
             for local_grad, reduced_grad in grad_accum_closure:
-                # Cast to accumulation data-type if specified and necessary.
-                if (
-                    isinstance(ddp_config.grad_accum_dtype, torch.dtype)
-                    and reduced_grad.dtype != ddp_config.grad_accum_dtype
-                ):
-                    reduced_grad = reduced_grad.to(ddp_config.grad_accum_dtype)
                 # Accumulate the reduced gradient into the local gradient buffer.
                 # Accumulation data-type is type-promoted with respect to the
-                # specified grad_accum_dtype and the buffer main_grads_dtype.
+                # accumulated gradient and the buffer main_grads_dtype.
                 local_grad += reduced_grad
             # Record a checkpoint for the event to synchronize against the reduce-scatter stream.
             reduce_scatter_view_out_event = reduce_scatter_stream.record_event()
@@ -3531,7 +3507,7 @@ class GradReducePipeline:
         """
         # Cast gradient to gradient communication dtype if specified and necessary.
         grad_comm_with_custom_dtype: bool = (
-            isinstance(self.buffer.ddp_config.grad_comm_dtype, torch.dtype)
+            self.buffer.ddp_config.grad_comm_dtype is not None
             and comm_tensor.dtype != self.buffer.ddp_config.grad_comm_dtype
         )
         if grad_comm_with_custom_dtype:
@@ -3702,94 +3678,6 @@ class AllGatherPipeline:
             f"bucket_can_be_released: {self.bucket_can_be_released}."
         )
 
-    def extend_bucket_group_with_prefetch(
-        self,
-        bucket_group,
-        parameter_groups: list[ParameterGroup],
-        prefetch_order: PrefetchOrder = PrefetchOrder.FORWARD_PASS_ORDER,
-        suggested_AG_prefetch_size: Optional[int] = None,
-        double_buf_units: Optional[set] = None,
-    ):
-        """
-        Update bucket_group with more pre-fetched buckets. Iteratively checks for
-        the next bucket in the direction of prefetch_order for buckets to pre-fetch.
-
-        If double_buf_units is passed, it will be used to determine the pre-fetch
-        scope and updated with pre-fetched FSDP units accordingly.
-        """
-        # Base group. Make a copy for pre-fetch modifications
-        # prior to updating the original list.
-        ag_buckets = bucket_group.copy()
-
-        def next_bucket_id(ag_buckets):
-            """
-            Search for the next bucket ID that is not in the list of all-gather buckets.
-            """
-            if prefetch_order == PrefetchOrder.FORWARD_PASS_ORDER:
-                # Search for bucket ID gaps from the initial bucket.
-                bucket_id = ag_buckets[0] + 1
-                for i in ag_buckets[1:]:
-                    if i != bucket_id:
-                        # bucket_id is missing in ag_buckets.
-                        # Pre-fetch this.
-                        break
-                    bucket_id += 1
-            else:
-                # Search for bucket ID gaps from the last bucket.
-                bucket_id = ag_buckets[-1] - 1
-                for i in reversed(ag_buckets[:-1]):
-                    if i != bucket_id:
-                        # bucket_id is missing in ag_buckets.
-                        # Pre-fetch this.
-                        break
-                    bucket_id -= 1
-            if bucket_id < 0 or bucket_id >= self.buffer.num_buckets:
-                # Out of bounds, return None.
-                return None
-            return bucket_id
-
-        def need_skip_prefetch(bucket_id):
-            # If use double buffer, we need to check if the next bucket
-            # is exceeding the coverage of the double buffer.
-            if isinstance(double_buf_units, set):
-                fsdp_unit_id = parameter_groups[bucket_id].fsdp_unit_id
-                double_buf_units.add(fsdp_unit_id)
-                if len(double_buf_units) > 2:
-                    # Prefetching the next bucket will exceed the coverage of
-                    # the double buffer, so we need to stop prefetching.
-                    return True
-            return False
-
-        if suggested_AG_prefetch_size is None:
-            # Default 500M
-            suggested_AG_prefetch_size = 500_000_000
-
-        base_all_gather_size = sum(
-            [parameter_groups[i].model_weight_buffer.bucket_index.size for i in ag_buckets]
-        )
-        bucket_id = next_bucket_id(ag_buckets)
-        while bucket_id is not None:
-            prefetch_all_gather_size = (
-                sum([parameter_groups[i].model_weight_buffer.bucket_index.size for i in ag_buckets])
-                - base_all_gather_size
-            )
-            if prefetch_all_gather_size >= suggested_AG_prefetch_size:
-                # Reached the prefetch limit.
-                break
-
-            if need_skip_prefetch(bucket_id):
-                break
-
-            # Extend the list of all-gather buckets with another group of buckets.
-            ag_buckets.extend(self.buffer.bucket_to_bucket_group[bucket_id])
-            # Re-sort and find the next bucket not in the list.
-            ag_buckets = list(sorted(set(ag_buckets)))
-            bucket_id = next_bucket_id(ag_buckets)
-
-        # Replace bucket_group entries (in-place) with pre-fetched group.
-        bucket_group.clear()
-        bucket_group.extend(ag_buckets)
-
     def all_gather_params(
         self,
         params: List[torch.Tensor],
@@ -3838,16 +3726,74 @@ class AllGatherPipeline:
         for bucket_id in ag_buckets:
             self.bucket_can_be_released[self.get_bucket_key(bucket_id, bwd)] = False
 
-        # If pre-fetch is enabled, we will add pre-fetched bucket IDs to
-        # ag_buckets (and double_buf_units if using double buffers).
+        # If prefetch is enabled, we will add prefetch buckets to ag_buckets.
         if prefetch:
-            self.extend_bucket_group_with_prefetch(
-                ag_buckets,
-                parameter_groups,
-                prefetch_order,
-                suggested_AG_prefetch_size,
-                double_buf_units if self.buffer.ddp_config.fsdp_double_buffer else None,
+
+            def next_bucket_id(ag_buckets):
+                """
+                Search for the next bucket ID that is not in the list of all-gather buckets.
+                """
+                if prefetch_order == PrefetchOrder.FORWARD_PASS_ORDER:
+                    # Search from the initial bucket.
+                    bucket_id = ag_buckets[0] + 1
+                    for i in ag_buckets[1:]:
+                        if i != bucket_id:
+                            break
+                        bucket_id += 1
+                else:
+                    # Search from the last bucket.
+                    bucket_id = ag_buckets[-1] - 1
+                    for i in reversed(ag_buckets[:-1]):
+                        if i != bucket_id:
+                            break
+                        bucket_id -= 1
+                if bucket_id < 0 or bucket_id >= self.buffer.num_buckets:
+                    # Out of bounds, return None.
+                    return None
+                return bucket_id
+
+            def need_skip_prefetch(bucket_id):
+                # If use double buffer, we need to check if the next bucket
+                # is exceeding the coverage of the double buffer.
+                if self.buffer.ddp_config.fsdp_double_buffer:
+                    fsdp_unit_id = parameter_groups[bucket_id].fsdp_unit_id
+                    double_buf_units.add(fsdp_unit_id)
+                    if len(double_buf_units) > 2:
+                        # Prefetching the next bucket will exceed the coverage of
+                        # the double buffer, so we need to stop prefetching.
+                        return True
+                return False
+
+            if suggested_AG_prefetch_size is None:
+                # Default 500M
+                suggested_AG_prefetch_size = 500_000_000
+
+            base_all_gather_size = sum(
+                [parameter_groups[i].model_weight_buffer.bucket_index.size for i in ag_buckets]
             )
+            bucket_id = next_bucket_id(ag_buckets)
+            while bucket_id is not None:
+                prefetch_all_gather_size = (
+                    sum(
+                        [
+                            parameter_groups[i].model_weight_buffer.bucket_index.size
+                            for i in ag_buckets
+                        ]
+                    )
+                    - base_all_gather_size
+                )
+                if prefetch_all_gather_size >= suggested_AG_prefetch_size:
+                    # Reached the prefetch limit.
+                    break
+
+                if need_skip_prefetch(bucket_id):
+                    break
+
+                # Extend the list of all-gather buckets with another group of buckets.
+                ag_buckets.extend(self.buffer.bucket_to_bucket_group[bucket_id])
+                # Re-sort and find the next bucket not in the list.
+                ag_buckets = list(sorted(set(ag_buckets)))
+                bucket_id = next_bucket_id(ag_buckets)
 
         # Only all-gather on buckets that have not been allocated yet.
         ag_buckets = [
@@ -3882,9 +3828,7 @@ class AllGatherPipeline:
                             # TODO(@kunlunl, @cspades): Support MXFP8 with HFSDP.
                             # Requires a hybrid-sharded transpose buffer.
                             assert param_group.transpose_weight_buffer is None
-                            # DP-Outer + DP-Shard Buffer
                             wbuf = param_group.model_weight_buffer
-                            # DP-Shard Buffer
                             hsdp_wbuf = param_group.hsdp_wbuf
 
                             # Gather the fully-sharded weights from the (DP-Outer, DP-Shard)-backed
@@ -3894,8 +3838,7 @@ class AllGatherPipeline:
                                 input_tensor=wbuf.data,
                                 group=outer_fsdp_group,
                             )
-
-                # Wait for the DP-Outer coalesced all-gather to finish.
+                # Wait for the DP-Outer group all-gather to finish.
                 all_gather_stream.wait_stream(self.outer_fsdp_group_param_gather_stream)
 
             # Coalesce the asynchronous NCCL operations in this context.
@@ -4001,19 +3944,19 @@ class AllGatherPipeline:
                 self.bucket_can_be_released[bucket_key] = False
 
     def get_fsdp_buffer(self, bucket_id: int, bwd=False) -> DataParallelBuffer:
-        """Get the FSDP / DP-Shard buffer with the given bucket ID."""
+        """
+        Get the FSDP / DP-Shard buffer with the given bucket ID.
+        If bwd=True, return the FSDP transpose buffer instead.
+        """
         param_group = self.buffer.parameter_groups[bucket_id]
         if self.buffer.ddp_config.outer_dp_sharding_strategy != "no_shard":
             if bwd and param_group.transpose_weight_buffer is not None:
                 raise RuntimeError("Transpose buffer is not supported for HSDP")
             else:
-                # Return the standard weight buffer.
                 return param_group.hsdp_wbuf
         if bwd and param_group.transpose_weight_buffer is not None:
-            # Return the column-wise weight buffer.
             return param_group.transpose_weight_buffer
         else:
-            # Return the standard weight buffer.
             return param_group.model_weight_buffer
 
     @torch.no_grad()
@@ -4067,49 +4010,16 @@ class AllGatherPipeline:
         )
 
 
-def _dtype_size(dtype: torch.dtype) -> int:
-    """
-    Get the size of the dtype. Note that many data-types un-common to ML
-    or not supported by NCCL communication (e.g. CFloat) are listed here
-    for mixed-precision coverage and to avoid allocating a dummy Tensor.
-
-    Args:
-        dtype (torch.dtype): The dtype to get the size of.
-    Returns:
-        int: The size of the dtype.
-    """
-    if dtype == torch.float16 or dtype == torch.bfloat16 or dtype == torch.int16:
-        return 2
-    elif dtype == torch.float32 or dtype == torch.int32 or torch.complex32:
-        return 4
-    elif dtype == torch.float64 or dtype == torch.int64 or torch.complex64:
-        return 8
-    elif dtype == torch.uint8 or dtype == torch.int8:
-        return 1
-    elif dtype == "float8":
-        return 1
-    else:
-        try:
-            # Allocate an empty Tensor on-the-fly to check the size.
-            # Non-ideal fall-back option before sizing the new dtype.
-            # Why does torch.dtype not support this without alloc?
-            return torch.empty((), dtype=dtype).element_size()
-        except:
-            raise ValueError(f"Unsupported dtype: {dtype}")
-
-
 def _use_custom_grad_accum_dtype(
     input_grad: torch.Tensor, ddp_config: DistributedDataParallelConfig
 ) -> bool:
     """
-    Checks if gradients need to be accumulated with a custom data-type,
-    which is the case when the gradient accumulation data-type is more
-    precise than the gradient communication data-type implied by input_grad.
+    Checks if gradients need to be accumulated with a custom data-type.
     """
     return (
-        isinstance(ddp_config.grad_accum_dtype, torch.dtype)
-        # Accumulation data-type size is greater than the communication data-type size.
-        and _dtype_size(ddp_config.grad_accum_dtype) > _dtype_size(input_grad.dtype)
+        ddp_config.grad_accum_dtype is not None
+        # Accumulation data-type does not match communication data-type.
+        and ddp_config.grad_accum_dtype != input_grad.dtype
     )
 
 
@@ -4118,24 +4028,27 @@ def gradient_reduce_preprocessing(grad_data, scaling_factor, ddp_config):
     """
     Gradient reduce preprocessing for gradient averaging and gradient scaling.
     """
-    if ddp_config.average_in_collective:
-        # Always AVG reduce without custom gradient scaling.
+
+    # TODO(@cspades): Clean up this logic in conjunction with
+    # gradient reduction arguments: calculate_per_token_loss,
+    # and average_in_collective.
+    if scaling_factor is None:
+        # No scaling - use SUM reduction.
+        reduce_op = torch.distributed.ReduceOp.SUM
+    elif ddp_config.average_in_collective:
+        # Scaling overridden by AVG reduction.
         reduce_op = torch.distributed.ReduceOp.AVG
     elif (
         ddp_config.gradient_reduce_div_fusion
-        # Custom precision gradient accumulation will not be supported
-        # due to communication and reduction data-type mismatch.
+        # Custom gradient accumulation precision cannot be fused.
         and not _use_custom_grad_accum_dtype(grad_data, ddp_config)
-        and scaling_factor is not None
         and grad_data.dtype != torch.bfloat16
     ):
-        # Use a fused gradient scaling reduction op.
+        # Fused SUM reduction.
         reduce_op = torch.distributed._make_nccl_premul_sum(scaling_factor)
     else:
-        # Apply pre-scaling if specified.
-        if scaling_factor is not None:
-            grad_data.mul_(scaling_factor)
-        # SUM reduction.
+        # Scale gradients with SUM reduction.
+        grad_data.mul_(scaling_factor)
         reduce_op = torch.distributed.ReduceOp.SUM
 
     return reduce_op
@@ -4256,6 +4169,37 @@ def override_sharded_param_methods_with_safety_checks(params, all_gather_pipelin
             return override_sharded_param_cpu_function
 
         setattr(p, "cpu", override_sharded_param_cpu_function_closure(p, cpu_function))
+
+
+def _dtype_size(dtype: torch.dtype) -> int:
+    """
+    Get the size of the dtype. Note that many data-types un-common to ML
+    or not supported by NCCL communication (e.g. CFloat) are listed here
+    for mixed-precision coverage and to avoid allocating a dummy Tensor.
+
+    Args:
+        dtype (torch.dtype): The dtype to get the size of.
+    Returns:
+        int: The size of the dtype.
+    """
+    if dtype == torch.float16 or dtype == torch.bfloat16 or dtype == torch.int16:
+        return 2
+    elif dtype == torch.float32 or dtype == torch.int32 or torch.complex32:
+        return 4
+    elif dtype == torch.float64 or dtype == torch.int64 or torch.complex64:
+        return 8
+    elif dtype == torch.uint8 or dtype == torch.int8:
+        return 1
+    elif dtype == "float8":
+        return 1
+    else:
+        try:
+            # Allocate an empty Tensor on-the-fly to check the size.
+            # Non-ideal fall-back option before sizing the new dtype.
+            # Why does torch.dtype not support this without alloc?
+            return torch.empty((), dtype=dtype).element_size()
+        except:
+            raise ValueError(f"Unsupported dtype: {dtype}")
 
 
 def to_local_if_dtensor(tensor):

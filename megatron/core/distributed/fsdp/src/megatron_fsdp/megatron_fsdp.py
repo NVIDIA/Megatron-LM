@@ -218,9 +218,10 @@ class MegatronFSDP(torch.nn.Module):
                 main_params_dtype=torch.float32,
                 # Default to FP32 gradients.
                 main_grads_dtype=torch.float32,
-                # No customization for communication or accum dtype.
+                # No customization for communication data-type.
                 grad_comm_dtype=None,
-                grad_accum_dtype=None,
+                # Default to FP32 gradient accumulation.
+                grad_accum_dtype=torch.float32,
                 overlap_grad_reduce=True,
                 overlap_param_gather=True,
                 average_in_collective=False,
@@ -587,16 +588,7 @@ class MegatronFSDP(torch.nn.Module):
                         # Add the gradient into the unsharded main gradient buffer.
                         # For unsharded gradients, this is gradient accumulation.
                         param.main_grad = param.get_main_grad()
-                        param_grad = to_local_if_dtensor(param.grad)
-                        # Cast to accumulation data-type if specified and necessary.
-                        if (
-                            isinstance(self.ddp_config.grad_accum_dtype, torch.dtype)
-                            and param_grad.dtype != self.ddp_config.grad_accum_dtype
-                        ):
-                            param_grad = param_grad.to(self.ddp_config.grad_accum_dtype)
-                        # Accumulation data-type is type-promoted with respect to the
-                        # specified grad_accum_dtype and the buffer main_grads_dtype.
-                        param.main_grad.add_(param_grad)
+                        param.main_grad.add_(to_local_if_dtensor(param.grad))
                         del param.grad
 
             if param.grad_added_to_main_grad and param.grad is not None:
@@ -795,7 +787,6 @@ class MegatronFSDP(torch.nn.Module):
             # is specified by the user, context manager, or FW before reduction.
             is_last_microbatch = getattr(self, "is_last_microbatch", False)
             if grad_reduce_every_bprop or is_last_microbatch or self.model_auto_sync:
-                # Reduce gradients.
                 self.grad_reduce_pipeline.reduce_gradients(
                     ordered_params,
                     suggested_queue_capacity=self.suggested_RS_queue_capacity,
