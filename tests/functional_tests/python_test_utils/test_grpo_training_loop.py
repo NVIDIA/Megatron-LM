@@ -10,9 +10,7 @@ logger = logging.getLogger(__name__)
 
 
 def test_grpo_training_loop(
-    golden_values_path: str,
-    test_values_path: str,
-    model_config_path: str,
+    golden_values_path: str, test_values_path: str, model_config_path: str
 ) -> None:
     with open(model_config_path, 'r') as f:
         model_config = yaml.safe_load(f)
@@ -111,7 +109,9 @@ def test_grpo_training_loop(
 
         # 10% variance is accepted.
         assert (
-            0.9 * mem_allocated_bytes_golden <= mem_allocated_bytes_sampled <= 1.1 * mem_allocated_bytes_golden
+            0.9 * mem_allocated_bytes_golden
+            <= mem_allocated_bytes_sampled
+            <= 1.1 * mem_allocated_bytes_golden
         ), (
             f"Mem allocated bytes {mem_allocated_bytes_sampled} bytes not within 10% below or 20% above "
             f"golden value ~{mem_allocated_bytes_golden} bytes. "
@@ -132,7 +132,9 @@ def test_grpo_training_loop(
 
         # 10% variance is accepted.
         assert (
-            0.9 * mem_max_allocated_bytes_golden <= mem_max_allocated_bytes_sampled <= 1.1 * mem_max_allocated_bytes_golden
+            0.9 * mem_max_allocated_bytes_golden
+            <= mem_max_allocated_bytes_sampled
+            <= 1.1 * mem_max_allocated_bytes_golden
         ), (
             f"Mem max allocated bytes {mem_max_allocated_bytes_sampled} bytes not within 10% below or 20% above "
             f"golden value ~{mem_max_allocated_bytes_golden} bytes. "
