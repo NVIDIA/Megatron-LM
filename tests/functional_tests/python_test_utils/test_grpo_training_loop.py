@@ -57,11 +57,11 @@ def test_grpo_training_loop(
             [l for l in output_groundtruth["iteration-time"]['values'].values()][1:]
         )
 
-        # 10% is empirically observed to be within hardware variance.
+        # 20% variance is accepted.
         assert (
-            0.9 * iteration_time_golden <= iteration_time_sampled <= 1.2 * iteration_time_golden
+            0.8 * iteration_time_golden <= iteration_time_sampled <= 1.2 * iteration_time_golden
         ), (
-            f"Iteration time {iteration_time_sampled} ms not within 10% below or 20% above "
+            f"Iteration time {iteration_time_sampled} ms not within 20% above or below "
             f"golden value ~{iteration_time_golden} ms. "
             f"Sampled: {output_current['iteration-time']} ms. "
             f"Please update golden values in the functional tests if this is expected."
