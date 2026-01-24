@@ -2,14 +2,21 @@
 
 import json
 import logging
-import math
 from statistics import median
+import yaml
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 
-def test_grpo_training_loop(golden_values_path: str, test_values_path: str) -> None:
+def test_grpo_training_loop(
+    golden_values_path: str,
+    test_values_path: str,
+    model_config_path: str,
+) -> None:
+    with open(model_config_path, 'r') as f:
+        model_config = yaml.safe_load(f)
+        metrics = model_config["METRICS"]
 
     with open(golden_values_path, 'r') as f1, open(test_values_path, 'r') as f2:
         golden_values_content = f1.read()
@@ -41,7 +48,7 @@ def test_grpo_training_loop(golden_values_path: str, test_values_path: str) -> N
         )
     assert len(output_groundtruth) > 0, "No test performed for output"
 
-    if "iteration-time" in output_groundtruth.keys():
+    if "iteration-time" in metrics:
 
         # First warmup iteration is excluded from iteration-time statistics.
         iteration_time_sampled = median(
@@ -63,7 +70,7 @@ def test_grpo_training_loop(golden_values_path: str, test_values_path: str) -> N
 
         output_groundtruth.pop('iteration-time')
 
-    if "lm-loss" in output_groundtruth.keys():
+    if "lm-loss" in metrics:
 
         # Require exact matching of all lm-loss values.
         golden_lm_loss_values = output_groundtruth["lm-loss"]['values']
@@ -78,7 +85,7 @@ def test_grpo_training_loop(golden_values_path: str, test_values_path: str) -> N
 
         output_groundtruth.pop('lm-loss')
 
-    if "num-zeros" in output_groundtruth.keys():
+    if "num-zeros" in metrics:
 
         # Require exact matching of all lm-loss values.
         golden_num_zeros_values = output_groundtruth["num-zeros"]['values']
@@ -93,7 +100,7 @@ def test_grpo_training_loop(golden_values_path: str, test_values_path: str) -> N
 
         output_groundtruth.pop('num-zeros')
 
-    if "mem-allocated-bytes" in output_groundtruth.keys():
+    if "mem-allocated-bytes" in metrics:
 
         mem_allocated_bytes_sampled = median(
             [l for l in output_current["mem-allocated-bytes"]['values'].values()][1:]
@@ -114,7 +121,7 @@ def test_grpo_training_loop(golden_values_path: str, test_values_path: str) -> N
 
         output_groundtruth.pop('mem-allocated-bytes')
 
-    if "mem-max-allocated-bytes" in output_groundtruth.keys():
+    if "mem-max-allocated-bytes" in metrics:
 
         mem_max_allocated_bytes_sampled = median(
             [l for l in output_current["mem-max-allocated-bytes"]['values'].values()][1:]
