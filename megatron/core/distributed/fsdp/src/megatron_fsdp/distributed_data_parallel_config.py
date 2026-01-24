@@ -115,8 +115,8 @@ class DistributedDataParallelConfig:
 
     main_grads_dtype: Optional[torch.dtype] = torch.float32
     """Data type for the main gradient buffer utilized for distributed optimization with
-      Megatron-FSDP. Defaults to None, in which case main gradients will match the dtype
-      of the model compute parameters specified by the user model.
+      Megatron-FSDP. If set to None, main gradients will match the dtype of the model
+      compute parameters specified by the user model. Defaults to torch.float32.
     """
 
     grad_comm_dtype: Optional[torch.dtype] = None
@@ -129,8 +129,8 @@ class DistributedDataParallelConfig:
     """Data type for gradient reduction and accumulation to control accumulation precision.
       Specifically, gradients will be reduced at this precision, but accumulated either at
       this precision or higher precision w.r.t. type-promotion with the main_grads_dtype.
-      Defaults to None, in which case type-promotion with respect to the main_grads_dtype
-      will determine the data-type when accumulating.
+      If set to None, type-promotion with respect to the main_grads_dtype will determine
+      the data-type when accumulating. Defaults to torch.float32.
     """
 
     def __post_init__(self):

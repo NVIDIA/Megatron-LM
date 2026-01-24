@@ -860,6 +860,15 @@ class TestMegatronFsdpFullyShard:
             grad_accum_dtype=torch.float64 if high_precision_grad_accum else None,
             init_model_with_meta_device=True,
         )
+        # Verify that the main weight and main gradient buffers have the correct dtype.
+        assert (
+            mfsdp_model.param_and_grad_buffer.parameter_groups[0].main_weight_buffer.data.dtype
+            == torch.float64
+        )
+        assert (
+            mfsdp_model.param_and_grad_buffer.parameter_groups[0].main_grad_buffer.data.dtype
+            == torch.float32
+        )
 
         # Initialize the distributed optimizer on the MegatronFSDP model.
         toy_adam = Adam(params=mfsdp_model.parameters(), lr=0.001)

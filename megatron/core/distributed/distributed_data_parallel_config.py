@@ -93,6 +93,12 @@ class DistributedDataParallelConfig:
       disables prefetching and may degrade performance. Adjust this value
       based on your system's memory and performance requirements."""
 
+    preserve_fp32_weights: bool = False
+    """
+    NOTE: The flag `preserve_fp32_weights` is deprecated and will be removed in future versions.
+    Please use `main_params_dtype` instead, which is a generalization of this argument.
+    """
+
     keep_fp8_transpose_cache: bool = False
     """If true, keep the fp8 transpose cache when using Megatron FSDP."""
 
@@ -164,8 +170,8 @@ class DistributedDataParallelConfig:
 
     main_grads_dtype: Optional[torch.dtype] = torch.float32
     """Data type for the main gradient buffer utilized for distributed optimization with
-      Megatron-FSDP. Defaults to None, in which case main gradients will match the dtype
-      of the model compute parameters specified by the user model.
+      Megatron-FSDP. If set to None, main gradients will match the dtype of the model
+      compute parameters specified by the user model. Defaults to torch.float32.
     """
 
     grad_comm_dtype: Optional[torch.dtype] = None
@@ -178,8 +184,8 @@ class DistributedDataParallelConfig:
     """Data type for gradient reduction and accumulation to control accumulation precision.
       Specifically, gradients will be reduced at this precision, but accumulated either at
       this precision or higher precision w.r.t. type-promotion with the main_grads_dtype.
-      Defaults to None, in which case type-promotion with respect to the main_grads_dtype
-      will determine the data-type when accumulating.
+      If set to None, type-promotion with respect to the main_grads_dtype will determine
+      the data-type when accumulating. Defaults to torch.float32.
     """
 
     def __post_init__(self):
@@ -195,3 +201,10 @@ class DistributedDataParallelConfig:
                     "PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True is currently not supported "
                     "with nccl_ub due to compatibility issue with torch.cuda.MemPool API."
                 )
+
+        # Backwards-compatibility for some older mixed-precision arguments.
+        if self.preserve_fp32_weights:
+            self.main_params_dtype = torch.float32
+        if self.grad_reduce_in_fp32:
+            self.main_grads_dtype = torch.float32
+            self.grad_accum_dtype = torch.float32

@@ -194,12 +194,12 @@ def fully_shard_model(
             model compute parameters specified by the user model. Defaults to torch.float32.
 
         grad_comm_dtype (Optional[torch.dtype]):
-            Data type for gradient all-reduce / reduce-scatter operations. Can be utilized to
-            reduce communication latency, but adds overhead for type-casting. Defaults to None,
-            in which case the original model gradient dtype is used.
+            Data type for gradient gather / scatter / A2A communications. Can be utilized to reduce
+            communication latency, but adds overhead for type-casting. Defaults to None, in which
+            case the original model gradient dtype is used.
 
         grad_accum_dtype (Optional[torch.dtype]):
-            Data type for gradient accumulation to control accumulation precision. If set to None,
+            Data type that controls gradient reduction and accumulation precision. If set to None,
             type-promotion with respect to the main_grads_dtype will determine the data-type when
             accumulating. Defaults to torch.float32.
 
