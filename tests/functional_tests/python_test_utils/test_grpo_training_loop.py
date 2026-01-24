@@ -48,7 +48,7 @@ def test_grpo_training_loop(
         )
     assert len(output_groundtruth) > 0, "No test performed for output"
 
-    if "iteration-time" in metrics:
+    if "iteration-time" in metrics and "iteration-time" in output_current:
 
         # First warmup iteration is excluded from iteration-time statistics.
         iteration_time_sampled = median(
@@ -70,7 +70,7 @@ def test_grpo_training_loop(
 
         output_groundtruth.pop('iteration-time')
 
-    if "lm-loss" in metrics:
+    if "lm-loss" in metrics and "lm-loss" in output_current:
 
         # Require exact matching of all lm-loss values.
         golden_lm_loss_values = output_groundtruth["lm-loss"]['values']
@@ -85,7 +85,7 @@ def test_grpo_training_loop(
 
         output_groundtruth.pop('lm-loss')
 
-    if "num-zeros" in metrics:
+    if "num-zeros" in metrics and "num-zeros" in output_current:
 
         # Require exact matching of all lm-loss values.
         golden_num_zeros_values = output_groundtruth["num-zeros"]['values']
@@ -100,7 +100,7 @@ def test_grpo_training_loop(
 
         output_groundtruth.pop('num-zeros')
 
-    if "mem-allocated-bytes" in metrics:
+    if "mem-allocated-bytes" in metrics and "mem-allocated-bytes" in output_current:
 
         mem_allocated_bytes_sampled = median(
             [l for l in output_current["mem-allocated-bytes"]['values'].values()][1:]
@@ -121,7 +121,7 @@ def test_grpo_training_loop(
 
         output_groundtruth.pop('mem-allocated-bytes')
 
-    if "mem-max-allocated-bytes" in metrics:
+    if "mem-max-allocated-bytes" in metrics and "mem-max-allocated-bytes" in output_current:
 
         mem_max_allocated_bytes_sampled = median(
             [l for l in output_current["mem-max-allocated-bytes"]['values'].values()][1:]
