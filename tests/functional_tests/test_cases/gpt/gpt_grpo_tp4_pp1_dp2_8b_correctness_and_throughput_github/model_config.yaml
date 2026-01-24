@@ -89,7 +89,7 @@ MODEL_ARGS:
   --dist-ckpt-strictness: log_unexpected
   --perform-rl-step: true
   --train-samples: 48828125
-  --exit-interval: 5
+  --exit-interval: 20
   --tensorboard-dir: ${TENSORBOARD_PATH}
   --save-interval: 1000000
   --eval-interval: 1000000
@@ -100,3 +100,6 @@ METRICS:
   - "mem-max-allocated-bytes"
   - "lm-loss"
   - "num-zeros"
+  - "iteration-time"
+THROUGHPUT_TEST_PARAMS:
+  --start_step: 10

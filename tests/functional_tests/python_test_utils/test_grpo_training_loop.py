@@ -16,6 +16,11 @@ def test_grpo_training_loop(
     with open(model_config_path, 'r') as f:
         model_config = yaml.safe_load(f)
         metrics = model_config["METRICS"]
+        if "THROUGHPUT_TEST_PARAMS" in model_config:
+            throughput_test_params = model_config["THROUGHPUT_TEST_PARAMS"]
+            start_step = throughput_test_params["--start_step"]
+        else:
+            start_step = 1
 
     with open(golden_values_path, 'r') as f1, open(test_values_path, 'r') as f2:
         golden_values_content = f1.read()
@@ -51,10 +56,10 @@ def test_grpo_training_loop(
 
         # First warmup iteration is excluded from iteration-time statistics.
         iteration_time_sampled = median(
-            [l for l in output_current["iteration-time"]['values'].values()][1:]
+            [l for l in output_current["iteration-time"]['values'].values()][start_step:]
         )
         iteration_time_golden = median(
-            [l for l in output_groundtruth["iteration-time"]['values'].values()][1:]
+            [l for l in output_groundtruth["iteration-time"]['values'].values()][start_step:]
         )
 
         # 20% variance is accepted.
