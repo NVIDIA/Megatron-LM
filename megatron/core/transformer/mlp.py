@@ -148,7 +148,7 @@ class MLP(MegatronModule):
             tp_group=tp_group,
         )
 
-    def forward(self, hidden_states, per_token_scale=None, **kwargs):
+    def forward(self, hidden_states, per_token_scale=None):
         """Perform the forward pass through the MLP block."""
         # [s, b, 4 * h/p]
         nvtx_range_push(suffix="linear_fc1")
