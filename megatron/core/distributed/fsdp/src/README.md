@@ -150,7 +150,7 @@ device_mesh = torch.distributed.device_mesh.init_device_mesh(
 # This sub-mesh can be provided to distributed samplers or dataloaders.
 device_mesh[("dp_outer", "dp_shard")]._flatten("dp")
 # Only required if using CP. Otherwise, just pass dp_shard to FSDP.
-device_mesh[("dp_shard", "cp")]._flatten("dp_cp")
+device_mesh[("dp_shard", "cp")]._flatten("dp_shard_cp")
 # Only required if using HSDP. Otherwise, don't pass hybrid_fsdp_group.
 device_mesh[("dp_outer", "dp_shard", "cp")]._flatten("hsdp")
 hsdp_group = device_mesh["hsdp"].get_group()
@@ -159,9 +159,9 @@ hsdp_group = device_mesh["hsdp"].get_group()
 expert_device_mesh = torch.distributed.device_mesh.init_device_mesh(
     "cuda",
     mesh_shape=(dp_outer_size, expt_dp_shard_size, expt_tp_size),
-    mesh_dim_names=("dp_outer", "dp_cp", "tp"),
+    mesh_dim_names=("dp_outer", "dp_shard_cp", "tp"),
 )
-expert_device_mesh[("dp_outer", "dp_cp")].flatten("hsdp")
+expert_device_mesh[("dp_outer", "dp_shard_cp")].flatten("hsdp")
 hsdp_expt_group = expert_device_mesh["hsdp"].get_group()
 ```
 
@@ -179,7 +179,7 @@ model = fully_shard_model(
     # Device Mesh
     device_mesh=device_mesh
     # Always required for FSDP or HSDP.
-    dp_shard_dim="dp_cp",
+    dp_shard_dim="dp_shard_cp",
     # Set this required argument to use HSDP instead of FSDP. Otherwise, set this to None.
     dp_outer_dim="dp_outer",
     # Only required for TP-sensitive models (i.e. Megatron-LM / TransformerEngine)
