@@ -64,6 +64,8 @@ MODEL_ARGS:
   --no-create-attention-mask-in-dataloader: true
   --straggler-minmax-count: 16
   --tensorboard-log-interval: 1
+  --log-interval: 1
+  --log-progress: true
   --empty-unused-memory-level: 2
   --seed: 42
   --calculate-per-token-loss: true

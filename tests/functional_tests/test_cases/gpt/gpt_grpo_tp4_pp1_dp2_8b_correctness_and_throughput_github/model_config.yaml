@@ -71,6 +71,8 @@ MODEL_ARGS:
   --rl-sequence-packing-algo: fifo
   --rl-offload-optimizer-during-inference: true
   --timing-log-level: 1
+  --log-interval: 1
+  --log-progress: true
   --cuda-graph-impl: local
   --micro-batch-size: 1
   --global-batch-size: 4
