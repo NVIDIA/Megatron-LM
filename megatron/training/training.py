@@ -12,7 +12,7 @@ import logging
 import math
 import os
 import sys
-from typing import Any, Optional
+from typing import Any, Optional, Dict
 
 import torch.distributed
 
@@ -56,10 +56,19 @@ from megatron.core.utils import (
     check_param_hashes_across_dp_replicas,
     get_attr_wrapped_model,
     get_model_config,
+    get_pg_size,
+    get_pg_rank,
     StragglerDetector,
 )
 from megatron.core.fp8_utils import correct_amax_history_if_needed
-from megatron.training.arguments import parse_args
+from megatron.core.process_groups_config import ProcessGroupCollection
+from megatron.core.pipeline_parallel.utils import (
+    is_pp_first_stage,
+    is_pp_last_stage,
+    is_vp_first_stage,
+    is_vp_last_stage,
+)
+from megatron.core.optimizer import get_standard_config_overrides
 from megatron.training.checkpointing import load_checkpoint
 from megatron.training.checkpointing import save_checkpoint
 from megatron.training.checkpointing import checkpoint_exists
@@ -72,6 +81,8 @@ from megatron.core.distributed import DistributedDataParallel as DDP
 from megatron.core.distributed.fsdp.mcore_fsdp_adapter import FullyShardedDataParallel as megatron_FSDP
 from megatron.training.simulation import VppSimulator, SimulationArgsOverride
 from megatron.core.optimizer.optimizer import param_group_identifier_keys
+from megatron.core.transformer.custom_layers.batch_invariant_kernels import enable_batch_invariant_mode
+
 from megatron.core.optimizer.qk_clip import clip_qk
 
 try:
@@ -104,6 +115,7 @@ from megatron.core.transformer.experimental_attention_variant.dsa import DSAInde
 from megatron.core.transformer.multi_token_prediction import MTPLossLoggingHelper
 from megatron.core.parallel_state import (
     destroy_global_memory_buffer,
+    destroy_global_symmetric_memory_buffer,
     destroy_model_parallel,
     update_pg_timeout
 )
@@ -156,6 +168,7 @@ def destroy_global_state():
     destroy_global_vars()
     destroy_num_microbatches_calculator()
     destroy_global_memory_buffer()
+    destroy_global_symmetric_memory_buffer()
     destroy_model_parallel()
     destroy_rerun_state_machine()
 
@@ -189,11 +202,19 @@ def num_floating_point_operations(args, batch_size):
         return 4 * expansion * scale_factor * batch_size * seq_len * hidden_size**2
 
     def moe_layer_flops(batch_size, seq_len, hidden_size, moe_ffn_hidden_size,
-                        shared_expert_ffn_hidden_size, num_experts_routed_to, swiglu=False):
+                        shared_expert_ffn_hidden_size, num_experts_routed_to,
+                        moe_latent_size=None, swiglu=False):
         """Calculate FLOPs for an MoE layer."""
         scale_factor = 3.0 / 2.0 if swiglu else 1.0
-        routed_flops = (4 * batch_size * seq_len * hidden_size *
-                        moe_ffn_hidden_size * num_experts_routed_to * scale_factor)
+        if moe_latent_size is None:
+            routed_flops = (4 * batch_size * seq_len * hidden_size *
+                            moe_ffn_hidden_size * num_experts_routed_to * scale_factor)
+        else:
+            # Routed experts run on moe_latent_size.
+            routed_flops = (4 * batch_size * seq_len * moe_latent_size *
+                            moe_ffn_hidden_size * num_experts_routed_to * scale_factor)
+            # Up proj and down proj.
+            routed_flops += (4 * batch_size * seq_len * hidden_size * moe_latent_size)
         shared_flops = 4 * batch_size * seq_len * hidden_size * shared_expert_ffn_hidden_size * scale_factor
         return routed_flops + shared_flops
 
@@ -241,6 +262,7 @@ def num_floating_point_operations(args, batch_size):
                      num_attn_heads=32, gqa=True,
                      gqa_groups=8, kv_channels=None,
                      mlp_expansion=4.0, swiglu=False,
+                     moe_latent_size=None,
                      moe_ffn_hidden_size=2048, shared_expert_ffn_hidden_size=2048, num_experts_routed_to=1,
                      vocab_size=256000):
         """Calculate total FLOPs for the hybrid model."""
@@ -253,7 +275,8 @@ def num_floating_point_operations(args, batch_size):
                                                      mamba_state_dim, mamba_head_dim,
                                                      mamba_num_groups, mamba_num_heads) +
                 num_moe_layers * moe_layer_flops(batch_size, seq_len, hidden_size, moe_ffn_hidden_size,
-                                                 shared_expert_ffn_hidden_size, num_experts_routed_to, swiglu) +
+                                                 shared_expert_ffn_hidden_size, num_experts_routed_to,
+                                                 moe_latent_size, swiglu) +
                 (2 * batch_size * seq_len * hidden_size * vocab_size)  # logits computation
         )
         return flops_fwd * 3
@@ -310,18 +333,15 @@ def num_floating_point_operations(args, batch_size):
             if args.moe_shared_expert_intermediate_size is None
             else args.moe_shared_expert_intermediate_size
         )
-        # SwiGLU.
-        gated_linear_multiplier = 3 / 2 if args.swiglu else 1
 
-        # The 12x term below comes from the following factors; for more details, see
-        # "APPENDIX: FLOATING-POINT OPERATIONS" in https://arxiv.org/abs/2104.04473.
         # - 3x: Each GEMM in the model needs to be performed 3 times (forward pass,
         #       backward wgrad [weight gradient], backward dgrad [data gradient]).
-        # - 2x: GEMMs of a particular size are stacked twice in the standard Transformer model
-        #       architectures implemented in this codebase (e.g., h->ffn_h GEMM and ffn_h->h GEMM
-        #       in MLP layer).
+        forward_backward_expansion_factor = 3
         # - 2x: A GEMM of a m*n tensor with a n*k tensor requires 2mnk floating-point operations.
-        expansion_factor = 3 * 2 * 2
+        fma_expansion_factor = 2
+        # - 3x (SwiGLU enabled): h->2*ffn_h GEMM and ffn_h->h GEMM are stacked.
+        # - 2x (SwiGLU disabled): h->ffn_h GEMM and ffn_h->h GEMM are stacked.
+        ffn_expansion_factor = 3 if args.swiglu else 2
 
         if args.multi_latent_attention:
             assert not args.group_query_attention
@@ -352,8 +372,8 @@ def num_floating_point_operations(args, batch_size):
                     + 1
                 )
             standard_self_attn_term = (
-                3
-                * 2  # fwd(1) + bwd(2) *FMA
+                forward_backward_expansion_factor
+                * fma_expansion_factor
                 * (
                     ## q lora + rope + q norm
                     q_term
@@ -380,13 +400,19 @@ def num_floating_point_operations(args, batch_size):
             query_projection_size = args.kv_channels * args.num_attention_heads
             key_projection_size = args.kv_channels * args.num_query_groups
             value_projection_size = args.kv_channels * args.num_query_groups
+            gate_projection_size = query_projection_size if args.attention_output_gate else 0
             standard_self_attn_term = (
-                3
-                * 2  # fwd(1) + bwd(2) *FMA
+                forward_backward_expansion_factor
+                * fma_expansion_factor
                 * (
                     ## qkv proj
                     args.hidden_size
-                    * (query_projection_size + key_projection_size + value_projection_size)
+                    * (
+                        query_projection_size
+                        + key_projection_size
+                        + value_projection_size
+                        + gate_projection_size
+                    )
                     ## core attention
                     + query_projection_size
                     * args.seq_length
@@ -414,7 +440,12 @@ def num_floating_point_operations(args, batch_size):
                     f"current linear attention pattern: {args.linear_attention_freq}"
                 )
             elif args.linear_attention_freq is None:
-                linear_attention_pattern = [1] * num_layers
+                # This should be caught by config validation, but raise here as a safety check
+                raise ValueError(
+                    f"Linear attention type {args.experimental_attention_variant} is specified "
+                    "but linear_attention_freq is None. "
+                    "Please set linear_attention_freq to specify the LA/SDPA layer pattern."
+                )
             else:
                 raise ValueError(
                     f"Invalid linear_attention_freq: {type(args.linear_attention_freq)},"
@@ -432,8 +463,8 @@ def num_floating_point_operations(args, batch_size):
                 qk_dim = qk_head_dim * num_qk_heads
                 v_dim = v_head_dim * num_v_heads
                 linear_self_attn_term = (
-                    3
-                    * 2  # fwd(1) + bwd(2) *FMA
+                    forward_backward_expansion_factor
+                    * fma_expansion_factor
                     * (
                         ## in proj
                         args.hidden_size
@@ -470,25 +501,25 @@ def num_floating_point_operations(args, batch_size):
             * args.seq_length
             * (
                 # MLP
-                expansion_factor
-                * num_layers
+                forward_backward_expansion_factor
+                * fma_expansion_factor
                 * args.hidden_size
                 * (
                     # dense layer (deepseek v2, v3 style)
-                    (args.ffn_hidden_size * gated_linear_multiplier)
-                    * (num_dense_layers / num_layers)
+                    (args.ffn_hidden_size * ffn_expansion_factor)
+                    * num_dense_layers
                     # routed experts
-                    + (moe_ffn_hidden_size * num_experts_routed_to * gated_linear_multiplier)
-                    * (num_moe_layers / num_layers)
+                    + (moe_ffn_hidden_size * num_experts_routed_to * ffn_expansion_factor)
+                    * num_moe_layers
                     # Shared Experts.
-                    + (shared_expert_ffn_hidden_size * gated_linear_multiplier)
-                    * (num_moe_layers / num_layers)
+                    + (shared_expert_ffn_hidden_size * ffn_expansion_factor)
+                    * num_moe_layers
                 )
                 # Self Attention
                 + self_attn_term
                 # MTP norms and proj
-                + 3
-                * 2
+                + forward_backward_expansion_factor
+                * fma_expansion_factor
                 * mtp_num_layers
                 * (
                     # MTP eh norm + final nrom
@@ -497,7 +528,11 @@ def num_floating_point_operations(args, batch_size):
                     + 2 * args.hidden_size * args.hidden_size
                 )
                 # Logit.
-                + 3 * 2 * args.hidden_size * args.padded_vocab_size * (mtp_num_layers + 1)
+                + forward_backward_expansion_factor
+                * fma_expansion_factor
+                * args.hidden_size
+                * args.padded_vocab_size
+                * (mtp_num_layers + 1)  # MTP + final logit
             )
         )
         return total_floating_point_operations
@@ -526,6 +561,7 @@ def num_floating_point_operations(args, batch_size):
             kv_channels=args.kv_channels,
             mlp_expansion=args.ffn_hidden_size / args.hidden_size,
             swiglu=args.swiglu,
+            moe_latent_size=args.moe_latent_size,
             moe_ffn_hidden_size=(args.moe_ffn_hidden_size if args.moe_ffn_hidden_size is not None
                                  else args.ffn_hidden_size),
             shared_expert_ffn_hidden_size=(0 if args.moe_shared_expert_intermediate_size is None
@@ -715,6 +751,16 @@ def pretrain(
 
     args = get_args()
     timers = get_timers()
+
+    if args.fine_grained_activation_offloading:
+        from megatron.core.pipeline_parallel.utils import (
+            set_ideal_affinity_for_current_gpu
+        )
+        set_ideal_affinity_for_current_gpu()
+
+    if args.batch_invariant_mode:
+        print_rank_0("Enabling batch invariant mode globally",flush=True)
+        enable_batch_invariant_mode()
 
     if args.log_progress:
         append_to_progress_log("Starting job")
@@ -983,10 +1029,12 @@ def update_train_iters(args):
     print_rank_0(f'setting training iterations to {args.train_iters}')
 
 
-def get_model(model_provider_func, model_type=ModelType.encoder_or_decoder, wrap_with_ddp=True):
+def get_model(model_provider_func, model_type=ModelType.encoder_or_decoder, wrap_with_ddp=True, config=None, pg_collection=None):
     """Build the model."""
     args = get_args()
     args.model_type = model_type
+    if pg_collection is None:
+        pg_collection = ProcessGroupCollection.use_mpu_process_groups()
 
     if has_nvidia_modelopt:
         from megatron.post_training.checkpointing import has_modelopt_state
@@ -1003,23 +1051,38 @@ def get_model(model_provider_func, model_type=ModelType.encoder_or_decoder, wrap
     # Build model.
     def build_model():
         if (
-            mpu.get_pipeline_model_parallel_world_size() > 1
+            get_pg_size(pg_collection.pp) > 1
             and args.virtual_pipeline_model_parallel_size is not None
         ):
             model = []
-            for i in range(args.virtual_pipeline_model_parallel_size):
+            vp_size = args.virtual_pipeline_model_parallel_size
+            for i in range(vp_size):
                 # Set pre_process and post_process only after virtual rank is set.
-                pre_process = mpu.is_pipeline_first_stage(ignore_virtual=False, vp_stage=i)
-                post_process = mpu.is_pipeline_last_stage(ignore_virtual=False, vp_stage=i)
+                pre_process = is_pp_first_stage(pg_collection.pp) and is_vp_first_stage(
+                    vp_stage=i, vp_size=vp_size
+                )
+                post_process = is_pp_last_stage(pg_collection.pp) and is_vp_last_stage(
+                    vp_stage=i, vp_size=vp_size
+                )
                 this_model = model_provider_func(
-                    pre_process=pre_process, post_process=post_process, vp_stage=i)
+                    pre_process=pre_process,
+                    post_process=post_process,
+                    vp_stage=i,
+                    config=config,
+                    pg_collection=pg_collection,
+                )
                 this_model.model_type = model_type
                 this_model.vp_stage = i
                 model.append(this_model)
         else:
-            pre_process = mpu.is_pipeline_first_stage()
-            post_process = mpu.is_pipeline_last_stage()
-            model = model_provider_func(pre_process=pre_process, post_process=post_process)
+            pre_process = is_pp_first_stage(pg_collection.pp)
+            post_process = is_pp_last_stage(pg_collection.pp)
+            model = model_provider_func(
+                pre_process=pre_process,
+                post_process=post_process,
+                config=config,
+                pg_collection=pg_collection,
+            )
             model.model_type = model_type
         return model
 
@@ -1044,12 +1107,12 @@ def get_model(model_provider_func, model_type=ModelType.encoder_or_decoder, wrap
     num_parameters = sum(
         [sum([p.nelement() for p in model_module.parameters()]) for model_module in model]
     )
-    if mpu.get_data_parallel_rank() == 0 and mpu.get_context_parallel_rank() == 0:
+    if get_pg_rank(pg_collection.dp) == 0 and get_pg_rank(pg_collection.cp) == 0:
         print(
             ' > number of parameters on (tensor, pipeline) '
             'model parallel rank ({}, {}): {}'.format(
-                mpu.get_tensor_model_parallel_rank(),
-                mpu.get_pipeline_model_parallel_rank(),
+                get_pg_rank(pg_collection.tp),
+                get_pg_rank(pg_collection.pp),
                 num_parameters,
             ),
             flush=True,
@@ -1232,17 +1295,9 @@ def get_megatron_optimizer_config(args: Any) -> OptimizerConfig:
     else:
         raise ValueError("Invalid optimizer type!")
 
-    # Construct the appropriate config_overrides object.
-    # TODO: add more logic here as needed down the road.
-    if args.decoupled_lr is not None:
-        decoupled_param_key = ParamKey(attr="is_embedding_or_output_parameter")
-        decoupled_optimizer_config = copy.deepcopy(config)
-        decoupled_optimizer_config.lr = args.decoupled_lr
-        if args.decoupled_min_lr is not None:
-            decoupled_optimizer_config.min_lr = args.decoupled_min_lr
-        config_overrides = {decoupled_param_key: decoupled_optimizer_config}
-    else:
-        config_overrides = None
+    # Construct the appropriate config_overrides object. This default handles many cases, but
+    #  can be added to as needed by the user, or replaced entirely with a custom override.
+    config_overrides = get_standard_config_overrides(config=config)
 
     return config, config_overrides
 
@@ -1257,34 +1312,38 @@ def setup_model_and_optimizer(
     timers = get_timers()
     one_logger = get_one_logger()
 
-    model = get_model(model_provider_func, model_type)
+    wrap_with_ddp = not args.skip_train
+    model = get_model(model_provider_func, model_type, wrap_with_ddp=wrap_with_ddp)
     unwrapped_model = unwrap_model(model)
 
     one_logger and one_logger.log_metrics({"app_build_optimzer_start_time": one_logger_utils.get_timestamp_in_ms()})
-    config, config_overrides = get_megatron_optimizer_config(args)
-    config.timers = timers
-
-    if 'muon' not in config.optimizer:
-        # If the user is asking for a non-zero embedding init std, skip weight decay for embeddings
-        # to avoid embeddings from shrinking to zero as recommended in https://arxiv.org/abs/2312.16903
-        # default_skip_embedding_weight_decay=args.embedding_init_method_std is not None,
-        optimizer = get_megatron_optimizer(
-            config,
-            model,
-            config_overrides=config_overrides,
-            use_gloo_process_groups=args.enable_gloo_process_groups,
-            dump_param_to_param_group_map=args.dump_param_to_param_group_map,
-        )
+    if args.skip_train:
+        optimizer, opt_param_scheduler = None, None
     else:
-        optimizer = get_megatron_muon_optimizer(
-            config,
-            model,
-            config_overrides=config_overrides,
-            use_gloo_process_groups=args.enable_gloo_process_groups,
-            layer_wise_distributed_optimizer='dist' in config.optimizer,
-        )
+        config, config_overrides = get_megatron_optimizer_config(args)
+        config.timers = timers
 
-    opt_param_scheduler = get_optimizer_param_scheduler(optimizer)
+        if 'muon' not in config.optimizer:
+            # If the user is asking for a non-zero embedding init std, skip weight decay for embeddings
+            # to avoid embeddings from shrinking to zero as recommended in https://arxiv.org/abs/2312.16903
+            # default_skip_embedding_weight_decay=args.embedding_init_method_std is not None,
+            optimizer = get_megatron_optimizer(
+                config,
+                model,
+                config_overrides=config_overrides,
+                use_gloo_process_groups=args.enable_gloo_process_groups,
+                dump_param_to_param_group_map=args.dump_param_to_param_group_map,
+            )
+        else:
+            optimizer = get_megatron_muon_optimizer(
+                config,
+                model,
+                config_overrides=config_overrides,
+                use_gloo_process_groups=args.enable_gloo_process_groups,
+                layer_wise_distributed_optimizer='dist' in config.optimizer,
+            )
+
+        opt_param_scheduler = get_optimizer_param_scheduler(optimizer)
     one_logger and one_logger.log_metrics({"app_build_optimzer_finish_time": one_logger_utils.get_timestamp_in_ms()})
 
     if args.moe_use_upcycling:
@@ -1415,6 +1474,12 @@ def train_step(forward_step_func, data_iterator, model, optimizer, opt_param_sch
 
     rerun_state_machine = get_rerun_state_machine()
     while rerun_state_machine.should_run_forward_backward(data_iterator):
+        # Offload optimizer states to CPU if enabled.
+        if args.offload_optimizer_states:
+            for optim_instance in optimizer.chained_optimizers:
+                if isinstance(optim_instance, DistributedOptimizer):
+                    optim_instance.offload_states()
+
         # Set grad to zero.
         for model_chunk in model:
             model_chunk.zero_grad_buffer()
@@ -1434,10 +1499,27 @@ def train_step(forward_step_func, data_iterator, model, optimizer, opt_param_sch
         # For the mxfp8_param with reuse_grad_buf_for_mxfp8_param_ag and dp_ag_overlap,
         # we need to call the _copy_main_params_to_param_buffer() after the grad buffer
         # is zeroed by zero_grad_buffer() because param and grad buffer are shared.
+        #
+        # However, we should skip this on the first iteration when forward_pre_hook is disabled,
+        # because:
+        # 1. The first iteration's params are already in param.data (from init or checkpoint).
+        # 2. Without forward_pre_hook, finish_param_sync() won't be called to zero the grad buffer,
+        #    so the main grads will be polluted by the main params.
         if args.reuse_grad_buf_for_mxfp8_param_ag and args.overlap_param_gather:
+            # Check if forward_pre_hook is enabled by checking if hooks are registered.
+            forward_pre_hook_enabled = len(model[0].remove_forward_pre_hook_handles) > 0
+            if forward_pre_hook_enabled:
+                for optim_instance in optimizer.chained_optimizers:
+                    if isinstance(optim_instance, DistributedOptimizer):
+                        optim_instance._copy_main_params_to_param_buffer()
+
+        # Release GPU memory for offloaded optimizer states.
+        # This needs to be done after _copy_main_params_to_param_buffer().
+        # Separate offload and release to allow early D2H transfer to overlap with other operations.
+        if args.offload_optimizer_states:
             for optim_instance in optimizer.chained_optimizers:
                 if isinstance(optim_instance, DistributedOptimizer):
-                    optim_instance._copy_main_params_to_param_buffer()
+                    optim_instance.release_offloaded_gpu_states()
 
         # Forward pass.
         losses_reduced = forward_backward_func(
@@ -1900,6 +1982,12 @@ def disable_forward_pre_hook(model_chunks, param_sync=True):
         model_chunk.disable_forward_pre_hook(param_sync=param_sync)
 
 
+def force_param_sync(model_chunks: list[DDP]) -> None:
+    for model_chunk in model_chunks:
+        assert isinstance(model_chunk, DDP)
+        model_chunk.start_param_sync(force_sync=True)
+
+
 def save_checkpoint_and_time(
     iteration,
     model,
@@ -1926,7 +2014,7 @@ def save_checkpoint_and_time(
     # Log E2E metrics before save-checkpoint
     one_logger_utils.track_e2e_metrics()
     if should_disable_forward_pre_hook(args):
-        disable_forward_pre_hook(model)
+        force_param_sync(model)
     save_checkpoint(
         iteration,
         model,
@@ -1943,8 +2031,6 @@ def save_checkpoint_and_time(
         # dequantized bf16 tensors that were temporarily created during fp8
         # model checkpoint saving.
         gc.collect()
-    if should_disable_forward_pre_hook(args):
-        enable_forward_pre_hook(model)
     timers(timer_key).stop(barrier=True)
     timers.log([timer_key])
 
@@ -2282,7 +2368,21 @@ def train(
         config.param_sync_func = [model_chunk.start_param_sync for model_chunk in model]
         if len(model) == 1:
             config.param_sync_func = config.param_sync_func[0]
-    config.finalize_model_grads_func = finalize_model_grads
+
+    # Wrap finalize_model_grads to reload offloaded optimizer states before grad finalization.
+    # This allows H2D transfer to overlap with grad all-reduce.
+    if args.offload_optimizer_states:
+
+        def finalize_model_grads_with_state_reload(*fmg_args, **fmg_kwargs):
+            # Reload offloaded states for all DistributedOptimizer instances
+            for optim_instance in optimizer.chained_optimizers:
+                if isinstance(optim_instance, DistributedOptimizer):
+                    optim_instance.reload_offloaded_states()
+            return finalize_model_grads(*fmg_args, **fmg_kwargs)
+
+        config.finalize_model_grads_func = finalize_model_grads_with_state_reload
+    else:
+        config.finalize_model_grads_func = finalize_model_grads
 
     if args.log_energy:
         energy_monitor.setup()
@@ -2549,6 +2649,20 @@ def train(
                         cuda_graph_helper.cuda_graph_set_manual_hooks()
 
         iteration += 1
+
+        # If requested, manually register FSDP communication buffers after a short warmup.
+        if (
+            getattr(args, "fsdp_manual_registration", False)
+            and getattr(args, "use_megatron_fsdp", False)
+            and iteration ==  start_iteration + 1
+        ):
+            for model_chunk in model:
+                if isinstance(model_chunk, megatron_FSDP) and getattr(
+                    model_chunk.ddp_config, "fsdp_manual_registration", False
+                ):
+                    pad_buf = getattr(model_chunk, "param_and_grad_buffer", None)
+                    if pad_buf is not None:
+                        pad_buf.manual_buffer_registration()
 
         if getattr(args, 'perform_rl_step', False) and args.rl_use_sequence_packing:
             iteration_sequences = rl_utils.get_iteration_sequence_count(args)
@@ -2983,11 +3097,15 @@ def get_train_valid_test_num_samples():
     if args.full_validation:
         eval_samples = None
     else:
-        eval_iters = (args.train_iters // args.eval_interval + 1) * args.eval_iters
+        if args.skip_train:
+            eval_iters = args.eval_iters
+        else:
+            assert args.train_iters is not None
+            eval_iters = (args.train_iters // args.eval_interval + 1) * args.eval_iters
         eval_samples = eval_iters * args.global_batch_size
-    test_iters = args.eval_iters
+    test_samples = args.eval_iters * args.global_batch_size
 
-    return (train_samples, eval_samples, test_iters * args.global_batch_size)
+    return (train_samples, eval_samples, test_samples)
 
 
 def build_train_valid_test_datasets(build_train_valid_test_datasets_provider, train_valid_test_num_samples=None, vp_stage=None):
@@ -3039,13 +3157,17 @@ def build_train_valid_test_data_loaders(build_train_valid_test_datasets_provider
             do_train = args.train_iters > 0
             do_valid = (args.full_validation or args.eval_iters > 0)
             do_test = (args.full_validation or args.eval_iters > 0)
+
         else:
+            # Build datasets.
             train_ds, valid_ds, test_ds = build_train_valid_test_datasets(
                 build_train_valid_test_datasets_provider,
                 vp_stage=vp_stage,
             )
             valid_ds = [valid_ds] if not isinstance(valid_ds, list) else valid_ds
-            if not args.skip_train:
+            if args.skip_train:
+                train_dataloader = None
+            else:
                 train_dataloader = build_pretraining_data_loader(train_ds, args.consumed_train_samples)
             valid_dataloaders = []
             for valid_d in valid_ds:
@@ -3060,7 +3182,7 @@ def build_train_valid_test_data_loaders(build_train_valid_test_datasets_provider
             if not args.multiple_validation_sets:
                 assert len(valid_dataloaders) == 1
             test_dataloader = build_pretraining_data_loader(test_ds, 0)
-            do_train = train_dataloader is not None and args.train_iters > 0
+            do_train = train_dataloader is not None and (args.skip_train or args.train_iters > 0)
             do_valid = valid_dataloaders is not None and (args.full_validation or args.eval_iters > 0)
             do_test = test_dataloader is not None and (args.full_validation or args.eval_iters > 0)
 

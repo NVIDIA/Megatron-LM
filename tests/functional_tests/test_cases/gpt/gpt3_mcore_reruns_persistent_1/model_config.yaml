@@ -57,7 +57,6 @@ MODEL_ARGS:
   --save-interval: 10000
   --eval-interval: 1000
   --ckpt-format: torch_dist
-  --dist-ckpt-save-pre-mcore-014: true
   --dist-ckpt-strictness: log_all # backward compatibility for TE changes
   --save: ${CHECKPOINT_SAVE_PATH}
   --load: ${CHECKPOINT_LOAD_PATH}
@@ -81,9 +80,9 @@ MODEL_ARGS:
   --error-injection-type: persistent_error
 AFTER_SCRIPT: |
   check_log() { if [[ -z $(grep -r $1 "$2" $LOG_DIR) ]]; then exit 1; else echo OK; fi }
-  check_log -F "WARNING:megatron.core.rerun_state_machine:Result validation enabled"
-  check_log -F "WARNING:megatron.core.rerun_state_machine:Injecting error type Persistent error"
-  check_log -F "WARNING:megatron.core.rerun_state_machine:First rerun: unexpected result is reproducible within the tolerance"
-  check_log -F "WARNING:megatron.core.rerun_state_machine:Saving a checkpoint and exiting now. Please resume the job from the checkpoint to rerun the last iteration and establish a diagnostic"
+  check_log -F "Result validation enabled"
+  check_log -F "Injecting error type Persistent error"
+  check_log -F "First rerun: unexpected result is reproducible within the tolerance"
+  check_log -F "Saving a checkpoint and exiting now. Please resume the job from the checkpoint to rerun the last iteration and establish a diagnostic"
   EXIT_CODE=0
 TEST_TYPE: regular

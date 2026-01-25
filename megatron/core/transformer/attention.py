@@ -1,5 +1,6 @@
 # Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
+import copy
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
 from typing import NoReturn, Optional, Tuple, Union
@@ -24,11 +25,10 @@ from megatron.core.parallel_state import (
     get_tensor_model_parallel_world_size,
 )
 from megatron.core.pipeline_parallel.fine_grained_activation_offload import (
-    fine_grained_offloading_group_commit,
-    fine_grained_offloading_group_start,
-    get_fine_grained_offloading_context,
+    FineGrainedActivationOffloadingInterface as off_interface,
 )
 from megatron.core.process_groups_config import ProcessGroupCollection
+from megatron.core.tensor_parallel.mappings import all_gather_last_dim_from_tensor_parallel_region
 from megatron.core.transformer.identity_op import IdentityOp
 from megatron.core.transformer.module import MegatronModule
 from megatron.core.transformer.spec_utils import ModuleSpec, build_module
@@ -66,7 +66,7 @@ except ImportError as e:
 
 if not HAVE_FA3:
     try:
-        from flash_attn_3.flash_attn_interface import _flash_attn_forward
+        from flashattn_hopper.flash_attn_interface import _flash_attn_forward
         from flashattn_hopper.flash_attn_interface import (
             flash_attn_with_kvcache as flash_attn3_with_kvcache,
         )
@@ -162,6 +162,7 @@ class Attention(MegatronModule, ABC):
 
         self.attn_mask_type = attn_mask_type
         self.attention_type = attention_type
+        self.batch_invariant_mode = config.batch_invariant_mode
 
         # For normal attention without groups, num_query_groups == num_attention_heads,
         # so these two will be the same
@@ -185,17 +186,39 @@ class Attention(MegatronModule, ABC):
         self.hidden_size_per_attention_head = divide(
             self.query_projection_size, self.config.num_attention_heads
         )
-        self.num_attention_heads_per_partition = divide(self.config.num_attention_heads, world_size)
-        self.num_query_groups_per_partition = divide(self.config.num_query_groups, world_size)
+        if self.config.num_query_groups < world_size:
+            # When num_kv_heads < tp_size, each TP rank (post AG) initially produces
+            # activations for 1 kv_head and (num_q_heads / num_kv_heads) q_heads.
+            # We then pull out the appropriate (num_q_heads / tp_size) q_heads.
+            self.num_query_groups_per_partition = 1
+            self.num_attention_heads_per_partition = divide(
+                self.config.num_attention_heads, self.config.num_query_groups
+            )
+        else:
+            # When num_kv_heads >= tp_size, each TP rank produces activations for
+            # (num_kv_heads / tp_size) kv_heads and (num_q_heads / tp_size) q_heads.
+            self.num_query_groups_per_partition = divide(self.config.num_query_groups, world_size)
+            self.num_attention_heads_per_partition = divide(
+                self.config.num_attention_heads, world_size
+            )
+        self.world_size = world_size
 
         # To support both CUDA Graphs and key value with different hidden size
         self.key_hidden_size = self.hidden_size_per_attention_head
         self.val_hidden_size = self.hidden_size_per_attention_head
 
         # TODO: This is built twice when using MLA, should be refactored.
+        if self.config.num_query_groups < world_size:
+            # TE throws an assertion error if num_kv_heads / num_query_groups
+            # is not divisible by TP size.
+            # TODO(rwaleffe/dnarayanan): Clean this up eventually.
+            tmp_config = copy.deepcopy(self.config)
+            tmp_config.num_query_groups = world_size
+        else:
+            tmp_config = self.config
         self.core_attention = build_module(
             submodules.core_attention,
-            config=self.config,
+            config=tmp_config,
             layer_number=self.layer_number,
             attn_mask_type=self.attn_mask_type,
             attention_type=self.attention_type,
@@ -628,11 +651,14 @@ class Attention(MegatronModule, ABC):
                     softcap=0.0,
                     rotary_interleaved=True,
                     scheduler_metadata=None,
-                    num_splits=0,
+                    num_splits=0 if not self.batch_invariant_mode else 1,
                     pack_gqa=None,
                     sm_margin=0,
                 )
             else:
+                assert (
+                    self.batch_invariant_mode is False
+                ), "Batch invariant mode is not supported for flash attention 2"
                 output_total = flash_attn_varlen_func(
                     q,
                     k,
@@ -683,10 +709,14 @@ class Attention(MegatronModule, ABC):
                     "cache_seqlens": seqlens_k,
                     "causal": True,
                     "page_table" if HAVE_FA3 else "block_table": block_table,
+                    "num_splits": 0 if not self.batch_invariant_mode else 1,
                 }
                 if HAVE_FA3:
                     output_total = flash_attn3_with_kvcache(**flash_attn_args)
                 else:
+                    assert (
+                        not self.batch_invariant_mode
+                    ), "Batch invariant mode is not supported for flash attention 2"
                     output_total = flash_attn_with_kvcache(**flash_attn_args)
         return output_total
 
@@ -798,14 +828,13 @@ class Attention(MegatronModule, ABC):
         if output_gate:
             assert split_qkv, "output_gate is not supported for unsplit mixed_qkv tensor."
 
-        if self.offload_qkv_linear:
-            hidden_states = fine_grained_offloading_group_start(hidden_states, name="qkv_linear")
-        with get_fine_grained_offloading_context(self.offload_qkv_linear):
+        with off_interface(self.offload_qkv_linear, hidden_states, "qkv_linear") as hidden_states:
             qkv_output = self.get_query_key_value_tensors(
                 hidden_states, key_value_states, output_gate=output_gate, split_qkv=split_qkv
             )
         if self.offload_qkv_linear:
-            (qkv_output,) = fine_grained_offloading_group_commit(
+            # `qkv_output` may be a tuple; commit supports tuple/list and will keep structure.
+            qkv_output = off_interface.group_commit(
                 qkv_output, name="qkv_linear", forced_released_tensors=[]
             )
 
@@ -957,11 +986,11 @@ class Attention(MegatronModule, ABC):
                 packed_seq_params=packed_seq_params,
             )
         else:
-            if self.offload_core_attention and self.training:
-                query = fine_grained_offloading_group_start(query, name="core_attn")
             if inference_context is None or inference_context.is_static_batching():
                 # Static batching attention kernel.
-                with get_fine_grained_offloading_context(self.offload_core_attention):
+                with off_interface(
+                    self.offload_core_attention and self.training, query, "core_attn"
+                ) as query:
                     core_attn_out = self.core_attention(
                         query,
                         key,
@@ -991,7 +1020,7 @@ class Attention(MegatronModule, ABC):
                 )
                 core_attn_out = rearrange(core_attn_out, 's b h d -> s b (h d)')
             if self.offload_core_attention and self.training:
-                (core_attn_out,) = fine_grained_offloading_group_commit(
+                core_attn_out = off_interface.group_commit(
                     core_attn_out, name="core_attn", forced_released_tensors=[query, key, value]
                 )
 
@@ -1014,13 +1043,11 @@ class Attention(MegatronModule, ABC):
         # =================
 
         nvtx_range_push(suffix="linear_proj")
-        if self.offload_attn_proj:
-            core_attn_out = fine_grained_offloading_group_start(core_attn_out, name="attn_proj")
-        with get_fine_grained_offloading_context(self.offload_attn_proj):
+        with off_interface(self.offload_attn_proj, core_attn_out, "attn_proj") as core_attn_out:
             output, bias = self.linear_proj(core_attn_out)
         if self.offload_attn_proj:
-            output, bias = fine_grained_offloading_group_commit(
-                output, bias, name="attn_proj", forced_released_tensors=[core_attn_out]
+            output = off_interface.group_commit(
+                output, name="attn_proj", forced_released_tensors=[core_attn_out]
             )
         nvtx_range_pop(suffix="linear_proj")
 
@@ -1201,6 +1228,27 @@ class SelfAttention(Attention):
 
         # If no output gate: [sq, b, hp] --> [sq, b, ng, (np/ng + 2) * hn]
         # If have output gate: [sq, b, hp] --> [sq, b, ng, (2 * np/ng + 2) * hn]
+        if self.config.num_query_groups < self.world_size:
+            # Note that weights are interleaved in the following manner:
+            # q1 q2 k1 v1 | q3 q4 k2 v2 | q5 q6 k3 v3 | ...
+            # When tp_size > num_kv_heads, we split "q1 q2 k1 v1" over multiple
+            # ranks, so a rank does not have a clean partitioning of just the q_heads
+            # it needs. Instead, we perform the following steps:
+            # 1. Assemble the full "q1 q2 k1 v1 | q3 q4 k2 v2 | q5 q6 k3 v3 | ..."
+            #    through an AG.
+            # 2. Pull out the right slice (e.g., "q1 q2 k1 v1" or "q3 q4 k2 v2").
+            # 3. Split q_heads (e.g., q1, q2), k_heads (e.g., k1), v_heads (e.g., v1).
+            # 4. Further index into query to get only the q_heads that this rank is
+            #    responsible for (e.g., q1).
+            # The block of code below performs steps 1 and 2.
+            mixed_qkv = all_gather_last_dim_from_tensor_parallel_region(mixed_qkv)
+            idx = get_tensor_model_parallel_rank() // (
+                self.world_size // self.config.num_query_groups
+            )
+            size = mixed_qkv.size()[-1] // self.config.num_query_groups
+            mixed_qkv = mixed_qkv[:, :, idx * size : (idx + 1) * size]
+
+        # [sq, b, hp] --> [sq, b, ng, (np/ng + 2) * hn]
         new_tensor_shape = mixed_qkv.size()[:-1] + (
             self.num_query_groups_per_partition,
             num_qkv_heads_per_group * self.hidden_size_per_attention_head,
@@ -1245,6 +1293,18 @@ class SelfAttention(Attention):
 
         # Query [sq, b, ng, np/ng * hn] -> [sq, b, np, hn]
         query = query.reshape(query.size(0), query.size(1), -1, self.hidden_size_per_attention_head)
+
+        if self.config.num_query_groups < self.world_size:
+            # query above corresponds to (num_q_heads / num_kv_heads) q_heads.
+            # Index appropriately into query to get (num_q_heads / tp_size) q_heads.
+            # This is step 4 in the list of steps above.
+            idx = get_tensor_model_parallel_rank() % (
+                self.world_size // self.config.num_query_groups
+            )
+            size = self.num_attention_heads_per_partition // (
+                self.world_size // self.config.num_query_groups
+            )
+            query = query[:, :, idx * size : (idx + 1) * size, :]
 
         if self.q_layernorm is not None:
             query = self.q_layernorm(query)

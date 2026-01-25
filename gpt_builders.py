@@ -10,7 +10,8 @@ from megatron.core.models.gpt.gpt_layer_specs import (
     get_gpt_decoder_layer_specs,
 )
 from megatron.core.models.gpt.experimental_attention_variant_module_specs import (
-    is_linear_attention_variant,
+    get_transformer_block_with_experimental_attention_variant_spec,
+    get_transformer_layer_with_experimental_attention_variant_spec,
 )
 from megatron.core.models.gpt.heterogeneous.heterogeneous_layer_specs import (
     get_gpt_heterogeneous_layer_spec,
@@ -25,7 +26,7 @@ import megatron.legacy.model  # isort: skip
 # NOTE: Loading `megatron.legacy.model` earlier fails due to circular import
 
 
-def gpt_builder(args, pre_process, post_process, vp_stage=None, config=None):
+def gpt_builder(args, pre_process, post_process, vp_stage=None, config=None, pg_collection=None):
     print_rank_0('building GPT model ...')
     if config is None:
         if args.yaml_cfg is not None:
@@ -46,7 +47,13 @@ def gpt_builder(args, pre_process, post_process, vp_stage=None, config=None):
         else:
             use_te = args.transformer_impl == "transformer_engine"
 
-            if args.num_experts or is_linear_attention_variant(args.experimental_attention_variant):
+            if args.experimental_attention_variant is not None:
+                transformer_layer_spec = (
+                    get_transformer_block_with_experimental_attention_variant_spec(
+                        config=config, vp_stage=vp_stage
+                    )
+                )
+            elif args.num_experts:
                 assert not (config.transformer_impl == "inference_optimized")
                 # Define the decoder block spec
                 transformer_layer_spec = get_gpt_decoder_block_spec(
@@ -70,9 +77,19 @@ def gpt_builder(args, pre_process, post_process, vp_stage=None, config=None):
                 mtp_transformer_layer_spec = import_module(args.spec)
             else:
                 # Define the decoder block spec
-                decoder_layer_specs = get_gpt_decoder_layer_specs(
-                    config, use_transformer_engine=use_te, normalization=args.normalization, qk_l2_norm=args.qk_l2_norm, vp_stage=vp_stage
-                )
+                if args.experimental_attention_variant is not None:
+                    decoder_layer_specs = (
+                        get_transformer_layer_with_experimental_attention_variant_spec(
+                            config=config
+                        )
+                    )
+                else:
+                    decoder_layer_specs = get_gpt_decoder_layer_specs(
+                        config,
+                        use_transformer_engine=use_te,
+                        normalization=args.normalization,
+                        qk_l2_norm=args.qk_l2_norm,
+                    )
                 mtp_transformer_layer_spec = decoder_layer_specs[-1]
             # Use spec of the last layer in decoder block as spec of the transformer layer in MTP
             mtp_block_spec = get_gpt_mtp_block_spec(
@@ -98,6 +115,7 @@ def gpt_builder(args, pre_process, post_process, vp_stage=None, config=None):
             rope_scaling=args.use_rope_scaling,
             mtp_block_spec=mtp_block_spec,
             vp_stage=vp_stage,
+            pg_collection=pg_collection,
         )
 
     return model
@@ -125,6 +143,8 @@ def _get_transformer_layer_spec(use_te, config):
             moe_use_legacy_grouped_gemm=args.moe_use_legacy_grouped_gemm,
             qk_l2_norm=args.qk_l2_norm,
             use_kitchen=config.use_kitchen,
+            use_kitchen_attention=config.use_kitchen_attention,
+            kitchen_attention_backend=config.kitchen_attention_backend,
             fallback_to_eager_attn=config.fallback_to_eager_attn,
         )
     elif config.transformer_impl == "inference_optimized":
@@ -143,4 +163,6 @@ def _get_transformer_layer_spec(use_te, config):
             moe_use_legacy_grouped_gemm=args.moe_use_legacy_grouped_gemm,
             normalization=args.normalization,
             use_kitchen=config.use_kitchen,
+            use_kitchen_attention=config.use_kitchen_attention,
+            kitchen_attention_backend=config.kitchen_attention_backend,
         )

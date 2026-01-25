@@ -175,7 +175,7 @@ class GPTDataset(MegatronDataset):
         """Abstract method implementation
 
         Args:
-            idx (Optioal[int]): The index into the dataset
+            idx (Optional[int]): The index into the dataset
 
         Returns:
             Dict[str, torch.Tensor]: The sample information wrapped in a dictionary
@@ -742,7 +742,7 @@ class MockGPTLowLevelDataset:
         return sample
 
     def get(self, idx: int, offset: int = 0, length: Optional[int] = None) -> numpy.ndarray:
-        """This function is n abstraction over __getitem__ with support for slicing
+        """This function is an abstraction over __getitem__ with support for slicing
 
         Args:
             idx (int): The index into the dataset
@@ -763,7 +763,7 @@ class MockGPTDataset(GPTDataset):
     """The mock GPT dataset
 
     Args:
-        indexed_dataset (MockGPTLowLevelDataset): The MockGPTLowLevelDataset around which to build
+        dataset (MockGPTLowLevelDataset): The MockGPTLowLevelDataset around which to build
             the MockGPTDataset
 
         dataset_path (Optional[str]): This argument is of no consequence for the MockGPTDataset
