@@ -69,6 +69,7 @@ from megatron.core.pipeline_parallel.utils import (
     is_vp_last_stage,
 )
 from megatron.core.optimizer import get_standard_config_overrides
+from megatron.training.arguments import parse_args
 from megatron.training.checkpointing import load_checkpoint
 from megatron.training.checkpointing import save_checkpoint
 from megatron.training.checkpointing import checkpoint_exists
