@@ -26,24 +26,38 @@ jobs:
         if: startsWith(github.ref, 'refs/heads/pull-request/')
         uses: nv-gha-runners/get-pr-info@main
 
-      - name: Check for complexity:low label
-        id: check-label
+      - name: Check for complexity:low label and core paths
+        id: check-conditions
         env:
+          GH_TOKEN: ${{ secrets.PAT }}
           PR_INFO: ${{ steps.get-pr-info.outputs.pr-info }}
+          PR_NUMBER: ${{ fromJSON(steps.get-pr-info.outputs.pr-info || '{}').number }}
         run: |
+          # Check for complexity:low label
           if echo "$PR_INFO" | jq -e '.labels[]? | select(.name == "complexity: low")' > /dev/null 2>&1; then
             echo "is_low_complexity=true" >> $GITHUB_OUTPUT
           else
             echo "is_low_complexity=false" >> $GITHUB_OUTPUT
           fi
 
+          # Check if any changed files are in megatron/core or megatron/training
+          CHANGED_FILES=$(gh api repos/${{ github.repository }}/pulls/$PR_NUMBER/files --jq '.[].filename')
+          if echo "$CHANGED_FILES" | grep -qE '^megatron/(core|training)/'; then
+            echo "has_core_changes=true" >> $GITHUB_OUTPUT
+            echo "PR has changes in megatron/core or megatron/training"
+          else
+            echo "has_core_changes=false" >> $GITHUB_OUTPUT
+            echo "PR does not have changes in megatron/core or megatron/training"
+          fi
+
       - name: Request reviews from required teams
+        if: steps.check-conditions.outputs.has_core_changes == 'true'
         env:
           GH_TOKEN: ${{ secrets.PAT }}
           PR_NUMBER: ${{ fromJSON(steps.get-pr-info.outputs.pr-info || '{}').number }}
-          IS_LOW_COMPLEXITY: ${{ steps.check-label.outputs.is_low_complexity }}
+          IS_LOW_COMPLEXITY: ${{ steps.check-conditions.outputs.is_low_complexity }}
         run: |
-          # Always request core-nemo
+          # Request core-nemo for core changes
           gh api repos/${{ github.repository }}/pulls/$PR_NUMBER/requested_reviewers \
             --method POST -f team_reviewers[]="core-nemo" 2>/dev/null || true
 
@@ -53,7 +67,8 @@ jobs:
               --method POST -f team_reviewers[]="core-adlr" 2>/dev/null || true
           fi
 
-      - name: Check core-nemo approval (always required)
+      - name: Check core-nemo approval (required for core changes)
+        if: steps.check-conditions.outputs.has_core_changes == 'true'
         env:
           GH_TOKEN: ${{ secrets.PAT }}
           PR_NUMBER: ${{ fromJSON(steps.get-pr-info.outputs.pr-info || '{}').number }}
@@ -80,8 +95,8 @@ jobs:
           echo "❌ Missing approval from @NVIDIA/core-nemo"
           exit 1
 
-      - name: Check core-adlr approval (required unless complexity:low)
-        if: steps.check-label.outputs.is_low_complexity != 'true'
+      - name: Check core-adlr approval (required for core changes unless complexity:low)
+        if: steps.check-conditions.outputs.has_core_changes == 'true' && steps.check-conditions.outputs.is_low_complexity != 'true'
         env:
           GH_TOKEN: ${{ secrets.PAT }}
           PR_NUMBER: ${{ fromJSON(steps.get-pr-info.outputs.pr-info || '{}').number }}
