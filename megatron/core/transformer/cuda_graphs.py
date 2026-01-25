@@ -1900,7 +1900,7 @@ class TECudaGraphHelper:
                 kwargs['fp8_enabled'] = False
 
             from megatron.core.pipeline_parallel.fine_grained_activation_offload import (
-                FineGrainedActivationOffloadingInterface as off_interface
+                FineGrainedActivationOffloadingInterface as off_interface,
             )
 
             # if self.config.offload_module_in_cuda_graph:
@@ -1942,7 +1942,7 @@ class TECudaGraphHelper:
 
         from megatron.core.distributed.finalize_model_grads import reset_model_temporary_tensors
         from megatron.core.pipeline_parallel.fine_grained_activation_offload import (
-            FineGrainedActivationOffloadingInterface as off_interface
+            FineGrainedActivationOffloadingInterface as off_interface,
         )
         from megatron.core.transformer.moe.moe_utils import clear_aux_losses_tracker
 

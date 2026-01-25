@@ -873,6 +873,9 @@ class TransformerConfig(ModelParallelConfig):
     delta_offload_bytes_across_pp_ranks: int = 0
     """Difference of offload bytes across PP ranks to balance the offload load."""
 
+    activation_offload_fraction: float = 1.0
+    """The fraction of the activation to be offloaded, which should be in range [0, 1]."""
+
     def __post_init__(self):
         """Python dataclass method that is used to modify attributes after initialization.
         See https://docs.python.org/3/library/dataclasses.html#post-init-processing for more

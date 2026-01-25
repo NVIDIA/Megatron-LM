@@ -1137,6 +1137,7 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
             from megatron.core.pipeline_parallel.fine_grained_activation_offload import (
                 FineGrainedActivationOffloadingInterface as off_interface,
             )
+
             TransformerLayer.cuda_graph_stream = off_interface.cuda_graph_stream()
             TransformerLayer.cuda_graph_event = off_interface.cuda_graph_event()
         else:

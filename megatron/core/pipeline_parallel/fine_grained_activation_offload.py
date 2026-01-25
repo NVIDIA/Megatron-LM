@@ -438,7 +438,8 @@ class PipelineOffloadManager:
         self.reset()
 
         self._saved_tensors_hooks = saved_tensors_hooks(
-            self.on_save_for_backward, self.on_get_saved_tensor)
+            self.on_save_for_backward, self.on_get_saved_tensor
+        )
 
     @property
     def d2h_stream(self):
@@ -449,12 +450,12 @@ class PipelineOffloadManager:
     def h2d_stream(self):
         """Get the host-to-device (CPU to GPU) transfer stream."""
         return self._h2d_stream
-    
+
     @property
     def cuda_graph_stream(self):
         """Get the CUDA graph stream."""
         return self._cuda_graph_stream
-    
+
     @property
     def cuda_graph_event(self):
         """Get the CUDA graph event."""
@@ -567,6 +568,7 @@ class PipelineOffloadManager:
             else:
                 break
         assert self._offload_margin == 0, "Offload margin is not 0"
+        # Disable the groups to meet the delta offload bytes across PP ranks.
         keep_on_gpu_bytes = self._pp_rank * self._delta_offload_bytes_across_pp_ranks
         for chunk in self._cached_chunks_backward:
             for group in chunk.offload_groups:
@@ -577,11 +579,27 @@ class PipelineOffloadManager:
                     )
                     keep_on_gpu_bytes -= group.total_offload_bytes
                     group.offload = False
+        # Disable the groups to meet the activation offload fraction.
+        for chunk in self._cached_chunks_backward:
+            offloaded_groups_count = 0
+            for group in chunk.offload_groups:
+                if group.offload:
+                    offloaded_groups_count += 1
+            disabled_groups_count = offloaded_groups_count * (1 - self._activation_offload_fraction)
+            debug_rank(f"Disabled {disabled_groups_count}/{offloaded_groups_count} groups")
+            for group in reversed(chunk.offload_groups):
+                if group.offload:
+                    if disabled_groups_count > 0:
+                        disabled_groups_count -= 1
+                        group.offload = False
+                    else:
+                        break
         # Dump the offload information
         total_tensor_count = {}
         total_offload_bytes = {}
         for chunk in self._cached_chunks_forward:
             for group in chunk.offload_groups:
+                debug_rank(f"chunk {chunk} group {group} offload {group.offload}")
                 if group.offload:
                     if group._name not in total_tensor_count:
                         total_tensor_count[group._name] = 0
@@ -593,6 +611,8 @@ class PipelineOffloadManager:
             # where the memory cost will not increase anymore.
             if chunk is self._cached_chunks_backward[0]:
                 break
+        debug_rank(f"total_tensor_count {total_tensor_count}")
+        debug_rank(f"total_offload_bytes {total_offload_bytes}")
         # Cache summary for downstream consumers (e.g., unit tests).
         self._offload_summary_bytes = dict(total_offload_bytes)
         self._offload_summary_total_bytes = int(sum(total_offload_bytes.values()))
@@ -639,6 +659,7 @@ class PipelineOffloadManager:
         vp_stage,
         min_offloaded_tensor_size=1024 * 1024,
         delta_offload_bytes_across_pp_ranks=0,
+        activation_offload_fraction: float = 1.0,
     ):
         """
         Initialize a chunk offload handler for a model chunk (microbatch).
@@ -661,6 +682,7 @@ class PipelineOffloadManager:
 
         self._delta_offload_bytes_across_pp_ranks = delta_offload_bytes_across_pp_ranks
         self._pp_rank = pp_rank
+        self._activation_offload_fraction = activation_offload_fraction
 
         if vp_stage is None:
             cur_vpp_rank = 0
@@ -723,7 +745,6 @@ class PipelineOffloadManager:
         self.inside_context = True
         self._saved_tensors_hooks.__enter__()
 
-
     def __exit__(self, *args: Any):
         """Exit context manager and restore original tensor saving behavior."""
         debug_rank("----__exit__")
@@ -768,6 +789,7 @@ class ChunkOffloadHandler:
         debug_rank("--------offload")
 
         from transformer_engine.pytorch.tensor.mxfp8_tensor import MXFP8Tensor
+
         is_mxfp8_tensor = isinstance(src_tensor, MXFP8Tensor)
         if is_mxfp8_tensor:
             mxfp8_tensor = src_tensor
@@ -842,11 +864,12 @@ class ChunkOffloadHandler:
         self._tensor_count_current_group = 0
         self._reloading_group = []
         self.mxfp8_tensors = []
-    def find_group_with_name(self, groups: list[OffloadTensorGroup], name: str, start_index: int = 0):
+
+    def find_group_with_name(
+        self, groups: list[OffloadTensorGroup], name: str, start_index: int = 0
+    ):
         """Find the group with the given name starting from the given index."""
-        return next(
-            (group for group in groups[start_index:] if group._name == name), None
-        )
+        return next((group for group in groups[start_index:] if group._name == name), None)
 
     def is_empty_chunk(self, name=None):
         """Check if this chunk has no tensors to manage."""
@@ -869,7 +892,10 @@ class ChunkOffloadHandler:
         ):
             return True
         assert name is not None, "Name is required"
-        return self.find_group_with_name(self.offload_groups, name, self._offloaded_group_index) is None
+        return (
+            self.find_group_with_name(self.offload_groups, name, self._offloaded_group_index)
+            is None
+        )
 
     def find_next_group(self, name=None):
         """Find the next group with the given name."""
@@ -911,8 +937,9 @@ class ChunkOffloadHandler:
         if tensor.numel() < self.min_offloaded_tensor_size:
             return False
         # Respect tensor's offload preference if specified
-        if getattr(tensor, "_TE_do_not_offload", False) \
-            or getattr(tensor, "_do_not_offload", False):
+        if getattr(tensor, "_TE_do_not_offload", False) or getattr(
+            tensor, "_do_not_offload", False
+        ):
             return False
         return True
 
@@ -1002,8 +1029,9 @@ class ChunkOffloadHandler:
         debug_rank("----bulk_offload")
         if self.should_bulk_offload(name):
             group_to_offload = self.find_group_with_name(self._groups_to_offload, name)
-            assert group_to_offload is not None, \
-                f"Group {name} not found in {self._groups_to_offload}"
+            assert (
+                group_to_offload is not None
+            ), f"Group {name} not found in {self._groups_to_offload}"
             self._groups_to_reload.append(group_to_offload)
             self.bulk_offload_group(group_to_offload)
             self._groups_to_offload.remove(group_to_offload)
@@ -1251,17 +1279,29 @@ class FineGrainedActivationOffloadingInterface:
     def cuda_graph_stream():
         """Get the CUDA graph stream."""
         return PipelineOffloadManager.get_instance().cuda_graph_stream
-    
+
     @staticmethod
     def cuda_graph_event():
         """Get the CUDA graph event."""
         return PipelineOffloadManager.get_instance().cuda_graph_event
 
     @staticmethod
-    def init_chunk_handler(pp_rank, vp_size, vp_stage, min_offloaded_tensor_size, delta_offload_bytes_across_pp_ranks):
+    def init_chunk_handler(
+        pp_rank,
+        vp_size,
+        vp_stage,
+        min_offloaded_tensor_size,
+        delta_offload_bytes_across_pp_ranks,
+        activation_offload_fraction,
+    ):
         """Initialize the chunk handler, called at the start of a microbatch forward pass."""
         PipelineOffloadManager.get_instance().init_model_chunk_offload_handler(
-            pp_rank, vp_size, vp_stage, min_offloaded_tensor_size, delta_offload_bytes_across_pp_ranks
+            pp_rank,
+            vp_size,
+            vp_stage,
+            min_offloaded_tensor_size,
+            delta_offload_bytes_across_pp_ranks,
+            activation_offload_fraction,
         )
 
     @staticmethod
@@ -1307,7 +1347,7 @@ class FineGrainedActivationOffloadingInterface:
     def flush_delayed_groups():
         """Flush the delayed groups."""
         PipelineOffloadManager.get_instance().flush_delayed_groups()
-    
+
     @staticmethod
     def disable_offload():
         """Disable the offload."""

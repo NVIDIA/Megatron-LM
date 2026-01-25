@@ -437,6 +437,7 @@ class GPTModel(LanguageModule):
             vp_stage=self.vp_stage,
             min_offloaded_tensor_size=self.config.min_offloaded_tensor_size,
             delta_offload_bytes_across_pp_ranks=self.config.delta_offload_bytes_across_pp_ranks,
+            activation_offload_fraction=self.config.activation_offload_fraction,
         )
         if self.disable_param_offloading:
             for param in self.decoder.parameters():

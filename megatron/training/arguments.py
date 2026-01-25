@@ -2442,6 +2442,8 @@ def _add_training_args(parser):
                        help='Delay the offload until the CUDA graph is executed for minimal CPU overhead.')
     group.add_argument('--delta-offload-bytes-across-pp-ranks', type=int, default=0,
                        help='Difference of offload bytes across PP ranks to balance the offload load.')
+    group.add_argument('--activation-offload-fraction', type=float, default=1.0,
+                       help='The fraction of the activation to be offloaded for each module, which should be in range [0, 1].')
     group.add_argument('--disable-jit-fuser', action='store_true',
                        help='Disable the JIT fuser.')
     group.add_argument('--batch-invariant-mode', action='store_true',
