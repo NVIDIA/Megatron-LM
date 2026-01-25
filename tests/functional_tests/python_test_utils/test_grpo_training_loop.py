@@ -3,7 +3,7 @@
 import json
 import logging
 from statistics import median
-from typing import Dict, List, Tuple, Any
+from typing import Any, Dict, List, Tuple
 
 import yaml
 
@@ -37,32 +37,30 @@ def validate_with_tolerance(
 ) -> Tuple[bool, List[str]]:
     """
     Validate that current values are within tolerance of golden values.
-    
+
     Args:
         golden_values: Dict mapping step -> expected value
         current_values: Dict mapping step -> actual value
         relative_tolerance: Maximum allowed relative difference (e.g., 0.01 for 1%)
         absolute_tolerance: Tolerance for values near zero
         metric_name: Name of metric for error messages
-        
+
     Returns:
         Tuple of (passed: bool, mismatches: List[str])
     """
     mismatches = []
-    
+
     for step, golden_val in golden_values.items():
         if step not in current_values:
             mismatches.append(f"Step {step}: missing in current run")
             continue
-            
+
         current_val = current_values[step]
-        
+
         # Handle the case where golden value is zero or near-zero
         if golden_val == 0 or abs(golden_val) < absolute_tolerance:
             if abs(current_val) > absolute_tolerance:
-                mismatches.append(
-                    f"Step {step}: expected ~0, got {current_val}"
-                )
+                mismatches.append(f"Step {step}: expected ~0, got {current_val}")
         else:
             # Calculate relative difference
             rel_diff = abs(current_val - golden_val) / abs(golden_val)
@@ -71,12 +69,12 @@ def validate_with_tolerance(
                     f"Step {step}: {current_val} differs from golden {golden_val} "
                     f"by {rel_diff:.4%} (tolerance: {relative_tolerance:.2%})"
                 )
-    
+
     # Check for extra steps in current that aren't in golden
     extra_steps = set(current_values.keys()) - set(golden_values.keys())
     if extra_steps:
         logger.info(f"{metric_name}: Ignoring extra steps in current run: {extra_steps}")
-    
+
     return len(mismatches) == 0, mismatches
 
 
@@ -134,9 +132,7 @@ def test_grpo_training_loop(
 
         lower_bound = (1 - ITERATION_TIME_RELATIVE_TOLERANCE) * iteration_time_golden
         upper_bound = (1 + ITERATION_TIME_RELATIVE_TOLERANCE) * iteration_time_golden
-        assert (
-            lower_bound <= iteration_time_sampled <= upper_bound
-        ), (
+        assert lower_bound <= iteration_time_sampled <= upper_bound, (
             f"Iteration time {iteration_time_sampled} ms not within "
             f"{ITERATION_TIME_RELATIVE_TOLERANCE:.0%} of golden value ~{iteration_time_golden} ms. "
             f"Sampled: {output_current['iteration-time']} ms. "
@@ -178,15 +174,15 @@ def test_grpo_training_loop(
         # Use max instead of median - we care about worst-case memory usage
         # Skip first step (warmup) which may have different memory characteristics
         current_values = [l for l in output_current["mem-allocated-bytes"]['values'].values()][1:]
-        golden_values = [l for l in output_groundtruth["mem-allocated-bytes"]['values'].values()][1:]
-        
+        golden_values = [l for l in output_groundtruth["mem-allocated-bytes"]['values'].values()][
+            1:
+        ]
+
         mem_allocated_bytes_sampled = max(current_values)
         mem_allocated_bytes_golden = max(golden_values)
 
         upper_bound = (1 + MEM_ALLOCATED_BYTES_RELATIVE_TOLERANCE) * mem_allocated_bytes_golden
-        assert (
-            mem_allocated_bytes_sampled <= upper_bound
-        ), (
+        assert mem_allocated_bytes_sampled <= upper_bound, (
             f"Max mem allocated bytes {mem_allocated_bytes_sampled} bytes exceeds "
             f"{MEM_ALLOCATED_BYTES_RELATIVE_TOLERANCE:.0%} above golden max {mem_allocated_bytes_golden} bytes. "
             f"Upper bound: {upper_bound} bytes. "
@@ -199,16 +195,20 @@ def test_grpo_training_loop(
 
         # Use max - we care that peak memory doesn't exceed the golden peak
         # Skip first step (warmup) which may have different memory characteristics
-        current_values = [l for l in output_current["mem-max-allocated-bytes"]['values'].values()][1:]
-        golden_values = [l for l in output_groundtruth["mem-max-allocated-bytes"]['values'].values()][1:]
-        
+        current_values = [l for l in output_current["mem-max-allocated-bytes"]['values'].values()][
+            1:
+        ]
+        golden_values = [
+            l for l in output_groundtruth["mem-max-allocated-bytes"]['values'].values()
+        ][1:]
+
         mem_max_allocated_bytes_sampled = max(current_values)
         mem_max_allocated_bytes_golden = max(golden_values)
 
-        upper_bound = (1 + MEM_MAX_ALLOCATED_BYTES_RELATIVE_TOLERANCE) * mem_max_allocated_bytes_golden
-        assert (
-            mem_max_allocated_bytes_sampled <= upper_bound
-        ), (
+        upper_bound = (
+            1 + MEM_MAX_ALLOCATED_BYTES_RELATIVE_TOLERANCE
+        ) * mem_max_allocated_bytes_golden
+        assert mem_max_allocated_bytes_sampled <= upper_bound, (
             f"Max mem-max-allocated bytes {mem_max_allocated_bytes_sampled} bytes exceeds "
             f"{MEM_MAX_ALLOCATED_BYTES_RELATIVE_TOLERANCE:.0%} above golden max {mem_max_allocated_bytes_golden} bytes. "
             f"Upper bound: {upper_bound} bytes. "

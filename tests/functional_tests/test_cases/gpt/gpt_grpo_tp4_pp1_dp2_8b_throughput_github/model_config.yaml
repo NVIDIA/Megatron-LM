@@ -98,8 +98,6 @@ MODEL_ARGS:
 METRICS:
   - "mem-allocated-bytes"
   - "mem-max-allocated-bytes"
-  - "lm-loss"
-  - "num-zeros"
   - "iteration-time"
 THROUGHPUT_TEST_PARAMS:
   --start_step: 10
