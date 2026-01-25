@@ -2597,6 +2597,10 @@ def _add_checkpointing_args(parser):
                        help='Output directory to save checkpoints to.')
     group.add_argument('--save-interval', '--persistent-save-interval', type=int, default=None,
                        help='Number of iterations between persistent checkpoint saves.')
+    group.add_argument('--save-wgrads-interval', type=int, default=None,
+                       help='Number of iterations between wgrad (main_grad) saves.')
+    group.add_argument('--save-dgrads-interval', type=int, default=None,
+                       help='Number of iterations between dgrad saves.')
     group.add_argument('--save-retain-interval', type=int, default=None,
                        help='Number of iterations between retained checkpoints (other'
                        'checkpoints _except the last checkpoint_ are automatically deleted).')
