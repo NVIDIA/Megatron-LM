@@ -370,6 +370,10 @@ class TestMultiTokenPrediction:
             args.save = ckpt_path
             args.load = ckpt_path
 
+        # Ensure all ranks finished forward/backward before checkpointing
+        torch.cuda.synchronize()
+        torch.distributed.barrier()
+
         with TempNamedDir(
             tmp_path_dist_ckpt / 'test_mtp_model_reconfiguration_model_A'
         ) as ckpt_dir_A:
