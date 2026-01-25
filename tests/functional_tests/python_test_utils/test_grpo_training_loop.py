@@ -21,7 +21,7 @@ LM_LOSS_RELATIVE_TOLERANCE = 0.01  # 1% relative tolerance
 LM_LOSS_ABSOLUTE_TOLERANCE = 1e-6  # For values near zero
 
 # Iteration time tolerances (performance metric, higher variance expected)
-ITERATION_TIME_RELATIVE_TOLERANCE = 0.20  # 20% relative tolerance
+ITERATION_TIME_RELATIVE_TOLERANCE = 0.15  # 15% relative tolerance
 
 # Memory allocation tolerances
 MEM_ALLOCATED_BYTES_RELATIVE_TOLERANCE = 0.10  # 10% relative tolerance
@@ -175,21 +175,21 @@ def test_grpo_training_loop(
 
     if "mem-allocated-bytes" in metrics and "mem-allocated-bytes" in output_current:
 
-        mem_allocated_bytes_sampled = median(
-            [l for l in output_current["mem-allocated-bytes"]['values'].values()][1:]
-        )
-        mem_allocated_bytes_golden = median(
-            [l for l in output_groundtruth["mem-allocated-bytes"]['values'].values()][1:]
-        )
+        # Use max instead of median - we care about worst-case memory usage
+        # Skip first step (warmup) which may have different memory characteristics
+        current_values = [l for l in output_current["mem-allocated-bytes"]['values'].values()][1:]
+        golden_values = [l for l in output_groundtruth["mem-allocated-bytes"]['values'].values()][1:]
+        
+        mem_allocated_bytes_sampled = max(current_values)
+        mem_allocated_bytes_golden = max(golden_values)
 
-        lower_bound = (1 - MEM_ALLOCATED_BYTES_RELATIVE_TOLERANCE) * mem_allocated_bytes_golden
         upper_bound = (1 + MEM_ALLOCATED_BYTES_RELATIVE_TOLERANCE) * mem_allocated_bytes_golden
         assert (
-            lower_bound <= mem_allocated_bytes_sampled <= upper_bound
+            mem_allocated_bytes_sampled <= upper_bound
         ), (
-            f"Mem allocated bytes {mem_allocated_bytes_sampled} bytes not within "
-            f"{MEM_ALLOCATED_BYTES_RELATIVE_TOLERANCE:.0%} of golden value ~{mem_allocated_bytes_golden} bytes. "
-            f"Sampled: {output_current['mem-allocated-bytes']} bytes. "
+            f"Max mem allocated bytes {mem_allocated_bytes_sampled} bytes exceeds "
+            f"{MEM_ALLOCATED_BYTES_RELATIVE_TOLERANCE:.0%} above golden max {mem_allocated_bytes_golden} bytes. "
+            f"Upper bound: {upper_bound} bytes. "
             f"Please update golden values in the functional tests if this is expected."
         )
 
@@ -197,21 +197,21 @@ def test_grpo_training_loop(
 
     if "mem-max-allocated-bytes" in metrics and "mem-max-allocated-bytes" in output_current:
 
-        mem_max_allocated_bytes_sampled = median(
-            [l for l in output_current["mem-max-allocated-bytes"]['values'].values()][1:]
-        )
-        mem_max_allocated_bytes_golden = median(
-            [l for l in output_groundtruth["mem-max-allocated-bytes"]['values'].values()][1:]
-        )
+        # Use max - we care that peak memory doesn't exceed the golden peak
+        # Skip first step (warmup) which may have different memory characteristics
+        current_values = [l for l in output_current["mem-max-allocated-bytes"]['values'].values()][1:]
+        golden_values = [l for l in output_groundtruth["mem-max-allocated-bytes"]['values'].values()][1:]
+        
+        mem_max_allocated_bytes_sampled = max(current_values)
+        mem_max_allocated_bytes_golden = max(golden_values)
 
-        lower_bound = (1 - MEM_MAX_ALLOCATED_BYTES_RELATIVE_TOLERANCE) * mem_max_allocated_bytes_golden
         upper_bound = (1 + MEM_MAX_ALLOCATED_BYTES_RELATIVE_TOLERANCE) * mem_max_allocated_bytes_golden
         assert (
-            lower_bound <= mem_max_allocated_bytes_sampled <= upper_bound
+            mem_max_allocated_bytes_sampled <= upper_bound
         ), (
-            f"Mem max allocated bytes {mem_max_allocated_bytes_sampled} bytes not within "
-            f"{MEM_MAX_ALLOCATED_BYTES_RELATIVE_TOLERANCE:.0%} of golden value ~{mem_max_allocated_bytes_golden} bytes. "
-            f"Sampled: {output_current['mem-max-allocated-bytes']} bytes. "
+            f"Max mem-max-allocated bytes {mem_max_allocated_bytes_sampled} bytes exceeds "
+            f"{MEM_MAX_ALLOCATED_BYTES_RELATIVE_TOLERANCE:.0%} above golden max {mem_max_allocated_bytes_golden} bytes. "
+            f"Upper bound: {upper_bound} bytes. "
             f"Please update golden values in the functional tests if this is expected."
         )
 

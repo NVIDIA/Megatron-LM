@@ -32,10 +32,11 @@ import argparse
 import glob
 import json
 import logging
+import math
 import os
 import sys
 from pathlib import Path
-from statistics import mean, stdev
+from statistics import mean, median, stdev
 from typing import Any, Dict, List, Optional, Tuple
 
 logging.basicConfig(level=logging.INFO, format='%(levelname)s: %(message)s')
@@ -221,9 +222,40 @@ def _detect_result_format(data: Dict[str, Any]) -> str:
     return "unknown"
 
 
+def _is_valid_numeric(value) -> bool:
+    """Check if a value is a valid (non-NaN) numeric value."""
+    if isinstance(value, str):
+        try:
+            value = float(value)
+        except ValueError:
+            return False
+    
+    if isinstance(value, (int, float)):
+        return not math.isnan(value)
+    
+    return False
+
+
+def _to_float(value) -> Optional[float]:
+    """Convert value to float, returning None for invalid/NaN values."""
+    if isinstance(value, str):
+        try:
+            value = float(value)
+        except ValueError:
+            return None
+    
+    if isinstance(value, (int, float)):
+        if math.isnan(value):
+            return None
+        return float(value)
+    
+    return None
+
+
 def _aggregate_training_results(
     data: Dict[str, Any], 
-    aggregated: Dict[str, Dict[str, List[float]]]
+    aggregated: Dict[str, Dict[str, List[float]]],
+    run_index: int
 ) -> None:
     """Aggregate results from training test format."""
     for metric_name, metric_data in data.items():
@@ -235,17 +267,32 @@ def _aggregate_training_results(
         
         values = metric_data['values']
         for step, value in values.items():
-            # Skip non-numeric values (e.g., "nan" strings)
-            if isinstance(value, str):
-                try:
-                    value = float(value)
-                except ValueError:
-                    continue
+            # Skip non-numeric or NaN values
+            float_val = _to_float(value)
+            if float_val is None:
+                continue
             
             if step not in aggregated[metric_name]:
                 aggregated[metric_name][step] = []
             
-            aggregated[metric_name][step].append(float(value))
+            aggregated[metric_name][step].append(float_val)
+        
+        # For metrics that use median-based comparison in the test (iteration-time, 
+        # mem-allocated-bytes, mem-max-allocated-bytes), also store all values from
+        # this run so we can compute per-run medians later.
+        # IMPORTANT: Store values in step order to match the test's index-based slicing.
+        if metric_name in ['iteration-time', 'mem-allocated-bytes', 'mem-max-allocated-bytes']:
+            all_values_key = f"_all_values_run_{run_index}"
+            if all_values_key not in aggregated[metric_name]:
+                aggregated[metric_name][all_values_key] = []
+            
+            # Sort by step number to ensure consistent ordering for index-based slicing
+            sorted_steps = sorted(values.keys(), key=lambda x: int(x) if x.isdigit() else float('inf'))
+            for step in sorted_steps:
+                float_val = _to_float(values[step])
+                if float_val is None:
+                    continue
+                aggregated[metric_name][all_values_key].append(float_val)  # Just the value, not tuple
 
 
 def _aggregate_inference_results(
@@ -357,7 +404,7 @@ def aggregate_results(result_files: List[str]) -> Dict[str, Dict[str, List[float
             logger.info(f"Detected result format: {file_format}")
         
         if file_format == "training":
-            _aggregate_training_results(data, aggregated)
+            _aggregate_training_results(data, aggregated, idx)
         elif file_format == "inference":
             _aggregate_inference_results(data, aggregated, idx)
         else:
@@ -392,7 +439,9 @@ def compute_statistics(aggregated: Dict[str, Dict[str, List[float]]]) -> Dict[st
     
     for metric_name, step_values in aggregated.items():
         # Determine number of samples (should be consistent across steps)
-        sample_counts = [len(vals) for vals in step_values.values()]
+        # Skip internal keys used for median calculations
+        regular_steps = {k: v for k, v in step_values.items() if not k.startswith("_")}
+        sample_counts = [len(vals) for vals in regular_steps.values()]
         num_samples = max(sample_counts) if sample_counts else 0
         
         metric_stats = {
@@ -400,7 +449,7 @@ def compute_statistics(aggregated: Dict[str, Dict[str, List[float]]]) -> Dict[st
             "values": {}
         }
         
-        for step, values in step_values.items():
+        for step, values in regular_steps.items():
             if len(values) == 0:
                 continue
             
@@ -424,17 +473,22 @@ def compute_statistics(aggregated: Dict[str, Dict[str, List[float]]]) -> Dict[st
 
 def compute_recommended_tolerances(
     stats: Dict[str, Any],
-    confidence_multiplier: float = 3.0
+    aggregated: Dict[str, Dict[str, List[float]]],
+    confidence_multiplier: float = 3.0,
+    start_step: int = 1
 ) -> Dict[str, Dict[str, float]]:
     """
     Compute recommended tolerances for each metric based on observed variance.
     
-    Uses mean ± (confidence_multiplier * std) to determine bounds, then
-    converts to relative tolerance.
+    For metrics that use median-based comparison in the test (iteration-time,
+    mem-allocated-bytes, mem-max-allocated-bytes), computes variance of per-run
+    medians rather than per-step variance.
     
     Args:
         stats: Output from compute_statistics()
+        aggregated: Raw aggregated data (needed for median calculations)
         confidence_multiplier: Number of standard deviations for bounds (default 3.0 for ~99.7% coverage)
+        start_step: First step to include in tolerance calculation (skips warmup steps)
     
     Returns:
         Dict mapping metric_name -> {
@@ -445,24 +499,109 @@ def compute_recommended_tolerances(
     """
     tolerances = {}
     
+    # Metrics that use median-based comparison in the test (iteration-time)
+    median_based_metrics = ['iteration-time']
+    # Metrics that use max-based comparison in the test (memory)
+    max_based_metrics = ['mem-allocated-bytes', 'mem-max-allocated-bytes']
+    
     for metric_name, metric_data in stats.items():
         max_relative_variance = 0.0
         max_absolute_variance = 0.0
+        steps_included = 0
         
-        for step, step_stats in metric_data["values"].items():
-            mean_val = step_stats["mean"]
-            std_val = step_stats["std"]
+        # For median-based metrics, compute variance of per-run medians
+        if metric_name in median_based_metrics and metric_name in aggregated:
+            run_medians = []
             
-            # Compute observed relative variance
-            if abs(mean_val) > 1e-9:
-                # For non-zero means, compute relative variance
-                for sample in step_stats["samples"]:
-                    rel_var = abs(sample - mean_val) / abs(mean_val)
-                    max_relative_variance = max(max_relative_variance, rel_var)
-            else:
-                # For near-zero means, track absolute variance
-                for sample in step_stats["samples"]:
-                    max_absolute_variance = max(max_absolute_variance, abs(sample))
+            # Find all run data keys
+            for key in aggregated[metric_name].keys():
+                if key.startswith("_all_values_run_"):
+                    run_data = aggregated[metric_name][key]
+                    # Use index-based slicing to match test behavior:
+                    # [start_step:] skips the first `start_step` items
+                    filtered_values = run_data[start_step:]
+                    
+                    if filtered_values:
+                        run_median = median(filtered_values)
+                        run_medians.append(run_median)
+            
+            if run_medians:
+                median_mean = mean(run_medians)
+                
+                # Compute relative variance of medians
+                if abs(median_mean) > 1e-9:
+                    for m in run_medians:
+                        rel_var = abs(m - median_mean) / abs(median_mean)
+                        max_relative_variance = max(max_relative_variance, rel_var)
+                else:
+                    for m in run_medians:
+                        max_absolute_variance = max(max_absolute_variance, abs(m))
+                
+                steps_included = len(run_medians)
+                
+                logger.debug(
+                    f"{metric_name}: computed variance from {len(run_medians)} run medians, "
+                    f"mean={median_mean:.4f}, max_rel_var={max_relative_variance:.4%}"
+                )
+        
+        # For max-based metrics (memory), compute variance of per-run max values
+        elif metric_name in max_based_metrics and metric_name in aggregated:
+            run_maxes = []
+            
+            # Find all run data keys
+            for key in aggregated[metric_name].keys():
+                if key.startswith("_all_values_run_"):
+                    run_data = aggregated[metric_name][key]
+                    # Skip first value (warmup), take max of rest
+                    filtered_values = run_data[1:] if len(run_data) > 1 else run_data
+                    
+                    if filtered_values:
+                        run_max = max(filtered_values)
+                        run_maxes.append(run_max)
+            
+            if run_maxes:
+                max_mean = mean(run_maxes)
+                
+                # Compute relative variance of max values
+                if abs(max_mean) > 1e-9:
+                    for m in run_maxes:
+                        rel_var = abs(m - max_mean) / abs(max_mean)
+                        max_relative_variance = max(max_relative_variance, rel_var)
+                else:
+                    for m in run_maxes:
+                        max_absolute_variance = max(max_absolute_variance, abs(m))
+                
+                steps_included = len(run_maxes)
+                
+                logger.debug(
+                    f"{metric_name}: computed variance from {len(run_maxes)} run maxes, "
+                    f"mean={max_mean:.4f}, max_rel_var={max_relative_variance:.4%}"
+                )
+        else:
+            # Standard per-step variance calculation for other metrics
+            for step, step_stats in metric_data["values"].items():
+                # Skip warmup steps - try to parse step as int, skip if < start_step
+                try:
+                    step_num = int(step)
+                    if step_num < start_step:
+                        continue
+                except (ValueError, TypeError):
+                    # Non-numeric step key (e.g., "mean" for inference metrics) - include it
+                    pass
+                
+                steps_included += 1
+                mean_val = step_stats["mean"]
+                
+                # Compute observed relative variance
+                if abs(mean_val) > 1e-9:
+                    # For non-zero means, compute relative variance
+                    for sample in step_stats["samples"]:
+                        rel_var = abs(sample - mean_val) / abs(mean_val)
+                        max_relative_variance = max(max_relative_variance, rel_var)
+                else:
+                    # For near-zero means, track absolute variance
+                    for sample in step_stats["samples"]:
+                        max_absolute_variance = max(max_absolute_variance, abs(sample))
         
         # Recommend tolerance with safety margin
         # Use observed variance * confidence_multiplier, with a minimum of 0.1%
@@ -476,6 +615,7 @@ def compute_recommended_tolerances(
             "absolute_tolerance": max(max_absolute_variance * confidence_multiplier, 1e-6),
             "max_observed_relative_variance": round(max_relative_variance, 6),
             "max_observed_absolute_variance": round(max_absolute_variance, 6),
+            "steps_included": steps_included,
         }
     
     return tolerances
@@ -551,8 +691,10 @@ def main():
     parser.add_argument(
         "--confidence-multiplier",
         type=float,
-        default=3.0,
-        help="Multiplier for standard deviation when computing tolerance bounds (default: 3.0)"
+        default=1.5,
+        help="Multiplier for observed max variance when computing recommended tolerance. "
+             "Example: if max observed variance is 5%% and multiplier is 1.5, recommended tolerance is 7.5%%. "
+             "Use higher values (2-3) for more safety margin. Default: 1.5"
     )
     
     parser.add_argument(
@@ -574,6 +716,15 @@ def main():
         default=None,
         help="Root of the megatron workspace (where runs/ directory is located). "
              "Defaults to current working directory."
+    )
+    
+    parser.add_argument(
+        "--start-step",
+        type=int,
+        default=0,
+        help="Number of initial steps to skip (index-based, matching test behavior). "
+             "Uses Python slicing [start_step:] so --start-step 10 skips first 10 items. "
+             "Default: 0 (include all). Set to match THROUGHPUT_TEST_PARAMS.--start_step from model_config.yaml."
     )
     
     args = parser.parse_args()
@@ -622,8 +773,12 @@ def main():
     # Compute statistics
     stats = compute_statistics(aggregated)
     
-    # Compute recommended tolerances
-    tolerances = compute_recommended_tolerances(stats, args.confidence_multiplier)
+    # Compute recommended tolerances (excluding warmup steps)
+    if args.start_step > 1:
+        logger.info(f"Excluding steps < {args.start_step} from tolerance calculation (warmup)")
+    tolerances = compute_recommended_tolerances(
+        stats, aggregated, args.confidence_multiplier, start_step=args.start_step
+    )
     
     # Build output
     output = {
@@ -631,6 +786,7 @@ def main():
             "num_runs": len(result_files),
             "result_files": result_files,
             "confidence_multiplier": args.confidence_multiplier,
+            "start_step": args.start_step,
         },
         "statistics": stats,
         "recommended_tolerances": tolerances,
