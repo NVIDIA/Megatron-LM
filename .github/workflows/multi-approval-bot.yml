@@ -26,6 +26,88 @@ jobs:
         if: startsWith(github.ref, 'refs/heads/pull-request/')
         uses: nv-gha-runners/get-pr-info@main
 
+      - name: Check for complexity:low label
+        id: check-label
+        env:
+          PR_INFO: ${{ steps.get-pr-info.outputs.pr-info }}
+        run: |
+          if echo "$PR_INFO" | jq -e '.labels[]? | select(.name == "complexity: low")' > /dev/null 2>&1; then
+            echo "is_low_complexity=true" >> $GITHUB_OUTPUT
+          else
+            echo "is_low_complexity=false" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Request reviews from required teams
+        env:
+          GH_TOKEN: ${{ secrets.PAT }}
+          PR_NUMBER: ${{ fromJSON(steps.get-pr-info.outputs.pr-info || '{}').number }}
+          IS_LOW_COMPLEXITY: ${{ steps.check-label.outputs.is_low_complexity }}
+        run: |
+          # Always request core-nemo
+          gh api repos/${{ github.repository }}/pulls/$PR_NUMBER/requested_reviewers \
+            --method POST -f team_reviewers[]="core-nemo" 2>/dev/null || true
+
+          # Request core-adlr unless complexity:low
+          if [ "$IS_LOW_COMPLEXITY" != "true" ]; then
+            gh api repos/${{ github.repository }}/pulls/$PR_NUMBER/requested_reviewers \
+              --method POST -f team_reviewers[]="core-adlr" 2>/dev/null || true
+          fi
+
+      - name: Check core-nemo approval (always required)
+        env:
+          GH_TOKEN: ${{ secrets.PAT }}
+          PR_NUMBER: ${{ fromJSON(steps.get-pr-info.outputs.pr-info || '{}').number }}
+        run: |
+          # Get team members
+          MEMBERS=$(gh api orgs/NVIDIA/teams/core-nemo/members --jq '.[].login' 2>/dev/null || echo "")
+          if [ -z "$MEMBERS" ]; then
+            echo "Warning: Could not fetch core-nemo team members"
+            exit 1
+          fi
+
+          # Get PR approvers
+          APPROVERS=$(gh api repos/${{ github.repository }}/pulls/$PR_NUMBER/reviews \
+            --jq '[.[] | select(.state == "APPROVED")] | [.[].user.login] | unique | .[]')
+
+          # Check if any team member approved
+          for member in $MEMBERS; do
+            if echo "$APPROVERS" | grep -q "^${member}$"; then
+              echo "✅ core-nemo approval found from: $member"
+              exit 0
+            fi
+          done
+
+          echo "❌ Missing approval from @NVIDIA/core-nemo"
+          exit 1
+
+      - name: Check core-adlr approval (required unless complexity:low)
+        if: steps.check-label.outputs.is_low_complexity != 'true'
+        env:
+          GH_TOKEN: ${{ secrets.PAT }}
+          PR_NUMBER: ${{ fromJSON(steps.get-pr-info.outputs.pr-info || '{}').number }}
+        run: |
+          # Get team members
+          MEMBERS=$(gh api orgs/NVIDIA/teams/core-adlr/members --jq '.[].login' 2>/dev/null || echo "")
+          if [ -z "$MEMBERS" ]; then
+            echo "Warning: Could not fetch core-adlr team members"
+            exit 1
+          fi
+
+          # Get PR approvers
+          APPROVERS=$(gh api repos/${{ github.repository }}/pulls/$PR_NUMBER/reviews \
+            --jq '[.[] | select(.state == "APPROVED")] | [.[].user.login] | unique | .[]')
+
+          # Check if any team member approved
+          for member in $MEMBERS; do
+            if echo "$APPROVERS" | grep -q "^${member}$"; then
+              echo "✅ core-adlr approval found from: $member"
+              exit 0
+            fi
+          done
+
+          echo "❌ Missing approval from @NVIDIA/core-adlr"
+          exit 1
+
       - name: Checkout action
         uses: actions/checkout@v3
         with:
