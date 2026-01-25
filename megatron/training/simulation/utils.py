@@ -143,6 +143,7 @@ class SimulationArgsOverride:
         # prepare for data build
         args.iteration = 0
         args.num_floating_point_operations_so_far = 0
+        args.eval_interval = 1
         return False
 
 
