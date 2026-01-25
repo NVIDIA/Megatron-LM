@@ -9,6 +9,9 @@ from torch.autograd.variable import Variable
 
 from megatron.core import parallel_state
 from megatron.core.enums import ModelType
+from megatron.core.pipeline_parallel.fine_grained_activation_offload import (
+    FineGrainedActivationOffloadingInterface as off_interface,
+)
 from megatron.core.pipeline_parallel.p2p_communication import P2PCommunicator
 from megatron.core.pipeline_parallel.utils import (
     is_pp_first_stage,
@@ -33,12 +36,13 @@ from .combined_1f1b import (
     combined_1f1b_schedule_for_interleaved_pipelining,
     combined_1f1b_schedule_for_no_pipelining,
 )
+from .hybrid_cp_schedule import hybrid_context_parallel_forward_backward
 
 # Types
 Shape = Union[List[int], torch.Size]
 
 
-def get_forward_backward_func():
+def get_forward_backward_func(pp_size: Optional[int] = None, vp_size: Optional[int] = None):
     """Retrieves the appropriate forward_backward function given the
     configuration of parallel_state.
 
@@ -107,9 +111,9 @@ def get_forward_backward_func():
     decoder_seq_length (int, optional): The sequence length for the decoder in a dual-stack
         transformer. This is ignored for a single-stack transformer.
 
-    forward_only (optional, default = False): Perform only the forward step
+    forward_only (optional, default = False): Perform only the forward step.
 
-    collect_non_loss_data (optional, bool, default=False): TODO
+    collect_non_loss_data (optional, bool, default=False): TODO.
 
     first_val_step (bool, optional): Is the first step of the validation phase. Used by
         Transformer Engine modules to only update their fp8 weights only on the first validation
@@ -121,10 +125,24 @@ def get_forward_backward_func():
         respective list of shapes. Thus it is not used in the other forward-backward functions
         which have different shape handling.
 
+    force_all_reduce (bool, optional): If true, force use of all-reduce for gradient reduction
+        instead of reduce-scatter (if using distributed optimizer) in this iteration to ensure all
+        data-parallel ranks have fully reduced gradients. This is useful for easier wgrad saving
+        (can just inspect DP replica 0 to get full set of wgrads for entire model).
+
+    Args:
+        pp_size (Optional[int]): Pipeline model parallel size to use.
+        vp_size (Optional[int]): Virtual pipeline model parallel size to use.
+            If both pp_size and vp_size are None, both values fall back to parallel_state.
+            Otherwise, provided values are used as-is and None is treated as an explicit input.
+
     """
-    pipeline_model_parallel_size = parallel_state.get_pipeline_model_parallel_world_size()
-    if pipeline_model_parallel_size > 1:
-        if parallel_state.get_virtual_pipeline_model_parallel_world_size() is not None:
+    if pp_size is None and vp_size is None:
+        pp_size = parallel_state.get_pipeline_model_parallel_world_size()
+        vp_size = parallel_state.get_virtual_pipeline_model_parallel_world_size()
+
+    if pp_size > 1:
+        if vp_size is not None:
             forward_backward_func = forward_backward_pipelining_with_interleaving
         else:
             forward_backward_func = forward_backward_pipelining_without_interleaving
@@ -510,7 +528,9 @@ def forward_backward_no_pipelining(
     collect_non_loss_data: bool = False,
     first_val_step: Optional[bool] = None,
     adjust_tensor_shapes_fn: Optional[Callable] = None,  # unused
+    p2p_communicator: Optional[P2PCommunicator] = None,  # unused
     pg_collection: Optional[ProcessGroupCollection] = None,
+    force_all_reduce: Optional[bool] = False,
 ):
     """Run forward and backward passes with no pipeline parallelism"""
 
@@ -592,6 +612,24 @@ def forward_backward_no_pipelining(
             total_num_tokens,
             partial(check_first_val_step, first_val_step, forward_only),
         )
+    elif config.hybrid_context_parallel:
+        forward_data_store, total_num_tokens = hybrid_context_parallel_forward_backward(
+            forward_step_func,
+            data_iterator,
+            model,
+            num_microbatches,
+            input_tensor,
+            output_tensor_grad,
+            forward_data_store,
+            config,
+            collect_non_loss_data,
+            first_val_step,
+            forward_only,
+            no_sync_func,
+            total_num_tokens,
+            check_first_val_step,
+            model_type,
+        )
     else:
         with no_sync_func():
             for i in range(num_microbatches - 1):
@@ -643,7 +681,11 @@ def forward_backward_no_pipelining(
             [model],
             total_num_tokens if config.calculate_per_token_loss else None,
             pg_collection=pg_collection,
+            force_all_reduce=force_all_reduce,
         )
+
+    if not forward_only and config.fine_grained_activation_offloading:
+        off_interface.reset()
 
     if config.timers is not None:
         config.timers('forward-backward').stop()
@@ -783,32 +825,6 @@ def get_schedule_table(num_microbatches, num_model_chunks, microbatch_group_size
     return schedule_table
 
 
-def convert_schedule_table_to_order(num_warmup_microbatches, num_model_chunks, schedule_table):
-    """Convert a tunable schedule lookup table to the te.make_graphed_callables() accepted
-    order format. For example, the tunable schedule table for PP2 N3M5 with VP2 is as below:
-    virtual_microbatch_id | 0 1 2 3 4 5 6 7 8 9
-    microbatch_id         | 0 1 2 0 1 2 3 4 3 4
-    model_chunk_id        | 0 0 0 1 1 1 0 0 1 1
-
-    Then the forward backward separated order is:
-    forward               | 1 1 1 2 2 2 1 1 2 2
-    backward              | -2 -2 -2 -1 -1 -1 -2 -2 -1 -1
-
-    If num_warmup_microbatches is 5, the output order is:
-    1 1 1 2 2 2 -2 1 -2 1 -2 2 -1 2 -1 -1 -2 -2 -1 -1
-    """
-    _, model_chunk_id_table = zip(*schedule_table)
-    forward_order = [chunk_id + 1 for chunk_id in model_chunk_id_table]
-    backward_order = [chunk_id - num_model_chunks for chunk_id in model_chunk_id_table]
-    order = forward_order[:num_warmup_microbatches]
-    for i in range(num_warmup_microbatches, len(forward_order)):
-        order.append(forward_order[i])
-        order.append(backward_order[i - num_warmup_microbatches])
-    if num_warmup_microbatches > 0:
-        order.extend(backward_order[-num_warmup_microbatches:])
-    return order
-
-
 def forward_backward_pipelining_with_interleaving(
     *,
     forward_step_func,
@@ -824,6 +840,7 @@ def forward_backward_pipelining_with_interleaving(
     adjust_tensor_shapes_fn: Optional[Callable] = None,  # unused
     p2p_communicator: Optional[P2PCommunicator] = None,
     pg_collection: Optional[ProcessGroupCollection] = None,
+    force_all_reduce: Optional[bool] = False,
 ):
     """Run interleaved 1F1B schedule (model split into model chunks), with
     communication between pipeline stages as needed.
@@ -1903,8 +1920,11 @@ def forward_backward_pipelining_with_interleaving(
             model,
             total_num_tokens if config.calculate_per_token_loss else None,
             pg_collection=pg_collection,
+            force_all_reduce=force_all_reduce,
         )
 
+    if not forward_only and config.fine_grained_activation_offloading:
+        off_interface.reset()
     # Restore config.grad_sync_func and config.param_sync_func.
     if forward_only:
         config.grad_sync_func, config.param_sync_func = grad_sync_func, param_sync_func
@@ -1964,6 +1984,7 @@ def forward_backward_pipelining_without_interleaving(
     adjust_tensor_shapes_fn: Optional[Callable] = None,
     p2p_communicator: Optional[P2PCommunicator] = None,
     pg_collection: Optional[ProcessGroupCollection] = None,
+    force_all_reduce: Optional[bool] = False,
 ):
     """Run non-interleaved 1F1B schedule, with communication between pipeline
     stages. Returns dictionary with losses if the last stage, empty dict otherwise."""
@@ -2291,7 +2312,11 @@ def forward_backward_pipelining_without_interleaving(
             [model],
             total_num_tokens if config.calculate_per_token_loss else None,
             pg_collection=pg_collection,
+            force_all_reduce=force_all_reduce,
         )
+
+    if not forward_only and config.fine_grained_activation_offloading:
+        off_interface.reset()
 
     if config.timers is not None:
         config.timers('forward-backward').stop()
