@@ -1098,7 +1098,7 @@ def prepare_data_for_update(
         total_turns_sampled = len(rollouts)
 
         # We might sample more than we consume in one step.
-        samples_ratio_per_step = args.global_batch_size // (args.grpo_prompts_per_step * args.grpo_group_size)
+        samples_ratio_per_step = args.global_batch_size / (args.grpo_prompts_per_step * args.grpo_group_size)
         assert samples_ratio_per_step <= 1, "You cannot use more data than you sampled."
 
         if (data_parallel_world_size := mpu.get_data_parallel_world_size()) > 0:
