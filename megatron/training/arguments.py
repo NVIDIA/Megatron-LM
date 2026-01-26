@@ -592,13 +592,6 @@ def validate_args(args, defaults={}):
             "This argument is kept only for loading old checkpoints.",
             args.rank,
         )
-    if args.mtp_spec is not None:
-        warn_rank_0(
-            "--mtp-spec is deprecated. "
-            "For new hybrid models with MTP models, use unified --hybrid-override-pattern instead. "
-            "This argument is kept only for loading old checkpoints.",
-            args.rank,
-        )
 
     # Backward compatibility: convert legacy mtp_hybrid_override_pattern to unified format
     from megatron.core.ssm.mamba_hybrid_layer_allocation import Symbols, parse_hybrid_pattern
@@ -657,13 +650,6 @@ def validate_args(args, defaults={}):
             warn_rank_0(
                 "--mtp-hybrid-override-pattern is for Mamba/hybrid models only. "
                 "For GPT models, MTP replicates the main transformer layer structure. "
-                "This argument will be ignored.",
-                args.rank
-            )
-        if args.mtp_spec is not None:
-            warn_rank_0(
-                "--mtp-spec is for Mamba/hybrid models only. "
-                "For GPT models, use the standard layer spec. "
                 "This argument will be ignored.",
                 args.rank
             )
@@ -3678,11 +3664,6 @@ def _add_experimental_args(parser):
                        help='DEPRECATED: Use unified --hybrid-override-pattern instead. '
                        'Legacy argument for loading old checkpoints. '
                        'Force a specific hybrid layer pattern for MTP layers.')
-    group.add_argument('--mtp-spec', type=str, default=None, nargs='*',
-                       help='DEPRECATED: Use unified --hybrid-override-pattern instead. '
-                       'Legacy argument for loading old checkpoints. '
-                       'Specify the <module_location function_name> pair '
-                       'that returns a spec for mtp layer.')
     group.add_argument('--mamba-state-dim', type=int, default=128,
                        help='State dimension for Mamba layers.')
     group.add_argument('--mamba-head-dim', type=int, default=64,

@@ -29,9 +29,6 @@ from megatron.core.transformer.module import MegatronModule
 from megatron.core.transformer.spec_utils import ModuleSpec, build_module
 from megatron.core.transformer.transformer_layer import TransformerLayer
 from megatron.core.transformer.utils import sharded_state_dict_default
-
-from megatron.core.ssm.mlp_layer import MLPLayer
-
 from megatron.core.utils import WrappedTensor, deprecate_inference_params, make_viewless_tensor
 
 
@@ -89,7 +86,6 @@ class MambaStack(MegatronModule):
         device=None,
         dtype=None,
         pg_collection: ProcessGroupCollection = None,
-        vp_stage: Optional[int] = None,
         is_mtp_layer: bool = False,
     ) -> None:
         super().__init__(config=config)
@@ -97,7 +93,6 @@ class MambaStack(MegatronModule):
         self.pre_process = pre_process
         self.post_layer_norm = post_layer_norm
         self.post_process = post_process
-        self.vp_stage = vp_stage
         self.is_mtp_layer = is_mtp_layer
 
         assert pg_collection is not None, "pg_collection must be provided for MambaStack"

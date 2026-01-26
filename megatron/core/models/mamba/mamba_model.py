@@ -121,10 +121,6 @@ class MambaModel(LanguageModule):
             self.mtp_pattern is not None and self.mtp_num_depths > 0 and mtp_on_this_rank(self.config, vp_stage=self.vp_stage)
         )
 
-        # Cache for RoPE tensors which do not change between iterations.
-        self.rotary_pos_emb_cache = {}
-
-
         # megatron core pipelining currently depends on model type
         # TODO: remove this dependency ?
         self.model_type = ModelType.encoder_or_decoder

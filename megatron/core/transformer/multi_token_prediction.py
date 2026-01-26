@@ -23,12 +23,6 @@ from megatron.core.tensor_parallel import (
 from megatron.core.transformer.enums import AttnMaskType, LayerType
 from megatron.core.transformer.module import MegatronModule
 from megatron.core.transformer.spec_utils import ModuleSpec, build_module
-
-# Type hint imports for Mamba support
-from typing import TYPE_CHECKING
-
-if TYPE_CHECKING:
-    from megatron.core.ssm.mamba_block import MambaStackSubmodules
 from megatron.core.transformer.transformer_block import TransformerBlockSubmodules
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.utils import (
@@ -775,7 +769,6 @@ class MultiTokenPredictionLayer(MegatronModule):
                 post_layer_norm=False,  # MTP has its own final_layernorm
                 post_process=True,      # MTP layer is self-contained
                 pg_collection=pg_collection,
-                vp_stage=vp_stage,
                 is_mtp_layer=True,
             )
         elif self.config.mtp_num_layers is not None:
