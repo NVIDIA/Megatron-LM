@@ -664,6 +664,8 @@ class TorchDistSaveShardedStrategy(AsyncSaveShardedStrategy):
             separation_hint=self.separation_hint,
             thread_count=self.thread_count,
             use_msc=MultiStorageClientFeature.is_enabled(),
+            sequential=False,
+            use_cached_data_structure=self.use_cached_ckpt_structure,
         )
         # This should be set differently if we run in a smaller process group than the default
         coordinator = 0
