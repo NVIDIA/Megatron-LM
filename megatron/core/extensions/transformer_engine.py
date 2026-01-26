@@ -461,8 +461,16 @@ class TENorm:
                 zero_centered_gamma=config.layernorm_zero_centered_gamma,
                 **_get_extra_te_kwargs(config),
             )
+        elif config.normalization == "ResidualRMSNorm":
+            extra_te_kwargs = _get_extra_te_kwargs(config)
+            extra_te_kwargs["dtype"] = extra_te_kwargs["params_dtype"]
+            del extra_te_kwargs["params_dtype"]
+            instance = te.pytorch.ops.Sequential(
+                te.pytorch.ops.MakeExtraOutput(),
+                te.pytorch.ops.RMSNorm(normalized_shape=hidden_size, eps=eps, zero_centered_gamma=config.layernorm_zero_centered_gamma, **extra_te_kwargs),
+            )
         else:
-            raise Exception("Only LayerNorm and RMSNorm are curently supported")
+            raise Exception("Only LayerNorm, RMSNorm and ResidualRMSNorm are curently supported")
 
         return instance
 
@@ -2186,7 +2194,6 @@ if HAVE_TE and is_te_min_version("1.13.0"):
 
 else:
     TEFusedMLP = None  # type: ignore[assignment, misc]
-
 
 class TEDelayedScaling(te.common.recipe.DelayedScaling):
     """
