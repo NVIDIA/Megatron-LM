@@ -10,25 +10,53 @@ import torch.distributed
 from contextlib import nullcontext
 from functools import partial
 
+from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core import parallel_state
 from megatron.training.global_vars import get_args
 from megatron.core.pipeline_parallel.schedules import forward_step
 from megatron.core.utils import get_model_config, get_attr_wrapped_model
 from megatron.training.utils import print_rank_0
+from megatron.training.simulation.utils import MockPipelineProcessGroup
+
+
+def get_pg_collection_for_simulation(pp_rank: int, pp_size: int):
+    """Create ProcessGroupCollection for simulation mode.
+
+    In simulation mode, we use fewer physical GPUs (EP GPUs) to simulate
+    a larger configuration (EP × PP GPUs). The PP process group is mocked
+    to return virtual size and rank, while all other groups use real
+    process groups from parallel_state.
+
+    Args:
+        pp_rank: Virtual pipeline parallel rank (0 to pp_size-1)
+        pp_size: Virtual pipeline parallel world size (e.g., 4)
+
+    Returns:
+        ProcessGroupCollection with mocked PP group and real other groups
+
+    """
+    # Start with real process groups from parallel_state
+    pg_collection = ProcessGroupCollection.use_mpu_process_groups()
+
+    # Replace PP group with mock
+    pg_collection.pp = MockPipelineProcessGroup(size=pp_size, rank=pp_rank)
+
+    return pg_collection
 
 
 def create_model(pp_rank, model_provider):
-    """Create model for specified pipeline rank
+    """Create model for specified pipeline rank in simulation mode.
 
     Args:
-        pp_rank: pipeline parallel rank
-        model_provider: function to create model
+        pp_rank: Virtual pipeline parallel rank (0 to pp_size-1)
+        model_provider: Function to create model
 
     Returns:
-        model: created model (list of model chunks for VPP)
+        model: Created model (list of model chunks for VPP)
     """
     # Reset MTP embedding for second MTP build
     from megatron.training import get_model
+    from megatron.core.process_groups_config import ProcessGroupCollection
     #from megatron.core.transformer.multi_token_prediction import MTPEmbeddingHelper
     #MTPEmbeddingHelper.set_embedding(None)
 
@@ -36,7 +64,15 @@ def create_model(pp_rank, model_provider):
     args = get_args()
     parallel_state.set_pipeline_model_parallel_rank(pp_rank)
     parallel_state.set_pipeline_model_parallel_world_size(args.pipeline_model_parallel_size)
-    model = get_model(model_provider)
+
+    # Create simulation-specific ProcessGroupCollection with mocked PP group
+    # This allows build_model() to see virtual PP size/rank without code changes
+    pg_collection = get_pg_collection_for_simulation(
+        pp_rank=pp_rank,
+        pp_size=args.pipeline_model_parallel_size
+    )
+    # Pass the simulation pg_collection to get_model
+    model = get_model(model_provider, pg_collection=pg_collection)
 
     return model
 

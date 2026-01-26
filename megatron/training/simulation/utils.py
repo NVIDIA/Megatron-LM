@@ -145,6 +145,43 @@ class SimulationArgsOverride:
         args.num_floating_point_operations_so_far = 0
         args.eval_interval = args.train_iters
         return False
+    
+
+class MockPipelineProcessGroup:
+    """Mock ProcessGroup for simulation mode.
+
+    In simulation mode, we use fewer physical GPUs than the model requires.
+    This mock allows us to simulate a larger pipeline parallel configuration
+    without actual distributed process groups.
+
+    Args:
+        size: Virtual world size (e.g., 4 for PP=4)
+        rank: Virtual rank in the group (0 to size-1)
+
+    Example:
+        # Simulate PP=4 with rank 2
+        mock_pp = MockProcessGroup(size=4, rank=2)
+        assert mock_pp.size() == 4
+        assert mock_pp.rank() == 2
+    """
+
+    def __init__(self, size: int = 1, rank: int = 0):
+        """Initialize MockProcessGroup with virtual size and rank."""
+        self._size = size
+        self._rank = rank
+
+    def size(self) -> int:
+        """Return the virtual world size of the process group."""
+        return self._size
+
+    def rank(self) -> int:
+        """Return the virtual rank of the current process in the group."""
+        return self._rank
+
+    def __repr__(self):
+        return f"MockProcessGroup(size={self._size}, rank={self._rank})"
+
+
 
 
 __all__ = ['SimulationArgsOverride']
