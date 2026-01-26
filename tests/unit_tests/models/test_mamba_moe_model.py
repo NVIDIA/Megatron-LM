@@ -272,6 +272,10 @@ GOLDEN_CONFIG: Dict[str, Any] = {
     "offload_modules": [],
     "hybrid_context_parallel": False,
     "max_seqlen_per_dp_cp_rank": None,
+    "enable_routing_replay": False,
+    "fallback_to_eager_attn": False,
+    "linear_attention_type": None,
+    "moe_router_force_biased": None,
 }
 # Fields to ignore entirely (ephemeral, environment-specific, very large).
 SKIP_FIELDS = set()
