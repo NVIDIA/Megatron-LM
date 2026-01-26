@@ -19,7 +19,7 @@ quantization.
 ```sh
 \
     HF_MODEL_CKPT=<pretrained_model_name_or_path> \
-    ./quantize.sh [model_conf] [qformat]
+    bash quantize.sh [model_conf] [qformat]
 ```
 
 > **❗ IMPORTANT:** `model_conf` is used to get the corresponding Megatron-LM `${MODEL_ARGS}`. For example,
