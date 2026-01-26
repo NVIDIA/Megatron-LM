@@ -1191,10 +1191,6 @@ class Attention(MegatronModule, ABC):
                     core_attn_out, name="core_attn", forced_released_tensors=[query, key, value]
                 )
 
-            if self.offload_core_attention and self.training:
-                core_attn_out = off_interface.group_commit(
-                    core_attn_out, name="core_attn", forced_released_tensors=[query, key, value]
-                )
         if packed_seq_params is not None and packed_seq_params.qkv_format == 'thd':
             # reshape to same output shape as unpacked case
             # (t, np, hn) -> (t, b=1, h=np*hn)

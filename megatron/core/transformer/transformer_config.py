@@ -923,45 +923,56 @@ class TransformerConfig(ModelParallelConfig):
                 f"tensor_model_parallel_size ({self.tensor_model_parallel_size})."
             )
 
-        if self.experimental_attention_variant == "gated_delta_net":
+        if self.linear_attention_type is not None:
+            warnings.warn(
+                "linear_attention_type is deprecated, "
+                "use experimental_attention_variant instead."
+            )
+            self.experimental_attention_variant = self.linear_attention_type
+            self.linear_attention_type = None
+
+        if self.experimental_attention_variant in ["gated_delta_net"]:
             assert (
                 self.linear_attention_freq is not None
-            ), f"linear_attention_freq must be set for linear gated_delta_net."
+            ), f"linear_attention_freq must be set for linear attention."
 
-            # Check required parameters
-            assert (
-                self.linear_conv_kernel_dim is not None
-            ), "linear_conv_kernel_dim must be set for gated delta net."
-            assert (
-                self.linear_key_head_dim is not None
-            ), "linear_key_head_dim must be set for gated delta net."
-            assert (
-                self.linear_value_head_dim is not None
-            ), "linear_value_head_dim must be set for gated delta net."
-            assert (
-                self.linear_num_key_heads is not None
-            ), "linear_num_key_heads must be set for gated delta net."
-            assert (
-                self.linear_num_value_heads is not None
-            ), "linear_num_value_heads must be set for gated delta net."
-            assert self.linear_num_value_heads % self.linear_num_key_heads == 0, (
-                f"linear_num_value_heads ({self.linear_num_value_heads}) must be a multiple of "
-                f"linear_num_key_heads ({self.linear_num_key_heads})."
-            )
+            if self.experimental_attention_variant == "gated_delta_net":
+                # Check required parameters
+                assert (
+                    self.linear_conv_kernel_dim is not None
+                ), "linear_conv_kernel_dim must be set for gated delta net."
+                assert (
+                    self.linear_key_head_dim is not None
+                ), "linear_key_head_dim must be set for gated delta net."
+                assert (
+                    self.linear_value_head_dim is not None
+                ), "linear_value_head_dim must be set for gated delta net."
+                assert (
+                    self.linear_num_key_heads is not None
+                ), "linear_num_key_heads must be set for gated delta net."
+                assert (
+                    self.linear_num_value_heads is not None
+                ), "linear_num_value_heads must be set for gated delta net."
+                assert self.linear_num_value_heads % self.linear_num_key_heads == 0, (
+                    f"linear_num_value_heads ({self.linear_num_value_heads}) must be a multiple of "
+                    f"linear_num_key_heads ({self.linear_num_key_heads})."
+                )
 
-            # Check tensor parallelism compatibility
+                # Check tensor parallelism compatibility
+                tp_cp_size = self.tensor_model_parallel_size * self.context_parallel_size
+                assert self.linear_num_key_heads % tp_cp_size == 0, (
+                    f"{self.linear_num_key_heads=} must be a multiple of "
+                    f"({self.tensor_model_parallel_size=} * {self.context_parallel_size=})."
+                )
+                assert self.linear_num_value_heads % tp_cp_size == 0, (
+                    f"{self.linear_num_value_heads=} must be a multiple of "
+                    f"({self.tensor_model_parallel_size=} * {self.context_parallel_size=})."
+                )
+        elif self.experimental_attention_variant == "dsa":
             assert (
-                self.linear_num_key_heads % self.tensor_model_parallel_size == 0
-            ), "linear_num_key_heads must be a multiple of tensor_model_parallel_size."
-            assert (
-                self.linear_num_value_heads % self.tensor_model_parallel_size == 0
-            ), "linear_num_value_heads must be a multiple of tensor_model_parallel_size."
-
-            # Do not support yet, but coming soon.
-            assert self.context_parallel_size == 1, (
-                f"Gated delta net does not support context parallel for now,"
-                f" but got {self.context_parallel_size=}."
-            )
+                self.context_parallel_size == 1
+            ), "Currently context parallelism is not supported by DSAttention!"
+            assert not self.apply_rope_fusion, "RoPE fusion is not supported for DSAttention"
 
         if self.fp8:
             # cannot support first last layer bf16 with delayed scaling
@@ -1964,12 +1975,6 @@ class TransformerConfig(ModelParallelConfig):
             assert not self.add_bias_linear
             assert not self.add_qkv_bias
             assert not self.use_kitchen
-
-        if self.experimental_attention_variant == "dsa":
-            assert (
-                self.context_parallel_size == 1
-            ), "Currently context parallelism is not supported by DSAttention!"
-            assert not self.apply_rope_fusion, "RoPE fusion is not supported for DSAttention"
 
         if self.inference_fuse_tp_communication:
             assert self.transformer_impl == "inference_optimized", (
