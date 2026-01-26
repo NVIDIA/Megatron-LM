@@ -16,6 +16,7 @@ import os
 import pickle
 import re
 from typing import Any, Dict, List, Optional, Tuple
+from megatron.training.utils import print_rank_0
 
 import torch
 
@@ -1103,7 +1104,7 @@ def display_gbs_statistics(pp_finished_task_queue_dict: Dict, pipeline_parallel_
     output_lines.append("=" * 80)
 
     # Print all info
-    logger.info('\n'.join(output_lines))
+    print_rank_0('\n'.join(output_lines))
 
 
 # =============================================================================
@@ -1153,4 +1154,4 @@ def display_memory_statistics(profile_dir: str, enable_memory_snapshot: bool,
             f'Peak Memory = {peak_mem:.2f} GB'
         )
 
-    logger.info('\n'.join(output_lines))
+    print_rank_0('\n'.join(output_lines))
