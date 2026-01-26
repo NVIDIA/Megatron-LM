@@ -152,7 +152,7 @@ async def main(
                     "generated_tokens": req.generated_tokens,
                     "latency": req.latency,  # InferenceClient populates this field in the returned future.
                 }
-                if req.sampling_params["return_log_probs"]:
+                if req.sampling_params.return_log_probs:
                     result_dict["logprobs"] = req.prompt_log_probs + req.generated_log_probs
                 throughput = len(req.generated_tokens) / req.latency
                 throughputs.append(throughput)

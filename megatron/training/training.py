@@ -31,6 +31,7 @@ def set_startup_timestamps(program_start=None, main_entry=None):
         _STARTUP_TIMESTAMPS['main_entry'] = main_entry
 
 
+from collections import defaultdict
 import copy
 import dataclasses
 from datetime import datetime, timedelta
@@ -100,7 +101,7 @@ from megatron.core.pipeline_parallel.utils import (
 )
 from megatron.core.optimizer import get_standard_config_overrides
 from megatron.training.checkpointing import load_checkpoint
-from megatron.training.checkpointing import save_checkpoint
+from megatron.training.checkpointing import save_checkpoint, save_grads
 from megatron.training.checkpointing import checkpoint_exists
 from megatron.training.checkpointing import get_loaded_iteration
 from megatron.core.full_cuda_graph import FullCudaGraphWrapper
@@ -139,7 +140,7 @@ from megatron.training.datasets.data_samplers import build_pretraining_data_load
 from megatron.core.datasets.data_schedule import HybridCPDataLoaderWrapper
 from megatron.core.optimizer_param_scheduler import OptimizerParamScheduler
 from megatron.core.transformer.moe import upcycling_utils
-from megatron.core.transformer.moe.moe_utils import track_moe_metrics
+from megatron.core.transformer.moe.moe_utils import track_moe_metrics, clear_aux_losses_tracker
 from megatron.core.transformer.experimental_attention_variant.dsa import DSAIndexerLossLoggingHelper
 from megatron.core.transformer.multi_token_prediction import MTPLossLoggingHelper
 from megatron.core.parallel_state import (
@@ -187,6 +188,7 @@ from .global_vars import (
     get_energy_monitor,
 )
 from . import one_logger_utils
+from .dgrad_logging import enable_dgrad_logging, disable_dgrad_logging, save_dgrads
 
 from . import ft_integration
 
@@ -1604,16 +1606,22 @@ def dummy_train_step(data_iterator):
             batch = get_batch_on_this_cp_rank(batch)
 
 
-def train_step(forward_step_func, data_iterator, model, optimizer, opt_param_scheduler, config, forward_backward_func):
+def train_step(forward_step_func, data_iterator, model, optimizer, opt_param_scheduler, config, forward_backward_func, iteration=None):
     """Single training step."""
     args = get_args()
     timers = get_timers()
 
     rerun_state_machine = get_rerun_state_machine()
+    save_dgrads_in_this_iteration = (args.save_dgrads_interval is not None and
+                                     (iteration + 1) % args.save_dgrads_interval == 0)
+    save_wgrads_in_this_iteration = (args.save_wgrads_interval is not None and
+                                     (iteration + 1) % args.save_wgrads_interval == 0)
     while rerun_state_machine.should_run_forward_backward(data_iterator):
         # Set grad to zero.
         for model_chunk in model:
             model_chunk.zero_grad_buffer()
+            # If saving main_grads in this iteration, then all-reduce instead of reduce-scatter.
+            model_chunk.force_all_reduce = save_wgrads_in_this_iteration
         optimizer.zero_grad()
 
         if has_nvidia_modelopt:
@@ -1636,6 +1644,8 @@ def train_step(forward_step_func, data_iterator, model, optimizer, opt_param_sch
                     optim_instance._copy_main_params_to_param_buffer()
 
         # Forward pass.
+        if save_dgrads_in_this_iteration:
+            enable_dgrad_logging(model, args.save)
         losses_reduced = forward_backward_func(
             forward_step_func=forward_step_func,
             data_iterator=data_iterator,
@@ -1646,7 +1656,31 @@ def train_step(forward_step_func, data_iterator, model, optimizer, opt_param_sch
             decoder_seq_length=args.decoder_seq_length,
             forward_only=False,
             adjust_tensor_shapes_fn=adjust_tensor_shapes_fn,
+            force_all_reduce=save_wgrads_in_this_iteration,
         )
+        if save_dgrads_in_this_iteration:
+            save_dgrads(iteration + 1)
+            disable_dgrad_logging()
+
+        # Reset force_all_reduce field.
+        for model_chunk in model:
+            model_chunk.force_all_reduce = False
+
+    # Checkpoint main_grads.
+    if save_wgrads_in_this_iteration:
+        # Collect state_dict of wgrads (each param's .main_grad field).
+        state_dict = defaultdict(dict)
+        for model_chunk_id, model_chunk in enumerate(model):
+            model_chunk_name = f"model_chunk{model_chunk_id}"
+            unwrapped_model_chunk = unwrap_model(model_chunk)
+            for param_name, param in unwrapped_model_chunk.named_parameters():
+                if getattr(param, "main_grad", None) is not None:
+                    main_grad_on_cpu = param.main_grad.cpu()
+                    state_dict[model_chunk_name][param_name] = main_grad_on_cpu
+
+        # iteration is 0-indexed, move to 1-indexed for checkpoint name and logging.
+        save_grads(args.save, state_dict, iteration + 1, "wgrads")
+
     should_checkpoint, should_exit, exit_code = rerun_state_machine.should_checkpoint_and_exit()
     if should_exit:
         return {}, True, should_checkpoint, should_exit, exit_code, None, None, 0
@@ -2748,7 +2782,7 @@ def train(
             num_zeros_in_grad,
             max_attention_logit,
         ) = train_step(
-            forward_step_func, train_data_iterator, model, optimizer, opt_param_scheduler, config, forward_backward_func
+            forward_step_func, train_data_iterator, model, optimizer, opt_param_scheduler, config, forward_backward_func, iteration=iteration
         )
         ft_integration.on_training_step_end()
         if should_checkpoint:
@@ -2919,6 +2953,8 @@ def train(
             timers('interval-time', log_level=0).start(barrier=True)
             if args.log_energy:
                 energy_monitor.resume()
+            if args.num_experts is not None:
+                clear_aux_losses_tracker()
 
         # Miscellaneous post-training-step functions (e.g., FT heartbeats, GC).
         # Some of these only happen at specific iterations. Capture updated FLOPs accumulator

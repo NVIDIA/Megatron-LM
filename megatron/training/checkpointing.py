@@ -10,6 +10,7 @@ import sys
 import threading
 import types
 from argparse import Namespace
+from datetime import datetime
 from enum import Enum, auto
 from logging import getLogger
 from pathlib import Path
@@ -431,6 +432,41 @@ def _build_sharded_state_dict_metadata(args: Namespace, dp_cp_group: Optional[to
         dp_cp_group = mpu.get_data_parallel_group(with_context_parallel=True)
     metadata['dp_cp_group'] = dp_cp_group
     return metadata
+
+
+def save_grads(save_dir, state_dict, iteration, grad_label):
+    """Persist state_dict of grads onto disk. In case of wgrads, this collection should
+    be performed before the grads are cleared but after they are reduced.
+
+    NOTE: wgrads for non-expert layers will be duplicated if using expert parallelism, but
+    this can be handled in postprocessing."""
+
+    print_rank_0(f"  [{datetime.now().strftime('%Y-%m-%d %H:%M:%S.%f')}] saving {grad_label} "
+                 f"from iteration {iteration:7d}")
+
+    if mpu.get_expert_data_parallel_rank() == 0:
+        # Create saving directory.
+        ep_rank = mpu.get_expert_model_parallel_rank()
+        pp_rank = mpu.get_pipeline_model_parallel_rank()
+        tp_rank = mpu.get_tensor_model_parallel_rank()
+        assert save_dir is not None
+        assert iteration is not None
+        save_dir = os.path.join(save_dir, grad_label, f"iter_{iteration:07d}")
+        os.makedirs(save_dir, exist_ok=True)
+
+        # Save state_dict.
+        checkpoint_name = f"mp_rank_{tp_rank:02d}"
+        if mpu.get_pipeline_model_parallel_world_size() > 1:
+            checkpoint_name += f"_{pp_rank:03d}"
+        if mpu.get_expert_model_parallel_world_size() > 1:
+            checkpoint_name += f"_{ep_rank:03d}"
+        full_save_path = os.path.join(save_dir, f"{checkpoint_name}.pth")
+        # Convert back to dict (e.g., from collections.defaultdict) for easy loading later.
+        torch.save(dict(state_dict), full_save_path)
+
+    print_rank_0(f"  [{datetime.now().strftime('%Y-%m-%d %H:%M:%S.%f')}] saved {grad_label} "
+                 f"from iteration {iteration:7d}")
+
 
 def save_checkpoint(iteration, model, optimizer, opt_param_scheduler, num_floating_point_operations_so_far,
                     checkpointing_context=None, pipeline_rank=None, expert_rank=None, tensor_rank=None, pipeline_parallel=None, expert_parallel=None, non_persistent_ckpt=False,
