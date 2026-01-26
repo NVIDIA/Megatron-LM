@@ -547,6 +547,9 @@ class DynamicInferenceContext(BaseInferenceContext):
 
         # Whether to offload the KV cache. Determines where the KV cache is allocated within memory.
         self.offload_kv_cache = offload_kv_cache
+        assert not (
+            self.offload_kv_cache and self.unified_memory_level
+        ), "The KV cache should not be instantiated in unified memory when it is offloaded during training."
 
         self._using_cuda_graph_this_step = False
         self.use_cuda_graphs_for_non_decode_steps = use_cuda_graphs_for_non_decode_steps
