@@ -14,7 +14,7 @@ from typing import List, Optional, Tuple
 
 import torch
 
-from megatron.core import parallel_state
+from megatron.core.utils import get_pg_size
 
 
 @dataclass(order=True, frozen=True)
@@ -151,20 +151,29 @@ class InferenceBatchDimensions:
 
     @staticmethod
     def adjust_batch_dims_for_expert_parallelism(
-        local_batch_dims, strict: bool, decode_only_cuda_graphs: bool
+        local_batch_dims,
+        strict: bool,
+        decode_only_cuda_graphs: bool,
+        ep_group: Optional[torch.distributed.ProcessGroup] = None,
     ) -> Optional["InferenceBatchDimensions"]:
         """Adjusted cuda graph batch dimensions for expert parallelism.
             We take the max token count across expert model parallel group.
+
+        Args:
+            local_batch_dims: The local batch dimensions to adjust.
+            strict: Whether to use strict matching for batch dimensions.
+            decode_only_cuda_graphs: Whether CUDA graphs are only used for decode steps.
+            ep_group: Optional expert parallel process group. If None, uses global parallel state.
+                      When using different EP sizes for inference vs training, pass the
+                      inference EP group explicitly.
+
         Return:
             (InferenceBatchDimensions) A new InferenceBatchDimensions object with
-            adjusted dimensions.
+            adjusted dimensions, or None if eager mode should be used.
         """
-
-        ep_size = parallel_state.get_expert_model_parallel_world_size()
+        ep_size = get_pg_size(ep_group)
         if ep_size <= 1:
             return local_batch_dims
-
-        expert_model_parallel_group = parallel_state.get_expert_model_parallel_group()
         # all reduce local work across expert model parallel group
 
         has_explicit_chunked_prefill_req = local_batch_dims.has_explicit_chunked_prefill_req
@@ -179,9 +188,7 @@ class InferenceBatchDimensions:
             device=torch.cuda.current_device(),
         )
 
-        torch.distributed.all_reduce(
-            sync_tensor, op=torch.distributed.ReduceOp.MAX, group=expert_model_parallel_group
-        )
+        torch.distributed.all_reduce(sync_tensor, op=torch.distributed.ReduceOp.MAX, group=ep_group)
 
         sync_tensor = sync_tensor.cpu()
         is_any_ep_rank_in_non_decode = sync_tensor[1].item() == 1
@@ -442,6 +449,7 @@ class CUDAGraphBatchDimensionBuilder:
         cuda_graph_batch_dimensions_list: List[InferenceBatchDimensions],
         strict: bool = False,
         decode_only_cuda_graphs: bool = False,
+        ep_group: Optional[torch.distributed.ProcessGroup] = None,
     ) -> Optional[InferenceBatchDimensions]:
         """
         Matches the best CUDA graph batch dimension for the given real batch dimension.
@@ -454,6 +462,9 @@ class CUDAGraphBatchDimensionBuilder:
             decode_only_cuda_graphs: Used by expert parallel matching. If this is true,
             and one of the EP ranks is running a non-decode step, we elect to run in
             eager mode instead of matching a decode-only cuda graph.
+            ep_group: Optional expert parallel process group. If None, uses global parallel state.
+                      When using different EP sizes for inference vs training, pass the
+                      inference EP group explicitly.
         Returns:
             The best matching CUDA graph batch dimension, or None if no applicable match is found
         """
@@ -463,7 +474,10 @@ class CUDAGraphBatchDimensionBuilder:
             return None
 
         adjusted_batch_dim = InferenceBatchDimensions.adjust_batch_dims_for_expert_parallelism(
-            real_batch_dim, strict=strict, decode_only_cuda_graphs=decode_only_cuda_graphs
+            real_batch_dim,
+            strict=strict,
+            decode_only_cuda_graphs=decode_only_cuda_graphs,
+            ep_group=ep_group,
         )
 
         if adjusted_batch_dim is None:

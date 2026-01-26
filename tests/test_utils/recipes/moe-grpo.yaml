@@ -4,7 +4,7 @@ maintainers: [mcore]
 loggers: [stdout]
 spec:
   name: "{test_case}_{environment}_{platforms}"
-  model: gpt
+  model: moe
   build: mcore-pyt-{environment}
   nodes: 1
   gpus: 1
@@ -54,28 +54,8 @@ spec:
     bash ./tests/functional_tests/shell_test_utils/run_ci_test.sh ${{ARGUMENTS[@]}}
 
 products:
-  # - test_case: [gpt_grpo_tp1_pp1_dp8_583m_throughputtest] # Offline until golden values are properly written to disk
-  #   products:
-  #     - environment: [dev]
-  #       scope: [mr]
-  #       platforms: [dgx_h100]
-  - test_case: [gpt_grpo_tp1_pp1_dp8_583m_throughputtest_github]
+  - test_case: [gpt_grpo_tp8tp4_pp1_ep8ep2_dp8_throughputtest]
     products:
       - environment: [dev]
-        scope: [mr-github-broken]
-        platforms: [dgx_h100]
-  - test_case: [gpt_grpo_tp1tp2_pp1_dp8_583m_throughputtest]
-    products:
-      - environment: [dev]
-        scope: [mr-broken]
-        platforms: [dgx_h100]
-  - test_case: [gpt_grpo_tp1tp2_pp1_dp8_583m_throughputtest_github]
-    products:
-      - environment: [dev]
-        scope: [mr-github-broken]
-        platforms: [dgx_h100]
-  - test_case: [gpt_grpo_tp2tp1_pp4pp2_dp8_583m_throughputtest]
-    products:
-      - environment: [dev]
-        scope: [mr-broken]
+        scope: [mr]
         platforms: [dgx_h100]
