@@ -2013,6 +2013,11 @@ def _add_ft_package_args(parser):
     group.add_argument('--calc-ft-timeouts', action='store_true',
                        help='If set, FT package will try to automatically compute the timeouts. '
                        'Note: This feature is for Nvidia internal use only.')
+    group.add_argument('--ft-num-warmup-iters', type=int, default=5,
+                       help='Number of warmup iterations before monitoring step section and '
+                       'out-of-section timeouts. The first N iterations are excluded from '
+                       'timeout monitoring as they can be significantly slower than steady-state. '
+                       'Default: 5. Note: This feature is for Nvidia internal use only.')
     return parser
 
 
