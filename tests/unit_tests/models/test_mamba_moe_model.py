@@ -453,6 +453,7 @@ class TestMambaMoEModel:
         args.moe_router_dtype = "fp64"
         args.moe_router_pre_softmax = False
         args.moe_token_dispatcher_type = "alltoall"
+        args.moe_enable_router_replay = False
         args.no_load_optim = True
         args.no_load_rng = True
         args.no_save_optim = True
