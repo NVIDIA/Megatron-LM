@@ -446,6 +446,14 @@ class CheckpointConfig:
     worker thread/process for handling async saves. When disabled, uses temporal workers that are
     created and destroyed for each save operation."""
 
+    async_ckpt_cpu_priority: int = 10
+    """CPU nice value (0-19, higher = lower priority) for the async checkpoint writer process.
+    Default 10 deprioritizes checkpoint I/O vs training. Only applies when using persistent ckpt worker."""
+
+    async_ckpt_io_priority: int = 3
+    """I/O scheduling class (0-3, 3=idle) for the async checkpoint writer process.
+    Only applies when using persistent ckpt worker. Caller may pass None to _set_process_qos to skip setting."""
+
     ckpt_fully_parallel_load: bool = False
     """Apply full load parallelization across DP for distributed checkpoints."""
 
