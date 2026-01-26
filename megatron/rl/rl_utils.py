@@ -1388,6 +1388,7 @@ def get_grpo_data_iterator(
             sequence_packing=sequence_packing,
             is_correction=is_correction,
             )
+        runtime_state.reset_iteration_counters(iteration)
 
     return buffered_rollouts
 
