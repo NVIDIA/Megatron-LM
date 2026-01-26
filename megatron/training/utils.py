@@ -603,6 +603,25 @@ def get_batch_on_this_tp_rank(data_iterator, mtp_on_this_rank: bool = False):
             _broadcast(batch['loss_mask'])
             _broadcast(batch['attention_mask'])
 
+        def _broadcast_cu_seqlens(cu_seqlens):
+            dev = torch.cuda.current_device()
+
+            n = 0 if cu_seqlens is None else int(cu_seqlens.numel())
+            n_tensor = torch.tensor(n, dtype=torch.int64, device=dev)
+            _broadcast(n_tensor)
+
+            if n == 0:
+                buf = torch.empty(0, dtype=torch.int32, device=dev)
+            else:
+                assert isinstance(cu_seqlens, torch.Tensor)
+                assert cu_seqlens.dtype == torch.int32
+                assert cu_seqlens.shape[0] == 1, "micro-batch-size must be 1 for packing"
+                buf = cu_seqlens.to(device=dev, non_blocking=True).contiguous()
+            _broadcast(buf)
+
+        _broadcast_cu_seqlens(batch['cu_seqlens'])
+        _broadcast(batch['max_seqlen'])
+
     else:
         if args.hybrid_context_parallel:
             seq_len = torch.tensor(0, dtype=torch.int32, device=torch.cuda.current_device())
@@ -705,6 +724,7 @@ def get_batch_on_this_tp_rank(data_iterator, mtp_on_this_rank: bool = False):
             position_ids = None
             cu_seqlens = None
             max_seqlen = None
+
             _broadcast(labels)
             _broadcast(loss_mask)
             _broadcast(attention_mask)
