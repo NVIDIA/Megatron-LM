@@ -57,7 +57,24 @@ def swap_model_weights(
 def reshard_model_weights(
     src_model: LanguageModule, target_model: LanguageModule, service: CopyService
 ):
-    """Reshard and copy model weights from ``src_model`` to ``target_model`` using ``service``."""
+    """Reshard and copy model weights from ``src_model`` to ``target_model`` using ``service``.
+
+    Supports None for both src_model and target_model to allow idle ranks in non-collocated
+    mode to participate in collective operations without performing actual transfers.
+    """
+    # Early check for None models (idle ranks in non-collocated mode)
+    if src_model is None and target_model is None:
+        # Idle rank - participate in collective operations but don't do actual work
+        plan = build_centralized_reshard_plan(None, None, num_experts=None)
+        execute_reshard_plan(plan, None, None, service=service)
+        return
+
+    # At least one model must be provided for active ranks
+    if src_model is None or target_model is None:
+        raise ValueError(
+            "Both src_model and target_model must be provided (or both must be None for idle ranks)"
+        )
+
     # Handle list-wrapped modules used throughout training utils
     src_lm = src_model[0] if isinstance(src_model, (list, tuple)) else src_model
     tgt_lm = target_model[0] if isinstance(target_model, (list, tuple)) else target_model

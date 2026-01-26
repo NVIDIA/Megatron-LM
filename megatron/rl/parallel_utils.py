@@ -21,6 +21,7 @@ def build_inference_pg_collection(
     ep_size: Optional[int] = None,
     expt_tp_size: Optional[int] = None,
     use_tp_pp_dp_mapping: bool = False,
+    rank_offset: int = 0,
 ) -> ProcessGroupCollection:
     """
     Build a ProcessGroupCollection for an RL inference model with custom parallelism.
@@ -30,13 +31,15 @@ def build_inference_pg_collection(
     - expert_grid: for MoE expert layers (expt_tp, ep, expt_dp, pp)
 
     Args:
-        world_size: Total world size (number of ranks).
+        world_size: Total world size (number of ranks) for this model.
         tp_size: Tensor model parallel size. Defaults to training's TP size.
         pp_size: Pipeline parallel size. Defaults to training's PP size.
         cp_size: Context parallel size. Defaults to training's CP size.
         ep_size: Expert parallel size. Defaults to training's EP size.
         expt_tp_size: Expert tensor parallel size. Defaults to training's expert TP size.
         use_tp_pp_dp_mapping: If True, use 'tp-pp-dp' order; otherwise 'tp-dp-pp'.
+        rank_offset: Starting rank when the grid doesn't span the entire communication world.
+                     Used in non-collocated mode where model ranks don't start from 0.
 
     Returns:
         ProcessGroupCollection configured for the inference model.
@@ -78,13 +81,15 @@ def build_inference_pg_collection(
         # Order: tp-cp-pp-dp
         decoder_grid = HyperCommGrid(
             [tp_size, cp_size, pp_size, dp_size],
-            ["tp", "cp", "pp", "dp"]
+            ["tp", "cp", "pp", "dp"],
+            rank_offset=rank_offset
         )
     else:
         # Order: tp-cp-dp-pp (default)
         decoder_grid = HyperCommGrid(
             [tp_size, cp_size, dp_size, pp_size],
-            ["tp", "cp", "dp", "pp"]
+            ["tp", "cp", "dp", "pp"],
+            rank_offset=rank_offset
         )
 
     # Create dense layer groups from decoder_grid
@@ -105,13 +110,15 @@ def build_inference_pg_collection(
         # Order: tp-ep-pp-dp
         expert_grid = HyperCommGrid(
             [expt_tp_size, ep_size, pp_size, expt_dp_size],
-            ["tp", "ep", "pp", "dp"]
+            ["tp", "ep", "pp", "dp"],
+            rank_offset=rank_offset
         )
     else:
         # Order: tp-ep-dp-pp (default)
         expert_grid = HyperCommGrid(
             [expt_tp_size, ep_size, expt_dp_size, pp_size],
-            ["tp", "ep", "dp", "pp"]
+            ["tp", "ep", "dp", "pp"],
+            rank_offset=rank_offset
         )
 
     # Verify PP groups match between decoder and expert grids (required by mpu)

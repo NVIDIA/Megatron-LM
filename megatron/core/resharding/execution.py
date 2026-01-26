@@ -23,8 +23,21 @@ def execute_reshard_plan(
     Execute a reshard plan (from centralized controller).
     A communication service must be provided to abstract transport.
     Expected service API: submit_send(tensor, dest_rank), submit_recv(tensor, src_rank), run().
+
+    Supports None for both src_module and dst_module to allow idle ranks in non-collocated
+    mode to participate in collective operations without performing actual transfers.
     """
 
+    # Handle idle ranks (both modules are None)
+    if src_module is None and dst_module is None:
+        # Idle rank - just participate in barriers, no actual send/recv
+        logger.info("Idle rank: participating in barriers only (no send/recv)")
+        service.run()  # Empty run (no ops submitted)
+        dist.barrier()
+        logger.info("Idle rank: barriers complete")
+        return
+
+    # Active rank - extract parameters and execute plan
     src_params = {name: p for name, p in src_module.named_parameters(recurse=True)}
     dst_params = {name: p for name, p in dst_module.named_parameters(recurse=True)}
     submit_send_with_id = getattr(service, "submit_send_with_id", None)

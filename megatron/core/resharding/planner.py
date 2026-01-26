@@ -215,47 +215,64 @@ def build_centralized_reshard_plan(
 ) -> ReshardPlan:
     """
     Centralized planning: Rank 0 builds complete plan for all ranks, then scatters.
+
+    Supports None for both src_module and dst_module to allow idle ranks in non-collocated
+    mode to participate in collective operations. Idle ranks provide empty metadata and
+    receive empty plans.
     """
     my_global_rank = dist.get_rank()
     world_size = dist.get_world_size()
 
-    # Get process groups
-    src_pg = getattr(src_module, "pg_collection", None)
-    dst_pg = getattr(dst_module, "pg_collection", None)
-    if src_pg is None or dst_pg is None:
-        raise ValueError("Both modules must have pg_collection")
+    # Handle idle ranks (both modules are None)
+    if src_module is None and dst_module is None:
+        # Idle rank - provide empty metadata to collective operations
+        my_src_metadata = []
+        my_dst_metadata = []
+    else:
+        # Active rank - extract metadata from models
+        if src_module is None or dst_module is None:
+            raise ValueError(
+                "Both modules must be provided (or both must be None for idle ranks)"
+            )
 
-    # Gather param metadata from all ranks
-    my_src_params = {name: p for name, p in src_module.named_parameters(recurse=True)}
-    my_dst_params = {name: p for name, p in dst_module.named_parameters(recurse=True)}
+        # Get process groups
+        src_pg = getattr(src_module, "pg_collection", None)
+        dst_pg = getattr(dst_module, "pg_collection", None)
+        if src_pg is None or dst_pg is None:
+            raise ValueError("Both modules must have pg_collection")
 
-    # Build PP layer prefix maps to be used for parameter name rewriting
-    src_layer_prefix_map = _build_layer_module_prefix_map(src_module)
-    dst_layer_prefix_map = _build_layer_module_prefix_map(dst_module)
+        # Gather param metadata from all ranks
+        my_src_params = {name: p for name, p in src_module.named_parameters(recurse=True)}
+        my_dst_params = {name: p for name, p in dst_module.named_parameters(recurse=True)}
 
-    my_src_metadata = [
-        extract_param_metadata(
-            p,
-            name,
-            my_global_rank,
-            src_pg,
-            num_experts=num_experts,
-            layer_module_prefix_map=src_layer_prefix_map,
-        )
-        for name, p in my_src_params.items()
-    ]
-    my_dst_metadata = [
-        extract_param_metadata(
-            p,
-            name,
-            my_global_rank,
-            dst_pg,
-            num_experts=num_experts,
-            layer_module_prefix_map=dst_layer_prefix_map,
-        )
-        for name, p in my_dst_params.items()
-    ]
+        # Build PP layer prefix maps to be used for parameter name rewriting
+        src_layer_prefix_map = _build_layer_module_prefix_map(src_module)
+        dst_layer_prefix_map = _build_layer_module_prefix_map(dst_module)
 
+        my_src_metadata = [
+            extract_param_metadata(
+                p,
+                name,
+                my_global_rank,
+                src_pg,
+                num_experts=num_experts,
+                layer_module_prefix_map=src_layer_prefix_map,
+            )
+            for name, p in my_src_params.items()
+        ]
+        my_dst_metadata = [
+            extract_param_metadata(
+                p,
+                name,
+                my_global_rank,
+                dst_pg,
+                num_experts=num_experts,
+                layer_module_prefix_map=dst_layer_prefix_map,
+            )
+            for name, p in my_dst_params.items()
+        ]
+
+    # All ranks participate in collective operations (idle ranks provide empty lists)
     all_src_metadata_by_rank = [None] * world_size
     all_dst_metadata_by_rank = [None] * world_size
     dist.all_gather_object(all_src_metadata_by_rank, my_src_metadata)
