@@ -81,7 +81,6 @@ def add_megatron_arguments(parser: argparse.ArgumentParser):
     parser = _add_one_logger_args(parser)
     parser = _add_inprocess_restart_args(parser)
     parser = _add_ft_package_args(parser)
-    parser = _add_config_logger_args(parser)
     parser = _add_rerun_machine_args(parser)
     parser = _add_msc_args(parser)
     parser = _add_kitchen_quantization_arguments(parser)
@@ -1873,10 +1872,6 @@ def _add_ft_package_args(parser):
     group.add_argument('--calc-ft-timeouts', action='store_true',
                        help='If set, FT package will try to automatically compute the timeouts. '
                        'Note: This feature is for Nvidia internal use only.')
-    return parser
-
-
-def _add_config_logger_args(parser):
     return parser
 
 
