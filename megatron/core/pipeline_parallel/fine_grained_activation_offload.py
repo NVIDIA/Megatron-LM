@@ -654,6 +654,9 @@ class PipelineOffloadManager:
         while not self._is_warmup and (
             self._cur_forward_chunk is None or self._cur_forward_chunk.finish_all_groups(name)
         ):
+            if self._cached_chunks_index_forward >= len(self._cached_chunks_forward):
+                self._cur_forward_chunk = None
+                break
             self._cur_forward_chunk = self._cached_chunks_forward[self._cached_chunks_index_forward]
             self._cached_chunks_index_forward += 1
             debug_rank(f"new cur_forward_chunk {self._cur_forward_chunk}")
