@@ -187,21 +187,7 @@ class GraphableMegatronModule(MegatronModule):
             # graphs. Those hooks and args are collected in this list and should be manually
             # triggered before CUDA Graph running. This is required to ensure the correct param
             # all-gather overlap with forward compute.
-            self.cuda_graph_manual_pre_hooks = []
-            self.cuda_graph_manual_wgrad_post_hooks = []
-
-    def _te_cuda_graph_backward_dw_graph(self, microbatch_idx):
-        """
-        CUDA Graph backward weight gradient computation for current layer.
-        """
-        cg_index = microbatch_idx % len(self.cuda_graphs)
-        if not hasattr(self.cuda_graphs[cg_index], 'backward_dw'):
-            return
-        self.cuda_graphs[cg_index].backward_dw()
-
-        # Trigger the backward post-hooks.
-        for hook in self.cuda_graph_manual_wgrad_post_hooks:
-            hook()
+            self.cuda_graph_manual_hooks = []
 
     def get_layer_static_inputs(self, seq_length, micro_batch_size):
         """
@@ -231,43 +217,24 @@ class GraphableMegatronModule(MegatronModule):
         )
         return static_inputs
 
-    def setup_manual_hooks(self, make_forward_pre_hook_func, make_backward_post_hook_func):
+    def setup_manual_hooks(self, make_hook_func):
         """
         Set CUDA Graph manual hooks for the submodules that contain direct parameters and are
         covered by cudagraphs.
         """
-        self.cuda_graph_manual_pre_hooks = []
-        self.cuda_graph_manual_wgrad_post_hooks = []
+        self.cuda_graph_manual_hooks = []
 
         # Select the modules who contain direct parameters and are covered by cudagraphs.
-        # Add these modules and params to `cuda_graph_manual_pre_hooks` and
-        # `cuda_graph_manual_wgrad_post_hooks` because their hooks will not be
-        # automatically triggered when they go through the CUDA Graph path.
+        # Add these modules to the `cuda_graph_manual_hooks` because their hooks will not
+        # be automatically triggered when they go through the CUDA Graph path.
         param_modules = {}
-        params = {}
         for submodule in self._get_submodules_under_cudagraphs():
             for module in submodule.modules():
                 if next(module.parameters(recurse=False), None) is not None:
                     # Module contains direct parameters.
                     param_modules[id(module)] = module
-
-                    # Add parameters to `params` to avoid duplicate parameters.
-                    if not hasattr(module, "register_wgrad_accumulation_and_reduce_hooks"):
-                        continue
-                    for param in module.parameters(recurse=False):
-                        if hasattr(module, "get_backward_dw_params"):
-                            for param in module.get_backward_dw_params():
-                                params[id(param)] = param
-                        else:
-                            params[id(param)] = param
-
-        # Save forward pre-hooks and backward post-hooks.
-        if make_forward_pre_hook_func is not None:
-            for module in param_modules.values():
-                self.cuda_graph_manual_pre_hooks.append((make_forward_pre_hook_func(), (module,)))
-        if make_backward_post_hook_func is not None:
-            for param in params.values():
-                self.cuda_graph_manual_wgrad_post_hooks.append(make_backward_post_hook_func(param))
+        for module in param_modules.values():
+            self.cuda_graph_manual_hooks.append((make_hook_func(), (module,)))
 
     def _get_submodules_under_cudagraphs(self):
         """
@@ -300,7 +267,7 @@ class GraphableMegatronModule(MegatronModule):
         cg_index = getattr(self, 'current_microbatch', 0) % len(self.cuda_graphs)
         cudagraph_args, cudagraph_kwargs = self._get_te_cuda_graph_replay_args(*args, **kwargs)
 
-        for hook, hook_args in self.cuda_graph_manual_pre_hooks:
+        for hook, hook_args in self.cuda_graph_manual_hooks:
             hook(*hook_args)
         return self.cuda_graphs[cg_index](*cudagraph_args, **cudagraph_kwargs)
 

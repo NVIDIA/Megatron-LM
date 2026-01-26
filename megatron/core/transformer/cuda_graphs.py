@@ -1996,13 +1996,8 @@ class TECudaGraphHelper:
         """
         for chunk_number, layers in enumerate(self.callables_per_chunk):
             model_chunk = self.model[chunk_number]
-            make_forward_pre_hook_func = model_chunk._make_forward_pre_hook
-            if self.config.delay_wgrad_compute:
-                make_backward_post_hook_func = model_chunk._make_backward_post_hook
-            else:
-                make_backward_post_hook_func = None
             for layer in layers:
-                layer.setup_manual_hooks(make_forward_pre_hook_func, make_backward_post_hook_func)
+                layer.setup_manual_hooks(model_chunk._make_forward_pre_hook)
 
     def delete_cuda_graphs(self):
         """
@@ -2021,8 +2016,7 @@ class TECudaGraphHelper:
                     else:
                         graphs_not_reset += 1
                 layer.cuda_graphs = []
-                layer.cuda_graph_manual_pre_hooks = []
-                layer.cuda_graph_manual_wgrad_post_hooks = []
+                layer.cuda_graph_manual_hooks = []
 
         log_on_each_pipeline_stage(
             logger=logger,

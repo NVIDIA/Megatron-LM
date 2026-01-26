@@ -424,7 +424,7 @@ def build_transformer_layer_callables(layer: TransformerLayer):
             )
             forward_func = layer._te_cuda_graph_replay
             attn_backward_dw_wrapper.set_graphed_backward_dw_callable(
-                partial(layer._te_cuda_graph_backward_dw_graph, layer.current_microbatch)
+                partial(layer.backward_dw_cudagraph, layer.current_microbatch)
             )
         else:
             # wrapper function that keeps consistent api with cuda graph replay
