@@ -406,10 +406,18 @@ class MoELayer(BaseMoELayer):
 
     def backward_dw(self, routed_experts: bool = True, shared_experts: bool = False):
         """Compute weight gradients for experts and shared experts."""
+        # TODO(Wohox): replace the "routed_experts" and "shared_experts" arguments with better
+        # naming to better explain that they are actually from different fine-grained callables,
+        # or use scanning to decide which backward_dw should be called.
         if routed_experts:
             self.experts.backward_dw()
-        if shared_experts and self.use_shared_expert and not self.shared_expert_overlap:
-            self.shared_experts.backward_dw()
+            if self.config.moe_latent_size:
+                self.fc2_latent_proj.backward_dw()
+        if shared_experts:
+            if self.use_shared_expert and not self.shared_expert_overlap:
+                self.shared_experts.backward_dw()
+            if self.config.moe_latent_size:
+                self.fc1_latent_proj.backward_dw()
 
     def set_for_recompute_pre_mlp_layernorm(self):
         """Set the MoE layer for recompute pre_mlp_layernorm. Only needed for fp8/fp4."""
