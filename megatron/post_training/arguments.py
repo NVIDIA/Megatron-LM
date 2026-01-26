@@ -73,7 +73,7 @@ def add_modelopt_args(parser):
         '--export-kd-teacher-ckpt-format',
         type=str,
         default=None,
-        choices=['torch', 'torch_dist', 'zarr', 'torch_dcp'],
+        choices=['torch', 'torch_dist', 'torch_dcp'],
         help="Checkpoint format of teacher model, if different from student's.",
     )
 
