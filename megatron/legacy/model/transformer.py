@@ -1124,10 +1124,6 @@ def _get_num_layers(args, model_type, is_decoder=False):
     return num_layers
 
 
-def _get_layer_type(default_layer_type):
-    return default_layer_type
-
-
 class ParallelTransformer(MegatronModule):
     """Transformer class."""
 
@@ -1218,11 +1214,10 @@ class ParallelTransformer(MegatronModule):
 
         def build_layer(layer_number):
             if args.transformer_impl == 'local':
-                current_layer_type = _get_layer_type(layer_type)
                 return ParallelTransformerLayer(
                     config,
                     layer_number,
-                    layer_type=current_layer_type,
+                    layer_type=layer_type,
                     self_attn_mask_type=self_attn_mask_type,
                     drop_path_rate=self.drop_path_rates[layer_number - 1])
             else:
