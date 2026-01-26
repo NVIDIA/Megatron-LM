@@ -10,7 +10,6 @@ import torch
 from torch.distributed import ProcessGroup
 from torch.utils.data import BatchSampler, DataLoader, SequentialSampler, Subset
 from torch.utils.data._utils.collate import default_collate
-from tqdm import tqdm
 
 from megatron.training import get_args, get_tokenizer, print_rank_0
 from megatron import core
