@@ -581,8 +581,6 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
 
         inference_context = deprecate_inference_params(inference_context, inference_params)
 
-        # Residual connection.
-        residual = hidden_states
 
         # Optional Input Layer norm
         if self.recompute_input_layernorm:
@@ -595,6 +593,13 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
             with off_interface(self.offload_attn_norm, hidden_states, "attn_norm") as hidden_states:
                 input_layernorm_output = apply_module(self.input_layernorm)(hidden_states)
 
+        if isinstance(input_layernorm_output, tuple):
+            if len(input_layernorm_output) != 2:
+                raise ValueError(f"When the output of input_layernorm is a tuple, it is expected to have 2 elements (output, residual), but got {len(input_layernorm_output)}")
+            input_layernorm_output, residual = input_layernorm_output
+        else:
+            residual = hidden_states
+        
         using_fused_tp_inference_kernel = (not self.training) and (
             self.config.inference_fuse_tp_communication
         )
@@ -649,11 +654,15 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
                 hidden_states, name="attn_norm", forced_released_tensors=[residual]
             )
 
-        # Residual connection.
-        residual = hidden_states
-
         # Optional Layer norm after self-attention
         pre_cross_attn_layernorm_output = apply_module(self.pre_cross_attn_layernorm)(hidden_states)
+
+        if isinstance(pre_cross_attn_layernorm_output, tuple):
+            if len(pre_cross_attn_layernorm_output) != 2:
+                raise ValueError(f"When the output of pre_cross_attn_layernorm_output is a tuple, it is expected to have 2 elements (output, residual), but got {len(pre_cross_attn_layernorm_output)}")
+            pre_cross_attn_layernorm_output, residual = pre_cross_attn_layernorm_output
+        else:
+            residual = hidden_states
 
         # Cross attention.
         attention_output_with_bias = self.cross_attention(
