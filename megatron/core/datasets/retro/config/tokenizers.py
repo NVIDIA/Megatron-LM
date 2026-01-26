@@ -4,12 +4,12 @@
 
 from dataclasses import dataclass
 
-from megatron.core.datasets.megatron_tokenizer import MegatronTokenizer
+from megatron.core.tokenizers import MegatronTokenizerBase
 
 
 @dataclass
 class RetroTokenizers:
     """Container class for GPT and Bert tokenizers."""
 
-    gpt: MegatronTokenizer = None
-    bert: MegatronTokenizer = None
+    gpt: MegatronTokenizerBase = None
+    bert: MegatronTokenizerBase = None

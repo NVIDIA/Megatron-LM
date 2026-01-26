@@ -475,7 +475,8 @@ def test_router_gating_linear(router_dtype):
     weight = ref_weight.detach()
     inp.requires_grad = True
     weight.requires_grad = True
-    output = router_gating_linear(inp, weight, router_dtype)
+    bias = None
+    output = router_gating_linear(inp, weight, bias, router_dtype)
     output.backward(bwd_input)
 
     assert output.dtype == router_dtype
@@ -484,3 +485,41 @@ def test_router_gating_linear(router_dtype):
     assert torch.allclose(output, ref_output, **tols)
     assert torch.allclose(inp.grad, ref_inp.grad, **tols)
     assert torch.allclose(weight.grad, ref_weight.grad, **tols)
+
+
+@pytest.mark.internal
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
+@pytest.mark.parametrize("router_dtype", [torch.bfloat16, torch.float32, torch.float64])
+def test_router_gating_linear_bias(router_dtype):
+    tols = dict(rtol=2.0e-2, atol=1.0e-3)
+
+    ref_inp = torch.randn((4096, 7168), dtype=router_dtype, device="cuda")
+    ref_weight = torch.randn((256, 7168), dtype=router_dtype, device="cuda")
+    ref_bias = torch.randn((256,), dtype=router_dtype, device="cuda")
+    ref_inp.requires_grad = True
+    ref_weight.requires_grad = True
+    ref_bias.requires_grad = True
+    bwd_input = torch.randn((4096, 256), dtype=router_dtype, device="cuda")
+
+    ref_output = torch.nn.functional.linear(
+        ref_inp.to(router_dtype), ref_weight.to(router_dtype), ref_bias.to(router_dtype)
+    )
+    ref_output.backward(bwd_input)
+
+    inp = ref_inp.detach()
+    weight = ref_weight.detach()
+    bias = ref_bias.detach()
+    inp.requires_grad = True
+    weight.requires_grad = True
+    bias.requires_grad = True
+    output = router_gating_linear(inp, weight, bias, router_dtype)
+    output.backward(bwd_input)
+
+    assert output.dtype == router_dtype
+    assert ref_inp.grad.dtype == ref_inp.dtype
+    assert ref_weight.grad.dtype == ref_weight.dtype
+    assert ref_bias.grad.dtype == ref_bias.dtype
+    assert torch.allclose(output, ref_output, **tols)
+    assert torch.allclose(inp.grad, ref_inp.grad, **tols)
+    assert torch.allclose(weight.grad, ref_weight.grad, **tols)
+    assert torch.allclose(bias.grad, ref_bias.grad, **tols)

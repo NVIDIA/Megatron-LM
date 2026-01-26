@@ -20,10 +20,10 @@ docker buildx create --name container --driver=docker-container --use tls-enviro
 
 ADDITIONAL_PARAMS=()
 
-if [[ "$CI_COMMIT_BRANCH" == "ci-rebuild-mcore-nemo-image" || "$CI_COMMIT_BRANCH" == "main" ]]; then
+if [[ "$CI_COMMIT_BRANCH" == "ci-rebuild-mcore-nemo-image" || "$CI_COMMIT_BRANCH" == "main" || "$CI_COMMIT_BRANCH" == "dev" ]]; then
     ADDITIONAL_PARAMS+=("--pull")
     ADDITIONAL_PARAMS+=("--cache-to type=registry,ref=${IMAGE}-buildcache:main,mode=max")
-    ADDITIONAL_PARAMS+=("-t ${IMAGE}:main")
+    ADDITIONAL_PARAMS+=("-t ${IMAGE}:${CI_COMMIT_BRANCH}")
 elif [[ -n "$CI_MERGE_REQUEST_IID" ]]; then
     ADDITIONAL_PARAMS+=("--cache-to type=registry,ref=${IMAGE}-buildcache:${CI_MERGE_REQUEST_IID},mode=max")
     ADDITIONAL_PARAMS+=("-t ${IMAGE}:${CI_MERGE_REQUEST_IID}")
@@ -44,7 +44,6 @@ JET_API_VERSION=$(curl -s -u "$ARTIFACTORY_USER:$ARTIFACTORY_TOKEN" "https://sc-
 DOCKER_BUILDKIT=1 docker build \
     --secret id=JET_INDEX_URLS \
     --secret id=LOGGER_INDEX_URL \
-    --secret id=EXPERIMENTAL_FLASH_ATTN \
     --target $STAGE \
     -f docker/$FILE \
     -t ${IMAGE}:${CI_PIPELINE_ID} \

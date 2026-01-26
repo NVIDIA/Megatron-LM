@@ -188,11 +188,14 @@ def get_required_reviewers(mr):
     ]
 
     if review_group is None or len(review_group) == 0:
-        review_group = ["okoenig@nvidia.com"]
+        review_group = ["S06GU680R3N"]
 
     print(f"Reviewer: {review_group}")
 
-    return ", ".join(get_slack_user_id(reviewer) for reviewer in review_group)
+    return ", ".join(
+        get_slack_user_id(reviewer) if "@" in reviewer else f"<!subteam^{reviewer}>"
+        for reviewer in review_group
+    )
 
 
 def get_priority(days_in_current_stage):

@@ -3,6 +3,7 @@
 /* Helper methods for fast index mapping builds */
 
 #include <algorithm>
+#include <cassert>
 #include <iostream>
 #include <limits>
 #include <math.h>
@@ -46,7 +47,7 @@ void build_exhaustive_blending_indices(py::array_t<int16_t> &dataset_index, py::
   while (dataset_unspent_indices.size() > 0) {
     double index_sample_double = std::max(static_cast<double>(index_sample), 1.0);
 
-    int64_t error_argmax;
+    int64_t error_argmax = -1;
     double error_max = std::numeric_limits<double>::lowest();
 
     for (int32_t index_dataset : dataset_unspent_indices) {
@@ -56,6 +57,7 @@ void build_exhaustive_blending_indices(py::array_t<int16_t> &dataset_index, py::
         error_max = error;
       }
     }
+    assert(error_argmax >= 0);
 
     // Populate the indices.
     dataset_index_ptr[index_sample] = static_cast<int16_t>(error_argmax);

@@ -9,11 +9,13 @@ import types
 import typing as T
 from collections import namedtuple
 from copy import deepcopy
+from functools import partial
 
 import numpy as np
 import torch
 from tqdm import tqdm
 
+from gpt_builders import gpt_builder
 from megatron.core import parallel_state
 from megatron.core.datasets.gpt_dataset import _get_ltor_masks_and_position_ids
 from megatron.core.enums import ModelType
@@ -31,7 +33,7 @@ from megatron.training.checkpointing import load_checkpoint as _load_checkpoint
 from megatron.training.checkpointing import save_checkpoint as _save_checkpoint
 from megatron.training.global_vars import set_global_variables, unset_global_variables
 from megatron.training.training import get_model
-from pretrain_gpt import model_provider
+from model_provider import model_provider
 from tests.unit_tests.test_utilities import Utils
 
 CHECKPOINTS_DIR = "/tmp/ckpt-converter-tests"
@@ -225,8 +227,9 @@ class Pipeline:
 
     @staticmethod
     def build_model():
+        model_provider_func = partial(model_provider, gpt_builder)
         models = get_model(
-            model_provider_func=model_provider, model_type=ModelType.encoder_or_decoder
+            model_provider_func=model_provider_func, model_type=ModelType.encoder_or_decoder
         )
         [m.eval() for m in models]
 

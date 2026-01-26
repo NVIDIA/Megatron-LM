@@ -29,6 +29,9 @@ ShardedStateDict = Dict[str, Any]
 ReplicaId = Union[int, Tuple[int, ...]]
 
 
+_logged_deprecations = {}
+
+
 class ShardedBase(ABC):
     """Base class for ShardedTensor and ShardedStateDict."""
 
@@ -135,16 +138,30 @@ class ShardedTensor(ShardedBase):
                 f"equal to global shape dimensions for {self}"
             )
 
-        for off, sh in zip(self.global_offset[self.prepend_axis_num :], self.local_shape):
-            if sh != 0 and off % sh != 0:
-                raise CheckpointingException(
-                    f"Global offset ({off}) must be divisible by local shape ({sh}) for {self}."
-                )
+        if self.axis_fragmentations is not None:
+            for off, sh in zip(self.global_offset[self.prepend_axis_num :], self.local_shape):
+                if sh != 0 and off % sh != 0:
+                    raise CheckpointingException(
+                        f"Global offset ({off}) must be divisible by local shape ({sh}) for {self}."
+                    )
 
         if has_flattened_range and self.flattened_range.step is not None:
             raise CheckpointingException(
                 f"`step` argument in the flattened range of a ShardedTensor is not supported."
             )
+
+        if self.flattened_range is not None:
+            if not _logged_deprecations.get("flattened_range", False):
+                logger.warning(
+                    "ShardedTensor.flattened_range is deprecated."
+                    " Use latest DistributedOptimizer formats."
+                )
+                _logged_deprecations["flattened_range"] = True
+
+    @property
+    def has_regular_grid(self):
+        """Alias for having a regular sharding grid."""
+        return self.axis_fragmentations is not None
 
     def global_slice(self) -> Tuple[Union[int, slice], ...]:
         """

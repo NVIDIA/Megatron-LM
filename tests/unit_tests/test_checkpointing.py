@@ -104,6 +104,9 @@ def create_args():
     args.no_load_rng = False
     args.log_progress = False
     args.ckpt_fully_parallel_save = False
+    args.dist_ckpt_save_pre_mcore_014 = False
+    args.dist_ckpt_optim_fully_reshardable = False
+    args.distrib_optim_fully_reshardable_mem_efficient = False
     args.auto_detect_ckpt_format = False
     args.retro_add_retriever = False
     args.ckpt_convert_update_legacy_dist_opt_format = False
@@ -131,6 +134,7 @@ def create_ckpt_load_args(create_args):
     args.ckpt_fully_parallel_save = False
     args.ckpt_fully_parallel_load = False
     args.dist_ckpt_strictness = 'assume_ok_unexpected'
+    args.use_megatron_fsdp = False
     args.strict_fsdp_dtensor_load = True
 
     yield args

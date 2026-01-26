@@ -1,0 +1,153 @@
+ENV_VARS:
+  SKIP_PYTEST: 0
+  CUDA_DEVICE_MAX_CONNECTIONS: 1
+  NVTE_ALLOW_NONDETERMINISTIC_ALGO: 0
+  NCCL_ALGO: Ring
+  CUBLAS_WORKSPACE_CONFIG: :4096:8
+MODEL_ENV_VARS:
+  # Model specific environmental variables below. Currently only GPUS_PER_NODE is supported.
+  MODEL_ARGS:
+    # DP=1, TP=1, CP=1, PP=1
+    GPUS_PER_NODE: 1
+  MODEL_ARGS_10:
+    # DP=1, TP=1, CP=1, PP=1
+    GPUS_PER_NODE: 2
+  MODEL_ARGS_2:
+    # DP=2, TP=1, CP=1, PP=1
+    GPUS_PER_NODE: 2
+  MODEL_ARGS_3:
+    # DP=1, TP=2, CP=1, PP=1
+    GPUS_PER_NODE: 2
+  MODEL_ARGS_4:
+    # DP=1, TP=1, CP=2, PP=1
+    GPUS_PER_NODE: 2
+  MODEL_ARGS_5:
+    # DP=1, TP=1, CP=1, PP=2
+    GPUS_PER_NODE: 2
+TEST_TYPE: checkpoint-consistency
+MODE: pretraining
+# TODO figure out how to use yq merge syntax to put reused arguments in a single place.
+BASE_MODEL_ARGS: &BASE_MODEL_ARGS
+  # generic training settings
+  #  Use a an odd ROPE base to make sure the gradients are farther from 0
+  --rotary-base: 500
+  # Vocab size divisible by 1 to keep dimensions in line under TP. TODO figure out vocab size.
+  --finetune: true
+  --seed: ${REPEAT}
+  --override-opt_param-scheduler: true
+  --no-load-optim: true
+  --recompute-num-layers: 1
+  --deterministic-mode: true
+  --bf16: true
+  --train-iters: 1
+  --eval-iters: 0
+  --manual-gc: true
+  --use-mcore-models: true
+  --distributed-backend: nccl
+  # parallelism settings
+  --sequence-parallel: true
+  # embedding settings
+  --untie-embeddings-and-output-weights: true
+  --position-embedding-type: rope
+  --rotary-percent: 1.0
+  --max-position-embeddings: 4096
+  # transformer settings
+  --num-layers: 32
+  --hidden-size: 3072
+  --ffn-hidden-size: 8192
+  --num-attention-heads: 32
+  --num-query-groups: 8
+  --seq-length: 512
+  --kv-channels: 128
+  --ffn-hidden-size: 8192
+  --group-query-attention: true
+  --normalization: RMSNorm
+  --swiglu: true
+  --attention-dropout: 0.0
+  --hidden-dropout: 0.0
+  --no-create-attention-mask-in-dataloader: true
+  --transformer-impl: transformer_engine
+  --disable-bias-linear: true
+  # gradient & optimizer settings
+  --clip-grad: 1.0
+  --overlap-grad-reduce: true
+  --overlap-param-gather: true
+  --lr: 3e-4
+  --lr-warmup-samples: 0
+  # Set adam beta1 and beta2 to 0 so that we can easily check the gradients
+  --adam-beta1: 0.0
+  --adam-beta2: 0.0
+  --adam-eps: 1e-8
+  --use-distributed-optimizer: true
+  --split: 949,50,1
+  --no-gradient-accumulation-fusion: true
+  # checkpoint settings
+  --save-interval: 1
+  --eval-interval: 1000
+  --ckpt-format: torch_dist
+  --dist-ckpt-strictness: log_all # backward compatibility for TE changes
+  --save: ${CHECKPOINT_SAVE_PATH}
+  --load: ${CHECKPOINT_LOAD_PATH}
+  # data settings
+  --data-cache-path: ${DATA_CACHE_PATH}
+  --data-path: ${DATA_PATH}/my-gpt3_00_text_document
+  --vocab-file: ${DATA_PATH}/bpe/vocab.json
+  --merge-file: ${DATA_PATH}/bpe/merges.txt
+  # logging settings
+  --tensorboard-dir: ${TENSORBOARD_PATH}
+  --timing-log-level: 2
+  --log-interval: 1
+  --log-params-norm: true
+  --log-num-zeros-in-grad: true
+  --log-validation-ppl-to-tensorboard: true
+  --log-timers-to-tensorboard: true
+  --log-memory-to-tensorboard: true
+  # Needed for easy access to optimizer states
+  --dist-ckpt-save-pre-mcore-014: true
+  # rerun settings
+  --rerun-mode: validate_results
+MODEL_ARGS:
+  <<: *BASE_MODEL_ARGS
+  #########################################################
+  # DP=1, TP=1, CP=1, PP=1
+  --micro-batch-size: 2
+  --global-batch-size: 2
+  --tensor-model-parallel-size: 1
+  --context-parallel-size: 1
+  --pipeline-model-parallel-size: 1
+MODEL_ARGS_2:
+  <<: *BASE_MODEL_ARGS
+  #########################################################
+  # DP=2, TP=1, CP=1, PP=1
+  --micro-batch-size: 1
+  --global-batch-size: 2
+  --tensor-model-parallel-size: 1
+  --context-parallel-size: 1
+  --pipeline-model-parallel-size: 1
+MODEL_ARGS_3:
+  <<: *BASE_MODEL_ARGS
+  #########################################################
+  # DP=1, TP=2, CP=1, PP=1
+  --micro-batch-size: 2
+  --global-batch-size: 2
+  --tensor-model-parallel-size: 2
+  --context-parallel-size: 1
+  --pipeline-model-parallel-size: 1
+MODEL_ARGS_4:
+  <<: *BASE_MODEL_ARGS
+  #########################################################
+  # DP=1, TP=1, CP=2, PP=1
+  --micro-batch-size: 2
+  --global-batch-size: 2
+  --tensor-model-parallel-size: 1
+  --context-parallel-size: 2
+  --pipeline-model-parallel-size: 1
+MODEL_ARGS_5:
+  <<: *BASE_MODEL_ARGS
+  #########################################################
+  # DP=1, TP=1, CP=1, PP=2
+  --micro-batch-size: 2
+  --global-batch-size: 2
+  --tensor-model-parallel-size: 1
+  --context-parallel-size: 1
+  --pipeline-model-parallel-size: 2

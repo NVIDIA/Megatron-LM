@@ -51,6 +51,7 @@ MODEL_ARGS:
   --deterministic-mode: true
   --ckpt-format: torch_dist
   --log-memory-to-tensorboard: true
+  --legacy-tokenizer: true
 TEST_TYPE: regular
 METRICS:
   - "iteration-time"

@@ -26,7 +26,7 @@ def add_mmlu_args(parser):
     """Add additional arguments for ModelOpt text generation PTQ."""
     group = parser.add_argument_group(title='ModelOpt text generation ptq')
     group.add_argument("--disable-tqdm", action="store_true", help="Disable tqdm.")
-    group.add_argument("--percentage", type=float, default=1.0)
+    group.add_argument("--fraction", type=float, default=1.0, help="Fraction of dataset to use.")
     group.add_argument("--lower-bound", type=float, default=None)
     add_modelopt_args(parser)
     return parser
@@ -130,18 +130,35 @@ if __name__ == "__main__":
 
     args = get_args()
 
+    # Meta device initialization for ParallelLinear only works if using cpu initialization.
+    # Meta device initialization is used such that models can be materialized in low-precision
+    # directly when ModelOpt real quant is used. Otherwise, the model is first initialized
+    # as BF16 in memory which may result in OOM and defeat the purpose of real quant.
+    if args.init_model_with_meta_device:
+        args.use_cpu_initialization = True
+    else:
+        warnings.warn(
+            "--init-model-with-meta-device is not set. If you would like to resume the "
+            "model in low-bit directly (low-memory initialization and skipping 16-bit), "
+            "--init-model-with-meta-device must be set.",
+            UserWarning,
+        )
+
+    model = get_model(functools.partial(model_provider, parallel_output=True), wrap_with_ddp=False)
+    report_current_memory_info()
+
+    # Materialize the model from meta device to gpu before loading the checkpoint.
+    unwrapped_model = unwrap_model(model)[0]
+    unwrapped_model.to_empty(device="cuda")
+    report_current_memory_info()
+
     disable_tqdm = args.disable_tqdm or torch.distributed.get_rank() > 0
 
     tokenizer = get_tokenizer()._tokenizer
-    model = get_model(functools.partial(model_provider, parallel_output=True), wrap_with_ddp=False)
-
-    report_current_memory_info()
 
     if args.load is not None:
         load_modelopt_checkpoint(model, strict=not args.untie_embeddings_and_output_weights)
         print_rank_0("Done loading checkpoint")
-
-    unwrapped_model = unwrap_model(model)[0]
 
     all_subjects = get_all_subjects()
 
@@ -153,7 +170,7 @@ if __name__ == "__main__":
 
         correct = []
         for idx, test_example in enumerate(test_data):
-            if idx > args.percentage * len(test_data):
+            if idx > args.fraction * len(test_data):
                 break
             prompt = generate_prompt(test_example, dev_data, few_shots=0)
             label = ["A", "B", "C", "D"][test_example["answer"]]

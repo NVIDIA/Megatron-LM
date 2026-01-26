@@ -17,6 +17,7 @@ import json
 import os
 import sys
 import warnings
+from contextlib import contextmanager
 from datetime import datetime
 from collections import defaultdict
 
@@ -42,7 +43,7 @@ except ImportError:
             local_multi_tensor_applier as multi_tensor_applier,
         )
 
-from megatron.training import get_args, get_adlr_autoresume
+from megatron.training import get_args, get_timers, get_adlr_autoresume
 from megatron.core import mpu
 from megatron.core.datasets.utils import get_blend_from_list
 from megatron.core.tensor_parallel import param_is_not_tensor_parallel_duplicate
@@ -140,14 +141,16 @@ def calc_params_l2_norm(model, force_create_fp32_copy=False):
             False,  # no per-parameter norm.
         )
         sharded_norm_2 = sharded_norm * sharded_norm
-        # Sum over all DP groups, including CP since distributed optimizer state is
-        # sharded jointly over DP+CP.
-        torch.distributed.all_reduce(
-            sharded_norm_2,
-            op=torch.distributed.ReduceOp.SUM,
-            group=mpu.get_data_parallel_group(with_context_parallel=True)
-        )
-        norm_2 += sharded_norm_2
+    else:
+        sharded_norm_2 = torch.zeros((1,), dtype=torch.float32, device='cuda')
+    # Sum over all DP groups, including CP since distributed optimizer state is
+    # sharded jointly over DP+CP.
+    torch.distributed.all_reduce(
+        sharded_norm_2,
+        op=torch.distributed.ReduceOp.SUM,
+        group=mpu.get_data_parallel_group(with_context_parallel=True)
+    )
+    norm_2 += sharded_norm_2
 
     # Add norm contribution from expert layers in MoEs.
     if len(moe_params_data) > 0:
@@ -322,9 +325,13 @@ def check_adlr_autoresume_termination(iteration, model, optimizer, opt_param_sch
         sys.exit(0)
 
 
-def get_ltor_masks_and_position_ids(
-    data, eod_token, reset_position_ids, reset_attention_mask, eod_mask_loss
-):
+def get_ltor_masks_and_position_ids(data,
+                                    eod_token,
+                                    pad_token,
+                                    reset_position_ids,
+                                    reset_attention_mask,
+                                    eod_mask_loss,
+                                    pad_mask_loss):
     """Build masks and position id for left to right model."""
 
     # Extract batch size and sequence length.
@@ -343,6 +350,8 @@ def get_ltor_masks_and_position_ids(
     loss_mask = torch.ones(data.size(), dtype=torch.float, device=data.device)
     if eod_mask_loss:
         loss_mask[data == eod_token] = 0.0
+    if pad_mask_loss:
+        loss_mask[data == pad_token] = 0.0
 
     # Position ids.
     position_ids = torch.arange(seq_length, dtype=torch.long, device=data.device)
@@ -356,7 +365,7 @@ def get_ltor_masks_and_position_ids(
         for b in range(micro_batch_size):
 
             # Find indecies where EOD token is.
-            eod_index = position_ids[b, data[b] == eod_token]
+            eod_index = position_ids[b, data[b] == eod_token] & position_ids[b, data[b] == pad_token]
             # Detach indecies from positions if going to modify positions.
             if reset_position_ids:
                 eod_index = eod_index.clone()
@@ -453,6 +462,18 @@ def print_rank_last(message):
         print(message, flush=True)
 
 
+def is_first_or_last_pipeline_stage(vp_stage):
+    """Return True if on first or last pipeline stage, taking into account virtual
+    pipeline parallelism."""
+    ignore_virtual = True
+    if vp_stage is not None:
+        ignore_virtual = False
+    return (
+        mpu.is_pipeline_first_stage(ignore_virtual=ignore_virtual, vp_stage=vp_stage)
+        or mpu.is_pipeline_last_stage(ignore_virtual=ignore_virtual, vp_stage=vp_stage)
+    )
+
+
 def get_device_arch_version():
     """Returns GPU arch version (8: Ampere, 9: Hopper, 10: Blackwell, ...)"""
     return torch.cuda.get_device_properties(torch.device("cuda:0")).major
@@ -538,11 +559,8 @@ def get_batch_on_this_tp_rank(data_iterator):
 
     if mpu.get_tensor_model_parallel_rank() == 0:
 
-        if data_iterator is not None:
-            data = next(data_iterator)
-        else:
-            data = None
-
+        assert data_iterator is not None
+        data = next(data_iterator)
         batch = {
             'tokens': data["tokens"].cuda(non_blocking=True),
             'labels': data["labels"].cuda(non_blocking=True),
@@ -653,107 +671,110 @@ def get_batch_on_this_tp_rank(data_iterator):
 def update_use_dist_ckpt(args):
     args.use_dist_ckpt = args.ckpt_format != "torch"
 
-def get_batch_on_this_tp_rank_idxmap_sft(data_iterator):
-    args = get_args()
-    tokenizer = get_tokenizer()
-    def _broadcast(item):
-        if item is None:
-            return
-        torch.distributed.broadcast(item, mpu.get_tensor_model_parallel_src_rank(),
-                                    group=mpu.get_tensor_model_parallel_group())
-        
-    if mpu.get_tensor_model_parallel_rank() == 0:
 
-        if isinstance(data_iterator, dict):
-            data = data_iterator
+def to_empty_if_meta_device(module: torch.nn.Module, *, device: torch.device, recurse=True):
+    """Move tensors to device if not meta device; otherwise materialize with empty_like().
+
+    Officially, torch suggests to_empty() for meta device materialization. Under the hood,
+    torch.empty_like() is applied to all parameters or buffers (see _apply). This may
+    accidently overwrite buffers with precomputed values during construction. Given the
+    goal is to only materialize those tensors on meta device, this function checks the
+    device first and only move the tensor to the destination if it is not on meta device.
+   
+    Args:
+        module: The target module to apply this transformation.
+        device: The desired device of the parameters
+            and buffers in this module.
+        recurse: Whether parameters and buffers of submodules should
+            be recursively moved to the specified device.
+    """
+
+    def _empty_like_if_meta(tensor: torch.Tensor, *, device: torch.device):
+        if tensor.device == torch.device("meta"):
+            return torch.empty_like(tensor, device=device)
         else:
-            data = next(data_iterator)
+            return tensor.to(device)
 
-        # sanity check
-        assert data['tokens'].shape[-1] == 2 * args.seq_length
-        actual_seqlen = args.seq_length
-        data['tokens'] = data['tokens'].long()
-        tokens = data['tokens'][..., :actual_seqlen]
-        labels = data['tokens'][..., actual_seqlen:]
-        loss_mask = (labels != -100).float()
-        
-        attention_mask, _, position_ids = get_ltor_masks_and_position_ids(
-            tokens,
-            tokenizer.eod,
-            args.reset_position_ids,
-            args.reset_attention_mask,
-            False,
-            args.create_attention_mask_in_dataloader
-        )
-        # dtype: long, long, float, bool, long
-        batch = {
-            'tokens': tokens.cuda(non_blocking=True),
-            'labels': labels.cuda(non_blocking=True),
-            'loss_mask': loss_mask.cuda(non_blocking=True),
-            'attention_mask': attention_mask.cuda(non_blocking=True) if attention_mask is not None else None,
-            'position_ids': position_ids.cuda(non_blocking=True)
-        }
+    return module._apply(
+        lambda t: _empty_like_if_meta(t, device=device), recurse=recurse
+    )
 
-        if args.pipeline_model_parallel_size == 1:
-            _broadcast(batch['tokens'])
-            _broadcast(batch['labels'])
-            _broadcast(batch['loss_mask'])
-            _broadcast(batch['attention_mask'])
 
-        elif mpu.is_pipeline_first_stage():
-            _broadcast(batch['tokens'])
-            _broadcast(batch['attention_mask'])
+def get_nvtx_range():
+    """Create an NVTX range context manager."""
+    try:
+        from torch.cuda import nvtx
 
-        elif mpu.is_pipeline_last_stage():
-            _broadcast(batch['labels'])
-            _broadcast(batch['loss_mask'])
-            _broadcast(batch['attention_mask'])
-        
-        _broadcast(batch['position_ids'])
+        @contextmanager
+        def nvtx_range(msg, time=False):
+            if time:
+                timers = get_timers()
+                timers(msg, log_level=0).start()
+            try:
+                nvtx.range_push(msg)
+                yield
+            finally:
+                nvtx.range_pop()
+                if time:
+                    timers(msg, log_level=0).stop()
 
-    else:
-        # dtype: long, long, float, bool, long
-        tokens = torch.empty((args.micro_batch_size, args.seq_length), dtype=torch.int64,
-                             device=torch.cuda.current_device())
-        labels = torch.empty((args.micro_batch_size, args.seq_length), dtype=torch.int64,
-                             device=torch.cuda.current_device())
-        loss_mask = torch.empty((args.micro_batch_size, args.seq_length), dtype=torch.float32,
-                                device=torch.cuda.current_device())
-        
-        attention_mask = None
-        if args.create_attention_mask_in_dataloader:
-            attention_mask = torch.empty((args.micro_batch_size, 1, args.seq_length, args.seq_length), dtype=torch.bool,
-                                        device=torch.cuda.current_device())
-        position_ids = torch.empty((args.micro_batch_size, args.seq_length), dtype=torch.int64,
-                                   device=torch.cuda.current_device())
+        return nvtx_range
+    except:
+        @contextmanager
+        def dummy_range(msg):
+            yield
+        return dummy_range
 
-        if args.pipeline_model_parallel_size == 1:
-            _broadcast(tokens)
-            _broadcast(labels)
-            _broadcast(loss_mask)
-            _broadcast(attention_mask)
 
-        elif mpu.is_pipeline_first_stage():
-            labels = None
-            loss_mask = None
+def to_empty_if_meta_device(module: torch.nn.Module, *, device: torch.device, recurse=True):
+    """Move tensors to device if not meta device; otherwise materialize with empty_like().
 
-            _broadcast(tokens)
-            _broadcast(attention_mask)
+    Officially, torch suggests to_empty() for meta device materialization. Under the hood,
+    torch.empty_like() is applied to all parameters or buffers (see _apply). This may
+    accidently overwrite buffers with precomputed values during construction. Given the
+    goal is to only materialize those tensors on meta device, this function checks the
+    device first and only move the tensor to the destination if it is not on meta device.
+   
+    Args:
+        module: The target module to apply this transformation.
+        device: The desired device of the parameters
+            and buffers in this module.
+        recurse: Whether parameters and buffers of submodules should
+            be recursively moved to the specified device.
+    """
 
-        elif mpu.is_pipeline_last_stage():
-            tokens = None
+    def _empty_like_if_meta(tensor: torch.Tensor, *, device: torch.device):
+        if tensor.device == torch.device("meta"):
+            return torch.empty_like(tensor, device=device)
+        else:
+            return tensor.to(device)
 
-            _broadcast(labels)
-            _broadcast(loss_mask)
-            _broadcast(attention_mask)
+    return module._apply(
+        lambda t: _empty_like_if_meta(t, device=device), recurse=recurse
+    )
 
-        _broadcast(position_ids)
-        batch = {
-            'tokens': tokens,
-            'labels': labels,
-            'loss_mask': loss_mask,
-            'attention_mask': attention_mask,
-            'position_ids': position_ids
-        }
 
-    return batch
+def get_nvtx_range():
+    """Create an NVTX range context manager."""
+    try:
+        from torch.cuda import nvtx
+
+        @contextmanager
+        def nvtx_range(msg, time=False):
+            if time:
+                timers = get_timers()
+                timers(msg, log_level=0).start()
+            try:
+                nvtx.range_push(msg)
+                yield
+            finally:
+                nvtx.range_pop()
+                if time:
+                    timers(msg, log_level=0).stop()
+
+        return nvtx_range
+    except:
+        @contextmanager
+        def dummy_range(msg):
+            yield
+        return dummy_range

@@ -663,6 +663,168 @@ class TestSerialization:
 
         assert loaded_metadata == content_metadata
 
+    @pytest.mark.parametrize(
+        ('src_split', 'dest_split'),
+        [
+            # Same src and dest
+            ([3] * 8, None),
+            (list(range(1, 9)), None),
+            ([1, 5, 7, 3, 6, 2, 5, 4], None),
+            ([2, 2, 2, 2, 2, 2, 2, 1], None),
+            ([2, 2, 2, 2, 2, 2, 2, 10], None),
+            # Different src and dest
+            ([3] * 8, [1] * 6 + [2, 16]),
+            ([1, 5, 7, 3, 6, 2, 5, 4], [14, 3, 6, 3, 1, 1, 2, 3]),
+            # Empty shards
+            ([5] * 6 + [0, 0], [5, 0, 5, 0, 5, 5, 3, 7]),
+            ([15] + [0] * 7, [0, 0, 0] + [3] * 5),
+        ],
+    )
+    @pytest.mark.skipif(
+        not is_torch_min_version("2.6a0"),
+        reason="CheckpointableShardedTensor requires PyTorch 2.6 or later",
+    )
+    def test_uneven_1d_sharding(self, tmp_path_dist_ckpt, src_split, dest_split):
+        Utils.initialize_model_parallel(2, 4)
+
+        if dest_split is None:
+            dest_split = src_split
+
+        assert len(src_split) == Utils.world_size
+        assert len(dest_split) == len(src_split)
+        assert sum(src_split) == sum(dest_split)
+
+        def _create_1d_sharded_tensor_based_on_split(split, content_split=None, key='a'):
+            # Split [a, b, c] means a global tensor of shape (a + b + c,), divided
+            # into 3 rank, with a, b, c, elements on each rank
+            global_shape = (sum(split),)  # Sum of all splits
+            local_shape = (split[Utils.rank],)  # Split size of this rank
+            global_offset = (sum(split[: Utils.rank]),)  # Sum of all sizes before this rank
+
+            if content_split is None:
+                data = torch.zeros(local_shape)
+            else:
+                data = torch.zeros(global_shape)
+                assert len(content_split) == len(split)
+                # Content split determines the data stored in the global tensor.
+                # Content split [a, b, c] means `a` zeros, `b` ones and `c` twos.
+                content_split = torch.cumsum(torch.tensor(content_split), 0)
+                for (
+                    idx
+                ) in content_split:  # this handles `data[content_split] += 1` with repeating values
+                    if idx < len(data):
+                        data[idx] += 1
+                    else:
+                        assert idx == len(data)
+                data = data.cumsum(0)
+                data = data[global_offset[0] : global_offset[0] + local_shape[0]]
+                assert data.shape == local_shape
+            return ShardedTensor(
+                key, data, data.dtype, data.shape, global_shape, global_offset, None
+            )
+
+        state_dict = {'a': _create_1d_sharded_tensor_based_on_split(src_split, dest_split)}
+
+        with TempNamedDir(tmp_path_dist_ckpt / 'test_uneven_sharding', sync=True) as ckpt_dir:
+            save(state_dict, ckpt_dir)
+            torch.distributed.barrier()
+
+            state_dict = {'a': _create_1d_sharded_tensor_based_on_split(dest_split)}
+            loaded_state_dict = load(state_dict, ckpt_dir)
+            assert torch.all(loaded_state_dict['a'] == Utils.rank)
+
+    @pytest.mark.parametrize(
+        ('src_split', 'dest_split'),
+        [
+            # Same src and dest
+            ([[3]] * 8, None),
+            ([[]] * 7 + [[3, 3]], None),
+            ([[4], [7, 8], [1], [1], [1], [1], [1], [3, 3]], None),
+            ([[2]] * 5 + [[10]] * 3, [[10]] * 3 + [[2]] * 5),
+            (
+                [[4], [7, 8], [1], [1], [1], [1], [1], [3, 3]],
+                [[2, 4], [], [5], [], [5, 9], [], [1, 1, 1, 1, 1], []],
+            ),
+            ([[3]] * 8, [[2, 4]] * 4 + [[]] * 4),
+        ],
+    )
+    @pytest.mark.skipif(
+        not is_torch_min_version("2.6a0"),
+        reason="CheckpointableShardedTensor requires PyTorch 2.6 or later",
+    )
+    def test_uneven_1d_sharding_multiple_shards(self, tmp_path_dist_ckpt, src_split, dest_split):
+        """The same as test_uneven_1d_sharding but with multiple shards per rank.
+
+        src_split and dest_split have now 2 levels.
+        """
+        Utils.initialize_model_parallel(2, 4)
+
+        if dest_split is None:
+            dest_split = src_split
+
+        def nested_sum(x):
+            return sum(map(sum, x))
+
+        assert len(src_split) == Utils.world_size
+        assert len(dest_split) == len(src_split)
+        assert nested_sum(src_split) == nested_sum(dest_split)
+
+        def _create_1d_sharded_tensors_based_on_split(split, content_split=None, key='a'):
+            # Split [a, b, c] means a global tensor of shape (a + b + c,), divided
+            # into 3 rank, with a, b, c, elements on each rank
+            global_shape = (nested_sum(split),)  # Sum of all splits
+            global_offset_base = nested_sum(
+                split[: Utils.rank]
+            )  # Sum of all sizes before this rank
+
+            local_shards = []
+            for local_split in split[Utils.rank]:
+                local_shape = (local_split,)
+                global_offset = (global_offset_base,)
+                global_offset_base += local_split
+
+                if content_split is None:
+                    data = torch.zeros(local_shape)
+                else:
+                    data = torch.zeros(global_shape)
+                    assert len(content_split) == len(split)
+                    # Content split determines the data stored in the global tensor.
+                    # Content split [a, b, c] means `a` zeros, `b` ones and `c` twos.
+                    cumsum_content_split = torch.cumsum(
+                        torch.tensor(list(map(sum, content_split))), 0
+                    )
+                    for (
+                        idx
+                    ) in (
+                        cumsum_content_split
+                    ):  # this handles `data[cumsum_content_split] += 1` with repeating values
+                        if idx < len(data):
+                            data[idx] += 1
+                        else:
+                            assert idx == len(data)
+                    data = data.cumsum(0)
+                    data = data[global_offset[0] : global_offset[0] + local_shape[0]]
+                    assert data.shape == local_shape
+                local_shards.append(
+                    ShardedTensor(
+                        key, data, data.dtype, data.shape, global_shape, global_offset, None
+                    )
+                )
+            return local_shards
+
+        state_dict = dict(
+            enumerate(_create_1d_sharded_tensors_based_on_split(src_split, dest_split))
+        )
+
+        with TempNamedDir(tmp_path_dist_ckpt / 'test_uneven_sharding', sync=True) as ckpt_dir:
+            save(state_dict, ckpt_dir)
+            torch.distributed.barrier()
+
+            state_dict = dict(enumerate(_create_1d_sharded_tensors_based_on_split(dest_split)))
+            loaded_state_dict = load(state_dict, ckpt_dir)
+            for local_shard in loaded_state_dict.values():
+                assert torch.all(local_shard == Utils.rank)
+
 
 class TestNonStrictLoad:
     def setup_method(self, method):

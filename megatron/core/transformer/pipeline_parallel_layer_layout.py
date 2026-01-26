@@ -1,14 +1,15 @@
 # Copyright (c) 2025, NVIDIA CORPORATION. All rights reserved.
 
 import copy
+import logging
 import re
 from functools import lru_cache
 from typing import Optional
 
-import torch
-
 from megatron.core import parallel_state
 from megatron.core.transformer.enums import LayerType
+
+logger = logging.getLogger(__name__)
 
 
 class PipelineParallelLayerLayout:
@@ -78,7 +79,7 @@ class PipelineParallelLayerLayout:
         self.layout = layout
         self.flatten_layout = flatten_layout
 
-    def validate_layer_layout(self, num_layers: int):
+    def validate_layer_layout(self, num_layers: int, mtp_num_layers: int):
         """Check whether the layout is valid."""
 
         # Check whether the input layer id is valid
@@ -103,18 +104,44 @@ class PipelineParallelLayerLayout:
             f"Number of decoder layers {self.flatten_layout.count(LayerType.decoder)}"
             f"must match num_layers {num_layers}"
         )
-
+        # MTP layer verification
+        assert self.flatten_layout.count(LayerType.mtp) == mtp_num_layers or (
+            mtp_num_layers is None and self.flatten_layout.count(LayerType.mtp) == 0
+        ), "Number of mtp layers in layout must match mtp_num_layers"
+        for i in range(len(self.flatten_layout)):
+            if self.flatten_layout[i] == LayerType.mtp:
+                assert (
+                    self.flatten_layout[i:].count(LayerType.decoder) == 0
+                ), "decoder layers must be placed before MTP layers"
+                break
+        for pp_rank in range(self.pipeline_model_parallel_size):
+            for vpp_rank in range(self.virtual_pipeline_model_parallel_size - 1):
+                assert (
+                    LayerType.mtp not in self.layout[pp_rank][vpp_rank]
+                ), f"Currently we restrict that the MTP should be always in the last "
+                f"virtual pipeline stage of that rank. But got {self.layout[pp_rank][vpp_rank]}"
+        for pp_rank in range(self.pipeline_model_parallel_size):
+            if LayerType.mtp in self.layout[pp_rank][-1]:
+                assert (
+                    self.layout[pp_rank][-1].count(LayerType.mtp) == mtp_num_layers
+                ), "All of the MTP layers must be in the same stage"
+                assert (
+                    pp_rank == self.pipeline_model_parallel_size - 1
+                    and LayerType.loss in self.layout[pp_rank][-1]
+                ), "MTP layers must be in the last stage together with Loss stage."
         # TODO: remove them in the future once they are supported
         if self.flatten_layout.count(LayerType.encoder) > 0:
             raise NotImplementedError("Encoder layer is not supported for flexible pipeline layout")
-        if self.flatten_layout.count(LayerType.mtp) > 0:
-            raise NotImplementedError("MTP layer is not supported for flexible pipeline layout")
 
     def get_num_layers_to_build(
-        self, layer_type: LayerType = LayerType.decoder, vp_stage: Optional[int] = None
+        self,
+        layer_type: LayerType = LayerType.decoder,
+        vp_stage: Optional[int] = None,
+        pp_rank: Optional[int] = None,
     ):
         """Get the number of layers to build in the pipeline stage"""
-        pp_rank = parallel_state.get_pipeline_model_parallel_rank()
+        if pp_rank is None:
+            pp_rank = parallel_state.get_pipeline_model_parallel_rank()
         if parallel_state.get_virtual_pipeline_model_parallel_world_size() is not None:
             assert vp_stage is not None, "vp_stage must be passed if virtual pipeline is enabled"
         else:
@@ -125,10 +152,14 @@ class PipelineParallelLayerLayout:
         return num_layers_to_build
 
     def get_layer_offset(
-        self, layer_type: LayerType = LayerType.decoder, vp_stage: Optional[int] = None
+        self,
+        layer_type: LayerType = LayerType.decoder,
+        vp_stage: Optional[int] = None,
+        pp_rank: Optional[int] = None,
     ):
         """Get the layer offset in the pipeline stage"""
-        pp_rank = parallel_state.get_pipeline_model_parallel_rank()
+        if pp_rank is None:
+            pp_rank = parallel_state.get_pipeline_model_parallel_rank()
         if parallel_state.get_virtual_pipeline_model_parallel_world_size() is not None:
             assert vp_stage is not None, "vp_stage must be passed if virtual pipeline is enabled"
         else:
@@ -145,11 +176,16 @@ class PipelineParallelLayerLayout:
         return offset
 
     def get_layer_id_list(
-        self, layer_type: LayerType = LayerType.decoder, vp_stage: Optional[int] = None
+        self,
+        layer_type: LayerType = LayerType.decoder,
+        vp_stage: Optional[int] = None,
+        pp_rank: Optional[int] = None,
     ):
         """Get the list of layer_id for each layer in the pipeline stage."""
-        offset = self.get_layer_offset(layer_type=layer_type, vp_stage=vp_stage)
-        num_layers_to_build = self.get_num_layers_to_build(layer_type=layer_type, vp_stage=vp_stage)
+        offset = self.get_layer_offset(layer_type=layer_type, vp_stage=vp_stage, pp_rank=pp_rank)
+        num_layers_to_build = self.get_num_layers_to_build(
+            layer_type=layer_type, vp_stage=vp_stage, pp_rank=pp_rank
+        )
         return list(range(offset, offset + num_layers_to_build))
 
     def pretty_repr(self):
@@ -212,10 +248,13 @@ class PipelineParallelLayerLayout:
         """Parse the pipeline model parallel layout from a string."""
         parsed_layout = PipelineParallelLayerLayout(layout, pipeline_model_parallel_size)
         # Pretty print the layout distribution.
-        if torch.distributed.get_rank() == 0:
-            print(
-                f"Parse pipeline model parallel layout {layout} to:\n" + parsed_layout.pretty_repr()
-            )
+        from megatron.core.utils import log_single_rank
+
+        log_single_rank(
+            logger,
+            logging.INFO,
+            f"Parse pipeline model parallel layout {layout} to:\n" + parsed_layout.pretty_repr(),
+        )
         return parsed_layout
 
     @staticmethod

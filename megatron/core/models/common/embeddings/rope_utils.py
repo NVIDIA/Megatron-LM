@@ -126,18 +126,53 @@ def _apply_rotary_pos_emb_bshd(
     return torch.cat((t, t_pass), dim=-1)
 
 
-def _get_thd_freqs_on_this_cp_rank(cp_rank: int, cp_size: int, x: Tensor, freqs: Tensor) -> Tensor:
+def _get_thd_freqs_on_this_cp_rank(
+    cp_rank: int, cp_size: int, x: Tensor, freqs: Tensor, offset: int = 0
+) -> Tensor:
+    """Get the correct frequency slice for this context parallel rank with optional sequence offset.
+
+    Args:
+        cp_rank: Current context parallel rank
+        cp_size: Total context parallel size
+        x: Input tensor for current sequence
+        freqs: Frequency tensor - either full batch positions or max sequence length
+        offset: Starting position offset for this sequence in the original batch (default: 0)
+
+    Returns:
+        Tensor: Frequency slice corresponding to this CP rank's portion of the sequence
+
+    Note:
+        This function supports two modes based on the offset parameter:
+        1. offset > 0: Exact mapping mode - freqs contains all positions across all sequences.
+           The offset ensures each sequence gets frequencies from its actual position within
+           the overall batch. Critical for non-1D RoPE in VLMs where spatial positions matter.
+        2. offset = 0: Traditional mode - freqs contains only max sequence length positions.
+           All sequences use frequencies starting from position 0, preserving backward
+           compatibility.
+    """
     if cp_size > 1:
         cp_seg = x.size(0) // 2
         full_seqlen = cp_size * x.size(0)
+        # Apply offset to both forward and backward segments for context parallelism
+        # offset=0: traditional behavior, freqs[0:cp_seg] and freqs[...]
+        # offset>0: exact mapping, freqs[offset+0:offset+cp_seg] and freqs[offset+...]
         return torch.cat(
             [
-                freqs[cp_rank * cp_seg : (cp_rank + 1) * cp_seg],
-                freqs[full_seqlen - (cp_rank + 1) * cp_seg : full_seqlen - cp_rank * cp_seg],
+                freqs[offset + cp_rank * cp_seg : offset + (cp_rank + 1) * cp_seg],
+                freqs[
+                    offset
+                    + full_seqlen
+                    - (cp_rank + 1) * cp_seg : offset
+                    + full_seqlen
+                    - cp_rank * cp_seg
+                ],
             ]
         )
     else:
-        return freqs[: x.size(0)]
+        # For single context parallel rank:
+        # offset=0: use freqs[0:x.size(0)] (traditional)
+        # offset>0: use freqs[offset:offset+x.size(0)] (exact mapping)
+        return freqs[offset : offset + x.size(0)]
 
 
 def _apply_rotary_pos_emb_thd(
@@ -166,21 +201,50 @@ def _apply_rotary_pos_emb_thd(
         raise ValueError("cp_group must be provided for THD format RoPE")
     cp_size = cp_group.size()
     cp_rank = cp_group.rank()
-    cu_seqlens = cu_seqlens // cp_size
-    seqlens = (cu_seqlens[1:] - cu_seqlens[:-1]).tolist()
+    seqlens = ((cu_seqlens[1:] - cu_seqlens[:-1]) // cp_size).tolist()
 
-    return torch.cat(
-        [
-            _apply_rotary_pos_emb_bshd(
-                x.unsqueeze(1),
-                _get_thd_freqs_on_this_cp_rank(cp_rank, cp_size, x, freqs),
-                rotary_interleaved=rotary_interleaved,
-                multi_latent_attention=multi_latent_attention,
-                mscale=mscale,
+    # Handle two different frequency tensor formats:
+    # 1. If freqs.size(0) == cu_seqlens[-1]: freqs contains all positions across all sequences
+    #    -> Use offset-based mapping for exact positional correspondence
+    # 2. Otherwise: freqs contains only max sequence length positions
+    #    -> Use traditional mapping without offsets (map first :seqlen part)
+    if freqs.dim() >= 1 and freqs.size(0) == cu_seqlens[-1]:
+        # CASE 1: Exact mapping with offsets
+        # Build packed freqs in one pass, then apply once to the whole packed tensor
+        sequence_splits = torch.split(t, seqlens)
+        freq_slices = []
+        for i, x in enumerate(sequence_splits):
+            # cu_seqlens[i] is the starting offset of this sequence in the original batch
+            seq_start_offset = cu_seqlens[i].item()
+            freq_slices.append(
+                _get_thd_freqs_on_this_cp_rank(cp_rank, cp_size, x, freqs, seq_start_offset)
             )
-            for x in torch.split(t, seqlens)
-        ]
-    ).squeeze(1)
+
+        freqs_packed = torch.cat(freq_slices, dim=0)
+
+        return _apply_rotary_pos_emb_bshd(
+            t.unsqueeze(1),
+            freqs_packed,
+            rotary_interleaved=rotary_interleaved,
+            multi_latent_attention=multi_latent_attention,
+            mscale=mscale,
+        ).squeeze(1)
+    else:
+        # CASE 2: Traditional mapping without offsets
+        # Build packed freqs for all sequences using the standard mapping, then apply once
+        sequence_splits = torch.split(t, seqlens)
+        freqs_packed = torch.cat(
+            [_get_thd_freqs_on_this_cp_rank(cp_rank, cp_size, x, freqs) for x in sequence_splits],
+            dim=0,
+        )
+
+        return _apply_rotary_pos_emb_bshd(
+            t.unsqueeze(1),
+            freqs_packed,
+            rotary_interleaved=rotary_interleaved,
+            multi_latent_attention=multi_latent_attention,
+            mscale=mscale,
+        ).squeeze(1)
 
 
 def apply_rotary_pos_emb(

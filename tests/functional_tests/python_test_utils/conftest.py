@@ -14,6 +14,12 @@ def pytest_addoption(parser):
         help="If set, test system checks for approximate results.",
     )
     parser.addoption("--golden-values-path", action="store", help="Path to golden values")
+    parser.addoption("--actual-values-path", action="store", help="Path to actual values")
+    parser.addoption("--actual-values-first-run-path", action="store", help="Path to actual values")
+    parser.addoption(
+        "--actual-values-second-run-path", action="store", help="Path to actual values"
+    )
+    parser.addoption("--scope", action="store", help="Test scope (MR, weekly, prerelease, release)")
     parser.addoption(
         "--train-iters", action="store", default=100, help="Number of train iters", type=int
     )
@@ -38,6 +44,34 @@ def golden_values_path(request):
 def golden_values(request):
     """Simple fixture returning golden values."""
     return common.read_golden_values_from_json(request.config.getoption("--golden-values-path"))
+
+
+@pytest.fixture
+def actual_values(request):
+    """Simple fixture returning golden values."""
+    return common.read_golden_values_from_json(request.config.getoption("--actual-values-path"))
+
+
+@pytest.fixture
+def actual_values_first_run(request):
+    """Simple fixture returning actual values."""
+    return common.read_golden_values_from_json(
+        request.config.getoption("--actual-values-first-run-path")
+    )
+
+
+@pytest.fixture
+def actual_values_second_run(request):
+    """Simple fixture returning actual values."""
+    return common.read_golden_values_from_json(
+        request.config.getoption("--actual-values-second-run-path")
+    )
+
+
+@pytest.fixture
+def scope(request):
+    """Simple fixture returning golden values."""
+    return request.config.getoption("--scope")
 
 
 @pytest.fixture
