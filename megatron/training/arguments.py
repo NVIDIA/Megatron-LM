@@ -2815,6 +2815,9 @@ def _add_distributed_args(parser):
                        help='IB SHARP can be enabled from only one communication group. '
                        'By default, it is enabled from dp group. '
                        'Available options: [dp, dp_replica]')
+    group.add_argument('--create-all-gather-group', action='store_true',
+                   help='Create a separate process group for all-gather operations '
+                   'to overlap reduce-scatter and all-gather operations.')
     group.add_argument('--use-megatron-fsdp', action='store_true',
                        help='Use the Megatron FSDP code path in DDP.')
     group.add_argument('--init-model-with-meta-device', action='store_true')
