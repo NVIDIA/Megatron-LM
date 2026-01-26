@@ -294,11 +294,13 @@ class MoEAllGatherTokenDispatcher(MoETokenDispatcher):
 
         tokens_per_expert = self.local_map.sum(dim=0).long().cpu()
 
-        (permuted_local_hidden_states, _, self.reversed_local_input_permutation_mapping) = permute(
-            hidden_states,
-            self.local_map,
-            num_out_tokens=tokens_per_expert.sum(),
-            fused=self.config.moe_permute_fusion,
+        permuted_local_hidden_states, _, self.reversed_local_input_permutation_mapping, _, _ = (
+            permute(
+                hidden_states,
+                self.local_map,
+                num_out_tokens=tokens_per_expert.sum(),
+                fused=self.config.moe_permute_fusion,
+            )
         )
 
         self.local_probs = self.local_probs.T.contiguous().masked_select(
@@ -634,6 +636,8 @@ class MoEAlltoAllTokenDispatcher(MoETokenDispatcher):
             permutated_local_input_tokens,
             permuted_probs,
             self.reversed_local_input_permutation_mapping,
+            _,
+            _,
         ) = permute(
             hidden_states,
             self.routing_map,
