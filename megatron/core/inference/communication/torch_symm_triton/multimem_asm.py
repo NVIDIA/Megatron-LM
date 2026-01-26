@@ -157,3 +157,57 @@ def st_128(ptr, x, y, z, w, mask, multicast_op):
             is_pure=False,
             pack=1,
         )
+
+
+@triton.jit
+def add_v8_bf16_from_u32(
+    a0,
+    a1,
+    a2,
+    a3,  # First vector of 8 bf16s, packed in 4 uint32s
+    b0,
+    b1,
+    b2,
+    b3,  # Second vector of 8 bf16s, packed in 4 uint32s
+):
+    """
+    Adds two vectors of 8 bfloat16 numbers.
+    Each vector is passed as four tl.uint32 tensors.
+    Returns the result as a tuple of four tl.uint32 tensors.
+    """
+    return tl.inline_asm_elementwise(
+        """
+        {
+            add.bf16x2 $0, $4, $8;
+            add.bf16x2 $1, $5, $9;
+            add.bf16x2 $2, $6, $10;
+            add.bf16x2 $3, $7, $11;
+        }
+        """,
+        # 8 outputs (=r), 8 inputs (r)
+        "=r,=r,=r,=r,r,r,r,r,r,r,r,r",
+        args=[a0, a1, a2, a3, b0, b1, b2, b3],
+        dtype=(tl.uint32, tl.uint32, tl.uint32, tl.uint32),
+        is_pure=True,
+        pack=1,
+    )
+
+
+@triton.jit
+def asm_rsqrt(x, eps):
+    """
+    Computes the reciprocal square root of a float32 number using inline assembly.
+    """
+    return tl.inline_asm_elementwise(
+        """
+        {
+            add.f32 $1, $1, $2;
+            rsqrt.approx.f32 $0, $1;
+        }
+        """,
+        "=f, f, f",
+        args=[x, eps],
+        dtype=(tl.float32),
+        is_pure=True,
+        pack=1,
+    )

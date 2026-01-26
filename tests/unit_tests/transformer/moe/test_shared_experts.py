@@ -20,7 +20,8 @@ class TestSharedExperts:
 
     @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
     @pytest.mark.internal
-    def test_gpu_forward(self):
+    @pytest.mark.parametrize("shared_expert_gate", [False, True])
+    def test_gpu_forward(self, shared_expert_gate):
         Utils.initialize_model_parallel(1, 1)
         model_parallel_cuda_manual_seed(123)
         print("done intializing")
@@ -38,6 +39,7 @@ class TestSharedExperts:
             moe_router_load_balancing_type="sinkhorn",
             moe_router_topk=1,
             add_bias_linear=False,
+            moe_shared_expert_gate=shared_expert_gate,
         )
         transformer_layer_spec = get_gpt_layer_local_spec(
             num_experts=num_moe_experts, moe_grouped_gemm=False
@@ -49,7 +51,10 @@ class TestSharedExperts:
         assert isinstance(self.moe_layer, MoELayer)
 
         num_weights = sum([p.numel() for p in self.moe_layer.parameters()])
-        assert num_weights == 3480 + 1152
+        if shared_expert_gate:
+            assert num_weights == 3480 + 1152 + 12  # 12 is the weight of the gate
+        else:
+            assert num_weights == 3480 + 1152
         assert self.moe_layer.shared_experts is not None
         assert self.moe_layer.shared_experts.stream is None
         assert self.moe_layer.token_dispatcher.shared_experts is None

@@ -1,4 +1,4 @@
-# Copyright (c) 2022, NVIDIA CORPORATION. All rights reserved.
+# Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
 
 from typing import List, Optional, Tuple, Union
@@ -298,13 +298,13 @@ class P2PCommunicator:
         tensor_recv_prev_func = None
         tensor_recv_next_func = None
 
-        if not config.variable_seq_lengths:
-            recv_prev_shape = tensor_shape
-            recv_next_shape = tensor_shape
-        else:
+        if config.variable_seq_lengths or config.mtp_standalone:
             recv_prev_shape, recv_next_shape = self._communicate_shapes(
                 tensor_send_next, tensor_send_prev, recv_prev, recv_next
             )
+        else:
+            recv_prev_shape = tensor_shape
+            recv_next_shape = tensor_shape
 
         def create_tensor_recv_prev():
             return torch.empty(

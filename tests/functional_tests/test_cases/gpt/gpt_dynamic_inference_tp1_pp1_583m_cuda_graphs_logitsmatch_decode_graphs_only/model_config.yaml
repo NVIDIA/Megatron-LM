@@ -54,6 +54,7 @@ MODEL_ARGS:
   --prompts: "Time travel to 2008, and go to a bar or a club or one of the myriad disco-basements on the Lower East Side that does not quite know which of those it is. Dance awkwardly in a room full of other glittered-up nerds, and wait for something to happen, buoyed on the feeling that this is the big swollen heart of life, that this is New York like the movies."
   --incoming-requests-per-sec: -1 # all requests arrive up front.
   --inference-repeat-n: 8
+  --inference-logging-step-interval: 1
 METRICS:
   - "generated_tokens"
   - "logprobs"

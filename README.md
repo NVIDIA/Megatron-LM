@@ -23,12 +23,13 @@ cd Megatron-LM
 pip install --no-build-isolation .[mlm,dev]
 ```
 
-**→ [Complete Installation Guide](#installation)** - Docker, pip variants (dev,lts,etc.), source installation, and system requirements
+**→ [Complete Installation Guide](#installation)** - Docker, pip variants (dev,lts,etc.), and system requirements
 
 # Latest News
 
-- 📣 NEW! **[Megatron Dev Branch](https://github.com/NVIDIA/Megatron-LM/tree/dev)** - early access branch with experimental features.
-- 🔄 **[Megatron Bridge](https://github.com/NVIDIA-NeMo/Megatron-Bridge)** - Bidirectional converter for interoperability between Hugging Face and Megatron checkpoints, featuring production-ready recipes for popular models.
+- **[2025/12]** 🎉 **Megatron Core development has moved to GitHub!** All development and CI now happens in the open. We welcome community contributions.
+- **[2025/10]** **[Megatron Dev Branch](https://github.com/NVIDIA/Megatron-LM/tree/dev)** - early access branch with experimental features.
+- **[2025/10]** **[Megatron Bridge](https://github.com/NVIDIA-NeMo/Megatron-Bridge)** - Bidirectional converter for interoperability between Hugging Face and Megatron checkpoints, featuring production-ready recipes for popular models.
 - **[2025/08]** **[MoE Q3-Q4 2025 Roadmap](https://github.com/NVIDIA/Megatron-LM/issues/1729)** - Comprehensive roadmap for MoE features including DeepSeek-V3, Qwen3, advanced parallelism strategies, FP8 optimizations, and Blackwell performance enhancements.
 - **[2025/08]** **[GPT-OSS Model](https://github.com/NVIDIA/Megatron-LM/issues/1739)** - Advanced features including YaRN RoPE scaling, attention sinks, and custom activation functions are being integrated into Megatron Core.
 - **[2025/06]** **[Megatron MoE Model Zoo](https://github.com/yanring/Megatron-MoE-ModelZoo)** - Best practices and optimized configurations for training DeepSeek-V3, Mixtral, and Qwen3 MoE models with performance benchmarking and checkpoint conversion tools.
@@ -56,8 +57,7 @@ pip install --no-build-isolation .[mlm,dev]
   - [Megatron Core: Production Library](#megatron-core-production-library)
 - [Installation](#installation)
   - [Docker (Recommended)](#-docker-recommended)
-  - [Pip Installation](#-pip-installation)
-  - [Source Installation](#-source-installation)
+  - [Pip Installation](#pip-installation)
   - [System Requirements](#system-requirements)
 
 **Core Features**
@@ -86,7 +86,7 @@ pip install --no-build-isolation .[mlm,dev]
 - [Examples](./examples/) - Training scripts and tutorials
 - [Documentation](https://docs.nvidia.com/Megatron-Core/) - Official docs
 - [Roadmaps](#roadmaps) - Development roadmaps and feature tracking
-- [Community & Support](#-community--support) - Get help and contribute
+- [Community & Support](#community--support) - Get help and contribute
   - [Getting Help](#getting-help)
   - [Contributing](#contributing)
   - [Citation](#citation)
@@ -133,7 +133,7 @@ Megatron-LM/
 
 **What you get:**
 
-- Pre-configured training scripts for GPT, LLama, DeepSeek, Qwen, and more.
+- Pre-configured training scripts for GPT, LLaMA, DeepSeek, Qwen, and more.
 - End-to-end examples from data prep to evaluation
 - Research-focused tools and utilities
 
@@ -178,7 +178,7 @@ Megatron-LM/
 
 ## 🐳 Docker (Recommended)
 
-We strongly recommend using the previous releases of [PyTorch NGC Container](https://catalog.ngc.nvidia.com/orgs/nvidia/containers/pytorch) rather than the latest one for optimal compatibility with Megatron Core release and testing. Our releases are always based on the previous month's NGC container, so this ensures compatibility and stability.
+We strongly recommend using the previous releases of [PyTorch NGC Container](https://catalog.ngc.nvidia.com/orgs/nvidia/containers/pytorch) rather than the latest one for optimal compatibility with Megatron Core release and testing matrix. Our releases are always based on the previous month's NGC container, so this ensures compatibility and stability.
 
 **Note:** The NGC PyTorch container constraints the python environment globally via `PIP_CONSTRAINT`. In the following examples we will unset the variable.
 
@@ -292,7 +292,7 @@ We also strong scaled the standard GPT-3 model (our version has slightly more th
 torchrun --nproc_per_node=2 examples/run_simple_mcore_train_loop.py
 ```
 
-### LLama-3 Training Example
+### LLaMA-3 Training Example
 
 ```bash
 # 8 GPUs, FP8 precision, mock data
@@ -404,9 +404,9 @@ Based on [NVIDIA NeMo production configurations](https://github.com/NVIDIA/NeMo/
 
 | Model | Size | GPUs | TP | PP | CP | EP | Notes |
 |-------|------|------|----|----|----|----|-------|
-| **LLama-3** | 8B | 8 | 1 | 1 | 2 | 1 | CP for long seqlen (8K) |
-| **LLama-3** | 70B | 64 | 4 | 4 | 2 | 1 | TP+PP |
-| **LLama-3.1** | 405B | 1024 | 8 | 8 | 2 | 1 | 3D parallelism for scale |
+| **LLaMA-3** | 8B | 8 | 1 | 1 | 2 | 1 | CP for long seqlen (8K) |
+| **LLaMA-3** | 70B | 64 | 4 | 4 | 2 | 1 | TP+PP |
+| **LLaMA-3.1** | 405B | 1024 | 8 | 8 | 2 | 1 | 3D parallelism for scale |
 | **GPT-3** | 175B | 128-512 | 4 | 8 | 1 | 1 | Large model config |
 | **Mixtral** | 8x7B | 64 | 1 | 4 | 1 | 8 | EP for MoE |
 | **Mixtral** | 8x22B | 256 | 4 | 4 | 8 | 8 | Combined TP+EP for large MoE |

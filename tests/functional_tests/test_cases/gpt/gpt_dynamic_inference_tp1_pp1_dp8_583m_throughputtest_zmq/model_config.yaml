@@ -55,6 +55,7 @@ MODEL_ARGS:
   --incoming-requests-per-step: 128
   --use-flashinfer-fused-rope: true
   --throughput-check-only: true
+  --inference-logging-step-interval: 1
 METRICS:
   - "generated_tokens"
   - "logprobs"

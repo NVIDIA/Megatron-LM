@@ -6,7 +6,6 @@ from typing import Optional
 
 import torch
 
-from .. import parallel_state
 from ..config_logger import has_config_logger_enabled, log_config_to_disk
 from ..fp8_utils import is_float8tensor, post_all_gather_processing
 from ..process_groups_config import ProcessGroupCollection
@@ -55,10 +54,15 @@ class DistributedDataParallel(_BaseDataParallel):
         # If using very large dp_sizes, make buckets larger to ensure that chunks used in NCCL
         # ring-reduce implementations are large enough to remain bandwidth-bound rather than
         # latency-bound.
+        # Setup process groups, handling both None and provided pg_collection values.
+        process_group_dict = ProcessGroupCollection.setup_process_groups_for_ddp(
+            pg_collection, config, ddp_config
+        )
+
+        # If bucket_size is not provided as an input, use sane default based on dp_group size.
+        dp_group = process_group_dict['dp_group']
         if ddp_config.bucket_size is None:
-            ddp_config.bucket_size = max(
-                40000000, 1000000 * parallel_state.get_data_parallel_world_size()
-            )
+            ddp_config.bucket_size = max(40000000, 1000000 * dp_group.size())
         # Set bucket_size to infinity if overlap_grad_reduce is False.
         if not ddp_config.overlap_grad_reduce:
             ddp_config.bucket_size = None
@@ -70,51 +74,26 @@ class DistributedDataParallel(_BaseDataParallel):
             f'Setting up DistributedDataParallel with config {self.ddp_config}',
         )
 
-        if pg_collection is None:
-            self.dp_group = parallel_state.get_data_parallel_group(
-                with_context_parallel=False, partial_data_parallel=False
-            )
-            self.dp_cp_group = parallel_state.get_data_parallel_group(
-                with_context_parallel=True, partial_data_parallel=False
-            )
-            self.intra_dp_cp_group = parallel_state.get_data_parallel_group(
-                with_context_parallel=True, partial_data_parallel=True
-            )
-            self.expt_dp_group = parallel_state.get_expert_data_parallel_group()
-            self.intra_expt_dp_group = parallel_state.get_expert_data_parallel_group(
-                partial_expert_data_parallel=True
-            )
-            if self.ddp_config.num_distributed_optimizer_instances > 1:
-                self.inter_dist_opt_group = (
-                    parallel_state.get_inter_distributed_optimizer_instance_group()
-                )
-            self.tp_group = parallel_state.get_tensor_model_parallel_group()
-            self.pp_group = parallel_state.get_pipeline_model_parallel_group()
-            self.ep_group = parallel_state.get_expert_model_parallel_group()
-        else:
-            # Setup process groups using DDP-specific helper method
-            process_groups = ProcessGroupCollection.setup_process_groups_for_ddp(
-                pg_collection, config, self.ddp_config
-            )
+        # Assign all required process groups
+        self.dp_group = process_group_dict['dp_group']
+        self.dp_cp_group = process_group_dict['dp_cp_group']
+        self.intra_dp_cp_group = process_group_dict['intra_dp_cp_group']
+        self.expt_dp_group = process_group_dict['expt_dp_group']
+        self.intra_expt_dp_group = process_group_dict['intra_expt_dp_group']
+        self.tp_group = process_group_dict['tp_group']
+        self.pp_group = process_group_dict['pp_group']
+        self.ep_group = process_group_dict['ep_group']
 
-            self.dp_group = process_groups['dp_group']
-            self.dp_cp_group = process_groups['dp_cp_group']
-            self.intra_dp_cp_group = process_groups['intra_dp_cp_group']
-            self.expt_dp_group = process_groups['expt_dp_group']
-            self.intra_expt_dp_group = process_groups['intra_expt_dp_group']
-            self.tp_group = process_groups['tp_group']
-            self.pp_group = process_groups['pp_group']
-            self.ep_group = process_groups['ep_group']
-
-            # Set inter_dist_opt_group if multiple optimizer instances
-            if self.ddp_config.num_distributed_optimizer_instances > 1:
-                self.inter_dist_opt_group = process_groups['inter_dist_opt_group']
+        # Set inter_dist_opt_group if multiple optimizer instances
+        if self.ddp_config.num_distributed_optimizer_instances > 1:
+            self.inter_dist_opt_group = process_group_dict['inter_dist_opt_group']
 
         # Turn off bucketing if we are on a pipeline stage that is not the first (since
         # data-parallel communication on these stages is not on the critical path), or if
         # disable_bucketing is True (e.g., we might not want to break up model parameters
         # into buckets for model chunks after the first in the interleaved schedule).
         self.bucket_size = self.ddp_config.bucket_size
+        self.force_all_reduce = False
         if isinstance(self.pp_group, list):
             pp_rank = self.pp_group[0].rank()
         else:
@@ -462,7 +441,9 @@ class DistributedDataParallel(_BaseDataParallel):
                 param.grad = None
 
                 if self.ddp_config.overlap_grad_reduce:
-                    self.param_to_bucket_group[param].register_grad_ready(param)
+                    self.param_to_bucket_group[param].register_grad_ready(
+                        param, self.force_all_reduce
+                    )
 
         return hook
 
@@ -541,7 +522,7 @@ class DistributedDataParallel(_BaseDataParallel):
         for bucket_group in self.bucket_groups + self.expert_parallel_bucket_groups:
             bucket_group.start_grad_sync()
 
-    def finish_grad_sync(self):
+    def finish_grad_sync(self, force_all_reduce: Optional[bool] = False):
         """
         Finishes grad sync (all-reduce or reduce-scatter) communication operations
         for all model gradients.
@@ -551,7 +532,7 @@ class DistributedDataParallel(_BaseDataParallel):
         communication ops.
         """
         for bucket_group in self.bucket_groups + self.expert_parallel_bucket_groups:
-            bucket_group.finish_grad_sync()
+            bucket_group.finish_grad_sync(force_all_reduce=force_all_reduce)
 
     def scale_gradients(self, scaling_factor: float):
         """Scale all gradients inside the buffers by `scaling_factor`."""

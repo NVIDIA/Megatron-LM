@@ -1,6 +1,8 @@
 # Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
+import logging
 import shutil
+from contextlib import nullcontext
 from copy import deepcopy
 from pathlib import Path
 
@@ -12,6 +14,8 @@ from torch.nn.functional import mse_loss
 from torch.optim import Adam
 
 from tests.unit_tests.test_utilities import Utils
+
+logger = logging.getLogger(__name__)
 
 HSDP = "hsdp"
 DP = "dp"
@@ -30,6 +34,10 @@ TE_TRANSFORMER = "te_transformer"
 DIM_SIZE = 2
 NUM_LAYERS = 2
 NUM_STEPS = 2
+DELAYED_FP8_RECIPE = "fp8_delayed_scaling"
+CURRENT_FP8_RECIPE = "fp8_current_scaling"
+BLOCKWISE_FP8_RECIPE = "fp8_blockwise_scaling"
+MXFP8_BLOCKWISE_RECIPE = "mxfp8_blockwise"
 
 # Needed for `torch.distributed.checkpoint.{save,load}` because
 # multiple processes need to write to the same directory.
@@ -37,15 +45,22 @@ SHARED_TMP_DIR = "/tmp/pytest-shared-tmp"
 
 
 def destroy_device_mesh(device_mesh):
-    from torch.distributed.device_mesh import _mesh_resources
 
     # Teardown device mesh.
     del device_mesh
-    _mesh_resources.mesh_stack.clear()
-    _mesh_resources.child_to_root_mapping.clear()
-    _mesh_resources.root_to_flatten_mapping.clear()
-    _mesh_resources.flatten_name_to_root_dims.clear()
-    _mesh_resources.mesh_dim_group_options.clear()
+    try:
+        from torch.distributed.device_mesh import _mesh_resources
+
+        _mesh_resources.child_to_root_mapping.clear()
+        _mesh_resources.root_to_flatten_mapping.clear()
+        _mesh_resources.mesh_stack.clear()
+        _mesh_resources.mesh_dim_group_options.clear()
+        _mesh_resources.flatten_name_to_root_dims.clear()
+    except Exception as e:
+        # Global _MeshEnv is on a convoluted deprecation path.
+        # Attempt to clean the global state, otherwise skip.
+        logger.warning(f"Did not clean the deprecated DeviceMesh global state. Skipping...\n{e}")
+        pass
 
 
 class ToyCNN(torch.nn.Module):
@@ -109,17 +124,33 @@ class ToyTransformer(torch.nn.Module):
 class ToyTETransformer(torch.nn.Module):
     """Toy Transformer model for testing Megatron-FSDP with Transformer Engine."""
 
-    def __init__(self, model_dim, num_heads, num_layers, output_dim):
+    def __init__(
+        self,
+        model_dim,
+        num_heads,
+        num_layers,
+        output_dim,
+        fuse_qkv_params=False,
+        params_dtype=torch.float32,
+        device="cuda",
+    ):
         super().__init__()
         self.layers = torch.nn.ModuleList(
             [
                 te.pytorch.TransformerLayer(
-                    hidden_size=model_dim, ffn_hidden_size=model_dim, num_attention_heads=num_heads
+                    hidden_size=model_dim,
+                    ffn_hidden_size=model_dim,
+                    num_attention_heads=num_heads,
+                    fuse_qkv_params=fuse_qkv_params,
+                    params_dtype=params_dtype,
+                    device=device,
                 )
                 for _ in range(num_layers)
             ]
         )
-        self.fc_out = te.pytorch.Linear(model_dim, output_dim)
+        self.fc_out = te.pytorch.Linear(
+            model_dim, output_dim, params_dtype=params_dtype, device=device
+        )
 
     def forward(self, x):
         for layer in self.layers:
@@ -128,9 +159,9 @@ class ToyTETransformer(torch.nn.Module):
         return x
 
 
-def build_toy_model_and_optimizer(model_type: str, init_model_with_meta_device: bool, seed=None):
+def build_toy_model(model_type: str, init_model_with_meta_device: bool, seed=None):
     """
-    Helper function to build a toy model and optimizer for testing Megatron-FSDP.
+    Helper function to build a toy model for testing Megatron-FSDP.
     """
     # Set the seed to make sure the same model is initialized on all ranks.
     if seed is not None:
@@ -156,13 +187,16 @@ def build_toy_model_and_optimizer(model_type: str, init_model_with_meta_device: 
             fsdp_unit_modules = [torch.nn.Transformer]
         elif model_type == TE_TRANSFORMER:
             toy_model = ToyTETransformer(
-                model_dim=DIM_SIZE, num_heads=2, num_layers=NUM_LAYERS, output_dim=DIM_SIZE
+                model_dim=DIM_SIZE,
+                num_heads=2,
+                num_layers=NUM_LAYERS,
+                output_dim=DIM_SIZE,
+                device="meta" if init_model_with_meta_device else "cuda",
             )
             fsdp_unit_modules = [te.pytorch.TransformerLayer]
-        toy_adam = Adam(params=toy_model.parameters(), lr=0.01)
 
     # Return the toy model, optimizer, and FSDP unit modules.
-    return toy_model, toy_adam, fsdp_unit_modules
+    return toy_model, fsdp_unit_modules
 
 
 def build_distributed_environment(mesh_dim_config: tuple):
@@ -223,16 +257,23 @@ class TestMegatronFsdpFullyShard:
             (2, 2, 1, 2),
         ],
     )
-    @pytest.mark.parametrize("preserve_fp32_weights", [True, False])
-    @pytest.mark.parametrize("init_model_with_meta_device", [True, False])
+    @pytest.mark.parametrize(
+        "common_args",
+        [
+            {
+                "preserve_fp32_weights": True,
+                "init_model_with_meta_device": True,
+                "torch_compile": True,
+            },
+            {
+                "preserve_fp32_weights": False,
+                "init_model_with_meta_device": False,
+                "torch_compile": False,
+            },
+        ],
+    )
     def test_fully_shard(
-        self,
-        model_type,
-        dp_shard_strategy,
-        dp_outer_strategy,
-        mesh_dim_config,
-        preserve_fp32_weights,
-        init_model_with_meta_device,
+        self, model_type, dp_shard_strategy, dp_outer_strategy, mesh_dim_config, common_args
     ):
         """
         Test the fully_shard API with different configurations.
@@ -244,6 +285,10 @@ class TestMegatronFsdpFullyShard:
         """
         from megatron.core.distributed.fsdp.src.megatron_fsdp.fully_shard import fully_shard
 
+        preserve_fp32_weights = common_args["preserve_fp32_weights"]
+        init_model_with_meta_device = common_args["init_model_with_meta_device"]
+        torch_compile = common_args["torch_compile"]
+
         # Skip due to lack of functionality.
         if init_model_with_meta_device and dp_shard_strategy == NO_SHARD:
             pytest.skip(
@@ -252,7 +297,7 @@ class TestMegatronFsdpFullyShard:
             )
         elif dp_outer_strategy == OPTIM:
             if dp_shard_strategy != OPTIM_GRADS_PARAMS:
-                # FIXME(@shjwudp, @cspades): This is an unexpected lack of support.
+                # TODO(@shjwudp, @cspades): Requires various modifications to support.
                 # [default0]:FAILED tests/unit_tests/distributed/test_mfsdp_fully_shard.py
                 # [False-True-True-True-mesh_dim_config0-optim-optim-cnn]
                 # [False-True-True-True-mesh_dim_config0-optim-optim_grads-cnn]
@@ -265,9 +310,8 @@ class TestMegatronFsdpFullyShard:
         device_mesh = build_distributed_environment(mesh_dim_config)
 
         # Construct toy model.
-        toy_model, toy_adam, fsdp_unit_modules = build_toy_model_and_optimizer(
-            model_type, init_model_with_meta_device
-        )
+        toy_model, fsdp_unit_modules = build_toy_model(model_type, init_model_with_meta_device)
+        toy_adam = Adam(params=toy_model.parameters(), lr=0.01)
 
         # Wrap in fully_shard.
         model, optimizer = fully_shard(
@@ -289,6 +333,7 @@ class TestMegatronFsdpFullyShard:
             grad_reduce_in_fp32=False,
             init_model_with_meta_device=init_model_with_meta_device,
         )
+        model = torch.compile(model) if torch_compile else model
 
         # Mock input and target.
         toy_input = torch.randn(1, DIM_SIZE, DIM_SIZE).to("cuda")
@@ -316,7 +361,7 @@ class TestMegatronFsdpFullyShard:
             # Validate gradients exist in the Torch Module, i.e. non-None and non-zero.
             grads_exist = any(
                 isinstance(p.grad, torch.Tensor) and p.grad.to_local().count_nonzero().item() > 0
-                for p in model.module.parameters()
+                for p in model.parameters()
             )
             sharding_group = (
                 device_mesh[HSDP].get_group()
@@ -396,9 +441,8 @@ class TestMegatronFsdpFullyShard:
         accuracy tests are non-trivial, i.e. don't just use the initialized weights.
         """
         # Test model.
-        toy_model, toy_adam, fsdp_unit_modules = build_toy_model_and_optimizer(
-            model_type, False, seed=0
-        )
+        toy_model, fsdp_unit_modules = build_toy_model(model_type, False, seed=0)
+        toy_adam = Adam(params=toy_model.parameters(), lr=0.01)
 
         # Wrap in fully_shard.
         model, optimizer = fully_shard(
@@ -477,9 +521,8 @@ class TestMegatronFsdpFullyShard:
         """
         # Initialize a new model for checkpoint loading. Set a different seed to force a different model init,
         # to ensure the checkpoint loading is accurate and non-trivial.
-        toy_model, toy_adam, fsdp_unit_modules = build_toy_model_and_optimizer(
-            model_type, False, seed=1
-        )
+        toy_model, fsdp_unit_modules = build_toy_model(model_type, False, seed=1)
+        toy_adam = Adam(params=toy_model.parameters(), lr=0.01)
 
         # Wrap in fully_shard.
         model, optimizer = fully_shard(
@@ -591,3 +634,143 @@ class TestMegatronFsdpFullyShard:
 
         # Destroy device mesh.
         destroy_device_mesh(device_mesh)
+
+    @pytest.mark.parametrize("shard_strategy", [OPTIM_GRADS_PARAMS, OPTIM_GRADS, OPTIM, NO_SHARD])
+    def test_fully_shard_ez(self, shard_strategy):
+        """
+        Test fully_shard(device_mesh=None). Represents the easiest entrypoint to Megatron-FSDP.
+        """
+        from megatron.core.distributed.fsdp.src.megatron_fsdp.fully_shard import (
+            fully_shard_model,
+            fully_shard_optimizer,
+        )
+
+        # Construct toy model.
+        toy_model, fsdp_unit_modules = build_toy_model(TRANSFORMER, False)
+
+        # Fully-shard the model.
+        mfsdp_model = fully_shard_model(
+            module=toy_model, fsdp_unit_modules=fsdp_unit_modules, zero_dp_strategy=shard_strategy
+        )
+
+        # Initialize the distributed optimizer on the MegatronFSDP model.
+        toy_adam = Adam(params=mfsdp_model.parameters(), lr=0.01)
+        optimizer = fully_shard_optimizer(optimizer=toy_adam)
+
+        # Mock input and target.
+        toy_input = torch.randn(1, DIM_SIZE, DIM_SIZE).to("cuda")
+        toy_target = torch.randn(1, DIM_SIZE, DIM_SIZE).to("cuda")
+
+        for step in range(NUM_STEPS):
+
+            # Forward pass.
+            output = mfsdp_model(toy_input, toy_input)
+
+            # Loss.
+            loss = mse_loss(output, toy_target)
+
+            # Backward pass.
+            loss.backward()
+
+            # Optimizer step.
+            optimizer.step()
+            optimizer.zero_grad()
+
+    @pytest.mark.parametrize("init_model_with_meta_device", [True, False])
+    @pytest.mark.parametrize(
+        "te_recipe",
+        [DELAYED_FP8_RECIPE, CURRENT_FP8_RECIPE, BLOCKWISE_FP8_RECIPE, MXFP8_BLOCKWISE_RECIPE],
+    )
+    def test_fully_shard_te_quantized(self, init_model_with_meta_device, te_recipe):
+        """
+        Test Megatron-FSDP with FP8 activations and parameters via TransformerEngine.
+        """
+        if te_recipe == MXFP8_BLOCKWISE_RECIPE:
+            # TODO(@cspades, @ko3n1g): Add this test case in.
+            pytest.skip(f"[Megatron CI/CD] MXFP8 requires Blackwell nodes to test.")
+
+        from megatron.core.distributed.fsdp.src.megatron_fsdp.fully_shard import (
+            fully_shard_model,
+            fully_shard_optimizer,
+        )
+
+        # Build FP8 recipe.
+        te_quant_recipe = None
+        if te_recipe == MXFP8_BLOCKWISE_RECIPE:
+            te_quant_recipe = te.common.recipe.MXFP8BlockScaling(
+                fp8_format=te.common.recipe.Format.HYBRID
+            )
+        elif te_recipe == DELAYED_FP8_RECIPE:
+            te_quant_recipe = te.common.recipe.DelayedScaling()
+        elif te_recipe == CURRENT_FP8_RECIPE:
+            te_quant_recipe = te.common.recipe.Float8CurrentScaling()
+        elif te_recipe == BLOCKWISE_FP8_RECIPE:
+            te_quant_recipe = te.common.recipe.Float8BlockScaling()
+
+        # Construct toy model compatible with FP8.
+        with (
+            te.pytorch.quantized_model_init(
+                recipe=te_quant_recipe,
+                # Needed for FP8 parameters with Megatron-FSDP.
+                preserve_high_precision_init_val=True,
+            )
+            if te_quant_recipe is not None
+            else nullcontext()
+        ):
+            # Fused QKV, BF16 precision for high-precision weights,
+            # and hidden dimension divisibility by 32 is required
+            # for some FP8 recipes such as MXFP8.
+            toy_model = ToyTETransformer(
+                model_dim=64,
+                num_heads=2,
+                num_layers=2,
+                output_dim=64,
+                fuse_qkv_params=True,
+                params_dtype=torch.bfloat16,
+                device="meta" if init_model_with_meta_device else "cuda",
+            )
+
+        # Fully-shard the model.
+        mfsdp_model = fully_shard_model(
+            module=toy_model,
+            fsdp_unit_modules=[te.pytorch.TransformerLayer, te.pytorch.Linear],
+            # Only ZeRO-3 / FSDP supports FP8 parameters.
+            zero_dp_strategy=3,
+            init_model_with_meta_device=init_model_with_meta_device,
+            # Required for FP8 parameter support, except for MXFP8 which has
+            # its own row-wise and col-wise (transpose) buffer management
+            # schedule that is natively managed by Megatron-FSDP.
+            keep_fp8_transpose_cache=True,
+            # Required for FP8 parameters. The optimizer state (and gradients)
+            # are never quantized, as TE produces high-precision wgrad and
+            # dgrad from FP8 weights and activations. Already defaults to True.
+            preserve_fp32_weights=True,
+        )
+
+        # Initialize the distributed optimizer on the MegatronFSDP model.
+        toy_adam = Adam(params=mfsdp_model.parameters(), lr=0.01)
+        optimizer = fully_shard_optimizer(optimizer=toy_adam)
+
+        # Mock input and target. Requires 2^N batch size for (MX)FP8 kernels.
+        toy_input = torch.randn(16, 64, 64, dtype=torch.bfloat16).to("cuda")
+        toy_target = torch.randn(16, 64, 64, dtype=torch.bfloat16).to("cuda")
+
+        for step in range(NUM_STEPS):
+
+            # Forward pass.
+            with (
+                te.pytorch.autocast(recipe=te_quant_recipe)
+                if te_quant_recipe is not None
+                else nullcontext()
+            ):
+                output = mfsdp_model(toy_input)
+
+            # Loss.
+            loss = mse_loss(output, toy_target)
+
+            # Backward pass.
+            loss.backward()
+
+            # Optimizer step.
+            optimizer.step()
+            optimizer.zero_grad()

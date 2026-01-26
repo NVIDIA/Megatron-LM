@@ -1,6 +1,7 @@
 # Copyright (c) 2024, NVIDIA CORPORATION. All rights reserved.
 
 """Megatron Module."""
+from functools import partial
 from typing import Optional, Tuple
 
 import torch
@@ -11,6 +12,7 @@ from megatron.core import parallel_state
 from megatron.core.dist_checkpointing.mapping import ShardedStateDict
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.transformer.utils import (
+    ensure_metadata_has_dp_cp_group,
     make_sharded_tensors_for_checkpoint,
     sharded_state_dict_default,
 )
@@ -56,7 +58,7 @@ class MegatronModule(torch.nn.Module):
     def sharded_state_dict(
         self,
         prefix: str = '',
-        sharded_offsets: Tuple[Tuple[int, int, int]] = (),
+        sharded_offsets: Tuple[Tuple[int, int, int], ...] = (),
         metadata: Optional[dict] = None,
     ) -> ShardedStateDict:
         """Default implementation for sharded state dict for distributed checkpointing.
@@ -77,13 +79,26 @@ class MegatronModule(torch.nn.Module):
         sharded_state_dict = {}
         # Save parameters
         self._save_to_state_dict(sharded_state_dict, '', keep_vars=True)
+        if not hasattr(self, 'tp_group'):
+            # some model interface hasn't updated for m4, fallback needed
+            tp_group = parallel_state.get_tensor_model_parallel_group()
+        else:
+            tp_group = self.tp_group
+        # Guard for cases metadata is not provided
+        metadata = ensure_metadata_has_dp_cp_group(metadata)
         sharded_state_dict = make_sharded_tensors_for_checkpoint(
-            sharded_state_dict, prefix, sharded_offsets=sharded_offsets
+            sharded_state_dict,
+            prefix,
+            sharded_offsets=sharded_offsets,
+            tp_group=tp_group,
+            dp_cp_group=metadata['dp_cp_group'],
         )
         # Recurse into submodules
         for name, module in self.named_children():
             sharded_state_dict.update(
-                sharded_state_dict_default(module, f'{prefix}{name}.', sharded_offsets, metadata)
+                sharded_state_dict_default(
+                    module, f'{prefix}{name}.', sharded_offsets, metadata, tp_group=tp_group
+                )
             )
         return sharded_state_dict
 
@@ -170,6 +185,39 @@ class GraphableMegatronModule(MegatronModule):
             # triggered before CUDA Graph running. This is required to ensure the correct param
             # all-gather overlap with forward compute.
             self.cuda_graph_manual_hooks = []
+            # _CudaGraphBackwardDWWrapper object used to manage the wgrad backward computation.
+            # The `backward_dw` func api is the same as `TransformerLayerNode.backward_dw` and
+            # calls wgrad computation in attention module (contains attn and shared expert)
+            # according to CUDA graph scope.
+            self.cuda_graph_backward_dw_wrapper = None
+
+    def init_backward_dw_wrapper(self):
+        """Initialize the backward_dw_wrapper."""
+        from megatron.core.models.gpt.fine_grained_callables import _BackwardDWWrapper
+
+        config = getattr(self, 'config', None)
+        assert config is not None, (
+            "TransformerLayer must be initialized before calling " "`init_backward_dw_wrapper`."
+        )
+        self.backward_dw_wrapper = _BackwardDWWrapper(self)
+
+    def set_te_cuda_graph_backward_dw_wrapper(self):
+        """Replace the backward_dw callable with dw cuda graph."""
+        assert (
+            self.backward_dw_wrapper is not None
+        ), "`backward_dw_wrapper` must be set when cuda graphs are enabled for ep overlap."
+        self.backward_dw_wrapper.set_graphed_backward_dw_callable(
+            partial(self._te_cuda_graph_backward_dw_graph, self.current_microbatch)
+        )
+
+    def _te_cuda_graph_backward_dw_graph(self, microbatch_idx):
+        """
+        CUDA Graph backward weight gradient computation for current layer.
+        """
+        cg_index = microbatch_idx % len(self.cuda_graphs)
+        if not hasattr(self.cuda_graphs[cg_index], 'backward_dw'):
+            return
+        self.cuda_graphs[cg_index].backward_dw()
 
     def get_layer_static_inputs(self, seq_length, micro_batch_size):
         """
@@ -379,7 +427,9 @@ class Float16Module(MegatronModule):
         self.config = config
         self.fp16 = config.fp16
         self.bf16 = config.bf16
+        self.vp_size = config.virtual_pipeline_model_parallel_size
         self.vp_stage = getattr(module, 'vp_stage', None)
+        self.pg_collection = getattr(module, 'pg_collection', None)
 
         if self.fp16:
             self.add_module('module', module.half())
@@ -424,11 +474,23 @@ class Float16Module(MegatronModule):
             The wrapped module's outputs, potentially upcast to fp32 depending on pipeline stage
             and ``fp32_output``.
         """
-        if parallel_state.is_pipeline_first_stage(ignore_virtual=False, vp_stage=self.vp_stage):
+        from megatron.core.pipeline_parallel.utils import (
+            is_pp_first_stage,
+            is_pp_last_stage,
+            is_vp_first_stage,
+            is_vp_last_stage,
+        )
+
+        if self.pg_collection is None:
+            pp_group = parallel_state.get_pipeline_model_parallel_group()
+        else:
+            pp_group = self.pg_collection.pp
+        if is_vp_first_stage(self.vp_stage, self.vp_size) and is_pp_first_stage(pp_group):
             inputs = fp32_to_float16(inputs, self.float16_convertor)
         outputs = self.module(*inputs, **kwargs)
         if (
-            parallel_state.is_pipeline_last_stage(ignore_virtual=False, vp_stage=self.vp_stage)
+            is_vp_last_stage(self.vp_stage, self.vp_size)
+            and is_pp_last_stage(pp_group)
             and fp32_output is True
         ):
             outputs = float16_to_fp32(outputs)
