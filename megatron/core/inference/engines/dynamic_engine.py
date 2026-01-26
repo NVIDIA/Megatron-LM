@@ -43,6 +43,7 @@ from megatron.core.inference.utils import Counter, await_process_event
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.transformer.cuda_graphs import delete_cuda_graphs
 from megatron.core.utils import (
+    deprecate_args,
     experimental_api,
     get_asyncio_loop,
     get_pg_rank,
@@ -90,6 +91,15 @@ try:
 except ImportError:
     HAVE_PSUTIL = False
 
+DEPRECATED_ARGS = [
+    "enable_cuda_graph",
+    "random_seed",
+    "track_paused_request_events",
+    "enable_chunked_prefill",
+    "inference_logging_step_interval",
+    "pg_collection",
+]
+
 
 class EngineSuspendedError(Exception):
     """Engine is currently suspended and not performing steps."""
@@ -134,6 +144,10 @@ class DynamicInferenceEngine(AbstractEngine):
             batching and a dynamic block-level KV cache (similar to paged attention).
     """
 
+    @deprecate_args(
+        *DEPRECATED_ARGS,
+        message="Argument `{name}` has been deprecated. Only pass `controller` and `context`",
+    )
     def __init__(self, controller: TextGenerationController, context: DynamicInferenceContext):
 
         assert isinstance(

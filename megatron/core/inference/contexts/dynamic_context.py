@@ -27,6 +27,7 @@ from megatron.core.models.common.embeddings.rope_utils import apply_rotary_pos_e
 from megatron.core.package_info import __version__ as mcore_version
 from megatron.core.ssm.mamba_hybrid_layer_allocation import get_layer_maps_from_layer_type_list
 from megatron.core.transformer import MLATransformerConfig, TransformerConfig
+from megatron.core.utils import deprecate_args
 from megatron.core.utils import divide as core_divide
 from megatron.core.utils import get_pg_size, internal_api
 
@@ -46,6 +47,37 @@ try:
     HAVE_FLASHINFER = True
 except ImportError:
     HAVE_FLASHINFER = False
+
+
+DEPRECATED_ARGS = [
+    "params_dtype",
+    "num_layers",
+    "kv_channels",
+    "num_attention_heads",
+    "max_sequence_length",
+    "buffer_size_gb",
+    "paused_buffer_size_gb",
+    "max_requests",
+    "max_tokens",
+    "block_size_tokens",
+    "tensor_model_parallel_size",
+    "pipeline_model_parallel_size",
+    "pg_collection",
+    "cache_mla_latent",
+    "kv_lora_rank",
+    "qk_pos_emb_head_dim",
+    "num_cuda_graphs",
+    "materialize_only_last_token_logits",
+    "mamba_inference_state_config",
+    "use_cuda_graphs_for_non_decode_steps",
+    "use_flashinfer_fused_rope",
+    "unified_memory_level",
+    "cuda_graph_max_tokens",
+    "cuda_graph_mixed_prefill_count",
+    "metrics_writer",
+    "request_metadata_types",
+    "persist_cuda_graphs",
+]
 
 
 class ContextOverflowError(Exception):
@@ -191,6 +223,13 @@ class DynamicInferenceContext(BaseInferenceContext):
     TOKEN_ROUNDER = 64
     REQUEST_ROUNDER = 4
 
+    @deprecate_args(
+        *DEPRECATED_ARGS,
+        message=(
+            "Argument `{name}` has been deprecated. "
+            "Only pass `model_config` and `inference_config`"
+        ),
+    )
     def __init__(self, model_config: TransformerConfig, inference_config: InferenceConfig):
         super().__init__(inference_config=inference_config)
 
