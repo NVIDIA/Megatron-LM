@@ -52,6 +52,10 @@ inputs:
 runs:
   using: "composite"
   steps:
+    - name: Print node name
+      shell: bash -x -e -u -o pipefail {0}
+      run: echo "node_name=$NODE_NAME" | tee -a "$GITHUB_OUTPUT"
+
     - name: Checkout repository
       uses: actions/checkout@v2
 

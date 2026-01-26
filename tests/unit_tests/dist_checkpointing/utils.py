@@ -202,7 +202,11 @@ def setup_model_and_optimizer(
     if 'muon' in optimizer:
         # Use layer-wise distributed optimizer with Muon
         optimizer_type = optimizer
-        optimizer = get_megatron_muon_optimizer(config, model)
+        # default lr None feels wrong. only change muon lr to avoid breaking old tests
+        config.lr = 0.0
+        optimizer = get_megatron_muon_optimizer(
+            config, model, layer_wise_distributed_optimizer='dist' in optimizer_type
+        )
     else:
         optimizer_type = optimizer
         optimizer = get_megatron_optimizer(config, model)
@@ -217,18 +221,8 @@ def setup_model_and_optimizer(
                     optimizer.optimizer.state[p]['exp_avg'] = torch.rand_like(p.data)
                     optimizer.optimizer.state[p]['exp_avg_sq'] = torch.rand_like(p.data)
     else:
-        for group in optimizer.chained_optimizers[0].param_groups:
-            for p in group['params']:
-                if len(optimizer.chained_optimizers[0].state[p]) == 0:
-                    optimizer.chained_optimizers[0].state[p]['momentum_buffer'] = torch.rand_like(
-                        p.data
-                    )
-
-        for group in optimizer.chained_optimizers[1].param_groups:
-            for p in group['params']:
-                if len(optimizer.chained_optimizers[1].state[p]) == 0:
-                    optimizer.chained_optimizers[1].state[p]['exp_avg'] = torch.rand_like(p.data)
-                    optimizer.chained_optimizers[1].state[p]['exp_avg_sq'] = torch.rand_like(p.data)
+        for opt in optimizer.chained_optimizers:
+            opt.init_state_fn(opt)
 
     optimizer.reload_model_params()
 
@@ -305,7 +299,11 @@ def setup_moe_model_and_optimizer(
 
     if 'muon' in optimizer:
         optimizer_type = optimizer
-        optimizer = get_megatron_muon_optimizer(config, model)
+        # default lr None feels wrong. only change muon lr to avoid breaking old tests
+        config.lr = 0.0
+        optimizer = get_megatron_muon_optimizer(
+            config, model, layer_wise_distributed_optimizer='dist' in optimizer_type
+        )
     else:
         optimizer_type = optimizer
         optimizer = get_megatron_optimizer(config, model)
@@ -321,18 +319,8 @@ def setup_moe_model_and_optimizer(
                         opt.state[p]['exp_avg'] = torch.rand_like(p.data)
                         opt.state[p]['exp_avg_sq'] = torch.rand_like(p.data)
     else:
-        for group in optimizer.chained_optimizers[0].param_groups:
-            for p in group['params']:
-                if len(optimizer.chained_optimizers[0].state[p]) == 0:
-                    optimizer.chained_optimizers[0].state[p]['momentum_buffer'] = torch.rand_like(
-                        p.data
-                    )
-
-        for group in optimizer.chained_optimizers[1].param_groups:
-            for p in group['params']:
-                if len(optimizer.chained_optimizers[1].state[p]) == 0:
-                    optimizer.chained_optimizers[1].state[p]['exp_avg'] = torch.rand_like(p.data)
-                    optimizer.chained_optimizers[1].state[p]['exp_avg_sq'] = torch.rand_like(p.data)
+        for opt in optimizer.chained_optimizers:
+            opt.init_state_fn(opt)
 
     optimizer.reload_model_params()
 
