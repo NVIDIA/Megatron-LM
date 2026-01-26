@@ -1352,13 +1352,14 @@ def validate_args(args, defaults={}):
         ):
             args.te_rng_tracker = True
             warn_rank_0("te_rng_tracker is not enabled, enabling it for CUDA graphs.", args.rank)
-        assert (
-            "expandable_segments:True" not in os.getenv("PYTORCH_CUDA_ALLOC_CONF", "")
-            or os.getenv("NCCL_GRAPH_REGISTER", "") == "0"
-        ), (
-            "Setting NCCL_GRAPH_REGISTER=0 to avoid illegal memory access when using "
-            "CUDA Graph with PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True."
-        )
+        if args.cuda_graph_impl == "transformer_engine":
+            assert (
+                "expandable_segments:True" not in os.getenv("PYTORCH_CUDA_ALLOC_CONF", "")
+                or os.getenv("NCCL_GRAPH_REGISTER", "") == "0"
+            ), (
+                "Setting NCCL_GRAPH_REGISTER=0 to avoid illegal memory access when using "
+                "CUDA Graph with PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True."
+            )
     if args.cuda_graph_scope == "full" or (
         isinstance(args.cuda_graph_scope, list) and "full" in args.cuda_graph_scope
     ):
