@@ -12,6 +12,7 @@ from .utils import (
     ReshardPlan,
     ShardingDescriptor,
     TransferOp,
+    _build_layer_module_prefix_map,
     _get_rank_in_group,
     extract_param_metadata,
     select_src_metadata_balanced,
@@ -163,14 +164,14 @@ def _finalize_dp_transfers(
     destination and source mode have no TP or the parameter is replicted on all ranks
     such as layernorm. If the source and destination DP groups match, we return a local
     full-tensor copy; otherwise we pick a source rank from the source DP group in a
-    deterministic round-robin manner based on the receiver's index in its destination DP group.
+    deterministic round-robin manner based on the receiver's global rank for better load
+    distribution.
     """
     dst_dp_ranks = dst_metadata.data_parallel_group_ranks
     src_dp_ranks = src_metadata.data_parallel_group_ranks
     if my_global_rank not in dst_dp_ranks:
         return []
 
-    my_dst_dp_rank = _get_rank_in_group(my_global_rank, dst_dp_ranks)
     dst_shape = dst_metadata.shape
 
     # Same DP layout - local copy
@@ -178,8 +179,11 @@ def _finalize_dp_transfers(
         full_slice = tuple(slice(None) for _ in range(len(dst_shape)))
         return [(my_global_rank, full_slice, full_slice)]
 
-    # Different DP groups - use round-robin for load balancing
-    src_global_rank = src_dp_ranks[my_dst_dp_rank % len(src_dp_ranks)]
+    # Different DP groups - use round-robin based on destination global rank for
+    # better load balancing across source ranks. This ensures that destination
+    # ranks are distributed across source ranks even when they have the same
+    # position within their respective DP groups.
+    src_global_rank = src_dp_ranks[my_global_rank % len(src_dp_ranks)]
     full_slice = tuple(slice(None) for _ in range(len(dst_shape)))
     return [(src_global_rank, full_slice, full_slice)]
 
@@ -225,12 +229,30 @@ def build_centralized_reshard_plan(
     my_src_params = {name: p for name, p in src_module.named_parameters(recurse=True)}
     my_dst_params = {name: p for name, p in dst_module.named_parameters(recurse=True)}
 
+    # Build PP layer prefix maps to be used for parameter name rewriting
+    src_layer_prefix_map = _build_layer_module_prefix_map(src_module)
+    dst_layer_prefix_map = _build_layer_module_prefix_map(dst_module)
+
     my_src_metadata = [
-        extract_param_metadata(p, name, my_global_rank, src_pg, num_experts=num_experts)
+        extract_param_metadata(
+            p,
+            name,
+            my_global_rank,
+            src_pg,
+            num_experts=num_experts,
+            layer_module_prefix_map=src_layer_prefix_map,
+        )
         for name, p in my_src_params.items()
     ]
     my_dst_metadata = [
-        extract_param_metadata(p, name, my_global_rank, dst_pg, num_experts=num_experts)
+        extract_param_metadata(
+            p,
+            name,
+            my_global_rank,
+            dst_pg,
+            num_experts=num_experts,
+            layer_module_prefix_map=dst_layer_prefix_map,
+        )
         for name, p in my_dst_params.items()
     ]
 
