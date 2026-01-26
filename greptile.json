@@ -1,5 +1,5 @@
 {
-    "labels": ["ai-review"],
+    "labels": [],
     "comment": "Disclaimer: This is AI-generated.",
     "commentTypes": ["logic", "syntax", "style"],
     "instructions": "Only comment if the PR description is unchanged from the default template, if a docstring is missing, or if there is a typo.",
