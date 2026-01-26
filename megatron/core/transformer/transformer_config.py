@@ -771,7 +771,7 @@ class TransformerConfig(ModelParallelConfig):
 
     symmetric_ar_type: Optional[Literal['two_shot', "one_shot", "multimem_all_reduce"]] = None
     """What type of symmetric all reduce to use. The default is None
-    which is no use of symetric memory.
+    which is no use of symmetric memory.
     """
 
     use_inference_optimized_layers: bool = False

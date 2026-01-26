@@ -57,7 +57,7 @@ class ModelParallelConfig:
     """Distributes Moe Experts across sub data parallel dimension."""
 
     expert_tensor_parallel_size: Optional[int] = None
-    """Intra-layer tensor model parallelsm for expert layer. Splits tensors across GPU ranks.
+    """Intra-layer tensor model parallelism for expert layer. Splits tensors across GPU ranks.
        Default is None, which will be set to the value of tensor_model_parallel_size.
     """
 
