@@ -36,6 +36,12 @@ def add_modelopt_export_args(parser):
         type=str,
         help="A pretrained model hosted inside a model repo on huggingface.co.",
     )
+    group.add_argument(
+        "--export-vllm-fq",
+        action="store_true",
+        default=False,
+        help="Export the model for vLLM fakequant reload.",
+    )
     group.add_argument("--export-dir", type=str, help="The target export path.")
     add_modelopt_args(parser)
     return parser
@@ -93,4 +99,6 @@ if __name__ == "__main__":
     }
     if modelopt_version_at_least("0.41.0"):
         export_kwargs.update({"trust_remote_code": args.trust_remote_code})
-    mtex.export_mcore_gpt_to_hf(unwrapped_model, args.pretrained_model_name, **export_kwargs)
+    
+    export_fn = mtex.export_mcore_gpt_to_hf_vllm_fq if args.export_vllm_fq else mtex.export_mcore_gpt_to_hf
+    export_fn(unwrapped_model, args.pretrained_model_name, **export_kwargs)

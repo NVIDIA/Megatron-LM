@@ -78,6 +78,18 @@ provide `${EXPORT_DIR}` to `export.sh`.
     ./export.sh meta-llama/Llama-3.2-1B-Instruct
 ```
 
+To export the model for vLLM fakequant example in `modelopt/examples/vllm_serve/vllm_serve_fakequant.py`,
+export the model with flag `--export-vllm-fq`:
+```sh
+\
+    PP=1 \
+    MLM_EXTRA_ARGS=--export-vllm-fq \
+    HF_MODEL_CKPT=<pretrained_model_name_or_path> \
+    MLM_MODEL_CKPT=/tmp/Llama-3.2-1B-Instruct_quant \
+    EXPORT_DIR=/tmp/Llama-3.2-1B-Instruct_export \
+    ./export.sh meta-llama/Llama-3.2-1B-Instruct
+```
+
 ### ⭐ Online BF16 EAGLE3 Training
 
 Online EAGLE3 training has both the target (frozen) and draft models in the memory where the `hidden_states`
