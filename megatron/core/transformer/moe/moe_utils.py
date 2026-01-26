@@ -248,8 +248,13 @@ def permute(
     drop_and_pad: bool = False,
     tokens_per_expert: Optional[torch.Tensor] = None,
     align_size: int = -1,
-):
-) -> Tuple[torch.Tensor, Optional[torch.Tensor], torch.Tensor]:
+) -> Tuple[
+    torch.Tensor,
+    Optional[torch.Tensor],
+    torch.Tensor,
+    Optional[torch.Tensor],
+    Optional[torch.Tensor],
+]:
     """Permute the tokens and probs based on the mask.
     Tokens with the same designated expert will be grouped together.
     The shape of mask is [tokens, num_experts], it indicates which experts were selected
@@ -257,6 +262,9 @@ def permute(
 
     When drop_and_pad=True, in routing_map, the number of non-zeros in each column equals to
     expert capacity. This function exploits this feature to use ops that support cuda graph.
+
+    If the fused permute and pad kernel is available, it will pad the tokens to the align_size
+    and return the padded permuted tokens, pad_offsets and padded tokens per expert.
 
     Args:
         tokens (torch.Tensor): The input token tensor, [num_tokens, hidden].
@@ -269,14 +277,20 @@ def permute(
                                        and pads the number of tokens to the expert capacity.
                                        If set to true, routing_map has a fixed number of non-zeros
                                        in each column.
-        tokens_per_expert : torch.Tensor
-            Tensor of shape `[num_experts]` containing actual token counts per expert.
-        align_size : int
-            the alignment size for the input tensor for fp8 or fp4.
+        tokens_per_expert (torch.Tensor, optional): Tensor of shape `[num_experts]` containing
+                                                    actual token counts per expert.
+        align_size (int, optional): The alignment size for the input tensor for fp8 or fp4.
 
     Returns:
-        Tuple[torch.Tensor, Optional[torch.Tensor], torch.Tensor]:
-            The permuted tokens, permuted probs, and sorted indices.
+        Tuple[
+            torch.Tensor,
+            Optional[torch.Tensor],
+            torch.Tensor,
+            Optional[torch.Tensor],
+            Optional[torch.Tensor],
+        ]:
+            The permuted tokens, (optional) permuted probs, sorted indices,
+            (optional) pad_offsets, (optional) padded_tokens_per_expert.
     """
     if fused and probs is None:
         if not HAVE_TE or fused_permute is None:
@@ -284,7 +298,7 @@ def permute(
         permuted_input, sorted_indices = fused_permute(
             tokens, routing_map, num_out_tokens=num_out_tokens
         )
-        return permuted_input, None, sorted_indices
+        return permuted_input, None, sorted_indices, None, tokens_per_expert
 
     if fused and probs is not None:
         if not HAVE_TE or (
@@ -346,7 +360,7 @@ def permute(
     # use the mapping to permute the tokens
     permuted_input = tokens.index_select(0, sorted_indices)
 
-    return permuted_input, permuted_probs, sorted_indices
+    return permuted_input, permuted_probs, sorted_indices, None, tokens_per_expert
 
 
 def unpermute(
@@ -358,7 +372,6 @@ def unpermute(
     fused: bool = False,
     drop_and_pad: bool = False,
     pad_offsets: Optional[torch.Tensor] = None,
-):
 ) -> torch.Tensor:
     """
     Restore the original order of tokens after permutation. If probs are provided, it
@@ -380,10 +393,10 @@ def unpermute(
         fused (bool, optional): Whether use the fused unpermute function.
         drop_and_pad (bool, optional): Whether or not the token dispatcher uses token-drop
                                        and pads the number of tokens to the expert capacity.
-        pad_offsets : torch.Tensor, default = None
+        pad_offsets (torch.Tensor, optional):
             Tensor of per-expert cumulative padding offsets used to remove padding added
             during permutation. This is the fourth output of `moe_permute_and_pad_with_probs`
-            and is required when unpermuting padded outputs.
+            and is required when unpermuting padded outputs. Defaults to None.
 
     Returns:
         torch.Tensor: The tokens restored to their original order.
