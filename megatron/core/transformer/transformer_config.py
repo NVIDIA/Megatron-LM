@@ -1862,9 +1862,10 @@ class TransformerConfig(ModelParallelConfig):
                         'to be enabled. This is because the default gradient accumulation does not '
                         'use static memory addresses, which breaks CUDA graph requirements.'
                     )
-                    assert (
-                        not self.add_bias_linear and not self.add_qkv_bias
-                    ), "CUDA graph with delay_wgrad_compute doesn't support bias for now."
+                    if CudaGraphScope.attn in self.cuda_graph_scope:
+                        assert (
+                            not self.add_bias_linear and not self.add_qkv_bias
+                        ), "CUDA graph with delay_wgrad_compute doesn't support attn bias for now."
 
         # Check delay_wgrad_compute compatibility
         if self.delay_wgrad_compute:
