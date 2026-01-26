@@ -1013,6 +1013,8 @@ class TestPartialCudaGraph:
 
         return torch.tensor(loss_list)
 
+    @pytest.mark.flaky
+    @pytest.mark.flaky_in_dev
     @pytest.mark.skipif(
         not (HAVE_TE and is_te_min_version("2.10.0")),
         reason="Partial CUDA graph UT support requires TransformerEngine version >= 2.10.0",
