@@ -962,9 +962,6 @@ class ParallelTransformerLayer(MegatronModule):
 
     def forward(self, hidden_states, attention_mask,
                 encoder_output=None, enc_dec_attn_mask=None,
-                retriever_input=None,
-                retriever_output=None,
-                retriever_attn_mask=None,
                 inference_context=None,
                 rotary_pos_emb=None,
                 *,
@@ -1407,9 +1404,6 @@ class ParallelTransformer(MegatronModule):
 
     def forward(self, hidden_states, attention_mask,
                 encoder_output=None, enc_dec_attn_mask=None,
-                retriever_input=None,
-                retriever_output=None,
-                retriever_attn_mask=None,
                 inference_context=None,
                 rotary_pos_emb=None,
                 *,
@@ -1494,9 +1488,6 @@ class ParallelTransformer(MegatronModule):
                             forward_kwargs['rotary_pos_emb'] = rotary_pos_emb
                     else:
                         forward_kwargs['rotary_pos_emb'] = rotary_pos_emb
-                        forward_kwargs['retriever_input'] = retriever_input
-                        forward_kwargs['retriever_output'] = retriever_output
-                        forward_kwargs['retriever_attn_mask'] = retriever_attn_mask
 
                     for index in range(self.num_layers):
                         layer = self._get_layer(index)
@@ -1505,11 +1496,6 @@ class ParallelTransformer(MegatronModule):
                             hidden_states,
                             attention_mask,
                             **forward_kwargs)
-
-                        if isinstance(hidden_states, tuple):
-                            assert len(hidden_states) == 2
-                            hidden_states, retriever_output = hidden_states
-                            forward_kwargs["retriever_output"] = retriever_output
 
                 # Skip counter update for eval and activation checkpointing
                 if torch.is_grad_enabled() and self.training:

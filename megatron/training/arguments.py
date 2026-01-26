@@ -1762,7 +1762,6 @@ def _add_network_size_args(parser):
                        help='Latent projection dimension for MoE. If None, MoE latent projections are not used.')
     return parser
 
-
 def _add_straggler_detector_args(parser):
     group = parser.add_argument_group(title='straggler')
     group.add_argument('--log-straggler', action='store_true',
@@ -2866,9 +2865,6 @@ def _add_data_args(parser):
                        'This should be exclusive of --seq-length')
     group.add_argument('--decoder-seq-length', type=int, default=None,
                        help="Maximum decoder sequence length to process.")
-    group.add_argument('--retriever-seq-length', type=int, default=256,
-                       help='Maximum sequence length for the biencoder model '
-                       'for retriever')
     group.add_argument('--sample-rate', type=float, default=1.0,
                        help='sample rate for training data. Supposed to be 0 '
                             ' < sample_rate < 1')
