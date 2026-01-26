@@ -191,7 +191,7 @@ GOLDEN_CONFIG: Dict[str, Any] = {
     "moe_token_dropping": False,
     "moe_use_legacy_grouped_gemm": False,
     "moe_z_loss_coeff": None,
-    "moe_enable_router_replay": False,
+    "moe_enable_routing_replay": False,
     "mrope_section": None,
     "mtp_loss_scaling_factor": 0.1,
     "mtp_num_layers": None,
@@ -453,7 +453,6 @@ class TestMambaMoEModel:
         args.moe_router_dtype = "fp64"
         args.moe_router_pre_softmax = False
         args.moe_token_dispatcher_type = "alltoall"
-        args.moe_enable_router_replay = False
         args.no_load_optim = True
         args.no_load_rng = True
         args.no_save_optim = True
