@@ -1,6 +1,7 @@
 # Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
 import asyncio
+import concurrent.futures
 import logging
 import multiprocessing
 import os
@@ -412,6 +413,7 @@ class DynamicInferenceEngine(AbstractEngine):
                     coordinator_ready_event,
                     inference_coordinator_port,
                     get_pg_size(self.pg_collection.dp),
+                    self.controller.tokenizer,
                 ),
             )
             self.inference_coordinator_process.start()
@@ -1204,6 +1206,7 @@ class DynamicInferenceEngine(AbstractEngine):
                 cuda_graph_request_count (int): The CUDA graph batch size matching this step.
         """
         # Increment finished_request_count.
+        range_push("bookkeeping")
         cuda_graph_request_count = None
 
         if step_result is not None:
@@ -1247,26 +1250,33 @@ class DynamicInferenceEngine(AbstractEngine):
             finished_request_records.append(failed_entry.record)
             failed_entry.future.set_result(failed_entry.record)
         self.failed_request_ids.clear()
+        range_pop()
 
-        # Detokenize all finished requests (critical for InferenceClient, which
-        # doesn't necessarily have the tokenizer).
-        for record in finished_request_records:
-            for request in record.requests:
-                if request.prompt is None:
-                    request.prompt = self.controller.tokenizer.detokenize(
-                        request.prompt_tokens.tolist()
+        # Detokenize all finished requests if not using
+        # the coordinator. Otherwise, the coordinator will
+        # overlap detokenization with the engine.
+        if not self.use_coordinator:
+            range_push("detokenization")
+            for record in finished_request_records:
+                for request in record.requests:
+                    if request.prompt is None:
+                        request.prompt = self.controller.tokenizer.detokenize(
+                            request.prompt_tokens.tolist()
+                        )
+                    request.generated_text = self.controller.tokenizer.detokenize(
+                        request.generated_tokens
                     )
-                request.generated_text = self.controller.tokenizer.detokenize(
-                    request.generated_tokens
-                )
+            range_pop()
 
         # Handle necessary ZMQ DP coordinator communication.
         if self.use_coordinator and self.is_mp_coordinator and finished_request_records:
+            range_push("coordinator_communication")
             payload = msgpack.packb(
                 [Headers.ENGINE_REPLY.value, [r.serialize() for r in finished_request_records]],
                 use_bin_type=True,
             )
             self.socket_for_receiving_requests.send(payload)
+            range_pop()
 
         # Log KV cache utilization stats to W&B
         if context_state["kv_stats"] is not None:
@@ -1368,11 +1378,29 @@ class DynamicInferenceEngine(AbstractEngine):
         # Keep for compatibility with current test suite.
         return ret
 
+    def _run_coroutine_sync(self, coro):
+        """Run a coroutine synchronously, handling the case when already in an event loop.
+
+        This method safely runs an async coroutine from synchronous code, even when
+        called from within an already running event loop (e.g., when used with async
+        frameworks like pytriton).
+        """
+        try:
+            # Check if there's already a running event loop
+            asyncio.get_running_loop()
+            # We're inside a running loop - run in a separate thread
+            with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
+                future = executor.submit(asyncio.run, coro)
+                return future.result()
+        except RuntimeError:
+            # No running loop - safe to use run_until_complete
+            return self._loop.run_until_complete(coro)
+
     def step_modern(
         self,
     ) -> Tuple[List[DynamicInferenceRequest], List[DynamicInferenceRequest], float]:
         """Synchronous wrapper for `self.async_step`."""
-        return self._loop.run_until_complete(self.async_step())
+        return self._run_coroutine_sync(self.async_step())
 
     def step_legacy(
         self, sampling_params: SamplingParams
@@ -1383,7 +1411,7 @@ class DynamicInferenceEngine(AbstractEngine):
             "0.16. Please use `step_modern()` going forward, which will eventually "
             "be renamed to `step()`."
         )
-        result = self._loop.run_until_complete(self.async_step())
+        result = self._run_coroutine_sync(self.async_step())
         active_requests = [self.get_request(i) for i in result["active_request_ids"]]
         finished_requests = [r.merge() for r in result["finished_request_records"]]
         return active_requests, finished_requests, result["step_time"]
@@ -1442,7 +1470,7 @@ class DynamicInferenceEngine(AbstractEngine):
             int: The number of messages that were received and processed in this batch.
         """
 
-        torch.cuda.nvtx.range_push("drain_zmq_socket")
+        range_push("drain_zmq_socket")
         all_messages = []
         if self.is_mp_coordinator:
             while True:
@@ -1475,7 +1503,7 @@ class DynamicInferenceEngine(AbstractEngine):
             else:
                 all_messages = []
 
-        torch.cuda.nvtx.range_pop()
+        range_pop()
         for message in all_messages:
             data = msgpack.unpackb(message, raw=False)
             header = Headers(data[0])
@@ -1488,7 +1516,9 @@ class DynamicInferenceEngine(AbstractEngine):
             if header == Headers.SUBMIT_REQUEST:
                 request_id, prompt, sampling_params = data[1:]
                 sampling_params = SamplingParams.deserialize(sampling_params)
+                range_push("add_request")
                 self.add_request(request_id, prompt, sampling_params)
+                range_pop()
             elif header == Headers.PAUSE:
                 # Pause thyself.
                 self.received_pause = True

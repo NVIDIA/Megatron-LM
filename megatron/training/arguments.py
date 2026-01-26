@@ -1352,13 +1352,14 @@ def validate_args(args, defaults={}):
         ):
             args.te_rng_tracker = True
             warn_rank_0("te_rng_tracker is not enabled, enabling it for CUDA graphs.", args.rank)
-        assert (
-            "expandable_segments:True" not in os.getenv("PYTORCH_CUDA_ALLOC_CONF", "")
-            or os.getenv("NCCL_GRAPH_REGISTER", "") == "0"
-        ), (
-            "Setting NCCL_GRAPH_REGISTER=0 to avoid illegal memory access when using "
-            "CUDA Graph with PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True."
-        )
+        if args.cuda_graph_impl == "transformer_engine":
+            assert (
+                "expandable_segments:True" not in os.getenv("PYTORCH_CUDA_ALLOC_CONF", "")
+                or os.getenv("NCCL_GRAPH_REGISTER", "") == "0"
+            ), (
+                "Setting NCCL_GRAPH_REGISTER=0 to avoid illegal memory access when using "
+                "CUDA Graph with PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True."
+            )
     if args.cuda_graph_scope == "full" or (
         isinstance(args.cuda_graph_scope, list) and "full" in args.cuda_graph_scope
     ):
@@ -2013,6 +2014,11 @@ def _add_ft_package_args(parser):
     group.add_argument('--calc-ft-timeouts', action='store_true',
                        help='If set, FT package will try to automatically compute the timeouts. '
                        'Note: This feature is for Nvidia internal use only.')
+    group.add_argument('--ft-num-warmup-iters', type=int, default=5,
+                       help='Number of warmup iterations before monitoring step section and '
+                       'out-of-section timeouts. The first N iterations are excluded from '
+                       'timeout monitoring as they can be significantly slower than steady-state. '
+                       'Default: 5. Note: This feature is for Nvidia internal use only.')
     return parser
 
 
@@ -2025,83 +2031,11 @@ def _add_config_logger_args(parser):
 
 
 def _add_logging_args(parser):
-    group = parser.add_argument_group(title='logging')
+    from megatron.training.training_config import LoggerConfig
 
-    group.add_argument('--log-params-norm', action='store_true',
-                       help='If set, calculate and log parameters norm.')
-    group.add_argument('--log-num-zeros-in-grad', action='store_true',
-                       help='If set, calculate and log the number of zeros in gradient.')
-    group.add_argument('--log-throughput', action='store_true',
-                       help='If set, calculate and log throughput per GPU.')
-    group.add_argument('--log-progress', action='store_true',
-                       help='If set, log progress (in terms of number of processed tokens and '
-                       'number of floating-point operations) to progress.txt file in checkpoint '
-                       'directory.')
-    group.add_argument('--timing-log-level', type=int,
-                       default=0, choices=range(0,3),
-                       help='Granularity level to measure and report timing. '
-                       '   0: report only iteration time and make sure timing '
-                       '      does not introduce extra overhead.'
-                       '   1: report timing for operations that are executed '
-                       '      very limited times (basically once) during '
-                       '      each iteration (such as gradient all-reduce) '
-                       '   2: report timing for operations that migh be '
-                       '      executed numerous times during each iteration. '
-                       'Note that setting the level to 1 or 2 might '
-                       'cause increase in iteration time.')
-    group.add_argument('--log-energy', action='store_true',
-                       help='If set, log energy consumption (in Joules)')
-    group.add_argument('--no-barrier-with-level-1-timing', action='store_false',
-                       help='If not set, use barrier with level 1 time '
-                       'measurements. Note that this is up to the user '
-                       'to make sure calling barrier with their timers '
-                       'will not result in hangs. This can happen if for '
-                       'example the user adds a level 1 timer that is not '
-                       'called by all ranks.',
-                       dest='barrier_with_L1_time')
-    group.add_argument('--timing-log-option', type=str, default='minmax',
-                       choices=['max', 'minmax', 'all'],
-                       help='Options for logging timing:'
-                       '  max: report the max timing across all ranks'
-                       '  minmax: report min and max timings across all ranks'
-                       '  all: report timings of all ranks.')
-    group.add_argument('--tensorboard-log-interval', type=int, default=1,
-                       help='Report to tensorboard interval.')
-    group.add_argument('--tensorboard-queue-size', type=int, default=1000,
-                       help='Size of the tensorboard queue for pending events '
-                       'and summaries before one of the "add" calls forces a '
-                       'flush to disk.')
-    group.add_argument('--log-timers-to-tensorboard', action='store_true',
-                       help='If set, write timers to tensorboard.')
-    group.add_argument('--no-log-loss-scale-to-tensorboard',
-                       action='store_false',
-                       help='Disable loss-scale logging to tensorboard.',
-                       dest='log_loss_scale_to_tensorboard')
-    group.add_argument('--log-validation-ppl-to-tensorboard',
-                       action='store_true',
-                       help='If set, write validation perplexity to '
-                       'tensorboard.')
-    group.add_argument('--log-memory-to-tensorboard',
-                       action='store_true',
-                       help='Enable memory logging to tensorboard.')
-    group.add_argument('--log-world-size-to-tensorboard',
-                       action='store_true',
-                       help='Enable world size logging to tensorboard.')
-    group.add_argument('--log-max-attention-logit', action='store_true',
-                       help='Enable max attention logit logging to tensorboard.')
-    group.add_argument('--wandb-project', type=str, default='',
-                       help='The wandb project name. Ignore wandb by default.')
-    group.add_argument('--wandb-entity', type=str, default='',
-                       help='The wandb entity name. It is useful when '
-                       'there are multiple sub-projects in a project. '
-                       'https://community.wandb.ai/t/how-do-i-decide-which-account-private-or-team-to-upload-the-run-to/5704 '
-                       'Ignore wandb by default.')
-    group.add_argument('--wandb-exp-name', type=str, default='',
-                       help='The wandb experiment name.')
-    group.add_argument('--wandb-save-dir', type=str, default='',
-                       help='Path to save the wandb results locally.')
-    group.add_argument('--logging-level', type=int, default=None,
-                       help='Set default logging level')
+    log_factory = ArgumentGroupFactory(LoggerConfig, exclude = ["log_throughput_to_tensorboard", "throughput_window_size", "memory_keys", "log_l2_norm_grad_to_tensorboard", "log_runtime_to_tensorboard", "runtime_time_unit", "filter_warnings", "modules_to_filter", "set_level_for_all_loggers", "save_config_filepath"])
+    group = log_factory.build_group(parser, title="logging")
+
     return parser
 
 
@@ -2400,14 +2334,6 @@ def _add_training_args(parser):
     group.add_argument('--checkpoint-activations', action='store_true',
                        help='Checkpoint activation to allow for training '
                        'with larger models, sequences, and batch sizes.')
-    group.add_argument('--log-interval', type=int, default=100,
-                       help='Report loss and timing interval.')
-    group.add_argument('--log-memory-interval', type=int, default=None,
-                       help='Report memory interval.')
-    group.add_argument('--log-device-memory-used', action='store_true',
-                       help='Log device memory used (as reported by nvidia-smi).')
-    group.add_argument('--tensorboard-dir', type=str, default=None,
-                       help='Write TensorBoard logs to this directory.')
     group.add_argument('--no-masked-softmax-fusion',
                        action='store_false',
                        help='Disable fusion of query_key_value scaling, '
@@ -2597,6 +2523,10 @@ def _add_checkpointing_args(parser):
                        help='Output directory to save checkpoints to.')
     group.add_argument('--save-interval', '--persistent-save-interval', type=int, default=None,
                        help='Number of iterations between persistent checkpoint saves.')
+    group.add_argument('--save-wgrads-interval', type=int, default=None,
+                       help='Number of iterations between wgrad (main_grad) saves.')
+    group.add_argument('--save-dgrads-interval', type=int, default=None,
+                       help='Number of iterations between dgrad saves.')
     group.add_argument('--save-retain-interval', type=int, default=None,
                        help='Number of iterations between retained checkpoints (other'
                        'checkpoints _except the last checkpoint_ are automatically deleted).')
@@ -2891,6 +2821,13 @@ def _add_distributed_args(parser):
     group.add_argument('--data-parallel-sharding-strategy', type=str, default='no_shard',
                        choices=['no_shard', 'optim', 'optim_grads', 'optim_grads_params'],
                        help='Sharding strategy of data parallelism.')
+    group.add_argument('--outer-dp-sharding-strategy', type=str, default='no_shard',
+                       choices=['no_shard', 'optim'],
+                       help='Sharding strategy for outer data parallel group in Hybrid Sharded Data Parallel (HSDP) mode. '
+                            'Valid values are "no_shard" (DP Replication) and "optim" (Optimizer State Hybrid Sharding). '
+                            'The "optim" option is only supported when --data-parallel-sharding-strategy is "optim_grads_params". '
+                            'This option is only effective when Hybrid FSDP is enabled (i.e., when dp_outer_dim is not None). '
+                            'Default: "no_shard".')
     group.add_argument('--no-gradient-reduce-div-fusion', action='store_false', dest='gradient_reduce_div_fusion',
                        help='If not set, fuse the division in gradient reduce.')
     group.add_argument('--fsdp-double-buffer', action='store_true',
