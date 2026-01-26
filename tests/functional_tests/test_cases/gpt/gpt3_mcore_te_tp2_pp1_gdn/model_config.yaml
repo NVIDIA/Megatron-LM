@@ -17,6 +17,7 @@ MODEL_ARGS:
   --rotary-percent: 0.5
   --no-rope-fusion: true #TODO: We can remove this once upgrading to the DEV container
   --apply-layernorm-1p: true
+  --apply-wd-to-qk-layernorm: true
   --attention-output-gate: true
   --experimental-attention-variant: gated_delta_net
   --linear-attention-freq: 3

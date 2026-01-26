@@ -369,7 +369,7 @@ def advise_managed_tensor_preferred_location(tensor, *, device: int) -> None:
         ctypes.c_void_p(int(tensor.data_ptr())), ctypes.c_size_t(nbytes), int(device)
     )
     if err != 0:
-        raise RuntimeError(f"cudaMemAdviseSetPreferredLocation failed with cudaError={err}")
+        raise RuntimeError(f"cudaMemAdviseSetAccessedBy failed with cudaError={err}")
 
 
 def advise_managed_tensor_accessed_by(tensor, *, device: int) -> None:
@@ -425,20 +425,12 @@ def prefetch_managed_module_parameters(
     # Avoid duplicate prefetch on shared tensors.
     seen_ptrs: set[int] = set()
     total_nbytes = 0
-
-    def _iter_tensors():
-        for p in module.parameters(recurse=True):
-            if p is None:
-                continue
-            yield p.data
-        if include_buffers:
-            for b in module.buffers(recurse=True):
-                if b is None:
-                    continue
-                yield b
-
     stream = torch.cuda.current_stream()
-    for t in _iter_tensors():
+
+    for name, p in module.named_parameters(recurse=True):
+        if p is None:
+            continue
+        t = p.data
         if not isinstance(t, torch.Tensor) or not t.is_cuda or t.numel() == 0:
             continue
         ptr = int(t.data_ptr())
@@ -446,8 +438,37 @@ def prefetch_managed_module_parameters(
             continue
         seen_ptrs.add(ptr)
         nbytes = t.nbytes
-        prefetch_managed_tensor(t, device=device, stream=stream)
+        err = prefetch_managed_tensor(t, device=device, stream=stream)
+        if err:
+            raise RuntimeError(
+                f"cudaMemPrefetchAsync failed (cudaError={err}) for parameter '{name}': "
+                f"shape={tuple(t.shape)}, dtype={t.dtype}, device={t.device}, "
+                f"data_ptr=0x{t.data_ptr():x}, nbytes={nbytes}. "
+                "This tensor is not UVM-allocated."
+            )
         total_nbytes += nbytes
+
+    if include_buffers:
+        for name, b in module.named_buffers(recurse=True):
+            if b is None:
+                continue
+            if not isinstance(b, torch.Tensor) or not b.is_cuda or b.numel() == 0:
+                continue
+            ptr = int(b.data_ptr())
+            if ptr in seen_ptrs:
+                continue
+            seen_ptrs.add(ptr)
+            nbytes = b.nbytes
+            err = prefetch_managed_tensor(b, device=device, stream=stream)
+            if err:
+                raise RuntimeError(
+                    f"cudaMemPrefetchAsync failed (cudaError={err}) for buffer '{name}': "
+                    f"shape={tuple(b.shape)}, dtype={b.dtype}, device={b.device}, "
+                    f"data_ptr=0x{b.data_ptr():x}, nbytes={nbytes}. "
+                    "This tensor is not UVM-allocated."
+                )
+            total_nbytes += nbytes
+
     return total_nbytes
 
 
@@ -466,7 +487,7 @@ def advise_managed_module_parameters_preferred_location(
         return
 
     seen_ptrs: set[int] = set()
-    for p in module.parameters(recurse=True):
+    for name, p in module.named_parameters(recurse=True):
         if p is None:
             continue
         t = p.data
@@ -476,10 +497,17 @@ def advise_managed_module_parameters_preferred_location(
         if ptr in seen_ptrs:
             continue
         seen_ptrs.add(ptr)
-        advise_managed_tensor_preferred_location(t, device=device)
+        err = advise_managed_tensor_preferred_location(t, device=device)
+        if err:
+            raise RuntimeError(
+                f"cudaMemAdviseSetPreferredLocation failed (cudaError={err}) for param '{name}': "
+                f"shape={tuple(t.shape)}, dtype={t.dtype}, device={t.device}, "
+                f"data_ptr=0x{t.data_ptr():x}, nbytes={t.nbytes}. "
+                "This tensor is not UVM-allocated."
+            )
 
     if include_buffers:
-        for b in module.buffers(recurse=True):
+        for name, b in module.named_buffers(recurse=True):
             if b is None:
                 continue
             if not isinstance(b, torch.Tensor) or not b.is_cuda or b.numel() == 0:
@@ -488,4 +516,11 @@ def advise_managed_module_parameters_preferred_location(
             if ptr in seen_ptrs:
                 continue
             seen_ptrs.add(ptr)
-            advise_managed_tensor_preferred_location(b, device=device)
+            err = advise_managed_tensor_preferred_location(b, device=device)
+            if err:
+                raise RuntimeError(
+                    f"cudaMemAdviseSetPreferredLocation failed (err={err}) for buf '{name}': "
+                    f"shape={tuple(b.shape)}, dtype={b.dtype}, device={b.device}, "
+                    f"data_ptr=0x{b.data_ptr():x}, nbytes={b.nbytes}. "
+                    "This tensor is not UVM-allocated."
+                )

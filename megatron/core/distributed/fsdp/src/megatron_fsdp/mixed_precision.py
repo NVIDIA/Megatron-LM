@@ -13,6 +13,7 @@
 # limitations under the License.
 
 import logging
+from contextlib import nullcontext
 from importlib.metadata import version
 from typing import List, Optional, Tuple
 
@@ -42,6 +43,20 @@ try:
         TE_VERSION = PkgVersion(version("transformer-engine"))
 except:
     TE_VERSION = None
+
+# Detect the quantized_model_init or fp8_model_init context manager.
+if HAVE_TE:
+    try:
+        from transformer_engine.pytorch import quantized_model_init
+
+        QUANTIZED_MODEL_INIT_CLASS = quantized_model_init
+    except:
+        # Fallback to original FP8 model init.
+        from transformer_engine.pytorch import fp8_model_init
+
+        QUANTIZED_MODEL_INIT_CLASS = fp8_model_init
+else:
+    QUANTIZED_MODEL_INIT_CLASS = nullcontext
 
 # Detect the FP8 tensor class
 try:
@@ -332,3 +347,15 @@ def _fp8_quantize_fallback(
             packed_amaxes, op=torch.distributed.ReduceOp.MAX, group=data_parallel_group
         )
         _multi_tensor_copy_this_to_that(packed_amax_views, amaxes, dummy_overflow_buf)
+
+
+def get_quantized_model_init_context_cls():
+    """
+    Get the TransformerEngine model parameter quantization context manager.
+    """
+    if QUANTIZED_MODEL_INIT_CLASS is nullcontext:
+        logger.warning(
+            f"quantized_model_init / fp8_model_init context was requested but does not exist. "
+            f"Verify TransformerEngine is installed (TE_INSTALLED={HAVE_TE})."
+        )
+    return QUANTIZED_MODEL_INIT_CLASS
