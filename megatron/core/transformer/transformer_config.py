@@ -549,6 +549,9 @@ class TransformerConfig(ModelParallelConfig):
     moe_router_topk: int = 2
     """Number of experts to route to for each token."""
 
+    moe_enable_routing_replay: bool = False
+    """If True, enable the routing replay feature for MoE layers."""
+
     moe_router_topk_limited_devices: Optional[int] = None
     """Number of EP ranks to consider for each token in group-limited routing,
     DEPRECATED and replaced by moe_router_num_groups and moe_router_group_topk.
