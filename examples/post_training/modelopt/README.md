@@ -59,7 +59,7 @@ provide `${EXPORT_DIR}` to `export.sh`.
 
 > **📙 NOTE:** ModelOpt supports different quantization formats which are listed in the [ModelOpt quant configs](https://github.com/NVIDIA/Model-Optimizer/blob/7971fff05882da7eae16eae6bc927d1481dcd63f/modelopt/torch/quantization/config.py#L626).
 > The quant config is specified by the full config name in all-caps, e.g. NVFP4_DEFAULT_CFG.
-> By default, we simulate the low-precision numerical behavior (fake-quant) which can be run on GPUs with compute > 80.
+> By default, we simulate the low-precision numerical behavior (fake-quant) which can be run on GPUs with [compute capability](https://developer.nvidia.com/cuda/gpus) > 8.0.
 > Real low-precision paramters (e.g. `E4M3` or `E2M1`)
 > and low-precision compute (e.g. `FP8Linear`) are also supported depending on GPU compute capability.
 > **See [Advanced Topics](./ADVANCED.md) for details**.
