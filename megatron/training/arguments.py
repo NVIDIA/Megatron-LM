@@ -344,6 +344,19 @@ def validate_args(args, defaults={}):
             "--rl-inference-model-unified-memory-level=1."
         )
 
+        # When using different EP sizes for inference and training (EP refit), the legacy
+        # GroupedMLP is not supported. Only SequentialMLP or TEGroupedMLP can be used.
+        if (
+            args.rl_inference_expert_model_parallel_size is not None
+            and args.rl_inference_expert_model_parallel_size != args.expert_model_parallel_size
+        ):
+            assert not args.moe_use_legacy_grouped_gemm, (
+                "Legacy GroupedMLP (--moe-use-legacy-grouped-gemm) is not supported when using "
+                "different expert parallelism sizes for inference and training. "
+                "Use SequentialMLP (default when --moe-grouped-gemm is not set) or "
+                "TEGroupedMLP (--moe-grouped-gemm without --moe-use-legacy-grouped-gemm)."
+            )
+
         args.grpo_samples_per_iteration = args.grpo_prompts_per_step * args.grpo_group_size
         num_generated_samples_per_inference_iteration = (
             args.grpo_samples_per_iteration * args.grpo_iterations)
@@ -831,6 +844,8 @@ def validate_args(args, defaults={}):
         if args.save_retain_interval is not None:
             assert args.save_retain_interval > 0
             assert args.save_retain_interval % args.save_interval == 0
+    if args.log_memory_interval is not None:
+        assert args.log_memory_interval % args.log_interval == 0
     # Mixed precision checks.
     if args.fp16_lm_cross_entropy:
         assert args.fp16, 'lm cross entropy in fp16 only support in fp16 mode.'
@@ -1586,8 +1601,12 @@ def _add_inference_args(parser):
     group.add_argument('--mlp-chunks-for-prefill', type=int, default=1,
                        help='Number of chunks along sequence dimension for MLP '
                        'computation during prefill')
-    group.add_argument('--disable-chunked-prefill', default=False, action="store_true",
-                       help='Disable chunked prefill (chunked prefill is enabled by default).')
+    # TODO(ksanthanam): Clean this up in future PR
+    group.add_argument('--enable-chunked-prefill', dest='disable_chunked_prefill',
+                       action='store_false', default=True,
+                       help="Enable chunked prefill (disabled by default)")
+    group.add_argument('--disable-chunked-prefill', dest='disable_chunked_prefill',
+                       action='store_true', help=argparse.SUPPRESS)
     group.add_argument('--inference-dynamic-batching-cuda-graph-max-tokens',
                        type=int, default=16384,
                        help='Maximum number of tokens to capture in a cuda graph.')
@@ -1860,83 +1879,11 @@ def _add_config_logger_args(parser):
 
 
 def _add_logging_args(parser):
-    group = parser.add_argument_group(title='logging')
+    from megatron.training.training_config import LoggerConfig
 
-    group.add_argument('--log-params-norm', action='store_true',
-                       help='If set, calculate and log parameters norm.')
-    group.add_argument('--log-num-zeros-in-grad', action='store_true',
-                       help='If set, calculate and log the number of zeros in gradient.')
-    group.add_argument('--log-throughput', action='store_true',
-                       help='If set, calculate and log throughput per GPU.')
-    group.add_argument('--log-progress', action='store_true',
-                       help='If set, log progress (in terms of number of processed tokens and '
-                       'number of floating-point operations) to progress.txt file in checkpoint '
-                       'directory.')
-    group.add_argument('--timing-log-level', type=int,
-                       default=0, choices=range(0,3),
-                       help='Granularity level to measure and report timing. '
-                       '   0: report only iteration time and make sure timing '
-                       '      does not introduce extra overhead.'
-                       '   1: report timing for operations that are executed '
-                       '      very limited times (basically once) during '
-                       '      each iteration (such as gradient all-reduce) '
-                       '   2: report timing for operations that migh be '
-                       '      executed numerous times during each iteration. '
-                       'Note that setting the level to 1 or 2 might '
-                       'cause increase in iteration time.')
-    group.add_argument('--log-energy', action='store_true',
-                       help='If set, log energy consumption (in Joules)')
-    group.add_argument('--no-barrier-with-level-1-timing', action='store_false',
-                       help='If not set, use barrier with level 1 time '
-                       'measurements. Note that this is up to the user '
-                       'to make sure calling barrier with their timers '
-                       'will not result in hangs. This can happen if for '
-                       'example the user adds a level 1 timer that is not '
-                       'called by all ranks.',
-                       dest='barrier_with_L1_time')
-    group.add_argument('--timing-log-option', type=str, default='minmax',
-                       choices=['max', 'minmax', 'all'],
-                       help='Options for logging timing:'
-                       '  max: report the max timing across all ranks'
-                       '  minmax: report min and max timings across all ranks'
-                       '  all: report timings of all ranks.')
-    group.add_argument('--tensorboard-log-interval', type=int, default=1,
-                       help='Report to tensorboard interval.')
-    group.add_argument('--tensorboard-queue-size', type=int, default=1000,
-                       help='Size of the tensorboard queue for pending events '
-                       'and summaries before one of the "add" calls forces a '
-                       'flush to disk.')
-    group.add_argument('--log-timers-to-tensorboard', action='store_true',
-                       help='If set, write timers to tensorboard.')
-    group.add_argument('--no-log-loss-scale-to-tensorboard',
-                       action='store_false',
-                       help='Disable loss-scale logging to tensorboard.',
-                       dest='log_loss_scale_to_tensorboard')
-    group.add_argument('--log-validation-ppl-to-tensorboard',
-                       action='store_true',
-                       help='If set, write validation perplexity to '
-                       'tensorboard.')
-    group.add_argument('--log-memory-to-tensorboard',
-                       action='store_true',
-                       help='Enable memory logging to tensorboard.')
-    group.add_argument('--log-world-size-to-tensorboard',
-                       action='store_true',
-                       help='Enable world size logging to tensorboard.')
-    group.add_argument('--log-max-attention-logit', action='store_true',
-                       help='Enable max attention logit logging to tensorboard.')
-    group.add_argument('--wandb-project', type=str, default='',
-                       help='The wandb project name. Ignore wandb by default.')
-    group.add_argument('--wandb-entity', type=str, default='',
-                       help='The wandb entity name. It is useful when '
-                       'there are multiple sub-projects in a project. '
-                       'https://community.wandb.ai/t/how-do-i-decide-which-account-private-or-team-to-upload-the-run-to/5704 '
-                       'Ignore wandb by default.')
-    group.add_argument('--wandb-exp-name', type=str, default='',
-                       help='The wandb experiment name.')
-    group.add_argument('--wandb-save-dir', type=str, default='',
-                       help='Path to save the wandb results locally.')
-    group.add_argument('--logging-level', type=int, default=None,
-                       help='Set default logging level')
+    log_factory = ArgumentGroupFactory(LoggerConfig, exclude = ["log_throughput_to_tensorboard", "throughput_window_size", "memory_keys", "log_l2_norm_grad_to_tensorboard", "log_runtime_to_tensorboard", "runtime_time_unit", "filter_warnings", "modules_to_filter", "set_level_for_all_loggers", "save_config_filepath"])
+    group = log_factory.build_group(parser, title="logging")
+
     return parser
 
 
@@ -2071,6 +2018,20 @@ def _add_rl_args(parser):
         type=int,
         default=None,
         help='Degree of pipeline model parallelism for inference for RL.',
+    )
+    group.add_argument(
+        '--rl-inference-expert-model-parallel-size',
+        type=int,
+        default=None,
+        help='Degree of expert model parallelism for inference for RL.',
+    )
+    group.add_argument(
+        '--rl-inference-expert-tensor-model-parallel-size',
+        type=int,
+        default=None,
+        help='Degree of expert tensor model parallelism for inference for RL. '
+             'For MoE models, this controls the TP size for expert layers specifically. '
+             'Defaults to training expert_tensor_parallel_size if not specified.',
     )
     group.add_argument(
         '--rl-inference-model-unified-memory-level',
@@ -2221,10 +2182,6 @@ def _add_training_args(parser):
     group.add_argument('--checkpoint-activations', action='store_true',
                        help='Checkpoint activation to allow for training '
                        'with larger models, sequences, and batch sizes.')
-    group.add_argument('--log-interval', type=int, default=100,
-                       help='Report loss and timing interval.')
-    group.add_argument('--tensorboard-dir', type=str, default=None,
-                       help='Write TensorBoard logs to this directory.')
     group.add_argument('--no-masked-softmax-fusion',
                        action='store_false',
                        help='Disable fusion of query_key_value scaling, '
@@ -2414,6 +2371,10 @@ def _add_checkpointing_args(parser):
                        help='Output directory to save checkpoints to.')
     group.add_argument('--save-interval', '--persistent-save-interval', type=int, default=None,
                        help='Number of iterations between persistent checkpoint saves.')
+    group.add_argument('--save-wgrads-interval', type=int, default=None,
+                       help='Number of iterations between wgrad (main_grad) saves.')
+    group.add_argument('--save-dgrads-interval', type=int, default=None,
+                       help='Number of iterations between dgrad saves.')
     group.add_argument('--save-retain-interval', type=int, default=None,
                        help='Number of iterations between retained checkpoints (other'
                        'checkpoints _except the last checkpoint_ are automatically deleted).')
