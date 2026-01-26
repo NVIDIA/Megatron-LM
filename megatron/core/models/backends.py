@@ -9,6 +9,18 @@ from megatron.core.transformer.dot_product_attention import DotProductAttention
 from megatron.core.transformer.mlp import MLPSubmodules
 from megatron.core.transformer.moe.experts import GroupedMLP, SequentialMLP
 from megatron.core.transformer.torch_norm import WrappedTorchNorm
+from megatron.core.extensions.transformer_engine import (
+    TEActivationOp,
+    TEColumnParallelGroupedLinear,
+    TEColumnParallelLinear,
+    TEDotProductAttention,
+    TELinear,
+    TENorm,
+    TERowParallelGroupedLinear,
+    TERowParallelLinear,
+)
+from megatron.core.utils import get_te_version, is_te_min_version
+from megatron.core.transformer.moe.experts import GroupedMLP, SequentialMLP, TEGroupedMLP
 
 try:
     import apex  # pylint: disable=unused-import
@@ -177,6 +189,31 @@ class InferenceSpecProvider(BackendSpecProvider):
     def grouped_mlp_modules(
         self, moe_use_grouped_gemm: bool, moe_use_legacy_grouped_gemm: bool
     ) -> Tuple[type, Optional[MLPSubmodules]]:
-        raise NotImplementedError(
-            "MOE is not supported with inference optimized transformer implementation."
-        )
+        """Which module and submodules to use for grouped mlp"""
+        if (
+            moe_use_grouped_gemm
+            and TEColumnParallelGroupedLinear is not None
+            and not moe_use_legacy_grouped_gemm
+        ):
+            return TEGroupedMLP, MLPSubmodules(
+                linear_fc1=TEColumnParallelGroupedLinear, linear_fc2=TERowParallelGroupedLinear
+            )
+        elif moe_use_grouped_gemm:
+            warnings.warn(
+                'The legacy GroupedMLP will be deprecated in Megatron-Core v0.12.0. '
+                'Please update the TransformerEngine to version>=1.7.0 and use TEGroupedMLP.'
+            )
+            return GroupedMLP, None
+        else:
+            if not is_te_min_version("1.7.0.dev0"):
+                warnings.warn(
+                    "Only transformer-engine>=1.7.0 supports MoE experts, "
+                    f"but your version is {get_te_version()}. "
+                    "Use local linear implementation instead."
+                )
+                return SequentialMLP, MLPSubmodules(
+                    linear_fc1=ColumnParallelLinear, linear_fc2=RowParallelLinear
+                )
+            return SequentialMLP, MLPSubmodules(
+                linear_fc1=TEColumnParallelLinear, linear_fc2=TERowParallelLinear
+            )

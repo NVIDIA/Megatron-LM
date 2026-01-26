@@ -3,9 +3,10 @@
 from typing import Optional
 
 from megatron.core.extensions.transformer_engine_spec_provider import TESpecProvider
-from megatron.core.models.backends import BackendSpecProvider, LocalSpecProvider
+from megatron.core.models.backends import BackendSpecProvider, LocalSpecProvider, InferenceSpecProvider
 from megatron.core.transformer.mlp import MLPSubmodules
 from megatron.core.transformer.moe.moe_layer import MoELayer, MoESubmodules
+from megatron.core.transformer.moe.moe_layer_inference import InferenceMoELayer
 from megatron.core.transformer.moe.shared_experts import SharedExpertMLP
 from megatron.core.transformer.spec_utils import ModuleSpec
 
@@ -26,8 +27,13 @@ def get_moe_module_spec(
         moe_use_legacy_grouped_gemm: Whether to use legacy grouped GEMM.
         inference_optimized: If True, use InferenceMoELayer for optimized inference.
     """
+    # This function is called my mamba_layer_specs.py 
+    # The GPT layer specs directly calls get_moe_module_spec_for_backend
+
     if use_te is not None and use_te:
         backend: BackendSpecProvider = TESpecProvider()
+    elif inference_optimized:
+        backend = InferenceSpecProvider()
     else:
         backend = LocalSpecProvider()
     return get_moe_module_spec_for_backend(
@@ -35,7 +41,6 @@ def get_moe_module_spec(
         num_experts=num_experts,
         moe_grouped_gemm=moe_grouped_gemm,
         moe_use_legacy_grouped_gemm=moe_use_legacy_grouped_gemm,
-        inference_optimized=inference_optimized,
     )
 
 
@@ -45,7 +50,6 @@ def get_moe_module_spec_for_backend(
     moe_grouped_gemm: Optional[bool] = False,
     moe_use_legacy_grouped_gemm: Optional[bool] = False,
     use_te_activation_func: bool = False,
-    inference_optimized: bool = False,
 ) -> ModuleSpec:
     """Helper function to get module spec for MoE
     
@@ -58,7 +62,8 @@ def get_moe_module_spec_for_backend(
         inference_optimized: If True, use InferenceMoELayer for optimized inference.
     """
     assert num_experts is not None
-
+    inference_optimized: bool = isinstance(backend, InferenceSpecProvider)
+    
     linear_fc1 = backend.column_parallel_linear()
     linear_fc2 = backend.row_parallel_linear()
     activation_func = backend.activation_func()
@@ -81,7 +86,6 @@ def get_moe_module_spec_for_backend(
 
     # Select MoE layer class based on inference_optimized flag
     if inference_optimized:
-        from megatron.core.transformer.moe.moe_layer_inference import InferenceMoELayer
         moe_layer_class = InferenceMoELayer
     else:
         moe_layer_class = MoELayer
