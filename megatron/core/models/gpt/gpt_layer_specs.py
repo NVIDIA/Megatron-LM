@@ -4,6 +4,11 @@ import warnings
 from typing import Optional, Union
 
 from megatron.core.fusions.fused_bias_dropout import get_bias_dropout_add
+from megatron.core.tensor_parallel.layers import (
+    BitNetColumnParallelLinear,
+    BitNetRowParallelLinear,
+)
+from megatron.core.transformer.dot_product_attention import DotProductAttention
 from megatron.core.models.backends import (
     BackendSpecProvider,
     InferenceSpecProvider,
@@ -311,6 +316,7 @@ def get_gpt_layer_local_spec(
     moe_grouped_gemm: Optional[bool] = False,
     qk_layernorm: Optional[bool] = False,
     multi_latent_attention: Optional[bool] = False,
+    use_bitnet: Optional[bool] = False,
     fp8: Optional[str] = None,  # pylint: disable=unused-argument
     moe_use_legacy_grouped_gemm: Optional[bool] = False,
     normalization: Optional[str] = None,
@@ -327,6 +333,7 @@ def get_gpt_layer_local_spec(
         moe_grouped_gemm (bool, optional): To use Grouped GEMM. Defaults to False.
         qk_layernorm (bool, optional): To use layernorm for queries/keys. Defaults to False.
         multi_latent_attention (bool, optional): To use MLA. Defaults to False.
+        use_bitnet (bool, optional): To use BitNet linear layers. Defaults to False.
         fp8 (str, optional): Deprecated. For temporary Nemo compatibility.
         moe_use_legacy_grouped_gemm (bool, optional): Force use the legacy GroupedMLP.
                                                       Defaults to False.
@@ -361,6 +368,7 @@ def get_gpt_layer_local_spec(
 
     mlp = get_mlp_module_spec_for_backend(
         backend=backend,
+        use_bitnet=use_bitnet,
         num_experts=num_experts,
         moe_grouped_gemm=moe_grouped_gemm,
         moe_use_legacy_grouped_gemm=moe_use_legacy_grouped_gemm,
@@ -393,6 +401,36 @@ def get_gpt_layer_local_spec(
                 mlp_bda=get_bias_dropout_add,
             ),
         )
+    elif use_bitnet: 
+        return ModuleSpec(
+            module=TransformerLayer,
+            submodules=TransformerLayerSubmodules(
+                input_layernorm=LNImpl,
+                self_attention=ModuleSpec(
+                    module=SelfAttention,
+                    params={"attn_mask_type": AttnMaskType.causal},
+                    submodules=SelfAttentionSubmodules(
+                        linear_qkv=BitNetColumnParallelLinear,
+                        core_attention=DotProductAttention,
+                        linear_proj=BitNetRowParallelLinear,
+                        q_layernorm=(
+                            L2Norm if qk_l2_norm else (LNImpl if qk_layernorm else IdentityOp)
+                        ),
+                        k_layernorm=(
+                            L2Norm if qk_l2_norm else (LNImpl if qk_layernorm else IdentityOp)
+                        ),
+                    ),
+                ),
+                self_attn_bda=get_bias_dropout_add,
+                pre_mlp_layernorm=LNImpl,
+                mlp=mlp,
+                mlp_bda=get_bias_dropout_add,
+                sharded_state_dict_keys_map={
+                    'input_layernorm.': 'self_attention.linear_qkv.layer_norm_',
+                    'pre_mlp_layernorm.': 'mlp.linear_fc1.layer_norm_',
+                },
+            ),
+        )    
     else:
         return ModuleSpec(
             module=TransformerLayer,
@@ -427,6 +465,7 @@ def get_gpt_layer_local_spec(
 
 def _get_mlp_module_spec(
     use_te: Optional[bool] = True,
+    use_bitnet: Optional[bool] = False,
     num_experts: Optional[int] = None,
     moe_grouped_gemm: Optional[bool] = False,
     fp8: Optional[str] = None,  # pylint: disable=unused-argument
@@ -439,6 +478,7 @@ def _get_mlp_module_spec(
 
     return get_mlp_module_spec(
         use_te=use_te,
+        use_bitnet=use_bitnet,
         num_experts=num_experts,
         moe_grouped_gemm=moe_grouped_gemm,
         fp8=fp8,
@@ -448,6 +488,7 @@ def _get_mlp_module_spec(
 
 def get_mlp_module_spec(
     use_te: Optional[bool] = True,
+    use_bitnet: Optional[bool] = False,
     num_experts: Optional[int] = None,
     moe_grouped_gemm: Optional[bool] = False,
     fp8: Optional[str] = None,  # pylint: disable=unused-argument
@@ -472,6 +513,7 @@ def get_mlp_module_spec(
 
     return get_mlp_module_spec_for_backend(
         backend=TESpecProvider() if use_te else LocalSpecProvider(),
+        use_bitnet=use_bitnet,
         num_experts=num_experts,
         moe_grouped_gemm=moe_grouped_gemm,
         moe_use_legacy_grouped_gemm=moe_use_legacy_grouped_gemm,
@@ -481,6 +523,7 @@ def get_mlp_module_spec(
 
 def get_mlp_module_spec_for_backend(
     backend: BackendSpecProvider,
+    use_bitnet: Optional[bool] = False,
     num_experts: Optional[int] = None,
     moe_grouped_gemm: Optional[bool] = False,
     moe_use_legacy_grouped_gemm: Optional[bool] = False,
@@ -491,8 +534,17 @@ def get_mlp_module_spec_for_backend(
 
     linear_fc2 = backend.row_parallel_linear()
     activation_func = backend.activation_func() if use_te_activation_func else None
-
-    if num_experts is None:
+    
+    if use_bitnet:
+            # Bitnet MLP only w/o TE modules.
+            return ModuleSpec(
+                module=MLP,
+                submodules=MLPSubmodules(
+                    linear_fc1=BitNetColumnParallelLinear,
+                    linear_fc2= BitNetRowParallelLinear,
+                ),
+            ) 
+    elif num_experts is None:
         # Dense MLP w/ or w/o TE modules.
         module = TEFusedMLP if use_te_op_fuser else MLP
         if backend.fuse_layernorm_and_linear():
@@ -522,6 +574,7 @@ def get_gpt_decoder_layer_specs(
     use_transformer_engine: bool,
     normalization: Optional[str] = None,
     qk_l2_norm: Optional[bool] = False,
+    use_bitnet: Optional[bool] = False,
     vp_stage: Optional[int] = None,
     pp_rank: Optional[int] = None,
 ) -> TransformerBlockSubmodules:
@@ -559,6 +612,7 @@ def get_gpt_decoder_layer_specs(
             moe_grouped_gemm=False,
             qk_layernorm=config.qk_layernorm,
             multi_latent_attention=config.multi_latent_attention,
+            use_bitnet=use_bitnet,
             moe_use_legacy_grouped_gemm=config.moe_use_legacy_grouped_gemm,
             normalization=normalization,
             qk_l2_norm=qk_l2_norm,
@@ -571,6 +625,7 @@ def get_gpt_decoder_layer_specs(
             moe_grouped_gemm=config.moe_grouped_gemm,
             qk_layernorm=config.qk_layernorm,
             multi_latent_attention=config.multi_latent_attention,
+            use_bitnet=use_bitnet,
             moe_use_legacy_grouped_gemm=config.moe_use_legacy_grouped_gemm,
             normalization=normalization,
             qk_l2_norm=qk_l2_norm,
