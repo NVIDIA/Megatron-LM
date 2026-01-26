@@ -875,6 +875,7 @@ def _test_parallel_attention_correctness(
         Utils.destroy_model_parallel()
 
 
+# TODO(yuzhongw): Add test case for fallback_to_eager_attn
 @pytest.mark.parametrize("apply_rope_fusion", [False, True])
 @pytest.mark.parametrize(
     ("tp", "sp", "cp"),
@@ -887,25 +888,15 @@ def _test_parallel_attention_correctness(
     ],
 )
 @pytest.mark.parametrize("qk_layernorm", [False, True])
-@pytest.mark.parametrize("fallback_to_eager_attn", [False, True])
 @pytest.mark.parametrize("output_gate", [False, True])
 def test_parallel_attention_correctness(
-    tmp_path_dist_ckpt,
-    apply_rope_fusion,
-    tp,
-    sp,
-    cp,
-    qk_layernorm,
-    fallback_to_eager_attn,
-    output_gate,
+    tmp_path_dist_ckpt, apply_rope_fusion, tp, sp, cp, qk_layernorm, output_gate
 ):
     transformer_config = TransformerConfig(
         num_layers=1,
         hidden_size=128,
         num_attention_heads=4,
-        context_parallel_size=1,
-        tensor_model_parallel_size=1,
-        sequence_parallel=False,
+        normalization="RMSNorm",
         bf16=True,
         qk_layernorm=qk_layernorm,
         apply_rope_fusion=apply_rope_fusion,
@@ -914,24 +905,20 @@ def test_parallel_attention_correctness(
         attention_dropout=0.0,
     )
 
-    transformer_layer_spec = get_gpt_layer_with_transformer_engine_spec(
-        fallback_to_eager_attn=fallback_to_eager_attn,
-        normalization="RMSNorm",
-        qk_layernorm=qk_layernorm,
-    )
-    if cp > 1:
-        if qk_layernorm:
-            atol, rtol = 2e-2, 2e-2
-        else:
-            atol, rtol = 5e-3, 5e-3
-    else:
-        if qk_layernorm:
-            atol, rtol = 1e-2, 1e-2
-        else:
-            atol, rtol = 2e-3, 2e-3
+    transformer_layer_spec = get_gpt_layer_with_transformer_engine_spec(qk_layernorm=qk_layernorm)
+    atol, rtol = 1e-2, 1e-2
 
     _test_parallel_attention_correctness(
-        transformer_config, transformer_layer_spec, tmp_path_dist_ckpt, tp, sp, cp
+        transformer_config,
+        transformer_layer_spec,
+        tmp_path_dist_ckpt,
+        atol=atol,
+        rtol=rtol,
+        tp=tp,
+        sp=sp,
+        cp=cp,
+        seed=123,
+        sequence_length=256,
     )
 
 

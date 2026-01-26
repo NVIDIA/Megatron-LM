@@ -543,9 +543,7 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
                 otherwise None.
         """
         from megatron.core.pipeline_parallel.fine_grained_activation_offload import (
-            fine_grained_offloading_group_commit,
-            fine_grained_offloading_group_start,
-            get_fine_grained_offloading_context,
+            FineGrainedActivationOffloadingInterface as off_interface,
         )
 
         inference_context = deprecate_inference_params(inference_context, inference_params)
@@ -553,17 +551,15 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
         # Residual connection.
         residual = hidden_states
 
-        if self.offload_attn_norm:
-            hidden_states = fine_grained_offloading_group_start(hidden_states, name="attn_norm")
         # Optional Input Layer norm
         if self.recompute_input_layernorm:
             self.input_layernorm_checkpoint = tensor_parallel.CheckpointWithoutOutput()
-            with get_fine_grained_offloading_context(self.offload_attn_norm):
+            with off_interface(self.offload_attn_norm, hidden_states, "attn_norm") as hidden_states:
                 input_layernorm_output = self.input_layernorm_checkpoint.checkpoint(
                     self.input_layernorm, hidden_states
                 )
         else:
-            with get_fine_grained_offloading_context(self.offload_attn_norm):
+            with off_interface(self.offload_attn_norm, hidden_states, "attn_norm") as hidden_states:
                 input_layernorm_output = self.input_layernorm(hidden_states)
 
         # Self attention.
@@ -598,8 +594,10 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
             )
         nvtx_range_pop(suffix="self_attn_bda")
 
+        # Delay the offload of the attention norm until after the self_attn_bda has been computed
+        # because the residual is needed in the self_attn_bda.
         if self.offload_attn_norm:
-            (hidden_states,) = fine_grained_offloading_group_commit(
+            hidden_states = off_interface.group_commit(
                 hidden_states, name="attn_norm", forced_released_tensors=[residual]
             )
 
@@ -647,24 +645,21 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
         """
 
         from megatron.core.pipeline_parallel.fine_grained_activation_offload import (
-            fine_grained_offloading_group_start,
-            get_fine_grained_offloading_context,
+            FineGrainedActivationOffloadingInterface as off_interface,
         )
 
         # Residual connection.
         residual = hidden_states
 
-        if self.offload_mlp_norm:
-            hidden_states = fine_grained_offloading_group_start(hidden_states, name="mlp_norm")
         # Optional Layer norm post the cross-attention.
         if self.recompute_pre_mlp_layernorm:
             self.pre_mlp_norm_checkpoint = tensor_parallel.CheckpointWithoutOutput()
-            with get_fine_grained_offloading_context(self.offload_mlp_norm):
+            with off_interface(self.offload_mlp_norm, hidden_states, "mlp_norm") as hidden_states:
                 pre_mlp_layernorm_output = self.pre_mlp_norm_checkpoint.checkpoint(
                     self.pre_mlp_layernorm, hidden_states
                 )
         else:
-            with get_fine_grained_offloading_context(self.offload_mlp_norm):
+            with off_interface(self.offload_mlp_norm, hidden_states, "mlp_norm") as hidden_states:
                 pre_mlp_layernorm_output = self.pre_mlp_layernorm(hidden_states)
 
         nvtx_range_push(suffix="mlp")
@@ -750,7 +745,7 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
         """
 
         from megatron.core.pipeline_parallel.fine_grained_activation_offload import (
-            fine_grained_offloading_group_commit,
+            FineGrainedActivationOffloadingInterface as off_interface,
         )
 
         # TODO: could we move `bias_dropout_add_exec_handler` itself
@@ -761,8 +756,10 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
                 mlp_output_with_bias, residual, self.hidden_dropout
             )
         nvtx_range_pop(suffix="mlp_bda")
+        # Delay the offload of the mlp norm until after the mlp_bda has been computed
+        # because the residual is needed in the mlp_bda.
         if self.offload_mlp_norm:
-            (hidden_states,) = fine_grained_offloading_group_commit(
+            hidden_states = off_interface.group_commit(
                 hidden_states, name="mlp_norm", forced_released_tensors=[residual]
             )
 

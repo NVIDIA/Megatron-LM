@@ -18,6 +18,7 @@ from megatron.core.tensor_parallel import (
 from megatron.core.tensor_parallel.mappings import reduce_from_tensor_model_parallel_region
 from megatron.core.transformer.cuda_graphs import is_graph_capturing
 from megatron.core.transformer.enums import CudaGraphScope
+from megatron.core.transformer.moe.router_replay import RouterReplay
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.utils import internal_api
 
@@ -580,6 +581,7 @@ def topk_routing_with_score_function(
     score_function: str = "softmax",
     expert_bias: Optional[torch.Tensor] = None,
     fused: bool = False,
+    router_replay: Optional['RouterReplay'] = None,
 ):
     """Compute the routing probabilities and map for top-k selection with score function.
     Args:
@@ -591,6 +593,9 @@ def topk_routing_with_score_function(
         scaling_factor (float): Scaling factor of routing score in top-k selection.
         score_function (str): The score function to use. Can be either "softmax" or "sigmoid".
         expert_bias (torch.Tensor): The bias added to logits for expert routing.
+        router_replay (Optional['RouterReplay']): For debugging and development, allows for
+                                             deterministic routing by replaying a previously
+                                             recorded routing sequence.
     Returns:
         Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
             - routing_probs (torch.Tensor): A tensor of shape [num_tokens, num_experts] containing
@@ -617,7 +622,7 @@ def topk_routing_with_score_function(
             expert_bias=expert_bias,
         )
 
-    def compute_topk(scores, topk, num_groups=None, group_topk=None):
+    def _compute_topk(scores, topk, num_groups=None, group_topk=None):
         if group_topk:
             return group_limited_topk(
                 scores=scores,
@@ -629,6 +634,15 @@ def topk_routing_with_score_function(
             )
         else:
             return torch.topk(scores, k=topk, dim=1)
+
+    def compute_topk(scores, topk, num_groups=None, group_topk=None):
+        # Default behavior if no replay is active
+        if router_replay is None:
+            return _compute_topk(scores, topk, num_groups=num_groups, group_topk=group_topk)
+        else:
+            return router_replay.get_replay_topk(
+                scores, topk, num_groups, group_topk, _compute_topk
+            )
 
     if score_function == "softmax":
         if use_pre_softmax:
