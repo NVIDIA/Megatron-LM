@@ -143,6 +143,13 @@ def embed_data_loader(models, data_loader, tag):
     return embeddings
 
 
+class Block(TypedDict):
+    """Specific block arg type to mute mypy."""
+
+    range: Tuple[int, int]
+    path: str
+
+
 def get_blocks(
     dirname: str, n_samples: int, block_size: int, validate: Optional[Callable] = None
 ) -> SimpleNamespace:
@@ -339,13 +346,6 @@ def get_blocks_by_rank(
         blocks.missing = sample_blocks(blocks.missing)
 
     return blocks
-
-
-class Block(TypedDict):
-    """Specific block arg type to mute mypy."""
-
-    range: Tuple[int, int]
-    path: str
 
 
 class TextDataset(torch.utils.data.Dataset):
