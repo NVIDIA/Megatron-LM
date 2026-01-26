@@ -924,8 +924,6 @@ class ParallelTransformerLayer(MegatronModule):
         self.bias_dropout_add_exec_handler = \
                 nullcontext if use_nvfuser else torch.enable_grad
 
-        self.retriever = None
-
     def default_decoder_cross_attention(self,
                                         encoder_output,
                                         enc_dec_attn_mask,
