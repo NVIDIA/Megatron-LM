@@ -412,7 +412,14 @@ class MoELayer(BaseMoELayer):
         if routed_experts:
             self.experts.backward_dw()
             if self.config.moe_latent_size:
-                self.fc2_latent_proj.backward_dw()
+                # TODO(Wohox): fc2_latent_proj forward and backward are executed in comm stream,
+                # so we execute its backward_dw in the comm stream too. But this may harm the
+                # EP overlap performance. Better to check if there is a better way to handle this.
+                from megatron.core.pipeline_parallel.utils import get_comm_stream
+
+                comm_stream = get_comm_stream()
+                with torch.cuda.stream(comm_stream):
+                    self.fc2_latent_proj.backward_dw()
         if shared_experts:
             if self.use_shared_expert and not self.shared_expert_overlap:
                 self.shared_experts.backward_dw()
