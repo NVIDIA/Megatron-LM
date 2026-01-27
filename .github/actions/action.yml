@@ -54,7 +54,7 @@ runs:
   steps:
     - name: Reset
       shell: bash
-      run: sudo nvidia-smi --gpu-reset
+      run: nvidia-smi --gpu-reset
 
     - name: Print node name
       shell: bash -x -e -u -o pipefail {0}
