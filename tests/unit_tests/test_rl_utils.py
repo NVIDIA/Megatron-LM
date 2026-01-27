@@ -28,9 +28,7 @@ class MockModel(LanguageModule):
         self.vocab = vocab
         self.pg_collection = ProcessGroupCollection.use_mpu_process_groups()
         self.config = TransformerConfig(
-            num_attention_heads=8,
-            num_layers=8,
-            pipeline_dtype=torch.bfloat16
+            num_attention_heads=8, num_layers=8, pipeline_dtype=torch.bfloat16
         )
         self.model_type = ModelType.encoder_or_decoder
 
@@ -83,10 +81,7 @@ def initialize_model_parallel(request):
             f"(TP={tp} * PP={pp} = {required_size})"
         )
 
-    Utils.initialize_model_parallel(
-        tensor_model_parallel_size=tp,
-        pipeline_model_parallel_size=pp,
-    )
+    Utils.initialize_model_parallel(tensor_model_parallel_size=tp, pipeline_model_parallel_size=pp)
     dp = world_size // (tp * pp)
     yield world_size, dp, tp, pp
     Utils.destroy_model_parallel()
@@ -119,11 +114,7 @@ class TestRLUtils:
 
     @pytest.mark.parametrize(
         "initialize_model_parallel",
-        [
-            pytest.param((tp, pp), id=f"tp{tp}-pp{pp}")
-            for tp in [1, 2, 4, 8]
-            for pp in [1]
-        ],
+        [pytest.param((tp, pp), id=f"tp{tp}-pp{pp}") for tp in [1, 2, 4, 8] for pp in [1]],
         indirect=["initialize_model_parallel"],
     )
     @pytest.mark.parametrize("use_sequence_packing", [False, True])
@@ -255,11 +246,7 @@ class TestRLUtils:
 
     @pytest.mark.parametrize(
         "initialize_model_parallel",
-        [
-            pytest.param((tp, pp), id=f"tp{tp}-pp{pp}")
-            for tp in [1, 2, 4, 8]
-            for pp in [1, 2, 4, 8]
-        ],
+        [pytest.param((tp, pp), id=f"tp{tp}-pp{pp}") for tp in [1, 2, 4, 8] for pp in [1, 2, 4, 8]],
         indirect=["initialize_model_parallel"],
     )
     def test_prepare_data_for_update(self, initialize_model_parallel):
