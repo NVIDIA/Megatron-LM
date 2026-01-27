@@ -2,7 +2,6 @@
 
 Installation is supported using Docker and pip.
 
-
 ## System Requirements
 
 ### Hardware Requirements
@@ -17,7 +16,27 @@ Installation is supported using Docker and pip.
 - **Transformer Engine**: Latest stable version
 - **Python**: 3.12 recommended
 
-## Docker (Recommended)
+
+## [Quick Installation](quickstart.md)
+
+Install Megatron Core with pip:
+
+1. Install Megatron Core with required dependencies:
+
+    ```bash
+    pip install --no-build-isolation megatron-core[mlm,dev]
+    ```
+
+2. Clone repository for examples:
+
+    ```bash
+    git clone https://github.com/NVIDIA/Megatron-LM.git
+    cd Megatron-LM
+    pip install --no-build-isolation .[mlm,dev]
+    ```
+
+
+## Docker Installation (Recommended)
 
 We strongly recommend using the previous releases of [PyTorch NGC Container](https://catalog.ngc.nvidia.com/orgs/nvidia/containers/pytorch) rather than the latest one for optimal compatibility with Megatron Core release and testing matrix. Our releases are always based on the previous month's NGC container, so this ensures compatibility and stability.
 
@@ -50,36 +69,38 @@ Megatron Core installation offers support for two NGC PyTorch containers:
 Both containers can be combined with `mlm`, which adds package dependencies for Megatron-LM on top of Megatron Core.
 
 
-## Install the latest release dependencies
+1. Install the latest release dependencies
 
     ```bash
     pip install "setuptools<80.0.0,>=77.0.0" "packaging>=24.2"
     pip install --no-build-isolation megatron-core[dev]
     ```
 
-## For running an Megatron LM application
+2. Next choose one of the following options:
 
-    ```bash
-    pip install "setuptools<80.0.0,>=77.0.0" "packaging>=24.2"
-    pip install --no-build-isolation megatron-core[mlm,dev]
-    ```
-## Install packages for LTS support NGC PyTorch 24.01
+* For running an Megatron LM application
 
-    ```bash
-    pip install "setuptools<80.0.0,>=77.0.0" "packaging>=24.2"
-    pip install --no-build-isolation megatron-core[lts]
-    ```
+        ```bash
+        pip install "setuptools<80.0.0,>=77.0.0" "packaging>=24.2"
+        pip install --no-build-isolation megatron-core[mlm,dev]
+        ```
+* Install packages for LTS support NGC PyTorch 24.01
 
-## For running an Megatron LM application
+        ```bash
+        pip install "setuptools<80.0.0,>=77.0.0" "packaging>=24.2"
+        pip install --no-build-isolation megatron-core[lts]
+        ```
 
-    ```bash
-    pip install "setuptools<80.0.0,>=77.0.0" "packaging>=24.2"
-    pip install --no-build-isolation megatron-core[mlm,lts]
-    ```
+* For running an Megatron LM application
 
-## For a version of Megatron Core with only Torch, run
+        ```bash
+        pip install "setuptools<80.0.0,>=77.0.0" "packaging>=24.2"
+        pip install --no-build-isolation megatron-core[mlm,lts]
+        ```
 
-    ```bash
-    pip install megatron-core
-    ```
+* For a version of Megatron Core with only Torch, run
+
+        ```bash
+        pip install megatron-core
+        ```
 
