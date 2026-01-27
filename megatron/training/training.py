@@ -2158,14 +2158,7 @@ def training_log(
         if args.log_memory_interval is not None and iteration % args.log_memory_interval == 0 and \
             not reported_memory_in_this_iteration:
             report_memory(f'(after {iteration} iterations)')
-        # Write timers to wandb, don't reset the counts.
-        if args.log_timers_to_tensorboard:
-            timers.write(timers_to_log, writer, iteration, normalizer=args.log_interval, reset=False)
-            timers.write(timers_to_log, wandb_writer, iteration, normalizer=args.log_interval, reset=False)
-        # Log timers to stdout
-        timers.log(timers_to_log, normalizer=args.log_interval, reset=should_reset)
-
-        # Log RL profiling data if enabled
+        # Log RL profiling data if enabled (must be before timers.log which resets timers)
         if has_rl_profiling and getattr(args, 'rl_profile', False):
             # Compute tokens/sec metrics
             tokens_per_sec = None
@@ -2186,6 +2179,13 @@ def training_log(
                 wandb_writer=wandb_writer,
                 tb_writer=writer,
             )
+
+        # Write timers to wandb, don't reset the counts.
+        if args.log_timers_to_tensorboard:
+            timers.write(timers_to_log, writer, iteration, normalizer=args.log_interval, reset=False)
+            timers.write(timers_to_log, wandb_writer, iteration, normalizer=args.log_interval, reset=False)
+        # Log timers to stdout
+        timers.log(timers_to_log, normalizer=args.log_interval, reset=should_reset)
 
     return report_memory_flag
 
