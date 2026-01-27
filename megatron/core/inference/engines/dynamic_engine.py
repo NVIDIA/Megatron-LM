@@ -104,6 +104,9 @@ if HAVE_TORCH_MEMORY_SAVER:
     from torch_memory_saver import torch_memory_saver
 
 
+logger = logging.getLogger(__name__)
+
+
 class EngineSuspendedError(Exception):
     """Engine is currently suspended and not performing steps."""
 
@@ -767,6 +770,7 @@ class DynamicInferenceEngine(AbstractEngine):
         if request.status != Status.FAILED:
             self.waiting_request_ids.append(request_id)
         else:
+            logger.error(f"Request {request_id} failed to add to engine. {request.events}")
             self.failed_request_ids.append(request_id)
             if self.rank == 0:
                 warnings.warn(

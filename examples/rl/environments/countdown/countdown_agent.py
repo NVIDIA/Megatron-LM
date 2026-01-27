@@ -10,6 +10,7 @@ from .countdown import compute_score
 
 
 class CountdownAgent(RewardOnlyAgent, HFDatasetAgent):
+    chat_mode: bool = True
 
     def make_prefix(self, target, nums) -> str:
         if self.chat_mode:

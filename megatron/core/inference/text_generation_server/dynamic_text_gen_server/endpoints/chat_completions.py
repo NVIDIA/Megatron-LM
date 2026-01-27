@@ -34,10 +34,8 @@ try:
                 messages, tokenize=True, add_generation_prompt=True
             )
         except AttributeError:
-            return (
-                "Tokenizer does not support 'apply_chat_template'. "
-                "Chat completions requires a tokenizer with a configured chat template."
-            ), 500
+            logger.warning("Tokenizer does not support 'apply_chat_template'. Using tokenize instead.")
+            prompt_tokens = tokenizer.tokenize("\n".join([message["content"] for message in messages]))
         except Exception as e:
             return f"Error processing 'messages': {e}", 500
 
@@ -62,7 +60,7 @@ try:
                 top_p=top_p,
                 return_log_probs=return_log_probs,
                 top_n_logprobs=top_n_logprobs,
-                num_tokens_to_generate=int(req.get("max_tokens", 16)),
+                num_tokens_to_generate=int(max_tokens) if ( (max_tokens := req.get("max_tokens", None)) is not None ) else None,
             )
         except ValueError as e:
             return f"Invalid sampling parameter: {e}", 400
@@ -78,6 +76,7 @@ try:
                 return_log_probs=sampling_params.return_log_probs,
                 top_n_logprobs=sampling_params.top_n_logprobs,
                 num_tokens_to_generate=sampling_params.num_tokens_to_generate,
+                skip_prompt_log_probs=True,
             )
             tasks.append(client.add_request(prompt_tokens, per_req_params))
 
@@ -85,6 +84,7 @@ try:
         try:
             batch_results = await asyncio.gather(*tasks)
         except Exception as e:
+            logger.error(f"Error during inference: {e}")
             return f"Error during inference: {e}", 500
 
         logger.info(
@@ -136,6 +136,10 @@ try:
                 choice_data = {
                     "index": 0,
                     "message": {"role": "assistant", "content": text_output},
+                    "prompt_token_ids": prompt_tokens,
+                    "generation_token_ids": result.generated_tokens,
+                    "generation_log_probs": result.generated_log_probs,
+                    "raw_text": result.prompt + result.generated_text,
                     # 'logprobs' in chat API is an object containing 'content'
                     "logprobs": {"content": logprobs_content} if logprobs_content else None,
                     "finish_reason": "length",  # Original code hardcoded this.

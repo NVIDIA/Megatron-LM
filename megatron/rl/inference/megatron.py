@@ -26,7 +26,6 @@ from megatron.training import get_wandb_writer
 from megatron.training.global_vars import get_args, get_tokenizer
 
 from ..inference.inference_interface import (
-    ChatInferenceInterface,
     InferenceRequest,
     InferenceResponse,
     LLMChatMessage,
@@ -72,51 +71,45 @@ def get_static_inference_engine(args: Namespace, model: MegatronModule) -> Abstr
 class MegatronLocal(InferenceServer, ReturnsTokens, ReturnsRaw):
     """Interface to use MCoreEngine directly as an inference engine."""
 
+    host: str
+    port: int
+
+    _server_task: asyncio.Task = PrivateAttr(None)
     _client: InferenceClient = PrivateAttr(None)
     _inference_engine: DynamicInferenceEngine = PrivateAttr(None)
 
     async def base_generate(self, request: InferenceRequest):
 
-        if any(isinstance(p, LLMChatMessage) for p in request.prompt):
-            raise ValueError(
-                "MegatronLocal does not support chat requests."
-                "Use MegatronChatLocal to apply chat templating."
-            )
-        assert all(
-            isinstance(p, str) for p in request.prompt
-        ), "MegatronLocal only supports string prompts."
+        assert self._server_task is not None, "Infernce server is not initialized"
 
-        assert self._client is not None, "Client is not initialized"
+        from openai import AsyncOpenAI
+        client = AsyncOpenAI(base_url=f"http://{self.host}:{self.port}", api_key="NONE")
 
-        tokenizer = get_tokenizer()
-        args = get_args()
-
-        sampling_params = SamplingParams(
-            num_tokens_to_generate=None,
-            num_tokens_total=request.generation_args.max_tokens,
+        # Things that may be problematic when doign this switch
+        # - Add BOS token
+        # - Skip prompt logprobs
+        generations = [ client.chat.completions.create(
+            model="",
+            messages=[message.model_dump() for message in prompt],
             temperature=request.generation_args.temperature or 1.0,
-            top_k=request.generation_args.top_k or 0,
             top_p=request.generation_args.top_p or 0.0,
-            termination_id=self._inference_engine.controller.tokenizer.eod,
-            return_log_probs=True,
-            skip_prompt_log_probs=True,
-            add_BOS=(not args.rl_skip_bos_token and tokenizer.bos is not None),
-        )
-        requests = [
-            self._client.add_request(prompt=prompt, sampling_params=sampling_params)
-            for prompt in request.prompt
-        ]
-        records = await asyncio.gather(*requests)
-        responses = [record[-1] for record in records]
+            n=request.generation_args.n or 1,
+            logprobs=True,
+        ) for prompt in request.prompt ]
+
+        responses = await asyncio.gather(*generations)
+
+        assert all(len(response.choices) == 1 for response in responses), "Still need to properly support requests with n > 1"
+
         return [
             InferenceResponse(
-                response=r.generated_text,
-                raw_text=p + r.generated_text,
-                token_ids=r.prompt_tokens.tolist() + r.generated_tokens,
-                logprobs=r.generated_log_probs,
-                prompt_length=len(r.prompt_tokens),
+                response=LLMChatMessage(**choice.message.model_dump(include={'role', 'content'})),
+                raw_text=choice.raw_text,
+                token_ids=choice.prompt_token_ids + choice.generation_token_ids,
+                logprobs=choice.generation_log_probs,
+                prompt_length=len(choice.prompt_token_ids),
             )
-            for p, r in zip(request.prompt, responses)
+            for response in responses for choice in response.choices
         ]
 
     @classmethod
@@ -138,14 +131,25 @@ class MegatronLocal(InferenceServer, ReturnsTokens, ReturnsRaw):
         dp_addr = await inference_engine.start_listening_to_data_parallel_coordinator(
             inference_coordinator_port=41521, launch_inference_coordinator=True,
         )
+
         if dist.get_rank() == 0:
-            # TODO: We have to do this only on the rank 0 process, should be fixed in the future when we have support for multiple inference clients. !2278
-            client = InferenceClient(inference_coordinator_address=dp_addr)
+            from megatron.core.inference.text_generation_server.dynamic_text_gen_server.flask_server import run_flask_server_on_client
+            loop = asyncio.get_event_loop()
+            client = InferenceClient(inference_coordinator_addr=dp_addr)
             await client.start()
+            server_task = loop.create_task(run_flask_server_on_client(
+                client=client,
+                tokenizer=inference_engine.controller.tokenizer,
+                rank=dist.get_rank(),
+                flask_port=8294,
+            ))
         else:
             client = None
+            server_task = None
+            
         launched_server = cls(**kwargs)
         launched_server._client = client
+        launched_server._server_task = server_task
         launched_server._inference_engine = inference_engine
 
         return launched_server
@@ -164,6 +168,3 @@ class MegatronLocal(InferenceServer, ReturnsTokens, ReturnsRaw):
         if dist.get_rank() == 0:
             self._client.unpause_engines()
         await self._inference_engine.running.wait()
-
-
-class MegatronChatLocal(ChatInferenceInterface, MegatronLocal): ...
