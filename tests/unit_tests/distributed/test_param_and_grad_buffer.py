@@ -3,6 +3,7 @@
 import contextlib
 import math
 from typing import Optional
+from unittest import mock
 
 import pytest
 import torch
@@ -263,5 +264,59 @@ def test_grad_sync(
         if not overlap_grad_reduce:
             # Reset grad_data for subsequent collectives.
             param_and_grad_buffer.grad_data.data.fill_(1.0)
+
+    Utils.destroy_model_parallel()
+
+
+@pytest.mark.parametrize("force_all_reduce", [False, True])
+def test_force_all_reduce_uses_correct_collective(force_all_reduce: bool):
+    """Test that force_all_reduce=True causes all-reduce to be used instead of reduce-scatter."""
+    Utils.initialize_model_parallel()
+
+    input_dim = 100
+    output_dim = 100
+    num_layers = 2
+    model, param_and_grad_buffer, _ = get_model_and_buffers(
+        input_dim=input_dim,
+        output_dim=output_dim,
+        num_layers=num_layers,
+        bias=True,
+        shared_embedding=False,
+        bucket_size=None,
+        use_distributed_optimizer=True,  # This normally uses reduce-scatter.
+        overlap_grad_reduce=False,
+        average_in_collective=False,
+    )
+
+    # Mock the collective operations to track which one is called.
+    with (
+        mock.patch('torch.distributed.all_reduce') as mock_all_reduce,
+        mock.patch(
+            'megatron.core.distributed.param_and_grad_buffer.dist_reduce_scatter_func'
+        ) as mock_reduce_scatter,
+    ):
+        # Set up the mocks to be no-ops.
+        mock_all_reduce.return_value = None
+        mock_reduce_scatter.return_value = None
+
+        # Trigger the grad sync via the DDP model's finish_grad_sync method.
+        model.finish_grad_sync(force_all_reduce=force_all_reduce)
+
+        if force_all_reduce:
+            # When force_all_reduce=True, all_reduce should be called.
+            assert (
+                mock_all_reduce.called
+            ), "Expected all_reduce to be called when force_all_reduce=True"
+            assert (
+                not mock_reduce_scatter.called
+            ), "Expected reduce_scatter NOT to be called when force_all_reduce=True"
+        else:
+            # When force_all_reduce=False with distributed optimizer, reduce_scatter should be called.
+            assert (
+                mock_reduce_scatter.called
+            ), "Expected reduce_scatter to be called when force_all_reduce=False"
+            assert (
+                not mock_all_reduce.called
+            ), "Expected all_reduce NOT to be called when force_all_reduce=False"
 
     Utils.destroy_model_parallel()
