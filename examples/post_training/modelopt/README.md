@@ -210,4 +210,8 @@ The saved Megatron-LM distributed checkpoint (output of above scripts) can be re
 ```
 
 ## Advanced Usage
-TBD
+To contribute, please ping [@NVIDIA/post-training](https://github.com/orgs/NVIDIA/teams/post-training) team members. We format the examples with
+```
+uvx black@24.10.0 .
+uvx isort .
+```

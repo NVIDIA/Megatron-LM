@@ -64,4 +64,5 @@ MODEL_ARGS:
   --muon-momentum: 0.9
   --muon-extra-scale-factor: 0.2
   --muon-scale-mode: spectral
+  --check-weight-hash-across-dp-replicas-interval: 1
 TEST_TYPE: ckpt-resume

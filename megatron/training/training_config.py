@@ -193,3 +193,130 @@ class SchedulerConfig:
 
     wsd_decay_steps: int | None = field(init=False, default=None)
     """Number of samples to decay WSD weight decay. Calculated at runtime."""
+
+
+@dataclass(kw_only=True)
+class LoggerConfig:
+    """Configuration settings for logging, including TensorBoard and WandB."""
+
+    log_interval: int = 100
+    """Report loss and timing interval."""
+
+    log_params_norm: bool = False
+    """If set, calculate and log parameters norm."""
+
+    log_throughput: bool = False
+    """If set, calculate and log throughput per GPU."""
+
+    log_throughput_to_tensorboard: bool = False
+    """Enable throughput logging to tensorboard."""
+
+    throughput_window_size: int = 100
+    """Number of batches to use for a rolling average of throughput."""
+
+    log_progress: bool = False
+    """If set, log progress (in terms of number of processed tokens and number of floating-point operations)
+    to progress.txt file in checkpoint directory.
+    """
+
+    timing_log_level: Literal[0, 1, 2] = 0
+    """Granularity level to measure and report timing.
+    0: report only iteration time and make sure timing does not introduce extra overhead.
+    1: report timing for operations that are executed very limited times (basically once) during each iteration
+        (such as gradient all-reduce)
+    2: report timing for operations that migh be executed numerous times during each iteration.
+    Note that setting the level to 1 or 2 might cause increase in iteration time.
+    """
+
+    timing_log_option: Literal["max", "minmax", "all"] = "minmax"
+    """Options for logging timing:
+    max: report the max timing across all ranks
+    minmax: report min and max timings across all ranks
+    all: report timings of all ranks.
+    """
+
+    tensorboard_dir: str | None = None
+    """Write TensorBoard logs to this directory."""
+
+    tensorboard_log_interval: int = 1
+    """Report to tensorboard interval."""
+
+    tensorboard_queue_size: int = 1000
+    """Size of the tensorboard queue for pending events and summaries
+    before one of the 'add' calls forces a flush to disk.
+    """
+
+    log_timers_to_tensorboard: bool = False
+    """If set, write timers to tensorboard."""
+
+    log_loss_scale_to_tensorboard: bool = True
+    """Disable loss-scale logging to tensorboard."""
+
+    log_validation_ppl_to_tensorboard: bool = False
+    """If set, write validation perplexity to tensorboard."""
+
+    log_memory_to_tensorboard: bool = False
+    """Enable memory logging to tensorboard."""
+
+    memory_keys: dict[str, str] | None = None
+    """Names of memory statistics to log from `torch.cuda.memory_stats()`"""
+
+    log_memory_interval: int | None = None
+    """Report memory interval."""
+
+    log_device_memory_used: bool = False
+    """Log device memory used (as reported by nvidia-smi)."""
+
+    log_l2_norm_grad_to_tensorboard: bool = False
+    """Enable gradients logging to tensorboard."""
+
+    log_num_zeros_in_grad: bool = False
+    """If set, calculate and log the number of zeros in gradient."""
+
+    log_max_attention_logit: bool = False
+    """Enable max attention logit logging to tensorboard."""
+
+    log_runtime_to_tensorboard: bool = False
+    """Enable runtime metrics logging to tensorboard."""
+
+    runtime_time_unit: str = "hours"
+    """Time unit to use for time logging. """
+
+    barrier_with_L1_time: bool = field(default=True, metadata={"argparse_meta": {"arg_names": ["--no-barrier-with-level-1-timing"]}})
+    """If not disabled, use barrier with level 1 time measurements. Note that this is up to the user to
+    make sure calling barrier with their timers will not result in hangs. This can happen if for
+    example the user adds a level 1 timer that is not called by all ranks.
+    """
+
+    log_world_size_to_tensorboard: bool = False
+    """Enable world size logging to tensorboard."""
+
+    wandb_project: str | None = None
+    """The wandb project name. Ignore wandb by default."""
+
+    wandb_exp_name: str | None = None
+    """The wandb experiment name."""
+
+    wandb_save_dir: str | None = None
+    """Path to save the wandb results locally."""
+
+    wandb_entity: str | None = None
+    """The wandb entity name. It is useful when there are multiple sub-projects in a project."""
+
+    logging_level: int | None = None
+    """Set default logging level"""
+
+    filter_warnings: bool = True
+    """Filter out warning messages"""
+
+    modules_to_filter: list[str] | None = None
+    """List of modules to filter out from the logs"""
+
+    set_level_for_all_loggers: bool = False
+    """Set the logging level for all loggers. If False, only level for NeMo loggers will be set."""
+
+    log_energy: bool = False
+    """If set, log energy consumption (in Joules)."""
+
+    save_config_filepath: str | None = None
+    """If set, save the task configuration (ConfigContainer) to this file."""
