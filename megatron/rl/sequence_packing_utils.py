@@ -1068,6 +1068,14 @@ def update_microbatch_calculator(
     decrease_batch_size_if_needed: bool,
 ):
     """Return a data loader with seqpacked indices with microbatches in bins frame of reference.
+    Args:
+        samples_ratio_per_step: Fraction of sampled trajectories to use per iteration.
+        num_bins_this_rank: Amount of packing bins that belongs to current rank.
+        bin_seq_indices: Global seq indices in the bin, see PackingInfo.
+        global_batch_size: Current global batch size.
+        rampup_batch_size: Rampup batch size. See num_microbatches_calculator.py for more.
+        micro_batch_size: Micro batch size at init.
+        decrease_batch_size_if_needed: Scale down batch size. See num_microbatches_calculator.py for more.
 
     As a side effect, we calculate the global batch size in the bins frame of reference.
     In sequence packing, our batch dimension shrinks as we move some trajs onto free
