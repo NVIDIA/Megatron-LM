@@ -1371,13 +1371,14 @@ def validate_args(args, defaults={}):
         ):
             args.te_rng_tracker = True
             warn_rank_0("te_rng_tracker is not enabled, enabling it for CUDA graphs.", args.rank)
-        assert (
-            "expandable_segments:True" not in os.getenv("PYTORCH_CUDA_ALLOC_CONF", "")
-            or os.getenv("NCCL_GRAPH_REGISTER", "") == "0"
-        ), (
-            "Setting NCCL_GRAPH_REGISTER=0 to avoid illegal memory access when using "
-            "CUDA Graph with PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True."
-        )
+        if args.cuda_graph_impl == "transformer_engine":
+            assert (
+                "expandable_segments:True" not in os.getenv("PYTORCH_CUDA_ALLOC_CONF", "")
+                or os.getenv("NCCL_GRAPH_REGISTER", "") == "0"
+            ), (
+                "Setting NCCL_GRAPH_REGISTER=0 to avoid illegal memory access when using "
+                "CUDA Graph with PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True."
+            )
     if args.cuda_graph_scope == "full" or (
         isinstance(args.cuda_graph_scope, list) and "full" in args.cuda_graph_scope
     ):
@@ -2032,6 +2033,11 @@ def _add_ft_package_args(parser):
     group.add_argument('--calc-ft-timeouts', action='store_true',
                        help='If set, FT package will try to automatically compute the timeouts. '
                        'Note: This feature is for Nvidia internal use only.')
+    group.add_argument('--ft-num-warmup-iters', type=int, default=5,
+                       help='Number of warmup iterations before monitoring step section and '
+                       'out-of-section timeouts. The first N iterations are excluded from '
+                       'timeout monitoring as they can be significantly slower than steady-state. '
+                       'Default: 5. Note: This feature is for Nvidia internal use only.')
     return parser
 
 
@@ -2834,6 +2840,13 @@ def _add_distributed_args(parser):
     group.add_argument('--data-parallel-sharding-strategy', type=str, default='no_shard',
                        choices=['no_shard', 'optim', 'optim_grads', 'optim_grads_params'],
                        help='Sharding strategy of data parallelism.')
+    group.add_argument('--outer-dp-sharding-strategy', type=str, default='no_shard',
+                       choices=['no_shard', 'optim'],
+                       help='Sharding strategy for outer data parallel group in Hybrid Sharded Data Parallel (HSDP) mode. '
+                            'Valid values are "no_shard" (DP Replication) and "optim" (Optimizer State Hybrid Sharding). '
+                            'The "optim" option is only supported when --data-parallel-sharding-strategy is "optim_grads_params". '
+                            'This option is only effective when Hybrid FSDP is enabled (i.e., when dp_outer_dim is not None). '
+                            'Default: "no_shard".')
     group.add_argument('--no-gradient-reduce-div-fusion', action='store_false', dest='gradient_reduce_div_fusion',
                        help='If not set, fuse the division in gradient reduce.')
     group.add_argument('--fsdp-double-buffer', action='store_true',
