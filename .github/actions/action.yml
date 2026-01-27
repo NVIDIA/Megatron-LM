@@ -262,5 +262,5 @@ runs:
       if: always()
       with:
         name: ${{ steps.check.outputs.logs_report }}
-        path: ${{ inputs.is_unit_test == 'true' && 'logs' || 'assets_dir' }}
+        path: ${{ inputs.is_unit_test == 'true' && 'assets_dir/logs' || 'assets_dir' }}
         include-hidden-files: true
