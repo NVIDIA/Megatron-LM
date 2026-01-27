@@ -57,6 +57,7 @@ runs:
       run: echo "node_name=$NODE_NAME" | tee -a "$GITHUB_OUTPUT"
 
     - name: GPU Sanity Check
+      shell: bash -x -e -u -o pipefail {0}
       run: |
         echo "Starting GPU Sanity Check..."
 
