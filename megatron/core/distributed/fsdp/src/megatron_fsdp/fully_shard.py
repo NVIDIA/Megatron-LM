@@ -92,6 +92,7 @@ def fully_shard_model(
     overlap_param_gather: bool = True,
     sync_model_each_microbatch: bool = True,
     preproc_state_dict_for_dcp_ckpt: bool = True,
+    check_for_nan_in_grad: bool = True,
     average_in_collective: bool = False,
     disable_bucketing: bool = False,
     calculate_per_token_loss: bool = False,
@@ -223,6 +224,9 @@ def fully_shard_model(
             Whether to preprocess the unevenly-sharded state dict for DCP checkpointing,
             for both the model and the optimizer.
             Defaults to True.
+
+        check_for_nan_in_grad (bool):
+            Whether to check for NaN values in gradients. Defaults to True.
 
         average_in_collective (bool):
             Whether to average gradients in collective communication. Defaults to False.
@@ -358,6 +362,7 @@ def fully_shard_model(
         fsdp_double_buffer=fsdp_double_buffer or nccl_ub,
         fsdp_db_use_persist_buf_on_alloc_fail=fsdp_db_use_persist_buf_on_alloc_fail,
         disable_symmetric_registration=disable_symmetric_registration,
+        check_for_nan_in_grad=check_for_nan_in_grad,
     )
 
     # Create FSDPDistributedIndex.
@@ -560,6 +565,7 @@ def fully_shard(
     overlap_param_gather: bool = True,
     sync_model_each_microbatch: bool = True,
     preproc_state_dict_for_dcp_ckpt: bool = True,
+    check_for_nan_in_grad: bool = True,
     average_in_collective: bool = False,
     disable_bucketing: bool = False,
     calculate_per_token_loss: bool = False,
@@ -610,6 +616,7 @@ def fully_shard(
         overlap_param_gather=overlap_param_gather,
         sync_model_each_microbatch=sync_model_each_microbatch,
         preproc_state_dict_for_dcp_ckpt=preproc_state_dict_for_dcp_ckpt,
+        check_for_nan_in_grad=check_for_nan_in_grad,
         average_in_collective=average_in_collective,
         disable_bucketing=disable_bucketing,
         calculate_per_token_loss=calculate_per_token_loss,
