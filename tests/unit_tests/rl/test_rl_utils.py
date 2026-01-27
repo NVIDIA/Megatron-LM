@@ -1,6 +1,7 @@
 # Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
 import itertools
+import os
 from types import SimpleNamespace
 
 import pytest
@@ -66,19 +67,22 @@ class MockTokenizer:
 
 
 @pytest.fixture
-def initialize_model_parallel(request):
+def initialize_model_parallel(request, monkeypatch):
     """Fixture to initialize and destroy model parallel.
 
     Parameters are passed via request.param as a tuple: (tp, pp)
     Skips if world_size < tp * pp.
     """
+    monkeypatch.setenv("CUDA_DEVICE_MAX_CONNECTIONS", "1")
+
     tp, pp = request.param
     world_size = Utils.world_size
-
     Utils.initialize_model_parallel(tensor_model_parallel_size=tp, pipeline_model_parallel_size=pp)
     dp = world_size // (tp * pp)
     yield world_size, dp, tp, pp
     Utils.destroy_model_parallel()
+    destroy_global_vars()
+    destroy_num_microbatches_calculator()
 
 
 class TestRLUtils:
