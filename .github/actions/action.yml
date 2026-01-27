@@ -52,10 +52,6 @@ inputs:
 runs:
   using: "composite"
   steps:
-    - name: Reset
-      shell: bash
-      run: docker run --rm --gpus all ubuntu nvidia-smi --gpu-reset
-
     - name: Print node name
       shell: bash -x -e -u -o pipefail {0}
       run: echo "node_name=$NODE_NAME" | tee -a "$GITHUB_OUTPUT"
