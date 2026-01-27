@@ -1,5 +1,6 @@
 # Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
+import itertools
 from types import SimpleNamespace
 
 import pytest
@@ -73,14 +74,6 @@ def initialize_model_parallel(request):
     tp, pp = request.param
     world_size = Utils.world_size
 
-    # Skip if world size is smaller than the parallelization requirements
-    required_size = tp * pp
-    if required_size > 0 and world_size < required_size:
-        pytest.skip(
-            f"World size ({world_size}) is smaller than required parallelization "
-            f"(TP={tp} * PP={pp} = {required_size})"
-        )
-
     Utils.initialize_model_parallel(tensor_model_parallel_size=tp, pipeline_model_parallel_size=pp)
     dp = world_size // (tp * pp)
     yield world_size, dp, tp, pp
@@ -114,7 +107,11 @@ class TestRLUtils:
 
     @pytest.mark.parametrize(
         "initialize_model_parallel",
-        [pytest.param((tp, pp), id=f"tp{tp}-pp{pp}") for tp in [1, 2, 4, 8] for pp in [1]],
+        [
+            pytest.param((tp, pp), id=f"tp{tp}-pp{pp}")
+            for tp, pp in itertools.product([1, 2, 4, 8], [1])
+            if tp * pp <= Utils.world_size
+        ],
         indirect=["initialize_model_parallel"],
     )
     @pytest.mark.parametrize("use_sequence_packing", [False, True])
@@ -246,7 +243,11 @@ class TestRLUtils:
 
     @pytest.mark.parametrize(
         "initialize_model_parallel",
-        [pytest.param((tp, pp), id=f"tp{tp}-pp{pp}") for tp in [1, 2, 4, 8] for pp in [1, 2, 4, 8]],
+        [
+            pytest.param((tp, pp), id=f"tp{tp}-pp{pp}")
+            for tp, pp in itertools.product([1, 2, 4, 8], [1, 2, 4, 8])
+            if tp * pp <= Utils.world_size
+        ],
         indirect=["initialize_model_parallel"],
     )
     def test_prepare_data_for_update(self, initialize_model_parallel):
