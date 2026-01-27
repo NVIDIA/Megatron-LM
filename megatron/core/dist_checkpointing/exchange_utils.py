@@ -11,7 +11,7 @@ from typing import Any, Dict, List, NamedTuple, Optional, Set, Tuple, TypeVar, c
 import numpy as np
 import torch
 
-from ..utils import get_pg_rank, get_pg_size
+from ..utils import get_pg_rank, get_pg_size, log_single_rank
 from .core import CheckpointingException
 from .dict_utils import nested_values
 from .mapping import ShardedStateDict, ShardedTensor, is_main_replica
@@ -408,11 +408,11 @@ def exchange_loaded_tensors_gather_object(
     # Error checks
     if len(all_loaded_tensors) != sum(map(len, all_loaded_tensors_list)):
         err_msg = "Duplicate shard ids loaded by different ranks"
-        if torch.distributed.get_rank() == 0:
-            logger.error(
-                f"{err_msg}. Shards ids by rank:"
-                f" {[lt.keys() for lt in all_loaded_tensors_list]}"
-            )
+        log_single_rank(
+            logger,
+            logging.ERROR,
+            f"{err_msg}. Shards ids by rank:" f" {[lt.keys() for lt in all_loaded_tensors_list]}",
+        )
         raise CheckpointingException(err_msg)
 
     return all_loaded_tensors
@@ -439,11 +439,11 @@ def exchange_loaded_objects_gather_object(
     # Error checks
     if len(all_loaded_objects) != sum(map(len, all_loaded_objects_list)):
         err_msg = "Duplicate shard ids loaded by different ranks"
-        if torch.distributed.get_rank() == 0:
-            logger.error(
-                f"{err_msg}. Shards ids by rank:"
-                f" {[lt.keys() for lt in all_loaded_objects_list]}"
-            )
+        log_single_rank(
+            logger,
+            logging.ERROR,
+            f"{err_msg}. Shards ids by rank:" f" {[lt.keys() for lt in all_loaded_objects_list]}",
+        )
         raise CheckpointingException(err_msg)
 
     return all_loaded_objects

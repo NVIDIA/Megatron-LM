@@ -1,11 +1,20 @@
 # Copyright (c) 2025, NVIDIA CORPORATION.  All rights reserved.
 """Pretrain and SFT Mamba."""
 
-# Capture the true program start time BEFORE any heavy imports
+# Capture the true program start time BEFORE any heavy imports.
 import time
 _PROGRAM_START_TIME = time.time()
 
 import json
+
+# Suppress warnings on all ranks but rank 0.
+import os
+import warnings
+rank = int(os.environ.get('RANK', 0))
+if rank != 0:
+    warnings.filterwarnings("ignore", category=UserWarning)
+    warnings.filterwarnings("ignore", category=FutureWarning)
+
 from functools import partial
 from typing import List, Optional, Tuple
 
