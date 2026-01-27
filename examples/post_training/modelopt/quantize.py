@@ -52,15 +52,9 @@ from model_provider import model_provider
 
 warnings.filterwarnings("ignore")
 
-# TODO deprecate these aliases in the next release
-QUANT_CFG_CHOICES = {
-    "int8_sq": mtq.INT8_SMOOTHQUANT_CFG,
-    "fp8": mtq.FP8_DEFAULT_CFG,
-    "fp8_blockwise": mtq.FP8_2D_BLOCKWISE_WEIGHT_ONLY_CFG,
-    "int4_awq": mtq.INT4_AWQ_CFG,
-    "w4a8_awq": mtq.W4A8_AWQ_BETA_CFG,
-    "nvfp4": mtq.NVFP4_DEFAULT_CFG,
-}
+QUANT_CFG_CHOICES = {}
+
+# Auto-load all quant configs by full name
 for k in mtq.config.choices:
     QUANT_CFG_CHOICES[k] = getattr(mtq, k)
 

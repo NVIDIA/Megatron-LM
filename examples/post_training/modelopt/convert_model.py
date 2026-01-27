@@ -136,7 +136,10 @@ if __name__ == "__main__":
         print_rank_0(
             "Import model from Hugging Face checkpoint in dtype {}.".format(str(import_dtype))
         )
-        import_kwargs = {"dtype": import_dtype}
+        import_kwargs = {
+            "dtype": import_dtype,
+            "moe_router_dtype": args.moe_router_dtype,
+        }
         if modelopt_version_at_least("0.41.0"):
             import_kwargs.update({"trust_remote_code": args.trust_remote_code})
         import_mcore_gpt_from_hf(
