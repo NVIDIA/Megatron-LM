@@ -22,7 +22,7 @@ from megatron.core.inference.text_generation_controllers.text_generation_control
     TextGenerationController,
 )
 from megatron.core.transformer.module import MegatronModule
-from megatron.inference.utils import get_dynamic_inference_engine
+from megatron.inference.utils import add_inference_args, get_dynamic_inference_engine
 from model_provider import model_provider
 
 sys.path.append(
@@ -32,7 +32,6 @@ sys.path.append(
 from functools import partial
 from typing import List
 
-from examples.inference.gpt.utils import add_common_inference_args
 from megatron.core import mpu
 from megatron.training import get_args, get_model, get_tokenizer
 from megatron.training.checkpointing import load_checkpoint
@@ -43,7 +42,7 @@ REQUEST_ID = 0
 
 def add_inference_benchmarking_args(parser):
     """Inference benchmarking arguments."""
-    parser = add_common_inference_args(parser)
+    parser = add_inference_args(parser)
 
     group = parser.add_argument_group(title='inference_benchmarking')
 
@@ -187,6 +186,7 @@ def main():
         return_log_probs=args.return_log_probs,
         top_n_logprobs=args.top_n_logprobs,
         num_tokens_to_generate=args.num_tokens_to_generate,
+        termination_id=-1,
     )
     sampling_params.add_attributes({"no_early_termination": True})
 
@@ -216,10 +216,10 @@ def main():
                 )
             )
 
-    if args.cuda_graph_impl == "local" and args.engine_type == "static":
-        print(f"Running warmup for CUDA graphs...")
-        warmup_sampling_params = SamplingParams(num_tokens_to_generate=10)
-        warmup_sampling_params.add_attributes({"no_early_termination": True})
+    # TODO(ksanthanam): Use a command line argument for warmup iterations
+    for i in range(3):
+        print(f"Running warmup iteration {i+1}...")
+        warmup_sampling_params = SamplingParams(num_tokens_to_generate=10, termination_id=-1)
         inference_engine.generate(prompts=["warmup"], sampling_params=warmup_sampling_params)
 
     if args.benchmark_profile:
@@ -260,6 +260,10 @@ def main():
             if args.prompts is not None:
                 result_dict['generated_output'] = tokenizer.detokenize(result.generated_tokens)
             print(result_dict)
+
+    total_output_tokens = args.num_tokens_to_generate * args.inference_max_requests
+    throughput = total_output_tokens / latency
+    print(f"Throughput: {throughput} output tokens / second")
 
 
 if __name__ == "__main__":
