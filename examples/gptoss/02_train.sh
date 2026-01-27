@@ -137,7 +137,6 @@ MODEL_ARGS=(
     --max-position-embeddings ${MAX_POSITION_EMBEDDINGS}
     --use-mcore-models
     --rotary-percent 1.0
-    # --rope-type yarn
     --rope-type rope
     --position-embedding-type rope
     --rotary-base 10000

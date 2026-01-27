@@ -36,6 +36,7 @@ if __name__ == "__main__":
     
     bridge = AutoBridge.from_hf_pretrained(HF_MODEL, trust_remote_code=True)
     provider = bridge.to_megatron_provider()
+    # Update these configs as needed
     provider.expert_tensor_parallel_size = 1
     provider.tensor_model_parallel_size = 1
     provider.pipeline_model_parallel_size = WORLD_SIZE

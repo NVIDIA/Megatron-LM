@@ -53,7 +53,7 @@ cd "$HOST_MEGATRON_LM_DIR"
 Set `--nproc-per-node` to be the number of GPUs per node. Set `hf_model_name` to be the Huggingface model. E.g. `openai/gpt-oss-20b`
 
 ```bash
-torchrun --nproc-per-node=8 examples/gptoss/01_convert_hf.py --hf-model openai/gpt-oss-20b
+torchrun --nproc-per-node=8 examples/gptoss/01_convert_from_hf.py --hf-model openai/gpt-oss-20b
 ```
 
 ## Step 2: Train from Scratch
