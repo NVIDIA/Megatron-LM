@@ -16,6 +16,7 @@ import megatron.core.nccl_allocator as nccl_allocator
 from megatron.core import parallel_state
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.rerun_state_machine import get_rerun_state_machine
+from megatron.core.utils import log_single_rank
 
 from ..fp8_utils import (
     is_float8tensor,
@@ -162,6 +163,11 @@ class _ParamAndGradBucketGroup:
         global dist_reduce_scatter_func
         if self.ddp_config.reduce_scatter_with_fp32_accumulation:
             dist_reduce_scatter_func = reduce_scatter_with_fp32_accumulation
+            log_single_rank(
+                logger,
+                logging.INFO,
+                "Using reduce_scatter_with_fp32_accumulation as reduce-scatter implementation",
+            )
 
         # per_param_grad_ready_counts is a dict mapping parameters to number of times
         # `register_grad_ready` is called for that parameter *when
