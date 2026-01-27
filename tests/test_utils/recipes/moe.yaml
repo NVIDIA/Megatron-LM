@@ -203,7 +203,7 @@ products:
   - test_case: [gpt3_moe_mcore_te_ep8_resume_torch_dist_muon]
     products:
       - environment: [dev]
-        scope: [mr-broken, mr-github-broken, mr-slim-broken]
+        scope: [mr, mr-github, mr-slim]
         platforms: [dgx_h100]
   - test_case: [gpt3_moe_mcore_te_tp2_pp2_ep4_etp1_no_mtp_no_a2a_ovlp_fine_grained_offloading]
     products:
