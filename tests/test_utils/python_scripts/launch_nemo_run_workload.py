@@ -120,6 +120,8 @@ def main(
             "ENABLE_LIGHTWEIGHT_MODE": str(enable_lightweight_mode).lower(),
             "N_REPEAT": str(n_repeat),
             "CLUSTER": "dgxh100_dgxc",
+            "NCCL_DEBUG": "INFO",
+            "NCCL_DEBUG_FILE": "/opt/megatron-lm/assets_dir/logs/nccl_debug.log",
         },
         packager=run.Packager(),
         volumes=artifacts,
