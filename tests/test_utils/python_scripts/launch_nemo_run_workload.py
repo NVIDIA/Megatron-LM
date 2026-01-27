@@ -50,6 +50,7 @@ def is_flaky_failure(concat_allranks_logs: str) -> bool:
 @click.option("--environment", required=True, type=str, help="Environment of the workload")
 @click.option("--platform", required=True, type=str, help="Platform of the workload")
 @click.option("--container-image", required=True, type=str, help="Container image of the workload")
+@click.option("--n-repeat", required=False, type=int, help="Number of times to repeat the workload", default=1)
 @click.option("--data-dir", required=False, type=str, help="Data directory of the workload")
 @click.option("--tag", required=False, type=str, help="Tag of the workload")
 @click.option(
@@ -68,6 +69,7 @@ def main(
     environment,
     platform,
     container_image,
+    n_repeat: int = 1,
     data_dir: Optional[str] = None,
     tag: Optional[str] = None,
     enable_lightweight_mode: Optional[bool] = False,
@@ -113,7 +115,7 @@ def main(
             "PYTHONUNBUFFERED": "1",
             "OUTPUT_PATH": os.getcwd(),
             "ENABLE_LIGHTWEIGHT_MODE": str(enable_lightweight_mode).lower(),
-            "N_REPEAT": "1",
+            "N_REPEAT": n_repeat,
             "CLUSTER": "dgxh100_dgxc",
             "NCCL_DEBUG": "INFO",
         },
