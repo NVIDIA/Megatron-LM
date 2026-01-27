@@ -80,8 +80,12 @@ def get_static_inference_engine(args: Namespace, model: MegatronModule) -> Abstr
     )
 
     inference_wrapped_model = GPTInferenceWrapper(model, inference_wrapper_config)
+    pg_collection = get_attr_wrapped_model(model, "pg_collection")
+    pp_group = pg_collection.pp
     text_generation_controller = SimpleTextGenerationController(
-        inference_wrapped_model=inference_wrapped_model, tokenizer=tokenizer
+        inference_wrapped_model=inference_wrapped_model,
+        tokenizer=tokenizer,
+        pp_group=pp_group,
     )
     return MCoreEngine(
         text_generation_controller=text_generation_controller,
@@ -119,20 +123,25 @@ def get_dynamic_inference_engine(
 
     mamba_inference_state_config = get_mamba_inference_state_config_from_model(model)
 
-    # DynamicInferenceContext must use the inference model's TP size, not the
-    # training TP size from global args. The inference model may have a custom
-    # ProcessGroupCollection with a different TP size.
+    # DynamicInferenceContext must use the inference model's TP / PP size, not the
+    # training TP / PP size from global args. The inference model may have a custom
+    # ProcessGroupCollection with a different TP / PP size.
     pg_collection = get_attr_wrapped_model(model, "pg_collection")
     tp_group = getattr(pg_collection, 'tp', None) if pg_collection is not None else None
     if tp_group is not None:
         inference_tp_size = get_pg_size(tp_group)
     else:
         inference_tp_size = args.tensor_model_parallel_size
+    pp_group = getattr(pg_collection, 'pp', None) if pg_collection is not None else None
+    if pp_group is not None:
+        inference_pp_size = get_pg_size(pp_group)
+    else:
+        inference_pp_size = args.pipeline_model_parallel_size
 
     # Inference context.
     inference_context = DynamicInferenceContext(
         params_dtype=args.params_dtype,
-        num_layers=args.num_layers // args.pipeline_model_parallel_size,
+        num_layers=args.num_layers // inference_pp_size,
         kv_channels=args.kv_channels,
         num_attention_heads=(
             args.num_query_groups if args.group_query_attention else args.num_attention_heads
@@ -143,8 +152,9 @@ def get_dynamic_inference_engine(
         ),
         block_size_tokens=args.inference_dynamic_batching_block_size,
         buffer_size_gb=args.inference_dynamic_batching_buffer_size_gb,
+        max_requests=args.inference_dynamic_batching_max_requests,
         max_tokens=args.inference_dynamic_batching_max_tokens,
-        tensor_model_parallel_size=inference_tp_size,
+        pg_collection=pg_collection,  # TP/PP sizes are derived from the model's pg_collection.
         materialize_only_last_token_logits=True,
         mamba_inference_state_config=mamba_inference_state_config,
         cache_mla_latent=args.multi_latent_attention and args.cache_mla_latents,
@@ -156,16 +166,20 @@ def get_dynamic_inference_engine(
         cuda_graph_max_tokens=args.inference_dynamic_batching_cuda_graph_max_tokens,
         cuda_graph_mixed_prefill_count=args.inference_dynamic_batching_cuda_graph_mixed_prefill_count,
         metrics_writer=metrics_writer,
+        persist_cuda_graphs=args.rl_training_cuda_graphs
     )
 
-    inference_wrapped_model = GPTInferenceWrapper(model, args, inference_context)
+    inference_wrapped_model = GPTInferenceWrapper(model, args, inference_context, pg_collection=pg_collection)
 
     inference_wrapped_model.model_is_pipeline_parallel = not (
         is_pp_first_stage(pg_collection.pp) and is_pp_last_stage(pg_collection.pp)
     )
 
+    pp_group = getattr(pg_collection, "pp", None)
     text_generation_controller = SimpleTextGenerationController(
-        inference_wrapped_model=inference_wrapped_model, tokenizer=tokenizer
+        inference_wrapped_model=inference_wrapped_model,
+        tokenizer=tokenizer,
+        pp_group=pp_group,
     )
 
     return DynamicInferenceEngine(
@@ -199,6 +213,7 @@ class MegatronLocal(InferenceServer, ReturnsTokens, ReturnsRaw):
         assert self._client is not None, "Client is not initialized"
 
         tokenizer = get_tokenizer()
+        args = get_args()
 
         sampling_params = SamplingParams(
             num_tokens_to_generate=None,
@@ -209,7 +224,7 @@ class MegatronLocal(InferenceServer, ReturnsTokens, ReturnsRaw):
             termination_id=self._inference_engine.controller.tokenizer.eod,
             return_log_probs=True,
             skip_prompt_log_probs=True,
-            add_BOS=tokenizer.bos is not None,
+            add_BOS=(not args.rl_skip_bos_token and tokenizer.bos is not None),
         )
         requests = [
             self._client.add_request(prompt=prompt, sampling_params=sampling_params)

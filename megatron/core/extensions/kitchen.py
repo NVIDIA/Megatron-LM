@@ -1431,9 +1431,9 @@ class KitchenFlashAttention(MegatronModule):
         query: Tensor,
         key: Tensor,
         value: Tensor,
-        attention_mask: Tensor,
-        attn_mask_type: AttnMaskType = None,
-        attention_bias: Tensor = None,
+        attention_mask: Optional[Tensor],
+        attn_mask_type: Optional[AttnMaskType] = None,
+        attention_bias: Optional[Tensor] = None,
         packed_seq_params: Optional[PackedSeqParams] = None,
     ):
         """Forward."""
@@ -1581,11 +1581,11 @@ class KitchenDotProductAttention(MegatronModule):
         query: Tensor,
         key: Tensor,
         value: Tensor,
-        attention_mask: Tensor,
-        attn_mask_type: AttnMaskType = None,
-        attention_bias: Tensor = None,
+        attention_mask: Optional[Tensor],
+        attn_mask_type: Optional[AttnMaskType] = None,
+        attention_bias: Optional[Tensor] = None,
         packed_seq_params: Optional[PackedSeqParams] = None,
-    ):
+    ) -> Tensor:
         """Forward."""
         assert self.init_finished, "Must call finish_init before forward."
         assert packed_seq_params is None, (
@@ -1725,7 +1725,7 @@ class KitchenSpecProvider(BackendSpecProvider):
         self.use_kitchen_attention = use_kitchen_attention
         self.kitchen_attention_backend = kitchen_attention_backend
 
-    def column_parallel_linear(self) -> type:
+    def column_parallel_linear(self) -> type[KitchenColumnParallelLinear]:
         """Which column parallel linear module kitchen backend uses"""
         return KitchenColumnParallelLinear
 
@@ -1744,7 +1744,7 @@ class KitchenSpecProvider(BackendSpecProvider):
         # explicitly about whether to include a norm.
         return self.fallback.fuse_layernorm_and_linear()
 
-    def column_parallel_layer_norm_linear(self) -> Optional[type]:
+    def column_parallel_layer_norm_linear(self) -> type[KitchenLayerNormColumnParallelLinear]:
         """Which module for sequential layernorm and linear"""
         return KitchenLayerNormColumnParallelLinear
 
@@ -1752,7 +1752,9 @@ class KitchenSpecProvider(BackendSpecProvider):
         """Which module to use for layer norm"""
         return self.fallback.layer_norm(rms_norm=rms_norm, for_qk=for_qk)
 
-    def core_attention(self) -> type:
+    def core_attention(
+        self,
+    ) -> type[KitchenDotProductAttention] | type[KitchenFlashAttention] | type:
         """Which module to use for attention"""
         if not self.use_kitchen_attention:
             log_single_rank(

@@ -1,5 +1,6 @@
 # Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
+import warnings
 from contextlib import nullcontext
 from dataclasses import dataclass
 from typing import Callable, List, Optional, Union
@@ -57,8 +58,8 @@ def tie_word_embeddings_state_dict(
     sharded_state_dict: ShardedStateDict,
     word_emb_weight: Tensor,
     word_emb_weight_key: str,
-    tp_group: torch.distributed.ProcessGroup = None,
-    dp_cp_group: torch.distributed.ProcessGroup = None,
+    tp_group: torch.distributed.ProcessGroup,
+    dp_cp_group: torch.distributed.ProcessGroup,
 ) -> None:
     """tie the embedding of the mtp processing stage in a given sharded state dict.
 
@@ -92,8 +93,8 @@ def tie_output_layer_state_dict(
     sharded_state_dict: ShardedStateDict,
     output_layer_weight: Tensor,
     output_layer_weight_key: str,
-    tp_group: torch.distributed.ProcessGroup = None,
-    dp_cp_group: torch.distributed.ProcessGroup = None,
+    tp_group: torch.distributed.ProcessGroup,
+    dp_cp_group: torch.distributed.ProcessGroup,
 ) -> None:
     """tie the output layer of the mtp processing stage in a given sharded state dict.
 
@@ -316,8 +317,8 @@ class MTPLossLoggingHelper:
         loss: torch.Tensor,
         layer_number: int,
         num_layers: int,
-        reduce_group: torch.distributed.ProcessGroup = None,
-        avg_group: torch.distributed.ProcessGroup = None,
+        reduce_group: Optional[torch.distributed.ProcessGroup] = None,
+        avg_group: Optional[torch.distributed.ProcessGroup] = None,
     ):
         """Save the mtp loss for logging.
         Args:
@@ -505,9 +506,6 @@ def get_mtp_ranks(pp_ranks: List[int], config: TransformerConfig) -> List[int]:
 
 def get_mtp_layer_offset(config: TransformerConfig, vp_stage: Optional[int] = None) -> int:
     """Get the offset of the MTP layer."""
-    # TODO(shifangx): Currently, we only support put all of MTP layers
-    # on the last pipeline stage, so the offset is always 0.
-    # We will support more flexible MTP placement in the future.
     if config.pipeline_model_parallel_size > 1:
         if config.pipeline_model_parallel_layout:
             offset = config.pipeline_model_parallel_layout.get_layer_offset(
@@ -866,15 +864,15 @@ class MultiTokenPredictionLayer(MegatronModule):
         position_ids: Tensor,
         hidden_states: Tensor,
         attention_mask: Tensor,
-        context: Tensor = None,
-        context_mask: Tensor = None,
-        rotary_pos_emb: Tensor = None,
-        rotary_pos_cos: Tensor = None,
-        rotary_pos_sin: Tensor = None,
-        attention_bias: Tensor = None,
-        inference_params: InferenceParams = None,
-        packed_seq_params: PackedSeqParams = None,
-        sequence_len_offset: Tensor = None,
+        context: Optional[Tensor] = None,
+        context_mask: Optional[Tensor] = None,
+        rotary_pos_emb: Optional[Tensor] = None,
+        rotary_pos_cos: Optional[Tensor] = None,
+        rotary_pos_sin: Optional[Tensor] = None,
+        attention_bias: Optional[Tensor] = None,
+        inference_params: Optional[InferenceParams] = None,
+        packed_seq_params: Optional[PackedSeqParams] = None,
+        sequence_len_offset: Optional[Tensor] = None,
         embedding=None,
     ):
         """
@@ -977,7 +975,7 @@ class MultiTokenPredictionBlockSubmodules:
             projection matrix, transformer block, shared output head).
     """
 
-    layer_specs: List[ModuleSpec] = None
+    layer_specs: Optional[List[ModuleSpec]] = None
 
 
 def _get_mtp_block_submodules(
@@ -1033,7 +1031,7 @@ class MultiTokenPredictionBlock(MegatronModule):
         config: TransformerConfig,
         spec: Union[TransformerBlockSubmodules, ModuleSpec],
         vp_stage: Optional[int] = None,
-        pg_collection: ProcessGroupCollection = None,
+        pg_collection: Optional[ProcessGroupCollection] = None,
     ):
         super().__init__(config=config)
         self.submodules = _get_mtp_block_submodules(config, spec)
@@ -1082,16 +1080,16 @@ class MultiTokenPredictionBlock(MegatronModule):
         position_ids: Tensor,
         hidden_states: Tensor,
         attention_mask: Tensor,
-        context: Tensor = None,
-        context_mask: Tensor = None,
-        rotary_pos_emb: Tensor = None,
-        rotary_pos_cos: Tensor = None,
-        rotary_pos_sin: Tensor = None,
-        attention_bias: Tensor = None,
-        inference_params: InferenceParams = None,
-        packed_seq_params: PackedSeqParams = None,
-        sequence_len_offset: Tensor = None,
-        extra_block_kwargs: dict = None,
+        context: Optional[Tensor] = None,
+        context_mask: Optional[Tensor] = None,
+        rotary_pos_emb: Optional[Tensor] = None,
+        rotary_pos_cos: Optional[Tensor] = None,
+        rotary_pos_sin: Optional[Tensor] = None,
+        attention_bias: Optional[Tensor] = None,
+        inference_params: Optional[InferenceParams] = None,
+        packed_seq_params: Optional[PackedSeqParams] = None,
+        sequence_len_offset: Optional[Tensor] = None,
+        extra_block_kwargs: Optional[dict] = None,
         embedding=None,
     ) -> Tensor:
         """

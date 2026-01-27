@@ -22,6 +22,7 @@ from megatron.core.rerun_state_machine import (
     RerunMode,
     initialize_rerun_state_machine,
 )
+from megatron.core.transformer.custom_layers.batch_invariant_kernels import enable_batch_invariant_mode
 from megatron.core.utils import get_te_version, is_te_min_version, is_torch_min_version
 from megatron.legacy import fused_kernels
 from megatron.training import get_adlr_autoresume, get_args, get_tensorboard_writer
@@ -114,6 +115,11 @@ def initialize_megatron(
         ),
         result_rejected_tracker_filename=args.result_rejected_tracker_filename,
     )
+    
+    if args.batch_invariant_mode:
+        if args.rank == 0:
+            print("Enabling batch invariant mode globally", flush=True)
+        enable_batch_invariant_mode()
 
     # torch.distributed initialization
     def finish_mpu_init():
