@@ -2091,6 +2091,9 @@ class ParamAndGradBuffer:
                     is_data_distributed=is_grad_buffer_distributed and main_buf_dp_group.size() > 1,
                     dtype=main_grad_dtype,
                     device=self.device,
+                    # Note: This will be DP-Outer + DP-Shard when sharding
+                    # the optimizer state in HFSDP, else just DP-Shard when
+                    # using basic HSDP or FSDP.
                     data_parallel_group=main_buf_dp_group,
                     is_transpose_buffer=False,
                     temporary_bucket_allocator=self.main_grad_alloc,
@@ -3301,6 +3304,9 @@ class GradReducePipeline:
                     bucket = gbuf.fetch_bucket()
 
                     # Cast gradient to gradient communication dtype if specified and necessary.
+                    # NOTE(@cspades): This feature is primarily used to down-cast the gradient
+                    # for efficient communication, commonly a no-op with BF16-native gradients.
+                    # Support for TE-quantized gradient (or parameter) communication is a TODO.
                     rs_input, grad_comm_with_custom_dtype = self._custom_grad_comm_dtype_cast(
                         bucket.data
                     )
@@ -3310,22 +3316,8 @@ class GradReducePipeline:
                     reduce_op = gradient_reduce_preprocessing(rs_input, scaling_factor, ddp_config)
 
                     # Reduce-scatter or all-reduce the unsharded gradient.
-                    if _use_custom_grad_accum_dtype(rs_input, ddp_config):
-                        # Reduce in grad_accum_dtype precision.
-                        reduced_gradient = self._custom_grad_accum_reduce_op(
-                            input_buffer=rs_input,
-                            output_shape=gbuf.data.shape,
-                            collective_group=gbuf.data_parallel_group,
-                            sharded_collective=gbuf.is_data_distributed,
-                            reduce_op=reduce_op,
-                        )
-                        # Track some closure tasks to accumulate the reduced grad
-                        # into the target gradient buffer.
-                        grad_accum_closure.append((gbuf.data, reduced_gradient))
-
-                    # Optim-Grads / Optim-Grads-Params
-                    elif gbuf.is_data_distributed:
-                        # View the sharded gradient from the bucket.
+                    if gbuf.is_data_distributed:
+                        # Get a view of the gradient shard from the bucket.
                         grad_shard = gbuf.get_shard_from_bucket(bucket)
                         # pylint: disable=C0301
                         # FIXME(@shjwudp, @cspades): There are partially-unexplained issues with memory
@@ -3336,17 +3328,26 @@ class GradReducePipeline:
                             # Create a temporary communication buffer for the reduce-scatter.
                             with self.buffer.mem_alloc_context():  # Optional[NCCL_UB]
                                 grad_shard = torch.empty_like(grad_shard, dtype=rs_input.dtype)
-                        # Reduce-scatter gradients on the FSDP group.
-                        torch.distributed.reduce_scatter_tensor(
-                            output=grad_shard,
-                            input=rs_input,
-                            op=reduce_op,
-                            group=gbuf.data_parallel_group,
-                        )
-                        # Track some closure tasks to accumulate the reduced grad.
-                        grad_accum_closure.append((gbuf.data, grad_shard))
 
-                    # No-Shard / Optim
+                        # Execute the reduce-scatter collective.
+                        custom_accum_dtype = _use_custom_grad_accum_dtype(rs_input, ddp_config)
+                        reduced_grad = self._custom_dtype_grad_accum_reduce_scatter_op(
+                            input_buffer=rs_input,
+                            output_buffer=grad_shard,
+                            collective_group=gbuf.data_parallel_group,
+                            # Skip reduction if using a custom reduction data-type.
+                            reduce_op=reduce_op if not custom_accum_dtype else None,
+                        )
+                        # Track some closure tasks to accumulate the reduced gradient shard.
+                        grad_accum_closure.append(
+                            (
+                                gbuf.data,
+                                reduced_grad,
+                                # If we skipped reduction (custom accumulation data-type),
+                                # we need to reduce during closure (post-collective).
+                                reduce_op if custom_accum_dtype else None,
+                            )
+                        )
                     else:
                         # All-reduce un-sharded gradients from every rank.
                         # NOTE(@shjwudp, @cspades): This should only be invoked on the
@@ -3364,11 +3365,22 @@ class GradReducePipeline:
                     # Mark bucket ID as CUDA work-in-progress.
                     self.bucket_status[bucket_id] = BucketStatus.COMMUNICATING
 
-            for local_grad, reduced_grad in grad_accum_closure:
+            for local_grad, reduced_grad, reduce_op in grad_accum_closure:
+                # Reduce gradients if necessary.
+                if reduce_op is not None:
+                    # TODO(@shjwudp, @cspades): Fuse the reduction and accumulation
+                    # with a custom kernel. For now, do them separately.
+                    if reduce_op == torch.distributed.ReduceOp.AVG:
+                        # AVG reduction.
+                        reduced_grad = reduced_grad.mean(dim=0, dtype=ddp_config.grad_accum_dtype)
+                    elif reduce_op == torch.distributed.ReduceOp.SUM:
+                        # SUM reduction.
+                        reduced_grad = reduced_grad.sum(dim=0, dtype=ddp_config.grad_accum_dtype)
                 # Accumulate the reduced gradient into the local gradient buffer.
                 # Accumulation data-type is type-promoted with respect to the
                 # accumulated gradient and the buffer main_grads_dtype.
                 local_grad += reduced_grad
+
             # Record a checkpoint for the event to synchronize against the reduce-scatter stream.
             reduce_scatter_view_out_event = reduce_scatter_stream.record_event()
 
@@ -3412,42 +3424,46 @@ class GradReducePipeline:
                         reduce_op = gradient_reduce_preprocessing(rs_input, None, ddp_config)
 
                         # All-reduce or reduce-scatter the DP-Shard gradients across DP-Outer.
-                        if _use_custom_grad_accum_dtype(rs_input, ddp_config):
-                            # Reduce in grad_accum_dtype precision.
-                            reduced_gradient = self._custom_grad_accum_reduce_op(
-                                input_buffer=rs_input,
-                                output_shape=main_grad_buffer.data.shape,
-                                collective_group=outer_fsdp_group,
-                                sharded_collective=hfsdp_optimizer_full_sharding,
-                                reduce_op=reduce_op,
-                            )
-                            # Track some closure tasks to accumulate the reduced grad into the
-                            # target HFSDP or FSDP (sharded or unsharded) gradient buffer.
-                            grad_accum_closure.append((main_grad_buffer.data, reduced_gradient))
-                        # HFSDP -> main_grad_buffer = HFSDP (DP-Shard, DP-Outer) Buffer
-                        elif hfsdp_optimizer_full_sharding:
+                        if (
+                            hfsdp_optimizer_full_sharding
+                        ):  # HFSDP -> main_grad_buffer = (DP-Shard, DP-Outer)
                             # Retrieve the (DP-Outer, DP-Shard) gradient shard from the
                             # main gradient buffer which shards across the entire DP group,
                             # i.e. across all DP-Shard and DP-Outer ranks.
-                            # FIXME(@shjwudp, @cspades): In-place reduce-scatter has unexplained
-                            # issues with corrupt gradients or convergence problems.
-                            output_buffer = torch.empty_like(
-                                # (DP-Shard, DP-Outer)-sharded local data.
-                                main_grad_buffer.data,
-                                # Cast to the communication data-type.
-                                dtype=rs_input.dtype,
-                            )
+                            custom_accum_dtype = _use_custom_grad_accum_dtype(rs_input, ddp_config)
+                            with self.buffer.mem_alloc_context():  # Optional[NCCL_UB]
+                                # FIXME(@shjwudp): In-place reduce-scatter has unexplained
+                                # issues with corrupt gradients or convergence problems.
+                                main_grad_buffer_shard = (
+                                    torch.empty_like(
+                                        # (DP-Shard, DP-Outer)-sharded local data.
+                                        main_grad_buffer.data,
+                                        # Cast to the communication data-type.
+                                        dtype=rs_input.dtype,
+                                    )
+                                    if not custom_accum_dtype
+                                    else main_grad_buffer.data
+                                )
                             # Reduce-scatter the FSDP gradient buffer shard further
                             # into the (DP-Outer, DP-Shard) gradient shard.
-                            torch.distributed.reduce_scatter_tensor(
-                                output=output_buffer,
-                                input=rs_input,
-                                op=reduce_op,
-                                group=outer_fsdp_group,
+                            reduced_grad = self._custom_dtype_grad_accum_reduce_scatter_op(
+                                input_buffer=rs_input,
+                                output_buffer=main_grad_buffer_shard,
+                                collective_group=outer_fsdp_group,
+                                # Skip reduction if using a custom reduction data-type.
+                                reduce_op=reduce_op if not custom_accum_dtype else None,
                             )
-                            # Track gradient accumulation closure tasks.
-                            grad_accum_closure.append((main_grad_buffer.data, output_buffer))
-                        else:  # HSDP -> main_grad_buffer = FSDP DP-Shard Buffer
+                            # Track some closure tasks to accumulate the reduced gradient shard.
+                            grad_accum_closure.append(
+                                (
+                                    main_grad_buffer.data,
+                                    reduced_grad,
+                                    # If we skipped reduction (custom accumulation data-type),
+                                    # we need to reduce during closure (post-collective).
+                                    reduce_op if custom_accum_dtype else None,
+                                )
+                            )
+                        else:  # HSDP -> main_grad_buffer = (DP-Shard,)
                             # No DP-Outer sharding, so all-reduce FSDP gradients across DP-Outer.
                             # All FSDP buffers will have reduced un-sharded or sharded gradients.
                             # NOTE(@shjwudp, @cspades): This should only be invoked on the
@@ -3461,10 +3477,25 @@ class GradReducePipeline:
                             # communication buffer that needs to be copied to the target buffer.
                             if grad_comm_with_custom_dtype:
                                 main_grad_buffer.data.copy_(rs_input)
-                for grad_buffer_shard, reduced_grad_shard in grad_accum_closure:
+                for grad_buffer_shard, reduced_grad_shard, reduce_op in grad_accum_closure:
+                    # Reduce gradients if necessary.
+                    if reduce_op is not None:
+                        # TODO(@shjwudp, @cspades): Fuse the reduction and copy
+                        # with a custom kernel. For now, do them separately.
+                        if reduce_op == torch.distributed.ReduceOp.AVG:
+                            # AVG reduction.
+                            reduced_grad = reduced_grad.mean(
+                                dim=0, dtype=ddp_config.grad_accum_dtype
+                            )
+                        elif reduce_op == torch.distributed.ReduceOp.SUM:
+                            # SUM reduction.
+                            reduced_grad = reduced_grad.sum(
+                                dim=0, dtype=ddp_config.grad_accum_dtype
+                            )
                     # Update the (DP-Outer, DP-Shard) gradient shard in the main gradient buffer.
                     # No accumulation should happen in the (DP-Shard, DP-Outer) gradient buffer.
                     grad_buffer_shard.copy_(reduced_grad_shard)
+
             reduce_scatter_view_out_event = self.outer_fsdp_group_grad_reduce_stream.record_event()
 
         free_up_grad_bucket_func = {}
@@ -3522,57 +3553,38 @@ class GradReducePipeline:
             # Return the original Tensor.
             return comm_tensor, False
 
-    def _custom_grad_accum_reduce_op(
+    def _custom_dtype_grad_accum_reduce_scatter_op(
         self,
         input_buffer: torch.Tensor,
-        output_shape: tuple,
+        output_buffer: torch.Tensor,
         collective_group: torch.distributed.ProcessGroup,
-        sharded_collective: bool,
-        reduce_op: torch.distributed.ReduceOp,
+        reduce_op: torch.distributed.ReduceOp = None,
     ) -> torch.Tensor:
         """
-        Reduce gradients with a customized accumulation data-type.
+        Reduce-scatter gradients with a customized accumulation data-type.
+        If reduce_op is None, then use A2A to communicate gradient shards
+        and skip reduction.
         """
-        # Output buffer for communications with shape compatible
-        # with the local gradient buffer data, sharded or unsharded.
-        with self.buffer.mem_alloc_context():  # Optional[NCCL_UB]
-            output_buffer = torch.empty(
-                # (DP-Size, Gradient Accum Buffer Data Size)
-                (collective_group.size(), *output_shape),
-                dtype=input_buffer.dtype,
-                device=input_buffer.device,
-            )
-
-        # Communicate gradients.
-        if sharded_collective:
+        if reduce_op is None:
+            # Alternative output buffer for A2A communications.
+            # Returned instead of the template output_buffer.
+            with self.buffer.mem_alloc_context():  # Optional[NCCL_UB]
+                output_buffer = torch.empty(
+                    # (DP-Size, Gradient Accum Buffer Data Size)
+                    (collective_group.size(), *output_buffer.shape),
+                    dtype=input_buffer.dtype,
+                    device=input_buffer.device,
+                )
             # All-to-all (gather-scatter) the un-sharded gradients.
             torch.distributed.all_to_all_single(
                 output=output_buffer, input=input_buffer, group=collective_group
             )
         else:
-            # TODO(@shjwudp, @cspades): Reduce-scatter in accumulation
-            # precision and all-gather in communication precision.
-            torch.distributed.all_gather_into_tensor(
-                output_tensor=output_buffer, input_tensor=input_buffer, group=collective_group
+            # Reduce-scatter in communication data-type.
+            torch.distributed.reduce_scatter_tensor(
+                output=output_buffer, input=input_buffer, op=reduce_op, group=collective_group
             )
-
-        # Reduce in grad_accum_dtype, e.g. high-precision / FP32.
-        if reduce_op == torch.distributed.ReduceOp.AVG:
-            # AVG reduction.
-            output_reduced = output_buffer.mean(
-                dim=0, dtype=self.buffer.ddp_config.grad_accum_dtype
-            )
-        elif reduce_op == torch.distributed.ReduceOp.SUM:
-            # SUM reduction.
-            output_reduced = output_buffer.sum(dim=0, dtype=self.buffer.ddp_config.grad_accum_dtype)
-        else:
-            raise ValueError(
-                f"[Megatron-FSDP] {reduce_op} is an invalid ReduceOp (SUM, AVG) "
-                "for gradient accumulation with a custom data-type. "
-            )
-
-        # Return the reduced gradient.
-        return output_reduced
+        return output_buffer
 
 
 class PrefetchOrder(Enum):

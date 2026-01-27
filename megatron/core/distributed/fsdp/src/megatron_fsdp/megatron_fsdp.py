@@ -230,6 +230,7 @@ class MegatronFSDP(torch.nn.Module):
                 fsdp_double_buffer=fsdp_double_buffer or nccl_ub,
                 fsdp_db_use_persist_buf_on_alloc_fail=fsdp_db_use_persist_buf_on_alloc_fail,
                 disable_symmetric_registration=disable_symmetric_registration,
+                check_for_nan_in_grad=True,
             )
         else:
             self.ddp_config = ddp_config
@@ -551,6 +552,15 @@ class MegatronFSDP(torch.nn.Module):
                 if is_float8tensor(param):
                     fp8_discard_transpose_cache(param)
 
+        def _check_nan_in_grad(grad: torch.Tensor):
+            """
+            Check if there are any NaN in grad.
+            """
+            if self.ddp_config.check_for_nan_in_grad and torch.isnan(grad).any():
+                raise ValueError(
+                    "[Megatron-FSDP](check_for_nan_in_grad=True) " f"Detected NaN in wgrad: {grad}"
+                )
+
         def _grad_acc(param):
             """
             Accumulate the gradient in the main_grad buffer.
@@ -575,16 +585,21 @@ class MegatronFSDP(torch.nn.Module):
 
                     param.main_grad = param.get_main_grad()
                     if param.grad is not None:
+                        _check_nan_in_grad(param.grad)
                         # Copy the gradient into the allocated main gradient bucket.
                         # It will be reduce-scattered and accumulated into gbuf.
                         param.main_grad.copy_(to_local_if_dtensor(param.grad))
                         del param.grad
                     else:
+                        # wgrad accumulation is fused.
+                        # Only supported for sharded gradients.
+                        _check_nan_in_grad(param.main_grad)
                         param.main_grad.zero_()
             # Unsharded Gradient Buffer
             else:
                 if not param.grad_added_to_main_grad:
                     if param.grad is not None:
+                        _check_nan_in_grad(param.grad)
                         # Add the gradient into the unsharded main gradient buffer.
                         # For unsharded gradients, this is gradient accumulation.
                         param.main_grad = param.get_main_grad()
