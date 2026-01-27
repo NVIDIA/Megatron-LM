@@ -90,6 +90,7 @@ def _plan_multi_dim_lcm(
     d = descriptors[0]
     if my_global_rank not in d.dst_dim_ranks:
         return []
+
     src_shape = tuple(src_metadata.shape)
     dst_shape = tuple(dst_metadata.shape)
     dim = d.dim
@@ -174,8 +175,8 @@ def _finalize_dp_transfers(
 
     dst_shape = dst_metadata.shape
 
-    # Same DP layout - local copy
-    if src_dp_ranks == dst_dp_ranks:
+    # Same DP layout - local copy (only if this rank has the source parameter)
+    if src_dp_ranks == dst_dp_ranks and my_global_rank in src_dp_ranks:
         full_slice = tuple(slice(None) for _ in range(len(dst_shape)))
         return [(my_global_rank, full_slice, full_slice)]
 
@@ -183,7 +184,17 @@ def _finalize_dp_transfers(
     # better load balancing across source ranks. This ensures that destination
     # ranks are distributed across source ranks even when they have the same
     # position within their respective DP groups.
+    #
+    # IMPORTANT: In non-collocated mode, src_dp_ranks might include ranks that don't
+    # have the source model (e.g., idle ranks or destination ranks). Filter to only
+    # include the rank that provided this metadata (src_metadata.owner_rank).
+    # src_metadata was selected by select_src_metadata_balanced, so owner_rank is the
+    # actual source rank for this parameter.
+    actual_src_rank = src_metadata.owner_rank
     src_global_rank = src_dp_ranks[my_global_rank % len(src_dp_ranks)]
+    # Override with the actual source rank if the selected rank doesn't have the parameter
+    if src_global_rank != actual_src_rank:
+        src_global_rank = actual_src_rank
     full_slice = tuple(slice(None) for _ in range(len(dst_shape)))
     return [(src_global_rank, full_slice, full_slice)]
 
@@ -216,39 +227,26 @@ def build_centralized_reshard_plan(
     """
     Centralized planning: Rank 0 builds complete plan for all ranks, then scatters.
 
-    Supports None for both src_module and dst_module to allow idle ranks in non-collocated
-    mode to participate in collective operations. Idle ranks provide empty metadata and
-    receive empty plans.
+    Supports None for src_module and/or dst_module to enable non-collocated mode:
+    - src_module=None: Rank doesn't have source model (destination-only)
+    - dst_module=None: Rank doesn't have destination model (source-only)
+    - Both provided: Rank has both models (collocated mode)
+
+    Each rank provides metadata only for the models it owns, including local positions
+    within parallel groups (tensor_parallel_local_rank, expert_parallel_local_rank).
+    This metadata is sufficient for rank 0 to build correct transfer plans without
+    requiring dummy models.
     """
     my_global_rank = dist.get_rank()
     world_size = dist.get_world_size()
 
-    # Handle idle ranks (both modules are None)
-    if src_module is None and dst_module is None:
-        # Idle rank - provide empty metadata to collective operations
-        my_src_metadata = []
-        my_dst_metadata = []
-    else:
-        # Active rank - extract metadata from models
-        if src_module is None or dst_module is None:
-            raise ValueError(
-                "Both modules must be provided (or both must be None for idle ranks)"
-            )
-
-        # Get process groups
+    # Extract metadata from source model if present
+    if src_module is not None:
         src_pg = getattr(src_module, "pg_collection", None)
-        dst_pg = getattr(dst_module, "pg_collection", None)
-        if src_pg is None or dst_pg is None:
-            raise ValueError("Both modules must have pg_collection")
-
-        # Gather param metadata from all ranks
+        if src_pg is None:
+            raise ValueError("Source module must have pg_collection")
         my_src_params = {name: p for name, p in src_module.named_parameters(recurse=True)}
-        my_dst_params = {name: p for name, p in dst_module.named_parameters(recurse=True)}
-
-        # Build PP layer prefix maps to be used for parameter name rewriting
         src_layer_prefix_map = _build_layer_module_prefix_map(src_module)
-        dst_layer_prefix_map = _build_layer_module_prefix_map(dst_module)
-
         my_src_metadata = [
             extract_param_metadata(
                 p,
@@ -260,6 +258,17 @@ def build_centralized_reshard_plan(
             )
             for name, p in my_src_params.items()
         ]
+    else:
+        # No source model on this rank - provide empty metadata
+        my_src_metadata = []
+
+    # Extract metadata from destination model if present
+    if dst_module is not None:
+        dst_pg = getattr(dst_module, "pg_collection", None)
+        if dst_pg is None:
+            raise ValueError("Destination module must have pg_collection")
+        my_dst_params = {name: p for name, p in dst_module.named_parameters(recurse=True)}
+        dst_layer_prefix_map = _build_layer_module_prefix_map(dst_module)
         my_dst_metadata = [
             extract_param_metadata(
                 p,
@@ -271,8 +280,14 @@ def build_centralized_reshard_plan(
             )
             for name, p in my_dst_params.items()
         ]
+    else:
+        # No destination model on this rank - provide empty metadata
+        my_dst_metadata = []
 
-    # All ranks participate in collective operations (idle ranks provide empty lists)
+    # All ranks participate in collective operations
+    # - Source ranks provide src metadata, empty dst metadata
+    # - Destination ranks provide dst metadata, empty src metadata
+
     all_src_metadata_by_rank = [None] * world_size
     all_dst_metadata_by_rank = [None] * world_size
     dist.all_gather_object(all_src_metadata_by_rank, my_src_metadata)

@@ -57,6 +57,12 @@ class ParameterMetadata:
     data_parallel_group_ranks: list[int] | None = None
     pipeline_parallel_group_ranks: list[int] | None = None
 
+    # Local position within parallel groups (for non-collocated mode)
+    # These allow the planner to correctly map between source and destination ranks
+    # when they use different process group configurations (e.g., with rank_offset)
+    tensor_parallel_local_rank: int | None = None
+    expert_parallel_local_rank: int | None = None
+
     # Canonical name for matching parameters across models with different EP/PP configurations.
     #
     # - EP (expert parallel): each rank owns a subset of experts with local indices
@@ -296,6 +302,26 @@ def extract_param_metadata(
     else:
         pipeline_parallel_group_ranks = list(range(dist.get_world_size()))
 
+    # Compute local positions within parallel groups
+    # This enables non-collocated mode without dummy models by providing enough
+    # information for the planner to correctly map ranks between different PG configs
+    tensor_parallel_local_rank: int | None = None
+    expert_parallel_local_rank: int | None = None
+
+    if tensor_parallel_group_ranks is not None:
+        try:
+            tensor_parallel_local_rank = tensor_parallel_group_ranks.index(owner_rank)
+        except ValueError:
+            # owner_rank not in TP group (shouldn't happen, but be defensive)
+            pass
+
+    if expert_parallel_group_ranks is not None:
+        try:
+            expert_parallel_local_rank = expert_parallel_group_ranks.index(owner_rank)
+        except ValueError:
+            # owner_rank not in EP group (shouldn't happen, but be defensive)
+            pass
+
     meta = ParameterMetadata(
         name=param_name,
         shape=tuple(param.shape),
@@ -311,6 +337,8 @@ def extract_param_metadata(
         expert_parallel_group_ranks=expert_parallel_group_ranks,
         data_parallel_group_ranks=data_parallel_group_ranks,
         pipeline_parallel_group_ranks=pipeline_parallel_group_ranks,
+        tensor_parallel_local_rank=tensor_parallel_local_rank,
+        expert_parallel_local_rank=expert_parallel_local_rank,
     )
     assign_resolved_name_inplace(
         meta, layer_module_prefix_map=layer_module_prefix_map, base_name=param_name
@@ -324,8 +352,11 @@ def select_src_metadata_balanced(
 ) -> ParameterMetadata:
     """Choose a representative source `ParameterMetadata` for a destination rank.
 
-    Multiple source data-parallel (DP) groups may hold the same logical parameter.
-    To avoid always reading from the same group, we:
+    For non-collocated mode: First filters by matching TP/EP local rank to ensure
+    correct rank-to-rank mapping when source and destination use different process
+    group configurations (e.g., with rank_offset).
+
+    Then balances across data-parallel (DP) groups to distribute load:
       - bucket `src_meta_list` by their DP group (tuple of ranks)
       - if there is only one bucket, just return the first entry
       - otherwise, use the destination rank's global rank to select a source
@@ -334,6 +365,31 @@ def select_src_metadata_balanced(
     """
     if not src_meta_list:
         raise ValueError("src_meta_list must be non-empty")
+
+    # Filter by matching TP local rank (for non-collocated mode)
+    # This ensures we match corresponding TP shards even when source and destination
+    # use different global rank numbering (e.g., src=[0,1] dst=[4,5])
+    dst_tp_local = dst_metadata.tensor_parallel_local_rank
+    if dst_tp_local is not None:
+        print(f"[METADATA DEBUG] Dst rank {dst_rank}: tp_local={dst_tp_local}, looking for matching sources", flush=True)
+        print(f"[METADATA DEBUG]   Available sources: {[(m.owner_rank, m.tensor_parallel_local_rank) for m in src_meta_list]}", flush=True)
+        matching_tp = [m for m in src_meta_list
+                       if m.tensor_parallel_local_rank == dst_tp_local]
+        if matching_tp:
+            print(f"[METADATA DEBUG]   Found {len(matching_tp)} matches!", flush=True)
+            src_meta_list = matching_tp
+        else:
+            print(f"[METADATA DEBUG]   WARNING: No TP matches found! Using all sources.", flush=True)
+        # If no matches found, fall back to original list (shouldn't happen)
+
+    # Filter by matching EP local rank (for non-collocated mode with MoE)
+    dst_ep_local = dst_metadata.expert_parallel_local_rank
+    if dst_ep_local is not None:
+        matching_ep = [m for m in src_meta_list
+                       if m.expert_parallel_local_rank == dst_ep_local]
+        if matching_ep:
+            src_meta_list = matching_ep
+        # If no matches found, fall back to previous list (shouldn't happen)
 
     # Group source metadata by their DP group layout so we can balance across groups.
     #   (dp_rank0, dp_rank1, ...) -> [ParameterMetadata for that DP group]
@@ -355,7 +411,9 @@ def select_src_metadata_balanced(
     chosen_group = sorted_dp_groups[dst_rank % len(sorted_dp_groups)]
 
     # Within the chosen group, any representative metadata works; use the first.
-    return grouped_by_dp[chosen_group][0]
+    selected = grouped_by_dp[chosen_group][0]
+    print(f"[METADATA DEBUG]   Selected source rank {selected.owner_rank} for dst rank {dst_rank}", flush=True)
+    return selected
 
 
 logger = logging.getLogger(__name__)

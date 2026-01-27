@@ -24,26 +24,24 @@ def execute_reshard_plan(
     A communication service must be provided to abstract transport.
     Expected service API: submit_send(tensor, dest_rank), submit_recv(tensor, src_rank), run().
 
-    Supports None for both src_module and dst_module to allow idle ranks in non-collocated
-    mode to participate in collective operations without performing actual transfers.
+    Supports None for src_module and/or dst_module to allow ranks in non-collocated mode:
+    - src_module=None: Rank only receives data (destination-only)
+    - dst_module=None: Rank only sends data (source-only)
+    - Both provided: Rank participates in both send and recv (collocated mode)
     """
 
-    # Handle idle ranks (both modules are None)
-    if src_module is None and dst_module is None:
-        # Idle rank - just participate in barriers, no actual send/recv
-        logger.info("Idle rank: participating in barriers only (no send/recv)")
-        service.run()  # Empty run (no ops submitted)
-        dist.barrier()
-        logger.info("Idle rank: barriers complete")
-        return
+    # Extract parameters from models if present
+    src_params = {}
+    dst_params = {}
+    if src_module is not None:
+        src_params = {name: p for name, p in src_module.named_parameters(recurse=True)}
+    if dst_module is not None:
+        dst_params = {name: p for name, p in dst_module.named_parameters(recurse=True)}
 
-    # Active rank - extract parameters and execute plan
-    src_params = {name: p for name, p in src_module.named_parameters(recurse=True)}
-    dst_params = {name: p for name, p in dst_module.named_parameters(recurse=True)}
     submit_send_with_id = getattr(service, "submit_send_with_id", None)
     submit_recv_with_id = getattr(service, "submit_recv_with_id", None)
 
-    # Submit sends
+    # Submit sends (only if we have source model)
     for op in plan.send_ops:
         src_param = src_params.get(op.param_name)
         if src_param is not None:
@@ -53,7 +51,7 @@ def execute_reshard_plan(
             else:
                 service.submit_send(src_view, op.peer_rank)
 
-    # Submit recvs
+    # Submit recvs (only if we have destination model)
     recv_writebacks: List[Tuple[torch.Tensor, torch.nn.Parameter, tuple[slice, ...]]] = []
     for op in plan.recv_ops:
         dst_param = dst_params.get(op.param_name)
@@ -66,8 +64,7 @@ def execute_reshard_plan(
                 service.submit_recv(recv_buffer, op.peer_rank)
             recv_writebacks.append((recv_buffer, dst_param, op.my_slice))
 
-    # Execute
-    logger.info(f"Executing {len(plan.send_ops)} sends + {len(plan.recv_ops)} recvs")
+    # Execute - all ranks participate, even if they have no send/recv operations
     service.run()
     dist.barrier()
 

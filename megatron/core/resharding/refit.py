@@ -22,6 +22,23 @@ from .copy_services.nvshmem_copy_service import NVSHMEMCopyService
 # Supported refit backend names
 RefitBackendName = Literal["nccl", "gloo", "nvshmem"]
 
+# Global plan cache: maps rank -> ReshardPlan
+# This is simpler and more consistent than caching on model objects or mixing
+# model attributes with globals. All ranks cache in the same way.
+_plan_cache: dict[int, Any] = {}
+
+
+def clear_plan_cache():
+    """Clear the cached reshard plans.
+
+    Call this if you need to invalidate the cache, for example:
+    - When switching between different model configurations
+    - When model parallelism settings change
+    - To free memory after refit operations are complete
+    """
+    global _plan_cache
+    _plan_cache.clear()
+
 
 def swap_model_weights(
     src_model: LanguageModule,
@@ -59,48 +76,70 @@ def reshard_model_weights(
 ):
     """Reshard and copy model weights from ``src_model`` to ``target_model`` using ``service``.
 
-    Supports None for both src_model and target_model to allow idle ranks in non-collocated
-    mode to participate in collective operations without performing actual transfers.
+    Supports None for src_model and/or target_model to enable non-collocated mode:
+    - (src_model, target_model): Both models present (collocated mode)
+    - (src_model, None): Source rank - only sends data (non-collocated)
+    - (None, target_model): Destination rank - only receives data (non-collocated)
+    - (None, None): Idle rank - participates in collectives but has no transfers (non-collocated)
+
+    In non-collocated mode, metadata includes local rank positions within parallel groups,
+    allowing the planner to correctly map between different process group configurations
+    without requiring dummy models on every rank.
     """
-    # Early check for None models (idle ranks in non-collocated mode)
+    global _plan_cache
+    import torch.distributed as dist
+
+    # Handle idle ranks (both models None) - they participate in collectives but have no work
     if src_model is None and target_model is None:
-        # Idle rank - participate in collective operations but don't do actual work
-        plan = build_centralized_reshard_plan(None, None, num_experts=None)
+        rank = dist.get_rank()
+
+        # Use cached plan if available, otherwise build (with collective participation)
+        if rank not in _plan_cache:
+            plan = build_centralized_reshard_plan(None, None, num_experts=None)
+            _plan_cache[rank] = plan
+        else:
+            plan = _plan_cache[rank]
         execute_reshard_plan(plan, None, None, service=service)
         return
 
-    # At least one model must be provided for active ranks
-    if src_model is None or target_model is None:
-        raise ValueError(
-            "Both src_model and target_model must be provided (or both must be None for idle ranks)"
-        )
+    # Handle None models - extract core modules only from non-None models
+    src_core = None
+    tgt_core = None
+    num_experts = None
 
-    # Handle list-wrapped modules used throughout training utils
-    src_lm = src_model[0] if isinstance(src_model, (list, tuple)) else src_model
-    tgt_lm = target_model[0] if isinstance(target_model, (list, tuple)) else target_model
+    if src_model is not None:
+        # Handle list-wrapped modules
+        src_lm = src_model[0] if isinstance(src_model, (list, tuple)) else src_model
+        num_experts = src_lm.config.num_moe_experts
+        # Unwrap to get owning modules (with parameters and pg_collection)
+        src_core = unwrap_model(src_lm)
+        # Ensure pg_collection exists
+        if not hasattr(src_core, "pg_collection") or src_core.pg_collection is None:
+            raise RuntimeError("Source model missing pg_collection required for reshard")
+        # Fill missing DP group on the source using Megatron's parallel state if not provided
+        if getattr(src_core.pg_collection, "dp", None) is None:
+            src_core.pg_collection.dp = parallel_state.get_data_parallel_group()
 
-    num_experts = src_lm.config.num_moe_experts
+    if target_model is not None:
+        # Handle list-wrapped modules
+        tgt_lm = target_model[0] if isinstance(target_model, (list, tuple)) else target_model
+        if num_experts is None:
+            num_experts = tgt_lm.config.num_moe_experts
+        # Unwrap to get owning modules (with parameters and pg_collection)
+        tgt_core = unwrap_model(tgt_lm)
+        # Ensure pg_collection exists
+        if not hasattr(tgt_core, "pg_collection") or tgt_core.pg_collection is None:
+            raise RuntimeError("Target model missing pg_collection required for reshard")
 
-    # Unwrap to get owning modules (with parameters and pg_collection)
-    src_core = unwrap_model(src_lm)
-    tgt_core = unwrap_model(tgt_lm)
+    # Build or retrieve cached plan
+    # Use rank-based cache - simpler and more consistent than model attributes
+    rank = dist.get_rank()
 
-    # Ensure pg_collection exists
-    if not hasattr(src_core, "pg_collection") or src_core.pg_collection is None:
-        raise RuntimeError("Source model missing pg_collection required for NCCL reshard")
-    if not hasattr(tgt_core, "pg_collection") or tgt_core.pg_collection is None:
-        raise RuntimeError("Target model missing pg_collection required for NCCL reshard")
-
-    # Fill missing DP group on the source using Megatron's parallel state if not provided
-    if getattr(src_core.pg_collection, "dp", None) is None:
-        src_core.pg_collection.dp = parallel_state.get_data_parallel_group()
-
-    # caching plan for reuse
-    cached_plan: Optional[Any] = getattr(tgt_core, "_cached_reshard_plan", None)
-    if cached_plan is None:
+    if rank not in _plan_cache:
+        # All ranks must participate in planning (collective operations)
         plan = build_centralized_reshard_plan(src_core, tgt_core, num_experts=num_experts)
-        setattr(tgt_core, "_cached_reshard_plan", plan)
+        _plan_cache[rank] = plan
     else:
-        plan = cached_plan
+        plan = _plan_cache[rank]
 
     execute_reshard_plan(plan, src_core, tgt_core, service=service)
