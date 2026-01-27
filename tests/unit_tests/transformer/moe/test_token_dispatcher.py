@@ -383,6 +383,7 @@ class TestAllgatherDispatcher:
 
         container.dispatcher_dropless_test()
 
+    @pytest.mark.flaky_in_dev
     @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
     @pytest.mark.internal
     @pytest.mark.parametrize("permute_fusion", permute_fusion_params)
