@@ -37,7 +37,9 @@ uv venv ${UV_PROJECT_ENVIRONMENT} --system-site-packages
 uv sync --locked --only-group build
 uv sync --locked --link-mode copy --all-extras --all-groups
 
-uv cache prune
+uv pip install --no-deps -e .
+
+source ${UV_PROJECT_ENVIRONMENT}/bin/activate
 ```
 
 ### Setup Environment
@@ -48,17 +50,21 @@ git clone https://github.com/NVIDIA/Megatron-LM.git "$HOST_MEGATRON_LM_DIR"
 cd "$HOST_MEGATRON_LM_DIR"
 ```
 
+```bash
+export HF_TOKEN={your_hf_token_here}
+```
+
 ## Step 1: Convert HuggingFace to Megatron (Optional - skip if you already have a Megatron checkpoint)
 
-Set `--nproc-per-node` to be the number of GPUs per node. Set `hf_model_name` to be the Huggingface model. E.g. `openai/gpt-oss-20b`
+Set `--nproc-per-node` to be the number of GPUs per node. Set `hf_model_name` to be the Huggingface model e.g. `openai/gpt-oss-20b`
 
 ```bash
-torchrun --nproc-per-node=8 examples/gptoss/01_convert_from_hf.py --hf-model openai/gpt-oss-20b
+python3 -m torch.distributed.launch --nproc-per-node=8 examples/gptoss/01_convert_from_hf.py --hf-model openai/gpt-oss-20b
 ```
 
 ## Step 2: Train from Scratch
 
-To train from scratch first follow the steps below to setup the environment appropriately before running the training script in docker.
+To train from scratch first follow the steps below to setup the environment appropriately before running the training script in docker. Even though we are running the same container as before, it is better to restart the container to ensure a clean environment and that all environment and docker variables are set correctly.
 
 ### Setup Environment
 

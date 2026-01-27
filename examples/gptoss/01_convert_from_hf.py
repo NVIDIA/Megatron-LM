@@ -20,6 +20,7 @@ def _parse_args():
         default=None,
         help="Path to save the converted Megatron checkpoint",
     )
+    parser.add_argument('--local-rank', '--local_rank', type=int, default=0)
     return parser.parse_args()
 
 if __name__ == "__main__":
