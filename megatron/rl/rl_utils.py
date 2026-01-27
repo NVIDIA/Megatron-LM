@@ -26,6 +26,7 @@ from megatron.core import mpu
 from megatron.core.datasets.megatron_tokenizer import MegatronLegacyTokenizer
 from megatron.core.full_cuda_graph import FullCudaGraphWrapper
 from megatron.core.models.common.language_module.language_module import LanguageModule
+from megatron.core.distributed import offload_grad_data, onload_grad_data
 from megatron.core.optimizer import MegatronOptimizer
 from megatron.core.pipeline_parallel import get_forward_backward_func
 from megatron.core.pipeline_parallel.utils import is_pp_last_stage, get_pp_last_rank
@@ -103,10 +104,8 @@ def _maybe_prefetch_separate_inference_model_weights(model_core, *, to_cpu: bool
         return
 
     device = -1 if to_cpu else int(torch.cuda.current_device())
-    # Note: include_buffers=False because buffers created with explicit device= in register_buffer()
-    # are not allocated via the UVM mempool and will fail UVM operations. Only parameters are UVM-allocated.
-    advise_managed_module_parameters_preferred_location(model_core, device=device, include_buffers=False)
-    nbytes = prefetch_managed_module_parameters(model_core, device=device, include_buffers=False)
+    advise_managed_module_parameters_preferred_location(model_core, device=device, include_buffers=True)
+    nbytes = prefetch_managed_module_parameters(model_core, device=device, include_buffers=True)
     # Ensure pages are resident before we enter CUDA-graph capture / inference, or before training continues.
     torch.cuda.synchronize()
 
@@ -460,11 +459,6 @@ def get_environment_rollouts(
 
     # If we have seperate training and inference models we to refit weights from the training model to the inference model.
     if inference_model is not None:
-        if args.rl_offload_optimizer_during_inference:
-            with nvtx_range("offload-optimizer-before-refit"):
-                optimizer.offload_to_cpu()
-                torch.cuda.empty_cache()
-
         # If the separate inference model weights were prefetched to CPU while idle, bring them
         # back to GPU before refit/copy and before any CUDA-graph'd inference.
         with nvtx_range("prefetch-inference-model-weights-to-gpu"):
@@ -1607,6 +1601,7 @@ def megatron_rl_inference_mode(
         if offload_optimizer_during_inference:
             with nvtx_range("offload-optimizer-before-inference"):
                 optimizer.offload_to_cpu()
+                offload_states = offload_grad_data(model[0], optimizer)
 
         # TODO: Remove this if statement once a change to `toggle_cuda_graphs` makes it safe to.
         if cuda_graph_impl != "none" and not args.rl_training_cuda_graphs:
@@ -1669,6 +1664,7 @@ def megatron_rl_inference_mode(
         if offload_optimizer_during_inference:
             with nvtx_range("onload-optimizer-after-inference"):
                 optimizer.restore_from_cpu()
+                onload_grad_data(model[0], offload_states, optimizer)
 
         lang_module.train()
 
