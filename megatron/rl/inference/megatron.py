@@ -22,7 +22,6 @@ from megatron.core.inference.text_generation_controllers.text_generation_control
 from megatron.core.models.gpt.gpt_model import GPTModel
 from megatron.core.transformer.module import MegatronModule
 from megatron.core.utils import get_attr_wrapped_model, log_single_rank
-from megatron.inference.utils import get_dynamic_inference_engine
 from megatron.training import get_wandb_writer
 from megatron.training.global_vars import get_args, get_tokenizer
 
@@ -68,6 +67,7 @@ def get_static_inference_engine(args: Namespace, model: MegatronModule) -> Abstr
             args.inference_max_requests if args.inference_max_requests is not None else 1
         ),
     )
+
 
 class MegatronLocal(InferenceServer, ReturnsTokens, ReturnsRaw):
     """Interface to use MCoreEngine directly as an inference engine."""
@@ -121,6 +121,9 @@ class MegatronLocal(InferenceServer, ReturnsTokens, ReturnsRaw):
 
     @classmethod
     async def launch(cls, model: GPTModel, **kwargs):
+        # Import here to avoid circular imports
+        from megatron.inference.utils import get_dynamic_inference_engine
+
         args = get_args()
         tokenizer = get_tokenizer()
 
@@ -131,7 +134,7 @@ class MegatronLocal(InferenceServer, ReturnsTokens, ReturnsRaw):
                 "WARNING: Tokenizer has no BOS token so prompt will not have BOS token",
             )
 
-        inference_engine: DynamicInferenceEngine = get_dynamic_inference_engine()
+        inference_engine: DynamicInferenceEngine = get_dynamic_inference_engine(model=model)
         await inference_engine.start_listening_to_data_parallel_coordinator(
             inference_coordinator_port=41521, launch_inference_coordinator=True
         )
