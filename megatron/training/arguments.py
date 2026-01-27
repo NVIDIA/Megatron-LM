@@ -123,7 +123,7 @@ def parse_args(extra_args_provider=None, ignore_unknown_args=False):
     if not args.enable_msc:
         MultiStorageClientFeature.disable()
         assert MultiStorageClientFeature.is_enabled() is False
-        print('WARNING: The MSC feature is disabled.')
+        warn_rank_0('The MSC feature is disabled.')
 
     return args
 
@@ -463,17 +463,16 @@ def validate_args(args, defaults={}):
             assert args.micro_batch_size == 1, \
                 "micro_batch_size must be 1 when using sequence packing. To increase compute per micro batch increase the sequence length."
 
-    if args.rank == 0:
-        print('using world size: {}, data-parallel size: {}, '
-              'context-parallel size: {}, '
-              'hierarchical context-parallel sizes: {}, '
-              'tensor-model-parallel size: {}, '
-              'pipeline-model-parallel size: {}'.format(
-                  args.world_size, args.data_parallel_size,
-                  args.context_parallel_size,
-                  args.hierarchical_context_parallel_sizes,
-                  args.tensor_model_parallel_size,
-                  args.pipeline_model_parallel_size), flush=True)
+    print_rank_0('using world size: {}, data-parallel size: {}, '
+                 'context-parallel size: {}, '
+                 'hierarchical context-parallel sizes: {}, '
+                 'tensor-model-parallel size: {}, '
+                 'pipeline-model-parallel size: {}'.format(
+                     args.world_size, args.data_parallel_size,
+                     args.context_parallel_size,
+                     args.hierarchical_context_parallel_sizes,
+                     args.tensor_model_parallel_size,
+                     args.pipeline_model_parallel_size))
 
     # Checks.
 
@@ -499,9 +498,8 @@ def validate_args(args, defaults={}):
     del args.model_parallel_size
 
     if args.checkpoint_activations:
-        if args.rank == 0:
-            print('--checkpoint-activations is no longer valid, use --recompute-activations, '
-                  'or, for more control, --recompute-granularity and --recompute-method.')
+        print_rank_0('--checkpoint-activations is no longer valid, use --recompute-activations, '
+                     'or, for more control, --recompute-granularity and --recompute-method.')
         exit()
     del args.checkpoint_activations
 
@@ -537,19 +535,16 @@ def validate_args(args, defaults={}):
         # arguments that are passed to the program. We check this by
         # ensuring the arg is set to None.
         if getattr(args, key, None) is not None:
-            if args.rank == 0:
-                print('WARNING: overriding default arguments for {key}:{v} \
-                       with {key}:{v2}'.format(key=key, v=defaults[key],
-                                               v2=getattr(args, key)),
-                                               flush=True)
+            warn_rank_0('Overriding default arguments for {key}:{v} '
+                        'with {key}:{v2}'.format(key=key, v=defaults[key],
+                                                 v2=getattr(args, key)))
         else:
             setattr(args, key, defaults[key])
 
     if args.data_path is not None and args.split is None:
         legacy_default_split_value = '969, 30, 1'
-        if args.rank == 0:
-            print('WARNING: Please specify --split when using --data-path. Using legacy default value '
-                  f'of "{legacy_default_split_value}"')
+        warn_rank_0('Please specify --split when using --data-path. Using legacy default value '
+                    f'of "{legacy_default_split_value}"')
         args.split = legacy_default_split_value
 
     use_data_path = (args.data_path is not None) or (args.data_args_path is not None)
@@ -577,9 +572,7 @@ def validate_args(args, defaults={}):
     assert args.micro_batch_size > 0
     if args.global_batch_size is None:
         args.global_batch_size = args.micro_batch_size * args.data_parallel_size
-        if args.rank == 0:
-            print('setting global batch size to {}'.format(
-                args.global_batch_size), flush=True)
+        print_rank_0('setting global batch size to {}'.format(args.global_batch_size))
     assert args.global_batch_size > 0
 
     # Uneven virtual pipeline parallelism
@@ -673,8 +666,9 @@ def validate_args(args, defaults={}):
                 'since non-interleaved schedule does not support overlapping p2p communication '
                 'and aligned param AG')
 
-    if args.rank == 0:
-        print(f"Number of virtual stages per pipeline stage: {args.virtual_pipeline_model_parallel_size}")
+    print_rank_0(
+        f"Number of virtual stages per pipeline stage: {args.virtual_pipeline_model_parallel_size}"
+    )
 
     if args.overlap_param_gather:
         assert args.use_distributed_optimizer or args.use_megatron_fsdp, \
@@ -788,9 +782,8 @@ def validate_args(args, defaults={}):
         # where NaNs in grads / loss are signal to the loss scaler.
         if not args.loss_scale:
             args.check_for_nan_in_loss_and_grad = False
-            if args.rank == 0:
-                print('WARNING: Setting args.check_for_nan_in_loss_and_grad to False since '
-                      'dynamic loss scaling is being used')
+            warn_rank_0('Setting args.check_for_nan_in_loss_and_grad to False since '
+                        'dynamic loss scaling is being used')
     if args.bf16:
         assert not args.fp16
         args.params_dtype = torch.bfloat16
@@ -804,9 +797,7 @@ def validate_args(args, defaults={}):
             args.accumulate_allreduce_grads_in_fp32 = False
         elif not args.accumulate_allreduce_grads_in_fp32 and args.main_grads_dtype == torch.float32:
             args.accumulate_allreduce_grads_in_fp32 = True
-            if args.rank == 0:
-                print('accumulate and all-reduce gradients in fp32 for '
-                      'bfloat16 data type.', flush=True)
+            print_rank_0('accumulate and all-reduce gradients in fp32 for bfloat16 data type.')
     if args.cuda_graph_impl == "local" and CudaGraphScope.full_iteration in args.cuda_graph_scope:
         if not args.inference_dynamic_batching:
             assert not args.check_for_nan_in_loss_and_grad, \
@@ -815,9 +806,7 @@ def validate_args(args, defaults={}):
             assert args.fp8 is None, \
             "fp8 is not supported with inference dynamic batching and full_iteration CUDA graph"
 
-    if args.rank == 0:
-        print('using {} for parameters ...'.format(args.params_dtype),
-              flush=True)
+    print_rank_0('using {} for parameters ...'.format(args.params_dtype))
 
     if args.dataloader_type is None:
         args.dataloader_type = 'single'
@@ -963,10 +952,9 @@ def validate_args(args, defaults={}):
     # Persistent fused layer norm.
     if not is_torch_min_version("1.11.0a0"):
         args.no_persist_layer_norm = True
-        if args.rank == 0:
-            print('Persistent fused layer norm kernel is supported from '
-                  'pytorch v1.11 (nvidia pytorch container paired with v1.11). '
-                  'Defaulting to no_persist_layer_norm=True')
+        print_rank_0('Persistent fused layer norm kernel is supported from '
+                     'pytorch v1.11 (nvidia pytorch container paired with v1.11). '
+                     'Defaulting to no_persist_layer_norm=True')
 
     # Activation recomputing.
     if args.distribute_saved_activations:
@@ -1118,8 +1106,7 @@ def validate_args(args, defaults={}):
         args.num_experts = None
     if args.num_experts is not None and args.moe_ffn_hidden_size is None:
         args.moe_ffn_hidden_size = args.ffn_hidden_size
-        if args.rank == 0:
-            print("Warning: moe_ffn_hidden_size is not set, using ffn_hidden_size for MoE instead.")
+        warn_rank_0("moe_ffn_hidden_size is not set, using ffn_hidden_size for MoE instead.")
 
     # Context parallel
     if args.context_parallel_size > 1:
@@ -1241,11 +1228,10 @@ def validate_args(args, defaults={}):
 
     if args.use_dist_ckpt and args.async_save:
         if not args.use_persistent_ckpt_worker:
-            if args.rank == 0:
-                print(
-                    'Warning: --async-save is not supported without --use-persistent-ckpt-worker. '
-                    'Disabling --async-save.'
-                )
+            warn_rank_0(
+                '--async-save is not supported without --use-persistent-ckpt-worker. '
+                'Disabling --async-save.'
+            )
             args.async_save = False
 
     # Inference args
@@ -1269,18 +1255,15 @@ def validate_args(args, defaults={}):
         assert args.save is not None, "When using upcycling, the --save option must be specified."
         if not args.no_load_optim:
             args.no_load_optim = True
-            if args.rank == 0:
-                print('Warning: enabling --no-load-optim for upcycling.')
+            warn_rank_0('enabling --no-load-optim for upcycling.')
         if not args.no_load_rng:
             args.no_load_rng = True
-            if args.rank == 0:
-                print('Warning: enabling --no-load-rng for upcycling.')
+            warn_rank_0('enabling --no-load-rng for upcycling.')
 
     # --skip-train checks.
     if args.skip_train and not args.no_load_optim:
         args.no_load_optim = True
-        if args.rank == 0:
-            print('Warning: enabling --no-load-optim when skipping training.')
+        warn_rank_0('enabling --no-load-optim when skipping training.')
 
     # Muon optimizer check
     if 'muon' in args.optimizer:
@@ -1311,7 +1294,7 @@ def validate_args(args, defaults={}):
         assert args.replication_jump is not None, "--replication requires the value of --replication-jump!"
         assert args.non_persistent_ckpt_type == "local", f"--replication requires args.non_persistent_ckpt_type == 'local', but got: {args.non_persistent_ckpt_type}"
     elif args.replication_jump:
-        print("Warning: --replication-jump was specified despite not using replication. Ignoring.")
+        warn_rank_0("--replication-jump was specified despite not using replication. Ignoring.")
         args.replication_jump = None
 
     if args.delay_wgrad_compute:
@@ -1395,17 +1378,16 @@ def validate_args(args, defaults={}):
 
 def _print_args(title, args):
     """Print arguments."""
-    if args.rank == 0:
-        print(f'------------------------ {title} ------------------------',
-              flush=True)
+    from megatron.training.utils import is_rank0
+    if is_rank0():
+        print(f'------------------------ {title} ------------------------', flush=True)
         str_list = []
         for arg in vars(args):
             dots = '.' * (48 - len(arg))
             str_list.append('  {} {} {}'.format(arg, dots, getattr(args, arg)))
         for arg in sorted(str_list, key=lambda x: x.lower()):
             print(arg, flush=True)
-        print(f'-------------------- end of {title} ---------------------',
-              flush=True)
+        print(f'-------------------- end of {title} ---------------------', flush=True)
 
 
 def _check_arg_is_not_none(args, arg):
