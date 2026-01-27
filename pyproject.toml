@@ -95,6 +95,7 @@ moe = [
     "nv-grouped-gemm~=1.1",
 ]
 
+
 # Optional AMem NCCL plugin for memory offloading in RL scenarios
 amem = []
 
@@ -241,7 +242,7 @@ select = ["S506"]
 
 # - On top of the Google convention, disable `D417`, which requires
 #   documentation for every function parameter.
-# - F841: local variable assigned but never used (exluced to favor readability)
+# - F841: local variable assigned but never used (exluded to favor readability)
 # TODO: Remove D10 once we are about to release to get all the docstrings written
 ignore = ["D417", "D10", "F841"]
 
