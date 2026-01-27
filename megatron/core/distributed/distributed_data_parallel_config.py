@@ -124,7 +124,7 @@ class DistributedDataParallelConfig:
       This option will be automatically set to True when nccl_ub=True.
     """
 
-    fsdp_db_use_persist_buf_on_alloc_fail: bool = True
+    fsdp_db_use_persist_buf_on_alloc_fail: bool = False
     """Whether to fall back to persistent buffer when a bucket does not
        fit FSDP double buffer size. If true, FSDP will use the persistently 
        allocated buffer for the bucket that does not fit, it will enable NCCL 
