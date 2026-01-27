@@ -174,7 +174,6 @@ runs:
           --environment dev \
           --platform dgx_h100 \
           --container-image ${{ inputs.container-image }} \
-          --n-repeat ${{ inputs.n-repeat }} \
           --data-dir /mnt/datadrive/TestData/megatron-lm/artifacts \
 
         RUN_TEST_EOF

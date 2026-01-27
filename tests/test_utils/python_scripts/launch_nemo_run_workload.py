@@ -117,7 +117,7 @@ def main(
             "PYTHONUNBUFFERED": "1",
             "OUTPUT_PATH": os.getcwd(),
             "ENABLE_LIGHTWEIGHT_MODE": str(enable_lightweight_mode).lower(),
-            "N_REPEAT": n_repeat,
+            "N_REPEAT": str(n_repeat),
             "CLUSTER": "dgxh100_dgxc",
         },
         packager=run.Packager(),
