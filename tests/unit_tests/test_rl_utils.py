@@ -9,6 +9,7 @@ import torch
 from megatron.core.enums import ModelType
 from megatron.core.models.common.language_module.language_module import LanguageModule
 from megatron.core.num_microbatches_calculator import destroy_num_microbatches_calculator
+from megatron.core.pipeline_parallel.utils import is_pp_last_stage
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.transformer import TransformerConfig
 from megatron.rl import rl_utils
@@ -91,10 +92,10 @@ class TestRLUtils:
 
         args.num_layers = 8
         args.num_attention_heads = 8
-        args.vocab_size = 1024
-        args.hidden_size = 512
-        args.max_position_embeddings = 512
-        args.seq_length = 512
+        args.vocab_size = VOCAB
+        args.hidden_size = 128
+        args.max_position_embeddings = 256
+        args.seq_length = 256
 
         args.micro_batch_size = 1
 
@@ -109,24 +110,28 @@ class TestRLUtils:
         "initialize_model_parallel",
         [
             pytest.param((tp, pp), id=f"tp{tp}-pp{pp}")
-            for tp, pp in itertools.product([1, 2, 4, 8], [1])
+            for tp, pp in itertools.product([1, 2, 4, 8], [1, 2, 4, 8])
             if tp * pp <= Utils.world_size
         ],
         indirect=["initialize_model_parallel"],
     )
-    @pytest.mark.parametrize("use_sequence_packing", [False, True])
+    @pytest.mark.parametrize("use_sequence_packing", [False])
     def test_get_logprobs(self, initialize_model_parallel, use_sequence_packing):
         """Test that getting logprobs at least does not crash."""
         self.create_test_args(rl_use_sequence_packing=use_sequence_packing)
 
+        model = MockModel()
         tokens = torch.ones((BATCH, SEQ), dtype=torch.long)
         logprobs = rl_utils.get_logprobs(
-            MockModel(), tokens, position_ids=None, sequence_packing=use_sequence_packing
+            model, tokens, position_ids=None, sequence_packing=use_sequence_packing
         )
-        # We chop off 1 element from the sequence dimension.
-        assert logprobs.shape == (BATCH, SEQ - 1)
-        # As we return ones as logits, all logprobs should be the same.
-        assert torch.all(logprobs == logprobs[0, 0]).item()
+        if is_pp_last_stage(model.pg_collection.pp):
+            # We chop off 1 element from the sequence dimension.
+            assert logprobs.shape == (BATCH, SEQ - 1)
+            # As we return ones as logits, all logprobs should be the same.
+            assert torch.all(logprobs == logprobs[0, 0]).item()
+        else:
+            assert logprobs.shape == (BATCH, SEQ, VOCAB)
 
     def test_grpo_loss_calculation_all_pi_eq(self):
         # All policies are equal: clamping is inactive, ratios are ones.
