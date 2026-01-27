@@ -63,6 +63,17 @@ try:
     has_rl_utils = True
 except ImportError:
     has_rl_utils = False
+
+try:
+    from megatron.rl.rl_profiling import (
+        initialize_rl_profiler,
+        log_iteration_profile,
+        shutdown_rl_profiler,
+        get_rl_profiler,
+    )
+    has_rl_profiling = True
+except ImportError:
+    has_rl_profiling = False
 from megatron.rl.parallel_utils import build_inference_pg_collection
 try:
     from modelopt.torch.distill.plugins.megatron import (
@@ -1024,6 +1035,30 @@ def pretrain(
         # Add job name to the wandb config to make it easier to run more singleton dependency jobs.
         wandb_writer.config.update({'slurm_job_name': os.getenv("SLURM_JOB_NAME", "N/A")})
 
+    # Initialize RL profiler if enabled
+    if has_rl_profiling and getattr(args, 'rl_profile', False):
+        # Determine output directory: use rl_profile_dir, or save/profiles, or ./profiles
+        profile_dir = getattr(args, 'rl_profile_dir', None)
+        if profile_dir is None:
+            if args.save:
+                profile_dir = os.path.join(args.save, 'profiles')
+            else:
+                profile_dir = './profiles'
+        
+        # Generate run ID from job name or timestamp
+        run_id = os.getenv("SLURM_JOB_ID", None)
+        if run_id is None:
+            run_id = datetime.now().strftime("%Y%m%d_%H%M%S")
+        
+        initialize_rl_profiler(
+            output_dir=profile_dir,
+            run_id=run_id,
+            enabled=True,
+            log_to_wandb=(wandb_writer is not None),
+            log_to_tensorboard=(get_tensorboard_writer() is not None),
+        )
+        print_rank_0(f'[RLProfiler] Profiling enabled, output: {profile_dir}')
+
     if not args.skip_train:
         print_rank_0('training ...')
 
@@ -1853,14 +1888,40 @@ def training_log(
         ])
     # Add timers from RL loop if needed.
     if getattr(args, 'perform_rl_step', False):
-        timers_to_log.extend(['rollout-collection', 'inference-setup', 'collect-rollouts', 'postrollout-gc-collect',
-                              'sync-rollouts', 'prepare-data-for-update', 'compute-group-stats',
-                              'prepare-trajectories', 'get-ltor-masks-and-position-ids', 'create-logprobs-dataloader',
-                              'compute-logprobs', 'compute-ref-logprobs', 'compute-prob-stats',
-                              'prepare-advantages', 'create-dataloader', 'log-wandb-tb',
-                              'offload-optimizer-before-inference', 'onload-kv-cache-before-inference',
-                              'wait-for-decode-only', 'build-cuda-graphs', 'suspend-engine',
-                              'offload-kv-cache-after-inference', 'onload-optimizer-after-inference'])
+        timers_to_log.extend([
+            # Top-level RL phases
+            'rl/rollout-collection',
+            'rl/prepare-data-for-update',
+            # Rollout collection breakdown
+            'rl/inference-setup',
+            'rl/collect-rollouts',
+            'rl/sync-rollouts',
+            'rl/suspend-engine',
+            # Optimizer offload/onload
+            'rl/offload-optimizer-before-inference',
+            'rl/onload-optimizer-after-inference',
+            'rl/offload-kv-cache-after-inference',
+            'rl/onload-kv-cache-before-inference',
+            # Weight prefetching
+            'rl/prefetch-weights-to-gpu',
+            'rl/prefetch-weights-to-cpu',
+            # Data preparation
+            'rl/compute-group-stats',
+            'rl/prepare-advantages',
+            'rl/prepare-trajectories',
+            'rl/get-ltor-masks',
+            'rl/create-dataloader',
+            'rl/sequence-packing',
+            'rl/align-inference-logprobs',
+            'rl/log-wandb-tb',
+            # Logprobs computation
+            'rl/compute-logprobs',
+            'rl/compute-old-logprobs',
+            'rl/compute-ref-logprobs',
+            'rl/get-logprobs',
+            'rl/forward-pass',
+            'rl/log-softmax',
+        ])
 
     # Calculate batch size.
     batch_size = args.micro_batch_size * args.data_parallel_size * get_num_microbatches()
@@ -2103,6 +2164,28 @@ def training_log(
             timers.write(timers_to_log, wandb_writer, iteration, normalizer=args.log_interval, reset=False)
         # Log timers to stdout
         timers.log(timers_to_log, normalizer=args.log_interval, reset=should_reset)
+
+        # Log RL profiling data if enabled
+        if has_rl_profiling and getattr(args, 'rl_profile', False):
+            # Compute tokens/sec metrics
+            tokens_per_sec = None
+            tokens_per_sec_per_gpu = None
+            if hasattr(args, 'seq_length') and args.seq_length > 0:
+                tokens_per_iteration = batch_size * args.seq_length
+                tokens_per_sec = tokens_per_iteration / elapsed_time_per_iteration
+                tokens_per_sec_per_gpu = tokens_per_sec / args.world_size
+
+            log_iteration_profile(
+                iteration=iteration,
+                timers=timers,
+                elapsed_time_ms=elapsed_time_per_iteration * 1000.0,
+                throughput_tflops=throughput if args.log_throughput else None,
+                global_batch_size=batch_size,
+                tokens_per_sec=tokens_per_sec,
+                tokens_per_sec_per_gpu=tokens_per_sec_per_gpu,
+                wandb_writer=wandb_writer,
+                tb_writer=writer,
+            )
 
     return report_memory_flag
 
@@ -3008,6 +3091,10 @@ def train(
         total_energy = energy_monitor.get_total()
         print_rank_0(f"Total training energy (GPU): {total_energy / 1e6} MJ")
         energy_monitor.shutdown()
+
+    # Shutdown RL profiler and export summary
+    if has_rl_profiling and getattr(args, 'rl_profile', False):
+        shutdown_rl_profiler()
 
     # If any exit conditions (signal handler, duration, iterations) have been reached, exit.
     if should_exit:
