@@ -3623,7 +3623,7 @@ class AllGatherPipeline:
 
         if lazy:
             # Mark the bucket can be released later.
-            self.bucket_can_be_released[bucket_id] = True
+            self.bucket_can_be_released[bucket_key] = True
             return
 
         self.wait_bucket_ready(bucket_id, bwd, empty_ok=True)
