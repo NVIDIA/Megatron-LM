@@ -19,6 +19,9 @@ class DistributedDataParallelConfig:
     overlap_param_gather: bool = False
     """If true, overlap param all-gather with forward compute."""
 
+    check_for_nan_in_grad: bool = False
+    """If True, check for NaNs and Infs in gradients _before_ communication collective."""
+
     bucket_size: Optional[int] = None
     """Maximum number of parameters in each bucket. If unspecified, MCore uses a default
        value of max(40000000, 1000000 * dp_size) parameters (larger DP sizes need larger
