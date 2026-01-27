@@ -50,7 +50,9 @@ def is_flaky_failure(concat_allranks_logs: str) -> bool:
 @click.option("--environment", required=True, type=str, help="Environment of the workload")
 @click.option("--platform", required=True, type=str, help="Platform of the workload")
 @click.option("--container-image", required=True, type=str, help="Container image of the workload")
-@click.option("--n-repeat", required=False, type=int, help="Number of times to repeat the workload", default=1)
+@click.option(
+    "--n-repeat", required=False, type=int, help="Number of times to repeat the workload", default=1
+)
 @click.option("--data-dir", required=False, type=str, help="Data directory of the workload")
 @click.option("--tag", required=False, type=str, help="Tag of the workload")
 @click.option(
