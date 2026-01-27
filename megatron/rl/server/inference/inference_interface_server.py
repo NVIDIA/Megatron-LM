@@ -11,10 +11,10 @@ from pydantic import Field, PrivateAttr
 from typing_extensions import Self
 from uvicorn import Config, Server
 
-from ...inference.api import ChatInferenceRequest, ChatInferenceResponse
 from ...inference.inference_interface import (
-    ChatInferenceInterface,
     InferenceInterface,
+    InferenceRequest,
+    InferenceResponse,
     ReturnsRaw,
     ReturnsTokens,
 )
@@ -22,18 +22,18 @@ from ...server.api import InferenceServer
 
 
 @InferenceServer.register_subclass
-class InferenceInterfaceClient(ChatInferenceInterface, InferenceServer):
+class InferenceInterfaceClient(InferenceServer):
     type_name: str = Field(default='InferenceInterfaceClient', frozen=True)
     env_server_host_port: str
     conversation_template: None = None
 
-    async def base_generate(self, request: ChatInferenceRequest) -> list[ChatInferenceResponse]:
+    async def base_generate(self, request: InferenceRequest) -> list[InferenceResponse]:
         async with httpx.AsyncClient(timeout=None) as client:
             response = await client.post(
                 f"http://{self.env_server_host_port}/base_generate/", json=request.model_dump()
             )
             return [
-                ChatInferenceResponse.model_validate(inference_response)
+                InferenceResponse.model_validate(inference_response)
                 for inference_response in response.json()
             ]
 
@@ -69,7 +69,7 @@ class InferenceInterfaceServer(InferenceInterfaceClient, ReturnsRaw, ReturnsToke
         server_ref = weakref.ref(launched_server)
 
         @app.post("/base_generate/")
-        async def base_generate(request: ChatInferenceRequest):
+        async def base_generate(request: InferenceRequest):
             server = server_ref()
             if server is None:
                 raise RuntimeError("Server has been garbage collected")

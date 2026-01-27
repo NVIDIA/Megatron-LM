@@ -3,7 +3,6 @@
 import re
 import traceback
 
-from megatron.rl.agent.pass_at_evaluation_agent import PassAtEvaluationAgent
 from megatron.rl.agent.reward_only_agent import RewardOnlyAgent
 
 try:

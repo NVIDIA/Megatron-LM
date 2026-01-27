@@ -90,6 +90,9 @@ except ImportError:
     HAVE_PSUTIL = False
 
 
+logger = logging.getLogger(__name__)
+
+
 class EngineSuspendedError(Exception):
     """Engine is currently suspended and not performing steps."""
 
@@ -738,6 +741,7 @@ class DynamicInferenceEngine(AbstractEngine):
         if request.status != Status.FAILED:
             self.waiting_request_ids.append(request_id)
         else:
+            logger.error(f"Request {request_id} failed to add to engine. {request.events}")
             self.failed_request_ids.append(request_id)
 
         return self.requests[request_id].future
