@@ -19,7 +19,11 @@ from megatron.core.parallel_state import destroy_model_parallel
 from megatron.post_training.arguments import add_modelopt_args
 from megatron.post_training.checkpointing import load_modelopt_checkpoint
 from megatron.post_training.model_builder import modelopt_gpt_mamba_builder
-from megatron.post_training.utils import report_current_memory_info, to_empty_if_meta
+from megatron.post_training.utils import (
+    modelopt_version_at_least,
+    report_current_memory_info,
+    to_empty_if_meta,
+)
 from megatron.training import get_args, get_tokenizer
 from megatron.training.checkpointing import save_checkpoint
 from megatron.training.initialize import initialize_megatron
@@ -50,8 +54,11 @@ def add_convert_args(parser):
         help='Chosing between different speculative decoding algorithms. Default is None.',
     )
     group.add_argument(
-        "--eagle-config", type=str, default=None, help="EAGLE architecture config. If not given, " \
-        "a default config will be use. If provided, it will overwrite the default config."
+        "--eagle-config",
+        type=str,
+        default=None,
+        help="EAGLE architecture config. If not given, "
+        "a default config will be use. If provided, it will overwrite the default config.",
     )
 
     add_modelopt_args(parser)
@@ -115,7 +122,9 @@ if __name__ == "__main__":
             UserWarning,
         )
 
-    model = get_model(functools.partial(model_provider, modelopt_gpt_mamba_builder), wrap_with_ddp=False)
+    model = get_model(
+        functools.partial(model_provider, modelopt_gpt_mamba_builder), wrap_with_ddp=False
+    )
     report_current_memory_info()
 
     unwrapped_model = unwrap_model(model)[0]
@@ -124,12 +133,14 @@ if __name__ == "__main__":
         import_dtype = torch.float16 if args.fp16 else torch.bfloat16
         unwrapped_model = unwrap_model(model)[0]
         workspace_dir = os.environ.get("MLM_WORK_DIR", "/tmp")
-        print_rank_0("Import model from Hugging Face checkpoint in dtype {}.".format(str(import_dtype)))
+        print_rank_0(
+            "Import model from Hugging Face checkpoint in dtype {}.".format(str(import_dtype))
+        )
+        import_kwargs = {"dtype": import_dtype}
+        if modelopt_version_at_least("0.41.0"):
+            import_kwargs.update({"trust_remote_code": args.trust_remote_code})
         import_mcore_gpt_from_hf(
-            unwrapped_model,
-            args.pretrained_model_path,
-            workspace_dir,
-            dtype = import_dtype,
+            unwrapped_model, args.pretrained_model_path, workspace_dir, **import_kwargs
         )
     elif args.load is not None:
         _ = load_modelopt_checkpoint(model)
@@ -137,10 +148,10 @@ if __name__ == "__main__":
     if args.algorithm in ("eagle1", "eagle3"):
         mtsp_config = ALGO_TO_CONFIG[args.algorithm]
         if args.eagle_config:
-            with open(args.eagle_config)as f:
+            with open(args.eagle_config) as f:
                 eagle_config = json.load(f)
             mtsp_config["config"]["eagle_architecture_config"].update(eagle_config)
-        
+
         if args.export_offline_model:
             mtsp_config["config"]["eagle_offline"] = True
 
@@ -151,11 +162,10 @@ if __name__ == "__main__":
             if eagle_module is not None:
                 mcore_eagle_state_dict = torch.load(args.extra_model_path)
                 eagle_module.load_state_dict(mcore_eagle_state_dict, strict=False)
-                
+
     elif args.algorithm == "medusa":
         config = {"medusa_num_heads": args.export_num_medusa_heads, "medusa_num_layers": 1}
         unwrapped_model = mtsp.convert(unwrapped_model, [("medusa", config)])
-
 
     print_rank_0(f"Converted Model:\n {model}")
     torch.distributed.barrier()

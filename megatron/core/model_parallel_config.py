@@ -1,4 +1,4 @@
-# Copyright (c) 2023, NVIDIA CORPORATION. All rights reserved.
+# Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
 import warnings
 from dataclasses import dataclass
@@ -51,6 +51,22 @@ class ModelParallelConfig:
        groups of two levels, so the first value of the list indicates the group size of the a2a
        communication type, and the second value indicates the group size of the p2p communication
        type.
+    """
+
+    max_seqlen_per_dp_cp_rank: Optional[int] = None
+    """
+    Maximum sequence length per DPxCP rank. This is the maximum sequence length each rank
+    can handle without overflowing the memory. Typically, a good starting point is to set this
+    to maximum sequence length / context parallel size.
+    This is used to calculate the number and length of sub-samples assigned to 
+    each rank when using hybrid_context_parallel.
+    """
+
+    hybrid_context_parallel: bool = False
+    """
+    If true, enables hybrid context parallel. This is used to balance the workload of 
+    each CP rank when we use packed samples with variable sequence lengths.
+    Please set max_seqlen_per_dp_cp_rank when using hybrid_context_parallel.
     """
 
     expert_model_parallel_size: int = 1
@@ -328,6 +344,10 @@ class ModelParallelConfig:
        rank 0 | 0 1 2 0 1 2 3 4 3 4 
        rank 1 |   0 1 2 0 1 2 3 4 3 4
     """
+
+    mtp_standalone: bool = False
+    """This will be set automatically according to the pipeline layout, 
+    and will be set to True if MTP is in a separate vpp stage."""
 
     ###################
     # CPU Offloading

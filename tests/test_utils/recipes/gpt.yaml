@@ -3,7 +3,7 @@ format_version: 1
 maintainers: [mcore]
 loggers: [stdout]
 spec:
-  name: '{test_case}_{environment}_{platforms}'
+  name: "{test_case}_{environment}_{platforms}"
   model: gpt
   build: mcore-pyt-{environment}
   nodes: 1
@@ -342,6 +342,11 @@ products:
         platforms: [dgx_h100]
       - environment: [lts]
         scope: [nightly]
+  - test_case: [gpt3_mcore_te_tp2_pp1_gdn]
+    products:
+      - environment: [dev]
+        scope: [mr, mr-github, mr-github-slim]
+        platforms: [dgx_h100]
   - test_case: [gpt3_mcore_te_tp2_pp2_mla]
     products:
       - environment: [dev]
@@ -457,7 +462,7 @@ products:
   - test_case: [gpt3_mcore_te_tp1_pp4_vp1_dist_optimizer_overlap_grad_reduce_param_gather_overlap_optimizer]
     products:
       - environment: [lts]
-        scope: [mr]
+        scope: [nightly]
       - environment: [dev]
         scope: [mr, mr-github, mr-github-slim]
         platforms: [dgx_h100]
@@ -467,11 +472,11 @@ products:
         scope: [mr]
         platforms: [dgx_h100]
       - environment: [lts]
-        scope: [mr]
+        scope: [nightly]
   - test_case: [gpt3_mcore_te_tp4_pp1_resume_torch_dist_dist_optimizer_overlap_grad_reduce_param_gather]
     products:
       - environment: [lts]
-        scope: [mr]
+        scope: [nightly]
       - environment: [dev]
         scope: [mr, mr-github, mr-github-slim]
         platforms: [dgx_h100]
@@ -481,7 +486,7 @@ products:
         scope: [mr]
         platforms: [dgx_h100]
       - environment: [lts]
-        scope: [mr]
+        scope: [nightly]
   # - test_case: [gpt3_mcore_te_tp4_pp2_frozen_resume_torch_dist_reshard_8x1xNone]
   #   products:
   #     - environment: [dev]
