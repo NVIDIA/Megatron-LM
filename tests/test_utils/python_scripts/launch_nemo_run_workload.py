@@ -96,6 +96,7 @@ def main(
     magic_values["assets_dir"] = "/opt/megatron-lm/assets_dir"
     magic_values["artifacts_dir"] = "/opt/megatron-lm/artifacts_dir"
     magic_values["environment"] = environment
+    magic_values["n_repeat"] = n_repeat
     magic_values["test_case"] = workload.spec["test_case"]
     magic_values["name"] = workload.spec["name"].format(**magic_values)
     workload.spec["script"] = workload.spec["script"].format(**magic_values)
