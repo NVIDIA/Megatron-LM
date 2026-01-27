@@ -1,9 +1,5 @@
 # Megatron-LM ModelOpt Distillation Integration
 
-## Table of Contents
-
-[[_TOC_]]
-
 ## How To
 
 ### Prerequisites
