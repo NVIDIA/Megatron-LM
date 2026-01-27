@@ -1715,7 +1715,6 @@ def _add_network_size_args(parser):
                        help='Pad value head dim to the size of qk head dim, and run ck fused attention.')
     group.add_argument('--attention-sink-k', type=int, default=0,
                        help='k attention sink tokens.')
-    parser.add_argument("--window-size", type=int, nargs=2, help="sliding window size")
 
     group.add_argument('--mtp-num-layers', type=int, default=None,
                        help='Number of Multi-Token Prediction (MTP) Layers.'
