@@ -54,7 +54,7 @@ runs:
   steps:
     - name: Reset
       shell: bash
-      run: nvidia-smi --gpu-reset
+      run: docker run --rm --gpus all ubuntu nvidia-smi --gpu-reset
 
     - name: Print node name
       shell: bash -x -e -u -o pipefail {0}
