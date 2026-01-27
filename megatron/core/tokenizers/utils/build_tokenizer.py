@@ -13,7 +13,7 @@ logger = logging.getLogger(__name__)
 
 
 def build_tokenizer(args, **kwargs):
-    """ """
+    """Initialize tokenizer."""
     kwargs = {}
     tokenizer_library = None
     tokenizer_path = None
