@@ -132,7 +132,9 @@ class TestRLUtils:
         self.create_test_args(rl_use_sequence_packing=use_sequence_packing)
 
         tokens = torch.ones((BATCH, SEQ), dtype=torch.long)
-        logprobs = rl_utils.get_logprobs(MockModel(), tokens, position_ids=None)
+        logprobs = rl_utils.get_logprobs(
+            MockModel(), tokens, position_ids=None, sequence_packing=use_sequence_packing
+        )
         # We chop off 1 element from the sequence dimension.
         assert logprobs.shape == (BATCH, SEQ - 1)
         # As we return ones as logits, all logprobs should be the same.
