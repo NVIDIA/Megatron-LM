@@ -78,8 +78,6 @@ dev = [
     "opentelemetry-api~=1.33.1",
     "mamba-ssm~=2.2",
     "causal-conv1d~=1.5",
-    "flash-linear-attention~=0.3.2",
-    "nv-grouped-gemm~=1.1",
     "megatron-energon[av_decode]~=6.0",
     "av",
     "flashinfer-python~=0.5.0",
@@ -88,6 +86,11 @@ dev = [
     "fastapi~=0.50",                                          # Forcing a little bit more recent version of fastapi to be compatible with pydantic 2.0
     "datasets",
     "emerging_optimizers",
+]
+
+# Optional MoE dependencies that may require building from source with CUTLASS headers
+moe = [
+    "nv-grouped-gemm~=1.1",
 ]
 
 lts = [
@@ -99,7 +102,6 @@ lts = [
     "opentelemetry-api~=1.33.1",
     "mamba-ssm~=2.2",
     "causal-conv1d~=1.5",
-    "nv-grouped-gemm~=1.1",
     "megatron-energon[av_decode]~=6.0",
     "av",
     "flashinfer-python~=0.5.0",
@@ -114,17 +116,6 @@ lts = [
 test = [
     "coverage",
     "nltk",
-    "wrapt",
-    "pytest==8.3.5",
-    "pytest-mock",
-    "pytest-cov",
-    "pytest-random-order",
-    "pytest-asyncio",
-    "pygithub",
-    "pydantic",
-    "tensorboard",
-    "pyyaml",
-    "nemo-run",
 ]
 docs = [
     "sphinx",
@@ -202,7 +193,7 @@ required_version = "24"
 skip_magic_trailing_comma = true
 include = '\.pyi?$'
 exclude = '''
-/(
+/( 
     \.git
   | \.venv
   | build
@@ -245,7 +236,7 @@ select = ["S506"]
 
 # - On top of the Google convention, disable `D417`, which requires
 #   documentation for every function parameter.
-# - F841: local variable assigned but never used (exluced to favor readability)
+# - F841: local variable assigned but never used (exluded to favor readability)
 # TODO: Remove D10 once we are about to release to get all the docstrings written
 ignore = ["D417", "D10", "F841"]
 

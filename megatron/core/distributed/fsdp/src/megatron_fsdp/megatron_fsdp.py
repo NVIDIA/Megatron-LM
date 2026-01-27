@@ -352,8 +352,15 @@ class MegatronFSDP(torch.nn.Module):
             device=self.device,
             reset_parameters_for_meta_device_init_module=self.init_model_with_meta_device,
         )
-        self.param_to_name = {p: name for name, p in self.module.named_parameters()}
-        self.raw_param = dict(self.module.named_parameters())
+        # Exclude expert-parallel params from FSDP bookkeeping
+        self.param_to_name = {}
+        self.raw_param = {}
+        from megatron.core.utils import is_ep_owned_param
+        for name, param in self.module.named_parameters():
+            if is_ep_owned_param(self.module, name):
+                continue
+            self.param_to_name[param] = name
+            self.raw_param[name] = param
 
         # Initialize a gradient buffer and accumulation stream for the GradReducePipeline.
         self.side_stream_for_buffer_copy_and_grad_accum = torch.cuda.Stream()
@@ -1144,7 +1151,11 @@ class MegatronFSDP(torch.nn.Module):
 
         pg_buffer = self.param_and_grad_buffer
         fsdp_params = dict(pg_buffer.optimizer_named_parameters)
-        for name, _ in self.module.named_parameters():
+        from megatron.core.utils import is_ep_owned_param
+        for name, param in self.module.named_parameters():
+            # Skip FSDP replacement for expert-parallel-owned parameters
+            if is_ep_owned_param(self.module, name):
+                continue
             assert name in fsdp_params, f"Parameter {name} not found in FSDP parameters."
             dist_param = fsdp_params[name]
             # Set the __fsdp_param__ attribute to True to indicate that this
@@ -1161,7 +1172,11 @@ class MegatronFSDP(torch.nn.Module):
             return
         self.is_param_fsdp_distributed = False
 
-        for name, _ in self.module.named_parameters():
+        from megatron.core.utils import is_ep_owned_param
+        for name, param in self.module.named_parameters():
+            # Skip FSDP replacement for expert-parallel-owned parameters
+            if is_ep_owned_param(self.module, name):
+                continue
             assert name in self.raw_param, f"Raw parameter {name} not found in module."
             _replace_module_parameter(self.module, name, self.raw_param[name])
 

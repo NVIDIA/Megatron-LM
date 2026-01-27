@@ -1757,6 +1757,15 @@ def _add_retro_args(parser):
 
 def _add_network_size_args(parser):
     group = parser.add_argument_group(title='network size')
+    group.add_argument('--attention-type', type=str, default='default',
+                       choices=['default', 'kda'],
+                       help='Type of attention mechanism to use. "kda" enables Kimi Delta Attention. Default is standard attention.')
+    group.add_argument('--kda-enable', action='store_true', default=False,
+                       help='(DEPRECATED: use --attention-type kda) Enable Kimi Delta Attention mechanism.')
+    group.add_argument('--kda-delta-threshold', type=float, default=0.1,
+                       help='Delta threshold for Kimi Delta Attention sparsity. Used if --attention-type kda.')
+    group.add_argument('--kda-sparsity-factor', type=float, default=0.5,
+                       help='Sparsity factor for Kimi Delta Attention. Used if --attention-type kda.')
 
     group.add_argument('--num-layers', type=int, default=None,
                        help='Number of transformer layers.')
@@ -2204,6 +2213,20 @@ def _add_rl_args(parser):
                         help='Number of parallel generation tasks for RL inference.')
     group.add_argument('--rl-skip-bos-token', action=argparse.BooleanOptionalAction, type=bool, default=False,
                         help='Skip BOS token at the beginning of the sequences. Default is False.')
+
+    # AMem NCCL plugin arguments
+    group.add_argument('--rl-use-amem-nccl', action='store_true',
+                       help='Enable AMem NCCL plugin for transparent NCCL memory offloading. '
+                            'When enabled, NCCL-allocated GPU memory will be offloaded during '
+                            'rollout/inference phases and restored before training. This can save '
+                            'up to 10GB+ GPU memory per card. Requires AMem NCCL plugin to be installed. '
+                            'See https://github.com/inclusionAI/asystem-amem')
+    group.add_argument('--rl-amem-group-id', type=int, default=None,
+                       help='Group ID for AMem NCCL plugin. Use different IDs for training and '
+                            'inference processes when they share GPUs (e.g., 100 for training, '
+                            '200 for inference). Must be set before first NCCL memory allocation.')
+    group.add_argument('--rl-amem-offload-during-rollout', action=argparse.BooleanOptionalAction, default=True,
+                       help='Whether to offload NCCL memory during rollout collection. Default is True.')
     return parser
 
 def _add_training_args(parser):

@@ -11,6 +11,7 @@ from megatron.core.models.backends import (
 )
 from megatron.core.models.gpt.moe_module_specs import get_moe_module_spec_for_backend
 from megatron.core.transformer.attention import SelfAttention, SelfAttentionSubmodules
+from megatron.core.transformer.attention_kda import KDASelfAttention
 from megatron.core.transformer.enums import AttnMaskType, LayerType
 from megatron.core.transformer.identity_op import IdentityOp
 from megatron.core.transformer.mlp import MLP, MLPSubmodules
@@ -526,58 +527,93 @@ def get_gpt_decoder_layer_specs(
     pp_rank: Optional[int] = None,
 ) -> TransformerBlockSubmodules:
     """GPT block spec."""
-    if use_transformer_engine:
-        layer_norm_impl = TENorm
-        dense_layer_spec = get_gpt_layer_with_transformer_engine_spec(
-            num_experts=None,
-            moe_grouped_gemm=False,
-            qk_layernorm=config.qk_layernorm,
-            multi_latent_attention=config.multi_latent_attention,
-            moe_use_legacy_grouped_gemm=config.moe_use_legacy_grouped_gemm,
-            qk_l2_norm=qk_l2_norm,
-            use_kitchen=config.use_kitchen,
-            use_te_activation_func=config.use_te_activation_func,
-            use_kitchen_attention=config.use_kitchen_attention,
-            kitchen_attention_backend=config.kitchen_attention_backend,
-        )
-        moe_layer_spec = get_gpt_layer_with_transformer_engine_spec(
-            num_experts=config.num_moe_experts,
-            moe_grouped_gemm=config.moe_grouped_gemm,
-            qk_layernorm=config.qk_layernorm,
-            multi_latent_attention=config.multi_latent_attention,
-            moe_use_legacy_grouped_gemm=config.moe_use_legacy_grouped_gemm,
-            qk_l2_norm=qk_l2_norm,
-            use_kitchen=config.use_kitchen,
-            use_te_activation_func=config.use_te_activation_func,
-            use_kitchen_attention=config.use_kitchen_attention,
-            kitchen_attention_backend=config.kitchen_attention_backend,
-        )
+    if getattr(config, "enable_kda", False):
+        # Use KDA attention for all dense layers
+        layer_norm_impl = LNImpl if not use_transformer_engine else TENorm
+        kda_params = getattr(config, "kda_hyperparameters", {}) or {}
+        delta_threshold = kda_params.get("delta_threshold", 0.1)
+        sparsity_factor = kda_params.get("sparsity_factor", 0.5)
+        dense_layer_spec = get_kda_layer_spec(delta_threshold=delta_threshold, sparsity_factor=sparsity_factor)
+        # For now, keep moe_layer_spec as before
+        if use_transformer_engine:
+            moe_layer_spec = get_gpt_layer_with_transformer_engine_spec(
+                num_experts=config.num_moe_experts,
+                moe_grouped_gemm=config.moe_grouped_gemm,
+                qk_layernorm=config.qk_layernorm,
+                multi_latent_attention=config.multi_latent_attention,
+                moe_use_legacy_grouped_gemm=config.moe_use_legacy_grouped_gemm,
+                qk_l2_norm=qk_l2_norm,
+                use_kitchen=config.use_kitchen,
+                use_te_activation_func=config.use_te_activation_func,
+                use_kitchen_attention=getattr(config, "use_kitchen_attention", False),
+                kitchen_attention_backend=getattr(config, "kitchen_attention_backend", "sdpa"),
+            )
+        else:
+            moe_layer_spec = get_gpt_layer_local_spec(
+                num_experts=config.num_moe_experts,
+                moe_grouped_gemm=config.moe_grouped_gemm,
+                qk_layernorm=config.qk_layernorm,
+                multi_latent_attention=config.multi_latent_attention,
+                moe_use_legacy_grouped_gemm=config.moe_use_legacy_grouped_gemm,
+                normalization=normalization,
+                qk_l2_norm=qk_l2_norm,
+                use_kitchen=config.use_kitchen,
+                use_kitchen_attention=getattr(config, "use_kitchen_attention", False),
+                kitchen_attention_backend=getattr(config, "kitchen_attention_backend", "sdpa"),
+            )
     else:
-        layer_norm_impl = LNImpl
-        dense_layer_spec = get_gpt_layer_local_spec(
-            num_experts=None,
-            moe_grouped_gemm=False,
-            qk_layernorm=config.qk_layernorm,
-            multi_latent_attention=config.multi_latent_attention,
-            moe_use_legacy_grouped_gemm=config.moe_use_legacy_grouped_gemm,
-            normalization=normalization,
-            qk_l2_norm=qk_l2_norm,
-            use_kitchen=config.use_kitchen,
-            use_kitchen_attention=config.use_kitchen_attention,
-            kitchen_attention_backend=config.kitchen_attention_backend,
-        )
-        moe_layer_spec = get_gpt_layer_local_spec(
-            num_experts=config.num_moe_experts,
-            moe_grouped_gemm=config.moe_grouped_gemm,
-            qk_layernorm=config.qk_layernorm,
-            multi_latent_attention=config.multi_latent_attention,
-            moe_use_legacy_grouped_gemm=config.moe_use_legacy_grouped_gemm,
-            normalization=normalization,
-            qk_l2_norm=qk_l2_norm,
-            use_kitchen=config.use_kitchen,
-            use_kitchen_attention=config.use_kitchen_attention,
-            kitchen_attention_backend=config.kitchen_attention_backend,
-        )
+        if use_transformer_engine:
+            layer_norm_impl = TENorm
+            dense_layer_spec = get_gpt_layer_with_transformer_engine_spec(
+                num_experts=None,
+                moe_grouped_gemm=False,
+                qk_layernorm=config.qk_layernorm,
+                multi_latent_attention=config.multi_latent_attention,
+                moe_use_legacy_grouped_gemm=config.moe_use_legacy_grouped_gemm,
+                qk_l2_norm=qk_l2_norm,
+                use_kitchen=config.use_kitchen,
+                use_te_activation_func=config.use_te_activation_func,
+                use_kitchen_attention=getattr(config, "use_kitchen_attention", False),
+                kitchen_attention_backend=getattr(config, "kitchen_attention_backend", "sdpa"),
+            )
+            moe_layer_spec = get_gpt_layer_with_transformer_engine_spec(
+                num_experts=config.num_moe_experts,
+                moe_grouped_gemm=config.moe_grouped_gemm,
+                qk_layernorm=config.qk_layernorm,
+                multi_latent_attention=config.multi_latent_attention,
+                moe_use_legacy_grouped_gemm=config.moe_use_legacy_grouped_gemm,
+                qk_l2_norm=qk_l2_norm,
+                use_kitchen=config.use_kitchen,
+                use_te_activation_func=config.use_te_activation_func,
+                use_kitchen_attention=getattr(config, "use_kitchen_attention", False),
+                kitchen_attention_backend=getattr(config, "kitchen_attention_backend", "sdpa"),
+            )
+        else:
+            layer_norm_impl = LNImpl
+            dense_layer_spec = get_gpt_layer_local_spec(
+                num_experts=None,
+                moe_grouped_gemm=False,
+                qk_layernorm=config.qk_layernorm,
+                multi_latent_attention=config.multi_latent_attention,
+                moe_use_legacy_grouped_gemm=config.moe_use_legacy_grouped_gemm,
+                normalization=normalization,
+                qk_l2_norm=qk_l2_norm,
+                use_kitchen=config.use_kitchen,
+                use_kitchen_attention=getattr(config, "use_kitchen_attention", False),
+                kitchen_attention_backend=getattr(config, "kitchen_attention_backend", "sdpa"),
+            )
+            moe_layer_spec = get_gpt_layer_local_spec(
+                num_experts=config.num_moe_experts,
+                moe_grouped_gemm=config.moe_grouped_gemm,
+                qk_layernorm=config.qk_layernorm,
+                multi_latent_attention=config.multi_latent_attention,
+                moe_use_legacy_grouped_gemm=config.moe_use_legacy_grouped_gemm,
+                normalization=normalization,
+                qk_l2_norm=qk_l2_norm,
+                use_kitchen=config.use_kitchen,
+                use_kitchen_attention=getattr(config, "use_kitchen_attention", False),
+                kitchen_attention_backend=getattr(config, "kitchen_attention_backend", "sdpa"),
+            )
 
     # Parse config.moe_layer_freq to determine the pattern of expert/dense layers.
     # 0 stands for dense layers, 1 stands for expert layers.
@@ -724,3 +760,49 @@ def get_gpt_mtp_block_spec_for_backend(
         mtp_block_spec = None
 
     return mtp_block_spec
+
+
+def get_kda_layer_spec(
+    delta_threshold: Optional[float] = 0.1,
+    sparsity_factor: Optional[float] = 0.5,
+) -> ModuleSpec:
+    """
+    Use this spec to configure KDA (Key Delta Attention) layers.
+
+    Args:
+        delta_threshold (float, optional): Threshold for delta-based sparsity. Defaults to 0.1.
+        sparsity_factor (float, optional): Factor to scale sparse attention. Defaults to 0.5.
+
+    Returns:
+        ModuleSpec: Specification for KDA layers.
+    """
+    backend = InferenceSpecProvider()
+
+    return ModuleSpec(
+        module=TransformerLayer,
+        submodules=TransformerLayerSubmodules(
+            input_layernorm=backend.layer_norm(),
+            self_attention=ModuleSpec(
+                module=KDASelfAttention,
+                params={
+                    "delta_threshold": delta_threshold,
+                    "sparsity_factor": sparsity_factor,
+                },
+                submodules=SelfAttentionSubmodules(
+                    linear_q_proj=backend.column_parallel_linear(),
+                    linear_kv_proj=backend.column_parallel_linear(),
+                    linear_out_proj=backend.row_parallel_linear(),
+                ),
+            ),
+            self_attn_bda=get_bias_dropout_add,
+            pre_mlp_layernorm=backend.layer_norm(),
+            mlp=ModuleSpec(
+                module=MLP,
+                submodules=MLPSubmodules(
+                    linear_fc1=backend.column_parallel_linear(),
+                    linear_fc2=backend.row_parallel_linear(),
+                ),
+            ),
+            mlp_bda=get_bias_dropout_add,
+        ),
+    )
