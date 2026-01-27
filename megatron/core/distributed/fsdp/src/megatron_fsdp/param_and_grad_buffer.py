@@ -1331,6 +1331,13 @@ def _get_parameter_groups(
     # All parameters in the module are assigned a parameter group, even non-FSDP modules.
     parameter_groups = []
     for name, param in module.named_parameters():
+        # Skip FSDP param/grad buffer construction for expert-parallel-owned parameters
+        parent_module = module
+        for submodule_name in name.split(".")[:-1]:
+            parent_module = getattr(parent_module, submodule_name, parent_module)
+        if getattr(parent_module, "expert_parallel_enabled", False):
+            continue
+        
         # We need this information to correctly dynamically allocate Tensors!
         is_fp8 = is_float8tensor(param)
         is_fp8_meta_device_init = meta_device_init_fp8_params.get(name, (False, False))[0]

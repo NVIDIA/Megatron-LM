@@ -864,6 +864,41 @@ def log_on_each_pipeline_stage(
         logger.log(*args, **kwargs)
 
 
+def assert_not_fsdp_wrapped_ep_param(module, param_name: str):
+    """
+    EP-owned parameters must never be wrapped or replaced by FSDP.
+    This assertion exists to prevent silent double-sharding regressions.
+    """
+    if getattr(module, "expert_parallel_enabled", False):
+        raise AssertionError(
+            f"FSDP attempted to manage EP-owned parameter: {param_name}. "
+            "This indicates a missing EP exclusion in the FSDP code path."
+        )
+
+
+def is_ep_owned_param(module, name):
+    """
+    Check if a parameter is owned by an expert-parallel-enabled submodule.
+    
+    Traverses the module hierarchy using the parameter name to find the parent
+    module and checks if any parent has expert_parallel_enabled set to True.
+    
+    Args:
+        module: The root module to start traversal from
+        name: The fully qualified parameter name (e.g., "layers.0.mlp.weight")
+    
+    Returns:
+        bool: True if the parameter is owned by an expert-parallel-enabled submodule,
+              False otherwise
+    """
+    parent = module
+    for sub in name.split(".")[:-1]:
+        parent = getattr(parent, sub, parent)
+        if getattr(parent, "expert_parallel_enabled", False):
+            return True
+    return False
+
+
 def check_param_hashes_across_dp_replicas(
     model: List[torch.nn.Module], cross_check: bool = False
 ) -> bool:

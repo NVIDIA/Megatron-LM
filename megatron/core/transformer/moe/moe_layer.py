@@ -115,6 +115,14 @@ class BaseMoELayer(MegatronModule, ABC):
         self.token_dispatcher: Optional[MoETokenDispatcher] = None
         self.layer_number = layer_number
 
+        # Used by FSDP to avoid double sharding
+        # Flag indicating if this MoE layer's expert parameters are managed by Expert Parallelism
+        self.expert_parallel_enabled = ep_size > 1
+
+        # Invariant:
+        # When expert_parallel_enabled=True, these parameters must never be wrapped,
+        # replaced, or sharded by FSDP. All FSDP code paths must explicitly skip them.
+
     @abstractmethod
     def forward(self, hidden_states):
         """Forward method for the MoE layer."""
