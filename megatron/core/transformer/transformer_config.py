@@ -846,6 +846,7 @@ class TransformerConfig(ModelParallelConfig):
     """Transformer implementation to use.
     Options are 'transformer_engine' for Transformer Engine and 'local' for MCore."""
 
+<<<<<<< HEAD
     #####################################
     # Fine-grained Activation Offloading
     #####################################
@@ -868,6 +869,19 @@ class TransformerConfig(ModelParallelConfig):
     """
     min_offloaded_tensor_size: int = 1024 * 1024
     """The minimum size of the tensor to be offloaded."""
+
+    enable_kda: bool = False
+    """Enable KDA (Key Delta Attention) module. Default is False."""
+
+    kda_hyperparameters: Optional[dict] = None
+    """Hyperparameters for KDA module. Should include keys like 'delta_threshold', 'sparsity_factor', etc."""
+=======
+    enable_kda: bool = False
+    """Enable KDA (Key Delta Attention) module. Default is False."""
+
+    kda_hyperparameters: Optional[dict] = None
+    """Hyperparameters for KDA module. Should include keys like 'delta_threshold', 'sparsity_factor', etc."""
+>>>>>>> fd6628797d9d92ee1f66426b18b4ff76333848d4
 
     def __post_init__(self):
         """Python dataclass method that is used to modify attributes after initialization.

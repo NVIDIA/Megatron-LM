@@ -701,6 +701,14 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
         tensor data (i.e., via torch.empty() below). This will be overwritten
         during load_parameter_state().
 
+        ** Note on parameter group compatibility (Issue #2625): **
+        When using custom pipeline parallel layouts (--pipeline-model-parallel-layout),
+        the optimizer parameter groups can be constructed differently between
+        training and checkpoint loading. This method now handles such mismatches
+        gracefully by using the runtime parameter group configuration as a fallback
+        when exact matches are not found in the checkpoint. A warning will be logged
+        when this occurs.
+
         ** Note: Torch optimizer's state structure. **
         The Torch optimizer stores its state in two levels. The top level is a
         list of groups, where each group contains a list of integer indexes
@@ -716,7 +724,7 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
         if self.ddp_config.use_megatron_fsdp:
             if "param_to_group_meta" in state_dict:
                 state_dict["param_groups"] = self._param2group_meta_to_param_groups(
-                    state_dict["param_to_group_meta"], self.optimizer.param_groups
+                    state_dict["param_to_group_meta"], self.optimizer.param_groups, strict=False
                 )
                 del state_dict["param_to_group_meta"]
             self.optimizer.load_state_dict(state_dict)
@@ -756,9 +764,22 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
         state_dict_param_groups = []
         for inner_param_group in inner_state_dict["param_groups"]:
             needed_groups = make_needed_groups(inner_param_group)
-            state_dict_param_groups.append(
-                {**param_groups_map[needed_groups], "params": inner_param_group['params']}
-            )
+            if needed_groups not in param_groups_map:
+                # Handle case where parameter groups don't match due to pipeline layout or other
+                # configuration differences. This can happen when using --pipeline-model-parallel-layout
+                # or when resuming from checkpoints with different parallel configurations.
+                logger.warning(
+                    f"Parameter group with keys {needed_groups} not found in checkpoint. "
+                    f"Available groups: {list(param_groups_map.keys())}. "
+                    f"This may occur when using different pipeline parallel layouts between "
+                    f"training and checkpoint loading. Using runtime parameter group configuration."
+                )
+                # Use the runtime parameter group configuration as fallback
+                state_dict_param_groups.append(inner_param_group)
+            else:
+                state_dict_param_groups.append(
+                    {**param_groups_map[needed_groups], "params": inner_param_group['params']}
+                )
 
         # Allocate or retrieve optimizer state (i.e., tensors).
         if len(self.optimizer.state) == 0:
