@@ -4,7 +4,7 @@
 
 from dataclasses import dataclass, field, fields
 from functools import partial
-from typing import List, Optional
+from typing import Dict, List, Optional
 
 import torch
 
@@ -569,3 +569,141 @@ class ProcessGroupCollection:
             result['ep_group'] = pg_collection.ep
 
             return result
+
+
+@dataclass
+class ProcessGroupCollectionWrapper:
+    """Wrapper for multiple process group collections in multi-module pipelines.
+
+    Used when a rank participates in multiple modules (e.g., colocated encoder + LLM).
+    The language_model key identifies which module is the language model (used for
+    CP size extraction and other LLM-specific operations).
+
+    Attributes:
+        module_collections: Dict mapping module names to ProcessGroupCollection objects
+        language_model: Key identifying the language model module (None if no LLM on this rank)
+
+    Example:
+        # Colocated rank with encoder and LLM
+        wrapper = ProcessGroupCollectionWrapper(
+            module_collections={
+                "encoder": encoder_pg,
+                "llm": llm_pg
+            },
+            language_model="llm"
+        )
+
+        # Rank with dual encoders (no LLM)
+        wrapper = ProcessGroupCollectionWrapper(
+            module_collections={
+                "encoder_1": encoder_1_pg,
+                "encoder_2": encoder_2_pg
+            },
+            language_model=None
+        )
+
+        # Single module (can also use ProcessGroupCollection directly)
+        wrapper = ProcessGroupCollectionWrapper(
+            module_collections={"llm": llm_pg},
+            language_model="llm"
+        )
+
+        # Usage
+        cp_size = wrapper.get_language_model_cp_size()
+        encoder_pg = wrapper["encoder_1"]  # Dict-like access
+        has_llm = wrapper.has_language_model()
+    """
+
+    module_collections: Dict[str, ProcessGroupCollection]
+    language_model: Optional[str] = None
+
+    def __post_init__(self):
+        if not self.module_collections:
+            raise ValueError("module_collections dict cannot be empty")
+        if self.language_model is not None:
+            if self.language_model not in self.module_collections:
+                raise ValueError(
+                    f"language_model '{self.language_model}' not found in "
+                    f"module_collections keys: {list(self.module_collections.keys())}"
+                )
+
+    def get_language_model_collection(self) -> ProcessGroupCollection:
+        """Get the language model's process group collection.
+
+        Returns:
+            ProcessGroupCollection for the language model.
+
+        Raises:
+            ValueError: If no language model is specified for this wrapper.
+        """
+        if self.language_model is None:
+            raise ValueError("No language model specified for this wrapper")
+        return self.module_collections[self.language_model]
+
+    def get_language_model_cp_size(self) -> int:
+        """Get context parallel size for the language model.
+
+        Returns:
+            Context parallel size for the language model.
+
+        Raises:
+            ValueError: If no language model is specified for this wrapper.
+        """
+        return self.get_language_model_collection().cp.size()
+
+    def has_language_model(self) -> bool:
+        """Check if this rank has a language model.
+
+        Returns:
+            True if this rank has a language model, False otherwise.
+        """
+        return self.language_model is not None
+
+    def get_module_collection(self, module_name: str) -> ProcessGroupCollection:
+        """Get process group collection for a specific module.
+
+        Args:
+            module_name: Name of the module.
+
+        Returns:
+            ProcessGroupCollection for the specified module.
+
+        Raises:
+            ValueError: If module_name is not found in collections.
+        """
+        if module_name not in self.module_collections:
+            raise ValueError(
+                f"Module '{module_name}' not found in collections. "
+                f"Available: {list(self.module_collections.keys())}"
+            )
+        return self.module_collections[module_name]
+
+    def __len__(self):
+        """Return the number of modules in this wrapper."""
+        return len(self.module_collections)
+
+    def __getitem__(self, module_name: str):
+        """Get process group collection for a module using dict-like access."""
+        return self.module_collections[module_name]
+
+    def __iter__(self):
+        """Iterate over all process group collections."""
+        return iter(self.module_collections.values())
+
+    def keys(self):
+        """Return module names."""
+        return self.module_collections.keys()
+
+    def values(self):
+        """Return process group collections."""
+        return self.module_collections.values()
+
+    def items(self):
+        """Return (module_name, collection) pairs."""
+        return self.module_collections.items()
+
+    def __repr__(self):
+        """Return a concise representation showing modules and their language model status."""
+        modules_str = ', '.join(self.module_collections.keys())
+        lm_str = f", language_model='{self.language_model}'" if self.language_model else ""
+        return f"ProcessGroupCollectionWrapper(modules=[{modules_str}]{lm_str})"
