@@ -8,6 +8,9 @@ ulimit -Sn $(ulimit -Hn)
 # Increase soft limit for number of processes to match hard limit
 ulimit -Su $(ulimit -Hu)
 
+# Set umask to 0002 to allow group read/write permissions
+umask 0002
+
 set +x
 for ARGUMENT in "$@"; do
     # Split on first = only, preserving any subsequent = signs in the value
@@ -53,6 +56,8 @@ TEST_TYPE=$(cat $TRAINING_PARAMS_PATH |
     /usr/local/bin/yq '.TEST_TYPE')
 ENABLE_LIGHTWEIGHT_MODE=$(cat $TRAINING_PARAMS_PATH |
     /usr/local/bin/yq '.ENV_VARS.ENABLE_LIGHTWEIGHT_MODE // "false"')
+N_REPEAT=$(cat $TRAINING_PARAMS_PATH |
+    /usr/local/bin/yq '.ENV_VARS.N_REPEAT // "'$N_REPEAT'"')
 MODE=$(cat $TRAINING_PARAMS_PATH |
     /usr/local/bin/yq '.MODE // "pretraining"')
 
