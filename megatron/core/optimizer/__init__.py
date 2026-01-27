@@ -105,6 +105,64 @@ def get_standard_config_overrides(config: OptimizerConfig) -> Dict[ParamKey, Par
     return config_overrides
 
 
+def get_mup_config_overrides(
+    config: OptimizerConfig,
+    mup_width_mult: float,
+    optimizer_type: str = 'adam',
+) -> Dict[ParamKey, ParamGroupOverride]:
+    """Get MuP config overrides for per-layer LR scaling.
+
+    In MuP, hidden layer learning rates are scaled by 1/width_mult to ensure
+    that parameter updates remain O(1) as model width increases. This enables
+    hyperparameter transfer from a smaller proxy model to a larger target model.
+
+    MuP LR scaling rules:
+    - Adam/AdamW: hidden_lr = base_lr / width_mult
+    - SGD: hidden_lr = base_lr (NO scaling - SGD is naturally width-invariant)
+
+    Embedding and output layers keep the base learning rate (no scaling).
+
+    Args:
+        config (OptimizerConfig): optimizer configuration object.
+        mup_width_mult (float): Width multiplier (hidden_size / base_hidden_size).
+        optimizer_type (str): Type of optimizer ('adam' or 'sgd'). SGD does not
+            need LR scaling with width in MuP. Defaults to 'adam'.
+
+    Returns:
+        Dict[ParamKey, ParamGroupOverride]: MuP config overrides for hidden layers.
+    """
+    if mup_width_mult == 1.0:
+        # No scaling needed when width_mult is 1
+        return {}
+
+    # SGD is width-invariant, no scaling needed.
+    if optimizer_type.lower() == 'sgd':
+        return {}
+
+    hidden_lr_mult = 1.0 / mup_width_mult
+    base_lr = config.lr
+    base_min_lr = config.min_lr
+
+    # Hidden/output layers get scaled LR; embeddings use base LR.
+    hidden_predicate = ParamWithNamePredicate(
+        name="mup_hidden_and_output",
+        fn=lambda p, n: (
+            'embedding' not in n.lower()
+        ),
+    )
+
+    override: ParamGroupOverride = {}
+    if base_lr is not None:
+        override["max_lr"] = base_lr * hidden_lr_mult
+    if base_min_lr is not None:
+        override["min_lr"] = base_min_lr * hidden_lr_mult
+
+    if not override:
+        return {}
+
+    return {ParamKey(with_name_predicate=hidden_predicate): override}
+
+
 def _get_param_groups(
     model_chunks: List[MegatronModule],
     config: OptimizerConfig,

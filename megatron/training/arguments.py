@@ -87,6 +87,7 @@ def add_megatron_arguments(parser: argparse.ArgumentParser):
     parser = _add_msc_args(parser)
     parser = _add_kitchen_quantization_arguments(parser)
     parser = _add_sft_args(parser)
+    parser = _add_mup_args(parser)
 
     return parser
 
@@ -3616,4 +3617,27 @@ def _add_sft_args(parser):
     group.add_argument('--sft', action="store_true", help='Megatron SFT training')
     group.add_argument('--sft-tokenizer-prompt-format', type=str, default="nemotron-h-aligned",
                        help='SFT prompt format.')
+    return parser
+
+
+def _add_mup_args(parser):
+    """Add Maximal Update Parameterization (MuP) arguments."""
+    group = parser.add_argument_group(title='mup')
+    group.add_argument('--use-mup', action='store_true',
+                       help='Enable Maximal Update Parameterization (MuP) for '
+                            'hyperparameter transfer across model widths.')
+    group.add_argument('--mup-base-hidden-size', type=int, default=None,
+                       help='Base hidden size for MuP width scaling. '
+                            'Required when --use-mup is set. The width multiplier '
+                            'is computed as hidden_size / mup_base_hidden_size.')
+    group.add_argument('--mup-embedding-mult', type=float, default=1.0,
+                       help='Multiplier for embedding layer output. '
+                            'Default: 1.0 (no scaling).')
+    group.add_argument('--mup-output-mult', type=float, default=1.0,
+                       help='Multiplier for output logits before softmax. '
+                            'Default: 1.0 (no scaling).')
+    group.add_argument('--mup-attn-scale-power', type=float, default=1.0,
+                       help='Power for attention scaling: softmax_scale = 1 / (d_head ** power). '
+                            '0.5 = standard (1/sqrt(d)), 1.0 = MuP (1/d). '
+                            'Default: 1.0 (MuP scaling).')
     return parser

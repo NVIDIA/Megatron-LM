@@ -596,6 +596,8 @@ class GPTModel(LanguageModule):
                     weight=output_weight,
                     runtime_gather_output=runtime_gather_output,
                 )
+                # Apply MuP output scaling to MTP logits
+                mtp_logits = self._scale_logits(mtp_logits)
                 # Calc loss for the current Multi-Token Prediction (MTP) layers.
                 mtp_labels, _ = roll_tensor(
                     mtp_labels,
@@ -660,6 +662,9 @@ class GPTModel(LanguageModule):
             hidden_states, weight=output_weight, runtime_gather_output=runtime_gather_output
         )
 
+        # Apply MuP output scaling to logits
+        logits = self._scale_logits(logits)
+
         # Restore sequence parallel execution to the output layer if necessary.
         if sequence_parallel_override:
             assert (
@@ -688,6 +693,27 @@ class GPTModel(LanguageModule):
         loss = self.compute_language_model_loss(labels, logits)
 
         return loss
+
+    def _scale_logits(self, logits: Tensor) -> Tensor:
+        """Apply MuP output scaling to logits.
+
+        Note: Width-based scaling is already handled by mup_scaled_init_method_normal
+        which scales output layer init by 1/sqrt(width_mult). This method only applies
+        the user-configurable mup_output_mult multiplier (default 1.0).
+
+        Args:
+            logits (Tensor): Raw logits from the output layer.
+
+        Returns:
+            Tensor: Scaled logits if MuP is enabled and mup_output_mult != 1.0,
+                    otherwise unchanged logits.
+        """
+        if not self.config.use_mup:
+            return logits
+        # Width scaling handled by init; only apply output multiplier here.
+        if self.config.mup_output_mult != 1.0:
+            return logits * self.config.mup_output_mult
+        return logits
 
     def shared_embedding_or_output_weight(self) -> Tensor:
         """Gets the embedding weight or output logit weights when share input embedding and
