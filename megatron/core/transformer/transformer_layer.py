@@ -1375,7 +1375,6 @@ class MoETransformerLayer(TransformerLayer):
                         functools.partial(
                             _forward_mlp_partial_cudagraphs, padding_mask=padding_mask
                         ),
-
                         False,
                         hidden_states,
                     )
