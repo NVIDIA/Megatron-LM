@@ -45,7 +45,7 @@ spec:
         "TRAINING_PARAMS_PATH=./tests/functional_tests/test_cases/{model}/{test_case}/model_config.yaml"
         "GOLDEN_VALUES_PATH=./tests/functional_tests/test_cases/{model}/{test_case}/golden_values_{environment}_{platforms}.json"
         "OUTPUT_PATH={assets_dir}"
-        "TENSORBOARD_PATH={assets_dir}/generations_{environment}_{platforms}.json"
+        "TENSORBOARD_PATH={assets_dir}/tensorboard"
         "N_REPEAT={n_repeat}"
         "ENABLE_LIGHTWEIGHT_MODE=${{ENABLE_LIGHTWEIGHT_MODE}}"
         "RECORD_CHECKPOINTS=${{RECORD_CHECKPOINTS}}"
@@ -54,15 +54,15 @@ spec:
     bash ./tests/functional_tests/shell_test_utils/run_ci_test.sh ${{ARGUMENTS[@]}}
 
 products:
-  # - test_case: [gpt_grpo_tp1_pp1_dp8_583m_throughputtest] # Offline until golden values are properly written to disk
-  #   products:
-  #     - environment: [dev]
-  #       scope: [mr]
-  #       platforms: [dgx_h100]
-  - test_case: [gpt_grpo_tp1_pp1_dp8_583m_throughputtest_github]
+  - test_case: [gpt_grpo_tp4_pp1_dp2_8b_throughput]
     products:
       - environment: [dev]
-        scope: [mr-github-broken]
+        scope: [mr]
+        platforms: [dgx_h100]
+  - test_case: [gpt_grpo_tp4_pp1_dp2_8b_throughput_github]
+    products:
+      - environment: [dev]
+        scope: [mr-github]
         platforms: [dgx_h100]
   - test_case: [gpt_grpo_tp1tp2_pp1_dp8_583m_throughputtest]
     products:
