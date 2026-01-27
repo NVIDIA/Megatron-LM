@@ -141,3 +141,11 @@ docker run --rm --gpus all --ipc=host --ulimit memlock=-1 \
     --distributed-config-file /workspace/megatron-lm/examples/gptoss/distributed_config.env \
   2>&1 | tee "${HOST_TENSORBOARD_LOGS_PATH}/training_custom_$(date +'%y-%m-%d_%H-%M-%S').log"
 ```
+
+## Step 3: Convert Megatron to HuggingFace
+
+Just run the following command to change from the megatron checkpoint from training to the huggingface format to share with others (make sure you have the same virtual environment setup as in Step 0):
+
+```bash
+python3 -m torch.distributed.launch --nproc-per-node=8 examples/gptoss/03_convert_to_hf.py --hf-model openai/gpt-oss-20b --megatron-model ./megatron_checkpoints/openai_gpt-oss_20b
+```
