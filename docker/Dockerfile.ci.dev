@@ -96,7 +96,7 @@ RUN --mount=type=secret,id=JET_INDEX_URLS \
     JET_INDEX_URLS=$(cat /run/secrets/JET_INDEX_URLS)
     LOGGER_INDEX_URL=$(cat /run/secrets/LOGGER_INDEX_URL)
     uv pip install --no-cache-dir --upgrade $LOGGER_INDEX_URL "one-logger"
-    uv pip install --no-cache-dir --upgrade "setuptools<80.0.0"
+    uv pip install --no-cache-dir --upgrade "setuptools<80.0.0,>=77.0.0"
     uv pip install --no-cache-dir --upgrade $JET_INDEX_URLS "jet-client~=4.0" 
 EOF
 ###

@@ -78,6 +78,8 @@ dev = [
     "opentelemetry-api~=1.33.1",
     "mamba-ssm~=2.2",
     "causal-conv1d~=1.5",
+    "flash-linear-attention~=0.3.2",
+    "nv-grouped-gemm~=1.1",
     "megatron-energon[av_decode]~=6.0",
     "av",
     "flashinfer-python~=0.5.0",
@@ -119,17 +121,6 @@ lts = [
 test = [
     "coverage",
     "nltk",
-    "wrapt",
-    "pytest==8.3.5",
-    "pytest-mock",
-    "pytest-cov",
-    "pytest-random-order",
-    "pytest-asyncio",
-    "pygithub",
-    "pydantic",
-    "tensorboard",
-    "pyyaml",
-    "nemo-run",
 ]
 docs = [
     "sphinx",
@@ -140,13 +131,13 @@ docs = [
     "nvidia-sphinx-theme", # Our NVIDIA theme
 ]
 build = [
-    "setuptools<80.0.0",
+    "setuptools<80.0.0,>=77.0.0",
     "packaging>=24.2",
     "hatchling",
     "pybind11",
     "Cython>=3.0.0",
     "torch",
-    "nvidia-mathdx",     # for TE
+    "nvidia-mathdx",              # for TE
 ]
 linting = [
     "ruff~=0.9.0",
@@ -207,7 +198,7 @@ required_version = "24"
 skip_magic_trailing_comma = true
 include = '\.pyi?$'
 exclude = '''
-/(
+/( 
     \.git
   | \.venv
   | build

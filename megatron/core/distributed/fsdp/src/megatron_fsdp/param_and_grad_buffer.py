@@ -39,6 +39,7 @@ from .mixed_precision import (
     fp8_need_transpose_data_for_meta_device_init,
     fp8_quantize,
     fp8_set_raw_data,
+    get_quantized_model_init_context_cls,
     is_blockwise_float8tensor,
     is_float8tensor,
     is_te_min_version,
@@ -74,7 +75,6 @@ except ImportError:
     logger.info("Megatron Core is not installed, Megatron-FSDP will run without Megatron Core.")
 
 try:
-    from transformer_engine.pytorch import fp8_model_init
     from transformer_engine.pytorch.module.base import TransformerEngineBaseModule
 
     HAVE_TE = True
@@ -1609,6 +1609,18 @@ class ParamAndGradBuffer:
             if self.dist_index.get_outer_fsdp_group() is not None:
                 # Outer/Inter-FSDP group when using hybrid FSDP
                 self.ubr_groups.append(self.dist_index.get_outer_fsdp_group())
+            if (
+                self.dist_index.get_fsdp_group(
+                    is_expert_parallel=False, independent_all_gather=True
+                )
+                is not None
+            ):
+                # All-gather group used when overlapping all-gather and gradient reduction.
+                self.ubr_groups.append(
+                    self.dist_index.get_fsdp_group(
+                        is_expert_parallel=False, independent_all_gather=True
+                    )
+                )
 
             if torch.distributed.get_rank() == 0:
                 logging.info(
@@ -1895,6 +1907,18 @@ class ParamAndGradBuffer:
                     is_expert_parallel=group.is_expert_param
                 )
 
+            # When --create-all-gather-group is enabled, use a separate process group for
+            # all-gather operations (model_weight_buffer) to enable overlap with gradient reduction
+            # operations (main_grad_buffer). This avoids head-of-line blocking between forward
+            # all-gather and backward reduce-scatter on the same communicator.
+            model_wbuf_dp_group = main_buf_dp_group
+            if not group.is_expert_param and not should_create_hfsdp_wbuf_and_gbuf:
+                ag_group = self.dist_index.get_fsdp_group(
+                    is_expert_parallel=False, independent_all_gather=True
+                )
+                if ag_group is not None:
+                    model_wbuf_dp_group = ag_group
+
             gradient_scaling_factor = (
                 self.gradient_scaling_factor
                 if not group.is_expert_param
@@ -1935,10 +1959,10 @@ class ParamAndGradBuffer:
                     self.ddp_config,
                     group.params,
                     is_data_distributed=is_model_weight_buffer_distributed
-                    and main_buf_dp_group.size() > 1,
+                    and model_wbuf_dp_group.size() > 1,
                     dtype=param_dtype,
                     device=self.device,
-                    data_parallel_group=main_buf_dp_group,
+                    data_parallel_group=model_wbuf_dp_group,
                     is_transpose_buffer=False,
                     temporary_bucket_allocator=self.weight_alloc,
                     bucket_id=group_id,
@@ -2648,7 +2672,12 @@ class ParamAndGradBuffer:
 
     @torch.no_grad()
     def copy_main_weights_to_model_weights(self):
-        """Update the model weights from the main weights."""
+        """
+        Update the model weights from the main weights.
+
+        If FP8 parameters are utilized, this function will quantize the high-precision
+        main weights prior to installation into the model compute weight buffers.
+        """
         dense_param_quantize_kwargs = {
             "model_params": [],
             "main_params": [],
@@ -2744,9 +2773,16 @@ class ParamAndGradBuffer:
                     model_param = to_local_if_dtensor(param)
                     main_weight = mbuf.get_item(item_id)
 
+                # TODO(@kunlunl, @cspades): Currently, we only support FP8 parameters
+                # for FSDP, i.e. fully-sharded compute parameters with a high-precision
+                # main weight buffer. Would it be possible to add if branches here to
+                # quantize the original param (no_shard) or wbuf data (optim, optim_grads)
+                # for a seamless user experience and coverage for ZeRO-1 and ZeRO-2?
+
                 if is_blockwise_float8tensor(param):
                     fp8_params.append(param)
                     if model_param.numel() == 0:
+                        # Empty parameter.
                         shard_fp32_from_fp8.append(None)
                         shard_offsets_in_fp8.append(None)
                         shard_model_params.append([None, None])
@@ -2775,6 +2811,7 @@ class ParamAndGradBuffer:
                 if is_float8tensor(param):
                     fp8_params.append(param)
                     if model_param.numel() == 0:
+                        # Empty parameter.
                         shard_fp32_from_fp8.append(None)
                         shard_offsets_in_fp8.append(None)
                         shard_model_params.append([None, None])
@@ -3171,7 +3208,7 @@ class GradReducePipeline:
                     # Scale gradients.
                     scaling_factor = gbuf.gradient_scaling_factor
                     reduce_op = gradient_reduce_preprocessing(
-                        gbuf.data, scaling_factor, gbuf.ddp_config
+                        bucket.data, scaling_factor, gbuf.ddp_config
                     )
                     if not gbuf.is_data_distributed:
                         # All-reduce the gradients on every rank. No scattering
@@ -3738,11 +3775,26 @@ class ResetParametersContext:
     def __enter__(self):
         self.stack = ExitStack()
         if self.init_param_with_fp8:
-            assert HAVE_TE
-            args = {"enabled": True}
-            if "preserve_high_precision_init_val" in inspect.signature(fp8_model_init).parameters:
-                args["preserve_high_precision_init_val"] = True
-            self.stack.enter_context(fp8_model_init(**args))
+            # FIXME(@cspades): This appears to be a legacy dependency that is not needed for
+            # more recent versions of TransformerEngine, which only requires this context during
+            # TransformerEngineBaseModule.__init__. Should be removed if backwards compatibility
+            # is confirmed, because overwrites the quantized_model_init context specified by user.
+            assert (
+                HAVE_TE
+            ), "TransformerEngine is required for using FP8 parameters with Megatron-FSDP."
+            # Retrieve import for quantized_model_init (new) or fp8_model_init (old).
+            # Will be nullcontext if TE is not installed.
+            te_quantized_model_init_cls = get_quantized_model_init_context_cls()
+            if te_quantized_model_init_cls is not nullcontext:
+                # Enable TE quantized parameter context manager.
+                args = {"enabled": True}
+                if (
+                    "preserve_high_precision_init_val"
+                    in inspect.signature(te_quantized_model_init_cls).parameters
+                ):
+                    # Required for Megatron-FSDP + FP8 parameters.
+                    args["preserve_high_precision_init_val"] = True
+                self.stack.enter_context(te_quantized_model_init_cls(**args))
 
         if self.with_cuda_rng_tracker:
             # Megatron / TE RNG tracker needs to be initialized and seeded by the user or FW
