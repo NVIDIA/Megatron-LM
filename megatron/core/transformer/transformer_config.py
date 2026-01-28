@@ -247,7 +247,7 @@ class TransformerConfig(ModelParallelConfig):
     ####################
     # attention variant
     ####################
-    experimental_attention_variant: Optional[str] = None
+    experimental_attention_variant: Optional[Literal['gated_delta_net', 'dsa']] = None
     """Type of attention variant to use. Currently support gated_delta_net and dsa."""
 
     ####################
@@ -279,19 +279,19 @@ class TransformerConfig(ModelParallelConfig):
     - An integer N: Represents a (N-1):N ratio, meaning (N-1) LA layers for every 1 SDPA layer
     - A list that defines a custom pattern, e.g.: [1,1,1,0,1,1,1,0,1,1,1,0]"""
 
-    linear_conv_kernel_dim: Optional[int] = None
+    linear_conv_kernel_dim: Optional[int] = 4
     """Conv kernel dimension for the gated delta net."""
 
-    linear_key_head_dim: Optional[int] = None
+    linear_key_head_dim: Optional[int] = 128
     """Query and key head dimension for the gated delta net."""
 
-    linear_value_head_dim: Optional[int] = None
+    linear_value_head_dim: Optional[int] = 128
     """Value and gate head dimension for the gated delta net."""
 
-    linear_num_key_heads: Optional[int] = None
+    linear_num_key_heads: Optional[int] = 16
     """Number of query and key heads for the gated delta net."""
 
-    linear_num_value_heads: Optional[int] = None
+    linear_num_value_heads: Optional[int] = 32
     """Number of value and gate heads for the gated delta net."""
 
     ####################
