@@ -7,6 +7,7 @@ import logging
 import math
 import warnings
 from abc import ABC, abstractmethod
+from collections import defaultdict
 from itertools import chain
 from logging import getLogger
 from typing import Any, Callable, Dict, List, Optional, Tuple, Union
@@ -343,41 +344,94 @@ class MegatronOptimizer(ABC):
 
     def offload_to_cpu(self):
         """Function used for RL training.
-        Move optimizer state tensors to CPU to free GPU memory during inference."""
+        Move optimizer state tensors to CPU to free GPU memory during inference.
+
+        Uses async transfers with pinned memory to overlap transfers and hide latency.
+        """
         if getattr(self, 'optimizer', None) is not None and not getattr(
             self, 'is_stub_optimizer', False
         ):
             log_single_rank(logger, logging.INFO, '[OFFLOAD] moving optimizer state to CPU')
-            # Move all optimizer tensors to CPU while keeping the optimizer instance
-            for param_group in self.optimizer.param_groups:
-                for p in param_group['params']:
-                    if isinstance(p, torch.Tensor) and p.is_cuda:
-                        p.data = p.data.cpu()
 
-            for state_dict in self.optimizer.state.values():
-                for k, v in state_dict.items():
-                    if isinstance(v, torch.Tensor) and v.is_cuda:
-                        state_dict[k] = v.cpu()
+            stream = torch.cuda.Stream()
 
+            with torch.cuda.stream(stream):
+                # Move param tensors to CPU asynchronously
+                for param_group in self.optimizer.param_groups:
+                    for p in param_group['params']:
+                        if isinstance(p, torch.Tensor) and p.is_cuda:
+                            cpu_tensor = torch.empty(
+                                p.shape, dtype=p.dtype, device='cpu', pin_memory=True
+                            )
+                            cpu_tensor.copy_(p.data, non_blocking=True)
+                            p.data = cpu_tensor
+
+                # Move optimizer state tensors to CPU asynchronously
+                for state_dict in self.optimizer.state.values():
+                    for k, v in state_dict.items():
+                        if isinstance(v, torch.Tensor) and v.is_cuda:
+                            cpu_tensor = torch.empty(
+                                v.shape, dtype=v.dtype, device='cpu', pin_memory=True
+                            )
+                            cpu_tensor.copy_(v, non_blocking=True)
+                            state_dict[k] = cpu_tensor
+
+            stream.synchronize()
             torch.cuda.empty_cache()
 
     def restore_from_cpu(self):
         """Function used for RL training.
-        Restore optimizer state tensors from CPU back to GPU for training."""
+        Restore optimizer state tensors from CPU back to GPU for training.
+
+        Uses batched transfers grouped by dtype for maximum throughput, since we
+        must wait for all transfers to complete before training can proceed.
+        """
         if getattr(self, 'optimizer', None) is not None and not getattr(
             self, 'is_stub_optimizer', False
         ):
             log_single_rank(logger, logging.INFO, '[RESTORE] moving optimizer state back to GPU')
-            # Move all optimizer tensors back to GPU
+
+            # Collect all CPU tensors grouped by dtype
+            # Each entry: ('param', param_obj, None) or ('state', (state_dict, key), tensor)
+            by_dtype: Dict[torch.dtype, List[Tuple]] = defaultdict(list)
+
             for param_group in self.optimizer.param_groups:
                 for p in param_group['params']:
                     if isinstance(p, torch.Tensor) and not p.is_cuda:
-                        p.data = p.data.cuda()
+                        by_dtype[p.dtype].append(('param', p, p.data))
 
             for state_dict in self.optimizer.state.values():
                 for k, v in state_dict.items():
                     if isinstance(v, torch.Tensor) and not v.is_cuda:
-                        state_dict[k] = v.cuda()
+                        by_dtype[v.dtype].append(('state', (state_dict, k), v))
+
+            # Batch transfer each dtype group
+            for dtype, items in by_dtype.items():
+                if not items:
+                    continue
+
+                # Flatten and concatenate all tensors of this dtype
+                flat_tensors = [item[2].view(-1) for item in items]
+                mega_tensor_cpu = torch.cat(flat_tensors)
+
+                # Single transfer to GPU
+                mega_tensor_gpu = mega_tensor_cpu.cuda()
+                del mega_tensor_cpu
+
+                # Unpack back to original locations
+                offset = 0
+                for loc_type, loc, original_tensor in items:
+                    numel = original_tensor.numel()
+                    chunk = mega_tensor_gpu[offset : offset + numel].view(original_tensor.shape)
+                    offset += numel
+
+                    if loc_type == 'param':
+                        loc.data = chunk
+                    else:
+                        state_dict, key = loc
+                        state_dict[key] = chunk
+
+                del mega_tensor_gpu
 
     @staticmethod
     def _filter_and_reorder_param_groups(
