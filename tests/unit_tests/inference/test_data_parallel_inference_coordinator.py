@@ -22,6 +22,7 @@ from megatron.core.inference.inference_request import (
     Status,
 )
 from megatron.core.inference.sampling_params import SamplingParams
+from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.utils import get_asyncio_loop
 from tests.unit_tests.test_utilities import Utils
 
@@ -32,7 +33,37 @@ try:
 except Exception:
     HAVE_ZMQ = False
 
-IS_ZMQ_FLAKY = True
+class DummyTokenizer:
+    """Dummy tokenizer."""
+    def __init__(self, vocab_size: int, bos: int | None = None, eod: int = 0, pad: int = 0):
+        self.vocab_size = vocab_size
+        self.bos = bos
+        self.eod = eod
+        self.pad = pad
+
+    def tokenize(self, prompt):
+        if isinstance(prompt, str):
+            tokens = [int(tok) % self.vocab_size for tok in prompt.strip().split()]
+        else:
+            tokens = list(prompt)
+        return tokens
+
+    def detokenize(self, tokens, skip_special_tokens: bool = False):
+        if isinstance(tokens, torch.Tensor):
+            tokens = tokens.tolist()
+        if skip_special_tokens and self.eod in tokens:
+            tokens = [tok for tok in tokens if tok != self.eod]
+        return " ".join(str(tok) for tok in tokens)
+
+    def offsets(self, tokens, text):
+        if isinstance(tokens, torch.Tensor):
+            tokens = tokens.tolist()
+        offsets = []
+        cursor = 0
+        for tok in tokens:
+            offsets.append(cursor)
+            cursor += len(str(tok)) + 1
+        return offsets
 
 
 class DummyContext:
@@ -43,6 +74,13 @@ class DummyContext:
 
     def get_active_request_count(self) -> int:
         return self.active_cnt
+
+
+class DummyController:
+    """Dummy inference controller."""
+
+    def __init__(self):
+        self.tokenizer = DummyTokenizer(vocab_size=10)
 
 
 class DummyEngine(DynamicInferenceEngine):
@@ -56,12 +94,14 @@ class DummyEngine(DynamicInferenceEngine):
         self.is_suspended = False
         self._loop = get_asyncio_loop()
         self.context = DummyContext()
+        self.controller = DummyController()
         self.running = asyncio.Event()
         self.paused = asyncio.Event()
         self.stopped = asyncio.Event()
         self.pending_microbatch = deque()
         self.received_pause: bool = False
         self.received_stop: bool = False
+        self.pg_collection = ProcessGroupCollection.use_mpu_process_groups()
 
     def add_request(
         self, request_id: int, prompt: str, sampling_params: Optional[SamplingParams] = None
@@ -190,7 +230,7 @@ class TestCoordinator:
 
         # Connect each engine to their respective processes.
         env.timing_data["start_time"] = time.time()
-        await env.engine.start_listening_to_data_parallel_coordinator(
+        dp_addr = await env.engine.start_listening_to_data_parallel_coordinator(
             inference_coordinator_port=test_config.port,
             launch_inference_coordinator=test_config.launch_inference_coordinator,
         )
@@ -199,7 +239,7 @@ class TestCoordinator:
         shutdown_success = False
         try:
             if dist.get_rank() == 0:
-                client = InferenceClient(test_config.port)
+                client = InferenceClient(dp_addr)
                 await client.start()
                 env.timing_data["init_time"] = time.time()
 
@@ -245,7 +285,6 @@ class TestCoordinator:
         Utils.destroy_model_parallel()
 
     @pytest.mark.internal
-    @pytest.mark.skipif(IS_ZMQ_FLAKY, reason="pyzmq is flaky in CI")
     @pytest.mark.skipif(not HAVE_ZMQ, reason="pyzmq is required for this test")
     @pytest.mark.asyncio
     async def test_simple(self):
@@ -253,7 +292,6 @@ class TestCoordinator:
         env = await self._run_test(tensor_model_parallel_size=1, pipeline_model_parallel_size=1)
 
     @pytest.mark.internal
-    @pytest.mark.skipif(IS_ZMQ_FLAKY, reason="pyzmq is flaky in CI")
     @pytest.mark.skipif(not HAVE_ZMQ, reason="pyzmq is required for this test")
     @pytest.mark.asyncio
     async def test_tp(self):
@@ -261,23 +299,6 @@ class TestCoordinator:
         env = await self._run_test(tensor_model_parallel_size=2, pipeline_model_parallel_size=1)
 
     @pytest.mark.internal
-    @pytest.mark.skipif(IS_ZMQ_FLAKY, reason="pyzmq is flaky in CI")
-    @pytest.mark.skipif(not HAVE_ZMQ, reason="pyzmq is required for this test")
-    @pytest.mark.asyncio
-    async def test_pp(self):
-        """Simple test with no TP, but PP."""
-        env = await self._run_test(tensor_model_parallel_size=1, pipeline_model_parallel_size=2)
-
-    @pytest.mark.internal
-    @pytest.mark.skipif(IS_ZMQ_FLAKY, reason="pyzmq is flaky in CI")
-    @pytest.mark.skipif(not HAVE_ZMQ, reason="pyzmq is required for this test")
-    @pytest.mark.asyncio
-    async def test_tp_pp(self):
-        """Simple test with both TP and PP."""
-        env = await self._run_test(tensor_model_parallel_size=2, pipeline_model_parallel_size=2)
-
-    @pytest.mark.internal
-    @pytest.mark.skipif(IS_ZMQ_FLAKY, reason="pyzmq is flaky in CI")
     @pytest.mark.skipif(not HAVE_ZMQ, reason="pyzmq is required for this test")
     @pytest.mark.asyncio
     async def test_pp(self):
@@ -286,7 +307,6 @@ class TestCoordinator:
 
     @pytest.mark.internal
     @pytest.mark.skipif(not HAVE_ZMQ, reason="pyzmq is required for this test")
-    @pytest.mark.skipif(IS_ZMQ_FLAKY, reason="pyzmq is flaky in CI")
     @pytest.mark.asyncio
     async def test_tp_pp(self):
         """Simple test with both TP and PP."""
@@ -294,7 +314,41 @@ class TestCoordinator:
 
     @pytest.mark.internal
     @pytest.mark.skipif(not HAVE_ZMQ, reason="pyzmq is required for this test")
-    @pytest.mark.skipif(IS_ZMQ_FLAKY, reason="pyzmq is flaky in CI")
+    @pytest.mark.asyncio
+    async def test_pp(self):
+        """Simple test with no TP, but PP."""
+        env = await self._run_test(tensor_model_parallel_size=1, pipeline_model_parallel_size=2)
+
+    @pytest.mark.internal
+    @pytest.mark.skipif(not HAVE_ZMQ, reason="pyzmq is required for this test")
+    @pytest.mark.asyncio
+    async def test_tp_pp(self):
+        """Simple test with both TP and PP."""
+        env = await self._run_test(tensor_model_parallel_size=2, pipeline_model_parallel_size=2)
+
+    @pytest.mark.internal
+    @pytest.mark.skipif(not HAVE_ZMQ, reason="pyzmq is required for this test")
+    @pytest.mark.asyncio
+    async def test_no_launch(self):
+        """Test initialization without launching the coordinator from the engine."""
+        # Initialize normally, but do not stop engines.
+        env = await self._run_test(stop_engines=False)
+        # Attempt to initialize again without launching the coordinator.
+        env = await self._run_test(launch_inference_coordinator=False)
+
+    @pytest.mark.internal
+    @pytest.mark.skipif(not HAVE_ZMQ, reason="pyzmq is required for this test")
+    @pytest.mark.asyncio
+    async def test_forbid_multiple_launch(self):
+        """Test attempting to relaunch the coordinator at the same IP."""
+        # Initialize normally, but do not stop engines.
+        env = await self._run_test(stop_engines=False)
+        # Attempt to initialize again and re-launch the coordinator.
+        with pytest.raises(RuntimeError):
+            env = await self._run_test(launch_inference_coordinator=True)
+
+    @pytest.mark.internal
+    @pytest.mark.skipif(not HAVE_ZMQ, reason="pyzmq is required for this test")
     @pytest.mark.asyncio
     async def test_pause(self):
         """Pause/resume test."""
@@ -385,7 +439,6 @@ class TestCoordinator:
 
     @pytest.mark.internal
     @pytest.mark.skipif(not HAVE_ZMQ, reason="pyzmq is required for this test")
-    @pytest.mark.skipif(IS_ZMQ_FLAKY, reason="pyzmq is flaky in CI")
     @pytest.mark.asyncio
     async def test_throughput(self):
         """Throughput test with no TP or PP."""
@@ -409,7 +462,7 @@ class TestCoordinator:
 
         if dist.get_rank() == 0:
             init_duration = (env.timing_data["init_time"] - env.timing_data["start_time"]) * 10**3
-            golden_init_duration = 4445.64  # ms
+            golden_init_duration = 7684.46  # ms
             run_duration = (env.timing_data["done_time"] - env.timing_data["init_time"]) * 10**3
             golden_run_duration = 2906.29  # ms
             stop_duration = (env.timing_data["stop_time"] - env.timing_data["done_time"]) * 10**3
