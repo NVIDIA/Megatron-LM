@@ -8,10 +8,9 @@ torch._grouped_mm without host synchronization.
 """
 
 import torch
-from typing import List, Optional, Tuple
+from typing import List, Optional
 
 from megatron.core.process_groups_config import ProcessGroupCollection
-from megatron.core.transformer.moe.moe_utils import sort_chunks_by_idxs
 from megatron.core.transformer.moe.token_dispatcher import MoEAlltoAllTokenDispatcher
 from megatron.core.transformer.transformer_config import TransformerConfig
 
@@ -89,51 +88,41 @@ class InferenceAlltoAllTokenDispatcher(MoEAlltoAllTokenDispatcher):
     def _maybe_dtoh_and_synchronize(
         self, point: str, tokens_per_expert: Optional[torch.Tensor] = None
     ) -> torch.Tensor:
-        """Move splits to CPU for AlltoAll, but keep tokens_per_expert on GPU.
+        """No-op for single GPU inference - all metadata stays on GPU.
 
-        The parent class moves all tensors to CPU including tokens_per_expert.
-        For inference with torch._grouped_mm, we need tokens_per_expert to stay
-        on GPU to avoid host synchronization.
+        For single GPU (ep_size=1, tp_size=1):
+        - input_splits, output_splits, output_splits_tp are all None (no AlltoAll needed)
+        - tokens_per_expert stays on GPU for torch._grouped_mm
+        - No DtoH transfers or synchronization required
 
-        This override:
-        - Still moves input_splits, output_splits, etc. to CPU (required by AlltoAll)
-        - Still does stream synchronization
-        - But keeps tokens_per_expert on GPU (for torch._grouped_mm)
+        This enables fully CUDA-graphable MoE forward pass.
         """
-        from megatron.core.transformer.moe.token_dispatcher import maybe_move_tensor_to_cpu
+        # Validate single GPU assumptions
+        assert self.ep_size == 1, (
+            f"InferenceAlltoAllTokenDispatcher requires ep_size=1, got {self.ep_size}"
+        )
+        assert self.tp_size == 1, (
+            f"InferenceAlltoAllTokenDispatcher requires tp_size=1, got {self.tp_size}"
+        )
+        assert self.input_splits is None, (
+            "input_splits should be None for single GPU inference"
+        )
+        assert self.output_splits is None, (
+            "output_splits should be None for single GPU inference"
+        )
+        assert self.output_splits_tp is None, (
+            "output_splits_tp should be None for single GPU inference"
+        )
+        assert not isinstance(self.num_out_tokens, torch.Tensor), (
+            "num_out_tokens should be a Python int for dropless single GPU inference, "
+            f"got {type(self.num_out_tokens)}. Ensure moe_expert_capacity_factor is None "
+            "and moe_router_padding_for_quantization is False."
+        )
+        assert tokens_per_expert.is_cuda, (
+            "tokens_per_expert should be on GPU for single GPU inference"
+        )
 
-        if not self.drop_and_pad:
-            if point == self.cuda_dtoh_point:
-                # Move splits to CPU (required by torch.distributed.all_to_all_single)
-                on_side_stream = torch.cuda.current_stream() != self.cuda_dtoh_stream
-                if on_side_stream:
-                    self.cuda_dtoh_stream.wait_stream(torch.cuda.current_stream())
-                with torch.cuda.stream(self.cuda_dtoh_stream):
-                    # Move AlltoAll splits to CPU (required)
-                    self.input_splits = maybe_move_tensor_to_cpu(
-                        self.input_splits, as_numpy=True, record_stream=on_side_stream
-                    )
-                    self.output_splits = maybe_move_tensor_to_cpu(
-                        self.output_splits, as_numpy=True, record_stream=on_side_stream
-                    )
-                    self.output_splits_tp = maybe_move_tensor_to_cpu(
-                        self.output_splits_tp, as_numpy=True, record_stream=on_side_stream
-                    )
-                    self.num_out_tokens = maybe_move_tensor_to_cpu(
-                        self.num_out_tokens, record_stream=on_side_stream
-                    )
-                    if self.num_local_experts > 1 and not self.config.moe_permute_fusion:
-                        self.num_global_tokens_per_local_expert = maybe_move_tensor_to_cpu(
-                            self.num_global_tokens_per_local_expert, record_stream=on_side_stream
-                        )
-                    # NOTE: We intentionally do NOT move tokens_per_expert to CPU here.
-                    # It stays on GPU for use with torch._grouped_mm.
-                self.d2h_event = self.cuda_dtoh_stream.record_event()
 
-            if point == self.cuda_sync_point:
-                # Synchronize with the DtoH stream
-                self.d2h_event.synchronize()
-
-        # Return tokens_per_expert unchanged (stays on GPU!)
+        # No DtoH transfers needed - return tokens_per_expert unchanged (stays on GPU!)
         return tokens_per_expert
 

@@ -1008,6 +1008,36 @@ class TransformerConfig(ModelParallelConfig):
         if self.expert_model_parallel_size > 1 and self.num_moe_experts is None:
             raise ValueError("num_moe_experts must be non None to use expert-parallel.")
 
+        if self.transformer_impl == "inference_optimized" and (
+            self.expert_model_parallel_size * self.expert_tensor_parallel_size > 1
+        ):
+            raise ValueError(
+                "Inference-optimized MoE layers currently only support data parallelism "
+                "(expert_model_parallel_size=1 and expert_tensor_parallel_size=1). "
+                "Multi-GPU support is planned for future work."
+            )
+
+        if self.transformer_impl == "inference_optimized" and (
+            self.moe_expert_capacity_factor is not None
+            or self.moe_router_padding_for_quantization
+        ):
+            raise ValueError(
+                "Inference-optimized MoE layers only support dropless MoE "
+                "(moe_expert_capacity_factor=None and moe_router_padding_for_quantization=False). "
+            )
+
+        if self.transformer_impl == "inference_optimized" and self.num_moe_experts is not None:
+            if not self.moe_permute_fusion:
+                raise ValueError(
+                    "Inference-optimized MoE layers require moe_permute_fusion=True "
+                    "to use TE fused kernels that support GPU-resident metadata."
+                )
+            if not self.moe_router_fusion:
+                raise ValueError(
+                    "Inference-optimized MoE layers require moe_router_fusion=True "
+                    "to use TE fused router kernels."
+                )
+
         if self.num_moe_experts is not None and self.num_moe_experts <= 0:
             raise ValueError("num_moe_experts must be non-negative.")
 
