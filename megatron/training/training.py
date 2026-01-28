@@ -557,7 +557,7 @@ def num_floating_point_operations(args, batch_size):
                                 * moe_latent_size
                                 / args.hidden_size
                             )  # Routed experts run on moe_latent_size.
-                            + moe_latent_size  # Up proj and down proj.
+                            + 2 * moe_latent_size  # Up proj and down proj.
                         )
                     )
                     * num_moe_layers
