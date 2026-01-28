@@ -1008,8 +1008,6 @@ def pretrain(
         args.do_valid,
         args.do_test,
         args.dataloader_type,
-        args.retro_project_dir,
-        args.retro_cyclic_train_iters,
     )
 
     # Print setup timing.
@@ -1026,11 +1024,6 @@ def pretrain(
 
     if not args.skip_train:
         print_rank_0('training ...')
-
-        if args.dataloader_type == 'cyclic' and args.retro_project_dir:
-            assert args.retro_cyclic_train_iters is not None
-            args.train_iters = args.retro_cyclic_train_iters
-            print_rank_0("retro cyclic train iters : %d" % args.train_iters)
 
         iteration = 0
         if args.do_train and args.train_iters > 0:
