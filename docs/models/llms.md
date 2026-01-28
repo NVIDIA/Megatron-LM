@@ -31,12 +31,6 @@ See the [Megatron Bridge supported models list](https://github.com/NVIDIA-NeMo/M
 |-------|-------------|--------------|
 | **T5** | Text-to-Text Transfer Transformer | Unified text-to-text framework, sequence-to-sequence |
 
-## Retrieval-Augmented Models
-
-| Model | Description | Key Features |
-|-------|-------------|--------------|
-| **RETRO** | Retrieval-Enhanced Transformer | Retrieval-augmented generation, knowledge grounding |
-
 ## Example Scripts
 
 Training examples for these models can be found in the `examples/` directory:
@@ -46,7 +40,6 @@ Training examples for these models can be found in the `examples/` directory:
 - `examples/mamba/` - Mamba training scripts
 - `examples/bert/` - BERT training scripts
 - `examples/t5/` - T5 training scripts
-- `examples/retro/` - RETRO training scripts
 
 ## Model Implementation
 
