@@ -4,18 +4,18 @@
 
 import copy
 import functools
+import json
 import os
+import random
 import sys
 import warnings
 
+import modelopt.torch.quantization as mtq
 import torch
 import torch.distributed
-from datasets import load_dataset
+from modelopt.torch.export import import_mcore_gpt_from_hf
+from modelopt.torch.utils.dataset_utils import get_dataset_dataloader
 from tqdm import tqdm
-
-sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "../../../")))
-
-import modelopt.torch.quantization as mtq
 
 try:
     import modelopt.torch.quantization.plugins.psx_formats as mtq_psx
@@ -24,17 +24,14 @@ except ImportError:
     warnings.warn(
         "psx_formats is not installed. PSX formats quantization configs will not be available."
     )
-
 try:
     import modelopt.torch.quantization.plugins.luts as mtq_luts
 except ImportError:
     mtq_luts = None
     warnings.warn("luts is not installed. LUTs quantization configs will not be available.")
 
+sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "../../../")))
 
-from modelopt.torch.export import import_mcore_gpt_from_hf
-
-from megatron.core import parallel_state
 from megatron.core.transformer.moe.router import TopKRouter
 from megatron.post_training.arguments import add_modelopt_args
 from megatron.post_training.checkpointing import load_modelopt_checkpoint
@@ -81,10 +78,21 @@ def add_text_generate_ptq_args(parser):
         "--calib-size", type=int, default=512, help="Samples to use for ptq calibration."
     )
     group.add_argument(
-        "--calib-dataset",
+        "--calib-dataset-path-or-name",
         type=str,
-        default="abisee/cnn_dailymail",
-        help="The default clibration dataset is cnn_dailymail from HF hub.",
+        default="cnn_dailymail",
+        help="Path to local calibration dataset file (.json/.jsonl) or HuggingFace dataset name.",
+    )
+    group.add_argument(
+        "--calib-max-sequence-length",
+        type=int,
+        default=512,
+        help="Maximum sequence length for calibration.",
+    )
+    group.add_argument(
+        "--calib-use-random-offset",
+        action="store_true",
+        help="Use random offsets when slicing sequences for calibration. (Only for local files)",
     )
     group.add_argument(
         "--prompts",
@@ -251,15 +259,76 @@ def get_modelopt_torch_quantization_config():
     return mtq_config
 
 
-def get_calib_dataloader(calib_size=512, max_sequence_length=512):
-    """Return a dataloader for calibration."""
-    args = get_args()
-    dataset = load_dataset(args.calib_dataset, name="3.0.0", split="train")
-    text_column = "article"
+def get_calib_dataloader(
+    dataset_path_or_name,
+    calib_size=512,
+    max_sequence_length=512,
+    use_random_offset=False,
+    tokenizer=None,
+):
+    """Return a dataloader/iterator for calibration using SFT or HF datasets.
 
-    calib_size = min(len(dataset), calib_size)
-    for i in range(calib_size):
-        yield dataset[i][text_column][:max_sequence_length]
+    Supports either a local path (.json, .jsonl) or a HuggingFace dataset name.
+
+    Args:
+        dataset_path_or_name (str): Local path to json/jsonl or HuggingFace dataset name.
+        calib_size (int): Number of calibration samples to yield.
+        max_sequence_length (int): Maximum number of tokens in sequence.
+        use_random_offset (bool): Whether to start sequence at random offsets. Default: False.
+        tokenizer (Tokenizer): Tokenizer to use for tokenization.
+
+    Yields:
+        torch.Tensor: input_ids tensor of shape (seq_len,) ready for model input.
+    """
+    if os.path.isfile(dataset_path_or_name):
+        # Local file
+        print_rank_0(f"Loading calibration dataset from local file: {dataset_path_or_name}")
+        if dataset_path_or_name.endswith(".jsonl"):
+            with open(dataset_path_or_name, "r") as f:
+                dataset = [json.loads(line) for line in f if line.strip()]
+        else:  # assume .json list
+            with open(dataset_path_or_name, "r") as f:
+                dataset = json.load(f)
+            assert isinstance(dataset, list), "Dataset should be a list"
+
+        print_rank_0(f"Loaded calibration dataset ({dataset_path_or_name}) with {len(dataset)} samples")
+        calib_size = min(len(dataset), calib_size)
+        print_rank_0(f"Calibration will run for {calib_size} steps with {max_sequence_length} max seq length")
+        print_rank_0(f"Sampling Strategy: {'Random Index' if use_random_offset else 'From Beginning'}")
+
+        for i in range(calib_size):
+            sample = dataset[i]
+            # Extract text field from various possible keys
+            if "text" in sample:
+                full_text = sample["text"]
+            elif "content" in sample:
+                full_text = sample["content"]
+            else:
+                raise ValueError(f"Sample {i} missing 'text' or 'content' field: {list(sample.keys())}")
+
+            start_idx = 0
+            # Check if sequence is long enough to be sliced
+            if use_random_offset and len(full_text) > max_sequence_length:
+                start_idx = random.randint(0, len(full_text) - max_sequence_length)
+
+            text = full_text[start_idx : start_idx + max_sequence_length]
+            tokens = tokenizer(text, return_tensors="pt")
+            yield tokens["input_ids"].cuda()
+    else:
+        # HuggingFace dataset
+        if use_random_offset:
+            warnings.warn("Random offset is not supported for HuggingFace datasets.")
+        print_rank_0(f"Loading calibration dataset from HuggingFace: {dataset_path_or_name}")
+        dataloader = get_dataset_dataloader(
+            dataset_name=dataset_path_or_name,
+            tokenizer=tokenizer,
+            num_samples=calib_size,
+            max_sample_length=max_sequence_length,
+            batch_size=1,
+            device="cuda",
+        )
+        for sample in dataloader:
+            yield sample["input_ids"]
 
 
 if __name__ == "__main__":
@@ -315,12 +384,29 @@ if __name__ == "__main__":
             if all_references[idx] is not None:
                 assert all_references[idx] == generated_texts[0], all_references[idx]
 
-    def _hf_dataset_forword_loop_func(model):
-        dataloader = get_calib_dataloader(args.calib_size)
+    def _dataset_forward_loop_func(model):
+        dataloader = get_calib_dataloader(
+            dataset_path_or_name=args.calib_dataset_path_or_name,
+            calib_size=args.calib_size,
+            max_sequence_length=args.calib_max_sequence_length,
+            use_random_offset=args.calib_use_random_offset,
+            tokenizer=tokenizer,
+        )
 
-        for prompt in tqdm(dataloader, total=args.calib_size, disable=torch.distributed.get_rank()):
-            tokens = tokenizer(prompt, return_tensors="pt")
-            generated_ids = simple_generate(model, tokens.input_ids.cuda(), osl=1)
+        if args.force_all_expert_routing:
+            for module in model.modules():
+                if isinstance(module, TopKRouter):
+                    module.topk = module.num_experts
+
+        # get_calib_dataloader yields untokenized text (local files) or
+        # returns dataloader with tokenized input_ids (HF datasets)
+        for input_ids in tqdm(dataloader, total=args.calib_size, disable=torch.distributed.get_rank()):
+            _ = simple_generate(model, input_ids, osl=1)
+
+            if args.force_all_expert_routing:
+                for module in model.modules():
+                    if isinstance(module, TopKRouter):
+                        module.topk = module.config.moe_router_topk
 
     unwrapped_model = unwrap_model(model)[0]
 
@@ -334,16 +420,15 @@ if __name__ == "__main__":
             raise ValueError(f"Unsupported quantization config {args.export_quant_cfg}.")
         print_rank_0("Quantizing the model...")
         mtq_config = get_modelopt_torch_quantization_config()
-        ptq_forward_loop_func = _hf_dataset_forword_loop_func
 
         if args.weight_only:
             mtq.quantize(unwrapped_model, mtq_config)
         elif hasattr(unwrapped_model, "calibration_mode"):
             unwrapped_model.calibration_mode = True
-            mtq.quantize(unwrapped_model, mtq_config, ptq_forward_loop_func)
+            mtq.quantize(unwrapped_model, mtq_config, _dataset_forward_loop_func)
             unwrapped_model.calibration_mode = False
         else:
-            mtq.quantize(unwrapped_model, mtq_config, ptq_forward_loop_func)
+            mtq.quantize(unwrapped_model, mtq_config, _dataset_forward_loop_func)
 
         if args.compress:
             mtq.compress(unwrapped_model)
