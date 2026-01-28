@@ -15,10 +15,6 @@ import torch.nn.functional as F
 from packaging.version import Version as PkgVersion
 
 from megatron.core.dist_checkpointing.validation import StrictHandling
-from megatron.core.models.retro.utils import (
-    get_config_path as get_retro_config_path,
-    get_gpt_data_dir as get_retro_data_dir,
-)
 from megatron.core.rerun_state_machine import RerunStateMachine
 from megatron.core.transformer import MLATransformerConfig, TransformerConfig
 from megatron.core.transformer.pipeline_parallel_layer_layout import PipelineParallelLayerLayout
@@ -77,7 +73,6 @@ def add_megatron_arguments(parser: argparse.ArgumentParser):
     parser = _add_workload_inspector_server_args(parser)
     parser = _add_inference_args(parser)
     parser = _add_transformer_engine_args(parser)
-    parser = _add_retro_args(parser)
     parser = _add_experimental_args(parser)
     parser = _add_one_logger_args(parser)
     parser = _add_inprocess_restart_args(parser)
@@ -201,81 +196,6 @@ def validate_model_config_args_from_heterogeneous_config(args):
             f"Arguments differ from heterogeneous config: {incompatible_args_str}"
         )
 
-
-def load_retro_config(retro_project_dir):
-    '''Load Retro's config.json.'''
-
-    # Retro config path.
-    retro_config_path = get_retro_config_path(retro_project_dir)
-    assert os.path.exists(retro_config_path), \
-        "Retro project dir missing config.json."
-
-    # Load retro config.
-    with open(retro_config_path) as f:
-        retro_config = types.SimpleNamespace(**json.load(f))
-
-    return retro_config
-
-
-def load_retro_args(args):
-    """Load predefined args from Retro config (if applicable).
-
-    When using Retro (or GPT for comparison purposes), data arguments are
-    overridden by the saved config.json within the Retro project directory. This
-    is to ensure that the data used for pretraining is consistent with the data
-    that was preprocessed using the Retro preprocessing pipeline (see
-    `tools/retro/preprocess_data.py`).
-    """
-
-    # Return if no project directory is specified.
-    if args.retro_project_dir is None:
-        return
-
-    # Load retro config.
-    retro_config = load_retro_config(args.retro_project_dir)
-
-    # Retro data path is relative to project dir (via hard or soft links).
-    data_dir = get_retro_data_dir(args.retro_project_dir)
-    data_path = list(retro_config.retro_gpt_data_path)
-    if len(data_path) % 2 == 0:
-        for i in range(len(data_path) - 1, -1, -2):
-            data_path[i] = os.path.join(data_dir, data_path[i])
-    else:
-        assert len(data_path) == 1
-        data_path[0] = os.path.join(data_dir, data_path[0])
-
-    # Update args.
-    args.data_cache_path = retro_config.retro_gpt_data_cache_path
-    args.data_path = data_path if args.data_path is None else args.data_path
-    args.eval_interval = retro_config.retro_gpt_eval_interval
-    args.eval_iters = retro_config.retro_gpt_eval_iters
-    args.global_batch_size = retro_config.retro_gpt_global_batch_size
-    args.max_position_embeddings = retro_config.retro_gpt_seq_length
-    args.merge_file = os.path.join(
-        args.retro_project_dir,
-        retro_config.retro_gpt_merge_file,
-    ) if retro_config.retro_gpt_merge_file is not None else None
-    args.seed = retro_config.retro_gpt_seed
-    args.seq_length = retro_config.retro_gpt_seq_length
-    args.tokenizer_model = os.path.join(
-        args.retro_project_dir,
-        retro_config.retro_gpt_tokenizer_model,
-    ) if retro_config.retro_gpt_tokenizer_model is not None else None
-    args.tokenizer_type = retro_config.retro_gpt_tokenizer_type
-    args.train_samples = retro_config.retro_gpt_train_samples
-    args.vocab_file = os.path.join(
-        args.retro_project_dir,
-        retro_config.retro_gpt_vocab_file,
-    ) if retro_config.retro_gpt_vocab_file is not None else None
-
-    # Retro-specific args.
-    args.retro_block_size = retro_config.retro_block_size
-    args.retro_chunk_length = retro_config.retro_gpt_chunk_length
-    args.retro_neighbor_dirs = retro_config.retro_neighbor_dirs
-    args.retro_split_preprocessing = retro_config.retro_gpt_split
-    args.retro_bert_tokenizer_type = retro_config.retro_bert_tokenizer_type
-    args.retro_bert_vocab_file = retro_config.retro_bert_vocab_file
-
 def _eval_pattern(pattern):
     """ Validate and evaluate a string containing a Python list expression """
     assert isinstance(pattern, str)
@@ -385,9 +305,6 @@ def validate_args(args, defaults={}):
 
     # validate model config args from heterogeneous config (if provided).
     validate_model_config_args_from_heterogeneous_config(args)
-
-    # Load saved args from Retro (if applicable).
-    load_retro_args(args)
 
     # Set args.use_dist_ckpt from args.ckpt_format.
     if args.use_legacy_models:
@@ -1058,21 +975,6 @@ def validate_args(args, defaults={}):
         assert is_te_min_version("2.9.0"), \
             '--log-max-attention-logit is only supported with TE >= 2.9.0.'
 
-    # Retro checks.
-    if args.retro_add_retriever:
-
-        # Train samples should be auto-loaded.
-        assert args.train_samples is not None, \
-            "args.train_samples should be auto-loaded from the retro config."
-
-        # Sequence parallelism unsupported.
-        assert not args.sequence_parallel, \
-            "retro currently does not support sequence parallelism."
-
-        # Pipeline parallelism unsupported.
-        assert args.pipeline_model_parallel_size == 1, \
-            "retro currently does not support pipeline parallelism."
-
     if args.decoupled_lr is not None or args.decoupled_min_lr is not None:
         assert not args.use_legacy_models, \
             '--decoupled-lr and --decoupled-min-lr is not supported in legacy models.'
@@ -1707,54 +1609,6 @@ def _add_inference_args(parser):
     return parser
 
 
-def _add_retro_args(parser):
-    group = parser.add_argument_group(title='retro')
-
-    group.add_argument('--retro-project-dir', default=None,
-                       help='Retro project directory, which contains the '
-                       'preprocessed data for pretraining. This directory '
-                       'is built during preprocessing (see '
-                       'tools/retro/README.md), and contains subdirectories '
-                       'for the chunk database and pretraining neighbors.')
-    group.add_argument('--retro-add-retriever',
-                       action='store_true', default=False,
-                       help='Add a retriever to the transformer, for use in '
-                       'pretraining a Retro model.')
-    group.add_argument('--retro-cyclic-train-iters', type=int, default=None,
-                       help='Set number of training iterations for cyclic '
-                       'Retro training.')
-    group.add_argument('--retro-encoder-layers', type=int, default=2,
-                       help='Number of layers to use for the retrieval '
-                       'encoder.')
-    group.add_argument('--retro-encoder-hidden-dropout',
-                       type=float, default=0.1, help='Hidden dropout for '
-                       'retrieval encoder.')
-    group.add_argument('--retro-encoder-attention-dropout',
-                       type=float, default=0.1, help='Attention dropout for '
-                       'retrieval encoder.')
-    group.add_argument("--retro-num-neighbors", type=int, default=2,
-                       help='Number of neighbors to retrieve during '
-                       'pretraining.')
-    group.add_argument("--retro-num-retrieved-chunks", type=int, default=2,
-                       help='Number of chunks to retrieve from the retrieval '
-                       'database.')
-    group.add_argument("--retro-attention-gate", type=float, default=1,
-                       help="Gated cross attention.")
-    group.add_argument("--retro-no-verify-neighbor-count", action="store_false",
-                       dest="retro_verify_neighbor_count",
-                       help="Skip verifying that len(GPT dataset) == len(saved "
-                       "neighbors).")
-
-    # Enforce argument naming convention.
-    for action in group._group_actions:
-        prefix = action.dest.split("_")[0]
-        assert prefix == "retro", \
-            "Retro args must be prefixed with '--retro-*', for consistent " \
-            "styling. Please fix '%s'." % ", ".join(action.option_strings)
-
-    return parser
-
-
 def _add_network_size_args(parser):
     group = parser.add_argument_group(title='network size')
 
@@ -1890,7 +1744,6 @@ def _add_network_size_args(parser):
     group.add_argument('--moe-latent-size', type=int, default=None,
                        help='Latent projection dimension for MoE. If None, MoE latent projections are not used.')
     return parser
-
 
 def _add_straggler_detector_args(parser):
     from megatron.training.resilience_config import StragglerDetectionConfig
@@ -2895,9 +2748,6 @@ def _add_data_args(parser):
                        'This should be exclusive of --seq-length')
     group.add_argument('--decoder-seq-length', type=int, default=None,
                        help="Maximum decoder sequence length to process.")
-    group.add_argument('--retriever-seq-length', type=int, default=256,
-                       help='Maximum sequence length for the biencoder model '
-                       'for retriever')
     group.add_argument('--sample-rate', type=float, default=1.0,
                        help='sample rate for training data. Supposed to be 0 '
                             ' < sample_rate < 1')
