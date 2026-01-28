@@ -572,58 +572,58 @@ class ProcessGroupCollection:
 
 
 @dataclass
-class ProcessGroupCollectionWrapper:
-    """Wrapper for multiple process group collections in multi-module pipelines.
+class MultiModuleProcessGroupCollection:
+    """Process group collection for multi-module pipelines.
 
     Used when a rank participates in multiple modules (e.g., colocated encoder + LLM).
-    The language_model key identifies which module is the language model (used for
-    CP size extraction and other LLM-specific operations).
+    The language_model_module_name identifies which module is the language model (used for
+    CP size extraction, loss computation, and other LLM-specific operations).
 
     Attributes:
         module_collections: Dict mapping module names to ProcessGroupCollection objects
-        language_model: Key identifying the language model module (None if no LLM on this rank)
+        language_model_module_name: Key identifying the language model module (None if no LLM on this rank)
 
     Example:
         # Colocated rank with encoder and LLM
-        wrapper = ProcessGroupCollectionWrapper(
+        pg_collection = MultiModuleProcessGroupCollection(
             module_collections={
                 "encoder": encoder_pg,
                 "llm": llm_pg
             },
-            language_model="llm"
+            language_model_module_name="llm"
         )
 
         # Rank with dual encoders (no LLM)
-        wrapper = ProcessGroupCollectionWrapper(
+        pg_collection = MultiModuleProcessGroupCollection(
             module_collections={
                 "encoder_1": encoder_1_pg,
                 "encoder_2": encoder_2_pg
             },
-            language_model=None
+            language_model_module_name=None
         )
 
         # Single module (can also use ProcessGroupCollection directly)
-        wrapper = ProcessGroupCollectionWrapper(
+        pg_collection = MultiModuleProcessGroupCollection(
             module_collections={"llm": llm_pg},
-            language_model="llm"
+            language_model_module_name="llm"
         )
 
         # Usage
-        cp_size = wrapper.get_language_model_cp_size()
-        encoder_pg = wrapper["encoder_1"]  # Dict-like access
-        has_llm = wrapper.has_language_model()
+        cp_size = pg_collection.get_language_model_cp_size()
+        encoder_pg = pg_collection["encoder_1"]  # Dict-like access
+        has_llm = pg_collection.has_language_model()
     """
 
     module_collections: Dict[str, ProcessGroupCollection]
-    language_model: Optional[str] = None
+    language_model_module_name: Optional[str] = None
 
     def __post_init__(self):
         if not self.module_collections:
             raise ValueError("module_collections dict cannot be empty")
-        if self.language_model is not None:
-            if self.language_model not in self.module_collections:
+        if self.language_model_module_name is not None:
+            if self.language_model_module_name not in self.module_collections:
                 raise ValueError(
-                    f"language_model '{self.language_model}' not found in "
+                    f"language_model_module_name '{self.language_model_module_name}' not found in "
                     f"module_collections keys: {list(self.module_collections.keys())}"
                 )
 
@@ -634,11 +634,11 @@ class ProcessGroupCollectionWrapper:
             ProcessGroupCollection for the language model.
 
         Raises:
-            ValueError: If no language model is specified for this wrapper.
+            ValueError: If no language model is specified for this collection.
         """
-        if self.language_model is None:
-            raise ValueError("No language model specified for this wrapper")
-        return self.module_collections[self.language_model]
+        if self.language_model_module_name is None:
+            raise ValueError("No language model specified for this collection")
+        return self.module_collections[self.language_model_module_name]
 
     def get_language_model_cp_size(self) -> int:
         """Get context parallel size for the language model.
@@ -647,7 +647,7 @@ class ProcessGroupCollectionWrapper:
             Context parallel size for the language model.
 
         Raises:
-            ValueError: If no language model is specified for this wrapper.
+            ValueError: If no language model is specified for this collection.
         """
         return self.get_language_model_collection().cp.size()
 
@@ -657,7 +657,7 @@ class ProcessGroupCollectionWrapper:
         Returns:
             True if this rank has a language model, False otherwise.
         """
-        return self.language_model is not None
+        return self.language_model_module_name is not None
 
     def get_module_collection(self, module_name: str) -> ProcessGroupCollection:
         """Get process group collection for a specific module.
@@ -705,5 +705,5 @@ class ProcessGroupCollectionWrapper:
     def __repr__(self):
         """Return a concise representation showing modules and their language model status."""
         modules_str = ', '.join(self.module_collections.keys())
-        lm_str = f", language_model='{self.language_model}'" if self.language_model else ""
-        return f"ProcessGroupCollectionWrapper(modules=[{modules_str}]{lm_str})"
+        lm_str = f", language_model_module_name='{self.language_model_module_name}'" if self.language_model_module_name else ""
+        return f"MultiModuleProcessGroupCollection(modules=[{modules_str}]{lm_str})"

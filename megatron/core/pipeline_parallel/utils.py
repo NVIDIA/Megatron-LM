@@ -356,6 +356,7 @@ def backward_step_multimodule(
     output_tensor: Union[torch.Tensor, Dict[str, torch.Tensor]],
     output_tensor_grad: Optional[Dict[str, torch.Tensor]],
     config,
+    language_model_module_name: str,
 ) -> Dict[str, torch.Tensor]:
     """Backward step for multi-module pipelines.
 
@@ -370,6 +371,8 @@ def backward_step_multimodule(
         output_tensor: Dict mapping module names to output tensors, or scalar loss (last stage)
         output_tensor_grad: Dict mapping module names to output grads, or None (last stage)
         config: Model parallel configuration
+        language_model_module_name: Name of the language model module (e.g., 'llm').
+            Used to associate scalar loss with the correct module at the terminal stage.
 
     Returns:
         Dict mapping module names to input tensor gradients
@@ -378,7 +381,7 @@ def backward_step_multimodule(
         - Assumes each module operates independently (no cross-module gradients in forward)
         - Each module should have sequential pipeline stages (no cross-stage skip connections)
         - Encoder-decoder models with skip connections (e.g., T5) are not yet supported as LLM.
-        - Last stage: Scalar loss requires single-module; multi-module should return dict of losses
+        - Last stage: Scalar loss is associated with language_model_module_name.
     """
     # Import locally to avoid circular dependency
     from megatron.core.pipeline_parallel.schedules import custom_backward
@@ -390,12 +393,10 @@ def backward_step_multimodule(
         if tensor is not None:
             tensor.retain_grad()
 
-    # Last stage: output_tensor is a scalar loss, wrap in dict for uniform handling
-    # Assumes last stage only has one module (LLM)
+    # Last stage: output_tensor is a scalar loss from the language model.
+    # Associate it with the language_model_module_name.
     if not isinstance(output_tensor, dict):
-        all_keys = list(input_tensor.keys())
-        main_module_key = all_keys[0]
-        output_tensor = {main_module_key: output_tensor}
+        output_tensor = {language_model_module_name: output_tensor}
 
     # Handle output_tensor_grad: None (last stage) or dict (intermediate stages)
     if not output_tensor_grad:

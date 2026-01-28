@@ -25,7 +25,7 @@ from megatron.core.pipeline_parallel.utils import (
 )
 from megatron.core.process_groups_config import (
     ProcessGroupCollection,
-    ProcessGroupCollectionWrapper,
+    MultiModuleProcessGroupCollection,
 )
 from megatron.core.transformer.cuda_graphs import create_cudagraphs
 from megatron.core.transformer.enums import CudaGraphScope
@@ -2016,7 +2016,7 @@ def forward_backward_pipelining_without_interleaving(
     first_val_step: Optional[bool] = None,
     adjust_tensor_shapes_fn: Optional[Callable] = None,
     p2p_communicator: Optional[P2PCommunicator] = None,
-    pg_collection: Optional[Union[ProcessGroupCollection, ProcessGroupCollectionWrapper]] = None,
+    pg_collection: Optional[Union[ProcessGroupCollection, MultiModuleProcessGroupCollection]] = None,
     force_all_reduce: Optional[bool] = False,
 ):
     """Run non-interleaved 1F1B schedule, with communication between pipeline
@@ -2040,6 +2040,11 @@ def forward_backward_pipelining_without_interleaving(
         )
 
     tp_group, cp_group, cp_size = None, None, None
+
+    # Determine if this is a multi-module pipeline (used for validation and backward function selection)
+    is_multimodule = isinstance(pg_collection, MultiModuleProcessGroupCollection) or isinstance(
+        p2p_communicator, MultiModulePipelineCommunicator
+    )
 
     if p2p_communicator is None and pg_collection is None:
         # Default: single-module with parallel_state groups
@@ -2066,7 +2071,7 @@ def forward_backward_pipelining_without_interleaving(
     elif p2p_communicator is not None and pg_collection is not None:
         # Custom process groups provided
 
-        if isinstance(pg_collection, ProcessGroupCollectionWrapper):
+        if is_multimodule:
             # Multi-module: use language model's CP size for loss scaling
             if not config.variable_seq_lengths:
                 raise ValueError(
@@ -2086,7 +2091,7 @@ def forward_backward_pipelining_without_interleaving(
 
         else:
             raise TypeError(
-                f"pg_collection must be ProcessGroupCollection or ProcessGroupCollectionWrapper, "
+                f"pg_collection must be ProcessGroupCollection or MultiModuleProcessGroupCollection, "
                 f"got {type(pg_collection)}"
             )
 
@@ -2142,10 +2147,13 @@ def forward_backward_pipelining_without_interleaving(
         max_outstanding_backprops = num_warmup_microbatches + 1
 
     # Select backward function based on whether multi-module or single-module
-    is_multimodule = isinstance(pg_collection, ProcessGroupCollectionWrapper) or isinstance(
-        p2p_communicator, MultiModulePipelineCommunicator
-    )
-    backward_func = backward_step_multimodule if is_multimodule else backward_step
+    if is_multimodule:
+        backward_func = partial(
+            backward_step_multimodule,
+            language_model_module_name=pg_collection.language_model_module_name,
+        )
+    else:
+        backward_func = backward_step
 
     recv_tensor_shapes = get_tensor_shapes(
         seq_length=seq_length,

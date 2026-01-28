@@ -45,12 +45,22 @@ class RankModuleInfo:
     is_terminal_stage: Optional[bool] = True
 
 
-def _ensure_3d_tensor(tensor):
+def _ensure_3d_tensor(
+    tensor: Union[torch.Tensor, List[torch.Tensor], None]
+) -> Union[torch.Tensor, List[torch.Tensor], None]:
     """Ensure tensor is 3D for P2P/bridge communication.
 
     P2P and bridge communicators expect 3D tensors.
     Handles both single tensors and lists of tensors (for VPP).
+
+    Args:
+        tensor: Input tensor (2D or 3D), list of tensors, or None.
+
+    Returns:
+        3D tensor (with singleton last dim if input was 2D), list of 3D tensors, or None.
     """
+    if tensor is None:
+        return None
     if isinstance(tensor, list):
         return [_ensure_3d_tensor(t) for t in tensor]
     if isinstance(tensor, torch.Tensor) and tensor.ndim == 2:
@@ -58,12 +68,22 @@ def _ensure_3d_tensor(tensor):
     return tensor
 
 
-def _restore_tensor_shape(tensor):
+def _restore_tensor_shape(
+    tensor: Union[torch.Tensor, List[torch.Tensor], None]
+) -> Union[torch.Tensor, List[torch.Tensor], None]:
     """Restore original tensor shape after P2P/bridge communication.
 
     Remove the extra dimension added by _ensure_3d_tensor if it was singleton.
     Handles both single tensors and lists of tensors (for VPP).
+
+    Args:
+        tensor: Input tensor (3D with singleton last dim), list of tensors, or None.
+
+    Returns:
+        2D tensor (if last dim was singleton), list of tensors, or None.
     """
+    if tensor is None:
+        return None
     if isinstance(tensor, list):
         return [_restore_tensor_shape(t) for t in tensor]
     if isinstance(tensor, torch.Tensor) and tensor.ndim == 3 and tensor.shape[-1] == 1:
