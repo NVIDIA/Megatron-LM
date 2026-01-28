@@ -22,6 +22,41 @@ from .copy_services.nvshmem_copy_service import NVSHMEMCopyService
 # Supported refit backend names
 RefitBackendName = Literal["nccl", "gloo", "nvshmem"]
 
+# Module-level cache for refit services to avoid repeated allocations
+_service_cache: dict[str, CopyService] = {}
+
+
+def get_or_create_service(backend: RefitBackendName) -> CopyService:
+    """Get or create a cached CopyService instance for the given backend.
+
+    This avoids expensive repeated allocations (especially for NVSHMEM buffers)
+    when swap_model_weights is called multiple times with the same backend.
+    """
+    if backend in _service_cache:
+        return _service_cache[backend]
+
+    if backend == "nccl":
+        service = NCCLCopyService()
+    elif backend == "gloo":
+        service = GlooCopyService()
+    elif backend == "nvshmem":
+        service = NVSHMEMCopyService()
+    else:
+        raise ValueError(f"Unknown backend '{backend}'")
+
+    _service_cache[backend] = service
+    return service
+
+
+def clear_service_cache():
+    """Clear the cached refit services.
+
+    Call this if you need to invalidate the cache, for example when
+    reinitializing distributed state.
+    """
+    global _service_cache
+    _service_cache.clear()
+
 
 def swap_model_weights(
     src_model: LanguageModule,
@@ -38,18 +73,8 @@ def swap_model_weights(
         service = refit_method
         reshard_model_weights(src_model, target_model, service=service)
     elif isinstance(refit_method, str):
-        if refit_method == "nccl":
-            service = NCCLCopyService()
-            reshard_model_weights(src_model, target_model, service=service)
-        elif refit_method == "gloo":
-            # Debug / fallback backend: run refit over CPU/Gloo instead of NCCL.
-            service = GlooCopyService()
-            reshard_model_weights(src_model, target_model, service=service)
-        elif refit_method == "nvshmem":
-            service = NVSHMEMCopyService()
-            reshard_model_weights(src_model, target_model, service=service)
-        else:
-            raise ValueError(f"Unknown refit_method '{refit_method}'")
+        service = get_or_create_service(refit_method)
+        reshard_model_weights(src_model, target_model, service=service)
     else:
         raise TypeError("refit_method must be a str backend name or a CopyService instance")
 
