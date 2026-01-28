@@ -441,7 +441,7 @@ class DynamicInferenceEngine(AbstractEngine):
                     f"is already in use."
                 )
         else:
-            dp_addr = f"tcp://{local_ip}:{inference_coordinator_port}"
+            dp_addr = None
 
         # Find available ports for MP and bind to them.
         if self.is_mp_coordinator:
