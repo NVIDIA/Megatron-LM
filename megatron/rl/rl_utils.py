@@ -102,7 +102,8 @@ def _maybe_prefetch_separate_inference_model_weights(model_core, *, to_cpu: bool
         return
     if args.rl_inference_model_unified_memory_level != 1:
         return
-
+    # Note: include_buffers=False because buffers created with explicit device= in register_buffer()
+    # are not allocated via the UVM mempool and will fail UVM operations. Only parameters are UVM-allocated.
     device = -1 if to_cpu else int(torch.cuda.current_device())
     advise_managed_module_parameters_preferred_location(model_core, device=device, include_buffers=True)
     nbytes = prefetch_managed_module_parameters(model_core, device=device, include_buffers=True)
