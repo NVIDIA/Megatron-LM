@@ -2832,10 +2832,6 @@ def _add_vision_args(parser):
     group.add_argument('--dino-warmup-teacher-temp-epochs', type=int, default=30,
                        help='warmup teacher temperaure epochs')
 
-    # regularization arguments
-    group.add_argument('--qk-l2-norm', action='store_true',
-                       help='Use llama 4 qk l2 norm')
-
     return parser
 
 def _add_moe_args(parser):
@@ -2898,19 +2894,6 @@ def _add_mla_args(parser):
 
 def _add_experimental_attention_variant_args(parser):
     group = parser.add_argument_group(title="experimental_attention_variant")
-    group.add_argument('--experimental-attention-variant', default=None, choices=['gated_delta_net', 'dsa'], type=str,
-                       help='Type of attention variant to use. Currently support gated_delta_net and dsa.')
-    # DSA
-    group.add_argument('--dsa-indexer-n-heads', default=None, type=int,
-                       help='Number of indexer heads for sparse attention. If not set, defaults to num-attention-heads.')
-    group.add_argument('--dsa-indexer-head-dim', default=None, type=int,
-                       help='Dimension per indexer head for sparse attention. If not set, defaults to kv-channels.')
-    group.add_argument('--dsa-indexer-topk', default=None, type=int,
-                       help='Number of top-k tokens to select in sparse attention indexer.')
-    group.add_argument('--dsa-indexer-loss-coeff', default=None, type=float,
-                       help='Coefficient for the indexer KL divergence loss. Set to 0 to disable indexer loss.')
-    group.add_argument('--dsa-indexer-use-sparse-loss', action='store_true',
-                       help='Use sparse indexer loss. If set, the indexer loss will be computed using the top-k indices.')
     # Linear attention
     group.add_argument('--linear-attention-freq', type=la_freq_type, default=None,
                        help='Frequency between LA (linear attention) layers and'
@@ -2921,16 +2904,6 @@ def _add_experimental_attention_variant_args(parser):
                             'where 1 indicates an LA layer and 0 indicates a SDPA layer. '
                             'Examples: "([0]+[1]*23)": 1 SDPA layer followed by 23 LA layers, '
                             '"([1]*3+[0]*2)*2": Three LA layers followed by two SDPA layers, repeated twice.')
-    group.add_argument('--linear-conv-kernel-dim', default=4, type=int,
-                       help='Conv kernel dimension for the gated delta net.')
-    group.add_argument('--linear-key-head-dim', default=128, type=int,
-                       help='Query and key head dimension for the gated delta net.')
-    group.add_argument('--linear-value-head-dim', default=128, type=int,
-                       help='Value and gate head dimension for the gated delta net.')
-    group.add_argument('--linear-num-key-heads', default=16, type=int,
-                       help='Number of query and key heads for the gated delta net.')
-    group.add_argument('--linear-num-value-heads', default=32, type=int,
-                       help='Number of value and gate heads for the gated delta net.')
     return parser
 
 def _add_heterogeneous_args(parser):
