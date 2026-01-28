@@ -1663,7 +1663,7 @@ def megatron_rl_inference_mode(
 
         if offload_optimizer_during_inference:
             with nvtx_range("onload-optimizer-after-inference"):
-                onload_grad_data(model[0], offload_states, optimizer)
+                onload_grad_data(model[0], offload_states)
 
         lang_module.train()
 

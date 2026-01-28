@@ -16,7 +16,10 @@ from typing import Dict, List, Optional, Tuple
 
 import torch
 
-from .param_and_grad_buffer import _ParamAndGradBuffer, _ParamAndGradBucket, _ParamAndGradBucketGroup
+from .param_and_grad_buffer import _ParamAndGradBuffer, _ParamAndGradBucketGroup
+from megatron.core.distributed.distributed_data_parallel import DistributedDataParallel
+from megatron.core.optimizer import ChainedOptimizer
+from megatron.core.optimizer.distrib_optimizer import DistributedOptimizer
 
 
 @dataclass
@@ -42,11 +45,9 @@ class GradBufferOffloadState:
     This is returned by offload_grad_data and should be passed to onload_grad_data.
     Note: The actual tensor data is NOT preserved - only metadata for reallocation.
     """
-    # Total number of elements in the buffer (for reallocation)
     numel: int
-    # Original dtype and device info
-    grad_dtype: torch.dtype
-    original_device: torch.device
+    dtype: torch.dtype
+    device: torch.device
     # Bucket metadata for restoring bucket.grad_data views
     bucket_metadata: List[BucketMetadata]
     # Parameter metadata for restoring param.main_grad views
@@ -55,9 +56,28 @@ class GradBufferOffloadState:
     buffer_id: int
 
 
+def _get_optimizer_buffers(optimizer: ChainedOptimizer | DistributedOptimizer) -> List[_ParamAndGradBuffer]:
+    """Extract all buffers from an optimizer, handling both ChainedOptimizer and DistributedOptimizer."""
+    if getattr(optimizer, 'is_stub_optimizer', False):
+        return []
+    
+    if hasattr(optimizer, 'buffers'):
+        # DistributedOptimizer has buffers directly
+        return optimizer.buffers
+    
+    if hasattr(optimizer, 'chained_optimizers'):
+        # ChainedOptimizer wraps multiple optimizers
+        buffers = []
+        for sub_optimizer in optimizer.chained_optimizers:
+            buffers.extend(_get_optimizer_buffers(sub_optimizer))
+        return buffers
+    
+    return []
+
+
 def offload_grad_data(
-    ddp_model,
-    optimizer=None,
+    ddp_model: DistributedDataParallel,
+    optimizer: Optional[ChainedOptimizer | DistributedOptimizer] = None,
     synchronize: bool = True,
     empty_cache: bool = True,
 ) -> List[GradBufferOffloadState]:
@@ -80,8 +100,8 @@ def offload_grad_data(
     
     Args:
         ddp_model: DistributedDataParallel model instance
-        optimizer: Optional DistribOptimizer instance. If provided, ensures
-                   consistency between DDP and optimizer buffer references.
+        optimizer: Optional ChainedOptimizer or DistributedOptimizer instance. If provided,
+                   validates that optimizer buffer references match DDP buffer references.
         synchronize: Whether to call torch.cuda.synchronize() before freeing
         empty_cache: Whether to call torch.cuda.empty_cache() after freeing
     
@@ -99,8 +119,8 @@ def offload_grad_data(
     all_bucket_groups = ddp_model.bucket_groups + ddp_model.expert_parallel_bucket_groups
     
     # Validate optimizer references point to same buffers if optimizer provided
-    if optimizer is not None and hasattr(optimizer, 'buffers') and not getattr(optimizer, 'is_stub_optimizer', False):
-        for opt_buffer in optimizer.buffers:
+    if optimizer is not None:
+        for opt_buffer in _get_optimizer_buffers(optimizer):
             assert opt_buffer in all_buffers, (
                 "Optimizer buffer not found in DDP buffers. "
                 "Ensure optimizer and DDP share the same buffer references."
@@ -163,16 +183,16 @@ def _offload_single_buffer(
     
     # Step 5: Store metadata for reallocation (NOT the tensor data)
     numel = buffer.grad_data.numel()
-    original_device = buffer.grad_data.device
-    grad_dtype = buffer.grad_dtype
+    device = buffer.grad_data.device
+    dtype = buffer.grad_dtype
     
     # Step 6: Free the GPU tensor
     buffer.grad_data = None
     
     return GradBufferOffloadState(
         numel=numel,
-        grad_dtype=grad_dtype,
-        original_device=original_device,
+        dtype=dtype,
+        device=device,
         bucket_metadata=bucket_metadata,
         param_grad_metadata=param_grad_metadata,
         buffer_id=buffer_id,
@@ -180,9 +200,8 @@ def _offload_single_buffer(
 
 
 def onload_grad_data(
-    ddp_model,
+    ddp_model: DistributedDataParallel,
     offload_states: List[GradBufferOffloadState],
-    optimizer=None,
     synchronize: bool = True,
     zero_grad_data: bool = True,
 ) -> None:
@@ -200,7 +219,6 @@ def onload_grad_data(
     Args:
         ddp_model: DistributedDataParallel model instance
         offload_states: List of GradBufferOffloadState objects from offload_grad_data
-        optimizer: Optional DistribOptimizer instance (for validation)
         synchronize: Whether to call torch.cuda.synchronize() after allocation
         zero_grad_data: Whether to zero the grad_data tensors after allocation
     """
@@ -233,12 +251,12 @@ def _onload_single_buffer(
     # Step 1: Allocate fresh tensor on GPU (contents are uninitialized)
     buffer.grad_data = torch.empty(
         offload_state.numel,
-        dtype=offload_state.grad_dtype,
-        device=offload_state.original_device,
+        dtype=offload_state.dtype,
+        device=offload_state.device,
     )
     
     # Step 2: Recreate bucket grad_data views
-    for bucket, metadata in zip(buffer.buckets, offload_state.bucket_metadata):
+    for bucket, metadata in zip(buffer.buckets, offload_state.bucket_metadata, strict=True):
         start_index = metadata.offset
         end_index = metadata.offset + metadata.numel
         bucket.grad_data = buffer.grad_data[start_index:end_index]
@@ -254,7 +272,7 @@ def _onload_single_buffer(
         buffer.grad_data.zero_()
 
 
-def get_grad_buffer_memory_usage(ddp_model) -> Dict[str, int]:
+def get_grad_buffer_memory_usage(ddp_model: DistributedDataParallel) -> Dict[str, int]:
     """
     Get the current GPU memory usage of grad buffers.
     
