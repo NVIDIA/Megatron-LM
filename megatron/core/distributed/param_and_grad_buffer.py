@@ -64,10 +64,6 @@ def shard_buffer(buffer: torch.Tensor, data_parallel_world_size: int):
     return sharded_buffer
 
 
-def _pad(number_to_be_padded: int, divisor: int) -> int:
-    return int(math.ceil(number_to_be_padded / divisor) * divisor)
-
-
 class _ParamAndGradBucket:
     """
     Bucket to keep track of a subset of the model's parameters and gradients.
@@ -626,6 +622,9 @@ class _ParamAndGradBuffer:
         self.buckets = []
         self.param_to_bucket = {}  # Param -> bucket mapping.
         self.param_index_map = {}  # Param -> location in buffer mapping (used in dist. optimizer).
+
+        def _pad(number_to_be_padded: int, divisor: int) -> int:
+            return int(math.ceil(number_to_be_padded / divisor) * divisor)
 
         def _pad_end_of_bucket_if_needed(bucket_end_index: int) -> int:
             """
