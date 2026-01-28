@@ -16,10 +16,11 @@ from typing import Dict, List, Optional, Tuple
 
 import torch
 
-from .param_and_grad_buffer import _ParamAndGradBuffer, _ParamAndGradBucketGroup
 from megatron.core.distributed.distributed_data_parallel import DistributedDataParallel
 from megatron.core.optimizer import ChainedOptimizer
 from megatron.core.optimizer.distrib_optimizer import DistributedOptimizer
+
+from .param_and_grad_buffer import _ParamAndGradBucketGroup, _ParamAndGradBuffer
 
 
 @dataclass

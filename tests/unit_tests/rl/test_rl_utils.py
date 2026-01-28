@@ -7,21 +7,22 @@ from types import SimpleNamespace
 import pytest
 import torch
 
-from megatron.core.distributed import DistributedDataParallel, DistributedDataParallelConfig
 from megatron.core.distributed import (
+    DistributedDataParallel,
+    DistributedDataParallelConfig,
+    get_grad_buffer_memory_usage,
     offload_grad_data,
     onload_grad_data,
-    get_grad_buffer_memory_usage,
 )
 from megatron.core.enums import ModelType
+from megatron.core.models.common.language_module.language_module import LanguageModule
 from megatron.core.models.gpt.gpt_layer_specs import get_gpt_layer_with_transformer_engine_spec
 from megatron.core.models.gpt.gpt_model import GPTModel
-from megatron.core.optimizer import get_megatron_optimizer, OptimizerConfig
-from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
-from megatron.core.models.common.language_module.language_module import LanguageModule
 from megatron.core.num_microbatches_calculator import destroy_num_microbatches_calculator
+from megatron.core.optimizer import OptimizerConfig, get_megatron_optimizer
 from megatron.core.pipeline_parallel.utils import is_pp_last_stage
 from megatron.core.process_groups_config import ProcessGroupCollection
+from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
 from megatron.core.transformer import TransformerConfig
 from megatron.rl import rl_utils
 from megatron.rl.agent.api import TokenRollout
