@@ -63,14 +63,27 @@ try:
         DistributedDataParallelConfig,
     )
     from megatron.core.tensor_parallel import get_cuda_rng_tracker
-    from megatron.core.utils import is_submodule
+    from megatron.core.utils import is_submodule, log_single_rank
 
+    HAVE_MCORE = True
     logger.info("Detected Megatron Core, using Megatron-FSDP with Megatron.")
 
 except ImportError:
     # Megatron-LM is not installed, use Megatron-FSDP as a standalone module.
     from .distributed_data_parallel_config import DistributedDataParallelConfig
     from .utils import get_cuda_rng_tracker, is_submodule
+
+    HAVE_MCORE = False
+
+    def log_single_rank(
+        logger_: logging.Logger, level: int, msg: str, *args, rank: int = 0, **kwargs
+    ):
+        """Fallback log_single_rank when Megatron Core is not available."""
+        if torch.distributed.is_initialized():
+            if torch.distributed.get_rank() == rank:
+                logger_.log(level, msg, *args, **kwargs)
+        else:
+            logger_.log(level, msg, *args, **kwargs)
 
     logger.info("Megatron Core is not installed, Megatron-FSDP will run without Megatron Core.")
 
@@ -215,11 +228,12 @@ class MultiGroupUBRAllocator:
         self.mem_allocator.__exit__(*args)
         for group in self.groups[1:]:
             backend = group._get_backend(torch.device("cuda", torch.cuda.current_device()))
-            if torch.distributed.get_rank() == 0:
-                logger.info(
-                    f"[MultiGroupUBRAllocator] Registering mem pool to group {group}, "
-                    f"group.group_desc:{group.group_desc}"
-                )
+            log_single_rank(
+                logger,
+                logging.INFO,
+                f"[MultiGroupUBRAllocator] Registering mem pool to group {group}, "
+                f"group.group_desc:{group.group_desc}",
+            )
             backend.register_mem_pool(self.pool)
 
 
@@ -1586,14 +1600,17 @@ class ParamAndGradBuffer:
             NCCL_MEMORY_POOL = nccl_allocator.create_nccl_mem_pool(
                 symmetric=not self.ddp_config.disable_symmetric_registration
             )
-            if torch.distributed.get_rank() == self.dist_index.representative_rank():
-                logging.info(
-                    f"[Rank {torch.distributed.get_rank()}] Created NCCL memory pool for \
-                        UserBuffer Registration"
-                )
-                logging.info(
-                    f"[Rank {torch.distributed.get_rank()}] FSDP double buffer is enabled."
-                )
+            log_single_rank(
+                logger,
+                logging.INFO,
+                f"[Rank {torch.distributed.get_rank()}] Created NCCL memory pool for "
+                "UserBuffer Registration",
+            )
+            log_single_rank(
+                logger,
+                logging.INFO,
+                f"[Rank {torch.distributed.get_rank()}] FSDP double buffer is enabled.",
+            )
             # Select the communicator groups to register FSDP buffers.
             self.ubr_groups = [self.dist_index.get_fsdp_group(is_expert_parallel=False)]
             if self.dist_index.get_fsdp_group(is_expert_parallel=True) is not None:
@@ -1603,10 +1620,24 @@ class ParamAndGradBuffer:
                 # Outer/Inter-FSDP group when using hybrid FSDP
                 self.ubr_groups.append(self.dist_index.get_outer_fsdp_group())
 
+            if (
+                self.dist_index.get_fsdp_group(
+                    is_expert_parallel=False, independent_all_gather=True
+                )
+                is not None
+            ):
+                # All-gather group used when overlapping all-gather and gradient reduction.
+                self.ubr_groups.append(
+                    self.dist_index.get_fsdp_group(
+                        is_expert_parallel=False, independent_all_gather=True
+                    )
+                )
+
             if torch.distributed.get_rank() == self.dist_index.representative_rank():
                 logging.info(
                     f"[ParamAndGradBuffer] FSDP UBRegistration Groups ({len(self.ubr_groups)}):"
                 )
+
             # All ranks in each group must participate in the collective to avoid deadlock.
             for i, group in enumerate(self.ubr_groups):
                 if torch.distributed.get_rank() == self.dist_index.representative_rank():
@@ -1742,21 +1773,23 @@ class ParamAndGradBuffer:
         torch.cuda.synchronize()
 
         for group in self.ubr_groups:
-            if torch.distributed.get_rank() == 0:
-                logging.info(
-                    f"[MCORE][FSDP][Manual REG] Registering mem pool to group {group},"
-                    f"group.group_desc:{group.group_desc}, group.size(): {group.size()}"
-                )
+            log_single_rank(
+                logger,
+                logging.INFO,
+                f"[MCORE][FSDP][Manual REG] Registering mem pool to group {group},"
+                f"group.group_desc:{group.group_desc}, group.size(): {group.size()}",
+            )
             nccl_allocator.register_mem_pool(
                 NCCL_MEMORY_POOL,
                 group,
                 symmetric=not self.ddp_config.disable_symmetric_registration,
             )
-            if torch.distributed.get_rank() == 0:
-                logging.info(
-                    f"[MCORE][FSDP][Manual REG] Registered mem pool to group {group},"
-                    f"group.group_desc:{group.group_desc}, group.size(): {group.size()}"
-                )
+            log_single_rank(
+                logger,
+                logging.INFO,
+                f"[MCORE][FSDP][Manual REG] Registered mem pool to group {group},"
+                f"group.group_desc:{group.group_desc}, group.size(): {group.size()}",
+            )
 
     def _log_parameter_groups(self):
         """Compact log of FSDP parameter groups and their parameters."""
@@ -1888,6 +1921,18 @@ class ParamAndGradBuffer:
                     is_expert_parallel=group.is_expert_param
                 )
 
+            # When --create-all-gather-group is enabled, use a separate process group for
+            # all-gather operations (model_weight_buffer) to enable overlap with gradient reduction
+            # operations (main_grad_buffer). This avoids head-of-line blocking between forward
+            # all-gather and backward reduce-scatter on the same communicator.
+            model_wbuf_dp_group = main_buf_dp_group
+            if not group.is_expert_param and not should_create_hfsdp_wbuf_and_gbuf:
+                ag_group = self.dist_index.get_fsdp_group(
+                    is_expert_parallel=False, independent_all_gather=True
+                )
+                if ag_group is not None:
+                    model_wbuf_dp_group = ag_group
+
             gradient_scaling_factor = (
                 self.gradient_scaling_factor
                 if not group.is_expert_param
@@ -1928,10 +1973,10 @@ class ParamAndGradBuffer:
                     self.ddp_config,
                     group.params,
                     is_data_distributed=is_model_weight_buffer_distributed
-                    and main_buf_dp_group.size() > 1,
+                    and model_wbuf_dp_group.size() > 1,
                     dtype=param_dtype,
                     device=self.device,
-                    data_parallel_group=main_buf_dp_group,
+                    data_parallel_group=model_wbuf_dp_group,
                     is_transpose_buffer=False,
                     temporary_bucket_allocator=self.weight_alloc,
                     bucket_id=group_id,
@@ -3177,7 +3222,7 @@ class GradReducePipeline:
                     # Scale gradients.
                     scaling_factor = gbuf.gradient_scaling_factor
                     reduce_op = gradient_reduce_preprocessing(
-                        gbuf.data, scaling_factor, gbuf.ddp_config
+                        bucket.data, scaling_factor, gbuf.ddp_config
                     )
                     if not gbuf.is_data_distributed:
                         # All-reduce the gradients on every rank. No scattering
@@ -3727,8 +3772,12 @@ def check_gpu_memory(threshold=0.9):
 
     near_full = allocated_ratio >= threshold or reserved_ratio >= threshold
 
-    if near_full and torch.distributed.get_rank() == 0:
-        logger.info(f"GPU Memory: Allocated: {allocated_ratio:.2%}, Reserved: {reserved_ratio:.2%}")
+    if near_full:
+        log_single_rank(
+            logger,
+            logging.INFO,
+            f"GPU Memory: Allocated: {allocated_ratio:.2%}, Reserved: {reserved_ratio:.2%}",
+        )
     return near_full
 
 
