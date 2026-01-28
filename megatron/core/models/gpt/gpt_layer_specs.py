@@ -193,6 +193,7 @@ def get_gpt_layer_with_transformer_engine_spec(
         num_experts (int, optional): Number of experts. Defaults to None.
         moe_grouped_gemm (bool, optional): To use Grouped GEMM. Defaults to False.
         qk_layernorm (bool, optional): To use layernorm for queries/keys. Defaults to False.
+        multi_latent_attention (bool, optional): To use MLA. Defaults to False.
         fp8 (str, optional): Deprecated. For temporary Nemo compatibility.
         moe_use_legacy_grouped_gemm (bool, optional): Force use the legacy GroupedMLP.
                                                       Defaults to False.
@@ -326,6 +327,7 @@ def get_gpt_layer_local_spec(
         num_experts (int, optional): Number of experts. Defaults to None.
         moe_grouped_gemm (bool, optional): To use Grouped GEMM. Defaults to False.
         qk_layernorm (bool, optional): To use layernorm for queries/keys. Defaults to False.
+        multi_latent_attention (bool, optional): To use MLA. Defaults to False.
         fp8 (str, optional): Deprecated. For temporary Nemo compatibility.
         moe_use_legacy_grouped_gemm (bool, optional): Force use the legacy GroupedMLP.
                                                       Defaults to False.
@@ -616,7 +618,6 @@ def get_gpt_decoder_block_spec(
     layer_specs = get_gpt_decoder_layer_specs(
         config, use_transformer_engine, normalization, qk_l2_norm
     )
-
     # Slice the layer specs to only include the layers that are built in this pipeline stage.
     # Note: MCore layer_number starts at 1
     num_layers_to_build = get_num_layers_to_build(config, vp_stage=vp_stage, pp_rank=pp_rank)
@@ -636,6 +637,10 @@ def get_gpt_decoder_block_spec(
         offset = get_transformer_layer_offset(config, vp_stage=vp_stage, pp_rank=pp_rank)
         local_layer_specs = layer_specs[offset : offset + num_layers_to_build]
 
+    if use_transformer_engine:
+        layer_norm_impl = TENorm
+    else:
+        layer_norm_impl = LNImpl
     # Block spec.
     if use_transformer_engine:
         layer_norm_impl = TENorm

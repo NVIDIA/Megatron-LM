@@ -174,6 +174,11 @@ class GroupedRolloutGenerator(Agent, ABC):
     parallel_generation_tasks: int = 512
     buffer_size: int = 10
 
+    def __init__(self, *, parallel_generation_tasks: int | None = None, **kwargs):
+        super().__init__(**kwargs)
+        if parallel_generation_tasks is not None:
+            self.parallel_generation_tasks = parallel_generation_tasks
+
     @abstractmethod
     async def group_rollout(self, request: GroupedRolloutRequest) -> list[Rollout]: ...
 
