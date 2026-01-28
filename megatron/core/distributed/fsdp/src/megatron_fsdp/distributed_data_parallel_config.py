@@ -3,8 +3,6 @@
 from dataclasses import dataclass
 from typing import Optional
 
-import torch
-
 
 @dataclass
 class DistributedDataParallelConfig:
@@ -20,7 +18,10 @@ class DistributedDataParallelConfig:
     """If true, overlap param all-gather with forward compute."""
 
     check_for_nan_in_grad: bool = False
-    """If True, check for NaNs and Infs in gradients _before_ communication collective."""
+    """
+    If True, check for NaNs and Infs in gradients _before_ communication collective.
+    Invoked by `start_grad_sync` such as in the Megatron-LM DDP training API.
+    """
 
     bucket_size: Optional[int] = None
     """Maximum number of parameters in each bucket. If unspecified, MCore uses a default
@@ -37,7 +38,7 @@ class DistributedDataParallelConfig:
 
     data_parallel_sharding_strategy: str = 'no_shard'
     """Sharding strategy for FSDP. Valid values are 'no_shard', 'optim',
-        'optim_grads', 'optim_grads_params'."""
+      'optim_grads', 'optim_grads_params'."""
 
     gradient_reduce_div_fusion: bool = True
     """If true, perform gradient reduce and division fusion."""
@@ -107,33 +108,6 @@ class DistributedDataParallelConfig:
       For symmetric registration with large models, the registration itself can take 
       a significant amount of time. This option minimizes the number of registration calls
       to minimize the registration time.
-    """
-
-    main_params_dtype: Optional[torch.dtype] = torch.float32
-    """Data type for the main weight buffer utilized for distributed optimization with
-      Megatron-FSDP. If set to None, the model compute weight buffer will take the role
-      of the main weights, or when no sharding is applied, the original model weights
-      become the main weights. Defaults to torch.float32.
-    """
-
-    main_grads_dtype: Optional[torch.dtype] = torch.float32
-    """Data type for the main gradient buffer utilized for distributed optimization with
-      Megatron-FSDP. If set to None, main gradients will match the dtype of the model
-      compute parameters specified by the user model. Defaults to torch.float32.
-    """
-
-    grad_comm_dtype: Optional[torch.dtype] = None
-    """Data type for gradient broadcast / scatter communications. Can be utilized to reduce
-      communication latency, but adds overhead for type-casting and local reduction.
-      Defaults to None, in which case the original model gradient dtype is used.
-    """
-
-    grad_accum_dtype: Optional[torch.dtype] = torch.float32
-    """Data type for gradient reduction and accumulation to control accumulation precision.
-      Specifically, gradients will be reduced at this precision, but accumulated either at
-      this precision or higher precision w.r.t. type-promotion with the main_grads_dtype.
-      If set to None, type-promotion with respect to the main_grads_dtype will determine
-      the data-type when accumulating. Defaults to torch.float32.
     """
 
     def __post_init__(self):
