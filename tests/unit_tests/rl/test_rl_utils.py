@@ -93,7 +93,6 @@ class TestRLUtils:
         destroy_num_microbatches_calculator()
 
         args = parse_args(ignore_unknown_args=True)
-
         args.num_layers = 8
         args.num_attention_heads = 8
         args.vocab_size = VOCAB
