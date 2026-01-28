@@ -7,7 +7,17 @@ from types import SimpleNamespace
 import pytest
 import torch
 
+from megatron.core.distributed import DistributedDataParallel, DistributedDataParallelConfig
+from megatron.core.distributed import (
+    offload_grad_data,
+    onload_grad_data,
+    get_grad_buffer_memory_usage,
+)
 from megatron.core.enums import ModelType
+from megatron.core.models.gpt.gpt_layer_specs import get_gpt_layer_with_transformer_engine_spec
+from megatron.core.models.gpt.gpt_model import GPTModel
+from megatron.core.optimizer import get_megatron_optimizer, OptimizerConfig
+from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
 from megatron.core.models.common.language_module.language_module import LanguageModule
 from megatron.core.num_microbatches_calculator import destroy_num_microbatches_calculator
 from megatron.core.pipeline_parallel.utils import is_pp_last_stage
@@ -416,3 +426,186 @@ class TestRLUtils:
                 got_t = got if torch.is_tensor(got) else torch.tensor(got, dtype=torch.float32)
                 exp_t = torch.tensor(exp, dtype=torch.float32, device=got_t.device)
                 torch.testing.assert_close(got_t, exp_t, rtol=0, atol=0)
+
+    def test_grad_buffer_offload(self):
+        """Test that grad buffer offload/onload correctly frees and restores GPU memory."""
+        Utils.initialize_model_parallel()
+        model_parallel_cuda_manual_seed(123)
+
+        # Create a realistic GPTModel as used in RL training
+        transformer_config = TransformerConfig(
+            num_layers=2,
+            hidden_size=64,
+            num_attention_heads=4,
+            use_cpu_initialization=True,
+        )
+        gpt_model = GPTModel(
+            config=transformer_config,
+            transformer_layer_spec=get_gpt_layer_with_transformer_engine_spec(),
+            vocab_size=256,
+            max_sequence_length=32,
+        ).cuda()
+
+        ddp_config = DistributedDataParallelConfig(
+            grad_reduce_in_fp32=True,
+            use_distributed_optimizer=True,
+            overlap_grad_reduce=False,
+            bucket_size=None,  # Single bucket for simplicity
+        )
+
+        ddp_model = DistributedDataParallel(
+            transformer_config, ddp_config=ddp_config, module=gpt_model
+        )
+
+        # Create optimizer to exercise buffer validation in offload_grad_data
+        optimizer_config = OptimizerConfig(
+            optimizer='adam',
+            bf16=True,
+            use_distributed_optimizer=True,
+        )
+        optimizer = get_megatron_optimizer(optimizer_config, [ddp_model])
+
+        # Measure initial memory usage
+        initial_memory = get_grad_buffer_memory_usage(ddp_model)
+        assert initial_memory["total_bytes"] > 0, "Expected non-zero initial memory"
+
+        # Offload grad buffers (passing optimizer exercises the buffer validation assertion)
+        offload_states = offload_grad_data(ddp_model, optimizer)
+
+        # Measure memory after offload - should be zero
+        offloaded_memory = get_grad_buffer_memory_usage(ddp_model)
+        assert offloaded_memory["total_bytes"] == 0, (
+            f"Expected zero memory after offload, got {offloaded_memory['total_bytes']} bytes"
+        )
+
+        # Verify all buffers report as offloaded
+        for buffer_name, buffer_info in offloaded_memory["buffers"].items():
+            assert buffer_info["device"] == "offloaded", (
+                f"Buffer {buffer_name} should report device as 'offloaded'"
+            )
+
+        # Onload grad buffers
+        onload_grad_data(ddp_model, offload_states)
+
+        # Measure memory after onload - should match initial
+        restored_memory = get_grad_buffer_memory_usage(ddp_model)
+        assert restored_memory["total_bytes"] == initial_memory["total_bytes"], (
+            f"Expected restored memory ({restored_memory['total_bytes']}) to match "
+            f"initial memory ({initial_memory['total_bytes']})"
+        )
+
+        # Verify buffer structure is restored
+        assert len(restored_memory["buffers"]) == len(initial_memory["buffers"])
+        for buffer_name in initial_memory["buffers"]:
+            assert restored_memory["buffers"][buffer_name]["numel"] == (
+                initial_memory["buffers"][buffer_name]["numel"]
+            ), f"Buffer {buffer_name} numel mismatch after restore"
+
+        Utils.destroy_model_parallel()
+
+    def test_optimizer_offload(self):
+        """Test that optimizer offload_to_cpu/restore_from_cpu correctly moves state to/from CPU."""
+        Utils.initialize_model_parallel()
+        model_parallel_cuda_manual_seed(123)
+
+        # Create a realistic GPTModel as used in RL training
+        transformer_config = TransformerConfig(
+            num_layers=2,
+            hidden_size=64,
+            num_attention_heads=4,
+            use_cpu_initialization=True,
+        )
+        gpt_model = GPTModel(
+            config=transformer_config,
+            transformer_layer_spec=get_gpt_layer_with_transformer_engine_spec(),
+            vocab_size=256,
+            max_sequence_length=32,
+        ).cuda()
+
+        ddp_config = DistributedDataParallelConfig(
+            grad_reduce_in_fp32=True,
+            use_distributed_optimizer=True,
+            overlap_grad_reduce=False,
+            bucket_size=None,  # Single bucket for simplicity
+        )
+
+        ddp_model = DistributedDataParallel(
+            transformer_config, ddp_config=ddp_config, module=gpt_model
+        )
+
+        # Create optimizer
+        optimizer_config = OptimizerConfig(
+            optimizer='adam',
+            bf16=True,
+            use_distributed_optimizer=True,
+        )
+        optimizer = get_megatron_optimizer(optimizer_config, [ddp_model])
+
+        # Manually initialize optimizer state (simulating what happens after first step)
+        # This avoids needing to run a full forward/backward/step cycle
+        for opt in optimizer.chained_optimizers:
+            if hasattr(opt, 'optimizer') and opt.optimizer is not None:
+                for group in opt.optimizer.param_groups:
+                    for p in group['params']:
+                        if len(opt.optimizer.state[p]) == 0:
+                            # Initialize Adam state (exp_avg and exp_avg_sq) on GPU
+                            opt.optimizer.state[p]['exp_avg'] = torch.rand_like(p.data)
+                            opt.optimizer.state[p]['exp_avg_sq'] = torch.rand_like(p.data)
+                            opt.optimizer.state[p]['step'] = torch.tensor(1)
+
+        # Helper to check if optimizer state tensors are on GPU or CPU
+        def get_optimizer_state_devices():
+            devices = set()
+            for opt in optimizer.chained_optimizers:
+                if hasattr(opt, 'optimizer') and opt.optimizer is not None:
+                    for state_dict in opt.optimizer.state.values():
+                        for v in state_dict.values():
+                            if isinstance(v, torch.Tensor):
+                                devices.add(str(v.device))
+            return devices
+
+        # Verify optimizer state is initially on GPU
+        initial_devices = get_optimizer_state_devices()
+        assert any('cuda' in d for d in initial_devices), (
+            f"Expected optimizer state on GPU initially, got devices: {initial_devices}"
+        )
+
+        # Record GPU memory before offload
+        torch.cuda.synchronize()
+        memory_before_offload = torch.cuda.memory_allocated()
+
+        # Offload optimizer state to CPU
+        optimizer.offload_to_cpu()
+
+        # Verify GPU memory decreased (optimizer state should be freed)
+        torch.cuda.synchronize()
+        memory_after_offload = torch.cuda.memory_allocated()
+        assert memory_after_offload < memory_before_offload, (
+            f"Expected GPU memory to decrease after offload. "
+            f"Before: {memory_before_offload}, After: {memory_after_offload}"
+        )
+
+        # Verify optimizer state is now on CPU
+        offloaded_devices = get_optimizer_state_devices()
+        assert all('cpu' in d for d in offloaded_devices), (
+            f"Expected all optimizer state on CPU after offload, got devices: {offloaded_devices}"
+        )
+
+        # Restore optimizer state to GPU
+        optimizer.restore_from_cpu()
+
+        # Verify optimizer state is back on GPU
+        restored_devices = get_optimizer_state_devices()
+        assert any('cuda' in d for d in restored_devices), (
+            f"Expected optimizer state on GPU after restore, got devices: {restored_devices}"
+        )
+
+        # Verify GPU memory increased after restore (optimizer state reallocated)
+        torch.cuda.synchronize()
+        memory_after_restore = torch.cuda.memory_allocated()
+        assert memory_after_restore > memory_after_offload, (
+            f"Expected GPU memory to increase after restore. "
+            f"After offload: {memory_after_offload}, After restore: {memory_after_restore}"
+        )
+
+        Utils.destroy_model_parallel()
