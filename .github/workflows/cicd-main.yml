@@ -399,8 +399,8 @@ jobs:
         success()
         || needs.pre-flight.outputs.is_ci_workload == 'true'
         || needs.pre-flight.outputs.force_run_all == 'true'
+        || needs.pre-flight.outputs.is_merge_group == 'true'
       )
-      && needs.pre-flight.outputs.is_merge_group == 'false'
       && !cancelled()
     outputs:
       integration-tests: ${{ steps.main.outputs.integration-tests }}
