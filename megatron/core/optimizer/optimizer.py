@@ -7,7 +7,6 @@ import logging
 import math
 import warnings
 from abc import ABC, abstractmethod
-from collections import defaultdict
 from itertools import chain
 from logging import getLogger
 from typing import Any, Callable, Dict, List, Optional, Tuple, Union
