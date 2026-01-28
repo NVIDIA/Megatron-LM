@@ -214,7 +214,7 @@ jobs:
           IS_PR: ${{ startsWith(github.ref, 'refs/heads/pull-request/') }}
         run: |
           if [[ "$IS_PR" == "true" ]]; then
-            SHA={{ fromJSON(steps.get-pr-info.outputs.pr-info || '{}').merge_commit_sha }}
+            SHA=${{ fromJSON(steps.get-pr-info.outputs.pr-info || '{}').merge_commit_sha }}
           else
             SHA=${GITHUB_SHA}
           fi
