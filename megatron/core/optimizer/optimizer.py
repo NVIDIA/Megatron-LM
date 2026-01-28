@@ -635,6 +635,9 @@ class MixedPrecisionOptimizer(MegatronOptimizer):
 
     @torch.no_grad()
     def step(self):
+        # Ensure any async restore_from_cpu() has completed before using optimizer state.
+        self.wait_for_restore()
+
         timers = self.config.timers
 
         found_inf_flag = self.prepare_grads()
@@ -1005,6 +1008,9 @@ class FP32Optimizer(MegatronOptimizer):
     def step(self):
         """Clip gradients (if needed) and step the base optimizer.
         Always return successful since there is no overflow."""
+        # Ensure any async restore_from_cpu() has completed before using optimizer state.
+        self.wait_for_restore()
+
         timers = self.config.timers
 
         found_inf_flag = self.prepare_grads()
@@ -1351,6 +1357,9 @@ class ChainedOptimizer(MegatronOptimizer):
     @torch.no_grad()
     def step(self):
         """ChainedOptimizer will step all optimizers one by one."""
+        # Ensure any async restore_from_cpu() has completed before using optimizer state.
+        self.wait_for_restore()
+
         found_inf_flag = self.prepare_grads()
         if found_inf_flag:
             return False, None, None
