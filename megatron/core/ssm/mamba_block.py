@@ -242,6 +242,7 @@ class MambaStack(MegatronModule):
         *,
         inference_params: Optional[BaseInferenceContext] = None,
         packed_seq_params: Optional[PackedSeqParams] = None,
+        padding_mask=None,
     ):
         """
         Forward function of the MambaStack class.
@@ -324,6 +325,7 @@ class MambaStack(MegatronModule):
                             rotary_pos_emb=rotary_pos_emb,
                             sequence_len_offset=sequence_len_offset,
                             packed_seq_params=packed_seq_params,
+                            padding_mask=padding_mask,
                         )
                     else:  # MambaLayer
                         hidden_states = layer(

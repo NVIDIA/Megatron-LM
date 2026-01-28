@@ -413,6 +413,7 @@ class DynamicInferenceEngine(AbstractEngine):
                     coordinator_ready_event,
                     inference_coordinator_port,
                     get_pg_size(self.pg_collection.dp),
+                    self.controller.tokenizer,
                 ),
             )
             self.inference_coordinator_process.start()
@@ -1205,6 +1206,7 @@ class DynamicInferenceEngine(AbstractEngine):
                 cuda_graph_request_count (int): The CUDA graph batch size matching this step.
         """
         # Increment finished_request_count.
+        range_push("bookkeeping")
         cuda_graph_request_count = None
 
         if step_result is not None:
@@ -1248,26 +1250,33 @@ class DynamicInferenceEngine(AbstractEngine):
             finished_request_records.append(failed_entry.record)
             failed_entry.future.set_result(failed_entry.record)
         self.failed_request_ids.clear()
+        range_pop()
 
-        # Detokenize all finished requests (critical for InferenceClient, which
-        # doesn't necessarily have the tokenizer).
-        for record in finished_request_records:
-            for request in record.requests:
-                if request.prompt is None:
-                    request.prompt = self.controller.tokenizer.detokenize(
-                        request.prompt_tokens.tolist()
+        # Detokenize all finished requests if not using
+        # the coordinator. Otherwise, the coordinator will
+        # overlap detokenization with the engine.
+        if not self.use_coordinator:
+            range_push("detokenization")
+            for record in finished_request_records:
+                for request in record.requests:
+                    if request.prompt is None:
+                        request.prompt = self.controller.tokenizer.detokenize(
+                            request.prompt_tokens.tolist()
+                        )
+                    request.generated_text = self.controller.tokenizer.detokenize(
+                        request.generated_tokens
                     )
-                request.generated_text = self.controller.tokenizer.detokenize(
-                    request.generated_tokens
-                )
+            range_pop()
 
         # Handle necessary ZMQ DP coordinator communication.
         if self.use_coordinator and self.is_mp_coordinator and finished_request_records:
+            range_push("coordinator_communication")
             payload = msgpack.packb(
                 [Headers.ENGINE_REPLY.value, [r.serialize() for r in finished_request_records]],
                 use_bin_type=True,
             )
             self.socket_for_receiving_requests.send(payload)
+            range_pop()
 
         # Log KV cache utilization stats to W&B
         if context_state["kv_stats"] is not None:
@@ -1461,7 +1470,7 @@ class DynamicInferenceEngine(AbstractEngine):
             int: The number of messages that were received and processed in this batch.
         """
 
-        torch.cuda.nvtx.range_push("drain_zmq_socket")
+        range_push("drain_zmq_socket")
         all_messages = []
         if self.is_mp_coordinator:
             while True:
@@ -1494,7 +1503,7 @@ class DynamicInferenceEngine(AbstractEngine):
             else:
                 all_messages = []
 
-        torch.cuda.nvtx.range_pop()
+        range_pop()
         for message in all_messages:
             data = msgpack.unpackb(message, raw=False)
             header = Headers(data[0])
@@ -1507,7 +1516,9 @@ class DynamicInferenceEngine(AbstractEngine):
             if header == Headers.SUBMIT_REQUEST:
                 request_id, prompt, sampling_params = data[1:]
                 sampling_params = SamplingParams.deserialize(sampling_params)
+                range_push("add_request")
                 self.add_request(request_id, prompt, sampling_params)
+                range_pop()
             elif header == Headers.PAUSE:
                 # Pause thyself.
                 self.received_pause = True
