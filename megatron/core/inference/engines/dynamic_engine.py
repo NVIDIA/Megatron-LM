@@ -38,7 +38,7 @@ from megatron.core.inference.sampling_params import SamplingParams
 from megatron.core.inference.text_generation_controllers.text_generation_controller import (
     TextGenerationController,
 )
-from megatron.core.inference.utils import Counter, await_process_event
+from megatron.core.inference.utils import Counter, await_process_call
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.transformer.cuda_graphs import delete_cuda_graphs
 from megatron.core.utils import (
@@ -428,6 +428,7 @@ class DynamicInferenceEngine(AbstractEngine):
                 ),
             )
             self.inference_coordinator_process.start()
+            await await_process_call(dp_pipe.poll, self.inference_coordinator_process)
             dp_addr = dp_pipe.recv()
 
             # Check if the port number is not inference_coordinator_port
@@ -510,7 +511,9 @@ class DynamicInferenceEngine(AbstractEngine):
             )
 
         if launch_inference_coordinator and self.is_dp_coordinator:
-            await await_process_event(coordinator_ready_event, self.inference_coordinator_process)
+            await await_process_call(
+                coordinator_ready_event.wait, self.inference_coordinator_process
+            )
             logging.info("Inference co-ordinator is ready to receive requests!")
             logging.info(f"Data parallel coordinator can be found at {dp_addr}")
 
