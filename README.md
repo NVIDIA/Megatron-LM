@@ -46,8 +46,23 @@ For more information, refer to [Megatron Bridge](https://github.com/NVIDIA-NeMo/
 
 ## Quick Start
 
-For instructions, refer to [Quick Start](https://docs.nvidia.com/megatron-core/developer-guide/latest/get-started/quickstart.html).
+Install Megatron Core with pip:
 
+1. Install Megatron Core with required dependencies:
+
+    ```bash
+    pip install --no-build-isolation megatron-core[mlm,dev]
+    ```
+
+2. Clone repository for examples:
+
+    ```bash
+    git clone https://github.com/NVIDIA/Megatron-LM.git
+    cd Megatron-LM
+    pip install --no-build-isolation .[mlm,dev]
+    ```
+
+For instructions, refer to [Quick Start](https://docs.nvidia.com/megatron-core/developer-guide/latest/get-started/quickstart.html).
 
 
 # Project Structure
