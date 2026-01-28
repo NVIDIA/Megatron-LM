@@ -82,11 +82,10 @@ def get_batch(data_iterator, vp_stage=None):
         return empty_batch.values()
 
     batch = get_batch_on_this_tp_rank(data_iterator)
-
-    # Support for Packed Sequence (Unused in this script)
-    cu_seqlens = batch.pop('cu_seqlens', None)
+    
+    cu_seqlens = batch['cu_seqlens']
+    # Unused at the moment
     cu_seqlens_padded = batch.pop('cu_seqlens_padded', None)
-    max_seqlen = batch.pop('max_seqlen', None)
     # Support for Hybrid Context Parallel (Unused in this script)
     local_cp_size = batch.pop('local_cp_size', None)
 
