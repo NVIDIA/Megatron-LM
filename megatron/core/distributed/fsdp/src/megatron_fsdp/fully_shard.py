@@ -23,6 +23,7 @@ from torch.distributed.device_mesh import init_device_mesh
 from torch.distributed.tensor import DTensor
 
 from .megatron_fsdp import MegatronFSDP
+from .mixed_precision import MixedPrecisionPolicy
 from .uneven_dtensor import preprocess_state_dict_for_uneven_dtensor
 from .utils import FSDPDistributedIndex, create_updated_function_signature
 
@@ -85,15 +86,12 @@ def fully_shard_model(
     outer_dp_sharding_strategy: str | int = 0,
     device: Optional[torch.device] = None,
     init_model_with_meta_device: bool = False,
-    main_params_dtype: Optional[torch.dtype] = torch.float32,
-    main_grads_dtype: Optional[torch.dtype] = torch.float32,
-    grad_comm_dtype: Optional[torch.dtype] = None,
-    grad_accum_dtype: Optional[torch.dtype] = torch.float32,
+    mixed_precision_policy: MixedPrecisionPolicy = MixedPrecisionPolicy(),
     overlap_grad_reduce: bool = True,
     overlap_param_gather: bool = True,
     sync_model_each_microbatch: bool = True,
     preproc_state_dict_for_dcp_ckpt: bool = True,
-    check_for_nan_in_grad: bool = True,
+    report_nan_in_param_grad: bool = False,
     average_in_collective: bool = False,
     disable_bucketing: bool = False,
     calculate_per_token_loss: bool = False,
@@ -184,26 +182,10 @@ def fully_shard_model(
             implementing a custom Module.reset_parameters() or Module._reset_parameters() method.
             Defaults to False.
 
-        main_params_dtype (Optional[torch.dtype]):
-            Data type for the main weight buffer utilized for distributed optimization. If set
-            to None, the model compute weight buffer will take the role of the main weights, or
-            when no sharding is applied, the original model weights become the main weights.
-            Defaults to torch.float32.
-
-        main_grads_dtype (Optional[torch.dtype]):
-            Data type for the main gradient buffer utilized for distributed optimization and
-            gradient accumulation. If set to None, main gradients will match the dtype of the
-            model compute parameters specified by the user model. Defaults to torch.float32.
-
-        grad_comm_dtype (Optional[torch.dtype]):
-            Data type for gradient gather / scatter / A2A communications. Can be utilized to reduce
-            communication latency, but adds overhead for type-casting. Defaults to None, in which
-            case the original model gradient dtype is used.
-
-        grad_accum_dtype (Optional[torch.dtype]):
-            Data type that controls gradient reduction and accumulation precision. If set to None,
-            type-promotion with respect to the main_grads_dtype will determine the data-type when
-            accumulating. Defaults to torch.float32.
+        mixed_precision_policy (megatron_fsdp.MixedPrecisionPolicy):
+            Megatron-FSDP mixed-precision config that controls compute and communication precision.
+            Defaults to FP32 main weights, FP32 main gradients, BF16 gradient communications, and
+            FP32 gradient reduction and accumulation.
 
         overlap_grad_reduce (bool):
             Whether to overlap gradient reduce-scatter (or all-reduce) with backward compute.
@@ -226,8 +208,9 @@ def fully_shard_model(
             for both the model and the optimizer.
             Defaults to True.
 
-        check_for_nan_in_grad (bool):
-            Whether to check for NaN values in gradients. Defaults to True.
+        report_nan_in_param_grad (bool):
+            Whether to precisely check for NaN values in gradients for every weight. Can
+            significantly degrade performance. Defaults to False.
 
         average_in_collective (bool):
             Whether to average gradients in collective communication. Defaults to False.
@@ -351,10 +334,6 @@ def fully_shard_model(
     ddp_config = DistributedDataParallelConfig(
         data_parallel_sharding_strategy=zero_dp_strategy,
         outer_dp_sharding_strategy=outer_dp_sharding_strategy,
-        main_params_dtype=main_params_dtype,
-        main_grads_dtype=main_grads_dtype,
-        grad_comm_dtype=grad_comm_dtype,
-        grad_accum_dtype=grad_accum_dtype,
         overlap_grad_reduce=overlap_grad_reduce,
         overlap_param_gather=overlap_param_gather,
         average_in_collective=average_in_collective,
@@ -363,7 +342,6 @@ def fully_shard_model(
         fsdp_double_buffer=fsdp_double_buffer or nccl_ub,
         fsdp_db_use_persist_buf_on_alloc_fail=fsdp_db_use_persist_buf_on_alloc_fail,
         disable_symmetric_registration=disable_symmetric_registration,
-        check_for_nan_in_grad=check_for_nan_in_grad,
     )
 
     # Create FSDPDistributedIndex.
@@ -392,6 +370,7 @@ def fully_shard_model(
         module=module,
         dist_index=dist_index,
         ddp_config=ddp_config,
+        mixed_precision_policy=mixed_precision_policy,
         fsdp_unit_modules=fsdp_unit_modules,
         disable_bucketing=disable_bucketing,
         device=device,
@@ -399,6 +378,7 @@ def fully_shard_model(
         init_model_with_meta_device=init_model_with_meta_device,
         sync_model_each_microbatch=sync_model_each_microbatch,
         enable_fine_grained_param_gather_hook=enable_fine_grained_param_gather,
+        report_nan_in_param_grad=report_nan_in_param_grad,
     )
 
     # Register a state dict post-hook to add Torch DCP metadata for writing checkpoints.
@@ -647,15 +627,12 @@ def fully_shard(
     outer_dp_sharding_strategy: str | int = 0,
     device: Optional[torch.device] = None,
     init_model_with_meta_device: bool = False,
-    main_params_dtype: Optional[torch.dtype] = torch.float32,
-    main_grads_dtype: Optional[torch.dtype] = torch.float32,
-    grad_comm_dtype: Optional[torch.dtype] = None,
-    grad_accum_dtype: Optional[torch.dtype] = torch.float32,
+    mixed_precision_policy: MixedPrecisionPolicy = MixedPrecisionPolicy(),
     overlap_grad_reduce: bool = True,
     overlap_param_gather: bool = True,
     sync_model_each_microbatch: bool = True,
     preproc_state_dict_for_dcp_ckpt: bool = True,
-    check_for_nan_in_grad: bool = True,
+    report_nan_in_param_grad: bool = False,
     average_in_collective: bool = False,
     disable_bucketing: bool = False,
     calculate_per_token_loss: bool = False,
@@ -698,15 +675,12 @@ def fully_shard(
         outer_dp_sharding_strategy=outer_dp_sharding_strategy,
         device=device,
         init_model_with_meta_device=init_model_with_meta_device,
-        main_params_dtype=main_params_dtype,
-        main_grads_dtype=main_grads_dtype,
-        grad_comm_dtype=grad_comm_dtype,
-        grad_accum_dtype=grad_accum_dtype,
+        mixed_precision_policy=mixed_precision_policy,
         overlap_grad_reduce=overlap_grad_reduce,
         overlap_param_gather=overlap_param_gather,
         sync_model_each_microbatch=sync_model_each_microbatch,
         preproc_state_dict_for_dcp_ckpt=preproc_state_dict_for_dcp_ckpt,
-        check_for_nan_in_grad=check_for_nan_in_grad,
+        report_nan_in_param_grad=report_nan_in_param_grad,
         average_in_collective=average_in_collective,
         disable_bucketing=disable_bucketing,
         calculate_per_token_loss=calculate_per_token_loss,
