@@ -1893,15 +1893,11 @@ def _add_network_size_args(parser):
 
 
 def _add_straggler_detector_args(parser):
-    group = parser.add_argument_group(title='straggler')
-    group.add_argument('--log-straggler', action='store_true',
-                       help='If set, tracks and logs straggler per GPU.')
-    group.add_argument('--disable-straggler-on-startup', action='store_true',
-                       help='If set, StragglerDetector is disabled on startup.')
-    group.add_argument('--straggler-ctrlr-port', type=int, default=65535,
-                       help='Port number to toggle StragglerDetector on/off at runtime')
-    group.add_argument('--straggler-minmax-count', type=int, default=1,
-                       help='Number of ranks to report with high/low estimated throughput')
+    from megatron.training.resilience_config import StragglerDetectionConfig
+
+    straggler_factory = ArgumentGroupFactory(StragglerDetectionConfig)
+    group = straggler_factory.build_group(parser, "straggler")
+
     return parser
 
 def _add_workload_inspector_server_args(parser):
