@@ -136,7 +136,7 @@ products:
         scope: [unit-tests]
         n_repeat: [1]
         time_limit: [1800]
-  - test_case: [tests/unit_tests/distributed/fsdp/**/*.py]
+  - test_case: [tests/unit_tests/distributed/megatron_fsdp/**/*.py]
     products:
       - environment: [lts, dev]
         tag: [latest]

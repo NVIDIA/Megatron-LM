@@ -3222,7 +3222,7 @@ class GradReducePipeline:
                     reduce_op = gradient_reduce_preprocessing(
                         bucket.data, scaling_factor, gbuf.ddp_config
                     )
-                    if not gbuf.is_data_distributed:
+                    if ddp_config.data_parallel_sharding_strategy == "no_shard":
                         # All-reduce the gradients on every rank. No scattering
                         # or sharding necessary.
                         torch.distributed.all_reduce(
