@@ -76,8 +76,12 @@ class CommunicationScheduler:
         PELogger.debug(f"  Local batches: {local_batches}")
 
         # Gather all batches from all PEs using torch.distributed
+        # NOTE: all_gather_object is a collective operation that requires all ranks
+        # to participate, even those with empty workloads
+        PELogger.debug(f"  About to call all_gather_object with {n_pes} PEs...")
         all_batches_list: List[List[Tuple[int, int, int]] | None] = [None] * n_pes
         dist.all_gather_object(all_batches_list, local_batches)
+        PELogger.debug(f"  all_gather_object completed successfully")
 
         # Flatten into global batch list
         global_batches: List[ScheduledBatch] = []
@@ -159,10 +163,14 @@ class CommunicationScheduler:
         PELogger.debug(f"  Local summaries: {batch_count} batches, {total_tasks} tasks")
 
         # Gather all summaries from all PEs using torch.distributed
+        # NOTE: all_gather_object is a collective operation that requires all ranks
+        # to participate, even those with empty workloads
+        PELogger.debug(f"  About to call all_gather_object for summaries...")
         all_summaries_list: List[Dict[Tuple[int, int, int], Dict[str, object]] | None] = [
             None
         ] * n_pes
         dist.all_gather_object(all_summaries_list, local_summaries)
+        PELogger.debug(f"  all_gather_object for summaries completed successfully")
 
         # Merge into global map
         global_map: Dict[Tuple[int, int, int], WorkloadSummary] = {}

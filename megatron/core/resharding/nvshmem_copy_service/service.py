@@ -99,8 +99,24 @@ class RemoteCopyService:
         PELogger.init(self.my_pe, level=log_level)
         PELogger.info(f"Initializing RemoteCopyService on PE {self.my_pe}/{self.n_pes}")
 
+        # CRITICAL: Barrier to ensure ALL PEs finish NVSHMEM init before ANY PE starts buffer allocation
+        # buffer_manager.allocate() calls bytetensor() which is a collective operation
+        # Without this barrier, early PEs call bytetensor() while late PEs are still in init() -> deadlock
+        import nvshmem.core
+        PELogger.info(f"PE {self.my_pe} entering pre-allocation barrier...")
+        nvshmem.core.barrier_all(stream=self.gpu_resources.send_stream)
+        self.gpu_resources.send_stream.sync()  # Ensure barrier completes on CPU
+        PELogger.info(f"PE {self.my_pe} passed pre-allocation barrier, starting buffer allocation...")
+
         # Allocate double-buffered send/recv slots
         self.buffer_manager.allocate()
+        PELogger.info(f"PE {self.my_pe} completed buffer allocation")
+
+        # Barrier to ensure all PEs complete buffer allocation before proceeding
+        PELogger.info(f"PE {self.my_pe} entering post-allocation barrier...")
+        nvshmem.core.barrier_all(stream=self.gpu_resources.send_stream)
+        PELogger.info(f"PE {self.my_pe} passed post-allocation barrier")
+
         PELogger.debug("Allocated double-buffered send/recv slots")
 
         # Load CUDA kernels
@@ -128,6 +144,17 @@ class RemoteCopyService:
             self.gpu_resources.torch_unpack_stream,
             self.gpu_resources.torch_copy_stream,
         )
+
+        # CRITICAL: Synchronize all NVSHMEM streams before returning
+        # This ensures all barrier operations complete and streams are idle
+        # Without this, subsequent torch.cuda.synchronize() may hang waiting for pending work
+        PELogger.debug("Synchronizing all NVSHMEM streams...")
+        self.gpu_resources.send_stream.sync()
+        self.gpu_resources.pack_stream.sync()
+        self.gpu_resources.unpack_stream.sync()
+        self.gpu_resources.copy_stream.sync()
+        PELogger.debug("All streams synchronized")
+
         PELogger.info("Initialization complete")
 
     def register_send(
