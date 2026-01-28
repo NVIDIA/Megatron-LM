@@ -129,6 +129,7 @@ import torch
 from megatron_fsdp import (
     fully_shard_model,
     fully_shard_optimizer,
+    MixedPrecisionPolicy,
 )
 ```
 
@@ -196,14 +197,8 @@ model = fully_shard_model(
     outer_dp_sharding_strategy=1,
     # Initialize the model on devices in shards to avoid OOM. Requires device("meta")-init for model.
     init_model_with_meta_device=True,
-    # Store FP32 parameters for distributed optimization and quantization.
-    main_params_dtype=torch.float32,
-    # Store FP32 gradients for distributed optimization.
-    main_grads_dtype=torch.float32,
-    # Communicate gradients (broadcast / scatter) in BF16.
-    grad_comm_dtype=torch.bfloat16,
-    # Reduce and accumulate gradients in FP32.
-    grad_accum_dtype=torch.float32,
+    # Mixed-Precision Policy for controlling compute and communication precision in Megatron-FSDP.
+    mixed_precision_policy=MixedPrecisionPolicy(),
     # Sync parameters and gradients each step. Allows for gradient transformations after backward pass,
     # and synchronizes parameters and gradients across HSDP groups, but deactivates compute-communication
     # overlap going into the subsequent training step.
@@ -309,18 +304,20 @@ Megatron-FSDP's `fully_shard_*` API has a comprehensive set of arguments for fin
 - `init_model_with_meta_device` has `MegatronFSDP` initialize your `meta`-device model in shards on every CUDA device to avoid OOM when initializing extremely large models that cannot fit on a single device. Users can initialize their model on a [`meta`-device](https://docs.pytorch.org/docs/stable/meta.html) (`with torch.device('meta'): ...`), and ``MegatronFSDP`` will further shard and initialize the model parameters layer-by-layer adhering to the customizable `module.reset_parameters` method, which prevents the entire model from being allocated in memory at any point during runtime.
     - Defaults to `False`.
     - Note that the `device` argument which installs your model on a specific device or rank will be deactivated when `init_model_with_meta_device=True`.
-- `main_params_dtype` controls the data-type for parameters used in distributed optimization or quantization. 
-    - Defaults to `torch.float32`.
-    - If `None`, the model compute parameter data-type will be utilized.
-    - Requires specification (cannot be `None`) when using `FP8` parameters with Megatron-FSDP.
-- `main_grads_dtype` controls the data-type for gradients used in distributed optimization.
-    - Defaults to `torch.float32`, which is highly-recommended for accuracy at scale.
-    - If set to `None`, the computed model gradient data-type will be utilized.
-- `grad_comm_dtype` controls the data-type for gradient communications (the all-gather / all-to-all component of all-reduce / reduce-scatter) when reducing gradients.
-    - Defaults to `None`, in which case the model compute parameter data-type will be utilized.
-- `grad_accum_dtype` controls the data-type for gradient reduction and accumulation to control accumulation precision. Specifically, gradients will be reduced at this precision, but accumulated either at this precision or higher precision with respect to type-promotion with the `main_grads_dtype`.
-    - Defaults to `torch.float32`, which is highly-recommended for accuracy at scale.
-    - If set to `None`, type-promotion with respect to the `main_grads_dtype` determines the accumulation data-type.
+- `mixed_precision_policy` takes a `megatron_fsdp.MixedPrecisionPolicy` that configures mixed-precision compute and communication for Megatron-FSDP. Configuration options include:
+    - `main_params_dtype` controls the data-type for parameters used in distributed optimization or quantization. 
+        - Defaults to `torch.float32`.
+        - If set to `None`, the model compute parameter data-type will be utilized.
+        - Requires specification (cannot be `None`) when using `FP8` parameters with Megatron-FSDP.
+    - `main_grads_dtype` controls the data-type for gradients used in distributed optimization.
+        - Defaults to `torch.float32`, which is highly-recommended for accuracy at scale.
+        - If set to `None`, the model native gradient data-type will be utilized.
+    - `grad_comm_dtype` controls the data-type for gradient communications (A2A / RS / AR) when reducing gradients.
+        - Defaults to `torch.bfloat16`, which has minor performance benefits even at small scale, and potentially major performance benefits at scale.
+        - If set to `None`, the model native weight gradient data-type will be utilized.
+    - `grad_accum_dtype` controls the data-type for gradient reduction and accumulation to control accumulation precision. Specifically, gradients will be reduced at this precision, but accumulated either at this precision or higher precision based on type-promotion with respect to the `main_grads_dtype`.
+        - Defaults to `torch.float32`, which is highly-recommended for accuracy at scale. Simpler models or coarser datasets can get away with lower gradient accumulation precision.
+        - If set to `None`, reduction is performed in the data-type of the communicated gradient, and type-promotion with respect to the `main_grads_dtype` determines the data-type when accumulating gradients. Defaults to `torch.float32`.
 - `overlap_grad_reduce` and `overlap_param_gather` will overlap gradient [`reduce-scatter`](https://docs.nvidia.com/deeplearning/nccl/user-guide/docs/usage/collectives.html#reducescatter) and parameter [`all-gather`](https://docs.nvidia.com/deeplearning/nccl/user-guide/docs/usage/collectives.html#allgather) group communications with backward and forward compute with asynchronous calls and pre-fetching. (In the case of `no_shard`, parameters are not gathered but gradient [`all-reduce`](https://docs.nvidia.com/deeplearning/nccl/user-guide/docs/usage/collectives.html#allreduce) is overlapped.)
     - Both default to `True`.
 - `sync_model_each_microbatch` will trigger a `wait` (`MegatronFSDP.finish_grad_sync()`) on gradient reduction, parameter de-allocation, and optimizer parameter / gradient installation (in preparation for `optimizer.step()`) after every forward-backward pass. When using HSDP, parameters and gradients will be all-gathered and reduced respectively on the "outer" DP group each training step instead of each optimization cycle. This behavior is desirable for a transparent and user-friendly sharded training loop where post-backward transformations on the gradient and a clean compute / memory state are necessary within and between training iterations, but damages performance in situations where optimization is delayed (e.g. gradient accumulation) when the communications of the previous training iteration can be overlapped with the compute of the next training iteration. Will also override `is_last_microbatch` / `microbatch_count` logic in `MegatronFSDP`.
@@ -374,8 +371,10 @@ mfsdp_model = fully_shard_model(
     fsdp_unit_modules=[te.pytorch.TransformerLayer],
     # Only FSDP / ZeRO-3 supports FP8 parameters.
     zero_dp_strategy=3,
-    # Needed for FP8 parameters. (Default is already True.)
-    preserve_fp32_weights=True,
+    # FP32 main weights needed for FP8 parameters.
+    mixed_precision_policy=MixedPrecisionPolicy(
+        main_params_dtype=torch.float32
+    ),
     # Needed for select FP8 recipes.
     keep_fp8_transpose_cache=True,
 )

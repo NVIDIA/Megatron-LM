@@ -1335,7 +1335,6 @@ def get_model(model_provider_func, model_type=ModelType.encoder_or_decoder, wrap
             ddp_config = TorchFullyShardedDataParallelConfig(reshard_after_forward=reshard_after_forward)
         else:
             kwargs = {}
-            # Common kwargs.
             for f in dataclasses.fields(DistributedDataParallelConfig):
                 if hasattr(args, f.name):
                     kwargs[f.name] = getattr(args, f.name)
@@ -1353,11 +1352,6 @@ def get_model(model_provider_func, model_type=ModelType.encoder_or_decoder, wrap
             kwargs['pad_buckets_for_high_nccl_busbw'] = args.ddp_pad_buckets_for_high_nccl_busbw
             kwargs['reduce_scatter_with_fp32_accumulation'] = args.ddp_reduce_scatter_with_fp32_accumulation
             kwargs['average_in_collective'] = args.ddp_average_in_collective
-            # Megatron-FSDP Mixed-Precision Config
-            kwargs['main_params_dtype'] = args.main_params_dtype
-            kwargs['main_grads_dtype'] = args.main_grads_dtype
-            kwargs['grad_comm_dtype'] = args.megatron_fsdp_grad_comm_dtype
-            kwargs['grad_accum_dtype'] = args.megatron_fsdp_grad_accum_dtype
             ddp_config = DistributedDataParallelConfig(**kwargs)
 
             # In the Megatron FSDP and DDP use path, we need to initialize the bucket size.
@@ -1380,15 +1374,26 @@ def get_model(model_provider_func, model_type=ModelType.encoder_or_decoder, wrap
         ddp_stream.wait_stream(torch.cuda.current_stream())
         # Make ddp_stream start after whatever the default stream already queued
         with torch.cuda.stream(ddp_stream):
+            dp_init_kwargs = {
+                # Model Config
+                "config": config,
+                # DDP Config
+                "ddp_config": ddp_config,
+            }
+            if args.use_megatron_fsdp:
+                # Also pass the mixed-precision arguments for Megatron-FSDP only.
+                dp_init_kwargs["main_params_dtype"] = args.megatron_fsdp_main_params_dtype
+                dp_init_kwargs["main_grads_dtype"] = args.megatron_fsdp_main_grads_dtype
+                dp_init_kwargs["grad_comm_dtype"] = args.megatron_fsdp_grad_comm_dtype
+                dp_init_kwargs["grad_accum_dtype"] = args.megatron_fsdp_grad_accum_dtype
+
             model = [
                 DP(
-                    config=config,
-                    ddp_config=ddp_config,
                     module=model_chunk,
-                    # Turn off bucketing for model_chunk 2 onwards, since communication for these
-                    # model chunks is overlapped with compute anyway.
-                    disable_bucketing=(model_chunk_idx > 0)
-                    or args.overlap_param_gather_with_optimizer_step,
+                    # Turn off bucketing for model_chunk 2 onwards, since communication
+                    # for these model chunks is overlapped with compute anyway.
+                    disable_bucketing=(model_chunk_idx > 0) or args.overlap_param_gather_with_optimizer_step,
+                    **dp_init_kwargs,
                 )
                 for (model_chunk_idx, model_chunk) in enumerate(model)
             ]

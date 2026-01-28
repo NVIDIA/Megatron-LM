@@ -24,6 +24,7 @@ import torch.nn as nn
 from torch.utils._pytree import tree_flatten, tree_map, tree_unflatten
 
 from .mixed_precision import (
+    MixedPrecisionPolicy,
     fp8_create_transpose_cache,
     fp8_discard_transpose_cache,
     is_float8tensor,
@@ -34,6 +35,7 @@ from .param_and_grad_buffer import (
     GradReducePipeline,
     ParamAndGradBuffer,
     PrefetchOrder,
+    _check_nan_in_grad,
     override_sharded_param_methods_with_safety_checks,
     to_local_if_dtensor,
 )
@@ -102,9 +104,11 @@ class MegatronFSDP(torch.nn.Module):
         module (torch.nn.Module): Underlying Torch Module.
         dist_index (FSDPDistributedIndex): FSDPDistributedIndex object containing references to the
             process groups and device meshes used by Megatron-FSDP.
-        ddp_config (DistributedDataParallelConfig): FullyShardedDataParallel configuration dataclass
-            containing a variety of Megatron-derived parameters that control the behavior of
-            Megatron-FSDP.
+        ddp_config (DistributedDataParallelConfig): FullyShardedDataParallel configuration
+            dataclass containing a variety of Megatron-derived parameters that control the
+            behavior of Megatron-FSDP.
+        mixed_precision_policy (megatron_fsdp.MixedPrecisionPolicy): Configuration for
+            mixed-precision customization of compute and communications in Megatron-FSDP.
         fsdp_unit_modules (List[torch.nn.Module] | List[str]): List of modules that
             should be treated as an FSDP Unit, i.e. the minimum releasable model unit.
             It affects the granularity of the communication parameter grouping and
@@ -143,6 +147,8 @@ class MegatronFSDP(torch.nn.Module):
             userbuffer registration when nccl_ub is set.
         enable_fine_grained_param_gather (bool): Whether to enable "fine-grained" param all-gather,
             which can improve performance when using MXFP8 parameters with activation recomputation.
+        report_nan_in_param_grad (bool): Whether to enable precise NaN-checking for parameter wgrad.
+            Can significantly degrade performance. Defaults to False.
 
     Examples:
         >>> model = GPTModel(config)
@@ -167,6 +173,7 @@ class MegatronFSDP(torch.nn.Module):
         module: torch.nn.Module,
         dist_index: FSDPDistributedIndex,
         ddp_config: DistributedDataParallelConfig = None,
+        mixed_precision_policy: MixedPrecisionPolicy = MixedPrecisionPolicy(),
         fsdp_unit_modules: Optional[List[torch.nn.Module] | List[str]] = None,
         disable_bucketing: bool = False,
         device: Optional[torch.device] = None,
@@ -179,6 +186,7 @@ class MegatronFSDP(torch.nn.Module):
         fsdp_db_use_persist_buf_on_alloc_fail: bool = False,
         disable_symmetric_registration: bool = False,
         enable_fine_grained_param_gather_hook: bool = False,
+        report_nan_in_param_grad: bool = False,
     ):
         super().__init__()
         # If device is not specified, use the current device.
@@ -213,15 +221,6 @@ class MegatronFSDP(torch.nn.Module):
             self.ddp_config = DistributedDataParallelConfig(
                 data_parallel_sharding_strategy="optim_grads_params",
                 outer_dp_sharding_strategy="no_shard",
-                # Main weight buffer required for Megatron-LM
-                # and TransformerEngine FP8 parameters.
-                main_params_dtype=torch.float32,
-                # Default to FP32 gradients.
-                main_grads_dtype=torch.float32,
-                # No customization for communication data-type.
-                grad_comm_dtype=None,
-                # Default to FP32 gradient accumulation.
-                grad_accum_dtype=torch.float32,
                 overlap_grad_reduce=True,
                 overlap_param_gather=True,
                 average_in_collective=False,
@@ -230,14 +229,21 @@ class MegatronFSDP(torch.nn.Module):
                 fsdp_double_buffer=fsdp_double_buffer or nccl_ub,
                 fsdp_db_use_persist_buf_on_alloc_fail=fsdp_db_use_persist_buf_on_alloc_fail,
                 disable_symmetric_registration=disable_symmetric_registration,
-                check_for_nan_in_grad=True,
+                check_for_nan_in_grad=False,
             )
         else:
             self.ddp_config = ddp_config
         self.data_parallel_sharding_strategy = self.ddp_config.data_parallel_sharding_strategy
+        self.mp_policy = mixed_precision_policy
         self.calculate_per_token_loss = calculate_per_token_loss
         self.init_model_with_meta_device = init_model_with_meta_device
         self.enable_fine_grained_param_gather_hook = enable_fine_grained_param_gather_hook
+        self.report_nan_in_param_grad = report_nan_in_param_grad
+
+        # FSDPDistributedIndex stores the process groups and meshes used by Megatron-FSDP.
+        # If not provided, Megatron-FSDP will default to a simple data parallel index
+        # supported by torch.distributed.group.WORLD.
+        self.dist_index = dist_index
 
         # Whether to constantly synchronize the model every training iteration,
         # which defaults to False to overlap communication with computation
@@ -249,11 +255,6 @@ class MegatronFSDP(torch.nn.Module):
 
         # Check if the module contains (Megatron-Core) expert parallel parameters or DTensors.
         has_expert_parameters = self._check_module_parameter_types()
-
-        # FSDPDistributedIndex stores the process groups and meshes used by Megatron-FSDP.
-        # If not provided, Megatron-FSDP will default to a simple data parallel index
-        # supported by torch.distributed.group.WORLD.
-        self.dist_index = dist_index
 
         # If Megatron Expert Parallelism is enabled, you need to provide an expt_dp_group.
         if (
@@ -356,8 +357,7 @@ class MegatronFSDP(torch.nn.Module):
                 data_parallel_sharding_strategy=self.data_parallel_sharding_strategy,
             ),
             dist_index=self.dist_index,
-            main_params_dtype=self.ddp_config.main_params_dtype,
-            main_grads_dtype=self.ddp_config.main_grads_dtype,
+            mixed_precision_policy=self.mp_policy,
             gradient_scaling_factor=gradient_scaling_factor,
             expert_gradient_scaling_factor=expert_gradient_scaling_factor,
             device=self.device,
@@ -552,15 +552,6 @@ class MegatronFSDP(torch.nn.Module):
                 if is_float8tensor(param):
                     fp8_discard_transpose_cache(param)
 
-        def _check_nan_in_grad(grad: torch.Tensor):
-            """
-            Check if there are any NaN in grad.
-            """
-            if self.ddp_config.check_for_nan_in_grad and torch.isnan(grad).any():
-                raise ValueError(
-                    "[Megatron-FSDP](check_for_nan_in_grad=True) " f"Detected NaN in wgrad: {grad}"
-                )
-
         def _grad_acc(param):
             """
             Accumulate the gradient in the main_grad buffer.
@@ -585,23 +576,22 @@ class MegatronFSDP(torch.nn.Module):
 
                     param.main_grad = param.get_main_grad()
                     if param.grad is not None:
-                        _check_nan_in_grad(param.grad)
+                        if self.report_nan_in_param_grad:
+                            _check_nan_in_grad(to_local_if_dtensor(param.grad))
                         # Copy the gradient into the allocated main gradient bucket.
                         # It will be reduce-scattered and accumulated into gbuf.
                         param.main_grad.copy_(to_local_if_dtensor(param.grad))
                         del param.grad
                     else:
-                        # wgrad accumulation is fused.
-                        # Only supported for sharded gradients.
-                        _check_nan_in_grad(param.main_grad)
+                        # Prepare for fused wgrad accumulation.
                         param.main_grad.zero_()
             # Unsharded Gradient Buffer
             else:
                 if not param.grad_added_to_main_grad:
                     if param.grad is not None:
-                        _check_nan_in_grad(param.grad)
-                        # Add the gradient into the unsharded main gradient buffer.
-                        # For unsharded gradients, this is gradient accumulation.
+                        if self.report_nan_in_param_grad:
+                            _check_nan_in_grad(to_local_if_dtensor(param.grad))
+                        # Accumulate the gradient into the main gradient buffer.
                         param.main_grad = param.get_main_grad()
                         param.main_grad.add_(to_local_if_dtensor(param.grad))
                         del param.grad
@@ -1114,15 +1104,20 @@ class MegatronFSDP(torch.nn.Module):
                 MegatronFSDP.model_auto_sync will be set to the value of sync_model.
                 Defaults to True. MegatronFSDP.model_auto_sync defaults to False.
         """
-        if self.data_parallel_sharding_strategy == "no_shard" and sync_model:
+        if sync_model and (
+            # Will reduce gradient buffer data in-place across DP-Shard.
+            self.data_parallel_sharding_strategy in ["no_shard", "optim"]
+            # Will reduce gradient buffer data in-place across DP-Outer.
+            or self.dist_index.use_hybrid_fsdp
+        ):
             logger.warning(
-                "[Megatron-FSDP.set_model_auto_sync()] Detected gradient reduction when "
-                "using 'no_shard' / DDP every step. Because Megatron-FSDP all-reduces "
-                "un-sharded gradients into the gradient accumulation buffer, multiple "
-                "reduction calls will corrupt the accumulated gradient. Please ensure "
-                "that `MegatronFSDP.zero_grad_buffer()` or `optimizer.zero_grad()` is "
-                "invoked every forward-backward pass, or that global batch size matches "
-                "microbatch size, only when using the 'no_shard' sharding strategy."
+                "[Megatron-FSDP.set_model_auto_sync()] Detected Megatron-FSDP "
+                "auto-synchronization with the 'no_shard' / 'optim' sharding "
+                "strategy for either FSDP (DP-Shard) or HSDP (DP-Outer). "
+                "`MegatronFSDP.zero_grad_buffer()` or `optimizer.zero_grad()` "
+                "must be invoked every forward-backward optimization cycle to "
+                "prevent successive in-place gradient buffer reductions from "
+                "corrupting previously accumulated gradients."
             )
         self.model_auto_sync = sync_model
 
@@ -1132,6 +1127,34 @@ class MegatronFSDP(torch.nn.Module):
         to the process groups and device meshes used by Megatron-FSDP.
         """
         return self.dist_index
+
+    @contextmanager
+    def mixed_precision_context(self, mixed_precision_policy: MixedPrecisionPolicy):
+        """
+        Context manager for re-configuring the MixedPrecisionPolicy
+        for MegatronFSDP / ParamAndGradBuffer.
+        """
+        mp_policy_backup = self.mp_policy
+        self.reset_mixed_precision_policy(mixed_precision_policy)
+        try:
+            yield
+        finally:
+            self.reset_mixed_precision_policy(mp_policy_backup)
+
+    def reset_mixed_precision_policy(self, mixed_precision_policy: MixedPrecisionPolicy):
+        """
+        Re-configure MixedPrecisionPolicy for MegatronFSDP / ParamAndGradBuffer.
+        """
+        mp_policy_reset = MixedPrecisionPolicy(
+            # Preserve the original main parameter + gradient data-type.
+            main_params_dtype=self.mp_policy.main_params_dtype,
+            main_grads_dtype=self.mp_policy.main_grads_dtype,
+            # Only communication and accumulation data-types can be reset.
+            grad_comm_dtype=mixed_precision_policy.grad_comm_dtype,
+            grad_accum_dtype=mixed_precision_policy.grad_accum_dtype,
+        )
+        self.mp_policy = mp_policy_reset
+        self.param_and_grad_buffer.mp_policy = mp_policy_reset
 
     def start_param_sync(self, *unused, force_sync: bool = False, force_dispatch: bool = False):
         """
