@@ -348,7 +348,7 @@ class DynamicInferenceEngine(AbstractEngine):
     @internal_api
     async def start_listening_to_data_parallel_coordinator(
         self,
-        inference_coordinator_port: int,
+        inference_coordinator_port: int | None = None,
         launch_inference_coordinator: bool = True,
         *,
         loop: Optional[asyncio.AbstractEventLoop] = None,
@@ -378,11 +378,20 @@ class DynamicInferenceEngine(AbstractEngine):
         (`self.run_engine`) as a background asyncio task.
 
         Args:
-            inference_coordinator_port (int): The network port where the central
+            inference_coordinator_port (int | None): The network port where the central
                 `InferenceCoordinator` is or will be listening.
+                If None, a random available port will be selected.
+                If not None, the coordinator will attempt to bind to this port, but should it
+                not succeed (e.g., if the port is already in use), it may bind to a different port.
+                The actual port used is returned by this method.
             launch_inference_coordinator (bool, optional): If True, the global rank 0
                 process will spawn and manage the `InferenceCoordinator`
                 process. Defaults to True.
+
+        Returns:
+            inference_coordinator_addresss (str): The network address of the central
+                `InferenceCoordinator`, which may not have the same port as what the user requested
+                with `inference_coordinator_port`.
         """
 
         assert HAVE_ZMQ, (
