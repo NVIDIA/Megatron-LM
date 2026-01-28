@@ -434,10 +434,7 @@ class TestRLUtils:
 
         # Create a realistic GPTModel as used in RL training
         transformer_config = TransformerConfig(
-            num_layers=2,
-            hidden_size=64,
-            num_attention_heads=4,
-            use_cpu_initialization=True,
+            num_layers=2, hidden_size=64, num_attention_heads=4, use_cpu_initialization=True
         )
         gpt_model = GPTModel(
             config=transformer_config,
@@ -459,9 +456,7 @@ class TestRLUtils:
 
         # Create optimizer to exercise buffer validation in offload_grad_data
         optimizer_config = OptimizerConfig(
-            optimizer='adam',
-            bf16=True,
-            use_distributed_optimizer=True,
+            optimizer='adam', bf16=True, use_distributed_optimizer=True
         )
         optimizer = get_megatron_optimizer(optimizer_config, [ddp_model])
 
@@ -474,15 +469,15 @@ class TestRLUtils:
 
         # Measure memory after offload - should be zero
         offloaded_memory = get_grad_buffer_memory_usage(ddp_model)
-        assert offloaded_memory["total_bytes"] == 0, (
-            f"Expected zero memory after offload, got {offloaded_memory['total_bytes']} bytes"
-        )
+        assert (
+            offloaded_memory["total_bytes"] == 0
+        ), f"Expected zero memory after offload, got {offloaded_memory['total_bytes']} bytes"
 
         # Verify all buffers report as offloaded
         for buffer_name, buffer_info in offloaded_memory["buffers"].items():
-            assert buffer_info["device"] == "offloaded", (
-                f"Buffer {buffer_name} should report device as 'offloaded'"
-            )
+            assert (
+                buffer_info["device"] == "offloaded"
+            ), f"Buffer {buffer_name} should report device as 'offloaded'"
 
         # Onload grad buffers
         onload_grad_data(ddp_model, offload_states)
@@ -510,10 +505,7 @@ class TestRLUtils:
 
         # Create a realistic GPTModel as used in RL training
         transformer_config = TransformerConfig(
-            num_layers=2,
-            hidden_size=64,
-            num_attention_heads=4,
-            use_cpu_initialization=True,
+            num_layers=2, hidden_size=64, num_attention_heads=4, use_cpu_initialization=True
         )
         gpt_model = GPTModel(
             config=transformer_config,
@@ -535,9 +527,7 @@ class TestRLUtils:
 
         # Create optimizer
         optimizer_config = OptimizerConfig(
-            optimizer='adam',
-            bf16=True,
-            use_distributed_optimizer=True,
+            optimizer='adam', bf16=True, use_distributed_optimizer=True
         )
         optimizer = get_megatron_optimizer(optimizer_config, [ddp_model])
 
@@ -566,9 +556,9 @@ class TestRLUtils:
 
         # Verify optimizer state is initially on GPU
         initial_devices = get_optimizer_state_devices()
-        assert any('cuda' in d for d in initial_devices), (
-            f"Expected optimizer state on GPU initially, got devices: {initial_devices}"
-        )
+        assert any(
+            'cuda' in d for d in initial_devices
+        ), f"Expected optimizer state on GPU initially, got devices: {initial_devices}"
 
         # Record GPU memory before offload
         torch.cuda.synchronize()
@@ -587,18 +577,18 @@ class TestRLUtils:
 
         # Verify optimizer state is now on CPU
         offloaded_devices = get_optimizer_state_devices()
-        assert all('cpu' in d for d in offloaded_devices), (
-            f"Expected all optimizer state on CPU after offload, got devices: {offloaded_devices}"
-        )
+        assert all(
+            'cpu' in d for d in offloaded_devices
+        ), f"Expected all optimizer state on CPU after offload, got devices: {offloaded_devices}"
 
         # Restore optimizer state to GPU
         optimizer.restore_from_cpu()
 
         # Verify optimizer state is back on GPU
         restored_devices = get_optimizer_state_devices()
-        assert any('cuda' in d for d in restored_devices), (
-            f"Expected optimizer state on GPU after restore, got devices: {restored_devices}"
-        )
+        assert any(
+            'cuda' in d for d in restored_devices
+        ), f"Expected optimizer state on GPU after restore, got devices: {restored_devices}"
 
         # Verify GPU memory increased after restore (optimizer state reallocated)
         torch.cuda.synchronize()
