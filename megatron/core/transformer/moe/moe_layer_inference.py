@@ -49,6 +49,10 @@ from megatron.core import utils
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.transformer.moe.moe_layer import MoELayer, MoESubmodules
 from megatron.core.transformer.transformer_config import TransformerConfig
+from megatron.core.transformer.moe.moe_utils import get_default_pg_collection
+from megatron.core.transformer.moe.experts import InferenceGroupedMLP
+
+from .token_dispatcher_inference import InferenceAlltoAllTokenDispatcher
 
 
 class InferenceMoELayer(MoELayer):
@@ -77,6 +81,9 @@ class InferenceMoELayer(MoELayer):
         Args are identical to MoELayer for checkpoint compatibility.
         """
         # Initialize parent MoELayer (creates router, experts, token_dispatcher)
+        if pg_collection is None:
+            pg_collection = get_default_pg_collection()
+
         super().__init__(
             config=config,
             submodules=submodules,
@@ -84,6 +91,13 @@ class InferenceMoELayer(MoELayer):
             pg_collection=pg_collection,
         )
         
+        self.token_dispatcher = InferenceAlltoAllTokenDispatcher(
+            self.num_local_experts,
+            self.local_expert_indices,
+            config=self.config,
+            pg_collection=pg_collection,
+        )
+
         # Validate dispatcher type
         if config.moe_token_dispatcher_type != "alltoall":
             raise ValueError(
@@ -160,7 +174,7 @@ class InferenceMoELayer(MoELayer):
         
         # ===== Step 5: Expert Computation (using inherited experts) =====
         expert_output, mlp_bias = self.experts(expert_input, tokens_per_expert, expert_probs)
-        
+
         # ===== Step 6: Combine Preprocess (unsort + TP ReduceScatter) =====
         combine_input = self.token_dispatcher.combine_preprocess(expert_output)
         

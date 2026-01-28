@@ -20,7 +20,7 @@ from megatron.core.extensions.transformer_engine import (
     TERowParallelLinear,
 )
 from megatron.core.utils import get_te_version, is_te_min_version
-from megatron.core.transformer.moe.experts import GroupedMLP, SequentialMLP, TEGroupedMLP
+from megatron.core.transformer.moe.experts import GroupedMLP, InferenceGroupedMLP, SequentialMLP, TEGroupedMLP
 
 try:
     import apex  # pylint: disable=unused-import
@@ -195,7 +195,7 @@ class InferenceSpecProvider(BackendSpecProvider):
             and TEColumnParallelGroupedLinear is not None
             and not moe_use_legacy_grouped_gemm
         ):
-            return TEGroupedMLP, MLPSubmodules(
+            return InferenceGroupedMLP, MLPSubmodules(
                 linear_fc1=TEColumnParallelGroupedLinear, linear_fc2=TERowParallelGroupedLinear
             )
         elif moe_use_grouped_gemm:
