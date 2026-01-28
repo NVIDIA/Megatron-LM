@@ -16,7 +16,7 @@ MLM_DEFAULT_ARGS="
 QUANT_CFG=$2
 
 if [ -z ${QUANT_CFG} ]; then
-    QUANT_CFG=fp8
+    QUANT_CFG='FP8_DEFAULT_CFG'
     printf "${MLM_WARNING} Variable ${PURPLE}QUANT_CFG${WHITE} is not set (default: ${QUANT_CFG})!\n"
 fi
 
