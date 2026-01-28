@@ -502,8 +502,8 @@ class TestA2AOverlap:
             position_ids = torch.tensor(data, dtype=torch.int64).repeat((1, 1)).cuda()
             attention_mask = torch.ones((1, 1, seq_len, seq_len), dtype=bool).cuda()
             # get rotary pos emb
-            _, rotary_pos_emb, rotary_pos_cos, rotary_pos_sin, _ = gpt_model._preprocess(
-                input_ids, position_ids
+            _, rotary_pos_emb, rotary_pos_cos, rotary_pos_sin, _, _padding_mask = (
+                gpt_model._preprocess(input_ids, position_ids)
             )
             # reset model
             params = reset_model(gpt_model)

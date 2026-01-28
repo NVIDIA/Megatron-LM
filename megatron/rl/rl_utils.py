@@ -916,9 +916,10 @@ def prepare_trajectories(
             env_id = rollout.env_id
             env_id_counts[env_id] += 1
 
-    logger.info(f"[{dist.get_rank()}] Rollout counts:")
-    for env_id, count in env_id_counts.items():
-        logger.info(f"[{dist.get_rank()}] \t{env_id}: {count}")
+    if torch.distributed.is_initialized():
+        logger.info(f"[{dist.get_rank()}] Rollout counts:")
+        for env_id, count in env_id_counts.items():
+            logger.info(f"[{dist.get_rank()}] \t{env_id}: {count}")
 
     generation_masks = torch.tensor(generation_masks, dtype=torch.bool, device='cpu')
     trajs = torch.tensor(trajs, device='cpu')
