@@ -84,15 +84,9 @@ def offload_grad_data(
     """
     Free all grad_data tensors from a DistributedDataParallel model to release GPU memory.
     
-    This function handles all references to the underlying grad_data tensors:
-    1. param.main_grad views on each parameter
-    2. bucket.grad_data views in each bucket
-    3. cached_grad_buffer_shard_list in bucket groups
-    4. The main buffer.grad_data tensor
-
-    It is insufficient to simply call param.main_grad.cpu() or similar
-    because the underlying GPU tensor is still referenced by other views
-    so the memory is not actually freed.
+    It is insufficient to simply call param.main_grad.cpu() or similar because the
+    underlying GPU tensor is still referenced by other views so the memory is not
+    actually freed. This function clears all references to ensure memory is released.
     
     Note: The tensor data is NOT preserved. Only metadata needed to reallocate
     the buffers is stored. Use this when the buffer contents don't matter
@@ -142,6 +136,12 @@ def _offload_single_buffer(
     buffer_id: int,
 ) -> GradBufferOffloadState:
     """Free a single buffer's grad_data from GPU memory.
+    
+    This clears all references to the underlying tensor to ensure memory is released:
+    1. param.main_grad views on each parameter
+    2. bucket.grad_data views in each bucket
+    3. cached_grad_buffer_shard_list in bucket groups
+    4. The main buffer.grad_data tensor
     
     The tensor data is NOT preserved - only metadata for reallocation is stored.
     """
@@ -208,11 +208,6 @@ def onload_grad_data(
     """
     Reallocate grad_data tensors on GPU.
     
-    This function allocates fresh buffers and recreates all references:
-    1. The main buffer.grad_data tensor (freshly allocated, uninitialized)
-    2. bucket.grad_data views in each bucket
-    3. param.main_grad views on each parameter
-    
     Note: The tensor contents are NOT restored - fresh memory is allocated.
     cached_grad_buffer_shard_list will be recreated lazily on next use.
     
@@ -244,6 +239,11 @@ def _onload_single_buffer(
     zero_grad_data: bool = True,
 ) -> None:
     """Reallocate a single buffer's grad_data on GPU.
+    
+    This allocates fresh buffers and recreates all references:
+    1. The main buffer.grad_data tensor (freshly allocated)
+    2. bucket.grad_data views in each bucket
+    3. param.main_grad views on each parameter
     
     Allocates fresh memory - the tensor contents are NOT restored.
     """
