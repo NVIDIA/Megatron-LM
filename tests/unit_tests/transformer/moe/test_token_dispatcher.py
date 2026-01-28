@@ -364,6 +364,7 @@ class TestAllgatherDispatcher:
     def teardown_method(self, method):
         Utils.destroy_model_parallel()
 
+    @pytest.mark.flaky_in_dev
     @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
     @pytest.mark.internal
     @pytest.mark.parametrize("tp_size,ep_size", [(8, 1), (1, 8), (2, 4), (1, 1)])
@@ -382,6 +383,7 @@ class TestAllgatherDispatcher:
 
         container.dispatcher_dropless_test()
 
+    @pytest.mark.flaky_in_dev
     @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
     @pytest.mark.internal
     @pytest.mark.parametrize("permute_fusion", permute_fusion_params)

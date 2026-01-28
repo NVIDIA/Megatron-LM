@@ -441,17 +441,18 @@ class _CudagraphGlobalRecord:
             ),
         }
 
-        if torch.distributed.get_rank() == 0:
-            logger.info(
-                "> built %d cuda graph(s) in %.2f sec, with total memory usage: "
-                "allocated %s, reserved %s."
-                % (
-                    len(cls.cudagraph_record),
-                    capture_stats["time"],
-                    format_mem_bytes(capture_stats["allocated_bytes"]),
-                    format_mem_bytes(capture_stats["reserved_bytes"]),
-                )
-            )
+        log_single_rank(
+            logger,
+            logging.INFO,
+            "> built %d cuda graph(s) in %.2f sec, with total memory usage: "
+            "allocated %s, reserved %s."
+            % (
+                len(cls.cudagraph_record),
+                capture_stats["time"],
+                format_mem_bytes(capture_stats["allocated_bytes"]),
+                format_mem_bytes(capture_stats["reserved_bytes"]),
+            ),
+        )
 
         # Mark cuda graphs as created.
         for g in cls.cudagraph_record:
