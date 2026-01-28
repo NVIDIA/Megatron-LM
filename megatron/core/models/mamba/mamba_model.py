@@ -185,7 +185,6 @@ class MambaModel(LanguageModule):
         *,
         inference_params: Optional[BaseInferenceContext] = None,
         packed_seq_params: Optional[PackedSeqParams] = None,
-        padding_mask: Optional[Tensor] = None,
     ) -> Tensor:
         """Forward function of the Mamba model. This function passes the input tensors
         through the embedding layer, and then the decoder and finally into the post
@@ -255,7 +254,6 @@ class MambaModel(LanguageModule):
             inference_context=inference_context,
             rotary_pos_emb=rotary_pos_emb,
             packed_seq_params=packed_seq_params,
-            padding_mask=padding_mask,
         )
 
         if not self.post_process:

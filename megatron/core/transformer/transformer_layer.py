@@ -1,6 +1,5 @@
 # Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
-import functools
 import logging
 import warnings
 from abc import ABC
@@ -511,11 +510,7 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
         # runners in the cuda graph manager
         kwargs.pop("dynamic_inference_decode_only", None)
         hidden_states, context = self._forward_attention(*args, **kwargs)
-        output = self._forward_mlp(
-            hidden_states,
-            kwargs.get("inference_context", None),
-            padding_mask=kwargs.get("padding_mask", None),
-        )
+        output = self._forward_mlp(hidden_states, kwargs.get("inference_context", None))
         return output, context
 
     def _forward_attention(
@@ -532,7 +527,6 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
         inference_context: Optional[Any] = None,
         packed_seq_params: Optional[PackedSeqParams] = None,
         sequence_len_offset: Optional[Tensor] = None,
-        padding_mask: Optional[Tensor] = None,
         *,
         inference_params: Optional[Any] = None,
     ):
@@ -680,18 +674,13 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
 
         return pre_mlp_layernorm_output
 
-    def _forward_mlp(self, hidden_states, inference_context=None, padding_mask=None):
+    def _forward_mlp(self, hidden_states, inference_context=None):
         """
         Perform a forward pass through the feed-forward layer.
 
         Args:
             hidden_states (Tensor): Transformed hidden states before the MLP layernorm.
-                Shape [seq_length, batch_size, hidden_size].
-            inference_context: Inference context for optimizations.
-            padding_mask (Tensor, optional): Padding mask for MoE routing.
-                Shape [bsz, seq_length]. True = padding (exclude), False = valid (include).
-                Only used for MoE layers to exclude padding tokens from aux loss computations.
-                The MoELayer will internally transform this to [seq_length, bsz] format.
+
         Returns:
             output (Tensor): Transformed hidden states of shape [s, b, h].
         """
@@ -727,13 +716,10 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
                     tensor_parallel.random.get_cuda_rng_tracker,
                     self.pg_collection.tp,
                     pre_mlp_layernorm_output,
-                    padding_mask=padding_mask,
                 )
             else:
                 mlp_output_with_bias = tensor_parallel.checkpoint(
-                    functools.partial(self.mlp, padding_mask=padding_mask),
-                    False,
-                    pre_mlp_layernorm_output,
+                    self.mlp, False, pre_mlp_layernorm_output
                 )
         elif should_chunk_mlp_for_prefill:
             # Chunk input along sequence dimension
@@ -753,7 +739,7 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
                 # Set the residual for fused reduce-scatter + add + layer-norm + all-gather
                 # operation in MLP's fc2.
                 self._set_fc2_residual(residual)
-            mlp_output_with_bias = self.mlp(pre_mlp_layernorm_output, padding_mask=padding_mask)
+            mlp_output_with_bias = self.mlp(pre_mlp_layernorm_output)
 
         nvtx_range_pop(suffix="mlp")
 
@@ -1277,7 +1263,7 @@ class MoETransformerLayer(TransformerLayer):
                 self.config, self, function_name="_forward_mlp_postprocess"
             )
 
-    def _forward_mlp_router(self, hidden_states, padding_mask=None):
+    def _forward_mlp_router(self, hidden_states):
         """
         Executes the router phase of the MoE block.
 
@@ -1288,9 +1274,7 @@ class MoETransformerLayer(TransformerLayer):
         residual = hidden_states
         self.mlp.fwd_execution_map = "route"
         pre_mlp_layernorm_output = self._forward_pre_mlp_layernorm(hidden_states)
-        router_outputs = self.mlp(
-            pre_mlp_layernorm_output, intermediate_tensors=(), padding_mask=padding_mask
-        )
+        router_outputs = self.mlp(pre_mlp_layernorm_output, intermediate_tensors=())
 
         for attr_name in self.mlp.token_dispatcher.cudagraph_attrs:
             attr = getattr(self.mlp.token_dispatcher, attr_name)
@@ -1331,7 +1315,7 @@ class MoETransformerLayer(TransformerLayer):
         output = self.mlp(None, intermediate_tensors=(output, shared_expert_output))
         return self._forward_post_mlp((output, mlp_bias), residual)
 
-    def _forward_mlp(self, hidden_states, inference_context=None, padding_mask=None):
+    def _forward_mlp(self, hidden_states, inference_context=None):
         """
         Orchestrates the MLP forward pass, handling partial CUDA graph execution logic.
 
@@ -1346,11 +1330,9 @@ class MoETransformerLayer(TransformerLayer):
                 "alongside inference."
             )
 
-        def _forward_mlp_partial_cudagraphs(
-            hidden_states, inference_context=None, padding_mask=None
-        ):
+        def _forward_mlp_partial_cudagraphs(hidden_states, inference_context=None):
             residual, hidden_states, probs, shared_expert_output = self._forward_mlp_router(
-                hidden_states, padding_mask=padding_mask
+                hidden_states
             )
             expert_output, mlp_bias = self._forward_mlp_expert_compute(hidden_states, probs)
             return self._forward_mlp_postprocess(
@@ -1368,17 +1350,12 @@ class MoETransformerLayer(TransformerLayer):
                         tensor_parallel.random.get_cuda_rng_tracker,
                         parallel_state.get_tensor_model_parallel_group(),
                         hidden_states,
-                        padding_mask=padding_mask,
                     )
                 else:
                     return tensor_parallel.checkpoint(
-                        functools.partial(
-                            _forward_mlp_partial_cudagraphs, padding_mask=padding_mask
-                        ),
-                        False,
-                        hidden_states,
+                        _forward_mlp_partial_cudagraphs, False, hidden_states
                     )
             else:
-                return _forward_mlp_partial_cudagraphs(hidden_states, padding_mask=padding_mask)
+                return _forward_mlp_partial_cudagraphs(hidden_states)
         else:
-            return super()._forward_mlp(hidden_states, padding_mask=padding_mask)
+            return super()._forward_mlp(hidden_states)
