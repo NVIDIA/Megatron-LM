@@ -440,8 +440,10 @@ class DynamicInferenceEngine(AbstractEngine):
                     f"but got port {actual_port} instead. This happens if the request port "
                     f"is already in use."
                 )
+        elif not launch_inference_coordinator:
+            dp_addr = f"tcp://{local_ip}:{inference_coordinator_port}"
         else:
-            dp_addr = ""
+            dp_addr = None
 
         # Find available ports for MP and bind to them.
         if self.is_mp_coordinator:
