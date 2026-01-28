@@ -6,11 +6,7 @@ from torch import Tensor
 
 from megatron.core.transformer.module import MegatronModule
 from megatron.core.transformer.transformer_config import TransformerConfig
-<<<<<<< HEAD
-from megatron.core.utils import nvtx_decorator
-=======
 from megatron.core.utils import nvtx_decorator, nvtx_range_push, nvtx_range_pop
->>>>>>> f7a2551df (Update: Align with Kernel Fusion Plan, add Torch.compile)
 
 if TYPE_CHECKING:
     from megatron.core.tensor_parallel.random import MHCBlockRecomputeManager
@@ -163,12 +159,8 @@ class HyperConnectionModule(MegatronModule):
     
 
     # TODO: Kernel fusion
-<<<<<<< HEAD
-    @nvtx_decorator()
-=======
     @torch.compile
     @nvtx_decorator(message="HyperConnection::projection_and_rms")
->>>>>>> f7a2551df (Update: Align with Kernel Fusion Plan, add Torch.compile)
     def _projection_and_rms(self, x : Tensor) -> Tuple[Tensor, Tensor]:
         """
         Project input hidden states to mapping space and apply RMS normalization.
@@ -185,28 +177,20 @@ class HyperConnectionModule(MegatronModule):
         return proj, r
     
     #TODO: kernel fusion
-<<<<<<< HEAD
-    @nvtx_decorator()
-    def _compute_h(self, proj: Tensor, r: Tensor) -> Tensor:
-=======
     @torch.compile
     @nvtx_decorator(message="HyperConnection::compute_h")
     def _compute_h(self, proj: Tensor, r: Tensor) -> Tuple[Tensor, Tensor, Tensor]:
->>>>>>> f7a2551df (Update: Align with Kernel Fusion Plan, add Torch.compile)
         """
         Compute h from projected hidden states and scaling factors.
         
         Args:
             proj: [s, b, n^2 + 2n] - projected hidden states
             r: [s, b, 1] - scaling factors
-<<<<<<< HEAD
-=======
         
         Returns:
             h_pre: [s, b, n] - aggregation weights
             h_post: [s, b, n] - expansion weights
             h_res: [s, b, n^2] - residual mixing logits
->>>>>>> f7a2551df (Update: Align with Kernel Fusion Plan, add Torch.compile)
         """
         s, b, _ = proj.shape
         alpha_ = torch.cat([self.alpha_pre.expand(self.n), self.alpha_post.expand(self.n), self.alpha_res.expand(self.n * self.n)], dim = -1)
@@ -219,11 +203,7 @@ class HyperConnectionModule(MegatronModule):
         h_res = h[..., 2*self.n:]
         return h_pre, h_post, h_res
     
-<<<<<<< HEAD
-    @nvtx_decorator()
-=======
     @nvtx_decorator(message="HyperConnection::compute_mappings")
->>>>>>> f7a2551df (Update: Align with Kernel Fusion Plan, add Torch.compile)
     def compute_mappings(self, x: Tensor) -> Tuple[Tensor, Tensor, Tensor]:
         """
         Compute mHC mappings from input hidden states.
@@ -245,12 +225,8 @@ class HyperConnectionModule(MegatronModule):
         
         return h_pre, h_post, h_res
     
-<<<<<<< HEAD
-    @nvtx_decorator()
-=======
     @torch.compile
     @nvtx_decorator(message="HyperConnection::apply_h_post_inner")
->>>>>>> f7a2551df (Update: Align with Kernel Fusion Plan, add Torch.compile)
     def _apply_h_post(self, x: Tensor, h_post: Tensor) -> Tensor:
         """
         Core implementation of H_post application to a single tensor.
@@ -283,11 +259,7 @@ class HyperConnectionModule(MegatronModule):
         result = h_post.unsqueeze(-1) * x_expanded
         return result.view(s, b, n * C)
     
-<<<<<<< HEAD
-    @nvtx_decorator()
-=======
     @nvtx_decorator(message="HyperConnection::apply_h_post")
->>>>>>> f7a2551df (Update: Align with Kernel Fusion Plan, add Torch.compile)
     def apply_h_post(
         self,
         x_with_bias: Tuple[Tensor, Optional[Tensor]],
@@ -339,12 +311,8 @@ class HyperConnectionModule(MegatronModule):
 
     
     #TODO: Kernel fusion
-<<<<<<< HEAD
-    @nvtx_decorator()
-=======
     @torch.compile
     @nvtx_decorator(message="HyperConnection::aggregate")
->>>>>>> f7a2551df (Update: Align with Kernel Fusion Plan, add Torch.compile)
     def aggregate(self, x: Tensor, h_pre: Tensor) -> Tensor:
         """
         Aggregate n-stream to 1-stream using H_pre weights.
@@ -369,12 +337,8 @@ class HyperConnectionModule(MegatronModule):
         
         return aggregated
 
-<<<<<<< HEAD
-    @nvtx_decorator()
-=======
     @torch.compile
     @nvtx_decorator(message="HyperConnection::apply_h_res")
->>>>>>> f7a2551df (Update: Align with Kernel Fusion Plan, add Torch.compile)
     def apply_h_res(self, h_res: Tensor, residual: Tensor) -> Tensor:
         """
         Apply H_res to residual using H_res weights.
@@ -488,11 +452,7 @@ class HyperConnectionModule(MegatronModule):
         aggregated = CheckpointWithoutOutput(ckpt_manager=manager).checkpoint(
             self.aggregate, hidden_states, h_pre
         )
-<<<<<<< HEAD
-        
-=======
         nvtx_range_pop("HyperConnection::aggregate")
->>>>>>> f7a2551df (Update: Align with Kernel Fusion Plan, add Torch.compile)
         return aggregated, h_res, h_post
     
     # ==================== Block-level utilities ====================
@@ -539,11 +499,7 @@ class HyperConnectionModule(MegatronModule):
 
     # ==================== Fused kernel placeholder ====================
     
-<<<<<<< HEAD
-    @nvtx_decorator()
-=======
     @nvtx_decorator(message="HyperConnection::fused_h_res_h_post_bda")
->>>>>>> f7a2551df (Update: Align with Kernel Fusion Plan, add Torch.compile)
     def fused_h_res_h_post_bda(
         self,
         h_res: Tensor,
@@ -593,10 +549,7 @@ class HyperConnectionModule(MegatronModule):
                 dropout_prob, training, fused
             )
     
-<<<<<<< HEAD
-=======
     @nvtx_decorator(message="HyperConnection::fused_h_res_h_post_bda_native")
->>>>>>> f7a2551df (Update: Align with Kernel Fusion Plan, add Torch.compile)
     def _fused_h_res_h_post_bda_native(
         self,
         h_res: Tensor,
@@ -638,10 +591,7 @@ class HyperConnectionModule(MegatronModule):
         
         return output
     
-<<<<<<< HEAD
-=======
     @nvtx_decorator(message="HyperConnection::fused_h_res_h_post_bda_with_checkpoint")
->>>>>>> f7a2551df (Update: Align with Kernel Fusion Plan, add Torch.compile)
     def _fused_h_res_h_post_bda_with_checkpoint(
         self,
         h_res: Tensor,
@@ -675,18 +625,6 @@ class HyperConnectionModule(MegatronModule):
         from megatron.core.fusions.fused_bias_dropout import get_bias_dropout_add
         
         # Step 1: Checkpoint apply_h_res
-<<<<<<< HEAD
-        mixed = CheckpointWithoutOutput(ckpt_manager=manager).checkpoint(
-            self.apply_h_res, h_res, original_residual
-        )
-        
-        # Step 2: Checkpoint apply_h_post for x
-        x, bias = layer_output_with_bias
-        x_expanded = CheckpointWithoutOutput(ckpt_manager=manager).checkpoint(
-            self._apply_h_post, x, h_post
-        )
-        
-=======
         nvtx_range_push("HyperConnection::apply_h_res")
         mixed = CheckpointWithoutOutput(ckpt_manager=manager).checkpoint(
             self.apply_h_res, h_res, original_residual
@@ -699,7 +637,6 @@ class HyperConnectionModule(MegatronModule):
             self._apply_h_post, x, h_post
         )   
         nvtx_range_pop("HyperConnection::apply_h_post")
->>>>>>> f7a2551df (Update: Align with Kernel Fusion Plan, add Torch.compile)
         # Checkpoint apply_h_post for bias if not None
         if bias is not None:
             bias_expanded = CheckpointWithoutOutput(ckpt_manager=manager).checkpoint(
@@ -728,13 +665,9 @@ class HyperConnectionModule(MegatronModule):
             return bda_func((output, bias), res, dropout)
         
         ckpt = CheckpointWithoutOutput(ckpt_manager=manager)
-<<<<<<< HEAD
-        output = ckpt.checkpoint(_bda_wrapper, x_expanded, bias_expanded, mixed, dropout_prob)
-=======
         nvtx_range_push("HyperConnection::bda_wrapper")
         output = ckpt.checkpoint(_bda_wrapper, x_expanded, bias_expanded, mixed, dropout_prob)
         nvtx_range_pop("HyperConnection::bda_wrapper")
->>>>>>> f7a2551df (Update: Align with Kernel Fusion Plan, add Torch.compile)
         
         return output
 
