@@ -891,7 +891,7 @@ class TransformerConfig(ModelParallelConfig):
     Fine-grained activation offloading is a module-level offloading method
     instead of a layer-level offloading method like cpu_offloading."""
 
-    offload_modules: Optional[list[str]] = None
+    offload_modules: Optional[list[str]] = field(default_factory=list)
     """The submodules to offload its input.
     choices: "attn_norm", "qkv_linear", "core_attn", "attn_proj",
              "mlp_norm", "expert_fc1", "moe_act".
