@@ -1699,7 +1699,7 @@ def train_step(forward_step_func, data_iterator, model, optimizer, opt_param_sch
     # Update parameters.
 
     timers('optimizer', log_level=1).start(barrier=args.barrier_with_L1_time)
-    if getattr(args, 'perform_rl_step', False) and args.offload_optimizer_during_inference:
+    if getattr(args, 'perform_rl_step', False) and args.rl_offload_optimizer_during_inference:
         optimizer.wait_for_restore()
     update_successful, grad_norm, num_zeros_in_grad = optimizer.step()
 
