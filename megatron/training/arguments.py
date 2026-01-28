@@ -2499,135 +2499,34 @@ def _add_learning_rate_args(parser):
 
 
 def _add_checkpointing_args(parser):
-    group = parser.add_argument_group(title='checkpointing')
+    from megatron.training.training_config import CheckpointConfig
 
-    group.add_argument('--save', type=str, default=None,
-                       help='Output directory to save checkpoints to.')
-    group.add_argument('--save-interval', '--persistent-save-interval', type=int, default=None,
-                       help='Number of iterations between persistent checkpoint saves.')
-    group.add_argument('--save-wgrads-interval', type=int, default=None,
-                       help='Number of iterations between wgrad (main_grad) saves.')
-    group.add_argument('--save-dgrads-interval', type=int, default=None,
-                       help='Number of iterations between dgrad saves.')
-    group.add_argument('--save-retain-interval', type=int, default=None,
-                       help='Number of iterations between retained checkpoints (other'
-                       'checkpoints _except the last checkpoint_ are automatically deleted).')
+    ckpt_factory = ArgumentGroupFactory(CheckpointConfig, exclude=["most_recent_k", "save_tokenizer_assets", "save_optim", "save_rng", "load_optim", "load_rng"])
+    group = ckpt_factory.build_group(parser, "checkpointing")
+
     group.add_argument('--no-save-optim', action='store_true', default=None,
                        help='Do not save current optimizer.')
     group.add_argument('--no-save-rng', action='store_true', default=None,
                        help='Do not save current rng state.')
-    group.add_argument('--load', type=str, default=None,
-                       help='Directory containing a model checkpoint.')
     group.add_argument('--no-load-optim', action='store_true', default=None,
                        help='Do not load optimizer when loading checkpoint.')
-    group.add_argument('--load-main-params-from-ckpt', action='store_true', default=None,
-                       help='Load main parameters from checkpoint directly.')
     group.add_argument('--no-load-rng', action='store_true', default=None,
                        help='Do not load rng state when loading checkpoint.')
-    group.add_argument('--no-strict-fsdp-dtensor-load', action='store_false', dest='strict_fsdp_dtensor_load',
-                       help='Do not strict loading for fsdp_dtensor checkpoint format.')
-    group.add_argument('--non-persistent-save-interval', type=int, default=None,
-                       help='Number of iterations between non-persistent saves.')
-    group.add_argument('--non-persistent-ckpt-type', type=str, default=None,
-                       choices=['global', 'local', 'in_memory', None],
-                       help='Type of non-persistent model checkpoints. '
-                           '"global" - Saved as a standard checkpoint (e.g., on Lustre) with old checkpoints being removed. '
-                           '"local" - Each rank saves a portion of the checkpoint locally (e.g., on SSD/ramdisk). '
-                           'None - No non-persistent checkpointing (default option).')
-    group.add_argument('--non-persistent-global-ckpt-dir', type=str, default=None,
-                       help='Directory containing global non-persistent model checkpoints.')
-    group.add_argument('--non-persistent-local-ckpt-dir', type=str, default=None,
-                       help='Directory containing local non-persistent model checkpoints.')
-    group.add_argument('--non-persistent-local-ckpt-algo', type=str, default='fully_parallel',
-                       choices=['fully_parallel', 'atomic'],
-                       help='Algorithm for local non-persistent checkpointing.')
-    group.add_argument('--finetune', action='store_true',
-                       help='Load model for finetuning. Do not load optimizer '
-                       'or rng state from checkpoint and set iteration to 0. '
-                       'Assumed when loading a release checkpoint.')
-    group.add_argument('--pretrained-checkpoint', type=str, default=None,
-                       help='Directory containing a pretrained model checkpoint for finetuning.')
-    group.add_argument('--ckpt-step', type=int, default=None,
-                       help='Checkpoint step to load model from.')
     group.add_argument('--no-initialization', action='store_false',
                        help='Do not perform initialization when building model, '
                        'can reduce startup time when definitely loading from a '
                        'checkpoint',
                        dest='perform_initialization')
-    group.add_argument('--use-checkpoint-args', action='store_true',
-                       help='Override model-related command-line arguments with arguments from checkpoint')
-    group.add_argument('--use-mp-args-from-checkpoint-args', action='store_true',
-                       help='Copy model parallelism command-line arguments from checkpoint')
-    group.add_argument('--no-use-tokenizer-model-from-checkpoint-args', action='store_false',
-                       dest='use_tokenizer_model_from_checkpoint_args',
-                       help='If set, do not use tokenizer model path from checkpoint')
-    group.add_argument('--exit-on-missing-checkpoint', action='store_true',
-                       help="If '--load' is set, but checkpoint is not found "
-                       "(e.g., path typo), then exit instead of random "
-                       "initialization.")
     group.add_argument('--use-dist-ckpt', action='store_true',
                        dest='use_dist_ckpt_deprecated',
                        help='Deprecated: see --ckpt-format.')
-    group.add_argument('--use-persistent-ckpt-worker', action='store_true',
-                       help='Enables a persitent checkpoint worker for async save')
 
-    group.add_argument('--auto-detect-ckpt-format', action='store_true',
-                       help='Determine if the checkpoint format is in legacy or distributed format.'
-                            ' If False, expects distributed checkpoint iff args.ckpt_format != "torch".'
-                            ' Might slow down loading a bit (double rank0 ckpt load).')
     group.add_argument('--dist-ckpt-format',
                        dest='dist_ckpt_format_deprecated',
                        help='Deprecated: see --ckpt-format.')
-    group.add_argument('--ckpt-format', default='torch_dist',
-                       choices=['torch', 'torch_dist', 'torch_dcp', 'fsdp_dtensor'],
-                       help='Checkpoint format to use. torch is the format used by torch.save/load.'
-                       ' torch_dist is a megatron built-in distributed checkpointing format.'
-                       ' torch_dcp is the torch.distributed.checkpoint format.'
-                       ' fsdp_dtensor is a torch DCP native, Megatron FSDP training-specific checkpoint format.')
-    group.add_argument('--ckpt-convert-format', default=None,
-                       choices=['torch', 'torch_dist'],
-                       help='Checkpoint format for conversion.')
-    group.add_argument('--ckpt-convert-save', default=None,
-                       help='Save directory for converted checkpoint.')
-    group.add_argument('--ckpt-convert-update-legacy-dist-opt-format', action='store_true',
-                       help='When loading a checkpoint, update the legacy format '
-                       'for the distributed optimizer, which previously used a '
-                       'merged param/grad buffer and a different bucket mapping. '
-                       'The legacy format was deprecated on Feb 13, 2024.')
     group.add_argument('--ckpt-fully-parallel-save', action='store_true',
                        dest='ckpt_fully_parallel_save_deprecated',
                        help='Deprecated: see --no-ckpt-fully-parallel-save.')
-    group.add_argument('--no-ckpt-fully-parallel-save', action='store_false',
-                       dest='ckpt_fully_parallel_save',
-                       help='Disable applying full save parallelization across DP for'
-                            ' distributed checkpoints. Depending on ckpt format'
-                            ' might decrease the number of files in the checkpoint.'
-                            ' Makes DistributedOptimizer checkpoint non-reshardable.')
-    group.add_argument('--async-save', action='store_true', default=None,
-                       help='Apply async checkpointing save. Currently works only with'
-                            '`torch_dist` distributed checkpoint format.')
-    group.add_argument('--ckpt-fully-parallel-load', action='store_true',
-                       help='Apply full load parallelization across DP for'
-                            ' distributed checkpoints.')
-    group.add_argument('--ckpt-assume-constant-structure', action='store_true',
-                       help='If the model and optimizer state dict structure is'
-                            'constant throughout a *single training job*, it allows for'
-                            'different checkpointing performance optimizations.')
-    group.add_argument('--dist-ckpt-strictness', type=str, default='assume_ok_unexpected',
-                       choices=[e.value for e in StrictHandling],
-                       help='Determine handling of key mismatch during checkpoint load.'
-                            ' Check StrictHandling docs for flags meaning.'
-                            ' NOTE: This flag controls only distributed checkpoint'
-                            ' load from storage, not loading state dict into the model.')
-    group.add_argument('--dist-ckpt-optim-fully-reshardable', action='store_true',
-                       help='Make optimizer distributed checkpoint fully reshardable (TP/PP/EP/DP)'
-                            ' as opposed to plain DP reshardability.')
-    group.add_argument('--distrib-optim-fully-reshardable-mem-efficient', action='store_true',
-                       help='During distributed optimizer checkpoint save and load tries to use as'
-                            ' little memory as possible by using Gloo (instead of NCCL) and only one'
-                            ' rank for saving. Turn on only if experiencing host or device memory'
-                            ' issues. Has affect only with `--dist-ckpt-optim-fully-reshardable`'
-                            ' flag.')
     return parser
 
 
@@ -2866,16 +2765,6 @@ def _add_distributed_args(parser):
     group.add_argument('--use-tp-pp-dp-mapping', action='store_true', default=False,
                         help='If set, distributed ranks initialize order is changed '
                         'from tp-cp-ep-dp-pp to tp-cp-ep-pp-dp.')
-    group.add_argument('--replication', action='store_true', default=False,
-                       help="If set, replication of local checkpoints is enabled. "
-                       "Needs to be enabled on all ranks.")
-    group.add_argument('--replication-jump', default=None, type=int,
-                       help="Specifies `J`, the spacing between ranks storing replicas of a given rank's data. "
-                       "Replicas for rank `n` may be on ranks `n+J`, `n+2J`, ..., or `n-J`, `n-2J`, etc. "
-                       "This flag has an effect only if --replication is used. "
-                       "and must be consistent across all ranks.")
-    group.add_argument('--replication-factor', default=2, type=int,
-                       help="Number of machines storing the replica of a given rank's data.")
     group.add_argument('--fake-process-group', action='store_true', default=False,
                        help='If set, initialize with fake distributed process group and all distributed communication operations will be skipped. \
                        This is quite useful for profiling memory usage of distributed training with just one GPU. \
