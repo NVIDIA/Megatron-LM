@@ -236,11 +236,6 @@ jobs:
           apt-get update
           apt-get install -y gh
 
-      - name: Get PR info
-        id: get-pr-info
-        if: startsWith(github.ref, 'refs/heads/pull-request/')
-        uses: nv-gha-runners/get-pr-info@main
-
       - name: Has lts label
         id: has-lts-label
         env:
