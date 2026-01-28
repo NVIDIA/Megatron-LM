@@ -1600,7 +1600,6 @@ def megatron_rl_inference_mode(
 
         if offload_optimizer_during_inference:
             with nvtx_range("offload-optimizer-before-inference"):
-                optimizer.offload_to_cpu()
                 offload_states = offload_grad_data(model[0], optimizer)
 
         # TODO: Remove this if statement once a change to `toggle_cuda_graphs` makes it safe to.
@@ -1663,7 +1662,6 @@ def megatron_rl_inference_mode(
 
         if offload_optimizer_during_inference:
             with nvtx_range("onload-optimizer-after-inference"):
-                optimizer.restore_from_cpu()
                 onload_grad_data(model[0], offload_states, optimizer)
 
         lang_module.train()
