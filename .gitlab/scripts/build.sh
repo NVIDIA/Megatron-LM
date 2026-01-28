@@ -20,6 +20,8 @@ docker buildx create --name container --driver=docker-container --use tls-enviro
 
 ADDITIONAL_PARAMS=()
 
+CI_COMMIT_BRANCH="${CI_COMMIT_BRANCH:-$CI_MERGE_REQUEST_SOURCE_BRANCH_NAME}"
+
 if [[ "$CI_COMMIT_BRANCH" == "ci-rebuild-mcore-nemo-image" || "$CI_COMMIT_BRANCH" == "main" || "$CI_COMMIT_BRANCH" == "dev" ]]; then
     ADDITIONAL_PARAMS+=("--pull")
 fi
@@ -27,6 +29,9 @@ fi
 CI_COMMIT_BRANCH=$(echo "$CI_COMMIT_BRANCH" | tr '/' '-' | tr '[:upper:]' '[:lower:]' | sed 's/[^a-z0-9._-]/-/g')
 ADDITIONAL_PARAMS+=("--cache-to type=registry,ref=${IMAGE}-buildcache:${CI_COMMIT_BRANCH}-${PLATFORM},mode=max")
 ADDITIONAL_PARAMS+=("--cache-from type=registry,ref=${IMAGE}-buildcache:${CI_COMMIT_BRANCH}-${PLATFORM}")
+ADDITIONAL_PARAMS+=("--cache-from type=registry,ref=${IMAGE}-buildcache:main-${PLATFORM}")
+ADDITIONAL_PARAMS+=("--cache-from type=registry,ref=${IMAGE}-buildcache:dev-${PLATFORM}")
+
 ADDITIONAL_PARAMS+=("-t ${IMAGE}:${CI_COMMIT_BRANCH}-${PLATFORM}")
 
 if [[ -n "$CI_MERGE_REQUEST_IID" ]]; then

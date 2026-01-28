@@ -31,6 +31,7 @@ def set_startup_timestamps(program_start=None, main_entry=None):
         _STARTUP_TIMESTAMPS['main_entry'] = main_entry
 
 
+from collections import defaultdict
 import copy
 import dataclasses
 from datetime import datetime, timedelta
@@ -79,6 +80,9 @@ except ImportError:
 
 
 from megatron.core import mpu, tensor_parallel
+from megatron.core.models.gpt.experimental_attention_variant_module_specs import (
+    is_linear_attention_variant,
+)
 from megatron.core.utils import (
     check_param_hashes_across_dp_replicas,
     get_attr_wrapped_model,
@@ -97,8 +101,9 @@ from megatron.core.pipeline_parallel.utils import (
 )
 from megatron.core.optimizer import get_standard_config_overrides
 from megatron.training.checkpointing import load_checkpoint
-from megatron.training.checkpointing import save_checkpoint
+from megatron.training.checkpointing import save_checkpoint, save_grads
 from megatron.training.checkpointing import checkpoint_exists
+from megatron.training.checkpointing import get_loaded_iteration
 from megatron.core.full_cuda_graph import FullCudaGraphWrapper
 from megatron.core.transformer.cuda_graphs import TECudaGraphHelper
 from megatron.core.transformer.enums import CudaGraphScope
@@ -132,9 +137,11 @@ from megatron.training.initialize import write_args_to_tensorboard
 from megatron.training.initialize import set_jit_fusion_options
 from megatron.training.utils import get_batch_on_this_cp_rank, get_batch_on_this_tp_rank
 from megatron.training.datasets.data_samplers import build_pretraining_data_loader
+from megatron.core.datasets.data_schedule import HybridCPDataLoaderWrapper
 from megatron.core.optimizer_param_scheduler import OptimizerParamScheduler
 from megatron.core.transformer.moe import upcycling_utils
-from megatron.core.transformer.moe.moe_utils import track_moe_metrics
+from megatron.core.transformer.moe.moe_utils import track_moe_metrics, clear_aux_losses_tracker
+from megatron.core.transformer.experimental_attention_variant.dsa import DSAIndexerLossLoggingHelper
 from megatron.core.transformer.multi_token_prediction import MTPLossLoggingHelper
 from megatron.core.parallel_state import (
     destroy_global_memory_buffer,
@@ -181,6 +188,7 @@ from .global_vars import (
     get_energy_monitor,
 )
 from . import one_logger_utils
+from .dgrad_logging import enable_dgrad_logging, disable_dgrad_logging, save_dgrads
 
 from . import ft_integration
 
@@ -312,9 +320,6 @@ def num_floating_point_operations(args, batch_size):
     def transformer_flops():
         """Calculate FLOPs for a standard Transformer model."""
         # TODO(helenn/dnarayanan): Refactor this to reuse the helper methods.
-        # Attention projection size.
-        query_projection_size = args.kv_channels * args.num_attention_heads
-        query_projection_to_hidden_size_ratio = query_projection_size / args.hidden_size
         # Group Query Attention.
         if not args.group_query_attention:
             args.num_query_groups = args.num_attention_heads
@@ -364,18 +369,15 @@ def num_floating_point_operations(args, batch_size):
             if args.moe_shared_expert_intermediate_size is None
             else args.moe_shared_expert_intermediate_size
         )
-        # SwiGLU.
-        gated_linear_multiplier = 3 / 2 if args.swiglu else 1
 
-        # The 12x term below comes from the following factors; for more details, see
-        # "APPENDIX: FLOATING-POINT OPERATIONS" in https://arxiv.org/abs/2104.04473.
         # - 3x: Each GEMM in the model needs to be performed 3 times (forward pass,
         #       backward wgrad [weight gradient], backward dgrad [data gradient]).
-        # - 2x: GEMMs of a particular size are stacked twice in the standard Transformer model
-        #       architectures implemented in this codebase (e.g., h->ffn_h GEMM and ffn_h->h GEMM
-        #       in MLP layer).
+        forward_backward_expansion_factor = 3
         # - 2x: A GEMM of a m*n tensor with a n*k tensor requires 2mnk floating-point operations.
-        expansion_factor = 3 * 2 * 2
+        fma_expansion_factor = 2
+        # - 3x (SwiGLU enabled): h->2*ffn_h GEMM and ffn_h->h GEMM are stacked.
+        # - 2x (SwiGLU disabled): h->ffn_h GEMM and ffn_h->h GEMM are stacked.
+        ffn_expansion_factor = 3 if args.swiglu else 2
 
         if args.multi_latent_attention:
             assert not args.group_query_attention
@@ -405,10 +407,9 @@ def num_floating_point_operations(args, batch_size):
                     + args.num_attention_heads * (args.qk_head_dim + args.qk_pos_emb_head_dim)
                     + 1
                 )
-            self_attn_term = (
-                3
-                * 2  # fwd(1) + bwd(2) *FMA
-                * num_layers
+            standard_self_attn_term = (
+                forward_backward_expansion_factor
+                * fma_expansion_factor
                 * (
                     ## q lora + rope + q norm
                     q_term
@@ -425,53 +426,136 @@ def num_floating_point_operations(args, batch_size):
                     ## core attn
                     + args.seq_length
                     * (args.num_attention_heads * (args.qk_head_dim + args.qk_pos_emb_head_dim))
-                    / 2
+                    / 2  # causal mask (only half of the mask is non-zero)
                     + args.seq_length * args.num_attention_heads * args.v_head_dim / 2
                 )
             )
 
         else:
             ## MHA or GQA
-            self_attn_term = (
-                expansion_factor
-                * num_layers
-                * args.hidden_size
-                * args.hidden_size
+            query_projection_size = args.kv_channels * args.num_attention_heads
+            key_projection_size = args.kv_channels * args.num_query_groups
+            value_projection_size = args.kv_channels * args.num_query_groups
+            gate_projection_size = query_projection_size if args.attention_output_gate else 0
+            standard_self_attn_term = (
+                forward_backward_expansion_factor
+                * fma_expansion_factor
                 * (
-                    (
-                        1
-                        + (args.num_query_groups / args.num_attention_heads)
-                        # # Only half of the attention matrix is non-zero and needs to be multiplied with V.
-                        + (args.seq_length / args.hidden_size / 2)
+                    ## qkv proj
+                    args.hidden_size
+                    * (
+                        query_projection_size
+                        + key_projection_size
+                        + value_projection_size
+                        + gate_projection_size
                     )
-                    * query_projection_to_hidden_size_ratio
+                    ## core attention
+                    + query_projection_size
+                    * args.seq_length
+                    / 2  # causal mask (only half of the mask is non-zero)
+                    * 2  # QK^T and (QK^T)V
+                    ## out proj
+                    + query_projection_size
+                    * args.hidden_size
                 )
             )
+
+        if is_linear_attention_variant(args.experimental_attention_variant):
+            # Calculate number of dense and MoE Transformer MLPs.
+            if isinstance(args.linear_attention_freq, int):
+                linear_attention_pattern = [
+                    # [1,1,...,1,0,1,1,...,1,0,...]
+                    0 if ((i + 1) % args.linear_attention_freq == 0)
+                    else 1 for i in range(num_layers)
+                ]
+            elif isinstance(args.linear_attention_freq, list):
+                linear_attention_pattern = args.linear_attention_freq
+                assert len(linear_attention_pattern) == num_layers, (
+                    f"Invalid length of linear_attention_pattern: {len(linear_attention_pattern)}, "
+                    f"expected {num_layers}, "
+                    f"current linear attention pattern: {args.linear_attention_freq}"
+                )
+            elif args.linear_attention_freq is None:
+                # This should be caught by config validation, but raise here as a safety check
+                raise ValueError(
+                    f"Linear attention type {args.experimental_attention_variant} is specified "
+                    "but linear_attention_freq is None. "
+                    "Please set linear_attention_freq to specify the LA/SDPA layer pattern."
+                )
+            else:
+                raise ValueError(
+                    f"Invalid linear_attention_freq: {type(args.linear_attention_freq)},"
+                    f" {args.linear_attention_freq}"
+                )
+            num_linear_attention_layers = sum(linear_attention_pattern)
+            num_standard_attention_layers = num_layers - num_linear_attention_layers
+
+            if args.experimental_attention_variant == "gated_delta_net":
+                # Calculate the FLOPs for the gated delta net attention.
+                qk_head_dim = args.linear_key_head_dim
+                v_head_dim = args.linear_value_head_dim
+                num_qk_heads = args.linear_num_key_heads
+                num_v_heads = args.linear_num_value_heads
+                qk_dim = qk_head_dim * num_qk_heads
+                v_dim = v_head_dim * num_v_heads
+                linear_self_attn_term = (
+                    forward_backward_expansion_factor
+                    * fma_expansion_factor
+                    * (
+                        ## in proj
+                        args.hidden_size
+                        * (2 * qk_dim + 2 * v_dim + 2 * num_v_heads)
+                        ## conv1d
+                        + args.linear_conv_kernel_dim
+                        * (2 * qk_dim + v_dim)
+                        ## gated delta rule
+                        + num_v_heads
+                        * (v_head_dim ** 2)
+                        * 4  # KK^T, VK^T, S(a(I-bKK^T)), and SQ
+                        ## out proj
+                        + args.hidden_size
+                        * v_dim
+                    )
+                )
+            else:
+                raise ValueError(
+                    "Invalid experimental_attention_variant: "
+                    f"{args.experimental_attention_variant}"
+                )
+        else:
+            num_linear_attention_layers = 0
+            linear_self_attn_term = 0
+            num_standard_attention_layers = num_layers
+
+        self_attn_term = (
+            linear_self_attn_term * num_linear_attention_layers
+            + standard_self_attn_term * num_standard_attention_layers
+        )
 
         total_floating_point_operations = (
             batch_size
             * args.seq_length
             * (
                 # MLP
-                expansion_factor
-                * num_layers
+                forward_backward_expansion_factor
+                * fma_expansion_factor
                 * args.hidden_size
                 * (
                     # dense layer (deepseek v2, v3 style)
-                    (args.ffn_hidden_size * gated_linear_multiplier)
-                    * (num_dense_layers / num_layers)
+                    (args.ffn_hidden_size * ffn_expansion_factor)
+                    * num_dense_layers
                     # routed experts
-                    + (moe_ffn_hidden_size * num_experts_routed_to * gated_linear_multiplier)
-                    * (num_moe_layers / num_layers)
+                    + (moe_ffn_hidden_size * num_experts_routed_to * ffn_expansion_factor)
+                    * num_moe_layers
                     # Shared Experts.
-                    + (shared_expert_ffn_hidden_size * gated_linear_multiplier)
-                    * (num_moe_layers / num_layers)
+                    + (shared_expert_ffn_hidden_size * ffn_expansion_factor)
+                    * num_moe_layers
                 )
                 # Self Attention
                 + self_attn_term
                 # MTP norms and proj
-                + 3
-                * 2
+                + forward_backward_expansion_factor
+                * fma_expansion_factor
                 * mtp_num_layers
                 * (
                     # MTP eh norm + final nrom
@@ -480,7 +564,11 @@ def num_floating_point_operations(args, batch_size):
                     + 2 * args.hidden_size * args.hidden_size
                 )
                 # Logit.
-                + 3 * 2 * args.hidden_size * args.padded_vocab_size * (mtp_num_layers + 1)
+                + forward_backward_expansion_factor
+                * fma_expansion_factor
+                * args.hidden_size
+                * args.padded_vocab_size
+                * (mtp_num_layers + 1)  # MTP + final logit
             )
         )
         return total_floating_point_operations
@@ -689,6 +777,13 @@ def pretrain(
     args = get_args()
     timers = get_timers()
 
+    if args.fine_grained_activation_offloading:
+        from megatron.core.pipeline_parallel.utils import (
+            set_ideal_affinity_for_current_gpu
+        )
+        set_ideal_affinity_for_current_gpu()
+
+
     if args.log_progress:
         append_to_progress_log("Starting job")
 
@@ -710,7 +805,7 @@ def pretrain(
         program_start_global = torch.tensor([_STARTUP_TIMESTAMPS['program_start']], dtype=torch.double, device='cuda')
         torch.distributed.all_reduce(program_start_global, op=torch.distributed.ReduceOp.MIN)
         program_start_global = program_start_global.item()
-        set_startup_timestamps(program_start=program_start_global)
+    set_startup_timestamps(program_start=program_start_global)
 
     global _LEGACY_TRAIN_START_TIME
     start_time_tensor = torch.tensor([_LEGACY_TRAIN_START_TIME], dtype=torch.double, device='cuda')
@@ -818,16 +913,22 @@ def pretrain(
         if (
             args.rl_inference_tensor_model_parallel_size is not None
             or args.rl_inference_pipeline_model_parallel_size is not None
+            or args.rl_inference_expert_model_parallel_size is not None
+            or args.rl_inference_expert_tensor_model_parallel_size is not None
         ):
             print_rank_0(
                 "Building separate RL inference model with custom parallelism: "
                 f"TP={args.rl_inference_tensor_model_parallel_size}, "
-                f"PP={args.rl_inference_pipeline_model_parallel_size}"
+                f"PP={args.rl_inference_pipeline_model_parallel_size}, "
+                f"EP={args.rl_inference_expert_model_parallel_size}, "
+                f"ExptTP={args.rl_inference_expert_tensor_model_parallel_size}"
             )
             inference_pg_collection = build_inference_pg_collection(
                 args.world_size,
                 tp_size=args.rl_inference_tensor_model_parallel_size,
                 pp_size=args.rl_inference_pipeline_model_parallel_size,
+                ep_size=args.rl_inference_expert_model_parallel_size,
+                expt_tp_size=args.rl_inference_expert_tensor_model_parallel_size,
                 use_tp_pp_dp_mapping=args.use_tp_pp_dp_mapping,
             )
 
@@ -838,6 +939,14 @@ def pretrain(
             if args.rl_inference_pipeline_model_parallel_size is not None:
                 inference_config.pipeline_model_parallel_size = (
                     args.rl_inference_pipeline_model_parallel_size
+                )
+            if args.rl_inference_expert_model_parallel_size is not None:
+                inference_config.expert_model_parallel_size = (
+                    args.rl_inference_expert_model_parallel_size
+                )
+            if args.rl_inference_expert_tensor_model_parallel_size is not None:
+                inference_config.expert_tensor_parallel_size = (
+                    args.rl_inference_expert_tensor_model_parallel_size
                 )
 
             # Optionally allocate the RL inference model weights from a unified virtual memory (UVM)
@@ -899,8 +1008,6 @@ def pretrain(
         args.do_valid,
         args.do_test,
         args.dataloader_type,
-        args.retro_project_dir,
-        args.retro_cyclic_train_iters,
     )
 
     # Print setup timing.
@@ -917,11 +1024,6 @@ def pretrain(
 
     if not args.skip_train:
         print_rank_0('training ...')
-
-        if args.dataloader_type == 'cyclic' and args.retro_project_dir:
-            assert args.retro_cyclic_train_iters is not None
-            args.train_iters = args.retro_cyclic_train_iters
-            print_rank_0("retro cyclic train iters : %d" % args.train_iters)
 
         iteration = 0
         if args.do_train and args.train_iters > 0:
@@ -1327,7 +1429,7 @@ def get_megatron_optimizer_config(args: Any) -> OptimizerConfig:
 
     # Construct the appropriate config_overrides object. This default handles many cases, but
     #  can be added to as needed by the user, or replaced entirely with a custom override.
-    config_overrides = get_standard_config_overrides(args.decoupled_lr, args.decoupled_min_lr)
+    config_overrides = get_standard_config_overrides(config=config)
 
     return config, config_overrides
 
@@ -1497,16 +1599,22 @@ def dummy_train_step(data_iterator):
             batch = get_batch_on_this_cp_rank(batch)
 
 
-def train_step(forward_step_func, data_iterator, model, optimizer, opt_param_scheduler, config, forward_backward_func):
+def train_step(forward_step_func, data_iterator, model, optimizer, opt_param_scheduler, config, forward_backward_func, iteration=None):
     """Single training step."""
     args = get_args()
     timers = get_timers()
 
     rerun_state_machine = get_rerun_state_machine()
+    save_dgrads_in_this_iteration = (args.save_dgrads_interval is not None and
+                                     (iteration + 1) % args.save_dgrads_interval == 0)
+    save_wgrads_in_this_iteration = (args.save_wgrads_interval is not None and
+                                     (iteration + 1) % args.save_wgrads_interval == 0)
     while rerun_state_machine.should_run_forward_backward(data_iterator):
         # Set grad to zero.
         for model_chunk in model:
             model_chunk.zero_grad_buffer()
+            # If saving main_grads in this iteration, then all-reduce instead of reduce-scatter.
+            model_chunk.force_all_reduce = save_wgrads_in_this_iteration
         optimizer.zero_grad()
 
         if has_nvidia_modelopt:
@@ -1523,12 +1631,23 @@ def train_step(forward_step_func, data_iterator, model, optimizer, opt_param_sch
         # For the mxfp8_param with reuse_grad_buf_for_mxfp8_param_ag and dp_ag_overlap,
         # we need to call the _copy_main_params_to_param_buffer() after the grad buffer
         # is zeroed by zero_grad_buffer() because param and grad buffer are shared.
+        #
+        # However, we should skip this on the first iteration when forward_pre_hook is disabled,
+        # because:
+        # 1. The first iteration's params are already in param.data (from init or checkpoint).
+        # 2. Without forward_pre_hook, finish_param_sync() won't be called to zero the grad buffer,
+        #    so the main grads will be polluted by the main params.
         if args.reuse_grad_buf_for_mxfp8_param_ag and args.overlap_param_gather:
-            for optim_instance in optimizer.chained_optimizers:
-                if isinstance(optim_instance, DistributedOptimizer):
-                    optim_instance._copy_main_params_to_param_buffer()
+            # Check if forward_pre_hook is enabled by checking if hooks are registered.
+            forward_pre_hook_enabled = len(model[0].remove_forward_pre_hook_handles) > 0
+            if forward_pre_hook_enabled:
+                for optim_instance in optimizer.chained_optimizers:
+                    if isinstance(optim_instance, DistributedOptimizer):
+                        optim_instance._copy_main_params_to_param_buffer()
 
         # Forward pass.
+        if save_dgrads_in_this_iteration:
+            enable_dgrad_logging(model, args.save)
         losses_reduced = forward_backward_func(
             forward_step_func=forward_step_func,
             data_iterator=data_iterator,
@@ -1539,7 +1658,31 @@ def train_step(forward_step_func, data_iterator, model, optimizer, opt_param_sch
             decoder_seq_length=args.decoder_seq_length,
             forward_only=False,
             adjust_tensor_shapes_fn=adjust_tensor_shapes_fn,
+            force_all_reduce=save_wgrads_in_this_iteration,
         )
+        if save_dgrads_in_this_iteration:
+            save_dgrads(iteration + 1)
+            disable_dgrad_logging()
+
+        # Reset force_all_reduce field.
+        for model_chunk in model:
+            model_chunk.force_all_reduce = False
+
+    # Checkpoint main_grads.
+    if save_wgrads_in_this_iteration:
+        # Collect state_dict of wgrads (each param's .main_grad field).
+        state_dict = defaultdict(dict)
+        for model_chunk_id, model_chunk in enumerate(model):
+            model_chunk_name = f"model_chunk{model_chunk_id}"
+            unwrapped_model_chunk = unwrap_model(model_chunk)
+            for param_name, param in unwrapped_model_chunk.named_parameters():
+                if getattr(param, "main_grad", None) is not None:
+                    main_grad_on_cpu = param.main_grad.cpu()
+                    state_dict[model_chunk_name][param_name] = main_grad_on_cpu
+
+        # iteration is 0-indexed, move to 1-indexed for checkpoint name and logging.
+        save_grads(args.save, state_dict, iteration + 1, "wgrads")
+
     should_checkpoint, should_exit, exit_code = rerun_state_machine.should_checkpoint_and_exit()
     if should_exit:
         return {}, True, should_checkpoint, should_exit, exit_code, None, None, 0
@@ -1599,28 +1742,14 @@ def train_step(forward_step_func, data_iterator, model, optimizer, opt_param_sch
         for key in losses_reduced[0].keys():
             val = [x[key].view(-1) for x in losses_reduced]
             if val[0].numel() == 2:
-                if args.sft:
-                    # in mcore the normalization happens on micro batch instead of global
-                    val = torch.vstack(val)
-                    val = val[:, 0] / val[:, 1]
-                    val = val.mean()
-                    torch.distributed.all_reduce(
-                        val,
-                        group=mpu.get_data_parallel_group(with_context_parallel=True)
-                    )
-                    val /= torch.distributed.get_world_size(
-                        group=mpu.get_data_parallel_group(with_context_parallel=True)
-                    )
-                    loss_reduced[key] = val
-                else:
-                    # there is one dict per microbatch. in new reporting, we average
-                    # over the total number of tokens across the global batch.
-                    val = torch.vstack(val).sum(dim=0)
-                    torch.distributed.all_reduce(
-                        val,
-                        group=mpu.get_data_parallel_group(with_context_parallel=True)
-                    )
-                    loss_reduced[key] = val[0] / val[1]
+                # there is one dict per microbatch. in new reporting, we average
+                # over the total number of tokens across the global batch.
+                val = torch.vstack(val).sum(dim=0)
+                torch.distributed.all_reduce(
+                    val,
+                    group=mpu.get_data_parallel_group(with_context_parallel=True)
+                )
+                loss_reduced[key] = val[0] / val[1]
             elif val[0].numel() == 1:
                 # legacy behavior, we average over the number of microbatches
                 val = torch.cat(val).mean()
@@ -1652,8 +1781,8 @@ def training_log(
     params_norm,
     num_zeros_in_grad,
     max_attention_logit,
-    is_first_iteration=False,
     pg_collection=None,
+    is_first_iteration=False,
 ):
     """Log training information such as losses, timing, ...."""
     args = get_args()
@@ -1821,6 +1950,8 @@ def training_log(
             writer.add_scalar('max_attention_logit', max_attention_logit, iteration)
             if wandb_writer:
                 wandb_writer.log({'max_attention_logit': max_attention_logit}, iteration)
+
+    # Log MoE metrics.
     if args.num_experts is not None:
         moe_loss_scale = 1 / get_num_microbatches()
         track_names = []
@@ -1852,11 +1983,26 @@ def training_log(
             mtp_num_layers=args.mtp_num_layers,
             pg_collection=pg_collection,
         )
+
+    # Log MTP metrics.
     if args.mtp_num_layers is not None:
         mtp_loss_scale = 1 / get_num_microbatches()
         MTPLossLoggingHelper.track_mtp_metrics(
             mtp_loss_scale, iteration, writer, wandb_writer, total_loss_dict
         )
+
+    # Track sparse attention indexer loss.
+    if args.dsa_indexer_loss_coeff is not None and args.dsa_indexer_loss_coeff > 0:
+        indexer_loss_scale = 1 / get_num_microbatches()
+        DSAIndexerLossLoggingHelper.track_indexer_metrics(
+            loss_scale=indexer_loss_scale,
+            iteration=iteration,
+            writer=writer,
+            wandb_writer=wandb_writer,
+            total_loss_dict=total_loss_dict,
+        )
+
+    # Dump memory snapshot and print metrics to stdout.
     if iteration % args.log_interval == 0 or is_first_iteration:
         if args.record_memory_history and (is_last_rank() or torch.distributed.get_backend() == 'fake'):
             snapshot = torch.cuda.memory._snapshot()
@@ -1874,12 +2020,15 @@ def training_log(
 
         one_logger_utils.track_e2e_metrics(args.log_throughput, throughput)
 
-        if args.log_timers_to_tensorboard:
+        # We log to stdout after the first iteration (controlled by `is_first_iteration`)
+        # to document initialization overhead. Log statistics to TensorBoard and
+        # WandB according to the regular schedule.
+        if args.log_timers_to_tensorboard and not is_first_iteration:
             if writer:
                 writer.add_scalar('iteration-time', elapsed_time_per_iteration, iteration)
             if wandb_writer:
                 wandb_writer.log({'iteration-time': elapsed_time_per_iteration}, iteration)
-        log_string = f" [{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}]"
+        log_string = f" [{datetime.now().strftime('%Y-%m-%d %H:%M:%S.%f')}]"
         log_string += ' iteration {:8d}/{:8d} |'.format(iteration, args.train_iters)
         log_string += ' consumed samples: {:12d} |'.format(args.consumed_train_samples)
         if has_rl_utils and args.rl_use_sequence_packing:
@@ -1935,16 +2084,22 @@ def training_log(
             total_loss_dict[skipped_iters_key] = 0
             total_loss_dict[nan_iters_key] = 0
         print_rank_last(log_string)
+        reported_memory_in_this_iteration = False
         if report_memory_flag:
             # Report memory after optimizer state has been initialized.
             if torch.distributed.get_rank() == 0:
                 num_microbatches = get_num_microbatches()
                 report_theoretical_memory(args, num_microbatches=num_microbatches, verbose=True)
             report_memory(f'(after {iteration} iterations)')
-            if iteration > 1:
+            reported_memory_in_this_iteration = True
+            loaded_iteration = max(get_loaded_iteration() or 0, 0)
+            if iteration > (loaded_iteration + 1):
                 # Make sure the memory after the second iteration is reported to include optimizer state memory.
                 report_memory_flag = False
-        # Write timers to wandb, don't reset the counts
+        if args.log_memory_interval is not None and iteration % args.log_memory_interval == 0 and \
+            not reported_memory_in_this_iteration:
+            report_memory(f'(after {iteration} iterations)')
+        # Write timers to wandb, don't reset the counts.
         if args.log_timers_to_tensorboard:
             timers.write(timers_to_log, writer, iteration, normalizer=args.log_interval, reset=False)
             timers.write(timers_to_log, wandb_writer, iteration, normalizer=args.log_interval, reset=False)
@@ -2004,6 +2159,9 @@ def force_param_sync(model_chunks: list[DDP]) -> None:
         assert isinstance(model_chunk, DDP)
         model_chunk.start_param_sync(force_sync=True)
 
+# Only report memory for first 3 checkpoint saves.
+num_checkpoints_memory_reported = 0
+MAX_NUM_CHECKPOINTS_MEMORY_REPORTED = 3
 
 def save_checkpoint_and_time(
     iteration,
@@ -2031,6 +2189,14 @@ def save_checkpoint_and_time(
     one_logger_utils.track_e2e_metrics()
     if should_disable_forward_pre_hook(args):
         force_param_sync(model)
+
+    global num_checkpoints_memory_reported, MAX_NUM_CHECKPOINTS_MEMORY_REPORTED
+    should_report_memory = num_checkpoints_memory_reported < MAX_NUM_CHECKPOINTS_MEMORY_REPORTED
+
+    if should_report_memory:
+        # Track memory before checkpoint save.
+        report_memory(f"(before save_checkpoint for iteration {iteration})")
+    # Save checkpoint.
     save_checkpoint(
         iteration,
         model,
@@ -2042,6 +2208,11 @@ def save_checkpoint_and_time(
         train_data_iterator=train_data_iterator,
         preprocess_common_state_dict_fn=preprocess_common_state_dict,
     )
+    if should_report_memory:
+        # Track memory after checkpoint save.
+        report_memory(f"(after save_checkpoint for iteration {iteration})")
+    num_checkpoints_memory_reported += 1
+
     if args.fp8:
         # Run garbage collection after checkpoint saving to free memory from
         # dequantized bf16 tensors that were temporarily created during fp8
@@ -2217,7 +2388,13 @@ def checkpoint_and_decide_exit(
             return True
 
     # Exit based on iterations.
-    if args.exit_interval and iteration % args.exit_interval == 0:
+    if (
+        args.exit_interval
+        and iteration % args.exit_interval == 0
+    ) or (
+        args.phase_transition_iterations
+        and iteration in args.phase_transition_iterations
+    ):
         if args.save and not saved_checkpoint:
             save_checkpoint_and_time(
                 iteration,
@@ -2313,6 +2490,9 @@ def train(
 
     energy_monitor = get_energy_monitor()
     one_logger = get_one_logger()
+
+    if args.hybrid_context_parallel:
+        train_data_iterator = iter(HybridCPDataLoaderWrapper(train_data_iterator, config))
 
     if args.run_workload_inspector_server:
         try:
@@ -2604,7 +2784,7 @@ def train(
             num_zeros_in_grad,
             max_attention_logit,
         ) = train_step(
-            forward_step_func, train_data_iterator, model, optimizer, opt_param_scheduler, config, forward_backward_func
+            forward_step_func, train_data_iterator, model, optimizer, opt_param_scheduler, config, forward_backward_func, iteration=iteration
         )
         ft_integration.on_training_step_end()
         if should_checkpoint:
@@ -2718,8 +2898,8 @@ def train(
             params_norm,
             num_zeros_in_grad,
             max_attention_logit,
-            is_first_iteration=is_first_iteration,
             pg_collection=model_pg_collection,
+            is_first_iteration=is_first_iteration,
         )
         is_first_iteration = False
 
@@ -2775,6 +2955,8 @@ def train(
             timers('interval-time', log_level=0).start(barrier=True)
             if args.log_energy:
                 energy_monitor.resume()
+            if args.num_experts is not None:
+                clear_aux_losses_tracker()
 
         # Miscellaneous post-training-step functions (e.g., FT heartbeats, GC).
         # Some of these only happen at specific iterations. Capture updated FLOPs accumulator
@@ -2826,7 +3008,7 @@ def train(
     if args.log_energy:
         energy_monitor.lap()
         total_energy = energy_monitor.get_total()
-        print_rank_0(f"Total training energy (GPU): {total_energy / 1e6} MJ")
+        print_rank_0(f"Total training energy (GPU): {total_energy / 1e6:.3f} MJ")
         energy_monitor.shutdown()
 
     # If any exit conditions (signal handler, duration, iterations) have been reached, exit.
@@ -3119,7 +3301,17 @@ def get_train_valid_test_num_samples():
         eval_samples = eval_iters * args.global_batch_size
     test_samples = args.eval_iters * args.global_batch_size
 
-    return (train_samples, eval_samples, test_samples)
+    # Get train_samples in current phase.
+    if args.phase_transition_iterations:
+        phase_transition_samples = [0] + [t * args.global_batch_size for t in args.phase_transition_iterations] + [args.train_samples]
+        current_sample = args.iteration * args.global_batch_size
+        last_transition_sample = max(s for s in phase_transition_samples if s <= current_sample)
+        next_transition_sample = min(s for s in phase_transition_samples if s > current_sample)
+        train_samples_in_current_phase = next_transition_sample - last_transition_sample
+    else:
+        train_samples_in_current_phase = train_samples
+
+    return (train_samples_in_current_phase, eval_samples, test_samples)
 
 
 def build_train_valid_test_datasets(build_train_valid_test_datasets_provider, train_valid_test_num_samples=None):
@@ -3147,12 +3339,20 @@ def build_train_valid_test_data_loaders(build_train_valid_test_datasets_provider
         assert (
             args.train_samples is None
         ), 'Only backward compatiblity support for iteration-based training'
+
         args.consumed_train_samples = args.iteration * args.global_batch_size
     if args.iteration > 0 and args.consumed_valid_samples == 0:
         if args.train_samples is None:
             args.consumed_valid_samples = (
                 (args.iteration // args.eval_interval) * args.eval_iters * args.global_batch_size
             )
+
+    # Get consumed train samples in this phase.
+    if args.phase_transition_iterations:
+        last_transition = max(iteration for iteration in (0, *args.phase_transition_iterations) if iteration <= args.iteration)
+        consumed_train_samples_in_current_phase = (args.iteration - last_transition) * args.global_batch_size
+    else:
+        consumed_train_samples_in_current_phase = args.consumed_train_samples
 
     # Rely on distributed-aware core datasets, temporary
     is_distributed = getattr(build_train_valid_test_datasets_provider, "is_distributed", False)
@@ -3177,7 +3377,7 @@ def build_train_valid_test_data_loaders(build_train_valid_test_datasets_provider
             if args.skip_train:
                 train_dataloader = None
             else:
-                train_dataloader = build_pretraining_data_loader(train_ds, args.consumed_train_samples)
+                train_dataloader = build_pretraining_data_loader(train_ds, consumed_train_samples_in_current_phase)
             valid_dataloaders = []
             for valid_d in valid_ds:
                 if args.skip_train or args.full_validation:
