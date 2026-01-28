@@ -1638,10 +1638,19 @@ def train_step(forward_step_func, data_iterator, model, optimizer, opt_param_sch
         # For the mxfp8_param with reuse_grad_buf_for_mxfp8_param_ag and dp_ag_overlap,
         # we need to call the _copy_main_params_to_param_buffer() after the grad buffer
         # is zeroed by zero_grad_buffer() because param and grad buffer are shared.
+        #
+        # However, we should skip this on the first iteration when forward_pre_hook is disabled,
+        # because:
+        # 1. The first iteration's params are already in param.data (from init or checkpoint).
+        # 2. Without forward_pre_hook, finish_param_sync() won't be called to zero the grad buffer,
+        #    so the main grads will be polluted by the main params.
         if args.reuse_grad_buf_for_mxfp8_param_ag and args.overlap_param_gather:
-            for optim_instance in optimizer.chained_optimizers:
-                if isinstance(optim_instance, DistributedOptimizer):
-                    optim_instance._copy_main_params_to_param_buffer()
+            # Check if forward_pre_hook is enabled by checking if hooks are registered.
+            forward_pre_hook_enabled = len(model[0].remove_forward_pre_hook_handles) > 0
+            if forward_pre_hook_enabled:
+                for optim_instance in optimizer.chained_optimizers:
+                    if isinstance(optim_instance, DistributedOptimizer):
+                        optim_instance._copy_main_params_to_param_buffer()
 
         # Forward pass.
         if save_dgrads_in_this_iteration:
@@ -2026,7 +2035,7 @@ def training_log(
                 writer.add_scalar('iteration-time', elapsed_time_per_iteration, iteration)
             if wandb_writer:
                 wandb_writer.log({'iteration-time': elapsed_time_per_iteration}, iteration)
-        log_string = f" [{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}]"
+        log_string = f" [{datetime.now().strftime('%Y-%m-%d %H:%M:%S.%f')}]"
         log_string += ' iteration {:8d}/{:8d} |'.format(iteration, args.train_iters)
         log_string += ' consumed samples: {:12d} |'.format(args.consumed_train_samples)
         if has_rl_utils and args.rl_use_sequence_packing:
@@ -3006,7 +3015,7 @@ def train(
     if args.log_energy:
         energy_monitor.lap()
         total_energy = energy_monitor.get_total()
-        print_rank_0(f"Total training energy (GPU): {total_energy / 1e6} MJ")
+        print_rank_0(f"Total training energy (GPU): {total_energy / 1e6:.3f} MJ")
         energy_monitor.shutdown()
 
     # If any exit conditions (signal handler, duration, iterations) have been reached, exit.

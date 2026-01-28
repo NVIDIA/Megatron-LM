@@ -526,8 +526,8 @@ def save_checkpoint(iteration, model, optimizer, opt_param_scheduler, num_floati
             raise NotImplementedError(f"Please use local or global non-persistent checkpoints (got: {args.non_persistent_ckpt_type})")
 
     ckpt_format = args.ckpt_format if ckpt_type == CheckpointType.GLOBAL else 'torch'
-    print_rank_0('saving checkpoint at iteration {:7d} to {} in {} format'.format(
-        iteration, save_dir, ckpt_format))
+    print_rank_0(f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S.%f')}] saving checkpoint "
+                 f"at iteration {iteration:7d} to {save_dir} in {ckpt_format} format")
 
     # Collect rng state across data parallel ranks.
     if tp_group is None and pp_group is None:
@@ -707,8 +707,8 @@ def save_checkpoint(iteration, model, optimizer, opt_param_scheduler, num_floati
 
         if ckpt_type == CheckpointType.LOCAL:
             def iter_finalize_fn():
-                print_rank_0('  successfully saved local checkpoint from iteration {:7d}'
-                             .format(iteration))
+                print_rank_0(f"  [{datetime.now().strftime('%Y-%m-%d %H:%M:%S.%f')}] successfully "
+                             f"saved local checkpoint from iteration {iteration:7d}")
                 if args.log_progress and args.async_save:
                     append_to_progress_log(f'Saved async local checkpoint\tIteration: {iteration}',
                                            barrier=False)
@@ -724,9 +724,10 @@ def save_checkpoint(iteration, model, optimizer, opt_param_scheduler, num_floati
                     f.write("release" if release else str(iteration))
                 tensor_rank_to_print = (tensor_rank if tensor_rank is not None else mpu.get_tensor_model_parallel_rank()) + 1
                 pipeline_rank_to_print = (pipeline_rank if pipeline_rank is not None else mpu.get_pipeline_model_parallel_rank()) + 1
-                print_rank_0(f'  successfully saved checkpoint from iteration {int(iteration):7d} to {args.save} '
-                             f'[ t {tensor_rank_to_print}/{mpu.get_tensor_model_parallel_world_size()}, '
-                             f'p {pipeline_rank_to_print}/{mpu.get_pipeline_model_parallel_world_size()} ]')
+                print_rank_0(f"  [{datetime.now().strftime('%Y-%m-%d %H:%M:%S.%f')}] successfully saved "
+                             f"checkpoint from iteration {int(iteration):7d} to {args.save} "
+                             f"[ t {tensor_rank_to_print}/{mpu.get_tensor_model_parallel_world_size()}, "
+                             f"p {pipeline_rank_to_print}/{mpu.get_pipeline_model_parallel_world_size()} ]")
                 if args.log_progress and args.async_save:
                     append_to_progress_log(f'Saved async checkpoint\tIteration: {iteration}',
                                            barrier=False)
@@ -736,8 +737,9 @@ def save_checkpoint(iteration, model, optimizer, opt_param_scheduler, num_floati
                                                           return_base_dir=True)
                     try:
                         shutil.rmtree(checkpoint_name)  # TODO: Make this work with MSC remote paths?
-                        print_rank_0(f'  successfully deleted checkpoint from iteration {iteration_to_delete:7d} '
-                                     f'at {args.save}')
+                        print_rank_0(f"  [{datetime.now().strftime('%Y-%m-%d %H:%M:%S.%f')}] successfully "
+                                     f"deleted checkpoint from iteration {iteration_to_delete:7d} "
+                                     f"at {args.save}")
                         if args.log_progress:
                             append_to_progress_log(f'Deleted checkpoint\tIteration: {iteration_to_delete}', barrier=False)
                     except Exception as e:
@@ -788,8 +790,8 @@ def save_checkpoint(iteration, model, optimizer, opt_param_scheduler, num_floati
 
     if args.async_save:
         schedule_async_save(async_save_request)
-        print_rank_0('  scheduled an async checkpoint save at iteration {:7d} to {}' \
-                     .format(iteration, save_dir))
+        print_rank_0(f"  [{datetime.now().strftime('%Y-%m-%d %H:%M:%S.%f')}] scheduled "
+                     f"an async checkpoint save at iteration {iteration:7d} to {save_dir}")
 
     # Wait so everyone is done (not necessary)
     if torch.distributed.is_initialized():
@@ -852,7 +854,8 @@ def maybe_save_dataloader_state(train_iterator, iteration, dataloader_save_path)
         return
 
     dp_rank = mpu.get_data_parallel_rank()
-    print(f"saving dataloader checkpoint at iteration {iteration} to {dataloader_save_path}")
+    if dp_rank == 0:
+        print(f"saving dataloader checkpoint at iteration {iteration} to {dataloader_save_path}")
     train_dataloader_state_dict = train_iterator.iterable.save_state()
     data_state_save_path = get_checkpoint_name(
         dataloader_save_path, iteration,
@@ -1833,7 +1836,7 @@ def load_checkpoint(ddp_model, optimizer, opt_param_scheduler, load_arg='load', 
             if 'rerun_state_machine' in state_dict:
                 get_rerun_state_machine().load_state_dict(state_dict['rerun_state_machine'])
         except Exception as e:
-            print(f"Unable to restore RerunMachine from checkpoint: {e}. Skipping.")
+            print_rank_0(f"Unable to restore RerunMachine from checkpoint: {e}. Skipping.")
 
     # rng states.
     if not release and not args.finetune and not args.no_load_rng and not ignore_rng_state:
@@ -1848,7 +1851,7 @@ def load_checkpoint(ddp_model, optimizer, opt_param_scheduler, load_arg='load', 
                     if f"({pp_rank}, {tp_rank})" in state_dict['rng_state']:
                         rng_state = state_dict['rng_state'][f"({pp_rank}, {tp_rank})"]
                     else:
-                        print("WARNING: RNG state not found for current TP/PP rank")
+                        print_rank_0("WARNING: RNG state not found for current TP/PP rank")
                         rng_state = next(iter(state_dict['rng_state'].values()))
                 else:
                     rng_state = state_dict['rng_state']
