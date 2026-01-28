@@ -12,7 +12,7 @@ allocates fresh buffers. This is useful when the buffer contents are not needed
 """
 
 from dataclasses import dataclass
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Optional
 
 import torch
 
@@ -63,7 +63,10 @@ class GradBufferOffloadState:
 def _get_optimizer_buffers(
     optimizer: ChainedOptimizer | DistributedOptimizer,
 ) -> List[_ParamAndGradBuffer]:
-    """Extract all buffers from an optimizer, handling both ChainedOptimizer and DistributedOptimizer."""
+    """
+    Extract all buffers from an optimizer, 
+    handling both ChainedOptimizer and DistributedOptimizer.
+    """
     if getattr(optimizer, 'is_stub_optimizer', False):
         return []
 
