@@ -202,8 +202,28 @@ jobs:
       && needs.pre-flight.outputs.is_merge_group == 'false'
       && !cancelled()
     steps:
+      - name: Get PR info
+        id: get-pr-info
+        if: startsWith(github.ref, 'refs/heads/pull-request/')
+        uses: nv-gha-runners/get-pr-info@main
+
+      - name: Get merge commit sha
+        shell: bash -x -e -u -o pipefail {0}
+        id: sha
+        env:
+          IS_PR: ${{ startsWith(github.ref, 'refs/heads/pull-request/') }}
+        run: |
+          if [[ "$IS_PR" == "true" ]]; then
+            SHA=${{ fromJSON(steps.get-pr-info.outputs.pr-info || '{}').merge_commit_sha }}
+          else
+            SHA=${GITHUB_SHA}
+          fi
+          echo "main=${SHA}" | tee -a "$GITHUB_OUTPUT"
+
       - name: Checkout
         uses: actions/checkout@v4
+        with:
+          ref: ${{ steps.sha.outputs.main }}
 
       - name: Setup python
         uses: actions/setup-python@v5
@@ -215,11 +235,6 @@ jobs:
         run: |
           apt-get update
           apt-get install -y gh
-
-      - name: Get PR info
-        id: get-pr-info
-        if: startsWith(github.ref, 'refs/heads/pull-request/')
-        uses: nv-gha-runners/get-pr-info@main
 
       - name: Has lts label
         id: has-lts-label
