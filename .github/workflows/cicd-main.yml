@@ -223,7 +223,7 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
         with:
-          sha: ${{ steps.sha.outputs.main }}
+          ref: ${{ steps.sha.outputs.main }}
 
       - name: Setup python
         uses: actions/setup-python@v5
