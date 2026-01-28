@@ -279,7 +279,7 @@ class TestRLUtils:
             curr_iteration=1,
             tensor_model_parallel_size=tp,
             pipeline_model_parallel_size=pp,
-            global_batch_size=Utils.world_size*2,
+            global_batch_size=Utils.world_size * 2,
             grpo_prompts_per_step=Utils.world_size,
             grpo_group_size=2,
         )
@@ -306,7 +306,9 @@ class TestRLUtils:
 
         rollouts = [[r1, r2] for _ in range(Utils.world_size)]
         try:
-            rl_utils.prepare_data_for_update([model], {}, rollouts, tokenizer, sequence_packing=False, is_correction=False)
+            rl_utils.prepare_data_for_update(
+                [model], {}, rollouts, tokenizer, sequence_packing=False, is_correction=False
+            )
         except AssertionError as e:
             # We expect trajectories to come padded there.
             assert str(e).startswith('Rollout is not the correct length')
@@ -328,7 +330,9 @@ class TestRLUtils:
             problem_id="2",
         )
         rollouts = [[r1, r2] for _ in range(Utils.world_size)]
-        data_iter = rl_utils.prepare_data_for_update([model], {}, rollouts, tokenizer, sequence_packing=False, is_correction=False)
+        data_iter = rl_utils.prepare_data_for_update(
+            [model], {}, rollouts, tokenizer, sequence_packing=False, is_correction=False
+        )
 
         _, _, old_logprobs, _, _, _, _ = next(data_iter)
         # All logits are ones in the MockModel.
@@ -378,7 +382,11 @@ class TestRLUtils:
         rollouts = [r1, r2, r3]
 
         trajs, genmask, inference_logprobs = rl_utils.prepare_trajectories(
-            rollouts, tokenizer, seq_length, sequence_packing=use_sequence_packing, skip_bos_token=False,
+            rollouts,
+            tokenizer,
+            seq_length,
+            sequence_packing=use_sequence_packing,
+            skip_bos_token=False,
         )
 
         expected_trajs = torch.tensor(
@@ -474,4 +482,3 @@ def test_pad_some_nones():
 def test_pad_normal():
     padded = rl_utils._pad_nonnull_with_zeros([torch.zeros(2), torch.zeros(3), torch.zeros(4)], 5)
     assert padded.shape == (3, 5)
-
