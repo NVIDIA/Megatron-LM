@@ -341,44 +341,6 @@ class MegatronOptimizer(ABC):
         for param_idx, param_state in state_dict['state'].items():
             param_state['step'] = copy.deepcopy(step)
 
-    def offload_to_cpu(self):
-        """Function used for RL training.
-        Move optimizer state tensors to CPU to free GPU memory during inference."""
-        if getattr(self, 'optimizer', None) is not None and not getattr(
-            self, 'is_stub_optimizer', False
-        ):
-            log_single_rank(logger, logging.INFO, '[OFFLOAD] moving optimizer state to CPU')
-            # Move all optimizer tensors to CPU while keeping the optimizer instance
-            for param_group in self.optimizer.param_groups:
-                for p in param_group['params']:
-                    if isinstance(p, torch.Tensor) and p.is_cuda:
-                        p.data = p.data.cpu()
-
-            for state_dict in self.optimizer.state.values():
-                for k, v in state_dict.items():
-                    if isinstance(v, torch.Tensor) and v.is_cuda:
-                        state_dict[k] = v.cpu()
-
-            torch.cuda.empty_cache()
-
-    def restore_from_cpu(self):
-        """Function used for RL training.
-        Restore optimizer state tensors from CPU back to GPU for training."""
-        if getattr(self, 'optimizer', None) is not None and not getattr(
-            self, 'is_stub_optimizer', False
-        ):
-            log_single_rank(logger, logging.INFO, '[RESTORE] moving optimizer state back to GPU')
-            # Move all optimizer tensors back to GPU
-            for param_group in self.optimizer.param_groups:
-                for p in param_group['params']:
-                    if isinstance(p, torch.Tensor) and not p.is_cuda:
-                        p.data = p.data.cuda()
-
-            for state_dict in self.optimizer.state.values():
-                for k, v in state_dict.items():
-                    if isinstance(v, torch.Tensor) and not v.is_cuda:
-                        state_dict[k] = v.cuda()
-
     @staticmethod
     def _filter_and_reorder_param_groups(
         current_groups: List[Dict], state_dict_groups: List[Dict]
