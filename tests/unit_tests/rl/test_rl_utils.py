@@ -85,6 +85,14 @@ def initialize_model_parallel(request, monkeypatch):
     destroy_num_microbatches_calculator()
 
 
+@pytest.fixture(autouse=True)
+def cleanup_global_state():
+    """Ensure global state is correctly cleaned up after every test."""
+    yield
+    destroy_global_vars()
+    destroy_num_microbatches_calculator()
+
+
 class TestRLUtils:
     """Test class for RL utilities."""
 
