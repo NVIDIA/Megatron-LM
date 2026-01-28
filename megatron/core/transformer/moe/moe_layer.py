@@ -437,11 +437,12 @@ class MoELayer(BaseMoELayer):
                     tensor_parallel.random.get_cuda_rng_tracker,
                     parallel_state.get_tensor_model_parallel_group(),
                     hidden_states,
+                    intermediate_tensors,
                     padding_mask,
                 )
             else:
                 outputs = tensor_parallel.checkpoint(
-                    custom_forward, False, hidden_states, padding_mask
+                    custom_forward, False, hidden_states, intermediate_tensors, padding_mask
                 )
         else:
             outputs = custom_forward(hidden_states, intermediate_tensors, padding_mask)
