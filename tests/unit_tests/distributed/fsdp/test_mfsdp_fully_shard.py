@@ -26,7 +26,7 @@ OPTIM_GRADS_PARAMS = "optim_grads_params"
 CNN = "cnn"
 TRANSFORMER = "transformer"
 TE_TRANSFORMER = "te_transformer"
-DIM_SIZE = 2
+DIM_SIZE = 4
 NUM_LAYERS = 2
 NUM_STEPS = 2
 
@@ -38,13 +38,43 @@ SHARED_TMP_DIR = "/tmp/pytest-shared-tmp"
 def destroy_device_mesh(device_mesh):
     from torch.distributed.device_mesh import _mesh_resources
 
-    # Teardown device mesh.
+    # Get all process groups from the mesh before deleting it
+    process_groups = []
+    try:
+        # Try to get process groups from the mesh
+        if hasattr(device_mesh, 'get_group'):
+            # Get all the groups including flattened ones
+            for dim_name in [DP, DP_SHARD, CP, TP, DP_OUTER, DP_SHARD_CP, HSDP]:
+                try:
+                    group = device_mesh[dim_name].get_group() if hasattr(device_mesh[dim_name], 'get_group') else None
+                    if group is not None and group not in process_groups:
+                        process_groups.append(group)
+                except:
+                    pass
+    except Exception as e:
+        print(f"  [Cleanup] Warning: Could not enumerate process groups: {e}")
+    
+    # Teardown device mesh
     del device_mesh
+    
+    # Clear mesh resources
     _mesh_resources.mesh_stack.clear()
     _mesh_resources.child_to_root_mapping.clear()
     _mesh_resources.root_to_flatten_mapping.clear()
     _mesh_resources.flatten_name_to_root_dims.clear()
     _mesh_resources.mesh_dim_group_options.clear()
+    
+    # Now try to destroy the process groups
+    # NOTE: This may not work on all PyTorch versions - the groups might be 
+    # reference-counted and destroying them explicitly can cause issues
+    for group in process_groups:
+        try:
+            # Only destroy non-default world groups
+            if group != torch.distributed.group.WORLD:
+                torch.distributed.destroy_process_group(group)
+        except Exception as e:
+            # Destroying process groups can fail, just log and continue
+            print(f"  [Cleanup] Warning: Could not destroy process group: {e}")
 
 
 class ToyCNN(torch.nn.Module):
