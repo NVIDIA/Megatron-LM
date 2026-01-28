@@ -44,7 +44,10 @@ class GlooCopyService(CopyService):
         self.send_ops: List[SendOp] = []
         self.recv_ops: List[Tuple[RecvOp, torch.Tensor]] = []
         self._copy_stream = torch.cuda.Stream()
-        logger.info(f"GlooCopyService initialized on rank {self.rank} with {self.world_size} ranks")
+        if self.rank == 0:
+            logger.info(
+                f"GlooCopyService initialized on rank {self.rank} with {self.world_size} ranks"
+            )
 
     def submit_send(self, src_tensor: torch.Tensor, dest_rank: int):
         self.send_ops.append(SendOp(task_id=None, tensor=src_tensor, dest_rank=dest_rank))
@@ -71,10 +74,11 @@ class GlooCopyService(CopyService):
 
     def run(self):
         total_ops = len(self.send_ops) + len(self.recv_ops)
-        logger.info(
-            f"GlooCopyService rank {self.rank}: executing batched communication: "
-            f"{len(self.send_ops)} sends + {len(self.recv_ops)} recvs = {total_ops} ops"
-        )
+        if self.rank == 0:
+            logger.info(
+                f"GlooCopyService rank {self.rank}: executing batched communication: "
+                f"{len(self.send_ops)} sends + {len(self.recv_ops)} recvs = {total_ops} ops"
+            )
 
         p2p_ops: List[dist.P2POp] = []
 
@@ -141,6 +145,7 @@ class GlooCopyService(CopyService):
         if self._copy_stream is not None:
             torch.cuda.current_stream().wait_stream(self._copy_stream)
 
-        logger.info("GlooCopyService: batched communication completed")
+        if self.rank == 0:
+            logger.info("GlooCopyService: batched communication completed")
         self.send_ops.clear()
         self.recv_ops.clear()

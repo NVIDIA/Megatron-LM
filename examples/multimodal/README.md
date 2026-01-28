@@ -13,6 +13,10 @@ Multimodal support in megatron is still under active development. This example i
 ### Docker container
 
 You can build a docker container using `examples/multimodal/Dockerfile` to run this example.
+```
+# At the Megatron-LM root directory, execute the following
+docker build -t megatron-multimodal -f examples/multimodal/Dockerfile .
+```
 
 ### Language model
 

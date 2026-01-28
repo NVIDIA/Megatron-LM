@@ -26,6 +26,9 @@ SPECIAL_TOKENS = ["<unk>", "<s>", "</s>", "<mask>", "<pad>", "<cls>", "<sep>"]
 SPECIAL_TOKEN_TEMPLATE = "<SPECIAL_{id}>"
 
 
+logger = logging.getLogger(__name__)
+
+
 def reload_mergeable_ranks(
     path: str, max_vocab: Optional[int] = None, num_special_tokens: Optional[int] = None
 ) -> Dict[bytes, int]:
@@ -42,15 +45,18 @@ def reload_mergeable_ranks(
     """
 
     assert path.endswith(".json")
+    from megatron.core.utils import log_single_rank
 
     # reload vocab
     with open(path, "r") as f:
         vocab = json.load(f)
     assert isinstance(vocab, list)
-    logger.info(f"Vocab size: {len(vocab)}")
+    log_single_rank(logger, logging.INFO, f"Vocab size: {len(vocab)}")
     if max_vocab is not None:
         vocab = vocab[:max_vocab]
-        logger.info(f"Cutting vocab to first {len(vocab)} tokens.")
+        from megatron.core.utils import log_single_rank
+
+        log_single_rank(logger, logging.INFO, f"Cutting vocab to first {len(vocab)} tokens")
 
     # build ranks
     ranks: Dict[bytes, int] = {}
@@ -127,10 +133,14 @@ class TikTokenTokenizer(MegatronTokenizerTextAbstract, MegatronTokenizerChatTemp
             for i in range(len(special_tokens), num_special_tokens)
         ]
         self.special_filler = special_filler
+        from megatron.core.utils import log_single_rank
+
         if special_filler:
-            logger.info(
+            log_single_rank(
+                logger,
+                logging.INFO,
                 "Adding special tokens: "
-                f"{', '.join(special_tokens)}, {special_filler[0]}, ..., {special_filler[-1]}"
+                f"{', '.join(special_tokens)}, {special_filler[0]}, ..., {special_filler[-1]}",
             )
         self.special_tokens = special_tokens + special_filler
         assert (
