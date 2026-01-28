@@ -969,20 +969,20 @@ def validate_args(args, defaults={}):
     if args.tp_comm_overlap:
         assert args.sequence_parallel == True, 'Tensor parallel communication/GEMM overlap can happen only when sequence parallelism is enabled'
 
-    if args.hybrid_context_parallel:
+    if args.dynamic_context_parallel:
         assert not (args.pipeline_model_parallel_size > 1 and args.use_megatron_fsdp), \
-        'Hybrid context parallelism not supported with pipeline parallelism when using FSDP'
-        assert not args.enable_cuda_graph, 'Hybrid context parallelism not supported with CUDA Graph'
-        assert args.dataloader_type == 'single', 'Hybrid context parallelism only supported with single dataloader type'
-        assert args.calculate_per_token_loss, 'Hybrid context parallelism must be used with --calculate-per-token-loss'
-        assert args.context_parallel_size == 1, 'context parallel size must be 1 for hybrid context parallelism'
+        'Dynamic context parallelism not supported with pipeline parallelism when using FSDP'
+        assert not args.enable_cuda_graph, 'Dynamic context parallelism not supported with CUDA Graph'
+        assert args.dataloader_type == 'single', 'Dynamic context parallelism only supported with single dataloader type'
+        assert args.calculate_per_token_loss, 'Dynamic context parallelism must be used with --calculate-per-token-loss'
+        assert args.context_parallel_size == 1, 'context parallel size must be 1 for dynamic context parallelism'
 
     if args.sequence_packing:
         assert not args.create_attention_mask_in_dataloader, \
         'Sequence packing does not support create_attention_mask_in_dataloader. ' \
         'Please set --no-create-attention-mask-in-dataloader'
         # Validate that packed sequence buffer is large enough for single sequences
-        if args.hybrid_context_parallel:
+        if args.dynamic_context_parallel:
             # packed_buffer_size = hdp_size * max_seqlen_per_rank >= single_seq_max_len
             hdp_size = args.world_size // (args.tensor_model_parallel_size * args.pipeline_model_parallel_size)
             assert hdp_size * args.max_seqlen_per_dp_cp_rank >= args.seq_length, \
@@ -2924,18 +2924,18 @@ def _add_distributed_args(parser):
     group.add_argument('--max-seqlen-per-dp-cp-rank', type=int, default=None,
                        help='Maximum sequence length per CP rank. This is used to calculate the '
                        'number of sub-samples assigned to each CP rank when using heterogeneous context parallel.')
-    group.add_argument('--hybrid-context-parallel', action='store_true', default=False,
-                       help='Enables hybrid context parallel. This is used to balance the workload '
+    group.add_argument('--dynamic-context-parallel', action='store_true', default=False,
+                       help='Enables dynamic context parallel. This is used to balance the workload '
                        'of each CP rank when we use packed samples with variable sequence lengths. '
                        'Requires --max-seqlen-per-dp-cp-rank to be set.')
-    group.add_argument('--min-hybrid-context-parallel-size', type=int, default=1,
-                        help='Minimum size of the hybrid context parallel groups.')
+    group.add_argument('--min-dynamic-context-parallel-size', type=int, default=1,
+                        help='Minimum size of the dynamic context parallel groups.')
     group.add_argument('--sequence-packing-scheduler', type=str, default=None,
-                        choices=['default_hybrid_cp', 'empty_scheduler_with_packing', 'empty_scheduler_no_packing', 'naive_sequence_packing'],
-                        help='Scheduler for sequence packing and hybrid context parallel. '
-                        'naive_sequence_packing: default naive sequence packing scheduler(just THD, no Hybrid-CP, this '
-                        'is just for comparison with default Hybrid-CP scheduler, not recommended for production) '
-                        'default_hybrid_cp: default hybrid-cp scheduler for hybrid context parallel provided by MCore. '
+                        choices=['default_dynamic_cp', 'empty_scheduler_with_packing', 'empty_scheduler_no_packing', 'naive_sequence_packing'],
+                        help='Scheduler for sequence packing and dynamic context parallel. '
+                        'naive_sequence_packing: default naive sequence packing scheduler(just THD, no Dynamic-CP, this '
+                        'is just for comparison with default Dynamic-CP scheduler, not recommended for production) '
+                        'default_dynamic_cp: default dynamic-cp scheduler for dynamic context parallel provided by MCore. '
                         'empty_scheduler_with_packing: scheduling is already handled by the data sampler, '
                         'this scheduler only performs packing. '
                         'empty_scheduler_no_packing: scheduling and packing are already handled by the data sampler, '

@@ -78,11 +78,11 @@ class SFTDataset(MegatronDataset):
             Calculate the divisor used for sequence padding.
             tp_pad = tp_size * 2 if tp_size > 1 else 1
             cp_pad = cp_size * 2 if cp_size > 1 else 1
-            cp_pad = cp_pad * dp_size if hybrid_cp else cp_pad
+            cp_pad = cp_pad * dp_size if dynamic_cp else cp_pad
             divisor = cp_pad * tp_pad
         """
-        if self.config.hybrid_context_parallel:
-            # Hybrid CP: consider both CP and DP
+        if self.config.dynamic_context_parallel:
+            # Dynamic CP: consider both CP and DP
             cp_pad = self.config.data_parallel_size * self.config.context_parallel_size * 2
         else:
             # Standard CP: only consider CP

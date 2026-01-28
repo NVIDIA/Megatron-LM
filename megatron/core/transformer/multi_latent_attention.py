@@ -558,8 +558,8 @@ class MLASelfAttention(MultiLatentAttention):
         if packed_seq_params is not None:
             assert (
                 packed_seq_params.local_cp_size is None
-            ), "hybrid_context_parallel is not supported with MLA yet and is planned for future. \
-            Please disable hybrid_context_parallel."
+            ), "dynamic_context_parallel is not supported with MLA yet and is planned for future. \
+            Please disable dynamic_context_parallel."
 
         inference_context = deprecate_inference_params(inference_context, inference_params)
 

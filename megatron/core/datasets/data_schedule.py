@@ -29,12 +29,12 @@ except ImportError:
 class PackingScheduler(enum.Enum):
     """Enum for supported sequence packing algorithms."""
 
-    # custom hybrid-cp scheduler, schedule in samplers, only need to pack
+    # custom dynamic-cp scheduler, schedule in samplers, only need to pack
     EMPTY_PACKING = "empty_scheduler_with_packing"
-    # custom hybrid-cp scheduler, schedule in samplers and pack in collate_fn
+    # custom dynamic-cp scheduler, schedule in samplers and pack in collate_fn
     EMPTY_NO_PACKING = "empty_scheduler_no_packing"
     NAIVE_SEQUENCE_PACKING = "naive_sequence_packing"
-    DEFAULT_HYBRID_CP = "default_hybrid_cp"
+    DEFAULT_DYNAMIC_CP = "default_dynamic_cp"
 
 
 def wrap_dataloader(
@@ -54,7 +54,7 @@ def wrap_dataloader(
     """
 
     scheduler_map: Dict[PackingScheduler, Type[BaseScheduler]] = {
-        PackingScheduler.DEFAULT_HYBRID_CP: DefaultHybridCPscheduler,
+        PackingScheduler.DEFAULT_DYNAMIC_CP: DefaultDynamicCPscheduler,
         PackingScheduler.NAIVE_SEQUENCE_PACKING: NaiveSequencePackingScheduler,
         PackingScheduler.EMPTY_PACKING: EmptyPackingScheduler,
         PackingScheduler.EMPTY_NO_PACKING: EmptyNoPackingScheduler,
@@ -359,7 +359,7 @@ def wrap_dataloader(
                 `dataset.__getitem__`.
             scheduler_type: packing scheduler.
             local_cp_sizes_gpu: CUDA int32 tensor of shape [num_micro_batches]
-            when DEFAULT_HYBRID_CP, otherwise None.
+            when DEFAULT_DYNAMIC_CP, otherwise None.
 
         Returns:
             new_samples: list of packed samples (dicts) length == num_micro_batches.
@@ -385,7 +385,7 @@ def wrap_dataloader(
             lp = padded_lens_all_gpu[seg_starts[i] : seg_starts[i + 1]]
             lo = original_lens_all_gpu[seg_starts[i] : seg_starts[i + 1]]
 
-            if scheduler_type is PackingScheduler.DEFAULT_HYBRID_CP:
+            if scheduler_type is PackingScheduler.DEFAULT_DYNAMIC_CP:
                 assert local_cp_sizes_gpu is not None
                 partner_cp_arg = local_cp_sizes_gpu[i]
             else:
@@ -425,7 +425,7 @@ def wrap_dataloader(
         pp_group = pg_collection.pp
     assert (
         dp_cp_group is not None and dp_group is not None and tp_group is not None
-    ), "dp_cp_group, dp_group, tp_group must not be None when using hybrid context parallel"
+    ), "dp_cp_group, dp_group, tp_group must not be None when using dynamic context parallel"
 
     total_hdp_gpus = dp_cp_group.size()
     dev = torch.cuda.current_device()
@@ -441,7 +441,7 @@ def wrap_dataloader(
                 config.virtual_pipeline_model_parallel_size == 1)
             else config.microbatch_group_size_per_vp_stage
         ),
-        config.hybrid_context_parallel,
+        config.dynamic_context_parallel,
     )
     if (
         config.virtual_pipeline_model_parallel_size is not None
@@ -524,7 +524,7 @@ def wrap_dataloader(
             new_samples = [batch] + [next(data_iterator) for _ in range(num_micro_batches - 1)]
 
         elif (
-            scheduler_type is PackingScheduler.DEFAULT_HYBRID_CP
+            scheduler_type is PackingScheduler.DEFAULT_DYNAMIC_CP
             or scheduler_type is PackingScheduler.NAIVE_SEQUENCE_PACKING
         ):
 
@@ -568,8 +568,8 @@ def wrap_dataloader(
             hdp_rank = parallel_state.get_data_parallel_rank(with_context_parallel=True)
             num_micro_batches = len(sample_id_groups)
 
-            # local_cp_sizes_gpu is computed outside and passed in for DEFAULT_HYBRID_CP.
-            if scheduler_type is PackingScheduler.DEFAULT_HYBRID_CP:
+            # local_cp_sizes_gpu is computed outside and passed in for DEFAULT_DYNAMIC_CP.
+            if scheduler_type is PackingScheduler.DEFAULT_DYNAMIC_CP:
                 # One H2D total
                 local_cp_sizes_cpu: List[int] = []
                 for i in range(num_micro_batches):
@@ -623,7 +623,7 @@ def wrap_dataloader(
             for sample in new_samples:
                 tensor_list.append(
                     sample["local_cp_size"].unsqueeze(0)
-                    if scheduler_type is PackingScheduler.DEFAULT_HYBRID_CP
+                    if scheduler_type is PackingScheduler.DEFAULT_DYNAMIC_CP
                     else torch.tensor([-1], dtype=torch.float32).cuda()
                 )
             for sample in new_samples:
@@ -650,7 +650,7 @@ def wrap_dataloader(
                 num_total_tokens_this_global_batch = info_numpy[1]
                 sequence_square_sum_this_global_batch = info_numpy[2]
                 max_seqlens = info_to_broadcast_this_pp_group[3 : 3 + num_micro_batches]
-                is_hybrid_cp = int(info_numpy[3 + num_micro_batches]) != -1
+                is_dynamic_cp = int(info_numpy[3 + num_micro_batches]) != -1
                 local_cp_sizes = info_to_broadcast_this_pp_group[
                     3 + num_micro_batches : 3 + 2 * num_micro_batches
                 ]
@@ -674,7 +674,7 @@ def wrap_dataloader(
                 for i in range(num_micro_batches):
                     new_sample = {}
                     new_sample["max_seqlen"] = max_seqlens[i].to(torch.int32)
-                    if is_hybrid_cp:
+                    if is_dynamic_cp:
                         new_sample["local_cp_size"] = local_cp_sizes[i].to(torch.int32)
                     new_sample["cu_seqlens"] = cu_seqlens_list[i].to(torch.int32)
                     new_sample["cu_seqlens_padded"] = cu_seqlens_padded_list[i].to(torch.int32)
@@ -717,7 +717,7 @@ def wrap_dataloader(
                     new_sample_for_other_ppstage["max_seqlen"] = sample["max_seqlen"]
                     new_sample_for_other_ppstage["cu_seqlens"] = sample["cu_seqlens"]
                     new_sample_for_other_ppstage["cu_seqlens_padded"] = sample["cu_seqlens_padded"]
-                    if scheduler_type is PackingScheduler.DEFAULT_HYBRID_CP:
+                    if scheduler_type is PackingScheduler.DEFAULT_DYNAMIC_CP:
                         new_sample_for_other_ppstage["local_cp_size"] = sample["local_cp_size"]
                     new_samples_for_other_ppstage.append(new_sample_for_other_ppstage)
                 if pp_group.rank() == 0:
@@ -756,13 +756,13 @@ class BaseScheduler:
         cp_size: int,
         dp_size: int,
         microbatch_group_size_per_vp_stage: Optional[int],
-        hybrid_context_parallel: bool = False,
+        dynamic_context_parallel: bool = False,
     ):
         self.max_seqlen_per_dp_cp_rank = max_seqlen_per_dp_cp_rank
         self.cp_size = cp_size
         self.dp_size = dp_size
         self.microbatch_group_size_per_vp_stage = microbatch_group_size_per_vp_stage
-        self.hybrid_context_parallel = hybrid_context_parallel
+        self.dynamic_context_parallel = dynamic_context_parallel
 
     def check_require_sample_keys(self, batch: List[Dict]):
         """
@@ -791,19 +791,19 @@ class EmptyPackingScheduler(BaseScheduler):
         cp_size,
         dp_size,
         microbatch_group_size_per_vp_stage,
-        hybrid_context_parallel: bool = False,
+        dynamic_context_parallel: bool = False,
     ):
         super().__init__(
             max_seqlen_per_dp_cp_rank,
             cp_size,
             dp_size,
             microbatch_group_size_per_vp_stage,
-            hybrid_context_parallel=hybrid_context_parallel,
+            dynamic_context_parallel=dynamic_context_parallel,
         )
 
     def check_require_sample_keys(self, batch: List[Dict]):
         """
-        Required per-(sub)sample fields expected by the default hybrid CP
+        Required per-(sub)sample fields expected by the default dynamic CP
         - tokens[torch.Tensor]:1D tensor of input token ids for the (sub)sequence
         (typically shape [padded_seq_len], dtype int64).
         - labels[torch.Tensor]: 1D tensor of target token ids aligned with `tokens` for next-token
@@ -818,7 +818,7 @@ class EmptyPackingScheduler(BaseScheduler):
         - padded_seq_len[torch.Tensor]: Scalar int32 tensor length after padding/truncation,
         used to build `cu_seqlens_padded` and for max_seqlen computation.
         - local_cp_size[torch.Tensor]: Scalar int32 tensor of the partner CP size, used to build
-        `local_cp_size` for Hybrid-CP.
+        `local_cp_size` for Dynamic-CP.
         - num_micro_batches_left[int]: number of microbatches left to be fetched.
         """
         required_keys = [
@@ -844,8 +844,8 @@ class EmptyPackingScheduler(BaseScheduler):
                 return False
         if "local_cp_size" in batch[0]:
             assert (
-                self.hybrid_context_parallel
-            ), "local_cp_size is only supported when using hybrid context parallel"
+                self.dynamic_context_parallel
+            ), "local_cp_size is only supported when using dynamic context parallel"
         return True
 
     def get_groups_and_subsamples(self, sample_id_seqlens):
@@ -867,19 +867,19 @@ class EmptyNoPackingScheduler(BaseScheduler):
         cp_size,
         dp_size,
         microbatch_group_size_per_vp_stage,
-        hybrid_context_parallel: bool = False,
+        dynamic_context_parallel: bool = False,
     ):
         super().__init__(
             max_seqlen_per_dp_cp_rank,
             cp_size,
             dp_size,
             microbatch_group_size_per_vp_stage,
-            hybrid_context_parallel=hybrid_context_parallel,
+            dynamic_context_parallel=dynamic_context_parallel,
         )
 
     def check_require_sample_keys(self, batch: List[Dict]):
         """
-        Required per-(sub)sample fields expected by the default hybrid CP
+        Required per-(sub)sample fields expected by the default dynamic CP
         - tokens[torch.Tensor]:1D tensor of input token ids for the (sub)sequence
         (typically shape [padded_seq_len], dtype int64).
         - labels[torch.Tensor]: 1D tensor of target token ids aligned with `tokens` for next-token
@@ -928,8 +928,8 @@ class EmptyNoPackingScheduler(BaseScheduler):
 
         if "local_cp_size" in batch[0]:
             assert (
-                self.hybrid_context_parallel
-            ), "local_cp_size is only supported when using hybrid context parallel"
+                self.dynamic_context_parallel
+            ), "local_cp_size is only supported when using dynamic context parallel"
 
         return True
 
@@ -954,20 +954,20 @@ class NaiveSequencePackingScheduler(BaseScheduler):
         cp_size,
         dp_size,
         microbatch_group_size_per_vp_stage,
-        hybrid_context_parallel: bool = False,
+        dynamic_context_parallel: bool = False,
     ):
         super().__init__(
             max_seqlen_per_dp_cp_rank,
             cp_size,
             dp_size,
             microbatch_group_size_per_vp_stage,
-            hybrid_context_parallel=hybrid_context_parallel,
+            dynamic_context_parallel=dynamic_context_parallel,
         )
         self.max_seq_len_all_ranks = self.max_seqlen_per_dp_cp_rank * self.cp_size
 
     def check_require_sample_keys(self, batch: List[Dict]):
         """
-        Required per-(sub)sample fields expected by the default hybrid CP
+        Required per-(sub)sample fields expected by the default dynamic CP
         - tokens[torch.Tensor]:1D tensor of input token ids for the (sub)sequence
         (typically shape [padded_seq_len], dtype int64).
         - labels[torch.Tensor]: 1D tensor of target token ids aligned with `tokens` for next-token
@@ -1054,7 +1054,7 @@ class NaiveSequencePackingScheduler(BaseScheduler):
         return sample_id_groups
 
 
-class DefaultHybridCPscheduler(BaseScheduler):
+class DefaultDynamicCPscheduler(BaseScheduler):
     """
     This class provides the functionality to form groups of sub-samples
     such that all DPxCP ranks have a roughly balanced workload in the group.
@@ -1066,21 +1066,21 @@ class DefaultHybridCPscheduler(BaseScheduler):
         cp_size,
         dp_size,
         microbatch_group_size_per_vp_stage,
-        hybrid_context_parallel: bool = False,
+        dynamic_context_parallel: bool = False,
     ):
         super().__init__(
             max_seqlen_per_dp_cp_rank,
             cp_size,
             dp_size,
             microbatch_group_size_per_vp_stage,
-            hybrid_context_parallel=hybrid_context_parallel,
+            dynamic_context_parallel=dynamic_context_parallel,
         )
         self.max_seq_len_per_rank = self.max_seqlen_per_dp_cp_rank
         self.total_hdp_gpus = self.dp_size * self.cp_size
 
     def check_require_sample_keys(self, batch: List[Dict]):
         """
-        Required per-(sub)sample fields expected by the default hybrid CP
+        Required per-(sub)sample fields expected by the default dynamic CP
         - tokens[torch.Tensor]:1D tensor of input token ids for the (sub)sequence
         (typically shape [padded_seq_len], dtype int64).
         - labels[torch.Tensor]: 1D tensor of target token ids aligned with `tokens` for next-token
@@ -1137,7 +1137,7 @@ class DefaultHybridCPscheduler(BaseScheduler):
         This is used to determine the CP size of a sub-sample.
 
         The number is rounded up to the next power of 2 to match the available
-        hybrid context parallel process group sizes.
+        dynamic context parallel process group sizes.
         """
         return max(1, 2 ** ceil(log2((seq_len / self.max_seq_len_per_rank))))
 
@@ -1474,7 +1474,7 @@ class DefaultHybridCPscheduler(BaseScheduler):
             "try to increase 'max-seqlen-per-dp-cp-rank'."
 
             min_group_size = min(existing_group_sizes)
-            # We have Hybrid DPxCP groups for every power of 2 of GPUs or the entire DPxCP group.
+            # We have Dynamic DPxCP groups for every power of 2 of GPUs or the entire DPxCP group.
             next_power = min(min_group_size * 2, total_gpus)
 
             # Find the first group of min_group_size that can be expanded
@@ -1690,7 +1690,7 @@ def get_batch_on_this_rank_for_sequence_packing(
     data_iterator,
     mtp_on_this_rank: bool = False,
     vp_stage: Optional[int] = None,
-    hybrid_context_parallel: bool = False,
+    dynamic_context_parallel: bool = False,
 ):
     """
     Get a batch of data for sequence packing.
@@ -1698,7 +1698,7 @@ def get_batch_on_this_rank_for_sequence_packing(
         data_iterator (Iterator): The data iterator to get the batch from.
         mtp_on_this_rank (bool): Whether to use multi-token prediction.
         vp_stage (Optional[int]): The stage of the pipeline.
-        hybrid_context_parallel (bool): Whether to use hybrid context parallel.
+        dynamic_context_parallel (bool): Whether to use dynamic context parallel.
     Returns:
         tuple of (tokens, labels, loss_mask, attention_mask, position_ids, packed_seq_params)
     """
@@ -1727,7 +1727,7 @@ def get_batch_on_this_rank_for_sequence_packing(
         'cu_seqlens_padded',
         'max_seqlen',
     ]
-    if hybrid_context_parallel:
+    if dynamic_context_parallel:
         batch_keys.append('local_cp_size')
     if is_first_stage:
         batch_keys.append('tokens')
@@ -1749,13 +1749,13 @@ def get_batch_on_this_rank_for_sequence_packing(
     # Partition tokens, position_ids, labels, loss_mask for context parallel, currently only
     # TP rank 0 and the first/last PP stage rank has these data.
     if is_tp_rank_0 and is_first_or_last_stage:
-        # Get the proper cp_size and cp_rank based on hybrid context parallel is enabled or not.
-        if hybrid_context_parallel:
+        # Get the proper cp_size and cp_rank based on dynamic context parallel is enabled or not.
+        if dynamic_context_parallel:
             cp_size = batch['local_cp_size']
             if type(cp_size) == torch.Tensor:
                 cp_size = cp_size.item()
             cp_rank = torch.distributed.get_rank(
-                group=parallel_state.get_hybrid_data_context_parallel_groups(group_size=cp_size)
+                group=parallel_state.get_dynamic_data_context_parallel_groups(group_size=cp_size)
             )
         else:
             cp_size = parallel_state.get_context_parallel_world_size()
@@ -1840,8 +1840,8 @@ def get_batch_on_this_rank_for_sequence_packing(
         batch['cu_seqlens_padded'] = torch.empty([cu_seqlen_size], dtype=torch.int32, device=dev)
         batch['max_seqlen'] = torch.empty(1, dtype=torch.int32, device=dev)
 
-    # Step4(optional): Prepare "local_cp_size" if hybrid context parallel is enabled.
-    if hybrid_context_parallel:
+    # Step4(optional): Prepare "local_cp_size" if dynamic context parallel is enabled.
+    if dynamic_context_parallel:
         if is_tp_rank_0:
             if type(batch['local_cp_size']) == int:
                 batch['local_cp_size'] = torch.tensor(
@@ -1861,7 +1861,7 @@ def get_batch_on_this_rank_for_sequence_packing(
     _broadcast_to_tp_group(batch['cu_seqlens'])
     _broadcast_to_tp_group(batch['cu_seqlens_padded'])
     _broadcast_to_tp_group(batch['max_seqlen'])
-    if hybrid_context_parallel:
+    if dynamic_context_parallel:
         _broadcast_to_tp_group(batch['local_cp_size'])
 
     # Extract the data from batch after broadcasting.
@@ -1873,10 +1873,10 @@ def get_batch_on_this_rank_for_sequence_packing(
     cu_seqlens_padded = batch['cu_seqlens_padded']
     max_seqlen = batch['max_seqlen'].item()
 
-    # Set the proper cp_group and local_cp_size when hybrid context parallel is enabled.
-    if hybrid_context_parallel:
+    # Set the proper cp_group and local_cp_size when dynamic context parallel is enabled.
+    if dynamic_context_parallel:
         local_cp_size = batch['local_cp_size'].item()
-        cp_group = parallel_state.get_hybrid_data_context_parallel_groups(group_size=local_cp_size)
+        cp_group = parallel_state.get_dynamic_data_context_parallel_groups(group_size=local_cp_size)
     else:
         local_cp_size = None
         cp_group = None

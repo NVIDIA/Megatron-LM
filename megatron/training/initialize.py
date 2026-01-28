@@ -371,7 +371,7 @@ def _initialize_distributed(get_embedding_ranks, get_position_embedding_ranks, s
                 use_sharp=args.use_sharp,
                 context_parallel_size=args.context_parallel_size,
                 hierarchical_context_parallel_sizes=args.hierarchical_context_parallel_sizes,
-                hybrid_context_parallel=args.hybrid_context_parallel,
+                dynamic_context_parallel=args.dynamic_context_parallel,
                 expert_model_parallel_size=args.expert_model_parallel_size,
                 num_distributed_optimizer_instances=args.num_distributed_optimizer_instances,
                 expert_tensor_parallel_size=args.expert_tensor_parallel_size,
@@ -383,7 +383,7 @@ def _initialize_distributed(get_embedding_ranks, get_position_embedding_ranks, s
                 create_gloo_process_groups=args.enable_gloo_process_groups,
                 high_priority_stream_groups=args.high_priority_stream_groups,
                 sharp_enabled_group=args.sharp_enabled_group,
-                min_hybrid_context_parallel_size=args.min_hybrid_context_parallel_size,
+                min_dynamic_context_parallel_size=args.min_dynamic_context_parallel_size,
             )
             if args.rank == 0:
                 print(

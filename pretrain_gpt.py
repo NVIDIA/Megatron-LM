@@ -52,7 +52,7 @@ def get_batch(data_iterator, vp_stage: Optional[int] = None):
             data_iterator,
             mtp_on_this_rank=mtp_on_this_rank(config, ignore_virtual=False, vp_stage=vp_stage),
             vp_stage=vp_stage,
-            hybrid_context_parallel=args.hybrid_context_parallel,
+            dynamic_context_parallel=args.dynamic_context_parallel,
         )
 
     # TODO: this is pretty hacky, find a better way
@@ -217,7 +217,7 @@ def core_gpt_dataset_config_from_args(args):
         "context_parallel_size": args.context_parallel_size,
         "data_parallel_size": args.data_parallel_size,
         "sequence_parallel_size": args.tensor_model_parallel_size*args.sequence_parallel,
-        "hybrid_context_parallel": args.hybrid_context_parallel,
+        "dynamic_context_parallel": args.dynamic_context_parallel,
         "sft_mock_dataset_config_json":args.sft_mock_dataset_config_json,
         "sequence_packing": args.sequence_packing,
     }

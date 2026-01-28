@@ -8,8 +8,8 @@ MCORE_PATH="../"
 OUTPUT_BASE="./output"
 SEQ_LEN=16384
 
-HYBRID_CP_ARGS=" \
-    --hybrid-context-parallel \
+DYNAMIC_CP_ARGS=" \
+    --dynamic-context-parallel \
     --sequence-packing \
     --calculate-per-token-loss \
     --max-seqlen-per-dp-cp-rank 4096 \
@@ -72,4 +72,4 @@ ARGS=" \
     --use-dist-ckpt \
 "
 
-torchrun --nproc_per_node 8 ${MCORE_PATH}/pretrain_gpt.py ${ARGS} ${HYBRID_CP_ARGS}
+torchrun --nproc_per_node 8 ${MCORE_PATH}/pretrain_gpt.py ${ARGS} ${DYNAMIC_CP_ARGS}

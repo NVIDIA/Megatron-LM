@@ -521,7 +521,7 @@ def wrap_iterator_helper(
     """Warp data iterator for sequence packing if needed."""
     if config.sequence_packing:
         scheduler_type_map = {
-            'default_hybrid_cp': PackingScheduler.DEFAULT_HYBRID_CP,
+            'default_dynamic_cp': PackingScheduler.DEFAULT_DYNAMIC_CP,
             'empty_scheduler_with_packing': PackingScheduler.EMPTY_PACKING,
             'empty_scheduler_no_packing': PackingScheduler.EMPTY_NO_PACKING,
             'naive_sequence_packing': PackingScheduler.NAIVE_SEQUENCE_PACKING,

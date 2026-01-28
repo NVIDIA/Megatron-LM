@@ -1229,9 +1229,9 @@ class TEDotProductAttention(te.pytorch.DotProductAttention):
                 else:
                     extra_kwargs["cp_comm_type"] = cp_comm_type
 
-        # we need to create a single stream for cp=1 and hybrid cp enabled.
+        # we need to create a single stream for cp=1 and dynamic cp enabled.
         if (
-            self.config.hybrid_context_parallel
+            self.config.dynamic_context_parallel
             and getattr(TEDotProductAttention, "cp_stream") is None
         ):
             TEDotProductAttention.cp_stream = torch.cuda.Stream()

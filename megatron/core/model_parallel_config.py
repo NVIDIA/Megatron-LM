@@ -72,20 +72,20 @@ class ModelParallelConfig:
     each rank when using sequence_packing.
     """
 
-    hybrid_context_parallel: bool = False
+    dynamic_context_parallel: bool = False
     """
-    If true, enables hybrid context parallel. This is used to balance the workload of 
+    If true, enables dynamic context parallel. This is used to balance the workload of 
     each CP rank when we use packed samples with variable sequence lengths.
-    Please set max_seqlen_per_dp_cp_rank when using hybrid_context_parallel.
-    When enabling hybrid_context_parallel, sequence_packing must be true.
+    Please set max_seqlen_per_dp_cp_rank when using dynamic_context_parallel.
+    When enabling dynamic_context_parallel, sequence_packing must be true.
     """
 
     sequence_packing_scheduler: Optional[str] = None
     """
-    Scheduler for sequence packing and hybrid context parallel.
-    naive_sequence_packing: default naive sequence packing scheduler(just THD, no Hybrid-CP, this 
-    is just for comparison with default hybrid-cp scheduler, not recommended for production)
-    default_hybrid_cp: default hybrid-cp scheduler for hybrid context parallel provided by MCore.
+    Scheduler for sequence packing and dynamic context parallel.
+    naive_sequence_packing: default naive sequence packing scheduler(just THD, no Dynamic-CP, this 
+    is just for comparison with default dynamic-cp scheduler, not recommended for production)
+    default_dynamic_cp: default dynamic-cp scheduler for dynamic context parallel provided by MCore.
     empty_scheduler_with_packing: scheduling is already handled by the data sampler,
     this scheduler only performs packing.
     empty_scheduler_no_packing: scheduling and packing are already handled by the data sampler,
@@ -463,8 +463,8 @@ class ModelParallelConfig:
                     "Pipeline parallel communication overlapping in warmup and flush is only "
                     "compatible with overlap_p2p_comm but not batch_p2p_comm."
                 )
-        if self.hybrid_context_parallel and not self.sequence_packing:
-            raise ValueError("Hybrid context parallel requires sequence packing to be enabled")
+        if self.dynamic_context_parallel and not self.sequence_packing:
+            raise ValueError("Dynamic context parallel requires sequence packing to be enabled")
         if self.sequence_packing:
             if not HAVE_PACKAGING:
                 raise ImportError(
@@ -479,7 +479,7 @@ class ModelParallelConfig:
                     f"but got {get_te_version()} (TE < 2.9.0 may have convergence issues)."
                 )
             if self.sequence_packing_scheduler == None:
-               if self.hybrid_context_parallel:
-                  self.sequence_packing_scheduler = "default_hybrid_cp"
+               if self.dynamic_context_parallel:
+                  self.sequence_packing_scheduler = "default_dynamic_cp"
                else:
                   self.sequence_packing_scheduler = "naive_sequence_packing"

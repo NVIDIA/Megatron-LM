@@ -195,7 +195,7 @@ def initialize_gpt_model(
     torch.manual_seed(args.seed)
     model_parallel_cuda_manual_seed(args.seed)
 
-    # NOTE: This unit test uses TP/PP/CP (and optionally hybrid-CP). We must pass the
+    # NOTE: This unit test uses TP/PP/CP (and optionally dynamic-CP). We must pass the
     # model-parallel sizes into TransformerConfig; otherwise it defaults to cp=1 which
     # breaks RoPE sharding (cp_group.size()>1 but config.context_parallel_size==1).
     default_config_kwargs = dict(
@@ -209,7 +209,7 @@ def initialize_gpt_model(
         pipeline_model_parallel_size=args.pipeline_model_parallel_size,
         context_parallel_size=args.context_parallel_size,
         sequence_parallel=args.sequence_parallel,
-        hybrid_context_parallel=args.hybrid_context_parallel,
+        dynamic_context_parallel=args.dynamic_context_parallel,
         sequence_packing_scheduler=args.sequence_packing_scheduler,
         sequence_packing=getattr(args, "sequence_packing", False),
         max_seqlen_per_dp_cp_rank=getattr(args, "max_seqlen_per_dp_cp_rank", None),
@@ -316,7 +316,7 @@ def get_data_iterator(args):
         context_parallel_size=args.context_parallel_size,
         data_parallel_size=args.data_parallel_size,
         sequence_parallel_size=args.tensor_model_parallel_size,
-        hybrid_context_parallel=args.hybrid_context_parallel,
+        dynamic_context_parallel=args.dynamic_context_parallel,
         sft_mock_dataset_config_json=args.sft_mock_dataset_config_json,
         sequence_packing=args.sequence_packing,
     )
@@ -377,7 +377,7 @@ def get_data_iterator(args):
         ((1, 1, 2, None), False),
     ],
 )
-def test_packing_and_hybrid_cp(create_args, tp_pp_cp_vpp, is_moe):
+def test_packing_and_dynamic_cp(create_args, tp_pp_cp_vpp, is_moe):
     
     def _compute_avg_loss(losses_list):
         """计算所有 micro-batches 的平均 loss"""
@@ -397,21 +397,21 @@ def test_packing_and_hybrid_cp(create_args, tp_pp_cp_vpp, is_moe):
     losses_reduced_baseline, is_last_stage = dummy_forward_func(
         args,
         is_sequence_packing=False,
-        is_hybrid_context_parallel=False,
+        is_dynamic_context_parallel=False,
         tp_pp_cp_vpp=tp_pp_cp_vpp,
         is_moe=is_moe,
     )
     losses_reduce_packing, _ = dummy_forward_func(
         args,
         is_sequence_packing=True,
-        is_hybrid_context_parallel=False,
+        is_dynamic_context_parallel=False,
         tp_pp_cp_vpp=tp_pp_cp_vpp,
         is_moe=is_moe,
     )
     losses_reduced_hybrid, _ = dummy_forward_func(
         args,
         is_sequence_packing=True,
-        is_hybrid_context_parallel=True,
+        is_dynamic_context_parallel=True,
         tp_pp_cp_vpp=tp_pp_cp_vpp,
         is_moe=is_moe,
     )
@@ -441,17 +441,17 @@ def test_packing_and_hybrid_cp(create_args, tp_pp_cp_vpp, is_moe):
         assert rel_err_hybrid < rtol, \
             f"hybrid avg loss {avg_hybrid:.6f} vs baseline {avg_baseline:.6f}, rel_err={rel_err_hybrid:.6e}"
             
-    print("test_packing_and_hybrid_cp passed with tp_pp_cp_vpp: ", tp_pp_cp_vpp, "is_moe: ", is_moe)
+    print("test_packing_and_dynamic_cp passed with tp_pp_cp_vpp: ", tp_pp_cp_vpp, "is_moe: ", is_moe)
 
 
 def dummy_forward_func(
-    args, is_sequence_packing, is_hybrid_context_parallel, tp_pp_cp_vpp, is_moe
+    args, is_sequence_packing, is_dynamic_context_parallel, tp_pp_cp_vpp, is_moe
 ):
     from megatron.core.pipeline_parallel import get_forward_backward_func
     from pretrain_gpt import forward_step, get_batch
 
     args.sequence_packing = is_sequence_packing
-    args.hybrid_context_parallel = is_hybrid_context_parallel
+    args.dynamic_context_parallel = is_dynamic_context_parallel
 
     args.num_experts = 4 if is_moe else None
     args.moe_ffn_hidden_size = 768 if is_moe else None
@@ -463,13 +463,13 @@ def dummy_forward_func(
         args.pipeline_model_parallel_size = pp
         args.virtual_pipeline_model_parallel_size = vpp
         args.data_parallel_size = 8 // (tp * pp)
-        # Hybrid-CP requires context_parallel_size == 1; CP is achieved via DPxCP hybrid groups.
-        args.context_parallel_size = 1 if args.hybrid_context_parallel else cp
-        if args.hybrid_context_parallel:
+        # Dynamic-CP requires context_parallel_size == 1; CP is achieved via DPxCP hybrid groups.
+        args.context_parallel_size = 1 if args.dynamic_context_parallel else cp
+        if args.dynamic_context_parallel:
             dp_cp_size = args.data_parallel_size * args.context_parallel_size
             if dp_cp_size % 2 != 0:
                 pytest.skip(
-                    "Hybrid context parallel requires an even dp-cp group size"
+                    "Dynamic context parallel requires an even dp-cp group size"
                 )
         if tp > 1:
             args.sequence_parallel = True
@@ -478,8 +478,8 @@ def dummy_forward_func(
             pp,
             vpp,
             context_parallel_size=args.context_parallel_size,
-            hybrid_context_parallel=args.hybrid_context_parallel,
-            min_hybrid_context_parallel_size=getattr(args, "min_hybrid_context_parallel_size", 1),
+            dynamic_context_parallel=args.dynamic_context_parallel,
+            min_dynamic_context_parallel_size=getattr(args, "min_dynamic_context_parallel_size", 1),
         )
 
     set_tp_pp_vpp(*tp_pp_cp_vpp)
@@ -490,9 +490,9 @@ def dummy_forward_func(
             f"Setting moe_token_dispatcher_type to alltoall for sft sequence packing with pipeline parallelism"
         )
         args.moe_token_dispatcher_type = "alltoall"
-        if is_hybrid_context_parallel:
+        if is_dynamic_context_parallel:
             args.max_seqlen_per_dp_cp_rank = args.seq_length // args.data_parallel_size
-            args.sequence_packing_scheduler = "default_hybrid_cp"
+            args.sequence_packing_scheduler = "default_dynamic_cp"
         else:
             args.max_seqlen_per_dp_cp_rank = args.seq_length // args.context_parallel_size
             args.sequence_packing_scheduler = "naive_sequence_packing"
@@ -565,7 +565,7 @@ class MockVariableLengthSequencePackingDataIterator:
             total_seq_length: Total length of packed sequences
             sequence_lengths: List of individual sequence lengths (variable-length).
                               If None, generates random variable lengths.
-            local_cp_size: Local CP size for hybrid context parallel
+            local_cp_size: Local CP size for dynamic context parallel
             device: Device to create tensors on
             seed: Random seed for reproducibility
         """
@@ -660,7 +660,7 @@ def _gather_tensor_from_all_ranks(tensor):
 
 
 @pytest.mark.parametrize(
-    ("tp", "pp", "cp", "hybrid_cp"),
+    ("tp", "pp", "cp", "dynamic_cp"),
     [
         (1, 1, 1, False),  # Basic case: no parallelism
         (2, 1, 1, False),  # Tensor parallel only
@@ -670,11 +670,11 @@ def _gather_tensor_from_all_ranks(tensor):
         (2, 1, 2, False),  # TP + CP
         (1, 2, 2, False),  # PP + CP
         (1, 4, 1, False),  # Has middle pp stage
-        (1, 1, 1, True),  # Hybrid CP enabled (CP=1 with hybrid groups)
-        (2, 1, 1, True),  # TP + Hybrid CP
+        (1, 1, 1, True),  # Dynamic CP enabled (CP=1 with hybrid groups)
+        (2, 1, 1, True),  # TP + Dynamic CP
     ],
 )
-def test_get_batch_on_this_rank_for_sequence_packing(tp, pp, cp, hybrid_cp):
+def test_get_batch_on_this_rank_for_sequence_packing(tp, pp, cp, dynamic_cp):
     """
     Test get_batch_on_this_rank_for_sequence_packing function with variable-length THD format.
 
@@ -688,7 +688,7 @@ def test_get_batch_on_this_rank_for_sequence_packing(tp, pp, cp, hybrid_cp):
     args.tensor_model_parallel_size = tp
     args.pipeline_model_parallel_size = pp
     args.context_parallel_size = cp
-    args.hybrid_context_parallel = hybrid_cp
+    args.dynamic_context_parallel = dynamic_cp
     args.virtual_pipeline_model_parallel_size = None
     args.data_parallel_size = 8 // (tp * pp * cp)
     args.seq_length = 8192
@@ -703,15 +703,15 @@ def test_get_batch_on_this_rank_for_sequence_packing(tp, pp, cp, hybrid_cp):
         pp,
         None,
         context_parallel_size=cp,
-        hybrid_context_parallel=hybrid_cp,
-        min_hybrid_context_parallel_size=1,
+        dynamic_context_parallel=dynamic_cp,
+        min_dynamic_context_parallel_size=1,
     )
 
     try:
         # Create mock data iterator with variable-length sequences
         # Only TP rank 0 needs the iterator; other TP ranks pass None
         tp_rank = parallel_state.get_tensor_model_parallel_rank()
-        local_cp_size = 8 // (tp * pp) if hybrid_cp else None
+        local_cp_size = 8 // (tp * pp) if dynamic_cp else None
 
         if tp_rank == 0:
             # Use deterministic seed based on DP rank so same data within TP/PP/CP group
@@ -737,7 +737,7 @@ def test_get_batch_on_this_rank_for_sequence_packing(tp, pp, cp, hybrid_cp):
             data_iterator=data_iterator,
             mtp_on_this_rank=False,
             vp_stage=None,
-            hybrid_context_parallel=hybrid_cp,
+            dynamic_context_parallel=dynamic_cp,
         )
 
         # Unpack the result
@@ -781,7 +781,7 @@ def test_get_batch_on_this_rank_for_sequence_packing(tp, pp, cp, hybrid_cp):
         # =====================================================================
         assert packed_seq_params is not None
         assert packed_seq_params.qkv_format == "thd"
-        if hybrid_cp:
+        if dynamic_cp:
             assert packed_seq_params.local_cp_size is not None
             assert packed_seq_params.cp_group is not None
 
@@ -793,7 +793,7 @@ def test_get_batch_on_this_rank_for_sequence_packing(tp, pp, cp, hybrid_cp):
             "cu_seqlens_kv_padded",
             "max_seqlen_kv",
         ]
-        if hybrid_cp:
+        if dynamic_cp:
             test_keys.append("local_cp_size")
         for key in test_keys:
             tensor = getattr(packed_seq_params, key)
@@ -824,12 +824,12 @@ def test_get_batch_on_this_rank_for_sequence_packing(tp, pp, cp, hybrid_cp):
         # =====================================================================
         # TEST 4: Verify CP partitioning
         # =====================================================================
-        if cp > 1 or hybrid_cp:
-            if hybrid_cp:
+        if cp > 1 or dynamic_cp:
+            if dynamic_cp:
                 assert packed_seq_params.local_cp_size is not None
                 cp_size = packed_seq_params.local_cp_size
                 assert packed_seq_params.cp_group == (
-                    parallel_state.get_hybrid_data_context_parallel_groups(group_size=cp_size)
+                    parallel_state.get_dynamic_data_context_parallel_groups(group_size=cp_size)
                 )
             else:
                 cp_size = cp
@@ -858,14 +858,14 @@ def test_get_batch_on_this_rank_for_sequence_packing(tp, pp, cp, hybrid_cp):
 @pytest.mark.parametrize(
     ("tp", "pp", "cp", "vpp","scheduler_type"),
     [
-        (1, 1, 1, None, PackingScheduler.DEFAULT_HYBRID_CP),
+        (1, 1, 1, None, PackingScheduler.DEFAULT_DYNAMIC_CP),
         (1, 1, 8, None, PackingScheduler.NAIVE_SEQUENCE_PACKING),
-        (2, 1, 1, None, PackingScheduler.DEFAULT_HYBRID_CP),
+        (2, 1, 1, None, PackingScheduler.DEFAULT_DYNAMIC_CP),
         (2, 1, 4, None, PackingScheduler.NAIVE_SEQUENCE_PACKING),
         (2, 4, 1, None, PackingScheduler.NAIVE_SEQUENCE_PACKING),
-        (2, 2, 1, None, PackingScheduler.DEFAULT_HYBRID_CP),
+        (2, 2, 1, None, PackingScheduler.DEFAULT_DYNAMIC_CP),
         (2, 2, 1, None, PackingScheduler.NAIVE_SEQUENCE_PACKING),
-        (1, 4, 1, 4, PackingScheduler.DEFAULT_HYBRID_CP),
+        (1, 4, 1, 4, PackingScheduler.DEFAULT_DYNAMIC_CP),
         (1, 4, 1, 4, PackingScheduler.NAIVE_SEQUENCE_PACKING),
     ],
 )
@@ -881,10 +881,10 @@ def test_wrap_dataloader(tp, pp, cp, vpp, scheduler_type):
     args.data_parallel_size = 8 // (tp * pp * cp)
     args.seq_length = 8192
     args.max_seqlen_per_dp_cp_rank = 8192
-    if scheduler_type is PackingScheduler.DEFAULT_HYBRID_CP:
-        args.hybrid_context_parallel = True
+    if scheduler_type is PackingScheduler.DEFAULT_DYNAMIC_CP:
+        args.dynamic_context_parallel = True
     elif scheduler_type is PackingScheduler.NAIVE_SEQUENCE_PACKING:
-        args.hybrid_context_parallel = False
+        args.dynamic_context_parallel = False
 
     # Skip invalid configurations
     if args.data_parallel_size < 1:
@@ -918,8 +918,8 @@ def test_wrap_dataloader(tp, pp, cp, vpp, scheduler_type):
         pp,
         vpp,
         context_parallel_size=cp,
-        hybrid_context_parallel=args.hybrid_context_parallel,
-        min_hybrid_context_parallel_size=1,
+        dynamic_context_parallel=args.dynamic_context_parallel,
+        min_dynamic_context_parallel_size=1,
     )
     
     global_batch_size = 64
@@ -930,7 +930,7 @@ def test_wrap_dataloader(tp, pp, cp, vpp, scheduler_type):
     config = SimpleNamespace()
     config.max_seqlen_per_dp_cp_rank = args.max_seqlen_per_dp_cp_rank
     config.microbatch_group_size_per_vp_stage = pp
-    config.hybrid_context_parallel = args.hybrid_context_parallel
+    config.dynamic_context_parallel = args.dynamic_context_parallel
     config.virtual_pipeline_model_parallel_size = vpp
     
     
@@ -977,7 +977,7 @@ def test_wrap_dataloader(tp, pp, cp, vpp, scheduler_type):
         # verify the result
         if is_tp_first:
             batch_keys = ["cu_seqlens","max_seqlen","cu_seqlens_padded"]
-            if scheduler_type is PackingScheduler.DEFAULT_HYBRID_CP:
+            if scheduler_type is PackingScheduler.DEFAULT_DYNAMIC_CP:
                 batch_keys.append("local_cp_size")
             if vpp is not None and vpp > 1:
                 if is_pp_first:

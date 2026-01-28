@@ -60,8 +60,8 @@ class GPTDatasetConfig(BlendedMegatronDatasetConfig):
     Set to 0 if sequence parallel is not enabled regardless of TP size.
     """
 
-    hybrid_context_parallel: bool = False
-    """Option to enable hybrid context parallelism. When setting this to True, 
+    dynamic_context_parallel: bool = False
+    """Option to enable dynamic context parallelism. When setting this to True, 
     each sample should be divisible by the data parallel size * context parallel size * 2.
     If sequence parallel is enabled, it should be divisible by the 
     data parallel size * context parallel size * sequence parallel size * 2.
