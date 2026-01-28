@@ -164,13 +164,14 @@ def _offload_single_buffer(
                 shape=param.main_grad.shape,
             )
     
-    # Step 2: Clear cached shard lists in bucket groups that reference this buffer's buckets
+    # Step 2: Clear cached shard lists for buckets that belong to this buffer
+    # Note: bucket_groups can contain buckets from multiple buffers, so we only
+    # clear cache entries for buckets from the buffer being offloaded.
     buffer_bucket_set = set(buffer.buckets)
     for bucket_group in bucket_groups:
-        # Check if this bucket group contains buckets from this buffer
-        if any(b in buffer_bucket_set for b in bucket_group.buckets):
-            for i in range(len(bucket_group.cached_grad_buffer_shard_list)):
-                bucket_group.cached_grad_buffer_shard_list[i] = None
+        for idx, bucket in enumerate(bucket_group.buckets):
+            if bucket in buffer_bucket_set:
+                bucket_group.cached_grad_buffer_shard_list[idx] = None
     
     # Step 3: Clear bucket grad_data views
     for bucket in buffer.buckets:
