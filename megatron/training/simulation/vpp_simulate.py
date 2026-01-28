@@ -119,7 +119,6 @@ class VppSimulator(object):
         self.pp_mbid_mcid_fb_task_dict = {}
         self.task_num_count = 0
 
-
         # Create forward tasks
         for pp_rank, model_chunk_id, micro_batch_id in self.forward_task_iter():
             self.pp_mbid_mcid_fb_task_dict[(pp_rank, micro_batch_id, model_chunk_id, TaskType.FORWARD)] = Task(
@@ -707,19 +706,6 @@ class VppSimulator(object):
         from megatron.training.simulation import analyzer
         from megatron.training.simulation.task import TaskType
 
-        analyzer.save_gbs_trace_timeline(
-            pp_finished_task_queue_dict=pp_finished_task_queue_dict,
-            pipeline_parallel_size=self.pipeline_parallel_size,
-            num_microbatches=self.num_microbatches,
-            num_model_chunks=self.num_model_chunks,
-            profile_dir=analysis_dir,
-            task_type_enum=TaskType
-        )
-
-        # Step 3: Display throughput statistics
-        print_rank_0("\n" + "-" * 80)
-        print_rank_0("Calculating throughput statistics...")
-        print_rank_0("-" * 80)
 
         analyzer.display_gbs_statistics(
             pp_finished_task_queue_dict=pp_finished_task_queue_dict,
@@ -728,22 +714,6 @@ class VppSimulator(object):
             num_model_chunks=self.num_model_chunks,
             args=args,
             task_type_enum=TaskType
-        )
-
-        # Step 4: Display memory statistics
-        print_rank_0("\n" + "-" * 80)
-        print_rank_0("Analyzing memory usage...")
-        print_rank_0("-" * 80)
-
-        # Always enable memory analysis in simulation mode
-        enable_memory_snapshot = True
-        execute_mode = getattr(args, 'execute_mode', 'router_balanced')
-
-        analyzer.display_memory_statistics(
-            profile_dir=analysis_dir,
-            enable_memory_snapshot=enable_memory_snapshot,
-            execute_mode=execute_mode,
-            pipeline_parallel_size=self.pipeline_parallel_size
         )
 
         print_rank_0("\n" + "=" * 80)
@@ -917,16 +887,7 @@ class VppSimulator(object):
             self.current_model = create_model(pp_rank, self.model_provider)
             self.current_model_pp_rank = pp_rank
             self.current_model_vpp_rank = vpp_rank
-
-            # Calculate and store static memory for this PP rank (only once per PP rank)
-            if pp_rank not in self.pp_static_memory_dict:
-                params_gb, grads_gb = calculate_model_static_memory(self.current_model)
-                self.pp_static_memory_dict[pp_rank] = {
-                    'params_memory_gb': params_gb,
-                    'grads_memory_gb': grads_gb
-                }
-                if global_rank == 0:
-                    print_rank_0(f"PP rank {pp_rank} static memory: params={params_gb:.4f} GB, grads={grads_gb:.4f} GB")
+            
         else:
             if global_rank == 0:
                 print_rank_0(f"Reusing existing model for pp_rank={pp_rank}, vpp_rank={vpp_rank}")

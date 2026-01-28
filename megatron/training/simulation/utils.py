@@ -182,6 +182,4 @@ class MockPipelineProcessGroup:
         return f"MockProcessGroup(size={self._size}, rank={self._rank})"
 
 
-
-
-__all__ = ['SimulationArgsOverride']
+__all__ = ['SimulationArgsOverride', 'MockPipelineProcessGroup']

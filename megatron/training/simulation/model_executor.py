@@ -297,44 +297,27 @@ def execute_forward_with_timing(
     pipeline_parallel_size = parallel_state.get_pipeline_model_parallel_world_size()
     is_last_stage = (pp_rank == pipeline_parallel_size - 1 and vpp_rank == len(model) - 1)
 
-    # Create timeline profiler
-    timeline_profiler = _create_timeline_profiler(
-        pp_rank, vpp_rank, microbatch_id, simulate_result_dir, global_rank, task_type='FORWARD'
-    )
-
     # Warmup phase with profiling
-    with timeline_profiler as p:
-        for i in range(warmup_times):
-            output_tensor, num_tokens = forward_step(
-                forward_step_func,
-                data_iterator,
-                model[vpp_rank],
-                num_microbatches,
-                input_tensor,
-                forward_data_store,
-                config,
-                cp_group_size,
-                collect_non_loss_data=collect_non_loss_data,
-                checkpoint_activations_microbatch=checkpoint_activations_microbatch,
-                is_first_microbatch=False,
-                current_microbatch=microbatch_id,
-                vp_stage=vpp_rank,
-                is_last_stage=is_last_stage,
-            )
-            torch.cuda.synchronize()
-            torch.distributed.barrier()
-            forward_data_store = []
-
-            # Enable memory tracking after first warmup iteration
-            if i == 1:
-                _start_memory_tracking()
-
-            # Call profiler step
-            p.step()
-
-            # Save memory snapshot after first warmup iteration
-            if i == 1 and simulate_result_dir is not None:
-                _save_memory_snapshot(pp_rank, vpp_rank, microbatch_id, simulate_result_dir, global_rank, task_type='FORWARD')
+    for i in range(warmup_times):
+        output_tensor, num_tokens = forward_step(
+            forward_step_func,
+            data_iterator,
+            model[vpp_rank],
+            num_microbatches,
+            input_tensor,
+            forward_data_store,
+            config,
+            cp_group_size,
+            collect_non_loss_data=collect_non_loss_data,
+            checkpoint_activations_microbatch=checkpoint_activations_microbatch,
+            is_first_microbatch=False,
+            current_microbatch=microbatch_id,
+            vp_stage=vpp_rank,
+            is_last_stage=is_last_stage,
+        )
+        torch.cuda.synchronize()
+        torch.distributed.barrier()
+        forward_data_store = []
 
     # Measurement phase - measure time with CUDA events
     total_forward_time = 0
@@ -491,52 +474,41 @@ def execute_backward_with_timing(
     )
 
     # Warmup phase with profiling
-    with timeline_profiler as p:
-        for i in range(warmup_times):
-            # Forward pass to build autograd graph
-            output_tensor, num_tokens = forward_step(
-                forward_step_func,
-                data_iterator,
-                model[vpp_rank],
-                num_microbatches,
-                input_tensor,
-                forward_data_store,
-                config,
-                cp_group_size,
-                collect_non_loss_data=collect_non_loss_data,
-                checkpoint_activations_microbatch=checkpoint_activations_microbatch,
-                is_first_microbatch=False,
-                current_microbatch=microbatch_id,
-                vp_stage=vpp_rank,
-                is_last_stage=is_last_stage,
-            )
-            forward_data_store = []
-            torch.cuda.synchronize()
-            torch.distributed.barrier()
+    for i in range(warmup_times):
+        # Forward pass to build autograd graph
+        output_tensor, num_tokens = forward_step(
+            forward_step_func,
+            data_iterator,
+            model[vpp_rank],
+            num_microbatches,
+            input_tensor,
+            forward_data_store,
+            config,
+            cp_group_size,
+            collect_non_loss_data=collect_non_loss_data,
+            checkpoint_activations_microbatch=checkpoint_activations_microbatch,
+            is_first_microbatch=False,
+            current_microbatch=microbatch_id,
+            vp_stage=vpp_rank,
+            is_last_stage=is_last_stage,
+        )
+        forward_data_store = []
+        torch.cuda.synchronize()
+        torch.distributed.barrier()
 
-            # Prepare output gradient tensor (with mock gradient generation if needed)
-            output_tensor_grad = prepare_output_grad_tensor(
-                pp_rank, vpp_rank, microbatch_id, task_input_tensor_grad_dict, num_model_chunks,
-                forward_output_tensor=output_tensor
-            )
+        # Prepare output gradient tensor (with mock gradient generation if needed)
+        output_tensor_grad = prepare_output_grad_tensor(
+            pp_rank, vpp_rank, microbatch_id, task_input_tensor_grad_dict, num_model_chunks,
+            forward_output_tensor=output_tensor
+        )
 
-            # Enable memory tracking after first warmup iteration
-            if i == 1:
-                _start_memory_tracking()
-
-            # Backward pass
-            input_tensor_grad = backward_step(
-                input_tensor, output_tensor, output_tensor_grad, model_type, config
-            )
-            torch.cuda.synchronize()
-            torch.distributed.barrier()
-
-            # Call profiler step
-            p.step()
-
-            # Save memory snapshot after first warmup iteration
-            if i == 1 and simulate_result_dir is not None:
-                _save_memory_snapshot(pp_rank, vpp_rank, microbatch_id, simulate_result_dir, global_rank, task_type='BACKWARD')
+            
+        # Backward pass
+        input_tensor_grad = backward_step(
+            input_tensor, output_tensor, output_tensor_grad, model_type, config
+        )
+        torch.cuda.synchronize()
+        torch.distributed.barrier()
 
     # Measurement phase - measure backward time with CUDA events
     total_backward_time = 0
