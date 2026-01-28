@@ -1464,3 +1464,8 @@ class ChainedOptimizer(MegatronOptimizer):
         """Restore optimizer state from CPU back to GPU for training."""
         for optimizer in self.chained_optimizers:
             optimizer.restore_from_cpu()
+
+    def wait_for_restore(self):
+        """Wait for async restore_from_cpu() to complete on all chained optimizers."""
+        for optimizer in self.chained_optimizers:
+            optimizer.wait_for_restore()
