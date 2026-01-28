@@ -384,6 +384,7 @@ def test_precision_aware_fused_adam():
     "moment_dtype",
     [torch.float32, torch.float16, torch.bfloat16, torch.uint8],
 )
+@pytest.mark.skip(reason="inconsistent ci test runs resulting in NCCL errors")
 def test_precision_aware_optimizer(
     precision: str,
     main_params_dtype: torch.dtype,

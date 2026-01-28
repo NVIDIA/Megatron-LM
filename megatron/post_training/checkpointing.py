@@ -13,6 +13,7 @@ from megatron.core.utils import get_torch_version, is_torch_min_version
 from megatron.training import get_args
 from megatron.training.checkpointing import _load_base_checkpoint, load_checkpoint
 from megatron.training.utils import print_rank_0, unwrap_model
+from .utils import print_distributed_quant_summary
 
 logger = logging.getLogger(__name__)
 
@@ -176,6 +177,7 @@ def load_modelopt_checkpoint(
         )
         model_state_dict = state_dict["model"]
         unwrapped_model[0].load_state_dict(model_state_dict, strict=False)
+        print_distributed_quant_summary(unwrapped_model[0])
     elif sharded_load_dir is not None and optimizer is None and opt_param_scheduler is None:
         sharded_state_dict_metadata = dist_checkpointing.load_content_metadata(sharded_load_dir)
         sharded_state_dict = unwrapped_model[0].sharded_state_dict(
@@ -190,5 +192,6 @@ def load_modelopt_checkpoint(
             sharded_state_dict, sharded_load_dir, strict=args.dist_ckpt_strictness
         )
         unwrapped_model[0].load_state_dict(model_state_dict, strict=False)
+        print_distributed_quant_summary(unwrapped_model[0])
     else:
         _ = load_checkpoint(model, optimizer, opt_param_scheduler, strict=strict, load_arg=load_arg)
