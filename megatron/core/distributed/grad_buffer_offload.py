@@ -1,6 +1,9 @@
-# Copyright (c) 2024, NVIDIA CORPORATION. All rights reserved.
+# Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
 
 """Utilities for freeing grad_data buffers and reallocating them.
+
+The motivating use case is to free grad_data buffers from GPU memory during inference
+within the rl training loop.
 
 This module provides memory management for grad_data buffers without preserving
 their contents. The offload operation frees GPU memory, and the onload operation
@@ -66,6 +69,10 @@ def offload_grad_data(
     2. bucket.grad_data views in each bucket
     3. cached_grad_buffer_shard_list in bucket groups
     4. The main buffer.grad_data tensor
+
+    It is insufficient to simply call param.main_grad.cpu() or similar
+    because the underlying GPU tensor is still referenced by other views
+    so the memory is not actually freed.
     
     Note: The tensor data is NOT preserved. Only metadata needed to reallocate
     the buffers is stored. Use this when the buffer contents don't matter
@@ -177,6 +184,7 @@ def onload_grad_data(
     offload_states: List[GradBufferOffloadState],
     optimizer=None,
     synchronize: bool = True,
+    zero_grad_data: bool = True,
 ) -> None:
     """
     Reallocate grad_data tensors on GPU.
@@ -194,6 +202,7 @@ def onload_grad_data(
         offload_states: List of GradBufferOffloadState objects from offload_grad_data
         optimizer: Optional DistribOptimizer instance (for validation)
         synchronize: Whether to call torch.cuda.synchronize() after allocation
+        zero_grad_data: Whether to zero the grad_data tensors after allocation
     """
     # Get all buffers (dense + expert parallel)
     all_buffers = ddp_model.buffers + ddp_model.expert_parallel_buffers
@@ -205,7 +214,7 @@ def onload_grad_data(
     
     for offload_state in offload_states:
         buffer = all_buffers[offload_state.buffer_id]
-        _onload_single_buffer(buffer, offload_state)
+        _onload_single_buffer(buffer, offload_state, zero_grad_data)
     
     if synchronize:
         torch.cuda.synchronize()
@@ -214,6 +223,7 @@ def onload_grad_data(
 def _onload_single_buffer(
     buffer: _ParamAndGradBuffer,
     offload_state: GradBufferOffloadState,
+    zero_grad_data: bool = True,
 ) -> None:
     """Reallocate a single buffer's grad_data on GPU.
     
@@ -238,33 +248,10 @@ def _onload_single_buffer(
         param.main_grad = buffer.grad_data[
             metadata.start_index:metadata.end_index
         ].view(metadata.shape)
-
-
-def offload_all_grad_data_to_cpu(
-    ddp_model,
-    optimizer=None,
-) -> List[GradBufferOffloadState]:
-    """
-    Convenience function to free all grad buffers from GPU.
     
-    Alias for offload_grad_data with default parameters.
-    Note: Despite the name, this does NOT copy data to CPU - it only frees GPU memory.
-    """
-    return offload_grad_data(ddp_model, optimizer)
-
-
-def onload_all_grad_data_from_cpu(
-    ddp_model,
-    offload_states: List[GradBufferOffloadState],
-    optimizer=None,
-) -> None:
-    """
-    Convenience function to reallocate all grad buffers on GPU.
-    
-    Alias for onload_grad_data with default parameters.
-    Note: Despite the name, this allocates fresh memory - it does NOT restore from CPU.
-    """
-    onload_grad_data(ddp_model, offload_states, optimizer)
+    # Step 4: Zero the grad_data tensor if requested
+    if zero_grad_data:
+        buffer.grad_data.zero_()
 
 
 def get_grad_buffer_memory_usage(ddp_model) -> Dict[str, int]:
