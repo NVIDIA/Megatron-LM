@@ -122,6 +122,7 @@ class MegatronOptimizer(ABC):
             )
         self.config = config
         self.init_state_fn = init_state_fn
+        self._restore_stream: Optional[torch.cuda.Stream] = None
 
     def get_parameters(self) -> List[torch.nn.Parameter]:
         """
@@ -383,55 +384,44 @@ class MegatronOptimizer(ABC):
         """Function used for RL training.
         Restore optimizer state tensors from CPU back to GPU for training.
 
-        Uses batched transfers grouped by dtype for maximum throughput, since we
-        must wait for all transfers to complete before training can proceed.
+        Uses async transfers to minimize blocking time. Transfers are initiated
+        immediately but may not be complete when this method returns. Call
+        wait_for_restore() before using the optimizer to ensure all transfers
+        have completed.
+
+        Note: For true async behavior, CPU tensors should be in pinned memory
+        (which is the case if they were created by offload_to_cpu()).
         """
         if getattr(self, 'optimizer', None) is not None and not getattr(
             self, 'is_stub_optimizer', False
         ):
             log_single_rank(logger, logging.INFO, '[RESTORE] moving optimizer state back to GPU')
 
-            # Collect all CPU tensors grouped by dtype
-            # Each entry: ('param', param_obj, None) or ('state', (state_dict, key), tensor)
-            by_dtype: Dict[torch.dtype, List[Tuple]] = defaultdict(list)
+            # Create stream for async transfers
+            self._restore_stream = torch.cuda.Stream()
 
-            for param_group in self.optimizer.param_groups:
-                for p in param_group['params']:
-                    if isinstance(p, torch.Tensor) and not p.is_cuda:
-                        by_dtype[p.dtype].append(('param', p, p.data))
+            with torch.cuda.stream(self._restore_stream):
+                # Move param tensors to GPU asynchronously
+                for param_group in self.optimizer.param_groups:
+                    for p in param_group['params']:
+                        if isinstance(p, torch.Tensor) and not p.is_cuda:
+                            p.data = p.data.to('cuda', non_blocking=True)
 
-            for state_dict in self.optimizer.state.values():
-                for k, v in state_dict.items():
-                    if isinstance(v, torch.Tensor) and not v.is_cuda:
-                        by_dtype[v.dtype].append(('state', (state_dict, k), v))
+                # Move optimizer state tensors to GPU asynchronously
+                for state_dict in self.optimizer.state.values():
+                    for k, v in state_dict.items():
+                        if isinstance(v, torch.Tensor) and not v.is_cuda:
+                            state_dict[k] = v.to('cuda', non_blocking=True)
 
-            # Batch transfer each dtype group
-            for dtype, items in by_dtype.items():
-                if not items:
-                    continue
+    def wait_for_restore(self):
+        """Wait for async restore_from_cpu() to complete.
 
-                # Flatten and concatenate all tensors of this dtype
-                flat_tensors = [item[2].view(-1) for item in items]
-                mega_tensor_cpu = torch.cat(flat_tensors)
-
-                # Single transfer to GPU
-                mega_tensor_gpu = mega_tensor_cpu.cuda()
-                del mega_tensor_cpu
-
-                # Unpack back to original locations
-                offset = 0
-                for loc_type, loc, original_tensor in items:
-                    numel = original_tensor.numel()
-                    chunk = mega_tensor_gpu[offset : offset + numel].view(original_tensor.shape)
-                    offset += numel
-
-                    if loc_type == 'param':
-                        loc.data = chunk
-                    else:
-                        state_dict, key = loc
-                        state_dict[key] = chunk
-
-                del mega_tensor_gpu
+        This method is idempotent - it's safe to call multiple times.
+        Must be called before using the optimizer after restore_from_cpu().
+        """
+        if self._restore_stream is not None:
+            self._restore_stream.synchronize()
+            self._restore_stream = None
 
     @staticmethod
     def _filter_and_reorder_param_groups(
