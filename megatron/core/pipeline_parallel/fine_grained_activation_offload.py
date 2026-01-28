@@ -1133,6 +1133,12 @@ def fine_grained_offloading_group_commit(
     )
 
 
+def fine_grained_offloading_group_flush_delayed_groups():
+    """Flush the delayed groups."""
+    debug_rank("fine_grained_offloading_group_flush_delayed_groups")
+    PipelineOffloadManager.get_instance().flush_delayed_groups()
+
+
 class FineGrainedOffloadingGroupStartFunction(torch.autograd.Function):
     """
     Identity operation that marks the start of a layer group for offload/reload.
@@ -1166,6 +1172,13 @@ def fine_grained_offloading_group_start(tensor, name=None):
     return FineGrainedOffloadingGroupStartFunction.apply(tensor, cur_forward_chunk, name)
 
 
+def fine_grained_offloading_forward_record(event: torch.cuda.Event) -> None:
+    """Record the forward event for cuda graph capture."""
+    d2h_stream = PipelineOffloadManager.get_instance().d2h_stream
+    torch.cuda.current_stream().record_event(event)
+    torch.cuda.current_stream().wait_stream(d2h_stream)
+
+
 class FineGrainedOffloadingBackwardRecordFunction(torch.autograd.Function):
     """
     Identity operation that marks the end of a layer group for offload synchronization.
@@ -1185,6 +1198,11 @@ class FineGrainedOffloadingBackwardRecordFunction(torch.autograd.Function):
         torch.cuda.current_stream().record_event(ctx.event)
         torch.cuda.current_stream().wait_stream(h2d_stream)
         return grad_output, None
+
+
+def fine_grained_offloading_backward_record(tensor, event: torch.cuda.Event) -> torch.Tensor:
+    """Record the backward event for cuda graph capture."""
+    return FineGrainedOffloadingBackwardRecordFunction.apply(tensor, event)
 
 
 class FineGrainedActivationOffloadingInterface:
@@ -1238,12 +1256,6 @@ class FineGrainedActivationOffloadingInterface:
         torch.cuda.current_stream().record_event(event)
         torch.cuda.current_stream().wait_stream(d2h_stream)
 
-    @staticmethod
-    def backward_record(tensor, event: torch.cuda.Event) -> torch.Tensor:
-        """Record the backward event for cuda graph capture."""
-        return FineGrainedOffloadingBackwardRecordFunction.apply(tensor, event)
-
-    @staticmethod
     def reset():
         """Reset the chunk handler."""
         PipelineOffloadManager.get_instance().reset()
@@ -1252,8 +1264,3 @@ class FineGrainedActivationOffloadingInterface:
     def reset_instance():
         """Reset the singleton instance."""
         PipelineOffloadManager.reset_instance()
-
-    @staticmethod
-    def flush_delayed_groups():
-        """Flush the delayed groups."""
-        PipelineOffloadManager.get_instance().flush_delayed_groups()

@@ -251,7 +251,7 @@ class TransformerConfig(ModelParallelConfig):
     dsa_indexer_loss_coeff: Optional[float] = None
     """Coefficient for the DSA indexer KL divergence loss. Set to 0 to disable indexer loss."""
 
-    dsa_indexer_use_sparse_loss: Optional[bool] = None
+    dsa_indexer_use_sparse_loss: bool = False
     """Whether to use sparse DSA indexer loss. If True, the indexer loss will be computed using the
     top-k indices."""
 
@@ -261,7 +261,6 @@ class TransformerConfig(ModelParallelConfig):
     linear_attention_type: Optional[str] = None
     """Type of linear attention to use.
     Deprecated. Use experimental_attention_variant instead."""
-
     linear_attention_freq: Optional[Union[int, List[int]]] = None
     """Frequency between LA (linear attention) layers 
     and SDPA (scaled dot-product attention) layers.
@@ -523,7 +522,8 @@ class TransformerConfig(ModelParallelConfig):
     in the hidden_states gradient."""
 
     moe_shared_expert_gate: bool = False
-    """Enable gate for shared expert."""
+    """Enable gate for shared expert. Only effective when
+    moe-shared-expert-intermediate-size is set."""
 
     moe_shared_expert_overlap: bool = False
     """Enable overlapping between shared expert computations and dispatcher communications.
@@ -762,10 +762,12 @@ class TransformerConfig(ModelParallelConfig):
     excluding optimizer) is enabled.
     "transformer_engine": capture the CUDA graph using TE make_graphed_callables()."""
 
-    cuda_graph_scope: Optional[List[CudaGraphScope]] = None
+    cuda_graph_scope: Union[str, CudaGraphScope, List[str], List[CudaGraphScope]] = "full"
     """Determines the CUDA graphs capturing scope.
     When cuda_graph_impl is set to "transformer_engine", valid values are "attn", "mlp", "moe",
-    "moe_router", "moe_preprocess", "mamba". None means the full layer.
+    "moe_router", "moe_preprocess", "mamba". "full" or an empty list means the full layer. "full"
+    is actually deprecated, but for backward compatibility, we still use "full" as the default
+    value. It will be transformed to an empty list in __post_init__.
     When cuda_graph_impl is set to "local", "full_iteration" can be specified as cuda_graph_scope
     to enable whole iteration CUDA graph. All other values enable layerwise CUDA graph."""
 
@@ -809,6 +811,9 @@ class TransformerConfig(ModelParallelConfig):
 
     use_inference_optimized_layers: bool = False
     """If True, use inference optimized transformer layers during inference."""
+
+    inference_fuse_tp_communication: bool = False
+    """ If true, uses a fused reduce-scatter-residual-norm-allgather kernel during inference. """
 
     mrope_section: Optional[List[int]] = None
     """ Multimodal rope section is for channel dimension of temporal, height and width
@@ -856,7 +861,6 @@ class TransformerConfig(ModelParallelConfig):
     fallback_to_eager_attn: bool = False
     """Whether to fallback to eager attention in TE implementation.
     Suggested for when desired features are not available in TE implementation."""
-
     #####################################
     # Fine-grained Activation Offloading
     #####################################
@@ -1744,7 +1748,7 @@ class TransformerConfig(ModelParallelConfig):
                         ), 'moe cuda graph is only supported with drop-padding MoE.'
                         if self.moe_token_dispatcher_type == 'alltoall' and (
                             self.moe_expert_capacity_factor is not None
-                            or self.moe_router_padding_for_quantization
+                            or self.moe_router_padding_for_fp8
                         ):
                             assert CudaGraphScope.moe_preprocess not in self.cuda_graph_scope, (
                                 'moe_preprocess cuda graph is not supported when there are '
@@ -1971,6 +1975,12 @@ class TransformerConfig(ModelParallelConfig):
             assert not self.add_bias_linear
             assert not self.add_qkv_bias
             assert not self.use_kitchen
+
+        if self.inference_fuse_tp_communication:
+            assert self.transformer_impl == "inference_optimized", (
+                "inference_fuse_tp_communication is only supported "
+                "for inference_optimized transformer implementation."
+            )
 
         if self.batch_invariant_mode:
             assert (

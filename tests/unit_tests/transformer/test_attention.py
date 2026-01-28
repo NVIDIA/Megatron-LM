@@ -402,13 +402,16 @@ class TestClipQK:
         assert attention.core_attention.current_max_attn_logits is None
 
 
+@pytest.mark.parametrize("output_gate", [False, True])
 class TestSelfAttention:
 
-    def setup_method(self, method):
+    @pytest.fixture(scope='function', autouse=True)
+    def setup_method(self, output_gate):
+        self.output_gate = output_gate
         Utils.initialize_model_parallel(1, 1)
         model_parallel_cuda_manual_seed(123)
 
-    def teardown_method(self, method):
+    def teardown_method(self):
         Utils.destroy_model_parallel()
 
     def test_clip_qk_disabled_raises_error(self):
