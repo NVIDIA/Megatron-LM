@@ -64,7 +64,7 @@ def _get_optimizer_buffers(
     optimizer: ChainedOptimizer | DistributedOptimizer,
 ) -> List[_ParamAndGradBuffer]:
     """
-    Extract all buffers from an optimizer, 
+    Extract all buffers from an optimizer,
     handling both ChainedOptimizer and DistributedOptimizer.
     """
     if getattr(optimizer, 'is_stub_optimizer', False):
