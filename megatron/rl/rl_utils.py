@@ -459,8 +459,9 @@ def get_environment_rollouts(
     nvtx_range = get_nvtx_range()
 
     if args.rl_offload_optimizer_during_inference:
-        with nvtx_range("offload-optimizer-during-inference"):
+        with nvtx_range("offload-optimizer-state-and-grad-buffers-during-inference"):
             offload_states = offload_grad_data(model[0], optimizer)
+            optimizer.offload_to_cpu()
              
     # If we have seperate training and inference models we to refit weights from the training model to the inference model.
     if inference_model is not None:
@@ -492,7 +493,7 @@ def get_environment_rollouts(
             optimizer,
             args.cuda_graph_impl,
             args.rl_reset_cuda_graphs,
-            args.rl_offload_optimizer_during_inference,
+            False, # offload optimizer during rollout collection is handled above
             args.rl_offload_kv_cache_during_training,
             args.rl_remove_kv_cache_during_training,
         ) as inference_interface:
@@ -533,8 +534,9 @@ def get_environment_rollouts(
         logger.debug(f"Got rollouts on rank {rank}")
 
     if args.rl_offload_optimizer_during_inference:
-        with nvtx_range("onload-optimizer-after-inference"):
+        with nvtx_range("onload-optimizer-state-and-grad-buffers-after-inference"):
             onload_grad_data(model[0], offload_states)
+            optimizer.restore_from_cpu()
 
     if lang_rl_log_dir and rank == get_pg_rank(inference_pg_collection.tp):
         with open(
@@ -1609,8 +1611,9 @@ def megatron_rl_inference_mode(
     with torch.no_grad():
 
         if offload_optimizer_during_inference:
-            with nvtx_range("offload-optimizer-before-inference"):
+            with nvtx_range("offload-optimizer-state-and-grad-buffers-before-inference"):
                 offload_states = offload_grad_data(model[0], optimizer)
+                optimizer.offload_to_cpu()
 
         # TODO: Remove this if statement once a change to `toggle_cuda_graphs` makes it safe to.
         if cuda_graph_impl != "none" and not args.rl_training_cuda_graphs:
@@ -1671,8 +1674,9 @@ def megatron_rl_inference_mode(
             _maybe_prefetch_separate_inference_model_weights(model_core, to_cpu=True)
 
         if offload_optimizer_during_inference:
-            with nvtx_range("onload-optimizer-after-inference"):
+            with nvtx_range("onload-optimizer-state-and-grad-buffers-after-inference"):
                 onload_grad_data(model[0], offload_states)
+                optimizer.restore_from_cpu()
 
         lang_module.train()
 
