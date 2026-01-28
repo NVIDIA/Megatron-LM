@@ -2202,8 +2202,7 @@ def _add_rl_args(parser):
                         help='Skip BOS token at the beginning of the sequences. Default is False.')
     group.add_argument('--rl-profile', action='store_true', default=False,
                         help='Enable RL profiling to collect detailed timer data for analysis. '
-                             'Profiling data is written to JSONL files for per-iteration data and CSV for '
-                             'aggregated statistics. Use rl_profiling_viz.py to generate reports.')
+                             'Profiling data is written to JSONL files for per-iteration data and CSV for ')
     group.add_argument('--rl-profile-dir', type=str, default=None,
                         help='Directory to write RL profiling data. If not set, defaults to '
                              '{save}/profiles or ./profiles if save is not set.')
