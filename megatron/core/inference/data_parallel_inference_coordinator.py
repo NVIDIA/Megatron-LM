@@ -84,7 +84,6 @@ class DataParallelInferenceCoordinator:
 
         Args:
             pipe_connection (Connection): A connecting pipe to the parent process.
-            inference_coordinator_port (int): The TCP port number to bind the server to.
             data_parallel_size (int): The number of TP-coordinator workers that are
                 expected to connect.
             tokenizer: The tokenizer to use for prompt tokenization and detokenization.
@@ -135,6 +134,7 @@ class DataParallelInferenceCoordinator:
 
         # Send the address to the parent process.
         self.pipe_connection.send(self.addr)
+        self.pipe_connection.close()
 
         logging.info("Inference Coordinator: waiting for connections from data parallel ranks...")
         # First wait for all data parallel ranks to establish connections.

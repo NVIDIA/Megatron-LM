@@ -430,10 +430,11 @@ class DynamicInferenceEngine(AbstractEngine):
             self.inference_coordinator_process.start()
             await await_process_call(dp_pipe.poll, self.inference_coordinator_process)
             dp_addr = dp_pipe.recv()
+            dp_pipe.close()
 
             # Check if the port number is not inference_coordinator_port
             actual_port = int(dp_addr.rsplit(":", 1)[-1])
-            if actual_port != inference_coordinator_port:
+            if inference_coordinator_port != None and actual_port != inference_coordinator_port:
                 logging.warning(
                     f"Requested InferenceCoordinator port {inference_coordinator_port} "
                     f"but got port {actual_port} instead. This happens if the request port "
