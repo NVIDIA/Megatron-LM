@@ -290,7 +290,6 @@ class TransformerBlock(GraphableMegatronModule, MegatronModule):
         self.post_layer_norm = post_layer_norm
         self.pre_process = pre_process
         self.post_process = post_process
-        self.world_size = parallel_state.get_tensor_model_parallel_world_size()
         self.vp_stage = vp_stage
 
         # required for pipeline parallel schedules
