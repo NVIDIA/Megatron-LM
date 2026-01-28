@@ -441,7 +441,7 @@ class DynamicInferenceEngine(AbstractEngine):
                     f"is already in use."
                 )
         else:
-            dp_addr = None
+            dp_addr = ""
 
         # Find available ports for MP and bind to them.
         if self.is_mp_coordinator:
