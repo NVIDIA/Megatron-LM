@@ -434,6 +434,8 @@ def get_cuda_rng_tracker(
     return _CUDA_RNG_STATE_TRACKER
 
 
+# TODO(@cspades): Migrate this to a new module: fsdp_dist_index.py.
+# Needs more visibility and is easily refactored / standalone.
 class FSDPDistributedIndex:
     """
     Class containing references to the process groups utilized by Megatron-FSDP.
