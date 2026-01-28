@@ -458,6 +458,10 @@ def get_environment_rollouts(
     args = get_args()
     nvtx_range = get_nvtx_range()
 
+    if args.rl_offload_optimizer_during_inference:
+        with nvtx_range("offload-optimizer-during-inference"):
+            offload_states = offload_grad_data(model[0], optimizer)
+             
     # If we have seperate training and inference models we to refit weights from the training model to the inference model.
     if inference_model is not None:
         # If the separate inference model weights were prefetched to CPU while idle, bring them
@@ -527,6 +531,10 @@ def get_environment_rollouts(
             # TODO(jbarker): double check why this isn't causing rank 0 memory allocations
             torch.distributed.broadcast_object_list(rollouts, src=0)
         logger.debug(f"Got rollouts on rank {rank}")
+
+    if args.rl_offload_optimizer_during_inference:
+        with nvtx_range("onload-optimizer-after-inference"):
+            onload_grad_data(model[0], offload_states)
 
     if lang_rl_log_dir and rank == get_pg_rank(inference_pg_collection.tp):
         with open(
