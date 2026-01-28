@@ -210,10 +210,9 @@ def get_inference_controller(
     """
 
     args = get_args()
-    if args.legacy_tokenizer:
-        tokenizer = get_tokenizer()
-    else:
-        tokenizer = build_tokenizer(args)
+
+    # Build tokenizer
+    tokenizer = build_tokenizer(args)
 
     # Wrap model in inference wrapper.
     model = GPTInferenceWrapper(model, args, context)
@@ -435,10 +434,9 @@ def main():
     configure_nvtx_profiling(True)
 
     args = get_args()
-    if args.legacy_tokenizer:
-        tokenizer = get_tokenizer()
-    else:
-        tokenizer = build_tokenizer(args)
+
+    # Build tokenizer
+    tokenizer = build_tokenizer(args)
 
     # Reset peak memory stats so functional tests measure this run and not
     # whatever happened earlier during initialization.

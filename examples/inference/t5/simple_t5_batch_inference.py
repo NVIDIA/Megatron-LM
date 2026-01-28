@@ -79,10 +79,8 @@ def get_inference_engine(args: Namespace, model: MegatronModule) -> AbstractEngi
     Returns:
         AbstractBackend: The chosen backend
     """
-    if args.legacy_tokenizer:
-        tokenizer = get_tokenizer()
-    else:
-        tokenizer = build_tokenizer(args)
+    # Build tokenizer
+    tokenizer = build_tokenizer(args)
 
     inference_wrapper_config = InferenceWrapperConfig(
         hidden_size=args.hidden_size,
@@ -133,10 +131,9 @@ def main():
         num_tokens_to_generate=args.num_tokens_to_generate,
     )
 
-    if args.legacy_tokenizer:
-        tokenizer = get_tokenizer()
-    else:
-        tokenizer = build_tokenizer(args)
+    # Build tokenizer
+    tokenizer = build_tokenizer(args)
+
     decoder_prompts = [""] * len(
         args.encoder_prompts
     )  # for T5, the prompt is provided as encoder input, hence decoder_prompts is empty

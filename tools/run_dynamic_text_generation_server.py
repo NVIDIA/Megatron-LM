@@ -77,10 +77,8 @@ if __name__ == "__main__":
         args = get_args()
         model = get_model()
 
-        if args.legacy_tokenizer:
-            tokenizer = get_tokenizer()
-        else:
-            tokenizer = build_tokenizer(args)
+        # Build tokenizer
+        tokenizer = build_tokenizer(args)
 
         mamba_inference_state_config = get_mamba_inference_state_config_from_model(model)
 

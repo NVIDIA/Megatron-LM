@@ -79,10 +79,9 @@ def get_inference_engine(args: Namespace, model: MegatronModule) -> StaticInfere
     Returns:
         AbstractBackend: The chosen backend
     """
-    if args.legacy_tokenizer:
-        tokenizer = get_tokenizer()
-    else:
-        tokenizer = build_tokenizer(args)
+    # Build tokenizer
+    tokenizer = build_tokenizer(args)
+
     inference_wrapper_config = InferenceWrapperConfig(
         hidden_size=args.hidden_size,
         inference_batch_times_seqlen_threshold=args.inference_batch_times_seqlen_threshold,
@@ -193,10 +192,9 @@ def main():
         top_n_logprobs=args.top_n_logprobs,
     )
 
-    if args.legacy_tokenizer:
-        tokenizer = get_tokenizer()
-    else:
-        tokenizer = build_tokenizer(args)
+    # Build tokenizer
+    tokenizer = build_tokenizer(args)
+
     requests = build_requests(args, tokenizer)
     prompts = [r.prompt_text for r in requests]
 
