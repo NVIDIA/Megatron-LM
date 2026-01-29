@@ -223,7 +223,7 @@ def load_workloads(
 
     workloads: List[dotdict] = []
     build_workloads: List = []
-    for file in list(recipes_dir.glob("*.yaml")) + list(local_dir.glob("*.yaml")):
+    for file in list(recipes_dir.rglob("*.yaml")) + list(local_dir.rglob("*.yaml")):
         workloads += load_and_flatten(config_path=str(file))
         if file.stem.startswith("_build"):
             build_workloads.append(load_config(config_path=str(file)))
