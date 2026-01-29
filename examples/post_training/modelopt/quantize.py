@@ -326,7 +326,7 @@ def get_calib_dataloader(
             max_sample_length=max_sequence_length,
             batch_size=1,
             device="cuda",
-        )
+        )  # cannot be returned since the other yield statement already makes this fn a generator
         for sample in dataloader:
             yield sample["input_ids"]
 
@@ -392,21 +392,8 @@ if __name__ == "__main__":
             use_random_offset=args.calib_use_random_offset,
             tokenizer=tokenizer,
         )
-
-        if args.force_all_expert_routing:
-            for module in model.modules():
-                if isinstance(module, TopKRouter):
-                    module.topk = module.num_experts
-
-        # get_calib_dataloader yields untokenized text (local files) or
-        # returns dataloader with tokenized input_ids (HF datasets)
         for input_ids in tqdm(dataloader, total=args.calib_size, disable=torch.distributed.get_rank()):
             _ = simple_generate(model, input_ids, osl=1)
-
-            if args.force_all_expert_routing:
-                for module in model.modules():
-                    if isinstance(module, TopKRouter):
-                        module.topk = module.config.moe_router_topk
 
     unwrapped_model = unwrap_model(model)[0]
 
