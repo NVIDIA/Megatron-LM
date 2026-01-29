@@ -561,7 +561,6 @@ class TestRLUtils:
 
         # Restore optimizer state to GPU
         optimizer.restore_from_cpu()
-        optimizer.wait_for_restore()
 
         # Verify optimizer state is back on GPU
         restored_devices = get_optimizer_state_devices()
