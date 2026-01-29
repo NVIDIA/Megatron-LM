@@ -49,6 +49,9 @@ from megatron.rl.sequence_packing_utils import (
     get_sequence_packing_tensorboard_metrics,
     get_sequence_packing_log_info,
     get_default_packed_seq_params,
+    get_packing_actual_tokens,
+    get_packing_compute_tokens,
+    get_packing_efficiency,
 )
 from megatron.rl.agent.api import (
     EvaluationRequest,
@@ -245,16 +248,37 @@ class RLRuntimeState:
         self.global_batches_per_collection = 0
         self.sequences_this_iteration_on_rank = 0
         self.latest_batch_num_sequences = 0
+        # Token tracking for sequence packing
+        self.actual_tokens_this_iteration = 0  # Real tokens (non-padding)
+        self.compute_tokens_this_iteration = 0  # Total tokens including padding
+        self.packing_efficiency = 0.0  # Ratio of actual/compute tokens
 
     def reset_iteration_counters(self, iteration):
         """Reset per-iteration counters."""
         self.sequences_this_iteration_on_rank = 0
         self.last_collection_iteration = iteration
+        self.actual_tokens_this_iteration = 0
+        self.compute_tokens_this_iteration = 0
+        self.packing_efficiency = 0.0
 
     def increment_sequences(self, count):
         """Increment the sequence counter."""
         self.sequences_this_iteration_on_rank += count
         self.latest_batch_num_sequences = count
+
+    def update_token_counts(self, actual_tokens: int, compute_tokens: int):
+        """Update token counts for the current iteration.
+        
+        Args:
+            actual_tokens: Number of real tokens (non-padding)
+            compute_tokens: Number of total tokens including padding
+        """
+        self.actual_tokens_this_iteration = actual_tokens
+        self.compute_tokens_this_iteration = compute_tokens
+        if compute_tokens > 0:
+            self.packing_efficiency = actual_tokens / compute_tokens
+        else:
+            self.packing_efficiency = 0.0
 
 
 # Global runtime state instance
@@ -461,7 +485,7 @@ def get_environment_rollouts(
     nvtx_range = get_nvtx_range()
 
     if args.rl_offload_optimizer_during_inference:
-        with nvtx_range("rl/offload-optimizer-state-and-grad-buffers-during-inference", time=True):
+        with nvtx_range("rl/offload-optimizer-before-inference", time=True):
             model[0].offload_grad_buffers()
             optimizer.offload_to_cpu()
              
@@ -536,8 +560,8 @@ def get_environment_rollouts(
         logger.debug(f"Got rollouts on rank {rank}")
 
     if args.rl_offload_optimizer_during_inference:
-        with nvtx_range("rl/restore-optimizer-state-and-grad-buffers-after-inference", time=True):
-            model[0].restore_grad_buffers()
+        with nvtx_range("rl/onload-optimizer-after-inference", time=True):
+            model[0].onload_grad_buffers()
             optimizer.restore_from_cpu()
 
     if lang_rl_log_dir and rank == get_pg_rank(inference_pg_collection.tp):
@@ -1679,7 +1703,7 @@ def megatron_rl_inference_mode(
 
         if offload_optimizer_during_inference:
             with nvtx_range("rl/onload-optimizer-after-inference", time=True):
-                model[0].restore_grad_buffers()
+                model[0].onload_grad_buffers()
                 optimizer.restore_from_cpu()
 
         lang_module.train()

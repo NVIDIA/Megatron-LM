@@ -36,6 +36,37 @@ import torch.distributed as dist
 logger = logging.getLogger(__name__)
 
 
+# Timer name aliases - maps canonical names to all possible variants
+# This allows the profiling tools to work with runs using different naming conventions
+TIMER_ALIASES = {
+    "rl/offload-optimizer-before-inference": [
+        "rl/offload-optimizer-before-inference",
+        "rl/offload-optimizer-state-and-grad-buffers-during-inference",
+        "rl/offload-optimizer-state-and-grad-buffers-before-inference",
+    ],
+    "rl/onload-optimizer-after-inference": [
+        "rl/onload-optimizer-after-inference",
+        "rl/restore-optimizer-state-and-grad-buffers-after-inference",
+        "rl/onload-optimizer-state-and-grad-buffers-after-inference",
+    ],
+}
+
+def get_timer_value(data: dict, canonical_name: str, default=None):
+    """Get timer value trying all known aliases for a canonical name."""
+    aliases = TIMER_ALIASES.get(canonical_name, [canonical_name])
+    for alias in aliases:
+        if alias in data:
+            return data[alias]
+    return default
+
+def get_timer_value_tuple(data: dict, canonical_name: str, default=(0, 0)):
+    """Get timer (min, max) tuple trying all known aliases."""
+    aliases = TIMER_ALIASES.get(canonical_name, [canonical_name])
+    for alias in aliases:
+        if alias in data:
+            return data[alias]
+    return default
+
 # Timer names we care about for RL profiling (in hierarchical order)
 RL_TIMER_NAMES = [
     # Top-level phases
@@ -50,9 +81,9 @@ RL_TIMER_NAMES = [
     "rl/sync-rollouts",
     "rl/suspend-engine",
     
-    # Optimizer offload/onload
+    # Optimizer offload/onload (canonical names)
     "rl/offload-optimizer-before-inference",
-    "rl/restore-optimizer-state-and-grad-buffers-after-inference",
+    "rl/onload-optimizer-after-inference",
     "rl/offload-kv-cache-after-inference",
     "rl/onload-kv-cache-before-inference",
     # Fine-grained offload/onload breakdown
@@ -106,7 +137,7 @@ TIMER_HIERARCHY = {
         "rl/sync-rollouts",
         "rl/suspend-engine",
         "rl/offload-optimizer-before-inference",
-        "rl/restore-optimizer-state-and-grad-buffers-after-inference",
+        "rl/onload-optimizer-after-inference",
         "rl/prefetch-weights-to-gpu",
         "rl/prefetch-weights-to-cpu",
         "rl/onload-kv-cache-before-inference",
@@ -151,6 +182,10 @@ class IterationProfile:
     global_batch_size: Optional[int] = None
     tokens_per_sec: Optional[float] = None
     tokens_per_sec_per_gpu: Optional[float] = None
+    # Actual tokens metrics (for sequence packing - counts real tokens, not padding)
+    actual_tokens_per_sec: Optional[float] = None
+    actual_tokens_per_sec_per_gpu: Optional[float] = None
+    packing_efficiency: Optional[float] = None
     
     # Computed metrics
     load_imbalance: Dict[str, float] = field(default_factory=dict)  # timer -> max/min ratio
@@ -165,6 +200,9 @@ class IterationProfile:
             "global_batch_size": self.global_batch_size,
             "tokens_per_sec": self.tokens_per_sec,
             "tokens_per_sec_per_gpu": self.tokens_per_sec_per_gpu,
+            "actual_tokens_per_sec": self.actual_tokens_per_sec,
+            "actual_tokens_per_sec_per_gpu": self.actual_tokens_per_sec_per_gpu,
+            "packing_efficiency": self.packing_efficiency,
         }
         
         # Flatten timer data
@@ -286,6 +324,9 @@ class RLProfiler:
         global_batch_size: Optional[int] = None,
         tokens_per_sec: Optional[float] = None,
         tokens_per_sec_per_gpu: Optional[float] = None,
+        actual_tokens_per_sec: Optional[float] = None,
+        actual_tokens_per_sec_per_gpu: Optional[float] = None,
+        packing_efficiency: Optional[float] = None,
         extra_metrics: Optional[Dict[str, float]] = None,
         wandb_writer=None,
         tb_writer=None,
@@ -299,8 +340,11 @@ class RLProfiler:
             elapsed_time_ms: Total iteration time in milliseconds
             throughput_tflops: TFLOPS throughput
             global_batch_size: Global batch size
-            tokens_per_sec: Token throughput
-            tokens_per_sec_per_gpu: Token throughput per GPU
+            tokens_per_sec: Compute token throughput (includes padding)
+            tokens_per_sec_per_gpu: Compute token throughput per GPU
+            actual_tokens_per_sec: Actual token throughput (non-padding, for sequence packing)
+            actual_tokens_per_sec_per_gpu: Actual token throughput per GPU
+            packing_efficiency: Ratio of actual tokens to compute tokens
             extra_metrics: Additional metrics to log
             wandb_writer: WandB writer for metric logging
             tb_writer: TensorBoard writer for metric logging
@@ -334,6 +378,9 @@ class RLProfiler:
             global_batch_size=global_batch_size,
             tokens_per_sec=tokens_per_sec,
             tokens_per_sec_per_gpu=tokens_per_sec_per_gpu,
+            actual_tokens_per_sec=actual_tokens_per_sec,
+            actual_tokens_per_sec_per_gpu=actual_tokens_per_sec_per_gpu,
+            packing_efficiency=packing_efficiency,
             load_imbalance=load_imbalance,
         )
         
@@ -422,16 +469,16 @@ class RLProfiler:
         timers = profile.timers
         phases = {}
         
-        # Helper to get max time safely
+        # Helper to get max time safely (supports timer aliases)
         def get_max(name: str) -> float:
-            return timers.get(name, (0, 0))[1]
+            return get_timer_value_tuple(timers, name, (0, 0))[1]
         
         # Rollout generation (actual generation, not container)
         phases["rollout_generation"] = get_max("rl/collect-rollouts")
         
-        # Optimizer memory management
+        # Optimizer memory management (uses aliases for different name variants)
         phases["optimizer_offload"] = get_max("rl/offload-optimizer-before-inference")
-        phases["optimizer_onload"] = get_max("rl/restore-optimizer-state-and-grad-buffers-after-inference")
+        phases["optimizer_onload"] = get_max("rl/onload-optimizer-after-inference")
         phases["optimizer_memory_mgmt"] = phases["optimizer_offload"] + phases["optimizer_onload"]
         
         # Logprobs computation
@@ -592,6 +639,9 @@ def log_iteration_profile(
     global_batch_size: Optional[int] = None,
     tokens_per_sec: Optional[float] = None,
     tokens_per_sec_per_gpu: Optional[float] = None,
+    actual_tokens_per_sec: Optional[float] = None,
+    actual_tokens_per_sec_per_gpu: Optional[float] = None,
+    packing_efficiency: Optional[float] = None,
     extra_metrics: Optional[Dict[str, float]] = None,
     wandb_writer=None,
     tb_writer=None,
@@ -600,6 +650,13 @@ def log_iteration_profile(
     Convenience function to log iteration profile using global profiler.
     
     This is the main entry point for logging timer data.
+    
+    Args:
+        tokens_per_sec: Compute tokens/sec (includes padding in packed sequences)
+        tokens_per_sec_per_gpu: Compute tokens/sec per GPU
+        actual_tokens_per_sec: Actual tokens/sec (real tokens, excludes padding)
+        actual_tokens_per_sec_per_gpu: Actual tokens/sec per GPU
+        packing_efficiency: Ratio of actual to compute tokens (0-1)
     """
     profiler = get_rl_profiler()
     if profiler:
@@ -611,6 +668,9 @@ def log_iteration_profile(
             global_batch_size=global_batch_size,
             tokens_per_sec=tokens_per_sec,
             tokens_per_sec_per_gpu=tokens_per_sec_per_gpu,
+            actual_tokens_per_sec=actual_tokens_per_sec,
+            actual_tokens_per_sec_per_gpu=actual_tokens_per_sec_per_gpu,
+            packing_efficiency=packing_efficiency,
             extra_metrics=extra_metrics,
             wandb_writer=wandb_writer,
             tb_writer=tb_writer,
@@ -753,7 +813,7 @@ def analyze_bottlenecks(profile_path: str, top_n: int = 10) -> str:
         "Rollout Generation": ["rl/collect-rollouts"],
         "Optimizer Memory Mgmt": [
             "rl/offload-optimizer-before-inference",
-            "rl/restore-optimizer-state-and-grad-buffers-after-inference",
+            "rl/onload-optimizer-after-inference",
         ],
         "Logprobs Computation": [
             "rl/compute-old-logprobs",
@@ -763,8 +823,16 @@ def analyze_bottlenecks(profile_path: str, top_n: int = 10) -> str:
         "Sync/Wait": ["rl/suspend-engine", "rl/sync-rollouts"],
     }
     
-    for phase_name, timers in phases.items():
-        total = sum(stats.get(t, {"mean_ms": 0})["mean_ms"] for t in timers)
+    def get_stat_with_aliases(timer_name: str) -> float:
+        """Get mean_ms for a timer, trying all known aliases."""
+        aliases = TIMER_ALIASES.get(timer_name, [timer_name])
+        for alias in aliases:
+            if alias in stats:
+                return stats[alias].get("mean_ms", 0)
+        return 0
+    
+    for phase_name, timer_list in phases.items():
+        total = sum(get_stat_with_aliases(t) for t in timer_list)
         if total > 0:
             lines.append(f"  {phase_name:<40} {total:>7.1f}ms")
     

@@ -1899,9 +1899,12 @@ def training_log(
             'rl/collect-rollouts',
             'rl/sync-rollouts',
             'rl/suspend-engine',
-            # Optimizer offload/onload
+            # Optimizer offload/onload (canonical names + legacy variants)
+            'rl/offload-optimizer-before-inference',
+            'rl/onload-optimizer-after-inference',
             'rl/offload-optimizer-state-and-grad-buffers-during-inference',
             'rl/restore-optimizer-state-and-grad-buffers-after-inference',
+            'rl/onload-optimizer-state-and-grad-buffers-after-inference',
             'rl/offload-kv-cache-after-inference',
             'rl/onload-kv-cache-before-inference',
             # Fine-grained offload/onload breakdown
@@ -2171,10 +2174,33 @@ def training_log(
             # Compute tokens/sec metrics
             tokens_per_sec = None
             tokens_per_sec_per_gpu = None
+            actual_tokens_per_sec = None
+            actual_tokens_per_sec_per_gpu = None
+            packing_efficiency = None
+            
             if hasattr(args, 'seq_length') and args.seq_length > 0:
+                # Compute tokens (includes padding for consistency with tensor shapes)
                 tokens_per_iteration = batch_size * args.seq_length
                 tokens_per_sec = tokens_per_iteration / elapsed_time_per_iteration
                 tokens_per_sec_per_gpu = tokens_per_sec / args.world_size
+                
+                # For sequence packing, also compute actual tokens (non-padding)
+                if getattr(args, 'perform_rl_step', False) and getattr(args, 'rl_use_sequence_packing', False):
+                    runtime_state = rl_utils.get_rl_runtime_state()
+                    if runtime_state.packing_context is not None:
+                        # Get actual tokens from packing context
+                        actual_tokens = rl_utils.get_packing_actual_tokens(runtime_state.packing_context)
+                        compute_tokens = rl_utils.get_packing_compute_tokens(runtime_state.packing_context)
+                        
+                        # Scale to global batch (all DP ranks)
+                        actual_tokens_global = actual_tokens * mpu.get_data_parallel_world_size()
+                        
+                        actual_tokens_per_sec = actual_tokens_global / elapsed_time_per_iteration
+                        actual_tokens_per_sec_per_gpu = actual_tokens_per_sec / args.world_size
+                        packing_efficiency = rl_utils.get_packing_efficiency(runtime_state.packing_context)
+                        
+                        # Update runtime state with token counts
+                        runtime_state.update_token_counts(actual_tokens, compute_tokens)
 
             log_iteration_profile(
                 iteration=iteration,
@@ -2184,6 +2210,9 @@ def training_log(
                 global_batch_size=batch_size,
                 tokens_per_sec=tokens_per_sec,
                 tokens_per_sec_per_gpu=tokens_per_sec_per_gpu,
+                actual_tokens_per_sec=actual_tokens_per_sec,
+                actual_tokens_per_sec_per_gpu=actual_tokens_per_sec_per_gpu,
+                packing_efficiency=packing_efficiency,
                 wandb_writer=wandb_writer,
                 tb_writer=writer,
             )
