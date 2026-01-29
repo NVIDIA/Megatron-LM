@@ -1,16 +1,22 @@
 import torch
 import sys
 import os
+import traceback
 
 # Add current directory to path
 sys.path.append(os.getcwd())
 
 try:
     from megatron.core.utils import local_multi_tensor_l2_norm
-except ImportError:
-    # If we can't import, we can't test the actual function.
-    print("Could not import megatron.core.utils. Make sure you are in the root of the repo.")
+except ImportError as e:
+    print(f"Could not import megatron.core.utils: {e}")
+    traceback.print_exc()
     sys.exit(1)
+except Exception as e:
+    print(f"An error occurred during import: {e}")
+    traceback.print_exc()
+    sys.exit(1)
+
 
 def test_local_multi_tensor_l2_norm_correctness():
     print("Running test_local_multi_tensor_l2_norm_correctness...")
@@ -22,8 +28,8 @@ def test_local_multi_tensor_l2_norm_correctness():
 
     print(f"Device: {device}")
 
-    t1 = torch.tensor([3.0, 4.0], device=device) # norm 5
-    t2 = torch.tensor([6.0, 8.0], device=device) # norm 10
+    t1 = torch.tensor([3.0, 4.0], device=device)  # norm 5
+    t2 = torch.tensor([6.0, 8.0], device=device)  # norm 10
 
     # Global norm = sqrt(5^2 + 10^2) = sqrt(125) = 11.1803...
     expected_norm = (t1.norm()**2 + t2.norm()**2).sqrt()
@@ -31,15 +37,12 @@ def test_local_multi_tensor_l2_norm_correctness():
     tensor_lists = [[t1, t2]]
 
     # Call the function
-    # chunk_size, noop_flag, tensor_lists, per_tensor
     try:
         result, _ = local_multi_tensor_l2_norm(2048, None, tensor_lists, False)
     except Exception as e:
         print(f"Function call failed: {e}")
-        # If it failed because of device mismatch (e.g. CPU input but function forces CUDA return on CPU machine), that's expected with current code.
-        if "AssertionError" in str(e) or "cuda" in str(e):
-             print("Failure expected on CPU with current implementation.")
-             return
+        # If it failed because of device mismatch on CPU machine, catch it?
+        # But my fix should handle CPU.
         raise e
 
     # Verify shape
@@ -54,18 +57,18 @@ def test_local_multi_tensor_l2_norm_correctness():
     if device == "cuda":
         assert result.is_cuda
 
-    # Verify dtype is float32 even if inputs are float16 (simulated if we could)
-    # But explicitly check result dtype
+    # Verify dtype is float32
     assert result.dtype == torch.float32, f"Expected float32, got {result.dtype}"
 
     print("test_local_multi_tensor_l2_norm_correctness PASSED")
 
+
 def test_local_multi_tensor_l2_norm_empty_input():
     print("Running test_local_multi_tensor_l2_norm_empty_input...")
     if torch.cuda.is_available():
-        device = "cuda"
+        pass
     else:
-        device = "cpu"
+        pass
 
     tensor_lists = [[]]
     try:
@@ -77,7 +80,10 @@ def test_local_multi_tensor_l2_norm_empty_input():
     assert result.item() == 0.0
     if torch.cuda.is_available():
         assert result.is_cuda
+
+    assert result.dtype == torch.float32
     print("test_local_multi_tensor_l2_norm_empty_input PASSED")
+
 
 if __name__ == "__main__":
     test_local_multi_tensor_l2_norm_correctness()
