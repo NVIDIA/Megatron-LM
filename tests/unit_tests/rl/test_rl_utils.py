@@ -10,9 +10,6 @@ import torch
 from megatron.core.distributed import (
     DistributedDataParallel,
     DistributedDataParallelConfig,
-    get_grad_buffer_memory_usage,
-    offload_grad_data,
-    onload_grad_data,
 )
 from megatron.core.enums import ModelType
 from megatron.core.models.common.language_module.language_module import LanguageModule
@@ -455,41 +452,27 @@ class TestRLUtils:
             transformer_config, ddp_config=ddp_config, module=gpt_model
         )
 
-        # Measure initial memory usage
-        initial_memory = get_grad_buffer_memory_usage(ddp_model)
-        assert initial_memory["total_bytes"] > 0, "Expected non-zero initial memory"
+        all_buffers = ddp_model.buffers + ddp_model.expert_parallel_buffers
+
+        # Verify initial storage is allocated
+        initial_sizes = [buf.grad_data.storage().size() for buf in all_buffers]
+        assert all(size > 0 for size in initial_sizes), "Expected non-zero initial storage"
 
         # Offload grad buffers
-        offload_grad_data(ddp_model)
+        ddp_model.offload_grad_buffers()
 
-        # Measure memory after offload - should be zero
-        offloaded_memory = get_grad_buffer_memory_usage(ddp_model)
-        assert (
-            offloaded_memory["total_bytes"] == 0
-        ), f"Expected zero memory after offload, got {offloaded_memory['total_bytes']} bytes"
-
-        # Verify all buffers report as offloaded
-        for buffer_name, buffer_info in offloaded_memory["buffers"].items():
-            assert (
-                buffer_info["device"] == "offloaded"
-            ), f"Buffer {buffer_name} should report device as 'offloaded'"
+        # Verify storage is released
+        for buf in all_buffers:
+            assert buf.grad_data.storage().size() == 0, "Expected zero storage after offload"
 
         # Onload grad buffers
-        onload_grad_data(ddp_model)
+        ddp_model.onload_grad_buffers()
 
-        # Measure memory after onload - should match initial
-        restored_memory = get_grad_buffer_memory_usage(ddp_model)
-        assert restored_memory["total_bytes"] == initial_memory["total_bytes"], (
-            f"Expected restored memory ({restored_memory['total_bytes']}) to match "
-            f"initial memory ({initial_memory['total_bytes']})"
+        # Verify storage is restored
+        restored_sizes = [buf.grad_data.storage().size() for buf in all_buffers]
+        assert initial_sizes == restored_sizes, (
+            f"Expected restored sizes {restored_sizes} to match initial {initial_sizes}"
         )
-
-        # Verify buffer structure is restored
-        assert len(restored_memory["buffers"]) == len(initial_memory["buffers"])
-        for buffer_name in initial_memory["buffers"]:
-            assert restored_memory["buffers"][buffer_name]["numel"] == (
-                initial_memory["buffers"][buffer_name]["numel"]
-            ), f"Buffer {buffer_name} numel mismatch after restore"
 
         Utils.destroy_model_parallel()
 
@@ -578,6 +561,7 @@ class TestRLUtils:
 
         # Restore optimizer state to GPU
         optimizer.restore_from_cpu()
+        optimizer.wait_for_restore()
 
         # Verify optimizer state is back on GPU
         restored_devices = get_optimizer_state_devices()

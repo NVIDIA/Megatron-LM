@@ -26,7 +26,6 @@ from megatron.core import mpu
 from megatron.core.datasets.megatron_tokenizer import MegatronLegacyTokenizer
 from megatron.core.full_cuda_graph import FullCudaGraphWrapper
 from megatron.core.models.common.language_module.language_module import LanguageModule
-from megatron.core.distributed import offload_grad_data, onload_grad_data
 from megatron.core.optimizer import MegatronOptimizer
 from megatron.core.pipeline_parallel import get_forward_backward_func
 from megatron.core.pipeline_parallel.utils import is_pp_last_stage, get_pp_last_rank
@@ -460,7 +459,7 @@ def get_environment_rollouts(
 
     if args.rl_offload_optimizer_during_inference:
         with nvtx_range("offload-optimizer-state-and-grad-buffers-during-inference"):
-            offload_grad_data(model[0])
+            model[0].offload_grad_buffers()
             optimizer.offload_to_cpu()
              
     # If we have seperate training and inference models we to refit weights from the training model to the inference model.
@@ -535,7 +534,7 @@ def get_environment_rollouts(
 
     if args.rl_offload_optimizer_during_inference:
         with nvtx_range("onload-optimizer-state-and-grad-buffers-after-inference"):
-            onload_grad_data(model[0])
+            model[0].onload_grad_buffers()
             optimizer.restore_from_cpu()
 
     if lang_rl_log_dir and rank == get_pg_rank(inference_pg_collection.tp):
@@ -1612,7 +1611,7 @@ def megatron_rl_inference_mode(
 
         if offload_optimizer_during_inference:
             with nvtx_range("offload-optimizer-state-and-grad-buffers-before-inference"):
-                offload_grad_data(model[0])
+                model[0].offload_grad_buffers()
                 optimizer.offload_to_cpu()
 
         # TODO: Remove this if statement once a change to `toggle_cuda_graphs` makes it safe to.
@@ -1675,7 +1674,7 @@ def megatron_rl_inference_mode(
 
         if offload_optimizer_during_inference:
             with nvtx_range("onload-optimizer-state-and-grad-buffers-after-inference"):
-                onload_grad_data(model[0])
+                model[0].onload_grad_buffers()
                 optimizer.restore_from_cpu()
 
         lang_module.train()
