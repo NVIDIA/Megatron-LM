@@ -85,9 +85,6 @@ def initialize_gpt_model(
         else:
             mtp_block_spec = None
 
-        # print("========================")
-        # print("[DEBUG] mtp_block_spec is ", mtp_block_spec)
-        # exit()
         pre_process = mpu.is_pipeline_first_stage(ignore_virtual=False, vp_stage=i)
         post_process = mpu.is_pipeline_last_stage(ignore_virtual=False, vp_stage=i)
         this_model = (
@@ -148,9 +145,9 @@ def create_args():
     args.no_load_rng = True
     args.use_distributed_optimizer = True
     args.use_megatron_fsdp = False
-    args.dist_ckpt_save_pre_mcore_014 = False
     args.dist_ckpt_optim_fully_reshardable = False
     args.distrib_optim_fully_reshardable_mem_efficient = False
+    args.phase_transition_iterations = None
 
     yield args
 

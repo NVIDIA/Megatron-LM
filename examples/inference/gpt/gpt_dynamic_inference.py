@@ -26,6 +26,7 @@ from examples.inference.gpt.utils import (
     build_dynamic_engine_setup_prefix,
     build_requests,
     get_curr_time,
+    get_global_peak_memory_stats_bytes,
 )
 from megatron.core.inference.contexts.dynamic_context import (
     ContextOverflowError,
@@ -155,7 +156,7 @@ def get_inference_context(
         max_sequence_length = args.inference_max_seq_length
 
     metrics_writer = None
-    if args.inference_wandb_logging_step_interval > 0:
+    if args.inference_logging_step_interval > 0 and args.inference_wandb_logging:
         metrics_writer = get_wandb_writer()
 
     # Inference context.
@@ -174,9 +175,12 @@ def get_inference_context(
         ),
         block_size_tokens=args.inference_dynamic_batching_block_size,
         buffer_size_gb=args.inference_dynamic_batching_buffer_size_gb,
+        paused_buffer_size_gb=args.inference_dynamic_batching_paused_buffer_size_gb,
+        max_requests=args.inference_dynamic_batching_max_requests,
         max_tokens=args.inference_dynamic_batching_max_tokens,
         tensor_model_parallel_size=args.tensor_model_parallel_size,
-        materialize_only_last_token_logits=not (args.return_log_probs or args.return_prompt_top_n_logprobs),
+        pipeline_model_parallel_size=args.pipeline_model_parallel_size,
+        materialize_only_last_token_logits=not args.return_log_probs,
         mamba_inference_state_config=mamba_inference_state_config,
         cache_mla_latent=args.multi_latent_attention and args.cache_mla_latents,
         kv_lora_rank=args.kv_lora_rank if args.multi_latent_attention else None,
@@ -310,7 +314,7 @@ def run_inference(
         # Step inference engine (i.e., generate a token for each active request).
         # Before step, we haven't done the scheduling, so we cannot know the is_decode_only
         try:
-            result = engine.step_modern(verbose=True)
+            result = engine.step_modern()
         except EngineSuspendedError as e:
             result = e
             pass # ignore error in order to call 'engine.resume()' below.
@@ -360,16 +364,17 @@ def run_inference(
             output_start = get_curr_time()
             for finished_request_record in finished_request_records:
 
-                finished_request = finished_request_record.merge(engine.controller.tokenizer)
+                finished_request = finished_request_record.merge()
 
                 # Update local request object.
                 request = requests[finished_request.request_id]
                 request.time_end = get_curr_time()
                 request.state = "finished"
                 request.request_id = finished_request.request_id
+                request.events = finished_request.events
 
                 # Update prompt, in case engine has been suspended and resumed.
-                request.prompt_tokens = finished_request.prompt_tokens
+                request.prompt_tokens = finished_request.prompt_tokens.tolist()
                 request.prompt_text = finished_request.prompt
 
                 # Get output tokens and text.
@@ -381,12 +386,14 @@ def run_inference(
                 if finished_request.sampling_params.return_log_probs:
                     if not finished_request.prompt_log_probs:
                         finished_request.prompt_log_probs = []
-                    request.log_probs = (
+                    request.prompt_log_probs = finished_request.prompt_log_probs
+                    request.generated_log_probs = finished_request.generated_log_probs
+                    request.logprobs = (
                         finished_request.prompt_log_probs + finished_request.generated_log_probs
                     )
                 if finished_request.sampling_params.top_n_logprobs > 0:
                     request.generated_top_n_logprobs = finished_request.generated_top_n_logprobs
-                if finished_request.sampling_params.return_prompt_top_n_logprobs:
+                if not finished_request.sampling_params.skip_prompt_log_probs:
                     request.prompt_top_n_logprobs = finished_request.prompt_top_n_logprobs
                 num_requests_finished += 1
             output_times.append(get_curr_time() - output_start)
@@ -394,6 +401,10 @@ def run_inference(
         # Check if all requests are finished.
         if not (engine.has_unfinished_requests() or num_requests_added < num_requests_total):
             break
+
+    # Resume engine (NOOP if not suspended).
+    if engine.is_suspended:
+        engine.resume()
 
     return {
         "step_times" : step_times,
@@ -429,6 +440,10 @@ def main():
     else:
         tokenizer = build_tokenizer(args)
 
+    # Reset peak memory stats so functional tests measure this run and not
+    # whatever happened earlier during initialization.
+    torch.cuda.reset_peak_memory_stats()
+
     # Sampling params.
     sampling_params = SamplingParams(
         temperature=args.temperature,
@@ -439,8 +454,8 @@ def main():
         num_tokens_to_generate=args.num_tokens_to_generate,
         termination_id=args.termination_id if args.termination_id is not None else tokenizer.eod,
         top_n_logprobs=args.top_n_logprobs,
-        return_prompt_top_n_logprobs=args.return_prompt_top_n_logprobs,
-    )
+        stop_words=args.stop_words,
+    ) 
 
     model = get_model()
 
@@ -474,7 +489,7 @@ def main():
         random_seed=args.seed,
         track_paused_request_events=args.inference_dynamic_batching_track_paused_request_events,
         enable_chunked_prefill=not args.disable_chunked_prefill,
-        inference_logging_step_interval=args.inference_wandb_logging_step_interval,
+        inference_logging_step_interval=args.inference_logging_step_interval,
     )
 
     setup_prefix = build_dynamic_engine_setup_prefix(args, model, context, requests)
@@ -485,6 +500,13 @@ def main():
     # Run and time test, optionally `args.inference_repeat_n` times.
     throughputs = []
     for _ in range(args.inference_repeat_n):
+
+        # Reset engine.
+        engine.reset()
+
+        torch.cuda.reset_peak_memory_stats()
+
+        # Trial.
         t = get_curr_time()
         result = run_inference(requests, engine)
         step_times = result["step_times"]
@@ -503,8 +525,9 @@ def main():
             f"request.state == '{request.state}' != 'finished'."
         )
 
-    # Print unique prompts + outputs.
+    peak_mem_stats = get_global_peak_memory_stats_bytes()
 
+    # Print unique prompts + outputs.
     if torch.distributed.get_rank() == 0:
         def escape_str(s):
             return s.replace("\n", "\\n")
@@ -523,7 +546,7 @@ def main():
             # ---- Prompt summary line ----
             prompt_len = len(requests[request_idxs[0]].prompt_tokens)
             escaped_prompt_text = escape_str(prompt_text)
-            print(f"{unique_idx+1}/{len(unique_prompt_map)} [n {len(request_idxs)}, l {prompt_len}] {escaped_prompt_text}")
+            print(f"\n{unique_idx+1}/{len(unique_prompt_map)} [n {len(request_idxs)}, l {prompt_len}] {escaped_prompt_text}")
 
             # ---- Group all outputs for this prompt ----
             output_map = defaultdict(list)
@@ -533,6 +556,12 @@ def main():
 
             # ---- Print each unique output ----
             for output_text, output_request_idxs in output_map.items():
+                evicted = False
+                for idx in output_request_idxs:
+                    for event in requests[idx].events:
+                        if event.type.name == "EVICT":
+                            evicted = True
+                            break
                 if output_text is not None:
                     # Use hash of prompt + generated text in case engine was
                     # suspended and resumed, which misaligns boundary between
@@ -546,7 +575,7 @@ def main():
                     o_hash = "--"
                     o_len = 0
                     escaped_output_text = "--"
-                print(f"  >>>> [n {len(output_request_idxs)}, {o_len} tokens, hash {o_hash}] {escaped_output_text}")
+                print(f"  >>>> [n {len(output_request_idxs)}, {o_len} tokens, hash {o_hash}{', <evicted>' if evicted else ''}] {escaped_output_text}")
                 text_hashes.append(o_hash)
 
         # Write results to JSON. Primarily used for functional testing.
@@ -568,12 +597,17 @@ def main():
                         "prompt_top_n_logprobs" : getattr(req, 'prompt_top_n_logprobs', None),
                     }
                     if req.sampling_params.return_log_probs:
-                        response_logprobs = req.log_probs
-                        result_dict["logprobs"] = response_logprobs
+                        result_dict["prompt_logprobs"] = getattr(req, 'prompt_log_probs', None)
+                        result_dict["generated_logprobs"] = getattr(req, 'generated_log_probs', None)
+                        result_dict["logprobs"] = getattr(req, 'logprobs', None)
                     json_results[req.request_id] = result_dict
 
             # Track system-level throughput as a test / debug metric
-            json_results["throughput"] = throughputs
+            if args.record_throughput:
+                json_results["throughput"] = throughputs
+            # Attach peak memory metrics; the functional test only validates these
+            # if the fields exist in the golden values.
+            json_results.update(peak_mem_stats)
 
             print(f' Saving results to {args.output_path}')
             with open(args.output_path, "w") as fp:
@@ -615,11 +649,11 @@ def main():
         )
         print(
             f"{setup_prefix} … "
-            f"throughput: {throughput:.3f} tok/s",
+            f"throughput: {throughput:.3f} tok/s … ",
             f"total time: {total_time:.3f}s … "
             f"mem {peak_alloc_gb:.1f}/{peak_resvd_gb:.1f} GB … "
             f"steps: {engine.step_count:d} … "
-            f"capture {capture_str} … "
+            f"capture {capture_str}"
         )
         print("~~~")
 

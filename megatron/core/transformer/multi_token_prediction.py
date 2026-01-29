@@ -1,5 +1,6 @@
 # Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
+import warnings
 from contextlib import nullcontext
 from dataclasses import dataclass
 from typing import Callable, List, Optional, Union
@@ -13,9 +14,6 @@ from megatron.core.dist_checkpointing.utils import replace_prefix_for_sharding
 from megatron.core.fp8_utils import get_fp8_context
 from megatron.core.models.backends import BackendSpecProvider, LocalSpecProvider
 from megatron.core.packed_seq_params import PackedSeqParams
-from megatron.core.pipeline_parallel.fine_grained_activation_offload import (
-    fine_grained_offloading_set_last_layer,
-)
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.tensor_parallel import (
     gather_from_tensor_model_parallel_region,
@@ -319,8 +317,8 @@ class MTPLossLoggingHelper:
         loss: torch.Tensor,
         layer_number: int,
         num_layers: int,
-        reduce_group: torch.distributed.ProcessGroup = None,
-        avg_group: torch.distributed.ProcessGroup = None,
+        reduce_group: Optional[torch.distributed.ProcessGroup] = None,
+        avg_group: Optional[torch.distributed.ProcessGroup] = None,
     ):
         """Save the mtp loss for logging.
         Args:
@@ -508,9 +506,6 @@ def get_mtp_ranks(pp_ranks: List[int], config: TransformerConfig) -> List[int]:
 
 def get_mtp_layer_offset(config: TransformerConfig, vp_stage: Optional[int] = None) -> int:
     """Get the offset of the MTP layer."""
-    # TODO(shifangx): Currently, we only support put all of MTP layers
-    # on the last pipeline stage, so the offset is always 0.
-    # We will support more flexible MTP placement in the future.
     if config.pipeline_model_parallel_size > 1:
         if config.pipeline_model_parallel_layout:
             offset = config.pipeline_model_parallel_layout.get_layer_offset(
@@ -869,15 +864,15 @@ class MultiTokenPredictionLayer(MegatronModule):
         position_ids: Tensor,
         hidden_states: Tensor,
         attention_mask: Tensor,
-        context: Tensor = None,
-        context_mask: Tensor = None,
-        rotary_pos_emb: Tensor = None,
-        rotary_pos_cos: Tensor = None,
-        rotary_pos_sin: Tensor = None,
-        attention_bias: Tensor = None,
-        inference_params: InferenceParams = None,
-        packed_seq_params: PackedSeqParams = None,
-        sequence_len_offset: Tensor = None,
+        context: Optional[Tensor] = None,
+        context_mask: Optional[Tensor] = None,
+        rotary_pos_emb: Optional[Tensor] = None,
+        rotary_pos_cos: Optional[Tensor] = None,
+        rotary_pos_sin: Optional[Tensor] = None,
+        attention_bias: Optional[Tensor] = None,
+        inference_params: Optional[InferenceParams] = None,
+        packed_seq_params: Optional[PackedSeqParams] = None,
+        sequence_len_offset: Optional[Tensor] = None,
         embedding=None,
     ):
         """
@@ -980,7 +975,7 @@ class MultiTokenPredictionBlockSubmodules:
             projection matrix, transformer block, shared output head).
     """
 
-    layer_specs: List[ModuleSpec] = None
+    layer_specs: Optional[List[ModuleSpec]] = None
 
 
 def _get_mtp_block_submodules(
@@ -1036,7 +1031,7 @@ class MultiTokenPredictionBlock(MegatronModule):
         config: TransformerConfig,
         spec: Union[TransformerBlockSubmodules, ModuleSpec],
         vp_stage: Optional[int] = None,
-        pg_collection: ProcessGroupCollection = None,
+        pg_collection: Optional[ProcessGroupCollection] = None,
     ):
         super().__init__(config=config)
         self.submodules = _get_mtp_block_submodules(config, spec)
@@ -1085,16 +1080,16 @@ class MultiTokenPredictionBlock(MegatronModule):
         position_ids: Tensor,
         hidden_states: Tensor,
         attention_mask: Tensor,
-        context: Tensor = None,
-        context_mask: Tensor = None,
-        rotary_pos_emb: Tensor = None,
-        rotary_pos_cos: Tensor = None,
-        rotary_pos_sin: Tensor = None,
-        attention_bias: Tensor = None,
-        inference_params: InferenceParams = None,
-        packed_seq_params: PackedSeqParams = None,
-        sequence_len_offset: Tensor = None,
-        extra_block_kwargs: dict = None,
+        context: Optional[Tensor] = None,
+        context_mask: Optional[Tensor] = None,
+        rotary_pos_emb: Optional[Tensor] = None,
+        rotary_pos_cos: Optional[Tensor] = None,
+        rotary_pos_sin: Optional[Tensor] = None,
+        attention_bias: Optional[Tensor] = None,
+        inference_params: Optional[InferenceParams] = None,
+        packed_seq_params: Optional[PackedSeqParams] = None,
+        sequence_len_offset: Optional[Tensor] = None,
+        extra_block_kwargs: Optional[dict] = None,
         embedding=None,
     ) -> Tensor:
         """
@@ -1114,8 +1109,6 @@ class MultiTokenPredictionBlock(MegatronModule):
         hidden_states_list = list(torch.chunk(hidden_states, 1 + offset, dim=0))
         hidden_states = hidden_states_list[offset]
         for layer_number in range(len(self.layers)):
-            if self.config.fine_grained_activation_offloading:
-                fine_grained_offloading_set_last_layer(layer_number == len(self.layers) - 1)
             (hidden_states, input_ids, position_ids) = self.layers[layer_number](
                 input_ids=input_ids,
                 position_ids=position_ids,

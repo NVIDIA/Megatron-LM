@@ -220,13 +220,16 @@ class TestFullyShardedDataParallel:
 
     # Testing fsdp_double_buffer with and without nccl_ub
     @pytest.mark.parametrize(
-        ("dp_size", "nccl_ub", "fsdp_double_buffer"), [(8, False, True), (8, True, True)]
+        ("dp_size", "nccl_ub", "fsdp_double_buffer", "fsdp_manual_registration"),
+        [(8, False, True, False), (8, True, True, False), (8, True, True, True)],
     )
-    def test_fsdp_user_buffer_registration(self, dp_size, nccl_ub, fsdp_double_buffer):
+    def test_fsdp_user_buffer_registration(
+        self, dp_size, nccl_ub, fsdp_double_buffer, fsdp_manual_registration
+    ):
         """Test that FSDP works correctly with user buffer registration.
         This test compares the training results of the baseline fsdp with the target fsdp config.
-        Baseline fsdp: nccl_ub=False, fsdp_double_buffer=False
-        Target fsdp: nccl_ub=[True, False], fsdp_double_buffer=[True, False]
+        Baseline fsdp: nccl_ub=False, fsdp_double_buffer=False, fsdp_manual_registration=False
+        Target fsdp: nccl_ub=[True, False], fsdp_double_buffer=[True, False], fsdp_manual_registration=[True, False]
         """
         if not is_torch_min_version("2.4.0"):
             pytest.skip("Megatron FSDP requires torch >= 2.4.0")
@@ -264,6 +267,7 @@ class TestFullyShardedDataParallel:
             use_megatron_fsdp=True,
             nccl_ub=False,
             fsdp_double_buffer=False,
+            fsdp_manual_registration=False,
         )
 
         # Setup FSDP config - target fsdp config
@@ -275,6 +279,7 @@ class TestFullyShardedDataParallel:
             use_megatron_fsdp=True,
             nccl_ub=nccl_ub,
             fsdp_double_buffer=fsdp_double_buffer,
+            fsdp_manual_registration=fsdp_manual_registration,
         )
 
         # Create two identical models
@@ -353,6 +358,13 @@ class TestFullyShardedDataParallel:
 
         out1, loss1 = train_step(baseline_fsdp_model, optimizer1, input_data)
         out2, loss2 = train_step(target_fsdp_model, optimizer2, input_data)
+
+        # In case of manual registration, we need to manually register the buffer
+        # And proceed one more step to check the results
+        if fsdp_manual_registration:
+            out1, loss1 = train_step(baseline_fsdp_model, optimizer1, input_data)
+            target_fsdp_model.manual_buffer_registration()
+            out2, loss2 = train_step(target_fsdp_model, optimizer2, input_data)
 
         testing.assert_close(out1, out2, rtol=0, atol=0)
         testing.assert_close(loss1, loss2, rtol=0, atol=0)

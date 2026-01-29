@@ -1,7 +1,7 @@
 # Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
 import copy
-import itertools
+import logging
 from copy import deepcopy
 from functools import partial
 from math import ceil
@@ -26,9 +26,7 @@ from megatron.core.fusions.fused_bias_swiglu import weighted_bias_swiglu_impl
 from megatron.core.fusions.fused_weighted_squared_relu import weighted_squared_relu_impl
 from megatron.core.jit import jit_fuser
 from megatron.core.pipeline_parallel.fine_grained_activation_offload import (
-    fine_grained_offloading_group_commit,
-    fine_grained_offloading_group_start,
-    get_fine_grained_offloading_context,
+    FineGrainedActivationOffloadingInterface as off_interface,
 )
 from megatron.core.tensor_parallel.layers import (
     _initialize_affine_weight_cpu,
@@ -50,7 +48,6 @@ from megatron.core.transformer.utils import (
     make_sharded_object_for_checkpoint,
     sharded_state_dict_default,
 )
-from megatron.core.utils import internal_api
 
 try:
     import transformer_engine as te  # pylint: disable=unused-import
@@ -63,6 +60,8 @@ except ImportError:
 
     HAVE_TE = False
 
+logger = logging.getLogger(__name__)
+
 
 class GroupedMLP(MegatronModule):
     """An efficient implementation of the Experts layer using GroupedGEMM.
@@ -71,7 +70,6 @@ class GroupedMLP(MegatronModule):
     """
 
     # TODO(M4): breaking api, switched from pass in tp_group to pass in pg_collection.
-    @internal_api
     def __init__(
         self,
         num_local_experts: int,
@@ -85,6 +83,9 @@ class GroupedMLP(MegatronModule):
         assert (
             config.add_bias_linear == False
         ), "bias not supported in Grouped GEMM yet, please set '--disable-bias-linear' instead."
+        assert (
+            config.moe_latent_size is None
+        ), "MoE latent projection not supported in GroupedMLP yet."
 
         self.expert_parallel = config.expert_model_parallel_size > 1
         if self.config.gated_linear_unit:
@@ -238,7 +239,7 @@ class GroupedMLP(MegatronModule):
         permuted_probs: torch.Tensor,
     ):
         """Forward step of the GroupedMLP."""
-        assert self.config.bf16, "Currently GroupedGEMM for MoE only supports bf16."
+        assert self.config.bf16, "Currently GroupedMLP for MoE only supports bf16."
         if self.activation_recompute:
             self.activation_checkpoint = tensor_parallel.CheckpointWithoutOutput()
 
@@ -441,186 +442,7 @@ class GroupedMLP(MegatronModule):
                             replica_id=replica_id,
                             prepend_axis_num=prepend_axis_num,
                         )
-            else:
-                if singleton_local_shards:
-                    raise NotImplementedError(
-                        'flattened_range not supported for'
-                        ' GroupedMLP with singleton_local_shards'
-                    )
-                # flattened optmizer states
-                # the non-flattened weight shape is [local_expert_num, hidden_size, ffn_size]
-                #
-                # For the case without GLU, it is straightforward, we just need to split each
-                # expert along the dim-0.
-                #
-                # For the case with GLU, we need to split the experts along dim-0 and split the
-                # two tensors for GLU along dim-2.
-                # To split along the non-first dim, we need to chunk the tensor into small pieces,
-                # since they belong to different tenors and are interleaved in the flattened space.
-                # Refer to the below sketch graph.
-                # |................|           |........|........|
-                # |............FFFF|           |........|....BBBB|
-                # |FFFFFFFFFFFFFFFF|     ->    |AAAAAAAA|BBBBBBBB|
-                # |FFFFFFFFFFFFFFFF|           |AAAAAAAA|BBBBBBBB|
-                # |FF..............|           |AA......|........|
-                # |................|           |........|........|
-                #
-                # But too many chunks have severe performance issues. We merge these chunks during
-                # the save process along with some length information and recover them during the
-                # load process.
-                assert t.ndim == 1, (key, t.shape)
-                if with_glu:
-                    non_flat_local_shape = (1, self.config.hidden_size, local_ffn_dim_size)
-                    chunk_numel = local_ffn_dim_size
-                    sub_states = []
-                    start_pos = 0
-                    for local_expert_idx in range(self.num_local_experts):
-                        first_glu_idx = -1
-                        w_start_range = -1
-                        v_start_range = -1
-                        w_tensors = []
-                        v_tensors = []
-                        w_lens = []
-                        v_lens = []
-                        expert_global_idx = local_expert_indices_offset + local_expert_idx
-                        for input_dim_idx in range(self.config.hidden_size):
-                            for glu_idx in range(2):
-                                local_idx = (
-                                    local_expert_idx * self.config.hidden_size * 2
-                                    + input_dim_idx * 2
-                                    + glu_idx
-                                )
-                                if (
-                                    flattened_range.start < chunk_numel * (local_idx + 1)
-                                    and flattened_range.stop > chunk_numel * local_idx
-                                ):
-                                    if first_glu_idx == -1:
-                                        first_glu_idx = glu_idx
-                                    end_pos = min(
-                                        flattened_range.stop,
-                                        chunk_numel * (local_idx + 1) - flattened_range.start,
-                                    )
-                                    local_tensor = t[start_pos:end_pos]
-                                    local_flattened_range = slice(
-                                        max(0, flattened_range.start - chunk_numel * local_idx),
-                                        min(
-                                            chunk_numel,
-                                            flattened_range.stop - chunk_numel * local_idx,
-                                        ),
-                                    )
-                                    assert (
-                                        len(local_tensor)
-                                        == local_flattened_range.stop - local_flattened_range.start
-                                    )
-                                    start_pos += len(local_tensor)
-                                    if glu_idx == 0:
-                                        w_tensors.append(local_tensor)
-                                        w_lens.append(len(local_tensor))
-                                        if w_start_range == -1:
-                                            w_start_range = max(
-                                                0, flattened_range.start - chunk_numel * local_idx
-                                            )
-                                    else:
-                                        v_tensors.append(local_tensor)
-                                        v_lens.append(len(local_tensor))
-                                        if v_start_range == -1:
-                                            v_start_range = max(
-                                                0, flattened_range.start - chunk_numel * local_idx
-                                            )
-                        sub_states.append(
-                            {
-                                'w_tensors': ShardedTensor.from_rank_offsets_flat(
-                                    key,
-                                    (
-                                        torch.cat(w_tensors, -1)
-                                        if len(w_tensors) > 0
-                                        else torch.Tensor()
-                                    ),
-                                    non_flat_local_shape,
-                                    *sharded_offsets,
-                                    (
-                                        prepend_axis_num,
-                                        expert_global_idx,  # pylint: disable=E0606
-                                        num_global_experts,
-                                    ),
-                                    (prepend_axis_num + 1 + tp_axis, tp_rank, tp_size * 2),
-                                    replica_id=replica_id,
-                                    prepend_axis_num=prepend_axis_num,
-                                    flattened_range=slice(
-                                        w_start_range, w_start_range + sum(w_lens)
-                                    ),
-                                ),
-                                'w_lens': LocalNonpersistentObject(w_lens),
-                                'v_tensors': ShardedTensor.from_rank_offsets_flat(
-                                    key,
-                                    (
-                                        torch.cat(v_tensors, -1)
-                                        if len(v_tensors) > 0
-                                        else torch.Tensor()
-                                    ),
-                                    non_flat_local_shape,
-                                    *sharded_offsets,
-                                    (prepend_axis_num, expert_global_idx, num_global_experts),
-                                    (
-                                        prepend_axis_num + 1 + tp_axis,
-                                        tp_rank + tp_size,
-                                        tp_size * 2,
-                                    ),
-                                    replica_id=replica_id,
-                                    prepend_axis_num=prepend_axis_num,
-                                    flattened_range=slice(
-                                        v_start_range, v_start_range + sum(v_lens)
-                                    ),
-                                ),
-                                'v_lens': LocalNonpersistentObject(v_lens),
-                                'first_glu_idx': LocalNonpersistentObject(first_glu_idx),
-                            }
-                        )
-                else:
-                    non_flat_local_shape = (
-                        real_shape[0] // self.num_local_experts,
-                        *real_shape[1:],
-                    )
-                    chunk_numel = local_ffn_dim_size * self.config.hidden_size
-                    sub_states = []
-                    start_pos = 0
-                    for local_expert_idx in range(self.num_local_experts):
-                        if (
-                            flattened_range.start < chunk_numel * (local_expert_idx + 1)
-                            and flattened_range.stop > chunk_numel * local_expert_idx
-                        ):
-                            end_pos = min(
-                                flattened_range.stop,
-                                chunk_numel * (local_expert_idx + 1) - flattened_range.start,
-                            )
-                            local_tensor = t[start_pos:end_pos]
-                            local_flattened_range = slice(
-                                max(0, flattened_range.start - chunk_numel * local_expert_idx),
-                                min(
-                                    chunk_numel,
-                                    flattened_range.stop - chunk_numel * local_expert_idx,
-                                ),
-                            )
-                            assert (
-                                len(local_tensor)
-                                == local_flattened_range.stop - local_flattened_range.start
-                            )
-                            start_pos += len(local_tensor)
-                            expert_global_idx = local_expert_indices_offset + local_expert_idx
-                            sub_states.append(
-                                ShardedTensor.from_rank_offsets_flat(
-                                    key,
-                                    local_tensor,
-                                    non_flat_local_shape,
-                                    *sharded_offsets,
-                                    (prepend_axis_num, expert_global_idx, num_global_experts),
-                                    (prepend_axis_num + 1 + tp_axis, tp_rank, tp_size),
-                                    replica_id=replica_id,
-                                    prepend_axis_num=prepend_axis_num,
-                                    flattened_range=local_flattened_range,
-                                )
-                            )
-            return sub_states
+            return sub_states  # pylint: disable=possibly-used-before-assignment
 
         @torch.no_grad()
         def sh_ten_merge_fn(sub_state_dict, tp_axis: int, with_glu: bool):
@@ -633,48 +455,24 @@ class GroupedMLP(MegatronModule):
                 assert with_glu == False
             else:
                 raise ValueError("tp_axis should be 0 or 1.")
-            if isinstance(sub_state_dict, list) and isinstance(sub_state_dict[0], dict):
-                # flattened tensor with glu
-                res = []
-                for local_expert_dict in sub_state_dict:
-                    w_tensors = torch.split(
-                        local_expert_dict['w_tensors'], local_expert_dict['w_lens']
+            if isinstance(sub_state_dict, dict):
+                assert sub_state_dict['singleton_local_shards']
+                if with_glu:
+                    assert isinstance(sub_state_dict['data'], dict)
+                    sub_state_dict = torch.cat(
+                        (
+                            torch.stack(sub_state_dict['data']['w']),
+                            torch.stack(sub_state_dict['data']['v']),
+                        ),
+                        dim=-2,
                     )
-                    v_tensors = torch.split(
-                        local_expert_dict['v_tensors'], local_expert_dict['v_lens']
-                    )
-                    first_glu_idx = local_expert_dict['first_glu_idx']
-                    if first_glu_idx == 0:
-                        res += [
-                            x for x in itertools.chain(*itertools.zip_longest(w_tensors, v_tensors))
-                        ]
-                    else:
-                        res += [
-                            x for x in itertools.chain(*itertools.zip_longest(v_tensors, w_tensors))
-                        ]
-                return torch.cat(res)
-            elif isinstance(sub_state_dict, list) and sub_state_dict[0].ndim == 1:
-                # flattened tensor without glu
-                return torch.cat(sub_state_dict)
-            else:
-                if isinstance(sub_state_dict, dict):
-                    assert sub_state_dict['singleton_local_shards']
-                    if with_glu:
-                        assert isinstance(sub_state_dict['data'], dict)
-                        sub_state_dict = torch.cat(
-                            (
-                                torch.stack(sub_state_dict['data']['w']),
-                                torch.stack(sub_state_dict['data']['v']),
-                            ),
-                            dim=-2,
-                        )
-                    else:
-                        assert isinstance(sub_state_dict['data'], list)
-                        sub_state_dict = torch.stack(sub_state_dict['data'])
                 else:
-                    if with_glu:
-                        sub_state_dict = torch.cat(sub_state_dict, -2)
-                return sub_state_dict.transpose(-1, -2).reshape(weight_shape)
+                    assert isinstance(sub_state_dict['data'], list)
+                    sub_state_dict = torch.stack(sub_state_dict['data'])
+            else:
+                if with_glu:
+                    sub_state_dict = torch.cat(sub_state_dict, -2)
+            return sub_state_dict.transpose(-1, -2).reshape(weight_shape)
 
         state_dict = self.state_dict(prefix='', keep_vars=True)
         for name, tensor in state_dict.items():
@@ -688,7 +486,6 @@ class GroupedMLP(MegatronModule):
                 wkey = f'{prefix}experts.linear_fc2.weight'
 
             this_replica_id = list(copy.deepcopy(replica_id))
-            flattened_range = None
 
             sharded_state_dict[f'{prefix}{name}'] = ShardedTensorFactory(
                 wkey,
@@ -696,7 +493,6 @@ class GroupedMLP(MegatronModule):
                 partial(sh_ten_build_fn, tp_axis=tp_axis, with_glu=with_glu),
                 partial(sh_ten_merge_fn, tp_axis=tp_axis, with_glu=with_glu),
                 tuple(this_replica_id),
-                flattened_range=flattened_range,
             )
 
         replica_id = (0, tp_rank, dp_rank)
@@ -737,7 +533,6 @@ class TEGroupedMLP(MegatronModule):
     """
 
     # TODO(M4): breaking api, switched from pass in tp_group to pass in pg_collection.
-    @internal_api
     def __init__(
         self,
         num_local_experts,
@@ -763,7 +558,7 @@ class TEGroupedMLP(MegatronModule):
         self.linear_fc1 = build_module(
             submodules.linear_fc1,
             self.num_local_experts,
-            self.input_size,
+            self.input_size if self.config.moe_latent_size is None else self.config.moe_latent_size,
             ffn_hidden_size,
             config=self.config,
             init_method=self.config.init_method,
@@ -783,7 +578,11 @@ class TEGroupedMLP(MegatronModule):
             submodules.linear_fc2,
             self.num_local_experts,
             self.config.moe_ffn_hidden_size,
-            self.config.hidden_size,
+            (
+                self.config.hidden_size
+                if self.config.moe_latent_size is None
+                else self.config.moe_latent_size
+            ),
             config=self.config,
             init_method=self.config.output_layer_init_method,
             bias=self.config.add_bias_linear,
@@ -813,7 +612,7 @@ class TEGroupedMLP(MegatronModule):
             set_save_original_input(self.linear_fc2)
 
         # This is to avoid the CPU overhead of multiple d2h copies
-        if self.offload_expert_fc1 and not (self.config.fp8 or self.config.fp4):
+        if self.offload_expert_fc1:
             from megatron.core.extensions.transformer_engine import set_save_original_input
 
             set_save_original_input(self.linear_fc1)
@@ -882,18 +681,15 @@ class TEGroupedMLP(MegatronModule):
             # Probs already applied, so reset to 1.
             permuted_probs = torch.ones_like(permuted_probs)
 
-        if self.offload_expert_fc1:
-            permuted_local_hidden_states = fine_grained_offloading_group_start(
-                permuted_local_hidden_states, name="expert_fc1"
-            )
-        with get_fine_grained_offloading_context(self.offload_expert_fc1):
+        with off_interface(
+            self.offload_expert_fc1, permuted_local_hidden_states, "expert_fc1"
+        ) as permuted_local_hidden_states:
             fc1_output, bias_parallel = self.linear_fc1(
                 permuted_local_hidden_states, tokens_per_expert
             )
         if self.offload_expert_fc1:
-            fc1_output, bias_parallel = fine_grained_offloading_group_commit(
+            fc1_output = off_interface.group_commit(
                 fc1_output,
-                bias_parallel,
                 name="expert_fc1",
                 forced_released_tensors=[permuted_local_hidden_states],
             )
@@ -956,32 +752,32 @@ class TEGroupedMLP(MegatronModule):
                 intermediate_parallel = intermediate_parallel.to(original_dtype)
             return intermediate_parallel
 
-        if self.offload_moe_act:
-            fc1_output = fine_grained_offloading_group_start(fc1_output, name="moe_act")
-
         if self.activation_recompute:
             self.activation_checkpoint = tensor_parallel.CheckpointWithoutOutput()
-            with get_fine_grained_offloading_context(self.offload_moe_act):
+            with off_interface(self.offload_moe_act, fc1_output, "moe_act") as fc1_output:
                 bias_act_output = self.activation_checkpoint.checkpoint(
                     bias_act_func, fc1_output, bias_parallel, permuted_probs
                 )
         else:
-            with get_fine_grained_offloading_context(self.offload_moe_act):
+            with off_interface(self.offload_moe_act, fc1_output, "moe_act") as fc1_output:
                 bias_act_output = bias_act_func(fc1_output, bias_parallel, permuted_probs)
 
         output, output_bias = self.linear_fc2(bias_act_output, tokens_per_expert)
         if self.activation_recompute:
             self.activation_checkpoint.discard_output_and_register_recompute(output)
+
+        # Delay the offload of the moe act until after the linear_fc2 has been computed
+        # to make sure the fc1_output is reloaded to GPU before recomputing moe_act.
         if self.offload_moe_act:
-            (output,) = fine_grained_offloading_group_commit(
+            output = off_interface.group_commit(
                 output, name="moe_act", forced_released_tensors=[fc1_output]
             )
+        output = self._apply_bias(output, output_bias, tokens_per_expert, permuted_probs)
 
         # upad and concat the output
         if self.config.fp8 or self.config.fp4:
             output = self.quantization_unpadding(output, actual_tokens_per_expert)
 
-        output = self._apply_bias(output, output_bias, tokens_per_expert, permuted_probs)
         output_bias = None
 
         return output, output_bias
@@ -1045,7 +841,6 @@ class SequentialMLP(MegatronModule):
     """
 
     # TODO(M4): breaking api, switched from pass in tp_group to pass in pg_collection.
-    @internal_api
     def __init__(
         self,
         num_local_experts,

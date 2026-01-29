@@ -546,14 +546,10 @@ class DSAIndexer(MegatronModule):
             None, None, x, self.config, packed_seq_params
         )
         if self.config.rope_type == "rope":
-            rotary_pos_emb = self.rotary_pos_emb(
-                rotary_seq_len, packed_seq_params=packed_seq_params
-            )
+            rotary_pos_emb = self.rotary_pos_emb(rotary_seq_len, packed_seq=False)
             mscale = 1.0
         else:
-            rotary_pos_emb, mscale = self.rotary_pos_emb(
-                rotary_seq_len, packed_seq_params=packed_seq_params
-            )
+            rotary_pos_emb, mscale = self.rotary_pos_emb(rotary_seq_len, packed_seq=False)
 
         # =========================================
         # Gather inputs if sp is enabled
@@ -734,9 +730,9 @@ class DSAttention(MegatronModule):
         query: torch.Tensor,
         key: torch.Tensor,
         value: torch.Tensor,
+        attention_mask: torch.Tensor,
         x: torch.Tensor,
         qr: torch.Tensor,
-        attention_mask: torch.Tensor,
         attn_mask_type: AttnMaskType = None,
         attention_bias: torch.Tensor = None,
         packed_seq_params: PackedSeqParams = None,

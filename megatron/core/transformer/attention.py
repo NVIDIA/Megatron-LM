@@ -1,8 +1,11 @@
 # Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+from __future__ import annotations
 
+import copy
+import inspect
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
-from typing import NoReturn, Optional, Tuple, Union
+from typing import Callable, Optional, Protocol, Tuple, Union
 
 import torch
 from torch import Tensor
@@ -24,14 +27,14 @@ from megatron.core.parallel_state import (
     get_tensor_model_parallel_world_size,
 )
 from megatron.core.pipeline_parallel.fine_grained_activation_offload import (
-    fine_grained_offloading_group_commit,
-    fine_grained_offloading_group_start,
-    get_fine_grained_offloading_context,
+    FineGrainedActivationOffloadingInterface as off_interface,
 )
 from megatron.core.process_groups_config import ProcessGroupCollection
+from megatron.core.tensor_parallel.mappings import all_gather_last_dim_from_tensor_parallel_region
 from megatron.core.transformer.identity_op import IdentityOp
 from megatron.core.transformer.module import MegatronModule
 from megatron.core.transformer.spec_utils import ModuleSpec, build_module
+from megatron.core.typed_torch import apply_module, not_none
 from megatron.core.utils import (
     deprecate_inference_params,
     divide,
@@ -39,6 +42,7 @@ from megatron.core.utils import (
     get_pg_size,
     is_fa_min_version,
     is_te_min_version,
+    is_using_quantization_scales,
     nvtx_range_pop,
     nvtx_range_push,
 )
@@ -66,7 +70,7 @@ except ImportError as e:
 
 if not HAVE_FA3:
     try:
-        from flash_attn_3.flash_attn_interface import _flash_attn_forward
+        from flashattn_hopper.flash_attn_interface import _flash_attn_forward
         from flashattn_hopper.flash_attn_interface import (
             flash_attn_with_kvcache as flash_attn3_with_kvcache,
         )
@@ -113,14 +117,107 @@ except ImportError:
     HAVE_FUSED_QKV_ROPE = False
 
 
+class LinearQkv(Protocol):
+    """Protocol for linear_qkv modules."""
+
+    def forward(self, input: Tensor, /) -> tuple[Tensor, object]:
+        """Applies linear_qkv."""
+        ...
+
+    def backward_dw(self) -> None:
+        """Backward pass for the linear_qkv module."""
+        ...
+
+
+class LinearQkvBuilder(Protocol):
+    """Protocol for building linear_qkv layers."""
+
+    def __call__(
+        self,
+        input_size: int,
+        output_size: int,
+        /,
+        *,
+        config: TransformerConfig,
+        init_method: Callable[[torch.Tensor], None],
+        gather_output: bool,
+        bias: bool,
+        skip_bias_add: bool,
+        is_expert: bool,
+        tp_comm_buffer_name: str,
+        tp_group: torch.distributed.ProcessGroup | None = None,
+    ) -> LinearQkv: ...
+
+
+class LinearLayer(Protocol):
+    """Protocol for linear_q and linear_kv modules."""
+
+    def forward(self, input: Tensor, /) -> Tuple[Tensor, object]:
+        """Applies linear_q/linear_kv."""
+        ...
+
+
+class LinearLayerBuilder(Protocol):
+    """Protocol for building linear_q and linear_kv layers."""
+
+    def __call__(
+        self,
+        input_size: int,
+        output_size: int,
+        /,
+        *,
+        config: TransformerConfig,
+        init_method: Callable[[torch.Tensor], None],
+        gather_output: bool,
+        bias: bool,
+        skip_bias_add: bool,
+        is_expert: bool,
+    ) -> LinearLayer: ...
+
+
+class CoreAttention(Protocol):
+    """Protocol for core_attention modules."""
+
+    def forward(
+        self,
+        query: Tensor,
+        key: Tensor,
+        value: Tensor,
+        attention_mask: Optional[Tensor],
+        /,
+        *,
+        attn_mask_type: AttnMaskType,
+        attention_bias: Optional[Tensor],
+        packed_seq_params: Optional[PackedSeqParams],
+    ) -> Tensor:
+        """Applies dot product attention."""
+        ...
+
+
+class CoreAttentionBuilder(Protocol):
+    """Protocol for building core_attention layers."""
+
+    def __call__(
+        self,
+        *,
+        config: TransformerConfig,
+        layer_number: int,
+        attn_mask_type: AttnMaskType,
+        attention_type: str,
+        cp_comm_type: Optional[str],
+        softmax_scale: Optional[float],
+        pg_collection: Optional[ProcessGroupCollection],
+    ) -> CoreAttention: ...
+
+
 @dataclass
 class SelfAttentionSubmodules:
     """
     Configuration class for specifying the submodules of a self-attention.
     """
 
-    linear_qkv: Union[ModuleSpec, type] = None
-    core_attention: Union[ModuleSpec, type] = None
+    linear_qkv: LinearQkvBuilder
+    core_attention: CoreAttentionBuilder
     linear_proj: Union[ModuleSpec, type] = None
     q_layernorm: Union[ModuleSpec, type] = None
     k_layernorm: Union[ModuleSpec, type] = None
@@ -132,9 +229,9 @@ class CrossAttentionSubmodules:
     Configuration class for specifying the submodules of a cross-attention.
     """
 
-    linear_q: Union[ModuleSpec, type] = None
-    linear_kv: Union[ModuleSpec, type] = None
-    core_attention: Union[ModuleSpec, type] = None
+    linear_q: LinearLayerBuilder
+    linear_kv: LinearLayerBuilder
+    core_attention: CoreAttentionBuilder
     linear_proj: Union[ModuleSpec, type] = None
 
 
@@ -152,8 +249,8 @@ class Attention(MegatronModule, ABC):
         layer_number: int,
         attn_mask_type: AttnMaskType,
         attention_type: str,
-        cp_comm_type: str = None,
-        pg_collection: ProcessGroupCollection = None,
+        cp_comm_type: str | None = None,
+        pg_collection: ProcessGroupCollection | None = None,
     ):
         super().__init__(config=config)
 
@@ -162,6 +259,10 @@ class Attention(MegatronModule, ABC):
 
         self.attn_mask_type = attn_mask_type
         self.attention_type = attention_type
+        self.batch_invariant_mode = config.batch_invariant_mode
+
+        assert self.config.kv_channels is not None
+        assert self.config.num_query_groups is not None
 
         # For normal attention without groups, num_query_groups == num_attention_heads,
         # so these two will be the same
@@ -185,17 +286,38 @@ class Attention(MegatronModule, ABC):
         self.hidden_size_per_attention_head = divide(
             self.query_projection_size, self.config.num_attention_heads
         )
-        self.num_attention_heads_per_partition = divide(self.config.num_attention_heads, world_size)
-        self.num_query_groups_per_partition = divide(self.config.num_query_groups, world_size)
+        if self.config.num_query_groups < world_size:
+            # When num_kv_heads < tp_size, each TP rank (post AG) initially produces
+            # activations for 1 kv_head and (num_q_heads / num_kv_heads) q_heads.
+            # We then pull out the appropriate (num_q_heads / tp_size) q_heads.
+            self.num_query_groups_per_partition = 1
+            self.num_attention_heads_per_partition = divide(
+                self.config.num_attention_heads, self.config.num_query_groups
+            )
+        else:
+            # When num_kv_heads >= tp_size, each TP rank produces activations for
+            # (num_kv_heads / tp_size) kv_heads and (num_q_heads / tp_size) q_heads.
+            self.num_query_groups_per_partition = divide(self.config.num_query_groups, world_size)
+            self.num_attention_heads_per_partition = divide(
+                self.config.num_attention_heads, world_size
+            )
+        self.world_size = world_size
 
         # To support both CUDA Graphs and key value with different hidden size
         self.key_hidden_size = self.hidden_size_per_attention_head
         self.val_hidden_size = self.hidden_size_per_attention_head
 
         # TODO: This is built twice when using MLA, should be refactored.
-        self.core_attention = build_module(
-            submodules.core_attention,
-            config=self.config,
+        if self.config.num_query_groups < world_size:
+            # TE throws an assertion error if num_kv_heads / num_query_groups
+            # is not divisible by TP size.
+            # TODO(rwaleffe/dnarayanan): Clean this up eventually.
+            tmp_config = copy.deepcopy(self.config)
+            tmp_config.num_query_groups = world_size
+        else:
+            tmp_config = self.config
+        self.core_attention = submodules.core_attention(
+            config=tmp_config,
             layer_number=self.layer_number,
             attn_mask_type=self.attn_mask_type,
             attention_type=self.attention_type,
@@ -277,7 +399,7 @@ class Attention(MegatronModule, ABC):
             attention_mask = inputs[3]
             attn_mask_type = inputs[5]
             attn_mask_type = AttnMaskType(attn_mask_type.item())
-            output_ = self.core_attention(
+            output_ = apply_module(self.core_attention)(
                 query,
                 key,
                 value,
@@ -335,7 +457,7 @@ class Attention(MegatronModule, ABC):
         sequence_len_offset: Optional[int] = None,
         *,
         inference_params: Optional[BaseInferenceContext] = None,
-    ) -> Tuple[Tensor, Tensor, Tensor, Tensor, Tensor, Tensor]:
+    ) -> tuple[Tensor, Tensor, Tensor, Tensor, AttnMaskType, Tensor]:
         """
         Saves the generated key and value tensors to the end of the buffers in inference_context.
         Returns the full size keys and values from the provided inference_context, as well as
@@ -503,7 +625,15 @@ class Attention(MegatronModule, ABC):
 
     @abstractmethod
     def get_query_key_value_tensors(
-        self, hidden_states, key_value_states, output_gate, split_qkv=True
+        self,
+        hidden_states: Tensor,
+        key_value_states: Tensor | None,
+        output_gate: bool = False,
+        split_qkv: bool = True,
+    ) -> (
+        tuple[Tensor, Tensor, Tensor, Tensor]
+        | tuple[Tensor, Tensor, Tensor]
+        | tuple[Tensor, list[int]]
     ):
         """
         This method needs to be implemented based on whether the derived class
@@ -521,7 +651,7 @@ class Attention(MegatronModule, ABC):
         rotary_cos: Tensor,
         rotary_sin: Tensor,
         rotary_interleaved: bool = False,
-    ) -> (Tensor, Tensor):
+    ) -> tuple[Tensor, Tensor]:
         """
         The flash decoding kernel will do the following in a single execution:
         1. Compute RoPE embedding with precomputed cos & sin tensors
@@ -556,6 +686,74 @@ class Attention(MegatronModule, ABC):
         )
         return out
 
+    def _flash_attention_3_forward_wrapper(
+        self,
+        q: Tensor,
+        k: Tensor,
+        v: Tensor,
+        max_seqlen_q,
+        max_seqlen_k,
+        cu_seqlens_q,
+        seqlens_k,
+        block_table,
+        softmax_scale,
+    ):
+        """
+        Wrapper for calling the FA3 _flash_attn_forward function.
+        Handles argument conversion for different versions of the _flash_attn_forward API.
+        """
+        candidate_kwargs = {
+            "q": q,
+            "k": k,
+            "v": v,
+            "k_new": None,
+            "v_new": None,
+            "qv": None,
+            "out": None,
+            "out_": None,
+            "cu_seqlens_q": cu_seqlens_q,
+            "cu_seqlens_k": None,
+            "cu_seqlens_k_new": None,
+            "seqused_q": None,
+            "seqused_k": seqlens_k,
+            "max_seqlen_q": max_seqlen_q,
+            "max_seqlen_k": max_seqlen_k,
+            "page_table": block_table,
+            "kv_batch_idx": None,
+            "leftpad_k": None,
+            "rotary_cos": None,
+            "rotary_sin": None,
+            "seqlens_rotary": None,
+            "q_descale": None,
+            "k_descale": None,
+            "v_descale": None,
+            "softmax_scale": softmax_scale,
+            "causal": True,
+            "attention_chunk": 0,
+            "softcap": 0.0,
+            "window_size": (-1, -1),
+            "window_size_left": -1,
+            "window_size_right": -1,
+            "rotary_interleaved": True,
+            "scheduler_metadata": None,
+            "num_splits": 0 if not self.batch_invariant_mode else 1,
+            "pack_gqa": None,
+            "sm_margin": 0,
+        }
+
+        # Parse the expect argument names from the function signature
+        if inspect.isfunction(_flash_attn_forward):
+            sig = inspect.signature(_flash_attn_forward)
+        else:
+            assert isinstance(_flash_attn_forward, torch._library.custom_ops.CustomOpDef)
+            sig = inspect.signature(_flash_attn_forward._init_fn)
+        valid_kwargs = set(sig.parameters.keys())
+        final_kwargs = {k: candidate_kwargs[k] for k in valid_kwargs if k in candidate_kwargs}
+
+        output_total, *unused = _flash_attn_forward(**final_kwargs)
+
+        return output_total
+
     def flash_decode_and_prefill(
         self,
         q: Tensor,
@@ -567,6 +765,7 @@ class Attention(MegatronModule, ABC):
         cu_seqlens_k,
         seqlens_k,
         block_table,
+        is_decode_only,
     ) -> Tensor:
         """Flash attention kernel for mixed decode and prefill samples.
 
@@ -580,6 +779,7 @@ class Attention(MegatronModule, ABC):
             cu_seqlens_k (Tensor): Cumulative key sequence lengths.
             seqlens_k (Tensor): key sequence lengths.
             block_table (Tensor): KV cache block ids for all samples.
+            is_decode_only (bool): True if batch is decode only.
         Return:
             (Tensor) Attention output.
         """
@@ -588,7 +788,7 @@ class Attention(MegatronModule, ABC):
         assert block_table is not None
 
         # Flash attn kernel.
-        if max_seqlen_q > 1:
+        if not is_decode_only:
             q = q.squeeze(1)
             if getattr(self, "softmax_scale", None) is not None:
                 softmax_scale = self.softmax_scale
@@ -597,42 +797,21 @@ class Attention(MegatronModule, ABC):
             if HAVE_FA3:
                 # TODO(ksanthanam): Replace with call to flash_attn_varlen_func once
                 # it accepts block_table
-                output_total, *unused = _flash_attn_forward(
-                    q=q,
-                    k=k,
-                    v=v,
-                    k_new=None,
-                    v_new=None,
-                    qv=None,
-                    out=None,
-                    cu_seqlens_q=cu_seqlens_q,
-                    cu_seqlens_k=None,
-                    cu_seqlens_k_new=None,
-                    seqused_q=None,
-                    seqused_k=seqlens_k,
-                    max_seqlen_q=max_seqlen_q,
-                    max_seqlen_k=max_seqlen_k,
-                    page_table=block_table,
-                    kv_batch_idx=None,
-                    leftpad_k=None,
-                    rotary_cos=None,
-                    rotary_sin=None,
-                    seqlens_rotary=None,
-                    q_descale=None,
-                    k_descale=None,
-                    v_descale=None,
-                    softmax_scale=softmax_scale,
-                    causal=True,
-                    window_size=(-1, -1),
-                    attention_chunk=0,
-                    softcap=0.0,
-                    rotary_interleaved=True,
-                    scheduler_metadata=None,
-                    num_splits=0,
-                    pack_gqa=None,
-                    sm_margin=0,
+                output_total = self._flash_attention_3_forward_wrapper(
+                    q,
+                    k,
+                    v,
+                    max_seqlen_q,
+                    max_seqlen_k,
+                    cu_seqlens_q,
+                    seqlens_k,
+                    block_table,
+                    softmax_scale,
                 )
             else:
+                assert (
+                    self.batch_invariant_mode is False
+                ), "Batch invariant mode is not supported for flash attention 2"
                 output_total = flash_attn_varlen_func(
                     q,
                     k,
@@ -683,10 +862,14 @@ class Attention(MegatronModule, ABC):
                     "cache_seqlens": seqlens_k,
                     "causal": True,
                     "page_table" if HAVE_FA3 else "block_table": block_table,
+                    "num_splits": 0 if not self.batch_invariant_mode else 1,
                 }
                 if HAVE_FA3:
                     output_total = flash_attn3_with_kvcache(**flash_attn_args)
                 else:
+                    assert (
+                        not self.batch_invariant_mode
+                    ), "Batch invariant mode is not supported for flash attention 2"
                     output_total = flash_attn_with_kvcache(**flash_attn_args)
         return output_total
 
@@ -705,7 +888,7 @@ class Attention(MegatronModule, ABC):
         sequence_len_offset: Optional[int] = None,
         *,
         inference_params: Optional[BaseInferenceContext] = None,
-    ) -> Tuple[Tensor, Tensor]:
+    ) -> tuple[Tensor, Tensor]:
         """
         Perform a forward pass through the attention module.
 
@@ -798,25 +981,31 @@ class Attention(MegatronModule, ABC):
         if output_gate:
             assert split_qkv, "output_gate is not supported for unsplit mixed_qkv tensor."
 
-        if self.offload_qkv_linear:
-            hidden_states = fine_grained_offloading_group_start(hidden_states, name="qkv_linear")
-        with get_fine_grained_offloading_context(self.offload_qkv_linear):
+        with off_interface(self.offload_qkv_linear, hidden_states, "qkv_linear") as hidden_states:
             qkv_output = self.get_query_key_value_tensors(
-                hidden_states, key_value_states, output_gate=output_gate, split_qkv=split_qkv
+                hidden_states,
+                key_value_states,
+                split_qkv=split_qkv,
+                output_gate=self.config.attention_output_gate,
             )
         if self.offload_qkv_linear:
-            (qkv_output,) = fine_grained_offloading_group_commit(
+            # `qkv_output` may be a tuple; commit supports tuple/list and will keep structure.
+            qkv_output = off_interface.group_commit(
                 qkv_output, name="qkv_linear", forced_released_tensors=[]
             )
-
         attn_mask_type = self.attn_mask_type
         block_table = None
         gate = None
-        if output_gate and split_qkv:
-            query, key, value, gate = qkv_output
-        elif split_qkv:
-            query, key, value = qkv_output
+        if split_qkv:
+            if self.config.attention_output_gate:
+                query, key, value, gate = qkv_output
+            else:
+                query, key, value = qkv_output
+            mixed_qkv = qkv_split_arg_list = None
         else:
+            assert (
+                not self.config.attention_output_gate
+            ), "attention_output_gate is not supported for unsplit mixed_qkv tensor."
             mixed_qkv, qkv_split_arg_list = qkv_output
         nvtx_range_pop(suffix="qkv")
 
@@ -957,12 +1146,12 @@ class Attention(MegatronModule, ABC):
                 packed_seq_params=packed_seq_params,
             )
         else:
-            if self.offload_core_attention and self.training:
-                query = fine_grained_offloading_group_start(query, name="core_attn")
             if inference_context is None or inference_context.is_static_batching():
                 # Static batching attention kernel.
-                with get_fine_grained_offloading_context(self.offload_core_attention):
-                    core_attn_out = self.core_attention(
+                with off_interface(
+                    self.offload_core_attention and self.training, query, "core_attn"
+                ) as query:
+                    core_attn_out = apply_module(self.core_attention)(
                         query,
                         key,
                         value,
@@ -988,10 +1177,17 @@ class Attention(MegatronModule, ABC):
                     cu_kv_lengths,
                     kv_lengths,
                     block_table,
+                    inference_context.is_decode_only(),
                 )
                 core_attn_out = rearrange(core_attn_out, 's b h d -> s b (h d)')
+
+                # Clear the outputs for padding tokens when using quantization scales
+                # to avoid corrupting amax calculations
+                if is_using_quantization_scales(self.config):
+                    core_attn_out[inference_context.padding_slice] = 0.0
+
             if self.offload_core_attention and self.training:
-                (core_attn_out,) = fine_grained_offloading_group_commit(
+                core_attn_out = off_interface.group_commit(
                     core_attn_out, name="core_attn", forced_released_tensors=[query, key, value]
                 )
 
@@ -1012,15 +1208,12 @@ class Attention(MegatronModule, ABC):
         # =================
         # Output. [sq, b, h]
         # =================
-
         nvtx_range_push(suffix="linear_proj")
-        if self.offload_attn_proj:
-            core_attn_out = fine_grained_offloading_group_start(core_attn_out, name="attn_proj")
-        with get_fine_grained_offloading_context(self.offload_attn_proj):
+        with off_interface(self.offload_attn_proj, core_attn_out, "attn_proj") as core_attn_out:
             output, bias = self.linear_proj(core_attn_out)
         if self.offload_attn_proj:
-            output, bias = fine_grained_offloading_group_commit(
-                output, bias, name="attn_proj", forced_released_tensors=[core_attn_out]
+            output = off_interface.group_commit(
+                output, name="attn_proj", forced_released_tensors=[core_attn_out]
             )
         nvtx_range_pop(suffix="linear_proj")
 
@@ -1059,9 +1252,9 @@ class SelfAttention(Attention):
         config: TransformerConfig,
         submodules: SelfAttentionSubmodules,
         layer_number: int,
-        attn_mask_type=AttnMaskType.padding,
-        cp_comm_type: str = None,
-        pg_collection: ProcessGroupCollection = None,
+        attn_mask_type: AttnMaskType = AttnMaskType.padding,
+        cp_comm_type: str | None = None,
+        pg_collection: ProcessGroupCollection | None = None,
     ):
         super().__init__(
             config=config,
@@ -1076,12 +1269,11 @@ class SelfAttention(Attention):
         self.linear_qkv_out_dim = self.query_projection_size + 2 * self.kv_projection_size
         if self.config.attention_output_gate:
             self.linear_qkv_out_dim += self.config.kv_channels * self.config.num_attention_heads
-        self.linear_qkv = build_module(
-            submodules.linear_qkv,
+        self.linear_qkv = submodules.linear_qkv(
             self.config.hidden_size,
             self.linear_qkv_out_dim,
             config=self.config,
-            init_method=self.config.init_method,
+            init_method=not_none(self.config.init_method),
             gather_output=False,
             bias=self.config.add_bias_linear or self.config.add_qkv_bias,
             skip_bias_add=False,
@@ -1182,22 +1374,51 @@ class SelfAttention(Attention):
             )
 
     def get_query_key_value_tensors(
-        self, hidden_states, key_value_states=None, output_gate=False, split_qkv=True
+        self,
+        hidden_states: Tensor,
+        key_value_states: Tensor | None = None,
+        output_gate: bool = False,
+        split_qkv: bool = True,
+    ) -> (
+        tuple[Tensor, Tensor, Tensor, Tensor]
+        | tuple[Tensor, Tensor, Tensor]
+        | tuple[Tensor, list[int]]
     ):
         """
-        Derives `query`, `key`, `value` tensors from `hidden_states`.
+        Derives `query`, `key` and `value` tensors from `hidden_states`.
         If `output_gate` is True, then also derives `gate` tensor.
         If `split_qkv=False`, then the unsplit mixed_qkv tensor is returned.
         """
         # If no output gate: Attention heads [sq, b, h] --> [sq, b, ng * (np/ng + 2) * hn)]
         # If have output gate: Attention heads [sq, b, h] --> [sq, b, ng * (2 * np/ng + 2) * hn)]
-        mixed_qkv, _ = self.linear_qkv(hidden_states)
+        mixed_qkv, _ = apply_module(self.linear_qkv)(hidden_states)
         num_query_heads_per_group = (
             self.num_attention_heads_per_partition // self.num_query_groups_per_partition
         )
         num_qkv_heads_per_group = num_query_heads_per_group + 2
         if output_gate:
             num_qkv_heads_per_group += num_query_heads_per_group
+
+        assert self.config.num_query_groups is not None
+        if self.config.num_query_groups < self.world_size:
+            # Note that weights are interleaved in the following manner:
+            # q1 q2 k1 v1 | q3 q4 k2 v2 | q5 q6 k3 v3 | ...
+            # When tp_size > num_kv_heads, we split "q1 q2 k1 v1" over multiple
+            # ranks, so a rank does not have a clean partitioning of just the q_heads
+            # it needs. Instead, we perform the following steps:
+            # 1. Assemble the full "q1 q2 k1 v1 | q3 q4 k2 v2 | q5 q6 k3 v3 | ..."
+            #    through an AG.
+            # 2. Pull out the right slice (e.g., "q1 q2 k1 v1" or "q3 q4 k2 v2").
+            # 3. Split q_heads (e.g., q1, q2), k_heads (e.g., k1), v_heads (e.g., v1).
+            # 4. Further index into query to get only the q_heads that this rank is
+            #    responsible for (e.g., q1).
+            # The block of code below performs steps 1 and 2.
+            mixed_qkv = all_gather_last_dim_from_tensor_parallel_region(mixed_qkv)
+            idx = get_tensor_model_parallel_rank() // (
+                self.world_size // self.config.num_query_groups
+            )
+            size = mixed_qkv.size()[-1] // self.config.num_query_groups
+            mixed_qkv = mixed_qkv[:, :, idx * size : (idx + 1) * size]
 
         # If no output gate: [sq, b, hp] --> [sq, b, ng, (np/ng + 2) * hn]
         # If have output gate: [sq, b, hp] --> [sq, b, ng, (2 * np/ng + 2) * hn]
@@ -1246,6 +1467,18 @@ class SelfAttention(Attention):
         # Query [sq, b, ng, np/ng * hn] -> [sq, b, np, hn]
         query = query.reshape(query.size(0), query.size(1), -1, self.hidden_size_per_attention_head)
 
+        if self.config.num_query_groups < self.world_size:
+            # query above corresponds to (num_q_heads / num_kv_heads) q_heads.
+            # Index appropriately into query to get (num_q_heads / tp_size) q_heads.
+            # This is step 4 in the list of steps above.
+            idx = get_tensor_model_parallel_rank() % (
+                self.world_size // self.config.num_query_groups
+            )
+            size = self.num_attention_heads_per_partition // (
+                self.world_size // self.config.num_query_groups
+            )
+            query = query[:, :, idx * size : (idx + 1) * size, :]
+
         if self.q_layernorm is not None:
             query = self.q_layernorm(query)
 
@@ -1262,7 +1495,7 @@ class SelfAttention(Attention):
 
         return query, key, value
 
-    def backward_dw(self) -> NoReturn:
+    def backward_dw(self) -> None:
         """Execute weight update operations"""
         self._backward_qkv_proj()
         self._backward_output_proj()
@@ -1391,9 +1624,9 @@ class CrossAttention(Attention):
         config: TransformerConfig,
         submodules: CrossAttentionSubmodules,
         layer_number: int,
-        attn_mask_type=AttnMaskType.padding,
-        cp_comm_type: str = None,
-        pg_collection: ProcessGroupCollection = None,
+        attn_mask_type: AttnMaskType = AttnMaskType.padding,
+        cp_comm_type: str | None = None,
+        pg_collection: ProcessGroupCollection | None = None,
     ):
         super().__init__(
             config=config,
@@ -1409,24 +1642,22 @@ class CrossAttention(Attention):
             raise ValueError("Group query attention is not currently supported in cross attention.")
         assert self.query_projection_size == self.kv_projection_size
 
-        self.linear_q = build_module(
-            submodules.linear_q,
+        self.linear_q = submodules.linear_q(
             self.config.hidden_size,
             self.query_projection_size,
             config=self.config,
-            init_method=self.config.init_method,
+            init_method=not_none(self.config.init_method),
             gather_output=False,
             bias=self.config.add_bias_linear,
             skip_bias_add=False,
             is_expert=False,
         )
 
-        self.linear_kv = build_module(
-            submodules.linear_kv,
+        self.linear_kv = submodules.linear_kv(
             self.config.hidden_size,
             2 * self.kv_projection_size,
             config=self.config,
-            init_method=self.config.init_method,
+            init_method=not_none(self.config.init_method),
             gather_output=False,
             bias=self.config.add_bias_linear,
             skip_bias_add=False,
@@ -1434,8 +1665,12 @@ class CrossAttention(Attention):
         )
 
     def get_query_key_value_tensors(
-        self, hidden_states, key_value_states, output_gate=False, split_qkv=True
-    ):
+        self,
+        hidden_states: Tensor,
+        key_value_states: Optional[Tensor],
+        output_gate: bool = False,
+        split_qkv: bool = True,
+    ) -> Tuple[Tensor, Tensor, Tensor]:
         """
         Derives `query` tensor from `hidden_states`, and `key`/`value` tensors
         from `key_value_states`.
@@ -1443,8 +1678,11 @@ class CrossAttention(Attention):
         assert not output_gate, "Output gate is not supported in cross attention for now."
 
         assert split_qkv, "split_qkv must be True for CrossAttention"
+        assert not output_gate, "Output gate is not supported in cross attention for now."
+
+        assert key_value_states is not None, "key_value_states cannot be None for CrossAttention"
         # Attention heads [sk, b, h] --> [sk, b, (np * 2 * hn)]
-        mixed_kv, _ = self.linear_kv(key_value_states)
+        mixed_kv, _ = apply_module(self.linear_kv)(key_value_states)
 
         # [sk, b, (np * 2 * hn)] --> [sk, b, np, 2 * hn]
         new_tensor_shape = mixed_kv.size()[:-1] + (
@@ -1457,7 +1695,7 @@ class CrossAttention(Attention):
         (key, value) = tensor_parallel.split_tensor_along_last_dim(mixed_kv, 2)
 
         # Attention head [sq, b, h] --> [sq, b, hp]
-        query, _ = self.linear_q(hidden_states)
+        query, _ = apply_module(self.linear_q)(hidden_states)
 
         # [sq, b, hp] --> [sq, b, np, hn]
         new_tensor_shape = query.size()[:-1] + (

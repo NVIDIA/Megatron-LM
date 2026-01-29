@@ -2,7 +2,7 @@
 
 import torch
 
-from megatron.core import mpu
+from megatron.core import parallel_state
 
 
 def clip_qk(model, log_max_only=False) -> float:
@@ -22,10 +22,15 @@ def clip_qk(model, log_max_only=False) -> float:
         for model_chunk in model:
             for transformer_layer in model_chunk.module.module.decoder.layers:
                 if hasattr(transformer_layer.self_attention, 'clip_qk'):
+                    if (
+                        transformer_layer.self_attention.core_attention.current_max_attn_logits
+                        is None
+                    ):
+                        continue
                     torch.distributed.all_reduce(
                         transformer_layer.self_attention.core_attention.current_max_attn_logits,
                         op=torch.distributed.ReduceOp.MAX,
-                        group=mpu.get_data_parallel_group(with_context_parallel=True),
+                        group=parallel_state.get_data_parallel_group(with_context_parallel=True),
                     )
                     log_max_attention_logit = max(
                         log_max_attention_logit,

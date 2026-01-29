@@ -1,7 +1,6 @@
 # Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
 import copy
-from functools import partial
 from unittest import mock
 
 import einops
@@ -404,6 +403,194 @@ class TestClipQK:
 
 
 @pytest.mark.parametrize("output_gate", [False, True])
+class TestSelfAttention:
+
+    @pytest.fixture(scope='function', autouse=True)
+    def setup_method(self, output_gate):
+        self.output_gate = output_gate
+        Utils.initialize_model_parallel(1, 1)
+        model_parallel_cuda_manual_seed(123)
+
+    def teardown_method(self):
+        Utils.destroy_model_parallel()
+
+    def test_clip_qk_disabled_raises_error(self):
+        """Test that clip_qk raises ValueError when qk_clip is not enabled."""
+        transformer_config = TransformerConfig(
+            num_layers=2,
+            hidden_size=128,
+            num_attention_heads=4,
+            use_cpu_initialization=True,
+            qk_clip=False,
+        )
+        attention = SelfAttention(
+            transformer_config,
+            get_gpt_layer_with_transformer_engine_spec().submodules.self_attention.submodules,
+            layer_number=1,
+        )
+
+        with pytest.raises(ValueError, match="qk_clip option needs to be enabled"):
+            attention.clip_qk()
+
+    def test_clip_qk_none_logits_raises_error(self):
+        """Test that clip_qk raises ValueError when current_max_attn_logits is None."""
+        transformer_config = TransformerConfig(
+            num_layers=2,
+            hidden_size=128,
+            num_attention_heads=4,
+            use_cpu_initialization=True,
+            qk_clip=True,
+            qk_clip_threshold=100.0,
+            qk_clip_alpha=0.5,
+        )
+        attention = SelfAttention(
+            transformer_config,
+            get_gpt_layer_with_transformer_engine_spec().submodules.self_attention.submodules,
+            layer_number=1,
+        )
+
+        with pytest.raises(ValueError, match="current_max_attn_logits is None"):
+            attention.clip_qk()
+
+    def test_clip_qk_below_threshold_no_update(self):
+        """Test that weights are not updated when max logits are below threshold."""
+        transformer_config = TransformerConfig(
+            num_layers=2,
+            hidden_size=128,
+            num_attention_heads=4,
+            use_cpu_initialization=True,
+            qk_clip=True,
+            qk_clip_threshold=100.0,
+            qk_clip_alpha=0.5,
+        )
+        attention = SelfAttention(
+            transformer_config,
+            get_gpt_layer_with_transformer_engine_spec().submodules.self_attention.submodules,
+            layer_number=1,
+        )
+        attention.cuda()
+
+        # Save original weights
+        original_weight = attention.linear_qkv.weight.data.clone()
+
+        # Set current_max_attn_logits below threshold
+        attention.core_attention.current_max_attn_logits = torch.tensor(
+            [50.0, 60.0, 70.0, 80.0], device='cuda'
+        )
+
+        # Call clip_qk
+        attention.clip_qk()
+
+        # Weights should not be updated
+        assert torch.equal(attention.linear_qkv.weight.data, original_weight)
+        # current_max_attn_logits should be reset
+        assert attention.core_attention.current_max_attn_logits is None
+
+    def test_clip_qk_above_threshold_updates_weights(self):
+        """Test that weights are updated when max logits exceed threshold."""
+        transformer_config = TransformerConfig(
+            num_layers=2,
+            hidden_size=128,
+            num_attention_heads=4,
+            use_cpu_initialization=True,
+            qk_clip=True,
+            qk_clip_threshold=100.0,
+            qk_clip_alpha=0.5,
+        )
+        attention = SelfAttention(
+            transformer_config,
+            get_gpt_layer_with_transformer_engine_spec().submodules.self_attention.submodules,
+            layer_number=1,
+        )
+        attention.cuda()
+
+        # Save original weights
+        original_weight = attention.linear_qkv.weight.data.clone()
+
+        # Set current_max_attn_logits above threshold
+        attention.core_attention.current_max_attn_logits = torch.tensor(
+            [150.0, 160.0, 170.0, 180.0], device='cuda'
+        )
+
+        # Call clip_qk
+        attention.clip_qk()
+
+        # Weights should be updated
+        assert not torch.equal(attention.linear_qkv.weight.data, original_weight)
+        # current_max_attn_logits should be reset
+        assert attention.core_attention.current_max_attn_logits is None
+
+    def test_clip_qk_gqa_configuration(self):
+        """Test clip_qk with GQA (Grouped Query Attention) configuration."""
+        transformer_config = TransformerConfig(
+            num_layers=2,
+            hidden_size=128,
+            num_attention_heads=8,
+            num_query_groups=4,  # GQA with 2 heads per group
+            use_cpu_initialization=True,
+            qk_clip=True,
+            qk_clip_threshold=100.0,
+            qk_clip_alpha=0.5,
+        )
+        attention = SelfAttention(
+            transformer_config,
+            get_gpt_layer_with_transformer_engine_spec().submodules.self_attention.submodules,
+            layer_number=1,
+        )
+        attention.cuda()
+
+        # Save original weights
+        original_weight = attention.linear_qkv.weight.data.clone()
+
+        # Set current_max_attn_logits for all heads (8 heads)
+        attention.core_attention.current_max_attn_logits = torch.tensor(
+            [150.0, 160.0, 170.0, 180.0, 190.0, 200.0, 210.0, 220.0], device='cuda'
+        )
+
+        # Call clip_qk
+        attention.clip_qk()
+
+        # Weights should be updated
+        assert not torch.equal(attention.linear_qkv.weight.data, original_weight)
+        # current_max_attn_logits should be reset
+        assert attention.core_attention.current_max_attn_logits is None
+
+    def test_clip_qk_mixed_logits(self):
+        """Test clip_qk with mixed logits (some above, some below threshold)."""
+        transformer_config = TransformerConfig(
+            num_layers=2,
+            hidden_size=128,
+            num_attention_heads=4,
+            use_cpu_initialization=True,
+            qk_clip=True,
+            qk_clip_threshold=100.0,
+            qk_clip_alpha=0.5,
+        )
+        attention = SelfAttention(
+            transformer_config,
+            get_gpt_layer_with_transformer_engine_spec().submodules.self_attention.submodules,
+            layer_number=1,
+        )
+        attention.cuda()
+
+        # Save original weights
+        original_weight = attention.linear_qkv.weight.data.clone()
+
+        # Set mixed current_max_attn_logits (some above, some below threshold)
+        attention.core_attention.current_max_attn_logits = torch.tensor(
+            [80.0, 150.0, 90.0, 200.0], device='cuda'
+        )
+
+        # Call clip_qk
+        attention.clip_qk()
+
+        # Weights should be updated since at least one head exceeds threshold
+        assert not torch.equal(attention.linear_qkv.weight.data, original_weight)
+        # current_max_attn_logits should be reset
+        assert attention.core_attention.current_max_attn_logits is None
+
+
+@pytest.mark.parametrize("output_gate", [False, True])
 @pytest.mark.parametrize("transformer_impl", ["transformer_engine", "native"])
 class TestSelfAttention:
 
@@ -525,7 +712,9 @@ def _test_parallel_attention_correctness(
     micro_batch_size=4,
 ):
     # Model initialization function
-    def initialize_gpt_model(config, pre_process=True, post_process=True, vp_stage=None):
+    def initialize_gpt_model(
+        config, pre_process=True, post_process=True, vp_stage=None, pg_collection=None
+    ):
         gpt_model = GPTModel(
             config=config,
             transformer_layer_spec=transformer_layer_spec,
@@ -534,6 +723,7 @@ def _test_parallel_attention_correctness(
             pre_process=pre_process,
             post_process=post_process,
             vp_stage=vp_stage,
+            pg_collection=pg_collection,
         )
         return gpt_model
 
@@ -561,9 +751,7 @@ def _test_parallel_attention_correctness(
         init_basic_mock_args(mock_args, 1, 1, bf16=True)
         mock_args.context_parallel_size = 1
         mock_args.sequence_parallel = 1
-        gpt_model = unwrap_model(
-            get_model(partial(initialize_gpt_model, config=transformer_config))
-        )
+        gpt_model = unwrap_model(get_model(initialize_gpt_model, config=transformer_config))
 
         # Initialize args and save checkpoint
         init_checkpointing_mock_args(mock_args, ckpt_dir, False)
@@ -603,9 +791,7 @@ def _test_parallel_attention_correctness(
         init_basic_mock_args(mock_args, tp, 1, bf16=True)
         mock_args.context_parallel_size = cp
         mock_args.sequence_parallel = sp
-        gpt_model = unwrap_model(
-            get_model(partial(initialize_gpt_model, config=transformer_config))
-        )
+        gpt_model = unwrap_model(get_model(initialize_gpt_model, config=transformer_config))
         with mock.patch('megatron.training.checkpointing.check_checkpoint_args'):
             with mock.patch('megatron.training.checkpointing.update_num_microbatches'):
                 load_checkpoint(gpt_model, None, None)
@@ -692,6 +878,7 @@ def _test_parallel_attention_correctness(
         Utils.destroy_model_parallel()
 
 
+# TODO(yuzhongw): Add test case for fallback_to_eager_attn
 @pytest.mark.parametrize("apply_rope_fusion", [False, True])
 @pytest.mark.parametrize(
     ("tp", "sp", "cp"),
@@ -704,25 +891,15 @@ def _test_parallel_attention_correctness(
     ],
 )
 @pytest.mark.parametrize("qk_layernorm", [False, True])
-@pytest.mark.parametrize("fallback_to_eager_attn", [False, True])
 @pytest.mark.parametrize("output_gate", [False, True])
 def test_parallel_attention_correctness(
-    tmp_path_dist_ckpt,
-    apply_rope_fusion,
-    tp,
-    sp,
-    cp,
-    qk_layernorm,
-    fallback_to_eager_attn,
-    output_gate,
+    tmp_path_dist_ckpt, apply_rope_fusion, tp, sp, cp, qk_layernorm, output_gate
 ):
     transformer_config = TransformerConfig(
         num_layers=1,
         hidden_size=128,
         num_attention_heads=4,
-        context_parallel_size=1,
-        tensor_model_parallel_size=1,
-        sequence_parallel=False,
+        normalization="RMSNorm",
         bf16=True,
         qk_layernorm=qk_layernorm,
         apply_rope_fusion=apply_rope_fusion,
@@ -731,24 +908,20 @@ def test_parallel_attention_correctness(
         attention_dropout=0.0,
     )
 
-    transformer_layer_spec = get_gpt_layer_with_transformer_engine_spec(
-        fallback_to_eager_attn=fallback_to_eager_attn,
-        normalization="RMSNorm",
-        qk_layernorm=qk_layernorm,
-    )
-    if cp > 1:
-        if qk_layernorm:
-            atol, rtol = 2e-2, 2e-2
-        else:
-            atol, rtol = 5e-3, 5e-3
-    else:
-        if qk_layernorm:
-            atol, rtol = 1e-2, 1e-2
-        else:
-            atol, rtol = 2e-3, 2e-3
+    transformer_layer_spec = get_gpt_layer_with_transformer_engine_spec(qk_layernorm=qk_layernorm)
+    atol, rtol = 1e-2, 1e-2
 
     _test_parallel_attention_correctness(
-        transformer_config, transformer_layer_spec, tmp_path_dist_ckpt, tp, sp, cp
+        transformer_config,
+        transformer_layer_spec,
+        tmp_path_dist_ckpt,
+        atol=atol,
+        rtol=rtol,
+        tp=tp,
+        sp=sp,
+        cp=cp,
+        seed=123,
+        sequence_length=256,
     )
 
 
