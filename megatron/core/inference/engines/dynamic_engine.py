@@ -99,6 +99,10 @@ DEPRECATED_ARGS = [
     "inference_logging_step_interval",
     "pg_collection",
 ]
+from megatron.core.inference.contexts.dynamic_context import HAVE_TORCH_MEMORY_SAVER
+
+if HAVE_TORCH_MEMORY_SAVER:
+    from torch_memory_saver import torch_memory_saver
 
 
 class EngineSuspendedError(Exception):
@@ -322,6 +326,9 @@ class DynamicInferenceEngine(AbstractEngine):
         )
 
         self.capture_stats = capture_stats
+
+        if HAVE_TORCH_MEMORY_SAVER:
+            torch_memory_saver.pause("kv_cache")
 
     @internal_api
     async def start_listening_to_data_parallel_coordinator(

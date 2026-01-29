@@ -286,6 +286,7 @@ def get_inference_config_from_model_and_args(model: MegatronModule, args):
         max_requests=args.inference_dynamic_batching_max_requests,
         max_tokens=args.inference_dynamic_batching_max_tokens,
         unified_memory_level=args.inference_dynamic_batching_unified_memory_level,
+        offload_kv_cache=args.rl_offload_kv_cache_during_training,
         cuda_graph_mixed_prefill_count=args.inference_dynamic_batching_cuda_graph_mixed_prefill_count,  # pylint: disable=line-too-long
         use_cuda_graphs_for_non_decode_steps=not args.decode_only_cuda_graphs,
         persist_cuda_graphs=args.rl_training_cuda_graphs,

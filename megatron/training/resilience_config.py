@@ -22,3 +22,21 @@ class RerunStateMachineConfig:
 
     check_for_spiky_loss: bool = False
     """Check for spiky loss."""
+
+
+@dataclass(kw_only=True)
+class StragglerDetectionConfig:
+    """Configuration settings for detecting and logging GPU stragglers."""
+
+    log_straggler: bool = False
+    """If set, tracks and logs straggler per GPU."""
+
+    straggler_ctrlr_port: int = 65535
+    """Port number to toggle StragglerDetector on/off at runtime"""
+
+    straggler_minmax_count: int = 1
+    """Number of ranks to report with high/low estimated throughput"""
+
+    disable_straggler_on_startup: bool = False
+    """If set, StragglerDetector is disabled on startup."""
+

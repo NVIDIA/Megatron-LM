@@ -102,6 +102,9 @@ class InferenceConfig:
     Eventually, additional levels will be included to control other tensors within the context.
     """
 
+    offload_kv_cache: bool = False
+    """If True, offload KV cache during RL training."""
+
     # =================================
     # CUDA graph config
     # =================================

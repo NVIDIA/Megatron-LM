@@ -48,6 +48,13 @@ try:
 except ImportError:
     HAVE_FLASHINFER = False
 
+try:
+    from torch_memory_saver import torch_memory_saver
+
+    torch_memory_saver.hook_mode = "torch"
+    HAVE_TORCH_MEMORY_SAVER = True
+except ImportError:
+    HAVE_TORCH_MEMORY_SAVER = False
 
 DEPRECATED_ARGS = [
     "params_dtype",
@@ -77,6 +84,7 @@ DEPRECATED_ARGS = [
     "metrics_writer",
     "request_metadata_types",
     "persist_cuda_graphs",
+    "offload_kv_cache",
 ]
 
 
@@ -475,6 +483,12 @@ class DynamicInferenceContext(BaseInferenceContext):
             )
         )
 
+        # Whether to offload the KV cache. Determines where the KV cache is allocated within memory.
+        self.offload_kv_cache = inference_config.offload_kv_cache
+        assert not (
+            self.offload_kv_cache and self.unified_memory_level
+        ), "The KV cache should not be instantiated in unified memory when it is offloaded during training."
+
         self._using_cuda_graph_this_step = False
         # Deal with chunked prefill
         self.chunked_prefill_request_id = -1
@@ -589,18 +603,25 @@ class DynamicInferenceContext(BaseInferenceContext):
                     device=torch.cuda.current_device(),
                 )
             else:
-                self.memory_buffer = torch.empty(
-                    (
-                        2,  # key and value
-                        self.num_attention_layers,
-                        self.block_allocator.total_count,
-                        self.block_size_tokens,
-                        self.num_attention_heads_per_partition,
-                        self.hidden_size_per_attention_head,
-                    ),
-                    dtype=self.params_dtype,
-                    device=torch.cuda.current_device(),
+                ctx = (
+                    torch_memory_saver.region(tag="kv_cache", enable_cpu_backup=True)
+                    if HAVE_TORCH_MEMORY_SAVER and self.offload_kv_cache
+                    else nullcontext()
                 )
+
+                with ctx:
+                    self.memory_buffer = torch.empty(
+                        (
+                            2,  # key and value
+                            self.num_attention_layers,
+                            self.block_allocator.total_count,
+                            self.block_size_tokens,
+                            self.num_attention_heads_per_partition,
+                            self.hidden_size_per_attention_head,
+                        ),
+                        dtype=self.params_dtype,
+                        device=torch.cuda.current_device(),
+                    )
 
         # Optional state tensors for hybrid models
         def allocate_mamba_states():

@@ -260,6 +260,7 @@ def forward_step(data_iterator, model: GPTModel, loss_only: bool = False):
     if packed_seq_params is None:
         packed_seq_params = get_default_packed_seq_params(
             seq_length=tokens.shape[1],
+            max_sequences_per_bin=args.rl_sequence_packing_max_sequences_per_bin,
             device=tokens.device,
         )
 
