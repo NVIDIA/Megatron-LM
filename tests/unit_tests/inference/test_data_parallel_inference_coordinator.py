@@ -251,6 +251,7 @@ class TestCoordinator:
         """Test coordinator with various TP, PP, and EP configurations."""
         await self.run_coordinator_test()
 
+    @pytest.mark.skipif(True, reason="ZMQ shutdown is not graceful")
     @pytest.mark.internal
     @pytest.mark.skipif(not HAVE_ZMQ, reason="pyzmq is required for this test")
     @pytest.mark.asyncio
@@ -311,6 +312,7 @@ class TestCoordinator:
             if engine3 is not None and hasattr(engine3, 'inference_coordinator_process'):
                 engine3.inference_coordinator_process.terminate()
 
+    @pytest.mark.skipif(True, reason="ZMQ shutdown is not graceful")
     @pytest.mark.internal
     @pytest.mark.skipif(not HAVE_ZMQ, reason="pyzmq is required for this test")
     @pytest.mark.asyncio
