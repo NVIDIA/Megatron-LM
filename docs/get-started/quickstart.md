@@ -1,18 +1,22 @@
 # Quick Start
 
-## Installation
+## Quick Installation
 
 Install Megatron Core with pip:
 
-```bash
-# 1. Install Megatron Core with required dependencies
-pip install --no-build-isolation megatron-core[mlm,dev]
+1. Install Megatron Core with required dependencies:
 
-# 2. Clone repository for examples
-git clone https://github.com/NVIDIA/Megatron-LM.git
-cd Megatron-LM
-pip install --no-build-isolation .[mlm,dev]
-```
+    ```bash
+    pip install --no-build-isolation megatron-core[mlm,dev]
+    ```
+
+2. Clone repository for examples:
+
+    ```bash
+    git clone https://github.com/NVIDIA/Megatron-LM.git
+    cd Megatron-LM
+    pip install --no-build-isolation .[mlm,dev]
+    ```
 
 That's it! You're ready to start training.
 

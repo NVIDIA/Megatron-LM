@@ -50,6 +50,9 @@ def is_flaky_failure(concat_allranks_logs: str) -> bool:
 @click.option("--environment", required=True, type=str, help="Environment of the workload")
 @click.option("--platform", required=True, type=str, help="Platform of the workload")
 @click.option("--container-image", required=True, type=str, help="Container image of the workload")
+@click.option(
+    "--n-repeat", required=False, type=int, help="Number of times to repeat the workload", default=1
+)
 @click.option("--data-dir", required=False, type=str, help="Data directory of the workload")
 @click.option("--tag", required=False, type=str, help="Tag of the workload")
 @click.option(
@@ -68,6 +71,7 @@ def main(
     environment,
     platform,
     container_image,
+    n_repeat: int = 1,
     data_dir: Optional[str] = None,
     tag: Optional[str] = None,
     enable_lightweight_mode: Optional[bool] = False,
@@ -92,6 +96,7 @@ def main(
     magic_values["assets_dir"] = "/opt/megatron-lm/assets_dir"
     magic_values["artifacts_dir"] = "/opt/megatron-lm/artifacts_dir"
     magic_values["environment"] = environment
+    magic_values["n_repeat"] = n_repeat
     magic_values["test_case"] = workload.spec["test_case"]
     magic_values["name"] = workload.spec["name"].format(**magic_values)
     workload.spec["script"] = workload.spec["script"].format(**magic_values)
@@ -113,9 +118,10 @@ def main(
             "PYTHONUNBUFFERED": "1",
             "OUTPUT_PATH": os.getcwd(),
             "ENABLE_LIGHTWEIGHT_MODE": str(enable_lightweight_mode).lower(),
-            "N_REPEAT": "1",
+            "N_REPEAT": str(n_repeat),
             "CLUSTER": "dgxh100_dgxc",
             "NCCL_DEBUG": "INFO",
+            "NCCL_DEBUG_FILE": "/opt/megatron-lm/assets_dir/logs/nccl_debug.log",
         },
         packager=run.Packager(),
         volumes=artifacts,

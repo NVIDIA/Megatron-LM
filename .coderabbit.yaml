@@ -1,0 +1,62 @@
+# yaml-language-server: $schema=https://coderabbit.ai/integrations/schema.v2.json
+language: "en-US"
+
+# Instruct the AI to be highly selective - only critical issues
+tone_instructions: |
+  IMPORTANT: Be EXTREMELY restrictive with comments. You should almost never comment.
+
+  ONLY comment if the issue is Critical (🔴) or Major (🟠) severity.
+  NEVER make Minor (🟡), Trivial (🔵), or Info (⚪) severity comments.
+
+  The ONLY acceptable comments are:
+  - Critical bugs: null pointer dereferences, infinite loops, security vulnerabilities, data corruption
+  - Major bugs: logic errors that break functionality, race conditions, resource leaks
+  - Obvious typos in error messages or user-facing strings that would confuse users
+  - Forgotten updates: docstrings that directly contradict the code behavior
+
+  Do NOT comment on (even if you think it's helpful):
+  - Style, formatting, or naming conventions
+  - Refactoring opportunities
+  - Performance suggestions
+  - Missing docstrings or comments
+  - Code organization
+  - Type hints or annotations
+  - Import ordering
+  - Any "minor" improvements
+
+  If you would label a comment as "Minor" severity or lower, DO NOT POST IT.
+  When in doubt, stay silent. Aim for 0-2 comments per PR maximum.
+
+reviews:
+  # Use chill profile - filters out nitpicks automatically
+  profile: "chill"
+
+  # Disable all summary features
+  high_level_summary: false
+  high_level_summary_in_walkthrough: false
+
+  # Disable walkthrough comment entirely
+  collapse_walkthrough: true
+  changed_files_summary: false
+  sequence_diagrams: false
+
+  # Disable status/effort estimates
+  review_status: false
+  commit_status: false
+  estimate_code_review_effort: false
+
+  # Disable auto-suggestions for labels/reviewers
+  suggested_labels: false
+  suggested_reviewers: false
+
+  # Disable related issues/PRs lookup
+  assess_linked_issues: false
+  related_issues: false
+  related_prs: false
+
+  # Auto-review disabled - only review when explicitly requested via @coderabbitai review
+  auto_review:
+    enabled: false
+
+chat:
+  auto_reply: true

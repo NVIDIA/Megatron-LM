@@ -14,12 +14,23 @@ Megatron Core offers a flexible, reusable foundation for building large-scale tr
 * High-performance dataloaders and dataset utilities
 * Model architectures (LLaMA, Qwen, DeepSeek, GPT, Mamba, etc.)
 
+
+```{toctree}
+:maxdepth: 2
+:hidden:
+:caption: About Megatron Core
+
+get-started/overview
+get-started/releasenotes
+```
+
 ```{toctree}
 :maxdepth: 2
 :hidden:
 :caption: Get Started
 
 get-started/quickstart
+get-started/install
 ```
 
 ```{toctree}

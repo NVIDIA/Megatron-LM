@@ -45,7 +45,8 @@ class NCCLCopyService(CopyService):
         # Dedicated stream for local (same-rank) copies to avoid unnecessary
         # serialization with work on the default stream.
         self._copy_stream = torch.cuda.Stream()
-        logger.info(f"NCCLCopyService initialized with {self.world_size} ranks")
+        if self.rank == 0:
+            logger.info(f"NCCLCopyService initialized with {self.world_size} ranks")
 
     def submit_send(self, src_tensor: torch.Tensor, dest_rank: int):
         self.send_ops.append(SendOp(task_id=None, tensor=src_tensor, dest_rank=dest_rank))
@@ -64,12 +65,13 @@ class NCCLCopyService(CopyService):
 
     def run(self):
         total_ops = len(self.send_ops) + len(self.recv_ops)
-        logger.info(
-            "Executing batched communication: %d sends + %d recvs = %d ops",
-            len(self.send_ops),
-            len(self.recv_ops),
-            total_ops,
-        )
+        if self.rank == 0:
+            logger.info(
+                "Executing batched communication: %d sends + %d recvs = %d ops",
+                len(self.send_ops),
+                len(self.recv_ops),
+                total_ops,
+            )
 
         local_sends = [op for op in self.send_ops if op.dest_rank == self.rank]
         remote_sends = [op for op in self.send_ops if op.dest_rank != self.rank]
@@ -121,6 +123,7 @@ class NCCLCopyService(CopyService):
         # Make sure the copy stream is finished
         torch.cuda.current_stream().wait_stream(self._copy_stream)
 
-        logger.info("Batched communication completed")
+        if self.rank == 0:
+            logger.info("Batched communication completed")
         self.send_ops.clear()
         self.recv_ops.clear()

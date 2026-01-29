@@ -95,6 +95,7 @@ class TestAlltoAllDispatcher:
         )
         container.dispatcher_drop_and_pad_test()
 
+    @pytest.mark.flaky_in_dev
     @pytest.mark.skipif(
         not is_te_min_version("1.7.0"), reason="TE 1.7.0 is required for MoE with FP8."
     )

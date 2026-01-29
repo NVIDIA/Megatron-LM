@@ -1,0 +1,40 @@
+{
+    "labels": [],
+    "comment": "Disclaimer: This is AI-generated.",
+    "commentTypes": ["logic", "syntax", "style"],
+    "instructions": "Only comment if the PR description is unchanged from the default template, if a docstring is missing, or if there is a typo.",
+    "ignoreKeywords": "rename\nlinter\nprettier\ngreptile-ignor",
+    "ignorePatterns": "greptile.json\ntesting/**/*.py\n*.md\n*.txt\n*.json",
+    "patternRepositories": ["NVIDIA/Megatron-LM"],
+    "triggerOnUpdates": true,
+    "shouldUpdateDescription": false,
+    "disabledLabels": ["docs"],
+    "includeAuthors": [],
+    "excludeAuthors": ["github-actions"],
+    "strictness": 3,
+    "fixWithAI": false,
+    "includeBranches": ["main"],
+    "statusCheck": false,
+    "skipReview": "AUTOMATIC",
+    "summarySection": {
+      "included": false,
+      "collapsible": false,
+      "defaultOpen": false
+    },
+    "issuesTableSection": {
+      "included": false,
+      "collapsible": false,
+      "defaultOpen": false
+    },
+    "confidenceScoreSection": {
+      "included": false,
+      "collapsible": false,
+      "defaultOpen": false
+    },
+    "sequenceDiagramSection": {
+      "included": false,
+      "collapsible": false,
+      "defaultOpen": false
+    },
+    "statusCommentsEnabled": false
+  }

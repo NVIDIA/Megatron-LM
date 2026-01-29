@@ -249,13 +249,13 @@ def _set_adlr_autoresume(args):
     _ensure_var_is_not_initialized(_GLOBAL_ADLR_AUTORESUME, 'adlr autoresume')
 
     if args.adlr_autoresume:
-        if args.rank == 0:
-            print('enabling autoresume ...', flush=True)
+        from megatron.training.utils import print_rank_0
+        print_rank_0('enabling autoresume ...')
         sys.path.append(os.environ.get('SUBMIT_SCRIPTS', '.'))
         try:
             from userlib.auto_resume import AutoResume
         except ImportError:
-            print('ADLR autoresume is not available, exiting ...')
+            print_rank_0('ADLR autoresume is not available, exiting ...')
             sys.exit()
 
         _GLOBAL_ADLR_AUTORESUME = AutoResume
