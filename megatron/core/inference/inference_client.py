@@ -69,6 +69,7 @@ class InferenceClient:
         ), "please install the messagepack library to use InferenceClient - pip install msgpack"
         self.context = zmq.Context()
         socket = self.context.socket(zmq.DEALER)
+        socket.setsockopt(zmq.LINGER, 0)
         socket.connect(inference_coordinator_address)
 
         self._loop = None

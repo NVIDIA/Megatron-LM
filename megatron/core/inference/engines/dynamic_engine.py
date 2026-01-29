@@ -480,7 +480,7 @@ class DynamicInferenceEngine(AbstractEngine):
             # 1. Create dealer sockets where tp_rank = 0 and pp_rank = 0
             #    These will receive requests from an InferenceCoordinator.
             self.socket_for_receiving_requests = self.zmq_context.socket(zmq.DEALER)
-
+            self.socket_for_receiving_requests.setsockopt(zmq.LINGER, 0)
             self.socket_for_receiving_requests.setsockopt(zmq.IDENTITY, identity.encode('utf-8'))
             self.socket_for_receiving_requests.connect(dp_addr)
 
