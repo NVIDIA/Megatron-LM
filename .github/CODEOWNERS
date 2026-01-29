@@ -19,8 +19,6 @@ megatron/core/optimizer/distrib_optimizer/ @NVIDIA/dist-optimizer
 
 megatron/core/inference/modelopt_support @NVIDIA/quantization-and-inference
 
-megatron/core/datasets/ @NVIDIA/datasets
-
 megatron/core/pipeline_parallel/ @NVIDIA/pipeline-parallelism
 
 megatron/core/transformer/ @NVIDIA/core-adlr @NVIDIA/core-nemo
