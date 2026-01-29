@@ -52,6 +52,7 @@ from .utils import (
     get_mcore_tensor_parallel_partition_dim,
     is_mcore_tensor_model_parallel,
     is_mcore_tensor_parallel_duplicated,
+    using_tensor_parallel,
 )
 
 logger = logging.getLogger(__name__)
@@ -4092,7 +4093,9 @@ def make_fsdp_dtensor(
     orig_param = param
 
     # Handle tensor model parallel specific logic
-    if is_mcore_tensor_model_parallel(param):
+    if not isinstance(param, DTensor) and using_tensor_parallel(
+        dist_index, is_expert_parallel=is_expert_param
+    ):
         # Ensure parameter is not already a DTensor
         assert not isinstance(param, DTensor), (
             "[Megatron-FSDP] Parameter is already a DTensor, yet tensor_model_parallel " "is True."
