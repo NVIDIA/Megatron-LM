@@ -734,6 +734,15 @@ def forward_backward_no_pipelining(
 
     if getattr(config, 'fine_grained_activation_offloading', False):
         off_interface.reset()
+    # Reset all_gather_pipeline bucket status before next validation iteration
+    if forward_only:
+        for model_chunk in [model]:
+            if (
+                model_chunk.ddp_config.overlap_param_gather
+                and model_chunk.ddp_config.use_megatron_fsdp
+            ):
+                model_chunk.synchronize_param_gather()
+
 
     if config.timers is not None:
         config.timers('forward-backward').stop()
