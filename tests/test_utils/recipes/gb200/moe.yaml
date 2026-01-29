@@ -9,7 +9,7 @@ spec:
   nodes: 2
   gpus: 4
   n_repeat: 5
-  platforms: dgx_a100
+  platforms: dgx_gb200
   script_setup: |
     unset https_proxy
     echo "machine gitlab-master.nvidia.com login okoenig password $RO_API_TOKEN" | tee -a /root/.netrc
@@ -65,47 +65,37 @@ products:
     products:
       - environment: [dev]
         scope: [nightly]
-        platforms: [dgx_a100, dgx_gb200]
-      - environment: [lts]
-        scope: [nightly]
+        platforms: [dgx_gb200]
   - test_case: [gpt3_mcore_tp2_cp2_pp2_ep2_te_4experts2parallel]
     products:
       - environment: [dev]
         scope: [nightly]
-        platforms: [dgx_a100, dgx_gb200]
+        platforms: [dgx_gb200]
   - test_case: [gpt3_mcore_tp2_pp2_ep2_etp2_te_4experts2parallel]
     products:
       - environment: [dev]
         scope: [nightly]
-        platforms: [dgx_a100, dgx_gb200]
-      - environment: [lts]
-        scope: [nightly]
+        platforms: [dgx_gb200]
   - test_case: [gpt3_mcore_tp2_pp2_ep2_etp2_te_4experts2parallel_dp_last]
     products:
       - environment: [dev]
         scope: [nightly]
-        platforms: [dgx_a100, dgx_gb200]
-      - environment: [lts]
-        scope: [nightly]
+        platforms: [dgx_gb200]
   - test_case: [gpt3_mcore_tp2_cp2_pp2_ep2_te_4experts2parallel_dp_last]
     products:
       - environment: [dev]
         scope: [nightly]
-        platforms: [dgx_a100, dgx_gb200]
+        platforms: [dgx_gb200]
   - test_case: [gpt3_mcore_cp2_pp2_ep2_te_4experts2parallel_nondeterministic]
     products:
       - environment: [dev]
         scope: [nightly]
-        platforms: [dgx_a100, dgx_gb200]
-      - environment: [lts]
-        scope: [nightly]
+        platforms: [dgx_gb200]
   - test_case: [gpt3_mcore_cp2_pp2_ep2_te_4experts2parallel_nondeterministic_dp_last]
     products:
       - environment: [dev]
         scope: [nightly]
-        platforms: [dgx_a100, dgx_gb200]
-      - environment: [lts]
-        scope: [nightly]
+        platforms: [dgx_gb200]
   # - test_case: [gpt3_mcore_tp2_pp2_resume_torch_dist_te_2experts]
   #   products: # non-determinism: #478
   #     - environment: [dev, lts]
@@ -152,13 +142,6 @@ products:
       - environment: [dev]
         scope: [mr]
         platforms: [dgx_gb200]
-  - test_case: [gpt3_mcore_te_tp2_pp1_te_8experts_etp1_ep4]
-    products:
-      # - environment: [dev]
-      #   scope: [mr]
-      #   platforms: [dgx_gb200] # hang: #513
-      - environment: [lts]
-        scope: [nightly]
   - test_case: [gpt3_mcore_te_tp2_pp1_te_a2a_ovlp_8experts_etp1_ep4]
     products:
       - environment: [dev]
@@ -184,8 +167,6 @@ products:
       - environment: [dev]
         scope: [mr]
         platforms: [dgx_gb200]
-      - environment: [lts]
-        scope: [nightly]
   - test_case: [gpt3_moe_mcore_te_ep8_resume_torch_dist_dist_optimizer]
     products:
       - environment: [dev]
