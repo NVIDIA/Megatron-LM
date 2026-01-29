@@ -7,10 +7,7 @@ from types import SimpleNamespace
 import pytest
 import torch
 
-from megatron.core.distributed import (
-    DistributedDataParallel,
-    DistributedDataParallelConfig,
-)
+from megatron.core.distributed import DistributedDataParallel, DistributedDataParallelConfig
 from megatron.core.enums import ModelType
 from megatron.core.models.common.language_module.language_module import LanguageModule
 from megatron.core.models.gpt.gpt_layer_specs import get_gpt_layer_with_transformer_engine_spec
@@ -425,9 +422,20 @@ class TestRLUtils:
                 exp_t = torch.tensor(exp, dtype=torch.float32, device=got_t.device)
                 torch.testing.assert_close(got_t, exp_t, rtol=0, atol=0)
 
-    def test_grad_buffer_offload(self):
+    @pytest.mark.parametrize(
+        "initialize_model_parallel",
+        [
+            pytest.param((tp, pp), id=f"tp{tp}-pp{pp}")
+            for tp, pp in itertools.product([1, 2], [1, 2])
+            if tp * pp <= Utils.world_size
+        ],
+        indirect=["initialize_model_parallel"],
+    )
+    def test_grad_buffer_offload(self, initialize_model_parallel):
         """Test that grad buffer offload/onload correctly frees and restores GPU memory."""
-        Utils.initialize_model_parallel()
+        world_size, dp, tp, pp = initialize_model_parallel
+        self.create_test_args(tensor_model_parallel_size=tp, pipeline_model_parallel_size=pp)
+
         model_parallel_cuda_manual_seed(123)
 
         # Create a realistic GPTModel as used in RL training
@@ -470,15 +478,23 @@ class TestRLUtils:
 
         # Verify storage is restored
         restored_sizes = [buf.grad_data.storage().size() for buf in all_buffers]
-        assert initial_sizes == restored_sizes, (
-            f"Expected restored sizes {restored_sizes} to match initial {initial_sizes}"
-        )
+        assert (
+            initial_sizes == restored_sizes
+        ), f"Expected restored sizes {restored_sizes} to match initial {initial_sizes}"
 
-        Utils.destroy_model_parallel()
-
-    def test_optimizer_offload(self):
+    @pytest.mark.parametrize(
+        "initialize_model_parallel",
+        [
+            pytest.param((tp, pp), id=f"tp{tp}-pp{pp}")
+            for tp, pp in itertools.product([1, 2], [1, 2])
+            if tp * pp <= Utils.world_size
+        ],
+        indirect=["initialize_model_parallel"],
+    )
+    def test_optimizer_offload(self, initialize_model_parallel):
         """Test that optimizer offload_to_cpu/restore_from_cpu correctly moves state to/from CPU."""
-        Utils.initialize_model_parallel()
+        world_size, dp, tp, pp = initialize_model_parallel
+        self.create_test_args(tensor_model_parallel_size=tp, pipeline_model_parallel_size=pp)
         model_parallel_cuda_manual_seed(123)
 
         # Create a realistic GPTModel as used in RL training
@@ -576,5 +592,3 @@ class TestRLUtils:
             f"Expected GPU memory to increase after restore. "
             f"After offload: {memory_after_offload}, After restore: {memory_after_restore}"
         )
-
-        Utils.destroy_model_parallel()
