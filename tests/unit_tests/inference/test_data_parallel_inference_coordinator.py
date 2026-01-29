@@ -259,6 +259,7 @@ class TestCoordinator:
         engine1 = DummyEngine()
         engine2 = None
         engine3 = None
+        third_addr = None
 
         # Launch first coordinator - binds to DEFAULT_PORT
         first_addr = await engine1.start_listening_to_data_parallel_coordinator(
@@ -305,11 +306,31 @@ class TestCoordinator:
             ), f"Expected different port due to conflict, but got same: {third_port}"
 
         finally:
-            # Clean up coordinator processes
-            if hasattr(engine1, 'inference_coordinator_process'):
-                engine1.inference_coordinator_process.terminate()
-            if engine3 is not None and hasattr(engine3, 'inference_coordinator_process'):
-                engine3.inference_coordinator_process.terminate()
+            # Clean up engine3's coordinator
+            if engine3 is not None and third_addr is not None:
+                client3 = InferenceClient(third_addr)
+                await client3.start()
+                await asyncio.wait_for(client3.stop_engines(), timeout=10.0)
+                client3.stop()
+                try:
+                    await asyncio.wait_for(engine3.engine_loop_task, timeout=30.0)
+                except asyncio.TimeoutError:
+                    engine3.engine_loop_task.cancel()
+
+            # Rebuild engine and reconnect to engine1's coordinator
+            first_port = int(first_addr.rsplit(":", 1)[-1])
+            engine1 = DummyEngine()
+            await engine1.start_listening_to_data_parallel_coordinator(
+                inference_coordinator_port=first_port, launch_inference_coordinator=False
+            )
+            client1 = InferenceClient(first_addr)
+            await client1.start()
+            await asyncio.wait_for(client1.stop_engines(), timeout=10.0)
+            client1.stop()
+            try:
+                await asyncio.wait_for(engine1.engine_loop_task, timeout=30.0)
+            except asyncio.TimeoutError:
+                engine1.engine_loop_task.cancel()
 
     @pytest.mark.internal
     @pytest.mark.skipif(not HAVE_ZMQ, reason="pyzmq is required for this test")
