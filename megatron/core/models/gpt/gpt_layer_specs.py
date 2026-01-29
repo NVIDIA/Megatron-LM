@@ -37,6 +37,7 @@ from megatron.core.transformer.transformer_layer import (
     TransformerLayerSubmodules,
     get_transformer_layer_offset,
 )
+from megatron.core.typed_torch import copy_signature
 from megatron.core.utils import is_te_min_version
 
 try:
@@ -163,6 +164,7 @@ def get_gpt_layer_with_inference_submodules(
 
 
 @functools.wraps(get_gpt_layer_with_inference_submodules)
+@copy_signature(get_gpt_layer_with_inference_submodules)
 def get_gpt_layer_with_inference_spec(*args, **kwargs) -> ModuleSpec:
     """Use this spec to use inference optimized linear layers.
 
@@ -303,6 +305,7 @@ def get_gpt_layer_with_transformer_engine_submodules(
 
 
 @functools.wraps(get_gpt_layer_with_transformer_engine_submodules)
+@copy_signature(get_gpt_layer_with_transformer_engine_submodules)
 def get_gpt_layer_with_transformer_engine_spec(*args, **kwargs) -> ModuleSpec:
     """Use this spec to use lower-level Transformer Engine modules (required for fp8 training).
 
@@ -428,6 +431,7 @@ def get_gpt_layer_local_submodules(
 
 
 @functools.wraps(get_gpt_layer_local_submodules)
+@copy_signature(get_gpt_layer_local_submodules)
 def get_gpt_layer_local_spec(*args, **kwargs) -> ModuleSpec:
     """Use this spec for an implementation using only modules in Megatron-Core.
 
