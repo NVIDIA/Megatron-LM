@@ -1359,6 +1359,9 @@ def validate_args(args, defaults={}):
     
     if args.multi_latent_attention:
         assert not args.group_query_attention, "Group query attention is mutually exclusive with multi latent attention."
+    else:
+        if getattr(args, 'qkv_down_proj_fusion', False):
+            raise AssertionError("--qkv-down-proj-fusion requires --multi-latent-attention")
 
     # MoE latent projections
     if args.moe_latent_size is not None:
@@ -2403,6 +2406,13 @@ def _add_training_args(parser):
                        help='Disable rope fusion, the fusion is available '
                        'only when using megatron-core.',
                        dest='apply_rope_fusion')
+    group.add_argument(
+        '--qkv-down-proj-fusion',
+        action='store_true',
+        default=False,
+        help='[EXPERIMENTAL] Fuse MLA q/kv down projections into a single linear. '
+        'Requires --multi-latent-attention.',
+    )
     group.add_argument('--rope-type', type=str, default=None,
                       choices=['rope', 'yarn'],
                       help='Type of rope to use. Note that MLA takes yarn by default, '

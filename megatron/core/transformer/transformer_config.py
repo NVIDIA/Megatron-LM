@@ -2016,6 +2016,13 @@ class MLATransformerConfig(TransformerConfig):
        This is only for the dynamic inference backend and requires that 
        Flash MLA is installed."""
 
+    qkv_down_proj_fusion: bool = False
+    """If True, fuse MLA q/kv down projections into a single linear module.
+
+    The implementation keeps backward compatibility by materializing
+    legacy keys in the sharded state dict.
+    """
+
     def __post_init__(self):
         super().__post_init__()
         if self.multi_latent_attention and self.apply_rope_fusion and self.rope_type != "yarn":

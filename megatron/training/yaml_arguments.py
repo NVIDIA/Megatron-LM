@@ -435,6 +435,7 @@ def core_transformer_config_from_yaml(args, transfomer_key = "language_model"):
     
     # Return Transformer config.
     if getattr(args, "multi_latent_attention", False):
+        kw_args['qkv_down_proj_fusion'] = getattr(args, 'qkv_down_proj_fusion', False)
         return MLATransformerConfig(**kw_args)
     else:
         return TransformerConfig(**kw_args)

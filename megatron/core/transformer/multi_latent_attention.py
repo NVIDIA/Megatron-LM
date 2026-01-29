@@ -2,7 +2,6 @@
 
 
 import math
-import os
 from dataclasses import dataclass
 from typing import NoReturn, Optional, Union
 
@@ -49,8 +48,6 @@ from megatron.core.utils import (
 )
 
 
-# NOTE: Experimental toggle. Expected to become a config option.
-FUSE_QKV_DOWN_PROJ = os.environ.get("FUSE_QKV_DOWN_PROJ", "0") == "1"
 
 try:
     from megatron.core.fusions.fused_mla_yarn_rope_apply import (
@@ -435,7 +432,7 @@ class MLASelfAttention(MultiLatentAttention):
             else:
                 raise ValueError(f"Unsupported linear_q_down_proj: {submodules.linear_q_down_proj}")
 
-            if not FUSE_QKV_DOWN_PROJ:
+            if not self.config.qkv_down_proj_fusion:
                 self.linear_q_down_proj = build_module(
                     submodules.linear_q_down_proj,
                     self.config.hidden_size,
@@ -482,7 +479,7 @@ class MLASelfAttention(MultiLatentAttention):
         else:
             raise ValueError(f"Unsupported linear_kv_down_proj: {submodules.linear_kv_down_proj}")
 
-        if not FUSE_QKV_DOWN_PROJ:
+        if not self.config.qkv_down_proj_fusion:
             self.linear_kv_down_proj = build_module(
                 submodules.linear_kv_down_proj,
                 self.config.hidden_size,
@@ -558,13 +555,13 @@ class MLASelfAttention(MultiLatentAttention):
     def sharded_state_dict(self, prefix: str = "", sharded_offsets: tuple = (), metadata=None):
         """Return a sharded state dict compatible with pre-fusion checkpoints.
 
-        When `FUSE_QKV_DOWN_PROJ` is enabled, this module owns a single
+        When `config.qkv_down_proj_fusion` is enabled, this module owns a single
         `linear_qkv_down_proj` instead of separate `linear_q_down_proj` and
         `linear_kv_down_proj`. To keep dist-checkpoint compatibility with older
         layouts, we materialize legacy keys and replicate any TE `_extra_state`
         blobs under the legacy module names.
         """
-        if not FUSE_QKV_DOWN_PROJ:
+        if not self.config.qkv_down_proj_fusion:
             return super().sharded_state_dict(prefix, sharded_offsets, metadata)
 
         sharded_state_dict = super().sharded_state_dict(prefix, sharded_offsets, metadata)
@@ -655,7 +652,7 @@ class MLASelfAttention(MultiLatentAttention):
 
     def _load_from_state_dict(self, state_dict, prefix, *args, **kwargs):
         """Load state dict with automatic unfused->fused conversion."""
-        if not FUSE_QKV_DOWN_PROJ:
+        if not self.config.qkv_down_proj_fusion:
             return super()._load_from_state_dict(state_dict, prefix, *args, **kwargs)
 
         q_key = f"{prefix}linear_q_down_proj.weight"
@@ -745,7 +742,7 @@ class MLASelfAttention(MultiLatentAttention):
         # =========================================
         # QKV down projection and layernorm
         # =========================================
-        if not FUSE_QKV_DOWN_PROJ:
+        if not self.config.qkv_down_proj_fusion:
             if self.config.q_lora_rank is not None:
                 # if linear_q_down_proj is ColumnParallelLinear:
                 #     q_compressed: [s, b, q_lora_rank / TP]
@@ -771,7 +768,7 @@ class MLASelfAttention(MultiLatentAttention):
             #     kv_combined: [s / TP, b, (kv_lora_rank + qk_pos_emb_head_dim)]
             kv_combined, _ = self.linear_kv_down_proj(hidden_states)
 
-        if FUSE_QKV_DOWN_PROJ:
+        if self.config.qkv_down_proj_fusion:
             qkv, _ = self.linear_qkv_down_proj(hidden_states)
             q_compressed, kv_combined = torch.split(
                 qkv,

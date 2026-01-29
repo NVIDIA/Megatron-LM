@@ -169,14 +169,6 @@ def get_gpt_layer_with_inference_spec(
                 },
             ),
         )
-
-
-import os
-# NOTE: These toggles are intentionally environment-driven for experimentation.
-# They are expected to be replaced by explicit config options.
-FUSE_INPUT_LAYERNORM = os.environ.get("FUSE_INPUT_LAYERNORM", "1") == "1"
-FUSE_QKV_DOWN_PROJ = os.environ.get("FUSE_QKV_DOWN_PROJ", "0") == "1"
-
 def get_gpt_layer_with_transformer_engine_spec(
     num_experts: Optional[int] = None,
     moe_grouped_gemm: Optional[bool] = False,
@@ -190,6 +182,8 @@ def get_gpt_layer_with_transformer_engine_spec(
     use_te_activation_func: bool = False,
     use_kitchen_attention: bool = False,
     kitchen_attention_backend: str = "sdpa",
+    fuse_mla_input_layernorm: bool = True,
+    qkv_down_proj_fusion: bool = False,
 ) -> ModuleSpec:
     """Use this spec to use lower-level Transformer Engine modules (required for fp8 training).
 
@@ -205,7 +199,7 @@ def get_gpt_layer_with_transformer_engine_spec(
         qk_l2_norm (bool, optional): To use l2 norm for queries/keys. Defaults to False.
         use_te_op_fuser (bool, optional): Use Transformer Engine's operation-based API, which may
                                           enable certain operation fusions. Defaults to False.
-
+        fuse_mla_input_layernorm (bool, optional): Fuse MLA input layernorm with QKV down projection. 
     Returns:
         ModuleSpec: Module specification with TE modules
 
@@ -243,8 +237,8 @@ def get_gpt_layer_with_transformer_engine_spec(
         assert qk_l2_norm is False, "qk_l2_norm is not supported with MLA."
 
         fuse_input_layernorm = (
-            FUSE_INPUT_LAYERNORM
-            and FUSE_QKV_DOWN_PROJ
+            fuse_mla_input_layernorm
+            and qkv_down_proj_fusion
             and backend.column_parallel_layer_norm_linear() is not None
         )
 
@@ -577,6 +571,7 @@ def get_gpt_decoder_layer_specs(
             use_te_activation_func=config.use_te_activation_func,
             use_kitchen_attention=config.use_kitchen_attention,
             kitchen_attention_backend=config.kitchen_attention_backend,
+            qkv_down_proj_fusion=getattr(config, 'qkv_down_proj_fusion', False),
         )
         moe_layer_spec = get_gpt_layer_with_transformer_engine_spec(
             num_experts=config.num_moe_experts,
@@ -589,6 +584,7 @@ def get_gpt_decoder_layer_specs(
             use_te_activation_func=config.use_te_activation_func,
             use_kitchen_attention=config.use_kitchen_attention,
             kitchen_attention_backend=config.kitchen_attention_backend,
+            qkv_down_proj_fusion=getattr(config, 'qkv_down_proj_fusion', False),
         )
     else:
         layer_norm_impl = LNImpl
