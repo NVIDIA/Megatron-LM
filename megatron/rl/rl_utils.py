@@ -84,6 +84,9 @@ from megatron.core.transformer.custom_layers.batch_invariant_kernels import (
     is_batch_invariant_mode_enabled,
 )
 
+from megatron.core.inference.contexts.dynamic_context import HAVE_TORCH_MEMORY_SAVER
+if HAVE_TORCH_MEMORY_SAVER:
+    from torch_memory_saver import torch_memory_saver
 
 logger = logging.getLogger(__name__)
 
@@ -916,9 +919,10 @@ def prepare_trajectories(
             env_id = rollout.env_id
             env_id_counts[env_id] += 1
 
-    logger.info(f"[{dist.get_rank()}] Rollout counts:")
-    for env_id, count in env_id_counts.items():
-        logger.info(f"[{dist.get_rank()}] \t{env_id}: {count}")
+    if torch.distributed.is_initialized():
+        logger.info(f"[{dist.get_rank()}] Rollout counts:")
+        for env_id, count in env_id_counts.items():
+            logger.info(f"[{dist.get_rank()}] \t{env_id}: {count}")
 
     generation_masks = torch.tensor(generation_masks, dtype=torch.bool, device='cpu')
     trajs = torch.tensor(trajs, device='cpu')
@@ -1616,9 +1620,9 @@ def megatron_rl_inference_mode(
 
         with nvtx_range("onload-kv-cache-before-inference"):
             if offload_kv_cache_during_training:
-                assert (
-                    reset_cuda_graphs
-                ), "reset_cuda_graphs must be True when offloading kv cache during training"
+                # Restore the KV cache by re-binding physical pages to a consistent virtual address
+                torch_memory_saver.resume("kv_cache")
+
                 logger.debug(
                     f"[{dist.get_rank()}] Restoring kv cache ({inference_interface._inference_engine.context.memory_buffer.numel() / 1024**3:.2f} GB) to GPU"
                 )
@@ -1653,7 +1657,8 @@ def megatron_rl_inference_mode(
                 logger.debug(
                     f"[{dist.get_rank()}] Offloading kv cache ({kv_cache.numel() * kv_cache.element_size() / 1024**3:.2f} GB) to CPU"
                 )
-                inference_interface._inference_engine.context.memory_buffer = kv_cache.cpu()
+                torch_memory_saver.pause("kv_cache")
+
             elif remove_kv_cache_during_training:
                 inference_interface._inference_engine.context.memory_buffer = None
 
