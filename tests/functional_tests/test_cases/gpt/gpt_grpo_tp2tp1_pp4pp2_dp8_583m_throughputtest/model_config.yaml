@@ -70,7 +70,7 @@ MODEL_ARGS:
   --dist-ckpt-strictness: log_unexpected
   --perform-rl-step: true
   --train-samples: 48828125
-  --exit-interval: 50
+  --exit-interval: 30
   --tensorboard-dir: ${TENSORBOARD_PATH}
   --save-interval: 1000000
   --eval-interval: 1000000
@@ -80,5 +80,11 @@ MODEL_ARGS:
   --rl-inference-pipeline-model-parallel-size: 2
   --refit-method: gloo
 METRICS:
+  - "iteration-time"
+  - "lm loss"
+  - "num-zeros"
   - "mem-allocated-bytes"
   - "mem-max-allocated-bytes"
+
+THROUGHPUT_TEST_PARAMS:
+  --start_step: 1

@@ -108,6 +108,12 @@ class DataParallelInferenceCoordinator:
             assert identity not in self.identities_of_data_parallel_ranks
             self.identities_of_data_parallel_ranks.append(identity)
         logging.info("Inference Coordinator: Connected with data parallel ranks...")
+
+        # In deterministic mode, sort identities for consistent scheduling order.
+        if torch.are_deterministic_algorithms_enabled():
+            self.identities_of_data_parallel_ranks = deque(
+                sorted(self.identities_of_data_parallel_ranks)
+            )
         self.data_parallel_rank_iterator = cycle(self.identities_of_data_parallel_ranks)
         self.data_parallel_pause_acks = set()
         self.data_parallel_stop_acks = set()
