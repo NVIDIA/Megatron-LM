@@ -229,13 +229,12 @@ class TestCoordinator:
                 client.stop()
             if stop_engines:
                 try:
-                    await asyncio.wait_for(engine.engine_loop_task, timeout=10.0)
+                    await asyncio.wait_for(engine.engine_loop_task, timeout=30.0)
                 except asyncio.TimeoutError:
                     engine.engine_loop_task.cancel()
 
         return dp_addr
 
-    @pytest.mark.skipif(True, reason="ZMQ shutdown is not graceful")
     @pytest.mark.internal
     @pytest.mark.skipif(not HAVE_ZMQ, reason="pyzmq is required for this test")
     @pytest.mark.asyncio
@@ -252,7 +251,6 @@ class TestCoordinator:
         """Test coordinator with various TP, PP, and EP configurations."""
         await self.run_coordinator_test()
 
-    @pytest.mark.skipif(True, reason="ZMQ shutdown is not graceful")
     @pytest.mark.internal
     @pytest.mark.skipif(not HAVE_ZMQ, reason="pyzmq is required for this test")
     @pytest.mark.asyncio
@@ -313,7 +311,6 @@ class TestCoordinator:
             if engine3 is not None and hasattr(engine3, 'inference_coordinator_process'):
                 engine3.inference_coordinator_process.terminate()
 
-    @pytest.mark.skipif(True, reason="ZMQ shutdown is not graceful")
     @pytest.mark.internal
     @pytest.mark.skipif(not HAVE_ZMQ, reason="pyzmq is required for this test")
     @pytest.mark.asyncio
@@ -368,7 +365,7 @@ class TestCoordinator:
                 if torch.distributed.get_rank() == 0:
                     await asyncio.wait_for(client.stop_engines(), timeout=5.0)
                     client.stop()
-                await asyncio.wait_for(engine.engine_loop_task, timeout=5.0)
+                await asyncio.wait_for(engine.engine_loop_task, timeout=30.0)
             except asyncio.TimeoutError:
                 engine.engine_loop_task.cancel()
         assert success, "Pause/resume test failed."
@@ -407,7 +404,7 @@ class TestCoordinator:
                 await asyncio.wait_for(client.stop_engines(), timeout=10.0)
                 client.stop()
             try:
-                await asyncio.wait_for(engine.engine_loop_task, timeout=10.0)
+                await asyncio.wait_for(engine.engine_loop_task, timeout=30.0)
             except asyncio.TimeoutError:
                 engine.engine_loop_task.cancel()
 
