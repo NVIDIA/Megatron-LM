@@ -35,5 +35,6 @@
       "included": false,
       "collapsible": false,
       "defaultOpen": false
-    }
+    },
+    "statusCommentsEnabled": false
   }

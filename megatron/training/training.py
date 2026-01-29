@@ -2766,8 +2766,15 @@ def train(
 
         if getattr(args, 'perform_rl_step', False):
             with torch.no_grad():
-                train_data_iterator = rl_utils.setup_grpo_data_iterator(
-                    model, inference_model, optimizer, iteration, ref_state_dict, buffered_rollouts
+                train_data_iterator = rl_utils.get_grpo_data_iterator(
+                    model, inference_model, optimizer, iteration, ref_state_dict,
+                    grpo_iterations=args.grpo_iterations,
+                    grpo_prompts_per_step=args.grpo_prompts_per_step,
+                    grpo_group_size=args.grpo_group_size,
+                    global_batch_size=args.global_batch_size,
+                    sequence_packing=args.rl_use_sequence_packing,
+                    buffered_rollouts=buffered_rollouts,
+                    is_correction=args.rl_inference_logprobs_is_correction,
                 )
                 # Buffered rollouts are used as a state container for setups when
                 # we use previously-generated data for an update.
@@ -2846,7 +2853,10 @@ def train(
         if getattr(args, 'perform_rl_step', False) and args.rl_use_sequence_packing:
             iteration_sequences = rl_utils.get_iteration_sequence_count(args)
             # Track bins separately for packed mode
-            rl_utils.update_sequence_packing_metrics(args)
+            bin_count = (
+                mpu.get_data_parallel_world_size() * args.micro_batch_size * get_num_microbatches()
+            )
+            args.consumed_train_bins += bin_count
         else:
             batch_size = (
                 mpu.get_data_parallel_world_size() * args.micro_batch_size * get_num_microbatches()
