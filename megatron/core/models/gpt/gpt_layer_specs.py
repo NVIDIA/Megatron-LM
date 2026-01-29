@@ -169,6 +169,8 @@ def get_gpt_layer_with_inference_spec(
                 },
             ),
         )
+
+
 def get_gpt_layer_with_transformer_engine_spec(
     num_experts: Optional[int] = None,
     moe_grouped_gemm: Optional[bool] = False,
