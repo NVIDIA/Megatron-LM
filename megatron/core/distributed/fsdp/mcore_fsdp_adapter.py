@@ -181,12 +181,7 @@ class FullyShardedDataParallel(_BaseDataParallel):
 
             if not is_expert_param(name, param) and tp_size > 1:
                 m_name, direct_module = param_to_direct_module[param]
-                if isinstance(direct_module, (TELinear,)):
-                    parallel_mode = getattr(direct_module, "parallel_mode", None)
-                    if parallel_mode is None:
-                        setattr(param, "_mcore_tp", True)
-                        setattr(param, "_tp_duplicated", True)
-                elif is_router_param(name, param):
+                if is_router_param(name, param):
                     setattr(param, "_mcore_tp", True)
                     setattr(param, "_tp_duplicated", True)
 
