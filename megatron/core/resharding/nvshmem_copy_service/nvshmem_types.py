@@ -4,10 +4,7 @@ from dataclasses import dataclass, field
 from typing import Any, List
 
 # Constants
-# Reduced from 256MB to 64MB to test NVSHMEM symmetric memory allocation with 128 PEs
-# Total symmetric memory per PE: 4 buffers × 64MB = 256MB
-# Total across 128 PEs: 128 × 256MB = 32GB (vs 128GB with 256MB buffers)
-MAX_SEGMENT_SIZE = 64 * 1024 * 1024  # 64MB (reduced for debugging)
+MAX_SEGMENT_SIZE = 256 * 1024 * 1024  # 256MB
 MAX_TASKS_PER_BATCH = 10000
 
 

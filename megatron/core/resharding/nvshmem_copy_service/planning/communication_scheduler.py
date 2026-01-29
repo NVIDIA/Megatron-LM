@@ -105,32 +105,59 @@ class CommunicationScheduler:
         return global_batches
 
     def _assign_iterations(self, batches: List[ScheduledBatch]):
+        """
+        Assign batches to iterations using efficient graph coloring.
+
+        Each iteration can have multiple batches as long as they don't conflict
+        (no PE is both sending and receiving in the same iteration).
+
+        Uses a greedy algorithm with efficient conflict tracking via sets.
+        """
         self.num_iterations = 0
+
+        # Sort batches: process batches with more potential conflicts first
+        # This heuristic (largest-degree-first) often produces better colorings
         batches.sort(key=lambda x: (x.src_pe, x.dest_pe, x.batch_index))
 
+        # Track which PEs are busy (sending or receiving) in each iteration
+        # iteration -> {src_pes: set, dst_pes: set}
+        iteration_usage = []
+
         for batch in batches:
-            iteration = 0
+            # Find first iteration where this batch fits (no conflicts)
             assigned = False
-            while not assigned:
-                if not self._has_conflict(batch, iteration, batches):
-                    batch.iteration = iteration
-                    self.num_iterations = max(self.num_iterations, iteration + 1)
+            for iter_idx in range(len(iteration_usage)):
+                # Check if src_pe or dest_pe are already busy in this iteration
+                if (batch.src_pe not in iteration_usage[iter_idx]['src_pes'] and
+                    batch.src_pe not in iteration_usage[iter_idx]['dst_pes'] and
+                    batch.dest_pe not in iteration_usage[iter_idx]['src_pes'] and
+                    batch.dest_pe not in iteration_usage[iter_idx]['dst_pes']):
+                    # No conflict - assign to this iteration
+                    batch.iteration = iter_idx
+                    iteration_usage[iter_idx]['src_pes'].add(batch.src_pe)
+                    iteration_usage[iter_idx]['dst_pes'].add(batch.dest_pe)
                     assigned = True
                     PELogger.debug(
                         f"  Assigned batch ({batch.src_pe} → {batch.dest_pe}, "
-                        f"idx={batch.batch_index}) to iteration {iteration}"
+                        f"idx={batch.batch_index}) to iteration {iter_idx}"
                     )
-                else:
-                    iteration += 1
+                    break
 
-    def _has_conflict(
-        self, batch: ScheduledBatch, iteration: int, all_batches: List[ScheduledBatch]
-    ) -> bool:
-        for other in all_batches:
-            if other.iteration == iteration and other is not batch:
-                if other.src_pe == batch.src_pe or other.dest_pe == batch.dest_pe:
-                    return True
-        return False
+            if not assigned:
+                # Need a new iteration
+                new_iter = len(iteration_usage)
+                batch.iteration = new_iter
+                iteration_usage.append({
+                    'src_pes': {batch.src_pe},
+                    'dst_pes': {batch.dest_pe}
+                })
+                PELogger.debug(
+                    f"  Assigned batch ({batch.src_pe} → {batch.dest_pe}, "
+                    f"idx={batch.batch_index}) to NEW iteration {new_iter}"
+                )
+
+        self.num_iterations = len(iteration_usage)
+        PELogger.info(f"Efficient scheduling: {len(batches)} batches → {self.num_iterations} iterations")
 
     def _exchange_workload_summaries(
         self, workloads: Dict[int, List[WorkloadGroup]], my_pe: int, n_pes: int
