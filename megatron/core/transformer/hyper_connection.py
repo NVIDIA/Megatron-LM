@@ -442,9 +442,8 @@ class HyperConnectionModule(MegatronModule):
         
         nvtx_range_push("HyperConnection::compute_mappings")
         # Checkpoint compute_mappings - auto-registers to manager via ckpt_manager parameter
-        h_pre, h_post, h_res = CheckpointWithoutOutput(ckpt_manager=manager).checkpoint(
-            self.compute_mappings, hidden_states
-        )
+        h_pre, h_post, h_res = self.compute_mappings(hidden_states)
+        
         nvtx_range_pop("HyperConnection::compute_mappings")
         # Checkpoint aggregate - auto-registers to manager
         nvtx_range_push("HyperConnection::aggregate")
