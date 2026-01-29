@@ -65,7 +65,7 @@ spec:
 
 products:
   #######################################################################
-  # Nightly tests: Run both DEV and LTS unless something is flaky       #
+  # Nightly tests: Run DEV unless something is flaky       #
   #######################################################################
   - test_case: [gpt3_mcore_tp1_pp1_resume_torch_dist_dist_optimizer_overlap_grad_reduce_param_gather]
     products:
@@ -128,15 +128,11 @@ products:
   #   products:
   #     - environment: [dev]
   #       scope: [mr]
-  #     - environment: [lts]
-  #       scope: [nightly] # Non-deterministic: #487
   - test_case: [gpt3_mcore_te_tp1_pp2_resume_torch_dist_rope_embeddings]
     products:
       - environment: [dev]
         scope: [mr]
         platforms: [dgx_gb200]
-      # - environment: [lts]
-      #   scope: [nightly] # outdated TE: #501
   - test_case: [gpt3_mcore_te_tp1_pp2_resume_torch_dist_rope_embeddings_interleaved_no_fusion]
     products:
       - environment: [dev]
@@ -182,8 +178,6 @@ products:
       #     - environment: [dev]
       #       scope: [mr]
       #       platforms: [dgx_gb200] # Hangs: #513
-      # - environment: [lts]
-      #   scope: [nightly]
   - test_case: [gpt3_mcore_te_tp1_pp4_vp1_resume_torch_dist_dist_optimizer_overlap_grad_reduce]
     products:
       - environment: [dev]
@@ -199,8 +193,6 @@ products:
       - environment: [dev]
         scope: [mr]
         platforms: [dgx_gb200]
-      - environment: [lts]
-        scope: [nightly]
   - test_case: [gpt3_mcore_te_tp1_pp4_vp2_account_for_embedding_loss_in_pipeline_split]
     products:
       - environment: [dev]
@@ -337,7 +329,7 @@ products:
         scope: [mr]
         platforms: [dgx_gb200]
   #######################################################################
-  # Super important mr, mr-github tests that run for both DEV and LTS per mr, mr-github       #
+  # Super important mr, mr-github tests that run for DEV per mr, mr-github       #
   #######################################################################
   - test_case: [gpt3_mcore_reruns_persistent_1]
     products:
