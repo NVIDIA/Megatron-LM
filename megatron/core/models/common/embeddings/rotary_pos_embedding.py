@@ -9,7 +9,7 @@ if TYPE_CHECKING:
     from megatron.core.transformer.transformer_block import TransformerBlock
     from megatron.core.inference.contexts import BaseInferenceContext
     from megatron.core.packed_seq_params import PackedSeqParams
-    from megatron.core.chunked_pipeline_parallel_utils import ChunkedPipelineParallelParams
+    from megatron.core.cached_prefix_utils import CachedPrefixParams
 
 import logging
 import math
@@ -24,8 +24,8 @@ from megatron.core.models.common.embeddings.rope_utils import (  # for backward 
     _apply_rotary_pos_emb_thd,
     _rotate_half,
     apply_rotary_pos_emb,
-    get_pos_emb_on_this_chunked_pp_span,
     get_pos_emb_on_this_cp_rank,
+    get_pos_emb_over_cached_prefix,
 )
 from megatron.core.utils import deprecate_inference_params, internal_api
 
@@ -184,7 +184,7 @@ class RotaryEmbedding(nn.Module):
         offset: int = 0,
         packed_seq: bool = False,
         cp_group: Optional[torch.distributed.ProcessGroup] = None,
-        chunked_pp_params: Optional[ChunkedPipelineParallelParams] = None,
+        cached_prefix_params: Optional[CachedPrefixParams] = None,
     ) -> Tensor:
         """Forward pass of RoPE embedding.
 
@@ -194,16 +194,18 @@ class RotaryEmbedding(nn.Module):
             packed_seq (bool, optional): Whether to use packed sequence. Defaults to False.
             cp_group (torch.distributed.ProcessGroup, optional): Context parallel group.
                 Defaults to None.
+            cached_prefix_params (CachedPrefixParams, optional): Cached prefix params.
+                Defaults to None.
 
         Returns:
             Tensor: Embeddings after applying RoPE.
         """
         emb = self.get_emb(max_seq_len, offset)
 
-        if chunked_pp_params is not None:
+        if cached_prefix_params is not None:
             # Slice rotary_pos_emb along sequence dimension
-            # and select the parition of the current chunked PP span
-            emb = get_pos_emb_on_this_chunked_pp_span(emb, 0, chunked_pp_params)
+            # and select the parition of the current span
+            emb = get_pos_emb_over_cached_prefix(emb, 0, cached_prefix_params)
 
         if cp_group is None:
             cp_group = self.cp_group
@@ -225,7 +227,7 @@ class RotaryEmbedding(nn.Module):
         transformer_input: Tensor,
         transformer_config: TransformerConfig,
         packed_seq_params: Optional[PackedSeqParams] = None,
-        chunked_pp_params: Optional[ChunkedPipelineParallelParams] = None,
+        cached_prefix_params: Optional[CachedPrefixParams] = None,
         *,
         inference_params: Optional[BaseInferenceContext] = None,
     ) -> int:
@@ -238,15 +240,21 @@ class RotaryEmbedding(nn.Module):
             transformer_input (Tensor): Input tensor to the transformer
             transformer_config (TransformerConfig): Transformer config used by the model
             packed_seq_params (PackedSeqParams): Packed sequence params
-
+            cached_prefix_params (CachedPrefixParams): Cached prefix params
         Returns:
             int: The rotary sequence length
         """
 
         inference_context = deprecate_inference_params(inference_context, inference_params)
 
-        if transformer_config.chunked_pipeline_model_parallel_splits > 1:
-            return sum(chunked_pp_params.spans)
+        if cached_prefix_params is not None:
+            if cached_prefix_params.max_total_seqlen is not None:
+                return cached_prefix_params.max_total_seqlen
+            else:
+                return (
+                    sum(cached_prefix_params.prefix_seqlens)
+                    + cached_prefix_params.this_chunk_seqlen
+                )
         elif packed_seq_params is not None:
             # max_seqlen are the max sequence length in the packed sequence before being divived
             # by the tp and cp size.

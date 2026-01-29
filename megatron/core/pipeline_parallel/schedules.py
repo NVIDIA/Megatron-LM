@@ -9,11 +9,11 @@ import torch
 from torch.autograd.variable import Variable
 
 from megatron.core import parallel_state
-from megatron.core.chunked_pipeline_parallel_utils import (
+from megatron.core.enums import ModelType
+from megatron.core.pipeline_parallel.chunked_pipeline_parallel_utils import (
     ChunkedPipelineParallelDataIterator,
     ChunkedPipelineParallelQueue,
 )
-from megatron.core.enums import ModelType
 from megatron.core.pipeline_parallel.fine_grained_activation_offload import (
     FineGrainedActivationOffloadingInterface as off_interface,
 )

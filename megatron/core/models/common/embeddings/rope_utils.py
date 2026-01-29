@@ -14,7 +14,7 @@ import torch
 from torch import Tensor
 
 from megatron.core import parallel_state
-from megatron.core.chunked_pipeline_parallel_utils import ChunkedPipelineParallelParams
+from megatron.core.cached_prefix_utils import CachedPrefixParams
 
 logger = logging.getLogger(__name__)
 
@@ -46,20 +46,20 @@ __all__ = [
 ]
 
 
-def get_pos_emb_on_this_chunked_pp_span(
-    pos_emb: Tensor, seq_dim: int, chunked_pp_params: ChunkedPipelineParallelParams
+def get_pos_emb_over_cached_prefix(
+    pos_emb: Tensor, seq_dim: int, cached_prefix_params: CachedPrefixParams
 ):
-    """Get the position embedding on the current chunked pipeline parallel span.
+    """Get the position embedding over the cached prefix.
 
     Args:
         pos_emb (Tensor): Positional embedding tensor
         seq_dim (int): Sequence dimension
-        chunked_pp_params (ChunkedPipelineParallelParams): Chunked pipeline parallel parameters
+        cached_prefix_params (CachedPrefixParams): Cached prefix parameters
     """
 
-    span_idx = chunked_pp_params.span_idx_in_micro
-    spans = chunked_pp_params.spans
-    pos_emb = pos_emb.split(spans, dim=seq_dim)[span_idx]
+    prefix_len = sum(cached_prefix_params.prefix_seqlens)
+    this_chunk_len = cached_prefix_params.this_chunk_seqlen
+    pos_emb = pos_emb.narrow(seq_dim, prefix_len, this_chunk_len)
     return pos_emb
 
 

@@ -7,20 +7,21 @@ from unittest.mock import MagicMock, Mock
 
 import pytest
 import torch
+from torch.nn import functional as F
 
 from megatron.core import parallel_state
-from megatron.core.chunked_pipeline_parallel_utils import (
-    ChunkedPipelineParallelDataIterator,
-    ChunkedPipelineParallelParams,
-    ChunkedPipelineParallelQueue,
-)
-from megatron.core.models.gpt.gpt_layer_specs import (
-    get_gpt_layer_with_transformer_engine_spec as gpt_te_spec,
+from megatron.core.cached_prefix_utils import CachedPrefixParams
+from megatron.core.models.gpt.experimental_attention_variant_module_specs import (
+    get_transformer_block_with_experimental_attention_variant_spec,
 )
 from megatron.core.models.gpt.gpt_model import GPTModel
 from megatron.core.num_microbatches_calculator import (
     init_num_microbatches_calculator,
     unset_num_microbatches_calculator,
+)
+from megatron.core.pipeline_parallel.chunked_pipeline_parallel_utils import (
+    ChunkedPipelineParallelDataIterator,
+    ChunkedPipelineParallelQueue,
 )
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
 from megatron.core.transformer.enums import ModelType
@@ -51,13 +52,25 @@ def initialize_gpt_model(seed, **config_kwargs):
         bf16=True,
         hidden_dropout=0.0,
         attention_dropout=0.0,
+        experimental_attention_variant="gated_delta_net",
+        linear_attention_freq=4,
+        linear_conv_kernel_dim=2,
+        linear_key_head_dim=32,
+        linear_value_head_dim=32,
+        linear_num_key_heads=4,
+        linear_num_value_heads=8,
+        activation_func=F.silu,
     )
     default_config_kwargs.update(**config_kwargs)
     transformer_config = TransformerConfig(**default_config_kwargs)
 
     model = []
     for i in range(transformer_config.virtual_pipeline_model_parallel_size or 1):
-        layer_spec = gpt_te_spec()
+        layer_spec = get_transformer_block_with_experimental_attention_variant_spec(
+            config=transformer_config,
+            vp_stage=i,
+            pp_rank=parallel_state.get_pipeline_model_parallel_rank(),
+        )
 
         mtp_block_spec = None
 
@@ -98,6 +111,7 @@ def create_args():
     args.exit_on_missing_checkpoint = True
     args.async_save = False
     args.data_parallel_random_init = False
+    args.phase_transition_iterations = False
     args.log_progress = False
     args.ckpt_fully_parallel_save = False
     args.ckpt_fully_parallel_load = False
@@ -132,7 +146,7 @@ def create_args():
     ('tp_pp_vpp', 'chunked_pp_splits'),
     [((1, 2, 1), 4), ((1, 2, 2), 4), ((2, 4, 1), 2), ((2, 4, 2), 2)],
 )
-def test_forward_chunked_pipeline_parallel(
+def test_chunked_pipeline_parallel_schedule(
     create_args, tmp_path_dist_ckpt, tp_pp_vpp, chunked_pp_splits
 ):
     """Test forward pass with chunked pipeline model parallel (splits > 1).
@@ -185,9 +199,9 @@ def test_forward_chunked_pipeline_parallel(
             loss_mask = data["loss_mask"]
 
         if model.config.chunked_pipeline_model_parallel_splits > 1:
-            chunked_pp_params = data_iterator.get_current_chunked_pp_params()
+            cached_prefix_params = data_iterator.get_current_cached_prefix_params()
         else:
-            chunked_pp_params = None
+            cached_prefix_params = None
 
         output_tensor = model(
             tokens,
@@ -196,7 +210,7 @@ def test_forward_chunked_pipeline_parallel(
             labels=labels,
             loss_mask=loss_mask,
             packed_seq_params=None,
-            chunked_pp_params=chunked_pp_params,
+            cached_prefix_params=cached_prefix_params,
         )
 
         def loss_func(output_tensor: torch.Tensor):
@@ -242,7 +256,7 @@ def test_forward_chunked_pipeline_parallel(
     opt_param_scheduler = None
     num_floating_point_operations_so_far = 456
 
-    with TempNamedDir(tmp_path_dist_ckpt / 'test_chunked_pp_forward') as ckpt_dir:
+    with TempNamedDir(tmp_path_dist_ckpt / 'test_chunked_pp_schedule') as ckpt_dir:
         args.save = ckpt_dir
         args.load = ckpt_dir
         save_checkpoint(
@@ -356,7 +370,7 @@ class TestChunkedPipelineParallelDataIterator:
         assert iterator._get_span(seq_length) == expected_spans
 
     def test_mock_next(self):
-        """Test mock_next correctly cycles through spans and micro batches."""
+        """Test mock_next correctly cycles through chunks and micro batches."""
         num_micro_batches = 2
         chunked_pp_splits = 4
         seq_length = 256
@@ -370,11 +384,12 @@ class TestChunkedPipelineParallelDataIterator:
                 assert iterator.count == mb_idx + 1
                 assert iterator.current_span_idx == span_idx
 
-                params = iterator.get_current_chunked_pp_params()
-                assert isinstance(params, ChunkedPipelineParallelParams)
-                assert params.micro_batch_idx == mb_idx
-                assert params.span_idx_in_micro == span_idx
-                assert params.spans == expected_spans
+                params = iterator.get_current_cached_prefix_params()
+                assert isinstance(params, CachedPrefixParams)
+                assert params.prefix_seqlens == expected_spans[:span_idx]
+                assert params.this_chunk_seqlen == expected_spans[span_idx]
+                assert params.max_total_seqlen == seq_length
+                assert params.kv_cache_pool is not None
 
     def test_next_slices_data_correctness(self):
         """Test __next__ produces correctly sliced data."""
@@ -406,11 +421,12 @@ class TestChunkedPipelineParallelDataIterator:
                 )
                 assert torch.equal(slice_data["tokens"], expected_tokens)
 
-                params = iterator.get_current_chunked_pp_params()
-                assert isinstance(params, ChunkedPipelineParallelParams)
-                assert params.micro_batch_idx == mb_idx
-                assert params.span_idx_in_micro == span_idx
-                assert params.spans == expected_spans
+                params = iterator.get_current_cached_prefix_params()
+                assert isinstance(params, CachedPrefixParams)
+                assert params.prefix_seqlens == expected_spans[:span_idx]
+                assert params.this_chunk_seqlen == expected_spans[span_idx]
+                assert params.max_total_seqlen == 256
+                assert params.kv_cache_pool is not None
 
     def test_get_current_chunked_pp_params(self):
         """Test params generation matches iterator state."""
@@ -422,12 +438,13 @@ class TestChunkedPipelineParallelDataIterator:
         for mb in range(2):
             for span in range(4):
                 iterator.mock_next(256)
-                params = iterator.get_current_chunked_pp_params()
+                params = iterator.get_current_cached_prefix_params()
 
-                assert isinstance(params, ChunkedPipelineParallelParams)
-                assert params.micro_batch_idx == mb
-                assert params.span_idx_in_micro == span
-                assert params.spans == [64, 64, 64, 64]
+                assert isinstance(params, CachedPrefixParams)
+                assert params.prefix_seqlens == [64] * span
+                assert params.this_chunk_seqlen == 64
+                assert params.max_total_seqlen == 256
+                assert params.kv_cache_pool is not None
 
 
 class TestChunkedPipelineParallelQueue:

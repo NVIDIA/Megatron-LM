@@ -3,13 +3,15 @@ from typing import Callable, List, Optional
 
 import torch
 
-from megatron.core.chunked_pipeline_parallel_utils import ChunkedPipelineParallelParams, KVCache
+from megatron.core.cached_prefix_utils import CachedPrefixParams, KVCache
 from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.core.transformer.enums import AttnMaskType
 from megatron.core.transformer.transformer_config import TransformerConfig
 
 
 class ChunkedKVCacheForAttention(KVCache):
+    """Chunked KV cache for attention."""
+
     def __init__(self, config: TransformerConfig):
         self.config = config
         self.key_cache = []
@@ -17,10 +19,10 @@ class ChunkedKVCacheForAttention(KVCache):
         self.grad_key_cache = []
         self.grad_value_cache = []
 
-    def forward_with_kv_cache(
+    def forward_attention_with_kv_cache(
         self,
         module: Callable,
-        chunked_pp_params: ChunkedPipelineParallelParams,
+        cached_prefix_params: CachedPrefixParams,
         query: torch.Tensor,
         key: torch.Tensor,
         value: torch.Tensor,
@@ -29,11 +31,28 @@ class ChunkedKVCacheForAttention(KVCache):
         attention_bias: Optional[torch.Tensor] = None,
         packed_seq_params: Optional[PackedSeqParams] = None,
     ):
-        assert len(self.key_cache) == chunked_pp_params.span_idx_in_micro
-        assert len(self.value_cache) == chunked_pp_params.span_idx_in_micro
-        assert len(self.grad_key_cache) == chunked_pp_params.span_idx_in_micro
-        assert len(self.grad_value_cache) == chunked_pp_params.span_idx_in_micro
-        return AttentionFuncionWithChunkedPipelineParallel.apply(
+        """Forward pass of attention with chunked KV cache."""
+
+        n_prefix = len(cached_prefix_params.prefix_seqlens)
+        assert len(self.key_cache) == n_prefix, (
+            f"Expected {n_prefix} prefix states, but got {len(self.key_cache)=}. "
+            "Please check the cached prefix parameters."
+        )
+        assert len(self.value_cache) == n_prefix, (
+            f"Expected {n_prefix} prefix states, but got {len(self.value_cache)=}. "
+            "Please check the cached prefix parameters."
+        )
+        assert len(self.grad_key_cache) == n_prefix, (
+            f"Expected {n_prefix} prefix states, but got {len(self.grad_key_cache)=}. "
+            "Please check the cached prefix parameters."
+        )
+        assert len(self.grad_value_cache) == n_prefix, (
+            f"Expected {n_prefix} prefix states, but got {len(self.grad_value_cache)=}. "
+            "Please check the cached prefix parameters."
+        )
+
+        query = query.contiguous()
+        return AttentionFuncionWithChunkedKVCache.apply(
             module,
             query,
             key,
@@ -49,8 +68,8 @@ class ChunkedKVCacheForAttention(KVCache):
         )
 
 
-class AttentionFuncionWithChunkedPipelineParallel(torch.autograd.Function):
-    """Attention function with chunked pipeline parallel."""
+class AttentionFuncionWithChunkedKVCache(torch.autograd.Function):
+    """Attention function with chunked KV cache."""
 
     @staticmethod
     def forward(
@@ -73,6 +92,7 @@ class AttentionFuncionWithChunkedPipelineParallel(torch.autograd.Function):
             packed_seq_params is None
         ), "Packed sequence is not compatible with chunked PP for now."
         assert attention_mask is None, "Attention mask is not supported with chunked PP for now."
+        assert attention_bias is None, "Attention bias is not supported with chunked PP for now."
 
         # Switch to bottom-right mask for causal mask
         if attn_mask_type == AttnMaskType.causal:
@@ -88,17 +108,18 @@ class AttentionFuncionWithChunkedPipelineParallel(torch.autograd.Function):
         grad_value_cache.append(None)
         key_joined = torch.cat(key_cache, dim=seq_dim).detach().requires_grad_()
         value_joined = torch.cat(value_cache, dim=seq_dim).detach().requires_grad_()
+        assert query.is_contiguous(), "Query should be contiguous."
 
         # Forward pass.
-        with torch.enable_grad():
+        with torch.autograd.set_grad_enabled(True):
             core_attn_out = module(
                 query,
                 key_joined,
                 value_joined,
                 attention_mask,
                 attn_mask_type=attn_mask_type,
-                attention_bias=attention_bias,
-                packed_seq_params=packed_seq_params,
+                attention_bias=None,
+                packed_seq_params=None,
             )
 
         # Release the data of joined key and value to save memory.
@@ -113,7 +134,7 @@ class AttentionFuncionWithChunkedPipelineParallel(torch.autograd.Function):
         ctx.grad_value_cache = grad_value_cache
         ctx.save_for_backward(query, key_joined, value_joined, core_attn_out)
 
-        core_attn_out = core_attn_out.clone()  # TODO: remove the clone
+        core_attn_out = core_attn_out.clone()
         return core_attn_out
 
     @staticmethod

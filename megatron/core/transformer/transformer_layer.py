@@ -12,7 +12,7 @@ import torch.distributed
 from torch import Tensor
 
 from megatron.core import parallel_state, tensor_parallel
-from megatron.core.chunked_pipeline_parallel_utils import ChunkedPipelineParallelParams
+from megatron.core.cached_prefix_utils import CachedPrefixParams
 from megatron.core.dist_checkpointing.mapping import ShardedStateDict
 from megatron.core.dist_checkpointing.utils import apply_prefix_mapping
 from megatron.core.packed_seq_params import PackedSeqParams
@@ -513,7 +513,7 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
         packed_seq_params: Optional[PackedSeqParams] = None,
         sequence_len_offset: Optional[Tensor] = None,
         padding_mask: Optional[Tensor] = None,
-        chunked_pp_params: Optional[ChunkedPipelineParallelParams] = None,
+        cached_prefix_params: Optional[CachedPrefixParams] = None,
         *,
         inference_params: Optional[Any] = None,
     ):
@@ -537,7 +537,7 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
             packed_seq_params (object, optional): Parameters for packed sequence processing.
             sequence_len_offset (Tensor, optional): Offset along sequence dimension
                 during inference.
-            chunked_pp_params (object, optional): Parameters for chunked pipeline model parallel.
+            cached_prefix_params (object, optional): Parameters for prefix caching.
         Returns:
             Tuple[Tensor, Tensor]: A tuple containing:
                 hidden_states (Tensor): Transformed hidden states before the MLP layernorm.
@@ -585,7 +585,7 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
             rotary_pos_cos_sin=rotary_pos_cos_sin,
             attention_bias=attention_bias,
             packed_seq_params=packed_seq_params,
-            chunked_pp_params=chunked_pp_params,
+            cached_prefix_params=cached_prefix_params,
             sequence_len_offset=sequence_len_offset,
         )
         nvtx_range_pop(suffix="self_attention")
@@ -998,10 +998,10 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
         assert (
             (kwargs.get('inference_context') is None)
             and (kwargs.get('packed_seq_params') is None)
-            and (kwargs.get('chunked_pp_params') is None)
+            and (kwargs.get('cached_prefix_params') is None)
         ), (
             "CUDA graph accepts only Tensor inputs. "
-            "inference_context, packed_seq_params and chunked_pp_params are excluded from "
+            "inference_context, packed_seq_params and cached_prefix_params are excluded from "
             "input list. For inference cuda graph, please use cuda_graph_impl=local instead."
         )
 

@@ -14,6 +14,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch import Tensor
 
+from megatron.core.cached_prefix_utils import CachedPrefixParams
 from megatron.core.dist_checkpointing import ShardedTensor
 from megatron.core.dist_checkpointing.mapping import ReplicaId, ShardedTensorFactory
 from megatron.core.fp8_utils import get_fp8_align_size
@@ -21,6 +22,7 @@ from megatron.core.inference.contexts import BaseInferenceContext
 from megatron.core.jit import jit_fuser
 from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.core.process_groups_config import ProcessGroupCollection
+from megatron.core.ssm.gated_delta_net_cached_prefix import ChunkedKVCacheForGatedDeltaNet
 from megatron.core.ssm.mamba_context_parallel import (
     _all_to_all_cp2hp,
     _all_to_all_hp2cp,
@@ -260,6 +262,7 @@ class GatedDeltaNet(MegatronModule):
         inference_context: Optional[BaseInferenceContext] = None,
         packed_seq_params: Optional[PackedSeqParams] = None,
         sequence_len_offset: Optional[int] = None,
+        cached_prefix_params: Optional[CachedPrefixParams] = None,
         *,
         inference_params: Optional[BaseInferenceContext] = None,
         **kwargs,
@@ -275,7 +278,8 @@ class GatedDeltaNet(MegatronModule):
             packed_seq_params (Optional[PackedSeqparams]): Parameters used for THD format.
             sequence_len_offset (Optional[int]): Sequence length offset used for
                 inference CUDA graphs.
-
+            cached_prefix_params (Optional[CachedPrefixParams]): Parameters used for
+                prefix caching.
         Return:
             (Tuple[Tensor, Tensor]) GDN output and bias.
 
@@ -363,7 +367,18 @@ class GatedDeltaNet(MegatronModule):
             if self.conv_bias
             else None
         )
+
+        if cached_prefix_params is not None:
+            kv_cache = cached_prefix_params.kv_cache_pool.get_kv_cache(
+                layer_idx=self.layer_number, kv_cache_cls=ChunkedKVCacheForGatedDeltaNet
+            )
+        else:
+            kv_cache = None
+
         if self.config.deterministic_mode:
+            assert (
+                kv_cache is None
+            ), "Cached prefix is not supported with GDN deterministic mode for now."
             qkv = qkv.transpose(1, 2).contiguous()  # b, s, d -> b, d, s
             conv_out = F.conv1d(
                 input=qkv,  # Torch-native only accept [b, d, s] format input
@@ -378,14 +393,24 @@ class GatedDeltaNet(MegatronModule):
             qkv = qkv.transpose(1, 2)  # b, d, s -> b, s, d
         else:
             assert self.activation in ["silu", "swish"]
-            qkv, _ = causal_conv1d(
-                x=qkv,  # FLA conv1d accepts [b, s, d] format input
-                weight=conv1d_weight.squeeze(1),  # d, 1, w -> d, w
-                bias=conv1d_bias,
-                activation=self.activation,
-                initial_state=None,
-                output_final_state=False,
-            )
+            if kv_cache is not None:
+                qkv = kv_cache.forward_conv1d_with_kv_cache(
+                    module=causal_conv1d,
+                    cached_prefix_params=cached_prefix_params,
+                    x=qkv,
+                    weight=conv1d_weight.squeeze(1),  # d, 1, w -> d, w
+                    bias=conv1d_bias,
+                    activation=self.activation,
+                )
+            else:
+                qkv, _ = causal_conv1d(
+                    x=qkv,  # FLA conv1d accepts [b, s, d] format input
+                    weight=conv1d_weight.squeeze(1),  # d, 1, w -> d, w
+                    bias=conv1d_bias,
+                    activation=self.activation,
+                    initial_state=None,
+                    output_final_state=False,
+                )
         nvtx_range_pop(suffix="conv1d")
 
         # Split qkv into query_key, and value
@@ -431,16 +456,28 @@ class GatedDeltaNet(MegatronModule):
         nvtx_range_pop(suffix="g_and_beta")
 
         nvtx_range_push(suffix="gated_delta_rule")
-        core_attn_out, last_recurrent_state = self.gated_delta_rule(
-            query,
-            key,
-            value,
-            g=g,
-            beta=beta,
-            initial_state=None,
-            output_final_state=False,
-            use_qk_l2norm_in_kernel=False,
-        )
+        if kv_cache is not None:
+            core_attn_out = kv_cache.forward_gated_delta_rule_with_kv_cache(
+                module=self.gated_delta_rule,
+                cached_prefix_params=cached_prefix_params,
+                query=query,
+                key=key,
+                value=value,
+                g=g,
+                beta=beta,
+                use_qk_l2norm_in_kernel=False,
+            )
+        else:
+            core_attn_out, last_recurrent_state = self.gated_delta_rule(
+                query,
+                key,
+                value,
+                g=g,
+                beta=beta,
+                initial_state=None,
+                output_final_state=False,
+                use_qk_l2norm_in_kernel=False,
+            )
         nvtx_range_pop(suffix="gated_delta_rule")
 
         # RMSNorm

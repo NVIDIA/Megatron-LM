@@ -1,50 +1,10 @@
-# Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
-from abc import abstractmethod
-from dataclasses import dataclass
-from typing import Any, Dict, List, Optional, Type
+from typing import List
 
-import torch
-
+from megatron.core.cached_prefix_utils import CachedPrefixParams, KVCachePool
 from megatron.core.rerun_state_machine import RerunDataIterator
 from megatron.core.transformer.transformer_config import TransformerConfig
-
-
-class KVCache:
-    '''Abstract class of KV cache for chunked pipeline model parallel.'''
-
-    @abstractmethod
-    def forward_with_kv_cache(self, *args, **kwargs):
-        '''Forward pass with KV cache.'''
-        raise NotImplementedError
-
-
-class KVCachePool:
-    def __init__(self, config: TransformerConfig):
-        self.config = config
-        self.kv_cache_pool = {}
-
-    def get_kv_cache(self, layer_idx: int, kv_cache_cls: Type[KVCache]) -> KVCache:
-        if layer_idx not in self.kv_cache_pool:
-            self.kv_cache_pool[layer_idx] = kv_cache_cls(self.config)
-        assert isinstance(self.kv_cache_pool[layer_idx], kv_cache_cls), (
-            f"Expected KV cache of type {kv_cache_cls}, "
-            f"but got {type(self.kv_cache_pool[layer_idx])}."
-        )
-        return self.kv_cache_pool[layer_idx]
-
-
-@dataclass
-class ChunkedPipelineParallelParams:
-    '''Parameters for chunked pipeline model parallel.'''
-
-    micro_batch_idx: int
-    span_idx_in_micro: int
-    spans: List[int]
-    kv_cache_pool: KVCachePool
-
-    def __hash__(self):
-        return hash((self.micro_batch_idx, self.span_idx_in_micro, len(self.spans)))
 
 
 class ChunkedPipelineParallelDataIterator:
@@ -127,11 +87,11 @@ class ChunkedPipelineParallelDataIterator:
             self.current_seq_length = seq_length
             self.current_split_span = self._get_span(seq_length)
 
-    def get_current_chunked_pp_params(self) -> ChunkedPipelineParallelParams:
-        return ChunkedPipelineParallelParams(
-            micro_batch_idx=self.count - 1,
-            span_idx_in_micro=self.current_span_idx,
-            spans=self.current_split_span,
+    def get_current_cached_prefix_params(self) -> CachedPrefixParams:
+        return CachedPrefixParams(
+            prefix_seqlens=self.current_split_span[:self.current_span_idx],
+            this_chunk_seqlen=self.current_split_span[self.current_span_idx],
+            max_total_seqlen=self.current_seq_length,
             kv_cache_pool=self.current_kv_cache_pool,
         )
 
