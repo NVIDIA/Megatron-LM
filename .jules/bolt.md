@@ -8,3 +8,7 @@
 ## 2025-10-27 - CPU Testing
 **Learning:** The codebase defaults to NCCL and CUDA for distributed init, causing tests to fail on CPU-only environments.
 **Action:** Patch `tests/unit_tests/test_utilities.py` to use `gloo` backend if CUDA is unavailable.
+
+## 2025-10-27 - [Avoid torch.tensor on list of tensors]
+**Learning:** `torch.tensor(list_of_tensors)` creates a new tensor by copying data, often involving host synchronization or inefficient copying, especially if the list contains CUDA tensors.
+**Action:** Use `torch.stack(list_of_tensors)` to stack tensors efficiently on the same device.

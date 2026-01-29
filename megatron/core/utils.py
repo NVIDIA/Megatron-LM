@@ -1237,10 +1237,26 @@ def local_multi_tensor_l2_norm(chunk_size, noop_flag, tensor_lists, per_tensor, 
     Computes l2 norm for a list of contiguous tensors
     works as a drop-in replacement for amp_C.multi_tensor_l2norm
     """
-    l2 = [[(torch.norm(tensor)) for tensor in tensor_list] for tensor_list in tensor_lists]
-    l2_reduced = torch.norm(torch.tensor(l2))
-    l2_cuda = torch.tensor([float(l2_reduced)], dtype=torch.float, device="cuda")
-    return l2_cuda, None
+    norms = []
+    for tensor_list in tensor_lists:
+        for tensor in tensor_list:
+            norms.append(torch.norm(tensor))
+
+    if norms:
+        l2_reduced = torch.norm(torch.stack(norms))
+    else:
+        l2_reduced = torch.tensor(
+            0.0, dtype=torch.float, device="cuda" if torch.cuda.is_available() else "cpu"
+        )
+
+    # Cast to float32 to avoid overflow in mixed precision and match legacy behavior
+    # Detach to avoid keeping computation graph, matching legacy behavior of float() casting
+    l2_reduced = l2_reduced.to(dtype=torch.float).detach()
+
+    if torch.cuda.is_available() and l2_reduced.device.type != 'cuda':
+        l2_reduced = l2_reduced.to("cuda")
+
+    return l2_reduced.view(1), None
 
 
 # works as a drop-in replacement for amp_C.multi_tensor_scale
