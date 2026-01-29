@@ -1900,8 +1900,8 @@ def training_log(
             'rl/sync-rollouts',
             'rl/suspend-engine',
             # Optimizer offload/onload
-            'rl/offload-optimizer-before-inference',
-            'rl/onload-optimizer-after-inference',
+            'rl/offload-optimizer-state-and-grad-buffers-during-inference',
+            'rl/restore-optimizer-state-and-grad-buffers-after-inference',
             'rl/offload-kv-cache-after-inference',
             'rl/onload-kv-cache-before-inference',
             # Fine-grained offload/onload breakdown

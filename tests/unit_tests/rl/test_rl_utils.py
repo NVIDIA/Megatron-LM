@@ -7,13 +7,7 @@ from types import SimpleNamespace
 import pytest
 import torch
 
-from megatron.core.distributed import (
-    DistributedDataParallel,
-    DistributedDataParallelConfig,
-    get_grad_buffer_memory_usage,
-    offload_grad_data,
-    onload_grad_data,
-)
+from megatron.core.distributed import DistributedDataParallel, DistributedDataParallelConfig
 from megatron.core.enums import ModelType
 from megatron.core.models.common.language_module.language_module import LanguageModule
 from megatron.core.models.gpt.gpt_layer_specs import get_gpt_layer_with_transformer_engine_spec
@@ -428,9 +422,20 @@ class TestRLUtils:
                 exp_t = torch.tensor(exp, dtype=torch.float32, device=got_t.device)
                 torch.testing.assert_close(got_t, exp_t, rtol=0, atol=0)
 
-    def test_grad_buffer_offload(self):
-        """Test that grad buffer offload/onload correctly frees and restores GPU memory."""
-        Utils.initialize_model_parallel()
+    @pytest.mark.parametrize(
+        "initialize_model_parallel",
+        [
+            pytest.param((tp, pp), id=f"tp{tp}-pp{pp}")
+            for tp, pp in itertools.product([1, 2], [1, 2])
+            if tp * pp <= Utils.world_size
+        ],
+        indirect=["initialize_model_parallel"],
+    )
+    def test_grad_buffer_offload(self, initialize_model_parallel):
+        """Test that grad buffer offload/restore correctly frees and restores GPU memory."""
+        world_size, dp, tp, pp = initialize_model_parallel
+        self.create_test_args(tensor_model_parallel_size=tp, pipeline_model_parallel_size=pp)
+
         model_parallel_cuda_manual_seed(123)
 
         # Create a realistic GPTModel as used in RL training
@@ -455,53 +460,41 @@ class TestRLUtils:
             transformer_config, ddp_config=ddp_config, module=gpt_model
         )
 
-        # Create optimizer to exercise buffer validation in offload_grad_data
-        optimizer_config = OptimizerConfig(
-            optimizer='adam', bf16=True, use_distributed_optimizer=True
-        )
-        optimizer = get_megatron_optimizer(optimizer_config, [ddp_model])
+        all_buffers = ddp_model.buffers + ddp_model.expert_parallel_buffers
 
-        # Measure initial memory usage
-        initial_memory = get_grad_buffer_memory_usage(ddp_model)
-        assert initial_memory["total_bytes"] > 0, "Expected non-zero initial memory"
+        # Verify initial storage is allocated
+        initial_sizes = [buf.grad_data.storage().size() for buf in all_buffers]
+        assert all(size > 0 for size in initial_sizes), "Expected non-zero initial storage"
 
-        # Offload grad buffers (passing optimizer exercises the buffer validation assertion)
-        offload_states = offload_grad_data(ddp_model, optimizer)
+        # Offload grad buffers to CPU
+        ddp_model.offload_grad_buffers()
 
-        # Measure memory after offload - should be zero
-        offloaded_memory = get_grad_buffer_memory_usage(ddp_model)
+        # Verify storage is released
+        for buf in all_buffers:
+            assert buf.grad_data.storage().size() == 0, "Expected zero storage after offload"
+
+        # Restore grad buffers to GPU
+        ddp_model.restore_grad_buffers()
+
+        # Verify storage is restored
+        restored_sizes = [buf.grad_data.storage().size() for buf in all_buffers]
         assert (
-            offloaded_memory["total_bytes"] == 0
-        ), f"Expected zero memory after offload, got {offloaded_memory['total_bytes']} bytes"
+            initial_sizes == restored_sizes
+        ), f"Expected restored sizes {restored_sizes} to match initial {initial_sizes}"
 
-        # Verify all buffers report as offloaded
-        for buffer_name, buffer_info in offloaded_memory["buffers"].items():
-            assert (
-                buffer_info["device"] == "offloaded"
-            ), f"Buffer {buffer_name} should report device as 'offloaded'"
-
-        # Onload grad buffers
-        onload_grad_data(ddp_model, offload_states)
-
-        # Measure memory after onload - should match initial
-        restored_memory = get_grad_buffer_memory_usage(ddp_model)
-        assert restored_memory["total_bytes"] == initial_memory["total_bytes"], (
-            f"Expected restored memory ({restored_memory['total_bytes']}) to match "
-            f"initial memory ({initial_memory['total_bytes']})"
-        )
-
-        # Verify buffer structure is restored
-        assert len(restored_memory["buffers"]) == len(initial_memory["buffers"])
-        for buffer_name in initial_memory["buffers"]:
-            assert restored_memory["buffers"][buffer_name]["numel"] == (
-                initial_memory["buffers"][buffer_name]["numel"]
-            ), f"Buffer {buffer_name} numel mismatch after restore"
-
-        Utils.destroy_model_parallel()
-
-    def test_optimizer_offload(self):
+    @pytest.mark.parametrize(
+        "initialize_model_parallel",
+        [
+            pytest.param((tp, pp), id=f"tp{tp}-pp{pp}")
+            for tp, pp in itertools.product([1, 2], [1, 2])
+            if tp * pp <= Utils.world_size
+        ],
+        indirect=["initialize_model_parallel"],
+    )
+    def test_optimizer_offload(self, initialize_model_parallel):
         """Test that optimizer offload_to_cpu/restore_from_cpu correctly moves state to/from CPU."""
-        Utils.initialize_model_parallel()
+        world_size, dp, tp, pp = initialize_model_parallel
+        self.create_test_args(tensor_model_parallel_size=tp, pipeline_model_parallel_size=pp)
         model_parallel_cuda_manual_seed(123)
 
         # Create a realistic GPTModel as used in RL training
@@ -598,5 +591,3 @@ class TestRLUtils:
             f"Expected GPU memory to increase after restore. "
             f"After offload: {memory_after_offload}, After restore: {memory_after_restore}"
         )
-
-        Utils.destroy_model_parallel()

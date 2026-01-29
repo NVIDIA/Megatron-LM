@@ -52,7 +52,7 @@ RL_TIMER_NAMES = [
     
     # Optimizer offload/onload
     "rl/offload-optimizer-before-inference",
-    "rl/onload-optimizer-after-inference",
+    "rl/restore-optimizer-state-and-grad-buffers-after-inference",
     "rl/offload-kv-cache-after-inference",
     "rl/onload-kv-cache-before-inference",
     # Fine-grained offload/onload breakdown
@@ -106,7 +106,7 @@ TIMER_HIERARCHY = {
         "rl/sync-rollouts",
         "rl/suspend-engine",
         "rl/offload-optimizer-before-inference",
-        "rl/onload-optimizer-after-inference",
+        "rl/restore-optimizer-state-and-grad-buffers-after-inference",
         "rl/prefetch-weights-to-gpu",
         "rl/prefetch-weights-to-cpu",
         "rl/onload-kv-cache-before-inference",
@@ -431,7 +431,7 @@ class RLProfiler:
         
         # Optimizer memory management
         phases["optimizer_offload"] = get_max("rl/offload-optimizer-before-inference")
-        phases["optimizer_onload"] = get_max("rl/onload-optimizer-after-inference")
+        phases["optimizer_onload"] = get_max("rl/restore-optimizer-state-and-grad-buffers-after-inference")
         phases["optimizer_memory_mgmt"] = phases["optimizer_offload"] + phases["optimizer_onload"]
         
         # Logprobs computation
@@ -753,7 +753,7 @@ def analyze_bottlenecks(profile_path: str, top_n: int = 10) -> str:
         "Rollout Generation": ["rl/collect-rollouts"],
         "Optimizer Memory Mgmt": [
             "rl/offload-optimizer-before-inference",
-            "rl/onload-optimizer-after-inference",
+            "rl/restore-optimizer-state-and-grad-buffers-after-inference",
         ],
         "Logprobs Computation": [
             "rl/compute-old-logprobs",

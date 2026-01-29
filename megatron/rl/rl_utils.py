@@ -26,7 +26,6 @@ from megatron.core import mpu
 from megatron.core.datasets.megatron_tokenizer import MegatronLegacyTokenizer
 from megatron.core.full_cuda_graph import FullCudaGraphWrapper
 from megatron.core.models.common.language_module.language_module import LanguageModule
-from megatron.core.distributed import offload_grad_data, onload_grad_data
 from megatron.core.optimizer import MegatronOptimizer
 from megatron.core.pipeline_parallel import get_forward_backward_func
 from megatron.core.pipeline_parallel.utils import is_pp_last_stage, get_pp_last_rank
@@ -85,13 +84,9 @@ from megatron.core.transformer.custom_layers.batch_invariant_kernels import (
     is_batch_invariant_mode_enabled,
 )
 
-# RL profiling infrastructure
-from megatron.rl.rl_profiling import (
-    initialize_rl_profiler,
-    log_iteration_profile,
-    shutdown_rl_profiler,
-    get_rl_profiler,
-)
+from megatron.core.inference.contexts.dynamic_context import HAVE_TORCH_MEMORY_SAVER
+if HAVE_TORCH_MEMORY_SAVER:
+    from torch_memory_saver import torch_memory_saver
 
 logger = logging.getLogger(__name__)
 
@@ -466,8 +461,9 @@ def get_environment_rollouts(
     nvtx_range = get_nvtx_range()
 
     if args.rl_offload_optimizer_during_inference:
-        with nvtx_range("rl/offload-optimizer-before-inference", time=True):
-            offload_states = offload_grad_data(model[0], optimizer)
+        with nvtx_range("rl/offload-optimizer-state-and-grad-buffers-during-inference", time=True):
+            model[0].offload_grad_buffers()
+            optimizer.offload_to_cpu()
              
     # If we have seperate training and inference models we to refit weights from the training model to the inference model.
     if inference_model is not None:
@@ -540,8 +536,9 @@ def get_environment_rollouts(
         logger.debug(f"Got rollouts on rank {rank}")
 
     if args.rl_offload_optimizer_during_inference:
-        with nvtx_range("rl/onload-optimizer-after-inference", time=True):
-            onload_grad_data(model[0], offload_states, optimizer)
+        with nvtx_range("rl/restore-optimizer-state-and-grad-buffers-after-inference", time=True):
+            model[0].restore_grad_buffers()
+            optimizer.restore_from_cpu()
 
     if lang_rl_log_dir and rank == get_pg_rank(inference_pg_collection.tp):
         with open(
@@ -1618,7 +1615,8 @@ def megatron_rl_inference_mode(
 
         if offload_optimizer_during_inference:
             with nvtx_range("rl/offload-optimizer-before-inference", time=True):
-                offload_states = offload_grad_data(model[0], optimizer)
+                model[0].offload_grad_buffers()
+                optimizer.offload_to_cpu()
 
         # TODO: Remove this if statement once a change to `toggle_cuda_graphs` makes it safe to.
         if cuda_graph_impl != "none" and not args.rl_training_cuda_graphs:
@@ -1628,9 +1626,9 @@ def megatron_rl_inference_mode(
 
         with nvtx_range("rl/onload-kv-cache-before-inference", time=True):
             if offload_kv_cache_during_training:
-                assert (
-                    reset_cuda_graphs
-                ), "reset_cuda_graphs must be True when offloading kv cache during training"
+                # Restore the KV cache by re-binding physical pages to a consistent virtual address
+                torch_memory_saver.resume("kv_cache")
+
                 logger.debug(
                     f"[{dist.get_rank()}] Restoring kv cache ({inference_interface._inference_engine.context.memory_buffer.numel() / 1024**3:.2f} GB) to GPU"
                 )
@@ -1665,7 +1663,8 @@ def megatron_rl_inference_mode(
                 logger.debug(
                     f"[{dist.get_rank()}] Offloading kv cache ({kv_cache.numel() * kv_cache.element_size() / 1024**3:.2f} GB) to CPU"
                 )
-                inference_interface._inference_engine.context.memory_buffer = kv_cache.cpu()
+                torch_memory_saver.pause("kv_cache")
+
             elif remove_kv_cache_during_training:
                 inference_interface._inference_engine.context.memory_buffer = None
 
@@ -1680,7 +1679,8 @@ def megatron_rl_inference_mode(
 
         if offload_optimizer_during_inference:
             with nvtx_range("rl/onload-optimizer-after-inference", time=True):
-                onload_grad_data(model[0], offload_states, optimizer)
+                model[0].restore_grad_buffers()
+                optimizer.restore_from_cpu()
 
         lang_module.train()
 
