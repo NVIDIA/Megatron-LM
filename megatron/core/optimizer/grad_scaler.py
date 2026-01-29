@@ -9,6 +9,11 @@ import torch
 
 
 class MegatronGradScaler(ABC):
+    """Abstract base class for gradient scalers.
+
+    Args:
+        initial_scale (float): The initial value for the loss scale.
+    """
     def __init__(self, initial_scale: float):
         """Initialize scale value with the input initial scale."""
         assert initial_scale > 0.0
@@ -37,7 +42,10 @@ class MegatronGradScaler(ABC):
 
 class ConstantGradScaler(MegatronGradScaler):
     """
-    Constant grad scaler (loss scale is never adjusted regardless of NaNs seen in gradients).
+    Grad scaler with a fixed scale factor.
+
+    The loss scale is never adjusted, regardless of whether NaNs or Infs
+    are detected in the gradients.
     """
 
     def update(self, found_inf: bool):
@@ -51,11 +59,26 @@ class ConstantGradScaler(MegatronGradScaler):
 
 
 class DynamicGradScaler(MegatronGradScaler):
-    """
-    Grad scaler with dynamic scale that gets adjusted during training.
+    """Gradient scaler with a dynamic scale factor adjusted during training.
 
-    Reduces loss scale by `backoff_factor` if `hysteresis` number of NaNs are seen in a row. Increases
-    loss scale by `growth_factor` if NaNs are not seen for `growth_interval` iterations.
+    This class implements a loss scaling strategy to prevent numerical underflow 
+    during mixed-precision training. It reduces the loss scale by a 
+    `backoff_factor` if a `hysteresis` number of NaNs/Infs are detected in 
+    consecutive iterations. Conversely, it increases the loss scale by a 
+    `growth_factor` if no non-finite gradients are seen for a specified 
+    `growth_interval` of iterations.
+
+    Args:
+        initial_scale (float): The starting value for the loss scale.
+        min_scale (float): The lower bound for the loss scale.
+        growth_factor (float): The multiplier used to increase the scale when 
+            gradients are stable. Must be greater than 1.0.
+        backoff_factor (float): The multiplier used to decrease the scale when 
+            non-finite gradients are detected. Must be between 0.0 and 1.0.
+        growth_interval (int): The number of consecutive stable iterations 
+            required before increasing the scale.
+        hysteresis (int): The number of consecutive non-finite iterations 
+            required before decreasing the scale.
     """
 
     def __init__(
