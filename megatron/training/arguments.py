@@ -1987,8 +1987,6 @@ def _add_rl_args(parser):
                        help='If set, use inference logprobs in importance sampling correction of the loss.')
     group.add_argument('--rl-importance-sampling-truncation-coef', type=float, default=None,
                        help="If --inference-logprobs-is-correction is on and this coefficient is set, apply truncation for the IS correction at GRPO loss.")
-    group.add_argument('--rl-calculate-intra-group-similarity', action=argparse.BooleanOptionalAction, default=False,
-                       help='If set, calculate the intra-group similarity of rollouts.')
     group.add_argument('--rl-use-sequence-packing', action=argparse.BooleanOptionalAction, type=bool, default=False,
                        help='Enable sequence packing')
     group.add_argument('--rl-sequence-packing-max-sequences-per-bin', type=int, default=50,

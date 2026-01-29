@@ -74,6 +74,8 @@ def initialize_model_parallel(request, monkeypatch):
     Skips if world_size < tp * pp.
     """
     monkeypatch.setenv("CUDA_DEVICE_MAX_CONNECTIONS", "1")
+    monkeypatch.setenv("WANDB_MODE", "disabled")
+    monkeypatch.setenv("LOG_TO_WANDB", "false")
 
     tp, pp = request.param
     world_size = Utils.world_size
@@ -107,6 +109,7 @@ class TestRLUtils:
         args.hidden_size = 128
         args.max_position_embeddings = 256
         args.seq_length = 256
+        args.wandb_project = None
 
         args.micro_batch_size = 1
 
@@ -269,58 +272,68 @@ class TestRLUtils:
     def test_prepare_data_for_update(self, initialize_model_parallel):
         """Test that getting logprobs at least does not crash."""
         world_size, dp, tp, pp = initialize_model_parallel
+        # Here I assume that we will be consuming all data in one step.
+        group_size = 2
         self.create_test_args(
             micro_batch_size=2,
             seq_length=4,
             curr_iteration=1,
             tensor_model_parallel_size=tp,
             pipeline_model_parallel_size=pp,
+            global_batch_size=dp * 2,
+            grpo_prompts_per_step=dp,
+            grpo_group_size=group_size,
         )
 
         model = MockModel()
         tokenizer = MockTokenizer()
 
         r1 = TokenRollout(
-            trajectory=[1, 2, 3],
+            trajectory=[[1, 2, 3]],
             reward=3.14,
-            generation_mask=[False, True, True],
-            logprobs=[0.1, 0.2, 0.3],
+            generation_mask=[[False, True, True]],
+            logprobs=[[0.1, 0.2, 0.3]],
             env_id='MEGAENV',
             problem_id="2",
         )
         r2 = TokenRollout(
-            trajectory=[1, 2, 3, 4],
+            trajectory=[[1, 2, 3, 4]],
             reward=0.14,
-            generation_mask=[False, True, True, True],
-            logprobs=[0.1, 0.2, 0.3, -1.2],
+            generation_mask=[[False, True, True, True]],
+            logprobs=[[0.1, 0.2, 0.3, -1.2]],
             env_id='MEGAENV',
             problem_id="2",
         )
+
         rollouts = [[r1, r2] for _ in range(dp)]
         try:
-            rl_utils.prepare_data_for_update([model], {}, rollouts, tokenizer)
+            rl_utils.prepare_data_for_update(
+                [model], {}, rollouts, tokenizer, sequence_packing=False, is_correction=False
+            )
         except AssertionError as e:
             # We expect trajectories to come padded there.
             assert str(e).startswith('Rollout is not the correct length')
 
         r1 = TokenRollout(
-            trajectory=torch.tensor([1, 2, 3, tokenizer.eod], dtype=torch.float).cuda(),
+            trajectory=torch.tensor([[1, 2, 3, tokenizer.eod]], dtype=torch.float).cuda(),
             reward=3.14,
-            generation_mask=torch.tensor([False, True, True, True], dtype=torch.float).cuda(),
-            logprobs=torch.tensor([-0.2, -0.3, -3.2]).cuda(),
+            generation_mask=torch.tensor([[False, True, True, True]], dtype=torch.float).cuda(),
+            logprobs=torch.tensor([[-0.2, -0.3, -3.2]]).cuda(),
             env_id='MEGAENV',
             problem_id="2",
         )
         r2 = TokenRollout(
-            trajectory=torch.tensor([1, 2, 234, tokenizer.eod], dtype=torch.float).cuda(),
+            trajectory=torch.tensor([[1, 2, 234, tokenizer.eod]], dtype=torch.float).cuda(),
             reward=0.14,
-            generation_mask=torch.tensor([False, True, True, True], dtype=torch.float).cuda(),
-            logprobs=torch.tensor([-0.2, -0.3, -1.2]),
+            generation_mask=torch.tensor([[False, True, True, True]], dtype=torch.float).cuda(),
+            logprobs=torch.tensor([[-0.2, -0.3, -1.2]]),
             env_id='MEGAENV',
             problem_id="2",
         )
         rollouts = [[r1, r2] for _ in range(dp)]
-        data_iter = rl_utils.prepare_data_for_update([model], {}, rollouts, tokenizer)
+        data_iter = rl_utils.prepare_data_for_update(
+            [model], {}, rollouts, tokenizer, sequence_packing=False, is_correction=False
+        )
 
         _, _, old_logprobs, _, _, _, _ = next(data_iter)
         # All logits are ones in the MockModel.
@@ -328,7 +341,8 @@ class TestRLUtils:
         torch.testing.assert_close(old_logprobs.exp(), torch.ones_like(old_logprobs) / VOCAB)
 
     @pytest.mark.parametrize("use_sequence_packing", [True, False])
-    def test_prepare_trajectories(self, use_sequence_packing):
+    @pytest.mark.parametrize("num_turns", [1, 2])
+    def test_prepare_trajectories(self, use_sequence_packing, num_turns):
         """Test that rollouts are properly prepared for training."""
         seq_length = 8
         self.create_test_args(
@@ -342,34 +356,38 @@ class TestRLUtils:
 
         # Create rollouts of varying lengths
         r1 = TokenRollout(
-            trajectory=[1, 2, 3, tokenizer.eod],
+            trajectory=[[1, 2, 3, tokenizer.eod]] * num_turns,
             reward=3.14,
-            generation_mask=[False, True, True, True],
-            logprobs=[0.1, 0.2, 0.3, 0.35],
+            generation_mask=[[False, True, True, True]] * num_turns,
+            logprobs=[[0.1, 0.2, 0.3, 0.35]] * num_turns,
             env_id='MEGAENV',
             problem_id="1",
         )
         r2 = TokenRollout(
-            trajectory=[4, 5, 6, 7, tokenizer.eod],
+            trajectory=[[4, 5, 6, 7, tokenizer.eod]] * num_turns,
             reward=0.14,
-            generation_mask=[False, True, True, True, True],
-            logprobs=[0.4, 0.5, 0.6, 0.7, 0.75],
+            generation_mask=[[False, True, True, True, True]] * num_turns,
+            logprobs=[[0.4, 0.5, 0.6, 0.7, 0.75]] * num_turns,
             env_id='MEGAENV',
             problem_id="2",
         )
         r3 = TokenRollout(
-            trajectory=[8, 9, tokenizer.eod],
+            trajectory=[[8, 9, tokenizer.eod]] * num_turns,
             reward=2.71,
-            generation_mask=[False, True, True],
-            logprobs=[0.8, 0.9, 0.95],
+            generation_mask=[[False, True, True]] * num_turns,
+            logprobs=[[0.8, 0.9, 0.95]] * num_turns,
             env_id='MEGAENV',
             problem_id="3",
         )
 
-        rollouts = [[r1, r2, r3]]
+        rollouts = [r1, r2, r3]
 
         trajs, genmask, inference_logprobs = rl_utils.prepare_trajectories(
-            rollouts, tokenizer, seq_length
+            rollouts,
+            tokenizer,
+            seq_length,
+            sequence_packing=use_sequence_packing,
+            skip_bos_token=False,
         )
 
         expected_trajs = torch.tensor(
@@ -380,7 +398,7 @@ class TestRLUtils:
             ],
             dtype=torch.long,
             device=trajs.device,
-        )
+        ).repeat_interleave(num_turns, dim=0)
         assert torch.equal(trajs, expected_trajs)
 
         expected_genmask = torch.tensor(
@@ -391,7 +409,7 @@ class TestRLUtils:
             ],
             dtype=torch.bool,
             device=genmask.device,
-        )
+        ).repeat_interleave(num_turns, dim=0)
         assert torch.equal(genmask, expected_genmask)
 
         if use_sequence_packing:
@@ -403,7 +421,7 @@ class TestRLUtils:
                 ],
                 dtype=torch.float32,
                 device=inference_logprobs.device,
-            )
+            ).repeat_interleave(num_turns, dim=0)
             torch.testing.assert_close(inference_logprobs, expected_logprobs, rtol=0, atol=0)
         else:
             expected_logprobs = [
@@ -411,8 +429,53 @@ class TestRLUtils:
                 [0.4, 0.5, 0.6, 0.7, 0.75],
                 [0.8, 0.9, 0.95],
             ]
+            expected_logprobs = [el for el in expected_logprobs for _ in range(num_turns)]
             assert len(inference_logprobs) == len(expected_logprobs)
             for got, exp in zip(inference_logprobs, expected_logprobs):
                 got_t = got if torch.is_tensor(got) else torch.tensor(got, dtype=torch.float32)
                 exp_t = torch.tensor(exp, dtype=torch.float32, device=got_t.device)
                 torch.testing.assert_close(got_t, exp_t, rtol=0, atol=0)
+
+    def test_single_turn_advantage_calculation(self):
+        rewards = [[-1, 1], [4, 4]]
+        num_turns = [[1, 1], [1, 1]]
+        advs = rl_utils.calculate_grpo_advantages(rewards, num_turns)
+        torch.testing.assert_close(
+            torch.tensor(advs), torch.tensor([-1, 1.0, 0.0, 0.0]), atol=1e-4, rtol=1e-5
+        )
+
+    def test_multi_turn_advantage_calculation(self):
+        rewards = [[-1, 1], [4, 4]]
+        num_turns = [[2, 1], [1, 3]]
+        advs = rl_utils.calculate_grpo_advantages(rewards, num_turns)
+        torch.testing.assert_close(
+            torch.tensor(advs),
+            torch.tensor([-1, -1, 1.0, 0.0, 0.0, 0.0, 0.0]),
+            atol=1e-4,
+            rtol=1e-5,
+        )
+
+    def test_pad_list_of_nones(self):
+        with pytest.raises(ValueError) as e_info:
+            rl_utils._pad_nonnull_with_zeros([None] * 3, 42)
+        assert "At least one" in str(e_info)
+
+    def test_pad_with_wrong_params(self):
+        with pytest.raises(ValueError) as e_info:
+            rl_utils._pad_nonnull_with_zeros([torch.zeros(5)], 4)
+        assert "larger length" in str(e_info)
+
+    def test_pad_full_size(self):
+        padded = rl_utils._pad_nonnull_with_zeros([torch.zeros(5), torch.zeros(5)], 5)
+        assert padded.shape == (2, 5)
+
+    def test_pad_some_nones(self):
+        padded = rl_utils._pad_nonnull_with_zeros([None, torch.zeros(5)], 5)
+        assert padded.shape == (2, 5)
+        assert (padded[0] == 0).all()
+
+    def test_pad_normal(self):
+        padded = rl_utils._pad_nonnull_with_zeros(
+            [torch.zeros(2), torch.zeros(3), torch.zeros(4)], 5
+        )
+        assert padded.shape == (3, 5)
