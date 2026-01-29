@@ -5,6 +5,12 @@ EP=${EP:-32}
 NODES_REQUIRED=${NODES_REQUIRED:-4}
 LLM="nemotron6_3b_moe"
 
+ROOT_DIR="/lustre/fsw/portfolios/llmservice/projects/llmservice_nlp_fm/nemotron6"
+
+CHECKPOINT="${ROOT_DIR}/3b_hybrid_moe/checkpoints/phase2_lc_reinit_emb/"
+
+TOKENIZER_MODEL="${ROOT_DIR}/tokenizers/multiMixV8.gpt4o_nc_sd.500000.128k.vocab.json"
+
 echo "Using Nemotron6 3B MOE model checkpoint"
 SCRIPT_PATH="${BASH_SOURCE[0]}"
 source $(dirname $SCRIPT_PATH)/common.sh
