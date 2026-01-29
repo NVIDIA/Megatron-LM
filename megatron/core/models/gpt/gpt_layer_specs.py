@@ -171,6 +171,12 @@ def get_gpt_layer_with_inference_spec(
         )
 
 
+import os
+# NOTE: These toggles are intentionally environment-driven for experimentation.
+# They are expected to be replaced by explicit config options.
+FUSE_INPUT_LAYERNORM = os.environ.get("FUSE_INPUT_LAYERNORM", "1") == "1"
+FUSE_QKV_DOWN_PROJ = os.environ.get("FUSE_QKV_DOWN_PROJ", "0") == "1"
+
 def get_gpt_layer_with_transformer_engine_spec(
     num_experts: Optional[int] = None,
     moe_grouped_gemm: Optional[bool] = False,
@@ -235,6 +241,31 @@ def get_gpt_layer_with_transformer_engine_spec(
 
     if multi_latent_attention:
         assert qk_l2_norm is False, "qk_l2_norm is not supported with MLA."
+
+        fuse_input_layernorm = (
+            FUSE_INPUT_LAYERNORM
+            and FUSE_QKV_DOWN_PROJ
+            and backend.column_parallel_layer_norm_linear() is not None
+        )
+
+        input_layernorm = (
+            IdentityOp 
+            if fuse_input_layernorm 
+            else backend.layer_norm()
+        )
+
+        linear_q_down_proj = (
+            backend.column_parallel_layer_norm_linear()
+            if fuse_input_layernorm
+            else backend.linear()
+        )
+
+        linear_kv_down_proj = (
+            backend.column_parallel_layer_norm_linear()
+            if fuse_input_layernorm
+            else backend.linear()
+        )
+
         linear_q_up_proj = (
             backend.column_parallel_layer_norm_linear()
             if qk_layernorm
@@ -248,15 +279,15 @@ def get_gpt_layer_with_transformer_engine_spec(
         return ModuleSpec(
             module=TransformerLayer,
             submodules=TransformerLayerSubmodules(
-                input_layernorm=backend.layer_norm(),
+                input_layernorm=input_layernorm,
                 self_attention=ModuleSpec(
                     module=MLASelfAttention,
                     params={"attn_mask_type": AttnMaskType.causal},
                     submodules=MLASelfAttentionSubmodules(
                         linear_q_proj=backend.column_parallel_linear(),
-                        linear_q_down_proj=backend.linear(),
+                        linear_q_down_proj=linear_q_down_proj,
                         linear_q_up_proj=linear_q_up_proj,
-                        linear_kv_down_proj=backend.linear(),
+                        linear_kv_down_proj=linear_kv_down_proj,
                         linear_kv_up_proj=linear_kv_up_proj,
                         core_attention=backend.core_attention(),
                         linear_proj=backend.row_parallel_linear(),
@@ -268,6 +299,13 @@ def get_gpt_layer_with_transformer_engine_spec(
                 pre_mlp_layernorm=backend.layer_norm() if num_experts else IdentityOp,
                 mlp=mlp,
                 mlp_bda=get_bias_dropout_add,
+                sharded_state_dict_keys_map=(
+                    {
+                        "self_attention.linear_qkv_down_proj.layer_norm_": "input_layernorm.",
+                    }
+                    if fuse_input_layernorm
+                    else {}
+                ),
             ),
         )
     else:
