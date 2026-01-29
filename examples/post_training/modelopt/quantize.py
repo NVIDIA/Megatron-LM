@@ -81,7 +81,7 @@ def add_text_generate_ptq_args(parser):
         "--calib-dataset-path-or-name",
         type=str,
         default="cnn_dailymail",
-        help="Path to local calibration dataset file (.json/.jsonl) or HuggingFace dataset name.",
+        help="Path to local calibration dataset file (.jsonl) or HuggingFace dataset name.",
     )
     group.add_argument(
         "--calib-max-sequence-length",
@@ -268,7 +268,7 @@ def get_calib_dataloader(
 ):
     """Return a dataloader/iterator for calibration using SFT or HF datasets.
 
-    Supports either a local path (.json, .jsonl) or a HuggingFace dataset name.
+    Supports either a local path (.jsonl) or a HuggingFace dataset name.
 
     Args:
         dataset_path_or_name (str): Local path to json/jsonl or HuggingFace dataset name.
@@ -283,13 +283,11 @@ def get_calib_dataloader(
     if os.path.isfile(dataset_path_or_name):
         # Local file
         print_rank_0(f"Loading calibration dataset from local file: {dataset_path_or_name}")
-        if dataset_path_or_name.endswith(".jsonl"):
-            with open(dataset_path_or_name, "r") as f:
+        try:
+            with open(dataset_path_or_name) as f:
                 dataset = [json.loads(line) for line in f if line.strip()]
-        else:  # assume .json list
-            with open(dataset_path_or_name, "r") as f:
-                dataset = json.load(f)
-            assert isinstance(dataset, list), "Dataset should be a list"
+        except Exception as e:
+            raise ValueError(f"Error reading jsonl file: {dataset_path_or_name}\n{e}")
 
         print_rank_0(f"Loaded calibration dataset ({dataset_path_or_name}) with {len(dataset)} samples")
         calib_size = min(len(dataset), calib_size)
@@ -299,12 +297,15 @@ def get_calib_dataloader(
         for i in range(calib_size):
             sample = dataset[i]
             # Extract text field from various possible keys
-            if "text" in sample:
+            if isinstance(sample, dict) and "text" in sample:
                 full_text = sample["text"]
-            elif "content" in sample:
-                full_text = sample["content"]
+            elif isinstance(sample, list) and isinstance(sample[0], dict):
+                assert "role" in sample[0] and "content" in sample[0]
+                # Sample looks like [{"role": "A", "content": "..."}, {"role": "B", "content": "..."}, ...]
+                # Concatenate them into single string i.e. "A: ...B: ..."
+                full_text = "".join([f"{msg['role']}: {msg['content']}" for msg in sample])
             else:
-                raise ValueError(f"Sample {i} missing 'text' or 'content' field: {list(sample.keys())}")
+                raise ValueError(f"Sample {i} has unexpected format: {sample!r}")
 
             start_idx = 0
             # Check if sequence is long enough to be sliced
@@ -327,8 +328,8 @@ def get_calib_dataloader(
             batch_size=1,
             device="cuda",
         )  # cannot be returned since the other yield statement already makes this fn a generator
-        for sample in dataloader:
-            yield sample["input_ids"]
+        for tokens in dataloader:
+            yield tokens["input_ids"]
 
 
 if __name__ == "__main__":
