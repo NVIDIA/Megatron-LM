@@ -8,6 +8,7 @@
 [Configuration](./ADVANCED.md#advanced-configuration) |
 [Slurm Examples](./ADVANCED.md#slurm-examples) |
 [Speculative Decoding](./speculative.md) |
+[Knowledge Distillation](./distillation.md) |
 [Advanced Topics](./ADVANCED.md)
 
 </div>

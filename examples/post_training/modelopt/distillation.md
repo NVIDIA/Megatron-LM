@@ -1,9 +1,5 @@
 # Megatron-LM ModelOpt Distillation Integration
 
-## Table of Contents
-
-[[_TOC_]]
-
 ## How To
 
 ### Prerequisites
@@ -16,22 +12,22 @@ We require the following pieces of data:
 * Teacher model weights
 * Student model weights (unless starting from scratch)
 * NeMo-format config file for teacher model
-* Distillation run config file
 * Tokenizer
 * Dataset
 
-It also requires the installation of the [NVIDIA Model Optimizer library](https://github.com/NVIDIA/Model-Optimizer)
+And optionally:
+* Distillation run config file
 
 ### Teacher checkpoint format
 
 We enforce the use of a config yaml in [NeMo](https://github.com/NVIDIA/NeMo) checkpoint-format style to define the arguments to the teacher model.
 The normal command-line arguments go toward constructing the student, thus the values in this file
-override the student arguments before being handed to the teacher constructor. This file must be
-named `model_config.yaml` and be placed in the root of the teacher model checkpoint folder.
-Unlike NeMo-generated checkpoints, Megatron-LM checkpoints do not contain these files by default and must be manually created.
+override the student arguments before being handed to the teacher constructor. This file must be either passed in via
+`--export-kd-teacher-model-config` or be named `model_config.yaml` in the root of the teacher model checkpoint folder.
+Unlike NeMo-generated checkpoints, Megatron-LM checkpoints do not contain this file by default and must be manually created.
 
-> NOTE: Not all keys in the NEMO-style yaml correspond 1:1 to the argument names for Megatron-LM. These
-are converted in `megatron/inference/gpt/model_provider.py`.
+> NOTE: Not all keys in the NeMo-style yaml correspond 1:1 to the argument names for Megatron-LM. These
+are converted in `megatron/post_training/model_builder.py`.
 
 ### Distillation config format
 
@@ -44,21 +40,31 @@ intermediate_layer_pairs:
   - ["decoder.final_layernorm", "decoder.layers.30.input_layernorm"]
 skip_lm_loss: true
 kd_loss_scale: 10.0
+logit_kl_temperature: 1.0
 ```
 
 * `logit_layers` defines the names of the student and teacher submodules, respectively, whose outputs are the logits.
 * `intermediate_layer_pairs` defines the potentially multiple – or zero – pairs of intermediate activation layers to also perform loss on.
-* `skip_lm_loss` decides whether or not to compute and combine the original training LM loss with the KD loss
+* `skip_lm_loss` decides whether or not to compute and combine the original training LM loss with the KD loss.
 * `kd_loss_scale` will scale the KD loss before adding it to the LM loss, if `skip_lm_loss` is `False`.
+* `logit_kl_temperature` is the temperature smoothing factor to multiply the logits by prior to softmax and loss.
+
+Without this configuration file, the default logits-only distillation with scale and temperatures of 1.0 will be performed.
 
 ### Training
 
-Distillation is triggered by calling `pretrain_gpt.py` with the additional following arguments:
+Distillation is triggered by calling `pretrain_gpt.py` or `pretrain_mamba.py` with the following arguments:
 
 ```bash
---kd-teacher-load <path-to-teacher-checkpoint>
---kd-distill-cfg <path-to-distill-config-yaml-file>
+--export-kd-teacher-load <path-to-teacher-checkpoint>
 --export-te-mcore-model
+```
+
+optionally alongside the additional following arguments:
+
+```bash
+--export-kd-distill-cfg <path-to-distill-config-yaml-file>
+--export-kd-teacher-model-config <path-to-teacher-model-config-file>
 ```
 
 > NOTE: If the teacher checkpoint happens to be in a different format from the student's (whose format is specified via `--ckpt-format`), it can
@@ -80,8 +86,6 @@ both defined in `modelopt.torch.distill.plugins.megatron`.
 ## Restrictions
 
 * Interleaved Pipeline Parallel is unsupported for Distillation.
-
-* Only Megatron-Core models (not legacy Megatron) are supported for Distillation.
 
 ## Known Issues
 
