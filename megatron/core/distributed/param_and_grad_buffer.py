@@ -974,13 +974,19 @@ class _ParamAndGradBuffer:
         """
         Reload the buffers from CPU.
         """
-        if move_params and self.param_data is not None and self.param_data_cpu is not None and self.param_data.storage().size() == 0:
+        if (
+            move_params
+            and self.param_data is not None
+            and self.param_data_cpu is not None
+            and self.param_data.storage().size() == 0
+        ):
             self.param_data.storage().resize_(self.param_data_size)
             self.param_data.copy_(self.param_data_cpu, non_blocking=True)
         if move_grads and self.grad_data is not None and self.grad_data_size > 0:
             self.grad_data.storage().resize_(self.grad_data_size)
             self.grad_data.zero_()
             self.grad_data_size = 0
+
 
 def partition_buckets(
     buffers: List[_ParamAndGradBuffer], force_single_bucket_group: bool = False

@@ -7,10 +7,7 @@ from types import SimpleNamespace
 import pytest
 import torch
 
-from megatron.core.distributed import (
-    DistributedDataParallel,
-    DistributedDataParallelConfig,
-)
+from megatron.core.distributed import DistributedDataParallel, DistributedDataParallelConfig
 from megatron.core.enums import ModelType
 from megatron.core.models.common.language_module.language_module import LanguageModule
 from megatron.core.models.gpt.gpt_layer_specs import get_gpt_layer_with_transformer_engine_spec
@@ -437,10 +434,7 @@ class TestRLUtils:
     def test_grad_buffer_offload(self, initialize_model_parallel):
         """Test that grad buffer offload/onload correctly frees and restores GPU memory."""
         world_size, dp, tp, pp = initialize_model_parallel
-        self.create_test_args(
-            tensor_model_parallel_size=tp,
-            pipeline_model_parallel_size=pp,
-        )
+        self.create_test_args(tensor_model_parallel_size=tp, pipeline_model_parallel_size=pp)
 
         model_parallel_cuda_manual_seed(123)
 
@@ -484,9 +478,9 @@ class TestRLUtils:
 
         # Verify storage is restored
         restored_sizes = [buf.grad_data.storage().size() for buf in all_buffers]
-        assert initial_sizes == restored_sizes, (
-            f"Expected restored sizes {restored_sizes} to match initial {initial_sizes}"
-        )
+        assert (
+            initial_sizes == restored_sizes
+        ), f"Expected restored sizes {restored_sizes} to match initial {initial_sizes}"
 
     @pytest.mark.parametrize(
         "initialize_model_parallel",
@@ -500,10 +494,7 @@ class TestRLUtils:
     def test_optimizer_offload(self, initialize_model_parallel):
         """Test that optimizer offload_to_cpu/restore_from_cpu correctly moves state to/from CPU."""
         world_size, dp, tp, pp = initialize_model_parallel
-        self.create_test_args(
-            tensor_model_parallel_size=tp,
-            pipeline_model_parallel_size=pp,
-        )
+        self.create_test_args(tensor_model_parallel_size=tp, pipeline_model_parallel_size=pp)
         model_parallel_cuda_manual_seed(123)
 
         # Create a realistic GPTModel as used in RL training
