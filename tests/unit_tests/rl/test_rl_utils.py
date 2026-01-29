@@ -484,6 +484,7 @@ class TestRLUtils:
             [torch.zeros(2), torch.zeros(3), torch.zeros(4)], 5
         )
         assert padded.shape == (3, 5)
+
     @pytest.mark.parametrize(
         "initialize_model_parallel",
         [
