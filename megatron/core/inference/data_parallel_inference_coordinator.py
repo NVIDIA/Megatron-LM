@@ -112,7 +112,6 @@ class DataParallelInferenceCoordinator:
         local_ip = socket.gethostname()
 
         self.router_socket = self.context.socket(zmq.ROUTER)
-        self.router_socket.setsockopt(zmq.LINGER, 0)
         is_bound = False
         if inference_coordinator_port is not None:
             try:
