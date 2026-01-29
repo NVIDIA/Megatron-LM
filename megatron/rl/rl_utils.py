@@ -84,6 +84,9 @@ from megatron.core.transformer.custom_layers.batch_invariant_kernels import (
     is_batch_invariant_mode_enabled,
 )
 
+from megatron.core.inference.contexts.dynamic_context import HAVE_TORCH_MEMORY_SAVER
+if HAVE_TORCH_MEMORY_SAVER:
+    from torch_memory_saver import torch_memory_saver
 
 logger = logging.getLogger(__name__)
 
@@ -101,7 +104,6 @@ def _maybe_prefetch_separate_inference_model_weights(model_core, *, to_cpu: bool
         return
     if args.rl_inference_model_unified_memory_level != 1:
         return
-
     device = -1 if to_cpu else int(torch.cuda.current_device())
     # Note: include_buffers=False because buffers created with explicit device= in register_buffer()
     # are not allocated via the UVM mempool and will fail UVM operations. Only parameters are UVM-allocated.
@@ -458,13 +460,13 @@ def get_environment_rollouts(
     args = get_args()
     nvtx_range = get_nvtx_range()
 
+    if args.rl_offload_optimizer_during_inference:
+        with nvtx_range("offload-optimizer-state-and-grad-buffers-during-inference"):
+            model[0].offload_grad_buffers()
+            optimizer.offload_to_cpu()
+             
     # If we have seperate training and inference models we to refit weights from the training model to the inference model.
     if inference_model is not None:
-        if args.rl_offload_optimizer_during_inference:
-            with nvtx_range("offload-optimizer-before-refit"):
-                optimizer.offload_to_cpu()
-                torch.cuda.empty_cache()
-
         # If the separate inference model weights were prefetched to CPU while idle, bring them
         # back to GPU before refit/copy and before any CUDA-graph'd inference.
         with nvtx_range("prefetch-inference-model-weights-to-gpu"):
@@ -493,7 +495,7 @@ def get_environment_rollouts(
             optimizer,
             args.cuda_graph_impl,
             args.rl_reset_cuda_graphs,
-            args.rl_offload_optimizer_during_inference,
+            False, # offload optimizer during rollout collection is handled above
             args.rl_offload_kv_cache_during_training,
             args.rl_remove_kv_cache_during_training,
         ) as inference_interface:
@@ -532,6 +534,11 @@ def get_environment_rollouts(
             # TODO(jbarker): double check why this isn't causing rank 0 memory allocations
             torch.distributed.broadcast_object_list(rollouts, src=0)
         logger.debug(f"Got rollouts on rank {rank}")
+
+    if args.rl_offload_optimizer_during_inference:
+        with nvtx_range("restore-optimizer-state-and-grad-buffers-after-inference"):
+            model[0].restore_grad_buffers()
+            optimizer.restore_from_cpu()
 
     if lang_rl_log_dir and rank == get_pg_rank(inference_pg_collection.tp):
         with open(
@@ -1606,7 +1613,8 @@ def megatron_rl_inference_mode(
     with torch.no_grad():
 
         if offload_optimizer_during_inference:
-            with nvtx_range("offload-optimizer-before-inference"):
+            with nvtx_range("offload-optimizer-state-and-grad-buffers-before-inference"):
+                model[0].offload_grad_buffers()
                 optimizer.offload_to_cpu()
 
         # TODO: Remove this if statement once a change to `toggle_cuda_graphs` makes it safe to.
@@ -1617,9 +1625,9 @@ def megatron_rl_inference_mode(
 
         with nvtx_range("onload-kv-cache-before-inference"):
             if offload_kv_cache_during_training:
-                assert (
-                    reset_cuda_graphs
-                ), "reset_cuda_graphs must be True when offloading kv cache during training"
+                # Restore the KV cache by re-binding physical pages to a consistent virtual address
+                torch_memory_saver.resume("kv_cache")
+
                 logger.debug(
                     f"[{dist.get_rank()}] Restoring kv cache ({inference_interface._inference_engine.context.memory_buffer.numel() / 1024**3:.2f} GB) to GPU"
                 )
@@ -1654,7 +1662,8 @@ def megatron_rl_inference_mode(
                 logger.debug(
                     f"[{dist.get_rank()}] Offloading kv cache ({kv_cache.numel() * kv_cache.element_size() / 1024**3:.2f} GB) to CPU"
                 )
-                inference_interface._inference_engine.context.memory_buffer = kv_cache.cpu()
+                torch_memory_saver.pause("kv_cache")
+
             elif remove_kv_cache_during_training:
                 inference_interface._inference_engine.context.memory_buffer = None
 
@@ -1668,7 +1677,8 @@ def megatron_rl_inference_mode(
             _maybe_prefetch_separate_inference_model_weights(model_core, to_cpu=True)
 
         if offload_optimizer_during_inference:
-            with nvtx_range("onload-optimizer-after-inference"):
+            with nvtx_range("onload-optimizer-state-and-grad-buffers-after-inference"):
+                model[0].restore_grad_buffers()
                 optimizer.restore_from_cpu()
 
         lang_module.train()
