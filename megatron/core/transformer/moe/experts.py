@@ -8,7 +8,7 @@ from copy import deepcopy
 from dataclasses import dataclass
 from functools import partial
 from math import ceil
-from typing import Optional, Protocol, Tuple, cast
+from typing import Optional, Protocol, Tuple
 
 import torch
 import torch.nn.functional as F
@@ -48,7 +48,6 @@ from megatron.core.transformer.moe.moe_utils import (
     ProcessGroupCollection,
     get_align_size_for_quantization,
 )
-from megatron.core.transformer.spec_utils import ModuleSpec, build_module
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.transformer.utils import (
     ensure_metadata_has_dp_cp_group,
@@ -518,7 +517,7 @@ class GroupedMLP(MegatronModule):
         pass
 
 
-class LinearFc1Interface(Protocol):
+class GroupedLinearFc1Interface(Protocol):
     """Interface for linear_fc1 module in TEGroupedMLP."""
 
     def forward(
@@ -532,7 +531,7 @@ class LinearFc1Interface(Protocol):
         ...
 
 
-class LinearFc1Builder(Protocol):
+class GroupedLinearFc1Builder(Protocol):
     """Protocol describing how to build a linear_fc1 layer in TEGroupedMLP."""
 
     def __call__(
@@ -549,12 +548,12 @@ class LinearFc1Builder(Protocol):
         is_expert: bool,
         tp_comm_buffer_name: str | None,
         pg_collection: ProcessGroupCollection | None,
-    ) -> LinearFc1Interface:
+    ) -> GroupedLinearFc1Interface:
         """Builds a linear_fc1 layer for TEGroupedMLP."""
         ...
 
 
-class LinearFc2Interface(Protocol):
+class GroupedLinearFc2Interface(Protocol):
     """Protocol for linear_fc2 module in TEGroupedMLP."""
 
     def forward(
@@ -568,7 +567,7 @@ class LinearFc2Interface(Protocol):
         ...
 
 
-class LinearFc2Builder(Protocol):
+class GroupedLinearFc2Builder(Protocol):
     """Protocol describing how to build a linear_fc2 layer in TEGroupedMLP."""
 
     def __call__(
@@ -585,7 +584,7 @@ class LinearFc2Builder(Protocol):
         is_expert: bool,
         tp_comm_buffer_name: str | None,
         pg_collection: ProcessGroupCollection | None,
-    ) -> LinearFc2Interface:
+    ) -> GroupedLinearFc2Interface:
         """Builds a linear_fc2 layer for TEGroupedMLP."""
         ...
 
@@ -597,9 +596,9 @@ class TEGroupedMLPSubmodules:
     including  linear fc1, activation function, linear fc2.
     """
 
-    linear_fc1: LinearFc1Builder
+    linear_fc1: GroupedLinearFc1Builder
 
-    linear_fc2: LinearFc2Builder
+    linear_fc2: GroupedLinearFc2Builder
 
     activation_func: TEActivationFunctionBuilder | None = None
     """
