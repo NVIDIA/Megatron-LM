@@ -149,7 +149,10 @@ class MambaStack(MegatronModule):
                 elif layer_type == LayerSymbols.MOE:
                     # Transformer layers apply their own pp_layer_offset
                     layer = build_module(
-                        submodules.moe_layer, config=self.config, layer_number=i + 1
+                        submodules.moe_layer,
+                        config=self.config,
+                        layer_number=i + 1,
+                        pg_collection=pg_collection,
                     )
                 else:
                     assert False, "unexpected layer_type"
@@ -208,6 +211,7 @@ class MambaStack(MegatronModule):
         *,
         inference_params: Optional[BaseInferenceContext] = None,
         packed_seq_params: Optional[PackedSeqParams] = None,
+        padding_mask=None,
     ):
         """
         Forward function of the MambaStack class.
@@ -290,6 +294,7 @@ class MambaStack(MegatronModule):
                             rotary_pos_emb=rotary_pos_emb,
                             sequence_len_offset=sequence_len_offset,
                             packed_seq_params=packed_seq_params,
+                            padding_mask=padding_mask,
                         )
                     else:  # MambaLayer
                         hidden_states = layer(
