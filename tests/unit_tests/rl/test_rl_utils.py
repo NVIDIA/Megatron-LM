@@ -273,15 +273,16 @@ class TestRLUtils:
         """Test that getting logprobs at least does not crash."""
         world_size, dp, tp, pp = initialize_model_parallel
         # Here I assume that we will be consuming all data in one step.
+        group_size = 2
         self.create_test_args(
             micro_batch_size=2,
             seq_length=4,
             curr_iteration=1,
             tensor_model_parallel_size=tp,
             pipeline_model_parallel_size=pp,
-            global_batch_size=Utils.world_size * 2,
-            grpo_prompts_per_step=Utils.world_size,
-            grpo_group_size=2,
+            global_batch_size=dp * 2,
+            grpo_prompts_per_step=dp,
+            grpo_group_size=group_size,
         )
 
         model = MockModel()
@@ -304,7 +305,7 @@ class TestRLUtils:
             problem_id="2",
         )
 
-        rollouts = [[r1, r2] for _ in range(Utils.world_size)]
+        rollouts = [[r1, r2] for _ in range(dp)]
         try:
             rl_utils.prepare_data_for_update(
                 [model], {}, rollouts, tokenizer, sequence_packing=False, is_correction=False
@@ -329,7 +330,7 @@ class TestRLUtils:
             env_id='MEGAENV',
             problem_id="2",
         )
-        rollouts = [[r1, r2] for _ in range(Utils.world_size)]
+        rollouts = [[r1, r2] for _ in range(dp)]
         data_iter = rl_utils.prepare_data_for_update(
             [model], {}, rollouts, tokenizer, sequence_packing=False, is_correction=False
         )
