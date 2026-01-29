@@ -42,7 +42,7 @@ spec:
 
     ARGUMENTS=(
         "DATA_PATH=/mnt/artifacts"
-        "DATA_CACHE_PATH=/workspace/data/cache"
+        "DATA_CACHE_PATH=/lustre/fsw/coreai_dlalgo_mcore/mcore_ci/data/$RUN_ID/cache/"
         "OUTPUT_PATH={assets_dir}"
         "TENSORBOARD_PATH={assets_dir}/tensorboard"
         "CHECKPOINT_SAVE_PATH={artifacts_dir}/checkpoints"
