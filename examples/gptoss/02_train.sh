@@ -110,7 +110,7 @@ DISTRIBUTED_ARGS=(
 # NOTE: Adjust the following model and training parameters as needed below, these are example values for openai/gpt-oss-20b
 TP_SIZE=1     
 EP_SIZE=1     
-PP_SIZE=1     
+PP_SIZE=${WORLD_SIZE}     
 MICRO_BATCH_SIZE=1
 GLOBAL_BATCH_SIZE=128
 NUM_LAYERS=12

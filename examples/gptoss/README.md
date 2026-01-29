@@ -6,7 +6,7 @@
 
 [Megatron-Bridge](https://github.com/NVIDIA-NeMo/Megatron-Bridge)
 
-Megatron bridge provides a quick and convenient way to convert HuggingFace checkpoints to the Megatron format used by Megatron-LM. Follow the instructions in the [Megatron-Bridge Installation](https://github.com/NVIDIA-NeMo/Megatron-Bridge/blob/main/README.md#-installation) to run the nemo docker container and convert checkpoints (via mounted volumes - make sure that the huggingface cache location AND the megatron checkpoint locations are properly mounted, otherwise you may not be saving the converted model to disk correctly).
+Megatron Bridge provides a quick and convenient way to convert HuggingFace checkpoints to the Megatron format used by Megatron-LM. Follow the instructions in the [Megatron-Bridge Installation](https://github.com/NVIDIA-NeMo/Megatron-Bridge/blob/main/README.md#-installation) to run the nemo docker container and convert checkpoints (via mounted volumes - make sure that the huggingface cache location AND the megatron checkpoint locations are properly mounted, otherwise you may not be saving the converted model to disk correctly).
 
 Below is an example of how to use Megatron-Bridge inside the pytorch container to convert a HuggingFace model checkpoint to Megatron format.
 
@@ -64,7 +64,7 @@ python3 -m torch.distributed.launch --nproc-per-node=8 examples/gptoss/01_conver
 
 ## Step 2: Train from Scratch
 
-To train from scratch first follow the steps below to setup the environment appropriately before running the training script in docker. Even though we are running the same container as before, it is better to restart the container to ensure a clean environment and that all environment and docker variables are set correctly.
+To train from scratch first follow the steps below to setup the environment appropriately before running the training script in docker. Even though we are running the same container as before, it is better to restart the container to ensure a clean environment and that all environment and docker variables are set correctly. For the following example we used 8x GB300, but you should change the number of GPUs and nodes as needed.
 
 ### Setup Environment
 
@@ -99,6 +99,8 @@ EOF
 ```
 
 ### Run Container with Mounted Volumes
+
+**NOTE:** This container runs the example training script `02_train.sh` located in the `examples/gptoss` directory. Adjust the script as needed for your training requirements, including changing model and training parameters, such as the *different parallelization sizes*, `--hidden-size`, `--ffn-hidden-size`, `--num-attention-heads`, `NUM_LAYERS`, etc. in the script itself.
 
 To train using mock data, run the following command:
 ```bash
