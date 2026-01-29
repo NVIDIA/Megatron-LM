@@ -760,25 +760,28 @@ def is_mcore_tensor_model_parallel(param: torch.Tensor) -> bool:
     """
     Check if the given parameter is Megatron-Core tensor model parallel.
     """
-    return getattr(param, "_mcore_tp", False) or getattr(param, "tensor_model_parallel", False)
+    return get_mcore_tensor_parallel_partition_dim(param) is not None
 
 
 def is_mcore_tensor_parallel_duplicated(param: torch.Tensor) -> bool:
     """
     Check if the given parameter is Megatron-Core tensor model parallel and duplicated.
     """
-    return getattr(param, "_tp_duplicated", False) or not is_mcore_tensor_model_parallel(param)
+    return get_mcore_tensor_parallel_partition_dim(param) is None
 
 
 def get_mcore_tensor_parallel_partition_dim(param: torch.Tensor) -> Optional[int]:
     """
     Get the partition dimension for a Megatron-Core tensor model parallel parameter.
     """
-    if is_mcore_tensor_model_parallel(param):
-        if hasattr(param, "_tp_partition_dim"):
-            return param._tp_partition_dim
-        else:
-            return param.partition_dim
+    if hasattr(param, "_tensor_parallel_mode"):
+        if param._tensor_parallel_mode == "column":
+            return 0
+        elif param._tensor_parallel_mode == "row":
+            return 1
+        return None
+    elif hasattr(param, "partition_dim"):
+        return param.partition_dim
     return None
 
 
