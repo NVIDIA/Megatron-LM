@@ -9,11 +9,12 @@ import random
 import re
 from collections import defaultdict
 from enum import Enum
-from typing import Any, Callable, Iterable, NamedTuple, Optional, Set, Tuple, Union
+from typing import Any, Callable, Iterable, List, NamedTuple, Optional, Set, Tuple, Union
 
 import numpy as np
 import torch
 
+from megatron.core._rank_utils import log_single_rank, safe_get_rank
 from megatron.core.dist_checkpointing.mapping import ShardedObject
 
 """DISCLAIMER: THIS IS AN EXPERIMENTAL FEATURE.
@@ -234,20 +235,36 @@ class RerunStateMachine:
 
         self.saved_results: dict[Call, Any] = {}
         self.stats: dict[Caller, QuickStats] = defaultdict(lambda: QuickStats())
-        if _safe_get_rank() == 0:
-            logger.warning(f"RerunStateMachine initialized in mode {mode}")
+        log_single_rank(logger, logging.WARNING, f"RerunStateMachine initialized in mode {mode}")
 
     def set_mode(self, mode: RerunMode) -> None:
         """Method to set the operating mode"""
 
-        if _safe_get_rank() == 0:
-            logger.warning(f"Setting RerunStateMachine mode {mode}")
+        log_single_rank(logger, logging.WARNING, f"Setting RerunStateMachine mode {mode}")
         self.mode = mode
 
     def get_mode(self) -> RerunMode:
         """Method to get the operating mode"""
 
         return self.mode
+
+    def _reduce_any(self, value: Union[bool, List[bool]]) -> Union[bool, Tuple[bool, ...]]:
+        """
+        All-reduce a boolean value (or multiple boolean values) across the world group.
+
+        If any of the ranks have a True value, return True.
+        If all the ranks have a False value, return False.
+
+        For multiple inputs, returns a tuple.
+        """
+        if isinstance(value, list):
+            val_tensor: torch.Tensor = torch.tensor(value, dtype=torch.int32, device='cuda')
+            torch.distributed.all_reduce(val_tensor)
+            return tuple([x > 0 for x in val_tensor.tolist()])
+        else:
+            val_tensor: torch.Tensor = torch.tensor([value], dtype=torch.int32, device='cuda')
+            torch.distributed.all_reduce(val_tensor)
+            return val_tensor.item() > 0
 
     def should_run_forward_backward(self, data_iterator: DataIteratorArgType) -> bool:
         """Method instructing whether to (re)run the forward-backward pass.
@@ -306,14 +323,11 @@ class RerunStateMachine:
             if self.mode == RerunMode.DISABLED:
                 self.state = RerunState.NOT_RUNNING_YET
                 return False
-            will_rerun_tensor: torch.Tensor = torch.tensor(
-                [self.rerun_requested], dtype=torch.int32, device="cuda"
-            )
-            torch.distributed.all_reduce(will_rerun_tensor)
-            if will_rerun_tensor.item() == 0:
+            will_rerun = self._reduce_any(self.rerun_requested)
+            if not will_rerun:
                 self.state = RerunState.NOT_RUNNING_YET
                 return False
-            if self.mode == RerunMode.VALIDATE_RESULTS and _safe_get_rank() == 0:
+            if self.mode == RerunMode.VALIDATE_RESULTS and safe_get_rank() == 0:
                 logger.warning("Need to rerun step to check reproducibility of initial result")
             self.state = RerunState.RERUNNING_IN_PLACE
             self._restore_state()
@@ -330,11 +344,22 @@ class RerunStateMachine:
                 self._maybe_report_stats()
                 self.saved_results = defaultdict(list)
                 return False
-            will_checkpoint_tensor: torch.Tensor = torch.tensor(
-                [self.checkpoint_requested], dtype=torch.int32, device="cuda"
+            # N.B. We may be able to rely on the behavior of the state machine
+            # to produce an equivalent value of self.continue_requested across
+            # ranks, since it depends on "fatal". That logic coupling seems
+            # brittle though.
+            will_continue, will_checkpoint = self._reduce_any(
+                [self.continue_requested, self.checkpoint_requested]
             )
-            torch.distributed.all_reduce(will_checkpoint_tensor)
-            if will_checkpoint_tensor.item() > 0:
+            if will_continue:
+                log_single_rank(
+                    logger,
+                    logging.WARNING,
+                    "Continuing normal execution because failed validation was not fatal",
+                )
+                self.state = RerunState.NOT_RUNNING_YET
+                return False
+            if will_checkpoint:
                 self.state = RerunState.WILL_RERUN_FROM_CHECKPOINT
             self._restore_state()
             if data_iterators:
@@ -347,27 +372,24 @@ class RerunStateMachine:
             return True
         # Are we done re-running from a checkpoint?
         elif self.state == RerunState.RERUNNING_FROM_CHECKPOINT:
-            will_restart_again_tensor: torch.Tensor = torch.tensor(
-                [self.restart_again_requested], dtype=torch.int32, device="cuda"
+            will_restart_again, will_continue = self._reduce_any(
+                [self.restart_again_requested, self.continue_requested]
             )
-            torch.distributed.all_reduce(will_restart_again_tensor)
-            if will_restart_again_tensor.item() > 0:
-                if _safe_get_rank() == 0:
-                    logger.warning(
-                        "Need to restart job from the same checkpoint "
-                        "because it was scheduled on the same node/GPU"
-                    )
+            if will_restart_again:
+                log_single_rank(
+                    logger,
+                    logging.WARNING,
+                    "Need to restart job from the same checkpoint "
+                    "because it was scheduled on the same node/GPU",
+                )
                 self.state = RerunState.RERUNNING_AGAIN_FROM_CHECKPOINT
             else:
-                will_continue_tensor: torch.Tensor = torch.tensor(
-                    [self.continue_requested], dtype=torch.int32, device="cuda"
-                )
-                torch.distributed.all_reduce(will_continue_tensor)
-                if will_continue_tensor.item() > 0:
-                    if _safe_get_rank() == 0:
-                        logger.warning(
-                            "Continuing normal execution because failed validation was not fatal"
-                        )
+                if will_continue:
+                    log_single_rank(
+                        logger,
+                        logging.WARNING,
+                        "Continuing normal execution because failed validation was not fatal",
+                    )
                     self.state = RerunState.NOT_RUNNING_YET
             return False
         raise RuntimeError("Should not be here")
@@ -403,33 +425,37 @@ class RerunStateMachine:
         if self.mode in [RerunMode.DISABLED, RerunMode.REPORT_DETERMINISM_STATS]:
             return False, False, 0
         if self.state == RerunState.RERUNNING_IN_PLACE:
-            if _safe_get_rank() == 0:
-                logger.warning(
-                    "Exiting now. A checkpoint at the last iteration is being saved "
-                    "if further examination is needed"
-                )
+            log_single_rank(
+                logger,
+                logging.WARNING,
+                "Exiting now. A checkpoint at the last iteration is being saved "
+                "if further examination is needed",
+            )
             return True, True, EXIT_CODE_FAILED_ON_RESULT_VALIDATION
         elif self.state == RerunState.WILL_RERUN_FROM_CHECKPOINT:
-            if _safe_get_rank() == 0:
-                logger.warning(
-                    "Saving a checkpoint and exiting now. Please resume the job "
-                    "from the checkpoint to rerun the last iteration "
-                    "and establish a diagnostic"
-                )
+            log_single_rank(
+                logger,
+                logging.WARNING,
+                "Saving a checkpoint and exiting now. Please resume the job "
+                "from the checkpoint to rerun the last iteration "
+                "and establish a diagnostic",
+            )
             return True, True, EXIT_CODE_RESUME_TO_DISAMBIGUATE
         elif self.state == RerunState.RERUNNING_FROM_CHECKPOINT:
-            if _safe_get_rank() == 0:
-                logger.warning(
-                    "Exiting now. A checkpoint at the last iteration already exists "
-                    "if further examination is needed"
-                )
+            log_single_rank(
+                logger,
+                logging.WARNING,
+                "Exiting now. A checkpoint at the last iteration already exists "
+                "if further examination is needed",
+            )
             return False, True, EXIT_CODE_FAILED_ON_RESULT_VALIDATION
         elif self.state == RerunState.RERUNNING_AGAIN_FROM_CHECKPOINT:
-            if _safe_get_rank() == 0:
-                logger.warning(
-                    "Exiting now. Please resume the job from the same checkpoint "
-                    "to rerun the last iteration and establish a diagnostic"
-                )
+            log_single_rank(
+                logger,
+                logging.WARNING,
+                "Exiting now. Please resume the job from the same checkpoint "
+                "to rerun the last iteration and establish a diagnostic",
+            )
             return False, True, EXIT_CODE_RESUME_TO_DISAMBIGUATE
         return False, False, 0
 
@@ -454,8 +480,8 @@ class RerunStateMachine:
                 the 2. The default implementation is for 0-dim float tensors.
             tolerance: tolerance used in combination with comparison_func to determine
                 reproducibility of results. Default is no tolerance (deterministic calculations).
-            fatal: whether to abort the job when no HW fault was identified (unexpected result is
-                reproducible and correct).
+            fatal: whether to abort the job when fault attribution is complete
+                (transient/permanent/not HW)
         Returns:
             None
 
@@ -487,14 +513,14 @@ class RerunStateMachine:
         """
 
         # If reruns are disabled, still validate the result and throw a RuntimeError if it is
-        # rejected. This is a backward-compatible behavior.
+        # rejected when fatal. This is a backward-compatible behavior for infs and NaNs.
         if self.mode == RerunMode.DISABLED:
             result_rejected: bool = rejection_func(result)
             if result_rejected:
                 self._log_validation_error_to_file(
                     status=RerunValidationStatus.RERUN_DISABLED, result=result, message=message
                 )
-                rank: int = _safe_get_rank()
+                rank: int = safe_get_rank()
                 node: str = os.uname()[1]
                 device: int = torch.cuda.current_device()
                 full_message: str = (
@@ -502,7 +528,10 @@ class RerunStateMachine:
                     f"iteration {self.current_iteration}: "
                     f"Unexpected result {result} (message='{message}')"
                 )
-                raise RuntimeError(full_message)
+                if fatal:
+                    raise RuntimeError(full_message)
+                else:
+                    logger.warning(full_message)
             return
 
         if comparison_func is None:
@@ -517,7 +546,7 @@ class RerunStateMachine:
         # Handle the stats reporting mode. In that mode, we rerun every iteration once to collect
         # stats about any non-determinism in the calculations (as a relative difference between the
         # calculations in the initial run and in the re-run). The only assumption here is that the
-        # control flow is deterministic (so that the results corresponding to the nth invokation of
+        # control flow is deterministic (so that the results corresponding to the nth invocation of
         # validate_result() can be compared).
 
         if self.mode == RerunMode.REPORT_DETERMINISM_STATS:
@@ -532,19 +561,27 @@ class RerunStateMachine:
                 self.stats[caller].record(diff)
             return
 
-        def log_failure(message: str) -> None:
-            rank: int = _safe_get_rank()
+        def log_failure(message: str, fatal: bool = True) -> None:
+            rank: int = safe_get_rank()
             node: str = os.uname()[1]
             device: int = torch.cuda.current_device()
-            logger.error(f"Rank {rank}, node {node}, device {device}: {message}!")
+            if fatal:
+                logger.error(
+                    f"Rank {rank}, node {node}, device {device}, "
+                    f"iteration #{self.current_iteration}: {message}!"
+                )
+            else:
+                logger.warning(
+                    f"Rank {rank}, node {node}, device {device}, "
+                    f"iteration #{self.current_iteration}: {message}!"
+                )
 
         # Emit message in log so that we can identify which jobs have this instrumentation
         # enabled. We do this from the validate_result() method because some jobs may run with
         # the check_for_nan_in_loss_and_grad option but never call validate_result.
         if not self.logged_sdc_enabled:
             self.logged_sdc_enabled = True
-            if _safe_get_rank() == 0:
-                logger.warning("Result validation enabled")
+            log_single_rank(logger, logging.WARNING, "Result validation enabled")
 
         # If this the initial run of the iteration, and no unexpected result has already been
         # identified?
@@ -555,7 +592,7 @@ class RerunStateMachine:
             if not self.first_iteration_complete:
                 return
 
-            result_rejected: bool = self.error_injector.maybe_inject() or rejection_func(result)
+            result_rejected = self.error_injector.maybe_inject() or rejection_func(result)
             if result_rejected:
                 self.failed_validation_call = validation_call
                 self.initial_result = result
@@ -565,9 +602,9 @@ class RerunStateMachine:
                 )
                 logger.error(
                     f"Unexpected result {result} "
-                    f"on rank {_safe_get_rank()} "
+                    f"on rank {safe_get_rank()} "
                     f"at iteration #{self.current_iteration} "
-                    f"invokation #{validation_call.sequence} "
+                    f"invocation #{validation_call.sequence} "
                     f"(message='{message}')"
                 )
         # If this the first rerun (same GPU) or second 2nd rerun (different GPU), and have we
@@ -582,18 +619,25 @@ class RerunStateMachine:
             # This is the first re-run.
             if self.state == RerunState.RERUNNING_IN_PLACE:
                 if comparison > tolerance:
-                    logger.warning(
+                    if not fatal:
+                        self.continue_requested = True
+                    log_failure(
                         "First rerun: unexpected result is not reproducible within the tolerance "
-                        f"({result} != {self.initial_result})"
+                        f"({result} != {self.initial_result})",
+                        fatal=fatal,
                     )
                     self._log_validation_error_to_file(
                         status=RerunValidationStatus.FIRST_RERUN_NOT_REPRODUCIBLE,
                         result=result,
                         message=message,
                     )
-                    log_failure("Possible transient error!")
+                    log_failure("Possible transient error!", fatal=fatal)
+
                 else:
-                    self.checkpoint_requested = True
+                    if fatal:
+                        self.checkpoint_requested = True
+                    else:
+                        self.continue_requested = True
                     # Remember the node and device we're running on so that we can check we're not
                     # rerunning on the same GPU when we resume from the checkpoint.
                     self.suspicious_node = os.uname()[1]
@@ -603,16 +647,17 @@ class RerunStateMachine:
                         result=result,
                         message=message,
                     )
-                    logger.warning(
+                    log_failure(
                         "First rerun: unexpected result is reproducible within the tolerance "
                         f"({result} = {self.initial_result}). "
-                        "Need to rerun on a different GPU to verify correctness"
+                        "Need to rerun on a different GPU to verify correctness.",
+                        fatal=fatal,
                     )
             # This is the second re-run.
             elif self.state == RerunState.RERUNNING_FROM_CHECKPOINT:
                 # Ensure we're not on the same GPU as the first rerun.
-                node: str = os.uname()[1]
-                device: int = torch.cuda.current_device()
+                node = os.uname()[1]
+                device = torch.cuda.current_device()
                 if node == self.suspicious_node and device == self.suspicious_device:
                     logger.error(
                         f"Got rescheduled on the same GPU. Need to resume again from the same "
@@ -630,6 +675,8 @@ class RerunStateMachine:
                         f"therefore was likely incorrect ({result} != {self.initial_result})"
                     )
                     log_failure("Possible persistent error!")
+                    if not fatal:
+                        self.continue_requested = True
                 else:
                     self._log_validation_error_to_file(
                         status=RerunValidationStatus.SECOND_RERUN_REPRODUCIBLE,
@@ -666,7 +713,7 @@ class RerunStateMachine:
             threshold: a float representing the minimum trigger threshold
                 e.g. 10 means > 10x max absolute value observed.
             context: a string identifying the value. This is used to differentiate
-                between different invokations of validate_results targetting different
+                between different invocations of validate_results targeting different
                 values, e.g. loss and grads.
             num_samples: the sample size used to estimate the max value.
                 Default is 100 value samples.
@@ -747,11 +794,12 @@ class RerunStateMachine:
                 return None
 
             if ckpt_format != "torch_dist":
-                if _safe_get_rank() == 0:
-                    logger.warning(
-                        "RerunStateMachine checkpoints ONLY SUPPORTED "
-                        "for checkpoint format torch_dist"
-                    )
+                log_single_rank(
+                    logger,
+                    logging.WARNING,
+                    "RerunStateMachine checkpoints ONLY SUPPORTED "
+                    "for checkpoint format torch_dist",
+                )
                 return None
 
         data_iterators: list[RerunDataIterator] = self._sanitize_data_iterators(data_iterator)
@@ -829,13 +877,17 @@ class RerunStateMachine:
         """
 
         if self.mode == RerunMode.DISABLED:
-            if _safe_get_rank() == 0:
-                logger.warning(
-                    "RerunStateMachine disabled via CLI, ignoring machine state saved in checkpoint"
-                )
+            log_single_rank(
+                logger,
+                logging.WARNING,
+                "RerunStateMachine disabled via CLI, ignoring machine state saved in checkpoint",
+            )
             return
-        if _safe_get_rank() == 0:
-            logger.warning("Getting RerunStateMachine state from checkpoint. Will rerun step.")
+        log_single_rank(
+            logger,
+            logging.WARNING,
+            "Getting RerunStateMachine state from checkpoint. Will rerun step.",
+        )
         self.mode = state_dict["mode"]
         self.current_iteration = state_dict["current_iteration"]
         self.state = state_dict["state"]
@@ -874,11 +926,14 @@ class RerunStateMachine:
     def _get_validation_call_info(self, message: str) -> Call:
         """Internal method to get the context about the caller to validate_result()."""
 
-        frame: inspect.frame = inspect.currentframe()
+        frame = inspect.currentframe()
+        assert frame is not None
+        assert frame.f_back is not None
         frame = frame.f_back.f_back
+        assert frame is not None
         filename: str = inspect.getframeinfo(frame).filename
         lineno: int = frame.f_lineno
-        rank: int = _safe_get_rank()
+        rank: int = safe_get_rank()
         caller = Caller(message=message, rank=rank)
         self.validation_counts[caller] += 1
         sequence: int = self.validation_counts[caller]
@@ -949,16 +1004,15 @@ class RerunStateMachine:
         if self.result_rejected_tracker_filename is not None:
             # Append to log.
             try:
-                rank: int = _safe_get_rank()
+                rank: int = safe_get_rank()
                 node: str = os.uname()[1]
                 device: int = torch.cuda.current_device()
                 with open(self.result_rejected_tracker_filename, "a") as f:
-                    print(
+                    f.write(
                         f"ts={datetime.datetime.now()} node={node} device={device} "
                         f"jobID={os.getenv('SLURM_JOBID', 'N/A')} rank={rank} "
                         f"iteration={self.current_iteration} status={status} result={result} "
-                        f"message='{message}'",
-                        file=f,
+                        f"message='{message}'\n"
                     )
             except Exception as e:
                 logger.error(f"Could not log validation error! ({e})")
@@ -1013,13 +1067,21 @@ class RerunStateMachine:
                             if len(iterations_seen_by_job[job][iteration]) > 1:
                                 iterations_to_ignore.add(iteration)
         except Exception as e:
-            logger.error(f"Could not parse iterations to skip in tracker file! ({e})")
+            log_single_rank(
+                logger, logging.ERROR, f"Could not parse iterations to skip in tracker file! ({e})"
+            )
         iterations_to_skip = sorted(iterations_to_potentially_skip - iterations_to_ignore)
-        logger.warning(f"Will skip these iterations from tracker file: {iterations_to_skip}")
+        log_single_rank(
+            logger,
+            logging.WARNING,
+            f"Will skip these iterations from tracker file: {iterations_to_skip}",
+        )
         if len(iterations_to_ignore) > 0:
-            logger.warning(
+            log_single_rank(
+                logger,
+                logging.WARNING,
                 "Will not skip these iterations due to multiple rank errors: "
-                f"{sorted(iterations_to_ignore)}"
+                f"{sorted(iterations_to_ignore)}",
             )
         return iterations_to_skip
 
@@ -1059,7 +1121,7 @@ class RerunDataIterator:
             n = self.saved_microbatches[self.replay_pos]
             self.replay_pos += 1
             return n
-        n: Any = next(self.iterable)
+        n = next(self.iterable)
         if get_rerun_state_machine().get_mode() != RerunMode.DISABLED:
             self.saved_microbatches.append(n)
         return n
@@ -1116,7 +1178,7 @@ class QuickStats:
             if self.pos < self.max_size:
                 self.samples.append(data)
             else:
-                self.samples[self.pos % self.self.max_size] = data
+                self.samples[self.pos % self.max_size] = data
             self.pos += 1
             if data > self.max:
                 self.max = data
@@ -1210,7 +1272,7 @@ class RerunErrorInjector:
         if not self.should_inject_errors or self.injected_error_type is not None:
             return False
         r: int = (
-            random.randint(0, self.error_injection_rate - 1) + _safe_get_rank()
+            random.randint(0, self.error_injection_rate - 1) + safe_get_rank()
         ) % self.error_injection_rate
         if r != 0:
             return False
@@ -1297,8 +1359,9 @@ def get_rerun_state_machine() -> RerunStateMachine:
     """Helper function to return the singleton instance of the rerun machine."""
 
     if _GLOBAL_RERUN_STATE_MACHINE is None:
-        logger.warning("Implicit initialization of Rerun State Machine!")
+        log_single_rank(logger, logging.WARNING, "Implicit initialization of Rerun State Machine!")
         initialize_rerun_state_machine()
+        assert _GLOBAL_RERUN_STATE_MACHINE is not None
     return _GLOBAL_RERUN_STATE_MACHINE
 
 
@@ -1308,19 +1371,6 @@ def _set_rerun_state_machine(rerun_state_machine) -> None:
     global _GLOBAL_RERUN_STATE_MACHINE
     assert _GLOBAL_RERUN_STATE_MACHINE is None, "Rerun state machine is already initialized"
     _GLOBAL_RERUN_STATE_MACHINE = rerun_state_machine
-
-
-def _safe_get_rank() -> int:
-    """Internal function that safely checks and returns the rank of the caller."""
-
-    if torch.distributed.is_initialized():
-        return torch.distributed.get_rank()
-
-    # If torch.distributed is not initialized, try to read environment variables.
-    try:
-        return int(os.environ.get("RANK", 0))
-    except (ValueError, TypeError):
-        return 0
 
 
 def _compare_floats(a: torch.Tensor, b: torch.Tensor) -> float:

@@ -31,4 +31,3 @@ class HFDatasetAgent(BaseModel):
             return load_dataset("arrow", data_dir=self.dataset_file, split=self.split)
         else:
             return load_dataset(self.hf_dataset_name, split=self.split)
-

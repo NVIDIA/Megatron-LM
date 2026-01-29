@@ -1,4 +1,4 @@
-# Copyright (c) 2024, NVIDIA CORPORATION. All rights reserved.
+# Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
 import os
 import sys
@@ -14,11 +14,14 @@ from megatron.core.models.gpt.gpt_layer_specs import (
 )
 from megatron.core.models.gpt.gpt_model import GPTModel
 from megatron.core.num_microbatches_calculator import destroy_num_microbatches_calculator
+from megatron.core.packed_seq_params import PackedSeqParams
+from megatron.core.parallel_state import get_context_parallel_group
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
 from megatron.core.transformer.multi_token_prediction import (
     MTPLossLoggingHelper,
     MultiTokenPredictionBlock,
+    roll_tensor,
 )
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.utils import is_te_min_version
@@ -245,6 +248,66 @@ class TestMultiTokenPrediction:
         }
         return batch
 
+    def get_packed_batch(self, seq_lengths, micro_batch_size):
+        """
+        Create a packed sequence batch with multiple sequences of varying lengths.
+
+        Args:
+            seq_lengths: List of sequence lengths (e.g., [10, 15, 8] for 3 sequences)
+            micro_batch_size: Batch size (typically 1 for packed sequences)
+
+        Returns:
+            batch: Dictionary containing packed sequences and PackedSeqParams
+        """
+        total_seq_length = sum(seq_lengths)
+
+        # Create packed input_ids, labels, and position_ids
+        input_ids_list = []
+        labels_list = []
+        position_ids_list = []
+
+        for seq_len in seq_lengths:
+            data = list(range(seq_len))
+            input_ids_list.extend(data)
+            labels_list.extend([x + 1 for x in data])
+            position_ids_list.extend(data)
+
+        # Convert to tensors with shape [batch, total_seq_length]
+        input_ids = torch.tensor(input_ids_list, dtype=torch.int64).unsqueeze(0).cuda()
+        labels = torch.tensor(labels_list, dtype=torch.int64).unsqueeze(0).cuda()
+        position_ids = torch.tensor(position_ids_list, dtype=torch.int64).unsqueeze(0).cuda()
+
+        # Create attention mask for packed sequences (all ones for simplicity)
+        attention_mask = torch.ones(
+            (micro_batch_size, 1, total_seq_length, total_seq_length), dtype=bool
+        ).cuda()
+
+        # Create loss mask with shape [batch, total_seq_length]
+        loss_mask = torch.ones(micro_batch_size, total_seq_length).cuda()
+
+        # Create cumulative sequence lengths for PackedSeqParams
+        cu_seqlens = torch.tensor(
+            [0] + [sum(seq_lengths[: i + 1]) for i in range(len(seq_lengths))], dtype=torch.int32
+        ).cuda()
+
+        packed_seq_params = PackedSeqParams(
+            cu_seqlens_q=cu_seqlens,
+            cu_seqlens_kv=cu_seqlens,
+            max_seqlen_q=max(seq_lengths),
+            max_seqlen_kv=max(seq_lengths),
+            qkv_format='thd',
+        )
+
+        batch = {
+            'tokens': input_ids,
+            'labels': labels,
+            'loss_mask': loss_mask,
+            'attention_mask': attention_mask,
+            'position_ids': position_ids,
+            'packed_seq_params': packed_seq_params,
+        }
+        return batch
+
     @pytest.mark.skipif(
         not HAVE_TE or not is_te_min_version("2.1.0"),
         reason="grouped_gemm requires TransformerEngine >= 2.1.0",
@@ -404,6 +467,149 @@ class TestMultiTokenPrediction:
 
         loss = output.mean()
         loss.backward()
+
+    @pytest.mark.skipif(
+        not HAVE_TE or not is_te_min_version("2.1.0"),
+        reason="grouped_gemm requires TransformerEngine >= 2.1.0",
+    )
+    @pytest.mark.parametrize(("tp", "cp"), [(1, 1), (2, 1), (2, 2)])
+    def test_packed_sequences(self, tp, cp):
+        """Test MTP with packed sequences."""
+        # Create args with packed sequences support
+        seq_lengths = [16, 24, 12]  # Three sequences of different lengths
+        total_seq_length = sum(seq_lengths)
+
+        args = self.create_test_args(tp, cp, total_seq_length, micro_batch_size=1)
+        set_args(args)
+
+        torch.manual_seed(_SEED)
+        Utils.initialize_model_parallel(tensor_model_parallel_size=tp, context_parallel_size=cp)
+
+        # Get packed batch
+        batch = self.get_packed_batch(seq_lengths, micro_batch_size=1)
+        tokens = batch['tokens']
+        labels = batch['labels']
+        loss_mask = batch['loss_mask']
+        attention_mask = batch['attention_mask']
+        position_ids = batch['position_ids']
+        packed_seq_params = batch['packed_seq_params']
+
+        # Create model
+        gpt_model, optimizer, opt_param_scheduler = setup_model_and_optimizer(
+            self.model_provider, ModelType.encoder_or_decoder
+        )
+
+        # Forward pass with packed sequences
+        output = gpt_model[0].forward(
+            input_ids=tokens,
+            position_ids=position_ids,
+            attention_mask=attention_mask,
+            labels=labels,
+            loss_mask=loss_mask,
+            packed_seq_params=packed_seq_params,
+        )
+
+        # Verify output shape
+        assert output.shape[0] == 1  # batch size
+        assert output.shape[1] == total_seq_length
+
+        # Verify MTP loss was computed
+        tracker = MTPLossLoggingHelper.tracker
+        assert "values" in tracker
+        mtp_loss = tracker['values'].clone()
+        assert mtp_loss.shape[0] == args.mtp_num_layers
+        MTPLossLoggingHelper.clean_loss_in_tracker()
+
+        # Backward pass
+        loss = output.mean()
+        loss.backward()
+
+        # Verify gradients exist
+        for name, param in gpt_model[0].named_parameters():
+            assert param.main_grad is not None, f"Gradient missing for {name}"
+
+    @pytest.mark.parametrize("cp", [1, 2])
+    def test_roll_tensor_with_packed_sequences(self, cp):
+        """Test roll_tensor function with packed sequences, with and without CP.
+
+        For CP=1: Tests standard packed sequence rolling with verified expected values
+        For CP=2: Tests CP-enabled rolling executes without errors
+        """
+        Utils.initialize_model_parallel(tensor_model_parallel_size=1, context_parallel_size=cp)
+        cp_group = get_context_parallel_group() if cp > 1 else None
+        cp_rank = torch.distributed.get_rank(group=cp_group) if cp_group is not None else 0
+
+        if cp == 1:
+            # Test case: Simple packed sequences (CP disabled)
+            tensor = torch.tensor([1, 2, 3, 4, 5], dtype=torch.float32).cuda()
+            cu_seqlens = torch.tensor([0, 3, 5], dtype=torch.int32).cuda()
+
+            packed_seq_params = PackedSeqParams(
+                cu_seqlens_q=cu_seqlens,
+                cu_seqlens_kv=cu_seqlens,
+                max_seqlen_q=3,
+                max_seqlen_kv=3,
+                qkv_format='thd',
+            )
+
+            # Roll by -1 (shift left)
+            rolled, sum_val = roll_tensor(
+                tensor, shifts=-1, dims=0, cp_group=cp_group, packed_seq_params=packed_seq_params
+            )
+
+            # Expected: [2, 3, 0, 5, 0] - boundaries at indices 2 and 4 are zeroed
+            expected = torch.tensor([2, 3, 0, 5, 0], dtype=torch.float32).cuda()
+            assert torch.equal(rolled, expected), f"Expected {expected}, got {rolled}"
+        else:
+            # Test case: Packed sequences with CP=2
+            # Two sequences:
+            #   seq1 = [1, 2, 3, 4, 5, 6, 7, 8]
+            #   seq2 = [11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22]
+
+            if cp_rank == 0:
+                # CP Rank 0: first half of each sequence
+                tensor = torch.tensor(
+                    [1, 2, 7, 8, 11, 12, 13, 20, 21, 22], dtype=torch.float32
+                ).cuda()
+                expected = torch.tensor(
+                    [2, 3, 8, 0, 12, 13, 14, 21, 22, 0], dtype=torch.float32
+                ).cuda()
+            else:
+                # CP Rank 1: second half of each sequence
+                tensor = torch.tensor(
+                    [3, 4, 5, 6, 14, 15, 16, 17, 18, 19], dtype=torch.float32
+                ).cuda()
+                expected = torch.tensor(
+                    [4, 5, 6, 7, 15, 16, 17, 18, 19, 20], dtype=torch.float32
+                ).cuda()
+
+            cu_seqlens = torch.tensor([0, 8, 20], dtype=torch.int32).cuda()
+
+            packed_seq_params = PackedSeqParams(
+                cu_seqlens_q=cu_seqlens,
+                cu_seqlens_kv=cu_seqlens,
+                max_seqlen_q=6,  # max(4, 6) - max local seq length per sequence
+                max_seqlen_kv=6,
+                qkv_format='thd',
+            )
+
+            # Roll by -1 (shift left) with CP communication
+            rolled, sum_val = roll_tensor(
+                tensor, shifts=-1, dims=0, cp_group=cp_group, packed_seq_params=packed_seq_params
+            )
+
+            # Verify the rolled tensor matches expected values
+            assert (
+                rolled.shape == expected.shape
+            ), f"Shape mismatch: expected {expected.shape}, got {rolled.shape}"
+            assert torch.equal(
+                rolled, expected
+            ), f"CP Rank {cp_rank}: Expected\n{expected}\nbut got\n{rolled}\nDiff:\n{rolled - expected}"
+
+            # Verify sum is correct
+            assert sum_val.numel() == 1, "Sum should be a scalar"
+
+        Utils.destroy_model_parallel()
 
 
 class TestMTPLossLoggingHelper:

@@ -43,11 +43,12 @@ from megatron.core.models.gpt.gpt_layer_specs import (
 from megatron.core.models.gpt.gpt_model import GPTModel
 from megatron.core.models.mamba.mamba_layer_specs import mamba_stack_spec
 from megatron.core.models.mamba.mamba_model import MambaModel
+from megatron.core.ssm.mamba_mixer import _check_mamba_sequence_packing_support
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
 from megatron.core.transformer.cuda_graphs import CudaGraphManager, _CudagraphGlobalRecord
+from megatron.core.transformer.enums import CudaGraphScope
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.utils import (
-    check_mamba_sequence_packing_support,
     get_mamba_inference_state_config_from_model,
     is_fa_min_version,
     is_te_min_version,
@@ -58,7 +59,7 @@ from tests.unit_tests.test_utilities import Utils
 def skip_if_mamba_sequence_packing_not_available(model_provider: str):
     if model_provider == "mamba":
         sequence_packing_available, reason_for_no_sequence_packing = (
-            check_mamba_sequence_packing_support()
+            _check_mamba_sequence_packing_support()
         )
         if not sequence_packing_available:
             pytest.skip(reason_for_no_sequence_packing)
@@ -89,7 +90,9 @@ class DynamicEngineTestConfig:
     num_gap_steps: int = 2
 
     context_buffer_size_gb: float = 0.1  # enough room for all tokens.
+    context_paused_buffer_size_gb: float | None = None
     context_block_size_tokens: int = 256
+    context_max_requests: Optional[int] = None
     context_max_tokens: Optional[int] = None
     tensor_model_parallel_size: int = 1
     pipeline_model_parallel_size: int = 1
@@ -104,7 +107,10 @@ class DynamicEngineTestConfig:
     return_log_probs: bool = False
     materialize_only_last_token_logits: bool = True
     skip_prompt_log_probs: bool = False
-    cuda_graph_scope: str = "full_iteration"
+    enable_chunked_prefill: bool = False
+    cuda_graph_scope: List[CudaGraphScope] = field(
+        default_factory=lambda: [CudaGraphScope.full_iteration]
+    )
     force_build_cuda_graphs: bool = False
     transformer_impl: str = "local"
     # If False, do not build cuda graphs in the tests, even if
@@ -127,6 +133,10 @@ class DynamicEngineTestConfig:
         else:
             assert self.num_tokens_total is not None
             self.max_sequence_length = self.num_tokens_total
+
+        # Default paused buffer size.
+        if self.context_paused_buffer_size_gb is None:
+            self.context_paused_buffer_size_gb = 0.2 * self.context_buffer_size_gb
 
 
 @dataclass
@@ -220,11 +230,14 @@ class TestDynamicInferenceEngine:
             num_attention_heads=transformer_config.num_query_groups,
             max_sequence_length=test_config.max_sequence_length,
             num_cuda_graphs=test_config.num_cuda_graphs,
-            use_cuda_graphs_for_non_decode_steps=not test_config.model_provider == "mamba",
+            use_cuda_graphs_for_non_decode_steps=True,
             buffer_size_gb=test_config.context_buffer_size_gb,
+            paused_buffer_size_gb=test_config.context_paused_buffer_size_gb,
             block_size_tokens=test_config.context_block_size_tokens,
+            max_requests=test_config.context_max_requests,
             max_tokens=test_config.context_max_tokens,
             tensor_model_parallel_size=transformer_config.tensor_model_parallel_size,
+            pipeline_model_parallel_size=transformer_config.pipeline_model_parallel_size,
             mamba_inference_state_config=mamba_inference_state_config,
             materialize_only_last_token_logits=test_config.materialize_only_last_token_logits,
             use_flashinfer_fused_rope=None,  # default to using flash-infer if available
@@ -416,6 +429,7 @@ class TestDynamicInferenceEngine:
             inference_context,
             random_seed=test_config.random_seed,
             enable_cuda_graph=transformer_config.cuda_graph_impl == "local",
+            enable_chunked_prefill=test_config.enable_chunked_prefill,
         )
 
         # Test env.
@@ -432,7 +446,7 @@ class TestDynamicInferenceEngine:
         # the only thing that differs between requests is num_tokens_to_generate,
         # and engine.async_step() doesn't use this sampling param's
         # num_tokens_to_generate.
-        result = env.engine.step_modern(verbose=False)
+        result = env.engine.step_modern()
 
         # Suspend + resume.
         if (
@@ -526,7 +540,7 @@ class TestDynamicInferenceEngine:
     )
     @pytest.mark.parametrize("model_provider", ["gpt", "mamba"])
     @pytest.mark.parametrize("num_cuda_graphs", [None, 1, 4])
-    @pytest.mark.parametrize("cuda_graph_scope", ["full", "full_iteration"])
+    @pytest.mark.parametrize("cuda_graph_scope", [[], [CudaGraphScope.full_iteration]])
     def test_simple(self, model_provider, num_cuda_graphs, cuda_graph_scope) -> None:
         """Simple test that runs without errors, and validates output."""
         skip_if_mamba_sequence_packing_not_available(model_provider)
@@ -674,12 +688,13 @@ class TestDynamicInferenceEngine:
 
         # Test num_cuda_graphs.
         for num_cuda_graphs, expected_cuda_graph_token_counts in [
-            (0, [40]),
-            (1, [40]),
-            (2, [40, 24]),
-            (4, [40, 32, 16]),
-            (8, [40, 32, 24, 16, 8]),
-            (16, [40, 32, 24, 16, 8]),
+            (0, [80]),
+            (1, [80]),
+            (2, [80, 40]),
+            (4, [80, 72, 48, 24]),
+            (8, [80, 64, 48, 32, 16]),
+            (16, [80, 72, 64, 56, 48, 40, 32, 24, 16, 8]),
+            (32, [80, 72, 64, 56, 48, 40, 32, 24, 16, 8]),
         ]:
 
             # Build cuda graphs (inside dynamic engine).
@@ -765,7 +780,7 @@ class TestDynamicInferenceEngine:
             test_config = DynamicEngineTestConfig(num_requests=8, use_fixed_output_lengths=True)
             env = self._build_test_env(test_config)
 
-            engine_task = asyncio.create_task(env.engine.run_engine(verbose=False))
+            engine_task = asyncio.create_task(env.engine.run_engine())
 
             request_completion_futures: Dict[int, asyncio.Future[DynamicInferenceRequest]] = {}
 
@@ -1141,7 +1156,7 @@ class TestDynamicInferenceEngine:
         num_tokens_to_generate = 16
         max_sequence_length = prompt_length + num_tokens_to_generate
 
-        # Configure context to force chunking (chunked prefill is enabled by default)
+        # Configure context to force chunking
         env = self._run_test(
             num_requests=1,
             min_prompt_length=prompt_length,
@@ -1151,6 +1166,7 @@ class TestDynamicInferenceEngine:
             model_provider=model_provider,
             context_block_size_tokens=256,
             context_max_tokens=1000,
+            enable_chunked_prefill=True,
         )
 
     @pytest.mark.internal
@@ -1180,6 +1196,7 @@ class TestDynamicInferenceEngine:
             model_provider="gpt",
             context_block_size_tokens=256,
             context_max_tokens=1000,
+            enable_chunked_prefill=True,
         )
 
         # Validate results
@@ -1258,7 +1275,7 @@ class TestDynamicInferenceEngine:
 
         # Step engine until all requests are finished
         while env.engine.has_unfinished_requests():
-            result = env.engine.step_modern(verbose=False)
+            result = env.engine.step_modern()
 
         # Validate results
         for request in requests_to_add:
@@ -1345,3 +1362,28 @@ class TestDynamicInferenceEngine:
                     assert (
                         abs(log_prob - top_n_dict[token_str]) < 0.1
                     ), f"Request {request.request_id}, token {i}: log_prob mismatch {log_prob} vs {top_n_dict[token_str]}"
+
+    @pytest.mark.internal
+    @pytest.mark.skipif(
+        not is_fa_min_version("2.7.3"), reason="need latest flash attn for dynamic batching"
+    )
+    @pytest.mark.parametrize("max_requests", [None, 4])
+    @torch.inference_mode()
+    def test_max_requests(self, max_requests: int | None):
+        """Test max requests."""
+        env = self._run_test(
+            context_max_requests=max_requests, num_tokens_to_generate=16, num_gap_steps=1
+        )
+        step_count = env.engine.step_count
+        context = env.engine.context
+        if max_requests is None:
+            assert context.max_requests == 816
+            assert step_count == 22
+        else:
+            assert max_requests < len(env.requests), (
+                f"Test is only useful if max_requests ({max_requests}) < "
+                f"num_requests ({len(env.requests)})."
+            )
+            assert context.max_requests == 4
+            assert step_count == 34
+        assert context.block_allocator.active_count == 655
