@@ -1365,6 +1365,13 @@ class TransformerConfig(ModelParallelConfig):
                 num_layers -= self.num_layers_in_last_pipeline_stage
                 pipeline_parallel_size -= 1
 
+            # Ensure you either have middle pp stages and layers or none of them.
+            if bool(num_layers) != bool(pipeline_parallel_size):
+                raise ValueError(
+                    f"Mismatch: {num_layers} middle layers remaining but {pipeline_parallel_size} "
+                    f"middle PP stages available."
+                )
+
             # Here pipeline_parallel_size is the number of middle PP stages. If there are middle
             # PP stages, check number of layers at middle stage is divisible by middle PP size.
             if pipeline_parallel_size and not num_layers % pipeline_parallel_size == 0:
