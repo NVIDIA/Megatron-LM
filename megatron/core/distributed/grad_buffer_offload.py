@@ -1,3 +1,5 @@
+# Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
+
 """Utilities for offloading grad_data buffers from GPU memory."""
 
 from typing import Dict, Any
