@@ -191,6 +191,7 @@ def get_inference_context(
         cuda_graph_max_tokens=args.inference_dynamic_batching_cuda_graph_max_tokens,
         cuda_graph_mixed_prefill_count=args.inference_dynamic_batching_cuda_graph_mixed_prefill_count,
         metrics_writer=metrics_writer,
+        offload_kv_cache=args.rl_offload_kv_cache_during_training
     )
 
     return context
