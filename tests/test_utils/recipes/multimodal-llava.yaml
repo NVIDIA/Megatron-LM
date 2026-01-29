@@ -3,7 +3,7 @@ format_version: 1
 maintainers: [mcore]
 loggers: [stdout]
 spec:
-  name: "{test_case}_{environment}_{platforms}"
+  name: '{test_case}_{environment}_{platforms}'
   model: multimodal-llava
   build: mcore-pyt-{environment}
   nodes: 1
@@ -61,10 +61,10 @@ products:
   - test_case: [multimodal_llava_mcore_te_tp1_pp1]
     products:
       - environment: [dev]
-        scope: [mr, mr-github]
+        scope: [mr]
         platforms: [dgx_h100]
   - test_case: [multimodal_llava_mcore_te_tp4_sp_cp2]
     products:
       - environment: [dev]
-        scope: [mr, mr-github]
+        scope: [mr]
         platforms: [dgx_h100]

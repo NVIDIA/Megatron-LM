@@ -20,8 +20,8 @@ from megatron.training.tokenizer.sft_tokenizer import SFTTokenizer
 
 def build_tokenizer(args, **kwargs):
     """Initialize tokenizer."""
-    if args.rank == 0:
-        print('> building {} tokenizer ...'.format(args.tokenizer_type), flush=True)
+    from megatron.training.utils import print_rank_0
+    print_rank_0('> building {} tokenizer ...'.format(args.tokenizer_type))
 
     # Select and instantiate the tokenizer.
     if args.tokenizer_type == 'BertWordPieceLowerCase':
@@ -63,7 +63,7 @@ def build_tokenizer(args, **kwargs):
             pattern=pattern,
             vocab_size=args.vocab_size,
             num_special_tokens=args.tiktoken_num_special_tokens,
-            special_tokens=args.tiktoken_special_tokens,
+            special_tokens=args.tokenizer_special_tokens,
         )
     elif args.tokenizer_type == 'NullTokenizer':
         assert args.vocab_size is not None

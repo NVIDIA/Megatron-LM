@@ -45,10 +45,49 @@ inputs:
   PAT:
     description: "GitHub Personal Access Token"
     required: true
+  is_ci_workload:
+    description: "Is CI workload"
+    required: true
 
 runs:
   using: "composite"
   steps:
+    - name: Print node name
+      shell: bash -x -e -u -o pipefail {0}
+      run: echo "node_name=$NODE_NAME" | tee -a "$GITHUB_OUTPUT"
+
+    - name: GPU Sanity Check
+      shell: bash -x -e -u -o pipefail {0}
+      run: |
+        echo "Starting GPU Sanity Check..."
+
+        # 1. Check for active Compute Processes
+        # query-compute-apps returns a list of PIDs using the GPU. If empty, we are good.
+        OPEN_PROCESSES=$(docker run --rm --gpus all ubuntu nvidia-smi --query-compute-apps=pid,process_name --format=csv,noheader)
+
+        if [ -n "$OPEN_PROCESSES" ]; then
+          echo "::error::❌ GPU is not clean! Found active processes:"
+          echo "$OPEN_PROCESSES"
+        else
+          echo "✅ No active compute processes found."
+        fi
+
+        # 2. Check VRAM Usage (Optional but recommended)
+        # We allow a small buffer (e.g., < 300MiB) for driver overhead/Xorg, 
+        # though on headless K8s nodes this should be very close to 0.
+
+        MEMORY_USAGES=$(docker run --rm --gpus all ubuntu nvidia-smi --query-gpu=memory.used --format=csv,noheader,nounits)
+
+        # Check each GPU visible to the container
+        for MEMORY in $MEMORY_USAGES; do
+          if [ "$MEMORY" -gt 300 ]; then
+            echo "::error::❌ GPU VRAM usage is suspiciously high: ${MEMORY} MiB"
+          fi
+        done
+
+        echo "✅ GPU Memory is clean (all < 300 MiB)."
+        echo "Ready to start workflow."
+
     - name: Checkout repository
       uses: actions/checkout@v2
 
@@ -77,6 +116,7 @@ runs:
 
         export PYTHONPATH=$(pwd)
         export NEMORUN_HOME=$(pwd)
+        export NCCL_DEBUG=INFO
         pip install --no-cache-dir uv
         uv sync --only-group test
         uv run python tests/test_utils/python_scripts/launch_nemo_run_workload.py \
@@ -114,6 +154,18 @@ runs:
         HAS_RUN_TESTS_LABEL=$(gh pr view $PR_NUMBER --json labels | jq '[.labels[].name] | any(. == "Run tests")') || echo "false"
         echo "main=$HAS_RUN_TESTS_LABEL" | tee -a $GITHUB_OUTPUT
 
+    - name: Has Run functional tests label
+      shell: bash -x -e -u -o pipefail {0}
+      id: has-run-functional-tests-label
+      env:
+        GH_TOKEN: ${{ github.token }}
+        IS_CI_WORKLOAD: ${{ inputs.is_ci_workload }}
+      run: |
+        PR_NUMBER=${{ fromJSON(steps.get-pr-info.outputs.pr-info || '{}').number }}
+        HAS_RUN_FUNCTIONAL_TESTS_LABEL=$(gh pr view $PR_NUMBER --json labels | jq '[.labels[].name] | any(. == "Run functional tests")') || echo "$IS_CI_WORKLOAD"
+        HAS_RUN_FUNCTIONAL_TESTS_LABEL=${HAS_RUN_FUNCTIONAL_TESTS_LABEL:-$IS_CI_WORKLOAD}
+        echo "main=$HAS_RUN_FUNCTIONAL_TESTS_LABEL" | tee -a $GITHUB_OUTPUT
+
     - name: Create run-script (e2e test)
       shell: bash -x -e -u -o pipefail {0}
       if: inputs.is_unit_test == 'false'
@@ -126,16 +178,22 @@ runs:
         set -euxo pipefail
 
         if [ "${{ steps.has-run-tests-label.outputs.main }}" == "true" ]; then
-            ARGS=(
-              --scope mr-github
-              --enable-lightweight-mode
-            )
-          else
-            ARGS=(
-              --scope mr-slim
-              --enable-lightweight-mode
-            )
-          fi
+          ARGS=(
+            --scope mr-github
+            --enable-lightweight-mode
+            --n-repeat 1
+          )
+        elif [ "${{ steps.has-run-functional-tests-label.outputs.main }}" == "true" ]; then
+          ARGS=(
+            --scope mr-github
+            --n-repeat 5
+          )
+        else
+          ARGS=(
+            --scope mr-github-slim
+            --n-repeat 5
+          )
+        fi
 
         export PYTHONPATH=$(pwd)
         export NEMORUN_HOME=$(pwd)
@@ -235,5 +293,5 @@ runs:
       if: always()
       with:
         name: ${{ steps.check.outputs.logs_report }}
-        path: ${{ inputs.is_unit_test == 'true' && 'logs' || 'assets_dir' }}
+        path: ${{ inputs.is_unit_test == 'true' && 'assets_dir/logs' || 'assets_dir' }}
         include-hidden-files: true

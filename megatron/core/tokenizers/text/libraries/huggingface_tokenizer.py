@@ -10,6 +10,8 @@ try:
 except ModuleNotFoundError:
     HAVE_TRANSFORMERS = False
 
+from megatron.core.utils import log_single_rank
+
 from .abstract_tokenizer import MegatronTokenizerTextAbstract
 
 logger = logging.getLogger(__name__)
@@ -69,7 +71,6 @@ class HuggingFaceTokenizer(MegatronTokenizerTextAbstract):
                     pretrained_model_name_or_path=tokenizer_path,
                     use_fast=use_fast,
                     trust_remote_code=trust_remote_code,
-                    chat_template=chat_template,
                 )
             elif merges_file is None:
                 self.tokenizer = AutoTokenizer.from_pretrained(
@@ -77,7 +78,6 @@ class HuggingFaceTokenizer(MegatronTokenizerTextAbstract):
                     vocab_file=vocab_file,
                     use_fast=use_fast,
                     trust_remote_code=trust_remote_code,
-                    chat_template=chat_template,
                 )
             else:
                 self.tokenizer = AutoTokenizer.from_pretrained(
@@ -86,13 +86,20 @@ class HuggingFaceTokenizer(MegatronTokenizerTextAbstract):
                     merge_files=merges_file,
                     use_fast=use_fast,
                     trust_remote_code=trust_remote_code,
-                    chat_template=chat_template,
                 )
         except Exception as e:
             raise ValueError(
                 'Unable to instantiate HuggingFace AutoTokenizer '
                 f'for {tokenizer_path}. Exception: {e}'
             )
+
+        # Store the tokenizer's existing chat template if the user does not provide
+        # a custom chat template. Otherwise, override the default chat template with
+        # the user-provided template.
+        if chat_template is None:
+            chat_template = self.tokenizer.chat_template
+        else:
+            self.tokenizer.chat_template = chat_template
 
         self.include_special_tokens = include_special_tokens
         self.original_vocab_size = len(self.tokenizer)
@@ -161,9 +168,11 @@ class HuggingFaceTokenizer(MegatronTokenizerTextAbstract):
             tokenizer.resize_token_embeddings(tokenizer_default.vocab_size)
             """
 
-            logger.warning(
+            log_single_rank(
+                logger,
+                logging.WARNING,
                 f'{new_tokens_in_vocab} \n will be added to the vocabulary.\n'
-                f'Please resize your model accordingly.'
+                f'Please resize your model accordingly.',
             )
         self.add_special_tokens(special_tokens_dict)
         self.space_sensitive = self.text_to_tokens('x y') != self.text_to_tokens(
@@ -191,7 +200,11 @@ class HuggingFaceTokenizer(MegatronTokenizerTextAbstract):
         num_tokens_added = self.tokenizer.add_special_tokens(special_tokens_dict)
 
         if num_tokens_added > 0:
-            logger.info(f'{num_tokens_added} special tokens added, resize your model accordingly.')
+            log_single_rank(
+                logger,
+                logging.INFO,
+                f'{num_tokens_added} special tokens added, resize your model accordingly.',
+            )
         for k in self.tokenizer.SPECIAL_TOKENS_ATTRIBUTES:
             setattr(self, k, getattr(self.tokenizer, k, None))
         return num_tokens_added

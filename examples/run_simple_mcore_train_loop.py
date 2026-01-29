@@ -1,10 +1,12 @@
+# Copyright (c) 2025, NVIDIA CORPORATION.  All rights reserved.
+
 import os
 import torch
 from torch.optim import Adam
-from torch.utils.data import DataLoader, Iterator
+from torch.utils.data import DataLoader
 from functools import partial
 from pathlib import Path
-from typing import Callable, Dict, Tuple
+from typing import Any, Callable, Dict, Tuple, Iterator
 
 from megatron.core import parallel_state
 from megatron.core import dist_checkpointing
@@ -40,10 +42,14 @@ def initialize_distributed(
     parallel_state.destroy_model_parallel()
 
     # Torch setup for distributed training
-    rank: int = int(os.environ["LOCAL_RANK"])
-    world_size: int = torch.cuda.device_count()
-    torch.cuda.set_device(rank)
-    torch.distributed.init_process_group(world_size=world_size, rank=rank)
+    rank: int = int(os.environ["RANK"])
+    world_size: int = int(os.environ["WORLD_SIZE"])
+    local_rank: int = int(os.environ["LOCAL_RANK"])
+
+    torch.cuda.set_device(local_rank)
+    torch.distributed.init_process_group(
+        backend="nccl", rank=rank, world_size=world_size
+    )
 
     # Megatron core distributed training initialization
     parallel_state.initialize_model_parallel(

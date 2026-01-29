@@ -1,3 +1,5 @@
+# Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+
 import pytest
 import torch
 
@@ -20,9 +22,6 @@ class TestTorchSoftmax:
             softmax_in_fp32=True,
             scale=None,
         )
-
-    def teardown_method(self):
-        get_default_causal_mask.cache_clear()
 
     def test_output_shape(self):
         x = torch.randn(8, 2, 4, 4, device="cuda")
@@ -125,9 +124,6 @@ class TestSoftmaxOne:
 
 class TestFusedScaleMaskSoftmaxComprehensive:
     """Comprehensive tests for FusedScaleMaskSoftmax including window attention and scaling."""
-
-    def teardown_method(self):
-        get_default_causal_mask.cache_clear()
 
     def test_scaling_factor(self):
         """Test softmax with different scaling factors."""

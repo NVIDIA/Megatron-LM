@@ -9,7 +9,7 @@ from multiprocessing import Event
 
 import torch
 
-from megatron.core.inference.headers import Headers
+from megatron.core.inference.headers import Headers, UnknownHeaderError
 
 try:
     import zmq
@@ -65,7 +65,7 @@ class DataParallelInferenceCoordinator:
         next_request_id (int): A counter for generating unique server-side request IDs.
     """
 
-    def __init__(self, inference_coordinator_port: int, data_parallel_size: int):
+    def __init__(self, inference_coordinator_port: int, data_parallel_size: int, tokenizer):
         """
         Initializes the inference coordinator.
 
@@ -109,11 +109,14 @@ class DataParallelInferenceCoordinator:
             self.identities_of_data_parallel_ranks.append(identity)
         logging.info("Inference Coordinator: Connected with data parallel ranks...")
         self.data_parallel_rank_iterator = cycle(self.identities_of_data_parallel_ranks)
+        self.data_parallel_pause_acks = set()
+        self.data_parallel_stop_acks = set()
 
         self.request_id_to_client_id = {}
         self.request_id_to_client_request_id = {}
 
         self.next_request_id = 0
+        self.tokenizer = tokenizer
 
     def get_next_data_parallel_rank(self):
         """
@@ -151,7 +154,7 @@ class DataParallelInferenceCoordinator:
                 # print(f"New client connected: {sender_identity}")
                 known_clients.add(sender_identity)
                 self.router_socket.send_multipart(
-                    [sender_identity, msgpack.packb([Headers.ACK.value], use_bin_type=True)]
+                    [sender_identity, msgpack.packb([Headers.CONNECT_ACK.value], use_bin_type=True)]
                 )
 
             elif header == Headers.SUBMIT_REQUEST:
@@ -193,7 +196,13 @@ class DataParallelInferenceCoordinator:
                         ),
                     ]
                 )
-            elif header in [Headers.PAUSE, Headers.UNPAUSE, Headers.STOP]:
+            elif header in [
+                Headers.PAUSE,
+                Headers.UNPAUSE,
+                Headers.SUSPEND,
+                Headers.RESUME,
+                Headers.STOP,
+            ]:
                 # control signals for the engine
                 # broadcast to all data parallel ranks
                 if sender_identity not in known_clients:
@@ -202,13 +211,59 @@ class DataParallelInferenceCoordinator:
                     self.router_socket.send_multipart(
                         [data_parallel_rank_id, msgpack.packb([header.value], use_bin_type=True)]
                     )
+                if header == Headers.UNPAUSE:
+                    self.data_parallel_pause_acks = set()
+            elif header == Headers.PAUSE_ACK:
+                # control signal ack from the engine
+                assert sender_identity in self.identities_of_data_parallel_ranks
+                assert sender_identity not in self.data_parallel_pause_acks
+                self.data_parallel_pause_acks.add(sender_identity)
+                # route to all clients only once we have gotten an ack from all data parallel ranks
+                if len(self.data_parallel_pause_acks) == self.data_parallel_size:
+                    for client_id in known_clients:
+                        self.router_socket.send_multipart(
+                            [
+                                client_id,
+                                msgpack.packb([header.value, sender_identity], use_bin_type=True),
+                            ]
+                        )
+                    for data_parallel_rank_id in self.identities_of_data_parallel_ranks:
+                        self.router_socket.send_multipart(
+                            [
+                                data_parallel_rank_id,
+                                msgpack.packb([Headers.PAUSE_ACK.value], use_bin_type=True),
+                            ]
+                        )
+            elif header == Headers.STOP_ACK:
+                # control signal ack from the engine
+                assert sender_identity in self.identities_of_data_parallel_ranks
+                assert sender_identity not in self.data_parallel_stop_acks
+                self.data_parallel_stop_acks.add(sender_identity)
+                # route to all clients only once we have gotten an ack from all data parallel ranks
+                if len(self.data_parallel_stop_acks) == self.data_parallel_size:
+                    for client_id in known_clients:
+                        self.router_socket.send_multipart(
+                            [
+                                client_id,
+                                msgpack.packb([header.value, sender_identity], use_bin_type=True),
+                            ]
+                        )
+                    for data_parallel_rank_id in self.identities_of_data_parallel_ranks:
+                        self.router_socket.send_multipart(
+                            [
+                                data_parallel_rank_id,
+                                msgpack.packb([Headers.STOP_ACK.value], use_bin_type=True),
+                            ]
+                        )
+                    break  # Exit the main loop after STOP_ACKs have been processed.
             elif header == Headers.ENGINE_REPLY:
                 # This is the output of a single engine step on some data parallel rank.
                 assert sender_identity in self.identities_of_data_parallel_ranks
-                finished_requests = deserialized_payload[1]
+                finished_request_records = deserialized_payload[1]
 
-                for finished_request in finished_requests:
-                    fid = finished_request["request_id"]
+                for finished_request_record in finished_request_records:
+                    self.detokenize(finished_request_record)
+                    fid = finished_request_record["requests"][0]["request_id"]
                     client_identity = self.request_id_to_client_id[fid]
                     client_request_identity = self.request_id_to_client_request_id[fid]
                     del self.request_id_to_client_id[fid]
@@ -218,14 +273,34 @@ class DataParallelInferenceCoordinator:
                         [
                             client_identity,
                             msgpack.packb(
-                                [client_request_identity, finished_request], use_bin_type=True
+                                [header.value, client_request_identity, finished_request_record],
+                                use_bin_type=True,
                             ),
                         ]
                     )
 
+            else:
+                raise UnknownHeaderError(header)
+
+    def detokenize(self, finished_request_record):
+        """
+        Detokenizes the generated tokens in the finished request record.
+
+        This method uses the coordinator's tokenizer to convert the list of
+        generated token IDs back into human-readable text.
+
+        Args:
+            finished_request_record (dict): The record containing the generated
+                tokens to be detokenized. It is modified in place.
+        """
+        for request in finished_request_record["requests"]:
+            if request["prompt"] is None:
+                request["prompt"] = self.tokenizer.detokenize(request["prompt_tokens"][1])
+            request["generated_text"] = self.tokenizer.detokenize(request["generated_tokens"])
+
     @classmethod
     def entrypoint(
-        cls, ready_event: Event, inference_coordinator_port: int, data_parallel_size: int
+        cls, ready_event: Event, inference_coordinator_port: int, data_parallel_size: int, tokenizer
     ):
         """
         Class method to instantiate and run the coordinator, for use in a separate process.
@@ -239,13 +314,14 @@ class DataParallelInferenceCoordinator:
             inference_coordinator_port (int): The port to bind to.
             data_parallel_size (int): The number of expected TP-coordinators.
         """
-        coordinator = cls(inference_coordinator_port, data_parallel_size)
+        coordinator = cls(inference_coordinator_port, data_parallel_size, tokenizer)
         ready_event.set()
         try:
             coordinator.start()
         except KeyboardInterrupt:
             logging.info("Coordinator process interrupted. Exiting...")
-            coordinator.stop()
+        coordinator.stop()
+        logging.info("Inference Coordinator: shut down successfully.")
 
     def stop(self):
         """
