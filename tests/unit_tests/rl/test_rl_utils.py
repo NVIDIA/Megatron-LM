@@ -455,18 +455,12 @@ class TestRLUtils:
             transformer_config, ddp_config=ddp_config, module=gpt_model
         )
 
-        # Create optimizer to exercise buffer validation in offload_grad_data
-        optimizer_config = OptimizerConfig(
-            optimizer='adam', bf16=True, use_distributed_optimizer=True
-        )
-        optimizer = get_megatron_optimizer(optimizer_config, [ddp_model])
-
         # Measure initial memory usage
         initial_memory = get_grad_buffer_memory_usage(ddp_model)
         assert initial_memory["total_bytes"] > 0, "Expected non-zero initial memory"
 
-        # Offload grad buffers (passing optimizer exercises the buffer validation assertion)
-        offload_states = offload_grad_data(ddp_model, optimizer)
+        # Offload grad buffers
+        offload_grad_data(ddp_model)
 
         # Measure memory after offload - should be zero
         offloaded_memory = get_grad_buffer_memory_usage(ddp_model)
@@ -481,7 +475,7 @@ class TestRLUtils:
             ), f"Buffer {buffer_name} should report device as 'offloaded'"
 
         # Onload grad buffers
-        onload_grad_data(ddp_model, offload_states)
+        onload_grad_data(ddp_model)
 
         # Measure memory after onload - should match initial
         restored_memory = get_grad_buffer_memory_usage(ddp_model)
