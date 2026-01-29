@@ -15,7 +15,6 @@ TOKENIZER_MAPPING_NAMES = OrderedDict(
         ("mamba", "MambaTokenizer"),
         ("bert", "BertTokenizer"),
         ("t5", "T5Tokenizer"),
-        ("retro", "RetroTokenizer"),
     ]
 )
 
@@ -104,7 +103,7 @@ class MegatronTokenizer:
             tokenizer_path (str): path to tokenizer model.
             tokenizer_library (str): tokenizer model library.
             model_type (str): type of the model to be used with tokenizer.
-                list of available model types: [gpt, bert, t5, mamba, retro, default].
+                list of available model types: [gpt, bert, t5, mamba, default].
                 `DefaultTokenizerText` will be used if model_type is not specified.
             tokenizer_class (MegatronTokenizerBase): pre-defined tokenizer class.
             chat_template (str): tokenizer chat template in jinja format.

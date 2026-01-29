@@ -3,7 +3,7 @@ format_version: 1
 maintainers: [maanug]
 spec:
   name: mcore-pyt-dev
-  platforms: [linux/amd64]
+  platforms: [linux/amd64,linux/arm64]
   source:
     # The image tag will be added via `jet-tests.yaml`
     # Tags are one of {buildcache, $CI_PIPELINE_ID}

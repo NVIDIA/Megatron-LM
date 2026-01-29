@@ -3,7 +3,7 @@
 import logging
 import os
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from math import ceil
 from typing import Dict, Optional, Tuple
 
@@ -50,10 +50,34 @@ class GPTDatasetConfig(BlendedMegatronDatasetConfig):
     object_storage_cache_path: Optional[str] = None
     """Path for caching indices for s3 or msc dataloading."""
 
+    context_parallel_size: int = 1
+    """Option to enable context parallelism"""
+
+    data_parallel_size: int = 1
+    """Option to enable data parallelism"""
+
+    sequence_parallel_size: int = 0
+    """Option to indicate the sequence parallelism size when using TP
+    Set to 0 if sequence parallel is not enabled regardless of TP size.
+    """
+
+    hybrid_context_parallel: bool = False
+    """Option to enable hybrid context parallelism. When setting this to True, 
+    each sample should be divisible by the data parallel size * context parallel size * 2.
+    If sequence parallel is enabled, it should be divisible by the 
+    data parallel size * context parallel size * sequence parallel size * 2.
+    """
+
     sequences_per_dataset: Optional[Dict[str, int]] = None
     """If provided, the sequence and document counts for each dataset. 
        Check --per-dataset-sequences-path
     """
+
+    token_dtype_code: Optional[int] = field(init=False, default=None)
+    """The dtype code for the token ids. 4 for int32, 8 for uint16."""
+
+    context_parallel_size: Optional[int] = None
+    """The size of the context parallel group. Needed for padding in packed sequences."""
 
     def __post_init__(self) -> None:
         """Do asserts and set fields post init"""
