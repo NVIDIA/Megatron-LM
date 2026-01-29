@@ -189,11 +189,6 @@ products:
       - environment: [dev]
         scope: [mr]
         platforms: [dgx_gb200]
-  - test_case: [gpt3_mcore_te_tp1_pp4_vp1_resume_torch_dist_dist_optimizer_overlap_grad_reduce_param_gather]
-    products:
-      # - environment: [dev]
-      #   scope: [mr]
-      #   platforms: [dgx_gb200] # Hangs: #513
   - test_case: [gpt3_mcore_te_tp1_pp4_vp1_tunable_overlap]
     products:
       - environment: [dev]
