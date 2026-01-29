@@ -3298,13 +3298,12 @@ def _add_kitchen_quantization_arguments(parser: argparse.ArgumentParser):
     If kitchen isn't available, nothing to do here, return unchanged parser
     """
     try:
-        from megatron.core.extensions.kitchen import KitchenSpecProvider
+        from megatron.core.extensions.kitchen import KitchenSpecProvider, HAVE_KITCHEN
 
-        have_kitchen = True
     except (ImportError, ModuleNotFoundError):
-        have_kitchen = False
+        HAVE_KITCHEN = False
 
-    if have_kitchen:
+    if HAVE_KITCHEN:
         group = parser.add_argument_group(title="kitchen")
         recipe_or_config_group = group.add_mutually_exclusive_group(required=False)
         recipe_or_config_group.add_argument(
