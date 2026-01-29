@@ -122,7 +122,6 @@ class HyperConnectionModule(MegatronModule):
         # - H_pre: n values
         # - H_post: n values  
         # - H_res: n^2 values (before Sinkhorn projection)
-        self.norm = nn.RMSNorm(self.hidden_size * self.n)
         
         self.mapping_proj = nn.Linear(
             self.n * self.hidden_size, 
@@ -151,7 +150,6 @@ class HyperConnectionModule(MegatronModule):
         # (nn.Linear, nn.RMSNorm) whose gradients need to be all-reduced.
         if self.config.sequence_parallel:
             setattr(self.mapping_proj.weight, 'sequence_parallel', True)
-            setattr(self.norm.weight, 'sequence_parallel', True)
             setattr(self.alpha_pre, 'sequence_parallel', True)
             setattr(self.alpha_post, 'sequence_parallel', True)
             setattr(self.alpha_res, 'sequence_parallel', True)
@@ -443,7 +441,7 @@ class HyperConnectionModule(MegatronModule):
         nvtx_range_push("HyperConnection::compute_mappings")
         # Checkpoint compute_mappings - auto-registers to manager via ckpt_manager parameter
         h_pre, h_post, h_res = self.compute_mappings(hidden_states)
-        
+
         nvtx_range_pop("HyperConnection::compute_mappings")
         # Checkpoint aggregate - auto-registers to manager
         nvtx_range_push("HyperConnection::aggregate")
