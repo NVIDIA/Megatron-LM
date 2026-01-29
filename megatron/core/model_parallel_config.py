@@ -75,13 +75,8 @@ class ModelParallelConfig:
     sequence_packing_scheduler: Optional[str] = None
     """
     Scheduler for sequence packing and hybrid context parallel.
-    naive_sequence_packing: default naive sequence packing scheduler(just THD, no Hybrid-CP, this 
-    is just for comparison with default hybrid-cp scheduler, not recommended for production)
-    default_hybrid_cp: default hybrid-cp scheduler for hybrid context parallel provided by MCore.
-    empty_scheduler_with_packing: scheduling is already handled by the data sampler,
-    this scheduler only performs packing.
-    empty_scheduler_no_packing: scheduling and packing are already handled by the data sampler,
-    this scheduler only returns the batch.
+    default_sequence_packing: default sequence packing scheduler for sequence packing.
+    empty: empty scheduler for sequence packing.
     """
 
     sequence_packing: bool = False

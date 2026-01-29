@@ -1997,17 +1997,15 @@ class TransformerConfig(ModelParallelConfig):
                     f"but got {get_te_version()} (TE < 2.9.0 may have convergence issues)."
                 )
 
-            assert self.context_parallel_size * self.max_seqlen_per_dp_cp_rank >= self.seq_length
-
             # Needed for passing variable sequences between pp stages.
             self.variable_seq_lengths = True
 
             # TODO(tailaim): add support for other dispatcher types
             warnings.warn("Setting moe_token_dispatcher_type to alltoall for sft sequence packing.")
-            args.moe_token_dispatcher_type = "alltoall"
+            self.moe_token_dispatcher_type = "alltoall"
 
             if self.sequence_packing_scheduler is None:
-                self.sequence_packing_scheduler = 'default'
+                self.sequence_packing_scheduler = 'default_sequence_packing'
 
 
 @dataclass

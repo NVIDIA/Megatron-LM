@@ -980,7 +980,7 @@ def validate_args(args, defaults={}):
         print(f"Setting moe_token_dispatcher_type to alltoall for sft sequence packing with pipeline parallelism")
         args.moe_token_dispatcher_type = "alltoall"
         if args.sequence_packing_scheduler is None:
-            args.sequence_packing_scheduler = 'default'
+            args.sequence_packing_scheduler = 'default_sequence_packing'
 
     # disable async_tensor_model_parallel_allreduce when
     # model parallel memory optimization is enabled
@@ -2915,7 +2915,7 @@ def _add_distributed_args(parser):
                        help='Enables hybrid context parallel. This is used to balance the workload '
                        'of each CP rank when we use packed samples with variable sequence lengths. '
                        'Requires --max-seqlen-per-dp-cp-rank to be set.')
-    group.add_argument('--sequence-packing-scheduler', type=str, default='default', choices=['default', 'empty'])
+    group.add_argument('--sequence-packing-scheduler', type=str, default='default_sequence_packing', choices=['default_sequence_packing', 'empty'])
     group.add_argument('--nccl-communicator-config-path', type=str, default=None,
                        help='Path to the yaml file with NCCL communicator '
                        'configurations. The number of min/max thread groups and thread '

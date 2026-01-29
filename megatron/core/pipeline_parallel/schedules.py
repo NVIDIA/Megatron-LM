@@ -521,9 +521,8 @@ def wrap_iterator_helper(
 ):
     """Warp data iterator for sequence packing if needed."""
     if config.sequence_packing:
-        num_total_tokens_this_global_batch, sequence_square_sum_this_global_batch = None, None
         scheduler_type_map = {
-            'default': PackingScheduler.DEFAULT,
+            'default_sequence_packing': PackingScheduler.DEFAULT_SEQUENCE_PACKING,
             'empty': PackingScheduler.EMPTY,
         }
         if config.sequence_packing_scheduler not in scheduler_type_map:
@@ -532,7 +531,9 @@ def wrap_iterator_helper(
                 {config.sequence_packing_scheduler}"
             )
         scheduler_type = scheduler_type_map[config.sequence_packing_scheduler]
-        return wrap_dataloader(data_iterator, config, scheduler_type, pg_collection=None)
+        return wrap_dataloader(
+            data_iterator, config, num_microbatches, scheduler_type, pg_collection=pg_collection
+        )
     else:
         return data_iterator, num_microbatches, None, None
 
@@ -569,6 +570,9 @@ def forward_backward_no_pipelining(
         pg_collection.pp = pp_group
         pg_collection.dp_cp = parallel_state.get_data_parallel_group(
             with_context_parallel=True, partial_data_parallel=False
+        )
+        pg_collection.dp = parallel_state.get_data_parallel_group(
+            with_context_parallel=False, partial_data_parallel=False
         )
 
     elif pg_collection is not None:
@@ -1038,6 +1042,9 @@ def forward_backward_pipelining_with_interleaving(
         pg_collection.dp_cp = parallel_state.get_data_parallel_group(
             with_context_parallel=True, partial_data_parallel=False
         )
+        pg_collection.dp = parallel_state.get_data_parallel_group(
+            with_context_parallel=False, partial_data_parallel=False
+        )
 
     elif p2p_communicator is not None and pg_collection is not None:
         model_type = get_model_type(model[0])
@@ -1079,6 +1086,25 @@ def forward_backward_pipelining_with_interleaving(
     assert (
         adjust_tensor_shapes_fn is None
     ), "adjust_tensor_shapes_fn is not supported for interleaved pipeline parallelism"
+
+    # Handle VPP data_iterator: extract the appropriate iterator for this PP stage
+    if (
+        config.virtual_pipeline_model_parallel_size is not None
+        and config.virtual_pipeline_model_parallel_size > 1
+    ):
+        # if enable VPP, data_iterator is a list of data_iterators for each VPP stage,
+        # and only the first and last stage rank will have data_iterator,
+        # other stages will have None.
+        assert len(data_iterator) == config.virtual_pipeline_model_parallel_size
+        pp_group = p2p_communicator.pp_group
+        if pp_group.rank() == 0:
+            # the first stage
+            data_iterator = data_iterator[0]
+        elif pp_group.rank() == pp_group.size() - 1:
+            # the last stage
+            data_iterator = data_iterator[-1]
+        else:
+            data_iterator = None
 
     if not forward_only and config.fine_grained_activation_offloading:
         fine_grained_offloading_reset()
@@ -2198,6 +2224,9 @@ def forward_backward_pipelining_without_interleaving(
         pg_collection.cp = cp_group
         pg_collection.dp_cp = parallel_state.get_data_parallel_group(
             with_context_parallel=True, partial_data_parallel=False
+        )
+        pg_collection.dp = parallel_state.get_data_parallel_group(
+            with_context_parallel=False, partial_data_parallel=False
         )
     elif p2p_communicator is not None and pg_collection is not None:
         model_type = get_model_type(model)
