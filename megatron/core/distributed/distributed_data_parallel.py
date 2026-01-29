@@ -593,7 +593,7 @@ class DistributedDataParallel(_BaseDataParallel):
         if empty_cache:
             torch.cuda.empty_cache()
 
-    def onload_grad_buffers(self, synchronize: bool = True) -> None:
+    def restore_grad_buffers(self, synchronize: bool = True) -> None:
         """
         Reallocate grad_data tensors on GPU.
 

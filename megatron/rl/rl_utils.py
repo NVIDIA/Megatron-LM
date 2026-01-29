@@ -536,8 +536,8 @@ def get_environment_rollouts(
         logger.debug(f"Got rollouts on rank {rank}")
 
     if args.rl_offload_optimizer_during_inference:
-        with nvtx_range("onload-optimizer-state-and-grad-buffers-after-inference"):
-            model[0].onload_grad_buffers()
+        with nvtx_range("restore-optimizer-state-and-grad-buffers-after-inference"):
+            model[0].restore_grad_buffers()
             optimizer.restore_from_cpu()
 
     if lang_rl_log_dir and rank == get_pg_rank(inference_pg_collection.tp):
@@ -1678,7 +1678,7 @@ def megatron_rl_inference_mode(
 
         if offload_optimizer_during_inference:
             with nvtx_range("onload-optimizer-state-and-grad-buffers-after-inference"):
-                model[0].onload_grad_buffers()
+                model[0].restore_grad_buffers()
                 optimizer.restore_from_cpu()
 
         lang_module.train()

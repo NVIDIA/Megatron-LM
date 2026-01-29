@@ -432,7 +432,7 @@ class TestRLUtils:
         indirect=["initialize_model_parallel"],
     )
     def test_grad_buffer_offload(self, initialize_model_parallel):
-        """Test that grad buffer offload/onload correctly frees and restores GPU memory."""
+        """Test that grad buffer offload/restore correctly frees and restores GPU memory."""
         world_size, dp, tp, pp = initialize_model_parallel
         self.create_test_args(tensor_model_parallel_size=tp, pipeline_model_parallel_size=pp)
 
@@ -466,15 +466,15 @@ class TestRLUtils:
         initial_sizes = [buf.grad_data.storage().size() for buf in all_buffers]
         assert all(size > 0 for size in initial_sizes), "Expected non-zero initial storage"
 
-        # Offload grad buffers
+        # Offload grad buffers to CPU
         ddp_model.offload_grad_buffers()
 
         # Verify storage is released
         for buf in all_buffers:
             assert buf.grad_data.storage().size() == 0, "Expected zero storage after offload"
 
-        # Onload grad buffers
-        ddp_model.onload_grad_buffers()
+        # Restore grad buffers to GPU
+        ddp_model.restore_grad_buffers()
 
         # Verify storage is restored
         restored_sizes = [buf.grad_data.storage().size() for buf in all_buffers]
