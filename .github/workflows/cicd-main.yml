@@ -20,8 +20,8 @@ on:
     branches:
       - dev
       - main
-      - 'pull-request/[0-9]+'
-      - 'deploy-release/*'
+      - "pull-request/[0-9]+"
+      - "deploy-release/*"
   merge_group:
     types: [checks_requested]
   workflow_dispatch:
@@ -128,42 +128,6 @@ jobs:
             echo "is_maintainer=false" | tee -a $GITHUB_OUTPUT
           fi
 
-      - name: Find Comment
-        uses: peter-evans/find-comment@v4
-        if: startsWith(github.ref, 'refs/heads/pull-request/')
-        id: fc
-        with:
-          issue-number: ${{ fromJSON(steps.get-pr-info.outputs.pr-info || '{}').number }}
-          repository: ${{ github.repository }}
-          body-includes: '<!--external-contributor-comment-->'
-
-      - name: Delete comment
-        uses: actions/github-script@v7
-        if: startsWith(github.ref, 'refs/heads/pull-request/') && steps.fc.outputs.comment-id != ''
-        with:
-          github-token: ${{ secrets.GITHUB_TOKEN }}
-          script: |
-            await github.rest.issues.deleteComment({
-              owner: context.repo.owner,
-              repo: context.repo.repo,
-              comment_id: ${{ steps.fc.outputs.comment-id }}
-            })
-
-      - name: Write pull request comment
-        if: startsWith(github.ref, 'refs/heads/pull-request/') && steps.check-membership.outputs.is_maintainer == 'false'
-        uses: peter-evans/create-or-update-comment@v5
-        with:
-          issue-number: ${{ fromJSON(steps.get-pr-info.outputs.pr-info || '{}').number }}
-          repository: ${{ github.repository }}
-          body: |
-            <!--external-contributor-comment-->
-
-            Thank you for your contribution!
-
-            NVIDIA Megatron-LM is currently transitioning to development on Github. We will aim to review your PR after we complete our transition and stabilize our Github development process.
-
-            Thank you for your understanding.
-
   pre-flight:
     needs: [is-not-external-contributor]
     if: github.repository == 'NVIDIA/Megatron-LM'
@@ -238,8 +202,28 @@ jobs:
       && needs.pre-flight.outputs.is_merge_group == 'false'
       && !cancelled()
     steps:
+      - name: Get PR info
+        id: get-pr-info
+        if: startsWith(github.ref, 'refs/heads/pull-request/')
+        uses: nv-gha-runners/get-pr-info@main
+
+      - name: Get merge commit sha
+        shell: bash -x -e -u -o pipefail {0}
+        id: sha
+        env:
+          IS_PR: ${{ startsWith(github.ref, 'refs/heads/pull-request/') }}
+        run: |
+          if [[ "$IS_PR" == "true" ]]; then
+            SHA=${{ fromJSON(steps.get-pr-info.outputs.pr-info || '{}').merge_commit_sha }}
+          else
+            SHA=${GITHUB_SHA}
+          fi
+          echo "main=${SHA}" | tee -a "$GITHUB_OUTPUT"
+
       - name: Checkout
         uses: actions/checkout@v4
+        with:
+          ref: ${{ steps.sha.outputs.main }}
 
       - name: Setup python
         uses: actions/setup-python@v5
@@ -251,11 +235,6 @@ jobs:
         run: |
           apt-get update
           apt-get install -y gh
-
-      - name: Get PR info
-        id: get-pr-info
-        if: startsWith(github.ref, 'refs/heads/pull-request/')
-        uses: nv-gha-runners/get-pr-info@main
 
       - name: Has lts label
         id: has-lts-label
@@ -381,7 +360,8 @@ jobs:
       - cicd-container-build
       - cicd-parse-unit-tests
     runs-on: ${{ needs.is-not-external-contributor.outputs.selected_runner }}
-    name: '${{ matrix.bucket }} - latest'
+    timeout-minutes: 60
+    name: "${{ matrix.bucket }} - latest"
     if: |
       (
         success()
@@ -403,12 +383,14 @@ jobs:
           test_case: ${{ matrix.bucket }}
           tag: latest
           timeout: ${{ matrix.timeout || 30 }}
-          is_unit_test: 'true'
+          is_unit_test: "true"
           PAT: ${{ secrets.PAT }}
           container-image: ${{ env.container-registry }}/megatron-lm:${{ github.sha }}
+          is_ci_workload: ${{ needs.pre-flight.outputs.is_ci_workload }}
 
   cicd-parse-integration-tests:
     runs-on: ubuntu-latest
+    timeout-minutes: 60
     needs:
       - pre-flight
       - cicd-wait-in-queue
@@ -419,8 +401,8 @@ jobs:
         success()
         || needs.pre-flight.outputs.is_ci_workload == 'true'
         || needs.pre-flight.outputs.force_run_all == 'true'
+        || needs.pre-flight.outputs.is_merge_group == 'true'
       )
-      && needs.pre-flight.outputs.is_merge_group == 'false'
       && !cancelled()
     outputs:
       integration-tests: ${{ steps.main.outputs.integration-tests }}
@@ -446,9 +428,11 @@ jobs:
         id: has-run-functional-tests-label
         env:
           GH_TOKEN: ${{ secrets.PAT }}
+          IS_CI_WORKLOAD: ${{ needs.pre-flight.outputs.is_ci_workload }}
         run: |
           PR_NUMBER=${{ fromJSON(steps.get-pr-info.outputs.pr-info || '{}').number }}
-          HAS_RUN_FUNCTIONAL_TESTS_LABEL=$(gh pr view $PR_NUMBER --json labels | jq '[.labels[].name] | any(. == "Run functional tests")') || echo "false"
+          HAS_RUN_FUNCTIONAL_TESTS_LABEL=$(gh pr view $PR_NUMBER --json labels | jq '[.labels[].name] | any(. == "Run functional tests")')
+          HAS_RUN_FUNCTIONAL_TESTS_LABEL=${HAS_RUN_FUNCTIONAL_TESTS_LABEL:-$IS_CI_WORKLOAD}
           echo "main=$HAS_RUN_FUNCTIONAL_TESTS_LABEL" | tee -a $GITHUB_OUTPUT
 
       - name: Parse functional tests
@@ -507,7 +491,7 @@ jobs:
       - cicd-parse-integration-tests
       - cicd-unit-tests-latest
     runs-on: ${{ needs.is-not-external-contributor.outputs.selected_runner }}
-    name: '${{ matrix.model }}/${{ matrix.test_case }} - latest'
+    name: "${{ matrix.model }}/${{ matrix.test_case }} - latest"
     env:
       PIP_DISABLE_PIP_VERSION_CHECK: 1
       PIP_NO_PYTHON_VERSION_WARNING: 1
@@ -530,9 +514,10 @@ jobs:
           model: ${{ matrix.model }}
           tag: latest
           timeout: ${{ matrix.timeout || 30 }}
-          is_unit_test: 'false'
+          is_unit_test: "false"
           PAT: ${{ secrets.PAT }}
           container-image: ${{ env.container-registry }}/megatron-lm:${{ github.sha }}
+          is_ci_workload: ${{ needs.pre-flight.outputs.is_ci_workload }}
 
   Nemo_CICD_Test:
     needs:
