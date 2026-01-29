@@ -17,16 +17,16 @@ Don't:
 
 ```bash
 source .venv/bin/activate
-python examples/models/generate_from_hf.py
+python pretrain_gpt.py
 ```
 
 Do:
 
 ```bash
-uv run python examples/models/generate_from_hf.py
+uv run python pretrain_gpt.py
 ```
 
-Exception: `docker/Dockerfile.ci` is exempt from this rule.
+Exception: `docker/Dockerfile.ci.dev` and `docker/Dockerfile.ci.nemo` are exempt from this rule.
 
 ## Python Coding Guidelines
 
@@ -36,7 +36,7 @@ Exception: `docker/Dockerfile.ci` is exempt from this rule.
 
 ### Line Length
 
-1. Maximum line length is **119 characters** (matching ruff configuration).
+1. Maximum line length is **100 characters** (matching black/isort/flake8 configuration).
 
 ### Indentation
 
