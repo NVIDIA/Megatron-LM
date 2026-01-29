@@ -50,7 +50,6 @@ from .utils import (
     FSDPDistributedIndex,
     get_global_memory_buffer,
     get_mcore_tensor_parallel_partition_dim,
-    is_mcore_tensor_model_parallel,
     is_mcore_tensor_parallel_duplicated,
     using_tensor_parallel,
 )
@@ -2432,7 +2431,7 @@ class ParamAndGradBuffer:
             self.param_to_direct_module[new_param] = self.param_to_direct_module[old_param]
             del self.param_to_direct_module[old_param]
 
-            for tp_attr in ["_mcore_tp", "_tp_partition_dim", "_tp_duplicated"]:
+            for tp_attr in ["_tensor_parallel_mode"]:
                 if getattr(old_param, tp_attr, None) is not None:
                     setattr(new_param, tp_attr, getattr(old_param, tp_attr))
 
@@ -2584,9 +2583,7 @@ class ParamAndGradBuffer:
                             "partition_dim",
                             "partition_stride",
                             "is_embedding_or_output_parameter",
-                            "_mcore_tp",
-                            "_tp_duplicated",
-                            "_tp_partition_dim",
+                            "_tensor_parallel_mode",
                         ]:
                             if hasattr(orig_param, attr_name):
                                 setattr(param, attr_name, getattr(orig_param, attr_name))
@@ -4103,35 +4100,34 @@ def make_fsdp_dtensor(
 
         tp_mesh = dist_index.get_submesh(dist_index.tp_dim, is_expert_parallel=is_expert_param)
         global_shape = list(param.shape)
-        if tp_mesh.mesh.numel() > 1:
-            if is_mcore_tensor_parallel_duplicated(param):
-                placements = [Replicate()]
-                if force_sync_tp_duplicated_param:
-                    if local_tensor.numel() > 0:
-                        torch.distributed.broadcast(
-                            local_tensor, group=tp_mesh.get_group(), group_src=0
-                        )
-                elif run_check:
-                    # TODO: Implement consistency check for duplicated TP parameters
-                    pass
-            else:
-                tp_dim = get_mcore_tensor_parallel_partition_dim(param)
-                assert tp_dim is not None, (
-                    "[Megatron-FSDP] Parameter is not tensor model parallel, "
-                    "yet tensor_model_parallel is True."
-                )
-                placements = [Shard(tp_dim)]
-                global_shape[tp_dim] *= tp_mesh.mesh.numel()
-
-            # Construct TP-sharded DTensor using Megatron-style placement
-            param = DTensor.from_local(
-                local_tensor=local_tensor,
-                device_mesh=tp_mesh,
-                placements=placements,
-                run_check=run_check,
-                shape=tuple(global_shape),
-                stride=torch.empty(global_shape).stride(),
+        if is_mcore_tensor_parallel_duplicated(param):
+            placements = [Replicate()]
+            if force_sync_tp_duplicated_param:
+                if local_tensor.numel() > 0:
+                    torch.distributed.broadcast(
+                        local_tensor, group=tp_mesh.get_group(), group_src=0
+                    )
+            elif run_check:
+                # TODO: Implement consistency check for duplicated TP parameters
+                pass
+        else:
+            tp_dim = get_mcore_tensor_parallel_partition_dim(param)
+            assert tp_dim is not None, (
+                "[Megatron-FSDP] Parameter is not tensor model parallel, "
+                "yet tensor_model_parallel is True."
             )
+            placements = [Shard(tp_dim)]
+            global_shape[tp_dim] *= tp_mesh.mesh.numel()
+
+        # Construct TP-sharded DTensor using Megatron-style placement
+        param = DTensor.from_local(
+            local_tensor=local_tensor,
+            device_mesh=tp_mesh,
+            placements=placements,
+            run_check=run_check,
+            shape=tuple(global_shape),
+            stride=torch.empty(global_shape).stride(),
+        )
 
     # Get FSDP-configured mesh and placements from provided param
     device_mesh, placements = _get_fsdp_tensor_spec(
