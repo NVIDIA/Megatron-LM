@@ -1987,8 +1987,6 @@ def _add_rl_args(parser):
                        help='If set, use inference logprobs in importance sampling correction of the loss.')
     group.add_argument('--rl-importance-sampling-truncation-coef', type=float, default=None,
                        help="If --inference-logprobs-is-correction is on and this coefficient is set, apply truncation for the IS correction at GRPO loss.")
-    group.add_argument('--rl-calculate-intra-group-similarity', action=argparse.BooleanOptionalAction, default=False,
-                       help='If set, calculate the intra-group similarity of rollouts.')
     group.add_argument('--rl-use-sequence-packing', action=argparse.BooleanOptionalAction, type=bool, default=False,
                        help='Enable sequence packing')
     group.add_argument('--rl-sequence-packing-max-sequences-per-bin', type=int, default=50,
@@ -3298,13 +3296,12 @@ def _add_kitchen_quantization_arguments(parser: argparse.ArgumentParser):
     If kitchen isn't available, nothing to do here, return unchanged parser
     """
     try:
-        from megatron.core.extensions.kitchen import KitchenSpecProvider
+        from megatron.core.extensions.kitchen import KitchenSpecProvider, HAVE_KITCHEN
 
-        have_kitchen = True
     except (ImportError, ModuleNotFoundError):
-        have_kitchen = False
+        HAVE_KITCHEN = False
 
-    if have_kitchen:
+    if HAVE_KITCHEN:
         group = parser.add_argument_group(title="kitchen")
         recipe_or_config_group = group.add_mutually_exclusive_group(required=False)
         recipe_or_config_group.add_argument(

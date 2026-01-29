@@ -360,6 +360,7 @@ jobs:
       - cicd-container-build
       - cicd-parse-unit-tests
     runs-on: ${{ needs.is-not-external-contributor.outputs.selected_runner }}
+    timeout-minutes: 60
     name: "${{ matrix.bucket }} - latest"
     if: |
       (
@@ -389,6 +390,7 @@ jobs:
 
   cicd-parse-integration-tests:
     runs-on: ubuntu-latest
+    timeout-minutes: 60
     needs:
       - pre-flight
       - cicd-wait-in-queue
