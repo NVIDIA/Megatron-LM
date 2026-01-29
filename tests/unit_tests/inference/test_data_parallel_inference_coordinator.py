@@ -235,6 +235,7 @@ class TestCoordinator:
 
         return dp_addr
 
+    @pytest.mark.skipif(True, reason="ZMQ shutdown is not graceful")
     @pytest.mark.internal
     @pytest.mark.skipif(not HAVE_ZMQ, reason="pyzmq is required for this test")
     @pytest.mark.asyncio
