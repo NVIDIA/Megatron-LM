@@ -72,7 +72,7 @@ Exception: `docker/Dockerfile.ci.dev` and `docker/Dockerfile.ci.nemo` are exempt
 
 ### Imports
 
-Organize imports in the following order, separated by blank lines:
+We recommend using `isort`. Organize imports in the following order, separated by blank lines:
 
 1. Future imports
 2. Standard library imports
@@ -239,17 +239,37 @@ Example:
 from dataclasses import dataclass
 
 @dataclass
-class ModelConfig:
-    """Configuration for model architecture."""
+class GPTModel(LanguageModule):
+"""GPT Transformer language model.
 
-    hidden_size: int
-    num_layers: int
-    num_attention_heads: int
-    vocab_size: int
-    max_position_embeddings: int = 2048
-    hidden_dropout: float = 0.1
-    attention_dropout: float = 0.1
-    use_flash_attention: bool | None = None
+Args:
+    config (TransformerConfig):
+        Transformer config
+    transformer_layer_spec (ModuleSpec):
+        Specifies module to use for transformer layers
+    vocab_size (int):
+        Vocabulary size
+    max_sequence_length (int):
+        maximum size of sequence. This is used for positional embedding
+    pre_process (bool, optional):
+        Include embedding layer (used with pipeline parallelism). Defaults to True.
+    post_process (bool, optional):
+        Include an output layer (used with pipeline parallelism). Defaults to True.
+    fp16_lm_cross_entropy (bool, optional):
+        Defaults to False.
+"""
+
+def __init__(
+    self,
+    config: TransformerConfig,
+    transformer_layer_spec: ModuleSpec,
+    vocab_size: int,
+    max_sequence_length: int,
+    pre_process: bool = True,
+    post_process: bool = True,
+    fp16_lm_cross_entropy: bool = False
+) -> None:
+    ...
 ```
 
 ## Documentation Guidelines
@@ -306,16 +326,4 @@ Add the following NVIDIA copyright header to all Python files and shell scripts.
 
 ```python
 # Copyright (c) 2026, NVIDIA CORPORATION.  All rights reserved.
-#
-# Licensed under the Apache License, Version 2.0 (the "License");
-# you may not use this file except in compliance with the License.
-# You may obtain a copy of the License at
-#
-#     http://www.apache.org/licenses/LICENSE-2.0
-#
-# Unless required by applicable law or agreed to in writing, software
-# distributed under the License is distributed on an "AS IS" BASIS,
-# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-# See the License for the specific language governing permissions and
-# limitations under the License.
 ```
