@@ -41,7 +41,7 @@ def deserialize_tensor(tensor_bytes: bytes) -> torch.Tensor:
         (Tensor) Tensor.
     """
     buffer = io.BytesIO(tensor_bytes)
-    tensor = torch.load(buffer)
+    tensor = torch.load(buffer, weights_only=True)
     return tensor
 
 
