@@ -22,6 +22,17 @@ from megatron.core.optimizer.distrib_optimizer import DistributedOptimizer
 
 from .param_and_grad_buffer import _ParamAndGradBucketGroup, _ParamAndGradBuffer
 
+# Lazy import to avoid circular dependency with megatron.training
+_nvtx_range = None
+
+def _get_nvtx_range():
+    """Lazy-load nvtx_range to avoid circular import with megatron.training."""
+    global _nvtx_range
+    if _nvtx_range is None:
+        from megatron.training.utils import get_nvtx_range
+        _nvtx_range = get_nvtx_range()
+    return _nvtx_range
+
 
 @dataclass
 class BucketMetadata:
@@ -110,8 +121,11 @@ def offload_grad_data(
         List of GradBufferOffloadState objects needed to reallocate the buffers.
         One state object per buffer (including expert parallel buffers).
     """
-    if synchronize:
-        torch.cuda.synchronize()
+    nvtx_range = _get_nvtx_range()
+    
+    with nvtx_range("offload/cuda-synchronize", time=True):
+        if synchronize:
+            torch.cuda.synchronize()
 
     offload_states = []
 
@@ -127,12 +141,14 @@ def offload_grad_data(
                 "Ensure optimizer and DDP share the same buffer references."
             )
 
-    for buffer_idx, buffer in enumerate(all_buffers):
-        offload_state = _offload_single_buffer(buffer, all_bucket_groups, buffer_idx)
-        offload_states.append(offload_state)
+    with nvtx_range("offload/free-buffers", time=True):
+        for buffer_idx, buffer in enumerate(all_buffers):
+            offload_state = _offload_single_buffer(buffer, all_bucket_groups, buffer_idx)
+            offload_states.append(offload_state)
 
-    if empty_cache:
-        torch.cuda.empty_cache()
+    with nvtx_range("offload/empty-cache", time=True):
+        if empty_cache:
+            torch.cuda.empty_cache()
 
     return offload_states
 
@@ -218,6 +234,8 @@ def onload_grad_data(
         synchronize: Whether to call torch.cuda.synchronize() after allocation
         zero_grad_data: Whether to zero the grad_data tensors after allocation
     """
+    nvtx_range = _get_nvtx_range()
+    
     # Get all buffers (dense + expert parallel)
     all_buffers = ddp_model.buffers + ddp_model.expert_parallel_buffers
 
@@ -226,12 +244,14 @@ def onload_grad_data(
         f"number of buffers ({len(all_buffers)})"
     )
 
-    for offload_state in offload_states:
-        buffer = all_buffers[offload_state.buffer_id]
-        _onload_single_buffer(buffer, offload_state, zero_grad_data)
+    with nvtx_range("onload/allocate-buffers", time=True):
+        for offload_state in offload_states:
+            buffer = all_buffers[offload_state.buffer_id]
+            _onload_single_buffer(buffer, offload_state, zero_grad_data)
 
-    if synchronize:
-        torch.cuda.synchronize()
+    with nvtx_range("onload/cuda-synchronize", time=True):
+        if synchronize:
+            torch.cuda.synchronize()
 
 
 def _onload_single_buffer(

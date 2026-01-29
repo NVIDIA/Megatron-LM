@@ -1904,6 +1904,12 @@ def training_log(
             'rl/onload-optimizer-after-inference',
             'rl/offload-kv-cache-after-inference',
             'rl/onload-kv-cache-before-inference',
+            # Fine-grained offload/onload breakdown
+            'offload/cuda-synchronize',
+            'offload/free-buffers',
+            'offload/empty-cache',
+            'onload/allocate-buffers',
+            'onload/cuda-synchronize',
             # Weight prefetching
             'rl/prefetch-weights-to-gpu',
             'rl/prefetch-weights-to-cpu',
