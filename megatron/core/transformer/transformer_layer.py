@@ -461,7 +461,6 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
             if "mlp" in self.config.recompute_modules:
                 if not self.is_moe_layer:
                     self.recompute_mlp = True
-        assert self.config.offload_modules is not None
         self.offload_attn_norm = (
             self.config.fine_grained_activation_offloading
             and "attn_norm" in self.config.offload_modules
