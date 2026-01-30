@@ -34,7 +34,15 @@ class RemoteCopyService:
     and executing pipelined communication with NVSHMEM.
     """
 
-    def __init__(self):
+    def __init__(self, scheduling_algorithm: str = "dsatur"):
+        """
+        Initialize RemoteCopyService.
+
+        Args:
+            scheduling_algorithm: Algorithm for scheduling batches to iterations
+                - "dsatur": DSatur graph coloring (near-optimal, default)
+                - "greedy": Simple greedy first-fit (baseline for comparison)
+        """
         # Core components
         self.gpu_resources = GPUResourceManager()
         self.buffer_manager = DoubleBufferManager()
@@ -44,7 +52,7 @@ class RemoteCopyService:
         # Planning components
         self.task_segmenter = TaskSegmenter()
         self.workload_packer = WorkloadPacker()
-        self.comm_scheduler = CommunicationScheduler()
+        self.comm_scheduler = CommunicationScheduler(algorithm=scheduling_algorithm)
         self.gpu_planner = GPUExecutionPlanner()
 
         # State

@@ -28,11 +28,11 @@ echo "Interactive mode: $IS_INTERACTIVE"
 
 # Container image
 if [ -z "${CONTAINER_IMAGE}" ]; then
-    SQSH_PATH="/lustre/fsw/portfolios/llmservice/users/ksanthanam/images/adlr+megatron+mamba-dynamic-engine.sqsh"
+    SQSH_PATH="/lustre/fsw/portfolios/adlr/users/wdykas/images/nvshmem+adlr+megatron-rl+260113.sqsh"
     if [ -f $SQSH_PATH ]; then
         CONTAINER_IMAGE=$SQSH_PATH
     else
-        CONTAINER_IMAGE="/lustre/fsw/portfolios/llmservice/users/ksanthanam/images/adlr+megatron+mamba-dynamic-engine.sqsh"
+        CONTAINER_IMAGE="/lustre/fsw/portfolios/adlr/users/wdykas/images/nvshmem+adlr+megatron-rl+260113.sqsh"
     fi
 fi
 

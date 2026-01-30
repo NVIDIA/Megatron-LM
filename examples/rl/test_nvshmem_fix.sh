@@ -1,25 +1,14 @@
 #!/bin/bash
 # Copyright (c) 2025, NVIDIA CORPORATION. All rights reserved.
 #
-# Multi-node benchmark script for Kimi K2 model refit performance
+# Quick test script for NVSHMEM fix validation
+# Tests on 2 nodes (16 GPUs) before running full 16-node benchmark
 #
-# Kimi K2 Model Specifications:
-# - Total parameters: 1.04T (1 trillion)
-# - Active parameters: 32B per token
-# - Layers: 61 (60 MoE + 1 dense)
-# - Hidden size: 7168
-# - Attention heads: 64
-# - MoE experts: 384
-# - Active experts per token: 8
-# - Shared experts: 1
-# - Vocabulary: 160K tokens
-# - Context length: 128K tokens
-#
-#SBATCH --job-name=benchmark-refit-kimi-k2-debug
-#SBATCH --nodes=16
+#SBATCH --job-name=test-nvshmem-fix
+#SBATCH --nodes=2
 #SBATCH --ntasks-per-node=8
 #SBATCH --gpus-per-node=8
-#SBATCH --time=00:30:00
+#SBATCH --time=00:15:00
 #SBATCH --partition=batch
 #SBATCH --account=llmservice_fm_text
 #SBATCH --exclusive
@@ -37,22 +26,17 @@ export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 
 # NVSHMEM environment variables
 # Buffer allocation: 4 buffers × 64MB = 256MB per PE per refit call
-# With warmup + 2 iterations = 3 calls × 256MB = 768MB needed
-# Set symmetric size to 1GB per PE to allow 3+ allocations
-# Total across 128 PEs: 128 × 1GB = 128GB
-export NVSHMEM_SYMMETRIC_SIZE=1073741824  # 1GB per PE (increased from 512MB)
+# With warmup + iterations, need enough for multiple allocations
+# Set symmetric size to 1GB per PE for safety
+export NVSHMEM_SYMMETRIC_SIZE=1073741824  # 1GB per PE
 export NVSHMEM_DEBUG=WARN
 export NVSHMEM_DEBUG_SUBSYS=INIT,BOOTSTRAP
 export NVSHMEM_DISABLE_CUDA_VMM=1
 export NVSHMEM_REMOTE_TRANSPORT=ibrc
-
-# Bootstrap tuning for 128 PEs
-export NVSHMEM_BOOTSTRAP_TIMEOUT=300  # Increase timeout to 5 minutes
+export NVSHMEM_BOOTSTRAP_TIMEOUT=300
 export NVSHMEM_BOOTSTRAP_MAX_RETRIES=10
 
 # Determine script paths
-# Use SLURM_SUBMIT_DIR which points to where sbatch was called
-# This avoids issues with script paths being resolved in container temp directories
 if [ -n "$SLURM_SUBMIT_DIR" ]; then
     SCRIPT_DIR="$SLURM_SUBMIT_DIR"
 else
@@ -61,12 +45,12 @@ else
 fi
 BENCHMARK_SCRIPT="${SCRIPT_DIR}/benchmark_refit.py"
 
-
+# Find megatron-rl directory
 MEGATRON_RL_DIR=$(dirname $(dirname "$SCRIPT_DIR"))
 export PYTHONPATH="${MEGATRON_RL_DIR}:${PYTHONPATH:-}"
 
 echo "============================================================================"
-echo "KIMI K2 REFIT BENCHMARK"
+echo "NVSHMEM FIX VALIDATION TEST (2 nodes, 16 GPUs)"
 echo "============================================================================"
 echo "Job ID: ${SLURM_JOB_ID}"
 echo "Nodes: ${SLURM_NNODES}"
@@ -97,7 +81,7 @@ LOG_DIR="${OUTPUT_DIR}/logs"
 
 # Generate run ID
 DATETIME=$(date +'%y%m%d_%H%M%S')
-RUN_ID="kimi_k2_${DATETIME}_${SLURM_JOB_ID}"
+RUN_ID="test_nvshmem_fix_${DATETIME}_${SLURM_JOB_ID}"
 LOG_FILE="${LOG_DIR}/${RUN_ID}.log"
 
 echo "Output directory: $OUTPUT_DIR"
@@ -105,84 +89,51 @@ echo "Log file: $LOG_FILE"
 echo ""
 
 # ============================================================================
-# SCALED DOWN Model Configuration FOR REFIT DEBUGGING
+# SMALL Model Configuration FOR QUICK TESTING
 # ============================================================================
-#
-# Testing refit with a scaled-down model WITH MLA
-#
-# MLA FIX: Fixed TELinear to correctly set tensor_model_parallel=False for
-#          duplicated mode parameters. MLA's linear_q_down_proj/linear_kv_down_proj
-#          use parallel_mode='duplicated' (replicated, not TP-sharded), and
-#          refit now correctly recognizes them as non-TP-sharded.
-#
-# Model: 16 layers, 4096 hidden, 128 experts (scaled down 4x from Kimi K2)
-# Memory: ~2-4 GB per GPU in bf16 (should easily fit in 80GB)
-#
-# Next steps:
-#   1. Verify refit works with MLA enabled
-#   2. Scale back up to full Kimi K2 size if successful
+# Even smaller than the 16-node test for faster iteration
 
-# Model architecture parameters - SCALED DOWN FOR DEBUGGING
-# Using 4x smaller model to fit in memory and debug refit
-NUM_LAYERS=16                      # Reduced from 61 to fit in memory
-HIDDEN_SIZE=4096                   # Reduced from 7168
-NUM_ATTENTION_HEADS=32             # Reduced from 64
-NUM_KEY_VALUE_HEADS=32             # Reduced from 64
-SEQ_LENGTH=2048                    # Reduced from 8192
-MAX_POSITION_EMBEDDINGS=131072     # max_position_embeddings (128K context)
+NUM_LAYERS=8                       # Reduced for speed
+HIDDEN_SIZE=2048                   # Reduced for speed
+NUM_ATTENTION_HEADS=16             # Reduced for speed
+NUM_KEY_VALUE_HEADS=16             # Reduced for speed
+SEQ_LENGTH=1024                    # Reduced for speed
+MAX_POSITION_EMBEDDINGS=131072
 
 # RoPE parameters
-ROTARY_BASE=10000                  # Standard RoPE base
+ROTARY_BASE=10000
 
-# MoE configuration - SCALED DOWN FOR DEBUGGING
-NUM_EXPERTS=128                    # Reduced from 384 to fit in memory
-MOE_ROUTER_TOPK=4                  # Reduced from 8
-MOE_FFN_HIDDEN_SIZE=1024           # Reduced from 2048
-MOE_SHARED_EXPERT_SIZE=1024        # 1 shared expert * 1024
+# MoE configuration
+NUM_EXPERTS=64                     # Reduced for speed
+MOE_ROUTER_TOPK=2                  # Reduced for speed
+MOE_FFN_HIDDEN_SIZE=512            # Reduced for speed
+MOE_SHARED_EXPERT_SIZE=512
 
 # Vocabulary
-VOCAB_SIZE=50000                   # Reduced from 163840 for debugging
+VOCAB_SIZE=32000                   # Reduced for speed
 
 # Other parameters
-FFN_HIDDEN_SIZE=11008              # Reduced from 18432
+FFN_HIDDEN_SIZE=5504               # Reduced for speed
 MICRO_BATCH_SIZE=1
 
 # ============================================================================
-# Refit Benchmark Configurations
+# Test Configurations
 # ============================================================================
-
-# DEBUG configuration - Testing refit WITH MLA
-# Format: "SRC_TP:SRC_EP:DST_TP:DST_EP:REFIT_MODE:REFIT_METHOD:DESCRIPTION"
-#
-# FIXED: TELinear now correctly marks duplicated parameters as non-TP-sharded
-#        MLA's linear_q_down_proj/linear_kv_down_proj are replicated and
-#        refit now correctly handles them
-#
-# Using 16 nodes (128 GPUs total) for debugging
-# - Scaled down model: 16 layers, 4096 hidden, 128 experts
-# - WITH MLA to test refit with duplicated parameters
-# - Once working, can scale up to full Kimi K2 size
-#
-# Strategy:
-# 1. Test with GLOO first to verify MLA fix works
-# 2. Then test with NVSHMEM to debug bootstrap issues separately
+# Using 2 nodes (16 GPUs): 8 source + 8 destination
 
 CONFIGS=(
-    # Test 1: GLOO - Verify MLA fix works (slower but reliable)
-    # Non-collocated: 64 source GPUs + 64 destination GPUs = 128 total
-    # Source TP=8, EP=8 -> Dest TP=4, EP=16
-    "8:8:4:16:non-collocated:gloo:TP8_EP8_to_TP4_EP16_64plus64_mla_gloo_bf16"
+    # Test 1: GLOO baseline (should work)
+    "4:2:2:4:non-collocated:gloo:TP4_EP2_to_TP2_EP4_8plus8_mla_gloo_bf16"
 
-    # Test 2: NVSHMEM - Debug bootstrap with 128 PEs
-    # Only runs if GLOO test passes
-    "8:8:4:16:non-collocated:nvshmem:TP8_EP8_to_TP4_EP16_64plus64_mla_nvshmem_bf16"
+    # Test 2: NVSHMEM (testing the fix)
+    "4:2:2:4:non-collocated:nvshmem:TP4_EP2_to_TP2_EP4_8plus8_mla_nvshmem_bf16"
 )
 
-NUM_BENCHMARK_WARMUP=3  # Warmup iterations (reduced for gloo test)
-NUM_BENCHMARK_ITERATIONS=10  # Reduced for faster testing
+NUM_BENCHMARK_WARMUP=1
+NUM_BENCHMARK_ITERATIONS=1  # Just 1 iteration for quick validation
 
 # ============================================================================
-# Run Benchmarks
+# Run Tests
 # ============================================================================
 
 MOUNTS="/home:/home,/lustre:/lustre"
@@ -196,8 +147,8 @@ fi
 
 # Create results summary file
 SUMMARY_FILE="${LOG_DIR}/${RUN_ID}_summary.txt"
-echo "Kimi K2 Refit Benchmark Summary" > "$SUMMARY_FILE"
-echo "================================" >> "$SUMMARY_FILE"
+echo "NVSHMEM Fix Validation Test" > "$SUMMARY_FILE"
+echo "============================" >> "$SUMMARY_FILE"
 echo "Date: $(date)" >> "$SUMMARY_FILE"
 echo "Job ID: ${SLURM_JOB_ID}" >> "$SUMMARY_FILE"
 echo "Nodes: ${SLURM_NNODES}" >> "$SUMMARY_FILE"
@@ -209,7 +160,6 @@ echo "  Hidden size: $HIDDEN_SIZE" >> "$SUMMARY_FILE"
 echo "  Attention heads: $NUM_ATTENTION_HEADS" >> "$SUMMARY_FILE"
 echo "  MoE experts: $NUM_EXPERTS" >> "$SUMMARY_FILE"
 echo "  Active experts: $MOE_ROUTER_TOPK" >> "$SUMMARY_FILE"
-echo "  Vocabulary: $VOCAB_SIZE" >> "$SUMMARY_FILE"
 echo "" >> "$SUMMARY_FILE"
 echo "Results:" >> "$SUMMARY_FILE"
 echo "--------" >> "$SUMMARY_FILE"
@@ -220,7 +170,7 @@ for config in "${CONFIGS[@]}"; do
 
     echo ""
     echo "============================================================================"
-    echo "Running benchmark: ${DESCRIPTION}"
+    echo "Running test: ${DESCRIPTION}"
     echo "  Source: TP=${SRC_TP}, EP=${SRC_EP} ($((SRC_TP * SRC_EP)) GPUs)"
     echo "  Target: TP=${DST_TP}, EP=${DST_EP} ($((DST_TP * DST_EP)) GPUs)"
     echo "  Mode: ${REFIT_MODE}, Method: ${REFIT_METHOD}"
@@ -228,11 +178,9 @@ for config in "${CONFIGS[@]}"; do
 
     CONFIG_LOG="${LOG_DIR}/${RUN_ID}_${DESCRIPTION}.log"
 
-    # Build command arguments with MLA support
-    # Fixed: TELinear now correctly sets tensor_model_parallel=False for duplicated mode
+    # Build command arguments
     ARGS=(
         --bf16
-        --grad-reduce-in-bf16
         --use-mcore-models
         --normalization RMSNorm
         --swiglu
@@ -285,18 +233,16 @@ for config in "${CONFIGS[@]}"; do
     exit_code=$?
 
     if [ $exit_code -eq 0 ]; then
-        echo "✓ Benchmark completed successfully"
+        echo "✓ Test completed successfully"
 
-        # Add interpretation based on method
         if [[ "$REFIT_METHOD" == "gloo" ]]; then
-            echo "  ✓ MLA fix verified: Refit works with duplicated parameters"
-            echo "  → Now safe to test NVSHMEM"
+            echo "  ✓ GLOO baseline works"
         elif [[ "$REFIT_METHOD" == "nvshmem" ]]; then
-            echo "  ✓ NVSHMEM bootstrap succeeded with 128 PEs"
-            echo "  ✓ Full test passed: MLA + NVSHMEM working"
+            echo "  ✓✓ NVSHMEM FIX VERIFIED!"
+            echo "  → Safe to run full 16-node benchmark"
         fi
 
-        # Extract results from log and add to summary
+        # Extract results from log
         echo "" >> "$SUMMARY_FILE"
         echo "Config: ${DESCRIPTION}" >> "$SUMMARY_FILE"
         echo "  Source: TP=${SRC_TP}, EP=${SRC_EP} ($((SRC_TP * SRC_EP)) GPUs)" >> "$SUMMARY_FILE"
@@ -304,22 +250,26 @@ for config in "${CONFIGS[@]}"; do
         echo "  Mode: ${REFIT_MODE}, Method: ${REFIT_METHOD}" >> "$SUMMARY_FILE"
         grep -A 2 "^Mean refit time:" "$CONFIG_LOG" >> "$SUMMARY_FILE" || echo "  Results not found in log" >> "$SUMMARY_FILE"
     else
-        echo "✗ Benchmark failed with exit code: $exit_code"
+        echo "✗ Test failed with exit code: $exit_code"
 
-        # Add interpretation based on method and error
         if [[ "$REFIT_METHOD" == "gloo" ]]; then
-            echo "  ✗ MLA fix may still have issues OR other problem"
-            echo "  → Check log for MLA parameter errors"
+            echo "  ✗ GLOO baseline failed - check model config"
         elif [[ "$REFIT_METHOD" == "nvshmem" ]]; then
-            echo "  ✗ NVSHMEM issue (bootstrap or collective deadlock)"
-            echo "  → Check if gloo test passed to isolate NVSHMEM vs MLA issue"
+            echo "  ✗ NVSHMEM still has issues"
+            echo "  → Check log: $CONFIG_LOG"
         fi
 
         echo "" >> "$SUMMARY_FILE"
         echo "Config: ${DESCRIPTION}" >> "$SUMMARY_FILE"
-        echo "  Source: TP=${SRC_TP}, EP=${SRC_EP} ($((SRC_TP * SRC_EP)) GPUs)" >> "$SUMMARY_FILE"
-        echo "  Target: TP=${DST_TP}, EP=${DST_EP} ($((DST_TP * DST_EP)) GPUs)" >> "$SUMMARY_FILE"
         echo "  FAILED (exit code: $exit_code)" >> "$SUMMARY_FILE"
+
+        # If NVSHMEM fails, don't continue - we need to fix it first
+        if [[ "$REFIT_METHOD" == "nvshmem" ]]; then
+            echo ""
+            echo "NVSHMEM test failed - stopping here to debug"
+            echo "Check log: $CONFIG_LOG"
+            break
+        fi
     fi
 
     echo "Log saved to: $CONFIG_LOG"
@@ -327,7 +277,7 @@ done
 
 echo ""
 echo "============================================================================"
-echo "All benchmarks complete!"
+echo "Test complete!"
 echo "============================================================================"
 echo "Summary file: $SUMMARY_FILE"
 echo ""
@@ -336,32 +286,16 @@ cat "$SUMMARY_FILE"
 
 echo ""
 echo "============================================================================"
-echo "Test Results Interpretation:"
-echo "============================================================================"
-
-# Check which tests passed/failed
-GLOO_PASSED=$(grep -q "TP8_EP8_to_TP4_EP16_64plus64_mla_gloo_bf16" "$SUMMARY_FILE" && ! grep -A 3 "TP8_EP8_to_TP4_EP16_64plus64_mla_gloo_bf16" "$SUMMARY_FILE" | grep -q "FAILED" && echo "yes" || echo "no")
-NVSHMEM_PASSED=$(grep -q "TP8_EP8_to_TP4_EP16_64plus64_mla_nvshmem_bf16" "$SUMMARY_FILE" && ! grep -A 3 "TP8_EP8_to_TP4_EP16_64plus64_mla_nvshmem_bf16" "$SUMMARY_FILE" | grep -q "FAILED" && echo "yes" || echo "no")
-
-if [[ "$GLOO_PASSED" == "yes" ]] && [[ "$NVSHMEM_PASSED" == "yes" ]]; then
-    echo "✓✓ Both tests passed!"
-    echo "   → MLA fix works correctly"
-    echo "   → NVSHMEM bootstrap works with 128 PEs"
-    echo "   → Ready to scale up to full Kimi K2 model"
-elif [[ "$GLOO_PASSED" == "yes" ]] && [[ "$NVSHMEM_PASSED" == "no" ]]; then
-    echo "✓✗ GLOO passed, NVSHMEM failed/hung"
-    echo "   → MLA fix works correctly (verified by gloo)"
-    echo "   → NVSHMEM bootstrap issue with 128 PEs (isolated)"
-    echo "   → Options: Use NCCL, or debug NVSHMEM bootstrap separately"
-elif [[ "$GLOO_PASSED" == "no" ]]; then
-    echo "✗ GLOO test failed"
-    echo "   → MLA fix may still have issues"
-    echo "   → OR: Other refit/model configuration problem"
-    echo "   → Check gloo log for error details"
+if grep -q "TP4_EP2_to_TP2_EP4_8plus8_mla_nvshmem_bf16" "$SUMMARY_FILE" && ! grep -A 2 "TP4_EP2_to_TP2_EP4_8plus8_mla_nvshmem_bf16" "$SUMMARY_FILE" | grep -q "FAILED"; then
+    echo "✓✓ NVSHMEM FIX VERIFIED!"
+    echo "   → Barrier fix resolved the deadlock"
+    echo "   → Safe to run full 16-node (128 GPU) benchmark"
+    echo ""
+    echo "Next step: sbatch benchmark_refit_kimi_k2.sh"
 else
-    echo "? Unexpected result - check logs"
+    echo "✗ NVSHMEM test did not complete successfully"
+    echo "   → Check the log for details"
 fi
-
 echo "============================================================================"
 echo ""
 
