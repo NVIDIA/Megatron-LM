@@ -335,8 +335,8 @@ def validate_args(args, defaults={}):
         assert not args.rl_reset_cuda_graphs or has_cg, (
             "--rl-reset-cuda-graphs is set but no CUDA graphs are being built."
         )
-        # Persisting CGs requires either torch_memory_saver or UVM
         if not args.rl_reset_cuda_graphs:
+            # Persisting CGs requires either torch_memory_saver or UVM
             try:
                 from torch_memory_saver import torch_memory_saver
             except ImportError:
@@ -344,8 +344,8 @@ def validate_args(args, defaults={}):
                     "--rl-persist-cuda-graphs requires either torch_memory_saver or "
                     "--inference-dynamic-batching-unified-memory-level > 0."
                 )
-        # If we are using both training and inference CGs without resetting them,
-        # and we do not offload or remove the KV$, then we use too much memory.
+            # If we persist both training and inference CGs, and do not offload or remove the KV$,
+            # then we use more memory than expected in both training and inference.
             if (
                 args.cuda_graph_impl != "none" and \
                 args.rl_training_cuda_graphs and \
