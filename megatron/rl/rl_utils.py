@@ -1642,14 +1642,11 @@ def megatron_rl_inference_mode(
     lang_module = model[0].module.module if hasattr(model[0].module, "module") else model[0].module
 
     lang_module.eval()
-    # If this is a separate RL inference model allocated with UVM, ensure weights are resident on GPU
-    # before any CUDA-graph capture/replay or inference.
-    # Note: For torch_saver, this is handled by the caller (get_environment_rollouts) before refit,
-    # so we only do this for UVM path to avoid double-resume issues.
+    # If this is a separate RL inference model with offloading enabled, ensure weights are on GPU
+    # before any CUDA-graph capture/replay or inference. This is a no-op if already on GPU.
     model_core = unwrap_model(model[0])
-    if args.rl_inference_model_unified_memory_level == 1:
-        with nvtx_range("prefetch-inference-model-weights-to-gpu"):
-            _maybe_prefetch_separate_inference_model_weights(model_core, to_cpu=False)
+    with nvtx_range("prefetch-inference-model-weights-to-gpu"):
+        _maybe_prefetch_separate_inference_model_weights(model_core, to_cpu=False)
 
     rotary_module = getattr(lang_module, "rotary_pos_emb", None)
     # Vanilla RotaryEmbedding module has lru_cache decorator which breaks RL training
