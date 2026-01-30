@@ -122,6 +122,7 @@ class HyperConnectionModule(MegatronModule):
         # - H_pre: n values
         # - H_post: n values  
         # - H_res: n^2 values (before Sinkhorn projection)
+        self.norm = nn.RMSNorm(self.hidden_size * self.n)
         
         self.mapping_proj = nn.Linear(
             self.n * self.hidden_size, 
@@ -150,6 +151,7 @@ class HyperConnectionModule(MegatronModule):
         # (nn.Linear, nn.RMSNorm) whose gradients need to be all-reduced.
         if self.config.sequence_parallel:
             setattr(self.mapping_proj.weight, 'sequence_parallel', True)
+            setattr(self.norm.weight, 'sequence_parallel', True)
             setattr(self.alpha_pre, 'sequence_parallel', True)
             setattr(self.alpha_post, 'sequence_parallel', True)
             setattr(self.alpha_res, 'sequence_parallel', True)
@@ -441,7 +443,7 @@ class HyperConnectionModule(MegatronModule):
         nvtx_range_push("HyperConnection::compute_mappings")
         # Checkpoint compute_mappings - auto-registers to manager via ckpt_manager parameter
         h_pre, h_post, h_res = self.compute_mappings(hidden_states)
-
+        
         nvtx_range_pop("HyperConnection::compute_mappings")
         # Checkpoint aggregate - auto-registers to manager
         nvtx_range_push("HyperConnection::aggregate")
@@ -602,7 +604,7 @@ class HyperConnectionModule(MegatronModule):
         """
         Checkpointed implementation of fused h_res, h_post and bda operations.
         
-        Each operation is wrapped with CheckpointWithoutOutput for memory efficiency.
+        Uses a single checkpoint wrapper around all operations for memory efficiency.
         
         Args:
             h_res: [s, b, n, n] - residual mixing matrix
@@ -620,50 +622,43 @@ class HyperConnectionModule(MegatronModule):
         from megatron.core.tensor_parallel.random import CheckpointWithoutOutput
         from megatron.core.fusions.fused_bias_dropout import get_bias_dropout_add
         
-        # Step 1: Checkpoint apply_h_res
-        nvtx_range_push("HyperConnection::apply_h_res")
-        mixed = CheckpointWithoutOutput(ckpt_manager=manager).checkpoint(
-            self.apply_h_res, h_res, original_residual
-        )
-        nvtx_range_pop("HyperConnection::apply_h_res")
-        # Step 2: Checkpoint apply_h_post for x
+        # Get BDA function (captured via closure)
+        bda_func = get_bias_dropout_add(training, fused)
+        
+        # Unpack layer_output_with_bias to avoid tuple tensors in checkpoint args
         x, bias = layer_output_with_bias
-        nvtx_range_push("HyperConnection::apply_h_post")
-        x_expanded = CheckpointWithoutOutput(ckpt_manager=manager).checkpoint(
-            self._apply_h_post, x, h_post
-        )   
-        nvtx_range_pop("HyperConnection::apply_h_post")
-        # Checkpoint apply_h_post for bias if not None
-        if bias is not None:
-            bias_expanded = CheckpointWithoutOutput(ckpt_manager=manager).checkpoint(
-                self._apply_h_post, bias, h_post
-            )
-        else:
-            bias_expanded = None
+        has_bias = bias is not None
         
-        # Step 3: Checkpoint bias-dropout-add
-        # Get the underlying BDA function
-        if fused:
-            from megatron.core.fusions.fused_bias_dropout import (
-                bias_dropout_add_fused_train,
-                bias_dropout_add_fused_inference,
-            )
-            if training:
-                bda_func = bias_dropout_add_fused_train
+        # Native wrapper that combines all operations without internal checkpointing.
+        # Non-tensor args (dropout_prob, has_bias) are captured via closure.
+        def _native_wrapper(h_res, original_residual, h_post, x, *optional_bias):
+            # Step 1: Apply H_res to original residual
+            nvtx_range_push("HyperConnection::apply_h_res")
+            mixed = self.apply_h_res(h_res, original_residual)
+            nvtx_range_pop("HyperConnection::apply_h_res")
+            
+            # Step 2: Apply H_post to x and bias
+            nvtx_range_push("HyperConnection::apply_h_post")
+            x_expanded = self._apply_h_post(x, h_post)
+            if has_bias:
+                bias_expanded = self._apply_h_post(optional_bias[0], h_post)
             else:
-                bda_func = bias_dropout_add_fused_inference
-        else:
-            from megatron.core.fusions.fused_bias_dropout import bias_dropout_add_unfused
-            bda_func = bias_dropout_add_unfused(training)
+                bias_expanded = None
+            nvtx_range_pop("HyperConnection::apply_h_post")
+            
+            # Step 3: Bias-dropout-add
+            nvtx_range_push("HyperConnection::bda")
+            output = bda_func((x_expanded, bias_expanded), mixed, dropout_prob)
+            nvtx_range_pop("HyperConnection::bda")
+            
+            return output
         
-        # Wrapper function that re-packs the tuple for the actual BDA function
-        def _bda_wrapper(output, bias, res, dropout):
-            return bda_func((output, bias), res, dropout)
-        
+        # Use a single checkpoint wrapper for all operations
         ckpt = CheckpointWithoutOutput(ckpt_manager=manager)
-        nvtx_range_push("HyperConnection::bda_wrapper")
-        output = ckpt.checkpoint(_bda_wrapper, x_expanded, bias_expanded, mixed, dropout_prob)
-        nvtx_range_pop("HyperConnection::bda_wrapper")
+        if has_bias:
+            output = ckpt.checkpoint(_native_wrapper, h_res, original_residual, h_post, x, bias)
+        else:
+            output = ckpt.checkpoint(_native_wrapper, h_res, original_residual, h_post, x)
         
         return output
 
