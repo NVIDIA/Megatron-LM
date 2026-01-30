@@ -627,8 +627,8 @@ def forward_backward_no_pipelining(
         (
             data_iterator,
             num_microbatches,
-            num_total_tokens_this_global_batch,
-            sequence_square_sum_this_global_batch,
+            seqlen_sum_this_global_batch,
+            seqlen_squared_sum_this_global_batch,
         ) = wrap_iterator_helper(config, data_iterator, num_microbatches, pg_collection)
 
     if config.overlap_moe_expert_parallel_comm and not forward_only:
@@ -731,7 +731,7 @@ def forward_backward_no_pipelining(
 
     if config.sequence_packing and not forward_only:
         forward_data_store.append(
-            [num_total_tokens_this_global_batch, sequence_square_sum_this_global_batch]
+            [seqlen_sum_this_global_batch, seqlen_squared_sum_this_global_batch]
         )
 
     return forward_data_store
@@ -1116,8 +1116,8 @@ def forward_backward_pipelining_with_interleaving(
         (
             data_iterator,
             num_microbatches,
-            num_total_tokens_this_global_batch,
-            sequence_square_sum_this_global_batch,
+            seqlen_sum_this_global_batch,
+            seqlen_squared_sum_this_global_batch,
         ) = wrap_iterator_helper(config, data_iterator, num_microbatches, pg_collection)
 
     # Needed only when gradients are finalized in M-Core
@@ -2138,7 +2138,7 @@ def forward_backward_pipelining_with_interleaving(
 
     if config.sequence_packing and not forward_only:
         forward_data_store.append(
-            [num_total_tokens_this_global_batch, sequence_square_sum_this_global_batch]
+            [seqlen_sum_this_global_batch, seqlen_squared_sum_this_global_batch]
         )
 
     return forward_data_store
@@ -2265,8 +2265,8 @@ def forward_backward_pipelining_without_interleaving(
         (
             data_iterator,
             num_microbatches,
-            num_total_tokens_this_global_batch,
-            sequence_square_sum_this_global_batch,
+            seqlen_sum_this_global_batch,
+            seqlen_squared_sum_this_global_batch,
         ) = wrap_iterator_helper(config, data_iterator, num_microbatches, pg_collection)
 
     # Needed only when gradients are finalized in M-Core
@@ -2540,7 +2540,7 @@ def forward_backward_pipelining_without_interleaving(
 
     if config.sequence_packing and not forward_only:
         forward_data_store.append(
-            [num_total_tokens_this_global_batch, sequence_square_sum_this_global_batch]
+            [seqlen_sum_this_global_batch, seqlen_squared_sum_this_global_batch]
         )
 
     return forward_data_store
