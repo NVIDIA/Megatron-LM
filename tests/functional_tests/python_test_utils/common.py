@@ -227,7 +227,7 @@ def pipeline(
                 is_close = np.isclose(actual, golden, rtol=test.rtol, atol=test.atol)
 
                 num_failing_steps_allowed = min(max(total_steps_evaluated // 100, 1), 50)
-                passing = np.mean(is_close) >= (num_failing_steps_allowed / total_steps_evaluated)
+                passing = np.mean(is_close) >= (1.0 - num_failing_steps_allowed / total_steps_evaluated)
 
                 if not passing:
                     logger.info(
