@@ -694,6 +694,10 @@ class FSDPDistributedIndex:
         # Find the index for the current rank in the hybrid group
         return self._hybrid_fsdp_group_ranks.index(self.hybrid_fsdp_group.rank())
 
+    def representative_rank(self) -> int:
+        """Get a representative rank from the device mesh."""
+        return self.device_mesh.mesh.flatten()[0].item()
+
 
 class GlobalMemoryBuffer:
     """Global buffer to avoid dynamic memory allocations.
@@ -767,7 +771,7 @@ def is_mcore_tensor_parallel_duplicated(param: torch.Tensor) -> bool:
     """
     Check if the given parameter is Megatron-Core tensor model parallel and duplicated.
     """
-    return getattr(param, "_tp_duplicated", False)
+    return getattr(param, "_tp_duplicated", False) or not is_mcore_tensor_model_parallel(param)
 
 
 def get_mcore_tensor_parallel_partition_dim(param: torch.Tensor) -> Optional[int]:
@@ -780,3 +784,11 @@ def get_mcore_tensor_parallel_partition_dim(param: torch.Tensor) -> Optional[int
         else:
             return param.partition_dim
     return None
+
+
+def using_tensor_parallel(dist_index, is_expert_parallel: bool = False) -> bool:
+    """
+    Check if tensor parallelism is being used based on the distributed index.
+    """
+    tp_mesh = dist_index.get_submesh(dist_index.tp_dim, is_expert_parallel=is_expert_parallel)
+    return tp_mesh.mesh.numel() > 1

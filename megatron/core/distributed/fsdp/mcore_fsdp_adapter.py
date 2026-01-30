@@ -16,13 +16,6 @@ import logging
 import random
 from typing import List, Optional
 
-try:
-    import einops
-
-    HAVE_EINOPS = True
-except ImportError:
-    HAVE_EINOPS = False
-
 import numpy as np
 import torch
 import torch.distributed as dist
@@ -259,7 +252,7 @@ class FullyShardedDataParallel(_BaseDataParallel):
             )
         else:
             if ep_group is not None:
-                expt_mesh = _get_dp_tp_mesh(expt_dp_group, expt_tp_group, ep_size=ep_group.size())
+                expt_mesh = _get_dp_tp_mesh(expt_dp_group, expt_tp_group)
                 expt_device_mesh = DeviceMesh.from_group(
                     [expt_dp_group, expt_tp_group],
                     device_type="cuda",
@@ -309,97 +302,44 @@ class FullyShardedDataParallel(_BaseDataParallel):
 
 
 def _get_hsdp_tp_mesh(outer_fsdp_dp_group, dp_cp_group, tp_group):
-    assert HAVE_EINOPS, "einops is not installed. Please install it with `pip install einops`."
-    world_size = dist.get_world_size()
+    if tp_group is None:
+        tp_ranks = [dist.get_rank()]
+    else:
+        tp_ranks = dist.get_process_group_ranks(tp_group)
 
-    mesh = einops.rearrange(
-        torch.arange(world_size),
-        "(outer_fsdp_dp fsdp tp) -> outer_fsdp_dp fsdp tp",
-        outer_fsdp_dp=outer_fsdp_dp_group.size(),
-        tp=tp_group.size(),
-    )
+    if dp_cp_group is None:
+        dp_cp_tp_ranks = [tp_ranks]
+    else:
+        dp_size = dist.get_world_size(dp_cp_group)
+        dp_cp_tp_ranks = [None for _ in range(dp_size)]
+        dist.all_gather_object(dp_cp_tp_ranks, tp_ranks, group=dp_cp_group)
 
-    mesh_fsdp_ranks = einops.rearrange(
-        mesh,
-        'outer_fsdp_dp fsdp tp -> (outer_fsdp_dp tp) fsdp',
-        tp=tp_group.size(),
-        fsdp=dp_cp_group.size(),
-    )
-    fsdp_group_ranks = dist.get_process_group_ranks(dp_cp_group)
-    assert _check_mesh_ranks_and_group_ranks_are_consistent(mesh_fsdp_ranks, fsdp_group_ranks), (
-        f"[Megatron-FSDP] FSDP ranks in the mesh {mesh_fsdp_ranks} "
-        f"do not match the ranks in the FSDP group {fsdp_group_ranks}."
-    )
+    if outer_fsdp_dp_group is None:
+        outer_fsdp_dp_dp_cp_tp_ranks = [dp_cp_tp_ranks]
+    else:
+        outer_fsdp_dp_size = dist.get_world_size(outer_fsdp_dp_group)
+        outer_fsdp_dp_dp_cp_tp_ranks = [None for _ in range(outer_fsdp_dp_size)]
+        dist.all_gather_object(
+            outer_fsdp_dp_dp_cp_tp_ranks, dp_cp_tp_ranks, group=outer_fsdp_dp_group
+        )
 
-    mesh_tp_ranks = einops.rearrange(
-        mesh,
-        'outer_fsdp_dp fsdp tp -> (outer_fsdp_dp fsdp) tp',
-        tp=tp_group.size(),
-        fsdp=dp_cp_group.size(),
-    )
-    tp_group_ranks = dist.get_process_group_ranks(tp_group)
-    assert _check_mesh_ranks_and_group_ranks_are_consistent(mesh_tp_ranks, tp_group_ranks), (
-        f"[Megatron-FSDP] Tensor Parallel ranks in the mesh {mesh_tp_ranks} "
-        f"do not match the ranks in the TP group {tp_group_ranks}."
-    )
-
-    mesh_outer_fsdp_dp_ranks = einops.rearrange(
-        mesh,
-        'outer_fsdp_dp fsdp tp -> (fsdp tp) outer_fsdp_dp',
-        tp=tp_group.size(),
-        fsdp=dp_cp_group.size(),
-    )
-    outer_fsdp_dp_group_ranks = dist.get_process_group_ranks(outer_fsdp_dp_group)
-    assert _check_mesh_ranks_and_group_ranks_are_consistent(
-        mesh_outer_fsdp_dp_ranks, outer_fsdp_dp_group_ranks
-    ), (
-        f"[Megatron-FSDP] Outer FSDP Data Parallel ranks in the mesh {mesh_outer_fsdp_dp_ranks} "
-        f"do not match the ranks in the Outer FSDP DP group {outer_fsdp_dp_group_ranks}."
-    )
-
-    return mesh
+    return torch.tensor(outer_fsdp_dp_dp_cp_tp_ranks)
 
 
-def _get_dp_tp_mesh(dp_cp_group, tp_group, ep_size=1):
-    assert HAVE_EINOPS, "einops is not installed. Please install it with `pip install einops`."
-    world_size = dist.get_world_size()
+def _get_dp_tp_mesh(dp_cp_group, tp_group):
+    if tp_group is None:
+        tp_ranks = [dist.get_rank()]
+    else:
+        tp_ranks = dist.get_process_group_ranks(tp_group)
 
-    tp_size = dist.get_world_size(tp_group) if tp_group is not None else 1
-    # TODO: Supports configurable (dp, cp, ep, tp) order.
-    mesh = einops.rearrange(
-        torch.arange(world_size),
-        "(dp_cp ep tp) -> ep dp_cp tp",
-        dp_cp=dp_cp_group.size(),
-        tp=tp_size,
-        ep=ep_size,
-    )
+    if dp_cp_group is None:
+        return torch.tensor([tp_ranks])
 
-    mesh_dp_ranks = einops.rearrange(mesh, 'ep dp_cp tp -> (ep tp) dp_cp', dp_cp=dp_cp_group.size())
-    dp_cp_group_ranks = dist.get_process_group_ranks(dp_cp_group)
-    assert _check_mesh_ranks_and_group_ranks_are_consistent(mesh_dp_ranks, dp_cp_group_ranks), (
-        f"[Megatron-FSDP] Data Parallel ranks in the mesh {mesh_dp_ranks} "
-        f"do not match the ranks in the DP group {dp_cp_group_ranks}."
-    )
+    dp_size = dist.get_world_size(dp_cp_group)
+    dp_cp_tp_ranks = [None for _ in range(dp_size)]
+    dist.all_gather_object(dp_cp_tp_ranks, tp_ranks, group=dp_cp_group)
 
-    mesh_tp_ranks = einops.rearrange(mesh, 'ep dp_cp tp -> (dp_cp ep) tp', tp=tp_size)
-    tp_group_ranks = dist.get_process_group_ranks(tp_group)
-    assert _check_mesh_ranks_and_group_ranks_are_consistent(mesh_tp_ranks, tp_group_ranks), (
-        f"[Megatron-FSDP] Tensor Parallel ranks in the mesh {mesh_tp_ranks} "
-        f"do not match the ranks in the TP group {tp_group_ranks}."
-    )
-
-    # Exclude the expert parallel dimension
-    rank = dist.get_rank()
-    dp_tp_meshes = [per_ep_mesh for per_ep_mesh in mesh if rank in per_ep_mesh.reshape(-1).tolist()]
-    assert (
-        len(dp_tp_meshes) == 1
-    ), f"[Megatron-FSDP] Current rank {rank} is not unique in the mesh ranks {mesh.tolist()}."
-    assert len(dp_tp_meshes[0].reshape(-1).tolist()) == dp_cp_group.size() * tp_group.size(), (
-        f"[Megatron-FSDP] DP-TP mesh size {len(dp_tp_meshes[0].reshape(-1).tolist())} "
-        f"does not match expected size {dp_cp_group.size() * tp_group.size()}."
-    )
-
-    return dp_tp_meshes[0]
+    return torch.tensor(dp_cp_tp_ranks)
 
 
 def _check_mesh_ranks_and_group_ranks_are_consistent(mesh_ranks, group_ranks):
