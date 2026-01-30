@@ -629,6 +629,7 @@ class DynamicInferenceContext(BaseInferenceContext):
             return
 
         for name in self._offloadable_tensor_names:
+            tensor = getattr(self, name)
             tensor.storage().resize_(self._offloadable_storage_sizes[name])
             tensor.copy_(self._offloadable_cpu_backups[name], non_blocking=True)
 
