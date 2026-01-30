@@ -514,15 +514,15 @@ def build_transformer_layer_callables(layer: TransformerLayer):
             token_dispatcher._comm_manager.token_probs = probs
 
         dispatched_tokens, dispatched_probs = layer.mlp.dispatch(local_tokens, probs)
-        node.layer_state.dispatched_probs = node.detach(dispatched_probs)
-        return dispatched_tokens
+        return dispatched_tokens, dispatched_probs
 
-    def submodule_moe_forward(node: ScheduleNode, dispatched_tokens: torch.Tensor):
+    def submodule_moe_forward(
+        node: ScheduleNode, dispatched_tokens: torch.Tensor, dispatched_probs: torch.Tensor
+    ):
         """
         Run forward pass for computations between dispatch and combine:
             post dispatch->experts->combine preprocess
         """
-        dispatched_probs = node.layer_state.dispatched_probs
         token_dispatcher = layer.mlp.token_dispatcher
         if enable_deepep or enable_hybridep:
             # update dispatched_probs to be detached version, prevents
@@ -541,9 +541,6 @@ def build_transformer_layer_callables(layer: TransformerLayer):
             # discard the output of the pre-mlp layernorm and register the recompute
             # as a gradient hook of expert_output
             layer.pre_mlp_norm_checkpoint.discard_output_and_register_recompute(expert_output)
-        # release tensor reference after use
-        node.layer_state.dispatched_probs = None
-        node.layer_state.pre_mlp_layernorm_output = None
 
         return expert_output
 
