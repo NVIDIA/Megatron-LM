@@ -55,6 +55,7 @@ class AttnMaskType(enum.Enum):
     padding_causal = 4  # only used for thd attention
     arbitrary = 5
     causal_bottom_right = 6  # only used for TE
+    padding_causal_bottom_right = 7  # only used for TE
 
 
 class AttnBackend(enum.Enum):

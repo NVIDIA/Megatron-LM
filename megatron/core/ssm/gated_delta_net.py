@@ -14,6 +14,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch import Tensor
 
+from megatron.core.cached_prefix_utils import CachedPrefixParams
 from megatron.core.dist_checkpointing import ShardedTensor
 from megatron.core.dist_checkpointing.mapping import ReplicaId, ShardedTensorFactory
 from megatron.core.fp8_utils import get_fp8_align_size
@@ -21,6 +22,7 @@ from megatron.core.inference.contexts import BaseInferenceContext
 from megatron.core.jit import jit_fuser
 from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.core.process_groups_config import ProcessGroupCollection
+from megatron.core.ssm.gated_delta_net_cached_prefix import ChunkedKVCacheForGatedDeltaNet
 from megatron.core.ssm.mamba_context_parallel import (
     _all_to_all_cp2hp,
     _all_to_all_hp2cp,
@@ -40,19 +42,17 @@ from megatron.core.transformer.utils import (
 from megatron.core.utils import deprecate_inference_params, nvtx_range_pop, nvtx_range_push
 
 try:
+    from fla.modules.convolution import causal_conv1d
     from fla.modules.l2norm import l2norm
     from fla.ops.gated_delta_rule import chunk_gated_delta_rule
 
     HAVE_FLA = True
 except ImportError:
+    causal_conv1d = None
+    l2norm = None
     chunk_gated_delta_rule = None
 
     HAVE_FLA = False
-
-try:
-    from causal_conv1d import causal_conv1d_fn
-except ImportError:
-    causal_conv1d_fn = None
 
 
 logger = logging.getLogger(__name__)
@@ -204,6 +204,11 @@ class GatedDeltaNet(MegatronModule):
         )
         setattr(self.A_log, "tensor_model_parallel", True)
 
+        if self.config.deterministic_mode:
+            self.gated_delta_rule = torch_chunk_gated_delta_rule
+        else:
+            self.gated_delta_rule = chunk_gated_delta_rule
+
         # Output layernorm before projection
         self.out_norm = build_module(
             submodules.out_norm,
@@ -257,6 +262,7 @@ class GatedDeltaNet(MegatronModule):
         inference_context: Optional[BaseInferenceContext] = None,
         packed_seq_params: Optional[PackedSeqParams] = None,
         sequence_len_offset: Optional[int] = None,
+        cached_prefix_params: Optional[CachedPrefixParams] = None,
         *,
         inference_params: Optional[BaseInferenceContext] = None,
         **kwargs,
@@ -272,7 +278,8 @@ class GatedDeltaNet(MegatronModule):
             packed_seq_params (Optional[PackedSeqparams]): Parameters used for THD format.
             sequence_len_offset (Optional[int]): Sequence length offset used for
                 inference CUDA graphs.
-
+            cached_prefix_params (Optional[CachedPrefixParams]): Parameters used for
+                prefix caching.
         Return:
             (Tuple[Tensor, Tensor]) GDN output and bias.
 
@@ -337,8 +344,8 @@ class GatedDeltaNet(MegatronModule):
         alpha = alpha.reshape(batch, seq_len, -1)
 
         # Convolution on qkv
-        qkv = qkv.transpose(1, 2).contiguous()  # b, s, d -> b, d, s
         nvtx_range_push(suffix="conv1d")
+        seq_len = qkv.shape[1]
         qkv_channels_split_sections = [
             self.qk_dim_local_tp,
             self.qk_dim_local_tp,
@@ -360,9 +367,21 @@ class GatedDeltaNet(MegatronModule):
             if self.conv_bias
             else None
         )
-        if (causal_conv1d_fn is None) or self.config.deterministic_mode:
+
+        if cached_prefix_params is not None:
+            kv_cache = cached_prefix_params.kv_cache_pool.get_kv_cache(
+                layer_idx=self.layer_number, kv_cache_cls=ChunkedKVCacheForGatedDeltaNet
+            )
+        else:
+            kv_cache = None
+
+        if self.config.deterministic_mode:
+            assert (
+                kv_cache is None
+            ), "Cached prefix is not supported with GDN deterministic mode for now."
+            qkv = qkv.transpose(1, 2).contiguous()  # b, s, d -> b, d, s
             conv_out = F.conv1d(
-                input=qkv,
+                input=qkv,  # Torch-native only accept [b, d, s] format input
                 weight=conv1d_weight,
                 bias=conv1d_bias,
                 stride=self.conv1d.stride,
@@ -371,33 +390,49 @@ class GatedDeltaNet(MegatronModule):
                 groups=self.conv_dim_local_tp // self.cp_size,
             )
             qkv = self.act_fn(conv_out[..., :seq_len])
+            qkv = qkv.transpose(1, 2)  # b, d, s -> b, s, d
         else:
             assert self.activation in ["silu", "swish"]
-            qkv = causal_conv1d_fn(
-                x=qkv,
-                weight=conv1d_weight.squeeze(1),  # d, 1, w -> d, w
-                bias=conv1d_bias,
-                activation=self.activation,
-            )
+            if kv_cache is not None:
+                qkv = kv_cache.forward_conv1d_with_kv_cache(
+                    module=causal_conv1d,
+                    cached_prefix_params=cached_prefix_params,
+                    x=qkv,
+                    weight=conv1d_weight.squeeze(1),  # d, 1, w -> d, w
+                    bias=conv1d_bias,
+                    activation=self.activation,
+                )
+            else:
+                qkv, _ = causal_conv1d(
+                    x=qkv,  # FLA conv1d accepts [b, s, d] format input
+                    weight=conv1d_weight.squeeze(1),  # d, 1, w -> d, w
+                    bias=conv1d_bias,
+                    activation=self.activation,
+                    initial_state=None,
+                    output_final_state=False,
+                )
         nvtx_range_pop(suffix="conv1d")
-        # Split qkv into query, key, and value
-        qkv = qkv.transpose(1, 2)  # b, d, s -> b, s, d
-        query, key, value = torch.split(
+
+        # Split qkv into query_key, and value
+        query_key, value = torch.split(
             qkv,
-            [
-                self.qk_dim_local_tp // self.cp_size,
-                self.qk_dim_local_tp // self.cp_size,
-                self.v_dim_local_tp // self.cp_size,
-            ],
+            [2 * self.qk_dim_local_tp // self.cp_size, self.v_dim_local_tp // self.cp_size],
             dim=-1,
         )
-        query = query.reshape(batch, seq_len, -1, self.key_head_dim)
-        key = key.reshape(batch, seq_len, -1, self.key_head_dim)
+        query_key = query_key.reshape(batch, seq_len, -1, self.key_head_dim)
         value = value.reshape(batch, seq_len, -1, self.value_head_dim)
         # Apply L2 norm to query and key
         if self.use_qk_l2norm:
-            query = l2norm(query.contiguous())
-            key = l2norm(key.contiguous())
+            query_key = l2norm(query_key.contiguous())
+        # Split query and key.
+        query, key = torch.split(
+            query_key,
+            [
+                self.qk_dim_local_tp // self.key_head_dim // self.cp_size,
+                self.qk_dim_local_tp // self.key_head_dim // self.cp_size,
+            ],
+            dim=2,
+        )
         if self.num_value_heads // self.num_key_heads > 1:
             query = query.repeat_interleave(self.num_value_heads // self.num_key_heads, dim=2)
             key = key.repeat_interleave(self.num_value_heads // self.num_key_heads, dim=2)
@@ -421,19 +456,19 @@ class GatedDeltaNet(MegatronModule):
         nvtx_range_pop(suffix="g_and_beta")
 
         nvtx_range_push(suffix="gated_delta_rule")
-        if self.config.deterministic_mode:
-            core_attn_out, last_recurrent_state = torch_chunk_gated_delta_rule(
-                query,
-                key,
-                value,
+        if kv_cache is not None:
+            core_attn_out = kv_cache.forward_gated_delta_rule_with_kv_cache(
+                module=self.gated_delta_rule,
+                cached_prefix_params=cached_prefix_params,
+                query=query,
+                key=key,
+                value=value,
                 g=g,
                 beta=beta,
-                initial_state=None,
-                output_final_state=False,
                 use_qk_l2norm_in_kernel=False,
             )
         else:
-            core_attn_out, last_recurrent_state = chunk_gated_delta_rule(
+            core_attn_out, last_recurrent_state = self.gated_delta_rule(
                 query,
                 key,
                 value,

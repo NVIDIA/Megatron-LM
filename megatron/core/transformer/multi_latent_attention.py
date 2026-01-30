@@ -212,6 +212,7 @@ class MultiLatentAttention(Attention):
         packed_seq_params=None,
         position_ids=None,
         sequence_len_offset=None,
+        cached_prefix_params=None,  # TODO(yuzhongw): support prefix caching for MLA
         *,
         inference_params=None,
     ):
@@ -225,6 +226,7 @@ class MultiLatentAttention(Attention):
         assert not (
             self.training and self.cache_mla_latents
         ), "cache_mla_latents conflicts with training."
+        assert cached_prefix_params is None, "Prefix caching is not supported for MLA."
 
         # hidden_states: [sq, b, h]
 
