@@ -36,9 +36,9 @@ from megatron.core.transformer.mlp import MLP, MLPSubmodules
 from megatron.core.transformer.module import MegatronModule
 from megatron.core.transformer.spec_utils import ModuleSpec
 from megatron.core.transformer.transformer_config import TransformerConfig
-from megatron.core.transformer.transformer_layer import TransformerLayer, TransformerLayerSubmodules
+from megatron.core.transformer.transformer_layer import TransformerLayerSubmodules
 from megatron.core.transformer.utils import make_sharded_tensors_for_checkpoint
-from megatron.core.typed_torch import not_none
+from megatron.core.typed_torch import copy_signature, not_none
 from megatron.core.utils import divide
 
 try:
@@ -173,6 +173,7 @@ def get_mlp_module_spec(use_te: bool = True) -> ModuleSpec:
 
 # Override a few things that are special in InternViT and not supported by the SelfAttention class.
 class InternViTSelfAttention(SelfAttention):
+    @copy_signature(SelfAttention.__init__)
     def __init__(
         self, config: TransformerConfig, submodules: SelfAttentionSubmodules, *args, **kwargs
     ):
@@ -213,6 +214,7 @@ class InternViTSelfAttention(SelfAttention):
 class InternViTTEDotProductAttention(TEDotProductAttention):
     """Adjusted Attention for InternViT"""
 
+    @copy_signature(TEDotProductAttention.forward)
     def forward(self, *args, **kwargs):
         """Regular TEDotProductAttention + zero-out dummy attention heads."""
         out = super().forward(*args, **kwargs)
