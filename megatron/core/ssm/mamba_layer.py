@@ -132,6 +132,8 @@ class MambaLayer(GraphableMegatronModule):
             residual = residual.to(torch.float32)
 
         hidden_states = hidden_states.to(dtype=self.config.params_dtype)
+
+        print("{} {} {}".format(str(hidden_states.shape), str(hidden_states.stride()), hidden_states.is_contiguous()), flush=True)
         hidden_states = self.norm(hidden_states)
 
         mixer_out_with_bias = self.mixer(
