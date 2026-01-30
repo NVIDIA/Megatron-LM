@@ -1977,12 +1977,12 @@ def _add_rl_args(parser):
             'Requires --rl-inference-model-unified-memory-level=1.'
         ),
     )
-    group.add_argument('--refit-method', type=str, default='gloo',
-                       choices=['nccl', 'gloo'],
+    group.add_argument('--refit-method', type=str, default='nvshmem',
+                       choices=['nccl', 'gloo', 'nvshmem'],
                        help=('Method to refit the model weights between training and inference models during RL. '
                              'nccl: use NCCLCopyService to refit using NCCL; '
                              'gloo: use GlooCopyService over CPU; '
-                             ))
+                             'nvshmem: use NVSHMEMCopyService to refit using the NVSHMEM.'))
     group.add_argument('--rl-verify-model-weights-swap', action=argparse.BooleanOptionalAction, default=False,
                        help='If set, verify that the model weights were correctly transferred by comparing forward pass outputs on'
                        'the first swap of model weights.')
