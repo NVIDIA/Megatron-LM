@@ -15,7 +15,7 @@ Megatron-LM and Megatron Core
 
 This repository contains two components: **Megatron-LM** and **Megatron Core**.
 
-**Megatron-LM** is a reference example that includes Megatron Core plus pre-configured training scripts for GPT, LLaMA, DeepSeek, Qwen, and more. Best for research teams, learning distributed training, and quick experimentation.
+**Megatron-LM** is a reference example that includes Megatron Core plus pre-configured training scripts. Best for research teams, learning distributed training, and quick experimentation.
 
 **Megatron Core** is a composable library with GPU-optimized building blocks for custom training frameworks. It provides transformer building blocks, advanced parallelism strategies (TP, PP, DP, EP, CP), mixed precision support (FP16, BF16, FP8, FP4), and model architectures. Best for framework developers and ML engineers building custom training pipelines.
 
