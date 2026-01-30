@@ -365,7 +365,7 @@ class TestDynamicPrefixCaching:
     # =========================================================================
 
     @pytest.mark.internal
-    def test_prefix_caching_basic_sharing(self):
+    def test_basic_sharing(self):
         """Test that identical prefixes share blocks."""
         self._setup_model_parallel_group(1, 1)
         dynamic_context = self._get_dynamic_context(
@@ -428,7 +428,7 @@ class TestDynamicPrefixCaching:
         assert block_allocator.block_ref_counts[req1_block_1].item() == 2
 
     @pytest.mark.internal
-    def test_prefix_caching_partial_match(self):
+    def test_partial_match(self):
         """Test partial prefix matching - only matching prefix is shared."""
         self._setup_model_parallel_group(1, 1)
         dynamic_context = self._get_dynamic_context(
@@ -489,7 +489,7 @@ class TestDynamicPrefixCaching:
         assert block_allocator.block_ref_counts[req2_block_2].item() == 1
 
     @pytest.mark.internal
-    def test_prefix_caching_ref_count_release(self):
+    def test_ref_count_release(self):
         """Test that ref counts decrement correctly on release."""
         self._setup_model_parallel_group(1, 1)
         dynamic_context = self._get_dynamic_context(
@@ -554,7 +554,7 @@ class TestDynamicPrefixCaching:
         assert block_0_hash in block_allocator.hash_to_block_id
 
     @pytest.mark.internal
-    def test_prefix_caching_lru_eviction(self):
+    def test_lru_eviction(self):
         """Test LRU eviction when cache is full."""
         self._setup_model_parallel_group(1, 1)
         dynamic_context = self._get_dynamic_context(
@@ -622,7 +622,7 @@ class TestDynamicPrefixCaching:
         assert dynamic_context.total_request_count == 1
 
     @pytest.mark.internal
-    def test_prefix_caching_no_match_allocates_new(self):
+    def test_no_match_allocates_new(self):
         """Test that non-matching prefixes allocate new blocks."""
         self._setup_model_parallel_group(1, 1)
         dynamic_context = self._get_dynamic_context(
@@ -675,7 +675,7 @@ class TestDynamicPrefixCaching:
             assert block_allocator.block_ref_counts[block_id].item() == 1
 
     @pytest.mark.internal
-    def test_prefix_caching_reuse_after_release(self):
+    def test_reuse_after_release(self):
         """Test that cached blocks with ref_count=0 are reused by new requests."""
         self._setup_model_parallel_group(1, 1)
         dynamic_context = self._get_dynamic_context(
@@ -738,7 +738,7 @@ class TestDynamicPrefixCaching:
         assert block_allocator.block_ref_counts[block_1].item() == 1
 
     @pytest.mark.internal
-    def test_prefix_caching_many_requests_same_prefix(self):
+    def test_many_requests_same_prefix(self):
         """Test that 10 requests with identical prefix all share the same blocks."""
         self._setup_model_parallel_group(1, 1)
         dynamic_context = self._get_dynamic_context(
@@ -790,7 +790,7 @@ class TestDynamicPrefixCaching:
             )
 
     @pytest.mark.internal
-    def test_prefix_caching_hash_chain_correctness(self):
+    def test_hash_chain_correctness(self):
         """Test that block hashes depend on parent hash (hash chaining)."""
         self._setup_model_parallel_group(1, 1)
         dynamic_context = self._get_dynamic_context(
@@ -849,7 +849,7 @@ class TestDynamicPrefixCaching:
     # =========================================================================
 
     @pytest.mark.internal
-    def test_prefix_caching_available_blocks_preserved(self):
+    def test_available_blocks_preserved(self):
         """Test that total_avail decreases less when sharing occurs."""
         self._setup_model_parallel_group(1, 1)
         dynamic_context = self._get_dynamic_context(
@@ -906,7 +906,7 @@ class TestDynamicPrefixCaching:
         )
 
     @pytest.mark.internal
-    def test_prefix_caching_memory_scaling_constant(self):
+    def test_memory_scaling_constant(self):
         """Test that block count is O(1) for N identical requests, not O(N)."""
         self._setup_model_parallel_group(1, 1)
         dynamic_context = self._get_dynamic_context(
@@ -955,7 +955,7 @@ class TestDynamicPrefixCaching:
     # =========================================================================
 
     @pytest.mark.internal
-    def test_prefix_caching_matched_blocks_tokens_preserved(self):
+    def test_matched_blocks_tokens_preserved(self):
         """Test that tokens in matched blocks are NOT overwritten."""
         self._setup_model_parallel_group(1, 1)
         dynamic_context = self._get_dynamic_context(
@@ -1009,7 +1009,7 @@ class TestDynamicPrefixCaching:
         )
 
     @pytest.mark.internal
-    def test_prefix_caching_only_new_blocks_hashed(self):
+    def test_only_new_blocks_hashed(self):
         """Test that matched blocks keep same hash, only new blocks get new hashes."""
         self._setup_model_parallel_group(1, 1)
         dynamic_context = self._get_dynamic_context(
@@ -1078,7 +1078,7 @@ class TestDynamicPrefixCaching:
     # =========================================================================
 
     @pytest.mark.internal
-    def test_prefix_caching_single_block_prefix(self):
+    def test_single_block_prefix(self):
         """Test that sharing works with just 1 complete block."""
         self._setup_model_parallel_group(1, 1)
         dynamic_context = self._get_dynamic_context(
@@ -1123,7 +1123,7 @@ class TestDynamicPrefixCaching:
         assert block_allocator.block_ref_counts[block_0].item() == 2
 
     @pytest.mark.internal
-    def test_prefix_caching_incomplete_block_not_shared(self):
+    def test_incomplete_block_not_shared(self):
         """Test that incomplete (partial) blocks are NOT shared."""
         self._setup_model_parallel_group(1, 1)
         dynamic_context = self._get_dynamic_context(
@@ -1188,7 +1188,7 @@ class TestDynamicPrefixCaching:
     # =========================================================================
 
     @pytest.mark.internal
-    def test_prefix_caching_disabled_no_sharing(self):
+    def test_disabled_no_sharing(self):
         """Test that identical prefixes do NOT share blocks when prefix caching is disabled."""
         self._setup_model_parallel_group(1, 1)
         dynamic_context = self._get_dynamic_context(
@@ -1243,7 +1243,7 @@ class TestDynamicPrefixCaching:
             assert block_allocator.block_ref_counts[block_id].item() == 1
 
     @pytest.mark.internal
-    def test_prefix_caching_disabled_deterministic_hashes(self):
+    def test_disabled_deterministic_hashes(self):
         """Test that blocks get deterministic unique hashes when prefix caching is disabled."""
         self._setup_model_parallel_group(1, 1)
         dynamic_context = self._get_dynamic_context(
@@ -1297,7 +1297,7 @@ class TestDynamicPrefixCaching:
             )
 
     @pytest.mark.internal
-    def test_prefix_caching_performance_comparison(self):
+    def test_performance_comparison(self):
         """Test that prefix caching enabled uses fewer blocks and is faster."""
         import time
 
