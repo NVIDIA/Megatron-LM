@@ -65,7 +65,13 @@ class DataParallelInferenceCoordinator:
         next_request_id (int): A counter for generating unique server-side request IDs.
     """
 
-    def __init__(self, inference_coordinator_port: int, data_parallel_size: int, tokenizer):
+    def __init__(
+        self,
+        inference_coordinator_port: int,
+        data_parallel_size: int,
+        tokenizer,
+        deterministic_mode: bool = False,
+    ):
         """
         Initializes the inference coordinator.
 
@@ -110,7 +116,7 @@ class DataParallelInferenceCoordinator:
         logging.info("Inference Coordinator: Connected with data parallel ranks...")
 
         # In deterministic mode, sort identities for consistent scheduling order.
-        if torch.are_deterministic_algorithms_enabled():
+        if deterministic_mode:
             self.identities_of_data_parallel_ranks = deque(
                 sorted(self.identities_of_data_parallel_ranks)
             )
@@ -306,7 +312,12 @@ class DataParallelInferenceCoordinator:
 
     @classmethod
     def entrypoint(
-        cls, ready_event: Event, inference_coordinator_port: int, data_parallel_size: int, tokenizer
+        cls,
+        ready_event: Event,
+        inference_coordinator_port: int,
+        data_parallel_size: int,
+        tokenizer,
+        deterministic_mode: bool = False,
     ):
         """
         Class method to instantiate and run the coordinator, for use in a separate process.
@@ -319,8 +330,11 @@ class DataParallelInferenceCoordinator:
                 once the coordinator is ready to accept connections.
             inference_coordinator_port (int): The port to bind to.
             data_parallel_size (int): The number of expected TP-coordinators.
+            deterministic_mode (bool): Whether to enable deterministic scheduling.
         """
-        coordinator = cls(inference_coordinator_port, data_parallel_size, tokenizer)
+        coordinator = cls(
+            inference_coordinator_port, data_parallel_size, tokenizer, deterministic_mode
+        )
         ready_event.set()
         try:
             coordinator.start()

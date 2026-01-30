@@ -414,6 +414,7 @@ class DynamicInferenceEngine(AbstractEngine):
         # Spawn a DP coordinator process and get the connection info.
         if launch_inference_coordinator and self.is_dp_coordinator:
             spawn_context = multiprocessing.get_context('spawn')
+            deterministic_mode = torch.are_deterministic_algorithms_enabled()
             coordinator_ready_event = spawn_context.Event()
             self.inference_coordinator_process = spawn_context.Process(
                 target=DataParallelInferenceCoordinator.entrypoint,
@@ -422,6 +423,7 @@ class DynamicInferenceEngine(AbstractEngine):
                     inference_coordinator_port,
                     get_pg_size(self.pg_collection.dp),
                     self.controller.tokenizer,
+                    deterministic_mode,
                 ),
             )
             self.inference_coordinator_process.start()
