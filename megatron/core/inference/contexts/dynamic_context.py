@@ -293,7 +293,7 @@ class DynamicInferenceContext(BaseInferenceContext):
         cuda_graph_mixed_prefill_count: Optional[int] = 16,
         metrics_writer: Optional['WandbModule'] = None,
         request_metadata_types: Optional[List[Tuple[str, torch.dtype, bool]]] = None,
-        persist_cuda_graphs: Optional[bool] = False,
+        reset_cuda_graphs: Optional[bool] = True,
         kv_cache_management_mode: Optional[str] = "persist",
     ):
         super().__init__(materialize_only_last_token_logits=materialize_only_last_token_logits)
@@ -423,7 +423,7 @@ class DynamicInferenceContext(BaseInferenceContext):
 
         # Unified memory and general tensor management.
         self.unified_memory_level = unified_memory_level
-        self.persist_cuda_graphs = persist_cuda_graphs
+        self.reset_cuda_graphs = reset_cuda_graphs
         # KV cache management mode: "persist", "offload", or "remove"
         assert kv_cache_management_mode in (
             "persist",
@@ -441,10 +441,13 @@ class DynamicInferenceContext(BaseInferenceContext):
                         "Unified memory requested but not available; defaulting to GPU memory."
                     )
                 self.unified_memory_level = 0
-        if self.persist_cuda_graphs and self.unified_memory_level == 0:
-            assert (
-                HAVE_TORCH_MEMORY_SAVER
-            ), "Can only persist CUDA graphs without UVM if torch_memory_saver is available"
+        # If CUDA graphs are not reset but KV$ memory address is not static, we need
+        # either UVM or torch_memory_saver to maintain memory address stability for CGs.
+        if not self.reset_cuda_graphs and self.kv_cache_management_mode != "persist":
+            assert HAVE_TORCH_MEMORY_SAVER or self.unified_memory_level > 0, (
+                "Not resetting CUDA graphs requires static KV$ memory. "
+                "Use --rl-kv-cache-management-mode=persist, UVM, or install torch_memory_saver."
+            )
 
         # When not using `torch_memory_saver`, we manually offload/restore tensors.
         # We use storage resize, similar to the logic in `core/distributed/param_and_grad_buffer.py`
@@ -657,7 +660,7 @@ class DynamicInferenceContext(BaseInferenceContext):
         if not is_init:
             if self.unified_memory_level != 0:
                 return
-            if self.persist_cuda_graphs and HAVE_TORCH_MEMORY_SAVER:
+            if len(self._offloadable_tensor_names) > 1:
                 torch_memory_saver.restore_region(tag="inference_context")
                 return
             # If we offloaded tensors, restore them before allocating other tensors
@@ -770,15 +773,17 @@ class DynamicInferenceContext(BaseInferenceContext):
 
         # Allocate large non-graphed buffers.
         # - If UVM is turned on, we use UVM unconditionally.
-        # - If CGs persist and we lack UVM, we need to use `torch_memory_saver`.
+        # - If CGs are not reset and KV$ is not persisted, we need `torch_memory_saver`.
         # - If offloading KV$, we prefer to use `torch_memory_saver` over manual offloading.
         # - If removing the KV$, we must re-allocate every time, not just at init.
-        ctx_manager = nullcontext()
+        need_static = not self.reset_cuda_graphs and self.kv_cache_management_mode != "persist"
         offload_kv = self.kv_cache_management_mode == "offload"
         remove_kv = self.kv_cache_management_mode == "remove"
+
+        ctx_manager = nullcontext()
         if self.unified_memory_level > 0:
             ctx_manager = torch.cuda.use_mem_pool(self.unified_memory_mempool)
-        elif (self.persist_cuda_graphs or offload_kv) and HAVE_TORCH_MEMORY_SAVER:
+        elif HAVE_TORCH_MEMORY_SAVER and (need_static or offload_kv):
             ctx_manager = torch_memory_saver.region(
                 tag="inference_context", enable_cpu_backup=offload_kv
             )
@@ -806,7 +811,7 @@ class DynamicInferenceContext(BaseInferenceContext):
         # UVM and `torch_memory_saver` do not require explicit deallocation.
         if self.unified_memory_level != 0:
             return
-        if self.persist_cuda_graphs and HAVE_TORCH_MEMORY_SAVER:
+        if len(self._offloadable_tensor_names) > 1:
             torch_memory_saver.backup_region(tag="inference_context")
             return
 
