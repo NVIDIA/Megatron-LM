@@ -13,6 +13,8 @@ ENV_VARS:
   NON_DETERMINSTIC_RESULTS: 1
   NVSHMEM_IB_ENABLE_IBGDA: 0
   CUDA_DEVICE_MAX_CONNECTIONS: 1
+  NUM_OF_HYBRID_EP_RANKS_PER_NVLINK_DOMAIN: 16
+  USE_MNNVL: 1
 TEST_TYPE: "release"
 MODEL_ARGS:
   # Distributed args
@@ -99,7 +101,7 @@ MODEL_ARGS:
   --moe-router-load-balancing-type: seq_aux_loss
   --moe-router-topk: 8
   --moe-token-dispatcher-type: flex
-  --moe-enable-deepep: true
+  --moe-flex-dispatcher-backend: hybridep
   --moe-router-pre-softmax: true
   --moe-grouped-gemm: true
   --moe-aux-loss-coeff: 1e-4
@@ -159,6 +161,7 @@ MODEL_ARGS:
 
   # enable experimental
   --enable-experimental: true
+  --exit-interval: 9536
 METRICS:
   - "iteration-time"
   - "lm loss"
