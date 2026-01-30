@@ -73,7 +73,7 @@ fi
 
 export HF_TOKEN=${HF_TOKEN}
 
-${LAUNCH_SCRIPT} pretrain_mamba.py \
+${LAUNCH_SCRIPT} ${SCRIPT_DIR}/../../../pretrain_mamba.py \
     ${MODEL_ARGS} \
     --tensor-model-parallel-size ${TP} \
     --expert-tensor-parallel-size ${ETP} \
