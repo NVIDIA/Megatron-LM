@@ -29,7 +29,7 @@ from torch.distributed.checkpoint.metadata import (
     TensorStorageMetadata,
 )
 from torch.distributed.checkpoint.state_dict_saver import _save_state_dict
-from torch.distributed.tensor import DeviceMesh, Replicate, Shard
+from torch.distributed.tensor import DeviceMesh, Shard
 
 from megatron.core.distributed.fsdp.src.megatron_fsdp.uneven_dtensor import split_dtensor, gather_uneven_dtensor_to_full_tensor
 
