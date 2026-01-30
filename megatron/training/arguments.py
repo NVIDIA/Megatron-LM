@@ -1505,9 +1505,6 @@ def _add_inference_args(parser):
                        '1) allocate `memory_buffer` in unified memory. '
                        'Eventually, additional levels will be included to '
                        'control other tensors within the context.')
-    group.add_argument('--nccl-all-reduce-for-prefill',
-                       action='store_true', default=False,
-                       help='When using symmeric all reduce kernels this will use regular nccl kernels for prefill. This can be more effecient when prefill is large as the nccl kernels can be more bandwith optimized')
     # TODO(ksanthanam): Clean this up in future PR
     group.add_argument('--enable-chunked-prefill', dest='enable_chunked_prefill',
                        action='store_true', default=False,
@@ -2709,10 +2706,6 @@ def _add_moe_args(parser):
     group.add_argument('--moe-upcycling-granularity', type=int, default=1,
                        help='This param sepecifics how many times smaller is the expert hidden size compared with the original dense FFN hidden size. '
                        'For using granular upcycling strategy, please set this param as a positive integer. If this param is set to 1, it means using the default upcycling strategy.')
-    group.add_argument('--moe-pad-experts-for-cuda-graph-inference', action='store_true',
-                       help="some MoE routers have a D2H sync that will break cuda graphs.  If this flag is set the router will switch" \
-                       " to dropping and padding during decode time which does not have a D2H sync. The capacity factor is set to the" \
-                       " max that an expert could see during inference so no tokens are actually dropped.")
     return parser
 
 def _add_mla_args(parser):
