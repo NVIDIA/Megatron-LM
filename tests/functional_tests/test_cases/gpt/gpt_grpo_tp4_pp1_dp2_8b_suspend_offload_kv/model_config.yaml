@@ -75,7 +75,7 @@ MODEL_ARGS:
   --timing-log-level: 1
   --cuda-graph-impl: local
   --micro-batch-size: 1
-  --global-batch-size: 2
+  --global-batch-size: 4
   --grpo-group-size: 2
   --grpo-prompts-per-step: 2
   --grpo-iterations: 1
