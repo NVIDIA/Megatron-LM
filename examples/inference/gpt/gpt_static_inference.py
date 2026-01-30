@@ -202,15 +202,14 @@ def main():
         from collections import defaultdict
 
         unique_prompt_map = defaultdict(list)
-        for result_idx, record in enumerate(results):
-            result = record.requests[0]
+        for result_idx, result in enumerate(results):
             unique_prompt_map[result.prompt].append(result_idx)
 
         # Print unique prompts + outputs.
         for unique_idx, (prompt_text, result_idxs) in enumerate(unique_prompt_map.items()):
             result_idx = result_idxs[0]
-            record = results[result_idx]
-            generated_text = record.requests[0].generated_text.replace("\n", "\\n")
+            result = results[result_idx]
+            generated_text = result.generated_text.replace("\n", "\\n")
             print(
                 f"{unique_idx}/{len(unique_prompt_map)} [{len(result_idxs)}]. {prompt_text} "
                 f"... {generated_text}"

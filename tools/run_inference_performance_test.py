@@ -13,7 +13,10 @@ from mamba_builders import mamba_builder
 from megatron.core.inference.contexts import StaticInferenceContext
 from megatron.core.inference.engines import DynamicInferenceEngine, StaticInferenceEngine
 from megatron.core.inference.engines.abstract_engine import AbstractEngine
-from megatron.core.inference.inference_request import InferenceRequest
+from megatron.core.inference.inference_request import (
+    DynamicInferenceRequestRecord,
+    InferenceRequest,
+)
 from megatron.core.inference.model_inference_wrappers.gpt.gpt_inference_wrapper import (
     GPTInferenceWrapper,
 )
@@ -232,9 +235,10 @@ def main():
         )
     else:
         prompts = [request.prompt_tokens for request in requests]
-        results: List[InferenceRequest] = inference_engine.generate(
+        records: List[DynamicInferenceRequestRecord] = inference_engine.generate(
             prompts=prompts, sampling_params=sampling_params
         )
+        results: List[InferenceRequest] = [record.requests[0] for record in records]
 
     end_time = time.perf_counter()
     latency = end_time - start_time
@@ -245,8 +249,7 @@ def main():
         torch.cuda.cudart().cudaProfilerStop()
 
     if not torch.distributed.is_initialized() or torch.distributed.get_rank() == 0:
-        for idx, record in enumerate(results):
-            result = record.requests[0]
+        for idx, result in enumerate(results):
             print(f' \n------------- RESULT FOR PROMPT {idx} --------------- ')
             generated_log_probs = result.generated_log_probs
             result_dict = {
