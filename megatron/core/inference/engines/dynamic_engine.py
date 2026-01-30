@@ -613,6 +613,7 @@ class DynamicInferenceEngine(AbstractEngine):
             "suspended", unified_memory_level=self.unified_memory_level
         ):
             self.context.deallocate_all_tensors()
+            torch.cuda.synchronize()
 
         if not self.persist_cuda_graphs:
             delete_cuda_graphs()

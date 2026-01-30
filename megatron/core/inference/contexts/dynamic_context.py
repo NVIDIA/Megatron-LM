@@ -615,6 +615,7 @@ class DynamicInferenceContext(BaseInferenceContext):
         freeing GPU memory. The data is copied to pinned CPU memory.
         """
         for name in self._offloadable_tensor_names:
+            tensor = getattr(self, name)
             self._offloadable_storage_sizes[name] = tensor.storage().size()
             if name in self._offloadable_cpu_backups:
                 self._offloadable_cpu_backups[name].copy_(tensor, non_blocking=True)
@@ -760,12 +761,15 @@ class DynamicInferenceContext(BaseInferenceContext):
             else:
                 self.mamba_metadata = None
 
-        # Allocate `ctx_manager`-managed buffers. When offloading is enabled,
-        # the context manager tracks which tensors are allocated for later offload/restore.
+        # Allocate large non-graphed buffers.
+        # - If UVM is turned on, we use UVM unconditionally.
+        # - If CGs persist and we lack UVM, we need to use `torch_memory_saver`.
+        # - If we are offloading, we prefer to use `torch_memory_saver` over manual offloading.
+        # - If we are removing the KV$, we must re-allocate every time, not just at init.
         ctx_manager = nullcontext()
         if self.unified_memory_level > 0:
             ctx_manager = torch.cuda.use_mem_pool(self.unified_memory_mempool)
-        elif self.persist_cuda_graphs and HAVE_TORCH_MEMORY_SAVER:
+        elif (self.persist_cuda_graphs or self.offload_kv_cache) and HAVE_TORCH_MEMORY_SAVER:
             ctx_manager = torch_memory_saver.region(
                 tag="inference_context", enable_cpu_backup=self.offload_kv_cache
             )
