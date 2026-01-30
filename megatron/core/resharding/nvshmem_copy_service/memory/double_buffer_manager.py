@@ -40,23 +40,16 @@ class DoubleBufferManager:
                 "Please install nvshmem to use DoubleBufferManager."
             )
 
-        # Import logger for debugging
-        from ..logger import PELogger
-
         for i in range(2):
-            PELogger.info(f"Allocating send_slot[{i}] ({self.slot_size} bytes)...")
             self.send_slots[i] = nvshmem.core.interop.torch.bytetensor(
                 (self.slot_size,), dtype=torch.uint8
             )
-            PELogger.info(f"send_slot[{i}] allocated, now allocating recv_slot[{i}]...")
             self.recv_slots[i] = nvshmem.core.interop.torch.bytetensor(
                 (self.slot_size,), dtype=torch.uint8
             )
-            PELogger.info(f"recv_slot[{i}] allocated, now zeroing buffers...")
             # Zero out buffers
             self.send_slots[i].zero_()
             self.recv_slots[i].zero_()
-            PELogger.info(f"Buffers [{i}] zeroed successfully")
 
     def get_send_slot(self, iteration: int):
         """

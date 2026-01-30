@@ -309,18 +309,10 @@ def extract_param_metadata(
     expert_parallel_local_rank: int | None = None
 
     if tensor_parallel_group_ranks is not None:
-        try:
-            tensor_parallel_local_rank = tensor_parallel_group_ranks.index(owner_rank)
-        except ValueError:
-            # owner_rank not in TP group (shouldn't happen, but be defensive)
-            pass
+        tensor_parallel_local_rank = tensor_parallel_group_ranks.index(owner_rank)
 
     if expert_parallel_group_ranks is not None:
-        try:
-            expert_parallel_local_rank = expert_parallel_group_ranks.index(owner_rank)
-        except ValueError:
-            # owner_rank not in EP group (shouldn't happen, but be defensive)
-            pass
+        expert_parallel_local_rank = expert_parallel_group_ranks.index(owner_rank)
 
     meta = ParameterMetadata(
         name=param_name,
@@ -352,67 +344,129 @@ def select_src_metadata_balanced(
 ) -> ParameterMetadata:
     """Choose a representative source `ParameterMetadata` for a destination rank.
 
-    For non-collocated mode: First filters by matching TP/EP local rank to ensure
-    correct rank-to-rank mapping when source and destination use different process
-    group configurations (e.g., with rank_offset).
+    The selected metadata provides topology information (TP/EP/DP group ranks) that the
+    LCM transfer planner uses to compute actual source ranks and slices. This function
+    doesn't perform transfers itself - it just picks which source configuration to use
+    as reference for planning.
 
-    Then balances across data-parallel (DP) groups to distribute load:
-      - bucket `src_meta_list` by their DP group (tuple of ranks)
-      - if there is only one bucket, just return the first entry
-      - otherwise, use the destination rank's global rank to select a source
-        DP group in a round-robin fashion, ensuring even distribution of load
-        across all source DP groups.
+    Two scenarios:
+    1. Non-collocated mode (same TP/EP sizes, different rank numbering):
+       - Filter by matching TP/EP local rank to pair ranks with same position
+       - Example: src ranks [0-63] and dst ranks [64-127] both with TP=8
+       - Dst TP local 0 should use src TP local 0 as reference (same shards)
+
+    2. Resharding mode (different TP/EP sizes):
+       - Skip TP/EP local rank filtering (sizes don't correspond)
+       - Example: EP=8→EP=16 means dst EP local 8 has no matching src EP local
+       - LCM algorithm handles size changes; we just need any valid topology reference
+
+    Finally, balances across data-parallel (DP) groups to distribute load:
+      - Groups src_meta_list by DP group
+      - Selects source DP group via round-robin: dst_rank % num_src_dp_groups
+      - Ensures even distribution of transfer load across source DP replicas
     """
     if not src_meta_list:
         raise ValueError("src_meta_list must be non-empty")
 
-    # Filter by matching TP local rank (for non-collocated mode)
-    # This ensures we match corresponding TP shards even when source and destination
-    # use different global rank numbering (e.g., src=[0,1] dst=[4,5])
+    # ============================================================================
+    # TENSOR PARALLELISM (TP) LOCAL RANK FILTERING
+    # ============================================================================
+    # Purpose: In non-collocated mode with same TP size, ensure destination ranks
+    # use source metadata from ranks with the same TP local position (same shard).
+    #
+    # Why size check matters:
+    #   - Same size (TP=8→TP=8): Local ranks 0-7 exist in both src and dst
+    #     → Filter ensures dst TP local 0 uses src TP local 0 (same shard data)
+    #   - Different size (TP=8→TP=4): Local ranks don't correspond semantically
+    #     → Skip filter; LCM algorithm handles merging/splitting of shards
+    #
+    # Load balancing impact: Skipping the filter when sizes differ gives the
+    # subsequent DP round-robin more source candidates to balance across, which
+    # is optimal since the LCM algorithm will compute actual transfers anyway.
+    # ============================================================================
     dst_tp_local = dst_metadata.tensor_parallel_local_rank
     if dst_tp_local is not None:
-        print(f"[METADATA DEBUG] Dst rank {dst_rank}: tp_local={dst_tp_local}, looking for matching sources", flush=True)
-        print(f"[METADATA DEBUG]   Available sources: {[(m.owner_rank, m.tensor_parallel_local_rank) for m in src_meta_list]}", flush=True)
-        matching_tp = [m for m in src_meta_list
-                       if m.tensor_parallel_local_rank == dst_tp_local]
-        if matching_tp:
-            print(f"[METADATA DEBUG]   Found {len(matching_tp)} matches!", flush=True)
-            src_meta_list = matching_tp
-        else:
-            print(f"[METADATA DEBUG]   WARNING: No TP matches found! Using all sources.", flush=True)
-        # If no matches found, fall back to original list (shouldn't happen)
+        # Check if TP sizes match between source and destination
+        src_tp_size = len(src_meta_list[0].tensor_parallel_group_ranks) if src_meta_list[0].tensor_parallel_group_ranks else None
+        dst_tp_size = len(dst_metadata.tensor_parallel_group_ranks) if dst_metadata.tensor_parallel_group_ranks else None
 
-    # Filter by matching EP local rank (for non-collocated mode with MoE)
+        # Only filter by TP local rank when sizes match (non-collocated, not resharding)
+        if src_tp_size == dst_tp_size and src_tp_size is not None:
+            matching_tp = [m for m in src_meta_list
+                           if m.tensor_parallel_local_rank == dst_tp_local]
+            if not matching_tp:
+                # This indicates a configuration bug: sizes match but no local rank match
+                raise ValueError(
+                    f"No source metadata with TP local rank {dst_tp_local} found for dst rank {dst_rank}. "
+                    f"Available: {[(m.owner_rank, m.tensor_parallel_local_rank) for m in src_meta_list]}"
+                )
+            src_meta_list = matching_tp
+        # else: TP resharding mode (sizes differ) - skip filter, keep all source candidates
+
+    # ============================================================================
+    # EXPERT PARALLELISM (EP) LOCAL RANK FILTERING
+    # ============================================================================
+    # Purpose: In non-collocated mode with same EP size, ensure destination ranks
+    # use source metadata from ranks with the same EP local position (same experts).
+    #
+    # Why size check matters:
+    #   - Same size (EP=8→EP=8): Local ranks 0-7 exist in both src and dst
+    #     → Filter ensures dst EP local 0 uses src EP local 0 (same global experts)
+    #   - Different size (EP=8→EP=16): Local ranks 0-15 in dst, only 0-7 in src
+    #     → Dst EP local 8 has no corresponding src EP local rank
+    #     → Skip filter; expert reassignment handled by resolved_name matching
+    #
+    # Expert routing: When EP size changes, each expert parameter is matched via
+    # resolved_name (which includes global expert index). The LCM/TP planner
+    # handles any TP dimension changes, and DP round-robin distributes load.
+    # ============================================================================
     dst_ep_local = dst_metadata.expert_parallel_local_rank
     if dst_ep_local is not None:
-        matching_ep = [m for m in src_meta_list
-                       if m.expert_parallel_local_rank == dst_ep_local]
-        if matching_ep:
-            src_meta_list = matching_ep
-        # If no matches found, fall back to previous list (shouldn't happen)
+        # Check if EP sizes match between source and destination
+        src_ep_size = len(src_meta_list[0].expert_parallel_group_ranks) if src_meta_list[0].expert_parallel_group_ranks else None
+        dst_ep_size = len(dst_metadata.expert_parallel_group_ranks) if dst_metadata.expert_parallel_group_ranks else None
 
-    # Group source metadata by their DP group layout so we can balance across groups.
-    #   (dp_rank0, dp_rank1, ...) -> [ParameterMetadata for that DP group]
+        # Only filter by EP local rank when sizes match (non-collocated, not resharding)
+        if src_ep_size == dst_ep_size and src_ep_size is not None:
+            matching_ep = [m for m in src_meta_list
+                           if m.expert_parallel_local_rank == dst_ep_local]
+            if not matching_ep:
+                # This indicates a configuration bug: sizes match but no local rank match
+                raise ValueError(
+                    f"No source metadata with EP local rank {dst_ep_local} found for dst rank {dst_rank}. "
+                    f"Available: {[(m.owner_rank, m.expert_parallel_local_rank) for m in src_meta_list]}"
+                )
+            src_meta_list = matching_ep
+        # else: EP resharding mode (sizes differ) - skip filter, keep all source candidates
+
+    # ============================================================================
+    # DATA PARALLELISM (DP) LOAD BALANCING
+    # ============================================================================
+    # After TP/EP filtering (if applicable), balance transfer load across source
+    # data-parallel replicas. Each DP group holds a complete copy of the model,
+    # so we can read from any DP group - choosing via round-robin spreads load.
+    #
+    # Load distribution: dst_rank % num_src_dp_groups ensures even distribution
+    # even when destination has different DP configuration than source.
+    # ============================================================================
     grouped_by_dp: dict[tuple[int, ...], list[ParameterMetadata]] = {}
     for meta in src_meta_list:
         dp_group = tuple(meta.data_parallel_group_ranks or [])
         grouped_by_dp.setdefault(dp_group, []).append(meta)
 
-    # Fast path: only one DP layout present; no balancing necessary.
+    # Fast path: only one DP group present; no balancing necessary
     if len(grouped_by_dp) == 1:
         return src_meta_list[0]
 
-    # Use the destination rank's global rank to select a source DP group in a
-    # round-robin fashion. This ensures that even when multiple destination ranks
-    # have the same DP index (e.g., ranks 0,1,2,3 all being at position 0 in their
-    # respective DP groups), they still get distributed across different source
-    # DP groups based on their global rank.
+    # Round-robin selection across source DP groups based on destination global rank
+    # This ensures even distribution: if we have 4 src DP groups and 128 dst ranks,
+    # each src DP group will be selected by 32 dst ranks (128 / 4 = 32)
     sorted_dp_groups = sorted(grouped_by_dp.keys())
     chosen_group = sorted_dp_groups[dst_rank % len(sorted_dp_groups)]
 
-    # Within the chosen group, any representative metadata works; use the first.
+    # Within the chosen DP group, any metadata entry works (they all have the same
+    # DP group configuration). Pick the first one as our representative.
     selected = grouped_by_dp[chosen_group][0]
-    print(f"[METADATA DEBUG]   Selected source rank {selected.owner_rank} for dst rank {dst_rank}", flush=True)
     return selected
 
 

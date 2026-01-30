@@ -7,6 +7,7 @@ High-level refit/reshard orchestration:
 - reshard_model_weights: transport-agnostic core; builds/caches plan and executes.
 """
 
+import torch
 from typing import Any, Literal, Optional, Union
 
 from megatron.core import parallel_state
@@ -25,6 +26,7 @@ RefitBackendName = Literal["nccl", "gloo", "nvshmem"]
 # Module-level cache for refit services to avoid repeated allocations
 _service_cache: dict[str, CopyService] = {}
 _plan_cache: dict[int, Any] = {}
+
 def get_or_create_service(backend: RefitBackendName) -> CopyService:
     """Get or create a cached CopyService instance for the given backend.
 
@@ -94,11 +96,10 @@ def reshard_model_weights(
     without requiring dummy models on every rank.
     """
     global _plan_cache
-    import torch.distributed as dist
 
     # Handle idle ranks (both models None) - they participate in collectives but have no work
     if src_model is None and target_model is None:
-        rank = dist.get_rank()
+        rank = torch.distributed.get_rank()
 
         # Use cached plan if available, otherwise build (with collective participation)
         if rank not in _plan_cache:
@@ -139,8 +140,7 @@ def reshard_model_weights(
             raise RuntimeError("Target model missing pg_collection required for reshard")
 
     # Build or retrieve cached plan
-    # Use rank-based cache - simpler and more consistent than model attributes
-    rank = dist.get_rank()
+    rank = torch.distributed.get_rank()
 
     if rank not in _plan_cache:
         # All ranks must participate in planning (collective operations)

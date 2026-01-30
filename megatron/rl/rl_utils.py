@@ -473,8 +473,7 @@ def get_environment_rollouts(
             inf_core = unwrap_model(inference_model[0])
             _maybe_prefetch_separate_inference_model_weights(inf_core, to_cpu=False)
         # Use the reusable service instance
-        refit_service = getattr(args, 'refit_service', args.refit_method)
-        swap_model_weights(model, inference_model, refit_service)
+        swap_model_weights(model, inference_model, args.refit_method)
         if args.rl_verify_model_weights_swap:
             verify_model_weights_swap(
                 train_model=model,

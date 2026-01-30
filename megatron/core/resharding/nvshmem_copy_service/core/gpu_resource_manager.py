@@ -80,27 +80,20 @@ class GPUResourceManager:
         rank_id = dist.get_rank()
 
         # Create/Broadcast UniqueID using broadcast_object_list
-        print(f"[Rank {rank_id}] Getting NVSHMEM unique ID...", flush=True)
         uniqueid = nvshmem.core.get_unique_id(empty=True)
         if rank_id == 0:
             uniqueid = nvshmem.core.get_unique_id()
             broadcast_objects = [uniqueid]
-            print(f"[Rank 0] Created unique ID for NVSHMEM bootstrap", flush=True)
         else:
             broadcast_objects = [None]
 
         # Broadcast ID to all ranks using the default group
-        print(f"[Rank {rank_id}] Broadcasting unique ID...", flush=True)
         dist.broadcast_object_list(broadcast_objects, src=0)
-        print(f"[Rank {rank_id}] Received unique ID", flush=True)
 
         # Barrier to ensure everyone has the ID before NVSHMEM init
-        print(f"[Rank {rank_id}] Entering pre-init barrier...", flush=True)
         dist.barrier()
-        print(f"[Rank {rank_id}] Passed pre-init barrier", flush=True)
 
         # Initialize NVSHMEM with the broadcasted UID
-        print(f"[Rank {rank_id}] Calling nvshmem.core.init() with rank={rank_id}, nranks={num_ranks}...", flush=True)
         nvshmem.core.init(
             device=self.device,
             uid=broadcast_objects[0],
@@ -109,7 +102,6 @@ class GPUResourceManager:
             initializer_method="uid",
         )
 
-        print(f"[Rank {rank_id}] nvshmem.core.init() completed!", flush=True)
         logger.info("NVSHMEM initialized")
 
         self.my_pe = nvshmem.core.my_pe()

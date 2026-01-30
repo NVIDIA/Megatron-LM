@@ -984,7 +984,6 @@ def pretrain(
             else:
                 # Fallback to string method (legacy behavior)
                 args.refit_service = args.refit_method
-            print_rank_0(f"Refit service created and will be reused across all iterations.")
 
     # Data stuff.
     app_metrics['app_build_dataiters_start_time'] = one_logger_utils.get_timestamp_in_ms()
@@ -1089,7 +1088,6 @@ def pretrain(
                 # back to the inference model for RL evaluation.
                 rl_utils._maybe_prefetch_separate_inference_model_weights(inf_core, to_cpu=False)
                 # Use the reusable service instance
-                refit_service = getattr(args, 'refit_service', args.refit_method)
                 swap_model_weights(model, inference_model, refit_service)
                 rl_eval_model = inference_model
             rl_utils.evaluate_and_print_results_rl(
