@@ -71,7 +71,7 @@ def should_free_input(name, is_moe, config):
     # The input and output of A2A are not needed anymore after the forward pass,
     # so we can free the input memory after the forward pass.
     free_input_nodes = {
-        "mlp": not enable_hybridep,
+        "mlp": not (enable_hybridep and config.fp8 is None),
         "moe_combine": True,
         # For non-DeepEP and non-HybridEP dispatcher mode, the input is the un-dispatched tokens
         # and probs before dispatch A2A and it's not needed anymore after the forward pass
@@ -316,7 +316,7 @@ class TransformerLayerNode(ScheduleNode):
         """Computes the weight gradients for the transformer layer node."""
         if not self.delay_wgrad_compute:
             return
-        with torch.cuda.nvtx.range(f"{self.name} wgrad"):
+        with self.stream_acquire_context(f"{self.name} wgrad"):
             for module in self.bwd_dw_callables:
                 module.backward_dw()
 
@@ -530,6 +530,12 @@ def build_transformer_layer_callables(layer: TransformerLayer):
             token_dispatcher._comm_manager.dispatched_probs = dispatched_probs
 
         expert_output, _ = layer.mlp.routed_experts_compute(dispatched_tokens, dispatched_probs)
+
+        # For HybridEP, tokens_per_expert is generated on comm stream, as the input to
+        # `routed_experts_compute`, it needs to be recorded to comp stream.
+        if enable_hybridep:
+            tokens_per_expert = token_dispatcher._comm_manager.get_number_of_tokens_per_expert()
+            tokens_per_expert.record_stream(torch.cuda.current_stream())
 
         if layer.recompute_pre_mlp_layernorm:
             # discard the output of the pre-mlp layernorm and register the recompute
