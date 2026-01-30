@@ -1,6 +1,4 @@
 # Copyright (c) 2023, NVIDIA CORPORATION. All rights reserved.
-
-import importlib
 import inspect
 import numbers
 
@@ -31,22 +29,14 @@ class FusedLayerNorm(torch.nn.Module):
     """Layer Norm, fused into a single CUDA kernel.
 
     Args:
+      config (TransformerConfig): Transformer config.
+
       hidden_size (int): Transformer hidden dimension.
 
       eps (float): Epsilon added to denominator, for numerical stability.
 
-      persist_layer_norm (bool): Use persistent fused layer norm kernel.
-      This kernel supports only a set of hidden sizes. Please
-      check persist_ln_hidden_sizes if your hidden size is supported.
-
-      zero_centered_gamma (bool): Adjust LayerNorm weights such that they are
-      centered around zero. This improves numerical stability.
-
-      config (TransformerConfig): Transformer config. Include to match custom
-      layer norm interfaces.
-
-      normalization (str): Normalization type, used for Transformer Engine.
-      Must equal 'LayerNorm' here.
+      maybe_fuse_quantize (bool): Whether to fuse quantize. Added for compatibility with
+                                  Transformer Engine.
     """
 
     def __init__(
@@ -54,9 +44,7 @@ class FusedLayerNorm(torch.nn.Module):
         config: TransformerConfig,
         hidden_size: int,
         eps: float = 1e-5,
-        persist_layer_norm: bool = True,
-        zero_centered_gamma: bool = False,
-        normalization: str = "LayerNorm",  # included to match TE interface
+        maybe_fuse_quantize: bool = False,
     ):
         super().__init__()
 
@@ -108,7 +96,8 @@ class FusedLayerNorm(torch.nn.Module):
             hidden_size = (hidden_size,)
         self.hidden_size = torch.Size(hidden_size)
         self.eps = eps
-        # Parameters need to be initialized with torch.empty rather than torch.Tensor for correct device placement with nemo2.
+        # Parameters need to be initialized with torch.empty rather than torch.Tensor
+        # for correct device placement with nemo2.
         self.weight = Parameter(torch.empty(*hidden_size))
         self.bias = Parameter(torch.empty(*hidden_size))
         self.reset_parameters()
@@ -120,6 +109,9 @@ class FusedLayerNorm(torch.nn.Module):
         setattr(self.bias, 'sequence_parallel', self.sequence_parallel)
 
     def reset_parameters(self):
+        """
+        Reset the parameters of the layer norm.
+        """
 
         if self.zero_centered_gamma:
             init.zeros_(self.weight)
@@ -129,6 +121,9 @@ class FusedLayerNorm(torch.nn.Module):
             init.zeros_(self.bias)
 
     def forward(self, input: Tensor) -> Tensor:
+        """
+        Forward pass of the layer norm.
+        """
 
         weight = self.weight + 1 if self.zero_centered_gamma else self.weight
 
