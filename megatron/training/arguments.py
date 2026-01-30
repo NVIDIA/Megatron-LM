@@ -1977,7 +1977,7 @@ def _add_rl_args(parser):
             'Requires --rl-inference-model-unified-memory-level=1.'
         ),
     )
-    group.add_argument('--refit-method', type=str, default='nvshmem',
+    group.add_argument('--refit-method', type=str, default='gloo',
                        choices=['nccl', 'gloo', 'nvshmem'],
                        help=('Method to refit the model weights between training and inference models during RL. '
                              'nccl: use NCCLCopyService to refit using NCCL; '
