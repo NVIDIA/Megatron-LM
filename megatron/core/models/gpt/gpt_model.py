@@ -589,6 +589,12 @@ class GPTModel(LanguageModule):
             if loss_mask is None:
                 # if loss_mask is not provided, use all ones as loss_mask
                 loss_mask = torch.ones_like(mtp_labels)
+
+            # Store the original number of tokens before rolling for proper normalization
+            # when calculate_per_token_loss is enabled. This ensures MTP gradients are
+            # correctly scaled relative to the main loss gradients in finalize_model_grads.
+            original_num_tokens = loss_mask.sum()
+
             for mtp_layer_number in range(self.config.mtp_num_layers):
                 # output
                 mtp_logits, _ = self.output_layer(
@@ -626,9 +632,17 @@ class GPTModel(LanguageModule):
                     )
                 mtp_loss_scale = self.config.mtp_loss_scaling_factor / self.config.mtp_num_layers
                 if self.config.calculate_per_token_loss:
-                    hidden_states = MTPLossAutoScaler.apply(
-                        hidden_states, mtp_loss_scale * mtp_loss
+                    # When calculate_per_token_loss is enabled, finalize_model_grads will
+                    # divide all gradients by total_num_tokens (from main loss).
+                    # However, MTP has fewer valid tokens due to rolling. To ensure correct
+                    # per-token gradient weighting, we normalize by the rolled token count
+                    # and re-scale by the original token count.
+                    # Avoid division by zero
+                    num_tokens_safe = torch.clamp(num_tokens, min=1)
+                    mtp_loss_normalized = (
+                        mtp_loss_scale * mtp_loss * (original_num_tokens / num_tokens_safe)
                     )
+                    hidden_states = MTPLossAutoScaler.apply(hidden_states, mtp_loss_normalized)
                 else:
                     hidden_states = MTPLossAutoScaler.apply(
                         hidden_states, mtp_loss_scale * mtp_loss / num_tokens
