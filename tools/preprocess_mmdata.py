@@ -1,5 +1,5 @@
-# coding=utf-8
 # Copyright (c) 2023, NVIDIA CORPORATION.  All rights reserved.
+# coding=utf-8
 
 """Processing text modality data for MultiModal pretraining."""
 
@@ -70,7 +70,7 @@ class Encoder(object):
         
         return sentence_ids, img_raw, len(json_line)
 
-def get_args():
+def get_args(args_list=None):
     parser = argparse.ArgumentParser()
     group = parser.add_argument_group(title='input data')
     group.add_argument('--input', type=str, required=True,
@@ -110,7 +110,8 @@ def get_args():
                        help='Number of worker processes to launch')
     group.add_argument('--log-interval', type=int, default=100,
                        help='Interval between progress updates')
-    args = parser.parse_args()
+
+    args = parser.parse_args(args_list)
     args.keep_empty = False
 
     # some default/dummy values for the tokenizer
@@ -121,8 +122,8 @@ def get_args():
 
     return args
 
-def main():
-    args = get_args()
+def main(args_list=None):
+    args = get_args(args_list)
     startup_start = time.time()
 
     encoder = Encoder(args)
