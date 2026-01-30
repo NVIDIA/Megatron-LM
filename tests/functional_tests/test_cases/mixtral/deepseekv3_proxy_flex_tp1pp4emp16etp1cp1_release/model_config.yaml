@@ -101,7 +101,7 @@ MODEL_ARGS:
   --moe-router-load-balancing-type: seq_aux_loss
   --moe-router-topk: 8
   --moe-token-dispatcher-type: flex
-  --moe-enable-deepep: true
+  --moe-flex-dispatcher-backend: hybridep
   --moe-router-pre-softmax: true
   --moe-grouped-gemm: true
   --moe-aux-loss-coeff: 1e-4
