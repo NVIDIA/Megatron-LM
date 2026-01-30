@@ -1,8 +1,13 @@
 # Copyright (c) 2025, NVIDIA CORPORATION. All rights reserved.
 
 """
-HLModel DSL Example: Nemotron-3 Nano (30B total, 3B active)
-Using `examples/post_training/modelopt/conf/nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B-BF16.sh` as reference.
+HLModel DSL Example: Complex (Imagined) Model
+
+Demonstrates using multiple layer configurations:
+- A1: Global attention (full sequence)
+- A2: Sliding window attention (local context)
+- E1: Large MoE (128 experts, top-6)
+- E2: Small MoE (32 experts, top-2)
 
 Pattern Syntax:
 ---------------
@@ -26,20 +31,19 @@ from megatron.core.models.hl import (
 )
 
 # =============================================================================
-# NEMOTRON-3 NANO CONFIGURATION (30B total, 3B active parameters)
+# COMPLEX (IMAGINED) MODEL CONFIGURATION
 # =============================================================================
 
-nemotron_config = HLModelConfig(
+model_config = HLModelConfig(
     vocab_size=131072,
     max_sequence_length=8192,
 
-    # Layer pattern: MEMEM*EMEMEM*EMEMEM*EMEMEM*EMEMEM*EMEMEMEM*EMEMEMEME
-    # 52 layers total, split across 4 pipeline stages (marked by |)
+    # Hybrid pattern with multiple layer types
     layer_pattern="""
-        M1 (E1 M1)x2 A1 (E1 M1)x3 A1 |
-        (E1 M1)x3 A1 (E1 M1)x3 A1    |
-        (E1 M1)x3 A1 (E1 M1)x4 A1    |
-        (E1 M1)x4 E1
+        M1 (E1 M1)x2 A1 (E2 M1)x3 A2 |
+        (E1 M1)x3 A2 (E2 M1)x3 A1    |
+        (E1 M1)x3 A2 (E2 M1)x4 A1    |
+        (E1 M1)x4 E2
     """,
 
     layer_configs={
@@ -61,6 +65,19 @@ nemotron_config = HLModelConfig(
             num_query_groups=2,
             kv_channels=128,
             use_flash_attention=True,
+            parallelism=ParallelismConfig(
+                tensor_parallel_size=8,
+                sequence_parallel=True,
+            ),
+        ),
+
+        "A2": AttentionLayer(
+            hidden_size=2688,
+            num_attention_heads=32,
+            num_query_groups=2,
+            kv_channels=128,
+            use_flash_attention=True,
+            sliding_window_size=4096,
             parallelism=ParallelismConfig(
                 tensor_parallel_size=8,
                 sequence_parallel=True,
@@ -89,6 +106,25 @@ nemotron_config = HLModelConfig(
                 expert_tensor_parallel_size=8,
             ),
         ),
+
+        "E2": MoELayer(
+            hidden_size=2688,
+            ffn_hidden_size=3712,
+            num_experts=32,
+            top_k=2,
+            router_score_function="softmax",
+            router_load_balancing_type="aux_loss",
+            router_dtype="fp32",
+            moe_aux_loss_coeff=1e-2,
+            activation="swiglu",
+            token_dispatcher_type="alltoall",
+            grouped_gemm=True,
+            parallelism=ParallelismConfig(
+                tensor_parallel_size=8,
+                sequence_parallel=True,
+                expert_parallel_size=4,
+            ),
+        ),
     },
 
     # Model settings
@@ -102,10 +138,10 @@ nemotron_config = HLModelConfig(
 
 
 def build_model() -> HLModel:
-    """Build and return the Nemotron-3 Nano model."""
-    return HLModel(nemotron_config)
+    """Build and return the complex hybrid model."""
+    return HLModel(model_config)
 
 
 if __name__ == "__main__":
     model = build_model()
-    print(f"Created Nemotron-3 Nano model with config:\n{nemotron_config}")
+    print(f"Created complex hybrid model with config:\n{model_config}")
