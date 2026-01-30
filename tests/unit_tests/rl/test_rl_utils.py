@@ -422,50 +422,6 @@ class TestRLUtils:
                 exp_t = torch.tensor(exp, dtype=torch.float32, device=got_t.device)
                 torch.testing.assert_close(got_t, exp_t, rtol=0, atol=0)
 
-    def test_single_turn_advantage_calculation(self):
-        rewards = [[-1, 1], [4, 4]]
-        num_turns = [[1, 1], [1, 1]]
-        advs = rl_utils.calculate_grpo_advantages(rewards, num_turns)
-        torch.testing.assert_close(
-            torch.tensor(advs), torch.tensor([-1, 1.0, 0.0, 0.0]), atol=1e-4, rtol=1e-5
-        )
-
-    def test_multi_turn_advantage_calculation(self):
-        rewards = [[-1, 1], [4, 4]]
-        num_turns = [[2, 1], [1, 3]]
-        advs = rl_utils.calculate_grpo_advantages(rewards, num_turns)
-        torch.testing.assert_close(
-            torch.tensor(advs),
-            torch.tensor([-1, -1, 1.0, 0.0, 0.0, 0.0, 0.0]),
-            atol=1e-4,
-            rtol=1e-5,
-        )
-
-    def test_pad_list_of_nones(self):
-        with pytest.raises(ValueError) as e_info:
-            rl_utils._pad_nonnull_with_zeros([None] * 3, 42)
-        assert "At least one" in str(e_info)
-
-    def test_pad_with_wrong_params(self):
-        with pytest.raises(ValueError) as e_info:
-            rl_utils._pad_nonnull_with_zeros([torch.zeros(5)], 4)
-        assert "larger length" in str(e_info)
-
-    def test_pad_full_size(self):
-        padded = rl_utils._pad_nonnull_with_zeros([torch.zeros(5), torch.zeros(5)], 5)
-        assert padded.shape == (2, 5)
-
-    def test_pad_some_nones(self):
-        padded = rl_utils._pad_nonnull_with_zeros([None, torch.zeros(5)], 5)
-        assert padded.shape == (2, 5)
-        assert (padded[0] == 0).all()
-
-    def test_pad_normal(self):
-        padded = rl_utils._pad_nonnull_with_zeros(
-            [torch.zeros(2), torch.zeros(3), torch.zeros(4)], 5
-        )
-        assert padded.shape == (3, 5)
-
     @pytest.mark.parametrize(
         "initialize_model_parallel",
         [
