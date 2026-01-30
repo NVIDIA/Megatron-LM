@@ -190,7 +190,7 @@ class DynamicInferenceEngine(AbstractEngine):
         self.enable_chunked_prefill = enable_chunked_prefill
         self.inference_logging_step_interval = inference_logging_step_interval
         self.unified_memory_level = context.unified_memory_level
-        self.persist_cuda_graphs = context.persist_cuda_graphs
+        self.reset_cuda_graphs = context.reset_cuda_graphs
 
         if enable_cuda_graph is not None:
             self.cuda_graph_impl = "local" if enable_cuda_graph else "none"
@@ -615,7 +615,7 @@ class DynamicInferenceEngine(AbstractEngine):
             self.context.deallocate_all_tensors()
             torch.cuda.synchronize()
 
-        if not self.persist_cuda_graphs:
+        if self.reset_cuda_graphs:
             delete_cuda_graphs()
 
         # Maintain references to requests before reset.
@@ -654,7 +654,7 @@ class DynamicInferenceEngine(AbstractEngine):
             self.context.reset()
 
             capture_time = time.time()
-            if not self.persist_cuda_graphs:
+            if self.reset_cuda_graphs:
                 self.create_cuda_graphs()
             capture_time = time.time() - capture_time
 

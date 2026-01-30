@@ -335,14 +335,15 @@ def validate_args(args, defaults={}):
         assert not args.rl_reset_cuda_graphs or has_cg, (
             "--rl-reset-cuda-graphs is set but no CUDA graphs are being built."
         )
-        if not args.rl_reset_cuda_graphs:
-            # Persisting CGs requires either torch_memory_saver or UVM
+        # If CUDA graphs are not reset but KV$ memory address is not static, we need
+        # either UVM or torch_memory_saver to maintain memory address stability for CGs.
+        if not args.rl_reset_cuda_graphs and args.rl_kv_cache_management_mode != "persist":
             try:
                 from torch_memory_saver import torch_memory_saver
             except ImportError:
                 assert args.inference_dynamic_batching_unified_memory_level > 0, (
-                    "--rl-persist-cuda-graphs requires either torch_memory_saver or "
-                    "--inference-dynamic-batching-unified-memory-level > 0."
+                    "Choosing to not reset CUDA graphs requires static KV$ memory. Use "
+                    "--rl-kv-cache-management-mode=persist, UVM, or install torch_memory_saver."
                 )
 
         # There's no need to manually offload the KV$ with UVM.
