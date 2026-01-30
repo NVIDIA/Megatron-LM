@@ -116,6 +116,7 @@ class RequestEntry:
 
     record: DynamicInferenceRequestRecord
     future: asyncio.Future
+    recompute_soon: bool = False
 
 
 # pylint: disable=line-too-long
@@ -555,12 +556,14 @@ class DynamicInferenceEngine(AbstractEngine):
 
             start_mem = torch.cuda.memory_stats()
             start_time = time.time()
+            range_push(f"{key}-inference-context")
             torch.cuda.synchronize()
 
             yield
 
         finally:
 
+            range_pop()
             end_time = time.time()
 
             end_mem = torch.cuda.memory_stats()
@@ -610,11 +613,9 @@ class DynamicInferenceEngine(AbstractEngine):
             "suspended", unified_memory_level=self.unified_memory_level
         ):
             self.context.deallocate_all_tensors()
+            torch.cuda.synchronize()
 
-        # Delete cuda graphs when not using unified memory at all (level 0) and
-        # `--rl-training-cuda-graphs` is not passed. For UVM levels 1 and 2, the context's tensors
-        # maintain static memory addresses, so the cuda graphs are re-used.
-        if self.unified_memory_level == 0 and not self.persist_cuda_graphs:
+        if not self.persist_cuda_graphs:
             delete_cuda_graphs()
 
         # Maintain references to requests before reset.
@@ -623,9 +624,10 @@ class DynamicInferenceEngine(AbstractEngine):
         self.resume_request_ids = [*active_request_ids, *waiting_request_ids]
         self.waiting_request_ids.clear()
 
-        # Suspend requests objects.
+        # Suspend request objects that are marked for recompute.
         for request_id in active_request_ids:
-            self.requests[request_id].record.checkpoint()
+            if self.requests[request_id].recompute_soon:
+                self.requests[request_id].record.checkpoint()
 
     def resume(self):
         """Resume engine by reallocating context's GPU state."""
@@ -651,20 +653,19 @@ class DynamicInferenceEngine(AbstractEngine):
             # Reset context and request data.
             self.context.reset()
 
-            # Create cuda graphs (before adding requests, to be in decode mode).
-            # Only create cuda graphs when not using unified memory at all (level
-            # 0). For levels 1 and 2, the context's tensors maintain static
-            # memory addresses, so the cuda graphs are re-used.
             capture_time = time.time()
-            if self.unified_memory_level == 0 and not self.persist_cuda_graphs:
+            if not self.persist_cuda_graphs:
                 self.create_cuda_graphs()
             capture_time = time.time() - capture_time
 
-            # Add requests.
+            # Add requests that are marked for recompute.
             add_time = time.time()
             torch.cuda.synchronize()
             for request_id in self.resume_request_ids:
-                self._add_request(self.get_request(request_id))
+                request_entry = self.requests[request_id]
+                if request_entry.recompute_soon:
+                    self._add_request(self.get_request(request_id))
+                    request_entry.recompute_soon = False
             torch.cuda.synchronize()
             add_time = time.time() - add_time
 
@@ -743,6 +744,7 @@ class DynamicInferenceEngine(AbstractEngine):
             request.sampling_params.num_tokens_to_generate = (
                 request.sampling_params.num_tokens_total - len(request.prompt_tokens)
             )
+            request.sampling_params.num_tokens_total = None
         if request.sampling_params.num_tokens_to_generate is None:
             request.sampling_params.num_tokens_to_generate = self.context.max_sequence_length - len(
                 request.prompt_tokens

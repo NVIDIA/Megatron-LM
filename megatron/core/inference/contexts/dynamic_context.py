@@ -3,7 +3,7 @@
 import logging
 import math
 import warnings
-from contextlib import nullcontext
+from contextlib import contextmanager, nullcontext
 from typing import TYPE_CHECKING, List, Optional, Sequence, Tuple
 
 import torch
@@ -295,6 +295,7 @@ class DynamicInferenceContext(BaseInferenceContext):
         request_metadata_types: Optional[List[Tuple[str, torch.dtype, bool]]] = None,
         persist_cuda_graphs: Optional[bool] = False,
         offload_kv_cache: Optional[bool] = False,
+        remove_kv_cache: Optional[bool] = False,
     ):
         super().__init__(materialize_only_last_token_logits=materialize_only_last_token_logits)
 
@@ -423,7 +424,6 @@ class DynamicInferenceContext(BaseInferenceContext):
 
         # Unified memory.
         self.unified_memory_level = unified_memory_level
-        self.persist_cuda_graphs = persist_cuda_graphs
         if unified_memory_level > 0:
             try:
                 self.unified_memory_mempool = create_unified_mempool()
@@ -433,6 +433,19 @@ class DynamicInferenceContext(BaseInferenceContext):
                         "Unified memory requested but not available; defaulting to GPU memory."
                     )
                 self.unified_memory_level = 0
+        self.persist_cuda_graphs = persist_cuda_graphs
+        if self.persist_cuda_graphs and self.unified_memory_level == 0:
+            assert (
+                HAVE_TORCH_MEMORY_SAVER
+            ), "Can only persist CUDA graphs without UVM if torch_memory_saver is available"
+        self.offload_kv_cache = offload_kv_cache
+        self.remove_kv_cache = remove_kv_cache
+        assert not (offload_kv_cache and remove_kv_cache), "Cannot both offload and remove KV$."
+        # For tensor offload via storage resize trick (when not using torch_memory_saver)
+        # These track tensors allocated within the _track_offloadable_tensors() context
+        self._offloadable_tensor_names: list[str] = []
+        self._offloadable_cpu_backups: dict[str, torch.Tensor] = {}
+        self._offloadable_storage_sizes: dict[str, int] = {}
 
         # Initialize block allocator.
         buffer_size_bytes = int(buffer_size_gb * 1024**3)
@@ -551,12 +564,6 @@ class DynamicInferenceContext(BaseInferenceContext):
             )
         )
 
-        # Whether to offload the KV cache. Determines where the KV cache is allocated within memory.
-        self.offload_kv_cache = offload_kv_cache
-        assert not (
-            self.offload_kv_cache and self.unified_memory_level
-        ), "The KV cache should not be instantiated in unified memory when it is offloaded during training."
-
         self._using_cuda_graph_this_step = False
         self.use_cuda_graphs_for_non_decode_steps = use_cuda_graphs_for_non_decode_steps
         # Deal with chunked prefill
@@ -584,6 +591,47 @@ class DynamicInferenceContext(BaseInferenceContext):
             )
         )
 
+    @contextmanager
+    def _track_offloadable_tensors(self):
+        """Context manager that tracks tensors allocated within it for later offload/restore.
+
+        Tensors created as attributes on `self` within this context will be recorded
+        in `_offloadable_tensor_names` so they can be offloaded to CPU and restored later.
+        """
+        initial_attrs = set(vars(self).keys())
+        yield
+        current_attrs = set(vars(self).keys())
+        new_attrs = current_attrs - initial_attrs
+        # Record tensor attributes created within this context
+        for attr in new_attrs:
+            value = getattr(self, attr, None)
+            if isinstance(value, torch.Tensor):
+                self._offloadable_tensor_names.append(attr)
+
+    def _offload_tracked_tensors_to_cpu(self) -> None:
+        """Offload all tracked tensors to CPU using storage resize trick.
+
+        This preserves the tensor objects (for CUDA graph compatibility) while
+        freeing GPU memory. The data is copied to pinned CPU memory.
+        """
+        for name in self._offloadable_tensor_names:
+            tensor = getattr(self, name)
+            self._offloadable_storage_sizes[name] = tensor.storage().size()
+            if name in self._offloadable_cpu_backups:
+                self._offloadable_cpu_backups[name].copy_(tensor, non_blocking=True)
+            else:
+                self._offloadable_cpu_backups[name] = tensor.cpu().pin_memory()
+            tensor.storage().resize_(0)
+
+    def _restore_tracked_tensors_from_cpu(self) -> None:
+        """Restore all tracked tensors from CPU backup."""
+        if not self._offloadable_cpu_backups or not self._offloadable_storage_sizes:
+            return
+
+        for name in self._offloadable_tensor_names:
+            tensor.storage().resize_(self._offloadable_storage_sizes[name])
+            tensor.copy_(self._offloadable_cpu_backups[name], non_blocking=True)
+
     def allocate_all_tensors(self, *, is_init: bool) -> None:
         """Allocate GPU state.
 
@@ -593,21 +641,28 @@ class DynamicInferenceContext(BaseInferenceContext):
         Args:
             is_init (bool): True if this is being called from `__init__()`.
         """
-
-        # Only allocate tensors when not using unified memory at all (level 0),
-        # or for initial allocation during `__init__()`. For levels 1 and 2, we do
-        # not perform any explicit allocations or deallocations after the initial
-        # call to `__init__()`.
-        if self.unified_memory_level != 0 and not is_init:
-            return
-
         # Mark allocated.
         if self.is_tensor_state_allocated:
             return
         self.is_tensor_state_allocated = True
 
+        # Only allocate tensors when not using either unified memory or torch_memory_saver.
+        # Otherwise, we do not need to perform any explicit allocations.
+        if not is_init:
+            if self.unified_memory_level != 0:
+                return
+            if self.persist_cuda_graphs and HAVE_TORCH_MEMORY_SAVER:
+                torch_memory_saver.restore_region(tag="inference_context")
+                return
+            # If we offloaded tensors, restore them before allocating other tensors
+            if self.offload_kv_cache:
+                self._restore_tracked_tensors_from_cpu()
+
         # Validate no tensors allocated prior to this method.
         for key in vars(self).keys():
+            # Skip offloaded tensors.
+            if not is_init and self.offload_kv_cache and key in self._offloadable_tensor_names:
+                continue
             value = getattr(self, key)
             assert not isinstance(value, torch.Tensor), (
                 "All tensors should be allocated within `allocate_all_tensors()."
@@ -672,25 +727,18 @@ class DynamicInferenceContext(BaseInferenceContext):
                     device=torch.cuda.current_device(),
                 )
             else:
-                ctx = (
-                    torch_memory_saver.region(tag="kv_cache", enable_cpu_backup=True)
-                    if HAVE_TORCH_MEMORY_SAVER and self.offload_kv_cache
-                    else nullcontext()
+                self.memory_buffer = torch.empty(
+                    (
+                        2,  # key and value
+                        self.num_attention_layers,
+                        self.block_allocator.total_count,
+                        self.block_size_tokens,
+                        self.num_attention_heads_per_partition,
+                        self.hidden_size_per_attention_head,
+                    ),
+                    dtype=self.params_dtype,
+                    device=torch.cuda.current_device(),
                 )
-
-                with ctx:
-                    self.memory_buffer = torch.empty(
-                        (
-                            2,  # key and value
-                            self.num_attention_layers,
-                            self.block_allocator.total_count,
-                            self.block_size_tokens,
-                            self.num_attention_heads_per_partition,
-                            self.hidden_size_per_attention_head,
-                        ),
-                        dtype=self.params_dtype,
-                        device=torch.cuda.current_device(),
-                    )
 
         # Optional state tensors for hybrid models
         def allocate_mamba_states():
@@ -710,20 +758,27 @@ class DynamicInferenceContext(BaseInferenceContext):
                     dtype=self.params_dtype,
                     device=torch.cuda.current_device(),
                 )
-
             else:
                 self.mamba_metadata = None
 
-        # Allocate `ctx_manager`-managed buffers. (For currently unknown reasons,
-        # `ctx_manager` can only be used once.)
-        ctx_manager = (
-            torch.cuda.use_mem_pool(self.unified_memory_mempool)
-            if self.unified_memory_level > 0
-            else nullcontext()
-        )
+        # Allocate large non-graphed buffers.
+        # - If UVM is turned on, we use UVM unconditionally.
+        # - If CGs persist and we lack UVM, we need to use `torch_memory_saver`.
+        # - If we are offloading, we prefer to use `torch_memory_saver` over manual offloading.
+        # - If we are removing the KV$, we must re-allocate every time, not just at init.
+        ctx_manager = nullcontext()
+        if self.unified_memory_level > 0:
+            ctx_manager = torch.cuda.use_mem_pool(self.unified_memory_mempool)
+        elif (self.persist_cuda_graphs or self.offload_kv_cache) and HAVE_TORCH_MEMORY_SAVER:
+            ctx_manager = torch_memory_saver.region(
+                tag="inference_context", enable_cpu_backup=self.offload_kv_cache
+            )
+        elif self.offload_kv_cache:
+            ctx_manager = self._track_offloadable_tensors()
         with ctx_manager:
-            allocate_memory_buffer()
-            allocate_mamba_states()
+            if is_init or self.remove_kv_cache:
+                allocate_memory_buffer()
+                allocate_mamba_states()
 
         # Reset attention and Mamba state.
         self.reset_attention_state()
@@ -734,25 +789,31 @@ class DynamicInferenceContext(BaseInferenceContext):
 
         This method is used for suspending the dynamic engine.
         """
-
-        # Only deallocate tensors when not using unified memory at all (level 0).
-        # For levels 1 and 2, we do not perform any explicit allocations or
-        # deallocations after the initial call to `__init__()`.
-        if self.unified_memory_level != 0:
-            return
-
         # Mark deallocated.
         if not self.is_tensor_state_allocated:
             return
         self.is_tensor_state_allocated = False
 
-        # Delete all tensor attributes.
-        # TODO(@lmcafee): check that device == 'cuda'?
-        keys = list(vars(self).keys())
-        for key in keys:
-            value = getattr(self, key)
-            if isinstance(value, torch.Tensor):
-                delattr(self, key)
+        # UVM and `torch_memory_saver` do not require explicit deallocation.
+        if self.unified_memory_level != 0:
+            return
+        if self.persist_cuda_graphs and HAVE_TORCH_MEMORY_SAVER:
+            torch_memory_saver.backup_region(tag="inference_context")
+            return
+        # If offloading manually, copy tracked tensors to CPU and resize storage to 0.
+        if self.offload_kv_cache:
+            self._offload_tracked_tensors_to_cpu()
+
+        # Delete tensor attributes if explicitly deallocating.
+        if self.remove_kv_cache:
+            keys = list(vars(self).keys())
+            for key in keys:
+                value = getattr(self, key)
+                if isinstance(value, torch.Tensor):
+                    # Keep tracked tensors if offloading (mutually exclusive with remove, but here for clarity)
+                    if self.offload_kv_cache and key in self._offloadable_tensor_names:
+                        continue
+                    delattr(self, key)
 
     @classmethod
     def round_up_tokens(cls, value, tp_size=None):
