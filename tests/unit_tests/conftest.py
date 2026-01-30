@@ -53,6 +53,14 @@ def set_env():
         os.environ['NVTE_FUSED_ATTN'] = '0'
 
 
+@pytest.fixture(scope="function", autouse=True)
+def sync_cuda():
+    """Ensure all GPU work is complete after each test."""
+    yield
+    if torch.cuda.is_available():
+        torch.cuda.synchronize()
+
+
 @pytest.fixture(scope="session")
 def tmp_path_dist_ckpt(tmp_path_factory) -> Path:
     """Common directory for saving the checkpoint.
