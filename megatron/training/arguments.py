@@ -395,13 +395,16 @@ def validate_args(args, defaults={}):
         #    ** This is controlled by `--inference-dynamic-batching-unified-memory-level`.
         #  - When RL is finished with inference, it suspends the engine.
         #    ** With `--rl-partial-rollouts`, it expects the engine to freeze its state.
-        #  - Suspending the engine causes it to handle the KV$ according to the provided arguments:
+        #  - Suspending the engine makes the context handle the KV$ according to the arguments:
         #    ** With `--rl-offload-kv-cache-during-training`, the KV$ is offloaded to CPU memory.
         #    ** With `--rl-remove-kv-cache-during-training`, the KV$ is deleted.
+        #    ** With neither argument, it no-ops, leaving the KV$ as-is.
         #  - When RL is finished with training, it resumes the engine.
         #    ** With `--rl-partial-rollouts`, it expects the engine to resume its state.
-        #  - Resuming the engine causes it to restore the KV$.
-        #    ** If offloaded, the KV$ is copied back to GPU memory.
+        #  - Resuming the engine makes the context restore/rebuild the KV$.
+        #    ** With `--rl-offload-kv-cache-during-training`, the KV$ is reloaded from CPU memory.
+        #    ** With `--rl-remove-kv-cache-during-training`, the KV$ is reallocated.
+        #    ** With neither argument, it no-ops, leaving the KV$ as-is.
         #  - The engine proceeds to recompute the KV$ of any request records marked as "recompute".
         #    ** If using both partial rollouts and KV$ removal, "recompute" must mark all requests.
         # ------------------------------------------------
