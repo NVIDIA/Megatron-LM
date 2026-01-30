@@ -294,7 +294,6 @@ class DynamicInferenceContext(BaseInferenceContext):
         metrics_writer: Optional['WandbModule'] = None,
         request_metadata_types: Optional[List[Tuple[str, torch.dtype, bool]]] = None,
         persist_cuda_graphs: Optional[bool] = False,
-        offload_kv_cache: Optional[bool] = False,
     ):
         super().__init__(materialize_only_last_token_logits=materialize_only_last_token_logits)
 
@@ -423,7 +422,6 @@ class DynamicInferenceContext(BaseInferenceContext):
 
         # Unified memory.
         self.unified_memory_level = unified_memory_level
-        self.persist_cuda_graphs = persist_cuda_graphs
         if unified_memory_level > 0:
             try:
                 self.unified_memory_mempool = create_unified_mempool()
@@ -433,6 +431,11 @@ class DynamicInferenceContext(BaseInferenceContext):
                         "Unified memory requested but not available; defaulting to GPU memory."
                     )
                 self.unified_memory_level = 0
+        self.persist_cuda_graphs = persist_cuda_graphs
+        if self.persist_cuda_graphs:
+            assert self.unified_memory_level == 0 or HAVE_TORCH_MEMORY_SAVER, (
+                "Can only persist CUDA graphs when using UVM or torch_memory_saver"
+            )
 
         # Initialize block allocator.
         buffer_size_bytes = int(buffer_size_gb * 1024**3)
@@ -551,12 +554,6 @@ class DynamicInferenceContext(BaseInferenceContext):
             )
         )
 
-        # Whether to offload the KV cache. Determines where the KV cache is allocated within memory.
-        self.offload_kv_cache = offload_kv_cache
-        assert not (
-            self.offload_kv_cache and self.unified_memory_level
-        ), "The KV cache should not be instantiated in unified memory when it is offloaded during training."
-
         self._using_cuda_graph_this_step = False
         self.use_cuda_graphs_for_non_decode_steps = use_cuda_graphs_for_non_decode_steps
         # Deal with chunked prefill
@@ -593,13 +590,14 @@ class DynamicInferenceContext(BaseInferenceContext):
         Args:
             is_init (bool): True if this is being called from `__init__()`.
         """
-
-        # Only allocate tensors when not using unified memory at all (level 0),
-        # or for initial allocation during `__init__()`. For levels 1 and 2, we do
-        # not perform any explicit allocations or deallocations after the initial
-        # call to `__init__()`.
-        if self.unified_memory_level != 0 and not is_init:
-            return
+        # Only allocate tensors when not using either unified memory or torch_memory_saver.
+        # Otherwise, we do not need to perform any explicit allocations.
+        if not is_init:
+            if self.unified_memory_level != 0:
+                return
+            if self.persist_cuda_graphs and HAVE_TORCH_MEMORY_SAVER:
+                torch_memory_saver.restore_region(tag="inference_context")
+                return
 
         # Mark allocated.
         if self.is_tensor_state_allocated:
@@ -672,25 +670,18 @@ class DynamicInferenceContext(BaseInferenceContext):
                     device=torch.cuda.current_device(),
                 )
             else:
-                ctx = (
-                    torch_memory_saver.region(tag="kv_cache", enable_cpu_backup=True)
-                    if HAVE_TORCH_MEMORY_SAVER and self.offload_kv_cache
-                    else nullcontext()
+                self.memory_buffer = torch.empty(
+                    (
+                        2,  # key and value
+                        self.num_attention_layers,
+                        self.block_allocator.total_count,
+                        self.block_size_tokens,
+                        self.num_attention_heads_per_partition,
+                        self.hidden_size_per_attention_head,
+                    ),
+                    dtype=self.params_dtype,
+                    device=torch.cuda.current_device(),
                 )
-
-                with ctx:
-                    self.memory_buffer = torch.empty(
-                        (
-                            2,  # key and value
-                            self.num_attention_layers,
-                            self.block_allocator.total_count,
-                            self.block_size_tokens,
-                            self.num_attention_heads_per_partition,
-                            self.hidden_size_per_attention_head,
-                        ),
-                        dtype=self.params_dtype,
-                        device=torch.cuda.current_device(),
-                    )
 
         # Optional state tensors for hybrid models
         def allocate_mamba_states():
@@ -710,17 +701,16 @@ class DynamicInferenceContext(BaseInferenceContext):
                     dtype=self.params_dtype,
                     device=torch.cuda.current_device(),
                 )
-
             else:
                 self.mamba_metadata = None
 
         # Allocate `ctx_manager`-managed buffers. (For currently unknown reasons,
         # `ctx_manager` can only be used once.)
-        ctx_manager = (
-            torch.cuda.use_mem_pool(self.unified_memory_mempool)
-            if self.unified_memory_level > 0
-            else nullcontext()
-        )
+        ctx_manager = nullcontext()
+        if self.unified_memory_level > 0:
+            ctx_manager = torch.cuda.use_mem_pool(self.unified_memory_mempool)
+        elif self.persist_cuda_graphs and HAVE_TORCH_MEMORY_SAVER:
+            ctx_manager = torch_memory_saver.region(tag="inference_context", enable_cpu_backup=True)
         with ctx_manager:
             allocate_memory_buffer()
             allocate_mamba_states()
@@ -740,13 +730,16 @@ class DynamicInferenceContext(BaseInferenceContext):
         # deallocations after the initial call to `__init__()`.
         if self.unified_memory_level != 0:
             return
+        if self.persist_cuda_graphs and HAVE_TORCH_MEMORY_SAVER:
+            torch_memory_saver.backup_region(tag="inference_context")
+            return
 
         # Mark deallocated.
         if not self.is_tensor_state_allocated:
             return
         self.is_tensor_state_allocated = False
 
-        # Delete all tensor attributes.
+        # Delete or offload all tensor attributes.
         # TODO(@lmcafee): check that device == 'cuda'?
         keys = list(vars(self).keys())
         for key in keys:
