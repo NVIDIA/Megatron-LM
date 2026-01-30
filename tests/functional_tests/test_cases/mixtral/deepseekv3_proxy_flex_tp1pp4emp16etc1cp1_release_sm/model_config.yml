@@ -13,7 +13,7 @@ ENV_VARS:
   NON_DETERMINSTIC_RESULTS: 1
   NVSHMEM_IB_ENABLE_IBGDA: 0
   CUDA_DEVICE_MAX_CONNECTIONS: 1
-TEST_TYPE: 'release'
+TEST_TYPE: "release"
 MODEL_ARGS:
   # Distributed args
   --distributed-timeout-minutes: 60
@@ -150,6 +150,7 @@ MODEL_ARGS:
   --logging-level: 40
   --tensorboard-dir: ${TENSORBOARD_PATH}
   --wandb-project: megatron-core-release-runs
+  --wandb-entity: adlr
   --wandb-exp-name: ${WANDB_EXPERIMENT}
   --wandb-save-dir: ${WANDB_SAVE_PATH}
 
@@ -160,7 +161,7 @@ MODEL_ARGS:
   --enable-experimental: true
   --exit-interval: 9536
 METRICS:
-  - 'iteration-time'
-  - 'lm loss'
-  - 'mem-allocated-bytes'
-  - 'mem-max-allocated-bytes'
+  - "iteration-time"
+  - "lm loss"
+  - "mem-allocated-bytes"
+  - "mem-max-allocated-bytes"

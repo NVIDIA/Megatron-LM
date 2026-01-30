@@ -37,7 +37,7 @@ spec:
     ls
     cd /opt/megatron-lm
 
-    NAME=$(echo {test_case}_{environment} | sed 's/dgx_h100/dgx_a100/g')
+    NAME=$(echo {test_case}_{environment} | sed 's/dgx_gb200/dgx_a100/g')
     export GPUS_PER_NODE={gpus}
 
     ARGUMENTS=(
@@ -64,6 +64,9 @@ spec:
     exit $exit_code
 
 products:
+  #######################################################################
+  # Nightly tests: Run DEV unless something is flaky       #
+  #######################################################################
   - test_case: [gpt3_mcore_tp1_pp1_resume_torch_dist_dist_optimizer_overlap_grad_reduce_param_gather]
     products:
       - environment: [dev]
@@ -78,7 +81,6 @@ products:
     products:
       - environment: [dev]
         scope: [nightly]
-        platforms: [dgx_gb200]
   - test_case: [gpt3_mcore_tp1_pp4]
     products:
       - environment: [dev]
@@ -88,7 +90,6 @@ products:
     products:
       - environment: [dev]
         scope: [nightly]
-        platforms: [dgx_gb200]
   - test_case: [gpt3_mcore_tp4_pp1_resume_torch]
     products:
       - environment: [dev]
@@ -99,258 +100,324 @@ products:
       - environment: [dev]
         scope: [nightly]
         platforms: [dgx_gb200]
+  #######################################################################
+  # mr, mr-github tests: Mostly DEV on mr, mr-github, and LTS on nightly cadence, except for  #
+  #             some very important tests.                              #
+  #######################################################################
   - test_case: [gpt3_mcore_te_tp1_pp1_dist_optimizer_no_mmap_bin_files]
     products:
       - environment: [dev]
-        scope: [nightly]
+        scope: [mr]
         platforms: [dgx_gb200]
   - test_case: [gpt3_mcore_te_tp1_pp1_dist_optimizer_fim_dataset]
     products:
       - environment: [dev]
-        scope: [nightly]
+        scope: [mr]
         platforms: [dgx_gb200]
   - test_case: [gpt3_mcore_te_tp1_pp1_resume_torch_dist_dist_optimizer]
     products:
       - environment: [dev]
-        scope: [nightly]
+        scope: [mr, mr-github-broken]
         platforms: [dgx_gb200]
   - test_case: [gpt3_mcore_te_tp1_pp1_resume_torch_dist_uniform_full_recompute]
     products:
       - environment: [dev]
-        scope: [nightly]
+        scope: [mr]
         platforms: [dgx_gb200]
+  # - test_case: [gpt3_mcore_te_tp1_pp2_resume_torch_dist_cp4_a2a_p2p_nondeterministic]
+  #   products:
+  #     - environment: [dev]
+  #       scope: [mr]
   - test_case: [gpt3_mcore_te_tp1_pp2_resume_torch_dist_rope_embeddings]
     products:
       - environment: [dev]
-        scope: [nightly]
+        scope: [mr]
         platforms: [dgx_gb200]
   - test_case: [gpt3_mcore_te_tp1_pp2_resume_torch_dist_rope_embeddings_interleaved_no_fusion]
     products:
       - environment: [dev]
-        scope: [nightly]
+        scope: [mr]
         platforms: [dgx_gb200]
   - test_case: [gpt3_mcore_te_tp1_pp4_resume_torch_dist_disable_bias_linear]
     products:
       - environment: [dev]
-        scope: [nightly]
+        scope: [mr]
         platforms: [dgx_gb200]
   - test_case: [gpt3_mcore_te_tp1_pp4_resume_torch_dist_persistent_disable_bias_linear]
     products:
       - environment: [dev]
-        scope: [nightly]
+        scope: [mr]
         platforms: [dgx_gb200]
   - test_case: [gpt3_mcore_te_tp1_pp4_resume_torch_dist_swiglu]
     products:
       - environment: [dev]
-        scope: [nightly]
+        scope: [mr]
         platforms: [dgx_gb200]
   - test_case: [gpt3_mcore_te_tp1_pp4_resume_torch_dist_untie_embeddings_and_outputs]
     products:
       - environment: [dev]
-        scope: [nightly]
+        scope: [mr]
         platforms: [dgx_gb200]
   - test_case: [gpt3_mcore_te_tp1_pp4_vp1]
     products:
       - environment: [dev]
-        scope: [nightly]
+        scope: [mr]
         platforms: [dgx_gb200]
   - test_case: [gpt3_mcore_te_tp1_pp4_vp1_resume_torch_decoupled_lr]
     products:
       - environment: [dev]
-        scope: [nightly]
+        scope: [mr]
         platforms: [dgx_gb200]
   - test_case: [gpt3_mcore_te_tp1_pp4_vp1_resume_torch_dist_calculate_per_token_loss]
     products:
       - environment: [dev]
-        scope: [nightly]
+        scope: [mr]
         platforms: [dgx_gb200]
+      # - test_case: [gpt3_mcore_te_tp1_pp4_vp1_resume_torch_dist]
+      #   products:
+      #     - environment: [dev]
+      #       scope: [mr]
+      #       platforms: [dgx_gb200] # Hangs: #513
   - test_case: [gpt3_mcore_te_tp1_pp4_vp1_resume_torch_dist_dist_optimizer_overlap_grad_reduce]
     products:
       - environment: [dev]
-        scope: [nightly]
-        platforms: [dgx_gb200]
-  - test_case: [gpt3_mcore_te_tp1_pp4_vp1_resume_torch_dist_dist_optimizer_overlap_grad_reduce_param_gather]
-    products:
-      - environment: [dev]
-        scope: [nightly]
-        platforms: [dgx_gb200]
-  - test_case: [gpt3_mcore_te_tp1_pp4_vp1_resume_torch_dist_dist_optimizer_overlap_grad_reduce_untied]
-    products:
-      - environment: [dev]
-        scope: [nightly]
-        platforms: [dgx_gb200]
-  - test_case: [gpt3_mcore_te_tp1_pp4_vp1_resume_torch_dist_tunable_overlap]
-    products:
-      - environment: [dev]
-        scope: [nightly]
+        scope: [mr]
         platforms: [dgx_gb200]
   - test_case: [gpt3_mcore_te_tp1_pp4_vp1_tunable_overlap]
     products:
       - environment: [dev]
-        scope: [nightly]
+        scope: [mr]
         platforms: [dgx_gb200]
   - test_case: [gpt3_mcore_te_tp1_pp4_vp1_uneven_pipeline]
     products:
       - environment: [dev]
-        scope: [nightly]
+        scope: [mr]
         platforms: [dgx_gb200]
   - test_case: [gpt3_mcore_te_tp1_pp4_vp2_account_for_embedding_loss_in_pipeline_split]
     products:
       - environment: [dev]
-        scope: [nightly]
+        scope: [mr]
         platforms: [dgx_gb200]
   - test_case: [gpt3_mcore_te_tp2_pp1_resume_torch_dist_cp2_nondeterministic]
     products:
       - environment: [dev]
-        scope: [nightly]
+        scope: [mr]
         platforms: [dgx_gb200]
   - test_case: [gpt3_mcore_te_tp2_pp1_resume_torch_dist_multi_dist_optimizer_instances]
     products:
       - environment: [dev]
-        scope: [nightly]
+        scope: [mr]
         platforms: [dgx_gb200]
   - test_case: [gpt3_mcore_te_tp2_pp2_cp2]
     products:
       - environment: [dev]
-        scope: [nightly]
+        scope: [mr]
         platforms: [dgx_gb200]
   - test_case: [gpt3_mcore_te_tp2_pp2_cp2_etp4_dp_last]
     products:
       - environment: [dev]
-        scope: [nightly]
+        scope: [mr]
         platforms: [dgx_gb200]
   - test_case: [gpt3_mcore_te_tp2_pp2_cp2_calculate_per_token_loss]
     products:
       - environment: [dev]
-        scope: [nightly]
+        scope: [mr]
         platforms: [dgx_gb200]
   - test_case: [gpt3_mcore_te_tp2_pp2_cp2_etp4_calculate_per_token_loss_dp_last]
     products:
       - environment: [dev]
-        scope: [nightly]
+        scope: [mr]
         platforms: [dgx_gb200]
   - test_case: [gpt3_mcore_te_tp2_pp2_cp2_nondeterministic]
     products:
       - environment: [dev]
-        scope: [nightly]
+        scope: [mr]
         platforms: [dgx_gb200]
   - test_case: [gpt3_mcore_te_tp2_pp2_cp2_etp4_nondeterministic_dp_last]
     products:
       - environment: [dev]
-        scope: [nightly]
+        scope: [mr]
         platforms: [dgx_gb200]
   - test_case: [gpt3_mcore_te_tp2_pp2_cp2_calculate_per_token_loss_nondeterministic]
     products:
       - environment: [dev]
-        scope: [nightly]
+        scope: [mr]
         platforms: [dgx_gb200]
   - test_case: [gpt3_mcore_te_tp2_pp2_cp2_etp4_calculate_per_token_loss_nondeterministic_dp_last]
     products:
       - environment: [dev]
-        scope: [nightly]
+        scope: [mr]
         platforms: [dgx_gb200]
   - test_case: [gpt3_mcore_te_tp2_pp2_cross_entropy_loss_fusion]
     products:
       - environment: [dev]
-        scope: [nightly]
+        scope: [mr]
         platforms: [dgx_gb200]
   - test_case: [gpt3_mcore_te_tp2_pp2_resume_torch_dist_cp2_nondeterministic]
     products:
       - environment: [dev]
-        scope: [nightly]
+        scope: [mr]
         platforms: [dgx_gb200]
   - test_case: [gpt3_mcore_te_tp2_pp2_resume_torch_dist_cross_entropy_loss_fusion]
     products:
       - environment: [dev]
-        scope: [nightly]
+        scope: [mr]
+        platforms: [dgx_gb200]
+  - test_case: [gpt3_mcore_te_tp2_pp1_gdn]
+    products:
+      - environment: [dev]
+        scope: [mr, mr-github, mr-github-slim]
         platforms: [dgx_gb200]
   - test_case: [gpt3_mcore_te_tp2_pp2_mla]
     products:
       - environment: [dev]
-        scope: [nightly]
+        scope: [mr]
         platforms: [dgx_gb200]
   - test_case: [gpt3_mcore_te_tp2_pp2_resume_torch_dist_ddp_average_in_collective]
     products:
       - environment: [dev]
-        scope: [nightly]
+        scope: [mr]
         platforms: [dgx_gb200]
   - test_case: [gpt3_mcore_te_tp2_pp2_resume_torch_dist_defer_embedding_wgrad_compute]
     products:
       - environment: [dev]
-        scope: [nightly]
+        scope: [mr]
         platforms: [dgx_gb200]
   - test_case: [gpt3_mcore_te_tp2_pp2_resume_torch_dist]
     products:
       - environment: [dev]
-        scope: [nightly]
-        platforms: [dgx_gb200]
-  - test_case: [gpt3_mcore_te_tp2_pp2_resume_torch_dist_no_create_attention_mask_in_dataloader]
-    products:
-      - environment: [dev]
-        scope: [nightly]
+        scope: [mr]
         platforms: [dgx_gb200]
   - test_case: [gpt3_mcore_te_tp2_pp2_resume_torch_dist_reshard_1x4xNone]
     products:
       - environment: [dev]
-        scope: [nightly]
+        scope: [mr]
         platforms: [dgx_gb200]
   - test_case: [gpt3_mcore_te_tp4_pp1_resume_torch_dist_dist_optimizer_overlap_grad_reduce]
     products:
       - environment: [dev]
-        scope: [nightly]
+        scope: [mr]
         platforms: [dgx_gb200]
   - test_case: [gpt3_mcore_te_tp4_pp1_resume_torch_dist_qk_layernorm_test_mode]
     products:
       - environment: [dev]
-        scope: [nightly]
+        scope: [mr]
         platforms: [dgx_gb200]
   - test_case: [gpt3_mcore_tp2_pp2_uninstall_te]
     products:
       - environment: [dev]
-        scope: [nightly]
+        scope: [mr]
         platforms: [dgx_gb200]
   - test_case: [gpt3_7b_tp1_pp4_memory_speed]
     products:
       - environment: [dev]
-        scope: [nightly]
+        scope: [mr]
         platforms: [dgx_gb200]
   - test_case: [gpt3_7b_tp4_pp1_memory_speed]
     products:
       - environment: [dev]
-        scope: [nightly]
+        scope: [mr]
         platforms: [dgx_gb200]
   - test_case: [gpt3_mcore_te_tp2_zp_z3_resume_fsdp_dtensor]
     products:
       - environment: [dev]
-        scope: [nightly]
+        scope: [mr]
         platforms: [dgx_gb200]
   - test_case: [gpt3_mcore_te_tp2_pp1_modelopt_distill_resume]
     products:
       - environment: [dev]
-        scope: [nightly]
+        scope: [mr]
         platforms: [dgx_gb200]
+  #######################################################################
+  # Super important mr, mr-github tests that run for DEV per mr, mr-github       #
+  #######################################################################
   - test_case: [gpt3_mcore_reruns_persistent_1]
     products:
       - environment: [dev]
-        scope: [nightly]
+        scope: [mr, mr-github-broken]
         platforms: [dgx_gb200]
   - test_case: [gpt3_mcore_te_tp1_pp4_vp1_dist_optimizer_overlap_grad_reduce_param_gather_overlap_optimizer]
     products:
       - environment: [dev]
-        scope: [nightly]
+        scope: [mr, mr-github, mr-github-slim]
         platforms: [dgx_gb200]
   - test_case: [gpt3_mcore_te_tp4_pp1_dist_optimizer_overlap_grad_reduce_param_gather]
     products:
       - environment: [dev]
-        scope: [nightly]
+        scope: [mr]
         platforms: [dgx_gb200]
   - test_case: [gpt3_mcore_te_tp4_pp1_resume_torch_dist_dist_optimizer_overlap_grad_reduce_param_gather]
     products:
       - environment: [dev]
-        scope: [nightly]
+        scope: [mr, mr-github, mr-github-slim]
         platforms: [dgx_gb200]
   - test_case: [gpt3_mcore_te_tp4_pp2_resume_torch_dist_reshard_8x1xNone]
     products:
       - environment: [dev]
-        scope: [nightly]
+        scope: [mr]
+        platforms: [dgx_gb200]
+  # - test_case: [gpt3_mcore_te_tp4_pp2_frozen_resume_torch_dist_reshard_8x1xNone]
+  #   products:
+  #     - environment: [dev]
+  #       scope: [mr]
+  #       platforms: [dgx_gb200]
+  # - test_case: [gpt3_mcore_te_tp1_pp1_frozen_resume_torch_dist_dist_optimizer]
+  #   products:
+  #     - environment: [dev]
+  #       scope: [mr]
+  #       platforms: [dgx_gb200]
+  # - test_case: [gpt3_mcore_te_tp1_pp4_frozen_resume_torch_dist_swiglu]
+  #   products:
+  #     - environment: [dev]
+  #       scope: [mr]
+  #       platforms: [dgx_gb200]
+  # - test_case: [gpt3_mcore_te_tp2_pp1_frozen_resume_torch_dist_cp2_nondeterministic]
+  #   products:
+  #     - environment: [dev]
+  #       scope: [mr]
+  #       platforms: [dgx_a100, dgx_gb200]
+  # - test_case: [gpt3_weekly_dgx_b200_mcore_tp2_pp2_current_scaling_native_fp8_tp_pp_sp_tp_overlap]
+  #   products:
+  #     - environment: [dev]
+  #       scope: [weekly]
+  #       platforms: [dgx_b200]
+  # - test_case: [gpt3_weekly_dgx_b200_mcore_tp4_cp2_current_scaling_native_fp8_tp_fsdp]
+  #   products:
+  #     - environment: [dev]
+  #       scope: [weekly]
+  #       platforms: [dgx_b200]
+  # - test_case: [gpt3_weekly_dgx_b200_mcore_tp4_cp2_current_scaling_native_fp8_tp_sp_cp_tp_overlap]
+  #   products:
+  #     - environment: [dev]
+  #       scope: [weekly]
+  #       platforms: [dgx_b200]
+  # - test_case: [gpt3_weekly_dgx_b200_mcore_tp4_cp2_mxfp8_tp_sp_cp]
+  #   products:
+  #     - environment: [dev]
+  #       scope: [weekly]
+  #       platforms: [dgx_b200]
+  # - test_case: [gpt3_weekly_dgx_b200_mcore_tp4_cp2_native_fp8_tp_sp_cp_tp_overlap]
+  #   products:
+  #     - environment: [dev]
+  #       scope: [weekly]
+  #       platforms: [dgx_b200]
+  - test_case: [gpt3_weekly_dgx_gb200_mcore_tp2_pp2_current_scaling_native_fp8_tp_pp_sp_tp_overlap]
+    products:
+      - environment: [dev]
+        scope: [weekly]
+        platforms: [dgx_gb200]
+  # - test_case: [gpt3_weekly_dgx_gb200_mcore_tp4_cp2_current_scaling_native_fp8_tp_fsdp]
+  #   products:
+  #     - environment: [dev]
+  #       scope: [weekly]
+  #       platforms: [dgx_gb200]
+  # - test_case: [gpt3_weekly_dgx_gb200_mcore_tp4_cp2_current_scaling_native_fp8_tp_sp_cp_tp_overlap]
+  #   products:
+  #     - environment: [dev]
+  #       scope: [weekly]
+  #       platforms: [dgx_gb200]
+  - test_case: [gpt3_weekly_dgx_gb200_mcore_tp4_cp2_native_fp8_tp_sp_cp_tp_overlap]
+    products:
+      - environment: [dev]
+        scope: [weekly]
         platforms: [dgx_gb200]
