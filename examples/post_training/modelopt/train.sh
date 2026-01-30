@@ -29,7 +29,6 @@ if [ -z ${MLM_DATA_ARGS} ]; then
         --lr-decay-samples 128000 \
         --lr-warmup-samples 0 \
 	--sft \
-	--sft-tokenizer-prompt-format identity \
 	--tokenizer-type SFTTokenizer \
 	--per-split-data-args-path ${BLEND_PATH} \
     "
