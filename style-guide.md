@@ -4,6 +4,8 @@ Note: This repository is Python-first. Prefer the Python guidelines in this docu
 
 ## Style Guides We Follow
 
+If there is a conflict between this file and the Google style guides, prioritize this file.
+
 - Python: [Google Python Style Guide](https://google.github.io/styleguide/pyguide.html)
 - Shell: [Google Shell Style Guide](https://google.github.io/styleguide/shellguide.html)
 
@@ -36,7 +38,7 @@ Exception: `docker/Dockerfile.ci.dev` and `docker/Dockerfile.ci.nemo` are exempt
 
 ### Line Length
 
-1. Maximum line length is **100 characters** (matching black/isort/flake8 configuration).
+1. Maximum line length is **100 characters**.
 
 ### Indentation
 
@@ -72,7 +74,7 @@ Exception: `docker/Dockerfile.ci.dev` and `docker/Dockerfile.ci.nemo` are exempt
 
 ### Imports
 
-We recommend using `isort`. Organize imports in the following order, separated by blank lines:
+We recommend using `isort --profile google`. Organize imports in the following order, separated by blank lines:
 
 1. Future imports
 2. Standard library imports
