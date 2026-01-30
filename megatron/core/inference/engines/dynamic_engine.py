@@ -116,7 +116,7 @@ class RequestEntry:
 
     record: DynamicInferenceRequestRecord
     future: asyncio.Future
-    recompute_soon: bool = False
+    recompute_upon_suspend: bool = False
 
 
 # pylint: disable=line-too-long
@@ -626,7 +626,7 @@ class DynamicInferenceEngine(AbstractEngine):
 
         # Suspend request objects that are marked for recompute.
         for request_id in active_request_ids:
-            if self.requests[request_id].recompute_soon:
+            if self.requests[request_id].recompute_upon_suspend:
                 self.requests[request_id].record.checkpoint()
 
     def resume(self):
@@ -663,9 +663,9 @@ class DynamicInferenceEngine(AbstractEngine):
             torch.cuda.synchronize()
             for request_id in self.resume_request_ids:
                 request_entry = self.requests[request_id]
-                if request_entry.recompute_soon:
+                if request_entry.recompute_upon_suspend:
                     self._add_request(self.get_request(request_id))
-                    request_entry.recompute_soon = False
+                    request_entry.recompute_upon_suspend = False
             torch.cuda.synchronize()
             add_time = time.time() - add_time
 

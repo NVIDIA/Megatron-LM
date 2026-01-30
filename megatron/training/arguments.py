@@ -382,10 +382,10 @@ def validate_args(args, defaults={}):
         #    ** This is controlled by `--rl-training-cuda-graphs`.
         #  - `megatron_rl_inference_mode` inside rl_utils toggles CGs on/off
         #      if inference is graphed but training is not.
-        #      Only the RL loop is aware that there's both training and inference.
+        #      This has to be done on an abstraction layer above training/inference.
         #    ** This is controlled by `--cuda-graph-impl` and `--rl-training-cuda-graphs`.
         #  - The engine - not the RL loop! - deletes and creates cuda graphs.
-        #      The engine needs to be aware of whether CGs are being used.
+        #      This has to be done at the abstraction layer of inference.
         #    ** This is controlled by `--rl-reset-cuda-graphs`.
         #  - The context ensures that the CGs still point to the correct memory addresses.
         #    ** This is attempted through UVM if enabled, otherwise through `torch_memory_saver`.
@@ -2057,7 +2057,7 @@ def _add_rl_args(parser):
                        help='Reset CUDA graphs between inference/training to save GPU memory')
     group.add_argument('--rl-training-cuda-graphs', action=argparse.BooleanOptionalAction, type=bool,
                        default=False,
-                       help='If set, do not call `delete_cuda_graphs` or `toggle_cuda_graphs` when the inference engine is suspended.')
+                       help='If set, prevents disabling of training CUDA graphs when switching from inference to training inside the RL loop.')
     group.add_argument('--rl-partial-rollouts', action=argparse.BooleanOptionalAction, default=False,
                        help='If set, use partial rollouts.')
     group.add_argument('--rl-inference-logprobs-is-correction', action=argparse.BooleanOptionalAction, type=bool, default=False,
