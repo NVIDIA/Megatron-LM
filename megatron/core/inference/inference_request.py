@@ -156,6 +156,37 @@ class InferenceRequest:
                 setattr(self, k, deserialize_tensor(v[1]))
 
 
+# =========================================================================
+# Hash computation for prefix caching
+# =========================================================================
+
+# Constants for hash computation
+HASH_PRIME = 1000000007
+HASH_BASE = 31
+
+
+def compute_block_hash(parent_hash: int, token_ids: torch.Tensor) -> int:
+    """Compute hash for a block from (parent_hash, token_ids).
+
+    Uses a GPU-based polynomial rolling hash combined with the parent hash.
+
+    Args:
+        parent_hash: Hash of parent block (0 for first block in sequence).
+        token_ids: Token IDs in this block, shape [block_size_tokens].
+
+    Returns:
+        Positive integer hash value (1 to HASH_PRIME).
+    """
+    block_size = token_ids.shape[0]
+    positions = torch.arange(block_size, device=token_ids.device, dtype=torch.int64)
+    powers = torch.pow(HASH_BASE, positions).to(torch.int64) % HASH_PRIME
+    token_hash = ((token_ids.to(torch.int64) * powers).sum() % HASH_PRIME).item()
+
+    # Combine with parent hash
+    combined = (parent_hash * HASH_BASE + token_hash) % HASH_PRIME
+    return combined + 1  # Ensure positive (1 to HASH_PRIME)
+
+
 class DynamicInferenceEventType(Enum):
     """Dynamic inference event type."""
 
@@ -274,10 +305,50 @@ class DynamicInferenceRequest(InferenceRequest):
     finished_chunk_token_count: int = 0
     stop_word_ids: Optional[List[List[int]]] = None  # Tokenized stop words (populated internally)
 
+    # Prefix caching fields
+    block_size_tokens: Optional[int] = None  # Block size for hash computation
+    enable_prefix_caching: bool = True  # Whether prefix caching is enabled
+
+    # Computed field - not passed by caller
+    precomputed_block_hashes: Optional[List[int]] = field(default=None, init=False)
+
     def __post_init__(self):
         self.sampling_params = copy.deepcopy(self.sampling_params)
         if self.prompt_tokens is not None:
             self.remaining_prompt_tokens = copy.deepcopy(self.prompt_tokens)
+
+        # Compute block hashes for prefix matching
+        if (
+            self.enable_prefix_caching
+            and self.block_size_tokens is not None
+            and self.prompt_tokens is not None
+        ):
+            self._compute_block_hashes()
+        elif self.block_size_tokens is not None:
+            # Prefix caching disabled or no prompt - set empty list to indicate "computed but none"
+            self.precomputed_block_hashes = []
+
+    def _compute_block_hashes(self) -> None:
+        """Compute hashes for all complete blocks in the prompt.
+
+        After this call:
+        - precomputed_block_hashes is [] if prompt < block_size (no complete blocks)
+        - precomputed_block_hashes is [hash1, ...] for N complete blocks
+        """
+        num_complete_blocks = len(self.prompt_tokens) // self.block_size_tokens
+
+        hashes = []
+        parent_hash = 0
+
+        for block_pos in range(num_complete_blocks):
+            start = block_pos * self.block_size_tokens
+            end = start + self.block_size_tokens
+            block_tokens = self.prompt_tokens[start:end]
+            block_hash = compute_block_hash(parent_hash, block_tokens)
+            hashes.append(block_hash)
+            parent_hash = block_hash
+
+        self.precomputed_block_hashes = hashes
 
     @property
     def remaining_prompt_length(self):

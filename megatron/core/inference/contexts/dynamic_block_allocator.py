@@ -57,6 +57,10 @@ class BlockAllocator:
         )
         self.global_timestamp = 0
 
+        # Pending block hashes for prefix caching coordination
+        # Maps block_id -> hash for blocks registered but not yet computed
+        self._pending_block_hashes: Dict[int, int] = {}
+
     def __str__(self):
         return (
             f"using: total {self.get_total_used()}/{self.total_count - 1}"
@@ -182,6 +186,7 @@ class BlockAllocator:
 
         # Reset prefix caching state
         self.hash_to_block_id.clear()
+        self._pending_block_hashes.clear()
         self.block_ref_counts.fill_(0)
         self.block_timestamps.fill_(0)
         self.global_timestamp = 0
@@ -247,16 +252,33 @@ class BlockAllocator:
         return self.hash_to_block_id.get(block_hash)
 
     def register_block_hash(self, block_id: int, block_hash: int) -> None:
-        """Register a block in the hash-to-block mapping.
+        """Register a block in the hash-to-block mapping for discovery.
 
-        Should be called after computing a block's hash to enable prefix matching.
+        NOTE: Does NOT mark block as computed. Call mark_block_computed() after
+        KV is computed. This two-phase approach enables prefix caching coordination
+        where subsequent requests wait for blocks to be computed before reusing.
 
         Args:
             block_id: The block ID.
             block_hash: The computed hash value.
         """
-        self.set_block_hash(block_id, block_hash)
+        # Store hash for later use, but block_hashes stays -1 until computed
+        self._pending_block_hashes[block_id] = block_hash
         self.hash_to_block_id[block_hash] = block_id
+
+    def mark_block_computed(self, block_id: int) -> None:
+        """Mark a block as having its KV computed.
+
+        Called after prefill completes for blocks that were registered.
+        This sets block_hashes[block_id] to the actual hash value,
+        signaling that the KV cache for this block is ready for reuse.
+
+        Args:
+            block_id: The block ID to mark as computed.
+        """
+        if block_id in self._pending_block_hashes:
+            hash_value = self._pending_block_hashes.pop(block_id)
+            self.set_block_hash(block_id, hash_value)
 
     def increment_ref_count(self, block_ids: Tensor) -> None:
         """Increment reference count for shared blocks.
@@ -328,6 +350,14 @@ class BlockAllocator:
         # Remove from hash mapping
         for block_id in blocks_to_evict:
             block_id_int = block_id.item()
+
+            # Clean up pending hash if block was pending computation
+            if block_id_int in self._pending_block_hashes:
+                pending_hash = self._pending_block_hashes.pop(block_id_int)
+                if pending_hash in self.hash_to_block_id:
+                    del self.hash_to_block_id[pending_hash]
+
+            # Clean up computed hash
             block_hash = self.block_hashes[block_id_int].item()
             if block_hash in self.hash_to_block_id:
                 del self.hash_to_block_id[block_hash]

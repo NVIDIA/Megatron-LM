@@ -1410,3 +1410,299 @@ class TestDynamicPrefixCaching:
         print(f"  Enabled:  {len(blocks_enabled)} blocks, {time_enabled*1000:.3f}ms")
         print(f"  Disabled: {len(blocks_disabled)} blocks, {time_disabled*1000:.3f}ms")
         print(f"  Memory ratio: {memory_ratio:.2f} (lower is better)")
+
+    # =========================================================================
+    # Prefix coordination tests
+    # =========================================================================
+
+    @pytest.mark.internal
+    def test_register_block_hash_does_not_set_block_hashes(self):
+        """Verify that register_block_hash does NOT set block_hashes (two-phase registration)."""
+        self._setup_model_parallel_group(1, 1)
+        dynamic_context = self._get_dynamic_context(
+            params_dtype=torch.float32,
+            num_layers=4,
+            kv_channels=8,
+            num_attention_heads=2,
+            max_sequence_length=512,
+            buffer_size_gb=0.1,
+            block_size_tokens=32,
+            max_tokens=None,
+            is_hybrid_model=False,
+            rounder=64,
+        )
+
+        allocator = dynamic_context.block_allocator
+
+        # Allocate a block
+        block_ids = allocator.allocate_memory_blocks(1)
+        block_id = block_ids[0].item()
+
+        # Verify initial state: block_hashes should be -1
+        assert allocator.block_hashes[block_id].item() == -1
+
+        # Register a hash for this block
+        test_hash = 12345
+        allocator.register_block_hash(block_id, test_hash)
+
+        # Verify: hash_to_block_id should be populated
+        assert allocator.hash_to_block_id.get(test_hash) == block_id
+
+        # Verify: block_hashes should still be -1 (not computed yet)
+        assert allocator.block_hashes[block_id].item() == -1
+
+        # Verify: _pending_block_hashes should contain the block
+        assert block_id in allocator._pending_block_hashes
+        assert allocator._pending_block_hashes[block_id] == test_hash
+
+    @pytest.mark.internal
+    def test_mark_block_computed_sets_hash(self):
+        """Verify that mark_block_computed correctly sets block_hashes."""
+        self._setup_model_parallel_group(1, 1)
+        dynamic_context = self._get_dynamic_context(
+            params_dtype=torch.float32,
+            num_layers=4,
+            kv_channels=8,
+            num_attention_heads=2,
+            max_sequence_length=512,
+            buffer_size_gb=0.1,
+            block_size_tokens=32,
+            max_tokens=None,
+            is_hybrid_model=False,
+            rounder=64,
+        )
+
+        allocator = dynamic_context.block_allocator
+
+        # Allocate a block and register hash
+        block_ids = allocator.allocate_memory_blocks(1)
+        block_id = block_ids[0].item()
+        test_hash = 12345
+
+        allocator.register_block_hash(block_id, test_hash)
+
+        # Verify: block_hashes is still -1
+        assert allocator.block_hashes[block_id].item() == -1
+
+        # Mark as computed
+        allocator.mark_block_computed(block_id)
+
+        # Verify: block_hashes should now be set
+        assert allocator.block_hashes[block_id].item() == test_hash
+
+        # Verify: _pending_block_hashes should no longer contain the block
+        assert block_id not in allocator._pending_block_hashes
+
+    @pytest.mark.internal
+    def test_pending_blocks_cleared_after_mark(self):
+        """Verify that mark_pending_blocks_computed clears the pending list."""
+        self._setup_model_parallel_group(1, 1)
+        dynamic_context = self._get_dynamic_context(
+            params_dtype=torch.float32,
+            num_layers=4,
+            kv_channels=8,
+            num_attention_heads=2,
+            max_sequence_length=512,
+            buffer_size_gb=0.1,
+            block_size_tokens=32,
+            max_tokens=None,
+            is_hybrid_model=False,
+            rounder=64,
+        )
+
+        block_size = dynamic_context.block_size_tokens
+
+        # Create request with 2 complete blocks
+        prompt_tokens = torch.arange(
+            block_size * 2, device=torch.cuda.current_device()
+        )
+        request = DynamicInferenceRequest(
+            request_id=1,
+            prompt_tokens=prompt_tokens,
+            sampling_params=SamplingParams(num_tokens_to_generate=10),
+            block_size_tokens=block_size,
+            enable_prefix_caching=True,
+        )
+
+        # Add request - blocks should be added to pending
+        dynamic_context.add_request(request)
+
+        # Verify: _blocks_pending_computation should have blocks
+        assert len(dynamic_context._blocks_pending_computation) > 0
+
+        # Mark pending blocks as computed
+        dynamic_context.mark_pending_blocks_computed()
+
+        # Verify: _blocks_pending_computation should be empty
+        assert len(dynamic_context._blocks_pending_computation) == 0
+
+    @pytest.mark.internal
+    def test_precomputed_hashes_correctness(self):
+        """Verify precomputed hashes match hashes computed by the allocator."""
+        self._setup_model_parallel_group(1, 1)
+        dynamic_context = self._get_dynamic_context(
+            params_dtype=torch.float32,
+            num_layers=4,
+            kv_channels=8,
+            num_attention_heads=2,
+            max_sequence_length=512,
+            buffer_size_gb=0.1,
+            block_size_tokens=32,
+            max_tokens=None,
+            is_hybrid_model=False,
+            rounder=64,
+        )
+
+        block_size = dynamic_context.block_size_tokens
+        allocator = dynamic_context.block_allocator
+
+        # Create request with 3 complete blocks
+        prompt_tokens = torch.arange(
+            block_size * 3, device=torch.cuda.current_device()
+        )
+        request = DynamicInferenceRequest(
+            request_id=1,
+            prompt_tokens=prompt_tokens,
+            sampling_params=SamplingParams(num_tokens_to_generate=10),
+            block_size_tokens=block_size,
+            enable_prefix_caching=True,
+        )
+
+        # Verify precomputed hashes match allocator computation
+        assert request.precomputed_block_hashes is not None
+        assert len(request.precomputed_block_hashes) == 3
+
+        # Manually compute hashes using allocator and compare
+        parent_hash = 0
+        for i in range(3):
+            start = i * block_size
+            end = start + block_size
+            block_tokens = prompt_tokens[start:end]
+            expected_hash = allocator.compute_block_hash(parent_hash, block_tokens)
+            assert request.precomputed_block_hashes[i] == expected_hash, (
+                f"Block {i} hash mismatch: {request.precomputed_block_hashes[i]} vs {expected_hash}"
+            )
+            parent_hash = expected_hash
+
+    @pytest.mark.internal
+    def test_request_shorter_than_block_size(self):
+        """Verify request with prompt shorter than block_size has empty precomputed_block_hashes."""
+        self._setup_model_parallel_group(1, 1)
+        dynamic_context = self._get_dynamic_context(
+            params_dtype=torch.float32,
+            num_layers=4,
+            kv_channels=8,
+            num_attention_heads=2,
+            max_sequence_length=512,
+            buffer_size_gb=0.1,
+            block_size_tokens=64,
+            max_tokens=None,
+            is_hybrid_model=False,
+            rounder=64,
+        )
+
+        block_size = dynamic_context.block_size_tokens
+
+        # Create request with tokens shorter than block_size
+        prompt_tokens = torch.arange(
+            block_size // 2, device=torch.cuda.current_device()  # 32 tokens < 64 block_size
+        )
+        request = DynamicInferenceRequest(
+            request_id=1,
+            prompt_tokens=prompt_tokens,
+            sampling_params=SamplingParams(num_tokens_to_generate=10),
+            block_size_tokens=block_size,
+            enable_prefix_caching=True,
+        )
+
+        # Verify: precomputed_block_hashes should be empty list (not None)
+        assert request.precomputed_block_hashes is not None
+        assert request.precomputed_block_hashes == []
+
+        # Request can still be added
+        dynamic_context.add_request(request)
+        assert dynamic_context.total_request_count == 1
+
+    @pytest.mark.internal
+    def test_request_longer_than_block_size(self):
+        """Verify request longer than block_size has correct number of precomputed hashes."""
+        self._setup_model_parallel_group(1, 1)
+        dynamic_context = self._get_dynamic_context(
+            params_dtype=torch.float32,
+            num_layers=4,
+            kv_channels=8,
+            num_attention_heads=2,
+            max_sequence_length=512,
+            buffer_size_gb=0.1,
+            block_size_tokens=32,
+            max_tokens=None,
+            is_hybrid_model=False,
+            rounder=64,
+        )
+
+        block_size = dynamic_context.block_size_tokens
+
+        # Create request with 2.5 blocks worth of tokens
+        num_tokens = int(block_size * 2.5)  # 80 tokens with block_size=32
+        prompt_tokens = torch.arange(
+            num_tokens, device=torch.cuda.current_device()
+        )
+        request = DynamicInferenceRequest(
+            request_id=1,
+            prompt_tokens=prompt_tokens,
+            sampling_params=SamplingParams(num_tokens_to_generate=10),
+            block_size_tokens=block_size,
+            enable_prefix_caching=True,
+        )
+
+        # Verify: should have 2 hashes (only complete blocks)
+        assert request.precomputed_block_hashes is not None
+        assert len(request.precomputed_block_hashes) == 2
+
+        # Verify hashes are positive
+        for h in request.precomputed_block_hashes:
+            assert h > 0
+
+    @pytest.mark.internal
+    def test_reset_clears_pending_computation_list(self):
+        """Verify that reset() clears _blocks_pending_computation."""
+        self._setup_model_parallel_group(1, 1)
+        dynamic_context = self._get_dynamic_context(
+            params_dtype=torch.float32,
+            num_layers=4,
+            kv_channels=8,
+            num_attention_heads=2,
+            max_sequence_length=512,
+            buffer_size_gb=0.1,
+            block_size_tokens=32,
+            max_tokens=None,
+            is_hybrid_model=False,
+            rounder=64,
+        )
+
+        block_size = dynamic_context.block_size_tokens
+
+        # Create and add request
+        prompt_tokens = torch.arange(
+            block_size * 2, device=torch.cuda.current_device()
+        )
+        request = DynamicInferenceRequest(
+            request_id=1,
+            prompt_tokens=prompt_tokens,
+            sampling_params=SamplingParams(num_tokens_to_generate=10),
+            block_size_tokens=block_size,
+            enable_prefix_caching=True,
+        )
+        dynamic_context.add_request(request)
+
+        # Verify: _blocks_pending_computation should have blocks
+        assert len(dynamic_context._blocks_pending_computation) > 0
+
+        # Reset context
+        dynamic_context.reset()
+
+        # Verify: _blocks_pending_computation should be cleared
+        assert len(dynamic_context._blocks_pending_computation) == 0
+
+        # Verify: _pending_block_hashes in allocator should also be cleared
+        assert len(dynamic_context.block_allocator._pending_block_hashes) == 0

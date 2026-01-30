@@ -253,6 +253,9 @@ class DynamicInferenceEngine(AbstractEngine):
         self.step_end_event = torch.cuda.Event(enable_timing=True)
         self.capture_stats = None
 
+        # Prefix coordination metrics
+        self._prefix_coordination_waits = 0  # Times a request waited for pending blocks
+
         # Runtime state.
         self._loop = get_asyncio_loop(getattr(self, "_loop", None))
         self._cond = asyncio.Condition()
@@ -792,6 +795,8 @@ class DynamicInferenceEngine(AbstractEngine):
             prompt=prompt_str,
             prompt_tokens=tokens,
             sampling_params=sampling_params,
+            block_size_tokens=self.context.block_size_tokens,
+            enable_prefix_caching=self.context.enable_prefix_caching,
         )
 
         # Add request.
@@ -1021,6 +1026,61 @@ class DynamicInferenceEngine(AbstractEngine):
 
         return False
 
+    def _has_pending_prefix_blocks(self, req: DynamicInferenceRequest) -> bool:
+        """Check if request has matching prefix blocks that are still computing.
+
+        Looks up each precomputed hash to see if it exists in the hash map.
+        If a block exists but its hash is -1 (not computed), the request should wait.
+
+        Args:
+            req: The inference request with precomputed_block_hashes set.
+
+        Returns:
+            True if any matching blocks are still computing, False otherwise.
+        """
+        if not self.context.enable_prefix_caching:
+            return False
+
+        # IMPORTANT: precomputed_block_hashes must be a list (not None) before scheduling
+        # None means hashes haven't been computed yet
+        # [] means hashes computed but no complete blocks (prompt < block_size)
+        if req.precomputed_block_hashes is None:
+            # Hashes not computed - this shouldn't happen if block_size_tokens was passed
+            return False
+
+        # Empty list means no complete blocks - nothing to wait for
+        if len(req.precomputed_block_hashes) == 0:
+            return False
+
+        allocator = self.context.block_allocator
+
+        for block_hash in req.precomputed_block_hashes:
+            block_id = allocator.lookup_block_by_hash(block_hash)
+
+            if block_id is None:
+                # No block with this hash exists yet - no need to wait
+                break
+
+            # Block exists - check if it's computed
+            stored_hash = allocator.get_block_hash(block_id)
+            if stored_hash == -1:
+                # Block allocated but not computed - request should wait
+                self._prefix_coordination_waits += 1
+                return True
+
+        return False
+
+    def get_prefix_coordination_metrics(self) -> Dict[str, int]:
+        """Return metrics about prefix coordination behavior.
+
+        Returns:
+            Dict with metrics:
+                - waits: Number of times a request waited for pending blocks
+        """
+        return {
+            "waits": self._prefix_coordination_waits,
+        }
+
     def schedule_waiting_requests(self):
         """Tries to schedule any requests in the waiting pool."""
         if self.enable_chunked_prefill:
@@ -1034,6 +1094,11 @@ class DynamicInferenceEngine(AbstractEngine):
         """
         while self.waiting_request_ids:
             req = self.get_request(self.waiting_request_ids[0])
+
+            # Check if this request should wait for pending prefix blocks
+            if self._has_pending_prefix_blocks(req):
+                break  # Prefix blocks still computing, retry next cycle
+
             request_can_be_added, request_tokens_can_be_added, kv_cache_available = (
                 self.context.check_availability(req)
             )
@@ -1071,6 +1136,11 @@ class DynamicInferenceEngine(AbstractEngine):
             # is_continuing_chunked_prefill is True if we are scheduling next
             # chunk of a existing chunked prefill request
             is_continuing_chunked_prefill = self.context.chunked_prefill_request_id >= 0
+
+            # Check if this request should wait for pending prefix blocks
+            # Only check for new requests, not continuing chunked prefills
+            if not is_continuing_chunked_prefill and self._has_pending_prefix_blocks(req):
+                break  # Prefix blocks still computing, retry next cycle
 
             # Use remaining prompt tokens for scheduling decisions
             remaining_len = len(req.remaining_prompt_tokens)
@@ -1157,6 +1227,10 @@ class DynamicInferenceEngine(AbstractEngine):
         self.step_end_event.synchronize()
         step_time = self.step_start_event.elapsed_time(self.step_end_event) / 1e3
         self.step_count += 1
+
+        # Mark prefilled blocks as computed for prefix caching coordination
+        if not is_decode_only:
+            self.context.mark_pending_blocks_computed()
 
         range_pop()
 

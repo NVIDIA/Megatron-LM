@@ -464,6 +464,9 @@ class DynamicInferenceContext(BaseInferenceContext):
             paused_count=paused_block_count,
         )
 
+        # Track blocks pending KV computation for prefix caching coordination
+        self._blocks_pending_computation: List[int] = []
+
         # Track request metadata.
         if request_metadata_types is None:
             request_metadata_types = DynamicInferenceRequest.get_metadata_types()
@@ -1477,6 +1480,9 @@ class DynamicInferenceContext(BaseInferenceContext):
             token_count=0, prefill_req_count=0, decode_req_count=0
         )
 
+        # Reset prefix caching coordination state
+        self._blocks_pending_computation.clear()
+
     def current_input_and_position_ids(
         self, *, num_warmup_tokens: Optional[int] = None
     ) -> Tuple[Tensor, Tensor]:
@@ -1526,6 +1532,17 @@ class DynamicInferenceContext(BaseInferenceContext):
 
         return last_token_logits
 
+    def mark_pending_blocks_computed(self) -> None:
+        """Mark all pending blocks as computed after prefill.
+
+        Called by the engine after a prefill step completes to mark blocks
+        as having their KV computed. This enables prefix caching coordination
+        where subsequent requests can safely reuse these blocks.
+        """
+        for block_id in self._blocks_pending_computation:
+            self.block_allocator.mark_block_computed(block_id)
+        self._blocks_pending_computation.clear()
+
     def check_availability(self, req: DynamicInferenceRequest) -> (bool, bool, bool):
         """
         Check if the request can be added to the context.
@@ -1543,15 +1560,15 @@ class DynamicInferenceContext(BaseInferenceContext):
         return request_can_be_added, request_tokens_can_be_added, kv_cache_available
 
     def _find_matching_prefix_blocks(
-        self, prompt_tokens: Tensor
+        self, req: DynamicInferenceRequest
     ) -> tuple[list[int], int]:
-        """Find cached blocks matching the prompt prefix.
+        """Find cached blocks matching the prompt prefix using precomputed hashes.
 
-        Computes block hashes for complete blocks in the prompt and looks them up
+        Uses the request's precomputed_block_hashes to look up existing blocks
         in the block allocator's hash-to-block mapping. Stops at the first non-match.
 
         Args:
-            prompt_tokens: Full prompt token IDs for this request.
+            req: The inference request with precomputed_block_hashes set.
 
         Returns:
             Tuple of:
@@ -1562,19 +1579,14 @@ class DynamicInferenceContext(BaseInferenceContext):
         if not self.enable_prefix_caching:
             return [], 0
 
+        # Check if precomputed hashes are available
+        if not req.precomputed_block_hashes:
+            return [], 0
+
         matched_blocks: list[int] = []
         parent_hash = 0
 
-        num_complete_blocks = len(prompt_tokens) // self.block_size_tokens
-
-        for block_pos in range(num_complete_blocks):
-            start = block_pos * self.block_size_tokens
-            end = start + self.block_size_tokens
-            block_tokens = prompt_tokens[start:end]
-
-            # Compute hash for this block
-            block_hash = self.block_allocator.compute_block_hash(parent_hash, block_tokens)
-
+        for block_hash in req.precomputed_block_hashes:
             # Look up existing block with this hash
             existing_block = self.block_allocator.lookup_block_by_hash(block_hash)
 
@@ -1628,9 +1640,7 @@ class DynamicInferenceContext(BaseInferenceContext):
 
         # Only attempt prefix matching on the first chunk of a new request
         if not is_chunked_prefill:
-            matched_block_ids, prefix_parent_hash = self._find_matching_prefix_blocks(
-                req.prompt_tokens
-            )
+            matched_block_ids, prefix_parent_hash = self._find_matching_prefix_blocks(req)
             num_matched_blocks = len(matched_block_ids)
 
         # =========================================================================
@@ -1763,24 +1773,12 @@ class DynamicInferenceContext(BaseInferenceContext):
         for block_pos in range(first_block_to_hash, num_complete_blocks):
             block_id = self.request_to_kv_block_ids[current_id][block_pos].item()
 
-            # Get parent hash
-            if block_pos == num_matched_blocks and num_matched_blocks > 0:
-                # First new block after matched prefix - use prefix_parent_hash
-                parent_hash = prefix_parent_hash
-            elif block_pos > 0:
-                parent_block_id = self.request_to_kv_block_ids[current_id][block_pos - 1].item()
-                parent_hash = self.block_allocator.get_block_hash(parent_block_id)
-            else:
-                parent_hash = 0
-
-            # Compute and register hash
-            if self.enable_prefix_caching:
-                # Use content-based hash from prompt tokens and register for prefix matching
-                start = block_pos * self.block_size_tokens
-                end = start + self.block_size_tokens
-                block_tokens = req.prompt_tokens[start:end]
-                block_hash = self.block_allocator.compute_block_hash(parent_hash, block_tokens)
+            # Register hash for prefix caching
+            if self.enable_prefix_caching and req.precomputed_block_hashes:
+                # Use precomputed hash from request
+                block_hash = req.precomputed_block_hashes[block_pos]
                 self.block_allocator.register_block_hash(block_id, block_hash)
+                self._blocks_pending_computation.append(block_id)
             else:
                 # Use deterministic unique hash based on block_id to prevent matching
                 # Knuth's multiplicative hash spreads IDs across hash space
