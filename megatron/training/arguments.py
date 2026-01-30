@@ -2017,9 +2017,6 @@ def _add_training_args(parser):
                        dest='check_for_large_grads')
     group.add_argument('--result-rejected-tracker-filename', type=str, default=None,
                        help='Optional name of file tracking `result_rejected` events.')
-    group.add_argument('--disable-gloo-process-groups', action='store_false',
-                       dest='enable_gloo_process_groups',
-                       help='Disables creation and usage of Gloo process groups.')
     group.add_argument('--tp-comm-overlap-cfg', type=str, default=None,
                        help='Config file when tp_comm_overlap is enabled.')
 
@@ -2092,10 +2089,6 @@ def _add_training_args(parser):
                        '--use-legacy-models to not use core models.')
     group.add_argument('--use-legacy-models', action='store_true',
                        help='Use the legacy Megatron models, not Megatron-Core models.')
-    group.add_argument('--high-priority-stream-groups', nargs='*', type=str, default=[],
-                       help='The communicator group names to use high priority streams.')
-    group.add_argument('--disable-jit-fuser', action='store_true',
-                       help='Disable the JIT fuser.')
 
     return parser
 
@@ -2204,7 +2197,10 @@ def _add_mixed_precision_args(parser):
 
 
 def _add_distributed_args(parser):
-    group = parser.add_argument_group(title='distributed')
+    from megatron.training.common_config import DistributedInitConfig
+
+    dist_init_factory = ArgumentGroupFactory(DistributedInitConfig, exclude=["lazy_mpu_init"])
+    group = dist_init_factory.build_group(parser, "distributed init")
 
     group.add_argument('--decoder-first-pipeline-num-layers',
                        type=int, default=None,
@@ -2232,20 +2228,8 @@ def _add_distributed_args(parser):
     group.add_argument('--no-overlap-p2p-communication', action='store_false',
                        help='overlap pipeline parallel communication with forward and backward chunks in 1F1B',
                        dest='overlap_p2p_comm')
-    group.add_argument('--distributed-backend', default='nccl',
-                       choices=['nccl', 'gloo'],
-                       help='Which backend to use for distributed training.')
-    group.add_argument('--distributed-timeout-minutes', type=int, default=10,
-                       help='Default timeout minutes for torch.distributed.')
-    group.add_argument('--distributed-timeout-seconds-after-init', type=int, default=None,
-                       help='Timeout seconds for process groups after initialization.'
-                            'This timeout is applied to all process groups after initialization.')
     group.add_argument('--overlap-grad-reduce', action='store_true',
                        default=False, help='If set, overlap DDP grad reduce.')
-    group.add_argument('--no-align-grad-reduce', action='store_false',
-                       help='If not set, all PP stages will launch gradient reduces simultaneously. '
-                       'Otherwise, each PP stage will independently launch as needed.',
-                       dest='align_grad_reduce')
     group.add_argument('--ddp-num-buckets', type=int, default=None,
                        help='Number of buckets for data-parallel communication')
     group.add_argument('--ddp-bucket-size', type=int, default=None,
@@ -2272,8 +2256,6 @@ def _add_distributed_args(parser):
     group.add_argument('--no-scatter-gather-tensors-in-pipeline', action='store_false',
                        help='If not set, use scatter/gather to optimize communication of tensors in pipeline.',
                        dest='scatter_gather_tensors_in_pipeline')
-    group.add_argument('--local-rank', type=int, default=int(os.getenv('LOCAL_RANK', '0')),
-                       help='local rank passed from distributed launcher.')
     group.add_argument('--lazy-mpu-init', type=bool, required=False,
                        help='If set to True, initialize_megatron() '
                        'skips DDP initialization and returns function to '
@@ -2292,18 +2274,9 @@ def _add_distributed_args(parser):
     group.add_argument('--fsdp-manual-registration', action='store_true', dest='fsdp_manual_registration',
                        default=False, help='Manually register the FSDP communication buffers to NCCL user buffer.'
                        'This option is only effective when use-megatron-fsdp and use-nccl-ub is set.')
-    group.add_argument('--use-sharp', action='store_true', 
-                       help='Required to enable SHARP communication.')
-    group.add_argument('--sharp-enabled-group', type=str, default=None,
-                       choices=['dp', 'dp_replica'],
-                       help='IB SHARP can be enabled from only one communication group. '
-                       'By default, it is enabled from dp group. '
-                       'Available options: [dp, dp_replica]')
     group.add_argument('--create-all-gather-group', action='store_true',
                    help='Create a separate process group for all-gather operations '
                    'to overlap reduce-scatter and all-gather operations.')
-    group.add_argument('--use-megatron-fsdp', action='store_true',
-                       help='Use the Megatron FSDP code path in DDP.')
     group.add_argument('--data-parallel-sharding-strategy', type=str, default='no_shard',
                        choices=['no_shard', 'optim', 'optim_grads', 'optim_grads_params'],
                        help='Sharding strategy of data parallelism.')
@@ -2332,9 +2305,6 @@ def _add_distributed_args(parser):
                        help='If set, enable full sharding in megatron-fsdp Hybrid Sharded Data Parallel (HSDP) mode.')
     group.add_argument('--num-distributed-optimizer-instances', type=int, default=1,
                        help='Number of Distributed Optimizer copies across Data Parallel domain.')
-    group.add_argument('--use-torch-fsdp2', action='store_true',
-                       help='Use the torch FSDP2 implementation. FSDP2 has not been tested with pipeline parallelism, '
-                       'and may contain bugs.')
     group.add_argument('--torch-fsdp2-no-reshard-after-forward', action='store_false', dest='torch_fsdp2_reshard_after_forward',
                        help='Whether to reshard weights after forward pass when using PyTorch FSDP2. '
                        'Set to enable FSDP ZeRO-2.')
@@ -2344,14 +2314,6 @@ def _add_distributed_args(parser):
                        'all layers will share the same communication type. Users can also '
                        'specify separated types for each layer like '
                        '--cp-comm-type p2p p2p a2a a2a a2a+p2p a2a+p2p')
-    group.add_argument('--nccl-communicator-config-path', type=str, default=None,
-                       help='Path to the yaml file with NCCL communicator '
-                       'configurations. The number of min/max thread groups and thread '
-                       'group cluster size of each communicator can be configured by '
-                       'setting `min_ctas`, `max_ctas`, and `cga_cluster_size`.')
-    group.add_argument('--use-tp-pp-dp-mapping', action='store_true', default=False,
-                        help='If set, distributed ranks initialize order is changed '
-                        'from tp-cp-ep-dp-pp to tp-cp-ep-pp-dp.')
     group.add_argument('--fake-process-group', action='store_true', default=False,
                        help='If set, initialize with fake distributed process group and all distributed communication operations will be skipped. \
                        This is quite useful for profiling memory usage of distributed training with just one GPU. \
