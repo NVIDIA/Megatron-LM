@@ -71,7 +71,7 @@ def should_free_input(name, is_moe, config):
     # The input and output of A2A are not needed anymore after the forward pass,
     # so we can free the input memory after the forward pass.
     free_input_nodes = {
-        "mlp": not enable_hybridep,
+        "mlp": not (enable_hybridep and config.fp8 is None),
         "moe_combine": True,
         # For non-DeepEP and non-HybridEP dispatcher mode, the input is the un-dispatched tokens
         # and probs before dispatch A2A and it's not needed anymore after the forward pass
@@ -316,7 +316,7 @@ class TransformerLayerNode(ScheduleNode):
         """Computes the weight gradients for the transformer layer node."""
         if not self.delay_wgrad_compute:
             return
-        with torch.cuda.nvtx.range(f"{self.name} wgrad"):
+        with self.stream_acquire_context(f"{self.name} wgrad"):
             for module in self.bwd_dw_callables:
                 module.backward_dw()
 
@@ -514,15 +514,15 @@ def build_transformer_layer_callables(layer: TransformerLayer):
             token_dispatcher._comm_manager.token_probs = probs
 
         dispatched_tokens, dispatched_probs = layer.mlp.dispatch(local_tokens, probs)
-        node.layer_state.dispatched_probs = node.detach(dispatched_probs)
-        return dispatched_tokens
+        return dispatched_tokens, dispatched_probs
 
-    def submodule_moe_forward(node: ScheduleNode, dispatched_tokens: torch.Tensor):
+    def submodule_moe_forward(
+        node: ScheduleNode, dispatched_tokens: torch.Tensor, dispatched_probs: torch.Tensor
+    ):
         """
         Run forward pass for computations between dispatch and combine:
             post dispatch->experts->combine preprocess
         """
-        dispatched_probs = node.layer_state.dispatched_probs
         token_dispatcher = layer.mlp.token_dispatcher
         if enable_deepep or enable_hybridep:
             # update dispatched_probs to be detached version, prevents
@@ -531,13 +531,16 @@ def build_transformer_layer_callables(layer: TransformerLayer):
 
         expert_output, _ = layer.mlp.routed_experts_compute(dispatched_tokens, dispatched_probs)
 
+        # For HybridEP, tokens_per_expert is generated on comm stream, as the input to
+        # `routed_experts_compute`, it needs to be recorded to comp stream.
+        if enable_hybridep:
+            tokens_per_expert = token_dispatcher._comm_manager.get_number_of_tokens_per_expert()
+            tokens_per_expert.record_stream(torch.cuda.current_stream())
+
         if layer.recompute_pre_mlp_layernorm:
             # discard the output of the pre-mlp layernorm and register the recompute
             # as a gradient hook of expert_output
             layer.pre_mlp_norm_checkpoint.discard_output_and_register_recompute(expert_output)
-        # release tensor reference after use
-        node.layer_state.dispatched_probs = None
-        node.layer_state.pre_mlp_layernorm_output = None
 
         return expert_output
 
