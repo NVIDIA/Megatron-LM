@@ -114,7 +114,9 @@ class TestDynamicContextSuspend:
 
     def setup_method(self, method):
         """Setup model parallel for each test."""
-        Utils.initialize_model_parallel(tensor_model_parallel_size=1, pipeline_model_parallel_size=1)
+        Utils.initialize_model_parallel(
+            tensor_model_parallel_size=1, pipeline_model_parallel_size=1
+        )
         model_parallel_cuda_manual_seed(123)
         set_rounder(4)
 
@@ -124,10 +126,7 @@ class TestDynamicContextSuspend:
         Utils.destroy_model_parallel()
         force_gc()
 
-    def _create_context(
-        self,
-        config: SuspendTestConfig,
-    ) -> DynamicInferenceContext:
+    def _create_context(self, config: SuspendTestConfig) -> DynamicInferenceContext:
         """Create a DynamicInferenceContext with the given configuration."""
         context = DynamicInferenceContext(
             params_dtype=torch.bfloat16,
@@ -367,7 +366,9 @@ class TestDynamicContextSuspend:
 
             force_gc()
             memory_deallocated = get_gpu_memory_allocated()
-            assert memory_deallocated < memory_with_requests, f"Cycle {cycle}: Memory should decrease"
+            assert (
+                memory_deallocated < memory_with_requests
+            ), f"Cycle {cycle}: Memory should decrease"
 
             # Reallocate
             context.allocate_all_tensors(is_init=False)
@@ -427,7 +428,9 @@ class TestDynamicEngineSuspend:
 
     def setup_method(self, method):
         """Setup model parallel for each test."""
-        Utils.initialize_model_parallel(tensor_model_parallel_size=1, pipeline_model_parallel_size=1)
+        Utils.initialize_model_parallel(
+            tensor_model_parallel_size=1, pipeline_model_parallel_size=1
+        )
         model_parallel_cuda_manual_seed(123)
         set_rounder(4)
 
@@ -444,15 +447,16 @@ class TestDynamicEngineSuspend:
         force_gc()
 
     def _build_engine(
-        self,
-        config: SuspendTestConfig,
-        enable_cuda_graph: bool = False,
+        self, config: SuspendTestConfig, enable_cuda_graph: bool = False
     ) -> DynamicInferenceEngine:
         """Build a DynamicInferenceEngine with the given configuration."""
         random.seed(config.random_seed)
         torch.manual_seed(config.random_seed)
         model_parallel_cuda_manual_seed(
-            seed=config.random_seed, inference_rng_tracker=True, use_cudagraphable_rng=False, force_reset_rng=True
+            seed=config.random_seed,
+            inference_rng_tracker=True,
+            use_cudagraphable_rng=False,
+            force_reset_rng=True,
         )
 
         # Transformer config
@@ -691,12 +695,10 @@ class TestDynamicEngineSuspend:
         request_ids = list(engine.requests.keys())
         for i, request_id in enumerate(request_ids):
             # Mark every other request for recompute
-            engine.requests[request_id].recompute_soon = (i % 2 == 0)
+            engine.requests[request_id].recompute_soon = i % 2 == 0
 
         # Record which requests were marked
-        marked_for_recompute = {
-            rid for rid in request_ids if engine.requests[rid].recompute_soon
-        }
+        marked_for_recompute = {rid for rid in request_ids if engine.requests[rid].recompute_soon}
 
         # Suspend
         engine.suspend()
@@ -712,9 +714,9 @@ class TestDynamicEngineSuspend:
 
         # Check that recompute_soon flags are cleared for marked requests
         for request_id in marked_for_recompute:
-            assert not engine.requests[request_id].recompute_soon, (
-                f"Request {request_id} recompute_soon should be False after resume"
-            )
+            assert not engine.requests[
+                request_id
+            ].recompute_soon, f"Request {request_id} recompute_soon should be False after resume"
 
     @pytest.mark.internal
     @pytest.mark.skipif(
@@ -775,9 +777,9 @@ class TestDynamicEngineSuspend:
 
         if enable_cuda_graph:
             # CUDA graphs should be deleted
-            assert len(_CudagraphGlobalRecord.cudagraph_record) == 0, (
-                "CUDA graphs should be deleted after suspend when not persisting"
-            )
+            assert (
+                len(_CudagraphGlobalRecord.cudagraph_record) == 0
+            ), "CUDA graphs should be deleted after suspend when not persisting"
 
         # Resume should recreate CUDA graphs
         engine.resume()
@@ -790,7 +792,9 @@ class TestRequestRecompute:
 
     def setup_method(self, method):
         """Setup model parallel for each test."""
-        Utils.initialize_model_parallel(tensor_model_parallel_size=1, pipeline_model_parallel_size=1)
+        Utils.initialize_model_parallel(
+            tensor_model_parallel_size=1, pipeline_model_parallel_size=1
+        )
         model_parallel_cuda_manual_seed(123)
         set_rounder(4)
 
@@ -835,7 +839,9 @@ class TestArgumentCombinations:
 
     def setup_method(self, method):
         """Setup model parallel for each test."""
-        Utils.initialize_model_parallel(tensor_model_parallel_size=1, pipeline_model_parallel_size=1)
+        Utils.initialize_model_parallel(
+            tensor_model_parallel_size=1, pipeline_model_parallel_size=1
+        )
         model_parallel_cuda_manual_seed(123)
         set_rounder(4)
 
@@ -942,7 +948,9 @@ class TestEngineStepWithSuspend:
 
     def setup_method(self, method):
         """Setup model parallel for each test."""
-        Utils.initialize_model_parallel(tensor_model_parallel_size=1, pipeline_model_parallel_size=1)
+        Utils.initialize_model_parallel(
+            tensor_model_parallel_size=1, pipeline_model_parallel_size=1
+        )
         model_parallel_cuda_manual_seed(123)
         set_rounder(4)
 
@@ -963,7 +971,10 @@ class TestEngineStepWithSuspend:
         random.seed(config.random_seed)
         torch.manual_seed(config.random_seed)
         model_parallel_cuda_manual_seed(
-            seed=config.random_seed, inference_rng_tracker=True, use_cudagraphable_rng=False, force_reset_rng=True
+            seed=config.random_seed,
+            inference_rng_tracker=True,
+            use_cudagraphable_rng=False,
+            force_reset_rng=True,
         )
 
         # Transformer config
@@ -1231,7 +1242,9 @@ class TestMemoryBehavior:
 
     def setup_method(self, method):
         """Setup model parallel for each test."""
-        Utils.initialize_model_parallel(tensor_model_parallel_size=1, pipeline_model_parallel_size=1)
+        Utils.initialize_model_parallel(
+            tensor_model_parallel_size=1, pipeline_model_parallel_size=1
+        )
         model_parallel_cuda_manual_seed(123)
         set_rounder(4)
 
@@ -1290,7 +1303,9 @@ class TestMemoryBehavior:
             request = DynamicInferenceRequest(
                 request_id=request_id,
                 prompt_tokens=prompt_tokens,
-                sampling_params=SamplingParams(num_tokens_to_generate=config.num_tokens_to_generate),
+                sampling_params=SamplingParams(
+                    num_tokens_to_generate=config.num_tokens_to_generate
+                ),
             )
             context.add_request(request)
 
@@ -1367,7 +1382,9 @@ class TestMemoryBehavior:
                 request = DynamicInferenceRequest(
                     request_id=request_id,
                     prompt_tokens=prompt_tokens,
-                    sampling_params=SamplingParams(num_tokens_to_generate=config.num_tokens_to_generate),
+                    sampling_params=SamplingParams(
+                        num_tokens_to_generate=config.num_tokens_to_generate
+                    ),
                 )
                 context.add_request(request)
 
@@ -1382,10 +1399,9 @@ class TestMemoryBehavior:
             force_gc()
             memory_after_cycle = get_gpu_memory_allocated()
 
-            cycle_memories.append({
-                'with_requests': memory_with_requests,
-                'after_cycle': memory_after_cycle,
-            })
+            cycle_memories.append(
+                {'with_requests': memory_with_requests, 'after_cycle': memory_after_cycle}
+            )
 
         # Check that memory is roughly consistent across cycles (allowing 10% variance)
         for i in range(1, len(cycle_memories)):
@@ -1404,7 +1420,9 @@ class TestTorchMemorySaverIntegration:
 
     def setup_method(self, method):
         """Setup model parallel for each test."""
-        Utils.initialize_model_parallel(tensor_model_parallel_size=1, pipeline_model_parallel_size=1)
+        Utils.initialize_model_parallel(
+            tensor_model_parallel_size=1, pipeline_model_parallel_size=1
+        )
         model_parallel_cuda_manual_seed(123)
         set_rounder(4)
 
@@ -1422,11 +1440,13 @@ class TestTorchMemorySaverIntegration:
         """Test that torch_memory_saver availability is properly detected."""
         try:
             from torch_memory_saver import torch_memory_saver
+
             has_tms = True
         except ImportError:
             has_tms = False
 
         from megatron.core.inference.contexts.dynamic_context import HAVE_TORCH_MEMORY_SAVER
+
         assert HAVE_TORCH_MEMORY_SAVER == has_tms
 
     @pytest.mark.internal
@@ -1437,6 +1457,7 @@ class TestTorchMemorySaverIntegration:
         """Test that persist_cuda_graphs without UVM requires torch_memory_saver."""
         try:
             from torch_memory_saver import torch_memory_saver
+
             # If torch_memory_saver is available, this should work
             config = SuspendTestConfig(
                 persist_cuda_graphs=True,
@@ -1498,7 +1519,9 @@ class TestEdgeCases:
 
     def setup_method(self, method):
         """Setup model parallel for each test."""
-        Utils.initialize_model_parallel(tensor_model_parallel_size=1, pipeline_model_parallel_size=1)
+        Utils.initialize_model_parallel(
+            tensor_model_parallel_size=1, pipeline_model_parallel_size=1
+        )
         model_parallel_cuda_manual_seed(123)
         set_rounder(4)
 
@@ -1648,7 +1671,9 @@ class TestTrackOffloadableTensors:
 
     def setup_method(self, method):
         """Setup model parallel for each test."""
-        Utils.initialize_model_parallel(tensor_model_parallel_size=1, pipeline_model_parallel_size=1)
+        Utils.initialize_model_parallel(
+            tensor_model_parallel_size=1, pipeline_model_parallel_size=1
+        )
         model_parallel_cuda_manual_seed(123)
         set_rounder(4)
 
@@ -1692,14 +1717,14 @@ class TestTrackOffloadableTensors:
         )
 
         # Verify that tracked tensors were recorded
-        assert len(context._offloadable_tensor_names) > 0, (
-            "Should have tracked tensors when using offload_kv_cache"
-        )
+        assert (
+            len(context._offloadable_tensor_names) > 0
+        ), "Should have tracked tensors when using offload_kv_cache"
 
         # Verify memory_buffer is among tracked tensors (it's the main KV cache)
-        assert 'memory_buffer' in context._offloadable_tensor_names, (
-            "memory_buffer should be tracked for offload"
-        )
+        assert (
+            'memory_buffer' in context._offloadable_tensor_names
+        ), "memory_buffer should be tracked for offload"
 
     @pytest.mark.internal
     @pytest.mark.skipif(
