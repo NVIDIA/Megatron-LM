@@ -38,6 +38,7 @@ class Net(nn.Module):
         x = self.fc3(x)
         return x
 
+
 class BigNet(nn.Module):
     def __init__(self):
         super().__init__()
@@ -58,6 +59,7 @@ class BigNet(nn.Module):
         x = F.relu(self.fc3(x))
         x = self.fc4(x)
         return x
+
 
 def setup_seed(seed):
     random.seed(seed)  # Set Python's built-in random seed
@@ -160,6 +162,7 @@ def test_multi_device_hybrid_optimizer(
             v, ref_params[k], atol=1e-03
         ), f"Weight {k} value mismatch, max error: {(v - ref_params[k]).abs().max()}"
 
+
 @pytest.mark.skipif(
     torch.__version__ < '2.3.0',
     reason=(
@@ -230,14 +233,14 @@ def test_overlap_cpu_optimizer_d2h_h2d_sync_correctness(
         if offload_fraction < 1:
             assert hdo.state_dict()["state"][last_param_id]["exp_avg"].is_cuda
 
-    inputs=[torch.randn(1, 3, 32, 32).cuda() for _ in range(1,n_steps)]
+    inputs = [torch.randn(1, 3, 32, 32).cuda() for _ in range(1, n_steps)]
     for i in range(1, n_steps):
-        output=net1(inputs[i-1])
+        output = net1(inputs[i - 1])
         output.sum().backward()
         hdo.step()
 
     for i in range(1, n_steps):
-        output=net2(inputs[i-1])
+        output = net2(inputs[i - 1])
         output.sum().backward()
         ref_optimizer.step()
 
