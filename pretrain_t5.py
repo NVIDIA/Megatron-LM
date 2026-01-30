@@ -140,6 +140,7 @@ def model_provider(
             rotary_percent=args.rotary_percent,
             relative_attention_num_buckets=args.relative_attention_num_buckets,
             relative_attention_max_distance=args.relative_attention_max_distance,
+            seq_len_interpolation_factor=args.seq_len_interpolation_factor,
             add_encoder=add_encoder,
             add_decoder=add_decoder,
         )
