@@ -167,8 +167,7 @@ def get_dynamic_inference_engine(
         cuda_graph_mixed_prefill_count=args.inference_dynamic_batching_cuda_graph_mixed_prefill_count,
         metrics_writer=metrics_writer,
         persist_cuda_graphs=not args.rl_reset_cuda_graphs,
-        offload_kv_cache=args.rl_offload_kv_cache_during_training,
-        remove_kv_cache=args.rl_remove_kv_cache_during_training,
+        kv_cache_management_mode=args.rl_kv_cache_management_mode,
     )
 
     inference_wrapped_model = GPTInferenceWrapper(model, args, inference_context, pg_collection=pg_collection)
@@ -251,7 +250,7 @@ class MegatronLocal(InferenceServer, ReturnsTokens, ReturnsRaw):
         tokenizer = get_tokenizer()
 
         self.partial_rollouts = args.rl_partial_rollouts
-        self.remove_kv_cache = args.rl_remove_kv_cache_during_training
+        self.kv_cache_management_mode = args.rl_kv_cache_management_mode
 
         if tokenizer.bos is None:
             log_single_rank(
@@ -316,7 +315,7 @@ class MegatronLocal(InferenceServer, ReturnsTokens, ReturnsRaw):
         Called before resume when using partial rollouts with KV cache removal,
         so the engine knows to recompute the KV cache for all in-flight requests.
         """
-        if self.partial_rollouts and self.remove_kv_cache:
+        if self.partial_rollouts and self.kv_cache_management_mode == "remove":
             for request_entry in self._inference_engine.requests.values():
                 request_entry.recompute_soon = True
 

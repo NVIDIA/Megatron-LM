@@ -497,8 +497,6 @@ def get_environment_rollouts(
             args.cuda_graph_impl,
             args.rl_training_cuda_graphs,
             False, # offload optimizer during rollout collection is handled above
-            args.rl_offload_kv_cache_during_training,
-            args.rl_remove_kv_cache_during_training,
         ) as inference_interface:
 
             with nvtx_range("inference-setup"):
@@ -1432,8 +1430,6 @@ def evaluate_and_print_results_rl(
             args.cuda_graph_impl,
             args.rl_training_cuda_graphs,
             args.rl_offload_optimizer_during_inference,
-            args.rl_offload_kv_cache_during_training,
-            args.rl_remove_kv_cache_during_training,
         ) as inference_interface:
 
             loop = get_asyncio_loop()
@@ -1616,8 +1612,6 @@ def megatron_rl_inference_mode(
     cuda_graph_impl: str,
     training_cuda_graphs: bool,
     offload_optimizer_during_inference: bool,
-    offload_kv_cache_during_training: bool,
-    remove_kv_cache_during_training: bool,
 ):
     """Manage the model inference context when collecting rollouts.
 
@@ -1626,8 +1620,6 @@ def megatron_rl_inference_mode(
         optimizer: optimizer used to train the model.
         cuda_graph_impl: which cuda graph implementation to use.
         offload_optimizer_during_inference: move optimizer to cpu during inference or not.
-        offload_kv_cache_during_training: manually offload kv cache to host before training or not.
-        remove_kv_cache_during_training: manually remove kv cache before training or not.
 
     Yields:
         None: this context manager does not return a value.

@@ -344,36 +344,28 @@ def validate_args(args, defaults={}):
                     "--rl-persist-cuda-graphs requires either torch_memory_saver or "
                     "--inference-dynamic-batching-unified-memory-level > 0."
                 )
-            # If we persist both training and inference CGs, and do not offload or remove the KV$,
+            # If we persist both training and inference CGs, and keep the KV$,
             # then we use more memory than expected in both training and inference.
             if (
                 args.cuda_graph_impl != "none" and \
                 args.rl_training_cuda_graphs and \
-                not args.rl_offload_kv_cache_during_training and \
-                not args.rl_remove_kv_cache_during_training
+                args.rl_kv_cache_management_mode == "keep"
             ):
                 warn_rank_0(
                     "Both training and inference CUDA graphs are enabled, and persist. "
-                    "The KV$ is neither offloaded nor deleted. This combination of "
+                    "The KV$ is kept in GPU memory. This combination of "
                     "arguments will lead to severe memory pressure and should be avoided."
                 )
 
         # Offloading the KV$ is technically what UVM does.
         # Having both arguments active does not cause any issues, but should be avoided.
-        if args.rl_offload_kv_cache_during_training:
+        if args.rl_kv_cache_management_mode == "offload":
             if args.inference_dynamic_batching_unified_memory_level > 0:
                 warn_rank_0(
                     "--inference-dynamic-batching-unified-memory-level and "
-                    "--rl-offload-kv-cache-during-training are both set. "
+                    "--rl-kv-cache-management-mode=offload are both set. "
                     "This will not cause issues currently, but it is not recommended or supported."
                 )
-        # We definitely cannot remove the KV$ if we are offloading it.
-            assert not args.rl_remove_kv_cache_during_training, (
-                "Cannot use both --rl-remove-kv-cache-during-training and "
-                "--rl-offload-kv-cache-during-training."
-            )
-        # Due to KV$ recomputation we can have partial rollouts and KV$ removal.
-        # We just assert that every single request record is marked for recomputation.
         # ------------------------------------------------
         # CGs are handled as follows:
         #  - The inference engine's init builds inference CGs, if desired.
@@ -390,21 +382,21 @@ def validate_args(args, defaults={}):
         #  - The context ensures that the CGs still point to the correct memory addresses.
         #    ** This is attempted through UVM if enabled, otherwise through `torch_memory_saver`.
         #
-        # KV$ management is handled as follows:
+        # KV$ management is handled as follows (controlled by `--rl-kv-cache-management-mode`):
         #  - The context initially allocates the KV$, either with or without UVM.
         #    ** This is controlled by `--inference-dynamic-batching-unified-memory-level`.
         #  - When RL is finished with inference, it suspends the engine.
         #    ** With `--rl-partial-rollouts`, it expects the engine to freeze its state.
-        #  - Suspending the engine makes the context handle the KV$ according to the arguments:
-        #    ** With `--rl-offload-kv-cache-during-training`, the KV$ is offloaded to CPU memory.
-        #    ** With `--rl-remove-kv-cache-during-training`, the KV$ is deleted.
-        #    ** With neither argument, it no-ops, leaving the KV$ as-is.
+        #  - Suspending the engine makes the context handle the KV$ according to the mode:
+        #    ** "offload": the KV$ is offloaded to CPU memory.
+        #    ** "remove": the KV$ is deleted.
+        #    ** "keep": no-op, leaving the KV$ as-is.
         #  - When RL is finished with training, it resumes the engine.
         #    ** With `--rl-partial-rollouts`, it expects the engine to resume its state.
-        #  - Resuming the engine makes the context restore/rebuild the KV$.
-        #    ** With `--rl-offload-kv-cache-during-training`, the KV$ is reloaded from CPU memory.
-        #    ** With `--rl-remove-kv-cache-during-training`, the KV$ is reallocated.
-        #    ** With neither argument, it no-ops, leaving the KV$ as-is.
+        #  - Resuming the engine makes the context restore/rebuild the KV$:
+        #    ** "offload": the KV$ is reloaded from CPU memory.
+        #    ** "remove": the KV$ is reallocated.
+        #    ** "keep": no-op, leaving the KV$ as-is.
         #  - The engine proceeds to recompute the KV$ of any request records marked as "recompute".
         #    ** If using both partial rollouts and KV$ removal, "recompute" must mark all requests.
         # ------------------------------------------------
@@ -2049,10 +2041,12 @@ def _add_rl_args(parser):
                        help="Default top-k for model inference.")
     group.add_argument('--rl-offload-optimizer-during-inference', action='store_true',
                        help='Offload optimizer state to CPU during inference/rollout to save GPU memory')
-    group.add_argument('--rl-offload-kv-cache-during-training', action=argparse.BooleanOptionalAction, default=False,
-                       help='Offload KV cache to CPU during training to save GPU memory')
-    group.add_argument('--rl-remove-kv-cache-during-training', action=argparse.BooleanOptionalAction, default=False,
-                       help='Remove KV cache during training to save GPU memory')
+    group.add_argument('--rl-kv-cache-management-mode', type=str, default='keep',
+                       choices=['keep', 'offload', 'remove'],
+                       help='KV cache management mode during RL training: '
+                            'keep: leave KV cache in GPU memory (default), '
+                            'offload: offload KV cache to CPU during training, '
+                            'remove: delete and reallocate KV cache each training/inference cycle')
     group.add_argument('--rl-reset-cuda-graphs', action=argparse.BooleanOptionalAction, type=bool, default=False,
                        help='Reset CUDA graphs between inference/training to save GPU memory')
     group.add_argument('--rl-training-cuda-graphs', action=argparse.BooleanOptionalAction, type=bool,

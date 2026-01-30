@@ -85,7 +85,7 @@ MODEL_ARGS:
   --grpo-entropy-term-weight: 0.0
   --langrl-env-config: tests/functional_tests/test_cases/gpt/gpt_grpo_tp4_pp1_dp2_8b_suspend_offload_kv/env_config.yaml
   --rl-partial-rollouts: true
-  --rl-offload-kv-cache-during-training: true
+  --rl-kv-cache-management-mode: offload
   --use-checkpoint-args: true
   --dist-ckpt-strictness: log_unexpected
   --perform-rl-step: true
