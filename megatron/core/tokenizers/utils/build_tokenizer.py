@@ -75,6 +75,8 @@ def build_tokenizer(args, **kwargs):
         if args.vocab_size:
             kwargs['vocab_size'] = args.vocab_size
         tokenizer = MegatronTokenizer.from_pretrained(metadata_path=metadata, **kwargs)
+
+        # Add vocab size (if not already set from a checkpoint).
         _set_padded_vocab_size(args, tokenizer)
 
         return tokenizer
@@ -86,6 +88,8 @@ def build_tokenizer(args, **kwargs):
     tokenizer = MegatronTokenizer.from_pretrained(
         tokenizer_path=tokenizer_path, metadata_path=metadata, **kwargs
     )
+
+    # Add vocab size (if not already set from a checkpoint).
     _set_padded_vocab_size(args, tokenizer)
 
     return tokenizer
@@ -108,6 +112,6 @@ def vocab_size_with_padding(orig_vocab_size, args, logging_enabled=True):
 
 
 def _set_padded_vocab_size(args, tokenizer):
-    # Add vocab size (if not already set from a checkpoint).
+    """Sets padded vocab size if None."""
     if getattr(args, "padded_vocab_size", None) is None:
         args.padded_vocab_size = vocab_size_with_padding(tokenizer.vocab_size, args)
