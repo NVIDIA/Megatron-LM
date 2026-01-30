@@ -425,9 +425,11 @@ class DynamicInferenceContext(BaseInferenceContext):
         self.unified_memory_level = unified_memory_level
         self.persist_cuda_graphs = persist_cuda_graphs
         # KV cache management mode: "persist", "offload", or "remove"
-        assert kv_cache_management_mode in ("persist", "offload", "remove"), (
-            f"Invalid kv_cache_management_mode: {kv_cache_management_mode}"
-        )
+        assert kv_cache_management_mode in (
+            "persist",
+            "offload",
+            "remove",
+        ), f"Invalid kv_cache_management_mode: {kv_cache_management_mode}"
         self.kv_cache_management_mode = kv_cache_management_mode
 
         if unified_memory_level > 0:
