@@ -329,27 +329,27 @@ if __name__ == "__main__":
             "--force-all-expert-routing will be deprecated in the next release and is no longer needed."
         )
 
-    if args.export_quant_cfg is not None:
-        if args.export_quant_cfg not in QUANT_CFG_CHOICES:
-            raise ValueError(f"Unsupported quantization config {args.export_quant_cfg}.")
-        print_rank_0("Quantizing the model...")
-        mtq_config = get_modelopt_torch_quantization_config()
-        ptq_forward_loop_func = _hf_dataset_forword_loop_func
+    #if args.export_quant_cfg is not None:
+    #    if args.export_quant_cfg not in QUANT_CFG_CHOICES:
+    #        raise ValueError(f"Unsupported quantization config {args.export_quant_cfg}.")
+    #    print_rank_0("Quantizing the model...")
+    #    mtq_config = get_modelopt_torch_quantization_config()
+    #    ptq_forward_loop_func = _hf_dataset_forword_loop_func
 
-        if args.weight_only:
-            mtq.quantize(unwrapped_model, mtq_config)
-        elif hasattr(unwrapped_model, "calibration_mode"):
-            unwrapped_model.calibration_mode = True
-            mtq.quantize(unwrapped_model, mtq_config, ptq_forward_loop_func)
-            unwrapped_model.calibration_mode = False
-        else:
-            mtq.quantize(unwrapped_model, mtq_config, ptq_forward_loop_func)
+    #    if args.weight_only:
+    #        mtq.quantize(unwrapped_model, mtq_config)
+    #    elif hasattr(unwrapped_model, "calibration_mode"):
+    #        unwrapped_model.calibration_mode = True
+    #        mtq.quantize(unwrapped_model, mtq_config, ptq_forward_loop_func)
+    #        unwrapped_model.calibration_mode = False
+    #    else:
+    #        mtq.quantize(unwrapped_model, mtq_config, ptq_forward_loop_func)
 
-        if args.compress:
-            mtq.compress(unwrapped_model)
-            print_rank_0("Weights are now compressed to low-bit!")
+    #    if args.compress:
+    #        mtq.compress(unwrapped_model)
+    #        print_rank_0("Weights are now compressed to low-bit!")
 
-        print_distributed_quant_summary(model, "Quantized Model:")
+    #    print_distributed_quant_summary(model, "Quantized Model:")
 
     _custom_prompt_forward_loop_func(unwrapped_model)
 
