@@ -16,6 +16,7 @@ from megatron.core.transformer.utils import (
     make_sharded_tensors_for_checkpoint,
     sharded_state_dict_default,
 )
+from megatron.core.process_groups_config import ProcessGroupCollection
 
 _FLOAT_TYPES = (torch.FloatTensor, torch.cuda.FloatTensor)
 _HALF_TYPES = (torch.HalfTensor, torch.cuda.HalfTensor)
@@ -162,9 +163,9 @@ class GraphableMegatronModule(MegatronModule):
         config (TransformerConfig): Transformer config
     """
 
-    def __init__(self, config: TransformerConfig, vp_stage: Optional[int] = None):
+    def __init__(self, config: TransformerConfig, vp_stage: Optional[int] = None, pg_collection: Optional[ProcessGroupCollection] = None):
         super().__init__(config)
-
+        self.pg_collection = pg_collection
         assert isinstance(config, TransformerConfig), "config must be a TransformerConfig"
 
         # Enable cuda graphs.
@@ -174,7 +175,7 @@ class GraphableMegatronModule(MegatronModule):
             else:
                 from megatron.core.transformer.cuda_graphs import CudaGraphManager
 
-                self.cudagraph_manager = CudaGraphManager(config)
+                self.cudagraph_manager = CudaGraphManager(config, pg_collection=pg_collection)
         elif config.cuda_graph_impl == "transformer_engine":
             # List to store CUDA graphs. A list of `N` CUDA graphs for this layer where N is
             # the number of microbatches. Multiple CUDA graphs per layer is required to support

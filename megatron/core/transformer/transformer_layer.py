@@ -270,10 +270,10 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
         vp_stage: Optional[int] = None,
     ):
         self.submodules_config = submodules
-        super().__init__(config=config, vp_stage=vp_stage)
-
         if pg_collection is None:
             pg_collection = ProcessGroupCollection.use_mpu_process_groups()
+        super().__init__(config=config, vp_stage=vp_stage, pg_collection=pg_collection)
+
         self.pg_collection = pg_collection
         self.tp_group = pg_collection.tp
 
@@ -471,19 +471,19 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
 
         # If full scope, just cudagraph the entire layer
         if not self.config.cuda_graph_scope:
-            self.cudagraph_manager = CudaGraphManager(config)
+            self.cudagraph_manager = CudaGraphManager(config, pg_collection=self.pg_collection)
         elif (
             CudaGraphScope.attn in self.config.cuda_graph_scope
             and self.submodules_config.self_attention != IdentityOp
         ):
-            self.cudagraph_manager = CudaGraphManager(config)
+            self.cudagraph_manager = CudaGraphManager(config, pg_collection=self.pg_collection)
         elif (
             CudaGraphScope.mlp in self.config.cuda_graph_scope
             and self.submodules_config.mlp != IdentityOp
         ):
             # Cudagraphing MoE layers are supposed handled by MoeTransforerLayer
             assert not self.is_moe_layer
-            self.cudagraph_manager = CudaGraphManager(config)
+            self.cudagraph_manager = CudaGraphManager(config, pg_collection=self.pg_collection)
 
     @staticmethod
     def _get_layer_offset(config: TransformerConfig):

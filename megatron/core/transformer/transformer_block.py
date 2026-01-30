@@ -276,7 +276,7 @@ class TransformerBlock(GraphableMegatronModule, MegatronModule):
         pg_collection: Optional[ProcessGroupCollection] = None,
         vp_stage: Optional[int] = None,
     ):
-        super().__init__(config=config)
+        super().__init__(config=config, pg_collection=pg_collection, vp_stage=vp_stage)
 
         if pg_collection is None:
             pg_collection = ProcessGroupCollection.use_mpu_process_groups()
