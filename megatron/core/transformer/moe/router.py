@@ -462,7 +462,8 @@ class TopKRouter(Router):
             # To correct this scaling, we need to scale the aux_loss by num_local_tokens here.
             # Use valid_token_count (excluding padding) if provided, otherwise use total tokens.
             num_tokens = valid_token_count if valid_token_count is not None else activation.shape[0]
-            activation = MoEAuxLossAutoScaler.apply(activation, aux_loss * num_tokens)
+            # TODO: update above comments
+            activation = MoEAuxLossAutoScaler.apply(activation, self.tp_cp_group.size() * aux_loss * num_tokens)
         else:
             activation = MoEAuxLossAutoScaler.apply(activation, aux_loss)
         return activation
