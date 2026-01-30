@@ -32,7 +32,6 @@ except ImportError:
 
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "../../../")))
 
-from megatron.core.transformer.moe.router import TopKRouter
 from megatron.post_training.arguments import add_modelopt_args
 from megatron.post_training.checkpointing import load_modelopt_checkpoint
 from megatron.post_training.generate import simple_generate
@@ -75,7 +74,7 @@ def add_text_generate_ptq_args(parser):
     """Add additional arguments for ModelOpt text generation PTQ."""
     group = parser.add_argument_group(title="ModelOpt text generation ptq")
     group.add_argument(
-        "--calib-size", type=int, default=512, help="Samples to use for ptq calibration."
+        "--calib-size", type=int, default=512, help="Number of samples to use for ptq calibration."
     )
     group.add_argument(
         "--calib-dataset-path-or-name",
@@ -261,57 +260,42 @@ def get_modelopt_torch_quantization_config():
 
 def get_calib_dataloader(
     dataset_path_or_name,
+    tokenizer,
     calib_size=512,
     max_sequence_length=512,
     use_random_offset=False,
-    tokenizer=None,
 ):
     """Return a dataloader/iterator for calibration using SFT or HF datasets.
 
     Supports either a local path (.jsonl) or a HuggingFace dataset name.
-
-    Args:
-        dataset_path_or_name (str): Local path to json/jsonl or HuggingFace dataset name.
-        calib_size (int): Number of calibration samples to yield.
-        max_sequence_length (int): Maximum number of tokens in sequence.
-        use_random_offset (bool): Whether to start sequence at random offsets. Default: False.
-        tokenizer (Tokenizer): Tokenizer to use for tokenization.
-
-    Yields:
-        torch.Tensor: input_ids tensor of shape (seq_len,) ready for model input.
     """
     if os.path.isfile(dataset_path_or_name):
         # Local file
         print_rank_0(f"Loading calibration dataset from local file: {dataset_path_or_name}")
-        try:
-            with open(dataset_path_or_name) as f:
-                dataset = [json.loads(line) for line in f if line.strip()]
-        except Exception as e:
-            raise ValueError(f"Error reading jsonl file: {dataset_path_or_name}\n{e}")
+        with open(dataset_path_or_name) as f:
+            dataset = []
+            for i, line in enumerate(f):
+                if i >= calib_size:
+                    break
+                sample = json.loads(line)
+                # Extract text field from various possible keys
+                if isinstance(sample, dict) and "text" in sample:
+                    dataset.append(sample["text"])
+                elif isinstance(sample, list) and isinstance(sample[0], dict):
+                    assert "role" in sample[0] and "content" in sample[0]
+                    dataset.append("".join([f"{msg['role']}: {msg['content']}" for msg in sample]))
+                else:
+                    raise ValueError(f"Sample {i} has unexpected format: {sample!r}")
 
         print_rank_0(f"Loaded calibration dataset ({dataset_path_or_name}) with {len(dataset)} samples")
-        calib_size = min(len(dataset), calib_size)
-        print_rank_0(f"Calibration will run for {calib_size} steps with {max_sequence_length} max seq length")
+        print_rank_0(f"Actual num samples: {min(len(dataset), calib_size)}, max seq length: {max_sequence_length}")
         print_rank_0(f"Sampling Strategy: {'Random Index' if use_random_offset else 'From Beginning'}")
 
-        for i in range(calib_size):
-            sample = dataset[i]
-            # Extract text field from various possible keys
-            if isinstance(sample, dict) and "text" in sample:
-                full_text = sample["text"]
-            elif isinstance(sample, list) and isinstance(sample[0], dict):
-                assert "role" in sample[0] and "content" in sample[0]
-                # Sample looks like [{"role": "A", "content": "..."}, {"role": "B", "content": "..."}, ...]
-                # Concatenate them into single string i.e. "A: ...B: ..."
-                full_text = "".join([f"{msg['role']}: {msg['content']}" for msg in sample])
-            else:
-                raise ValueError(f"Sample {i} has unexpected format: {sample!r}")
-
-            start_idx = 0
-            # Check if sequence is long enough to be sliced
+        for full_text in dataset:
             if use_random_offset and len(full_text) > max_sequence_length:
                 start_idx = random.randint(0, len(full_text) - max_sequence_length)
-
+            else:
+                start_idx = 0
             text = full_text[start_idx : start_idx + max_sequence_length]
             tokens = tokenizer(text, return_tensors="pt")
             yield tokens["input_ids"].cuda()
@@ -388,10 +372,10 @@ if __name__ == "__main__":
     def _dataset_forward_loop_func(model):
         dataloader = get_calib_dataloader(
             dataset_path_or_name=args.calib_dataset_path_or_name,
+            tokenizer=tokenizer,
             calib_size=args.calib_size,
             max_sequence_length=args.calib_max_sequence_length,
             use_random_offset=args.calib_use_random_offset,
-            tokenizer=tokenizer,
         )
         for input_ids in tqdm(dataloader, total=args.calib_size, disable=torch.distributed.get_rank()):
             _ = simple_generate(model, input_ids, osl=1)
