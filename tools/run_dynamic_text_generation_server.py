@@ -13,7 +13,7 @@ from examples.inference.gpt.gpt_dynamic_inference import (
 )
 from megatron.core.inference.engines import DynamicInferenceEngine
 from megatron.core.inference.text_generation_server.dynamic_text_gen_server import run_flask_server
-from megatron.core.tokenizers.text.utils.build_tokenizer import build_tokenizer
+from megatron.core.tokenizers.utils.build_tokenizer import build_tokenizer
 from megatron.core.utils import get_mamba_inference_state_config_from_model, trace_async_exceptions
 from megatron.post_training.arguments import add_modelopt_args
 from megatron.training import get_args, get_tokenizer
@@ -77,10 +77,8 @@ if __name__ == "__main__":
         args = get_args()
         model = get_model()
 
-        if args.legacy_tokenizer:
-            tokenizer = get_tokenizer()
-        else:
-            tokenizer = build_tokenizer(args)
+        # Build tokenizer
+        tokenizer = build_tokenizer(args)
 
         mamba_inference_state_config = get_mamba_inference_state_config_from_model(model)
 

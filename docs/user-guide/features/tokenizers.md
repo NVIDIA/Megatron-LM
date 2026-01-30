@@ -141,7 +141,7 @@ Use a null tokenizer for testing or non-text models:
 
 ```python
 tokenizer = MegatronTokenizer.from_pretrained(
-    metadata_path={"library": "null"},
+    metadata_path={"library": "null-text"},
     vocab_size=131072,
 )
 ```
@@ -172,16 +172,6 @@ torchrun --nproc_per_node=8 pretrain_gpt.py \
 ### Auto-Generated Metadata
 
 If `--tokenizer-metadata` is not specified, a default metadata file is generated automatically based on the tokenizer type.
-
-### Legacy Tokenizer Support
-
-The old tokenizer system is still supported for backward compatibility:
-
-```bash
-torchrun --nproc_per_node=8 pretrain_gpt.py \
-    --legacy-tokenizer \
-    ...
-```
 
 ## Supported Tokenizer Libraries
 

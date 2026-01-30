@@ -43,7 +43,7 @@ from megatron.core.inference.sampling_params import SamplingParams
 from megatron.core.inference.text_generation_controllers.text_generation_controller import (
     TextGenerationController,
 )
-from megatron.core.tokenizers.text.utils.build_tokenizer import build_tokenizer
+from megatron.core.tokenizers.utils.build_tokenizer import build_tokenizer
 from megatron.core.transformer.module import MegatronModule
 from megatron.core.utils import get_mamba_inference_state_config_from_model
 
@@ -211,10 +211,9 @@ def get_inference_controller(
     """
 
     args = get_args()
-    if args.legacy_tokenizer:
-        tokenizer = get_tokenizer()
-    else:
-        tokenizer = build_tokenizer(args)
+
+    # Build tokenizer
+    tokenizer = build_tokenizer(args)
 
     # Wrap model in inference wrapper.
     model = GPTInferenceWrapper(model, args, context)
@@ -436,10 +435,9 @@ def main():
     configure_nvtx_profiling(True)
 
     args = get_args()
-    if args.legacy_tokenizer:
-        tokenizer = get_tokenizer()
-    else:
-        tokenizer = build_tokenizer(args)
+
+    # Build tokenizer
+    tokenizer = build_tokenizer(args)
 
     # Reset peak memory stats so functional tests measure this run and not
     # whatever happened earlier during initialization.
