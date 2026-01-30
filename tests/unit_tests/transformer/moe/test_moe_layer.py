@@ -306,7 +306,9 @@ class TestMoELayerRecompute:
         if fp8 and not is_te_min_version("1.7.0.dev0"):
             pytest.skip("FP8 MoE recompute requires TE 1.7.0 and later.")
 
-        Utils.initialize_model_parallel(tensor_model_parallel_size=tp_size, expert_model_parallel_size=ep_size)
+        Utils.initialize_model_parallel(
+            tensor_model_parallel_size=tp_size, expert_model_parallel_size=ep_size
+        )
         _set_random_seed(seed_=123, data_parallel_random_init=False)
 
         hidden_size = 64
@@ -363,16 +365,15 @@ class TestMoELayerRecompute:
         # Create padding mask if needed: shape [batch_size, sequence_length]
         padding_mask = None
         if with_padding_mask:
-            # Mark some tokens as padding (False means padding)
             padding_mask = torch.ones(
-                micro_batch_size, sequence_length,
+                micro_batch_size,
+                sequence_length,
                 device=torch.cuda.current_device(),
                 dtype=torch.bool,
             )
             # Mark last 4 tokens as padding for each batch
             padding_mask[:, -4:] = False
 
-        # Forward pass
         output, _ = moe_layer(hidden_states, padding_mask=padding_mask)
 
         assert output.dtype == torch.bfloat16, f"Expected bf16 output, got {output.dtype}"
