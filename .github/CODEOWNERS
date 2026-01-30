@@ -47,11 +47,11 @@ tests/test_utils/recipes/ @NVIDIA/ci
 tests/unit_tests/run_ci_test.sh @NVIDIA/ci
 
 # API Backwards Compatibility Check
-scripts/check_api_backwards_compatibility.py @NVIDIA/ci @pablo-garay
-scripts/README_API_COMPAT.md @NVIDIA/ci @pablo-garay
-.github/workflows/check_api_backwards_compatibility_workflow.yml @NVIDIA/ci @pablo-garay
-docs/api-backwards-compatibility-check.md @NVIDIA/ci @pablo-garay
-tests/unit_tests/test_api_backwards_compat_setup.py @NVIDIA/ci @pablo-garay
+scripts/check_api_backwards_compatibility.py @NVIDIA/ci
+scripts/README_API_COMPAT.md @NVIDIA/ci
+.github/workflows/check_api_backwards_compatibility_workflow.yml @NVIDIA/ci
+docs/api-backwards-compatibility-check.md @NVIDIA/ci
+tests/unit_tests/test_api_backwards_compat_setup.py @NVIDIA/ci
 
 megatron/rl/ @NVIDIA/reinforcement-learning
 examples/rl/ @NVIDIA/reinforcement-learning

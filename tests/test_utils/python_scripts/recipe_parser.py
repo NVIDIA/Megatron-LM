@@ -39,14 +39,25 @@ def resolve_cluster_config(cluster: str) -> str:
 
 def flatten_products(workload_manifest: dotdict) -> dotdict:
     """Flattens a nested dict of products"""
-    workload_manifest.products = [
-        dict(**dict(zip(inp.keys(), values)), **{"test_case": product["test_case"][0]})
-        for product in (workload_manifest.products or [])
-        if "products" in product
-        for inp in product["products"]
-        for values in itertools.product(*inp.values())
-    ]
+    flattened_products = []
+    products = workload_manifest.products or []
 
+    for product in products:
+        if "products" not in product:
+            continue
+
+        test_case = product["test_case"][0]
+        for param_dict in product["products"]:
+            # Generate all combinations of parameter values
+            param_combinations = itertools.product(*param_dict.values())
+
+            for value_combination in param_combinations:
+                # Map parameter names to their values
+                flattened = dict(zip(param_dict.keys(), value_combination))
+                flattened["test_case"] = test_case
+                flattened_products.append(flattened)
+
+    workload_manifest.products = flattened_products
     return workload_manifest
 
 
@@ -223,14 +234,13 @@ def load_workloads(
 
     workloads: List[dotdict] = []
     build_workloads: List = []
-    for file in list(recipes_dir.glob("*.yaml")) + list(local_dir.glob("*.yaml")):
+    for file in list(recipes_dir.glob("**/*.yaml")) + list(local_dir.glob("**/*.yaml")):
         workloads += load_and_flatten(config_path=str(file))
         if file.stem.startswith("_build"):
             build_workloads.append(load_config(config_path=str(file)))
 
     if scope:
         workloads = filter_by_scope(workload_manifests=workloads, scope=scope)
-
     if workloads and environment:
         workloads = filter_by_environment(workload_manifests=workloads, environment=environment)
 

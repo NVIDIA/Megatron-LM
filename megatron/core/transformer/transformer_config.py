@@ -1,7 +1,7 @@
 # Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
 import warnings
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Callable, List, Literal, Optional, Tuple, Union
 
 import torch
@@ -42,14 +42,22 @@ class TransformerConfig(ModelParallelConfig):
     # model architecture
     ####################
 
-    num_layers: int = 0
+    num_layers: int = field(default=0, metadata={"argparse_meta": {"default": None}})
     """Number of transformer layers in a transformer block."""
 
     mtp_num_layers: Optional[int] = None
-    """Number of Multi-Token Prediction (MTP) Layers."""
+    """Number of Multi-Token Prediction (MTP) Layers.
+    MTP extends the prediction scope to multiple future tokens at each position.
+    This MTP implementation sequentially predict additional tokens
+    by using D sequential modules to predict D additional tokens.
+    """
 
-    mtp_loss_scaling_factor: Optional[float] = None
-    """Weighting factor of Multi-Token Prediction (MTP) loss."""
+    mtp_loss_scaling_factor: Optional[float] = 0.1
+    """Weighting factor of Multi-Token Prediction (MTP) loss.
+    We compute the average of the MTP losses across all depths, 
+    and multiply it the scaling factor to obtain the overall MTP loss, 
+    which serves as an additional training objective.
+    """
 
     num_layers_in_first_pipeline_stage: Optional[int] = None
     """Number of transformer layers on first pipeline stage.
@@ -93,10 +101,10 @@ class TransformerConfig(ModelParallelConfig):
     """If set, the loss layer will be treated as a standard transformer
     layer in the context of partition and placement for pipeline parallelism."""
 
-    hidden_size: int = 0
+    hidden_size: int = field(default=0, metadata={"argparse_meta": {"default": None}})
     """Transformer hidden size."""
 
-    num_attention_heads: int = 0
+    num_attention_heads: int = field(default=0, metadata={"argparse_meta": {"default": None}})
     """Number of transformer attention heads."""
 
     attention_backend: AttnBackend = AttnBackend.auto
@@ -113,7 +121,9 @@ class TransformerConfig(ModelParallelConfig):
        Supports both TE FusedAttention and local unfused attention. Supports both a fixed offset and 
        and learnable offset."""
 
-    num_query_groups: Optional[int] = None
+    num_query_groups: Optional[int] = field(
+        default=None, metadata={"argparse_meta": {"default": 1}}
+    )
     """Number of query groups for group query attention. If None, normal attention is used."""
 
     ffn_hidden_size: Optional[int] = None
@@ -137,16 +147,22 @@ class TransformerConfig(ModelParallelConfig):
     apply_residual_connection_post_layernorm: bool = False
     """If True, uses the original BERT residule connection ordering."""
 
-    layernorm_epsilon: float = 1e-5
-    """Epsilon value for any LayerNorm operations."""
+    layernorm_epsilon: float = field(
+        default=1e-5, metadata={"argparse_meta": {"arg_names": ["--norm-epsilon"]}}
+    )
+    """Epsilon value for any LayerNorm/RMSNorm operations."""
 
-    layernorm_zero_centered_gamma: bool = False
+    layernorm_zero_centered_gamma: bool = field(
+        default=False, metadata={"argparse_meta": {"arg_names": ["--apply-layernorm-1p"]}}
+    )
     """If set to True, the LayerNorm is adjusted to center the gamma values around 0. This improves
     numerical stability."""
 
-    add_bias_linear: bool = True
-    """Include a bias term in all linear layers (QKV projections, after core attention, and two in
-    MLP layer)."""
+    add_bias_linear: bool = field(
+        default=True, metadata={"argparse_meta": {"arg_names": ["--disable-bias-linear"]}}
+    )
+    """Include/exclude a bias term in all linear layers (QKV projections, after core attention,
+    and two in MLP layer)."""
 
     add_qkv_bias: bool = False
     """Add a bias term only for QKV projections."""
@@ -186,7 +202,7 @@ class TransformerConfig(ModelParallelConfig):
     - An integer N: Represents a (N-1):1 ratio, one full attention layer after (N-1) SWA layers.
     - A list that defines a custom pattern, e.g.: [1,1,1,1,0,0,0,0], where 1 represents SWA. """
 
-    normalization: str = "LayerNorm"
+    normalization: Literal['LayerNorm', 'RMSNorm'] = "LayerNorm"
     """Which norm to use for normalization layers, valid options are `LayerNorm` and `RMSNorm`."""
 
     qk_layernorm: bool = False
@@ -231,7 +247,7 @@ class TransformerConfig(ModelParallelConfig):
     ####################
     # attention variant
     ####################
-    experimental_attention_variant: Optional[str] = None
+    experimental_attention_variant: Optional[Literal['gated_delta_net', 'dsa']] = None
     """Type of attention variant to use. Currently support gated_delta_net and dsa."""
 
     ####################
@@ -263,19 +279,19 @@ class TransformerConfig(ModelParallelConfig):
     - An integer N: Represents a (N-1):N ratio, meaning (N-1) LA layers for every 1 SDPA layer
     - A list that defines a custom pattern, e.g.: [1,1,1,0,1,1,1,0,1,1,1,0]"""
 
-    linear_conv_kernel_dim: Optional[int] = None
+    linear_conv_kernel_dim: Optional[int] = 4
     """Conv kernel dimension for the gated delta net."""
 
-    linear_key_head_dim: Optional[int] = None
+    linear_key_head_dim: Optional[int] = 128
     """Query and key head dimension for the gated delta net."""
 
-    linear_value_head_dim: Optional[int] = None
+    linear_value_head_dim: Optional[int] = 128
     """Value and gate head dimension for the gated delta net."""
 
-    linear_num_key_heads: Optional[int] = None
+    linear_num_key_heads: Optional[int] = 16
     """Number of query and key heads for the gated delta net."""
 
-    linear_num_value_heads: Optional[int] = None
+    linear_num_value_heads: Optional[int] = 32
     """Number of value and gate heads for the gated delta net."""
 
     ####################
@@ -305,7 +321,10 @@ class TransformerConfig(ModelParallelConfig):
     embedding_init_method_std: Optional[float] = None
     """
     Standard deviation of the zero mean normal for the default initialization method for the 
-    embedding layer. If None, will be set to init_method_std.
+    embedding layer. If None, will be set to init_method_std. Setting this to a value around
+    1.0 may avoid loss spikes in training. Setting this to any value will also skip applying
+    weight decay on embedding weights to avoid shrinkage towards zero.
+    See https://arxiv.org/abs/2312.16903 for more details.
     """
 
     init_model_with_meta_device: bool = False
@@ -319,7 +338,7 @@ class TransformerConfig(ModelParallelConfig):
     ####################
     apply_query_key_layer_scaling: bool = False
     """If true, scale Q * K^T by 1 / layer-number. This improve numeric stability when training with
-    fp16."""
+    fp16. Also sets `attention_softmax_in_fp32` to True."""
 
     attention_softmax_in_fp32: bool = True
     """If True, run attention masking and softmax in fp32. This should be True if
@@ -361,7 +380,7 @@ class TransformerConfig(ModelParallelConfig):
     ####################
     # activation recomputation
     ####################
-    recompute_granularity: Optional[str] = None
+    recompute_granularity: Optional[Literal['full', 'selective']] = None
     """Determines which type of activation recompute to use.  Megatron-core supports 'selective'
     activation checkpointing where the submodules set in --recompute-modules is checkpointed.
     The default is "core_attn" which is the memory intensive part of attention.
@@ -372,7 +391,7 @@ class TransformerConfig(ModelParallelConfig):
     If set, must be 'selective' or 'full'. 'selective' always uses all layers.
     """
 
-    recompute_method: Optional[str] = None
+    recompute_method: Optional[Literal['uniform', 'block']] = None
     """Determines which transformer layers will be recomputed. uniform will uniformly divide the
     total number of transformer layers in a transformer block and recompute the input activation of
     each divided chunk at the specified granularity.  block will recompute the input activations for
@@ -386,7 +405,7 @@ class TransformerConfig(ModelParallelConfig):
     the number of transformer layers to recompute within each pipeline stage.  Must be None for
     'selective' activation checkpointing."""
 
-    distribute_saved_activations: Optional[bool] = None
+    distribute_saved_activations: Optional[bool] = False
     """If True, distribute recomputed activations across the model parallel group."""
 
     recompute_modules: Optional[List[str]] = None
@@ -407,12 +426,16 @@ class TransformerConfig(ModelParallelConfig):
     ####################
     # fp8 related
     ####################
-    fp8: Optional[str] = None
+    fp8: Optional[Literal['e4m3', 'hybrid']] = field(
+        default=None, metadata={"argparse_meta": {"arg_names": ["--fp8-format"]}}
+    )
     """If set, enables the use of FP8 precision through Transformer Engine. There are 2 predefined
     choices (1) 'e4m3' uniformly uses e4m3 for all FP8 tensors, (2) 'hybrid' uses e4m3 for all FP8
     activation and weight tensors and e5m2 for all FP8 output activation gradient tensors."""
 
-    fp8_recipe: Optional[str] = "delayed"
+    fp8_recipe: Optional[Literal['tensorwise', 'delayed', 'mxfp8', 'blockwise', 'custom']] = (
+        "delayed"
+    )
     """If set, enables the use of FP8 precision through Transformer Engine. There are 5 predefined
     choices (1) 'tensorwise' uses per tensor current scaling recipe, (2) 'delayed'
     uses delayed scaling recipe, 3) 'mxfp8' for Blackwell architecture only,
@@ -440,7 +463,7 @@ class TransformerConfig(ModelParallelConfig):
     fp8_amax_history_len: int = 1
     """The length of the amax history window used for scaling factor computation."""
 
-    fp8_amax_compute_algo: str = "most_recent"
+    fp8_amax_compute_algo: Literal['most_recent', 'max'] = "most_recent"
     """Algorithm used for choosing the `amax` value for the scaling factor computation. There are 2
     predefined choices: `max` chooses the largest `amax` in the history window, while `most_recent`
     always chooses the most recently seen value.
@@ -484,15 +507,19 @@ class TransformerConfig(ModelParallelConfig):
     ####################
     # fp4 related
     ####################
-    fp4: Optional[str] = None
+    fp4: Optional[Literal['e2m1']] = field(
+        default=None, metadata={"argparse_meta": {"arg_names": ["--fp4-format"]}}
+    )
     """If set, enables the use of FP4 precision through Transformer Engine. Currently only 
     supports 'nvfp4' which uses NVFP4BlockScaling recipe (requires TE >= 2.7.0.dev0)."""
 
-    fp4_recipe: Optional[str] = "nvfp4"
+    fp4_recipe: Optional[Literal['nvfp4', 'custom']] = "nvfp4"
     """If set, enables the use of FP4 precision through Transformer Engine. Currently only
     'nvfp4' is supported which uses NVFP4BlockScaling recipe for Blackwell+ architecture."""
 
-    fp4_param: bool = False
+    fp4_param: bool = field(
+        default=False, metadata={"argparse_meta": {"arg_names": ["--fp4-param-gather"]}}
+    )
     """If set, keep the parameters in fp4 precision to save memory. This option must be used
     together with fp4 mode (i.e., TransformerConfig.fp4 is not None). Note that not all parameters
     will be converted to fp4; for example, biases will remain unchanged."""
@@ -522,7 +549,9 @@ class TransformerConfig(ModelParallelConfig):
 
     moe_shared_expert_overlap: bool = False
     """Enable overlapping between shared expert computations and dispatcher communications.
-    Without this, the shared experts execute before the router."""
+    Without this, the shared experts execute before the router. 
+    Only effective when moe-shared-expert-intermediate-size is set.
+    """
 
     moe_layer_freq: Union[int, List[int]] = 1
     """Frequency between MoE layers and Dense layers. Accepts either:
@@ -530,7 +559,7 @@ class TransformerConfig(ModelParallelConfig):
     - A list that defines a custom pattern, e.g.: [1,1,1,0,1,1,1,0,1,1,1,0]"""
 
     moe_ffn_hidden_size: Optional[int] = None
-    """MoE Feed-Forward Network hidden size"""
+    """MoE Feed-Forward Network hidden size. If not specified, defaults to the ffn_hidden_size."""
 
     moe_router_load_balancing_type: Union[str, List[str]] = "aux_loss"
     """The load balancing strategy for the router.
@@ -594,10 +623,10 @@ class TransformerConfig(ModelParallelConfig):
     """Scaling factor for routing score in top-k selection, only works when moe_router_pre_softmax
     enabled. Defaults to None, which means no scaling."""
 
-    moe_router_score_function: str = "softmax"
+    moe_router_score_function: Literal['softmax', 'sigmoid'] = "softmax"
     """Score function for MoE routing. Can be "softmax" or "sigmoid"."""
 
-    moe_router_dtype: Optional[str] = None
+    moe_router_dtype: Optional[Literal['fp32', 'fp64']] = None
     """Data type for routing and expert output weighted averaging. Using fp32 or fp64 can
     improve stability especially when the number of experts is large (e.g. finegrained-moe).
     None means no changes for dtype."""
@@ -643,14 +672,14 @@ class TransformerConfig(ModelParallelConfig):
     specified capacity, similar to GShard, Switch-Transformer, and DeepSpeed-MoE. Note that this is
     currently unsupported so should remain False."""
 
-    moe_token_dispatcher_type: str = "allgather"
+    moe_token_dispatcher_type: Literal['allgather', 'alltoall', 'flex'] = "allgather"
     """The type of token dispatcher to use. The default is 'allgather'.
     Options are 'allgather','alltoall' and 'flex'."""
 
     moe_enable_deepep: bool = False
     """[Experimental] Enable DeepEP for efficient token dispatching and combine in MoE models."""
 
-    moe_flex_dispatcher_backend: str = "deepep"
+    moe_flex_dispatcher_backend: Literal['deepep', 'hybridep'] = "deepep"
     """[Experimental] The backend to use for flex token dispatcher. The default is "deepep".
     Options are "deepep" and "hybridep". Currently only "hybridep" backend supports 
     the MNNVL case."""
@@ -667,7 +696,7 @@ class TransformerConfig(ModelParallelConfig):
     the expert capacity length, effective only after the moe_expert_capacity_factor is set. The
     default setting is False."""
 
-    moe_token_drop_policy: str = "probs"
+    moe_token_drop_policy: Literal['probs', 'position'] = "probs"
     """The policy to drop tokens. Can be either "probs" or "position". If "probs", the tokens with
     the lowest probabilities will be dropped. If "position", tokens at the end of each batch will
     be dropped.
@@ -680,7 +709,9 @@ class TransformerConfig(ModelParallelConfig):
     """Fuse token rearrangement ops during token dispatching."""
 
     moe_router_fusion: bool = False
-    """Fuse ops in routing and aux loss calculation."""
+    """Enable fusion for MoE TopK routing and aux-loss computation. This is only
+    supported in TransformerEngine 2.7.0 and above.
+    """
 
     moe_apply_probs_on_input: bool = False
     """Apply probs on input of experts instead of applying after activation and glu."""
@@ -742,7 +773,7 @@ class TransformerConfig(ModelParallelConfig):
     """DEPRECATED and replaced by cuda_graph_impl.
     When set to true, TransformerLayer layers are swapped with user provided CUDA graphs."""
 
-    cuda_graph_impl: str = "none"
+    cuda_graph_impl: Literal['none', 'local', 'transformer_engine'] = "none"
     """Determines the CUDA graph capture implementation.
     "none": no CUDA graph.
     "local": capture the CUDA graph using MCore local implementation. Either partial CUDA graph
@@ -794,8 +825,10 @@ class TransformerConfig(ModelParallelConfig):
     inference_sampling_seed: int = 42
     """ Random seed to use for sampling during inference. """
 
-    symmetric_ar_type: Optional[str] = None
-    """Type of symmetric all reduce to use"""
+    symmetric_ar_type: Optional[Literal['two_shot', "one_shot", "multimem_all_reduce"]] = None
+    """What type of symmetric all reduce to use. The default is None
+    which is no use of symmetric memory.
+    """
 
     use_inference_optimized_layers: bool = False
     """If True, use inference optimized transformer layers during inference."""
@@ -823,8 +856,10 @@ class TransformerConfig(ModelParallelConfig):
     """The number of heads used in Mamba layers.
     If None, the number of heads will be hidden_size * expand // mamba_head_dim."""
 
-    use_mamba_mem_eff_path: bool = True
-    """If True, use the memory efficient path for Mamba layers."""
+    use_mamba_mem_eff_path: bool = field(
+        default=True, metadata={"argparse_meta": {"arg_names": ["--disable-mamba-mem-eff-path"]}}
+    )
+    """Controls usage of the memory efficient path for Mamba layers."""
 
     mlp_chunks_for_prefill: int = 1
     """The number of chunks along the sequence dimension to use for MLP computation
@@ -842,7 +877,9 @@ class TransformerConfig(ModelParallelConfig):
     quant_recipe: Optional[RecipeConfig] = None
     """Configuration of any per-module quantization settings to be applied to the model"""
 
-    transformer_impl: str = "transformer_engine"
+    transformer_impl: Literal['local', 'transformer_engine', 'inference_optimized'] = (
+        "transformer_engine"
+    )
     """Transformer implementation to use.
     Options are 'transformer_engine' for Transformer Engine and 'local' for MCore."""
 
@@ -854,7 +891,7 @@ class TransformerConfig(ModelParallelConfig):
     Fine-grained activation offloading is a module-level offloading method
     instead of a layer-level offloading method like cpu_offloading."""
 
-    offload_modules: Optional[list[str]] = None
+    offload_modules: Optional[list[str]] = field(default_factory=list)
     """The submodules to offload its input.
     choices: "attn_norm", "qkv_linear", "core_attn", "attn_proj",
              "mlp_norm", "expert_fc1", "moe_act".
@@ -1364,6 +1401,13 @@ class TransformerConfig(ModelParallelConfig):
                         )
                 num_layers -= self.num_layers_in_last_pipeline_stage
                 pipeline_parallel_size -= 1
+
+            # Ensure you either have middle pp stages and layers or none of them.
+            if bool(num_layers) != bool(pipeline_parallel_size):
+                raise ValueError(
+                    f"Mismatch: {num_layers} middle layers remaining but {pipeline_parallel_size} "
+                    f"middle PP stages available."
+                )
 
             # Here pipeline_parallel_size is the number of middle PP stages. If there are middle
             # PP stages, check number of layers at middle stage is divisible by middle PP size.

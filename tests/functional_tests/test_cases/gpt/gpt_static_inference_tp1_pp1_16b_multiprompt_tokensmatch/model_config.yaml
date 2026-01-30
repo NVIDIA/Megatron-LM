@@ -75,7 +75,7 @@ MODEL_ARGS:
   --num-tokens-to-generate: 80
   --max-tokens-to-oom: 3600000
   --inference-max-seq-length: 4096
-  --output-path: ${TENSORBOARD_PATH}
+  --output-path: ${INFERENCE_OUTPUT_PATH}
   --prompt-file: ./tests/functional_tests/test_cases/gpt/gpt_static_inference_tp1_pp1_16b_multiprompt_tokensmatch/test_prompts.jsonl
   --incoming-requests-per-sec: -1 # all requests arrive up front.
   --inference-logging-step-interval: 1

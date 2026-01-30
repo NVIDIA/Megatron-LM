@@ -107,6 +107,10 @@ class MLP(MegatronModule):
         if self.config.gated_linear_unit:
             ffn_hidden_size *= 2
             fc1_stride = 2
+            if self.config.use_kitchen:
+                # Kitchen Linear doesn't support stride != 1.
+                # Weight resharding across TP sizes will have aforementioned problems.
+                fc1_stride = 1
         else:
             fc1_stride = 1
 
@@ -148,7 +152,7 @@ class MLP(MegatronModule):
             tp_group=tp_group,
         )
 
-    def forward(self, hidden_states, per_token_scale=None):
+    def forward(self, hidden_states, per_token_scale=None, **kwargs):
         """Perform the forward pass through the MLP block."""
         # [s, b, 4 * h/p]
         nvtx_range_push(suffix="linear_fc1")

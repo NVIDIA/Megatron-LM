@@ -129,3 +129,13 @@ MODEL_ARGS:
   --tensorboard-dir: ${TENSORBOARD_PATH}
   --straggler-minmax-count: 16
   --empty-unused-memory-level: 2
+
+METRICS:
+  - "iteration-time"
+  - "lm loss"
+  - "num-zeros"
+  - "mem-allocated-bytes"
+  - "mem-max-allocated-bytes"
+
+THROUGHPUT_TEST_PARAMS:
+  --start_step: 1

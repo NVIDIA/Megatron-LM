@@ -132,6 +132,8 @@ SKIP_PYTEST=$(cat $TRAINING_PARAMS_PATH |
 
 export RECORD_CHECKPOINTS=${RECORD_CHECKPOINTS:-"false"}
 
+NODE_RANK=${SLURM_NODEID:-${SLURM_NODEID:-0}}
+
 for i in $(seq 1 $N_REPEAT); do
     # Move TB logs into a repeat-specific directory
     DIR=$(dirname "$_TENSORBOARD_PATH")
@@ -327,7 +329,7 @@ for i in $(seq 1 $N_REPEAT); do
             if [[ "$TEST_TYPE" == "frozen-start" ]]; then
                 uv run --no-sync pytest -s -o log_cli=true --log-cli-level=info $ROOT_DIR/tests/functional_tests/python_test_utils/test_inference_regular_pipeline.py \
                     --golden-values-path $GOLDEN_VALUES_PATH \
-                    --test-values-path $TENSORBOARD_PATH \
+                    --test-values-path $INFERENCE_OUTPUT_PATH \
                     --model-config-path ${TRAINING_PARAMS_PATH} \
                     $ALLOW_NONDETERMINISTIC_ALGO_ARG
             fi

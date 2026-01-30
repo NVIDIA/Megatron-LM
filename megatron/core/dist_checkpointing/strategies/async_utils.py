@@ -16,6 +16,8 @@ from typing import Callable, Dict, List, NamedTuple, Optional, Tuple
 import torch
 from torch import multiprocessing as mp
 
+from megatron.core.utils import log_single_rank
+
 from ..utils import debug_time
 
 logger = logging.getLogger(__name__)
@@ -167,7 +169,7 @@ class AsyncCaller(ABC):
     @abstractmethod
     def close(self, abort=False):
         """Terminate the async caller at exit of an application or some termination conditions"""
-        logger.info(f"AsyncCaller: {torch.distributed.get_rank()}, Destroying Async Caller")
+        logger.debug(f"AsyncCaller: {torch.distributed.get_rank()}, Destroying Async Caller")
 
     def __del__(self):
         raise NotImplementedError("This should be implemented")
@@ -265,7 +267,11 @@ class TemporalAsyncCaller(AsyncCaller):
         if self.process:
             logger.debug(f"rank: {torch.distributed.get_rank()}, joining self.process")
             if abort:
-                logger.warning(f"Temporal worker aborted in rank {torch.distributed.get_rank()}")
+                log_single_rank(
+                    logger,
+                    logging.WARNING,
+                    f"Temporal worker aborted in rank {torch.distributed.get_rank()}",
+                )
                 self.process.kill()
             else:
                 self.process.join()
@@ -319,7 +325,7 @@ class PersistentAsyncCaller(AsyncCaller):
         self.start_time = time()
         if self.process is None:
             ctx = mp.get_context('spawn')
-            logger.info(
+            logger.debug(
                 f"PersistentAsyncCaller: {torch.distributed.get_rank()}, Starting Async Caller"
             )
             self.process: mp.Process = ctx.Process(
@@ -333,7 +339,7 @@ class PersistentAsyncCaller(AsyncCaller):
                 ),
             )
             self.process.start()
-            logger.info(
+            logger.debug(
                 f"PersistentAsyncCaller: {torch.distributed.get_rank()}, Started Async Caller"
             )
 
@@ -419,12 +425,16 @@ class PersistentAsyncCaller(AsyncCaller):
             abort (bool, optional): Default to False. Needs to be manually set to true when
                 the checkpoint async process needs to be aborted.
         """
-        logger.info(
+        logger.debug(
             f"PersistentAsyncCaller: {torch.distributed.get_rank()}, Destroying Async Caller"
         )
         if self.process:
             if abort:
-                logger.warning(f"Persistent worker aborted in rank {torch.distributed.get_rank()}")
+                log_single_rank(
+                    logger,
+                    logging.WARNING,
+                    f"Persistent worker aborted in rank {torch.distributed.get_rank()}",
+                )
                 self.process.kill()
             else:
                 self.queue.put('DONE')
@@ -469,7 +479,7 @@ class PersistentAsyncCaller(AsyncCaller):
         # Set logger.
         logger = logging.getLogger(__name__)
         logger.setLevel(log_level)
-        logger.info(f"PersistentAsyncCaller: persistent ckpt worker for {rank} has started")
+        logger.debug(f"PersistentAsyncCaller: persistent ckpt worker for {rank} has started")
 
         # Set CUDA device to appropriate local_rank to ensure allocations / CUDA contexts
         # in this new process are on the right device, and device 0 on the node does not
@@ -496,7 +506,7 @@ class PersistentAsyncCaller(AsyncCaller):
                 comp_q.put(item.call_idx)
                 queue.task_done()
 
-        logger.info(f"PersistentAsyncCaller: persistent ckpt worker for {rank}  has terminated")
+        logger.debug(f"PersistentAsyncCaller: persistent ckpt worker for {rank}  has terminated")
 
 
 class _ActiveAsyncRequest(NamedTuple):

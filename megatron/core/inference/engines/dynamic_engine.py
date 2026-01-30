@@ -4,7 +4,6 @@ import asyncio
 import concurrent.futures
 import logging
 import multiprocessing
-import os
 import socket
 import struct
 import time
@@ -39,7 +38,7 @@ from megatron.core.inference.sampling_params import SamplingParams
 from megatron.core.inference.text_generation_controllers.text_generation_controller import (
     TextGenerationController,
 )
-from megatron.core.inference.utils import Counter, await_process_event
+from megatron.core.inference.utils import Counter, await_process_call
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.transformer.cuda_graphs import delete_cuda_graphs
 from megatron.core.utils import (
@@ -89,6 +88,11 @@ try:
     HAVE_PSUTIL = True
 except ImportError:
     HAVE_PSUTIL = False
+
+from megatron.core.inference.contexts.dynamic_context import HAVE_TORCH_MEMORY_SAVER
+
+if HAVE_TORCH_MEMORY_SAVER:
+    from torch_memory_saver import torch_memory_saver
 
 
 class EngineSuspendedError(Exception):
@@ -341,10 +345,13 @@ class DynamicInferenceEngine(AbstractEngine):
 
         self.capture_stats = capture_stats
 
+        if HAVE_TORCH_MEMORY_SAVER:
+            torch_memory_saver.pause("kv_cache")
+
     @internal_api
     async def start_listening_to_data_parallel_coordinator(
         self,
-        inference_coordinator_port: int,
+        inference_coordinator_port: int | None = None,
         launch_inference_coordinator: bool = True,
         *,
         loop: Optional[asyncio.AbstractEventLoop] = None,
@@ -374,11 +381,20 @@ class DynamicInferenceEngine(AbstractEngine):
         (`self.run_engine`) as a background asyncio task.
 
         Args:
-            inference_coordinator_port (int): The network port where the central
+            inference_coordinator_port (int | None): The network port where the central
                 `InferenceCoordinator` is or will be listening.
+                If None, a random available port will be selected.
+                If not None, the coordinator will attempt to bind to this port, but should it
+                not succeed (e.g., if the port is already in use), it may bind to a different port.
+                The actual port used is returned by this method.
             launch_inference_coordinator (bool, optional): If True, the global rank 0
                 process will spawn and manage the `InferenceCoordinator`
                 process. Defaults to True.
+
+        Returns:
+            inference_coordinator_addresss (str): The network address of the central
+                `InferenceCoordinator`, which may not have the same port as what the user requested
+                with `inference_coordinator_port`.
         """
 
         assert HAVE_ZMQ, (
@@ -406,24 +422,43 @@ class DynamicInferenceEngine(AbstractEngine):
         self.is_mp_coordinator = tp_rank == 0 and pp_rank == 0
         self.is_dp_coordinator = (dp_rank == 0) and self.is_mp_coordinator
 
+        local_ip = socket.gethostname()
+
         # Spawn a DP coordinator process and get the connection info.
         if launch_inference_coordinator and self.is_dp_coordinator:
             spawn_context = multiprocessing.get_context('spawn')
+            dp_pipe, dp_process_pipe = spawn_context.Pipe()
             coordinator_ready_event = spawn_context.Event()
             self.inference_coordinator_process = spawn_context.Process(
                 target=DataParallelInferenceCoordinator.entrypoint,
                 args=(
+                    dp_process_pipe,
                     coordinator_ready_event,
-                    inference_coordinator_port,
                     get_pg_size(self.pg_collection.dp),
                     self.controller.tokenizer,
+                    inference_coordinator_port,
                 ),
             )
             self.inference_coordinator_process.start()
+            await await_process_call(dp_pipe.poll, self.inference_coordinator_process)
+            dp_addr = dp_pipe.recv()
+            dp_pipe.close()
+
+            # Check if the port number is not inference_coordinator_port
+            actual_port = int(dp_addr.rsplit(":", 1)[-1])
+            if inference_coordinator_port != None and actual_port != inference_coordinator_port:
+                logging.warning(
+                    f"Requested InferenceCoordinator port {inference_coordinator_port} "
+                    f"but got port {actual_port} instead. This happens if the request port "
+                    f"is already in use."
+                )
+        elif not launch_inference_coordinator:
+            dp_addr = f"tcp://{local_ip}:{inference_coordinator_port}"
+        else:
+            dp_addr = None
 
         # Find available ports for MP and bind to them.
         if self.is_mp_coordinator:
-            local_ip = socket.gethostname()
             mp_req_sock = self.zmq_context.socket(zmq.PUB)
             mp_req_sock.bind_to_random_port(f"tcp://{local_ip}")
             mp_req_addr = mp_req_sock.getsockopt_string(zmq.LAST_ENDPOINT)
@@ -436,12 +471,13 @@ class DynamicInferenceEngine(AbstractEngine):
             mp_len_addr = None
 
         # Broadcast addresses to respective ranks.
+        bcast = [dp_addr]
+        torch.distributed.broadcast_object_list(bcast, src=dp_src, group=dp_group)
+        [dp_addr] = bcast
         bcast = [mp_req_addr, mp_len_addr]
         torch.distributed.broadcast_object_list(bcast, src=mp_src, group=mp_group)
         [mp_req_addr, mp_len_addr] = bcast
 
-        ip_address_of_dp_coordinator = os.getenv('MASTER_ADDR', '127.0.0.1')
-        dp_addr = f"tcp://{ip_address_of_dp_coordinator}:{inference_coordinator_port}"
         identity = f'mp-coord-{dp_rank}'
         if self.is_mp_coordinator:
             # 1. Create dealer sockets where tp_rank = 0 and pp_rank = 0
@@ -490,12 +526,17 @@ class DynamicInferenceEngine(AbstractEngine):
             )
 
         if launch_inference_coordinator and self.is_dp_coordinator:
-            await await_process_event(coordinator_ready_event, self.inference_coordinator_process)
+            await await_process_call(
+                coordinator_ready_event.wait, self.inference_coordinator_process
+            )
             logging.info("Inference co-ordinator is ready to receive requests!")
+            logging.info(f"Data parallel coordinator can be found at {dp_addr}")
 
         # Finally run the engine infinite loop
         loop = get_asyncio_loop(loop)
         self.engine_loop_task = loop.create_task(self.run_engine_with_coordinator(loop=loop))
+
+        return dp_addr
 
     @contextmanager
     @staticmethod
