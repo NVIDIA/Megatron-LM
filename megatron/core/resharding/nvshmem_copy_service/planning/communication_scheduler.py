@@ -10,21 +10,12 @@ class CommunicationScheduler:
     """
     Builds a conflict-free, iteration-based schedule for communication.
     Ensures that in any given iteration, a PE is not overloaded.
+    Uses greedy first-fit scheduling algorithm.
     """
 
-    def __init__(self, algorithm: str = "dsatur"):
-        """
-        Initialize scheduler.
-
-        Args:
-            algorithm: Scheduling algorithm to use
-                - "greedy": Simple greedy first-fit (baseline)
-                - "dsatur": DSatur graph coloring (near-optimal, default)
-        """
+    def __init__(self):
+        """Initialize scheduler."""
         self.num_iterations = 0
-        self.algorithm = algorithm
-        if algorithm not in ["greedy", "dsatur"]:
-            raise ValueError(f"Unknown algorithm: {algorithm}. Use 'greedy' or 'dsatur'")
 
     def build_schedule(
         self, workloads: Dict[int, List[WorkloadGroup]], my_pe: int, n_pes: int
@@ -45,13 +36,10 @@ class CommunicationScheduler:
         all_batches = self._collect_all_batches(workloads, my_pe, n_pes)
         PELogger.debug(f"Collected {len(all_batches)} total batches globally")
 
-        # Step 2: Assign batches to iterations using conflict-free algorithm
-        PELogger.debug(f"Assigning batches to iterations using '{self.algorithm}' algorithm...")
-        if self.algorithm == "dsatur":
-            self._assign_iterations_dsatur(all_batches)
-        elif self.algorithm == "greedy":
-            self._assign_iterations_greedy(all_batches)
-        PELogger.info(f"Schedule built ({self.algorithm}): {self.num_iterations} iterations")
+        # Step 2: Assign batches to iterations using greedy algorithm
+        PELogger.debug("Assigning batches to iterations using greedy algorithm...")
+        self._assign_iterations_greedy(all_batches)
+        PELogger.info(f"Schedule built: {self.num_iterations} iterations")
 
         # Step 3: Exchange detailed workload summaries (Task IDs/Sizes)
         # This is needed for receivers to know what tasks are in each batch
@@ -120,13 +108,11 @@ class CommunicationScheduler:
 
     def _assign_iterations_greedy(self, batches: List[ScheduledBatch]):
         """
-        BASELINE: Greedy first-fit scheduling algorithm.
+        Greedy first-fit scheduling algorithm.
 
         Assigns batches to iterations using simple greedy first-fit.
         Processes batches in sorted order and assigns each to the first
         available iteration with no conflicts.
-
-        Fast but suboptimal - serves as baseline for comparison.
         """
         self.num_iterations = 0
 
@@ -173,103 +159,6 @@ class CommunicationScheduler:
 
         self.num_iterations = len(iteration_usage)
         PELogger.info(f"Greedy scheduling: {len(batches)} batches → {self.num_iterations} iterations")
-
-    def _assign_iterations_dsatur(self, batches: List[ScheduledBatch]):
-        """
-        DSatur (Saturation Degree) algorithm for near-optimal scheduling.
-
-        Colors batches (assigns to iterations) by prioritizing batches with
-        the highest saturation degree (most constrained choices).
-
-        This is the standard algorithm for graph coloring and produces
-        near-optimal results in practice (typically 2-3x better than greedy).
-        """
-        if not batches:
-            self.num_iterations = 0
-            return
-
-        PELogger.info(f"DSatur scheduling: {len(batches)} batches")
-
-        # Step 1: Build conflict graph
-        conflicts = self._build_conflict_graph(batches)
-
-        # Step 2: DSatur algorithm
-        uncolored = set(range(len(batches)))
-        colors = {}  # batch_idx -> iteration (color)
-
-        # Start with batch that has most conflicts (highest degree)
-        first_batch = max(range(len(batches)), key=lambda i: len(conflicts[i]))
-        colors[first_batch] = 0
-        uncolored.remove(first_batch)
-        PELogger.debug(f"  Colored batch {first_batch} with color 0 (highest degree: {len(conflicts[first_batch])} conflicts)")
-
-        # Color remaining batches
-        while uncolored:
-            # Select batch with highest saturation degree
-            # Tie-break by degree (most conflicts), then by index
-            best = max(uncolored, key=lambda i: (
-                self._saturation_degree(i, colors, conflicts),
-                len(conflicts[i]),
-                -i  # Negative for stable ordering
-            ))
-
-            # Assign smallest available color (iteration)
-            neighbor_colors = {colors[j] for j in conflicts[best] if j in colors}
-            color = 0
-            while color in neighbor_colors:
-                color += 1
-
-            colors[best] = color
-            uncolored.remove(best)
-
-            if len(uncolored) % 20 == 0:  # Log progress periodically
-                PELogger.debug(f"  Colored {len(colors)}/{len(batches)} batches, using {max(colors.values())+1} iterations so far")
-
-        # Step 3: Apply colors to batches
-        for idx, batch in enumerate(batches):
-            batch.iteration = colors[idx]
-
-        self.num_iterations = max(colors.values()) + 1
-        PELogger.info(f"DSatur result: {len(batches)} batches → {self.num_iterations} iterations")
-
-    def _build_conflict_graph(self, batches: List[ScheduledBatch]) -> List[set]:
-        """
-        Build conflict graph: conflicts[i] = set of batch indices that conflict with i.
-
-        Two batches conflict if they share a source PE or destination PE.
-        A PE cannot send and receive simultaneously in the same iteration.
-        """
-        n = len(batches)
-        conflicts = [set() for _ in range(n)]
-
-        PELogger.debug(f"Building conflict graph for {n} batches...")
-
-        for i in range(n):
-            for j in range(i + 1, n):
-                # Check if batches i and j conflict
-                if (batches[i].src_pe == batches[j].src_pe or
-                    batches[i].src_pe == batches[j].dest_pe or
-                    batches[i].dest_pe == batches[j].src_pe or
-                    batches[i].dest_pe == batches[j].dest_pe):
-                    conflicts[i].add(j)
-                    conflicts[j].add(i)
-
-        total_edges = sum(len(c) for c in conflicts) // 2
-        max_degree = max(len(c) for c in conflicts) if conflicts else 0
-        avg_degree = sum(len(c) for c in conflicts) / n if n > 0 else 0
-        PELogger.debug(f"Conflict graph: {total_edges} edges, max degree: {max_degree}, avg degree: {avg_degree:.1f}")
-
-        return conflicts
-
-    def _saturation_degree(self, batch_idx: int, colors: dict, conflicts: List[set]) -> int:
-        """
-        Saturation degree = number of distinct colors used by neighbors.
-
-        Higher saturation means the batch has fewer color choices available,
-        so it should be colored earlier (more constrained).
-        """
-        neighbor_colors = {colors[j] for j in conflicts[batch_idx] if j in colors}
-        return len(neighbor_colors)
 
     def _exchange_workload_summaries(
         self, workloads: Dict[int, List[WorkloadGroup]], my_pe: int, n_pes: int

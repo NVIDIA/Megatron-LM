@@ -10,6 +10,8 @@ try:
 except ModuleNotFoundError:
     HAVE_TRANSFORMERS = False
 
+from megatron.core.utils import log_single_rank
+
 from .abstract_tokenizer import MegatronTokenizerTextAbstract
 
 logger = logging.getLogger(__name__)
@@ -166,9 +168,11 @@ class HuggingFaceTokenizer(MegatronTokenizerTextAbstract):
             tokenizer.resize_token_embeddings(tokenizer_default.vocab_size)
             """
 
-            logger.warning(
+            log_single_rank(
+                logger,
+                logging.WARNING,
                 f'{new_tokens_in_vocab} \n will be added to the vocabulary.\n'
-                f'Please resize your model accordingly.'
+                f'Please resize your model accordingly.',
             )
         self.add_special_tokens(special_tokens_dict)
         self.space_sensitive = self.text_to_tokens('x y') != self.text_to_tokens(
@@ -196,7 +200,11 @@ class HuggingFaceTokenizer(MegatronTokenizerTextAbstract):
         num_tokens_added = self.tokenizer.add_special_tokens(special_tokens_dict)
 
         if num_tokens_added > 0:
-            logger.info(f'{num_tokens_added} special tokens added, resize your model accordingly.')
+            log_single_rank(
+                logger,
+                logging.INFO,
+                f'{num_tokens_added} special tokens added, resize your model accordingly.',
+            )
         for k in self.tokenizer.SPECIAL_TOKENS_ATTRIBUTES:
             setattr(self, k, getattr(self.tokenizer, k, None))
         return num_tokens_added

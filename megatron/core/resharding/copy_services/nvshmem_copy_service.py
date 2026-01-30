@@ -17,20 +17,13 @@ logger = logging.getLogger(__name__)
 class NVSHMEMCopyService(CopyService):
     """CopyService implementation backed by NVSHMEM RemoteCopyService."""
 
-    def __init__(self, scheduling_algorithm: str = "dsatur"):
-        """
-        Initialize NVSHMEM copy service.
-
-        Args:
-            scheduling_algorithm: Algorithm for scheduling batches to iterations
-                - "dsatur": DSatur graph coloring (near-optimal, default)
-                - "greedy": Simple greedy first-fit (baseline for comparison)
-        """
+    def __init__(self):
+        """Initialize NVSHMEM copy service."""
         if not dist.is_initialized():
             raise RuntimeError("torch.distributed must be initialized before NVSHMEMCopyService()")
 
         self.rank = dist.get_rank()
-        self._remote = RemoteCopyService(scheduling_algorithm=scheduling_algorithm)
+        self._remote = RemoteCopyService()
         # Lazily initialized on first use to avoid side effects at import time
         self._initialized = False
 

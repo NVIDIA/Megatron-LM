@@ -43,13 +43,6 @@ def add_benchmark_args(parser):
         action='store_true',
         help='Skip checkpoint loading (benchmark uses random weights).'
     )
-    group.add_argument(
-        '--nvshmem-scheduling-algorithm',
-        type=str,
-        default='dsatur',
-        choices=['dsatur', 'greedy'],
-        help='NVSHMEM scheduling algorithm: dsatur (near-optimal, default) or greedy (baseline)'
-    )
 
     return parser
 
@@ -172,9 +165,9 @@ def benchmark_refit_collocated():
     # This avoids repeated NVSHMEM buffer allocations
     refit_service = None
     if args.refit_method == 'nvshmem':
-        print_rank_0(f"Creating NVSHMEM service with '{args.nvshmem_scheduling_algorithm}' scheduler...")
+        print_rank_0("Creating NVSHMEM service...")
         from megatron.core.resharding.copy_services.nvshmem_copy_service import NVSHMEMCopyService
-        refit_service = NVSHMEMCopyService(scheduling_algorithm=args.nvshmem_scheduling_algorithm)
+        refit_service = NVSHMEMCopyService()
         # Service will be lazily initialized on first use
 
         # CRITICAL: Ensure all CUDA work from NVSHMEM init is complete
@@ -182,7 +175,7 @@ def benchmark_refit_collocated():
         # before torch.distributed (NCCL) operations can safely proceed
         torch.cuda.synchronize()
         torch.distributed.barrier()
-        print_rank_0(f"NVSHMEM service created (algorithm: {args.nvshmem_scheduling_algorithm}).")
+        print_rank_0("NVSHMEM service created.")
     elif args.refit_method == 'nccl':
         print_rank_0("Creating NCCL service (will be reused across all iterations)...")
         from megatron.core.resharding.copy_services.nccl_copy_service import NCCLCopyService
@@ -428,9 +421,9 @@ def benchmark_refit_non_collocated():
     # This avoids repeated NVSHMEM buffer allocations
     refit_service = None
     if args.refit_method == 'nvshmem':
-        print_rank_0(f"Creating NVSHMEM service with '{args.nvshmem_scheduling_algorithm}' scheduler...")
+        print_rank_0("Creating NVSHMEM service...")
         from megatron.core.resharding.copy_services.nvshmem_copy_service import NVSHMEMCopyService
-        refit_service = NVSHMEMCopyService(scheduling_algorithm=args.nvshmem_scheduling_algorithm)
+        refit_service = NVSHMEMCopyService()
         # Service will be lazily initialized on first use
 
         # CRITICAL: Ensure all CUDA work from NVSHMEM init is complete
@@ -438,7 +431,7 @@ def benchmark_refit_non_collocated():
         # before torch.distributed (NCCL) operations can safely proceed
         torch.cuda.synchronize()
         torch.distributed.barrier()
-        print_rank_0(f"NVSHMEM service created (algorithm: {args.nvshmem_scheduling_algorithm}).")
+        print_rank_0("NVSHMEM service created.")
     elif args.refit_method == 'nccl':
         print_rank_0("Creating NCCL service (will be reused across all iterations)...")
         from megatron.core.resharding.copy_services.nccl_copy_service import NCCLCopyService

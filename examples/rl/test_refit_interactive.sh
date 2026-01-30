@@ -9,7 +9,7 @@
 #   srun --nodes=1 --ntasks-per-node=8 --gpus-per-node=8 --time=00:30:00 --pty bash
 #
 #   # Then run this script:
-#   bash test_refit_interactive.sh [gloo|nvshmem|nvshmem-dsatur|nvshmem-greedy|nccl|all]
+#   bash test_refit_interactive.sh [gloo|nvshmem|nccl|all]
 #
 
 set -e
@@ -20,10 +20,7 @@ set -e
 REFIT_METHOD="${1:-gloo}"  # Default to gloo for safety
 
 if [[ "$REFIT_METHOD" == "all" ]]; then
-    METHODS=("gloo" "nccl" "nvshmem-dsatur" "nvshmem-greedy")
-elif [[ "$REFIT_METHOD" == "nvshmem" ]]; then
-    # When user specifies "nvshmem", test both algorithms
-    METHODS=("nvshmem-dsatur" "nvshmem-greedy")
+    METHODS=("gloo" "nccl" "nvshmem")
 else
     METHODS=("$REFIT_METHOD")
 fi
@@ -156,16 +153,6 @@ for method in "${METHODS[@]}"; do
 
     LOG_FILE="${OUTPUT_DIR}/test_${DATETIME}_${method}.log"
 
-    # Parse method and scheduling algorithm
-    if [[ "$method" == "nvshmem-"* ]]; then
-        # Extract algorithm from method name (e.g., "nvshmem-dsatur" -> "dsatur")
-        REFIT_METHOD_ACTUAL="nvshmem"
-        SCHEDULING_ALGO="${method#nvshmem-}"
-    else
-        REFIT_METHOD_ACTUAL="$method"
-        SCHEDULING_ALGO="dsatur"  # Default for nvshmem
-    fi
-
     # Build command arguments
     ARGS=(
         --bf16
@@ -184,8 +171,7 @@ for method in "${METHODS[@]}"; do
         --rl-inference-expert-model-parallel-size $DST_EP
         --rl-inference-expert-tensor-model-parallel-size 1
         --refit-mode $REFIT_MODE
-        --refit-method $REFIT_METHOD_ACTUAL
-        --nvshmem-scheduling-algorithm $SCHEDULING_ALGO
+        --refit-method $method
         --num-layers $NUM_LAYERS
         --hidden-size $HIDDEN_SIZE
         --num-attention-heads $NUM_ATTENTION_HEADS
@@ -223,7 +209,7 @@ for method in "${METHODS[@]}"; do
     if [ $exit_code -eq 0 ]; then
         echo "✓ ${method} test PASSED"
         # Show scheduling results
-        grep -E "Schedule built.*iterations|DSatur result|Greedy scheduling" "$LOG_FILE" | head -3 || true
+        grep -E "Schedule built.*iterations|Greedy scheduling" "$LOG_FILE" | head -3 || true
         # Show timing results
         grep -E "(Iteration [0-9]+/[0-9]+:|Mean refit time|Throughput)" "$LOG_FILE" | tail -5 || true
     else
