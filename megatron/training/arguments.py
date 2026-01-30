@@ -1508,6 +1508,13 @@ def _add_inference_args(parser):
                        '1) allocate `memory_buffer` in unified memory. '
                        'Eventually, additional levels will be included to '
                        'control other tensors within the context.')
+    group.add_argument('--inference-dynamic-batching-disable-prefix-caching',
+                       action='store_false',
+                       dest='inference_dynamic_batching_enable_prefix_caching',
+                       help='Disable prefix caching for dynamic batching inference. '
+                       'When disabled, KV cache blocks cannot be shared between '
+                       'requests with identical prompt prefixes.')
+    group.set_defaults(inference_dynamic_batching_enable_prefix_caching=True)
     group.add_argument('--nccl-all-reduce-for-prefill',
                        action='store_true', default=False,
                        help='When using symmeric all reduce kernels this will use regular nccl kernels for prefill. This can be more effecient when prefill is large as the nccl kernels can be more bandwith optimized')

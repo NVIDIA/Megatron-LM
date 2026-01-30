@@ -54,6 +54,7 @@ class TestDynamicContext:
         layer_type_list=None,
         rounder=64,
         paused_buffer_size_gb=None,
+        enable_prefix_caching=True,
     ):
         set_rounder(rounder)
 
@@ -86,6 +87,7 @@ class TestDynamicContext:
             use_flashinfer_fused_rope=None,  # default to using flash-infer if available
             # this is for compatibility with the LTS environment
             unified_memory_level=0,  # unit tests currently broken with UVM
+            enable_prefix_caching=enable_prefix_caching,
         )
         return dynamic_context
 
@@ -1251,3 +1253,4 @@ class TestDynamicContext:
         assert (
             len(unique_counts) == 1
         ), f"Block counts were not synchronized across ranks. Gathered: {all_counts}"
+

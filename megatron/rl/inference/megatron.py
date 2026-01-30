@@ -167,6 +167,7 @@ def get_dynamic_inference_engine(
         cuda_graph_mixed_prefill_count=args.inference_dynamic_batching_cuda_graph_mixed_prefill_count,
         metrics_writer=metrics_writer,
         persist_cuda_graphs=args.rl_training_cuda_graphs,
+        enable_prefix_caching=getattr(args, 'inference_dynamic_batching_enable_prefix_caching', True),
         offload_kv_cache=args.rl_offload_kv_cache_during_training
     )
 
