@@ -294,7 +294,7 @@ class DynamicInferenceContext(BaseInferenceContext):
         metrics_writer: Optional['WandbModule'] = None,
         request_metadata_types: Optional[List[Tuple[str, torch.dtype, bool]]] = None,
         persist_cuda_graphs: Optional[bool] = False,
-        kv_cache_management_mode: Optional[str] = "keep",
+        kv_cache_management_mode: Optional[str] = "persist",
     ):
         super().__init__(materialize_only_last_token_logits=materialize_only_last_token_logits)
 
@@ -424,8 +424,8 @@ class DynamicInferenceContext(BaseInferenceContext):
         # Unified memory and general tensor management.
         self.unified_memory_level = unified_memory_level
         self.persist_cuda_graphs = persist_cuda_graphs
-        # KV cache management mode: "keep", "offload", or "remove"
-        assert kv_cache_management_mode in ("keep", "offload", "remove"), (
+        # KV cache management mode: "persist", "offload", or "remove"
+        assert kv_cache_management_mode in ("persist", "offload", "remove"), (
             f"Invalid kv_cache_management_mode: {kv_cache_management_mode}"
         )
         self.kv_cache_management_mode = kv_cache_management_mode
