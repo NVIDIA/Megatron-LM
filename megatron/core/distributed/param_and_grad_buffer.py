@@ -765,7 +765,7 @@ class _ParamAndGradBuffer:
             # Since nccl communicator group is created lazily, we need to perform a warmup call to
             # initialize NCCL comm buffers for this dp_group before doing buffer registration.
             torch.distributed.barrier()
-            tmp_warmup_tensor = torch.tensor([0.0], device="cuda")
+            tmp_warmup_tensor = torch.zeros([1], device="cuda")
             torch.distributed.all_reduce(tmp_warmup_tensor, group=self.data_parallel_group)
             torch.distributed.barrier()
         else:
