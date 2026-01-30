@@ -294,8 +294,7 @@ class DynamicInferenceContext(BaseInferenceContext):
         metrics_writer: Optional['WandbModule'] = None,
         request_metadata_types: Optional[List[Tuple[str, torch.dtype, bool]]] = None,
         persist_cuda_graphs: Optional[bool] = False,
-        offload_kv_cache: Optional[bool] = False,
-        remove_kv_cache: Optional[bool] = False,
+        kv_cache_management_mode: Optional[str] = "keep",
     ):
         super().__init__(materialize_only_last_token_logits=materialize_only_last_token_logits)
 
@@ -425,8 +424,11 @@ class DynamicInferenceContext(BaseInferenceContext):
         # Unified memory and general tensor management.
         self.unified_memory_level = unified_memory_level
         self.persist_cuda_graphs = persist_cuda_graphs
-        self.offload_kv_cache = offload_kv_cache
-        self.remove_kv_cache = remove_kv_cache
+        # KV cache management mode: "keep", "offload", or "remove"
+        assert kv_cache_management_mode in ("keep", "offload", "remove"), (
+            f"Invalid kv_cache_management_mode: {kv_cache_management_mode}"
+        )
+        self.kv_cache_management_mode = kv_cache_management_mode
 
         if unified_memory_level > 0:
             try:
@@ -441,7 +443,6 @@ class DynamicInferenceContext(BaseInferenceContext):
             assert (
                 HAVE_TORCH_MEMORY_SAVER
             ), "Can only persist CUDA graphs without UVM if torch_memory_saver is available"
-        assert not (offload_kv_cache and remove_kv_cache), "Cannot both offload and remove KV$."
 
         # When not using `torch_memory_saver`, we manually offload/restore tensors.
         # We use storage resize, similar to the logic in `core/distributed/param_and_grad_buffer.py`
@@ -658,14 +659,15 @@ class DynamicInferenceContext(BaseInferenceContext):
                 torch_memory_saver.restore_region(tag="inference_context")
                 return
             # If we offloaded tensors, restore them before allocating other tensors
-            if self.offload_kv_cache:
+            if self.kv_cache_management_mode == "offload":
                 self._restore_tracked_tensors_from_cpu()
 
         # Validate no tensors allocated prior to this method.
         for key in vars(self).keys():
             # Skip offloaded tensors.
-            if not is_init and self.offload_kv_cache and key in self._offloadable_tensor_names:
-                continue
+            if not is_init and self.kv_cache_management_mode == "offload":
+                if key in self._offloadable_tensor_names:
+                    continue
             value = getattr(self, key)
             assert not isinstance(value, torch.Tensor), (
                 "All tensors should be allocated within `allocate_all_tensors()."
@@ -767,19 +769,21 @@ class DynamicInferenceContext(BaseInferenceContext):
         # Allocate large non-graphed buffers.
         # - If UVM is turned on, we use UVM unconditionally.
         # - If CGs persist and we lack UVM, we need to use `torch_memory_saver`.
-        # - If we are offloading, we prefer to use `torch_memory_saver` over manual offloading.
-        # - If we are removing the KV$, we must re-allocate every time, not just at init.
+        # - If offloading KV$, we prefer to use `torch_memory_saver` over manual offloading.
+        # - If removing the KV$, we must re-allocate every time, not just at init.
         ctx_manager = nullcontext()
+        offload_kv = self.kv_cache_management_mode == "offload"
+        remove_kv = self.kv_cache_management_mode == "remove"
         if self.unified_memory_level > 0:
             ctx_manager = torch.cuda.use_mem_pool(self.unified_memory_mempool)
-        elif (self.persist_cuda_graphs or self.offload_kv_cache) and HAVE_TORCH_MEMORY_SAVER:
+        elif (self.persist_cuda_graphs or offload_kv) and HAVE_TORCH_MEMORY_SAVER:
             ctx_manager = torch_memory_saver.region(
-                tag="inference_context", enable_cpu_backup=self.offload_kv_cache
+                tag="inference_context", enable_cpu_backup=offload_kv
             )
-        elif self.offload_kv_cache:
+        elif offload_kv:
             ctx_manager = self._track_offloadable_tensors()
         with ctx_manager:
-            if is_init or self.remove_kv_cache:
+            if is_init or remove_kv:
                 allocate_memory_buffer()
                 allocate_mamba_states()
 
@@ -805,12 +809,12 @@ class DynamicInferenceContext(BaseInferenceContext):
             return
 
         # Explicitly deallocate tensors and offload them.
-        if self.offload_kv_cache:
+        if self.kv_cache_management_mode == "offload":
             self._offload_tracked_tensors_to_cpu()
 
         # Explicitly deallocate tensors and delete them.
         # TODO(@lmcafee): check that device == 'cuda'?
-        if self.remove_kv_cache:
+        if self.kv_cache_management_mode == "remove":
             for key in list(vars(self).keys()):
                 value = getattr(self, key)
                 if isinstance(value, torch.Tensor):
