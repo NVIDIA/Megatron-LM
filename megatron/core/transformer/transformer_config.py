@@ -1009,7 +1009,7 @@ class TransformerConfig(ModelParallelConfig):
             raise ValueError("num_moe_experts must be non None to use expert-parallel.")
 
         if self.transformer_impl == "inference_optimized" and (
-            self.expert_model_parallel_size * self.expert_tensor_parallel_size > 1
+            self.expert_tensor_parallel_size > 1
         ):
             raise ValueError(
                 "Inference-optimized MoE layers currently only support data parallelism "

@@ -98,9 +98,9 @@ class InferenceAlltoAllTokenDispatcher(MoEAlltoAllTokenDispatcher):
         This enables fully CUDA-graphable MoE forward pass.
         """
         # Validate single GPU assumptions
-        assert self.ep_size == 1, (
-            f"InferenceAlltoAllTokenDispatcher requires ep_size=1, got {self.ep_size}"
-        )
+        # assert self.ep_size == 1, (
+        #     f"InferenceAlltoAllTokenDispatcher requires ep_size=1, got {self.ep_size}"
+        # )
         assert self.tp_size == 1, (
             f"InferenceAlltoAllTokenDispatcher requires tp_size=1, got {self.tp_size}"
         )
