@@ -139,7 +139,7 @@ class TestTop2Router:
         # Create input with shape [seq_len, batch_size, hidden_size]
         hidden_states = torch.randn((seq_len, batch_size, hidden_size)).cuda().bfloat16()
 
-        # Create padding mask: first half valid (False), second half padding (True)
+        # Create padding mask: first half valid, second half padding
         # padding_mask shape: [seq_len, batch_size]
         # Convention: True = padding (exclude), False = valid (include)
         padding_mask = torch.zeros((seq_len, batch_size), dtype=torch.bool, device='cuda')

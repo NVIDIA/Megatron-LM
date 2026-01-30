@@ -204,7 +204,7 @@ class TopKRouter(Router):
             self.ga_steps = None
 
         self.router_replay = None
-        if self.config.enable_routing_replay:
+        if self.config.moe_enable_routing_replay:
             self.router_replay = RouterReplay()
 
     def _maintain_float32_expert_bias(self):
@@ -293,6 +293,7 @@ class TopKRouter(Router):
                 with_padding_mask=with_padding_mask,
             )
         )
+
         aux_loss = switch_load_balancing_loss_func(
             probs=scores_for_aux_loss,
             tokens_per_expert=global_tokens_per_expert,
@@ -302,6 +303,7 @@ class TopKRouter(Router):
             moe_aux_loss_coeff=aux_loss_coeff,
             fused=self.config.moe_router_fusion,
         )
+
         probs = self.attach_and_log_load_balancing_loss(
             probs,
             aux_loss_coeff,
@@ -401,14 +403,15 @@ class TopKRouter(Router):
             moe_aux_loss_coeff=global_aux_loss_coeff,
             fused=self.config.moe_router_fusion,
         )
+
         probs = self.attach_and_log_load_balancing_loss(
             probs,
             global_aux_loss_coeff,
             global_aux_loss,
             "global_load_balancing_loss",
             self.tp_dp_cp_group,
-            valid_token_count=local_num_tokens,
             reduce_group_has_dp=True,
+            valid_token_count=local_num_tokens,
         )
         return probs
 
@@ -419,23 +422,23 @@ class TopKRouter(Router):
         aux_loss: torch.Tensor,
         aux_loss_name: str,
         reduce_group: torch.distributed.ProcessGroup,
-        valid_token_count: Optional[Union[int, torch.Tensor]] = None,
         reduce_group_has_dp: bool = False,
+        valid_token_count: Optional[Union[int, torch.Tensor]] = None,
     ):
         """Attach aux loss function to activation and add to logging.
 
         Args:
-            activation (torch.Tensor): The activation tensor to attach the loss to.
-            aux_loss_coeff (float): The coefficient for the auxiliary loss.
-            aux_loss (torch.Tensor): The auxiliary loss tensor.
-            aux_loss_name (str): The name of the auxiliary loss for logging.
-            reduce_group (torch.distributed.ProcessGroup): The group for reducing the loss.
-            valid_token_count (int or torch.Tensor, optional): Number of valid tokens excluding
-                padding tokens. Can be a Python int or a torch.Tensor (typically 0-d tensor).
-                If None, uses activation.shape[0]. Defaults to None.
+            activation (torch.Tensor): Activation tensor to attach the aux loss to.
+            aux_loss_coeff (float): Coefficient for the aux loss.
+            aux_loss (torch.Tensor): Computed aux loss.
+            aux_loss_name (str): Name of the aux loss for logging.
+            reduce_group (torch.distributed.ProcessGroup): Process group for reduction.
             reduce_group_has_dp (bool): Whether the reduce group has data parallel ranks.
                 Set this to True if the reduce group has data parallel ranks. This flag is used to
                 ensure the correct reduction in aux loss tracking.
+            valid_token_count (int or torch.Tensor, optional): Number of valid tokens excluding
+                padding tokens. Can be a Python int or a torch.Tensor (typically 0-d tensor).
+                If None, uses activation.shape[0]. Defaults to None.
         """
         # TODO (zijiey): fix the per_layer_logging for MTP, currently it will incorrectly
         # add the aux loss logging value to other layer's since it is difficult to get the
@@ -473,9 +476,9 @@ class TopKRouter(Router):
 
         Args:
             logits (torch.Tensor): The logits of the router.
-            padding_mask (torch.Tensor, optional): Boolean mask indicating padding positions.
-                                                   Shape [num_tokens]. True = padding (exclude),
-                                                   False = valid (include). Defaults to None.
+            padding_mask (torch.Tensor, optional): Boolean mask indicating non-padding tokens.
+                                                   Shape in [num_tokens]. True for valid tokens,
+                                                   False for padding tokens. Defaults to None.
 
         Returns:
             torch.Tensor: The logits after applying the z-loss.
@@ -534,11 +537,6 @@ class TopKRouter(Router):
         """
         Update expert bias and tokens_per_expert
         Prevent extra local tokens accumulation on evaluation or activation recomputation
-
-        Args:
-            routing_map (torch.Tensor): Token to expert routing map, [num_tokens, num_experts].
-            padding_mask (torch.Tensor, optional): Boolean mask indicating padding positions.
-                Shape [num_tokens]. True = padding (exclude), False = valid (include).
         """
         if self.enable_expert_bias and torch.is_grad_enabled():
             with torch.no_grad():
@@ -551,9 +549,9 @@ class TopKRouter(Router):
 
         Args:
             logits (torch.Tensor): Logits tensor after gating.
-            padding_mask (torch.Tensor, optional): Boolean mask indicating padding positions.
-                                                   Shape = [seq_length, bsz]. True=padding(exclude),
-                                                   False=valid(include). Defaults to None.
+            padding_mask (torch.Tensor, optional): Boolean mask indicating non-padding tokens.
+                                                   Shape [seq_length, bsz]. True for valid tokens,
+                                                   False for padding tokens. Defaults to None.
 
         Returns:
             probs (torch.Tensor): The probabilities of token to experts assignment.
@@ -646,9 +644,9 @@ class TopKRouter(Router):
 
         Args:
             input (torch.Tensor): Input tensor.
-            padding_mask (torch.Tensor, optional): Boolean mask indicating padding positions.
-                                                   Shape = [seq_length, bsz]. True=padding(exclude),
-                                                   False=valid(include). Defaults to None.
+            padding_mask (torch.Tensor, optional): Boolean mask indicating non-padding tokens.
+                                                   Shape [seq_length, bsz]. True for valid tokens,
+                                                   False for padding tokens. Defaults to None.
         """
         self._maintain_float32_expert_bias()
 

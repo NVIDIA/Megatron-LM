@@ -16,6 +16,7 @@ import megatron.core.nccl_allocator as nccl_allocator
 from megatron.core import parallel_state
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.rerun_state_machine import get_rerun_state_machine
+from megatron.core.utils import log_single_rank
 
 from ..fp8_utils import (
     is_float8tensor,
@@ -165,6 +166,11 @@ class _ParamAndGradBucketGroup:
         global dist_reduce_scatter_func
         if self.ddp_config.reduce_scatter_with_fp32_accumulation:
             dist_reduce_scatter_func = reduce_scatter_with_fp32_accumulation
+            log_single_rank(
+                logger,
+                logging.INFO,
+                "Using reduce_scatter_with_fp32_accumulation as reduce-scatter implementation",
+            )
 
         # per_param_grad_ready_counts is a dict mapping parameters to number of times
         # `register_grad_ready` is called for that parameter *when
@@ -358,7 +364,7 @@ class _ParamAndGradBucketGroup:
                 if len(fp8_params) > 0:
                     post_all_gather_processing(fp8_params)
 
-    def start_grad_sync(self):
+    def start_grad_sync(self, force_all_reduce: Optional[bool] = False):
         """
         Initiates grad sync (all-reduce or reduce-scatter) communication operations
         for all buckets in the bucket group.
@@ -429,7 +435,7 @@ class _ParamAndGradBucketGroup:
         grad_reduce_handle = None
         with stream_context, _coalescing_manager(communication_group, async_ops=async_op) as cm:
             for idx, bucket in enumerate(self.buckets):
-                if self.ddp_config.use_distributed_optimizer:
+                if self.ddp_config.use_distributed_optimizer and not force_all_reduce:
                     if self.cached_grad_buffer_shard_list[idx] is None:
                         self.cached_grad_buffer_shard_list[idx] = shard_buffer(
                             bucket.grad_data, self.intra_distributed_optimizer_instance_size
@@ -445,6 +451,10 @@ class _ParamAndGradBucketGroup:
                         async_op=async_op,
                     )
                 else:
+                    if torch.distributed.get_rank() == 0 and force_all_reduce:
+                        logger.info(
+                            f"Performing reduction using all_reduce because {force_all_reduce=}"
+                        )
                     torch.distributed.all_reduce(
                         bucket.grad_data, op=reduce_op, group=communication_group, async_op=async_op
                     )
@@ -479,7 +489,7 @@ class _ParamAndGradBucketGroup:
                     )
 
         if async_op:
-            if self.ddp_config.reduce_scatter_with_fp32_accumulation:
+            if self.ddp_config.reduce_scatter_with_fp32_accumulation and not force_all_reduce:
                 assert (
                     len(self.buckets) == 1
                 ), "Only 1 bucket supported with reduce_scatter_with_fp32_accumulation=True"
@@ -497,7 +507,7 @@ class _ParamAndGradBucketGroup:
             # None.
             self.grad_reduce_handle = None
 
-    def finish_grad_sync(self):
+    def finish_grad_sync(self, force_all_reduce: Optional[bool] = False):
         """
         Finishes grad sync (all-reduce or reduce-scatter) communication operations
         for all buckets in the bucket group.
@@ -509,13 +519,13 @@ class _ParamAndGradBucketGroup:
         self.param_gather_dispatched = False
         # If overlap_grad_reduce is False, start (and finish) synchronous communication call here.
         if not self.ddp_config.overlap_grad_reduce:
-            self.start_grad_sync()
+            self.start_grad_sync(force_all_reduce=force_all_reduce)
             return
         # If first batch, start asynchronous communication here. register_grad_ready() launches
         # asynchronous communication only once self.golden_per_param_grad_ready_counts is
         # populated at the end of this first batch.
         if self.is_first_batch:
-            self.start_grad_sync()
+            self.start_grad_sync(force_all_reduce=force_all_reduce)
         # When using multiple DistOpt instances, we don't need to sync here as we launch
         # communications on a separate communication stream.
         if self.ddp_config.num_distributed_optimizer_instances > 1:
@@ -529,7 +539,9 @@ class _ParamAndGradBucketGroup:
         self.grad_reduce_handle.wait()
         self.grad_reduce_handle = None
 
-    def register_grad_ready(self, param: torch.nn.Parameter):
+    def register_grad_ready(
+        self, param: torch.nn.Parameter, force_all_reduce: Optional[bool] = False
+    ):
         """
         Registers grads for the passed-in param to be "ready" for grad sync.
 
@@ -549,7 +561,7 @@ class _ParamAndGradBucketGroup:
             if not self.is_first_batch:
                 if self.per_param_grad_ready_counts == self.golden_per_param_grad_ready_counts:
                     assert len(self.per_param_grad_ready_counts) == len(self.params)
-                    self.start_grad_sync()
+                    self.start_grad_sync(force_all_reduce=force_all_reduce)
 
 
 class _ParamAndGradBuffer:
@@ -792,6 +804,10 @@ class _ParamAndGradBuffer:
                     requires_grad=False,
                 )
 
+        self.grad_data_size = 0
+        self.param_data_size = 0
+        self.param_data_cpu = None
+
         # Finally, map param.data and param.main_grad fields to buffers.
         bucket_params = []
         bucket_start_index = 0
@@ -942,6 +958,38 @@ class _ParamAndGradBuffer:
         Zero out the underlying grad_buffer.
         """
         self.grad_data.zero_()
+
+    def offload_to_cpu(self, move_params: bool = True, move_grads: bool = True) -> None:
+        """
+        Offload the buffers to CPU.
+        """
+        if move_grads and self.grad_data is not None and self.grad_data.storage().size() > 0:
+            self.grad_data_size = self.grad_data.storage().size()
+            self.grad_data.storage().resize_(0)
+        if move_params and self.param_data is not None and self.param_data.storage().size() > 0:
+            self.param_data_size = self.param_data.storage().size()
+            if self.param_data_cpu is not None:
+                self.param_data_cpu.copy_(self.param_data, non_blocking=True)
+            else:
+                self.param_data_cpu = self.param_data.cpu().pin_memory()
+            self.param_data.storage().resize_(0)
+
+    def reload_from_cpu(self, move_params: bool = True, move_grads: bool = True):
+        """
+        Reload the buffers from CPU.
+        """
+        if (
+            move_params
+            and self.param_data is not None
+            and self.param_data_cpu is not None
+            and self.param_data.storage().size() == 0
+        ):
+            self.param_data.storage().resize_(self.param_data_size)
+            self.param_data.copy_(self.param_data_cpu, non_blocking=True)
+        if move_grads and self.grad_data is not None and self.grad_data_size > 0:
+            self.grad_data.storage().resize_(self.grad_data_size)
+            self.grad_data.zero_()
+            self.grad_data_size = 0
 
 
 def partition_buckets(

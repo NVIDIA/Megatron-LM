@@ -2,7 +2,6 @@
 
 import asyncio
 import logging
-import os
 import time
 from typing import Awaitable, List, Optional, Union
 
@@ -54,12 +53,12 @@ class InferenceClient:
             completed requests.
     """
 
-    def __init__(self, inference_coordinator_port: int):
+    def __init__(self, inference_coordinator_address: str):
         """
         Initializes the InferenceClient.
 
         Args:
-            inference_coordinator_port (int): The port number on which the
+            inference_coordinator_address (str): The address on which the
                 inference coordinator is listening.
         """
         assert (
@@ -70,8 +69,7 @@ class InferenceClient:
         ), "please install the messagepack library to use InferenceClient - pip install msgpack"
         self.context = zmq.Context()
         socket = self.context.socket(zmq.DEALER)
-        inference_coordinator_address = os.getenv('MASTER_ADDR', '127.0.0.1')
-        socket.connect(f"tcp://{inference_coordinator_address}:{inference_coordinator_port}")
+        socket.connect(inference_coordinator_address)
 
         self._loop = None
         self.running = asyncio.Event()

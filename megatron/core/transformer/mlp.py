@@ -107,6 +107,10 @@ class MLP(MegatronModule):
         if self.config.gated_linear_unit:
             ffn_hidden_size *= 2
             fc1_stride = 2
+            if self.config.use_kitchen:
+                # Kitchen Linear doesn't support stride != 1.
+                # Weight resharding across TP sizes will have aforementioned problems.
+                fc1_stride = 1
         else:
             fc1_stride = 1
 
