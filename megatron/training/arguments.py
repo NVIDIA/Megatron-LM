@@ -1173,15 +1173,6 @@ def validate_args(args, defaults={}):
         args.no_load_optim = True
         warn_rank_0('enabling --no-load-optim when skipping training.')
 
-    # Experimental attention variant check
-    if args.linear_attention_type is not None:
-        print_rank_0(
-            '--linear-attention-type is deprecated, use --experimental-attention-variant instead.',
-            args.rank,
-        )
-        args.experimental_attention_variant = args.linear_attention_type
-        del args.linear_attention_type
-
     # Muon optimizer check
     if 'muon' in args.optimizer:
         # TODO: remove these checks once we support them
@@ -2788,8 +2779,6 @@ def _add_mla_args(parser):
 def _add_experimental_attention_variant_args(parser):
     group = parser.add_argument_group(title="experimental_attention_variant")
     # Linear attention
-    group.add_argument('--linear-attention-type', default=None, choices=['gated_delta_net'], type=str,
-                       help='(Deprecated, use --experimental-attention-variant instead) Type of linear attention to use. Currently support gated_delta_net.')
     group.add_argument('--linear-attention-freq', type=la_freq_type, default=None,
                        help='Frequency between LA (linear attention) layers and'
                             ' SDPA (scaled dot-product attention) layers. Accepts either: '
