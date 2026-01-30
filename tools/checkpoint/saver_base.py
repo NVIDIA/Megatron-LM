@@ -169,10 +169,52 @@ class MegatronCheckpointSaverBase:
         mpu.set_expert_model_parallel_rank(0)
         
         # For backward compatibility during local parallel states refactoring
+        # Create fake process groups for all parallel dimensions
         fake_tp_group = _ConverterFakeProcessGroup(size=self.args.target_tensor_parallel_size)
+        fake_pp_group = _ConverterFakeProcessGroup(size=self.args.target_pipeline_parallel_size)
         fake_ep_group = _ConverterFakeProcessGroup(size=self.args.target_expert_parallel_size)
+        fake_dp_group = _ConverterFakeProcessGroup(size=1) # Single Process for conversion
+        
+        # Model parallel groups
         mpu._TENSOR_MODEL_PARALLEL_GROUP = fake_tp_group
+        mpu._PIPELINE_MODEL_PARALLEL_GROUP = fake_pp_group
+        mpu._MODEL_PARALLEL_GROUP = fake_tp_group
         mpu._EXPERT_MODEL_PARALLEL_GROUP = fake_ep_group
+        mpu._EXPERT_TENSOR_PARALLEL_GROUP = fake_ep_group
+        mpu._EXPERT_TENSOR_AND_MODEL_PARALLEL_GROUP = fake_ep_group
+        mpu._EXPERT_TENSOR_MODEL_PIPELINE_PARALLEL_GROUP = fake_ep_group
+        
+        # Data parallel group
+        mpu._DATA_PARALLEL_GROUP = fake_dp_group
+        mpu._DATA_PARALLEL_GROUP_GLOO = fake_dp_group
+        mpu._DATA_PARALLEL_GROUP_WITH_CP = fake_dp_group
+        mpu._DATA_PARALLEL_GROUP_WITH_CP_GLOO = fake_dp_group
+        mpu._INTRA_PARTIAL_DATA_PARALLEL_GROUP_WITH_CP = fake_dp_group
+        mpu._INTER_PARTIAL_DATA_PARALLEL_GROUP_WITH_CP_GLOO = fake_dp_group
+        mpu._TENSOR_AND_DATA_PARALLEL_GROUP = fake_dp_group
+        mpu._EXPERT_AND_DATA_PARALLEL_GROUP_WITH_CP = fake_dp_group
+        
+        # Expert data parallel groups
+        mpu._EXPERT_DATA_PARALLEL_GROUP = fake_dp_group
+        mpu._EXPERT_DATA_PARALLEL_GROUP_GLOO = fake_dp_group
+        mpu._INTRA_PARTIAL_EXPERT_DATA_PARALLEL_GROUP = fake_dp_group
+        mpu._INTRA_PARTIAL_EXPERT_DATA_PARALLEL_GROUP_GLOO = fake_dp_group
+        mpu._INTER_PARTIAL_EXPERT_DATA_PARALLEL_GROUP = fake_dp_group
+        mpu._INTER_PARTIAL_EXPERT_DATA_PARALLEL_GROUP_GLOO = fake_dp_group
+        
+        # Context parallel groups (set to None as not used in conversion)
+        mpu._CONTEXT_PARALLEL_GROUP = None
+        mpu._TENSOR_AND_CONTEXT_PARALLEL_GROUP = None
+        mpu._HIERARCHICAL_CONTEXT_PARALLEL_GROUPS = None
+        
+        # Embedding groups (set to None, handled separately in conversion)
+        mpu._EMBEDDING_GROUP = None
+        mpu._POSITION_EMBEDDING_GROUP = None
+        
+        # Distributed optimizer group
+        mpu._INTRA_DISTRIBUTED_OPTIMIZER_INSTANCE_GROUP = None
+        
+        
         fused_kernels.load(self.margs)
         
         try:
