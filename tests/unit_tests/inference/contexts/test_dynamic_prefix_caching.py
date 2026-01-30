@@ -1706,3 +1706,481 @@ class TestDynamicPrefixCaching:
 
         # Verify: _pending_block_hashes in allocator should also be cleared
         assert len(dynamic_context.block_allocator._pending_block_hashes) == 0
+
+    @pytest.mark.internal
+    def test_two_phase_registration_flow(self):
+        """Test the full two-phase registration: register → discoverable but pending → mark computed."""
+        self._setup_model_parallel_group(1, 1)
+        dynamic_context = self._get_dynamic_context(
+            params_dtype=torch.float32,
+            num_layers=4,
+            kv_channels=8,
+            num_attention_heads=2,
+            max_sequence_length=512,
+            buffer_size_gb=0.1,
+            block_size_tokens=32,
+            max_tokens=None,
+            is_hybrid_model=False,
+            rounder=64,
+        )
+
+        block_size = dynamic_context.block_size_tokens
+        allocator = dynamic_context.block_allocator
+
+        # Create request with 2 complete blocks
+        prompt_tokens = torch.arange(
+            block_size * 2, device=torch.cuda.current_device()
+        )
+        request = DynamicInferenceRequest(
+            request_id=1,
+            prompt_tokens=prompt_tokens,
+            sampling_params=SamplingParams(num_tokens_to_generate=10),
+            block_size_tokens=block_size,
+            enable_prefix_caching=True,
+        )
+
+        # Add request
+        dynamic_context.add_request(request)
+
+        # Get block IDs
+        block_0 = dynamic_context.request_to_kv_block_ids[0][0].item()
+        block_1 = dynamic_context.request_to_kv_block_ids[0][1].item()
+
+        # Phase 1: After add_request, blocks should be in hash_to_block_id but block_hashes == -1
+        hash_0 = request.precomputed_block_hashes[0]
+        hash_1 = request.precomputed_block_hashes[1]
+
+        # Blocks are discoverable by hash
+        assert allocator.lookup_block_by_hash(hash_0) == block_0, (
+            "Block 0 should be discoverable by hash after add_request"
+        )
+        assert allocator.lookup_block_by_hash(hash_1) == block_1, (
+            "Block 1 should be discoverable by hash after add_request"
+        )
+
+        # But block_hashes is still -1 (not computed)
+        assert allocator.get_block_hash(block_0) == -1, (
+            "Block 0 hash should be -1 (pending) before mark_pending_blocks_computed"
+        )
+        assert allocator.get_block_hash(block_1) == -1, (
+            "Block 1 hash should be -1 (pending) before mark_pending_blocks_computed"
+        )
+
+        # Blocks should be in pending lists
+        assert block_0 in allocator._pending_block_hashes
+        assert block_1 in allocator._pending_block_hashes
+        assert len(dynamic_context._blocks_pending_computation) == 2
+
+        # Phase 2: After mark_pending_blocks_computed, block_hashes should be set
+        dynamic_context.mark_pending_blocks_computed()
+
+        assert allocator.get_block_hash(block_0) == hash_0, (
+            "Block 0 hash should be set after mark_pending_blocks_computed"
+        )
+        assert allocator.get_block_hash(block_1) == hash_1, (
+            "Block 1 hash should be set after mark_pending_blocks_computed"
+        )
+
+        # Pending lists should be cleared
+        assert block_0 not in allocator._pending_block_hashes
+        assert block_1 not in allocator._pending_block_hashes
+        assert len(dynamic_context._blocks_pending_computation) == 0
+
+    @pytest.mark.internal
+    def test_lookup_vs_get_hash_difference(self):
+        """Test that lookup_block_by_hash finds pending blocks but get_block_hash returns -1."""
+        self._setup_model_parallel_group(1, 1)
+        dynamic_context = self._get_dynamic_context(
+            params_dtype=torch.float32,
+            num_layers=4,
+            kv_channels=8,
+            num_attention_heads=2,
+            max_sequence_length=512,
+            buffer_size_gb=0.1,
+            block_size_tokens=32,
+            max_tokens=None,
+            is_hybrid_model=False,
+            rounder=64,
+        )
+
+        allocator = dynamic_context.block_allocator
+
+        # Allocate a block and register its hash (but don't mark computed)
+        block_ids = allocator.allocate_memory_blocks(1)
+        block_id = block_ids[0].item()
+        test_hash = 99999
+
+        allocator.register_block_hash(block_id, test_hash)
+
+        # lookup_block_by_hash should find the block
+        found_block = allocator.lookup_block_by_hash(test_hash)
+        assert found_block == block_id, (
+            "lookup_block_by_hash should find the pending block"
+        )
+
+        # But get_block_hash should return -1 (not computed yet)
+        stored_hash = allocator.get_block_hash(block_id)
+        assert stored_hash == -1, (
+            "get_block_hash should return -1 for pending block"
+        )
+
+        # This is the key difference that enables coordination:
+        # A second request can FIND the block (lookup) but knows it's not READY (get_hash == -1)
+
+        # After marking computed, get_block_hash should return the actual hash
+        allocator.mark_block_computed(block_id)
+        stored_hash_after = allocator.get_block_hash(block_id)
+        assert stored_hash_after == test_hash, (
+            "get_block_hash should return actual hash after mark_block_computed"
+        )
+
+    @pytest.mark.internal
+    def test_eviction_cleans_pending_hashes(self):
+        """Test that evicting a pending block cleans up both pending and hash mappings."""
+        self._setup_model_parallel_group(1, 1)
+        dynamic_context = self._get_dynamic_context(
+            params_dtype=torch.float32,
+            num_layers=4,
+            kv_channels=8,
+            num_attention_heads=2,
+            max_sequence_length=512,
+            buffer_size_gb=0.01,  # Small buffer to make eviction easier
+            block_size_tokens=32,
+            max_tokens=None,
+            is_hybrid_model=False,
+            rounder=1,
+        )
+
+        allocator = dynamic_context.block_allocator
+
+        # Allocate a block, register its hash (pending state)
+        block_ids = allocator.allocate_memory_blocks(1)
+        block_id = block_ids[0].item()
+        test_hash = 88888
+
+        allocator.register_block_hash(block_id, test_hash)
+
+        # Verify pending state
+        assert block_id in allocator._pending_block_hashes
+        assert test_hash in allocator.hash_to_block_id
+        assert allocator.get_block_hash(block_id) == -1
+
+        # Set ref_count to 0 so block is evictable (cached state)
+        allocator.block_ref_counts[block_id] = 0
+
+        # Force the block back to free pool (simulating release)
+        allocator.release_memory_blocks(block_ids)
+
+        # Manually call evict_lru_blocks with enough blocks to evict our block
+        # First, we need to exhaust available blocks to trigger eviction
+        initial_avail = allocator.total_avail
+
+        # Allocate all available blocks
+        if initial_avail > 0:
+            _ = allocator.allocate_memory_blocks(initial_avail)
+
+        # Now try to allocate more - this should trigger eviction
+        # But first, we need blocks in cached state (ref_count=0)
+        # The block we registered should be in the evictable set if ref_count=0
+
+        # Re-add the block to simulate it being cached but evictable
+        allocator.release_memory_blocks(torch.tensor([block_id], device='cuda'))
+        allocator.block_ref_counts[block_id] = 0
+        allocator._pending_block_hashes[block_id] = test_hash
+        allocator.hash_to_block_id[test_hash] = block_id
+
+        # Now evict
+        allocator.evict_lru_blocks(1)
+
+        # After eviction, pending hash should be cleaned up
+        assert block_id not in allocator._pending_block_hashes, (
+            "Pending hash should be removed after eviction"
+        )
+        assert test_hash not in allocator.hash_to_block_id, (
+            "Hash mapping should be removed after eviction"
+        )
+
+    @pytest.mark.internal
+    def test_prefix_matching_requires_sequential_match(self):
+        """Test that prefix matching stops at first non-matching block."""
+        self._setup_model_parallel_group(1, 1)
+        dynamic_context = self._get_dynamic_context(
+            params_dtype=torch.float32,
+            num_layers=4,
+            kv_channels=8,
+            num_attention_heads=2,
+            max_sequence_length=512,
+            buffer_size_gb=0.1,
+            block_size_tokens=32,
+            max_tokens=None,
+            is_hybrid_model=False,
+            rounder=64,
+        )
+
+        block_size = dynamic_context.block_size_tokens
+        allocator = dynamic_context.block_allocator
+
+        # Create first request with 3 blocks: [A, B, C]
+        prompt_1 = torch.arange(block_size * 3, device=torch.cuda.current_device())
+        request_1 = DynamicInferenceRequest(
+            request_id=1,
+            prompt_tokens=prompt_1,
+            sampling_params=SamplingParams(num_tokens_to_generate=10),
+        )
+        dynamic_context.add_request(request_1)
+        dynamic_context.mark_pending_blocks_computed()
+
+        req1_block_0 = dynamic_context.request_to_kv_block_ids[0][0].item()
+        req1_block_1 = dynamic_context.request_to_kv_block_ids[0][1].item()
+        req1_block_2 = dynamic_context.request_to_kv_block_ids[0][2].item()
+
+        # Create second request: [A, X, C] - same first and third, different second
+        # This tests that matching MUST be sequential - we can't skip block 1
+        prompt_2 = torch.arange(block_size * 3, device=torch.cuda.current_device())
+        # Modify middle block tokens (indices 32-63)
+        prompt_2[block_size:block_size * 2] += 5000
+
+        request_2 = DynamicInferenceRequest(
+            request_id=2,
+            prompt_tokens=prompt_2,
+            sampling_params=SamplingParams(num_tokens_to_generate=10),
+        )
+        dynamic_context.add_request(request_2)
+
+        req2_block_0 = dynamic_context.request_to_kv_block_ids[1][0].item()
+        req2_block_1 = dynamic_context.request_to_kv_block_ids[1][1].item()
+        req2_block_2 = dynamic_context.request_to_kv_block_ids[1][2].item()
+
+        # Only block 0 should be shared (sequential match stops at block 1)
+        assert req2_block_0 == req1_block_0, "Block 0 should be shared (same content)"
+        assert req2_block_1 != req1_block_1, "Block 1 should NOT be shared (different content)"
+
+        # Block 2 should NOT be shared even though content would match
+        # because the hash chain is broken (different parent hash from block 1)
+        assert req2_block_2 != req1_block_2, (
+            "Block 2 should NOT be shared - hash chain is broken at block 1"
+        )
+
+        # Verify ref counts
+        assert allocator.block_ref_counts[req1_block_0].item() == 2  # Shared
+        assert allocator.block_ref_counts[req1_block_1].item() == 1  # Not shared
+        assert allocator.block_ref_counts[req1_block_2].item() == 1  # Not shared
+        assert allocator.block_ref_counts[req2_block_1].item() == 1  # Newly allocated
+        assert allocator.block_ref_counts[req2_block_2].item() == 1  # Newly allocated
+
+    @pytest.mark.internal
+    def test_pending_block_detection_logic(self):
+        """Test the logic used by engine's _has_pending_prefix_blocks."""
+        self._setup_model_parallel_group(1, 1)
+        dynamic_context = self._get_dynamic_context(
+            params_dtype=torch.float32,
+            num_layers=4,
+            kv_channels=8,
+            num_attention_heads=2,
+            max_sequence_length=512,
+            buffer_size_gb=0.1,
+            block_size_tokens=32,
+            max_tokens=None,
+            is_hybrid_model=False,
+            rounder=64,
+        )
+
+        block_size = dynamic_context.block_size_tokens
+        allocator = dynamic_context.block_allocator
+
+        # Create first request with 2 blocks
+        prompt = torch.arange(block_size * 2, device=torch.cuda.current_device())
+        request_1 = DynamicInferenceRequest(
+            request_id=1,
+            prompt_tokens=prompt.clone(),
+            sampling_params=SamplingParams(num_tokens_to_generate=10),
+            block_size_tokens=block_size,
+            enable_prefix_caching=True,
+        )
+
+        # Add request - blocks are registered but pending
+        dynamic_context.add_request(request_1)
+
+        # Create second request with same prompt - it has precomputed hashes
+        request_2 = DynamicInferenceRequest(
+            request_id=2,
+            prompt_tokens=prompt.clone(),
+            sampling_params=SamplingParams(num_tokens_to_generate=10),
+            block_size_tokens=block_size,
+            enable_prefix_caching=True,
+        )
+
+        # Simulate _has_pending_prefix_blocks logic:
+        # Check if any precomputed hash matches a pending (uncomputed) block
+        def has_pending_prefix_blocks(req):
+            """Simulate engine's _has_pending_prefix_blocks."""
+            if req.precomputed_block_hashes is None:
+                return False
+            if len(req.precomputed_block_hashes) == 0:
+                return False
+
+            for block_hash in req.precomputed_block_hashes:
+                block_id = allocator.lookup_block_by_hash(block_hash)
+                if block_id is None:
+                    break  # No block with this hash - no need to wait
+                stored_hash = allocator.get_block_hash(block_id)
+                if stored_hash == -1:
+                    return True  # Block exists but not computed - wait!
+            return False
+
+        # Before mark_pending_blocks_computed: request_2 should detect pending blocks
+        assert has_pending_prefix_blocks(request_2), (
+            "Should detect pending blocks before mark_pending_blocks_computed"
+        )
+
+        # After mark_pending_blocks_computed: no more pending blocks
+        dynamic_context.mark_pending_blocks_computed()
+        assert not has_pending_prefix_blocks(request_2), (
+            "Should NOT detect pending blocks after mark_pending_blocks_computed"
+        )
+
+    @pytest.mark.internal
+    def test_pending_block_detection_edge_cases(self):
+        """Test edge cases for pending block detection."""
+        self._setup_model_parallel_group(1, 1)
+        dynamic_context = self._get_dynamic_context(
+            params_dtype=torch.float32,
+            num_layers=4,
+            kv_channels=8,
+            num_attention_heads=2,
+            max_sequence_length=512,
+            buffer_size_gb=0.1,
+            block_size_tokens=32,
+            max_tokens=None,
+            is_hybrid_model=False,
+            rounder=64,
+        )
+
+        block_size = dynamic_context.block_size_tokens
+        allocator = dynamic_context.block_allocator
+
+        def has_pending_prefix_blocks(req):
+            """Simulate engine's _has_pending_prefix_blocks."""
+            if req.precomputed_block_hashes is None:
+                return False
+            if len(req.precomputed_block_hashes) == 0:
+                return False
+
+            for block_hash in req.precomputed_block_hashes:
+                block_id = allocator.lookup_block_by_hash(block_hash)
+                if block_id is None:
+                    break
+                stored_hash = allocator.get_block_hash(block_id)
+                if stored_hash == -1:
+                    return True
+            return False
+
+        # Edge case 1: precomputed_block_hashes is None
+        request_none = DynamicInferenceRequest(
+            request_id=1,
+            prompt_tokens=torch.arange(block_size, device=torch.cuda.current_device()),
+            sampling_params=SamplingParams(num_tokens_to_generate=10),
+            # Not passing block_size_tokens, so hashes won't be precomputed
+        )
+        # Manually set to None to test
+        request_none.precomputed_block_hashes = None
+        assert not has_pending_prefix_blocks(request_none), (
+            "Should return False when precomputed_block_hashes is None"
+        )
+
+        # Edge case 2: precomputed_block_hashes is empty list (prompt < block_size)
+        request_short = DynamicInferenceRequest(
+            request_id=2,
+            prompt_tokens=torch.arange(block_size // 2, device=torch.cuda.current_device()),
+            sampling_params=SamplingParams(num_tokens_to_generate=10),
+            block_size_tokens=block_size,
+            enable_prefix_caching=True,
+        )
+        assert request_short.precomputed_block_hashes == [], (
+            "Short prompt should have empty precomputed_block_hashes"
+        )
+        assert not has_pending_prefix_blocks(request_short), (
+            "Should return False when precomputed_block_hashes is empty"
+        )
+
+        # Edge case 3: First hash not found (no existing block)
+        request_new = DynamicInferenceRequest(
+            request_id=3,
+            prompt_tokens=torch.arange(1000, 1000 + block_size * 2, device=torch.cuda.current_device()),
+            sampling_params=SamplingParams(num_tokens_to_generate=10),
+            block_size_tokens=block_size,
+            enable_prefix_caching=True,
+        )
+        # No blocks with these hashes exist yet
+        assert not has_pending_prefix_blocks(request_new), (
+            "Should return False when no matching block exists"
+        )
+
+    @pytest.mark.internal
+    def test_second_request_can_share_after_first_computed(self):
+        """Test full coordination flow: request 2 shares blocks only after request 1's KV is computed."""
+        self._setup_model_parallel_group(1, 1)
+        dynamic_context = self._get_dynamic_context(
+            params_dtype=torch.float32,
+            num_layers=4,
+            kv_channels=8,
+            num_attention_heads=2,
+            max_sequence_length=512,
+            buffer_size_gb=0.1,
+            block_size_tokens=32,
+            max_tokens=None,
+            is_hybrid_model=False,
+            rounder=64,
+        )
+
+        block_size = dynamic_context.block_size_tokens
+        allocator = dynamic_context.block_allocator
+
+        # Request 1 added - blocks registered but pending
+        prompt = torch.arange(block_size * 2, device=torch.cuda.current_device())
+        request_1 = DynamicInferenceRequest(
+            request_id=1,
+            prompt_tokens=prompt.clone(),
+            sampling_params=SamplingParams(num_tokens_to_generate=10),
+            block_size_tokens=block_size,
+            enable_prefix_caching=True,
+        )
+        dynamic_context.add_request(request_1)
+
+        # At this point, blocks are in pending state
+        block_0 = dynamic_context.request_to_kv_block_ids[0][0].item()
+        block_1 = dynamic_context.request_to_kv_block_ids[0][1].item()
+
+        # Verify pending state
+        assert allocator.get_block_hash(block_0) == -1
+        assert allocator.get_block_hash(block_1) == -1
+        assert allocator.block_ref_counts[block_0].item() == 1
+        assert allocator.block_ref_counts[block_1].item() == 1
+
+        # Simulate: Engine computes KV for request 1 and marks blocks computed
+        dynamic_context.mark_pending_blocks_computed()
+
+        # Now blocks are computed
+        assert allocator.get_block_hash(block_0) != -1
+        assert allocator.get_block_hash(block_1) != -1
+
+        # Request 2 with same prompt can now share blocks
+        request_2 = DynamicInferenceRequest(
+            request_id=2,
+            prompt_tokens=prompt.clone(),
+            sampling_params=SamplingParams(num_tokens_to_generate=10),
+            block_size_tokens=block_size,
+            enable_prefix_caching=True,
+        )
+        dynamic_context.add_request(request_2)
+
+        # Verify blocks are shared
+        req2_block_0 = dynamic_context.request_to_kv_block_ids[1][0].item()
+        req2_block_1 = dynamic_context.request_to_kv_block_ids[1][1].item()
+
+        assert req2_block_0 == block_0, "Request 2 should share block 0"
+        assert req2_block_1 == block_1, "Request 2 should share block 1"
+
+        # Ref counts should be 2
+        assert allocator.block_ref_counts[block_0].item() == 2
+        assert allocator.block_ref_counts[block_1].item() == 2
