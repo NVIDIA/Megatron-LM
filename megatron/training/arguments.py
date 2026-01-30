@@ -327,22 +327,86 @@ def validate_args(args, defaults={}):
     total_model_size = args.tensor_model_parallel_size * args.pipeline_model_parallel_size * args.context_parallel_size
     args.data_parallel_size = args.world_size // total_model_size
 
-    # Assert that `torch_memory_saver` is installed if offloading KV cache during RL.
-    if args.rl_offload_kv_cache_during_training:
-        try:
-            from torch_memory_saver import torch_memory_saver
-        except ImportError:
-            raise AssertionError("To use offload-kv-cache-during-training, `torch_memory_saver` must be installed. See https://github.com/fzyzcjy/torch_memory_saver.")
-        assert not args.inference_dynamic_batching_unified_memory_level, "The KV cache should not be instantiated in unified memory when it is offloaded during training."
-
-    # Batch size checks if running RL.
     if args.perform_rl_step:
-        assert not (args.rl_remove_kv_cache_during_training and args.rl_offload_kv_cache_during_training), \
-            "Cannot use both remove-kv-cache-during-training and offload-kv-cache-during-training"
+        # CUDA graph and KV$ handling support matrix is as follows:
+        # ------------------------------------------------
+        # Resetting CGs only makes sense if we build any CGs
+        has_cg = args.cuda_graph_impl != "none" or args.rl_training_cuda_graphs
+        assert not args.rl_reset_cuda_graphs or has_cg, (
+            "--rl-reset-cuda-graphs is set but no CUDA graphs are being built."
+        )
+        # Persisting CGs requires either torch_memory_saver or UVM
+        if not args.rl_reset_cuda_graphs:
+            try:
+                from torch_memory_saver import torch_memory_saver
+            except ImportError:
+                assert args.inference_dynamic_batching_unified_memory_level > 0, (
+                    "--rl-persist-cuda-graphs requires either torch_memory_saver or "
+                    "--inference-dynamic-batching-unified-memory-level > 0."
+                )
+        # If we are using both training and inference CGs without resetting them,
+        # and we do not offload or remove the KV$, then we use too much memory.
+            if (
+                args.cuda_graph_impl != "none" and \
+                args.rl_training_cuda_graphs and \
+                not args.rl_offload_kv_cache_during_training and \
+                not args.rl_remove_kv_cache_during_training
+            ):
+                warn_rank_0(
+                    "Both training and inference CUDA graphs are enabled, and persist. "
+                    "The KV$ is neither offloaded nor deleted. This combination of "
+                    "arguments will lead to severe memory pressure and should be avoided."
+                )
 
-        assert not (args.rl_partial_rollouts and args.rl_remove_kv_cache_during_training), \
-            "Cannot use both partial-rollouts and remove-kv-cache-during-training"
+        # Offloading the KV$ is technically what UVM does.
+        # Having both arguments active does not cause any issues, but should be avoided.
+        if args.rl_offload_kv_cache_during_training:
+            if args.inference_dynamic_batching_unified_memory_level > 0:
+                warn_rank_0(
+                    "--inference-dynamic-batching-unified-memory-level and "
+                    "--rl-offload-kv-cache-during-training are both set. "
+                    "This will not cause issues currently, but it is not recommended or supported."
+                )
+        # We definitely cannot remove the KV$ if we are offloading it.
+            assert not args.rl_remove_kv_cache_during_training, (
+                "Cannot use both --rl-remove-kv-cache-during-training and "
+                "--rl-offload-kv-cache-during-training."
+            )
+        # Due to KV$ recomputation we can have partial rollouts and KV$ removal.
+        # We just assert that every single request record is marked for recomputation.
+        # ------------------------------------------------
+        # CGs are handled as follows:
+        #  - The inference engine's init builds inference CGs, if desired.
+        #    ** This is controlled by `--cuda-graph-impl`.
+        #  - Training is graphed on the first training step, if desired.
+        #    ** This is controlled by `--rl-training-cuda-graphs`.
+        #  - `megatron_rl_inference_mode` inside rl_utils toggles CGs on/off
+        #      if inference is graphed but training is not.
+        #      Only the RL loop is aware that there's both training and inference.
+        #    ** This is controlled by `--cuda-graph-impl` and `--rl-training-cuda-graphs`.
+        #  - The engine - not the RL loop! - deletes and creates cuda graphs.
+        #      The engine needs to be aware of whether CGs are being used.
+        #    ** This is controlled by `--rl-reset-cuda-graphs`.
+        #  - The context ensures that the CGs still point to the correct memory addresses.
+        #    ** This is attempted through UVM if enabled, otherwise through `torch_memory_saver`.
+        #
+        # KV$ management is handled as follows:
+        #  - The context initially allocates the KV$, either with or without UVM.
+        #    ** This is controlled by `--inference-dynamic-batching-unified-memory-level`.
+        #  - When RL is finished with inference, it suspends the engine.
+        #    ** With `--rl-partial-rollouts`, it expects the engine to freeze its state.
+        #  - Suspending the engine causes it to handle the KV$ according to the provided arguments:
+        #    ** With `--rl-offload-kv-cache-during-training`, the KV$ is offloaded to CPU memory.
+        #    ** With `--rl-remove-kv-cache-during-training`, the KV$ is deleted.
+        #  - When RL is finished with training, it resumes the engine.
+        #    ** With `--rl-partial-rollouts`, it expects the engine to resume its state.
+        #  - Resuming the engine causes it to restore the KV$.
+        #    ** If offloaded, the KV$ is copied back to GPU memory.
+        #  - The engine proceeds to recompute the KV$ of any request records marked as "recompute".
+        #    ** If using both partial rollouts and KV$ removal, "recompute" must mark all requests.
+        # ------------------------------------------------
 
+        # TODO: Add support for `torch_memory_saver` with async model weight offload.
         assert not (
             args.rl_offload_inference_model_weights_when_idle
             and args.rl_inference_model_unified_memory_level != 1
@@ -350,6 +414,7 @@ def validate_args(args, defaults={}):
             "--rl-offload-inference-model-weights-when-idle requires "
             "--rl-inference-model-unified-memory-level=1."
         )
+        # TODO: Add support for `torch_memory_saver` with async KV$ offload.
 
         # When using different EP sizes for inference and training (EP refit), the legacy
         # GroupedMLP is not supported. Only SequentialMLP or TEGroupedMLP can be used.
@@ -1987,6 +2052,9 @@ def _add_rl_args(parser):
                        help='Remove KV cache during training to save GPU memory')
     group.add_argument('--rl-reset-cuda-graphs', action=argparse.BooleanOptionalAction, type=bool, default=False,
                        help='Reset CUDA graphs between inference/training to save GPU memory')
+    group.add_argument('--rl-training-cuda-graphs', action=argparse.BooleanOptionalAction, type=bool,
+                       default=False,
+                       help='If set, do not call `delete_cuda_graphs` or `toggle_cuda_graphs` when the inference engine is suspended.')
     group.add_argument('--rl-partial-rollouts', action=argparse.BooleanOptionalAction, default=False,
                        help='If set, use partial rollouts.')
     group.add_argument('--rl-inference-logprobs-is-correction', action=argparse.BooleanOptionalAction, type=bool, default=False,
@@ -2002,9 +2070,6 @@ def _add_rl_args(parser):
                        help='Algorithm for distributing packed bins across ranks. '
                             'fifo: first-in-first-out sequential distribution, '
                             'round-robin: distribute bins cyclically across ranks for better load balancing')
-    group.add_argument('--rl-training-cuda-graphs', action=argparse.BooleanOptionalAction, type=bool,
-                       default=False,
-                       help='If set, do not call `delete_cuda_graphs` or `toggle_cuda_graphs` when the inference engine is suspended.')
     group.add_argument('--rl-inference-tensor-model-parallel-size', type=int, default=None,
                        help='Degree of tensor model parallelism for inference for RL.')     
     group.add_argument(

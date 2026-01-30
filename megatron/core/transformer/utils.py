@@ -391,7 +391,7 @@ def init_cuda_graph_cache(model):
     find_modules_with_attrs(model_modules)
 
 
-def toggle_cuda_graphs(model, set_to="none", reset_cuda_graphs=True):
+def toggle_cuda_graphs(model, set_to="none", reset_cuda_graphs=False):
     """
     Toggle CUDA graph-related attributes for the model and its modules.
 
