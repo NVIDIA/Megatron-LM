@@ -116,6 +116,7 @@ class RequestEntry:
 
     record: DynamicInferenceRequestRecord
     future: asyncio.Future
+    recompute_soon: bool = False
 
 
 # pylint: disable=line-too-long
@@ -622,9 +623,10 @@ class DynamicInferenceEngine(AbstractEngine):
         self.resume_request_ids = [*active_request_ids, *waiting_request_ids]
         self.waiting_request_ids.clear()
 
-        # Suspend requests objects.
+        # Suspend request objects that are marked for recompute.
         for request_id in active_request_ids:
-            self.requests[request_id].record.checkpoint()
+            if self.requests[request_id].recompute_soon:
+                self.requests[request_id].record.checkpoint()
 
     def resume(self):
         """Resume engine by reallocating context's GPU state."""
@@ -655,11 +657,14 @@ class DynamicInferenceEngine(AbstractEngine):
                 self.create_cuda_graphs()
             capture_time = time.time() - capture_time
 
-            # Add requests.
+            # Add requests that are marked for recompute.
             add_time = time.time()
             torch.cuda.synchronize()
             for request_id in self.resume_request_ids:
-                self._add_request(self.get_request(request_id))
+                request_entry = self.requests[request_id]
+                if request_entry.recompute_soon:
+                    self._add_request(self.get_request(request_id))
+                    request_entry.recompute_soon = False
             torch.cuda.synchronize()
             add_time = time.time() - add_time
 
