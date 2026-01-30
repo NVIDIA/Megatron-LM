@@ -116,6 +116,8 @@ def get_batch(data_iterator, vp_stage=None):
 # define spiky loss as a loss that's 10x the max loss observed
 SPIKY_LOSS_FACTOR = 10
 
+loss_func_cached_logits = None
+
 def loss_func(loss_mask: torch.Tensor, output_tensor: torch.Tensor, model: Optional[HybridModel] = None):
     """Loss function.
 
@@ -132,6 +134,17 @@ def loss_func(loss_mask: torch.Tensor, output_tensor: torch.Tensor, model: Optio
     args = get_args()
     if has_nvidia_modelopt and getattr(args, 'modelopt_enabled', False):  # [ModelOpt]
         loss, num_tokens, report = loss_func_modelopt(loss_mask, output_tensor, model=model)
+    elif args.logits_load_dir is not None:
+        global loss_func_cached_logits
+        if loss_func_cached_logits is None:
+            from megatron.training.cached_logits_loss import LossFuncCallable
+            loss_func_cached_logits = LossFuncCallable(
+                logprobs_dir=args.logits_load_dir,
+                num_workers=args.logits_load_num_workers,
+                prefetch_factor=args.logits_load_prefetch_factor,
+                kd_loss_alpha=args.logits_load_kd_loss_alpha,
+            )
+        loss, num_tokens, report = loss_func_cached_logits(loss_mask, output_tensor, model=model)
     else:
         losses = output_tensor.view(-1).float()
         loss_mask = loss_mask.view(-1).float()
