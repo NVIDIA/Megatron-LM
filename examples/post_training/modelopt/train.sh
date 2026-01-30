@@ -23,18 +23,15 @@ if [ -z ${MLM_MODEL_SAVE} ]; then
     printf "${MLM_WARNING} Variable ${PURPLE}MLM_MODEL_SAVE${WHITE} is not set (default: ${MLM_MODEL_CKPT})!\n"
 fi
 
-if [ -z ${DATASET} ]; then
-    DATASET="Magpie-Align/Magpie-Llama-3.1-Pro-MT-300K-Filtered"
-    printf "${MLM_WARNING} Variable ${PURPLE}DATASET${WHITE} is not set (default: Magpie-Align/Magpie-Llama-3.1-Pro-MT-300K-Filtered)!\n"
-fi
-
 if [ -z ${MLM_DATA_ARGS} ]; then
     MLM_DATA_ARGS=" \
         --train-samples 128000 \
         --lr-decay-samples 128000 \
         --lr-warmup-samples 0 \
-        --split 100,0,0 \
-        --finetune-hf-dataset ${DATASET} \
+	--sft \
+	--sft-tokenizer-prompt-format identity \
+	--tokenizer-type SFTTokenizer \
+	--per-split-data-args-path ${BLEND_PATH} \
     "
 fi
 
@@ -76,7 +73,7 @@ fi
 
 export HF_TOKEN=${HF_TOKEN}
 
-${LAUNCH_SCRIPT} pretrain_gpt.py \
+${LAUNCH_SCRIPT} pretrain_mamba.py \
     ${MODEL_ARGS} \
     --tensor-model-parallel-size ${TP} \
     --expert-tensor-parallel-size ${ETP} \
