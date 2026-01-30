@@ -243,7 +243,7 @@ class StaticInferenceEngine(AbstractEngine):
             )
 
         # Return the underlying `InferenceRequest` objects from the `DynamicInferenceRequestRecord`s.
-        return [record.results[0] for record in request_records]
+        return [record.merge() for record in request_records]
 
     def generate_using_legacy_static_engine(
         self,

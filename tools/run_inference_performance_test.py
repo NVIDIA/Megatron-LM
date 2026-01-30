@@ -238,7 +238,7 @@ def main():
         records: List[DynamicInferenceRequestRecord] = inference_engine.generate(
             prompts=prompts, sampling_params=sampling_params
         )
-        results: List[InferenceRequest] = [record.requests[0] for record in records]
+        results: List[InferenceRequest] = [record.merge() for record in records]
 
     end_time = time.perf_counter()
     latency = end_time - start_time
