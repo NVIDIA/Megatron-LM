@@ -1,4 +1,5 @@
 # Copyright (c) 2025, NVIDIA CORPORATION. All rights reserved.
+from __future__ import annotations
 
 HAVE_KITCHEN = False
 
