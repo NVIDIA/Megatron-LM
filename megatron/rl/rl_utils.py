@@ -518,6 +518,10 @@ def get_environment_rollouts(
                     rollouts = [
                         loop.run_until_complete(anext(rollout_generator)) for _ in range(n_prompts)
                     ]
+                    # In deterministic mode, sort rollouts by problem_id for consistent ordering
+                    # regardless of completion order due to system timing jitter.
+                    if torch.are_deterministic_algorithms_enabled():
+                        rollouts.sort(key=lambda group: group[0].problem_id if group and group[0].problem_id else "")
                     if not args.rl_partial_rollouts:
                         while True:
                             try:
