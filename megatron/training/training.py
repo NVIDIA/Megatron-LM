@@ -42,6 +42,7 @@ import logging
 import math
 import os
 import sys
+import multiprocessing
 from contextlib import nullcontext
 from typing import Any, Optional, Dict
 
@@ -49,6 +50,9 @@ import torch.distributed
 
 from megatron.core.optimizer.distrib_optimizer import DistributedOptimizer
 from .log_handler import CustomHandler
+
+from megatron.core.tensor_tracer import _set_tt_hook_manager
+from .training_wsserver import websocket_server_process
 
 # Make default logging level INFO, but filter out all log messages not from MCore.
 logging.basicConfig(handlers=[CustomHandler()], level=logging.INFO)
@@ -904,6 +908,8 @@ def pretrain(
     model, optimizer, opt_param_scheduler = setup_model_and_optimizer(
         model_provider, model_type, checkpointing_context=checkpointing_context
     )
+    if args.tensor_tracer_port is not None:
+        _set_tt_hook_manager(args, model)
 
     timers('model-and-optimizer-setup').stop()
     print_datetime('after model, optimizer, and learning rate ' 'scheduler are built')
@@ -2446,6 +2452,60 @@ def train(
     args = get_args()
     timers = get_timers()
 
+    if args.tensor_tracer_port is not None and torch.distributed.get_rank() == 0:
+        data_queue = multiprocessing.Queue()
+        config_queue = multiprocessing.Queue(maxsize=1)
+        start_training_event = multiprocessing.Event()
+        shutdown_event = multiprocessing.Event()
+        training_args_dict = {
+            "micro_batch_size": args.micro_batch_size,
+            "seq_length": args.seq_length,
+            "num_layers": args.num_layers
+        }
+        ws_process = multiprocessing.Process(
+            target=websocket_server_process,
+            args=(args.tensor_tracer_port, data_queue, config_queue, start_training_event, shutdown_event, training_args_dict),
+            daemon=True
+        )
+        ws_process.start()
+        from megatron.core.tensor_tracer import FlagType, set_report
+        def report_func(name_tuple, report_args, tensor_data):
+            # name_tuple is (layer_id, FlagType)
+            # report_args are specific to the FlagType (e.g., [n,m] for attention)
+            # tensor_data is the actual data (list or tensor that can be .tolist())
+            try:
+                if name_tuple[1] == FlagType.INVALID_FLAG:
+                    return
+                torch.cuda.synchronize()
+                data_queue.put_nowait((name_tuple, report_args, tensor_data.to('cpu', non_blocking=True)))
+            except Exception as e:
+                pass
+        set_report(report_func)
+
+    if args.tensor_tracer_port is not None:
+        if torch.distributed.get_rank() == 0:
+            print_rank_0("Waiting for 'run_training_step' command from frontend to start training...")
+            start_training_event.wait()
+            print_rank_0("Command received. Synchronizing configs across all ranks...")
+
+        if torch.distributed.get_rank() == 0:
+            received_configs = config_queue.get()
+            vis_flags = received_configs.get('visualization_flags', {})
+            dist_configs = received_configs.get('disturbance_configs', {})
+            comp_configs = received_configs.get('compressor_config', {})
+            configs_to_broadcast = [vis_flags, dist_configs, comp_configs]
+        else:
+            configs_to_broadcast = [None, None, None]
+
+        torch.distributed.broadcast_object_list(configs_to_broadcast, src=0)
+
+        vis_flags, dist_configs, comp_configs = configs_to_broadcast
+        from megatron.core.tensor_tracer import get_tt_flags, get_compressor
+        get_tt_flags().set_by_configs(vis_flags)
+        get_compressor().set_by_configs(comp_configs)
+
+        print_rank_0("Configs synchronized. Starting training.")
+
     if getattr(args, 'perform_rl_step', False):
         assert has_rl_utils, "RL cannot run without the megatron.rl package"
 
@@ -3014,6 +3074,18 @@ def train(
         )
         if should_exit:
             break
+
+    if ws_process:
+        print_rank_0("Signaling WebSocket process to shut down...")
+        shutdown_event.set()
+        data_queue.close()
+        config_queue.close()
+        data_queue.cancel_join_thread()
+        config_queue.cancel_join_thread()
+        ws_process.join(timeout=5)
+        if ws_process.is_alive():
+            print_rank_0("WebSocket process did not shut down cleanly, terminating.")
+            ws_process.terminate()
 
     # Destroy CUDA Graphs.
     if args.cuda_graph_impl == "transformer_engine" and cuda_graph_helper.graphs_created():
