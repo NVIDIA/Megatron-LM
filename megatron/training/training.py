@@ -220,10 +220,20 @@ def num_floating_point_operations(args, batch_size):
     def calculate_layer_counts():
         """Calculate the number of attention, Mamba, and MLP layers."""
         if args.hybrid_override_pattern:
-            counts = {'M': 0, '*': 0, '-': 0, 'E':0}
-            for layer_type in args.hybrid_override_pattern:
-                if layer_type in counts:
-                    counts[layer_type] += 1
+            from megatron.core.ssm.mamba_hybrid_layer_allocation import parse_hybrid_pattern
+            # Parse unified pattern to separate main and MTP components
+            parsed = parse_hybrid_pattern(args.hybrid_override_pattern)
+            counts = {'M': 0, '*': 0, '-': 0, 'E': 0}
+            # Count main decoder layers
+            if parsed.main_pattern:
+                for layer_type in parsed.main_pattern:
+                    if layer_type in counts:
+                        counts[layer_type] += 1
+            # Count MTP layers (pattern repeated mtp_num_depths times)
+            if parsed.mtp_pattern and parsed.mtp_num_depths > 0:
+                for layer_type in parsed.mtp_pattern:
+                    if layer_type in counts:
+                        counts[layer_type] += parsed.mtp_num_depths
             return counts['*'], counts['M'], counts['-'], counts['E']
         else:
             num_attn_layers = round(args.num_layers * args.hybrid_attention_ratio)
@@ -300,7 +310,7 @@ def num_floating_point_operations(args, batch_size):
                      mlp_expansion=4.0, swiglu=False,
                      moe_latent_size=None,
                      moe_ffn_hidden_size=2048, shared_expert_ffn_hidden_size=2048, num_experts_routed_to=1,
-                     vocab_size=256000):
+                     vocab_size=256000, mtp_num_layers=0):
         """Calculate total FLOPs for the hybrid model."""
         flops_fwd = (
                 num_attn_layers * attn_layer_flops(batch_size, seq_len, hidden_size,
@@ -313,7 +323,7 @@ def num_floating_point_operations(args, batch_size):
                 num_moe_layers * moe_layer_flops(batch_size, seq_len, hidden_size, moe_ffn_hidden_size,
                                                  shared_expert_ffn_hidden_size, num_experts_routed_to,
                                                  moe_latent_size, swiglu) +
-                (2 * batch_size * seq_len * hidden_size * vocab_size)  # logits computation
+                (2 * batch_size * seq_len * hidden_size * vocab_size * (1 + mtp_num_layers))  # logits computation
         )
         return flops_fwd * 3
 
@@ -604,6 +614,7 @@ def num_floating_point_operations(args, batch_size):
                                            else args.moe_shared_expert_intermediate_size),
             num_experts_routed_to=args.moe_router_topk,
             vocab_size=args.padded_vocab_size,
+            mtp_num_layers=args.mtp_num_layers,
         )
     else:
         # Compute standard Transformer model FLOPs.

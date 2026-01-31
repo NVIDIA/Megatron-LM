@@ -704,7 +704,7 @@ def get_gpt_mtp_block_spec_for_backend(
         raise ValueError(f"Invalid spec: {spec}")
 
     mtp_layer_spec = get_mtp_layer_spec_for_backend(
-        transformer_layer_spec=transformer_layer_spec, backend=backend
+        mtp_model_layer_spec=transformer_layer_spec, backend=backend
     )
     mtp_num_layers = config.mtp_num_layers if config.mtp_num_layers else 0
     mtp_layer_specs = [mtp_layer_spec] * mtp_num_layers

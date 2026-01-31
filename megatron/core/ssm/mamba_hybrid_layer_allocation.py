@@ -1,7 +1,8 @@
 # Copyright (c) 2024, NVIDIA CORPORATION. All rights reserved.
 
 import logging
-from typing import Dict, List, Tuple
+from dataclasses import dataclass
+from typing import Dict, List, Optional, Tuple
 
 if __name__ != "__main__":
     from megatron.core.utils import log_single_rank
@@ -29,7 +30,127 @@ class Symbols:
     ATTENTION = "*"
     MLP = "-"
     MOE = 'E'
+    MTP_SEPARATOR = "/"
     VALID = {MAMBA, ATTENTION, MLP, MOE}
+
+
+@dataclass
+class ParsedHybridPattern:
+    """Result of parsing a unified hybrid pattern string.
+
+    A unified pattern encodes both the main decoder pattern and the MTP pattern
+    in a single string using "/" as a separator.
+
+    Format: "<main_pattern>/<mtp_pattern>/<mtp_pattern>/..."
+
+    Examples:
+        - "M*M*" -> main="M*M*", mtp=None, depths=0 (no MTP)
+        - "M*M*/MM/MM" -> main="M*M*", mtp="MM", depths=2
+        - "MMMM/*M/*M/*M" -> main="MMMM", mtp="*M", depths=3
+
+    The "/" symbol introduces MTP patterns. Each repeated pattern after the main
+    decoder represents one MTP prediction depth.
+
+    Attributes:
+        main_pattern: The main decoder layer pattern (e.g., "M*M*")
+        mtp_pattern: The MTP layer pattern per depth (e.g., "MM"), or None if no MTP
+        mtp_num_depths: Number of MTP prediction depths (0 if no MTP)
+    """
+
+    main_pattern: Optional[str]
+    mtp_pattern: Optional[str]
+    mtp_num_depths: int
+
+
+def parse_hybrid_pattern(pattern: Optional[str]) -> ParsedHybridPattern:
+    """Parse a unified hybrid pattern string into main and MTP components.
+
+    The pattern uses "/" as a separator between the main decoder pattern and
+    MTP patterns. Each MTP pattern after the separator represents one prediction
+    depth.
+
+    Format: "<main_pattern>/<mtp_pattern>/<mtp_pattern>/..."
+
+    Args:
+        pattern: Unified pattern string, e.g., "M*M*/MM/MM" or just "M*M*"
+
+    Returns:
+        ParsedHybridPattern with main_pattern, mtp_pattern, and mtp_num_depths
+
+    Raises:
+        ValueError: If MTP patterns are inconsistent (all must be identical)
+        ValueError: If pattern contains invalid layer symbols
+
+    Examples:
+        >>> parse_hybrid_pattern("M*M*")
+        ParsedHybridPattern(main_pattern="M*M*", mtp_pattern=None, mtp_num_depths=0)
+
+        >>> parse_hybrid_pattern("M*M*/MM/MM")
+        ParsedHybridPattern(main_pattern="M*M*", mtp_pattern="MM", mtp_num_depths=2)
+
+        >>> parse_hybrid_pattern("MMMM/*M/*M/*M")
+        ParsedHybridPattern(main_pattern="MMMM", mtp_pattern="*M", mtp_num_depths=3)
+    """
+    if pattern is None:
+        return ParsedHybridPattern(main_pattern=None, mtp_pattern=None, mtp_num_depths=0)
+
+    parts = pattern.split(Symbols.MTP_SEPARATOR)
+
+    if len(parts) == 1:
+        # No MTP separator found - pattern is main decoder only
+        main_pattern = parts[0]
+        _validate_pattern(main_pattern, "main")
+        return ParsedHybridPattern(main_pattern=main_pattern, mtp_pattern=None, mtp_num_depths=0)
+
+    # First part is main decoder pattern
+    main_pattern = parts[0]
+    if main_pattern:
+        _validate_pattern(main_pattern, "main")
+
+    # Remaining parts are MTP patterns (one per depth)
+    mtp_parts = parts[1:]
+
+    if not mtp_parts or all(p == "" for p in mtp_parts):
+        # No MTP patterns after separator
+        return ParsedHybridPattern(
+            main_pattern=main_pattern if main_pattern else None, mtp_pattern=None, mtp_num_depths=0
+        )
+
+    # Validate all MTP patterns are identical
+    mtp_pattern = mtp_parts[0]
+    for i, part in enumerate(mtp_parts[1:], start=2):
+        if part != mtp_pattern:
+            raise ValueError(
+                f"All MTP patterns must be identical. "
+                f"Pattern 1 is '{mtp_pattern}', but pattern {i} is '{part}'. "
+                f"Full pattern: '{pattern}'"
+            )
+
+    _validate_pattern(mtp_pattern, "MTP")
+
+    return ParsedHybridPattern(
+        main_pattern=main_pattern if main_pattern else None,
+        mtp_pattern=mtp_pattern,
+        mtp_num_depths=len(mtp_parts),
+    )
+
+
+def _validate_pattern(pattern: str, pattern_name: str) -> None:
+    """Validate that a pattern contains only valid layer symbols.
+
+    Args:
+        pattern: Layer pattern string to validate
+        pattern_name: Name of pattern for error messages (e.g., "main" or "MTP")
+
+    Raises:
+        ValueError: If pattern contains invalid symbols
+    """
+    for char in pattern:
+        if char not in Symbols.VALID:
+            raise ValueError(
+                f"In {pattern_name} pattern, '{char}' is not a valid layer symbol. "
+                f"Valid symbols are: {Symbols.VALID}"
+            )
 
 
 def _allocate_auto(
@@ -97,19 +218,21 @@ def allocate_layers(
     target_attention_ratio: float,
     target_mlp_ratio: float,
     override_pattern: str = None,
+    silent: bool = False,
 ) -> list:
     """Allocates layers according to the requested distribution of layer types."""
     assert total_layers_count > 0
     assert target_attention_ratio >= 0.0 and target_attention_ratio <= 1.0
     assert target_mlp_ratio >= 0.0 and target_mlp_ratio <= 1.0
     assert target_attention_ratio + target_mlp_ratio <= 1.0
+    maybe_log_single_rank = (lambda *args, **kwargs: None) if silent else log_single_rank
     # Note: target_mamba_ratio = 1.0 - target_attention_ratio - target_mlp_ratio
 
     layer_type_list = _allocate_auto(total_layers_count, target_attention_ratio, target_mlp_ratio)
 
     if override_pattern is not None:
         layer_type_list_override = _allocate_override(total_layers_count, override_pattern)
-        log_single_rank(logger, logging.INFO, "Using hybrid override pattern")
+        maybe_log_single_rank(logger, logging.INFO, "Using hybrid override pattern")
         if (target_attention_ratio > 0.0 or target_mlp_ratio > 0.0) and not _layer_counts_match(
             layer_type_list_override, layer_type_list
         ):
@@ -119,13 +242,15 @@ def allocate_layers(
                 "pattern."
             )
         if layer_type_list_override == layer_type_list:
-            log_single_rank(
+            maybe_log_single_rank(
                 logger, logging.INFO, "The override pattern matches the overridden pattern"
             )
         else:
-            log_single_rank(logger, logging.INFO, "Warning: overriding pattern A with pattern B")
-            log_single_rank(logger, logging.INFO, f"A: {''.join(layer_type_list)}")
-            log_single_rank(logger, logging.INFO, f"B: {''.join(layer_type_list_override)}")
+            maybe_log_single_rank(
+                logger, logging.INFO, "Warning: overriding pattern A with pattern B"
+            )
+            maybe_log_single_rank(logger, logging.INFO, f"A: {''.join(layer_type_list)}")
+            maybe_log_single_rank(logger, logging.INFO, f"B: {''.join(layer_type_list_override)}")
         layer_type_list = layer_type_list_override
 
     if target_attention_ratio > 0.0 or target_mlp_ratio > 0.0 or override_pattern is not None:
@@ -134,32 +259,32 @@ def allocate_layers(
         actual_mlp_layers_count = layer_type_list.count(Symbols.MLP)
         actual_mlp_ratio = actual_mlp_layers_count / total_layers_count
         allocation_string = "".join(layer_type_list)
-        log_single_rank(
+        maybe_log_single_rank(
             logger,
             logging.INFO,
             f"Hybrid allocation ({Symbols.MAMBA} is mamba, "
             f"{Symbols.ATTENTION} is attention, "
             f"{Symbols.MLP} is mlp):",
         )
-        log_single_rank(logger, logging.INFO, allocation_string)
-        log_single_rank(
+        maybe_log_single_rank(logger, logging.INFO, allocation_string)
+        maybe_log_single_rank(
             logger,
             logging.INFO,
             f"{actual_attention_layers_count} attention layers in "
             f"{total_layers_count} total layers.",
         )
-        log_single_rank(
+        maybe_log_single_rank(
             logger,
             logging.INFO,
             f"Target attention ratio: {target_attention_ratio:.2f}. "
             f"Actual attention ratio: {actual_attention_ratio:.2f}.",
         )
-        log_single_rank(
+        maybe_log_single_rank(
             logger,
             logging.INFO,
             f"{actual_mlp_layers_count} mlp layers in " f"{total_layers_count} total layers.",
         )
-        log_single_rank(
+        maybe_log_single_rank(
             logger,
             logging.INFO,
             f"Target mlp ratio: {target_mlp_ratio:.2f}. "

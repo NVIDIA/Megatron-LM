@@ -257,6 +257,7 @@ def forward_step(data_iterator, model: MambaModel):
             attention_mask,
             labels=labels,
             packed_seq_params=packed_seq_params,
+            loss_mask=loss_mask
         )
 
     # [ModelOpt]: model is needed to access ModelOpt distillation losses
