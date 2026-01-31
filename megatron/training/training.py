@@ -283,7 +283,7 @@ def _mamba_layer_flops(batch_size, seq_len, hidden_size, state_dim=16,
         nheads = d_in // head_dim
     return (
         (
-            4
+            2
             * batch_size
             * seq_len
             * hidden_size
@@ -294,16 +294,34 @@ def _mamba_layer_flops(batch_size, seq_len, hidden_size, state_dim=16,
     )
 
 
+def _moe_layer_flops(batch_size, seq_len, hidden_size, moe_ffn_hidden_size,
+                    shared_expert_ffn_hidden_size, num_experts_routed_to,
+                    moe_latent_size=None, swiglu=False):
+    """Calculate FLOPs for an MoE layer."""
+    scale_factor = 3.0 / 2.0 if swiglu else 1.0
+    if moe_latent_size is None:
+        routed_flops = (4 * batch_size * seq_len * hidden_size *
+                        moe_ffn_hidden_size * num_experts_routed_to * scale_factor)
+    else:
+        # Routed experts run on moe_latent_size.
+        routed_flops = (4 * batch_size * seq_len * moe_latent_size *
+                        moe_ffn_hidden_size * num_experts_routed_to * scale_factor)
+        # Up proj and down proj.
+        routed_flops += (4 * batch_size * seq_len * hidden_size * moe_latent_size)
+    shared_flops = 4 * batch_size * seq_len * hidden_size * shared_expert_ffn_hidden_size * scale_factor
+    return routed_flops + shared_flops
+
+
 def _hybrid_flops(batch_size, seq_len, hidden_size,
-                  num_attn_layers, num_mamba_layers, num_mlp_layers, num_moe_layers,
-                  mamba_state_dim=128, mamba_head_dim=64,
-                  mamba_num_groups=8, mamba_num_heads=128,
-                  num_attn_heads=32, gqa=True,
-                  gqa_groups=8, kv_channels=None,
-                  mlp_expansion=4.0, swiglu=False,
-                  moe_latent_size=None,
-                  moe_ffn_hidden_size=2048, shared_expert_ffn_hidden_size=2048, num_experts_routed_to=1,
-                  vocab_size=256000):
+                 num_attn_layers, num_mamba_layers, num_mlp_layers, num_moe_layers,
+                 mamba_state_dim=128, mamba_head_dim=64,
+                 mamba_num_groups=8, mamba_num_heads=128,
+                 num_attn_heads=32, gqa=True,
+                 gqa_groups=8, kv_channels=None,
+                 mlp_expansion=4.0, swiglu=False,
+                 moe_latent_size=None,
+                 moe_ffn_hidden_size=2048, shared_expert_ffn_hidden_size=2048, num_experts_routed_to=1,
+                 vocab_size=256000):
     """Calculate total FLOPs for the hybrid model."""
     flops_fwd = (
             num_attn_layers * _attn_layer_flops(batch_size, seq_len, hidden_size,
@@ -311,11 +329,11 @@ def _hybrid_flops(batch_size, seq_len, hidden_size,
             num_mlp_layers * _mlp_layer_flops(batch_size, seq_len, hidden_size,
                                               mlp_expansion, swiglu) +
             num_mamba_layers * _mamba_layer_flops(batch_size, seq_len, hidden_size,
-                                                  mamba_state_dim, mamba_head_dim,
-                                                  mamba_num_groups, mamba_num_heads) +
+                                                 mamba_state_dim, mamba_head_dim,
+                                                 mamba_num_groups, mamba_num_heads) +
             num_moe_layers * _moe_layer_flops(batch_size, seq_len, hidden_size, moe_ffn_hidden_size,
-                                              shared_expert_ffn_hidden_size, num_experts_routed_to,
-                                              moe_latent_size, swiglu) +
+                                             shared_expert_ffn_hidden_size, num_experts_routed_to,
+                                             moe_latent_size, swiglu) +
             (2 * batch_size * seq_len * hidden_size * vocab_size)  # logits computation
     )
     return flops_fwd * 3
@@ -441,6 +459,7 @@ def _transformer_flops(args, batch_size):
         key_projection_size = args.kv_channels * args.num_query_groups
         value_projection_size = args.kv_channels * args.num_query_groups
         gate_projection_size = query_projection_size if args.attention_output_gate else 0
+        query_projection_to_hidden_size_ratio = query_projection_size / args.hidden_size
         standard_self_attn_term = (
             forward_backward_expansion_factor
             * fma_expansion_factor
@@ -462,6 +481,7 @@ def _transformer_flops(args, batch_size):
                 + query_projection_size
                 * args.hidden_size
             )
+            * query_projection_to_hidden_size_ratio
         )
 
     if is_linear_attention_variant(args.experimental_attention_variant):
