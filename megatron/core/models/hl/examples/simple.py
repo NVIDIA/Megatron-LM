@@ -21,40 +21,47 @@ from megatron.core.models.hl import (
 )
 
 # =============================================================================
-# SIMPLE 7B DENSE TRANSFORMER
+# LAYER DEFINITIONS
+# =============================================================================
+
+A1 = AttentionLayer(
+    hidden_size=4096,
+    num_attention_heads=32,
+    num_query_groups=8,
+    kv_channels=128,
+    use_flash_attention=True,
+    parallelism=ParallelismConfig(
+        tensor_parallel_size=8,
+        sequence_parallel=True,
+    ),
+)
+
+F1 = MLPLayer(
+    hidden_size=4096,
+    ffn_hidden_size=14336,
+    activation="swiglu",
+    parallelism=ParallelismConfig(
+        tensor_parallel_size=8,
+        sequence_parallel=True,
+    ),
+)
+
+# =============================================================================
+# LAYER PATTERN
+# =============================================================================
+
+# Simple pattern: 32 layers of Attention + MLP
+# No pipeline parallelism needed for this small model
+layer_pattern = [A1, F1] * 32
+
+# =============================================================================
+# MODEL CONFIGURATION
 # =============================================================================
 
 simple_config = HLModelConfig(
     vocab_size=128000,
     max_sequence_length=4096,
-
-    # Simple repeating pattern: Attention + MLP for each layer
-    # 32 layers total, no pipeline stages
-    layer_pattern="(A1 F1)x32",
-
-    layer_configs={
-        "A1": AttentionLayer(
-            hidden_size=4096,
-            num_attention_heads=32,
-            num_query_groups=8,
-            kv_channels=128,
-            use_flash_attention=True,
-            parallelism=ParallelismConfig(
-                tensor_parallel_size=8,
-                sequence_parallel=True,
-            ),
-        ),
-
-        "F1": MLPLayer(
-            hidden_size=4096,
-            ffn_hidden_size=14336,
-            activation="swiglu",
-            parallelism=ParallelismConfig(
-                tensor_parallel_size=8,
-                sequence_parallel=True,
-            ),
-        ),
-    },
+    layer_pattern=layer_pattern,
 
     # Model settings
     share_embeddings_and_output_weights=True,
