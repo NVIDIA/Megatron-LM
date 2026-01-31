@@ -237,6 +237,24 @@ def _mlp_layer_flops(batch_size, seq_len, hidden_size, expansion=4.0, swiglu=Fal
     return 4 * expansion * scale_factor * batch_size * seq_len * hidden_size**2
 
 
+def _moe_layer_flops(batch_size, seq_len, hidden_size, moe_ffn_hidden_size,
+                     shared_expert_ffn_hidden_size, num_experts_routed_to,
+                     moe_latent_size=None, swiglu=False):
+    """Calculate FLOPs for an MoE layer."""
+    scale_factor = 3.0 / 2.0 if swiglu else 1.0
+    if moe_latent_size is None:
+        routed_flops = (4 * batch_size * seq_len * hidden_size *
+                        moe_ffn_hidden_size * num_experts_routed_to * scale_factor)
+    else:
+        # Routed experts run on moe_latent_size.
+        routed_flops = (4 * batch_size * seq_len * moe_latent_size *
+                        moe_ffn_hidden_size * num_experts_routed_to * scale_factor)
+        # Up proj and down proj.
+        routed_flops += (4 * batch_size * seq_len * hidden_size * moe_latent_size)
+    shared_flops = 4 * batch_size * seq_len * hidden_size * shared_expert_ffn_hidden_size * scale_factor
+    return routed_flops + shared_flops
+
+
 def _attn_layer_flops(
     batch_size, seq_len, hidden_size, num_heads, gqa=True, gqa_groups=8, kv_channels=None
 ):
@@ -254,7 +272,7 @@ def _attn_layer_flops(
 
 
 def _mamba_layer_flops(batch_size, seq_len, hidden_size, state_dim=16,
-                      head_dim=64, num_groups=1, num_heads=128):
+                       head_dim=64, num_groups=1, num_heads=128):
     """Calculate FLOPs for a Mamba layer."""
     # Note (rwaleffe): flops estimate for scan should be updated based on new SSD kernels,
     # but small percent of overall layer flops
@@ -307,9 +325,9 @@ def _hybrid_flops(batch_size, seq_len, hidden_size,
     """Calculate total FLOPs for the hybrid model."""
     flops_fwd = (
             num_attn_layers * _attn_layer_flops(batch_size, seq_len, hidden_size,
-                                               num_attn_heads, gqa, gqa_groups, kv_channels) +
+                                                num_attn_heads, gqa, gqa_groups, kv_channels) +
             num_mlp_layers * _mlp_layer_flops(batch_size, seq_len, hidden_size,
-                                             mlp_expansion, swiglu) +
+                                              mlp_expansion, swiglu) +
             num_mamba_layers * _mamba_layer_flops(batch_size, seq_len, hidden_size,
                                                  mamba_state_dim, mamba_head_dim,
                                                  mamba_num_groups, mamba_num_heads) +
@@ -576,6 +594,8 @@ def _transformer_flops(args, batch_size):
             * args.padded_vocab_size
             * (mtp_num_layers + 1)  # MTP + final logit
         )
+        # Logit.
+        + 3 * 2 * args.hidden_size * args.padded_vocab_size * (mtp_num_layers + 1)
     )
     return total_floating_point_operations
 
