@@ -450,6 +450,7 @@ class FSDPDistributedIndex:
         dp_outer_dim: Optional[str] = None,
         tp_dim: Optional[str] = None,
         hybrid_fsdp_group: Optional[torch.distributed.ProcessGroup] = None,
+        hybrid_fsdp_expt_group: Optional[torch.distributed.ProcessGroup] = None,
         hsdp_outer_dp_shard: bool = False,
         expt_device_mesh: Optional[DeviceMesh] = None,
     ):
@@ -464,6 +465,9 @@ class FSDPDistributedIndex:
             hybrid_fsdp_group (Optional[torch.distributed.ProcessGroup]): The
                 process group for hybrid FSDP communication, which is the flattened
                 combination of the dp_outer and dp_shard process groups.
+            hybrid_fsdp_expt_group (Optional[torch.distributed.ProcessGroup]): The
+                process group for hybrid FSDP expert communication, which is the flattened
+                combination of the expert dp_outer and expert dp_shard process groups.
             hsdp_outer_dp_shard (bool): Whether to have outer DP group sharding
                 in hybrid FSDP. Specifying outer sharding will lift the bucket sharding
                 coordinate system to flattened ranks of (dp_shard, dp_outer) instead of
@@ -509,12 +513,20 @@ class FSDPDistributedIndex:
         # Save a reference to the overall HSDP process group, which is the flattened
         # combination of the outer-FSDP and FSDP process groups.
         self.hybrid_fsdp_group = hybrid_fsdp_group
+        self.hybrid_fsdp_expt_group = hybrid_fsdp_expt_group
 
         # Retrieve the expert parallel process groups from the DeviceMesh.
         self.expt_fsdp_group = (
             self.expt_device_mesh[self.dp_shard_dim].get_group()
             if self.expt_device_mesh is not None
             and contains_submesh(self.expt_device_mesh, self.dp_shard_dim)
+            else None
+        )
+
+        self.expt_outer_fsdp_group = (
+            self.expt_device_mesh[self.dp_outer_dim].get_group()
+            if self.expt_device_mesh is not None
+            and contains_submesh(self.expt_device_mesh, self.dp_outer_dim)
             else None
         )
 
@@ -558,6 +570,8 @@ class FSDPDistributedIndex:
             register_submesh(self.expt_device_mesh, tp_submesh, True)
             register_submesh(self.expt_device_mesh, fsdp_tp_submesh, True)
             register_submesh(self.expt_device_mesh, fsdp_submesh, True)
+            register_submesh(self.expt_device_mesh, hsdp_submesh, True)
+            register_submesh(self.expt_device_mesh, hsdp_tp_submesh, True)
 
         # Validate FSDP arguments.
         if self.fsdp_group is None:
@@ -629,6 +643,8 @@ class FSDPDistributedIndex:
     def get_dp_group(self, is_expert_parallel: bool = False) -> ProcessGroup:
         """Get the data parallel process group."""
         if is_expert_parallel:
+            if self.use_hybrid_fsdp:
+                return self.hybrid_fsdp_expt_group
             return self.expt_fsdp_group
         if self.use_hybrid_fsdp:
             return self.hybrid_fsdp_group
@@ -644,10 +660,12 @@ class FSDPDistributedIndex:
             return self.fsdp_group_ag
         return self.fsdp_group
 
-    def get_outer_fsdp_group(self) -> ProcessGroup:
+    def get_outer_fsdp_group(self, is_expert_parallel: bool = False) -> ProcessGroup:
         """Get the outer-FSDP process group."""
         if not self.use_hybrid_fsdp:
             return None
+        if is_expert_parallel:
+            return self.expt_outer_fsdp_group
         return self.outer_fsdp_group
 
     def get_root_mesh(self, is_expert_parallel: bool = False) -> DeviceMesh:
@@ -659,7 +677,7 @@ class FSDPDistributedIndex:
             return self.expt_device_mesh
         return self.device_mesh
 
-    def get_logical_hybrid_fsdp_rank(self):
+    def get_logical_hybrid_fsdp_rank(self, is_expert_parallel: bool = False):
         """
         Returns the logical rank of the current process within the full-shard hybrid FSDP group.
 
@@ -679,20 +697,28 @@ class FSDPDistributedIndex:
             self.hsdp_outer_dp_shard
         ), "get_logical_hybrid_fsdp_rank is only valid when full-shard hybrid FSDP is enabled."
 
-        if not hasattr(self, "_hybrid_fsdp_group_ranks"):
-            dp_world_size = self.get_dp_group().size()
+        _hybrid_fsdp_group_name = (
+            "_hybrid_fsdp_group_ranks"
+            if not is_expert_parallel
+            else "_hybrid_fsdp_expt_group_ranks"
+        )
+
+        if not hasattr(self, _hybrid_fsdp_group_name):
+            dp_world_size = self.get_dp_group(is_expert_parallel).size()
 
             # Reorder the flat ranks: (outer_dp, inner_dp) -> (inner_dp, outer_dp)
             mesh = einops.rearrange(
                 torch.arange(dp_world_size),
                 "(outer_dp inner_dp) -> (inner_dp outer_dp)",
-                outer_dp=self.outer_fsdp_group.size(),
-                inner_dp=self.fsdp_group.size(),
+                outer_dp=self.get_outer_fsdp_group(is_expert_parallel).size(),
+                inner_dp=self.get_fsdp_group(is_expert_parallel).size(),
             )
-            self._hybrid_fsdp_group_ranks = mesh.tolist()
+            setattr(self, _hybrid_fsdp_group_name, mesh.tolist())
 
         # Find the index for the current rank in the hybrid group
-        return self._hybrid_fsdp_group_ranks.index(self.hybrid_fsdp_group.rank())
+        return getattr(self, _hybrid_fsdp_group_name).index(
+            self.get_dp_group(is_expert_parallel).rank()
+        )
 
 
 class GlobalMemoryBuffer:
