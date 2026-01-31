@@ -14,6 +14,7 @@ from torch import _C
 from torch.cuda import _lazy_call, _lazy_init
 from torch.cuda import device as device_ctx_manager
 from torch.utils.checkpoint import detach_variable
+from typing_extensions import Unpack
 
 from megatron.core.parallel_state import (
     get_expert_model_parallel_rank,
@@ -511,9 +512,9 @@ class CheckpointFunction(torch.autograd.Function):
     @staticmethod
     def forward(
         ctx: Any,
-        run_function: Callable[[*_Ts], _R],
+        run_function: Callable[[Unpack[_Ts]], _R],
         distribute_saved_activations: bool,
-        *args: *_Ts,
+        *args: Unpack[_Ts],
     ) -> _R:
         """Forward pass."""
         _set_checkpointing()
@@ -582,7 +583,7 @@ class CheckpointFunction(torch.autograd.Function):
 
 
 def checkpoint(
-    function: Callable[[*_Ts], _R], distribute_saved_activations: bool, *args: *_Ts
+    function: Callable[[Unpack[_Ts]], _R], distribute_saved_activations: bool, *args: Unpack[_Ts]
 ) -> _R:
     """Checkpoint a model or part of the model.
     This has been directly copied from torch.utils.checkpoint."""
@@ -598,9 +599,9 @@ class CheckpointWithoutOutputFunction(torch.autograd.Function):
     @staticmethod
     def forward(
         ctx: Any,
-        run_function: Callable[[*_Ts], _R],
+        run_function: Callable[[Unpack[_Ts]], _R],
         checkpoint_without_output_obj: CheckpointWithoutOutput,
-        *args: *_Ts,
+        *args: Unpack[_Ts],
     ) -> _R:
         """Forward pass."""
         if checkpoint_without_output_obj.fp8:
@@ -659,7 +660,7 @@ class CheckpointWithoutOutput(object):
         self.ctx = None
         self.outputs = None
 
-    def checkpoint(self, run_function: Callable[[*_Ts], _R], *args: *_Ts) -> _R:
+    def checkpoint(self, run_function: Callable[[Unpack[_Ts]], _R], *args: Unpack[_Ts]) -> _R:
         """Checkpoint function."""
 
         # If in cuda graph warmup, disable checkpointing, as 'discard_output_and_register_recompute'
