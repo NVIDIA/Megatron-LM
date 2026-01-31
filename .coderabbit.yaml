@@ -1,0 +1,39 @@
+# yaml-language-server: $schema=https://coderabbit.ai/integrations/schema.v2.json
+language: "en-US"
+
+# Only comment on Critical/Major bugs. No Minor, Trivial, or style comments.
+tone_instructions: "Only comment on Critical or Major bugs. Never comment on Minor issues, style, refactoring, or suggestions. When in doubt, stay silent."
+
+reviews:
+  # Use chill profile - filters out nitpicks automatically
+  profile: "chill"
+
+  # Disable all summary features
+  high_level_summary: false
+  high_level_summary_in_walkthrough: false
+
+  # Disable walkthrough comment entirely
+  collapse_walkthrough: true
+  changed_files_summary: false
+  sequence_diagrams: false
+
+  # Disable status/effort estimates
+  review_status: false
+  commit_status: false
+  estimate_code_review_effort: false
+
+  # Disable auto-suggestions for labels/reviewers
+  suggested_labels: false
+  suggested_reviewers: false
+
+  # Disable related issues/PRs lookup
+  assess_linked_issues: false
+  related_issues: false
+  related_prs: false
+
+  # Auto-review disabled - only review when explicitly requested via @coderabbitai review
+  auto_review:
+    enabled: false
+
+chat:
+  auto_reply: true

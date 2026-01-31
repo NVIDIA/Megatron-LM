@@ -1,5 +1,6 @@
 # Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
+import dataclasses
 import gc
 import inspect
 import logging
@@ -9,7 +10,7 @@ import time
 from collections import defaultdict
 from contextlib import nullcontext
 from copy import deepcopy
-from dataclasses import dataclass, fields, is_dataclass
+from dataclasses import dataclass, is_dataclass
 from enum import Enum
 from functools import partial
 from itertools import chain, zip_longest
@@ -17,7 +18,7 @@ from math import ceil
 from typing import Any, Dict, List
 
 import torch
-from torch.utils._pytree import tree_map
+from torch.utils._pytree import tree_map as tree_map_pyt
 
 from megatron.core import parallel_state
 from megatron.core.num_microbatches_calculator import get_num_microbatches
@@ -199,6 +200,25 @@ class TensorReusePool:
         return out
 
 
+def tree_map(func, tree):
+    """
+    Wrapper around pytorch's tree_map, but also recurses into dataclasses.
+    """
+
+    def wrapper(arg):
+        # If it's a dataclass, map over its fields
+        if is_dataclass(arg) and not isinstance(arg, type):
+            changes = {
+                f.name: tree_map_pyt(func, getattr(arg, f.name)) for f in dataclasses.fields(arg)
+            }
+            return dataclasses.replace(arg, **changes)
+
+        # Otherwise, apply the user function
+        return func(arg)
+
+    return tree_map_pyt(wrapper, tree)
+
+
 def _check_supported_type(meta):
     """Check if arg meta is a supported type for cudagraph input/outputs."""
 
@@ -215,6 +235,7 @@ def _check_supported_type(meta):
         int,
         str,
         float,
+        dataclass,
         StaticInferenceContext,
         DynamicInferenceContext,
         ArgMetadata,
@@ -420,17 +441,18 @@ class _CudagraphGlobalRecord:
             ),
         }
 
-        if torch.distributed.get_rank() == 0:
-            logger.info(
-                "> built %d cuda graph(s) in %.2f sec, with total memory usage: "
-                "allocated %s, reserved %s."
-                % (
-                    len(cls.cudagraph_record),
-                    capture_stats["time"],
-                    format_mem_bytes(capture_stats["allocated_bytes"]),
-                    format_mem_bytes(capture_stats["reserved_bytes"]),
-                )
-            )
+        log_single_rank(
+            logger,
+            logging.INFO,
+            "> built %d cuda graph(s) in %.2f sec, with total memory usage: "
+            "allocated %s, reserved %s."
+            % (
+                len(cls.cudagraph_record),
+                capture_stats["time"],
+                format_mem_bytes(capture_stats["allocated_bytes"]),
+                format_mem_bytes(capture_stats["reserved_bytes"]),
+            ),
+        )
 
         # Mark cuda graphs as created.
         for g in cls.cudagraph_record:
@@ -1260,7 +1282,7 @@ class _CudaGraphRunner(torch.nn.Module):
                     add_error(f"Tensor mismatch at {context}: {', '.join(mismatches)}")
 
             elif is_dataclass(ref.value):
-                for field in fields(ref.value):
+                for field in dataclasses.fields(ref.value):
                     check(
                         ArgMetadata(getattr(val.value, field.name)),
                         ArgMetadata(getattr(ref.value, field.name)),
@@ -1322,7 +1344,7 @@ class _CudaGraphRunner(torch.nn.Module):
             if is_dataclass(arg):
                 return [
                     attr
-                    for field in fields(arg)
+                    for field in dataclasses.fields(arg)
                     if torch.is_tensor(attr := getattr(arg, field.name))
                 ]
 
@@ -1426,15 +1448,14 @@ class CudaGraphManager(torch.nn.Module):
                 # Only hooks from Mcore DDP, which take no args, should be called at this point.
                 hook(module)
 
-    def get_cudagraph_runner(self, megatron_module, args, kwargs):
+    def get_cudagraph_runner(self, megatron_module, args, kwargs, reuse_cudagraphs):
         '''Returns a valid cudagraph runner for the current forward call.
         The cudagraph corresponding to this call is the first element of 'self.cudagraph_runners'.
         We iterate through the list by 1 for each call, and the number of calls is equal to the
         length of 'self.cudagraph_runners'.
         Otherwise, we assign a mempool per microbatch, which allows cudagraphs to be reused
         over different microbatches by tracking their respective fwd and bwd passes.'''
-
-        if self.reuse_cudagraphs:
+        if reuse_cudagraphs:
             is_inference_mode = 'inference_context' in kwargs.keys() and kwargs['inference_context']
             if is_inference_mode:
                 is_static_batching = kwargs['inference_context'].is_static_batching()
@@ -1528,12 +1549,12 @@ class CudaGraphManager(torch.nn.Module):
                 for module in megatron_module.modules():
                     self.call_ddp_preforward_hook(module)
 
-            runner = self.get_cudagraph_runner(megatron_module, args, kwargs)
+            runner = self.get_cudagraph_runner(megatron_module, args, kwargs, self.reuse_cudagraphs)
             out = runner.replay_graph_capture(self.is_first_microbatch, args, kwargs)
         else:
             if is_inference_mode:
                 # Inference generation mode creates graphs immediately
-                runner = self.get_cudagraph_runner(megatron_module, args, kwargs)
+                runner = self.get_cudagraph_runner(megatron_module, args, kwargs, True)
                 runner.eval()
 
                 if not runner.fwd_graph_recorded:
@@ -1574,7 +1595,9 @@ class CudaGraphManager(torch.nn.Module):
                 # Now replay the graph
                 out = runner.replay_graph_capture(self.is_first_microbatch, args, kwargs)
             elif self.training or is_in_checkpoint_fwd:
-                runner = self.get_cudagraph_runner(megatron_module, args, kwargs)
+                runner = self.get_cudagraph_runner(
+                    megatron_module, args, kwargs, self.reuse_cudagraphs
+                )
                 # check if a layer is frozen during training.
                 if not torch.is_grad_enabled():
                     # If the layer is frozen, we need to set the runner to eval mode.

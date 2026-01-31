@@ -185,6 +185,7 @@ class MambaModel(LanguageModule):
         *,
         inference_params: Optional[BaseInferenceContext] = None,
         packed_seq_params: Optional[PackedSeqParams] = None,
+        padding_mask: Optional[Tensor] = None,
     ) -> Tensor:
         """Forward function of the Mamba model. This function passes the input tensors
         through the embedding layer, and then the decoder and finally into the post
@@ -254,6 +255,7 @@ class MambaModel(LanguageModule):
             inference_context=inference_context,
             rotary_pos_emb=rotary_pos_emb,
             packed_seq_params=packed_seq_params,
+            padding_mask=padding_mask,
         )
 
         if not self.post_process:
@@ -265,7 +267,7 @@ class MambaModel(LanguageModule):
             output_weight = self.shared_embedding_or_output_weight()
 
         sequence_parallel_override = False
-        if in_inference_mode and inference_context.materialize_only_last_token_logits:
+        if in_inference_mode and inference_context.config.materialize_only_last_token_logits:
             if inference_context.is_static_batching():
                 hidden_states = hidden_states[-1:, :, :]
             else:
@@ -295,7 +297,7 @@ class MambaModel(LanguageModule):
             assert (
                 in_inference_mode
                 and inference_context.is_dynamic_batching()
-                and inference_context.materialize_only_last_token_logits
+                and inference_context.config.materialize_only_last_token_logits
             )
             self.output_layer.sequence_parallel = True
 
