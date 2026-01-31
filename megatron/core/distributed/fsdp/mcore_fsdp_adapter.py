@@ -42,7 +42,7 @@ from megatron.core.extensions.transformer_engine import TELinear
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.transformer.transformer_layer import TransformerLayer
-from megatron.core.utils import log_single_rank
+from megatron.core.utils import is_te_min_version, log_single_rank
 
 try:
     from megatron.core.distributed.fsdp.src.megatron_fsdp import FSDPDistributedIndex, MegatronFSDP
@@ -84,6 +84,18 @@ class FullyShardedDataParallel(_BaseDataParallel):
         )
 
         self.megatron_fsdp_dist_index = self._init_dist_index(pg_collection)
+
+        if config.gradient_accumulation_fusion:
+            assert (
+                self.megatron_fsdp_dist_index.get_dp_group(is_expert_parallel=True).size() == 1
+            ), (
+                "Megatron-FSDP with gradient_accumulation_fusion does not support "
+                "data parallelism when expert parallelism is enabled."
+            )
+            assert is_te_min_version("2.10"), (
+                "Megatron-FSDP with gradient_accumulation_fusion requires "
+                "Transformer Engine version 2.10 or higher."
+            )
 
         self.bucket_size = self.ddp_config.bucket_size
         if disable_bucketing:
