@@ -50,11 +50,8 @@ except ImportError:
     HAVE_TE = False
 
 try:
-    import nvidia_kitchen  # type: ignore[import-not-found]  # pylint: disable=unused-import
+    from megatron.core.extensions.kitchen import HAVE_KITCHEN, KitchenSpecProvider
 
-    from megatron.core.extensions.kitchen import KitchenSpecProvider
-
-    HAVE_KITCHEN = True
 except ImportError:
     HAVE_KITCHEN = False
 
