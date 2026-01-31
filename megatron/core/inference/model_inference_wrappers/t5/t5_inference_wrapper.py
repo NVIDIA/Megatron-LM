@@ -11,6 +11,9 @@ from megatron.core.inference.contexts import BaseInferenceContext
 from megatron.core.inference.model_inference_wrappers.abstract_model_inference_wrapper import (
     AbstractModelInferenceWrapper,
 )
+from megatron.core.inference.model_inference_wrappers.inference_wrapper_config import (
+    InferenceWrapperConfig,
+)
 from megatron.core.models.T5 import T5Model
 from megatron.core.utils import get_attr_wrapped_model
 
@@ -24,6 +27,7 @@ class T5InferenceWrapper(AbstractModelInferenceWrapper):
 
     Args:
         model (T5Model): The T5 model (MCore or legacy)
+        inference_wrapper_config (InferenceWrapperConfig): The command line arguments that were passed
         inference_context (BaseInferenceContext): Manages KV cache, and tracks
             sequence/token/batch offsets.
         use_local (bool): Whether  the T5 model's transformer impl
@@ -33,10 +37,11 @@ class T5InferenceWrapper(AbstractModelInferenceWrapper):
     def __init__(
         self,
         model: T5Model,
+        inference_wrapper_config: InferenceWrapperConfig,
         inference_context: Optional[BaseInferenceContext] = None,
         use_local: bool = False,
     ):
-        super().__init__(model, inference_context)
+        super().__init__(model, inference_wrapper_config, inference_context)
         self.use_local = use_local
 
     def prep_inference_input(

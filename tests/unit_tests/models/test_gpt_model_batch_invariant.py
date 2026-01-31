@@ -5,15 +5,17 @@ import pytest
 import torch
 import torch.distributed as dist
 
-from megatron.core.inference.config import InferenceConfig
 from megatron.core.inference.contexts.dynamic_context import DynamicInferenceContext
 from megatron.core.inference.engines.dynamic_engine import DynamicInferenceEngine
 from megatron.core.inference.model_inference_wrappers.gpt.gpt_inference_wrapper import (
     GPTInferenceWrapper,
 )
+from megatron.core.inference.model_inference_wrappers.inference_wrapper_config import (
+    InferenceWrapperConfig,
+)
 from megatron.core.inference.sampling_params import SamplingParams
-from megatron.core.inference.text_generation_controllers.text_generation_controller import (
-    TextGenerationController,
+from megatron.core.inference.text_generation_controllers.simple_text_generation_controller import (
+    SimpleTextGenerationController,
 )
 from megatron.core.models.gpt.gpt_layer_specs import get_gpt_layer_with_transformer_engine_spec
 from megatron.core.models.gpt.gpt_model import GPTModel
@@ -89,8 +91,6 @@ def _build_flash_attn_bik_model(seq_len: int, vocab_size: int, hidden_size: int 
         normalization="RMSNorm",
         params_dtype=torch.bfloat16,
         attention_backend=AttnBackend.flash,
-        fp32_residual_connection=False,
-        nccl_all_reduce_for_prefill=False,
     )
     cfg.fp16 = False
     cfg.bf16 = True
@@ -184,21 +184,32 @@ class TestGPTModelBatchInvariant:
         inference_model = Float16Module(base_model.config, base_model).cuda().eval()
 
         ctx = DynamicInferenceContext(
-            model_config=base_model.config,
-            inference_config=InferenceConfig(
-                max_sequence_length=seq_len,
-                buffer_size_gb=0.125,
-                block_size_tokens=16,
-                num_cuda_graphs=None,
-                materialize_only_last_token_logits=False,
-                use_cuda_graphs_for_non_decode_steps=False,
-                unified_memory_level=0,
-            ),
+            params_dtype=torch.bfloat16,
+            num_layers=base_model.config.num_layers,
+            kv_channels=base_model.config.kv_channels,
+            num_attention_heads=base_model.config.num_attention_heads,
+            max_sequence_length=seq_len,
+            buffer_size_gb=0.125,
+            block_size_tokens=16,
+            num_cuda_graphs=None,
+            materialize_only_last_token_logits=False,
+            use_cuda_graphs_for_non_decode_steps=False,
+            unified_memory_level=0,
         )
 
-        wrapper = GPTInferenceWrapper(inference_model, ctx)
+        wrapper_cfg = InferenceWrapperConfig(
+            hidden_size=base_model.config.hidden_size,
+            inference_batch_times_seqlen_threshold=-1,
+            fp32_residual_connection=False,
+            params_dtype=torch.bfloat16,
+            padded_vocab_size=vocab_size,
+            inference_max_seq_length=seq_len,
+            inference_max_requests=8,
+            nccl_all_reduce_for_prefill=False,
+        )
+        wrapper = GPTInferenceWrapper(inference_model, wrapper_cfg, ctx)
         tokenizer = DummyTokenizer(vocab_size=vocab_size, bos=None, eod=vocab_size - 1, pad=0)
-        controller = TextGenerationController(wrapper, tokenizer)
+        controller = SimpleTextGenerationController(wrapper, tokenizer)
         engine = DynamicInferenceEngine(
             controller=controller, context=ctx, enable_cuda_graph=False, random_seed=123
         )
@@ -262,21 +273,32 @@ class TestGPTModelBatchInvariant:
 
         def _run_engine_with_order(order):
             ctx = DynamicInferenceContext(
-                model_config=based_model.config,
-                inference_config=InferenceConfig(
-                    max_sequence_length=seq_len,
-                    buffer_size_gb=0.125,
-                    block_size_tokens=16,
-                    num_cuda_graphs=None,
-                    materialize_only_last_token_logits=False,
-                    use_cuda_graphs_for_non_decode_steps=False,
-                    unified_memory_level=0,
-                ),
+                params_dtype=torch.bfloat16,
+                num_layers=base_model.config.num_layers,
+                kv_channels=base_model.config.kv_channels,
+                num_attention_heads=base_model.config.num_attention_heads,
+                max_sequence_length=seq_len,
+                buffer_size_gb=0.125,
+                block_size_tokens=16,
+                num_cuda_graphs=None,
+                materialize_only_last_token_logits=False,
+                use_cuda_graphs_for_non_decode_steps=False,
+                unified_memory_level=0,
             )
 
-            wrapper = GPTInferenceWrapper(inference_model, ctx)
+            wrapper_cfg = InferenceWrapperConfig(
+                hidden_size=base_model.config.hidden_size,
+                inference_batch_times_seqlen_threshold=-1,
+                fp32_residual_connection=False,
+                params_dtype=torch.bfloat16,
+                padded_vocab_size=vocab_size,
+                inference_max_seq_length=seq_len,
+                inference_max_requests=8,
+                nccl_all_reduce_for_prefill=False,
+            )
+            wrapper = GPTInferenceWrapper(inference_model, wrapper_cfg, ctx)
             tokenizer = DummyTokenizer(vocab_size=vocab_size, bos=None, eod=vocab_size - 1, pad=0)
-            controller = TextGenerationController(wrapper, tokenizer)
+            controller = SimpleTextGenerationController(wrapper, tokenizer)
             engine = DynamicInferenceEngine(
                 controller=controller, context=ctx, enable_cuda_graph=False, random_seed=123
             )

@@ -193,9 +193,6 @@ class MambaLayer(GraphableMegatronModule):
             and kwargs.get('attention_mask') is None
             and kwargs.get('inference_context') is not None
         ):
-            context = kwargs['inference_context']
-            using_cuda_graph = (context.is_static_batching() and context.is_decode_only()) or (
-                not context.is_static_batching() and context.using_cuda_graph_this_step()
-            )
+            using_cuda_graph = kwargs['inference_context'].using_cuda_graph_this_step()
             return using_cuda_graph
         return False

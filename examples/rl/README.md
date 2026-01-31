@@ -94,7 +94,7 @@ MODEL_OPTIONS="\
   --ckpt-format torch \
   --seq-length $MAX_SEQ_LENGTH \
   --inference-max-seq-length $MAX_SEQ_LENGTH \
-  --inference-max-requests $MAX_INFERENCE_BS \
+  --inference-max-batch-size $MAX_INFERENCE_BS \
   --pretrained-checkpoint $CHECKPOINT \
   --untie-embeddings-and-output-weights \
   --disable-bias-linear \

@@ -42,7 +42,6 @@ from megatron.core.inference.utils import Counter, await_process_call
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.transformer.cuda_graphs import delete_cuda_graphs
 from megatron.core.utils import (
-    deprecate_args,
     experimental_api,
     get_asyncio_loop,
     get_pg_rank,
@@ -90,14 +89,6 @@ try:
 except ImportError:
     HAVE_PSUTIL = False
 
-DEPRECATED_ARGS = [
-    "enable_cuda_graph",
-    "random_seed",
-    "track_paused_request_events",
-    "enable_chunked_prefill",
-    "inference_logging_step_interval",
-    "pg_collection",
-]
 from megatron.core.inference.contexts.dynamic_context import HAVE_TORCH_MEMORY_SAVER
 
 if HAVE_TORCH_MEMORY_SAVER:
@@ -145,13 +136,24 @@ class DynamicInferenceEngine(AbstractEngine):
             outputs and detokenizer the output tokens.
         inference_context (DynamicInferenceContext): Context for managing in-flight
             batching and a dynamic block-level KV cache (similar to paged attention).
+        random_seed (Optional[int]): Use a random seed if you want deterministic
+            results. Defaults to None.
+        inference_logging_step_interval (int): The step interval at which to log
+        inference metrics to wandb. Defaults to 0, which means no logging.
     """
 
-    @deprecate_args(
-        *DEPRECATED_ARGS,
-        message="Argument `{name}` has been deprecated. Only pass `controller` and `context`",
-    )
-    def __init__(self, controller: TextGenerationController, context: DynamicInferenceContext):
+    def __init__(
+        self,
+        controller: TextGenerationController,
+        context: DynamicInferenceContext,
+        enable_cuda_graph: Optional[bool] = None,
+        random_seed: Optional[int] = None,
+        *,
+        track_paused_request_events: bool = False,
+        enable_chunked_prefill: bool = True,
+        inference_logging_step_interval: int = 0,
+        pg_collection: Optional[ProcessGroupCollection] = None,
+    ):
 
         assert isinstance(
             controller, TextGenerationController
@@ -159,28 +161,40 @@ class DynamicInferenceEngine(AbstractEngine):
         assert isinstance(
             context, DynamicInferenceContext
         ), f"context must be a DynamicInferenceContext, got {type(context)}"
+        assert isinstance(random_seed, int), f"random_seed must be an int, got {type(random_seed)}"
 
-        model_config = controller.inference_wrapped_model.model.config
-        inference_config = context.config
+        # Deprecate `enable_cuda_graph`.
+        if enable_cuda_graph is not None:
+            warnings.warn(
+                "The `enable_cuda_graph` argument is deprecated and will be "
+                "removed in `megatron-core 0.15`. `enable_cuda_graph` is now "
+                "read directly from the transformer config object."
+            )
+            self.enable_cuda_graph = enable_cuda_graph
+        else:
+            self.enable_cuda_graph = (
+                controller.inference_wrapped_model.model.config.enable_cuda_graph
+            )
 
-        if inference_config.pg_collection is not None:
-            self.pg_collection = inference_config.pg_collection
+        if pg_collection is not None:
+            self.pg_collection = pg_collection
         else:
             self.pg_collection = ProcessGroupCollection.use_mpu_process_groups()
 
         # Initialization options.
         self.controller = controller
         self.context = context
-        self.track_paused_request_events = inference_config.track_paused_request_events
-        self.enable_chunked_prefill = inference_config.enable_chunked_prefill
-        self.metrics_writer = inference_config.metrics_writer
-        self.logging_step_interval = inference_config.logging_step_interval
-        self.unified_memory_level = inference_config.unified_memory_level
-        self.persist_cuda_graphs = inference_config.persist_cuda_graphs
-        self.materialize_only_last_token_logits = (
-            inference_config.materialize_only_last_token_logits
-        )
-        self.cuda_graph_impl = model_config.cuda_graph_impl
+        self.random_seed = random_seed
+        self.track_paused_request_events = track_paused_request_events
+        self.enable_chunked_prefill = enable_chunked_prefill
+        self.inference_logging_step_interval = inference_logging_step_interval
+        self.unified_memory_level = context.unified_memory_level
+        self.persist_cuda_graphs = context.persist_cuda_graphs
+
+        if enable_cuda_graph is not None:
+            self.cuda_graph_impl = "local" if enable_cuda_graph else "none"
+        else:
+            self.cuda_graph_impl = controller.inference_wrapped_model.model.config.cuda_graph_impl
 
         # Initialize engine.
         self.reset()
@@ -191,12 +205,12 @@ class DynamicInferenceEngine(AbstractEngine):
         )
 
         # Configure wandb to use separate step counter for inference metrics (only once)
-        if self.logging_step_interval > 0 and self.metrics_writer is not None:
+        if self.inference_logging_step_interval > 0 and self.context.metrics_writer is not None:
             logging.info(
                 f"\033[1;93m[INFERENCE]\033[0m "
                 f"\033[1;95mLogging inference metrics to wandb (rank {self.rank})\033[0m"
             )
-            if HAVE_WANDB and self.metrics_writer.__name__ == "wandb":
+            if HAVE_WANDB and self.context.metrics_writer.__name__ == "wandb":
                 # Make all inference/* metrics use inference_step as their x-axis
                 # This allows inference and training to have independent step counters
                 context.metrics_writer.define_metric(
@@ -273,6 +287,8 @@ class DynamicInferenceEngine(AbstractEngine):
 
         context = self.context
         controller = self.controller
+
+        config = controller.inference_wrapped_model.inference_wrapper_config
 
         time_start = time.time()
         mem_stats_start = torch.cuda.memory_stats()
@@ -717,7 +733,7 @@ class DynamicInferenceEngine(AbstractEngine):
             request.sampling_params.return_log_probs
             and not request.sampling_params.skip_prompt_log_probs
         ):
-            assert not self.materialize_only_last_token_logits, (
+            assert not self.context.materialize_only_last_token_logits, (
                 "Prompt log probs cannot be calculated if only last token logits are materialized. "
                 "Set materialize_only_last_token_logits to False in DynamicInferenceContext "
                 "or skip_prompt_log_probs to True in SamplingParams."
@@ -906,7 +922,7 @@ class DynamicInferenceEngine(AbstractEngine):
                 # For chunked prefill with materialize_only_last_token_logits, discard intermediate log probs
                 if (
                     request_id == self.context.chunked_prefill_request_id
-                    and self.materialize_only_last_token_logits
+                    and self.context.materialize_only_last_token_logits
                 ):
                     request.prompt_log_probs = []
                     request.generated_log_probs = []
@@ -1186,10 +1202,10 @@ class DynamicInferenceEngine(AbstractEngine):
         range_pop()
 
         if (
-            self.logging_step_interval > 0
+            self.inference_logging_step_interval > 0
             and self.step_count > 0
-            and self.step_count % self.logging_step_interval == 0
-            and self.metrics_writer is not None
+            and self.step_count % self.inference_logging_step_interval == 0
+            and self.context.metrics_writer is not None
         ):
             kvcache_util_stats = self.context.get_kvcache_utilization_stats()
         else:
@@ -1322,13 +1338,18 @@ class DynamicInferenceEngine(AbstractEngine):
                 else:
                     metrics[f'inference/{key}'] = value
 
-            if HAVE_WANDB and self.metrics_writer.__name__ == "wandb":
-                self.metrics_writer.log(metrics, commit=True)
+            if HAVE_WANDB and self.context.metrics_writer.__name__ == "wandb":
+                self.context.metrics_writer.log(metrics, commit=True)
             else:
-                raise ValueError(f"Unsupported metrics writer type: {type(self.metrics_writer)}")
+                raise ValueError(
+                    f"Unsupported metrics writer type: {type(self.context.metrics_writer)}"
+                )
 
         # Print context state.
-        if self.logging_step_interval > 0 and step_count % self.logging_step_interval == 0:
+        if (
+            self.inference_logging_step_interval > 0
+            and step_count % self.inference_logging_step_interval == 0
+        ):
             mem = torch.cuda.memory_stats()
             step_type = "decode" if context_state["is_decode_only"] else "non-decode"
             output_str = (

@@ -1,10 +1,34 @@
 # Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
-from typing import Optional
+from dataclasses import dataclass
+from typing import List, Optional, Tuple
 
 import torch
 
 from megatron.core.inference.batch_dimensions_utils import InferenceBatchDimensions
+
+
+@dataclass
+class MambaInferenceStateConfig:
+    """
+    Config for initializing Mamba model inference state tensors.
+
+    Note that we maintain separate metadata for decode, regular prefill, and
+    chunked prefill requests because the Mamba kernels do not yet support mixing
+    these. Once the kernels have been updated we can simplify this code.
+    """
+
+    layer_type_list: List[str]
+    """
+    A list of strings that indicates the layer type (Mamba / Attention / MLP) for each layer.
+    See `megatron/core/ssm/mamba_hybrid_layer_allocation.py` for the list of symbols.
+    """
+
+    mamba_conv_states_shape: Tuple[int]
+    """Mamba conv states shape per request."""
+
+    mamba_ssm_states_shape: Tuple[int]
+    """Mamba ssm states shape per request."""
 
 
 class MambaMetadata:

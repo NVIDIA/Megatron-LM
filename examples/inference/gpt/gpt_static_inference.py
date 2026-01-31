@@ -1,11 +1,21 @@
 # Copyright (c) 2025, NVIDIA CORPORATION. All rights reserved.
 
 import os
+from megatron.core.inference.model_inference_wrappers.inference_wrapper_config import (
+    InferenceWrapperConfig,
+)
+from model_provider import model_provider
+from gpt_builders import gpt_builder
+from mamba_builders import mamba_builder
+import torch
 import sys
 import time
+import warnings
+from functools import partial
 from argparse import Namespace
 
 import torch
+import tqdm
 
 from megatron.core.inference.contexts import StaticInferenceContext
 from megatron.core.inference.engines import StaticInferenceEngine
@@ -13,12 +23,17 @@ from megatron.core.inference.inference_request import InferenceRequest
 from megatron.core.inference.model_inference_wrappers.gpt.gpt_inference_wrapper import (
     GPTInferenceWrapper,
 )
+from megatron.core.inference.model_inference_wrappers.inference_wrapper_config import (
+    InferenceWrapperConfig,
+)
 from megatron.core.inference.sampling_params import SamplingParams
 from megatron.core.inference.text_generation_controllers.text_generation_controller import (
     TextGenerationController,
 )
 from megatron.core.tokenizers.text.utils.build_tokenizer import build_tokenizer
 from megatron.core.transformer.module import MegatronModule
+from pretrain_gpt import model_provider as gpt_model_provider
+from pretrain_mamba import model_provider as mamba_model_provider
 
 sys.path.append(
     os.path.abspath(os.path.join(os.path.dirname(__file__), os.path.pardir, os.path.pardir))
@@ -26,18 +41,18 @@ sys.path.append(
 
 import asyncio
 import json
-from typing import List
+from typing import Any, AsyncIterator, List
 
-from examples.inference.gpt.utils import build_requests
-from megatron.inference.utils import add_inference_args, get_model_for_inference
-from megatron.training import get_args, get_tokenizer, print_rank_0
+from examples.inference.gpt.utils import add_common_inference_args, build_requests
+from megatron.core import mpu
+from megatron.training import get_args, get_model, get_tokenizer, print_rank_0
+from megatron.training.checkpointing import load_checkpoint
 from megatron.training.initialize import initialize_megatron
-
 
 def add_static_inference_args(parser):
     """Static inference arguments."""
 
-    add_inference_args(parser)
+    add_common_inference_args(parser)
 
     group = parser.add_argument_group(title='Static inference')
     group.add_argument(
@@ -68,16 +83,30 @@ def get_inference_engine(args: Namespace, model: MegatronModule) -> StaticInfere
         tokenizer = get_tokenizer()
     else:
         tokenizer = build_tokenizer(args)
-    inference_context = StaticInferenceContext(
-        args.inference_max_requests, args.inference_max_seq_length
+    inference_wrapper_config = InferenceWrapperConfig(
+        hidden_size=args.hidden_size,
+        inference_batch_times_seqlen_threshold=args.inference_batch_times_seqlen_threshold,
+        fp32_residual_connection=args.fp32_residual_connection,
+        params_dtype=args.params_dtype,
+        padded_vocab_size=args.padded_vocab_size,
+        inference_max_requests=args.inference_max_batch_size,
+        inference_max_seq_length=args.inference_max_seq_length,
+        nccl_all_reduce_for_prefill=args.nccl_all_reduce_for_prefill,
+        fp8=args.fp8,
+        moe_pad_experts_for_cuda_graph_inference = args.moe_pad_experts_for_cuda_graph_inference
     )
-    inference_wrapped_model = GPTInferenceWrapper(model, inference_context)
+
+    inference_context = StaticInferenceContext.from_config(inference_wrapper_config)
+
+    inference_wrapped_model = GPTInferenceWrapper(
+        model, inference_wrapper_config, inference_context
+    )
     text_generation_controller = TextGenerationController(
         inference_wrapped_model=inference_wrapped_model, tokenizer=tokenizer
     )
     engine_kwargs = {
-        "text_generation_controller": text_generation_controller,
-        "legacy": args.use_legacy_static_engine,
+        "text_generation_controller" : text_generation_controller,
+        "legacy" : args.use_legacy_static_engine,
     }
     if not args.use_legacy_static_engine:
         engine_kwargs["buffer_size_gb"] = args.inference_dynamic_batching_buffer_size_gb
@@ -136,7 +165,22 @@ def main():
 
     args = get_args()
 
-    model = get_model_for_inference()
+    if args.max_batch_size is not None:
+        warnings.warn(
+            f"`--max-batch-size` has been deprecated in favor of `--inference-max-requests`."
+        )
+        args.inference_max_batch_size = max(args.max_batch_size, args.inference_max_batch_size)
+
+    # Set up model and load checkpoint
+    if args.model_provider == "gpt":
+        model_builder = gpt_builder
+    elif args.model_provider == "mamba":
+        model_builder = mamba_builder
+    else:
+        raise ValueError(f"Invalid model provider {args.model_provider}")
+    model = get_model(partial(model_provider, model_builder), wrap_with_ddp=False)
+    load_checkpoint(model, None, None, strict=False)
+    model = model[0]
 
     inference_engine = get_inference_engine(args, model)
 
@@ -232,7 +276,7 @@ def main():
                 )
             ),
             len(requests),
-            args.inference_max_requests,
+            args.inference_max_batch_size,
             stats["allocated_bytes.all.peak"] / (1024**3),
             stats["reserved_bytes.all.peak"] / (1024**3),
             latency,
@@ -247,6 +291,7 @@ def main():
         os._exit(0)
     else:
         torch.distributed.destroy_process_group()
+
 
 
 if __name__ == "__main__":

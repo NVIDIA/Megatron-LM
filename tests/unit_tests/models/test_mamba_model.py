@@ -10,7 +10,6 @@ from transformer_engine.pytorch.fp8 import check_fp8_support
 
 from megatron.core import parallel_state
 from megatron.core.hyper_comm_grid import HyperCommGrid
-from megatron.core.inference.config import InferenceConfig, MambaInferenceStateConfig
 from megatron.core.inference.contexts import BaseInferenceContext, StaticInferenceContext
 from megatron.core.inference.contexts.dynamic_context import DynamicInferenceContext
 from megatron.core.inference.inference_request import DynamicInferenceRequest
@@ -22,7 +21,12 @@ from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
 from megatron.core.transformer import TransformerConfig
 from megatron.core.transformer.enums import AttnBackend
 from megatron.core.transformer.module import Float16Module
-from megatron.core.utils import divide, is_fa_min_version, is_torch_min_version
+from megatron.core.utils import (
+    divide,
+    get_mamba_inference_state_config_from_model,
+    is_fa_min_version,
+    is_torch_min_version,
+)
 from tests.unit_tests.test_utilities import Utils
 
 
@@ -340,17 +344,20 @@ class TestMambaWithDynamicInference:
         self.model.eval()
         config = self.model.config
 
-        mamba_inference_state_config = MambaInferenceStateConfig.from_model(self.model.module)
+        mamba_inference_state_config = get_mamba_inference_state_config_from_model(
+            self.model.module
+        )
 
         inference_context = DynamicInferenceContext(
-            model_config=self.model.config,
-            inference_config=InferenceConfig(
-                max_sequence_length=self.model.module.max_sequence_length,
-                buffer_size_gb=1.0,
-                block_size_tokens=256,
-                materialize_only_last_token_logits=False,
-                mamba_inference_state_config=mamba_inference_state_config,
-            ),
+            params_dtype=config.params_dtype,
+            num_layers=config.num_layers,
+            kv_channels=config.hidden_size // config.num_attention_heads,
+            num_attention_heads=config.num_attention_heads,
+            max_sequence_length=self.model.module.max_sequence_length,
+            buffer_size_gb=1.0,
+            block_size_tokens=256,
+            materialize_only_last_token_logits=False,
+            mamba_inference_state_config=mamba_inference_state_config,
         )
 
         # Add a request with 10 tokens. Since 10 is not a multiple of 64 (TOKEN_ROUNDER),

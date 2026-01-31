@@ -77,7 +77,7 @@ MODEL_OPTIONS="\
   --ckpt-format torch_dist \
   --seq-length $MAX_SEQ_LENGTH \
   --inference-max-seq-length $MAX_SEQ_LENGTH \
-  --inference-max-requests $MAX_INFERENCE_BS \
+  --inference-max-batch-size $MAX_INFERENCE_BS \
   --pretrained-checkpoint $CHECKPOINT \
   --add-qkv-bias \
   --normalization RMSNorm \
@@ -101,7 +101,6 @@ MODEL_OPTIONS="\
   --max-position-embeddings 131072  \
   --tokenizer-type HuggingFaceTokenizer \
   --tokenizer-model unsloth/Meta-Llama-3.1-8B-Instruct \
-  --legacy-tokenizer \
   --langrl-inference-server-type "inplace_megatron_chat" \
   --langrl-inference-server-conversation-template "unsloth/Meta-Llama-3.1-8B-Instruct" \
   --lr 3e-7 \
