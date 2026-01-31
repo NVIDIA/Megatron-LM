@@ -817,6 +817,155 @@ class TEGroupedMLP(MegatronModule):
         self.linear_fc1.backward_dw()
 
 
+class InferenceGroupedMLP(TEGroupedMLP):
+    """Inference-optimized GroupedMLP using torch._grouped_mm with GPU-resident offsets.
+
+    Inherits from TEGroupedMLP to reuse weight initialization and checkpoint compatibility.
+    Overrides forward() to use torch._grouped_mm instead of TE's grouped linear,
+    keeping tokens_per_expert on GPU to avoid host synchronization.
+    """
+
+    def __init__(
+        self,
+        num_local_experts: int,
+        config: TransformerConfig,
+        submodules: MLPSubmodules,
+        pg_collection: Optional[ProcessGroupCollection] = None,
+    ):
+        # Initialize parent TEGroupedMLP (creates linear_fc1, linear_fc2)
+        super().__init__(
+            num_local_experts=num_local_experts,
+            config=config,
+            submodules=submodules,
+            pg_collection=pg_collection,
+        )
+
+        # Concatenate TE's per-expert weights into single tensors for torch._grouped_mm
+        # TE GroupedLinear stores weights as weight0, weight1, ..., weight{n-1}
+        # torch._grouped_mm expects shape [num_experts, out_features, in_features]
+        self._build_concatenated_weights()
+
+        # Register hook to rebuild concatenated weights after load_state_dict
+        # self._register_load_state_dict_post_hook(self._rebuild_weights_hook)
+
+        # Set up activation function for inference (simplified, no recompute)
+        if self.config.gated_linear_unit:
+            @jit_fuser
+            def glu(x):
+                x = torch.chunk(x, 2, dim=-1)
+                return self.config.activation_func(x[0]) * x[1]
+            self._inference_activation_func = glu
+        else:
+            self._inference_activation_func = self.config.activation_func
+
+        @jit_fuser
+        def activation_func_with_probs(x, probs):
+            dtype = x.dtype
+            res = self._inference_activation_func(x) * probs
+            return res.to(dtype)
+
+        self._activation_func_with_probs = activation_func_with_probs
+
+    def _build_concatenated_weights(self):
+        """Create big contiguous weight tensors with per-expert views for checkpoint compatibility.
+
+        Creates _fc1_weight and _fc2_weight as contiguous tensors of shape
+        [num_experts, out_features, in_features]. Replaces TE's individual weight{i}
+        parameters with views into these tensors.
+
+        This allows:
+        - load_state_dict to load into weight{i} views -> writes into big tensor
+        - forward() to use big tensor directly with torch._grouped_mm
+        - No post-load hooks needed
+        """
+        # Get device/dtype from existing TE weights
+        device = self.linear_fc1.weight0.device
+        dtype = self.linear_fc1.weight0.dtype
+
+        fc1_shape = self.linear_fc1.weight0.shape  # [out_features, in_features]
+        fc2_shape = self.linear_fc2.weight0.shape
+
+        # Create big contiguous tensors
+        _fc1_weight = torch.empty(
+            self.num_local_experts, *fc1_shape, device=device, dtype=dtype
+        )
+        _fc2_weight = torch.empty(
+            self.num_local_experts, *fc2_shape, device=device, dtype=dtype
+        )
+
+        # Copy existing TE weights into big tensors, then replace with views
+        for i in range(self.num_local_experts):
+            # Copy initialized data
+            _fc1_weight[i].copy_(getattr(self.linear_fc1, f'weight{i}').data)
+            _fc2_weight[i].copy_(getattr(self.linear_fc2, f'weight{i}').data)
+
+            # Delete TE's original parameters
+            delattr(self.linear_fc1, f'weight{i}')
+            delattr(self.linear_fc2, f'weight{i}')
+
+            # Register views as parameters (checkpoint loads will write into big tensor)
+            self.linear_fc1.register_parameter(
+                f'weight{i}', torch.nn.Parameter(_fc1_weight[i])
+            )
+            self.linear_fc2.register_parameter(
+                f'weight{i}', torch.nn.Parameter(_fc2_weight[i])
+            )
+
+        # Register big tensors as non-persistent buffers (for .to() device movement, not saved)
+        self.register_buffer('_fc1_weight', _fc1_weight, persistent=False)
+        self.register_buffer('_fc2_weight', _fc2_weight, persistent=False)
+
+    def forward(
+        self,
+        permuted_local_hidden_states: torch.Tensor,
+        tokens_per_expert: torch.Tensor,
+        permuted_probs: torch.Tensor,
+    ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
+        """Forward pass using torch._grouped_mm with GPU-resident offsets.
+
+        Args:
+            permuted_local_hidden_states: [total_tokens, hidden_size] input tensor
+            tokens_per_expert: [num_local_experts] GPU tensor with token counts per expert
+            permuted_probs: [total_tokens] routing probabilities
+
+        Returns:
+            Tuple of (output, None) for interface compatibility
+        """
+        permuted_probs = permuted_probs.unsqueeze(-1)
+        assert tokens_per_expert.is_cuda, "tokens_per_expert must be on GPU"
+
+        if self.config.moe_apply_probs_on_input:
+            assert (
+                self.config.moe_router_topk == 1
+            ), "`moe_apply_probs_on_input` only works with `moe_router_topk`=1."
+            original_dtype = permuted_local_hidden_states.dtype
+            permuted_local_hidden_states = permuted_probs * permuted_local_hidden_states
+            permuted_local_hidden_states = permuted_local_hidden_states.to(original_dtype)
+            permuted_probs = torch.ones_like(permuted_probs)
+
+        if permuted_local_hidden_states.nelement() != 0:
+            # Use pre-concatenated weights (built during init/load)
+            # _fc1_weight shape: [num_experts, ffn_hidden * (2 if gated else 1), hidden_size]
+            # _fc2_weight shape: [num_experts, hidden_size, ffn_hidden]
+            # Compute cumulative offsets on GPU (no host sync!)
+            # offs[i] = end index of expert i's tokens
+            offs = tokens_per_expert.cumsum(0).to(torch.int32)
+
+            # FC1: [total_tokens, hidden] @ [num_experts, ffn_hidden, hidden] -> [total_tokens, ffn_hidden]
+            fc1_output = torch._grouped_mm(permuted_local_hidden_states, self._fc1_weight.transpose(1, 2), offs=offs)
+
+            # Activation with routing probabilities
+            intermediate_parallel = self._activation_func_with_probs(fc1_output, permuted_probs)
+
+            # FC2: [total_tokens, ffn_hidden] @ [num_experts, hidden, ffn_hidden] -> [total_tokens, hidden]
+            fc2_output = torch._grouped_mm(intermediate_parallel, self._fc2_weight.transpose(1, 2), offs=offs)
+        else:
+            # No tokens allocated - return empty tensor with correct shape
+            fc2_output = permuted_local_hidden_states
+
+        return fc2_output, None
+
+
 class SequentialMLP(MegatronModule):
     """An implementation of the Experts layer using a sequence of MLP layers.
 
