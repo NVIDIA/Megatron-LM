@@ -13,6 +13,7 @@ This example demonstrates:
 from megatron.core.models.hl import (
     HLModel,
     HLModelConfig,
+    EmbeddingLayer,
     AttentionLayer,
     MambaLayer,
     MoELayer,
@@ -23,6 +24,17 @@ from megatron.core.models.hl import (
 # =============================================================================
 # LAYER DEFINITIONS
 # =============================================================================
+
+Embed = EmbeddingLayer(
+    vocab_size=131072,
+    hidden_size=2688,
+    max_sequence_length=8192,
+    position_embedding_type="none",
+    parallelism=ParallelismConfig(
+        tensor_parallel_size=8,
+        sequence_parallel=True,
+    ),
+)
 
 M1 = MambaLayer(
     hidden_size=2688,
@@ -93,13 +105,11 @@ layer_pattern = [P1, PS, P2, PS, P3, PS, P4]
 # =============================================================================
 
 nemotron_config = HLModelConfig(
-    vocab_size=131072,
-    max_sequence_length=8192,
+    embedding=Embed,
     layer_pattern=layer_pattern,
 
     # Model settings
     share_embeddings_and_output_weights=False,
-    position_embedding_type="none",
     normalization="RMSNorm",
     disable_bias_linear=True,
     init_method_std=0.0173,

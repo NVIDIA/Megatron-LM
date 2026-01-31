@@ -15,6 +15,7 @@ This example demonstrates:
 from megatron.core.models.hl import (
     HLModel,
     HLModelConfig,
+    EmbeddingLayer,
     AttentionLayer,
     MLPLayer,
     ParallelismConfig,
@@ -23,6 +24,18 @@ from megatron.core.models.hl import (
 # =============================================================================
 # LAYER DEFINITIONS
 # =============================================================================
+
+Embed = EmbeddingLayer(
+    vocab_size=128000,
+    hidden_size=4096,
+    max_sequence_length=4096,
+    position_embedding_type="rope",
+    rotary_base=500000,
+    parallelism=ParallelismConfig(
+        tensor_parallel_size=8,
+        sequence_parallel=True,
+    ),
+)
 
 A1 = AttentionLayer(
     hidden_size=4096,
@@ -59,14 +72,11 @@ layer_pattern = [A1, F1] * 32
 # =============================================================================
 
 simple_config = HLModelConfig(
-    vocab_size=128000,
-    max_sequence_length=4096,
+    embedding=Embed,
     layer_pattern=layer_pattern,
 
     # Model settings
     share_embeddings_and_output_weights=True,
-    position_embedding_type="rope",
-    rotary_base=500000,
     normalization="RMSNorm",
     disable_bias_linear=True,
     init_method_std=0.02,
