@@ -366,6 +366,9 @@ class HybridDeviceOptimizer(torch.optim.Optimizer):
                     else:
                         self.state[orig_param][k] = state[k] = v.to("cuda")
 
+    def move_state_to_right_device(self):
+        self._move_new_state_to_right_device()
+
     def _update_fp32_params_by_new_state(self):
         if not self.param_update_in_fp32:
             return
