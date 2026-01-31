@@ -22,6 +22,7 @@ from torch.distributed import DeviceMesh
 from torch.distributed.device_mesh import init_device_mesh
 
 from .megatron_fsdp import MegatronFSDP
+from .mp_policy import MixedPrecisionPolicy
 from .uneven_dtensor import preprocess_state_dict_for_uneven_dtensor
 from .utils import FSDPDistributedIndex, create_updated_function_signature
 
@@ -83,13 +84,12 @@ def fully_shard_model(
     outer_dp_sharding_strategy: str | int = 0,
     device: Optional[torch.device] = None,
     init_model_with_meta_device: bool = False,
-    grad_reduce_in_fp32: bool = False,
-    preserve_fp32_weights: bool = True,
+    mp_policy: MixedPrecisionPolicy = MixedPrecisionPolicy(),
     overlap_grad_reduce: bool = True,
     overlap_param_gather: bool = True,
     sync_model_each_microbatch: bool = True,
     preproc_state_dict_for_dcp_ckpt: bool = True,
-    check_for_nan_in_grad: bool = True,
+    check_for_nan_in_grad: bool = False,
     average_in_collective: bool = False,
     disable_bucketing: bool = False,
     calculate_per_token_loss: bool = False,
@@ -179,11 +179,10 @@ def fully_shard_model(
             implementing a custom Module.reset_parameters() or Module._reset_parameters() method.
             Defaults to False.
 
-        grad_reduce_in_fp32 (bool):
-            Whether to perform gradient reduction in FP32. Defaults to False.
-
-        preserve_fp32_weights (bool):
-            Whether to preserve FP32 optimization weights. Defaults to True.
+        mp_policy (megatron_fsdp.MixedPrecisionPolicy):
+            Megatron-FSDP mixed-precision config that controls compute and communication precision.
+            Defaults to FP32 main weights, FP32 main gradients, BF16 gradient communications, and
+            FP32 gradient reduction and accumulation.
 
         overlap_grad_reduce (bool):
             Whether to overlap gradient reduce-scatter (or all-reduce) with backward compute.
@@ -207,7 +206,8 @@ def fully_shard_model(
             Defaults to True.
 
         check_for_nan_in_grad (bool):
-            Whether to check for NaN values in gradients. Defaults to True.
+            Whether to check for NaN values in gradients. Hinders performance by around 5%.
+            Defaults to False.
 
         average_in_collective (bool):
             Whether to average gradients in collective communication. Defaults to False.
@@ -327,8 +327,6 @@ def fully_shard_model(
     ddp_config = DistributedDataParallelConfig(
         data_parallel_sharding_strategy=zero_dp_strategy,
         outer_dp_sharding_strategy=outer_dp_sharding_strategy,
-        grad_reduce_in_fp32=grad_reduce_in_fp32,
-        preserve_fp32_weights=preserve_fp32_weights,
         overlap_grad_reduce=overlap_grad_reduce,
         overlap_param_gather=overlap_param_gather,
         average_in_collective=average_in_collective,
@@ -363,6 +361,7 @@ def fully_shard_model(
         module=module,
         dist_index=dist_index,
         ddp_config=ddp_config,
+        mp_policy=mp_policy,
         fsdp_unit_modules=fsdp_unit_modules,
         disable_bucketing=disable_bucketing,
         device=device,
@@ -513,6 +512,7 @@ def fully_shard_optimizer(
     return optimizer
 
 
+@experimental_api
 def fully_shard(
     module: torch.nn.Module,
     optimizer: torch.optim.Optimizer,
@@ -527,13 +527,12 @@ def fully_shard(
     outer_dp_sharding_strategy: str | int = 0,
     device: Optional[torch.device] = None,
     init_model_with_meta_device: bool = False,
-    grad_reduce_in_fp32: bool = False,
-    preserve_fp32_weights: bool = True,
+    mp_policy: MixedPrecisionPolicy = MixedPrecisionPolicy(),
     overlap_grad_reduce: bool = True,
     overlap_param_gather: bool = True,
     sync_model_each_microbatch: bool = True,
     preproc_state_dict_for_dcp_ckpt: bool = True,
-    check_for_nan_in_grad: bool = True,
+    check_for_nan_in_grad: bool = False,
     average_in_collective: bool = False,
     disable_bucketing: bool = False,
     calculate_per_token_loss: bool = False,
@@ -574,8 +573,7 @@ def fully_shard(
         outer_dp_sharding_strategy=outer_dp_sharding_strategy,
         device=device,
         init_model_with_meta_device=init_model_with_meta_device,
-        grad_reduce_in_fp32=grad_reduce_in_fp32,
-        preserve_fp32_weights=preserve_fp32_weights,
+        mp_policy=mp_policy,
         overlap_grad_reduce=overlap_grad_reduce,
         overlap_param_gather=overlap_param_gather,
         sync_model_each_microbatch=sync_model_each_microbatch,
