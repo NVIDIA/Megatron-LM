@@ -108,7 +108,7 @@ class MambaStack(MegatronModule):
         self.hybrid_override_pattern = hybrid_override_pattern
         self.pg_collection = pg_collection
 
-        # For MTP layers, always use pattern length (not config.num_layers which is for main decoder)
+        # For MTP layers, always use pattern length (config.num_layers is for main decoder)
         if self.is_mtp_layer:
             num_layers_for_allocation = len(self.hybrid_override_pattern)
         else:

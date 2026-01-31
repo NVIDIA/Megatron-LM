@@ -1269,7 +1269,8 @@ class MultiTokenPredictionBlock(MegatronModule):
             # Legacy repeated layer mode
             if len(self.submodules.layer_specs) != 1:
                 warnings.warn(
-                    f"Repeated MTP mode expects exactly 1 layer spec, got {len(self.submodules.layer_specs)}. "
+                    "Repeated MTP mode expects exactly 1 layer spec, got "
+                    f"{len(self.submodules.layer_specs)} instead. "
                     f"The first layer will be applied {self.config.mtp_num_layers} times."
                 )
             self.layers = torch.nn.ModuleList(
