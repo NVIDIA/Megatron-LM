@@ -313,7 +313,7 @@ class LanguageModule(MegatronModule):
         # Also, if MTP is not placed in the post processing stage, we need to maintain a copy
         # of output layer in the mtp process stage and tie it to the output layer in the post
         # processing stage.
-        if self.mtp_process and not self.pre_process:
+        if getattr(self, 'mtp_process', False) and not self.pre_process:
             emb_weight = self.embedding.word_embeddings.weight
             tie_word_embeddings_state_dict(
                 sharded_state_dict,
@@ -323,7 +323,7 @@ class LanguageModule(MegatronModule):
                 dp_cp_group=metadata['dp_cp_group'],
             )
 
-        if self.mtp_process and not self.post_process:
+        if getattr(self, 'mtp_process', False) and not self.post_process:
             # We only need to tie the output layer weight if share_embeddings_and_output_weights
             # is False. Because if share_embeddings_and_output_weights is True, the shared weight
             # will be stored in embedding layer, and output layer will not have any weight.

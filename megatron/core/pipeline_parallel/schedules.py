@@ -406,7 +406,7 @@ def forward_step(
 
     if is_first_microbatch and hasattr(model, 'set_is_first_microbatch'):
         model.set_is_first_microbatch()
-    if config.external_cuda_graph and current_microbatch is not None:
+    if current_microbatch is not None:
         set_current_microbatch(model, current_microbatch)
 
     unwrap_output_tensor = False
