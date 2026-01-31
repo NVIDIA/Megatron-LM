@@ -10,33 +10,31 @@ import torch
 
 from gpt_builders import gpt_builder
 from mamba_builders import mamba_builder
-from megatron.core.inference.contexts import DynamicInferenceContext
+from megatron.core.inference.contexts import StaticInferenceContext
 from megatron.core.inference.engines import DynamicInferenceEngine, StaticInferenceEngine
 from megatron.core.inference.engines.abstract_engine import AbstractEngine
-from megatron.core.inference.inference_request import InferenceRequest
+from megatron.core.inference.inference_request import (
+    DynamicInferenceRequestRecord,
+    InferenceRequest,
+)
 from megatron.core.inference.model_inference_wrappers.gpt.gpt_inference_wrapper import (
     GPTInferenceWrapper,
-)
-from megatron.core.inference.model_inference_wrappers.inference_wrapper_config import (
-    InferenceWrapperConfig,
 )
 from megatron.core.inference.sampling_params import SamplingParams
 from megatron.core.inference.text_generation_controllers.text_generation_controller import (
     TextGenerationController,
 )
 from megatron.core.transformer.module import MegatronModule
-from megatron.core.utils import get_mamba_inference_state_config_from_model
+from megatron.inference.utils import add_inference_args, get_dynamic_inference_engine
 from model_provider import model_provider
 
 sys.path.append(
     os.path.abspath(os.path.join(os.path.dirname(__file__), os.path.pardir, os.path.pardir))
 )
 
-import asyncio
 from functools import partial
-from typing import List, Union
+from typing import List
 
-from examples.inference.gpt.utils import add_common_inference_args
 from megatron.core import mpu
 from megatron.training import get_args, get_model, get_tokenizer
 from megatron.training.checkpointing import load_checkpoint
@@ -47,7 +45,7 @@ REQUEST_ID = 0
 
 def add_inference_benchmarking_args(parser):
     """Inference benchmarking arguments."""
-    parser = add_common_inference_args(parser)
+    parser = add_inference_args(parser)
 
     group = parser.add_argument_group(title='inference_benchmarking')
 
@@ -60,7 +58,6 @@ def add_inference_benchmarking_args(parser):
     group.add_argument(
         "--benchmark-profile", action="store_true", default=False, help="If set, profile"
     )
-    group.add_argument('--stream', action="store_true", default=False, help="If set, stream tokens")
     return parser
 
 
@@ -74,24 +71,13 @@ def get_inference_engine(args: argparse.Namespace, model: MegatronModule) -> Abs
     Returns:
         AbstractBackend: The chosen backend
     """
-    tokenizer = get_tokenizer()
-
-    inference_wrapper_config = InferenceWrapperConfig(
-        hidden_size=args.hidden_size,
-        inference_batch_times_seqlen_threshold=args.inference_batch_times_seqlen_threshold,
-        fp32_residual_connection=args.fp32_residual_connection,
-        params_dtype=args.params_dtype,
-        padded_vocab_size=args.padded_vocab_size,
-        inference_max_requests=args.inference_max_batch_size,
-        inference_max_seq_length=args.inference_max_seq_length,
-        nccl_all_reduce_for_prefill=args.nccl_all_reduce_for_prefill,
-        moe_pad_experts_for_cuda_graph_inference=args.moe_pad_experts_for_cuda_graph_inference,
-    )
-
-    mamba_inference_state_config = get_mamba_inference_state_config_from_model(model)
 
     if args.engine_type == "static":
-        inference_wrapped_model = GPTInferenceWrapper(model, inference_wrapper_config)
+        tokenizer = get_tokenizer()
+        context = StaticInferenceContext(
+            args.inference_max_requests, args.inference_max_sequence_length
+        )
+        inference_wrapped_model = GPTInferenceWrapper(model, context)
         inference_wrapped_model.model_is_pipeline_parallel = not (
             mpu.is_pipeline_first_stage() and mpu.is_pipeline_last_stage()
         )
@@ -100,98 +86,7 @@ def get_inference_engine(args: argparse.Namespace, model: MegatronModule) -> Abs
         )
         return StaticInferenceEngine(text_generation_controller=text_generation_controller)
     elif args.engine_type == "dynamic":
-        context = DynamicInferenceContext(
-            params_dtype=args.params_dtype,
-            num_layers=args.num_layers,
-            kv_channels=args.kv_channels,
-            num_attention_heads=(
-                args.num_query_groups if args.group_query_attention else args.num_attention_heads
-            ),
-            max_sequence_length=args.inference_max_seq_length,
-            num_cuda_graphs=(
-                args.inference_dynamic_batching_num_cuda_graphs
-                if args.cuda_graph_impl == "local"
-                else None
-            ),
-            buffer_size_gb=args.inference_dynamic_batching_buffer_size_gb,
-            buffer_guaranteed_fraction=args.inference_dynamic_batching_buffer_guaranteed_fraction,
-            buffer_overflow_factor=args.inference_dynamic_batching_buffer_overflow_factor,
-            max_requests_override=args.inference_dynamic_batching_max_requests_override,
-            max_tokens_override=args.inference_dynamic_batching_max_tokens_override,
-            block_size_tokens=args.inference_dynamic_batching_block_size,
-            tensor_model_parallel_size=args.tensor_model_parallel_size,
-            pipeline_model_parallel_size=args.pipeline_model_parallel_size,
-            materialize_only_last_token_logits=not args.return_log_probs,
-            mamba_inference_state_config=mamba_inference_state_config,
-            cache_mla_latent=args.multi_latent_attention and args.cache_mla_latents,
-            kv_lora_rank=args.kv_lora_rank if args.multi_latent_attention else None,
-            qk_pos_emb_head_dim=args.qk_pos_emb_head_dim,
-            use_cuda_graphs_for_non_decode_steps=not args.decode_only_cuda_graphs,
-            use_flashinfer_fused_rope=args.use_flashinfer_fused_rope,
-            unified_memory_level=args.inference_dynamic_batching_unified_memory_level,
-        )
-        inference_wrapped_model = GPTInferenceWrapper(
-            model, inference_wrapper_config, inference_context=context
-        )
-        inference_wrapped_model.model_is_pipeline_parallel = not (
-            mpu.is_pipeline_first_stage() and mpu.is_pipeline_last_stage()
-        )
-        text_generation_controller = TextGenerationController(
-            inference_wrapped_model=inference_wrapped_model, tokenizer=tokenizer
-        )
-        return DynamicInferenceEngine(
-            text_generation_controller,
-            context,
-            termination_id=-1,
-            enable_cuda_graph=args.cuda_graph_impl == "local",
-            random_seed=args.seed,
-        )
-
-
-async def generate(
-    inference_engine: Union[StaticInferenceEngine, DynamicInferenceEngine],
-    sampling_params: SamplingParams,
-    prompts: List[str],
-    inference_requests: List[InferenceRequest] = None,
-) -> List[InferenceRequest]:
-    async def collect_stream(prompt, request_id, stream_generator):
-        async for output in stream_generator:
-            pass
-
-    if inference_requests is None:
-        assert prompts is not None
-        inference_requests = [None for _ in range(len(prompts))]
-    elif prompts is None:
-        assert inference_requests is not None
-        tokenizer = get_tokenizer()
-        prompts = [tokenizer.detokenize(request.prompt_tokens) for request in inference_requests]
-
-    request_ids: List[int] = [
-        inference_engine.add_request(
-            prompt=prompt,
-            inference_request=inference_request,
-            inference_parameters=sampling_params,
-            streaming=True,
-        )
-        for prompt, inference_request in zip(prompts, inference_requests)
-    ]
-    stream_generators = [
-        inference_engine.get_stream_generator(request_id) for request_id in request_ids
-    ]
-
-    tasks = [
-        asyncio.create_task(collect_stream(prompt, request_id, stream_generator))
-        for (prompt, request_id, stream_generator) in zip(prompts, request_ids, stream_generators)
-    ]
-
-    await inference_engine.run_engine_async()
-    await asyncio.gather(*tasks)
-
-    results: List[InferenceRequest] = [
-        inference_engine.scheduler.completed_request_pool[request_id] for request_id in request_ids
-    ]
-
-    return results
+        return get_dynamic_inference_engine(model=model)
 
 
 def get_random_prompt_tokens(tokenizer, num_input_tokens) -> List[int]:
@@ -232,14 +127,12 @@ def generate_dynamic(
         request_id = REQUEST_ID
         REQUEST_ID += 1
         prompt_tokens = request.prompt_tokens
-        inference_engine.add_request(
-            request_id, prompt_tokens, request.inference_parameters,
-        )
+        inference_engine.add_request(request_id, prompt_tokens, request.inference_parameters)
 
     start_time = time.perf_counter()
     all_finished_requests = []
     while inference_engine.has_unfinished_requests():
-        result = inference_engine.step(verbose=False)
+        result = inference_engine.step()
         finished_requests = result["finished_requests"]
         for request in finished_requests:
             req_id = request.request_id
@@ -257,8 +150,6 @@ def generate_dynamic(
 def main():
     """Main program."""
 
-    # Note: The default args passed here can be overwritten by using appropriate params (check arguments.py file)
-    # Micro batch size is not needed to be set by user. (It is calculated based on inference-batch-times-seqlen-threshold argument)
     initialize_megatron(
         extra_args_provider=add_inference_benchmarking_args,
         args_defaults={
@@ -298,13 +189,14 @@ def main():
         return_log_probs=args.return_log_probs,
         top_n_logprobs=args.top_n_logprobs,
         num_tokens_to_generate=args.num_tokens_to_generate,
+        termination_id=-1,
     )
     sampling_params.add_attributes({"no_early_termination": True})
 
     requests = []
     if args.num_input_tokens is not None:
         assert args.prompts is None
-        batch_size = args.inference_max_batch_size
+        batch_size = args.inference_max_requests
         for i in range(batch_size):
             prompt_tokens = get_random_prompt_tokens(tokenizer, args.num_input_tokens)
             requests.append(
@@ -327,33 +219,27 @@ def main():
                 )
             )
 
-    if args.cuda_graph_impl == "local":
-        print(f"Running warmup for CUDA graphs...")
-        warmup_sampling_params = SamplingParams(num_tokens_to_generate=10)
-        warmup_sampling_params.add_attributes({"no_early_termination": True})
+    # TODO(ksanthanam): Use a command line argument for warmup iterations
+    for i in range(3):
+        print(f"Running warmup iteration {i+1}...")
+        warmup_sampling_params = SamplingParams(num_tokens_to_generate=10, termination_id=-1)
         inference_engine.generate(prompts=["warmup"], sampling_params=warmup_sampling_params)
 
     if args.benchmark_profile:
         torch.cuda.cudart().cudaProfilerStart()
 
     start_time = time.perf_counter()
-    if args.stream:
-        if args.engine_type == "dynamic":
-            raise NotImplementedError("Streaming not supported with DynamicInferenceEngine")
-        results: List[InferenceRequest] = asyncio.run(
-            generate(
-                inference_engine, sampling_params, prompts=args.prompts, inference_requests=requests
-            )
+    if args.engine_type == "static":
+        results: List[InferenceRequest] = inference_engine.generate(
+            prompts=args.prompts, inference_requests=requests, sampling_params=sampling_params
         )
     else:
-        if args.engine_type == "static":
-            results: List[InferenceRequest] = inference_engine.generate(
-                prompts=args.prompts, inference_requests=requests, sampling_params=sampling_params
-            )
-        elif args.engine_type == "dynamic":
-            results: List[InferenceRequest] = generate_dynamic(
-                args, requests, inference_engine,
-            )
+        prompts = [request.prompt_tokens for request in requests]
+        records: List[DynamicInferenceRequestRecord] = inference_engine.generate(
+            prompts=prompts, sampling_params=sampling_params
+        )
+        results: List[InferenceRequest] = [record.merge() for record in records]
+
     end_time = time.perf_counter()
     latency = end_time - start_time
 
@@ -377,6 +263,10 @@ def main():
             if args.prompts is not None:
                 result_dict['generated_output'] = tokenizer.detokenize(result.generated_tokens)
             print(result_dict)
+
+    total_output_tokens = args.num_tokens_to_generate * args.inference_max_requests
+    throughput = total_output_tokens / latency
+    print(f"Throughput: {throughput} output tokens / second")
 
 
 if __name__ == "__main__":
