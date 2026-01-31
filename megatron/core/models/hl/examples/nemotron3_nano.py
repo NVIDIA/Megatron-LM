@@ -8,11 +8,15 @@ This example demonstrates:
 - Hybrid architecture with Mamba (M), Attention (A), and MoE (E) layers
 - Pipeline parallelism across 4 stages
 - Expert parallelism for MoE layers
+- CommonConfig for shared settings with per-layer overrides
 """
+
+import torch
 
 from megatron.core.models.hl import (
     HLModel,
     HLModelConfig,
+    CommonConfig,
     EmbeddingLayer,
     AttentionLayer,
     MambaLayer,
@@ -22,46 +26,46 @@ from megatron.core.models.hl import (
 )
 
 # =============================================================================
-# LAYER DEFINITIONS
+# COMMON CONFIGURATION
 # =============================================================================
 
-Embed = EmbeddingLayer(
-    vocab_size=131072,
+# Shared settings inherited by all layers (can be overridden per-layer)
+common_config = CommonConfig(
+    dtype=torch.bfloat16,
     hidden_size=2688,
-    max_sequence_length=8192,
-    position_embedding_type="none",
     parallelism=ParallelismConfig(
         tensor_parallel_size=8,
         sequence_parallel=True,
     ),
 )
 
+# =============================================================================
+# LAYER DEFINITIONS
+# =============================================================================
+
+# Layers inherit dtype, hidden_size, and parallelism from common_config
+
+Embed = EmbeddingLayer(
+    vocab_size=131072,
+    max_sequence_length=8192,
+    position_embedding_type="none",
+)
+
 M1 = MambaLayer(
-    hidden_size=2688,
     num_heads=64,
     head_dim=64,
     state_size=128,
     conv_kernel_size=4,
-    parallelism=ParallelismConfig(
-        tensor_parallel_size=8,
-        sequence_parallel=True,
-    ),
 )
 
 A1 = AttentionLayer(
-    hidden_size=2688,
     num_attention_heads=32,
     num_query_groups=2,
     kv_channels=128,
     use_flash_attention=True,
-    parallelism=ParallelismConfig(
-        tensor_parallel_size=8,
-        sequence_parallel=True,
-    ),
 )
 
 E1 = MoELayer(
-    hidden_size=2688,
     ffn_hidden_size=1856,
     num_experts=128,
     top_k=6,
@@ -75,9 +79,8 @@ E1 = MoELayer(
     activation="squared_relu",
     token_dispatcher_type="allgather",
     grouped_gemm=True,
+    # Extends common_config.parallelism with expert-specific settings
     parallelism=ParallelismConfig(
-        tensor_parallel_size=8,
-        sequence_parallel=True,
         expert_parallel_size=16,
         expert_tensor_parallel_size=8,
     ),
@@ -105,6 +108,7 @@ layer_pattern = [P1, PS, P2, PS, P3, PS, P4]
 # =============================================================================
 
 nemotron_config = HLModelConfig(
+    common_config=common_config,
     embedding=Embed,
     layer_pattern=layer_pattern,
 

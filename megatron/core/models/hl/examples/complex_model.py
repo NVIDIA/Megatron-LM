@@ -4,15 +4,19 @@
 HLModel DSL Example: Complex (Imagined) Model
 
 Demonstrates using multiple layer configurations:
-- A1: Global attention (full sequence)
-- A2: Sliding window attention (local context)
-- E1: Large MoE (128 experts, top-6)
-- E2: Small MoE (32 experts, top-2)
+- A1: Global attention (full sequence), FP8 override
+- A2: Sliding window attention (local context), inherits bf16
+- E1: Large MoE (128 experts, top-6), FP8 override
+- E2: Small MoE (32 experts, top-2), inherits bf16
+- CommonConfig for shared settings with per-layer overrides
 """
+
+import torch
 
 from megatron.core.models.hl import (
     HLModel,
     HLModelConfig,
+    CommonConfig,
     EmbeddingLayer,
     AttentionLayer,
     MambaLayer,
@@ -22,59 +26,57 @@ from megatron.core.models.hl import (
 )
 
 # =============================================================================
-# LAYER DEFINITIONS
+# COMMON CONFIGURATION
 # =============================================================================
 
-Embed = EmbeddingLayer(
-    vocab_size=131072,
+# Shared settings inherited by all layers (can be overridden per-layer)
+common_config = CommonConfig(
+    dtype=torch.bfloat16,
     hidden_size=2688,
-    max_sequence_length=8192,
-    position_embedding_type="none",
     parallelism=ParallelismConfig(
         tensor_parallel_size=8,
         sequence_parallel=True,
     ),
 )
 
+# =============================================================================
+# LAYER DEFINITIONS
+# =============================================================================
+
+# Layers inherit dtype, hidden_size, and parallelism from common_config
+
+Embed = EmbeddingLayer(
+    vocab_size=131072,
+    max_sequence_length=8192,
+    position_embedding_type="none",
+)
+
 M1 = MambaLayer(
-    hidden_size=2688,
     num_heads=64,
     head_dim=64,
     state_size=128,
     conv_kernel_size=4,
-    parallelism=ParallelismConfig(
-        tensor_parallel_size=8,
-        sequence_parallel=True,
-    ),
+    # Inherits dtype=bf16, hidden_size, parallelism from common_config
 )
 
 A1 = AttentionLayer(
-    hidden_size=2688,
     num_attention_heads=32,
     num_query_groups=2,
     kv_channels=128,
     use_flash_attention=True,
-    parallelism=ParallelismConfig(
-        tensor_parallel_size=8,
-        sequence_parallel=True,
-    ),
+    dtype=torch.float8_e4m3fn,  # Override: use FP8 for faster attention
 )
 
 A2 = AttentionLayer(
-    hidden_size=2688,
     num_attention_heads=32,
     num_query_groups=2,
     kv_channels=128,
     use_flash_attention=True,
     sliding_window_size=4096,
-    parallelism=ParallelismConfig(
-        tensor_parallel_size=8,
-        sequence_parallel=True,
-    ),
+    # Inherits bf16 from common_config
 )
 
 E1 = MoELayer(
-    hidden_size=2688,
     ffn_hidden_size=1856,
     num_experts=128,
     top_k=6,
@@ -88,16 +90,15 @@ E1 = MoELayer(
     activation="squared_relu",
     token_dispatcher_type="allgather",
     grouped_gemm=True,
+    dtype=torch.float8_e4m3fn,  # Override: FP8 for expert computation
+    # Extends common_config.parallelism with expert-specific settings
     parallelism=ParallelismConfig(
-        tensor_parallel_size=8,
-        sequence_parallel=True,
         expert_parallel_size=16,
         expert_tensor_parallel_size=8,
     ),
 )
 
 E2 = MoELayer(
-    hidden_size=2688,
     ffn_hidden_size=3712,
     num_experts=32,
     top_k=2,
@@ -108,9 +109,8 @@ E2 = MoELayer(
     activation="swiglu",
     token_dispatcher_type="alltoall",
     grouped_gemm=True,
+    # Extends common_config.parallelism with expert-specific settings
     parallelism=ParallelismConfig(
-        tensor_parallel_size=8,
-        sequence_parallel=True,
         expert_parallel_size=4,
     ),
 )
@@ -136,6 +136,7 @@ layer_pattern = [P1, PS, P2, PS, P3, PS, P4]
 # =============================================================================
 
 model_config = HLModelConfig(
+    common_config=common_config,
     embedding=Embed,
     layer_pattern=layer_pattern,
 
@@ -144,7 +145,6 @@ model_config = HLModelConfig(
     normalization="RMSNorm",
     disable_bias_linear=True,
     init_method_std=0.0173,
-    dtype="bf16",
 )
 
 

@@ -10,11 +10,15 @@ This example demonstrates:
 - Simple layer pattern without pipeline stages
 - Dense MLP layers (no MoE)
 - Basic parallelism configuration (TP=8, SP enabled)
+- CommonConfig for shared settings with per-layer overrides
 """
+
+import torch
 
 from megatron.core.models.hl import (
     HLModel,
     HLModelConfig,
+    CommonConfig,
     EmbeddingLayer,
     AttentionLayer,
     MLPLayer,
@@ -22,41 +26,42 @@ from megatron.core.models.hl import (
 )
 
 # =============================================================================
-# LAYER DEFINITIONS
+# COMMON CONFIGURATION
 # =============================================================================
 
-Embed = EmbeddingLayer(
-    vocab_size=128000,
+# Shared settings inherited by all layers (can be overridden per-layer)
+common_config = CommonConfig(
+    dtype=torch.bfloat16,
     hidden_size=4096,
-    max_sequence_length=4096,
-    position_embedding_type="rope",
-    rotary_base=500000,
     parallelism=ParallelismConfig(
         tensor_parallel_size=8,
         sequence_parallel=True,
     ),
 )
 
+# =============================================================================
+# LAYER DEFINITIONS
+# =============================================================================
+
+# Layers inherit dtype, hidden_size, and parallelism from common_config
+
+Embed = EmbeddingLayer(
+    vocab_size=128000,
+    max_sequence_length=4096,
+    position_embedding_type="rope",
+    rotary_base=500000,
+)
+
 A1 = AttentionLayer(
-    hidden_size=4096,
     num_attention_heads=32,
     num_query_groups=8,
     kv_channels=128,
     use_flash_attention=True,
-    parallelism=ParallelismConfig(
-        tensor_parallel_size=8,
-        sequence_parallel=True,
-    ),
 )
 
 F1 = MLPLayer(
-    hidden_size=4096,
     ffn_hidden_size=14336,
     activation="swiglu",
-    parallelism=ParallelismConfig(
-        tensor_parallel_size=8,
-        sequence_parallel=True,
-    ),
 )
 
 # =============================================================================
@@ -72,6 +77,7 @@ layer_pattern = [A1, F1] * 32
 # =============================================================================
 
 simple_config = HLModelConfig(
+    common_config=common_config,
     embedding=Embed,
     layer_pattern=layer_pattern,
 
@@ -80,7 +86,6 @@ simple_config = HLModelConfig(
     normalization="RMSNorm",
     disable_bias_linear=True,
     init_method_std=0.02,
-    dtype="bf16",
 )
 
 
