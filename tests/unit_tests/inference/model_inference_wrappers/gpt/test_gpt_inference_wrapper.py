@@ -13,10 +13,7 @@ from megatron.core.inference.model_inference_wrappers.gpt.gpt_inference_wrapper 
 from megatron.core.inference.model_inference_wrappers.inference_wrapper_config import (
     InferenceWrapperConfig,
 )
-from megatron.core.models.gpt.gpt_layer_specs import (
-    get_gpt_layer_local_spec,
-    get_gpt_layer_with_transformer_engine_spec,
-)
+from megatron.core.models.gpt.gpt_layer_specs import get_gpt_layer_local_spec
 from megatron.core.models.gpt.gpt_model import GPTModel
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
 from megatron.core.transformer.transformer_config import TransformerConfig
