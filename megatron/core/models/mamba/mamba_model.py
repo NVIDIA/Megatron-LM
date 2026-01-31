@@ -17,8 +17,8 @@ from megatron.core.tensor_parallel import gather_from_sequence_parallel_region
 from megatron.core.transformer import TransformerConfig
 from megatron.core.transformer.enums import ModelType
 from megatron.core.transformer.multi_token_prediction import (
-    mtp_on_this_rank,
     MultiTokenPredictionBlock,
+    mtp_on_this_rank,
     process_mtp_loss,
 )
 from megatron.core.transformer.spec_utils import ModuleSpec, build_module
@@ -118,7 +118,9 @@ class MambaModel(LanguageModule):
 
         # Determine if MTP is needed (based on pattern parsing)
         self.mtp_process = (
-            self.mtp_pattern is not None and self.mtp_num_depths > 0 and mtp_on_this_rank(self.config, vp_stage=self.vp_stage)
+            self.mtp_pattern is not None
+            and self.mtp_num_depths > 0
+            and mtp_on_this_rank(self.config, vp_stage=self.vp_stage)
         )
 
         # megatron core pipelining currently depends on model type

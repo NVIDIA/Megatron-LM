@@ -113,7 +113,8 @@ class MambaStack(MegatronModule):
             num_layers_for_allocation = len(self.hybrid_override_pattern)
         else:
             num_layers_for_allocation = (
-                self.config.num_layers if self.config.num_layers is not None
+                self.config.num_layers
+                if self.config.num_layers is not None
                 else len(self.hybrid_override_pattern)
             )
 

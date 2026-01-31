@@ -160,10 +160,7 @@ class TestParseHybridPattern:
 
     def test_invalid_symbols_in_mtp_pattern(self):
         """Test that invalid symbols in MTP pattern raise ValueError."""
-        invalid_patterns = [
-            "M*M*/MX",  # X is not valid
-            "M*M*/MM/Ma",  # a is not valid
-        ]
+        invalid_patterns = ["M*M*/MX", "M*M*/MM/Ma"]  # X is not valid  # a is not valid
         for pattern in invalid_patterns:
             with pytest.raises(ValueError, match="not a valid layer symbol"):
                 parse_hybrid_pattern(pattern)

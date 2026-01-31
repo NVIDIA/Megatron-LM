@@ -699,9 +699,8 @@ class MultiTokenPredictionLayer(MegatronModule):
         self.mtp_layer_pattern = mtp_layer_pattern
 
         # Validate attention mask type if using transformer-based inner layers
-        if (
-            self.submodules.mtp_model_layer is not None
-            and hasattr(self.submodules.mtp_model_layer, 'submodules')
+        if self.submodules.mtp_model_layer is not None and hasattr(
+            self.submodules.mtp_model_layer, 'submodules'
         ):
             if hasattr(self.submodules.mtp_model_layer.submodules, 'attention_layer'):
                 self_attention_spec = self.submodules.mtp_model_layer.submodules.attention_layer
@@ -752,7 +751,7 @@ class MultiTokenPredictionLayer(MegatronModule):
             bias=False,
             skip_bias_add=False,
             is_expert=False,
-            tp_comm_buffer_name="mtp_eh_proj"
+            tp_comm_buffer_name="mtp_eh_proj",
         )
 
         # Build inner layers: two possible paths
@@ -765,9 +764,9 @@ class MultiTokenPredictionLayer(MegatronModule):
                 config=self.config,
                 submodules=mamba_submodules,
                 hybrid_override_pattern=mtp_layer_pattern,
-                pre_process=True,       # Always receives input from eh_proj
+                pre_process=True,  # Always receives input from eh_proj
                 post_layer_norm=False,  # MTP has its own final_layernorm
-                post_process=True,      # MTP layer is self-contained
+                post_process=True,  # MTP layer is self-contained
                 pg_collection=pg_collection,
                 is_mtp_layer=True,
             )
@@ -781,7 +780,7 @@ class MultiTokenPredictionLayer(MegatronModule):
                 config=self.config,
                 vp_stage=self.vp_stage,
                 layer_number=self.layer_number,
-                is_mtp_layer=True
+                is_mtp_layer=True,
             )
 
         self.final_layernorm = build_module(
@@ -1220,7 +1219,7 @@ class MultiTokenPredictionBlock(MegatronModule):
                     layer_number=layer_number,
                     vp_stage=self.vp_stage,
                     pg_collection=pg_collection,
-                    mtp_layer_pattern=self.mtp_layer_pattern
+                    mtp_layer_pattern=self.mtp_layer_pattern,
                 )
             return module
 
@@ -1245,22 +1244,27 @@ class MultiTokenPredictionBlock(MegatronModule):
                 # Shared/repeated layer: build one layer, use it for all depths
                 layer_spec = self.submodules.layer_specs[0]
                 shared_layer = build_layer_with_pattern(
-                    layer_spec, layer_number=1,
+                    layer_spec,
+                    layer_number=1,
                     mtp_layer_pattern=self.mtp_layer_pattern,
                     mamba_submodules=self.mamba_submodules,
                 )
                 self.layers = torch.nn.ModuleList([shared_layer])
             else:
                 # Non-shared: each depth gets its own layers
-                self.layers = torch.nn.ModuleList([
-                    build_layer_with_pattern(
-                        self.submodules.layer_specs[min(i, len(self.submodules.layer_specs) - 1)],
-                        layer_number=i + 1,
-                        mtp_layer_pattern=self.mtp_layer_pattern,
-                        mamba_submodules=self.mamba_submodules,
-                    )
-                    for i in range(num_depths)
-                ])
+                self.layers = torch.nn.ModuleList(
+                    [
+                        build_layer_with_pattern(
+                            self.submodules.layer_specs[
+                                min(i, len(self.submodules.layer_specs) - 1)
+                            ],
+                            layer_number=i + 1,
+                            mtp_layer_pattern=self.mtp_layer_pattern,
+                            mamba_submodules=self.mamba_submodules,
+                        )
+                        for i in range(num_depths)
+                    ]
+                )
         elif self.mtp_use_repeated_layer:
             # Legacy repeated layer mode
             if len(self.submodules.layer_specs) != 1:
@@ -1268,9 +1272,9 @@ class MultiTokenPredictionBlock(MegatronModule):
                     f"Repeated MTP mode expects exactly 1 layer spec, got {len(self.submodules.layer_specs)}. "
                     f"The first layer will be applied {self.config.mtp_num_layers} times."
                 )
-            self.layers = torch.nn.ModuleList([
-                build_layer_legacy(self.submodules.layer_specs[0], layer_number=1)
-            ])
+            self.layers = torch.nn.ModuleList(
+                [build_layer_legacy(self.submodules.layer_specs[0], layer_number=1)]
+            )
         else:
             # Legacy mode: build from layer_specs
             self.layers = torch.nn.ModuleList(

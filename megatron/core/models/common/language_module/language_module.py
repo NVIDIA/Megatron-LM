@@ -23,6 +23,10 @@ from megatron.core.pipeline_parallel.utils import (
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.transformer.enums import AttnBackend, CudaGraphScope
 from megatron.core.transformer.module import MegatronModule
+from megatron.core.transformer.multi_token_prediction import (
+    tie_output_layer_state_dict,
+    tie_word_embeddings_state_dict,
+)
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.transformer.utils import ensure_metadata_has_dp_cp_group
 from megatron.core.utils import (
@@ -31,10 +35,6 @@ from megatron.core.utils import (
     make_tp_sharded_tensor_for_checkpoint,
 )
 
-from megatron.core.transformer.multi_token_prediction import (
-    tie_output_layer_state_dict,
-    tie_word_embeddings_state_dict,
-)
 
 class LanguageModule(MegatronModule):
     """Base language module that has common helper functions used across GPT, BERT etc.

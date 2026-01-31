@@ -1,11 +1,11 @@
 # Copyright (c) 2023, NVIDIA CORPORATION. All rights reserved.
 
 from megatron.core.extensions.transformer_engine import (
+    TEColumnParallelLinear,
     TEDotProductAttention,
     TELayerNormColumnParallelLinear,
     TENorm,
     TERowParallelLinear,
-    TEColumnParallelLinear,
 )
 from megatron.core.fusions.fused_bias_dropout import get_bias_dropout_add
 from megatron.core.models.gpt.moe_module_specs import get_moe_module_spec
@@ -20,17 +20,17 @@ from megatron.core.tensor_parallel import (
 from megatron.core.transformer.attention import SelfAttention, SelfAttentionSubmodules
 from megatron.core.transformer.enums import AttnMaskType
 from megatron.core.transformer.mlp import MLP, MLPSubmodules
-from megatron.core.transformer.transformer_layer import (
-    MoETransformerLayer,
-    TransformerLayer,
-    TransformerLayerSubmodules,
-)
-from megatron.core.transformer.spec_utils import ModuleSpec
 from megatron.core.transformer.multi_token_prediction import (
     MultiTokenPredictionBlock,
     MultiTokenPredictionBlockSubmodules,
     MultiTokenPredictionLayer,
     MultiTokenPredictionLayerSubmodules,
+)
+from megatron.core.transformer.spec_utils import ModuleSpec
+from megatron.core.transformer.transformer_layer import (
+    MoETransformerLayer,
+    TransformerLayer,
+    TransformerLayerSubmodules,
 )
 
 # This should be private and should not be used outside of this file.

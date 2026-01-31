@@ -29,8 +29,10 @@ class Router(ABC, MegatronModule):
     """Base Router class"""
 
     def __init__(
-        self, config: TransformerConfig, pg_collection: Optional[ProcessGroupCollection] = None,
-        is_mtp_layer: bool = False
+        self,
+        config: TransformerConfig,
+        pg_collection: Optional[ProcessGroupCollection] = None,
+        is_mtp_layer: bool = False,
     ) -> None:
         """
         Initialize the Router module.
@@ -148,8 +150,10 @@ class TopKRouter(Router):
     """
 
     def __init__(
-        self, config: TransformerConfig, pg_collection: Optional[ProcessGroupCollection] = None,
-        is_mtp_layer: bool = False
+        self,
+        config: TransformerConfig,
+        pg_collection: Optional[ProcessGroupCollection] = None,
+        is_mtp_layer: bool = False,
     ) -> None:
         """Initialize the zero token dropping router.
 
@@ -445,7 +449,11 @@ class TopKRouter(Router):
         """
         # When using repeated MTP layers, the loss is counted "mtp_num_layers" times. To avoid accumulating the
         # load balancing loss multiple times, we scale it by 1/mtp_num_layers so the total loss is correct.
-        if self.is_mtp_layer and self.config.mtp_use_repeated_layer and self.config.mtp_num_layers is not None:
+        if (
+            self.is_mtp_layer
+            and self.config.mtp_use_repeated_layer
+            and self.config.mtp_num_layers is not None
+        ):
             aux_loss = aux_loss / self.config.mtp_num_layers
 
         # TODO (zijiey): fix the per_layer_logging for MTP, currently it will incorrectly
@@ -517,7 +525,11 @@ class TopKRouter(Router):
 
             # When using repeated MTP layers, the same MTP layer is called mtp_num_layers times. To avoid
             # accumulating the z_loss multiple times, we scale it by 1/mtp_num_layers so the total loss is correct.
-            if self.is_mtp_layer and self.config.mtp_use_repeated_layer and self.config.mtp_num_layers is not None:
+            if (
+                self.is_mtp_layer
+                and self.config.mtp_use_repeated_layer
+                and self.config.mtp_num_layers is not None
+            ):
                 z_loss = z_loss / self.config.mtp_num_layers
 
             num_layers = self.config.num_layers

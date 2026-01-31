@@ -150,8 +150,10 @@ class MoELayer(BaseMoELayer):
         if pg_collection is None:
             pg_collection = get_default_pg_collection()
         super(MoELayer, self).__init__(
-            config=config, layer_number=layer_number, pg_collection=pg_collection,
-            is_mtp_layer=is_mtp_layer
+            config=config,
+            layer_number=layer_number,
+            pg_collection=pg_collection,
+            is_mtp_layer=is_mtp_layer,
         )
         # If using mcore cudagraphs, recompute is handled by transformer_layer.MoETransformerLayer
         self.moe_layer_recompute = (
@@ -167,7 +169,9 @@ class MoELayer(BaseMoELayer):
         self.tp_group = pg_collection.tp
 
         # Initialize router.
-        self.router = submodules.router(config=self.config, pg_collection=pg_collection, is_mtp_layer=is_mtp_layer)
+        self.router = submodules.router(
+            config=self.config, pg_collection=pg_collection, is_mtp_layer=is_mtp_layer
+        )
         self.tp_group = pg_collection.tp
 
         # Initialize latent projections.

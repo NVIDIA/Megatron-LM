@@ -702,12 +702,7 @@ class TestMultiTokenPredictionMamba:
         destroy_num_microbatches_calculator()
         MTPLossLoggingHelper.tracker = {}
 
-    def model_provider(
-        self,
-        pre_process=True,
-        post_process=True,
-        **config_kwargs,
-    ):
+    def model_provider(self, pre_process=True, post_process=True, **config_kwargs):
         """Model provider for Mamba hybrid models with MTP.
 
         Uses the unified pattern syntax where MTP is configured via hybrid_override_pattern:
@@ -868,9 +863,7 @@ class TestMultiTokenPredictionMamba:
             args.save = ckpt_path
             args.load = ckpt_path
 
-        with TempNamedDir(
-            tmp_path_dist_ckpt / 'test_mtp_mamba_model_reconfiguration'
-        ) as ckpt_dir:
+        with TempNamedDir(tmp_path_dist_ckpt / 'test_mtp_mamba_model_reconfiguration') as ckpt_dir:
             set_ckpt_path(ckpt_dir)
             save_checkpoint(
                 iteration,
@@ -925,8 +918,7 @@ class TestMultiTokenPredictionMamba:
 
     @pytest.mark.skipif(not HAVE_TE, reason="transformer_engine not available")
     def test_attention_mask_validation_mamba(self):
-        """Test that attention mask type validation works for Mamba hybrid models.
-        """
+        """Test that attention mask type validation works for Mamba hybrid models."""
         tp = 1
         cp = 1
         args = self.create_test_args(tp, cp, self.seq_length, self.micro_batch_size)
@@ -940,8 +932,6 @@ class TestMultiTokenPredictionMamba:
             assert mamba_model[0].mtp is not None
         except AssertionError as e:
             if "Multi-Token Prediction (MTP) is not yet supported" in str(e):
-                pytest.fail(
-                    f"Attention mask validation failed for Mamba hybrid model: {e}"
-                )
+                pytest.fail(f"Attention mask validation failed for Mamba hybrid model: {e}")
             else:
                 raise

@@ -246,7 +246,9 @@ def allocate_layers(
                 logger, logging.INFO, "The override pattern matches the overridden pattern"
             )
         else:
-            maybe_log_single_rank(logger, logging.INFO, "Warning: overriding pattern A with pattern B")
+            maybe_log_single_rank(
+                logger, logging.INFO, "Warning: overriding pattern A with pattern B"
+            )
             maybe_log_single_rank(logger, logging.INFO, f"A: {''.join(layer_type_list)}")
             maybe_log_single_rank(logger, logging.INFO, f"B: {''.join(layer_type_list_override)}")
         layer_type_list = layer_type_list_override
