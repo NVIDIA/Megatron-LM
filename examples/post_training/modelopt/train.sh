@@ -37,9 +37,6 @@ fi
 if [ -z ${MLM_TRAIN_ARGS} ]; then
     MLM_TRAIN_ARGS=" \
         --no-gradient-accumulation-fusion \
-        --reset-position-ids \
-        --reset-attention-mask \
-        --eod-mask-loss \
         --micro-batch-size 1 \
         --attention-dropout 0.0 \
         --hidden-dropout 0.0 \
