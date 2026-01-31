@@ -4,19 +4,22 @@ import logging
 import math
 import warnings
 from contextlib import nullcontext
-from typing import List, Optional, Sequence, Tuple
+from typing import TYPE_CHECKING, List, Optional, Sequence, Tuple
 
-import torch  # type: ignore
-import torch.nn.functional as F  # type: ignore
-from torch import Tensor  # type: ignore
+import torch
+import torch.nn.functional as F
+from packaging.version import Version as PkgVersion
+from torch import Tensor
 
 from megatron.core import parallel_state
 from megatron.core.inference.batch_dimensions_utils import (
     CUDAGraphBatchDimensionBuilder,
     InferenceBatchDimensions,
 )
-from megatron.core.inference.config import InferenceConfig
 from megatron.core.inference.inference_request import DynamicInferenceRequest
+from megatron.core.inference.model_inference_wrappers.inference_wrapper_config import (
+    InferenceWrapperConfig,
+)
 from megatron.core.inference.sampling_params import SamplingParams
 from megatron.core.inference.unified_memory import (
     UnifiedMemoryUnsupportedError,
@@ -25,13 +28,13 @@ from megatron.core.inference.unified_memory import (
 from megatron.core.inference.utils import tensor_swap
 from megatron.core.models.common.embeddings.rope_utils import apply_rotary_pos_emb
 from megatron.core.package_info import __version__ as mcore_version
+from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.ssm.mamba_hybrid_layer_allocation import get_layer_maps_from_layer_type_list
-from megatron.core.transformer import MLATransformerConfig, TransformerConfig
-from megatron.core.utils import deprecate_args
+from megatron.core.transformer import TransformerConfig
 from megatron.core.utils import divide as core_divide
-from megatron.core.utils import get_pg_size, internal_api
+from megatron.core.utils import get_attr_wrapped_model, get_pg_size, internal_api
 
-from .attention_context.mamba_metadata import MambaMetadata
+from .attention_context.mamba_metadata import MambaInferenceStateConfig, MambaMetadata
 from .attention_context.mha_metadata import GraphedMHAMetadata, NonGraphedMHAMetadata
 from .base_context import BaseInferenceContext
 from .dynamic_block_allocator import BlockAllocator
@@ -42,7 +45,14 @@ except ImportError:
     triton_append_key_value_cache = None
 
 try:
-    import flashinfer  # type: ignore # pylint: disable=unused-import
+    from packaging.version import Version as PkgVersion
+
+    HAVE_PACKAGING = True
+except:
+    HAVE_PACKAGING = False
+
+try:
+    import flashinfer  # pylint: disable=unused-import
 
     HAVE_FLASHINFER = True
 except ImportError:
@@ -56,36 +66,16 @@ try:
 except ImportError:
     HAVE_TORCH_MEMORY_SAVER = False
 
-DEPRECATED_ARGS = [
-    "params_dtype",
-    "num_layers",
-    "kv_channels",
-    "num_attention_heads",
-    "max_sequence_length",
-    "buffer_size_gb",
-    "paused_buffer_size_gb",
-    "max_requests",
-    "max_tokens",
-    "block_size_tokens",
-    "tensor_model_parallel_size",
-    "pipeline_model_parallel_size",
-    "pg_collection",
-    "cache_mla_latent",
-    "kv_lora_rank",
-    "qk_pos_emb_head_dim",
-    "num_cuda_graphs",
-    "materialize_only_last_token_logits",
-    "mamba_inference_state_config",
-    "use_cuda_graphs_for_non_decode_steps",
-    "use_flashinfer_fused_rope",
-    "unified_memory_level",
-    "cuda_graph_max_tokens",
-    "cuda_graph_mixed_prefill_count",
-    "metrics_writer",
-    "request_metadata_types",
-    "persist_cuda_graphs",
-    "offload_kv_cache",
-]
+try:
+    import wandb  # pylint: disable=unused-import
+
+    HAVE_WANDB = True
+except ImportError:
+    HAVE_WANDB = False
+    wandb = None
+
+if TYPE_CHECKING:
+    import wandb as WandbModule
 
 
 class ContextOverflowError(Exception):
@@ -223,44 +213,129 @@ class DynamicInferenceContext(BaseInferenceContext):
     given step, any unassigned blocks equate to unused space.
 
     Args:
-        model_config (TransformerConfig): Model config.
-        inference_config (InferenceConfig): Inference config.
+        params_dtype (torch.dtype): Dtype used for KV cache.
+        num_layers (int): Number of layers on this pipeline parallel rank.
+        kv_channels (int): Hidden dimension per attention head.
+        num_attention_heads (int): Number of attention heads.
+        max_sequence_length (int): Max possible sequence length (prompt + output)
+            that will occur.
+        buffer_size_gb (float): Buffer size reserved on the GPU for the KV cache.
+            if `unified_memory_level` >= 1, then CPU memory is additionally
+            utilized, resulting in a total buffer size of `buffer_size_gb +
+            paused_buffer_size_gb`.
+        paused_buffer_size_gb (float | None): Portion of buffer reserved for
+            paused requests. Active requests are paused when there are not enough
+            active blocks available to continue generating a request. The total
+            buffer size (active + paused) depends on `unified_memory_level` (uvm):
+            - uvm 0: buffer_size_gb (paused buffer is inclusive)
+            - uvm 1: buffer_size_gb + paused_buffer_size_gb
+        max_requests (int): Max number of active requests to use for
+            decode-only forward passes. This value is primarily limited by the
+            combination of `buffer_size_gb` and `max_sequence_length`.
+        max_tokens (int): Max number of tokens to use for forward passes. This is
+            primarily limited by prefill activation memory usage. (Defaults to
+            16384).
+        block_size_tokens (int): Size of KV cache block size.
+        tensor_model_parallel_size (Optional[int]): Tensor model parallel size.
+        num_cuda_graphs (Optional[int]): Maximum number of cuda graphs to capture,
+            where the cuda graph batch sizes range from 1 to `max_requests`
+            (as computed below). Due to rounding, the actual number of cuda graphs
+            may not equal this argument.
+        materialize_only_last_token_logits (Optional[bool]): Whether to only
+            materialize logits for the last token. This should be set to False
+            if returning log probs.
+        mamba_inference_state_config (Optional[MambaInferenceStateConfig]): The Mamba
+            inference state config if the model is a hybrid model.
+        use_cuda_graphs_for_non_decode_steps (bool): If True, use cuda graphs for non-decode
+            engine steps.
+        unified_memory_level (Optional[int]): Set unified memory usage within the
+            dynamic inference context. The levels are: 0) no unified memory, 1)
+            allocate `memory_buffer` in unified memory. Eventually, additional
+            levels will be included to control other tensors within the context.
+        use_flashinfer_fused_rope (bool): If True, use flashinfer's fused rope implementation.
+            If None, defaults to using flash-infer if available.
+        metrics_writer (Optional['WandbModule']): Wandb module for writing metrics.
+        request_metadata_types (Optional[List[Tuple[str, torch.dtype, bool]]]): A list of the
+            per-request metadata types to track. Each entry is a tuple consisting of the string
+            label, the target dtype, and whether to store the data on GPU.
     """
 
     DEFAULT_MAX_TOKENS = 16384
     TOKEN_ROUNDER = 64
     REQUEST_ROUNDER = 4
 
-    @deprecate_args(
-        *DEPRECATED_ARGS,
-        message=(
-            "Argument `{name}` has been deprecated. "
-            "Only pass `model_config` and `inference_config`"
-        ),
-    )
-    def __init__(self, model_config: TransformerConfig, inference_config: InferenceConfig):
-        super().__init__(inference_config=inference_config)
+    def __init__(
+        self,
+        *,
+        params_dtype: torch.dtype,
+        num_layers: int,
+        kv_channels: int,
+        num_attention_heads: int,
+        max_sequence_length: int,
+        buffer_size_gb: float,
+        paused_buffer_size_gb: float | None = None,
+        max_requests: int = None,
+        max_tokens: int = DEFAULT_MAX_TOKENS,
+        block_size_tokens: int = 256,
+        tensor_model_parallel_size: Optional[int] = None,
+        pipeline_model_parallel_size: Optional[int] = None,
+        pg_collection: Optional[ProcessGroupCollection] = None,
+        cache_mla_latent: bool = False,
+        kv_lora_rank: Optional[int] = None,
+        qk_pos_emb_head_dim: Optional[int] = None,
+        num_cuda_graphs: Optional[int] = None,
+        materialize_only_last_token_logits: Optional[bool] = True,
+        mamba_inference_state_config: Optional[MambaInferenceStateConfig] = None,
+        use_cuda_graphs_for_non_decode_steps: bool = True,
+        use_flashinfer_fused_rope: bool = False,
+        unified_memory_level: Optional[int] = 0,
+        cuda_graph_max_tokens: Optional[int] = None,
+        cuda_graph_mixed_prefill_count: Optional[int] = 16,
+        metrics_writer: Optional['WandbModule'] = None,
+        request_metadata_types: Optional[List[Tuple[str, torch.dtype, bool]]] = None,
+        persist_cuda_graphs: Optional[bool] = False,
+        offload_kv_cache: Optional[bool] = False,
+    ):
+        super().__init__(materialize_only_last_token_logits=materialize_only_last_token_logits)
 
-        self.cache_mla_latent = (
-            isinstance(model_config, MLATransformerConfig) and model_config.cache_mla_latents
-        )
+        self.cache_mla_latent = cache_mla_latent
         if self.cache_mla_latent:
             assert (
-                inference_config.block_size_tokens == 64
+                block_size_tokens == 64
             ), "Flash MLA requires a block size of 64. Set --inference-dynamic-batching-block-size 64 to fix this assert"
 
+        # give deprecated args warning for cuda_graph_max_tokens
+        if cuda_graph_max_tokens is not None:
+            warnings.warn(
+                "`cuda_graph_max_tokens` is deprecated and will be removed in a future release. "
+                "The context now automatically sets the max tokens for cuda graphs based on "
+                "`max_requests`.",
+                DeprecationWarning,
+            )
+
+        self.metrics_writer = metrics_writer
+
         # Per partition num heads and hidden size.
-        num_attention_heads = model_config.num_query_groups or model_config.num_attention_heads
-        projection_size = model_config.kv_channels * num_attention_heads
-        pg_collection = inference_config.pg_collection
-        if pg_collection is not None:
-            tp_size = get_pg_size(pg_collection.tp)
-            pp_size = get_pg_size(pg_collection.pp)
+        projection_size = kv_channels * num_attention_heads
+        if tensor_model_parallel_size is None:
+            tp_size = (
+                get_pg_size(pg_collection.tp)
+                if pg_collection is not None
+                else parallel_state.get_tensor_model_parallel_world_size()
+            )
         else:
-            tp_size = model_config.tensor_model_parallel_size
-            pp_size = model_config.pipeline_model_parallel_size
+            tp_size = tensor_model_parallel_size
         self.hidden_size_per_attention_head = core_divide(projection_size, num_attention_heads)
         self.num_attention_heads_per_partition = core_divide(num_attention_heads, tp_size)
+
+        if pipeline_model_parallel_size is None:
+            pp_size = (
+                get_pg_size(pg_collection.pp)
+                if pg_collection is not None
+                else parallel_state.get_pipeline_model_parallel_world_size()
+            )
+        else:
+            pp_size = pipeline_model_parallel_size
 
         # Cache the PP group we should use for PP collectives inside the context.
         # If the model provides a pg_collection with a pp group, prefer it.
@@ -282,7 +357,6 @@ class DynamicInferenceContext(BaseInferenceContext):
             self.expert_model_parallel_group = None
 
         # Mamba states.
-        mamba_inference_state_config = inference_config.mamba_inference_state_config
         self.is_hybrid_model = mamba_inference_state_config is not None
         if self.is_hybrid_model:
             mamba_conv_states_shape = mamba_inference_state_config.mamba_conv_states_shape
@@ -307,7 +381,7 @@ class DynamicInferenceContext(BaseInferenceContext):
             self.layer_map = attention_layer_map | mamba_layer_map
         else:
             # The layer map is the identity function for pure Transformer models.
-            self.num_attention_layers = model_config.num_layers // pp_size
+            self.num_attention_layers = num_layers
             self.num_mamba_layers = 0
             (self.mamba_conv_states_shape, self.mamba_ssm_states_shape) = (None, None)
             self.layer_map = {i: i for i in range(self.num_attention_layers)}
@@ -318,11 +392,11 @@ class DynamicInferenceContext(BaseInferenceContext):
             )
 
         # Block size tokens, bytes.
-        dtype_size_bytes = model_config.params_dtype.itemsize
-        self.block_size_tokens = inference_config.block_size_tokens
+        dtype_size_bytes = params_dtype.itemsize
+        self.block_size_tokens = block_size_tokens
         if self.cache_mla_latent:
             #   one vector  c_t  (rank)  +  optional RoPE phase slice
-            self.kv_reduced_dim = model_config.kv_lora_rank + model_config.qk_pos_emb_head_dim
+            self.kv_reduced_dim = kv_lora_rank + qk_pos_emb_head_dim
             self.block_size_bytes = (
                 dtype_size_bytes
                 * self.num_attention_layers
@@ -348,9 +422,9 @@ class DynamicInferenceContext(BaseInferenceContext):
             mamba_states_memory_per_request *= dtype_size_bytes
 
         # Unified memory.
-        self.unified_memory_level = inference_config.unified_memory_level
-        self.persist_cuda_graphs = inference_config.persist_cuda_graphs
-        if self.unified_memory_level > 0:
+        self.unified_memory_level = unified_memory_level
+        self.persist_cuda_graphs = persist_cuda_graphs
+        if unified_memory_level > 0:
             try:
                 self.unified_memory_mempool = create_unified_mempool()
             except UnifiedMemoryUnsupportedError:
@@ -361,11 +435,9 @@ class DynamicInferenceContext(BaseInferenceContext):
                 self.unified_memory_level = 0
 
         # Initialize block allocator.
-        buffer_size_bytes = int(inference_config.buffer_size_gb * 1024**3)
+        buffer_size_bytes = int(buffer_size_gb * 1024**3)
         paused_buffer_size_bytes = (
-            0
-            if inference_config.paused_buffer_size_gb is None
-            else int(inference_config.paused_buffer_size_gb * 1024**3)
+            0 if paused_buffer_size_gb is None else int(paused_buffer_size_gb * 1024**3)
         )
         # TODO: Add parameter to control fraction of memory assigned to KV cache
         # versus Mamba state.
@@ -399,14 +471,13 @@ class DynamicInferenceContext(BaseInferenceContext):
         )
 
         # Track request metadata.
-        request_metadata_types = inference_config.request_metadata_types
         if request_metadata_types is None:
             request_metadata_types = DynamicInferenceRequest.get_metadata_types()
         self.request_metadata_types = request_metadata_types
 
         # Initialize context state.
-        self.params_dtype = model_config.params_dtype
-        self.max_sequence_length = inference_config.max_sequence_length
+        self.params_dtype = params_dtype
+        self.max_sequence_length = max_sequence_length
 
         # Request and token counts.
         self.total_request_count = 0
@@ -426,16 +497,16 @@ class DynamicInferenceContext(BaseInferenceContext):
         self.max_kv_block_count = math.ceil(self.max_sequence_length / self.block_size_tokens)
 
         # Set max_requests, max_tokens.
-        if inference_config.max_requests is None:
+        if max_requests is None:
             # Maximize compute utilization by defaulting to 1 block per request.
             self.max_requests = self.block_allocator.total_count - 1  # -1 for dummy block
             self.max_requests = self.max_requests // tp_size * tp_size
             self.max_requests = self.max_requests // self.REQUEST_ROUNDER * self.REQUEST_ROUNDER
         else:
             # User can control request overflow via max_requests.
-            self.max_requests = inference_config.max_requests
+            self.max_requests = max_requests
 
-        self.max_tokens = inference_config.max_tokens or self.DEFAULT_MAX_TOKENS
+        self.max_tokens = max_tokens or self.DEFAULT_MAX_TOKENS
 
         assert self.max_tokens >= self.max_requests, (
             f"max_tokens ({self.max_tokens}) must be >= "
@@ -467,39 +538,37 @@ class DynamicInferenceContext(BaseInferenceContext):
         )
 
         # CUDA graph config list
-        self.use_cuda_graphs_for_non_decode_steps = (
-            inference_config.use_cuda_graphs_for_non_decode_steps
-        )
         self.cuda_graph_batch_dimensions_list, self.cuda_graph_token_counts = (
             CUDAGraphBatchDimensionBuilder.generate_cuda_graph_batch_dimensions_list(
                 tp_size=tp_size,
-                num_cuda_graphs=inference_config.num_cuda_graphs,
+                num_cuda_graphs=num_cuda_graphs,
                 cuda_graph_max_tokens=self.max_requests,
-                cuda_graph_mixed_prefill_count=inference_config.cuda_graph_mixed_prefill_count,
+                cuda_graph_mixed_prefill_count=cuda_graph_mixed_prefill_count,
                 max_requests=self.max_requests,
                 max_tokens=self.max_tokens,
                 max_sequence_length=self.max_sequence_length,
-                use_cuda_graphs_for_non_decode_steps=self.use_cuda_graphs_for_non_decode_steps,
+                use_cuda_graphs_for_non_decode_steps=use_cuda_graphs_for_non_decode_steps,
             )
         )
 
         # Whether to offload the KV cache. Determines where the KV cache is allocated within memory.
-        self.offload_kv_cache = inference_config.offload_kv_cache
+        self.offload_kv_cache = offload_kv_cache
         assert not (
             self.offload_kv_cache and self.unified_memory_level
         ), "The KV cache should not be instantiated in unified memory when it is offloaded during training."
 
         self._using_cuda_graph_this_step = False
+        self.use_cuda_graphs_for_non_decode_steps = use_cuda_graphs_for_non_decode_steps
         # Deal with chunked prefill
         self.chunked_prefill_request_id = -1
         self.has_explicit_chunked_prefill_req = False
 
         # FlashInfer.
-        if inference_config.use_flashinfer_fused_rope is True:
+        if use_flashinfer_fused_rope is True:
             assert HAVE_FLASHINFER, "flashinfer is not installed"
-        elif inference_config.use_flashinfer_fused_rope is None:
-            inference_config.use_flashinfer_fused_rope = HAVE_FLASHINFER
-        self.use_flashinfer_fused_rope = inference_config.use_flashinfer_fused_rope
+        elif use_flashinfer_fused_rope is None:
+            use_flashinfer_fused_rope = HAVE_FLASHINFER
+        self.use_flashinfer_fused_rope = use_flashinfer_fused_rope
 
         # Allocate GPU state.
         self.is_tensor_state_allocated = False
@@ -687,7 +756,14 @@ class DynamicInferenceContext(BaseInferenceContext):
 
     @classmethod
     def round_up_tokens(cls, value, tp_size=None):
-        """Round up to nearest multiple of `TOKEN_ROUNDER` that is also divisible by tensor model parallel size."""
+        """Round up to nearest multiple of `TOKEN_ROUNDER` (above) that is also divisible by tensor model parallel size."""
+        if not HAVE_PACKAGING:
+            raise ImportError(
+                "`packaging` is required for this functionality, please install it with `pip install packaging`"
+            )
+        if PkgVersion(mcore_version) < PkgVersion("0.13"):
+            return cls.round_up(value)
+
         # Make sure divisible by TP size
         if tp_size is None:
             # Check if parallel state is initialized before trying to get TP size
@@ -700,8 +776,71 @@ class DynamicInferenceContext(BaseInferenceContext):
         return token_rounder * int(math.ceil(int(value) / token_rounder))
 
     @classmethod
+    def from_config(
+        cls,
+        inference_config: InferenceWrapperConfig,
+        model,
+        max_batch_size: int,
+        buffer_size_gb: float = 40,
+        num_cuda_graphs: int = None,
+        mamba_inference_state_config: Optional[MambaInferenceStateConfig] = None,
+        unified_memory_level: int = 0,
+    ):
+        """
+        Instantiate a `DynamicInferenceContext` from a `TransformerConfig` and an `InferenceWrapperConfig`.
+        """
+        # TODO: Add other necessary configs from inference_config
+
+        # Max sequence length.
+        position_embedding_type = get_attr_wrapped_model(model, "position_embedding_type")
+        model_max_seq_len = get_attr_wrapped_model(model, "max_sequence_length")
+        inf_max_seq_len = inference_config.inference_max_seq_length
+
+        if position_embedding_type == "learned_absolute":
+            # When using absolute position embeddings, it is critical that the
+            # context's `max_sequence_length` is less than or equal to the model's
+            # `max_sequence_length`. Otherwise, the context's `position_ids` will
+            # contain ids greater than the dimension of the position embedding
+            # tensor, which will result in an index error.
+            if inf_max_seq_len:
+                max_sequence_length = min(model_max_seq_len, inf_max_seq_len)
+            else:
+                max_sequence_length = model_max_seq_len
+            assert max_batch_size <= model_max_seq_len
+        else:
+            max_sequence_length = (
+                inference_config.inference_max_seq_length or model_config.max_sequence_length
+            )
+        max_sequence_length = max(max_sequence_length, max_batch_size)
+
+        # Context.
+        model_config = model.config
+        return cls(
+            params_dtype=inference_config.params_dtype,
+            num_layers=model_config.num_layers // model_config.pipeline_model_parallel_size,
+            kv_channels=model_config.kv_channels,
+            num_attention_heads=model_config.num_query_groups,
+            tensor_model_parallel_size=model_config.tensor_model_parallel_size,
+            pipeline_model_parallel_size=model_config.pipeline_model_parallel_size,
+            max_sequence_length=max_sequence_length,
+            buffer_size_gb=buffer_size_gb,
+            materialize_only_last_token_logits=False,
+            num_cuda_graphs=num_cuda_graphs,
+            use_flashinfer_fused_rope=None,
+            mamba_inference_state_config=mamba_inference_state_config,
+            unified_memory_level=unified_memory_level,
+        )
+
+    @classmethod
     def round_up_requests(cls, value, tp_size=None):
-        """Round up to nearest multiple of `REQUEST_ROUNDER` that is also divisible by tensor model parallel size."""
+        """Round up to nearest multiple of `REQUEST_ROUNDER` (above) that is also divisible by tensor model parallel size."""
+        if not HAVE_PACKAGING:
+            raise ImportError(
+                "`packaging` is required for this functionality, please install it with `pip install packaging`"
+            )
+        if PkgVersion(mcore_version) < PkgVersion("0.13"):
+            return cls.round_up(value)
+
         # Make sure divisible by TP size
         if tp_size is None:
             # Check if parallel state is initialized before trying to get TP size
@@ -712,6 +851,16 @@ class DynamicInferenceContext(BaseInferenceContext):
         request_rounder = math.ceil(cls.REQUEST_ROUNDER / tp_size) * tp_size
 
         return request_rounder * int(math.ceil(int(value) / request_rounder))
+
+    @classmethod
+    def round_up(cls, value):
+        """Deprecated in favor of round_up_tokens and round_up_requests."""
+        warnings.warn(
+            "`round_up` is deprecated in favor of `round_up_tokens` or `round_up_requests` "
+            "and will be removed in `megatron-core` 0.14."
+        )
+        ROUNDER = getattr(cls, "ROUNDER", 64)
+        return ROUNDER * int(math.ceil(int(value) / ROUNDER))
 
     def is_static_batching(self) -> bool:
         """Is static batching? False."""
@@ -733,7 +882,6 @@ class DynamicInferenceContext(BaseInferenceContext):
 
     def cu_query_lengths(self) -> Tuple[Tensor, int]:
         """Cumulative query sequence lengths."""
-        assert self.active_attn_metadata is not None
         return (
             self.active_attn_metadata["mha_metadata"].state_data["cu_query_seq_lengths"],
             self.active_attn_metadata["mha_metadata"].state_data["max_seqlen_q"],
@@ -741,7 +889,6 @@ class DynamicInferenceContext(BaseInferenceContext):
 
     def cu_kv_lengths(self) -> Tuple[Tensor, Tensor, int]:
         """Cumulative key/value sequence lengths."""
-        assert self.active_attn_metadata is not None
         return (
             self.active_attn_metadata["mha_metadata"].state_data["cu_kv_seq_lengths"],
             self.active_attn_metadata["mha_metadata"].state_data["kv_seq_lengths"],
@@ -811,19 +958,17 @@ class DynamicInferenceContext(BaseInferenceContext):
                 : self.padded_active_token_count
             ]
 
-    def key_value_cache(self, layer_number: int) -> Tuple[Tensor, Optional[Tensor], Tensor]:
+    def key_value_cache(self, layer_number: int) -> Tuple[Tensor, Tensor]:
         """Read from KV cache.
 
         Args:
             layer_number (int): Layer number.
 
         Return:
-            (Tuple[Tensor, Tensor, Tensor]) The key and value pointer tensors that point
-            to blocks within the block-level memory buffer as well as the block table.
+            (Tuple[Tensor, Tensor]) The key and value pointer tensors that point
+            to blocks within the block-level memory buffer.
         """
         attention_layer_number = self.layer_map[layer_number - 1]
-
-        assert self.active_attn_metadata is not None
 
         if self.cache_mla_latent:
             return (
@@ -1241,9 +1386,9 @@ class DynamicInferenceContext(BaseInferenceContext):
         ] = 0
 
         self.active_attn_metadata = (
-            self.graph_attn_metadata  # type: ignore[assignment]
+            self.graph_attn_metadata
             if self.using_cuda_graph_this_step()
-            else self.non_graph_attn_metadata  # type: ignore[assignment]
+            else self.non_graph_attn_metadata
         )
 
         # Update cu_query_seq_lengths, max_seqlen_q.
@@ -1268,7 +1413,6 @@ class DynamicInferenceContext(BaseInferenceContext):
                     has_explicit_chunked_prefill_req=False,
                 )
 
-        assert self.active_attn_metadata is not None
         self.active_attn_metadata["mha_metadata"].update(
             request_query_lengths=query_lengths_view,
             request_kv_length_offsets=request_kv_length_offsets_view,
@@ -1401,7 +1545,7 @@ class DynamicInferenceContext(BaseInferenceContext):
 
         return last_token_logits
 
-    def check_availability(self, req: DynamicInferenceRequest) -> Tuple[bool, bool, bool]:
+    def check_availability(self, req: DynamicInferenceRequest) -> (bool, bool, bool):
         """
         Check if the request can be added to the context.
         """
@@ -1640,7 +1784,7 @@ class DynamicInferenceContext(BaseInferenceContext):
         active_request_count: int,
         newly_paused_request_ids: torch.Tensor,
         next_tokens: torch.Tensor,
-    ) -> tuple[int, torch.Tensor]:
+    ) -> tuple[int, int, torch.Tensor]:
         """Resume as many paused requests as we have space for in the active buffer.
 
         Args:
@@ -1719,7 +1863,7 @@ class DynamicInferenceContext(BaseInferenceContext):
 
     def evict_overflow_paused_requests(
         self, active_request_count: int, next_tokens: torch.Tensor
-    ) -> Optional[tuple[torch.Tensor, torch.Tensor]]:
+    ) -> tuple[torch.Tensor, torch.Tensor]:
         """Evict requests that overflow the paused buffer.
 
         Args:

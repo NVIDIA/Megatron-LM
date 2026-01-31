@@ -1,5 +1,3 @@
-# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
-
 import copy
 import os
 import random
@@ -15,6 +13,9 @@ import torch
 
 from megatron.core.inference.contexts import StaticInferenceContext
 from megatron.core.inference.inference_request import InferenceRequest, Status, VLMInferenceRequest
+from megatron.core.inference.model_inference_wrappers.inference_wrapper_config import (
+    InferenceWrapperConfig,
+)
 from megatron.core.inference.model_inference_wrappers.multimodal.vlm_inference_wrapper import (
     VLMInferenceWrapper,
 )
@@ -91,9 +92,19 @@ class TestVLMTextGenerationController:
         self.image_token_index = self.model.image_token_index
         self.model = Float16Module(self.model.config, self.model)
 
-        inference_context = StaticInferenceContext(max_batch_size=8, max_sequence_length=2560)
+        inference_wrapper_config = InferenceWrapperConfig(
+            hidden_size=self.language_hidden_size,
+            inference_batch_times_seqlen_threshold=-1,
+            fp32_residual_connection=False,
+            params_dtype=torch.float,
+            padded_vocab_size=self.language_vocab_size,
+        )
 
-        inference_wrapped_model = VLMInferenceWrapper(self.model, inference_context)
+        inference_context = StaticInferenceContext.from_config(inference_wrapper_config)
+
+        inference_wrapped_model = VLMInferenceWrapper(
+            self.model, inference_wrapper_config, inference_context
+        )
 
         self.mock_tokenizer = mock.Mock()
 

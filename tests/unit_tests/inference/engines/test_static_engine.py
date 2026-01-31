@@ -20,6 +20,9 @@ from megatron.core.inference.inference_request import (
 from megatron.core.inference.model_inference_wrappers.gpt.gpt_inference_wrapper import (
     GPTInferenceWrapper,
 )
+from megatron.core.inference.model_inference_wrappers.inference_wrapper_config import (
+    InferenceWrapperConfig,
+)
 from megatron.core.inference.sampling_params import SamplingParams
 from megatron.core.inference.text_generation_controllers.text_generation_controller import (
     TextGenerationController,
@@ -82,11 +85,20 @@ class StaticInferenceEngineTestHarness:
         ).cuda()
         gpt_model.to(inference_config_params_dtype)
 
-        inference_context = StaticInferenceContext(
-            max_batch_size=self.batch_size, max_sequence_length=self.sequence_length
+        inference_wrapper_config = InferenceWrapperConfig(
+            hidden_size=self.hidden_size,
+            inference_batch_times_seqlen_threshold=400,
+            inference_max_requests=self.batch_size,
+            fp32_residual_connection=False,
+            params_dtype=inference_config_params_dtype,
+            padded_vocab_size=self.vocab_size,
         )
 
-        inference_wrapped_model = GPTInferenceWrapper(gpt_model, inference_context)
+        inference_context = StaticInferenceContext.from_config(inference_wrapper_config)
+
+        inference_wrapped_model = GPTInferenceWrapper(
+            gpt_model, inference_wrapper_config, inference_context
+        )
         self.mock_tokenizer = mock.Mock()
         # Set required tokenizer attributes before engine creation
         self.mock_tokenizer.vocab_size = self.vocab_size
@@ -188,6 +200,8 @@ class TestStaticInferenceEngine(StaticInferenceEngineTestHarness):
 
             assert len(results) == batch_size
             for result in results:
+                if isinstance(result, DynamicInferenceRequestRecord):
+                    result = result.merge()
                 assert isinstance(result, InferenceRequest), (
                     "expected <InferenceRequest>; found <%s>." % type(result).__name__
                 )

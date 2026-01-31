@@ -1,5 +1,3 @@
-# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
-
 import random
 import string
 import time
@@ -14,6 +12,9 @@ import torch
 
 from megatron.core.inference.contexts import StaticInferenceContext
 from megatron.core.inference.inference_request import InferenceRequest, Status
+from megatron.core.inference.model_inference_wrappers.inference_wrapper_config import (
+    InferenceWrapperConfig,
+)
 from megatron.core.inference.model_inference_wrappers.t5.t5_inference_wrapper import (
     T5InferenceWrapper,
 )
@@ -84,9 +85,19 @@ class TestEncoderDecoderTextGenerationController:
             add_decoder=True,
         ).cuda()
 
-        inference_context = StaticInferenceContext(max_batch_size=8, max_sequence_length=2560)
+        inference_wrapper_config = InferenceWrapperConfig(
+            hidden_size=hidden_size,
+            inference_batch_times_seqlen_threshold=-1,
+            fp32_residual_connection=False,
+            params_dtype=torch.float,
+            padded_vocab_size=self.vocab_size,
+        )
 
-        inference_wrapped_model = T5InferenceWrapper(t5_model, inference_context)
+        inference_context = StaticInferenceContext.from_config(inference_wrapper_config)
+
+        inference_wrapped_model = T5InferenceWrapper(
+            t5_model, inference_wrapper_config, inference_context
+        )
 
         self.mock_tokenizer = mock.Mock()
 

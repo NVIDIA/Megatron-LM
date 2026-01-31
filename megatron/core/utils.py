@@ -496,6 +496,17 @@ def divide(numerator, denominator):
     return numerator // denominator
 
 
+def deprecate_inference_params(inference_context, inference_params):
+    """Print warning for deprecated `inference_params`."""
+    if inference_context is None and inference_params is not None:
+        warnings.warn(
+            "`inference_params` renamed to `inference_context`, and will be "
+            "removed in `megatron-core` 0.13."
+        )
+        return inference_params
+    return inference_context
+
+
 def get_tensor_model_parallel_group_if_none(tp_group, is_expert=False, check_initialized=True):
     """Issue a deprecation warning if tp_group is None and return the default tp group."""
     # TODO(zijiey): remove this function later.
@@ -2394,6 +2405,25 @@ def trace_async_exceptions(func: Optional[Callable] = None, *, verbose: bool = F
     return _decorate if func is None else _decorate(func)
 
 
+def get_mamba_inference_state_config_from_model(model) -> Optional["MambaInferenceStateConfig"]:
+    """Returns Mamba inference state config from the model if it is a hybrid model."""
+    from megatron.core.inference.contexts.attention_context.mamba_metadata import (
+        MambaInferenceStateConfig,
+    )
+    from megatron.core.ssm.mamba_hybrid_layer_allocation import Symbols
+
+    decoder = get_attr_wrapped_model(model, "decoder")
+    layer_type_list = getattr(decoder, "layer_type_list", None)
+    if layer_type_list is not None and Symbols.MAMBA in layer_type_list:
+        (mamba_conv_states_shape, mamba_ssm_states_shape) = decoder.mamba_state_shapes_per_request()
+        return MambaInferenceStateConfig(
+            layer_type_list=layer_type_list,
+            mamba_conv_states_shape=mamba_conv_states_shape,
+            mamba_ssm_states_shape=mamba_ssm_states_shape,
+        )
+    return None
+
+
 # ============================================================================
 # Backward Compatibility Decorators
 # ============================================================================
@@ -2528,43 +2558,3 @@ def experimental_api(func: Callable) -> Callable:
     """
     func._experimental_api = True
     return func
-
-
-def deprecate_args(
-    *deprecated_keys, message="Argument '{name}' has been deprecated and should not be used."
-):
-    """
-    Intercepts specific keyword arguments to raise a custom TypeError.
-
-    Args:
-        *deprecated_keys: Strings representing the argument names to block.
-        message: Custom error message string. Use {name} as a placeholder.
-    """
-
-    def decorator(func):
-        @functools.wraps(func)
-        def wrapper(*args, **kwargs):
-            # Check if any deprecated key is present in kwargs
-            found_deprecated = set(deprecated_keys) & set(kwargs.keys())
-
-            if found_deprecated:
-                bad_key = list(found_deprecated)[0]
-                raise TypeError(message.format(name=bad_key))
-
-            # Send args to the real function
-            return func(*args, **kwargs)
-
-        return wrapper
-
-    return decorator
-
-
-def deprecate_inference_params(inference_context, inference_params):
-    """Print warning for deprecated `inference_params`."""
-    if inference_context is None and inference_params is not None:
-        warnings.warn(
-            "`inference_params` renamed to `inference_context`, and will be "
-            "removed in `megatron-core` 0.13."
-        )
-        return inference_params
-    return inference_context
