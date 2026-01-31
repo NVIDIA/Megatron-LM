@@ -1,3 +1,5 @@
+# Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+
 import os
 import sys
 from pathlib import Path
@@ -37,14 +39,6 @@ def experimental(request):
 def pytest_sessionfinish(session, exitstatus):
     if exitstatus == 5:
         session.exitstatus = 0
-
-
-@pytest.fixture(scope="session", autouse=True)
-def cleanup():
-    yield
-    if torch.distributed.is_initialized():
-        torch.distributed.barrier()
-        torch.distributed.destroy_process_group()
 
 
 @pytest.fixture(scope="function", autouse=True)
