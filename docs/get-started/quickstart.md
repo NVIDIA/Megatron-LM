@@ -1,20 +1,22 @@
 # Quick Start
 
-## Installation
+## Quick Installation
 
 ### Option 1: Install from PyPI (library only)
 
-```bash
-pip install --no-build-isolation megatron-core[mlm,dev]
-```
+1. Install Megatron Core with required dependencies:
 
-### Option 2: Install from source (includes examples)
+    ```bash
+    pip install --no-build-isolation megatron-core[mlm,dev]
+    ```
 
-```bash
-git clone https://github.com/NVIDIA/Megatron-LM.git
-cd Megatron-LM
-pip install --no-build-isolation .[mlm,dev]
-```
+2. Clone repository for examples:
+
+    ```bash
+    git clone https://github.com/NVIDIA/Megatron-LM.git
+    cd Megatron-LM
+    pip install --no-build-isolation .[mlm,dev]
+    ```
 
 That's it! You're ready to start training.
 

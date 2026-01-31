@@ -1,6 +1,6 @@
 # models package
 
-This package contains most of the popular LLMs. Currently we have support for GPT, BERT, T5 and RETRO. This is an ever growing list so keep an eye out.
+This package contains most of the popular LLMs. Currently we have support for GPT, BERT, and T5. This is an ever growing list so keep an eye out.
 
 ## Subpackages
 
