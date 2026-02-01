@@ -12,6 +12,7 @@ import torch.distributed
 from torch import Tensor
 
 from megatron.core import parallel_state, tensor_parallel
+from megatron.core.cached_prefix_utils import CachedPrefixParams
 from megatron.core.dist_checkpointing.mapping import ShardedStateDict
 from megatron.core.dist_checkpointing.utils import apply_prefix_mapping
 from megatron.core.packed_seq_params import PackedSeqParams
@@ -512,6 +513,7 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
         packed_seq_params: Optional[PackedSeqParams] = None,
         sequence_len_offset: Optional[Tensor] = None,
         padding_mask: Optional[Tensor] = None,
+        cached_prefix_params: Optional[CachedPrefixParams] = None,
         *,
         inference_params: Optional[Any] = None,
     ):
@@ -535,7 +537,7 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
             packed_seq_params (object, optional): Parameters for packed sequence processing.
             sequence_len_offset (Tensor, optional): Offset along sequence dimension
                 during inference.
-
+            cached_prefix_params (object, optional): Parameters for prefix caching.
         Returns:
             Tuple[Tensor, Tensor]: A tuple containing:
                 hidden_states (Tensor): Transformed hidden states before the MLP layernorm.
@@ -583,6 +585,7 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
             rotary_pos_cos_sin=rotary_pos_cos_sin,
             attention_bias=attention_bias,
             packed_seq_params=packed_seq_params,
+            cached_prefix_params=cached_prefix_params,
             sequence_len_offset=sequence_len_offset,
         )
         nvtx_range_pop(suffix="self_attention")
@@ -992,12 +995,14 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
             args = (hidden_states,)
             kwargs = {}
 
-        assert (kwargs.get('inference_context') is None) and (
-            kwargs.get('packed_seq_params') is None
+        assert (
+            (kwargs.get('inference_context') is None)
+            and (kwargs.get('packed_seq_params') is None)
+            and (kwargs.get('cached_prefix_params') is None)
         ), (
             "CUDA graph accepts only Tensor inputs. "
-            "inference_context and packed_seq_params are excluded from input list. "
-            "For inference cuda graph, please use cuda_graph_impl=local instead."
+            "inference_context, packed_seq_params and cached_prefix_params are excluded from "
+            "input list. For inference cuda graph, please use cuda_graph_impl=local instead."
         )
 
         cuda_graph_output = list(super()._te_cuda_graph_replay(*args, **kwargs))

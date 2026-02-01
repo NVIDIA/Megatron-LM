@@ -4,6 +4,7 @@ from __future__ import annotations
 import copy
 import inspect
 from abc import ABC, abstractmethod
+from collections import defaultdict
 from dataclasses import dataclass
 from typing import Callable, Optional, Protocol, Tuple, Union
 
@@ -11,6 +12,7 @@ import torch
 from torch import Tensor
 
 from megatron.core import tensor_parallel
+from megatron.core.cached_prefix_utils import CachedPrefixParams
 from megatron.core.inference.contexts import BaseInferenceContext
 from megatron.core.jit import jit_fuser
 from megatron.core.models.common.embeddings.rope_utils import (
@@ -31,6 +33,7 @@ from megatron.core.pipeline_parallel.fine_grained_activation_offload import (
 )
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.tensor_parallel.mappings import all_gather_last_dim_from_tensor_parallel_region
+from megatron.core.transformer.attention_cached_prefix import ChunkedKVCacheForAttention
 from megatron.core.transformer.identity_op import IdentityOp
 from megatron.core.transformer.module import MegatronModule
 from megatron.core.transformer.spec_utils import ModuleSpec, build_module
@@ -886,6 +889,7 @@ class Attention(MegatronModule, ABC):
         attention_bias: Optional[Tensor] = None,
         packed_seq_params: Optional[PackedSeqParams] = None,
         sequence_len_offset: Optional[int] = None,
+        cached_prefix_params: Optional[CachedPrefixParams] = None,
         *,
         inference_params: Optional[BaseInferenceContext] = None,
     ) -> tuple[Tensor, Tensor]:
@@ -908,6 +912,8 @@ class Attention(MegatronModule, ABC):
             packed_seq_params (Optional[PackedSeqparams]): Parameters used for THD format.
             sequence_len_offset (Optional[int]): Sequence length offset used for
                 inference CUDA graphs.
+            cached_prefix_params (Optional[CachedPrefixParams]): Parameters used for
+                prefix caching.
 
         Return:
             (Tuple[Tensor, Tensor]) Attention output and bias.
@@ -960,6 +966,7 @@ class Attention(MegatronModule, ABC):
                 self.config.fused_single_qkv_rope,
                 inference_context is None,
                 packed_seq_params is None,
+                cached_prefix_params is None,
                 (
                     rotary_pos_emb is not None
                     and rotary_pos_emb[0] is not None
@@ -1136,6 +1143,10 @@ class Attention(MegatronModule, ABC):
 
         nvtx_range_push(suffix="core_attention")
         if self.checkpoint_core_attention and self.training:
+            assert False, "no checkpointing"
+            assert (
+                cached_prefix_params is None
+            ), "cached_prefix_params is not supported with core attention checkpointing."
             core_attn_out = self._checkpointed_attention_forward(
                 query,
                 key,
@@ -1148,18 +1159,39 @@ class Attention(MegatronModule, ABC):
         else:
             if inference_context is None or inference_context.is_static_batching():
                 # Static batching attention kernel.
-                with off_interface(
-                    self.offload_core_attention and self.training, query, "core_attn"
-                ) as query:
-                    core_attn_out = apply_module(self.core_attention)(
-                        query,
-                        key,
-                        value,
-                        attention_mask,
+                if cached_prefix_params is not None:
+                    assert not self.offload_core_attention, (
+                        "Core attention offloading is not supported with prefix caching, "
+                        f"but got {self.config.offload_modules=}."
+                    )
+
+                    kv_cache = cached_prefix_params.kv_cache_pool.get_kv_cache(
+                        layer_idx=self.layer_number, kv_cache_cls=ChunkedKVCacheForAttention
+                    )
+                    core_attn_out = kv_cache.forward_attention_with_kv_cache(
+                        module=apply_module(self.core_attention),
+                        cached_prefix_params=cached_prefix_params,
+                        query=query,
+                        key=key,
+                        value=value,
+                        attention_mask=attention_mask,
                         attn_mask_type=attn_mask_type,
                         attention_bias=attention_bias,
                         packed_seq_params=packed_seq_params,
                     )
+                else:
+                    with off_interface(
+                        self.offload_core_attention and self.training, query, "core_attn"
+                    ) as query:
+                        core_attn_out = apply_module(self.core_attention)(
+                            query,
+                            key,
+                            value,
+                            attention_mask,
+                            attn_mask_type=attn_mask_type,
+                            attention_bias=attention_bias,
+                            packed_seq_params=packed_seq_params,
+                        )
 
             else:
                 # Dynamic batching attention kernel.
