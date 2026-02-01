@@ -6,10 +6,12 @@ HLModel DSL Example: Complex (Imagined) Model
 Demonstrates using multiple layer configurations:
 - A1: Global attention (full sequence), FP8 override
 - A2: Sliding window attention (local context), inherits bf16
-- E1: Large MoE (128 experts, top-6), FP8 override
-- E2: Small MoE (32 experts, top-2), inherits bf16
+- E1: Large MoE (128 experts, top-6), FP8 override, custom moe_config
+- E2: Small MoE (32 experts, top-2), inherits bf16, custom moe_config
 - CommonConfig for shared settings with per-layer overrides
 """
+
+from dataclasses import replace
 
 import torch
 
@@ -21,7 +23,6 @@ from megatron.core.models.hl import (
     AttentionLayer,
     MambaLayer,
     MoELayer,
-    ParallelismConfig,
     PipelineSplit,
 )
 
@@ -31,19 +32,24 @@ from megatron.core.models.hl import (
 
 # Shared settings inherited by all layers (can be overridden per-layer)
 common_config = CommonConfig(
-    dtype=torch.bfloat16,
     hidden_size=2688,
-    parallelism=ParallelismConfig(
-        tensor_parallel_size=8,
-        sequence_parallel=True,
-    ),
+    bf16=True,
+    tensor_model_parallel_size=8,
+    sequence_parallel=True,
+)
+
+# MoE-specific configuration (copy of common_config with expert parallelism)
+moe_config = replace(
+    common_config,
+    expert_model_parallel_size=16,
+    expert_tensor_parallel_size=8,
 )
 
 # =============================================================================
 # LAYER DEFINITIONS
 # =============================================================================
 
-# Layers inherit dtype, hidden_size, and parallelism from common_config
+# Layers inherit hidden_size and parallelism settings from common_config
 
 Embed = EmbeddingLayer(
     vocab_size=131072,
@@ -51,14 +57,15 @@ Embed = EmbeddingLayer(
     position_embedding_type="none",
 )
 
+# Defaults to using common_config
 M1 = MambaLayer(
     num_heads=64,
     head_dim=64,
     state_size=128,
     conv_kernel_size=4,
-    # Inherits dtype=bf16, hidden_size, parallelism from common_config
 )
 
+# Defaults to using common_config
 A1 = AttentionLayer(
     num_attention_heads=32,
     num_query_groups=2,
@@ -67,16 +74,17 @@ A1 = AttentionLayer(
     dtype=torch.float8_e4m3fn,  # Override: use FP8 for faster attention
 )
 
+# Defaults to using common_config
 A2 = AttentionLayer(
     num_attention_heads=32,
     num_query_groups=2,
     kv_channels=128,
     use_flash_attention=True,
     sliding_window_size=4096,
-    # Inherits bf16 from common_config
 )
 
 E1 = MoELayer(
+    moe_config=moe_config,
     ffn_hidden_size=1856,
     num_experts=128,
     top_k=6,
@@ -91,14 +99,10 @@ E1 = MoELayer(
     token_dispatcher_type="allgather",
     grouped_gemm=True,
     dtype=torch.float8_e4m3fn,  # Override: FP8 for expert computation
-    # Extends common_config.parallelism with expert-specific settings
-    parallelism=ParallelismConfig(
-        expert_parallel_size=16,
-        expert_tensor_parallel_size=8,
-    ),
 )
 
 E2 = MoELayer(
+    moe_config=replace(moe_config, expert_model_parallel_size=4),
     ffn_hidden_size=3712,
     num_experts=32,
     top_k=2,
@@ -109,10 +113,6 @@ E2 = MoELayer(
     activation="swiglu",
     token_dispatcher_type="alltoall",
     grouped_gemm=True,
-    # Extends common_config.parallelism with expert-specific settings
-    parallelism=ParallelismConfig(
-        expert_parallel_size=4,
-    ),
 )
 
 # =============================================================================

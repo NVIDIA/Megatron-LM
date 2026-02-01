@@ -11,8 +11,6 @@ This example demonstrates:
 - CommonConfig for shared settings with per-layer overrides
 """
 
-import torch
-
 from megatron.core.models.hl import (
     HLModel,
     HLModelConfig,
@@ -31,19 +29,17 @@ from megatron.core.models.hl import (
 
 # Shared settings inherited by all layers (can be overridden per-layer)
 common_config = CommonConfig(
-    dtype=torch.bfloat16,
     hidden_size=2688,
-    parallelism=ParallelismConfig(
-        tensor_parallel_size=8,
-        sequence_parallel=True,
-    ),
+    bf16=True,
+    tensor_model_parallel_size=8,
+    sequence_parallel=True,
 )
 
 # =============================================================================
 # LAYER DEFINITIONS
 # =============================================================================
 
-# Layers inherit dtype, hidden_size, and parallelism from common_config
+# Layers inherit hidden_size and parallelism settings from common_config
 
 Embed = EmbeddingLayer(
     vocab_size=131072,
