@@ -345,7 +345,7 @@ jobs:
       - name: Parse unit tests
         id: parse-unit-tests
         run: |
-          cat tests/test_utils/recipes/unit-tests.yaml | yq -o json '[.products[].test_case[] | { "bucket": .}] | sort_by(.model, .test_case)' | jq -c > unit-tests.json
+          cat tests/test_utils/recipes/h100/unit-tests.yaml | yq -o json '[.products[].test_case[] | { "bucket": .}] | sort_by(.model, .test_case)' | jq -c > unit-tests.json
           echo "unit-tests=$(cat unit-tests.json)" | tee -a $GITHUB_OUTPUT
 
   cicd-unit-tests-latest:
