@@ -2161,7 +2161,7 @@ if HAVE_TE and is_te_min_version("1.13.0"):
                     "TEFusedMLP module does not support submodules with post-backward hooks"
                 )
 
-        def forward(self, hidden_states: torch.Tensor) -> Tuple[Tensor, Optional[Tensor]]:
+        def forward(self, hidden_states: torch.Tensor, **kwargs) -> Tuple[Tensor, Optional[Tensor]]:
             """Forward."""
 
             # Construct fused impl if needed

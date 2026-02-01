@@ -42,7 +42,7 @@ logging.basicConfig(level=logging.INFO, force=True)
 async def main(
     engine: DynamicInferenceEngine,
     requests: List[Request],
-    port: int,
+    port: int | None = None,
     sampling_params: SamplingParams | None = None,
 ):
     if sampling_params is not None:
@@ -55,8 +55,9 @@ async def main(
     # once you call engine.start_listening_to_data_parallel_coordinator,
     # the engine will start accepting requests from the data parallel coordinator.
     # and processing them in an asyncio coroutine.
+    # leaving inference_coordinator_port as None will find a free port automatically.
     
-    await engine.start_listening_to_data_parallel_coordinator(
+    dp_addr = await engine.start_listening_to_data_parallel_coordinator(
         inference_coordinator_port=port,
         launch_inference_coordinator=True,
     )
@@ -83,7 +84,7 @@ async def main(
 
     # Create client and run example.
     if dist.get_rank() == 0:
-        client = InferenceClient(port)  # submits requests to the inference coordinator
+        client = InferenceClient(dp_addr)  # submits requests to the inference coordinator
         await client.start()
         base_arrival_time = time.time_ns() / 10**9
         for request in requests:
