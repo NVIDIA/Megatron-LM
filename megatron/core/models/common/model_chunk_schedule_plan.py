@@ -1,4 +1,4 @@
-# Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# Copyright (c) 2025, NVIDIA CORPORATION. All rights reserved.
 
 from contextlib import nullcontext
 from typing import Optional
@@ -8,9 +8,6 @@ from torch import Tensor
 
 from megatron.core.enums import Fp8Recipe
 from megatron.core.fp8_utils import get_fp8_context
-from megatron.core.pipeline_parallel.fine_grained_activation_offload import (
-    fine_grained_offloading_set_last_layer,
-)
 from megatron.core.pipeline_parallel.utils import (
     AbstractSchedulePlan,
     NoopScheduleNode,
@@ -38,7 +35,7 @@ class TransformerLayerSchedulePlan:
     mtp post process nodes.
 
     layer (TransformerLayerSchedulePlan)
-    ├── attn (TransformerLayerNode): attention -> router -> dispatch preprocess
+    ├── attn (TransformerLayerNode): attention -> layernorm -> router -> dispatch preprocess
     ├── moe_dispatch (TransformerLayerNode): dispatch All2All
     ├── mlp (TransformerLayerNode): mlp module
     ├── moe_combine (TransformerLayerNode): combine All2All
@@ -91,9 +88,6 @@ class TransformerLayerSchedulePlan:
         if hasattr(self, 'attn') and self.attn is not None:
             del self.attn
             self.attn = None
-        if hasattr(self, 'post_attn') and self.post_attn is not None:
-            del self.post_attn
-            self.post_attn = None
         if hasattr(self, 'moe_dispatch') and self.moe_dispatch is not None:
             del self.moe_dispatch
             self.moe_dispatch = None
@@ -359,10 +353,6 @@ class TransformerModelChunkSchedulePlan(AbstractSchedulePlan):
                 model, self._model_chunk_state, self._event, comp_stream
             )
 
-        # preprocess may receive dgrad from attn, which is managed by cuda graph.
-        if CudaGraphScope.attn in model.config.cuda_graph_scope:
-            self.pre_process.manual_grads_release = False
-
     def _build_layer_schedule_plan(self, module, comp_stream, comm_stream):
         if module is None:
             return
@@ -488,8 +478,6 @@ class TransformerModelChunkSchedulePlan(AbstractSchedulePlan):
         # combined forward and backward pass for overlapped layers
         for i in range(overlapped_layers):
             f_layer = f_schedule_plan.get_layer(i)
-            if f_layer.layer.config.fine_grained_activation_offloading:
-                fine_grained_offloading_set_last_layer(i == f_num_layers - 1)
             b_layer = b_schedule_plan.pop_layer()
             torch.cuda.nvtx.range_push(f"layer_{i}f-layer_{b_schedule_plan.num_layers()}b")
             f_input, b_grad = TransformerLayerSchedulePlan.run(
@@ -518,8 +506,6 @@ class TransformerModelChunkSchedulePlan(AbstractSchedulePlan):
         for i in range(overlapped_layers, f_num_layers):
             f_layer = f_schedule_plan.get_layer(i)
             torch.cuda.nvtx.range_push(f"layer_{i}f")
-            if f_layer.layer.config.fine_grained_activation_offloading:
-                fine_grained_offloading_set_last_layer(i == f_num_layers - 1)
             f_input, _ = TransformerLayerSchedulePlan.run(f_layer, None, f_input=f_input)
             torch.cuda.nvtx.range_pop()
 

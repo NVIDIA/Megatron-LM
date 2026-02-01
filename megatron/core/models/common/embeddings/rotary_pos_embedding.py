@@ -147,7 +147,6 @@ class RotaryEmbedding(nn.Module):
         sin = torch.sin(freqs)
         return cos, sin
 
-    @lru_cache(maxsize=32)
     def get_emb(self, max_seq_len: int, offset: int = 0) -> Tensor:
         """Forward pass of RoPE embedding before CP sharding.
 
@@ -175,28 +174,30 @@ class RotaryEmbedding(nn.Module):
         emb = emb[:, None, None, :]
         return emb
 
+    @lru_cache(maxsize=32)
     @internal_api
     def forward(
-        self, max_seq_len: int, offset: int = 0, packed_seq_params: Optional[PackedSeqParams] = None
+        self,
+        max_seq_len: int,
+        offset: int = 0,
+        packed_seq: bool = False,
+        cp_group: Optional[torch.distributed.ProcessGroup] = None,
     ) -> Tensor:
         """Forward pass of RoPE embedding.
 
         Args:
             max_seq_len (int): Maximum size of sequence
             offset (int, optional): RoPE offset. Defaults to 0.
-            packed_seq_params (PackedSeqParams, optional): Packed sequence params. Defaults to None.
+            packed_seq (bool, optional): Whether to use packed sequence. Defaults to False.
+            cp_group (torch.distributed.ProcessGroup, optional): Context parallel group.
+                Defaults to None.
 
         Returns:
             Tensor: Embeddings after applying RoPE.
         """
         emb = self.get_emb(max_seq_len, offset)
-        packed_seq = packed_seq_params is not None and packed_seq_params.qkv_format == 'thd'
-        if packed_seq_params is not None and packed_seq_params.local_cp_size is not None:
-            # Set CP group to dynamic CP group for CP slicing
-            cp_group = packed_seq_params.cp_group
-        else:
+        if cp_group is None:
             cp_group = self.cp_group
-
         if cp_group is not None and cp_group.size() > 1 and not packed_seq:
             # slice rotary_pos_emb along sequence dimension
             # and select the parition of the current CP rank
@@ -307,7 +308,7 @@ class MultimodalRotaryEmbedding(nn.Module):
         self,
         position_ids: torch.Tensor,
         mrope_section: List[int],
-        packed_seq_params: Optional[PackedSeqParams] = None,
+        cp_group: Optional[torch.distributed.ProcessGroup] = None,
     ) -> Tensor:
         """Forward pass of multimodal RoPE embedding.
 
@@ -315,7 +316,8 @@ class MultimodalRotaryEmbedding(nn.Module):
             position_ids (torch.Tensor): A postion_id tensor with shape [3, batchsize, seqlens]
             mrope_section (list[int]): Multimodal rope section is for channel dimension of temporal,
                 height and width in rope calculation.
-            packed_seq_params (PackedSeqParams, optional): Packed sequence params. Defaults to None.
+            cp_group (torch.distributed.ProcessGroup, optional): Context parallel group.
+                Defaults to None.
 
         Returns:
             Tensor: Embeddings after applying RoPE.
@@ -348,14 +350,7 @@ class MultimodalRotaryEmbedding(nn.Module):
 
         # shape (seq_length, bs, 1, 2 * dim)
         emb = emb[..., None, :].transpose(0, 1).contiguous()
-        if packed_seq_params is not None and packed_seq_params.local_cp_size is not None:
-            if packed_seq_params.local_cp_size > 1:
-                # Set CP group to dynamic CP group for CP slicing
-                cp_group = packed_seq_params.cp_group
-            else:
-                # Set CP group to None to avoid CP slicing
-                cp_group = None
-        else:
+        if cp_group is None:
             cp_group = self.cp_group
         if cp_group is not None and cp_group.size() > 1:
             # slice rotary_pos_emb along sequence dimension and select the parition of the current
