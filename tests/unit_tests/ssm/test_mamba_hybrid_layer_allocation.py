@@ -160,10 +160,18 @@ class TestParseHybridPattern:
 
     def test_invalid_symbols_in_mtp_pattern(self):
         """Test that invalid symbols in MTP pattern raise ValueError."""
-        invalid_patterns = ["M*M*/MX", "M*M*/MM/Ma"]  # X is not valid  # a is not valid
-        for pattern in invalid_patterns:
-            with pytest.raises(ValueError, match="not a valid layer symbol"):
-                parse_hybrid_pattern(pattern)
+        # Single MTP depth with invalid symbol - should raise "not a valid layer symbol"
+        with pytest.raises(ValueError, match="not a valid layer symbol"):
+            parse_hybrid_pattern("M*M*/MX")  # X is not valid
+
+        # Multiple MTP depths with invalid symbol and matching patterns
+        with pytest.raises(ValueError, match="not a valid layer symbol"):
+            parse_hybrid_pattern("M*M*/Ma/Ma")  # a is not valid
+
+        # Multiple MTP depths with invalid symbol but mismatched patterns
+        # This raises "All MTP patterns must be identical" before checking symbols
+        with pytest.raises(ValueError, match="All MTP patterns must be identical"):
+            parse_hybrid_pattern("M*M*/MM/Ma")
 
     def test_empty_main_pattern_with_mtp(self):
         """Test pattern that starts with / (empty main pattern)."""
