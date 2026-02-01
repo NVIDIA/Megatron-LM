@@ -127,7 +127,7 @@ class TestParseHybridPattern:
             ("M*M*/MM/MM", "M*M*", "MM", 2),
             ("M*M*/MM/MM/MM", "M*M*", "MM", 3),
             ("MMMM/*M/*M/*M", "MMMM", "*M", 3),
-            ("M*/*/*/*", "M*", "*", 4),
+            ("M*/*/*/*", "M*", "*", 3),
             ("M/M/M/M/M", "M", "M", 4),
         ]
         for pattern, expected_main, expected_mtp, expected_depths in test_cases:

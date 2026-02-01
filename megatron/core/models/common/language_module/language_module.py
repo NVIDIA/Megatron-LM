@@ -23,10 +23,7 @@ from megatron.core.pipeline_parallel.utils import (
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.transformer.enums import AttnBackend, CudaGraphScope
 from megatron.core.transformer.module import MegatronModule
-from megatron.core.transformer.multi_token_prediction import (
-    tie_output_layer_state_dict,
-    tie_word_embeddings_state_dict,
-)
+from megatron.core.transformer.multi_token_prediction import tie_word_embeddings_state_dict
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.transformer.utils import ensure_metadata_has_dp_cp_group
 from megatron.core.utils import (
@@ -305,14 +302,12 @@ class LanguageModule(MegatronModule):
         output_layer_weight_key = f'{prefix}output_layer.weight'
         output_layer_bias_key = f'{prefix}output_layer.bias'
 
-        # Multi-Token Prediction (MTP) need both embedding layer and output layer in
-        # mtp process stage.
+        # Multi-Token Prediction (MTP) needs embedding layer in mtp process stage.
         # If MTP is not placed in the pre processing stage, we need to maintain a copy of
         # embedding layer in the mtp process stage and tie it to the embedding in the pre
         # processing stage.
-        # Also, if MTP is not placed in the post processing stage, we need to maintain a copy
-        # of output layer in the mtp process stage and tie it to the output layer in the post
-        # processing stage.
+        # Note: MTP loss is computed at post_process stage, so the output_layer on mtp_process
+        # rank doesn't need special tying - it's not used for loss computation.
         if getattr(self, 'mtp_process', False) and not self.pre_process:
             emb_weight = self.embedding.word_embeddings.weight
             tie_word_embeddings_state_dict(
@@ -322,20 +317,6 @@ class LanguageModule(MegatronModule):
                 tp_group=self.tp_group,
                 dp_cp_group=metadata['dp_cp_group'],
             )
-
-        if getattr(self, 'mtp_process', False) and not self.post_process:
-            # We only need to tie the output layer weight if share_embeddings_and_output_weights
-            # is False. Because if share_embeddings_and_output_weights is True, the shared weight
-            # will be stored in embedding layer, and output layer will not have any weight.
-            if not self.share_embeddings_and_output_weights:
-                output_layer_weight = self.output_layer.weight
-                tie_output_layer_state_dict(
-                    sharded_state_dict,
-                    output_layer_weight,
-                    output_layer_weight_key,
-                    tp_group=self.tp_group,
-                    dp_cp_group=metadata['dp_cp_group'],
-                )
         if self.share_embeddings_and_output_weights:
             self.tie_embeddings_and_output_weights_state_dict(
                 sharded_state_dict, output_layer_weight_key, first_stage_word_emb_key, metadata
