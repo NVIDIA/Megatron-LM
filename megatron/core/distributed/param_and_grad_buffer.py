@@ -762,6 +762,12 @@ class _ParamAndGradBuffer:
                 group=self.data_parallel_group,
                 symmetric=not self.ddp_config.disable_symmetric_registration,
             )
+            # Since nccl communicator group is created lazily, we need to perform a warmup call to
+            # initialize NCCL comm buffers for this dp_group before doing buffer registration.
+            torch.distributed.barrier()
+            tmp_warmup_tensor = torch.zeros([1], device="cuda")
+            torch.distributed.all_reduce(tmp_warmup_tensor, group=self.data_parallel_group)
+            torch.distributed.barrier()
         else:
             # If nccl_ub is False, mem_alloc_context is nullcontext.
             mem_alloc_context = nullcontext
