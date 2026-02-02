@@ -387,18 +387,27 @@ def select_src_metadata_balanced(
     dst_tp_local = dst_metadata.tensor_parallel_local_rank
     if dst_tp_local is not None:
         # Check if TP sizes match between source and destination
-        src_tp_size = len(src_meta_list[0].tensor_parallel_group_ranks) if src_meta_list[0].tensor_parallel_group_ranks else None
-        dst_tp_size = len(dst_metadata.tensor_parallel_group_ranks) if dst_metadata.tensor_parallel_group_ranks else None
+        src_tp_size = (
+            len(src_meta_list[0].tensor_parallel_group_ranks)
+            if src_meta_list[0].tensor_parallel_group_ranks
+            else None
+        )
+        dst_tp_size = (
+            len(dst_metadata.tensor_parallel_group_ranks)
+            if dst_metadata.tensor_parallel_group_ranks
+            else None
+        )
 
         # Only filter by TP local rank when sizes match (non-collocated, not resharding)
         if src_tp_size == dst_tp_size and src_tp_size is not None:
-            matching_tp = [m for m in src_meta_list
-                           if m.tensor_parallel_local_rank == dst_tp_local]
+            matching_tp = [m for m in src_meta_list if m.tensor_parallel_local_rank == dst_tp_local]
             if not matching_tp:
                 # This indicates a configuration bug: sizes match but no local rank match
                 raise ValueError(
-                    f"No source metadata with TP local rank {dst_tp_local} found for dst rank {dst_rank}. "
-                    f"Available: {[(m.owner_rank, m.tensor_parallel_local_rank) for m in src_meta_list]}"
+                    f"No source metadata with TP local rank {dst_tp_local}"
+                    f" found for dst rank {dst_rank}. "
+                    f"Available:"
+                    f" {[(m.owner_rank, m.tensor_parallel_local_rank) for m in src_meta_list]}"
                 )
             src_meta_list = matching_tp
         # else: TP resharding mode (sizes differ) - skip filter, keep all source candidates
@@ -423,18 +432,27 @@ def select_src_metadata_balanced(
     dst_ep_local = dst_metadata.expert_parallel_local_rank
     if dst_ep_local is not None:
         # Check if EP sizes match between source and destination
-        src_ep_size = len(src_meta_list[0].expert_parallel_group_ranks) if src_meta_list[0].expert_parallel_group_ranks else None
-        dst_ep_size = len(dst_metadata.expert_parallel_group_ranks) if dst_metadata.expert_parallel_group_ranks else None
+        src_ep_size = (
+            len(src_meta_list[0].expert_parallel_group_ranks)
+            if src_meta_list[0].expert_parallel_group_ranks
+            else None
+        )
+        dst_ep_size = (
+            len(dst_metadata.expert_parallel_group_ranks)
+            if dst_metadata.expert_parallel_group_ranks
+            else None
+        )
 
         # Only filter by EP local rank when sizes match (non-collocated, not resharding)
         if src_ep_size == dst_ep_size and src_ep_size is not None:
-            matching_ep = [m for m in src_meta_list
-                           if m.expert_parallel_local_rank == dst_ep_local]
+            matching_ep = [m for m in src_meta_list if m.expert_parallel_local_rank == dst_ep_local]
             if not matching_ep:
                 # This indicates a configuration bug: sizes match but no local rank match
                 raise ValueError(
-                    f"No source metadata with EP local rank {dst_ep_local} found for dst rank {dst_rank}. "
-                    f"Available: {[(m.owner_rank, m.expert_parallel_local_rank) for m in src_meta_list]}"
+                    f"No source metadata with EP local rank {dst_ep_local}"
+                    f" found for dst rank {dst_rank}. "
+                    f"Available: "
+                    f"{[(m.owner_rank, m.expert_parallel_local_rank) for m in src_meta_list]}"
                 )
             src_meta_list = matching_ep
         # else: EP resharding mode (sizes differ) - skip filter, keep all source candidates

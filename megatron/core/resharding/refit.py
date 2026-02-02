@@ -7,8 +7,9 @@ High-level refit/reshard orchestration:
 - reshard_model_weights: transport-agnostic core; builds/caches plan and executes.
 """
 
+from typing import Any, Literal, Union
+
 import torch
-from typing import Any, Literal, Optional, Union
 
 from megatron.core import parallel_state
 from megatron.core.models.common.language_module.language_module import LanguageModule
@@ -26,6 +27,7 @@ RefitBackendName = Literal["nccl", "gloo", "nvshmem"]
 # Module-level cache for refit services to avoid repeated allocations
 _service_cache: dict[str, CopyService] = {}
 _plan_cache: dict[int, Any] = {}
+
 
 def get_or_create_service(backend: RefitBackendName) -> CopyService:
     """Get or create a cached CopyService instance for the given backend.

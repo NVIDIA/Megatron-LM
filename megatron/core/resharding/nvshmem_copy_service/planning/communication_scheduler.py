@@ -36,8 +36,8 @@ class CommunicationScheduler:
         all_batches = self._collect_all_batches(workloads, my_pe, n_pes)
         PELogger.debug(f"Collected {len(all_batches)} total batches globally")
 
-        # Step 2: Assign batches to iterations using greedy algorithm
-        PELogger.debug("Assigning batches to iterations using greedy algorithm...")
+        # Step 2: Assign batches to iterations using greedy conflict-free algorithm
+        PELogger.debug("Assigning batches to iterations using greedy conflict-free algorithm...")
         self._assign_iterations_greedy(all_batches)
         PELogger.info(f"Schedule built: {self.num_iterations} iterations")
 
@@ -78,12 +78,8 @@ class CommunicationScheduler:
         PELogger.debug(f"  Local batches: {local_batches}")
 
         # Gather all batches from all PEs using torch.distributed
-        # NOTE: all_gather_object is a collective operation that requires all ranks
-        # to participate, even those with empty workloads
-        PELogger.debug(f"  About to call all_gather_object with {n_pes} PEs...")
         all_batches_list: List[List[Tuple[int, int, int]] | None] = [None] * n_pes
         dist.all_gather_object(all_batches_list, local_batches)
-        PELogger.debug(f"  all_gather_object completed successfully")
 
         # Flatten into global batch list
         global_batches: List[ScheduledBatch] = []
@@ -116,9 +112,25 @@ class CommunicationScheduler:
         """
         self.num_iterations = 0
 
+        # Calculate degree (conflict count) for each batch
+        def calc_degree(batch: ScheduledBatch, all_batches: List[ScheduledBatch]) -> int:
+            """Count how many other batches conflict with this batch."""
+            conflicts = 0
+            batch_pes = {batch.src_pe, batch.dest_pe}
+            for other in all_batches:
+                if other is batch:
+                    continue
+                other_pes = {other.src_pe, other.dest_pe}
+                # Conflict if they share any PE
+                if batch_pes & other_pes:
+                    conflicts += 1
+            return conflicts
+
         # Sort batches: process batches with more potential conflicts first
         # This heuristic (largest-degree-first) often produces better colorings
-        batches.sort(key=lambda x: (x.src_pe, x.dest_pe, x.batch_index))
+        # Sort by degree (descending), then total_size (descending) for tie-breaking
+        PELogger.debug("Computing batch degrees for scheduling...")
+        batches.sort(key=lambda b: (-calc_degree(b, batches), -b.total_size))
 
         # Track which PEs are busy (sending or receiving) in each iteration
         # iteration -> {src_pes: set, dst_pes: set}
@@ -129,10 +141,12 @@ class CommunicationScheduler:
             assigned = False
             for iter_idx in range(len(iteration_usage)):
                 # Check if src_pe or dest_pe are already busy in this iteration
-                if (batch.src_pe not in iteration_usage[iter_idx]['src_pes'] and
-                    batch.src_pe not in iteration_usage[iter_idx]['dst_pes'] and
-                    batch.dest_pe not in iteration_usage[iter_idx]['src_pes'] and
-                    batch.dest_pe not in iteration_usage[iter_idx]['dst_pes']):
+                if (
+                    batch.src_pe not in iteration_usage[iter_idx]['src_pes']
+                    and batch.src_pe not in iteration_usage[iter_idx]['dst_pes']
+                    and batch.dest_pe not in iteration_usage[iter_idx]['src_pes']
+                    and batch.dest_pe not in iteration_usage[iter_idx]['dst_pes']
+                ):
                     # No conflict - assign to this iteration
                     batch.iteration = iter_idx
                     iteration_usage[iter_idx]['src_pes'].add(batch.src_pe)
@@ -148,17 +162,16 @@ class CommunicationScheduler:
                 # Need a new iteration
                 new_iter = len(iteration_usage)
                 batch.iteration = new_iter
-                iteration_usage.append({
-                    'src_pes': {batch.src_pe},
-                    'dst_pes': {batch.dest_pe}
-                })
+                iteration_usage.append({'src_pes': {batch.src_pe}, 'dst_pes': {batch.dest_pe}})
                 PELogger.debug(
                     f"  Assigned batch ({batch.src_pe} → {batch.dest_pe}, "
                     f"idx={batch.batch_index}) to NEW iteration {new_iter}"
                 )
 
         self.num_iterations = len(iteration_usage)
-        PELogger.info(f"Greedy scheduling: {len(batches)} batches → {self.num_iterations} iterations")
+        PELogger.info(
+            f"Greedy scheduling: {len(batches)} batches → {self.num_iterations} iterations"
+        )
 
     def _exchange_workload_summaries(
         self, workloads: Dict[int, List[WorkloadGroup]], my_pe: int, n_pes: int
@@ -191,14 +204,10 @@ class CommunicationScheduler:
         PELogger.debug(f"  Local summaries: {batch_count} batches, {total_tasks} tasks")
 
         # Gather all summaries from all PEs using torch.distributed
-        # NOTE: all_gather_object is a collective operation that requires all ranks
-        # to participate, even those with empty workloads
-        PELogger.debug(f"  About to call all_gather_object for summaries...")
         all_summaries_list: List[Dict[Tuple[int, int, int], Dict[str, object]] | None] = [
             None
         ] * n_pes
         dist.all_gather_object(all_summaries_list, local_summaries)
-        PELogger.debug(f"  all_gather_object for summaries completed successfully")
 
         # Merge into global map
         global_map: Dict[Tuple[int, int, int], WorkloadSummary] = {}

@@ -185,7 +185,7 @@ def _finalize_dp_transfers(
     # ranks are distributed across source ranks even when they have the same
     # position within their respective DP groups.
     #
-    # IMPORTANT: In non-collocated mode, src_dp_ranks might include ranks that don't
+    # In non-collocated mode, src_dp_ranks might include ranks that don't
     # have the source model (e.g., idle ranks or destination ranks). Filter to only
     # include the rank that provided this metadata (src_metadata.owner_rank).
     # src_metadata was selected by select_src_metadata_balanced, so owner_rank is the
@@ -283,10 +283,6 @@ def build_centralized_reshard_plan(
     else:
         # No destination model on this rank - provide empty metadata
         my_dst_metadata = []
-
-    # All ranks participate in collective operations
-    # - Source ranks provide src metadata, empty dst metadata
-    # - Destination ranks provide dst metadata, empty src metadata
 
     all_src_metadata_by_rank = [None] * world_size
     all_dst_metadata_by_rank = [None] * world_size
