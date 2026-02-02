@@ -970,6 +970,7 @@ def pretrain(
             inference_model[0].eval()
 
 
+
     # Data stuff.
     app_metrics['app_build_dataiters_start_time'] = one_logger_utils.get_timestamp_in_ms()
     timers('train/valid/test-data-iterators-setup', log_level=0).start(barrier=True)
@@ -1072,7 +1073,6 @@ def pretrain(
                 # If separate inference and training models, swap training weights
                 # back to the inference model for RL evaluation.
                 rl_utils._maybe_prefetch_separate_inference_model_weights(inf_core, to_cpu=False)
-                # Use the reusable service instance
                 swap_model_weights(model, inference_model, args.refit_method)
                 rl_eval_model = inference_model
             rl_utils.evaluate_and_print_results_rl(
