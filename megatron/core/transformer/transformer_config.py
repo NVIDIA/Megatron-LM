@@ -789,6 +789,22 @@ class TransformerConfig(ModelParallelConfig):
     hyper_connection_recompute_block_size: Optional[int] = None
     """Block size for mHC recomputation. If None, computed as sqrt(n*L/(n+2))."""
 
+    recompute_hyper_connections: bool = False
+    """Enable recomputation for HyperConnection intermediate activations.
+    
+    When enabled, all HyperConnection operations (compute_mappings, aggregate, apply_h_res, 
+    apply_h_post) are wrapped with CheckpointWithoutOutput and managed by MHCBlockRecomputeManager.
+    This significantly reduces memory usage by discarding intermediate activations and 
+    recomputing them during backward pass.
+    
+    Requirements:
+    - Only effective when enable_hyper_connections=True and training=True
+    - Must use recompute_granularity='selective'
+    - Cannot be used together with recompute_mlp=True (they use different checkpoint mechanisms)
+    
+    The last layer's final MLP BDA output is NOT checkpointed and serves as the hook_tensor
+    for registering the unified recompute hook."""
+
     ####################
     # miscellaneous
     ####################

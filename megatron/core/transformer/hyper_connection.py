@@ -1,4 +1,4 @@
-from typing import Tuple, Optional
+from typing import Tuple, Optional, TYPE_CHECKING
 import math
 import torch
 import torch.nn as nn
@@ -6,6 +6,9 @@ from torch import Tensor
 
 from megatron.core.transformer.module import MegatronModule
 from megatron.core.transformer.transformer_config import TransformerConfig
+
+if TYPE_CHECKING:
+    from megatron.core.tensor_parallel.random import MHCBlockRecomputeManager
 
 
 class SinkhornKnopp(torch.autograd.Function):
@@ -254,21 +257,45 @@ class HyperConnectionModule(MegatronModule):
         hidden_states: Tensor,
         residual: Tensor, 
         training: bool = True,
-    ) -> Tuple[Tensor, Tensor, Tensor, Tensor]:
+        mhc_recompute_manager: Optional['MHCBlockRecomputeManager'] = None,
+    ) -> Tuple[Tensor, Tensor, Tensor]:
         """
         Full mHC forward pass.
         
         Args:
             hidden_states: [s, b, n*C] - n-stream hidden states
             residual: [s, b, n*C] - n-stream hidden states (x_l)
-            dropout_p: Dropout probability for residual merge
             training: Whether in training mode
+            mhc_recompute_manager: Optional MHCBlockRecomputeManager for checkpoint management.
+                When provided, uses _forward_with_checkpoint for memory-efficient execution.
         
         Returns:
             aggregated: [s, b, C] - aggregated input for layer computation
             mixed: [s, b, n*C] - mixed output (H_res @ x_l)
             h_post: [s, b, n] - expansion weights
             
+        """
+        if mhc_recompute_manager is not None:
+            return self._forward_with_checkpoint(
+                hidden_states, residual, mhc_recompute_manager
+            )
+        else:
+            return self._forward_normal(hidden_states, residual)
+    
+    def _forward_normal(
+        self, hidden_states: Tensor, residual: Tensor
+    ) -> Tuple[Tensor, Tensor, Tensor]:
+        """
+        Normal forward pass without checkpointing.
+        
+        Args:
+            hidden_states: [s, b, n*C] - n-stream hidden states
+            residual: [s, b, n*C] - n-stream hidden states (x_l)
+        
+        Returns:
+            aggregated: [s, b, C] - aggregated input for layer computation
+            mixed: [s, b, n*C] - mixed output (H_res @ x_l)
+            h_post: [s, b, n] - expansion weights
         """
         # Compute mappings
         h_pre, h_post, h_res = self.compute_mappings(hidden_states)
@@ -279,6 +306,75 @@ class HyperConnectionModule(MegatronModule):
         mixed = self.apply_h_res(h_res, residual)
 
         return aggregated, mixed, h_post
+    
+    def _forward_with_checkpoint(
+        self,
+        hidden_states: Tensor,
+        residual: Tensor,
+        manager: 'MHCBlockRecomputeManager',
+    ) -> Tuple[Tensor, Tensor, Tensor]:
+        """
+        Forward pass with checkpointing for memory efficiency.
+        
+        All operations (compute_mappings, aggregate, apply_h_res) are wrapped with
+        CheckpointWithoutOutput and auto-registered to the manager.
+        
+        Args:
+            hidden_states: [s, b, n*C] - n-stream hidden states
+            residual: [s, b, n*C] - n-stream hidden states (x_l)
+            manager: MHCBlockRecomputeManager for unified recomputation
+        
+        Returns:
+            aggregated: [s, b, C] - aggregated input for layer computation
+            mixed: [s, b, n*C] - mixed output (H_res @ x_l)
+            h_post: [s, b, n] - expansion weights
+        """
+        from megatron.core.tensor_parallel.random import CheckpointWithoutOutput
+        
+        # Checkpoint compute_mappings - auto-registers to manager via ckpt_manager parameter
+        h_pre, h_post, h_res = CheckpointWithoutOutput(ckpt_manager=manager).checkpoint(
+            self.compute_mappings, hidden_states
+        )
+        
+        # Checkpoint aggregate - auto-registers to manager
+        aggregated = CheckpointWithoutOutput(ckpt_manager=manager).checkpoint(
+            self.aggregate, hidden_states, h_pre
+        )
+        
+        # Checkpoint apply_h_res - auto-registers to manager
+        mixed = CheckpointWithoutOutput(ckpt_manager=manager).checkpoint(
+            self.apply_h_res, h_res, residual
+        )
+        
+        return aggregated, mixed, h_post
+    
+    def apply_h_post_with_checkpoint(
+        self,
+        x_with_bias: Tuple[Tensor, Optional[Tensor]],
+        h_post: Tensor,
+        manager: Optional['MHCBlockRecomputeManager'] = None,
+    ) -> Tuple[Tensor, Optional[Tensor]]:
+        """
+        Apply H_post with optional checkpointing.
+        
+        When manager is provided, wraps apply_h_post with CheckpointWithoutOutput
+        and auto-registers to the manager for unified recomputation.
+        
+        Args:
+            x_with_bias: Tuple of (x, bias) with shapes [s, b, C] and [C] respectively
+            h_post: [s, b, n] - expansion weights
+            manager: Optional MHCBlockRecomputeManager for checkpoint management
+        
+        Returns:
+            Tuple of (x, bias) after applying H_post
+        """
+        if manager is not None:
+            from megatron.core.tensor_parallel.random import CheckpointWithoutOutput
+            return CheckpointWithoutOutput(ckpt_manager=manager).checkpoint(
+                self.apply_h_post, x_with_bias, h_post
+            )
+        else:
+            return self.apply_h_post(x_with_bias, h_post)
     
     # ==================== Block-level utilities ====================
     

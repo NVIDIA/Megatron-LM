@@ -8,6 +8,7 @@ import torch
 from torch import Tensor
 
 from megatron.core import parallel_state, tensor_parallel
+from megatron.core.tensor_parallel.random import MHCBlockRecomputeManager
 from megatron.core.dist_checkpointing.mapping import ShardedStateDict
 from megatron.core.dist_checkpointing.utils import replace_prefix_for_sharding
 from megatron.core.enums import Fp8Recipe
@@ -739,6 +740,15 @@ class TransformerBlock(GraphableMegatronModule, MegatronModule):
             use_inner_quantization_context = False
             outer_quantization_context = nullcontext()
 
+        # Determine if MHC recompute should be used
+        # Only enable when: training mode AND hyper connections enabled AND recompute_hyper_connections is True
+        use_mhc_recompute = (
+            self.training and
+            self.config.enable_hyper_connections and
+            self.config.recompute_hyper_connections
+        )
+        mhc_manager = MHCBlockRecomputeManager() if use_mhc_recompute else None
+
         with rng_context, outer_quantization_context:
             # Forward pass.
             if self.config.recompute_granularity == 'full' and self.training:
@@ -754,6 +764,7 @@ class TransformerBlock(GraphableMegatronModule, MegatronModule):
                     padding_mask=padding_mask,
                 )
             else:
+                num_layers = len(self.layers)
                 for l_no, layer in enumerate(self.layers):
                     # Get appropriate inner quantization context
                     if use_inner_quantization_context:
@@ -770,6 +781,14 @@ class TransformerBlock(GraphableMegatronModule, MegatronModule):
                     else:
                         inner_quantization_context = nullcontext()
 
+                    if self.config.fine_grained_activation_offloading:
+                        fine_grained_offloading_set_last_layer(
+                            l_no == self.num_layers_per_pipeline_rank - 1
+                        )
+
+                    # Determine if this is the last layer in the block
+                    is_last_layer_in_block = (l_no == num_layers - 1)
+
                     with self.offload_context, inner_quantization_context:
                         hidden_states, context = layer(
                             hidden_states=hidden_states,
@@ -785,6 +804,8 @@ class TransformerBlock(GraphableMegatronModule, MegatronModule):
                             packed_seq_params=packed_seq_params,
                             sequence_len_offset=sequence_len_offset,
                             padding_mask=padding_mask,
+                            mhc_recompute_manager=mhc_manager,
+                            is_last_layer_in_block=is_last_layer_in_block,
                         )
 
                     if (
@@ -814,6 +835,12 @@ class TransformerBlock(GraphableMegatronModule, MegatronModule):
         # on the computational graph and will lead to unexpected errors in pipeline schedules.
         if not self.pre_process and len(self.layers) == 0 and not self.final_layernorm:
             hidden_states = hidden_states.clone()
+
+        # Register unified recompute hook on final output
+        # The hook_tensor is the last layer's MLP BDA output (NOT checkpointed),
+        # which is now hidden_states after final layernorm processing
+        if mhc_manager is not None:
+            mhc_manager.discard_all_outputs_and_register_unified_recompute(hidden_states)
 
         return hidden_states
 
