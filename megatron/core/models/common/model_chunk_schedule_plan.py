@@ -131,6 +131,7 @@ class TransformerLayerSchedulePlan:
 
         extra_args["config"] = self.layer.config
         extra_args["is_moe"] = is_moe
+        extra_args["num_local_experts"] = self.layer.mlp.num_local_experts if is_moe else None
         extra_args["delay_wgrad_compute"] = self.layer.config.delay_wgrad_compute
         extra_args["is_mtp"] = is_mtp
 

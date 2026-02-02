@@ -43,13 +43,14 @@ def weak_method(method):
 
 
 @internal_api
-def should_free_input(name, is_moe, config):
+def should_free_input(name, is_moe, config, num_local_experts):
     """Determine if the node should free its input memory.
 
     Args:
         name: Node name
         is_moe: Whether it's a MoE model
         config: TransformerConfig object
+        num_local_experts: Number of local experts in MoE module
 
     Returns:
         bool: Whether to free input memory
@@ -71,7 +72,7 @@ def should_free_input(name, is_moe, config):
     # The input and output of A2A are not needed anymore after the forward pass,
     # so we can free the input memory after the forward pass.
     free_input_nodes = {
-        "mlp": not (enable_hybridep and config.fp8 is None),
+        "mlp": not ((enable_hybridep and config.fp8 is None) or num_local_experts == 1),
         "moe_combine": True,
         # For non-DeepEP and non-HybridEP dispatcher mode, the input is the un-dispatched tokens
         # and probs before dispatch A2A and it's not needed anymore after the forward pass
@@ -256,7 +257,8 @@ class TransformerLayerNode(ScheduleNode):
         config = extra_args.get("config", None)
         assert config is not None, "model config must be passed to TransformerLayerNode."
         is_moe = extra_args.get("is_moe", False)
-        free_input = should_free_input(name, is_moe, config)
+        num_local_experts = extra_args.get("num_local_experts", None)
+        free_input = should_free_input(name, is_moe, config, num_local_experts)
         self.delay_wgrad_compute = extra_args.get("delay_wgrad_compute", False)
 
         super().__init__(
