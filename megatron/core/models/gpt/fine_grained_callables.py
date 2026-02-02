@@ -71,8 +71,19 @@ def should_free_input(name, is_moe, config, num_local_experts):
     # when and how to free the input memory.
     # The input and output of A2A are not needed anymore after the forward pass,
     # so we can free the input memory after the forward pass.
+
+    # When fp8 is enabled, the casted tensors are saved and the original bf16 tensors
+    # are safe to be freed.
+    free_mlp = config.fp8 is not None
+    if not free_mlp:
+        # AlltoAll dispatcher with local_num_experts=1 and HybridEP both use identity
+        # operation for `dispatch_postprocess`, hence the mlp inputs will be directly
+        # passed to GroupedGemm and should be saved for backward pass.
+        free_mlp = num_local_experts > 1 or config.moe_token_dispatcher_type != "alltoall"
+        free_mlp = free_mlp and not enable_hybridep
+
     free_input_nodes = {
-        "mlp": not ((enable_hybridep and config.fp8 is None) or num_local_experts == 1),
+        "mlp": free_mlp,
         "moe_combine": True,
         # For non-DeepEP and non-HybridEP dispatcher mode, the input is the un-dispatched tokens
         # and probs before dispatch A2A and it's not needed anymore after the forward pass
