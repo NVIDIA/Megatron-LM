@@ -54,6 +54,7 @@ from megatron.core.transformer.moe.experts import InferenceGroupedMLP
 
 from .token_dispatcher_inference import InferenceAlltoAllTokenDispatcher
 
+import logging
 
 class InferenceMoELayer(MoELayer):
     """
@@ -126,6 +127,13 @@ class InferenceMoELayer(MoELayer):
             self.restore_output_by_local_experts = input_chunk_idxs.reshape(
                 self.num_local_experts, -1
             ).T.ravel()
+
+        self.is_cuda_graphed_iteration = False
+
+    def set_is_cuda_graphed_iteration(self, set_to):
+        self.is_cuda_graphed_iteration = set_to
+        logging.info("set is cuda graphed iteration to %s", set_to)
+        exit()
 
     # ==================== Simplified Forward Pass ====================
     def forward(self, hidden_states: torch.Tensor, padding_mask: Optional[torch.Tensor] = None):

@@ -25,7 +25,7 @@ from megatron.core.inference.model_inference_wrappers.abstract_model_inference_w
     AbstractModelInferenceWrapper,
 )
 from megatron.core.inference.sampling_params import SamplingParams
-from megatron.core.inference.utils import get_attention_mask, set_decode_expert_padding
+from megatron.core.inference.utils import get_attention_mask, set_decode_expert_padding, set_is_cuda_graphed_iteration_for_ep_inference
 from megatron.core.transformer.enums import CudaGraphScope
 from megatron.core.transformer.moe.moe_layer import BaseMoELayer
 from megatron.core.transformer.utils import set_model_to_sequence_parallel
@@ -523,12 +523,20 @@ class TextGenerationController:
         moe_pad_experts_for_cuda_graph_inference = (
             inference_wrapper_config.moe_pad_experts_for_cuda_graph_inference
         )
+        is_inference_optimized = inference_wrapper_config.transformer_impl == "inference_optimized"
+        if is_inference_optimized:
+            assert not moe_pad_experts_for_cuda_graph_inference, (
+                "moe_pad_experts_for_cuda_graph_inference cannot be True when "
+                "transformer_impl is 'inference_optimized'"
+            )
         if moe_pad_experts_for_cuda_graph_inference:
             if context.using_cuda_graph_this_step():
                 capacity_factor = model_config.num_moe_experts / model_config.moe_router_topk
                 set_decode_expert_padding(unwrapped_model, True, capacity_factor=capacity_factor)
             else:
                 set_decode_expert_padding(unwrapped_model, False)
+        if is_inference_optimized and model_config.expert_model_parallel_size > 1:
+            set_is_cuda_graphed_iteration_for_ep_inference(unwrapped_model, context.using_cuda_graph_this_step())
 
         # initialize symmetric memory if needed
         if model_config.transformer_impl == "inference_optimized":
@@ -1146,6 +1154,7 @@ class TextGenerationController:
             moe_pad_experts_for_cuda_graph_inference = (
                 inference_wrapper_config.moe_pad_experts_for_cuda_graph_inference
             )
+            
             if moe_pad_experts_for_cuda_graph_inference:
                 set_decode_expert_padding(unwrapped_model, False)
 

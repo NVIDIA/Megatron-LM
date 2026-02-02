@@ -131,6 +131,21 @@ def set_decode_expert_padding(model, set_to: bool = False, capacity_factor: int 
             router.config.moe_expert_capacity_factor = capacity_factor
             router.config.moe_pad_expert_input_to_capacity = bool(set_to)
 
+def set_is_cuda_graphed_iteration_for_ep_inference(model, set_to: bool):
+    """
+    Toggle CUDA graph compatibility for expert parallel inference. 
+    This sets a boolean flag in all InferenceMoELayers to indicate whether
+    the current iteration is being captured/executed in a CUDA graph. 
+    This allows the dispatcher to adjust its behavior for CUDA graph compatibility,
+    Args:
+    - set_to: Enable (True) or disable (False) CUDA graph compatibility.
+    """
+    global moe_layer_cache
+    if moe_layer_cache is None:
+        _init_moe_expert_cache(model)
+    
+    for moe_layer in moe_layer_cache:
+        moe_layer.set_is_cuda_graphed_iteration(set_to)
 
 def tensor_swap(x, src_idxs, dst_idxs):
     """
@@ -216,3 +231,4 @@ if sys.version_info < (3, 13):
 else:
     asyncio_QueueShutDown = asyncio.QueueShutDown
     asyncio_Queue = asyncio.Queue
+

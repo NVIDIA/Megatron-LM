@@ -11,7 +11,10 @@ import torch
 from typing import List, Optional
 
 from megatron.core.process_groups_config import ProcessGroupCollection
-from megatron.core.transformer.moe.token_dispatcher import MoEAlltoAllTokenDispatcher
+from megatron.core.transformer.moe.token_dispatcher import (
+    MoEAlltoAllTokenDispatcher,
+    MoEAllGatherTokenDispatcher,
+)
 from megatron.core.transformer.transformer_config import TransformerConfig
 
 
@@ -56,7 +59,7 @@ class InferenceAlltoAllTokenDispatcher(MoEAlltoAllTokenDispatcher):
         """
         if self.drop_and_pad:
             # Replicate parent's drop_and_pad logic but create tensor on GPU
-            from megatron.core.transformer.moe.moe_utils import get_capacity
+            
 
             num_tokens = routing_map.size(0) * self.config.moe_router_topk
             self.capacity = get_capacity(
@@ -125,4 +128,41 @@ class InferenceAlltoAllTokenDispatcher(MoEAlltoAllTokenDispatcher):
 
         # No DtoH transfers needed - return tokens_per_expert unchanged (stays on GPU!)
         return tokens_per_expert
+
+
+class InferenceAllGatherTokenDispatcher(MoEAllGatherTokenDispatcher):
+    """
+    Inference-optimized AllGather token dispatcher.
+
+    This dispatcher uses AllGather instead of AlltoAll for token exchange,
+    which can be simpler and more efficient for certain configurations.
+
+    Key features:
+    - Simpler communication pattern (AllGather vs AlltoAll)
+    - GPU-resident metadata for CUDA graph compatibility
+    - Assumes tp_size == 1 (no tensor parallelism within experts)
+    """
+
+    def __init__(
+        self,
+        num_local_experts: int,
+        local_expert_indices: List[int],
+        config: TransformerConfig,
+        pg_collection: Optional[ProcessGroupCollection] = None,
+    ) -> None:
+        """
+        Initialize the inference AllGather token dispatcher.
+
+        Args:
+            num_local_experts: Number of experts on this rank.
+            local_expert_indices: Global indices of experts on this rank.
+            config: Transformer configuration.
+            pg_collection: Process group collection for distributed ops.
+        """
+        super().__init__(
+            num_local_experts=num_local_experts,
+            local_expert_indices=local_expert_indices,
+            config=config,
+            pg_collection=pg_collection,
+        )
 
