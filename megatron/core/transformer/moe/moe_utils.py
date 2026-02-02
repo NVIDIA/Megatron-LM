@@ -18,6 +18,7 @@ from megatron.core.tensor_parallel import (
 from megatron.core.tensor_parallel.mappings import reduce_from_tensor_model_parallel_region
 from megatron.core.transformer.cuda_graphs import is_graph_capturing
 from megatron.core.transformer.enums import CudaGraphScope
+from megatron.core.transformer.moe.router_replay import RouterReplay
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.utils import internal_api
 
@@ -217,7 +218,7 @@ def get_tokens_per_expert_and_token_count(
 class MoEAuxLossAutoScaler(torch.autograd.Function):
     """An AutoScaler that triggers the backward pass and scales the grad for auxiliary loss."""
 
-    main_loss_backward_scale: torch.Tensor = None
+    main_loss_backward_scale: Optional[torch.Tensor] = None
 
     @staticmethod
     def forward(ctx, output: torch.Tensor, aux_loss: torch.Tensor):
@@ -358,8 +359,8 @@ def unpermute(
     permuted_tokens: torch.Tensor,
     sorted_indices: torch.Tensor,
     restore_shape: torch.Size,
-    probs: torch.Tensor = None,
-    routing_map: torch.Tensor = None,
+    probs: Optional[torch.Tensor] = None,
+    routing_map: Optional[torch.Tensor] = None,
     fused: bool = False,
     drop_and_pad: bool = False,
 ):
@@ -580,6 +581,7 @@ def topk_routing_with_score_function(
     score_function: str = "softmax",
     expert_bias: Optional[torch.Tensor] = None,
     fused: bool = False,
+    router_replay: Optional['RouterReplay'] = None,
 ):
     """Compute the routing probabilities and map for top-k selection with score function.
     Args:
@@ -591,6 +593,9 @@ def topk_routing_with_score_function(
         scaling_factor (float): Scaling factor of routing score in top-k selection.
         score_function (str): The score function to use. Can be either "softmax" or "sigmoid".
         expert_bias (torch.Tensor): The bias added to logits for expert routing.
+        router_replay (Optional['RouterReplay']): For debugging and development, allows for
+                                             deterministic routing by replaying a previously
+                                             recorded routing sequence.
     Returns:
         Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
             - routing_probs (torch.Tensor): A tensor of shape [num_tokens, num_experts] containing
@@ -617,7 +622,7 @@ def topk_routing_with_score_function(
             expert_bias=expert_bias,
         )
 
-    def compute_topk(scores, topk, num_groups=None, group_topk=None):
+    def _compute_topk(scores, topk, num_groups=None, group_topk=None):
         if group_topk:
             return group_limited_topk(
                 scores=scores,
@@ -629,6 +634,15 @@ def topk_routing_with_score_function(
             )
         else:
             return torch.topk(scores, k=topk, dim=1)
+
+    def compute_topk(scores, topk, num_groups=None, group_topk=None):
+        # Default behavior if no replay is active
+        if router_replay is None:
+            return _compute_topk(scores, topk, num_groups=num_groups, group_topk=group_topk)
+        else:
+            return router_replay.get_replay_topk(
+                scores, topk, num_groups, group_topk, _compute_topk
+            )
 
     if score_function == "softmax":
         if use_pre_softmax:
@@ -787,8 +801,8 @@ def save_to_aux_losses_tracker(
     loss: torch.Tensor,
     layer_number: int,
     num_layers: int,
-    reduce_group: torch.distributed.ProcessGroup = None,
-    avg_group: torch.distributed.ProcessGroup = None,
+    reduce_group: Optional[torch.distributed.ProcessGroup] = None,
+    avg_group: Optional[torch.distributed.ProcessGroup] = None,
     reduce_group_has_dp: bool = False,
 ):
     """Save the auxiliary loss for logging.
@@ -854,9 +868,7 @@ def reduce_aux_losses_tracker_across_ranks(
             # does not have 'dp' attribute, do it manually.
             if not tracker[name].get('reduce_group_has_dp', False):
                 torch.distributed.all_reduce(
-                    values,
-                    group=parallel_state.get_data_parallel_group(with_context_parallel=False),
-                    op=torch.distributed.ReduceOp.AVG,
+                    values, group=dp_group, op=torch.distributed.ReduceOp.AVG
                 )
         if tracker[name].get('avg_group') is not None:
             torch.distributed.all_reduce(
@@ -896,7 +908,6 @@ def track_moe_metrics(
                     tracker[key]["reduce_group"] = None
                     tracker[key]["avg_group"] = None
                     tracker[key]["reduce_group_has_dp"] = False
-
     reduce_aux_losses_tracker_across_ranks(track_names, pg_collection=pg_collection)
 
     # Get number of MoE layers

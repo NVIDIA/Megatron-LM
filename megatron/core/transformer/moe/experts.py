@@ -26,9 +26,7 @@ from megatron.core.fusions.fused_bias_swiglu import weighted_bias_swiglu_impl
 from megatron.core.fusions.fused_weighted_squared_relu import weighted_squared_relu_impl
 from megatron.core.jit import jit_fuser
 from megatron.core.pipeline_parallel.fine_grained_activation_offload import (
-    fine_grained_offloading_group_commit,
-    fine_grained_offloading_group_start,
-    get_fine_grained_offloading_context,
+    FineGrainedActivationOffloadingInterface as off_interface,
 )
 from megatron.core.tensor_parallel.layers import (
     _initialize_affine_weight_cpu,
@@ -50,7 +48,6 @@ from megatron.core.transformer.utils import (
     make_sharded_object_for_checkpoint,
     sharded_state_dict_default,
 )
-from megatron.core.utils import deprecated, internal_api
 
 try:
     import transformer_engine as te  # pylint: disable=unused-import
@@ -66,51 +63,6 @@ except ImportError:
 logger = logging.getLogger(__name__)
 
 
-@deprecated(
-    version="0.16",
-    removal_version="0.17",
-    alternative=None,
-    reason="pg_collection is being passed to sub-module",
-)
-def expert_dist_ckpt_decorator(func):
-    """Decorator of shared_state_dict in expert layer for distributed checkpoint.
-    Since !1940, the TP size for Expert layer can be different with Attention.
-    To make distributed checkpoint work in such cases, we use a decorator to
-    replace the default TP parallel states with expert-TP parallel states.
-    """
-
-    logger.warning("expert_dist_ckpt_decorator is deprecated and will be removed in version 0.17.")
-
-    @wraps(func)
-    def wrapper(*args, **kwargs):
-        # Store original states
-        original_rank = parallel_state._MPU_TENSOR_MODEL_PARALLEL_RANK
-        original_size = parallel_state._MPU_TENSOR_MODEL_PARALLEL_WORLD_SIZE
-        original_group = parallel_state._TENSOR_MODEL_PARALLEL_GROUP
-        try:
-            # Set new states
-            parallel_state._MPU_TENSOR_MODEL_PARALLEL_RANK = (
-                parallel_state.get_expert_tensor_parallel_rank()
-            )
-            parallel_state._MPU_TENSOR_MODEL_PARALLEL_WORLD_SIZE = (
-                parallel_state.get_expert_tensor_parallel_world_size()
-            )
-            parallel_state._TENSOR_MODEL_PARALLEL_GROUP = (
-                parallel_state.get_expert_tensor_parallel_group()
-            )
-
-            # Execute the function
-            result = func(*args, **kwargs)
-        finally:
-            # Restore original states
-            parallel_state._MPU_TENSOR_MODEL_PARALLEL_RANK = original_rank
-            parallel_state._MPU_TENSOR_MODEL_PARALLEL_WORLD_SIZE = original_size
-            parallel_state._TENSOR_MODEL_PARALLEL_GROUP = original_group
-        return result
-
-    return wrapper
-
-
 class GroupedMLP(MegatronModule):
     """An efficient implementation of the Experts layer using GroupedGEMM.
 
@@ -118,7 +70,6 @@ class GroupedMLP(MegatronModule):
     """
 
     # TODO(M4): breaking api, switched from pass in tp_group to pass in pg_collection.
-    @internal_api
     def __init__(
         self,
         num_local_experts: int,
@@ -288,7 +239,7 @@ class GroupedMLP(MegatronModule):
         permuted_probs: torch.Tensor,
     ):
         """Forward step of the GroupedMLP."""
-        assert self.config.bf16, "Currently GroupedGEMM for MoE only supports bf16."
+        assert self.config.bf16, "Currently GroupedMLP for MoE only supports bf16."
         if self.activation_recompute:
             self.activation_checkpoint = tensor_parallel.CheckpointWithoutOutput()
 
@@ -582,7 +533,6 @@ class TEGroupedMLP(MegatronModule):
     """
 
     # TODO(M4): breaking api, switched from pass in tp_group to pass in pg_collection.
-    @internal_api
     def __init__(
         self,
         num_local_experts,
@@ -662,7 +612,7 @@ class TEGroupedMLP(MegatronModule):
             set_save_original_input(self.linear_fc2)
 
         # This is to avoid the CPU overhead of multiple d2h copies
-        if self.offload_expert_fc1 and not (self.config.fp8 or self.config.fp4):
+        if self.offload_expert_fc1:
             from megatron.core.extensions.transformer_engine import set_save_original_input
 
             set_save_original_input(self.linear_fc1)
@@ -731,18 +681,15 @@ class TEGroupedMLP(MegatronModule):
             # Probs already applied, so reset to 1.
             permuted_probs = torch.ones_like(permuted_probs)
 
-        if self.offload_expert_fc1:
-            permuted_local_hidden_states = fine_grained_offloading_group_start(
-                permuted_local_hidden_states, name="expert_fc1"
-            )
-        with get_fine_grained_offloading_context(self.offload_expert_fc1):
+        with off_interface(
+            self.offload_expert_fc1, permuted_local_hidden_states, "expert_fc1"
+        ) as permuted_local_hidden_states:
             fc1_output, bias_parallel = self.linear_fc1(
                 permuted_local_hidden_states, tokens_per_expert
             )
         if self.offload_expert_fc1:
-            fc1_output, bias_parallel = fine_grained_offloading_group_commit(
+            fc1_output = off_interface.group_commit(
                 fc1_output,
-                bias_parallel,
                 name="expert_fc1",
                 forced_released_tensors=[permuted_local_hidden_states],
             )
@@ -805,32 +752,32 @@ class TEGroupedMLP(MegatronModule):
                 intermediate_parallel = intermediate_parallel.to(original_dtype)
             return intermediate_parallel
 
-        if self.offload_moe_act:
-            fc1_output = fine_grained_offloading_group_start(fc1_output, name="moe_act")
-
         if self.activation_recompute:
             self.activation_checkpoint = tensor_parallel.CheckpointWithoutOutput()
-            with get_fine_grained_offloading_context(self.offload_moe_act):
+            with off_interface(self.offload_moe_act, fc1_output, "moe_act") as fc1_output:
                 bias_act_output = self.activation_checkpoint.checkpoint(
                     bias_act_func, fc1_output, bias_parallel, permuted_probs
                 )
         else:
-            with get_fine_grained_offloading_context(self.offload_moe_act):
+            with off_interface(self.offload_moe_act, fc1_output, "moe_act") as fc1_output:
                 bias_act_output = bias_act_func(fc1_output, bias_parallel, permuted_probs)
 
         output, output_bias = self.linear_fc2(bias_act_output, tokens_per_expert)
         if self.activation_recompute:
             self.activation_checkpoint.discard_output_and_register_recompute(output)
+
+        # Delay the offload of the moe act until after the linear_fc2 has been computed
+        # to make sure the fc1_output is reloaded to GPU before recomputing moe_act.
         if self.offload_moe_act:
-            (output,) = fine_grained_offloading_group_commit(
+            output = off_interface.group_commit(
                 output, name="moe_act", forced_released_tensors=[fc1_output]
             )
+        output = self._apply_bias(output, output_bias, tokens_per_expert, permuted_probs)
 
         # upad and concat the output
         if self.config.fp8 or self.config.fp4:
             output = self.quantization_unpadding(output, actual_tokens_per_expert)
 
-        output = self._apply_bias(output, output_bias, tokens_per_expert, permuted_probs)
         output_bias = None
 
         return output, output_bias
@@ -894,7 +841,6 @@ class SequentialMLP(MegatronModule):
     """
 
     # TODO(M4): breaking api, switched from pass in tp_group to pass in pg_collection.
-    @internal_api
     def __init__(
         self,
         num_local_experts,

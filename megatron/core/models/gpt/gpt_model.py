@@ -19,7 +19,7 @@ from megatron.core.models.common.embeddings.rotary_pos_embedding import (
 from megatron.core.models.common.language_module.language_module import LanguageModule
 from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.core.pipeline_parallel.fine_grained_activation_offload import (
-    fine_grained_offloading_init_chunk_handler,
+    FineGrainedActivationOffloadingInterface as off_interface,
 )
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.quantization.utils import get_quant_config_or_none
@@ -35,7 +35,11 @@ from megatron.core.transformer.multi_token_prediction import (
 from megatron.core.transformer.spec_utils import ModuleSpec
 from megatron.core.transformer.transformer_block import TransformerBlock
 from megatron.core.transformer.transformer_config import TransformerConfig
-from megatron.core.utils import WrappedTensor, deprecate_inference_params
+from megatron.core.utils import (
+    WrappedTensor,
+    deprecate_inference_params,
+    is_using_quantization_scales,
+)
 
 
 class GPTModel(LanguageModule):
@@ -358,7 +362,10 @@ class GPTModel(LanguageModule):
                     inference_context, self.decoder, decoder_input, self.config, packed_seq_params
                 )
                 rotary_pos_emb = self.rotary_pos_emb(
-                    rotary_seq_len, packed_seq_params=packed_seq_params
+                    rotary_seq_len,
+                    packed_seq=packed_seq_params is not None
+                    and packed_seq_params.qkv_format == 'thd',
+                    cp_group=packed_seq_params.cp_group if packed_seq_params is not None else None,
                 )
         elif self.position_embedding_type == 'yarn':
             if self.training or not self.config.flash_decode:
@@ -366,7 +373,10 @@ class GPTModel(LanguageModule):
                     inference_context, self.decoder, decoder_input, self.config, packed_seq_params
                 )
                 rotary_pos_emb, _ = self.rotary_pos_emb(
-                    rotary_seq_len, packed_seq_params=packed_seq_params
+                    rotary_seq_len,
+                    packed_seq=packed_seq_params is not None
+                    and packed_seq_params.qkv_format == 'thd',
+                    cp_group=packed_seq_params.cp_group if packed_seq_params is not None else None,
                 )
             else:
                 raise NotImplementedError(
@@ -376,7 +386,9 @@ class GPTModel(LanguageModule):
         elif self.position_embedding_type == 'mrope' and not self.config.multi_latent_attention:
             if self.training or not self.config.flash_decode:
                 rotary_pos_emb = self.rotary_pos_emb(
-                    position_ids, self.mrope_section, packed_seq_params=packed_seq_params
+                    position_ids,
+                    self.mrope_section,
+                    cp_group=packed_seq_params.cp_group if packed_seq_params is not None else None,
                 )
             else:
                 # Flash decoding uses precomputed cos and sin for RoPE
@@ -405,11 +417,19 @@ class GPTModel(LanguageModule):
         else:
             sequence_len_offset = None
 
-        # Wrap decoder_input to allow the decoder (TransformerBlock) to delete the
-        # reference held by this caller function, enabling early garbage collection for
-        # inference. Skip wrapping if decoder_input is logged after decoder completion.
-        if in_inference_mode and not has_config_logger_enabled(self.config):
-            decoder_input = WrappedTensor(decoder_input)
+        if in_inference_mode:
+            # Clear the outputs for padding tokens when using dynamic batching with
+            # quantization scales to avoid corrupting amax calculations
+            if inference_context.is_dynamic_batching() and is_using_quantization_scales(
+                self.config
+            ):
+                decoder_input[inference_context.padding_slice] = 0.0
+
+            # Wrap decoder_input to allow the decoder (TransformerBlock) to delete the
+            # reference held by this caller function, enabling early garbage collection for
+            # inference. Skip wrapping if decoder_input is logged after decoder completion.
+            if not has_config_logger_enabled(self.config):
+                decoder_input = WrappedTensor(decoder_input)
 
         preproc_output = (
             decoder_input,
@@ -431,20 +451,20 @@ class GPTModel(LanguageModule):
 
     def preprocess_for_fine_grained_offloading(self):
         """Preprocess for fine-grained activation offloading."""
-        fine_grained_offloading_init_chunk_handler(
+        off_interface.init_chunk_handler(
             vp_size=self.config.virtual_pipeline_model_parallel_size,
             vp_stage=self.vp_stage,
             min_offloaded_tensor_size=self.config.min_offloaded_tensor_size,
         )
         if self.disable_param_offloading:
             for param in self.decoder.parameters():
-                param.offloading_activation = False
+                off_interface.mark_not_offloadable(param)
             if self.mtp_process:
                 for param in self.mtp.parameters():
-                    param.offloading_activation = False
+                    off_interface.mark_not_offloadable(param)
             if self.post_process:
                 for param in self.output_layer.parameters():
-                    param.offloading_activation = False
+                    off_interface.mark_not_offloadable(param)
             self.disable_param_offloading = False
 
     def forward(
@@ -588,8 +608,7 @@ class GPTModel(LanguageModule):
         if not self.post_process:
             return hidden_states
 
-        # Skip when mtp_num_layers is None or 0
-        if self.config.mtp_num_layers:
+        if self.config.mtp_num_layers is not None:
             mtp_labels = labels.clone()
             hidden_states_list = torch.chunk(hidden_states, 1 + self.config.mtp_num_layers, dim=0)
             hidden_states = hidden_states_list[0]

@@ -104,7 +104,9 @@ class GatedDeltaNet(MegatronModule):
         """
 
         if not HAVE_FLA:
-            raise ImportError("FLA is not installed. Please install it with `pip install fla`.")
+            raise ImportError(
+                "FLA is not installed. Please install it with `pip install flash-linear-attention`."
+            )
 
         super().__init__(config)
 
@@ -246,7 +248,7 @@ class GatedDeltaNet(MegatronModule):
                     dtype=self.config.params_dtype,
                     device=torch.cuda.current_device(),
                 ).uniform_(*self.A_init_range)
-                self.A_log.data.copy_(A)
+                self.A_log.data.copy_(torch.log(A))
 
     def forward(
         self,

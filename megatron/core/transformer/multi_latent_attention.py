@@ -23,9 +23,7 @@ from megatron.core.models.common.embeddings import (
     apply_rotary_pos_emb,
 )
 from megatron.core.pipeline_parallel.fine_grained_activation_offload import (
-    fine_grained_offloading_group_commit,
-    fine_grained_offloading_group_start,
-    get_fine_grained_offloading_context,
+    FineGrainedActivationOffloadingInterface as off_interface,
 )
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.tensor_parallel.layers import ColumnParallelLinear
@@ -92,12 +90,12 @@ class MultiLatentAttention(Attention):
     def __init__(
         self,
         config: MLATransformerConfig,
-        submodules: Union[MLASelfAttentionSubmodules],
+        submodules: MLASelfAttentionSubmodules,
         layer_number: int,
         attn_mask_type: AttnMaskType,
         attention_type: str,
         cp_comm_type: Optional[str] = None,
-        pg_collection: ProcessGroupCollection = None,
+        pg_collection: Optional[ProcessGroupCollection] = None,
     ) -> None:
 
         super().__init__(
@@ -108,6 +106,7 @@ class MultiLatentAttention(Attention):
             attn_mask_type=attn_mask_type,
             pg_collection=pg_collection,
         )
+        self.config: MLATransformerConfig
 
         self.query_projection_size = self.config.v_head_dim * self.config.num_attention_heads
 
@@ -244,27 +243,17 @@ class MultiLatentAttention(Attention):
         # Get the query, key and value tensors based on the type of attention -
         # self or cross attn.
         # query: [96, 1, 16, 128], key:[96, 1, 16, 128], value:[96, 1, 16, 128]
-        if self.config.experimental_attention_variant is None:
-            query, key, value = self.get_query_key_value_tensors(
+        with off_interface(self.offload_qkv_linear, hidden_states, "qkv_linear") as hidden_states:
+            query, key, value, q_compressed, kv_compressed = self.get_query_key_value_tensors(
                 hidden_states,
                 key_value_states,
                 position_ids,
                 packed_seq_params,
                 inference_context=inference_context,
             )
-        elif self.config.experimental_attention_variant == "dsa":
-            query, key, value, q_compressed, _ = self.get_query_key_value_tensors(
-                hidden_states,
-                key_value_states,
-                position_ids,
-                packed_seq_params,
-                inference_context=inference_context,
-                return_compressed_tensors=True,
-            )
-        else:
-            raise ValueError(
-                f"Unsupported experimental attention variant: "
-                f"{self.config.experimental_attention_variant}"
+        if self.offload_qkv_linear:
+            query = off_interface.group_commit(
+                query, name="qkv_linear", forced_released_tensors=[hidden_states]
             )
 
         # ===================================================
@@ -292,39 +281,25 @@ class MultiLatentAttention(Attention):
                 query, key, value, attention_mask, packed_seq_params=packed_seq_params
             )
         else:
-            if self.offload_core_attention and self.training:
-                query = fine_grained_offloading_group_start(query, name="core_attn")
-
             if inference_context is None or inference_context.is_static_batching():
-                with get_fine_grained_offloading_context(self.offload_core_attention):
-                    if self.config.experimental_attention_variant is None:
-                        core_attn_out = self.core_attention(
-                            query,
-                            key,
-                            value,
-                            attention_mask,
-                            packed_seq_params=packed_seq_params,
-                            attn_mask_type=attn_mask_type,
-                        )
-                    elif self.config.experimental_attention_variant == "dsa":
-                        # For dsa we need to pass in the original hidden states and the compressed
-                        # query representation.
-                        core_attn_out = self.core_attention(
-                            query,
-                            key,
-                            value,
-                            x=hidden_states,
-                            qr=q_compressed,
-                            attention_mask=attention_mask,
-                            attn_mask_type=attn_mask_type,
-                            attention_bias=None,
-                            packed_seq_params=packed_seq_params,
-                        )
-                    else:
-                        raise ValueError(
-                            f"Unsupported attention variant: "
-                            f"{self.config.experimental_attention_variant}"
-                        )
+                extra_kwargs = {}
+                if self.config.experimental_attention_variant == "dsa":
+                    # For dsa we need to pass in the original hidden states and the compressed
+                    # query representation.
+                    extra_kwargs["x"] = hidden_states
+                    extra_kwargs["qr"] = q_compressed
+                with off_interface(
+                    self.offload_core_attention and self.training, query, "core_attn"
+                ) as query:
+                    core_attn_out = self.core_attention(
+                        query,
+                        key,
+                        value,
+                        attention_mask,
+                        packed_seq_params=packed_seq_params,
+                        attn_mask_type=attn_mask_type,
+                        **extra_kwargs,
+                    )
             elif self.cache_mla_latents:
                 # Dynamic batching attention kernel.
                 q, k, v = (query, key, value)
@@ -346,7 +321,7 @@ class MultiLatentAttention(Attention):
                 if not inference_context.is_decode_only():
                     core_attn_out = rearrange(core_attn_out, 's b h d -> s b (h d)')
             if self.offload_core_attention and self.training:
-                (core_attn_out,) = fine_grained_offloading_group_commit(
+                core_attn_out = off_interface.group_commit(
                     core_attn_out, name="core_attn", forced_released_tensors=[query, key, value]
                 )
 
@@ -374,13 +349,11 @@ class MultiLatentAttention(Attention):
         # =================
         # Output. [sq, b, h]
         # =================
-        if self.offload_attn_proj:
-            core_attn_out = fine_grained_offloading_group_start(core_attn_out, name="attn_proj")
-        with get_fine_grained_offloading_context(self.offload_attn_proj):
+        with off_interface(self.offload_attn_proj, core_attn_out, "attn_proj") as core_attn_out:
             output, bias = self.linear_proj(core_attn_out)
         if self.offload_attn_proj:
-            output, bias = fine_grained_offloading_group_commit(
-                output, bias, name="attn_proj", forced_released_tensors=[core_attn_out]
+            output = off_interface.group_commit(
+                output, name="attn_proj", forced_released_tensors=[core_attn_out]
             )
 
         return output, bias
@@ -400,7 +373,7 @@ class MLASelfAttention(MultiLatentAttention):
         layer_number: int,
         attn_mask_type=AttnMaskType.padding,
         cp_comm_type: Optional[str] = None,
-        pg_collection: ProcessGroupCollection = None,
+        pg_collection: Optional[ProcessGroupCollection] = None,
     ):
         if pg_collection is None:
             pg_collection = ProcessGroupCollection.use_mpu_process_groups()
@@ -545,7 +518,6 @@ class MLASelfAttention(MultiLatentAttention):
         inference_context=None,
         *,
         inference_params=None,
-        return_compressed_tensors=False,
     ):
         """
         Derives `query`, `key` and `value` tensors from `hidden_states`.
@@ -576,13 +548,11 @@ class MLASelfAttention(MultiLatentAttention):
         rotary_pos_sin = None
         packed_seq = packed_seq_params is not None and packed_seq_params.qkv_format == 'thd'
         if self.config.rope_type == "rope":
-            rotary_pos_emb = self.rotary_pos_emb(
-                rotary_seq_len, packed_seq_params=packed_seq_params
-            )
+            rotary_pos_emb = self.rotary_pos_emb(rotary_seq_len, packed_seq=packed_seq)
         else:
             if self.config.apply_rope_fusion:
                 rotary_pos_cos, rotary_pos_sin = self.rotary_pos_emb.get_cached_cos_sin(
-                    rotary_seq_len, dtype=hidden_states.dtype, packed_seq_params=packed_seq_params
+                    rotary_seq_len, dtype=hidden_states.dtype, packed_seq=packed_seq
                 )
                 rotary_pos_emb = None
                 assert inference_context is None, "Inference with MLA RoPE fusion is not supported"
@@ -591,9 +561,7 @@ class MLASelfAttention(MultiLatentAttention):
                     and fused_apply_mla_rope_for_kv is not None
                 ), "Fused MLA RoPE apply is not imported successfully"
             else:
-                rotary_pos_emb, mscale = self.rotary_pos_emb(
-                    rotary_seq_len, packed_seq_params=packed_seq_params
-                )
+                rotary_pos_emb, mscale = self.rotary_pos_emb(rotary_seq_len, packed_seq=packed_seq)
 
         if packed_seq_params is not None and packed_seq_params.qkv_format == 'thd':
             if packed_seq_params.cu_seqlens_q_padded is not None:
@@ -886,10 +854,7 @@ class MLASelfAttention(MultiLatentAttention):
                     q_compressed, kv_compressed, k_pos_emb, rotary_pos_emb
                 )
 
-        if return_compressed_tensors:
-            return query, key, value, q_compressed, kv_compressed
-        else:
-            return query, key, value
+        return query, key, value, q_compressed, kv_compressed
 
     def uncompress_kv_from_cache(self, kv_cached):
         """
