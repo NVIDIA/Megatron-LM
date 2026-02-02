@@ -146,8 +146,8 @@ class SFTDataset(MegatronDataset):
                 max_body = pack_length
                 pack_tokens = pack_tokens[:max_body]
                 pack_targets = pack_targets[:max_body]
-                pack_tokens.extend(pad)
-                pack_targets.extend(pad)
+                pack_tokens.append(pad)
+                pack_targets.append(pad)
                 pack_positions = pack_positions[:pack_length+1]
                 # Note len({pack_tokens, pack_targets, pack_positions}) should be pack_length + 1
                 cu_seqlens[-1] = len(pack_tokens) - 1
