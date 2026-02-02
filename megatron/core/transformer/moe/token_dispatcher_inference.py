@@ -17,8 +17,10 @@ from megatron.core.transformer.moe.token_dispatcher import (
 from megatron.core.transformer.transformer_config import TransformerConfig
 
 from megatron.core.tensor_parallel import gather_from_sequence_parallel_region
-from megatron.core.transformer.moe.moe_utils import permute
-from megatron.core.transformer.moe.inference_kernels import launch_moe_kernels, launch_extract_probs    
+from megatron.core.transformer.moe.inference_kernels import (
+    launch_fused_permute_and_probs,
+    launch_unpermute_kernel,
+)    
 
 import logging
 
@@ -126,47 +128,56 @@ class InferenceAllGatherTokenDispatcher(MoEAllGatherTokenDispatcher):
     def dispatch_postprocess(self, hidden_states, probs):
         """After gathering in token_dispatch, this method identifies tokens for local experts and
         permutes them for expert processing.
+
+        Optimized to use a fused kernel that:
+        1. Computes mask_T and dest_indices ONCE (instead of twice)
+        2. Permutes hidden states AND extracts probs in a single kernel launch
         """
         self.hidden_shape_before_permute = hidden_states.shape
 
-        # The routing map and probs that for local experts.
+        # The routing map and probs for local experts.
         self.local_map = self.routing_map[
             :, self.local_expert_indices[0] : self.local_expert_indices[-1] + 1
         ].contiguous()
-        # probs of global token assignment to local experts.
+        # Probs of global token assignment to local experts.
         self.local_probs = probs[
             :, self.local_expert_indices[0] : self.local_expert_indices[-1] + 1
         ].contiguous()
 
-        # Change 1: Keep tokens_per_expert on GPU for CUDA graph compatibility.
-        tokens_per_expert = self.local_map.sum(dim=0).long() #.cpu()
+        # Keep tokens_per_expert on GPU for CUDA graph compatibility.
+        tokens_per_expert = self.local_map.sum(dim=0).long()
+
+        # Pre-allocate workspaces
+        max_out = hidden_states.size(0) * min(self.topk, self.num_local_experts)
         tokens_workspace = torch.empty(
-            hidden_states.size(0) * min(self.topk, self.num_local_experts),
-            hidden_states.size(1),
+            max_out, hidden_states.size(1),
             dtype=hidden_states.dtype,
             device=hidden_states.device,
         )
-        launch_moe_kernels(hidden_states, self.local_map, tokens_workspace, unpermute=False)    
-        
         probs_workspace = torch.empty(
-            self.local_probs.size(0) * min(self.topk, self.num_local_experts),
-            1,
+            max_out,
             dtype=probs.dtype,
             device=probs.device,
         )
-        launch_extract_probs(self.local_probs, self.local_map, probs_workspace)
-        
-        permuted_local_hidden_states = tokens_workspace
-        permuted_local_probs = probs_workspace.squeeze(-1)
 
-        self.local_probs = permuted_local_probs 
+        # Fused kernel launch: permute hidden states + extract probs in one pass
+        # Also returns cached mask_T and dest_indices for reuse in unpermute
+        self._cached_mask_T, self._cached_dest_indices = launch_fused_permute_and_probs(
+            hidden_states, self.local_probs, self.local_map,
+            tokens_workspace, probs_workspace
+        )
+
+        self.local_probs = probs_workspace
         self.routing_map = None
-        return permuted_local_hidden_states, tokens_per_expert, self.local_probs
+        return tokens_workspace, tokens_per_expert, probs_workspace
 
     def combine_preprocess(self, permuted_expert_outputs):
         """
         Reverses token permutation to restore original ordering.
         Handles Top-K summation into original hidden state positions.
+
+        Uses cached mask_T and dest_indices from dispatch_postprocess to avoid
+        recomputing them (saves 2 kernel launches).
         """
         # 1. Pre-allocate static output buffer
         unpermuted_hidden = torch.zeros(
@@ -175,14 +186,14 @@ class InferenceAllGatherTokenDispatcher(MoEAllGatherTokenDispatcher):
             device=permuted_expert_outputs.device
         )
 
-        # 2. Launch the Un-permute kernel
+        # 2. Launch the Un-permute kernel with cached intermediates
         # It handles the Expert-grouped -> Token-major transition.
-        # We use the same self.local_map and self.local_probs we cached during dispatch.
-        launch_moe_kernels(
-            unpermuted_hidden,      # The [Tokens, Hidden] destination
-            self.local_map,         # The boolean mask [Tokens, Experts]
+        launch_unpermute_kernel(
+            unpermuted_hidden,       # The [Tokens, Hidden] destination
+            self.local_map,          # The boolean mask [Tokens, Experts]
             permuted_expert_outputs, # The [MAX_OUT, Hidden] source
-            unpermute=True
+            self._cached_mask_T,
+            self._cached_dest_indices,
         )
 
         return unpermuted_hidden

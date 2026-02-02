@@ -109,12 +109,18 @@ class InferenceMoELayer(MoELayer):
         self.is_cuda_graphed_iteration = set_to
 
     def activate_inference_token_dispatcher(self):
+        # replace the token dispatcher with the inference-optimized version
         self.old_token_dispatcher = self.token_dispatcher
-        self.old_expert_overlap = self.shared_expert_overlap
         self.token_dispatcher = self.inference_token_dispatcher
+
+        # disable shared expert overlap during inference as it is not 
+        # supported in InferenceAllGatherTokenDispatcher
+        self.old_expert_overlap = self.shared_expert_overlap
         self.shared_expert_overlap = False 
         
     def deactivate_inference_token_dispatcher(self):
+        # restore the original token dispatcher 
+        # and shared expert overlap setting
         self.token_dispatcher = self.old_token_dispatcher
         self.shared_expert_overlap = self.old_expert_overlap
         
