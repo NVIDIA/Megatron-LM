@@ -8,21 +8,16 @@ Run with torchrun:
 """
 
 import os
+
 import pytest
 import torch
 import torch.distributed as dist
-from torch.distributed._tensor import (
-    DeviceMesh,
-    DTensor,
-    Shard,
-    Replicate,
-    distribute_tensor,
-)
+from torch.distributed._tensor import DeviceMesh, DTensor, Replicate, Shard, distribute_tensor
 from torch.distributed.tensor.placement_types import _StridedShard
 
 from megatron.core.distributed.fsdp.src.megatron_fsdp.uneven_dtensor import (
-    uneven_dtensor_to_full_tensor,
     split_dtensor,
+    uneven_dtensor_to_full_tensor,
 )
 
 
@@ -33,11 +28,11 @@ def distributed_setup():
     # Check if running under torchrun
     if "RANK" not in os.environ or "WORLD_SIZE" not in os.environ:
         pytest.skip("Not running in distributed mode. Use torchrun to run this test.")
-    
+
     rank = int(os.environ["RANK"])
     world_size = int(os.environ["WORLD_SIZE"])
     local_rank = int(os.environ.get("LOCAL_RANK", rank))
-    
+
     # Determine device type and set CUDA device
     if torch.cuda.is_available():
         device_type = "cuda"
@@ -49,15 +44,11 @@ def distributed_setup():
         device_type = "cpu"
         device = torch.device("cpu")
         backend = "gloo"
-    
+
     # Initialize process group if not already initialized
     if not dist.is_initialized():
-        dist.init_process_group(
-            backend=backend,
-            rank=rank,
-            world_size=world_size,
-        )
-    
+        dist.init_process_group(backend=backend, rank=rank, world_size=world_size)
+
     yield {
         "rank": rank,
         "world_size": world_size,
@@ -65,13 +56,14 @@ def distributed_setup():
         "device_type": device_type,
         "device": device,
     }
-    
+
     # Cleanup
     if dist.is_initialized():
         dist.destroy_process_group()
 
 
 # ---------- Helper: distributed setup ----------
+
 
 @pytest.fixture(scope="module")
 def distributed_setup():
@@ -110,6 +102,7 @@ def distributed_setup():
 
 # ---------- Helper: broadcast-based global tensor creation ----------
 
+
 def make_global_randn(shape, dtype=torch.float32, device=torch.device("cpu")):
     """
     Create the same random tensor on all ranks by generating on rank 0
@@ -133,9 +126,9 @@ def make_global_arange(shape, dtype=torch.float32, device=torch.device("cpu")):
     """Same idea as make_global_randn, but deterministic arange."""
     rank = dist.get_rank()
     if rank == 0:
-        tensor = torch.arange(torch.prod(torch.tensor(shape)).item(),
-                              dtype=dtype,
-                              device=device).reshape(*shape)
+        tensor = torch.arange(
+            torch.prod(torch.tensor(shape)).item(), dtype=dtype, device=device
+        ).reshape(*shape)
     else:
         tensor = torch.empty(*shape, dtype=dtype, device=device)
     dist.broadcast(tensor, src=0)
@@ -147,6 +140,7 @@ def make_global_arange(shape, dtype=torch.float32, device=torch.device("cpu")):
 # ---------------------------------------------------------------------------
 # uneven_dtensor_to_full_tensor tests
 # ---------------------------------------------------------------------------
+
 
 @pytest.mark.distributed
 def test_basic_shard_gather(distributed_setup):
@@ -173,7 +167,6 @@ def test_replicated_dtensor(distributed_setup):
     dtensor = distribute_tensor(global_tensor, mesh, [Replicate()])
 
     gathered = uneven_dtensor_to_full_tensor(dtensor)
-    
 
     assert gathered.shape == global_tensor.shape
     assert torch.allclose(gathered, global_tensor)
@@ -192,24 +185,16 @@ def test_uneven_sharding_dim0(distributed_setup):
 
     shard = Shard(0)
     local_list, _ = shard._split_tensor(
-        global_tensor,
-        world_size,
-        with_padding=False,
-        contiguous=True,
+        global_tensor, world_size, with_padding=False, contiguous=True
     )
 
     local = local_list[setup["rank"]]
 
     dtensor = DTensor.from_local(
-        local,
-        mesh,
-        (Shard(0),),
-        shape=global_tensor.size(),
-        stride=global_tensor.stride(),
+        local, mesh, (Shard(0),), shape=global_tensor.size(), stride=global_tensor.stride()
     )
 
     gathered = uneven_dtensor_to_full_tensor(dtensor)
-    
 
     assert gathered.shape == global_tensor.shape
     assert torch.allclose(gathered, global_tensor)
@@ -227,23 +212,15 @@ def test_uneven_sharding_dim1(distributed_setup):
 
     shard = Shard(1)
     local_list, _ = shard._split_tensor(
-        global_tensor,
-        world_size,
-        with_padding=False,
-        contiguous=True,
+        global_tensor, world_size, with_padding=False, contiguous=True
     )
     local = local_list[setup["rank"]]
 
     dtensor = DTensor.from_local(
-        local,
-        mesh,
-        (Shard(1),),
-        shape=global_tensor.size(),
-        stride=global_tensor.stride(),
+        local, mesh, (Shard(1),), shape=global_tensor.size(), stride=global_tensor.stride()
     )
 
     gathered = uneven_dtensor_to_full_tensor(dtensor)
-    
 
     assert gathered.shape == global_tensor.shape
     assert torch.allclose(gathered, global_tensor)
@@ -269,7 +246,6 @@ def test_2d_mesh_shard_and_replicate(distributed_setup):
     dtensor = distribute_tensor(global_tensor, mesh, [Shard(0), Replicate()])
 
     gathered = uneven_dtensor_to_full_tensor(dtensor)
-    
 
     assert gathered.shape == global_tensor.shape
     assert torch.allclose(gathered, global_tensor, rtol=1e-5, atol=1e-5)
@@ -295,7 +271,6 @@ def test_multiple_sharded_dims_even(distributed_setup):
     dtensor = distribute_tensor(global_tensor, mesh, [Shard(0), Shard(1)])
 
     gathered = uneven_dtensor_to_full_tensor(dtensor)
-    
 
     assert gathered.shape == global_tensor.shape
     assert torch.allclose(gathered, global_tensor, rtol=1e-5, atol=1e-5)
@@ -327,33 +302,22 @@ def test_multiple_sharded_dims_uneven(distributed_setup):
     shard1 = Shard(1)
 
     list0, _ = shard0._split_tensor(
-        global_tensor,
-        mesh_shape[0],
-        with_padding=False,
-        contiguous=True,
+        global_tensor, mesh_shape[0], with_padding=False, contiguous=True
     )
     rank0 = setup["rank"] // mesh_shape[1]
     intermediate = list0[rank0]
 
     list1, _ = shard1._split_tensor(
-        intermediate,
-        mesh_shape[1],
-        with_padding=False,
-        contiguous=True,
+        intermediate, mesh_shape[1], with_padding=False, contiguous=True
     )
     rank1 = setup["rank"] % mesh_shape[1]
     local = list1[rank1]
 
     dtensor = DTensor.from_local(
-        local,
-        mesh,
-        (Shard(0), Shard(1)),
-        shape=global_tensor.size(),
-        stride=global_tensor.stride(),
+        local, mesh, (Shard(0), Shard(1)), shape=global_tensor.size(), stride=global_tensor.stride()
     )
 
     gathered = uneven_dtensor_to_full_tensor(dtensor)
-    
 
     assert gathered.shape == global_tensor.shape
     assert torch.allclose(gathered, global_tensor, rtol=1e-5, atol=1e-5)
@@ -379,7 +343,6 @@ def test_3d_tensor_two_shards(distributed_setup):
     dtensor = distribute_tensor(global_tensor, mesh, [Shard(0), Shard(2)])
 
     gathered = uneven_dtensor_to_full_tensor(dtensor)
-    
 
     assert gathered.shape == global_tensor.shape
     assert torch.allclose(gathered, global_tensor, rtol=1e-5, atol=1e-5)
@@ -396,7 +359,6 @@ def test_different_dtypes(distributed_setup):
         dtensor = distribute_tensor(global_tensor, mesh, [Shard(0)])
 
         gathered = uneven_dtensor_to_full_tensor(dtensor)
-        
 
         assert gathered.dtype == dtype
         assert torch.equal(gathered, global_tensor)
@@ -412,7 +374,6 @@ def test_large_tensor(distributed_setup):
     dtensor = distribute_tensor(global_tensor, mesh, [Shard(0)])
 
     gathered = uneven_dtensor_to_full_tensor(dtensor)
-    
 
     assert gathered.shape == global_tensor.shape
     assert torch.allclose(gathered, global_tensor, rtol=1e-5, atol=1e-5)
@@ -428,7 +389,6 @@ def test_3d_tensor_single_shard(distributed_setup):
     dtensor = distribute_tensor(global_tensor, mesh, [Shard(0)])
 
     gathered = uneven_dtensor_to_full_tensor(dtensor)
-    
 
     assert gathered.shape == global_tensor.shape
     assert torch.allclose(gathered, global_tensor)
@@ -484,10 +444,7 @@ def test_strided_shard_2d_mesh(distributed_setup):
     # Shard dim 0 over both mesh dims; one of them is encoded as _StridedShard.
     # Example pattern: [Shard(0), _StridedShard(0, split_factor=mesh_shape[0])]
     # so that combined, dim 0 is split across mesh_shape[0] * mesh_shape[1] ranks. [web:146]
-    placements = [
-        Shard(0),
-        _StridedShard(0, split_factor=mesh_shape[0]),
-    ]
+    placements = [Shard(0), _StridedShard(0, split_factor=mesh_shape[0])]
 
     dtensor = distribute_tensor(global_tensor, mesh, placements)
 
@@ -518,7 +475,9 @@ def test_wild_random_uneven_shards(distributed_setup):
 
     if rank == 0:
         # Random lengths per rank, allowing zero
-        lengths = torch.randint(low=0, high=max_local + 1, size=(world_size,), device=setup["device"])
+        lengths = torch.randint(
+            low=0, high=max_local + 1, size=(world_size,), device=setup["device"]
+        )
         # Ensure at least one element globally to avoid degenerate zero-sized tensor
         if lengths.sum().item() == 0:
             lengths[0] = 1
@@ -534,7 +493,9 @@ def test_wild_random_uneven_shards(distributed_setup):
     global_cols = total
 
     # Build a “reference” tensor on all ranks via broadcast from rank 0
-    ref_global = make_global_arange((rows, global_cols), dtype=torch.float32, device=setup["device"])
+    ref_global = make_global_arange(
+        (rows, global_cols), dtype=torch.float32, device=setup["device"]
+    )
 
     # Local slice for this rank is a contiguous segment in dim 1
     start = int(lengths[:rank].sum().item())
@@ -549,11 +510,7 @@ def test_wild_random_uneven_shards(distributed_setup):
 
     # Construct DTensor with explicit shape/stride; offsets handled by your metadata helper
     dtensor = DTensor.from_local(
-        local,
-        mesh,
-        (Shard(1),),
-        shape=(rows, global_cols),
-        stride=(global_cols, 1),
+        local, mesh, (Shard(1),), shape=(rows, global_cols), stride=(global_cols, 1)
     )
 
     gathered = uneven_dtensor_to_full_tensor(dtensor)
@@ -591,8 +548,12 @@ def test_wild_random_uneven_shards_multi_dim(distributed_setup):
 
     # Each mesh row gets its own random row-count; each mesh col gets its own random col-count
     if rank == 0:
-        row_chunks = torch.randint(low=0, high=base_rows + 2, size=(mesh_shape[0],), device=setup["device"])
-        col_chunks = torch.randint(low=0, high=base_cols + 3, size=(mesh_shape[1],), device=setup["device"])
+        row_chunks = torch.randint(
+            low=0, high=base_rows + 2, size=(mesh_shape[0],), device=setup["device"]
+        )
+        col_chunks = torch.randint(
+            low=0, high=base_cols + 3, size=(mesh_shape[1],), device=setup["device"]
+        )
         if row_chunks.sum().item() == 0:
             row_chunks[0] = 1
         if col_chunks.sum().item() == 0:
@@ -627,18 +588,10 @@ def test_wild_random_uneven_shards_multi_dim(distributed_setup):
     if row_len > 0 and col_len > 0:
         local = ref_global[row_start:row_end, col_start:col_end].clone()
     else:
-        local = torch.empty(
-            (row_len, col_len),
-            dtype=ref_global.dtype,
-            device=ref_global.device,
-        )
+        local = torch.empty((row_len, col_len), dtype=ref_global.dtype, device=ref_global.device)
 
     dtensor = DTensor.from_local(
-        local,
-        mesh,
-        (Shard(0), Shard(1)),
-        shape=(total_rows, total_cols),
-        stride=(total_cols, 1),
+        local, mesh, (Shard(0), Shard(1)), shape=(total_rows, total_cols), stride=(total_cols, 1)
     )
 
     gathered = uneven_dtensor_to_full_tensor(dtensor)
@@ -646,9 +599,11 @@ def test_wild_random_uneven_shards_multi_dim(distributed_setup):
     assert gathered.shape == ref_global.shape
     assert torch.allclose(gathered, ref_global, rtol=1e-5, atol=1e-5)
 
+
 # ---------------------------------------------------------------------------
 # split_dtensor tests
 # ---------------------------------------------------------------------------
+
 
 @pytest.mark.distributed
 def test_split_dtensor_even_shard_dim0(distributed_setup):
@@ -727,19 +682,12 @@ def test_split_dtensor_uneven_shard_with_metadata(distributed_setup):
 
     shard = Shard(0)
     local_list, _ = shard._split_tensor(
-        global_tensor,
-        world_size,
-        with_padding=False,
-        contiguous=True,
+        global_tensor, world_size, with_padding=False, contiguous=True
     )
     local = local_list[setup["rank"]]
 
     dt = DTensor.from_local(
-        local,
-        mesh,
-        (Shard(0),),
-        shape=global_tensor.size(),
-        stride=global_tensor.stride(),
+        local, mesh, (Shard(0),), shape=global_tensor.size(), stride=global_tensor.stride()
     )
 
     # Split into size 2 along dim 0
@@ -769,7 +717,9 @@ def test_split_dtensor_zero_local_shard(distributed_setup):
     # Similar style to your "wild random uneven" gather test.
     if rank == 0:
         # random but deterministic lengths
-        lengths = torch.tensor([0] + [4] * (world_size - 1), dtype=torch.int64, device=setup["device"])
+        lengths = torch.tensor(
+            [0] + [4] * (world_size - 1), dtype=torch.int64, device=setup["device"]
+        )
         if lengths.sum().item() == 0:
             lengths[0] = 1  # fallback
     else:
@@ -792,11 +742,7 @@ def test_split_dtensor_zero_local_shard(distributed_setup):
         local = torch.empty((rows, 0), dtype=global_tensor.dtype, device=global_tensor.device)
 
     dt = DTensor.from_local(
-        local,
-        mesh,
-        (Shard(1),),
-        shape=global_tensor.size(),
-        stride=global_tensor.stride(),
+        local, mesh, (Shard(1),), shape=global_tensor.size(), stride=global_tensor.stride()
     )
 
     # Split dim 1 into chunks of size 5
