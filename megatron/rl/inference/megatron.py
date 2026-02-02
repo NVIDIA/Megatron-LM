@@ -199,6 +199,7 @@ class MegatronLocal(InferenceServer, ReturnsTokens, ReturnsRaw):
 
     _client: InferenceClient = PrivateAttr(None)
     _inference_engine: DynamicInferenceEngine = PrivateAttr(None)
+    _rl_kv_cache_management_mode: str
 
     async def base_generate(self, request: InferenceRequest):
 
@@ -292,6 +293,7 @@ class MegatronLocal(InferenceServer, ReturnsTokens, ReturnsRaw):
         launched_server = cls(**kwargs)
         launched_server._client = client
         launched_server._inference_engine = inference_engine
+        launched_server._rl_kv_cache_management_mode = args.rl_kv_cache_management_mode
 
         return launched_server
 
@@ -312,10 +314,9 @@ class MegatronLocal(InferenceServer, ReturnsTokens, ReturnsRaw):
         Called before resume when using partial rollouts with KV cache removal,
         so the engine knows to recompute the KV cache for all in-flight requests.
         """
-        args = get_args()
-        if args.rl_partial_rollouts and args.rl_remove_kv_cache_during_training:
+        if self._rl_kv_cache_management_mode == "remove":
             for request_entry in self._inference_engine.requests.values():
-                request_entry.recompute_soon = True
+                request_entry.recompute_upon_suspend = True
 
     async def resume(self):
         self.mark_for_recompute()
