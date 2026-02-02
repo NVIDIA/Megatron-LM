@@ -657,114 +657,6 @@ class TestRLUtils:
             f"Expected GPU memory to increase after restore. "
             f"After offload: {memory_after_offload}, After restore: {memory_after_restore}"
         )
-
-    @pytest.mark.parametrize(
-        "initialize_model_parallel",
-        [
-            pytest.param((1, 1), id="tp1-pp1"),
-        ],
-        indirect=["initialize_model_parallel"],
-    )
-    def test_rl_training_cuda_graphs(self, initialize_model_parallel):
-        """Test that training CUDA graphs can be created and reused in subsequent forward passes.
-
-        This test verifies the --rl-training-cuda-graphs functionality by:
-        1. Creating a model with CUDA graphs enabled (cuda_graph_impl="local")
-        2. Running a forward pass to create and record CUDA graph runners
-        3. Marking cudagraphs as created (simulating what happens after warmup)
-        4. Running another forward pass to verify existing runners are found and reused
-        """
-        initialize_rng_tracker(use_te_rng_tracker=True, force_reset=True)
-        world_size, dp, tp, pp = initialize_model_parallel
-        self.create_test_args(
-            tensor_model_parallel_size=tp,
-            pipeline_model_parallel_size=pp,
-            rl_training_cuda_graphs=True,
-            cuda_graph_impl="local",
-        )
-        model_parallel_cuda_manual_seed(123)
-
-        # Reset global CUDA graph state
-        _CudagraphGlobalRecord.cudagraph_created = False
-        _CudagraphGlobalRecord.cudagraph_record = []
-        CudaGraphManager.global_mempool = None
-
-        # Create a GPTModel with CUDA graphs enabled
-        transformer_config = TransformerConfig(
-            num_layers=2,
-            hidden_size=64,
-            num_attention_heads=4,
-            use_cpu_initialization=True,
-            cuda_graph_impl="local",
-        )
-        gpt_model = GPTModel(
-            config=transformer_config,
-            transformer_layer_spec=get_gpt_layer_with_transformer_engine_spec(),
-            vocab_size=256,
-            max_sequence_length=32,
-        ).cuda()
-
-        # Create test inputs
-        batch_size = 2
-        seq_length = 16
-        tokens = torch.randint(0, 256, (batch_size, seq_length), dtype=torch.long).cuda()
-        position_ids = torch.arange(seq_length).unsqueeze(0).expand(batch_size, -1).cuda()
-
-        # First forward pass - this should create CUDA graph runners
-        with torch.no_grad():
-            output1 = gpt_model(
-                tokens,
-                position_ids,
-                attention_mask=None,
-            )
-
-        # Collect all CudaGraphManager instances and their runners
-        cudagraph_managers = []
-        for module in gpt_model.modules():
-            if hasattr(module, 'cudagraph_manager') and module.cudagraph_manager is not None:
-                cudagraph_managers.append(module.cudagraph_manager)
-
-        # Verify that CUDA graph runners were created
-        total_runners = sum(len(mgr.cudagraph_runners) for mgr in cudagraph_managers)
-        assert total_runners > 0, (
-            f"Expected CUDA graph runners to be created after first forward pass, "
-            f"but found {total_runners} runners across {len(cudagraph_managers)} managers"
-        )
-
-        # Record the number of runners before creating cudagraphs
-        runners_before = {id(mgr): len(mgr.cudagraph_runners) for mgr in cudagraph_managers}
-
-        # Create the CUDA graphs (this is normally called at the end of the first training step)
-        create_cudagraphs()
-
-        # Second forward pass - this should find and reuse existing runners
-        # If runners are not found, an assertion error would be raised
-        with torch.no_grad():
-            output2 = gpt_model(
-                tokens,
-                position_ids,
-                attention_mask=None,
-            )
-
-        # Verify that no new runners were created (reuse happened)
-        runners_after = {id(mgr): len(mgr.cudagraph_runners) for mgr in cudagraph_managers}
-        for mgr_id, count_before in runners_before.items():
-            count_after = runners_after[mgr_id]
-            assert count_after == count_before, (
-                f"Expected runner count to remain {count_before} after reuse, "
-                f"but got {count_after}. New runners should not be created when "
-                f"cudagraph_created=True."
-            )
-
-        # Verify outputs are valid tensors
-        assert output1 is not None, "First forward pass output should not be None"
-        assert output2 is not None, "Second forward pass output should not be None"
-
-        # Cleanup CUDA graph state
-        _CudagraphGlobalRecord.cudagraph_created = False
-        _CudagraphGlobalRecord.cudagraph_record = []
-        CudaGraphManager.global_mempool = None
-
     @pytest.mark.parametrize(
         "initialize_model_parallel",
         [
@@ -773,14 +665,16 @@ class TestRLUtils:
         indirect=["initialize_model_parallel"],
     )
     def test_get_logprobs_cuda_graphs(self, initialize_model_parallel):
-        """Test that get_logprobs reuses CUDA graphs for forward passes.
+        """Test that get_logprobs reuses CUDA graphs created during training forward pass.
 
-        This test verifies that rl_utils.get_logprobs works correctly with CUDA graphs by:
+        This test verifies that rl_utils.get_logprobs can reuse CUDA graphs by:
         1. Creating a GPTModel wrapped in Float16Module (required for get_logprobs)
-        2. Running a warmup forward pass via get_logprobs to record CUDA graph runners
+        2. Running a training-style forward pass to record CUDA graph runners
         3. Creating the CUDA graphs
-        4. Running get_logprobs again to verify graph replay works
+        4. Running get_logprobs to verify it reuses the same forward graph
         """
+        from megatron.rl.sequence_packing_utils import get_default_packed_seq_params
+
         initialize_rng_tracker(use_te_rng_tracker=True, force_reset=True)
         world_size, dp, tp, pp = initialize_model_parallel
         self.create_test_args(
@@ -823,10 +717,27 @@ class TestRLUtils:
         tokens = torch.randint(0, 256, (batch_size, seq_length), dtype=torch.long).cuda()
         position_ids = torch.arange(seq_length).unsqueeze(0).expand(batch_size, -1).cuda()
 
-        # First get_logprobs call - this should create CUDA graph runners
-        logprobs1 = rl_utils.get_logprobs(
-            wrapped_model, tokens, position_ids=position_ids, sequence_packing=True
+        # Create packed_seq_params to match what get_logprobs will use
+        packed_seq_params = get_default_packed_seq_params(
+            seq_length=seq_length,
+            max_sequences_per_bin=4,
+            device=tokens.device,
         )
+
+        # First forward pass via training path - this creates CUDA graph runners
+        output1 = wrapped_model(
+            tokens,
+            position_ids,
+            attention_mask=None,
+            packed_seq_params=packed_seq_params,
+            runtime_gather_output=True,
+            fp32_output=False,
+        )
+
+        # Run backward to reset runner status from BWD_READY back to FWD_READY
+        # This is needed because get_logprobs runs in no_grad mode and expects FWD_READY
+        loss = output1.sum()
+        loss.backward()
 
         # Collect all CudaGraphManager instances and their runners
         cudagraph_managers = []
@@ -834,24 +745,60 @@ class TestRLUtils:
             if hasattr(module, 'cudagraph_manager') and module.cudagraph_manager is not None:
                 cudagraph_managers.append(module.cudagraph_manager)
 
-        # Verify that CUDA graph runners were created
-        total_runners = sum(len(mgr.cudagraph_runners) for mgr in cudagraph_managers)
+        # Verify that cudagraph_managers were found on the model
+        assert len(cudagraph_managers) > 0, (
+            f"No cudagraph_managers found on model. Check that cuda_graph_impl='local' "
+            f"is properly configured in TransformerConfig."
+        )
+
+        # Record runner count before creating graphs
+        runners_before = {id(mgr): len(mgr.cudagraph_runners) for mgr in cudagraph_managers}
+
+        # Verify runners were created during forward pass
+        total_runners_before = sum(len(mgr.cudagraph_runners) for mgr in cudagraph_managers)
+        assert total_runners_before > 0, (
+            f"No CUDA graph runners created during forward pass. "
+            f"Found {len(cudagraph_managers)} managers but 0 runners. "
+            f"Check that _should_call_local_cudagraph returns True."
+        )
+
+        # Create the CUDA graphs (simulates end of warmup step)
+        create_cudagraphs()
+
+        # Verify that each runner has a fwd_graph successfully created
+        total_runners = 0
+        for mgr in cudagraph_managers:
+            for runner in mgr.cudagraph_runners:
+                total_runners += 1
+                assert runner.fwd_graph is not None, (
+                    f"Expected runner to have fwd_graph created after create_cudagraphs(), "
+                    f"but fwd_graph is None"
+                )
+                print("ADDING FWD GRAPH")
         assert total_runners > 0, (
-            f"Expected CUDA graph runners to be created after first get_logprobs call, "
+            f"Expected CUDA graph runners with fwd_graph after create_cudagraphs(), "
             f"but found {total_runners} runners across {len(cudagraph_managers)} managers"
         )
 
-        # Create the CUDA graphs
-        create_cudagraphs()
-
-        # Second get_logprobs call - this should reuse existing CUDA graphs
-        logprobs2 = rl_utils.get_logprobs(
-            wrapped_model, tokens, position_ids=position_ids, sequence_packing=True
+        # Now call get_logprobs - this should reuse the existing CUDA graphs
+        # Pass the same packed_seq_params to ensure CUDA graph signature matches
+        logprobs = rl_utils.get_logprobs(
+            wrapped_model, tokens, position_ids=position_ids,
+            sequence_packing=True, packed_seq_params=packed_seq_params
         )
 
+        # Verify that no new runners were created (graph was reused)
+        runners_after = {id(mgr): len(mgr.cudagraph_runners) for mgr in cudagraph_managers}
+        for mgr_id, count_before in runners_before.items():
+            count_after = runners_after[mgr_id]
+            assert count_after == count_before, (
+                f"Expected runner count to remain {count_before} after get_logprobs, "
+                f"but got {count_after}. get_logprobs should reuse training CUDA graphs."
+            )
+
         # Verify outputs are valid
-        assert logprobs1 is not None, "First get_logprobs should return valid output"
-        assert logprobs2 is not None, "Second get_logprobs should return valid output"
+        assert output1 is not None, "Training forward pass should return valid output"
+        assert logprobs is not None, "get_logprobs should return valid output"
 
         # Cleanup CUDA graph state
         _CudagraphGlobalRecord.cudagraph_created = False
