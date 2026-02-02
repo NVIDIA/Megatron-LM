@@ -59,15 +59,6 @@ class TransformerConfig(ModelParallelConfig):
     which serves as an additional training objective.
     """
 
-    mtp_use_repeated_layer: bool = False
-    """Use a single MTP layer repeatedly instead of multiple separate layers."""
-
-    mtp_hybrid_override_pattern: Optional[str] = None
-    """DEPRECATED: Use unified hybrid_override_pattern instead.
-    Legacy argument for loading old checkpoints.
-    Force a specific hybrid layer pattern for MTP layers.
-    """
-
     num_layers_in_first_pipeline_stage: Optional[int] = None
     """Number of transformer layers on first pipeline stage.
     None implies equal layer division across PP ranks."""
