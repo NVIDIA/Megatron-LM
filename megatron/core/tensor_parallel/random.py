@@ -7,14 +7,14 @@ from __future__ import annotations
 import contextlib
 import logging
 from collections.abc import Callable
-from typing import Any, Optional, TypeVar, TypeVarTuple, Union
+from typing import Any, Optional, TypeVar, Union
 
 import torch
 from torch import _C
 from torch.cuda import _lazy_call, _lazy_init
 from torch.cuda import device as device_ctx_manager
 from torch.utils.checkpoint import detach_variable
-from typing_extensions import Unpack
+from typing_extensions import TypeVarTuple, Unpack
 
 from megatron.core.parallel_state import (
     get_expert_model_parallel_rank,
