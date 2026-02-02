@@ -1,3 +1,4 @@
+# Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
 """
 Unit tests for Megatron-FSDP uneven_dtensor functions.
 
