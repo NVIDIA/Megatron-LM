@@ -6,8 +6,6 @@ import struct
 
 import torch.distributed as dist
 
-from megatron.core import parallel_state
-
 try:
     import zmq
 
@@ -39,6 +37,8 @@ class AsyncZMQCommunicator:
         self.rank = dist.get_rank(process_group)
         self.world_size = dist.get_world_size(process_group)
         self.is_leader = self.rank == 0
+        # Get the global rank of the leader (first rank in the process group)
+        src_rank = dist.get_process_group_ranks(process_group)[0]
 
         if self.is_leader:
             local_ip = socket.gethostname()
@@ -52,18 +52,12 @@ class AsyncZMQCommunicator:
 
             # Share the socket addresses with all peers
             dist.broadcast_object_list(
-                [gather_socket_addr, bcast_socket_addr],
-                src=parallel_state.get_expert_model_parallel_src_rank(),
-                group=process_group,
+                [gather_socket_addr, bcast_socket_addr], src=src_rank, group=process_group
             )
 
         else:
             bcast_output = [None, None]
-            dist.broadcast_object_list(
-                bcast_output,
-                src=parallel_state.get_expert_model_parallel_src_rank(),
-                group=process_group,
-            )
+            dist.broadcast_object_list(bcast_output, src=src_rank, group=process_group)
             gather_socket_addr, bcast_socket_addr = bcast_output
             self.gather_sock = zmq_context.socket(zmq.PUSH)
             self.gather_sock.connect(gather_socket_addr)
