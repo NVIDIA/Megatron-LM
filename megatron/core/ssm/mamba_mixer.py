@@ -24,6 +24,9 @@ from megatron.core.inference.contexts.attention_context.triton.tensor_ops import
     tensor_masked_update,
     tensor_merge,
 )
+from megatron.core.pipeline_parallel.fine_grained_activation_offload import (
+    FineGrainedActivationOffloadingInterface as off_interface,
+)
 from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.tensor_parallel import get_cuda_rng_tracker
@@ -397,6 +400,17 @@ class MambaMixer(MegatronModule):
         )
         self.tp_group = pg_collection.tp
 
+        self.offload_in_proj = (
+            self.config.fine_grained_activation_offloading
+            and "mamba_in_proj" in self.config.offload_modules
+        )
+
+        self.offload_out_proj = (
+            self.config.fine_grained_activation_offloading
+            and "mamba_out_proj" in self.config.offload_modules
+        )
+
+
     def forward(
         self,
         hidden_states,
@@ -429,7 +443,13 @@ class MambaMixer(MegatronModule):
                     out, out_bias = self._decode(hidden_states, conv_state, ssm_state)
                     return out, out_bias
 
-        zxBCdt, _ = self.in_proj(hidden_states)
+        with off_interface(self.offload_in_proj, hidden_states, "mamba_in_proj") as hidden_states:
+            zxBCdt, _ = self.in_proj(hidden_states)
+
+        if self.offload_in_proj:
+            zxBCdt = off_interface.group_commit(
+                zxBCdt, name="mamba_in_proj", forced_released_tensors=[]
+            )
 
         zxBCdt = self.cp.pre_conv_ssm(zxBCdt, packed_seq_params)
 
@@ -444,7 +464,14 @@ class MambaMixer(MegatronModule):
             assert ssm_state is None
             y = self._ssm_training(zxBCdt, packed_seq_params)
 
-        out, out_bias = self.out_proj(y)
+
+        with off_interface(self.offload_out_proj, y, "mamba_out_proj") as y:
+            out, out_bias = self.out_proj(y)
+
+        if self.offload_out_proj:
+            out = off_interface.group_commit(
+                out, name="mamba_out_proj", forced_released_tensors=[]
+            )
 
         return out, out_bias
 

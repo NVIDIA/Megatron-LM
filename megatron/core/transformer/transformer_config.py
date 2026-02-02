@@ -1278,6 +1278,8 @@ class TransformerConfig(ModelParallelConfig):
                 "attn_norm",
                 "mlp_norm",
                 "qkv_linear",
+                "mamba_in_proj",
+                "mamba_out_proj",
             }
             invalid_modules = set(self.offload_modules) - allowed_modules
             assert not invalid_modules, (

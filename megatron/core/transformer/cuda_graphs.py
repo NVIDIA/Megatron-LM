@@ -384,6 +384,12 @@ class _CudagraphGlobalRecord:
                     [isinstance(m, TransformerEngineBaseModule) for m in base_module.modules()]
                 )
 
+        # Graph captures requires offloading to be from a blank state.
+        from megatron.core.pipeline_parallel.fine_grained_activation_offload import (
+            FineGrainedActivationOffloadingInterface as off_interface,
+        )
+        off_interface.reset()
+
         progress_bar = enumerate(cls.cudagraph_record)
         time_start = time.time()
         mem_stats_start = torch.cuda.memory_stats()
@@ -478,6 +484,9 @@ class _CudagraphGlobalRecord:
         # Reset global record.
         cls.cudagraph_created = True
         cls.cudagraph_record = []
+
+        # Reset offloading data structures, which may have been advanced during capture
+        off_interface.reset()
 
         # Finished capturing.
         _set_capture_end()
@@ -1003,7 +1012,7 @@ class _CudaGraphRunner(torch.nn.Module):
                     )
                     # Record completion event inside the graph so the current stream can
                     # proceed as soon as module compute finishes, before async comms are joined.
-                    if self.fwd_completion_event is not None:
+                    if self.stream is not None:
                         self.fwd_completion_event.record()
                     join_external_streams()
 
@@ -1126,7 +1135,7 @@ class _CudaGraphRunner(torch.nn.Module):
                 allow_unused=True,
             )
 
-            if self.bwd_completion_event is not None:
+            if self.stream is not None:
                 self.bwd_completion_event.record()
             join_external_streams()
 
