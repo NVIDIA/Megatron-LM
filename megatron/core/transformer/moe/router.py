@@ -29,10 +29,7 @@ class Router(ABC, MegatronModule):
     """Base Router class"""
 
     def __init__(
-        self,
-        config: TransformerConfig,
-        pg_collection: Optional[ProcessGroupCollection] = None,
-        is_mtp_layer: bool = False,
+        self, config: TransformerConfig, pg_collection: Optional[ProcessGroupCollection] = None
     ) -> None:
         """
         Initialize the Router module.
@@ -40,14 +37,12 @@ class Router(ABC, MegatronModule):
         Args:
             config (TransformerConfig): Configuration object for the Transformer model.
             pg_collection (ProcessGroupCollection, optional): Process groups for MoE operations.
-            is_mtp_layer (bool): Flag indicating if this router is part of an MTP layer.
         """
         super().__init__(config)
         self.config = config
         self.num_experts = self.config.num_moe_experts
         self.moe_aux_loss_func = None
         self.layer_number = None
-        self.is_mtp_layer = is_mtp_layer
         self.tp_group = pg_collection.tp
         self.cp_group = pg_collection.cp
         self.tp_cp_group = pg_collection.tp_cp
@@ -150,19 +145,15 @@ class TopKRouter(Router):
     """
 
     def __init__(
-        self,
-        config: TransformerConfig,
-        pg_collection: Optional[ProcessGroupCollection] = None,
-        is_mtp_layer: bool = False,
+        self, config: TransformerConfig, pg_collection: Optional[ProcessGroupCollection] = None
     ) -> None:
         """Initialize the zero token dropping router.
 
         Args:
             config (TransformerConfig): The configuration for the transformer model.
             pg_collection (ProcessGroupCollection, optional): Process groups for MoE operations.
-            is_mtp_layer (bool): Flag indicating if this router is part of an MTP layer.
         """
-        super().__init__(config=config, pg_collection=pg_collection, is_mtp_layer=is_mtp_layer)
+        super().__init__(config=config, pg_collection=pg_collection)
         self.topk = self.config.moe_router_topk
         self.routing_type = self.config.moe_router_load_balancing_type
         self.score_function = self.config.moe_router_score_function
@@ -447,16 +438,6 @@ class TopKRouter(Router):
                 padding tokens. Can be a Python int or a torch.Tensor (typically 0-d tensor).
                 If None, uses activation.shape[0]. Defaults to None.
         """
-        # When using repeated MTP layers, the loss is counted "mtp_num_layers" times.
-        # To avoid accumulating the load balancing loss multiple times, we scale it by
-        # 1/mtp_num_layers so the total loss is correct.
-        if (
-            self.is_mtp_layer
-            and self.config.mtp_use_repeated_layer
-            and self.config.mtp_num_layers is not None
-        ):
-            aux_loss = aux_loss / self.config.mtp_num_layers
-
         # TODO (zijiey): fix the per_layer_logging for MTP, currently it will incorrectly
         # add the aux loss logging value to other layer's since it is difficult to get the
         # correct layer_number for MTP. It does not affect the correctness of the calculation
@@ -464,16 +445,10 @@ class TopKRouter(Router):
         num_layers = self.config.num_layers
         if self.config.mtp_num_layers is not None:
             num_layers += self.config.mtp_num_layers
-
-        if self.is_mtp_layer:
-            layer_number = self.layer_number + self.config.num_layers
-        else:
-            layer_number = self.layer_number
-
         save_to_aux_losses_tracker(
             aux_loss_name,
             aux_loss / aux_loss_coeff,
-            layer_number,
+            self.layer_number,
             num_layers,
             reduce_group=reduce_group,
             reduce_group_has_dp=reduce_group_has_dp,
@@ -524,27 +499,11 @@ class TopKRouter(Router):
             else:
                 logits = MoEAuxLossAutoScaler.apply(logits, z_loss)
 
-            # When using repeated MTP layers, the same MTP layer is called mtp_num_layers times.
-            # To avoid accumulating the z_loss multiple times, we scale it by 1/mtp_num_layers
-            # so the total loss is correct.
-            if (
-                self.is_mtp_layer
-                and self.config.mtp_use_repeated_layer
-                and self.config.mtp_num_layers is not None
-            ):
-                z_loss = z_loss / self.config.mtp_num_layers
-
             num_layers = self.config.num_layers
             if self.config.mtp_num_layers is not None:
                 num_layers += self.config.mtp_num_layers
-
-            if self.is_mtp_layer:
-                layer_number = self.layer_number + self.config.num_layers
-            else:
-                layer_number = self.layer_number
-
             save_to_aux_losses_tracker(
-                "z_loss", z_loss / moe_z_loss_coeff, layer_number, num_layers
+                "z_loss", z_loss / moe_z_loss_coeff, self.layer_number, num_layers
             )
         return logits
 
