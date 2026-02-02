@@ -20,8 +20,7 @@ def get_open_retrieval_wiki_dataset():
     dataset = OpenRetrievalEvidenceDataset('2018 Wikipedia from DPR codebase',
                                            'evidence',
                                            args.evidence_data_path,
-                                           tokenizer,
-                                           args.retriever_seq_length)
+                                           tokenizer)
     return dataset
 
 

@@ -181,9 +181,6 @@ def convert_split_vector_to_split_matrix(
 
     [0.99, 0.01, 0.0] -> [(0, 0.99), (0.99, 1.0), None]
 
-    Ex. a conversion for Retro when Retro pretraining uses a [0.99, 0.01, 0.0] split and Retro
-    preprocessing used a [0.98, 0.02, 0.0] split:
-
     [0.99, 0.01, 0.0], [0.98, 0.02, 0.0] -> [(0, 0.98), (0.99, 1.0), None]
 
     Args:
