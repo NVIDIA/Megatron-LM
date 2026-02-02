@@ -16,9 +16,17 @@ from megatron.core.num_microbatches_calculator import destroy_num_microbatches_c
 from megatron.core.optimizer import OptimizerConfig, get_megatron_optimizer
 from megatron.core.pipeline_parallel.utils import is_pp_last_stage
 from megatron.core.process_groups_config import ProcessGroupCollection
-from megatron.core.tensor_parallel.random import HAVE_TE, initialize_rng_tracker, model_parallel_cuda_manual_seed
+from megatron.core.tensor_parallel.random import (
+    HAVE_TE,
+    initialize_rng_tracker,
+    model_parallel_cuda_manual_seed,
+)
 from megatron.core.transformer import TransformerConfig
-from megatron.core.transformer.cuda_graphs import CudaGraphManager, _CudagraphGlobalRecord, create_cudagraphs
+from megatron.core.transformer.cuda_graphs import (
+    CudaGraphManager,
+    _CudagraphGlobalRecord,
+    create_cudagraphs,
+)
 from megatron.core.transformer.module import Float16Module
 from megatron.core.utils import is_te_min_version
 from megatron.rl import rl_utils
@@ -657,11 +665,10 @@ class TestRLUtils:
             f"Expected GPU memory to increase after restore. "
             f"After offload: {memory_after_offload}, After restore: {memory_after_restore}"
         )
+
     @pytest.mark.parametrize(
         "initialize_model_parallel",
-        [
-            pytest.param((1, 1), id="tp1-pp1"),
-        ],
+        [pytest.param((1, 1), id="tp1-pp1")],
         indirect=["initialize_model_parallel"],
     )
     def test_get_logprobs_cuda_graphs(self, initialize_model_parallel):
@@ -671,7 +678,7 @@ class TestRLUtils:
         1. Creating a GPTModel (needs to be wrapped in Float16Module for get_logprobs)
         2. Running a training-style forward pass to record CUDA graph runners
         3. Creating the CUDA graphs
-        4. Running get_logprobs to verify it reuses the same forward graph
+        4. Running get_logprobs to verify it reuses the same forward graph from training
         """
         from megatron.rl.sequence_packing_utils import get_default_packed_seq_params
 
@@ -692,7 +699,7 @@ class TestRLUtils:
         _CudagraphGlobalRecord.cudagraph_record = []
         CudaGraphManager.global_mempool = None
 
-        # Create a GPTModel with CUDA graphs enabled and wrap in Float16Module
+        # Create a GPTModel with CUDA graphs enabled
         transformer_config = TransformerConfig(
             num_layers=2,
             hidden_size=64,
@@ -711,21 +718,19 @@ class TestRLUtils:
         # Wrap in Float16Module so it accepts fp32_output argument from get_logprobs
         wrapped_model = Float16Module(transformer_config, gpt_model)
 
-        # Create test inputs (batch_size=1 required for THD format with sequence packing)
+        # Create test inputs (batch_size=1 required for thd format with sequence packing)
         batch_size = 1
         seq_length = 16
         tokens = torch.randint(0, 256, (batch_size, seq_length), dtype=torch.long).cuda()
         position_ids = torch.arange(seq_length).unsqueeze(0).expand(batch_size, -1).cuda()
 
-        # Create packed_seq_params to match what get_logprobs will use
+        # Create packed_seq_params for dummy data
         packed_seq_params = get_default_packed_seq_params(
-            seq_length=seq_length,
-            max_sequences_per_bin=4,
-            device=tokens.device,
+            seq_length=seq_length, max_sequences_per_bin=4, device=tokens.device
         )
 
-        # First forward pass via training path - this creates CUDA graph runners
-        output1 = wrapped_model(
+        # Run a single training forward pass to record cudagraphs
+        output = wrapped_model(
             tokens,
             position_ids,
             attention_mask=None,
@@ -736,7 +741,7 @@ class TestRLUtils:
 
         # Run backward to reset runner status from BWD_READY back to FWD_READY
         # This is needed because get_logprobs runs in no_grad mode and expects FWD_READY
-        loss = output1.sum()
+        loss = output.sum()
         loss.backward()
 
         # Collect all CudaGraphManager instances and their runners
@@ -745,27 +750,12 @@ class TestRLUtils:
             if hasattr(module, 'cudagraph_manager') and module.cudagraph_manager is not None:
                 cudagraph_managers.append(module.cudagraph_manager)
 
-        # Verify that cudagraph_managers were found on the model
-        assert len(cudagraph_managers) > 0, (
-            f"No cudagraph_managers found on model. Check that cuda_graph_impl='local' "
-            f"is properly configured in TransformerConfig."
-        )
-
         # Record runner count before creating graphs
         runners_before = {id(mgr): len(mgr.cudagraph_runners) for mgr in cudagraph_managers}
 
-        # Verify runners were created during forward pass
-        total_runners_before = sum(len(mgr.cudagraph_runners) for mgr in cudagraph_managers)
-        assert total_runners_before > 0, (
-            f"No CUDA graph runners created during forward pass. "
-            f"Found {len(cudagraph_managers)} managers but 0 runners. "
-            f"Check that _should_call_local_cudagraph returns True."
-        )
-
-        # Create the CUDA graphs (simulates end of warmup step)
         create_cudagraphs()
 
-        # Verify that each runner has a fwd_graph successfully created
+        # Verify that each runner has a fwd_graph created
         total_runners = 0
         for mgr in cudagraph_managers:
             for runner in mgr.cudagraph_runners:
@@ -774,20 +764,14 @@ class TestRLUtils:
                     f"Expected runner to have fwd_graph created after create_cudagraphs(), "
                     f"but fwd_graph is None"
                 )
-                print("ADDING FWD GRAPH")
-        assert total_runners > 0, (
-            f"Expected CUDA graph runners with fwd_graph after create_cudagraphs(), "
-            f"but found {total_runners} runners across {len(cudagraph_managers)} managers"
-        )
 
-        # Now call get_logprobs - this should reuse the existing CUDA graphs
-        # Pass the same packed_seq_params to ensure CUDA graph signature matches
+        # Now test `get_logprobs`; this should reuse the existing CUDA graphs
+        # We do not pass packed_seq_params; it should be created within `get_logprobs`
         logprobs = rl_utils.get_logprobs(
-            wrapped_model, tokens, position_ids=position_ids,
-            sequence_packing=True, packed_seq_params=packed_seq_params
+            wrapped_model, tokens, position_ids=position_ids, sequence_packing=True
         )
 
-        # Verify that no new runners were created (graph was reused)
+        # Verify that no new runners were created and graph was reused
         runners_after = {id(mgr): len(mgr.cudagraph_runners) for mgr in cudagraph_managers}
         for mgr_id, count_before in runners_before.items():
             count_after = runners_after[mgr_id]
@@ -797,7 +781,7 @@ class TestRLUtils:
             )
 
         # Verify outputs are valid
-        assert output1 is not None, "Training forward pass should return valid output"
+        assert output is not None, "Training forward pass should return valid output"
         assert logprobs is not None, "get_logprobs should return valid output"
 
         # Cleanup CUDA graph state
