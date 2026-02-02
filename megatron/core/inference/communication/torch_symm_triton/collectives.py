@@ -32,6 +32,7 @@ def _multimem_all_gather_kernel(
     multicast_ptr,
     signal_pad_ptrs,
     numel,
+    byte_offset,
     BLOCK_SIZE: tl.constexpr,
     NUMEL_PER_THREAD: tl.constexpr,
     RANK: tl.constexpr,
@@ -39,6 +40,9 @@ def _multimem_all_gather_kernel(
 ):
     """
     Triton kernel to perform multicast all-gather over nvlink using multimem instructions.
+
+    Args:
+        byte_offset: Byte offset into the multicast buffer where this tensor starts.
     """
     # an all-gather is simply a multicast store operation
     # we only need a barrier at the end to ensure visibility of writes
@@ -56,10 +60,12 @@ def _multimem_all_gather_kernel(
         mask = offsets < numel_per_rank
 
         # Each pointer points to a 128-bit bit pack
+        # byte_offset // 8 -> converts byte offset to uint64 offset
         # RANK * numel_per_rank -> brings us to the start of our rank's segment
         # offsets -> brings us to the right offset within our rank's segment
+        # * 2 -> each 128-bit pack is 2 uint64s
         multicast_ptrs = (
-            multicast_ptr.to(tl.pointer_type(tl.uint64)) + (RANK * numel_per_rank + offsets) * 2
+            multicast_ptr.to(tl.pointer_type(tl.uint64)) + byte_offset // 8 + (RANK * numel_per_rank + offsets) * 2
         )
         local_ptrs = local_ptr.to(tl.pointer_type(tl.uint64)) + offsets * 2
         (x, y, z, w) = ld_128(local_ptrs, mask=mask, multicast_op=False)
@@ -82,6 +88,7 @@ def multimem_all_gather(
     output_tensor: torch.Tensor,
     input_tensor: torch.Tensor,
     symm_mem_hdl: _SymmetricMemory,
+    byte_offset: int = 0,
     **kwargs,
 ) -> torch.Tensor:
     """
@@ -92,6 +99,7 @@ def multimem_all_gather(
         output_tensor: torch.Tensor - output tensor to be all-gathered into
         input_tensor: torch.Tensor - input tensor to be all-gathered from
         symm_mem_hdl: _SymmetricMemory - handle to the symmetric memory buffer for output_tensor
+        byte_offset: int - byte offset into the multicast buffer where output_tensor starts
     Returns:
         torch.Tensor - all-gathered tensor, which is output_tensor
     """
@@ -102,8 +110,8 @@ def multimem_all_gather(
         "num_warps": kwargs.get("num_warps", 32),
         "BLOCK_SIZE": kwargs.get("BLOCK_SIZE", 1024),
     }
-    assert input_tensor.dtype == torch.bfloat16, "Only bfloat16 is supported for now."
-    assert output_tensor.dtype == torch.bfloat16, "Only bfloat16 is supported for now."
+    # assert input_tensor.dtype == torch.bfloat16, "Only bfloat16 is supported for now."
+    # assert output_tensor.dtype == torch.bfloat16, "Only bfloat16 is supported for now."
     numel_per_thread = 128 // (input_tensor.element_size() * 8)
 
     assert (
@@ -118,6 +126,7 @@ def multimem_all_gather(
         symm_mem_hdl.multicast_ptr,
         symm_mem_hdl.signal_pad_ptrs_dev,
         numel=output_tensor.numel(),
+        byte_offset=byte_offset,
         BLOCK_SIZE=config["BLOCK_SIZE"],
         NUMEL_PER_THREAD=numel_per_thread,
         RANK=symm_mem_hdl.rank,
