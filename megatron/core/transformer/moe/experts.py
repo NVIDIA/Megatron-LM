@@ -932,7 +932,9 @@ class InferenceGroupedMLP(TEGroupedMLP):
             Tuple of (output, None) for interface compatibility
         """
         permuted_probs = permuted_probs.unsqueeze(-1)
-        assert tokens_per_expert.is_cuda, "tokens_per_expert must be on GPU"
+        #assert tokens_per_expert.is_cuda, "tokens_per_expert must be on GPU"
+        if not tokens_per_expert.is_cuda:
+            tokens_per_expert = tokens_per_expert.to('cuda')
 
         if self.config.moe_apply_probs_on_input:
             assert (

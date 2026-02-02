@@ -50,9 +50,7 @@ from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.transformer.moe.moe_layer import MoELayer, MoESubmodules
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.transformer.moe.moe_utils import get_default_pg_collection
-from megatron.core.transformer.moe.experts import InferenceGroupedMLP
-
-from .token_dispatcher_inference import InferenceAlltoAllTokenDispatcher
+from megatron.core.transformer.moe.token_dispatcher_inference import InferenceAllGatherTokenDispatcher
 
 import logging
 
@@ -92,113 +90,53 @@ class InferenceMoELayer(MoELayer):
             pg_collection=pg_collection,
         )
         
-        self.token_dispatcher = InferenceAlltoAllTokenDispatcher(
-            self.num_local_experts,
-            self.local_expert_indices,
-            config=self.config,
-            pg_collection=pg_collection,
-        )
-
         # Validate dispatcher type
+        # todo: move this assert to arguments.py or transformer_config.py
         if config.moe_token_dispatcher_type != "alltoall":
             raise ValueError(
                 f"InferenceMoELayer only supports 'alltoall' dispatcher, "
                 f"got '{config.moe_token_dispatcher_type}'"
             )
         
-        # Cache frequently used values
-        self.hidden_size = config.hidden_size
-        self.topk = config.moe_router_topk
-        
-        # Get process group info from token_dispatcher
-        self.ep_size = self.token_dispatcher.ep_size
-        self.ep_rank = utils.get_pg_rank(self.token_dispatcher.ep_group)
-        self.tp_size = self.token_dispatcher.tp_size
-        self.tp_rank = self.token_dispatcher.tp_rank
-        
-        # Precompute sort indices for multi-expert case
-        if self.num_local_experts > 1:
-            input_chunk_idxs = torch.arange(
-                self.config.num_moe_experts * self.tp_size, device="cuda"
-            )
-            self.sort_input_by_local_experts = input_chunk_idxs.reshape(
-                -1, self.num_local_experts
-            ).T.ravel()
-            self.restore_output_by_local_experts = input_chunk_idxs.reshape(
-                self.num_local_experts, -1
-            ).T.ravel()
-
         self.is_cuda_graphed_iteration = False
-
+        self.inference_token_dispatcher = InferenceAllGatherTokenDispatcher( 
+                                                                            self.num_local_experts,
+                                                                            self.local_expert_indices,
+                                                                            config=self.config,
+                                                                            pg_collection=pg_collection,
+                                                                        )  
     def set_is_cuda_graphed_iteration(self, set_to):
         self.is_cuda_graphed_iteration = set_to
-        logging.info("set is cuda graphed iteration to %s", set_to)
-        exit()
 
+    def activate_inference_token_dispatcher(self):
+        self.old_token_dispatcher = self.token_dispatcher
+        self.old_expert_overlap = self.shared_expert_overlap
+        self.token_dispatcher = self.inference_token_dispatcher
+        self.shared_expert_overlap = False 
+        
+    def deactivate_inference_token_dispatcher(self):
+        self.token_dispatcher = self.old_token_dispatcher
+        self.shared_expert_overlap = self.old_expert_overlap
+        
     # ==================== Simplified Forward Pass ====================
     def forward(self, hidden_states: torch.Tensor, padding_mask: Optional[torch.Tensor] = None):
+        """      
         """
-        Simplified forward pass optimized for inference.
-        
-        This overrides MoELayer.forward() with a streamlined version that:
-        - Removes training overhead (aux losses, recomputation)
-        - Uses a linear, easy-to-follow flow
-        - Reuses inherited router, token_dispatcher, and experts
-        
-        Args:
-            hidden_states: [S, B, H] input tensor
-            padding_mask: Optional [B, S] boolean mask. True for valid tokens, False for padding.
-            
-        Returns:
-            Tuple of (output, None) for compatibility with MoELayer interface
-        """
-        # Store original shape for restoration
-        hidden_shape = hidden_states.shape
-        hidden_states = hidden_states.view(-1, hidden_shape[-1])
-        
-        # Transpose padding_mask from [bsz, seq_length] to [seq_length, bsz] to align with hidden_states
-        if padding_mask is not None:
-            padding_mask = padding_mask.transpose(0, 1).bool()
-        
-        # ===== Step 1: Routing (using inherited router) =====
-        # The router returns probs and routing_map
-        probs, routing_map = self.router(hidden_states, padding_mask)
-        
-        # ===== Step 2: Dispatch Preprocess =====
-        # Compute metadata and permute tokens by expert assignment
-        permuted_tokens, permuted_probs = self.token_dispatcher.dispatch_preprocess(
-            hidden_states, routing_map, probs
-        )
-        
-        # ===== Step 3: Token Dispatch (EP AlltoAll) =====
-        dispatched_tokens, dispatched_probs = self.token_dispatcher.token_dispatch(
-            permuted_tokens, permuted_probs
-        )
-        
-        # ===== Step 4: Dispatch Postprocess (TP AllGather + sort by expert) =====
-        expert_input, tokens_per_expert, expert_probs = self.token_dispatcher.dispatch_postprocess(
-            dispatched_tokens, dispatched_probs
-        )
-        
-        # ===== Step 5: Expert Computation (using inherited experts) =====
-        expert_output, mlp_bias = self.experts(expert_input, tokens_per_expert, expert_probs)
+        if not self.is_cuda_graphed_iteration:
+            # Note: this will still call InferenceGroupedMLP.forward()
+            # and therefore optimized cutlass grouped gemms. 
+            return super().forward(hidden_states, padding_mask)
 
-        # ===== Step 6: Combine Preprocess (unsort + TP ReduceScatter) =====
-        combine_input = self.token_dispatcher.combine_preprocess(expert_output)
-        
-        # ===== Step 7: Token Combine (EP AlltoAll reverse) =====
-        combined_output = self.token_dispatcher.token_combine(combine_input)
-        
-        # ===== Step 8: Combine Postprocess (unpermute to original order) =====
-        output = self.token_dispatcher.combine_postprocess(combined_output)
-        
-        # Restore original shape
-        output = output.view(hidden_shape)
-        
-        # Handle shared experts (if configured, computed separately)
-        if self.use_shared_expert and not self.shared_expert_overlap:
-            shared_output = self.shared_experts(hidden_states.view(hidden_shape))
-            output = output + shared_output
-        
-        return output, mlp_bias
+        self.activate_inference_token_dispatcher()
+        assert self.token_dispatcher is self.inference_token_dispatcher 
+        logging.info("activated inference token dispatcher")
 
+        forward_pass_output = super().forward(hidden_states, padding_mask)
+
+        self.deactivate_inference_token_dispatcher()
+        assert self.token_dispatcher is not self.inference_token_dispatcher
+        logging.info("deactivated inference token dispatcher")
+
+        return forward_pass_output
+
+      
