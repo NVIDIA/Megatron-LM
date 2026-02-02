@@ -15,6 +15,7 @@ from typing import Callable, Dict, Optional, Set, Tuple, Union
 import torch
 
 from megatron.core.msc_utils import MultiStorageClientFeature
+from megatron.core.utils import log_single_rank
 
 from . import ShardedTensor
 from .core import CheckpointingConfig, save_config
@@ -181,9 +182,12 @@ def load_common_state_dict(checkpoint_dir: Union[str, Path]) -> StateDict:
     """
     if isinstance(checkpoint_dir, Path):
         checkpoint_dir = str(checkpoint_dir)
-        logger.warning(
-            "DEPRECATED: Passing 'checkpoint_dir' as a Path object in load_common_state_dict will "
-            "no longer be supported in a future release. Please pass it as a string instead."
+        log_single_rank(
+            logger,
+            logging.WARNING,
+            "DEPRECATED: Passing 'checkpoint_dir' as a Path object in "
+            "load_common_state_dict will no longer be supported in a future release. "
+            "Please pass it as a string instead.",
         )
     sharded_strategy, common_strategy = verify_checkpoint_and_load_strategy(checkpoint_dir)
     return common_strategy.load_common(checkpoint_dir)
