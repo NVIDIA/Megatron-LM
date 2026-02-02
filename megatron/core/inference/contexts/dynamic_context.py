@@ -59,6 +59,14 @@ except ImportError:
     HAVE_FLASHINFER = False
 
 try:
+    from torch_memory_saver import torch_memory_saver
+
+    torch_memory_saver.hook_mode = "torch"
+    HAVE_TORCH_MEMORY_SAVER = True
+except ImportError:
+    HAVE_TORCH_MEMORY_SAVER = False
+
+try:
     import wandb  # pylint: disable=unused-import
 
     HAVE_WANDB = True
@@ -286,6 +294,7 @@ class DynamicInferenceContext(BaseInferenceContext):
         metrics_writer: Optional['WandbModule'] = None,
         request_metadata_types: Optional[List[Tuple[str, torch.dtype, bool]]] = None,
         persist_cuda_graphs: Optional[bool] = False,
+        offload_kv_cache: Optional[bool] = False,
     ):
         super().__init__(materialize_only_last_token_logits=materialize_only_last_token_logits)
 
@@ -339,6 +348,13 @@ class DynamicInferenceContext(BaseInferenceContext):
             self.pipeline_parallel_group = parallel_state.get_pipeline_model_parallel_group()
         else:
             self.pipeline_parallel_group = None
+
+        if pg_collection is not None:
+            self.expert_model_parallel_group = pg_collection.ep
+        elif parallel_state.get_expert_model_parallel_world_size() > 1:
+            self.expert_model_parallel_group = parallel_state.get_expert_model_parallel_group()
+        else:
+            self.expert_model_parallel_group = None
 
         # Mamba states.
         self.is_hybrid_model = mamba_inference_state_config is not None
@@ -522,7 +538,6 @@ class DynamicInferenceContext(BaseInferenceContext):
         )
 
         # CUDA graph config list
-        is_expert_parallel = parallel_state.get_expert_model_parallel_world_size() > 1
         self.cuda_graph_batch_dimensions_list, self.cuda_graph_token_counts = (
             CUDAGraphBatchDimensionBuilder.generate_cuda_graph_batch_dimensions_list(
                 tp_size=tp_size,
@@ -536,10 +551,17 @@ class DynamicInferenceContext(BaseInferenceContext):
             )
         )
 
+        # Whether to offload the KV cache. Determines where the KV cache is allocated within memory.
+        self.offload_kv_cache = offload_kv_cache
+        assert not (
+            self.offload_kv_cache and self.unified_memory_level
+        ), "The KV cache should not be instantiated in unified memory when it is offloaded during training."
+
         self._using_cuda_graph_this_step = False
         self.use_cuda_graphs_for_non_decode_steps = use_cuda_graphs_for_non_decode_steps
         # Deal with chunked prefill
         self.chunked_prefill_request_id = -1
+        self.has_explicit_chunked_prefill_req = False
 
         # FlashInfer.
         if use_flashinfer_fused_rope is True:
@@ -650,18 +672,25 @@ class DynamicInferenceContext(BaseInferenceContext):
                     device=torch.cuda.current_device(),
                 )
             else:
-                self.memory_buffer = torch.empty(
-                    (
-                        2,  # key and value
-                        self.num_attention_layers,
-                        self.block_allocator.total_count,
-                        self.block_size_tokens,
-                        self.num_attention_heads_per_partition,
-                        self.hidden_size_per_attention_head,
-                    ),
-                    dtype=self.params_dtype,
-                    device=torch.cuda.current_device(),
+                ctx = (
+                    torch_memory_saver.region(tag="kv_cache", enable_cpu_backup=True)
+                    if HAVE_TORCH_MEMORY_SAVER and self.offload_kv_cache
+                    else nullcontext()
                 )
+
+                with ctx:
+                    self.memory_buffer = torch.empty(
+                        (
+                            2,  # key and value
+                            self.num_attention_layers,
+                            self.block_allocator.total_count,
+                            self.block_size_tokens,
+                            self.num_attention_heads_per_partition,
+                            self.hidden_size_per_attention_head,
+                        ),
+                        dtype=self.params_dtype,
+                        device=torch.cuda.current_device(),
+                    )
 
         # Optional state tensors for hybrid models
         def allocate_mamba_states():
@@ -1300,15 +1329,11 @@ class DynamicInferenceContext(BaseInferenceContext):
         if construct_graph_dimensions is not None:
             self.add_dummy_requests_for_cudagraph_capture(construct_graph_dimensions)
 
-        has_explicit_chunked_prefill_req = (
-            self.chunked_prefill_request_id != -1 and self.is_hybrid_model
-        )
-
         batch_dimensions = InferenceBatchDimensions(
             token_count=self.active_token_count,
             prefill_req_count=self.num_prefill_requests,
             decode_req_count=self.num_decode_requests,
-            has_explicit_chunked_prefill_req=has_explicit_chunked_prefill_req,
+            has_explicit_chunked_prefill_req=self.has_explicit_chunked_prefill_req,
         )
         self.batch_dimensions = batch_dimensions
         best_graph = CUDAGraphBatchDimensionBuilder.match_graph_config(
@@ -1316,6 +1341,7 @@ class DynamicInferenceContext(BaseInferenceContext):
             self.cuda_graph_batch_dimensions_list,
             strict=self.is_hybrid_model,
             decode_only_cuda_graphs=(not self.use_cuda_graphs_for_non_decode_steps),
+            ep_group=self.expert_model_parallel_group,
         )
         self._using_cuda_graph_this_step = best_graph is not None
 
@@ -1342,7 +1368,7 @@ class DynamicInferenceContext(BaseInferenceContext):
                 token_count=padded_token_count,
                 prefill_req_count=padded_prefill_req_count,
                 decode_req_count=padded_decode_req_count,
-                has_explicit_chunked_prefill_req=has_explicit_chunked_prefill_req,
+                has_explicit_chunked_prefill_req=self.has_explicit_chunked_prefill_req,
             )
         self.padded_active_token_count = self.padded_batch_dimensions.token_count
         self.padded_active_request_count = self.padded_batch_dimensions.req_count
@@ -1373,6 +1399,8 @@ class DynamicInferenceContext(BaseInferenceContext):
 
         attn_dimensions = batch_dimensions
         if self.using_cuda_graph_this_step():
+            assert not self.has_explicit_chunked_prefill_req
+
             # Treat some decode requests as prefill requests to fit the cuda graph batch dimension.
             if batch_dimensions.decode_req_count > self.padded_batch_dimensions.decode_req_count:
                 total_req = batch_dimensions.req_count
@@ -1382,7 +1410,7 @@ class DynamicInferenceContext(BaseInferenceContext):
                     token_count=batch_dimensions.token_count,
                     prefill_req_count=adjusted_prefill_req_count,
                     decode_req_count=adjusted_decode_req_count,
-                    has_explicit_chunked_prefill_req=has_explicit_chunked_prefill_req,
+                    has_explicit_chunked_prefill_req=False,
                 )
 
         self.active_attn_metadata["mha_metadata"].update(
@@ -1461,6 +1489,7 @@ class DynamicInferenceContext(BaseInferenceContext):
 
         # Reset chunked prefill state
         self.chunked_prefill_request_id = -1
+        self.has_explicit_chunked_prefill_req = False
         self.num_prefill_requests = 0
         self._using_cuda_graph_this_step = False
         self.padded_batch_dimensions = InferenceBatchDimensions(
@@ -1609,6 +1638,13 @@ class DynamicInferenceContext(BaseInferenceContext):
         metadata_types = req.get_metadata_types()
         for m, m_type in zip(metadata, metadata_types):
             label, _, _ = m_type
+            if not isinstance(m, torch.Tensor):
+                m = torch.as_tensor(
+                    m,
+                    device=self.request_metadata[label].device,
+                    dtype=self.request_metadata[label].dtype,
+                )
+
             self.request_metadata[label][current_id] = m
 
         # Handle length and block assignments.
@@ -1981,6 +2017,7 @@ class DynamicInferenceContext(BaseInferenceContext):
             active_requests_mask[-1] = (
                 1  # must keep this, next iteration will add a new chunk to it
             )
+        self.has_explicit_chunked_prefill_req = False
 
         active_request_count = (active_requests_mask == 1).sum().item()
         finished_request_count = (active_requests_mask == 0).sum().item()
@@ -2011,7 +2048,6 @@ class DynamicInferenceContext(BaseInferenceContext):
 
             # Reset Mamba state.
             self.reset_mamba_state()
-
             return
 
         # 3. Concatenate the paused tokens to the active tokens if present.
@@ -2070,9 +2106,9 @@ class DynamicInferenceContext(BaseInferenceContext):
 
             if self.chunked_prefill_request_id != -1:
                 # find the id in request_ids that is the chunked_prefill_request_id. Only one request should be chunked.
-                active_requests_requiring_new_block[self.get_index_of_chunked_prefill_request()] = (
-                    0  # chunked prefill should not be paused
-                )
+                active_requests_requiring_new_block[
+                    self.get_index_of_chunked_prefill_request() - self.paused_request_count
+                ] = 0  # chunked prefill should not be paused
 
             active_requests_requiring_new_block_count = (
                 (active_requests_requiring_new_block == 1).sum().item()

@@ -1,0 +1,220 @@
+type: basic
+format_version: 1
+maintainers: [mcore]
+loggers: [stdout]
+spec:
+  name: "{test_case}_{environment}_{platforms}"
+  model: moe
+  build: mcore-pyt-{environment}
+  nodes: 2
+  gpus: 4
+  n_repeat: 5
+  platforms: dgx_gb200
+  script_setup: |
+    unset https_proxy
+    echo "machine gitlab-master.nvidia.com login okoenig password $RO_API_TOKEN" | tee -a /root/.netrc
+
+    # Checkout latest
+    cd /opt
+    rm -rf /opt/megatron-lm; mkdir megatron-lm; cd megatron-lm
+    git init
+    git remote add origin $MCORE_REPO
+    git fetch origin '+refs/merge-requests/*:refs/remotes/merge-requests/*'
+    git fetch origin $MCORE_MR_COMMIT
+    git checkout $MCORE_MR_COMMIT
+    git rev-parse HEAD
+
+    # Checkout backwards-ref
+    cd /opt
+    rm -rf /opt/megatron-lm-legacy; mkdir megatron-lm-legacy; cd megatron-lm-legacy
+    git init
+    git remote add origin $MCORE_REPO
+    git fetch origin $MCORE_BACKWARDS_COMMIT
+    git checkout $MCORE_BACKWARDS_COMMIT
+    git rev-parse HEAD
+    rm -rf megatron; cp -a /opt/megatron-lm/megatron ./
+  script: |-
+    ls
+    cd /opt/megatron-lm
+
+    NAME=$(echo {test_case}_{environment} | sed 's/dgx_gb200/dgx_a100/g')
+    export GPUS_PER_NODE={gpus}
+
+    ARGUMENTS=(
+        "DATA_PATH=/mnt/artifacts"
+        "DATA_CACHE_PATH=/lustre/fsw/coreai_dlalgo_mcore/mcore_ci/data/$RUN_ID/cache/"
+        "OUTPUT_PATH={assets_dir}"
+        "TENSORBOARD_PATH={assets_dir}/tensorboard"
+        "CHECKPOINT_SAVE_PATH={artifacts_dir}/checkpoints"
+        "CHECKPOINT_LOAD_PATH=/mnt/artifacts"
+        "TRAINING_SCRIPT_PATH=pretrain_gpt.py"
+        "TRAINING_PARAMS_PATH=./tests/functional_tests/test_cases/{model}/{test_case}/model_config.yaml"
+        "GOLDEN_VALUES_PATH=./tests/functional_tests/test_cases/{model}/{test_case}/golden_values_{environment}_{platforms}.json"
+        "N_REPEAT={n_repeat}"
+        "ENABLE_LIGHTWEIGHT_MODE=${{ENABLE_LIGHTWEIGHT_MODE}}"
+        "RECORD_CHECKPOINTS=${{RECORD_CHECKPOINTS}}"
+    )
+
+    bash ./tests/functional_tests/shell_test_utils/run_ci_test.sh ${{ARGUMENTS[@]}}
+
+products:
+  #######################################################################
+  # Nightly tests: Run both DEV and LTS unless something is flaky       #
+  #######################################################################
+  - test_case: [gpt3_mcore_tp2_pp2_ep2_te_4experts2parallel]
+    products:
+      - environment: [dev]
+        scope: [nightly]
+        platforms: [dgx_gb200]
+  - test_case: [gpt3_mcore_tp2_cp2_pp2_ep2_te_4experts2parallel]
+    products:
+      - environment: [dev]
+        scope: [nightly]
+        platforms: [dgx_gb200]
+  - test_case: [gpt3_mcore_tp2_pp2_ep2_etp2_te_4experts2parallel]
+    products:
+      - environment: [dev]
+        scope: [nightly]
+        platforms: [dgx_gb200]
+  - test_case: [gpt3_mcore_tp2_pp2_ep2_etp2_te_4experts2parallel_dp_last]
+    products:
+      - environment: [dev]
+        scope: [nightly]
+        platforms: [dgx_gb200]
+  - test_case: [gpt3_mcore_tp2_cp2_pp2_ep2_te_4experts2parallel_dp_last]
+    products:
+      - environment: [dev]
+        scope: [nightly]
+        platforms: [dgx_gb200]
+  - test_case: [gpt3_mcore_cp2_pp2_ep2_te_4experts2parallel_nondeterministic]
+    products:
+      - environment: [dev]
+        scope: [nightly]
+        platforms: [dgx_gb200]
+  - test_case: [gpt3_mcore_cp2_pp2_ep2_te_4experts2parallel_nondeterministic_dp_last]
+    products:
+      - environment: [dev]
+        scope: [nightly]
+        platforms: [dgx_gb200]
+  # - test_case: [gpt3_mcore_tp2_pp2_resume_torch_dist_te_2experts]
+  #   products: # non-determinism: #478
+  #     - environment: [dev, lts]
+  #       scope: [nightly]
+  #######################################################################
+  # Weekly tests: Run both DEV and LTS unless something is flaky        #
+  #######################################################################
+  #######################################################################
+  # mr, mr-github tests: Mostly DEV on mr, mr-github, and LTS on nightly cadence, except for  #
+  #             some very important tests.                              #
+  #######################################################################
+  - test_case: [gpt3_mcore_te_tp1_pp2_resume_torch_dist_reshard_2x1x4_te_8experts2parallel_dist_optimizer]
+    products:
+      - environment: [dev]
+        scope: [mr]
+        platforms: [dgx_gb200]
+  # - test_case: [gpt3_mcore_te_tp2_pp2_ep4_etp1_mtp_resume_torch_dist_fp8]
+  #   products:
+  #     - environment: [dev]
+  #       scope: [mr]
+  #       platforms: [dgx_gb200] # hang: #513
+  - test_case: [gpt3_mcore_te_tp2_pp2_ep4_etp1_resume_torch_dist_attn_cudagraph]
+    products:
+      - environment: [dev]
+        scope: [mr-broken]
+        platforms: [dgx_gb200] # hang: #513
+  # - test_case: [gpt3_mcore_te_tp2_pp2_ep4_etp1_selective_recompute_experimental]
+  #   products:
+  #     - environment: [dev]
+  #       scope: [mr]
+  #       platforms: [dgx_gb200] # hang: #513
+  - test_case: [gpt3_mcore_te_tp2_pp1_resume_torch_dist_te_8experts2parallel_dist_optimizer]
+    products:
+      - environment: [dev]
+        scope: [mr]
+        platforms: [dgx_gb200]
+  - test_case: [gpt3_mcore_te_tp2_pp1_resume_torch_dist_te_8experts2parallel_multi_dist_optimizer_instances]
+    products:
+      - environment: [dev]
+        scope: [mr]
+        platforms: [dgx_gb200]
+  - test_case: [gpt3_mcore_te_tp2_pp1_te_8experts2parallel_overlap_grad_reduce_param_gather_groupedGEMM]
+    products:
+      - environment: [dev]
+        scope: [mr]
+        platforms: [dgx_gb200]
+  - test_case: [gpt3_mcore_te_tp2_pp1_te_a2a_ovlp_8experts_etp1_ep4]
+    products:
+      - environment: [dev]
+        scope: [mr]
+        platforms: [dgx_gb200]
+  - test_case: [gpt3_mcore_te_tp2_zp_z3_resume_torch_dist_te_8experts2parallel_top2router]
+    products:
+      - environment: [dev]
+        scope: [mr]
+        platforms: [dgx_gb200]
+  # - test_case: [gpt3_moe_mcore_te_tp2_pp2_ep4_etp1_fine_grained_offloading]
+  #   products:
+  #     - environment: [dev]
+  #       scope: [mr]
+  #       platforms: [dgx_gb200]
+  # - test_case: [gpt3_moe_mcore_te_tp2_pp2_ep4_etp1_no_mtp_no_a2a_ovlp_fine_grained_offloading]
+  #   products:
+  #     - environment: [dev]
+  #       scope: [mr]
+  #       platforms: [dgx_gb200]
+  - test_case: [gpt3_mcore_te_tp2_pp1_te_8experts2parallel_ddp_average_in_collective]
+    products:
+      - environment: [dev]
+        scope: [mr]
+        platforms: [dgx_gb200]
+  - test_case: [gpt3_moe_mcore_te_ep8_resume_torch_dist_dist_optimizer]
+    products:
+      - environment: [dev]
+        scope: [mr]
+        platforms: [dgx_gb200]
+  - test_case: [gpt3_moe_mcore_te_tp4_ep2_etp2_pp2_scoped_cudagraph]
+    products:
+      - environment: [dev]
+        scope: [mr]
+        platforms: [dgx_gb200]
+  - test_case: [gpt3_moe_mcore_te_ep8_resume_torch_dist_dist_muon]
+    products:
+      - environment: [dev]
+        scope: [mr, mr-github, mr-slim]
+        platforms: [dgx_gb200]
+  - test_case: [gpt3_moe_mcore_te_ep8_resume_torch_dist_muon]
+    products:
+      - environment: [dev]
+        scope: [mr, mr-github, mr-slim]
+        platforms: [dgx_gb200]
+  - test_case: [gpt3_moe_mcore_te_tp2_pp2_ep4_etp1_fine_grained_offloading]
+    products:
+      - environment: [dev]
+        scope: [mr-broken]
+        platforms: [dgx_gb200]
+  #######################################################################
+  # Super important mr, mr-github tests that run for both DEV and LTS per mr, mr-github       #
+  #######################################################################
+  # - test_case: [gpt3_mcore_te_tp2_pp1_frozen_resume_torch_dist_te_8experts2parallel_dist_optimizer]
+  #   products:
+  #     - environment: [dev]
+  #       scope: [mr]
+  #       platforms: [dgx_gb200]
+  # - test_case: [gpt3_mcore_te_tp2_pp1_frozen_resume_torch_dist_te_8experts2parallel_groupedGEMM]
+  #   products:
+  #     - environment: [dev]
+  #       scope: [mr]
+  #       platforms: [dgx_gb200]
+  ###########################
+  # Merge train tests       #
+  ###########################
+  - test_case: [gpt3_moe_mcore_te_tp4_ep2_etp2_pp2_resume_torch_dist_dist_optimizer]
+    products:
+      - environment: [dev]
+        scope: [mr, mr-github, mr-github-slim]
+        platforms: [dgx_gb200]
+  - test_case: [gpt3_mcore_te_tp2_pp2_ep4_etp1_memory_speed]
+    products:
+      - environment: [dev]
+        scope: [mr-broken]
+        platforms: [dgx_gb200]
