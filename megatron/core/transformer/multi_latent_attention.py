@@ -210,7 +210,6 @@ class MultiLatentAttention(Attention):
         rotary_pos_cos_sin=None,
         attention_bias=None,
         packed_seq_params=None,
-        position_ids=None,
         sequence_len_offset=None,
         *,
         inference_params=None,
@@ -247,7 +246,6 @@ class MultiLatentAttention(Attention):
             query, key, value, q_compressed, kv_compressed = self.get_query_key_value_tensors(
                 hidden_states,
                 key_value_states,
-                position_ids,
                 packed_seq_params,
                 inference_context=inference_context,
             )
@@ -513,7 +511,6 @@ class MLASelfAttention(MultiLatentAttention):
         self,
         hidden_states,
         key_value_states=None,
-        position_ids=None,
         packed_seq_params=None,
         inference_context=None,
         *,

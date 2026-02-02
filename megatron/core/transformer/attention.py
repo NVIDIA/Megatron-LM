@@ -307,25 +307,6 @@ class Attention(MegatronModule, ABC):
         self.key_hidden_size = self.hidden_size_per_attention_head
         self.val_hidden_size = self.hidden_size_per_attention_head
 
-        # TODO: This is built twice when using MLA, should be refactored.
-        if self.config.num_query_groups < world_size:
-            # TE throws an assertion error if num_kv_heads / num_query_groups
-            # is not divisible by TP size.
-            # TODO(rwaleffe/dnarayanan): Clean this up eventually.
-            tmp_config = copy.deepcopy(self.config)
-            tmp_config.num_query_groups = world_size
-        else:
-            tmp_config = self.config
-        self.core_attention = submodules.core_attention(
-            config=tmp_config,
-            layer_number=self.layer_number,
-            attn_mask_type=self.attn_mask_type,
-            attention_type=self.attention_type,
-            cp_comm_type=cp_comm_type,
-            softmax_scale=self.config.softmax_scale,
-            pg_collection=self.pg_collection,
-        )
-
         self.checkpoint_core_attention = (
             self.config.recompute_granularity == 'selective'
             and "core_attn" in self.config.recompute_modules
@@ -1266,6 +1247,24 @@ class SelfAttention(Attention):
             pg_collection=pg_collection,
         )
 
+        if self.config.num_query_groups < self.world_size:
+            # TE throws an assertion error if num_kv_heads / num_query_groups
+            # is not divisible by TP size.
+            # TODO(rwaleffe/dnarayanan): Clean this up eventually.
+            tmp_config = copy.deepcopy(self.config)
+            tmp_config.num_query_groups = self.world_size
+        else:
+            tmp_config = self.config
+        self.core_attention = submodules.core_attention(
+            config=tmp_config,
+            layer_number=self.layer_number,
+            attn_mask_type=self.attn_mask_type,
+            attention_type=self.attention_type,
+            cp_comm_type=cp_comm_type,
+            softmax_scale=self.config.softmax_scale,
+            pg_collection=self.pg_collection,
+        )
+
         self.linear_qkv_out_dim = self.query_projection_size + 2 * self.kv_projection_size
         if self.config.attention_output_gate:
             self.linear_qkv_out_dim += self.config.kv_channels * self.config.num_attention_heads
@@ -1641,6 +1640,24 @@ class CrossAttention(Attention):
         if self.config.num_query_groups != self.config.num_attention_heads:
             raise ValueError("Group query attention is not currently supported in cross attention.")
         assert self.query_projection_size == self.kv_projection_size
+
+        if self.config.num_query_groups < self.world_size:
+            # TE throws an assertion error if num_kv_heads / num_query_groups
+            # is not divisible by TP size.
+            # TODO(rwaleffe/dnarayanan): Clean this up eventually.
+            tmp_config = copy.deepcopy(self.config)
+            tmp_config.num_query_groups = self.world_size
+        else:
+            tmp_config = self.config
+        self.core_attention = submodules.core_attention(
+            config=tmp_config,
+            layer_number=self.layer_number,
+            attn_mask_type=self.attn_mask_type,
+            attention_type=self.attention_type,
+            cp_comm_type=cp_comm_type,
+            softmax_scale=self.config.softmax_scale,
+            pg_collection=self.pg_collection,
+        )
 
         self.linear_q = submodules.linear_q(
             self.config.hidden_size,
