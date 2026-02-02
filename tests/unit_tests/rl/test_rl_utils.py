@@ -691,11 +691,6 @@ class TestRLUtils:
         )
         model_parallel_cuda_manual_seed(123)
 
-        # Reset global CUDA graph state
-        # _CudagraphGlobalRecord.cudagraph_created = False
-        # _CudagraphGlobalRecord.cudagraph_record = []
-        # CudaGraphManager.global_mempool = None
-
         # Create a model with training CUDA graphs enabled
         transformer_config = TransformerConfig(
             num_layers=2,
