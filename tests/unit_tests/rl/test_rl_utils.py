@@ -673,10 +673,9 @@ class TestRLUtils:
         """Test that get_logprobs reuses CUDA graphs created during training forward pass.
 
         This test verifies that rl_utils.get_logprobs can reuse CUDA graphs by:
-        1. Creating a GPTModel (needs to be wrapped in Float16Module for get_logprobs)
-        2. Running a training-style forward pass to record CUDA graph runners
-        3. Creating the CUDA graphs
-        4. Running get_logprobs to verify it reuses the same forward graph from training
+        1. Running a training-style forward pass on some model to record CUDA graph runners.
+        2. Creating the CUDA graphs.
+        3. Running `get_logprobs` to verify it reuses the same forward graph from training.
         """
         from megatron.rl.sequence_packing_utils import get_default_packed_seq_params
 
@@ -693,9 +692,9 @@ class TestRLUtils:
         model_parallel_cuda_manual_seed(123)
 
         # Reset global CUDA graph state
-        _CudagraphGlobalRecord.cudagraph_created = False
-        _CudagraphGlobalRecord.cudagraph_record = []
-        CudaGraphManager.global_mempool = None
+        # _CudagraphGlobalRecord.cudagraph_created = False
+        # _CudagraphGlobalRecord.cudagraph_record = []
+        # CudaGraphManager.global_mempool = None
 
         # Create a model with training CUDA graphs enabled
         transformer_config = TransformerConfig(
@@ -754,10 +753,8 @@ class TestRLUtils:
         create_cudagraphs()
 
         # Verify that each runner has a fwd_graph created
-        total_runners = 0
         for mgr in cudagraph_managers:
             for runner in mgr.cudagraph_runners:
-                total_runners += 1
                 assert runner.fwd_graph is not None, (
                     f"Expected runner to have fwd_graph created after create_cudagraphs(), "
                     f"but fwd_graph is None"
@@ -775,14 +772,14 @@ class TestRLUtils:
             count_after = runners_after[mgr_id]
             assert count_after == count_before, (
                 f"Expected runner count to remain {count_before} after `get_logprobs`, "
-                f"but got {count_after}. `get_logprobs` should reuse training CUDA graphs."
+                f"but got {count_after}. `get_logprobs` should not create new runners."
             )
 
         # Verify outputs are valid
         assert output is not None, "Training forward pass should return valid output"
         assert logprobs is not None, "get_logprobs should return valid output"
 
-        # Cleanup CUDA graph state
+        # Cleanup CUDA graph global state
         _CudagraphGlobalRecord.cudagraph_created = False
         _CudagraphGlobalRecord.cudagraph_record = []
         CudaGraphManager.global_mempool = None
