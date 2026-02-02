@@ -3686,6 +3686,10 @@ def _add_experimental_args(parser):
                        'When enabled, all HyperConnection operations are wrapped with '
                        'CheckpointWithoutOutput for memory-efficient recomputation. '
                        'Requires --enable-hyper-connections and --recompute-granularity selective.')
+    group.add_argument('--mhc-recompute-layer-num', type=int, default=None,
+                       help='Number of layers per MHC recompute block. '
+                       'When set, every N layers form a recompute block. '
+                       'If None, all layers share a single recompute block.')
 
     return parser
 

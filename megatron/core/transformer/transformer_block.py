@@ -748,6 +748,7 @@ class TransformerBlock(GraphableMegatronModule, MegatronModule):
             self.config.recompute_hyper_connections
         )
         mhc_manager = MHCBlockRecomputeManager() if use_mhc_recompute else None
+        mhc_recompute_layer_num = self.config.mhc_recompute_layer_num
 
         with rng_context, outer_quantization_context:
             # Forward pass.
@@ -786,8 +787,18 @@ class TransformerBlock(GraphableMegatronModule, MegatronModule):
                             l_no == self.num_layers_per_pipeline_rank - 1
                         )
 
-                    # Determine if this is the last layer in the block
-                    is_last_layer_in_block = (l_no == num_layers - 1)
+                    # Determine if this is the last layer in the current MHC recompute block
+                    # A layer is last in recompute block if:
+                    # 1. It's the final layer in the transformer block, OR
+                    # 2. mhc_recompute_layer_num is set and (l_no + 1) % mhc_recompute_layer_num == 0
+                    is_last_in_transformer_block = (l_no == num_layers - 1)
+                    is_last_in_recompute_block = is_last_in_transformer_block
+                    if use_mhc_recompute and mhc_recompute_layer_num is not None:
+                        # l_no is 0-indexed, so (l_no + 1) gives the 1-indexed layer number
+                        is_last_in_recompute_block = (
+                            is_last_in_transformer_block or
+                            ((l_no + 1) % mhc_recompute_layer_num == 0)
+                        )
 
                     with self.offload_context, inner_quantization_context:
                         hidden_states, context = layer(
@@ -805,8 +816,17 @@ class TransformerBlock(GraphableMegatronModule, MegatronModule):
                             sequence_len_offset=sequence_len_offset,
                             padding_mask=padding_mask,
                             mhc_recompute_manager=mhc_manager,
-                            is_last_layer_in_block=is_last_layer_in_block,
+                            is_last_layer_in_recompute_block=is_last_in_recompute_block,
                         )
+
+                    # Create new manager for next recompute block if current block ended
+                    # (but not if this is the final layer in transformer block)
+                    if (
+                        use_mhc_recompute and
+                        is_last_in_recompute_block and
+                        not is_last_in_transformer_block
+                    ):
+                        mhc_manager = MHCBlockRecomputeManager()
 
                     if (
                         torch.is_grad_enabled()

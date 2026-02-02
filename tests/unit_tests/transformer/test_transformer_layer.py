@@ -373,7 +373,7 @@ class TestTransformerLayerWithHyperConnectionRecompute:
             hidden_states=hidden_states,
             attention_mask=attention_mask,
             mhc_recompute_manager=manager,
-            is_last_layer_in_block=True,  # Last layer, so MLP BDA not checkpointed
+            is_last_layer_in_recompute_block=True,  # Last layer, so MLP BDA not checkpointed
         )
 
         # Verify output shape
@@ -381,8 +381,8 @@ class TestTransformerLayerWithHyperConnectionRecompute:
             f"Expected output shape {(seq_len, batch_size, n_channels)}, got {output.shape}"
         )
 
-        # Register unified recompute hook (simulating what TransformerBlock does)
-        manager.discard_all_outputs_and_register_unified_recompute(output)
+        # Unified recompute hook is automatically registered inside layer when
+        # is_last_layer_in_recompute_block=True, no need to call manually
 
         # Backward pass should work without error
         loss = output.sum()
@@ -440,11 +440,11 @@ class TestTransformerLayerWithHyperConnectionRecompute:
             hidden_states=hidden_states_ckpt,
             attention_mask=attention_mask,
             mhc_recompute_manager=manager,
-            is_last_layer_in_block=True,
+            is_last_layer_in_recompute_block=True,
         )
 
-        # Register unified recompute hook
-        manager.discard_all_outputs_and_register_unified_recompute(output_ckpt)
+        # Unified recompute hook is automatically registered inside layer when
+        # is_last_layer_in_recompute_block=True, no need to call manually
 
         loss_ckpt = output_ckpt.sum()
         loss_ckpt.backward()
@@ -485,7 +485,7 @@ class TestTransformerLayerWithHyperConnectionRecompute:
             hidden_states=hidden_states,
             attention_mask=attention_mask,
             mhc_recompute_manager=manager,
-            is_last_layer_in_block=False,  # Intermediate layer, MLP BDA is checkpointed
+            is_last_layer_in_recompute_block=False,  # Intermediate layer, MLP BDA is checkpointed
         )
 
         # Verify output shape
@@ -507,7 +507,6 @@ class TestTransformerLayerWithHyperConnectionRecompute:
         Test multiple TransformerLayers chained together with a single
         MHCBlockRecomputeManager, simulating TransformerBlock behavior.
         """
-        # return 
         hidden_size = 64
         num_streams = 4
         seq_len = 8
@@ -553,12 +552,11 @@ class TestTransformerLayerWithHyperConnectionRecompute:
                 hidden_states=h,
                 attention_mask=attention_mask,
                 mhc_recompute_manager=manager,
-                is_last_layer_in_block=is_last,
+                is_last_layer_in_recompute_block=is_last,
             )
 
-        return 
-        # Register unified recompute on final output
-        manager.discard_all_outputs_and_register_unified_recompute(h)
+        # Unified recompute hook is automatically registered inside the last layer
+        # when is_last_layer_in_recompute_block=True, no need to call manually
 
         # Backward pass
         loss = h.sum()

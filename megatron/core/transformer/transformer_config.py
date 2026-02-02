@@ -786,9 +786,6 @@ class TransformerConfig(ModelParallelConfig):
     mhc_init_gating_factor: float = 0.01
     """Initial value of Gating Factor (alpha in paper)."""
 
-    hyper_connection_recompute_block_size: Optional[int] = None
-    """Block size for mHC recomputation. If None, computed as sqrt(n*L/(n+2))."""
-
     recompute_hyper_connections: bool = False
     """Enable recomputation for HyperConnection intermediate activations.
     
@@ -802,8 +799,20 @@ class TransformerConfig(ModelParallelConfig):
     - Must use recompute_granularity='selective'
     - Cannot be used together with recompute_mlp=True (they use different checkpoint mechanisms)
     
-    The last layer's final MLP BDA output is NOT checkpointed and serves as the hook_tensor
-    for registering the unified recompute hook."""
+    The last layer in each recompute block's final MLP BDA output is NOT checkpointed and 
+    serves as the hook_tensor for registering the unified recompute hook."""
+
+    mhc_recompute_layer_num: Optional[int] = None
+    """Number of layers per MHC recompute block.
+    
+    When set, every `mhc_recompute_layer_num` layers form a recompute block. The last layer
+    in each recompute block (i.e., layer_number % mhc_recompute_layer_num == 0 or the final
+    layer in the transformer block) will:
+    - NOT checkpoint its final MLP BDA
+    - Register the unified recompute hook on its MLP BDA output
+    - A new MHCBlockRecomputeManager is created for subsequent layers
+    
+    If None, all layers in the transformer block share a single recompute block."""
 
     ####################
     # miscellaneous
