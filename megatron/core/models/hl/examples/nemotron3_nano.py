@@ -13,7 +13,6 @@ This example demonstrates:
 
 from megatron.core.models.hl import (
     HLModel,
-    HLModelConfig,
     CommonConfig,
     EmbeddingLayer,
     AttentionLayer,
@@ -100,15 +99,13 @@ P4 = [[E1, M1] * 4, E1]
 layer_pattern = [P1, PS, P2, PS, P3, PS, P4]
 
 # =============================================================================
-# MODEL CONFIGURATION
+# MODEL
 # =============================================================================
 
-nemotron_config = HLModelConfig(
+nemotron_model = HLModel(
     common_config=common_config,
     embedding=Embed,
     layer_pattern=layer_pattern,
-
-    # Model settings
     share_embeddings_and_output_weights=False,
     normalization="RMSNorm",
     disable_bias_linear=True,
@@ -116,11 +113,5 @@ nemotron_config = HLModelConfig(
 )
 
 
-def build_model() -> HLModel:
-    """Build and return the Nemotron-3 Nano model."""
-    return HLModel(nemotron_config)
-
-
 if __name__ == "__main__":
-    model = build_model()
-    print(f"Created Nemotron-3 Nano model with config:\n{nemotron_config}")
+    print(f"Created Nemotron-3 Nano model: {nemotron_model}")

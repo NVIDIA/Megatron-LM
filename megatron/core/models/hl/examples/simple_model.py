@@ -15,7 +15,6 @@ This example demonstrates:
 
 from megatron.core.models.hl import (
     HLModel,
-    HLModelConfig,
     CommonConfig,
     EmbeddingLayer,
     AttentionLayer,
@@ -68,15 +67,13 @@ F1 = MLPLayer(
 layer_pattern = [A1, F1] * 32
 
 # =============================================================================
-# MODEL CONFIGURATION
+# MODEL
 # =============================================================================
 
-simple_config = HLModelConfig(
+simple_model = HLModel(
     common_config=common_config,
     embedding=Embed,
     layer_pattern=layer_pattern,
-
-    # Model settings
     share_embeddings_and_output_weights=True,
     normalization="RMSNorm",
     disable_bias_linear=True,
@@ -84,11 +81,5 @@ simple_config = HLModelConfig(
 )
 
 
-def build_model() -> HLModel:
-    """Build and return the simple 7B model."""
-    return HLModel(simple_config)
-
-
 if __name__ == "__main__":
-    model = build_model()
-    print(f"Created simple 7B model with config:\n{simple_config}")
+    print(f"Created simple 7B model: {simple_model}")

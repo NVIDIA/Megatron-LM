@@ -17,7 +17,6 @@ import torch
 
 from megatron.core.models.hl import (
     HLModel,
-    HLModelConfig,
     CommonConfig,
     EmbeddingLayer,
     AttentionLayer,
@@ -132,15 +131,13 @@ P4 = [[E1, M1] * 4, E2]
 layer_pattern = [P1, PS, P2, PS, P3, PS, P4]
 
 # =============================================================================
-# MODEL CONFIGURATION
+# MODEL
 # =============================================================================
 
-model_config = HLModelConfig(
+complex_model = HLModel(
     common_config=common_config,
     embedding=Embed,
     layer_pattern=layer_pattern,
-
-    # Model settings
     share_embeddings_and_output_weights=False,
     normalization="RMSNorm",
     disable_bias_linear=True,
@@ -148,11 +145,5 @@ model_config = HLModelConfig(
 )
 
 
-def build_model() -> HLModel:
-    """Build and return the complex hybrid model."""
-    return HLModel(model_config)
-
-
 if __name__ == "__main__":
-    model = build_model()
-    print(f"Created complex hybrid model with config:\n{model_config}")
+    print(f"Created complex hybrid model: {complex_model}")
