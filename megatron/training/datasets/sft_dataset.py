@@ -164,6 +164,8 @@ class SFTDataset(MegatronDataset):
         assert len(pack_targets) == pack_length + 1
         assert len(pack_positions) == pack_length + 1
 
+        print("pack_targets", pack_targets[1:])
+
         # Align and convert to tensors
         input_ids    = torch.tensor(pack_tokens[:-1],  dtype=torch.int64)
         labels       = torch.tensor(pack_targets[1:], dtype=torch.int64)
