@@ -122,7 +122,7 @@ class SharedExpertMLP(MLP):
             if self.stream is None:
                 self.stream = torch.cuda.Stream()
 
-    def forward(self, hidden_states):
+    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
         """Forward function"""
         output, _ = super().forward(hidden_states)
         if self.use_shared_expert_gate:
