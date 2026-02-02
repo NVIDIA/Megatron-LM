@@ -294,7 +294,7 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
             eps=self.config.layernorm_epsilon,
         )
 
-        if config.enable_hyper_connection:
+        if config.enable_hyper_connections:
             # [Module 1.5: Self Attention Hyper Connection]
             self.self_attention_hyper_connection = build_module(
                 submodules.self_attention_hyper_connection,
@@ -578,7 +578,7 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
         # Residual connection.
         residual = hidden_states
 
-        if self.config.enable_hyper_connection:
+        if self.config.enable_hyper_connections:
             nvtx_range_push(suffix="self_attention_hyper_connection")
             # hidden_states: [s, b, n * C] -> [s, b, C]
             # residual: [s, b, n * C] -> [s, b, n * C]
@@ -630,7 +630,7 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
                 attention_output_with_bias[0]
             )
 
-        if self.config.enable_hyper_connection:
+        if self.config.enable_hyper_connections:
             nvtx_range_push(suffix="self_attention_hyper_connection_post")
             attention_output_with_bias = self.self_attention_hyper_connection.apply_h_post(attention_output_with_bias, self_attn_hc_h_post)
             nvtx_range_pop(suffix="self_attention_hyper_connection_post")
@@ -660,7 +660,7 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
         # Residual connection.
         residual = hidden_states
 
-        if self.config.enable_hyper_connection:
+        if self.config.enable_hyper_connections:
             nvtx_range_push(suffix="cross_attention_hyper_connection")
             # hidden_states: [s, b, n * C] -> [s, b, C]
             # residual: [s, b, n * C] -> [s, b, n * C]
@@ -683,7 +683,7 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
         if isinstance(attention_output_with_bias, dict) and "context" in attention_output_with_bias:
             context = attention_output_with_bias["context"]
 
-        if self.config.enable_hyper_connection:
+        if self.config.enable_hyper_connections:
             nvtx_range_push(suffix="cross_attention_hyper_connection_post")
             attention_output_with_bias = self.cross_attention_hyper_connection.apply_h_post(
                 attention_output_with_bias, cross_attn_hc_h_post
@@ -723,7 +723,7 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
         # Residual connection.
         residual = hidden_states
 
-        if self.config.enable_hyper_connection:
+        if self.config.enable_hyper_connections:
             nvtx_range_push(suffix="mlp_hyper_connection")
             # hidden_states: [s, b, n * C] -> [s, b, C]
             # residual: [s, b, n * C] -> [s, b, n * C]
@@ -770,7 +770,7 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
                 not self.recompute_pre_mlp_layernorm
             ), "Recomputation is not supported for CUDA graph."
             assert (
-                not self.config.enable_hyper_connection
+                not self.config.enable_hyper_connections
             ), "Hyper connection is not supported for CUDA graph MoE."
             cudagraph_outputs = self.mlp(pre_mlp_layernorm_output, padding_mask=padding_mask)
             nvtx_range_pop(suffix="mlp")
@@ -838,14 +838,12 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
                     self.pre_mlp_norm_checkpoint.discard_output_and_register_recompute(tensor)
             return list(mlp_output_with_bias) + [residual]
         else:
-            if self.config.enable_hyper_connection:
+            if self.config.enable_hyper_connections:
                 nvtx_range_push(suffix="mlp_hyper_connection_post")
                 mlp_output_with_bias = self.mlp_hyper_connection.apply_h_post(
                     mlp_output_with_bias, mlp_hc_h_post
                 )
                 nvtx_range_pop(suffix="mlp_hyper_connection_post")
-            return self._forward_post_mlp(mlp_output_with_bias, residual)
-        
 
     def _forward_post_mlp(self, mlp_output_with_bias, residual):
         """
