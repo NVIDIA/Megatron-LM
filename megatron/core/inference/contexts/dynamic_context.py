@@ -604,6 +604,10 @@ class DynamicInferenceContext(BaseInferenceContext):
 
         Tensors created as attributes on `self` within this context will be recorded
         in `_offloadable_tensor_names` so they can be offloaded to CPU and restored later.
+
+
+        NOTE: This current tracks the KV cache and mamba states, as they are the largest tensors.
+        TODO: Benchmark the benefits of tracking additional tensors.
         """
         initial_attrs = set(vars(self).keys())
         yield
