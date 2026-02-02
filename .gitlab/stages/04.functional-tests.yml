@@ -205,15 +205,15 @@ functional:run_dev_dgx_gb200:
 functional:run_nemo:
   extends: [.functional_tests_rules]
   trigger:
-    project: 'dl/joc/nemo-ci'
+    project: "dl/joc/nemo-ci"
     branch: main-mirror
     strategy: depend
   inherit:
     variables: true
   variables:
     MCORE_COMMIT: $CI_COMMIT_SHA
-    TEST_NEMO2_MODULE: 'True'
-    ALLOW_FAILURE_DEPENDENCY: 'True'
+    TEST_NEMO2_MODULE: "True"
+    ALLOW_FAILURE_DEPENDENCY: "True"
     TESTS_TO_RUN_ON_THIS_COMMIT: nightly
   rules:
     - if: $FUNCTIONAL_TEST == "yes"
@@ -229,6 +229,8 @@ functional:x_notify:
     - functional:run_dev_dgx_a100
     - functional:run_lts_dgx_h100
     - functional:run_dev_dgx_h100
+    - functional:run_lts_dgx_gb200
+    - functional:run_dev_dgx_gb200
   tags:
     - arch/amd64
     - env/prod
