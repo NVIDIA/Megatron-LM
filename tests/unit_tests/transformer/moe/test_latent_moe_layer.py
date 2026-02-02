@@ -84,7 +84,7 @@ class TestLatentMoELayer:
                 ), f"Shape mismatch for expert {i} {fc2_weight.shape=}"
         else:
             for i in range(num_moe_experts):
-                expert = moe_layer.experts.local_experts[i] 
+                expert = moe_layer.experts.local_experts[i]
                 assert (
                     expert.linear_fc1.weight.shape[1] == config.moe_latent_size
                 ), f"Shape mismatch for expert {i} {fc1_weight.shape=}"
