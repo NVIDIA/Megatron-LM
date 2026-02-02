@@ -104,16 +104,16 @@ class RewardOnlyAgent(RolloutGenerator, GroupedRolloutGenerator, PassAtEvaluatio
                 for x in range(len(response.token_ids))
             ]
             rollout = TokenRollout(
-                trajectory=response.token_ids,
+                trajectory=[response.token_ids],
                 reward=await self.get_reward(response_text, golden),
-                logprobs=logprobs,
-                generation_mask=generation_mask,
+                logprobs=[logprobs],
+                generation_mask=[generation_mask],
                 env_id=self.env_id,
                 problem_id=golden['problem_id'] if 'problem_id' in golden else None,
             )
         else:
             rollout = Rollout(
-                trajectory=raw_text,
+                trajectory=[raw_text],
                 reward=await self.get_reward(response_text, golden),
                 env_id=self.env_id,
                 problem_id=golden['problem_id'] if 'problem_id' in golden else None,
