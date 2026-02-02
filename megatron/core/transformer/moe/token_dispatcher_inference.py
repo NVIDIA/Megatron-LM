@@ -143,53 +143,24 @@ class InferenceAllGatherTokenDispatcher(MoEAllGatherTokenDispatcher):
 
         # Change 1: Keep tokens_per_expert on GPU for CUDA graph compatibility.
         tokens_per_expert = self.local_map.sum(dim=0).long() #.cpu()
-        #hidden_states = torch.randn_like(hidden_states)  # Dummy init for exit()
-        if False:
-            (permuted_local_hidden_states, permuted_local_probs, self.reversed_local_input_permutation_mapping) = permute(
-                hidden_states,
-                self.local_map,
-                probs=probs, # Change 2: permute probs as well
-                num_out_tokens=hidden_states.size(0) * self.topk, # Change 3: accounting for worst case
-                fused=self.config.moe_permute_fusion,
-            )
-            self.test_permute_output(hidden_states, permuted_local_hidden_states, self.local_map)
-            self.test_permute_probs_output(self.local_probs, permuted_local_probs, self.local_map)
-            logging.info("TE: After permute verification for both tokens and probs")
-        else:
-            # shape of static_buffer is [hidden_states.shape(0) * min(topk, num_local_experts), hidden_states.shape(1)]
-            tokens_workspace = torch.zeros(
-                hidden_states.size(0) * min(self.topk, self.num_local_experts),
-                hidden_states.size(1),
-                dtype=hidden_states.dtype,
-                device=hidden_states.device,
-            )
-            launch_moe_kernels(hidden_states, self.local_map, tokens_workspace, unpermute=False)    
-            #self.test_permute_output(hidden_states, tokens_workspace, self.local_map)
-            #logging.info("Triton: After permute verification in token_dispatcher_inference for tokens")
-
-            probs_workspace = torch.zeros(
-                self.local_probs.size(0) * min(self.topk, self.num_local_experts),
-                1,
-                dtype=probs.dtype,
-                device=probs.device,
-            )
-            launch_extract_probs(self.local_probs, self.local_map, probs_workspace)
-            #self.test_permute_probs_output(self.local_probs, probs_workspace, self.local_map)
-            #logging.info("Triton: After permute verification in token_dispatcher_inference for probs")
-
-            permuted_local_hidden_states = tokens_workspace
-            permuted_local_probs = probs_workspace.squeeze(-1)
-            # probs_workspace = torch.zeros(
-            #     local_probs.size(0) * min(self.topk, self.num_local_experts),
-            #     1,
-            #     dtype=probs.dtype,
-            #     device=probs.device,
-            # )
-
-            # print(probs.shape)
-            # launch_moe_kernels(probs.unsqueeze(-1), self.local_map, probs_workspace, unpermute=False)
-            # self.test_permute_output(probs.unsqueeze(-1), probs_workspace, self.local_map)
-
+        tokens_workspace = torch.zeros(
+            hidden_states.size(0) * min(self.topk, self.num_local_experts),
+            hidden_states.size(1),
+            dtype=hidden_states.dtype,
+            device=hidden_states.device,
+        )
+        launch_moe_kernels(hidden_states, self.local_map, tokens_workspace, unpermute=False)    
+        
+        probs_workspace = torch.zeros(
+            self.local_probs.size(0) * min(self.topk, self.num_local_experts),
+            1,
+            dtype=probs.dtype,
+            device=probs.device,
+        )
+        launch_extract_probs(self.local_probs, self.local_map, probs_workspace)
+        
+        permuted_local_hidden_states = tokens_workspace
+        permuted_local_probs = probs_workspace.squeeze(-1)
 
         self.local_probs = permuted_local_probs 
         self.routing_map = None
