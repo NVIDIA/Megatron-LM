@@ -37,23 +37,24 @@ common_config = CommonConfig(
 # LAYER DEFINITIONS
 # =============================================================================
 
-# Layers inherit hidden_size and parallelism settings from common_config
-
-Embed = EmbeddingLayerConfig(
+Embedding = EmbeddingLayerConfig(
+    common_config=common_config,
     vocab_size=128000,
     max_sequence_length=4096,
     position_embedding_type="rope",
     rotary_base=500000,
 )
 
-A1 = AttentionLayerConfig(
+Attention = AttentionLayerConfig(
+    common_config=common_config,
     num_attention_heads=32,
     num_query_groups=8,
     kv_channels=128,
     use_flash_attention=True,
 )
 
-F1 = MLPLayerConfig(
+Mlp = MLPLayerConfig(
+    common_config=common_config,
     ffn_hidden_size=14336,
     activation="swiglu",
 )
@@ -64,7 +65,7 @@ F1 = MLPLayerConfig(
 
 # Simple pattern: 32 layers of Attention + MLP
 # No pipeline parallelism needed for this small model
-layer_pattern = [A1, F1] * 32
+layer_pattern = [Attention, Mlp] * 32
 
 # =============================================================================
 # MODEL
@@ -72,7 +73,7 @@ layer_pattern = [A1, F1] * 32
 
 simple_model = HLModel(
     common_config=common_config,
-    embedding=Embed,
+    embedding=Embedding,
     layer_pattern=layer_pattern,
     share_embeddings_and_output_weights=True,
     normalization="RMSNorm",

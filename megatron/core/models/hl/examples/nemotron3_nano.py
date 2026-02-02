@@ -46,29 +46,30 @@ moe_common_config = replace(
 # LAYER DEFINITIONS
 # =============================================================================
 
-# Layers inherit hidden_size and parallelism settings from common_config
-
-Embed = EmbeddingLayerConfig(
+Embedding = EmbeddingLayerConfig(
+    common_config=common_config,
     vocab_size=131072,
     max_sequence_length=8192,
     position_embedding_type="none",
 )
 
-M1 = MambaLayerConfig(
+Mamba = MambaLayerConfig(
+    common_config=common_config,
     num_heads=64,
     head_dim=64,
     state_size=128,
     conv_kernel_size=4,
 )
 
-A1 = AttentionLayerConfig(
+Attention = AttentionLayerConfig(
+    common_config=common_config,
     num_attention_heads=32,
     num_query_groups=2,
     kv_channels=128,
     use_flash_attention=True,
 )
 
-E1 = MoELayerConfig(
+MoE = MoELayerConfig(
     common_config=moe_common_config,
     ffn_hidden_size=1856,
     num_experts=128,
@@ -92,15 +93,13 @@ E1 = MoELayerConfig(
 # Pipeline split marker
 PS = PipelineSplit()
 
-# Define each pipeline stage
-# Pattern: MEMEM*EMEMEM*EMEMEM*EMEMEM*EMEMEM*EMEMEMEM*EMEMEMEME
-# 52 layers total, split across 4 pipeline stages
-P1 = [M1, [E1, M1] * 2, A1, [E1, M1] * 3, A1]
-P2 = [[E1, M1] * 3, A1, [E1, M1] * 3, A1]
-P3 = [[E1, M1] * 3, A1, [E1, M1] * 4, A1]
-P4 = [[E1, M1] * 4, E1]
+# Define each pipeline stage (52 layers total, split across 4 stages)
+Stage1 = [Mamba, [MoE, Mamba] * 2, Attention, [MoE, Mamba] * 3, Attention]
+Stage2 = [[MoE, Mamba] * 3, Attention, [MoE, Mamba] * 3, Attention]
+Stage3 = [[MoE, Mamba] * 3, Attention, [MoE, Mamba] * 4, Attention]
+Stage4 = [[MoE, Mamba] * 4, MoE]
 
-layer_pattern = [P1, PS, P2, PS, P3, PS, P4]
+layer_pattern = [Stage1, PS, Stage2, PS, Stage3, PS, Stage4]
 
 # =============================================================================
 # MODEL
@@ -108,7 +107,7 @@ layer_pattern = [P1, PS, P2, PS, P3, PS, P4]
 
 nemotron_model = HLModel(
     common_config=common_config,
-    embedding=Embed,
+    embedding=Embedding,
     layer_pattern=layer_pattern,
     share_embeddings_and_output_weights=False,
     normalization="RMSNorm",

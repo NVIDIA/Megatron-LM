@@ -1,14 +1,14 @@
 # Copyright (c) 2025, NVIDIA CORPORATION. All rights reserved.
 
 """
-HLModel DSL Example: Complex (Imagined) Model
+HLModel DSL Example: Advanced Hybrid Model
 
 Demonstrates using multiple layer configurations:
-- A1: Global attention (full sequence), FP8 override
-- A2: Sliding window attention (local context), inherits bf16
-- E1: Large MoE (128 experts, top-6), FP8 override, custom moe_config
-- E2: Small MoE (32 experts, top-2), inherits bf16, custom moe_config
-- CommonConfig for shared settings with per-layer overrides
+- GlobalAttention: Full sequence attention with FP8
+- SlidingAttention: Local context attention (4096 window), bf16
+- Mamba: State-space model layers
+- LargeMoE: 128 experts (top-6), FP8, custom parallelism
+- SmallMoE: 32 experts (top-2), bf16, custom parallelism
 """
 
 from dataclasses import replace
@@ -48,24 +48,23 @@ moe_common_config = replace(
 # LAYER DEFINITIONS
 # =============================================================================
 
-# Layers inherit hidden_size and parallelism settings from common_config
-
-Embed = EmbeddingLayerConfig(
+Embedding = EmbeddingLayerConfig(
+    common_config=common_config,
     vocab_size=131072,
     max_sequence_length=8192,
     position_embedding_type="none",
 )
 
-# Defaults to using common_config
-M1 = MambaLayerConfig(
+Mamba = MambaLayerConfig(
+    common_config=common_config,
     num_heads=64,
     head_dim=64,
     state_size=128,
     conv_kernel_size=4,
 )
 
-# Defaults to using common_config
-A1 = AttentionLayerConfig(
+GlobalAttention = AttentionLayerConfig(
+    common_config=common_config,
     num_attention_heads=32,
     num_query_groups=2,
     kv_channels=128,
@@ -73,8 +72,8 @@ A1 = AttentionLayerConfig(
     dtype=torch.float8_e4m3fn,  # Override: use FP8 for faster attention
 )
 
-# Defaults to using common_config
-A2 = AttentionLayerConfig(
+SlidingAttention = AttentionLayerConfig(
+    common_config=common_config,
     num_attention_heads=32,
     num_query_groups=2,
     kv_channels=128,
@@ -82,7 +81,7 @@ A2 = AttentionLayerConfig(
     sliding_window_size=4096,
 )
 
-E1 = MoELayerConfig(
+LargeMoE = MoELayerConfig(
     common_config=moe_common_config,
     ffn_hidden_size=1856,
     num_experts=128,
@@ -100,7 +99,7 @@ E1 = MoELayerConfig(
     dtype=torch.float8_e4m3fn,  # Override: FP8 for expert computation
 )
 
-E2 = MoELayerConfig(
+SmallMoE = MoELayerConfig(
     common_config=replace(moe_common_config, expert_model_parallel_size=4),
     ffn_hidden_size=3712,
     num_experts=32,
@@ -123,12 +122,12 @@ PS = PipelineSplit()
 
 # Define each pipeline stage
 # Hybrid pattern with multiple layer types
-P1 = [M1, [E1, M1] * 2, A1, [E2, M1] * 3, A2]
-P2 = [[E1, M1] * 3, A2, [E2, M1] * 3, A1]
-P3 = [[E1, M1] * 3, A2, [E2, M1] * 4, A1]
-P4 = [[E1, M1] * 4, E2]
+Stage1 = [Mamba, [LargeMoE, Mamba] * 2, GlobalAttention, [SmallMoE, Mamba] * 3, SlidingAttention]
+Stage2 = [[LargeMoE, Mamba] * 3, SlidingAttention, [SmallMoE, Mamba] * 3, GlobalAttention]
+Stage3 = [[LargeMoE, Mamba] * 3, SlidingAttention, [SmallMoE, Mamba] * 4, GlobalAttention]
+Stage4 = [[LargeMoE, Mamba] * 4, SmallMoE]
 
-layer_pattern = [P1, PS, P2, PS, P3, PS, P4]
+layer_pattern = [Stage1, PS, Stage2, PS, Stage3, PS, Stage4]
 
 # =============================================================================
 # MODEL
@@ -136,7 +135,7 @@ layer_pattern = [P1, PS, P2, PS, P3, PS, P4]
 
 complex_model = HLModel(
     common_config=common_config,
-    embedding=Embed,
+    embedding=Embedding,
     layer_pattern=layer_pattern,
     share_embeddings_and_output_weights=False,
     normalization="RMSNorm",
