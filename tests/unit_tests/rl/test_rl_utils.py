@@ -17,7 +17,6 @@ from megatron.core.optimizer import OptimizerConfig, get_megatron_optimizer
 from megatron.core.pipeline_parallel.utils import is_pp_last_stage
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.tensor_parallel.random import (
-    HAVE_TE,
     initialize_rng_tracker,
     model_parallel_cuda_manual_seed,
 )
@@ -28,11 +27,10 @@ from megatron.core.transformer.cuda_graphs import (
     create_cudagraphs,
 )
 from megatron.core.transformer.module import Float16Module
-from megatron.core.utils import is_te_min_version
 from megatron.rl import rl_utils
 from megatron.rl.agent.api import TokenRollout
 from megatron.training.arguments import parse_args, validate_args
-from megatron.training.global_vars import destroy_global_vars, get_args, set_global_variables
+from megatron.training.global_vars import destroy_global_vars, set_global_variables
 from tests.unit_tests.test_utilities import Utils
 
 BATCH = 2
@@ -699,7 +697,7 @@ class TestRLUtils:
         _CudagraphGlobalRecord.cudagraph_record = []
         CudaGraphManager.global_mempool = None
 
-        # Create a GPTModel with CUDA graphs enabled
+        # Create a model with training CUDA graphs enabled
         transformer_config = TransformerConfig(
             num_layers=2,
             hidden_size=64,
@@ -776,8 +774,8 @@ class TestRLUtils:
         for mgr_id, count_before in runners_before.items():
             count_after = runners_after[mgr_id]
             assert count_after == count_before, (
-                f"Expected runner count to remain {count_before} after get_logprobs, "
-                f"but got {count_after}. get_logprobs should reuse training CUDA graphs."
+                f"Expected runner count to remain {count_before} after `get_logprobs`, "
+                f"but got {count_after}. `get_logprobs` should reuse training CUDA graphs."
             )
 
         # Verify outputs are valid
