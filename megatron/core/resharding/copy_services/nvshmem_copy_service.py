@@ -171,17 +171,8 @@ class NVSHMEMCopyService(CopyService):
 
         has_work = bool(self._remote.send_requests or self._remote.receive_requests)
 
-        if has_work:
-            logger.info("NVSHMEMCopyService: building NVSHMEM schedule and executing")
-        else:
-            logger.info("NVSHMEMCopyService: no remote requests; participating in collectives only")
-
+        logger.info("NVSHMEMCopyService: building NVSHMEM schedule and executing")
         self._remote.schedule()
         self._remote.run()
-
-        if has_work:
-            self._remote.clear_requests()
-            logger.info("NVSHMEMCopyService: NVSHMEM transfers complete")
-        else:
-            self._remote.clear_requests()
-            logger.info("NVSHMEMCopyService: collective participation complete")
+        self._remote.clear_requests()
+        logger.info("NVSHMEMCopyService: NVSHMEM transfers complete")

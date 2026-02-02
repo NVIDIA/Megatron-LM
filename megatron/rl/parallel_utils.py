@@ -31,7 +31,7 @@ def build_inference_pg_collection(
     - expert_grid: for MoE expert layers (expt_tp, ep, expt_dp, pp)
 
     Args:
-        world_size: Total world size (number of ranks) for this model.
+        world_size: Total world size (number of ranks).
         tp_size: Tensor model parallel size. Defaults to training's TP size.
         pp_size: Pipeline parallel size. Defaults to training's PP size.
         cp_size: Context parallel size. Defaults to training's CP size.

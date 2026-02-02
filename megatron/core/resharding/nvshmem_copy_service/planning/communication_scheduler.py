@@ -126,6 +126,27 @@ class CommunicationScheduler:
                     conflicts += 1
             return conflicts
 
+        def has_conflict(batch: ScheduledBatch, iteration_state: Dict) -> bool:
+            """
+            Check if a batch conflicts with an iteration's current PE usage.
+
+            A batch conflicts if either its source or destination PE is already
+            being used (as sender or receiver) in the iteration.
+
+            Args:
+                batch: The batch to check
+                iteration_state: Dict with 'src_pes' and 'dst_pes' sets
+
+            Returns:
+                True if there's a conflict, False if the batch can be scheduled
+            """
+            return (
+                batch.src_pe in iteration_state['src_pes']
+                or batch.src_pe in iteration_state['dst_pes']
+                or batch.dest_pe in iteration_state['src_pes']
+                or batch.dest_pe in iteration_state['dst_pes']
+            )
+
         # Sort batches: process batches with more potential conflicts first
         # This heuristic (largest-degree-first) often produces better colorings
         # Sort by degree (descending), then total_size (descending) for tie-breaking
@@ -140,13 +161,7 @@ class CommunicationScheduler:
             # Find first iteration where this batch fits (no conflicts)
             assigned = False
             for iter_idx in range(len(iteration_usage)):
-                # Check if src_pe or dest_pe are already busy in this iteration
-                if (
-                    batch.src_pe not in iteration_usage[iter_idx]['src_pes']
-                    and batch.src_pe not in iteration_usage[iter_idx]['dst_pes']
-                    and batch.dest_pe not in iteration_usage[iter_idx]['src_pes']
-                    and batch.dest_pe not in iteration_usage[iter_idx]['dst_pes']
-                ):
+                if not has_conflict(batch, iteration_usage[iter_idx]):
                     # No conflict - assign to this iteration
                     batch.iteration = iter_idx
                     iteration_usage[iter_idx]['src_pes'].add(batch.src_pe)
