@@ -140,10 +140,10 @@ def main(
         succeeded = str(job_dict["status"]) == "SUCCEEDED"
 
         if succeeded:
-            logger.info(f"Job succeeded with status: {job_dict["status"]}")
+            logger.info(f"Job succeeded with status: {job_dict['status']}")
             sys.exit(0)
 
-        logger.error(f"Job failed with status: {job_dict["status"]}")
+        logger.error(f"Job failed with status: {job_dict['status']}")
         log_file_paths = pathlib.Path(os.getcwd()).glob("assets_dir/logs/*/*/attempt_0/*/std*.log")
         all_ranks_all_logs = []
         for log_file_path in log_file_paths:
