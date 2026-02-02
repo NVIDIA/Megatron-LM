@@ -140,7 +140,7 @@ from megatron.training.datasets.data_samplers import build_pretraining_data_load
 from megatron.core.datasets.data_schedule import HybridCPDataLoaderWrapper
 from megatron.core.optimizer_param_scheduler import OptimizerParamScheduler
 from megatron.core.transformer.moe import upcycling_utils
-from megatron.core.transformer.moe.moe_utils import track_moe_metrics
+from megatron.core.transformer.moe.moe_utils import track_moe_metrics, clear_aux_losses_tracker
 from megatron.core.transformer.experimental_attention_variant.dsa import DSAIndexerLossLoggingHelper
 from megatron.core.transformer.multi_token_prediction import MTPLossLoggingHelper
 from megatron.core.parallel_state import (
@@ -220,10 +220,20 @@ def num_floating_point_operations(args, batch_size):
     def calculate_layer_counts():
         """Calculate the number of attention, Mamba, and MLP layers."""
         if args.hybrid_override_pattern:
-            counts = {'M': 0, '*': 0, '-': 0, 'E':0}
-            for layer_type in args.hybrid_override_pattern:
-                if layer_type in counts:
-                    counts[layer_type] += 1
+            from megatron.core.ssm.mamba_hybrid_layer_allocation import parse_hybrid_pattern
+            # Parse unified pattern to separate main and MTP components
+            parsed = parse_hybrid_pattern(args.hybrid_override_pattern)
+            counts = {'M': 0, '*': 0, '-': 0, 'E': 0}
+            # Count main decoder layers
+            if parsed.main_pattern:
+                for layer_type in parsed.main_pattern:
+                    if layer_type in counts:
+                        counts[layer_type] += 1
+            # Count MTP layers (pattern repeated mtp_num_depths times)
+            if parsed.mtp_pattern and parsed.mtp_num_depths > 0:
+                for layer_type in parsed.mtp_pattern:
+                    if layer_type in counts:
+                        counts[layer_type] += parsed.mtp_num_depths
             return counts['*'], counts['M'], counts['-'], counts['E']
         else:
             num_attn_layers = round(args.num_layers * args.hybrid_attention_ratio)
@@ -300,7 +310,7 @@ def num_floating_point_operations(args, batch_size):
                      mlp_expansion=4.0, swiglu=False,
                      moe_latent_size=None,
                      moe_ffn_hidden_size=2048, shared_expert_ffn_hidden_size=2048, num_experts_routed_to=1,
-                     vocab_size=256000):
+                     vocab_size=256000, mtp_num_layers=0):
         """Calculate total FLOPs for the hybrid model."""
         flops_fwd = (
                 num_attn_layers * attn_layer_flops(batch_size, seq_len, hidden_size,
@@ -313,7 +323,7 @@ def num_floating_point_operations(args, batch_size):
                 num_moe_layers * moe_layer_flops(batch_size, seq_len, hidden_size, moe_ffn_hidden_size,
                                                  shared_expert_ffn_hidden_size, num_experts_routed_to,
                                                  moe_latent_size, swiglu) +
-                (2 * batch_size * seq_len * hidden_size * vocab_size)  # logits computation
+                (2 * batch_size * seq_len * hidden_size * vocab_size * (1 + mtp_num_layers))  # logits computation
         )
         return flops_fwd * 3
 
@@ -604,6 +614,7 @@ def num_floating_point_operations(args, batch_size):
                                            else args.moe_shared_expert_intermediate_size),
             num_experts_routed_to=args.moe_router_topk,
             vocab_size=args.padded_vocab_size,
+            mtp_num_layers=args.mtp_num_layers,
         )
     else:
         # Compute standard Transformer model FLOPs.
@@ -1008,8 +1019,6 @@ def pretrain(
         args.do_valid,
         args.do_test,
         args.dataloader_type,
-        args.retro_project_dir,
-        args.retro_cyclic_train_iters,
     )
 
     # Print setup timing.
@@ -1026,11 +1035,6 @@ def pretrain(
 
     if not args.skip_train:
         print_rank_0('training ...')
-
-        if args.dataloader_type == 'cyclic' and args.retro_project_dir:
-            assert args.retro_cyclic_train_iters is not None
-            args.train_iters = args.retro_cyclic_train_iters
-            print_rank_0("retro cyclic train iters : %d" % args.train_iters)
 
         iteration = 0
         if args.do_train and args.train_iters > 0:
@@ -1638,10 +1642,19 @@ def train_step(forward_step_func, data_iterator, model, optimizer, opt_param_sch
         # For the mxfp8_param with reuse_grad_buf_for_mxfp8_param_ag and dp_ag_overlap,
         # we need to call the _copy_main_params_to_param_buffer() after the grad buffer
         # is zeroed by zero_grad_buffer() because param and grad buffer are shared.
+        #
+        # However, we should skip this on the first iteration when forward_pre_hook is disabled,
+        # because:
+        # 1. The first iteration's params are already in param.data (from init or checkpoint).
+        # 2. Without forward_pre_hook, finish_param_sync() won't be called to zero the grad buffer,
+        #    so the main grads will be polluted by the main params.
         if args.reuse_grad_buf_for_mxfp8_param_ag and args.overlap_param_gather:
-            for optim_instance in optimizer.chained_optimizers:
-                if isinstance(optim_instance, DistributedOptimizer):
-                    optim_instance._copy_main_params_to_param_buffer()
+            # Check if forward_pre_hook is enabled by checking if hooks are registered.
+            forward_pre_hook_enabled = len(model[0].remove_forward_pre_hook_handles) > 0
+            if forward_pre_hook_enabled:
+                for optim_instance in optimizer.chained_optimizers:
+                    if isinstance(optim_instance, DistributedOptimizer):
+                        optim_instance._copy_main_params_to_param_buffer()
 
         # Forward pass.
         if save_dgrads_in_this_iteration:
@@ -2026,7 +2039,7 @@ def training_log(
                 writer.add_scalar('iteration-time', elapsed_time_per_iteration, iteration)
             if wandb_writer:
                 wandb_writer.log({'iteration-time': elapsed_time_per_iteration}, iteration)
-        log_string = f" [{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}]"
+        log_string = f" [{datetime.now().strftime('%Y-%m-%d %H:%M:%S.%f')}]"
         log_string += ' iteration {:8d}/{:8d} |'.format(iteration, args.train_iters)
         log_string += ' consumed samples: {:12d} |'.format(args.consumed_train_samples)
         if has_rl_utils and args.rl_use_sequence_packing:
@@ -2764,8 +2777,15 @@ def train(
 
         if getattr(args, 'perform_rl_step', False):
             with torch.no_grad():
-                train_data_iterator = rl_utils.setup_grpo_data_iterator(
-                    model, inference_model, optimizer, iteration, ref_state_dict, buffered_rollouts
+                train_data_iterator = rl_utils.get_grpo_data_iterator(
+                    model, inference_model, optimizer, iteration, ref_state_dict,
+                    grpo_iterations=args.grpo_iterations,
+                    grpo_prompts_per_step=args.grpo_prompts_per_step,
+                    grpo_group_size=args.grpo_group_size,
+                    global_batch_size=args.global_batch_size,
+                    sequence_packing=args.rl_use_sequence_packing,
+                    buffered_rollouts=buffered_rollouts,
+                    is_correction=args.rl_inference_logprobs_is_correction,
                 )
                 # Buffered rollouts are used as a state container for setups when
                 # we use previously-generated data for an update.
@@ -2844,7 +2864,10 @@ def train(
         if getattr(args, 'perform_rl_step', False) and args.rl_use_sequence_packing:
             iteration_sequences = rl_utils.get_iteration_sequence_count(args)
             # Track bins separately for packed mode
-            rl_utils.update_sequence_packing_metrics(args)
+            bin_count = (
+                mpu.get_data_parallel_world_size() * args.micro_batch_size * get_num_microbatches()
+            )
+            args.consumed_train_bins += bin_count
         else:
             batch_size = (
                 mpu.get_data_parallel_world_size() * args.micro_batch_size * get_num_microbatches()
@@ -2953,6 +2976,8 @@ def train(
             timers('interval-time', log_level=0).start(barrier=True)
             if args.log_energy:
                 energy_monitor.resume()
+            if args.num_experts is not None:
+                clear_aux_losses_tracker()
 
         # Miscellaneous post-training-step functions (e.g., FT heartbeats, GC).
         # Some of these only happen at specific iterations. Capture updated FLOPs accumulator
@@ -3004,7 +3029,7 @@ def train(
     if args.log_energy:
         energy_monitor.lap()
         total_energy = energy_monitor.get_total()
-        print_rank_0(f"Total training energy (GPU): {total_energy / 1e6} MJ")
+        print_rank_0(f"Total training energy (GPU): {total_energy / 1e6:.3f} MJ")
         energy_monitor.shutdown()
 
     # If any exit conditions (signal handler, duration, iterations) have been reached, exit.
