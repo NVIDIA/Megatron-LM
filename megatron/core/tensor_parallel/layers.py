@@ -6,11 +6,12 @@
 import os
 import warnings
 from functools import partial
-from typing import Any, Callable, List, Optional, Tuple, override
+from typing import Any, Callable, List, Optional, Tuple
 
 import torch
 import torch.nn.functional as F
 from torch.nn.parameter import Parameter
+from typing_extensions import override
 
 from megatron.core.model_parallel_config import ModelParallelConfig
 from megatron.core.parallel_state import (
