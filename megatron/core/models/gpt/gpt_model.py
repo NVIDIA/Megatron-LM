@@ -619,6 +619,7 @@ class GPTModel(LanguageModule):
                     output_cross_entropy_loss=True,
                     input_=hidden_states_list[mtp_layer_number + 1],
                     weight=output_weight,
+                    labels=mtp_labels,
                     runtime_gather_output=runtime_gather_output,
                 )
 

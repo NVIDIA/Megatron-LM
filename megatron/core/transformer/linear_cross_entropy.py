@@ -34,6 +34,7 @@ class LinearCrossEntropyModule(tensor_parallel.ColumnParallelLinear):
     ) -> Union[torch.Tensor, Tuple[torch.Tensor, Optional[torch.Tensor]]]:
         """Run either the plain ColumnParallelLinear or fused linear+cross-entropy."""
         if output_cross_entropy_loss:
+            assert labels is not None, "labels cannot be None when outputting cross-entropy loss."
             return self._compute_linear_and_cross_entropy_loss(
                 hidden=input_,
                 weight=weight if weight is not None else self.weight,
