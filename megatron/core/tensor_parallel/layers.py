@@ -6,7 +6,7 @@
 import os
 import warnings
 from functools import partial
-from typing import Any, Callable, List, Optional, Tuple
+from typing import Any, Callable, List, Optional, Tuple, override
 
 import torch
 import torch.nn.functional as F
@@ -1076,12 +1076,15 @@ class ColumnParallelLinear(torch.nn.Module):
         """Keep compatibility with TE state dict."""
         return None
 
-    def __repr__(self):
+    @override
+    def extra_repr(self) -> str:
         tp = self.output_size // self.output_size_per_partition
         use_bias = self.bias is not None and self.bias is True
         return (
-            f"{type(self).__name__}(in_features={self.input_size}, "
-            f"out_features={self.output_size}, bias={use_bias}, TP={tp})"
+            f"in_features={self.input_size}, "
+            f"out_features={self.output_size}, "
+            f"bias={use_bias}, "
+            f"TP={tp}"
         )
 
 
@@ -1319,10 +1322,13 @@ class RowParallelLinear(torch.nn.Module):
         """Keep compatibility with TE state dict."""
         return None
 
-    def __repr__(self):
+    @override
+    def extra_repr(self) -> str:
         tp = self.input_size // self.input_size_per_partition
         use_bias = self.bias is not None and self.bias is True
         return (
-            f"{type(self).__name__}(in_features={self.input_size}, "
-            f"out_features={self.output_size}, bias={use_bias}, TP={tp})"
+            f"in_features={self.input_size}, "
+            f"out_features={self.output_size}, "
+            f"bias={use_bias}, "
+            f"TP={tp}"
         )
