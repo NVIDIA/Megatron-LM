@@ -7,7 +7,8 @@ High-level refit/reshard orchestration:
 - reshard_model_weights: transport-agnostic core; builds/caches plan and executes.
 """
 
-from typing import Any, Literal, Union
+from dataclasses import dataclass
+from typing import Any, Literal, Optional, Tuple, Union
 
 import torch
 
@@ -24,9 +25,53 @@ from .copy_services.nvshmem_copy_service import NVSHMEMCopyService
 # Supported refit backend names
 RefitBackendName = Literal["nccl", "gloo", "nvshmem"]
 
+
+@dataclass(frozen=True)
+class _PlanCacheKey:
+    """Cache key for reshard plans.
+
+    Frozen dataclass ensures immutability and automatic __hash__/__eq__ implementation.
+    """
+    rank: int
+    src_config: Optional[Tuple[int, int, int]]  # (TP, PP, EP) or None
+    dst_config: Optional[Tuple[int, int, int]]  # (TP, PP, EP) or None
+    num_experts: Optional[int]
+
+
+def _get_config_tuple(core) -> Optional[Tuple[int, int, int]]:
+    """Extract (TP, PP, EP) sizes from a model core, or None if core is None."""
+    if core is None:
+        return None
+    pg = core.pg_collection
+    return (
+        len(torch.distributed.get_process_group_ranks(pg.tp)) if pg.tp else 1,
+        len(torch.distributed.get_process_group_ranks(pg.pp)) if pg.pp else 1,
+        len(torch.distributed.get_process_group_ranks(pg.ep)) if pg.ep else 1,
+    )
+
+
+def _build_plan_cache_key(src_core, tgt_core, num_experts: Optional[int]) -> _PlanCacheKey:
+    """Build cache key for reshard plan.
+
+    Args:
+        src_core: Source model core (or None for non-collocated destination/idle ranks)
+        tgt_core: Target model core (or None for non-collocated source/idle ranks)
+        num_experts: Number of MoE experts (or None for non-MoE models)
+
+    Returns:
+        Cache key that uniquely identifies this reshard configuration for this rank
+    """
+    rank = torch.distributed.get_rank()
+    src_config = _get_config_tuple(src_core)
+    dst_config = _get_config_tuple(tgt_core)
+    return _PlanCacheKey(
+        rank=rank, src_config=src_config, dst_config=dst_config, num_experts=num_experts
+    )
+
+
 # Module-level cache for refit services to avoid repeated allocations
 _service_cache: dict[str, CopyService] = {}
-_plan_cache: dict[int, Any] = {}
+_plan_cache: dict[_PlanCacheKey, Any] = {}
 
 
 def get_or_create_service(backend: RefitBackendName) -> CopyService:
@@ -56,9 +101,37 @@ def clear_service_cache():
 
     Call this if you need to invalidate the cache, for example when
     reinitializing distributed state.
+
+    This properly finalizes services (especially NVSHMEM) to free GPU buffers
+    before clearing the cache.
     """
     global _service_cache
+
+    # Finalize services to free resources (especially NVSHMEM buffers)
+    # NCCL/Gloo services have no cleanup needed (no persistent buffers).
+    for backend_name, service in _service_cache.items():
+        # NVSHMEM: NVSHMEMCopyService wraps RemoteCopyService which allocates
+        # ~1GB of GPU buffers. Call finalize() on the inner service to free them.
+        if hasattr(service, '_remote') and hasattr(service._remote, 'finalize'):
+            service._remote.finalize()
+
     _service_cache.clear()
+
+
+def clear_plan_cache():
+    """
+    Clear the cached refit plans.
+    """
+    global _plan_cache
+    _plan_cache.clear()
+
+
+def clear_all_caches():
+    """
+    Clear both service and plan caches.
+    """
+    clear_service_cache()
+    clear_plan_cache()
 
 
 def swap_model_weights(
@@ -101,14 +174,14 @@ def reshard_model_weights(
 
     # Handle idle ranks (both models None) - they participate in collectives but have no work
     if src_model is None and target_model is None:
-        rank = torch.distributed.get_rank()
+        cache_key = _build_plan_cache_key(src_core=None, tgt_core=None, num_experts=None)
 
         # Use cached plan if available, otherwise build (with collective participation)
-        if rank not in _plan_cache:
+        if cache_key not in _plan_cache:
             plan = build_centralized_reshard_plan(None, None, num_experts=None)
-            _plan_cache[rank] = plan
+            _plan_cache[cache_key] = plan
         else:
-            plan = _plan_cache[rank]
+            plan = _plan_cache[cache_key]
         execute_reshard_plan(plan, None, None, service=service)
         return
 
@@ -142,13 +215,13 @@ def reshard_model_weights(
             raise RuntimeError("Target model missing pg_collection required for reshard")
 
     # Build or retrieve cached plan
-    rank = torch.distributed.get_rank()
+    cache_key = _build_plan_cache_key(src_core, tgt_core, num_experts)
 
-    if rank not in _plan_cache:
+    if cache_key not in _plan_cache:
         # All ranks must participate in planning (collective operations)
         plan = build_centralized_reshard_plan(src_core, tgt_core, num_experts=num_experts)
-        _plan_cache[rank] = plan
+        _plan_cache[cache_key] = plan
     else:
-        plan = _plan_cache[rank]
+        plan = _plan_cache[cache_key]
 
     execute_reshard_plan(plan, src_core, tgt_core, service=service)

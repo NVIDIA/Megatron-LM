@@ -458,6 +458,22 @@ def select_src_metadata_balanced(
         # else: EP resharding mode (sizes differ) - skip filter, keep all source candidates
 
     # ============================================================================
+    # LOCAL COPY OPTIMIZATION (COLLOCATED MODE)
+    # ============================================================================
+    # In collocated mode, prefer local copies when available. If dst_rank appears
+    # in the source metadata list (after TP/EP filtering), use it directly to
+    # avoid unnecessary data transfers.
+    #
+    # A local copy is essentially free
+    # (tensor.copy_() on same GPU), while any remote transfer incurs significant
+    # overhead even within the same node.
+    # ============================================================================
+    local_meta = [m for m in src_meta_list if m.owner_rank == dst_rank]
+    if local_meta:
+        # Found local metadata - use it for a free local copy
+        return local_meta[0]
+
+    # ============================================================================
     # DATA PARALLELISM (DP) LOAD BALANCING
     # ============================================================================
     # After TP/EP filtering (if applicable), balance transfer load across source
@@ -482,9 +498,13 @@ def select_src_metadata_balanced(
     sorted_dp_groups = sorted(grouped_by_dp.keys())
     chosen_group = sorted_dp_groups[dst_rank % len(sorted_dp_groups)]
 
-    # Within the chosen DP group, any metadata entry works (they all have the same
-    # DP group configuration). Pick the first one as our representative.
-    selected = grouped_by_dp[chosen_group][0]
+    # Within the chosen DP group, distribute across available metadata entries
+    # to balance load across all TP groups in the DP replica.
+    # Example: With 4 TP groups in a DP group, dst_ranks will cycle through all 4
+    # instead of always using the first one, better distributing transfer load.
+    group_metadata = grouped_by_dp[chosen_group]
+    within_group_idx = (dst_rank // len(sorted_dp_groups)) % len(group_metadata)
+    selected = group_metadata[within_group_idx]
     return selected
 
 
