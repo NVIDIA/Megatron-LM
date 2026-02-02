@@ -969,21 +969,6 @@ def pretrain(
                 )
             inference_model[0].eval()
 
-            # Create refit service once and store it for reuse across all training iterations
-            # This avoids repeated NVSHMEM buffer allocations
-            print_rank_0(f"Creating refit service ({args.refit_method}) for reuse across training...")
-            if args.refit_method == 'nvshmem':
-                from megatron.core.resharding.copy_services.nvshmem_copy_service import NVSHMEMCopyService
-                args.refit_service = NVSHMEMCopyService()
-            elif args.refit_method == 'nccl':
-                from megatron.core.resharding.copy_services.nccl_copy_service import NCCLCopyService
-                args.refit_service = NCCLCopyService()
-            elif args.refit_method == 'gloo':
-                from megatron.core.resharding.copy_services.gloo_copy_service import GlooCopyService
-                args.refit_service = GlooCopyService()
-            else:
-                # Fallback to string method (legacy behavior)
-                args.refit_service = args.refit_method
 
     # Data stuff.
     app_metrics['app_build_dataiters_start_time'] = one_logger_utils.get_timestamp_in_ms()
@@ -1088,7 +1073,7 @@ def pretrain(
                 # back to the inference model for RL evaluation.
                 rl_utils._maybe_prefetch_separate_inference_model_weights(inf_core, to_cpu=False)
                 # Use the reusable service instance
-                swap_model_weights(model, inference_model, refit_service)
+                swap_model_weights(model, inference_model, args.refit_method)
                 rl_eval_model = inference_model
             rl_utils.evaluate_and_print_results_rl(
                 valid_data_iterator,
@@ -2950,9 +2935,7 @@ def train(
                     rl_utils._maybe_prefetch_separate_inference_model_weights(
                         inf_core, to_cpu=False
                     )
-                    # Use the reusable service instance
-                    refit_service = getattr(args, 'refit_service', args.refit_method)
-                    swap_model_weights(model, inference_model, refit_service)
+                    swap_model_weights(model, inference_model, args.refit_method)
                     rl_eval_model = inference_model
                 rl_utils.evaluate_and_print_results_rl(
                     valid_data_iterator,
