@@ -66,6 +66,7 @@ except:
 
 _IS_GRAPH_CAPTURING = False
 _IS_GRAPH_WARMUP = False
+_JOIN_STREAMS = []
 logger = logging.getLogger(__name__)
 
 # Freeze GC during capture.
@@ -98,6 +99,20 @@ def _set_capture_end():
     _IS_GRAPH_CAPTURING = False
 
 
+def set_external_join_stream_for_graph_capture(stream: torch.cuda.Stream):
+    """Add a stream that needs to be joined for CUDA graph capture."""
+    _JOIN_STREAMS.append(stream)
+
+
+def join_external_streams():
+    """Join external streams back to current stream if it was used during capture."""
+    global _JOIN_STREAMS
+
+    for stream in _JOIN_STREAMS:
+        torch.cuda.current_stream().wait_stream(stream)
+    _JOIN_STREAMS = []
+
+
 def is_graph_warmup():
     """Query if currently warming up for graph capture."""
     return _IS_GRAPH_WARMUP
@@ -112,6 +127,7 @@ def _set_warmup_start():
 def _set_warmup_end():
     """Set graph warmup has ended."""
     global _IS_GRAPH_WARMUP
+    _IS_GRAPH_WARMUP = False
 
 
 @dataclass
@@ -576,15 +592,20 @@ class _CudagraphReplayNode(torch.autograd.Function):
 
         # Copy new data into fwd graph input buffer
         need_copy_inputs = []
+
         for user_input, cudagraph_input in zip(inputs, runner.fwd_graph_input_surface):
-            if (
-                hasattr(cudagraph_input, "can_skip_replay_copy")
-                and cudagraph_input.can_skip_replay_copy
-            ):
-                need_copy_inputs.append(user_input)
-                assert user_input.data_ptr() == cudagraph_input.data_ptr()
+            if hasattr(cudagraph_input, "can_skip_replay_copy"):
+                if not cudagraph_input.can_skip_replay_copy:
+                    cudagraph_input.copy_(user_input)
+                    need_copy_inputs.append(user_input)
             else:
-                cudagraph_input.copy_(user_input)
+                assert user_input.data_ptr() == cudagraph_input.data_ptr(), (
+                    f"Static CUDA graph input tensor changed memory address between graph capture and replay. "
+                    f"Expected data_ptr={cudagraph_input.data_ptr()}, got data_ptr={user_input.data_ptr()}. "
+                    f"Tensor shape={user_input.shape}, dtype={user_input.dtype}. "
+                    f"Static inputs must maintain the same memory address across replays. "
+                    f"Consider marking this input as copyable during graph capture."
+                )
 
         ctx.runner = runner
         ctx.save_for_backward(*need_copy_inputs)
@@ -609,7 +630,14 @@ class _CudagraphReplayNode(torch.autograd.Function):
                 FP8GlobalStateManager.set_skip_fp8_weight_update_tensor(not is_first_microbatch)
                 runner.fp8_param_cache_updated = is_first_microbatch
 
-        runner.fwd_graph.replay()
+        if runner.stream is not None:
+            runner.stream.wait_stream(torch.cuda.current_stream())
+            with torch.cuda.stream(runner.stream):
+                runner.fwd_graph.replay()
+            torch.cuda.current_stream().wait_event(runner.fwd_completion_event)
+        else:
+            runner.fwd_graph.replay()
+
         return runner.fwd_graph_output_surface
 
     @staticmethod
@@ -626,12 +654,11 @@ class _CudagraphReplayNode(torch.autograd.Function):
         assert len(grads) == len(
             runner.static_grad_outputs
         ), "Bwd cudagraph received a different number of tensors than what it was graphed with!"
-
         need_copy_inputs = list(ctx.saved_tensors)
         for cudagraph_input in runner.fwd_graph_input_surface:
             if (
                 hasattr(cudagraph_input, "can_skip_replay_copy")
-                and cudagraph_input.can_skip_replay_copy
+                and not cudagraph_input.can_skip_replay_copy
             ):
                 cudagraph_input.copy_(need_copy_inputs.pop(0))
 
@@ -642,7 +669,14 @@ class _CudagraphReplayNode(torch.autograd.Function):
             if user_output_grad.data_ptr() != cudagraph_output_grad.data_ptr():
                 cudagraph_output_grad.copy_(user_output_grad)
 
-        runner.bwd_graph.replay()
+        if runner.stream is not None:
+            runner.stream.wait_stream(torch.cuda.current_stream())
+            with torch.cuda.stream(runner.stream):
+                runner.bwd_graph.replay()
+            torch.cuda.current_stream().wait_event(runner.bwd_completion_event)
+        else:
+            runner.bwd_graph.replay()
+
         runner.status = _GraphStatus.FWD_READY
 
         # Update FP8 scale factors if needed
@@ -678,6 +712,7 @@ class _CudaGraphRunner(torch.nn.Module):
         fwd_graph_input_kwargs: Dict[str, Any],
         func,
         need_backward,
+        stream: torch.cuda.Stream = None,
     ):
         """Creates a _CudaGraphRunner, which holds a single pair of fwd and bwd cudagraphs, which
         are not created until this runner records its graph creation into
@@ -687,6 +722,7 @@ class _CudaGraphRunner(torch.nn.Module):
 
         self.base_module = base_module
         self.mempool = mempool
+        self.stream = None
 
         self.fwd_graph_input_arg_metas = [ArgMetadata(a) for a in fwd_graph_input_args]
         self.fwd_graph_input_kwarg_metas = {
@@ -730,6 +766,20 @@ class _CudaGraphRunner(torch.nn.Module):
             self.fp4_enabled = self.base_module.config.fp4 is not None
             self.fp8_runtime_enabled = None
             self.fp4_runtime_enabled = None
+
+            if self.base_module.config.fine_grained_activation_offloading:
+                # Dedicated stream for this runner's graph replays
+                self.stream = stream
+                self.fwd_completion_event = (
+                    torch.cuda.Event(external=True, interprocess=True)
+                    if stream is not None
+                    else None
+                )
+                self.bwd_completion_event = (
+                    torch.cuda.Event(external=True, interprocess=True)
+                    if stream is not None
+                    else None
+                )
 
             if self.fp8_enabled:
                 self.fp8_recipe = FP8GlobalStateManager.get_fp8_recipe()
@@ -878,7 +928,7 @@ class _CudaGraphRunner(torch.nn.Module):
 
         if clone_inputs:
             # if a buffer is used for multiple inputs, create it now
-            for ten in self.get_tensors(args, kwargs):
+            for ten in self.get_arg_metas(args, kwargs):
                 if (
                     hasattr(ten, 'cg_buffer_metadata')
                     and ten.cg_buffer_metadata.input_use_count > 1
@@ -951,6 +1001,11 @@ class _CudaGraphRunner(torch.nn.Module):
                     fwd_graph_outputs = self.func(
                         *self.fwd_graph_input_args, **self.fwd_graph_input_kwargs
                     )
+                    # Record completion event inside the graph so the current stream can
+                    # proceed as soon as module compute finishes, before async comms are joined.
+                    if self.fwd_completion_event is not None:
+                        self.fwd_completion_event.record()
+                    join_external_streams()
 
                 # Unfreeze GC.
                 if FREEZE_GC:
@@ -1070,6 +1125,10 @@ class _CudaGraphRunner(torch.nn.Module):
                 only_inputs=True,
                 allow_unused=True,
             )
+
+            if self.bwd_completion_event is not None:
+                self.bwd_completion_event.record()
+            join_external_streams()
 
         # Unfreeze GC.
         if FREEZE_GC:
@@ -1422,6 +1481,7 @@ class CudaGraphManager(torch.nn.Module):
         self.cudagraph_runners: list[_CudaGraphRunner] = []
         self.inference_cudagraphs_lookup_table: dict = defaultdict(lambda: None)
         self.is_first_microbatch = False
+        self.stream = torch.cuda.Stream()
 
         # Without pipeline parallelism, microbatches execute one at a time.
         # Therefore modules will always execute in the same order, so cudagraphs
@@ -1498,6 +1558,7 @@ class CudaGraphManager(torch.nn.Module):
                         kwargs,
                         self.func,
                         self.need_backward,
+                        stream=self.stream,
                     )
                     self.cudagraph_runners.append(runner)
                     if is_inference_mode:
@@ -1522,6 +1583,7 @@ class CudaGraphManager(torch.nn.Module):
                     kwargs,
                     self.func,
                     self.need_backward,
+                    stream=self.stream,
                 )
                 self.cudagraph_runners.append(runner)
 
