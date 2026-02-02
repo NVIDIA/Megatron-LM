@@ -11,6 +11,8 @@ This example demonstrates:
 - CommonConfig for shared settings with per-layer overrides
 """
 
+from dataclasses import replace
+
 from megatron.core.models.hl import (
     HLModel,
     CommonConfig,
@@ -18,7 +20,6 @@ from megatron.core.models.hl import (
     AttentionLayer,
     MambaLayer,
     MoELayer,
-    ParallelismConfig,
     PipelineSplit,
 )
 
@@ -32,6 +33,13 @@ common_config = CommonConfig(
     bf16=True,
     tensor_model_parallel_size=8,
     sequence_parallel=True,
+)
+
+# MoE-specific configuration (copy of common_config with expert parallelism)
+moe_config = replace(
+    common_config,
+    expert_model_parallel_size=16,
+    expert_tensor_parallel_size=8,
 )
 
 # =============================================================================
@@ -61,6 +69,7 @@ A1 = AttentionLayer(
 )
 
 E1 = MoELayer(
+    moe_config=moe_config,
     ffn_hidden_size=1856,
     num_experts=128,
     top_k=6,
@@ -74,11 +83,6 @@ E1 = MoELayer(
     activation="squared_relu",
     token_dispatcher_type="allgather",
     grouped_gemm=True,
-    # Extends common_config.parallelism with expert-specific settings
-    parallelism=ParallelismConfig(
-        expert_parallel_size=16,
-        expert_tensor_parallel_size=8,
-    ),
 )
 
 # =============================================================================
