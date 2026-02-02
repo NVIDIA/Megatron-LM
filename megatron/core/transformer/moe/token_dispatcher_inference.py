@@ -5,6 +5,9 @@ Inference-optimized AlltoAll Token Dispatcher with GPU-resident metadata.
 
 This implementation keeps tokens_per_expert GPU-resident to enable use of
 torch._grouped_mm without host synchronization.
+
+Supports latency-optimized NVLS collectives (multimem all-gather/reduce-scatter)
+on Hopper+ GPUs with BF16, with automatic fallback to NCCL via superclass methods.
 """
 
 import torch
@@ -16,11 +19,16 @@ from megatron.core.transformer.moe.token_dispatcher import (
 )
 from megatron.core.transformer.transformer_config import TransformerConfig
 
-from megatron.core.tensor_parallel import gather_from_sequence_parallel_region
 from megatron.core.transformer.moe.inference_kernels import (
     launch_fused_permute_and_probs,
     launch_unpermute_kernel,
-)    
+)
+from megatron.core.tensor_parallel import gather_from_sequence_parallel_region
+from megatron.core.parallel_state import get_global_symmetric_memory_buffer_ep
+from megatron.core.inference.communication.torch_symm_triton import (
+    multimem_all_gather,
+    multimem_reduce_scatter,
+)
 
 import logging
 
@@ -61,24 +69,74 @@ class InferenceAllGatherTokenDispatcher(MoEAllGatherTokenDispatcher):
         )
         self.topk = config.moe_router_topk
 
+        # Cache for NVLS eligibility
+        self._nvls_eligible = None
+
+    def _check_nvls_eligibility(self, x: torch.Tensor) -> bool:
+        """
+        Check if we can use NVLS (latency-optimized) collectives.
+        Requirements: BF16 dtype, Hopper+ GPU (SM >= 9).
+        """
+        is_bf16 = x.dtype == torch.bfloat16
+        is_hopper_or_newer = torch.cuda.get_device_properties(x.device).major >= 9
+        return is_bf16 and is_hopper_or_newer
+
+    def _maybe_allocate_ag_buffer(self, x: torch.Tensor) -> dict:
+        """
+        Allocate symmetric memory buffer for all-gather output.
+        Output shape: [local_tokens * ep_size, hidden_dim]
+        """
+        ag_output_dims = list(x.size())
+        ag_output_dims[0] *= self.ep_size
+        symm_mem_buffer = get_global_symmetric_memory_buffer_ep().maybe_get_tensor(
+            ag_output_dims, dtype=x.dtype
+        )
+        return symm_mem_buffer
+
+    def _maybe_allocate_rs_buffer(self, x: torch.Tensor) -> dict:
+        """
+        Allocate symmetric memory buffer for reduce-scatter input.
+        Input shape matches x (the unpermuted hidden states).
+        """
+        symm_mem_buffer = get_global_symmetric_memory_buffer_ep().maybe_get_tensor(
+            list(x.size()), dtype=x.dtype
+        )
+        return symm_mem_buffer
+
     def token_dispatch(self, hidden_states, probs):
-        """Gathers tokens from all TP*EP ranks using AllGather."""
+        """
+        Gathers tokens from all EP ranks using AllGather.
 
-        # Permute the tokens across the expert parallel devices.
-        if self.tp_size > 1 or self.ep_size > 1:
-            ## local_indices calculation
-            with torch.no_grad():
-                # [num_local_tokens, num_experts] -> [num_global_tokens, num_experts], where:
-                #     num_local_tokens=(S/TP)*B, num_global_tokens=S*B*EP
-                self.routing_map = gather_from_sequence_parallel_region(
-                    self.routing_map, group=self.tp_ep_group
-                )
+        Uses NCCL for routing_map and probs.
+        Uses latency-optimized NVLS multimem_all_gather for hidden_states on Hopper+ GPUs
+        with BF16 when symmetric memory is available, falls back to NCCL otherwise.
+        """
+        if self.ep_size == 1:
+            return hidden_states, probs
 
-            ## local_probs calculation
-            # max_prob: [S/TP*B, num_experts] -> global_probs: [S*B*EP, num_experts]
-            probs = gather_from_sequence_parallel_region(probs, group=self.tp_ep_group)
-            # Note that this allgather spans the communication domain of TP*EP.
-            #  [(S/TP)*B, H] -> [((S/TP)*B)*(TP*EP), H] = [S*B*EP, H]
+        # All-gather routing_map and probs using NCCL      
+        self.routing_map = gather_from_sequence_parallel_region(
+            self.routing_map, group=self.tp_ep_group
+        )
+
+        # [local_tokens, num_experts] -> [global_tokens, num_experts]
+        probs = gather_from_sequence_parallel_region(probs, group=self.tp_ep_group)
+
+        # All-gather hidden_states: try NVLS first, fallback to NCCL
+        nvls_eligible = self._check_nvls_eligibility(hidden_states)
+        ag_buffer = None
+
+        if nvls_eligible:
+            ag_buffer = self._maybe_allocate_ag_buffer(hidden_states)
+
+        can_use_nvls = nvls_eligible and ag_buffer["handle"] is not None
+
+        if can_use_nvls:
+            # Use latency-optimized NVLS all-gather for hidden_states
+            multimem_all_gather(ag_buffer["tensor"], hidden_states, ag_buffer["handle"])
+            hidden_states = ag_buffer["tensor"]
+        else:
+            # Fallback to NCCL for hidden_states
             hidden_states = gather_from_sequence_parallel_region(
                 hidden_states, group=self.tp_ep_group
             )
@@ -182,7 +240,7 @@ class InferenceAllGatherTokenDispatcher(MoEAllGatherTokenDispatcher):
         Uses cached mask_T and dest_indices from dispatch_postprocess to avoid
         recomputing them (saves 2 kernel launches).
         """
-        # 1. Pre-allocate static output buffer (zeros for atomic accumulation)
+        # 1. Pre-allocate output buffer w/ zeros.
         unpermuted_hidden = torch.zeros(
             self.hidden_shape_before_permute,
             dtype=permuted_expert_outputs.dtype,
@@ -199,4 +257,47 @@ class InferenceAllGatherTokenDispatcher(MoEAllGatherTokenDispatcher):
         )
 
         return unpermuted_hidden
+
+    def token_combine(self, hidden_states):
+        """
+        Combines expert outputs using Reduce-Scatter.
+
+        Uses latency-optimized NVLS multimem_reduce_scatter on Hopper+ GPUs with BF16
+        when symmetric memory is available. Falls back to NCCL via superclass otherwise.
+
+        Args:
+            hidden_states: [global_tokens, hidden_dim] tensor to reduce-scatter
+
+        Returns:
+            [local_tokens, hidden_dim] tensor after reduce-scatter
+        """
+        if self.ep_size == 1:
+            return hidden_states
+
+        # Check NVLS eligibility and try to allocate symmetric memory
+        nvls_eligible = self._check_nvls_eligibility(hidden_states)
+        rs_buffer = None
+
+        if nvls_eligible:
+            rs_buffer = self._maybe_allocate_rs_buffer(hidden_states)
+
+        can_use_nvls = nvls_eligible and rs_buffer["handle"] is not None
+
+        if can_use_nvls:
+            # Copy input to symmetric memory for reduce-scatter
+            rs_buffer["tensor"].copy_(hidden_states)
+
+            # Allocate output tensor
+            output_shape = list(hidden_states.size())
+            output_shape[0] = hidden_states.size(0) // self.ep_size
+            output = torch.empty(
+                output_shape, dtype=hidden_states.dtype, device=hidden_states.device
+            )
+
+            # Use latency-optimized NVLS reduce-scatter
+            multimem_reduce_scatter(output, rs_buffer["tensor"], rs_buffer["handle"])
+            return output
+        else:
+            # Fallback to NCCL via superclass
+            return super().token_combine(hidden_states)
 

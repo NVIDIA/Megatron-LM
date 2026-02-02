@@ -14,7 +14,7 @@ from megatron.core.inference.communication.torch_symm_triton import (
     multimem_reduce_scatter,
 )
 from megatron.core.model_parallel_config import ModelParallelConfig
-from megatron.core.parallel_state import get_global_symmetric_memory_buffer
+from megatron.core.parallel_state import get_global_symmetric_memory_buffer_tp
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.utils import get_tensor_model_parallel_group_if_none
 
@@ -103,7 +103,7 @@ class InferenceLayerNormColumnParallelLinear(TELayerNormColumnParallelLinear):
         """
         symm_mem_buffer_dims = list(x.size())
         symm_mem_buffer_dims[0] *= self.tp_size
-        symm_mem_buffer = get_global_symmetric_memory_buffer().maybe_get_tensor(
+        symm_mem_buffer = get_global_symmetric_memory_buffer_tp().maybe_get_tensor(
             symm_mem_buffer_dims, dtype=x.dtype
         )
         return symm_mem_buffer
@@ -223,7 +223,7 @@ class InferenceRowParallelLinear(TERowParallelLinear):
         # 3. attempt to ask for symmetric memory
         symm_mem_buffer_dims = list(x.size())
         symm_mem_buffer_dims[-1] = self.weight.size(0)
-        symm_mem_buffer = get_global_symmetric_memory_buffer().maybe_get_tensor(
+        symm_mem_buffer = get_global_symmetric_memory_buffer_tp().maybe_get_tensor(
             symm_mem_buffer_dims, dtype=x.dtype
         )
         has_enough_symmetric_memory = symm_mem_buffer["handle"] is not None
