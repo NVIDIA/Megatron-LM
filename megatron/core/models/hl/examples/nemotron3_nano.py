@@ -11,8 +11,6 @@ This example demonstrates:
 - CommonConfig for shared settings with per-layer overrides
 """
 
-from dataclasses import replace
-
 from megatron.core.models.hl import (
     HLModel,
     CommonConfig,
@@ -36,8 +34,7 @@ common_config = CommonConfig(
 )
 
 # MoE-specific configuration (copy of common_config with expert parallelism)
-moe_common_config = replace(
-    common_config,
+moe_common_config = common_config.update(
     expert_model_parallel_size=16,
     expert_tensor_parallel_size=8,
 )

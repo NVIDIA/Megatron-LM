@@ -11,8 +11,6 @@ Demonstrates using multiple layer configurations:
 - SmallMoE: 32 experts (top-2), bf16, custom parallelism
 """
 
-from dataclasses import replace
-
 import torch
 
 from megatron.core.models.hl import (
@@ -38,8 +36,7 @@ common_config = CommonConfig(
 )
 
 # MoE-specific configuration (copy of common_config with expert parallelism)
-moe_common_config = replace(
-    common_config,
+moe_common_config = common_config.update(
     expert_model_parallel_size=16,
     expert_tensor_parallel_size=8,
 )
@@ -100,7 +97,7 @@ LargeMoE = MoELayerConfig(
 )
 
 SmallMoE = MoELayerConfig(
-    common_config=replace(moe_common_config, expert_model_parallel_size=4),
+    common_config=moe_common_config.update(expert_model_parallel_size=4),
     ffn_hidden_size=3712,
     num_experts=32,
     top_k=2,
