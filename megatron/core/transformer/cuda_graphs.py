@@ -1855,7 +1855,7 @@ class TECudaGraphHelper:
             Get the static inputs for a layer.
             """
             assert layer in chunk_of_the_layer.decoder.layers or any(
-                layer is mtp_layer.transformer_layer for mtp_layer in chunk_of_the_layer.mtp.layers
+                layer is mtp_layer.mtp_model_layer for mtp_layer in chunk_of_the_layer.mtp.layers
             ), "Layer is not in the chunk"
 
             def get_rotary_pos_emb(transformer_module, transformer_input):
