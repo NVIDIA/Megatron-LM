@@ -441,7 +441,7 @@ class DynamicInferenceContext(BaseInferenceContext):
                         "Unified memory requested but not available; defaulting to GPU memory."
                     )
                 self.unified_memory_level = 0
-        # If CUDA graphs are not reset but KV$ memory address is not static, we need
+        # If CUDA graphs are not reset and KV cache memory address is not static, we need
         # either UVM or torch_memory_saver to maintain memory address stability for CGs.
         if not self.reset_cuda_graphs and self.kv_cache_management_mode != "persist":
             assert HAVE_TORCH_MEMORY_SAVER or self.unified_memory_level > 0, (
