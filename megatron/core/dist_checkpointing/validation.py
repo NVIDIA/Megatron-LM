@@ -4,7 +4,6 @@ import logging
 import os
 from collections import Counter, defaultdict
 from enum import Enum
-from itertools import chain
 from typing import TYPE_CHECKING, List, Optional, Set, Tuple, Union
 
 import numpy as np
