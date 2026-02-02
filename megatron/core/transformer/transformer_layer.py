@@ -673,7 +673,7 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
 
         if self.config.enable_hyper_connections and self.do_self_attention_hyper_connection:
             nvtx_range_push(suffix="self_attention_hyper_connection_post")
-            attention_output_with_bias = self.self_attention_hyper_connection.apply_h_post_with_checkpoint(
+            attention_output_with_bias = self.self_attention_hyper_connection.apply_h_post(
                 attention_output_with_bias, self_attn_hc_h_post, manager=mhc_recompute_manager
             )
             nvtx_range_pop(suffix="self_attention_hyper_connection_post")
@@ -740,7 +740,7 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
 
         if self.config.enable_hyper_connections and self.do_cross_attention_hyper_connection:
             nvtx_range_push(suffix="cross_attention_hyper_connection_post")
-            attention_output_with_bias = self.cross_attention_hyper_connection.apply_h_post_with_checkpoint(
+            attention_output_with_bias = self.cross_attention_hyper_connection.apply_h_post(
                 attention_output_with_bias, cross_attn_hc_h_post, manager=mhc_recompute_manager
             )
             nvtx_range_pop(suffix="cross_attention_hyper_connection_post")
@@ -918,11 +918,11 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
             return list(mlp_output_with_bias) + [residual]
         else:
             if self.config.enable_hyper_connections and self.do_mlp_hyper_connection:
-                    nvtx_range_push(suffix="mlp_hyper_connection_post")
-                    mlp_output_with_bias = self.mlp_hyper_connection.apply_h_post_with_checkpoint(
-                        mlp_output_with_bias, mlp_hc_h_post, manager=mhc_recompute_manager
-                    )
-            nvtx_range_pop(suffix="mlp_hyper_connection_post")
+                nvtx_range_push(suffix="mlp_hyper_connection_post")
+                mlp_output_with_bias = self.mlp_hyper_connection.apply_h_post(
+                    mlp_output_with_bias, mlp_hc_h_post, manager=mhc_recompute_manager
+                )
+                nvtx_range_pop(suffix="mlp_hyper_connection_post")
 
             return self._forward_post_mlp(
                     mlp_output_with_bias, residual, mhc_recompute_manager, is_last_layer_in_block

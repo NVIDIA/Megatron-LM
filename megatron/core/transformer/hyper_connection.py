@@ -181,35 +181,85 @@ class HyperConnectionModule(MegatronModule):
         
         return h_pre, h_post, h_res
     
-    def apply_h_post(self, x_with_bias: Tuple[Tensor, Optional[Tensor]], h_post: Tensor) -> Tuple[Tensor, Optional[Tensor]]:
+    def _apply_h_post(self, x: Tensor, h_post: Tensor) -> Tensor:
         """
-        Apply H_post to x using H_post weights.
+        Core implementation of H_post application to a single tensor.
         
-        Computes: H_post^T @ x_with_bias
+        Computes: H_post^T @ x
         
-        Here x_with_bias is a tuple of (x, bias), with shape
-        [s, b, C] and [C], respectively.
+        Args:
+            x: Input tensor, can be either:
+               - [s, b, C] - standard hidden states
+               - [C] - bias tensor (will be broadcast)
+            h_post: [s, b, n] - expansion weights
         
-        h_post: [s, b, n] - expansion weights
-
-        Return the tuple of (x, bias) after applying H_post.
+        Returns:
+            output: [s, b, n*C] - expanded tensor
+        """
+        n = self.n
+        s, b, _ = h_post.shape
+        
+        if x.dim() == 1:
+            # x is bias with shape [C], need to broadcast to [s, b, 1, C]
+            C = x.shape[0]
+            x_expanded = x.unsqueeze(0).unsqueeze(0).unsqueeze(0).expand(s, b, 1, C)
+        else:
+            # x is [s, b, C]
+            C = x.shape[-1]
+            x_expanded = x.unsqueeze(2)  # [s, b, 1, C]
+        
+        # h_post^T @ x : [s, b, n, 1] @ [s, b, 1, C] -> [s, b, n, C]
+        result = torch.einsum('sbij,sbjc->sbic', h_post.unsqueeze(-1), x_expanded)
+        return result.view(s, b, n * C)
+    
+    def apply_h_post(
+        self,
+        x_with_bias: Tuple[Tensor, Optional[Tensor]],
+        h_post: Tensor,
+        manager: Optional['MHCBlockRecomputeManager'] = None,
+    ) -> Tuple[Tensor, Optional[Tensor]]:
+        """
+        Apply H_post to x and optionally bias, with optional checkpointing.
+        
+        This is the unified entry point that handles both normal execution
+        and checkpoint-based execution for memory efficiency.
+        
+        Args:
+            x_with_bias: Tuple of (x, bias) where:
+                - x: [s, b, C] - hidden states
+                - bias: [C] or None - optional bias tensor
+            h_post: [s, b, n] - expansion weights
+            manager: Optional MHCBlockRecomputeManager for checkpoint management.
+                When provided, wraps _apply_h_post with CheckpointWithoutOutput.
+        
+        Returns:
+            Tuple of (x_out, bias_out) where:
+                - x_out: [s, b, n*C] - expanded hidden states
+                - bias_out: [s, b, n*C] or None - expanded bias if input bias was not None
         """
         x, bias = x_with_bias
-        s, b, C = x.shape 
-        n = self.n
-
-        # x : h_post^T @ x : [s, b, n, 1] @ [s, b, 1, C] -> [s, b, n, C] 
-        x = torch.einsum('sbij,sbjc->sbic', h_post.unsqueeze(-1), x.unsqueeze(2)) # [s, b, n, C]
-        x = x.view(s, b, n * C)
-
-        if bias is not None : 
-            assert bias.shape == (C,), "Bias must be of shape [C]"
-            # bias : h_post^T @ bias : [s, b, n, 1] @ [s, b, 1, C] -> [s, b, n, C]
-            bias = torch.einsum('sbij,sbjc->sbic', h_post.unsqueeze(-1), bias.unsqueeze(0).expand(s, b, -1, C)) # [s, b, n, C]
-            bias = bias.view(s, b, n * C)
-            return x, bias
+        
+        if manager is not None:
+            from megatron.core.tensor_parallel.random import CheckpointWithoutOutput
+            
+            # Checkpoint _apply_h_post for x
+            x_out = CheckpointWithoutOutput(ckpt_manager=manager).checkpoint(
+                self._apply_h_post, x, h_post
+            )
+            
+            # Checkpoint _apply_h_post for bias if not None
+            if bias is not None:
+                bias_out = CheckpointWithoutOutput(ckpt_manager=manager).checkpoint(
+                    self._apply_h_post, bias, h_post
+                )
+            else:
+                bias_out = None
         else:
-            return x, None
+            # Normal execution without checkpoint
+            x_out = self._apply_h_post(x, h_post)
+            bias_out = self._apply_h_post(bias, h_post) if bias is not None else None
+        
+        return x_out, bias_out
 
     
     def aggregate(self, x: Tensor, h_pre: Tensor) -> Tensor:
@@ -347,34 +397,6 @@ class HyperConnectionModule(MegatronModule):
         )
         
         return aggregated, mixed, h_post
-    
-    def apply_h_post_with_checkpoint(
-        self,
-        x_with_bias: Tuple[Tensor, Optional[Tensor]],
-        h_post: Tensor,
-        manager: Optional['MHCBlockRecomputeManager'] = None,
-    ) -> Tuple[Tensor, Optional[Tensor]]:
-        """
-        Apply H_post with optional checkpointing.
-        
-        When manager is provided, wraps apply_h_post with CheckpointWithoutOutput
-        and auto-registers to the manager for unified recomputation.
-        
-        Args:
-            x_with_bias: Tuple of (x, bias) with shapes [s, b, C] and [C] respectively
-            h_post: [s, b, n] - expansion weights
-            manager: Optional MHCBlockRecomputeManager for checkpoint management
-        
-        Returns:
-            Tuple of (x, bias) after applying H_post
-        """
-        if manager is not None:
-            from megatron.core.tensor_parallel.random import CheckpointWithoutOutput
-            return CheckpointWithoutOutput(ckpt_manager=manager).checkpoint(
-                self.apply_h_post, x_with_bias, h_post
-            )
-        else:
-            return self.apply_h_post(x_with_bias, h_post)
     
     # ==================== Block-level utilities ====================
     
