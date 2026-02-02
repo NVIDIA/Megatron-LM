@@ -472,7 +472,6 @@ def get_environment_rollouts(
         with nvtx_range("prefetch-inference-model-weights-to-gpu"):
             inf_core = unwrap_model(inference_model[0])
             _maybe_prefetch_separate_inference_model_weights(inf_core, to_cpu=False)
-        # Use the reusable service instance
         swap_model_weights(model, inference_model, args.refit_method)
         if args.rl_verify_model_weights_swap:
             verify_model_weights_swap(

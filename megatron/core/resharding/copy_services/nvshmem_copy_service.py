@@ -18,7 +18,6 @@ class NVSHMEMCopyService(CopyService):
     """CopyService implementation backed by NVSHMEM RemoteCopyService."""
 
     def __init__(self):
-        """Initialize NVSHMEM copy service."""
         if not dist.is_initialized():
             raise RuntimeError("torch.distributed must be initialized before NVSHMEMCopyService()")
 
@@ -168,9 +167,6 @@ class NVSHMEMCopyService(CopyService):
         #  - schedule() has dist.all_gather_object() (torch distributed collective)
         #  - run() has nvshmem.core.barrier_all() (nvshmem collective)
         # This is critical for non-collocated refit where some ranks may have no work.
-
-        has_work = bool(self._remote.send_requests or self._remote.receive_requests)
-
         logger.info("NVSHMEMCopyService: building NVSHMEM schedule and executing")
         self._remote.schedule()
         self._remote.run()
