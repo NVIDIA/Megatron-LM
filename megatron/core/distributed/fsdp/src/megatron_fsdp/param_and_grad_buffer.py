@@ -3646,12 +3646,40 @@ class AllGatherPipeline:
         mark_bucket_ready_to_use()
 
     @torch.no_grad()
-    def release_bucket(self, bucket_id, bwd):
-        """Release the bucket."""
-        # TODO(mxfp8): In some cases, there won't be ag before bwd?
-        bucket_key = self.get_bucket_key(bucket_id, bwd)
+    def release_bucket(self, bucket_id, bwd, lazy: bool = False):
+        """
+        Release the specified parameter bucket, freeing its associated buffer storage.
 
+        This function marks or frees the memory of a parameter bucket depending on
+        whether lazy release is enabled. It ensures that buckets are not released
+        while still being communicated or in use by the pipeline.
+
+        Args:
+            bucket_id (int): Identifier of the bucket to be released.
+            bwd (bool): Indicates if the release is triggered during the backward pass.
+            lazy (bool, optional): Determines when the parameter buffer (bucket) is released.
+                - If False, the buffer is released immediately.
+                - If True, the release is deferred until just before the all-gather pipeline
+                requests a new buffer. The delayed release is performed by invoking
+                `recycle_unused_buckets`.
+
+        Raises:
+            ValueError: If the specified bucket is currently in communication and
+                cannot be safely released.
+
+        Notes:
+            - Buckets marked as lazy will be released later when the pipeline determines
+            they are no longer needed.
+            - If the bucket has a transpose weight buffer (used in FP8 backward passes),
+            this buffer is freed; otherwise, the model weight buffer is released.
+        """
+        bucket_key = self.get_bucket_key(bucket_id, bwd)
         if self.bucket_status[bucket_key] == BucketStatus.EMPTY:
+            return
+
+        if lazy:
+            # Mark the bucket can be released later.
+            self.bucket_can_be_released[bucket_key] = True
             return
 
         self.wait_bucket_ready(bucket_id, bwd, empty_ok=True)

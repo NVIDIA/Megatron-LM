@@ -510,10 +510,31 @@ class MegatronFSDP(torch.nn.Module):
         """
         fsdp_unit_modules = self.fsdp_unit_modules
 
-        def release_module_parameters(module, bwd, *unused):
+        def release_module_parameters(module, bwd, lazy=False, *unused):
+            """
+            Release the parameters of a given module after completing the forward
+            and backward passes.
+
+            Args:
+                module: The module whose parameters should be released.
+                bwd (bool): Indicates if the release is triggered during the backward pass.
+                lazy (bool, optional): Determines when the parameter buffer (bucket) is released.
+                    - If False, the buffer is released immediately.
+                    - If True, the release is deferred until just before the all-gather pipeline
+                    requests a new buffer. The delayed release is performed by invoking
+                    `recycle_unused_buckets`.
+                *unused: Placeholder for any unused arguments.
+
+            Notes:
+                - The function maps each parameter to its corresponding buffer group,
+                then releases the associated bucket through the all-gather pipeline.
+                - If `ddp_config.keep_fp8_transpose_cache` is False, it also clears
+                the FP8 transpose cache associated with the module’s parameters.
+            """
             for param in module.parameters():
                 bucket_id = self.param_and_grad_buffer.param_to_param_group[param]
-                self.all_gather_pipeline.release_bucket(bucket_id, bwd)
+                self.all_gather_pipeline.release_bucket(bucket_id, bwd, lazy=lazy)
+
             if not self.ddp_config.keep_fp8_transpose_cache:
                 release_params_fp8_transpose_cache(module.parameters())
 
@@ -850,19 +871,23 @@ class MegatronFSDP(torch.nn.Module):
         def _post_forward(module: nn.Module, input: Any, output: Any):
             # When composed with module-hook-based activation recomputation, the
             # post-backward hook is responsible for resharding the module parameters
-            # after the forward pass. Skip resharding the module parameters in this case.
+            # after the forward pass. In this case, the resharding is performed lazily.
             if module._training_state == TrainingState.PRE_BACKWARD:
-                # Skip weight deallocation until the backward pass is complete
-                # during activation recomputation / gradient checkpointing.
-                return output
+                # Delay parameter resharding because this is currently running inside
+                # the activation recomputation forward. The corresponding backward
+                # pass may still need these parameters, and delaying avoids an
+                # unnecessary all-gather.
+                lazy_release = True
+            else:
+                lazy_release = False
+                module._training_state = TrainingState.IDLE
 
             assert isinstance(
                 module, tuple(fsdp_unit_modules)
             ), "_post_forward hook should only be registered on FSDP unit modules."
 
             # Release the module parameters after the forward pass to save memory.
-            release_module_parameters(module, bwd=False)
-            module._training_state = TrainingState.IDLE
+            release_module_parameters(module, bwd=False, lazy=lazy_release)
 
             return output
 

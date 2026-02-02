@@ -1418,6 +1418,12 @@ def load_args_from_checkpoint(
     _set_arg('hidden_dropout', force=True)
 
     _set_arg('hybrid_override_pattern', force=True)
+
+    # Legacy MTP pattern for old checkpoints
+    _set_arg('mtp_hybrid_override_pattern', force=True)
+    _set_arg('mtp_num_layers', force=True)
+    _set_arg('mtp_use_repeated_layer', force=True)
+
     _set_arg('spec', force=True)
     _set_arg('hybrid_attention_ratio', force=True)
     _set_arg('hybrid_mlp_ratio', force=True)
@@ -1766,7 +1772,6 @@ def load_checkpoint(ddp_model, optimizer, opt_param_scheduler, load_arg='load', 
                 load_return = module.load_state_dict(state_dict, strict=False)
                 print(f"load_return: {load_return}")
     # Model.
-    strict = False if args.retro_add_retriever else strict
     if not skip_load_to_model_and_opt:
         if len(ddp_model) == 1:
             load_model_state_dict(ddp_model[0], state_dict['model'], strict)
