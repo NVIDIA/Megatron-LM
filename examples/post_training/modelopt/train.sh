@@ -11,10 +11,10 @@ export HF_DATASETS_CACHE="/tmp/hf_datasets_cache"
 
 # Extra arguments of this script
 MLM_DEFAULT_ARGS=" \
+    --modelopt-enabled \
     --distributed-timeout-minutes 60 \
     --auto-detect-ckpt-format \
     --export-te-mcore-model \
-    --finetune \
 "
 
 
@@ -69,7 +69,8 @@ fi
 
 export HF_TOKEN=${HF_TOKEN}
 
-${LAUNCH_SCRIPT} ${SCRIPT_DIR}/../../../pretrain_mamba.py \
+#${LAUNCH_SCRIPT} ${SCRIPT_DIR}/../../../pretrain_mamba.py \
+${LAUNCH_SCRIPT} ${SCRIPT_DIR}/../../../pretrain_gpt.py \
     ${MODEL_ARGS} \
     --tensor-model-parallel-size ${TP} \
     --expert-tensor-parallel-size ${ETP} \
