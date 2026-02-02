@@ -693,9 +693,15 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
                     self.self_attn_bda_checkpoint = tensor_parallel.CheckpointWithoutOutput(
                         ckpt_manager=mhc_recompute_manager
                     )
+                    # Unpack tuple to avoid "save_for_backward can only save variables" error
+                    attn_output, attn_bias = attention_output_with_bias
+                    bda_func = self.self_attn_bda(self.training, self.config.bias_dropout_fusion)
+                    
+                    def _bda_wrapper(output, bias, res, dropout):
+                        return bda_func((output, bias), res, dropout)
+                    
                     hidden_states = self.self_attn_bda_checkpoint.checkpoint(
-                        self.self_attn_bda(self.training, self.config.bias_dropout_fusion),
-                        attention_output_with_bias, residual, self.hidden_dropout
+                        _bda_wrapper, attn_output, attn_bias, residual, self.hidden_dropout
                     )
                     # No-op when manager is set - manager handles all discarding uniformly
                     self.self_attn_bda_checkpoint.discard_output_and_register_recompute(hidden_states)
@@ -753,9 +759,15 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
                 self.cross_attn_bda_checkpoint = tensor_parallel.CheckpointWithoutOutput(
                     ckpt_manager=mhc_recompute_manager
                 )
+                # Unpack tuple to avoid "save_for_backward can only save variables" error
+                cross_attn_output, cross_attn_bias = attention_output_with_bias
+                bda_func = self.cross_attn_bda(self.training, self.config.bias_dropout_fusion)
+                
+                def _bda_wrapper(output, bias, res, dropout):
+                    return bda_func((output, bias), res, dropout)
+                
                 hidden_states = self.cross_attn_bda_checkpoint.checkpoint(
-                    self.cross_attn_bda(self.training, self.config.bias_dropout_fusion),
-                    attention_output_with_bias, residual, self.hidden_dropout
+                    _bda_wrapper, cross_attn_output, cross_attn_bias, residual, self.hidden_dropout
                 )
                 # No-op when manager is set - manager handles all discarding uniformly
                 self.cross_attn_bda_checkpoint.discard_output_and_register_recompute(hidden_states)
@@ -973,14 +985,20 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
                     self.mlp_bda_checkpoint = tensor_parallel.CheckpointWithoutOutput(
                         ckpt_manager=mhc_recompute_manager
                     )
+                    # Unpack tuple to avoid "save_for_backward can only save variables" error
+                    mlp_output, mlp_bias = mlp_output_with_bias
+                    bda_func = self.mlp_bda(self.training, self.config.bias_dropout_fusion)
+                    
+                    def _bda_wrapper(output, bias, res, dropout):
+                        return bda_func((output, bias), res, dropout)
+                    
                     hidden_states = self.mlp_bda_checkpoint.checkpoint(
-                        self.mlp_bda(self.training, self.config.bias_dropout_fusion),
-                        mlp_output_with_bias, residual, self.hidden_dropout
+                        _bda_wrapper, mlp_output, mlp_bias, residual, self.hidden_dropout
                     )
                     # No-op when manager is set - manager handles all discarding uniformly
                     self.mlp_bda_checkpoint.discard_output_and_register_recompute(hidden_states)
                 else:
-                # Last layer OR no manager: normal BDA without checkpoint
+                    # Last layer OR no manager: normal BDA without checkpoint
                     hidden_states = self.mlp_bda(self.training, self.config.bias_dropout_fusion)(
                         mlp_output_with_bias, residual, self.hidden_dropout
                     )
