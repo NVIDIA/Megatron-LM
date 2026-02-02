@@ -129,23 +129,26 @@ class InferenceAllGatherTokenDispatcher(MoEAllGatherTokenDispatcher):
         """After gathering in token_dispatch, this method identifies tokens for local experts and
         permutes them for expert processing.
 
-        Optimized to use a fused kernel that:
-        1. Computes mask_T and dest_indices ONCE (instead of twice)
-        2. Permutes hidden states AND extracts probs in a single kernel launch
+        Optimized to:
+        1. Fuse slice + transpose for mask (single kernel instead of two)
+        2. Use stride-based probs access in kernel (avoids probs transpose entirely)
+        3. Permute hidden states AND extract probs in a single kernel launch
         """
         self.hidden_shape_before_permute = hidden_states.shape
 
-        # The routing map and probs for local experts.
-        self.local_map = self.routing_map[
+        # Fuse slice + transpose for mask: [T, num_experts] -> [num_local_experts, T]
+        # This produces mask_T directly, avoiding a separate transpose kernel
+        self._cached_mask_T = self.routing_map[
             :, self.local_expert_indices[0] : self.local_expert_indices[-1] + 1
-        ].contiguous()
-        # Probs of global token assignment to local experts.
-        self.local_probs = probs[
-            :, self.local_expert_indices[0] : self.local_expert_indices[-1] + 1
-        ].contiguous()
+        ].t().contiguous()  # [E, T] layout
 
-        # Keep tokens_per_expert on GPU for CUDA graph compatibility.
-        tokens_per_expert = self.local_map.sum(dim=0).long()
+        # Probs: just slice, no transpose needed (kernel uses stride-based access)
+        local_probs = probs[
+            :, self.local_expert_indices[0] : self.local_expert_indices[-1] + 1
+        ].contiguous()  # [T, E] layout
+
+        # tokens_per_expert from transposed mask: sum over tokens (dim=1) for each expert
+        tokens_per_expert = self._cached_mask_T.sum(dim=1)
 
         # Pre-allocate workspaces
         max_out = hidden_states.size(0) * min(self.topk, self.num_local_experts)
@@ -161,14 +164,14 @@ class InferenceAllGatherTokenDispatcher(MoEAllGatherTokenDispatcher):
         )
 
         # Fused kernel launch: permute hidden states + extract probs in one pass
-        # Also returns cached mask_T and dest_indices for reuse in unpermute
-        self._cached_mask_T, self._cached_dest_indices = launch_fused_permute_and_probs(
-            hidden_states, self.local_probs, self.local_map,
+        # Pass mask_T directly (already transposed), probs as [T, E] (kernel uses strides)
+        self._cached_dest_indices = launch_fused_permute_and_probs(
+            hidden_states, local_probs, self._cached_mask_T,
             tokens_workspace, probs_workspace
         )
 
-        self.local_probs = probs_workspace
         self.routing_map = None
+        self.local_probs = probs_workspace
         return tokens_workspace, tokens_per_expert, probs_workspace
 
     def combine_preprocess(self, permuted_expert_outputs):
@@ -179,7 +182,7 @@ class InferenceAllGatherTokenDispatcher(MoEAllGatherTokenDispatcher):
         Uses cached mask_T and dest_indices from dispatch_postprocess to avoid
         recomputing them (saves 2 kernel launches).
         """
-        # 1. Pre-allocate static output buffer
+        # 1. Pre-allocate static output buffer (zeros for atomic accumulation)
         unpermuted_hidden = torch.zeros(
             self.hidden_shape_before_permute,
             dtype=permuted_expert_outputs.dtype,
@@ -189,11 +192,10 @@ class InferenceAllGatherTokenDispatcher(MoEAllGatherTokenDispatcher):
         # 2. Launch the Un-permute kernel with cached intermediates
         # It handles the Expert-grouped -> Token-major transition.
         launch_unpermute_kernel(
-            unpermuted_hidden,       # The [Tokens, Hidden] destination
-            self.local_map,          # The boolean mask [Tokens, Experts]
-            permuted_expert_outputs, # The [MAX_OUT, Hidden] source
-            self._cached_mask_T,
-            self._cached_dest_indices,
+            unpermuted_hidden,        # The [T, H] destination
+            permuted_expert_outputs,  # The [max_out, H] source
+            self._cached_mask_T,      # Cached [E, T] mask
+            self._cached_dest_indices # Cached cumsum indices
         )
 
         return unpermuted_hidden
