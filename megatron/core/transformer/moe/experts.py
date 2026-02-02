@@ -848,24 +848,6 @@ class InferenceGroupedMLP(TEGroupedMLP):
         # Register hook to rebuild concatenated weights after load_state_dict
         # self._register_load_state_dict_post_hook(self._rebuild_weights_hook)
 
-        # Set up activation function for inference (simplified, no recompute)
-        if self.config.gated_linear_unit:
-            @jit_fuser
-            def glu(x):
-                x = torch.chunk(x, 2, dim=-1)
-                return self.config.activation_func(x[0]) * x[1]
-            self._inference_activation_func = glu
-        else:
-            self._inference_activation_func = self.config.activation_func
-
-        @jit_fuser
-        def activation_func_with_probs(x, probs):
-            dtype = x.dtype
-            res = self._inference_activation_func(x) * probs
-            return res.to(dtype)
-
-        self._activation_func_with_probs = activation_func_with_probs
-
     def _build_concatenated_weights(self):
         """Create big contiguous weight tensors with per-expert views for checkpoint compatibility.
 
@@ -945,6 +927,65 @@ class InferenceGroupedMLP(TEGroupedMLP):
             permuted_local_hidden_states = permuted_local_hidden_states.to(original_dtype)
             permuted_probs = torch.ones_like(permuted_probs)
 
+        def bias_act_func(intermediate_parallel, bias_parallel, permuted_probs):
+            if self.config.use_te_activation_func:
+                if bias_parallel is not None:
+                    intermediate_parallel = intermediate_parallel + bias_parallel
+                intermediate_parallel = self.activation_func(intermediate_parallel)
+                if permuted_probs is not None:
+                    original_dtype = intermediate_parallel.dtype
+                    intermediate_parallel = intermediate_parallel * permuted_probs
+                    intermediate_parallel = intermediate_parallel.to(original_dtype)
+            elif self.config.bias_activation_fusion:
+                if self.activation_func == F.silu and self.config.gated_linear_unit:
+                    # dtype is handled inside the fused kernel
+                    intermediate_parallel = weighted_bias_swiglu_impl(
+                        intermediate_parallel,
+                        bias_parallel,
+                        permuted_probs,
+                        self.config.activation_func_fp8_input_store,
+                    )
+                elif self.activation_func == quick_gelu and self.config.gated_linear_unit:
+                    intermediate_parallel = weighted_bias_quick_geglu_impl(
+                        intermediate_parallel,
+                        bias_parallel,
+                        permuted_probs,
+                        self.config.activation_func_fp8_input_store,
+                        self.config.glu_linear_offset,
+                        self.config.activation_func_clamp_value,
+                    )
+                else:
+                    raise ValueError(
+                        "Only support fusion of swiglu and quick_gelu in TEGroupedMLP."
+                    )
+            elif (
+                self.activation_func == squared_relu and self.config.use_fused_weighted_squared_relu
+            ):
+                assert bias_parallel is None
+                intermediate_parallel = weighted_squared_relu_impl(
+                    intermediate_parallel, permuted_probs
+                )
+            else:
+                if self.config.gated_linear_unit:
+
+                    def glu(x):
+                        x_glu, x_linear = torch.chunk(x, 2, dim=-1)
+                        if (val := self.config.activation_func_clamp_value) is not None:
+                            x_glu = x_glu.clamp(min=None, max=val)
+                            x_linear = x_linear.clamp(min=-val, max=val)
+                        return self.config.activation_func(x_glu) * (
+                            x_linear + self.config.glu_linear_offset
+                        )
+
+                    intermediate_parallel = glu(intermediate_parallel)
+                else:
+                    intermediate_parallel = self.activation_func(intermediate_parallel)
+                original_dtype = intermediate_parallel.dtype
+                intermediate_parallel = intermediate_parallel * permuted_probs
+                intermediate_parallel = intermediate_parallel.to(original_dtype)
+            return intermediate_parallel
+
+
         if permuted_local_hidden_states.nelement() != 0:
             # Use pre-concatenated weights (built during init/load)
             # _fc1_weight shape: [num_experts, ffn_hidden * (2 if gated else 1), hidden_size]
@@ -957,10 +998,11 @@ class InferenceGroupedMLP(TEGroupedMLP):
             fc1_output = torch._grouped_mm(permuted_local_hidden_states, self._fc1_weight.transpose(1, 2), offs=offs)
 
             # Activation with routing probabilities
-            intermediate_parallel = self._activation_func_with_probs(fc1_output, permuted_probs)
+            # intermediate_parallel = self._activation_func_with_probs(fc1_output, permuted_probs)
+            bias_act_output = bias_act_func(fc1_output, None, permuted_probs)
 
             # FC2: [total_tokens, ffn_hidden] @ [num_experts, hidden, ffn_hidden] -> [total_tokens, hidden]
-            fc2_output = torch._grouped_mm(intermediate_parallel, self._fc2_weight.transpose(1, 2), offs=offs)
+            fc2_output = torch._grouped_mm(bias_act_output, self._fc2_weight.transpose(1, 2), offs=offs)
         else:
             # No tokens allocated - return empty tensor with correct shape
             fc2_output = permuted_local_hidden_states

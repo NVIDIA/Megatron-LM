@@ -129,13 +129,13 @@ class InferenceMoELayer(MoELayer):
 
         self.activate_inference_token_dispatcher()
         assert self.token_dispatcher is self.inference_token_dispatcher 
-        logging.info("activated inference token dispatcher")
+        #logging.info("activated inference token dispatcher")
 
         forward_pass_output = super().forward(hidden_states, padding_mask)
 
         self.deactivate_inference_token_dispatcher()
         assert self.token_dispatcher is not self.inference_token_dispatcher
-        logging.info("deactivated inference token dispatcher")
+        #logging.info("deactivated inference token dispatcher")
 
         return forward_pass_output
 
