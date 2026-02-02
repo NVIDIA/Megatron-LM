@@ -588,6 +588,9 @@ def num_floating_point_operations(args, batch_size):
         # Calculate the number of each type of layer.
         num_attn_layers, num_mamba_layers, num_mlp_layers, num_moe_layers = calculate_layer_counts()
 
+        mtp_num_layers = args.mtp_num_layers
+        if mtp_num_layers is None:
+            mtp_num_layers = 0
         # Compute hybrid model FLOPs.
         return hybrid_flops(
             batch_size=batch_size,
@@ -614,7 +617,7 @@ def num_floating_point_operations(args, batch_size):
                                            else args.moe_shared_expert_intermediate_size),
             num_experts_routed_to=args.moe_router_topk,
             vocab_size=args.padded_vocab_size,
-            mtp_num_layers=args.mtp_num_layers,
+            mtp_num_layers=mtp_num_layers,
         )
     else:
         # Compute standard Transformer model FLOPs.
