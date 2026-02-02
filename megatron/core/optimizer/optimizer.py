@@ -9,9 +9,10 @@ import warnings
 from abc import ABC, abstractmethod
 from itertools import chain
 from logging import getLogger
-from typing import Any, Callable, Dict, List, Optional, Tuple, Union, override
+from typing import Any, Callable, Dict, List, Optional, Tuple, Union
 
 import torch
+from typing_extensions import override
 
 try:
     from transformer_engine.pytorch.optimizers import multi_tensor_applier, multi_tensor_scale
