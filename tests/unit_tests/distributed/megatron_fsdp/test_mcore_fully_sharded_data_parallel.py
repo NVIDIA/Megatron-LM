@@ -636,21 +636,41 @@ class TestMegatronFSDPE2E:
         ],
     )
     @pytest.mark.parametrize(
-        ("fsdp_sharding_strategy", "use_double_buffer"),
+        ("fsdp_sharding_strategy", "use_double_buffer", "mixed_precision_config"),
         [
-            ("optim_grads_params", False),
-            ("optim_grads_params", True),
-            ("optim_grads", False),
-            ("optim", True),
+            ("optim_grads_params", False, {}),
+            ("optim_grads_params", True, {}),
+            (
+                "optim_grads_params",
+                True,
+                {"fp8_recipe": "mxfp8", "fp8_format": "e4m3", "fp8_param_gather": True},
+            ),
+            (
+                "optim_grads_params",
+                True,
+                {"fp4_recipe": "nvfp4", "fp4_format": "e2m1", "fp4_param_gather": True},
+            ),
+            ("optim_grads", False, {}),
+            ("optim", True, {}),
         ],
     )
     def test_compatible_with_nd_parallel(
-        self, ref_cache, nd_topology, fsdp_sharding_strategy, use_double_buffer
+        self,
+        ref_cache,
+        nd_topology,
+        fsdp_sharding_strategy,
+        use_double_buffer,
+        mixed_precision_config,
     ):
+        if "fp8_recipe" in mixed_precision_config or "fp4_recipe" in mixed_precision_config:
+            major, minor = torch.cuda.get_device_capability()
+            if major < 10:
+                pytest.skip("FP8/FP4 tests require GPU with compute capability 10.0 or higher")
+
         nd_topology_str = "_".join([f"{k}{v}" for k, v in nd_topology.items()])
         if nd_topology_str not in ref_cache:
             ref_cache[nd_topology_str] = TestMegatronFSDPE2E._training_loop(
-                use_distributed_optimizer=True
+                use_distributed_optimizer=True, **mixed_precision_config
             )
 
         outputs = TestMegatronFSDPE2E._training_loop(
@@ -660,6 +680,7 @@ class TestMegatronFSDPE2E:
             ckpt_format="fsdp_dtensor",
             gradient_accumulation_fusion=False,
             fsdp_double_buffer=use_double_buffer,
+            **mixed_precision_config,
         )
         reference_outputs = ref_cache[nd_topology_str]
 
