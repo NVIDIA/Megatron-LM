@@ -172,7 +172,7 @@ class RecipeConfig:
             raise ImportError("yaml is not installed. Please install it with `pip install pyyaml`.")
 
         with open(recipe_yaml_path, "r") as f:
-            config = yaml.load(f, Loader=yaml.FullLoader)
+            config = yaml.load(f, Loader=yaml.SafeLoader)
 
         return RecipeConfig.from_config_dict(config)
 
