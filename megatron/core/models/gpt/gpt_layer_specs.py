@@ -373,85 +373,6 @@ def get_gpt_layer_local_spec(
         moe_use_legacy_grouped_gemm=moe_use_legacy_grouped_gemm,
     )
 
-    return get_transformer_layer_spec_for_backend(
-        backend=backend,
-        attention=attention,
-        mlp=mlp,
-        sharded_state_dict_keys_map=sharded_state_dict_keys_map,
-        normalization=normalization,
-    )
-
-
-def get_transformer_layer_spec_for_backend(
-    backend: BackendSpecProvider,
-    attention: ModuleSpec,
-    mlp: ModuleSpec,
-    sharded_state_dict_keys_map: Optional[dict] = None,
-    normalization: Optional[str] = None,
-) -> ModuleSpec:
-    """Helper function to get module spec for TransformerLayer"""
-
-    rms_norm = normalization == "RMSNorm"
-
-    input_layernorm = (
-        IdentityOp
-        if attention.metainfo["fuse_input_layernorm"]
-        else backend.layer_norm(rms_norm=rms_norm, for_qk=False)
-    )
-    pre_mlp_layernorm = (
-        IdentityOp
-        if mlp.metainfo["fuse_pre_mlp_layernorm"]
-        else backend.layer_norm(rms_norm=rms_norm, for_qk=False)
-    )
-
-    transformer_layer = ModuleSpec(
-        module=TransformerLayer,
-        submodules=TransformerLayerSubmodules(
-            input_layernorm=input_layernorm,
-            self_attention=attention,
-            self_attn_bda=get_bias_dropout_add,
-            self_attention_hyper_connection=HyperConnectionModule,
-            pre_mlp_layernorm=pre_mlp_layernorm,
-            mlp=mlp,
-            mlp_bda=get_bias_dropout_add,
-            mlp_hyper_connection=HyperConnectionModule,
-            sharded_state_dict_keys_map=sharded_state_dict_keys_map,
-        ),
-    )
-    return transformer_layer
-
-
-def get_attention_module_spec_for_backend(
-    backend: BackendSpecProvider,
-    sharded_state_dict_keys_map: dict,
-    experimental_attention_variant: Optional[str] = None,
-    qk_layernorm: Optional[bool] = False,
-    qk_l2_norm: Optional[bool] = False,
-    multi_latent_attention: Optional[bool] = False,
-    mla_down_proj_use_column_parallel: Optional[bool] = False,
-    normalization: Optional[str] = None,
-    fallback_to_eager_attn: Optional[bool] = False,
-) -> ModuleSpec:
-    """Helper function to get module spec for Attention"""
-
-    if experimental_attention_variant is not None:
-        return get_experimental_attention_variant_module_spec_for_backend(
-            backend,
-            sharded_state_dict_keys_map,
-            experimental_attention_variant,
-            qk_layernorm,
-            qk_l2_norm,
-            multi_latent_attention,
-            mla_down_proj_use_column_parallel,
-            normalization,
-            fallback_to_eager_attn,
-        )
-
-    # Adjust for RMS norm.
-    rms_norm = normalization == "RMSNorm"
-    qk_norm = backend.layer_norm(rms_norm=rms_norm, for_qk=True)
-
-    core_attention = backend.core_attention() if not fallback_to_eager_attn else DotProductAttention
     if multi_latent_attention:
         assert qk_l2_norm is False, "qk_l2_norm is not supported with MLA."
         return ModuleSpec(
@@ -474,9 +395,11 @@ def get_attention_module_spec_for_backend(
                     ),
                 ),
                 self_attn_bda=get_bias_dropout_add,
+                self_attention_hyper_connection=HyperConnectionModule,
                 pre_mlp_layernorm=layer_norm,
                 mlp=mlp,
                 mlp_bda=get_bias_dropout_add,
+                mlp_hyper_connection=HyperConnectionModule,
             ),
         )
     else:
@@ -500,9 +423,11 @@ def get_attention_module_spec_for_backend(
                     ),
                 ),
                 self_attn_bda=get_bias_dropout_add,
+                self_attention_hyper_connection=HyperConnectionModule,
                 pre_mlp_layernorm=layer_norm,
                 mlp=mlp,
                 mlp_bda=get_bias_dropout_add,
+                mlp_hyper_connection=HyperConnectionModule,
                 sharded_state_dict_keys_map={
                     "input_layernorm.": "self_attention.linear_qkv.layer_norm_",
                     "pre_mlp_layernorm.": "mlp.linear_fc1.layer_norm_",

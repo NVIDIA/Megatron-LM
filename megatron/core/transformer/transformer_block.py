@@ -782,11 +782,6 @@ class TransformerBlock(GraphableMegatronModule, MegatronModule):
                     else:
                         inner_quantization_context = nullcontext()
 
-                    if self.config.fine_grained_activation_offloading:
-                        fine_grained_offloading_set_last_layer(
-                            l_no == self.num_layers_per_pipeline_rank - 1
-                        )
-
                     # Determine if this is the last layer in the current MHC recompute block
                     # A layer is last in recompute block if:
                     # 1. It's the final layer in the transformer block, OR
