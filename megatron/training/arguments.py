@@ -328,25 +328,25 @@ def validate_args(args, defaults={}):
     args.data_parallel_size = args.world_size // total_model_size
 
     if args.perform_rl_step:
-        # CUDA graph and KV$ handling support matrix is as follows:
+        # CUDA graph and KV cache handling support matrix is as follows:
         # ------------------------------------------------
         # Resetting CGs only makes sense if we build any CGs
         has_cg = args.cuda_graph_impl != "none" or args.rl_training_cuda_graphs
         assert not args.rl_reset_cuda_graphs or has_cg, (
             "--rl-reset-cuda-graphs is set but no CUDA graphs are being built."
         )
-        # If CUDA graphs are not reset but KV$ memory address is not static, we need
+        # If CUDA graphs are not reset but KV cache memory address is not static, we need
         # either UVM or torch_memory_saver to maintain memory address stability for CGs.
         if not args.rl_reset_cuda_graphs and args.rl_kv_cache_management_mode != "persist":
             try:
                 from torch_memory_saver import torch_memory_saver
             except ImportError:
                 assert args.inference_dynamic_batching_unified_memory_level > 0, (
-                    "Choosing to not reset CUDA graphs requires static KV$ memory. Use "
+                    "Choosing to not reset CUDA graphs requires static KV cache memory. Use "
                     "--rl-kv-cache-management-mode=persist, UVM, or install torch_memory_saver."
                 )
 
-        # There's no need to manually offload the KV$ with UVM.
+        # There's no need to manually offload the KV cache with UVM.
         assert not (
             args.inference_dynamic_batching_unified_memory_level > 0
             and args.rl_kv_cache_management_mode == "offload"
@@ -367,23 +367,23 @@ def validate_args(args, defaults={}):
         #  - The context ensures that the CGs still point to the correct memory addresses.
         #    ** This is attempted through UVM if enabled, otherwise through `torch_memory_saver`.
         #
-        # KV$ management is handled as follows (controlled by `--rl-kv-cache-management-mode`):
-        #  - The context initially allocates the KV$, either with or without UVM.
+        # KV cache management is handled as follows (controlled by `--rl-kv-cache-management-mode`):
+        #  - The context initially allocates the KV cache, either with or without UVM.
         #    ** This is controlled by `--inference-dynamic-batching-unified-memory-level`.
         #  - When RL is finished with inference, it suspends the engine.
         #    ** With `--rl-partial-rollouts`, it expects the engine to freeze its state.
-        #  - Suspending the engine makes the context handle the KV$ according to the mode:
-        #    ** "offload": the KV$ is offloaded to CPU memory.
-        #    ** "remove": the KV$ is deleted.
-        #    ** "persist": no-op, leaving the KV$ as-is.
+        #  - Suspending the engine makes the context handle the KV cache according to the mode:
+        #    ** "offload": the KV cache is offloaded to CPU memory.
+        #    ** "remove": the KV cache is deleted.
+        #    ** "persist": no-op, leaving the KV cache as-is.
         #  - When RL is finished with training, it resumes the engine.
         #    ** With `--rl-partial-rollouts`, it expects the engine to resume its state.
-        #  - Resuming the engine makes the context restore/rebuild the KV$:
-        #    ** "offload": the KV$ is reloaded from CPU memory.
-        #    ** "remove": the KV$ is reallocated.
-        #    ** "persist": no-op, leaving the KV$ as-is.
-        #  - The engine proceeds to recompute the KV$ of any request records marked as "recompute".
-        #    ** If using both partial rollouts and KV$ removal, "recompute" must mark all requests.
+        #  - Resuming the engine makes the context restore/rebuild the KV cache:
+        #    ** "offload": the KV cache is reloaded from CPU memory.
+        #    ** "remove": the KV cache is reallocated.
+        #    ** "persist": no-op, leaving the KV cache as-is.
+        #  - The engine proceeds to recompute the KV cache of any requests marked as "recompute".
+        #    ** If using both partial rollouts and KV cache removal, "recompute" must mark all.
         # ------------------------------------------------
 
         # TODO: Add support for `torch_memory_saver` with async model weight offload.

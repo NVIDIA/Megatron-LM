@@ -444,7 +444,7 @@ class DynamicInferenceContext(BaseInferenceContext):
         # either UVM or torch_memory_saver to maintain memory address stability for CGs.
         if not self.reset_cuda_graphs and self.kv_cache_management_mode != "persist":
             assert HAVE_TORCH_MEMORY_SAVER or self.unified_memory_level > 0, (
-                "Not resetting CUDA graphs requires static KV$ memory. "
+                "Not resetting CUDA graphs requires static KV cache memory. "
                 "Use --rl-kv-cache-management-mode=persist, UVM, or install torch_memory_saver."
             )
 
@@ -776,9 +776,9 @@ class DynamicInferenceContext(BaseInferenceContext):
 
         # Allocate large non-graphed buffers.
         # - If UVM is turned on, we use UVM unconditionally.
-        # - If CGs are not reset and KV$ is not persisted, we need `torch_memory_saver`.
-        # - If offloading KV$, we prefer to use `torch_memory_saver` over manual offloading.
-        # - If removing the KV$, we must re-allocate every time, not just at init.
+        # - If CGs are not reset and KV cache is not persisted, we need `torch_memory_saver`.
+        # - If offloading KV cache, we prefer to use `torch_memory_saver` over manual offloading.
+        # - If removing the KV cache, we must re-allocate every time, not just at init.
         need_static = not self.reset_cuda_graphs and self.kv_cache_management_mode != "persist"
         offload_kv = self.kv_cache_management_mode == "offload"
         remove_kv = self.kv_cache_management_mode == "remove"
