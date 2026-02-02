@@ -118,6 +118,8 @@ class TestTextGenerationController:
                 num_layers=transformer_config.num_layers // pipeline_model_parallel_size,
                 kv_channels=transformer_config.kv_channels,
                 num_attention_heads=transformer_config.num_attention_heads,
+                tensor_model_parallel_size=transformer_config.tensor_model_parallel_size,
+                pipeline_model_parallel_size=transformer_config.pipeline_model_parallel_size,
                 max_sequence_length=2048,
                 buffer_size_gb=0.2,
                 materialize_only_last_token_logits=False,
