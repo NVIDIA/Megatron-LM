@@ -33,6 +33,9 @@ def add_common_inference_args(parser: ArgumentParser) -> ArgumentParser:
         help='Return the log probabilities of the final output tokens',
     )
     group.add_argument(
+        "--num-speculative-tokens", type=int, default=0, help='Number of speculative tokens to generate.',
+    )
+    group.add_argument(
         "--prompts",
         metavar='N',
         type=str,

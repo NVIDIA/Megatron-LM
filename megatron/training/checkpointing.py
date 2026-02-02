@@ -1363,6 +1363,7 @@ def load_args_from_checkpoint(
     _set_arg('hybrid_mlp_ratio', force=True)
 
     _set_arg('num_experts', force=True)
+    _set_arg('mtp_num_layers', force=True)
     _set_arg('moe_layer_freq', force=True)
     if getattr(checkpoint_args, 'num_experts', None) is not None:
         _set_arg('moe_ffn_hidden_size', force=True)

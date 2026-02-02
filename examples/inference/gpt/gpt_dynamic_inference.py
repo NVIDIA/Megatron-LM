@@ -180,7 +180,7 @@ def get_inference_context(
         max_tokens=args.inference_dynamic_batching_max_tokens,
         tensor_model_parallel_size=args.tensor_model_parallel_size,
         pipeline_model_parallel_size=args.pipeline_model_parallel_size,
-        materialize_only_last_token_logits=not args.return_log_probs,
+        materialize_only_last_token_logits=False , #not args.return_log_probs,
         mamba_inference_state_config=mamba_inference_state_config,
         cache_mla_latent=args.multi_latent_attention and args.cache_mla_latents,
         kv_lora_rank=args.kv_lora_rank if args.multi_latent_attention else None,
@@ -454,7 +454,7 @@ def main():
         num_tokens_to_generate=args.num_tokens_to_generate,
         termination_id=args.termination_id if args.termination_id is not None else tokenizer.eod,
         top_n_logprobs=args.top_n_logprobs,
-        stop_words=args.stop_words,
+        stop_words=args.stop_words
     ) 
 
     model = get_model()
@@ -490,6 +490,7 @@ def main():
         track_paused_request_events=args.inference_dynamic_batching_track_paused_request_events,
         enable_chunked_prefill=not args.disable_chunked_prefill,
         inference_logging_step_interval=args.inference_logging_step_interval,
+        num_speculative_tokens=args.num_speculative_tokens,
     )
 
     setup_prefix = build_dynamic_engine_setup_prefix(args, model, context, requests)
@@ -546,7 +547,7 @@ def main():
             # ---- Prompt summary line ----
             prompt_len = len(requests[request_idxs[0]].prompt_tokens)
             escaped_prompt_text = escape_str(prompt_text)
-            print(f"\n{unique_idx+1}/{len(unique_prompt_map)} [n {len(request_idxs)}, l {prompt_len}] {escaped_prompt_text}")
+            #print(f"\n{unique_idx+1}/{len(unique_prompt_map)} [n {len(request_idxs)}, l {prompt_len}] {escaped_prompt_text}")
 
             # ---- Group all outputs for this prompt ----
             output_map = defaultdict(list)
@@ -575,7 +576,7 @@ def main():
                     o_hash = "--"
                     o_len = 0
                     escaped_output_text = "--"
-                print(f"  >>>> [n {len(output_request_idxs)}, {o_len} tokens, hash {o_hash}{', <evicted>' if evicted else ''}] {escaped_output_text}")
+                #print(f"  >>>> [n {len(output_request_idxs)}, {o_len} tokens, hash {o_hash}{', <evicted>' if evicted else ''}] {escaped_output_text}")
                 text_hashes.append(o_hash)
 
         # Write results to JSON. Primarily used for functional testing.
@@ -585,7 +586,7 @@ def main():
             # Write every 'n' requests, plus the final request.
             for i, req in enumerate(requests):
                 if i % args.output_every_n_results == 0 or i == len(requests) - 1:
-                    print(f' Attributes of request {i}: {req.__dict__}')
+                    #print(f' Attributes of request {i}: {req.__dict__}')
                     result_dict = {
                         "input_prompt": req.prompt_text,
                         "generated_text": req.output_text,

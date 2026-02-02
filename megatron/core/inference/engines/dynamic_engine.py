@@ -148,6 +148,7 @@ class DynamicInferenceEngine(AbstractEngine):
         enable_chunked_prefill: bool = True,
         inference_logging_step_interval: int = 0,
         pg_collection: Optional[ProcessGroupCollection] = None,
+        num_speculative_tokens: Optional[int] = 0,
     ):
 
         assert isinstance(
@@ -185,6 +186,16 @@ class DynamicInferenceEngine(AbstractEngine):
         self.inference_logging_step_interval = inference_logging_step_interval
         self.unified_memory_level = context.unified_memory_level
         self.persist_cuda_graphs = context.persist_cuda_graphs
+        self.num_speculative_tokens = num_speculative_tokens
+
+        assert self.num_speculative_tokens >= 0, "Number of speculative tokens must be non-negative"
+
+        if self.num_speculative_tokens > 0:
+            assert not self.context.materialize_only_last_token_logits, "Speculative decoding requires materialize_only_last_token_logits to be False"
+            assert self.num_speculative_tokens <= self.controller.num_mtp_heads, f"Number of speculative tokens {self.num_speculative_tokens} must be less than or equal to number of MTP heads {self.controller.num_mtp_heads}"
+        
+        self.context.num_speculative_tokens = num_speculative_tokens
+        self.controller.num_speculative_tokens = num_speculative_tokens
 
         if enable_cuda_graph is not None:
             self.cuda_graph_impl = "local" if enable_cuda_graph else "none"
@@ -813,7 +824,7 @@ class DynamicInferenceEngine(AbstractEngine):
             finished_request_ids (torch.Tensor): A list of finished request ids
             evict_request_ids (torch.Tensor): A list of evicted request ids.
             step_time (float): The latency of the last step
-            sample: (torch.Tensor): The newly generated tokens for each request
+            sample: List[Tensor]: The newly generated tokens for each request (Will include speculative tokens as well)
             log_probs: (List): Log probs for each request
             top_n_logprobs: (Dict): Top-n log probs for each request. Maps request_idx to
                 list of (top_n_logprobs, top_n_indices) tuples.
@@ -830,15 +841,18 @@ class DynamicInferenceEngine(AbstractEngine):
 
         log_probs_iter = log_probs if log_probs else repeat(None)
 
-        for req_idx, (request_id, token, request_log_probs) in enumerate(
+        for req_idx, (request_id, tokens, request_log_probs) in enumerate(
             zip(request_ids.tolist(), sample.tolist(), log_probs_iter)
         ):
             request: DynamicInferenceRequest = self.get_request(request_id)
             if request_id != self.context.chunked_prefill_request_id:
                 # Skip appending token for requests being finished due to stop words
                 # (they already have their final token from the previous step)
+                # If the request already has more tokens, then we only append as much as is necessary
+                if len(request.generated_tokens) + len(tokens) >= request.sampling_params.max_tokens:
+                    tokens = tokens[:request.sampling_params.max_tokens - len(request.generated_tokens)]
                 if request_id not in self.stop_word_being_finished_ids:
-                    request.generated_tokens.append(token)
+                    request.generated_tokens.append(tokens)
                     if request.tpot is None:
                         request.tpot = []
                     request.tpot.append(step_time)
@@ -1014,8 +1028,15 @@ class DynamicInferenceEngine(AbstractEngine):
             stop_len = len(stop_word_ids)
             if len(generated_tokens) >= stop_len:
                 # Check if the last stop_len tokens match the stop word
-                if list(generated_tokens[-stop_len:]) == stop_word_ids:
-                    return True
+                if stop_len > self.num_speculative_tokens:
+                    if list(generated_tokens[-stop_len:]) == stop_word_ids:
+                        return True
+                else:
+                    # Need to check the last stop len tokens shifting by 1 up to num_speculative_tokens
+                    # Check logic and vecotrize this if possible
+                    for i in range(self.num_speculative_tokens):
+                        if list(generated_tokens[-stop_len - i: -i]) == stop_word_ids:
+                            return True
 
         return False
 
