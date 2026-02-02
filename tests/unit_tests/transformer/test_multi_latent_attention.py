@@ -295,7 +295,7 @@ class TestParallelMLAAttention:
             # Test that the get_query_key_value_tensors function properly handles padded cu_seqlens
             query, key, value, q_compressed, kv_compressed = (
                 self.parallel_attention.get_query_key_value_tensors(
-                    hidden_states, None, None, packed_seq_params, None
+                    hidden_states, None, packed_seq_params, None
                 )
             )
 
@@ -683,12 +683,12 @@ class TestParallelMLAAttentionPrecision:
             # fine-grained check
             query_sbhd, key_sbhd, value_sbhd, q_compressed_sbhd, kv_compressed_sbhd = (
                 self.parallel_attention.get_query_key_value_tensors(
-                    hidden_states_sbhd, None, None, None, None
+                    hidden_states_sbhd, None, None, None
                 )
             )
             query_thd, key_thd, value_thd, q_compressed_thd, kv_compressed_thd = (
                 self.parallel_attention.get_query_key_value_tensors(
-                    hidden_states_thd, None, None, packed_seq_params, None
+                    hidden_states_thd, None, packed_seq_params, None
                 )
             )
             _query_sbhd = query_sbhd.transpose(0, 1).contiguous().view(*query_thd.shape)
@@ -848,12 +848,12 @@ class TestContextParallelMLAAttentionPrecision:
             # fine-grained check
             query_sbhd, key_sbhd, value_sbhd, q_compressed_sbhd, kv_compressed_sbhd = (
                 self.parallel_attention.get_query_key_value_tensors(
-                    hidden_states_sbhd, None, None, None, None
+                    hidden_states_sbhd, None, None, None
                 )
             )
             query_thd, key_thd, value_thd, q_compressed_thd, kv_compressed_thd = (
                 self.parallel_attention.get_query_key_value_tensors(
-                    hidden_states_thd, None, None, packed_seq_params, None
+                    hidden_states_thd, None, packed_seq_params, None
                 )
             )
             _query_sbhd = query_sbhd.transpose(0, 1).contiguous().view(*query_thd.shape)
@@ -999,12 +999,12 @@ class TestParallelMLAAttentionPrecisionWithRopeFusion:
             # fine-grained check
             query_sbhd, key_sbhd, value_sbhd, q_compressed_sbhd, kv_compressed_sbhd = (
                 self.parallel_attention.get_query_key_value_tensors(
-                    hidden_states_sbhd, None, None, None, None
+                    hidden_states_sbhd, None, None, None
                 )
             )
             query_thd, key_thd, value_thd, q_compressed_thd, kv_compressed_thd = (
                 self.parallel_attention.get_query_key_value_tensors(
-                    hidden_states_thd, None, None, packed_seq_params, None
+                    hidden_states_thd, None, packed_seq_params, None
                 )
             )
             _query_sbhd = query_sbhd.transpose(0, 1).contiguous().view(*query_thd.shape)
