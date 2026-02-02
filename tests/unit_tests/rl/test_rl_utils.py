@@ -668,7 +668,7 @@ class TestRLUtils:
         """Test that get_logprobs reuses CUDA graphs created during training forward pass.
 
         This test verifies that rl_utils.get_logprobs can reuse CUDA graphs by:
-        1. Creating a GPTModel wrapped in Float16Module (required for get_logprobs)
+        1. Creating a GPTModel (needs to be wrapped in Float16Module for get_logprobs)
         2. Running a training-style forward pass to record CUDA graph runners
         3. Creating the CUDA graphs
         4. Running get_logprobs to verify it reuses the same forward graph
