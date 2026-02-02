@@ -16,10 +16,10 @@ from dataclasses import replace
 from megatron.core.models.hl import (
     HLModel,
     CommonConfig,
-    EmbeddingLayer,
-    AttentionLayer,
-    MambaLayer,
-    MoELayer,
+    EmbeddingLayerConfig,
+    AttentionLayerConfig,
+    MambaLayerConfig,
+    MoELayerConfig,
     PipelineSplit,
 )
 
@@ -36,7 +36,7 @@ common_config = CommonConfig(
 )
 
 # MoE-specific configuration (copy of common_config with expert parallelism)
-moe_config = replace(
+moe_common_config = replace(
     common_config,
     expert_model_parallel_size=16,
     expert_tensor_parallel_size=8,
@@ -48,28 +48,28 @@ moe_config = replace(
 
 # Layers inherit hidden_size and parallelism settings from common_config
 
-Embed = EmbeddingLayer(
+Embed = EmbeddingLayerConfig(
     vocab_size=131072,
     max_sequence_length=8192,
     position_embedding_type="none",
 )
 
-M1 = MambaLayer(
+M1 = MambaLayerConfig(
     num_heads=64,
     head_dim=64,
     state_size=128,
     conv_kernel_size=4,
 )
 
-A1 = AttentionLayer(
+A1 = AttentionLayerConfig(
     num_attention_heads=32,
     num_query_groups=2,
     kv_channels=128,
     use_flash_attention=True,
 )
 
-E1 = MoELayer(
-    moe_config=moe_config,
+E1 = MoELayerConfig(
+    common_config=moe_common_config,
     ffn_hidden_size=1856,
     num_experts=128,
     top_k=6,

@@ -16,9 +16,9 @@ This example demonstrates:
 from megatron.core.models.hl import (
     HLModel,
     CommonConfig,
-    EmbeddingLayer,
-    AttentionLayer,
-    MLPLayer,
+    EmbeddingLayerConfig,
+    AttentionLayerConfig,
+    MLPLayerConfig,
 )
 
 # =============================================================================
@@ -39,21 +39,21 @@ common_config = CommonConfig(
 
 # Layers inherit hidden_size and parallelism settings from common_config
 
-Embed = EmbeddingLayer(
+Embed = EmbeddingLayerConfig(
     vocab_size=128000,
     max_sequence_length=4096,
     position_embedding_type="rope",
     rotary_base=500000,
 )
 
-A1 = AttentionLayer(
+A1 = AttentionLayerConfig(
     num_attention_heads=32,
     num_query_groups=8,
     kv_channels=128,
     use_flash_attention=True,
 )
 
-F1 = MLPLayer(
+F1 = MLPLayerConfig(
     ffn_hidden_size=14336,
     activation="swiglu",
 )
