@@ -108,7 +108,7 @@ class SFTDataset(MegatronDataset):
         eod = tokenizer.eod
         pad = tokenizer.pad
 
-        print("pad tokens", tokenizer.pad)
+        print("pad tokens", tokenizer.pad, "type", type(tokenizer))
 
         # TODO(duncan): Track number of convs dropped and/or truncated and amount of end-padding
         for conversation in split_conversations:
