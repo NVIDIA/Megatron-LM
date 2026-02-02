@@ -106,7 +106,7 @@ def multimem_all_gather(
     assert HAVE_TRITON, "Triton is required for multimem all-gather."
 
     config = {
-        "max_num_blocks": kwargs.get("max_num_blocks", 24),
+        "max_num_blocks": kwargs.get("max_num_blocks", 128),
         "num_warps": kwargs.get("num_warps", 32),
         "BLOCK_SIZE": kwargs.get("BLOCK_SIZE", 1024),
     }
@@ -209,7 +209,7 @@ def multimem_reduce_scatter(
     assert HAVE_TRITON, "Triton is required for multimem reduce-scatter."
 
     config = {
-        "max_num_blocks": kwargs.get("max_num_blocks", 24),
+        "max_num_blocks": kwargs.get("max_num_blocks", 128),
         "num_warps": kwargs.get("num_warps", 32),
         "BLOCK_SIZE": kwargs.get("BLOCK_SIZE", 1024),
     }

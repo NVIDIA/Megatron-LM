@@ -951,6 +951,12 @@ class _CudaGraphRunner(torch.nn.Module):
         # issues, for instance with pipeline parallelism
         return tuple(o.clone() if torch.is_tensor(o) else o for o in out)
 
+    def _get_cached_parameters_set_for_inference(self):
+        """Return cached parameters for inference mode."""
+        if not hasattr(self, '_cached_parameters_set_for_inference'):
+            self._cached_parameters_set_for_inference = tuple(self.parameters())
+        return self._cached_parameters_set_for_inference
+
     def replay_graph_capture(self, is_first_microbatch, args, kwargs):
         """Replay the fwd cuda graph with autograd."""
 
@@ -963,7 +969,11 @@ class _CudaGraphRunner(torch.nn.Module):
             raise AssertionError(error_msg)
 
         inp_tensors = self.get_tensors(args, kwargs)
-        func_args = inp_tensors + tuple(self.parameters())
+        is_inference_mode = 'inference_context' in kwargs.keys() and kwargs['inference_context']
+        if not is_inference_mode:
+            func_args = inp_tensors + tuple(self.parameters())
+        else:
+            func_args = inp_tensors + self._get_cached_parameters_set_for_inference()
         out = _CudagraphReplayNode.apply(self, is_first_microbatch, *func_args)
         out = list(out)
 
@@ -1338,7 +1348,6 @@ class CudaGraphManager(torch.nn.Module):
             if 'inference_context' in kwargs.keys() and kwargs['inference_context']:
                 # Inference generation mode creates graphs immediately
                 runner = self.get_cudagraph_runner(megatron_module, args, kwargs)
-                runner.eval()
 
                 if not runner.fwd_graph_recorded:
                     # Reuse graph input-output buffers for inference
@@ -1375,6 +1384,7 @@ class CudaGraphManager(torch.nn.Module):
                     _CudagraphGlobalRecord.cudagraph_inference_record.append(
                         (runner, "fwd", args, kwargs)
                     )
+                    runner = runner.eval()
 
                 # Now replay the graph
                 out = runner.replay_graph_capture(self.is_first_microbatch, args, kwargs)
