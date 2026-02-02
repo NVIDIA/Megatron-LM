@@ -8,6 +8,8 @@ from typing import Generic, TypeVar
 import numpy as np
 from pydantic import BaseModel
 
+from megatron.core.utils import trace_async_exceptions
+
 from ..__init__ import Request, TypeLookupable
 from ..inference import (
     ChatInferenceInterface,
@@ -17,8 +19,6 @@ from ..inference import (
     LLMChatMessage,
     ReturnsRaw,
 )
-
-from megatron.core.utils import trace_async_exceptions
 
 
 class AgentBaseModel(BaseModel, extra='allow'):
@@ -46,8 +46,8 @@ class GroupedRolloutRequest(Request):
 class Rollout(AgentBaseModel):
     """Data for language-based Rollout."""
 
-    trajectory: str
-    prompt_length: int | None = None
+    trajectory: list[str]
+    prompt_length: list[int] | None = None
     reward: float = None
     env_id: str | None = None
     problem_id: str | None = None
@@ -56,10 +56,10 @@ class Rollout(AgentBaseModel):
 class TokenRollout(AgentBaseModel):
     """Tokenized representation of a language-based Rollout."""
 
-    trajectory: list[int]
+    trajectory: list[list[int]]
     reward: list[float] | float
-    generation_mask: list[list[int]] | list[bool] | None = None
-    logprobs: list[float] | None = None
+    generation_mask: list[list[bool]] | None = None
+    logprobs: list[list[float]] | None = None
     env_id: str | None = None
     problem_id: str | None = None
 
@@ -67,8 +67,8 @@ class TokenRollout(AgentBaseModel):
 class ContrastiveRollout(AgentBaseModel):
     """Contrastive/Preference data for language-based Rollout."""
 
-    chosen_trajectory: str
-    rejected_trajectory: str
+    chosen_trajectory: list[str]
+    rejected_trajectory: list[str]
 
 
 class Head2HeadRolloutRequest(Request):
@@ -173,6 +173,11 @@ class GroupedRolloutGenerator(Agent, ABC):
 
     parallel_generation_tasks: int = 512
     buffer_size: int = 10
+
+    def __init__(self, *, parallel_generation_tasks: int | None = None, **kwargs):
+        super().__init__(**kwargs)
+        if parallel_generation_tasks is not None:
+            self.parallel_generation_tasks = parallel_generation_tasks
 
     @abstractmethod
     async def group_rollout(self, request: GroupedRolloutRequest) -> list[Rollout]: ...
