@@ -38,7 +38,7 @@ class CommunicationScheduler:
 
         # Step 2: Assign batches to iterations using greedy conflict-free algorithm
         PELogger.debug("Assigning batches to iterations using greedy conflict-free algorithm...")
-        self._assign_iterations_greedy(all_batches)
+        self._assign_iterations(all_batches)
         PELogger.info(f"Schedule built: {self.num_iterations} iterations")
 
         # Step 3: Exchange detailed workload summaries (Task IDs/Sizes)
@@ -102,7 +102,7 @@ class CommunicationScheduler:
 
         return global_batches
 
-    def _assign_iterations_greedy(self, batches: List[ScheduledBatch]):
+    def _assign_iterations(self, batches: List[ScheduledBatch]):
         """
         Greedy first-fit scheduling algorithm.
 

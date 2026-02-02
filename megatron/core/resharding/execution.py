@@ -64,7 +64,7 @@ def execute_reshard_plan(
                 service.submit_recv(recv_buffer, op.peer_rank)
             recv_writebacks.append((recv_buffer, dst_param, op.my_slice))
 
-    # Execute - all ranks participate, even if they have no send/recv operations
+    logger.info(f"Executing {len(plan.send_ops)} sends + {len(plan.recv_ops)} recvs")
     service.run()
     dist.barrier()
 
