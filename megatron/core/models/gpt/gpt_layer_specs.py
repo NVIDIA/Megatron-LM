@@ -9,10 +9,6 @@ from megatron.core.models.backends import (
     InferenceSpecProvider,
     LocalSpecProvider,
 )
-from megatron.core.models.gpt.experimental_attention_variant_module_specs import (
-    get_experimental_attention_variant_module_spec_for_backend,
-    is_linear_attention_variant,
-)
 
 from megatron.core.transformer.hyper_connection import HyperConnectionModule
 from megatron.core.models.gpt.moe_module_specs import get_moe_module_spec_for_backend
@@ -272,9 +268,11 @@ def get_gpt_layer_with_transformer_engine_spec(
                     ),
                 ),
                 self_attn_bda=get_bias_dropout_add,
+                self_attention_hyper_connection=HyperConnectionModule,
                 pre_mlp_layernorm=backend.layer_norm() if num_experts else IdentityOp,
                 mlp=mlp,
                 mlp_bda=get_bias_dropout_add,
+                mlp_hyper_connection=HyperConnectionModule,
             ),
         )
     else:
@@ -298,9 +296,11 @@ def get_gpt_layer_with_transformer_engine_spec(
                     ),
                 ),
                 self_attn_bda=get_bias_dropout_add,
+                self_attention_hyper_connection=HyperConnectionModule,
                 pre_mlp_layernorm=backend.layer_norm() if num_experts else IdentityOp,
                 mlp=mlp,
                 mlp_bda=get_bias_dropout_add,
+                mlp_hyper_connection=HyperConnectionModule,
                 sharded_state_dict_keys_map={
                     "mlp.0.weight": "mlp.linear_fc1.layer_norm_weight",
                     "mlp.0.bias": "mlp.linear_fc1.layer_norm_bias",
