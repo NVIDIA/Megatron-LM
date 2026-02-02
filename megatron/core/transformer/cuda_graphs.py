@@ -1738,7 +1738,7 @@ class TECudaGraphHelper:
                         callables.append(layer)
                         callables_is_mtp.append(False)
                 for layer_number in range(num_mtp_layers):
-                    layer = chunk_with_decoder.mtp.layers[layer_number].mtp_model_layer
+                    layer = chunk_with_decoder.mtp.layers[layer_number].transformer_layer
                     if _layer_is_graphable(layer, config):
                         num_graphable_layers += 1
                         callables.append(layer)
