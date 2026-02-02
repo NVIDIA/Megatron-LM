@@ -6,11 +6,13 @@ from torch import Tensor
 
 from megatron.core.transformer.module import MegatronModule
 from megatron.core.transformer.transformer_config import TransformerConfig
+from megatron.core.utils import nvtx_decorator
 
 if TYPE_CHECKING:
     from megatron.core.tensor_parallel.random import MHCBlockRecomputeManager
 
 
+#TODO: kernel fusion
 class SinkhornKnopp(torch.autograd.Function):
     """
     Differentiable Sinkhorn-Knopp algorithm for doubly stochastic projection.
@@ -155,6 +157,46 @@ class HyperConnectionModule(MegatronModule):
             setattr(self.alpha_res, 'sequence_parallel', True)
             setattr(self.bias, 'sequence_parallel', True)
     
+
+    # TODO: Kernel fusion
+    @nvtx_decorator()
+    def _projection_and_rms(self, x : Tensor) -> Tuple[Tensor, Tensor]:
+        """
+        Project input hidden states to mapping space and apply RMS normalization.
+        
+        Args:
+            x: [s, b, n*C] - n-stream hidden states
+        """
+        s, b, nC = x.shape
+        n = self.n
+        x_norm = self.norm(x)  # [s, b, n*C]
+        r = x_norm.norm(dim=-1, keepdim=True) / math.sqrt(nC) # shape: [s, b, 1]
+        r = 1.0 / (r + 1e-8) # shape: [s, b, 1]
+        proj = self.mapping_proj(x_norm)  # [s, b, n^2 + 2n]
+        return proj, r
+    
+    #TODO: kernel fusion
+    @nvtx_decorator()
+    def _compute_h(self, proj: Tensor, r: Tensor) -> Tensor:
+        """
+        Compute h from projected hidden states and scaling factors.
+        
+        Args:
+            proj: [s, b, n^2 + 2n] - projected hidden states
+            r: [s, b, 1] - scaling factors
+        """
+        s, b, _ = proj.shape
+        alpha_ = torch.cat([self.alpha_pre.expand(self.n), self.alpha_post.expand(self.n), self.alpha_res.expand(self.n * self.n)], dim = -1)
+        h = r * proj * alpha_ + self.bias
+        # H_pre = σ(α_pre * (θ_pre @ x̃) + b_pre)
+        h_pre = h[..., :self.n].sigmoid()  # [s, b, n]
+
+        # H_post = 2σ(α_post * (θ_post @ x̃) + b_post)
+        h_post = h[..., self.n:2*self.n].sigmoid() * 2 # [s, b, n]
+        h_res = h[..., 2*self.n:]
+        return h_pre, h_post, h_res
+    
+    @nvtx_decorator()
     def compute_mappings(self, x: Tensor) -> Tuple[Tensor, Tensor, Tensor]:
         """
         Compute mHC mappings from input hidden states.
@@ -169,33 +211,14 @@ class HyperConnectionModule(MegatronModule):
             h_post: [s, b, n] - expansion weights (2*sigmoid activated)
             h_res: [s, b, n, n] - residual mixing matrix (doubly stochastic)
         """
-        s, b, nC = x.shape
-        n = self.n 
-        # Todo: kernel fusion
-        # x_norm = self.norm(x)  # [s, b, n*C]
-        r = x.norm(dim=-1, keepdim=True) / math.sqrt(nC) # shape: [s, b, 1]
-        r = 1.0 / (r + 1e-8) # shape: [s, b, 1]
-        # Project to mapping space
-        proj = self.mapping_proj(x)  # [s, b, n^2 + 2n]
-        
-        alpha_ = torch.cat([self.alpha_pre.expand(n), self.alpha_post.expand(n), self.alpha_res.expand(n * n)], dim = -1)
-
-        h = r * proj * alpha_ + self.bias
-
-        # Split projections
-        # H_pre = σ(α_pre * (θ_pre @ x̃) + b_pre)
-        h_pre = h[..., :self.n].sigmoid()  # [s, b, n]
-
-        # H_post = 2σ(α_post * (θ_post @ x̃) + b_post)
-        h_post = h[..., self.n:2*self.n].sigmoid() * 2 # [s, b, n]
-        
-        # H_res = Sinkhorn-Knopp(exp(α_res * (θ_res @ x̃) + b_res))
-        h_res = SinkhornKnopp.apply(h[..., 2*self.n:].view(s, b, self.n, self.n), self.sinkhorn_iterations) # [s, b, n, n] 
-
-        # h_res = torch.dia
+        s, b, _ = x.shape
+        proj, r = self._projection_and_rms(x)
+        h_pre, h_post, h_res = self._compute_h(proj, r)
+        h_res = SinkhornKnopp.apply(h_res.view(s, b, self.n, self.n), self.sinkhorn_iterations) # [s, b, n, n] 
         
         return h_pre, h_post, h_res
     
+    @nvtx_decorator()
     def _apply_h_post(self, x: Tensor, h_post: Tensor) -> Tensor:
         """
         Core implementation of H_post application to a single tensor.
@@ -227,6 +250,7 @@ class HyperConnectionModule(MegatronModule):
         result = torch.einsum('sbij,sbjc->sbic', h_post.unsqueeze(-1), x_expanded)
         return result.view(s, b, n * C)
     
+    @nvtx_decorator()
     def apply_h_post(
         self,
         x_with_bias: Tuple[Tensor, Optional[Tensor]],
@@ -277,6 +301,8 @@ class HyperConnectionModule(MegatronModule):
         return x_out, bias_out
 
     
+    #TODO: Kernel fusion
+    @nvtx_decorator()
     def aggregate(self, x: Tensor, h_pre: Tensor) -> Tensor:
         """
         Aggregate n-stream to 1-stream using H_pre weights.
@@ -301,6 +327,7 @@ class HyperConnectionModule(MegatronModule):
         
         return aggregated
 
+    @nvtx_decorator()
     def apply_h_res(self, h_res: Tensor, residual: Tensor) -> Tensor:
         """
         Apply H_res to residual using H_res weights.
@@ -336,7 +363,7 @@ class HyperConnectionModule(MegatronModule):
         
         Returns:
             aggregated: [s, b, C] - aggregated input for layer computation
-            mixed: [s, b, n*C] - mixed output (H_res @ x_l)
+            h_res: [s, b, n, n] - residual mixing matrix (for fused kernel)
             h_post: [s, b, n] - expansion weights
             
         """
@@ -359,7 +386,7 @@ class HyperConnectionModule(MegatronModule):
         
         Returns:
             aggregated: [s, b, C] - aggregated input for layer computation
-            mixed: [s, b, n*C] - mixed output (H_res @ x_l)
+            h_res: [s, b, n, n] - residual mixing matrix (for fused kernel)
             h_post: [s, b, n] - expansion weights
         """
         # Compute mappings
@@ -368,9 +395,7 @@ class HyperConnectionModule(MegatronModule):
         # Aggregate for layer input
         aggregated = self.aggregate(hidden_states, h_pre)
 
-        mixed = self.apply_h_res(h_res, residual)
-
-        return aggregated, mixed, h_post
+        return aggregated, h_res, h_post
     
     def _forward_with_checkpoint(
         self,
@@ -381,8 +406,9 @@ class HyperConnectionModule(MegatronModule):
         """
         Forward pass with checkpointing for memory efficiency.
         
-        All operations (compute_mappings, aggregate, apply_h_res) are wrapped with
+        Operations (compute_mappings, aggregate) are wrapped with
         CheckpointWithoutOutput and auto-registered to the manager.
+        apply_h_res is deferred to fused_h_res_h_post_bda for kernel fusion.
         
         Args:
             hidden_states: [s, b, n*C] - n-stream hidden states
@@ -391,7 +417,7 @@ class HyperConnectionModule(MegatronModule):
         
         Returns:
             aggregated: [s, b, C] - aggregated input for layer computation
-            mixed: [s, b, n*C] - mixed output (H_res @ x_l)
+            h_res: [s, b, n, n] - residual mixing matrix (for fused kernel)
             h_post: [s, b, n] - expansion weights
         """
         from megatron.core.tensor_parallel.random import CheckpointWithoutOutput
@@ -406,12 +432,7 @@ class HyperConnectionModule(MegatronModule):
             self.aggregate, hidden_states, h_pre
         )
         
-        # Checkpoint apply_h_res - auto-registers to manager
-        mixed = CheckpointWithoutOutput(ckpt_manager=manager).checkpoint(
-            self.apply_h_res, h_res, residual
-        )
-        
-        return aggregated, mixed, h_post
+        return aggregated, h_res, h_post
     
     # ==================== Block-level utilities ====================
     
@@ -454,6 +475,174 @@ class HyperConnectionModule(MegatronModule):
         x_streams = x.view(s, b, n, C)
         contracted = x_streams.mean(dim=2)
         return contracted
+
+    # ==================== Fused kernel placeholder ====================
+    
+    @nvtx_decorator()
+    def fused_h_res_h_post_bda(
+        self,
+        h_res: Tensor,
+        original_residual: Tensor,
+        h_post: Tensor,
+        layer_output_with_bias: Tuple[Tensor, Optional[Tensor]],
+        dropout_prob: float,
+        training: bool,
+        fused: bool,
+        manager: Optional['MHCBlockRecomputeManager'] = None,
+    ) -> Tensor:
+        """
+        Fused kernel combining apply_h_res, apply_h_post and bias-dropout-add.
+        
+        This is a placeholder for future kernel fusion optimization.
+        Currently implements the operations sequentially using native PyTorch.
+        
+        The computation flow is:
+            1. mixed = H_res @ original_residual (apply_h_res)
+            2. expanded = H_post^T @ layer_output (apply_h_post)
+            3. output = dropout(expanded + bias) + mixed (bias-dropout-add)
+        
+        Args:
+            h_res: [s, b, n, n] - residual mixing matrix
+            original_residual: [s, b, n*C] - n-stream hidden states (before H_res applied)
+            h_post: [s, b, n] - expansion weights
+            layer_output_with_bias: Tuple of (x, bias) where:
+                - x: [s, b, C] - layer output (attention or MLP output)
+                - bias: [C] or None - optional bias tensor
+            dropout_prob: Dropout probability
+            training: Whether in training mode
+            fused: Whether to use fused BDA implementation
+            manager: Optional MHCBlockRecomputeManager for checkpoint management.
+                When provided, each operation is wrapped with CheckpointWithoutOutput.
+        
+        Returns:
+            output: [s, b, n*C] - final output after all operations
+        """
+        if manager is not None:
+            return self._fused_h_res_h_post_bda_with_checkpoint(
+                h_res, original_residual, h_post, layer_output_with_bias,
+                dropout_prob, training, fused, manager
+            )
+        else:
+            return self._fused_h_res_h_post_bda_native(
+                h_res, original_residual, h_post, layer_output_with_bias,
+                dropout_prob, training, fused
+            )
+    
+    def _fused_h_res_h_post_bda_native(
+        self,
+        h_res: Tensor,
+        original_residual: Tensor,
+        h_post: Tensor,
+        layer_output_with_bias: Tuple[Tensor, Optional[Tensor]],
+        dropout_prob: float,
+        training: bool,
+        fused: bool,
+    ) -> Tensor:
+        """
+        Native implementation of fused h_res, h_post and bda operations.
+        
+        Args:
+            h_res: [s, b, n, n] - residual mixing matrix
+            original_residual: [s, b, n*C] - n-stream hidden states
+            h_post: [s, b, n] - expansion weights
+            layer_output_with_bias: Tuple of (x, bias)
+            dropout_prob: Dropout probability
+            training: Whether in training mode
+            fused: Whether to use fused BDA implementation
+        
+        Returns:
+            output: [s, b, n*C] - final output
+        """
+        from megatron.core.fusions.fused_bias_dropout import get_bias_dropout_add
+        
+        # Step 1: Apply H_res to original residual
+        mixed = self.apply_h_res(h_res, original_residual)
+        
+        # Step 2: Apply H_post to layer output
+        x, bias = layer_output_with_bias
+        x_expanded = self._apply_h_post(x, h_post)
+        bias_expanded = self._apply_h_post(bias, h_post) if bias is not None else None
+        
+        # Step 3: Bias-dropout-add
+        bda_func = get_bias_dropout_add(training, fused)
+        output = bda_func((x_expanded, bias_expanded), mixed, dropout_prob)
+        
+        return output
+    
+    def _fused_h_res_h_post_bda_with_checkpoint(
+        self,
+        h_res: Tensor,
+        original_residual: Tensor,
+        h_post: Tensor,
+        layer_output_with_bias: Tuple[Tensor, Optional[Tensor]],
+        dropout_prob: float,
+        training: bool,
+        fused: bool,
+        manager: 'MHCBlockRecomputeManager',
+    ) -> Tensor:
+        """
+        Checkpointed implementation of fused h_res, h_post and bda operations.
+        
+        Each operation is wrapped with CheckpointWithoutOutput for memory efficiency.
+        
+        Args:
+            h_res: [s, b, n, n] - residual mixing matrix
+            original_residual: [s, b, n*C] - n-stream hidden states
+            h_post: [s, b, n] - expansion weights
+            layer_output_with_bias: Tuple of (x, bias)
+            dropout_prob: Dropout probability
+            training: Whether in training mode
+            fused: Whether to use fused BDA implementation
+            manager: MHCBlockRecomputeManager for checkpoint management
+        
+        Returns:
+            output: [s, b, n*C] - final output
+        """
+        from megatron.core.tensor_parallel.random import CheckpointWithoutOutput
+        from megatron.core.fusions.fused_bias_dropout import get_bias_dropout_add
+        
+        # Step 1: Checkpoint apply_h_res
+        mixed = CheckpointWithoutOutput(ckpt_manager=manager).checkpoint(
+            self.apply_h_res, h_res, original_residual
+        )
+        
+        # Step 2: Checkpoint apply_h_post for x
+        x, bias = layer_output_with_bias
+        x_expanded = CheckpointWithoutOutput(ckpt_manager=manager).checkpoint(
+            self._apply_h_post, x, h_post
+        )
+        
+        # Checkpoint apply_h_post for bias if not None
+        if bias is not None:
+            bias_expanded = CheckpointWithoutOutput(ckpt_manager=manager).checkpoint(
+                self._apply_h_post, bias, h_post
+            )
+        else:
+            bias_expanded = None
+        
+        # Step 3: Checkpoint bias-dropout-add
+        # Get the underlying BDA function
+        if fused:
+            from megatron.core.fusions.fused_bias_dropout import (
+                bias_dropout_add_fused_train,
+                bias_dropout_add_fused_inference,
+            )
+            if training:
+                bda_func = bias_dropout_add_fused_train
+            else:
+                bda_func = bias_dropout_add_fused_inference
+        else:
+            from megatron.core.fusions.fused_bias_dropout import bias_dropout_add_unfused
+            bda_func = bias_dropout_add_unfused(training)
+        
+        # Wrapper function that re-packs the tuple for the actual BDA function
+        def _bda_wrapper(output, bias, res, dropout):
+            return bda_func((output, bias), res, dropout)
+        
+        ckpt = CheckpointWithoutOutput(ckpt_manager=manager)
+        output = ckpt.checkpoint(_bda_wrapper, x_expanded, bias_expanded, mixed, dropout_prob)
+        
+        return output
 
 
 # ==================== Checkpoint utilities for mHC ====================
