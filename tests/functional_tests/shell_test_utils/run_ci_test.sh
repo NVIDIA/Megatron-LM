@@ -132,6 +132,8 @@ SKIP_PYTEST=$(cat $TRAINING_PARAMS_PATH |
 
 export RECORD_CHECKPOINTS=${RECORD_CHECKPOINTS:-"false"}
 
+NODE_RANK=${SLURM_NODEID:-${SLURM_NODEID:-0}}
+
 for i in $(seq 1 $N_REPEAT); do
     # Move TB logs into a repeat-specific directory
     DIR=$(dirname "$_TENSORBOARD_PATH")
