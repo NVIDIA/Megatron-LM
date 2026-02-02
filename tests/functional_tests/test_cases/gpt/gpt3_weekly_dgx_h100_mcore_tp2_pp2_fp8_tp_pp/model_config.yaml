@@ -47,7 +47,6 @@ MODEL_ARGS:
   --fp8-amax-compute-algo: max
   --attention-softmax-in-fp32: true
   --ckpt-format: torch_dist
-  --dist-ckpt-save-pre-mcore-014: true
   --dist-ckpt-strictness: log_all # backward compatibility for TE changes
   --data-cache-path: ${DATA_CACHE_PATH}
   --bf16: true

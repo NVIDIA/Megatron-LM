@@ -1,7 +1,7 @@
 # Copyright (c) 2024, NVIDIA CORPORATION. All rights reserved.
 
 import warnings
-from copy import deepcopy
+from copy import copy
 from typing import Optional
 
 import torch
@@ -43,13 +43,13 @@ class SharedExpertMLP(MLP):
         gate: bool,
         pg_collection: Optional[ProcessGroupCollection] = None,
     ):
-        config = deepcopy(config)
+        config = copy(config)
         assert config.add_bias_linear == False, "bias is not supported in the shared experts, "
         "please set '--disable-bias-linear' instead."
 
         config.ffn_hidden_size = config.moe_shared_expert_intermediate_size
         # TODO(Hepteract): pass pg_collection to MLP after refactoring MLP
-        super().__init__(config=config, submodules=submodules)
+        super().__init__(config=config, submodules=submodules, tp_group=pg_collection.tp)
 
         self.use_shared_expert_gate = gate
         if self.use_shared_expert_gate:
@@ -122,7 +122,7 @@ class SharedExpertMLP(MLP):
             if self.stream is None:
                 self.stream = torch.cuda.Stream()
 
-    def forward(self, hidden_states):
+    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
         """Forward function"""
         output, _ = super().forward(hidden_states)
         if self.use_shared_expert_gate:
@@ -141,7 +141,11 @@ class SharedExpertMLP(MLP):
             state_dict = self.state_dict(prefix='', keep_vars=True)
             sub_sd = {
                 f'{prefix}{name}': make_sharded_tensor_for_checkpoint(
-                    state_dict[name], f'{prefix}{name}', prepend_offsets=sharded_offsets
+                    state_dict[name],
+                    f'{prefix}{name}',
+                    prepend_offsets=sharded_offsets,
+                    tp_group=self.tp_group,
+                    dp_cp_group=metadata['dp_cp_group'],
                 )
             }
             sharded_state_dict.update(sub_sd)

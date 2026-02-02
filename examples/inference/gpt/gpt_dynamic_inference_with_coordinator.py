@@ -42,7 +42,7 @@ logging.basicConfig(level=logging.INFO, force=True)
 async def main(
     engine: DynamicInferenceEngine,
     requests: List[Request],
-    port: int,
+    port: int | None = None,
     sampling_params: SamplingParams | None = None,
 ):
     if sampling_params is not None:
@@ -51,28 +51,21 @@ async def main(
             "Sampling parameters are specified per request.",
             DeprecationWarning,
         )
+        
     # once you call engine.start_listening_to_data_parallel_coordinator,
     # the engine will start accepting requests from the data parallel coordinator.
     # and processing them in an asyncio coroutine.
+    # leaving inference_coordinator_port as None will find a free port automatically.
     
-    await engine.start_listening_to_data_parallel_coordinator(
+    dp_addr = await engine.start_listening_to_data_parallel_coordinator(
         inference_coordinator_port=port,
         launch_inference_coordinator=True,
-        verbose=True,
     )
-
-    # if you want to use your own inference coordinator -
-    # 1. set launch_inference_coordinator to False
-    # 2. setup a router socket at tcp://MASTER_ADDR:PORT
-    # 3. wait for data parallel groups to establish connection (BasicInferenceCoordinator.__init__)
-    # 4. look at InferenceCoordinator.start() to see how we can route requests from users <-> data parallel groups
-    #   based on headers.
-    # 5. look at InferenceClient to see how we create requests with headers.
 
     args = get_args()
 
     # Test suspend/resume intervals.
-    if args.suspend_resume_interval is not None:
+    if dist.get_rank() == 0 and args.suspend_resume_interval is not None:
         # Since the client doesn't directly call engine.async_step here, we test
         # the suspend-resume system ~4 times.
         suspend_resume_interval = max(1, len(requests) // 4)
@@ -91,7 +84,7 @@ async def main(
 
     # Create client and run example.
     if dist.get_rank() == 0:
-        client = InferenceClient(port)  # submits requests to the inference coordinator
+        client = InferenceClient(dp_addr)  # submits requests to the inference coordinator
         await client.start()
         base_arrival_time = time.time_ns() / 10**9
         for request in requests:
@@ -99,7 +92,8 @@ async def main(
         futures = []
         num_requests_total = len(requests)
         num_requests_added = 0
-        
+        # logging.info("Waiting for 20 seconds before starting to add requests. This is to mimic an RL style setup..")
+        # time.sleep(20)
         while True:
             current_time = time.time_ns() / 10**9
             if args.incoming_requests_per_step is None:
@@ -159,7 +153,7 @@ async def main(
                     "generated_tokens": req.generated_tokens,
                     "latency": req.latency,  # InferenceClient populates this field in the returned future.
                 }
-                if req.sampling_params["return_log_probs"]:
+                if req.sampling_params.return_log_probs:
                     result_dict["logprobs"] = req.prompt_log_probs + req.generated_log_probs
                 throughput = len(req.generated_tokens) / req.latency
                 throughputs.append(throughput)
@@ -185,11 +179,14 @@ async def main(
                 ))
 
         # kill the engines and suspend the client
-        client.stop_engines()
+        # Right now, we can only call stop when all requests are done. 
+        # Todo: Make this explicit in the Client class....
+        await client.stop_engines()
         client.stop()
 
     # once the stop signal eventually makes its way to each GPU, the engines will stop.
     await asyncio.gather(engine.engine_loop_task)
+    logging.info(f"Rank: {dist.get_rank()} stopped their engine instance successfully.")
 
 
 if __name__ == "__main__":
@@ -239,6 +236,7 @@ if __name__ == "__main__":
             enable_cuda_graph=args.cuda_graph_impl == "local",
             random_seed=args.seed,
             enable_chunked_prefill=not args.disable_chunked_prefill,
+            inference_logging_step_interval=args.inference_logging_step_interval,
         )
 
         if dist.get_rank() == 0:
