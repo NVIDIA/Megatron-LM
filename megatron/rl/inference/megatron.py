@@ -249,9 +249,6 @@ class MegatronLocal(InferenceServer, ReturnsTokens, ReturnsRaw):
         args = get_args()
         tokenizer = get_tokenizer()
 
-        self.partial_rollouts = args.rl_partial_rollouts
-        self.kv_cache_management_mode = args.rl_kv_cache_management_mode
-
         if tokenizer.bos is None:
             log_single_rank(
                 logger,
@@ -315,7 +312,8 @@ class MegatronLocal(InferenceServer, ReturnsTokens, ReturnsRaw):
         Called before resume when using partial rollouts with KV cache removal,
         so the engine knows to recompute the KV cache for all in-flight requests.
         """
-        if self.partial_rollouts and self.kv_cache_management_mode == "remove":
+        args = get_args()
+        if args.rl_partial_rollouts and args.rl_remove_kv_cache_during_training:
             for request_entry in self._inference_engine.requests.values():
                 request_entry.recompute_soon = True
 
