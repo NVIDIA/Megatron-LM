@@ -296,11 +296,14 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
 
         if config.enable_hyper_connections:
             # [Module 1.5: Self Attention Hyper Connection]
+            
             self.self_attention_hyper_connection = build_module(
                 submodules.self_attention_hyper_connection,
                 config=self.config,
                 layer_number=self.layer_number,
             )
+            # Todo: Implement the hyper connection placeholder to remove following checks. 
+            self.do_self_attention_hyper_connection = submodules.self_attention_hyper_connection is not IdentityOp
 
             # [Module 4.5: Cross Attention Hyper Connection]
             self.cross_attention_hyper_connection = build_module(
@@ -308,6 +311,7 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
                 config=self.config,
                 layer_number=self.layer_number,
             )
+            self.do_cross_attention_hyper_connection = submodules.cross_attention_hyper_connection is not IdentityOp
 
             # [Module 7.5: MLP Hyper Connection]
             self.mlp_hyper_connection = build_module(
@@ -315,6 +319,7 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
                 config=self.config,
                 layer_number=self.layer_number,
             )
+            self.do_mlp_hyper_connection = submodules.mlp_hyper_connection is not IdentityOp
 
         attention_optional_kwargs = {}
         if config.context_parallel_size > 1 and config.cp_comm_type is not None:
@@ -578,7 +583,8 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
         # Residual connection.
         residual = hidden_states
 
-        if self.config.enable_hyper_connections:
+        # Todo: implement an identity hyper connection class as a placeholder in TransformerLayerSubmodules
+        if self.config.enable_hyper_connections and self.do_self_attention_hyper_connection:
             nvtx_range_push(suffix="self_attention_hyper_connection")
             # hidden_states: [s, b, n * C] -> [s, b, C]
             # residual: [s, b, n * C] -> [s, b, n * C]
@@ -630,7 +636,7 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
                 attention_output_with_bias[0]
             )
 
-        if self.config.enable_hyper_connections:
+        if self.config.enable_hyper_connections and self.do_self_attention_hyper_connection:
             nvtx_range_push(suffix="self_attention_hyper_connection_post")
             attention_output_with_bias = self.self_attention_hyper_connection.apply_h_post(attention_output_with_bias, self_attn_hc_h_post)
             nvtx_range_pop(suffix="self_attention_hyper_connection_post")
@@ -660,7 +666,7 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
         # Residual connection.
         residual = hidden_states
 
-        if self.config.enable_hyper_connections:
+        if self.config.enable_hyper_connections and self.do_cross_attention_hyper_connection:
             nvtx_range_push(suffix="cross_attention_hyper_connection")
             # hidden_states: [s, b, n * C] -> [s, b, C]
             # residual: [s, b, n * C] -> [s, b, n * C]
@@ -683,7 +689,7 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
         if isinstance(attention_output_with_bias, dict) and "context" in attention_output_with_bias:
             context = attention_output_with_bias["context"]
 
-        if self.config.enable_hyper_connections:
+        if self.config.enable_hyper_connections and self.do_cross_attention_hyper_connection:
             nvtx_range_push(suffix="cross_attention_hyper_connection_post")
             attention_output_with_bias = self.cross_attention_hyper_connection.apply_h_post(
                 attention_output_with_bias, cross_attn_hc_h_post
@@ -723,7 +729,7 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
         # Residual connection.
         residual = hidden_states
 
-        if self.config.enable_hyper_connections:
+        if self.config.enable_hyper_connections and self.do_mlp_hyper_connection:
             nvtx_range_push(suffix="mlp_hyper_connection")
             # hidden_states: [s, b, n * C] -> [s, b, C]
             # residual: [s, b, n * C] -> [s, b, n * C]
@@ -838,7 +844,7 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
                     self.pre_mlp_norm_checkpoint.discard_output_and_register_recompute(tensor)
             return list(mlp_output_with_bias) + [residual]
         else:
-            if self.config.enable_hyper_connections:
+            if self.config.enable_hyper_connections and self.do_mlp_hyper_connection:
                 nvtx_range_push(suffix="mlp_hyper_connection_post")
                 mlp_output_with_bias = self.mlp_hyper_connection.apply_h_post(
                     mlp_output_with_bias, mlp_hc_h_post
