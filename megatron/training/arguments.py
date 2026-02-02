@@ -2199,7 +2199,7 @@ def _add_mixed_precision_args(parser):
 def _add_distributed_args(parser):
     from megatron.training.common_config import DistributedInitConfig
 
-    dist_init_factory = ArgumentGroupFactory(DistributedInitConfig, exclude=["lazy_mpu_init"])
+    dist_init_factory = ArgumentGroupFactory(DistributedInitConfig)
     group = dist_init_factory.build_group(parser, "distributed init")
 
     group.add_argument('--decoder-first-pipeline-num-layers',
@@ -2256,12 +2256,6 @@ def _add_distributed_args(parser):
     group.add_argument('--no-scatter-gather-tensors-in-pipeline', action='store_false',
                        help='If not set, use scatter/gather to optimize communication of tensors in pipeline.',
                        dest='scatter_gather_tensors_in_pipeline')
-    group.add_argument('--lazy-mpu-init', type=bool, required=False,
-                       help='If set to True, initialize_megatron() '
-                       'skips DDP initialization and returns function to '
-                       'complete it instead. Also turns on '
-                       '--use-cpu-initialization flag. This is for '
-                       'external DDP manager.' )
     group.add_argument('--use-distributed-optimizer', action='store_true',
                        help='Use distributed optimizer.')
     group.add_argument('--use-nccl-ub', action='store_true', dest='nccl_ub',
