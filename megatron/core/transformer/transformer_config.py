@@ -772,6 +772,24 @@ class TransformerConfig(ModelParallelConfig):
     to enable whole iteration CUDA graph. All other values enable layerwise CUDA graph."""
 
     ####################
+    # Hyper-Connection Configuration
+    ####################
+    enable_hyper_connections: bool = False
+    """Enable mHC residual connections."""
+
+    num_residual_streams: int = 4
+    """Number of residual streams (n in paper)."""
+
+    mhc_sinkhorn_iterations: int = 20
+    """Number of Sinkhorn-Knopp iterations for doubly stochastic projection."""
+
+    mhc_init_gating_factor: float = 0.01
+    """Initial value of Gating Factor (alpha in paper)."""
+
+    hyper_connection_recompute_block_size: Optional[int] = None
+    """Block size for mHC recomputation. If None, computed as sqrt(n*L/(n+2))."""
+
+    ####################
     # miscellaneous
     ####################
     clone_scatter_output_in_embedding: bool = True

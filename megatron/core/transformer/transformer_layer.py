@@ -222,14 +222,17 @@ class TransformerLayerSubmodules:
     """
 
     input_layernorm: Union[ModuleSpec, type] = IdentityOp
+    self_attention_hyper_connection: Union[ModuleSpec, type] = IdentityOp
     self_attention: Union[ModuleSpec, type] = IdentityOp
     self_attn_bda: Union[ModuleSpec, type] = IdentityFuncOp
 
     pre_cross_attn_layernorm: Union[ModuleSpec, type] = IdentityOp
+    cross_attention_hyper_connection: Union[ModuleSpec, type] = IdentityOp
     cross_attention: Union[ModuleSpec, type] = IdentityOp
     cross_attn_bda: Union[ModuleSpec, type] = IdentityFuncOp
 
     pre_mlp_layernorm: Union[ModuleSpec, type] = IdentityOp
+    mlp_hyper_connection: Union[ModuleSpec, type] = IdentityOp
     mlp: Union[ModuleSpec, type] = IdentityOp
     mlp_bda: Union[ModuleSpec, type] = IdentityFuncOp
 
@@ -291,6 +294,28 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
             eps=self.config.layernorm_epsilon,
         )
 
+        if config.enable_hyper_connection:
+            # [Module 1.5: Self Attention Hyper Connection]
+            self.self_attention_hyper_connection = build_module(
+                submodules.self_attention_hyper_connection,
+                config=self.config,
+                layer_number=self.layer_number,
+            )
+
+            # [Module 4.5: Cross Attention Hyper Connection]
+            self.cross_attention_hyper_connection = build_module(
+                submodules.cross_attention_hyper_connection,
+                config=self.config,
+                layer_number=self.layer_number,
+            )
+
+            # [Module 7.5: MLP Hyper Connection]
+            self.mlp_hyper_connection = build_module(
+                submodules.mlp_hyper_connection,
+                config=self.config,
+                layer_number=self.layer_number,
+            )
+
         attention_optional_kwargs = {}
         if config.context_parallel_size > 1 and config.cp_comm_type is not None:
             if isinstance(config.cp_comm_type, list):
@@ -337,6 +362,7 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
             hidden_size=self.config.hidden_size,
             eps=self.config.layernorm_epsilon,
         )
+
         # [Module 8: MLP block]
         additional_mlp_kwargs = {}
         # import here to avoid circular import
@@ -548,9 +574,19 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
 
         inference_context = deprecate_inference_params(inference_context, inference_params)
 
+
         # Residual connection.
         residual = hidden_states
 
+        if self.config.enable_hyper_connection:
+            nvtx_range_push(suffix="self_attention_hyper_connection")
+            # hidden_states: [s, b, n * C] -> [s, b, C]
+            # residual: [s, b, n * C] -> [s, b, n * C]
+            hidden_states, residual, self_attn_hc_h_post,  = self.self_attention_hyper_connection(hidden_states, residual)
+            nvtx_range_pop(suffix="self_attention_hyper_connection")
+
+        if self.offload_attn_norm:
+            hidden_states = fine_grained_offloading_group_start(hidden_states, name="attn_norm")
         # Optional Input Layer norm
         if self.recompute_input_layernorm:
             self.input_layernorm_checkpoint = tensor_parallel.CheckpointWithoutOutput()
@@ -594,6 +630,11 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
                 attention_output_with_bias[0]
             )
 
+        if self.config.enable_hyper_connection:
+            nvtx_range_push(suffix="self_attention_hyper_connection_post")
+            attention_output_with_bias = self.self_attention_hyper_connection.apply_h_post(attention_output_with_bias, self_attn_hc_h_post)
+            nvtx_range_pop(suffix="self_attention_hyper_connection_post")
+
         # TODO: could we move `bias_dropout_add_exec_handler` itself
         # inside the module provided in the `bias_dropout_add_spec` module?
         nvtx_range_push(suffix="self_attn_bda")
@@ -619,6 +660,15 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
         # Residual connection.
         residual = hidden_states
 
+        if self.config.enable_hyper_connection:
+            nvtx_range_push(suffix="cross_attention_hyper_connection")
+            # hidden_states: [s, b, n * C] -> [s, b, C]
+            # residual: [s, b, n * C] -> [s, b, n * C]
+            hidden_states, residual, cross_attn_hc_h_post = self.cross_attention_hyper_connection(
+                hidden_states, residual
+            )
+            nvtx_range_pop(suffix="cross_attention_hyper_connection")
+
         # Optional Layer norm after self-attention
         pre_cross_attn_layernorm_output = self.pre_cross_attn_layernorm(hidden_states)
 
@@ -632,6 +682,13 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
 
         if isinstance(attention_output_with_bias, dict) and "context" in attention_output_with_bias:
             context = attention_output_with_bias["context"]
+
+        if self.config.enable_hyper_connection:
+            nvtx_range_push(suffix="cross_attention_hyper_connection_post")
+            attention_output_with_bias = self.cross_attention_hyper_connection.apply_h_post(
+                attention_output_with_bias, cross_attn_hc_h_post
+            )
+            nvtx_range_pop(suffix="cross_attention_hyper_connection_post")
 
         # TODO: could we move `bias_dropout_add_exec_handler` itself
         # inside the module provided in the `bias_dropout_add_spec` module?
@@ -666,6 +723,17 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
         # Residual connection.
         residual = hidden_states
 
+        if self.config.enable_hyper_connection:
+            nvtx_range_push(suffix="mlp_hyper_connection")
+            # hidden_states: [s, b, n * C] -> [s, b, C]
+            # residual: [s, b, n * C] -> [s, b, n * C]
+            hidden_states, residual, mlp_hc_h_post = self.mlp_hyper_connection(
+                hidden_states, residual
+            )
+            nvtx_range_pop(suffix="mlp_hyper_connection")
+
+        if self.offload_mlp_norm:
+            hidden_states = fine_grained_offloading_group_start(hidden_states, name="mlp_norm")
         # Optional Layer norm post the cross-attention.
         if self.recompute_pre_mlp_layernorm:
             self.pre_mlp_norm_checkpoint = tensor_parallel.CheckpointWithoutOutput()
@@ -691,7 +759,23 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
             self.config.inference_fuse_tp_communication
         )
 
-        if self.recompute_mlp:
+        if (
+            self.is_moe_layer
+            and self.config.cuda_graph_impl == "transformer_engine"
+            and self.training
+            and is_graph_capturing()
+            and CudaGraphScope.moe_router in self.config.cuda_graph_scope
+        ):
+            assert (
+                not self.recompute_pre_mlp_layernorm
+            ), "Recomputation is not supported for CUDA graph."
+            assert (
+                not self.config.enable_hyper_connection
+            ), "Hyper connection is not supported for CUDA graph MoE."
+            cudagraph_outputs = self.mlp(pre_mlp_layernorm_output, padding_mask=padding_mask)
+            nvtx_range_pop(suffix="mlp")
+            return cudagraph_outputs + [residual]
+        elif self.recompute_mlp:
             if self.config.fp8 or self.config.fp4:
                 # import here to avoid circular import
                 from megatron.core.extensions.transformer_engine import te_checkpoint
@@ -754,7 +838,14 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
                     self.pre_mlp_norm_checkpoint.discard_output_and_register_recompute(tensor)
             return list(mlp_output_with_bias) + [residual]
         else:
+            if self.config.enable_hyper_connection:
+                nvtx_range_push(suffix="mlp_hyper_connection_post")
+                mlp_output_with_bias = self.mlp_hyper_connection.apply_h_post(
+                    mlp_output_with_bias, mlp_hc_h_post
+                )
+                nvtx_range_pop(suffix="mlp_hyper_connection_post")
             return self._forward_post_mlp(mlp_output_with_bias, residual)
+        
 
     def _forward_post_mlp(self, mlp_output_with_bias, residual):
         """
