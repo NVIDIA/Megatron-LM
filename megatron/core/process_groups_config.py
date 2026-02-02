@@ -639,12 +639,13 @@ class MultiModuleProcessGroupCollection:
         """Get context parallel size for the language model.
 
         Returns:
-            Context parallel size for the language model.
-
-        Raises:
-            ValueError: If no language model is specified for this collection.
+            Context parallel size for the language model, or 1 if no language
+            model is on this rank (e.g., encoder-only ranks in multi-module PP).
         """
-        return self.get_language_model_collection().cp.size()
+        if not self.has_language_model():
+            return 1  # Default CP size for non-LM ranks
+        cp = self.get_language_model_collection().cp
+        return cp.size() if cp is not None else 1
 
     def has_language_model(self) -> bool:
         """Check if this rank has a language model.
