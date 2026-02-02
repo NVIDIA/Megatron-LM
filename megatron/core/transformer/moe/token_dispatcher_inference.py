@@ -137,13 +137,10 @@ class InferenceAllGatherTokenDispatcher(MoEAllGatherTokenDispatcher):
         self.local_probs = probs[
             :, self.local_expert_indices[0] : self.local_expert_indices[-1] + 1
         ].contiguous()
-        # logging.info(f"Routing map shapre: {self.routing_map.shape}, local_map shape: {self.local_map.shape}, hidden_states shape: {hidden_states.shape}, local_probs shape: {self.local_probs.shape}")
-        # logging.info(f"Routing map: {self.routing_map}")
-        # exit()
 
         # Change 1: Keep tokens_per_expert on GPU for CUDA graph compatibility.
         tokens_per_expert = self.local_map.sum(dim=0).long() #.cpu()
-        tokens_workspace = torch.zeros(
+        tokens_workspace = torch.empty(
             hidden_states.size(0) * min(self.topk, self.num_local_experts),
             hidden_states.size(1),
             dtype=hidden_states.dtype,
@@ -151,7 +148,7 @@ class InferenceAllGatherTokenDispatcher(MoEAllGatherTokenDispatcher):
         )
         launch_moe_kernels(hidden_states, self.local_map, tokens_workspace, unpermute=False)    
         
-        probs_workspace = torch.zeros(
+        probs_workspace = torch.empty(
             self.local_probs.size(0) * min(self.topk, self.num_local_experts),
             1,
             dtype=probs.dtype,
@@ -171,17 +168,14 @@ class InferenceAllGatherTokenDispatcher(MoEAllGatherTokenDispatcher):
         Reverses token permutation to restore original ordering.
         Handles Top-K summation into original hidden state positions.
         """
-        # 1. Pre-allocate/Fetch static output buffer
-        # In a real CUDA Graph, this should be a pre-allocated buffer attribute
-        # to ensure the data_ptr() remains constant.
-        unpermuted_hidden = torch.empty(
+        # 1. Pre-allocate static output buffer
+        unpermuted_hidden = torch.zeros(
             self.hidden_shape_before_permute,
             dtype=permuted_expert_outputs.dtype,
             device=permuted_expert_outputs.device
-        ).zero_()
+        )
 
         # 2. Launch the Un-permute kernel
-        # This kernel uses 'atomic_add' to gather expert outputs.
         # It handles the Expert-grouped -> Token-major transition.
         # We use the same self.local_map and self.local_probs we cached during dispatch.
         launch_moe_kernels(
