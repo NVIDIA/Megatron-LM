@@ -495,6 +495,7 @@ class TestTransformerConfigRecomputeHyperConnections:
             enable_hyper_connections=True,
             num_residual_streams=4,
             recompute_hyper_connections=True,
+            recompute_granularity='selective',
         )
         assert config.recompute_hyper_connections is True
         assert config.enable_hyper_connections is True
