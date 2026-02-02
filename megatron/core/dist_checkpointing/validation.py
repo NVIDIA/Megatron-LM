@@ -447,7 +447,7 @@ def validate_sharding_integrity(
 
 
 def _validate_sharding_for_key(
-    rank_sharding: List[Tuple[int, ShardedTensor]],
+    rank_sharding: List[Tuple[int, ShardedTensor]]
 ) -> List[CheckpointingException]:
     some_rank_shard = rank_sharding[0][1]
     global_shape = some_rank_shard.global_shape
