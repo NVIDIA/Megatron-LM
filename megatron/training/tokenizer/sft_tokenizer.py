@@ -134,7 +134,7 @@ class SFTTokenizer(MegatronLegacyTokenizer):
             else:
                 raise ValueError(f"Wrong role value.")
 
-            print(turn_idx, turn_len, turn_tokens.shape, type(tokens), type(turn_tokens), flush=True)
+            print(turn_idx, turn_len, len(turn_tokens), type(tokens), type(turn_tokens), flush=True)
 
             assert np.allclose(
                 tokens[idx : idx + turn_len], turn_tokens
