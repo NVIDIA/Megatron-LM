@@ -122,7 +122,16 @@ class DistributedDataParallelConfig:
       This option will cause additional memory overhead, however, it is necessary for
       to register user buffer (nccl_ub=True) for the Megatron FSDP. 
       This option will be automatically set to True when nccl_ub=True.
-   """
+    """
+
+    fsdp_db_use_persist_buf_on_alloc_fail: bool = False
+    """Whether to fall back to persistent buffer when a bucket does not
+       fit FSDP double buffer size. If true, FSDP will use the persistently 
+       allocated buffer for the bucket that does not fit, it will enable NCCL 
+       user buffer with the cost of more memory usage. If false, FSDP will use
+       Dynamic memory allocator, NCCL user buffer won't not enabled, which 
+       usually leads to low performance. 
+    """
 
     fsdp_all_gather_in_start_param_sync: bool = True
     """

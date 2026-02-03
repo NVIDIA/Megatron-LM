@@ -1,5 +1,6 @@
 ENV_VARS:
   CUDA_DEVICE_MAX_CONNECTIONS: 1
+  THROUGHPUT_START_STEP: 1
   NVTE_ALLOW_NONDETERMINISTIC_ALGO: 0
   NCCL_ALGO: Ring
   CUBLAS_WORKSPACE_CONFIG: :4096:8
@@ -129,3 +130,11 @@ MODEL_ARGS:
   --tensorboard-dir: ${TENSORBOARD_PATH}
   --straggler-minmax-count: 16
   --empty-unused-memory-level: 2
+
+METRICS:
+  - "iteration-time"
+  - "lm loss"
+  - "num-zeros"
+  - "mem-allocated-bytes"
+  - "mem-max-allocated-bytes"
+
