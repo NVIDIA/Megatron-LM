@@ -258,6 +258,11 @@ class DynamicInferenceContext(BaseInferenceContext):
         request_metadata_types (Optional[List[Tuple[str, torch.dtype, bool]]]): A list of the
             per-request metadata types to track. Each entry is a tuple consisting of the string
             label, the target dtype, and whether to store the data on GPU.
+        kv_cache_management_mode (Optional[str]): Mode used to determine how large tensors are
+            handled by the allocate and deallocate methods. Options are:
+            - "persist": do not deallocate and reallocate large tensors; keep them on GPU.
+            - "offload": offload large tensors to CPU during dellocation; onload during allocation.
+            - "remove": deallocate large tensors during dellocation; reallocate during allocation.
     """
 
     DEFAULT_MAX_TOKENS = 16384
@@ -294,7 +299,7 @@ class DynamicInferenceContext(BaseInferenceContext):
         metrics_writer: Optional['WandbModule'] = None,
         request_metadata_types: Optional[List[Tuple[str, torch.dtype, bool]]] = None,
         reset_cuda_graphs: Optional[bool] = True,
-        kv_cache_management_mode: Optional[str] = "persist",
+        kv_cache_management_mode: Optional[str] = "remove",
     ):
         super().__init__(materialize_only_last_token_logits=materialize_only_last_token_logits)
 
@@ -602,47 +607,17 @@ class DynamicInferenceContext(BaseInferenceContext):
     def _track_offloadable_tensors(self):
         """Context manager that tracks tensors allocated within it for later offload/restore.
 
-        Tensors created as attributes on `self` within this context will be recorded
-        in `_offloadable_tensor_names` so they can be offloaded to CPU and restored later.
-
-
         NOTE: This current tracks the KV cache and mamba states, as they are the largest tensors.
         TODO: Benchmark the benefits of tracking additional tensors.
         """
-        initial_attrs = set(vars(self).keys())
+        initial_attrs = vars(self).keys()
         yield
-        current_attrs = set(vars(self).keys())
-        new_attrs = current_attrs - initial_attrs
-        # Record tensor attributes created within this context
-        for attr in new_attrs:
-            value = getattr(self, attr, None)
-            if isinstance(value, torch.Tensor):
-                self._offloadable_tensor_names.append(attr)
-
-    def _offload_tracked_tensors_to_cpu(self) -> None:
-        """Offload all tracked tensors to CPU using storage resize trick.
-
-        This preserves the tensor objects (for CUDA graph compatibility) while
-        freeing GPU memory. The data is copied to pinned CPU memory.
-        """
-        for name in self._offloadable_tensor_names:
-            tensor = getattr(self, name)
-            self._offloadable_storage_sizes[name] = tensor.storage().size()
-            if name in self._offloadable_cpu_backups:
-                self._offloadable_cpu_backups[name].copy_(tensor, non_blocking=True)
-            else:
-                self._offloadable_cpu_backups[name] = tensor.cpu().pin_memory()
-            tensor.storage().resize_(0)
-
-    def _restore_tracked_tensors_from_cpu(self) -> None:
-        """Restore all tracked tensors from CPU backup."""
-        if not self._offloadable_cpu_backups or not self._offloadable_storage_sizes:
-            return
-
-        for name in self._offloadable_tensor_names:
-            tensor = getattr(self, name)
-            tensor.storage().resize_(self._offloadable_storage_sizes[name])
-            tensor.copy_(self._offloadable_cpu_backups[name], non_blocking=True)
+        new_tensors = {x for x in vars(self).keys() - initial_attrs if isinstance(x, str)}
+        for tensor_name in new_tensors:
+            self._offloadable_tensor_names.append(tensor_name)
+            self._offloadable_cpu_backups[tensor_name] = torch.empty_like(
+                getattr(self, tensor_name), device="cpu"
+            ).pin_memory()
 
     def allocate_all_tensors(self, *, is_init: bool) -> None:
         """Allocate GPU state.
@@ -668,7 +643,9 @@ class DynamicInferenceContext(BaseInferenceContext):
                 return
             # If we offloaded tensors, restore them before allocating other tensors
             if self.kv_cache_management_mode == "offload":
-                self._restore_tracked_tensors_from_cpu()
+                for tensor:= getattr(self, name) for name in self._offloadable_tensor_names:
+                    tensor.storage().resize_(self._offloadable_storage_sizes[name])
+                    tensor.copy_(self._offloadable_cpu_backups[name], non_blocking=True)
 
         # Validate no tensors allocated prior to this method.
         for key in vars(self).keys():
@@ -820,7 +797,10 @@ class DynamicInferenceContext(BaseInferenceContext):
 
         # Explicitly deallocate tensors and offload them.
         if self.kv_cache_management_mode == "offload":
-            self._offload_tracked_tensors_to_cpu()
+            for tensor := getattr(self, name) for name in self._offloadable_tensor_names:
+                self._offloadable_storage_sizes[name] = tensor.storage().size()
+                self._offloadable_cpu_backups[name].copy_(tensor, non_blocking=True)
+                tensor.storage().resize_(0)
 
         # Explicitly deallocate tensors and delete them.
         # TODO(@lmcafee): check that device == 'cuda'?
