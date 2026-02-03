@@ -205,10 +205,11 @@ class TestBlockHash(PrefixCachingTestBase):
         # Release blocks (simulate request completion)
         dynamic_context.release_memory_blocks_from_request_indexes(torch.tensor([0]))
 
-        # Check: All released blocks should have hash reset to -1
-        assert block_allocator.block_hashes[block_0_id].item() == -1, "Block 0 hash should reset"
-        assert block_allocator.block_hashes[block_1_id].item() == -1, "Block 1 hash should reset"
-        assert block_allocator.block_hashes[block_2_id].item() == -1, "Block 2 hash should reset"
+        # Check: Released blocks remain cached with hashes preserved (for prefix reuse).
+        # Hashes are only reset after eviction, not release.
+        assert block_allocator.block_hashes[block_0_id].item() > 0, "Block 0 should retain hash after release"
+        assert block_allocator.block_hashes[block_1_id].item() > 0, "Block 1 should retain hash after release"
+        assert block_allocator.block_hashes[block_2_id].item() == -1, "Block 2 incomplete, no hash"
 
     @pytest.mark.internal
     @pytest.mark.skipif(TEST_LEVEL < TestLevel.CRITICAL, reason="Test level not met")
