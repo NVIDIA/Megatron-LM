@@ -518,6 +518,10 @@ def get_environment_rollouts(
                     rollouts = [
                         loop.run_until_complete(anext(rollout_generator)) for _ in range(n_prompts)
                     ]
+                    # In deterministic mode, sort rollouts by problem_id for consistent ordering
+                    # regardless of completion order due to system timing jitter.
+                    if torch.are_deterministic_algorithms_enabled():
+                        rollouts.sort(key=lambda group: group[0].problem_id if group and group[0].problem_id else "")
                     if not args.rl_partial_rollouts:
                         while True:
                             try:
@@ -999,7 +1003,7 @@ def logprobs_forward_step(data_iterator, model, is_correction, packing_context=N
             b_trajs.cuda(),
             b_posids.cuda(),
             no_grad=True,
-            sequence_packing=b_packed_seq_params is not None, 
+            sequence_packing=packing_context is not None,
             packed_seq_params=b_packed_seq_params,
         ),
         None,
