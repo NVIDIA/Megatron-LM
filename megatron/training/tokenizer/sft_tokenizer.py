@@ -60,7 +60,7 @@ class SFTTokenizer(MegatronLegacyTokenizer):
             )
         elif prompt_format == "identity":
             self._prompt_config = PromptConfig(
-                assistant_prefix_len=0,
+                assistant_prefix_len=len(tokenizer.apply_chat_template([{"role": "user", "content": ""}]),
                 pad_token_id=tokenizer.pad_token_id if tokenizer.pad_token_id is not None else tokenizer.eos_token_id,
                 custom_chat_template=tokenizer.chat_template,
                 has_bos=tokenizer.bos_token_id is not None,
