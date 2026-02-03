@@ -33,7 +33,7 @@ def temp_log_level(level, logger=None):
 
 
 @trace_async_exceptions
-async def run_flask_server_on_client(client: InferenceClient, tokenizer, rank: int, flask_port: int):
+async def run_flask_server_on_client(client: InferenceClient, tokenizer, flask_port: int, parsers: list[str] = []):
     """Initializes and runs the async Flask server."""
     if not HAS_FLASK:
         raise RuntimeError(f"Flask not available")
@@ -49,6 +49,7 @@ async def run_flask_server_on_client(client: InferenceClient, tokenizer, rank: i
     # Store client and tokenizer in app config for Blueprints to use
     app.config['client'] = client
     app.config['tokenizer'] = tokenizer
+    app.config['parsers'] = parsers
 
     # Register all blueprints from the 'endpoints' package
     for endpoint in endpoints.__all__:
@@ -69,12 +70,12 @@ async def run_flask_server_on_client(client: InferenceClient, tokenizer, rank: i
 
 
 @trace_async_exceptions
-async def run_flask_server(coordinator_addr: str, tokenizer, rank: int, flask_port: int):
+async def run_flask_server(coordinator_addr: str, tokenizer, rank: int, flask_port: int, parsers: list[str] = []):
     inference_client = InferenceClient(coordinator_addr)
     await inference_client.start()
     logger.info(f"Rank {rank}: InferenceClient connected.")
     try:
-        await run_flask_server_on_client(inference_client, tokenizer, rank, flask_port)
+        await run_flask_server_on_client(inference_client, tokenizer, flask_port, parsers)
     finally:
         await inference_client.stop()
         logger.info(f"Rank {rank}: Flask server and client shut down.")

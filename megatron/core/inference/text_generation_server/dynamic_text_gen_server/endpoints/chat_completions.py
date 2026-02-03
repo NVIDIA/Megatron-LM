@@ -19,6 +19,7 @@ try:
         """Handles async POST requests for chat completions."""
         client = current_app.config['client']
         tokenizer = current_app.config['tokenizer']
+        parsers = current_app.config['parsers']
 
         req = request.get_json()
 
@@ -31,12 +32,14 @@ try:
 
         try:
             prompt_tokens = tokenizer.apply_chat_template(
-                messages, tokenize=True, add_generation_prompt=True
+                messages, tokenize=True, add_generation_prompt=True, tools=req.get("tools", None)
             )
         except AttributeError:
             logger.warning("Tokenizer does not support 'apply_chat_template'. Using tokenize instead.")
             prompt_tokens = tokenizer.tokenize("\n".join([message["content"] for message in messages]))
         except Exception as e:
+            import traceback
+            logger.error(f"{traceback.format_exc()}")
             return f"Error processing 'messages': {e}", 500
 
         # --- 2. Parse Sampling Params ---
@@ -133,16 +136,31 @@ try:
                         }
                         logprobs_content.append(entry)
 
+                from megatron.core.tokenizers.text.parsers import PARSER_MAPPING
+                metadata = {}
+                message_text = text_output
+                for parser in parsers:
+                    if parser not in PARSER_MAPPING:
+                        raise ValueError(f"Parser {parser} not found in PARSER_MAPPING")
+                    message_text, new_info = PARSER_MAPPING[parser].parse(message_text, tools=req.get("tools", None))
+                    assert not (metadata.keys() & new_info.keys()), "Multiple parsers found the same information."
+                    metadata.update(new_info)
+                message = {"role": "assistant", "content": message_text}
+                if "tool_calls" in metadata:
+                    message["tool_calls"] = metadata["tool_calls"]
+                if "reasoning" in metadata:
+                    message["reasoning"] = metadata["reasoning"]
+
                 choice_data = {
                     "index": 0,
-                    "message": {"role": "assistant", "content": text_output},
+                    "message": message,
                     "prompt_token_ids": prompt_tokens,
                     "generation_token_ids": result.generated_tokens,
                     "generation_log_probs": result.generated_log_probs,
                     "raw_text": result.prompt + result.generated_text,
                     # 'logprobs' in chat API is an object containing 'content'
                     "logprobs": {"content": logprobs_content} if logprobs_content else None,
-                    "finish_reason": "length",  # Original code hardcoded this.
+                    "finish_reason": "tool_calls" if metadata.get("tool_calls", []) else "stop",  # Original code hardcoded this.
                 }
                 choices.append(choice_data)
                 total_completion_tokens += len(result.generated_tokens)
