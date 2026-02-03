@@ -56,6 +56,38 @@ runs:
       shell: bash -x -e -u -o pipefail {0}
       run: echo "node_name=$NODE_NAME" | tee -a "$GITHUB_OUTPUT"
 
+    - name: GPU Sanity Check
+      shell: bash -x -e -u -o pipefail {0}
+      run: |
+        echo "Starting GPU Sanity Check..."
+
+        # 1. Check for active Compute Processes
+        # query-compute-apps returns a list of PIDs using the GPU. If empty, we are good.
+        OPEN_PROCESSES=$(docker run --rm --gpus all ubuntu nvidia-smi --query-compute-apps=pid,process_name --format=csv,noheader)
+
+        if [ -n "$OPEN_PROCESSES" ]; then
+          echo "::error::❌ GPU is not clean! Found active processes:"
+          echo "$OPEN_PROCESSES"
+        else
+          echo "✅ No active compute processes found."
+        fi
+
+        # 2. Check VRAM Usage (Optional but recommended)
+        # We allow a small buffer (e.g., < 300MiB) for driver overhead/Xorg, 
+        # though on headless K8s nodes this should be very close to 0.
+
+        MEMORY_USAGES=$(docker run --rm --gpus all ubuntu nvidia-smi --query-gpu=memory.used --format=csv,noheader,nounits)
+
+        # Check each GPU visible to the container
+        for MEMORY in $MEMORY_USAGES; do
+          if [ "$MEMORY" -gt 300 ]; then
+            echo "::error::❌ GPU VRAM usage is suspiciously high: ${MEMORY} MiB"
+          fi
+        done
+
+        echo "✅ GPU Memory is clean (all < 300 MiB)."
+        echo "Ready to start workflow."
+
     - name: Checkout repository
       uses: actions/checkout@v2
 

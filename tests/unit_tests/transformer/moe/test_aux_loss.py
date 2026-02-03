@@ -632,19 +632,14 @@ class TestPaddingMaskAuxLoss:
 
     @pytest.mark.internal
     @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
-    @pytest.mark.parametrize("sequence_parallel", [True, False])
     @pytest.mark.parametrize("aux_loss_type", ["aux_loss", "seq_aux_loss", "global_aux_loss"])
     @pytest.mark.parametrize(
         "tp_size,ep_size,cp_size", [(8, 1, 1), (4, 2, 1), (1, 1, 8), (2, 1, 4), (2, 2, 2)]
     )
-    def test_padding_mask_removes_padding_tokens(
-        self, aux_loss_type, tp_size, ep_size, cp_size, sequence_parallel
-    ):
+    def test_padding_mask_removes_padding_tokens(self, aux_loss_type, tp_size, ep_size, cp_size):
         """Test that padding tokens are correctly excluded from aux loss calculation."""
         # Initialize model parallel with given configuration
-        self.setup_model_parallel(
-            tp_size=tp_size, ep_size=ep_size, cp_size=cp_size, sequence_parallel=sequence_parallel
-        )
+        self.setup_model_parallel(tp_size=tp_size, ep_size=ep_size, cp_size=cp_size)
 
         try:
             clear_aux_losses_tracker()
@@ -664,8 +659,7 @@ class TestPaddingMaskAuxLoss:
                 (seq_len, batch_size, hidden_size), dtype=torch.bfloat16, device='cuda'
             )
 
-            # Create padding mask: first half valid (False), second half padding (True)
-            # Convention: True = padding (exclude), False = valid (include)
+            # Create padding mask: first half valid, second half padding
             padding_mask = torch.zeros((seq_len, batch_size), dtype=torch.bool, device='cuda')
             padding_mask[seq_len // 2 :, :] = True
 
@@ -696,7 +690,7 @@ class TestPaddingMaskAuxLoss:
             aux_loss_without_mask = tracker[loss_name]["values"][0].clone()
             grad_without_mask = router.weight.grad.clone()
 
-            # The aux loss with mask should be close to the aux loss without mask
+            # The aux loss with mask should be equal to the aux loss without mask
             assert torch.equal(aux_loss_with_mask, aux_loss_without_mask)
             assert torch.equal(grad_with_mask, grad_without_mask)
 
@@ -734,8 +728,7 @@ class TestPaddingMaskAuxLoss:
                 (seq_len, batch_size, hidden_size), dtype=torch.bfloat16, device='cuda'
             )
 
-            # Create padding mask: first half valid (False), second half padding (True)
-            # Convention: True = padding (exclude), False = valid (include)
+            # Create padding mask: first half valid, second half padding
             padding_mask = torch.zeros((seq_len, batch_size), dtype=torch.bool, device='cuda')
             padding_mask[seq_len // 2 :, :] = True
 

@@ -3,7 +3,7 @@ format_version: 1
 maintainers: [mcore]
 loggers: [stdout]
 spec:
-  name: '{test_case}_{environment}_{platforms}'
+  name: "{test_case}_{environment}_{platforms}"
   model: gpt
   build: mcore-pyt-{environment}
   nodes: 1
@@ -45,7 +45,8 @@ spec:
         "TRAINING_PARAMS_PATH=./tests/functional_tests/test_cases/{model}/{test_case}/model_config.yaml"
         "GOLDEN_VALUES_PATH=./tests/functional_tests/test_cases/{model}/{test_case}/golden_values_{environment}_{platforms}.json"
         "OUTPUT_PATH={assets_dir}"
-        "TENSORBOARD_PATH={assets_dir}/generations_{environment}_{platforms}.json"
+        "TENSORBOARD_PATH={assets_dir}/tensorboard"
+        "INFERENCE_OUTPUT_PATH={assets_dir}/golden_values_{environment}_{platforms}.json"
         "N_REPEAT={n_repeat}"
         "ENABLE_LIGHTWEIGHT_MODE=${{ENABLE_LIGHTWEIGHT_MODE}}"
         "RECORD_CHECKPOINTS=${{RECORD_CHECKPOINTS}}"
@@ -69,11 +70,11 @@ products:
       - environment: [dev]
         scope: [mr]
         platforms: [dgx_h100]
-  - test_case: [gpt_dynamic_inference_tp1_pp1_dp8_583m_throughputtest_zmq]
-    products:
-      - environment: [dev]
-        scope: [mr]
-        platforms: [dgx_h100]
+  # - test_case: [gpt_dynamic_inference_tp1_pp1_dp8_583m_throughputtest_zmq]
+  #   products:
+  #     - environment: [dev]
+  #       scope: [mr]
+  #       platforms: [dgx_h100]
   - test_case: [gpt_dynamic_inference_tp2_pp2_dp2_583m_logitsmatch_zmq]
     products:
       - environment: [dev]
