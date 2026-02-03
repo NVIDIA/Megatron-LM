@@ -295,6 +295,7 @@ class DynamicInferenceContext(BaseInferenceContext):
         request_metadata_types: Optional[List[Tuple[str, torch.dtype, bool]]] = None,
         persist_cuda_graphs: Optional[bool] = False,
         enable_prefix_caching: bool = True,
+        prefix_caching_mamba_gb: Optional[float] = None,
         offload_kv_cache: Optional[bool] = False,
     ):
         super().__init__(materialize_only_last_token_logits=materialize_only_last_token_logits)
@@ -417,12 +418,12 @@ class DynamicInferenceContext(BaseInferenceContext):
             )
         assert self.block_size_bytes > 0
 
-        mamba_states_memory_per_request = 0
+        self.mamba_states_memory_per_request = 0
         if self.is_hybrid_model:
-            mamba_states_memory_per_request += math.prod(self.mamba_conv_states_shape)
-            mamba_states_memory_per_request += math.prod(self.mamba_ssm_states_shape)
-            mamba_states_memory_per_request *= self.num_mamba_layers
-            mamba_states_memory_per_request *= dtype_size_bytes
+            self.mamba_states_memory_per_request += math.prod(self.mamba_conv_states_shape)
+            self.mamba_states_memory_per_request += math.prod(self.mamba_ssm_states_shape)
+            self.mamba_states_memory_per_request *= self.num_mamba_layers
+            self.mamba_states_memory_per_request *= dtype_size_bytes
 
         # Unified memory.
         self.unified_memory_level = unified_memory_level
@@ -444,10 +445,10 @@ class DynamicInferenceContext(BaseInferenceContext):
         )
         # TODO: Add parameter to control fraction of memory assigned to KV cache
         # versus Mamba state.
-        block_count = buffer_size_bytes // (self.block_size_bytes + mamba_states_memory_per_request)
+        block_count = buffer_size_bytes // (self.block_size_bytes + self.mamba_states_memory_per_request)
         block_count = max(2, block_count)  # need >= 1 active block + 1 dummy block
         paused_block_count = paused_buffer_size_bytes // (
-            self.block_size_bytes + mamba_states_memory_per_request
+            self.block_size_bytes + self.mamba_states_memory_per_request
         )
 
         # If using pipeline parallelism synchronize the total block count in case the
@@ -720,6 +721,48 @@ class DynamicInferenceContext(BaseInferenceContext):
             else:
                 self.mamba_metadata = None
 
+        # Fixed-size tensor pool for Mamba prefix caching
+        def allocate_mamba_cache():
+            """Allocate Mamba state cache for prefix caching. Called below within
+            `with ctx_manager:`."""
+            # Calculate max slots from memory budget
+            if (self.is_hybrid_model and self.enable_prefix_caching and
+                prefix_caching_mamba_gb is not None and prefix_caching_mamba_gb > 0):
+                prefix_caching_mamba_bytes = int(prefix_caching_mamba_gb * (1024 ** 3))
+                self.max_mamba_cache_slots = prefix_caching_mamba_bytes // self.mamba_states_memory_per_request
+            else:
+                self.max_mamba_cache_slots = 0
+
+            if self.max_mamba_cache_slots > 0:
+                # Fixed-size tensor pool for cached Mamba states
+                self.mamba_cache_conv_states = torch.empty(
+                    (self.num_mamba_layers, self.max_mamba_cache_slots) + self.mamba_conv_states_shape,
+                    dtype=self.params_dtype,
+                    device=torch.cuda.current_device(),
+                )
+                self.mamba_cache_ssm_states = torch.empty(
+                    (self.num_mamba_layers, self.max_mamba_cache_slots) + self.mamba_ssm_states_shape,
+                    dtype=self.params_dtype,
+                    device=torch.cuda.current_device(),
+                )
+
+                # Mapping: block_id -> mamba_slot_id (-1 if no cached state)
+                total_blocks = self.block_allocator.total_count
+                self.block_to_mamba_slot = torch.full(
+                    (total_blocks,), -1, dtype=torch.int32, device=torch.cuda.current_device()
+                )
+
+                # Reverse mapping for eviction: slot_id -> block_id
+                self.mamba_slot_to_block = torch.full(
+                    (self.max_mamba_cache_slots,), -1, dtype=torch.int32, device=torch.cuda.current_device()
+                )
+
+                # Free slot pool (similar to MambaMetadata pattern)
+                self.mamba_cache_free_slots = torch.arange(
+                    self.max_mamba_cache_slots, dtype=torch.int32, device=torch.cuda.current_device()
+                )
+                self.mamba_cache_free_count = self.max_mamba_cache_slots
+
         # Allocate `ctx_manager`-managed buffers. (For currently unknown reasons,
         # `ctx_manager` can only be used once.)
         ctx_manager = (
@@ -730,6 +773,7 @@ class DynamicInferenceContext(BaseInferenceContext):
         with ctx_manager:
             allocate_memory_buffer()
             allocate_mamba_states()
+            allocate_mamba_cache()
 
         # Reset attention and Mamba state.
         self.reset_attention_state()
@@ -1120,6 +1164,141 @@ class DynamicInferenceContext(BaseInferenceContext):
         """Reset state used within Mamba layers."""
         if self.is_hybrid_model:
             self.mamba_metadata.reset()
+
+    # =========================================================================
+    # Mamba prefix caching methods
+    # =========================================================================
+
+    def _allocate_mamba_cache_slot(self, block_id: int) -> int:
+        """Allocate a Mamba cache slot for a block, evicting LRU if needed.
+
+        Args:
+            block_id: The KV block ID to associate with this Mamba state
+
+        Returns:
+            Slot index for storing the Mamba state
+        """
+        # Check if block already has a slot
+        existing_slot = self.block_to_mamba_slot[block_id].item()
+        if existing_slot >= 0:
+            return existing_slot
+
+        # Try to get a free slot
+        if self.mamba_cache_free_count > 0:
+            self.mamba_cache_free_count -= 1
+            slot = self.mamba_cache_free_slots[self.mamba_cache_free_count].item()
+        else:
+            # Need to evict LRU - find oldest block with Mamba state
+            slot = self._evict_lru_mamba_slot()
+
+        # Update mappings
+        self.block_to_mamba_slot[block_id] = slot
+        self.mamba_slot_to_block[slot] = block_id
+        return slot
+
+    def _evict_lru_mamba_slot(self) -> int:
+        """Evict the least recently used Mamba state and return its slot.
+
+        Uses block_timestamps from KV block allocator for LRU ordering.
+        Only evicts Mamba state - KV cache remains intact.
+        """
+        # Find all blocks with Mamba state that are not currently in use
+        # (ref_count == 0 means cached but not actively used)
+        candidates = []
+        for slot in range(self.max_mamba_cache_slots):
+            block_id = self.mamba_slot_to_block[slot].item()
+            if block_id >= 0:
+                ref_count = self.block_allocator.block_ref_counts[block_id].item()
+                if ref_count == 0:
+                    timestamp = self.block_allocator.block_timestamps[block_id].item()
+                    candidates.append((timestamp, slot, block_id))
+
+        if not candidates:
+            raise RuntimeError("Cannot evict Mamba state - all slots in active use")
+
+        # Sort by timestamp (oldest first) and evict
+        candidates.sort(key=lambda x: x[0])
+        _, slot, block_id = candidates[0]
+
+        # Clear mappings (but keep KV cache intact)
+        self.block_to_mamba_slot[block_id] = -1
+        self.mamba_slot_to_block[slot] = -1
+
+        return slot
+
+    def store_mamba_state_for_block(self, block_id: int, request_idx: int) -> None:
+        """Copy current per-request Mamba state to block cache.
+
+        Called after prefill completes a block that needs caching.
+
+        Args:
+            block_id: The KV block ID to store state for
+            request_idx: Index of request whose Mamba state to store
+        """
+        if self.max_mamba_cache_slots == 0:
+            return  # Mamba caching disabled
+
+        # Allocate slot (may trigger LRU eviction)
+        slot = self._allocate_mamba_cache_slot(block_id)
+
+        # Copy from per-request state to cache
+        mamba_idx = self.mamba_metadata.request_to_mamba_state_idx[request_idx].item()
+        self.mamba_cache_conv_states[:, slot] = self.mamba_conv_states[:, mamba_idx].clone()
+        self.mamba_cache_ssm_states[:, slot] = self.mamba_ssm_states[:, mamba_idx].clone()
+
+    def has_mamba_state_for_block(self, block_id: int) -> bool:
+        """Check if a block has valid cached Mamba state.
+
+        Args:
+            block_id: The KV block ID to check
+
+        Returns:
+            True if block has cached Mamba state, False otherwise
+        """
+        if self.max_mamba_cache_slots == 0:
+            return False
+        return self.block_to_mamba_slot[block_id].item() >= 0
+
+    def restore_mamba_state_from_block(self, request_idx: int, block_id: int) -> bool:
+        """Initialize request's Mamba state from cached block state.
+
+        Args:
+            request_idx: Index of request to restore state for
+            block_id: The KV block ID containing cached state
+
+        Returns:
+            True if state was restored, False if no cached state
+        """
+        if self.max_mamba_cache_slots == 0:
+            return False
+
+        slot = self.block_to_mamba_slot[block_id].item()
+        if slot < 0:
+            return False
+
+        mamba_idx = self.mamba_metadata.request_to_mamba_state_idx[request_idx].item()
+        self.mamba_conv_states[:, mamba_idx] = self.mamba_cache_conv_states[:, slot].clone()
+        self.mamba_ssm_states[:, mamba_idx] = self.mamba_cache_ssm_states[:, slot].clone()
+        return True
+
+    def invalidate_mamba_state_for_block(self, block_id: int) -> None:
+        """Invalidate Mamba state when KV block is evicted.
+
+        Called when a KV block is evicted - must also free its Mamba slot.
+
+        Args:
+            block_id: The KV block ID being evicted
+        """
+        if self.max_mamba_cache_slots == 0:
+            return
+
+        slot = self.block_to_mamba_slot[block_id].item()
+        if slot >= 0:
+            # Return slot to free pool
+            self.block_to_mamba_slot[block_id] = -1
+            self.mamba_slot_to_block[slot] = -1
+            self.mamba_cache_free_slots[self.mamba_cache_free_count] = slot
+            self.mamba_cache_free_count += 1
 
     def add_dummy_requests_parallel(
         self, requests: Sequence[DynamicInferenceRequest], *, count_as_prefill: bool = True
@@ -1812,11 +1991,23 @@ class DynamicInferenceContext(BaseInferenceContext):
             mamba_idx = self.mamba_metadata.allocate_slot()
             if mamba_idx is None:
                 raise ContextOverflowError(req.request_id, "No Mamba slots available")
-
-            # Initialize the allocated Mamba state
-            self.mamba_conv_states[:, mamba_idx] = 0.0
-            self.mamba_ssm_states[:, mamba_idx] = 0.0
             self.mamba_metadata.request_to_mamba_state_idx[self.total_request_count] = mamba_idx
+
+            # Check if we should restore Mamba state from cache (prefix match)
+            num_mamba_matched = getattr(req, '_mamba_num_matched_blocks', 0)
+            restored = False
+            if num_mamba_matched > 0 and num_matched_blocks > 0:
+                # Find the block ID of the last Mamba-matched block
+                last_mamba_block_idx = num_mamba_matched - 1
+                last_mamba_block_id = matched_block_ids[last_mamba_block_idx]
+                restored = self.restore_mamba_state_from_block(
+                    self.total_request_count, last_mamba_block_id
+                )
+
+            if not restored:
+                # No cached state - initialize to zero
+                self.mamba_conv_states[:, mamba_idx] = 0.0
+                self.mamba_ssm_states[:, mamba_idx] = 0.0
 
         self.active_token_count += chunk_length
         self.total_request_count += 0 if req.finished_chunk_token_count > 0 else 1

@@ -347,7 +347,7 @@ class BlockAllocator:
         sorted_indices = torch.argsort(cached_timestamps)
         blocks_to_evict = cached_block_ids[sorted_indices[:num_blocks_needed]]
 
-        # Remove from hash mapping
+        # Remove from hash mapping and invalidate Mamba state
         for block_id in blocks_to_evict:
             block_id_int = block_id.item()
 
@@ -361,6 +361,9 @@ class BlockAllocator:
             block_hash = self.block_hashes[block_id_int].item()
             if block_hash in self.hash_to_block_id:
                 del self.hash_to_block_id[block_hash]
+
+            # Invalidate Mamba state for this block (if Mamba prefix caching is enabled)
+            self.context.invalidate_mamba_state_for_block(block_id_int)
 
         # Reset block state
         self.block_hashes[blocks_to_evict] = -1

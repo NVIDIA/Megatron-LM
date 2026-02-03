@@ -1155,6 +1155,16 @@ def validate_args(args, defaults={}):
         assert args.inference_dynamic_batching_buffer_size_gb is not None
         assert args.inference_dynamic_batching_block_size % 256 == 0, "block size should be a multiple of 256"
 
+        # Mamba prefix caching requires chunked prefill for breaking at block boundaries
+        if (args.inference_dynamic_batching_prefix_caching_mamba_gb is not None and
+            args.inference_dynamic_batching_prefix_caching_mamba_gb > 0):
+            if args.disable_chunked_prefill:
+                args.disable_chunked_prefill = False
+                warn_rank_0(
+                    'Chunked prefill was disabled but is required for Mamba prefix caching. '
+                    'Enabling chunked prefill automatically.'
+                )
+
     if args.cuda_graph_impl == "local" and args.expert_model_parallel_size > 1:
        assert args.moe_pad_experts_for_cuda_graph_inference, \
         "--moe-pad-experts-for-cuda-graph-inference must be set when using CUDA graphs with expert parallelism"
@@ -1517,6 +1527,12 @@ def _add_inference_args(parser):
                        'When disabled, KV cache blocks cannot be shared between '
                        'requests with identical prompt prefixes.')
     group.set_defaults(inference_dynamic_batching_enable_prefix_caching=True)
+    group.add_argument('--inference-dynamic-batching-prefix-caching-mamba-gb',
+                       type=float, default=None,
+                       help='Memory budget (GB) for cached Mamba states in prefix caching. '
+                       'Required for Mamba prefix caching in hybrid models. '
+                       'If not specified, Mamba prefix caching is disabled. '
+                       'When enabled, chunked prefill is automatically enabled if disabled.')
     group.add_argument('--nccl-all-reduce-for-prefill',
                        action='store_true', default=False,
                        help='When using symmeric all reduce kernels this will use regular nccl kernels for prefill. This can be more effecient when prefill is large as the nccl kernels can be more bandwith optimized')
