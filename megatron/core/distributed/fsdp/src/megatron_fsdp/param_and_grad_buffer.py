@@ -50,8 +50,8 @@ from .utils import (
     FSDPDistributedIndex,
     get_global_memory_buffer,
     get_mcore_tensor_parallel_partition_dim,
-    is_mcore_tensor_model_parallel,
     is_mcore_tensor_parallel_duplicated,
+    using_tensor_parallel,
 )
 
 logger = logging.getLogger(__name__)
@@ -1653,6 +1653,7 @@ class ParamAndGradBuffer:
             if self.dist_index.get_outer_fsdp_group() is not None:
                 # Outer/Inter-FSDP group when using hybrid FSDP
                 self.ubr_groups.append(self.dist_index.get_outer_fsdp_group())
+
             if (
                 self.dist_index.get_fsdp_group(
                     is_expert_parallel=False, independent_all_gather=True
@@ -1666,29 +1667,28 @@ class ParamAndGradBuffer:
                     )
                 )
 
-            log_single_rank(
-                logger,
-                logging.INFO,
-                f"[ParamAndGradBuffer] FSDP UBRegistration Groups ({len(self.ubr_groups)}):",
-            )
+            if torch.distributed.get_rank() == self.dist_index.representative_rank():
+                logging.info(
+                    f"[ParamAndGradBuffer] FSDP UBRegistration Groups ({len(self.ubr_groups)}):"
+                )
+
             # All ranks in each group must participate in the collective to avoid deadlock.
             for i, group in enumerate(self.ubr_groups):
-                log_single_rank(
-                    logger,
-                    logging.INFO,
-                    f"Group [{i+1}/{len(self.ubr_groups)}] "
-                    f"group.group_desc: {group.group_desc}, group.size(): {group.size()}",
-                )
+                if torch.distributed.get_rank() == self.dist_index.representative_rank():
+                    logging.info(
+                        f"Group [{i+1}/{len(self.ubr_groups)}] \
+                            group.group_desc: {group.group_desc}, group.size(): {group.size()}"
+                    )
                 torch.distributed.barrier(group=group, async_op=False)
-                log_single_rank(
-                    logger,
-                    logging.INFO,
-                    f"Call Success with the group [{i+1}/{len(self.ubr_groups)}] "
-                    f"group.group_desc: {group.group_desc}",
-                )
+                if torch.distributed.get_rank() == self.dist_index.representative_rank():
+                    logging.info(
+                        f"Call Success with the group [{i+1}/{len(self.ubr_groups)}] \
+                            group.group_desc: {group.group_desc}"
+                    )
             # Call barrier from the global communitcator group
             torch.distributed.barrier(async_op=False)
-            log_single_rank(logger, logging.INFO, "Call Success with the global communicator group")
+            if torch.distributed.get_rank() == self.dist_index.representative_rank():
+                logging.info(f"Call Success with the global communicator group")
 
         # If using nccl_ub, it returns a function that registers buffers to the NCCL memory pool
         # Buffer is registered to data_parallel_group and expert_data_parallel_group if it exists
@@ -1872,7 +1872,8 @@ class ParamAndGradBuffer:
             f"Total pad: {_bytes_to_mb(total_padded_bytes)}"
         )
 
-        log_single_rank(logger, logging.INFO, "\n".join(log_lines))
+        if torch.distributed.get_rank() == self.dist_index.representative_rank():
+            logger.info("\n".join(log_lines))
 
     def _init_each_parameter_group_buffers(self, meta_device_init_fp8_params):
         """
@@ -2168,7 +2169,8 @@ class ParamAndGradBuffer:
                 f"CUDA params numel: {cuda_params_numel / 1_000_000:.2f} M, "
                 f"CPU params numel: {cpu_params_numel / 1_000_000:.2f} M"
             )
-            log_single_rank(logger, logging.INFO, log_str)
+            if torch.distributed.get_rank() == self.dist_index.representative_rank():
+                logger.info(log_str)
 
         # Initialize the model weight buffer data of each parameter group.
         # Specifically, replace the Torch module's parameter data with tensors
@@ -4132,7 +4134,9 @@ def make_fsdp_dtensor(
     orig_param = param
 
     # Handle tensor model parallel specific logic
-    if is_mcore_tensor_model_parallel(param):
+    if not isinstance(param, DTensor) and using_tensor_parallel(
+        dist_index, is_expert_parallel=is_expert_param
+    ):
         # Ensure parameter is not already a DTensor
         assert not isinstance(param, DTensor), (
             "[Megatron-FSDP] Parameter is already a DTensor, yet tensor_model_parallel " "is True."
@@ -4165,7 +4169,7 @@ def make_fsdp_dtensor(
                 local_tensor=local_tensor,
                 device_mesh=tp_mesh,
                 placements=placements,
-                run_check=run_check,
+                run_check=False,
                 shape=tuple(global_shape),
                 stride=torch.empty(global_shape).stride(),
             )

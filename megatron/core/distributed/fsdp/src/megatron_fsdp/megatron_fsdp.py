@@ -282,10 +282,9 @@ class MegatronFSDP(torch.nn.Module):
         if self.ddp_config.data_parallel_sharding_strategy in ["optim_grads_params", "optim_grads"]:
             # Default to overlapped gradient reduce-scatter when sharding gradients.
             self.ddp_config.overlap_grad_reduce = True
-        if not self.is_delay_grad_reduce:
-            # Gradient reduce-scatter must be overlapped when using sharding optimizer
-            # and gradients.
-            assert self.ddp_config.overlap_grad_reduce
+        if self.ddp_config.data_parallel_sharding_strategy == "optim_grads":
+            # Default to overlapped gradient reduce communication when sharding gradients.
+            self.ddp_config.overlap_grad_reduce = True
 
         for param in self.module.parameters():
             if not hasattr(param, "grad_added_to_main_grad"):

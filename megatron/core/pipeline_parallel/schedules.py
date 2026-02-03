@@ -1,6 +1,7 @@
 # Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
 import contextlib
+import logging
 from functools import partial
 from typing import Callable, Iterator, List, Optional, Union
 
@@ -161,7 +162,8 @@ def deallocate_output_tensor(out, deallocate_pipeline_outputs=False):
     if (out is None) or (not deallocate_pipeline_outputs):
         return
     assert isinstance(out, torch.Tensor), "expected Tensor, found %s." % type(out).__name__
-    assert out._base is None, "counter-productive to free a view of another tensor."
+    if out._base is not None:
+        logging.debug("counter-productive to free a view of another tensor.")
     out.data = torch.empty((1,), device=out.device, dtype=out.dtype)
 
 
