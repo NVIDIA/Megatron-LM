@@ -752,18 +752,14 @@ class DynamicInferenceContext(BaseInferenceContext):
                 self.mamba_metadata = None
 
         # Allocate large non-graphed buffers.
-        # - If UVM is turned on, we use UVM unconditionally.
-        # - If CGs are not reset and KV cache is not persisted, we need `torch_memory_saver`.
-        # - If offloading KV cache, we prefer to use `torch_memory_saver` over manual offloading.
-        # - If removing the KV cache, we must re-allocate every time, not just at init.
-        need_static = not self.reset_cuda_graphs and self.kv_cache_management_mode != "persist"
+        need_static_addr = not self.reset_cuda_graphs and self.kv_cache_management_mode != "persist"
         offload_kv = self.kv_cache_management_mode == "offload"
         remove_kv = self.kv_cache_management_mode == "remove"
 
         ctx_manager = nullcontext()
         if self.unified_memory_level != 0:
             ctx_manager = torch.cuda.use_mem_pool(self.unified_memory_mempool)
-        elif HAVE_TORCH_MEMORY_SAVER and (need_static or offload_kv):
+        elif HAVE_TORCH_MEMORY_SAVER and (need_static_addr or offload_kv):
             ctx_manager = torch_memory_saver.region(
                 tag="inference_context", enable_cpu_backup=offload_kv
             )
