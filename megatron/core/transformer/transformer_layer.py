@@ -1094,7 +1094,8 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
             nvtx_range_pop(suffix="mlp")
 
             output = self._forward_post_mlp(
-                mlp_output_with_bias, residual, flush_delayed_groups=False)
+                mlp_output_with_bias, residual, flush_delayed_groups=False
+            )
         else:
             # If EP overlap is enabled, needs to return same outputs as submodule.attn
             if self.config.overlap_moe_expert_parallel_comm:

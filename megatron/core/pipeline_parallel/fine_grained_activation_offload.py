@@ -937,7 +937,7 @@ class ChunkOffloadHandler:
             return False
         return True
 
-    def bulk_offload_group(self):
+    def bulk_offload_group(self, group_to_offload):
         """offload a group of tensors recorded in tensor_push()."""
         debug_rank("------bulk_offload_group")
         torch.cuda.nvtx.range_push("activation offloading " + group_to_offload._name)
@@ -952,7 +952,6 @@ class ChunkOffloadHandler:
                     tensor_on_device.record_stream(self.d2h_stream)
                     group_to_offload.push_tensor(tensor_tag, state)
             group_to_offload.record_offload_event(self.d2h_stream)
-        self._groups_to_offload.pop()
         torch.cuda.nvtx.range_pop()
 
     def get_max_deduplicated_groups(self):
