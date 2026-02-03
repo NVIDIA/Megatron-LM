@@ -23,6 +23,7 @@ class ChunkedPipelineParallelDataIterator:
         self.current_seq_length = None
         self.current_split_span = None
         self.current_kv_cache_pool = None
+        self.current_boundary_elements_for_mtp = None
 
     def __next__(self):
         assert (
@@ -66,6 +67,19 @@ class ChunkedPipelineParallelDataIterator:
             'loss_mask': self.loss_mask_slices[self.current_span_idx],
             'position_ids': self.position_ids_slices[self.current_span_idx],
         }
+        if self.config.mtp_num_layers is not None and self.config.mtp_num_layers > 0:
+            assert (
+                self.config.mtp_num_layers == 1
+            ), "Chunked pipeline parallelism currently only supports one MTP layer."
+            if self.current_span_idx == self.chunked_pp_splits - 1:
+                self.current_boundary_elements_for_mtp = None
+            else:
+                self.current_boundary_elements_for_mtp = {
+                    'tokens': self.token_slices[self.current_span_idx + 1][:, 0],
+                    'labels': self.labels_slices[self.current_span_idx + 1][:, 0],
+                    'loss_mask': self.loss_mask_slices[self.current_span_idx + 1][:, 0],
+                    'position_ids': self.position_ids_slices[self.current_span_idx + 1][:, 0],
+                }
 
         return slice_data
 
@@ -74,6 +88,8 @@ class ChunkedPipelineParallelDataIterator:
         return spans
 
     def mock_next(self, seq_length: int):
+        """Mock next method for null data iterator."""
+
         assert self.data_iterator is None, "mock_next is only available for data_iterator is None."
         if self.current_span_idx == -1 or self.current_span_idx + 1 == self.chunked_pp_splits:
             self.count += 1
@@ -88,11 +104,14 @@ class ChunkedPipelineParallelDataIterator:
             self.current_split_span = self._get_span(seq_length)
 
     def get_current_cached_prefix_params(self) -> CachedPrefixParams:
+        """Get cached prefix params for the current chunk."""
+
         return CachedPrefixParams(
-            prefix_seqlens=self.current_split_span[:self.current_span_idx],
+            prefix_seqlens=self.current_split_span[: self.current_span_idx],
             this_chunk_seqlen=self.current_split_span[self.current_span_idx],
             max_total_seqlen=self.current_seq_length,
             kv_cache_pool=self.current_kv_cache_pool,
+            boundary_elements_for_mtp=self.current_boundary_elements_for_mtp,
         )
 
 

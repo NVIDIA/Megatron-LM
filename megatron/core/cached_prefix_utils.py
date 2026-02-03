@@ -3,6 +3,8 @@
 from dataclasses import dataclass
 from typing import List, Optional, Type
 
+import torch
+
 from megatron.core.transformer.transformer_config import TransformerConfig
 
 
@@ -17,27 +19,53 @@ class KVCachePool:
     def __init__(self, config: TransformerConfig):
         self.config = config
         self.kv_cache_pool = {}
+        self.block_prefixes = []
+
+    def block_range_push(self, suffix: str):
+        """Push a block range onto the stack."""
+
+        self.block_prefixes.append(suffix)
+        if tuple(self.block_prefixes) not in self.kv_cache_pool:
+            self.kv_cache_pool[tuple(self.block_prefixes)] = {}
+
+    def block_range_pop(self, suffix: Optional[str] = None):
+        """Pop a block range from the stack."""
+
+        assert len(self.block_prefixes) > 0, "No block range to pop."
+        if suffix is not None:
+            assert (
+                self.block_prefixes[-1] == suffix
+            ), f"Expected block range suffix {suffix}, but got {self.block_prefixes[-1]}."
+        self.block_prefixes.pop()
 
     def get_kv_cache(self, layer_idx: int, kv_cache_cls: Type[KVCache]) -> KVCache:
-        if layer_idx not in self.kv_cache_pool:
-            self.kv_cache_pool[layer_idx] = kv_cache_cls(self.config)
-        assert isinstance(self.kv_cache_pool[layer_idx], kv_cache_cls), (
-            f"Expected KV cache of type {kv_cache_cls}, "
-            f"but got {type(self.kv_cache_pool[layer_idx])}."
-        )
-        return self.kv_cache_pool[layer_idx]
+        """Get the KV cache for the given layer index."""
+
+        if layer_idx not in self.kv_cache_pool[tuple(self.block_prefixes)]:
+            # Create a new KV cache for the given layer index.
+            self.kv_cache_pool[tuple(self.block_prefixes)][layer_idx] = kv_cache_cls(self.config)
+        else:
+            # Check if the KV cache is of the expected type.
+            assert isinstance(
+                self.kv_cache_pool[tuple(self.block_prefixes)][layer_idx], kv_cache_cls
+            ), (
+                f"Expected KV cache of type {kv_cache_cls}, "
+                f"but got {type(self.kv_cache_pool[tuple(self.block_prefixes)][layer_idx])}."
+            )
+        return self.kv_cache_pool[tuple(self.block_prefixes)][layer_idx]
 
 
 @dataclass
 class CachedPrefixParams:
     '''Parameters for prefix caching.
-    
+
     Args:
         prefix_seqlens: Sequence lengths of the prefixes
         this_chunk_seqlen: Sequence length of the current chunk
         max_total_seqlen: Maximum total sequence length globally
         kv_cache_pool: KV cache pool of the current micro batch
-    
+        boundary_elements_for_mtp: Boundary elements for MTP rolling.
+
     Note: All seqlens here ignore the parallelism.
     For example, if we split a sequence of length 4096 into 4 evenly-sized chunks,
     then for the i-th chunk (i=0,1,2,3), whatever the TP and CP sizes are, we always have:
@@ -46,12 +74,11 @@ class CachedPrefixParams:
       - max_total_seqlen = 4096
     '''
 
-    prefix_seqlens: List[int]  # Sequence lengths of the prefixes
-    this_chunk_seqlen: int  # Sequence length of the current chunk
-    max_total_seqlen: Optional[int]  # Maximum total sequence length globally
+    prefix_seqlens: List[int]
+    this_chunk_seqlen: int
+    max_total_seqlen: Optional[int]
     kv_cache_pool: KVCachePool
+    boundary_elements_for_mtp: Optional[torch.Tensor]
 
     def __hash__(self):
-        return hash(
-            (tuple(self.prefix_seqlens), self.this_chunk_seqlen, self.max_total_seqlen)
-        )
+        return hash((tuple(self.prefix_seqlens), self.this_chunk_seqlen, self.max_total_seqlen))

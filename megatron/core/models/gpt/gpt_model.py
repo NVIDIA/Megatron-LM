@@ -539,6 +539,8 @@ class GPTModel(LanguageModule):
         rotary_pos_cos_sin = preproc_output[6] if len(preproc_output) == 7 else None
 
         # Run decoder.
+        if cached_prefix_params is not None:
+            cached_prefix_params.kv_cache_pool.block_range_push("decoder")
         hidden_states = self.decoder(
             hidden_states=decoder_input,
             attention_mask=attention_mask,
@@ -553,6 +555,8 @@ class GPTModel(LanguageModule):
             padding_mask=padding_mask,
             **(extra_block_kwargs or {}),
         )
+        if cached_prefix_params is not None:
+            cached_prefix_params.kv_cache_pool.block_range_pop("decoder")
 
         return self._postprocess(
             hidden_states=hidden_states,
@@ -572,6 +576,7 @@ class GPTModel(LanguageModule):
             runtime_gather_output=runtime_gather_output,
             extra_block_kwargs=extra_block_kwargs,
             inference_context=inference_context,
+            cached_prefix_params=cached_prefix_params,
         )
 
     def _postprocess(
@@ -593,6 +598,7 @@ class GPTModel(LanguageModule):
         runtime_gather_output=None,
         extra_block_kwargs=None,
         inference_context=None,
+        cached_prefix_params=None,
     ):
         """Postprocesses decoder hidden states to generate logits or compute loss.
 
@@ -608,6 +614,8 @@ class GPTModel(LanguageModule):
         if self.share_embeddings_and_output_weights:
             output_weight = self.shared_embedding_or_output_weight()
         if mtp_in_postprocess:
+            if cached_prefix_params is not None:
+                cached_prefix_params.kv_cache_pool.block_range_push("mtp")
             hidden_states = self.mtp(
                 input_ids=input_ids,
                 position_ids=position_ids,
@@ -620,8 +628,11 @@ class GPTModel(LanguageModule):
                 packed_seq_params=packed_seq_params,
                 sequence_len_offset=sequence_len_offset,
                 embedding=self.embedding,
+                cached_prefix_params=cached_prefix_params,
                 **(extra_block_kwargs or {}),
             )
+            if cached_prefix_params is not None:
+                cached_prefix_params.kv_cache_pool.block_range_pop("mtp")
 
         if not self.post_process:
             return hidden_states
@@ -635,12 +646,26 @@ class GPTModel(LanguageModule):
                 loss_mask = torch.ones_like(mtp_labels)
             for mtp_layer_number in range(self.config.mtp_num_layers):
                 # Calc loss for the current Multi-Token Prediction (MTP) layers.
+                if (
+                    cached_prefix_params is not None
+                    and cached_prefix_params.boundary_elements_for_mtp is not None
+                ):
+                    # Boundary elements for MTP are stored in the cached_prefix_params.
+                    assert (
+                        mtp_layer_number == 0
+                    ), "Prefix caching currently only supports at most one MTP layer."
+                    boundary_mtp_labels = cached_prefix_params.boundary_elements_for_mtp["labels"]
+                    boundary_loss_mask = cached_prefix_params.boundary_elements_for_mtp["loss_mask"]
+                else:
+                    boundary_mtp_labels = None
+                    boundary_loss_mask = None
                 mtp_labels, _ = roll_tensor(
                     mtp_labels,
                     shifts=-1,
                     dims=-1,
                     cp_group=self.cp_group,
                     packed_seq_params=packed_seq_params,
+                    boundary_elements=boundary_mtp_labels,
                 )
                 loss_mask, num_tokens = roll_tensor(
                     loss_mask,
@@ -648,6 +673,7 @@ class GPTModel(LanguageModule):
                     dims=-1,
                     cp_group=self.cp_group,
                     packed_seq_params=packed_seq_params,
+                    boundary_elements=boundary_loss_mask,
                 )
 
                 # Compute mtp loss without storing logits to save memory.

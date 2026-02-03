@@ -9,6 +9,7 @@ import torch
 from torch import Tensor
 
 from megatron.core import InferenceParams, parallel_state, tensor_parallel
+from megatron.core.cached_prefix_utils import CachedPrefixParams
 from megatron.core.dist_checkpointing.mapping import ShardedStateDict
 from megatron.core.dist_checkpointing.utils import replace_prefix_for_sharding
 from megatron.core.fp8_utils import get_fp8_context
@@ -124,7 +125,9 @@ def tie_output_layer_state_dict(
     )
 
 
-def roll_tensor(tensor, shifts=-1, dims=-1, cp_group=None, packed_seq_params=None):
+def roll_tensor(
+    tensor, shifts=-1, dims=-1, cp_group=None, packed_seq_params=None, boundary_elements=None
+):
     """Roll the tensor input along the sequence dimension with Context Parallelism (CP) support.
 
     This function extends the original roll_tensor to support Context Parallelism, which allows
@@ -147,17 +150,26 @@ def roll_tensor(tensor, shifts=-1, dims=-1, cp_group=None, packed_seq_params=Non
                                falls back to standard rolling behavior.
         packed_seq_params (PackedSeqParams): Parameters for packed sequence processing.
                                             If provided, respects sequence boundaries.
+        boundary_elements (Tensor, optional): The elements to be filled into the boundary.
     Returns:
         tuple: (rolled_tensor, sum_of_rolled_tensor)
     """
     # Handle packed sequences cases
     if packed_seq_params is not None:
+        assert (
+            boundary_elements is None
+        ), "Manually specifying boundary elements is not supported with sequence packing for now."
         return _roll_tensor_packed_seq(tensor, shifts, dims, packed_seq_params, cp_group)
 
     # Standard rolling behavior when CP is not enabled (cp_group is None or size=1)
     if cp_group is None or cp_group.size() == 1:
         rolled_tensor = torch.roll(tensor, shifts=shifts, dims=dims)
-        rolled_tensor.select(dims, shifts).fill_(0)
+        if boundary_elements is not None:
+            # Fill the specified elements into the boundary.
+            rolled_tensor.select(dims, shifts).copy_(boundary_elements)
+        else:
+            # Fill the boundary elements with 0.
+            rolled_tensor.select(dims, shifts).fill_(0)
         return rolled_tensor, rolled_tensor.sum()
 
     # CP-enabled rolling: Split tensor into chunks and handle boundary communication
@@ -194,8 +206,12 @@ def roll_tensor(tensor, shifts=-1, dims=-1, cp_group=None, packed_seq_params=Non
         req_recv_second_part = torch.distributed.irecv(tensor=tensor_recv_list[1], src=prev_rank)
         ops.append(req_recv_second_part)
     else:
-        # Inserted elements are set to be 0.0.
-        tensor_recv_list[1] = 0
+        if boundary_elements is not None:
+            # Fill the specified elements into the boundary.
+            tensor_recv_list[1] = boundary_elements
+        else:
+            # Fill the boundary elements with 0.
+            tensor_recv_list[1] = 0
     if local_rank != len(global_ranks) - 1:
         req_recv_first_part = torch.distributed.irecv(tensor=tensor_recv_list[0], src=next_rank)
         ops.append(req_recv_first_part)
@@ -685,6 +701,7 @@ class MultiTokenPredictionLayer(MegatronModule):
         embedding: Callable,
         hidden_states: torch.Tensor,
         packed_seq_params: Optional[PackedSeqParams] = None,
+        cached_prefix_params: Optional[CachedPrefixParams] = None,
     ):
         """
         Preprocesses input data for the Multi-Token Prediction (MTP) layers.
@@ -700,14 +717,27 @@ class MultiTokenPredictionLayer(MegatronModule):
             hidden_states (torch.Tensor): hidden states tensor of shape [s, b, h] where s is the
                 sequence length, b is the batch size, and h is the hidden size.
             packed_seq_params (PackedSeqParams): Parameters for packed sequence processing.
+            cached_prefix_params (CachedPrefixParams, optional): Parameters for cached prefix.
         """
         # Calc logits for the current Multi-Token Prediction (MTP) layers.
+        if (
+            cached_prefix_params is not None
+            and cached_prefix_params.boundary_elements_for_mtp is not None
+        ):
+            # Boundary elements for MTP are stored in the cached_prefix_params.
+            # Currently only support one MTP layer.
+            boundary_input_ids = cached_prefix_params.boundary_elements_for_mtp["tokens"]
+            boundary_position_ids = cached_prefix_params.boundary_elements_for_mtp["position_ids"]
+        else:
+            boundary_input_ids = None
+            boundary_position_ids = None
         input_ids, _ = roll_tensor(
             input_ids,
             shifts=-1,
             dims=-1,
             cp_group=self.cp_group,
             packed_seq_params=packed_seq_params,
+            boundary_elements=boundary_input_ids,
         )
         position_ids, _ = roll_tensor(
             position_ids,
@@ -715,6 +745,7 @@ class MultiTokenPredictionLayer(MegatronModule):
             dims=-1,
             cp_group=self.cp_group,
             packed_seq_params=packed_seq_params,
+            boundary_elements=boundary_position_ids,
         )
         # embedding
         decoder_input = embedding(input_ids=input_ids, position_ids=position_ids)
@@ -760,6 +791,7 @@ class MultiTokenPredictionLayer(MegatronModule):
         inference_params: Optional[InferenceParams] = None,
         packed_seq_params: Optional[PackedSeqParams] = None,
         sequence_len_offset: Optional[torch.Tensor] = None,
+        cached_prefix_params: Optional[CachedPrefixParams] = None,
     ) -> torch.Tensor:
         """
         Concatenates embeddings with hidden states and then applies transformer layer forward.
@@ -800,6 +832,7 @@ class MultiTokenPredictionLayer(MegatronModule):
                     inference_params=inference_params,
                     packed_seq_params=packed_seq_params,
                     sequence_len_offset=sequence_len_offset,
+                    cached_prefix_params=cached_prefix_params,
                 )
 
         hidden_states = self._postprocess(hidden_states)
@@ -874,6 +907,7 @@ class MultiTokenPredictionLayer(MegatronModule):
         packed_seq_params: Optional[PackedSeqParams] = None,
         sequence_len_offset: Optional[Tensor] = None,
         embedding=None,
+        cached_prefix_params: Optional[CachedPrefixParams] = None,
     ):
         """
         Execute the forward pass through the Multi-Token Prediction (MTP) layer.
@@ -892,6 +926,7 @@ class MultiTokenPredictionLayer(MegatronModule):
             rotary_pos_sin (Tensor, optional): Sine component of rotary positional embeddings.
             sequence_len_offset (Tensor, optional): Offset for sequence length, if applicable.
             embedding (Callable): The embedding module from gpt model to compute the decoder input.
+            cached_prefix_params (CachedPrefixParams, optional): Parameters for cached prefix.
 
         Returns:
             Union[Tensor, Tuple[Tensor, Tensor]]: The output hidden states tensor of shape
@@ -905,9 +940,13 @@ class MultiTokenPredictionLayer(MegatronModule):
             embedding=embedding,
             hidden_states=hidden_states,
             packed_seq_params=packed_seq_params,
+            cached_prefix_params=cached_prefix_params,
         )
 
         if self.config.recompute_granularity == 'full' and self.training:
+            assert (
+                cached_prefix_params is None
+            ), "Prefix caching is not supported with MTP recompute for now."
             hidden_states = self._checkpointed_forward(
                 self._proj_and_transformer_layer,
                 hidden_states=hidden_states,
@@ -937,6 +976,7 @@ class MultiTokenPredictionLayer(MegatronModule):
                 inference_params=inference_params,
                 packed_seq_params=packed_seq_params,
                 sequence_len_offset=sequence_len_offset,
+                cached_prefix_params=cached_prefix_params,
             )
 
         return hidden_states, input_ids, position_ids
@@ -1091,6 +1131,7 @@ class MultiTokenPredictionBlock(MegatronModule):
         sequence_len_offset: Optional[Tensor] = None,
         extra_block_kwargs: Optional[dict] = None,
         embedding=None,
+        cached_prefix_params: Optional[CachedPrefixParams] = None,
     ) -> Tensor:
         """
         Perform the forward pass through all of the MTP modules.
@@ -1121,6 +1162,7 @@ class MultiTokenPredictionBlock(MegatronModule):
                 packed_seq_params=packed_seq_params,
                 sequence_len_offset=sequence_len_offset,
                 embedding=embedding,
+                cached_prefix_params=cached_prefix_params,
                 **(extra_block_kwargs or {}),
             )
 

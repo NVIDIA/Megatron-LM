@@ -4,7 +4,6 @@ from __future__ import annotations
 import copy
 import inspect
 from abc import ABC, abstractmethod
-from collections import defaultdict
 from dataclasses import dataclass
 from typing import Callable, Optional, Protocol, Tuple, Union
 

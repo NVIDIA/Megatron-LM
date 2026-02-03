@@ -59,7 +59,8 @@ class ChunkedKVCacheForGatedDeltaNet(KVCache):
         """Forward pass of gated delta rule with chunked KV cache."""
         n_prefix = len(cached_prefix_params.prefix_seqlens)
         assert len(self.gated_delta_rule_states_cache) == n_prefix, (
-            f"Expected {n_prefix} prefix states, but got {len(self.gated_delta_rule_states_cache)=}. "
+            f"Expected {n_prefix} prefix states, "
+            f"but got {len(self.gated_delta_rule_states_cache)=}. "
             "Please check the cached prefix parameters."
         )
 

@@ -610,6 +610,51 @@ class TestMultiTokenPrediction:
 
         Utils.destroy_model_parallel()
 
+    def test_roll_tensor_with_boundary_elements(self):
+        """Test roll_tensor function with boundary elements."""
+
+        tensor = torch.tensor([1, 2, 3, 4, 5], dtype=torch.float32).cuda()
+
+        boundary_elements = torch.tensor(6, dtype=torch.float32).cuda()
+        expected = tensor + 1
+
+        # Roll by -1 (shift left) with CP communication
+        rolled, sum_val = roll_tensor(
+            tensor, shifts=-1, dims=0, boundary_elements=boundary_elements
+        )
+
+        # Verify the rolled tensor matches expected values
+        assert torch.equal(
+            rolled, expected
+        ), f"Expected\n{expected}\nbut got\n{rolled}\nDiff:\n{rolled - expected}"
+
+    def test_roll_tensor_with_boundary_elements_and_cp(self):
+        """Test roll_tensor function with boundary elements and context parallelism."""
+
+        Utils.initialize_model_parallel(tensor_model_parallel_size=1, context_parallel_size=2)
+        cp_group = get_context_parallel_group()
+        cp_rank = torch.distributed.get_rank(group=cp_group)
+
+        if cp_rank == 0:
+            # CP Rank 0: first half of each sequence
+            tensor = torch.tensor([1, 2, 3, 4, 13, 14, 15, 16], dtype=torch.float32).cuda()
+        else:
+            # CP Rank 1: second half of each sequence
+            tensor = torch.tensor([5, 6, 7, 8, 9, 10, 11, 12], dtype=torch.float32).cuda()
+
+        boundary_elements = torch.tensor(17, dtype=torch.float32).cuda()
+        expected = tensor + 1
+
+        # Roll by -1 (shift left) with CP communication
+        rolled, sum_val = roll_tensor(
+            tensor, shifts=-1, dims=0, cp_group=cp_group, boundary_elements=boundary_elements
+        )
+
+        # Verify the rolled tensor matches expected values
+        assert torch.equal(
+            rolled, expected
+        ), f"CP Rank {cp_rank}: Expected\n{expected}\nbut got\n{rolled}\nDiff:\n{rolled - expected}"
+
 
 class TestMTPLossLoggingHelper:
     def setup_method(self, method):

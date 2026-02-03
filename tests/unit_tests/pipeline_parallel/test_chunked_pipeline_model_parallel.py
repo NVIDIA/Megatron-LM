@@ -14,6 +14,7 @@ from megatron.core.cached_prefix_utils import CachedPrefixParams
 from megatron.core.models.gpt.experimental_attention_variant_module_specs import (
     get_transformer_block_with_experimental_attention_variant_spec,
 )
+from megatron.core.models.gpt.gpt_layer_specs import get_gpt_mtp_block_spec
 from megatron.core.models.gpt.gpt_model import GPTModel
 from megatron.core.num_microbatches_calculator import (
     init_num_microbatches_calculator,
@@ -60,6 +61,8 @@ def initialize_gpt_model(seed, **config_kwargs):
         linear_num_key_heads=4,
         linear_num_value_heads=8,
         activation_func=F.silu,
+        mtp_num_layers=1,
+        mtp_loss_scaling_factor=0.1,
     )
     default_config_kwargs.update(**config_kwargs)
     transformer_config = TransformerConfig(**default_config_kwargs)
@@ -72,10 +75,20 @@ def initialize_gpt_model(seed, **config_kwargs):
             pp_rank=parallel_state.get_pipeline_model_parallel_rank(),
         )
 
-        mtp_block_spec = None
-
         pre_process = parallel_state.is_pipeline_first_stage(ignore_virtual=False, vp_stage=i)
         post_process = parallel_state.is_pipeline_last_stage(ignore_virtual=False, vp_stage=i)
+
+        if post_process:
+            mtp_block_spec = get_gpt_mtp_block_spec(
+                config=transformer_config,
+                spec=layer_spec,
+                use_transformer_engine=True,
+                vp_stage=i,
+                pp_rank=parallel_state.get_pipeline_model_parallel_rank(),
+            )
+        else:
+            mtp_block_spec = None
+
         this_model = (
             GPTModel(
                 config=transformer_config,
@@ -338,10 +351,11 @@ def get_batch_iterator(seq_length, micro_batch_size, num_batches=None):
 ############
 
 
-def create_mock_config(chunked_pp_splits: int):
+def create_mock_config(chunked_pp_splits: int, mtp_num_layers: int = 0):
     """Create a mock TransformerConfig."""
     config = MagicMock()
     config.chunked_pipeline_model_parallel_splits = chunked_pp_splits
+    config.mtp_num_layers = mtp_num_layers
     return config
 
 
@@ -398,7 +412,7 @@ class TestChunkedPipelineParallelDataIterator:
         seq_length = 256
         expected_spans = [64, 64, 64, 64]
         micro_batch_size = 3
-        config = create_mock_config(chunked_pp_splits)
+        config = create_mock_config(chunked_pp_splits, mtp_num_layers=1)
 
         sample_data = [
             create_sample_data(micro_batch_size, seq_length) for _ in range(num_micro_batches)
@@ -421,6 +435,7 @@ class TestChunkedPipelineParallelDataIterator:
                 )
                 assert torch.equal(slice_data["tokens"], expected_tokens)
 
+                # Verify cached prefix params
                 params = iterator.get_current_cached_prefix_params()
                 assert isinstance(params, CachedPrefixParams)
                 assert params.prefix_seqlens == expected_spans[:span_idx]
@@ -428,7 +443,25 @@ class TestChunkedPipelineParallelDataIterator:
                 assert params.max_total_seqlen == 256
                 assert params.kv_cache_pool is not None
 
-    def test_get_current_chunked_pp_params(self):
+                # Verify boundary elements for MTP
+                if span_idx == chunked_pp_splits - 1:
+                    assert params.boundary_elements_for_mtp is None
+                else:
+                    assert params.boundary_elements_for_mtp is not None
+                    assert params.boundary_elements_for_mtp["tokens"].shape == (micro_batch_size,)
+                    assert params.boundary_elements_for_mtp["labels"].shape == (micro_batch_size,)
+                    assert params.boundary_elements_for_mtp["loss_mask"].shape == (
+                        micro_batch_size,
+                    )
+                    assert params.boundary_elements_for_mtp["position_ids"].shape == (
+                        micro_batch_size,
+                    )
+                    expected_next_token = torch.LongTensor([expected_end]).expand(micro_batch_size)
+                    assert torch.equal(
+                        params.boundary_elements_for_mtp["tokens"], expected_next_token
+                    )
+
+    def test_mock_next(self):
         """Test params generation matches iterator state."""
 
         config = create_mock_config(4)
