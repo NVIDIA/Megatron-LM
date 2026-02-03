@@ -1233,9 +1233,11 @@ def validate_args(args, defaults={}):
 
     if args.mtp_num_layers:
         assert not args.use_legacy_models, "The legacy Megatron models does not support Multi-Token Prediction (MTP)."
-        assert args.position_embedding_type == "rope" or args.position_embedding_type == "none", (
-            f"Multi-Token Prediction (MTP) is not supported with {args.position_embedding_type} position embedding type."
-            + f"The supported position embedding types are rope and none."
+        # MTP is compatible with position embedding types that use position_ids.
+        supported_position_types = ["learned_absolute", "rope", "mrope", "none"]
+        assert args.position_embedding_type in supported_position_types, (
+            f"Multi-Token Prediction (MTP) is not supported with '{args.position_embedding_type}' position embedding type. "
+            f"The supported position embedding types are: {', '.join(supported_position_types)}."
         )
 
     if args.cpu_offloading_num_layers > 0:
@@ -1925,8 +1927,6 @@ def _add_rl_args(parser):
                        help='If set, use inference logprobs in importance sampling correction of the loss.')
     group.add_argument('--rl-importance-sampling-truncation-coef', type=float, default=None,
                        help="If --inference-logprobs-is-correction is on and this coefficient is set, apply truncation for the IS correction at GRPO loss.")
-    group.add_argument('--rl-calculate-intra-group-similarity', action=argparse.BooleanOptionalAction, default=False,
-                       help='If set, calculate the intra-group similarity of rollouts.')
     group.add_argument('--rl-use-sequence-packing', action=argparse.BooleanOptionalAction, type=bool, default=False,
                        help='Enable sequence packing')
     group.add_argument('--rl-sequence-packing-max-sequences-per-bin', type=int, default=50,
@@ -1986,11 +1986,11 @@ def _add_rl_args(parser):
         ),
     )
     group.add_argument('--refit-method', type=str, default='gloo',
-                       choices=['nccl', 'gloo'],
+                       choices=['nccl', 'gloo', 'nvshmem'],
                        help=('Method to refit the model weights between training and inference models during RL. '
                              'nccl: use NCCLCopyService to refit using NCCL; '
                              'gloo: use GlooCopyService over CPU; '
-                             ))
+                             'nvshmem: use NVSHMEMCopyService to refit using the NVSHMEM.'))
     group.add_argument('--rl-verify-model-weights-swap', action=argparse.BooleanOptionalAction, default=False,
                        help='If set, verify that the model weights were correctly transferred by comparing forward pass outputs on'
                        'the first swap of model weights.')
