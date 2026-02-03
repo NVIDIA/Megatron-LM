@@ -58,12 +58,12 @@ products:
   - test_case: [gpt_static_inference_tp1_pp1_ep1_16B_logitsmatch]
     products:
       - environment: [dev]
-        scope: [mr, mr-github]
+        scope: [mr, mr-github-broken]
         platforms: [dgx_h100]
   - test_case: [gpt_static_inference_tp4_pp1_ep4_16B_logitsmatch]
     products:
       - environment: [dev]
-        scope: [mr, mr-github]
+        scope: [mr, mr-github-broken]
         platforms: [dgx_h100]
   - test_case: [gpt_static_inference_cuda_graphs_pad_tp4_pp1_ep4_16B_logitsmatch]
     products:

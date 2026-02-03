@@ -15,7 +15,9 @@ from megatron.core.inference.communication_utils import (
 from megatron.core.inference.contexts import BaseInferenceContext
 from megatron.core.models.gpt.gpt_model import GPTModel
 from megatron.core.process_groups_config import ProcessGroupCollection
-from megatron.core.utils import get_attr_wrapped_model, get_model_config
+from megatron.core.utils import deprecate_args, get_attr_wrapped_model, get_model_config
+
+DEPRECATED_ARGS = ["inference_wrapper_config", "pg_collection"]
 
 
 class AbstractModelInferenceWrapper(abc.ABC):
@@ -31,14 +33,13 @@ class AbstractModelInferenceWrapper(abc.ABC):
             or MLM).
         inference_context (BaseInferenceContext): Context for managing KV
             cache and other inference params.
-        pg_collection (ProcessGroupCollection): Process groups for model communication.
     """
 
+    @deprecate_args(*DEPRECATED_ARGS)
     def __init__(
         self,
         model: Union['LegacyGPTModel', GPTModel],  # type: ignore[name-defined]
         inference_context: BaseInferenceContext,
-        pg_collection: Optional[ProcessGroupCollection] = None,
     ):
         assert not isinstance(
             model, Iterable
@@ -52,7 +53,9 @@ class AbstractModelInferenceWrapper(abc.ABC):
 
         self.inference_context = inference_context
 
-        if pg_collection is None:
+        # Get the inference pg_collection from the config if it exists; otherwise the training
+        # pg_collection might be used during RL
+        if (pg_collection := self.inference_context.config.pg_collection) is None:
             pg_collection = ProcessGroupCollection.use_mpu_process_groups()
 
         self.tp_group = pg_collection.tp
