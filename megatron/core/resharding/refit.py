@@ -118,16 +118,14 @@ def clear_service_cache():
     Call this if you need to invalidate the cache, for example when
     reinitializing distributed state.
 
-    This properly finalizes services (especially NVSHMEM) to free GPU buffers
+    This properly finalizes services to free GPU buffers
     before clearing the cache.
     """
     global _service_cache
 
-    # Finalize services to free resources (especially NVSHMEM buffers)
-    # NCCL/Gloo services have no cleanup needed (no persistent buffers).
+    # Finalize services to free resources for NVSHMEM backend
+    # NCCL/Gloo services have no cleanup needed
     for backend_name, service in _service_cache.items():
-        # NVSHMEM: NVSHMEMCopyService wraps RemoteCopyService which allocates
-        # ~1GB of GPU buffers. Call finalize() on the inner service to free them.
         if hasattr(service, '_remote') and hasattr(service._remote, 'finalize'):
             service._remote.finalize()
 
