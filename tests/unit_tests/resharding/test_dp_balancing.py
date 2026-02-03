@@ -1,10 +1,4 @@
 # Copyright (c) 2025, NVIDIA CORPORATION. All rights reserved.
-"""
-Unit tests for DP balancing logic in select_src_metadata_balanced.
-
-Tests that destination ranks are evenly distributed across source DP groups
-to balance transfer load.
-"""
 import pytest
 
 from megatron.core.resharding.utils import ParameterMetadata, select_src_metadata_balanced

@@ -1,9 +1,4 @@
 # Copyright (c) 2025, NVIDIA CORPORATION. All rights reserved.
-"""
-Unit tests for the task segmenter.
-
-Tests the task segmentation logic that breaks large transfers into chunks.
-"""
 import pytest
 
 from megatron.core.resharding.nvshmem_copy_service.nvshmem_types import (

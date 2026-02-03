@@ -1,9 +1,4 @@
 # Copyright (c) 2025, NVIDIA CORPORATION. All rights reserved.
-"""
-Unit tests for the communication scheduler.
-
-Tests the greedy first-fit conflict-free scheduling algorithm.
-"""
 import pytest
 
 from megatron.core.resharding.nvshmem_copy_service.nvshmem_types import ScheduledBatch

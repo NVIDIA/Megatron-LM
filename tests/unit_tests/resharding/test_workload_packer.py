@@ -1,9 +1,4 @@
 # Copyright (c) 2025, NVIDIA CORPORATION. All rights reserved.
-"""
-Unit tests for the workload packer.
-
-Tests the bin packing algorithm that groups tasks into batches.
-"""
 import pytest
 
 from megatron.core.resharding.nvshmem_copy_service.nvshmem_types import SendRequest
