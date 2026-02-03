@@ -275,11 +275,14 @@ def get_calib_dataloader(
         with open(dataset_path_or_name) as f:
             dataset = []
             for i, line in enumerate(f):
-                if i >= calib_size:
+                if len(dataset) == calib_size:
                     break
                 sample = json.loads(line)
                 # Extract text field from various possible keys
                 if isinstance(sample, dict) and "text" in sample:
+                    if not sample["text"]:
+                        warnings.warn(f"Sample {i} has empty text, skipping")
+                        continue
                     dataset.append(sample["text"])
                 elif isinstance(sample, list) and isinstance(sample[0], dict):
                     assert "role" in sample[0] and "content" in sample[0]
@@ -408,7 +411,8 @@ if __name__ == "__main__":
 
         print_distributed_quant_summary(model, "Quantized Model:")
 
-    _custom_prompt_forward_loop_func(unwrapped_model)
-
     if args.save is not None:
         save_checkpoint(1, model, None, None, 0, release=True)
+
+    # Do this after saving in case it causes issues
+    _custom_prompt_forward_loop_func(unwrapped_model)
