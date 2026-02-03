@@ -704,6 +704,10 @@ class DynamicInferenceEngine(AbstractEngine):
         Returns:
             (DynamicInferenceRequest) The most recent request in the record.
         """
+        # >>>
+        # if not isinstance(request_id, int):
+        #     pax("request_id")
+        # <<<
         return self.requests[request_id].record[-1]
 
     def _add_request(
@@ -1195,7 +1199,16 @@ class DynamicInferenceEngine(AbstractEngine):
         self.is_decode_only = is_decode_only
 
         self.step_start_event.record()
+        # >>>
+        import builtins
+        builtins.step_count = self.step_count
+        # <<<
         result = await self.controller.async_generate_output_tokens_dynamic_batch()
+        # >>>
+        # newly_paused_request_ids = result.get("newly_paused_request_ids")
+        # if newly_paused_request_ids is not None:
+        #     pax("newly_paused_request_ids")
+        # <<<
         self.step_end_event.record()
         self.step_end_event.synchronize()
         step_time = self.step_start_event.elapsed_time(self.step_end_event) / 1e3
@@ -1270,6 +1283,9 @@ class DynamicInferenceEngine(AbstractEngine):
             # Mark requests finished.
             [self.get_request(i).add_event_finish() for i in finished_request_ids.tolist()]
             # Add finished events.
+            # >>>
+            # pax("log_probs")
+            # <<<
             (active_request_ids, finished_request_records) = self.post_process_requests(
                 active_request_ids,
                 finished_request_ids,

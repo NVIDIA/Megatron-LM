@@ -56,6 +56,9 @@ class StaticInferenceEngine(AbstractEngine):
         legacy=False,
         buffer_size_gb: Optional[float] = 40,
     ):
+        # >>>
+        # pax("legacy")
+        # <<<
         self.legacy = legacy
         if legacy:
             warnings.warn(
@@ -127,6 +130,10 @@ class StaticInferenceEngine(AbstractEngine):
             # Restore original context when falling back to legacy static engine
             self.controller.inference_wrapped_model.inference_context = original_context
             self.legacy = True
+            # >>>
+            raise e
+            pax()
+            # <<<
 
     def get_new_request_id(self) -> str:
         """Gets a new request id from the scheduler"""
