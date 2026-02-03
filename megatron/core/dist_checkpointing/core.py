@@ -4,8 +4,6 @@
 
 from pathlib import Path
 
-from megatron.core.msc_utils import MultiStorageClientFeature
-
 
 class CheckpointingException(Exception):
     """Base checkpointing related exception"""
