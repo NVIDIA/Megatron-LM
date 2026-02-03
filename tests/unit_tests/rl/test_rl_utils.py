@@ -690,14 +690,14 @@ class TestRLUtils:
             pipeline_dtype=torch.bfloat16,  # Without this, pp!=1 runs will fail.
         )
         vocab_size = 10_000
-        pp = ProcessGroupCollection.use_mpu_process_groups().pp
+        pp_group = ProcessGroupCollection.use_mpu_process_groups().pp
         gpt_model = GPTModel(
             config=transformer_config,
             transformer_layer_spec=get_gpt_layer_with_transformer_engine_spec(),
             vocab_size=vocab_size,
             max_sequence_length=4192,
-            pre_process=is_pp_first_stage(pp),
-            post_process=is_pp_last_stage(pp),
+            pre_process=is_pp_first_stage(pp_group),
+            post_process=is_pp_last_stage(pp_group),
         ).cuda()
         sequence_length = gpt_model.max_sequence_length
 
@@ -707,24 +707,20 @@ class TestRLUtils:
         input_ids = torch.tensor(data, dtype=torch.int64).repeat((micro_batch_size, 1)).cuda()
         position_ids = torch.tensor(data, dtype=torch.int64).repeat((micro_batch_size, 1)).cuda()
 
-        # For pipeline parallelism, we need to use the schedule.
-        # We cannot just call get_logprobs().
-        # TODO(vitalyk): reuse this function across the tests (or write a wrapper in rl_utils.py)
-        def forward_step_func(data_iterator, model):
-            tokens, pos_ids = next(data_iterator)
-            logprobs = rl_utils.get_logprobs(model, tokens, position_ids=pos_ids, no_grad=True)
-            return logprobs, lambda x, non_loss_data=False: x
-
-        logprobs = get_forward_backward_func()(
-            forward_step_func=forward_step_func,
-            data_iterator=iter([(input_ids, position_ids)]),
-            model=gpt_model,
-            num_microbatches=1,
-            seq_length=sequence_length,
-            micro_batch_size=micro_batch_size,
-            decoder_seq_length=sequence_length,
-            forward_only=True,
-            collect_non_loss_data=True,
-        )
-        if is_pp_last_stage(gpt_model.pg_collection.pp):
-            assert logprobs[0].shape == (2, sequence_length - 1)
+        with torch.no_grad():
+            logprobs = rl_utils.compute_logprobs_batch(
+                model=gpt_model,
+                data_loader=[(input_ids, position_ids)],
+                forward_backward_func=get_forward_backward_func(pp_size=pp),
+                packing_context=None,
+                trajs_batch_size=micro_batch_size,
+                seq_length=sequence_length,
+                logprobs_batch_size=micro_batch_size,
+                decoder_seq_length=sequence_length,
+                dtype=torch.bfloat16,
+                pp_group=gpt_model.pg_collection.pp,
+                is_correction=False,
+                collect_non_loss_data=True,
+            )
+        if is_pp_last_stage(pp_group):
+            assert logprobs.shape == (micro_batch_size, sequence_length - 1)
