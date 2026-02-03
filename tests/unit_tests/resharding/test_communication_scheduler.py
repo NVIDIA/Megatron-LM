@@ -52,7 +52,9 @@ class TestCommunicationScheduler:
             ScheduledBatch(src_pe=0, dest_pe=1, batch_index=0, iteration=-1, total_size=1000),
             ScheduledBatch(src_pe=0, dest_pe=2, batch_index=0, iteration=-1, total_size=1000),
             ScheduledBatch(src_pe=0, dest_pe=3, batch_index=0, iteration=-1, total_size=1000),
-            ScheduledBatch(src_pe=4, dest_pe=5, batch_index=0, iteration=-1, total_size=1000),  # isolated
+            ScheduledBatch(
+                src_pe=4, dest_pe=5, batch_index=0, iteration=-1, total_size=1000
+            ),  # isolated
         ]
 
         scheduler._assign_iterations(batches)

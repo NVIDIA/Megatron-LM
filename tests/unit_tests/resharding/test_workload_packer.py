@@ -17,9 +17,7 @@ class TestWorkloadPacker:
         """Test packing a single send request."""
         packer = WorkloadPacker()
 
-        requests = [
-            SendRequest(task_id=1, src_tensor=None, src_pos=0, size=1000, dest_pe=1)
-        ]
+        requests = [SendRequest(task_id=1, src_tensor=None, src_pos=0, size=1000, dest_pe=1)]
         workloads = packer.pack_workloads(requests, n_pes=2)
 
         # Should create one batch for destination PE 1

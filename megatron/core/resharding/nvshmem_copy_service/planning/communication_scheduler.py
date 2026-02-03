@@ -14,7 +14,6 @@ class CommunicationScheduler:
     """
 
     def __init__(self):
-        """Initialize scheduler."""
         self.num_iterations = 0
 
     def build_schedule(
@@ -150,7 +149,6 @@ class CommunicationScheduler:
         # Sort batches: process batches with more potential conflicts first
         # This heuristic (largest-degree-first) often produces better colorings
         # Sort by degree (descending), then total_size (descending) for tie-breaking
-        PELogger.debug("Computing batch degrees for scheduling...")
         batches.sort(key=lambda b: (-calc_degree(b, batches), -b.total_size))
 
         # Track which PEs are busy (sending or receiving) in each iteration

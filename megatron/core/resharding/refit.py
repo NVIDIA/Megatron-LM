@@ -28,18 +28,28 @@ RefitBackendName = Literal["nccl", "gloo", "nvshmem"]
 
 @dataclass(frozen=True)
 class _PlanCacheKey:
-    """Cache key for reshard plans.
-
-    Frozen dataclass ensures immutability and automatic __hash__/__eq__ implementation.
     """
+    Cache key for reshard plans.
+    """
+
     rank: int
-    src_config: Optional[Tuple[int, int, int]]  # (TP, PP, EP) or None
-    dst_config: Optional[Tuple[int, int, int]]  # (TP, PP, EP) or None
+    # Parallelism configuration: (TP, PP, EP, DP, expt_tp) or None for non-collocated ranks
+    src_config: Optional[Tuple[int, int, int, int, int]]
+    dst_config: Optional[Tuple[int, int, int, int, int]]
     num_experts: Optional[int]
 
 
-def _get_config_tuple(core) -> Optional[Tuple[int, int, int]]:
-    """Extract (TP, PP, EP) sizes from a model core, or None if core is None."""
+def _get_config_tuple(core) -> Optional[Tuple[int, int, int, int, int]]:
+    """Extract (TP, PP, EP, DP, expt_tp) sizes from a model core.
+
+    Returns:
+        Tuple of (TP, PP, EP, DP, expt_tp) sizes, or None if core is None.
+        - TP: Tensor parallelism
+        - PP: Pipeline parallelism
+        - EP: Expert parallelism
+        - DP: Data parallelism
+        - expt_tp: Expert tensor parallelism
+    """
     if core is None:
         return None
     pg = core.pg_collection
@@ -47,6 +57,12 @@ def _get_config_tuple(core) -> Optional[Tuple[int, int, int]]:
         len(torch.distributed.get_process_group_ranks(pg.tp)) if pg.tp else 1,
         len(torch.distributed.get_process_group_ranks(pg.pp)) if pg.pp else 1,
         len(torch.distributed.get_process_group_ranks(pg.ep)) if pg.ep else 1,
+        len(torch.distributed.get_process_group_ranks(pg.dp)) if pg.dp else 1,
+        (
+            len(torch.distributed.get_process_group_ranks(pg.expt_tp))
+            if hasattr(pg, 'expt_tp') and pg.expt_tp
+            else 1
+        ),
     )
 
 

@@ -35,7 +35,6 @@ class RemoteCopyService:
     """
 
     def __init__(self):
-        """Initialize RemoteCopyService."""
         # Core components
         self.gpu_resources = GPUResourceManager()
         self.buffer_manager = DoubleBufferManager()

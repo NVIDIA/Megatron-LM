@@ -7,9 +7,9 @@ Tests the task segmentation logic that breaks large transfers into chunks.
 import pytest
 
 from megatron.core.resharding.nvshmem_copy_service.nvshmem_types import (
-    SendRequest,
-    ReceiveRequest,
     MAX_SEGMENT_SIZE,
+    ReceiveRequest,
+    SendRequest,
 )
 from megatron.core.resharding.nvshmem_copy_service.planning.task_segmenter import TaskSegmenter
 
@@ -82,9 +82,7 @@ class TestTaskSegmenter:
 
         task_size = int(2.5 * MAX_SEGMENT_SIZE)
         send_req = SendRequest(task_id=1, src_tensor=None, src_pos=0, size=task_size, dest_pe=1)
-        recv_req = ReceiveRequest(
-            task_id=1, dest_tensor=None, dest_pos=0, size=task_size, src_pe=0
-        )
+        recv_req = ReceiveRequest(task_id=1, dest_tensor=None, dest_pos=0, size=task_size, src_pe=0)
 
         send_segments = segmenter.segment_send_request(send_req)
         recv_segments = segmenter.segment_receive_request(recv_req)

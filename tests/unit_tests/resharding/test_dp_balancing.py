@@ -7,15 +7,13 @@ to balance transfer load.
 """
 import pytest
 
-from megatron.core.resharding.utils import select_src_metadata_balanced, ParameterMetadata
+from megatron.core.resharding.utils import ParameterMetadata, select_src_metadata_balanced
 
 
 class TestDPBalancing:
     """Test suite for DP load balancing."""
 
-    def _create_metadata(
-        self, rank, tp_group, dp_group, tp_local, ep_local=None, ep_group=None
-    ):
+    def _create_metadata(self, rank, tp_group, dp_group, tp_local, ep_local=None, ep_group=None):
         """Helper to create ParameterMetadata for testing."""
         return ParameterMetadata(
             name="test.weight",
@@ -206,48 +204,23 @@ class TestDPBalancing:
 
         src_meta_list = [
             self._create_metadata(
-                rank=0,
-                tp_group=[0],
-                dp_group=[0, 4],
-                tp_local=0,
-                ep_local=0,
-                ep_group=[0, 1, 2, 3],
+                rank=0, tp_group=[0], dp_group=[0, 4], tp_local=0, ep_local=0, ep_group=[0, 1, 2, 3]
             ),
             self._create_metadata(
-                rank=1,
-                tp_group=[1],
-                dp_group=[1, 5],
-                tp_local=0,
-                ep_local=1,
-                ep_group=[0, 1, 2, 3],
+                rank=1, tp_group=[1], dp_group=[1, 5], tp_local=0, ep_local=1, ep_group=[0, 1, 2, 3]
             ),
             self._create_metadata(
-                rank=2,
-                tp_group=[2],
-                dp_group=[2, 6],
-                tp_local=0,
-                ep_local=2,
-                ep_group=[0, 1, 2, 3],
+                rank=2, tp_group=[2], dp_group=[2, 6], tp_local=0, ep_local=2, ep_group=[0, 1, 2, 3]
             ),
             self._create_metadata(
-                rank=3,
-                tp_group=[3],
-                dp_group=[3, 7],
-                tp_local=0,
-                ep_local=3,
-                ep_group=[0, 1, 2, 3],
+                rank=3, tp_group=[3], dp_group=[3, 7], tp_local=0, ep_local=3, ep_group=[0, 1, 2, 3]
             ),
         ]
 
         # Destination with EP=8 (different from source EP=4)
         # Dst EP local 5 doesn't exist in source
         dst_meta = self._create_metadata(
-            rank=8,
-            tp_group=[8],
-            dp_group=[8, 9],
-            tp_local=0,
-            ep_local=5,
-            ep_group=list(range(8)),
+            rank=8, tp_group=[8], dp_group=[8, 9], tp_local=0, ep_local=5, ep_group=list(range(8))
         )
 
         # Should NOT filter by EP local rank (sizes differ)
@@ -310,7 +283,10 @@ class TestDPBalancing:
         selections = {}
         for dst_rank in range(8):
             selected = select_src_metadata_balanced(src_meta_list, dst_meta, dst_rank)
-            selections[dst_rank] = (selected.owner_rank, tuple(selected.tensor_parallel_group_ranks))
+            selections[dst_rank] = (
+                selected.owner_rank,
+                tuple(selected.tensor_parallel_group_ranks),
+            )
 
         # Verify distribution:
         # dst_rank 0: DP group 0 ([0,2,4,6]), within-group idx 0 → rank 0, TP [0,1]
