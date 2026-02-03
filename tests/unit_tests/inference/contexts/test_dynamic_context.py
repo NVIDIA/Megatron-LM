@@ -5,6 +5,7 @@ import math
 import pytest
 import torch
 
+from megatron.core import parallel_state
 from megatron.core.inference.contexts.attention_context.mamba_metadata import (
     MambaInferenceStateConfig,
 )
@@ -52,6 +53,7 @@ class TestDynamicContext:
         is_hybrid_model=False,
         layer_type_list=None,
         rounder=64,
+        paused_buffer_size_gb=None,
     ):
         set_rounder(rounder)
 
@@ -75,6 +77,9 @@ class TestDynamicContext:
             num_cuda_graphs=None,
             use_cuda_graphs_for_non_decode_steps=True,
             buffer_size_gb=buffer_size_gb,
+            paused_buffer_size_gb=(
+                0.2 * buffer_size_gb if paused_buffer_size_gb is None else paused_buffer_size_gb
+            ),
             block_size_tokens=block_size_tokens,
             max_tokens=max_tokens,
             mamba_inference_state_config=mamba_inference_state_config,
@@ -107,18 +112,16 @@ class TestDynamicContext:
 
         if not is_hybrid_model:
             assert dynamic_context.block_allocator.total_count == 491
-            assert dynamic_context.block_allocator.active_count == 245
-            assert dynamic_context.max_total_requests == 490
-            # We make max_active_requests divisible by the REQUEST_ROUNDER.
-            assert dynamic_context.max_active_requests == 192
+            assert dynamic_context.block_allocator.active_count == 392
+            # We make max_requests divisible by the REQUEST_ROUNDER.
+            assert dynamic_context.max_requests == 448
             assert dynamic_context.max_tokens == 16384
             assert dynamic_context.num_mamba_layers == 0
             assert dynamic_context.mamba_metadata is None
         else:
-            assert dynamic_context.block_allocator.total_count == 555
-            assert dynamic_context.block_allocator.active_count == 277
-            assert dynamic_context.max_total_requests == 554
-            assert dynamic_context.max_active_requests == 256
+            assert dynamic_context.block_allocator.total_count == 556
+            assert dynamic_context.block_allocator.active_count == 444
+            assert dynamic_context.max_requests == 512
             assert dynamic_context.max_tokens == 16384
             assert dynamic_context.num_mamba_layers == 1
             assert dynamic_context.mamba_metadata is not None
@@ -156,12 +159,12 @@ class TestDynamicContext:
             max_tokens=None,
             is_hybrid_model=is_hybrid_model,
         )
-        dynamic_context.block_allocator.active_count = 10
+        dynamic_context.block_allocator.total_avail = 10
         assert dynamic_context.block_allocator.is_memory_available(10)
         assert not dynamic_context.block_allocator.is_memory_available(11)
 
         assert dynamic_context.block_allocator.is_memory_available(1)
-        dynamic_context.block_allocator.active_count = 0
+        dynamic_context.block_allocator.total_avail = 0
         assert not dynamic_context.block_allocator.is_memory_available(1)
 
     @pytest.mark.internal
@@ -181,9 +184,9 @@ class TestDynamicContext:
             rounder=1,
             is_hybrid_model=is_hybrid_model,
         )
-        dynamic_context.max_active_requests //= 2
+        dynamic_context.max_requests //= 2
         with pytest.raises(RequestOverflowError):
-            for i in range(dynamic_context.max_active_requests + 1):
+            for i in range(dynamic_context.max_requests + 1):
                 dynamic_context.add_request(
                     DynamicInferenceRequest(
                         request_id=i,
@@ -207,7 +210,7 @@ class TestDynamicContext:
             max_sequence_length=512,
             buffer_size_gb=0.1,
             block_size_tokens=128,
-            max_tokens=200,  # setting low, but >= context.max_active_requests.
+            max_tokens=200,  # setting low, but >= context.max_requests.
             rounder=1,
             is_hybrid_model=is_hybrid_model,
         )
@@ -287,10 +290,12 @@ class TestDynamicContext:
         assert torch.all(dynamic_context.token_to_position_in_request == 0)
         assert torch.all(dynamic_context.token_to_block_idx == -1)
         assert torch.all(dynamic_context.token_to_local_position_within_kv_block == 0)
-        assert (
-            dynamic_context.block_allocator.active_count
-            == dynamic_context.block_allocator.total_count // 2
-        )
+        if not is_hybrid_model:
+            assert dynamic_context.block_allocator.active_count == 819
+            assert dynamic_context.block_allocator.total_count == 1024
+        else:
+            assert dynamic_context.block_allocator.active_count == 1517
+            assert dynamic_context.block_allocator.total_count == 1897
         assert torch.all(dynamic_context.request_to_kv_block_ids == -1)
         if is_hybrid_model:
             assert torch.all(dynamic_context.mamba_metadata.request_to_mamba_state_idx == -1)
@@ -312,7 +317,7 @@ class TestDynamicContext:
         )
 
         if is_hybrid_model:
-            expected_memory_blocks = [550, 551, 552, 553]
+            expected_memory_blocks = [551, 552, 553, 554]
         else:
             expected_memory_blocks = [486, 487, 488, 489]
         expected_block_count_avail = expected_memory_blocks[0]
@@ -378,7 +383,7 @@ class TestDynamicContext:
         assert dynamic_context.request_kv_length_offsets[0] == 0
         assert dynamic_context.request_kv_block_counts[0] == 2
         assert dynamic_context.request_last_kv_block_id[0].item() == (
-            553 if is_hybrid_model else 489
+            554 if is_hybrid_model else 489
         )
         assert dynamic_context.request_last_kv_block_offset[0].item() == 15
         assert torch.all(
@@ -736,13 +741,13 @@ class TestDynamicContext:
                 dynamic_context.request_to_kv_block_ids[0:10].cpu()
                 == torch.tensor(
                     [
-                        [543, 546, -1, -1],
-                        [544, 543, -1, -1],
-                        [548, 550, -1, -1],
+                        [544, 547, -1, -1],
+                        [545, 544, -1, -1],
                         [549, 551, -1, -1],
-                        [547, -1, -1, -1],
-                        [545, -1, -1, -1],
-                        [552, -1, -1, -1],
+                        [550, 552, -1, -1],
+                        [548, -1, -1, -1],
+                        [546, -1, -1, -1],
+                        [553, -1, -1, -1],
                         [-1, -1, -1, -1],
                         [-1, -1, -1, -1],
                         [-1, -1, -1, -1],
@@ -1198,3 +1203,51 @@ class TestDynamicContext:
                 )
 
                 current_global_token_offset += expected_len
+
+    @pytest.mark.internal
+    def test_pipeline_parallel_uneven_layers(self):
+        """
+        Test that DynamicInferenceContext synchronizes the total block count across
+        pipeline stages when they have unequal layer counts.
+        """
+        pp_size = 2
+        self._setup_model_parallel_group(tensor_parallel_size=1, pipeline_parallel_size=pp_size)
+
+        rank = parallel_state.get_pipeline_model_parallel_rank()
+
+        if rank == 0:
+            local_num_layers = 12
+        else:
+            local_num_layers = 4
+
+        context = DynamicInferenceContext(
+            params_dtype=torch.float32,
+            num_layers=local_num_layers,
+            kv_channels=64,
+            num_attention_heads=8,
+            max_sequence_length=128,
+            buffer_size_gb=0.1,
+            block_size_tokens=16,
+            max_tokens=1024,
+            pipeline_model_parallel_size=pp_size,
+            tensor_model_parallel_size=1,
+            unified_memory_level=0,
+        )
+
+        # Collect the total block counts on each rank
+        local_total_blocks = torch.tensor(
+            [context.block_allocator.total_count], device='cuda', dtype=torch.long
+        )
+        gathered_block_counts = [torch.zeros_like(local_total_blocks) for _ in range(pp_size)]
+        torch.distributed.all_gather(
+            gathered_block_counts,
+            local_total_blocks,
+            group=parallel_state.get_pipeline_model_parallel_group(),
+        )
+        all_counts = [t.item() for t in gathered_block_counts]
+
+        # Verify that there is only 1 unique value across all ranks
+        unique_counts = set(all_counts)
+        assert (
+            len(unique_counts) == 1
+        ), f"Block counts were not synchronized across ranks. Gathered: {all_counts}"
