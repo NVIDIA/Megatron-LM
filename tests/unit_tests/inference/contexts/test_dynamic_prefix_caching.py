@@ -335,6 +335,7 @@ class TestBlockHash(PrefixCachingTestBase):
             request_id=1,
             prompt_tokens=prompt,
             sampling_params=SamplingParams(num_tokens_to_generate=50),
+        block_size_tokens=block_size,
         )
         dynamic_context.add_request(request)
 
@@ -390,6 +391,7 @@ class TestBlockHash(PrefixCachingTestBase):
             request_id=1,
             prompt_tokens=prompt,
             sampling_params=SamplingParams(num_tokens_to_generate=50),
+        block_size_tokens=block_size,
         )
         dynamic_context.add_request(request)
 
@@ -1734,8 +1736,10 @@ class TestEdgeCases(PrefixCachingTestBase):
             request_id=1,
             prompt_tokens=prompt.clone(),
             sampling_params=SamplingParams(num_tokens_to_generate=10),
+            block_size_tokens=block_size,
         )
         dynamic_context.add_request(request_1)
+        dynamic_context.mark_pending_blocks_computed()
 
         block_0 = dynamic_context.request_to_kv_block_ids[0][0].item()
         assert block_allocator.block_ref_counts[block_0].item() == 1
@@ -1745,6 +1749,7 @@ class TestEdgeCases(PrefixCachingTestBase):
             request_id=2,
             prompt_tokens=prompt.clone(),
             sampling_params=SamplingParams(num_tokens_to_generate=10),
+            block_size_tokens=block_size,
         )
         dynamic_context.add_request(request_2)
 
@@ -1782,8 +1787,10 @@ class TestEdgeCases(PrefixCachingTestBase):
             request_id=1,
             prompt_tokens=prompt.clone(),
             sampling_params=SamplingParams(num_tokens_to_generate=10),
+            block_size_tokens=block_size,
         )
         dynamic_context.add_request(request_1)
+        dynamic_context.mark_pending_blocks_computed()
 
         req1_block_0 = dynamic_context.request_to_kv_block_ids[0][0].item()
         req1_block_1 = dynamic_context.request_to_kv_block_ids[0][1].item()
@@ -1801,6 +1808,7 @@ class TestEdgeCases(PrefixCachingTestBase):
             request_id=2,
             prompt_tokens=prompt.clone(),
             sampling_params=SamplingParams(num_tokens_to_generate=10),
+            block_size_tokens=block_size,
         )
         dynamic_context.add_request(request_2)
 
@@ -1903,6 +1911,7 @@ class TestDisabledMode(PrefixCachingTestBase):
             request_id=1,
             prompt_tokens=prompt,
             sampling_params=SamplingParams(num_tokens_to_generate=10),
+        block_size_tokens=block_size,
         )
         dynamic_context.add_request(request)
 
@@ -2572,6 +2581,7 @@ class TestPrefixCoordination(PrefixCachingTestBase):
             request_id=1,
             prompt_tokens=prompt_1,
             sampling_params=SamplingParams(num_tokens_to_generate=10),
+        block_size_tokens=block_size,
         )
         dynamic_context.add_request(request_1)
         dynamic_context.mark_pending_blocks_computed()
@@ -2590,6 +2600,7 @@ class TestPrefixCoordination(PrefixCachingTestBase):
             request_id=2,
             prompt_tokens=prompt_2,
             sampling_params=SamplingParams(num_tokens_to_generate=10),
+        block_size_tokens=block_size,
         )
         dynamic_context.add_request(request_2)
 
@@ -3216,6 +3227,7 @@ class TestComplexPrefixPatterns(PrefixCachingTestBase):
             request_id=1,
             prompt_tokens=prompt_a,
             sampling_params=SamplingParams(num_tokens_to_generate=10),
+        block_size_tokens=block_size,
         )
         dynamic_context.add_request(request_a)
         dynamic_context.mark_pending_blocks_computed()
@@ -3231,6 +3243,7 @@ class TestComplexPrefixPatterns(PrefixCachingTestBase):
             request_id=2,
             prompt_tokens=prompt_b,
             sampling_params=SamplingParams(num_tokens_to_generate=10),
+        block_size_tokens=block_size,
         )
         dynamic_context.add_request(request_b)
         dynamic_context.mark_pending_blocks_computed()
@@ -3249,6 +3262,7 @@ class TestComplexPrefixPatterns(PrefixCachingTestBase):
             request_id=3,
             prompt_tokens=prompt_c,
             sampling_params=SamplingParams(num_tokens_to_generate=10),
+        block_size_tokens=block_size,
         )
         dynamic_context.add_request(request_c)
 
@@ -3359,6 +3373,7 @@ class TestMemoryPressure(PrefixCachingTestBase):
             request_id=1,
             prompt_tokens=prompt,
             sampling_params=SamplingParams(num_tokens_to_generate=10),
+        block_size_tokens=block_size,
         )
         dynamic_context.add_request(request_1)
         dynamic_context.mark_pending_blocks_computed()
@@ -3380,6 +3395,7 @@ class TestMemoryPressure(PrefixCachingTestBase):
                     request_id=i + 100,
                     prompt_tokens=filler_prompt,
                     sampling_params=SamplingParams(num_tokens_to_generate=10),
+                block_size_tokens=block_size,
                 )
                 dynamic_context.add_request(filler_request)
                 dynamic_context.mark_pending_blocks_computed()
@@ -3426,6 +3442,7 @@ class TestMemoryPressure(PrefixCachingTestBase):
                     request_id=requests_added + 1,
                     prompt_tokens=prompt,
                     sampling_params=SamplingParams(num_tokens_to_generate=10),
+                block_size_tokens=block_size,
                 )
                 dynamic_context.add_request(request)
                 dynamic_context.mark_pending_blocks_computed()
@@ -3444,6 +3461,7 @@ class TestMemoryPressure(PrefixCachingTestBase):
             request_id=9000,
             prompt_tokens=cached_prompt,
             sampling_params=SamplingParams(num_tokens_to_generate=10),
+        block_size_tokens=block_size,
         )
 
         try:
@@ -3484,6 +3502,7 @@ class TestRequestLifecycle(PrefixCachingTestBase):
             request_id=1,
             prompt_tokens=prompt,
             sampling_params=SamplingParams(num_tokens_to_generate=10),
+        block_size_tokens=block_size,
         )
         dynamic_context.add_request(request_1)
         dynamic_context.mark_pending_blocks_computed()
@@ -3512,6 +3531,7 @@ class TestRequestLifecycle(PrefixCachingTestBase):
             request_id=2,
             prompt_tokens=prompt,
             sampling_params=SamplingParams(num_tokens_to_generate=10),
+        block_size_tokens=block_size,
         )
         dynamic_context.add_request(request_2)
 
@@ -3552,6 +3572,7 @@ class TestRequestLifecycle(PrefixCachingTestBase):
             request_id=1,
             prompt_tokens=long_prompt,
             sampling_params=SamplingParams(num_tokens_to_generate=10),
+        block_size_tokens=block_size,
         )
 
         # First chunk (assume 4 blocks)
@@ -3567,6 +3588,7 @@ class TestRequestLifecycle(PrefixCachingTestBase):
             request_id=2,
             prompt_tokens=long_prompt,
             sampling_params=SamplingParams(num_tokens_to_generate=10),
+        block_size_tokens=block_size,
         )
 
         # Add first chunk - should match the first 4 blocks
@@ -3608,6 +3630,7 @@ class TestAdditionalEdgeCases(PrefixCachingTestBase):
             request_id=1,
             prompt_tokens=empty_prompt,
             sampling_params=SamplingParams(num_tokens_to_generate=10),
+        block_size_tokens=block_size,
         )
 
         # Should handle gracefully (no blocks allocated, no hashes)
@@ -3645,6 +3668,7 @@ class TestAdditionalEdgeCases(PrefixCachingTestBase):
             request_id=1,
             prompt_tokens=single_token,
             sampling_params=SamplingParams(num_tokens_to_generate=10),
+        block_size_tokens=block_size,
         )
 
         # No complete blocks, so no precomputed hashes
@@ -3682,6 +3706,7 @@ class TestAdditionalEdgeCases(PrefixCachingTestBase):
             request_id=1,
             prompt_tokens=long_prompt,
             sampling_params=SamplingParams(num_tokens_to_generate=10),
+        block_size_tokens=block_size,
         )
 
         # Verify all 120 blocks have hashes computed
@@ -3728,6 +3753,7 @@ class TestAdditionalEdgeCases(PrefixCachingTestBase):
             request_id=1,
             prompt_tokens=all_zeros,
             sampling_params=SamplingParams(num_tokens_to_generate=10),
+        block_size_tokens=block_size,
         )
 
         # Verify hashes are computed (even for pathological input)
@@ -3777,6 +3803,7 @@ class TestObservability(PrefixCachingTestBase):
                 request_id=i + 1,
                 prompt_tokens=prompt,
                 sampling_params=SamplingParams(num_tokens_to_generate=10),
+            block_size_tokens=block_size,
             )
             dynamic_context.add_request(request)
             dynamic_context.mark_pending_blocks_computed()
@@ -3822,6 +3849,7 @@ class TestObservability(PrefixCachingTestBase):
             request_id=1,
             prompt_tokens=prompt,
             sampling_params=SamplingParams(num_tokens_to_generate=10),
+        block_size_tokens=block_size,
         )
         dynamic_context.add_request(request_1)
         dynamic_context.mark_pending_blocks_computed()
