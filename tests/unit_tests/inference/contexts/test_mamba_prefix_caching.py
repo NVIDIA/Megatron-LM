@@ -43,8 +43,8 @@ def set_rounder(value):
     DynamicInferenceContext.REQUEST_ROUNDER = value
 
 
-class TestMambaPrefixCaching:
-    """Test suite for Mamba state caching with prefix sharing."""
+class MambaPrefixCachingTestBase:
+    """Base class with shared setup/teardown and helper methods for Mamba prefix caching tests."""
 
     def _setup_model_parallel_group(self, tensor_parallel_size, pipeline_parallel_size):
         self.pp_size = pipeline_parallel_size
@@ -109,9 +109,8 @@ class TestMambaPrefixCaching:
     def teardown_method(self, method):
         Utils.destroy_model_parallel()
 
-    # =========================================================================
-    # CRITICAL: Basic functionality tests
-    # =========================================================================
+class TestBasicMambaStateCaching(MambaPrefixCachingTestBase):
+    """Tests for basic Mamba state caching functionality."""
 
     @pytest.mark.internal
     @pytest.mark.skipif(TEST_LEVEL < TestLevel.CRITICAL, reason="Test level not met")
@@ -222,9 +221,8 @@ class TestMambaPrefixCaching:
         assert torch.allclose(context.mamba_conv_states[:, mamba_idx], torch.ones_like(context.mamba_conv_states[:, mamba_idx]))
         assert torch.allclose(context.mamba_ssm_states[:, mamba_idx], torch.full_like(context.mamba_ssm_states[:, mamba_idx], 2.0))
 
-    # =========================================================================
-    # IMPORTANT: LRU eviction tests
-    # =========================================================================
+class TestMambaEviction(MambaPrefixCachingTestBase):
+    """Tests for Mamba LRU eviction."""
 
     @pytest.mark.internal
     @pytest.mark.skipif(TEST_LEVEL < TestLevel.IMPORTANT, reason="Test level not met")
@@ -319,9 +317,8 @@ class TestMambaPrefixCaching:
 
         assert not context.has_mamba_state_for_block(block_0_id), "Mamba state should be invalidated"
 
-    # =========================================================================
-    # MEDIUM: Edge case tests
-    # =========================================================================
+class TestMambaEdgeCases(MambaPrefixCachingTestBase):
+    """Tests for Mamba edge cases."""
 
     @pytest.mark.internal
     @pytest.mark.skipif(TEST_LEVEL < TestLevel.MEDIUM, reason="Test level not met")
@@ -416,9 +413,8 @@ class TestMambaPrefixCaching:
         slot2 = context._allocate_mamba_cache_slot(block_id + 1)
         assert slot2 == slot, "Should reuse the same slot"
 
-    # =========================================================================
-    # LOW: Memory and metrics tests
-    # =========================================================================
+class TestMambaMemoryAccounting(MambaPrefixCachingTestBase):
+    """Tests for Mamba memory accounting."""
 
     @pytest.mark.internal
     @pytest.mark.skipif(TEST_LEVEL < TestLevel.LOW, reason="Test level not met")
@@ -473,9 +469,8 @@ class TestMambaPrefixCaching:
         assert context.mamba_states_memory_per_request > 0, \
             "mamba_states_memory_per_request should be positive for hybrid models"
 
-    # =========================================================================
-    # IMPORTANT: Eviction edge case tests
-    # =========================================================================
+class TestMambaEvictionEdgeCases(MambaPrefixCachingTestBase):
+    """Tests for Mamba eviction edge cases."""
 
     @pytest.mark.internal
     @pytest.mark.skipif(TEST_LEVEL < TestLevel.IMPORTANT, reason="Test level not met")
@@ -639,9 +634,8 @@ class TestMambaPrefixCaching:
         assert context.block_to_mamba_slot[blocks[2]].item() == -1, "Block 2 should be evicted second"
         assert context.block_to_mamba_slot[blocks[1]].item() >= 0, "Block 1 (newest) should still exist"
 
-    # =========================================================================
-    # IMPORTANT: Integration tests
-    # =========================================================================
+class TestMambaIntegration(MambaPrefixCachingTestBase):
+    """Tests for Mamba integration with prefix caching."""
 
     @pytest.mark.internal
     @pytest.mark.skipif(TEST_LEVEL < TestLevel.IMPORTANT, reason="Test level not met")
@@ -775,9 +769,8 @@ class TestMambaPrefixCaching:
             torch.full_like(context.mamba_ssm_states[:, mamba_idx_2], 456.0)
         ), "Mamba SSM state should be restored from cache"
 
-    # =========================================================================
-    # MEDIUM: Memory budget edge cases
-    # =========================================================================
+class TestMambaMemoryBudgetEdgeCases(MambaPrefixCachingTestBase):
+    """Tests for Mamba memory budget edge cases."""
 
     @pytest.mark.internal
     @pytest.mark.skipif(TEST_LEVEL < TestLevel.MEDIUM, reason="Test level not met")
@@ -872,9 +865,8 @@ class TestMambaPrefixCaching:
         assert context.max_mamba_cache_slots == target_slots, \
             f"Expected exactly {target_slots} slots, got {context.max_mamba_cache_slots}"
 
-    # =========================================================================
-    # LOW: Stress and robustness tests
-    # =========================================================================
+class TestMambaStress(MambaPrefixCachingTestBase):
+    """Tests for Mamba stress and robustness."""
 
     @pytest.mark.internal
     @pytest.mark.skipif(TEST_LEVEL < TestLevel.LOW, reason="Test level not met")
