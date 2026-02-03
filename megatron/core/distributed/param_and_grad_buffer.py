@@ -973,6 +973,10 @@ class _ParamAndGradBuffer:
     def reload_from_cpu(self, move_params: bool = True, move_grads: bool = True):
         """
         Reload the buffers from CPU.
+        
+        Args:
+            move_params: Whether to reload parameter buffers.
+            move_grads: Whether to reload gradient buffers.
         """
         if (
             move_params
@@ -982,6 +986,7 @@ class _ParamAndGradBuffer:
         ):
             self.param_data.storage().resize_(self.param_data_size)
             self.param_data.copy_(self.param_data_cpu, non_blocking=True)
+                
         if move_grads and self.grad_data is not None and self.grad_data_size > 0:
             self.grad_data.storage().resize_(self.grad_data_size)
             self.grad_data.zero_()

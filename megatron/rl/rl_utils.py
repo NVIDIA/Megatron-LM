@@ -486,8 +486,10 @@ def get_environment_rollouts(
 
     if args.rl_offload_optimizer_during_inference:
         with nvtx_range("rl/offload-optimizer-before-inference", time=True):
-            model[0].offload_grad_buffers()
-            optimizer.offload_to_cpu()
+            with nvtx_range("rl/offload/grad-buffers", time=True):
+                model[0].offload_grad_buffers()
+            with nvtx_range("rl/offload/optimizer-state", time=True):
+                optimizer.offload_to_cpu()
              
     # If we have seperate training and inference models we to refit weights from the training model to the inference model.
     if inference_model is not None:
@@ -561,8 +563,19 @@ def get_environment_rollouts(
 
     if args.rl_offload_optimizer_during_inference:
         with nvtx_range("rl/onload-optimizer-after-inference", time=True):
-            model[0].onload_grad_buffers()
-            optimizer.restore_from_cpu()
+            # Use synchronize=False to avoid blocking CPU on all pending GPU work.
+            # The grad buffer allocation and zeroing is enqueued on the default stream,
+            # so any subsequent GPU work (like backward pass) will automatically wait for it.
+            # The optimizer restore is async and will be synchronized in optimizer.step().
+            with nvtx_range("rl/onload/grad-buffers", time=True):
+                model[0].onload_grad_buffers(synchronize=False)
+            with nvtx_range("rl/onload/optimizer-state", time=True):
+                optimizer.restore_from_cpu()
+            # Sync here to get accurate timing of the actual data transfer
+            with nvtx_range("rl/onload/wait-for-transfers", time=True):
+                if hasattr(optimizer, '_restore_stream') and optimizer._restore_stream is not None:
+                    optimizer._restore_stream.synchronize()
+                    optimizer._restore_stream = None
 
     if lang_rl_log_dir and rank == get_pg_rank(inference_pg_collection.tp):
         with open(
@@ -1233,9 +1246,10 @@ def prepare_data_for_update(
                 # logprobs are [b, seq, h] now.
                 model.load_state_dict(cur_st_dict)
 
-            torch.cuda.synchronize()
-            gc.collect()
-            torch.cuda.empty_cache()
+                with nvtx_range("rl/synchronize-cuda-and-collect-garbage", time=True):
+                    torch.cuda.synchronize()
+                    gc.collect()
+                    torch.cuda.empty_cache()
 
 
         if args.rl_use_sequence_packing:
@@ -1431,9 +1445,10 @@ def evaluate_and_print_results_rl(
                         'top_k': args.rl_default_top_k,
                     },
                 )
-                evaluation_responses = loop.run_until_complete(agent.run_evaluation(request))
-                if not isinstance(evaluation_responses, list):
-                    evaluation_responses = [evaluation_responses]
+                with get_nvtx_range()("rl/run-evaluation", time=True):
+                    evaluation_responses = loop.run_until_complete(agent.run_evaluation(request))
+                    if not isinstance(evaluation_responses, list):
+                        evaluation_responses = [evaluation_responses]
             else:
                 evaluation_responses = None
 
@@ -1639,8 +1654,10 @@ def megatron_rl_inference_mode(
 
         if offload_optimizer_during_inference:
             with nvtx_range("rl/offload-optimizer-before-inference", time=True):
-                model[0].offload_grad_buffers()
-                optimizer.offload_to_cpu()
+                with nvtx_range("rl/offload/grad-buffers", time=True):
+                    model[0].offload_grad_buffers()
+                with nvtx_range("rl/offload/optimizer-state", time=True):
+                    optimizer.offload_to_cpu()
 
         # TODO: Remove this if statement once a change to `toggle_cuda_graphs` makes it safe to.
         if cuda_graph_impl != "none" and not args.rl_training_cuda_graphs:
@@ -1703,8 +1720,19 @@ def megatron_rl_inference_mode(
 
         if offload_optimizer_during_inference:
             with nvtx_range("rl/onload-optimizer-after-inference", time=True):
-                model[0].onload_grad_buffers()
-                optimizer.restore_from_cpu()
+                # Use synchronize=False to avoid blocking CPU on all pending GPU work.
+                # The grad buffer allocation and zeroing is enqueued on the default stream,
+                # so any subsequent GPU work (like backward pass) will automatically wait for it.
+                # The optimizer restore is async and will be synchronized in optimizer.step().
+                with nvtx_range("rl/onload/grad-buffers", time=True):
+                    model[0].onload_grad_buffers(synchronize=False)
+                with nvtx_range("rl/onload/optimizer-state", time=True):
+                    optimizer.restore_from_cpu()
+                # Sync here to get accurate timing of the actual data transfer
+                with nvtx_range("rl/onload/wait-for-transfers", time=True):
+                    if hasattr(optimizer, '_restore_stream') and optimizer._restore_stream is not None:
+                        optimizer._restore_stream.synchronize()
+                        optimizer._restore_stream = None
 
         lang_module.train()
 

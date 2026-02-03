@@ -77,21 +77,23 @@ RL_TIMER_NAMES = [
     
     # Rollout collection breakdown
     "rl/inference-setup",
+    "rl/build-cuda-graphs",
     "rl/collect-rollouts",
     "rl/sync-rollouts",
     "rl/suspend-engine",
+    "rl/wait-for-decode-only",
     
     # Optimizer offload/onload (canonical names)
     "rl/offload-optimizer-before-inference",
     "rl/onload-optimizer-after-inference",
     "rl/offload-kv-cache-after-inference",
     "rl/onload-kv-cache-before-inference",
-    # Fine-grained offload/onload breakdown
-    "offload/cuda-synchronize",
-    "offload/free-buffers",
-    "offload/empty-cache",
-    "onload/allocate-buffers",
-    "onload/cuda-synchronize",
+    # Fine-grained offload/onload breakdown (using nvtx_range)
+    "rl/offload/grad-buffers",
+    "rl/offload/optimizer-state",
+    "rl/onload/grad-buffers",
+    "rl/onload/optimizer-state",
+    "rl/onload/wait-for-transfers",
     
     # Weight prefetching
     "rl/prefetch-weights-to-gpu",
@@ -107,6 +109,8 @@ RL_TIMER_NAMES = [
     "rl/pack-logprobs",
     "rl/align-inference-logprobs",
     "rl/log-wandb-tb",
+    "pack_sequences",
+    "regather_trajectories",
     
     # Logprobs computation
     "rl/compute-logprobs",
@@ -189,6 +193,8 @@ class IterationProfile:
     
     # Computed metrics
     load_imbalance: Dict[str, float] = field(default_factory=dict)  # timer -> max/min ratio
+    # Rank0 times (for detailed analysis - rank0 is typically the coordinator)
+    rank0_timers: Dict[str, float] = field(default_factory=dict)  # timer_name -> rank0_ms
     
     def to_dict(self) -> Dict[str, Any]:
         """Convert to dictionary for JSON serialization."""
@@ -210,6 +216,11 @@ class IterationProfile:
             safe_name = name.replace("/", "_").replace("-", "_")
             result[f"timer_{safe_name}_min_ms"] = min_t
             result[f"timer_{safe_name}_max_ms"] = max_t
+        
+        # Add rank0 timer values
+        for name, rank0_t in self.rank0_timers.items():
+            safe_name = name.replace("/", "_").replace("-", "_")
+            result[f"timer_{safe_name}_rank0_ms"] = rank0_t
         
         # Add load imbalance metrics
         for name, ratio in self.load_imbalance.items():
@@ -354,8 +365,8 @@ class RLProfiler:
             
         self._ensure_initialized()
         
-        # Collect timer data (min, max across ranks)
-        timer_data = self._collect_timer_data(timers)
+        # Collect timer data (min, max across ranks) and rank0 times
+        timer_data, rank0_timers = self._collect_timer_data(timers)
         
         # Warn if no timer data was collected (might indicate timing issue)
         if not timer_data:
@@ -382,6 +393,7 @@ class RLProfiler:
             actual_tokens_per_sec_per_gpu=actual_tokens_per_sec_per_gpu,
             packing_efficiency=packing_efficiency,
             load_imbalance=load_imbalance,
+            rank0_timers=rank0_timers,
         )
         
         self.iteration_profiles.append(profile)
@@ -402,17 +414,48 @@ class RLProfiler:
         if self.log_to_tensorboard and tb_writer:
             self._log_to_tensorboard(profile, tb_writer, iteration, extra_metrics)
             
-    def _collect_timer_data(self, timers) -> Dict[str, Tuple[float, float]]:
-        """Collect min/max timer data across ranks."""
-        # Use timers' internal method to get min/max times
-        # This does an all_gather internally
-        name_to_min_max = timers._get_global_min_max_time(
+    def _collect_timer_data(self, timers) -> Tuple[Dict[str, Tuple[float, float]], Dict[str, float]]:
+        """Collect min/max timer data across ranks and rank0 times.
+        
+        Returns:
+            Tuple of:
+                - Dict mapping timer_name -> (min_ms, max_ms) across all ranks
+                - Dict mapping timer_name -> rank0_ms (rank0's local time)
+        """
+        # Get the full per-rank timing data (calls all_gather internally)
+        rank_name_to_time = timers._get_elapsed_time_all_ranks(
             names=self.timer_names,
             reset=False,  # Don't reset - let the main logging code handle that
             barrier=False,
-            normalizer=1.0 / 1000.0,  # Convert to milliseconds
         )
-        return name_to_min_max or {}
+        
+        if rank_name_to_time is None:
+            return {}, {}
+        
+        # Convert from seconds to milliseconds
+        normalizer = 1000.0  # seconds -> ms
+        
+        # Extract min/max and rank0 times
+        name_to_min_max = {}
+        rank0_timers = {}
+        
+        for i, name in enumerate(self.timer_names):
+            # Get times for all ranks for this timer
+            rank_times = rank_name_to_time[:, i].tolist()
+            # Filter out zeros (timers that weren't active)
+            active_times = [t for t in rank_times if t > 0.0]
+            
+            if active_times:
+                min_time = min(active_times) * normalizer
+                max_time = max(active_times) * normalizer
+                name_to_min_max[name] = (min_time, max_time)
+            
+            # Get rank0's time specifically (index 0)
+            rank0_time = rank_times[0] * normalizer if rank_times else 0.0
+            if rank0_time > 0:
+                rank0_timers[name] = rank0_time
+        
+        return name_to_min_max, rank0_timers
         
     def _log_to_wandb(
         self, 
