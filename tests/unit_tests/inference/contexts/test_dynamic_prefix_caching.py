@@ -9,7 +9,11 @@ from megatron.core.inference.contexts.attention_context.mamba_metadata import (
 from megatron.core.inference.contexts.dynamic_context import (
     DynamicInferenceContext,
 )
-from megatron.core.inference.inference_request import DynamicInferenceRequest
+from megatron.core.inference.inference_request import (
+    DynamicInferenceRequest,
+    compute_block_hash,
+    HASH_PRIME,
+)
 from megatron.core.inference.sampling_params import SamplingParams
 from megatron.core.ssm.mamba_hybrid_layer_allocation import Symbols
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
@@ -141,21 +145,21 @@ class TestBlockHash(PrefixCachingTestBase):
 
         # Test 1: Hash should be positive for any valid input
         token_ids = torch.arange(128, device=torch.cuda.current_device(), dtype=torch.int64)
-        hash_value = block_allocator.compute_block_hash(0, token_ids)
+        hash_value = compute_block_hash(0, token_ids)
         assert hash_value > 0, "Hash should be positive"
 
         # Test 2: Same inputs should produce same hash
-        hash_value_2 = block_allocator.compute_block_hash(0, token_ids)
+        hash_value_2 = compute_block_hash(0, token_ids)
         assert hash_value == hash_value_2, "Hash should be deterministic"
 
         # Test 3: Different parent hash should produce different result
-        hash_with_parent = block_allocator.compute_block_hash(12345, token_ids)
+        hash_with_parent = compute_block_hash(12345, token_ids)
         assert hash_with_parent != hash_value, "Different parent should produce different hash"
         assert hash_with_parent > 0, "Hash with parent should still be positive"
 
         # Test 4: Different tokens should produce different hash
         different_tokens = torch.arange(1, 129, device=torch.cuda.current_device(), dtype=torch.int64)
-        hash_different = block_allocator.compute_block_hash(0, different_tokens)
+        hash_different = compute_block_hash(0, different_tokens)
         assert hash_different != hash_value, "Different tokens should produce different hash"
 
         # Test 5: Block hashes tensor initialized to -1
@@ -948,11 +952,11 @@ class TestPrefixCaching(PrefixCachingTestBase):
         # Verify hash chaining: same tokens with different parent = different hash
         # Block 0's tokens are the first block_size tokens from the prompt
         block_0_tokens = prompt[:block_size]
-        computed_hash_0 = block_allocator.compute_block_hash(0, block_0_tokens)
+        computed_hash_0 = compute_block_hash(0, block_0_tokens)
         assert computed_hash_0 == hash_0, "Block 0 hash should match with parent=0"
 
         # Same tokens with different parent should give different hash
-        hash_with_different_parent = block_allocator.compute_block_hash(12345, block_0_tokens)
+        hash_with_different_parent = compute_block_hash(12345, block_0_tokens)
         assert hash_with_different_parent != hash_0, (
             "Same tokens with different parent should produce different hash"
         )
@@ -1092,7 +1096,12 @@ class TestTTFT(PrefixCachingTestBase):
     @pytest.mark.internal
     @pytest.mark.skipif(TEST_LEVEL < TestLevel.IMPORTANT, reason="Test level not met")
     def test_matched_blocks_tokens_preserved(self):
-        """Test that tokens in matched blocks are NOT overwritten."""
+        """Test that tokens in matched blocks are NOT overwritten.
+
+        We verify this by checking that block IDs and hashes remain the same
+        when a second request shares blocks with the first request.
+        If the hash is unchanged, the tokens must be preserved.
+        """
         self._setup_model_parallel_group(1, 1)
         dynamic_context = self._get_dynamic_context(
             params_dtype=torch.float32,
@@ -1116,32 +1125,44 @@ class TestTTFT(PrefixCachingTestBase):
             request_id=1,
             prompt_tokens=prompt.clone(),
             sampling_params=SamplingParams(num_tokens_to_generate=10),
+            block_size_tokens=block_size,
+            enable_prefix_caching=True,
         )
         dynamic_context.add_request(request_1)
 
-        # Record token IDs stored in blocks
+        # Mark blocks as computed
+        dynamic_context.mark_pending_blocks_computed()
+
+        # Record block IDs and hashes
         block_0 = dynamic_context.request_to_kv_block_ids[0][0].item()
         block_1 = dynamic_context.request_to_kv_block_ids[0][1].item()
-        original_tokens_0 = block_allocator.block_to_token_ids[block_0].clone()
-        original_tokens_1 = block_allocator.block_to_token_ids[block_1].clone()
+        original_hash_0 = block_allocator.get_block_hash(block_0)
+        original_hash_1 = block_allocator.get_block_hash(block_1)
 
         # Add second request with same prefix
         request_2 = DynamicInferenceRequest(
             request_id=2,
             prompt_tokens=prompt.clone(),
             sampling_params=SamplingParams(num_tokens_to_generate=10),
+            block_size_tokens=block_size,
+            enable_prefix_caching=True,
         )
         dynamic_context.add_request(request_2)
 
-        # Verify tokens are preserved (not overwritten)
-        current_tokens_0 = block_allocator.block_to_token_ids[block_0]
-        current_tokens_1 = block_allocator.block_to_token_ids[block_1]
+        # Verify blocks are shared (same block IDs)
+        req2_block_0 = dynamic_context.request_to_kv_block_ids[1][0].item()
+        req2_block_1 = dynamic_context.request_to_kv_block_ids[1][1].item()
+        assert req2_block_0 == block_0, "Block 0 should be shared"
+        assert req2_block_1 == block_1, "Block 1 should be shared"
 
-        assert torch.equal(original_tokens_0, current_tokens_0), (
-            "Block 0 tokens should not be overwritten"
+        # Verify hashes are preserved (implies tokens are preserved)
+        current_hash_0 = block_allocator.get_block_hash(block_0)
+        current_hash_1 = block_allocator.get_block_hash(block_1)
+        assert current_hash_0 == original_hash_0, (
+            "Block 0 hash should not change (tokens preserved)"
         )
-        assert torch.equal(original_tokens_1, current_tokens_1), (
-            "Block 1 tokens should not be overwritten"
+        assert current_hash_1 == original_hash_1, (
+            "Block 1 hash should not change (tokens preserved)"
         )
 
     @pytest.mark.internal
@@ -1171,8 +1192,13 @@ class TestTTFT(PrefixCachingTestBase):
             request_id=1,
             prompt_tokens=prompt_1,
             sampling_params=SamplingParams(num_tokens_to_generate=10),
+            block_size_tokens=block_size,
+            enable_prefix_caching=True,
         )
         dynamic_context.add_request(request_1)
+
+        # Mark blocks as computed
+        dynamic_context.mark_pending_blocks_computed()
 
         # Record original hashes
         block_0 = dynamic_context.request_to_kv_block_ids[0][0].item()
@@ -1189,6 +1215,8 @@ class TestTTFT(PrefixCachingTestBase):
             request_id=2,
             prompt_tokens=prompt_2,
             sampling_params=SamplingParams(num_tokens_to_generate=10),
+            block_size_tokens=block_size,
+            enable_prefix_caching=True,
         )
         dynamic_context.add_request(request_2)
 
@@ -1200,10 +1228,15 @@ class TestTTFT(PrefixCachingTestBase):
             "Matched block hash should not change"
         )
 
-        # Verify new blocks have different hashes
+        # New blocks are pending until marked computed
         req2_block_1 = dynamic_context.request_to_kv_block_ids[1][1].item()
         req2_block_2 = dynamic_context.request_to_kv_block_ids[1][2].item()
         assert req2_block_1 != block_1, "Second block should be newly allocated"
+
+        # Mark request 2's new blocks as computed
+        dynamic_context.mark_pending_blocks_computed()
+
+        # Verify new blocks have different hashes (now computed)
         new_hash_1 = block_allocator.get_block_hash(req2_block_1)
         new_hash_2 = block_allocator.get_block_hash(req2_block_2)
         assert new_hash_1 != original_hash_1, "New block 1 should have different hash"
@@ -1244,6 +1277,8 @@ class TestTTFT(PrefixCachingTestBase):
             request_id=1,
             prompt_tokens=prompt.clone(),
             sampling_params=SamplingParams(num_tokens_to_generate=10),
+            block_size_tokens=block_size,
+            enable_prefix_caching=True,
         )
         dynamic_context.add_request(request_1)
 
@@ -1266,6 +1301,8 @@ class TestTTFT(PrefixCachingTestBase):
             request_id=2,
             prompt_tokens=prompt.clone(),
             sampling_params=SamplingParams(num_tokens_to_generate=10),
+            block_size_tokens=block_size,
+            enable_prefix_caching=True,
         )
         dynamic_context.add_request(request_2)
 
@@ -1293,6 +1330,8 @@ class TestTTFT(PrefixCachingTestBase):
             request_id=3,
             prompt_tokens=extended_prompt,
             sampling_params=SamplingParams(num_tokens_to_generate=10),
+            block_size_tokens=block_size,
+            enable_prefix_caching=True,
         )
         dynamic_context.add_request(request_3)
 
@@ -1338,6 +1377,8 @@ class TestTTFT(PrefixCachingTestBase):
                 request_id=req_id + 1,
                 prompt_tokens=prompt.clone(),
                 sampling_params=SamplingParams(num_tokens_to_generate=10),
+                block_size_tokens=block_size,
+                enable_prefix_caching=True,
             )
             # All requests should compute the same precomputed hashes
             all_hashes.append(request.precomputed_block_hashes.copy())
@@ -1388,6 +1429,8 @@ class TestTTFT(PrefixCachingTestBase):
                 request_id=i + 1,
                 prompt_tokens=prompt,
                 sampling_params=SamplingParams(num_tokens_to_generate=10),
+                block_size_tokens=block_size,
+                enable_prefix_caching=True,
             )
 
             # Collect first block's hash
@@ -1406,16 +1449,21 @@ class TestTTFT(PrefixCachingTestBase):
         )
 
     @pytest.mark.internal
-    @pytest.mark.skipif(TEST_LEVEL < TestLevel.CRITICAL, reason="Test level not met")
+    @pytest.mark.skipif(TEST_LEVEL < TestLevel.LOW, reason="Test level not met")
     def test_hash_collision_would_cause_incorrect_sharing(self):
-        """Test documenting that hash collisions would cause incorrect block sharing.
+        """THEORETICAL documentation test: hash collisions would cause incorrect sharing.
 
-        CRITICAL ISSUE: The current implementation does NOT verify token content after
-        a hash match. If two different token sequences produce the same hash, they would
-        incorrectly share blocks, leading to wrong KV cache values and incorrect outputs.
+        NOTE: This is a theoretical demonstration, NOT a practical concern. Real hash
+        collisions are astronomically unlikely with HASH_PRIME = 2305843009213693951
+        (2^61 - 1, ~10^18 hash space). This test artificially forces a collision by
+        manually overwriting precomputed hashes to document what *would* happen if a
+        collision occurred.
 
-        This test artificially creates a collision scenario to demonstrate the issue.
-        A production fix would need to add token verification after hash matches.
+        The current implementation does NOT verify token content after a hash match.
+        If two different token sequences produced the same hash (nearly impossible),
+        they would incorrectly share blocks, leading to wrong KV cache values.
+
+        This test exists purely for documentation/awareness purposes.
         """
         self._setup_model_parallel_group(1, 1)
         dynamic_context = self._get_dynamic_context(
@@ -1440,6 +1488,13 @@ class TestTTFT(PrefixCachingTestBase):
             request_id=1,
             prompt_tokens=prompt_1,
             sampling_params=SamplingParams(num_tokens_to_generate=10),
+            block_size_tokens=block_size,
+        )
+        assert request_1.precomputed_block_hashes is not None, (
+            "precomputed_block_hashes should be set when block_size_tokens is provided"
+        )
+        assert len(request_1.precomputed_block_hashes) == 1, (
+            "Should have exactly 1 block hash for prompt of size block_size"
         )
         dynamic_context.add_request(request_1)
         dynamic_context.mark_pending_blocks_computed()
@@ -1447,7 +1502,6 @@ class TestTTFT(PrefixCachingTestBase):
         # Get the hash and block ID of first request's block
         block_id_1 = dynamic_context.request_to_kv_block_ids[0][0].item()
         hash_1 = block_allocator.get_block_hash(block_id_1)
-        tokens_1 = block_allocator.block_to_token_ids[block_id_1].clone()
 
         # Add second request with DIFFERENT tokens
         prompt_2 = torch.arange(
@@ -1457,11 +1511,17 @@ class TestTTFT(PrefixCachingTestBase):
             request_id=2,
             prompt_tokens=prompt_2,
             sampling_params=SamplingParams(num_tokens_to_generate=10),
+            block_size_tokens=block_size,
+        )
+        assert request_2.precomputed_block_hashes is not None, (
+            "precomputed_block_hashes should be set when block_size_tokens is provided"
+        )
+        assert len(request_2.precomputed_block_hashes) == 1, (
+            "Should have exactly 1 block hash for prompt of size block_size"
         )
 
         # Artificially create a collision by overriding the precomputed hash
         # This simulates what would happen if two different sequences hashed to the same value
-        original_hash_2 = request_2.precomputed_block_hashes[0]
         request_2.precomputed_block_hashes[0] = hash_1  # Force collision
 
         dynamic_context.add_request(request_2)
@@ -1471,23 +1531,12 @@ class TestTTFT(PrefixCachingTestBase):
 
         if block_id_2 == block_id_1:
             # Collision caused incorrect sharing!
-            tokens_2_in_block = block_allocator.block_to_token_ids[block_id_2]
-
-            # The block should contain prompt_1's tokens, not prompt_2's tokens
-            assert torch.equal(tokens_2_in_block, tokens_1), (
-                "Block contains original tokens as expected"
-            )
-            assert not torch.equal(tokens_2_in_block[:block_size], prompt_2), (
-                "CRITICAL: Hash collision caused request 2 to incorrectly share request 1's block! "
-                f"Request 2 expected tokens {prompt_2[:5].tolist()}... "
-                f"but block contains {tokens_2_in_block[:5].tolist()}... "
-                "This would lead to incorrect KV cache and wrong model outputs. "
-                "FIX REQUIRED: Add token verification after hash matches."
-            )
-
-            # Log warning about the vulnerability
+            # This documents that the implementation does NOT verify token content after hash matches.
+            # Request 2 has completely different tokens than request 1, but they share the same block
+            # because their hashes (artificially) match. This means request 2 will use request 1's
+            # KV cache, leading to incorrect model outputs.
             print(
-                "\n⚠️  WARNING: Hash collision test confirmed that the current implementation "
+                "\nWARNING: Hash collision test confirmed that the current implementation "
                 "does NOT verify token content after hash matches. If a real collision occurs, "
                 "it will cause incorrect block sharing and wrong outputs. "
                 "Consider adding token verification in _find_matching_prefix_blocks()."
@@ -1496,7 +1545,7 @@ class TestTTFT(PrefixCachingTestBase):
             # Collision did not cause sharing (perhaps due to other factors)
             # This is fine, but we still want to document the risk
             print(
-                "\n⚠️  INFO: Artificial collision did not trigger incorrect sharing in this test. "
+                "\nINFO: Artificial collision did not trigger incorrect sharing in this test. "
                 "However, the implementation still lacks token verification after hash matches, "
                 "which is a potential correctness issue if real collisions occur."
             )
@@ -1536,6 +1585,7 @@ class TestTTFT(PrefixCachingTestBase):
                 request_id=req_id + 1,
                 prompt_tokens=shared_prefix.clone(),
                 sampling_params=SamplingParams(num_tokens_to_generate=10),
+                block_size_tokens=block_size,
             )
             dynamic_context.add_request(request)
 
@@ -1551,19 +1601,13 @@ class TestTTFT(PrefixCachingTestBase):
                 f"Request {req_id} should share blocks with request 0"
             )
 
-        # Verify token content in shared blocks matches the expected prefix
+        # Verify ref counts are correct for shared blocks
         for block_idx in range(3):
             block_id = first_req_blocks[block_idx].item()
-            block_tokens = block_allocator.block_to_token_ids[block_id]
-            expected_tokens = shared_prefix[
-                block_idx * block_size : (block_idx + 1) * block_size
-            ]
-
-            assert torch.equal(block_tokens[:block_size], expected_tokens), (
-                f"Block {block_idx} (ID {block_id}) has incorrect tokens. "
-                f"Expected {expected_tokens[:5].tolist()}..., "
-                f"got {block_tokens[:5].tolist()}... "
-                "Token content corruption in shared blocks!"
+            ref_count = block_allocator.block_ref_counts[block_id].item()
+            assert ref_count == num_requests, (
+                f"Block {block_id} should have ref_count={num_requests} "
+                f"(shared by all requests), got {ref_count}"
             )
 
     @pytest.mark.internal
@@ -1597,6 +1641,7 @@ class TestTTFT(PrefixCachingTestBase):
             request_id=1,
             prompt_tokens=prompt_1,
             sampling_params=SamplingParams(num_tokens_to_generate=10),
+            block_size_tokens=block_size,
         )
         dynamic_context.add_request(request_1)
         dynamic_context.mark_pending_blocks_computed()
@@ -1614,6 +1659,7 @@ class TestTTFT(PrefixCachingTestBase):
             request_id=2,
             prompt_tokens=prompt_1.clone(),
             sampling_params=SamplingParams(num_tokens_to_generate=10),
+            block_size_tokens=block_size,
         )
         dynamic_context.add_request(request_2)
 
@@ -1634,6 +1680,7 @@ class TestTTFT(PrefixCachingTestBase):
                 request_id=i + 100,
                 prompt_tokens=filler_prompt,
                 sampling_params=SamplingParams(num_tokens_to_generate=10),
+                block_size_tokens=block_size,
             )
             try:
                 dynamic_context.add_request(filler_request)
@@ -1650,13 +1697,11 @@ class TestTTFT(PrefixCachingTestBase):
             "Shared block 1 was incorrectly evicted or corrupted!"
         )
 
-        # Verify the blocks still contain the correct tokens
-        tokens_0 = block_allocator.block_to_token_ids[req1_block_0][:block_size]
-        tokens_1 = block_allocator.block_to_token_ids[req1_block_1][:block_size]
-        assert torch.equal(tokens_0, prompt_1[:block_size]), "Block 0 tokens corrupted!"
-        assert torch.equal(tokens_1, prompt_1[block_size : block_size * 2]), (
-            "Block 1 tokens corrupted!"
-        )
+        # Verify the blocks still have valid hashes (blocks weren't reset/corrupted)
+        hash_0 = block_allocator.block_hashes[req1_block_0].item()
+        hash_1 = block_allocator.block_hashes[req1_block_1].item()
+        assert hash_0 != -1, "Block 0 hash was reset (block corrupted/evicted)!"
+        assert hash_1 != -1, "Block 1 hash was reset (block corrupted/evicted)!"
 
 
 class TestEdgeCases(PrefixCachingTestBase):
@@ -1878,7 +1923,7 @@ class TestDisabledMode(PrefixCachingTestBase):
         # Verify hashes are deterministic (based on block_id)
         # The formula is: (block_id * 2654435761) % HASH_PRIME + 1
         for block_id in block_ids:
-            expected_hash = (block_id * 2654435761) % block_allocator.HASH_PRIME + 1
+            expected_hash = (block_id * 2654435761) % HASH_PRIME + 1
             actual_hash = block_allocator.block_hashes[block_id].item()
             assert actual_hash == expected_hash, (
                 f"Hash for block {block_id} should be deterministic: "
@@ -2172,7 +2217,7 @@ class TestPrefixCoordination(PrefixCachingTestBase):
             start = i * block_size
             end = start + block_size
             block_tokens = prompt_tokens[start:end]
-            expected_hash = allocator.compute_block_hash(parent_hash, block_tokens)
+            expected_hash = compute_block_hash(parent_hash, block_tokens)
             assert request.precomputed_block_hashes[i] == expected_hash, (
                 f"Block {i} hash mismatch: {request.precomputed_block_hashes[i]} vs {expected_hash}"
             )

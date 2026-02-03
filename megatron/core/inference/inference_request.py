@@ -161,7 +161,9 @@ class InferenceRequest:
 # =========================================================================
 
 # Constants for hash computation
-HASH_PRIME = 1000000007
+# Using 2^61 - 1 (Mersenne prime) for ~10^18 hash space, reducing collision probability
+# from ~10^-9 to ~10^-18 compared to the previous prime (1000000007).
+HASH_PRIME = 2305843009213693951
 HASH_BASE = 31
 
 
