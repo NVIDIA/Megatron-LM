@@ -8,16 +8,14 @@ from enum import Enum
 from pathlib import Path
 from typing import Any, DefaultDict, Union
 
-from ..mapping import CheckpointingException, ShardedStateDict, StateDict
+from ..mapping import CheckpointingException, ShardedStateDict
 from .async_utils import AsyncCallsQueue, AsyncRequest
 
 
 class StrategyAction(Enum):
-    """Specifies save vs load and sharded vs common action."""
+    """Specifies save vs load action."""
 
-    LOAD_COMMON = 'load_common'
     LOAD_SHARDED = 'load_sharded'
-    SAVE_COMMON = 'save_common'
     SAVE_SHARDED = 'save_sharded'
 
 
@@ -56,7 +54,7 @@ def register_default_strategy(
     """Adds a given strategy to the registry of default strategies.
 
     Args:
-        action (StrategyAction): specifies save/load and sharded/common
+        action (StrategyAction): specifies save/load and sharded
         backend (str): backend that the strategy becomes a default for
         version (int): version that the strategy becomes a default for
         strategy (SaveStrategyBase, LoadStrategyBase): strategy to register
@@ -101,28 +99,6 @@ class SaveStrategyBase(ABC):
         return f'{self.__class__.__name__}({self.backend}, {self.version})'
 
 
-class LoadCommonStrategy(LoadStrategyBase):
-    """Load strategy for common (non-sharded) objects"""
-
-    @abstractmethod
-    def load_common(self, checkpoint_dir: Union[str, Path]):
-        """Load common part of the checkpoint."""
-        raise NotImplementedError
-
-    @abstractmethod
-    def load_sharded_objects(
-        self, sharded_objects_state_dict: ShardedStateDict, checkpoint_dir: Union[str, Path]
-    ):
-        """Load sharded objects from the checkpoint."""
-        raise NotImplementedError
-
-    def load_sharded_metadata(self, checkpoint_dir: Union[str, Path]) -> ShardedStateDict:
-        """Load just the metadata from the checkpoint."""
-        if not self.can_handle_sharded_objects:
-            return {}
-        raise NotImplementedError
-
-
 class LoadShardedStrategy(LoadStrategyBase):
     """Load strategy for sharded tensors"""
 
@@ -163,21 +139,6 @@ class LoadShardedStrategy(LoadStrategyBase):
 
     def remove_sharded_tensors(self, checkpoint_dir: Union[str, Path], key_prefix: str):
         """Remove all tensors whose key starts with key_prefix"""
-        raise NotImplementedError
-
-
-class SaveCommonStrategy(SaveStrategyBase):
-    """Save strategy for common (non-sharded) objects"""
-
-    @abstractmethod
-    def save_common(self, common_state_dict: StateDict, checkpoint_dir: Union[str, Path]):
-        """Save common part of the state dict."""
-        raise NotImplementedError
-
-    def save_sharded_objects(
-        self, sharded_objects_state_dict: ShardedStateDict, checkpoint_dir: Union[str, Path]
-    ):
-        """Save sharded objects from the state dict."""
         raise NotImplementedError
 
 
