@@ -79,13 +79,3 @@ products:
       - environment: [dev]
         scope: [mr-broken]
         platforms: [dgx_h100]
-  - test_case: [gpt_grpo_tp4_pp1_dp2_8b_suspend_remove_kv]
-    products:
-      - environment: [dev]
-        scope: [mr]
-        platforms: [dgx_h100]
-  - test_case: [gpt_grpo_tp4_pp1_dp2_8b_suspend_offload_kv]
-    products:
-      - environment: [dev]
-        scope: [mr]
-        platforms: [dgx_h100]
