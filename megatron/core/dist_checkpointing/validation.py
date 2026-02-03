@@ -471,11 +471,11 @@ def _validate_sharding_for_key(
                 some_rank_shard,
             )
 
+    errors = []
     if not has_regular_sharding_grid:
         # In case of uneven sharding we defer the validation to DCP
-        return
+        return errors
 
-    errors = []
     shard_access_cnt = _compute_shards_access(rank_sharding)
     if not torch.all(shard_access_cnt == 1):
         errors.append(
