@@ -713,6 +713,9 @@ class PipelineOffloadManager:
         while not self._is_warmup and (
             self._cur_forward_chunk is None or self._cur_forward_chunk.finish_all_groups(name)
         ):
+            if self._cached_chunks_index_forward >= len(self._cached_chunks_forward):
+                self._cur_forward_chunk = None
+                break
             self._cur_forward_chunk = self._cached_chunks_forward[self._cached_chunks_index_forward]
             self._cached_chunks_index_forward += 1
             debug_rank(f"new cur_forward_chunk {self._cur_forward_chunk}")
@@ -807,16 +810,13 @@ class ChunkOffloadHandler:
             )
 
         cpu_backup.copy_(src_tensor, non_blocking=pin_memory)
-        state = (src_tensor.device, cpu_backup, use_cpu_pool, mxfp8_tensor)
-        if is_mxfp8_tensor:
-            src_tensor.record_stream(torch.cuda.current_stream())
-            src_tensor.untyped_storage().resize_(0)
+        state = (src_tensor.device, cpu_backup, use_cpu_pool)
         return state
 
     def reload(self, state, non_blocking=None):
         """Reload."""
         debug_rank("------reload")
-        dev, cpu_backup, use_cpu_pool, mxfp8_tensor = state
+        dev, cpu_backup, use_cpu_pool = state
         if non_blocking is None:
             non_blocking = cpu_backup.is_pinned()
         gpu_tensor = torch.empty(
@@ -825,9 +825,6 @@ class ChunkOffloadHandler:
         gpu_tensor.copy_(cpu_backup, non_blocking=non_blocking)
         if use_cpu_pool:
             self.cpu_tensor_pool.free(cpu_backup)
-        if mxfp8_tensor is not None:
-            mxfp8_tensor._columnwise_data = gpu_tensor
-            return mxfp8_tensor
         return gpu_tensor
 
     def __init__(self, min_offloaded_tensor_size, cpu_tensor_pool):
@@ -854,8 +851,6 @@ class ChunkOffloadHandler:
         self.cpu_tensor_pool = cpu_tensor_pool
         self.is_warmup = True
 
-        self.mxfp8_tensors = []
-
     def reset(self):
         """Reset the chunk offload handler."""
         self._offloaded_group_index = 0
@@ -863,7 +858,6 @@ class ChunkOffloadHandler:
         self._groups_to_reload = []
         self._tensor_count_current_group = 0
         self._reloading_group = []
-        self.mxfp8_tensors = []
 
     def find_group_with_name(
         self, groups: list[OffloadTensorGroup], name: str, start_index: int = 0
@@ -943,7 +937,7 @@ class ChunkOffloadHandler:
             return False
         return True
 
-    def bulk_offload_group(self, group_to_offload):
+    def bulk_offload_group(self):
         """offload a group of tensors recorded in tensor_push()."""
         debug_rank("------bulk_offload_group")
         torch.cuda.nvtx.range_push("activation offloading " + group_to_offload._name)
@@ -955,10 +949,10 @@ class ChunkOffloadHandler:
                     )
                     if self.is_warmup:
                         group_to_offload.update_offload_info(tensor_on_device)
-                    if state[3] is None:
-                        tensor_on_device.record_stream(self.d2h_stream)
+                    tensor_on_device.record_stream(self.d2h_stream)
                     group_to_offload.push_tensor(tensor_tag, state)
             group_to_offload.record_offload_event(self.d2h_stream)
+        self._groups_to_offload.pop()
         torch.cuda.nvtx.range_pop()
 
     def get_max_deduplicated_groups(self):
@@ -987,7 +981,6 @@ class ChunkOffloadHandler:
             group_to_reload.record_reload_event(self.h2d_stream)
         self._groups_to_reload.pop()
         # Add the group to the reloading group to wait for the reload event.
-        debug_rank(f"add group to reloading group {group_to_reload}")
         self._reloading_group.append(group_to_reload)
         torch.cuda.nvtx.range_pop()
 
@@ -1127,6 +1120,18 @@ class ChunkOffloadHandler:
         self.bulk_reload()
 
 
+def fine_grained_offloading_disable_offload():
+    """Disable the offload."""
+    debug_rank("fine_grained_offloading_disable_offload")
+    PipelineOffloadManager.get_instance().disable_offload()
+
+
+def fine_grained_offloading_enable_offload():
+    """Enable the offload."""
+    debug_rank("fine_grained_offloading_enable_offload")
+    PipelineOffloadManager.get_instance().enable_offload()
+
+
 class FineGrainedOffloadingGroupCommitFunction(torch.autograd.Function):
     """
     Identity operation that marks the end of a layer group for offload synchronization.
@@ -1199,6 +1204,12 @@ def fine_grained_offloading_group_commit(
     return FineGrainedOffloadingGroupCommitFunction.apply(
         tensor, cur_forward_chunk, name, forced_released_tensors, delay_offload
     )
+
+
+def fine_grained_offloading_group_flush_delayed_groups():
+    """Flush the delayed groups."""
+    debug_rank("fine_grained_offloading_group_flush_delayed_groups")
+    PipelineOffloadManager.get_instance().flush_delayed_groups()
 
 
 class FineGrainedOffloadingGroupStartFunction(torch.autograd.Function):

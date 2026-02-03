@@ -25,6 +25,7 @@ from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.quantization.utils import get_quant_config_or_none
 from megatron.core.tensor_parallel import gather_from_sequence_parallel_region
 from megatron.core.transformer.enums import CudaGraphScope, ModelType
+from megatron.core.transformer.linear_cross_entropy import LinearCrossEntropyModule
 from megatron.core.transformer.multi_token_prediction import (
     MTPLossAutoScaler,
     MTPLossLoggingHelper,
@@ -35,7 +36,11 @@ from megatron.core.transformer.multi_token_prediction import (
 from megatron.core.transformer.spec_utils import ModuleSpec
 from megatron.core.transformer.transformer_block import TransformerBlock
 from megatron.core.transformer.transformer_config import TransformerConfig
-from megatron.core.utils import WrappedTensor, deprecate_inference_params
+from megatron.core.utils import (
+    WrappedTensor,
+    deprecate_inference_params,
+    is_using_quantization_scales,
+)
 
 
 class GPTModel(LanguageModule):
@@ -234,7 +239,7 @@ class GPTModel(LanguageModule):
                 self.embedding_activation_buffer = None
                 self.grad_output_buffer = None
 
-            self.output_layer = tensor_parallel.ColumnParallelLinear(
+            self.output_layer = LinearCrossEntropyModule(
                 config.hidden_size,
                 self.vocab_size,
                 config=config,
@@ -358,7 +363,10 @@ class GPTModel(LanguageModule):
                     inference_context, self.decoder, decoder_input, self.config, packed_seq_params
                 )
                 rotary_pos_emb = self.rotary_pos_emb(
-                    rotary_seq_len, packed_seq_params=packed_seq_params
+                    rotary_seq_len,
+                    packed_seq=packed_seq_params is not None
+                    and packed_seq_params.qkv_format == 'thd',
+                    cp_group=packed_seq_params.cp_group if packed_seq_params is not None else None,
                 )
         elif self.position_embedding_type == 'yarn':
             if self.training or not self.config.flash_decode:
@@ -366,7 +374,10 @@ class GPTModel(LanguageModule):
                     inference_context, self.decoder, decoder_input, self.config, packed_seq_params
                 )
                 rotary_pos_emb, _ = self.rotary_pos_emb(
-                    rotary_seq_len, packed_seq_params=packed_seq_params
+                    rotary_seq_len,
+                    packed_seq=packed_seq_params is not None
+                    and packed_seq_params.qkv_format == 'thd',
+                    cp_group=packed_seq_params.cp_group if packed_seq_params is not None else None,
                 )
             else:
                 raise NotImplementedError(
@@ -376,7 +387,9 @@ class GPTModel(LanguageModule):
         elif self.position_embedding_type == 'mrope' and not self.config.multi_latent_attention:
             if self.training or not self.config.flash_decode:
                 rotary_pos_emb = self.rotary_pos_emb(
-                    position_ids, self.mrope_section, packed_seq_params=packed_seq_params
+                    position_ids,
+                    self.mrope_section,
+                    cp_group=packed_seq_params.cp_group if packed_seq_params is not None else None,
                 )
             else:
                 # Flash decoding uses precomputed cos and sin for RoPE
@@ -405,11 +418,19 @@ class GPTModel(LanguageModule):
         else:
             sequence_len_offset = None
 
-        # Wrap decoder_input to allow the decoder (TransformerBlock) to delete the
-        # reference held by this caller function, enabling early garbage collection for
-        # inference. Skip wrapping if decoder_input is logged after decoder completion.
-        if in_inference_mode and not has_config_logger_enabled(self.config):
-            decoder_input = WrappedTensor(decoder_input)
+        if in_inference_mode:
+            # Clear the outputs for padding tokens when using dynamic batching with
+            # quantization scales to avoid corrupting amax calculations
+            if inference_context.is_dynamic_batching() and is_using_quantization_scales(
+                self.config
+            ):
+                decoder_input[inference_context.padding_slice] = 0.0
+
+            # Wrap decoder_input to allow the decoder (TransformerBlock) to delete the
+            # reference held by this caller function, enabling early garbage collection for
+            # inference. Skip wrapping if decoder_input is logged after decoder completion.
+            if not has_config_logger_enabled(self.config):
+                decoder_input = WrappedTensor(decoder_input)
 
         preproc_output = (
             decoder_input,
@@ -591,8 +612,7 @@ class GPTModel(LanguageModule):
         if not self.post_process:
             return hidden_states
 
-        # Skip when mtp_num_layers is None or 0
-        if self.config.mtp_num_layers:
+        if self.config.mtp_num_layers is not None:
             mtp_labels = labels.clone()
             hidden_states_list = torch.chunk(hidden_states, 1 + self.config.mtp_num_layers, dim=0)
             hidden_states = hidden_states_list[0]
@@ -617,16 +637,12 @@ class GPTModel(LanguageModule):
                 )
 
                 # Compute mtp loss without storing logits to save memory.
-                mtp_loss = self.compute_output_layer_and_language_model_loss(
-                    hidden_states_list[mtp_layer_number + 1],
+                mtp_loss = self.output_layer(
+                    output_cross_entropy_loss=True,
+                    input_=hidden_states_list[mtp_layer_number + 1],
+                    weight=output_weight,
                     labels=mtp_labels,
-                    weight=self.shared_embedding_or_output_weight(),
-                    sequence_parallel_enabled=self.output_layer.sequence_parallel,
-                    column_parallel_linear=self.output_layer,
-                    col_linear_kwargs={
-                        'weight': output_weight,
-                        'runtime_gather_output': runtime_gather_output,
-                    },
+                    runtime_gather_output=runtime_gather_output,
                 )
 
                 mtp_loss = loss_mask * mtp_loss
@@ -705,16 +721,12 @@ class GPTModel(LanguageModule):
             # [s b h] => [b s h]
             return logits.transpose(0, 1).contiguous()
 
-        loss = self.compute_output_layer_and_language_model_loss(
-            hidden_states,
+        loss = self.output_layer(
+            output_cross_entropy_loss=True,
+            input_=hidden_states,
             labels=labels,
-            weight=self.shared_embedding_or_output_weight(),
-            sequence_parallel_enabled=self.output_layer.sequence_parallel,
-            column_parallel_linear=self.output_layer,
-            col_linear_kwargs={
-                'weight': output_weight,
-                'runtime_gather_output': runtime_gather_output,
-            },
+            weight=output_weight,
+            runtime_gather_output=runtime_gather_output,
         )
 
         return loss
