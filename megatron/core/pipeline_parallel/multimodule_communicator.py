@@ -313,7 +313,9 @@ class MultiModulePipelineCommunicator:
                 # from incoming modules.
                 for bridge_comm in rank_module_info.bridge_comms_as_dest_module:
                     received_tensor = bridge_comm.recv_forward()
-                    input_dict[bridge_comm.src_module_name] = _restore_tensor_from_comm(received_tensor)
+                    input_dict[bridge_comm.src_module_name] = _restore_tensor_from_comm(
+                        received_tensor
+                    )
             else:
                 # If not first stage, receive forward activation tensor from P2P communicator.
                 received_tensor = rank_module_info.p2p_communicator.recv_forward(
@@ -338,9 +340,7 @@ class MultiModulePipelineCommunicator:
             else:
                 # If not last stage, send forward activation by using P2P communicator.
                 tensor_to_send = _prepare_tensor_for_comm(output_dict[module_name])
-                rank_module_info.p2p_communicator.send_forward(
-                    tensor_to_send, is_last_stage=False
-                )
+                rank_module_info.p2p_communicator.send_forward(tensor_to_send, is_last_stage=False)
 
     def send_forward_recv_backward(
         self,
@@ -399,7 +399,9 @@ class MultiModulePipelineCommunicator:
                     # receive forward activation by using bridge communicator.
                     grad_to_send = _prepare_tensor_for_comm(grad_dict[bridge_comm.src_module_name])
                     received_tensor = bridge_comm.send_backward_recv_forward(grad_to_send)
-                    input_dict[bridge_comm.src_module_name] = _restore_tensor_from_comm(received_tensor)
+                    input_dict[bridge_comm.src_module_name] = _restore_tensor_from_comm(
+                        received_tensor
+                    )
             else:
                 # If not first stage, send backward gradient and receive forward activation
                 # by using P2P communicator.
@@ -457,9 +459,7 @@ class MultiModulePipelineCommunicator:
             else:
                 # If not first stage, send backward activation by using P2P communicator.
                 grad_to_send = _prepare_tensor_for_comm(grad_dict[module_name])
-                rank_module_info.p2p_communicator.send_backward(
-                    grad_to_send, is_first_stage=False
-                )
+                rank_module_info.p2p_communicator.send_backward(grad_to_send, is_first_stage=False)
 
     @staticmethod
     def compute_total_pipeline_stages(

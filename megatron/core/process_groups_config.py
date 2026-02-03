@@ -581,7 +581,8 @@ class MultiModuleProcessGroupCollection:
 
     Attributes:
         module_pgs: Dict mapping module names to ProcessGroupCollection objects
-        language_model_module_name: Key identifying the language model module (None if no LLM on this rank)
+        language_model_module_name: Key identifying the language model module
+            (None if no LLM on this rank)
 
     Example:
         # Colocated rank with encoder and LLM
@@ -699,5 +700,9 @@ class MultiModuleProcessGroupCollection:
     def __repr__(self):
         """Return a concise representation showing modules and their language model status."""
         modules_str = ', '.join(self.module_pgs.keys())
-        lm_str = f", language_model_module_name='{self.language_model_module_name}'" if self.language_model_module_name else ""
+        lm_str = (
+            f", language_model_module_name='{self.language_model_module_name}'"
+            if self.language_model_module_name
+            else ""
+        )
         return f"MultiModuleProcessGroupCollection(modules=[{modules_str}]{lm_str})"

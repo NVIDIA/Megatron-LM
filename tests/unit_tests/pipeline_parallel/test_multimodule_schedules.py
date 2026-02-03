@@ -16,9 +16,7 @@ from megatron.core.distributed import DistributedDataParallel, DistributedDataPa
 from megatron.core.distributed.finalize_model_grads import finalize_model_grads
 from megatron.core.hyper_comm_grid import HyperCommGrid
 from megatron.core.models.gpt.gpt_layer_specs import get_gpt_layer_with_transformer_engine_spec
-from megatron.core.pipeline_parallel.multimodule_communicator import (
-    MultiModulePipelineCommunicator,
-)
+from megatron.core.pipeline_parallel.multimodule_communicator import MultiModulePipelineCommunicator
 from megatron.core.pipeline_parallel.utils import is_pp_first_stage, is_pp_last_stage
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
@@ -106,11 +104,13 @@ def create_transformer_block(hidden_size, pg_collection, dtype=torch.bfloat16):
         bf16=(dtype == torch.bfloat16),
     )
 
-    block = TransformerBlock(
-        config,
-        get_gpt_layer_with_transformer_engine_spec(),
-        pg_collection=pg_collection,
-    ).cuda().to(dtype)
+    block = (
+        TransformerBlock(
+            config, get_gpt_layer_with_transformer_engine_spec(), pg_collection=pg_collection
+        )
+        .cuda()
+        .to(dtype)
+    )
 
     with torch.no_grad():
         for mod in block.modules():
@@ -166,16 +166,18 @@ class MultiModuleModel(torch.nn.Module):
         for enc_cfg in encoder_configs:
             name = enc_cfg['name']
             module, grid = create_module_with_grid(
-                enc_cfg['tp'], enc_cfg['pp'], enc_cfg['dp'],
-                enc_cfg['grid_offset'], hidden_size
+                enc_cfg['tp'], enc_cfg['pp'], enc_cfg['dp'], enc_cfg['grid_offset'], hidden_size
             )
             self.encoders[name] = module
             self.encoder_grids[name] = grid
 
         # Create LLM
         self.llm, self.llm_grid = create_module_with_grid(
-            llm_config['tp'], llm_config['pp'], llm_config['dp'],
-            llm_config['grid_offset'], hidden_size
+            llm_config['tp'],
+            llm_config['pp'],
+            llm_config['dp'],
+            llm_config['grid_offset'],
+            hidden_size,
         )
 
         # Track all modules for gradient sync
@@ -274,8 +276,7 @@ class MultiModuleModel(torch.nn.Module):
             if encoder is not None and self.is_rank_in_grid(self.encoder_grids[name]):
                 pp_group = self.encoder_grids[name].get_pg("pp")
                 input_tensor = (
-                    hidden_states if is_pp_first_stage(pp_group)
-                    else self.input_tensors[name]
+                    hidden_states if is_pp_first_stage(pp_group) else self.input_tensors[name]
                 )
                 output_dict[name] = encoder(input_tensor, attention_mask=None)
 
@@ -304,8 +305,11 @@ class DataIterator:
 
     def __next__(self):
         return torch.randn(
-            self.seq_length, self.micro_batch_size, self.hidden_size,
-            device='cuda', dtype=torch.bfloat16
+            self.seq_length,
+            self.micro_batch_size,
+            self.hidden_size,
+            device='cuda',
+            dtype=torch.bfloat16,
         )
 
 
@@ -315,8 +319,7 @@ class DataIterator:
 
 
 def run_multimodule_schedule_test(
-    encoder_configs, llm_config, hidden_size, seq_length,
-    micro_batch_size, num_microbatches
+    encoder_configs, llm_config, hidden_size, seq_length, micro_batch_size, num_microbatches
 ):
     """Run multimodule schedule test with given configuration.
 
@@ -352,7 +355,8 @@ def run_multimodule_schedule_test(
     config.finalize_model_grads_func = model.finalize_model_grads
     config.grad_scale_func = lambda loss: (
         torch.tensor(loss, dtype=torch.float32, device='cuda', requires_grad=True)
-        if isinstance(loss, (int, float)) else loss
+        if isinstance(loss, (int, float))
+        else loss
     )
     config.hidden_size = hidden_size
     model.config = config
@@ -377,7 +381,10 @@ def run_multimodule_schedule_test(
         if grid.rank_offset <= rank < grid.rank_offset + grid.size:
             pg_collection = add_embedding_groups(get_pg_collection(grid))
             break
-    if pg_collection is None and model.llm_grid.rank_offset <= rank < model.llm_grid.rank_offset + model.llm_grid.size:
+    if (
+        pg_collection is None
+        and model.llm_grid.rank_offset <= rank < model.llm_grid.rank_offset + model.llm_grid.size
+    ):
         pg_collection = add_embedding_groups(get_pg_collection(model.llm_grid))
 
     # Define step function
@@ -442,8 +449,12 @@ class TestMultimoduleSchedules:
         llm_config = {'tp': 1, 'pp': 1, 'dp': 1, 'grid_offset': 1}
 
         run_multimodule_schedule_test(
-            encoder_configs, llm_config,
-            hidden_size=512, seq_length=64, micro_batch_size=2, num_microbatches=4
+            encoder_configs,
+            llm_config,
+            hidden_size=512,
+            seq_length=64,
+            micro_batch_size=2,
+            num_microbatches=4,
         )
 
     def test_dual_encoder_2gpu(self):
@@ -458,8 +469,12 @@ class TestMultimoduleSchedules:
         llm_config = {'tp': 1, 'pp': 1, 'dp': 1, 'grid_offset': 1}
 
         run_multimodule_schedule_test(
-            encoder_configs, llm_config,
-            hidden_size=512, seq_length=64, micro_batch_size=2, num_microbatches=4
+            encoder_configs,
+            llm_config,
+            hidden_size=512,
+            seq_length=64,
+            micro_batch_size=2,
+            num_microbatches=4,
         )
 
     def test_single_encoder_8gpu(self):
@@ -471,8 +486,12 @@ class TestMultimoduleSchedules:
         llm_config = {'tp': 2, 'pp': 2, 'dp': 1, 'grid_offset': 4}
 
         run_multimodule_schedule_test(
-            encoder_configs, llm_config,
-            hidden_size=1024, seq_length=512, micro_batch_size=4, num_microbatches=16
+            encoder_configs,
+            llm_config,
+            hidden_size=1024,
+            seq_length=512,
+            micro_batch_size=4,
+            num_microbatches=16,
         )
 
     def test_dual_encoder_8gpu(self):
@@ -487,6 +506,10 @@ class TestMultimoduleSchedules:
         llm_config = {'tp': 2, 'pp': 2, 'dp': 1, 'grid_offset': 4}
 
         run_multimodule_schedule_test(
-            encoder_configs, llm_config,
-            hidden_size=1024, seq_length=512, micro_batch_size=4, num_microbatches=16
+            encoder_configs,
+            llm_config,
+            hidden_size=1024,
+            seq_length=512,
+            micro_batch_size=4,
+            num_microbatches=16,
         )
