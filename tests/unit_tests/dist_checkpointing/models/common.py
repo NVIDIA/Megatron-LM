@@ -6,14 +6,12 @@ import torch
 from megatron.core import parallel_state
 from megatron.core.dist_checkpointing import load, load_plain_tensors, save
 from megatron.core.dist_checkpointing.dict_utils import diff
-from megatron.core.dist_checkpointing.serialization import (
-    get_default_load_sharded_strategy,
-    get_default_save_sharded_strategy,
-)
+from megatron.core.dist_checkpointing.serialization import get_default_save_sharded_strategy
 from megatron.core.dist_checkpointing.strategies.fully_parallel import (
     FullyParallelLoadStrategyWrapper,
     FullyParallelSaveStrategyWrapper,
 )
+from megatron.core.dist_checkpointing.strategies.torch import TorchDistLoadShardedStrategy
 from megatron.core.dist_checkpointing.validation import StrictHandling
 from tests.unit_tests.dist_checkpointing import TempNamedDir
 from tests.unit_tests.test_utilities import Utils
@@ -104,7 +102,7 @@ def common_test_parallel_reconfiguration_e2e(
             **dst_model_init_kwargs,
         )
         if use_fpsl:
-            load_strategy = get_default_load_sharded_strategy(ckpt_dir_A)
+            load_strategy = TorchDistLoadShardedStrategy()
             load_strategy = FullyParallelLoadStrategyWrapper(load_strategy)
         else:
             load_strategy = None

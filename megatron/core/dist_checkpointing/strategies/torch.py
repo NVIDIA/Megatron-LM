@@ -426,6 +426,10 @@ class MCoreSavePlanner(DefaultSavePlanner):
     ) -> None:
         # `dedup_replicated_tensors` was deprecated in 2.3; this check avoids warnings
         # during saving.
+        from ...utils import get_torch_version
+
+        if get_torch_version() <= PkgVersion("2.2"):
+            kwargs['dedup_replicated_tensors'] = dedup_replicated_tensors
         super().__init__(*args, **kwargs)
         self.can_run_decentralized_global_plan = can_run_decentralized_global_plan
         if can_run_decentralized_global_plan:
@@ -860,6 +864,11 @@ class TorchDistLoadShardedStrategy(LoadShardedStrategy):
         4. resaves the new metadata and removes the old metadata
         5. removes the relevant files
         """
+        from ...utils import is_torch_min_version
+
+        assert is_torch_min_version(
+            "2.3.0"
+        ), f'torch >= 2.3.0 is required for remove_sharded_tensors'
 
         distckpt_files = [f for f in os.listdir(checkpoint_dir) if f.endswith("distcp")]
         files_to_remove = [f for f in distckpt_files if f.startswith(key_prefix)]
