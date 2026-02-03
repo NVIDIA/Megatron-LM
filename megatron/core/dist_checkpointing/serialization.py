@@ -18,7 +18,6 @@ from megatron.core.msc_utils import MultiStorageClientFeature
 from megatron.core.utils import log_single_rank
 
 from . import ShardedTensor
-from .core import save_config
 from .dict_utils import extract_matching_values, merge
 from .mapping import (
     CheckpointingException,
