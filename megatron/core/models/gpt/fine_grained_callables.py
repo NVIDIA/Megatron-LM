@@ -71,7 +71,7 @@ def should_free_input(name, is_moe, config):
     # The input and output of A2A are not needed anymore after the forward pass,
     # so we can free the input memory after the forward pass.
     free_input_nodes = {
-        "mlp": not enable_hybridep,
+        "mlp": not (enable_hybridep and config.fp8 is None),
         "moe_combine": True,
         # For non-DeepEP and non-HybridEP dispatcher mode, the input is the un-dispatched tokens
         # and probs before dispatch A2A and it's not needed anymore after the forward pass
