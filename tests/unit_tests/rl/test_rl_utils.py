@@ -683,6 +683,8 @@ class TestRLUtils:
         3. Running `get_logprobs` to verify it reuses the same forward graph from training.
         """
 
+        num_layers = 2
+
         world_size, dp, tp, pp = initialize_model_parallel
         self.create_test_args(
             tensor_model_parallel_size=tp,
@@ -695,14 +697,14 @@ class TestRLUtils:
 
         # Create a model with training CUDA graphs enabled
         transformer_config = TransformerConfig(
-            num_layers=2,
+            num_layers=num_layers,
             hidden_size=64,
             num_attention_heads=4,
             use_cpu_initialization=True,
             cuda_graph_impl="local",
             bf16=True,
         )
-        gpt_model = GPTModel(
+        model = GPTModel(
             config=transformer_config,
             transformer_layer_spec=get_gpt_layer_with_transformer_engine_spec(),
             vocab_size=256,
@@ -710,7 +712,7 @@ class TestRLUtils:
         ).cuda()
 
         # Wrap in Float16Module so it accepts fp32_output argument from get_logprobs
-        wrapped_model = Float16Module(transformer_config, gpt_model)
+        wrapped_model = Float16Module(transformer_config, model)
 
         # Create test inputs (batch_size=1 required for thd format with sequence packing)
         batch_size = 1
@@ -776,5 +778,22 @@ class TestRLUtils:
         assert output is not None, "Training forward pass should return valid output"
         assert logprobs is not None, "get_logprobs should return valid output"
 
-        # Cleanup CUDA graph global state
-        delete_cuda_graphs()
+        # breakpoint()
+
+        # Destroy all captured graphs deterministically
+        for l in model.decoder.layers:
+            for runner in getattr(l.cudagraph_manager, "cudagraph_runners", []):
+                # Safely delete both graphs if present
+                if hasattr(runner, "fwd_graph"):
+                    del runner.fwd_graph
+                if hasattr(runner, "bwd_graph"):
+                    del runner.bwd_graph
+
+        # Ensure all pending work is complete and graph destruction runs now
+        torch.cuda.synchronize()
+
+        _CudagraphGlobalRecord.cudagraph_created = False
+        _CudagraphGlobalRecord.cudagraph_record = []
+        CudaGraphManager.global_mempool = None
+        CudaGraphManager.fwd_mempools = None
+        CudaGraphManager.bwd_mempools = None
