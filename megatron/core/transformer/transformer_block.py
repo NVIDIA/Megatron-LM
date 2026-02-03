@@ -606,6 +606,7 @@ class TransformerBlock(GraphableMegatronModule, MegatronModule):
                 if isinstance(kwargs['hidden_states'], WrappedTensor)
                 else kwargs['hidden_states']
             )
+            return super().__call__(*args, **kwargs)[0]
         return super().__call__(*args, **kwargs)
 
     def forward(

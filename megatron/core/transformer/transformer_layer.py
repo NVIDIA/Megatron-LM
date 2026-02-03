@@ -1199,19 +1199,6 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
                 return True
         return False
 
-    def __call__(self, *args, **kwargs):
-        if self._should_call_local_cudagraph(*args, **kwargs):
-            # Inference mode.
-            if kwargs.get('inference_context') is not None:
-                # dynamic_inference_decode_only is not a real argument to forward, it is only used
-                # to differentiate the cuda graph used for decode from the one used for non-decode
-                # inference.
-                kwargs["dynamic_inference_decode_only"] = kwargs[
-                    'inference_context'
-                ].is_decode_only()
-
-        return super().__call__(*args, **kwargs)
-
     def get_layer_norm_weights(self):
         """
         Get the weights of all layernorms (attention and MLP) in the transformer layer.
