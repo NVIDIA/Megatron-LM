@@ -3,7 +3,7 @@
 import logging
 from collections import Counter, defaultdict
 from enum import Enum
-from path import Path
+from pathlib import Path
 from typing import TYPE_CHECKING, List, Optional, Set, Tuple, Union
 
 import numpy as np
