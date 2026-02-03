@@ -388,6 +388,7 @@ class _CudagraphGlobalRecord:
         from megatron.core.pipeline_parallel.fine_grained_activation_offload import (
             FineGrainedActivationOffloadingInterface as off_interface,
         )
+
         off_interface.reset()
 
         progress_bar = enumerate(cls.cudagraph_record)
@@ -779,16 +780,8 @@ class _CudaGraphRunner(torch.nn.Module):
             if self.base_module.config.fine_grained_activation_offloading:
                 # Dedicated stream for this runner's graph replays
                 self.stream = stream
-                self.fwd_completion_event = (
-                    torch.cuda.Event(external=True, interprocess=True)
-                    if stream is not None
-                    else None
-                )
-                self.bwd_completion_event = (
-                    torch.cuda.Event(external=True, interprocess=True)
-                    if stream is not None
-                    else None
-                )
+                self.fwd_completion_event = torch.cuda.Event(external=True, interprocess=True)
+                self.bwd_completion_event = torch.cuda.Event(external=True, interprocess=True)
 
             if self.fp8_enabled:
                 self.fp8_recipe = FP8GlobalStateManager.get_fp8_recipe()

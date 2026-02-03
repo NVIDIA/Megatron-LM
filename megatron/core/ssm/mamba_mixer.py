@@ -24,10 +24,10 @@ from megatron.core.inference.contexts.attention_context.triton.tensor_ops import
     tensor_masked_update,
     tensor_merge,
 )
+from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.core.pipeline_parallel.fine_grained_activation_offload import (
     FineGrainedActivationOffloadingInterface as off_interface,
 )
-from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.tensor_parallel import get_cuda_rng_tracker
 from megatron.core.transformer import TransformerConfig
@@ -410,7 +410,6 @@ class MambaMixer(MegatronModule):
             and "mamba_out_proj" in self.config.offload_modules
         )
 
-
     def forward(
         self,
         hidden_states,
@@ -464,14 +463,11 @@ class MambaMixer(MegatronModule):
             assert ssm_state is None
             y = self._ssm_training(zxBCdt, packed_seq_params)
 
-
         with off_interface(self.offload_out_proj, y, "mamba_out_proj") as y:
             out, out_bias = self.out_proj(y)
 
         if self.offload_out_proj:
-            out = off_interface.group_commit(
-                out, name="mamba_out_proj", forced_released_tensors=[]
-            )
+            out = off_interface.group_commit(out, name="mamba_out_proj", forced_released_tensors=[])
 
         return out, out_bias
 

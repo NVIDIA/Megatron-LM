@@ -1263,7 +1263,7 @@ class FineGrainedActivationOffloadingInterface:
     def __exit__(self, *args: Any):
         """Exit context manager to disable activation offloading hooks."""
         if is_graph_warmup():
-            return self.tensor
+            return
 
         if self.offload:
             PipelineOffloadManager.get_instance().__exit__()
