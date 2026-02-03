@@ -58,6 +58,14 @@ class SFTTokenizer(MegatronLegacyTokenizer):
                 has_bos=False,
                 has_system_role=True,
             )
+        elif prompt_format == "identity":
+            self._prompt_config = PromptConfig(
+                assistant_prefix_len=0,
+                pad_token_id=tokenizer.pad_token_id if tokenizer.pad_token_id is not None else tokenizer.eos_token_id,
+                custom_chat_template=tokenizer.chat_template,
+                has_bos=False,
+                has_system_role=True,
+            )
         else:
             raise NotImplementedError("unknown SFT prompt format", prompt_format)
 
