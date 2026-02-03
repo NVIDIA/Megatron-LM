@@ -922,6 +922,7 @@ class TELayerNormColumnParallelLinear(te.pytorch.LayerNormLinear):
 
     @override
     def extra_repr(self) -> str:
+        """Extra context to add to the module's string representation."""
         return (
             f"in_features={self.in_features}, "
             f"out_features={self.out_features}, "
@@ -1031,6 +1032,7 @@ class TEColumnParallelLinear(TELinear):
 
     @override
     def extra_repr(self) -> str:
+        """Extra context to add to the module's string representation."""
         return (
             f"in_features={self.in_features}, "
             f"out_features={self.out_features}, "
@@ -1134,6 +1136,7 @@ class TERowParallelLinear(TELinear):
 
     @override
     def extra_repr(self) -> str:
+        """Extra context to add to the module's string representation."""
         return (
             f"in_features={self.in_features}, "
             f"out_features={self.out_features}, "
