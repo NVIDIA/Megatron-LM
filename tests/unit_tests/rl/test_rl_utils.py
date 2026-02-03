@@ -25,10 +25,12 @@ from megatron.core.transformer.cuda_graphs import (
     CudaGraphManager,
     _CudagraphGlobalRecord,
     create_cudagraphs,
+    delete_cuda_graphs,
 )
 from megatron.core.transformer.module import Float16Module
 from megatron.rl import rl_utils
 from megatron.rl.agent.api import TokenRollout
+from megatron.rl.sequence_packing_utils import get_default_packed_seq_params
 from megatron.training.arguments import parse_args, validate_args
 from megatron.training.global_vars import destroy_global_vars, set_global_variables
 from tests.unit_tests.test_utilities import Utils
@@ -91,9 +93,12 @@ def initialize_model_parallel(request, monkeypatch):
     monkeypatch.setenv("WANDB_MODE", "disabled")
     monkeypatch.setenv("LOG_TO_WANDB", "false")
 
+    initialize_rng_tracker(use_te_rng_tracker=True, force_reset=True)
+
     tp, pp = request.param
     world_size = Utils.world_size
     Utils.initialize_model_parallel(tensor_model_parallel_size=tp, pipeline_model_parallel_size=pp)
+    model_parallel_cuda_manual_seed(123)
     dp = world_size // (tp * pp)
     yield world_size, dp, tp, pp
     Utils.destroy_model_parallel()
@@ -677,9 +682,7 @@ class TestRLUtils:
         2. Creating the CUDA graphs.
         3. Running `get_logprobs` to verify it reuses the same forward graph from training.
         """
-        from megatron.rl.sequence_packing_utils import get_default_packed_seq_params
 
-        initialize_rng_tracker(use_te_rng_tracker=True, force_reset=True)
         world_size, dp, tp, pp = initialize_model_parallel
         self.create_test_args(
             tensor_model_parallel_size=tp,
@@ -689,7 +692,6 @@ class TestRLUtils:
             bf16=True,
             rl_sequence_packing_max_sequences_per_bin=4,
         )
-        model_parallel_cuda_manual_seed(123)
 
         # Create a model with training CUDA graphs enabled
         transformer_config = TransformerConfig(
@@ -775,6 +777,4 @@ class TestRLUtils:
         assert logprobs is not None, "get_logprobs should return valid output"
 
         # Cleanup CUDA graph global state
-        _CudagraphGlobalRecord.cudagraph_created = False
-        _CudagraphGlobalRecord.cudagraph_record = []
-        CudaGraphManager.global_mempool = None
+        delete_cuda_graphs()
