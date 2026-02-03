@@ -345,8 +345,7 @@ try:
             and num_valid_tokens.dtype == torch.int64
         )
 
-        # Allocate d_hidden in float32 for better numerical stability
-        d_hidden = torch.empty_like(global_hidden, dtype=torch.float32)
+        d_hidden = torch.empty_like(global_hidden)
         d_weight = torch.empty_like(weight)
         assert d_hidden.is_contiguous() and d_weight.is_contiguous()
 
@@ -436,15 +435,14 @@ try:
                 )
                 valid_d_logits = _d_logits[:, :vocab_right_bound]
 
-                _delta_hidden = torch.mm(
-                    valid_d_logits,
-                    weight[split_idx * vocab_per_split : (split_idx + 1) * vocab_per_split, :],
-                    out_dtype=torch.float32,
-                ).view_as(d_hidden)
-                if split_idx == 0:
-                    d_hidden.copy_(_delta_hidden)
-                else:
-                    d_hidden.add_(_delta_hidden)
+                torch.addmm(
+                    input=d_hidden.view(-1, dim),
+                    mat1=valid_d_logits,
+                    mat2=weight[split_idx * vocab_per_split : (split_idx + 1) * vocab_per_split, :],
+                    beta=(split_idx != 0),
+                    alpha=1.0,
+                    out=d_hidden.view(-1, dim),
+                )
                 torch.matmul(
                     valid_d_logits.T,
                     hidden_view,
@@ -467,9 +465,6 @@ try:
                     tp_rank * partial_num_tokens : (tp_rank + 1) * partial_num_tokens, :
                 ]
                 d_hidden = d_hidden.view(partial_hidden_shape).clone()
-
-        # convert d_hidden to the original dtype
-        d_hidden = d_hidden.type_as(global_hidden)
 
         return d_hidden, d_weight
 
