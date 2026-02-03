@@ -10,7 +10,10 @@ import numpy as np
 import torch
 
 from megatron.core.dist_checkpointing import ShardedTensor
-from megatron.core.dist_checkpointing.core import CheckpointingException, maybe_load_config
+from megatron.core.dist_checkpointing.core import (
+    CheckpointingException,
+    check_is_distributed_checkpoint,
+)
 from megatron.core.dist_checkpointing.dict_utils import diff, extract_matching_values, nested_values
 from megatron.core.dist_checkpointing.mapping import (
     CommonStateDict,
@@ -226,32 +229,23 @@ def verify_checkpoint_and_load_strategy(
     if not isdir:
         raise CheckpointingException(f"Checkpoint directory {checkpoint_dir} does not exist")
 
-    saved_config = maybe_load_config(checkpoint_dir)
-    if saved_config is None:
+    if not check_is_distributed_checkpoint(checkpoint_dir):
         raise CheckpointingException(f"{checkpoint_dir} is not a distributed checkpoint")
 
     if sharded_strategy is None:
-        sharded_strategy = get_default_strategy(
-            StrategyAction.LOAD_SHARDED,
-            saved_config.sharded_backend,
-            saved_config.sharded_backend_version,
-        )
+        sharded_strategy = get_default_strategy(StrategyAction.LOAD_SHARDED, 'torch_dist', 1)
     elif isinstance(sharded_strategy, tuple):
         sharded_strategy = get_default_strategy(StrategyAction.LOAD_SHARDED, *sharded_strategy)
 
     if common_strategy is None:
-        common_strategy = get_default_strategy(
-            StrategyAction.LOAD_COMMON,
-            saved_config.common_backend,
-            saved_config.common_backend_version,
-        )
+        common_strategy = get_default_strategy(StrategyAction.LOAD_COMMON, 'torch', 1)
     elif isinstance(common_strategy, tuple):
         sharded_strategy = get_default_strategy(StrategyAction.LOAD_COMMON, *common_strategy)
 
-    sharded_strategy.check_backend_compatibility(saved_config.sharded_backend)
-    sharded_strategy.check_version_compatibility(saved_config.sharded_backend_version)
-    common_strategy.check_backend_compatibility(saved_config.common_backend)
-    common_strategy.check_version_compatibility(saved_config.common_backend_version)
+    sharded_strategy.check_backend_compatibility('torch_dist')
+    sharded_strategy.check_version_compatibility(1)
+    common_strategy.check_backend_compatibility('torch')
+    common_strategy.check_version_compatibility(1)
     return sharded_strategy, common_strategy
 
 
