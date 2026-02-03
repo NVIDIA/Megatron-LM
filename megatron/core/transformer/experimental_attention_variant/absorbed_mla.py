@@ -24,11 +24,6 @@ from megatron.core.models.common.embeddings import (
     _yarn_get_mscale,
     apply_rotary_pos_emb,
 )
-from megatron.core.pipeline_parallel.fine_grained_activation_offload import (
-    fine_grained_offloading_group_commit,
-    fine_grained_offloading_group_start,
-    get_fine_grained_offloading_context,
-)
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.tensor_parallel.layers import ColumnParallelLinear
 from megatron.core.tensor_parallel.mappings import (
@@ -755,27 +750,16 @@ class AbsorbedMLASelfAttention(Attention):
                 packed_seq_params=packed_seq_params,
             )
         else:
-            if self.offload_core_attention and self.training:
-                q_absorbed = fine_grained_offloading_group_start(q_absorbed, name="core_attn")
-
-            with get_fine_grained_offloading_context(self.offload_core_attention):
-                core_attn_out = self.core_attention(
-                    q_absorbed,
-                    kv_compressed,
-                    None,
-                    hidden_states,
-                    q_compressed,
-                    attention_mask,
-                    packed_seq_params=packed_seq_params,
-                    attn_mask_type=self.attn_mask_type,
-                )
-
-            if self.offload_core_attention and self.training:
-                (core_attn_out,) = fine_grained_offloading_group_commit(
-                    core_attn_out,
-                    name="core_attn",
-                    forced_released_tensors=[q_absorbed, kv_compressed, q_compressed],
-                )
+            core_attn_out = self.core_attention(
+                q_absorbed,
+                kv_compressed,
+                None,
+                hidden_states,
+                q_compressed,
+                attention_mask,
+                packed_seq_params=packed_seq_params,
+                attn_mask_type=self.attn_mask_type,
+            )
 
         # ==================================
         # Apply V up projection
@@ -820,14 +804,7 @@ class AbsorbedMLASelfAttention(Attention):
         # =================
         # Output. [sq, b, h]
         # =================
-        if self.offload_attn_proj:
-            core_attn_out = fine_grained_offloading_group_start(core_attn_out, name="attn_proj")
-        with get_fine_grained_offloading_context(self.offload_attn_proj):
-            output, bias = self.linear_proj(core_attn_out)
-        if self.offload_attn_proj:
-            output, bias = fine_grained_offloading_group_commit(
-                output, bias, name="attn_proj", forced_released_tensors=[core_attn_out]
-            )
+        output, bias = self.linear_proj(core_attn_out)
 
         return output, bias
 
