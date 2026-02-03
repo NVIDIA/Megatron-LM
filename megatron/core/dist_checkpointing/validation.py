@@ -1,16 +1,16 @@
 # Copyright (c) 2024, NVIDIA CORPORATION. All rights reserved.
 
 import logging
-import os
 from collections import Counter, defaultdict
 from enum import Enum
+from path import Path
 from typing import TYPE_CHECKING, List, Optional, Set, Tuple, Union
 
 import numpy as np
 import torch
 
 from megatron.core.dist_checkpointing import ShardedTensor
-from megatron.core.dist_checkpointing.core import CheckpointingException, maybe_load_config
+from megatron.core.dist_checkpointing.core import CheckpointingException, check_is_distributed_checkpoint
 from megatron.core.dist_checkpointing.dict_utils import diff, extract_matching_values, nested_values
 from megatron.core.dist_checkpointing.mapping import (
     CommonStateDict,
@@ -19,7 +19,6 @@ from megatron.core.dist_checkpointing.mapping import (
     ShardedStateDict,
     is_main_replica,
 )
-from megatron.core.msc_utils import MultiStorageClientFeature
 
 if TYPE_CHECKING:
     from megatron.core.dist_checkpointing.serialization import CkptShardedMetadata
