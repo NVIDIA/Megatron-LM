@@ -27,6 +27,10 @@ def compile_helpers():
         import sys
 
         log_single_rank(logger, logging.ERROR, "Failed to compile the C++ dataset helper functions")
+        import torch
+        import torch.distributed as dist
+        dist.destroy_process_group()
+
         sys.exit(1)
 
 
