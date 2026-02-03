@@ -192,10 +192,13 @@ class TestBlockHash(PrefixCachingTestBase):
             request_id=1,
             prompt_tokens=torch.arange(prompt_length, device=torch.cuda.current_device()),
             sampling_params=SamplingParams(num_tokens_to_generate=50),
+            block_size_tokens=block_size,
         )
 
         # Add request (prefill)
         dynamic_context.add_request(request)
+        # Mark blocks as computed (simulates prefill completion)
+        dynamic_context.mark_pending_blocks_computed()
 
         # Check: First 2 blocks should have hashes computed (they're complete)
         block_0_id = dynamic_context.request_to_kv_block_ids[0][0].item()
@@ -285,6 +288,8 @@ class TestBlockHash(PrefixCachingTestBase):
 
         # Verify that adding requests and prefix matching works correctly
         dynamic_context.add_request(request_1)
+        # Mark blocks as computed so request_2 can find and share them
+        dynamic_context.mark_pending_blocks_computed()
         dynamic_context.add_request(request_2)
 
         # With prefix caching, request 2 should share the same blocks as request 1
@@ -338,6 +343,8 @@ class TestBlockHash(PrefixCachingTestBase):
         block_size_tokens=block_size,
         )
         dynamic_context.add_request(request)
+        # Mark blocks as computed (simulates prefill completion)
+        dynamic_context.mark_pending_blocks_computed()
 
         # Verify: block 0 has hash (complete block), block 1 is partial (no hash)
         block_0 = dynamic_context.request_to_kv_block_ids[0][0].item()
@@ -1856,6 +1863,7 @@ class TestDisabledMode(PrefixCachingTestBase):
             request_id=1,
             prompt_tokens=prompt.clone(),
             sampling_params=SamplingParams(num_tokens_to_generate=10),
+            block_size_tokens=block_size,
         )
         dynamic_context.add_request(request_1)
 
@@ -1867,6 +1875,7 @@ class TestDisabledMode(PrefixCachingTestBase):
             request_id=2,
             prompt_tokens=prompt.clone(),
             sampling_params=SamplingParams(num_tokens_to_generate=10),
+            block_size_tokens=block_size,
         )
         dynamic_context.add_request(request_2)
 
@@ -1977,7 +1986,7 @@ class TestDisabledMode(PrefixCachingTestBase):
                 request_id=i + 1,
                 prompt_tokens=prompt.clone(),
                 sampling_params=SamplingParams(num_tokens_to_generate=10),
-                block_size_tokens=block_size,
+                block_size_tokens=context_enabled.block_size_tokens,
             )
             context_enabled.add_request(request)
             if i == 0:
@@ -2016,6 +2025,7 @@ class TestDisabledMode(PrefixCachingTestBase):
                 request_id=i + 1,
                 prompt_tokens=prompt.clone(),
                 sampling_params=SamplingParams(num_tokens_to_generate=10),
+                block_size_tokens=block_size,
             )
             context_disabled.add_request(request)
         time_disabled = time.perf_counter() - start_disabled
@@ -2541,8 +2551,11 @@ class TestPrefixCoordination(PrefixCachingTestBase):
         # The block we registered should be in the evictable set if ref_count=0
 
         # Re-add the block to simulate it being cached but evictable
+        # Set up the block to be evictable (ref_count=0, block_hashes!=-1)
+        # Also add pending hash to test cleanup of both pending and computed state
         allocator.release_memory_blocks(torch.tensor([block_id], device='cuda'))
         allocator.block_ref_counts[block_id] = 0
+        allocator.block_hashes[block_id] = test_hash  # Required for eviction eligibility
         allocator._pending_block_hashes[block_id] = test_hash
         allocator.hash_to_block_id[test_hash] = block_id
 
@@ -2974,11 +2987,12 @@ class TestConcurrentRequests(PrefixCachingTestBase):
     @pytest.mark.internal
     @pytest.mark.skipif(TEST_LEVEL < TestLevel.IMPORTANT, reason="Test level not met")
     def test_concurrent_requests_same_prefix(self):
-        """Test multiple requests with same prefix added before any marked computed.
+        """Test multiple requests with same prefix share blocks via two-phase registration.
 
-        When multiple requests arrive simultaneously with the same prefix, each should
-        initially allocate its own blocks (since none are marked computed yet). After
-        marking computed, subsequent requests should be able to share.
+        With two-phase registration, the first request registers block hashes immediately.
+        Subsequent requests with the same prefix find these registered hashes and share
+        the same blocks (incrementing ref counts). They wait for computation to complete
+        before using the cached KV values.
         """
         self._setup_model_parallel_group(1, 1)
         dynamic_context = self._get_dynamic_context(
@@ -3002,6 +3016,7 @@ class TestConcurrentRequests(PrefixCachingTestBase):
             request_id=1,
             prompt_tokens=prompt.clone(),
             sampling_params=SamplingParams(num_tokens_to_generate=10),
+            block_size_tokens=block_size,
         )
         dynamic_context.add_request(request_1)
 
@@ -3009,6 +3024,7 @@ class TestConcurrentRequests(PrefixCachingTestBase):
             request_id=2,
             prompt_tokens=prompt.clone(),
             sampling_params=SamplingParams(num_tokens_to_generate=10),
+            block_size_tokens=block_size,
         )
         dynamic_context.add_request(request_2)
 
@@ -3016,50 +3032,54 @@ class TestConcurrentRequests(PrefixCachingTestBase):
             request_id=3,
             prompt_tokens=prompt.clone(),
             sampling_params=SamplingParams(num_tokens_to_generate=10),
+            block_size_tokens=block_size,
         )
         dynamic_context.add_request(request_3)
 
-        # All 3 should have allocated their own blocks (no sharing yet)
+        # With two-phase registration, all requests should share blocks immediately
+        # (request 2 and 3 find the registered hashes from request 1)
         req1_blocks = dynamic_context.request_to_kv_block_ids[0][:2]
         req2_blocks = dynamic_context.request_to_kv_block_ids[1][:2]
         req3_blocks = dynamic_context.request_to_kv_block_ids[2][:2]
 
-        assert not torch.equal(req1_blocks, req2_blocks), (
-            "Requests 1 and 2 should not share blocks before marking computed"
+        assert torch.equal(req1_blocks, req2_blocks), (
+            "Requests 1 and 2 should share blocks (two-phase registration)"
         )
-        assert not torch.equal(req1_blocks, req3_blocks), (
-            "Requests 1 and 3 should not share blocks before marking computed"
+        assert torch.equal(req1_blocks, req3_blocks), (
+            "Requests 1 and 3 should share blocks (two-phase registration)"
         )
+
+        # Ref counts should reflect 3 requests sharing the same blocks
+        block_allocator = dynamic_context.block_allocator
+        for i in range(2):
+            block_id = req1_blocks[i].item()
+            ref_count = block_allocator.block_ref_counts[block_id].item()
+            assert ref_count == 3, f"Block {i} should have ref_count=3, got {ref_count}"
 
         # Mark all blocks as computed
         dynamic_context.mark_pending_blocks_computed()
 
-        # Now add a 4th request - it SHOULD share with one of the first 3
+        # Add a 4th request - it should also share the same blocks
         request_4 = DynamicInferenceRequest(
             request_id=4,
             prompt_tokens=prompt.clone(),
             sampling_params=SamplingParams(num_tokens_to_generate=10),
+            block_size_tokens=block_size,
         )
         dynamic_context.add_request(request_4)
-
-        req4_blocks = dynamic_context.request_to_kv_block_ids[3][:2]
-
-        # Request 4 should share blocks with at least one of the earlier requests
-        shares_with_req1 = torch.equal(req4_blocks, req1_blocks)
-        shares_with_req2 = torch.equal(req4_blocks, req2_blocks)
-        shares_with_req3 = torch.equal(req4_blocks, req3_blocks)
-
-        assert shares_with_req1 or shares_with_req2 or shares_with_req3, (
-            "Request 4 should share blocks with one of the computed requests"
-        )
 
     @pytest.mark.internal
     @pytest.mark.skipif(TEST_LEVEL < TestLevel.IMPORTANT, reason="Test level not met")
     def test_racing_pending_blocks(self):
-        """Verify two-phase registration prevents race conditions.
+        """Verify two-phase registration enables safe block sharing.
 
-        Request 2 should NOT match blocks from Request 1 that are still pending
-        (not yet marked computed). Only after marking computed should sharing happen.
+        With two-phase registration, subsequent requests find registered hashes
+        and share the same blocks. The coordination happens through:
+        1. hash_to_block_id mapping (for discovery)
+        2. block_hashes tensor (for determining if KV is computed)
+
+        This test verifies that multiple requests can safely share blocks,
+        with ref counts tracking all users.
         """
         self._setup_model_parallel_group(1, 1)
         dynamic_context = self._get_dynamic_context(
@@ -3076,6 +3096,7 @@ class TestConcurrentRequests(PrefixCachingTestBase):
         )
 
         block_size = dynamic_context.block_size_tokens
+        block_allocator = dynamic_context.block_allocator
         prompt = torch.arange(block_size * 2, device=torch.cuda.current_device())
 
         # Request 1: add and register hashes (pending state)
@@ -3083,46 +3104,63 @@ class TestConcurrentRequests(PrefixCachingTestBase):
             request_id=1,
             prompt_tokens=prompt.clone(),
             sampling_params=SamplingParams(num_tokens_to_generate=10),
+            block_size_tokens=block_size,
         )
         dynamic_context.add_request(request_1)
-        # Do NOT mark as computed yet
+        # Do NOT mark as computed yet - blocks are in pending state
 
-        # Request 2: add with same prefix (should NOT match pending blocks)
+        # Request 2: add with same prefix - finds registered hashes and shares blocks
         request_2 = DynamicInferenceRequest(
             request_id=2,
             prompt_tokens=prompt.clone(),
             sampling_params=SamplingParams(num_tokens_to_generate=10),
+            block_size_tokens=block_size,
         )
         dynamic_context.add_request(request_2)
 
-        # Verify: Request 2 should NOT share blocks (they're still pending)
+        # Verify: Request 2 DOES share blocks (via registered hashes)
         req1_blocks = dynamic_context.request_to_kv_block_ids[0][:2]
         req2_blocks = dynamic_context.request_to_kv_block_ids[1][:2]
 
-        assert not torch.equal(req1_blocks, req2_blocks), (
-            "Request 2 should NOT share pending blocks from Request 1. "
-            "Two-phase registration should prevent sharing until blocks are marked computed."
+        assert torch.equal(req1_blocks, req2_blocks), (
+            "Request 2 should share blocks with Request 1 via two-phase registration"
         )
 
-        # Now mark Request 1's blocks as computed
+        # Verify ref counts reflect both requests
+        for i in range(2):
+            block_id = req1_blocks[i].item()
+            ref_count = block_allocator.block_ref_counts[block_id].item()
+            assert ref_count == 2, f"Block {i} should have ref_count=2, got {ref_count}"
+
+        # Verify blocks are still pending (not computed)
+        for i in range(2):
+            block_id = req1_blocks[i].item()
+            assert block_allocator.get_block_hash(block_id) == -1, (
+                f"Block {i} should be pending (hash=-1)"
+            )
+
+        # Now mark blocks as computed
         dynamic_context.mark_pending_blocks_computed()
 
-        # Request 3: add with same prefix (SHOULD match now)
+        # Verify blocks are now computed
+        for i in range(2):
+            block_id = req1_blocks[i].item()
+            assert block_allocator.get_block_hash(block_id) != -1, (
+                f"Block {i} should be computed (hash!=-1)"
+            )
+
+        # Request 3: add with same prefix - also shares blocks
         request_3 = DynamicInferenceRequest(
             request_id=3,
             prompt_tokens=prompt.clone(),
             sampling_params=SamplingParams(num_tokens_to_generate=10),
+            block_size_tokens=block_size,
         )
         dynamic_context.add_request(request_3)
 
         req3_blocks = dynamic_context.request_to_kv_block_ids[2][:2]
-
-        # Request 3 should share with Request 1 or Request 2
-        shares_with_req1 = torch.equal(req3_blocks, req1_blocks)
-        shares_with_req2 = torch.equal(req3_blocks, req2_blocks)
-
-        assert shares_with_req1 or shares_with_req2, (
-            "Request 3 should share blocks now that they're marked computed"
+        assert torch.equal(req3_blocks, req1_blocks), (
+            "Request 3 should share blocks with Request 1"
         )
 
 
@@ -3156,6 +3194,7 @@ class TestComplexPrefixPatterns(PrefixCachingTestBase):
             request_id=1,
             prompt_tokens=prompt.clone(),
             sampling_params=SamplingParams(num_tokens_to_generate=10),
+            block_size_tokens=block_size,
         )
         dynamic_context.add_request(request_1)
         dynamic_context.mark_pending_blocks_computed()
@@ -3171,6 +3210,7 @@ class TestComplexPrefixPatterns(PrefixCachingTestBase):
             request_id=2,
             prompt_tokens=prompt.clone(),
             sampling_params=SamplingParams(num_tokens_to_generate=10),
+            block_size_tokens=block_size,
         )
         dynamic_context.add_request(request_2)
 
@@ -3183,6 +3223,7 @@ class TestComplexPrefixPatterns(PrefixCachingTestBase):
             request_id=3,
             prompt_tokens=prompt.clone(),
             sampling_params=SamplingParams(num_tokens_to_generate=10),
+            block_size_tokens=block_size,
         )
         dynamic_context.add_request(request_3)
 
@@ -3312,6 +3353,7 @@ class TestComplexPrefixPatterns(PrefixCachingTestBase):
                 request_id=i + 1,
                 prompt_tokens=prefix_x.clone(),
                 sampling_params=SamplingParams(num_tokens_to_generate=10),
+                block_size_tokens=block_size,
             )
             dynamic_context.add_request(request)
             if i == 0:
@@ -3323,6 +3365,7 @@ class TestComplexPrefixPatterns(PrefixCachingTestBase):
                 request_id=i + 10,
                 prompt_tokens=prefix_y.clone(),
                 sampling_params=SamplingParams(num_tokens_to_generate=10),
+                block_size_tokens=block_size,
             )
             dynamic_context.add_request(request)
             if i == 0:
@@ -3505,15 +3548,16 @@ class TestRequestLifecycle(PrefixCachingTestBase):
             request_id=1,
             prompt_tokens=prompt,
             sampling_params=SamplingParams(num_tokens_to_generate=10),
-        block_size_tokens=block_size,
+            block_size_tokens=block_size,
         )
         dynamic_context.add_request(request_1)
         dynamic_context.mark_pending_blocks_computed()
 
-        block_ids = dynamic_context.request_to_kv_block_ids[0][:2]
+        # Clone to preserve block IDs after release (release sets the tensor to -1)
+        block_ids = dynamic_context.request_to_kv_block_ids[0][:2].clone()
 
         # Release request 1
-        dynamic_context.release_kv_blocks(0)  # Release first request
+        dynamic_context.release_memory_blocks_from_request_indexes(torch.tensor([0]))  # Release first request
 
         # Verify blocks have ref_count = 0 (cached, evictable)
         for block_id in block_ids:
@@ -3534,7 +3578,7 @@ class TestRequestLifecycle(PrefixCachingTestBase):
             request_id=2,
             prompt_tokens=prompt,
             sampling_params=SamplingParams(num_tokens_to_generate=10),
-        block_size_tokens=block_size,
+            block_size_tokens=block_size,
         )
         dynamic_context.add_request(request_2)
 
@@ -3633,10 +3677,11 @@ class TestAdditionalEdgeCases(PrefixCachingTestBase):
             request_id=1,
             prompt_tokens=empty_prompt,
             sampling_params=SamplingParams(num_tokens_to_generate=10),
-        block_size_tokens=block_size,
+            block_size_tokens=dynamic_context.block_size_tokens,
         )
 
         # Should handle gracefully (no blocks allocated, no hashes)
+        assert request.precomputed_block_hashes is not None, "Should have precomputed_block_hashes list"
         assert len(request.precomputed_block_hashes) == 0, "Empty prompt should have no hashes"
 
         try:
@@ -3671,7 +3716,7 @@ class TestAdditionalEdgeCases(PrefixCachingTestBase):
             request_id=1,
             prompt_tokens=single_token,
             sampling_params=SamplingParams(num_tokens_to_generate=10),
-        block_size_tokens=block_size,
+            block_size_tokens=dynamic_context.block_size_tokens,
         )
 
         # No complete blocks, so no precomputed hashes
@@ -3691,7 +3736,7 @@ class TestAdditionalEdgeCases(PrefixCachingTestBase):
             kv_channels=8,
             num_attention_heads=2,
             max_sequence_length=8192,
-            buffer_size_gb=0.5,  # Larger buffer for long prompt
+            buffer_size_gb=0.1,  # Buffer for 120-block test
             block_size_tokens=32,
             max_tokens=None,
             is_hybrid_model=False,
@@ -3863,6 +3908,7 @@ class TestObservability(PrefixCachingTestBase):
                 request_id=i,
                 prompt_tokens=prompt.clone(),
                 sampling_params=SamplingParams(num_tokens_to_generate=10),
+                block_size_tokens=block_size,
             )
             dynamic_context.add_request(request)
 
