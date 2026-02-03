@@ -753,8 +753,14 @@ def pretrain(
             to it. It is used for programs to add their own arguments.
         args_defaults: a dictionary from argument-name to argument-value. It
             to set already parse arguments.
-        get_embedding_ranks (TODO):
-        get_position_embedding_ranks (TODO):
+        get_embedding_ranks: a function that takes a list of ranks for a pipeline
+            group and returns those ranks that should have word embeddings.
+            For most models, these are the first and last pipeline stages.
+            If None, defaults to returning the first and last pipeline stages.
+        get_position_embedding_ranks: a function that takes a list of ranks for
+            a pipeline group and returns those ranks that should have position
+            embeddings. For most models, this is only the first pipeline stage.
+            If None, defaults to returning only the first pipeline stage.
         non_loss_data_func (callable): A custom function to call during evaluation.
             It can run e.g. benchmarks.
         store: an optional instance of torch.distributed.Store, to be used by
