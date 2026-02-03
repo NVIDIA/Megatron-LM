@@ -74,6 +74,7 @@ class DataParallelInferenceCoordinator:
         data_parallel_size: int,
         tokenizer,
         inference_coordinator_port: int | None = None,
+        deterministic_mode: bool = False,
     ):
         """
         Initializes the inference coordinator.
@@ -145,6 +146,12 @@ class DataParallelInferenceCoordinator:
             assert identity not in self.identities_of_data_parallel_ranks
             self.identities_of_data_parallel_ranks.append(identity)
         logging.info("Inference Coordinator: Connected with data parallel ranks...")
+
+        # In deterministic mode, sort identities for consistent scheduling order.
+        if deterministic_mode:
+            self.identities_of_data_parallel_ranks = deque(
+                sorted(self.identities_of_data_parallel_ranks)
+            )
         self.data_parallel_rank_iterator = cycle(self.identities_of_data_parallel_ranks)
         self.data_parallel_pause_acks = set()
         self.data_parallel_stop_acks = set()
@@ -343,6 +350,7 @@ class DataParallelInferenceCoordinator:
         data_parallel_size: int,
         tokenizer,
         inference_coordinator_port: int | None = None,
+        deterministic_mode: bool = False,
     ):
         """
         Class method to instantiate and run the coordinator, for use in a separate process.
@@ -356,9 +364,14 @@ class DataParallelInferenceCoordinator:
                 once the coordinator is ready to accept connections.
             inference_coordinator_port (int): The port to bind to.
             data_parallel_size (int): The number of expected TP-coordinators.
+            deterministic_mode (bool): Whether to enable deterministic scheduling.
         """
         coordinator = cls(
-            pipe_connection, data_parallel_size, tokenizer, inference_coordinator_port
+            pipe_connection,
+            data_parallel_size,
+            tokenizer,
+            inference_coordinator_port,
+            deterministic_mode=deterministic_mode,
         )
         ready_event.set()
         try:
