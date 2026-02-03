@@ -2709,6 +2709,125 @@ class TestPrefixCoordination(PrefixCachingTestBase):
         assert allocator.block_ref_counts[block_0].item() == 2
         assert allocator.block_ref_counts[block_1].item() == 2
 
+    @pytest.mark.internal
+    @pytest.mark.skipif(TEST_LEVEL < TestLevel.IMPORTANT, reason="Test level not met")
+    def test_requests_wait_for_pending_blocks_then_share(self):
+        """
+        Simulate the engine scheduling flow where requests with pending
+        prefix blocks wait, then proceed to share computed blocks.
+
+        This tests the coordination scenario where:
+        1. Request A, B, C are added with the same prefix
+        2. Engine schedules ONLY request A for forward pass (B, C must wait)
+        3. Forward pass runs on A -> mark_pending_blocks_computed()
+        4. B and C are now unblocked and can be scheduled
+        5. B and C run forward pass sharing A's computed blocks
+        """
+        self._setup_model_parallel_group(1, 1)
+        dynamic_context = self._get_dynamic_context(
+            params_dtype=torch.float32,
+            num_layers=4,
+            kv_channels=8,
+            num_attention_heads=2,
+            max_sequence_length=512,
+            buffer_size_gb=0.1,
+            block_size_tokens=32,
+            max_tokens=None,
+            is_hybrid_model=False,
+            rounder=64,
+        )
+
+        allocator = dynamic_context.block_allocator
+        block_size = dynamic_context.block_size_tokens
+        prompt = torch.arange(block_size * 2, device=torch.cuda.current_device())
+
+        # Phase 1: Add request A (first request gets scheduled)
+        req_a = DynamicInferenceRequest(
+            request_id=1,
+            prompt_tokens=prompt.clone(),
+            sampling_params=SamplingParams(num_tokens_to_generate=10),
+            block_size_tokens=block_size,
+            enable_prefix_caching=True,
+        )
+        dynamic_context.add_request(req_a)
+
+        # Get request A's blocks and precomputed hashes
+        req_a_block_0 = dynamic_context.request_to_kv_block_ids[0][0].item()
+        req_a_block_1 = dynamic_context.request_to_kv_block_ids[0][1].item()
+
+        # Verify blocks are in pending state (registered but not computed)
+        assert allocator.get_block_hash(req_a_block_0) == -1, "Block 0 should be pending"
+        assert allocator.get_block_hash(req_a_block_1) == -1, "Block 1 should be pending"
+
+        # Precompute hashes for requests B and C (simulating what would happen
+        # when they're added to the engine but before add_request is called)
+        req_b = DynamicInferenceRequest(
+            request_id=2,
+            prompt_tokens=prompt.clone(),
+            sampling_params=SamplingParams(num_tokens_to_generate=10),
+            block_size_tokens=block_size,
+            enable_prefix_caching=True,
+        )
+        req_c = DynamicInferenceRequest(
+            request_id=3,
+            prompt_tokens=prompt.clone(),
+            sampling_params=SamplingParams(num_tokens_to_generate=10),
+            block_size_tokens=block_size,
+            enable_prefix_caching=True,
+        )
+
+        # Phase 2: Simulate engine checking B and C - they should detect pending blocks
+        # This simulates the engine's _has_pending_prefix_blocks check
+        def has_pending_prefix_blocks(req):
+            """Simulate engine's _has_pending_prefix_blocks check."""
+            for block_hash in req.precomputed_block_hashes:
+                block_id = allocator.lookup_block_by_hash(block_hash)
+                if block_id is not None and allocator.get_block_hash(block_id) == -1:
+                    return True  # Block exists but not computed - WAIT
+            return False
+
+        assert has_pending_prefix_blocks(req_b), "B should wait for A's pending blocks"
+        assert has_pending_prefix_blocks(req_c), "C should wait for A's pending blocks"
+
+        # Phase 3: Simulate forward pass completing on A
+        dynamic_context.mark_pending_blocks_computed()
+
+        # Verify blocks are now computed
+        assert allocator.get_block_hash(req_a_block_0) != -1, "Block 0 should be computed"
+        assert allocator.get_block_hash(req_a_block_1) != -1, "Block 1 should be computed"
+
+        # Phase 4: B and C should no longer see pending blocks
+        assert not has_pending_prefix_blocks(req_b), "B can now proceed"
+        assert not has_pending_prefix_blocks(req_c), "C can now proceed"
+
+        # Phase 5: Add B and C - they should share A's computed blocks
+        dynamic_context.add_request(req_b)
+        dynamic_context.add_request(req_c)
+
+        # Verify all three share the same blocks
+        a_blocks = [
+            dynamic_context.request_to_kv_block_ids[0][i].item() for i in range(2)
+        ]
+        b_blocks = [
+            dynamic_context.request_to_kv_block_ids[1][i].item() for i in range(2)
+        ]
+        c_blocks = [
+            dynamic_context.request_to_kv_block_ids[2][i].item() for i in range(2)
+        ]
+
+        assert a_blocks == b_blocks == c_blocks, (
+            f"All requests should share same blocks. "
+            f"A: {a_blocks}, B: {b_blocks}, C: {c_blocks}"
+        )
+
+        # Verify ref counts are 3 (one for each request)
+        assert allocator.block_ref_counts[a_blocks[0]].item() == 3, (
+            f"Block 0 ref count should be 3, got {allocator.block_ref_counts[a_blocks[0]].item()}"
+        )
+        assert allocator.block_ref_counts[a_blocks[1]].item() == 3, (
+            f"Block 1 ref count should be 3, got {allocator.block_ref_counts[a_blocks[1]].item()}"
+        )
+
 
 class TestConcurrentRequests(PrefixCachingTestBase):
     """Tests for concurrent request handling with prefix caching."""
