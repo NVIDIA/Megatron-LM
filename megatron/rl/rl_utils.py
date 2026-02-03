@@ -1003,7 +1003,7 @@ def logprobs_forward_step(data_iterator, model, is_correction, packing_context=N
             b_trajs.cuda(),
             b_posids.cuda(),
             no_grad=True,
-            sequence_packing=b_packed_seq_params is not None, 
+            sequence_packing=packing_context is not None,
             packed_seq_params=b_packed_seq_params,
         ),
         None,
