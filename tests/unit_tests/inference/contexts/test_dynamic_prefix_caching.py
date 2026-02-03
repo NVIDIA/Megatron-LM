@@ -48,7 +48,8 @@ def set_rounder(value):
     DynamicInferenceContext.REQUEST_ROUNDER = value
 
 
-class TestDynamicPrefixCaching:
+class PrefixCachingTestBase:
+    """Base class with shared setup/teardown and helper methods for prefix caching tests."""
 
     def _setup_model_parallel_group(self, tensor_parallel_size, pipeline_parallel_size):
 
@@ -114,9 +115,9 @@ class TestDynamicPrefixCaching:
     def teardown_method(self, method):
         Utils.destroy_model_parallel()
 
-    # =========================================================================
-    # Block hash tests
-    # =========================================================================
+
+class TestBlockHash(PrefixCachingTestBase):
+    """Tests for block hash computation."""
 
     @pytest.mark.internal
     @pytest.mark.skipif(TEST_LEVEL < TestLevel.CRITICAL, reason="Test level not met")
@@ -390,9 +391,9 @@ class TestDynamicPrefixCaching:
             "Block 1 should STILL not have hash (only 15 tokens, need 32)"
         )
 
-    # =========================================================================
-    # Prefix caching tests
-    # =========================================================================
+
+class TestPrefixCaching(PrefixCachingTestBase):
+    """Tests for basic prefix caching and block sharing."""
 
     @pytest.mark.internal
     @pytest.mark.skipif(TEST_LEVEL < TestLevel.CRITICAL, reason="Test level not met")
@@ -882,9 +883,9 @@ class TestDynamicPrefixCaching:
             "Same tokens with different parent should produce different hash"
         )
 
-    # =========================================================================
-    # Memory usage tests
-    # =========================================================================
+
+class TestMemoryUsage(PrefixCachingTestBase):
+    """Tests for memory accounting with prefix caching."""
 
     @pytest.mark.internal
     @pytest.mark.skipif(TEST_LEVEL < TestLevel.IMPORTANT, reason="Test level not met")
@@ -990,9 +991,9 @@ class TestDynamicPrefixCaching:
             f"Actually used {total_blocks_used}"
         )
 
-    # =========================================================================
-    # TTFT tests
-    # =========================================================================
+
+class TestTTFT(PrefixCachingTestBase):
+    """Tests for time-to-first-token optimization with prefix caching."""
 
     @pytest.mark.internal
     @pytest.mark.skipif(TEST_LEVEL < TestLevel.IMPORTANT, reason="Test level not met")
@@ -1563,9 +1564,9 @@ class TestDynamicPrefixCaching:
             "Block 1 tokens corrupted!"
         )
 
-    # =========================================================================
-    # Edge case tests
-    # =========================================================================
+
+class TestEdgeCases(PrefixCachingTestBase):
+    """Tests for edge case handling in prefix caching."""
 
     @pytest.mark.internal
     @pytest.mark.skipif(TEST_LEVEL < TestLevel.MEDIUM, reason="Test level not met")
@@ -1675,9 +1676,9 @@ class TestDynamicPrefixCaching:
             "Partial block should NOT be shared (no hash for matching)"
         )
 
-    # =========================================================================
-    # Disabled mode tests
-    # =========================================================================
+
+class TestDisabledMode(PrefixCachingTestBase):
+    """Tests for prefix caching when disabled."""
 
     @pytest.mark.internal
     @pytest.mark.skipif(TEST_LEVEL < TestLevel.MEDIUM, reason="Test level not met")
@@ -1906,9 +1907,9 @@ class TestDynamicPrefixCaching:
         print(f"  Disabled: {len(blocks_disabled)} blocks, {time_disabled*1000:.3f}ms")
         print(f"  Memory ratio: {memory_ratio:.2f} (lower is better)")
 
-    # =========================================================================
-    # Prefix coordination tests
-    # =========================================================================
+
+class TestPrefixCoordination(PrefixCachingTestBase):
+    """Tests for multi-rank prefix caching coordination."""
 
     @pytest.mark.internal
     @pytest.mark.skipif(TEST_LEVEL < TestLevel.IMPORTANT, reason="Test level not met")
@@ -2694,9 +2695,9 @@ class TestDynamicPrefixCaching:
         assert allocator.block_ref_counts[block_0].item() == 2
         assert allocator.block_ref_counts[block_1].item() == 2
 
-    # =========================================================================
-    # Concurrent request handling tests (IMPORTANT)
-    # =========================================================================
+
+class TestConcurrentRequests(PrefixCachingTestBase):
+    """Tests for concurrent request handling with prefix caching."""
 
     @pytest.mark.internal
     @pytest.mark.skipif(TEST_LEVEL < TestLevel.IMPORTANT, reason="Test level not met")
@@ -2852,9 +2853,9 @@ class TestDynamicPrefixCaching:
             "Request 3 should share blocks now that they're marked computed"
         )
 
-    # =========================================================================
-    # Complex prefix pattern tests (IMPORTANT)
-    # =========================================================================
+
+class TestComplexPrefixPatterns(PrefixCachingTestBase):
+    """Tests for complex prefix sharing patterns."""
 
     @pytest.mark.internal
     @pytest.mark.skipif(TEST_LEVEL < TestLevel.IMPORTANT, reason="Test level not met")
@@ -3069,9 +3070,9 @@ class TestDynamicPrefixCaching:
             "Tree 1 and Tree 2 should use different blocks"
         )
 
-    # =========================================================================
-    # Memory pressure and eviction tests (IMPORTANT)
-    # =========================================================================
+
+class TestMemoryPressure(PrefixCachingTestBase):
+    """Tests for memory pressure and eviction with prefix caching."""
 
     @pytest.mark.internal
     @pytest.mark.skipif(TEST_LEVEL < TestLevel.IMPORTANT, reason="Test level not met")
@@ -3194,9 +3195,9 @@ class TestDynamicPrefixCaching:
             # If it fails, that's also acceptable behavior for a full cache
             pass
 
-    # =========================================================================
-    # Request lifecycle tests (MEDIUM)
-    # =========================================================================
+
+class TestRequestLifecycle(PrefixCachingTestBase):
+    """Tests for request lifecycle with prefix caching."""
 
     @pytest.mark.internal
     @pytest.mark.skipif(TEST_LEVEL < TestLevel.MEDIUM, reason="Test level not met")
@@ -3321,9 +3322,8 @@ class TestDynamicPrefixCaching:
             "First chunk should share blocks"
         )
 
-    # =========================================================================
-    # Additional edge case tests (MEDIUM)
-    # =========================================================================
+class TestAdditionalEdgeCases(PrefixCachingTestBase):
+    """Tests for additional edge cases in prefix caching."""
 
     @pytest.mark.internal
     @pytest.mark.skipif(TEST_LEVEL < TestLevel.MEDIUM, reason="Test level not met")
@@ -3483,9 +3483,8 @@ class TestDynamicPrefixCaching:
             f"Got {len(unique_hashes)} unique hashes for 4 blocks"
         )
 
-    # =========================================================================
-    # Observability tests (LOW)
-    # =========================================================================
+class TestObservability(PrefixCachingTestBase):
+    """Tests for observability features like metrics and debugging."""
 
     @pytest.mark.internal
     @pytest.mark.skipif(TEST_LEVEL < TestLevel.LOW, reason="Test level not met")
