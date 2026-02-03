@@ -368,6 +368,9 @@ def bwd_fused_indexer_loss_naive(
     key_reshaped = key.permute(1, 2, 3, 0).reshape(b * np, hn, sk)
     # Compute attention scores [b * np, sq, sk]
     attention_scores = torch.bmm(query_reshaped.float(), key_reshaped.float()) * softmax_scale
+    # Free reshaped tensors - no longer needed after bmm
+    del query_reshaped, key_reshaped
+
     # Reshape to [b, np, sq, sk]
     attention_scores = attention_scores.reshape(b, np, sq, sk)
 
@@ -386,6 +389,8 @@ def bwd_fused_indexer_loss_naive(
     attention_scores = attention_scores + causal_mask.view(1, 1, sq, sk)
     # [b, sq, sk] + [1, sq, sk] -> [b, sq, sk]
     index_scores = index_scores + causal_mask.unsqueeze(0)
+    # Free causal_mask - no longer needed
+    del causal_mask
 
     if sparse_loss:
         # [b, np, sq, sk] + [b, 1, sq, sk] -> [b, np, sq, sk]
@@ -397,10 +402,17 @@ def bwd_fused_indexer_loss_naive(
     attention_scores_softmax = torch.nn.functional.softmax(
         attention_scores, dim=-1, dtype=torch.float32
     )
+    # Free attention_scores immediately
+    del attention_scores
+
     index_scores_softmax = torch.nn.functional.softmax(index_scores, dim=-1, dtype=torch.float32)
+    # Free index_scores - no longer needed after softmax
+    del index_scores
 
     # Sum attention scores across heads: [b, np, sq, sk] -> [b, sq, sk]
     attention_scores_sum = attention_scores_softmax.sum(dim=1)
+    # Free attention_scores_softmax
+    del attention_scores_softmax
 
     if pg_collection.tp.size() > 1:
         # attention scores are scattered to TP ranks in head dimension.
@@ -410,6 +422,8 @@ def bwd_fused_indexer_loss_naive(
     attention_scores_normalized = attention_scores_sum / attention_scores_sum.sum(
         dim=-1, keepdim=True
     )
+    # Free attention_scores_sum - no longer needed after normalization
+    del attention_scores_sum
 
     # Backward through loss = kl_div * loss_coeff
     # where kl_div = kl_per_element.sum(dim=-1).mean()
@@ -427,35 +441,49 @@ def bwd_fused_indexer_loss_naive(
     grad_index_scores_softmax = (
         -attention_scores_normalized / (index_scores_softmax + 1e-10) * grad_kl_per_element
     )
+    # Free attention_scores_normalized - no longer needed
+    del attention_scores_normalized
 
     # Backward through softmax: ∂L/∂x = softmax * (∂L/∂softmax - sum(∂L/∂softmax * softmax))
     sum_grad = (grad_index_scores_softmax * index_scores_softmax).sum(dim=-1, keepdim=True)
     grad_index_scores_logits = index_scores_softmax * (grad_index_scores_softmax - sum_grad)
+    # Free intermediate tensors
+    del index_scores_softmax, grad_index_scores_softmax, sum_grad
 
     # Zero out gradients for masked positions
     # Create a mask for valid (non-masked) positions
     # Causal mask: position (i, j) is valid if j <= i
     causal_valid_mask = torch.tril(
-        torch.ones((sq, sk), device=index_scores.device, dtype=torch.bool)
+        torch.ones((sq, sk), device=q.device, dtype=torch.bool)
     )  # [sq, sk]
     if sparse_loss:
         # Also apply index mask - only topk positions are valid
         index_valid_mask = index_mask == 0  # [b, sq, sk]
+        del index_mask  # Free index_mask immediately after use
         valid_mask = causal_valid_mask.unsqueeze(0) & index_valid_mask  # [b, sq, sk]
+        del index_valid_mask
     else:
+        del index_mask  # Free index_mask even if not used for sparse_loss
         valid_mask = causal_valid_mask.unsqueeze(0).expand(b, sq, sk)  # [b, sq, sk]
+    del causal_valid_mask
 
     grad_index_scores_logits = grad_index_scores_logits * valid_mask.float()
+    del valid_mask
 
     # Transpose from [b, sq, sk] to [sq, b, sk]
     grad_index_scores = grad_index_scores_logits.transpose(0, 1)  # [sq, b, sk]
+    del grad_index_scores_logits
 
     # Backward through sum over heads: expand gradient
     grad_weighted_scores = grad_index_scores.unsqueeze(2)  # [sq, b, 1, sk]
+    del grad_index_scores
 
     # Compute forward values needed for backward
     scores = torch.einsum('sbhd,tbd->sbht', q.float(), k.float())  # [sq, b, h, sk]
+    # Compute relu_mask before relu (saves memory vs keeping both scores and relu output)
+    relu_mask = scores > 0
     scores_after_relu = torch.relu(scores)
+    del scores
 
     # Backward through multiplication by weights: index_scores_per_head * weights
     # ∂L/∂weights = grad * relu_scores (sum over sk)
@@ -463,16 +491,18 @@ def bwd_fused_indexer_loss_naive(
 
     # ∂L/∂relu_scores = grad * weights
     grad_scores_after_relu = grad_weighted_scores * weights.unsqueeze(-1)  # [sq, b, h, sk]
+    del grad_weighted_scores, scores_after_relu
 
     # Backward through ReLU
-    relu_mask = (scores > 0).float()
-    grad_scores = grad_scores_after_relu * relu_mask  # [sq, b, h, sk]
+    grad_scores = grad_scores_after_relu * relu_mask.float()  # [sq, b, h, sk]
+    del grad_scores_after_relu, relu_mask
 
     # Backward through einsum 'sbhd,tbd->sbht'
     # ∂L/∂q = einsum('sbht,tbd->sbhd', grad_scores, k)
     grad_q = torch.einsum('sbht,tbd->sbhd', grad_scores, k.float())  # [sq, b, h, d]
     # ∂L/∂k = einsum('sbht,sbhd->tbd', grad_scores, q)
     grad_k = torch.einsum('sbht,sbhd->tbd', grad_scores, q.float())  # [sk, b, d]
+    del grad_scores
 
     return grad_q.to(q.dtype), grad_weights.to(weights.dtype), grad_k.to(k.dtype)
 
