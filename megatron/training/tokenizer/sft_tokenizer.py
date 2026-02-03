@@ -63,7 +63,7 @@ class SFTTokenizer(MegatronLegacyTokenizer):
                 assistant_prefix_len=0,
                 pad_token_id=tokenizer.pad_token_id if tokenizer.pad_token_id is not None else tokenizer.eos_token_id,
                 custom_chat_template=tokenizer.chat_template,
-                has_bos=False,
+                has_bos=tokenizer.bos_token_id is not None,
                 has_system_role=True,
             )
         else:
