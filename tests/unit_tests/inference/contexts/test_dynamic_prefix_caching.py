@@ -166,7 +166,7 @@ class TestBlockHash(PrefixCachingTestBase):
         assert (block_allocator.block_hashes == -1).all(), "Block hashes should initialize to -1"
 
     @pytest.mark.internal
-    @pytest.mark.skipif(TEST_LEVEL < TestLevel.CRITICAL, reason="Test level not met")
+    @pytest.mark.skipif(TEST_LEVEL < TestLevel.IMPORTANT, reason="Test level not met")
     def test_block_hash_prefill_decode_release(self):
         """Integration test for hash computation during prefill, decode, and release."""
         self._setup_model_parallel_group(1, 1)
@@ -306,7 +306,7 @@ class TestBlockHash(PrefixCachingTestBase):
         )
 
     @pytest.mark.internal
-    @pytest.mark.skipif(TEST_LEVEL < TestLevel.CRITICAL, reason="Test level not met")
+    @pytest.mark.skipif(TEST_LEVEL < TestLevel.IMPORTANT, reason="Test level not met")
     def test_block_hash_computed_when_filled_during_decode(self):
         """Test hash behavior for partial blocks during decode.
 
@@ -369,7 +369,7 @@ class TestBlockHash(PrefixCachingTestBase):
         )
 
     @pytest.mark.internal
-    @pytest.mark.skipif(TEST_LEVEL < TestLevel.CRITICAL, reason="Test level not met")
+    @pytest.mark.skipif(TEST_LEVEL < TestLevel.IMPORTANT, reason="Test level not met")
     def test_block_hash_not_computed_for_partial_during_decode(self):
         """Test that hash is NOT computed for partial blocks during decode."""
         self._setup_model_parallel_group(1, 1)
@@ -1949,7 +1949,7 @@ class TestDisabledMode(PrefixCachingTestBase):
             )
 
     @pytest.mark.internal
-    @pytest.mark.skipif(TEST_LEVEL < TestLevel.IMPORTANT, reason="Test level not met")
+    @pytest.mark.skipif(TEST_LEVEL < TestLevel.MEDIUM, reason="Test level not met")
     def test_performance_comparison(self):
         """Test that prefix caching enabled uses fewer blocks and is faster."""
         import time
@@ -2197,7 +2197,7 @@ class TestPrefixCoordination(PrefixCachingTestBase):
         assert len(dynamic_context._blocks_pending_computation) == 0
 
     @pytest.mark.internal
-    @pytest.mark.skipif(TEST_LEVEL < TestLevel.IMPORTANT, reason="Test level not met")
+    @pytest.mark.skipif(TEST_LEVEL < TestLevel.CRITICAL, reason="Test level not met")
     def test_precomputed_hashes_correctness(self):
         """Verify precomputed hashes match hashes computed by the allocator."""
         self._setup_model_parallel_group(1, 1)
@@ -2246,7 +2246,7 @@ class TestPrefixCoordination(PrefixCachingTestBase):
             parent_hash = expected_hash
 
     @pytest.mark.internal
-    @pytest.mark.skipif(TEST_LEVEL < TestLevel.IMPORTANT, reason="Test level not met")
+    @pytest.mark.skipif(TEST_LEVEL < TestLevel.MEDIUM, reason="Test level not met")
     def test_request_shorter_than_block_size(self):
         """Verify request with prompt shorter than block_size has empty precomputed_block_hashes."""
         self._setup_model_parallel_group(1, 1)
@@ -2286,7 +2286,7 @@ class TestPrefixCoordination(PrefixCachingTestBase):
         assert dynamic_context.total_request_count == 1
 
     @pytest.mark.internal
-    @pytest.mark.skipif(TEST_LEVEL < TestLevel.IMPORTANT, reason="Test level not met")
+    @pytest.mark.skipif(TEST_LEVEL < TestLevel.MEDIUM, reason="Test level not met")
     def test_request_longer_than_block_size(self):
         """Verify request longer than block_size has correct number of precomputed hashes."""
         self._setup_model_parallel_group(1, 1)
@@ -2327,7 +2327,7 @@ class TestPrefixCoordination(PrefixCachingTestBase):
             assert h > 0
 
     @pytest.mark.internal
-    @pytest.mark.skipif(TEST_LEVEL < TestLevel.IMPORTANT, reason="Test level not met")
+    @pytest.mark.skipif(TEST_LEVEL < TestLevel.MEDIUM, reason="Test level not met")
     def test_reset_clears_pending_computation_list(self):
         """Verify that reset() clears _blocks_pending_computation."""
         self._setup_model_parallel_group(1, 1)
@@ -2372,7 +2372,7 @@ class TestPrefixCoordination(PrefixCachingTestBase):
         assert len(dynamic_context.block_allocator._pending_block_hashes) == 0
 
     @pytest.mark.internal
-    @pytest.mark.skipif(TEST_LEVEL < TestLevel.IMPORTANT, reason="Test level not met")
+    @pytest.mark.skipif(TEST_LEVEL < TestLevel.CRITICAL, reason="Test level not met")
     def test_two_phase_registration_flow(self):
         """Test the full two-phase registration: register → discoverable but pending → mark computed."""
         self._setup_model_parallel_group(1, 1)
@@ -2501,7 +2501,7 @@ class TestPrefixCoordination(PrefixCachingTestBase):
         )
 
     @pytest.mark.internal
-    @pytest.mark.skipif(TEST_LEVEL < TestLevel.IMPORTANT, reason="Test level not met")
+    @pytest.mark.skipif(TEST_LEVEL < TestLevel.MEDIUM, reason="Test level not met")
     def test_eviction_cleans_pending_hashes(self):
         """Test that evicting a pending block cleans up both pending and hash mappings."""
         self._setup_model_parallel_group(1, 1)
@@ -2571,7 +2571,7 @@ class TestPrefixCoordination(PrefixCachingTestBase):
         )
 
     @pytest.mark.internal
-    @pytest.mark.skipif(TEST_LEVEL < TestLevel.IMPORTANT, reason="Test level not met")
+    @pytest.mark.skipif(TEST_LEVEL < TestLevel.MEDIUM, reason="Test level not met")
     def test_prefix_matching_requires_sequential_match(self):
         """Test that prefix matching stops at first non-matching block."""
         self._setup_model_parallel_group(1, 1)
@@ -2642,7 +2642,7 @@ class TestPrefixCoordination(PrefixCachingTestBase):
         assert allocator.block_ref_counts[req2_block_2].item() == 1  # Newly allocated
 
     @pytest.mark.internal
-    @pytest.mark.skipif(TEST_LEVEL < TestLevel.IMPORTANT, reason="Test level not met")
+    @pytest.mark.skipif(TEST_LEVEL < TestLevel.MEDIUM, reason="Test level not met")
     def test_pending_block_detection_logic(self):
         """Test the logic used by engine's _has_pending_prefix_blocks."""
         self._setup_model_parallel_group(1, 1)
@@ -2714,7 +2714,7 @@ class TestPrefixCoordination(PrefixCachingTestBase):
         )
 
     @pytest.mark.internal
-    @pytest.mark.skipif(TEST_LEVEL < TestLevel.IMPORTANT, reason="Test level not met")
+    @pytest.mark.skipif(TEST_LEVEL < TestLevel.MEDIUM, reason="Test level not met")
     def test_pending_block_detection_edge_cases(self):
         """Test edge cases for pending block detection."""
         self._setup_model_parallel_group(1, 1)
@@ -2792,7 +2792,7 @@ class TestPrefixCoordination(PrefixCachingTestBase):
         )
 
     @pytest.mark.internal
-    @pytest.mark.skipif(TEST_LEVEL < TestLevel.IMPORTANT, reason="Test level not met")
+    @pytest.mark.skipif(TEST_LEVEL < TestLevel.CRITICAL, reason="Test level not met")
     def test_second_request_can_share_after_first_computed(self):
         """Test full coordination flow: request 2 shares blocks only after request 1's KV is computed."""
         self._setup_model_parallel_group(1, 1)
@@ -2862,7 +2862,7 @@ class TestPrefixCoordination(PrefixCachingTestBase):
         assert allocator.block_ref_counts[block_1].item() == 2
 
     @pytest.mark.internal
-    @pytest.mark.skipif(TEST_LEVEL < TestLevel.IMPORTANT, reason="Test level not met")
+    @pytest.mark.skipif(TEST_LEVEL < TestLevel.LOW, reason="Test level not met")
     def test_requests_wait_for_pending_blocks_then_share(self):
         """
         Simulate the engine scheduling flow where requests with pending
@@ -2985,7 +2985,7 @@ class TestConcurrentRequests(PrefixCachingTestBase):
     """Tests for concurrent request handling with prefix caching."""
 
     @pytest.mark.internal
-    @pytest.mark.skipif(TEST_LEVEL < TestLevel.IMPORTANT, reason="Test level not met")
+    @pytest.mark.skipif(TEST_LEVEL < TestLevel.MEDIUM, reason="Test level not met")
     def test_concurrent_requests_same_prefix(self):
         """Test multiple requests with same prefix share blocks via two-phase registration.
 
@@ -3069,7 +3069,7 @@ class TestConcurrentRequests(PrefixCachingTestBase):
         dynamic_context.add_request(request_4)
 
     @pytest.mark.internal
-    @pytest.mark.skipif(TEST_LEVEL < TestLevel.IMPORTANT, reason="Test level not met")
+    @pytest.mark.skipif(TEST_LEVEL < TestLevel.MEDIUM, reason="Test level not met")
     def test_racing_pending_blocks(self):
         """Verify two-phase registration enables safe block sharing.
 
@@ -3168,7 +3168,7 @@ class TestComplexPrefixPatterns(PrefixCachingTestBase):
     """Tests for complex prefix sharing patterns."""
 
     @pytest.mark.internal
-    @pytest.mark.skipif(TEST_LEVEL < TestLevel.IMPORTANT, reason="Test level not met")
+    @pytest.mark.skipif(TEST_LEVEL < TestLevel.MEDIUM, reason="Test level not met")
     def test_three_way_prefix_sharing(self):
         """Test three requests sharing the same prefix (ref_count = 3)."""
         self._setup_model_parallel_group(1, 1)
@@ -3241,7 +3241,7 @@ class TestComplexPrefixPatterns(PrefixCachingTestBase):
         assert torch.equal(req1_blocks, req2_blocks) and torch.equal(req1_blocks, req3_blocks)
 
     @pytest.mark.internal
-    @pytest.mark.skipif(TEST_LEVEL < TestLevel.IMPORTANT, reason="Test level not met")
+    @pytest.mark.skipif(TEST_LEVEL < TestLevel.LOW, reason="Test level not met")
     def test_prefix_chain_extending(self):
         """Test prefix chain where B extends A, C extends B.
 
@@ -3317,7 +3317,7 @@ class TestComplexPrefixPatterns(PrefixCachingTestBase):
         assert torch.equal(blocks_c[:2], blocks_a), "C should share first 2 blocks with A"
 
     @pytest.mark.internal
-    @pytest.mark.skipif(TEST_LEVEL < TestLevel.IMPORTANT, reason="Test level not met")
+    @pytest.mark.skipif(TEST_LEVEL < TestLevel.LOW, reason="Test level not met")
     def test_multiple_independent_prefix_trees(self):
         """Test multiple separate prefix patterns in cache simultaneously.
 
@@ -3393,7 +3393,7 @@ class TestMemoryPressure(PrefixCachingTestBase):
     """Tests for memory pressure and eviction with prefix caching."""
 
     @pytest.mark.internal
-    @pytest.mark.skipif(TEST_LEVEL < TestLevel.IMPORTANT, reason="Test level not met")
+    @pytest.mark.skipif(TEST_LEVEL < TestLevel.LOW, reason="Test level not met")
     def test_eviction_preserves_active_blocks(self):
         """Test that blocks with ref_count > 0 cannot be evicted."""
         self._setup_model_parallel_group(1, 1)
@@ -3455,7 +3455,7 @@ class TestMemoryPressure(PrefixCachingTestBase):
             )
 
     @pytest.mark.internal
-    @pytest.mark.skipif(TEST_LEVEL < TestLevel.IMPORTANT, reason="Test level not met")
+    @pytest.mark.skipif(TEST_LEVEL < TestLevel.LOW, reason="Test level not met")
     def test_cache_full_scenario(self):
         """Test behavior when cache is completely full."""
         self._setup_model_parallel_group(1, 1)
@@ -3522,7 +3522,7 @@ class TestRequestLifecycle(PrefixCachingTestBase):
     """Tests for request lifecycle with prefix caching."""
 
     @pytest.mark.internal
-    @pytest.mark.skipif(TEST_LEVEL < TestLevel.MEDIUM, reason="Test level not met")
+    @pytest.mark.skipif(TEST_LEVEL < TestLevel.LOW, reason="Test level not met")
     def test_release_preserves_cached_blocks(self):
         """Test that releasing a request leaves blocks cached (evictable) for reuse."""
         self._setup_model_parallel_group(1, 1)
@@ -3588,7 +3588,7 @@ class TestRequestLifecycle(PrefixCachingTestBase):
         assert torch.equal(req2_blocks, block_ids), "Request 2 should reuse cached blocks"
 
     @pytest.mark.internal
-    @pytest.mark.skipif(TEST_LEVEL < TestLevel.MEDIUM, reason="Test level not met")
+    @pytest.mark.skipif(TEST_LEVEL < TestLevel.LOW, reason="Test level not met")
     def test_chunked_prefill_prefix_matching(self):
         """Test that prefix matching only happens on first chunk.
 
@@ -3653,7 +3653,7 @@ class TestAdditionalEdgeCases(PrefixCachingTestBase):
     """Tests for additional edge cases in prefix caching."""
 
     @pytest.mark.internal
-    @pytest.mark.skipif(TEST_LEVEL < TestLevel.MEDIUM, reason="Test level not met")
+    @pytest.mark.skipif(TEST_LEVEL < TestLevel.LOW, reason="Test level not met")
     def test_empty_prompt(self):
         """Test request with 0 tokens."""
         self._setup_model_parallel_group(1, 1)
@@ -3692,7 +3692,7 @@ class TestAdditionalEdgeCases(PrefixCachingTestBase):
             pass
 
     @pytest.mark.internal
-    @pytest.mark.skipif(TEST_LEVEL < TestLevel.MEDIUM, reason="Test level not met")
+    @pytest.mark.skipif(TEST_LEVEL < TestLevel.LOW, reason="Test level not met")
     def test_single_token_prompt(self):
         """Test request with only 1 token (less than block size)."""
         self._setup_model_parallel_group(1, 1)
@@ -3726,7 +3726,7 @@ class TestAdditionalEdgeCases(PrefixCachingTestBase):
         # Should allocate 1 block for the partial prompt
 
     @pytest.mark.internal
-    @pytest.mark.skipif(TEST_LEVEL < TestLevel.MEDIUM, reason="Test level not met")
+    @pytest.mark.skipif(TEST_LEVEL < TestLevel.LOW, reason="Test level not met")
     def test_extremely_long_prompt(self):
         """Test request with many blocks (100+) to verify hash computation scales."""
         self._setup_model_parallel_group(1, 1)
@@ -3775,7 +3775,7 @@ class TestAdditionalEdgeCases(PrefixCachingTestBase):
             pass
 
     @pytest.mark.internal
-    @pytest.mark.skipif(TEST_LEVEL < TestLevel.MEDIUM, reason="Test level not met")
+    @pytest.mark.skipif(TEST_LEVEL < TestLevel.LOW, reason="Test level not met")
     def test_pathological_repeated_tokens(self):
         """Test all tokens identical (pathological case for hash function)."""
         self._setup_model_parallel_group(1, 1)
