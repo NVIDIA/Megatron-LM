@@ -995,7 +995,7 @@ def pretrain(
         if args.rl_offload_inference_model_weights_when_idle and inference_model is None:
             raise ValueError(
                 "--rl-offload-inference-model-weights-when-idle requires a separate inference model. "
-                "This flag is not useful if not doing refit since the weights are shared with the training model."
+                "This flag is only useful when doing refit since the weights are shared with the training model."
             )
 
     # Data stuff.
