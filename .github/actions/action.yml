@@ -118,6 +118,8 @@ runs:
         export NEMORUN_HOME=$(pwd)
         export NCCL_DEBUG=INFO
         pip install --no-cache-dir uv
+        uv venv .venv
+        uv cache clean
         uv sync --only-group test
         uv run python tests/test_utils/python_scripts/launch_nemo_run_workload.py \
           --scope unit-tests \
