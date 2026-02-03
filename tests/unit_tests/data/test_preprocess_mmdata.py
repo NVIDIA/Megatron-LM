@@ -5,11 +5,12 @@ import random
 import sys
 import tempfile
 
-import nltk
 import numpy
+import torch
 
 from megatron.core.datasets.indexed_dataset import IndexedDataset
 from tests.unit_tests.data.test_preprocess_data import dummy_jsonl, gpt2_merge, gpt2_vocab
+from tests.unit_tests.test_utilities import Utils
 from tools.merge_datasets import main as merge_main
 from tools.preprocess_mmdata import Encoder
 from tools.preprocess_mmdata import get_args as build_args
@@ -31,8 +32,7 @@ def dummy_img(odir_txt, odir_img):
 
 def build_datasets(idir_txt, idir_img, odir, extra_args=[]):
     for name in os.listdir(idir_txt):
-        sys.argv = [
-            sys.argv[0],
+        args_list = [
             "--input",
             os.path.join(idir_txt, name),
             "--input-image",
@@ -40,26 +40,15 @@ def build_datasets(idir_txt, idir_img, odir, extra_args=[]):
             "--output-prefix",
             os.path.join(odir, os.path.splitext(name)[0]),
         ] + extra_args
-        build_main()
+        build_main(args_list)
 
 
 def merge_datasets(idir):
-    sys.argv = [
-        sys.argv[0],
-        "--input",
-        idir,
-        "--output-prefix",
-        os.path.join(idir, "merge"),
-        "--multimodal",
-    ]
-    merge_main()
+    args_list = ["--input", idir, "--output-prefix", os.path.join(idir, "merge"), "--multimodal"]
+    merge_main(args_list)
 
 
 def do_test_preprocess_mmdata(temp_dir, extra_args=[]):
-    # set the default nltk data path
-    os.environ["NLTK_DATA"] = os.path.join(temp_dir, "nltk_data")
-    nltk.data.path.append(os.environ["NLTK_DATA"])
-
     path_to_raws_txt = os.path.join(temp_dir, "sample_raws_txt")
     path_to_raws_img = os.path.join(temp_dir, "sample_raws_img")
     path_to_data = os.path.join(temp_dir, "sample_data")
@@ -79,16 +68,8 @@ def do_test_preprocess_mmdata(temp_dir, extra_args=[]):
     # merge the datasets
     merge_datasets(path_to_data)
 
-    sys.argv = [
-        sys.argv[0],
-        "--input",
-        None,
-        "--input-image",
-        None,
-        "--output-prefix",
-        None,
-    ] + extra_args
-    encoder = Encoder(build_args())
+    args_list = ["--input", None, "--input-image", None, "--output-prefix", None] + extra_args
+    encoder = Encoder(build_args(args_list))
     encoder.initializer()
 
     def tokens_to_string(toks):
@@ -193,6 +174,11 @@ def do_test_preprocess_mmdata(temp_dir, extra_args=[]):
 
 
 def test_preprocess_mmdata():
+    if torch.distributed.is_available():
+        Utils.initialize_distributed()
+        if torch.distributed.get_rank() != 0:
+            return
+
     with tempfile.TemporaryDirectory() as temp_dir:
 
         # gpt specific args

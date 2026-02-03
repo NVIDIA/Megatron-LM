@@ -14,6 +14,7 @@ import glob
 import torch
 import numpy as np
 import multiprocessing
+
 try:
     import nltk
     from nltk.tokenize.punkt import PunktLanguageVars
@@ -41,6 +42,7 @@ class CustomLanguageVars(PunktLanguageVars):
             |
             (?P<next_tok>\S+)     #  <-- Normally you would have \s+ here
         ))"""
+
 
 class IdentitySplitter(object):
     def tokenize(self, *text):
@@ -195,7 +197,7 @@ class Partition(object):
         builders[key].finalize(output_idx_files[key])
 
 
-def get_args():
+def get_args(args_list=None):
     parser = argparse.ArgumentParser()
     parser = _add_tokenizer_args(parser)
     group = parser.add_argument_group(title='input data')
@@ -227,9 +229,8 @@ def get_args():
     group.add_argument('--keep-sequential-samples', action='store_true',
                        help='Ensure ordering of samples in .jsonl files is '
                             'preserved when using partitions>1.')
-    # group.add_argument('--legacy-tokenizer', action='store_true',
-    #                    help='Use legacy tokenizer system.')
-    args = parser.parse_args()
+
+    args = parser.parse_args(args_list)
     args.keep_empty = False
 
     if args.tokenizer_type.lower().startswith('bert') and not args.split_sentences:
@@ -263,8 +264,8 @@ def check_files_exist(in_ss_out_names, key, num_partitions):
     return True
 
 
-def main():
-    args = get_args()
+def main(args_list=None):
+    args = get_args(args_list)
 
     if args.split_sentences:
         if nltk_available:
@@ -405,6 +406,5 @@ def main():
 
 
 if __name__ == '__main__':
-
     main()
 
