@@ -113,6 +113,10 @@ def run_distributed_test():
         grid.create_pg(["dp"])
         grid.create_pg(["dp", "cp"])
         grid.create_pg(["ep"])
+        # Required by _get_pg_collection_for_optimizer
+        grid.create_pg(["tp", "pp"])
+        grid.create_pg(["tp", "ep", "pp"])
+        grid.create_pg(["dp", "ep"])
         return grid
 
     def get_pg_collection(grid):
