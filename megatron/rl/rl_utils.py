@@ -462,7 +462,11 @@ def get_environment_rollouts(
 
     if args.rl_offload_optimizer_during_inference:
         with nvtx_range("offload-optimizer-state-and-grad-buffers-during-inference"):
-            model[0].offload_grad_buffers()
+            if not args.rl_training_cuda_graphs:
+                model[0].offload_grad_buffers()
+            else:
+                logger.warning(
+                    "Gradient buffers will not be offloaded when training cudagraphs are enabled!")
             optimizer.offload_to_cpu()
              
     # If we have seperate training and inference models we to refit weights from the training model to the inference model.
@@ -1663,7 +1667,11 @@ def megatron_rl_inference_mode(
 
         if offload_optimizer_during_inference:
             with nvtx_range("offload-optimizer-state-and-grad-buffers-before-inference"):
-                model[0].offload_grad_buffers()
+                if not args.rl_training_cuda_graphs:
+                    model[0].offload_grad_buffers()
+                else:
+                    logger.warning(
+                        "Gradient buffers will not be offloaded when training cudagraphs are enabled!")
                 optimizer.offload_to_cpu()
 
         # TODO: Remove this if statement once a change to `toggle_cuda_graphs` makes it safe to.
