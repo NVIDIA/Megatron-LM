@@ -281,6 +281,9 @@ class BlockAllocator:
             if block_hash in self.hash_to_block_id:
                 del self.hash_to_block_id[block_hash]
 
+            # Invalidate Mamba state for this block (if Mamba prefix caching is enabled)
+            self.context.invalidate_mamba_state_for_block(block_id_int)
+
         # Reset block state
         self.block_hashes[block_ids] = -1
         self.block_ref_counts[block_ids] = 0

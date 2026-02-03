@@ -173,6 +173,10 @@ class InferenceConfig:
     block_evict_lru: bool = False
     """Use LRU eviction for prefix caching blocks. Only applies when enable_prefix_caching is True."""
 
+    prefix_caching_mamba_gb: Optional[float] = None
+    """Memory budget (GB) for cached Mamba states in prefix caching.
+    Required for Mamba prefix caching in hybrid models. If None, Mamba prefix caching is disabled."""
+
     # =================================
     # Logging config
     # =================================
