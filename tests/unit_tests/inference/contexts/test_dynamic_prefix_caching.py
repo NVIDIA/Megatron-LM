@@ -992,8 +992,13 @@ class TestMemoryUsage(PrefixCachingTestBase):
             request_id=1,
             prompt_tokens=prompt.clone(),
             sampling_params=SamplingParams(num_tokens_to_generate=10),
+            block_size_tokens=block_size,
+            enable_prefix_caching=True,
         )
         dynamic_context.add_request(request_1)
+
+        # Mark blocks as computed so request_2 can share
+        dynamic_context.mark_pending_blocks_computed()
 
         avail_after_first = block_allocator.total_avail
         blocks_used_first = initial_avail - avail_after_first
@@ -1003,6 +1008,8 @@ class TestMemoryUsage(PrefixCachingTestBase):
             request_id=2,
             prompt_tokens=prompt.clone(),
             sampling_params=SamplingParams(num_tokens_to_generate=10),
+            block_size_tokens=block_size,
+            enable_prefix_caching=True,
         )
         dynamic_context.add_request(request_2)
 
@@ -1045,13 +1052,26 @@ class TestMemoryUsage(PrefixCachingTestBase):
         # Record initial available blocks
         initial_avail = block_allocator.total_avail
 
-        # Add N identical requests
+        # Add first request and mark computed
         prompt = torch.arange(block_size * num_blocks, device=torch.cuda.current_device())
-        for i in range(num_requests):
+        first_request = DynamicInferenceRequest(
+            request_id=1,
+            prompt_tokens=prompt.clone(),
+            sampling_params=SamplingParams(num_tokens_to_generate=10),
+            block_size_tokens=block_size,
+            enable_prefix_caching=True,
+        )
+        dynamic_context.add_request(first_request)
+        dynamic_context.mark_pending_blocks_computed()
+
+        # Add remaining requests - they should share computed blocks
+        for i in range(1, num_requests):
             request = DynamicInferenceRequest(
                 request_id=i + 1,
                 prompt_tokens=prompt.clone(),
                 sampling_params=SamplingParams(num_tokens_to_generate=10),
+                block_size_tokens=block_size,
+                enable_prefix_caching=True,
             )
             dynamic_context.add_request(request)
 
