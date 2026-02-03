@@ -778,8 +778,6 @@ class TestRLUtils:
         assert output is not None, "Training forward pass should return valid output"
         assert logprobs is not None, "get_logprobs should return valid output"
 
-        # breakpoint()
-
         # Destroy all captured graphs deterministically
         for l in model.decoder.layers:
             for runner in getattr(l.cudagraph_manager, "cudagraph_runners", []):
