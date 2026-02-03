@@ -1228,9 +1228,11 @@ def validate_args(args, defaults={}):
 
     if args.mtp_num_layers:
         assert not args.use_legacy_models, "The legacy Megatron models does not support Multi-Token Prediction (MTP)."
-        assert args.position_embedding_type == "rope" or args.position_embedding_type == "none", (
-            f"Multi-Token Prediction (MTP) is not supported with {args.position_embedding_type} position embedding type."
-            + f"The supported position embedding types are rope and none."
+        # MTP is compatible with position embedding types that use position_ids.
+        supported_position_types = ["learned_absolute", "rope", "mrope", "none"]
+        assert args.position_embedding_type in supported_position_types, (
+            f"Multi-Token Prediction (MTP) is not supported with '{args.position_embedding_type}' position embedding type. "
+            f"The supported position embedding types are: {', '.join(supported_position_types)}."
         )
 
     if args.cpu_offloading_num_layers > 0:
