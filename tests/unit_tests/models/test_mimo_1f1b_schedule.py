@@ -20,7 +20,9 @@ from megatron.core.models.gpt.gpt_layer_specs import get_gpt_layer_with_transfor
 from megatron.core.models.gpt.gpt_model import GPTModel
 from megatron.core.models.mimo.config.base_configs import MimoModelConfig
 from megatron.core.models.mimo.model.base import MimoModel
+from megatron.core.models.mimo.optimizer import get_mimo_optimizer
 from megatron.core.models.mimo.submodules.vision import VisionModalitySubmodules
+from megatron.core.optimizer.optimizer_config import OptimizerConfig
 from megatron.core.models.vision.multimodal_projector import MultimodalProjector
 from megatron.core.pipeline_parallel.multimodule_communicator import (
     MultiModulePipelineCommunicator,
@@ -515,6 +517,19 @@ def run_mimo_1f1b_test(
         if isinstance(loss, (int, float)) else loss
     )
 
+    # Create MimoOptimizer
+    logger.info(f"[Rank {dist.get_rank()}] Creating MimoOptimizer...")
+    opt_config = OptimizerConfig(
+        optimizer='adam',
+        lr=1e-4,
+        weight_decay=0.01,
+        clip_grad=1.0,
+        bf16=True,
+        use_distributed_optimizer=True,
+    )
+    optimizer = get_mimo_optimizer(mimo_model, opt_config)
+    logger.info(f"[Rank {dist.get_rank()}] MimoOptimizer created with {len(optimizer._active_optimizers)} active optimizers")
+
     logger.info(f"[Rank {dist.get_rank()}] Creating communicator...")
     communicator = MultiModulePipelineCommunicator(
         module_to_grid_map, topology, mimo_model.config, dim_mapping={'s': 0, 'h': 2, 'b': 1}
@@ -585,6 +600,10 @@ def run_mimo_1f1b_test(
         return output_tensor, partial(loss_func, loss_mask)
 
     logger.info(f"[Rank {dist.get_rank()}] Running 1F1B schedule with {num_microbatches} microbatches...")
+
+    # Zero gradients before forward/backward
+    optimizer.zero_grad()
+
     losses = schedule.forward_backward_pipelining_without_interleaving(
         forward_step_func=step_func,
         data_iterator=data_iterator,
@@ -596,6 +615,11 @@ def run_mimo_1f1b_test(
         p2p_communicator=communicator,
         pg_collection=pg_collection,
     )
+
+    # Optimizer step with global gradient clipping
+    logger.info(f"[Rank {dist.get_rank()}] Running optimizer step...")
+    success, grad_norm, num_zeros = optimizer.step()
+    logger.info(f"[Rank {dist.get_rank()}] Optimizer step: success={success}, grad_norm={grad_norm}")
 
     # Verify results on last LLM stage
     if is_rank_in_grid(llm_grid):
