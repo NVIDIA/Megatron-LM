@@ -31,11 +31,7 @@ class MimoOptimizer(MegatronOptimizer):
     across all modules via all_reduce MAX.
     """
 
-    def __init__(
-        self,
-        module_infos: Dict[str, ModuleOptimizerInfo],
-        config: OptimizerConfig,
-    ):
+    def __init__(self, module_infos: Dict[str, ModuleOptimizerInfo], config: OptimizerConfig):
         self.module_infos = module_infos
         self.config = config
         self._active_optimizers: List[MegatronOptimizer] = [
@@ -187,10 +183,7 @@ def _get_pg_collection_for_optimizer(grid) -> ProcessGroupCollection:
     return pg
 
 
-def get_mimo_optimizer(
-    mimo_model: "MimoModel",
-    config: OptimizerConfig,
-) -> MimoOptimizer:
+def get_mimo_optimizer(mimo_model: "MimoModel", config: OptimizerConfig) -> MimoOptimizer:
     """Create optimizer for MimoModel with heterogeneous parallelism."""
     from megatron.core.optimizer import get_megatron_optimizer
 
@@ -200,7 +193,7 @@ def get_mimo_optimizer(
     module_infos: Dict[str, ModuleOptimizerInfo] = {}
 
     for module_name, grid in grid_map.items():
-        is_active = grid.is_rank_in_grid()
+        is_active = grid.is_current_rank_in_grid()
 
         optimizer = None
         pg_collection = _get_pg_collection_for_optimizer(grid)
@@ -209,20 +202,15 @@ def get_mimo_optimizer(
             if module_name == lang_key:
                 module = mimo_model.language_model
             else:
-                module = mimo_model.modality_submodules.get(module_name)
+                module = mimo_model.modality_submodules[module_name]
 
             if module is not None:
                 optimizer = get_megatron_optimizer(
-                    config=config,
-                    model_chunks=[module],
-                    pg_collection=pg_collection,
+                    config=config, model_chunks=[module], pg_collection=pg_collection
                 )
 
         module_infos[module_name] = ModuleOptimizerInfo(
-            optimizer=optimizer,
-            grid=grid,
-            pg_collection=pg_collection,
-            is_active=is_active,
+            optimizer=optimizer, grid=grid, pg_collection=pg_collection, is_active=is_active
         )
 
     return MimoOptimizer(module_infos, config)
