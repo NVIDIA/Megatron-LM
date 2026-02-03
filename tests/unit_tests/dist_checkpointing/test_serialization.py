@@ -640,6 +640,8 @@ class TestSerialization:
             tmp_path_dist_ckpt / 'test_content_metadata_load_from_state_dict', sync=True
         ) as ckpt_dir:
             save(state_dict, ckpt_dir, content_metadata=content_metadata)
+            with open(ckpt_dir / '__0_0.distcp', 'w') as f:
+                pass
             torch.distributed.barrier()
             loaded_state_dict = load(state_dict, ckpt_dir)
             loaded_metadata = load_content_metadata(preloaded_state_dict=loaded_state_dict)
