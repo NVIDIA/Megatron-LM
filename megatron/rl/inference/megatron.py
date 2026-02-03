@@ -140,8 +140,8 @@ class MegatronLocal(InferenceServer, ReturnsTokens, ReturnsRaw):
             server_task = loop.create_task(run_flask_server_on_client(
                 client=client,
                 tokenizer=inference_engine.controller.tokenizer,
-                rank=dist.get_rank(),
                 flask_port=8294,
+                parsers=[]
             ))
         else:
             client = None
