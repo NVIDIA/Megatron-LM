@@ -420,9 +420,7 @@ def bwd_fused_indexer_loss_naive(
 
     # Backward through sum(dim=-1): broadcast back to [b, sq, sk]
     # Each element in a row contributes to the sum, so gradient is same for all
-    grad_kl_per_element = torch.full(
-        (b, sq, sk), grad_kl_per_row.item(), device=index_scores.device, dtype=torch.float32
-    )
+    grad_kl_per_element = grad_kl_per_row.view(1, 1, 1).expand(b, sq, sk)
 
     # Backward through kl_per_element = target * (log(target) - log(index))
     # ∂kl/∂index_softmax = -target / index_softmax
