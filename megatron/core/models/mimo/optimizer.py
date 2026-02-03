@@ -146,35 +146,44 @@ class MimoOptimizer(MegatronOptimizer):
             opt.reload_model_params(state_dict)
 
 
-def _get_pg_collection_from_grid(grid) -> ProcessGroupCollection:
-    """Create ProcessGroupCollection from HyperCommGrid."""
-    import torch.distributed as dist
+def _get_pg_collection_for_optimizer(grid) -> ProcessGroupCollection:
+    """Create ProcessGroupCollection from HyperCommGrid for optimizer use.
 
-    from megatron.core.pipeline_parallel.utils import is_pp_first_stage, is_pp_last_stage
+    Only fetches process groups required by the optimizer. Assumes all groups
+    are pre-created in the grid via grid.create_pg() - does not create any new groups.
 
+    The following groups must be pre-created in the grid before calling this function:
+        grid.create_pg(["dp"])
+        grid.create_pg(["dp", "cp"])
+        grid.create_pg(["tp"])
+        grid.create_pg(["tp", "pp"])
+        grid.create_pg(["tp", "ep", "pp"])
+        grid.create_pg(["dp", "ep"])
+
+    Args:
+        grid: HyperCommGrid with pre-created process groups.
+
+    Returns:
+        ProcessGroupCollection containing optimizer-required groups:
+        - dp: Data parallel group
+        - dp_cp: Data parallel with context parallel
+        - tp: Tensor parallel group
+        - mp: Model parallel group (tp × pp)
+        - tp_ep_pp: Expert tensor-model-pipeline group
+        - expt_dp: Expert data parallel group
+    """
     pg = ProcessGroupCollection()
-    pg.tp = grid.get_pg("tp")
-    pg.cp = grid.get_pg("cp")
-    pg.pp = grid.get_pg("pp")
-    pg.ep = grid.get_pg("ep")
+
+    # Core groups needed by optimizer
     pg.dp = grid.get_pg("dp")
     pg.dp_cp = grid.get_pg(["dp", "cp"])
+    pg.tp = grid.get_pg("tp")
+    pg.mp = grid.get_pg(["tp", "pp"])
 
-    # Embedding groups
-    if pg.pp:
-        pp_ranks = sorted(dist.get_process_group_ranks(pg.pp))
-        pos_embd_ranks = [pp_ranks[0]]
-        embd_ranks = [pp_ranks[0]]
-        if pp_ranks[-1] != pp_ranks[0]:
-            embd_ranks.append(pp_ranks[-1])
+    # Expert groups
+    pg.tp_ep_pp = grid.get_pg(["tp", "ep", "pp"])
+    pg.expt_dp = grid.get_pg(["dp", "ep"])
 
-        pos_embd_pg = dist.new_group(ranks=pos_embd_ranks)
-        embd_pg = dist.new_group(ranks=embd_ranks)
-
-        pg.pos_embd = pos_embd_pg if is_pp_first_stage(pg.pp) else None
-        pg.embd = embd_pg if (is_pp_last_stage(pg.pp) or is_pp_first_stage(pg.pp)) else None
-
-    pg.mp = grid.get_pg("tp")
     return pg
 
 
@@ -194,7 +203,7 @@ def get_mimo_optimizer(
         is_active = grid.is_rank_in_grid()
 
         optimizer = None
-        pg_collection = None
+        pg_collection = _get_pg_collection_for_optimizer(grid)
 
         if is_active:
             if module_name == lang_key:
@@ -203,7 +212,6 @@ def get_mimo_optimizer(
                 module = mimo_model.modality_submodules.get(module_name)
 
             if module is not None:
-                pg_collection = _get_pg_collection_from_grid(grid)
                 optimizer = get_megatron_optimizer(
                     config=config,
                     model_chunks=[module],
