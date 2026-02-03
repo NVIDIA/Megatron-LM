@@ -602,8 +602,8 @@ class MultiTokenPredictionLayer(MegatronModule):
     the linear projection. The combined serves as the input of the Transformer block at
     the k-th depth to produce the output representation.
 
-    for more information, please refer to DeepSeek-V3 Technical Report
-    https://github.com/deepseek-ai/DeepSeek-V3/blob/main/DeepSeek_V3.pdf
+    For more information, refer to DeepSeek-V3 Technical Report
+    https://arxiv.org/pdf/2412.19437.pdf
     """
 
     def __init__(
@@ -1022,8 +1022,8 @@ class MultiTokenPredictionBlock(MegatronModule):
     the linear projection. The combined serves as the input of the Transformer block at
     the k-th depth to produce the output representation.
 
-    for more information, please refer to DeepSeek-V3 Technical Report
-    https://github.com/deepseek-ai/DeepSeek-V3/blob/main/DeepSeek_V3.pdf
+    For more information, refer to DeepSeek-V3 Technical Report
+    https://arxiv.org/pdf/2412.19437.pdf
     """
 
     def __init__(

@@ -27,7 +27,7 @@ This guide for Megatron Core walks you through the following tasks:
 
     <br>
 
-For a more comprehensive overview of different installation methods, refer to the [Installation Guide](https://github.com/NVIDIA/Megatron-LM/blob/main/megatron/core/Installation_Guide.md)
+For a more comprehensive overview of different installation methods, refer to the [Installation Guide](https://github.com/NVIDIA/Megatron-LM/#installation).
 
 ### Write Your First Training Loop
 
