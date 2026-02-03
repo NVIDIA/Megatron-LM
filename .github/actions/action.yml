@@ -120,7 +120,7 @@ runs:
         pip install --no-cache-dir uv
         uv venv .venv
         uv cache clean
-        uv sync --only-group test
+        uv sync --no-cache--only-group test
         uv run python tests/test_utils/python_scripts/launch_nemo_run_workload.py \
           --scope unit-tests \
           --model unit-tests \
@@ -202,7 +202,7 @@ runs:
         pip install --no-cache-dir uv
         uv venv .venv
         uv cache clean
-        uv sync --only-group test
+        uv sync --no-cache --only-group test
         uv run python tests/test_utils/python_scripts/launch_nemo_run_workload.py \
           ${ARGS[@]} \
           --model ${{ inputs.model }} \
