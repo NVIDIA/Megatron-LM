@@ -372,7 +372,7 @@ def test_functionality(tp_cp: List[int], qkv_format: str, down_proj_use_column_p
                 absorbed_grad_flat.unsqueeze(0), standard_grad_flat.unsqueeze(0)
             ).item()
             assert cos_sim > 0.9999, f"name: {name}, cosine similarity = {cos_sim} < 0.9999"
-            torch.testing.assert_close(absorbed_grad, standard_grad, atol=1e-1, rtol=1e-2)
+            torch.testing.assert_close(combined_grad, param.grad, atol=1e-1, rtol=1e-2)
         else:
             absorbed_grad = absorbed_grads[name].grad
             standard_grad = param.grad
