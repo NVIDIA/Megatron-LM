@@ -431,7 +431,7 @@ class DynamicInferenceContext(BaseInferenceContext):
         )
         self.kv_cache_management_mode = kv_cache_management_mode
 
-        if unified_memory_level > 0:
+        if unified_memory_level != 0:
             try:
                 self.unified_memory_mempool = create_unified_mempool()
             except UnifiedMemoryUnsupportedError:
@@ -443,7 +443,7 @@ class DynamicInferenceContext(BaseInferenceContext):
         # If CUDA graphs are not reset and KV cache memory address is not static, we need
         # either UVM or torch_memory_saver to maintain memory address stability for CGs.
         if not self.reset_cuda_graphs and self.kv_cache_management_mode != "persist":
-            assert HAVE_TORCH_MEMORY_SAVER or self.unified_memory_level > 0, (
+            assert HAVE_TORCH_MEMORY_SAVER or self.unified_memory_level != 0, (
                 "Not resetting CUDA graphs requires static KV cache memory. "
                 "Use --rl-kv-cache-management-mode=persist, UVM, or install torch_memory_saver."
             )
@@ -784,7 +784,7 @@ class DynamicInferenceContext(BaseInferenceContext):
         remove_kv = self.kv_cache_management_mode == "remove"
 
         ctx_manager = nullcontext()
-        if self.unified_memory_level > 0:
+        if self.unified_memory_level != 0:
             ctx_manager = torch.cuda.use_mem_pool(self.unified_memory_mempool)
         elif HAVE_TORCH_MEMORY_SAVER and (need_static or offload_kv):
             ctx_manager = torch_memory_saver.region(
