@@ -436,12 +436,17 @@ class TestPrefixCaching(PrefixCachingTestBase):
             request_id=1,
             prompt_tokens=prompt_tokens.clone(),
             sampling_params=SamplingParams(num_tokens_to_generate=10),
+            block_size_tokens=block_size,
+            enable_prefix_caching=True,
         )
         dynamic_context.add_request(request_1)
 
         # Get block IDs for request 1
         req1_block_0 = dynamic_context.request_to_kv_block_ids[0][0].item()
         req1_block_1 = dynamic_context.request_to_kv_block_ids[0][1].item()
+
+        # Mark blocks as computed (simulates forward pass completion)
+        dynamic_context.mark_pending_blocks_computed()
 
         # Verify hashes are registered in the mapping
         block_0_hash = block_allocator.get_block_hash(req1_block_0)
@@ -453,11 +458,13 @@ class TestPrefixCaching(PrefixCachingTestBase):
         assert block_allocator.block_ref_counts[req1_block_0].item() == 1
         assert block_allocator.block_ref_counts[req1_block_1].item() == 1
 
-        # Create second request with same prefix
+        # Create second request with same prefix (should share computed blocks)
         request_2 = DynamicInferenceRequest(
             request_id=2,
             prompt_tokens=prompt_tokens.clone(),
             sampling_params=SamplingParams(num_tokens_to_generate=10),
+            block_size_tokens=block_size,
+            enable_prefix_caching=True,
         )
         dynamic_context.add_request(request_2)
 
@@ -500,8 +507,13 @@ class TestPrefixCaching(PrefixCachingTestBase):
             request_id=1,
             prompt_tokens=prompt_tokens_1,
             sampling_params=SamplingParams(num_tokens_to_generate=10),
+            block_size_tokens=block_size,
+            enable_prefix_caching=True,
         )
         dynamic_context.add_request(request_1)
+
+        # Mark blocks as computed (simulates forward pass completion)
+        dynamic_context.mark_pending_blocks_computed()
 
         req1_block_0 = dynamic_context.request_to_kv_block_ids[0][0].item()
         req1_block_1 = dynamic_context.request_to_kv_block_ids[0][1].item()
@@ -516,6 +528,8 @@ class TestPrefixCaching(PrefixCachingTestBase):
             request_id=2,
             prompt_tokens=prompt_tokens_2,
             sampling_params=SamplingParams(num_tokens_to_generate=10),
+            block_size_tokens=block_size,
+            enable_prefix_caching=True,
         )
         dynamic_context.add_request(request_2)
 
@@ -563,13 +577,20 @@ class TestPrefixCaching(PrefixCachingTestBase):
             request_id=1,
             prompt_tokens=prompt_tokens.clone(),
             sampling_params=SamplingParams(num_tokens_to_generate=10),
+            block_size_tokens=block_size,
+            enable_prefix_caching=True,
         )
         dynamic_context.add_request(request_1)
+
+        # Mark blocks as computed so request 2 can share them
+        dynamic_context.mark_pending_blocks_computed()
 
         request_2 = DynamicInferenceRequest(
             request_id=2,
             prompt_tokens=prompt_tokens.clone(),
             sampling_params=SamplingParams(num_tokens_to_generate=10),
+            block_size_tokens=block_size,
+            enable_prefix_caching=True,
         )
         dynamic_context.add_request(request_2)
 
@@ -631,8 +652,13 @@ class TestPrefixCaching(PrefixCachingTestBase):
             request_id=1,
             prompt_tokens=large_prompt,
             sampling_params=SamplingParams(num_tokens_to_generate=10),
+            block_size_tokens=block_size,
+            enable_prefix_caching=True,
         )
         dynamic_context.add_request(request_1)
+
+        # Mark blocks as computed
+        dynamic_context.mark_pending_blocks_computed()
 
         # Get block info for request 1
         block_0 = dynamic_context.request_to_kv_block_ids[0][0].item()
@@ -658,6 +684,8 @@ class TestPrefixCaching(PrefixCachingTestBase):
             request_id=2,
             prompt_tokens=different_prompt,
             sampling_params=SamplingParams(num_tokens_to_generate=10),
+            block_size_tokens=block_size,
+            enable_prefix_caching=True,
         )
 
         # If pool is empty, this will trigger LRU eviction
@@ -697,8 +725,13 @@ class TestPrefixCaching(PrefixCachingTestBase):
             request_id=1,
             prompt_tokens=prompt_1,
             sampling_params=SamplingParams(num_tokens_to_generate=10),
+            block_size_tokens=block_size,
+            enable_prefix_caching=True,
         )
         dynamic_context.add_request(request_1)
+
+        # Mark blocks as computed
+        dynamic_context.mark_pending_blocks_computed()
 
         req1_blocks = set()
         for i in range(2):
@@ -710,6 +743,8 @@ class TestPrefixCaching(PrefixCachingTestBase):
             request_id=2,
             prompt_tokens=prompt_2,
             sampling_params=SamplingParams(num_tokens_to_generate=10),
+            block_size_tokens=block_size,
+            enable_prefix_caching=True,
         )
         dynamic_context.add_request(request_2)
 
@@ -751,8 +786,13 @@ class TestPrefixCaching(PrefixCachingTestBase):
             request_id=1,
             prompt_tokens=prompt.clone(),
             sampling_params=SamplingParams(num_tokens_to_generate=10),
+            block_size_tokens=block_size,
+            enable_prefix_caching=True,
         )
         dynamic_context.add_request(request_1)
+
+        # Mark blocks as computed
+        dynamic_context.mark_pending_blocks_computed()
 
         # Get block IDs and verify ref_count=1
         block_0 = dynamic_context.request_to_kv_block_ids[0][0].item()
@@ -775,6 +815,8 @@ class TestPrefixCaching(PrefixCachingTestBase):
             request_id=2,
             prompt_tokens=prompt.clone(),
             sampling_params=SamplingParams(num_tokens_to_generate=10),
+            block_size_tokens=block_size,
+            enable_prefix_caching=True,
         )
         dynamic_context.add_request(request_2)
 
@@ -814,12 +856,25 @@ class TestPrefixCaching(PrefixCachingTestBase):
         # Create identical prompt
         prompt = torch.arange(block_size * num_blocks, device=torch.cuda.current_device())
 
-        # Add 10 requests
-        for i in range(num_requests):
+        # Add first request and mark blocks as computed
+        first_request = DynamicInferenceRequest(
+            request_id=1,
+            prompt_tokens=prompt.clone(),
+            sampling_params=SamplingParams(num_tokens_to_generate=10),
+            block_size_tokens=block_size,
+            enable_prefix_caching=True,
+        )
+        dynamic_context.add_request(first_request)
+        dynamic_context.mark_pending_blocks_computed()
+
+        # Add remaining requests - they should share computed blocks
+        for i in range(1, num_requests):
             request = DynamicInferenceRequest(
                 request_id=i + 1,
                 prompt_tokens=prompt.clone(),
                 sampling_params=SamplingParams(num_tokens_to_generate=10),
+                block_size_tokens=block_size,
+                enable_prefix_caching=True,
             )
             dynamic_context.add_request(request)
 
@@ -868,8 +923,13 @@ class TestPrefixCaching(PrefixCachingTestBase):
             request_id=1,
             prompt_tokens=prompt,
             sampling_params=SamplingParams(num_tokens_to_generate=10),
+            block_size_tokens=block_size,
+            enable_prefix_caching=True,
         )
         dynamic_context.add_request(request)
+
+        # Mark blocks as computed so hashes are set
+        dynamic_context.mark_pending_blocks_computed()
 
         # Get block hashes
         block_0 = dynamic_context.request_to_kv_block_ids[0][0].item()
@@ -886,8 +946,8 @@ class TestPrefixCaching(PrefixCachingTestBase):
         assert hash_0 != hash_2, "Block 0 and 2 should have different hashes"
 
         # Verify hash chaining: same tokens with different parent = different hash
-        # Block 0's tokens with parent_hash=0
-        block_0_tokens = block_allocator.block_to_token_ids[block_0]
+        # Block 0's tokens are the first block_size tokens from the prompt
+        block_0_tokens = prompt[:block_size]
         computed_hash_0 = block_allocator.compute_block_hash(0, block_0_tokens)
         assert computed_hash_0 == hash_0, "Block 0 hash should match with parent=0"
 
