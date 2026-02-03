@@ -17,8 +17,10 @@ class DeepSeekR1ReasoningParser(BaseParser):
         if "</think>" in text:
             if "<think>" in text:
                 # Strip the <think> prefix (it might not be present if it was part of the prompt)
-                text = text.split("<think>")[1]
-            reasoning_content = text.split("</think>")[0]
-            return text.split("<think>")[0]+text.split("</think>")[-1], {'reasoning': reasoning_content}
+                pre_text, text = text.split("<think>", maxsplit=1)
+            else:
+                pre_text = ""
+            reasoning_content, remaining_text = text.split("</think>", maxsplit=1)
+            return pre_text+remaining_text, {'reasoning': reasoning_content}
         else:
             return text, {}

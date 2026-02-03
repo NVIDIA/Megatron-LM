@@ -65,6 +65,8 @@ async def run_flask_server_on_client(client: InferenceClient, tokenizer, flask_p
     # Force logging level to INFO to ensure that hostname is printed
     with temp_log_level(logging.INFO, logger):
         logger.info(f"Starting Flask server on http://{hostname}:{flask_port}")
+        logger.info(f"Using tokenizer: {type(tokenizer)}")
+        logger.info(f"Using parsers: {parsers}")
 
     await serve(app, config)
 
