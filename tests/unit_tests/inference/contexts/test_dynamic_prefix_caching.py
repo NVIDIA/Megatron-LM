@@ -1977,8 +1977,11 @@ class TestDisabledMode(PrefixCachingTestBase):
                 request_id=i + 1,
                 prompt_tokens=prompt.clone(),
                 sampling_params=SamplingParams(num_tokens_to_generate=10),
+                block_size_tokens=block_size,
             )
             context_enabled.add_request(request)
+            if i == 0:
+                context_enabled.mark_pending_blocks_computed()
         time_enabled = time.perf_counter() - start_enabled
 
         # Count unique blocks allocated
