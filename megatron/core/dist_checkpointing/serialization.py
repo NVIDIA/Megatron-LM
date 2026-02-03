@@ -18,7 +18,7 @@ from megatron.core.msc_utils import MultiStorageClientFeature
 from megatron.core.utils import log_single_rank
 
 from . import ShardedTensor
-from .core import CheckpointingConfig, save_config
+from .core import save_config
 from .dict_utils import extract_matching_values, merge
 from .mapping import (
     CheckpointingException,
@@ -417,17 +417,8 @@ def save(
         )
         common_strategy.save_sharded_objects(sharded_objects_state_dict, checkpoint_dir)
 
-    def metadata_finalize_fn():
-        if torch.distributed.get_rank() == 0:
-            save_config(
-                CheckpointingConfig(sharded_strategy.backend, sharded_strategy.version),
-                checkpoint_dir,
-            )
-        torch.distributed.barrier()
-
     if not async_sharded_save:
         sharded_strategy.save(sharded_state_dict, checkpoint_dir)
-        metadata_finalize_fn()
         return None
 
     if not isinstance(sharded_strategy, AsyncSaveShardedStrategy):
@@ -435,7 +426,6 @@ def save(
             f'Cannot apply async_save to non-async strategy {sharded_strategy}'
         )
     async_request = sharded_strategy.async_save(sharded_state_dict, checkpoint_dir)
-    async_request.finalize_fns.append(metadata_finalize_fn)
     return async_request
 
 
