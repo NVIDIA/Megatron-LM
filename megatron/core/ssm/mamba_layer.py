@@ -194,6 +194,9 @@ class MambaLayer(GraphableMegatronModule):
             and kwargs.get('inference_context') is not None
             and CudaGraphScope.full_iteration not in self.config.cuda_graph_scope
         ):
-            using_cuda_graph = kwargs['inference_context'].using_cuda_graph_this_step()
+            context = kwargs['inference_context']
+            using_cuda_graph = (context.is_static_batching() and context.is_decode_only()) or (
+                not context.is_static_batching() and context.using_cuda_graph_this_step()
+            )
             return using_cuda_graph
         return False
