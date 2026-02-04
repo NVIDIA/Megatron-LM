@@ -1,5 +1,6 @@
 from typing import Any
 
+
 class BaseParser:
     @staticmethod
     def parse(text: str, **kwargs) -> tuple[str, dict[str, Any]]:

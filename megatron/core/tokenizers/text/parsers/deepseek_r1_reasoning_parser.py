@@ -1,5 +1,6 @@
 from megatron.core.tokenizers.text.parsers.base_parser import BaseParser
 
+
 class DeepSeekR1ReasoningParser(BaseParser):
     @staticmethod
     def parse(text: str, **kwargs) -> tuple[str, dict[str, str]]:
@@ -23,6 +24,6 @@ class DeepSeekR1ReasoningParser(BaseParser):
             else:
                 pre_text = ""
             reasoning_content, remaining_text = text.split("</think>", maxsplit=1)
-            return pre_text+remaining_text, {'reasoning': reasoning_content}
+            return pre_text + remaining_text, {'reasoning': reasoning_content}
         else:
             return text, {}

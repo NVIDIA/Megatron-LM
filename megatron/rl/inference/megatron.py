@@ -87,7 +87,7 @@ class MegatronLocal(InferenceServer, ReturnsTokens, ReturnsRaw):
         if dist.get_rank() == 0:
             from megatron.core.inference.text_generation_server.dynamic_text_gen_server.flask_server import run_flask_server_on_client
             loop = asyncio.get_event_loop()
-            client = InferenceClient(inference_coordinator_addr=dp_addr)
+            client = InferenceClient(inference_coordinator_address=dp_addr)
             await client.start()
             server_task = loop.create_task(run_flask_server_on_client(
                 client=client,

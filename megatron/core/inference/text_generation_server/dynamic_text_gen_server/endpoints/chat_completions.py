@@ -37,8 +37,12 @@ try:
                 messages, tokenize=True, add_generation_prompt=True, tools=req.get("tools", None)
             )
         except AttributeError:
-            logger.warning("Tokenizer does not support 'apply_chat_template'. Using tokenize instead.")
-            prompt_tokens = tokenizer.tokenize("\n".join([message["content"] for message in messages]))
+            logger.warning(
+                "Tokenizer does not support 'apply_chat_template'. Using tokenize instead."
+            )
+            prompt_tokens = tokenizer.tokenize(
+                "\n".join([message["content"] for message in messages])
+            )
         except Exception as e:
             logger.error(f"{traceback.format_exc()}")
             return f"Error processing 'messages': {e}", 500
@@ -64,7 +68,11 @@ try:
                 top_p=top_p,
                 return_log_probs=return_log_probs,
                 top_n_logprobs=top_n_logprobs,
-                num_tokens_to_generate=int(max_tokens) if ( (max_tokens := req.get("max_tokens", None)) is not None ) else None,
+                num_tokens_to_generate=(
+                    int(max_tokens)
+                    if ((max_tokens := req.get("max_tokens", None)) is not None)
+                    else None
+                ),
                 skip_prompt_log_probs=True,
             )
         except ValueError as e:
@@ -135,8 +143,12 @@ try:
                     for parser in parsers:
                         if parser not in PARSER_MAPPING:
                             raise ValueError(f"Parser {parser} not found in PARSER_MAPPING")
-                        message_text, new_info = PARSER_MAPPING[parser].parse(message_text, tools=req.get("tools", None))
-                        assert not (metadata.keys() & new_info.keys()), "Multiple parsers found the same information."
+                        message_text, new_info = PARSER_MAPPING[parser].parse(
+                            message_text, tools=req.get("tools", None)
+                        )
+                        assert not (
+                            metadata.keys() & new_info.keys()
+                        ), "Multiple parsers found the same information."
                         metadata.update(new_info)
                 message = {"role": "assistant", "content": message_text}
                 if "tool_calls" in metadata:
@@ -153,7 +165,9 @@ try:
                     "raw_text": result.prompt + result.generated_text,
                     # 'logprobs' in chat API is an object containing 'content'
                     "logprobs": {"content": logprobs_content} if logprobs_content else None,
-                    "finish_reason": "tool_calls" if metadata.get("tool_calls", []) else "stop",  # Original code hardcoded this.
+                    "finish_reason": (
+                        "tool_calls" if metadata.get("tool_calls", []) else "stop"
+                    ),  # Original code hardcoded this.
                 }
                 choices.append(choice_data)
                 total_completion_tokens += len(result.generated_tokens)

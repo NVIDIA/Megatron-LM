@@ -5,13 +5,14 @@
 
 import ast
 import json
+import logging
 import uuid
 from types import SimpleNamespace
 from typing import Any
 
 import regex as re
+
 from megatron.core.tokenizers.text.parsers.base_parser import BaseParser
-import logging
 
 logger = logging.getLogger(__name__)
 
@@ -22,6 +23,7 @@ ChatCompletionToolsParam = dict[str, Any]
 ChatCompletionRequest = dict[str, Any]
 ExtractedToolCallInformation = dict
 
+
 class _Qwen3CoderToolParser:
 
     # Sentinel tokens for streaming mode
@@ -30,20 +32,12 @@ class _Qwen3CoderToolParser:
     tool_call_prefix: str = "<function="
 
     # Regex patterns
-    tool_call_complete_regex = re.compile(
-        r"<tool_call>(.*?)</tool_call>", re.DOTALL
-    )
-    tool_call_regex = re.compile(
-        r"<tool_call>(.*?)</tool_call>|<tool_call>(.*?)$", re.DOTALL
-    )
-    tool_call_function_regex = re.compile(
-        r"<function=(.*?)</function>|<function=(.*)$", re.DOTALL
-    )
+    tool_call_complete_regex = re.compile(r"<tool_call>(.*?)</tool_call>", re.DOTALL)
+    tool_call_regex = re.compile(r"<tool_call>(.*?)</tool_call>|<tool_call>(.*?)$", re.DOTALL)
+    tool_call_function_regex = re.compile(r"<function=(.*?)</function>|<function=(.*)$", re.DOTALL)
     tool_call_parameter_regex = re.compile(
-        r"<parameter=(.*?)(?:</parameter>|(?=<parameter=)|(?=</function>)|$)",
-        re.DOTALL,
+        r"<parameter=(.*?)(?:</parameter>|(?=<parameter=)|(?=</function>)|$)", re.DOTALL
     )
-
 
     def _generate_tool_call_id(self) -> str:
         """Generate a unique tool call ID."""
@@ -56,7 +50,7 @@ class _Qwen3CoderToolParser:
         if tools is None:
             return {}
         for config in tools:
-            config = SimpleNamespace(**config) # Convert to SimpleNamespace for ease of access
+            config = SimpleNamespace(**config)  # Convert to SimpleNamespace for ease of access
             if not hasattr(config, "type") or not (
                 hasattr(config, "function") and hasattr(config.function, "name")
             ):
@@ -93,10 +87,7 @@ class _Qwen3CoderToolParser:
                 )
             return param_value
 
-        if (
-            isinstance(param_config[param_name], dict)
-            and "type" in param_config[param_name]
-        ):
+        if isinstance(param_config[param_name], dict) and "type" in param_config[param_name]:
             param_type = str(param_config[param_name]["type"]).strip().lower()
         else:
             param_type = "string"
@@ -213,9 +204,7 @@ class _Qwen3CoderToolParser:
     def _get_function_calls(self, model_output: str) -> list[str]:
         # Find all tool calls
         matched_ranges = self.tool_call_regex.findall(model_output)
-        raw_tool_calls = [
-            match[0] if match[0] else match[1] for match in matched_ranges
-        ]
+        raw_tool_calls = [match[0] if match[0] else match[1] for match in matched_ranges]
 
         # Back-off strategy if no tool_call tags found
         if len(raw_tool_calls) == 0:
@@ -225,15 +214,11 @@ class _Qwen3CoderToolParser:
         for tool_call in raw_tool_calls:
             raw_function_calls.extend(self.tool_call_function_regex.findall(tool_call))
 
-        function_calls = [
-            match[0] if match[0] else match[1] for match in raw_function_calls
-        ]
+        function_calls = [match[0] if match[0] else match[1] for match in raw_function_calls]
         return function_calls
 
     def extract_tool_calls(
-        self,
-        model_output: str,
-        tools: list[ChatCompletionToolsParam] | None,
+        self, model_output: str, tools: list[ChatCompletionToolsParam] | None
     ) -> ExtractedToolCallInformation:
         # Quick check to avoid unnecessary processing
         if self.tool_call_prefix not in model_output:
@@ -271,6 +256,7 @@ class _Qwen3CoderToolParser:
                 tools_called=False, tool_calls=[], content=model_output
             )
 
+
 class Qwen3CoderToolParser(BaseParser):
     @staticmethod
     def parse(text: str, **kwargs) -> tuple[str, dict[str, list[dict]]]:
@@ -286,7 +272,9 @@ class Qwen3CoderToolParser(BaseParser):
             and a dictionary with the extracted tool calls.
         """
 
-        information = _Qwen3CoderToolParser().extract_tool_calls(text, tools=kwargs.get("tools", []))
+        information = _Qwen3CoderToolParser().extract_tool_calls(
+            text, tools=kwargs.get("tools", [])
+        )
         if information.get("tools_called", False):
             return information.get("content", ""), {"tool_calls": information.get("tool_calls", [])}
         else:
