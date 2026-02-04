@@ -9,7 +9,6 @@ from megatron.core.inference.model_inference_wrappers.abstract_model_inference_w
 )
 from megatron.core.inference.utils import get_attention_mask
 from megatron.core.models.gpt import GPTModel
-from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.transformer.enums import AttnBackend
 from megatron.core.utils import deprecate_args, get_model_config
 
