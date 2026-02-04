@@ -613,9 +613,9 @@ def build_mtp_layer_callables(layer):
     multi-token prediction layer nodes (attention, MLP, etc.)
     """
 
-    forward_funcs, backward_dw = build_transformer_layer_callables(layer.mtp_model_layer)
+    forward_funcs, backward_dw = build_transformer_layer_callables(layer.transformer_layer)
     attn_forward, dispatch_forward, mlp_forward, combine_forward, _ = forward_funcs
-    is_moe = isinstance(layer.mtp_model_layer.mlp, MoELayer)
+    is_moe = isinstance(layer.transformer_layer.mlp, MoELayer)
     assert is_moe, "MTP layer in a2a overlap only supports MoE layer for now."
 
     def submodule_mtp_attn_forward(node, hidden_states):
