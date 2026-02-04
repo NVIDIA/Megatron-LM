@@ -1,15 +1,11 @@
 # Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
 import asyncio
-from abc import abstractmethod
-from itertools import zip_longest
-from typing import Annotated, Any, ClassVar
 
-from pydantic import BaseModel, BeforeValidator, ValidationError
+from pydantic import BaseModel
 
 from ..__init__ import GenericGenerationArgs
 from ..inference.api import (
-    GroupedInferenceResponse,
     InferenceRequest,
     InferenceResponse,
     LLMChatMessage,
@@ -23,24 +19,22 @@ class InferenceInterface(BaseModel):
         arbitrary_types_allowed = True
 
     def prepare_request(
-        self, prompts: list[str | list[LLMChatMessage]], generation_args: GenericGenerationArgs
+        self, prompt: str | list[LLMChatMessage], generation_args: GenericGenerationArgs
     ) -> InferenceRequest:
-        prompt = [
-            [LLMChatMessage(role='user', content=p)] if isinstance(p, str) else p for p in prompts
-        ]
+        prompt = [LLMChatMessage(role='user', content=prompt)] if isinstance(prompt, str) else prompt
         return InferenceRequest(prompt=prompt, generation_args=generation_args)
 
-    async def base_generate(self, request: InferenceRequest) -> list[InferenceResponse]:
+    async def base_generate(self, request: InferenceRequest) -> InferenceResponse:
         assert NotImplementedError("Direct Inference Classes must implement the base_generate method.")
 
     async def agenerate(
         self, request: InferenceRequest
-    ) -> list[InferenceResponse] | list[GroupedInferenceResponse]:
+    ) -> InferenceResponse:
         return await self.base_generate(request)
 
     def generate(
         self, request: InferenceRequest
-    ) -> list[InferenceResponse] | list[GroupedInferenceResponse]:
+    ) -> InferenceResponse:
         try:
             loop = asyncio.get_running_loop()
         except RuntimeError:

@@ -27,15 +27,12 @@ class InferenceInterfaceClient(InferenceServer):
     env_server_host_port: str
     conversation_template: None = None
 
-    async def base_generate(self, request: InferenceRequest) -> list[InferenceResponse]:
+    async def base_generate(self, request: InferenceRequest) -> InferenceResponse:
         async with httpx.AsyncClient(timeout=None) as client:
             response = await client.post(
                 f"http://{self.env_server_host_port}/base_generate/", json=request.model_dump()
             )
-            return [
-                InferenceResponse.model_validate(inference_response)
-                for inference_response in response.json()
-            ]
+            return InferenceResponse.model_validate(response.json())
 
 
 @InferenceServer.register_subclass
@@ -69,7 +66,7 @@ class InferenceInterfaceServer(InferenceInterfaceClient, ReturnsRaw, ReturnsToke
         server_ref = weakref.ref(launched_server)
 
         @app.post("/base_generate/")
-        async def base_generate(request: InferenceRequest):
+        async def base_generate(request: InferenceRequest) -> InferenceResponse:
             server = server_ref()
             if server is None:
                 raise RuntimeError("Server has been garbage collected")

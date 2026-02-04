@@ -436,7 +436,7 @@ def get_inference_interface(args, loop, model):
             MegatronLocal.launch(
                 model[0], 
                 host='0.0.0.0', 
-                port=os.getenv('MEGATRON_RL_INFERENCE_SERVER_PORT', 8294))
+                port=8294)
         )
     return _INFERENCE_INTERFACE
 

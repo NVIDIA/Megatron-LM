@@ -3,16 +3,14 @@
 
 #### TODO: This parser was copied from vLLM and modified to work with megatron-lm inference
 
-
 import ast
 import json
 import uuid
-from collections.abc import Sequence
+from types import SimpleNamespace
 from typing import Any
 
 import regex as re
 from megatron.core.tokenizers.text.parsers.base_parser import BaseParser
-from megatron.core.tokenizers.text.libraries.huggingface_tokenizer import HuggingFaceTokenizer
 import logging
 
 logger = logging.getLogger(__name__)
@@ -25,27 +23,26 @@ ChatCompletionRequest = dict[str, Any]
 ExtractedToolCallInformation = dict
 
 class _Qwen3CoderToolParser:
-    def __init__(self):
 
-        # Sentinel tokens for streaming mode
-        self.tool_call_start_token: str = "<tool_call>"
-        self.tool_call_end_token: str = "</tool_call>"
-        self.tool_call_prefix: str = "<function="
+    # Sentinel tokens for streaming mode
+    tool_call_start_token: str = "<tool_call>"
+    tool_call_end_token: str = "</tool_call>"
+    tool_call_prefix: str = "<function="
 
-        # Regex patterns
-        self.tool_call_complete_regex = re.compile(
-            r"<tool_call>(.*?)</tool_call>", re.DOTALL
-        )
-        self.tool_call_regex = re.compile(
-            r"<tool_call>(.*?)</tool_call>|<tool_call>(.*?)$", re.DOTALL
-        )
-        self.tool_call_function_regex = re.compile(
-            r"<function=(.*?)</function>|<function=(.*)$", re.DOTALL
-        )
-        self.tool_call_parameter_regex = re.compile(
-            r"<parameter=(.*?)(?:</parameter>|(?=<parameter=)|(?=</function>)|$)",
-            re.DOTALL,
-        )
+    # Regex patterns
+    tool_call_complete_regex = re.compile(
+        r"<tool_call>(.*?)</tool_call>", re.DOTALL
+    )
+    tool_call_regex = re.compile(
+        r"<tool_call>(.*?)</tool_call>|<tool_call>(.*?)$", re.DOTALL
+    )
+    tool_call_function_regex = re.compile(
+        r"<function=(.*?)</function>|<function=(.*)$", re.DOTALL
+    )
+    tool_call_parameter_regex = re.compile(
+        r"<parameter=(.*?)(?:</parameter>|(?=<parameter=)|(?=</function>)|$)",
+        re.DOTALL,
+    )
 
 
     def _generate_tool_call_id(self) -> str:
@@ -59,6 +56,7 @@ class _Qwen3CoderToolParser:
         if tools is None:
             return {}
         for config in tools:
+            config = SimpleNamespace(**config) # Convert to SimpleNamespace for ease of access
             if not hasattr(config, "type") or not (
                 hasattr(config, "function") and hasattr(config.function, "name")
             ):
@@ -275,7 +273,7 @@ class _Qwen3CoderToolParser:
 
 class Qwen3CoderToolParser(BaseParser):
     @staticmethod
-    def parse(text: str, **kwargs) -> tuple[str, dict[str, str]]:
+    def parse(text: str, **kwargs) -> tuple[str, dict[str, list[dict]]]:
         """
         Extracts the tool calls from the text using <tool_call>...</tool_call> tags.
         Uses the _Qwen3CoderToolParser class (copied from vLLM) to extract the tool calls.

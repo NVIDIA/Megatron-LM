@@ -120,14 +120,10 @@ class RewardOnlyAgent(RolloutGenerator, GroupedRolloutGenerator, PassAtEvaluatio
         prompt, golden = await self.get_prompt(validation=request.validation)
 
         inference_request = request.inference_interface.prepare_request(
-            [prompt], request.generation_args
+            prompt, request.generation_args
         )
 
-        responses = await request.inference_interface.agenerate(inference_request)
-        assert (
-            len(responses) == 1
-        ), "get_reward_rollouts only requested a single response but got multiple responses"
-        response = responses[0]
+        response = await request.inference_interface.agenerate(inference_request)
 
         return await self.rollout_from_response(request, response, golden)
 
@@ -136,26 +132,21 @@ class RewardOnlyAgent(RolloutGenerator, GroupedRolloutGenerator, PassAtEvaluatio
         prompt, golden = await self.get_prompt(validation=request.validation)
 
         inference_request = request.inference_interface.prepare_request(
-            [prompt], request.generation_args
+            prompt, request.generation_args
         )
 
         responses = await asyncio.gather(*[request.inference_interface.agenerate(inference_request) for _ in range(request.rollouts_per_group)])
-        return [await self.rollout_from_response(request, response[0], golden) for response in responses]
+        return [await self.rollout_from_response(request, response, golden) for response in responses]
 
     async def _evaluation(
         self, prompt: str, golden: Any, request: EvaluationRequest
     ) -> RewardOnlyEvaluationResponse:
 
         inference_request = request.inference_interface.prepare_request(
-            [prompt], request.generation_args
+            prompt, request.generation_args
         )
 
-        responses = await request.inference_interface.agenerate(inference_request)
-        assert (
-            len(responses) == 1
-        ), "evaluation only requested a single response but got multiple responses"
-        response = responses[0]
-
+        response = await request.inference_interface.agenerate(inference_request)
         response_text = response.response.content
 
         result = RewardEvaluationResult(

@@ -33,7 +33,7 @@ def temp_log_level(level, logger=None):
 
 
 @trace_async_exceptions
-async def run_flask_server_on_client(client: InferenceClient, tokenizer, flask_port: int, parsers: list[str] = []):
+async def run_flask_server_on_client(client: InferenceClient, tokenizer, flask_port: int, parsers: list[str] = None):
     """Initializes and runs the async Flask server."""
     if not HAS_FLASK:
         raise RuntimeError(f"Flask not available")
@@ -72,7 +72,7 @@ async def run_flask_server_on_client(client: InferenceClient, tokenizer, flask_p
 
 
 @trace_async_exceptions
-async def run_flask_server(coordinator_addr: str, tokenizer, rank: int, flask_port: int, parsers: list[str] = []):
+async def run_flask_server(coordinator_addr: str, tokenizer, rank: int, flask_port: int, parsers: list[str] = None):
     inference_client = InferenceClient(coordinator_addr)
     await inference_client.start()
     logger.info(f"Rank {rank}: InferenceClient connected.")

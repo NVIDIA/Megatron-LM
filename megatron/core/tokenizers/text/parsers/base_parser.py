@@ -1,6 +1,8 @@
+from typing import Any
+
 class BaseParser:
     @staticmethod
-    def parse(text: str, **kwargs) -> tuple[str, dict[str, str]]:
+    def parse(text: str, **kwargs) -> tuple[str, dict[str, Any]]:
         """
         Parses the text into a tuple containing extracted content
         and a dictionary of additional information.
@@ -9,7 +11,7 @@ class BaseParser:
             text (str): The text to parse.
 
         Returns:
-            tuple[str, dict[str, str]]: A tuple containing the unprocessed text
+            tuple[str, dict[str, Any]]: A tuple containing the unprocessed text
             and a dictionary with the extracted information.
         """
         return text, {}

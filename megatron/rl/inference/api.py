@@ -11,12 +11,8 @@ class LLMChatMessage(BaseModel):
 
 
 class InferenceRequest(Request):
-    prompt: list[list[LLMChatMessage]]
+    prompt: list[LLMChatMessage]
     tools: list[dict] | None = None
-
-
-class GroupedInferenceRequest(InferenceRequest):
-    group_size: int = 1
 
 
 class InferenceResponse(BaseModel):
@@ -27,9 +23,3 @@ class InferenceResponse(BaseModel):
     token_ids: list[int] | None = None
     prompt_length: int | None = None
     logprobs: list[float] | None = None
-
-
-class GroupedInferenceResponse(BaseModel):
-    """An inference response which includes a list of responses."""
-
-    responses: list[InferenceResponse]

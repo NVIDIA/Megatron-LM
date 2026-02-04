@@ -78,9 +78,9 @@ class MegatronLocal(InferenceServer, ReturnsTokens, ReturnsRaw):
     _client: InferenceClient = PrivateAttr(None)
     _inference_engine: DynamicInferenceEngine = PrivateAttr(None)
 
-    async def base_generate(self, request: InferenceRequest):
+    async def base_generate(self, request: InferenceRequest) -> InferenceResponse:
 
-        assert self._server_task is not None, "Infernce server is not initialized"
+        assert self._server_task is not None, "Inference server is not initialized"
 
         from openai import AsyncOpenAI
         client = AsyncOpenAI(base_url=f"http://{self.host}:{self.port}", api_key="NONE")
@@ -88,29 +88,25 @@ class MegatronLocal(InferenceServer, ReturnsTokens, ReturnsRaw):
         # Things that may be problematic when doign this switch
         # - Add BOS token
         # - Skip prompt logprobs
-        generations = [ client.chat.completions.create(
+        response = await client.chat.completions.create(
             model="",
             messages=[message.model_dump() for message in prompt],
             temperature=request.generation_args.temperature or 1.0,
             top_p=request.generation_args.top_p or 0.0,
-            n=request.generation_args.n or 1,
+            n=1,
             logprobs=True,
-        ) for prompt in request.prompt ]
+        )
 
-        responses = await asyncio.gather(*generations)
+        choice = response.choices[0]
 
-        assert all(len(response.choices) == 1 for response in responses), "Still need to properly support requests with n > 1"
-
-        return [
-            InferenceResponse(
-                response=LLMChatMessage(**choice.message.model_dump(include={'role', 'content'})),
-                raw_text=choice.raw_text,
-                token_ids=choice.prompt_token_ids + choice.generation_token_ids,
-                logprobs=choice.generation_log_probs,
-                prompt_length=len(choice.prompt_token_ids),
-            )
-            for response in responses for choice in response.choices
-        ]
+        return InferenceResponse(
+            # TODO: Handle tool calls and reasoning in LLMChatMessage
+            response=LLMChatMessage(**choice.message.model_dump(include={'role', 'content'})),
+            raw_text=choice.raw_text,
+            token_ids=choice.prompt_token_ids + choice.generation_token_ids,
+            logprobs=choice.generation_log_probs,
+            prompt_length=len(choice.prompt_token_ids),
+        )
 
     @classmethod
     async def launch(cls, model: GPTModel, **kwargs):
@@ -140,7 +136,7 @@ class MegatronLocal(InferenceServer, ReturnsTokens, ReturnsRaw):
             server_task = loop.create_task(run_flask_server_on_client(
                 client=client,
                 tokenizer=inference_engine.controller.tokenizer,
-                flask_port=8294,
+                flask_port=kwargs.get('port', 8294),
                 parsers=[]
             ))
         else:

@@ -5,6 +5,8 @@ class DeepSeekR1ReasoningParser(BaseParser):
     def parse(text: str, **kwargs) -> tuple[str, dict[str, str]]:
         """
         Extracts the reasoning content from the text using <think>...</think> tags.
+        Only extracts the first set of think tags.
+        If an initial <think> tag is not present but a </think> tag is, it will infer a <think> tag at the beginning of the text.
 
         Args:
             text (str): The text to parse.

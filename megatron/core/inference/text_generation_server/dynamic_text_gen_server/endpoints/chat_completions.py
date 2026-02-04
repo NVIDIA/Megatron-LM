@@ -3,8 +3,10 @@
 import asyncio
 import logging
 import time
+import traceback
 
 from megatron.core.inference.sampling_params import SamplingParams
+from megatron.core.tokenizers.text.parsers import PARSER_MAPPING
 
 logger = logging.getLogger(__name__)
 
@@ -38,7 +40,6 @@ try:
             logger.warning("Tokenizer does not support 'apply_chat_template'. Using tokenize instead.")
             prompt_tokens = tokenizer.tokenize("\n".join([message["content"] for message in messages]))
         except Exception as e:
-            import traceback
             logger.error(f"{traceback.format_exc()}")
             return f"Error processing 'messages': {e}", 500
 
@@ -64,6 +65,7 @@ try:
                 return_log_probs=return_log_probs,
                 top_n_logprobs=top_n_logprobs,
                 num_tokens_to_generate=int(max_tokens) if ( (max_tokens := req.get("max_tokens", None)) is not None ) else None,
+                skip_prompt_log_probs=True,
             )
         except ValueError as e:
             return f"Invalid sampling parameter: {e}", 400
@@ -72,16 +74,7 @@ try:
         # For chat, we run the *same* prompt 'n' times.
         tasks = []
         for _ in range(n):
-            per_req_params = SamplingParams(
-                temperature=sampling_params.temperature,
-                top_k=sampling_params.top_k,
-                top_p=sampling_params.top_p,
-                return_log_probs=sampling_params.return_log_probs,
-                top_n_logprobs=sampling_params.top_n_logprobs,
-                num_tokens_to_generate=sampling_params.num_tokens_to_generate,
-                skip_prompt_log_probs=True,
-            )
-            tasks.append(client.add_request(prompt_tokens, per_req_params))
+            tasks.append(client.add_request(prompt_tokens, sampling_params))
 
         start_time = time.perf_counter()
         try:
@@ -136,15 +129,15 @@ try:
                         }
                         logprobs_content.append(entry)
 
-                from megatron.core.tokenizers.text.parsers import PARSER_MAPPING
                 metadata = {}
                 message_text = text_output
-                for parser in parsers:
-                    if parser not in PARSER_MAPPING:
-                        raise ValueError(f"Parser {parser} not found in PARSER_MAPPING")
-                    message_text, new_info = PARSER_MAPPING[parser].parse(message_text, tools=req.get("tools", None))
-                    assert not (metadata.keys() & new_info.keys()), "Multiple parsers found the same information."
-                    metadata.update(new_info)
+                if parsers:
+                    for parser in parsers:
+                        if parser not in PARSER_MAPPING:
+                            raise ValueError(f"Parser {parser} not found in PARSER_MAPPING")
+                        message_text, new_info = PARSER_MAPPING[parser].parse(message_text, tools=req.get("tools", None))
+                        assert not (metadata.keys() & new_info.keys()), "Multiple parsers found the same information."
+                        metadata.update(new_info)
                 message = {"role": "assistant", "content": message_text}
                 if "tool_calls" in metadata:
                     message["tool_calls"] = metadata["tool_calls"]
@@ -152,7 +145,7 @@ try:
                     message["reasoning"] = metadata["reasoning"]
 
                 choice_data = {
-                    "index": 0,
+                    "index": request_idx,
                     "message": message,
                     "prompt_token_ids": prompt_tokens,
                     "generation_token_ids": result.generated_tokens,
