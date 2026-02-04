@@ -806,7 +806,7 @@ class _ParamAndGradBuffer:
                     device=torch.cuda.current_device(),
                     requires_grad=False,
                 )
-   
+
         self.grad_data_size = 0
         self.param_data_size = 0
         self.param_data_cpu = None
