@@ -302,15 +302,19 @@ class MambaStack(MegatronModule):
         outer_fp8_context = get_fp8_context(self.config) if use_outer_fp8_context else nullcontext()
 
         if use_inner_fp8_context:
+
             def get_inner_quant_context(config, layer_number):
                 return get_fp8_context(config, layer_number)
+
         elif use_fp4_context:
+
             def get_inner_quant_context(config, layer_number):
                 return get_fp4_context(config, layer_number)
+
         else:
+
             def get_inner_quant_context(config, layer_number):
                 return nullcontext()
-
 
         with outer_fp8_context:
             for layer in self.layers:
