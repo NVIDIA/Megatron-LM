@@ -784,6 +784,10 @@ class DynamicInferenceEngine(AbstractEngine):
             self.waiting_request_ids.append(request_id)
         else:
             self.failed_request_ids.append(request_id)
+            if self.rank == 0:
+                warnings.warn(
+                    f"Request {request_id} failed to be added to the engine due to errors."
+                )
 
         return self.requests[request_id].future
 
@@ -1706,7 +1710,11 @@ class DynamicInferenceEngine(AbstractEngine):
                 if ep_group_has_work and local_pending_requests == 0:
                     # run dummy forward pass if EP group as a whole has work,
                     # but this rank does not have any work.
+                    self.step_start_event.record()
                     self.controller.dummy_forward()
+                    self.step_end_event.record()
+                    self.step_end_event.synchronize()
+                    self.step_count += 1
                     continue
 
                 # 3. No work in EP group

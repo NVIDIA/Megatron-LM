@@ -94,16 +94,61 @@ logger = logging.getLogger(__name__)
 _GLOBAL_PACKING_CONTEXT = None
 
 
-def _maybe_prefetch_separate_inference_model_weights(model_core, *, to_cpu: bool) -> None:
-    """Prefetch RL *separate inference model* weights to CPU/GPU (UVM-only path).
+# Track whether the inference model is currently paused (offloaded to CPU).
+# Model starts on GPU after creation and is used immediately, so starts as False.
+_INFERENCE_MODEL_IS_PAUSED = False
 
-    Gated only by user args; this assumes the separate inference model was allocated with UVM when enabled.
+
+def _torch_saver_swap_inference_model(*, to_cpu: bool) -> None:
+    """Swap RL inference model weights between CPU and GPU using torch_memory_saver.
+
+    Uses torch_memory_saver.pause()/resume() to transfer inference model weights
+    that were allocated within a torch_memory_saver.region() context.
+
+    Args:
+        to_cpu: If True, move weights to CPU (pause). If False, restore weights to GPU (resume).
+    """
+    global _INFERENCE_MODEL_IS_PAUSED
+
+    if not HAVE_TORCH_MEMORY_SAVER:
+        raise RuntimeError(
+            "torch_memory_saver is required for inference model offloading when not using UVM. "
+            "Please install it: pip install torch_memory_saver "
+            "(see https://github.com/fzyzcjy/torch_memory_saver)"
+        )
+
+    if to_cpu:
+        if not _INFERENCE_MODEL_IS_PAUSED:
+            torch_memory_saver.pause("rl_inference_model")
+            _INFERENCE_MODEL_IS_PAUSED = True
+            print_rank_0("[Rank 0] offloaded RL inference model weights to CPU using torch_memory_saver")
+    else:
+        if _INFERENCE_MODEL_IS_PAUSED:
+            torch_memory_saver.resume("rl_inference_model")
+            _INFERENCE_MODEL_IS_PAUSED = False
+            print_rank_0("[Rank 0] restored RL inference model weights to GPU using torch_memory_saver")
+
+
+def _maybe_prefetch_separate_inference_model_weights(model_core, *, to_cpu: bool) -> None:
+    """Prefetch RL *separate inference model* weights to CPU/GPU.
+
+    Supports two modes:
+    1. UVM-based offloading (when --rl-inference-model-unified-memory-level=1)
+    2. torch_memory_saver-based offloading (when offloading is enabled but UVM is not)
+
+    Gated by user args; this assumes the separate inference model was allocated
+    with UVM or torch_memory_saver when enabled.
     """
     args = get_args()
     if not args.rl_offload_inference_model_weights_when_idle:
         return
+
+    # Check for torch_memory_saver path (when offloading is enabled but UVM is not)
     if args.rl_inference_model_unified_memory_level != 1:
+        _torch_saver_swap_inference_model(to_cpu=to_cpu)
         return
+
+    # UVM-based path (when UVM level is 1)
     device = -1 if to_cpu else int(torch.cuda.current_device())
     # Note: include_buffers=False because buffers created with explicit device= in register_buffer()
     # are not allocated via the UVM mempool and will fail UVM operations. Only parameters are UVM-allocated.
@@ -462,7 +507,11 @@ def get_environment_rollouts(
 
     if args.rl_offload_optimizer_during_inference:
         with nvtx_range("offload-optimizer-state-and-grad-buffers-during-inference"):
-            model[0].offload_grad_buffers()
+            if not args.rl_training_cuda_graphs:
+                model[0].offload_grad_buffers()
+            else:
+                logger.warning(
+                    "Gradient buffers will not be offloaded when training cudagraphs are enabled!")
             optimizer.offload_to_cpu()
              
     # If we have seperate training and inference models we to refit weights from the training model to the inference model.
@@ -1003,7 +1052,7 @@ def logprobs_forward_step(data_iterator, model, is_correction, packing_context=N
             b_trajs.cuda(),
             b_posids.cuda(),
             no_grad=True,
-            sequence_packing=b_packed_seq_params is not None, 
+            sequence_packing=packing_context is not None,
             packed_seq_params=b_packed_seq_params,
         ),
         None,
@@ -1646,10 +1695,10 @@ def megatron_rl_inference_mode(
     lang_module = model[0].module.module if hasattr(model[0].module, "module") else model[0].module
 
     lang_module.eval()
-    # If this is a separate RL inference model allocated with UVM, ensure weights are resident on GPU
-    # before any CUDA-graph capture/replay or inference.
+    # If this is a separate RL inference model with offloading enabled, ensure weights are on GPU
+    # before any CUDA-graph capture/replay or inference. This is a no-op if already on GPU.
+    model_core = unwrap_model(model[0])
     with nvtx_range("prefetch-inference-model-weights-to-gpu"):
-        model_core = unwrap_model(model[0])
         _maybe_prefetch_separate_inference_model_weights(model_core, to_cpu=False)
 
     rotary_module = getattr(lang_module, "rotary_pos_emb", None)
@@ -1663,7 +1712,11 @@ def megatron_rl_inference_mode(
 
         if offload_optimizer_during_inference:
             with nvtx_range("offload-optimizer-state-and-grad-buffers-before-inference"):
-                model[0].offload_grad_buffers()
+                if not args.rl_training_cuda_graphs:
+                    model[0].offload_grad_buffers()
+                else:
+                    logger.warning(
+                        "Gradient buffers will not be offloaded when training cudagraphs are enabled!")
                 optimizer.offload_to_cpu()
 
         # TODO: Remove this if statement once a change to `toggle_cuda_graphs` makes it safe to.
