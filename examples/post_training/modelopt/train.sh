@@ -69,8 +69,13 @@ fi
 
 export HF_TOKEN=${HF_TOKEN}
 
-#${LAUNCH_SCRIPT} ${SCRIPT_DIR}/../../../pretrain_gpt.py \
-${LAUNCH_SCRIPT} ${SCRIPT_DIR}/../../../pretrain_mamba.py \
+if [[ ${MODEL_ARGS} == *"MambaModel"* ]]; then
+    PRETRAIN_EXE=${SCRIPT_DIR}/../../../pretrain_mamba.py
+else
+    PRETRAIN_EXE=${SCRIPT_DIR}/../../../pretrain_gpt.py
+fi
+
+${LAUNCH_SCRIPT} ${PRETRAIN_EXE} \
     ${MODEL_ARGS} \
     --tensor-model-parallel-size ${TP} \
     --expert-tensor-parallel-size ${ETP} \
