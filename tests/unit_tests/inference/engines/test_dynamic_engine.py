@@ -1121,26 +1121,78 @@ class TestDynamicInferenceEngine:
         )
 
         expected_event_types = [
-            ['ADD', 'FINISH'],
-            ['ADD', 'FINISH'],
-            ['ADD', 'FINISH'],
-            ['ADD', 'FINISH'],
-            ['ERROR_TRANSIENT', 'ADD', 'FINISH'],
-            ['ERROR_TRANSIENT', 'ADD', 'FINISH'],
-            ['ADD', 'FINISH'],
+            ['ADD_ENGINE', 'ADD_CONTEXT', 'FIRST_TOKEN', 'FINISH'],
+            ['ADD_ENGINE', 'ADD_CONTEXT', 'FIRST_TOKEN', 'FINISH'],
+            ['ADD_ENGINE', 'ADD_CONTEXT', 'FIRST_TOKEN', 'FINISH'],
+            ['ADD_ENGINE', 'ADD_CONTEXT', 'FIRST_TOKEN', 'FINISH'],
+            ['ERROR_TRANSIENT', 'ADD_ENGINE', 'ADD_CONTEXT', 'FIRST_TOKEN', 'FINISH'],
+            ['ERROR_TRANSIENT', 'ADD_ENGINE', 'ADD_CONTEXT', 'FIRST_TOKEN', 'FINISH'],
+            ['ADD_ENGINE', 'ADD_CONTEXT', 'FIRST_TOKEN', 'FINISH'],
             ['ERROR_NONTRANSIENT', 'FAIL'],
             ['ERROR_NONTRANSIENT', 'FAIL'],
-            ['ERROR_TRANSIENT', 'ADD', 'FINISH'],
+            ['ERROR_TRANSIENT', 'ADD_ENGINE', 'ADD_CONTEXT', 'FIRST_TOKEN', 'FINISH'],
             ['ERROR_NONTRANSIENT', 'FAIL'],
-            ['ERROR_TRANSIENT', 'ADD', 'FINISH'],
-            ['ADD', 'FINISH'],
-            ['ERROR_TRANSIENT', 'ADD', 'FINISH'],
-            ['ERROR_TRANSIENT', 'ADD', 'FINISH'],
-            ['ERROR_TRANSIENT', 'ADD', 'FINISH'],
+            ['ERROR_TRANSIENT', 'ADD_ENGINE', 'ADD_CONTEXT', 'FIRST_TOKEN', 'FINISH'],
+            ['ADD_ENGINE', 'ADD_CONTEXT', 'FIRST_TOKEN', 'FINISH'],
+            ['ERROR_TRANSIENT', 'ADD_ENGINE', 'ADD_CONTEXT', 'FIRST_TOKEN', 'FINISH'],
+            ['ERROR_TRANSIENT', 'ADD_ENGINE', 'ADD_CONTEXT', 'FIRST_TOKEN', 'FINISH'],
+            ['ERROR_TRANSIENT', 'ADD_ENGINE', 'ADD_CONTEXT', 'FIRST_TOKEN', 'FINISH'],
         ]
         result_event_types = [[e.type.name for e in r.events] for r in env.requests]
 
         assert result_event_types == expected_event_types
+
+    @pytest.mark.internal
+    @pytest.mark.skipif(
+        not is_fa_min_version("2.7.3"), reason="need latest flash attn for dynamic batching"
+    )
+    @torch.inference_mode()
+    def test_event_timestamps(self):
+        """Test that events are recorded with sensical timestamps.
+
+        Verifies:
+        1. Completed requests have ADD_ENGINE, ADD_CONTEXT, FIRST_TOKEN, FINISH events
+        2. Event timestamps are monotonically increasing
+        3. TTFT (time-to-first-token) can be computed as FIRST_TOKEN - ADD_ENGINE
+        """
+        env = self._run_test(
+            num_requests=4,
+            max_prompt_length=16,
+            num_tokens_to_generate=8,
+            context_buffer_size_gb=0.1,
+            num_gap_steps=0,
+        )
+
+        for request in env.requests:
+            if request.status != Status.COMPLETED:
+                continue
+
+            # Verify event types for completed requests
+            event_types = [e.type.name for e in request.events]
+            assert event_types == ['ADD_ENGINE', 'ADD_CONTEXT', 'FIRST_TOKEN', 'FINISH'], (
+                f"Request {request.request_id} has unexpected events: {event_types}"
+            )
+
+            # Verify timestamps are monotonically increasing
+            timestamps = [e.timestamp for e in request.events]
+            for i in range(1, len(timestamps)):
+                assert timestamps[i] >= timestamps[i - 1], (
+                    f"Request {request.request_id}: timestamp[{i}] ({timestamps[i]}) < "
+                    f"timestamp[{i-1}] ({timestamps[i-1]})"
+                )
+
+            # Verify TTFT is positive and sensical
+            add_engine_ts = request.events[0].timestamp
+            first_token_ts = request.events[2].timestamp
+            ttft = first_token_ts - add_engine_ts
+            assert ttft >= 0, f"Request {request.request_id}: TTFT is negative ({ttft})"
+
+            # Verify total request time is positive
+            finish_ts = request.events[3].timestamp
+            total_time = finish_ts - add_engine_ts
+            assert total_time >= ttft, (
+                f"Request {request.request_id}: total_time ({total_time}) < TTFT ({ttft})"
+            )
 
     @pytest.mark.internal
     @pytest.mark.skipif(
