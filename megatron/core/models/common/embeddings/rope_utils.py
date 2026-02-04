@@ -196,8 +196,6 @@ def _apply_rotary_pos_emb_thd(
     Returns:
         Tensor: Shape [t, h, d]. The input tensor after applying RoPE.
     """
-    cu_seqlens = cu_seqlens.squeeze(0)
-
     if cp_group is None:
         raise ValueError("cp_group must be provided for THD format RoPE")
     cp_size = cp_group.size()
