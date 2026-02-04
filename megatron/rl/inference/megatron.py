@@ -2,27 +2,14 @@
 
 import asyncio
 import logging
-from argparse import Namespace
 
 import torch.distributed as dist
 from pydantic import PrivateAttr
 
-from megatron.core.inference.contexts.dynamic_context import DynamicInferenceContext
-from megatron.core.inference.engines.abstract_engine import AbstractEngine
 from megatron.core.inference.engines.dynamic_engine import DynamicInferenceEngine
-from megatron.core.inference.engines.mcore_engine import MCoreEngine
 from megatron.core.inference.inference_client import InferenceClient
-from megatron.core.inference.model_inference_wrappers.gpt.gpt_inference_wrapper import (
-    GPTInferenceWrapper,
-)
-from megatron.core.inference.sampling_params import SamplingParams
-from megatron.core.inference.text_generation_controllers.text_generation_controller import (
-    TextGenerationController,
-)
 from megatron.core.models.gpt.gpt_model import GPTModel
-from megatron.core.transformer.module import MegatronModule
-from megatron.core.utils import get_attr_wrapped_model, log_single_rank
-from megatron.training import get_wandb_writer
+from megatron.core.utils import log_single_rank
 from megatron.training.global_vars import get_args, get_tokenizer
 
 from ..inference.inference_interface import (
@@ -35,37 +22,6 @@ from ..inference.inference_interface import (
 from ..server.api import InferenceServer
 
 logger = logging.getLogger(__name__)
-
-
-## This code is copied from tools/run_text_generation_server.py
-def get_static_inference_engine(args: Namespace, model: MegatronModule) -> AbstractEngine:
-    """Get the relevant backend for running inference.
-
-    This function will automatically choose the TRTLLMBackend when possible,
-    and default to Mcore backend if the user does not specify any backends.
-    TRTLLMBackend is not implmented yet.
-
-    Args:
-        args (Namespace): The user arguments parsed from command line
-        model (MegatronModule): The megatron model.
-
-    Returns:
-        AbstractBackend: The chosen backend
-    """
-    tokenizer = get_tokenizer()
-
-    inference_wrapped_model = GPTInferenceWrapper(model)
-    pg_collection = get_attr_wrapped_model(model, "pg_collection")
-    pp_group = pg_collection.pp
-    text_generation_controller = TextGenerationController(
-        inference_wrapped_model=inference_wrapped_model, tokenizer=tokenizer, pp_group=pp_group
-    )
-    return MCoreEngine(
-        text_generation_controller=text_generation_controller,
-        max_batch_size=(
-            args.inference_max_requests if args.inference_max_requests is not None else 1
-        ),
-    )
 
 
 class MegatronLocal(InferenceServer, ReturnsTokens, ReturnsRaw):
@@ -90,7 +46,7 @@ class MegatronLocal(InferenceServer, ReturnsTokens, ReturnsRaw):
         # - Skip prompt logprobs
         response = await client.chat.completions.create(
             model="",
-            messages=[message.model_dump() for message in prompt],
+            messages=[message.model_dump() for message in request.prompt],
             temperature=request.generation_args.temperature or 1.0,
             top_p=request.generation_args.top_p or 0.0,
             n=1,
