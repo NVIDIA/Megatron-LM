@@ -625,6 +625,3 @@ class TestMegatronFsdpFullyShard:
         if torch.distributed.get_rank() == 0:
             shutil.rmtree(CKPT_DIR)
         torch.distributed.barrier()
-
-        # Destroy device mesh.
-        destroy_device_mesh(device_mesh)
