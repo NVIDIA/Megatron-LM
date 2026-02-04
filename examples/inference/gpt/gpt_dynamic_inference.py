@@ -375,6 +375,17 @@ def run_inference(
                 request.request_id = finished_request.request_id
                 request.events = finished_request.events
 
+                # Calculate TTFT = FIRST_TOKEN timestamp - ADD_ENGINE timestamp
+                add_engine_time = None
+                first_token_time = None
+                for event in finished_request.events:
+                    if event.type.name == "ADD_ENGINE":
+                        add_engine_time = event.timestamp
+                    elif event.type.name == "FIRST_TOKEN":
+                        first_token_time = event.timestamp
+                if add_engine_time is not None and first_token_time is not None:
+                    request.ttft = first_token_time - add_engine_time
+
                 # Update prompt, in case engine has been suspended and resumed.
                 request.prompt_tokens = finished_request.prompt_tokens.tolist()
                 request.prompt_text = finished_request.prompt
@@ -593,6 +604,7 @@ def main():
                         "generated_text": req.output_text,
                         "generated_tokens": req.output_tokens,
                         "latency": req.time_end - req.time_start,
+                        "ttft": req.ttft,  # Time-to-first-token in seconds
                         "cuda_graph_request_count_map" : result["cuda_graph_request_count_map"],
                         "step_count" : engine.step_count,
                         "top_n_logprobs" : getattr(req, 'generated_top_n_logprobs', None),
