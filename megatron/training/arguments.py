@@ -2127,18 +2127,6 @@ def _add_training_args(parser):
                        help='Use the legacy Megatron models, not Megatron-Core models.')
     group.add_argument('--high-priority-stream-groups', nargs='*', type=str, default=[],
                        help='The communicator group names to use high priority streams.')
-    group.add_argument('--fine-grained-activation-offloading', action='store_true',
-                       help='Enable fine-grained activation offloading.')
-    group.add_argument('--offload-modules', nargs='*', type=str, default=[],
-                       help='The submodules to offload its input. Choices: "attn_norm", "qkv_linear", "core_attn", "attn_proj", "mlp_norm", "expert_fc1", "moe_act".')
-    group.add_argument('--min-offloaded-tensor-size', type=int, default=1024*1024,
-                       help='The minimum size of the tensor to be offloaded.')
-    group.add_argument('--delay-offload-until-cuda-graph', action='store_true',
-                       help='Delay the offload until the CUDA graph is executed for minimal CPU overhead.')
-    group.add_argument('--delta-offload-bytes-across-pp-ranks', type=int, default=0,
-                       help='Difference of offload bytes across PP ranks to balance the offload load.')
-    group.add_argument('--activation-offload-fraction', type=float, default=1.0,
-                       help='The fraction of the activation to be offloaded for each module, which should be in range [0, 1].')
     group.add_argument('--disable-jit-fuser', action='store_true',
                        help='Disable the JIT fuser.')
 
