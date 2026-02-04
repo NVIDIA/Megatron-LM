@@ -3,7 +3,7 @@ from typing import Any
 
 class BaseParser:
     """Base class for text parsers."""
-    
+
     @staticmethod
     def parse(text: str, **kwargs) -> tuple[str, dict[str, Any]]:
         """

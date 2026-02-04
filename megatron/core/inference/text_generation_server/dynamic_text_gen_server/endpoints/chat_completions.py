@@ -36,7 +36,7 @@ try:
             prompt_tokens = tokenizer.apply_chat_template(
                 messages, tokenize=True, add_generation_prompt=True, tools=req.get("tools", None)
             )
-        except AttributeError:
+        except (AttributeError, AssertionError):
             logger.warning(
                 "Tokenizer does not support 'apply_chat_template'. Using tokenize instead."
             )
