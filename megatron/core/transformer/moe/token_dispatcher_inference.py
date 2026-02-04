@@ -20,8 +20,9 @@ from megatron.core.transformer.moe.token_dispatcher import (
 from megatron.core.transformer.transformer_config import TransformerConfig
 
 from megatron.core.transformer.moe.inference_kernels import (
-    launch_fused_permute_and_probs,
-    launch_unpermute_kernel,
+    shift_topk_indices,
+    permute_tokens_and_probs,
+    unpermute_and_combine,
 )
 from megatron.core.tensor_parallel import gather_from_sequence_parallel_region
 from megatron.core.parallel_state import get_global_symmetric_memory_buffer_ep
@@ -117,8 +118,8 @@ class InferenceAllGatherTokenDispatcher(MoEAllGatherTokenDispatcher):
         # Calculate output shapes after all-gather
         local_tokens = probs.size(0)
         global_tokens = local_tokens * self.ep_size
-        num_experts = probs.size(1)
-        hidden_dim = hidden_states.size(1)
+        topk = probs.size(-1)
+        hidden_dim = hidden_states.size(-1)
 
         # Calculate bytes needed for each tensor (with 16-byte alignment)
         def aligned_bytes(numel, dtype):
@@ -127,8 +128,8 @@ class InferenceAllGatherTokenDispatcher(MoEAllGatherTokenDispatcher):
             # Align to 16 bytes for 128-bit access
             return ((raw_bytes + 15) // 16) * 16
 
-        routing_map_bytes = aligned_bytes(global_tokens * num_experts, routing_map.dtype)
-        probs_bytes = aligned_bytes(global_tokens * num_experts, probs.dtype)
+        routing_map_bytes = aligned_bytes(global_tokens * topk, routing_map.dtype)
+        probs_bytes = aligned_bytes(global_tokens * topk, probs.dtype)
         hidden_states_bytes = aligned_bytes(global_tokens * hidden_dim, hidden_states.dtype)
         total_bytes = routing_map_bytes + probs_bytes + hidden_states_bytes
 
@@ -200,7 +201,7 @@ class InferenceAllGatherTokenDispatcher(MoEAllGatherTokenDispatcher):
             # Output shape: [local_tokens * ep_size, dim]
             local_tokens = probs.size(0)
             global_tokens = local_tokens * self.ep_size
-            num_experts = probs.size(1)
+            topk = probs.size(1)
             hidden_dim = hidden_states.size(1)
             routing_map_dtype = self.routing_map.dtype
             probs_dtype = probs.dtype
@@ -214,7 +215,7 @@ class InferenceAllGatherTokenDispatcher(MoEAllGatherTokenDispatcher):
                 ag_buffers["handle"],
                 byte_offset=ag_buffers["routing_map_offset"],
             )
-            self.routing_map = ag_buffers["routing_map"].view(routing_map_dtype).view(global_tokens, num_experts)
+            self.routing_map = ag_buffers["routing_map"].view(routing_map_dtype).view(global_tokens, topk)
 
             multimem_all_gather(
                 ag_buffers["probs"].view(torch.bfloat16),
@@ -222,7 +223,7 @@ class InferenceAllGatherTokenDispatcher(MoEAllGatherTokenDispatcher):
                 ag_buffers["handle"],
                 byte_offset=ag_buffers["probs_offset"],
             )
-            probs = ag_buffers["probs"].view(probs_dtype).view(global_tokens, num_experts)
+            probs = ag_buffers["probs"].view(probs_dtype).view(global_tokens, topk)
 
             multimem_all_gather(
                 ag_buffers["hidden_states"].view(torch.bfloat16),
@@ -244,120 +245,90 @@ class InferenceAllGatherTokenDispatcher(MoEAllGatherTokenDispatcher):
 
         return hidden_states, probs
 
-    def test_permute_output(self, hidden_states, permute_output, mask):
-        # Verification of Grouped-by-Expert layout
-        E = self.local_map.size(1)
-        T = hidden_states.size(0)
-        mask = self.local_map
-        buffer_idx = 0
-        for e_idx in range(E):
-            for t_idx in range(T):
-                if mask[t_idx, e_idx]:
-                    assert torch.allclose(permute_output[buffer_idx], hidden_states[t_idx])
-                    buffer_idx += 1
-        
-        #assert static_buffer[buffer_idx:].sum() == 0, "Stale data found in buffer tail"
-
-    def test_permute_probs_output(self, local_probs, probs_workspace, mask):
-        """
-        Verification of Grouped-by-Expert layout for probabilities.
-        local_probs: [Tokens, Experts]
-        probs_workspace: [MAX_OUT, 1] (or [MAX_OUT])
-        mask: [Tokens, Experts] boolean mask
-        """
-        T = local_probs.size(0)
-        E = local_probs.size(1)
-        
-        buffer_idx = 0
-        # Expert-major traversal (Outer loop: Experts, Inner loop: Tokens)
-        for e_idx in range(E):
-            for t_idx in range(T):
-                if mask[t_idx, e_idx]:
-                    # Extract the expected probability from the source [Tokens, Experts]
-                    expected_prob = local_probs[t_idx, e_idx]
-                                        # Using a slightly relaxed atol for BF16 if necessary
-                    actual_prob = probs_workspace[buffer_idx]
-                    assert torch.allclose(
-                        actual_prob,
-                        expected_prob
-                    ), f"Prob mismatch at buffer index {buffer_idx} (Expert {e_idx}, Token {t_idx})"
-                    
-                    buffer_idx += 1
         
     def dispatch_postprocess(self, hidden_states, probs):
         """After gathering in token_dispatch, this method identifies tokens for local experts and
         permutes them for expert processing.
 
-        Optimized to:
-        1. Fuse slice + transpose for mask (single kernel instead of two)
-        2. Use stride-based probs access in kernel (avoids probs transpose entirely)
-        3. Permute hidden states AND extract probs in a single kernel launch
+        Algorithm:
+        1. Filter topk_indices to keep only those for local experts
+        2. Shift valid indices to local coordinate system (0-indexed)
+        3. Mark invalid indices with sentinel value
+        4. Argsort to get token permutation that groups by expert
+        5. Permute tokens and probs using this map
+        6. Bincount to get tokens per expert
         """
         self.hidden_shape_before_permute = hidden_states.shape
-
-        # Fuse slice + transpose for mask: [T, num_experts] -> [num_local_experts, T]
-        # This produces mask_T directly, avoiding a separate transpose kernel
-        self._cached_mask_T = self.routing_map[
-            :, self.local_expert_indices[0] : self.local_expert_indices[-1] + 1
-        ].t().contiguous()  # [E, T] layout
-
-        # Probs: just slice, no transpose needed (kernel uses stride-based access)
-        local_probs = probs[
-            :, self.local_expert_indices[0] : self.local_expert_indices[-1] + 1
-        ].contiguous()  # [T, E] layout
-
-        # tokens_per_expert from transposed mask: sum over tokens (dim=1) for each expert
-        tokens_per_expert = self._cached_mask_T.sum(dim=1)
-
-        # Pre-allocate workspaces
-        max_out = hidden_states.size(0) * min(self.topk, self.num_local_experts)
-        tokens_workspace = torch.empty(
-            max_out, hidden_states.size(1),
-            dtype=hidden_states.dtype,
-            device=hidden_states.device,
+        
+        # self.routing_map is actually topk_indices: [num_tokens, topk]
+        topk_indices = self.routing_map
+        num_tokens, topk = topk_indices.shape
+        
+        # Shift global expert indices to local coordinate system using Triton kernel.
+        # For each index:
+        #   - If in range [local_expert_indices[0], local_expert_indices[-1]]:
+        #     shift to 0-based (e.g., expert 4 -> 0 if local_expert_indices[0] == 4)
+        #   - Otherwise: mark with sentinel value (num_local_experts)
+        # This prepares indices for argsort which will group tokens by local expert.
+        # Result: [num_tokens, topk] with local indices or sentinels
+        adjusted_topk_indices = shift_topk_indices(
+            topk_indices,
+            local_start=self.local_expert_indices[0],
+            local_end=self.local_expert_indices[-1],
+            num_local_experts=self.num_local_experts,
         )
-        probs_workspace = torch.empty(
-            max_out,
-            dtype=probs.dtype,
-            device=probs.device,
+        
+        # Flatten and argsort to get permutation that groups tokens by expert.
+        # After argsort, all tokens for expert 0 are at the beginning, then expert 1, etc.
+        # Sentinel values (num_local_experts) sort to the end.
+        # flat_indices: [num_tokens * topk]
+        # permutation: [num_tokens * topk] indices for reordering
+        flat_indices = adjusted_topk_indices.flatten()
+        self._cached_permutation = torch.argsort(flat_indices, stable=True)
+        
+        # Allocate workspace for permuted outputs
+        # Max possible tokens = num_tokens * min(topk, num_local_experts)
+        max_tokens = num_tokens * min(topk, self.num_local_experts)
+        
+        # Permute tokens and probs, count tokens per expert using Triton kernel
+        # Each thread block handles one output position, skipping sentinels
+        permuted_hidden, permuted_probs, tokens_per_expert = permute_tokens_and_probs(
+            hidden_states,
+            probs,
+            flat_indices,
+            self._cached_permutation,
+            num_local_experts=self.num_local_experts,
+            max_tokens=max_tokens,
         )
-
-        # Fused kernel launch: permute hidden states + extract probs in one pass
-        # Pass mask_T directly (already transposed), probs as [T, E] (kernel uses strides)
-        self._cached_dest_indices = launch_fused_permute_and_probs(
-            hidden_states, local_probs, self._cached_mask_T,
-            tokens_workspace, probs_workspace
-        )
-
+        
+        # Cache data needed for unpermute in combine_preprocess
+        self._cached_flat_indices = flat_indices
+        self._cached_num_tokens = num_tokens
+        self._cached_topk = topk
+        
         self.routing_map = None
-        self.local_probs = probs_workspace
-        return tokens_workspace, tokens_per_expert, probs_workspace
-
+        self.local_probs = permuted_probs
+        return permuted_hidden, tokens_per_expert, permuted_probs
+        
+        
     def combine_preprocess(self, permuted_expert_outputs):
         """
         Reverses token permutation to restore original ordering.
-        Handles Top-K summation into original hidden state positions.
 
-        Uses cached mask_T and dest_indices from dispatch_postprocess to avoid
-        recomputing them (saves 2 kernel launches).
+        Uses cached permutation and expert_assignments from dispatch_postprocess.
+        Note: Probability weighting is handled by experts via moe_apply_probs_on_input.
         """
-        # 1. Pre-allocate output buffer w/ zeros.
-        unpermuted_hidden = torch.zeros(
-            self.hidden_shape_before_permute,
-            dtype=permuted_expert_outputs.dtype,
-            device=permuted_expert_outputs.device
+        # Unpermute expert outputs using cached data
+        output = unpermute_and_combine(
+            permuted_expert_outputs,
+            self._cached_flat_indices,
+            self._cached_permutation,
+            num_tokens=self._cached_num_tokens,
+            topk=self._cached_topk,
+            num_local_experts=self.num_local_experts,
         )
-
-        # 2. Launch the Un-permute kernel with cached intermediates
-        # It handles the Expert-grouped -> Token-major transition.
-        launch_unpermute_kernel(
-            unpermuted_hidden,        # The [T, H] destination
-            permuted_expert_outputs,  # The [max_out, H] source
-            self._cached_mask_T,      # Cached [E, T] mask
-            self._cached_dest_indices # Cached cumsum indices
-        )
-
-        return unpermuted_hidden
+        
+        return output
 
     def token_combine(self, hidden_states):
         """

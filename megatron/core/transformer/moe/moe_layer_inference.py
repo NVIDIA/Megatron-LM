@@ -107,6 +107,7 @@ class InferenceMoELayer(MoELayer):
                                                                         )  
     def set_is_cuda_graphed_iteration(self, set_to):
         self.is_cuda_graphed_iteration = set_to
+        self.router.set_is_cuda_graphed_iteration(set_to)
 
     def activate_inference_token_dispatcher(self):
         # replace the token dispatcher with the inference-optimized version

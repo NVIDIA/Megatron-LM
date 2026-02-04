@@ -9,6 +9,7 @@ from megatron.core.transformer.moe.moe_layer import MoELayer, MoESubmodules
 from megatron.core.transformer.moe.moe_layer_inference import InferenceMoELayer
 from megatron.core.transformer.moe.shared_experts import SharedExpertMLP
 from megatron.core.transformer.spec_utils import ModuleSpec
+from megatron.core.transformer.moe.router import InferenceTopKRouter
 
 
 def get_moe_module_spec(
@@ -86,14 +87,18 @@ def get_moe_module_spec_for_backend(
 
     # Select MoE layer class based on inference_optimized flag
     if inference_optimized:
-        moe_layer_class = InferenceMoELayer
+        moe_module_spec = ModuleSpec(
+            module=InferenceMoELayer,
+            submodules=MoESubmodules(router=InferenceTopKRouter,
+                                     experts=experts, 
+                                     shared_experts=shared_experts),
+            metainfo={"fuse_pre_mlp_layernorm": False},
+        )
     else:
-        moe_layer_class = MoELayer
-
-    # MoE module spec
-    moe_module_spec = ModuleSpec(
-        module=moe_layer_class,
-        submodules=MoESubmodules(experts=experts, shared_experts=shared_experts),
-        metainfo={"fuse_pre_mlp_layernorm": False},
-    )
+        # MoE module spec
+        moe_module_spec = ModuleSpec(
+            module=MoELayer,
+            submodules=MoESubmodules(experts=experts, shared_experts=shared_experts),
+            metainfo={"fuse_pre_mlp_layernorm": False},
+        )
     return moe_module_spec

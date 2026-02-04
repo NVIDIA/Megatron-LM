@@ -23,7 +23,7 @@ from megatron.core.transformer.moe.moe_utils import (
 )
 from megatron.core.transformer.moe.router_replay import RouterReplay
 from megatron.core.transformer.transformer_config import TransformerConfig
-
+import logging
 
 class Router(ABC, MegatronModule):
     """Base Router class"""
@@ -669,3 +669,83 @@ class TopKRouter(Router):
         """Save the state dict of the router."""
         self._maintain_float32_expert_bias()  # switch to float32 before saving
         return super()._save_to_state_dict(*args, **kwargs)
+
+
+class InferenceTopKRouter(TopKRouter):
+    """Specialized top-k router optimized for inference with specific constraints.
+
+    This router enforces:
+    - moe_router_num_groups: None (no group-limited routing)
+    - moe_router_score_function: sigmoid
+    - moe_router_enable_expert_bias: True
+    """
+
+    def __init__(
+        self, config: TransformerConfig, pg_collection: Optional[ProcessGroupCollection] = None
+    ) -> None:
+        """Initialize the specialized inference top-k router.
+
+        Args:
+            config (TransformerConfig): The configuration for the transformer model.
+            pg_collection (ProcessGroupCollection, optional): Process groups for MoE operations.
+        """
+        # Enforce constraints before calling super().__init__
+        assert (
+            config.moe_router_num_groups is None
+        ), f"InferenceTopKRouter requires moe_router_num_groups=None, got {config.moe_router_num_groups}"
+        assert (
+            config.moe_router_score_function == "sigmoid"
+        ), f"InferenceTopKRouter requires moe_router_score_function='sigmoid', got '{config.moe_router_score_function}'"
+        assert (
+            config.moe_router_enable_expert_bias is True
+        ), f"InferenceTopKRouter requires moe_router_enable_expert_bias=True, got {config.moe_router_enable_expert_bias}"
+
+        super().__init__(config=config, pg_collection=pg_collection)
+
+        self.is_cuda_graphed_iteration = False
+
+    def set_is_cuda_graphed_iteration(self, set_to: bool):
+        self.is_cuda_graphed_iteration = set_to
+
+    def _forward(self, input: torch.Tensor, padding_mask: Optional[torch.Tensor] = None):
+        logits = self.gating(input)  # [num_tokens, num_experts]
+
+        # Apply sigmoid to get independent scores per expert
+        scores = torch.sigmoid(logits.float()).type_as(logits)  # [num_tokens, num_experts]
+
+        # Add expert bias for topk selection (helps with load balancing)
+        scores_for_routing = scores + self.expert_bias  # [num_experts] broadcasted
+
+        # Select top-k experts based on biased scores
+        _, topk_indices = torch.topk(scores_for_routing, k=self.topk, dim=-1)  # [num_tokens, topk]
+
+        # Gather the original sigmoid scores (without bias) for selected experts
+        topk_probs = torch.gather(scores, dim=-1, index=topk_indices)  # [num_tokens, topk]
+
+        # Normalize to get routing probabilities (sum to 1 per token)
+        if self.topk > 1:
+            topk_probs = topk_probs / (topk_probs.sum(dim=-1, keepdim=True) + 1e-20)
+
+        # NOTE: Return format differs from parent class for efficiency:
+        # - Parent: Returns sparse tensors [num_tokens, num_experts] (routing_probs, routing_map)
+        # - This:   Returns dense tensors [num_tokens, topk] (topk_probs, topk_indices)
+        return topk_probs.squeeze(1), topk_indices.squeeze(1)
+
+    def forward(self, input: torch.Tensor, padding_mask: Optional[torch.Tensor] = None):
+        """Simplified forward pass for inference - returns dense tensors only.
+
+        Args:
+            input (torch.Tensor): Input tensor of shape [seq_length, bsz, hidden_size].
+            padding_mask (torch.Tensor, optional): Not used in inference.
+
+        Returns:
+            Tuple[torch.Tensor, torch.Tensor]:
+                - probs: Normalized routing probabilities [num_tokens, topk]
+                - top_indices: Selected expert indices [num_tokens, topk]
+        """
+        # Compute logits via gating network
+        
+        if not self.is_cuda_graphed_iteration:
+            return super().forward(input, padding_mask)
+
+        return self._forward(input, padding_mask)
