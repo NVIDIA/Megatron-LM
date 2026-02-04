@@ -18,6 +18,7 @@ from megatron.core.enums import Fp8Recipe
 from megatron.core.extensions.transformer_engine import TENorm
 from megatron.core.fp8_utils import get_fp8_context
 from megatron.core.inference.contexts import BaseInferenceContext
+from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.ssm.mamba_hybrid_layer_allocation import Symbols as LayerSymbols
 from megatron.core.ssm.mamba_hybrid_layer_allocation import allocate_layers
@@ -148,7 +149,10 @@ class MambaStack(MegatronModule):
                 elif layer_type == LayerSymbols.MOE:
                     # Transformer layers apply their own pp_layer_offset
                     layer = build_module(
-                        submodules.moe_layer, config=self.config, layer_number=i + 1
+                        submodules.moe_layer,
+                        config=self.config,
+                        layer_number=i + 1,
+                        pg_collection=pg_collection,
                     )
                 else:
                     assert False, "unexpected layer_type"
@@ -198,6 +202,37 @@ class MambaStack(MegatronModule):
                 return layer.mamba_state_shapes_per_request()
         return None
 
+    def _should_call_local_cudagraph(self, *args, **kwargs):
+        """
+        Check if we should call the local cudagraph path.
+        """
+        if not self.training and (
+            hasattr(self, 'cudagraph_manager')
+            and kwargs['attention_mask'] is None
+            and (
+                kwargs.get('inference_context') is not None
+                or kwargs.get('inference_params') is not None
+            )
+            and CudaGraphScope.full_iteration in self.config.cuda_graph_scope
+        ):
+            if kwargs['inference_context'].is_static_batching():
+                using_cuda_graph = kwargs['inference_context'].is_decode_only()
+            else:
+                using_cuda_graph = kwargs['inference_context'].using_cuda_graph_this_step()
+
+            if using_cuda_graph:
+                return True
+        return False
+
+    def __call__(self, *args, **kwargs):
+        if self._should_call_local_cudagraph(*args, **kwargs):
+            kwargs['hidden_states'] = (
+                kwargs['hidden_states'].unwrap()
+                if isinstance(kwargs['hidden_states'], WrappedTensor)
+                else kwargs['hidden_states']
+            )
+        return super().__call__(*args, **kwargs)
+
     def forward(
         self,
         hidden_states: Union[Tensor, WrappedTensor],
@@ -206,6 +241,8 @@ class MambaStack(MegatronModule):
         rotary_pos_emb: Optional[Tensor] = None,
         *,
         inference_params: Optional[BaseInferenceContext] = None,
+        packed_seq_params: Optional[PackedSeqParams] = None,
+        padding_mask=None,
     ):
         """
         Forward function of the MambaStack class.
@@ -287,12 +324,15 @@ class MambaStack(MegatronModule):
                             inference_context=inference_context,
                             rotary_pos_emb=rotary_pos_emb,
                             sequence_len_offset=sequence_len_offset,
+                            packed_seq_params=packed_seq_params,
+                            padding_mask=padding_mask,
                         )
                     else:  # MambaLayer
                         hidden_states = layer(
                             hidden_states=hidden_states,
                             attention_mask=attention_mask,
                             inference_context=inference_context,
+                            packed_seq_params=packed_seq_params,
                         )
 
                 # The attention layer (currently a simplified transformer layer)

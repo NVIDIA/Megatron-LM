@@ -1,4 +1,4 @@
-# Copyright (c) 2024, NVIDIA CORPORATION. All rights reserved.
+# Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
 
 import math
@@ -21,6 +21,9 @@ from megatron.core.models.common.embeddings import (
     YarnRotaryEmbedding,
     _yarn_get_mscale,
     apply_rotary_pos_emb,
+)
+from megatron.core.pipeline_parallel.fine_grained_activation_offload import (
+    FineGrainedActivationOffloadingInterface as off_interface,
 )
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.tensor_parallel.layers import ColumnParallelLinear
@@ -240,13 +243,18 @@ class MultiLatentAttention(Attention):
         # Get the query, key and value tensors based on the type of attention -
         # self or cross attn.
         # query: [96, 1, 16, 128], key:[96, 1, 16, 128], value:[96, 1, 16, 128]
-        query, key, value = self.get_query_key_value_tensors(
-            hidden_states,
-            key_value_states,
-            position_ids,
-            packed_seq_params,
-            inference_context=inference_context,
-        )
+        with off_interface(self.offload_qkv_linear, hidden_states, "qkv_linear") as hidden_states:
+            query, key, value, q_compressed, kv_compressed = self.get_query_key_value_tensors(
+                hidden_states,
+                key_value_states,
+                position_ids,
+                packed_seq_params,
+                inference_context=inference_context,
+            )
+        if self.offload_qkv_linear:
+            query = off_interface.group_commit(
+                query, name="qkv_linear", forced_released_tensors=[hidden_states]
+            )
 
         # ===================================================
         # Adjust key, value for inference
@@ -274,14 +282,24 @@ class MultiLatentAttention(Attention):
             )
         else:
             if inference_context is None or inference_context.is_static_batching():
-                core_attn_out = self.core_attention(
-                    query,
-                    key,
-                    value,
-                    attention_mask,
-                    packed_seq_params=packed_seq_params,
-                    attn_mask_type=attn_mask_type,
-                )
+                extra_kwargs = {}
+                if self.config.experimental_attention_variant == "dsa":
+                    # For dsa we need to pass in the original hidden states and the compressed
+                    # query representation.
+                    extra_kwargs["x"] = hidden_states
+                    extra_kwargs["qr"] = q_compressed
+                with off_interface(
+                    self.offload_core_attention and self.training, query, "core_attn"
+                ) as query:
+                    core_attn_out = self.core_attention(
+                        query,
+                        key,
+                        value,
+                        attention_mask,
+                        packed_seq_params=packed_seq_params,
+                        attn_mask_type=attn_mask_type,
+                        **extra_kwargs,
+                    )
             elif self.cache_mla_latents:
                 # Dynamic batching attention kernel.
                 q, k, v = (query, key, value)
@@ -302,6 +320,10 @@ class MultiLatentAttention(Attention):
                 # Only rearrange if not in absorption mode (Flash MLA handles format correctly)
                 if not inference_context.is_decode_only():
                     core_attn_out = rearrange(core_attn_out, 's b h d -> s b (h d)')
+            if self.offload_core_attention and self.training:
+                core_attn_out = off_interface.group_commit(
+                    core_attn_out, name="core_attn", forced_released_tensors=[query, key, value]
+                )
 
         # We are doing absorption with cache mla latents and decode mode.
         if self.cache_mla_latents and inference_context.is_decode_only():
@@ -327,7 +349,12 @@ class MultiLatentAttention(Attention):
         # =================
         # Output. [sq, b, h]
         # =================
-        output, bias = self.linear_proj(core_attn_out)
+        with off_interface(self.offload_attn_proj, core_attn_out, "attn_proj") as core_attn_out:
+            output, bias = self.linear_proj(core_attn_out)
+        if self.offload_attn_proj:
+            output = off_interface.group_commit(
+                output, name="attn_proj", forced_released_tensors=[core_attn_out]
+            )
 
         return output, bias
 
@@ -500,6 +527,11 @@ class MLASelfAttention(MultiLatentAttention):
         assert (
             hidden_states.ndim == 3
         ), f"hidden_states should be 3D, [s, b, n*h], got {hidden_states.ndim}D"
+        if packed_seq_params is not None:
+            assert (
+                packed_seq_params.local_cp_size is None
+            ), "hybrid_context_parallel is not supported with MLA yet and is planned for future. \
+            Please disable hybrid_context_parallel."
 
         inference_context = deprecate_inference_params(inference_context, inference_params)
 
@@ -531,7 +563,7 @@ class MLASelfAttention(MultiLatentAttention):
             else:
                 rotary_pos_emb, mscale = self.rotary_pos_emb(rotary_seq_len, packed_seq=packed_seq)
 
-        if packed_seq_params is not None:
+        if packed_seq_params is not None and packed_seq_params.qkv_format == 'thd':
             if packed_seq_params.cu_seqlens_q_padded is not None:
                 cu_seqlens_q = packed_seq_params.cu_seqlens_q_padded
             else:
@@ -598,6 +630,16 @@ class MLASelfAttention(MultiLatentAttention):
             k_pos_emb = k_pos_emb.squeeze(1)
 
         # =========================================
+        # Apply norm
+        # =========================================
+
+        if self.config.q_lora_rank is not None:
+            # q_compressed: [num_tokens, q_lora_rank]
+            q_compressed = self.q_layernorm(q_compressed)
+
+        kv_compressed = self.kv_layernorm(kv_compressed)
+
+        # =========================================
         # QKV up projection and RoPE apply
         # =========================================
 
@@ -607,7 +649,6 @@ class MLASelfAttention(MultiLatentAttention):
             if self.config.q_lora_rank is not None:
                 # q_compressed: [num_tokens, q_lora_rank]
                 # q: [num_tokens, n * (qk_head_dim + qk_pos_emb_head_dim)]
-                q_compressed = self.q_layernorm(q_compressed)
                 q, _ = self.linear_q_up_proj(q_compressed)
             else:
                 # q_compressed: [num_tokens, hidden_size]
@@ -616,8 +657,6 @@ class MLASelfAttention(MultiLatentAttention):
 
             # q: [num_tokens, n, q_head_dim]
             q = q.view(*q.size()[:-1], self.num_attention_heads_per_partition, self.q_head_dim)
-
-            kv_compressed = self.kv_layernorm(kv_compressed)
 
             # [num_tokens, qk_pos_emb_head_dim] -> [num_tokens, 1, qk_pos_emb_head_dim]
             k_pos_emb = torch.unsqueeze(k_pos_emb, -2)
@@ -682,7 +721,6 @@ class MLASelfAttention(MultiLatentAttention):
             if self.config.q_lora_rank is not None:
                 # q_compressed: [num_tokens, q_lora_rank]
                 # q: [num_tokens, n * (qk_head_dim + qk_pos_emb_head_dim)]
-                q_compressed = self.q_layernorm(q_compressed)
                 q, _ = self.linear_q_up_proj(q_compressed)
             else:
                 # q_compressed: [num_tokens, hidden_size]
@@ -691,8 +729,6 @@ class MLASelfAttention(MultiLatentAttention):
 
             # q: [num_tokens, n, q_head_dim]
             q = q.view(*q.size()[:-1], self.num_attention_heads_per_partition, self.q_head_dim)
-
-            kv_compressed = self.kv_layernorm(kv_compressed)
 
             # kv: [num_tokens, n * (qk_head_dim + v_head_dim)]
             kv, _ = self.linear_kv_up_proj(kv_compressed)
@@ -818,7 +854,7 @@ class MLASelfAttention(MultiLatentAttention):
                     q_compressed, kv_compressed, k_pos_emb, rotary_pos_emb
                 )
 
-        return query, key, value
+        return query, key, value, q_compressed, kv_compressed
 
     def uncompress_kv_from_cache(self, kv_cached):
         """

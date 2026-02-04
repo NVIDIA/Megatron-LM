@@ -20,7 +20,7 @@ dynamic = ["version", "readme"]
 description = "Megatron Core - a library for efficient and scalable training of transformer based models"
 requires-python = ">=3.10"
 license = { text = "Apache 2.0" }
-dependencies = ["torch", "numpy", "packaging>=24.2"]
+dependencies = ["torch>=2.6.0", "numpy", "packaging>=24.2"]
 authors = [{ name = "NVIDIA", email = "nemo-toolkit@nvidia.com" }]
 maintainers = [{ name = "NVIDIA", email = "nemo-toolkit@nvidia.com" }]
 keywords = [
@@ -64,7 +64,7 @@ Download = "https://github.com/NVIDIA/Megatron-LM/releases"
 Homepage = "https://github.com/NVIDIA/Megatron-LM/megatron/core"
 
 [project.optional-dependencies]
-mlm = ["flask-restful", "sentencepiece", "tiktoken", "wandb", "transformers"]
+mlm = ["flask-restful", "sentencepiece", "tiktoken", "wandb", "transformers", "accelerate"]
 
 dev = [
     "nvidia-modelopt[torch]; sys_platform != 'darwin'",
@@ -78,6 +78,7 @@ dev = [
     "opentelemetry-api~=1.33.1",
     "mamba-ssm~=2.2",
     "causal-conv1d~=1.5",
+    "flash-linear-attention~=0.4.0",
     "nv-grouped-gemm~=1.1",
     "megatron-energon[av_decode]~=6.0",
     "av",
@@ -134,13 +135,13 @@ docs = [
     "nvidia-sphinx-theme", # Our NVIDIA theme
 ]
 build = [
-    "setuptools<80.0.0",
+    "setuptools<80.0.0,>=77.0.0",
     "packaging>=24.2",
     "hatchling",
     "pybind11",
     "Cython>=3.0.0",
     "torch",
-    "nvidia-mathdx",     # for TE
+    "nvidia-mathdx",              # for TE
 ]
 linting = [
     "ruff~=0.9.0",
@@ -178,7 +179,7 @@ override-dependencies = [
 flash_mla = [
     { git = "https://github.com/deepseek-ai/FlashMLA", rev = "9edee0c022cd0938148a18e334203b0aab43aa19" },
 ]
-transformer-engine = { git = "https://github.com/NVIDIA/TransformerEngine.git", rev = "release_v2.11" }
+transformer-engine = { git = "https://github.com/NVIDIA/TransformerEngine.git", rev = "d9b7fc5770a88af06e2e9c2bd97b550614c3a69f" }
 nemo-run = { git = "https://github.com/NVIDIA-NeMo/Run.git", rev = "01a9a8ba360f7b2908728ad0516e0ad9d936966d" }
 emerging_optimizers = { git = "https://github.com/NVIDIA-NeMo/Emerging-Optimizers.git", rev = "v0.1.0" }
 

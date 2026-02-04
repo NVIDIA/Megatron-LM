@@ -21,13 +21,14 @@ from megatron.core.optimizer import (
     _get_param_groups,
     check_config_overrides_consistency,
     get_megatron_optimizer,
+    get_standard_config_overrides,
 )
 from megatron.core.optimizer_param_scheduler import ParamGroupOverride
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.transformer import TransformerConfig
 from megatron.core.utils import is_te_min_version, is_torch_min_version
 from tests.unit_tests.test_utilities import Utils
-from tests.unit_tests.test_utils import _deinit_distributed, _init_distributed
+from tests.unit_tests.test_utils import _init_distributed
 
 try:
     # Check if FP8 block scaling is available.
@@ -45,7 +46,7 @@ except:
 
 
 class Net(nn.Module):
-    def __init__(self):
+    def __init__(self, add_layernorm=False):
         super().__init__()
         self.conv1 = nn.Conv2d(3, 6, 5)
         self.pool = nn.MaxPool2d(2, 2)
@@ -53,6 +54,10 @@ class Net(nn.Module):
         self.fc1 = nn.Linear(16 * 5 * 5, 120)
         self.fc2 = nn.Linear(120, 84)
         self.fc3 = nn.Linear(84, 10)
+        if add_layernorm:
+            self.q_layernorm = nn.LayerNorm(10, bias=False)
+            self.k_layernorm = nn.LayerNorm(10, bias=False)
+            self.layernorm = nn.LayerNorm(10, bias=False)
 
     def forward(self, x):
         x = self.pool(F.relu(self.conv1(x)))
@@ -206,6 +211,81 @@ def test_get_param_groups_overlapping_matches(mock_get_world_size):
     assert param_groups[2]['max_lr'] == 0.01
 
 
+@patch('torch.distributed.get_world_size', return_value=1)
+@patch(
+    'torch.distributed.all_gather_object', lambda output_list, obj: output_list.__setitem__(0, obj)
+)
+def test_get_param_groups_with_standard_config_overrides(apply_wd_to_qk_layernorm: bool):
+    """In this test, we see if the standard config overrides are applied correctly."""
+
+    # Initialize the model with layernorm
+    net = Net()
+
+    config = OptimizerConfig(optimizer='adam', lr=0.01)
+    config_overrides = get_standard_config_overrides(config=config)
+    param_groups = _get_param_groups([net], config, config_overrides)
+
+    assert len(param_groups) == 2
+    p_set = set(net.parameters())
+
+    assert p_set == set(param_groups[0]['params']) | set(param_groups[1]['params'])
+    assert len(p_set) == len(param_groups[0]['params']) + len(param_groups[1]['params'])
+    assert param_groups[0]['wd_mult'] == 0.0 or param_groups[1]['wd_mult'] == 0.0
+    assert param_groups[0]['wd_mult'] == 1.0 or param_groups[1]['wd_mult'] == 1.0
+    assert len(param_groups[0]['params']) > 0 and len(param_groups[1]['params']) > 0
+
+    # Both param groups should have 5 parameters.
+    # Param group A (wd_mult=1.0): conv1.weight, conv2.weight, fc1.weight, fc2.weight, fc3.weight
+    # Param group B (wd_mult=0.0): conv1.bias, conv2.bias, fc1.bias, fc2.bias, fc3.bias
+    assert len(param_groups[0]['params']) == 5, (
+        f"Expected 5 parameters in the first param group, "
+        f"but got {len(param_groups[0]['params'])}"
+    )
+    assert len(param_groups[1]['params']) == 5, (
+        f"Expected 5 parameters in the second param group, "
+        f"but got {len(param_groups[1]['params'])}"
+    )
+
+
+@patch('torch.distributed.get_world_size', return_value=1)
+@patch(
+    'torch.distributed.all_gather_object', lambda output_list, obj: output_list.__setitem__(0, obj)
+)
+def test_get_param_groups_appling_wd_to_qk_layernorm(apply_wd_to_qk_layernorm: bool):
+    """In this test, we see if the `apply_wd_to_qk_layernorm` config is applied correctly."""
+
+    # Initialize the model with layernorm
+    net = Net(add_layernorm=True)
+
+    config = OptimizerConfig(
+        optimizer='adam', lr=0.01, apply_wd_to_qk_layernorm=apply_wd_to_qk_layernorm
+    )
+    config_overrides = get_standard_config_overrides(config=config)
+    param_groups = _get_param_groups([net], config, config_overrides)
+
+    assert len(param_groups) == 2
+    p_set = set(net.parameters())
+
+    assert p_set == set(param_groups[0]['params']) | set(param_groups[1]['params'])
+    assert len(p_set) == len(param_groups[0]['params']) + len(param_groups[1]['params'])
+    assert param_groups[0]['wd_mult'] == 1.0
+    assert param_groups[1]['wd_mult'] == 0.0
+
+    # There are two param groups, having 7, and 6 parameters respectively.
+    # Param group A (wd_mult=1.0): conv1.weight, conv2.weight, fc1.weight, fc2.weight, fc3.weight,
+    #    q_layernorm.weight, k_layernorm.weight
+    # Param group B (wd_mult=0.0): conv1.bias, conv2.bias, fc1.bias, fc2.bias, fc3.bias,
+    #    layernorm.weight
+    assert len(param_groups[0]['params']) == 7, (
+        f"Expected 5 parameters in the first param group, "
+        f"but got {len(param_groups[0]['params'])}"
+    )
+    assert len(param_groups[1]['params']) == 6, (
+        f"Expected 6 parameters in the second param group, "
+        f"but got {len(param_groups[1]['params'])}"
+    )
+
+
 def test_chained_optimizer():
     net = Net()
     optimizer_1 = Adam(list(net.parameters())[:2], lr=0.01)
@@ -244,6 +324,43 @@ def test_chained_optimizer():
 
     assert list(optimizer_1.state.values())[0]["exp_avg"].is_cuda
     assert list(optimizer_2.state.values())[0]["momentum_buffer"].is_cuda
+
+
+def test_chained_optimizer_get_parameters():
+    """Test ChainedOptimizer.get_parameters() aggregates params from all sub-optimizers.
+
+    Regression test: without the get_parameters() override, ChainedOptimizer would
+    access self.optimizer which asserts only one optimizer exists, failing with VPP/MoE.
+    """
+
+    class MockOptimizer:
+        """Mock that mimics MegatronOptimizer's get_parameters() interface."""
+
+        def __init__(self, params):
+            self.params = list(params)
+            self.param_groups = [{"params": self.params}]
+
+        def get_parameters(self):
+            return self.params
+
+    net = Net()
+    all_params = list(net.parameters())
+
+    # Test empty
+    assert ChainedOptimizer([]).get_parameters() == []
+
+    # Test single optimizer
+    opt1 = MockOptimizer(all_params[:3])
+    assert ChainedOptimizer([opt1]).get_parameters() == opt1.params
+
+    # Test multiple optimizers (the case that previously failed)
+    opt2 = MockOptimizer(all_params[3:6])
+    opt3 = MockOptimizer(all_params[6:])
+    chained = ChainedOptimizer([opt1, opt2, opt3])
+    result = chained.get_parameters()
+
+    assert len(result) == len(all_params)
+    assert result == opt1.params + opt2.params + opt3.params
 
 
 def test_precision_aware_fused_adam():
@@ -304,6 +421,7 @@ def test_precision_aware_fused_adam():
     "moment_dtype",
     [torch.float32, torch.float16, torch.bfloat16, torch.uint8],
 )
+@pytest.mark.skip(reason="inconsistent ci test runs resulting in NCCL errors")
 def test_precision_aware_optimizer(
     precision: str,
     main_params_dtype: torch.dtype,

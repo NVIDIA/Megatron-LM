@@ -50,11 +50,8 @@ except ImportError:
     HAVE_TE = False
 
 try:
-    import nvidia_kitchen  # type: ignore[import-not-found]  # pylint: disable=unused-import
+    from megatron.core.extensions.kitchen import HAVE_KITCHEN, KitchenSpecProvider
 
-    from megatron.core.extensions.kitchen import KitchenSpecProvider
-
-    HAVE_KITCHEN = True
 except ImportError:
     HAVE_KITCHEN = False
 
@@ -192,6 +189,7 @@ def get_gpt_layer_with_transformer_engine_spec(
         num_experts (int, optional): Number of experts. Defaults to None.
         moe_grouped_gemm (bool, optional): To use Grouped GEMM. Defaults to False.
         qk_layernorm (bool, optional): To use layernorm for queries/keys. Defaults to False.
+        multi_latent_attention (bool, optional): To use MLA. Defaults to False.
         fp8 (str, optional): Deprecated. For temporary Nemo compatibility.
         moe_use_legacy_grouped_gemm (bool, optional): Force use the legacy GroupedMLP.
                                                       Defaults to False.
@@ -325,6 +323,7 @@ def get_gpt_layer_local_spec(
         num_experts (int, optional): Number of experts. Defaults to None.
         moe_grouped_gemm (bool, optional): To use Grouped GEMM. Defaults to False.
         qk_layernorm (bool, optional): To use layernorm for queries/keys. Defaults to False.
+        multi_latent_attention (bool, optional): To use MLA. Defaults to False.
         fp8 (str, optional): Deprecated. For temporary Nemo compatibility.
         moe_use_legacy_grouped_gemm (bool, optional): Force use the legacy GroupedMLP.
                                                       Defaults to False.
