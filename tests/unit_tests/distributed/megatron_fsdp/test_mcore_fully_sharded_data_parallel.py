@@ -96,6 +96,8 @@ class TestFullyShardedDataParallel:
         """Test that FSDP works correctly with different process group configurations."""
         if not is_torch_min_version("2.4.0"):
             pytest.skip("Megatron FSDP requires torch >= 2.4.0")
+        if dp_size > torch.cuda.device_count():
+            pytest.skip(f"Test requires {dp_size} GPUs, but only {torch.cuda.device_count()} are available")
 
         # Initialize torch.distributed if not already initialized
         if not torch.distributed.is_initialized():
@@ -240,6 +242,8 @@ class TestFullyShardedDataParallel:
         """
         if not is_torch_min_version("2.4.0"):
             pytest.skip("Megatron FSDP requires torch >= 2.4.0")
+        if dp_size > torch.cuda.device_count():
+            pytest.skip(f"Test requires {dp_size} GPUs, but only {torch.cuda.device_count()} are available")
 
         # Skip nccl_ub=True cases if PyTorch version is less than 2.7.0
         if nccl_ub and version.parse(torch.__version__) < version.parse('2.7.0'):
@@ -638,20 +642,22 @@ class TestMegatronFSDPE2E:
     @pytest.mark.parametrize(
         ("fsdp_sharding_strategy", "use_double_buffer", "mixed_precision_config"),
         [
-            ("optim_grads_params", False, {}),
-            ("optim_grads_params", True, {}),
-            (
+            pytest.param("optim_grads_params", False, {}, id="optim_grads_params_no_double_buffer"),
+            pytest.param("optim_grads_params", True, {}, id="optim_grads_params_double_buffer"),
+            pytest.param(
                 "optim_grads_params",
                 True,
-                {"fp8_recipe": "mxfp8", "fp8_format": "e4m3", "fp8_param_gather": True},
+                {"fp8_recipe": "mxfp8", "fp8": "e4m3", "fp8_param_gather": True},
+                id="optim_grads_params_mxfp8_double_buffer",
             ),
-            (
+            pytest.param(
                 "optim_grads_params",
                 True,
-                {"fp4_recipe": "nvfp4", "fp4_format": "e2m1", "fp4_param_gather": True},
+                {"fp4_recipe": "nvfp4", "fp4": "e2m1", "fp4_param_gather": True},
+                id="optim_grads_params_nvfp4_double_buffer",
             ),
-            ("optim_grads", False, {}),
-            ("optim", True, {}),
+            pytest.param("optim_grads", False, {}, id="optim_grads_no_double_buffer"),
+            pytest.param("optim", True, {}, id="optim_double_buffer"),
         ],
     )
     def test_compatible_with_nd_parallel(

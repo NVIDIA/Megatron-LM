@@ -1711,6 +1711,7 @@ def _add_network_size_args(parser):
         # args uses same var with a different name
         "num_moe_experts",
         "fp8_param",
+        "fp4_param",
         # incompatible defaults in dataclass
         "gradient_accumulation_fusion",
         "overlap_p2p_comm",

@@ -2055,16 +2055,6 @@ class ParamAndGradBuffer:
             # Currently, only mxfp8 needs it.
             should_create_transpose_weight_buffer = (param_dtype == "nvfp8_t")
 
-            # Check if the parameter group needs a transpose buffer for model weights.
-            # Currently, only mxfp8 needs it.
-            need_transpose_data = is_float8tensor(one_param) and fp8_need_transpose_data(one_param)
-            need_transpose_data_for_meta_device_init = meta_device_init_fp8_params.get(
-                self.param_to_name[one_param], (False, False)
-            )[1]
-            should_create_transpose_weight_buffer = (
-                need_transpose_data or need_transpose_data_for_meta_device_init
-            )
-
             # Check if the parameter group requires a grad buffer or main weight buffer.
             should_create_grad_buffer_or_main_weight_buffer = (
                 not self.only_create_grad_buffer_and_main_weight_buffer_for_param_requires_grad
