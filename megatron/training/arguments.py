@@ -343,13 +343,18 @@ def validate_args(args, defaults={}):
         assert not (args.rl_partial_rollouts and args.rl_remove_kv_cache_during_training), \
             "Cannot use both partial-rollouts and remove-kv-cache-during-training"
 
-        assert not (
-            args.rl_offload_inference_model_weights_when_idle
-            and args.rl_inference_model_unified_memory_level != 1
-        ), (
-            "--rl-offload-inference-model-weights-when-idle requires "
-            "--rl-inference-model-unified-memory-level=1."
-        )
+        # Validate inference model offloading - requires either UVM or torch_memory_saver
+        if args.rl_offload_inference_model_weights_when_idle:
+            if args.rl_inference_model_unified_memory_level != 1:
+                # Not using UVM, so we need torch_memory_saver
+                try:
+                    from torch_memory_saver import torch_memory_saver
+                except ImportError:
+                    raise AssertionError(
+                        "To use --rl-offload-inference-model-weights-when-idle without UVM "
+                        "(--rl-inference-model-unified-memory-level=1), `torch_memory_saver` must be "
+                        "installed. See https://github.com/fzyzcjy/torch_memory_saver."
+                    )
 
         # When using different EP sizes for inference and training (EP refit), the legacy
         # GroupedMLP is not supported. Only SequentialMLP or TEGroupedMLP can be used.
@@ -499,79 +504,6 @@ def validate_args(args, defaults={}):
         print_rank_0('setting global batch size to {}'.format(args.global_batch_size))
     assert args.global_batch_size > 0
 
-    # === MTP validation ===
-    # Deprecation warnings for legacy MTP arguments
-    if args.mtp_hybrid_override_pattern is not None:
-        warn_rank_0(
-            "--mtp-hybrid-override-pattern is deprecated. "
-            "For new hybrid models with MTP models, use unified --hybrid-override-pattern instead. "
-            "Example: 'M*M*/MM/MM' means main='M*M*', MTP pattern='MM' with 2 depths. "
-            "This argument is kept only for loading old checkpoints.",
-            args.rank,
-        )
-
-    # Backward compatibility: convert legacy mtp_hybrid_override_pattern to unified format
-    from megatron.core.ssm.mamba_hybrid_layer_allocation import Symbols, parse_hybrid_pattern
-    sep = Symbols.MTP_SEPARATOR
-    if (
-        getattr(args, 'mtp_hybrid_override_pattern', None) is not None
-        and args.mtp_num_layers is not None
-        and args.mtp_num_layers > 0
-        and (args.hybrid_override_pattern is None or sep not in args.hybrid_override_pattern)
-    ):
-        main_pattern = args.hybrid_override_pattern or ''
-        mtp_pattern = args.mtp_hybrid_override_pattern
-        args.hybrid_override_pattern = main_pattern + sep + sep.join([mtp_pattern] * args.mtp_num_layers)
-        args.mtp_hybrid_override_pattern = None
-        print_rank_0(f"Converted legacy MTP pattern to unified: {args.hybrid_override_pattern}")
-
-    # Infer mtp_num_layers from unified pattern
-    if args.hybrid_override_pattern and sep in args.hybrid_override_pattern:
-        parsed = parse_hybrid_pattern(args.hybrid_override_pattern)
-        if parsed.mtp_pattern and parsed.mtp_num_depths > 0:
-            inferred_mtp_num_layers = parsed.mtp_num_depths
-            if args.mtp_num_layers is None:
-                args.mtp_num_layers = inferred_mtp_num_layers
-            elif args.mtp_num_layers != inferred_mtp_num_layers:
-                warn_rank_0(
-                    f"--mtp-num-layers ({args.mtp_num_layers}) conflicts with "
-                    f"MTP depth count ({inferred_mtp_num_layers}) in pattern '{args.hybrid_override_pattern}'. "
-                    f"Using the inferred value ({inferred_mtp_num_layers}).",
-                    args.rank
-                )
-                args.mtp_num_layers = inferred_mtp_num_layers
-
-    # MTP validation
-    if args.mtp_num_layers:
-        assert not args.use_legacy_models, "The legacy Megatron models does not support Multi-Token Prediction (MTP)."
-        assert args.position_embedding_type == "rope" or args.position_embedding_type == "none", (
-            f"Multi-Token Prediction (MTP) is not supported with {args.position_embedding_type} position embedding type."
-            + f"The supported position embedding types are rope and none."
-        )
-
-    # Validate MTP args for hybrid vs non-hybrid models
-    if args.is_hybrid_model:
-        # Mamba/hybrid model MTP validation
-        if args.mtp_num_layers and not (args.hybrid_override_pattern and sep in args.hybrid_override_pattern):
-            # Hybrid model wants MTP but no unified pattern - check for legacy args
-            if args.mtp_hybrid_override_pattern is None:
-                warn_rank_0(
-                    "Hybrid model with --mtp-num-layers but no MTP pattern. "
-                    "Use unified --hybrid-override-pattern with '/' separator (e.g., 'M*M*/MM/MM') "
-                    "or legacy --mtp-hybrid-override-pattern for old checkpoints.",
-                    args.rank
-                )
-    else:
-        # Non-hybrid (GPT) model MTP validation
-        if args.mtp_hybrid_override_pattern is not None:
-            warn_rank_0(
-                "--mtp-hybrid-override-pattern is for Mamba/hybrid models only. "
-                "For GPT models, MTP replicates the main transformer layer structure. "
-                "This argument will be ignored.",
-                args.rank
-            )
-    # === End of MTP validation ===
-    
     # Uneven virtual pipeline parallelism
     assert (
         int(args.num_layers_per_virtual_pipeline_stage is not None)
@@ -1301,9 +1233,11 @@ def validate_args(args, defaults={}):
 
     if args.mtp_num_layers:
         assert not args.use_legacy_models, "The legacy Megatron models does not support Multi-Token Prediction (MTP)."
-        assert args.position_embedding_type == "rope" or args.position_embedding_type == "none", (
-            f"Multi-Token Prediction (MTP) is not supported with {args.position_embedding_type} position embedding type."
-            + f"The supported position embedding types are rope and none."
+        # MTP is compatible with position embedding types that use position_ids.
+        supported_position_types = ["learned_absolute", "rope", "mrope", "none"]
+        assert args.position_embedding_type in supported_position_types, (
+            f"Multi-Token Prediction (MTP) is not supported with '{args.position_embedding_type}' position embedding type. "
+            f"The supported position embedding types are: {', '.join(supported_position_types)}."
         )
 
     if args.cpu_offloading_num_layers > 0:
@@ -2045,9 +1979,10 @@ def _add_rl_args(parser):
         required=False,
         default=False,
         help=(
-            'When using a separate RL inference model with UVM-enabled parameters, prefetch its weights '
-            'to CPU when not doing rollout inference, and prefetch back to GPU right before inference. '
-            'Requires --rl-inference-model-unified-memory-level=1.'
+            'When using a separate RL inference model, offload its weights to CPU when not doing rollout '
+            'inference, and restore to GPU right before inference. Works with two backends: '
+            '1) UVM (when --rl-inference-model-unified-memory-level=1), or '
+            '2) torch_memory_saver (when UVM is not enabled; requires torch_memory_saver to be installed).'
         ),
     )
     group.add_argument('--refit-method', type=str, default='gloo',
