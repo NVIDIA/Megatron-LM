@@ -8,7 +8,7 @@ This example demonstrates:
 - Hybrid architecture with Mamba (M), Attention (A), and MoE (E) layers
 - Pipeline parallelism across 4 stages
 - Expert parallelism for MoE layers
-- LayerConfig for shared settings with per-layer overrides
+- CommonLayerConfig for shared settings with per-layer overrides
 """
 
 from megatron.core.models.hl import (

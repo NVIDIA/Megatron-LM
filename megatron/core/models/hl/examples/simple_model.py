@@ -10,7 +10,7 @@ This example demonstrates:
 - Simple layer pattern without pipeline stages
 - Dense MLP layers (no MoE)
 - Basic parallelism configuration (TP=8, SP enabled)
-- LayerConfig for shared settings with per-layer overrides
+- CommonLayerConfig for shared settings with per-layer overrides
 """
 
 from megatron.core.models.hl import (
