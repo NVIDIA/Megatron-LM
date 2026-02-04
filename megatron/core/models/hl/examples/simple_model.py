@@ -14,10 +14,10 @@ This example demonstrates:
 """
 
 from megatron.core.models.hl import (
-    HLModel,
+    AttentionLayerConfig,
     CommonConfig,
     EmbeddingLayerConfig,
-    AttentionLayerConfig,
+    HLModel,
     MLPLayerConfig,
 )
 
@@ -27,10 +27,7 @@ from megatron.core.models.hl import (
 
 # Shared settings inherited by all layers (can be overridden per-layer)
 common_config = CommonConfig(
-    hidden_size=4096,
-    bf16=True,
-    tensor_model_parallel_size=8,
-    sequence_parallel=True,
+    hidden_size=4096, bf16=True, tensor_model_parallel_size=8, sequence_parallel=True
 )
 
 # =============================================================================
@@ -53,11 +50,7 @@ Attention = AttentionLayerConfig(
     use_flash_attention=True,
 )
 
-Mlp = MLPLayerConfig(
-    common_config=common_config,
-    ffn_hidden_size=14336,
-    activation="swiglu",
-)
+Mlp = MLPLayerConfig(common_config=common_config, ffn_hidden_size=14336, activation="swiglu")
 
 # =============================================================================
 # LAYER PATTERN

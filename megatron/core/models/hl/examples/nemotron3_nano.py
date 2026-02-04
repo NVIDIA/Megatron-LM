@@ -12,10 +12,10 @@ This example demonstrates:
 """
 
 from megatron.core.models.hl import (
-    HLModel,
+    AttentionLayerConfig,
     CommonConfig,
     EmbeddingLayerConfig,
-    AttentionLayerConfig,
+    HLModel,
     MambaLayerConfig,
     MoELayerConfig,
     PipelineSplit,
@@ -27,16 +27,12 @@ from megatron.core.models.hl import (
 
 # Shared settings inherited by all layers (can be overridden per-layer)
 common_config = CommonConfig(
-    hidden_size=2688,
-    bf16=True,
-    tensor_model_parallel_size=8,
-    sequence_parallel=True,
+    hidden_size=2688, bf16=True, tensor_model_parallel_size=8, sequence_parallel=True
 )
 
 # MoE-specific configuration (copy of common_config with expert parallelism)
 moe_common_config = common_config.update(
-    expert_model_parallel_size=16,
-    expert_tensor_parallel_size=8,
+    expert_model_parallel_size=16, expert_tensor_parallel_size=8
 )
 
 # =============================================================================
@@ -51,11 +47,7 @@ Embedding = EmbeddingLayerConfig(
 )
 
 Mamba = MambaLayerConfig(
-    common_config=common_config,
-    num_heads=64,
-    head_dim=64,
-    state_size=128,
-    conv_kernel_size=4,
+    common_config=common_config, num_heads=64, head_dim=64, state_size=128, conv_kernel_size=4
 )
 
 Attention = AttentionLayerConfig(
