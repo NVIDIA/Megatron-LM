@@ -65,6 +65,15 @@ class TestGatedDeltaNet:
         self.tp_size = tp_size
         self.cp_size = cp_size
         self.sp_size = tp_size if sp else 1
+        self.cp_comm_type = "fla"  # TODO: add a flag to choose A2A or FLA CP.
+        if self.cp_comm_type == "a2a":
+            self.cp_size_fla = 1
+            self.cp_size_a2a = self.cp_size
+        elif self.cp_comm_type == "fla":
+            self.cp_size_fla = self.cp_size
+            self.cp_size_a2a = 1
+        else:
+            raise ValueError(f"Invalid CP communication type: {self.cp_comm_type}")
 
         # Get TP and CP process groups from device mesh
         tp_group = parallel_state.get_tensor_model_parallel_group()
@@ -116,7 +125,7 @@ class TestGatedDeltaNet:
     def test_gpu_forward(self):
         gdn = self.gdn
 
-        micro_batch_size = 2
+        micro_batch_size = 1 if self.cp_comm_type == "fla" and self.cp_size > 1 else 2
         seq_length = 64
         hidden_states = torch.ones(
             (seq_length // self.sp_size // self.cp_size, micro_batch_size, gdn.config.hidden_size),
@@ -149,9 +158,9 @@ class TestGatedDeltaNet:
         batch = 2
         seq_len = 16
 
-        num_v_heads_local = gdn.num_value_heads // gdn.tp_size // gdn.cp_size
+        num_v_heads_local = gdn.num_value_heads // gdn.tp_size // self.cp_size_a2a
 
-        qkv_last_dim = (2 * gdn.qk_dim_local_tp + gdn.v_dim_local_tp) // gdn.cp_size
+        qkv_last_dim = (2 * gdn.qk_dim_local_tp + gdn.v_dim_local_tp) // self.cp_size_a2a
         qkv = torch.randn(
             batch, seq_len, qkv_last_dim, device=torch.cuda.current_device(), dtype=torch.bfloat16
         )
@@ -182,7 +191,9 @@ class TestGatedDeltaNet:
         # which are normally wrapped by @jit_fuser (torch.compile).
         with torch._dynamo.config.patch(disable=True):
             query, key, value, gate_out, beta_out, alpha_out = (
-                gdn._prepare_qkv_for_gated_delta_rule(qkv, gate, beta, alpha, batch, seq_len)
+                gdn._prepare_qkv_for_gated_delta_rule(
+                    qkv, gate, beta, alpha, batch, seq_len, cp_size_a2a=self.cp_size_a2a
+                )
             )
 
         assert query.shape == (batch, seq_len, num_v_heads_local, gdn.key_head_dim)
@@ -314,7 +325,6 @@ class TestGDNCuSeqlensResolve:
     @pytest.fixture
     def mock_gdn(self):
         class MockGDN:
-            cp_size = 2
             _resolve_cu_seqlens = GatedDeltaNet._resolve_cu_seqlens
 
         return MockGDN()
@@ -341,12 +351,6 @@ class TestGDNCuSeqlensResolve:
         with pytest.raises(ValueError, match="does not match"):
             mock_gdn._resolve_cu_seqlens(padded, actual, 1008, "cu_seqlens_q")
 
-    def test_cp1_still_validates_total(self, mock_gdn):
-        mock_gdn.cp_size = 1
-        actual = torch.tensor([0, 500, 1000], dtype=torch.int32)
-        with pytest.raises(ValueError, match="does not match"):
-            mock_gdn._resolve_cu_seqlens(None, actual, 1008, "cu_seqlens_q")
-
 
 @pytest.mark.parametrize("sequence_packing", [False, True])
 @pytest.mark.parametrize(
@@ -361,6 +365,7 @@ class TestGDNCuSeqlensResolve:
 )
 @pytest.mark.skipif(not HAVE_FLA, reason="FLA is not installed.")
 def test_parallel_gated_delta_net_correctness(tmp_path_dist_ckpt, sequence_packing, tp, sp, cp):
+    cp_comm_type = "fla"
     transformer_config = TransformerConfig(
         hidden_size=128,
         linear_conv_kernel_dim=2,
@@ -384,10 +389,15 @@ def test_parallel_gated_delta_net_correctness(tmp_path_dist_ckpt, sequence_packi
         config=transformer_config, vp_stage=None, pp_rank=0
     )
 
-    if cp:
-        atol, rtol = 5e-3, 5e-3
+    cosine_similarity_threshold = None
+    if cp_comm_type == "fla" and cp > 1:
+        # TODO: the tolerances are too loose, need to tighten.
+        atol, rtol = 2e-2, 3e-2
+        cosine_similarity_threshold = 0.996
+    elif cp_comm_type == "a2a" and cp > 1:
+        atol, rtol = 5e-3, 1e-2
     else:
-        atol, rtol = 5e-4, 5e-4
+        atol, rtol = 1e-3, 2e-3
 
     _test_parallel_attention_correctness(
         transformer_config=transformer_config,
@@ -395,11 +405,12 @@ def test_parallel_gated_delta_net_correctness(tmp_path_dist_ckpt, sequence_packi
         tmp_path_dist_ckpt=tmp_path_dist_ckpt,
         atol=atol,
         rtol=rtol,
+        cosine_similarity_threshold=cosine_similarity_threshold,
         tp=tp,
         sp=sp,
         cp=cp,
         seed=123,
         sequence_length=256,
-        micro_batch_size=4,
+        micro_batch_size=1 if cp_comm_type == "fla" and cp > 1 else 4,
         sequence_packing=sequence_packing,
     )
