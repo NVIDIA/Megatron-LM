@@ -196,13 +196,12 @@ def _apply_rotary_pos_emb_thd(
     Returns:
         Tensor: Shape [t, h, d]. The input tensor after applying RoPE.
     """
+
     if cp_group is None:
         raise ValueError("cp_group must be provided for THD format RoPE")
     cp_size = cp_group.size()
     cp_rank = cp_group.rank()
     seqlens = ((cu_seqlens[1:] - cu_seqlens[:-1]) // cp_size).tolist()
-
-    print(freqs.size(0), cu_seqlens[-1], cu_seqlens.shape, freqs.size(0) == cu_seqlens[-1])
 
     # Handle two different frequency tensor formats:
     # 1. If freqs.size(0) == cu_seqlens[-1]: freqs contains all positions across all sequences

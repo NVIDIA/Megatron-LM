@@ -3141,8 +3141,6 @@ def evaluate(
             if verbose:
                 print_rank_0(f'Evaluating iter {iteration}/{eval_iters}')
 
-            print_rank_0("data: {}".format(str(data_iterator)))
-
             # Don't care about timing during evaluation
             config.timers = None
             ft_integration.on_eval_step_start()

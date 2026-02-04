@@ -108,8 +108,6 @@ class SFTDataset(MegatronDataset):
         eod = tokenizer.eod
         pad = tokenizer.pad
 
-        print("pad tokens", tokenizer.pad, "type", type(tokenizer))
-
         # TODO(duncan): Track number of convs dropped and/or truncated and amount of end-padding
         for conversation in split_conversations:
 
@@ -166,8 +164,6 @@ class SFTDataset(MegatronDataset):
         assert len(pack_tokens) == pack_length + 1
         assert len(pack_targets) == pack_length + 1
         assert len(pack_positions) == pack_length + 1
-
-        print("pack_targets", pack_targets[1:])
 
         # Align and convert to tensors
         input_ids    = torch.tensor(pack_tokens[:-1],  dtype=torch.int64)

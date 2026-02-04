@@ -135,7 +135,6 @@ def _load_teacher_model(config, config_raw: Namespace, model_kwargs: Dict[str, A
                 local_core_attention=False if config.context_parallel_size > 1 else args.export_force_local_attention,
                 remap_te_layernorm=args.export_te_mcore_model,
                 real_quant_cfg=args.export_real_quant_cfg,
-                #use_arbitrary_attention_mask=False if config.context_parallel_size > 1 else True,
                 use_arbitrary_attention_mask=False,
             )
         teacher = MCoreGPTModel(config=config, **model_kwargs)
@@ -227,21 +226,17 @@ def modelopt_gpt_mamba_builder(
                 use_te=args.transformer_impl == "transformer_engine",
             )
         else:
-            local_core_attention=args.export_force_local_attention
             if config.context_parallel_size > 1:
                 print_rank_0("context_parallel_size > 1! Force using TEDotProductAttention!")
                 local_core_attention=False
-                print_rank_0("context_parallel_size > 1! Force attention_mask_type to Causal. This can be wrong for EAGLE training!")
-                use_arbitrary_attention_mask = False
             else:
-                use_arbitrary_attention_mask = True
+                local_core_attention=args.export_force_local_attention
 
             transformer_layer_spec = get_gpt_modelopt_spec(
                 config=config,
                 local_core_attention=local_core_attention,
                 remap_te_layernorm=args.export_te_mcore_model,
                 real_quant_cfg=args.export_real_quant_cfg,
-                #use_arbitrary_attention_mask=use_arbitrary_attention_mask,
                 use_arbitrary_attention_mask=False,
             )
 
