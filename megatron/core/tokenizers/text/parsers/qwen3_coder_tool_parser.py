@@ -1,8 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
-#### TODO: This parser was copied from vLLM and modified to work with megatron-lm inference
-
 import ast
 import json
 import logging

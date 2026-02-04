@@ -1,3 +1,4 @@
+# Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 from megatron.core.tokenizers.text.parsers.base_parser import BaseParser
 
 

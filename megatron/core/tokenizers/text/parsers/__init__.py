@@ -1,3 +1,4 @@
+# Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 from megatron.core.tokenizers.text.parsers.deepseek_r1_reasoning_parser import (
     DeepSeekR1ReasoningParser,
 )
