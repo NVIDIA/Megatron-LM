@@ -2092,8 +2092,7 @@ def get_tensor_shapes(
     config,
     tp_group: torch.distributed.ProcessGroup,
     cp_group: torch.distributed.ProcessGroup,
-    pp_rank: int = None,
-    pp_size: int = None,
+    pp_group: torch.distributed.ProcessGroup = None,
     is_recv: bool = True,
 ):
     """
@@ -2119,7 +2118,9 @@ def get_tensor_shapes(
 
     # Determine hidden dimension based on hyper connections and pipeline stage
     hidden_dim = config.hidden_size
-    if config.enable_hyper_connections and pp_rank is not None and pp_size is not None:
+    if config.enable_hyper_connections and pp_group is not None:
+        pp_rank = pp_group.rank()
+        pp_size = pp_group.size()
         # For hyper connections:
         # - recv: stages with rank > 0 receive n-stream (n*C) from previous stage
         # - send: stages with rank < pp_size-1 send n-stream (n*C) to next stage
@@ -2280,7 +2281,6 @@ def forward_backward_pipelining_without_interleaving(
     model_type = get_model_type(model)
 
     rank = p2p_communicator.pp_group.rank()
-    pp_size = p2p_communicator.pp_group.size()
     recv_tensor_shapes = get_tensor_shapes(
         seq_length=seq_length,
         micro_batch_size=micro_batch_size,
@@ -2288,8 +2288,7 @@ def forward_backward_pipelining_without_interleaving(
         config=config,
         tp_group=tp_group,
         cp_group=cp_group,
-        pp_rank=rank,
-        pp_size=pp_size,
+        pp_group=p2p_communicator.pp_group,
         is_recv=True,
     )
     send_tensor_shapes = get_tensor_shapes(
@@ -2299,8 +2298,7 @@ def forward_backward_pipelining_without_interleaving(
         config=config,
         tp_group=tp_group,
         cp_group=cp_group,
-        pp_rank=rank,
-        pp_size=pp_size,
+        pp_group=p2p_communicator.pp_group,
         is_recv=False,
     )
     if adjust_tensor_shapes_fn is not None:
