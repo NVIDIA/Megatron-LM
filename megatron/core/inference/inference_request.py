@@ -161,7 +161,9 @@ class InferenceRequest:
 # =========================================================================
 
 # Constants for hash computation
-HASH_PRIME = 1000000007
+# Using 2^61 - 1 (Mersenne prime) for ~10^18 hash space, reducing collision probability
+# from ~10^-9 to ~10^-18 compared to the previous prime (1000000007).
+HASH_PRIME = 2305843009213693951
 HASH_BASE = 31
 
 
@@ -190,7 +192,9 @@ def compute_block_hash(parent_hash: int, token_ids: torch.Tensor) -> int:
 class DynamicInferenceEventType(Enum):
     """Dynamic inference event type."""
 
-    ADD = auto()
+    ADD_ENGINE = auto()    # When request is added to engine via _add_request()
+    ADD_CONTEXT = auto()   # When request is added to context (scheduled for prefill)
+    FIRST_TOKEN = auto()   # When first output token is about to be generated
     PAUSE = auto()
     EVICT = auto()
     FINISH = auto()
@@ -431,9 +435,17 @@ class DynamicInferenceRequest(InferenceRequest):
         """Add event."""
         self.events.append(DynamicInferenceEvent(type=type, payload=payload))
 
-    def add_event_add(self):
-        """Add 'add' event."""
-        return self.add_event(DynamicInferenceEventType.ADD)
+    def add_event_add_engine(self):
+        """Add 'add_engine' event - called when request enters the engine queue."""
+        return self.add_event(DynamicInferenceEventType.ADD_ENGINE)
+
+    def add_event_add_context(self):
+        """Add 'add_context' event - called when request is added to context for prefill."""
+        return self.add_event(DynamicInferenceEventType.ADD_CONTEXT)
+
+    def add_event_first_token(self):
+        """Add 'first_token' event - called when first output token is about to be generated."""
+        return self.add_event(DynamicInferenceEventType.FIRST_TOKEN)
 
     def add_event_pause(self):
         """Add 'pause' event."""

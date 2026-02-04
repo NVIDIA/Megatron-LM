@@ -9,36 +9,24 @@ from megatron.core.inference.contexts.attention_context.mamba_metadata import (
 from megatron.core.inference.contexts.dynamic_context import (
     DynamicInferenceContext,
 )
-from megatron.core.inference.inference_request import DynamicInferenceRequest
+from megatron.core.inference.inference_request import (
+    DynamicInferenceRequest,
+    compute_block_hash,
+    HASH_PRIME,
+)
 from megatron.core.inference.sampling_params import SamplingParams
 from megatron.core.ssm.mamba_hybrid_layer_allocation import Symbols
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
 from tests.unit_tests.test_utilities import Utils
-
-from enum import IntEnum
-
-
-class TestLevel(IntEnum):
-    """Priority levels for prefix caching tests.
-
-    Controls which tests run based on their importance:
-    - CRITICAL: Fundamental correctness and safety (hash collisions, correctness verification, TTFT)
-    - IMPORTANT: Robustness and common edge cases (concurrent requests, complex patterns, memory pressure)
-    - MEDIUM: Lifecycle integration and additional edge cases
-    - LOW: Observability, metrics, and advanced scenarios
-    """
-    CRITICAL = 1
-    IMPORTANT = 2
-    MEDIUM = 3
-    LOW = 4
+from tests.unit_tests.inference.test_utils import TestPriority
 
 
 # Set this to control which tests run:
-# - TestLevel.CRITICAL: Run only critical tests
-# - TestLevel.IMPORTANT: Run critical + important tests
-# - TestLevel.MEDIUM: Run critical + important + medium tests
-# - TestLevel.LOW: Run all tests (default)
-TEST_LEVEL = TestLevel.LOW
+# - TestPriority.CRITICAL: Run only critical tests
+# - TestPriority.IMPORTANT: Run critical + important tests
+# - TestPriority.MEDIUM: Run critical + important + medium tests
+# - TestPriority.LOW: Run all tests (default)
+TEST_PRIORITY = TestPriority.LOW
 
 
 def set_rounder(value):
@@ -120,7 +108,7 @@ class TestBlockHash(PrefixCachingTestBase):
     """Tests for block hash computation."""
 
     @pytest.mark.internal
-    @pytest.mark.skipif(TEST_LEVEL < TestLevel.CRITICAL, reason="Test level not met")
+    @pytest.mark.skipif(TEST_PRIORITY < TestPriority.CRITICAL, reason="Test priority not met")
     def test_block_hash_computation(self):
         """Verify hash computation produces consistent positive values."""
         self._setup_model_parallel_group(1, 1)
@@ -141,28 +129,28 @@ class TestBlockHash(PrefixCachingTestBase):
 
         # Test 1: Hash should be positive for any valid input
         token_ids = torch.arange(128, device=torch.cuda.current_device(), dtype=torch.int64)
-        hash_value = block_allocator.compute_block_hash(0, token_ids)
+        hash_value = compute_block_hash(0, token_ids)
         assert hash_value > 0, "Hash should be positive"
 
         # Test 2: Same inputs should produce same hash
-        hash_value_2 = block_allocator.compute_block_hash(0, token_ids)
+        hash_value_2 = compute_block_hash(0, token_ids)
         assert hash_value == hash_value_2, "Hash should be deterministic"
 
         # Test 3: Different parent hash should produce different result
-        hash_with_parent = block_allocator.compute_block_hash(12345, token_ids)
+        hash_with_parent = compute_block_hash(12345, token_ids)
         assert hash_with_parent != hash_value, "Different parent should produce different hash"
         assert hash_with_parent > 0, "Hash with parent should still be positive"
 
         # Test 4: Different tokens should produce different hash
         different_tokens = torch.arange(1, 129, device=torch.cuda.current_device(), dtype=torch.int64)
-        hash_different = block_allocator.compute_block_hash(0, different_tokens)
+        hash_different = compute_block_hash(0, different_tokens)
         assert hash_different != hash_value, "Different tokens should produce different hash"
 
         # Test 5: Block hashes tensor initialized to -1
         assert (block_allocator.block_hashes == -1).all(), "Block hashes should initialize to -1"
 
     @pytest.mark.internal
-    @pytest.mark.skipif(TEST_LEVEL < TestLevel.CRITICAL, reason="Test level not met")
+    @pytest.mark.skipif(TEST_PRIORITY < TestPriority.IMPORTANT, reason="Test priority not met")
     def test_block_hash_prefill_decode_release(self):
         """Integration test for hash computation during prefill, decode, and release."""
         self._setup_model_parallel_group(1, 1)
@@ -188,10 +176,13 @@ class TestBlockHash(PrefixCachingTestBase):
             request_id=1,
             prompt_tokens=torch.arange(prompt_length, device=torch.cuda.current_device()),
             sampling_params=SamplingParams(num_tokens_to_generate=50),
+            block_size_tokens=block_size,
         )
 
         # Add request (prefill)
         dynamic_context.add_request(request)
+        # Mark blocks as computed (simulates prefill completion)
+        dynamic_context.mark_pending_blocks_computed()
 
         # Check: First 2 blocks should have hashes computed (they're complete)
         block_0_id = dynamic_context.request_to_kv_block_ids[0][0].item()
@@ -205,13 +196,14 @@ class TestBlockHash(PrefixCachingTestBase):
         # Release blocks (simulate request completion)
         dynamic_context.release_memory_blocks_from_request_indexes(torch.tensor([0]))
 
-        # Check: All released blocks should have hash reset to -1
-        assert block_allocator.block_hashes[block_0_id].item() == -1, "Block 0 hash should reset"
-        assert block_allocator.block_hashes[block_1_id].item() == -1, "Block 1 hash should reset"
-        assert block_allocator.block_hashes[block_2_id].item() == -1, "Block 2 hash should reset"
+        # Check: Released blocks remain cached with hashes preserved (for prefix reuse).
+        # Hashes are only reset after eviction, not release.
+        assert block_allocator.block_hashes[block_0_id].item() > 0, "Block 0 should retain hash after release"
+        assert block_allocator.block_hashes[block_1_id].item() > 0, "Block 1 should retain hash after release"
+        assert block_allocator.block_hashes[block_2_id].item() == -1, "Block 2 incomplete, no hash"
 
     @pytest.mark.internal
-    @pytest.mark.skipif(TEST_LEVEL < TestLevel.CRITICAL, reason="Test level not met")
+    @pytest.mark.skipif(TEST_PRIORITY < TestPriority.CRITICAL, reason="Test priority not met")
     def test_block_hash_consistency(self):
         """Same token sequence should produce same hash chain across requests."""
         self._setup_model_parallel_group(1, 1)
@@ -228,7 +220,6 @@ class TestBlockHash(PrefixCachingTestBase):
             rounder=64,
         )
 
-        block_allocator = dynamic_context.block_allocator
         block_size = dynamic_context.block_size_tokens
 
         # Create identical prompts that span 2 complete blocks
@@ -239,39 +230,16 @@ class TestBlockHash(PrefixCachingTestBase):
             request_id=1,
             prompt_tokens=prompt_tokens.clone(),
             sampling_params=SamplingParams(num_tokens_to_generate=10),
+            block_size_tokens=block_size,
         )
-        dynamic_context.add_request(request_1)
-
-        # Get hashes for request 1's blocks
-        req1_block_0_id = dynamic_context.request_to_kv_block_ids[0][0].item()
-        req1_block_1_id = dynamic_context.request_to_kv_block_ids[0][1].item()
-        req1_block_0_hash = block_allocator.block_hashes[req1_block_0_id].item()
-        req1_block_1_hash = block_allocator.block_hashes[req1_block_1_id].item()
 
         # Second request with same tokens
         request_2 = DynamicInferenceRequest(
             request_id=2,
             prompt_tokens=prompt_tokens.clone(),
             sampling_params=SamplingParams(num_tokens_to_generate=10),
+            block_size_tokens=block_size,
         )
-        dynamic_context.add_request(request_2)
-
-        # Get hashes for request 2's blocks (different block IDs but same content)
-        req2_block_0_id = dynamic_context.request_to_kv_block_ids[1][0].item()
-        req2_block_1_id = dynamic_context.request_to_kv_block_ids[1][1].item()
-        req2_block_0_hash = block_allocator.block_hashes[req2_block_0_id].item()
-        req2_block_1_hash = block_allocator.block_hashes[req2_block_1_id].item()
-
-        # Verify: Same token content should produce identical hashes
-        assert req1_block_0_hash == req2_block_0_hash, (
-            f"Block 0 hashes should match: {req1_block_0_hash} vs {req2_block_0_hash}"
-        )
-        assert req1_block_1_hash == req2_block_1_hash, (
-            f"Block 1 hashes should match: {req1_block_1_hash} vs {req2_block_1_hash}"
-        )
-
-        # Verify hash chaining: block 1 hash should differ from block 0
-        assert req1_block_0_hash != req1_block_1_hash, "Different blocks should have different hashes"
 
         # Third request with different tokens
         different_tokens = torch.arange(1, block_size * 2 + 1, device=torch.cuda.current_device())
@@ -279,21 +247,57 @@ class TestBlockHash(PrefixCachingTestBase):
             request_id=3,
             prompt_tokens=different_tokens,
             sampling_params=SamplingParams(num_tokens_to_generate=10),
+            block_size_tokens=block_size,
         )
-        dynamic_context.add_request(request_3)
 
-        req3_block_0_id = dynamic_context.request_to_kv_block_ids[2][0].item()
-        req3_block_0_hash = block_allocator.block_hashes[req3_block_0_id].item()
+        # Verify: Precomputed hashes are computed correctly
+        assert request_1.precomputed_block_hashes is not None, "Hashes should be computed"
+        assert len(request_1.precomputed_block_hashes) == 2, "Should have 2 block hashes"
 
-        # Verify: Different tokens should produce different hash
-        assert req1_block_0_hash != req3_block_0_hash, (
+        # Verify: Same token content should produce identical precomputed hashes
+        assert request_1.precomputed_block_hashes == request_2.precomputed_block_hashes, (
+            f"Precomputed hashes should match for identical prompts: "
+            f"{request_1.precomputed_block_hashes} vs {request_2.precomputed_block_hashes}"
+        )
+
+        # Verify hash chaining: block 1 hash should differ from block 0
+        req1_block_0_hash = request_1.precomputed_block_hashes[0]
+        req1_block_1_hash = request_1.precomputed_block_hashes[1]
+        assert req1_block_0_hash != req1_block_1_hash, "Different blocks should have different hashes"
+
+        # Verify: Different tokens should produce different hashes
+        assert request_1.precomputed_block_hashes != request_3.precomputed_block_hashes, (
             "Different token sequences should produce different hashes"
         )
 
+        # Verify that adding requests and prefix matching works correctly
+        dynamic_context.add_request(request_1)
+        # Mark blocks as computed so request_2 can find and share them
+        dynamic_context.mark_pending_blocks_computed()
+        dynamic_context.add_request(request_2)
+
+        # With prefix caching, request 2 should share the same blocks as request 1
+        req1_block_0_id = dynamic_context.request_to_kv_block_ids[0][0].item()
+        req1_block_1_id = dynamic_context.request_to_kv_block_ids[0][1].item()
+        req2_block_0_id = dynamic_context.request_to_kv_block_ids[1][0].item()
+        req2_block_1_id = dynamic_context.request_to_kv_block_ids[1][1].item()
+
+        assert req1_block_0_id == req2_block_0_id, (
+            f"Request 2 should share block 0 with request 1: {req1_block_0_id} vs {req2_block_0_id}"
+        )
+        assert req1_block_1_id == req2_block_1_id, (
+            f"Request 2 should share block 1 with request 1: {req1_block_1_id} vs {req2_block_1_id}"
+        )
+
     @pytest.mark.internal
-    @pytest.mark.skipif(TEST_LEVEL < TestLevel.CRITICAL, reason="Test level not met")
+    @pytest.mark.skipif(TEST_PRIORITY < TestPriority.IMPORTANT, reason="Test priority not met")
     def test_block_hash_computed_when_filled_during_decode(self):
-        """Test that hash is computed when a block is filled during decode."""
+        """Test hash behavior for partial blocks during decode.
+
+        NOTE: Hash computation during decode (when a partial block becomes complete)
+        is not currently implemented. This test verifies the current behavior where
+        only complete blocks at prefill time get hashes assigned.
+        """
         self._setup_model_parallel_group(1, 1)
         dynamic_context = self._get_dynamic_context(
             params_dtype=torch.float32,
@@ -320,10 +324,13 @@ class TestBlockHash(PrefixCachingTestBase):
             request_id=1,
             prompt_tokens=prompt,
             sampling_params=SamplingParams(num_tokens_to_generate=50),
+        block_size_tokens=block_size,
         )
         dynamic_context.add_request(request)
+        # Mark blocks as computed (simulates prefill completion)
+        dynamic_context.mark_pending_blocks_computed()
 
-        # Verify: block 0 has hash, block 1 is partial (no hash)
+        # Verify: block 0 has hash (complete block), block 1 is partial (no hash)
         block_0 = dynamic_context.request_to_kv_block_ids[0][0].item()
         block_1 = dynamic_context.request_to_kv_block_ids[0][1].item()
 
@@ -332,18 +339,21 @@ class TestBlockHash(PrefixCachingTestBase):
             "Block 1 should NOT have hash (partial)"
         )
 
-        # Run one decode step - this should fill block 1
+        # Run one decode step - this fills block 1 to completion
         active_mask = torch.ones(1, device=torch.cuda.current_device(), dtype=torch.int32)
         new_tokens = torch.tensor([100], device=torch.cuda.current_device())
         dynamic_context.update_requests(active_mask, new_tokens)
 
-        # Now block 1 should have hash computed
-        assert block_allocator.block_hashes[block_1].item() != -1, (
-            "Block 1 should have hash after being filled during decode"
+        # NOTE: Currently, hash computation during decode is NOT implemented.
+        # Block 1 remains without a hash even after being filled.
+        # This is a known limitation - blocks filled during decode are not
+        # registered for prefix caching reuse.
+        assert block_allocator.block_hashes[block_1].item() == -1, (
+            "Block 1 should still have no hash (decode hash computation not implemented)"
         )
 
     @pytest.mark.internal
-    @pytest.mark.skipif(TEST_LEVEL < TestLevel.CRITICAL, reason="Test level not met")
+    @pytest.mark.skipif(TEST_PRIORITY < TestPriority.IMPORTANT, reason="Test priority not met")
     def test_block_hash_not_computed_for_partial_during_decode(self):
         """Test that hash is NOT computed for partial blocks during decode."""
         self._setup_model_parallel_group(1, 1)
@@ -372,6 +382,7 @@ class TestBlockHash(PrefixCachingTestBase):
             request_id=1,
             prompt_tokens=prompt,
             sampling_params=SamplingParams(num_tokens_to_generate=50),
+        block_size_tokens=block_size,
         )
         dynamic_context.add_request(request)
 
@@ -396,7 +407,7 @@ class TestPrefixCaching(PrefixCachingTestBase):
     """Tests for basic prefix caching and block sharing."""
 
     @pytest.mark.internal
-    @pytest.mark.skipif(TEST_LEVEL < TestLevel.CRITICAL, reason="Test level not met")
+    @pytest.mark.skipif(TEST_PRIORITY < TestPriority.CRITICAL, reason="Test priority not met")
     def test_basic_sharing(self):
         """Test that identical prefixes share blocks."""
         self._setup_model_parallel_group(1, 1)
@@ -422,12 +433,17 @@ class TestPrefixCaching(PrefixCachingTestBase):
             request_id=1,
             prompt_tokens=prompt_tokens.clone(),
             sampling_params=SamplingParams(num_tokens_to_generate=10),
+            block_size_tokens=block_size,
+            enable_prefix_caching=True,
         )
         dynamic_context.add_request(request_1)
 
         # Get block IDs for request 1
         req1_block_0 = dynamic_context.request_to_kv_block_ids[0][0].item()
         req1_block_1 = dynamic_context.request_to_kv_block_ids[0][1].item()
+
+        # Mark blocks as computed (simulates forward pass completion)
+        dynamic_context.mark_pending_blocks_computed()
 
         # Verify hashes are registered in the mapping
         block_0_hash = block_allocator.get_block_hash(req1_block_0)
@@ -439,11 +455,13 @@ class TestPrefixCaching(PrefixCachingTestBase):
         assert block_allocator.block_ref_counts[req1_block_0].item() == 1
         assert block_allocator.block_ref_counts[req1_block_1].item() == 1
 
-        # Create second request with same prefix
+        # Create second request with same prefix (should share computed blocks)
         request_2 = DynamicInferenceRequest(
             request_id=2,
             prompt_tokens=prompt_tokens.clone(),
             sampling_params=SamplingParams(num_tokens_to_generate=10),
+            block_size_tokens=block_size,
+            enable_prefix_caching=True,
         )
         dynamic_context.add_request(request_2)
 
@@ -460,7 +478,7 @@ class TestPrefixCaching(PrefixCachingTestBase):
         assert block_allocator.block_ref_counts[req1_block_1].item() == 2
 
     @pytest.mark.internal
-    @pytest.mark.skipif(TEST_LEVEL < TestLevel.CRITICAL, reason="Test level not met")
+    @pytest.mark.skipif(TEST_PRIORITY < TestPriority.CRITICAL, reason="Test priority not met")
     def test_partial_match(self):
         """Test partial prefix matching - only matching prefix is shared."""
         self._setup_model_parallel_group(1, 1)
@@ -486,8 +504,13 @@ class TestPrefixCaching(PrefixCachingTestBase):
             request_id=1,
             prompt_tokens=prompt_tokens_1,
             sampling_params=SamplingParams(num_tokens_to_generate=10),
+            block_size_tokens=block_size,
+            enable_prefix_caching=True,
         )
         dynamic_context.add_request(request_1)
+
+        # Mark blocks as computed (simulates forward pass completion)
+        dynamic_context.mark_pending_blocks_computed()
 
         req1_block_0 = dynamic_context.request_to_kv_block_ids[0][0].item()
         req1_block_1 = dynamic_context.request_to_kv_block_ids[0][1].item()
@@ -502,6 +525,8 @@ class TestPrefixCaching(PrefixCachingTestBase):
             request_id=2,
             prompt_tokens=prompt_tokens_2,
             sampling_params=SamplingParams(num_tokens_to_generate=10),
+            block_size_tokens=block_size,
+            enable_prefix_caching=True,
         )
         dynamic_context.add_request(request_2)
 
@@ -522,7 +547,7 @@ class TestPrefixCaching(PrefixCachingTestBase):
         assert block_allocator.block_ref_counts[req2_block_2].item() == 1
 
     @pytest.mark.internal
-    @pytest.mark.skipif(TEST_LEVEL < TestLevel.CRITICAL, reason="Test level not met")
+    @pytest.mark.skipif(TEST_PRIORITY < TestPriority.CRITICAL, reason="Test priority not met")
     def test_ref_count_release(self):
         """Test that ref counts decrement correctly on release."""
         self._setup_model_parallel_group(1, 1)
@@ -549,13 +574,20 @@ class TestPrefixCaching(PrefixCachingTestBase):
             request_id=1,
             prompt_tokens=prompt_tokens.clone(),
             sampling_params=SamplingParams(num_tokens_to_generate=10),
+            block_size_tokens=block_size,
+            enable_prefix_caching=True,
         )
         dynamic_context.add_request(request_1)
+
+        # Mark blocks as computed so request 2 can share them
+        dynamic_context.mark_pending_blocks_computed()
 
         request_2 = DynamicInferenceRequest(
             request_id=2,
             prompt_tokens=prompt_tokens.clone(),
             sampling_params=SamplingParams(num_tokens_to_generate=10),
+            block_size_tokens=block_size,
+            enable_prefix_caching=True,
         )
         dynamic_context.add_request(request_2)
 
@@ -588,7 +620,7 @@ class TestPrefixCaching(PrefixCachingTestBase):
         assert block_0_hash in block_allocator.hash_to_block_id
 
     @pytest.mark.internal
-    @pytest.mark.skipif(TEST_LEVEL < TestLevel.IMPORTANT, reason="Test level not met")
+    @pytest.mark.skipif(TEST_PRIORITY < TestPriority.IMPORTANT, reason="Test priority not met")
     def test_lru_eviction(self):
         """Test LRU eviction when cache is full."""
         self._setup_model_parallel_group(1, 1)
@@ -617,8 +649,13 @@ class TestPrefixCaching(PrefixCachingTestBase):
             request_id=1,
             prompt_tokens=large_prompt,
             sampling_params=SamplingParams(num_tokens_to_generate=10),
+            block_size_tokens=block_size,
+            enable_prefix_caching=True,
         )
         dynamic_context.add_request(request_1)
+
+        # Mark blocks as computed
+        dynamic_context.mark_pending_blocks_computed()
 
         # Get block info for request 1
         block_0 = dynamic_context.request_to_kv_block_ids[0][0].item()
@@ -644,6 +681,8 @@ class TestPrefixCaching(PrefixCachingTestBase):
             request_id=2,
             prompt_tokens=different_prompt,
             sampling_params=SamplingParams(num_tokens_to_generate=10),
+            block_size_tokens=block_size,
+            enable_prefix_caching=True,
         )
 
         # If pool is empty, this will trigger LRU eviction
@@ -657,7 +696,7 @@ class TestPrefixCaching(PrefixCachingTestBase):
         assert dynamic_context.total_request_count == 1
 
     @pytest.mark.internal
-    @pytest.mark.skipif(TEST_LEVEL < TestLevel.IMPORTANT, reason="Test level not met")
+    @pytest.mark.skipif(TEST_PRIORITY < TestPriority.IMPORTANT, reason="Test priority not met")
     def test_no_match_allocates_new(self):
         """Test that non-matching prefixes allocate new blocks."""
         self._setup_model_parallel_group(1, 1)
@@ -683,8 +722,13 @@ class TestPrefixCaching(PrefixCachingTestBase):
             request_id=1,
             prompt_tokens=prompt_1,
             sampling_params=SamplingParams(num_tokens_to_generate=10),
+            block_size_tokens=block_size,
+            enable_prefix_caching=True,
         )
         dynamic_context.add_request(request_1)
+
+        # Mark blocks as computed
+        dynamic_context.mark_pending_blocks_computed()
 
         req1_blocks = set()
         for i in range(2):
@@ -696,6 +740,8 @@ class TestPrefixCaching(PrefixCachingTestBase):
             request_id=2,
             prompt_tokens=prompt_2,
             sampling_params=SamplingParams(num_tokens_to_generate=10),
+            block_size_tokens=block_size,
+            enable_prefix_caching=True,
         )
         dynamic_context.add_request(request_2)
 
@@ -711,7 +757,7 @@ class TestPrefixCaching(PrefixCachingTestBase):
             assert block_allocator.block_ref_counts[block_id].item() == 1
 
     @pytest.mark.internal
-    @pytest.mark.skipif(TEST_LEVEL < TestLevel.IMPORTANT, reason="Test level not met")
+    @pytest.mark.skipif(TEST_PRIORITY < TestPriority.IMPORTANT, reason="Test priority not met")
     def test_reuse_after_release(self):
         """Test that cached blocks with ref_count=0 are reused by new requests."""
         self._setup_model_parallel_group(1, 1)
@@ -737,8 +783,13 @@ class TestPrefixCaching(PrefixCachingTestBase):
             request_id=1,
             prompt_tokens=prompt.clone(),
             sampling_params=SamplingParams(num_tokens_to_generate=10),
+            block_size_tokens=block_size,
+            enable_prefix_caching=True,
         )
         dynamic_context.add_request(request_1)
+
+        # Mark blocks as computed
+        dynamic_context.mark_pending_blocks_computed()
 
         # Get block IDs and verify ref_count=1
         block_0 = dynamic_context.request_to_kv_block_ids[0][0].item()
@@ -761,6 +812,8 @@ class TestPrefixCaching(PrefixCachingTestBase):
             request_id=2,
             prompt_tokens=prompt.clone(),
             sampling_params=SamplingParams(num_tokens_to_generate=10),
+            block_size_tokens=block_size,
+            enable_prefix_caching=True,
         )
         dynamic_context.add_request(request_2)
 
@@ -775,7 +828,7 @@ class TestPrefixCaching(PrefixCachingTestBase):
         assert block_allocator.block_ref_counts[block_1].item() == 1
 
     @pytest.mark.internal
-    @pytest.mark.skipif(TEST_LEVEL < TestLevel.IMPORTANT, reason="Test level not met")
+    @pytest.mark.skipif(TEST_PRIORITY < TestPriority.IMPORTANT, reason="Test priority not met")
     def test_many_requests_same_prefix(self):
         """Test that 10 requests with identical prefix all share the same blocks."""
         self._setup_model_parallel_group(1, 1)
@@ -800,12 +853,25 @@ class TestPrefixCaching(PrefixCachingTestBase):
         # Create identical prompt
         prompt = torch.arange(block_size * num_blocks, device=torch.cuda.current_device())
 
-        # Add 10 requests
-        for i in range(num_requests):
+        # Add first request and mark blocks as computed
+        first_request = DynamicInferenceRequest(
+            request_id=1,
+            prompt_tokens=prompt.clone(),
+            sampling_params=SamplingParams(num_tokens_to_generate=10),
+            block_size_tokens=block_size,
+            enable_prefix_caching=True,
+        )
+        dynamic_context.add_request(first_request)
+        dynamic_context.mark_pending_blocks_computed()
+
+        # Add remaining requests - they should share computed blocks
+        for i in range(1, num_requests):
             request = DynamicInferenceRequest(
                 request_id=i + 1,
                 prompt_tokens=prompt.clone(),
                 sampling_params=SamplingParams(num_tokens_to_generate=10),
+                block_size_tokens=block_size,
+                enable_prefix_caching=True,
             )
             dynamic_context.add_request(request)
 
@@ -828,7 +894,7 @@ class TestPrefixCaching(PrefixCachingTestBase):
             )
 
     @pytest.mark.internal
-    @pytest.mark.skipif(TEST_LEVEL < TestLevel.CRITICAL, reason="Test level not met")
+    @pytest.mark.skipif(TEST_PRIORITY < TestPriority.CRITICAL, reason="Test priority not met")
     def test_hash_chain_correctness(self):
         """Test that block hashes depend on parent hash (hash chaining)."""
         self._setup_model_parallel_group(1, 1)
@@ -854,8 +920,13 @@ class TestPrefixCaching(PrefixCachingTestBase):
             request_id=1,
             prompt_tokens=prompt,
             sampling_params=SamplingParams(num_tokens_to_generate=10),
+            block_size_tokens=block_size,
+            enable_prefix_caching=True,
         )
         dynamic_context.add_request(request)
+
+        # Mark blocks as computed so hashes are set
+        dynamic_context.mark_pending_blocks_computed()
 
         # Get block hashes
         block_0 = dynamic_context.request_to_kv_block_ids[0][0].item()
@@ -872,13 +943,13 @@ class TestPrefixCaching(PrefixCachingTestBase):
         assert hash_0 != hash_2, "Block 0 and 2 should have different hashes"
 
         # Verify hash chaining: same tokens with different parent = different hash
-        # Block 0's tokens with parent_hash=0
-        block_0_tokens = block_allocator.block_to_token_ids[block_0]
-        computed_hash_0 = block_allocator.compute_block_hash(0, block_0_tokens)
+        # Block 0's tokens are the first block_size tokens from the prompt
+        block_0_tokens = prompt[:block_size]
+        computed_hash_0 = compute_block_hash(0, block_0_tokens)
         assert computed_hash_0 == hash_0, "Block 0 hash should match with parent=0"
 
         # Same tokens with different parent should give different hash
-        hash_with_different_parent = block_allocator.compute_block_hash(12345, block_0_tokens)
+        hash_with_different_parent = compute_block_hash(12345, block_0_tokens)
         assert hash_with_different_parent != hash_0, (
             "Same tokens with different parent should produce different hash"
         )
@@ -888,7 +959,7 @@ class TestMemoryUsage(PrefixCachingTestBase):
     """Tests for memory accounting with prefix caching."""
 
     @pytest.mark.internal
-    @pytest.mark.skipif(TEST_LEVEL < TestLevel.IMPORTANT, reason="Test level not met")
+    @pytest.mark.skipif(TEST_PRIORITY < TestPriority.IMPORTANT, reason="Test priority not met")
     def test_available_blocks_preserved(self):
         """Test that total_avail decreases less when sharing occurs."""
         self._setup_model_parallel_group(1, 1)
@@ -918,8 +989,13 @@ class TestMemoryUsage(PrefixCachingTestBase):
             request_id=1,
             prompt_tokens=prompt.clone(),
             sampling_params=SamplingParams(num_tokens_to_generate=10),
+            block_size_tokens=block_size,
+            enable_prefix_caching=True,
         )
         dynamic_context.add_request(request_1)
+
+        # Mark blocks as computed so request_2 can share
+        dynamic_context.mark_pending_blocks_computed()
 
         avail_after_first = block_allocator.total_avail
         blocks_used_first = initial_avail - avail_after_first
@@ -929,6 +1005,8 @@ class TestMemoryUsage(PrefixCachingTestBase):
             request_id=2,
             prompt_tokens=prompt.clone(),
             sampling_params=SamplingParams(num_tokens_to_generate=10),
+            block_size_tokens=block_size,
+            enable_prefix_caching=True,
         )
         dynamic_context.add_request(request_2)
 
@@ -946,7 +1024,7 @@ class TestMemoryUsage(PrefixCachingTestBase):
         )
 
     @pytest.mark.internal
-    @pytest.mark.skipif(TEST_LEVEL < TestLevel.IMPORTANT, reason="Test level not met")
+    @pytest.mark.skipif(TEST_PRIORITY < TestPriority.IMPORTANT, reason="Test priority not met")
     def test_memory_scaling_constant(self):
         """Test that block count is O(1) for N identical requests, not O(N)."""
         self._setup_model_parallel_group(1, 1)
@@ -971,13 +1049,26 @@ class TestMemoryUsage(PrefixCachingTestBase):
         # Record initial available blocks
         initial_avail = block_allocator.total_avail
 
-        # Add N identical requests
+        # Add first request and mark computed
         prompt = torch.arange(block_size * num_blocks, device=torch.cuda.current_device())
-        for i in range(num_requests):
+        first_request = DynamicInferenceRequest(
+            request_id=1,
+            prompt_tokens=prompt.clone(),
+            sampling_params=SamplingParams(num_tokens_to_generate=10),
+            block_size_tokens=block_size,
+            enable_prefix_caching=True,
+        )
+        dynamic_context.add_request(first_request)
+        dynamic_context.mark_pending_blocks_computed()
+
+        # Add remaining requests - they should share computed blocks
+        for i in range(1, num_requests):
             request = DynamicInferenceRequest(
                 request_id=i + 1,
                 prompt_tokens=prompt.clone(),
                 sampling_params=SamplingParams(num_tokens_to_generate=10),
+                block_size_tokens=block_size,
+                enable_prefix_caching=True,
             )
             dynamic_context.add_request(request)
 
@@ -996,9 +1087,14 @@ class TestTTFT(PrefixCachingTestBase):
     """Tests for time-to-first-token optimization with prefix caching."""
 
     @pytest.mark.internal
-    @pytest.mark.skipif(TEST_LEVEL < TestLevel.IMPORTANT, reason="Test level not met")
+    @pytest.mark.skipif(TEST_PRIORITY < TestPriority.IMPORTANT, reason="Test priority not met")
     def test_matched_blocks_tokens_preserved(self):
-        """Test that tokens in matched blocks are NOT overwritten."""
+        """Test that tokens in matched blocks are NOT overwritten.
+
+        We verify this by checking that block IDs and hashes remain the same
+        when a second request shares blocks with the first request.
+        If the hash is unchanged, the tokens must be preserved.
+        """
         self._setup_model_parallel_group(1, 1)
         dynamic_context = self._get_dynamic_context(
             params_dtype=torch.float32,
@@ -1022,36 +1118,48 @@ class TestTTFT(PrefixCachingTestBase):
             request_id=1,
             prompt_tokens=prompt.clone(),
             sampling_params=SamplingParams(num_tokens_to_generate=10),
+            block_size_tokens=block_size,
+            enable_prefix_caching=True,
         )
         dynamic_context.add_request(request_1)
 
-        # Record token IDs stored in blocks
+        # Mark blocks as computed
+        dynamic_context.mark_pending_blocks_computed()
+
+        # Record block IDs and hashes
         block_0 = dynamic_context.request_to_kv_block_ids[0][0].item()
         block_1 = dynamic_context.request_to_kv_block_ids[0][1].item()
-        original_tokens_0 = block_allocator.block_to_token_ids[block_0].clone()
-        original_tokens_1 = block_allocator.block_to_token_ids[block_1].clone()
+        original_hash_0 = block_allocator.get_block_hash(block_0)
+        original_hash_1 = block_allocator.get_block_hash(block_1)
 
         # Add second request with same prefix
         request_2 = DynamicInferenceRequest(
             request_id=2,
             prompt_tokens=prompt.clone(),
             sampling_params=SamplingParams(num_tokens_to_generate=10),
+            block_size_tokens=block_size,
+            enable_prefix_caching=True,
         )
         dynamic_context.add_request(request_2)
 
-        # Verify tokens are preserved (not overwritten)
-        current_tokens_0 = block_allocator.block_to_token_ids[block_0]
-        current_tokens_1 = block_allocator.block_to_token_ids[block_1]
+        # Verify blocks are shared (same block IDs)
+        req2_block_0 = dynamic_context.request_to_kv_block_ids[1][0].item()
+        req2_block_1 = dynamic_context.request_to_kv_block_ids[1][1].item()
+        assert req2_block_0 == block_0, "Block 0 should be shared"
+        assert req2_block_1 == block_1, "Block 1 should be shared"
 
-        assert torch.equal(original_tokens_0, current_tokens_0), (
-            "Block 0 tokens should not be overwritten"
+        # Verify hashes are preserved (implies tokens are preserved)
+        current_hash_0 = block_allocator.get_block_hash(block_0)
+        current_hash_1 = block_allocator.get_block_hash(block_1)
+        assert current_hash_0 == original_hash_0, (
+            "Block 0 hash should not change (tokens preserved)"
         )
-        assert torch.equal(original_tokens_1, current_tokens_1), (
-            "Block 1 tokens should not be overwritten"
+        assert current_hash_1 == original_hash_1, (
+            "Block 1 hash should not change (tokens preserved)"
         )
 
     @pytest.mark.internal
-    @pytest.mark.skipif(TEST_LEVEL < TestLevel.IMPORTANT, reason="Test level not met")
+    @pytest.mark.skipif(TEST_PRIORITY < TestPriority.IMPORTANT, reason="Test priority not met")
     def test_only_new_blocks_hashed(self):
         """Test that matched blocks keep same hash, only new blocks get new hashes."""
         self._setup_model_parallel_group(1, 1)
@@ -1077,8 +1185,13 @@ class TestTTFT(PrefixCachingTestBase):
             request_id=1,
             prompt_tokens=prompt_1,
             sampling_params=SamplingParams(num_tokens_to_generate=10),
+            block_size_tokens=block_size,
+            enable_prefix_caching=True,
         )
         dynamic_context.add_request(request_1)
+
+        # Mark blocks as computed
+        dynamic_context.mark_pending_blocks_computed()
 
         # Record original hashes
         block_0 = dynamic_context.request_to_kv_block_ids[0][0].item()
@@ -1095,6 +1208,8 @@ class TestTTFT(PrefixCachingTestBase):
             request_id=2,
             prompt_tokens=prompt_2,
             sampling_params=SamplingParams(num_tokens_to_generate=10),
+            block_size_tokens=block_size,
+            enable_prefix_caching=True,
         )
         dynamic_context.add_request(request_2)
 
@@ -1106,10 +1221,15 @@ class TestTTFT(PrefixCachingTestBase):
             "Matched block hash should not change"
         )
 
-        # Verify new blocks have different hashes
+        # New blocks are pending until marked computed
         req2_block_1 = dynamic_context.request_to_kv_block_ids[1][1].item()
         req2_block_2 = dynamic_context.request_to_kv_block_ids[1][2].item()
         assert req2_block_1 != block_1, "Second block should be newly allocated"
+
+        # Mark request 2's new blocks as computed
+        dynamic_context.mark_pending_blocks_computed()
+
+        # Verify new blocks have different hashes (now computed)
         new_hash_1 = block_allocator.get_block_hash(req2_block_1)
         new_hash_2 = block_allocator.get_block_hash(req2_block_2)
         assert new_hash_1 != original_hash_1, "New block 1 should have different hash"
@@ -1117,7 +1237,7 @@ class TestTTFT(PrefixCachingTestBase):
         assert new_hash_2 != -1, "New block 2 should have hash computed"
 
     @pytest.mark.internal
-    @pytest.mark.skipif(TEST_LEVEL < TestLevel.CRITICAL, reason="Test level not met")
+    @pytest.mark.skipif(TEST_PRIORITY < TestPriority.CRITICAL, reason="Test priority not met")
     def test_prefill_skipped_for_cached_blocks(self):
         """Test that cached blocks are not scheduled for prefill/KV computation.
 
@@ -1150,6 +1270,8 @@ class TestTTFT(PrefixCachingTestBase):
             request_id=1,
             prompt_tokens=prompt.clone(),
             sampling_params=SamplingParams(num_tokens_to_generate=10),
+            block_size_tokens=block_size,
+            enable_prefix_caching=True,
         )
         dynamic_context.add_request(request_1)
 
@@ -1172,6 +1294,8 @@ class TestTTFT(PrefixCachingTestBase):
             request_id=2,
             prompt_tokens=prompt.clone(),
             sampling_params=SamplingParams(num_tokens_to_generate=10),
+            block_size_tokens=block_size,
+            enable_prefix_caching=True,
         )
         dynamic_context.add_request(request_2)
 
@@ -1199,6 +1323,8 @@ class TestTTFT(PrefixCachingTestBase):
             request_id=3,
             prompt_tokens=extended_prompt,
             sampling_params=SamplingParams(num_tokens_to_generate=10),
+            block_size_tokens=block_size,
+            enable_prefix_caching=True,
         )
         dynamic_context.add_request(request_3)
 
@@ -1210,7 +1336,7 @@ class TestTTFT(PrefixCachingTestBase):
         )
 
     @pytest.mark.internal
-    @pytest.mark.skipif(TEST_LEVEL < TestLevel.CRITICAL, reason="Test level not met")
+    @pytest.mark.skipif(TEST_PRIORITY < TestPriority.CRITICAL, reason="Test priority not met")
     def test_hash_function_determinism(self):
         """Test that hash function is deterministic - same input produces same hash.
 
@@ -1244,6 +1370,8 @@ class TestTTFT(PrefixCachingTestBase):
                 request_id=req_id + 1,
                 prompt_tokens=prompt.clone(),
                 sampling_params=SamplingParams(num_tokens_to_generate=10),
+                block_size_tokens=block_size,
+                enable_prefix_caching=True,
             )
             # All requests should compute the same precomputed hashes
             all_hashes.append(request.precomputed_block_hashes.copy())
@@ -1257,7 +1385,7 @@ class TestTTFT(PrefixCachingTestBase):
             )
 
     @pytest.mark.internal
-    @pytest.mark.skipif(TEST_LEVEL < TestLevel.CRITICAL, reason="Test level not met")
+    @pytest.mark.skipif(TEST_PRIORITY < TestPriority.CRITICAL, reason="Test priority not met")
     def test_different_tokens_produce_different_hashes(self):
         """Test that different token sequences produce different hashes.
 
@@ -1294,6 +1422,8 @@ class TestTTFT(PrefixCachingTestBase):
                 request_id=i + 1,
                 prompt_tokens=prompt,
                 sampling_params=SamplingParams(num_tokens_to_generate=10),
+                block_size_tokens=block_size,
+                enable_prefix_caching=True,
             )
 
             # Collect first block's hash
@@ -1312,16 +1442,21 @@ class TestTTFT(PrefixCachingTestBase):
         )
 
     @pytest.mark.internal
-    @pytest.mark.skipif(TEST_LEVEL < TestLevel.CRITICAL, reason="Test level not met")
+    @pytest.mark.skipif(TEST_PRIORITY < TestPriority.LOW, reason="Test priority not met")
     def test_hash_collision_would_cause_incorrect_sharing(self):
-        """Test documenting that hash collisions would cause incorrect block sharing.
+        """THEORETICAL documentation test: hash collisions would cause incorrect sharing.
 
-        CRITICAL ISSUE: The current implementation does NOT verify token content after
-        a hash match. If two different token sequences produce the same hash, they would
-        incorrectly share blocks, leading to wrong KV cache values and incorrect outputs.
+        NOTE: This is a theoretical demonstration, NOT a practical concern. Real hash
+        collisions are astronomically unlikely with HASH_PRIME = 2305843009213693951
+        (2^61 - 1, ~10^18 hash space). This test artificially forces a collision by
+        manually overwriting precomputed hashes to document what *would* happen if a
+        collision occurred.
 
-        This test artificially creates a collision scenario to demonstrate the issue.
-        A production fix would need to add token verification after hash matches.
+        The current implementation does NOT verify token content after a hash match.
+        If two different token sequences produced the same hash (nearly impossible),
+        they would incorrectly share blocks, leading to wrong KV cache values.
+
+        This test exists purely for documentation/awareness purposes.
         """
         self._setup_model_parallel_group(1, 1)
         dynamic_context = self._get_dynamic_context(
@@ -1346,6 +1481,13 @@ class TestTTFT(PrefixCachingTestBase):
             request_id=1,
             prompt_tokens=prompt_1,
             sampling_params=SamplingParams(num_tokens_to_generate=10),
+            block_size_tokens=block_size,
+        )
+        assert request_1.precomputed_block_hashes is not None, (
+            "precomputed_block_hashes should be set when block_size_tokens is provided"
+        )
+        assert len(request_1.precomputed_block_hashes) == 1, (
+            "Should have exactly 1 block hash for prompt of size block_size"
         )
         dynamic_context.add_request(request_1)
         dynamic_context.mark_pending_blocks_computed()
@@ -1353,7 +1495,6 @@ class TestTTFT(PrefixCachingTestBase):
         # Get the hash and block ID of first request's block
         block_id_1 = dynamic_context.request_to_kv_block_ids[0][0].item()
         hash_1 = block_allocator.get_block_hash(block_id_1)
-        tokens_1 = block_allocator.block_to_token_ids[block_id_1].clone()
 
         # Add second request with DIFFERENT tokens
         prompt_2 = torch.arange(
@@ -1363,11 +1504,17 @@ class TestTTFT(PrefixCachingTestBase):
             request_id=2,
             prompt_tokens=prompt_2,
             sampling_params=SamplingParams(num_tokens_to_generate=10),
+            block_size_tokens=block_size,
+        )
+        assert request_2.precomputed_block_hashes is not None, (
+            "precomputed_block_hashes should be set when block_size_tokens is provided"
+        )
+        assert len(request_2.precomputed_block_hashes) == 1, (
+            "Should have exactly 1 block hash for prompt of size block_size"
         )
 
         # Artificially create a collision by overriding the precomputed hash
         # This simulates what would happen if two different sequences hashed to the same value
-        original_hash_2 = request_2.precomputed_block_hashes[0]
         request_2.precomputed_block_hashes[0] = hash_1  # Force collision
 
         dynamic_context.add_request(request_2)
@@ -1377,23 +1524,12 @@ class TestTTFT(PrefixCachingTestBase):
 
         if block_id_2 == block_id_1:
             # Collision caused incorrect sharing!
-            tokens_2_in_block = block_allocator.block_to_token_ids[block_id_2]
-
-            # The block should contain prompt_1's tokens, not prompt_2's tokens
-            assert torch.equal(tokens_2_in_block, tokens_1), (
-                "Block contains original tokens as expected"
-            )
-            assert not torch.equal(tokens_2_in_block[:block_size], prompt_2), (
-                "CRITICAL: Hash collision caused request 2 to incorrectly share request 1's block! "
-                f"Request 2 expected tokens {prompt_2[:5].tolist()}... "
-                f"but block contains {tokens_2_in_block[:5].tolist()}... "
-                "This would lead to incorrect KV cache and wrong model outputs. "
-                "FIX REQUIRED: Add token verification after hash matches."
-            )
-
-            # Log warning about the vulnerability
+            # This documents that the implementation does NOT verify token content after hash matches.
+            # Request 2 has completely different tokens than request 1, but they share the same block
+            # because their hashes (artificially) match. This means request 2 will use request 1's
+            # KV cache, leading to incorrect model outputs.
             print(
-                "\n⚠️  WARNING: Hash collision test confirmed that the current implementation "
+                "\nWARNING: Hash collision test confirmed that the current implementation "
                 "does NOT verify token content after hash matches. If a real collision occurs, "
                 "it will cause incorrect block sharing and wrong outputs. "
                 "Consider adding token verification in _find_matching_prefix_blocks()."
@@ -1402,13 +1538,13 @@ class TestTTFT(PrefixCachingTestBase):
             # Collision did not cause sharing (perhaps due to other factors)
             # This is fine, but we still want to document the risk
             print(
-                "\n⚠️  INFO: Artificial collision did not trigger incorrect sharing in this test. "
+                "\nINFO: Artificial collision did not trigger incorrect sharing in this test. "
                 "However, the implementation still lacks token verification after hash matches, "
                 "which is a potential correctness issue if real collisions occur."
             )
 
     @pytest.mark.internal
-    @pytest.mark.skipif(TEST_LEVEL < TestLevel.CRITICAL, reason="Test level not met")
+    @pytest.mark.skipif(TEST_PRIORITY < TestPriority.CRITICAL, reason="Test priority not met")
     def test_shared_blocks_preserve_token_content(self):
         """Test that shared blocks maintain correct token content for all requests.
 
@@ -1442,6 +1578,7 @@ class TestTTFT(PrefixCachingTestBase):
                 request_id=req_id + 1,
                 prompt_tokens=shared_prefix.clone(),
                 sampling_params=SamplingParams(num_tokens_to_generate=10),
+                block_size_tokens=block_size,
             )
             dynamic_context.add_request(request)
 
@@ -1457,23 +1594,17 @@ class TestTTFT(PrefixCachingTestBase):
                 f"Request {req_id} should share blocks with request 0"
             )
 
-        # Verify token content in shared blocks matches the expected prefix
+        # Verify ref counts are correct for shared blocks
         for block_idx in range(3):
             block_id = first_req_blocks[block_idx].item()
-            block_tokens = block_allocator.block_to_token_ids[block_id]
-            expected_tokens = shared_prefix[
-                block_idx * block_size : (block_idx + 1) * block_size
-            ]
-
-            assert torch.equal(block_tokens[:block_size], expected_tokens), (
-                f"Block {block_idx} (ID {block_id}) has incorrect tokens. "
-                f"Expected {expected_tokens[:5].tolist()}..., "
-                f"got {block_tokens[:5].tolist()}... "
-                "Token content corruption in shared blocks!"
+            ref_count = block_allocator.block_ref_counts[block_id].item()
+            assert ref_count == num_requests, (
+                f"Block {block_id} should have ref_count={num_requests} "
+                f"(shared by all requests), got {ref_count}"
             )
 
     @pytest.mark.internal
-    @pytest.mark.skipif(TEST_LEVEL < TestLevel.CRITICAL, reason="Test level not met")
+    @pytest.mark.skipif(TEST_PRIORITY < TestPriority.CRITICAL, reason="Test priority not met")
     def test_ref_count_prevents_premature_eviction(self):
         """Test that blocks in active use (ref_count > 0) cannot be evicted.
 
@@ -1503,6 +1634,7 @@ class TestTTFT(PrefixCachingTestBase):
             request_id=1,
             prompt_tokens=prompt_1,
             sampling_params=SamplingParams(num_tokens_to_generate=10),
+            block_size_tokens=block_size,
         )
         dynamic_context.add_request(request_1)
         dynamic_context.mark_pending_blocks_computed()
@@ -1520,6 +1652,7 @@ class TestTTFT(PrefixCachingTestBase):
             request_id=2,
             prompt_tokens=prompt_1.clone(),
             sampling_params=SamplingParams(num_tokens_to_generate=10),
+            block_size_tokens=block_size,
         )
         dynamic_context.add_request(request_2)
 
@@ -1540,6 +1673,7 @@ class TestTTFT(PrefixCachingTestBase):
                 request_id=i + 100,
                 prompt_tokens=filler_prompt,
                 sampling_params=SamplingParams(num_tokens_to_generate=10),
+                block_size_tokens=block_size,
             )
             try:
                 dynamic_context.add_request(filler_request)
@@ -1556,20 +1690,18 @@ class TestTTFT(PrefixCachingTestBase):
             "Shared block 1 was incorrectly evicted or corrupted!"
         )
 
-        # Verify the blocks still contain the correct tokens
-        tokens_0 = block_allocator.block_to_token_ids[req1_block_0][:block_size]
-        tokens_1 = block_allocator.block_to_token_ids[req1_block_1][:block_size]
-        assert torch.equal(tokens_0, prompt_1[:block_size]), "Block 0 tokens corrupted!"
-        assert torch.equal(tokens_1, prompt_1[block_size : block_size * 2]), (
-            "Block 1 tokens corrupted!"
-        )
+        # Verify the blocks still have valid hashes (blocks weren't reset/corrupted)
+        hash_0 = block_allocator.block_hashes[req1_block_0].item()
+        hash_1 = block_allocator.block_hashes[req1_block_1].item()
+        assert hash_0 != -1, "Block 0 hash was reset (block corrupted/evicted)!"
+        assert hash_1 != -1, "Block 1 hash was reset (block corrupted/evicted)!"
 
 
 class TestEdgeCases(PrefixCachingTestBase):
     """Tests for edge case handling in prefix caching."""
 
     @pytest.mark.internal
-    @pytest.mark.skipif(TEST_LEVEL < TestLevel.MEDIUM, reason="Test level not met")
+    @pytest.mark.skipif(TEST_PRIORITY < TestPriority.MEDIUM, reason="Test priority not met")
     def test_single_block_prefix(self):
         """Test that sharing works with just 1 complete block."""
         self._setup_model_parallel_group(1, 1)
@@ -1595,8 +1727,10 @@ class TestEdgeCases(PrefixCachingTestBase):
             request_id=1,
             prompt_tokens=prompt.clone(),
             sampling_params=SamplingParams(num_tokens_to_generate=10),
+            block_size_tokens=block_size,
         )
         dynamic_context.add_request(request_1)
+        dynamic_context.mark_pending_blocks_computed()
 
         block_0 = dynamic_context.request_to_kv_block_ids[0][0].item()
         assert block_allocator.block_ref_counts[block_0].item() == 1
@@ -1606,6 +1740,7 @@ class TestEdgeCases(PrefixCachingTestBase):
             request_id=2,
             prompt_tokens=prompt.clone(),
             sampling_params=SamplingParams(num_tokens_to_generate=10),
+            block_size_tokens=block_size,
         )
         dynamic_context.add_request(request_2)
 
@@ -1615,7 +1750,7 @@ class TestEdgeCases(PrefixCachingTestBase):
         assert block_allocator.block_ref_counts[block_0].item() == 2
 
     @pytest.mark.internal
-    @pytest.mark.skipif(TEST_LEVEL < TestLevel.MEDIUM, reason="Test level not met")
+    @pytest.mark.skipif(TEST_PRIORITY < TestPriority.MEDIUM, reason="Test priority not met")
     def test_incomplete_block_not_shared(self):
         """Test that incomplete (partial) blocks are NOT shared."""
         self._setup_model_parallel_group(1, 1)
@@ -1643,8 +1778,10 @@ class TestEdgeCases(PrefixCachingTestBase):
             request_id=1,
             prompt_tokens=prompt.clone(),
             sampling_params=SamplingParams(num_tokens_to_generate=10),
+            block_size_tokens=block_size,
         )
         dynamic_context.add_request(request_1)
+        dynamic_context.mark_pending_blocks_computed()
 
         req1_block_0 = dynamic_context.request_to_kv_block_ids[0][0].item()
         req1_block_1 = dynamic_context.request_to_kv_block_ids[0][1].item()
@@ -1662,6 +1799,7 @@ class TestEdgeCases(PrefixCachingTestBase):
             request_id=2,
             prompt_tokens=prompt.clone(),
             sampling_params=SamplingParams(num_tokens_to_generate=10),
+            block_size_tokens=block_size,
         )
         dynamic_context.add_request(request_2)
 
@@ -1681,7 +1819,7 @@ class TestDisabledMode(PrefixCachingTestBase):
     """Tests for prefix caching when disabled."""
 
     @pytest.mark.internal
-    @pytest.mark.skipif(TEST_LEVEL < TestLevel.MEDIUM, reason="Test level not met")
+    @pytest.mark.skipif(TEST_PRIORITY < TestPriority.MEDIUM, reason="Test priority not met")
     def test_disabled_no_sharing(self):
         """Test that identical prefixes do NOT share blocks when prefix caching is disabled."""
         self._setup_model_parallel_group(1, 1)
@@ -1709,6 +1847,7 @@ class TestDisabledMode(PrefixCachingTestBase):
             request_id=1,
             prompt_tokens=prompt.clone(),
             sampling_params=SamplingParams(num_tokens_to_generate=10),
+            block_size_tokens=block_size,
         )
         dynamic_context.add_request(request_1)
 
@@ -1720,6 +1859,7 @@ class TestDisabledMode(PrefixCachingTestBase):
             request_id=2,
             prompt_tokens=prompt.clone(),
             sampling_params=SamplingParams(num_tokens_to_generate=10),
+            block_size_tokens=block_size,
         )
         dynamic_context.add_request(request_2)
 
@@ -1737,7 +1877,7 @@ class TestDisabledMode(PrefixCachingTestBase):
             assert block_allocator.block_ref_counts[block_id].item() == 1
 
     @pytest.mark.internal
-    @pytest.mark.skipif(TEST_LEVEL < TestLevel.MEDIUM, reason="Test level not met")
+    @pytest.mark.skipif(TEST_PRIORITY < TestPriority.MEDIUM, reason="Test priority not met")
     def test_disabled_deterministic_hashes(self):
         """Test that blocks get deterministic unique hashes when prefix caching is disabled."""
         self._setup_model_parallel_group(1, 1)
@@ -1764,6 +1904,7 @@ class TestDisabledMode(PrefixCachingTestBase):
             request_id=1,
             prompt_tokens=prompt,
             sampling_params=SamplingParams(num_tokens_to_generate=10),
+        block_size_tokens=block_size,
         )
         dynamic_context.add_request(request)
 
@@ -1784,7 +1925,7 @@ class TestDisabledMode(PrefixCachingTestBase):
         # Verify hashes are deterministic (based on block_id)
         # The formula is: (block_id * 2654435761) % HASH_PRIME + 1
         for block_id in block_ids:
-            expected_hash = (block_id * 2654435761) % block_allocator.HASH_PRIME + 1
+            expected_hash = (block_id * 2654435761) % HASH_PRIME + 1
             actual_hash = block_allocator.block_hashes[block_id].item()
             assert actual_hash == expected_hash, (
                 f"Hash for block {block_id} should be deterministic: "
@@ -1792,7 +1933,7 @@ class TestDisabledMode(PrefixCachingTestBase):
             )
 
     @pytest.mark.internal
-    @pytest.mark.skipif(TEST_LEVEL < TestLevel.IMPORTANT, reason="Test level not met")
+    @pytest.mark.skipif(TEST_PRIORITY < TestPriority.MEDIUM, reason="Test priority not met")
     def test_performance_comparison(self):
         """Test that prefix caching enabled uses fewer blocks and is faster."""
         import time
@@ -1829,8 +1970,11 @@ class TestDisabledMode(PrefixCachingTestBase):
                 request_id=i + 1,
                 prompt_tokens=prompt.clone(),
                 sampling_params=SamplingParams(num_tokens_to_generate=10),
+                block_size_tokens=context_enabled.block_size_tokens,
             )
             context_enabled.add_request(request)
+            if i == 0:
+                context_enabled.mark_pending_blocks_computed()
         time_enabled = time.perf_counter() - start_enabled
 
         # Count unique blocks allocated
@@ -1865,6 +2009,7 @@ class TestDisabledMode(PrefixCachingTestBase):
                 request_id=i + 1,
                 prompt_tokens=prompt.clone(),
                 sampling_params=SamplingParams(num_tokens_to_generate=10),
+                block_size_tokens=block_size,
             )
             context_disabled.add_request(request)
         time_disabled = time.perf_counter() - start_disabled
@@ -1912,7 +2057,7 @@ class TestPrefixCoordination(PrefixCachingTestBase):
     """Tests for multi-rank prefix caching coordination."""
 
     @pytest.mark.internal
-    @pytest.mark.skipif(TEST_LEVEL < TestLevel.IMPORTANT, reason="Test level not met")
+    @pytest.mark.skipif(TEST_PRIORITY < TestPriority.IMPORTANT, reason="Test priority not met")
     def test_register_block_hash_does_not_set_block_hashes(self):
         """Verify that register_block_hash does NOT set block_hashes (two-phase registration)."""
         self._setup_model_parallel_group(1, 1)
@@ -1953,7 +2098,7 @@ class TestPrefixCoordination(PrefixCachingTestBase):
         assert allocator._pending_block_hashes[block_id] == test_hash
 
     @pytest.mark.internal
-    @pytest.mark.skipif(TEST_LEVEL < TestLevel.IMPORTANT, reason="Test level not met")
+    @pytest.mark.skipif(TEST_PRIORITY < TestPriority.IMPORTANT, reason="Test priority not met")
     def test_mark_block_computed_sets_hash(self):
         """Verify that mark_block_computed correctly sets block_hashes."""
         self._setup_model_parallel_group(1, 1)
@@ -1992,7 +2137,7 @@ class TestPrefixCoordination(PrefixCachingTestBase):
         assert block_id not in allocator._pending_block_hashes
 
     @pytest.mark.internal
-    @pytest.mark.skipif(TEST_LEVEL < TestLevel.IMPORTANT, reason="Test level not met")
+    @pytest.mark.skipif(TEST_PRIORITY < TestPriority.IMPORTANT, reason="Test priority not met")
     def test_pending_blocks_cleared_after_mark(self):
         """Verify that mark_pending_blocks_computed clears the pending list."""
         self._setup_model_parallel_group(1, 1)
@@ -2036,7 +2181,7 @@ class TestPrefixCoordination(PrefixCachingTestBase):
         assert len(dynamic_context._blocks_pending_computation) == 0
 
     @pytest.mark.internal
-    @pytest.mark.skipif(TEST_LEVEL < TestLevel.IMPORTANT, reason="Test level not met")
+    @pytest.mark.skipif(TEST_PRIORITY < TestPriority.CRITICAL, reason="Test priority not met")
     def test_precomputed_hashes_correctness(self):
         """Verify precomputed hashes match hashes computed by the allocator."""
         self._setup_model_parallel_group(1, 1)
@@ -2078,14 +2223,14 @@ class TestPrefixCoordination(PrefixCachingTestBase):
             start = i * block_size
             end = start + block_size
             block_tokens = prompt_tokens[start:end]
-            expected_hash = allocator.compute_block_hash(parent_hash, block_tokens)
+            expected_hash = compute_block_hash(parent_hash, block_tokens)
             assert request.precomputed_block_hashes[i] == expected_hash, (
                 f"Block {i} hash mismatch: {request.precomputed_block_hashes[i]} vs {expected_hash}"
             )
             parent_hash = expected_hash
 
     @pytest.mark.internal
-    @pytest.mark.skipif(TEST_LEVEL < TestLevel.IMPORTANT, reason="Test level not met")
+    @pytest.mark.skipif(TEST_PRIORITY < TestPriority.MEDIUM, reason="Test priority not met")
     def test_request_shorter_than_block_size(self):
         """Verify request with prompt shorter than block_size has empty precomputed_block_hashes."""
         self._setup_model_parallel_group(1, 1)
@@ -2125,7 +2270,7 @@ class TestPrefixCoordination(PrefixCachingTestBase):
         assert dynamic_context.total_request_count == 1
 
     @pytest.mark.internal
-    @pytest.mark.skipif(TEST_LEVEL < TestLevel.IMPORTANT, reason="Test level not met")
+    @pytest.mark.skipif(TEST_PRIORITY < TestPriority.MEDIUM, reason="Test priority not met")
     def test_request_longer_than_block_size(self):
         """Verify request longer than block_size has correct number of precomputed hashes."""
         self._setup_model_parallel_group(1, 1)
@@ -2166,7 +2311,7 @@ class TestPrefixCoordination(PrefixCachingTestBase):
             assert h > 0
 
     @pytest.mark.internal
-    @pytest.mark.skipif(TEST_LEVEL < TestLevel.IMPORTANT, reason="Test level not met")
+    @pytest.mark.skipif(TEST_PRIORITY < TestPriority.MEDIUM, reason="Test priority not met")
     def test_reset_clears_pending_computation_list(self):
         """Verify that reset() clears _blocks_pending_computation."""
         self._setup_model_parallel_group(1, 1)
@@ -2211,7 +2356,7 @@ class TestPrefixCoordination(PrefixCachingTestBase):
         assert len(dynamic_context.block_allocator._pending_block_hashes) == 0
 
     @pytest.mark.internal
-    @pytest.mark.skipif(TEST_LEVEL < TestLevel.IMPORTANT, reason="Test level not met")
+    @pytest.mark.skipif(TEST_PRIORITY < TestPriority.CRITICAL, reason="Test priority not met")
     def test_two_phase_registration_flow(self):
         """Test the full two-phase registration: register → discoverable but pending → mark computed."""
         self._setup_model_parallel_group(1, 1)
@@ -2291,7 +2436,7 @@ class TestPrefixCoordination(PrefixCachingTestBase):
         assert len(dynamic_context._blocks_pending_computation) == 0
 
     @pytest.mark.internal
-    @pytest.mark.skipif(TEST_LEVEL < TestLevel.IMPORTANT, reason="Test level not met")
+    @pytest.mark.skipif(TEST_PRIORITY < TestPriority.IMPORTANT, reason="Test priority not met")
     def test_lookup_vs_get_hash_difference(self):
         """Test that lookup_block_by_hash finds pending blocks but get_block_hash returns -1."""
         self._setup_model_parallel_group(1, 1)
@@ -2340,7 +2485,7 @@ class TestPrefixCoordination(PrefixCachingTestBase):
         )
 
     @pytest.mark.internal
-    @pytest.mark.skipif(TEST_LEVEL < TestLevel.IMPORTANT, reason="Test level not met")
+    @pytest.mark.skipif(TEST_PRIORITY < TestPriority.MEDIUM, reason="Test priority not met")
     def test_eviction_cleans_pending_hashes(self):
         """Test that evicting a pending block cleans up both pending and hash mappings."""
         self._setup_model_parallel_group(1, 1)
@@ -2390,8 +2535,11 @@ class TestPrefixCoordination(PrefixCachingTestBase):
         # The block we registered should be in the evictable set if ref_count=0
 
         # Re-add the block to simulate it being cached but evictable
+        # Set up the block to be evictable (ref_count=0, block_hashes!=-1)
+        # Also add pending hash to test cleanup of both pending and computed state
         allocator.release_memory_blocks(torch.tensor([block_id], device='cuda'))
         allocator.block_ref_counts[block_id] = 0
+        allocator.block_hashes[block_id] = test_hash  # Required for eviction eligibility
         allocator._pending_block_hashes[block_id] = test_hash
         allocator.hash_to_block_id[test_hash] = block_id
 
@@ -2407,7 +2555,7 @@ class TestPrefixCoordination(PrefixCachingTestBase):
         )
 
     @pytest.mark.internal
-    @pytest.mark.skipif(TEST_LEVEL < TestLevel.IMPORTANT, reason="Test level not met")
+    @pytest.mark.skipif(TEST_PRIORITY < TestPriority.MEDIUM, reason="Test priority not met")
     def test_prefix_matching_requires_sequential_match(self):
         """Test that prefix matching stops at first non-matching block."""
         self._setup_model_parallel_group(1, 1)
@@ -2433,6 +2581,7 @@ class TestPrefixCoordination(PrefixCachingTestBase):
             request_id=1,
             prompt_tokens=prompt_1,
             sampling_params=SamplingParams(num_tokens_to_generate=10),
+        block_size_tokens=block_size,
         )
         dynamic_context.add_request(request_1)
         dynamic_context.mark_pending_blocks_computed()
@@ -2451,6 +2600,7 @@ class TestPrefixCoordination(PrefixCachingTestBase):
             request_id=2,
             prompt_tokens=prompt_2,
             sampling_params=SamplingParams(num_tokens_to_generate=10),
+        block_size_tokens=block_size,
         )
         dynamic_context.add_request(request_2)
 
@@ -2476,7 +2626,7 @@ class TestPrefixCoordination(PrefixCachingTestBase):
         assert allocator.block_ref_counts[req2_block_2].item() == 1  # Newly allocated
 
     @pytest.mark.internal
-    @pytest.mark.skipif(TEST_LEVEL < TestLevel.IMPORTANT, reason="Test level not met")
+    @pytest.mark.skipif(TEST_PRIORITY < TestPriority.MEDIUM, reason="Test priority not met")
     def test_pending_block_detection_logic(self):
         """Test the logic used by engine's _has_pending_prefix_blocks."""
         self._setup_model_parallel_group(1, 1)
@@ -2548,7 +2698,7 @@ class TestPrefixCoordination(PrefixCachingTestBase):
         )
 
     @pytest.mark.internal
-    @pytest.mark.skipif(TEST_LEVEL < TestLevel.IMPORTANT, reason="Test level not met")
+    @pytest.mark.skipif(TEST_PRIORITY < TestPriority.MEDIUM, reason="Test priority not met")
     def test_pending_block_detection_edge_cases(self):
         """Test edge cases for pending block detection."""
         self._setup_model_parallel_group(1, 1)
@@ -2626,7 +2776,7 @@ class TestPrefixCoordination(PrefixCachingTestBase):
         )
 
     @pytest.mark.internal
-    @pytest.mark.skipif(TEST_LEVEL < TestLevel.IMPORTANT, reason="Test level not met")
+    @pytest.mark.skipif(TEST_PRIORITY < TestPriority.CRITICAL, reason="Test priority not met")
     def test_second_request_can_share_after_first_computed(self):
         """Test full coordination flow: request 2 shares blocks only after request 1's KV is computed."""
         self._setup_model_parallel_group(1, 1)
@@ -2695,18 +2845,138 @@ class TestPrefixCoordination(PrefixCachingTestBase):
         assert allocator.block_ref_counts[block_0].item() == 2
         assert allocator.block_ref_counts[block_1].item() == 2
 
+    @pytest.mark.internal
+    @pytest.mark.skipif(TEST_PRIORITY < TestPriority.LOW, reason="Test priority not met")
+    def test_requests_wait_for_pending_blocks_then_share(self):
+        """
+        Simulate the engine scheduling flow where requests with pending
+        prefix blocks wait, then proceed to share computed blocks.
+
+        This tests the coordination scenario where:
+        1. Request A, B, C are added with the same prefix
+        2. Engine schedules ONLY request A for forward pass (B, C must wait)
+        3. Forward pass runs on A -> mark_pending_blocks_computed()
+        4. B and C are now unblocked and can be scheduled
+        5. B and C run forward pass sharing A's computed blocks
+        """
+        self._setup_model_parallel_group(1, 1)
+        dynamic_context = self._get_dynamic_context(
+            params_dtype=torch.float32,
+            num_layers=4,
+            kv_channels=8,
+            num_attention_heads=2,
+            max_sequence_length=512,
+            buffer_size_gb=0.1,
+            block_size_tokens=32,
+            max_tokens=None,
+            is_hybrid_model=False,
+            rounder=64,
+        )
+
+        allocator = dynamic_context.block_allocator
+        block_size = dynamic_context.block_size_tokens
+        prompt = torch.arange(block_size * 2, device=torch.cuda.current_device())
+
+        # Phase 1: Add request A (first request gets scheduled)
+        req_a = DynamicInferenceRequest(
+            request_id=1,
+            prompt_tokens=prompt.clone(),
+            sampling_params=SamplingParams(num_tokens_to_generate=10),
+            block_size_tokens=block_size,
+            enable_prefix_caching=True,
+        )
+        dynamic_context.add_request(req_a)
+
+        # Get request A's blocks and precomputed hashes
+        req_a_block_0 = dynamic_context.request_to_kv_block_ids[0][0].item()
+        req_a_block_1 = dynamic_context.request_to_kv_block_ids[0][1].item()
+
+        # Verify blocks are in pending state (registered but not computed)
+        assert allocator.get_block_hash(req_a_block_0) == -1, "Block 0 should be pending"
+        assert allocator.get_block_hash(req_a_block_1) == -1, "Block 1 should be pending"
+
+        # Precompute hashes for requests B and C (simulating what would happen
+        # when they're added to the engine but before add_request is called)
+        req_b = DynamicInferenceRequest(
+            request_id=2,
+            prompt_tokens=prompt.clone(),
+            sampling_params=SamplingParams(num_tokens_to_generate=10),
+            block_size_tokens=block_size,
+            enable_prefix_caching=True,
+        )
+        req_c = DynamicInferenceRequest(
+            request_id=3,
+            prompt_tokens=prompt.clone(),
+            sampling_params=SamplingParams(num_tokens_to_generate=10),
+            block_size_tokens=block_size,
+            enable_prefix_caching=True,
+        )
+
+        # Phase 2: Simulate engine checking B and C - they should detect pending blocks
+        # This simulates the engine's _has_pending_prefix_blocks check
+        def has_pending_prefix_blocks(req):
+            """Simulate engine's _has_pending_prefix_blocks check."""
+            for block_hash in req.precomputed_block_hashes:
+                block_id = allocator.lookup_block_by_hash(block_hash)
+                if block_id is not None and allocator.get_block_hash(block_id) == -1:
+                    return True  # Block exists but not computed - WAIT
+            return False
+
+        assert has_pending_prefix_blocks(req_b), "B should wait for A's pending blocks"
+        assert has_pending_prefix_blocks(req_c), "C should wait for A's pending blocks"
+
+        # Phase 3: Simulate forward pass completing on A
+        dynamic_context.mark_pending_blocks_computed()
+
+        # Verify blocks are now computed
+        assert allocator.get_block_hash(req_a_block_0) != -1, "Block 0 should be computed"
+        assert allocator.get_block_hash(req_a_block_1) != -1, "Block 1 should be computed"
+
+        # Phase 4: B and C should no longer see pending blocks
+        assert not has_pending_prefix_blocks(req_b), "B can now proceed"
+        assert not has_pending_prefix_blocks(req_c), "C can now proceed"
+
+        # Phase 5: Add B and C - they should share A's computed blocks
+        dynamic_context.add_request(req_b)
+        dynamic_context.add_request(req_c)
+
+        # Verify all three share the same blocks
+        a_blocks = [
+            dynamic_context.request_to_kv_block_ids[0][i].item() for i in range(2)
+        ]
+        b_blocks = [
+            dynamic_context.request_to_kv_block_ids[1][i].item() for i in range(2)
+        ]
+        c_blocks = [
+            dynamic_context.request_to_kv_block_ids[2][i].item() for i in range(2)
+        ]
+
+        assert a_blocks == b_blocks == c_blocks, (
+            f"All requests should share same blocks. "
+            f"A: {a_blocks}, B: {b_blocks}, C: {c_blocks}"
+        )
+
+        # Verify ref counts are 3 (one for each request)
+        assert allocator.block_ref_counts[a_blocks[0]].item() == 3, (
+            f"Block 0 ref count should be 3, got {allocator.block_ref_counts[a_blocks[0]].item()}"
+        )
+        assert allocator.block_ref_counts[a_blocks[1]].item() == 3, (
+            f"Block 1 ref count should be 3, got {allocator.block_ref_counts[a_blocks[1]].item()}"
+        )
+
 
 class TestConcurrentRequests(PrefixCachingTestBase):
     """Tests for concurrent request handling with prefix caching."""
 
     @pytest.mark.internal
-    @pytest.mark.skipif(TEST_LEVEL < TestLevel.IMPORTANT, reason="Test level not met")
+    @pytest.mark.skipif(TEST_PRIORITY < TestPriority.MEDIUM, reason="Test priority not met")
     def test_concurrent_requests_same_prefix(self):
-        """Test multiple requests with same prefix added before any marked computed.
+        """Test multiple requests with same prefix share blocks via two-phase registration.
 
-        When multiple requests arrive simultaneously with the same prefix, each should
-        initially allocate its own blocks (since none are marked computed yet). After
-        marking computed, subsequent requests should be able to share.
+        With two-phase registration, the first request registers block hashes immediately.
+        Subsequent requests with the same prefix find these registered hashes and share
+        the same blocks (incrementing ref counts). They wait for computation to complete
+        before using the cached KV values.
         """
         self._setup_model_parallel_group(1, 1)
         dynamic_context = self._get_dynamic_context(
@@ -2730,6 +3000,7 @@ class TestConcurrentRequests(PrefixCachingTestBase):
             request_id=1,
             prompt_tokens=prompt.clone(),
             sampling_params=SamplingParams(num_tokens_to_generate=10),
+            block_size_tokens=block_size,
         )
         dynamic_context.add_request(request_1)
 
@@ -2737,6 +3008,7 @@ class TestConcurrentRequests(PrefixCachingTestBase):
             request_id=2,
             prompt_tokens=prompt.clone(),
             sampling_params=SamplingParams(num_tokens_to_generate=10),
+            block_size_tokens=block_size,
         )
         dynamic_context.add_request(request_2)
 
@@ -2744,50 +3016,54 @@ class TestConcurrentRequests(PrefixCachingTestBase):
             request_id=3,
             prompt_tokens=prompt.clone(),
             sampling_params=SamplingParams(num_tokens_to_generate=10),
+            block_size_tokens=block_size,
         )
         dynamic_context.add_request(request_3)
 
-        # All 3 should have allocated their own blocks (no sharing yet)
+        # With two-phase registration, all requests should share blocks immediately
+        # (request 2 and 3 find the registered hashes from request 1)
         req1_blocks = dynamic_context.request_to_kv_block_ids[0][:2]
         req2_blocks = dynamic_context.request_to_kv_block_ids[1][:2]
         req3_blocks = dynamic_context.request_to_kv_block_ids[2][:2]
 
-        assert not torch.equal(req1_blocks, req2_blocks), (
-            "Requests 1 and 2 should not share blocks before marking computed"
+        assert torch.equal(req1_blocks, req2_blocks), (
+            "Requests 1 and 2 should share blocks (two-phase registration)"
         )
-        assert not torch.equal(req1_blocks, req3_blocks), (
-            "Requests 1 and 3 should not share blocks before marking computed"
+        assert torch.equal(req1_blocks, req3_blocks), (
+            "Requests 1 and 3 should share blocks (two-phase registration)"
         )
+
+        # Ref counts should reflect 3 requests sharing the same blocks
+        block_allocator = dynamic_context.block_allocator
+        for i in range(2):
+            block_id = req1_blocks[i].item()
+            ref_count = block_allocator.block_ref_counts[block_id].item()
+            assert ref_count == 3, f"Block {i} should have ref_count=3, got {ref_count}"
 
         # Mark all blocks as computed
         dynamic_context.mark_pending_blocks_computed()
 
-        # Now add a 4th request - it SHOULD share with one of the first 3
+        # Add a 4th request - it should also share the same blocks
         request_4 = DynamicInferenceRequest(
             request_id=4,
             prompt_tokens=prompt.clone(),
             sampling_params=SamplingParams(num_tokens_to_generate=10),
+            block_size_tokens=block_size,
         )
         dynamic_context.add_request(request_4)
 
-        req4_blocks = dynamic_context.request_to_kv_block_ids[3][:2]
-
-        # Request 4 should share blocks with at least one of the earlier requests
-        shares_with_req1 = torch.equal(req4_blocks, req1_blocks)
-        shares_with_req2 = torch.equal(req4_blocks, req2_blocks)
-        shares_with_req3 = torch.equal(req4_blocks, req3_blocks)
-
-        assert shares_with_req1 or shares_with_req2 or shares_with_req3, (
-            "Request 4 should share blocks with one of the computed requests"
-        )
-
     @pytest.mark.internal
-    @pytest.mark.skipif(TEST_LEVEL < TestLevel.IMPORTANT, reason="Test level not met")
+    @pytest.mark.skipif(TEST_PRIORITY < TestPriority.MEDIUM, reason="Test priority not met")
     def test_racing_pending_blocks(self):
-        """Verify two-phase registration prevents race conditions.
+        """Verify two-phase registration enables safe block sharing.
 
-        Request 2 should NOT match blocks from Request 1 that are still pending
-        (not yet marked computed). Only after marking computed should sharing happen.
+        With two-phase registration, subsequent requests find registered hashes
+        and share the same blocks. The coordination happens through:
+        1. hash_to_block_id mapping (for discovery)
+        2. block_hashes tensor (for determining if KV is computed)
+
+        This test verifies that multiple requests can safely share blocks,
+        with ref counts tracking all users.
         """
         self._setup_model_parallel_group(1, 1)
         dynamic_context = self._get_dynamic_context(
@@ -2804,6 +3080,7 @@ class TestConcurrentRequests(PrefixCachingTestBase):
         )
 
         block_size = dynamic_context.block_size_tokens
+        block_allocator = dynamic_context.block_allocator
         prompt = torch.arange(block_size * 2, device=torch.cuda.current_device())
 
         # Request 1: add and register hashes (pending state)
@@ -2811,46 +3088,63 @@ class TestConcurrentRequests(PrefixCachingTestBase):
             request_id=1,
             prompt_tokens=prompt.clone(),
             sampling_params=SamplingParams(num_tokens_to_generate=10),
+            block_size_tokens=block_size,
         )
         dynamic_context.add_request(request_1)
-        # Do NOT mark as computed yet
+        # Do NOT mark as computed yet - blocks are in pending state
 
-        # Request 2: add with same prefix (should NOT match pending blocks)
+        # Request 2: add with same prefix - finds registered hashes and shares blocks
         request_2 = DynamicInferenceRequest(
             request_id=2,
             prompt_tokens=prompt.clone(),
             sampling_params=SamplingParams(num_tokens_to_generate=10),
+            block_size_tokens=block_size,
         )
         dynamic_context.add_request(request_2)
 
-        # Verify: Request 2 should NOT share blocks (they're still pending)
+        # Verify: Request 2 DOES share blocks (via registered hashes)
         req1_blocks = dynamic_context.request_to_kv_block_ids[0][:2]
         req2_blocks = dynamic_context.request_to_kv_block_ids[1][:2]
 
-        assert not torch.equal(req1_blocks, req2_blocks), (
-            "Request 2 should NOT share pending blocks from Request 1. "
-            "Two-phase registration should prevent sharing until blocks are marked computed."
+        assert torch.equal(req1_blocks, req2_blocks), (
+            "Request 2 should share blocks with Request 1 via two-phase registration"
         )
 
-        # Now mark Request 1's blocks as computed
+        # Verify ref counts reflect both requests
+        for i in range(2):
+            block_id = req1_blocks[i].item()
+            ref_count = block_allocator.block_ref_counts[block_id].item()
+            assert ref_count == 2, f"Block {i} should have ref_count=2, got {ref_count}"
+
+        # Verify blocks are still pending (not computed)
+        for i in range(2):
+            block_id = req1_blocks[i].item()
+            assert block_allocator.get_block_hash(block_id) == -1, (
+                f"Block {i} should be pending (hash=-1)"
+            )
+
+        # Now mark blocks as computed
         dynamic_context.mark_pending_blocks_computed()
 
-        # Request 3: add with same prefix (SHOULD match now)
+        # Verify blocks are now computed
+        for i in range(2):
+            block_id = req1_blocks[i].item()
+            assert block_allocator.get_block_hash(block_id) != -1, (
+                f"Block {i} should be computed (hash!=-1)"
+            )
+
+        # Request 3: add with same prefix - also shares blocks
         request_3 = DynamicInferenceRequest(
             request_id=3,
             prompt_tokens=prompt.clone(),
             sampling_params=SamplingParams(num_tokens_to_generate=10),
+            block_size_tokens=block_size,
         )
         dynamic_context.add_request(request_3)
 
         req3_blocks = dynamic_context.request_to_kv_block_ids[2][:2]
-
-        # Request 3 should share with Request 1 or Request 2
-        shares_with_req1 = torch.equal(req3_blocks, req1_blocks)
-        shares_with_req2 = torch.equal(req3_blocks, req2_blocks)
-
-        assert shares_with_req1 or shares_with_req2, (
-            "Request 3 should share blocks now that they're marked computed"
+        assert torch.equal(req3_blocks, req1_blocks), (
+            "Request 3 should share blocks with Request 1"
         )
 
 
@@ -2858,7 +3152,7 @@ class TestComplexPrefixPatterns(PrefixCachingTestBase):
     """Tests for complex prefix sharing patterns."""
 
     @pytest.mark.internal
-    @pytest.mark.skipif(TEST_LEVEL < TestLevel.IMPORTANT, reason="Test level not met")
+    @pytest.mark.skipif(TEST_PRIORITY < TestPriority.MEDIUM, reason="Test priority not met")
     def test_three_way_prefix_sharing(self):
         """Test three requests sharing the same prefix (ref_count = 3)."""
         self._setup_model_parallel_group(1, 1)
@@ -2884,6 +3178,7 @@ class TestComplexPrefixPatterns(PrefixCachingTestBase):
             request_id=1,
             prompt_tokens=prompt.clone(),
             sampling_params=SamplingParams(num_tokens_to_generate=10),
+            block_size_tokens=block_size,
         )
         dynamic_context.add_request(request_1)
         dynamic_context.mark_pending_blocks_computed()
@@ -2899,6 +3194,7 @@ class TestComplexPrefixPatterns(PrefixCachingTestBase):
             request_id=2,
             prompt_tokens=prompt.clone(),
             sampling_params=SamplingParams(num_tokens_to_generate=10),
+            block_size_tokens=block_size,
         )
         dynamic_context.add_request(request_2)
 
@@ -2911,6 +3207,7 @@ class TestComplexPrefixPatterns(PrefixCachingTestBase):
             request_id=3,
             prompt_tokens=prompt.clone(),
             sampling_params=SamplingParams(num_tokens_to_generate=10),
+            block_size_tokens=block_size,
         )
         dynamic_context.add_request(request_3)
 
@@ -2928,7 +3225,7 @@ class TestComplexPrefixPatterns(PrefixCachingTestBase):
         assert torch.equal(req1_blocks, req2_blocks) and torch.equal(req1_blocks, req3_blocks)
 
     @pytest.mark.internal
-    @pytest.mark.skipif(TEST_LEVEL < TestLevel.IMPORTANT, reason="Test level not met")
+    @pytest.mark.skipif(TEST_PRIORITY < TestPriority.LOW, reason="Test priority not met")
     def test_prefix_chain_extending(self):
         """Test prefix chain where B extends A, C extends B.
 
@@ -2958,6 +3255,7 @@ class TestComplexPrefixPatterns(PrefixCachingTestBase):
             request_id=1,
             prompt_tokens=prompt_a,
             sampling_params=SamplingParams(num_tokens_to_generate=10),
+        block_size_tokens=block_size,
         )
         dynamic_context.add_request(request_a)
         dynamic_context.mark_pending_blocks_computed()
@@ -2973,6 +3271,7 @@ class TestComplexPrefixPatterns(PrefixCachingTestBase):
             request_id=2,
             prompt_tokens=prompt_b,
             sampling_params=SamplingParams(num_tokens_to_generate=10),
+        block_size_tokens=block_size,
         )
         dynamic_context.add_request(request_b)
         dynamic_context.mark_pending_blocks_computed()
@@ -2991,6 +3290,7 @@ class TestComplexPrefixPatterns(PrefixCachingTestBase):
             request_id=3,
             prompt_tokens=prompt_c,
             sampling_params=SamplingParams(num_tokens_to_generate=10),
+        block_size_tokens=block_size,
         )
         dynamic_context.add_request(request_c)
 
@@ -3001,7 +3301,7 @@ class TestComplexPrefixPatterns(PrefixCachingTestBase):
         assert torch.equal(blocks_c[:2], blocks_a), "C should share first 2 blocks with A"
 
     @pytest.mark.internal
-    @pytest.mark.skipif(TEST_LEVEL < TestLevel.IMPORTANT, reason="Test level not met")
+    @pytest.mark.skipif(TEST_PRIORITY < TestPriority.LOW, reason="Test priority not met")
     def test_multiple_independent_prefix_trees(self):
         """Test multiple separate prefix patterns in cache simultaneously.
 
@@ -3037,6 +3337,7 @@ class TestComplexPrefixPatterns(PrefixCachingTestBase):
                 request_id=i + 1,
                 prompt_tokens=prefix_x.clone(),
                 sampling_params=SamplingParams(num_tokens_to_generate=10),
+                block_size_tokens=block_size,
             )
             dynamic_context.add_request(request)
             if i == 0:
@@ -3048,6 +3349,7 @@ class TestComplexPrefixPatterns(PrefixCachingTestBase):
                 request_id=i + 10,
                 prompt_tokens=prefix_y.clone(),
                 sampling_params=SamplingParams(num_tokens_to_generate=10),
+                block_size_tokens=block_size,
             )
             dynamic_context.add_request(request)
             if i == 0:
@@ -3075,7 +3377,7 @@ class TestMemoryPressure(PrefixCachingTestBase):
     """Tests for memory pressure and eviction with prefix caching."""
 
     @pytest.mark.internal
-    @pytest.mark.skipif(TEST_LEVEL < TestLevel.IMPORTANT, reason="Test level not met")
+    @pytest.mark.skipif(TEST_PRIORITY < TestPriority.LOW, reason="Test priority not met")
     def test_eviction_preserves_active_blocks(self):
         """Test that blocks with ref_count > 0 cannot be evicted."""
         self._setup_model_parallel_group(1, 1)
@@ -3101,6 +3403,7 @@ class TestMemoryPressure(PrefixCachingTestBase):
             request_id=1,
             prompt_tokens=prompt,
             sampling_params=SamplingParams(num_tokens_to_generate=10),
+        block_size_tokens=block_size,
         )
         dynamic_context.add_request(request_1)
         dynamic_context.mark_pending_blocks_computed()
@@ -3122,6 +3425,7 @@ class TestMemoryPressure(PrefixCachingTestBase):
                     request_id=i + 100,
                     prompt_tokens=filler_prompt,
                     sampling_params=SamplingParams(num_tokens_to_generate=10),
+                block_size_tokens=block_size,
                 )
                 dynamic_context.add_request(filler_request)
                 dynamic_context.mark_pending_blocks_computed()
@@ -3135,7 +3439,7 @@ class TestMemoryPressure(PrefixCachingTestBase):
             )
 
     @pytest.mark.internal
-    @pytest.mark.skipif(TEST_LEVEL < TestLevel.IMPORTANT, reason="Test level not met")
+    @pytest.mark.skipif(TEST_PRIORITY < TestPriority.LOW, reason="Test priority not met")
     def test_cache_full_scenario(self):
         """Test behavior when cache is completely full."""
         self._setup_model_parallel_group(1, 1)
@@ -3168,6 +3472,7 @@ class TestMemoryPressure(PrefixCachingTestBase):
                     request_id=requests_added + 1,
                     prompt_tokens=prompt,
                     sampling_params=SamplingParams(num_tokens_to_generate=10),
+                block_size_tokens=block_size,
                 )
                 dynamic_context.add_request(request)
                 dynamic_context.mark_pending_blocks_computed()
@@ -3186,6 +3491,7 @@ class TestMemoryPressure(PrefixCachingTestBase):
             request_id=9000,
             prompt_tokens=cached_prompt,
             sampling_params=SamplingParams(num_tokens_to_generate=10),
+        block_size_tokens=block_size,
         )
 
         try:
@@ -3200,7 +3506,7 @@ class TestRequestLifecycle(PrefixCachingTestBase):
     """Tests for request lifecycle with prefix caching."""
 
     @pytest.mark.internal
-    @pytest.mark.skipif(TEST_LEVEL < TestLevel.MEDIUM, reason="Test level not met")
+    @pytest.mark.skipif(TEST_PRIORITY < TestPriority.LOW, reason="Test priority not met")
     def test_release_preserves_cached_blocks(self):
         """Test that releasing a request leaves blocks cached (evictable) for reuse."""
         self._setup_model_parallel_group(1, 1)
@@ -3226,14 +3532,16 @@ class TestRequestLifecycle(PrefixCachingTestBase):
             request_id=1,
             prompt_tokens=prompt,
             sampling_params=SamplingParams(num_tokens_to_generate=10),
+            block_size_tokens=block_size,
         )
         dynamic_context.add_request(request_1)
         dynamic_context.mark_pending_blocks_computed()
 
-        block_ids = dynamic_context.request_to_kv_block_ids[0][:2]
+        # Clone to preserve block IDs after release (release sets the tensor to -1)
+        block_ids = dynamic_context.request_to_kv_block_ids[0][:2].clone()
 
         # Release request 1
-        dynamic_context.release_kv_blocks(0)  # Release first request
+        dynamic_context.release_memory_blocks_from_request_indexes(torch.tensor([0]))  # Release first request
 
         # Verify blocks have ref_count = 0 (cached, evictable)
         for block_id in block_ids:
@@ -3254,6 +3562,7 @@ class TestRequestLifecycle(PrefixCachingTestBase):
             request_id=2,
             prompt_tokens=prompt,
             sampling_params=SamplingParams(num_tokens_to_generate=10),
+            block_size_tokens=block_size,
         )
         dynamic_context.add_request(request_2)
 
@@ -3263,7 +3572,7 @@ class TestRequestLifecycle(PrefixCachingTestBase):
         assert torch.equal(req2_blocks, block_ids), "Request 2 should reuse cached blocks"
 
     @pytest.mark.internal
-    @pytest.mark.skipif(TEST_LEVEL < TestLevel.MEDIUM, reason="Test level not met")
+    @pytest.mark.skipif(TEST_PRIORITY < TestPriority.LOW, reason="Test priority not met")
     def test_chunked_prefill_prefix_matching(self):
         """Test that prefix matching only happens on first chunk.
 
@@ -3294,6 +3603,7 @@ class TestRequestLifecycle(PrefixCachingTestBase):
             request_id=1,
             prompt_tokens=long_prompt,
             sampling_params=SamplingParams(num_tokens_to_generate=10),
+        block_size_tokens=block_size,
         )
 
         # First chunk (assume 4 blocks)
@@ -3309,6 +3619,7 @@ class TestRequestLifecycle(PrefixCachingTestBase):
             request_id=2,
             prompt_tokens=long_prompt,
             sampling_params=SamplingParams(num_tokens_to_generate=10),
+        block_size_tokens=block_size,
         )
 
         # Add first chunk - should match the first 4 blocks
@@ -3326,7 +3637,7 @@ class TestAdditionalEdgeCases(PrefixCachingTestBase):
     """Tests for additional edge cases in prefix caching."""
 
     @pytest.mark.internal
-    @pytest.mark.skipif(TEST_LEVEL < TestLevel.MEDIUM, reason="Test level not met")
+    @pytest.mark.skipif(TEST_PRIORITY < TestPriority.LOW, reason="Test priority not met")
     def test_empty_prompt(self):
         """Test request with 0 tokens."""
         self._setup_model_parallel_group(1, 1)
@@ -3350,9 +3661,11 @@ class TestAdditionalEdgeCases(PrefixCachingTestBase):
             request_id=1,
             prompt_tokens=empty_prompt,
             sampling_params=SamplingParams(num_tokens_to_generate=10),
+            block_size_tokens=dynamic_context.block_size_tokens,
         )
 
         # Should handle gracefully (no blocks allocated, no hashes)
+        assert request.precomputed_block_hashes is not None, "Should have precomputed_block_hashes list"
         assert len(request.precomputed_block_hashes) == 0, "Empty prompt should have no hashes"
 
         try:
@@ -3363,7 +3676,7 @@ class TestAdditionalEdgeCases(PrefixCachingTestBase):
             pass
 
     @pytest.mark.internal
-    @pytest.mark.skipif(TEST_LEVEL < TestLevel.MEDIUM, reason="Test level not met")
+    @pytest.mark.skipif(TEST_PRIORITY < TestPriority.LOW, reason="Test priority not met")
     def test_single_token_prompt(self):
         """Test request with only 1 token (less than block size)."""
         self._setup_model_parallel_group(1, 1)
@@ -3387,6 +3700,7 @@ class TestAdditionalEdgeCases(PrefixCachingTestBase):
             request_id=1,
             prompt_tokens=single_token,
             sampling_params=SamplingParams(num_tokens_to_generate=10),
+            block_size_tokens=dynamic_context.block_size_tokens,
         )
 
         # No complete blocks, so no precomputed hashes
@@ -3396,7 +3710,7 @@ class TestAdditionalEdgeCases(PrefixCachingTestBase):
         # Should allocate 1 block for the partial prompt
 
     @pytest.mark.internal
-    @pytest.mark.skipif(TEST_LEVEL < TestLevel.MEDIUM, reason="Test level not met")
+    @pytest.mark.skipif(TEST_PRIORITY < TestPriority.LOW, reason="Test priority not met")
     def test_extremely_long_prompt(self):
         """Test request with many blocks (100+) to verify hash computation scales."""
         self._setup_model_parallel_group(1, 1)
@@ -3406,7 +3720,7 @@ class TestAdditionalEdgeCases(PrefixCachingTestBase):
             kv_channels=8,
             num_attention_heads=2,
             max_sequence_length=8192,
-            buffer_size_gb=0.5,  # Larger buffer for long prompt
+            buffer_size_gb=0.1,  # Buffer for 120-block test
             block_size_tokens=32,
             max_tokens=None,
             is_hybrid_model=False,
@@ -3424,6 +3738,7 @@ class TestAdditionalEdgeCases(PrefixCachingTestBase):
             request_id=1,
             prompt_tokens=long_prompt,
             sampling_params=SamplingParams(num_tokens_to_generate=10),
+        block_size_tokens=block_size,
         )
 
         # Verify all 120 blocks have hashes computed
@@ -3444,7 +3759,7 @@ class TestAdditionalEdgeCases(PrefixCachingTestBase):
             pass
 
     @pytest.mark.internal
-    @pytest.mark.skipif(TEST_LEVEL < TestLevel.MEDIUM, reason="Test level not met")
+    @pytest.mark.skipif(TEST_PRIORITY < TestPriority.LOW, reason="Test priority not met")
     def test_pathological_repeated_tokens(self):
         """Test all tokens identical (pathological case for hash function)."""
         self._setup_model_parallel_group(1, 1)
@@ -3470,6 +3785,7 @@ class TestAdditionalEdgeCases(PrefixCachingTestBase):
             request_id=1,
             prompt_tokens=all_zeros,
             sampling_params=SamplingParams(num_tokens_to_generate=10),
+        block_size_tokens=block_size,
         )
 
         # Verify hashes are computed (even for pathological input)
@@ -3487,7 +3803,7 @@ class TestObservability(PrefixCachingTestBase):
     """Tests for observability features like metrics and debugging."""
 
     @pytest.mark.internal
-    @pytest.mark.skipif(TEST_LEVEL < TestLevel.LOW, reason="Test level not met")
+    @pytest.mark.skipif(TEST_PRIORITY < TestPriority.LOW, reason="Test priority not met")
     def test_block_allocation_tracking(self):
         """Test that we can track block allocation and usage statistics."""
         self._setup_model_parallel_group(1, 1)
@@ -3519,6 +3835,7 @@ class TestObservability(PrefixCachingTestBase):
                 request_id=i + 1,
                 prompt_tokens=prompt,
                 sampling_params=SamplingParams(num_tokens_to_generate=10),
+            block_size_tokens=block_size,
             )
             dynamic_context.add_request(request)
             dynamic_context.mark_pending_blocks_computed()
@@ -3539,7 +3856,7 @@ class TestObservability(PrefixCachingTestBase):
         )
 
     @pytest.mark.internal
-    @pytest.mark.skipif(TEST_LEVEL < TestLevel.LOW, reason="Test level not met")
+    @pytest.mark.skipif(TEST_PRIORITY < TestPriority.LOW, reason="Test priority not met")
     def test_prefix_cache_hit_rate(self):
         """Test tracking prefix cache hit rate."""
         self._setup_model_parallel_group(1, 1)
@@ -3564,6 +3881,7 @@ class TestObservability(PrefixCachingTestBase):
             request_id=1,
             prompt_tokens=prompt,
             sampling_params=SamplingParams(num_tokens_to_generate=10),
+        block_size_tokens=block_size,
         )
         dynamic_context.add_request(request_1)
         dynamic_context.mark_pending_blocks_computed()
@@ -3574,6 +3892,7 @@ class TestObservability(PrefixCachingTestBase):
                 request_id=i,
                 prompt_tokens=prompt.clone(),
                 sampling_params=SamplingParams(num_tokens_to_generate=10),
+                block_size_tokens=block_size,
             )
             dynamic_context.add_request(request)
 

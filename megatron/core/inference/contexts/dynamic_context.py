@@ -16,7 +16,7 @@ from megatron.core.inference.batch_dimensions_utils import (
     CUDAGraphBatchDimensionBuilder,
     InferenceBatchDimensions,
 )
-from megatron.core.inference.inference_request import DynamicInferenceRequest
+from megatron.core.inference.inference_request import DynamicInferenceRequest, HASH_PRIME
 from megatron.core.inference.model_inference_wrappers.inference_wrapper_config import (
     InferenceWrapperConfig,
 )
@@ -1781,7 +1781,16 @@ class DynamicInferenceContext(BaseInferenceContext):
             return [], 0
 
         # Check if precomputed hashes are available
+        if req.precomputed_block_hashes is None:
+            # This means block_size_tokens wasn't set on the request
+            raise ValueError(
+                f"DynamicInferenceRequest {req.request_id} has precomputed_block_hashes=None "
+                "but prefix caching is enabled. Set block_size_tokens on the request to "
+                "enable prefix caching."
+            )
+
         if not req.precomputed_block_hashes:
+            # Empty list means prompt < block_size, no complete blocks to match
             return [], 0
 
         matched_blocks: list[int] = []
@@ -1983,7 +1992,7 @@ class DynamicInferenceContext(BaseInferenceContext):
             else:
                 # Use deterministic unique hash based on block_id to prevent matching
                 # Knuth's multiplicative hash spreads IDs across hash space
-                unique_hash = (block_id * 2654435761) % self.block_allocator.HASH_PRIME + 1
+                unique_hash = (block_id * 2654435761) % HASH_PRIME + 1
                 self.block_allocator.set_block_hash(block_id, unique_hash)
 
         if self.is_hybrid_model and not is_chunked_prefill:

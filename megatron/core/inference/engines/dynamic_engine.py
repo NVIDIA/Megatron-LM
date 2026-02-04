@@ -720,6 +720,7 @@ class DynamicInferenceEngine(AbstractEngine):
                 record=DynamicInferenceRequestRecord.from_request(request),
                 future=self._loop.create_future(),
             )
+            request.add_event_add_engine()  # Record when request enters engine
 
         if request.status is None:
             request.status = Status.ACTIVE_AND_GENERATING_TOKENS
@@ -886,6 +887,13 @@ class DynamicInferenceEngine(AbstractEngine):
                 # Skip appending token for requests being finished due to stop words
                 # (they already have their final token from the previous step)
                 if request_id not in self.stop_word_being_finished_ids:
+                    # Record FIRST_TOKEN event when:
+                    # - Prefill is complete (remaining_prompt_tokens is empty)
+                    # - No tokens generated yet (this is the first token)
+                    if (request.remaining_prompt_tokens.numel() == 0 and
+                            len(request.generated_tokens) == 0):
+                        request.add_event_first_token()
+
                     request.generated_tokens.append(token)
                     if request.tpot is None:
                         request.tpot = []
@@ -1229,7 +1237,7 @@ class DynamicInferenceEngine(AbstractEngine):
                     self._loop.create_task, self._notify_cond_for_new_request()
                 )
                 req.remaining_prompt_tokens = req.remaining_prompt_tokens.new_empty(0)
-                req.add_event_add()
+                req.add_event_add_context()
                 self.waiting_request_ids.popleft()
             else:
                 break
@@ -1305,7 +1313,7 @@ class DynamicInferenceEngine(AbstractEngine):
                         self._loop.create_task, self._notify_cond_for_new_request()
                     )
                     req.remaining_prompt_tokens = req.remaining_prompt_tokens.new_empty(0)
-                    req.add_event_add()
+                    req.add_event_add_context()
                     # Fully scheduled, so we remove from waiting pool
                     self.waiting_request_ids.popleft()
                     # Only this case we keep checking the rest of the waiting queue

@@ -191,31 +191,6 @@ class BlockAllocator:
         self.block_timestamps.fill_(0)
         self.global_timestamp = 0
 
-    # Constants for hash computation
-    HASH_PRIME = 1000000007
-    HASH_BASE = 31
-
-    def compute_block_hash(self, parent_hash: int, token_ids: Tensor) -> int:
-        """Compute hash for a block from (parent_hash, token_ids).
-
-        Uses a GPU-based polynomial rolling hash combined with the parent hash.
-
-        Args:
-            parent_hash: Hash of parent block (0 for first block in sequence).
-            token_ids: Token IDs in this block, shape [block_size_tokens].
-
-        Returns:
-            Positive integer hash value (1 to HASH_PRIME).
-        """
-        block_size = token_ids.shape[0]
-        positions = torch.arange(block_size, device=token_ids.device, dtype=torch.int64)
-        powers = torch.pow(self.HASH_BASE, positions).to(torch.int64) % self.HASH_PRIME
-        token_hash = ((token_ids.to(torch.int64) * powers).sum() % self.HASH_PRIME).item()
-
-        # Combine with parent hash
-        combined = (parent_hash * self.HASH_BASE + token_hash) % self.HASH_PRIME
-        return combined + 1  # Ensure positive (1 to HASH_PRIME)
-
     def set_block_hash(self, block_id: int, hash_value: int) -> None:
         """Set the hash for a specific block.
 
