@@ -18,23 +18,7 @@ from megatron.core.inference.sampling_params import SamplingParams
 from megatron.core.ssm.mamba_hybrid_layer_allocation import Symbols
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
 from tests.unit_tests.test_utilities import Utils
-
-from enum import IntEnum
-
-
-class TestPriority(IntEnum):
-    """Priority levels for prefix caching tests.
-
-    Controls which tests run based on their importance:
-    - CRITICAL: Fundamental correctness and safety (hash collisions, correctness verification, TTFT)
-    - IMPORTANT: Robustness and common edge cases (concurrent requests, complex patterns, memory pressure)
-    - MEDIUM: Lifecycle integration and additional edge cases
-    - LOW: Observability, metrics, and advanced scenarios
-    """
-    CRITICAL = 1
-    IMPORTANT = 2
-    MEDIUM = 3
-    LOW = 4
+from tests.unit_tests.inference.test_utils import TestPriority
 
 
 # Set this to control which tests run:
