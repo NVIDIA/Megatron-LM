@@ -79,6 +79,8 @@ def fully_shard_model(
     hybrid_fsdp_group: Optional[torch.distributed.ProcessGroup] = None,
     hybrid_fsdp_expt_group: Optional[torch.distributed.ProcessGroup] = None,
     expt_device_mesh: Optional[DeviceMesh] = None,
+    fsdp_group_ag: Optional[torch.distributed.ProcessGroup] = None,
+    expt_fsdp_group_ag: Optional[torch.distributed.ProcessGroup] = None,
     fsdp_unit_modules: Optional[Sequence[Type[torch.nn.Module]] | Sequence[str]] = None,
     zero_dp_strategy: str | int = 3,
     outer_dp_sharding_strategy: str | int = 0,
@@ -140,6 +142,17 @@ def fully_shard_model(
         expt_device_mesh (Optional[DeviceMesh]):
             Expert parallel device mesh object defining the topology for MoE distributed training.
             Utilizes the mesh dimension names specified by the *_dim arguments.
+
+        fsdp_group_ag (Optional[torch.distributed.ProcessGroup]):
+            Independent all-gather process group for overlapping all-gather and reduce-scatter
+            operations. When provided, enables AG/RS overlap optimization for regular (non-expert)
+            parameters. Users should create this group with the same ranks as the dp-cp group.
+            Defaults to None.
+
+        expt_fsdp_group_ag (Optional[torch.distributed.ProcessGroup]):
+            Independent all-gather process group for expert parameters in MoE models. When provided,
+            enables AG/RS overlap optimization for expert parameters. Users should create this group
+            with the same ranks as the expert data parallel group. Defaults to None.
 
         fsdp_unit_modules (Optional[Sequence[Type[torch.nn.Module]] | Sequence[str]]):
             List of (sub-)module classes or (sub-)module class import paths that are "units",
@@ -365,6 +378,9 @@ def fully_shard_model(
         hsdp_outer_dp_shard=_outer_fsdp_sharding,
         # Only required for Megatron-FSDP + EP.
         expt_device_mesh=expt_device_mesh,
+        # AG groups for AG/RS overlap optimization.
+        fsdp_group_ag=fsdp_group_ag,
+        expt_fsdp_group_ag=expt_fsdp_group_ag,
     )
 
     # Wrap model in Megatron FSDP.
@@ -532,6 +548,8 @@ def fully_shard(
     hybrid_fsdp_group: Optional[torch.distributed.ProcessGroup] = None,
     hybrid_fsdp_expt_group: Optional[torch.distributed.ProcessGroup] = None,
     expt_device_mesh: Optional[DeviceMesh] = None,
+    fsdp_group_ag: Optional[torch.distributed.ProcessGroup] = None,
+    expt_fsdp_group_ag: Optional[torch.distributed.ProcessGroup] = None,
     fsdp_unit_modules: Optional[Sequence[Type[torch.nn.Module]] | Sequence[str]] = None,
     zero_dp_strategy: str | int = 3,
     outer_dp_sharding_strategy: str | int = 0,
@@ -581,6 +599,8 @@ def fully_shard(
         hybrid_fsdp_group=hybrid_fsdp_group,
         hybrid_fsdp_expt_group=hybrid_fsdp_expt_group,
         expt_device_mesh=expt_device_mesh,
+        fsdp_group_ag=fsdp_group_ag,
+        expt_fsdp_group_ag=expt_fsdp_group_ag,
         fsdp_unit_modules=fsdp_unit_modules,
         zero_dp_strategy=zero_dp_strategy,
         outer_dp_sharding_strategy=outer_dp_sharding_strategy,

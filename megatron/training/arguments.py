@@ -2360,9 +2360,18 @@ def _add_distributed_args(parser):
     group.add_argument('--fsdp-manual-registration', action='store_true', dest='fsdp_manual_registration',
                        default=False, help='Manually register the FSDP communication buffers to NCCL user buffer.'
                        'This option is only effective when use-megatron-fsdp and use-nccl-ub is set.')
+    group.add_argument('--use-sharp', action='store_true', 
+                       help='Required to enable SHARP communication.')
+    group.add_argument('--sharp-enabled-group', type=str, default=None,
+                       choices=['dp', 'dp_replica'],
+                       help='IB SHARP can be enabled from only one communication group. '
+                       'By default, it is enabled from dp group. '
+                       'Available options: [dp, dp_replica]')
+    group.add_argument('--use-megatron-fsdp', action='store_true',
+                       help='Use the Megatron FSDP code path in DDP.')
     group.add_argument('--create-all-gather-group', action='store_true',
-                   help='Create a separate process group for all-gather operations '
-                   'to overlap reduce-scatter and all-gather operations.')
+                       help='Enable AG/RS overlap optimization by creating separate '
+                       'all-gather communicators.')
     group.add_argument('--data-parallel-sharding-strategy', type=str, default='no_shard',
                        choices=['no_shard', 'optim', 'optim_grads', 'optim_grads_params'],
                        help='Sharding strategy of data parallelism.')
