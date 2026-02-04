@@ -525,7 +525,7 @@ class TextGenerationController:
         moe_pad_experts_for_cuda_graph_inference = (
             self.model_config.moe_pad_experts_for_cuda_graph_inference
         )
-        is_inference_optimized = inference_wrapper_config.transformer_impl == "inference_optimized"
+        is_inference_optimized =  self.model_config.transformer_impl == "inference_optimized"
         if is_inference_optimized:
             assert not moe_pad_experts_for_cuda_graph_inference, (
                 "moe_pad_experts_for_cuda_graph_inference cannot be True when "
@@ -537,6 +537,7 @@ class TextGenerationController:
                 set_decode_expert_padding(unwrapped_model, True, capacity_factor=capacity_factor)
             else:
                 set_decode_expert_padding(unwrapped_model, False)
+        
         if is_inference_optimized and model_config.expert_model_parallel_size > 1:
             set_is_cuda_graphed_iteration_for_ep_inference(unwrapped_model, context.using_cuda_graph_this_step())
 

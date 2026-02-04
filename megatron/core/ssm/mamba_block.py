@@ -25,7 +25,7 @@ from megatron.core.ssm.mamba_hybrid_layer_allocation import allocate_layers
 from megatron.core.transformer import TransformerConfig
 from megatron.core.transformer.enums import CudaGraphScope
 from megatron.core.transformer.identity_op import IdentityOp
-from megatron.core.transformer.module import MegatronModule
+from megatron.core.transformer.module import MegatronModule, GraphableMegatronModule
 from megatron.core.transformer.spec_utils import ModuleSpec, build_module
 from megatron.core.transformer.transformer_layer import TransformerLayer
 from megatron.core.transformer.utils import sharded_state_dict_default
@@ -44,7 +44,7 @@ class MambaStackSubmodules:
     moe_layer: Union[ModuleSpec, type] = IdentityOp
 
 
-class MambaStack(MegatronModule):
+class MambaStack(GraphableMegatronModule, MegatronModule):
     """
     Constructor for the MambaStack class.
 
@@ -231,6 +231,7 @@ class MambaStack(MegatronModule):
                 if isinstance(kwargs['hidden_states'], WrappedTensor)
                 else kwargs['hidden_states']
             )
+            return super().__call__(*args, **kwargs)[0]
         return super().__call__(*args, **kwargs)
 
     def forward(
