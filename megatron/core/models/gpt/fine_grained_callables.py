@@ -588,11 +588,14 @@ def build_transformer_layer_callables(layer: TransformerLayer):
             inp=hidden_states, requires_grad=hidden_states.requires_grad, keep_graph=True
         )
 
-        # Need to record residual to comm stream, since it's created on comp stream
+        # Need to record tensors created on comp stream to comm stream
         node.layer_state.residual.record_stream(torch.cuda.current_stream())
+        if shared_expert_output is not None:
+            shared_expert_output.record_stream(torch.cuda.current_stream())
 
         # release tensor reference after use
         node.layer_state.residual = None
+        node.layer_state.shared_expert_output = None
 
         # final layer norm from decoder
         final_layernorm = node.chunk_state.model.decoder.final_layernorm
