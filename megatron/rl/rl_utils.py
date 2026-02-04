@@ -432,21 +432,12 @@ _INFERENCE_INTERFACE = None
 def get_inference_interface(args, loop, model):
     global _INFERENCE_INTERFACE
     if _INFERENCE_INTERFACE is None:
-        rank = torch.distributed.get_rank()
-        if rank == 0 and args.langrl_external_server:
-            _INFERENCE_INTERFACE = loop.run_until_complete(
-                InferenceInterfaceServer.launch(MegatronLocal, 
-                model=model[0],
-                host='0.0.0.0',
+        _INFERENCE_INTERFACE = loop.run_until_complete(
+            MegatronLocal.launch(
+                model[0], 
+                host='0.0.0.0', 
                 port=os.getenv('MEGATRON_RL_INFERENCE_SERVER_PORT', 8294))
-            )
-        else:
-            _INFERENCE_INTERFACE = loop.run_until_complete(
-                MegatronLocal.launch(
-                    model[0], 
-                    host='0.0.0.0', 
-                    port=os.getenv('MEGATRON_RL_INFERENCE_SERVER_PORT', 8294))
-            )
+        )
     return _INFERENCE_INTERFACE
 
 

@@ -11,8 +11,6 @@ from megatron.core.utils import get_asyncio_loop, trace_async_exceptions
 
 from .headers import Headers
 
-logger = logging.getLogger(__name__)
-
 try:
     import zmq
 

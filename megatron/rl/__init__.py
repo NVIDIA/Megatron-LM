@@ -65,7 +65,7 @@ class GenericGenerationArgs(BaseModel):
     top_k: int | None = None
     top_p: float | None = None
     max_tokens: int | None = None
-    n: int | None = None
+    n: int | None = None # Number of completions to generate per request
 
     def add(self, generation_args: 'GenericGenerationArgs') -> 'GenericGenerationArgs':
         return GenericGenerationArgs.model_validate(
