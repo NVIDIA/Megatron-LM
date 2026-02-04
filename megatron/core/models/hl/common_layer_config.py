@@ -199,7 +199,7 @@ class CommonLayerConfig:
     gated_linear_unit: bool = False
     """Use a gated linear unit for the first linear layer in the MLP."""
 
-    activation_func: Callable = F.gelu
+    activation_func: str = "gelu"
     """Activation function to use for the non-linearity in the MLP."""
 
     activation_func_fp8_input_store: bool = False
@@ -207,9 +207,28 @@ class CommonLayerConfig:
     The stored input is casted back to the original precision before backprop compuatation."""
 
     glu_linear_offset: float = 0.0
-    """Offset term in the GLU activation function: activation_func(x[0]) * (x[1] + offset). Only 
+    """Offset term in the GLU activation function: activation_func(x[0]) * (x[1] + offset). Only
     used when gated_linear_unit is True"""
 
-    activation_func_clamp_value: Optional[float] = None
+    activation_func_clamp_value: float | None = None
     """Clamp the output of the linear_fc1 in the activation function. Only used when activation_func
     is quick_gelu."""
+
+    ####################
+    # initialization
+    ####################
+    init_method: str | None = None
+    """Method to initialize weights. Note that bias is always set to zero. Should be a function that
+    takes a single Tensor and initializes it. If None, will be set to
+    megatron.core.utils.init_method_normal(init_method_std) which is torch nn init normal with
+    mean=0.0 and std=init_method_std."""
+
+    init_method_std: float = 0.02
+    """Standard deviation of the zero mean normal for the default initialization method, not used if
+    init_method and output_layer_init_method are provided."""
+
+    init_model_with_meta_device: bool = False
+    """
+    If True, initializes the model with the meta device. This is helpful for
+    training of very large models. This feature is only works when megatron fsdp is turned on.
+    """

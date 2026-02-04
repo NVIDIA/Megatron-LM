@@ -18,7 +18,7 @@ from megatron.core.models.hl import (
     CommonLayerConfig,
     CrossEntropyLayerConfig,
     EmbeddingLayerConfig,
-    HLModel,
+    HLModelConfig,
     MLPLayerConfig,
 )
 
@@ -30,10 +30,10 @@ from megatron.core.models.hl import (
 common_config = CommonLayerConfig(
     hidden_size=4096,
     bf16=True,
-    tensor_model_parallel_size=8,
     sequence_parallel=True,
     normalization="RMSNorm",
     add_bias_linear=False,
+    init_method_std=0.02,
 )
 
 # =============================================================================
@@ -72,12 +72,12 @@ layer_pattern = [Embedding] + [Attention, Mlp] * 32 + [Loss]
 # MODEL
 # =============================================================================
 
-simple_model = HLModel(
+simple_model = HLModelConfig(
     common_config=common_config,
     layer_pattern=layer_pattern,
-    share_embeddings_and_output_weights=True,
-    init_method_std=0.02,
-)
+    tensor_model_parallel_size=8,
+    untie_embeddings_and_output_weights=False,
+).build()
 
 
 if __name__ == "__main__":

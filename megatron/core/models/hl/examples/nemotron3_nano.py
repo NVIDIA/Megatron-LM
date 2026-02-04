@@ -16,7 +16,7 @@ from megatron.core.models.hl import (
     CommonLayerConfig,
     CrossEntropyLayerConfig,
     EmbeddingLayerConfig,
-    HLModel,
+    HLModelConfig,
     MambaLayerConfig,
     MoELayerConfig,
     PipelineSplit,
@@ -30,10 +30,10 @@ from megatron.core.models.hl import (
 common_config = CommonLayerConfig(
     hidden_size=2688,
     bf16=True,
-    tensor_model_parallel_size=8,
     sequence_parallel=True,
     normalization="RMSNorm",
     add_bias_linear=False,
+    init_method_std=0.0173,
 )
 
 # MoE-specific configuration (copy of common_config with expert parallelism)
@@ -102,12 +102,12 @@ layer_pattern = [Embedding, Stage1, PS, Stage2, PS, Stage3, PS, Stage4, Loss]
 # MODEL
 # =============================================================================
 
-nemotron_model = HLModel(
+nemotron_model = HLModelConfig(
     common_config=common_config,
     layer_pattern=layer_pattern,
-    share_embeddings_and_output_weights=False,
-    init_method_std=0.0173,
-)
+    tensor_model_parallel_size=8,
+    untie_embeddings_and_output_weights=True,
+).build()
 
 
 if __name__ == "__main__":

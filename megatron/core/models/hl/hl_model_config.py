@@ -8,7 +8,7 @@ from megatron.core.models.hl import HLLayerConfig
 
 
 @dataclass
-class JobConfig:
+class HLModelConfig:
 
     ###################
     # Model parallelism
@@ -110,3 +110,11 @@ class JobConfig:
        calling barrier with their timers will not result in hangs. This can happen if for example
        the user adds a level 1 timer that is not called by all ranks.
     """
+
+    ###################
+    # Model settings
+    ###################
+    untie_embeddings_and_output_weights = False
+
+    def build(self):
+        ...
