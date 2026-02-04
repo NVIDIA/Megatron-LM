@@ -36,7 +36,7 @@ def temp_log_level(level, logger=None):
 async def run_flask_server_on_client(
     client: InferenceClient, tokenizer, flask_port: int, parsers: list[str] = None
 ):
-    """Initializes and runs the async Flask server."""
+    """Initializes and runs the async Flask server using the provided InferenceClient."""
     if not HAS_FLASK:
         raise RuntimeError(f"Flask not available")
 
@@ -77,6 +77,8 @@ async def run_flask_server_on_client(
 async def run_flask_server(
     coordinator_addr: str, tokenizer, rank: int, flask_port: int, parsers: list[str] = None
 ):
+    """Initializes and runs the async Flask server
+    starting an InferenceClient with the provided coordinator address."""
     inference_client = InferenceClient(coordinator_addr)
     await inference_client.start()
     logger.info(f"Rank {rank}: InferenceClient connected.")

@@ -220,6 +220,7 @@ class _Qwen3CoderToolParser:
     def extract_tool_calls(
         self, model_output: str, tools: list[ChatCompletionToolsParam] | None
     ) -> ExtractedToolCallInformation:
+        """Extracts the tool calls from the text using <tool_call>...</tool_call> tags."""
         # Quick check to avoid unnecessary processing
         if self.tool_call_prefix not in model_output:
             return ExtractedToolCallInformation(
@@ -258,6 +259,8 @@ class _Qwen3CoderToolParser:
 
 
 class Qwen3CoderToolParser(BaseParser):
+    """Parser for Qwen3 Coder style tool calls."""
+
     @staticmethod
     def parse(text: str, **kwargs) -> tuple[str, dict[str, list[dict]]]:
         """
