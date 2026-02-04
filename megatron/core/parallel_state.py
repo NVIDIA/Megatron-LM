@@ -120,7 +120,6 @@ _HYBRID_DP_CP_GROUPS = {}
 
 # Data parallel group information with context parallel combined.
 _DATA_PARALLEL_GROUP_WITH_CP = None
-_DATA_PARALLEL_GROUP_WITH_CP_AG = None
 _DATA_PARALLEL_GROUP_WITH_CP_GLOO = None
 _DATA_PARALLEL_GLOBAL_RANKS_WITH_CP = None
 
@@ -567,7 +566,6 @@ def initialize_model_parallel(
     create_gloo_process_groups: bool = True,
     high_priority_stream_groups: Optional[List[str]] = None,
     sharp_enabled_group: Optional[str] = None,
-    create_all_gather_group: Optional[bool] = False,
 ) -> None:
     """Initialize model data parallel groups.
 
@@ -681,13 +679,6 @@ def initialize_model_parallel(
             This option is only valid when use_sharp is True.
             By default (None), it is enabled from dp group.
             Available options (choose one): [dp, dp_replica]
-
-        create_all_gather_group (bool, default = False):
-            Create a separate process group for all-gather operations to avoid
-            head-of-line blocking with reduce-scatter operations. When enabled,
-            creates an additional NCCL communicator with identical ranks as the
-            dp-cp group but with independent progress engines for better communication
-            overlap.
 
     Let's say we have a total of 16 GPUs denoted by g0 ... g15 and we
     use 2 GPUs to parallelize the model tensor, and 4 GPUs to parallelize
@@ -825,7 +816,6 @@ def initialize_model_parallel(
     global _DATA_PARALLEL_GROUP_GLOO
     global _DATA_PARALLEL_GLOBAL_RANKS
     global _DATA_PARALLEL_GROUP_WITH_CP
-    global _DATA_PARALLEL_GROUP_WITH_CP_AG
     global _DATA_PARALLEL_GROUP_WITH_CP_GLOO
     global _DATA_PARALLEL_GLOBAL_RANKS_WITH_CP
     global _INTRA_PARTIAL_DATA_PARALLEL_GROUP_WITH_CP
@@ -857,15 +847,6 @@ def initialize_model_parallel(
             pg_options=get_nccl_options("dp_cp", nccl_comm_cfgs),
             group_desc="DATA_PARALLEL_GROUP_WITH_CP",
         )
-        if create_all_gather_group:
-            group_with_cp_ag = create_group(
-                ranks_with_cp,
-                timeout=timeout,
-                pg_options=get_nccl_options("dp_cp", nccl_comm_cfgs),
-                group_desc="DATA_PARALLEL_GROUP_WITH_CP_AG",
-            )
-        else:
-            group_with_cp_ag = None
         if create_gloo_process_groups:
             group_with_cp_gloo = create_group(
                 ranks_with_cp,
@@ -877,7 +858,6 @@ def initialize_model_parallel(
             group_with_cp_gloo = None
         if rank in ranks_with_cp:
             _DATA_PARALLEL_GROUP_WITH_CP = group_with_cp
-            _DATA_PARALLEL_GROUP_WITH_CP_AG = group_with_cp_ag
             _DATA_PARALLEL_GROUP_WITH_CP_GLOO = group_with_cp_gloo
             _DATA_PARALLEL_GLOBAL_RANKS_WITH_CP = ranks_with_cp
 
@@ -1407,9 +1387,7 @@ def get_pipeline_model_parallel_group(check_initialized=True):
     return _PIPELINE_MODEL_PARALLEL_GROUP
 
 
-def get_data_parallel_group(
-    with_context_parallel=False, partial_data_parallel=False, independent_all_gather=False
-):
+def get_data_parallel_group(with_context_parallel=False, partial_data_parallel=False):
     """Get the data-parallel group the caller rank belongs to."""
     if with_context_parallel:
         if partial_data_parallel:
@@ -1417,11 +1395,6 @@ def get_data_parallel_group(
                 _INTRA_PARTIAL_DATA_PARALLEL_GROUP_WITH_CP is not None
             ), "Intra partial data parallel group is not initialized"
             return _INTRA_PARTIAL_DATA_PARALLEL_GROUP_WITH_CP
-        if independent_all_gather:
-            assert (
-                _DATA_PARALLEL_GROUP_WITH_CP_AG is not None
-            ), "data parallel group with context parallel AG is not initialized"
-            return _DATA_PARALLEL_GROUP_WITH_CP_AG
         assert (
             _DATA_PARALLEL_GROUP_WITH_CP is not None
         ), "data parallel group with context parallel combined is not initialized"
@@ -1430,15 +1403,6 @@ def get_data_parallel_group(
         assert _DATA_PARALLEL_GROUP is not None, "data parallel group is not initialized"
         assert partial_data_parallel == False, "Partial DP for Optimizer needs to include CP"
         return _DATA_PARALLEL_GROUP
-
-
-def has_separate_all_gather_group() -> bool:
-    """Check if a separate all-gather process group has been created.
-
-    Returns True if a dedicated all-gather process group exists for improved
-    communication overlap, False otherwise.
-    """
-    return _DATA_PARALLEL_GROUP_WITH_CP_AG is not None
 
 
 def get_data_parallel_group_gloo(with_context_parallel=False, partial_data_parallel=False):
@@ -2100,9 +2064,6 @@ def destroy_model_parallel():
 
     global _DATA_PARALLEL_GROUP_WITH_CP
     _DATA_PARALLEL_GROUP_WITH_CP = None
-
-    global _DATA_PARALLEL_GROUP_WITH_CP_AG
-    _DATA_PARALLEL_GROUP_WITH_CP_AG = None
 
     global _CONTEXT_PARALLEL_GROUP
     _CONTEXT_PARALLEL_GROUP = None

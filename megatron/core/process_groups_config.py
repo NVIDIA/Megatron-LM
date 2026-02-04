@@ -114,12 +114,18 @@ class ProcessGroupCollection:
     # _DATA_PARALLEL_GROUP_WITH_CP
     dp_cp: torch.distributed.ProcessGroup = field(init=False)
 
+    # _DATA_PARALLEL_GROUP_WITH_CP_AG
+    dp_cp_ag: torch.distributed.ProcessGroup = field(init=False)
+
     # MoE layers need expt_dp group for sharded state dict
     # we need this workaround until distributed checkpoint is refactored
     # to have sharded_state_dict can take the PG and pass it down
     # TODO (Hepteract): remove this once distributed checkpoint is refactored
     # _EXPERT_DATA_PARALLEL_GROUP
     expt_dp: torch.distributed.ProcessGroup = field(init=False)
+
+    # _EXPERT_DATA_PARALLEL_GROUP_AG
+    expt_dp_ag: torch.distributed.ProcessGroup = field(init=False)
 
     # _INTRA_PARTIAL_DATA_PARALLEL_GROUP_WITH_CP
     intra_dp_cp: torch.distributed.ProcessGroup = field(init=False)
@@ -210,6 +216,7 @@ class ProcessGroupCollection:
             ),
             'dp': parallel_state.get_data_parallel_group,
             'dp_cp': partial(parallel_state.get_data_parallel_group, with_context_parallel=True),
+            'dp_cp_ag': lambda: None,  # AG groups should be created in user code
             'intra_dp_cp': partial(
                 parallel_state.get_data_parallel_group,
                 with_context_parallel=True,
@@ -232,6 +239,7 @@ class ProcessGroupCollection:
             'expt_dp': partial(
                 parallel_state.get_expert_data_parallel_group, check_initialized=False
             ),
+            'expt_dp_ag': lambda: None,  # Expert AG groups should be created in user code
             'tp_dp_cp': partial(
                 parallel_state.get_tensor_and_data_parallel_group,
                 check_initialized=False,
