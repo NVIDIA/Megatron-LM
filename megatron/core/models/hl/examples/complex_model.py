@@ -16,6 +16,7 @@ import torch
 from megatron.core.models.hl import (
     AttentionLayerConfig,
     CommonLayerConfig,
+    CrossEntropyLayerConfig,
     EmbeddingLayerConfig,
     HLModel,
     MambaLayerConfig,
@@ -102,6 +103,8 @@ SmallMoE = MoELayerConfig(
     grouped_gemm=True,
 )
 
+Loss = CrossEntropyLayerConfig()
+
 # =============================================================================
 # LAYER PATTERN
 # =============================================================================
@@ -116,7 +119,7 @@ Stage2 = [[LargeMoE, Mamba] * 3, SlidingAttention, [SmallMoE, Mamba] * 3, Global
 Stage3 = [[LargeMoE, Mamba] * 3, SlidingAttention, [SmallMoE, Mamba] * 4, GlobalAttention]
 Stage4 = [[LargeMoE, Mamba] * 4, SmallMoE]
 
-layer_pattern = [Stage1, PS, Stage2, PS, Stage3, PS, Stage4]
+layer_pattern = [Embedding, Stage1, PS, Stage2, PS, Stage3, PS, Stage4, Loss]
 
 # =============================================================================
 # MODEL
@@ -124,7 +127,6 @@ layer_pattern = [Stage1, PS, Stage2, PS, Stage3, PS, Stage4]
 
 complex_model = HLModel(
     common_config=common_config,
-    embedding=Embedding,
     layer_pattern=layer_pattern,
     share_embeddings_and_output_weights=False,
     normalization="RMSNorm",

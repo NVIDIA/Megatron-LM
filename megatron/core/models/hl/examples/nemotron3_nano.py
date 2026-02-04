@@ -14,6 +14,7 @@ This example demonstrates:
 from megatron.core.models.hl import (
     AttentionLayerConfig,
     CommonLayerConfig,
+    CrossEntropyLayerConfig,
     EmbeddingLayerConfig,
     HLModel,
     MambaLayerConfig,
@@ -75,6 +76,8 @@ MoE = MoELayerConfig(
     grouped_gemm=True,
 )
 
+Loss = CrossEntropyLayerConfig()
+
 # =============================================================================
 # LAYER PATTERN
 # =============================================================================
@@ -88,7 +91,7 @@ Stage2 = [[MoE, Mamba] * 3, Attention, [MoE, Mamba] * 3, Attention]
 Stage3 = [[MoE, Mamba] * 3, Attention, [MoE, Mamba] * 4, Attention]
 Stage4 = [[MoE, Mamba] * 4, MoE]
 
-layer_pattern = [Stage1, PS, Stage2, PS, Stage3, PS, Stage4]
+layer_pattern = [Embedding, Stage1, PS, Stage2, PS, Stage3, PS, Stage4, Loss]
 
 # =============================================================================
 # MODEL
@@ -96,7 +99,6 @@ layer_pattern = [Stage1, PS, Stage2, PS, Stage3, PS, Stage4]
 
 nemotron_model = HLModel(
     common_config=common_config,
-    embedding=Embedding,
     layer_pattern=layer_pattern,
     share_embeddings_and_output_weights=False,
     normalization="RMSNorm",

@@ -16,6 +16,7 @@ This example demonstrates:
 from megatron.core.models.hl import (
     AttentionLayerConfig,
     CommonLayerConfig,
+    CrossEntropyLayerConfig,
     EmbeddingLayerConfig,
     HLModel,
     MLPLayerConfig,
@@ -52,13 +53,15 @@ Attention = AttentionLayerConfig(
 
 Mlp = MLPLayerConfig(common_config=common_config, ffn_hidden_size=14336, activation="swiglu")
 
+Loss = CrossEntropyLayerConfig()
+
 # =============================================================================
 # LAYER PATTERN
 # =============================================================================
 
 # Simple pattern: 32 layers of Attention + MLP
 # No pipeline parallelism needed for this small model
-layer_pattern = [Attention, Mlp] * 32
+layer_pattern = [Embedding] + [Attention, Mlp] * 32 + [Loss]
 
 # =============================================================================
 # MODEL
@@ -66,7 +69,6 @@ layer_pattern = [Attention, Mlp] * 32
 
 simple_model = HLModel(
     common_config=common_config,
-    embedding=Embedding,
     layer_pattern=layer_pattern,
     share_embeddings_and_output_weights=True,
     normalization="RMSNorm",
