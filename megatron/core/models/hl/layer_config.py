@@ -159,3 +159,57 @@ class CommonLayerConfig:
        calling barrier with their timers will not result in hangs. This can happen if for example
        the user adds a level 1 timer that is not called by all ranks.
     """
+
+    #######################
+    # Common layer settings
+    #######################
+    hidden_size: int = 0
+    """Layer hidden size."""
+
+    normalization: str = "LayerNorm"
+    """Which norm to use for normalization layers, valid options are `LayerNorm` and `RMSNorm`."""
+
+    hidden_dropout: float = 0.1
+    """Dropout probability for transformer hidden state."""
+
+    attention_dropout: float = 0.1
+    """Post attention dropout probability."""
+
+    fp32_residual_connection: bool = False
+    """If true, move residual connections to fp32."""
+
+    # @jcasper should we keep this option?
+    apply_residual_connection_post_layernorm: bool = False
+    """If True, uses the original BERT residule connection ordering."""
+
+    layernorm_epsilon: float = 1e-5
+    """Epsilon value for any LayerNorm operations."""
+
+    layernorm_zero_centered_gamma: bool = False
+    """If set to True, the LayerNorm is adjusted to center the gamma values around 0. This improves
+    numerical stability."""
+
+    add_bias_linear: bool = True
+    """Include a bias term in all linear layers (QKV projections, after core attention, and two in
+    MLP layer)."""
+
+    add_qkv_bias: bool = False
+    """Add a bias term only for QKV projections."""
+
+    gated_linear_unit: bool = False
+    """Use a gated linear unit for the first linear layer in the MLP."""
+
+    activation_func: Callable = F.gelu
+    """Activation function to use for the non-linearity in the MLP."""
+
+    activation_func_fp8_input_store: bool = False
+    """Store the input of MLP activation function in FP8 for backprop to save memory.
+    The stored input is casted back to the original precision before backprop compuatation."""
+
+    glu_linear_offset: float = 0.0
+    """Offset term in the GLU activation function: activation_func(x[0]) * (x[1] + offset). Only 
+    used when gated_linear_unit is True"""
+
+    activation_func_clamp_value: Optional[float] = None
+    """Clamp the output of the linear_fc1 in the activation function. Only used when activation_func
+    is quick_gelu."""

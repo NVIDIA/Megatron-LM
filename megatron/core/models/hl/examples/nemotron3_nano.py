@@ -28,7 +28,12 @@ from megatron.core.models.hl import (
 
 # Shared settings inherited by all layers (can be overridden per-layer)
 common_config = CommonLayerConfig(
-    hidden_size=2688, bf16=True, tensor_model_parallel_size=8, sequence_parallel=True
+    hidden_size=2688,
+    bf16=True,
+    tensor_model_parallel_size=8,
+    sequence_parallel=True,
+    normalization="RMSNorm",
+    add_bias_linear=False,
 )
 
 # MoE-specific configuration (copy of common_config with expert parallelism)
@@ -101,8 +106,6 @@ nemotron_model = HLModel(
     common_config=common_config,
     layer_pattern=layer_pattern,
     share_embeddings_and_output_weights=False,
-    normalization="RMSNorm",
-    disable_bias_linear=True,
     init_method_std=0.0173,
 )
 
