@@ -104,9 +104,6 @@ if HAVE_TORCH_MEMORY_SAVER:
     from torch_memory_saver import torch_memory_saver
 
 
-logger = logging.getLogger(__name__)
-
-
 class EngineSuspendedError(Exception):
     """Engine is currently suspended and not performing steps."""
 
