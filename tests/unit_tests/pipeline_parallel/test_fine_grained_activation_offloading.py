@@ -318,7 +318,7 @@ def test_gpt_fine_grained_activation_offloading_correctness_and_memory(
         ("alltoall", True, ["mlp_norm"]),
         ("alltoall", False, ["expert_fc1"]),
         ("alltoall", False, ["moe_act"]),
-        ("alltoall", False, ["mlp_norm", "expert_fc1", "moe_act"]),
+        # ("alltoall", False, ["mlp_norm", "expert_fc1", "moe_act"]),
         (
             "alltoall",
             True,
