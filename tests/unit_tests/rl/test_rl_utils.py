@@ -7,14 +7,30 @@ from types import SimpleNamespace
 import pytest
 import torch
 
+from megatron.core.distributed import DistributedDataParallel, DistributedDataParallelConfig
 from megatron.core.enums import ModelType
 from megatron.core.models.common.language_module.language_module import LanguageModule
+from megatron.core.models.gpt.gpt_layer_specs import get_gpt_layer_with_transformer_engine_spec
+from megatron.core.models.gpt.gpt_model import GPTModel
 from megatron.core.num_microbatches_calculator import destroy_num_microbatches_calculator
+from megatron.core.optimizer import OptimizerConfig, get_megatron_optimizer
 from megatron.core.pipeline_parallel.utils import is_pp_last_stage
 from megatron.core.process_groups_config import ProcessGroupCollection
+from megatron.core.tensor_parallel.random import (
+    initialize_rng_tracker,
+    model_parallel_cuda_manual_seed,
+)
 from megatron.core.transformer import TransformerConfig
+from megatron.core.transformer.cuda_graphs import (
+    CudaGraphManager,
+    _CudagraphGlobalRecord,
+    create_cudagraphs,
+    delete_cuda_graphs,
+)
+from megatron.core.transformer.module import Float16Module
 from megatron.rl import rl_utils
 from megatron.rl.agent.api import TokenRollout
+from megatron.rl.sequence_packing_utils import get_default_packed_seq_params
 from megatron.training.arguments import parse_args, validate_args
 from megatron.training.global_vars import destroy_global_vars, set_global_variables
 from tests.unit_tests.test_utilities import Utils
@@ -77,9 +93,12 @@ def initialize_model_parallel(request, monkeypatch):
     monkeypatch.setenv("WANDB_MODE", "disabled")
     monkeypatch.setenv("LOG_TO_WANDB", "false")
 
+    initialize_rng_tracker(use_te_rng_tracker=True, force_reset=True)
+
     tp, pp = request.param
     world_size = Utils.world_size
     Utils.initialize_model_parallel(tensor_model_parallel_size=tp, pipeline_model_parallel_size=pp)
+    model_parallel_cuda_manual_seed(123)
     dp = world_size // (tp * pp)
     yield world_size, dp, tp, pp
     Utils.destroy_model_parallel()
@@ -479,3 +498,300 @@ class TestRLUtils:
             [torch.zeros(2), torch.zeros(3), torch.zeros(4)], 5
         )
         assert padded.shape == (3, 5)
+
+    @pytest.mark.parametrize(
+        "initialize_model_parallel",
+        [
+            pytest.param((tp, pp), id=f"tp{tp}-pp{pp}")
+            for tp, pp in itertools.product([1, 2], [1, 2])
+            if tp * pp <= Utils.world_size
+        ],
+        indirect=["initialize_model_parallel"],
+    )
+    def test_grad_buffer_offload(self, initialize_model_parallel):
+        """Test that grad buffer offload/restore correctly frees and restores GPU memory."""
+        world_size, dp, tp, pp = initialize_model_parallel
+        self.create_test_args(tensor_model_parallel_size=tp, pipeline_model_parallel_size=pp)
+
+        model_parallel_cuda_manual_seed(123)
+
+        # Create a realistic GPTModel as used in RL training
+        transformer_config = TransformerConfig(
+            num_layers=2, hidden_size=64, num_attention_heads=4, use_cpu_initialization=True
+        )
+        gpt_model = GPTModel(
+            config=transformer_config,
+            transformer_layer_spec=get_gpt_layer_with_transformer_engine_spec(),
+            vocab_size=256,
+            max_sequence_length=32,
+        ).cuda()
+
+        ddp_config = DistributedDataParallelConfig(
+            grad_reduce_in_fp32=True,
+            use_distributed_optimizer=True,
+            overlap_grad_reduce=False,
+            bucket_size=None,  # Single bucket for simplicity
+        )
+
+        ddp_model = DistributedDataParallel(
+            transformer_config, ddp_config=ddp_config, module=gpt_model
+        )
+
+        all_buffers = ddp_model.buffers + ddp_model.expert_parallel_buffers
+
+        # Verify initial storage is allocated
+        initial_sizes = [buf.grad_data.storage().size() for buf in all_buffers]
+        assert all(size > 0 for size in initial_sizes), "Expected non-zero initial storage"
+
+        # Offload grad buffers to CPU
+        ddp_model.offload_grad_buffers()
+
+        # Verify storage is released
+        for buf in all_buffers:
+            assert buf.grad_data.storage().size() == 0, "Expected zero storage after offload"
+
+        # Restore grad buffers to GPU
+        ddp_model.restore_grad_buffers()
+
+        # Verify storage is restored
+        restored_sizes = [buf.grad_data.storage().size() for buf in all_buffers]
+        assert (
+            initial_sizes == restored_sizes
+        ), f"Expected restored sizes {restored_sizes} to match initial {initial_sizes}"
+
+    @pytest.mark.parametrize(
+        "initialize_model_parallel",
+        [
+            pytest.param((tp, pp), id=f"tp{tp}-pp{pp}")
+            for tp, pp in itertools.product([1, 2], [1, 2])
+            if tp * pp <= Utils.world_size
+        ],
+        indirect=["initialize_model_parallel"],
+    )
+    def test_optimizer_offload(self, initialize_model_parallel):
+        """Test that optimizer offload_to_cpu/restore_from_cpu correctly moves state to/from CPU."""
+        world_size, dp, tp, pp = initialize_model_parallel
+        self.create_test_args(tensor_model_parallel_size=tp, pipeline_model_parallel_size=pp)
+        model_parallel_cuda_manual_seed(123)
+
+        # Create a realistic GPTModel as used in RL training
+        transformer_config = TransformerConfig(
+            num_layers=2, hidden_size=64, num_attention_heads=4, use_cpu_initialization=True
+        )
+        gpt_model = GPTModel(
+            config=transformer_config,
+            transformer_layer_spec=get_gpt_layer_with_transformer_engine_spec(),
+            vocab_size=256,
+            max_sequence_length=32,
+        ).cuda()
+
+        ddp_config = DistributedDataParallelConfig(
+            grad_reduce_in_fp32=True,
+            use_distributed_optimizer=True,
+            overlap_grad_reduce=False,
+            bucket_size=None,  # Single bucket for simplicity
+        )
+
+        ddp_model = DistributedDataParallel(
+            transformer_config, ddp_config=ddp_config, module=gpt_model
+        )
+
+        # Create optimizer
+        optimizer_config = OptimizerConfig(
+            optimizer='adam', bf16=True, use_distributed_optimizer=True
+        )
+        optimizer = get_megatron_optimizer(optimizer_config, [ddp_model])
+
+        # Manually initialize optimizer state (simulating what happens after first step)
+        # This avoids needing to run a full forward/backward/step cycle
+        for opt in optimizer.chained_optimizers:
+            if hasattr(opt, 'optimizer') and opt.optimizer is not None:
+                for group in opt.optimizer.param_groups:
+                    for p in group['params']:
+                        if len(opt.optimizer.state[p]) == 0:
+                            # Initialize Adam state (exp_avg and exp_avg_sq) on GPU
+                            opt.optimizer.state[p]['exp_avg'] = torch.rand_like(p.data)
+                            opt.optimizer.state[p]['exp_avg_sq'] = torch.rand_like(p.data)
+                            opt.optimizer.state[p]['step'] = torch.tensor(1)
+
+        # Helper to check if optimizer state tensors are on GPU or CPU
+        def get_optimizer_state_devices():
+            devices = set()
+            for opt in optimizer.chained_optimizers:
+                if hasattr(opt, 'optimizer') and opt.optimizer is not None:
+                    for state_dict in opt.optimizer.state.values():
+                        for v in state_dict.values():
+                            if isinstance(v, torch.Tensor):
+                                devices.add(str(v.device))
+            return devices
+
+        # Verify optimizer state is initially on GPU
+        initial_devices = get_optimizer_state_devices()
+        assert any(
+            'cuda' in d for d in initial_devices
+        ), f"Expected optimizer state on GPU initially, got devices: {initial_devices}"
+
+        # Record GPU memory before offload
+        torch.cuda.synchronize()
+        memory_before_offload = torch.cuda.memory_allocated()
+
+        # Offload optimizer state to CPU
+        optimizer.offload_to_cpu()
+
+        # Verify GPU memory decreased (optimizer state should be freed)
+        torch.cuda.synchronize()
+        memory_after_offload = torch.cuda.memory_allocated()
+        assert memory_after_offload < memory_before_offload, (
+            f"Expected GPU memory to decrease after offload. "
+            f"Before: {memory_before_offload}, After: {memory_after_offload}"
+        )
+
+        # Verify optimizer state is now on CPU
+        offloaded_devices = get_optimizer_state_devices()
+        assert all(
+            'cpu' in d for d in offloaded_devices
+        ), f"Expected all optimizer state on CPU after offload, got devices: {offloaded_devices}"
+
+        # Restore optimizer state to GPU
+        optimizer.restore_from_cpu()
+
+        # Verify optimizer state is back on GPU
+        restored_devices = get_optimizer_state_devices()
+        assert any(
+            'cuda' in d for d in restored_devices
+        ), f"Expected optimizer state on GPU after restore, got devices: {restored_devices}"
+
+        # Verify GPU memory increased after restore (optimizer state reallocated)
+        torch.cuda.synchronize()
+        memory_after_restore = torch.cuda.memory_allocated()
+        assert memory_after_restore > memory_after_offload, (
+            f"Expected GPU memory to increase after restore. "
+            f"After offload: {memory_after_offload}, After restore: {memory_after_restore}"
+        )
+
+    @pytest.mark.parametrize(
+        "initialize_model_parallel",
+        [pytest.param((1, 1), id="tp1-pp1")],
+        indirect=["initialize_model_parallel"],
+    )
+    def test_get_logprobs_cuda_graphs(self, initialize_model_parallel):
+        """Test that get_logprobs reuses CUDA graphs created during training forward pass.
+
+        This test verifies that rl_utils.get_logprobs can reuse CUDA graphs by:
+        1. Running a training-style forward pass on some model to record CUDA graph runners.
+        2. Creating the CUDA graphs.
+        3. Running `get_logprobs` to verify it reuses the same forward graph from training.
+        """
+
+        num_layers = 2
+
+        world_size, dp, tp, pp = initialize_model_parallel
+        self.create_test_args(
+            tensor_model_parallel_size=tp,
+            pipeline_model_parallel_size=pp,
+            rl_training_cuda_graphs=True,
+            cuda_graph_impl="local",
+            bf16=True,
+            rl_sequence_packing_max_sequences_per_bin=4,
+        )
+
+        # Create a model with training CUDA graphs enabled
+        transformer_config = TransformerConfig(
+            num_layers=num_layers,
+            hidden_size=64,
+            num_attention_heads=4,
+            use_cpu_initialization=True,
+            cuda_graph_impl="local",
+            bf16=True,
+        )
+        model = GPTModel(
+            config=transformer_config,
+            transformer_layer_spec=get_gpt_layer_with_transformer_engine_spec(),
+            vocab_size=256,
+            max_sequence_length=32,
+        ).cuda()
+
+        # Wrap in Float16Module so it accepts fp32_output argument from get_logprobs
+        wrapped_model = Float16Module(transformer_config, model)
+
+        # Create test inputs (batch_size=1 required for thd format with sequence packing)
+        batch_size = 1
+        seq_length = 16
+        tokens = torch.randint(0, 256, (batch_size, seq_length), dtype=torch.long).cuda()
+        position_ids = torch.arange(seq_length).unsqueeze(0).expand(batch_size, -1).cuda()
+
+        # Create packed_seq_params for dummy data
+        packed_seq_params = get_default_packed_seq_params(
+            seq_length=seq_length, max_sequences_per_bin=4, device=tokens.device
+        )
+
+        # Run a single training forward pass to record cudagraphs
+        output = wrapped_model(
+            tokens,
+            position_ids,
+            attention_mask=None,
+            packed_seq_params=packed_seq_params,
+            runtime_gather_output=True,
+            fp32_output=False,
+        )
+
+        # Run backward to reset runner status from BWD_READY back to FWD_READY
+        # This is needed because get_logprobs runs in no_grad mode and expects FWD_READY
+        loss = output.sum()
+        loss.backward()
+
+        # Collect all CudaGraphManager instances and their runners
+        cudagraph_managers = []
+        for module in wrapped_model.modules():
+            if hasattr(module, 'cudagraph_manager') and module.cudagraph_manager is not None:
+                cudagraph_managers.append(module.cudagraph_manager)
+
+        # Record runner count before creating graphs
+        runners_before = {id(mgr): len(mgr.cudagraph_runners) for mgr in cudagraph_managers}
+
+        create_cudagraphs()
+
+        # Verify that each runner has a fwd_graph created
+        for mgr in cudagraph_managers:
+            for runner in mgr.cudagraph_runners:
+                assert runner.fwd_graph is not None, (
+                    f"Expected runner to have fwd_graph created after create_cudagraphs(), "
+                    f"but fwd_graph is None"
+                )
+
+        # Now test `get_logprobs`; this should reuse the existing CUDA graphs
+        # We do not pass packed_seq_params; it should be created within `get_logprobs`
+        logprobs = rl_utils.get_logprobs(
+            wrapped_model, tokens, position_ids=position_ids, sequence_packing=True
+        )
+
+        # Verify that no new runners were created and graph was reused
+        runners_after = {id(mgr): len(mgr.cudagraph_runners) for mgr in cudagraph_managers}
+        for mgr_id, count_before in runners_before.items():
+            count_after = runners_after[mgr_id]
+            assert count_after == count_before, (
+                f"Expected runner count to remain {count_before} after `get_logprobs`, "
+                f"but got {count_after}. `get_logprobs` should not create new runners."
+            )
+
+        # Verify outputs are valid
+        assert output is not None, "Training forward pass should return valid output"
+        assert logprobs is not None, "get_logprobs should return valid output"
+
+        # Destroy all captured graphs deterministically
+        for l in model.decoder.layers:
+            for runner in getattr(l.cudagraph_manager, "cudagraph_runners", []):
+                # Safely delete both graphs if present
+                if hasattr(runner, "fwd_graph"):
+                    del runner.fwd_graph
+                if hasattr(runner, "bwd_graph"):
+                    del runner.bwd_graph
+
+        # Ensure all pending work is complete and graph destruction runs now
+        torch.cuda.synchronize()
+
+        _CudagraphGlobalRecord.cudagraph_created = False
+        _CudagraphGlobalRecord.cudagraph_record = []
+        CudaGraphManager.global_mempool = None
+        CudaGraphManager.fwd_mempools = None
+        CudaGraphManager.bwd_mempools = None
