@@ -343,13 +343,18 @@ def validate_args(args, defaults={}):
         assert not (args.rl_partial_rollouts and args.rl_remove_kv_cache_during_training), \
             "Cannot use both partial-rollouts and remove-kv-cache-during-training"
 
-        assert not (
-            args.rl_offload_inference_model_weights_when_idle
-            and args.rl_inference_model_unified_memory_level != 1
-        ), (
-            "--rl-offload-inference-model-weights-when-idle requires "
-            "--rl-inference-model-unified-memory-level=1."
-        )
+        # Validate inference model offloading - requires either UVM or torch_memory_saver
+        if args.rl_offload_inference_model_weights_when_idle:
+            if args.rl_inference_model_unified_memory_level != 1:
+                # Not using UVM, so we need torch_memory_saver
+                try:
+                    from torch_memory_saver import torch_memory_saver
+                except ImportError:
+                    raise AssertionError(
+                        "To use --rl-offload-inference-model-weights-when-idle without UVM "
+                        "(--rl-inference-model-unified-memory-level=1), `torch_memory_saver` must be "
+                        "installed. See https://github.com/fzyzcjy/torch_memory_saver."
+                    )
 
         # When using different EP sizes for inference and training (EP refit), the legacy
         # GroupedMLP is not supported. Only SequentialMLP or TEGroupedMLP can be used.
@@ -1448,13 +1453,10 @@ def _add_inference_args(parser):
                        dest='use_legacy_static_engine')
     group.add_argument('--inference-max-requests', type=int, default=8,
                        help='Maximum number of requests for inference.',
-                       dest='inference_max_batch_size')
+                       dest='inference_max_requests')
     group.add_argument('--inference-max-seq-length', type=int, default=2560,
                        help='Maximum sequence length expected for inference (prefill + decode).',
                        dest='inference_max_seq_length')
-    group.add_argument('--inference-max-batch-size', type=int, default=None,
-                       help='Maximum batch size for inference.',
-                       dest='inference_max_batch_size')
     group.add_argument('--inference-dynamic-batching',
                        action='store_true', default=False,
                        help='Enable dynamic batching mode.')
@@ -1510,15 +1512,10 @@ def _add_inference_args(parser):
                        '1) allocate `memory_buffer` in unified memory. '
                        'Eventually, additional levels will be included to '
                        'control other tensors within the context.')
-    group.add_argument('--nccl-all-reduce-for-prefill',
-                       action='store_true', default=False,
-                       help='When using symmeric all reduce kernels this will use regular nccl kernels for prefill. This can be more effecient when prefill is large as the nccl kernels can be more bandwith optimized')
     # TODO(ksanthanam): Clean this up in future PR
-    group.add_argument('--enable-chunked-prefill', dest='disable_chunked_prefill',
-                       action='store_false', default=True,
+    group.add_argument('--enable-chunked-prefill', dest='enable_chunked_prefill',
+                       action='store_true', default=False,
                        help="Enable chunked prefill (disabled by default)")
-    group.add_argument('--disable-chunked-prefill', dest='disable_chunked_prefill',
-                       action='store_true', help=argparse.SUPPRESS)
     group.add_argument('--inference-dynamic-batching-cuda-graph-max-tokens',
                        type=int, default=16384,
                        help='Maximum number of tokens to capture in a cuda graph.')
@@ -1974,9 +1971,10 @@ def _add_rl_args(parser):
         required=False,
         default=False,
         help=(
-            'When using a separate RL inference model with UVM-enabled parameters, prefetch its weights '
-            'to CPU when not doing rollout inference, and prefetch back to GPU right before inference. '
-            'Requires --rl-inference-model-unified-memory-level=1.'
+            'When using a separate RL inference model, offload its weights to CPU when not doing rollout '
+            'inference, and restore to GPU right before inference. Works with two backends: '
+            '1) UVM (when --rl-inference-model-unified-memory-level=1), or '
+            '2) torch_memory_saver (when UVM is not enabled; requires torch_memory_saver to be installed).'
         ),
     )
     group.add_argument('--refit-method', type=str, default='gloo',
@@ -2716,10 +2714,6 @@ def _add_moe_args(parser):
     group.add_argument('--moe-upcycling-granularity', type=int, default=1,
                        help='This param sepecifics how many times smaller is the expert hidden size compared with the original dense FFN hidden size. '
                        'For using granular upcycling strategy, please set this param as a positive integer. If this param is set to 1, it means using the default upcycling strategy.')
-    group.add_argument('--moe-pad-experts-for-cuda-graph-inference', action='store_true',
-                       help="some MoE routers have a D2H sync that will break cuda graphs.  If this flag is set the router will switch" \
-                       " to dropping and padding during decode time which does not have a D2H sync. The capacity factor is set to the" \
-                       " max that an expert could see during inference so no tokens are actually dropped.")
     return parser
 
 def _add_mla_args(parser):

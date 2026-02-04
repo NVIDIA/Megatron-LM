@@ -696,6 +696,12 @@ class TransformerConfig(ModelParallelConfig):
     the expert capacity length, effective only after the moe_expert_capacity_factor is set. The
     default setting is False."""
 
+    moe_pad_experts_for_cuda_graph_inference: bool = False
+    """moe_pad_experts_for_cuda_graph_inference (bool): If True, the router will switch to dropping
+    and padding during decode time which does not have a D2H sync. The capacity factor is set to the
+    max that an expert could see during inference so no tokens are actually dropped. The default
+    setting is False."""
+
     moe_token_drop_policy: Literal['probs', 'position'] = "probs"
     """The policy to drop tokens. Can be either "probs" or "position". If "probs", the tokens with
     the lowest probabilities will be dropped. If "position", tokens at the end of each batch will
@@ -829,6 +835,9 @@ class TransformerConfig(ModelParallelConfig):
     """What type of symmetric all reduce to use. The default is None
     which is no use of symmetric memory.
     """
+
+    nccl_all_reduce_for_prefill: bool = False
+    """If True, use NCCL all-reduce kernels when symmetric all-reduce is enabled."""
 
     use_inference_optimized_layers: bool = False
     """If True, use inference optimized transformer layers during inference."""
