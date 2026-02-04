@@ -2,6 +2,8 @@
 
 from dataclasses import dataclass
 
+import torch
+
 
 @dataclass
 class LayerConfig:
@@ -19,7 +21,7 @@ class LayerConfig:
     context_parallel_size: int = 1
     """Splits network input along sequence dimension across GPU ranks."""
 
-    hierarchical_context_parallel_sizes: Optional[list[int]] = None
+    hierarchical_context_parallel_sizes: list[int] | None = None
     """Degrees of the hierarchical context parallelism. Users should provide a list to specify
        the sizes for different levels. Taking the a2a+p2p cp comm type as example, it contains
        groups of two levels, so the first value of the list indicates the group size of the a2a
@@ -27,7 +29,7 @@ class LayerConfig:
        type.
     """
 
-    max_seqlen_per_dp_cp_rank: Optional[int] = None
+    max_seqlen_per_dp_cp_rank: int | None = None
     """
     Maximum sequence length per DPxCP rank. This is the maximum sequence length each rank
     can handle without overflowing the memory. Typically, a good starting point is to set this
@@ -46,7 +48,7 @@ class LayerConfig:
     expert_model_parallel_size: int = 1
     """Distributes Moe Experts across sub data parallel dimension."""
 
-    expert_tensor_parallel_size: Optional[int] = None
+    expert_tensor_parallel_size: int | None = None
     """Intra-layer tensor model parallelsm for expert layer. Splits tensors across GPU ranks."""
 
     ###################
@@ -82,10 +84,10 @@ class LayerConfig:
     enable_autocast: bool = False
     """If true runs the forward step function inside torch.autocast context."""
 
-    autocast_dtype: Optional[torch.dtype] = None
+    autocast_dtype: torch.dtype | None = None
     """dtype to pass to torch.amp.autocast when enabled. If None, is set to pipeline_dtype."""
 
-    num_microbatches_with_partial_activation_checkpoints: Optional[int] = None
+    num_microbatches_with_partial_activation_checkpoints: int | None = None
     """If int, set the number of microbatches where not all of the layers will be checkpointed and
        recomputed. The rest of the microbatches within the window of maximum outstanding
        microbatches will recompute all layers (either full recompute or selective recompute). If

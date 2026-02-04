@@ -2,6 +2,8 @@
 
 from dataclasses import dataclass
 
+import torch
+
 
 @dataclass
 class JobConfig:
@@ -12,7 +14,7 @@ class JobConfig:
     tensor_model_parallel_size: int = 1
     """Intra-layer model parallelism. Splits tensors across GPU ranks."""
 
-    pipeline_model_parallel_comm_backend: Optional[str] = None
+    pipeline_model_parallel_comm_backend: str | None = None
     """Configuring backend option of pipeline parallel communication (e.g., nccl, ucc)
        If None, the default backend will be used.
     """
@@ -80,7 +82,7 @@ class JobConfig:
        Defaults to False.
     """
 
-    microbatch_group_size_per_vp_stage: Optional[int] = None
+    microbatch_group_size_per_vp_stage: int | None = None
     """This value specifies the number of micro-batches that are executed
        at a time for a given virtual stage (both forward and backward).
        Default (in __post_init__() method below) to pipeline_parallel_size
