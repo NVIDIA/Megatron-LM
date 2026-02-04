@@ -762,6 +762,12 @@ class _ParamAndGradBuffer:
                 group=self.data_parallel_group,
                 symmetric=not self.ddp_config.disable_symmetric_registration,
             )
+            # Since nccl communicator group is created lazily, we need to perform a warmup call to
+            # initialize NCCL comm buffers for this dp_group before doing buffer registration.
+            torch.distributed.barrier()
+            tmp_warmup_tensor = torch.zeros([1], device="cuda")
+            torch.distributed.all_reduce(tmp_warmup_tensor, group=self.data_parallel_group)
+            torch.distributed.barrier()
         else:
             # If nccl_ub is False, mem_alloc_context is nullcontext.
             mem_alloc_context = nullcontext
@@ -973,10 +979,6 @@ class _ParamAndGradBuffer:
     def reload_from_cpu(self, move_params: bool = True, move_grads: bool = True):
         """
         Reload the buffers from CPU.
-        
-        Args:
-            move_params: Whether to reload parameter buffers.
-            move_grads: Whether to reload gradient buffers.
         """
         if (
             move_params
@@ -986,7 +988,6 @@ class _ParamAndGradBuffer:
         ):
             self.param_data.storage().resize_(self.param_data_size)
             self.param_data.copy_(self.param_data_cpu, non_blocking=True)
-                
         if move_grads and self.grad_data is not None and self.grad_data_size > 0:
             self.grad_data.storage().resize_(self.grad_data_size)
             self.grad_data.zero_()
