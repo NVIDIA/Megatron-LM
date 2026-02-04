@@ -96,7 +96,6 @@ MODEL_ARGS:
   --finetune: true
   --inference-logging-step-interval: 1
   --rl-training-cuda-graphs: true
-  --legacy-tokenizer: true
 METRICS:
   - "mem-allocated-bytes"
   - "mem-max-allocated-bytes"
