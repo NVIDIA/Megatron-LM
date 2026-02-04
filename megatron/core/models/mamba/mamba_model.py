@@ -149,6 +149,15 @@ class MambaModel(LanguageModule):
                 tp_group=self.pg_collection.tp,
             )
 
+            # The Linear-Cross-Entropy fusion bypasses the output layer during the forward pass.
+            # The output_layer submodule shares its weights with the gpt_model to prevent
+            # issues arising from pre-forward hooks attached to the output layer.
+            if (
+                self.config.cross_entropy_loss_fusion
+                and self.config.cross_entropy_fusion_impl == 'linear'
+            ):
+                self.shared_output_layer_weight = self.output_layer.weight
+
         if self.pre_process or self.post_process:
             self.setup_embeddings_and_output_layer()
 
@@ -305,6 +314,16 @@ class MambaModel(LanguageModule):
             # [s b h] => [b s h]
             return logits.transpose(0, 1).contiguous()
 
-        loss = self.compute_language_model_loss(labels, logits)
+        loss = self.compute_output_layer_and_language_model_loss(
+            hidden_states,
+            labels,
+            weight=output_weight if output_weight is not None else self.shared_output_layer_weight,
+            sequence_parallel_enabled=self.output_layer.sequence_parallel,
+            column_parallel_linear=self.output_layer,
+            col_linear_kwargs={
+                "weight": output_weight,
+                "runtime_gather_output": runtime_gather_output,
+            },
+        )
 
         return loss
