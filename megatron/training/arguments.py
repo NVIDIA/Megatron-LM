@@ -2096,6 +2096,8 @@ def _add_training_args(parser):
                        help='The communicator group names to use high priority streams.')
     group.add_argument('--disable-jit-fuser', action='store_true',
                        help='Disable the JIT fuser.')
+    group.add_argument('--activation-func-fp8-input-store', action='store_true',
+                       help='Store swiglu inputs in fp8 to save activation memory.')
 
     return parser
 
