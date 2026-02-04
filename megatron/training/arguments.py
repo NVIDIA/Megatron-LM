@@ -2889,25 +2889,25 @@ def _add_experimental_args(parser):
                             'optimizer state in memory during training but does not affect '
                             'the precision in the kernel computation.')
     # mHC (Manifold-Constrained Hyper-Connections) arguments
-    group.add_argument('--enable-hyper-connections', action='store_true',
-                       default=False,
-                       help='Enable Hyper-Connections (mHC) for multi-stream residual learning.')
-    group.add_argument('--num-residual-streams', type=int, default=4,
-                       help='Number of residual streams for Hyper-Connections. Default: 4.')
-    group.add_argument('--mhc-sinkhorn-iterations', type=int, default=20,
-                       help='Number of Sinkhorn-Knopp iterations for doubly stochastic projection. Default: 20.')
-    group.add_argument('--mhc-init-gating-factor', type=float, default=0.01,
-                       help='Initial gating factor for mHC alpha parameters. Default: 0.01.')
-    group.add_argument('--recompute-hyper-connections', action='store_true',
-                       default=False,
-                       help='Enable recomputation for HyperConnection intermediate activations. '
-                       'When enabled, all HyperConnection operations are wrapped with '
-                       'CheckpointWithoutOutput for memory-efficient recomputation. '
-                       'Requires --enable-hyper-connections and --recompute-granularity selective.')
-    group.add_argument('--mhc-recompute-layer-num', type=int, default=None,
-                       help='Number of layers per MHC recompute block. '
-                       'When set, every N layers form a recompute block. '
-                       'If None, all layers share a single recompute block.')
+    # group.add_argument('--enable-hyper-connections', action='store_true',
+    #                    default=False,
+    #                    help='Enable Hyper-Connections (mHC) for multi-stream residual learning.')
+    # group.add_argument('--num-residual-streams', type=int, default=4,
+    #                    help='Number of residual streams for Hyper-Connections. Default: 4.')
+    # group.add_argument('--mhc-sinkhorn-iterations', type=int, default=20,
+    #                    help='Number of Sinkhorn-Knopp iterations for doubly stochastic projection. Default: 20.')
+    # group.add_argument('--mhc-init-gating-factor', type=float, default=0.01,
+    #                    help='Initial gating factor for mHC alpha parameters. Default: 0.01.')
+    # group.add_argument('--recompute-hyper-connections', action='store_true',
+    #                    default=False,
+    #                    help='Enable recomputation for HyperConnection intermediate activations. '
+    #                    'When enabled, all HyperConnection operations are wrapped with '
+    #                    'CheckpointWithoutOutput for memory-efficient recomputation. '
+    #                    'Requires --enable-hyper-connections and --recompute-granularity selective.')
+    # group.add_argument('--mhc-recompute-layer-num', type=int, default=None,
+    #                    help='Number of layers per MHC recompute block. '
+    #                    'When set, every N layers form a recompute block. '
+    #                    'If None, all layers share a single recompute block.')
 
     return parser
 
