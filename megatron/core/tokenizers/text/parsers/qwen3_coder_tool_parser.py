@@ -5,11 +5,10 @@
 import ast
 import json
 import logging
+import re
 import uuid
 from types import SimpleNamespace
 from typing import Any
-
-import re
 
 from megatron.core.tokenizers.text.parsers.base_parser import BaseParser
 
