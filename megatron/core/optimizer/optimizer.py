@@ -121,7 +121,6 @@ class MegatronOptimizer(ABC):
             )
         self.config = config
         self.init_state_fn = init_state_fn
-        self._restore_stream: Optional[torch.cuda.Stream] = None
 
     def get_parameters(self) -> List[torch.nn.Parameter]:
         """
@@ -344,83 +343,41 @@ class MegatronOptimizer(ABC):
 
     def offload_to_cpu(self):
         """Function used for RL training.
-        Move optimizer state tensors to CPU to free GPU memory during inference.
-
-        Uses async transfers with pinned memory to overlap transfers and hide latency.
-        """
+        Move optimizer state tensors to CPU to free GPU memory during inference."""
         if getattr(self, 'optimizer', None) is not None and not getattr(
             self, 'is_stub_optimizer', False
         ):
             log_single_rank(logger, logging.INFO, '[OFFLOAD] moving optimizer state to CPU')
+            # Move all optimizer tensors to CPU while keeping the optimizer instance
+            for param_group in self.optimizer.param_groups:
+                for p in param_group['params']:
+                    if isinstance(p, torch.Tensor) and p.is_cuda:
+                        p.data = p.data.cpu()
 
-            stream = torch.cuda.Stream()
+            for state_dict in self.optimizer.state.values():
+                for k, v in state_dict.items():
+                    if isinstance(v, torch.Tensor) and v.is_cuda:
+                        state_dict[k] = v.cpu()
 
-            with torch.cuda.stream(stream):
-                # Move param tensors to CPU asynchronously
-                for param_group in self.optimizer.param_groups:
-                    for p in param_group['params']:
-                        if isinstance(p, torch.Tensor) and p.is_cuda:
-                            cpu_tensor = torch.empty(
-                                p.shape, dtype=p.dtype, device='cpu', pin_memory=True
-                            )
-                            cpu_tensor.copy_(p.data, non_blocking=True)
-                            p.data = cpu_tensor
-
-                # Move optimizer state tensors to CPU asynchronously
-                for state_dict in self.optimizer.state.values():
-                    for k, v in state_dict.items():
-                        if isinstance(v, torch.Tensor) and v.is_cuda:
-                            cpu_tensor = torch.empty(
-                                v.shape, dtype=v.dtype, device='cpu', pin_memory=True
-                            )
-                            cpu_tensor.copy_(v, non_blocking=True)
-                            state_dict[k] = cpu_tensor
-
-            stream.synchronize()
             torch.cuda.empty_cache()
 
     def restore_from_cpu(self):
         """Function used for RL training.
-        Restore optimizer state tensors from CPU back to GPU for training.
-
-        Uses async transfers to minimize blocking time. Transfers are initiated
-        immediately but may not be complete when this method returns. Call
-        wait_for_restore() before using the optimizer to ensure all transfers
-        have completed.
-
-        Note: For true async behavior, CPU tensors should be in pinned memory
-        (which is the case if they were created by offload_to_cpu()).
-        """
+        Restore optimizer state tensors from CPU back to GPU for training."""
         if getattr(self, 'optimizer', None) is not None and not getattr(
             self, 'is_stub_optimizer', False
         ):
             log_single_rank(logger, logging.INFO, '[RESTORE] moving optimizer state back to GPU')
+            # Move all optimizer tensors back to GPU
+            for param_group in self.optimizer.param_groups:
+                for p in param_group['params']:
+                    if isinstance(p, torch.Tensor) and not p.is_cuda:
+                        p.data = p.data.cuda()
 
-            # Create stream for async transfers
-            self._restore_stream = torch.cuda.Stream()
-
-            with torch.cuda.stream(self._restore_stream):
-                # Move param tensors to GPU asynchronously
-                for param_group in self.optimizer.param_groups:
-                    for p in param_group['params']:
-                        if isinstance(p, torch.Tensor) and not p.is_cuda:
-                            p.data = p.data.to('cuda', non_blocking=True)
-
-                # Move optimizer state tensors to GPU asynchronously
-                for state_dict in self.optimizer.state.values():
-                    for k, v in state_dict.items():
-                        if isinstance(v, torch.Tensor) and not v.is_cuda:
-                            state_dict[k] = v.to('cuda', non_blocking=True)
-
-    def wait_for_restore(self):
-        """Wait for async restore_from_cpu() to complete.
-
-        This method is idempotent - it's safe to call multiple times.
-        Must be called before using the optimizer after restore_from_cpu().
-        """
-        if self._restore_stream is not None:
-            self._restore_stream.synchronize()
-            self._restore_stream = None
+            for state_dict in self.optimizer.state.values():
+                for k, v in state_dict.items():
+                    if isinstance(v, torch.Tensor) and not v.is_cuda:
+                        state_dict[k] = v.cuda()
 
     @staticmethod
     def _filter_and_reorder_param_groups(
@@ -634,9 +591,6 @@ class MixedPrecisionOptimizer(MegatronOptimizer):
 
     @torch.no_grad()
     def step(self):
-        # Ensure any async restore_from_cpu() has completed before using optimizer state.
-        self.wait_for_restore()
-
         timers = self.config.timers
 
         found_inf_flag = self.prepare_grads()
@@ -1007,9 +961,6 @@ class FP32Optimizer(MegatronOptimizer):
     def step(self):
         """Clip gradients (if needed) and step the base optimizer.
         Always return successful since there is no overflow."""
-        # Ensure any async restore_from_cpu() has completed before using optimizer state.
-        self.wait_for_restore()
-
         timers = self.config.timers
 
         found_inf_flag = self.prepare_grads()
@@ -1356,9 +1307,6 @@ class ChainedOptimizer(MegatronOptimizer):
     @torch.no_grad()
     def step(self):
         """ChainedOptimizer will step all optimizers one by one."""
-        # Ensure any async restore_from_cpu() has completed before using optimizer state.
-        self.wait_for_restore()
-
         found_inf_flag = self.prepare_grads()
         if found_inf_flag:
             return False, None, None
@@ -1472,8 +1420,3 @@ class ChainedOptimizer(MegatronOptimizer):
         """Restore optimizer state from CPU back to GPU for training."""
         for optimizer in self.chained_optimizers:
             optimizer.restore_from_cpu()
-
-    def wait_for_restore(self):
-        """Wait for async restore_from_cpu() to complete on all chained optimizers."""
-        for optimizer in self.chained_optimizers:
-            optimizer.wait_for_restore()
