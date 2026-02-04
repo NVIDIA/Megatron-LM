@@ -241,7 +241,8 @@ def modelopt_gpt_mamba_builder(
                 local_core_attention=local_core_attention,
                 remap_te_layernorm=args.export_te_mcore_model,
                 real_quant_cfg=args.export_real_quant_cfg,
-                use_arbitrary_attention_mask=use_arbitrary_attention_mask,
+                #use_arbitrary_attention_mask=use_arbitrary_attention_mask,
+                use_arbitrary_attention_mask=False,
             )
 
         model_kwargs = {
