@@ -2,41 +2,15 @@
 
 Megatron Core MoE is a production-ready framework for training large-scale Mixture-of-Experts models, providing the foundational architecture, performance optimizations, and best practices that guide MoE framework development across the industry.
 
-## Table of Contents
-
-- [What's New](#whats-new)
-- [Overview of MCore MoE Supported Features and Architectures](#overview-of-mcore-moe-supported-features-and-architectures)
-- [Quick Start Guide](#quick-start-guide)
-  - [Basic MoE Training](#basic-moe-training-in-megatron-lm)
-  - [Pre-defined Configs for Popular Models](#use-the-pre-defined-config-to-train-the-popular-moe-models)
-  - [General Performance Tips](#general-performance-tips)
-- [Best Practices for High Performance MoE Training](#best-practices-to-achieve-high-performance-on-moe-training)
-  - [Step 1: Find Feasible Parallel Mapping](#step-1-find-the-feasible-parallel-mapping-under-the-memory-capacity-of-the-gpu)
-  - [Step 2: Select Optimal Parallelism Strategy](#step-2-select-optimal-parallelism-strategy)
-  - [Step 3: Enable Performance Features](#step-3-enable-performance-features-based-on-profiling-bottlenecks)
-- [Feature Documentation](#feature-documentation)
-  - [Router and Load Balancing](#router-and-load-balancing)
-  - [Token Dispatching](#token-dispatching)
-  - [Upcycling](#upcycling)
-- [Training Optimizations](#training-optimizations)
-  - [MoE Parallel Folding](#moe-parallel-folding)
-  - [Memory Optimization](#memory-optimization)
-  - [Communication Optimization](#communication-optimization)
-  - [Compute Optimization](#compute-optimization)
-  - [FP8 Training](#fp8-training)
-  - [CUDA Graph](#cuda-graph)
-- [MoE Arguments Reference](#moe-arguments-reference)
-- [Examples](#examples)
-- [Contributing](#contributing)
-- [Citation](#citation)
-
 ## What's New
 For latest features and architectures, please refer to the [MCore dev roadmap](https://github.com/NVIDIA/Megatron-LM/issues/1729).
 
 ### 🔥 [MCore dev] (2026/01)
-- 🚀 Pipeline-aware fine-grained activation offloading 
+- 🚀 Pipeline-aware fine-grained activation offloading
 - 🚀 Qwen3-Next model support
+- 🚀 DeepSeek-V3.2 model support
 - 🚀 Muon and Layer-wise distributed optimizer
+- 🚀 CUDA Graph support with fine-grained scopes
 
 ### 🔥 [MCore v0.15] (2025/11)
 - 🚀 Add HybridEP backend to Flex Dispatcher(GB200, B200, H100 supported)
@@ -480,9 +454,11 @@ FP8 training provides benefits across all three performance walls:
 
 | Wall | FP8 Benefit | Impact |
 |------|-------------|--------|
-| **Compute** | Faster Tensor Core GEMMs | FP8 ops on Hopper/Blackwell are faster than BF16 |
 | **Memory** | 50% activation reduction | Stores linear layer inputs in FP8 instead of BF16 |
+| **Memory** | Eliminate BF16 weight copies | Native FP8 casts directly from FP32 to FP8 |
+| **Communication** | 50% EP dispatch volume | Dispatches tokens in FP8 instead of BF16 |
 | **Communication** | 50% parameter all-gather | With FP8 primary weights (except MXFP8) |
+| **Compute** | Faster Tensor Core GEMMs | FP8 ops on Hopper/Blackwell are faster than BF16 |
 
 #### FP8 Recipes
 
@@ -718,26 +694,6 @@ We welcome contributions! Please see [CONTRIBUTING.md](../../../../CONTRIBUTING.
 - GitHub Issues: [Report bugs or request features](https://github.com/NVIDIA/Megatron-LM/issues)
 - Documentation: [Full documentation](https://docs.nvidia.com/megatron-core/developer-guide/latest/index.html)
 
-## Tuning Guide of Parallel Mappings
-For a specific model, the best parallel mapping varies based on the model architecture, trained sequence length, and the hardware platform.
-Here we provide some general rules to get better performance:
-1. Keep the model parallelism size as small as possible.
-    - For large language models, model parallelism is often required to prevent OOM, but it adds communication overhead.
-    - With distributed optimizer, master weights and optimizer states are sharded across DP ranks with slight communication overhead.
-    - Reduce model parallelism size and increase data parallelism size when there is available GPU memory.
-2. Ensure the EPxTP communication stays within the NVLink domain.
-    - Communications of EP and TP should remain within the NVLink domain as much as possible, as both are communication-intensive.
-    - If the model is too large and requires scaling across multiple nodes, consider PP before TP and EP. See item 3 for details.
-3. Use Pipeline Parallelism to scale the model further.
-    - Enable Virtual Pipeline Parallelism (VPP) to reduce PP bubbles when PP size >= 2 by setting `num_layers_per_virtual_pipeline_stage`.
-    - VPP size tuning: the legal values of vpp_size are all common divisors of num_layers/pp_size. For example, num_layers=24 and pp_size=4 gives vpp_size in {1, 2, 3, 6}.
-4. Prefer EP over TP for the expert layer when possible:
-    - TP saves more memory than EP, but EP can achieve better GEMM efficiency and less communication overhead than TP.
-    - If EP size increases to the number of experts, local token permutation/un-permutation for expert computation is omitted.
-    - In practice, EP8TP1 is better than EP4TP2 for 8x7B.
-5. Enable Context Parallelism for long-context training.
-    - The efficiency of CP largely depends on whether its communication can be overlapped with computation.
-    - Empirically, use CP when sequence length >= 8K.
 
 ## Citation
 
