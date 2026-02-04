@@ -60,6 +60,14 @@ def build_tokenizer(args):
         tokenizer = MegatronTokenizer.from_pretrained(metadata_path=metadata, **kwargs)
 
         return tokenizer
+    elif args.tokenizer_type == 'SFTTokenizer':
+        # SFTTokenizer uses the legacy tokenizer system
+        from megatron.training.tokenizer.sft_tokenizer import SFTTokenizer
+        tokenizer = SFTTokenizer(
+            args.tokenizer_model,
+            args.sft_tokenizer_prompt_format,
+        )
+        return tokenizer
 
     if args.tokenizer_metadata:
         metadata = args.tokenizer_metadata
