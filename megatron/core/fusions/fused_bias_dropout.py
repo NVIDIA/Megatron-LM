@@ -45,20 +45,14 @@ def _bias_dropout_add_func(x_with_bias, residual, prob, training):
             x.add_(bias)
         else:
             x = x + bias
-        if prob != 0.0:
-            out = torch.nn.functional.dropout(x, p=prob, training=training, inplace=inplace)
-        else:
-            out = x
+        out = torch.nn.functional.dropout(x, p=prob, training=training, inplace=inplace)
         if inplace:
             out.add_(residual)
         else:
             out = residual + out
         return out
     else:
-        if prob != 0.0:
-            out = torch.nn.functional.dropout(x, p=prob, training=training, inplace=inplace)
-        else:
-            out = x
+        out = torch.nn.functional.dropout(x, p=prob, training=training, inplace=inplace)
         if inplace:
             out.add_(residual)
         else:

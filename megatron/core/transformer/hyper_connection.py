@@ -122,8 +122,6 @@ class HyperConnectionModule(MegatronModule):
         # - H_pre: n values
         # - H_post: n values  
         # - H_res: n^2 values (before Sinkhorn projection)
-        self.norm = nn.RMSNorm(self.hidden_size * self.n)
-        
         self.mapping_proj = nn.Linear(
             self.n * self.hidden_size, 
             self.n * self.n + 2 * self.n,
@@ -151,7 +149,6 @@ class HyperConnectionModule(MegatronModule):
         # (nn.Linear, nn.RMSNorm) whose gradients need to be all-reduced.
         if self.config.sequence_parallel:
             setattr(self.mapping_proj.weight, 'sequence_parallel', True)
-            setattr(self.norm.weight, 'sequence_parallel', True)
             setattr(self.alpha_pre, 'sequence_parallel', True)
             setattr(self.alpha_post, 'sequence_parallel', True)
             setattr(self.alpha_res, 'sequence_parallel', True)
