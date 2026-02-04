@@ -530,19 +530,15 @@ def get_environment_rollouts(
     nvtx_range = get_nvtx_range()
 
     if args.rl_offload_optimizer_during_inference:
-        with nvtx_range("rl/offload-optimizer-before-inference", time=True):
-            with nvtx_range("rl/offload/grad-buffers", time=True):
-                model[0].offload_grad_buffers()
-            with nvtx_range("rl/offload/optimizer-state", time=True):
-                optimizer.offload_to_cpu()
-
-        with nvtx_range("rl/offload-optimizer-state-and-grad-buffers-during-inference"):
+        with nvtx_range("rl/offload-optimizer-state-and-grad-buffers-during-inference", time=True):
             if not args.rl_training_cuda_graphs:
-                model[0].offload_grad_buffers()
+                with nvtx_range("rl/offload/grad-buffers", time=True):
+                    model[0].offload_grad_buffers()
             else:
                 logger.warning(
                     "Gradient buffers will not be offloaded when training cudagraphs are enabled!")
-            optimizer.offload_to_cpu()
+            with nvtx_range("rl/offload/optimizer-state", time=True):
+                optimizer.offload_to_cpu()
              
     # If we have seperate training and inference models we to refit weights from the training model to the inference model.
     if inference_model is not None:
@@ -619,26 +615,11 @@ def get_environment_rollouts(
         logger.debug(f"Got rollouts on rank {rank}")
 
     if args.rl_offload_optimizer_during_inference:
-<<<<<<< HEAD
-        with nvtx_range("rl/onload-optimizer-after-inference", time=True):
-            # Use synchronize=False to avoid blocking CPU on all pending GPU work.
-            # The grad buffer allocation and zeroing is enqueued on the default stream,
-            # so any subsequent GPU work (like backward pass) will automatically wait for it.
-            # The optimizer restore is async and will be synchronized in optimizer.step().
-            with nvtx_range("rl/onload/grad-buffers", time=True):
-                model[0].onload_grad_buffers(synchronize=False)
-            with nvtx_range("rl/onload/optimizer-state", time=True):
+        with nvtx_range("restore-optimizer-state-and-grad-buffers-after-inference", time=True):
+            with nvtx_range("rl/restore/grad-buffers", time=True):
+                model[0].restore_grad_buffers()
+            with nvtx_range("rl/restore/optimizer-state", time=True):
                 optimizer.restore_from_cpu()
-            # Sync here to get accurate timing of the actual data transfer
-            with nvtx_range("rl/onload/wait-for-transfers", time=True):
-                if hasattr(optimizer, '_restore_stream') and optimizer._restore_stream is not None:
-                    optimizer._restore_stream.synchronize()
-                    optimizer._restore_stream = None
-=======
-        with nvtx_range("restore-optimizer-state-and-grad-buffers-after-inference"):
-            model[0].restore_grad_buffers()
-            optimizer.restore_from_cpu()
->>>>>>> main
 
     if lang_rl_log_dir and rank == get_pg_rank(inference_pg_collection.tp):
         with open(
@@ -724,14 +705,8 @@ def get_logprobs(model, tokens, position_ids, no_grad=False, sequence_packing=Fa
 
     nvtx_range = get_nvtx_range()
 
-<<<<<<< HEAD
     with nvtx_range("rl/get-logprobs", time=True):
-
         with nvtx_range("rl/forward-pass", time=True):
-=======
-    with nvtx_range("get-logprobs", time=False):
-        with nvtx_range("forward-pass", time=False):
->>>>>>> main
             # TODO(vitalyk): use fp16/bf16 as a function argument. Do not use args.
 
             attention_mask_for_forward = None
@@ -1198,40 +1173,11 @@ def prepare_data_for_update(
     model = model[0]
     dtype = torch.bfloat16 if args.bf16 else (torch.float16 if args.fp16 else torch.float32)
 
-<<<<<<< HEAD
     with nvtx_range("rl/prepare-data-for-update", time=True):
         with nvtx_range("rl/compute-group-stats", time=True):
-            # These are computed on all rollouts for reporting purposes
-            group_stats = compute_group_stats(rollouts, tokenizer)
-            rewards = np.array([[rollout.reward for rollout in group] for group in rollouts])
-            group_stats.rewards = rewards.flatten().tolist()
-            group_stats.advantages = (
-                (
-                    (rewards - rewards.mean(axis=1, keepdims=True))
-                    / (1e-4 + rewards.std(axis=1, keepdims=True))
-                )
-                .flatten()
-                .tolist()
-            )
-            global_rollout_count = len(group_stats.rewards)
-
-        with nvtx_range("rl/prepare-advantages", time=True):        
-            # [g, group_size]
-            # Making an assumption that all groups are of the same size!
-            rewards = torch.tensor(rewards, device='cpu')
-            advantages = (rewards - rewards.mean(axis=1, keepdim=True)) / (
-                1e-4 + rewards.std(axis=1, keepdim=True)
-            )
-
-            # Flatten advantages for training and move to GPU
-            advantages = global_advantages = advantages.view(-1).cuda()
-=======
-    with nvtx_range("prepare-data-for-update"):
-        with nvtx_range("compute-group-stats"):
             group_stats = compute_group_stats(rollouts, tokenizer, args.seq_length)
             # TODO(vitalyk): why do we need global_advantages here? go inside packing
             advantages = global_advantages = torch.tensor(group_stats.advantages, dtype=dtype).cuda()
->>>>>>> main
 
         # Now split the rollouts across the data parallel ranks for training
         # This needs to be done at this point because we are about to calculate logprobs
@@ -1272,13 +1218,8 @@ def prepare_data_for_update(
 
         packing_context = None
         # Build trajectories based on sequence packing or standard processing
-<<<<<<< HEAD
         if args.rl_use_sequence_packing:
             with nvtx_range("rl/sequence-packing", time=True):
-=======
-        if sequence_packing:
-            with nvtx_range("sequence_packing", time=True):
->>>>>>> main
                 runtime_state.packing_context = packing_context = pack_all_trajectories(
                     trajs, 
                     generation_masks, 
@@ -1317,12 +1258,8 @@ def prepare_data_for_update(
                 )
                 logprobs_batch_size = args.micro_batch_size
 
-<<<<<<< HEAD
 
         with torch.no_grad(), nvtx_range("rl/compute-logprobs", time=True):
-=======
-        with torch.no_grad(), nvtx_range("compute_logprobs", time=True):
->>>>>>> main
             # Before we can update the model, we need to get the logprobs for the \pi_{old} model.
 
             # Wrap forward_backward_func for Full iteration CUDA graph
@@ -1340,45 +1277,6 @@ def prepare_data_for_update(
             pg_collection = get_attr_wrapped_model(model, "pg_collection")
             pp_group = pg_collection.pp
 
-<<<<<<< HEAD
-            def _compute_logprobs_batch():
-                """Compute logprobs for all batches in the data loader."""
-                logprobs_list = []
-                data_iterator = iter(data_loader)
-                for i in range(len(data_loader)):
-                    output_tensor = forward_backward_func(
-                        forward_step_func=logprobs_forward_step,
-                        data_iterator=data_iterator,
-                        model=model,
-                        num_microbatches=1,
-                        seq_length=args.seq_length,
-                        micro_batch_size=logprobs_batch_size,
-                        decoder_seq_length=args.decoder_seq_length,
-                        forward_only=True,
-                        adjust_tensor_shapes_fn=None,
-                    )
-                    if is_pp_last_stage(pp_group):
-                        logprobs_list.append(output_tensor[0].detach())
-
-                if is_pp_last_stage(pp_group):
-                    logprobs = torch.concat(logprobs_list, dim=0)
-                    assert logprobs.dtype == dtype
-                else:
-                    logprobs = torch.empty(
-                        len(compute_trajs),
-                        args.seq_length - 1,
-                        dtype=dtype,
-                        device=torch.cuda.current_device(),
-                    )
-
-                # Only PP>1 needs a broadcast from the last stage; for PP=1 the output is already local.
-                if get_pg_size(pp_group) > 1:
-                    dist.broadcast(logprobs, src=get_pp_last_rank(pp_group), group=pp_group)
-                return logprobs.cpu()
-
-            with torch.no_grad(), nvtx_range("rl/compute-old-logprobs", time=True):
-                old_logprobs = _compute_logprobs_batch()
-=======
             with torch.no_grad(), nvtx_range("compute_old_logprobs", time=True):
                 old_logprobs = _compute_logprobs_batch(
                     model=model,
@@ -1393,7 +1291,6 @@ def prepare_data_for_update(
                     pp_group=pp_group,
                     is_correction=args.rl_inference_logprobs_is_correction,
                 )
->>>>>>> main
 
             with torch.no_grad(), nvtx_range("rl/compute-ref-logprobs", time=True):
                 # We need to load the ref model state dict and compute the logprobs for the ref model
@@ -1424,13 +1321,8 @@ def prepare_data_for_update(
                     torch.cuda.empty_cache()
 
 
-<<<<<<< HEAD
-        if args.rl_use_sequence_packing:
-            with nvtx_range("rl/pack-logprobs", time=True):
-=======
         if sequence_packing:
-            with nvtx_range("pack_logprobs", time=True):
->>>>>>> main
+            with nvtx_range("rl/pack-logprobs", time=True):
                 # Store logprobs on gpu in packing context
                 # Since PackingContext is a dataclass, we add these as new attributes
                 packing_context.old_logprobs = old_logprobs.cuda()
@@ -1458,7 +1350,7 @@ def prepare_data_for_update(
                     packing_context.packed_inference_logprobs = packed_inference_logprobs.cuda()
                     # Only mark as having inference logprobs for IS correction if enabled
                     packing_context.has_inference_logprobs = args.rl_inference_logprobs_is_correction
-            with nvtx_range("create_dataloader"):
+            with nvtx_range("rl/create-dataloader", time=True):
                 # @vitalyk: This function also reconfigures the data loader to count the
                 # global_batch_size in the bins frame of reference.
                 # I think it will be a better design if we split the data loader creating and logic
@@ -1488,18 +1380,9 @@ def prepare_data_for_update(
                     # Nullify logprobs if not used in IS correction,
                     if not args.rl_inference_logprobs_is_correction:
                         inference_logprobs = None
-<<<<<<< HEAD
-
-        with nvtx_range("rl/create-dataloader", time=True):
-            if args.rl_use_sequence_packing:
-               loader, optimizer_steps = get_microbatch_dataloader(packing_context)
-               runtime_state.global_batches_per_collection = optimizer_steps
-            else:
-=======
-            with nvtx_range("create_dataloader"):
+            with nvtx_range("rl/create-dataloader", time=True):
                 # Because of multiturn, our batch sizes for non-sequence packed trajectories are not fixed anymore.
                 # As in sequence packing above, we need to reconfigure it too.
->>>>>>> main
                 runtime_state.packing_context = None
 
                 reconfigure_num_microbatches_calculator(
@@ -1526,12 +1409,7 @@ def prepare_data_for_update(
                 data = TensorDataset(*dataset_tensors)
                 loader = DataLoader(data, batch_size=args.micro_batch_size)
 
-<<<<<<< HEAD
         with nvtx_range("rl/log-wandb-tb", time=True):
-=======
-
-        with nvtx_range("log-wandb-tb"):
->>>>>>> main
             maybe_log_training_metrics(
                 group_stats=group_stats,
                 current_iteration=args.curr_iteration,
@@ -1847,18 +1725,10 @@ def megatron_rl_inference_mode(
     lang_module = model[0].module.module if hasattr(model[0].module, "module") else model[0].module
 
     lang_module.eval()
-<<<<<<< HEAD
-    # If this is a separate RL inference model allocated with UVM, ensure weights are resident on GPU
-    # before any CUDA-graph capture/replay or inference.
-    nvtx_range = get_nvtx_range()
-    with nvtx_range("rl/prefetch-weights-to-gpu", time=True):
-        model_core = unwrap_model(model[0])
-=======
     # If this is a separate RL inference model with offloading enabled, ensure weights are on GPU
     # before any CUDA-graph capture/replay or inference. This is a no-op if already on GPU.
     model_core = unwrap_model(model[0])
-    with nvtx_range("prefetch-inference-model-weights-to-gpu"):
->>>>>>> main
+    with nvtx_range("rl/prefetch-weights-to-gpu", time=True):
         _maybe_prefetch_separate_inference_model_weights(model_core, to_cpu=False)
 
     rotary_module = getattr(lang_module, "rotary_pos_emb", None)
@@ -1871,21 +1741,15 @@ def megatron_rl_inference_mode(
     with torch.no_grad():
 
         if offload_optimizer_during_inference:
-<<<<<<< HEAD
-            with nvtx_range("rl/offload-optimizer-before-inference", time=True):
-                with nvtx_range("rl/offload/grad-buffers", time=True):
-                    model[0].offload_grad_buffers()
-                with nvtx_range("rl/offload/optimizer-state", time=True):
-                    optimizer.offload_to_cpu()
-=======
             with nvtx_range("offload-optimizer-state-and-grad-buffers-before-inference"):
                 if not args.rl_training_cuda_graphs:
-                    model[0].offload_grad_buffers()
+                    with nvtx_range("rl/offload/grad-buffers", time=True):
+                        model[0].offload_grad_buffers()
                 else:
                     logger.warning(
                         "Gradient buffers will not be offloaded when training cudagraphs are enabled!")
-                optimizer.offload_to_cpu()
->>>>>>> main
+                with nvtx_range("rl/offload/optimizer-state", time=True):
+                    optimizer.offload_to_cpu()
 
         # TODO: Remove this if statement once a change to `toggle_cuda_graphs` makes it safe to.
         if cuda_graph_impl != "none" and not args.rl_training_cuda_graphs:
@@ -1947,26 +1811,11 @@ def megatron_rl_inference_mode(
             _maybe_prefetch_separate_inference_model_weights(model_core, to_cpu=True)
 
         if offload_optimizer_during_inference:
-<<<<<<< HEAD
-            with nvtx_range("rl/onload-optimizer-after-inference", time=True):
-                # Use synchronize=False to avoid blocking CPU on all pending GPU work.
-                # The grad buffer allocation and zeroing is enqueued on the default stream,
-                # so any subsequent GPU work (like backward pass) will automatically wait for it.
-                # The optimizer restore is async and will be synchronized in optimizer.step().
-                with nvtx_range("rl/onload/grad-buffers", time=True):
-                    model[0].onload_grad_buffers(synchronize=False)
-                with nvtx_range("rl/onload/optimizer-state", time=True):
+            with nvtx_range("rl/onload-optimizer-state-and-grad-buffers-after-inference", time=True):
+                with nvtx_range("rl/restore/grad-buffers", time=True):
+                    model[0].restore_grad_buffers()
+                with nvtx_range("rl/restore/optimizer-state", time=True):
                     optimizer.restore_from_cpu()
-                # Sync here to get accurate timing of the actual data transfer
-                with nvtx_range("rl/onload/wait-for-transfers", time=True):
-                    if hasattr(optimizer, '_restore_stream') and optimizer._restore_stream is not None:
-                        optimizer._restore_stream.synchronize()
-                        optimizer._restore_stream = None
-=======
-            with nvtx_range("onload-optimizer-state-and-grad-buffers-after-inference"):
-                model[0].restore_grad_buffers()
-                optimizer.restore_from_cpu()
->>>>>>> main
 
         lang_module.train()
 
