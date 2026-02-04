@@ -1786,6 +1786,12 @@ def rl_inference_interface_shutdown():
     else:
         logger.warning("No inference interface to shutdown. This should not happen.")
 
+    # TODO(rkirby): This is a hack to hard exit. There is a bug that is preventing us from using sys.exit(0).
+    # It seem the Flask server has non-daemon threads that are preventing the program from exiting.
+    # We need to find a way to gracefully complete all in progress requests and shutdown the Flask server.
+    import os
+    os._exit(0)
+
 
 def get_iteration_sequence_count(args):
     """Get the total number of sequences processed in this iteration across all ranks."""
