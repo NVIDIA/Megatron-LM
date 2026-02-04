@@ -15,9 +15,9 @@ This example demonstrates:
 
 from megatron.core.models.hl import (
     AttentionLayerConfig,
+    CommonLayerConfig,
     EmbeddingLayerConfig,
     HLModel,
-    LayerConfig,
     MLPLayerConfig,
 )
 
@@ -26,7 +26,7 @@ from megatron.core.models.hl import (
 # =============================================================================
 
 # Shared settings inherited by all layers (can be overridden per-layer)
-common_config = LayerConfig(
+common_config = CommonLayerConfig(
     hidden_size=4096, bf16=True, tensor_model_parallel_size=8, sequence_parallel=True
 )
 

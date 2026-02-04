@@ -6,7 +6,7 @@ import torch
 
 
 @dataclass
-class LayerConfig:
+class CommonLayerConfig:
     """Base configuration for the `HLModel`."""
 
     ###################
