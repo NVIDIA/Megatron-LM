@@ -1,6 +1,7 @@
 # Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 from typing import Any
 
+
 class BaseParser:
     """Base class for text parsers."""
 
