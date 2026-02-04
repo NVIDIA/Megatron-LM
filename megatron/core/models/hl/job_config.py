@@ -4,6 +4,8 @@ from dataclasses import dataclass
 
 import torch
 
+from megatron.core.models.hl import HLLayerConfig
+
 
 @dataclass
 class JobConfig:
@@ -11,6 +13,9 @@ class JobConfig:
     ###################
     # Model parallelism
     ###################
+    layer_pattern: list[HLLayerConfig]
+    """Layer pattern specifying pipeline parallel partitioning."""
+
     tensor_model_parallel_size: int = 1
     """Intra-layer model parallelism. Splits tensors across GPU ranks."""
 
