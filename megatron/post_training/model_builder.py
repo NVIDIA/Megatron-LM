@@ -135,7 +135,8 @@ def _load_teacher_model(config, config_raw: Namespace, model_kwargs: Dict[str, A
                 local_core_attention=False if config.context_parallel_size > 1 else args.export_force_local_attention,
                 remap_te_layernorm=args.export_te_mcore_model,
                 real_quant_cfg=args.export_real_quant_cfg,
-                use_arbitrary_attention_mask=False if config.context_parallel_size > 1 else True,
+                #use_arbitrary_attention_mask=False if config.context_parallel_size > 1 else True,
+                use_arbitrary_attention_mask=False,
             )
         teacher = MCoreGPTModel(config=config, **model_kwargs)
     _add_load_convert_hooks(teacher)
