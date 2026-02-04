@@ -343,13 +343,18 @@ def validate_args(args, defaults={}):
         assert not (args.rl_partial_rollouts and args.rl_remove_kv_cache_during_training), \
             "Cannot use both partial-rollouts and remove-kv-cache-during-training"
 
-        assert not (
-            args.rl_offload_inference_model_weights_when_idle
-            and args.rl_inference_model_unified_memory_level != 1
-        ), (
-            "--rl-offload-inference-model-weights-when-idle requires "
-            "--rl-inference-model-unified-memory-level=1."
-        )
+        # Validate inference model offloading - requires either UVM or torch_memory_saver
+        if args.rl_offload_inference_model_weights_when_idle:
+            if args.rl_inference_model_unified_memory_level != 1:
+                # Not using UVM, so we need torch_memory_saver
+                try:
+                    from torch_memory_saver import torch_memory_saver
+                except ImportError:
+                    raise AssertionError(
+                        "To use --rl-offload-inference-model-weights-when-idle without UVM "
+                        "(--rl-inference-model-unified-memory-level=1), `torch_memory_saver` must be "
+                        "installed. See https://github.com/fzyzcjy/torch_memory_saver."
+                    )
 
         # When using different EP sizes for inference and training (EP refit), the legacy
         # GroupedMLP is not supported. Only SequentialMLP or TEGroupedMLP can be used.
@@ -1966,9 +1971,10 @@ def _add_rl_args(parser):
         required=False,
         default=False,
         help=(
-            'When using a separate RL inference model with UVM-enabled parameters, prefetch its weights '
-            'to CPU when not doing rollout inference, and prefetch back to GPU right before inference. '
-            'Requires --rl-inference-model-unified-memory-level=1.'
+            'When using a separate RL inference model, offload its weights to CPU when not doing rollout '
+            'inference, and restore to GPU right before inference. Works with two backends: '
+            '1) UVM (when --rl-inference-model-unified-memory-level=1), or '
+            '2) torch_memory_saver (when UVM is not enabled; requires torch_memory_saver to be installed).'
         ),
     )
     group.add_argument('--refit-method', type=str, default='gloo',

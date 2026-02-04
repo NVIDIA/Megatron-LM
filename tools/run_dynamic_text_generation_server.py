@@ -36,7 +36,7 @@ async def run_text_generation_server(
 
     rank = torch.distributed.get_rank()
 
-    await engine.start_listening_to_data_parallel_coordinator(
+    coordinator_addr = await engine.start_listening_to_data_parallel_coordinator(
         inference_coordinator_port=coordinator_port, launch_inference_coordinator=True
     )
 
@@ -44,7 +44,7 @@ async def run_text_generation_server(
     if rank == 0:
         server_task = asyncio.create_task(
             run_flask_server(
-                coordinator_port=coordinator_port,
+                coordinator_addr=coordinator_addr,
                 tokenizer=engine.controller.tokenizer,
                 rank=rank,
                 flask_port=flask_port,
