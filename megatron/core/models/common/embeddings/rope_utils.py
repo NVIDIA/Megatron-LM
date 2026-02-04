@@ -203,6 +203,8 @@ def _apply_rotary_pos_emb_thd(
     cp_rank = cp_group.rank()
     seqlens = ((cu_seqlens[1:] - cu_seqlens[:-1]) // cp_size).tolist()
 
+    print(freq.size(0), cu_seqlens[-1], freqs.size(0) == cu_seqlens[-1])
+
     # Handle two different frequency tensor formats:
     # 1. If freqs.size(0) == cu_seqlens[-1]: freqs contains all positions across all sequences
     #    -> Use offset-based mapping for exact positional correspondence
