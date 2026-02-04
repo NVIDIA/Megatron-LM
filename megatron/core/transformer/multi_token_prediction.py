@@ -1028,15 +1028,6 @@ class MultiTokenPredictionLayer(MegatronModule):
             packed_seq_params=packed_seq_params,
         )
 
-        # Roll RoPE to match rolled positions (position_ids were rolled in _get_embeddings)
-        # After rolling, index i should use RoPE for position i+1
-        if rotary_pos_emb is not None:
-            rotary_pos_emb = torch.roll(rotary_pos_emb, shifts=-1, dims=0)
-        if rotary_pos_cos is not None:
-            rotary_pos_cos = torch.roll(rotary_pos_cos, shifts=-1, dims=0)
-        if rotary_pos_sin is not None:
-            rotary_pos_sin = torch.roll(rotary_pos_sin, shifts=-1, dims=0)
-
         if self.config.recompute_granularity == 'full' and self.training:
             hidden_states = self._checkpointed_forward(
                 self._proj_and_transformer_layer,
