@@ -359,7 +359,7 @@ def permute(
                 "fused_permute_with_probs typically requires TE >= 2.1.0, and "
                 "fused_permute_and_pad_with_probs` typically requires TE >= 2.12.0. "
             )
-        if fused_permute_and_pad_with_probs is not None:
+        if fused_permute_and_pad_with_probs is not None and tokens_per_expert is not None:
             return fused_permute_and_pad_with_probs(
                 tokens, probs, routing_map, tokens_per_expert, align_size
             )
