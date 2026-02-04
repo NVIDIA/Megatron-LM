@@ -297,7 +297,7 @@ class MoEAllGatherTokenDispatcher(MoETokenDispatcher):
         (permuted_local_hidden_states, _, self.reversed_local_input_permutation_mapping) = permute(
             hidden_states,
             self.local_map,
-            num_out_tokens=tokens_per_expert.sum(),
+            num_out_tokens=tokens_per_expert.sum().item(),
             fused=self.config.moe_permute_fusion,
         )
 

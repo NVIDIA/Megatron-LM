@@ -77,6 +77,7 @@ def fully_shard_model(
     dp_outer_dim: Optional[str] = None,
     tp_dim: Optional[str] = None,
     hybrid_fsdp_group: Optional[torch.distributed.ProcessGroup] = None,
+    hybrid_fsdp_expt_group: Optional[torch.distributed.ProcessGroup] = None,
     expt_device_mesh: Optional[DeviceMesh] = None,
     fsdp_unit_modules: Optional[Sequence[Type[torch.nn.Module]] | Sequence[str]] = None,
     zero_dp_strategy: str | int = 3,
@@ -358,6 +359,8 @@ def fully_shard_model(
         tp_dim=tp_dim,
         # Only required for HSDP.
         hybrid_fsdp_group=hybrid_fsdp_group,
+        # Only required for HSDP + EP.
+        hybrid_fsdp_expt_group=hybrid_fsdp_expt_group,
         # Access to flattened DP rank assignments for HSDP.
         hsdp_outer_dp_shard=_outer_fsdp_sharding,
         # Only required for Megatron-FSDP + EP.
@@ -527,6 +530,7 @@ def fully_shard(
     dp_outer_dim: Optional[str] = None,
     tp_dim: Optional[str] = None,
     hybrid_fsdp_group: Optional[torch.distributed.ProcessGroup] = None,
+    hybrid_fsdp_expt_group: Optional[torch.distributed.ProcessGroup] = None,
     expt_device_mesh: Optional[DeviceMesh] = None,
     fsdp_unit_modules: Optional[Sequence[Type[torch.nn.Module]] | Sequence[str]] = None,
     zero_dp_strategy: str | int = 3,
@@ -575,6 +579,7 @@ def fully_shard(
         dp_outer_dim=dp_outer_dim,
         tp_dim=tp_dim,
         hybrid_fsdp_group=hybrid_fsdp_group,
+        hybrid_fsdp_expt_group=hybrid_fsdp_expt_group,
         expt_device_mesh=expt_device_mesh,
         fsdp_unit_modules=fsdp_unit_modules,
         zero_dp_strategy=zero_dp_strategy,

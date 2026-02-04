@@ -343,13 +343,18 @@ def validate_args(args, defaults={}):
         assert not (args.rl_partial_rollouts and args.rl_remove_kv_cache_during_training), \
             "Cannot use both partial-rollouts and remove-kv-cache-during-training"
 
-        assert not (
-            args.rl_offload_inference_model_weights_when_idle
-            and args.rl_inference_model_unified_memory_level != 1
-        ), (
-            "--rl-offload-inference-model-weights-when-idle requires "
-            "--rl-inference-model-unified-memory-level=1."
-        )
+        # Validate inference model offloading - requires either UVM or torch_memory_saver
+        if args.rl_offload_inference_model_weights_when_idle:
+            if args.rl_inference_model_unified_memory_level != 1:
+                # Not using UVM, so we need torch_memory_saver
+                try:
+                    from torch_memory_saver import torch_memory_saver
+                except ImportError:
+                    raise AssertionError(
+                        "To use --rl-offload-inference-model-weights-when-idle without UVM "
+                        "(--rl-inference-model-unified-memory-level=1), `torch_memory_saver` must be "
+                        "installed. See https://github.com/fzyzcjy/torch_memory_saver."
+                    )
 
         # When using different EP sizes for inference and training (EP refit), the legacy
         # GroupedMLP is not supported. Only SequentialMLP or TEGroupedMLP can be used.
@@ -499,6 +504,79 @@ def validate_args(args, defaults={}):
         print_rank_0('setting global batch size to {}'.format(args.global_batch_size))
     assert args.global_batch_size > 0
 
+    # === MTP validation ===
+    # Deprecation warnings for legacy MTP arguments
+    if args.mtp_hybrid_override_pattern is not None:
+        warn_rank_0(
+            "--mtp-hybrid-override-pattern is deprecated. "
+            "For new hybrid models with MTP models, use unified --hybrid-override-pattern instead. "
+            "Example: 'M*M*/MM/MM' means main='M*M*', MTP pattern='MM' with 2 depths. "
+            "This argument is kept only for loading old checkpoints.",
+            args.rank,
+        )
+
+    # Backward compatibility: convert legacy mtp_hybrid_override_pattern to unified format
+    from megatron.core.ssm.mamba_hybrid_layer_allocation import Symbols, parse_hybrid_pattern
+    sep = Symbols.MTP_SEPARATOR
+    if (
+        getattr(args, 'mtp_hybrid_override_pattern', None) is not None
+        and args.mtp_num_layers is not None
+        and args.mtp_num_layers > 0
+        and (args.hybrid_override_pattern is None or sep not in args.hybrid_override_pattern)
+    ):
+        main_pattern = args.hybrid_override_pattern or ''
+        mtp_pattern = args.mtp_hybrid_override_pattern
+        args.hybrid_override_pattern = main_pattern + sep + sep.join([mtp_pattern] * args.mtp_num_layers)
+        args.mtp_hybrid_override_pattern = None
+        print_rank_0(f"Converted legacy MTP pattern to unified: {args.hybrid_override_pattern}")
+
+    # Infer mtp_num_layers from unified pattern
+    if args.hybrid_override_pattern and sep in args.hybrid_override_pattern:
+        parsed = parse_hybrid_pattern(args.hybrid_override_pattern)
+        if parsed.mtp_pattern and parsed.mtp_num_depths > 0:
+            inferred_mtp_num_layers = parsed.mtp_num_depths
+            if args.mtp_num_layers is None:
+                args.mtp_num_layers = inferred_mtp_num_layers
+            elif args.mtp_num_layers != inferred_mtp_num_layers:
+                warn_rank_0(
+                    f"--mtp-num-layers ({args.mtp_num_layers}) conflicts with "
+                    f"MTP depth count ({inferred_mtp_num_layers}) in pattern '{args.hybrid_override_pattern}'. "
+                    f"Using the inferred value ({inferred_mtp_num_layers}).",
+                    args.rank
+                )
+                args.mtp_num_layers = inferred_mtp_num_layers
+
+    # MTP validation
+    if args.mtp_num_layers:
+        assert not args.use_legacy_models, "The legacy Megatron models does not support Multi-Token Prediction (MTP)."
+        assert args.position_embedding_type == "rope" or args.position_embedding_type == "none", (
+            f"Multi-Token Prediction (MTP) is not supported with {args.position_embedding_type} position embedding type."
+            + f"The supported position embedding types are rope and none."
+        )
+
+    # Validate MTP args for hybrid vs non-hybrid models
+    if args.is_hybrid_model:
+        # Mamba/hybrid model MTP validation
+        if args.mtp_num_layers and not (args.hybrid_override_pattern and sep in args.hybrid_override_pattern):
+            # Hybrid model wants MTP but no unified pattern - check for legacy args
+            if args.mtp_hybrid_override_pattern is None:
+                warn_rank_0(
+                    "Hybrid model with --mtp-num-layers but no MTP pattern. "
+                    "Use unified --hybrid-override-pattern with '/' separator (e.g., 'M*M*/MM/MM') "
+                    "or legacy --mtp-hybrid-override-pattern for old checkpoints.",
+                    args.rank
+                )
+    else:
+        # Non-hybrid (GPT) model MTP validation
+        if args.mtp_hybrid_override_pattern is not None:
+            warn_rank_0(
+                "--mtp-hybrid-override-pattern is for Mamba/hybrid models only. "
+                "For GPT models, MTP replicates the main transformer layer structure. "
+                "This argument will be ignored.",
+                args.rank
+            )
+    # === End of MTP validation ===
+    
     # Uneven virtual pipeline parallelism
     assert (
         int(args.num_layers_per_virtual_pipeline_stage is not None)
@@ -1448,13 +1526,10 @@ def _add_inference_args(parser):
                        dest='use_legacy_static_engine')
     group.add_argument('--inference-max-requests', type=int, default=8,
                        help='Maximum number of requests for inference.',
-                       dest='inference_max_batch_size')
+                       dest='inference_max_requests')
     group.add_argument('--inference-max-seq-length', type=int, default=2560,
                        help='Maximum sequence length expected for inference (prefill + decode).',
                        dest='inference_max_seq_length')
-    group.add_argument('--inference-max-batch-size', type=int, default=None,
-                       help='Maximum batch size for inference.',
-                       dest='inference_max_batch_size')
     group.add_argument('--inference-dynamic-batching',
                        action='store_true', default=False,
                        help='Enable dynamic batching mode.')
@@ -1510,15 +1585,10 @@ def _add_inference_args(parser):
                        '1) allocate `memory_buffer` in unified memory. '
                        'Eventually, additional levels will be included to '
                        'control other tensors within the context.')
-    group.add_argument('--nccl-all-reduce-for-prefill',
-                       action='store_true', default=False,
-                       help='When using symmeric all reduce kernels this will use regular nccl kernels for prefill. This can be more effecient when prefill is large as the nccl kernels can be more bandwith optimized')
     # TODO(ksanthanam): Clean this up in future PR
-    group.add_argument('--enable-chunked-prefill', dest='disable_chunked_prefill',
-                       action='store_false', default=True,
+    group.add_argument('--enable-chunked-prefill', dest='enable_chunked_prefill',
+                       action='store_true', default=False,
                        help="Enable chunked prefill (disabled by default)")
-    group.add_argument('--disable-chunked-prefill', dest='disable_chunked_prefill',
-                       action='store_true', help=argparse.SUPPRESS)
     group.add_argument('--inference-dynamic-batching-cuda-graph-max-tokens',
                        type=int, default=16384,
                        help='Maximum number of tokens to capture in a cuda graph.')
@@ -1974,9 +2044,10 @@ def _add_rl_args(parser):
         required=False,
         default=False,
         help=(
-            'When using a separate RL inference model with UVM-enabled parameters, prefetch its weights '
-            'to CPU when not doing rollout inference, and prefetch back to GPU right before inference. '
-            'Requires --rl-inference-model-unified-memory-level=1.'
+            'When using a separate RL inference model, offload its weights to CPU when not doing rollout '
+            'inference, and restore to GPU right before inference. Works with two backends: '
+            '1) UVM (when --rl-inference-model-unified-memory-level=1), or '
+            '2) torch_memory_saver (when UVM is not enabled; requires torch_memory_saver to be installed).'
         ),
     )
     group.add_argument('--refit-method', type=str, default='gloo',
@@ -2019,9 +2090,6 @@ def _add_training_args(parser):
                        dest='check_for_large_grads')
     group.add_argument('--result-rejected-tracker-filename', type=str, default=None,
                        help='Optional name of file tracking `result_rejected` events.')
-    group.add_argument('--disable-gloo-process-groups', action='store_false',
-                       dest='enable_gloo_process_groups',
-                       help='Disables creation and usage of Gloo process groups.')
     group.add_argument('--tp-comm-overlap-cfg', type=str, default=None,
                        help='Config file when tp_comm_overlap is enabled.')
 
@@ -2094,10 +2162,6 @@ def _add_training_args(parser):
                        '--use-legacy-models to not use core models.')
     group.add_argument('--use-legacy-models', action='store_true',
                        help='Use the legacy Megatron models, not Megatron-Core models.')
-    group.add_argument('--high-priority-stream-groups', nargs='*', type=str, default=[],
-                       help='The communicator group names to use high priority streams.')
-    group.add_argument('--disable-jit-fuser', action='store_true',
-                       help='Disable the JIT fuser.')
 
     return parser
 
@@ -2206,7 +2270,10 @@ def _add_mixed_precision_args(parser):
 
 
 def _add_distributed_args(parser):
-    group = parser.add_argument_group(title='distributed')
+    from megatron.training.common_config import DistributedInitConfig
+
+    dist_init_factory = ArgumentGroupFactory(DistributedInitConfig)
+    group = dist_init_factory.build_group(parser, "distributed init")
 
     group.add_argument('--decoder-first-pipeline-num-layers',
                        type=int, default=None,
@@ -2234,20 +2301,8 @@ def _add_distributed_args(parser):
     group.add_argument('--no-overlap-p2p-communication', action='store_false',
                        help='overlap pipeline parallel communication with forward and backward chunks in 1F1B',
                        dest='overlap_p2p_comm')
-    group.add_argument('--distributed-backend', default='nccl',
-                       choices=['nccl', 'gloo'],
-                       help='Which backend to use for distributed training.')
-    group.add_argument('--distributed-timeout-minutes', type=int, default=10,
-                       help='Default timeout minutes for torch.distributed.')
-    group.add_argument('--distributed-timeout-seconds-after-init', type=int, default=None,
-                       help='Timeout seconds for process groups after initialization.'
-                            'This timeout is applied to all process groups after initialization.')
     group.add_argument('--overlap-grad-reduce', action='store_true',
                        default=False, help='If set, overlap DDP grad reduce.')
-    group.add_argument('--no-align-grad-reduce', action='store_false',
-                       help='If not set, all PP stages will launch gradient reduces simultaneously. '
-                       'Otherwise, each PP stage will independently launch as needed.',
-                       dest='align_grad_reduce')
     group.add_argument('--ddp-num-buckets', type=int, default=None,
                        help='Number of buckets for data-parallel communication')
     group.add_argument('--ddp-bucket-size', type=int, default=None,
@@ -2274,14 +2329,6 @@ def _add_distributed_args(parser):
     group.add_argument('--no-scatter-gather-tensors-in-pipeline', action='store_false',
                        help='If not set, use scatter/gather to optimize communication of tensors in pipeline.',
                        dest='scatter_gather_tensors_in_pipeline')
-    group.add_argument('--local-rank', type=int, default=int(os.getenv('LOCAL_RANK', '0')),
-                       help='local rank passed from distributed launcher.')
-    group.add_argument('--lazy-mpu-init', type=bool, required=False,
-                       help='If set to True, initialize_megatron() '
-                       'skips DDP initialization and returns function to '
-                       'complete it instead. Also turns on '
-                       '--use-cpu-initialization flag. This is for '
-                       'external DDP manager.' )
     group.add_argument('--use-distributed-optimizer', action='store_true',
                        help='Use distributed optimizer.')
     group.add_argument('--use-nccl-ub', action='store_true', dest='nccl_ub',
@@ -2294,18 +2341,9 @@ def _add_distributed_args(parser):
     group.add_argument('--fsdp-manual-registration', action='store_true', dest='fsdp_manual_registration',
                        default=False, help='Manually register the FSDP communication buffers to NCCL user buffer.'
                        'This option is only effective when use-megatron-fsdp and use-nccl-ub is set.')
-    group.add_argument('--use-sharp', action='store_true', 
-                       help='Required to enable SHARP communication.')
-    group.add_argument('--sharp-enabled-group', type=str, default=None,
-                       choices=['dp', 'dp_replica'],
-                       help='IB SHARP can be enabled from only one communication group. '
-                       'By default, it is enabled from dp group. '
-                       'Available options: [dp, dp_replica]')
     group.add_argument('--create-all-gather-group', action='store_true',
                    help='Create a separate process group for all-gather operations '
                    'to overlap reduce-scatter and all-gather operations.')
-    group.add_argument('--use-megatron-fsdp', action='store_true',
-                       help='Use the Megatron FSDP code path in DDP.')
     group.add_argument('--data-parallel-sharding-strategy', type=str, default='no_shard',
                        choices=['no_shard', 'optim', 'optim_grads', 'optim_grads_params'],
                        help='Sharding strategy of data parallelism.')
@@ -2334,9 +2372,6 @@ def _add_distributed_args(parser):
                        help='If set, enable full sharding in megatron-fsdp Hybrid Sharded Data Parallel (HSDP) mode.')
     group.add_argument('--num-distributed-optimizer-instances', type=int, default=1,
                        help='Number of Distributed Optimizer copies across Data Parallel domain.')
-    group.add_argument('--use-torch-fsdp2', action='store_true',
-                       help='Use the torch FSDP2 implementation. FSDP2 has not been tested with pipeline parallelism, '
-                       'and may contain bugs.')
     group.add_argument('--torch-fsdp2-no-reshard-after-forward', action='store_false', dest='torch_fsdp2_reshard_after_forward',
                        help='Whether to reshard weights after forward pass when using PyTorch FSDP2. '
                        'Set to enable FSDP ZeRO-2.')
@@ -2346,14 +2381,6 @@ def _add_distributed_args(parser):
                        'all layers will share the same communication type. Users can also '
                        'specify separated types for each layer like '
                        '--cp-comm-type p2p p2p a2a a2a a2a+p2p a2a+p2p')
-    group.add_argument('--nccl-communicator-config-path', type=str, default=None,
-                       help='Path to the yaml file with NCCL communicator '
-                       'configurations. The number of min/max thread groups and thread '
-                       'group cluster size of each communicator can be configured by '
-                       'setting `min_ctas`, `max_ctas`, and `cga_cluster_size`.')
-    group.add_argument('--use-tp-pp-dp-mapping', action='store_true', default=False,
-                        help='If set, distributed ranks initialize order is changed '
-                        'from tp-cp-ep-dp-pp to tp-cp-ep-pp-dp.')
     group.add_argument('--fake-process-group', action='store_true', default=False,
                        help='If set, initialize with fake distributed process group and all distributed communication operations will be skipped. \
                        This is quite useful for profiling memory usage of distributed training with just one GPU. \
@@ -2716,10 +2743,6 @@ def _add_moe_args(parser):
     group.add_argument('--moe-upcycling-granularity', type=int, default=1,
                        help='This param sepecifics how many times smaller is the expert hidden size compared with the original dense FFN hidden size. '
                        'For using granular upcycling strategy, please set this param as a positive integer. If this param is set to 1, it means using the default upcycling strategy.')
-    group.add_argument('--moe-pad-experts-for-cuda-graph-inference', action='store_true',
-                       help="some MoE routers have a D2H sync that will break cuda graphs.  If this flag is set the router will switch" \
-                       " to dropping and padding during decode time which does not have a D2H sync. The capacity factor is set to the" \
-                       " max that an expert could see during inference so no tokens are actually dropped.")
     return parser
 
 def _add_mla_args(parser):
