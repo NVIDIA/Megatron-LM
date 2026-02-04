@@ -6,6 +6,7 @@ import numpy as np
 
 nemotron_h_aligned_custom_template = """{% for message in messages %}{% if message['role'] == 'system' %}{{ '<SPECIAL_10>System\n' + message['content'].strip() + '\n' }}{% elif message['role'] == 'user' %}{{ '<SPECIAL_11>User\n' + message['content'].strip() + '\n' + '<SPECIAL_11>Assistant\n' }}{% elif message['role'] == 'assistant' %}{{ message['content'].strip() + '\n' }}{% endif %}{% endfor %}"""
 nemotron_nano_v2_custom_template = """{% for message in messages %}{% set content = message['content'] %}{% if message['role'] == 'system' %}{{ '<SPECIAL_10>System\n' + content.replace('/think', '').replace('/no_think', '').strip() + '\n' }}{% elif message['role'] == 'user' %}{{ '<SPECIAL_11>User\n' + content.replace('/think', '').replace('/no_think', '').strip() + '\n' }}{% elif message['role'] == 'assistant' %}{{ '<SPECIAL_11>Assistant\n' + content.strip() + '\n<SPECIAL_12>\n' }}{% endif %}{% endfor %}"""
+identity_template = """{% for message in messages %}{{ message['content'] }}{% endfor %}"""
 
 from megatron.core.datasets.megatron_tokenizer import MegatronLegacyTokenizer
 from megatron.training.datasets.sft_dataset import IGNORE_INDEX
@@ -61,6 +62,14 @@ class SFTTokenizer(MegatronLegacyTokenizer):
         elif prompt_format == "identity":
             self._prompt_config = PromptConfig(
                 assistant_prefix_len=0,
+                pad_token_id=tokenizer.convert_tokens_to_ids("<unk>"),
+                custom_chat_template=dentity_template,
+                has_bos=False,
+                has_system_role=True,
+            )
+        elif prompt_format == "default":
+            self._prompt_config = PromptConfig(
+                assistant_prefix_len=0,
                 pad_token_id=tokenizer.pad_token_id if tokenizer.pad_token_id is not None else tokenizer.eos_token_id,
                 custom_chat_template=tokenizer.chat_template,
                 has_bos=tokenizer.bos_token_id is not None,
@@ -106,7 +115,9 @@ class SFTTokenizer(MegatronLegacyTokenizer):
 
         target = tokens.copy()
 
-        if self._prompt_format == "identity":
+        # When using the default prompt format, we do not replace any tokens with IGNORE_INDEX.
+        # Instead, all token losses will be used for simplicity.
+        if self._prompt_format == "default":
             return tokens, target
 
         # Mask system and user tokens in the target.
@@ -116,7 +127,7 @@ class SFTTokenizer(MegatronLegacyTokenizer):
             if turn["role"].lower() == "assistant" and len(turn["content"]) == 0:
                 raise ValueError(f"empty assistant turn in conversation: {conversation}.")
             if turn["role"].lower() == "assistant":
-                assert conversation[turn_idx-1]["role"].lower() == "user"
+                assert conversation[turn_idx-1]["role"].lower() in ("user", "tool")
 
             turn_tokens = self._tokenizer.apply_chat_template(
                 [turn], tokenize=True, chat_template=self._prompt_config.custom_chat_template
