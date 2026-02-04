@@ -70,7 +70,8 @@ MODEL_ARGS:
   # Add checkpointing args
   --load: ${CHECKPOINT_LOAD_PATH}
   --save: ${CHECKPOINT_SAVE_PATH}
-  --save-interval: 1000
+  --save-interval: 5000
+  --save-retain-interval: 2500
   # Add initialization args
   --init-method-std: 0.0134
   # Add logging args
@@ -83,6 +84,7 @@ MODEL_ARGS:
   --log-interval: 100
   --tensorboard-dir: ${TENSORBOARD_PATH}
   --wandb-project: megatron-core-release-runs
+  --wandb-entity: adlr
   --wandb-exp-name: ${WANDB_EXPERIMENT}
   # Add mixed precision args
   --bf16: true
