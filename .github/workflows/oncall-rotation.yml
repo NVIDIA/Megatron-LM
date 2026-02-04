@@ -45,7 +45,7 @@ jobs:
           # Slack token for updating the Slack usergroup
           SLACK_TOKEN: ${{ secrets.ONCALL_SLACK_TOKEN }}
         run: |
-          pip install --no-cache-dir "uv!=0.9.29"
+          pip install --no-cache-dir "uv<0.9.29"
           uv venv .venv
           uv cache clean
           uv sync --no-cache 
