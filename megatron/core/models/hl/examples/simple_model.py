@@ -10,14 +10,14 @@ This example demonstrates:
 - Simple layer pattern without pipeline stages
 - Dense MLP layers (no MoE)
 - Basic parallelism configuration (TP=8, SP enabled)
-- CommonConfig for shared settings with per-layer overrides
+- LayerConfig for shared settings with per-layer overrides
 """
 
 from megatron.core.models.hl import (
     AttentionLayerConfig,
-    CommonConfig,
     EmbeddingLayerConfig,
     HLModel,
+    LayerConfig,
     MLPLayerConfig,
 )
 
@@ -26,7 +26,7 @@ from megatron.core.models.hl import (
 # =============================================================================
 
 # Shared settings inherited by all layers (can be overridden per-layer)
-common_config = CommonConfig(
+common_config = LayerConfig(
     hidden_size=4096, bf16=True, tensor_model_parallel_size=8, sequence_parallel=True
 )
 
