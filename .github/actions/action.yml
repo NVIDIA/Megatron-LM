@@ -117,8 +117,10 @@ runs:
         export PYTHONPATH=$(pwd)
         export NEMORUN_HOME=$(pwd)
         export NCCL_DEBUG=INFO
-        pip install --no-cache-dir uv
-        uv sync --only-group test
+        pip install --no-cache-dir "uv!=0.9.29"
+        uv venv .venv
+        uv cache clean
+        uv sync --no-cache --only-group test
         uv run python tests/test_utils/python_scripts/launch_nemo_run_workload.py \
           --scope unit-tests \
           --model unit-tests \
@@ -197,8 +199,10 @@ runs:
 
         export PYTHONPATH=$(pwd)
         export NEMORUN_HOME=$(pwd)
-        pip install --no-cache-dir uv
-        uv sync --only-group test
+        pip install --no-cache-dir "uv!=0.9.29"
+        uv venv .venv
+        uv cache clean
+        uv sync --no-cache --only-group test
         uv run python tests/test_utils/python_scripts/launch_nemo_run_workload.py \
           ${ARGS[@]} \
           --model ${{ inputs.model }} \
