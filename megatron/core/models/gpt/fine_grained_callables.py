@@ -72,9 +72,9 @@ def should_free_input(name, is_moe, config, num_local_experts):
     # The input and output of A2A are not needed anymore after the forward pass,
     # so we can free the input memory after the forward pass.
 
-    # When fp8 is enabled, the casted tensors are saved and the original bf16 tensors
-    # are safe to be freed.
-    free_mlp = config.fp8 is not None
+    # When low precision fp8/4 is enabled, the casted tensors are saved and the
+    # original bf16 tensors are safe to be freed.
+    free_mlp = config.fp8 is not None or config.fp4 is not None
     if not free_mlp:
         # AlltoAll dispatcher with local_num_experts=1 and HybridEP both use identity
         # operation for `dispatch_postprocess`, hence the mlp inputs will be directly
