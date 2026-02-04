@@ -1075,17 +1075,17 @@ class TransformerConfig(ModelParallelConfig):
                 "(moe_expert_capacity_factor=None and moe_router_padding_for_quantization=False). "
             )
 
-        if self.transformer_impl == "inference_optimized" and self.num_moe_experts is not None:
-            if not self.moe_permute_fusion:
-                raise ValueError(
-                    "Inference-optimized MoE layers require moe_permute_fusion=True "
-                    "to use TE fused kernels that support GPU-resident metadata."
-                )
-            # if not self.moe_router_fusion:
-            #     raise ValueError(
-            #         "Inference-optimized MoE layers require moe_router_fusion=True "
-            #         "to use TE fused router kernels."
-            #     )
+        # if self.transformer_impl == "inference_optimized" and self.num_moe_experts is not None:
+        #     if not self.moe_permute_fusion:
+        #         raise ValueError(
+        #             "Inference-optimized MoE layers require moe_permute_fusion=True "
+        #             "to use TE fused kernels that support GPU-resident metadata."
+        #         )
+        #     # if not self.moe_router_fusion:
+        #     #     raise ValueError(
+        #     #         "Inference-optimized MoE layers require moe_router_fusion=True "
+        #     #         "to use TE fused router kernels."
+        #     #     )
 
         if self.num_moe_experts is not None and self.num_moe_experts <= 0:
             raise ValueError("num_moe_experts must be non-negative.")
