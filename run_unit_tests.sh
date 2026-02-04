@@ -4,7 +4,7 @@ set -x
 
 # Install mock for unit tests
 pip install mock
-
+chmod +x run_unit_tests_bucketed.sh
 BUCKETS=(
     "tests/unit_tests/data/"
     "tests/unit_tests/dist_checkpointing/*.py"
