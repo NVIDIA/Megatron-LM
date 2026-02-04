@@ -167,10 +167,11 @@ class LLaVAModel(MegatronModule):
                     language_transformer_layer_spec.submodules.self_attention.submodules,
                     SelfAttentionSubmodules,
                 )
+                attn_submodules = (
+                    language_transformer_layer_spec.submodules.self_attention.submodules
+                )
                 assert (
-                    language_transformer_layer_spec.submodules.self_attention.submodules.core_attention
-                    == TEDotProductAttention
-                    and HAVE_TE
+                    attn_submodules.core_attention == TEDotProductAttention and HAVE_TE
                 ), "Sequence/Context Parallelism is supported only with TE DotProductAttention."
             if self.context_parallel_lm > 1:
                 self.cp_group = self.pg_collection.cp
