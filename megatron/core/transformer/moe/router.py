@@ -693,12 +693,10 @@ class InferenceTopKRouter(TopKRouter):
         assert (
             config.moe_router_num_groups is None
         ), f"InferenceTopKRouter requires moe_router_num_groups=None, got {config.moe_router_num_groups}"
-        assert (
-            config.moe_router_score_function == "sigmoid"
-        ), f"InferenceTopKRouter requires moe_router_score_function='sigmoid', got '{config.moe_router_score_function}'"
-        assert (
-            config.moe_router_enable_expert_bias is True
-        ), f"InferenceTopKRouter requires moe_router_enable_expert_bias=True, got {config.moe_router_enable_expert_bias}"
+        assert config.moe_router_score_function in [
+            "sigmoid",
+            "softmax",
+        ], f"InferenceTopKRouter requires moe_router_score_function in ['sigmoid', 'softmax'], got '{config.moe_router_score_function}'"
 
         super().__init__(config=config, pg_collection=pg_collection)
 
@@ -707,19 +705,28 @@ class InferenceTopKRouter(TopKRouter):
     def set_is_cuda_graphed_iteration(self, set_to: bool):
         self.is_cuda_graphed_iteration = set_to
 
+    @torch.compile()
     def _forward(self, input: torch.Tensor, padding_mask: Optional[torch.Tensor] = None):
         logits = self.gating(input)  # [num_tokens, num_experts]
 
-        # Apply sigmoid to get independent scores per expert
-        scores = torch.sigmoid(logits.float()).type_as(logits)  # [num_tokens, num_experts]
+        # Apply score function to get scores per expert
+        if self.score_function == "sigmoid":
+            # Sigmoid: independent scores per expert
+            scores = torch.sigmoid(logits.float()).type_as(logits)  # [num_tokens, num_experts]
+        else:  # softmax
+            # Softmax: normalized scores across all experts
+            scores = torch.softmax(logits.float(), dim=-1).type_as(logits)  # [num_tokens, num_experts]
 
-        # Add expert bias for topk selection (helps with load balancing)
-        scores_for_routing = scores + self.expert_bias  # [num_experts] broadcasted
+        # Add expert bias for topk selection if enabled (helps with load balancing)
+        if self.expert_bias is not None:
+            scores_for_routing = scores + self.expert_bias  # [num_experts] broadcasted
+        else:
+            scores_for_routing = scores
 
-        # Select top-k experts based on biased scores
+        # Select top-k experts based on scores (with or without bias)
         _, topk_indices = torch.topk(scores_for_routing, k=self.topk, dim=-1)  # [num_tokens, topk]
 
-        # Gather the original sigmoid scores (without bias) for selected experts
+        # Gather the original scores (without bias) for selected experts
         topk_probs = torch.gather(scores, dim=-1, index=topk_indices)  # [num_tokens, topk]
 
         # Normalize to get routing probabilities (sum to 1 per token)
