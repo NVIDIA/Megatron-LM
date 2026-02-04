@@ -1394,7 +1394,11 @@ class TEDotProductAttention(te.pytorch.DotProductAttention):
                 #  need to change mask type for SWA inference decode stage.
                 attn_mask_type = AttnMaskType.causal_bottom_right
         if self.te_forward_mask_type:
+
+            print("qkv_format", qkv_format)
+
             if qkv_format == "thd" and is_te_min_version("1.7.0"):
+                print("set padding_causal", )
                 # thd format uses flash attention with cuDNN kernel which requires is_padding=True,
                 # so the only acceptable mask types are `padding_causal` and `padding`. These do not
                 # necessarily indicate there are padded tokens in the sequence.
@@ -1402,6 +1406,7 @@ class TEDotProductAttention(te.pytorch.DotProductAttention):
                     attn_mask_type = AttnMaskType.padding_causal
                 elif attn_mask_type == AttnMaskType.no_mask:
                     attn_mask_type = AttnMaskType.padding
+                print("set padding_causal", attn_mask_type, AttnMaskType.padding_causal)
             _fa_kwargs = dict(
                 attn_mask_type=attn_mask_type.name, **attention_bias_kwargs, **packed_seq_kwargs
             )
