@@ -9,7 +9,7 @@ import uuid
 from types import SimpleNamespace
 from typing import Any
 
-import regex as re
+import re
 
 from megatron.core.tokenizers.text.parsers.base_parser import BaseParser
 
