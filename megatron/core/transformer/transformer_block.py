@@ -606,16 +606,7 @@ class TransformerBlock(GraphableMegatronModule, MegatronModule):
                 if isinstance(kwargs['hidden_states'], WrappedTensor)
                 else kwargs['hidden_states']
             )
-            # dynamic_inference_decode_only is not a real argument to forward, it is only used
-            # to differentiate the cuda graph used for decode from the one used for non-decode
-            # inference.
-            dynamic_inference_decode_only = kwargs['inference_context'].is_decode_only()
-            # cudagraphmanager returns a singleton tuple, whereas the
-            # normal forward returns a tensor, therefore we need
-            # to extract the tensor from the tuple
-            return super().__call__(
-                *args, dynamic_inference_decode_only=dynamic_inference_decode_only, **kwargs
-            )[0]
+            return super().__call__(*args, **kwargs)[0]
         return super().__call__(*args, **kwargs)
 
     def forward(
