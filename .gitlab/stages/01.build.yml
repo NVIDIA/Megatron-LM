@@ -121,6 +121,7 @@ test:build_image:
     KUBERNETES_SERVICE_MEMORY_LIMIT: 90Gi
     SHARED_PATH: /builds/$CI_PROJECT_PATH/shared
   script:
+    - apk add skopeo
     - |
       set -x
 
