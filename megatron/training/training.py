@@ -1940,24 +1940,21 @@ def training_log(
             'rl/collect-rollouts',
             'rl/sync-rollouts',
             'rl/suspend-engine',
-            # Optimizer offload/onload (canonical names + legacy variants)
+            # Optimizer offload/restore
             'rl/offload-optimizer-before-inference',
-            'rl/onload-optimizer-after-inference',
-            'rl/offload-optimizer-state-and-grad-buffers-during-inference',
-            'rl/restore-optimizer-state-and-grad-buffers-after-inference',
-            'rl/onload-optimizer-state-and-grad-buffers-after-inference',
+            'rl/restore-optimizer-after-inference',
             'rl/offload-kv-cache-after-inference',
-            'rl/onload-kv-cache-before-inference',
-            # Fine-grained offload/onload breakdown
+            'rl/restore-kv-cache-before-inference',
+            # Fine-grained offload/restore breakdown
             'offload/cuda-synchronize',
             'offload/free-buffers',
             'offload/empty-cache',
-            'onload/allocate-buffers',
-            'onload/cuda-synchronize',
-            # Fine-grained onload timers (using nvtx_range)
-            'rl/onload/grad-buffers',
-            'rl/onload/optimizer-state',
-            'rl/onload/wait-for-transfers',
+            'restore/allocate-buffers',
+            'restore/cuda-synchronize',
+            # Fine-grained restore timers (using nvtx_range)
+            'rl/restore/grad-buffers',
+            'rl/restore/optimizer-state',
+            'rl/restore/wait-for-transfers',
             # Fine-grained offload timers (using nvtx_range)
             'rl/offload/grad-buffers',
             'rl/offload/optimizer-state',

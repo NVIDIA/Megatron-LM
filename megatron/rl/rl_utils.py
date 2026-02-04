@@ -530,7 +530,7 @@ def get_environment_rollouts(
     nvtx_range = get_nvtx_range()
 
     if args.rl_offload_optimizer_during_inference:
-        with nvtx_range("rl/offload-optimizer-state-and-grad-buffers-during-inference", time=True):
+        with nvtx_range("rl/offload-optimizer-before-inference", time=True):
             if not args.rl_training_cuda_graphs:
                 with nvtx_range("rl/offload/grad-buffers", time=True):
                     model[0].offload_grad_buffers()
@@ -615,7 +615,7 @@ def get_environment_rollouts(
         logger.debug(f"Got rollouts on rank {rank}")
 
     if args.rl_offload_optimizer_during_inference:
-        with nvtx_range("restore-optimizer-state-and-grad-buffers-after-inference", time=True):
+        with nvtx_range("rl/restore-optimizer-after-inference", time=True):
             with nvtx_range("rl/restore/grad-buffers", time=True):
                 model[0].restore_grad_buffers()
             with nvtx_range("rl/restore/optimizer-state", time=True):
@@ -1741,7 +1741,7 @@ def megatron_rl_inference_mode(
     with torch.no_grad():
 
         if offload_optimizer_during_inference:
-            with nvtx_range("offload-optimizer-state-and-grad-buffers-before-inference"):
+            with nvtx_range("rl/offload-optimizer-before-inference", time=True):
                 if not args.rl_training_cuda_graphs:
                     with nvtx_range("rl/offload/grad-buffers", time=True):
                         model[0].offload_grad_buffers()
@@ -1757,7 +1757,7 @@ def megatron_rl_inference_mode(
 
         inference_interface = get_inference_interface(args, loop, model)
 
-        with nvtx_range("rl/onload-kv-cache-before-inference", time=True):
+        with nvtx_range("rl/restore-kv-cache-before-inference", time=True):
             if offload_kv_cache_during_training:
                 # Restore the KV cache by re-binding physical pages to a consistent virtual address
                 torch_memory_saver.resume("kv_cache")
@@ -1811,10 +1811,10 @@ def megatron_rl_inference_mode(
             _maybe_prefetch_separate_inference_model_weights(model_core, to_cpu=True)
 
         if offload_optimizer_during_inference:
-            with nvtx_range("rl/onload-optimizer-state-and-grad-buffers-after-inference", time=True):
-                with nvtx_range("rl/restore/grad-buffers", time=True):
+            with nvtx_range("rl/onload-optimizer-after-inference", time=True):
+                with nvtx_range("rl/onload/grad-buffers", time=True):
                     model[0].restore_grad_buffers()
-                with nvtx_range("rl/restore/optimizer-state", time=True):
+                with nvtx_range("rl/onload/optimizer-state", time=True):
                     optimizer.restore_from_cpu()
 
         lang_module.train()

@@ -36,36 +36,6 @@ import torch.distributed as dist
 logger = logging.getLogger(__name__)
 
 
-# Timer name aliases - maps canonical names to all possible variants
-# This allows the profiling tools to work with runs using different naming conventions
-TIMER_ALIASES = {
-    "rl/offload-optimizer-before-inference": [
-        "rl/offload-optimizer-before-inference",
-        "rl/offload-optimizer-state-and-grad-buffers-during-inference",
-        "rl/offload-optimizer-state-and-grad-buffers-before-inference",
-    ],
-    "rl/onload-optimizer-after-inference": [
-        "rl/onload-optimizer-after-inference",
-        "rl/restore-optimizer-state-and-grad-buffers-after-inference",
-        "rl/onload-optimizer-state-and-grad-buffers-after-inference",
-    ],
-}
-
-def get_timer_value(data: dict, canonical_name: str, default=None):
-    """Get timer value trying all known aliases for a canonical name."""
-    aliases = TIMER_ALIASES.get(canonical_name, [canonical_name])
-    for alias in aliases:
-        if alias in data:
-            return data[alias]
-    return default
-
-def get_timer_value_tuple(data: dict, canonical_name: str, default=(0, 0)):
-    """Get timer (min, max) tuple trying all known aliases."""
-    aliases = TIMER_ALIASES.get(canonical_name, [canonical_name])
-    for alias in aliases:
-        if alias in data:
-            return data[alias]
-    return default
 
 # Timer names we care about for RL profiling (in hierarchical order)
 RL_TIMER_NAMES = [
@@ -83,17 +53,17 @@ RL_TIMER_NAMES = [
     "rl/suspend-engine",
     "rl/wait-for-decode-only",
     
-    # Optimizer offload/onload (canonical names)
+    # Optimizer offload/restore (canonical names)
     "rl/offload-optimizer-before-inference",
-    "rl/onload-optimizer-after-inference",
+    "rl/restore-optimizer-after-inference",
     "rl/offload-kv-cache-after-inference",
-    "rl/onload-kv-cache-before-inference",
-    # Fine-grained offload/onload breakdown (using nvtx_range)
+    "rl/restore-kv-cache-before-inference",
+    # Fine-grained offload/restore breakdown (using nvtx_range)
     "rl/offload/grad-buffers",
     "rl/offload/optimizer-state",
-    "rl/onload/grad-buffers",
-    "rl/onload/optimizer-state",
-    "rl/onload/wait-for-transfers",
+    "rl/restore/grad-buffers",
+    "rl/restore/optimizer-state",
+    "rl/restore/wait-for-transfers",
     
     # Weight prefetching
     "rl/prefetch-weights-to-gpu",
@@ -141,10 +111,10 @@ TIMER_HIERARCHY = {
         "rl/sync-rollouts",
         "rl/suspend-engine",
         "rl/offload-optimizer-before-inference",
-        "rl/onload-optimizer-after-inference",
+        "rl/restore-optimizer-after-inference",
         "rl/prefetch-weights-to-gpu",
         "rl/prefetch-weights-to-cpu",
-        "rl/onload-kv-cache-before-inference",
+        "rl/restore-kv-cache-before-inference",
         "rl/offload-kv-cache-after-inference",
     ],
     "rl/prepare-data-for-update": [
@@ -512,17 +482,17 @@ class RLProfiler:
         timers = profile.timers
         phases = {}
         
-        # Helper to get max time safely (supports timer aliases)
+        # Helper to get max time safely
         def get_max(name: str) -> float:
-            return get_timer_value_tuple(timers, name, (0, 0))[1]
+            return timers.get(name, (0, 0))[1]
         
         # Rollout generation (actual generation, not container)
         phases["rollout_generation"] = get_max("rl/collect-rollouts")
         
-        # Optimizer memory management (uses aliases for different name variants)
+        # Optimizer memory management
         phases["optimizer_offload"] = get_max("rl/offload-optimizer-before-inference")
-        phases["optimizer_onload"] = get_max("rl/onload-optimizer-after-inference")
-        phases["optimizer_memory_mgmt"] = phases["optimizer_offload"] + phases["optimizer_onload"]
+        phases["optimizer_restore"] = get_max("rl/restore-optimizer-after-inference")
+        phases["optimizer_memory_mgmt"] = phases["optimizer_offload"] + phases["optimizer_restore"]
         
         # Logprobs computation
         phases["logprobs_old"] = get_max("rl/compute-old-logprobs")
@@ -856,7 +826,7 @@ def analyze_bottlenecks(profile_path: str, top_n: int = 10) -> str:
         "Rollout Generation": ["rl/collect-rollouts"],
         "Optimizer Memory Mgmt": [
             "rl/offload-optimizer-before-inference",
-            "rl/onload-optimizer-after-inference",
+            "rl/restore-optimizer-after-inference",
         ],
         "Logprobs Computation": [
             "rl/compute-old-logprobs",
@@ -866,16 +836,8 @@ def analyze_bottlenecks(profile_path: str, top_n: int = 10) -> str:
         "Sync/Wait": ["rl/suspend-engine", "rl/sync-rollouts"],
     }
     
-    def get_stat_with_aliases(timer_name: str) -> float:
-        """Get mean_ms for a timer, trying all known aliases."""
-        aliases = TIMER_ALIASES.get(timer_name, [timer_name])
-        for alias in aliases:
-            if alias in stats:
-                return stats[alias].get("mean_ms", 0)
-        return 0
-    
     for phase_name, timer_list in phases.items():
-        total = sum(get_stat_with_aliases(t) for t in timer_list)
+        total = sum(stats.get(t, {}).get("mean_ms", 0) for t in timer_list)
         if total > 0:
             lines.append(f"  {phase_name:<40} {total:>7.1f}ms")
     
