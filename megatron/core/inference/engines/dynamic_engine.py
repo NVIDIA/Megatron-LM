@@ -851,6 +851,7 @@ class DynamicInferenceEngine(AbstractEngine):
                     # Request finished by normal means (termination_id, max_length, or stop word from previous step)
                     request.generated_length = len(request.generated_tokens)
                     request.status = Status.COMPLETED
+                    request.add_event_finish()
                     finished_entry = self.requests.pop(request_id)
                     finished_request = finished_entry.record[-1]
                     finished_request.generated_length = len(finished_request.generated_tokens)
@@ -1222,9 +1223,7 @@ class DynamicInferenceEngine(AbstractEngine):
                 newly_paused_request_ids = newly_paused_request_ids.tolist()
                 [self.get_request(i).add_event_pause() for i in newly_paused_request_ids]
 
-            # Mark requests finished.
-            [self.get_request(i).add_event_finish() for i in finished_request_ids.tolist()]
-            # Add finished events.
+            # Process finished requests (adds FINISH events and returns records).
             (active_request_ids, finished_request_records) = self.post_process_requests(
                 active_request_ids,
                 finished_request_ids,
