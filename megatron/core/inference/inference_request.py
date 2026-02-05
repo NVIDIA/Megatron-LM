@@ -287,12 +287,27 @@ class DynamicInferenceRequest(InferenceRequest):
 
         Returns:
             List[int]: List of token IDs in the order they were generated.
+
+        Note:
+            This property overrides the parent class's generated_tokens field.
+            The setter is provided to allow dataclass __init__ to work (it ignores
+            the value since tokens are computed from GENERATED_TOKEN events).
         """
         return [
             e.payload
             for e in self.events
             if e.type == DynamicInferenceEventType.GENERATED_TOKEN
         ]
+
+    @generated_tokens.setter
+    def generated_tokens(self, value) -> None:
+        """No-op setter to allow dataclass __init__ to work.
+
+        The parent class InferenceRequest has generated_tokens as a field, which
+        means dataclass __init__ tries to set it. This setter ignores the value
+        since generated_tokens is computed from GENERATED_TOKEN events.
+        """
+        pass  # Ignore - tokens are computed from events
 
     def __str__(self):
         return ", ".join(
