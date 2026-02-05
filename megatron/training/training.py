@@ -1942,7 +1942,7 @@ def training_log(
 
     # Log MoE metrics.
     if args.num_experts is not None:
-        moe_loss_scale = 1 / get_num_microbatches()
+        moe_loss_scale = 1 / get_num_microbatches() / args.chunked_pipeline_model_parallel_splits
         track_names = []
         if "aux_loss" in args.moe_router_load_balancing_type:
             track_names.append("load_balancing_loss")
@@ -1975,13 +1975,13 @@ def training_log(
 
     # Log MTP metrics.
     if args.mtp_num_layers is not None:
-        mtp_loss_scale = 1 / get_num_microbatches()
+        mtp_loss_scale = 1 / get_num_microbatches() / args.chunked_pipeline_model_parallel_splits
         MTPLossLoggingHelper.track_mtp_metrics(
             mtp_loss_scale, iteration, writer, wandb_writer, total_loss_dict
         )
     # Track sparse attention indexer loss.
     if args.dsa_indexer_loss_coeff is not None and args.dsa_indexer_loss_coeff > 0:
-        indexer_loss_scale = 1 / get_num_microbatches()
+        indexer_loss_scale = 1 / get_num_microbatches() / args.chunked_pipeline_model_parallel_splits
         DSAIndexerLossLoggingHelper.track_indexer_metrics(
             loss_scale=indexer_loss_scale,
             iteration=iteration,
