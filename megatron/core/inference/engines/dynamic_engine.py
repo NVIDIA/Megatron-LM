@@ -196,6 +196,8 @@ class DynamicInferenceEngine(AbstractEngine):
         
         self.context.num_speculative_tokens = num_speculative_tokens
         self.controller.num_speculative_tokens = num_speculative_tokens
+        # Initialize MTP sampling tensor now that num_speculative_tokens is set
+        self.controller._init_mtp_sampling_tensor()
 
         if enable_cuda_graph is not None:
             self.cuda_graph_impl = "local" if enable_cuda_graph else "none"
@@ -813,6 +815,7 @@ class DynamicInferenceEngine(AbstractEngine):
         evict_request_ids: torch.Tensor,
         step_time: float,
         sample: torch.Tensor,
+        accepted_tokens: torch.Tensor,
         log_probs: torch.Tensor,
         top_n_logprobs: Optional[Dict[int, List[Tuple[torch.Tensor, torch.Tensor]]]] = None,
     ) -> Tuple[List[DynamicInferenceRequest], List[DynamicInferenceRequest]]:
@@ -824,7 +827,8 @@ class DynamicInferenceEngine(AbstractEngine):
             finished_request_ids (torch.Tensor): A list of finished request ids
             evict_request_ids (torch.Tensor): A list of evicted request ids.
             step_time (float): The latency of the last step
-            sample: List[Tensor]: The newly generated tokens for each request (Will include speculative tokens as well)
+            sample: Tensor: The newly generated token for each request
+            accepted_tokens: Tensor: The additional accepted tokens for each request
             log_probs: (List): Log probs for each request
             top_n_logprobs: (Dict): Top-n log probs for each request. Maps request_idx to
                 list of (top_n_logprobs, top_n_indices) tuples.
@@ -841,18 +845,31 @@ class DynamicInferenceEngine(AbstractEngine):
 
         log_probs_iter = log_probs if log_probs else repeat(None)
 
-        for req_idx, (request_id, tokens, request_log_probs) in enumerate(
-            zip(request_ids.tolist(), sample.tolist(), log_probs_iter)
+        # When accepted_tokens is None (no speculative decoding), use repeat([]) to provide
+        # empty lists for each request, so the zip produces the correct number of iterations
+        accepted_tokens_iter = repeat([]) if accepted_tokens is None else accepted_tokens.tolist()
+
+        for req_idx, (request_id, tokens, accepted_tokens_list, request_log_probs) in enumerate(
+            zip(request_ids.tolist(), sample.tolist(), accepted_tokens_iter, log_probs_iter)
         ):
+
+            # Ensure tokens is always a list for consistent handling
+            if not isinstance(tokens, list):
+                tokens = [tokens]
+
+            if self.num_speculative_tokens > 0:
+                accepted_tokens = list(filter(lambda tok: tok != -1, accepted_tokens_list))
+                tokens = tokens + accepted_tokens
+            
             request: DynamicInferenceRequest = self.get_request(request_id)
             if request_id != self.context.chunked_prefill_request_id:
                 # Skip appending token for requests being finished due to stop words
                 # (they already have their final token from the previous step)
                 # If the request already has more tokens, then we only append as much as is necessary
-                if len(request.generated_tokens) + len(tokens) >= request.sampling_params.max_tokens:
-                    tokens = tokens[:request.sampling_params.max_tokens - len(request.generated_tokens)]
+                if len(request.generated_tokens) + len(tokens) >= request.sampling_params.num_tokens_to_generate:
+                    tokens = tokens[:request.sampling_params.num_tokens_to_generate - len(request.generated_tokens)]
                 if request_id not in self.stop_word_being_finished_ids:
-                    request.generated_tokens.append(tokens)
+                    request.generated_tokens += tokens
                     if request.tpot is None:
                         request.tpot = []
                     request.tpot.append(step_time)
@@ -1005,6 +1022,7 @@ class DynamicInferenceEngine(AbstractEngine):
         self.stop_word_finished_request_ids -= result
         return result
 
+    # TODO : We also might have to delete some tokens, if stop word hit in the middle (speculative case)
     def _check_stop_words_for_request_post_append(self, request: DynamicInferenceRequest) -> bool:
         """Check if a request should stop due to stop words (after token is appended).
 
@@ -1223,6 +1241,7 @@ class DynamicInferenceEngine(AbstractEngine):
             newly_paused_request_ids = step_result.get("newly_paused_request_ids")
             evict_request_ids = step_result.get("evict_request_ids")
             sample = step_result["sample"]
+            accepted_tokens = step_result["accepted_tokens"]
             log_probs = step_result["log_probs"]
             top_n_logprobs = step_result.get("top_n_logprobs", None)
             cuda_graph_request_count = step_result["cuda_graph_request_count"]
@@ -1241,6 +1260,7 @@ class DynamicInferenceEngine(AbstractEngine):
                 evict_request_ids,
                 step_time,
                 sample,
+                accepted_tokens,
                 log_probs,
                 top_n_logprobs,
             )

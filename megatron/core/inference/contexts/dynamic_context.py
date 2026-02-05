@@ -600,6 +600,7 @@ class DynamicInferenceContext(BaseInferenceContext):
         )
         # request_query_lengths is the input prompt tokens length during prefill phase (1st step) and then 1 for the decode phase (i.e During generation)
         self.request_query_lengths = torch.empty_like(self.request_ids)
+        self.request_in_prefill_status_tensor = torch.empty_like(self.request_ids)
         # request_output_lengths is len(input_prompt_tokens) + num_tokens_to_generate
         self.request_output_lengths = torch.empty_like(self.request_ids)
         # request_kv_length_offsets is the same as query length during prefill phase (1st step) and then 1 for the decode phase (i.e During generation)
@@ -1153,6 +1154,7 @@ class DynamicInferenceContext(BaseInferenceContext):
 
         self.request_ids[request_slice] = request_ids_tensor
         self.request_query_lengths[request_slice] = lengths_tensor
+        self.request_in_prefill_status_tensor[request_slice] = 1
         self.request_output_lengths[request_slice] = lengths_tensor + tokens_to_generate_tensor
         self.request_kv_length_offsets[request_slice] = 0
         self.request_kv_block_counts[request_slice] = block_counts
@@ -1442,6 +1444,7 @@ class DynamicInferenceContext(BaseInferenceContext):
         self.request_last_kv_block_id.fill_(-1)
         self.request_last_kv_block_offset.fill_(0)
         self.request_to_kv_block_ids.fill_(-1)
+        self.request_in_prefill_status_tensor.fill_(-1)
 
         # Reset request metadata.
         for metadata_tensor in self.request_metadata.values():
@@ -1487,8 +1490,7 @@ class DynamicInferenceContext(BaseInferenceContext):
             self.token_to_input_ids[:num_tokens].unsqueeze(0),
             self.token_to_pos_ids[:num_tokens].unsqueeze(0),
         )
-
-    # TODO SHAN : Should do verification here for speculative tokens and get the indices. 
+ 
     def last_token_logits(self, logits: Tensor, mtp_logits: Optional[Tensor] = None) -> Tensor:
         """Last tokens of logits.
 
@@ -1616,6 +1618,7 @@ class DynamicInferenceContext(BaseInferenceContext):
 
         # Handle length and block assignments.
         self.request_query_lengths[current_id] = chunk_length
+        self.request_in_prefill_status_tensor[current_id] = 1
         self.request_output_lengths[current_id] = (
             req.finished_chunk_token_count
             + chunk_length
@@ -1678,12 +1681,12 @@ class DynamicInferenceContext(BaseInferenceContext):
         Move all the relevent booking tensors with src idxs to dst idxs
         """
         self.request_kv_length_offsets[dst_idxs] = self.request_kv_length_offsets[src_idxs]
+        self.request_in_prefill_status_tensor[dst_idxs] = self.request_in_prefill_status_tensor[src_idxs]
         self.request_query_lengths[dst_idxs] = self.request_query_lengths[src_idxs]
         self.request_output_lengths[dst_idxs] = self.request_output_lengths[src_idxs]
         self.request_ids[dst_idxs] = self.request_ids[src_idxs]
-        next_tokens[dst_idxs] = next_tokens[src_idxs]
+        next_tokens[dst_idxs] = next_tokens[src_idxs] # num tokens sames as num samples
         if new_speculative_tokens is not None:
-            # Handle multi-token next_tokens: shape [num_speculative_tokens, total_request_count]
             new_speculative_tokens[:, dst_idxs] = new_speculative_tokens[:, src_idxs]
         self.request_to_kv_block_ids[dst_idxs] = self.request_to_kv_block_ids[src_idxs]
         self.request_kv_block_counts[dst_idxs] = self.request_kv_block_counts[src_idxs]
@@ -1704,6 +1707,7 @@ class DynamicInferenceContext(BaseInferenceContext):
         """
         tensor_swap(self.request_kv_length_offsets, src_idxs, dst_idxs)
         tensor_swap(self.request_query_lengths, src_idxs, dst_idxs)
+        tensor_swap(self.request_in_prefill_status_tensor, src_idxs, dst_idxs)
         tensor_swap(self.request_output_lengths, src_idxs, dst_idxs)
         tensor_swap(self.request_ids, src_idxs, dst_idxs)
         tensor_swap(next_tokens, src_idxs, dst_idxs)
@@ -1937,6 +1941,7 @@ class DynamicInferenceContext(BaseInferenceContext):
 
         return evict_request_ids
 
+
     def update_requests(self, active_requests_mask: Tensor, new_tokens: Tensor, new_speculative_tokens: Tensor = None) -> Tensor:
         """Update context state after calling engine.step().
 
@@ -1982,11 +1987,23 @@ class DynamicInferenceContext(BaseInferenceContext):
         # active_request_count -> This corresponds to requests that have not reached EOD or max length
         # finished_request_count are requests that have reached the termination criterion
 
+
+            # new_tokens :       [ b4 , c4,   a6] 
+            # actgive_requesT_mask [ 0   1    0 ]
+            #                      [1  0  0 ]
+            # new_spec_Tokens : [ [b4s1, c4s1, a6s1], 
+            #                     [b4s2, c4s2, a6s2]]
+
+            ## Vijay : [b4 b4s1, b4s2, c4 , c4s1, c4s2, a6 , a6s1, a6s2]
+            # 
         self.num_prefill_requests = 0  # all turns to decode
+        # All request that were in prefill become decode requests
+        self.request_in_prefill_status_tensor[self.request_in_prefill_status_tensor == 1] = 0 # TODO : Check how this works with chunked prefill
         if self.chunked_prefill_request_id != -1:
             active_requests_mask[-1] = (
                 1  # must keep this, next iteration will add a new chunk to it
             )
+
 
         active_request_count = (active_requests_mask == 1).sum().item()
         finished_request_count = (active_requests_mask == 0).sum().item()
@@ -2156,7 +2173,6 @@ class DynamicInferenceContext(BaseInferenceContext):
 
         # 6.d. Swap the chunked prefill request to the end of the active requests
         # to obey the invariance.
-        # SHAN : Should check this
         if self.chunked_prefill_request_id != -1:
             self._swap_book_keeping_tensors(
                 src_idxs=torch.tensor([self.get_index_of_chunked_prefill_request()]),
@@ -2190,33 +2206,43 @@ class DynamicInferenceContext(BaseInferenceContext):
         sampled_tokens = next_tokens[
             self.paused_request_count : self.total_request_count
         ]
-        sampled_speculative_tokens = new_speculative_tokens[
-            self.paused_request_count : self.total_request_count
-        ]
-        next_tokens = torch.vstack([sampled_tokens, sampled_speculative_tokens]).T.reshape(-1) # This will insert the speculative tokens after the sampled tokens
+        if self.num_speculative_tokens > 0:
+            # new_speculative_tokens has shape [num_spec_tokens, num_requests], slice the request dimension (dim 1)
+            sampled_speculative_tokens = new_speculative_tokens[
+                :, self.paused_request_count : self.total_request_count
+            ]
 
+            next_tokens = torch.vstack([sampled_tokens.unsqueeze(0), sampled_speculative_tokens]).T.reshape(-1)# 
+        
+        else:
+            next_tokens = sampled_tokens
+            
         self.token_to_input_ids[: self.active_token_count] = next_tokens
 
         # kv length offsets will tell the sequence length (query + generated_tokens) (During add request alone its 0) (It tells how many tokens there are in kv cache)
         self.token_to_pos_ids[: self.active_token_count] = self.request_kv_length_offsets[
             self.paused_request_count : self.total_request_count
-        ].repeate_interleave(1 + self.num_speculative_tokens) + torch.arange(1 + self.num_speculative_tokens).repeat(active_request_count)
+        ].repeat_interleave(1 + self.num_speculative_tokens) + torch.arange(1 + self.num_speculative_tokens, device=torch.cuda.current_device()).repeat(active_request_count)
+        #
 
-        # 8. We make relevant changes to the token bookkeeping tensors
+        # 8. We make relevant changes to the token bookkeeping tensors [1 2 3]  [1 1 1 2 2 2 ]
         self.token_to_request_idx[: self.active_token_count] = torch.arange(
             self.paused_request_count, self.total_request_count, device=torch.cuda.current_device()
-        ).repeate_interleave(1 + self.num_speculative_tokens)
+        ).repeat_interleave(1 + self.num_speculative_tokens)
 
         # shan : Same as token_to_pos_ids ? 
         self.token_to_position_in_request[: self.active_token_count] = (
             self.request_kv_length_offsets[self.paused_request_count : self.total_request_count]
-        ).repeate_interleave(1 + self.num_speculative_tokens) + torch.arange(1 + self.num_speculative_tokens).repeat(active_request_count)
+        ).repeat_interleave(1 + self.num_speculative_tokens) + torch.arange(1 + self.num_speculative_tokens, device=torch.cuda.current_device()).repeat(active_request_count)
 
         self.token_to_local_position_within_kv_block[: self.active_token_count] = self.token_to_pos_ids[: self.active_token_count] % self.block_size_tokens
 
 
         current_block_ids = self.request_last_kv_block_id[self.paused_request_count : self.total_request_count]
-        raw_positions = old_offsets[:, None] + 1 + torch.arange(1 + self.num_speculative_tokens + 1 )[None, :]  # [active_request_count, num_speculative_tokens + 1] (+1 for generated toekns)
+        # 16 IS THE NUMBER OF TOKENS 
+        # 4 speculative tokens 
+        # 14  (2 )
+        raw_positions = old_offsets[:, None] + 1 + torch.arange(1 + self.num_speculative_tokens + 1, device=torch.cuda.current_device())[None, :]  # [active_request_count, num_speculative_tokens + 1] (+1 for generated toekns)
         # A token crosses to the next block if its raw_position >= block_size
         crosses_boundary = raw_positions >= self.block_size_tokens
 
@@ -2225,7 +2251,7 @@ class DynamicInferenceContext(BaseInferenceContext):
              # Fast path: no tokens cross block boundary, all use current block
             self.token_to_block_idx[: self.active_token_count] = self.request_last_kv_block_id[
                 self.paused_request_count : self.total_request_count
-            ].repeate_interleave(1 + self.num_speculative_tokens) 
+            ].repeat_interleave(1 + self.num_speculative_tokens) 
         else:
 
                 # Some tokens cross to the next block (this happens for resumed requests)
