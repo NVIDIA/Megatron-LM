@@ -13,9 +13,7 @@ from tqdm import tqdm
 from transformer_engine.pytorch.fp8 import check_fp8_support
 
 from megatron.core import parallel_state
-from megatron.core.inference.contexts.attention_context.mamba_metadata import (
-    MambaInferenceStateConfig,
-)
+from megatron.core.inference.config import InferenceConfig, MambaInferenceStateConfig
 from megatron.core.inference.contexts.dynamic_context import (
     ActiveRequestCountOverflowError,
     BlockOverflowError,
@@ -27,9 +25,6 @@ from megatron.core.inference.engines import DynamicInferenceEngine
 from megatron.core.inference.inference_request import DynamicInferenceRequest, Status
 from megatron.core.inference.model_inference_wrappers.gpt.gpt_inference_wrapper import (
     GPTInferenceWrapper,
-)
-from megatron.core.inference.model_inference_wrappers.inference_wrapper_config import (
-    InferenceWrapperConfig,
 )
 from megatron.core.inference.sampling_params import SamplingParams
 from megatron.core.inference.text_generation_controllers.text_generation_controller import (
@@ -43,22 +38,19 @@ from megatron.core.models.gpt.gpt_layer_specs import (
 from megatron.core.models.gpt.gpt_model import GPTModel
 from megatron.core.models.mamba.mamba_layer_specs import mamba_stack_spec
 from megatron.core.models.mamba.mamba_model import MambaModel
+from megatron.core.ssm.mamba_mixer import _check_mamba_sequence_packing_support
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
 from megatron.core.transformer.cuda_graphs import CudaGraphManager, _CudagraphGlobalRecord
+from megatron.core.transformer.enums import CudaGraphScope
 from megatron.core.transformer.transformer_config import TransformerConfig
-from megatron.core.utils import (
-    check_mamba_sequence_packing_support,
-    get_mamba_inference_state_config_from_model,
-    is_fa_min_version,
-    is_te_min_version,
-)
+from megatron.core.utils import is_fa_min_version, is_te_min_version
 from tests.unit_tests.test_utilities import Utils
 
 
 def skip_if_mamba_sequence_packing_not_available(model_provider: str):
     if model_provider == "mamba":
         sequence_packing_available, reason_for_no_sequence_packing = (
-            check_mamba_sequence_packing_support()
+            _check_mamba_sequence_packing_support()
         )
         if not sequence_packing_available:
             pytest.skip(reason_for_no_sequence_packing)
@@ -89,7 +81,9 @@ class DynamicEngineTestConfig:
     num_gap_steps: int = 2
 
     context_buffer_size_gb: float = 0.1  # enough room for all tokens.
+    context_paused_buffer_size_gb: float | None = None
     context_block_size_tokens: int = 256
+    context_max_requests: Optional[int] = None
     context_max_tokens: Optional[int] = None
     tensor_model_parallel_size: int = 1
     pipeline_model_parallel_size: int = 1
@@ -104,7 +98,10 @@ class DynamicEngineTestConfig:
     return_log_probs: bool = False
     materialize_only_last_token_logits: bool = True
     skip_prompt_log_probs: bool = False
-    cuda_graph_scope: str = "full_iteration"
+    enable_chunked_prefill: bool = False
+    cuda_graph_scope: List[CudaGraphScope] = field(
+        default_factory=lambda: [CudaGraphScope.full_iteration]
+    )
     force_build_cuda_graphs: bool = False
     transformer_impl: str = "local"
     # If False, do not build cuda graphs in the tests, even if
@@ -127,6 +124,10 @@ class DynamicEngineTestConfig:
         else:
             assert self.num_tokens_total is not None
             self.max_sequence_length = self.num_tokens_total
+
+        # Default paused buffer size.
+        if self.context_paused_buffer_size_gb is None:
+            self.context_paused_buffer_size_gb = 0.2 * self.context_buffer_size_gb
 
 
 @dataclass
@@ -213,23 +214,22 @@ class TestDynamicInferenceEngine:
 
         # Inference context.
         context = DynamicInferenceContext(
-            params_dtype=transformer_config.params_dtype,
-            num_layers=transformer_config.num_layers
-            // transformer_config.pipeline_model_parallel_size,
-            kv_channels=transformer_config.kv_channels,
-            num_attention_heads=transformer_config.num_query_groups,
-            max_sequence_length=test_config.max_sequence_length,
-            num_cuda_graphs=test_config.num_cuda_graphs,
-            use_cuda_graphs_for_non_decode_steps=not test_config.model_provider == "mamba",
-            buffer_size_gb=test_config.context_buffer_size_gb,
-            block_size_tokens=test_config.context_block_size_tokens,
-            max_tokens=test_config.context_max_tokens,
-            tensor_model_parallel_size=transformer_config.tensor_model_parallel_size,
-            mamba_inference_state_config=mamba_inference_state_config,
-            materialize_only_last_token_logits=test_config.materialize_only_last_token_logits,
-            use_flashinfer_fused_rope=None,  # default to using flash-infer if available
-            # this is for compatibility with the LTS environment
-            unified_memory_level=0,  # unit tests currently broken with UVM
+            model_config=transformer_config,
+            inference_config=InferenceConfig(
+                max_sequence_length=test_config.max_sequence_length,
+                num_cuda_graphs=test_config.num_cuda_graphs,
+                use_cuda_graphs_for_non_decode_steps=True,
+                buffer_size_gb=test_config.context_buffer_size_gb,
+                paused_buffer_size_gb=test_config.context_paused_buffer_size_gb,
+                block_size_tokens=test_config.context_block_size_tokens,
+                max_requests=test_config.context_max_requests,
+                max_tokens=test_config.context_max_tokens,
+                mamba_inference_state_config=mamba_inference_state_config,
+                materialize_only_last_token_logits=test_config.materialize_only_last_token_logits,
+                use_flashinfer_fused_rope=None,  # default to using flash-infer if available
+                # this is for compatibility with the LTS environment
+                unified_memory_level=0,  # unit tests currently broken with UVM
+            ),
         )
 
         return context
@@ -369,17 +369,7 @@ class TestDynamicInferenceEngine:
 
         model.eval()
 
-        mamba_inference_state_config = get_mamba_inference_state_config_from_model(model)
-
-        # Inference config.
-        inference_config = InferenceWrapperConfig(
-            hidden_size=transformer_config.hidden_size,
-            inference_batch_times_seqlen_threshold=400,
-            fp32_residual_connection=False,
-            params_dtype=transformer_config.params_dtype,
-            fp8=transformer_config.fp8,
-            padded_vocab_size=test_config.vocab_size,
-        )
+        mamba_inference_state_config = MambaInferenceStateConfig.from_model(model)
 
         # Inference context.
         inference_context = cls._build_inference_context(
@@ -390,7 +380,7 @@ class TestDynamicInferenceEngine:
         )
 
         # Inference model wrapper.
-        inference_wrapped_model = GPTInferenceWrapper(model, inference_config, inference_context)
+        inference_wrapped_model = GPTInferenceWrapper(model, inference_context)
 
         # Note: the following is taken from AbstractModelInferenceWrapper.prep_model_for_inference().
         inference_wrapped_model.model_is_pipeline_parallel = not (
@@ -411,12 +401,7 @@ class TestDynamicInferenceEngine:
         CudaGraphManager.global_mempool = None
 
         # Inference engine.
-        engine = DynamicInferenceEngine(
-            text_generation_controller,
-            inference_context,
-            random_seed=test_config.random_seed,
-            enable_cuda_graph=transformer_config.cuda_graph_impl == "local",
-        )
+        engine = DynamicInferenceEngine(text_generation_controller, inference_context)
 
         # Test env.
         env = DynamicEngineTestEnv(config=test_config, requests=requests, engine=engine)
@@ -432,7 +417,7 @@ class TestDynamicInferenceEngine:
         # the only thing that differs between requests is num_tokens_to_generate,
         # and engine.async_step() doesn't use this sampling param's
         # num_tokens_to_generate.
-        result = env.engine.step_modern(verbose=False)
+        result = env.engine.step_modern()
 
         # Suspend + resume.
         if (
@@ -454,7 +439,7 @@ class TestDynamicInferenceEngine:
 
         # Append output tokens.
         for finished_request_record in finished_request_records:
-            finished_request = finished_request_record.merge(env.engine.controller.tokenizer)
+            finished_request = finished_request_record.merge()
             request = env.requests[finished_request.request_id]
             request.output = finished_request.generated_tokens
             request.status = finished_request.status
@@ -526,7 +511,7 @@ class TestDynamicInferenceEngine:
     )
     @pytest.mark.parametrize("model_provider", ["gpt", "mamba"])
     @pytest.mark.parametrize("num_cuda_graphs", [None, 1, 4])
-    @pytest.mark.parametrize("cuda_graph_scope", ["full", "full_iteration"])
+    @pytest.mark.parametrize("cuda_graph_scope", [[], [CudaGraphScope.full_iteration]])
     def test_simple(self, model_provider, num_cuda_graphs, cuda_graph_scope) -> None:
         """Simple test that runs without errors, and validates output."""
         skip_if_mamba_sequence_packing_not_available(model_provider)
@@ -674,12 +659,13 @@ class TestDynamicInferenceEngine:
 
         # Test num_cuda_graphs.
         for num_cuda_graphs, expected_cuda_graph_token_counts in [
-            (0, [40]),
-            (1, [40]),
-            (2, [40, 24]),
-            (4, [40, 32, 16]),
-            (8, [40, 32, 24, 16, 8]),
-            (16, [40, 32, 24, 16, 8]),
+            (0, [80]),
+            (1, [80]),
+            (2, [80, 40]),
+            (4, [80, 72, 48, 24]),
+            (8, [80, 64, 48, 32, 16]),
+            (16, [80, 72, 64, 56, 48, 40, 32, 24, 16, 8]),
+            (32, [80, 72, 64, 56, 48, 40, 32, 24, 16, 8]),
         ]:
 
             # Build cuda graphs (inside dynamic engine).
@@ -731,9 +717,7 @@ class TestDynamicInferenceEngine:
         # It's safe to use request 0's sampling params here because all sampling
         # params are identical as long as use_fixed_output_lengths == False.
         finished_request_records = env.engine.generate(prompts, env.requests[0].sampling_params)
-        finished_requests = [
-            r.merge(env.engine.controller.tokenizer) for r in finished_request_records
-        ]
+        finished_requests = [r.merge() for r in finished_request_records]
 
         # Verify results
         assert len(finished_requests) == len(
@@ -767,7 +751,7 @@ class TestDynamicInferenceEngine:
             test_config = DynamicEngineTestConfig(num_requests=8, use_fixed_output_lengths=True)
             env = self._build_test_env(test_config)
 
-            engine_task = asyncio.create_task(env.engine.run_engine(verbose=False))
+            engine_task = asyncio.create_task(env.engine.run_engine())
 
             request_completion_futures: Dict[int, asyncio.Future[DynamicInferenceRequest]] = {}
 
@@ -784,7 +768,7 @@ class TestDynamicInferenceEngine:
                     request_id
                 ].sampling_params.num_tokens_to_generate
                 request_record = fut.result()
-                request = request_record.merge(env.engine.controller.tokenizer)
+                request = request_record.merge()
                 assert request.generated_length == num_tokens_to_generate, (
                     f"Request {request_id} expected to generate {num_tokens_to_generate} "
                     f"tokens but generated {request.generated_length}"
@@ -812,17 +796,187 @@ class TestDynamicInferenceEngine:
     )
     @torch.inference_mode()
     def test_return_log_probs(self):
-        """Verify that returning log probs does not raise any error."""
+        """Verify that log probs are returned and computed correctly."""
         # Returning log probs requires materializing the full prompt logits or
         # explicitly disabling prompt logits.
         with pytest.raises(AssertionError):
             env = self._run_test(return_log_probs=True, materialize_only_last_token_logits=True)
-        env = self._run_test(return_log_probs=True, materialize_only_last_token_logits=False)
+
+        # Test with full logits materialization
+        env = self._run_test(
+            return_log_probs=True,
+            materialize_only_last_token_logits=False,
+            num_tokens_to_generate=5,
+        )
+
+        # Validate log probs for each completed request
+        for request in env.requests:
+            if request.status != Status.COMPLETED:
+                continue
+
+            # Validate prompt log probs
+            if request.prompt_log_probs is not None and len(request.prompt_log_probs) > 0:
+                prompt_len = len(request.prompt_tokens)
+                # Should have log probs for all tokens except the first one
+                assert len(request.prompt_log_probs) == prompt_len - 1, (
+                    f"Request {request.request_id}: Expected {prompt_len - 1} prompt log probs, "
+                    f"got {len(request.prompt_log_probs)}"
+                )
+
+                # Validate each prompt log prob
+                for i, log_prob in enumerate(request.prompt_log_probs):
+                    assert not math.isnan(
+                        log_prob
+                    ), f"Request {request.request_id}, prompt token {i}: log_prob is NaN"
+                    assert not math.isinf(
+                        log_prob
+                    ), f"Request {request.request_id}, prompt token {i}: log_prob is inf"
+                    assert log_prob <= 0.0, (
+                        f"Request {request.request_id}, prompt token {i}: "
+                        f"log_prob {log_prob} should be <= 0"
+                    )
+                    assert log_prob >= -50.0, (
+                        f"Request {request.request_id}, prompt token {i}: "
+                        f"log_prob {log_prob} is unreasonably small"
+                    )
+
+            # Validate generated log probs
+            assert (
+                request.generated_log_probs is not None
+            ), f"Request {request.request_id}: generated_log_probs should not be None"
+            assert len(request.generated_log_probs) == len(request.generated_tokens), (
+                f"Request {request.request_id}: Expected {len(request.generated_tokens)} "
+                f"generated log probs, got {len(request.generated_log_probs)}"
+            )
+
+            # Validate each generated log prob
+            for i, log_prob in enumerate(request.generated_log_probs):
+                assert not math.isnan(
+                    log_prob
+                ), f"Request {request.request_id}, generated token {i}: log_prob is NaN"
+                assert not math.isinf(
+                    log_prob
+                ), f"Request {request.request_id}, generated token {i}: log_prob is inf"
+                assert log_prob <= 0.0, (
+                    f"Request {request.request_id}, generated token {i}: "
+                    f"log_prob {log_prob} should be <= 0"
+                )
+                assert log_prob >= -50.0, (
+                    f"Request {request.request_id}, generated token {i}: "
+                    f"log_prob {log_prob} is unreasonably small"
+                )
+
+            # Validate that all generated tokens are valid
+            for i, token_id in enumerate(request.generated_tokens):
+                assert 0 <= token_id < env.config.vocab_size, (
+                    f"Request {request.request_id}, token {i}: token_id {token_id} "
+                    f"is out of valid range [0, {env.config.vocab_size})"
+                )
+
+        # Test with skipping prompt log probs
         env = self._run_test(
             return_log_probs=True,
             materialize_only_last_token_logits=True,
             skip_prompt_log_probs=True,
+            num_tokens_to_generate=5,
         )
+
+        # Validate that prompt log probs are empty/None when skipped
+        for request in env.requests:
+            if request.status != Status.COMPLETED:
+                continue
+
+            # When skip_prompt_log_probs is True, prompt_log_probs should be empty
+            assert request.prompt_log_probs is None or len(request.prompt_log_probs) == 0, (
+                f"Request {request.request_id}: prompt_log_probs should be empty when "
+                f"skip_prompt_log_probs=True, but got {len(request.prompt_log_probs)} items"
+            )
+
+            # Generated log probs should still be present
+            assert (
+                request.generated_log_probs is not None and len(request.generated_log_probs) > 0
+            ), f"Request {request.request_id}: generated_log_probs should be present"
+
+            # Validate generated log probs are still valid
+            for i, log_prob in enumerate(request.generated_log_probs):
+                assert not math.isnan(log_prob) and not math.isinf(log_prob), (
+                    f"Request {request.request_id}, generated token {i}: "
+                    f"log_prob {log_prob} is invalid"
+                )
+                assert -50.0 <= log_prob <= 0.0, (
+                    f"Request {request.request_id}, generated token {i}: "
+                    f"log_prob {log_prob} is out of expected range [-50.0, 0.0]"
+                )
+
+    @pytest.mark.skipif(
+        not is_fa_min_version("2.7.3"), reason="need latest flash attn for dynamic batching"
+    )
+    @torch.inference_mode()
+    def test_log_probs_token_correspondence(self):
+        """
+        Verify that log probabilities correspond to the actual sampled tokens.
+        This test checks that the log probability reported for each token actually
+        corresponds to that token's probability in the distribution.
+        """
+        # Run test with log probs enabled
+        env = self._run_test(
+            return_log_probs=True,
+            materialize_only_last_token_logits=False,
+            num_tokens_to_generate=5,
+            num_requests=4,
+        )
+
+        # For each completed request
+        for request in env.requests:
+            if request.status != Status.COMPLETED:
+                continue
+
+            # Check that we have log probs for generated tokens
+            assert request.generated_log_probs is not None
+            assert len(request.generated_log_probs) == len(request.generated_tokens)
+
+            # Verify log probs are valid and in reasonable range
+            for i, (token_id, log_prob) in enumerate(
+                zip(request.generated_tokens, request.generated_log_probs)
+            ):
+                # Basic validity checks
+                assert not math.isnan(
+                    log_prob
+                ), f"Request {request.request_id}, token {i}: log_prob is NaN"
+                assert not math.isinf(
+                    log_prob
+                ), f"Request {request.request_id}, token {i}: log_prob is inf"
+
+                # Log probabilities should be <= 0 (since prob <= 1)
+                assert log_prob <= 0.0, (
+                    f"Request {request.request_id}, token {i}: "
+                    f"log_prob {log_prob} should be <= 0"
+                )
+
+                # Check reasonable range (not too negative)
+                # Using a more lenient threshold since actual model outputs can vary
+                assert log_prob >= -100.0, (
+                    f"Request {request.request_id}, token {i}: "
+                    f"log_prob {log_prob} is unreasonably small"
+                )
+
+                # Token ID should be valid
+                assert 0 <= token_id < env.config.vocab_size, (
+                    f"Request {request.request_id}, token {i}: "
+                    f"token_id {token_id} is out of range [0, {env.config.vocab_size})"
+                )
+
+            # Check prompt log probs if available
+            if request.prompt_log_probs is not None and len(request.prompt_log_probs) > 0:
+                expected_prompt_log_probs = len(request.prompt_tokens) - 1
+                assert len(request.prompt_log_probs) == expected_prompt_log_probs, (
+                    f"Request {request.request_id}: Expected {expected_prompt_log_probs} "
+                    f"prompt log probs, got {len(request.prompt_log_probs)}"
+                )
+
+                for i, log_prob in enumerate(request.prompt_log_probs):
+                    assert not math.isnan(log_prob) and not math.isinf(log_prob)
+                    assert -100.0 <= log_prob <= 0.0
 
     @pytest.mark.internal
     @pytest.mark.skipif(
@@ -973,7 +1127,7 @@ class TestDynamicInferenceEngine:
         num_tokens_to_generate = 16
         max_sequence_length = prompt_length + num_tokens_to_generate
 
-        # Configure context to force chunking (chunked prefill is enabled by default)
+        # Configure context to force chunking
         env = self._run_test(
             num_requests=1,
             min_prompt_length=prompt_length,
@@ -983,20 +1137,82 @@ class TestDynamicInferenceEngine:
             model_provider=model_provider,
             context_block_size_tokens=256,
             context_max_tokens=1000,
+            enable_chunked_prefill=True,
         )
 
     @pytest.mark.internal
     @pytest.mark.skipif(
         not is_fa_min_version("2.7.3"), reason="need latest flash attn for dynamic batching"
     )
-    @pytest.mark.parametrize("return_prompt_top_n_logprobs", [True, False])
     @torch.inference_mode()
-    def test_top_n_logprobs_dynamic(self, return_prompt_top_n_logprobs: bool):
+    def test_chunked_prefill_with_log_probs(self):
+        """
+        Test that chunked prefill correctly handles log probs with materialize_only_last_token_logits.
+        This verifies that intermediate log probs are properly discarded during chunked prefill.
+        When materialize_only_last_token_logits=True, skip_prompt_log_probs must be True.
+        """
+        prompt_length = 1200
+        num_tokens_to_generate = 8
+
+        # Run with chunked prefill, materialize_only_last_token_logits=True, and skip_prompt_log_probs=True
+        # This is the only valid combination for chunked prefill with last-token-only logits
+        env = self._run_test(
+            num_requests=1,
+            min_prompt_length=prompt_length,
+            max_prompt_length=prompt_length,
+            num_tokens_to_generate=num_tokens_to_generate,
+            materialize_only_last_token_logits=True,
+            return_log_probs=True,
+            skip_prompt_log_probs=True,
+            model_provider="gpt",
+            context_block_size_tokens=256,
+            context_max_tokens=1000,
+            enable_chunked_prefill=True,
+        )
+
+        # Validate results
+        for request in env.requests:
+            if request.status != Status.COMPLETED:
+                continue
+
+            # Validate generated log probs
+            assert (
+                request.generated_log_probs is not None
+            ), f"Request {request.request_id}: generated_log_probs should not be None"
+            assert len(request.generated_log_probs) == len(request.generated_tokens), (
+                f"Request {request.request_id}: Expected {len(request.generated_tokens)} "
+                f"generated log probs, got {len(request.generated_log_probs)}"
+            )
+
+            # When skip_prompt_log_probs is True, prompt_log_probs should be empty
+            assert request.prompt_log_probs is None or len(request.prompt_log_probs) == 0, (
+                f"Request {request.request_id}: prompt_log_probs should be empty when "
+                f"skip_prompt_log_probs=True, but got {len(request.prompt_log_probs) if request.prompt_log_probs else 0} items"
+            )
+
+            # Validate each generated log prob
+            for i, log_prob in enumerate(request.generated_log_probs):
+                assert not math.isnan(log_prob) and not math.isinf(log_prob), (
+                    f"Request {request.request_id}, generated token {i}: "
+                    f"log_prob {log_prob} is invalid"
+                )
+                assert -50.0 <= log_prob <= 0.0, (
+                    f"Request {request.request_id}, generated token {i}: "
+                    f"log_prob {log_prob} is out of expected range [-50.0, 0.0]"
+                )
+
+    @pytest.mark.internal
+    @pytest.mark.skipif(
+        not is_fa_min_version("2.7.3"), reason="need latest flash attn for dynamic batching"
+    )
+    @pytest.mark.parametrize("skip_prompt_log_probs", [True, False])
+    @torch.inference_mode()
+    def test_top_n_logprobs_dynamic(self, skip_prompt_log_probs: bool):
         """
         Test that top_n_logprobs are computed correctly in dynamic batching mode.
         Verifies:
         1. top_n_logprobs are returned for generated tokens
-        2. return_prompt_top_n_logprobs controls whether prompt top-n logprobs are returned
+        2. skip_prompt_log_probs controls whether prompt top-n logprobs are skipped
         3. The top-n values are consistent with the selected token's log prob
         """
         # Build test environment with multiple requests of varying lengths
@@ -1019,7 +1235,7 @@ class TestDynamicInferenceEngine:
                 termination_id=test_config.vocab_size - 1,
                 return_log_probs=True,
                 top_n_logprobs=top_n,
-                return_prompt_top_n_logprobs=return_prompt_top_n_logprobs,
+                skip_prompt_log_probs=skip_prompt_log_probs,
                 top_k=10,  # Add some sampling randomness
             )
             requests_to_add.append(request)
@@ -1030,7 +1246,7 @@ class TestDynamicInferenceEngine:
 
         # Step engine until all requests are finished
         while env.engine.has_unfinished_requests():
-            result = env.engine.step_modern(verbose=False)
+            result = env.engine.step_modern()
 
         # Validate results
         for request in requests_to_add:
@@ -1059,8 +1275,8 @@ class TestDynamicInferenceEngine:
                     len(top_n_dict) > 0
                 ), f"Request {request.request_id}, token {i}: empty top-n dict"
 
-            # Validate prompt top-n logprobs based on return_prompt_top_n_logprobs flag
-            if return_prompt_top_n_logprobs:
+            # Validate prompt top-n logprobs based on skip_prompt_log_probs flag
+            if not skip_prompt_log_probs:
                 assert hasattr(
                     request, 'prompt_top_n_logprobs'
                 ), f"Request {request.request_id} missing prompt_top_n_logprobs"
@@ -1085,12 +1301,12 @@ class TestDynamicInferenceEngine:
                         len(top_n_dict) > 0
                     ), f"Request {request.request_id}, prompt token {i}: empty top-n dict"
             else:
-                # When return_prompt_top_n_logprobs is False, prompt_top_n_logprobs should be None or empty
+                # When skip_prompt_log_probs is True, prompt_top_n_logprobs should be None or empty
                 if hasattr(request, 'prompt_top_n_logprobs'):
                     assert (
                         request.prompt_top_n_logprobs is None
                         or len(request.prompt_top_n_logprobs) == 0
-                    ), f"Request {request.request_id}: prompt_top_n_logprobs should be None or empty when return_prompt_top_n_logprobs is False"
+                    ), f"Request {request.request_id}: prompt_top_n_logprobs should be None or empty when skip_prompt_log_probs is True"
 
             # Validate consistency between log_probs and top_n_logprobs
             if hasattr(request, 'generated_log_probs') and request.generated_log_probs is not None:
@@ -1117,3 +1333,28 @@ class TestDynamicInferenceEngine:
                     assert (
                         abs(log_prob - top_n_dict[token_str]) < 0.1
                     ), f"Request {request.request_id}, token {i}: log_prob mismatch {log_prob} vs {top_n_dict[token_str]}"
+
+    @pytest.mark.internal
+    @pytest.mark.skipif(
+        not is_fa_min_version("2.7.3"), reason="need latest flash attn for dynamic batching"
+    )
+    @pytest.mark.parametrize("max_requests", [None, 4])
+    @torch.inference_mode()
+    def test_max_requests(self, max_requests: int | None):
+        """Test max requests."""
+        env = self._run_test(
+            context_max_requests=max_requests, num_tokens_to_generate=16, num_gap_steps=1
+        )
+        step_count = env.engine.step_count
+        context = env.engine.context
+        if max_requests is None:
+            assert context.max_requests == 816
+            assert step_count == 22
+        else:
+            assert max_requests < len(env.requests), (
+                f"Test is only useful if max_requests ({max_requests}) < "
+                f"num_requests ({len(env.requests)})."
+            )
+            assert context.max_requests == 4
+            assert step_count == 34
+        assert context.block_allocator.active_count == 655

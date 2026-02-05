@@ -23,13 +23,18 @@ if [ -z ${MLM_MODEL_SAVE} ]; then
     printf "${MLM_WARNING} Variable ${PURPLE}MLM_MODEL_SAVE${WHITE} is not set (default: ${MLM_MODEL_CKPT})!\n"
 fi
 
+if [ -z ${DATASET} ]; then
+    DATASET="Magpie-Align/Magpie-Llama-3.1-Pro-MT-300K-Filtered"
+    printf "${MLM_WARNING} Variable ${PURPLE}DATASET${WHITE} is not set (default: Magpie-Align/Magpie-Llama-3.1-Pro-MT-300K-Filtered)!\n"
+fi
+
 if [ -z ${MLM_DATA_ARGS} ]; then
     MLM_DATA_ARGS=" \
         --train-samples 128000 \
         --lr-decay-samples 128000 \
         --lr-warmup-samples 0 \
         --split 100,0,0 \
-        --finetune-hf-dataset Magpie-Align/Magpie-Llama-3.1-Pro-MT-300K-Filtered \
+        --finetune-hf-dataset ${DATASET} \
     "
 fi
 
@@ -56,6 +61,7 @@ if [ -z ${MLM_OPTIM_ARGS} ]; then
         --adam-beta1 0.9 \
         --adam-beta2 0.95 \
         --init-method-std 0.010 \
+        --use-distributed-optimizer \
     "
 fi
 

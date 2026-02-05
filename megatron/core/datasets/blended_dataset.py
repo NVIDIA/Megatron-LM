@@ -86,9 +86,23 @@ class BlendedDataset(torch.utils.data.Dataset):
         self.dataset_index, self.dataset_sample_index = self._build_indices()
 
     def __len__(self) -> int:
+        if self.config.defer_npy_index_mmap:
+            size = sum(self.weights)
+            if self.size is not None:
+                size = self.size
+            return size
+
         return self.dataset_index.shape[0]
 
     def __getitem__(self, idx: int) -> Dict[str, Union[int, numpy.ndarray]]:
+        if self.dataset_index is None:
+            self.dataset_index = numpy.load(
+                self.path_to_dataset_index, allow_pickle=True, mmap_mode="r"
+            )
+            self.dataset_sample_index = numpy.load(
+                self.path_to_dataset_sample_index, allow_pickle=True, mmap_mode="r"
+            )
+
         dataset_id = self.dataset_index[idx]
         dataset_sample_id = self.dataset_sample_index[idx]
         return {"dataset_id": dataset_id, **self.datasets[dataset_id][dataset_sample_id]}
@@ -103,6 +117,15 @@ class BlendedDataset(torch.utils.data.Dataset):
         Returns:
             Tuple[numpy.ndarray, numpy.ndarray]: The dataset index and the dataset sample index
         """
+        if self.config.defer_npy_index_mmap:
+            # NOTE(asolergi-nv): Direct path to lazy memmap the indexes
+            get_path_to = lambda suffix: os.path.join(
+                self.config.path_to_cache,
+                f"{self.unique_description_hash}-{type(self).__name__}-{self.split.name}-{suffix}",
+            )
+            self.path_to_dataset_index = get_path_to("dataset_index.npy")
+            self.path_to_dataset_sample_index = get_path_to("dataset_sample_index.npy")
+            return None, None
 
         path_to_cache = self.config.path_to_cache
 
@@ -114,10 +137,14 @@ class BlendedDataset(torch.utils.data.Dataset):
             path_to_description = get_path_to("description.txt")
             path_to_dataset_index = get_path_to("dataset_index.npy")
             path_to_dataset_sample_index = get_path_to("dataset_sample_index.npy")
-            cache_hit = all(
-                map(
-                    os.path.isfile,
-                    [path_to_description, path_to_dataset_index, path_to_dataset_sample_index],
+            cache_hit = (
+                True
+                if self.config.fast_cache_load
+                else all(
+                    map(
+                        os.path.isfile,
+                        [path_to_description, path_to_dataset_index, path_to_dataset_sample_index],
+                    )
                 )
             )
         else:
