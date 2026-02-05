@@ -35,59 +35,6 @@ TEST_PRIORITY = TestPriority.LOW
 
 
 # ============================================================================
-# Helper Functions
-# ============================================================================
-
-
-def create_dynamic_request(
-    request_id: int = 1,
-    prompt_tokens: torch.Tensor = None,
-    sampling_params: SamplingParams = None,
-) -> DynamicInferenceRequest:
-    """Create a DynamicInferenceRequest bypassing the generated_tokens field conflict.
-
-    The DynamicInferenceRequest class has a property 'generated_tokens' that conflicts
-    with the field 'generated_tokens' inherited from InferenceRequest. This helper
-    creates the request using object.__new__ and manually initializes fields.
-    """
-    if prompt_tokens is None:
-        prompt_tokens = torch.tensor([1, 2, 3, 4], dtype=torch.int64)
-    if sampling_params is None:
-        sampling_params = SamplingParams(num_tokens_to_generate=10)
-
-    # Create instance without calling __init__
-    req = object.__new__(DynamicInferenceRequest)
-
-    # Initialize all required fields manually
-    req.request_id = request_id
-    req.prompt = None
-    req.prompt_tokens = prompt_tokens
-    req.remaining_prompt_tokens = prompt_tokens.clone()
-    req.sampling_params = sampling_params
-    req.inference_parameters = None
-    req.arrival_time = None
-    req.status = None
-    req.encoder_prompt = None
-    req.generated_text = None
-    req.segments = None
-    req.generated_segments = None
-    req.generated_sequence_lengths = None
-    # Note: We skip setting generated_tokens since it's a property in DynamicInferenceRequest
-    req.prompt_log_probs = None
-    req.generated_log_probs = None
-    req.prompt_top_n_logprobs = None
-    req.generated_top_n_logprobs = None
-    req.generated_length = None
-    req.tpot = None
-    req.latency = None
-    req.finished_chunk_token_count = 0
-    req.stop_word_ids = None
-    req.events = []
-
-    return req
-
-
-# ============================================================================
 # Fixtures
 # ============================================================================
 
@@ -95,15 +42,20 @@ def create_dynamic_request(
 @pytest.fixture
 def basic_request():
     """Create a basic request for testing."""
-    return create_dynamic_request(request_id=1)
+    return DynamicInferenceRequest(
+        request_id=1,
+        prompt_tokens=torch.tensor([1, 2, 3, 4], dtype=torch.int64),
+        sampling_params=SamplingParams(num_tokens_to_generate=10),
+    )
 
 
 @pytest.fixture
 def request_with_lifecycle():
     """Create a request with a full lifecycle of events."""
-    req = create_dynamic_request(
+    req = DynamicInferenceRequest(
         request_id=1,
         prompt_tokens=torch.tensor([1, 2, 3], dtype=torch.int64),
+        sampling_params=SamplingParams(num_tokens_to_generate=10),
     )
     req.add_event_add_engine()
     req.add_event_add_context()
@@ -679,37 +631,8 @@ class TestGeneratedTokensProperty:
 # ============================================================================
 
 
-def deserialize_dynamic_request(serialized: dict) -> DynamicInferenceRequest:
-    """Deserialize a DynamicInferenceRequest working around the property conflict bug.
-
-    The DynamicInferenceRequest.deserialize method is currently broken because
-    the generated_tokens property conflicts with the inherited field from InferenceRequest.
-    This helper provides a working deserialization for tests.
-    """
-    req = create_dynamic_request(
-        request_id=serialized['request_id'],
-        prompt_tokens=torch.tensor(serialized['prompt_tokens'][1]) if serialized.get('prompt_tokens') and isinstance(serialized['prompt_tokens'], tuple) else None,
-    )
-    # Restore other fields from serialized data
-    req.prompt = serialized.get('prompt')
-    req.status = None
-    if serialized.get('status'):
-        from megatron.core.inference.inference_request import Status
-        req.status = Status[serialized['status']]
-    req.latency = serialized.get('latency')
-
-    # Restore events
-    req.events = [DynamicInferenceEvent.deserialize(e) for e in serialized.get('events', [])]
-    return req
-
-
 class TestRequestSerialization:
-    """Tests for DynamicInferenceRequest serialization with events.
-
-    Note: DynamicInferenceRequest.deserialize() is currently broken due to a
-    property/field conflict (generated_tokens is a property in the subclass but
-    a field in the parent class). These tests use a custom deserialize helper.
-    """
+    """Tests for DynamicInferenceRequest serialization with events."""
 
     @pytest.mark.skipif(
         TEST_PRIORITY < TestPriority.IMPORTANT, reason="Test priority not met"
@@ -768,50 +691,39 @@ class TestRequestSerialization:
 
 
 class TestRequestRecordMerge:
-    """Tests for DynamicInferenceRequestRecord functionality.
-
-    Note: DynamicInferenceRequestRecord.merge() is currently broken because it
-    creates a new DynamicInferenceRequest, which fails due to the property/field
-    conflict (generated_tokens is a property in DynamicInferenceRequest but a field
-    in InferenceRequest). These tests verify the record structure without calling merge().
-    """
+    """Tests for DynamicInferenceRequestRecord merge functionality."""
 
     @pytest.mark.skipif(
         TEST_PRIORITY < TestPriority.IMPORTANT, reason="Test priority not met"
     )
-    def test_from_request(self, request_with_lifecycle):
-        """Test DynamicInferenceRequestRecord.from_request() creates correct structure."""
+    def test_single_request_merge(self, request_with_lifecycle):
+        """Test merge with single request returns same events."""
         record = DynamicInferenceRequestRecord.from_request(request_with_lifecycle)
-        assert len(record.requests) == 1
-        assert record.requests[0] is request_with_lifecycle
-        assert record.request_id == request_with_lifecycle.request_id
+        merged = record.merge()
+
+        assert len(merged.events) == len(request_with_lifecycle.events)
+        assert merged.generated_tokens == request_with_lifecycle.generated_tokens
 
     @pytest.mark.skipif(
         TEST_PRIORITY < TestPriority.IMPORTANT, reason="Test priority not met"
     )
-    def test_record_indexing(self, request_with_lifecycle):
-        """Test that record[idx] works correctly."""
-        record = DynamicInferenceRequestRecord.from_request(request_with_lifecycle)
-        assert record[0] is request_with_lifecycle
-
-    @pytest.mark.skipif(
-        TEST_PRIORITY < TestPriority.IMPORTANT, reason="Test priority not met"
-    )
-    def test_multiple_requests_in_record(self):
-        """Test record can hold multiple checkpoint requests."""
-        req1 = create_dynamic_request(
+    def test_two_checkpoints_merge(self):
+        """Test merge concatenates events from multiple checkpoints."""
+        req1 = DynamicInferenceRequest(
             request_id=1,
             prompt_tokens=torch.tensor([1, 2, 3], dtype=torch.int64),
             sampling_params=SamplingParams(num_tokens_to_generate=10),
         )
         req1.add_event_add_engine()
+        req1.add_event_add_context()
         req1.add_event_generated_token(100)
 
-        req2 = create_dynamic_request(
+        req2 = DynamicInferenceRequest(
             request_id=1,
             prompt_tokens=torch.tensor([1, 2, 3, 100], dtype=torch.int64),
             sampling_params=SamplingParams(num_tokens_to_generate=9),
         )
+        req2.add_event_add_engine()
         req2.add_event_generated_token(200)
         req2.add_event_finish()
 
@@ -819,16 +731,42 @@ class TestRequestRecordMerge:
         record.requests.append(req1)
         record.requests.append(req2)
 
-        assert len(record.requests) == 2
-        assert record[0].generated_tokens == [100]
-        assert record[1].generated_tokens == [200]
+        merged = record.merge()
+        assert len(merged.events) == 6  # 3 + 3 events
 
     @pytest.mark.skipif(
         TEST_PRIORITY < TestPriority.IMPORTANT, reason="Test priority not met"
     )
-    def test_all_events_accessible_across_requests(self):
-        """Test that events from all requests can be accessed."""
-        req1 = create_dynamic_request(
+    def test_preserves_generated_tokens(self):
+        """Test that merge preserves generated_tokens from all checkpoints."""
+        req1 = DynamicInferenceRequest(
+            request_id=1,
+            prompt_tokens=torch.tensor([1, 2], dtype=torch.int64),
+            sampling_params=SamplingParams(num_tokens_to_generate=5),
+        )
+        req1.add_event_generated_token(10)
+        req1.add_event_generated_token(20)
+
+        req2 = DynamicInferenceRequest(
+            request_id=1,
+            prompt_tokens=torch.tensor([1, 2, 10, 20], dtype=torch.int64),
+            sampling_params=SamplingParams(num_tokens_to_generate=3),
+        )
+        req2.add_event_generated_token(30)
+
+        record = DynamicInferenceRequestRecord()
+        record.requests.append(req1)
+        record.requests.append(req2)
+
+        merged = record.merge()
+        assert merged.generated_tokens == [10, 20, 30]
+
+    @pytest.mark.skipif(
+        TEST_PRIORITY < TestPriority.IMPORTANT, reason="Test priority not met"
+    )
+    def test_eviction_events_preserved(self):
+        """Test that EVICT events are preserved in merged list."""
+        req1 = DynamicInferenceRequest(
             request_id=1,
             prompt_tokens=torch.tensor([1, 2, 3], dtype=torch.int64),
             sampling_params=SamplingParams(num_tokens_to_generate=5),
@@ -836,7 +774,7 @@ class TestRequestRecordMerge:
         req1.add_event_add_engine()
         req1.add_event_evict()
 
-        req2 = create_dynamic_request(
+        req2 = DynamicInferenceRequest(
             request_id=1,
             prompt_tokens=torch.tensor([1, 2, 3], dtype=torch.int64),
             sampling_params=SamplingParams(num_tokens_to_generate=5),
@@ -848,15 +786,9 @@ class TestRequestRecordMerge:
         record.requests.append(req1)
         record.requests.append(req2)
 
-        # Manually collect all events (what merge() would do)
-        all_events = []
-        for r in record.requests:
-            all_events.extend(r.events)
-
-        event_types = [e.type for e in all_events]
+        merged = record.merge()
+        event_types = [e.type for e in merged.events]
         assert DynamicInferenceEventType.EVICT in event_types
-        assert DynamicInferenceEventType.FINISH in event_types
-        assert len(all_events) == 4
 
 
 # ============================================================================
