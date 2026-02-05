@@ -79,10 +79,10 @@ def run_model_submodules_with_capture(model, input_tensors, microbatches):
         local_tokens, probs = attn(node, input_tensors[i])
 
         # dispatch fwd
-        dispatched_tokens, dispatched_probs = dispatch(node, local_tokens, probs)
+        dispatched_tokens = dispatch(node, local_tokens, probs)
 
         # moe fwd
-        expert_output = moe(node, dispatched_tokens, dispatched_probs)
+        expert_output = moe(node, dispatched_tokens)
 
         # combine fwd
         hidden_states = combine(node, expert_output)
