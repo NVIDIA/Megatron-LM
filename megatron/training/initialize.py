@@ -13,6 +13,7 @@ import torch
 
 from megatron.core import mpu, tensor_parallel
 from megatron.core.fusions.fused_bias_dropout import bias_dropout_add_fused_train
+from megatron.core.fusions.fused_bias_geglu import bias_geglu
 from megatron.core.fusions.fused_bias_gelu import bias_gelu
 from megatron.core.fusions.fused_bias_swiglu import bias_swiglu
 from megatron.core.parallel_state import create_group
@@ -471,8 +472,53 @@ def _warmup_jit_function():
     else:
         dtype = torch.float32
 
-    # Warmup fused bias+gelu
-    if (args.swiglu and args.bias_swiglu_fusion) or (not args.swiglu and args.bias_gelu_fusion):
+    # Check if TE activation function is used (in which case, no need to warmup custom fusions)
+    use_te_activation_func = getattr(args, 'use_te_activation_func', False)
+
+    # Determine which activation fusion to warmup based on args
+    # Reference: megatron/core/transformer/mlp.py and megatron/core/transformer/moe/shared_experts.py
+    #
+    # In MLP forward (when bias_activation_fusion=True and use_te_activation_func=False):
+    #   - activation_func=F.gelu + gated_linear_unit=True  -> bias_geglu_impl
+    #   - activation_func=F.gelu + gated_linear_unit=False -> bias_gelu_impl
+    #   - activation_func=F.silu + gated_linear_unit=True  -> bias_swiglu_impl
+    #
+    # Args mapping:
+    #   - args.swiglu=True       -> gated_linear_unit=True, activation_func=F.silu
+    #   - args.quick_geglu=True  -> gated_linear_unit=True, activation_func=quick_gelu (no fusion warmup needed)
+    #   - default (neither set)  -> gated_linear_unit=False, activation_func=F.gelu
+
+    # gated_linear_unit can be set via YAML config or other means
+    gated_linear_unit = getattr(args, 'gated_linear_unit', False)
+
+    # Warmup bias_swiglu: swiglu activation (F.silu + GLU)
+    warmup_bias_swiglu = (
+        not use_te_activation_func
+        and args.swiglu
+        and args.bias_swiglu_fusion
+    )
+
+    # Warmup bias_gelu: non-gated gelu activation (F.gelu without GLU)
+    warmup_bias_gelu = (
+        not use_te_activation_func
+        and not args.swiglu
+        and not getattr(args, 'quick_geglu', False)
+        and not gated_linear_unit
+        and args.bias_gelu_fusion
+    )
+
+    # Warmup bias_geglu: gated gelu activation (F.gelu + GLU)
+    # This is triggered when gated_linear_unit=True with gelu activation
+    warmup_bias_geglu = (
+        not use_te_activation_func
+        and not args.swiglu
+        and not getattr(args, 'quick_geglu', False)
+        and gated_linear_unit
+        and args.bias_gelu_fusion
+    )
+
+    # Warmup fused bias+swiglu
+    if warmup_bias_swiglu:
         bias = torch.rand(
             args.ffn_hidden_size // args.tensor_model_parallel_size, dtype=dtype, device="cuda"
         )
@@ -490,10 +536,52 @@ def _warmup_jit_function():
         for bias_grad, input_grad in zip([True, True], [False, True]):
             bias.requires_grad, input.requires_grad = bias_grad, input_grad
             for _ in range(5):
-                if args.swiglu:
-                    output = bias_swiglu(input, bias)
-                else:
-                    output = bias_gelu(bias, input)
+                output = bias_swiglu(input, bias)
+        del bias, input, output
+
+    # Warmup fused bias+gelu (non-gated)
+    if warmup_bias_gelu:
+        bias = torch.rand(
+            args.ffn_hidden_size // args.tensor_model_parallel_size, dtype=dtype, device="cuda"
+        )
+        input = torch.rand(
+            (
+                args.seq_length // args.context_parallel_size,
+                args.micro_batch_size,
+                args.ffn_hidden_size // args.tensor_model_parallel_size,
+            ),
+            dtype=dtype,
+            device="cuda",
+        )
+        # Warmup JIT fusions with the input grad_enable state of both forward
+        # prop and recomputation
+        for bias_grad, input_grad in zip([True, True], [False, True]):
+            bias.requires_grad, input.requires_grad = bias_grad, input_grad
+            for _ in range(5):
+                output = bias_gelu(bias, input)
+        del bias, input, output
+
+    # Warmup fused bias+geglu (gated gelu)
+    if warmup_bias_geglu:
+        # For geglu, input size is 2x ffn_hidden_size (will be split into two halves)
+        bias = torch.rand(
+            (args.ffn_hidden_size // args.tensor_model_parallel_size) * 2, dtype=dtype, device="cuda"
+        )
+        input = torch.rand(
+            (
+                args.seq_length // args.context_parallel_size,
+                args.micro_batch_size,
+                (args.ffn_hidden_size // args.tensor_model_parallel_size) * 2,
+            ),
+            dtype=dtype,
+            device="cuda",
+        )
+        # Warmup JIT fusions with the input grad_enable state of both forward
+        # prop and recomputation
+        for bias_grad, input_grad in zip([True, True], [False, True]):
+            bias.requires_grad, input.requires_grad = bias_grad, input_grad
+            for _ in range(5):
+                output = bias_geglu(bias, input)
         del bias, input, output
 
     # Warmup fused bias+dropout+add
