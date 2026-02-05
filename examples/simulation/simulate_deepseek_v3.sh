@@ -15,7 +15,7 @@ WORLD_SIZE=$(($GPUS_PER_NODE*$NUM_NODES))
 
 export TIME_STAMP=$(date '+%Y%m%d-%H%M')
 
-BASEDIR="/dnn_training_sys/users/lisiyuan.li/autolab/workspace/simulation"
+BASEDIR="${SIMULATION_OUTPUT_DIR:-./simulation_results}"
 LOG_PATH="${BASEDIR}/simulate_deepseek_v3/${TIME_STAMP}/logs"
 OUTPUT_PATH="${BASEDIR}/simulate_deepseek_v3/${TIME_STAMP}/outputs"
 mkdir -p $LOG_PATH

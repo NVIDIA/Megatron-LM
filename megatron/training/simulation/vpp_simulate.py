@@ -2,6 +2,7 @@
 
 """VPP Training Simulation for Performance Profiling"""
 import itertools
+import logging
 import os
 import time
 import json
@@ -13,8 +14,8 @@ import torch.distributed
 from megatron.core import parallel_state
 from megatron.core.pipeline_parallel.schedules import get_schedule_table, get_pp_rank_microbatches
 from megatron.core.num_microbatches_calculator import get_num_microbatches
+from megatron.core.utils import log_single_rank
 from megatron.training.global_vars import get_args
-from megatron.training.utils import print_rank_0
 from megatron.training.simulation.task import Task, TaskType
 from megatron.core.transformer.enums import LayerType
 from megatron.core.pipeline_parallel.schedules import forward_step
@@ -25,6 +26,8 @@ from megatron.training.simulation.model_executor import (
     execute_forward_with_timing,
     execute_backward_with_timing,
 )
+
+logger = logging.getLogger(__name__)
 
 
 def calculate_model_static_memory(model):
@@ -163,17 +166,17 @@ class VppSimulator(object):
         self.pp_static_memory_dict = {}
 
         # DEBUG: Print schedule_table for debugging
-        print_rank_0("\n" + "="*80)
-        print_rank_0("DEBUG: Schedule Table Information")
-        print_rank_0("="*80)
-        print_rank_0(f"num_microbatches: {self.num_microbatches}")
-        print_rank_0(f"num_model_chunks: {self.num_model_chunks}")
-        print_rank_0(f"total_num_microbatches: {self.total_num_microbatches}")
-        print_rank_0(f"microbatch_group_size_per_vp_stage: {self.microbatch_group_size_per_vp_stage}")
-        print_rank_0(f"\nSchedule table (first 10 entries):")
+        log_single_rank(logger, logging.DEBUG, "\n" + "="*80)
+        log_single_rank(logger, logging.DEBUG, "DEBUG: Schedule Table Information")
+        log_single_rank(logger, logging.DEBUG, "="*80)
+        log_single_rank(logger, logging.DEBUG, f"num_microbatches: {self.num_microbatches}")
+        log_single_rank(logger, logging.DEBUG, f"num_model_chunks: {self.num_model_chunks}")
+        log_single_rank(logger, logging.DEBUG, f"total_num_microbatches: {self.total_num_microbatches}")
+        log_single_rank(logger, logging.DEBUG, f"microbatch_group_size_per_vp_stage: {self.microbatch_group_size_per_vp_stage}")
+        log_single_rank(logger, logging.DEBUG, f"\nSchedule table (first 10 entries):")
         for i, (mb_id, mc_id) in enumerate(self.schedule_table[:10]):
-            print_rank_0(f"  virtual_mb_id {i}: (microbatch_id={mb_id}, model_chunk_id={mc_id})")
-        print_rank_0("="*80 + "\n")
+            log_single_rank(logger, logging.DEBUG, f"  virtual_mb_id {i}: (microbatch_id={mb_id}, model_chunk_id={mc_id})")
+        log_single_rank(logger, logging.DEBUG, "="*80 + "\n")
 
     def _create_task_dependencies(self):
         for pp_rank in range(self.pipeline_parallel_size):
@@ -189,20 +192,20 @@ class VppSimulator(object):
             self._create_pp_rank_schedule_dependencies(pp_rank)
 
     def _create_cross_pp_rank_dependencies(self):
-        """创建跨PP rank的pipeline依赖关系
-        
-        Forward pipeline: PP rank i 依赖于 PP rank i-1 的同一microbatch
-        Backward pipeline: PP rank i 依赖于 PP rank i+1 的同一microbatch  
+        """Create cross-PP rank pipeline dependencies
+
+        Forward pipeline: PP rank i depends on PP rank i-1 for the same microbatch
+        Backward pipeline: PP rank i depends on PP rank i+1 for the same microbatch
         """
         for micro_batch_id in range(self.num_microbatches):
             for model_chunk_id in range(self.num_model_chunks):
-                # Forward pipeline依赖：pp_rank > 0 的forward task依赖于前一个pp_rank的forward task
+                # Forward pipeline dependency: forward tasks at pp_rank > 0 depend on forward tasks from the previous pp_rank
                 for pp_rank in range(1, self.pipeline_parallel_size):
                     current_forward_task = self.pp_mbid_mcid_fb_task_dict[(pp_rank, micro_batch_id, model_chunk_id, TaskType.FORWARD)]
                     prev_forward_task = self.pp_mbid_mcid_fb_task_dict[(pp_rank-1, micro_batch_id, model_chunk_id, TaskType.FORWARD)]
                     current_forward_task.dependencies.append(prev_forward_task.task_id)
                 
-                # Backward pipeline依赖：pp_rank < pipeline_parallel_size-1 的backward task依赖于后一个pp_rank的backward task
+                # Backward pipeline dependency: backward tasks at pp_rank < pipeline_parallel_size-1 depend on backward tasks from the next pp_rank
                 for pp_rank in range(self.pipeline_parallel_size-1):
                     current_backward_task = self.pp_mbid_mcid_fb_task_dict[(pp_rank, micro_batch_id, model_chunk_id, TaskType.BACKWARD)]
                     next_backward_task = self.pp_mbid_mcid_fb_task_dict[(pp_rank+1, micro_batch_id, model_chunk_id, TaskType.BACKWARD)]
@@ -231,7 +234,7 @@ class VppSimulator(object):
         if forward:
             microbatch_id = self.microbatch_id_table[virtual_microbatch_id % self.total_num_microbatches]
         else:
-            # 反向传播时也使用同样的microbatch_id
+            # Use the same microbatch_id for backward pass
             microbatch_id = self.microbatch_id_table[virtual_microbatch_id % self.total_num_microbatches]
         return microbatch_id
 
@@ -242,15 +245,15 @@ class VppSimulator(object):
             model_chunk_id = self.num_model_chunks - model_chunk_id - 1
             # DEBUG: Print reversal logic for backward at virtual_mb_id=0
             if virtual_microbatch_id == 0:
-                print_rank_0(f"      [_get_model_chunk_id] virtual_mb_id={virtual_microbatch_id}, forward={forward}")
-                print_rank_0(f"      [_get_model_chunk_id] original_chunk_id={original_chunk_id}, reversed_chunk_id={model_chunk_id}")
+                log_single_rank(logger, logging.DEBUG, f"      [_get_model_chunk_id] virtual_mb_id={virtual_microbatch_id}, forward={forward}")
+                log_single_rank(logger, logging.DEBUG, f"      [_get_model_chunk_id] original_chunk_id={original_chunk_id}, reversed_chunk_id={model_chunk_id}")
         return model_chunk_id
 
     def _create_pp_rank_schedule_dependencies(self, pp_rank: int):
         # Initialize execution order list for this PP rank
         self.pp_rank_execution_order[pp_rank] = []
 
-        # 获取该PP rank的microbatch分布
+        # Get microbatch distribution for this PP rank
         (
             total_num_microbatches,
             are_all_microbatches_in_warmup,
@@ -258,10 +261,10 @@ class VppSimulator(object):
             num_microbatches_remaining,
         ) = self._get_pp_rank_microbatches(pp_rank)
 
-        # 为每个virtual microbatch创建调度依赖
+        # Create schedule dependencies for each virtual microbatch
         prev_task_id = None
 
-        # Phase 1: Warmup阶段 - 只有前向任务
+        # Phase 1: Warmup phase - forward tasks only
         for k in range(num_warmup_microbatches):
             model_chunk_id = self._get_model_chunk_id(k, forward=True)
             microbatch_id = self._get_microbatch_id_in_model_chunk(k, forward=True)
@@ -271,71 +274,71 @@ class VppSimulator(object):
             # Record execution order
             self.pp_rank_execution_order[pp_rank].append(forward_task.task_id)
 
-            # 同一PP rank内的顺序依赖
+            # Sequential dependencies within the same PP rank
             if prev_task_id is not None:
                 forward_task.dependencies.append(prev_task_id)
 
             prev_task_id = forward_task.task_id
-        
-        # Phase 2: Steady State阶段 - 1F1B
+
+        # Phase 2: Steady state phase - 1F1B
         for k in range(num_microbatches_remaining):
-            # 前向任务
+            # Forward task
             forward_k = k + num_warmup_microbatches
             f_model_chunk_id = self._get_model_chunk_id(forward_k, forward=True)
             f_microbatch_id = self._get_microbatch_id_in_model_chunk(forward_k, forward=True)
 
             forward_task = self.pp_mbid_mcid_fb_task_dict[(pp_rank, f_microbatch_id, f_model_chunk_id, TaskType.FORWARD)]
 
-            # 反向任务
+            # Backward task
             backward_k = k
 
             # DEBUG: Print backward task calculation for first iteration and specific pp_rank
             if k == 0 and pp_rank in [0, 3]:
-                print_rank_0(f"\n>>> DEBUG 1F1B Phase (pp_rank={pp_rank}, k={k}):")
-                print_rank_0(f"    backward_k = {backward_k}")
+                log_single_rank(logger, logging.DEBUG, f"\n>>> DEBUG 1F1B Phase (pp_rank={pp_rank}, k={k}):")
+                log_single_rank(logger, logging.DEBUG, f"    backward_k = {backward_k}")
                 # Get raw values from schedule table
                 raw_mb_id = self.microbatch_id_table[backward_k % self.total_num_microbatches]
                 raw_mc_id = self.model_chunk_id_table[backward_k % self.total_num_microbatches]
-                print_rank_0(f"    schedule_table[{backward_k}] = (mb_id={raw_mb_id}, mc_id={raw_mc_id})")
+                log_single_rank(logger, logging.DEBUG, f"    schedule_table[{backward_k}] = (mb_id={raw_mb_id}, mc_id={raw_mc_id})")
 
             b_model_chunk_id = self._get_model_chunk_id(backward_k, forward=False)
             b_microbatch_id = self._get_microbatch_id_in_model_chunk(backward_k, forward=False)
 
             # DEBUG: Print results after get functions
             if k == 0 and pp_rank in [0, 3]:
-                print_rank_0(f"    After _get_model_chunk_id(backward_k={backward_k}, forward=False):")
-                print_rank_0(f"      b_model_chunk_id = {b_model_chunk_id} (should be reversed!)")
-                print_rank_0(f"      b_microbatch_id = {b_microbatch_id}")
-                print_rank_0(f"    num_model_chunks = {self.num_model_chunks}")
+                log_single_rank(logger, logging.DEBUG, f"    After _get_model_chunk_id(backward_k={backward_k}, forward=False):")
+                log_single_rank(logger, logging.DEBUG, f"      b_model_chunk_id = {b_model_chunk_id} (should be reversed!)")
+                log_single_rank(logger, logging.DEBUG, f"      b_microbatch_id = {b_microbatch_id}")
+                log_single_rank(logger, logging.DEBUG, f"    num_model_chunks = {self.num_model_chunks}")
 
             backward_task = self.pp_mbid_mcid_fb_task_dict[(pp_rank, b_microbatch_id, b_model_chunk_id, TaskType.BACKWARD)]
 
             # DEBUG: Print task_id
             if k == 0 and pp_rank in [0, 3]:
-                print_rank_0(f"    backward_task.task_id = {backward_task.task_id}\n")
+                log_single_rank(logger, logging.DEBUG, f"    backward_task.task_id = {backward_task.task_id}\n")
 
-            # 1F1B阶段的正确依赖关系：forward先执行，然后backward
-            # 1. forward依赖于前一个任务
+            # Correct dependency order for 1F1B phase: execute forward first, then backward
+            # 1. Forward task depends on the previous task
             if prev_task_id is not None:
                 forward_task.dependencies.append(prev_task_id)
 
             # Record execution order: forward first
             self.pp_rank_execution_order[pp_rank].append(forward_task.task_id)
 
-            # 更新 prev_task_id 为当前 forward
+            # Update prev_task_id to current forward task
             prev_task_id = forward_task.task_id
 
-            # 2. backward依赖于前一个任务 (刚执行完的 forward)
+            # 2. Backward task depends on the previous task (the just-completed forward)
             if prev_task_id is not None:
                 backward_task.dependencies.append(prev_task_id)
 
             # Record execution order: backward second
             self.pp_rank_execution_order[pp_rank].append(backward_task.task_id)
 
-            # 3. 下一轮的任务会依赖于当前的backward
+            # 3. Next iteration's task will depend on current backward task
             prev_task_id = backward_task.task_id
-        
-        # Phase 3: Cooldown阶段 - 只有反向任务
+
+        # Phase 3: Cooldown phase - backward tasks only
         if not are_all_microbatches_in_warmup:
             for k in range(num_microbatches_remaining, total_num_microbatches):
                 model_chunk_id = self._get_model_chunk_id(k, forward=False)
@@ -346,7 +349,7 @@ class VppSimulator(object):
                 # Record execution order
                 self.pp_rank_execution_order[pp_rank].append(backward_task.task_id)
 
-                # 同一PP rank内的顺序依赖
+                # Sequential dependencies within the same PP rank
                 if prev_task_id is not None:
                     backward_task.dependencies.append(prev_task_id)
 
@@ -495,7 +498,7 @@ class VppSimulator(object):
         if task_key in self.task_recorder:
             task.duration = self.task_recorder[task_key]
             task.finished = True
-            print_rank_0(f'\tAssigned duration from recorded task: {task.duration:.2f}ms')
+            log_single_rank(logger, logging.INFO, f'\tAssigned duration from recorded task: {task.duration:.2f}ms')
         else:
             raise RuntimeError(
                 f'Task key {task_key} not found in task_recorder. '
@@ -509,28 +512,28 @@ class VppSimulator(object):
 
         # Check if we should skip execution and load from previous results
         if args.skip_execute:
-            print_rank_0("\n" + "="*80)
-            print_rank_0("SKIP EXECUTE MODE: Loading Previous Simulation Results")
-            print_rank_0("="*80)
-            print_rank_0(f"Loading results from: {args.load_result_dir}")
+            log_single_rank(logger, logging.INFO, "\n" + "="*80)
+            log_single_rank(logger, logging.INFO, "SKIP EXECUTE MODE: Loading Previous Simulation Results")
+            log_single_rank(logger, logging.INFO, "="*80)
+            log_single_rank(logger, logging.INFO, f"Loading results from: {args.load_result_dir}")
 
             # Skip Phase 1 and Phase 2, directly go to Phase 3 with loaded data
             # Only rank 0 performs analysis to avoid file I/O conflicts
             if torch.distributed.get_rank() == 0:
-                print_rank_0("\n" + "="*80)
-                print_rank_0("PHASE 3: Analyzing Global Batch Results (from loaded data)")
-                print_rank_0("="*80)
+                log_single_rank(logger, logging.INFO, "\n" + "="*80)
+                log_single_rank(logger, logging.INFO, "PHASE 3: Analyzing Global Batch Results (from loaded data)")
+                log_single_rank(logger, logging.INFO, "="*80)
                 self.analyze_global_batch(load_from_dir=args.load_result_dir)
             return
 
         # Normal execution path
         # Phase 1: Execute all forward tasks
-        print_rank_0("\n" + "="*80)
-        print_rank_0("PHASE 1: Executing Forward Tasks")
-        print_rank_0("="*80)
+        log_single_rank(logger, logging.INFO, "\n" + "="*80)
+        log_single_rank(logger, logging.INFO, "PHASE 1: Executing Forward Tasks")
+        log_single_rank(logger, logging.INFO, "="*80)
         for pp_rank, model_chunk_id, micro_batch_id in self.forward_task_iter():
             now_task = self.pp_mbid_mcid_fb_task_dict[(pp_rank, micro_batch_id, model_chunk_id, TaskType.FORWARD)]
-            print_rank_0("'During run_global_step. Prepare to run FORWARD task. \n"
+            log_single_rank(logger, logging.INFO, "'During run_global_step. Prepare to run FORWARD task. \n"
                          f"\tpp_rank: {pp_rank}; model_chunk_id: {model_chunk_id}; micro_batch_id: {micro_batch_id}")
 
             # Determine execution requirements
@@ -540,9 +543,9 @@ class VppSimulator(object):
             # Execute task if needed (for timing or static memory collection)
             if need_execute_task or need_create_model:
                 if need_execute_task:
-                    print_rank_0(f'\tExecuting task for timing')
+                    log_single_rank(logger, logging.INFO, f'\tExecuting task for timing')
                 else:
-                    print_rank_0(f'\tCreating model for static memory collection only')
+                    log_single_rank(logger, logging.INFO, f'\tCreating model for static memory collection only')
 
                 # Execute task (may skip computation if only collecting static memory)
                 now_task = self._execute_forward_task(
@@ -560,16 +563,16 @@ class VppSimulator(object):
                     now_task = self._assign_task_duration(now_task)
             else:
                 # No execution or model creation needed - assign duration from recorder
-                print_rank_0(f'\tSkipping task execution')
+                log_single_rank(logger, logging.INFO, f'\tSkipping task execution')
                 now_task = self._assign_task_duration(now_task)
 
         # Phase 2: Execute all backward tasks
-        print_rank_0("\n" + "="*80)
-        print_rank_0("PHASE 2: Executing Backward Tasks")
-        print_rank_0("="*80)
+        log_single_rank(logger, logging.INFO, "\n" + "="*80)
+        log_single_rank(logger, logging.INFO, "PHASE 2: Executing Backward Tasks")
+        log_single_rank(logger, logging.INFO, "="*80)
         for pp_rank, model_chunk_id, micro_batch_id in self.backward_task_iter():
             now_task = self.pp_mbid_mcid_fb_task_dict[(pp_rank, micro_batch_id, model_chunk_id, TaskType.BACKWARD)]
-            print_rank_0("'During run_global_step. Prepare to run BACKWARD task. \n"
+            log_single_rank(logger, logging.INFO, "'During run_global_step. Prepare to run BACKWARD task. \n"
                          f"\tpp_rank: {pp_rank}; model_chunk_id: {model_chunk_id}; micro_batch_id: {micro_batch_id}")
 
             # Check if backward task needs execution
@@ -579,32 +582,32 @@ class VppSimulator(object):
             if need_execute_task:
                 forward_task = self.pp_mbid_mcid_fb_task_dict[(pp_rank, micro_batch_id, model_chunk_id, TaskType.FORWARD)]
                 if not forward_task.finished:
-                    print_rank_0(f'\tCorresponding forward task not finished, executing it first...')
+                    log_single_rank(logger, logging.INFO, f'\tCorresponding forward task not finished, executing it first...')
                     forward_task = self._execute_forward_task(forward_task, self.train_data_iterator, execute_task=True)
                     self.record_task(forward_task)
-                    print_rank_0(f'\tForced forward execution completed for backward dependency')
+                    log_single_rank(logger, logging.INFO, f'\tForced forward execution completed for backward dependency')
 
             # Execute or assign duration
             if need_execute_task:
-                print_rank_0(f'\tExecuting backward task for timing')
+                log_single_rank(logger, logging.INFO, f'\tExecuting backward task for timing')
                 now_task = self._execute_backward_task(now_task, self.train_data_iterator)
                 self.record_task(now_task)
             else:
-                print_rank_0(f'\tSkipping backward task execution')
+                log_single_rank(logger, logging.INFO, f'\tSkipping backward task execution')
                 now_task = self._assign_task_duration(now_task)
 
         # Phase 3: Collect and save results
         # Only rank 0 performs file I/O operations to avoid conflicts
         if torch.distributed.get_rank() == 0:
-            print_rank_0("\n" + "="*80)
-            print_rank_0("PHASE 3: Collecting and Saving Results")
-            print_rank_0("="*80)
+            log_single_rank(logger, logging.INFO, "\n" + "="*80)
+            log_single_rank(logger, logging.INFO, "PHASE 3: Collecting and Saving Results")
+            log_single_rank(logger, logging.INFO, "="*80)
             self._collect_and_save_results()
 
             # Phase 4: Analyze and generate reports
-            print_rank_0("\n" + "="*80)
-            print_rank_0("PHASE 4: Analyzing Global Batch Results")
-            print_rank_0("="*80)
+            log_single_rank(logger, logging.INFO, "\n" + "="*80)
+            log_single_rank(logger, logging.INFO, "PHASE 4: Analyzing Global Batch Results")
+            log_single_rank(logger, logging.INFO, "="*80)
             self.analyze_global_batch(load_from_dir=args.simulate_result_dir)
 
     def _collect_and_save_results(self):
@@ -621,7 +624,7 @@ class VppSimulator(object):
         if simulate_result_dir is None:
             raise ValueError("--simulate-result-dir must be specified in execute mode")
 
-        print_rank_0(f"Collecting results and saving to: {simulate_result_dir}")
+        log_single_rank(logger, logging.INFO, f"Collecting results and saving to: {simulate_result_dir}")
 
         # Collect finished tasks from current execution
         # IMPORTANT: Collect tasks in execution order (not dict iteration order)
@@ -651,26 +654,26 @@ class VppSimulator(object):
                     if task.finished:
                         pp_finished_task_queue_dict[pp_rank].append(task)
                 else:
-                    print_rank_0(f"Warning: task {task_id} not found in task dict")
+                    log_single_rank(logger, logging.WARNING, f"Warning: task {task_id} not found in task dict")
 
         # Count total finished tasks
         total_finished_tasks = sum(len(tasks) for tasks in pp_finished_task_queue_dict.values())
-        print_rank_0(f"Collected {total_finished_tasks} finished tasks across {self.pipeline_parallel_size} PP ranks")
+        log_single_rank(logger, logging.INFO, f"Collected {total_finished_tasks} finished tasks across {self.pipeline_parallel_size} PP ranks")
 
         # Verification: Print task collection order for debugging
-        print_rank_0("\n" + "=" * 80)
-        print_rank_0("Task Collection Order Verification:")
-        print_rank_0("=" * 80)
+        log_single_rank(logger, logging.DEBUG, "\n" + "=" * 80)
+        log_single_rank(logger, logging.DEBUG, "Task Collection Order Verification:")
+        log_single_rank(logger, logging.DEBUG, "=" * 80)
         for pp_rank in range(min(2, self.pipeline_parallel_size)):  # Print first 2 PP ranks
-            print_rank_0(f"PP Rank {pp_rank}: {len(pp_finished_task_queue_dict[pp_rank])} tasks collected")
+            log_single_rank(logger, logging.DEBUG, f"PP Rank {pp_rank}: {len(pp_finished_task_queue_dict[pp_rank])} tasks collected")
             for i, task in enumerate(pp_finished_task_queue_dict[pp_rank][:5]):  # Print first 5 tasks
-                print_rank_0(f"  [{i}] {task.task_id}")
-        print_rank_0("=" * 80 + "\n")
+                log_single_rank(logger, logging.DEBUG, f"  [{i}] {task.task_id}")
+        log_single_rank(logger, logging.DEBUG, "=" * 80 + "\n")
 
         # Save auxiliary files
         self._save_auxiliary_files(pp_finished_task_queue_dict, simulate_result_dir)
 
-        print_rank_0("✅ Results collection and saving complete!")
+        log_single_rank(logger, logging.INFO, "✅ Results collection and saving complete!")
 
     def analyze_global_batch(self, load_from_dir):
         """Analyze complete global batch execution including timeline, throughput, and memory
@@ -688,21 +691,21 @@ class VppSimulator(object):
         """
         args = get_args()
 
-        print_rank_0("=" * 80)
-        print_rank_0("Starting Global Batch Analysis")
-        print_rank_0("=" * 80)
+        log_single_rank(logger, logging.INFO, "=" * 80)
+        log_single_rank(logger, logging.INFO, "Starting Global Batch Analysis")
+        log_single_rank(logger, logging.INFO, "=" * 80)
 
         # Step 1: Load finished tasks from directory
-        print_rank_0(f"Loading finished tasks from: {load_from_dir}")
+        log_single_rank(logger, logging.INFO, f"Loading finished tasks from: {load_from_dir}")
         pp_finished_task_queue_dict = self._load_finished_tasks(load_from_dir)
 
         # Use load_from_dir as the analysis directory
         analysis_dir = load_from_dir
 
         # Step 2: Generate timeline visualization
-        print_rank_0("\n" + "-" * 80)
-        print_rank_0("Generating timeline visualization...")
-        print_rank_0("-" * 80)
+        log_single_rank(logger, logging.INFO, "\n" + "-" * 80)
+        log_single_rank(logger, logging.INFO, "Generating timeline visualization...")
+        log_single_rank(logger, logging.INFO, "-" * 80)
         from megatron.training.simulation import analyzer
         from megatron.training.simulation.task import TaskType
 
@@ -716,10 +719,10 @@ class VppSimulator(object):
             task_type_enum=TaskType
         )
 
-        print_rank_0("\n" + "=" * 80)
-        print_rank_0("✅ Global Batch Analysis Complete!")
-        print_rank_0("=" * 80)
-        print_rank_0(f"Analysis results from: {analysis_dir}")
+        log_single_rank(logger, logging.INFO, "\n" + "=" * 80)
+        log_single_rank(logger, logging.INFO, "✅ Global Batch Analysis Complete!")
+        log_single_rank(logger, logging.INFO, "=" * 80)
+        log_single_rank(logger, logging.INFO, f"Analysis results from: {analysis_dir}")
 
     def _load_finished_tasks(self, load_result_dir):
         """Load finished tasks from a previous simulation run
@@ -738,7 +741,7 @@ class VppSimulator(object):
                 "Please ensure the directory contains results from a previous simulation run."
             )
 
-        print_rank_0(f"Loading finished tasks from: {finished_tasks_path}")
+        log_single_rank(logger, logging.INFO, f"Loading finished tasks from: {finished_tasks_path}")
         with open(finished_tasks_path, 'r') as f:
             finished_tasks_json = json.load(f)
 
@@ -750,7 +753,7 @@ class VppSimulator(object):
 
         # Count total tasks loaded
         total_tasks = sum(len(tasks) for tasks in pp_finished_task_queue_dict.values())
-        print_rank_0(f"Loaded {total_tasks} finished tasks from {len(pp_finished_task_queue_dict)} PP ranks")
+        log_single_rank(logger, logging.INFO, f"Loaded {total_tasks} finished tasks from {len(pp_finished_task_queue_dict)} PP ranks")
 
         return pp_finished_task_queue_dict
 
@@ -773,7 +776,7 @@ class VppSimulator(object):
         pp_task_orders_path = os.path.join(simulate_result_dir, 'pp_task_orders.json')
         with open(pp_task_orders_path, 'w') as f:
             json.dump(pp_task_orders, f, indent=2)
-        print_rank_0(f"Saved task orders to: {pp_task_orders_path}")
+        log_single_rank(logger, logging.INFO, f"Saved task orders to: {pp_task_orders_path}")
 
         # 2. Save all_pp_vpp_layout.json
         all_pp_vpp_layout = {}
@@ -789,7 +792,7 @@ class VppSimulator(object):
         vpp_layout_path = os.path.join(simulate_result_dir, 'all_pp_vpp_layout.json')
         with open(vpp_layout_path, 'w') as f:
             json.dump(all_pp_vpp_layout, f, indent=2)
-        print_rank_0(f"Saved VPP layouts to: {vpp_layout_path}")
+        log_single_rank(logger, logging.INFO, f"Saved VPP layouts to: {vpp_layout_path}")
 
         # 3. Save static_memory_info.json with actual model memory info
         static_memory_info = {
@@ -805,7 +808,7 @@ class VppSimulator(object):
                 # This should not happen in normal simulation, but provide fallback
                 params_gb = 0.0
                 grads_gb = 0.0
-                print_rank_0(f"Warning: PP rank {pp_rank} static memory not collected, using 0.0")
+                log_single_rank(logger, logging.WARNING, f"Warning: PP rank {pp_rank} static memory not collected, using 0.0")
 
             static_memory_info["executor_0"][str(pp_rank)] = {
                 "static": {
@@ -818,7 +821,7 @@ class VppSimulator(object):
         static_memory_path = os.path.join(simulate_result_dir, 'static_memory_info.json')
         with open(static_memory_path, 'w') as f:
             json.dump(static_memory_info, f, indent=2)
-        print_rank_0(f"Saved static memory info to: {static_memory_path}")
+        log_single_rank(logger, logging.INFO, f"Saved static memory info to: {static_memory_path}")
 
         # 4. Save finished_tasks.json - complete task objects for re-analysis
         finished_tasks_json = {}
@@ -828,7 +831,7 @@ class VppSimulator(object):
         finished_tasks_path = os.path.join(simulate_result_dir, 'finished_tasks.json')
         with open(finished_tasks_path, 'w') as f:
             json.dump(finished_tasks_json, f, indent=2)
-        print_rank_0(f"Saved finished tasks to: {finished_tasks_path}")
+        log_single_rank(logger, logging.INFO, f"Saved finished tasks to: {finished_tasks_path}")
 
         # 5. Save task_durations.json - human-readable task duration records
         task_durations = {}
@@ -845,7 +848,7 @@ class VppSimulator(object):
         task_durations_path = os.path.join(simulate_result_dir, 'task_durations.json')
         with open(task_durations_path, 'w') as f:
             json.dump(task_durations, f, indent=2)
-        print_rank_0(f"Saved task durations to: {task_durations_path}")
+        log_single_rank(logger, logging.INFO, f"Saved task durations to: {task_durations_path}")
 
     def _execute_forward_task(self, task: Task, data_iterator, execute_task: bool = True):
         """Execute forward task with actual computation
@@ -876,26 +879,26 @@ class VppSimulator(object):
             # Clear old model if exists
             if self.current_model is not None:
                 if global_rank == 0:
-                    print_rank_0(f"Clearing old model: pp_rank={self.current_model_pp_rank}, "
+                    log_single_rank(logger, logging.INFO, f"Clearing old model: pp_rank={self.current_model_pp_rank}, "
                                 f"vpp_rank={self.current_model_vpp_rank}")
                 clear_model_mem(self.current_model)
                 self.current_model = None
 
             # Create new model
             if global_rank == 0:
-                print_rank_0(f"Creating new model for pp_rank={pp_rank}, vpp_rank={vpp_rank}")
+                log_single_rank(logger, logging.INFO, f"Creating new model for pp_rank={pp_rank}, vpp_rank={vpp_rank}")
             self.current_model = create_model(pp_rank, self.model_provider)
             self.current_model_pp_rank = pp_rank
             self.current_model_vpp_rank = vpp_rank
-            
+
         else:
             if global_rank == 0:
-                print_rank_0(f"Reusing existing model for pp_rank={pp_rank}, vpp_rank={vpp_rank}")
+                log_single_rank(logger, logging.INFO, f"Reusing existing model for pp_rank={pp_rank}, vpp_rank={vpp_rank}")
 
         # If we don't need to execute the task (only collecting static memory), return early
         if not execute_task:
             if global_rank == 0:
-                print_rank_0(f"Skipping forward execution (static memory collected)")
+                log_single_rank(logger, logging.INFO, f"Skipping forward execution (static memory collected)")
             # Mark task as finished with 0 duration (will be filled from task_recorder later)
             task.duration = 0.0
             task.finished = False  # Not actually executed
@@ -907,7 +910,7 @@ class VppSimulator(object):
         )
 
         input_info = f"shape: {input_tensor.shape}" if input_tensor is not None else "None"
-        print_rank_0(f"Forward task Before execute. - pp_rank: {pp_rank}, vpp_rank: {vpp_rank}, "
+        log_single_rank(logger, logging.DEBUG, f"Forward task Before execute. - pp_rank: {pp_rank}, vpp_rank: {vpp_rank}, "
                     f"microbatch_id: {microbatch_id}, input_tensor: {input_info}")
 
         # Execute forward with timing
@@ -924,14 +927,14 @@ class VppSimulator(object):
         )
 
         # Cache output tensor for downstream stages
-        print_rank_0(f"Forward task After execute. - pp_rank: {pp_rank}, vpp_rank: {vpp_rank}, "
+        log_single_rank(logger, logging.DEBUG, f"Forward task After execute. - pp_rank: {pp_rank}, vpp_rank: {vpp_rank}, "
                     f"microbatch_id: {microbatch_id}, output_tensor: {output_tensor}")
         cache_key = (pp_rank, vpp_rank, microbatch_id)
         self.task_output_tensor_dict[cache_key] = output_tensor.detach().clone()
 
         if global_rank == 0:
             output_info = f"shape: {output_tensor.shape}" if output_tensor is not None else "None"
-            print_rank_0(f"Forward task completed - output_tensor: {output_info}, "
+            log_single_rank(logger, logging.DEBUG, f"Forward task completed - output_tensor: {output_info}, "
                         f"duration: {avg_forward_time:.2f}ms")
 
         # Update task
@@ -970,21 +973,21 @@ class VppSimulator(object):
             # Clear old model if exists
             if self.current_model is not None:
                 if global_rank == 0:
-                    print_rank_0(f"Clearing old model: pp_rank={self.current_model_pp_rank}, "
+                    log_single_rank(logger, logging.INFO, f"Clearing old model: pp_rank={self.current_model_pp_rank}, "
                                 f"vpp_rank={self.current_model_vpp_rank}")
                 clear_model_mem(self.current_model)
                 self.current_model = None
 
             # Create new model
             if global_rank == 0:
-                print_rank_0(f"Creating new model for pp_rank={pp_rank}, vpp_rank={vpp_rank}")
+                log_single_rank(logger, logging.INFO, f"Creating new model for pp_rank={pp_rank}, vpp_rank={vpp_rank}")
             self.current_model = create_model(pp_rank, self.model_provider)
             self.current_model_pp_rank = pp_rank
             self.current_model_vpp_rank = vpp_rank
             # Note: Static memory is already collected in forward task, no need to recalculate here
         else:
             if global_rank == 0:
-                print_rank_0(f"Reusing existing model for pp_rank={pp_rank}, vpp_rank={vpp_rank}")
+                log_single_rank(logger, logging.INFO, f"Reusing existing model for pp_rank={pp_rank}, vpp_rank={vpp_rank}")
 
         # Prepare input tensor from forward pass output
         input_tensor = prepare_input_tensor(
@@ -997,7 +1000,7 @@ class VppSimulator(object):
 
         if global_rank == 0:
             input_info = f"shape: {input_tensor.shape}" if input_tensor is not None else "None"
-            print_rank_0(f"Backward task - pp_rank: {pp_rank}, vpp_rank: {vpp_rank}, "
+            log_single_rank(logger, logging.DEBUG, f"Backward task - pp_rank: {pp_rank}, vpp_rank: {vpp_rank}, "
                         f"microbatch_id: {microbatch_id}, input_tensor: {input_info}")
 
         # Execute backward with timing (output_tensor_grad will be prepared inside)
@@ -1022,7 +1025,7 @@ class VppSimulator(object):
 
         if global_rank == 0:
             input_grad_info = f"shape: {input_tensor_grad.shape}" if input_tensor_grad is not None else "None"
-            print_rank_0(f"Backward task completed - input_tensor_grad: {input_grad_info}, "
+            log_single_rank(logger, logging.DEBUG, f"Backward task completed - input_tensor_grad: {input_grad_info}, "
                         f"duration: {avg_backward_time:.2f}ms")
 
         # Update task

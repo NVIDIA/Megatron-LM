@@ -2,6 +2,7 @@
 
 """Model Executor Utilities for VPP Training Simulation"""
 
+import logging
 import os
 import time
 import torch
@@ -12,11 +13,13 @@ from functools import partial
 
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core import parallel_state
+from megatron.core.utils import get_model_config, get_attr_wrapped_model, log_single_rank
 from megatron.training.global_vars import get_args
 from megatron.core.pipeline_parallel.schedules import forward_step
-from megatron.core.utils import get_model_config, get_attr_wrapped_model
 from megatron.training.utils import print_rank_0
 from megatron.training.simulation.utils import MockPipelineProcessGroup
+
+logger = logging.getLogger(__name__)
 
 
 def get_pg_collection_for_simulation(pp_rank: int, pp_size: int):
@@ -127,101 +130,6 @@ def clear_model_mem(model):
 
     # Force garbage collection
     gc.collect()
-
-
-def _create_timeline_profiler(pp_rank, vpp_rank, microbatch_id, profile_dir, global_rank, task_type='FORWARD'):
-    """Create timeline profiler for performance analysis
-
-    Args:
-        pp_rank: pipeline parallel rank
-        vpp_rank: virtual pipeline rank (model_chunk_id)
-        microbatch_id: microbatch id
-        profile_dir: directory to save profiler results
-        global_rank: global rank for multi-GPU setup
-        task_type: type of task ('FORWARD' or 'BACKWARD')
-
-    Returns:
-        torch.profiler.profile: configured profiler instance
-    """
-    current_profile_sub_dir = f'pp_{pp_rank}-vpp_{vpp_rank}-microbatch_id_{microbatch_id}-task_type_{task_type}'
-
-    def trace_handler():
-        # Only save for rank 0 to reduce overhead
-        if global_rank == 0:
-            return torch.profiler.tensorboard_trace_handler(
-                os.path.join(profile_dir, current_profile_sub_dir),
-                worker_name=f"torch_profiler-global_rank_{global_rank}",
-                use_gzip=True,
-            )
-        else:
-            def _dummy_writer(p):
-                # Do nothing for non-zero ranks
-                pass
-            return _dummy_writer
-
-    default_profiler_config = dict(
-        activities=[torch.profiler.ProfilerActivity.CPU, torch.profiler.ProfilerActivity.CUDA],
-        with_stack=True,
-        record_shapes=True,
-        profile_memory=False,
-        schedule=torch.profiler.schedule(
-            wait=2,
-            warmup=2,
-            active=1,
-            repeat=1,
-            skip_first=0,
-        ),
-        on_trace_ready=trace_handler(),
-    )
-
-    return torch.profiler.profile(**default_profiler_config)
-
-
-def _stop_memory_tracking():
-    """Stop memory tracking and clear history"""
-    torch.cuda.memory._record_memory_history(enabled=None)
-
-
-def _start_memory_tracking():
-    """Start memory tracking for snapshot generation"""
-    # Stop any previous tracking to ensure clean state
-    _stop_memory_tracking()
-    torch.cuda.memory._record_memory_history(
-        enabled='all',  # Keep information for currently allocated memory
-        max_entries=10000000,
-    )
-
-
-def _save_memory_snapshot(pp_rank, vpp_rank, microbatch_id, profile_dir, global_rank, task_type='FORWARD'):
-    """Save memory snapshot to file
-
-    Args:
-        pp_rank: pipeline parallel rank
-        vpp_rank: virtual pipeline rank (model_chunk_id)
-        microbatch_id: microbatch id
-        profile_dir: directory to save snapshot
-        global_rank: global rank for multi-GPU setup
-        task_type: type of task ('FORWARD' or 'BACKWARD')
-    """
-    # Only save for rank 0 to reduce overhead
-    if global_rank == 0:
-        os.makedirs(profile_dir, exist_ok=True)
-
-        # Convert task_type to standard format
-        if task_type == 'FORWARD' or task_type.upper() == 'FORWARD':
-            task_type_str = 'TaskType.FORWARD'
-        elif task_type == 'BACKWARD' or task_type.upper() == 'BACKWARD':
-            task_type_str = 'TaskType.BACKWARD'
-        else:
-            # Keep original task_type if it's already in the correct format
-            task_type_str = task_type
-
-        snapshot_file = os.path.join(
-            profile_dir,
-            f'memory_snapshot-global_rank{global_rank}-pp_rank_{pp_rank}-vpp_rank_{vpp_rank}-microbatch_id_{microbatch_id}-task_type_{task_type_str}.pickle'
-        )
-        torch.cuda.memory._dump_snapshot(snapshot_file)
-        print(f"Memory snapshot saved: {snapshot_file}")
 
 
 def prepare_input_tensor(pp_rank, vpp_rank, microbatch_id, task_output_tensor_dict):
@@ -467,11 +375,6 @@ def execute_backward_with_timing(
     # Save original config setting and temporarily disable deallocate
     original_deallocate = config.deallocate_pipeline_outputs
     config.deallocate_pipeline_outputs = False
-
-    # Create timeline profiler
-    timeline_profiler = _create_timeline_profiler(
-        pp_rank, vpp_rank, microbatch_id, simulate_result_dir, global_rank, task_type='BACKWARD'
-    )
 
     # Warmup phase with profiling
     for i in range(warmup_times):
