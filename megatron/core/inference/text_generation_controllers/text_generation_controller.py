@@ -11,21 +11,22 @@ from typing import Any, Dict, Iterator, List, Optional, OrderedDict, Tuple, Unio
 import torch
 import torch.nn.functional as F
 from torch import Tensor
-from torch.distributed import ProcessGroup
 
+from megatron.core import parallel_state
 from megatron.core.inference.async_stream import AsyncStream
 from megatron.core.inference.communication_utils import (
     broadcast_from_last_pipeline_stage,
-    is_pipeline_first_stage,
     is_pipeline_last_stage,
 )
 from megatron.core.inference.contexts.dynamic_context import MaxSequenceLengthOverflowError
+from megatron.core.inference.contexts.static_context import StaticInferenceContext
 from megatron.core.inference.inference_request import InferenceRequest, Status
 from megatron.core.inference.model_inference_wrappers.abstract_model_inference_wrapper import (
     AbstractModelInferenceWrapper,
 )
 from megatron.core.inference.sampling_params import SamplingParams
 from megatron.core.inference.utils import get_attention_mask, set_decode_expert_padding
+from megatron.core.models.multimodal.llava_model import LLaVAModel
 from megatron.core.transformer.enums import CudaGraphScope
 from megatron.core.transformer.moe.moe_layer import BaseMoELayer
 from megatron.core.transformer.utils import set_model_to_sequence_parallel
@@ -52,28 +53,32 @@ class TextGenerationController:
         inference_wrapped_model (AbstractModelInferenceWrapper): A model that
             is wrapped using the specs given in the abstract_model_inference_wrapper.py
         tokenizer (_type_): Tokenizer used for tokenizing and detokenizing the prompts
-        pp_group (ProcessGroup): Process group for pipeline parallelism
     """
 
-    def __init__(
-        self,
-        inference_wrapped_model: AbstractModelInferenceWrapper,
-        tokenizer,
-        pp_group: ProcessGroup = None,
-    ):
+    def __init__(self, inference_wrapped_model: AbstractModelInferenceWrapper, tokenizer):
         self.inference_wrapped_model = inference_wrapped_model
+        self.model_config = self.inference_wrapped_model.model.config
+        inference_config = self.inference_wrapped_model.inference_context.config
         self.tokenizer = tokenizer
 
-        self.pp_group = pp_group
+        pg_collection = inference_config.pg_collection
+        if pg_collection is not None:
+            self.pp_group = pg_collection.pp
+        else:
+            self.pp_group = parallel_state.get_pipeline_model_parallel_group()
 
-        # For models without pipeline parallelism, is_first_stage and is_last_stage returns True
-        self.model_is_pipeline_parallel = not (
-            is_pipeline_first_stage(self.pp_group) and is_pipeline_last_stage(self.pp_group)
-        )
+        self.model_is_pipeline_parallel = self.model_config.pipeline_model_parallel_size > 1
 
-        model_config = get_model_config(self.inference_wrapped_model.model)
+        # Use padded vocab size because tokenizer vocab size might pad to nearest power of 2.
+        # TODO(ksanthanam): Consider deprecating this check if LLaVAModel is no longer used
+        unwrapped_model = unwrap_model(self.inference_wrapped_model.model)
+        if isinstance(unwrapped_model, LLaVAModel):
+            self.vocab_size = unwrapped_model.language_model.vocab_size
+        else:
+            self.vocab_size = unwrapped_model.vocab_size
+
         self.sampling_rng = torch.Generator(device=torch.cuda.current_device())
-        self.sampling_rng.manual_seed(model_config.inference_sampling_seed)
+        self.sampling_rng.manual_seed(self.model_config.inference_sampling_seed)
 
         if self.inference_wrapped_model.inference_context.is_dynamic_batching():
             self._init_dynamic_sampling_tensors()
@@ -98,9 +103,7 @@ class TextGenerationController:
         self._get_stop_word_finished_ids_callback = None
 
         device = torch.cuda.current_device()
-        logits_dtype = self.inference_wrapped_model.inference_wrapper_config.params_dtype
-        # Use padded vocab size because tokenizer vocab size might pad to nearest power of 2.
-        vocab_size = self.inference_wrapped_model.inference_wrapper_config.padded_vocab_size
+        logits_dtype = self.inference_wrapped_model.config.params_dtype
 
         self._sampling_backend = "torch"
         self._sampled_tokens_cuda = torch.empty(max_requests, dtype=torch.int64, device=device)
@@ -505,7 +508,6 @@ class TextGenerationController:
             position_ids (Tensor): The active position IDs.
         """
         context = self.inference_wrapped_model.inference_context
-        inference_wrapper_config = self.inference_wrapped_model.inference_wrapper_config
         active_request_slice = slice(context.paused_request_count, context.total_request_count)
 
         # Remove Float16Module wrapper if it exists
@@ -517,11 +519,11 @@ class TextGenerationController:
 
         # If using symmetric kernels and we are using using nccl
         # for prefill turn off symmetric kernels
-        symmetric_ar_type = model_config.symmetric_ar_type
-        nccl_all_reduce_for_prefill = inference_wrapper_config.nccl_all_reduce_for_prefill
+        symmetric_ar_type = self.model_config.symmetric_ar_type
+        nccl_all_reduce_for_prefill = self.model_config.nccl_all_reduce_for_prefill
         # Turning on/off MoE padding for cuda-graphs
         moe_pad_experts_for_cuda_graph_inference = (
-            inference_wrapper_config.moe_pad_experts_for_cuda_graph_inference
+            self.model_config.moe_pad_experts_for_cuda_graph_inference
         )
         if moe_pad_experts_for_cuda_graph_inference:
             if context.using_cuda_graph_this_step():
@@ -569,8 +571,6 @@ class TextGenerationController:
             input_ids (Tensor): The input token IDs.
             position_ids (Tensor): The position IDs.
         """
-        inference_wrapper_config = self.inference_wrapped_model.inference_wrapper_config
-
         context = self.inference_wrapped_model.inference_context
         active_request_count = context.total_request_count - context.paused_request_count
 
@@ -582,18 +582,17 @@ class TextGenerationController:
         if self.model_is_pipeline_parallel:
             logits_seq_len = (
                 active_request_count
-                if context.materialize_only_last_token_logits
+                if context.config.materialize_only_last_token_logits
                 else input_ids.shape[1]
             )
-            vocab_size = inference_wrapper_config.padded_vocab_size
-            logits_shape = [1, logits_seq_len, vocab_size]
+            logits_shape = [1, logits_seq_len, self.vocab_size]
 
             if is_pipeline_last_stage(self.pp_group):
                 assert logits is not None and torch.Size(logits_shape) == logits.shape
 
             logits = broadcast_from_last_pipeline_stage(
                 logits_shape,
-                dtype=inference_wrapper_config.params_dtype,
+                dtype=self.model_config.params_dtype,
                 tensor=logits,
                 pp_group=self.pp_group,
             )
@@ -639,7 +638,7 @@ class TextGenerationController:
 
         # Last token logits.
         context = self.inference_wrapped_model.inference_context
-        if context.materialize_only_last_token_logits:
+        if context.config.materialize_only_last_token_logits:
             # When materialize_only_last_token_logits is true, last_token_logits is
             # already called in the forward pass of GPT.
             last_token_logits = logits.squeeze(0)
@@ -684,7 +683,7 @@ class TextGenerationController:
         return context.calculate_log_probs(
             logits,
             self._sampled_tokens_cuda[:active_request_count],
-            only_last_token_logits=context.materialize_only_last_token_logits,
+            only_last_token_logits=context.config.materialize_only_last_token_logits,
         )
 
     def _dynamic_step_calculate_top_n_logprobs(
@@ -712,7 +711,7 @@ class TextGenerationController:
         active_request_slice = slice(context.paused_request_count, context.total_request_count)
 
         # Handle decode-only mode (only last token)
-        if context.materialize_only_last_token_logits or context.is_decode_only():
+        if context.config.materialize_only_last_token_logits or context.is_decode_only():
             # In decode mode or when only last token logits are materialized,
             # logits already represent only the last tokens
             log_probs = log_probs_tensor[:active_request_count]
@@ -1024,9 +1023,10 @@ class TextGenerationController:
         # Pad batch tokens if necessary
         batch_size = len(active_requests)
         max_sequence_length = max_prompt_length_in_batch + sampling_params.num_tokens_to_generate
-        inference_wrapper_config = self.inference_wrapped_model.inference_wrapper_config
-        inference_max_batch_size = inference_wrapper_config.inference_max_requests
-        inference_max_sequence_length = inference_wrapper_config.inference_max_seq_length
+        context = self.inference_wrapped_model.inference_context
+        assert isinstance(context, StaticInferenceContext)
+        inference_max_batch_size = context.max_batch_size
+        inference_max_sequence_length = context.max_sequence_length
         padded_batch_size = inference_max_batch_size if enable_cuda_graph else batch_size
         if padded_batch_size > inference_max_batch_size:
             raise ValueError(
@@ -1065,10 +1065,6 @@ class TextGenerationController:
         generated_sequence_lengths = torch.zeros(
             batch_size, device=torch.cuda.current_device()
         ).cuda()
-
-        # Use padded vocab size because tokenizer vocab size might not include padding
-        # to nearest power of 2
-        vocab_size = inference_wrapper_config.padded_vocab_size
 
         # Check whether early termination is enabled
         no_early_termination = getattr(sampling_params, "no_early_termination", False)
@@ -1130,14 +1126,14 @@ class TextGenerationController:
 
             # If using symmetric kernels and we are using using nccl
             # for prefill turn off symmetric kernels
-            symmetric_ar_type = model_config.symmetric_ar_type
-            nccl_all_reduce_for_prefill = inference_wrapper_config.nccl_all_reduce_for_prefill
+            symmetric_ar_type = self.model_config.symmetric_ar_type
+            nccl_all_reduce_for_prefill = self.model_config.nccl_all_reduce_for_prefill
             if symmetric_ar_type is not None and nccl_all_reduce_for_prefill:
                 unwrapped_model.set_symmetric_ar(None)
 
             # Turning off MoE padding for prefill
             moe_pad_experts_for_cuda_graph_inference = (
-                inference_wrapper_config.moe_pad_experts_for_cuda_graph_inference
+                self.model_config.moe_pad_experts_for_cuda_graph_inference
             )
             if moe_pad_experts_for_cuda_graph_inference:
                 set_decode_expert_padding(unwrapped_model, False)
@@ -1191,7 +1187,7 @@ class TextGenerationController:
                     or not (sampling_params.return_log_probs or sampling_params.top_n_logprobs > 0)
                 )
                 inference_context = self.inference_wrapped_model.inference_context
-                inference_context.materialize_only_last_token_logits = (
+                inference_context.config.materialize_only_last_token_logits = (
                     materialize_only_last_token_logits
                 )
 
@@ -1212,14 +1208,14 @@ class TextGenerationController:
                 if self.model_is_pipeline_parallel:
                     context_length = context_end_position - context_start_position
                     logits_seq_len = 1 if materialize_only_last_token_logits else context_length
-                    logits_shape = [batch_size, logits_seq_len, vocab_size]
+                    logits_shape = [batch_size, logits_seq_len, self.vocab_size]
                     if is_pipeline_last_stage(self.pp_group):
                         assert logits is not None and torch.Size(logits_shape) == logits.shape
                     # TODO(ksanthanam): Evaluate whether it makes more sense to sample on 1 rank
                     # and then broadcast the sampled tokens rather than broadcasting the raw logits.
                     logits = broadcast_from_last_pipeline_stage(
-                        [batch_size, logits_seq_len, vocab_size],
-                        dtype=inference_wrapper_config.params_dtype,
+                        [batch_size, logits_seq_len, self.vocab_size],
+                        dtype=self.model_config.params_dtype,
                         tensor=logits,
                         pp_group=self.pp_group,
                     )
@@ -1248,7 +1244,7 @@ class TextGenerationController:
                 sampled_logits = self.sample_from_logits(
                     last_token_logits,
                     sampling_params,
-                    vocab_size,
+                    self.vocab_size,
                     generation_started=generation_started,
                     top_n_logprobs_dict=top_n_logprobs_dict,
                     logits=logits_for_top_n_prompt_logprobs,
