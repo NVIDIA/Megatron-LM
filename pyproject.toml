@@ -64,7 +64,7 @@ Download = "https://github.com/NVIDIA/Megatron-LM/releases"
 Homepage = "https://github.com/NVIDIA/Megatron-LM/megatron/core"
 
 [project.optional-dependencies]
-mlm = ["flask-restful", "sentencepiece", "tiktoken", "wandb", "transformers"]
+mlm = ["flask-restful", "sentencepiece", "tiktoken", "wandb", "transformers", "accelerate"]
 
 dev = [
     "nvidia-modelopt[torch]; sys_platform != 'darwin'",
