@@ -77,12 +77,12 @@ Megatron-LM/
 │   │   ├── distributed/         # Distributed training (FSDP, DDP)
 │   │   ├── optimizer/           # Optimizers
 │   │   ├── datasets/            # Dataset loaders
-│   │   ├── inference/           # Inference engines
+│   │   ├── inference/           # Inference engines and server
 │   │   └── export/              # Model export (e.g. TensorRT-LLM)
 │   ├── training/                # Training scripts
-│   ├── inference/               # Inference server
 │   ├── legacy/                  # Legacy components
-│   └── post_training/           # Post-training (RLHF, etc.)
+│   ├── post_training/           # Post-training (quantization, distillation, pruning, etc.)
+│   └── rl/                      # Reinforcement learning (RLHF, etc.)
 ├── examples/                    # Ready-to-use training examples
 ├── tools/                       # Utility tools
 ├── tests/                       # Comprehensive test suite
