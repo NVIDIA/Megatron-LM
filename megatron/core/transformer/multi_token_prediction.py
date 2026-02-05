@@ -265,13 +265,13 @@ def _roll_tensor_packed_seq(tensor, shifts, dims, packed_seq_params, cp_group=No
         # the idx has been multiplied by cp_size, need to divide it by cp_size to get the local idx
         local_start_idx = start_idx // cp_size
         local_end_idx = end_idx // cp_size
-        
+
         # Skip empty sequences - this can happen when a sequence is very short and
         # after dividing by cp_size, the local slice has zero length
         local_seq_len = local_end_idx - local_start_idx
         if local_seq_len == 0:
             continue
-            
+
         tensor_slice = rolled_tensor[..., local_start_idx:local_end_idx].clone()
 
         # The following code is very similar as the code in roll_tensor function
@@ -283,10 +283,12 @@ def _roll_tensor_packed_seq(tensor, shifts, dims, packed_seq_params, cp_group=No
         for chunk in rolled_chunks:
             # Skip empty chunks that can occur when the sequence slice is very small
             if chunk.size(dims) == 0:
-                empty_shape = list(chunk.shape)
-                empty_shape[dims] = 0
-                tensor_send_list.append(torch.empty(chunk.shape[:-1], dtype=chunk.dtype, device=chunk.device))
-                tensor_recv_list.append(torch.empty(chunk.shape[:-1], dtype=chunk.dtype, device=chunk.device))
+                tensor_send_list.append(
+                    torch.empty(chunk.shape[:-1], dtype=chunk.dtype, device=chunk.device)
+                )
+                tensor_recv_list.append(
+                    torch.empty(chunk.shape[:-1], dtype=chunk.dtype, device=chunk.device)
+                )
                 continue
             boundary = chunk.select(dims, shifts).contiguous().clone()
             tensor_send_list.append(boundary)
