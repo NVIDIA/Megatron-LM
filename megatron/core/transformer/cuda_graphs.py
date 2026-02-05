@@ -113,6 +113,56 @@ def join_external_streams():
     _JOIN_STREAMS = []
 
 
+class RecordStreamTracker:
+    """Tracks tensor references and alternates CUDA streams across consecutive cudagraph replays.
+
+    Double-buffers both tensor references (intercepted via record_stream) and CUDA streams so
+    that consecutive cudagraph replays use different streams, allowing overlap with async comms.
+    This is needed as any tensors that have been attached to a stream with record_stream
+    may be deallocated when the stream is joined. Because we may wish to overlap the subsequent
+    cudagraph with the previous cudagraph's async comms (ie. offloads), the subsequent cudagraph
+    may invalidate the memory of async comm. So we intercept torch.Tensor.record_stream calls
+    and manually store references to such tensors.
+
+    """
+
+    # Double-buffered tensor references and CUDA streams, alternated via _idx
+    _buffers = [[], []]
+    _streams = [None, None]
+    _idx = 0
+
+    _original_record_stream = torch.Tensor.record_stream
+
+    def _patched_record_stream(*args, **kwargs):
+        RecordStreamTracker._original_record_stream(*args, **kwargs)
+        RecordStreamTracker._buffers[RecordStreamTracker._idx].append(args[0])
+
+    def __init__(self):
+        RecordStreamTracker._idx = 0 if RecordStreamTracker._idx == 1 else 1
+        RecordStreamTracker._buffers[RecordStreamTracker._idx] = []
+
+    @classmethod
+    def clear(cls):
+        """Clear all record_stream tensor references."""
+        cls._buffers = [[], []]
+
+    @classmethod
+    def get_next_stream(cls):
+        """Return the next alternating stream for cudagraph replay."""
+        if cls._streams[0] is None:
+            cls._streams = [torch.cuda.Stream(), torch.cuda.Stream()]
+        idx = cls._idx
+        cls._idx = 0 if cls._idx == 1 else 1
+        return cls._streams[idx]
+
+    def __enter__(self):
+        torch.Tensor.record_stream = RecordStreamTracker._patched_record_stream
+        return self
+
+    def __exit__(self, *args):
+        torch.Tensor.record_stream = RecordStreamTracker._original_record_stream
+
+
 def is_graph_warmup():
     """Query if currently warming up for graph capture."""
     return _IS_GRAPH_WARMUP
@@ -123,11 +173,23 @@ def _set_warmup_start():
     global _IS_GRAPH_WARMUP
     _IS_GRAPH_WARMUP = True
 
+    from megatron.core.pipeline_parallel.fine_grained_activation_offload import (
+        fine_grained_offloading_disable_offload,
+    )
+
+    fine_grained_offloading_disable_offload()
+
 
 def _set_warmup_end():
     """Set graph warmup has ended."""
     global _IS_GRAPH_WARMUP
     _IS_GRAPH_WARMUP = False
+
+    from megatron.core.pipeline_parallel.fine_grained_activation_offload import (
+        fine_grained_offloading_enable_offload,
+    )
+
+    fine_grained_offloading_enable_offload()
 
 
 @dataclass
@@ -391,6 +453,7 @@ class _CudagraphGlobalRecord:
 
         off_interface.reset()
 
+        last_fwd_runner = [r for r in cls.cudagraph_record if r[1] == "fwd"][-1]
         progress_bar = enumerate(cls.cudagraph_record)
         time_start = time.time()
         mem_stats_start = torch.cuda.memory_stats()
@@ -445,6 +508,16 @@ class _CudagraphGlobalRecord:
             if graph_type == 'fwd':
                 args, kwargs, out = g[2:]
                 runner.create_fwd_graph(args, kwargs, out, clone_inputs=True)
+
+                if runner is last_fwd_runner:
+                    RecordStreamTracker.clear()
+                    if FREEZE_GC:
+                        # gc.collect() drops references to unreachable tensors created during
+                        # capture, returning their storage to the allocator to avoid a slowdown
+                        # during replay. However, it forces expensive global garbage collection,
+                        # so must be done only on the last layer per-device to avoid slowing
+                        # down graph creation.
+                        gc.collect()
             else:
                 assert fwd_buffer_reuse_ref_count == 0
                 runner.create_bwd_graph()
@@ -610,11 +683,11 @@ class _CudagraphReplayNode(torch.autograd.Function):
                     need_copy_inputs.append(user_input)
             else:
                 assert user_input.data_ptr() == cudagraph_input.data_ptr(), (
-                    f"Static CUDA graph input tensor changed memory address between graph capture and replay. "
-                    f"Expected data_ptr={cudagraph_input.data_ptr()}, got data_ptr={user_input.data_ptr()}. "
-                    f"Tensor shape={user_input.shape}, dtype={user_input.dtype}. "
-                    f"Static inputs must maintain the same memory address across replays. "
-                    f"Consider marking this input as copyable during graph capture."
+                    f"Static CUDA graph input tensor changed memory address between graph",
+                    f"capture and replay. Expected data_ptr={cudagraph_input.data_ptr()}, "
+                    f"got data_ptr={user_input.data_ptr()}. Static inputs must maintain ",
+                    f"the same memory address across replays. Consider marking this input as ",
+                    f"copyable during graph capture.",
                 )
 
         ctx.runner = runner
@@ -640,9 +713,10 @@ class _CudagraphReplayNode(torch.autograd.Function):
                 FP8GlobalStateManager.set_skip_fp8_weight_update_tensor(not is_first_microbatch)
                 runner.fp8_param_cache_updated = is_first_microbatch
 
-        if runner.stream is not None:
-            runner.stream.wait_stream(torch.cuda.current_stream())
-            with torch.cuda.stream(runner.stream):
+        if runner.use_stream:
+            stream = RecordStreamTracker.get_next_stream()
+            stream.wait_stream(torch.cuda.current_stream())
+            with torch.cuda.stream(stream):
                 runner.fwd_graph.replay()
             torch.cuda.current_stream().wait_event(runner.fwd_completion_event)
         else:
@@ -679,9 +753,10 @@ class _CudagraphReplayNode(torch.autograd.Function):
             if user_output_grad.data_ptr() != cudagraph_output_grad.data_ptr():
                 cudagraph_output_grad.copy_(user_output_grad)
 
-        if runner.stream is not None:
-            runner.stream.wait_stream(torch.cuda.current_stream())
-            with torch.cuda.stream(runner.stream):
+        if runner.use_stream:
+            stream = RecordStreamTracker.get_next_stream()
+            stream.wait_stream(torch.cuda.current_stream())
+            with torch.cuda.stream(stream):
                 runner.bwd_graph.replay()
             torch.cuda.current_stream().wait_event(runner.bwd_completion_event)
         else:
@@ -722,7 +797,6 @@ class _CudaGraphRunner(torch.nn.Module):
         fwd_graph_input_kwargs: Dict[str, Any],
         func,
         need_backward,
-        stream: torch.cuda.Stream = None,
     ):
         """Creates a _CudaGraphRunner, which holds a single pair of fwd and bwd cudagraphs, which
         are not created until this runner records its graph creation into
@@ -732,7 +806,7 @@ class _CudaGraphRunner(torch.nn.Module):
 
         self.base_module = base_module
         self.mempool = mempool
-        self.stream = None
+        self.use_stream = False
 
         self.fwd_graph_input_arg_metas = [ArgMetadata(a) for a in fwd_graph_input_args]
         self.fwd_graph_input_kwarg_metas = {
@@ -778,8 +852,8 @@ class _CudaGraphRunner(torch.nn.Module):
             self.fp4_runtime_enabled = None
 
             if self.base_module.config.fine_grained_activation_offloading:
-                # Dedicated stream for this runner's graph replays
-                self.stream = stream
+                # Use alternating streams from RecordStreamTracker for graph replays
+                self.use_stream = True
                 self.fwd_completion_event = torch.cuda.Event(external=True, interprocess=True)
                 self.bwd_completion_event = torch.cuda.Event(external=True, interprocess=True)
 
@@ -997,28 +1071,29 @@ class _CudaGraphRunner(torch.nn.Module):
                 if FREEZE_GC:
                     gc.freeze()
 
-                with torch.cuda.graph(
-                    self.fwd_graph, pool=self.mempool, capture_error_mode="thread_local"
+                if self.use_stream:
+                    record_stream_tracker = RecordStreamTracker()
+                else:
+                    record_stream_tracker = nullcontext()
+
+                with (
+                    torch.cuda.graph(
+                        self.fwd_graph, pool=self.mempool, capture_error_mode="thread_local"
+                    ),
+                    record_stream_tracker,
                 ):
                     fwd_graph_outputs = self.func(
                         *self.fwd_graph_input_args, **self.fwd_graph_input_kwargs
                     )
                     # Record completion event inside the graph so the current stream can
                     # proceed as soon as module compute finishes, before async comms are joined.
-                    if self.stream is not None:
+                    if self.use_stream:
                         self.fwd_completion_event.record()
                     join_external_streams()
 
                 # Unfreeze GC.
                 if FREEZE_GC:
                     gc.unfreeze()
-
-                    # gc.collect() drops references to unreachable tensors created during capture,
-                    # returning their storage to the allocator to avoid a slowdown during replay.
-                    # However, it forces expensive global garbage collection, so must be done
-                    # only on the last layer per-device to avoid slowing down graph creation.
-                    if self.is_last_layer:
-                        gc.collect()
 
         # save cudagraph output buffer
         self.fwd_graph_outputs = fwd_graph_outputs
@@ -1128,7 +1203,7 @@ class _CudaGraphRunner(torch.nn.Module):
                 allow_unused=True,
             )
 
-            if self.stream is not None:
+            if self.use_stream:
                 self.bwd_completion_event.record()
             join_external_streams()
 
@@ -1483,7 +1558,6 @@ class CudaGraphManager(torch.nn.Module):
         self.cudagraph_runners: list[_CudaGraphRunner] = []
         self.inference_cudagraphs_lookup_table: dict = defaultdict(lambda: None)
         self.is_first_microbatch = False
-        self.stream = torch.cuda.Stream()
 
         # Without pipeline parallelism, microbatches execute one at a time.
         # Therefore modules will always execute in the same order, so cudagraphs
@@ -1560,7 +1634,6 @@ class CudaGraphManager(torch.nn.Module):
                         kwargs,
                         self.func,
                         self.need_backward,
-                        stream=self.stream,
                     )
                     self.cudagraph_runners.append(runner)
                     if is_inference_mode:
@@ -1585,7 +1658,6 @@ class CudaGraphManager(torch.nn.Module):
                     kwargs,
                     self.func,
                     self.need_backward,
-                    stream=self.stream,
                 )
                 self.cudagraph_runners.append(runner)
 

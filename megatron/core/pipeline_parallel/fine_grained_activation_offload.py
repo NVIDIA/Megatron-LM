@@ -1,4 +1,5 @@
-# Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+
 
 from collections import deque
 from contextlib import nullcontext
@@ -12,7 +13,6 @@ DEBUG_RANK = 0
 
 from megatron.core.transformer.cuda_graphs import (
     is_graph_capturing,
-    is_graph_warmup,
     set_external_join_stream_for_graph_capture,
 )
 
@@ -892,6 +892,9 @@ class ChunkOffloadHandler:
         # Respect tensor's offload preference if specified
         if hasattr(tensor, "offloading_activation") and not tensor.offloading_activation:
             return False
+        if hasattr(tensor, "_TE_do_not_offload") and tensor._TE_do_not_offload:
+            return False
+
         return True
 
     def bulk_offload_group(self):
@@ -997,11 +1000,8 @@ class ChunkOffloadHandler:
         if is_graph_capturing():
             # Mark that d2h_stream is used so it gets joined before capture ends
             set_external_join_stream_for_graph_capture(self.d2h_stream)
-            event = torch.cuda.Event()
-            event.record(torch.cuda.current_stream())
-            self.d2h_stream.wait_event(event)
-        else:
-            self.d2h_stream.wait_stream(torch.cuda.current_stream())
+
+        self.d2h_stream.wait_stream(torch.cuda.current_stream())
         self.bulk_offload(forced_released_tensors)
 
     def bulk_reload(self):
@@ -1076,11 +1076,8 @@ class ChunkOffloadHandler:
 
         if is_graph_capturing():
             set_external_join_stream_for_graph_capture(self.h2d_stream)
-            event = torch.cuda.Event()
-            event.record(torch.cuda.current_stream())
-            self.h2d_stream.wait_event(event)
-        else:
-            self.h2d_stream.wait_stream(torch.cuda.current_stream())
+
+        self.h2d_stream.wait_stream(torch.cuda.current_stream())
         self.bulk_reload()
 
 
@@ -1252,9 +1249,6 @@ class FineGrainedActivationOffloadingInterface:
 
     def __enter__(self):
         """Enter context manager to enable activation offloading hooks."""
-        if is_graph_warmup():
-            return self.tensor
-
         if self.offload:
             self.tensor = fine_grained_offloading_group_start(self.tensor, self.name)
             PipelineOffloadManager.get_instance().__enter__()
@@ -1262,9 +1256,6 @@ class FineGrainedActivationOffloadingInterface:
 
     def __exit__(self, *args: Any):
         """Exit context manager to disable activation offloading hooks."""
-        if is_graph_warmup():
-            return
-
         if self.offload:
             PipelineOffloadManager.get_instance().__exit__()
 
@@ -1283,10 +1274,6 @@ class FineGrainedActivationOffloadingInterface:
     @staticmethod
     def group_commit(tensor, name, forced_released_tensors=None, delay_offload=False):
         """Group commit the tensors."""
-
-        if is_graph_warmup():
-            return tensor
-
         return fine_grained_offloading_group_commit(
             tensor, name, forced_released_tensors, delay_offload
         )
