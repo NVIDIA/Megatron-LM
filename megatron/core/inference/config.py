@@ -161,6 +161,9 @@ class InferenceConfig:
     enable_chunked_prefill: bool = False
     """Whether to enable chunked prefill."""
 
+    enable_prefix_caching: bool = True
+    """Whether to enable prefix caching for KV cache block sharing."""
+
     # =================================
     # Logging config
     # =================================
