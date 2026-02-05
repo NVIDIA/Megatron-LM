@@ -140,7 +140,7 @@ class SFTTokenizer(MegatronLegacyTokenizer):
             turn_len = len(turn_tokens)
 
             role = turn["role"].lower()
-            if role in ("system", "user"):
+            if role in ("system", "user", "tool"):
                 target[idx : idx + turn_len] = IGNORE_INDEX
             elif role == "assistant":
                 if self._prompt_config.assistant_prefix_len > 0:
