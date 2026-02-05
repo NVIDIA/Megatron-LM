@@ -443,3 +443,17 @@ def build_dynamic_engine_setup_prefix(
     ]
 
     return " | ".join(parts)
+
+
+def get_global_peak_memory_stats_bytes() -> dict:
+    """Peak allocated CUDA memory aggregated across ranks (MAX), in bytes.
+
+    Uses `torch.cuda.max_memory_allocated()` and assumes peak stats were reset
+    before the benchmark run.
+    """
+    peak_alloc = int(torch.cuda.max_memory_allocated())
+    if torch.distributed.is_available() and torch.distributed.is_initialized():
+        t = torch.tensor([peak_alloc], device="cuda", dtype=torch.int64)
+        torch.distributed.all_reduce(t, op=torch.distributed.ReduceOp.MAX)
+        peak_alloc = int(t[0].item())
+    return {"mem-max-allocated-bytes": peak_alloc}
