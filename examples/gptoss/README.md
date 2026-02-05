@@ -86,7 +86,7 @@ export HOST_DATA_PREFIX="/path/to/host/mydata_prefix"
 
 ### Setup Training Configurations
 
-Run the following to create a `distributed_config.env` file with the appropriate distributed training configurations. Change the values as needed for your setup.
+Run the following to create a `distributed_config.env` file with the appropriate distributed training configurations. Change the values as needed for your setup. This file will override the default values in `02_train.sh`.
 
 ```bash
 cat > ./distributed_config.env << 'EOF'
@@ -100,7 +100,7 @@ EOF
 
 ### Run Container with Mounted Volumes
 
-**NOTE:** This container runs the example training script `02_train.sh` located in the `examples/gptoss` directory. Adjust the script as needed for your training requirements, including changing model and training parameters, such as the *different parallelization sizes*, `--hidden-size`, `--ffn-hidden-size`, `--num-attention-heads`, `NUM_LAYERS`, etc. in the script itself.
+**NOTE:** This container runs the example training script `02_train.sh` located in the `examples/gptoss` directory. By default, we have only set pipeline parallelism to be the number of GPUs. Adjust TP_SIZE, EP_SIZE, PP_SIZE, etc. in `02_train.sh`. You can also adjust modify `--hidden-size`, `--ffn-hidden-size`, `--num-attention-heads`, `NUM_LAYERS`, etc. 
 
 To train using mock data, run the following command:
 ```bash

@@ -66,7 +66,8 @@ if [ ! -d "$TENSORBOARD_LOGS_PATH" ]; then
 fi
 echo "TensorBoard logs path exists: $TENSORBOARD_LOGS_PATH"
 
-# Distributed training setup - default values
+# NOTE: by default we use 8 GPUs
+# These values will be over-written below with environmental variables
 GPUS_PER_NODE=8
 NUM_NODES=1
 MASTER_ADDR="localhost"
@@ -107,7 +108,8 @@ DISTRIBUTED_ARGS=(
     --node_rank $NODE_RANK
 )
 
-# NOTE: Adjust the following model and training parameters as needed below, these are example values for openai/gpt-oss-20b
+# NOTE: we only set pipeline parallelism to be the number of GPUs
+# Adjust each value based on your setup.
 TP_SIZE=1     
 EP_SIZE=1     
 PP_SIZE=${WORLD_SIZE}     
