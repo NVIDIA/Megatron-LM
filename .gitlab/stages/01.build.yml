@@ -121,6 +121,7 @@ test:build_image:
     KUBERNETES_SERVICE_MEMORY_LIMIT: 90Gi
     SHARED_PATH: /builds/$CI_PROJECT_PATH/shared
   script:
+    - apk add skopeo
     - |
       set -x
 
@@ -134,8 +135,7 @@ test:build_image:
       docker manifest push ${IMAGE}:${CI_PIPELINE_ID}
 
       if [[ "$CI_COMMIT_BRANCH" == "ci-rebuild-mcore-nemo-image" || "$CI_COMMIT_BRANCH" == "main" || "$CI_COMMIT_BRANCH" == "dev" ]]; then
-        docker tag ${IMAGE}:${CI_PIPELINE_ID} ${IMAGE}:${CI_COMMIT_BRANCH}
-        docker push ${IMAGE}:${CI_COMMIT_BRANCH}
+        skopeo copy --all docker://${IMAGE}:${CI_PIPELINE_ID} docker://${IMAGE}:${CI_COMMIT_BRANCH}
       fi
 
     - echo "MCORE_MR_COMMIT=$CI_COMMIT_SHA" | tee -a build.env
