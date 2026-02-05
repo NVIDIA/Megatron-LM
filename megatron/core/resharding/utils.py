@@ -369,50 +369,6 @@ def select_src_metadata_balanced(
         raise ValueError("src_meta_list must be non-empty")
 
     # ============================================================================
-    # TENSOR PARALLELISM (TP) LOCAL RANK FILTERING
-    # ============================================================================
-    # Purpose: In non-collocated mode with same TP size, ensure destination ranks
-    # use source metadata from ranks with the same TP local position (same shard).
-    #
-    # Why size check matters:
-    #   - Same size (TP=8→TP=8): Local ranks 0-7 exist in both src and dst
-    #     → Filter ensures dst TP local 0 uses src TP local 0 (same shard data)
-    #   - Different size (TP=8→TP=4): Local ranks don't correspond semantically
-    #     → Skip filter; LCM algorithm handles merging/splitting of shards
-    #
-    # Load balancing impact: Skipping the filter when sizes differ gives the
-    # subsequent DP round-robin more source candidates to balance across, which
-    # is optimal since the LCM algorithm will compute actual transfers anyway.
-    # ============================================================================
-    dst_tp_local = dst_metadata.tensor_parallel_local_rank
-    if dst_tp_local is not None:
-        # Check if TP sizes match between source and destination
-        src_tp_size = (
-            len(src_meta_list[0].tensor_parallel_group_ranks)
-            if src_meta_list[0].tensor_parallel_group_ranks
-            else None
-        )
-        dst_tp_size = (
-            len(dst_metadata.tensor_parallel_group_ranks)
-            if dst_metadata.tensor_parallel_group_ranks
-            else None
-        )
-
-        # Only filter by TP local rank when sizes match (non-collocated, not resharding)
-        if src_tp_size == dst_tp_size and src_tp_size is not None:
-            matching_tp = [m for m in src_meta_list if m.tensor_parallel_local_rank == dst_tp_local]
-            if not matching_tp:
-                # This indicates a configuration bug: sizes match but no local rank match
-                raise ValueError(
-                    f"No source metadata with TP local rank {dst_tp_local}"
-                    f" found for dst rank {dst_rank}. "
-                    f"Available:"
-                    f" {[(m.owner_rank, m.tensor_parallel_local_rank) for m in src_meta_list]}"
-                )
-            src_meta_list = matching_tp
-        # else: TP resharding mode (sizes differ) - skip filter, keep all source candidates
-
-    # ============================================================================
     # EXPERT PARALLELISM (EP) LOCAL RANK FILTERING
     # ============================================================================
     # Purpose: In non-collocated mode with same EP size, ensure destination ranks
