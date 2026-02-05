@@ -839,14 +839,7 @@ class DynamicInferenceEngine(AbstractEngine):
                 # Skip appending token for requests being finished due to stop words
                 # (they already have their final token from the previous step)
                 if request_id not in self.stop_word_being_finished_ids:
-                    # Record FIRST_TOKEN event when:
-                    # - Prefill is complete (remaining_prompt_tokens is empty)
-                    # - No tokens generated yet (this is the first token)
-                    if (request.remaining_prompt_tokens.numel() == 0 and
-                            len(request.generated_tokens) == 0):
-                        request.add_event_first_token()
-
-                    request.generated_tokens.append(token)
+                    request.add_event_generated_token(token)
                     if request.tpot is None:
                         request.tpot = []
                     request.tpot.append(step_time)

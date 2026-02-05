@@ -27,17 +27,18 @@ class TestDynamicInferenceEventType:
         TEST_PRIORITY < TestPriority.CRITICAL, reason="Test priority not met"
     )
     def test_new_event_types_exist(self):
-        """Verify ADD_ENGINE, ADD_CONTEXT, FIRST_TOKEN event types exist."""
+        """Verify ADD_ENGINE, ADD_CONTEXT, GENERATED_TOKEN event types exist."""
         assert hasattr(DynamicInferenceEventType, 'ADD_ENGINE')
         assert hasattr(DynamicInferenceEventType, 'ADD_CONTEXT')
-        assert hasattr(DynamicInferenceEventType, 'FIRST_TOKEN')
+        assert hasattr(DynamicInferenceEventType, 'GENERATED_TOKEN')
 
     @pytest.mark.skipif(
         TEST_PRIORITY < TestPriority.CRITICAL, reason="Test priority not met"
     )
-    def test_old_add_event_removed(self):
-        """Verify old ADD event type no longer exists."""
+    def test_old_event_types_removed(self):
+        """Verify old ADD and FIRST_TOKEN event types no longer exist."""
         assert not hasattr(DynamicInferenceEventType, 'ADD')
+        assert not hasattr(DynamicInferenceEventType, 'FIRST_TOKEN')
 
     @pytest.mark.skipif(
         TEST_PRIORITY < TestPriority.IMPORTANT, reason="Test priority not met"
@@ -47,7 +48,7 @@ class TestDynamicInferenceEventType:
         expected_types = [
             'ADD_ENGINE',
             'ADD_CONTEXT',
-            'FIRST_TOKEN',
+            'GENERATED_TOKEN',
             'PAUSE',
             'EVICT',
             'FINISH',
@@ -72,7 +73,6 @@ class TestDynamicInferenceEvent:
         [
             DynamicInferenceEventType.ADD_ENGINE,
             DynamicInferenceEventType.ADD_CONTEXT,
-            DynamicInferenceEventType.FIRST_TOKEN,
         ],
     )
     def test_event_creation(self, event_type):
@@ -83,6 +83,17 @@ class TestDynamicInferenceEvent:
         assert event.timestamp is not None
 
     @pytest.mark.skipif(
+        TEST_PRIORITY < TestPriority.CRITICAL, reason="Test priority not met"
+    )
+    def test_generated_token_event_creation(self):
+        """Test creating GENERATED_TOKEN events with token payload."""
+        token_id = 42
+        event = DynamicInferenceEvent(type=DynamicInferenceEventType.GENERATED_TOKEN, payload=token_id)
+        assert event.type == DynamicInferenceEventType.GENERATED_TOKEN
+        assert event.payload == token_id
+        assert event.timestamp is not None
+
+    @pytest.mark.skipif(
         TEST_PRIORITY < TestPriority.IMPORTANT, reason="Test priority not met"
     )
     @pytest.mark.parametrize(
@@ -90,7 +101,6 @@ class TestDynamicInferenceEvent:
         [
             DynamicInferenceEventType.ADD_ENGINE,
             DynamicInferenceEventType.ADD_CONTEXT,
-            DynamicInferenceEventType.FIRST_TOKEN,
         ],
     )
     def test_event_serialization_roundtrip(self, event_type):
@@ -103,6 +113,24 @@ class TestDynamicInferenceEvent:
 
         deserialized = DynamicInferenceEvent.deserialize(serialized)
         assert deserialized.type == original.type
+        assert deserialized.timestamp == original.timestamp
+
+    @pytest.mark.skipif(
+        TEST_PRIORITY < TestPriority.IMPORTANT, reason="Test priority not met"
+    )
+    def test_generated_token_serialization_roundtrip(self):
+        """Test serialize/deserialize preserves GENERATED_TOKEN event data including payload."""
+        token_id = 123
+        original = DynamicInferenceEvent(type=DynamicInferenceEventType.GENERATED_TOKEN, payload=token_id)
+        serialized = original.serialize()
+
+        assert serialized['type'] == 'GENERATED_TOKEN'
+        assert serialized['payload'] == token_id
+        assert 'timestamp' in serialized
+
+        deserialized = DynamicInferenceEvent.deserialize(serialized)
+        assert deserialized.type == original.type
+        assert deserialized.payload == token_id
         assert deserialized.timestamp == original.timestamp
 
 
@@ -139,11 +167,40 @@ class TestRequestEventMethods:
     @pytest.mark.skipif(
         TEST_PRIORITY < TestPriority.CRITICAL, reason="Test priority not met"
     )
-    def test_add_event_first_token(self, req):
-        """Test add_event_first_token() method."""
-        req.add_event_first_token()
+    def test_add_event_generated_token(self, req):
+        """Test add_event_generated_token() method."""
+        token_id = 42
+        req.add_event_generated_token(token_id)
         assert len(req.events) == 1
-        assert req.events[0].type == DynamicInferenceEventType.FIRST_TOKEN
+        assert req.events[0].type == DynamicInferenceEventType.GENERATED_TOKEN
+        assert req.events[0].payload == token_id
+
+    @pytest.mark.skipif(
+        TEST_PRIORITY < TestPriority.CRITICAL, reason="Test priority not met"
+    )
+    def test_generated_tokens_property(self, req):
+        """Test that generated_tokens property returns correct token list."""
+        assert req.generated_tokens == []
+
+        req.add_event_generated_token(10)
+        req.add_event_generated_token(20)
+        req.add_event_generated_token(30)
+
+        assert req.generated_tokens == [10, 20, 30]
+
+    @pytest.mark.skipif(
+        TEST_PRIORITY < TestPriority.IMPORTANT, reason="Test priority not met"
+    )
+    def test_generated_tokens_filters_only_token_events(self, req):
+        """Test that generated_tokens only includes GENERATED_TOKEN events."""
+        req.add_event_add_engine()
+        req.add_event_add_context()
+        req.add_event_generated_token(100)
+        req.add_event_generated_token(200)
+        req.add_event_finish()
+
+        # Should only include the token payloads, not other events
+        assert req.generated_tokens == [100, 200]
 
     @pytest.mark.skipif(
         TEST_PRIORITY < TestPriority.IMPORTANT, reason="Test priority not met"
@@ -152,11 +209,11 @@ class TestRequestEventMethods:
         """Test adding multiple events creates correct sequence."""
         req.add_event_add_engine()
         req.add_event_add_context()
-        req.add_event_first_token()
+        req.add_event_generated_token(42)
         req.add_event_finish()
 
         event_types = [e.type.name for e in req.events]
-        assert event_types == ['ADD_ENGINE', 'ADD_CONTEXT', 'FIRST_TOKEN', 'FINISH']
+        assert event_types == ['ADD_ENGINE', 'ADD_CONTEXT', 'GENERATED_TOKEN', 'FINISH']
 
     @pytest.mark.skipif(
         TEST_PRIORITY < TestPriority.MEDIUM, reason="Test priority not met"
@@ -169,7 +226,7 @@ class TestRequestEventMethods:
         time.sleep(0.001)
         req.add_event_add_context()
         time.sleep(0.001)
-        req.add_event_first_token()
+        req.add_event_generated_token(42)
 
         timestamps = [e.timestamp for e in req.events]
         assert timestamps == sorted(timestamps), "Timestamps should be increasing"

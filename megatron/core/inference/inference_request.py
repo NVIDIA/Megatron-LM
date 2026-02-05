@@ -140,7 +140,7 @@ class DynamicInferenceEventType(Enum):
 
     ADD_ENGINE = auto()    # When request is added to engine via _add_request()
     ADD_CONTEXT = auto()   # When request is added to context (scheduled for prefill)
-    FIRST_TOKEN = auto()   # When first output token is about to be generated
+    GENERATED_TOKEN = auto()  # When an output token is generated (payload = token id)
     PAUSE = auto()
     EVICT = auto()
     FINISH = auto()
@@ -183,11 +183,18 @@ class DynamicInferenceEvent:
             DynamicInferenceEventType.ERROR_NONTRANSIENT,
         ):
             assert self.payload is not None
+        elif self.type == DynamicInferenceEventType.GENERATED_TOKEN:
+            assert self.payload is not None and isinstance(self.payload, int)
         else:
             assert self.payload is None
 
     def __str__(self):
-        payload_str = "" if self.payload is None else f", {type(self.payload).__name__}"
+        if self.type == DynamicInferenceEventType.GENERATED_TOKEN:
+            payload_str = f", token={self.payload}"
+        elif self.payload is None:
+            payload_str = ""
+        else:
+            payload_str = f", {type(self.payload).__name__}"
         return f"[{self.timestamp:.3f}] {self.type.name}{payload_str}"
 
     def serialize(self) -> dict:
@@ -203,10 +210,14 @@ class DynamicInferenceEvent:
         obj["type"] = self.type.name
 
         # Serialize payload.
-        if self.payload:
-            from .contexts.dynamic_context import ContextErrorFactory  # avoid circular import.
+        if self.payload is not None:
+            if self.type == DynamicInferenceEventType.GENERATED_TOKEN:
+                # Token ID is already an int, no special serialization needed
+                obj["payload"] = self.payload
+            else:
+                from .contexts.dynamic_context import ContextErrorFactory  # avoid circular import.
 
-            obj["payload"] = ContextErrorFactory.serialize(self.payload)
+                obj["payload"] = ContextErrorFactory.serialize(self.payload)
 
         return obj
 
@@ -220,15 +231,20 @@ class DynamicInferenceEvent:
         Returns:
             (DynamicInferenceEvent) Deserialized event.
         """
+        event_type = DynamicInferenceEventType[obj["type"]]
 
         # Initialize event.
-        event = cls(**{**obj, "type": DynamicInferenceEventType[obj["type"]]})
+        event = cls(**{**obj, "type": event_type})
 
         # Deserialize payload.
-        if obj["payload"]:
-            from .contexts.dynamic_context import ContextErrorFactory  # avoid circular import.
+        if obj["payload"] is not None:
+            if event_type == DynamicInferenceEventType.GENERATED_TOKEN:
+                # Token ID is already an int, no special deserialization needed
+                event.payload = obj["payload"]
+            else:
+                from .contexts.dynamic_context import ContextErrorFactory  # avoid circular import.
 
-            event.payload = ContextErrorFactory.deserialize(obj["payload"])
+                event.payload = ContextErrorFactory.deserialize(obj["payload"])
 
         return event
 
@@ -243,7 +259,6 @@ class DynamicInferenceRequest(InferenceRequest):
     """
 
     request_id: int
-    generated_tokens: List[int] = field(default_factory=list)
     prompt: Optional[str] = None
     prompt_tokens: Optional[torch.Tensor] = None
     # remaining prompt tokens are used for chunked prefill
@@ -266,6 +281,19 @@ class DynamicInferenceRequest(InferenceRequest):
 
     events: List[DynamicInferenceEvent] = field(default_factory=list)
 
+    @property
+    def generated_tokens(self) -> List[int]:
+        """Get the list of generated token IDs from GENERATED_TOKEN events.
+
+        Returns:
+            List[int]: List of token IDs in the order they were generated.
+        """
+        return [
+            e.payload
+            for e in self.events
+            if e.type == DynamicInferenceEventType.GENERATED_TOKEN
+        ]
+
     def __str__(self):
         return ", ".join(
             (
@@ -286,6 +314,8 @@ class DynamicInferenceRequest(InferenceRequest):
         """
         obj = super().serialize()
         obj["events"] = [e.serialize() for e in self.events]
+        # Include generated_tokens computed from events for compatibility
+        obj["generated_tokens"] = self.generated_tokens
         return obj
 
     @classmethod
@@ -298,7 +328,10 @@ class DynamicInferenceRequest(InferenceRequest):
         Returns:
             (DynamicInferenceRequest) Deserialized request.
         """
-        request = super().deserialize(obj)
+        # Remove generated_tokens from obj since it's now a property computed from events
+        # The tokens will be recovered from GENERATED_TOKEN events
+        obj_copy = {k: v for k, v in obj.items() if k != "generated_tokens"}
+        request = super().deserialize(obj_copy)
         request.events = [DynamicInferenceEvent.deserialize(e) for e in obj["events"]]
         return request
 
@@ -354,9 +387,13 @@ class DynamicInferenceRequest(InferenceRequest):
         """Add 'add_context' event - called when request is added to context for prefill."""
         return self.add_event(DynamicInferenceEventType.ADD_CONTEXT)
 
-    def add_event_first_token(self):
-        """Add 'first_token' event - called when first output token is about to be generated."""
-        return self.add_event(DynamicInferenceEventType.FIRST_TOKEN)
+    def add_event_generated_token(self, token: int):
+        """Add 'generated_token' event - records each generated token.
+
+        Args:
+            token (int): The token ID that was generated.
+        """
+        return self.add_event(DynamicInferenceEventType.GENERATED_TOKEN, token)
 
     def add_event_pause(self):
         """Add 'pause' event."""
@@ -500,6 +537,9 @@ class DynamicInferenceRequestRecord:
             generated_text = None
 
         # Merged request.
+        # Note: generated_tokens is computed from GENERATED_TOKEN events via property,
+        # so we pass the merged events and generated_tokens will be derived from them.
+        merged_events = merge_lists("events")
         request = DynamicInferenceRequest(
             request_id=self.requests[0].request_id,
             prompt=prompt_text,
@@ -507,15 +547,14 @@ class DynamicInferenceRequestRecord:
             prompt_log_probs=self.requests[0].prompt_log_probs,
             prompt_top_n_logprobs=self.requests[0].prompt_top_n_logprobs,
             generated_text=generated_text,
-            generated_tokens=generated_tokens,
-            generated_length=len(generated_tokens),
+            generated_length=len(generated_tokens) if generated_tokens else 0,
             generated_log_probs=merge_lists("generated_log_probs"),
             generated_top_n_logprobs=merge_lists("generated_top_n_logprobs"),
             sampling_params=self.requests[0].sampling_params,
             tpot=merge_lists("tpot"),
             status=self.requests[-1].status,
             latency=self.latency,
-            events=merge_lists("events"),
+            events=merged_events,
         )
 
         return request

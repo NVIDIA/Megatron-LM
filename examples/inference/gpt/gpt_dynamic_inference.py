@@ -373,13 +373,13 @@ def run_inference(
                 request.request_id = finished_request.request_id
                 request.events = finished_request.events
 
-                # Calculate TTFT = FIRST_TOKEN timestamp - ADD_ENGINE timestamp
+                # Calculate TTFT = first GENERATED_TOKEN timestamp - ADD_ENGINE timestamp
                 add_engine_time = None
                 first_token_time = None
                 for event in finished_request.events:
                     if event.type.name == "ADD_ENGINE":
                         add_engine_time = event.timestamp
-                    elif event.type.name == "FIRST_TOKEN":
+                    elif event.type.name == "GENERATED_TOKEN" and first_token_time is None:
                         first_token_time = event.timestamp
                 if add_engine_time is not None and first_token_time is not None:
                     request.ttft = first_token_time - add_engine_time
