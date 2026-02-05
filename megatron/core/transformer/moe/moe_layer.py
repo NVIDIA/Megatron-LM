@@ -87,10 +87,12 @@ class BaseMoELayer(MegatronModule, ABC):
         config: TransformerConfig,
         layer_number: Optional[int] = None,
         pg_collection: Optional[ProcessGroupCollection] = None,
+        is_mtp_layer: bool = False,
     ):
         super(BaseMoELayer, self).__init__(config)
         self.config = config
         self.layer_number = layer_number
+        self.is_mtp_layer = is_mtp_layer
         self.ep_group = pg_collection.ep
         # use pg_collection.expt_tp_group as tensor parallel group in this module.
         self.attn_tp_group = pg_collection.tp
@@ -140,6 +142,7 @@ class MoELayer(BaseMoELayer):
         submodules: Optional[MoESubmodules] = None,
         layer_number: Optional[int] = None,
         pg_collection: Optional[ProcessGroupCollection] = None,
+        is_mtp_layer: bool = False,
     ):
         self.submodules = submodules
         # TODO(Hepteract): delete the usage of the global parallel_state.
@@ -147,10 +150,16 @@ class MoELayer(BaseMoELayer):
         if pg_collection is None:
             pg_collection = get_default_pg_collection()
         super(MoELayer, self).__init__(
-            config=config, layer_number=layer_number, pg_collection=pg_collection
+            config=config,
+            layer_number=layer_number,
+            pg_collection=pg_collection,
+            is_mtp_layer=is_mtp_layer,
         )
+        # If using mcore cudagraphs, recompute is handled by transformer_layer.MoETransformerLayer
         self.moe_layer_recompute = (
-            config.recompute_granularity == 'selective' and "moe" in config.recompute_modules
+            config.recompute_granularity == 'selective'
+            and "moe" in config.recompute_modules
+            and config.cuda_graph_impl != 'local'
         )
         self.shared_experts_recompute = (
             config.recompute_granularity == 'selective'
@@ -160,7 +169,9 @@ class MoELayer(BaseMoELayer):
         self.tp_group = pg_collection.tp
 
         # Initialize router.
-        self.router = submodules.router(config=self.config, pg_collection=pg_collection)
+        self.router = submodules.router(
+            config=self.config, pg_collection=pg_collection, is_mtp_layer=is_mtp_layer
+        )
         self.tp_group = pg_collection.tp
 
         # Initialize latent projections.
@@ -237,15 +248,16 @@ class MoELayer(BaseMoELayer):
 
         # Cudagraph tensor store for resuming the forward pass from the end of the cudagraph.
         self.cudagraph_tensor_store = MoECudaGraphTensorStore()
+        self.fwd_execution_map = ["route", "expert_compute", "postprocess"]
 
     @maybe_skip_or_early_return_by_cudagraph("route")
-    def route(self, hidden_states: torch.Tensor):
+    def route(self, hidden_states: torch.Tensor, padding_mask: Optional[torch.Tensor] = None):
         """Compute token routing for preprocessing.
 
         This method uses the router to determine which experts to send each token to,
         producing routing probabilities and a mapping.
         """
-        probs, routing_map = apply_module(self.router)(hidden_states)
+        probs, routing_map = apply_module(self.router)(hidden_states, padding_mask)
         return probs, routing_map
 
     @maybe_skip_or_early_return_by_cudagraph("preprocess")
@@ -322,19 +334,23 @@ class MoELayer(BaseMoELayer):
 
         return output, mlp_bias
 
-    def combine(self, output: torch.Tensor, shared_expert_output: Optional[torch.Tensor]):
+    def combine(self, output: torch.Tensor):
         """Combines expert outputs via communication and adds shared expert output.
 
         This method uses the token dispatcher to combine the outputs from different
-        experts (e.g., via an All-to-All communication). It then adds the output
-        from the shared expert if it exists.
+        experts (e.g., via an All-to-All communication).
         """
         output = self.token_dispatcher.token_combine(output)
+        return output
+
+    def postprocess(self, output: torch.Tensor, shared_expert_output: Optional[torch.Tensor]):
+        """Project the output back from latent dimension to hidden dimension after combine
+        in latent dimension if needed. Combine expert output with shared_experts if needed."""
+
         output = self.token_dispatcher.combine_postprocess(output)
-        # Project the output back from latent dimension to hidden dimension after combine
-        # in latent dimension.
         if self.config.moe_latent_size:
             output, _ = self.fc2_latent_proj(output)
+
         if shared_expert_output is not None:
             output = output + shared_expert_output
         return output
@@ -346,7 +362,12 @@ class MoELayer(BaseMoELayer):
         hidden_states, probs, residual = self.preprocess(hidden_states, probs, routing_map)
         return hidden_states, probs, residual
 
-    def forward(self, hidden_states: torch.Tensor):
+    def forward(
+        self,
+        hidden_states: torch.Tensor,
+        intermediate_tensors=None,
+        padding_mask: Optional[torch.Tensor] = None,
+    ):
         """Forward pass for the MoE layer.
 
         The forward pass comprises four main steps:
@@ -356,8 +377,10 @@ class MoELayer(BaseMoELayer):
         4. Combine: The outputs from the experts are combined and returned.
 
         Args:
-            hidden_states (torch.Tensor): The input tensor to the MoE layer.
-
+            hidden_states (torch.Tensor): The input tensor shape [seq_length, bsz, hidden_size].
+            padding_mask (torch.Tensor, optional): Boolean mask indicating non-padding tokens.
+                                                   Shape [seq_length, bsz]. True for valid tokens,
+                                                   False for padding tokens. Defaults to None.
         Returns:
             A tuple containing the output tensor and the MLP bias, if any.
         """
@@ -366,13 +389,21 @@ class MoELayer(BaseMoELayer):
                 "During training, performance may degrade if MoE and tensor parallelism"
                 "are enabled without also enabling sequence parallelism."
             )
+        # Transpose from [bsz, seq_length] to [seq_length, bsz] to align with hidden_states
+        if padding_mask is not None:
+            padding_mask = padding_mask.transpose(0, 1).bool()
 
         # MoE forward: route -> dispatch -> compute -> combine
-        def custom_forward(hidden_states):
+        def custom_forward(hidden_states, intermediate_tensors=None, padding_mask=None):
             try:
-                shared_expert_output = self.shared_experts_compute(hidden_states)
-                probs, routing_map = self.route(hidden_states)
-                hidden_states, probs = self.preprocess(hidden_states, probs, routing_map)
+                if "route" in self.fwd_execution_map:
+                    shared_expert_output = self.shared_experts_compute(hidden_states)
+                    probs, routing_map = self.route(hidden_states, padding_mask)
+                    hidden_states, probs = self.preprocess(hidden_states, probs, routing_map)
+
+                    if intermediate_tensors is not None:
+                        return hidden_states, probs, shared_expert_output
+
             except MoECudaGraphPartialCaptureSignal as e:
                 # This signal is raised from the maybe_skip_or_early_return_by_cudagraph decorator.
                 # It means we should early-return from the MoE layer forward pass.
@@ -381,10 +412,28 @@ class MoELayer(BaseMoELayer):
                 # We need to return the intermediate tensors as CUDA graph outputs.
                 return e.get_early_return_outputs(hidden_states, shared_expert_output)
 
-            dispatched_input, probs = self.dispatch(hidden_states, probs)
-            output, mlp_bias = self.routed_experts_compute(dispatched_input, probs)
-            assert mlp_bias is None, f"mlp_bias is not supported for {type(self.token_dispatcher)}"
-            output = self.combine(output, shared_expert_output)
+            if "expert_compute" in self.fwd_execution_map:
+                if intermediate_tensors is not None:
+                    hidden_states, probs = intermediate_tensors
+
+                dispatched_input, probs = self.dispatch(hidden_states, probs)
+                output, mlp_bias = self.routed_experts_compute(dispatched_input, probs)
+                assert (
+                    mlp_bias is None
+                ), f"mlp_bias is not supported for {type(self.token_dispatcher)}"
+                output = self.combine(output)
+
+                if intermediate_tensors is not None:
+                    return output, mlp_bias
+
+            if "postprocess" in self.fwd_execution_map:
+                if intermediate_tensors is not None:
+                    output, shared_expert_output = intermediate_tensors
+
+                output = self.postprocess(output, shared_expert_output)
+
+                if intermediate_tensors is not None:
+                    return output
 
             return output, mlp_bias
 
@@ -396,20 +445,39 @@ class MoELayer(BaseMoELayer):
                     tensor_parallel.random.get_cuda_rng_tracker,
                     parallel_state.get_tensor_model_parallel_group(),
                     hidden_states,
+                    intermediate_tensors,
+                    padding_mask,
                 )
             else:
-                outputs = tensor_parallel.checkpoint(custom_forward, False, hidden_states)
+                outputs = tensor_parallel.checkpoint(
+                    custom_forward, False, hidden_states, intermediate_tensors, padding_mask
+                )
         else:
-            outputs = custom_forward(hidden_states)
+            outputs = custom_forward(hidden_states, intermediate_tensors, padding_mask)
 
         return outputs
 
     def backward_dw(self, routed_experts: bool = True, shared_experts: bool = False):
         """Compute weight gradients for experts and shared experts."""
+        # TODO(Wohox): replace the "routed_experts" and "shared_experts" arguments with better
+        # naming to better explain that they are actually from different fine-grained callables,
+        # or use scanning to decide which backward_dw should be called.
         if routed_experts:
             self.experts.backward_dw()
-        if shared_experts and self.use_shared_expert and not self.shared_expert_overlap:
-            self.shared_experts.backward_dw()
+            if self.config.moe_latent_size:
+                # TODO(Wohox): fc2_latent_proj forward and backward are executed in comm stream,
+                # so we execute its backward_dw in the comm stream too. But this may harm the
+                # EP overlap performance. Better to check if there is a better way to handle this.
+                from megatron.core.pipeline_parallel.utils import get_comm_stream
+
+                comm_stream = get_comm_stream()
+                with torch.cuda.stream(comm_stream):
+                    self.fc2_latent_proj.backward_dw()
+        if shared_experts:
+            if self.use_shared_expert and not self.shared_expert_overlap:
+                self.shared_experts.backward_dw()
+            if self.config.moe_latent_size:
+                self.fc1_latent_proj.backward_dw()
 
     def set_for_recompute_pre_mlp_layernorm(self):
         """Set the MoE layer for recompute pre_mlp_layernorm. Only needed for fp8/fp4."""

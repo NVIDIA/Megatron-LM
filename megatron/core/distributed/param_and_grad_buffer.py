@@ -16,6 +16,7 @@ import megatron.core.nccl_allocator as nccl_allocator
 from megatron.core import parallel_state
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.rerun_state_machine import get_rerun_state_machine
+from megatron.core.utils import log_single_rank
 
 from ..fp8_utils import (
     is_float8tensor,
@@ -162,6 +163,11 @@ class _ParamAndGradBucketGroup:
         global dist_reduce_scatter_func
         if self.ddp_config.reduce_scatter_with_fp32_accumulation:
             dist_reduce_scatter_func = reduce_scatter_with_fp32_accumulation
+            log_single_rank(
+                logger,
+                logging.INFO,
+                "Using reduce_scatter_with_fp32_accumulation as reduce-scatter implementation",
+            )
 
         # per_param_grad_ready_counts is a dict mapping parameters to number of times
         # `register_grad_ready` is called for that parameter *when
@@ -756,6 +762,12 @@ class _ParamAndGradBuffer:
                 group=self.data_parallel_group,
                 symmetric=not self.ddp_config.disable_symmetric_registration,
             )
+            # Since nccl communicator group is created lazily, we need to perform a warmup call to
+            # initialize NCCL comm buffers for this dp_group before doing buffer registration.
+            torch.distributed.barrier()
+            tmp_warmup_tensor = torch.zeros([1], device="cuda")
+            torch.distributed.all_reduce(tmp_warmup_tensor, group=self.data_parallel_group)
+            torch.distributed.barrier()
         else:
             # If nccl_ub is False, mem_alloc_context is nullcontext.
             mem_alloc_context = nullcontext
@@ -794,6 +806,10 @@ class _ParamAndGradBuffer:
                     device=torch.cuda.current_device(),
                     requires_grad=False,
                 )
+
+        self.grad_data_size = 0
+        self.param_data_size = 0
+        self.param_data_cpu = None
 
         # Finally, map param.data and param.main_grad fields to buffers.
         bucket_params = []
@@ -944,6 +960,38 @@ class _ParamAndGradBuffer:
         Zero out the underlying grad_buffer.
         """
         self.grad_data.zero_()
+
+    def offload_to_cpu(self, move_params: bool = True, move_grads: bool = True) -> None:
+        """
+        Offload the buffers to CPU.
+        """
+        if move_grads and self.grad_data is not None and self.grad_data.storage().size() > 0:
+            self.grad_data_size = self.grad_data.storage().size()
+            self.grad_data.storage().resize_(0)
+        if move_params and self.param_data is not None and self.param_data.storage().size() > 0:
+            self.param_data_size = self.param_data.storage().size()
+            if self.param_data_cpu is not None:
+                self.param_data_cpu.copy_(self.param_data, non_blocking=True)
+            else:
+                self.param_data_cpu = self.param_data.cpu().pin_memory()
+            self.param_data.storage().resize_(0)
+
+    def reload_from_cpu(self, move_params: bool = True, move_grads: bool = True):
+        """
+        Reload the buffers from CPU.
+        """
+        if (
+            move_params
+            and self.param_data is not None
+            and self.param_data_cpu is not None
+            and self.param_data.storage().size() == 0
+        ):
+            self.param_data.storage().resize_(self.param_data_size)
+            self.param_data.copy_(self.param_data_cpu, non_blocking=True)
+        if move_grads and self.grad_data is not None and self.grad_data_size > 0:
+            self.grad_data.storage().resize_(self.grad_data_size)
+            self.grad_data.zero_()
+            self.grad_data_size = 0
 
 
 def partition_buckets(
