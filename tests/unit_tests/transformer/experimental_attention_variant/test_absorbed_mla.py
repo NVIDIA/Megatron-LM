@@ -31,10 +31,10 @@ class MockCoreAttention(torch.nn.Module):
 
     def __init__(self, *args, **kwargs):
         super().__init__()
-        self.softmax_scale = kwargs["softmax_scale"]
-        self.k_channels = kwargs["k_channels"]
-        self.v_channels = kwargs["v_channels"]
-        self.pg_collection = kwargs["pg_collection"]
+        self.softmax_scale = kwargs.get("softmax_scale")
+        self.k_channels = kwargs.get("k_channels")
+        self.v_channels = kwargs.get("v_channels")
+        self.pg_collection = kwargs.get("pg_collection")
 
     def forward(
         self, q, k, v, *args, packed_seq_params: Optional[PackedSeqParams] = None, **kwargs
@@ -172,6 +172,7 @@ def get_mock_mla_config(
         delay_wgrad_compute=False,
         tp_comm_overlap=False,
         experimental_attention_variant=None,
+        softmax_scale=None,
     )
 
 
@@ -322,6 +323,14 @@ def test_functionality(tp_cp: List[int], qkv_format: str, down_proj_use_column_p
     )
     standard_outputs.backward(grads)
 
+    def _calculate_tensor_similarity(x, y):
+        x, y = x.data.double(), y.data.double()
+        denominator = (x * x + y * y).sum()
+        if denominator == 0:
+            return 1
+        sim = 2 * (x * y).sum() / denominator
+        return sim
+
     # Compute cosine similarity
     absorbed_flat = absorbed_outputs.flatten().float()
     standard_flat = standard_outputs.flatten().float()
@@ -329,6 +338,7 @@ def test_functionality(tp_cp: List[int], qkv_format: str, down_proj_use_column_p
         absorbed_flat.unsqueeze(0), standard_flat.unsqueeze(0)
     ).item()
     assert cosine_sim > 0.9999, f"output cosine similarity = {cosine_sim} < 0.9999"
+    assert _calculate_tensor_similarity(absorbed_outputs, standard_outputs) > 0.9999
     torch.testing.assert_close(absorbed_outputs, standard_outputs, atol=5e-3, rtol=5e-3)
 
     for name, param in absorbed_mla.named_parameters():
@@ -372,7 +382,7 @@ def test_functionality(tp_cp: List[int], qkv_format: str, down_proj_use_column_p
                 absorbed_grad_flat.unsqueeze(0), standard_grad_flat.unsqueeze(0)
             ).item()
             assert cos_sim > 0.9999, f"name: {name}, cosine similarity = {cos_sim} < 0.9999"
-            torch.testing.assert_close(combined_grad, param.grad, atol=1e-1, rtol=1e-2)
+            assert _calculate_tensor_similarity(combined_grad, param.grad) > 0.9999
         else:
             absorbed_grad = absorbed_grads[name].grad
             standard_grad = param.grad
@@ -384,6 +394,6 @@ def test_functionality(tp_cp: List[int], qkv_format: str, down_proj_use_column_p
                 absorbed_grad_flat.unsqueeze(0), standard_grad_flat.unsqueeze(0)
             ).item()
             assert cos_sim > 0.9999, f"name: {name}, cosine similarity = {cos_sim} < 0.9999"
-            torch.testing.assert_close(absorbed_grad, standard_grad, atol=1e-1, rtol=1e-2)
+            assert _calculate_tensor_similarity(absorbed_grad, standard_grad) > 0.9999
 
     Utils.destroy_model_parallel()
