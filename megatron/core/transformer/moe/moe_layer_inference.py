@@ -129,6 +129,7 @@ class InferenceMoELayer(MoELayer):
         self.token_dispatcher = self.old_token_dispatcher
         self.shared_expert_overlap = self.old_expert_overlap
         
+        
     # ==================== Simplified Forward Pass ====================
     def forward(self, hidden_states: torch.Tensor, padding_mask: Optional[torch.Tensor] = None):
         """      

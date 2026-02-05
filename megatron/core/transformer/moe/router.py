@@ -733,6 +733,10 @@ class InferenceTopKRouter(TopKRouter):
         if self.topk > 1:
             topk_probs = topk_probs / (topk_probs.sum(dim=-1, keepdim=True) + 1e-20)
 
+        # Apply scaling factor if configured
+        if self.config.moe_router_topk_scaling_factor:
+            topk_probs = topk_probs * self.config.moe_router_topk_scaling_factor
+
         # NOTE: Return format differs from parent class for efficiency:
         # - Parent: Returns sparse tensors [num_tokens, num_experts] (routing_probs, routing_map)
         # - This:   Returns dense tensors [num_tokens, topk] (topk_probs, topk_indices)
@@ -750,9 +754,10 @@ class InferenceTopKRouter(TopKRouter):
                 - probs: Normalized routing probabilities [num_tokens, topk]
                 - top_indices: Selected expert indices [num_tokens, topk]
         """
-        # Compute logits via gating network
+        # Maintain float32 expert bias (important for bf16/fp16)
+        self._maintain_float32_expert_bias()
         
         if not self.is_cuda_graphed_iteration:
             return super().forward(input, padding_mask)
-
+        
         return self._forward(input, padding_mask)
