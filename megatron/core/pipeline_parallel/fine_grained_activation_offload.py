@@ -1001,6 +1001,7 @@ class ChunkOffloadHandler:
             # Mark that d2h_stream is used so it gets joined before capture ends
             set_external_join_stream_for_graph_capture(self.d2h_stream)
 
+        # Wait for compute to finish before starting offload
         self.d2h_stream.wait_stream(torch.cuda.current_stream())
         self.bulk_offload(forced_released_tensors)
 
@@ -1077,6 +1078,7 @@ class ChunkOffloadHandler:
         if is_graph_capturing():
             set_external_join_stream_for_graph_capture(self.h2d_stream)
 
+        # Wait for compute to finish before starting reload
         self.h2d_stream.wait_stream(torch.cuda.current_stream())
         self.bulk_reload()
 

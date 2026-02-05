@@ -113,54 +113,55 @@ def join_external_streams():
     _JOIN_STREAMS = []
 
 
-class RecordStreamTracker:
+class StreamTracker:
     """Tracks tensor references and alternates CUDA streams across consecutive cudagraph replays.
 
-    Double-buffers both tensor references (intercepted via record_stream) and CUDA streams so
+    Multi-buffers both tensor references (intercepted via record_stream) and CUDA streams so
     that consecutive cudagraph replays use different streams, allowing overlap with async comms.
-    This is needed as any tensors that have been attached to a stream with record_stream
-    may be deallocated when the stream is joined. Because we may wish to overlap the subsequent
+    This is needed as tensors attached to a stream with 'torch.Tensor.record_stream'
+    may be deallocated when the stream is joined. Because we may overlap the subsequent
     cudagraph with the previous cudagraph's async comms (ie. offloads), the subsequent cudagraph
-    may invalidate the memory of async comm. So we intercept torch.Tensor.record_stream calls
-    and manually store references to such tensors.
+    may invalidate the memory of attached tensors. So we intercept torch.Tensor.record_stream calls
+    and manually store references to such tensors until the graph is guarenteed to have finished.
 
     """
 
-    # Double-buffered tensor references and CUDA streams, alternated via _idx
-    _buffers = [[], []]
-    _streams = [None, None]
+    # Multi-buffered tensor references and CUDA streams, alternated via _idx
+    _num_buffers = 4
+    _buffers = [[] for _ in range(_num_buffers)]
+    _streams = [None] * _num_buffers
     _idx = 0
 
     _original_record_stream = torch.Tensor.record_stream
 
     def _patched_record_stream(*args, **kwargs):
-        RecordStreamTracker._original_record_stream(*args, **kwargs)
-        RecordStreamTracker._buffers[RecordStreamTracker._idx].append(args[0])
+        StreamTracker._original_record_stream(*args, **kwargs)
+        StreamTracker._buffers[StreamTracker._idx].append(args[0])
 
     def __init__(self):
-        RecordStreamTracker._idx = 0 if RecordStreamTracker._idx == 1 else 1
-        RecordStreamTracker._buffers[RecordStreamTracker._idx] = []
+        StreamTracker._idx = (StreamTracker._idx + 1) % StreamTracker._num_buffers
+        StreamTracker._buffers[StreamTracker._idx] = []
 
     @classmethod
     def clear(cls):
         """Clear all record_stream tensor references."""
-        cls._buffers = [[], []]
+        cls._buffers = [[] for _ in range(cls._num_buffers)]
 
     @classmethod
     def get_next_stream(cls):
         """Return the next alternating stream for cudagraph replay."""
         if cls._streams[0] is None:
-            cls._streams = [torch.cuda.Stream(), torch.cuda.Stream()]
+            cls._streams = [torch.cuda.Stream() for _ in range(cls._num_buffers)]
         idx = cls._idx
-        cls._idx = 0 if cls._idx == 1 else 1
+        cls._idx = (cls._idx + 1) % cls._num_buffers
         return cls._streams[idx]
 
     def __enter__(self):
-        torch.Tensor.record_stream = RecordStreamTracker._patched_record_stream
+        torch.Tensor.record_stream = StreamTracker._patched_record_stream
         return self
 
     def __exit__(self, *args):
-        torch.Tensor.record_stream = RecordStreamTracker._original_record_stream
+        torch.Tensor.record_stream = StreamTracker._original_record_stream
 
 
 def is_graph_warmup():
@@ -510,7 +511,7 @@ class _CudagraphGlobalRecord:
                 runner.create_fwd_graph(args, kwargs, out, clone_inputs=True)
 
                 if runner is last_fwd_runner:
-                    RecordStreamTracker.clear()
+                    StreamTracker.clear()
                     if FREEZE_GC:
                         # gc.collect() drops references to unreachable tensors created during
                         # capture, returning their storage to the allocator to avoid a slowdown
@@ -714,7 +715,7 @@ class _CudagraphReplayNode(torch.autograd.Function):
                 runner.fp8_param_cache_updated = is_first_microbatch
 
         if runner.use_stream:
-            stream = RecordStreamTracker.get_next_stream()
+            stream = StreamTracker.get_next_stream()
             stream.wait_stream(torch.cuda.current_stream())
             with torch.cuda.stream(stream):
                 runner.fwd_graph.replay()
@@ -754,7 +755,7 @@ class _CudagraphReplayNode(torch.autograd.Function):
                 cudagraph_output_grad.copy_(user_output_grad)
 
         if runner.use_stream:
-            stream = RecordStreamTracker.get_next_stream()
+            stream = StreamTracker.get_next_stream()
             stream.wait_stream(torch.cuda.current_stream())
             with torch.cuda.stream(stream):
                 runner.bwd_graph.replay()
@@ -852,7 +853,7 @@ class _CudaGraphRunner(torch.nn.Module):
             self.fp4_runtime_enabled = None
 
             if self.base_module.config.fine_grained_activation_offloading:
-                # Use alternating streams from RecordStreamTracker for graph replays
+                # Use alternating streams from StreamTracker for graph replays
                 self.use_stream = True
                 self.fwd_completion_event = torch.cuda.Event(external=True, interprocess=True)
                 self.bwd_completion_event = torch.cuda.Event(external=True, interprocess=True)
@@ -1072,7 +1073,7 @@ class _CudaGraphRunner(torch.nn.Module):
                     gc.freeze()
 
                 if self.use_stream:
-                    record_stream_tracker = RecordStreamTracker()
+                    record_stream_tracker = StreamTracker()
                 else:
                     record_stream_tracker = nullcontext()
 
