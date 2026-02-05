@@ -1954,7 +1954,9 @@ class ParamAndGradBuffer:
                 hsdp_buf_dp_group = self.dist_index.get_fsdp_group(
                     is_expert_parallel=group.is_expert_param
                 )
-                main_buf_extra_kwargs["dp_rank"] = self.dist_index.get_logical_hybrid_fsdp_rank()
+                main_buf_extra_kwargs["dp_rank"] = self.dist_index.get_logical_hybrid_fsdp_rank(
+                    is_expert_parallel=group.is_expert_param
+                )
             else:
                 main_buf_dp_group = self.dist_index.get_fsdp_group(
                     is_expert_parallel=group.is_expert_param
