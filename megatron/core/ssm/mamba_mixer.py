@@ -578,7 +578,7 @@ class MambaMixer(MegatronModule):
             return y_combined
         elif y_chunked is not None:
             y_prefill = torch.empty(
-                (num_prefill_tokens, 1, y_chunked.shape[-1]),
+                (prefill_token_count, 1, y_chunked.shape[-1]),
                 dtype=y_chunked_dtype,
                 device=y_chunked.device,
             )
