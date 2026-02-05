@@ -34,7 +34,7 @@ class CachedMetadataFileSystemReader(FileSystemReader):
     def read_metadata(self) -> Metadata:
         """
         Read metadata from file system, caching for subsequent calls.
-        
+
         If a .metadata_offset file exists alongside .metadata, it will be loaded
         and combined with the base metadata. This allows for faster checkpoint saving
         by splitting the metadata into a reusable base part and a smaller offset part.
@@ -44,7 +44,7 @@ class CachedMetadataFileSystemReader(FileSystemReader):
         """
         if self._cached_metadata is None:
             self._cached_metadata = super().read_metadata()
-            
+
             # Check if .metadata_offset exists
             metadata_offset_path = os.path.join(self.path, ".metadata_offset")
             if os.path.exists(metadata_offset_path):
@@ -55,7 +55,7 @@ class CachedMetadataFileSystemReader(FileSystemReader):
                     # Note: use_bin_type is only for packb(), not unpackb()
                     # raw=False tells msgpack to decode bytes to str (default in msgpack 1.0+)
                     data = msgpack.unpackb(f.read())
-                    
+
                     # Handle both chunked and non-chunked formats
                     if isinstance(data, Iterable) and len(data) == 2 and data[0] == 'chunked':
                         # Chunked format: ('chunked', [pickled_chunk1, pickled_chunk2, ...])
@@ -63,6 +63,7 @@ class CachedMetadataFileSystemReader(FileSystemReader):
                         _, pickled_chunks = data
                         storage_md = {}
                         from concurrent.futures import ThreadPoolExecutor
+
                         with ThreadPoolExecutor(max_workers=len(pickled_chunks)) as chunk_executor:
                             chunks = list(chunk_executor.map(pickle.loads, pickled_chunks))
                         for chunk in chunks:
@@ -80,5 +81,5 @@ class CachedMetadataFileSystemReader(FileSystemReader):
                 else:
                     # Set storage_data if it doesn't exist
                     self._cached_metadata.storage_data = storage_md
-                    
+
         return self._cached_metadata

@@ -10,8 +10,6 @@ import pickle
 import queue
 from concurrent.futures import ThreadPoolExecutor
 from functools import partial
-
-import msgpack
 from heapq import heappop, heappush
 from itertools import chain
 from operator import itemgetter
@@ -19,6 +17,7 @@ from pathlib import Path
 from time import time
 from typing import Any, Callable, Dict, List, Optional, Tuple, Union
 
+import msgpack
 import torch
 from torch import multiprocessing as mp
 from torch.distributed.checkpoint import FileSystemWriter
@@ -482,11 +481,11 @@ class FileSystemWriterAsync(FileSystemWriter):
     def finish(self, metadata: Metadata, results: List[List[WriteResult]]) -> None:
         """
         Finish the checkpointing process.
-        
+
         If source_checkpoint_dir is provided, this will use split metadata approach:
         1. Copy base .metadata from source checkpoint
         2. Save only storage_md to .metadata_offset
-        
+
         This significantly speeds up checkpoint saving for large nested dictionaries.
 
         Args:
@@ -497,7 +496,7 @@ class FileSystemWriterAsync(FileSystemWriter):
         storage_md = dict()
         for wr_list in results:
             storage_md.update({wr.index: wr.storage_data for wr in wr_list})
-        
+
         if self.use_msc:
             start_time = time()
             import multistorageclient as msc
@@ -510,23 +509,29 @@ class FileSystemWriterAsync(FileSystemWriter):
             with msc.open(path, "wb") as metadata_file:
                 pickle.dump(metadata, metadata_file)
             end_time = time()
-            logger.debug(f"Finish timestamp: {end_time}, MSC metadata save time: {end_time - start_time}")
+            logger.debug(
+                f"Finish timestamp: {end_time}, MSC metadata save time: {end_time - start_time}"
+            )
         else:
             if self.source_checkpoint_dir:
                 # Split metadata approach: copy base metadata and save only offset
                 source_metadata_path = os.path.join(self.source_checkpoint_dir, ".metadata")
                 dest_metadata_path = os.path.join(self.checkpoint_dir, ".metadata")
-                
+
                 # Validate that source checkpoint still exists before attempting copy
-                if not os.path.exists(self.source_checkpoint_dir) or not os.path.exists(source_metadata_path):
+                if not os.path.exists(self.source_checkpoint_dir) or not os.path.exists(
+                    source_metadata_path
+                ):
                     logger.warning(
                         f"Source checkpoint dir {self.source_checkpoint_dir} no longer exists "
-                        f"(may have been deleted by retention policy). Falling back to complete metadata save."
+                        f"(may have been deleted by retention policy). "
+                        f"Falling back to complete metadata save."
                     )
                     super().finish(metadata, results)
                 else:
                     # Copy the base metadata file from source and save offset in parallel
                     import shutil
+
                     start_time = time()
                     offset_path = os.path.join(self.checkpoint_dir, ".metadata_offset")
 
@@ -540,45 +545,55 @@ class FileSystemWriterAsync(FileSystemWriter):
 
                     def save_offset():
                         pickle_start = time()
-                        
+
                         # Split dictionary into chunks for parallel pickling
                         items = list(storage_md.items())
-                        num_workers = min(4, max(1, len(items) // 1000))  # Use up to 4 workers, 1 per 1000 items
-                        
+                        num_workers = min(
+                            4, max(1, len(items) // 1000)
+                        )  # Use up to 4 workers, 1 per 1000 items
+
                         if num_workers > 1 and len(items) > 1000:
                             chunk_size = len(items) // num_workers
                             chunks = []
                             for i in range(num_workers):
                                 start_idx = i * chunk_size
-                                end_idx = start_idx + chunk_size if i < num_workers - 1 else len(items)
+                                end_idx = (
+                                    start_idx + chunk_size if i < num_workers - 1 else len(items)
+                                )
                                 chunks.append(dict(items[start_idx:end_idx]))
-                            
+
                             # Pickle each chunk in parallel
                             def pickle_chunk(chunk):
                                 return pickle.dumps(chunk, protocol=pickle.HIGHEST_PROTOCOL)
-                            
+
                             with ThreadPoolExecutor(max_workers=num_workers) as chunk_executor:
                                 pickled_chunks = list(chunk_executor.map(pickle_chunk, chunks))
-                            
+
                             # Write the chunked structure
                             with open(offset_path, "wb") as offset_file:
-                                # Use msgpack for the simple wrapper structure (string + list of bytes)
-                                # msgpack is faster and more efficient than pickle for this simple case
-                                offset_file.write(msgpack.packb(('chunked', pickled_chunks), use_bin_type=True))
+                                # Use msgpack for the simple wrapper structure
+                                # (string + list of bytes)
+                                # msgpack is faster and more efficient than pickle
+                                offset_file.write(
+                                    msgpack.packb(('chunked', pickled_chunks), use_bin_type=True)
+                                )
                         else:
                             # For small dictionaries, just pickle directly
                             with open(offset_path, "wb") as offset_file:
                                 pickle.dump(storage_md, offset_file)
-                        
+
                         pickle_end = time()
-                        logger.debug(f"Metadata offset save time: {pickle_end - pickle_start:.6f}s (workers: {num_workers})")
+                        logger.debug(
+                            f"Metadata offset save time: {pickle_end - pickle_start:.6f}s "
+                            f"(workers: {num_workers})"
+                        )
                         return pickle_end - pickle_start
 
                     # Execute both operations in parallel using threads
                     with ThreadPoolExecutor(max_workers=2) as executor:
                         copy_future = executor.submit(copy_metadata)
                         pickle_future = executor.submit(save_offset)
-                        
+
                         # Wait for both to complete
                         copy_time = copy_future.result()
                         pickle_time = pickle_future.result()
@@ -586,9 +601,17 @@ class FileSystemWriterAsync(FileSystemWriter):
                     end_time = time()
                     total_time = end_time - start_time
                     sequential_time = copy_time + pickle_time
-                    logger.debug(f"Finish timestamp: {end_time}, total parallel time: {total_time:.6f}s")
-                    logger.debug(f"Overlap savings: {sequential_time - total_time:.6f}s (would be {sequential_time:.6f}s sequential)")
-                    logger.debug(f"Split metadata: copied base from {source_metadata_path}, saved offset to {offset_path}")
+                    logger.debug(
+                        f"Finish timestamp: {end_time}, total parallel time: {total_time:.6f}s"
+                    )
+                    logger.debug(
+                        f"Overlap savings: {sequential_time - total_time:.6f}s "
+                        f"(would be {sequential_time:.6f}s sequential)"
+                    )
+                    logger.debug(
+                        f"Split metadata: copied base from {source_metadata_path}, "
+                        f"saved offset to {offset_path}"
+                    )
             else:
                 logger.debug("No source checkpoint directory provided, saving complete metadata")
                 # Original behavior: save complete metadata
