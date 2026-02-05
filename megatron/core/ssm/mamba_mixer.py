@@ -466,7 +466,7 @@ class MambaMixer(MegatronModule):
         token_count = padded_dims.token_count
         decode_req_count = padded_dims.decode_req_count
         prefill_req_count = padded_dims.prefill_req_count
-        has_explicit_chunked_prefill_req = padded_dims.has_explicit_chunked_prefill_req
+        enable_chunked_prefill = context.is_chunked_prefill_enabled()
 
         # Input projection
         zxBCdt, _ = self.in_proj(hidden_states)
@@ -479,8 +479,24 @@ class MambaMixer(MegatronModule):
                 ssm_state,
                 context.mamba_metadata.batch_indices_decode,
             ).transpose(0, 1)
-        elif decode_req_count == 0 and (prefill_req_count > 0 or has_explicit_chunked_prefill_req):
-            if prefill_req_count > 0:
+        elif decode_req_count == 0 and prefill_req_count > 0:
+            if enable_chunked_prefill:
+                y_chunked_prefill = self._ssm_prefill(
+                    zxBCdt[: context.mamba_metadata.device_chunked_prefill[0]],
+                    conv_state=conv_state,
+                    ssm_state=ssm_state,
+                    batch_indices=context.mamba_metadata.batch_indices_chunked_prefill,
+                    is_chunked_prefill=True,
+                )
+                zxBCdt_regular_prefill = torch.empty_like(zxBCdt)
+                tensor_get_slice_after(
+                    zxBCdt,
+                    zxBCdt_regular_prefill,
+                    context.mamba_metadata.device_chunked_prefill,
+                    check_bounds=False,
+                )
+                zxBCdt = zxBCdt_regular_prefill
+            if not enable_chunked_prefill or prefill_req_count > 1:
                 # Prefill only (regular prefill requests)
                 y_prefill = self._ssm_prefill(
                     zxBCdt,
@@ -491,34 +507,25 @@ class MambaMixer(MegatronModule):
                     return_varlen_states=True,
                     batch_indices=context.mamba_metadata.batch_indices_prefill,
                 )
-            if has_explicit_chunked_prefill_req:
-                # Prefill only (chunked prefill request)
-                zxBCdt_chunked_prefill = torch.empty_like(zxBCdt)
-                tensor_get_slice_after(
-                    zxBCdt,
-                    zxBCdt_chunked_prefill,
-                    context.mamba_metadata.device_chunked_prefill,
-                    check_bounds=False,
+            if enable_chunked_prefill and prefill_req_count > 1:
+                # Merge chunked prefill and regular prefill
+                y = torch.empty(
+                    [token_count, 1, y_prefill.shape[-1]],
+                    dtype=y_prefill.dtype,
+                    device=y_prefill.device,
                 )
-                y_chunked_prefill = self._ssm_prefill(
-                    zxBCdt_chunked_prefill[: context.mamba_metadata.device_chunked_prefill[1]],
-                    conv_state=conv_state,
-                    ssm_state=ssm_state,
-                    batch_indices=context.mamba_metadata.batch_indices_chunked_prefill,
-                    is_chunked_prefill=True,
-                )
-            if prefill_req_count > 0 and has_explicit_chunked_prefill_req:
-                # Merge regular prefill and chunked prefill parts
                 tensor_merge(
-                    y_prefill, y_chunked_prefill, context.mamba_metadata.device_chunked_prefill
+                    y_chunked_prefill,
+                    y_prefill,
+                    context.mamba_metadata.device_chunked_prefill,
+                    output_tensor=y,
                 )
-                y = y_prefill
-            elif prefill_req_count > 0:
-                # Prefill-only without chunked prefill
-                y = y_prefill
-            else:
+            elif enable_chunked_prefill and prefill_req_count == 1:
                 # Prefill-only with only chunked prefill
                 y = y_chunked_prefill
+            else:
+                # Prefill-only without chunked prefill
+                y = y_prefill
         else:
             # Mix of decode and prefill
             zxBCdt_prefill = torch.empty_like(zxBCdt)
@@ -536,8 +543,24 @@ class MambaMixer(MegatronModule):
                 context.mamba_metadata.batch_indices_decode,
             ).transpose(0, 1)
             y_prefill, y_chunked_prefill = None, None
-            if prefill_req_count > 0:
-                # Regular prefill requests
+            if enable_chunked_prefill:
+                y_chunked_prefill = self._ssm_prefill(
+                    zxBCdt_prefill[: context.mamba_metadata.device_chunked_prefill[0]],
+                    conv_state=conv_state,
+                    ssm_state=ssm_state,
+                    batch_indices=context.mamba_metadata.batch_indices_chunked_prefill,
+                    is_chunked_prefill=True,
+                )
+                zxBCdt_regular_prefill = torch.empty_like(zxBCdt_prefill)
+                tensor_get_slice_after(
+                    zxBCdt_prefill,
+                    zxBCdt_regular_prefill,
+                    context.mamba_metadata.device_chunked_prefill,
+                    check_bounds=False,
+                )
+                zxBCdt_prefill = zxBCdt_regular_prefill
+            if not enable_chunked_prefill or prefill_req_count > 1:
+                # Prefill only (regular prefill requests)
                 y_prefill = self._ssm_prefill(
                     zxBCdt_prefill,
                     conv_state=conv_state,
@@ -547,37 +570,26 @@ class MambaMixer(MegatronModule):
                     return_varlen_states=True,
                     batch_indices=context.mamba_metadata.batch_indices_prefill,
                 )
-            if has_explicit_chunked_prefill_req:
-                # Chunked prefill request
-                zxBCdt_chunked_prefill = torch.empty_like(zxBCdt_prefill)
-                tensor_get_slice_after(
-                    zxBCdt_prefill,
-                    zxBCdt_chunked_prefill,
-                    context.mamba_metadata.device_chunked_prefill,
-                    check_bounds=False,
+            if enable_chunked_prefill and prefill_req_count > 1:
+                # Merge chunked prefill and regular prefill
+                y_prefill_combined = torch.empty(
+                    [token_count - decode_req_count, 1, y_prefill.shape[-1]],
+                    dtype=y_prefill.dtype,
+                    device=y_prefill.device,
                 )
-                y_chunked_prefill = self._ssm_prefill(
-                    zxBCdt_chunked_prefill[: context.mamba_metadata.device_chunked_prefill[1]],
-                    conv_state=conv_state,
-                    ssm_state=ssm_state,
-                    batch_indices=context.mamba_metadata.batch_indices_chunked_prefill,
-                    is_chunked_prefill=True,
-                )
-            if prefill_req_count > 0 and has_explicit_chunked_prefill_req:
-                # Merge regular prefill and chunked prefill parts
-                assert y_prefill is not None
-                assert y_chunked_prefill is not None
                 tensor_merge(
-                    y_prefill, y_chunked_prefill, context.mamba_metadata.device_chunked_prefill
+                    y_chunked_prefill,
+                    y_prefill,
+                    context.mamba_metadata.device_chunked_prefill,
+                    output_tensor=y_prefill_combined,
                 )
-            elif has_explicit_chunked_prefill_req:
-                # Chunked prefill only
-                assert y_prefill is None
-                assert y_chunked_prefill is not None
+                y_prefill = y_prefill_combined
+            elif enable_chunked_prefill and prefill_req_count == 1:
+                # Prefill-only with only chunked prefill
                 y_prefill = y_chunked_prefill
             else:
-                # Regular prefill only; y_prefill is already set, nothing more to be done
-                assert y_prefill is not None
+                # Prefill-only without chunked prefill, y_prefill already assigned
+                pass
             # Merge decode and prefill parts
             y = torch.empty(
                 [token_count, 1, y_prefill.shape[-1]],
