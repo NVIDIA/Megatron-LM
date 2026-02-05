@@ -3,7 +3,7 @@
 """Comprehensive tests for DynamicInferenceEvent and request event lifecycle.
 
 This test suite covers all 9 event types, payload validation, serialization,
-request methods, and lifecycle sequences.
+request methods, and lifecycle sequences with exactly 10 substantial tests.
 """
 
 import time
@@ -24,14 +24,6 @@ from megatron.core.inference.contexts.dynamic_context import (
     TokenOverflowError,
 )
 from megatron.core.inference.sampling_params import SamplingParams
-from tests.unit_tests.inference.test_utils import TestPriority
-
-# Set this to control which tests run:
-# - TestPriority.CRITICAL: Run only critical tests
-# - TestPriority.IMPORTANT: Run critical + important tests
-# - TestPriority.MEDIUM: Run critical + important + medium tests
-# - TestPriority.LOW: Run all tests (default)
-TEST_PRIORITY = TestPriority.LOW
 
 
 # ============================================================================
@@ -49,1087 +41,663 @@ def basic_request():
     )
 
 
-@pytest.fixture
-def request_with_lifecycle():
-    """Create a request with a full lifecycle of events."""
-    req = DynamicInferenceRequest(
-        request_id=1,
-        prompt_tokens=torch.tensor([1, 2, 3], dtype=torch.int64),
-        sampling_params=SamplingParams(num_tokens_to_generate=10),
-    )
-    req.add_event_add_engine()
-    req.add_event_add_context()
-    req.add_event_generated_token(100)
-    req.add_event_generated_token(200)
-    req.add_event_finish()
-    return req
-
-
 # ============================================================================
-# 1. TestDynamicInferenceEventType [CRITICAL]
+# Test 1: All Event Types Creation and Payload Validation
 # ============================================================================
 
 
-class TestDynamicInferenceEventType:
-    """Tests for the DynamicInferenceEventType enum."""
+def test_all_event_types_creation_and_payload_validation():
+    """Test all 9 event types exist, are unique, and enforce payload validation rules.
 
-    @pytest.mark.skipif(
-        TEST_PRIORITY < TestPriority.CRITICAL, reason="Test priority not met"
-    )
-    def test_all_nine_event_types_exist(self):
-        """Verify all 9 event types are defined."""
-        expected_types = [
-            'ADD_ENGINE',
-            'ADD_CONTEXT',
-            'GENERATED_TOKEN',
-            'PAUSE',
-            'EVICT',
-            'FINISH',
-            'FAIL',
-            'ERROR_TRANSIENT',
-            'ERROR_NONTRANSIENT',
-        ]
-        for event_type in expected_types:
-            assert hasattr(
-                DynamicInferenceEventType, event_type
-            ), f"Missing event type: {event_type}"
-        # Verify exactly 9 types
-        assert len(DynamicInferenceEventType) == 9
+    Coverage:
+    - All 9 event types (ADD_ENGINE, ADD_CONTEXT, GENERATED_TOKEN, PAUSE, EVICT,
+      FINISH, FAIL, ERROR_TRANSIENT, ERROR_NONTRANSIENT)
+    - Payload requirements (int for GENERATED_TOKEN, exception for errors, None for others)
+    - Auto-timestamp generation
+    - Invalid payload rejection via AssertionError
+    """
+    # Verify exactly 9 event types exist
+    expected_types = [
+        'ADD_ENGINE', 'ADD_CONTEXT', 'GENERATED_TOKEN', 'PAUSE', 'EVICT',
+        'FINISH', 'FAIL', 'ERROR_TRANSIENT', 'ERROR_NONTRANSIENT',
+    ]
+    for event_type in expected_types:
+        assert hasattr(DynamicInferenceEventType, event_type), f"Missing: {event_type}"
+    assert len(DynamicInferenceEventType) == 9
 
-    @pytest.mark.skipif(
-        TEST_PRIORITY < TestPriority.CRITICAL, reason="Test priority not met"
-    )
-    def test_old_event_types_removed(self):
-        """Verify old ADD and FIRST_TOKEN event types no longer exist."""
-        assert not hasattr(DynamicInferenceEventType, 'ADD')
-        assert not hasattr(DynamicInferenceEventType, 'FIRST_TOKEN')
+    # Verify all values are unique
+    values = [e.value for e in DynamicInferenceEventType]
+    assert len(values) == len(set(values)), "Duplicate event type values"
 
-    @pytest.mark.skipif(
-        TEST_PRIORITY < TestPriority.CRITICAL, reason="Test priority not met"
-    )
-    def test_event_types_are_unique(self):
-        """Verify no duplicate auto() values."""
-        values = [e.value for e in DynamicInferenceEventType]
-        assert len(values) == len(set(values)), "Duplicate event type values detected"
-
-
-# ============================================================================
-# 2. TestEventCreation [CRITICAL]
-# ============================================================================
-
-
-class TestEventCreation:
-    """Tests for creating DynamicInferenceEvent instances."""
-
-    @pytest.mark.skipif(
-        TEST_PRIORITY < TestPriority.CRITICAL, reason="Test priority not met"
-    )
-    @pytest.mark.parametrize(
-        "event_type",
-        [
-            DynamicInferenceEventType.ADD_ENGINE,
-            DynamicInferenceEventType.ADD_CONTEXT,
-            DynamicInferenceEventType.PAUSE,
-            DynamicInferenceEventType.EVICT,
-            DynamicInferenceEventType.FINISH,
-            DynamicInferenceEventType.FAIL,
-        ],
-    )
-    def test_create_event_without_payload(self, event_type):
-        """Test creating events that should have no payload."""
+    # Create events that require no payload
+    no_payload_types = [
+        DynamicInferenceEventType.ADD_ENGINE,
+        DynamicInferenceEventType.ADD_CONTEXT,
+        DynamicInferenceEventType.PAUSE,
+        DynamicInferenceEventType.EVICT,
+        DynamicInferenceEventType.FINISH,
+        DynamicInferenceEventType.FAIL,
+    ]
+    for event_type in no_payload_types:
         event = DynamicInferenceEvent(type=event_type)
         assert event.type == event_type
         assert event.payload is None
         assert event.timestamp is not None
-
-    @pytest.mark.skipif(
-        TEST_PRIORITY < TestPriority.CRITICAL, reason="Test priority not met"
-    )
-    def test_create_generated_token_event(self):
-        """Test creating GENERATED_TOKEN events with int payload."""
-        token_id = 42
-        event = DynamicInferenceEvent(
-            type=DynamicInferenceEventType.GENERATED_TOKEN, payload=token_id
-        )
-        assert event.type == DynamicInferenceEventType.GENERATED_TOKEN
-        assert event.payload == token_id
-        assert event.timestamp is not None
-
-    @pytest.mark.skipif(
-        TEST_PRIORITY < TestPriority.CRITICAL, reason="Test priority not met"
-    )
-    def test_create_error_transient_event(self):
-        """Test creating ERROR_TRANSIENT events with Exception payload."""
-        error = RequestOverflowError(request_id=1, message="Too many requests")
-        event = DynamicInferenceEvent(
-            type=DynamicInferenceEventType.ERROR_TRANSIENT, payload=error
-        )
-        assert event.type == DynamicInferenceEventType.ERROR_TRANSIENT
-        assert event.payload is error
-        assert event.timestamp is not None
-
-    @pytest.mark.skipif(
-        TEST_PRIORITY < TestPriority.CRITICAL, reason="Test priority not met"
-    )
-    def test_create_error_nontransient_event(self):
-        """Test creating ERROR_NONTRANSIENT events with Exception payload."""
-        error = MaxSequenceLengthOverflowError(request_id=2, message="Sequence too long")
-        event = DynamicInferenceEvent(
-            type=DynamicInferenceEventType.ERROR_NONTRANSIENT, payload=error
-        )
-        assert event.type == DynamicInferenceEventType.ERROR_NONTRANSIENT
-        assert event.payload is error
-        assert event.timestamp is not None
-
-    @pytest.mark.skipif(
-        TEST_PRIORITY < TestPriority.CRITICAL, reason="Test priority not met"
-    )
-    def test_auto_timestamp_assigned(self):
-        """Test that timestamp is auto-generated when not provided."""
-        before = time.time()
-        event = DynamicInferenceEvent(type=DynamicInferenceEventType.ADD_ENGINE)
-        after = time.time()
-        assert before <= event.timestamp <= after
-
-    @pytest.mark.skipif(
-        TEST_PRIORITY < TestPriority.CRITICAL, reason="Test priority not met"
-    )
-    def test_explicit_timestamp_preserved(self):
-        """Test that explicit timestamp is preserved."""
-        explicit_time = 1234567890.123
-        event = DynamicInferenceEvent(
-            type=DynamicInferenceEventType.ADD_ENGINE, timestamp=explicit_time
-        )
-        assert event.timestamp == explicit_time
-
-
-# ============================================================================
-# 3. TestPayloadValidation [CRITICAL]
-# ============================================================================
-
-
-class TestPayloadValidation:
-    """Tests for payload validation in DynamicInferenceEvent."""
-
-    @pytest.mark.skipif(
-        TEST_PRIORITY < TestPriority.CRITICAL, reason="Test priority not met"
-    )
-    @pytest.mark.parametrize(
-        "event_type",
-        [
-            DynamicInferenceEventType.ADD_ENGINE,
-            DynamicInferenceEventType.ADD_CONTEXT,
-            DynamicInferenceEventType.PAUSE,
-            DynamicInferenceEventType.EVICT,
-            DynamicInferenceEventType.FINISH,
-            DynamicInferenceEventType.FAIL,
-        ],
-    )
-    def test_no_payload_events_reject_payload(self, event_type):
-        """Test that events that must have None payload reject non-None payload."""
+        # Verify these types reject non-None payloads
         with pytest.raises(AssertionError):
             DynamicInferenceEvent(type=event_type, payload="not allowed")
 
-    @pytest.mark.skipif(
-        TEST_PRIORITY < TestPriority.CRITICAL, reason="Test priority not met"
+    # Create GENERATED_TOKEN event with int payload
+    token_event = DynamicInferenceEvent(
+        type=DynamicInferenceEventType.GENERATED_TOKEN, payload=42
     )
-    def test_generated_token_requires_int_rejects_none(self):
-        """Test GENERATED_TOKEN rejects None payload."""
-        with pytest.raises(AssertionError):
-            DynamicInferenceEvent(type=DynamicInferenceEventType.GENERATED_TOKEN)
+    assert token_event.type == DynamicInferenceEventType.GENERATED_TOKEN
+    assert token_event.payload == 42
+    assert token_event.timestamp is not None
 
-    @pytest.mark.skipif(
-        TEST_PRIORITY < TestPriority.CRITICAL, reason="Test priority not met"
-    )
-    def test_generated_token_requires_int_rejects_string(self):
-        """Test GENERATED_TOKEN rejects string payload."""
-        with pytest.raises(AssertionError):
-            DynamicInferenceEvent(
-                type=DynamicInferenceEventType.GENERATED_TOKEN, payload="not an int"
-            )
+    # GENERATED_TOKEN rejects None, string, and float payloads
+    with pytest.raises(AssertionError):
+        DynamicInferenceEvent(type=DynamicInferenceEventType.GENERATED_TOKEN)
+    with pytest.raises(AssertionError):
+        DynamicInferenceEvent(type=DynamicInferenceEventType.GENERATED_TOKEN, payload="bad")
+    with pytest.raises(AssertionError):
+        DynamicInferenceEvent(type=DynamicInferenceEventType.GENERATED_TOKEN, payload=3.14)
 
-    @pytest.mark.skipif(
-        TEST_PRIORITY < TestPriority.CRITICAL, reason="Test priority not met"
+    # Create error events with exception payloads
+    transient_error = RequestOverflowError(request_id=1, message="Transient")
+    event_transient = DynamicInferenceEvent(
+        type=DynamicInferenceEventType.ERROR_TRANSIENT, payload=transient_error
     )
-    def test_generated_token_requires_int_rejects_float(self):
-        """Test GENERATED_TOKEN rejects float payload."""
-        with pytest.raises(AssertionError):
-            DynamicInferenceEvent(
-                type=DynamicInferenceEventType.GENERATED_TOKEN, payload=3.14
-            )
+    assert event_transient.type == DynamicInferenceEventType.ERROR_TRANSIENT
+    assert event_transient.payload is transient_error
 
-    @pytest.mark.skipif(
-        TEST_PRIORITY < TestPriority.CRITICAL, reason="Test priority not met"
+    nontransient_error = MaxSequenceLengthOverflowError(request_id=2, message="Fatal")
+    event_nontransient = DynamicInferenceEvent(
+        type=DynamicInferenceEventType.ERROR_NONTRANSIENT, payload=nontransient_error
     )
-    def test_error_transient_requires_payload(self):
-        """Test ERROR_TRANSIENT rejects None payload."""
-        with pytest.raises(AssertionError):
-            DynamicInferenceEvent(type=DynamicInferenceEventType.ERROR_TRANSIENT)
+    assert event_nontransient.type == DynamicInferenceEventType.ERROR_NONTRANSIENT
+    assert event_nontransient.payload is nontransient_error
 
-    @pytest.mark.skipif(
-        TEST_PRIORITY < TestPriority.CRITICAL, reason="Test priority not met"
-    )
-    def test_error_nontransient_requires_payload(self):
-        """Test ERROR_NONTRANSIENT rejects None payload."""
-        with pytest.raises(AssertionError):
-            DynamicInferenceEvent(type=DynamicInferenceEventType.ERROR_NONTRANSIENT)
+    # Error events reject None payloads
+    with pytest.raises(AssertionError):
+        DynamicInferenceEvent(type=DynamicInferenceEventType.ERROR_TRANSIENT)
+    with pytest.raises(AssertionError):
+        DynamicInferenceEvent(type=DynamicInferenceEventType.ERROR_NONTRANSIENT)
+
+    # Verify auto-timestamp is reasonable
+    before = time.time()
+    event = DynamicInferenceEvent(type=DynamicInferenceEventType.ADD_ENGINE)
+    after = time.time()
+    assert before <= event.timestamp <= after
 
 
 # ============================================================================
-# 4. TestEventSerialization [CRITICAL]
+# Test 2: Successful Request Lifecycle with Serialization Roundtrip
 # ============================================================================
 
 
-class TestEventSerialization:
-    """Tests for event serialization and deserialization."""
+def test_successful_request_lifecycle_with_serialization_roundtrip(basic_request):
+    """Test full request lifecycle: ADD_ENGINE -> ADD_CONTEXT -> GENERATED_TOKEN(s) -> FINISH.
 
-    @pytest.mark.skipif(
-        TEST_PRIORITY < TestPriority.CRITICAL, reason="Test priority not met"
-    )
-    @pytest.mark.parametrize(
-        "event_type",
-        [
-            DynamicInferenceEventType.ADD_ENGINE,
-            DynamicInferenceEventType.ADD_CONTEXT,
-            DynamicInferenceEventType.PAUSE,
-            DynamicInferenceEventType.EVICT,
-            DynamicInferenceEventType.FINISH,
-            DynamicInferenceEventType.FAIL,
-        ],
-    )
-    def test_simple_event_roundtrip(self, event_type):
-        """Test serialize/deserialize roundtrip for simple events."""
-        original = DynamicInferenceEvent(type=event_type)
-        serialized = original.serialize()
+    Coverage:
+    - Full successful lifecycle event sequence
+    - Event order preservation
+    - Request serialization/deserialization roundtrip
+    - generated_tokens property extraction
+    """
+    # Build complete successful lifecycle
+    basic_request.add_event_add_engine()
+    basic_request.add_event_add_context()
+    basic_request.add_event_generated_token(100)
+    basic_request.add_event_generated_token(200)
+    basic_request.add_event_generated_token(300)
+    basic_request.add_event_finish()
 
+    # Verify event sequence
+    event_types = [e.type for e in basic_request.events]
+    assert event_types == [
+        DynamicInferenceEventType.ADD_ENGINE,
+        DynamicInferenceEventType.ADD_CONTEXT,
+        DynamicInferenceEventType.GENERATED_TOKEN,
+        DynamicInferenceEventType.GENERATED_TOKEN,
+        DynamicInferenceEventType.GENERATED_TOKEN,
+        DynamicInferenceEventType.FINISH,
+    ]
+
+    # Verify generated_tokens property
+    assert basic_request.generated_tokens == [100, 200, 300]
+
+    # Serialize request
+    serialized = basic_request.serialize()
+    assert 'events' in serialized
+    assert len(serialized['events']) == 6
+    assert serialized['generated_tokens'] == [100, 200, 300]
+
+    # Verify event types in serialized form
+    event_type_names = [e['type'] for e in serialized['events']]
+    assert event_type_names == [
+        'ADD_ENGINE', 'ADD_CONTEXT', 'GENERATED_TOKEN',
+        'GENERATED_TOKEN', 'GENERATED_TOKEN', 'FINISH'
+    ]
+
+    # Deserialize and verify restoration
+    restored = DynamicInferenceRequest.deserialize(serialized)
+    assert len(restored.events) == 6
+    assert restored.generated_tokens == [100, 200, 300]
+
+    # Verify event order preserved after roundtrip
+    restored_types = [e.type for e in restored.events]
+    assert restored_types == event_types
+
+    # Verify timestamps preserved
+    for orig, rest in zip(basic_request.events, restored.events):
+        assert rest.timestamp == orig.timestamp
+
+
+# ============================================================================
+# Test 3: Error Event Serialization with ContextErrorFactory
+# ============================================================================
+
+
+def test_error_event_serialization_with_context_error_factory():
+    """Test error event serialization using ContextErrorFactory for all error types.
+
+    Coverage:
+    - ERROR_TRANSIENT and ERROR_NONTRANSIENT events
+    - All 4 error types: RequestOverflowError, TokenOverflowError,
+      MaxSequenceLengthOverflowError, BlockOverflowError
+    - Error attribute preservation (request_id, message, is_transient) through roundtrip
+    """
+    error_cases = [
+        # (event_type, error_class, request_id, message, is_transient)
+        (DynamicInferenceEventType.ERROR_TRANSIENT, RequestOverflowError,
+         1, "Max requests exceeded", True),
+        (DynamicInferenceEventType.ERROR_TRANSIENT, TokenOverflowError,
+         2, "Token limit exceeded", True),
+        (DynamicInferenceEventType.ERROR_TRANSIENT, BlockOverflowError,
+         3, "Block overflow", True),
+        (DynamicInferenceEventType.ERROR_NONTRANSIENT, MaxSequenceLengthOverflowError,
+         4, "Sequence too long", False),
+    ]
+
+    for event_type, error_class, req_id, message, is_transient in error_cases:
+        # Create error and event
+        error = error_class(request_id=req_id, message=message)
+        event = DynamicInferenceEvent(type=event_type, payload=error)
+
+        # Verify error attributes before serialization
+        assert event.payload.request_id == req_id
+        assert event.payload.message == message
+        assert event.payload.is_transient == is_transient
+
+        # Serialize and deserialize
+        serialized = event.serialize()
         assert serialized['type'] == event_type.name
-        assert 'timestamp' in serialized
-
-        deserialized = DynamicInferenceEvent.deserialize(serialized)
-        assert deserialized.type == original.type
-        assert deserialized.timestamp == original.timestamp
-        assert deserialized.payload is None
-
-    @pytest.mark.skipif(
-        TEST_PRIORITY < TestPriority.CRITICAL, reason="Test priority not met"
-    )
-    def test_generated_token_roundtrip(self):
-        """Test serialize/deserialize preserves token ID payload."""
-        token_id = 12345
-        original = DynamicInferenceEvent(
-            type=DynamicInferenceEventType.GENERATED_TOKEN, payload=token_id
-        )
-        serialized = original.serialize()
-
-        assert serialized['type'] == 'GENERATED_TOKEN'
-        assert serialized['payload'] == token_id
-
-        deserialized = DynamicInferenceEvent.deserialize(serialized)
-        assert deserialized.type == DynamicInferenceEventType.GENERATED_TOKEN
-        assert deserialized.payload == token_id
-        assert deserialized.timestamp == original.timestamp
-
-    @pytest.mark.skipif(
-        TEST_PRIORITY < TestPriority.CRITICAL, reason="Test priority not met"
-    )
-    def test_error_transient_roundtrip(self):
-        """Test serialize/deserialize preserves ERROR_TRANSIENT payload via ContextErrorFactory."""
-        error = TokenOverflowError(request_id=5, message="Token overflow")
-        original = DynamicInferenceEvent(
-            type=DynamicInferenceEventType.ERROR_TRANSIENT, payload=error
-        )
-        serialized = original.serialize()
-
-        assert serialized['type'] == 'ERROR_TRANSIENT'
         assert serialized['payload'] is not None
 
         deserialized = DynamicInferenceEvent.deserialize(serialized)
-        assert deserialized.type == DynamicInferenceEventType.ERROR_TRANSIENT
-        assert deserialized.payload.request_id == error.request_id
-        assert deserialized.payload.message == error.message
 
-    @pytest.mark.skipif(
-        TEST_PRIORITY < TestPriority.CRITICAL, reason="Test priority not met"
-    )
-    def test_error_nontransient_roundtrip(self):
-        """Test serialize/deserialize preserves ERROR_NONTRANSIENT payload."""
-        error = MaxSequenceLengthOverflowError(request_id=10, message="Max sequence exceeded")
-        original = DynamicInferenceEvent(
-            type=DynamicInferenceEventType.ERROR_NONTRANSIENT, payload=error
-        )
-        serialized = original.serialize()
-
-        assert serialized['type'] == 'ERROR_NONTRANSIENT'
-
-        deserialized = DynamicInferenceEvent.deserialize(serialized)
-        assert deserialized.type == DynamicInferenceEventType.ERROR_NONTRANSIENT
-        assert deserialized.payload.request_id == error.request_id
-        assert deserialized.payload.message == error.message
-
-    @pytest.mark.skipif(
-        TEST_PRIORITY < TestPriority.CRITICAL, reason="Test priority not met"
-    )
-    def test_timestamp_preserved(self):
-        """Test that exact timestamp is preserved after roundtrip."""
-        explicit_time = 1700000000.123456
-        original = DynamicInferenceEvent(
-            type=DynamicInferenceEventType.FINISH, timestamp=explicit_time
-        )
-        serialized = original.serialize()
-        deserialized = DynamicInferenceEvent.deserialize(serialized)
-        assert deserialized.timestamp == explicit_time
+        # Verify restoration
+        assert deserialized.type == event_type
+        assert deserialized.payload.request_id == req_id
+        assert deserialized.payload.message == message
+        assert deserialized.payload.is_transient == is_transient
+        assert deserialized.timestamp == event.timestamp
 
 
 # ============================================================================
-# 5. TestErrorPayloads [IMPORTANT]
+# Test 4: Generated Tokens Property Filters and Preserves Order
 # ============================================================================
 
 
-class TestErrorPayloads:
-    """Tests for error payload handling in events."""
+def test_generated_tokens_property_filters_and_preserves_order(basic_request):
+    """Test generated_tokens property correctly filters GENERATED_TOKEN events and preserves order.
 
-    @pytest.mark.skipif(
-        TEST_PRIORITY < TestPriority.IMPORTANT, reason="Test priority not met"
-    )
-    def test_request_overflow_error_payload(self):
-        """Test RequestOverflowError can be used as event payload."""
-        error = RequestOverflowError(request_id=1, message="Max requests exceeded")
-        event = DynamicInferenceEvent(
-            type=DynamicInferenceEventType.ERROR_TRANSIENT, payload=error
-        )
-        assert isinstance(event.payload, RequestOverflowError)
+    Coverage:
+    - Mixed event filtering (only GENERATED_TOKEN payloads extracted)
+    - Token ID edge cases: 0, large values (2^62)
+    - Order preservation with interspersed events
+    """
+    # Start with no events
+    assert basic_request.generated_tokens == []
 
-    @pytest.mark.skipif(
-        TEST_PRIORITY < TestPriority.IMPORTANT, reason="Test priority not met"
-    )
-    def test_token_overflow_error_payload(self):
-        """Test TokenOverflowError can be used as event payload."""
-        error = TokenOverflowError(request_id=2, message="Token limit exceeded")
-        event = DynamicInferenceEvent(
-            type=DynamicInferenceEventType.ERROR_TRANSIENT, payload=error
-        )
-        assert isinstance(event.payload, TokenOverflowError)
+    # Add only non-token events
+    basic_request.add_event_add_engine()
+    basic_request.add_event_add_context()
+    assert basic_request.generated_tokens == []
 
-    @pytest.mark.skipif(
-        TEST_PRIORITY < TestPriority.IMPORTANT, reason="Test priority not met"
-    )
-    def test_max_seq_overflow_error_payload(self):
-        """Test MaxSequenceLengthOverflowError can be used as event payload."""
-        error = MaxSequenceLengthOverflowError(request_id=3, message="Sequence too long")
-        event = DynamicInferenceEvent(
-            type=DynamicInferenceEventType.ERROR_NONTRANSIENT, payload=error
-        )
-        assert isinstance(event.payload, MaxSequenceLengthOverflowError)
+    # Add token with edge case ID 0
+    basic_request.add_event_generated_token(0)
+    assert basic_request.generated_tokens == [0]
 
-    @pytest.mark.skipif(
-        TEST_PRIORITY < TestPriority.IMPORTANT, reason="Test priority not met"
-    )
-    def test_error_preserves_request_id(self):
-        """Test that request_id is accessible from error payload."""
-        error = BlockOverflowError(request_id=42, message="Block overflow")
-        event = DynamicInferenceEvent(
-            type=DynamicInferenceEventType.ERROR_TRANSIENT, payload=error
-        )
-        assert event.payload.request_id == 42
+    # Intersperse with PAUSE
+    basic_request.add_event_pause()
+    basic_request.add_event_generated_token(100)
+    assert basic_request.generated_tokens == [0, 100]
 
-    @pytest.mark.skipif(
-        TEST_PRIORITY < TestPriority.IMPORTANT, reason="Test priority not met"
-    )
-    def test_error_preserves_is_transient(self):
-        """Test that is_transient flag is accessible from error payload."""
-        # RequestOverflowError should be transient by default
-        transient_error = RequestOverflowError(request_id=1, message="Transient error")
-        assert transient_error.is_transient is True
+    # Add large token ID
+    large_id = 2**62
+    basic_request.add_event_generated_token(large_id)
+    assert basic_request.generated_tokens == [0, 100, large_id]
 
-        # MaxSequenceLengthOverflowError should be non-transient by default
-        nontransient_error = MaxSequenceLengthOverflowError(
-            request_id=2, message="Non-transient error"
-        )
-        assert nontransient_error.is_transient is False
+    # More interspersed events
+    error = RequestOverflowError(request_id=1, message="Transient")
+    basic_request.add_event_error_transient(error)
+    basic_request.add_event_generated_token(200)
+    basic_request.add_event_finish()
+
+    # Final check - only token payloads, in order
+    assert basic_request.generated_tokens == [0, 100, large_id, 200]
+
+    # Verify total events vs token events
+    assert len(basic_request.events) == 9  # All events
+    assert len(basic_request.generated_tokens) == 4  # Only token events
 
 
 # ============================================================================
-# 6. TestRequestEventMethods [CRITICAL]
+# Test 5: Request Record Merge Across Eviction Recovery
 # ============================================================================
 
 
-class TestRequestEventMethods:
-    """Tests for DynamicInferenceRequest event helper methods."""
+def test_request_record_merge_across_eviction_recovery():
+    """Test RequestRecord.merge() combines events from multiple checkpoints across eviction/recovery.
 
-    @pytest.mark.skipif(
-        TEST_PRIORITY < TestPriority.CRITICAL, reason="Test priority not met"
+    Coverage:
+    - RequestRecord creation and merge()
+    - Eviction lifecycle simulation (first attempt evicted, second attempt succeeds)
+    - Multi-checkpoint event combination
+    - Token aggregation from all checkpoints
+    """
+    # First request: starts, generates some tokens, then gets evicted
+    req1 = DynamicInferenceRequest(
+        request_id=1,
+        prompt_tokens=torch.tensor([1, 2, 3], dtype=torch.int64),
+        sampling_params=SamplingParams(num_tokens_to_generate=10),
     )
-    def test_add_event_add_engine(self, basic_request):
-        """Test add_event_add_engine() method."""
-        assert len(basic_request.events) == 0
-        basic_request.add_event_add_engine()
-        assert len(basic_request.events) == 1
-        assert basic_request.events[0].type == DynamicInferenceEventType.ADD_ENGINE
-        assert basic_request.events[0].payload is None
+    req1.add_event_add_engine()
+    req1.add_event_add_context()
+    req1.add_event_generated_token(100)
+    req1.add_event_generated_token(101)
+    req1.add_event_evict()
 
-    @pytest.mark.skipif(
-        TEST_PRIORITY < TestPriority.CRITICAL, reason="Test priority not met"
+    # Second request: recovered, generates more tokens, completes
+    req2 = DynamicInferenceRequest(
+        request_id=1,
+        prompt_tokens=torch.tensor([1, 2, 3, 100, 101], dtype=torch.int64),
+        sampling_params=SamplingParams(num_tokens_to_generate=8),
     )
-    def test_add_event_add_context(self, basic_request):
-        """Test add_event_add_context() method."""
-        basic_request.add_event_add_context()
-        assert len(basic_request.events) == 1
-        assert basic_request.events[0].type == DynamicInferenceEventType.ADD_CONTEXT
-        assert basic_request.events[0].payload is None
+    req2.add_event_add_engine()
+    req2.add_event_add_context()
+    req2.add_event_generated_token(200)
+    req2.add_event_generated_token(201)
+    req2.add_event_finish()
 
-    @pytest.mark.skipif(
-        TEST_PRIORITY < TestPriority.CRITICAL, reason="Test priority not met"
-    )
-    def test_add_event_generated_token(self, basic_request):
-        """Test add_event_generated_token() method with token payload."""
-        token_id = 42
-        basic_request.add_event_generated_token(token_id)
-        assert len(basic_request.events) == 1
-        assert basic_request.events[0].type == DynamicInferenceEventType.GENERATED_TOKEN
-        assert basic_request.events[0].payload == token_id
+    # Create record with both checkpoints
+    record = DynamicInferenceRequestRecord()
+    record.requests.append(req1)
+    record.requests.append(req2)
 
-    @pytest.mark.skipif(
-        TEST_PRIORITY < TestPriority.CRITICAL, reason="Test priority not met"
-    )
-    def test_add_event_pause(self, basic_request):
-        """Test add_event_pause() method."""
-        basic_request.add_event_pause()
-        assert len(basic_request.events) == 1
-        assert basic_request.events[0].type == DynamicInferenceEventType.PAUSE
-        assert basic_request.events[0].payload is None
+    # Merge
+    merged = record.merge()
 
-    @pytest.mark.skipif(
-        TEST_PRIORITY < TestPriority.CRITICAL, reason="Test priority not met"
-    )
-    def test_add_event_evict(self, basic_request):
-        """Test add_event_evict() method."""
-        basic_request.add_event_evict()
-        assert len(basic_request.events) == 1
-        assert basic_request.events[0].type == DynamicInferenceEventType.EVICT
-        assert basic_request.events[0].payload is None
+    # Verify all events present (5 from req1 + 5 from req2)
+    assert len(merged.events) == 10
 
-    @pytest.mark.skipif(
-        TEST_PRIORITY < TestPriority.CRITICAL, reason="Test priority not met"
-    )
-    def test_add_event_finish(self, basic_request):
-        """Test add_event_finish() method."""
-        basic_request.add_event_finish()
-        assert len(basic_request.events) == 1
-        assert basic_request.events[0].type == DynamicInferenceEventType.FINISH
-        assert basic_request.events[0].payload is None
+    # Verify event types include eviction
+    event_types = [e.type for e in merged.events]
+    assert DynamicInferenceEventType.EVICT in event_types
+    assert event_types.count(DynamicInferenceEventType.ADD_ENGINE) == 2
+    assert event_types.count(DynamicInferenceEventType.ADD_CONTEXT) == 2
 
-    @pytest.mark.skipif(
-        TEST_PRIORITY < TestPriority.CRITICAL, reason="Test priority not met"
-    )
-    def test_add_event_fail(self, basic_request):
-        """Test add_event_fail() method."""
-        basic_request.add_event_fail()
-        assert len(basic_request.events) == 1
-        assert basic_request.events[0].type == DynamicInferenceEventType.FAIL
-        assert basic_request.events[0].payload is None
+    # Verify all tokens combined correctly
+    assert merged.generated_tokens == [100, 101, 200, 201]
 
-    @pytest.mark.skipif(
-        TEST_PRIORITY < TestPriority.CRITICAL, reason="Test priority not met"
-    )
-    def test_add_event_error_transient(self, basic_request):
-        """Test add_event_error_transient() method with exception."""
-        error = TokenOverflowError(request_id=1, message="Token overflow")
-        basic_request.add_event_error_transient(error)
-        assert len(basic_request.events) == 1
-        assert basic_request.events[0].type == DynamicInferenceEventType.ERROR_TRANSIENT
-        assert basic_request.events[0].payload is error
-
-    @pytest.mark.skipif(
-        TEST_PRIORITY < TestPriority.CRITICAL, reason="Test priority not met"
-    )
-    def test_add_event_error_nontransient(self, basic_request):
-        """Test add_event_error_nontransient() method with exception."""
-        error = MaxSequenceLengthOverflowError(request_id=1, message="Sequence too long")
-        basic_request.add_event_error_nontransient(error)
-        assert len(basic_request.events) == 1
-        assert basic_request.events[0].type == DynamicInferenceEventType.ERROR_NONTRANSIENT
-        assert basic_request.events[0].payload is error
+    # Test from_request convenience method
+    single_record = DynamicInferenceRequestRecord.from_request(req1)
+    single_merged = single_record.merge()
+    assert len(single_merged.events) == len(req1.events)
+    assert single_merged.generated_tokens == req1.generated_tokens
 
 
 # ============================================================================
-# 7. TestGeneratedTokensProperty [CRITICAL]
+# Test 6: Compact Serialization Mode Roundtrip
 # ============================================================================
 
 
-class TestGeneratedTokensProperty:
-    """Tests for the generated_tokens property on DynamicInferenceRequest."""
+def test_compact_serialization_mode_roundtrip(basic_request):
+    """Test compact serialization (track_generated_token_events=False) for all levels.
 
-    @pytest.mark.skipif(
-        TEST_PRIORITY < TestPriority.CRITICAL, reason="Test priority not met"
+    Coverage:
+    - GENERATED_TOKEN events become integers in compact mode
+    - Other events remain dicts in compact mode
+    - Deserialization restores GENERATED_TOKEN events with timestamp=-1 sentinel
+    - Request-level and RequestRecord-level compact serialization
+    - generated_tokens property works after compact roundtrip
+    """
+    # Event-level compact serialization
+    token_event = DynamicInferenceEvent(
+        type=DynamicInferenceEventType.GENERATED_TOKEN, payload=42
     )
-    def test_empty_when_no_events(self, basic_request):
-        """Test generated_tokens returns [] when no events."""
-        assert basic_request.generated_tokens == []
+    compact_serialized = token_event.serialize(track_generated_token_events=False)
+    assert compact_serialized == 42  # Just the token ID
 
-    @pytest.mark.skipif(
-        TEST_PRIORITY < TestPriority.CRITICAL, reason="Test priority not met"
-    )
-    def test_empty_when_no_token_events(self, basic_request):
-        """Test generated_tokens returns [] when only non-token events."""
-        basic_request.add_event_add_engine()
-        basic_request.add_event_add_context()
-        basic_request.add_event_finish()
-        assert basic_request.generated_tokens == []
+    # Non-token event serializes normally even in compact mode
+    add_event = DynamicInferenceEvent(type=DynamicInferenceEventType.ADD_ENGINE)
+    normal_serialized = add_event.serialize(track_generated_token_events=False)
+    assert isinstance(normal_serialized, dict)
+    assert normal_serialized["type"] == "ADD_ENGINE"
 
-    @pytest.mark.skipif(
-        TEST_PRIORITY < TestPriority.CRITICAL, reason="Test priority not met"
-    )
-    def test_single_token(self, basic_request):
-        """Test generated_tokens returns [token_id] for single token."""
-        basic_request.add_event_generated_token(999)
-        assert basic_request.generated_tokens == [999]
+    # Deserialize compact int back to GENERATED_TOKEN event
+    restored_token = DynamicInferenceEvent.deserialize(42)
+    assert restored_token.type == DynamicInferenceEventType.GENERATED_TOKEN
+    assert restored_token.payload == 42
+    assert restored_token.timestamp == -1  # Sentinel value
 
-    @pytest.mark.skipif(
-        TEST_PRIORITY < TestPriority.CRITICAL, reason="Test priority not met"
-    )
-    def test_multiple_tokens_in_order(self, basic_request):
-        """Test generated_tokens preserves generation order."""
-        basic_request.add_event_generated_token(10)
-        basic_request.add_event_generated_token(20)
-        basic_request.add_event_generated_token(30)
-        assert basic_request.generated_tokens == [10, 20, 30]
+    # Request-level compact serialization
+    basic_request.add_event_add_engine()
+    basic_request.add_event_generated_token(100)
+    basic_request.add_event_generated_token(200)
+    basic_request.add_event_finish()
 
-    @pytest.mark.skipif(
-        TEST_PRIORITY < TestPriority.CRITICAL, reason="Test priority not met"
-    )
-    def test_filters_only_token_events(self, basic_request):
-        """Test generated_tokens ignores other event types."""
-        basic_request.add_event_add_engine()
-        basic_request.add_event_add_context()
-        basic_request.add_event_generated_token(100)
-        basic_request.add_event_pause()
-        basic_request.add_event_generated_token(200)
-        basic_request.add_event_finish()
+    serialized = basic_request.serialize(track_generated_token_events=False)
+    events = serialized["events"]
 
-        assert basic_request.generated_tokens == [100, 200]
+    # Verify mixed format
+    assert isinstance(events[0], dict)  # ADD_ENGINE
+    assert events[1] == 100  # GENERATED_TOKEN compact
+    assert events[2] == 200  # GENERATED_TOKEN compact
+    assert isinstance(events[3], dict)  # FINISH
 
-    @pytest.mark.skipif(
-        TEST_PRIORITY < TestPriority.CRITICAL, reason="Test priority not met"
-    )
-    def test_zero_token_id_valid(self, basic_request):
-        """Test that token ID 0 works correctly."""
-        basic_request.add_event_generated_token(0)
-        assert basic_request.generated_tokens == [0]
+    # Deserialize and verify
+    restored = DynamicInferenceRequest.deserialize(serialized)
+    assert len(restored.events) == 4
+    assert restored.generated_tokens == [100, 200]
 
-    @pytest.mark.skipif(
-        TEST_PRIORITY < TestPriority.CRITICAL, reason="Test priority not met"
-    )
-    def test_large_token_id(self, basic_request):
-        """Test near INT64_MAX token ID works."""
-        large_id = 2**62  # Large but valid int
-        basic_request.add_event_generated_token(large_id)
-        assert basic_request.generated_tokens == [large_id]
+    # Token events have sentinel timestamp
+    token_events = [e for e in restored.events
+                    if e.type == DynamicInferenceEventType.GENERATED_TOKEN]
+    assert all(e.timestamp == -1 for e in token_events)
+
+    # RequestRecord-level compact serialization
+    record = DynamicInferenceRequestRecord.from_request(basic_request)
+    record_serialized = record.serialize(track_generated_token_events=False)
+    assert record_serialized["requests"][0]["events"][1] == 100
 
 
 # ============================================================================
-# 8. TestRequestSerialization [IMPORTANT]
+# Test 7: TTFT Calculation from Event Timestamps
 # ============================================================================
 
 
-class TestRequestSerialization:
-    """Tests for DynamicInferenceRequest serialization with events."""
+def test_ttft_calculation_from_event_timestamps(basic_request):
+    """Test TTFT (time-to-first-token) calculation using ADD_ENGINE and GENERATED_TOKEN timestamps.
 
-    @pytest.mark.skipif(
-        TEST_PRIORITY < TestPriority.IMPORTANT, reason="Test priority not met"
+    Coverage:
+    - Timestamp accuracy
+    - ADD_ENGINE/ADD_CONTEXT split for TTFT calculation
+    - Timestamps are monotonically increasing
+    - Explicit timestamp preservation through serialization
+    """
+    # Add events with deliberate delays
+    basic_request.add_event_add_engine()
+    time.sleep(0.01)
+    basic_request.add_event_add_context()
+    time.sleep(0.01)
+    basic_request.add_event_generated_token(100)
+
+    # Find timestamps
+    add_engine_time = None
+    first_token_time = None
+    for event in basic_request.events:
+        if event.type == DynamicInferenceEventType.ADD_ENGINE:
+            add_engine_time = event.timestamp
+        elif event.type == DynamicInferenceEventType.GENERATED_TOKEN and first_token_time is None:
+            first_token_time = event.timestamp
+
+    assert add_engine_time is not None
+    assert first_token_time is not None
+
+    # Calculate TTFT
+    ttft = first_token_time - add_engine_time
+    assert ttft > 0, "TTFT should be positive"
+    assert ttft > 0.01, "TTFT should include deliberate delay"
+    assert ttft < 1.0, "TTFT should be reasonable in test"
+
+    # Verify timestamps are monotonically increasing
+    timestamps = [e.timestamp for e in basic_request.events]
+    for i in range(1, len(timestamps)):
+        assert timestamps[i] >= timestamps[i - 1], "Timestamps should not decrease"
+
+    # Test explicit timestamp preservation through serialization
+    explicit_time = 1700000000.123456
+    event_with_explicit = DynamicInferenceEvent(
+        type=DynamicInferenceEventType.FINISH, timestamp=explicit_time
     )
-    def test_request_with_no_events(self, basic_request):
-        """Test serialize produces correct structure with empty events list."""
-        serialized = basic_request.serialize()
-        assert 'events' in serialized
-        assert serialized['events'] == []
-        assert 'generated_tokens' in serialized
-        assert serialized['generated_tokens'] == []
-
-    @pytest.mark.skipif(
-        TEST_PRIORITY < TestPriority.IMPORTANT, reason="Test priority not met"
-    )
-    def test_request_with_full_lifecycle(self, request_with_lifecycle):
-        """Test serialize produces correct event structure."""
-        serialized = request_with_lifecycle.serialize()
-        assert len(serialized['events']) == 5
-
-        # Verify event types in serialized form
-        event_type_names = [e['type'] for e in serialized['events']]
-        expected = ['ADD_ENGINE', 'ADD_CONTEXT', 'GENERATED_TOKEN', 'GENERATED_TOKEN', 'FINISH']
-        assert event_type_names == expected
-
-        # Verify generated_tokens is included
-        assert serialized['generated_tokens'] == [100, 200]
-
-    @pytest.mark.skipif(
-        TEST_PRIORITY < TestPriority.IMPORTANT, reason="Test priority not met"
-    )
-    def test_preserves_event_order(self, basic_request):
-        """Test that event order is maintained in serialization."""
-        basic_request.add_event_finish()
-        basic_request.add_event_pause()
-        basic_request.add_event_add_engine()
-
-        serialized = basic_request.serialize()
-        event_type_names = [e['type'] for e in serialized['events']]
-        expected = ['FINISH', 'PAUSE', 'ADD_ENGINE']
-        assert event_type_names == expected
-
-    @pytest.mark.skipif(
-        TEST_PRIORITY < TestPriority.IMPORTANT, reason="Test priority not met"
-    )
-    def test_generated_tokens_in_serialized_output(self, request_with_lifecycle):
-        """Test generated_tokens is correctly included in serialized output."""
-        serialized = request_with_lifecycle.serialize()
-        assert 'generated_tokens' in serialized
-        assert serialized['generated_tokens'] == [100, 200]
+    serialized = event_with_explicit.serialize()
+    deserialized = DynamicInferenceEvent.deserialize(serialized)
+    assert deserialized.timestamp == explicit_time
 
 
 # ============================================================================
-# 9. TestRequestRecordMerge [IMPORTANT]
+# Test 8: Failed Request Lifecycle with Error Propagation
 # ============================================================================
 
 
-class TestRequestRecordMerge:
-    """Tests for DynamicInferenceRequestRecord merge functionality."""
+def test_failed_request_lifecycle_with_error_propagation(basic_request):
+    """Test failed request lifecycle: transient errors followed by nontransient error and FAIL.
 
-    @pytest.mark.skipif(
-        TEST_PRIORITY < TestPriority.IMPORTANT, reason="Test priority not met"
-    )
-    def test_single_request_merge(self, request_with_lifecycle):
-        """Test merge with single request returns same events."""
-        record = DynamicInferenceRequestRecord.from_request(request_with_lifecycle)
-        merged = record.merge()
+    Coverage:
+    - FAIL event
+    - Error event -> failure path
+    - Multiple transient errors followed by nontransient
+    - Error serialization preserved in full request roundtrip
+    """
+    # Build failure lifecycle
+    basic_request.add_event_add_engine()
 
-        assert len(merged.events) == len(request_with_lifecycle.events)
-        assert merged.generated_tokens == request_with_lifecycle.generated_tokens
+    # Transient errors (retryable)
+    transient1 = TokenOverflowError(request_id=1, message="Token overflow 1")
+    basic_request.add_event_error_transient(transient1)
 
-    @pytest.mark.skipif(
-        TEST_PRIORITY < TestPriority.IMPORTANT, reason="Test priority not met"
-    )
-    def test_two_checkpoints_merge(self):
-        """Test merge concatenates events from multiple checkpoints."""
-        req1 = DynamicInferenceRequest(
-            request_id=1,
-            prompt_tokens=torch.tensor([1, 2, 3], dtype=torch.int64),
-            sampling_params=SamplingParams(num_tokens_to_generate=10),
-        )
-        req1.add_event_add_engine()
-        req1.add_event_add_context()
-        req1.add_event_generated_token(100)
+    transient2 = BlockOverflowError(request_id=1, message="Block overflow")
+    basic_request.add_event_error_transient(transient2)
 
-        req2 = DynamicInferenceRequest(
-            request_id=1,
-            prompt_tokens=torch.tensor([1, 2, 3, 100], dtype=torch.int64),
-            sampling_params=SamplingParams(num_tokens_to_generate=9),
-        )
-        req2.add_event_add_engine()
-        req2.add_event_generated_token(200)
-        req2.add_event_finish()
+    # Fatal error
+    fatal = MaxSequenceLengthOverflowError(request_id=1, message="Sequence too long")
+    basic_request.add_event_error_nontransient(fatal)
 
-        record = DynamicInferenceRequestRecord()
-        record.requests.append(req1)
-        record.requests.append(req2)
+    # Request fails
+    basic_request.add_event_fail()
 
-        merged = record.merge()
-        assert len(merged.events) == 6  # 3 + 3 events
+    # Verify event sequence
+    event_types = [e.type for e in basic_request.events]
+    assert event_types == [
+        DynamicInferenceEventType.ADD_ENGINE,
+        DynamicInferenceEventType.ERROR_TRANSIENT,
+        DynamicInferenceEventType.ERROR_TRANSIENT,
+        DynamicInferenceEventType.ERROR_NONTRANSIENT,
+        DynamicInferenceEventType.FAIL,
+    ]
 
-    @pytest.mark.skipif(
-        TEST_PRIORITY < TestPriority.IMPORTANT, reason="Test priority not met"
-    )
-    def test_preserves_generated_tokens(self):
-        """Test that merge preserves generated_tokens from all checkpoints."""
-        req1 = DynamicInferenceRequest(
-            request_id=1,
-            prompt_tokens=torch.tensor([1, 2], dtype=torch.int64),
-            sampling_params=SamplingParams(num_tokens_to_generate=5),
-        )
-        req1.add_event_generated_token(10)
-        req1.add_event_generated_token(20)
+    # Serialize entire request
+    serialized = basic_request.serialize()
+    assert len(serialized['events']) == 5
 
-        req2 = DynamicInferenceRequest(
-            request_id=1,
-            prompt_tokens=torch.tensor([1, 2, 10, 20], dtype=torch.int64),
-            sampling_params=SamplingParams(num_tokens_to_generate=3),
-        )
-        req2.add_event_generated_token(30)
+    # Deserialize
+    restored = DynamicInferenceRequest.deserialize(serialized)
+    assert len(restored.events) == 5
 
-        record = DynamicInferenceRequestRecord()
-        record.requests.append(req1)
-        record.requests.append(req2)
+    # Verify error payloads preserved
+    error_events = [e for e in restored.events if 'ERROR' in e.type.name]
+    assert len(error_events) == 3
 
-        merged = record.merge()
-        assert merged.generated_tokens == [10, 20, 30]
+    # Check first transient error
+    assert error_events[0].payload.message == "Token overflow 1"
+    assert error_events[0].payload.is_transient is True
 
-    @pytest.mark.skipif(
-        TEST_PRIORITY < TestPriority.IMPORTANT, reason="Test priority not met"
-    )
-    def test_eviction_events_preserved(self):
-        """Test that EVICT events are preserved in merged list."""
-        req1 = DynamicInferenceRequest(
-            request_id=1,
-            prompt_tokens=torch.tensor([1, 2, 3], dtype=torch.int64),
-            sampling_params=SamplingParams(num_tokens_to_generate=5),
-        )
-        req1.add_event_add_engine()
-        req1.add_event_evict()
+    # Check second transient error
+    assert error_events[1].payload.message == "Block overflow"
+    assert error_events[1].payload.is_transient is True
 
-        req2 = DynamicInferenceRequest(
-            request_id=1,
-            prompt_tokens=torch.tensor([1, 2, 3], dtype=torch.int64),
-            sampling_params=SamplingParams(num_tokens_to_generate=5),
-        )
-        req2.add_event_add_engine()
-        req2.add_event_finish()
-
-        record = DynamicInferenceRequestRecord()
-        record.requests.append(req1)
-        record.requests.append(req2)
-
-        merged = record.merge()
-        event_types = [e.type for e in merged.events]
-        assert DynamicInferenceEventType.EVICT in event_types
+    # Check nontransient error
+    assert error_events[2].payload.message == "Sequence too long"
+    assert error_events[2].payload.is_transient is False
 
 
 # ============================================================================
-# 10. TestEventLifecycleSequences [IMPORTANT]
+# Test 9: Event String Representation for All Types
 # ============================================================================
 
 
-class TestEventLifecycleSequences:
-    """Tests for common event lifecycle sequences."""
+def test_event_str_representation_for_all_types():
+    """Test __str__ method produces correct format for all event types.
 
-    @pytest.mark.skipif(
-        TEST_PRIORITY < TestPriority.IMPORTANT, reason="Test priority not met"
-    )
-    def test_successful_lifecycle(self, basic_request):
-        """Test ADD_ENGINE -> ADD_CONTEXT -> GENERATED_TOKEN(s) -> FINISH lifecycle."""
-        basic_request.add_event_add_engine()
-        basic_request.add_event_add_context()
-        basic_request.add_event_generated_token(100)
-        basic_request.add_event_generated_token(200)
-        basic_request.add_event_generated_token(300)
-        basic_request.add_event_finish()
-
-        event_types = [e.type for e in basic_request.events]
-        assert event_types == [
-            DynamicInferenceEventType.ADD_ENGINE,
-            DynamicInferenceEventType.ADD_CONTEXT,
-            DynamicInferenceEventType.GENERATED_TOKEN,
-            DynamicInferenceEventType.GENERATED_TOKEN,
-            DynamicInferenceEventType.GENERATED_TOKEN,
-            DynamicInferenceEventType.FINISH,
-        ]
-        assert basic_request.generated_tokens == [100, 200, 300]
-
-    @pytest.mark.skipif(
-        TEST_PRIORITY < TestPriority.IMPORTANT, reason="Test priority not met"
-    )
-    def test_failed_lifecycle(self, basic_request):
-        """Test ADD_ENGINE -> ERROR_NONTRANSIENT -> FAIL lifecycle."""
-        error = MaxSequenceLengthOverflowError(request_id=1, message="Sequence too long")
-        basic_request.add_event_add_engine()
-        basic_request.add_event_error_nontransient(error)
-        basic_request.add_event_fail()
-
-        event_types = [e.type for e in basic_request.events]
-        assert event_types == [
-            DynamicInferenceEventType.ADD_ENGINE,
-            DynamicInferenceEventType.ERROR_NONTRANSIENT,
-            DynamicInferenceEventType.FAIL,
-        ]
-
-    @pytest.mark.skipif(
-        TEST_PRIORITY < TestPriority.IMPORTANT, reason="Test priority not met"
-    )
-    def test_eviction_lifecycle(self, basic_request):
-        """Test full evict/recover sequence."""
-        # First attempt - evicted
-        basic_request.add_event_add_engine()
-        basic_request.add_event_add_context()
-        basic_request.add_event_generated_token(100)
-        basic_request.add_event_evict()
-
-        # Second attempt after recovery (re-added to engine)
-        basic_request.add_event_add_engine()
-        basic_request.add_event_add_context()
-        basic_request.add_event_generated_token(200)
-        basic_request.add_event_finish()
-
-        event_types = [e.type for e in basic_request.events]
-        assert DynamicInferenceEventType.EVICT in event_types
-        assert basic_request.generated_tokens == [100, 200]
-
-    @pytest.mark.skipif(
-        TEST_PRIORITY < TestPriority.IMPORTANT, reason="Test priority not met"
-    )
-    def test_pause_lifecycle(self, basic_request):
-        """Test lifecycle with PAUSE events."""
-        basic_request.add_event_add_engine()
-        basic_request.add_event_add_context()
-        basic_request.add_event_generated_token(100)
-        basic_request.add_event_pause()
-        # Resumed
-        basic_request.add_event_generated_token(200)
-        basic_request.add_event_finish()
-
-        event_types = [e.type for e in basic_request.events]
-        assert DynamicInferenceEventType.PAUSE in event_types
-        assert basic_request.generated_tokens == [100, 200]
-
-
-# ============================================================================
-# 11. TestEventTimestamps [MEDIUM]
-# ============================================================================
-
-
-class TestEventTimestamps:
-    """Tests for event timestamp behavior."""
-
-    @pytest.mark.skipif(
-        TEST_PRIORITY < TestPriority.MEDIUM, reason="Test priority not met"
-    )
-    def test_auto_timestamp_recent(self):
-        """Test that auto-generated timestamp is within 1 second of now."""
-        before = time.time()
-        event = DynamicInferenceEvent(type=DynamicInferenceEventType.ADD_ENGINE)
-        after = time.time()
-
-        assert before <= event.timestamp <= after
-        assert (after - event.timestamp) < 1.0
-
-    @pytest.mark.skipif(
-        TEST_PRIORITY < TestPriority.MEDIUM, reason="Test priority not met"
-    )
-    def test_monotonically_increasing(self, basic_request):
-        """Test that sequential events have ordered timestamps."""
-        basic_request.add_event_add_engine()
-        time.sleep(0.001)
-        basic_request.add_event_add_context()
-        time.sleep(0.001)
-        basic_request.add_event_generated_token(42)
-
-        timestamps = [e.timestamp for e in basic_request.events]
-        assert timestamps == sorted(timestamps), "Timestamps should be increasing"
-
-    @pytest.mark.skipif(
-        TEST_PRIORITY < TestPriority.MEDIUM, reason="Test priority not met"
-    )
-    def test_ttft_calculable(self, basic_request):
-        """Test that TTFT can be computed from GENERATED_TOKEN[0] - ADD_ENGINE."""
-        basic_request.add_event_add_engine()
-        time.sleep(0.01)  # Small delay to make TTFT measurable
-        basic_request.add_event_add_context()
-        time.sleep(0.01)
-        basic_request.add_event_generated_token(100)
-
-        add_engine_time = None
-        first_token_time = None
-
-        for event in basic_request.events:
-            if event.type == DynamicInferenceEventType.ADD_ENGINE:
-                add_engine_time = event.timestamp
-            elif event.type == DynamicInferenceEventType.GENERATED_TOKEN and first_token_time is None:
-                first_token_time = event.timestamp
-
-        assert add_engine_time is not None
-        assert first_token_time is not None
-
-        ttft = first_token_time - add_engine_time
-        assert ttft > 0, "TTFT should be positive"
-        assert ttft < 1.0, "TTFT should be less than 1 second in test"
-
-
-# ============================================================================
-# 12. TestEventEdgeCases [MEDIUM]
-# ============================================================================
-
-
-class TestEventEdgeCases:
-    """Tests for edge cases in event handling."""
-
-    @pytest.mark.skipif(
-        TEST_PRIORITY < TestPriority.MEDIUM, reason="Test priority not met"
-    )
-    @pytest.mark.parametrize(
-        "event_type",
-        [
-            DynamicInferenceEventType.ADD_ENGINE,
-            DynamicInferenceEventType.ADD_CONTEXT,
-            DynamicInferenceEventType.PAUSE,
-            DynamicInferenceEventType.EVICT,
-            DynamicInferenceEventType.FINISH,
-            DynamicInferenceEventType.FAIL,
-        ],
-    )
-    def test_event_str_representation_simple(self, event_type):
-        """Test __str__ for simple events (no payload)."""
+    Coverage:
+    - Simple events show type and timestamp
+    - GENERATED_TOKEN shows token=<id>
+    - Error events show error class name
+    - Format consistency across types
+    """
+    # Simple events (no payload)
+    simple_types = [
+        DynamicInferenceEventType.ADD_ENGINE,
+        DynamicInferenceEventType.ADD_CONTEXT,
+        DynamicInferenceEventType.PAUSE,
+        DynamicInferenceEventType.EVICT,
+        DynamicInferenceEventType.FINISH,
+        DynamicInferenceEventType.FAIL,
+    ]
+    for event_type in simple_types:
         event = DynamicInferenceEvent(type=event_type)
         str_repr = str(event)
+        assert event_type.name in str_repr, f"{event_type.name} not in {str_repr}"
+        # Timestamp should appear (at least first few digits)
+        assert str(event.timestamp)[:5] in str_repr
+
+    # GENERATED_TOKEN shows token=<id>
+    token_event = DynamicInferenceEvent(
+        type=DynamicInferenceEventType.GENERATED_TOKEN, payload=42
+    )
+    str_repr = str(token_event)
+    assert 'GENERATED_TOKEN' in str_repr
+    assert 'token=42' in str_repr
+
+    # Large token ID
+    large_token_event = DynamicInferenceEvent(
+        type=DynamicInferenceEventType.GENERATED_TOKEN, payload=9999999
+    )
+    assert 'token=9999999' in str(large_token_event)
+
+    # Error events show error class name
+    error_cases = [
+        (DynamicInferenceEventType.ERROR_TRANSIENT, RequestOverflowError, "RequestOverflowError"),
+        (DynamicInferenceEventType.ERROR_TRANSIENT, TokenOverflowError, "TokenOverflowError"),
+        (DynamicInferenceEventType.ERROR_TRANSIENT, BlockOverflowError, "BlockOverflowError"),
+        (DynamicInferenceEventType.ERROR_NONTRANSIENT, MaxSequenceLengthOverflowError,
+         "MaxSequenceLengthOverflowError"),
+    ]
+    for event_type, error_class, expected_name in error_cases:
+        error = error_class(request_id=1, message="Test error")
+        event = DynamicInferenceEvent(type=event_type, payload=error)
+        str_repr = str(event)
         assert event_type.name in str_repr
-        assert str(event.timestamp)[:5] in str_repr  # Timestamp should appear
-
-    @pytest.mark.skipif(
-        TEST_PRIORITY < TestPriority.MEDIUM, reason="Test priority not met"
-    )
-    def test_event_str_representation_generated_token(self):
-        """Test __str__ for GENERATED_TOKEN event shows token ID."""
-        event = DynamicInferenceEvent(
-            type=DynamicInferenceEventType.GENERATED_TOKEN, payload=42
-        )
-        str_repr = str(event)
-        assert 'GENERATED_TOKEN' in str_repr
-        assert 'token=42' in str_repr
-
-    @pytest.mark.skipif(
-        TEST_PRIORITY < TestPriority.MEDIUM, reason="Test priority not met"
-    )
-    def test_event_str_representation_error(self):
-        """Test __str__ for error events shows error type."""
-        error = RequestOverflowError(request_id=1, message="Error")
-        event = DynamicInferenceEvent(
-            type=DynamicInferenceEventType.ERROR_TRANSIENT, payload=error
-        )
-        str_repr = str(event)
-        assert 'ERROR_TRANSIENT' in str_repr
-        assert 'RequestOverflowError' in str_repr
-
-    @pytest.mark.skipif(
-        TEST_PRIORITY < TestPriority.MEDIUM, reason="Test priority not met"
-    )
-    def test_rapid_events_distinct_timestamps(self, basic_request):
-        """Test that rapidly added events get distinct or at least ordered timestamps."""
-        for i in range(100):
-            basic_request.add_event_generated_token(i)
-
-        timestamps = [e.timestamp for e in basic_request.events]
-        # Timestamps should be non-decreasing (may be equal if added very fast)
-        for i in range(1, len(timestamps)):
-            assert timestamps[i] >= timestamps[i - 1], "Timestamps should not decrease"
-
-    @pytest.mark.skipif(
-        TEST_PRIORITY < TestPriority.MEDIUM, reason="Test priority not met"
-    )
-    def test_many_generated_tokens(self, basic_request):
-        """Test performance with 100+ generated tokens."""
-        num_tokens = 150
-        for i in range(num_tokens):
-            basic_request.add_event_generated_token(i)
-
-        assert len(basic_request.events) == num_tokens
-        assert len(basic_request.generated_tokens) == num_tokens
-        assert basic_request.generated_tokens == list(range(num_tokens))
+        assert expected_name in str_repr
 
 
 # ============================================================================
-# 13. TestCompactGeneratedTokenSerialization [CRITICAL]
+# Test 10: Complex Multi-Pause-Evict Lifecycle with Record
 # ============================================================================
 
 
-class TestCompactGeneratedTokenSerialization:
-    """Tests for compact GENERATED_TOKEN serialization (track_generated_token_events=False)."""
+def test_complex_multi_pause_evict_lifecycle_with_record():
+    """Test complex real-world scenario with multiple pauses, evictions, and recoveries.
 
-    @pytest.mark.skipif(
-        TEST_PRIORITY < TestPriority.CRITICAL, reason="Test priority not met"
+    Coverage:
+    - Complex lifecycle with multiple PAUSE events
+    - Multiple evictions and recoveries
+    - Full roundtrip with RequestRecord
+    - Complete event history and all tokens present
+    """
+    # First attempt: starts, generates token, pauses, generates more, gets evicted
+    req1 = DynamicInferenceRequest(
+        request_id=1,
+        prompt_tokens=torch.tensor([1, 2, 3], dtype=torch.int64),
+        sampling_params=SamplingParams(num_tokens_to_generate=20),
     )
-    def test_generated_token_serializes_to_int(self):
-        """GENERATED_TOKEN events serialize to just the token ID when compact."""
-        event = DynamicInferenceEvent(
-            type=DynamicInferenceEventType.GENERATED_TOKEN, payload=42
-        )
-        serialized = event.serialize(track_generated_token_events=False)
-        assert serialized == 42
+    req1.add_event_add_engine()
+    req1.add_event_add_context()
+    req1.add_event_generated_token(10)
+    req1.add_event_pause()  # Paused for higher priority request
+    req1.add_event_generated_token(11)
+    req1.add_event_generated_token(12)
+    req1.add_event_evict()  # Memory pressure
 
-    @pytest.mark.skipif(
-        TEST_PRIORITY < TestPriority.CRITICAL, reason="Test priority not met"
+    # Second attempt: recovered, generates tokens, evicted again
+    req2 = DynamicInferenceRequest(
+        request_id=1,
+        prompt_tokens=torch.tensor([1, 2, 3, 10, 11, 12], dtype=torch.int64),
+        sampling_params=SamplingParams(num_tokens_to_generate=17),
     )
-    def test_other_events_serialize_normally(self):
-        """Non-GENERATED_TOKEN events serialize normally regardless of flag."""
-        event = DynamicInferenceEvent(type=DynamicInferenceEventType.ADD_ENGINE)
-        serialized = event.serialize(track_generated_token_events=False)
-        assert isinstance(serialized, dict)
-        assert serialized["type"] == "ADD_ENGINE"
+    req2.add_event_add_engine()
+    req2.add_event_add_context()
+    req2.add_event_generated_token(20)
+    req2.add_event_pause()
+    req2.add_event_pause()  # Paused twice
+    req2.add_event_generated_token(21)
+    req2.add_event_evict()
 
-    @pytest.mark.skipif(
-        TEST_PRIORITY < TestPriority.CRITICAL, reason="Test priority not met"
+    # Third attempt: finally completes
+    req3 = DynamicInferenceRequest(
+        request_id=1,
+        prompt_tokens=torch.tensor([1, 2, 3, 10, 11, 12, 20, 21], dtype=torch.int64),
+        sampling_params=SamplingParams(num_tokens_to_generate=15),
     )
-    def test_deserialize_int_to_generated_token(self):
-        """Integer deserializes to GENERATED_TOKEN event with timestamp=-1."""
-        event = DynamicInferenceEvent.deserialize(42)
-        assert event.type == DynamicInferenceEventType.GENERATED_TOKEN
-        assert event.payload == 42
-        assert event.timestamp == -1
+    req3.add_event_add_engine()
+    req3.add_event_add_context()
+    req3.add_event_generated_token(30)
+    req3.add_event_generated_token(31)
+    req3.add_event_generated_token(32)
+    req3.add_event_finish()
 
-    @pytest.mark.skipif(
-        TEST_PRIORITY < TestPriority.CRITICAL, reason="Test priority not met"
-    )
-    def test_compact_roundtrip(self):
-        """Compact serialize -> deserialize preserves token ID."""
-        original = DynamicInferenceEvent(
-            type=DynamicInferenceEventType.GENERATED_TOKEN, payload=12345
-        )
-        serialized = original.serialize(track_generated_token_events=False)
-        restored = DynamicInferenceEvent.deserialize(serialized)
-        assert restored.type == original.type
-        assert restored.payload == original.payload
-        # Timestamp is lost in compact mode
-        assert restored.timestamp == -1
+    # Create record with all checkpoints
+    record = DynamicInferenceRequestRecord()
+    record.requests.append(req1)
+    record.requests.append(req2)
+    record.requests.append(req3)
 
-    @pytest.mark.skipif(
-        TEST_PRIORITY < TestPriority.IMPORTANT, reason="Test priority not met"
-    )
-    def test_request_compact_serialization(self, basic_request):
-        """Request serializes events in compact mode when flag is False."""
-        basic_request.add_event_add_engine()
-        basic_request.add_event_generated_token(100)
-        basic_request.add_event_generated_token(200)
-        basic_request.add_event_finish()
+    # Serialize and deserialize record
+    serialized = record.serialize()
+    assert len(serialized['requests']) == 3
 
-        serialized = basic_request.serialize(track_generated_token_events=False)
-        events = serialized["events"]
+    # Merge all checkpoints
+    merged = record.merge()
 
-        # ADD_ENGINE and FINISH are dicts, GENERATED_TOKEN are ints
-        assert isinstance(events[0], dict)  # ADD_ENGINE
-        assert events[1] == 100  # GENERATED_TOKEN compact
-        assert events[2] == 200  # GENERATED_TOKEN compact
-        assert isinstance(events[3], dict)  # FINISH
+    # Verify all tokens collected
+    assert merged.generated_tokens == [10, 11, 12, 20, 21, 30, 31, 32]
 
-    @pytest.mark.skipif(
-        TEST_PRIORITY < TestPriority.IMPORTANT, reason="Test priority not met"
-    )
-    def test_request_compact_roundtrip(self, basic_request):
-        """Request roundtrip works in compact mode."""
-        basic_request.add_event_add_engine()
-        basic_request.add_event_generated_token(100)
-        basic_request.add_event_finish()
+    # Count event types in merged history
+    event_types = [e.type for e in merged.events]
+    assert event_types.count(DynamicInferenceEventType.ADD_ENGINE) == 3
+    assert event_types.count(DynamicInferenceEventType.ADD_CONTEXT) == 3
+    assert event_types.count(DynamicInferenceEventType.EVICT) == 2
+    assert event_types.count(DynamicInferenceEventType.PAUSE) == 3
+    assert event_types.count(DynamicInferenceEventType.FINISH) == 1
+    assert event_types.count(DynamicInferenceEventType.GENERATED_TOKEN) == 8
 
-        serialized = basic_request.serialize(track_generated_token_events=False)
-        restored = DynamicInferenceRequest.deserialize(serialized)
+    # Total events: 7 from req1 + 7 from req2 + 6 from req3 = 20
+    assert len(merged.events) == 20
 
-        assert restored.generated_tokens == [100]
-        assert len(restored.events) == 3
+    # Test compact serialization roundtrip of entire record
+    compact_serialized = record.serialize(track_generated_token_events=False)
 
-    @pytest.mark.skipif(
-        TEST_PRIORITY < TestPriority.MEDIUM, reason="Test priority not met"
-    )
-    def test_record_compact_serialization(self, basic_request):
-        """Record serializes nested requests in compact mode."""
-        basic_request.add_event_generated_token(42)
-        record = DynamicInferenceRequestRecord.from_request(basic_request)
-
-        serialized = record.serialize(track_generated_token_events=False)
-        assert serialized["requests"][0]["events"][0] == 42
-
-    @pytest.mark.skipif(
-        TEST_PRIORITY < TestPriority.MEDIUM, reason="Test priority not met"
-    )
-    def test_generated_tokens_property_with_compact_events(self, basic_request):
-        """generated_tokens property works after deserializing compact events."""
-        basic_request.add_event_generated_token(10)
-        basic_request.add_event_generated_token(20)
-        basic_request.add_event_generated_token(30)
-
-        serialized = basic_request.serialize(track_generated_token_events=False)
-        restored = DynamicInferenceRequest.deserialize(serialized)
-
-        assert restored.generated_tokens == [10, 20, 30]
+    # Verify compact format in first request's events
+    first_request_events = compact_serialized['requests'][0]['events']
+    # Events: ADD_ENGINE(dict), ADD_CONTEXT(dict), TOKEN(int), PAUSE(dict),
+    #         TOKEN(int), TOKEN(int), EVICT(dict)
+    assert isinstance(first_request_events[0], dict)  # ADD_ENGINE
+    assert isinstance(first_request_events[1], dict)  # ADD_CONTEXT
+    assert first_request_events[2] == 10  # GENERATED_TOKEN compact
+    assert isinstance(first_request_events[3], dict)  # PAUSE
+    assert first_request_events[4] == 11  # GENERATED_TOKEN compact
+    assert first_request_events[5] == 12  # GENERATED_TOKEN compact
+    assert isinstance(first_request_events[6], dict)  # EVICT
