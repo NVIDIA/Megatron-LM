@@ -1,11 +1,20 @@
 # Copyright (c) 2025, NVIDIA CORPORATION.  All rights reserved.
 """Pretrain and SFT Mamba."""
 
-# Capture the true program start time BEFORE any heavy imports
+# Capture the true program start time BEFORE any heavy imports.
 import time
 _PROGRAM_START_TIME = time.time()
 
 import json
+
+# Suppress warnings on all ranks but rank 0.
+import os
+import warnings
+rank = int(os.environ.get('RANK', 0))
+if rank != 0:
+    warnings.filterwarnings("ignore", category=UserWarning)
+    warnings.filterwarnings("ignore", category=FutureWarning)
+
 from functools import partial
 from typing import List, Optional, Tuple
 
@@ -82,11 +91,10 @@ def get_batch(data_iterator, vp_stage=None):
         return empty_batch.values()
 
     batch = get_batch_on_this_tp_rank(data_iterator)
-
-    # Support for Packed Sequence (Unused in this script)
-    cu_seqlens = batch.pop('cu_seqlens', None)
+    
+    cu_seqlens = batch['cu_seqlens']
+    # Unused at the moment
     cu_seqlens_padded = batch.pop('cu_seqlens_padded', None)
-    max_seqlen = batch.pop('max_seqlen', None)
     # Support for Hybrid Context Parallel (Unused in this script)
     local_cp_size = batch.pop('local_cp_size', None)
 

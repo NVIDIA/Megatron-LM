@@ -50,11 +50,8 @@ except ImportError:
     HAVE_TE = False
 
 try:
-    import nvidia_kitchen  # pylint: disable=unused-import
+    from megatron.core.extensions.kitchen import HAVE_KITCHEN, KitchenSpecProvider
 
-    from megatron.core.extensions.kitchen import KitchenSpecProvider
-
-    HAVE_KITCHEN = True
 except ImportError:
     HAVE_KITCHEN = False
 
@@ -618,6 +615,7 @@ def get_gpt_decoder_block_spec(
     layer_specs = get_gpt_decoder_layer_specs(
         config, use_transformer_engine, normalization, qk_l2_norm
     )
+
     # Slice the layer specs to only include the layers that are built in this pipeline stage.
     # Note: MCore layer_number starts at 1
     num_layers_to_build = get_num_layers_to_build(config, vp_stage=vp_stage, pp_rank=pp_rank)
@@ -637,10 +635,6 @@ def get_gpt_decoder_block_spec(
         offset = get_transformer_layer_offset(config, vp_stage=vp_stage, pp_rank=pp_rank)
         local_layer_specs = layer_specs[offset : offset + num_layers_to_build]
 
-    if use_transformer_engine:
-        layer_norm_impl = TENorm
-    else:
-        layer_norm_impl = LNImpl
     # Block spec.
     if use_transformer_engine:
         layer_norm_impl = TENorm

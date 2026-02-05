@@ -204,8 +204,28 @@ jobs:
       && needs.pre-flight.outputs.is_merge_group == 'false'
       && !cancelled()
     steps:
+      - name: Get PR info
+        id: get-pr-info
+        if: startsWith(github.ref, 'refs/heads/pull-request/')
+        uses: nv-gha-runners/get-pr-info@main
+
+      - name: Get merge commit sha
+        shell: bash -x -e -u -o pipefail {0}
+        id: sha
+        env:
+          IS_PR: ${{ startsWith(github.ref, 'refs/heads/pull-request/') }}
+        run: |
+          if [[ "$IS_PR" == "true" ]]; then
+            SHA=${{ fromJSON(steps.get-pr-info.outputs.pr-info || '{}').merge_commit_sha }}
+          else
+            SHA=${GITHUB_SHA}
+          fi
+          echo "main=${SHA}" | tee -a "$GITHUB_OUTPUT"
+
       - name: Checkout
         uses: actions/checkout@v4
+        with:
+          ref: ${{ steps.sha.outputs.main }}
 
       - name: Setup python
         uses: actions/setup-python@v5
@@ -217,11 +237,6 @@ jobs:
         run: |
           apt-get update
           apt-get install -y gh
-
-      - name: Get PR info
-        id: get-pr-info
-        if: startsWith(github.ref, 'refs/heads/pull-request/')
-        uses: nv-gha-runners/get-pr-info@main
 
       - name: Has lts label
         id: has-lts-label
@@ -347,6 +362,7 @@ jobs:
       - cicd-container-build
       - cicd-parse-unit-tests
     runs-on: ${{ needs.is-not-external-contributor.outputs.selected_runner }}
+    timeout-minutes: 60
     name: "${{ matrix.bucket }} - latest"
     if: |
       (
@@ -376,6 +392,7 @@ jobs:
 
   cicd-parse-integration-tests:
     runs-on: ubuntu-latest
+    timeout-minutes: 60
     needs:
       - pre-flight
       - cicd-wait-in-queue
@@ -387,8 +404,8 @@ jobs:
         success()
         || needs.pre-flight.outputs.is_ci_workload == 'true'
         || needs.pre-flight.outputs.force_run_all == 'true'
+        || needs.pre-flight.outputs.is_merge_group == 'true'
       )
-      && needs.pre-flight.outputs.is_merge_group == 'false'
       && !cancelled()
     outputs:
       integration-tests: ${{ steps.main.outputs.integration-tests }}
