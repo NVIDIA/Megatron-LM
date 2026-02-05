@@ -43,6 +43,7 @@ import math
 import os
 import sys
 from contextlib import nullcontext
+from pathlib import Path
 from typing import Any, Optional, Dict
 
 import torch.distributed
@@ -2342,6 +2343,8 @@ def post_training_step_callbacks(
         if args.use_pytorch_profiler:
             assert prof is not None
             prof.stop()
+            if prof.execution_trace_observer is not None:
+                prof.execution_trace_observer.unregister_callback()
         else:
             torch.cuda.check_error(torch.cuda.cudart().cudaProfilerStop())
             if nsys_nvtx_context is not None:
@@ -2693,11 +2696,15 @@ def train(
         and args.use_pytorch_profiler
     ):
         if args.pytorch_profiler_collect_chakra:
-            et = torch.profiler.ExecutionTraceObserver().register_callback(f"{args.tensorboard_dir}/chakra/rank-{torch.distributed.get_rank()}.et.json.gz")
+            et_dir = Path(f"{args.tensorboard_dir}/chakra")
+            et_dir.mkdir(parents=True, exist_ok=True)
+            et = torch.profiler.ExecutionTraceObserver().register_callback(f"{args.tensorboard_dir}/chakra/rank-{torch.distributed.get_rank()}.json.gz")
         else:
             et = None
         def trace_handler(p):
-            p.export_chrome_trace(f"{args.tensorboard_dir}/torch_profile/rank-{torch.distributed.get_rank()}.pt.json.gz")
+            profile_dir = Path(f"{args.tensorboard_dir}/torch_profile")
+            profile_dir.mkdir(parents=True, exist_ok=True)
+            p.export_chrome_trace(f"{args.tensorboard_dir}/torch_profile/rank-{torch.distributed.get_rank()}.json.gz")
         prof = torch.profiler.profile(
             schedule=torch.profiler.schedule(
                 wait=max(args.profile_step_start - 1, 0),

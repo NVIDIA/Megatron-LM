@@ -49,9 +49,8 @@ class ProfilingConfig:
   
     pytorch_profiler_collect_chakra: bool = False                
     """Collect chakra trace in pytorch profiler."""
-  
 
-    profile_ranks: list[int] = field(default_factory=lambda: [0])
+    profile_ranks: list[int] = field(default_factory=lambda: [])
     """Global ranks to profile."""
 
     record_memory_history: bool = False
