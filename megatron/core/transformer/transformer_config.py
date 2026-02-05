@@ -1280,6 +1280,7 @@ class TransformerConfig(ModelParallelConfig):
                 "qkv_linear",
                 "mamba_in_proj",
                 "mamba_out_proj",
+                "mamba_ssm",
             }
             invalid_modules = set(self.offload_modules) - allowed_modules
             assert not invalid_modules, (
