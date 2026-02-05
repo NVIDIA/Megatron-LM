@@ -1,6 +1,8 @@
 # Copyright (c) 2024, NVIDIA CORPORATION. All rights reserved.
 
+import os
 from datetime import timedelta
+from itertools import accumulate
 
 import pytest
 import torch
@@ -8,21 +10,19 @@ from transformer_engine.pytorch.fp8 import check_fp8_support
 
 from megatron.core import parallel_state
 from megatron.core.hyper_comm_grid import HyperCommGrid
+from megatron.core.inference.config import InferenceConfig, MambaInferenceStateConfig
 from megatron.core.inference.contexts import BaseInferenceContext, StaticInferenceContext
 from megatron.core.inference.contexts.dynamic_context import DynamicInferenceContext
 from megatron.core.inference.inference_request import DynamicInferenceRequest
 from megatron.core.inference.sampling_params import SamplingParams
 from megatron.core.models.mamba.mamba_layer_specs import mamba_stack_spec
 from megatron.core.models.mamba.mamba_model import MambaModel
+from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
 from megatron.core.transformer import TransformerConfig
+from megatron.core.transformer.enums import AttnBackend
 from megatron.core.transformer.module import Float16Module
-from megatron.core.utils import (
-    divide,
-    get_mamba_inference_state_config_from_model,
-    is_fa_min_version,
-    is_torch_min_version,
-)
+from megatron.core.utils import divide, is_fa_min_version, is_torch_min_version
 from tests.unit_tests.test_utilities import Utils
 
 
@@ -72,7 +72,6 @@ class TestMambaModel:
         assert self.model.decoder.input_tensor.shape[2] == config.hidden_size
 
     def test_forward(self):
-        config: TransformerConfig = self.model.config
         sequence_length = self.model.max_sequence_length
         micro_batch_size = 2
 
@@ -93,8 +92,70 @@ class TestMambaModel:
         assert logits.shape[1] == sequence_length
         assert logits.shape[2] == self.model.vocab_size
 
+    def test_forward_packed_sequence(self):
+        os.environ.pop('NVTE_FUSED_ATTN', None)
+        os.environ.pop('NVTE_FLASH_ATTN', None)
+        os.environ.pop('NVTE_UNFUSED_ATTN', None)
+        model_config = TransformerConfig(
+            num_layers=3,  # 1 Mamba layer, 1 attention layer, 1 MLP layer
+            hidden_size=256,  # The Mamba layer places several constraints on this
+            num_attention_heads=4,
+            use_cpu_initialization=True,
+            bf16=True,  # Needed for backend=flash
+            params_dtype=torch.bfloat16,  # Needed for backend=flash
+            attention_backend=AttnBackend.flash,  # Needed for packed sequence
+        )
+        vocab_size = 100
+        model = MambaModel(
+            config=model_config,
+            mamba_stack_spec=mamba_stack_spec,
+            vocab_size=vocab_size,
+            max_sequence_length=12,
+            hybrid_attention_ratio=0.3,
+            hybrid_mlp_ratio=0.3,
+        )
+
+        sequence_length = model.max_sequence_length
+        micro_batch_size = 1  # must be 1 for packed sequence
+
+        model.cuda()
+
+        data = [i % vocab_size for i in range(sequence_length)]
+        input_ids = torch.tensor(data, dtype=torch.int64).repeat((micro_batch_size, 1)).cuda()
+        lengths = [4, 3, 5]
+        assert sum(lengths) == sequence_length
+        positions = [i for n in lengths for i in range(n)]
+        position_ids = (
+            torch.tensor(positions, dtype=torch.int64).repeat((micro_batch_size, 1)).cuda()
+        )
+        attention_mask = None
+
+        cumsum = [0] + list(accumulate(lengths))
+        cu_seqlens = torch.tensor(cumsum, dtype=torch.int32).cuda()
+        max_seqlen = max(lengths)
+
+        packed_seq_params = PackedSeqParams(
+            qkv_format="thd",
+            cu_seqlens_q=cu_seqlens,
+            cu_seqlens_kv=cu_seqlens,
+            cu_seqlens_q_padded=None,
+            cu_seqlens_kv_padded=None,
+            max_seqlen_q=max_seqlen,
+            max_seqlen_kv=max_seqlen,
+        )
+
+        logits = model.forward(
+            input_ids=input_ids,
+            position_ids=position_ids,
+            attention_mask=attention_mask,
+            packed_seq_params=packed_seq_params,
+        )
+
+        assert logits.shape[0] == micro_batch_size
+        assert logits.shape[1] == sequence_length
+        assert logits.shape[2] == model.vocab_size
+
     def test_inference(self):
-        config: TransformerConfig = self.model.config
         micro_batch_size = 2
         inference_context: BaseInferenceContext = StaticInferenceContext(
             max_batch_size=micro_batch_size, max_sequence_length=self.model.max_sequence_length
@@ -279,20 +340,17 @@ class TestMambaWithDynamicInference:
         self.model.eval()
         config = self.model.config
 
-        mamba_inference_state_config = get_mamba_inference_state_config_from_model(
-            self.model.module
-        )
+        mamba_inference_state_config = MambaInferenceStateConfig.from_model(self.model.module)
 
         inference_context = DynamicInferenceContext(
-            params_dtype=config.params_dtype,
-            num_layers=config.num_layers,
-            kv_channels=config.hidden_size // config.num_attention_heads,
-            num_attention_heads=config.num_attention_heads,
-            max_sequence_length=self.model.module.max_sequence_length,
-            buffer_size_gb=1.0,
-            block_size_tokens=256,
-            materialize_only_last_token_logits=False,
-            mamba_inference_state_config=mamba_inference_state_config,
+            model_config=self.model.config,
+            inference_config=InferenceConfig(
+                max_sequence_length=self.model.module.max_sequence_length,
+                buffer_size_gb=1.0,
+                block_size_tokens=256,
+                materialize_only_last_token_logits=False,
+                mamba_inference_state_config=mamba_inference_state_config,
+            ),
         )
 
         # Add a request with 10 tokens. Since 10 is not a multiple of 64 (TOKEN_ROUNDER),

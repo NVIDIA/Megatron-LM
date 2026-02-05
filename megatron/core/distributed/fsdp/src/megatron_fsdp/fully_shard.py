@@ -77,6 +77,7 @@ def fully_shard_model(
     dp_outer_dim: Optional[str] = None,
     tp_dim: Optional[str] = None,
     hybrid_fsdp_group: Optional[torch.distributed.ProcessGroup] = None,
+    hybrid_fsdp_expt_group: Optional[torch.distributed.ProcessGroup] = None,
     expt_device_mesh: Optional[DeviceMesh] = None,
     fsdp_unit_modules: Optional[Sequence[Type[torch.nn.Module]] | Sequence[str]] = None,
     zero_dp_strategy: str | int = 3,
@@ -96,7 +97,9 @@ def fully_shard_model(
     keep_fp8_transpose_cache: bool = False,
     nccl_ub: bool = False,
     fsdp_double_buffer: bool = False,
+    fsdp_db_use_persist_buf_on_alloc_fail: bool = False,
     disable_symmetric_registration: bool = False,
+    enable_fine_grained_param_gather: bool = False,
 ) -> torch.nn.Module:
     """
     Fully-shard the model for Megatron-FSDP. This wraps the model in a MegatronFSDP
@@ -229,9 +232,20 @@ def fully_shard_model(
         fsdp_double_buffer (bool):
             Whether to use double buffer for FSDP. Defaults to False.
 
+        fsdp_db_use_persist_buf_on_alloc_fail (bool):
+            Whether to fall back to persistent buffer allocator when a bucket does not
+            fit FSDP double buffer size.
+
         disable_symmetric_registration (bool):
             Whether to disable symmetric (window) registration for NCCL UB registration.
             This option forces conventional (local) UB registration when nccl_ub is set.
+            Defaults to False.
+
+        enable_fine_grained_param_gather (bool):
+            Whether to enable "fine-grained" param all-gather, which can improve performance
+            when using MXFP8 parameters with activation recomputation. Specifically, it
+            unshards parameters per-Module instead of unsharding all sub-modules of an FSDP
+            unit module simultaneously. Defaults to False.
 
     Returns:
         model (MegatronFSDP): The wrapped Megatron-FSDP model configured for FSDP.
@@ -241,14 +255,17 @@ def fully_shard_model(
     if device_mesh is None:
         if dp_shard_dim is None:
             dp_shard_dim = "fsdp"
+        if tp_dim is None:
+            # Trivial TP dimension to seamlessly support TransformerEngine.
+            tp_dim = "tp"
         # Deactivate DP-Outer, which needs to be consistent with Expert DeviceMesh.
         dp_outer_dim = None
         hybrid_fsdp_group = None
         outer_dp_sharding_strategy = ShardingStrategy.NO_SHARD
         device_mesh = init_device_mesh(
             device_type="cuda",
-            mesh_shape=(torch.distributed.get_world_size(),),
-            mesh_dim_names=(dp_shard_dim,),
+            mesh_shape=(torch.distributed.get_world_size(), 1),
+            mesh_dim_names=(dp_shard_dim, tp_dim),
         )
 
     # Parse zero_dp_strategy and outer_dp_sharding_strategy.
@@ -293,7 +310,7 @@ def fully_shard_model(
     if _outer_fsdp_sharding and zero_dp_strategy != "optim_grads_params":
         # If sharding on outer DP using HSDP, then we must use HSDP buffers and
         # we must be fully-sharding on inner DP. HSDP is an extension of FSDP.
-        # FIXME(@shjwudp, @cspades): This is an unexpected lack of support.
+        # TODO(@shjwudp, @cspades): Requires various modifications to support.
         raise ValueError(
             f"Sharding with Hybrid (Fully) Sharded Data Parallel (HSDP) requires "
             "zero_dp_strategy to use FSDP ('optim_grads_params', 3), because "
@@ -324,6 +341,7 @@ def fully_shard_model(
         keep_fp8_transpose_cache=keep_fp8_transpose_cache,  # pylint: disable=C0301
         nccl_ub=nccl_ub,
         fsdp_double_buffer=fsdp_double_buffer or nccl_ub,
+        fsdp_db_use_persist_buf_on_alloc_fail=fsdp_db_use_persist_buf_on_alloc_fail,
         disable_symmetric_registration=disable_symmetric_registration,
         check_for_nan_in_grad=check_for_nan_in_grad,
     )
@@ -341,6 +359,8 @@ def fully_shard_model(
         tp_dim=tp_dim,
         # Only required for HSDP.
         hybrid_fsdp_group=hybrid_fsdp_group,
+        # Only required for HSDP + EP.
+        hybrid_fsdp_expt_group=hybrid_fsdp_expt_group,
         # Access to flattened DP rank assignments for HSDP.
         hsdp_outer_dp_shard=_outer_fsdp_sharding,
         # Only required for Megatron-FSDP + EP.
@@ -358,6 +378,7 @@ def fully_shard_model(
         calculate_per_token_loss=calculate_per_token_loss,
         init_model_with_meta_device=init_model_with_meta_device,
         sync_model_each_microbatch=sync_model_each_microbatch,
+        enable_fine_grained_param_gather_hook=enable_fine_grained_param_gather,
     )
 
     # Register a state dict post-hook to add Torch DCP metadata for writing checkpoints.
@@ -509,6 +530,7 @@ def fully_shard(
     dp_outer_dim: Optional[str] = None,
     tp_dim: Optional[str] = None,
     hybrid_fsdp_group: Optional[torch.distributed.ProcessGroup] = None,
+    hybrid_fsdp_expt_group: Optional[torch.distributed.ProcessGroup] = None,
     expt_device_mesh: Optional[DeviceMesh] = None,
     fsdp_unit_modules: Optional[Sequence[Type[torch.nn.Module]] | Sequence[str]] = None,
     zero_dp_strategy: str | int = 3,
@@ -528,7 +550,9 @@ def fully_shard(
     keep_fp8_transpose_cache: bool = False,
     nccl_ub: bool = False,
     fsdp_double_buffer: bool = False,
+    fsdp_db_use_persist_buf_on_alloc_fail: bool = False,
     disable_symmetric_registration: bool = False,
+    enable_fine_grained_param_gather: bool = False,
 ) -> tuple[MegatronFSDP, torch.optim.Optimizer]:
     """
     Fully shard the model and the optimizer for Megatron-FSDP.
@@ -555,6 +579,7 @@ def fully_shard(
         dp_outer_dim=dp_outer_dim,
         tp_dim=tp_dim,
         hybrid_fsdp_group=hybrid_fsdp_group,
+        hybrid_fsdp_expt_group=hybrid_fsdp_expt_group,
         expt_device_mesh=expt_device_mesh,
         fsdp_unit_modules=fsdp_unit_modules,
         zero_dp_strategy=zero_dp_strategy,
@@ -574,7 +599,9 @@ def fully_shard(
         keep_fp8_transpose_cache=keep_fp8_transpose_cache,
         nccl_ub=nccl_ub,
         fsdp_double_buffer=fsdp_double_buffer,
+        fsdp_db_use_persist_buf_on_alloc_fail=fsdp_db_use_persist_buf_on_alloc_fail,
         disable_symmetric_registration=disable_symmetric_registration,
+        enable_fine_grained_param_gather=enable_fine_grained_param_gather,
     )
 
     # Extend optimizer methods to support Megatron-FSDP operations.

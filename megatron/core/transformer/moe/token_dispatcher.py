@@ -297,7 +297,7 @@ class MoEAllGatherTokenDispatcher(MoETokenDispatcher):
         (permuted_local_hidden_states, _, self.reversed_local_input_permutation_mapping) = permute(
             hidden_states,
             self.local_map,
-            num_out_tokens=tokens_per_expert.sum(),
+            num_out_tokens=tokens_per_expert.sum().item(),
             fused=self.config.moe_permute_fusion,
         )
 
@@ -436,9 +436,9 @@ class MoEAlltoAllTokenDispatcher(MoETokenDispatcher):
             "no_sync": 4,
         }
         self.cuda_dtoh_point = "before_permutation_1"
-        if (
-            config.cuda_graph_impl == "transformer_engine"
-            and CudaGraphScope.moe_preprocess in config.cuda_graph_scope
+        if config.cuda_graph_impl != "none" and (
+            CudaGraphScope.moe_preprocess in config.cuda_graph_scope
+            or not self.config.cuda_graph_scope
         ):
             self.cuda_dtoh_point = "before_ep_alltoall"
         if MoEAlltoAllTokenDispatcher.cuda_dtoh_stream is None:
