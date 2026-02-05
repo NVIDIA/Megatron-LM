@@ -59,6 +59,11 @@ products:
       - environment: [dev]
         scope: [mr]
         platforms: [dgx_h100]
+  - test_case: [gpt_grpo_tp4_pp1_dp2_8b_cudagraphs_throughput]
+    products:
+      - environment: [dev]
+        scope: [mr]
+        platforms: [dgx_h100]
   - test_case: [gpt_grpo_tp4_pp1_dp2_8b_throughput_github]
     products:
       - environment: [dev]
@@ -77,5 +82,5 @@ products:
   - test_case: [gpt_grpo_tp2tp1_pp4pp2_dp8_583m_throughputtest]
     products:
       - environment: [dev]
-        scope: [mr-broken]
+        scope: [mr]
         platforms: [dgx_h100]
