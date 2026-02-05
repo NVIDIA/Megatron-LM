@@ -63,7 +63,7 @@ class SFTTokenizer(MegatronLegacyTokenizer):
             self._prompt_config = PromptConfig(
                 assistant_prefix_len=0,
                 pad_token_id=tokenizer.convert_tokens_to_ids("<unk>"),
-                custom_chat_template=dentity_template,
+                custom_chat_template=identity_template,
                 has_bos=False,
                 has_system_role=True,
             )
