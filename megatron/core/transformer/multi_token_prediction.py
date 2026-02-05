@@ -26,7 +26,6 @@ from megatron.core.transformer.spec_utils import ModuleSpec, build_module
 from megatron.core.transformer.torch_norm import LayerNormBuilder
 from megatron.core.transformer.transformer_block import TransformerBlockSubmodules
 from megatron.core.transformer.transformer_config import TransformerConfig
-from megatron.core.transformer.transformer_layer import get_transformer_layer_offset
 from megatron.core.typed_torch import apply_module
 from megatron.core.utils import (
     get_pg_rank,
@@ -428,7 +427,6 @@ class MultiTokenPredictionLayerSubmodules:
 
     eh_proj: Union[ModuleSpec, type] = None
     mtp_model_layer: Union[ModuleSpec, type] = None
-
 
 
 def get_mtp_layer_spec(
