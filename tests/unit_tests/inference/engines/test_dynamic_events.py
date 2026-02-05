@@ -1019,3 +1019,117 @@ class TestEventEdgeCases:
         assert len(basic_request.events) == num_tokens
         assert len(basic_request.generated_tokens) == num_tokens
         assert basic_request.generated_tokens == list(range(num_tokens))
+
+
+# ============================================================================
+# 13. TestCompactGeneratedTokenSerialization [CRITICAL]
+# ============================================================================
+
+
+class TestCompactGeneratedTokenSerialization:
+    """Tests for compact GENERATED_TOKEN serialization (track_generated_token_events=False)."""
+
+    @pytest.mark.skipif(
+        TEST_PRIORITY < TestPriority.CRITICAL, reason="Test priority not met"
+    )
+    def test_generated_token_serializes_to_int(self):
+        """GENERATED_TOKEN events serialize to just the token ID when compact."""
+        event = DynamicInferenceEvent(
+            type=DynamicInferenceEventType.GENERATED_TOKEN, payload=42
+        )
+        serialized = event.serialize(track_generated_token_events=False)
+        assert serialized == 42
+
+    @pytest.mark.skipif(
+        TEST_PRIORITY < TestPriority.CRITICAL, reason="Test priority not met"
+    )
+    def test_other_events_serialize_normally(self):
+        """Non-GENERATED_TOKEN events serialize normally regardless of flag."""
+        event = DynamicInferenceEvent(type=DynamicInferenceEventType.ADD_ENGINE)
+        serialized = event.serialize(track_generated_token_events=False)
+        assert isinstance(serialized, dict)
+        assert serialized["type"] == "ADD_ENGINE"
+
+    @pytest.mark.skipif(
+        TEST_PRIORITY < TestPriority.CRITICAL, reason="Test priority not met"
+    )
+    def test_deserialize_int_to_generated_token(self):
+        """Integer deserializes to GENERATED_TOKEN event with timestamp=-1."""
+        event = DynamicInferenceEvent.deserialize(42)
+        assert event.type == DynamicInferenceEventType.GENERATED_TOKEN
+        assert event.payload == 42
+        assert event.timestamp == -1
+
+    @pytest.mark.skipif(
+        TEST_PRIORITY < TestPriority.CRITICAL, reason="Test priority not met"
+    )
+    def test_compact_roundtrip(self):
+        """Compact serialize -> deserialize preserves token ID."""
+        original = DynamicInferenceEvent(
+            type=DynamicInferenceEventType.GENERATED_TOKEN, payload=12345
+        )
+        serialized = original.serialize(track_generated_token_events=False)
+        restored = DynamicInferenceEvent.deserialize(serialized)
+        assert restored.type == original.type
+        assert restored.payload == original.payload
+        # Timestamp is lost in compact mode
+        assert restored.timestamp == -1
+
+    @pytest.mark.skipif(
+        TEST_PRIORITY < TestPriority.IMPORTANT, reason="Test priority not met"
+    )
+    def test_request_compact_serialization(self, basic_request):
+        """Request serializes events in compact mode when flag is False."""
+        basic_request.add_event_add_engine()
+        basic_request.add_event_generated_token(100)
+        basic_request.add_event_generated_token(200)
+        basic_request.add_event_finish()
+
+        serialized = basic_request.serialize(track_generated_token_events=False)
+        events = serialized["events"]
+
+        # ADD_ENGINE and FINISH are dicts, GENERATED_TOKEN are ints
+        assert isinstance(events[0], dict)  # ADD_ENGINE
+        assert events[1] == 100  # GENERATED_TOKEN compact
+        assert events[2] == 200  # GENERATED_TOKEN compact
+        assert isinstance(events[3], dict)  # FINISH
+
+    @pytest.mark.skipif(
+        TEST_PRIORITY < TestPriority.IMPORTANT, reason="Test priority not met"
+    )
+    def test_request_compact_roundtrip(self, basic_request):
+        """Request roundtrip works in compact mode."""
+        basic_request.add_event_add_engine()
+        basic_request.add_event_generated_token(100)
+        basic_request.add_event_finish()
+
+        serialized = basic_request.serialize(track_generated_token_events=False)
+        restored = DynamicInferenceRequest.deserialize(serialized)
+
+        assert restored.generated_tokens == [100]
+        assert len(restored.events) == 3
+
+    @pytest.mark.skipif(
+        TEST_PRIORITY < TestPriority.MEDIUM, reason="Test priority not met"
+    )
+    def test_record_compact_serialization(self, basic_request):
+        """Record serializes nested requests in compact mode."""
+        basic_request.add_event_generated_token(42)
+        record = DynamicInferenceRequestRecord.from_request(basic_request)
+
+        serialized = record.serialize(track_generated_token_events=False)
+        assert serialized["requests"][0]["events"][0] == 42
+
+    @pytest.mark.skipif(
+        TEST_PRIORITY < TestPriority.MEDIUM, reason="Test priority not met"
+    )
+    def test_generated_tokens_property_with_compact_events(self, basic_request):
+        """generated_tokens property works after deserializing compact events."""
+        basic_request.add_event_generated_token(10)
+        basic_request.add_event_generated_token(20)
+        basic_request.add_event_generated_token(30)
+
+        serialized = basic_request.serialize(track_generated_token_events=False)
+        restored = DynamicInferenceRequest.deserialize(serialized)
+
+        assert restored.generated_tokens == [10, 20, 30]

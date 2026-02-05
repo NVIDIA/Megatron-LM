@@ -197,13 +197,19 @@ class DynamicInferenceEvent:
             payload_str = f", {type(self.payload).__name__}"
         return f"[{self.timestamp:.3f}] {self.type.name}{payload_str}"
 
-    def serialize(self) -> dict:
+    def serialize(self, track_generated_token_events: bool = True) -> dict | int:
         """Converts the instance into a serializable dictionary.
 
+        Args:
+            track_generated_token_events: If False and this is a GENERATED_TOKEN event,
+                return just the token ID integer instead of the full event dict.
+
         Returns:
-            (dict) A dictionary representation of the instance suitable for
-                serialization.
+            dict or int: Full event dict, or just the token ID if compact mode.
         """
+        # If compact mode for GENERATED_TOKEN, return just the token ID
+        if not track_generated_token_events and self.type == DynamicInferenceEventType.GENERATED_TOKEN:
+            return self.payload
 
         # Dataclass to dict.
         obj = asdict(self)
@@ -222,15 +228,23 @@ class DynamicInferenceEvent:
         return obj
 
     @classmethod
-    def deserialize(cls, obj: dict) -> "DynamicInferenceEvent":
+    def deserialize(cls, obj: dict | int) -> "DynamicInferenceEvent":
         """Deserialize event.
 
         Args:
-            obj (dict): Serialized event data.
+            obj: Serialized event data (dict for full event, int for compact GENERATED_TOKEN).
 
         Returns:
             (DynamicInferenceEvent) Deserialized event.
         """
+        # Handle compact GENERATED_TOKEN format
+        if isinstance(obj, int):
+            return cls(
+                type=DynamicInferenceEventType.GENERATED_TOKEN,
+                timestamp=-1,  # Sentinel value indicating compact format
+                payload=obj,
+            )
+
         event_type = DynamicInferenceEventType[obj["type"]]
 
         # Initialize event.
@@ -320,15 +334,19 @@ class DynamicInferenceRequest(InferenceRequest):
             )
         )
 
-    def serialize(self):
+    def serialize(self, track_generated_token_events: bool = True):
         """Converts the instance into a serializable dictionary.
+
+        Args:
+            track_generated_token_events: If False, GENERATED_TOKEN events are serialized
+                as just the token ID integer instead of the full event dict.
 
         Returns:
             (dict) A dictionary representation of the instance suitable for
                 serialization.
         """
         obj = super().serialize()
-        obj["events"] = [e.serialize() for e in self.events]
+        obj["events"] = [e.serialize(track_generated_token_events) for e in self.events]
         # Include generated_tokens computed from events for compatibility
         obj["generated_tokens"] = self.generated_tokens
         return obj
@@ -574,15 +592,19 @@ class DynamicInferenceRequestRecord:
 
         return request
 
-    def serialize(self) -> dict:
+    def serialize(self, track_generated_token_events: bool = True) -> dict:
         """Converts the instance into a serializable dictionary.
+
+        Args:
+            track_generated_token_events: If False, GENERATED_TOKEN events are serialized
+                as just the token ID integer instead of the full event dict.
 
         Returns:
             (dict) A dictionary representation of the instance suitable for
                 serialization.
         """
         obj = asdict(self)
-        obj["requests"] = [r.serialize() for r in self.requests]
+        obj["requests"] = [r.serialize(track_generated_token_events) for r in self.requests]
         return obj
 
     @classmethod
