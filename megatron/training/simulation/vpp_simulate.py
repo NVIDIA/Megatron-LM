@@ -146,7 +146,7 @@ class VppSimulator(object):
         self._create_task_dependencies()
 
         # create task execution time recorder
-        self.task_recoreder = {}
+        self.task_recorder = {}
 
         # Model caching for reuse across tasks
         self.current_model = None
@@ -454,7 +454,7 @@ class VppSimulator(object):
             task_key = (now_enhanced_layout, now_task.microbatch_id, now_task.task_type)
         else:
             raise ValueError(f'Unknown execute_mode: {args.execute_mode}')        
-        if task_key in self.task_recoreder:
+        if task_key in self.task_recorder:
             return False
         else:
             return True
@@ -468,7 +468,7 @@ class VppSimulator(object):
             task_key = (now_enhanced_layout, task.microbatch_id, task.task_type)
         else:
             raise ValueError(f'Unknown execute_mode: {args.execute_mode}')
-        self.task_recoreder[task_key] = task.duration
+        self.task_recorder[task_key] = task.duration
 
     def _assign_task_duration(self, task):
         """
@@ -492,8 +492,8 @@ class VppSimulator(object):
         else:
             raise ValueError(f'Unknown execute_mode: {args.execute_mode}')
 
-        if task_key in self.task_recoreder:
-            task.duration = self.task_recoreder[task_key]
+        if task_key in self.task_recorder:
+            task.duration = self.task_recorder[task_key]
             task.finished = True
             print_rank_0(f'\tAssigned duration from recorded task: {task.duration:.2f}ms')
         else:
