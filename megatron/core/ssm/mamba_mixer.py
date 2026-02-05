@@ -534,6 +534,7 @@ class MambaMixer(MegatronModule):
         """Helper to run dynamic inference prefill (chunked prefill request separately)."""
         metadata = context.mamba_metadata
         prefill_req_count = context.padded_batch_dimensions.prefill_req_count
+        prefill_token_count = zxBCdt.shape[0]
         enable_chunked_prefill = context.is_chunked_prefill_enabled()
 
         y_chunked = None
@@ -576,7 +577,13 @@ class MambaMixer(MegatronModule):
             )
             return y_combined
         elif y_chunked is not None:
-            return y_chunked
+            y_prefill = torch.empty(
+                (num_prefill_tokens, 1, y_chunked.shape[-1]),
+                dtype=y_chunked_dtype,
+                device=y_chunked.device,
+            )
+            y_prefill[: metadata.device_chunked_prefill[0]] = y_chunked
+            return y_prefill
         else:
             return y_regular
 
