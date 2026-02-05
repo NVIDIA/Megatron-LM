@@ -1326,7 +1326,10 @@ class TransformerConfig(ModelParallelConfig):
                     "because the input of attn_proj is the output of core_attn, "
                     "which is needed in core_attn.backward()."
                 )
-            if self.external_cuda_graph or self.cuda_graph_impl == "transformer_engine":
+            if self.external_cuda_graph or self.enable_cuda_graph:
+                assert (
+                    self.cuda_graph_impl == "transformer_engine"
+                ), "cuda_graph_impl must be transformer_engine when enabling offloading."
                 assert (
                     self.cuda_graph_scope is not None
                 ), "cuda_graph_scope must be set when enabling offloading."

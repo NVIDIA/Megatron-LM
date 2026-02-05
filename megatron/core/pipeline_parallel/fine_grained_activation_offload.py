@@ -760,7 +760,6 @@ class PipelineOffloadManager:
         else:
             raise RuntimeError("TE CPU offload is not available")
         self.inside_context = False
-        # torch._C._autograd._pop_saved_tensors_default_hooks()
         self._saved_tensors_hooks.__exit__()
 
     def on_save_for_backward(self, tensor: torch.Tensor) -> Any:
@@ -791,14 +790,6 @@ class ChunkOffloadHandler:
         """Offload."""
         debug_rank("--------offload")
 
-        from transformer_engine.pytorch.tensor.mxfp8_tensor import MXFP8Tensor
-
-        is_mxfp8_tensor = isinstance(src_tensor, MXFP8Tensor)
-        if is_mxfp8_tensor:
-            mxfp8_tensor = src_tensor
-            src_tensor = src_tensor._columnwise_data
-        else:
-            mxfp8_tensor = None
         if not src_tensor.is_contiguous():
             src_tensor = src_tensor.contiguous()
 

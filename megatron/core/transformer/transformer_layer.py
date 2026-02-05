@@ -1285,7 +1285,10 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
         if self.offload_module_in_cuda_graph:
             assert is_torch_min_version(
                 "2.9.0a0"
-            ), "Fine-grained activation offloading needs torch>=2.9.0 to support cuda graph."
+            ), "Offloading modules captured in cuda graph requires torch>=2.9.0."
+            assert is_te_min_version(
+                "2.13.0"
+            ), "Offloading modules captured in cuda graph requires TE>=2.13.0."
             assert (
                 self.config.cuda_graph_warmup_steps > 0
             ), "Fine-grained activation offloading needs cuda_graph_warmup_steps > 0."
