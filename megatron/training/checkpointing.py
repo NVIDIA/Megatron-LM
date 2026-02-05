@@ -201,6 +201,94 @@ def get_checkpoint_name(checkpoints_path, iteration, release=False,
     return os.path.join(common_path, basename)
 
 
+def find_latest_stable_checkpoint(checkpoints_path, current_iteration, save_retain_interval):
+    """
+    Find the most recent checkpoint that exists and is not the current iteration.
+    
+    This is used for the split metadata optimization to ensure we use a stable
+    existing checkpoint as the source for metadata copying.
+    
+    Args:
+        checkpoints_path: Base checkpoint directory
+        current_iteration: Current training iteration being saved
+        save_retain_interval: Number of iterations between retained checkpoints (other
+        checkpoints _except the last checkpoint_ are automatically deleted).
+    Returns:
+        Path to the most recent stable checkpoint, or None if not found
+    """
+    try:
+        logger.debug(f"find_latest_stable_checkpoint: checkpoints_path={checkpoints_path}, current_iteration={current_iteration}, save_retain_interval={save_retain_interval}")
+        
+        # Use MultiStorageClient if available, otherwise use pathlib
+        if MultiStorageClientFeature.is_enabled():
+            msc = MultiStorageClientFeature.import_package()
+            base_path = msc.Path(checkpoints_path)
+        else:
+            base_path = Path(checkpoints_path) if not isinstance(checkpoints_path, Path) else checkpoints_path
+            # Resolve the path to handle .. and symlinks
+            base_path = base_path.resolve()
+        
+        logger.debug(f"find_latest_stable_checkpoint: resolved base_path={base_path}, exists={base_path.exists()}")
+        
+        if not base_path.exists():
+            logger.debug(f"find_latest_stable_checkpoint: base_path does not exist")
+            return None
+            
+        # Get all iter_* directories that are complete (have metadata.json)
+        # For async checkpoints, metadata.json is only written after the checkpoint is fully saved
+        all_iter_dirs = [d for d in base_path.iterdir() if d.is_dir() and d.name.startswith('iter_')]
+        iter_dirs = []
+        for d in all_iter_dirs:
+            # Check for metadata.json which is written after checkpoint completion
+            metadata_json = d / 'metadata.json'
+            if metadata_json.exists():
+                iter_dirs.append(d)
+            else:
+                logger.debug(f"find_latest_stable_checkpoint: skipping {d.name} (no metadata.json file, checkpoint incomplete or in progress)")
+        
+        logger.debug(f"find_latest_stable_checkpoint: found {len(iter_dirs)} complete iter_* directories (out of {len(all_iter_dirs)} total): {[d.name for d in iter_dirs]}")
+        
+        if not iter_dirs:
+            logger.debug(f"find_latest_stable_checkpoint: no iter_* directories found")
+            return None
+            
+        # Find the most recent checkpoint iteration
+        # Prioritize retained checkpoints (divisible by save_retain_interval) over non-retained ones
+        latest_retained_iter = None
+        latest_non_retained_iter = None
+        
+        for d in iter_dirs:
+            parts = d.name.split('_')
+            if len(parts) > 1 and parts[1].isdigit():
+                iter_num = int(parts[1])
+                if iter_num < current_iteration:
+                    # Check if this checkpoint would be retained
+                    if save_retain_interval and iter_num % save_retain_interval == 0:
+                        if latest_retained_iter is None or iter_num > latest_retained_iter:
+                            latest_retained_iter = iter_num
+                    else:
+                        if latest_non_retained_iter is None or iter_num > latest_non_retained_iter:
+                            latest_non_retained_iter = iter_num
+        
+        logger.debug(f"find_latest_stable_checkpoint: latest_retained_iter={latest_retained_iter}, latest_non_retained_iter={latest_non_retained_iter}")
+        
+        # Prefer retained checkpoints as they won't be deleted
+        # Fall back to non-retained if no retained checkpoint exists
+        latest_iter = latest_retained_iter if latest_retained_iter is not None else latest_non_retained_iter
+        
+        if latest_iter is None:
+            logger.debug(f"find_latest_stable_checkpoint: no valid checkpoint found before iteration {current_iteration}")
+            return None
+        
+        result = get_checkpoint_name(checkpoints_path, iteration=latest_iter, return_base_dir=True)
+        logger.debug(f"find_latest_stable_checkpoint: returning checkpoint path={result}")
+        return result
+        
+    except Exception as e:
+        logger.error(f"Error finding latest stable checkpoint: {e}", exc_info=True)
+        return None
+
+
 def get_load_checkpoint_path_by_args(args, load_arg="load"):
     """Get the checkpoint path based on the arguments."""
     load_dir = getattr(args, load_arg)
@@ -623,13 +711,26 @@ def save_checkpoint(iteration, model, optimizer, opt_param_scheduler, num_floati
                             save_strategy.cached_global_metadata = cached_global_metadata
                         else:
                             logger.debug("Failed to plug in the read metadata from the load strategy...")
+                    
 
                 if args.ckpt_fully_parallel_save:
                     save_strategy = FullyParallelSaveStrategyWrapper(save_strategy, mpu.get_data_parallel_group(with_context_parallel=True),
                                                                      args.ckpt_assume_constant_structure)
+            if args.ckpt_assume_constant_structure:
+                stable_source = find_latest_stable_checkpoint(args.save, iteration, args.save_retain_interval)
+                if args.ckpt_fully_parallel_save:
+                    save_strategy.base_strategy.source_checkpoint_dir = stable_source
+                else:
+                    save_strategy.source_checkpoint_dir = stable_source
+                if stable_source:
+                    logger.info(f"Using latest checkpoint {stable_source} as source for split metadata")
+                else:
+                    logger.warning(f"No stable checkpoint found for iteration {iteration}, will save complete metadata")
+            
             # Store save strategy for future checkpoint saves
             if checkpointing_context is not None:
                 checkpointing_context['save_strategy'] = save_strategy
+
             end_ckpt = time()
             logger.debug(f"rank: {rank}, takes {end_ckpt - start_ckpt} to prepare state dict for ckpt ")
             async_save_request = dist_checkpointing.save(state_dict, checkpoint_name, save_strategy,
