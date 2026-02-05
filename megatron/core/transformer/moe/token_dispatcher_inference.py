@@ -247,68 +247,10 @@ class InferenceAllGatherTokenDispatcher(MoEAllGatherTokenDispatcher):
 
         
     def dispatch_postprocess(self, hidden_states, probs):
-        """After gathering in token_dispatch, this method identifies tokens for local experts and
-        permutes them for expert processing.
-
-        Algorithm:
-        1. Filter topk_indices to keep only those for local experts
-        2. Shift valid indices to local coordinate system (0-indexed)
-        3. Mark invalid indices with sentinel value
-        4. Argsort to get token permutation that groups by expert
-        5. Permute tokens and probs using this map
-        6. Bincount to get tokens per expert
         """
-        self.hidden_shape_before_permute = hidden_states.shape
-        
-        # self.routing_map is actually topk_indices: [num_tokens, topk]
-        topk_indices = self.routing_map
-        num_tokens, topk = topk_indices.shape
-        
-        # Shift global expert indices to local coordinate system using Triton kernel.
-        # For each index:
-        #   - If in range [local_expert_indices[0], local_expert_indices[-1]]:
-        #     shift to 0-based (e.g., expert 4 -> 0 if local_expert_indices[0] == 4)
-        #   - Otherwise: mark with sentinel value (num_local_experts)
-        # This prepares indices for argsort which will group tokens by local expert.
-        # Result: [num_tokens, topk] with local indices or sentinels
-        adjusted_topk_indices = shift_topk_indices(
-            topk_indices,
-            local_start=self.local_expert_indices[0],
-            local_end=self.local_expert_indices[-1],
-            num_local_experts=self.num_local_experts,
-        )
-        
-        # Flatten and argsort to get permutation that groups tokens by expert.
-        # After argsort, all tokens for expert 0 are at the beginning, then expert 1, etc.
-        # Sentinel values (num_local_experts) sort to the end.
-        # flat_indices: [num_tokens * topk]
-        # permutation: [num_tokens * topk] indices for reordering
-        flat_indices = adjusted_topk_indices.flatten()
-        self._cached_permutation = torch.argsort(flat_indices, stable=True)
-        
-        # Allocate workspace for permuted outputs
-        # Max possible tokens = num_tokens * min(topk, num_local_experts)
-        max_tokens = num_tokens * min(topk, self.num_local_experts)
-        
-        # Permute tokens and probs, count tokens per expert using Triton kernel
-        # Each thread block handles one output position, skipping sentinels
-        permuted_hidden, permuted_probs, tokens_per_expert = permute_tokens_and_probs(
-            hidden_states,
-            probs,
-            flat_indices,
-            self._cached_permutation,
-            num_local_experts=self.num_local_experts,
-            max_tokens=max_tokens,
-        )
-        
-        # Cache data needed for unpermute in combine_preprocess
-        self._cached_flat_indices = flat_indices
-        self._cached_num_tokens = num_tokens
-        self._cached_topk = topk
-        
-        self.routing_map = None
-        self.local_probs = permuted_probs
-        return permuted_hidden, tokens_per_expert, permuted_probs
+        No op for flashinfer
+        """
+        raise NotImplementedError
         
         
     def combine_preprocess(self, permuted_expert_outputs):
@@ -318,17 +260,7 @@ class InferenceAllGatherTokenDispatcher(MoEAllGatherTokenDispatcher):
         Uses cached permutation and expert_assignments from dispatch_postprocess.
         Note: Probability weighting is handled by experts via moe_apply_probs_on_input.
         """
-        # Unpermute expert outputs using cached data
-        output = unpermute_and_combine(
-            permuted_expert_outputs,
-            self._cached_flat_indices,
-            self._cached_permutation,
-            num_tokens=self._cached_num_tokens,
-            topk=self._cached_topk,
-            num_local_experts=self.num_local_experts,
-        )
-        
-        return output
+        raise NotImplementedError 
 
     def token_combine(self, hidden_states):
         """

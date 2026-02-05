@@ -44,13 +44,17 @@ TODO: Add unit test to verify that InferenceMoELayer.forward() and MoELayer.forw
 from typing import Optional
 
 import torch
+import torch.nn.functional as F
 
 from megatron.core import utils
+from megatron.core.activations import squared_relu
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.transformer.moe.moe_layer import MoELayer, MoESubmodules
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.transformer.moe.moe_utils import get_default_pg_collection
 from megatron.core.transformer.moe.token_dispatcher_inference import InferenceAllGatherTokenDispatcher
+import flashinfer.fused_moe as fused_moe
+from flashinfer.fused_moe.core import ActivationType
 
 import logging
 
@@ -145,5 +149,57 @@ class InferenceMoELayer(MoELayer):
         #logging.info("deactivated inference token dispatcher")
 
         return forward_pass_output
+
+    def routed_experts_compute(self, hidden_states: torch.Tensor, probs: torch.Tensor):
+        """Computes the output of the routed experts on the dispatched tokens.
+
+        This method first post-processes the dispatched input to get permuted tokens
+        for each expert. It then passes the tokens through the local experts.
+        The output from the experts is preprocessed for the combine step.
+        """
+        if not self.is_cuda_graphed_iteration:
+            # todo: can we go down the flashinfer path even if not cuda graphed? 
+            return super().routed_experts_compute(hidden_states, probs)
+
+        # Currently only squared_relu (non-gated) is supported with FlashInfer
+        assert not self.config.gated_linear_unit, (
+            "FlashInfer MoE kernel currently only supports non-gated activations. "
+            f"Got gated_linear_unit={self.config.gated_linear_unit}"
+        )
+        assert self.config.activation_func == squared_relu, (
+            "FlashInfer MoE kernel currently only supports squared_relu activation. "
+            f"Got activation_func={self.config.activation_func}"
+        )
+
+        # Get dtype from input
+        output_dtype = hidden_states.dtype
+        
+        # Get expert weights from self.experts (GroupedMLP)
+        w1 = self.experts._fc1_weight
+        w2 = self.experts._fc2_weight
+
+        # Get routing information (stored from route() step)
+        selected_experts = self.token_dispatcher.routing_map
+        routing_weights = probs
+        
+        # Get EP attributes
+        ep_size = utils.get_pg_size(self.ep_group)
+        ep_rank = utils.get_pg_rank(self.ep_group)
+    
+        # Call FlashInfer fused MoE kernel with Relu2 (squared ReLU)
+        output = fused_moe.cutlass_fused_moe(
+            hidden_states,
+            selected_experts.to(torch.int),
+            routing_weights.float(),
+            w1,
+            w2,
+            output_dtype,
+            quant_scales=None,
+            activation_type=ActivationType.Relu2,
+            ep_size=ep_size,
+            ep_rank=ep_rank,
+        )[0]
+        
+        return output, None
 
       
