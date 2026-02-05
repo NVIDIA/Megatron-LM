@@ -13,7 +13,7 @@ class SimulationArgsOverride:
     during simulation initialization.
 
     In simulation mode, we use EP GPUs to simulate a model that normally requires
-    EP×PP GPUs. To make the network initialization succeed with fewer GPUs, we
+    EPxPP GPUs. To make the network initialization succeed with fewer GPUs, we
     temporarily set PP=1 and clear the pipeline layout. After initialization, we
     restore the user-defined PP configuration for simulation logic to use.
 

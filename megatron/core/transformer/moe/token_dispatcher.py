@@ -437,13 +437,12 @@ class MoEAlltoAllTokenDispatcher(MoETokenDispatcher):
             "before_finish": 3,
             "no_sync": 4,
         }
-        if (
-            config.cuda_graph_impl == "transformer_engine"
-            and CudaGraphScope.moe_preprocess in config.cuda_graph_scope
+        self.cuda_dtoh_point = "before_permutation_1"
+        if config.cuda_graph_impl != "none" and (
+            CudaGraphScope.moe_preprocess in config.cuda_graph_scope
+            or not self.config.cuda_graph_scope
         ):
             self.cuda_dtoh_point = "before_ep_alltoall"
-        else:
-            self.cuda_dtoh_point = "before_permutation_1"
         if MoEAlltoAllTokenDispatcher.cuda_dtoh_stream is None:
             MoEAlltoAllTokenDispatcher.cuda_dtoh_stream = torch.cuda.Stream()
 
@@ -863,7 +862,7 @@ class MoEAlltoAllTokenDispatcher(MoETokenDispatcher):
             self.cuda_sync_point = point
 
     def _maybe_dtoh_and_synchronize(
-        self, point: str, tokens_per_expert: torch.Tensor = None
+        self, point: str, tokens_per_expert: Optional[torch.Tensor] = None
     ) -> torch.Tensor:
         """
         Move all possible GPU tensors to CPU and make a synchronization at the expected point.
@@ -1433,7 +1432,7 @@ class MoEFlexTokenDispatcher(MoETokenDispatcher):
     def token_dispatch(
         self,
         hidden_states: torch.Tensor,
-        probs: torch.Tensor = None,
+        probs: Optional[torch.Tensor] = None,
         async_finish: bool = True,
         allocate_on_comm_stream: bool = True,
     ):

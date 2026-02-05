@@ -4,12 +4,6 @@ This directory contains in-depth guides, tutorials, and discussions about optimi
 
 ## Available Guides
 
-### Performance Optimization
-
-- **[A Guide to Reproduce DeepSeek-V3 Pre-training Performance on GB200](deepseek-v3-gb200-optimization/deepseek-v3-gb200-reproduce-guide.md)**
-  
-  A detailed guide on how to reproduce the DeepSeek-V3 pre-training performance on GB200, incluing the dockerfile, package requirements and training scripts.
-
 ### Training Guides
 
 - **[Megatron-FSDP User Guide](megatron-fsdp-user-guide/megatron-fsdp-user-guide.md)**

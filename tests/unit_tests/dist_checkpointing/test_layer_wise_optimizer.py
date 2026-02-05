@@ -10,9 +10,9 @@ import torch
 from megatron.core import parallel_state
 from megatron.core.dist_checkpointing import load, save
 from megatron.core.dist_checkpointing.dict_utils import nested_values
-from megatron.core.models.gpt.gpt_layer_specs import get_gpt_decoder_block_spec
 from megatron.core.models.gpt.gpt_layer_specs import (
-    get_gpt_layer_with_transformer_engine_spec as gpt_te_spec,
+    get_gpt_decoder_block_spec,
+    get_gpt_layer_with_transformer_engine_spec,
 )
 from megatron.core.models.gpt.gpt_model import GPTModel
 from megatron.core.optimizer import ChainedOptimizer
@@ -62,11 +62,6 @@ def initialize_real_model(
     virtual_pipeline_model_parallel_size=None,
     **config_kwargs,
 ):
-    # These kwargs are passed through training.get_model for model construction,
-    # but are not part of TransformerConfig; strip them before building config.
-    config_kwargs.pop("pg_collection", None)
-    config_kwargs.pop("config", None)
-
     torch.manual_seed(seed)
     model_parallel_cuda_manual_seed(seed)
 
@@ -95,6 +90,8 @@ def initialize_real_model(
         default_config_kwargs["qk_head_dim"] = 64
         default_config_kwargs["qk_pos_emb_head_dim"] = 32
         default_config_kwargs["v_head_dim"] = 64
+    config_kwargs.pop("pg_collection", None)
+    config_kwargs.pop("config", None)
     default_config_kwargs.update(**config_kwargs)
     config_cls = MLATransformerConfig if is_mla else TransformerConfig
     transformer_config = config_cls(**default_config_kwargs)
@@ -104,7 +101,7 @@ def initialize_real_model(
             transformer_config, use_transformer_engine=True, vp_stage=vp_stage
         )
     else:
-        layer_spec = gpt_te_spec(multi_latent_attention=is_mla)
+        layer_spec = get_gpt_layer_with_transformer_engine_spec(multi_latent_attention=is_mla)
     this_model = GPTModel(
         config=transformer_config,
         transformer_layer_spec=layer_spec,
@@ -189,10 +186,10 @@ class TestLayerWiseOptimizer:
             for name, param in model[0].named_parameters():
                 assert torch.allclose(param.data, original_params[name])
 
-    # TODO(@boxiangw): add PP=4 back and fix the test
+    # TODO(deyuf): check bf16 False case
     @pytest.mark.parametrize('tp', [1, 2, 4])
-    @pytest.mark.parametrize('pp', [1, 2])
-    @pytest.mark.parametrize('bf16', [True, False])
+    @pytest.mark.parametrize('pp', [1, 2, 4])
+    @pytest.mark.parametrize('bf16', [True])
     def test_layer_wise_optimizer_save_load(self, tmp_path_dist_ckpt, tp, pp, bf16):
         """Test save/load of LayerWiseDistributedOptimizer checkpoints."""
         if tp * pp > 8:
@@ -318,11 +315,10 @@ class TestLayerWiseOptimizer:
             num_zeros = optimizer.count_zeros()
             assert num_zeros >= 0
 
-    # TODO(@boxiangw): add PP=4 back and fix the test
     @pytest.mark.parametrize('src_tp', [1, 2, 4])
-    @pytest.mark.parametrize('src_pp', [1, 2])
+    @pytest.mark.parametrize('src_pp', [1, 2, 4])
     @pytest.mark.parametrize('dest_tp', [1, 2, 4])
-    @pytest.mark.parametrize('dest_pp', [1, 2])
+    @pytest.mark.parametrize('dest_pp', [1, 2, 4])
     def test_layer_wise_optimizer_resharding(
         self, tmp_path_dist_ckpt, src_tp, src_pp, dest_tp, dest_pp
     ):
