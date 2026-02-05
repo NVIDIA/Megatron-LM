@@ -494,7 +494,7 @@ class TextGenerationController:
     def _dynamic_step_context_init(
         self,
         construct_graph_dimensions: Optional[InferenceBatchDimensions] = None,
-        is_dummy_forward: bool = False,
+        ep_dummy_batch_dimensions: Optional[InferenceBatchDimensions] = None,
     ):
         """Initializes the inference context for dynamic batching.
 
@@ -507,6 +507,8 @@ class TextGenerationController:
             input_ids (Tensor): The active input IDs.
             position_ids (Tensor): The active position IDs.
         """
+        is_dummy_forward = ep_dummy_batch_dimensions is not None
+
         context = self.inference_wrapped_model.inference_context
         active_request_slice = slice(context.paused_request_count, context.total_request_count)
 
@@ -515,7 +517,8 @@ class TextGenerationController:
         model_config = get_model_config(unwrapped_model)
 
         # Initialize attention state.
-        context.initialize_attention_state(construct_graph_dimensions=construct_graph_dimensions)
+        context.initialize_attention_state(construct_graph_dimensions=construct_graph_dimensions,
+                                           ep_dummy_batch_dimensions=ep_dummy_batch_dimensions)
 
         # If using symmetric kernels and we are using using nccl
         # for prefill turn off symmetric kernels
@@ -800,8 +803,7 @@ class TextGenerationController:
         # a dummy cuda graph.
         input_ids, position_ids = self._dynamic_step_context_init(
             # try to use the smallest cuda-graph config for dummy forward
-            construct_graph_dimensions=min(context.cuda_graph_batch_dimensions_list),
-            is_dummy_forward=True,
+            ep_dummy_batch_dimensions=min(context.cuda_graph_batch_dimensions_list)
         )
 
         # _dynamic_step_context_init tries to find a cuda-graph that is compatible

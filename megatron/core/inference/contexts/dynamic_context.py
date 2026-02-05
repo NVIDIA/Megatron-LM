@@ -1095,7 +1095,9 @@ class DynamicInferenceContext(BaseInferenceContext):
         )
         self.token_to_block_idx[token_slice] = dummy_block_idx
 
+
         if self.is_hybrid_model:
+            torch.cuda.nvtx.range_push("allocate mamba states for dummy requests")
             for logical_idx, request_idx in enumerate(range(start_request_idx, end_request_idx)):
                 mamba_idx = self.mamba_metadata.allocate_slot()
                 if mamba_idx is None:
@@ -1105,6 +1107,7 @@ class DynamicInferenceContext(BaseInferenceContext):
                 self.mamba_conv_states[:, mamba_idx] = 0.0
                 self.mamba_ssm_states[:, mamba_idx] = 0.0
                 self.mamba_metadata.request_to_mamba_state_idx[request_idx] = mamba_idx
+            torch.cuda.nvtx.range_pop()
 
         self.active_token_count = token_end
         self.total_request_count = end_request_idx
@@ -1174,7 +1177,10 @@ class DynamicInferenceContext(BaseInferenceContext):
         return self.total_request_count - self.paused_request_count - self.num_prefill_requests
 
     def initialize_attention_state(
-        self, *, construct_graph_dimensions: Optional[InferenceBatchDimensions] = None
+        self, 
+        *, 
+        construct_graph_dimensions: Optional[InferenceBatchDimensions] = None,
+        ep_dummy_batch_dimensions: Optional[InferenceBatchDimensions] = None,
     ) -> None:
         """Initialize attention state so that every layer can use it.
 
@@ -1184,15 +1190,26 @@ class DynamicInferenceContext(BaseInferenceContext):
             None.
         """
         # if in recording mode, add dummy requests for cuda graph capture
-        if construct_graph_dimensions is not None:
-            self.add_dummy_requests_for_cudagraph_capture(construct_graph_dimensions)
+        torch.cuda.nvtx.range_push("init attention state")
 
-        batch_dimensions = InferenceBatchDimensions(
-            token_count=self.active_token_count,
-            prefill_req_count=self.num_prefill_requests,
-            decode_req_count=self.num_decode_requests,
-            has_explicit_chunked_prefill_req=self.has_explicit_chunked_prefill_req,
-        )
+        if construct_graph_dimensions is not None:
+            assert ep_dummy_batch_dimensions is None
+            torch.cuda.nvtx.range_push("add dummy requests....")
+            rank = torch.distributed.get_rank()
+            logging.info(f"rank = {rank}: adding dummy requests.....!!!!!")
+            self.add_dummy_requests_for_cudagraph_capture(construct_graph_dimensions)
+            torch.cuda.nvtx.range_pop()
+        
+        if ep_dummy_batch_dimensions is not None:
+            batch_dimensions = ep_dummy_batch_dimensions 
+        else:
+            batch_dimensions = InferenceBatchDimensions(
+                token_count=self.active_token_count,
+                prefill_req_count=self.num_prefill_requests,
+                decode_req_count=self.num_decode_requests,
+                has_explicit_chunked_prefill_req=self.has_explicit_chunked_prefill_req,
+            )
+            
         self.batch_dimensions = batch_dimensions
         best_graph = CUDAGraphBatchDimensionBuilder.match_graph_config(
             batch_dimensions,
@@ -1205,7 +1222,18 @@ class DynamicInferenceContext(BaseInferenceContext):
 
         if self.using_cuda_graph_this_step():
             self.padded_batch_dimensions = best_graph
+            if ep_dummy_batch_dimensions is not None:
+                # no requests should exist in the system 
+                # we will only have padding tokens 
+                # and dummy block idxes.
+                assert not self.active_token_count
+                assert not self.paused_request_count
+                self.total_request_count = ep_dummy_batch_dimensions.prefill_req_count + \
+                    ep_dummy_batch_dimensions.decode_req_count
         else:
+            if ep_dummy_batch_dimensions is not None:
+                return 
+
             padded_token_count = self.round_up_tokens(self.active_token_count)
             if self.is_decode_only():
                 padded_token_count = min(
@@ -1279,7 +1307,7 @@ class DynamicInferenceContext(BaseInferenceContext):
             batch_dimensions=attn_dimensions,
             padded_batch_dimensions=self.padded_batch_dimensions,
         )
-
+        torch.cuda.nvtx.range_push("mamba metadata update")
         if self.is_hybrid_model:
             active_mamba_indices_view = self.mamba_metadata.request_to_mamba_state_idx[active_slice]
             token_to_request_idx_view = self.token_to_request_idx[: self.active_token_count]
@@ -1293,6 +1321,8 @@ class DynamicInferenceContext(BaseInferenceContext):
                 batch_dimensions=attn_dimensions,
                 padded_batch_dimensions=self.padded_batch_dimensions,
             )
+        torch.cuda.nvtx.range_pop()
+        torch.cuda.nvtx.range_pop()
 
     def reset(self) -> None:
         """Reset entire context.

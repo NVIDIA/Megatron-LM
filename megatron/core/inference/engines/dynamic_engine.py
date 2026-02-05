@@ -1650,7 +1650,7 @@ class DynamicInferenceEngine(AbstractEngine):
             # Note that it is important to use a non-blocking asyncio-friendly all-reduce here.
             # The user may have other tasks running in the event loop that need to be serviced.
             # Do not using a torch.distributed blocking all-reduce here using nccl/gloo.
-            # We have tried that and it blocks the event loop is megatron-rl.
+            # We have tried that and it blocks the event loop in megatron-rl.
             max_global_work = await self.expert_parallel_zmq_communicator.all_reduce_max(local_work)
         else:
             max_global_work = local_work
