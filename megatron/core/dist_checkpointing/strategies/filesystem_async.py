@@ -32,11 +32,11 @@ from torch.distributed.checkpoint.planner import SavePlan, SavePlanner, WriteIte
 from torch.distributed.checkpoint.storage import WriteResult
 from torch.futures import Future
 
-from .async_utils import _disable_gc, PersistentAsyncCaller
+from .async_utils import PersistentAsyncCaller, _disable_gc
 
 logger = logging.getLogger(__name__)
 
-WriteBucket = Tuple[Path, str, Tuple[list, list]]  # represents writes to a single file
+WriteBucket = Tuple[str, str, Tuple[list, list]]  # represents writes to a single file
 # Compact structure: plan items + resolved data, avoiding expanded bucket structure
 ResolvedPlanData = Tuple[
     str, str, List[WriteItem], List[Any], int, _StoragePrefix
@@ -84,13 +84,11 @@ def _compute_data_structure_key_from_plan(items: List[WriteItem]) -> int:
             )
         else:
             # For non-tensor data (BYTE_IO), use placeholder
-            data_info = ("BYTE_IO",)
+            data_info = (("BYTE_IO",), "BYTE_IO")
         structure_info.append((item_info, data_info))
 
     # Create a hash from the structure info
     return hash(tuple(structure_info))
-
-
 
 
 try:
@@ -102,8 +100,17 @@ except ImportError:
 
 _results_queue = None
 
+
 @_disable_gc()
 def get_write_results_queue(mp_mode: str = 'spawn') -> mp.Queue:
+    """Get or create a multiprocessing queue for write results.
+
+    Args:
+        mp_mode (str): Multiprocessing context mode. Defaults to 'spawn'.
+
+    Returns:
+        mp.Queue: Queue for collecting write results.
+    """
     global _results_queue
     if _results_queue is None:
         ctx = mp.get_context(mp_mode)
@@ -131,6 +138,7 @@ class FileSystemWriterAsync(FileSystemWriter):
     Currently, it is assumed that a separate writer is created for each ckpt save
     (intermediate state is stored as writer attributes).
     """
+
     # Class-level cache to track identifiers that have been sent to worker across instances
     _cached_identifiers: set = set()
 
@@ -212,13 +220,13 @@ class FileSystemWriterAsync(FileSystemWriter):
         # CPU tensors and ByteIO must be resolved fresh (cannot use IPC)
         tensor_items = [item for item in plan.items if item.type != WriteItemType.BYTE_IO]
         byte_io_items = [item for item in plan.items if item.type == WriteItemType.BYTE_IO]
-        
+
         # Helper to separate resolved tensors by device
         def separate_by_device(items, resolved_data):
             """Separate tensor items and data into GPU and CPU categories."""
             gpu_items, gpu_data = [], []
             cpu_items, cpu_data = [], []
-            
+
             for item, data in zip(items, resolved_data):
                 if isinstance(data, torch.Tensor) and data.device.type == "cpu":
                     cpu_items.append(item)
@@ -226,45 +234,55 @@ class FileSystemWriterAsync(FileSystemWriter):
                 else:
                     gpu_items.append(item)
                     gpu_data.append(data)
-            
+
             return (gpu_items, gpu_data), (cpu_items, cpu_data)
-        
+
         # Handle GPU tensor caching (only GPU tensors can benefit from IPC)
         # CPU tensors will be separated and treated like ByteIO (always resolved fresh)
         if self.use_cached_data_structure and tensor_items:
             key = _compute_data_structure_key_from_plan(tensor_items)
             self.consistent_data_identifier = ConsistentDataIdentifier(key)
             cache_exists = key in FileSystemWriterAsync._cached_identifiers
-            
+
             # Always resolve tensors to separate CPU tensors (which can't be cached)
             resolved_tensors = resolve_data(tensor_items)
-            (gpu_items, gpu_data), (cpu_items, cpu_data) = separate_by_device(tensor_items, resolved_tensors)
-            
+            (gpu_items, gpu_data), (cpu_items, cpu_data) = separate_by_device(
+                tensor_items, resolved_tensors
+            )
+
             if cache_exists:
                 # Reuse cached GPU tensors from worker
                 self.cached_tensor_data = None  # Signal to reuse cached data
-                logger.debug(f"Reusing cached GPU tensors (key={key}), resolved {len(cpu_items)} CPU tensors fresh")
+                logger.debug(
+                    f"Reusing cached GPU tensors (key={key}), "
+                    f"resolved {len(cpu_items)} CPU tensors fresh"
+                )
             else:
                 # First time caching - send GPU tensor data to worker
                 self.cached_tensor_data = (gpu_items, gpu_data) if gpu_items else None
                 FileSystemWriterAsync._cached_identifiers.add(key)
-                logger.debug(f"Caching {len(gpu_items)} GPU tensors (key={key}), {len(cpu_items)} CPU tensors passed fresh")
-            
+                logger.debug(
+                    f"Caching {len(gpu_items)} GPU tensors (key={key}), "
+                    f"{len(cpu_items)} CPU tensors passed fresh"
+                )
+
             # CPU tensors are always passed fresh (never cached)
             self.cpu_tensor_data = (cpu_items, cpu_data) if cpu_items else None
         else:
             # No caching - resolve and separate all tensors
             self.consistent_data_identifier = None
-            
+
             if tensor_items:
                 resolved_tensors = resolve_data(tensor_items)
-                (gpu_items, gpu_data), (cpu_items, cpu_data) = separate_by_device(tensor_items, resolved_tensors)
+                (gpu_items, gpu_data), (cpu_items, cpu_data) = separate_by_device(
+                    tensor_items, resolved_tensors
+                )
                 self.cached_tensor_data = (gpu_items, gpu_data) if gpu_items else None
                 self.cpu_tensor_data = (cpu_items, cpu_data) if cpu_items else None
             else:
                 self.cached_tensor_data = None
                 self.cpu_tensor_data = None
-        
+
         # Always resolve ByteIO fresh (cannot use IPC)
         self.byte_io_data = (byte_io_items, resolve_data(byte_io_items)) if byte_io_items else None
         self.storage_plan = plan.storage_data
@@ -290,13 +308,22 @@ class FileSystemWriterAsync(FileSystemWriter):
             return None, None, []
         transform_list = [self.transforms] if hasattr(self, "transforms") else []
 
-        # Format: (identifier, (separation_hint, cached_tensor_data, cpu_tensor_data, byte_io_data, thread_count, storage_plan))
+        # Format: (identifier, (separation_hint, cached_tensor_data,
+        # cpu_tensor_data, byte_io_data, thread_count, storage_plan))
         # identifier is None when caching is disabled
         # cpu_tensor_data is always passed fresh (like ByteIO), never cached
         cpu_tensor_data = getattr(self, 'cpu_tensor_data', None)
-        data_to_pass = (self.consistent_data_identifier, 
-                       (self.separation_hint, self.cached_tensor_data, cpu_tensor_data, self.byte_io_data, 
-                        self.thread_count, self.storage_plan))
+        data_to_pass = (
+            self.consistent_data_identifier,
+            (
+                self.separation_hint,
+                self.cached_tensor_data,
+                cpu_tensor_data,
+                self.byte_io_data,
+                self.thread_count,
+                self.storage_plan,
+            ),
+        )
 
         return (
             partial(
@@ -309,13 +336,15 @@ class FileSystemWriterAsync(FileSystemWriter):
     @staticmethod
     def preload_tensors(resolved_plan_data: Tuple, non_blocking=True) -> List[WriteBucket]:
         """
-        Creates write_buckets from resolved plan data and preloads tensors to host memory via CPU memory.
+        Creates write_buckets and preloads tensors to host memory.
 
         Args:
-            resolved_plan_data (Tuple): Tuple containing (checkpoint_dir, (identifier, data_structure)) where:
-                - identifier: ConsistentDataIdentifier (for caching) or None (no caching)
-                - data_structure: (separation_hint, cached_tensor_data, cpu_tensor_data, byte_io_data, thread_count, storage_plan)
-            non_blocking (bool, optional): knob to enable pinned D2H memcpy. Default is True.
+            resolved_plan_data (Tuple): Tuple containing
+                (checkpoint_dir, (identifier, data_structure)) where:
+                - identifier: ConsistentDataIdentifier (caching) or None
+                - data_structure: (separation_hint, cached_tensor_data,
+                  cpu_tensor_data, byte_io_data, thread_count, storage_plan)
+            non_blocking (bool, optional): Enable pinned D2H memcpy.
 
         Returns:
             List[WriteBucket]: List of write buckets with tensors moved to CPU
@@ -333,12 +362,20 @@ class FileSystemWriterAsync(FileSystemWriter):
                     items.extend(data[0])
                     resolved.extend(data[1])
             return items, resolved
-        
-        # Parse data structure: (identifier, (separation_hint, cached_tensor_data, cpu_tensor_data, byte_io_data, thread_count, storage_plan))
-        # identifier is None when caching is disabled, or ConsistentDataIdentifier when caching is enabled
+
+        # Parse data structure: (identifier, (separation_hint, cached_tensor_data,
+        # cpu_tensor_data, byte_io_data, thread_count, storage_plan))
+        # identifier is None when disabled, ConsistentDataIdentifier when enabled
         identifier, data_structure = data_or_identifier
-        separation_hint, cached_tensor_data, cpu_tensor_data, byte_io_data, thread_count, storage_plan = data_structure
-        
+        (
+            separation_hint,
+            cached_tensor_data,
+            cpu_tensor_data,
+            byte_io_data,
+            thread_count,
+            storage_plan,
+        ) = data_structure
+
         if isinstance(identifier, ConsistentDataIdentifier):
             # Caching enabled: get or cache GPU tensor data
             # CPU tensors are NOT cached (treated like ByteIO)
@@ -352,7 +389,7 @@ class FileSystemWriterAsync(FileSystemWriter):
             else:
                 raise RuntimeError(f"Worker cache miss for key {key}. Worker may have restarted.")
         # else: identifier is None, no caching needed
-        
+
         items, resolved_data = combine_data(cached_tensor_data, cpu_tensor_data, byte_io_data)
 
         logger.debug(f"preload_tensors: thread_count: {thread_count}, time: {start}")
@@ -401,9 +438,10 @@ class FileSystemWriterAsync(FileSystemWriter):
                     )
 
         # Now move GPU tensors to CPU (CPU tensors are already on CPU)
-        result = []
-        for bucket in write_buckets:
-            file_name, storage_key, (bytes_data, tensor_data) = bucket
+        result: List[WriteBucket] = []
+        for bucket in write_buckets:  # type: ignore[assignment]
+            bucket_path, bucket_key, bucket_data = bucket  # type: ignore[misc]
+            bytes_data, tensor_data = bucket_data
             tensor_list = []
             for item, tensor in tensor_data:
                 # we believe these tensors are detached from the model trainers
@@ -411,7 +449,7 @@ class FileSystemWriterAsync(FileSystemWriter):
                 tensor_list.append((item, tensor.to("cpu", non_blocking=non_blocking)))
                 # This is required for `PersistentAsyncCaller` to remove reference
                 # del tensor
-            result.append((file_name, storage_key, (bytes_data, tensor_list)))
+            result.append((bucket_path, bucket_key, (bytes_data, tensor_list)))  # type: ignore[arg-type]
 
         if non_blocking:
             torch.cuda.synchronize()
@@ -623,7 +661,7 @@ class FileSystemWriterAsync(FileSystemWriter):
         """
         # Note: consistent_data_structure can be None when caching is enabled and
         # we're reusing a cached identifier, so we don't assert on it
-        
+
         if self.results_queue is None:
             write_results_or_exc = {}
         else:
@@ -718,7 +756,8 @@ class FileSystemWriterAsync(FileSystemWriter):
 
         This method is available in PyTorch 2.3 and above.
         """
-        if checkpoint_id.startswith("msc://"):
+        checkpoint_id_str = str(checkpoint_id)
+        if checkpoint_id_str.startswith("msc://"):
             return True
 
         if hasattr(FileSystemWriter, "validate_checkpoint_id"):
@@ -787,10 +826,10 @@ def _split_by_separation_hint(
         mapping the prefix to the relevant buckets
     """
     bins = len(buckets)
-    buckets_with_separation_hint = {}
+    buckets_with_separation_hint: Dict[str, List[List[WriteItem]]] = {}
     if separation_hint is not None:
-        buckets_default = [[] for _ in range(bins)]
-        buckets_hint = [[] for _ in range(bins)]
+        buckets_default: List[List[WriteItem]] = [[] for _ in range(bins)]
+        buckets_hint: List[List[WriteItem]] = [[] for _ in range(bins)]
         for i in range(bins):
             for item in buckets[i]:
                 if item.index.fqn.startswith(separation_hint):

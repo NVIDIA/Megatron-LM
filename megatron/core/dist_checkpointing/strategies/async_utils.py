@@ -29,24 +29,24 @@ def _set_process_qos(cpu_priority: int = 10, io_priority: Optional[int] = None) 
     """
     Set QoS (Quality of Service) for the current checkpoint writer process.
     This ensures checkpoint writing doesn't interfere with training.
-    
+
     Args:
         cpu_priority: Nice value for CPU scheduling (0-19, higher = lower priority).
                      Default 10 is moderately deprioritized.
         io_priority: I/O scheduling class and priority. If None, uses best-effort class.
                     Format: class_id (0-3) where 3 = idle (lowest priority).
-    
+
     Note: Requires appropriate permissions. Failures are logged but not fatal.
     """
     pid = os.getpid()
-    
+
     # Set CPU priority (nice value)
     try:
         os.nice(cpu_priority)
         logger.debug(f"PID {pid}: Set CPU nice value to +{cpu_priority}")
     except (OSError, PermissionError) as e:
         logger.warning(f"PID {pid}: Failed to set CPU priority: {e}")
-    
+
     # Set I/O priority (ionice) - Linux only
     if io_priority is not None:
         try:
@@ -54,9 +54,7 @@ def _set_process_qos(cpu_priority: int = 10, io_priority: Optional[int] = None) 
             # class 3 = idle (only when no other process needs I/O)
             # class 2 = best-effort (default, can set priority 0-7)
             subprocess.run(
-                ["ionice", "-c", str(io_priority), "-p", str(pid)],
-                check=True,
-                capture_output=True
+                ["ionice", "-c", str(io_priority), "-p", str(pid)], check=True, capture_output=True
             )
             logger.debug(f"PID {pid}: Set I/O priority class to {io_priority}")
         except (subprocess.CalledProcessError, FileNotFoundError, PermissionError) as e:
@@ -98,7 +96,7 @@ class AsyncRequest(NamedTuple):
     async_fn_args: Tuple
     finalize_fns: List[Callable]
     async_fn_kwargs: Dict = {}
-    preload_fn: Callable = None
+    preload_fn: Optional[Callable] = None
     is_frozen: bool = False
     call_idx: int = 0
 
@@ -123,7 +121,7 @@ class AsyncRequest(NamedTuple):
         """
         # preload tensors.
         async_fn_args = list(self.async_fn_args)
-        if self.preload_fn:
+        if self.preload_fn is not None:
             assert len(async_fn_args) == 3, "Expected 3 args to be passed to async function"
             # The async_fn is passed as a partial functool with pre-determined args
             # In the async_fn_args we pass the remaining positional args required by the async_fn
@@ -241,7 +239,7 @@ class TemporalAsyncCaller(AsyncCaller):
             return  # nothing to do
 
         async_fn_args = list(async_req.async_fn_args)
-        if async_req.preload_fn:
+        if async_req.preload_fn is not None:
             # If there's a preload_fn in `async_req`, we call this func
             # to do the defined action in `async_req.preload_fn` to
             # stage GPU tensors to its defined destination
@@ -336,48 +334,54 @@ class PersistentAsyncCaller(AsyncCaller):
     _persistent_queue: mp.JoinableQueue = None
     _persistent_preload_q: mp.JoinableQueue = None
     _persistent_comp_q: mp.Queue = None
-    
+
     # Worker-side cache for consistent data structures
-    # Key: identifier key, Value: (separation_hint, items, resolved_data, thread_count, storage_plan)
-    # This cache contains IPC handles from shared tensors and must be cleaned up properly
+    # Key: identifier key
+    # Value: (separation_hint, items, resolved_data, thread_count, storage_plan)
+    # This cache contains IPC handles and must be cleaned up properly
     _worker_data_cache: Dict = {}
-    
+
     # QoS settings for checkpoint writer processes
-    # Can be configured via environment variables: ASYNC_CKPT_CPU_PRIORITY and ASYNC_CKPT_IO_PRIORITY
+    # Configure via env vars: ASYNC_CKPT_CPU_PRIORITY, ASYNC_CKPT_IO_PRIORITY
     _cpu_priority: int = int(os.environ.get('ASYNC_CKPT_CPU_PRIORITY', '10'))
-    _io_priority: Optional[int] = int(os.environ.get('ASYNC_CKPT_IO_PRIORITY', '3')) \
-        if os.environ.get('ASYNC_CKPT_IO_PRIORITY') != 'none' else None
+    _io_priority: Optional[int] = (
+        int(os.environ.get('ASYNC_CKPT_IO_PRIORITY', '3'))
+        if os.environ.get('ASYNC_CKPT_IO_PRIORITY') != 'none'
+        else None
+    )
 
     def __init__(self):
-        self.process: mp.Process = None
+        self.process: Optional[mp.Process] = None
         self.start_time: Optional[float] = None
-        self.cur_item: int = None
+        self.cur_item: Optional[int] = None
         self.cur_idx: int = -1
-
 
     @classmethod
     def _get_process(cls, rank: int, mp_mode: str = 'spawn'):
-        
+
         if cls._persistent_process is None:
             ctx = mp.get_context(mp_mode)
-            logger.debug(
-                f"PersistentAsyncCaller: {rank}, Starting Async Caller"
-            )
+            logger.debug(f"PersistentAsyncCaller: {rank}, Starting Async Caller")
             cls._persistent_queue = ctx.JoinableQueue()
             cls._persistent_preload_q = ctx.JoinableQueue()
             cls._persistent_comp_q = ctx.Queue()
-            cls._persistent_process: mp.Process = ctx.Process(
+            cls._persistent_process = ctx.Process(
                 target=PersistentAsyncCaller.async_loop,
-                args=(rank, cls._persistent_queue, cls._persistent_preload_q, cls._persistent_comp_q, 
-                      logger.getEffectiveLevel(), cls._cpu_priority, cls._io_priority),
+                args=(
+                    rank,
+                    cls._persistent_queue,
+                    cls._persistent_preload_q,
+                    cls._persistent_comp_q,
+                    logger.getEffectiveLevel(),
+                    cls._cpu_priority,
+                    cls._io_priority,
+                ),
             )
             cls._persistent_process.daemon = True
             cls._persistent_process.start()
-            logger.debug(
-                f"PersistentAsyncCaller: {rank}, Started Async Caller"
-            )
+            logger.debug(f"PersistentAsyncCaller: {rank}, Started Async Caller")
         return cls._persistent_process
-    
+
     def schedule_async_call(self, async_req: AsyncRequest) -> None:
         """Put `AsyncRequest` to the Persistent Async Caller
 
@@ -397,12 +401,12 @@ class PersistentAsyncCaller(AsyncCaller):
         self.start_time = time()
         if self.process is None:
             self.process = PersistentAsyncCaller._get_process(torch.distributed.get_rank())
-        if async_req.preload_fn:
+        if async_req.preload_fn is not None:
             self._persistent_preload_q.put(async_req.call_idx)
         self._persistent_queue.put(async_req)
         logger.debug(f"rank: {torch.distributed.get_rank()}, put {async_req.call_idx}")
 
-        if async_req.preload_fn:
+        if async_req.preload_fn is not None:
             start_sync = time()
             # Synchronize for pre-staging tensors
             self._persistent_preload_q.join()
@@ -508,7 +512,7 @@ class PersistentAsyncCaller(AsyncCaller):
     @classmethod
     def cleanup_worker_data_cache(cls):
         """Clean up the worker data cache and release IPC handles.
-        
+
         This function should be called when the async worker is being torn down
         to properly release any IPC handles stored in the cache.
         """
@@ -567,7 +571,7 @@ class PersistentAsyncCaller(AsyncCaller):
         # take on undue memory burden from other devices on node (default behavior without
         # this line).
         torch.cuda.set_device(rank % torch.cuda.device_count())
-        
+
         # Set QoS to deprioritize checkpoint writing vs training
         # This prevents checkpoint I/O from interfering with data loader
         _set_process_qos(cpu_priority=cpu_priority, io_priority=io_priority)
@@ -580,13 +584,14 @@ class PersistentAsyncCaller(AsyncCaller):
                 break
             elif isinstance(item, AsyncRequest):
                 async_fn_args = list(item.async_fn_args)
-                if item.preload_fn:
+                if item.preload_fn is not None:
                     call_idx = preload_q.get()
                     # the 2nd arg is state dict
                     async_fn_args[1] = item.preload_fn()
                     logger.debug(f"{rank} has completed D2H of {call_idx}")
                     preload_q.task_done()
-                item.async_fn(*async_fn_args, **item.async_fn_kwargs)
+                if item.async_fn is not None:
+                    item.async_fn(*async_fn_args, **item.async_fn_kwargs)
                 logger.debug(f"{rank} has completed saving {item.call_idx}")
                 comp_q.put(item.call_idx)
                 queue.task_done()
@@ -617,7 +622,9 @@ class AsyncCallsQueue:
     Allows adding a new async call with `schedule_async_request` and finalizing
     active calls with `maybe_finalize_async_calls`.
     """
+
     _persistent_caller: Optional[PersistentAsyncCaller] = None
+
     def __init__(self, persistent: bool = False):
         self.async_calls: deque[_ActiveAsyncRequest] = deque([])
         self.call_idx: int = -1
@@ -629,7 +636,7 @@ class AsyncCallsQueue:
         if AsyncCallsQueue._persistent_caller is None:
             AsyncCallsQueue._persistent_caller = PersistentAsyncCaller()
         return AsyncCallsQueue._persistent_caller
-    
+
     @classmethod
     def warmup_persistent_caller(cls, rank: int, mp_mode: str = 'spawn'):
         """Warmup the persistent caller to avoid the overhead of creating it on the first call."""
