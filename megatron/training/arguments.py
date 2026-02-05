@@ -1482,26 +1482,9 @@ def _add_transformer_engine_args(parser):
                             'dtype) and perform the param all-gather in fp8.')
 
     # FP4 related arguments
-    group.add_argument('--fp4-format', default=None,
-                       choices=['e2m1'],
-                       help='Which nvfp4 format scheme to use for FP4 tensors in the forward and backward pass',
-                       dest='fp4')
-    group.add_argument('--fp4-recipe', default='nvfp4',
-                       choices=['nvfp4', 'custom'],
-                       help='Which fp4 recipe to use for FP4 tensors in the forward and backward pass',
-                       dest='fp4_recipe')
-    group.add_argument('--fp4-quantizer-factory', default=None,
-                       help='Python import path to a callable quantizer factory, '
-                            'e.g., package.module.quantizer_factory.',
-                       dest='fp4_quantizer_factory')
     group.add_argument('--fp4-param-gather', action='store_true',
                        help='Keep the compute param in fp4 (do not use any other intermediate '
                             'dtype) and perform the param all-gather in fp4.')
-    group.add_argument('--te-rng-tracker', action='store_true', default=False,
-                       help='Use the Transformer Engine version of the random number generator. '
-                            'Required for CUDA graphs support.')
-    group.add_argument('--inference-rng-tracker', action='store_true', default=False,
-                       help='Use a random number generator configured for inference.')
     group.add_argument('--te-precision-config-file', default=None,
                        help='Configuration file to select per-module precision overrides. '
                        'See TransformerEngineMixedPrecision.md')

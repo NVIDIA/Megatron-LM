@@ -1168,11 +1168,6 @@ class DataParallelBuffer:
         Returns:
             None
         """
-        # When fully sharded, we need to get the slice of the item to be stored in this shard.
-        # Otherwise, we can just flatten the entire item since this buffer contains
-        # the entire bucket.
-        item_data = get_raw_data(item_data, self.is_transpose_buffer)
-
         if self.is_data_distributed:
             # Get the coordinates of the slice of the item that is contained in this shard.
             slice_start, slice_end = self._get_item_slice_in_shard(item_id)
@@ -2857,6 +2852,7 @@ class ParamAndGradBuffer:
                     main_weight = mbuf.get_item(item_id)
 
                 if is_blockwise_float8tensor(param) or is_nvfp4tensor(param):
+                    use_copy_in_out_quant = True
                     fp8_params.append(param)
                     if model_param.numel() == 0:
                         # Empty parameter.
@@ -2886,7 +2882,6 @@ class ParamAndGradBuffer:
                         copy_io_quant_params.append(
                             {"bucket_param": b_model_param, "param": model_param}
                         )
-                        use_copy_in_out_quant = True
                     continue
 
                 if _tensor_dtype(param) in ["nvfp8", "nvfp8_t", "nvfp4"]:

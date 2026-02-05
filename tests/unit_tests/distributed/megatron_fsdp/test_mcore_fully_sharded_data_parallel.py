@@ -647,13 +647,13 @@ class TestMegatronFSDPE2E:
             pytest.param(
                 "optim_grads_params",
                 True,
-                {"fp8_recipe": "mxfp8", "fp8": "e4m3", "fp8_param_gather": True},
+                {"fp8_recipe": "mxfp8", "fp8": "e4m3", "fp8_param_gather": True, "bf16": True},
                 id="optim_grads_params_mxfp8_double_buffer",
             ),
             pytest.param(
                 "optim_grads_params",
                 True,
-                {"fp4_recipe": "nvfp4", "fp4": "e2m1", "fp4_param_gather": True},
+                {"fp4_recipe": "nvfp4", "fp4": "e2m1", "fp4_param_gather": True, "bf16": True},
                 id="optim_grads_params_nvfp4_double_buffer",
             ),
             pytest.param("optim_grads", False, {}, id="optim_grads_no_double_buffer"),
@@ -675,8 +675,14 @@ class TestMegatronFSDPE2E:
 
         nd_topology_str = "_".join([f"{k}{v}" for k, v in nd_topology.items()])
         if nd_topology_str not in ref_cache:
-            ref_cache[nd_topology_str] = TestMegatronFSDPE2E._training_loop(
+            distopt_args = dict(
                 use_distributed_optimizer=True, **mixed_precision_config
+            )
+            distopt_args.update(
+                fp8_param_gather=False, fp4_param_gather=False,
+            )
+            ref_cache[nd_topology_str] = TestMegatronFSDPE2E._training_loop(
+                **distopt_args
             )
 
         outputs = TestMegatronFSDPE2E._training_loop(
