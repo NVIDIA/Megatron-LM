@@ -650,7 +650,7 @@ def process_mtp_loss(
     # when calculate_per_token_loss is enabled. This ensures MTP gradients are
     # correctly scaled relative to the main loss gradients in finalize_model_grads.
     original_num_tokens = loss_mask.sum()
-    
+
     for mtp_layer_number in range(config.mtp_num_layers):
         mtp_logits, _ = output_layer(
             hidden_states_list[mtp_layer_number + 1],
