@@ -232,8 +232,8 @@ def build_centralized_reshard_plan(
     - dst_module=None: Rank doesn't have destination model (source-only)
     - Both provided: Rank has both models (collocated mode)
 
-    Each rank provides metadata only for the models it owns, including local positions
-    within parallel groups (tensor_parallel_local_rank, expert_parallel_local_rank).
+    Each rank provides metadata only for the models it owns, including parallel group
+    membership (tensor_parallel_group_ranks, expert_parallel_group_ranks, etc.).
     This metadata is sufficient for rank 0 to build correct transfer plans without
     requiring dummy models.
     """

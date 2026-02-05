@@ -57,12 +57,6 @@ class ParameterMetadata:
     data_parallel_group_ranks: list[int] | None = None
     pipeline_parallel_group_ranks: list[int] | None = None
 
-    # Local position within parallel groups (for non-collocated mode)
-    # These allow the planner to correctly map between source and destination ranks
-    # when they use different process group configurations (e.g., with rank_offset)
-    tensor_parallel_local_rank: int | None = None
-    expert_parallel_local_rank: int | None = None
-
     # Canonical name for matching parameters across models with different EP/PP configurations.
     #
     # - EP (expert parallel): each rank owns a subset of experts with local indices
@@ -302,18 +296,6 @@ def extract_param_metadata(
     else:
         pipeline_parallel_group_ranks = list(range(dist.get_world_size()))
 
-    # Compute local positions within parallel groups
-    # This enables non-collocated mode without dummy models by providing enough
-    # information for the planner to correctly map ranks between different PG configs
-    tensor_parallel_local_rank: int | None = None
-    expert_parallel_local_rank: int | None = None
-
-    if tensor_parallel_group_ranks is not None:
-        tensor_parallel_local_rank = tensor_parallel_group_ranks.index(owner_rank)
-
-    if expert_parallel_group_ranks is not None:
-        expert_parallel_local_rank = expert_parallel_group_ranks.index(owner_rank)
-
     meta = ParameterMetadata(
         name=param_name,
         shape=tuple(param.shape),
@@ -329,8 +311,6 @@ def extract_param_metadata(
         expert_parallel_group_ranks=expert_parallel_group_ranks,
         data_parallel_group_ranks=data_parallel_group_ranks,
         pipeline_parallel_group_ranks=pipeline_parallel_group_ranks,
-        tensor_parallel_local_rank=tensor_parallel_local_rank,
-        expert_parallel_local_rank=expert_parallel_local_rank,
     )
     assign_resolved_name_inplace(
         meta, layer_module_prefix_map=layer_module_prefix_map, base_name=param_name
@@ -349,16 +329,16 @@ def select_src_metadata_balanced(
     doesn't perform transfers itself - it just picks which source configuration to use
     as reference for planning.
 
-    Two scenarios:
-    1. Non-collocated mode (same TP/EP sizes, different rank numbering):
-       - Filter by matching TP/EP local rank to pair ranks with same position
-       - Example: src ranks [0-63] and dst ranks [64-127] both with TP=8
-       - Dst TP local 0 should use src TP local 0 as reference (same shards)
+    Two scenarios for EP-sharded parameters:
+    1. Non-collocated mode (same EP size, different rank numbering):
+       - Filter by matching EP local rank to pair ranks with same expert position
+       - Example: src ranks [0-63] and dst ranks [64-127] both with EP=8
+       - Dst EP local 0 should use src EP local 0 as reference (same experts)
 
-    2. Resharding mode (different TP/EP sizes):
-       - Skip TP/EP local rank filtering (sizes don't correspond)
+    2. Resharding mode (different EP sizes):
+       - Skip EP local rank filtering (sizes don't correspond)
        - Example: EP=8→EP=16 means dst EP local 8 has no matching src EP local
-       - LCM algorithm handles size changes; we just need any valid topology reference
+       - Expert matching handled by resolved_name; LCM handles TP dimension changes
 
     Finally, balances across data-parallel (DP) groups to distribute load:
       - Groups src_meta_list by DP group
@@ -385,30 +365,38 @@ def select_src_metadata_balanced(
     # resolved_name (which includes global expert index). The LCM/TP planner
     # handles any TP dimension changes, and DP round-robin distributes load.
     # ============================================================================
-    dst_ep_local = dst_metadata.expert_parallel_local_rank
-    if dst_ep_local is not None:
+    dst_ep_group = dst_metadata.expert_parallel_group_ranks
+    if dst_ep_group is not None:
+        dst_ep_local = dst_ep_group.index(dst_rank)
         # Check if EP sizes match between source and destination
         src_ep_size = (
             len(src_meta_list[0].expert_parallel_group_ranks)
             if src_meta_list[0].expert_parallel_group_ranks
             else None
         )
-        dst_ep_size = (
-            len(dst_metadata.expert_parallel_group_ranks)
-            if dst_metadata.expert_parallel_group_ranks
-            else None
-        )
+        dst_ep_size = len(dst_ep_group)
 
         # Only filter by EP local rank when sizes match (non-collocated, not resharding)
-        if src_ep_size == dst_ep_size and src_ep_size is not None:
-            matching_ep = [m for m in src_meta_list if m.expert_parallel_local_rank == dst_ep_local]
+        if src_ep_size == dst_ep_size:
+            matching_ep = [
+                m
+                for m in src_meta_list
+                if m.expert_parallel_group_ranks
+                and m.expert_parallel_group_ranks.index(m.owner_rank) == dst_ep_local
+            ]
             if not matching_ep:
                 # This indicates a configuration bug: sizes match but no local rank match
+                def _ep_local(m):
+                    return (
+                        m.expert_parallel_group_ranks.index(m.owner_rank)
+                        if m.expert_parallel_group_ranks
+                        else None
+                    )
+
+                available = [(m.owner_rank, _ep_local(m)) for m in src_meta_list]
                 raise ValueError(
                     f"No source metadata with EP local rank {dst_ep_local}"
-                    f" found for dst rank {dst_rank}. "
-                    f"Available: "
-                    f"{[(m.owner_rank, m.expert_parallel_local_rank) for m in src_meta_list]}"
+                    f" found for dst rank {dst_rank}. Available: {available}"
                 )
             src_meta_list = matching_ep
         # else: EP resharding mode (sizes differ) - skip filter, keep all source candidates
