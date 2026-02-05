@@ -612,7 +612,7 @@ class TEGroupedMLP(MegatronModule):
             set_save_original_input(self.linear_fc2)
 
         # This is to avoid the CPU overhead of multiple d2h copies
-        if self.offload_expert_fc1:
+        if self.offload_expert_fc1 and not self.config.fp8:
             from megatron.core.extensions.transformer_engine import set_save_original_input
 
             set_save_original_input(self.linear_fc1)
@@ -692,6 +692,7 @@ class TEGroupedMLP(MegatronModule):
                 fc1_output,
                 name="expert_fc1",
                 forced_released_tensors=[permuted_local_hidden_states],
+                delay_offload=self.config.delay_offload_until_cuda_graph,
             )
 
         def bias_act_func(intermediate_parallel, bias_parallel, permuted_probs):
@@ -770,7 +771,10 @@ class TEGroupedMLP(MegatronModule):
         # to make sure the fc1_output is reloaded to GPU before recomputing moe_act.
         if self.offload_moe_act:
             output = off_interface.group_commit(
-                output, name="moe_act", forced_released_tensors=[fc1_output]
+                output,
+                name="moe_act",
+                forced_released_tensors=[fc1_output],
+                delay_offload=self.config.delay_offload_until_cuda_graph,
             )
         output = self._apply_bias(output, output_bias, tokens_per_expert, permuted_probs)
 

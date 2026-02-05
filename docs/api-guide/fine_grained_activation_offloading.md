@@ -22,6 +22,21 @@ Currently, the supported offloading modules are `"attn_norm", "core_attn", "attn
 # Specify which modules are going to offload its input
 # Choices: "attn_norm", "core_attn", "attn_proj", "mlp_norm", "expert_fc1", "moe_act".
 --offload-modules expert_fc1
+
+# Specify the minimum tensor shape to be offloaded
+# This is to avoid scattered offloading of small tensors
+--min-offloaded-tensor-size 1048576 # 1M elements
+
+# When enabling cuda graph, delay the offloading outside graph until the graph launch.
+# This is to utilize the leading advantages of CPU by cuda graph
+--delay-offload-until-cuda-graph
+
+# Difference of offload bytes across PP ranks to balance the offload load.
+# Larger PP ranks offload less bytes to reduce the overhead.
+delta_offload_bytes_across_pp_ranks 1073741824 # 1GB
+
+# The fraction of the activation to be offloaded, which should be in range [0, 1].
+--activation-offload-fraction 0.8
 ```
 **Compatible with Fine-grained Recomputation**
 - For modules with minor perf overhead like layernorm or moe_act, use recomputing to reduce memory footprint;
