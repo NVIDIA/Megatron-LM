@@ -743,9 +743,9 @@ class TransformerBlock(GraphableMegatronModule, MegatronModule):
         # Determine if MHC recompute should be used
         # Only enable when: training mode AND hyper connections enabled AND recompute_hyper_connections is True
         use_mhc_recompute = (
-            self.training and
-            self.config.enable_hyper_connections and
-            self.config.recompute_hyper_connections
+            self.training
+            and self.config.enable_hyper_connections
+            and self.config.recompute_hyper_connections
         )
         mhc_manager = MHCBlockRecomputeManager() if use_mhc_recompute else None
         mhc_recompute_layer_num = self.config.mhc_recompute_layer_num
@@ -786,13 +786,12 @@ class TransformerBlock(GraphableMegatronModule, MegatronModule):
                     # A layer is last in recompute block if:
                     # 1. It's the final layer in the transformer block, OR
                     # 2. mhc_recompute_layer_num is set and (l_no + 1) % mhc_recompute_layer_num == 0
-                    is_last_in_transformer_block = (l_no == num_layers - 1)
+                    is_last_in_transformer_block = l_no == num_layers - 1
                     is_last_in_recompute_block = is_last_in_transformer_block
                     if use_mhc_recompute and mhc_recompute_layer_num is not None:
                         # l_no is 0-indexed, so (l_no + 1) gives the 1-indexed layer number
-                        is_last_in_recompute_block = (
-                            is_last_in_transformer_block or
-                            ((l_no + 1) % mhc_recompute_layer_num == 0)
+                        is_last_in_recompute_block = is_last_in_transformer_block or (
+                            (l_no + 1) % mhc_recompute_layer_num == 0
                         )
 
                     with self.offload_context, inner_quantization_context:
@@ -817,9 +816,9 @@ class TransformerBlock(GraphableMegatronModule, MegatronModule):
                     # Create new manager for next recompute block if current block ended
                     # (but not if this is the final layer in transformer block)
                     if (
-                        use_mhc_recompute and
-                        is_last_in_recompute_block and
-                        not is_last_in_transformer_block
+                        use_mhc_recompute
+                        and is_last_in_recompute_block
+                        and not is_last_in_transformer_block
                     ):
                         mhc_manager = MHCBlockRecomputeManager()
 

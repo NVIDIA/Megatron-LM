@@ -91,7 +91,7 @@ class TestHyperConnectionCheckpoint:
         aggregated_ckpt, h_res_ckpt, h_post_ckpt = module._forward_with_checkpoint(
             hidden_states_ckpt, residual_ckpt, manager
         )
-        mixed_ckpt = module.apply_h_res(h_res_ckpt, residual_ckpt)  
+        mixed_ckpt = module.apply_h_res(h_res_ckpt, residual_ckpt)
         # Calculate loss before discarding outputs
         loss_ckpt = aggregated_ckpt.sum() + mixed_ckpt.sum() + h_post_ckpt.sum()
 
@@ -303,12 +303,12 @@ class TestMHCBlockRecomputeIntegration:
         grad_residual_ckpt = residual_ckpt.grad.clone()
 
         # Verify gradients
-        assert torch.allclose(grad_hidden_ckpt, grad_hidden_ref, atol=1e-4), (
-            f"Chained HyperConnection hidden gradients mismatch"
-        )
-        assert torch.allclose(grad_residual_ckpt, grad_residual_ref, atol=1e-4), (
-            f"Chained HyperConnection residual gradients mismatch"
-        )
+        assert torch.allclose(
+            grad_hidden_ckpt, grad_hidden_ref, atol=1e-4
+        ), f"Chained HyperConnection hidden gradients mismatch"
+        assert torch.allclose(
+            grad_residual_ckpt, grad_residual_ref, atol=1e-4
+        ), f"Chained HyperConnection residual gradients mismatch"
 
     def test_partial_checkpoint_last_layer_not_checkpointed(self):
         """
@@ -350,8 +350,12 @@ class TestMHCBlockRecomputeIntegration:
         aggregated_ref, h_res_ref, h_post_ref = module.forward(
             hidden_states_ref, residual_ref, mhc_recompute_manager=None
         )
-        aggregated_ref, _ = module.apply_h_post((0.1 * aggregated_ref, None), h_post_ref, manager=None)
-        mixed_ref = module.apply_h_res(h_res_ref, residual_ref)  # Apply h_res to get mixed [s, b, n*C]
+        aggregated_ref, _ = module.apply_h_post(
+            (0.1 * aggregated_ref, None), h_post_ref, manager=None
+        )
+        mixed_ref = module.apply_h_res(
+            h_res_ref, residual_ref
+        )  # Apply h_res to get mixed [s, b, n*C]
         # Simulate BDA that is NOT checkpointed (last layer)
         output_ref = aggregated_ref + 0.5 * mixed_ref
         loss_ref = output_ref.sum()
@@ -366,8 +370,12 @@ class TestMHCBlockRecomputeIntegration:
             hidden_states_ckpt, residual_ckpt, mhc_recompute_manager=manager
         )
 
-        aggregated_ckpt, _ = module.apply_h_post((0.1 * aggregated_ckpt, None), h_post_ckpt, manager=manager)
-        mixed_ckpt = module.apply_h_res(h_res_ckpt, residual_ckpt)  # Apply h_res to get mixed [s, b, n*C]
+        aggregated_ckpt, _ = module.apply_h_post(
+            (0.1 * aggregated_ckpt, None), h_post_ckpt, manager=manager
+        )
+        mixed_ckpt = module.apply_h_res(
+            h_res_ckpt, residual_ckpt
+        )  # Apply h_res to get mixed [s, b, n*C]
         # Simulate BDA that is NOT checkpointed (last layer) - this is the hook_tensor
         output_ckpt = aggregated_ckpt + 0.5 * mixed_ckpt
 
@@ -445,6 +453,7 @@ class TestCheckpointWithoutOutputManager:
         """
         Test that CheckpointWithoutOutput without manager maintains original behavior.
         """
+
         def simple_func(x):
             return x * 2
 
@@ -484,11 +493,7 @@ class TestTransformerConfigRecomputeHyperConnections:
 
     def test_config_default_value(self):
         """Test that recompute_hyper_connections defaults to False."""
-        config = TransformerConfig(
-            num_layers=2,
-            hidden_size=64,
-            num_attention_heads=4,
-        )
+        config = TransformerConfig(num_layers=2, hidden_size=64, num_attention_heads=4)
         assert config.recompute_hyper_connections is False
 
     def test_config_enable_recompute_hyper_connections(self):

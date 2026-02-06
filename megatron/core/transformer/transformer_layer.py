@@ -299,14 +299,16 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
 
         if config.enable_hyper_connections:
             # [Module 1.5: Self Attention Hyper Connection]
-            
+
             self.self_attention_hyper_connection = build_module(
                 submodules.self_attention_hyper_connection,
                 config=self.config,
                 layer_number=self.layer_number,
             )
-            # Todo: Implement the hyper connection placeholder to remove following checks. 
-            self.do_self_attention_hyper_connection = submodules.self_attention_hyper_connection is not IdentityOp
+            # Todo: Implement the hyper connection placeholder to remove following checks.
+            self.do_self_attention_hyper_connection = (
+                submodules.self_attention_hyper_connection is not IdentityOp
+            )
 
             # [Module 4.5: Cross Attention Hyper Connection]
             self.cross_attention_hyper_connection = build_module(
@@ -314,13 +316,13 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
                 config=self.config,
                 layer_number=self.layer_number,
             )
-            self.do_cross_attention_hyper_connection = submodules.cross_attention_hyper_connection is not IdentityOp
+            self.do_cross_attention_hyper_connection = (
+                submodules.cross_attention_hyper_connection is not IdentityOp
+            )
 
             # [Module 7.5: MLP Hyper Connection]
             self.mlp_hyper_connection = build_module(
-                submodules.mlp_hyper_connection,
-                config=self.config,
-                layer_number=self.layer_number,
+                submodules.mlp_hyper_connection, config=self.config, layer_number=self.layer_number
             )
             self.do_mlp_hyper_connection = submodules.mlp_hyper_connection is not IdentityOp
 
@@ -539,7 +541,7 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
 
         This method calls the core computation of a transformer layer, including
         self-attention, cross-attention (if applicable), and feed-forward operations.
-        
+
         Additional kwargs for MHC recompute:
             mhc_recompute_manager: Optional MHCBlockRecomputeManager for checkpoint management.
             is_last_layer_in_recompute_block: If True, this layer is the last in its MHC recompute block.
@@ -549,15 +551,13 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
         # this is only used to uniquely identify decode and non-decode cuda graph
         # runners in the cuda graph manager
         kwargs.pop("dynamic_inference_decode_only", None)
-        
+
         # Extract MHC recompute parameters
         mhc_recompute_manager = kwargs.pop("mhc_recompute_manager", None)
         is_last_layer_in_recompute_block = kwargs.pop("is_last_layer_in_recompute_block", False)
-        
+
         hidden_states, context = self._forward_attention(
-            *args, 
-            mhc_recompute_manager=mhc_recompute_manager,
-            **kwargs
+            *args, mhc_recompute_manager=mhc_recompute_manager, **kwargs
         )
 
         output = self._forward_mlp(
@@ -621,7 +621,6 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
 
         inference_context = deprecate_inference_params(inference_context, inference_params)
 
-
         # Residual connection.
         residual = hidden_states
 
@@ -630,8 +629,10 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
             nvtx_range_push(suffix="self_attention_hyper_connection")
             # hidden_states: [s, b, n * C] -> [s, b, C]
             # self_attn_h_res: [s, b, n, n] - residual mixing matrix (for fused kernel)
-            hidden_states, self_attn_h_res, self_attn_hc_h_post = self.self_attention_hyper_connection(
-                hidden_states, residual, mhc_recompute_manager=mhc_recompute_manager
+            hidden_states, self_attn_h_res, self_attn_hc_h_post = (
+                self.self_attention_hyper_connection(
+                    hidden_states, residual, mhc_recompute_manager=mhc_recompute_manager
+                )
             )
             nvtx_range_pop(suffix="self_attention_hyper_connection")
         # Optional Input Layer norm
@@ -703,16 +704,16 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
             # TODO: could we move `bias_dropout_add_exec_handler` itself
             # inside the module provided in the `bias_dropout_add_spec` module?
             if using_fused_tp_inference_kernel:
-            # In inference optimized transformer layer, there is no bias and dropout
-            # The remaining residual add is already handled inside the
-            # self attention module.
+                # In inference optimized transformer layer, there is no bias and dropout
+                # The remaining residual add is already handled inside the
+                # self attention module.
                 hidden_states = attention_output_with_bias[0]
             else:
                 nvtx_range_push(suffix="self_attn_bda")
                 with self.bias_dropout_add_exec_handler():
-                        hidden_states = self.self_attn_bda(
-                            self.training, self.config.bias_dropout_fusion, mhc_recompute_manager
-                        )(attention_output_with_bias, residual, self.hidden_dropout)
+                    hidden_states = self.self_attn_bda(
+                        self.training, self.config.bias_dropout_fusion, mhc_recompute_manager
+                    )(attention_output_with_bias, residual, self.hidden_dropout)
                 nvtx_range_pop(suffix="self_attn_bda")
 
         # Delay the offload of the attention norm until after the self_attn_bda has been computed
@@ -729,8 +730,10 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
             nvtx_range_push(suffix="cross_attention_hyper_connection")
             # hidden_states: [s, b, n * C] -> [s, b, C]
             # cross_attn_h_res: [s, b, n, n] - residual mixing matrix (for fused kernel)
-            hidden_states, cross_attn_h_res, cross_attn_hc_h_post = self.cross_attention_hyper_connection(
-                hidden_states, residual, mhc_recompute_manager=mhc_recompute_manager
+            hidden_states, cross_attn_h_res, cross_attn_hc_h_post = (
+                self.cross_attention_hyper_connection(
+                    hidden_states, residual, mhc_recompute_manager=mhc_recompute_manager
+                )
             )
             nvtx_range_pop(suffix="cross_attention_hyper_connection")
 
@@ -772,7 +775,6 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
                 )(attention_output_with_bias, residual, self.hidden_dropout)
 
         return hidden_states, context
-
 
     def _forward_pre_mlp_layernorm(self, hidden_states):
         from megatron.core.pipeline_parallel.fine_grained_activation_offload import (
@@ -818,10 +820,10 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
             output (Tensor): Transformed hidden states of shape [s, b, h].
         """
 
-
         from megatron.core.pipeline_parallel.fine_grained_activation_offload import (
             FineGrainedActivationOffloadingInterface as off_interface,
         )
+
         # Residual connection.
         residual = hidden_states
 
@@ -956,7 +958,10 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
                 )
             else:
                 return self._forward_post_mlp(
-                    mlp_output_with_bias, residual, mhc_recompute_manager, is_last_layer_in_recompute_block
+                    mlp_output_with_bias,
+                    residual,
+                    mhc_recompute_manager,
+                    is_last_layer_in_recompute_block,
                 )
 
     def _forward_post_mlp(
@@ -1003,17 +1008,19 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
             # MLP module.
             hidden_states = mlp_output_with_bias[0]
         else:
-        # Delay the offload of the mlp norm until after the mlp_bda has been computed
-        # because the residual is needed in the mlp_bda.
+            # Delay the offload of the mlp norm until after the mlp_bda has been computed
+            # because the residual is needed in the mlp_bda.
             with self.bias_dropout_add_exec_handler():
                 # MLP BDA: checkpoint only if NOT the last layer in recompute block
                 # Last layer's MLP BDA output serves as hook_tensor for unified recompute
-                mlp_bda_manager = mhc_recompute_manager if not is_last_layer_in_recompute_block else None
+                mlp_bda_manager = (
+                    mhc_recompute_manager if not is_last_layer_in_recompute_block else None
+                )
                 hidden_states = self.mlp_bda(
                     self.training, self.config.bias_dropout_fusion, mlp_bda_manager
                 )(mlp_output_with_bias, residual, self.hidden_dropout)
         nvtx_range_pop(suffix="mlp_bda")
-        
+
         # If this is the last layer in the recompute block, register unified recompute hook
         # The MLP BDA output serves as the hook_tensor that triggers recomputation during backward
         if mhc_recompute_manager is not None and is_last_layer_in_recompute_block:
@@ -1046,7 +1053,7 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
     ):
         """
         Perform operations after the MLP computation with fused hyper connection kernel.
-        
+
         This method uses the fused kernel combining apply_h_res, apply_h_post and bias-dropout-add.
 
         Args:
@@ -1083,7 +1090,7 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
                 fused_manager,
             )
         nvtx_range_pop(suffix="mlp_fused_h_res_h_post_bda")
-        
+
         # If this is the last layer in the recompute block, register unified recompute hook
         # The MLP BDA output serves as the hook_tensor that triggers recomputation during backward
         if mhc_recompute_manager is not None and is_last_layer_in_recompute_block:

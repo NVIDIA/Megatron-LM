@@ -2098,10 +2098,10 @@ def get_tensor_shapes(
     """
     Determine right tensor sizes (based on position of rank with respect to split rank) and
     model size.
-    
+
     For hyper connections (mHC), intermediate pipeline stages communicate n-stream tensors
     with dimension hidden_size * num_residual_streams.
-    
+
     Args:
         is_recv: If True, compute shape for receiving; if False, for sending.
                  This matters for hyper connections where first/last stages have different
@@ -2131,7 +2131,7 @@ def get_tensor_shapes(
         elif not is_recv and pp_rank < pp_size - 1:
             # Sending to next stage (send n*C)
             use_nstream = True
-        
+
         if use_nstream:
             hidden_dim = config.hidden_size * config.num_residual_streams
 

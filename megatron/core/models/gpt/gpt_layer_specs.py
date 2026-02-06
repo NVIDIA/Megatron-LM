@@ -705,7 +705,7 @@ def get_gpt_mtp_block_spec_for_backend(
     else:
         raise ValueError(f"Invalid spec: {spec}")
 
-    # TODO: support hyper connections for mtp. 
+    # TODO: support hyper connections for mtp.
     # Remove all hyper connections in transformer_layer_spec
     transformer_layer_spec.submodules.self_attention_hyper_connection = IdentityOp
     transformer_layer_spec.submodules.cross_attention_hyper_connection = IdentityOp

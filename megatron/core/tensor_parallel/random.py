@@ -580,7 +580,7 @@ class CheckpointWithoutOutputFunction(torch.autograd.Function):
     """
     Checkpoint Function Helper for CheckpointWithouOutput.
     Save context for recompute.
-    
+
     Handles both tensor and non-tensor arguments:
     - Tensor arguments are saved via save_for_backward
     - Non-tensor arguments (int, float, bool, None, etc.) are stored separately
@@ -602,13 +602,13 @@ class CheckpointWithoutOutputFunction(torch.autograd.Function):
 
         with torch.no_grad(), fwd_ctx:
             outputs = run_function(*args)
-        
+
         # Separate tensor and non-tensor arguments
         # save_for_backward can only save tensors, so we need to handle non-tensors separately
         tensor_args = []
         non_tensor_indices = []
         non_tensor_values = []
-        
+
         for i, arg in enumerate(args):
             if isinstance(arg, torch.Tensor):
                 tensor_args.append(arg)
@@ -616,15 +616,15 @@ class CheckpointWithoutOutputFunction(torch.autograd.Function):
                 # Store non-tensor argument's index and value
                 non_tensor_indices.append(i)
                 non_tensor_values.append(arg)
-        
+
         # Save tensor arguments via save_for_backward
         ctx.save_for_backward(*detach_variable(tuple(tensor_args)))
-        
+
         # Store non-tensor metadata in ctx attributes (not via save_for_backward)
         ctx.non_tensor_indices = non_tensor_indices
         ctx.non_tensor_values = non_tensor_values
         ctx.total_args_count = len(args)
-        
+
         # the CheckpointWithoutOutput object is passed in, then it can access the saved input
         # tensors later for recomputation
         checkpoint_without_output_obj.ctx = ctx
@@ -858,19 +858,22 @@ class CheckpointWithoutOutput(object):
                 return t
 
             tensor_inputs = tuple(detach(t) for t in tensor_inputs)
-            
+
             # Reconstruct full args list by merging tensor and non-tensor arguments
             # Non-tensor args are stored in ctx.non_tensor_indices and ctx.non_tensor_values
             total_args_count = self.ctx.total_args_count
             non_tensor_indices = self.ctx.non_tensor_indices
             non_tensor_values = self.ctx.non_tensor_values
-            
+
             # Build full inputs list
             inputs = [None] * total_args_count
             tensor_idx = 0
             non_tensor_idx = 0
             for i in range(total_args_count):
-                if non_tensor_idx < len(non_tensor_indices) and non_tensor_indices[non_tensor_idx] == i:
+                if (
+                    non_tensor_idx < len(non_tensor_indices)
+                    and non_tensor_indices[non_tensor_idx] == i
+                ):
                     # This position is a non-tensor argument
                     inputs[i] = non_tensor_values[non_tensor_idx]
                     non_tensor_idx += 1
@@ -878,7 +881,7 @@ class CheckpointWithoutOutput(object):
                     # This position is a tensor argument
                     inputs[i] = tensor_inputs[tensor_idx]
                     tensor_idx += 1
-            
+
             inputs = tuple(inputs)
             with torch.enable_grad(), fp8_ctx, recompute_ctx:
                 outputs = self.run_function(*inputs)

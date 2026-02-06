@@ -377,9 +377,11 @@ class TestTransformerLayerWithHyperConnectionRecompute:
         )
 
         # Verify output shape
-        assert output.shape == (seq_len, batch_size, n_channels), (
-            f"Expected output shape {(seq_len, batch_size, n_channels)}, got {output.shape}"
-        )
+        assert output.shape == (
+            seq_len,
+            batch_size,
+            n_channels,
+        ), f"Expected output shape {(seq_len, batch_size, n_channels)}, got {output.shape}"
 
         # Unified recompute hook is automatically registered inside layer when
         # is_last_layer_in_recompute_block=True, no need to call manually
@@ -452,7 +454,8 @@ class TestTransformerLayerWithHyperConnectionRecompute:
 
         assert torch.allclose(output_ckpt, output_ref, atol=1e-4, rtol=1e-4), (
             f"Output mismatch between recompute and non-recompute paths.\n"
-            f"Max diff: {(grad_ckpt - grad_ref).abs().max()}")
+            f"Max diff: {(grad_ckpt - grad_ref).abs().max()}"
+        )
         # Verify gradients match
         assert torch.allclose(grad_ckpt, grad_ref, atol=1e-4, rtol=1e-4), (
             f"Gradients mismatch between recompute and non-recompute paths.\n"
@@ -547,7 +550,7 @@ class TestTransformerLayerWithHyperConnectionRecompute:
         # Forward through all layers
         h = hidden_states
         for i, layer in enumerate(layers):
-            is_last = (i == num_layers - 1)
+            is_last = i == num_layers - 1
             h, _ = layer(
                 hidden_states=h,
                 attention_mask=attention_mask,

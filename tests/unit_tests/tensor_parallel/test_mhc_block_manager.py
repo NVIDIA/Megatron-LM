@@ -206,9 +206,7 @@ def test_mhc_block_recompute_manager():
 
     # Verify gradients match
     assert torch.allclose(grad_ckpt, grad_ref, atol=1e-6), (
-        f"Gradients mismatch!\n"
-        f"With manager: {grad_ckpt}\n"
-        f"Reference: {grad_ref}"
+        f"Gradients mismatch!\n" f"With manager: {grad_ckpt}\n" f"Reference: {grad_ref}"
     )
 
     # ========== Test 2: With randomness (dropout-like behavior) ==========
@@ -248,7 +246,6 @@ def test_mhc_block_recompute_manager():
     loss_ckpt2.backward()
     grad_ckpt2 = input_ckpt2.grad.clone()
 
-
     # Gradients should match because RNG state is restored during recompute
     assert torch.allclose(grad_ckpt2, grad_ref2, atol=1e-6), (
         f"Gradients with dropout mismatch!\n"
@@ -287,7 +284,9 @@ def test_mhc_block_recompute_manager_with_multiple_outputs():
     # With manager using ckpt_manager parameter
     manager = MHCBlockRecomputeManager()
 
-    y1a, y1b = CheckpointWithoutOutput(ckpt_manager=manager).checkpoint(func_multi_output, input_ckpt)
+    y1a, y1b = CheckpointWithoutOutput(ckpt_manager=manager).checkpoint(
+        func_multi_output, input_ckpt
+    )
     y2 = CheckpointWithoutOutput(ckpt_manager=manager).checkpoint(func_combine, y1a, y1b)
 
     loss_ckpt = y2.sum()
@@ -397,8 +396,8 @@ def test_mhc_block_recompute_manager_partial_checkpoint():
 
     # a --[f]--> b --[g]--> c --[h]--> d
     b_ref = func_f(input_ref)  # a = input_ref, b = f(a)
-    c_ref = func_g(b_ref)      # c = g(b)
-    d_ref = func_h(c_ref)      # d = h(c)
+    c_ref = func_g(b_ref)  # c = g(b)
+    d_ref = func_h(c_ref)  # d = h(c)
     loss_ref = d_ref.sum()
     loss_ref.backward()
     grad_ref = input_ref.grad.clone()
@@ -532,9 +531,7 @@ def test_mhc_block_recompute_manager_partial_checkpoint_with_tuple_output():
     )
 
     # Step 5: apply_h_post is checkpointed
-    output = CheckpointWithoutOutput(ckpt_manager=manager).checkpoint(
-        apply_h_post, y, h_post
-    )
+    output = CheckpointWithoutOutput(ckpt_manager=manager).checkpoint(apply_h_post, y, h_post)
 
     # Step 6: Final output
     final = output + mixed
@@ -561,9 +558,7 @@ def test_mhc_block_recompute_manager_partial_checkpoint_with_tuple_output():
 
     # Verify gradients match
     assert torch.allclose(grad_x_ckpt, grad_x_ref, atol=1e-6), (
-        f"Gradients for x mismatch!\n"
-        f"With manager: {grad_x_ckpt}\n"
-        f"Reference: {grad_x_ref}"
+        f"Gradients for x mismatch!\n" f"With manager: {grad_x_ckpt}\n" f"Reference: {grad_x_ref}"
     )
     assert torch.allclose(grad_residual_ckpt, grad_residual_ref, atol=1e-6), (
         f"Gradients for residual mismatch!\n"
