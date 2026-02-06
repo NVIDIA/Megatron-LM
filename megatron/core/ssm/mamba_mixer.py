@@ -706,9 +706,7 @@ class MambaMixer(MegatronModule):
             )
 
         if self.offload_ssm:
-            y = off_interface.group_commit(
-                y, name="mamba_ssm", forced_released_tensors=[]
-            )
+            y = off_interface.group_commit(y, name="mamba_ssm", forced_released_tensors=[])
 
         y = rearrange(y, "b l d -> l b d").contiguous()
         y = self.cp.post_conv_ssm(y, packed_seq_params)

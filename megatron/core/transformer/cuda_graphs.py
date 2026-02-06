@@ -682,14 +682,9 @@ class _CudagraphReplayNode(torch.autograd.Function):
                 if not cudagraph_input.can_skip_replay_copy:
                     cudagraph_input.copy_(user_input)
                     need_copy_inputs.append(user_input)
-            else:
-                assert user_input.data_ptr() == cudagraph_input.data_ptr(), (
-                    f"Static CUDA graph input tensor changed memory address between graph",
-                    f"capture and replay. Expected data_ptr={cudagraph_input.data_ptr()}, "
-                    f"got data_ptr={user_input.data_ptr()}. Static inputs must maintain ",
-                    f"the same memory address across replays. Consider marking this input as ",
-                    f"copyable during graph capture.",
-                )
+            elif user_input.data_ptr() != cudagraph_input.data_ptr():
+                cudagraph_input.copy_(user_input)
+                need_copy_inputs.append(user_input)
 
         ctx.runner = runner
         ctx.save_for_backward(*need_copy_inputs)
