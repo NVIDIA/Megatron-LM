@@ -1928,9 +1928,7 @@ def training_log(
     total_iterations = total_loss_dict[advanced_iters_key] + total_loss_dict[skipped_iters_key]
 
     # learning rate will be None on ranks without trainable params, so we must gather across mp ranks
-    print_rank_0(f'LEARNING RATE BEFORE CALLING reduce_max_stat_across_model_parallel_group: {learning_rate}')
     learning_rate = reduce_max_stat_across_model_parallel_group(learning_rate)
-    print_rank_0(f'LEARNING RATE AFTER CALLING reduce_max_stat_across_model_parallel_group: {learning_rate}')
     # Tensorboard values.
     if writer and (iteration % args.tensorboard_log_interval == 0):
         if wandb_writer:
@@ -2953,7 +2951,6 @@ def train(
                 continue
             if param_group['default_config']:
                 learning_rate = param_group['lr']
-        print_rank_0(f'LEARNING RATE BEFORE CALLING training_log: {learning_rate}')
         report_memory_flag = training_log(
             loss_dict,
             total_loss_dict,
