@@ -165,6 +165,13 @@ def add_inference_args(parser: ArgumentParser) -> ArgumentParser:
         "results of every `n` requests.",
     )
     group.add_argument(
+        "--output-request-events",
+        action='store_true',
+        default=False,
+        help="Include request events (lifecycle + per-token block allocator metrics) "
+        "in the JSON output.",
+    )
+    group.add_argument(
         "--prompt-file",
         help='Jsonl file containing input prompts, where each item (i.e., line) '
         'contains the field \'text\' where the value is the prompt. All other '

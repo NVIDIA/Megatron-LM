@@ -433,6 +433,8 @@ def main():
                             req, 'generated_log_probs', None
                         )
                         result_dict["logprobs"] = getattr(req, 'logprobs', None)
+                    if args.output_request_events:
+                        result_dict["events"] = [e.serialize() for e in req.events]
                     json_results[req.request_id] = result_dict
 
             # Track system-level throughput as a test / debug metric
