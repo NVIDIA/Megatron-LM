@@ -1133,7 +1133,7 @@ class TestDynamicInferenceEngine:
             num_tokens_total=200,
             context_max_tokens=52,
             context_max_requests=5,
-            context_block_size_tokens=16,
+            context_block_size_tokens=256,
             enable_chunked_prefill=True,
             use_cuda_graphs_for_non_decode_steps=False,
         )
