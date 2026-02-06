@@ -117,7 +117,7 @@ runs:
         export PYTHONPATH=$(pwd)
         export NEMORUN_HOME=$(pwd)
         export NCCL_DEBUG=INFO
-        pip install --no-cache-dir "uv!=0.9.29"
+        pip install --no-cache-dir "uv<0.9.29"
         uv venv .venv
         uv cache clean
         uv sync --no-cache --only-group test
@@ -199,7 +199,7 @@ runs:
 
         export PYTHONPATH=$(pwd)
         export NEMORUN_HOME=$(pwd)
-        pip install --no-cache-dir "uv!=0.9.29"
+        pip install --no-cache-dir "uv<0.9.29"
         uv venv .venv
         uv cache clean
         uv sync --no-cache --only-group test
