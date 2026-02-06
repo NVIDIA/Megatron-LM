@@ -9,6 +9,7 @@ from typing import Optional, Protocol, Union
 import torch
 
 from megatron.core import parallel_state, tensor_parallel, utils
+from megatron.core.cached_prefix_utils import CachedPrefixParams
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.transformer.module import MegatronModule
 from megatron.core.transformer.moe.moe_utils import (
@@ -239,13 +240,20 @@ class MoELayer(BaseMoELayer):
         self.cudagraph_tensor_store = MoECudaGraphTensorStore()
 
     @maybe_skip_or_early_return_by_cudagraph("route")
-    def route(self, hidden_states: torch.Tensor, padding_mask: Optional[torch.Tensor] = None):
+    def route(
+        self,
+        hidden_states: torch.Tensor,
+        padding_mask: Optional[torch.Tensor] = None,
+        cached_prefix_params: Optional[CachedPrefixParams] = None,
+    ):
         """Compute token routing for preprocessing.
 
         This method uses the router to determine which experts to send each token to,
         producing routing probabilities and a mapping.
         """
-        probs, routing_map = apply_module(self.router)(hidden_states, padding_mask=padding_mask)
+        probs, routing_map = apply_module(self.router)(
+            hidden_states, padding_mask=padding_mask, cached_prefix_params=cached_prefix_params
+        )
         return probs, routing_map
 
     @maybe_skip_or_early_return_by_cudagraph("preprocess")
@@ -339,14 +347,21 @@ class MoELayer(BaseMoELayer):
             output = output + shared_expert_output
         return output
 
-    def router_and_preprocess(self, hidden_states: torch.Tensor):
+    def router_and_preprocess(
+        self, hidden_states: torch.Tensor, cached_prefix_params: Optional[CachedPrefixParams] = None
+    ):
         """This method is a combined method of route and preprocess. Deprecated."""
 
-        probs, routing_map = self.route(hidden_states)
+        probs, routing_map = self.route(hidden_states, cached_prefix_params=cached_prefix_params)
         hidden_states, probs, residual = self.preprocess(hidden_states, probs, routing_map)
         return hidden_states, probs, residual
 
-    def forward(self, hidden_states: torch.Tensor, padding_mask: Optional[torch.Tensor] = None):
+    def forward(
+        self,
+        hidden_states: torch.Tensor,
+        padding_mask: Optional[torch.Tensor] = None,
+        cached_prefix_params: Optional[CachedPrefixParams] = None,
+    ):
         """Forward pass for the MoE layer.
 
         The forward pass comprises four main steps:
@@ -361,6 +376,7 @@ class MoELayer(BaseMoELayer):
                 used for correct auxiliary loss computation for packed sequence.
                 Shape = [bsz, seq_length]. True = padding (exclude), False = valid (include).
                 Defaults to None (all tokens are valid).
+            cached_prefix_params (CachedPrefixParams, optional): Cached prefix parameters.
 
         Returns:
             A tuple containing the output tensor and the MLP bias, if any.
@@ -379,7 +395,11 @@ class MoELayer(BaseMoELayer):
         def custom_forward(hidden_states, padding_mask=None):
             try:
                 shared_expert_output = self.shared_experts_compute(hidden_states)
-                probs, routing_map = self.route(hidden_states, padding_mask=padding_mask)
+                probs, routing_map = self.route(
+                    hidden_states,
+                    padding_mask=padding_mask,
+                    cached_prefix_params=cached_prefix_params,
+                )
                 hidden_states, probs = self.preprocess(hidden_states, probs, routing_map)
             except MoECudaGraphPartialCaptureSignal as e:
                 # This signal is raised from the maybe_skip_or_early_return_by_cudagraph decorator.

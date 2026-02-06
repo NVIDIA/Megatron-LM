@@ -25,8 +25,6 @@ class KVCachePool:
         """Push a block range onto the stack."""
 
         self.block_prefixes.append(suffix)
-        if tuple(self.block_prefixes) not in self.kv_cache_pool:
-            self.kv_cache_pool[tuple(self.block_prefixes)] = {}
 
     def block_range_pop(self, suffix: Optional[str] = None):
         """Pop a block range from the stack."""
@@ -41,18 +39,20 @@ class KVCachePool:
     def get_kv_cache(self, layer_idx: int, kv_cache_cls: Type[KVCache]) -> KVCache:
         """Get the KV cache for the given layer index."""
 
+        if tuple(self.block_prefixes) not in self.kv_cache_pool:
+            self.kv_cache_pool[tuple(self.block_prefixes)] = {}
+
         if layer_idx not in self.kv_cache_pool[tuple(self.block_prefixes)]:
             # Create a new KV cache for the given layer index.
-            self.kv_cache_pool[tuple(self.block_prefixes)][layer_idx] = kv_cache_cls(self.config)
-        else:
-            # Check if the KV cache is of the expected type.
-            assert isinstance(
-                self.kv_cache_pool[tuple(self.block_prefixes)][layer_idx], kv_cache_cls
-            ), (
-                f"Expected KV cache of type {kv_cache_cls}, "
-                f"but got {type(self.kv_cache_pool[tuple(self.block_prefixes)][layer_idx])}."
-            )
-        return self.kv_cache_pool[tuple(self.block_prefixes)][layer_idx]
+            self.kv_cache_pool[tuple(self.block_prefixes)][layer_idx] = []
+        pool_of_current_block_and_layer = self.kv_cache_pool[tuple(self.block_prefixes)][layer_idx]
+
+        found_exist = False
+        for kv_cache in pool_of_current_block_and_layer:
+            if isinstance(kv_cache, kv_cache_cls):
+                return kv_cache
+        pool_of_current_block_and_layer.append(kv_cache_cls(self.config))
+        return pool_of_current_block_and_layer[-1]
 
 
 @dataclass
@@ -65,6 +65,7 @@ class CachedPrefixParams:
         max_total_seqlen: Maximum total sequence length globally
         kv_cache_pool: KV cache pool of the current micro batch
         boundary_elements_for_mtp: Boundary elements for MTP rolling.
+        is_terminal: Whether the current chunk is the terminal chunk.
 
     Note: All seqlens here ignore the parallelism.
     For example, if we split a sequence of length 4096 into 4 evenly-sized chunks,
@@ -79,6 +80,7 @@ class CachedPrefixParams:
     max_total_seqlen: Optional[int]
     kv_cache_pool: KVCachePool
     boundary_elements_for_mtp: Optional[torch.Tensor]
+    is_terminal: bool
 
     def __hash__(self):
         return hash((tuple(self.prefix_seqlens), self.this_chunk_seqlen, self.max_total_seqlen))

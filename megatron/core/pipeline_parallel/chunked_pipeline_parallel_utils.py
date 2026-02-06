@@ -112,6 +112,7 @@ class ChunkedPipelineParallelDataIterator:
             max_total_seqlen=self.current_seq_length,
             kv_cache_pool=self.current_kv_cache_pool,
             boundary_elements_for_mtp=self.current_boundary_elements_for_mtp,
+            is_terminal=self.current_span_idx == self.chunked_pp_splits - 1,
         )
 
 

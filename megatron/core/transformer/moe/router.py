@@ -5,10 +5,12 @@ from typing import Optional, Union
 
 import torch
 
+from megatron.core.cached_prefix_utils import CachedPrefixParams
 from megatron.core.jit import jit_fuser
 from megatron.core.transformer.module import MegatronModule
 from megatron.core.transformer.moe.moe_utils import (
     MoEAuxLossAutoScaler,
+    MoERouterScoreCache,
     ProcessGroupCollection,
     apply_biased_logits,
     apply_random_logits,
@@ -546,7 +548,12 @@ class TopKRouter(Router):
                     routing_map = routing_map & (~padding_mask)
                 self.local_tokens_per_expert += routing_map.sum(dim=0)
 
-    def routing(self, logits: torch.Tensor, padding_mask: Optional[torch.Tensor] = None):
+    def routing(
+        self,
+        logits: torch.Tensor,
+        padding_mask: Optional[torch.Tensor] = None,
+        cached_prefix_params: Optional[CachedPrefixParams] = None,
+    ):
         """Top-k routing function
 
         Args:
@@ -554,6 +561,7 @@ class TopKRouter(Router):
             padding_mask (torch.Tensor, optional): Boolean mask indicating padding positions.
                                                    Shape = [seq_length, bsz]. True=padding(exclude),
                                                    False=valid(include). Defaults to None.
+            cached_prefix_params (CachedPrefixParams, optional): Cached prefix parameters.
 
         Returns:
             probs (torch.Tensor): The probabilities of token to experts assignment.
@@ -608,12 +616,26 @@ class TopKRouter(Router):
                 fused=self.config.moe_router_fusion,
                 padding_mask=padding_mask,
             )
-            probs = self._apply_aux_loss(
-                probs,
-                scores_for_aux_loss,
-                routing_map_for_aux_loss,
-                with_padding_mask=padding_mask is not None,
-            )
+            if cached_prefix_params is not None:
+                kv_cache = cached_prefix_params.kv_cache_pool.get_kv_cache(
+                    layer_idx=self.layer_number, kv_cache_cls=MoERouterScoreCache
+                )
+                probs = kv_cache.apply_aux_loss(
+                    router=self,
+                    cached_prefix_params=cached_prefix_params,
+                    probs=probs,
+                    scores_for_aux_loss=scores_for_aux_loss,
+                    routing_map_for_aux_loss=routing_map_for_aux_loss,
+                    with_padding_mask=padding_mask is not None,
+                )
+                # TODO(yuzhongw): only support aux_loss now. Add support for seq_aux_loss and global_aux_loss in the future.
+            else:
+                probs = self._apply_aux_loss(
+                    probs,
+                    scores_for_aux_loss,
+                    routing_map_for_aux_loss,
+                    with_padding_mask=padding_mask is not None,
+                )
             probs = self._apply_seq_aux_loss(
                 probs,
                 scores_for_aux_loss,
@@ -640,7 +662,12 @@ class TopKRouter(Router):
             self.global_tokens_per_expert.zero_()
             self.ga_steps.zero_()
 
-    def forward(self, input: torch.Tensor, padding_mask: Optional[torch.Tensor] = None):
+    def forward(
+        self,
+        input: torch.Tensor,
+        padding_mask: Optional[torch.Tensor] = None,
+        cached_prefix_params: Optional[CachedPrefixParams] = None,
+    ):
         """
         Forward pass of the router.
 
@@ -649,6 +676,7 @@ class TopKRouter(Router):
             padding_mask (torch.Tensor, optional): Boolean mask indicating padding positions.
                                                    Shape = [seq_length, bsz]. True=padding(exclude),
                                                    False=valid(include). Defaults to None.
+            cached_prefix_params (CachedPrefixParams, optional): Cached prefix parameters.
         """
         self._maintain_float32_expert_bias()
 
@@ -666,7 +694,9 @@ class TopKRouter(Router):
                 logits, self.config.moe_router_force_biased, self.layer_number
             )
 
-        probs, routing_map = self.routing(logits, padding_mask=padding_mask)
+        probs, routing_map = self.routing(
+            logits, padding_mask=padding_mask, cached_prefix_params=cached_prefix_params
+        )
 
         return probs, routing_map
 

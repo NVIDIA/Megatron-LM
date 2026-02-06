@@ -9,6 +9,7 @@ import torch
 from torch import Tensor
 
 from megatron.core import tensor_parallel
+from megatron.core.cached_prefix_utils import CachedPrefixParams
 from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.core.pipeline_parallel.fine_grained_activation_offload import (
     FineGrainedActivationOffloadingInterface as off_interface,
@@ -448,6 +449,7 @@ def build_transformer_layer_callables(layer: TransformerLayer):
                 rotary_pos_sin: Optional[Tensor] = None,
                 packed_seq_params: Optional[PackedSeqParams] = None,
                 sequence_len_offset: Optional[Tensor] = None,
+                cached_prefix_params: Optional[CachedPrefixParams] = None,
             ):
                 hidden_states, _ = layer._forward_attention(
                     hidden_states=hidden_states,
@@ -475,7 +477,9 @@ def build_transformer_layer_callables(layer: TransformerLayer):
                         pre_mlp_layernorm_output = layer.pre_mlp_layernorm(hidden_states)
 
                 shared_expert_output = layer.mlp.shared_experts_compute(pre_mlp_layernorm_output)
-                probs, routing_map = layer.mlp.route(pre_mlp_layernorm_output)
+                probs, routing_map = layer.mlp.route(
+                    pre_mlp_layernorm_output, cached_prefix_params=cached_prefix_params
+                )
                 local_tokens, probs = layer.mlp.preprocess(
                     pre_mlp_layernorm_output, probs, routing_map
                 )

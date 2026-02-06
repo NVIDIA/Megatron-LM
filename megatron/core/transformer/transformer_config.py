@@ -90,6 +90,13 @@ class TransformerConfig(ModelParallelConfig):
     chunked_pipeline_model_parallel_splits: int = 1
     """Number of chunked pipeline model parallel splits."""
 
+    moe_load_balancing_loss_mode_for_chunked_sequence: str = "reduce"
+    """
+    Mode for applying load balancing loss for chunked sequence in MoE layer.
+    "all_gather": all-gather chunks before applying load balancing loss.
+    "reduce": reduce the loss across chunks.
+    """
+
     account_for_embedding_in_pipeline_split: bool = False
     """If set, the embedding layer will be treated as a standard transformer
     layer in the context of partition and placement for pipeline parallelism."""
@@ -1200,6 +1207,12 @@ class TransformerConfig(ModelParallelConfig):
                 assert not invalid_modules, (
                     f"Invalid choices for recompute_modules: {invalid_modules}. "
                     f"Allowed modules are: {allowed_modules}"
+                )
+
+            if "moe" in self.recompute_modules:
+                assert self.moe_load_balancing_loss_mode_for_chunked_sequence == "reduce", (
+                    f"moe recompute only supports load balancing loss mode 'reduce' for chunked "
+                    f"sequence, but got {self.moe_load_balancing_loss_mode_for_chunked_sequence}."
                 )
 
             if "moe_act" in self.recompute_modules and not self.moe_grouped_gemm:

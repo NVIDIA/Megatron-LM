@@ -2814,6 +2814,11 @@ def _add_distributed_args(parser):
                        help='Degree of pipeline model parallelism.')
     group.add_argument('--chunked-pipeline-model-parallel-splits', type=int, default=1,
                        help='Number of splits in chunked pipeline model parallel.')
+    group.add_argument('--moe-load-balancing-loss-mode-for-chunked-sequence', type=str, 
+                       default="reduce",choices=["all_gather", "reduce"],
+                       help='Mode for applying load balancing loss for chunked sequence in MoE layer.'
+                       'all_gather: all-gather chunks before applying load balancing loss.'
+                       'reduce: reduce the loss across chunks.')
     group.add_argument('--decoder-first-pipeline-num-layers',
                        type=int, default=None,
                        help=('The number of transformer layers on the first pipeline stage of the decoder. '

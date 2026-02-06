@@ -495,6 +495,7 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
             hidden_states,
             kwargs.get("inference_context", None),
             padding_mask=kwargs.get("padding_mask", None),
+            cached_prefix_params=kwargs.get("cached_prefix_params", None),
         )
         return output, context
 
@@ -645,7 +646,9 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
 
         return hidden_states, context
 
-    def _forward_mlp(self, hidden_states, inference_context=None, padding_mask=None):
+    def _forward_mlp(
+        self, hidden_states, inference_context=None, padding_mask=None, cached_prefix_params=None
+    ):
         """
         Perform a forward pass through the feed-forward layer.
 
@@ -657,6 +660,7 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
                 Shape [bsz, seq_length]. True = padding (exclude), False = valid (include).
                 Only used for MoE layers to exclude padding tokens from aux loss computations.
                 The MoELayer will internally transform this to [seq_length, bsz] format.
+            cached_prefix_params (CachedPrefixParams, optional): Cached prefix parameters.
 
         Returns:
             output (Tensor): Transformed hidden states of shape [s, b, h].
@@ -706,14 +710,19 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
                     self.pg_collection.tp,
                     pre_mlp_layernorm_output,
                     padding_mask=padding_mask,
+                    cached_prefix_params=cached_prefix_params,
                 )
             else:
                 mlp_output_with_bias = tensor_parallel.checkpoint(
                     functools.partial(self.mlp, padding_mask=padding_mask),
                     False,
                     pre_mlp_layernorm_output,
+                    cached_prefix_params=cached_prefix_params,
                 )
         elif should_chunk_mlp_for_prefill:
+            assert (
+                cached_prefix_params is None
+            ), "Cached prefix parameters are not supported for chunk MLP for prefill."
             # Chunk input along sequence dimension
             num_chunks = min(self.config.mlp_chunks_for_prefill, pre_mlp_layernorm_output.shape[0])
             chunks = pre_mlp_layernorm_output.chunk(num_chunks, dim=0)
@@ -731,7 +740,11 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
                 # Set the residual for fused reduce-scatter + add + layer-norm + all-gather
                 # operation in MLP's fc2.
                 self._set_fc2_residual(residual)
-            mlp_output_with_bias = self.mlp(pre_mlp_layernorm_output, padding_mask=padding_mask)
+            mlp_output_with_bias = self.mlp(
+                pre_mlp_layernorm_output,
+                padding_mask=padding_mask,
+                cached_prefix_params=cached_prefix_params,
+            )
 
         if self.recompute_pre_mlp_layernorm:
             # discard the output of the pre-mlp layernorm and register the recompute
