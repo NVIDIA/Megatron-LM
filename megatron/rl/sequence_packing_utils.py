@@ -1167,3 +1167,61 @@ def get_sequence_packing_tensorboard_metrics(args):
         metrics['bin-batch-size'] = bin_batch_size
         metrics['consumed-bins'] = args.consumed_train_bins
     return metrics
+
+
+def get_packing_actual_tokens(packing_context: PackingContext) -> int:
+    """Get the actual number of tokens (non-padding) in the packed sequences for this rank.
+    
+    Args:
+        packing_context: The PackingContext containing packing information.
+        
+    Returns:
+        Total number of actual tokens across all bins on this rank.
+    """
+    if packing_context is None or packing_context.packing_info is None:
+        return 0
+    
+    packing_info = packing_context.packing_info
+    my_bin_seq_indices = packing_info.bin_seq_indices
+    
+    # Sum the actual sequence lengths for all sequences in bins assigned to this rank
+    actual_tokens = sum(
+        packing_info.seq_lengths[idx]
+        for indices in my_bin_seq_indices
+        for idx in indices
+    )
+    return actual_tokens
+
+
+def get_packing_compute_tokens(packing_context: PackingContext) -> int:
+    """Get the total compute tokens (including padding) for packed sequences on this rank.
+    
+    Args:
+        packing_context: The PackingContext containing packing information.
+        
+    Returns:
+        Total compute tokens (num_bins * bin_size) on this rank.
+    """
+    if packing_context is None or packing_context.packed_trajs is None:
+        return 0
+    
+    packed_trajs = packing_context.packed_trajs
+    return packed_trajs.shape[0] * packed_trajs.shape[1]
+
+
+def get_packing_efficiency(packing_context: PackingContext) -> float:
+    """Get the packing efficiency (actual_tokens / compute_tokens) for this rank.
+    
+    Args:
+        packing_context: The PackingContext containing packing information.
+        
+    Returns:
+        Packing efficiency as a float between 0 and 1.
+    """
+    actual_tokens = get_packing_actual_tokens(packing_context)
+    compute_tokens = get_packing_compute_tokens(packing_context)
+    
+    if compute_tokens == 0:
+        return 0.0
+    
+    return actual_tokens / compute_tokens

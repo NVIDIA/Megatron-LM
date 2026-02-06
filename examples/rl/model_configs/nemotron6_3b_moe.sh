@@ -56,7 +56,7 @@ ENV_DEPENDENT="\
 
 MODEL_OPTIONS="\
   --rl-skip-bos-token \
-  --no-rl-use-sequence-packing \
+  --rl-use-sequence-packing \
   --rl-partial-rollouts \
   --rl-offload-optimizer-during-inference \
   --moe-pad-experts-for-cuda-graph-inference \
