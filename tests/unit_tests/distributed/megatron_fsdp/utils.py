@@ -53,7 +53,7 @@ def make_gpt_mock_data_iterator(
 def make_moe_args_model_and_optimizer(ut_filename, **overrides):
     sys.argv = [ut_filename]
     base_args = dict(
-        num_layers=4,
+        num_layers=6,
         mtp_num_layers=1,
         hidden_size=128,
         num_attention_heads=2,
@@ -67,7 +67,7 @@ def make_moe_args_model_and_optimizer(ut_filename, **overrides):
         attention_dropout=0.0,
         num_experts=4,
         moe_shared_expert_intermediate_size=256,
-        moe_layer_freq=[0, 0, 1, 1],
+        moe_layer_freq=[0, 0, 1, 1, 1, 1],
         moe_permute_fusion=True,
         moe_router_fusion=True,
         moe_router_topk=2,

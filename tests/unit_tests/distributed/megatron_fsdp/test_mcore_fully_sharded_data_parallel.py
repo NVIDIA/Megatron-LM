@@ -97,7 +97,9 @@ class TestFullyShardedDataParallel:
         if not is_torch_min_version("2.4.0"):
             pytest.skip("Megatron FSDP requires torch >= 2.4.0")
         if dp_size > torch.cuda.device_count():
-            pytest.skip(f"Test requires {dp_size} GPUs, but only {torch.cuda.device_count()} are available")
+            pytest.skip(
+                f"Test requires {dp_size} GPUs, but only {torch.cuda.device_count()} are available"
+            )
 
         # Initialize torch.distributed if not already initialized
         if not torch.distributed.is_initialized():
@@ -243,7 +245,9 @@ class TestFullyShardedDataParallel:
         if not is_torch_min_version("2.4.0"):
             pytest.skip("Megatron FSDP requires torch >= 2.4.0")
         if dp_size > torch.cuda.device_count():
-            pytest.skip(f"Test requires {dp_size} GPUs, but only {torch.cuda.device_count()} are available")
+            pytest.skip(
+                f"Test requires {dp_size} GPUs, but only {torch.cuda.device_count()} are available"
+            )
 
         # Skip nccl_ub=True cases if PyTorch version is less than 2.7.0
         if nccl_ub and version.parse(torch.__version__) < version.parse('2.7.0'):
@@ -640,59 +644,82 @@ class TestMegatronFSDPE2E:
         ],
     )
     @pytest.mark.parametrize(
-        ("fsdp_sharding_strategy", "use_double_buffer", "mixed_precision_config"),
+        "spec_configs",
         [
-            pytest.param("optim_grads_params", False, {}, id="optim_grads_params_no_double_buffer"),
-            pytest.param("optim_grads_params", True, {}, id="optim_grads_params_double_buffer"),
             pytest.param(
-                "optim_grads_params",
-                True,
-                {"fp8_recipe": "mxfp8", "fp8": "e4m3", "fp8_param_gather": True, "bf16": True},
+                dict(
+                    data_parallel_sharding_strategy="optim_grads_params", fsdp_double_buffer=False
+                ),
+                id="optim_grads_params_no_double_buffer",
+            ),
+            pytest.param(
+                dict(
+                    data_parallel_sharding_strategy="optim_grads_params",
+                    fsdp_double_buffer=True,
+                    recompute_granularity="full",
+                    recompute_method="uniform",
+                    recompute_num_layers=1,
+                ),
+                id="optim_grads_params_double_buffer",
+            ),
+            pytest.param(
+                dict(
+                    data_parallel_sharding_strategy="optim_grads_params",
+                    fsdp_double_buffer=True,
+                    fp8_recipe="mxfp8",
+                    fp8="e4m3",
+                    fp8_param_gather=True,
+                    bf16=True,
+                ),
                 id="optim_grads_params_mxfp8_double_buffer",
             ),
             pytest.param(
-                "optim_grads_params",
-                True,
-                {"fp4_recipe": "nvfp4", "fp4": "e2m1", "fp4_param_gather": True, "bf16": True},
+                dict(
+                    data_parallel_sharding_strategy="optim_grads_params",
+                    fsdp_double_buffer=True,
+                    fp4_recipe="nvfp4",
+                    fp4="e2m1",
+                    fp4_param_gather=True,
+                    bf16=True,
+                    recompute_granularity="full",
+                    recompute_method="uniform",
+                    recompute_num_layers=1,
+                ),
                 id="optim_grads_params_nvfp4_double_buffer",
             ),
-            pytest.param("optim_grads", False, {}, id="optim_grads_no_double_buffer"),
-            pytest.param("optim", True, {}, id="optim_double_buffer"),
+            pytest.param(
+                dict(data_parallel_sharding_strategy="optim_grads", fsdp_double_buffer=True),
+                id="optim_grads_no_double_buffer",
+            ),
+            pytest.param(
+                dict(data_parallel_sharding_strategy="optim", fsdp_double_buffer=False),
+                id="optim_double_buffer",
+            ),
         ],
     )
     def test_compatible_with_nd_parallel(
         self,
         ref_cache,
         nd_topology,
-        fsdp_sharding_strategy,
-        use_double_buffer,
-        mixed_precision_config,
+        spec_configs,
     ):
-        if "fp8_recipe" in mixed_precision_config or "fp4_recipe" in mixed_precision_config:
+        if "fp8_recipe" in spec_configs or "fp4_recipe" in spec_configs:
             major, minor = torch.cuda.get_device_capability()
             if major < 10:
                 pytest.skip("FP8/FP4 tests require GPU with compute capability 10.0 or higher")
 
         nd_topology_str = "_".join([f"{k}{v}" for k, v in nd_topology.items()])
         if nd_topology_str not in ref_cache:
-            distopt_args = dict(
-                use_distributed_optimizer=True, **mixed_precision_config
-            )
-            distopt_args.update(
-                fp8_param_gather=False, fp4_param_gather=False,
-            )
-            ref_cache[nd_topology_str] = TestMegatronFSDPE2E._training_loop(
-                **distopt_args
-            )
+            distopt_args = dict(use_distributed_optimizer=True, **spec_configs)
+            distopt_args.update(fp8_param_gather=False, fp4_param_gather=False)
+            ref_cache[nd_topology_str] = TestMegatronFSDPE2E._training_loop(**distopt_args)
 
         outputs = TestMegatronFSDPE2E._training_loop(
             use_megatron_fsdp=True,
-            data_parallel_sharding_strategy=fsdp_sharding_strategy,
             init_model_with_meta_device=True,
             ckpt_format="fsdp_dtensor",
             gradient_accumulation_fusion=False,
-            fsdp_double_buffer=use_double_buffer,
-            **mixed_precision_config,
+            **spec_configs,
         )
         reference_outputs = ref_cache[nd_topology_str]
 
