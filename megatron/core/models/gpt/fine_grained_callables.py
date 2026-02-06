@@ -530,15 +530,19 @@ def build_transformer_layer_callables(layer: TransformerLayer):
             token_dispatcher._comm_manager.token_probs = probs
 
         dispatched_tokens, dispatched_probs = layer.mlp.dispatch(local_tokens, probs)
-        return dispatched_tokens, dispatched_probs
 
-    def submodule_moe_forward(
-        node: ScheduleNode, dispatched_tokens: torch.Tensor, dispatched_probs: torch.Tensor
-    ):
+        # `dispatched_probs` is needed by backward pass of swiglu, therefore it's
+        # passed to moe_forward within `layer_state` to avoid the free_input process
+        # of the input tensors.
+        node.layer_state.dispatched_probs = node.detach(dispatched_probs)
+        return dispatched_tokens
+
+    def submodule_moe_forward(node: ScheduleNode, dispatched_tokens: torch.Tensor):
         """
         Run forward pass for computations between dispatch and combine:
             post dispatch->experts->combine preprocess
         """
+        dispatched_probs = node.layer_state.dispatched_probs
         token_dispatcher = layer.mlp.token_dispatcher
         if enable_deepep or enable_hybridep:
             # update dispatched_probs to be detached version, prevents
@@ -548,10 +552,10 @@ def build_transformer_layer_callables(layer: TransformerLayer):
         expert_output, _ = layer.mlp.routed_experts_compute(dispatched_tokens, dispatched_probs)
 
         # For HybridEP, tokens_per_expert is generated on comm stream, as the input to
-        # `routed_experts_compute`, it needs to be recorded to comp stream.
+        # `routed_experts_compute`, a ref is needed to prevent it from being freed.
         if enable_hybridep:
             tokens_per_expert = token_dispatcher._comm_manager.get_number_of_tokens_per_expert()
-            tokens_per_expert.record_stream(torch.cuda.current_stream())
+            node.layer_state.tokens_per_expert = tokens_per_expert
 
         if layer.recompute_pre_mlp_layernorm:
             # discard the output of the pre-mlp layernorm and register the recompute
@@ -594,11 +598,14 @@ def build_transformer_layer_callables(layer: TransformerLayer):
         if node.chunk_state.flush_delayed_groups:
             off_interface.flush_delayed_groups()
 
-        # Need to record residual to comm stream, since it's created on comp stream
+        # Need to record tensors created on comp stream to comm stream
         node.layer_state.residual.record_stream(torch.cuda.current_stream())
+        if shared_expert_output is not None:
+            shared_expert_output.record_stream(torch.cuda.current_stream())
 
         # release tensor reference after use
         node.layer_state.residual = None
+        node.layer_state.shared_expert_output = None
 
         # final layer norm from decoder
         final_layernorm = node.chunk_state.model.decoder.final_layernorm
