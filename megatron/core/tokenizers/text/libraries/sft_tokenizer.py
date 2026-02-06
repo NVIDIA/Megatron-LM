@@ -62,7 +62,7 @@ class SFTTokenizer:
         else:
             raise ImportError(
                 "SFTTokenizer currently requires transformers library to be installed"
-            )    
+            )
 
         self._vocab_size = len(tokenizer)
         self._tokenizer = tokenizer
