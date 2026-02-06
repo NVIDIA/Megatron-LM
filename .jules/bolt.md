@@ -12,3 +12,7 @@
 ## 2025-10-27 - PyTorch Optimization
 **Learning:** Using `torch.tensor(list_of_tensors)` or `float(tensor)` causes significant CPU-GPU synchronization overhead.
 **Action:** Use `torch.stack` to combine tensors and keep computations on the device. Avoid converting tensors to Python scalars in hot paths.
+
+## 2025-10-27 - torch._foreach_norm Precision Safety
+**Learning:** `torch._foreach_norm` accumulates in the input dtype and lacks a `dtype` argument. Using it on FP16/BF16 inputs can cause overflow if the sum of squares exceeds the type's range (e.g., > 65504 for FP16).
+**Action:** Restrict `torch._foreach_norm` optimization to `torch.float32` inputs. For lower precision, fallback to `torch.norm(..., dtype=torch.float32)` or manually cast before calling.
