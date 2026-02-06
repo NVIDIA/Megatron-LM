@@ -268,6 +268,7 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
         hidden_dropout: Optional[float] = None,
         pg_collection: Optional[ProcessGroupCollection] = None,
         vp_stage: Optional[int] = None,
+        is_mtp_layer: bool = False,
     ):
         self.submodules_config = submodules
         super().__init__(config=config, vp_stage=vp_stage)
@@ -277,10 +278,18 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
         self.pg_collection = pg_collection
         self.tp_group = pg_collection.tp
 
-        self.layer_number = layer_number + get_transformer_layer_offset(
-            self.config, vp_stage, get_pg_rank(pg_collection.pp)
-        )
+        # MTP inner layers use their own layer numbering (starting from 1 within each MTP depth),
+        # so they should NOT add the decoder layer offset. The router.py handles MTP layer
+        # numbering separately by adding config.num_layers to distinguish MTP layers from decoder
+        # layers in the aux loss tracker.
+        if is_mtp_layer:
+            self.layer_number = layer_number
+        else:
+            self.layer_number = layer_number + get_transformer_layer_offset(
+                self.config, vp_stage, get_pg_rank(pg_collection.pp)
+            )
         self.hidden_dropout = config.hidden_dropout if hidden_dropout is None else hidden_dropout
+        self.is_mtp_layer = is_mtp_layer
 
         # [Module 1: Input Layernorm] Optional Layernorm on the input data
         # TODO: add pytorch only layernorm
@@ -351,6 +360,9 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
         if isinstance(submodules.mlp, ModuleSpec):
             if submodules.mlp.module in (MoELayer, GroupedMLP, TEGroupedMLP, SequentialMLP):
                 additional_mlp_kwargs["pg_collection"] = pg_collection
+                # Pass is_mtp_layer flag to MoELayer to distinguish MTP MoE layers.
+                if submodules.mlp.module == MoELayer:
+                    additional_mlp_kwargs["is_mtp_layer"] = self.is_mtp_layer
             elif submodules.mlp.module == MLP:
                 assert hasattr(
                     pg_collection, 'tp'
@@ -506,10 +518,6 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
         This method calls the core computation of a transformer layer, including
         self-attention, cross-attention (if applicable), and feed-forward operations.
         """
-        # Remove 'dynamic_inference_decode_only' from kwargs if present
-        # this is only used to uniquely identify decode and non-decode cuda graph
-        # runners in the cuda graph manager
-        kwargs.pop("dynamic_inference_decode_only", None)
         hidden_states, context = self._forward_attention(*args, **kwargs)
         output = self._forward_mlp(
             hidden_states,
@@ -1202,19 +1210,6 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
             if using_cuda_graph:
                 return True
         return False
-
-    def __call__(self, *args, **kwargs):
-        if self._should_call_local_cudagraph(*args, **kwargs):
-            # Inference mode.
-            if kwargs.get('inference_context') is not None:
-                # dynamic_inference_decode_only is not a real argument to forward, it is only used
-                # to differentiate the cuda graph used for decode from the one used for non-decode
-                # inference.
-                kwargs["dynamic_inference_decode_only"] = kwargs[
-                    'inference_context'
-                ].is_decode_only()
-
-        return super().__call__(*args, **kwargs)
 
     def get_layer_norm_weights(self):
         """
