@@ -127,6 +127,44 @@ class MambaMetadata:
 
         has_chunked_prefill_req = enable_chunked_prefill and real_prefill_count > 0
 
+        # Although the context ensures that the last request is always the designated
+        # chunked prefill request, what we actually care about is ensuring that any
+        # prefill request with non-zero initial states is executed through the
+        # chunked prefill path.
+        #
+        # In the batch arrangement passed to this update function, the logic assumes
+        # the *first* prefill request is the one carrying states.
+        #
+        # There are three scenarios:
+        #
+        # Scenario A: No prefill request has initial states yet, but the last request
+        #             is the designated chunked prefill request (starting a new chunk).
+        #
+        #   [ ... Decode Requests ... ] [ Prefill (start) ]
+        #                               ^
+        #                               |--- First prefill request
+        #                                    Treated as having states.
+        #                                    Harmless because actual initial states are 0.
+        #
+        # Scenario B: There is exactly 1 prefill request which is a continuing
+        #             chunked prefill request with non-zero initial states.
+        #
+        #   [ ... Decode Requests ... ] [ Prefill (cont)  ]
+        #                               ^
+        #                               |--- First prefill request
+        #                                    Has non-zero initial states.
+        #
+        # Scenario C: There is a leftover chunked prefill request that is executing
+        #             its last chunk, followed by additional prefill requests.
+        #
+        #   [ ... Decode Requests ... ] [ Prefill (end)   ] [ Prefill (new) ] ...
+        #                               ^
+        #                               |--- First prefill request
+        #                                    Has non-zero initial states.
+        #
+        # The implementation generalizes to Scenario A as well, where the first prefill
+        # request is treated as if it has non-zero initial states, which is safe.
+
         if padded_decode_count > 0:
             # Update decode indices
             self._batch_indices_decode_buffer[:real_decode_count].copy_(
