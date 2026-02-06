@@ -15,6 +15,7 @@ from megatron.core.models.common.embeddings.language_model_embedding import Lang
 from megatron.core.models.common.embeddings.rotary_pos_embedding import RotaryEmbedding
 from megatron.core.models.common.language_module.language_module import LanguageModule
 from megatron.core.process_groups_config import ProcessGroupCollection
+from megatron.core.transformer.attention import SelfAttentionSubmodules
 from megatron.core.transformer.dot_product_attention import (
     DotProductAttention as MCoreDotProductAttention,
 )
@@ -22,6 +23,7 @@ from megatron.core.transformer.enums import AttnBackend, AttnMaskType, ModelType
 from megatron.core.transformer.spec_utils import ModuleSpec
 from megatron.core.transformer.transformer_block import TransformerBlock
 from megatron.core.transformer.transformer_config import TransformerConfig
+from megatron.core.transformer.transformer_layer import TransformerLayerSubmodules
 from megatron.core.transformer.utils import get_linear_layer
 from megatron.core.utils import deprecate_inference_params
 from megatron.core.utils import get_te_version as _get_te_version
@@ -187,6 +189,11 @@ class BertModel(LanguageModule):
         """
         attention_backend = self.config.attention_backend
         attn_mask_dimensions = None
+        assert isinstance(self.transformer_layer_spec.submodules, TransformerLayerSubmodules)
+        assert isinstance(
+            self.transformer_layer_spec.submodules.self_attention.submodules,
+            SelfAttentionSubmodules,
+        )
         # For local layer spec we just use b1ss
         if (
             self.transformer_layer_spec.submodules.self_attention.submodules.core_attention
