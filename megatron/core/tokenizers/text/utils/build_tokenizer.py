@@ -1,8 +1,10 @@
 # Copyright (c) 2025, NVIDIA CORPORATION. All rights reserved.
 
 from megatron.core.tokenizers import MegatronTokenizer
+
 try:
     from megatron.training.tokenizer.sft_tokenizer import SFTTokenizer
+
     HAVE_SFT_TOKENIZER = True
 except ImportError:
     HAVE_SFT_TOKENIZER = False
@@ -68,13 +70,8 @@ def build_tokenizer(args):
     elif args.tokenizer_type == 'SFTTokenizer':
         # SFTTokenizer uses the legacy tokenizer system
         if not HAVE_SFT_TOKENIZER:
-            raise ImportError(
-                "SFTTokenizer currently requires megatron.training module"
-            )
-        tokenizer = SFTTokenizer(
-            args.tokenizer_model,
-            args.sft_tokenizer_prompt_format,
-        )
+            raise ImportError("SFTTokenizer currently requires megatron.training module")
+        tokenizer = SFTTokenizer(args.tokenizer_model, args.sft_tokenizer_prompt_format)
         return tokenizer
 
     if args.tokenizer_metadata:
