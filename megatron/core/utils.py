@@ -1220,6 +1220,21 @@ def local_multi_tensor_l2_norm(chunk_size, noop_flag, tensor_lists, per_tensor, 
             if device is None:
                 device = tensor.device
             all_tensors.append(tensor)
+        if not tensor_list:
+            continue
+        if device is None:
+            device = tensor_list[0].device
+
+        # Check for _foreach_norm availability AND float32 dtype to ensure precision/range safety.
+        # _foreach_norm returns results in the same dtype as input. For fp16/bf16, this can cause
+        # overflow if the norm exceeds the range of the type (e.g., > 65504 for fp16).
+        # The original implementation forces float32 accumulation and return type.
+        if hasattr(torch, "_foreach_norm") and tensor_list[0].dtype == torch.float32:
+            batch_norms = torch._foreach_norm(tensor_list, 2.0)
+            norms.extend(batch_norms)
+        else:
+            for tensor in tensor_list:
+                norms.append(torch.norm(tensor, p=2, dtype=torch.float32))
 
     if not all_tensors:
         if device is None:
