@@ -248,15 +248,21 @@ def reduce_max_stat_across_model_parallel_group(stat: float) -> float:
 
     We use an all_reduce max since the values have already been summed across optimizer ranks where possible
     """
+    print_rank_0(f'LEARNING RATE AT THE BEGINNING OF FUNC: {stat}')
     if stat is None:
+        print_rank_0('LEARNING RATE IS NONE')
         stat = -1.0
     stat = torch.tensor([stat], dtype=torch.float32, device=torch.cuda.current_device())
+    print_rank_0(f'LEARNING RATE IN TENSOR FORMAT: {stat}')
     torch.distributed.all_reduce(
         stat, op=torch.distributed.ReduceOp.MAX, group=mpu.get_model_parallel_group()
     )
+    print_rank_0(f'LEARNING RATE AFTER RE-CALCULATION: {stat}, {stat.item()}')
     if stat.item() == -1.0:
+        print_rank_0(f'LEARNING RATE IS -1.0? {stat}, {stat.item()}')
         return None
     else:
+        print_rank_0(f'LEARNING RATE IS {stat}, {stat.item()}')
         return stat.item()
 
 
