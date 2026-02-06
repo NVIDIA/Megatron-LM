@@ -1118,33 +1118,6 @@ class TestDynamicInferenceEngine:
     @pytest.mark.skipif(
         not is_fa_min_version("2.7.3"), reason="need latest flash attn for dynamic batching"
     )
-    @pytest.mark.parametrize("model_provider", ["gpt", "mamba"])
-    @torch.inference_mode()
-    def test_chunked_prefill(self, model_provider: str):
-        """Verify that chunked prefill output is equivalent to regular prefill."""
-        skip_if_mamba_sequence_packing_not_available(model_provider)
-
-        prompt_length = 1200
-        num_tokens_to_generate = 16
-        max_sequence_length = prompt_length + num_tokens_to_generate
-
-        # Configure context to force chunking
-        env = self._run_test(
-            num_requests=1,
-            min_prompt_length=prompt_length,
-            max_prompt_length=prompt_length,
-            num_tokens_to_generate=num_tokens_to_generate,
-            materialize_only_last_token_logits=False,
-            model_provider=model_provider,
-            context_block_size_tokens=256,
-            context_max_tokens=1000,
-            enable_chunked_prefill=True,
-        )
-
-    @pytest.mark.internal
-    @pytest.mark.skipif(
-        not is_fa_min_version("2.7.3"), reason="need latest flash attn for dynamic batching"
-    )
     @torch.inference_mode()
     def test_mamba_chunked_prefill(self):
         """

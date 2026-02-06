@@ -70,6 +70,8 @@ class MambaMetadata:
         )
         self.mamba_state_free_slot_count = self.max_requests
 
+        self.reset_varlen_metadata()
+
     def reset(self) -> None:
         """
         Resets all Mamba states and frees all allocated slots.
