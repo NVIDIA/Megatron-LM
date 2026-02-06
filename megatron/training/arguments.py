@@ -504,6 +504,79 @@ def validate_args(args, defaults={}):
         print_rank_0('setting global batch size to {}'.format(args.global_batch_size))
     assert args.global_batch_size > 0
 
+    # === MTP validation ===
+    # Deprecation warnings for legacy MTP arguments
+    if args.mtp_hybrid_override_pattern is not None:
+        warn_rank_0(
+            "--mtp-hybrid-override-pattern is deprecated. "
+            "For new hybrid models with MTP models, use unified --hybrid-override-pattern instead. "
+            "Example: 'M*M*/MM/MM' means main='M*M*', MTP pattern='MM' with 2 depths. "
+            "This argument is kept only for loading old checkpoints.",
+            args.rank,
+        )
+
+    # Backward compatibility: convert legacy mtp_hybrid_override_pattern to unified format
+    from megatron.core.ssm.mamba_hybrid_layer_allocation import Symbols, parse_hybrid_pattern
+    sep = Symbols.MTP_SEPARATOR
+    if (
+        getattr(args, 'mtp_hybrid_override_pattern', None) is not None
+        and args.mtp_num_layers is not None
+        and args.mtp_num_layers > 0
+        and (args.hybrid_override_pattern is None or sep not in args.hybrid_override_pattern)
+    ):
+        main_pattern = args.hybrid_override_pattern or ''
+        mtp_pattern = args.mtp_hybrid_override_pattern
+        args.hybrid_override_pattern = main_pattern + sep + sep.join([mtp_pattern] * args.mtp_num_layers)
+        args.mtp_hybrid_override_pattern = None
+        print_rank_0(f"Converted legacy MTP pattern to unified: {args.hybrid_override_pattern}")
+
+    # Infer mtp_num_layers from unified pattern
+    if args.hybrid_override_pattern and sep in args.hybrid_override_pattern:
+        parsed = parse_hybrid_pattern(args.hybrid_override_pattern)
+        if parsed.mtp_pattern and parsed.mtp_num_depths > 0:
+            inferred_mtp_num_layers = parsed.mtp_num_depths
+            if args.mtp_num_layers is None:
+                args.mtp_num_layers = inferred_mtp_num_layers
+            elif args.mtp_num_layers != inferred_mtp_num_layers:
+                warn_rank_0(
+                    f"--mtp-num-layers ({args.mtp_num_layers}) conflicts with "
+                    f"MTP depth count ({inferred_mtp_num_layers}) in pattern '{args.hybrid_override_pattern}'. "
+                    f"Using the inferred value ({inferred_mtp_num_layers}).",
+                    args.rank
+                )
+                args.mtp_num_layers = inferred_mtp_num_layers
+
+    # MTP validation
+    if args.mtp_num_layers:
+        assert not args.use_legacy_models, "The legacy Megatron models does not support Multi-Token Prediction (MTP)."
+        assert args.position_embedding_type == "rope" or args.position_embedding_type == "none", (
+            f"Multi-Token Prediction (MTP) is not supported with {args.position_embedding_type} position embedding type."
+            + f"The supported position embedding types are rope and none."
+        )
+
+    # Validate MTP args for hybrid vs non-hybrid models
+    if args.is_hybrid_model:
+        # Mamba/hybrid model MTP validation
+        if args.mtp_num_layers and not (args.hybrid_override_pattern and sep in args.hybrid_override_pattern):
+            # Hybrid model wants MTP but no unified pattern - check for legacy args
+            if args.mtp_hybrid_override_pattern is None:
+                warn_rank_0(
+                    "Hybrid model with --mtp-num-layers but no MTP pattern. "
+                    "Use unified --hybrid-override-pattern with '/' separator (e.g., 'M*M*/MM/MM') "
+                    "or legacy --mtp-hybrid-override-pattern for old checkpoints.",
+                    args.rank
+                )
+    else:
+        # Non-hybrid (GPT) model MTP validation
+        if args.mtp_hybrid_override_pattern is not None:
+            warn_rank_0(
+                "--mtp-hybrid-override-pattern is for Mamba/hybrid models only. "
+                "For GPT models, MTP replicates the main transformer layer structure. "
+                "This argument will be ignored.",
+                args.rank
+            )
+    # === End of MTP validation ===
+    
     # Uneven virtual pipeline parallelism
     assert (
         int(args.num_layers_per_virtual_pipeline_stage is not None)
@@ -1218,6 +1291,25 @@ def validate_args(args, defaults={}):
             assert is_te_min_version("2.8.0"), (
                 "overlap_grad_reduce is only supported with TE >= 2.8.0 when enabling delay_wgrad_compute"
             )
+            wgrad_in_graph_scope = CudaGraphScope.attn in args.cuda_graph_scope or (
+                CudaGraphScope.moe_router in args.cuda_graph_scope
+                and args.moe_shared_expert_intermediate_size is not None
+                and not args.moe_shared_expert_overlap
+            )
+            if wgrad_in_graph_scope:
+                assert is_te_min_version(
+                    "2.12.0"
+                ), "CUDA graph with delay_wgrad_compute requires TE version >= 2.12.0."
+                assert args.gradient_accumulation_fusion, (
+                    'CUDA graph with delay_wgrad_compute requires gradient_accumulation_fusion '
+                    'to be enabled. This is because the default gradient accumulation does not '
+                    'use static memory addresses, which breaks CUDA graph requirements.'
+                )
+                if CudaGraphScope.attn in args.cuda_graph_scope:
+                    assert (
+                        not args.add_bias_linear and not args.add_qkv_bias
+                    ), "CUDA graph with delay_wgrad_compute doesn't support attn bias for now."
+
         if not args.gradient_accumulation_fusion:
             assert is_te_min_version("2.7.0"), (
                 "disabling gradient_accumulation_fusion is only supported with TE >= 2.7.0 "
