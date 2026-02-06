@@ -779,9 +779,6 @@ def get_mcore_tensor_parallel_partition_dim(param: torch.Tensor) -> Optional[int
             return 0
         elif param._tensor_parallel_mode == "row":
             return 1
-        return None
-    elif hasattr(param, "partition_dim"):
-        return param.partition_dim
     return None
 
 
