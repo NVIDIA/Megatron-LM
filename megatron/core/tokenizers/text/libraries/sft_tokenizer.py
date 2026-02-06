@@ -5,7 +5,7 @@ from typing import Dict, List, Union
 
 import numpy as np
 
-from .abstract_tokenizer import MegatronTokenizerTextAbstract
+#from megatr.abstract_tokenizer import MegatronTokenizerTextAbstract
 
 nemotron_h_aligned_custom_template = """{% for message in messages %}{% if message['role'] == 'system' %}{{ '<SPECIAL_10>System\n' + message['content'].strip() + '\n' }}{% elif message['role'] == 'user' %}{{ '<SPECIAL_11>User\n' + message['content'].strip() + '\n' + '<SPECIAL_11>Assistant\n' }}{% elif message['role'] == 'assistant' %}{{ message['content'].strip() + '\n' }}{% endif %}{% endfor %}""" # pylint: disable=line-too-long
 nemotron_nano_v2_custom_template = """{% for message in messages %}{% set content = message['content'] %}{% if message['role'] == 'system' %}{{ '<SPECIAL_10>System\n' + content.replace('/think', '').replace('/no_think', '').strip() + '\n' }}{% elif message['role'] == 'user' %}{{ '<SPECIAL_11>User\n' + content.replace('/think', '').replace('/no_think', '').strip() + '\n' }}{% elif message['role'] == 'assistant' %}{{ '<SPECIAL_11>Assistant\n' + content.strip() + '\n<SPECIAL_12>\n' }}{% endif %}{% endfor %}""" # pylint: disable=line-too-long
@@ -35,7 +35,7 @@ class PromptConfig:
     system_default: dict = None
 
 
-class SFTTokenizer(MegatronTokenizerTextAbstract):
+class SFTTokenizer:
     """SFT Tokenizer."""
 
     def __init__(self, tokenizer_path: str, prompt_format: str):
@@ -213,12 +213,12 @@ class SFTTokenizer(MegatronTokenizerTextAbstract):
         raise NotImplementedError("This method is not supported for SFTTokenizer.")
 
     @property
-    def pad(self):
+    def pad_id(self):
         """Pad token ID."""
         return self._prompt_config.pad_token_id
 
     @property
-    def bos(self):
+    def bos_id(self):
         """Beginning of sequence token ID."""
         return self._tokenizer.bos_token_id
 
