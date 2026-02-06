@@ -152,6 +152,13 @@ from megatron.core.parallel_state import (
 from megatron.core.inference.unified_memory import create_unified_mempool
 from megatron.core.resharding.refit import swap_model_weights
 
+try:
+    from torch_memory_saver import torch_memory_saver
+    torch_memory_saver.hook_mode = "torch"
+    HAVE_TORCH_MEMORY_SAVER = True
+except ImportError:
+    HAVE_TORCH_MEMORY_SAVER = False
+
 from megatron.core.pipeline_parallel import get_forward_backward_func
 from megatron.core.num_microbatches_calculator import (
     destroy_num_microbatches_calculator,
@@ -220,10 +227,20 @@ def num_floating_point_operations(args, batch_size):
     def calculate_layer_counts():
         """Calculate the number of attention, Mamba, and MLP layers."""
         if args.hybrid_override_pattern:
-            counts = {'M': 0, '*': 0, '-': 0, 'E':0}
-            for layer_type in args.hybrid_override_pattern:
-                if layer_type in counts:
-                    counts[layer_type] += 1
+            from megatron.core.ssm.mamba_hybrid_layer_allocation import parse_hybrid_pattern
+            # Parse unified pattern to separate main and MTP components
+            parsed = parse_hybrid_pattern(args.hybrid_override_pattern)
+            counts = {'M': 0, '*': 0, '-': 0, 'E': 0}
+            # Count main decoder layers
+            if parsed.main_pattern:
+                for layer_type in parsed.main_pattern:
+                    if layer_type in counts:
+                        counts[layer_type] += 1
+            # Count MTP layers (pattern repeated mtp_num_depths times)
+            if parsed.mtp_pattern and parsed.mtp_num_depths > 0:
+                for layer_type in parsed.mtp_pattern:
+                    if layer_type in counts:
+                        counts[layer_type] += parsed.mtp_num_depths
             return counts['*'], counts['M'], counts['-'], counts['E']
         else:
             num_attn_layers = round(args.num_layers * args.hybrid_attention_ratio)
@@ -334,7 +351,7 @@ def num_floating_point_operations(args, batch_size):
                      mlp_expansion=4.0, swiglu=False,
                      moe_latent_size=None,
                      moe_ffn_hidden_size=2048, shared_expert_ffn_hidden_size=2048, num_experts_routed_to=1,
-                     vocab_size=256000):
+                     vocab_size=256000, mtp_num_layers=0):
         """Calculate total FLOPs for the hybrid model."""
         flops_fwd = (
                 num_attn_layers * attn_layer_flops(batch_size, seq_len, hidden_size,
@@ -347,7 +364,7 @@ def num_floating_point_operations(args, batch_size):
                 num_moe_layers * moe_layer_flops(batch_size, seq_len, hidden_size, moe_ffn_hidden_size,
                                                  shared_expert_ffn_hidden_size, num_experts_routed_to,
                                                  moe_latent_size, swiglu) +
-                (2 * batch_size * seq_len * hidden_size * vocab_size)  # logits computation
+                (2 * batch_size * seq_len * hidden_size * vocab_size * (1 + mtp_num_layers))  # logits computation
         )
         return flops_fwd * 3
 
@@ -398,6 +415,7 @@ def num_floating_point_operations(args, batch_size):
             if args.moe_ffn_hidden_size is not None
             else args.ffn_hidden_size
         )
+        moe_latent_size = args.moe_latent_size
         shared_expert_ffn_hidden_size = (
             0
             if args.moe_shared_expert_intermediate_size is None
@@ -580,7 +598,20 @@ def num_floating_point_operations(args, batch_size):
                     (args.ffn_hidden_size * ffn_expansion_factor)
                     * num_dense_layers
                     # routed experts
-                    + (moe_ffn_hidden_size * num_experts_routed_to * ffn_expansion_factor)
+                    + (
+                        (moe_ffn_hidden_size * num_experts_routed_to * ffn_expansion_factor)
+                        if moe_latent_size is None
+                        else (
+                            (
+                                moe_ffn_hidden_size
+                                * num_experts_routed_to
+                                * ffn_expansion_factor
+                                * moe_latent_size
+                                / args.hidden_size
+                            )  # Routed experts run on moe_latent_size.
+                            + 2 * moe_latent_size  # Up proj and down proj.
+                        )
+                    )
                     * num_moe_layers
                     # Shared Experts.
                     + (shared_expert_ffn_hidden_size * ffn_expansion_factor)
@@ -613,6 +644,9 @@ def num_floating_point_operations(args, batch_size):
         # Calculate the number of each type of layer.
         num_attn_layers, num_mamba_layers, num_mlp_layers, num_moe_layers = calculate_layer_counts()
 
+        mtp_num_layers = args.mtp_num_layers
+        if mtp_num_layers is None:
+            mtp_num_layers = 0
         # Compute hybrid model FLOPs.
         return hybrid_flops(
             batch_size=batch_size,
@@ -639,6 +673,7 @@ def num_floating_point_operations(args, batch_size):
                                            else args.moe_shared_expert_intermediate_size),
             num_experts_routed_to=args.moe_router_topk,
             vocab_size=args.padded_vocab_size,
+            mtp_num_layers=mtp_num_layers,
         )
     else:
         # Compute standard Transformer model FLOPs.
@@ -986,15 +1021,30 @@ def pretrain(
 
             # Optionally allocate the RL inference model weights from a unified virtual memory (UVM)
             # mempool so we can prefetch weights to CPU when idle while keeping CUDA-graph-safe pointers.
+            # Alternatively, use torch_memory_saver to offload the weights to CPU when idle.
             uvm_mempool = None
             uvm_level = args.rl_inference_model_unified_memory_level
             if uvm_level and uvm_level > 0:
                 uvm_mempool = create_unified_mempool()
 
-            mempool_ctx = (
-                torch.cuda.use_mem_pool(uvm_mempool) if uvm_mempool is not None else nullcontext()
+            # Determine which context manager to use for model allocation
+            # Use torch_memory_saver if offloading is requested but UVM is not enabled
+            use_torch_saver_for_inference_model = (
+                args.rl_offload_inference_model_weights_when_idle
+                and uvm_level == 0
+                and HAVE_TORCH_MEMORY_SAVER
             )
-            with mempool_ctx:
+            if use_torch_saver_for_inference_model:
+                # Use torch_memory_saver for offloading - allocate within a tagged region
+                model_alloc_ctx = torch_memory_saver.region(
+                    tag="rl_inference_model", enable_cpu_backup=True
+                )
+            elif uvm_mempool is not None:
+                model_alloc_ctx = torch.cuda.use_mem_pool(uvm_mempool)
+            else:
+                model_alloc_ctx = nullcontext()
+
+            with model_alloc_ctx:
                 inference_model = get_model(
                     model_provider,
                     model_type,
@@ -1004,7 +1054,12 @@ def pretrain(
                 )
             inference_model[0].eval()
 
-
+        # Validate: offloading flag requires a separate inference model
+        if args.rl_offload_inference_model_weights_when_idle and inference_model is None:
+            raise ValueError(
+                "--rl-offload-inference-model-weights-when-idle requires a separate inference model. "
+                "This flag is only useful when doing refit since the weights are shared with the training model."
+            )
 
     # Data stuff.
     app_metrics['app_build_dataiters_start_time'] = one_logger_utils.get_timestamp_in_ms()
@@ -2801,8 +2856,15 @@ def train(
 
         if getattr(args, 'perform_rl_step', False):
             with torch.no_grad():
-                train_data_iterator = rl_utils.setup_grpo_data_iterator(
-                    model, inference_model, optimizer, iteration, ref_state_dict, buffered_rollouts
+                train_data_iterator = rl_utils.get_grpo_data_iterator(
+                    model, inference_model, optimizer, iteration, ref_state_dict,
+                    grpo_iterations=args.grpo_iterations,
+                    grpo_prompts_per_step=args.grpo_prompts_per_step,
+                    grpo_group_size=args.grpo_group_size,
+                    global_batch_size=args.global_batch_size,
+                    sequence_packing=args.rl_use_sequence_packing,
+                    buffered_rollouts=buffered_rollouts,
+                    is_correction=args.rl_inference_logprobs_is_correction,
                 )
                 # Buffered rollouts are used as a state container for setups when
                 # we use previously-generated data for an update.
@@ -2881,7 +2943,10 @@ def train(
         if getattr(args, 'perform_rl_step', False) and args.rl_use_sequence_packing:
             iteration_sequences = rl_utils.get_iteration_sequence_count(args)
             # Track bins separately for packed mode
-            rl_utils.update_sequence_packing_metrics(args)
+            bin_count = (
+                mpu.get_data_parallel_world_size() * args.micro_batch_size * get_num_microbatches()
+            )
+            args.consumed_train_bins += bin_count
         else:
             batch_size = (
                 mpu.get_data_parallel_world_size() * args.micro_batch_size * get_num_microbatches()
