@@ -304,6 +304,7 @@ def get_inference_config_from_model_and_args(model: MegatronModule, args):
         materialize_only_last_token_logits=not args.return_log_probs,
         track_paused_request_events=args.inference_dynamic_batching_track_paused_request_events,
         enable_chunked_prefill=args.enable_chunked_prefill,
+        enable_prefix_caching=args.inference_dynamic_batching_enable_prefix_caching,
         metrics_writer=metrics_writer,
         logging_step_interval=args.inference_logging_step_interval,
     )

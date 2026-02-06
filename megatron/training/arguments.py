@@ -1613,6 +1613,13 @@ def _add_inference_args(parser):
     group.add_argument('--enable-chunked-prefill', dest='enable_chunked_prefill',
                        action='store_true', default=False,
                        help="Enable chunked prefill (disabled by default)")
+    group.add_argument('--inference-dynamic-batching-disable-prefix-caching',
+                       action='store_false',
+                       dest='inference_dynamic_batching_enable_prefix_caching',
+                       help='Disable prefix caching for dynamic batching inference. '
+                       'When disabled, KV cache blocks cannot be shared between '
+                       'requests with identical prompt prefixes.')
+    group.set_defaults(inference_dynamic_batching_enable_prefix_caching=True)
     group.add_argument('--inference-dynamic-batching-cuda-graph-max-tokens',
                        type=int, default=16384,
                        help='Maximum number of tokens to capture in a cuda graph.')
