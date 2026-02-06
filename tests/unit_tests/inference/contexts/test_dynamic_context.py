@@ -1,14 +1,13 @@
 # Copyright (c) 2025, NVIDIA CORPORATION. All rights reserved.
 
+import contextlib
 import math
 
 import pytest
 import torch
 
 from megatron.core import parallel_state
-from megatron.core.inference.contexts.attention_context.mamba_metadata import (
-    MambaInferenceStateConfig,
-)
+from megatron.core.inference.config import InferenceConfig, MambaInferenceStateConfig
 from megatron.core.inference.contexts.dynamic_context import (
     DynamicInferenceContext,
     RequestOverflowError,
@@ -18,14 +17,21 @@ from megatron.core.inference.inference_request import DynamicInferenceRequest
 from megatron.core.inference.sampling_params import SamplingParams
 from megatron.core.ssm.mamba_hybrid_layer_allocation import Symbols
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
+from megatron.core.transformer.transformer_config import TransformerConfig
 from tests.unit_tests.test_utilities import Utils
 
 
-def set_rounder(value):
-    """Utility function to set the DynamicInferenceContext rounder."""
-    DynamicInferenceContext.ROUNDER = value  # For backwards compatibility
-    DynamicInferenceContext.TOKEN_ROUNDER = value
-    DynamicInferenceContext.REQUEST_ROUNDER = value
+@contextlib.contextmanager
+def rounder_override(n):
+    original_token_rounder = DynamicInferenceContext.TOKEN_ROUNDER
+    original_request_rounder = DynamicInferenceContext.REQUEST_ROUNDER
+    try:
+        DynamicInferenceContext.TOKEN_ROUNDER = n
+        DynamicInferenceContext.REQUEST_ROUNDER = n
+        yield
+    finally:
+        DynamicInferenceContext.TOKEN_ROUNDER = original_token_rounder
+        DynamicInferenceContext.REQUEST_ROUNDER = original_request_rounder
 
 
 class TestDynamicContext:
@@ -52,10 +58,8 @@ class TestDynamicContext:
         max_tokens,
         is_hybrid_model=False,
         layer_type_list=None,
-        rounder=64,
+        paused_buffer_size_gb=None,
     ):
-        set_rounder(rounder)
-
         if is_hybrid_model:
             if layer_type_list is None:
                 layer_type_list = [Symbols.MAMBA, Symbols.MLP, Symbols.ATTENTION, Symbols.MLP]
@@ -68,20 +72,27 @@ class TestDynamicContext:
             mamba_inference_state_config = None
 
         dynamic_context = DynamicInferenceContext(
-            params_dtype=params_dtype,
-            num_layers=num_layers // self.pp_size,
-            kv_channels=kv_channels,
-            num_attention_heads=num_attention_heads,
-            max_sequence_length=max_sequence_length,
-            num_cuda_graphs=None,
-            use_cuda_graphs_for_non_decode_steps=True,
-            buffer_size_gb=buffer_size_gb,
-            block_size_tokens=block_size_tokens,
-            max_tokens=max_tokens,
-            mamba_inference_state_config=mamba_inference_state_config,
-            use_flashinfer_fused_rope=None,  # default to using flash-infer if available
-            # this is for compatibility with the LTS environment
-            unified_memory_level=0,  # unit tests currently broken with UVM
+            model_config=TransformerConfig(
+                params_dtype=params_dtype,
+                num_layers=num_layers,
+                kv_channels=kv_channels,
+                num_attention_heads=num_attention_heads,
+            ),
+            inference_config=InferenceConfig(
+                max_sequence_length=max_sequence_length,
+                num_cuda_graphs=None,
+                use_cuda_graphs_for_non_decode_steps=True,
+                buffer_size_gb=buffer_size_gb,
+                paused_buffer_size_gb=(
+                    0.2 * buffer_size_gb if paused_buffer_size_gb is None else paused_buffer_size_gb
+                ),
+                block_size_tokens=block_size_tokens,
+                max_tokens=max_tokens,
+                mamba_inference_state_config=mamba_inference_state_config,
+                use_flashinfer_fused_rope=None,  # default to using flash-infer if available
+                # this is for compatibility with the LTS environment
+                unified_memory_level=0,  # unit tests currently broken with UVM
+            ),
         )
         return dynamic_context
 
@@ -89,6 +100,7 @@ class TestDynamicContext:
         Utils.destroy_model_parallel()
 
     @pytest.mark.internal
+    @rounder_override(64)
     @pytest.mark.parametrize("is_hybrid_model", [False, True])
     def test_initialize_dynamic_context(self, is_hybrid_model: bool):
         self._setup_model_parallel_group(1, 1)
@@ -103,23 +115,20 @@ class TestDynamicContext:
             block_size_tokens=128,
             max_tokens=None,
             is_hybrid_model=is_hybrid_model,
-            rounder=64,
         )
 
         if not is_hybrid_model:
             assert dynamic_context.block_allocator.total_count == 491
-            assert dynamic_context.block_allocator.active_count == 245
-            assert dynamic_context.max_total_requests == 490
-            # We make max_active_requests divisible by the REQUEST_ROUNDER.
-            assert dynamic_context.max_active_requests == 192
+            assert dynamic_context.block_allocator.active_count == 392
+            # We make max_requests divisible by the REQUEST_ROUNDER.
+            assert dynamic_context.max_requests == 448
             assert dynamic_context.max_tokens == 16384
             assert dynamic_context.num_mamba_layers == 0
             assert dynamic_context.mamba_metadata is None
         else:
-            assert dynamic_context.block_allocator.total_count == 555
-            assert dynamic_context.block_allocator.active_count == 277
-            assert dynamic_context.max_total_requests == 554
-            assert dynamic_context.max_active_requests == 256
+            assert dynamic_context.block_allocator.total_count == 556
+            assert dynamic_context.block_allocator.active_count == 444
+            assert dynamic_context.max_requests == 512
             assert dynamic_context.max_tokens == 16384
             assert dynamic_context.num_mamba_layers == 1
             assert dynamic_context.mamba_metadata is not None
@@ -143,6 +152,7 @@ class TestDynamicContext:
         assert not dynamic_context.is_static_batching()
 
     @pytest.mark.internal
+    @rounder_override(64)
     @pytest.mark.parametrize("is_hybrid_model", [False, True])
     def test_is_memory_available(self, is_hybrid_model):
         self._setup_model_parallel_group(1, 1)
@@ -157,15 +167,16 @@ class TestDynamicContext:
             max_tokens=None,
             is_hybrid_model=is_hybrid_model,
         )
-        dynamic_context.block_allocator.active_count = 10
+        dynamic_context.block_allocator.total_avail = 10
         assert dynamic_context.block_allocator.is_memory_available(10)
         assert not dynamic_context.block_allocator.is_memory_available(11)
 
         assert dynamic_context.block_allocator.is_memory_available(1)
-        dynamic_context.block_allocator.active_count = 0
+        dynamic_context.block_allocator.total_avail = 0
         assert not dynamic_context.block_allocator.is_memory_available(1)
 
     @pytest.mark.internal
+    @rounder_override(1)
     @pytest.mark.parametrize("is_hybrid_model", [False, True])
     def test_request_overflow(self, is_hybrid_model: bool):
         self._setup_model_parallel_group(1, 1)
@@ -179,12 +190,11 @@ class TestDynamicContext:
             buffer_size_gb=0.01,
             block_size_tokens=32,
             max_tokens=None,
-            rounder=1,
             is_hybrid_model=is_hybrid_model,
         )
-        dynamic_context.max_active_requests //= 2
+        dynamic_context.max_requests //= 2
         with pytest.raises(RequestOverflowError):
-            for i in range(dynamic_context.max_active_requests + 1):
+            for i in range(dynamic_context.max_requests + 1):
                 dynamic_context.add_request(
                     DynamicInferenceRequest(
                         request_id=i,
@@ -196,6 +206,7 @@ class TestDynamicContext:
                 )  # Adding more than allowed requests
 
     @pytest.mark.internal
+    @rounder_override(1)
     @pytest.mark.parametrize("is_hybrid_model", [False, True])
     def test_token_overflow_error(self, is_hybrid_model: bool):
         self._setup_model_parallel_group(1, 1)
@@ -208,8 +219,7 @@ class TestDynamicContext:
             max_sequence_length=512,
             buffer_size_gb=0.1,
             block_size_tokens=128,
-            max_tokens=200,  # setting low, but >= context.max_active_requests.
-            rounder=1,
+            max_tokens=200,  # setting low, but >= context.max_requests.
             is_hybrid_model=is_hybrid_model,
         )
 
@@ -225,6 +235,7 @@ class TestDynamicContext:
             )  # Exceeding max token count
 
     @pytest.mark.internal
+    @rounder_override(64)
     @pytest.mark.parametrize("is_hybrid_model", [False, True])
     def test_reset(self, is_hybrid_model: bool):
         self._setup_model_parallel_group(1, 1)
@@ -288,15 +299,18 @@ class TestDynamicContext:
         assert torch.all(dynamic_context.token_to_position_in_request == 0)
         assert torch.all(dynamic_context.token_to_block_idx == -1)
         assert torch.all(dynamic_context.token_to_local_position_within_kv_block == 0)
-        assert (
-            dynamic_context.block_allocator.active_count
-            == dynamic_context.block_allocator.total_count // 2
-        )
+        if not is_hybrid_model:
+            assert dynamic_context.block_allocator.active_count == 819
+            assert dynamic_context.block_allocator.total_count == 1024
+        else:
+            assert dynamic_context.block_allocator.active_count == 1517
+            assert dynamic_context.block_allocator.total_count == 1897
         assert torch.all(dynamic_context.request_to_kv_block_ids == -1)
         if is_hybrid_model:
             assert torch.all(dynamic_context.mamba_metadata.request_to_mamba_state_idx == -1)
 
     @pytest.mark.internal
+    @rounder_override(64)
     @pytest.mark.parametrize("is_hybrid_model", [False, True])
     def test_allocate_and_release_memory_blocks(self, is_hybrid_model):
         self._setup_model_parallel_group(1, 1)
@@ -313,7 +327,7 @@ class TestDynamicContext:
         )
 
         if is_hybrid_model:
-            expected_memory_blocks = [550, 551, 552, 553]
+            expected_memory_blocks = [551, 552, 553, 554]
         else:
             expected_memory_blocks = [486, 487, 488, 489]
         expected_block_count_avail = expected_memory_blocks[0]
@@ -345,6 +359,7 @@ class TestDynamicContext:
         )
 
     @pytest.mark.internal
+    @rounder_override(64)
     @pytest.mark.parametrize("is_hybrid_model", [False, True])
     def test_add_request(self, is_hybrid_model: bool):
         self._setup_model_parallel_group(1, 1)
@@ -379,7 +394,7 @@ class TestDynamicContext:
         assert dynamic_context.request_kv_length_offsets[0] == 0
         assert dynamic_context.request_kv_block_counts[0] == 2
         assert dynamic_context.request_last_kv_block_id[0].item() == (
-            553 if is_hybrid_model else 489
+            554 if is_hybrid_model else 489
         )
         assert dynamic_context.request_last_kv_block_offset[0].item() == 15
         assert torch.all(
@@ -418,6 +433,7 @@ class TestDynamicContext:
         )
 
     @pytest.mark.internal
+    @rounder_override(64)
     def test_add_dummy_requests_parallel_populates_state(self):
         self._setup_model_parallel_group(1, 1)
 
@@ -516,6 +532,7 @@ class TestDynamicContext:
         )
 
     @pytest.mark.internal
+    @rounder_override(64)
     def test_add_dummy_requests_parallel_hybrid_allocates_mamba(self):
         self._setup_model_parallel_group(1, 1)
 
@@ -546,6 +563,7 @@ class TestDynamicContext:
         assert torch.all(dynamic_context.mamba_ssm_states[:, mamba_idx] == 0)
 
     @pytest.mark.internal
+    @rounder_override(64)
     def test_add_dummy_requests_parallel_decode_does_not_count_as_prefill(self):
         self._setup_model_parallel_group(1, 1)
 
@@ -571,6 +589,7 @@ class TestDynamicContext:
         assert dynamic_context.num_prefill_requests == 0
 
     @pytest.mark.internal
+    @rounder_override(64)
     @pytest.mark.parametrize("is_hybrid_model", [False, True])
     def test_update_request(self, is_hybrid_model: bool):
         self._setup_model_parallel_group(1, 1)
@@ -737,13 +756,13 @@ class TestDynamicContext:
                 dynamic_context.request_to_kv_block_ids[0:10].cpu()
                 == torch.tensor(
                     [
-                        [543, 546, -1, -1],
-                        [544, 543, -1, -1],
-                        [548, 550, -1, -1],
+                        [544, 547, -1, -1],
+                        [545, 544, -1, -1],
                         [549, 551, -1, -1],
-                        [547, -1, -1, -1],
-                        [545, -1, -1, -1],
-                        [552, -1, -1, -1],
+                        [550, 552, -1, -1],
+                        [548, -1, -1, -1],
+                        [546, -1, -1, -1],
+                        [553, -1, -1, -1],
                         [-1, -1, -1, -1],
                         [-1, -1, -1, -1],
                         [-1, -1, -1, -1],
@@ -770,6 +789,7 @@ class TestDynamicContext:
             )
 
     @pytest.mark.internal
+    @rounder_override(64)
     @pytest.mark.parametrize("is_hybrid_model", [False, True])
     def test_release_memory_blocks_for_finished_requests(self, is_hybrid_model):
         """Test that memory blocks are correctly released for finished requests."""
@@ -842,6 +862,7 @@ class TestDynamicContext:
             assert mamba_idx[4] == -1
 
     @pytest.mark.internal
+    @rounder_override(64)
     @pytest.mark.parametrize("is_hybrid_model", [False, True])
     def test_finished_requests_with_multiple_blocks(self, is_hybrid_model):
         """Test that all memory blocks are correctly released for finished requests that use multiple blocks."""
@@ -909,6 +930,7 @@ class TestDynamicContext:
         assert dynamic_context.block_allocator.total_avail == initial_available_blocks + 6
 
     @pytest.mark.internal
+    @rounder_override(64)
     @pytest.mark.parametrize("is_hybrid_model", [False, True])
     def test_mamba_states_cache(self, is_hybrid_model: bool):
         self._setup_model_parallel_group(1, 1)
@@ -984,6 +1006,7 @@ class TestDynamicContext:
         assert torch.all(ssm_state_layer3 == 40.0)
 
     @pytest.mark.internal
+    @rounder_override(64)
     def test_calculate_and_store_log_probs(self):
         self._setup_model_parallel_group(1, 1)
         dynamic_context = self._get_dynamic_context(
@@ -1201,6 +1224,7 @@ class TestDynamicContext:
                 current_global_token_offset += expected_len
 
     @pytest.mark.internal
+    @rounder_override(64)
     def test_pipeline_parallel_uneven_layers(self):
         """
         Test that DynamicInferenceContext synchronizes the total block count across
@@ -1211,23 +1235,39 @@ class TestDynamicContext:
 
         rank = parallel_state.get_pipeline_model_parallel_rank()
 
+        mamba_conv_states_shape = (544, 4)
+        mamba_ssm_states_shape = (8, 64, 16)
+
         if rank == 0:
-            local_num_layers = 12
+            mamba_inference_state_config = MambaInferenceStateConfig(
+                [Symbols.MAMBA] + [Symbols.ATTENTION] * 4,
+                mamba_conv_states_shape,
+                mamba_ssm_states_shape,
+            )
         else:
-            local_num_layers = 4
+            mamba_inference_state_config = MambaInferenceStateConfig(
+                [Symbols.MAMBA] * 4 + [Symbols.ATTENTION],
+                mamba_conv_states_shape,
+                mamba_ssm_states_shape,
+            )
 
         context = DynamicInferenceContext(
-            params_dtype=torch.float32,
-            num_layers=local_num_layers,
-            kv_channels=64,
-            num_attention_heads=8,
-            max_sequence_length=128,
-            buffer_size_gb=0.1,
-            block_size_tokens=16,
-            max_tokens=1024,
-            pipeline_model_parallel_size=pp_size,
-            tensor_model_parallel_size=1,
-            unified_memory_level=0,
+            model_config=TransformerConfig(
+                params_dtype=torch.float32,
+                num_layers=10,
+                kv_channels=64,
+                num_attention_heads=8,
+                pipeline_model_parallel_size=pp_size,
+                tensor_model_parallel_size=1,
+                pipeline_dtype=torch.float32,
+            ),
+            inference_config=InferenceConfig(
+                max_sequence_length=128,
+                buffer_size_gb=0.1,
+                block_size_tokens=16,
+                max_tokens=1024,
+                unified_memory_level=0,
+            ),
         )
 
         # Collect the total block counts on each rank

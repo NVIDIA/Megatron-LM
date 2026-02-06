@@ -1013,6 +1013,8 @@ class TestPartialCudaGraph:
 
         return torch.tensor(loss_list)
 
+    @pytest.mark.flaky
+    @pytest.mark.flaky_in_dev
     @pytest.mark.skipif(
         not (HAVE_TE and is_te_min_version("2.10.0")),
         reason="Partial CUDA graph UT support requires TransformerEngine version >= 2.10.0",
@@ -1037,10 +1039,6 @@ class TestPartialCudaGraph:
             extra_kwargs["moe_token_dispatcher_type"] = "flex"
             extra_kwargs["moe_flex_dispatcher_backend"] = "deepep"
         elif moe_dispatcher_type == "hybridep":
-            pytest.skip(
-                "Currently, the Hybrid EP is broken. "
-                "Temporarily skip the test and wait for the fix."
-            )
             if not is_hybrid_ep_available():
                 pytest.skip("Hybrid EP is not available")
             extra_kwargs["moe_token_dispatcher_type"] = "flex"
@@ -1050,8 +1048,6 @@ class TestPartialCudaGraph:
         if not moe_dropless_dispatcher:
             if moe_dispatcher_type == "deepep":
                 pytest.skip("Deep EP doesn't support drop&pad MoE")
-            if moe_dispatcher_type == "hybridep" and ep_size == 1:
-                pytest.skip("Hybrid EP doesn't support drop&pad MoE with ep_size == 1")
             extra_kwargs["moe_expert_capacity_factor"] = 1.0
             extra_kwargs["moe_pad_expert_input_to_capacity"] = True
 
