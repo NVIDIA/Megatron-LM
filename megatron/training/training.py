@@ -2959,7 +2959,7 @@ def train(
         for param_group in optimizer.param_groups:
             if len(param_group['params']) == 0:
                 continue
-            print(f"DEFAULT CONFIG VALUE: {param_group['default_config']}")
+            print_rank_0(f"DEFAULT CONFIG VALUE: {param_group['default_config']}")
             if param_group['default_config']:
                 learning_rate = param_group['lr']
 
