@@ -775,6 +775,10 @@ def validate_args(args, defaults={}):
         if args.use_megatron_fsdp:
             args.reuse_grad_buf_for_mxfp8_param_ag = False
 
+    if args.nccl_ub and args.use_megatron_fsdp and args.expert_model_parallel_size > 1 \
+        and not args.disable_symmetric_registration:
+        raise NotImplementedError('NCCL userbuffer registration is currently not supported with expert parallelism')
+
     # Parameters dtype.
     args.params_dtype = torch.float
     if args.fp16:
