@@ -87,10 +87,12 @@ class BaseMoELayer(MegatronModule, ABC):
         config: TransformerConfig,
         layer_number: Optional[int] = None,
         pg_collection: Optional[ProcessGroupCollection] = None,
+        is_mtp_layer: bool = False,
     ):
         super(BaseMoELayer, self).__init__(config)
         self.config = config
         self.layer_number = layer_number
+        self.is_mtp_layer = is_mtp_layer
         self.ep_group = pg_collection.ep
         # use pg_collection.expt_tp_group as tensor parallel group in this module.
         self.attn_tp_group = pg_collection.tp
@@ -140,6 +142,7 @@ class MoELayer(BaseMoELayer):
         submodules: Optional[MoESubmodules] = None,
         layer_number: Optional[int] = None,
         pg_collection: Optional[ProcessGroupCollection] = None,
+        is_mtp_layer: bool = False,
     ):
         self.submodules = submodules
         # TODO(Hepteract): delete the usage of the global parallel_state.
@@ -147,7 +150,10 @@ class MoELayer(BaseMoELayer):
         if pg_collection is None:
             pg_collection = get_default_pg_collection()
         super(MoELayer, self).__init__(
-            config=config, layer_number=layer_number, pg_collection=pg_collection
+            config=config,
+            layer_number=layer_number,
+            pg_collection=pg_collection,
+            is_mtp_layer=is_mtp_layer,
         )
         # If using mcore cudagraphs, recompute is handled by transformer_layer.MoETransformerLayer
         self.moe_layer_recompute = (
@@ -163,7 +169,9 @@ class MoELayer(BaseMoELayer):
         self.tp_group = pg_collection.tp
 
         # Initialize router.
-        self.router = submodules.router(config=self.config, pg_collection=pg_collection)
+        self.router = submodules.router(
+            config=self.config, pg_collection=pg_collection, is_mtp_layer=is_mtp_layer
+        )
         self.tp_group = pg_collection.tp
 
         # Initialize latent projections.
@@ -451,10 +459,25 @@ class MoELayer(BaseMoELayer):
 
     def backward_dw(self, routed_experts: bool = True, shared_experts: bool = False):
         """Compute weight gradients for experts and shared experts."""
+        # TODO(Wohox): replace the "routed_experts" and "shared_experts" arguments with better
+        # naming to better explain that they are actually from different fine-grained callables,
+        # or use scanning to decide which backward_dw should be called.
         if routed_experts:
             self.experts.backward_dw()
-        if shared_experts and self.use_shared_expert and not self.shared_expert_overlap:
-            self.shared_experts.backward_dw()
+            if self.config.moe_latent_size:
+                # TODO(Wohox): fc2_latent_proj forward and backward are executed in comm stream,
+                # so we execute its backward_dw in the comm stream too. But this may harm the
+                # EP overlap performance. Better to check if there is a better way to handle this.
+                from megatron.core.pipeline_parallel.utils import get_comm_stream
+
+                comm_stream = get_comm_stream()
+                with torch.cuda.stream(comm_stream):
+                    self.fc2_latent_proj.backward_dw()
+        if shared_experts:
+            if self.use_shared_expert and not self.shared_expert_overlap:
+                self.shared_experts.backward_dw()
+            if self.config.moe_latent_size:
+                self.fc1_latent_proj.backward_dw()
 
     def set_for_recompute_pre_mlp_layernorm(self):
         """Set the MoE layer for recompute pre_mlp_layernorm. Only needed for fp8/fp4."""
