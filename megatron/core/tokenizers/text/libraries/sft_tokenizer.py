@@ -5,12 +5,19 @@ from typing import Dict, List, Union
 
 import numpy as np
 
+try:
+    import transformers
 
-# pylint: disable=all
+    HAVE_TRANSFORMERS = True
+except ModuleNotFoundError:
+    HAVE_TRANSFORMERS = False
+
+
+# fmt: off
 nemotron_h_aligned_custom_template = """{% for message in messages %}{% if message['role'] == 'system' %}{{ '<SPECIAL_10>System\n' + message['content'].strip() + '\n' }}{% elif message['role'] == 'user' %}{{ '<SPECIAL_11>User\n' + message['content'].strip() + '\n' + '<SPECIAL_11>Assistant\n' }}{% elif message['role'] == 'assistant' %}{{ message['content'].strip() + '\n' }}{% endif %}{% endfor %}""" # pylint: disable=line-too-long
 nemotron_nano_v2_custom_template = """{% for message in messages %}{% set content = message['content'] %}{% if message['role'] == 'system' %}{{ '<SPECIAL_10>System\n' + content.replace('/think', '').replace('/no_think', '').strip() + '\n' }}{% elif message['role'] == 'user' %}{{ '<SPECIAL_11>User\n' + content.replace('/think', '').replace('/no_think', '').strip() + '\n' }}{% elif message['role'] == 'assistant' %}{{ '<SPECIAL_11>Assistant\n' + content.strip() + '\n<SPECIAL_12>\n' }}{% endif %}{% endfor %}""" # pylint: disable=line-too-long
 identity_template = """{% for message in messages %}{{ message['content'] }}{% endfor %}"""
-# pylint: enable=all
+# fmt: on
 
 
 IGNORE_INDEX = -100
@@ -47,17 +54,15 @@ class SFTTokenizer:
             tokenizer_path (str): Underlying tokenizer path.
             prompt_format (str): Prompt format for the tokenizer.
         """
-        try:
-            import transformers
-        except ImportError:
+        if HAVE_TRANSFORMERS:
+            # Currently, only HuggingFace tokenizers are supported.
+            tokenizer = transformers.AutoTokenizer.from_pretrained(
+                pretrained_model_name_or_path=tokenizer_path
+            )
+        else:
             raise ImportError(
                 "SFTTokenizer currently requires transformers library to be installed"
-            )
-
-        # Currently, only HuggingFace tokenizers are supported.
-        tokenizer = transformers.AutoTokenizer.from_pretrained(
-            pretrained_model_name_or_path=tokenizer_path
-        )
+            )    
 
         self._vocab_size = len(tokenizer)
         self._tokenizer = tokenizer
@@ -168,7 +173,7 @@ class SFTTokenizer:
                 if self._prompt_config.assistant_prefix_len > 0:
                     target[idx : idx + self._prompt_config.assistant_prefix_len] = IGNORE_INDEX
             else:
-                raise ValueError(f"Wrong role value.")
+                raise ValueError("Wrong role value.")
 
             assert np.allclose(
                 tokens[idx : idx + turn_len], turn_tokens
@@ -215,6 +220,7 @@ class SFTTokenizer:
         return self._tokenizer.get_added_vocab()
 
     def add_special_tokens(self):
+        """Add special tokens."""
         raise NotImplementedError("This method is not supported for SFTTokenizer.")
 
     @property
