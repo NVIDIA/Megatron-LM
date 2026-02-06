@@ -59,7 +59,7 @@ class ProfilingConfig:
 
 
 @dataclass(kw_only=True)
-class DistributedInitConfig:
+class DistributedConfig:
     """Configuration settings for distributed training initialization."""
 
     distributed_backend: Literal["nccl", "gloo"] = "nccl"
