@@ -600,6 +600,7 @@ class DynamicInferenceContext(BaseInferenceContext):
         )
         # request_query_lengths is the input prompt tokens length during prefill phase (1st step) and then 1 for the decode phase (i.e During generation)
         self.request_query_lengths = torch.empty_like(self.request_ids)
+        # True only for a new request , then after a forward pass it is set to False
         self.request_in_prefill_status_tensor = torch.empty_like(self.request_ids)
         # request_output_lengths is len(input_prompt_tokens) + num_tokens_to_generate
         self.request_output_lengths = torch.empty_like(self.request_ids)
@@ -1491,7 +1492,7 @@ class DynamicInferenceContext(BaseInferenceContext):
             self.token_to_pos_ids[:num_tokens].unsqueeze(0),
         )
  
-    def last_token_logits(self, logits: Tensor, mtp_logits: Optional[Tensor] = None) -> Tensor:
+    def last_token_logits(self, logits: Tensor) -> Tensor:
         """Last tokens of logits.
 
         Args:
@@ -1506,10 +1507,9 @@ class DynamicInferenceContext(BaseInferenceContext):
             f"logits.size(1) ({tuple(logits.shape)}) != "
             f"padded_active_token_count ({self.padded_active_token_count})."
         )
-        # Logits shape is [1, padded_active_token_count, vocab_size]
 
         # Last token logits.
-        logits = logits.squeeze(0) # [padded_active_token_count, vocaba_size]
+        logits = logits.squeeze(0) 
         last_token_idxs = (
             torch.cumsum(
                 self.request_query_lengths[self.paused_request_count : self.total_request_count],
@@ -1977,7 +1977,7 @@ class DynamicInferenceContext(BaseInferenceContext):
         Args:
             active_requests_mask (Tensor): 1D Mask tensor marking active requests. (Active request length)
             new_tokens (Tensor): Newly sampled tokens, with one token per active request. (Active request length)
-            new_speculative_tokens (Tensor): Newly sampled speculative tokens, with one token per active request. (num_speculative_tokens, active_request_length)
+            new_speculative_tokens (Tensor): Newly sampled speculative tokens, with num_speculative tokens per active request. (num_speculative_tokens, active_request_length)
 
         Return:
             (Tensor) Newly paused request IDs.
@@ -1987,15 +1987,6 @@ class DynamicInferenceContext(BaseInferenceContext):
         # active_request_count -> This corresponds to requests that have not reached EOD or max length
         # finished_request_count are requests that have reached the termination criterion
 
-
-            # new_tokens :       [ b4 , c4,   a6] 
-            # actgive_requesT_mask [ 0   1    0 ]
-            #                      [1  0  0 ]
-            # new_spec_Tokens : [ [b4s1, c4s1, a6s1], 
-            #                     [b4s2, c4s2, a6s2]]
-
-            ## Vijay : [b4 b4s1, b4s2, c4 , c4s1, c4s2, a6 , a6s1, a6s2]
-            # 
         self.num_prefill_requests = 0  # all turns to decode
         # All request that were in prefill become decode requests
         self.request_in_prefill_status_tensor[self.request_in_prefill_status_tensor == 1] = 0 # TODO : Check how this works with chunked prefill
@@ -2193,65 +2184,65 @@ class DynamicInferenceContext(BaseInferenceContext):
             self.request_query_lengths[self.paused_request_count : self.total_request_count]
         )
 
-        self.request_query_lengths[self.paused_request_count : self.total_request_count].fill_(1 + self.num_speculative_tokens)
+        num_generated_tokens = 1 + self.num_speculative_tokens
+        self.request_query_lengths[self.paused_request_count : self.total_request_count].fill_(num_generated_tokens)
 
         old_offsets = self.request_last_kv_block_offset[self.paused_request_count : self.total_request_count].clone()
 
         self.request_last_kv_block_offset[self.paused_request_count : self.total_request_count] = (
-            old_offsets + 1 + self.num_speculative_tokens
+            old_offsets + num_generated_tokens
         ) % self.block_size_tokens
 
         # ================================================================
-        self.active_token_count = active_request_count  * (1 + self.num_speculative_tokens) 
+        self.active_token_count = active_request_count  * num_generated_tokens
         sampled_tokens = next_tokens[
             self.paused_request_count : self.total_request_count
         ]
+
         if self.num_speculative_tokens > 0:
             # new_speculative_tokens has shape [num_spec_tokens, num_requests], slice the request dimension (dim 1)
             sampled_speculative_tokens = new_speculative_tokens[
                 :, self.paused_request_count : self.total_request_count
             ]
-
-            next_tokens = torch.vstack([sampled_tokens.unsqueeze(0), sampled_speculative_tokens]).T.reshape(-1)# 
-        
+            # This will become [sampled, spec1, spec2, sampled, spec1, spec2 ...] # For every request we will have the sampled token followed by the speculative tokens (i.e next indices)
+            next_tokens = torch.vstack([sampled_tokens.unsqueeze(0), sampled_speculative_tokens]).T.reshape(-1)
         else:
             next_tokens = sampled_tokens
             
         self.token_to_input_ids[: self.active_token_count] = next_tokens
 
-        # kv length offsets will tell the sequence length (query + generated_tokens) (During add request alone its 0) (It tells how many tokens there are in kv cache)
+        # Req kv length offsets : [0, 5, 10 ... ]
+        # For num spec tokens = 2 , this will become [0, 1, 2, 5, 6, 7 10, 11, 12 ...] 
         self.token_to_pos_ids[: self.active_token_count] = self.request_kv_length_offsets[
             self.paused_request_count : self.total_request_count
-        ].repeat_interleave(1 + self.num_speculative_tokens) + torch.arange(1 + self.num_speculative_tokens, device=torch.cuda.current_device()).repeat(active_request_count)
+        ].repeat_interleave(num_generated_tokens) + torch.arange(num_generated_tokens, device=torch.cuda.current_device()).repeat(active_request_count)
         #
-
-        # 8. We make relevant changes to the token bookkeeping tensors [1 2 3]  [1 1 1 2 2 2 ]
+        # Token to request idx : [0, 0, 0, 1, 1, 1, 2, 2, 2 ...]
         self.token_to_request_idx[: self.active_token_count] = torch.arange(
             self.paused_request_count, self.total_request_count, device=torch.cuda.current_device()
-        ).repeat_interleave(1 + self.num_speculative_tokens)
+        ).repeat_interleave(num_generated_tokens)
 
         # shan : Same as token_to_pos_ids ? 
-        self.token_to_position_in_request[: self.active_token_count] = (
-            self.request_kv_length_offsets[self.paused_request_count : self.total_request_count]
-        ).repeat_interleave(1 + self.num_speculative_tokens) + torch.arange(1 + self.num_speculative_tokens, device=torch.cuda.current_device()).repeat(active_request_count)
+        self.token_to_position_in_request[: self.active_token_count] = self.token_to_pos_ids[: self.active_token_count]
 
         self.token_to_local_position_within_kv_block[: self.active_token_count] = self.token_to_pos_ids[: self.active_token_count] % self.block_size_tokens
 
-
         current_block_ids = self.request_last_kv_block_id[self.paused_request_count : self.total_request_count]
-        # 16 IS THE NUMBER OF TOKENS 
-        # 4 speculative tokens 
-        # 14  (2 )
-        raw_positions = old_offsets[:, None] + 1 + torch.arange(1 + self.num_speculative_tokens + 1, device=torch.cuda.current_device())[None, :]  # [active_request_count, num_speculative_tokens + 1] (+1 for generated toekns)
+
+        # raw positions shape : [active_request_count, num_generated_tokens]
+        # e.g block size 6, old_offsets = [1,5,2] , num_generated_tokens = 3 
+        # raw_positions = [[1, 2, 3], [5, 6, 7], [2, 3, 4]]
+        # crosses_boundary = [[False, False, False], [False, True, True], [False, False, False]]
+        raw_positions = old_offsets[:, None] + torch.arange(num_generated_tokens, device=torch.cuda.current_device())[None, :]  
+        #
         # A token crosses to the next block if its raw_position >= block_size
         crosses_boundary = raw_positions >= self.block_size_tokens
 
-        # TOKEN TO BLOCK IDX alone is quite complex
-        if not crosses_boundary.any():
+        if not crosses_boundary.any() or self.num_speculative_tokens == 0:
              # Fast path: no tokens cross block boundary, all use current block
             self.token_to_block_idx[: self.active_token_count] = self.request_last_kv_block_id[
                 self.paused_request_count : self.total_request_count
-            ].repeat_interleave(1 + self.num_speculative_tokens) 
+            ].repeat_interleave(num_generated_tokens) 
         else:
 
                 # Some tokens cross to the next block (this happens for resumed requests)
@@ -2279,7 +2270,9 @@ class DynamicInferenceContext(BaseInferenceContext):
                 
                 # Build block_idx: [active_count, N]
                 # Start with current (new) block for all
-                block_idx = current_block_ids[:, None].expand(-1, 1 + self.num_speculative_tokens).clone()  # [active_count, N]
+                # Lets say current block ids is [a1, a2 , a3] and num generated_tokens is 3
+                # This will be [[a1, a1, a1], [a2, a2, a2], [a3, a3, a3]]
+                block_idx = current_block_ids[:, None].expand(-1, num_generated_tokens).clone()  # [active_count, N]
                 
                 # For requests that have crossing, tokens BEFORE boundary use prev block
                 # crosses_boundary is False for tokens before boundary
@@ -2287,11 +2280,11 @@ class DynamicInferenceContext(BaseInferenceContext):
                 use_prev_block = request_has_crossing[:, None] & ~crosses_boundary  # [active_count, N]
                 
                 # Apply previous block IDs where needed
-                prev_block_ids_expanded = prev_block_ids[:, None].expand(-1, 1 + self.num_speculative_tokens)
+                prev_block_ids_expanded = prev_block_ids[:, None].expand(-1, num_generated_tokens)
                 block_idx = torch.where(use_prev_block, prev_block_ids_expanded, block_idx)
                 
+                # Convert back to 1d tensor
                 self.token_to_block_idx[: self.active_token_count] = block_idx.flatten() 
-        # ================================================================
 
         return {
             "newly_paused_request_ids": newly_paused_request_ids,

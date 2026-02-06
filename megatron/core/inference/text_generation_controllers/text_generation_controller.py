@@ -100,7 +100,7 @@ class TextGenerationController:
 
     def _init_dynamic_sampling_tensors(self):
         """Initialize tensors needed for dynamic sampling."""
-        context: DynamicInferenceContext = self.inference_wrapped_model.inference_context
+        context = self.inference_wrapped_model.inference_context
         max_requests = context.max_requests
 
         # Callback to get request IDs that should be marked as finished due to stop words
@@ -135,7 +135,7 @@ class TextGenerationController:
     def _init_mtp_sampling_tensor(self):
         """Initialize the MTP sampling tensor after num_speculative_tokens is set."""
         if self.num_speculative_tokens is not None and self.num_speculative_tokens > 0:
-            context: DynamicInferenceContext = self.inference_wrapped_model.inference_context
+            context = self.inference_wrapped_model.inference_context
             max_requests = context.max_requests
             device = torch.cuda.current_device()
             self._sampled_mtp_tokens_cuda = torch.empty(
@@ -530,7 +530,7 @@ class TextGenerationController:
             input_ids (Tensor): The active input IDs.
             position_ids (Tensor): The active position IDs.
         """
-        context: DynamicInferenceContext = self.inference_wrapped_model.inference_context
+        context = self.inference_wrapped_model.inference_context
         inference_wrapper_config = self.inference_wrapped_model.inference_wrapper_config
         active_request_slice = slice(context.paused_request_count, context.total_request_count)
 
@@ -597,7 +597,7 @@ class TextGenerationController:
         """
         inference_wrapper_config = self.inference_wrapped_model.inference_wrapper_config
 
-        context: DynamicInferenceContext = self.inference_wrapped_model.inference_context
+        context = self.inference_wrapped_model.inference_context
         active_request_count = context.total_request_count - context.paused_request_count
 
         with torch.inference_mode():
@@ -640,7 +640,7 @@ class TextGenerationController:
 
     def _dynamic_step_sample_bookkeeping(self):
         """Perform bookkeeping necessary to sample logits for dynamic batching."""
-        context: DynamicInferenceContext = self.inference_wrapped_model.inference_context
+        context = self.inference_wrapped_model.inference_context
         active_request_slice = slice(context.paused_request_count, context.total_request_count)
 
         if self._sampling_backend == "torch":
@@ -653,9 +653,9 @@ class TextGenerationController:
             top_k = self._request_metadata["top_k"][active_request_slice].tolist()
             top_p = self._request_metadata["top_p"][active_request_slice].tolist()
 
-            for i, (t, k, p) in enumerate(zip(temp, top_k, top_p)):
+            for request_index, (t, k, p) in enumerate(zip(temp, top_k, top_p)):
                 sampling_params = (t, k, p)
-                bucket_map[sampling_params].append(i)
+                bucket_map[sampling_params].append(request_index)
 
             # Just unpack the key directly!
             self._torch_sampling_buckets = [
@@ -677,7 +677,7 @@ class TextGenerationController:
            - Clear the entry in request_to_kv_block_ids for the released block
            - Release the block back to the allocator
         """
-        context: DynamicInferenceContext = self.inference_wrapped_model.inference_context
+        context = self.inference_wrapped_model.inference_context
         active_request_count = context.total_request_count - context.paused_request_count
         active_request_slice = slice(context.paused_request_count, context.total_request_count)
 
@@ -747,7 +747,7 @@ class TextGenerationController:
     def _dynamic_step_sample_logits_and_verify_tokens(self, logits: Tensor, mtp_logits: Tensor, input_ids: Tensor):
         f"""Sample tokens from logits for dynamic batching with speculative tokens and verify the tokens.
         """ 
-        context: DynamicInferenceContext = self.inference_wrapped_model.inference_context
+        context = self.inference_wrapped_model.inference_context
         active_request_count = context.total_request_count - context.paused_request_count
 
 
@@ -917,7 +917,7 @@ class TextGenerationController:
         # and then broadcast the sampled tokens rather than broadcasting the raw logits.
 
         # Last token logits.
-        context: DynamicInferenceContext = self.inference_wrapped_model.inference_context
+        context = self.inference_wrapped_model.inference_context
         if context.materialize_only_last_token_logits:
             # When materialize_only_last_token_logits is true, last_token_logits is
             # already called in the forward pass of GPT.
@@ -953,7 +953,7 @@ class TextGenerationController:
         Returns:
             return_log_probs (bool): Whether to return the sampled log_probs.
         """
-        context: DynamicInferenceContext = self.inference_wrapped_model.inference_context
+        context = self.inference_wrapped_model.inference_context
         active_request_slice = slice(context.paused_request_count, context.total_request_count)
 
         return_log_probs = self._request_metadata["return_log_probs"][active_request_slice]
@@ -963,7 +963,7 @@ class TextGenerationController:
 
     def _dynamic_step_calculate_log_probs(self, logits: Tensor) -> Optional[Tensor]:
         """Calculate log probs from logits."""
-        context: DynamicInferenceContext = self.inference_wrapped_model.inference_context
+        context = self.inference_wrapped_model.inference_context
         active_request_count = context.total_request_count - context.paused_request_count
 
         return context.calculate_log_probs(
@@ -992,7 +992,7 @@ class TextGenerationController:
             "computing log_probs when return_top_n_logprobs is True."
         )
 
-        context: DynamicInferenceContext = self.inference_wrapped_model.inference_context
+        context = self.inference_wrapped_model.inference_context
         active_request_count = context.total_request_count - context.paused_request_count
         active_request_slice = slice(context.paused_request_count, context.total_request_count)
 
@@ -1060,7 +1060,7 @@ class TextGenerationController:
         """Perform a dummy forward pass. This is used in expert model parallelism
         on ranks that do not have any real requests."""
 
-        context: DynamicInferenceContext = self.inference_wrapped_model.inference_context
+        context = self.inference_wrapped_model.inference_context
         # if no cuda graphs, directly use dummy forward
         if not context.cuda_graph_batch_dimensions_list:
             return self.inference_wrapped_model.dummy_forward()
@@ -1101,7 +1101,7 @@ class TextGenerationController:
                 newly_paused_request_ids (Tensor): Newly paused request IDs.
                 finished_request_ids (Tensor): Finished request IDs.
         """
-        context: DynamicInferenceContext = self.inference_wrapped_model.inference_context
+        context = self.inference_wrapped_model.inference_context
         active_request_count = context.total_request_count - context.paused_request_count
         active_request_slice = slice(context.paused_request_count, context.total_request_count)
 
@@ -1110,8 +1110,7 @@ class TextGenerationController:
         active_sequence_lengths = context.get_active_sequence_lengths()
 
         if self.num_speculative_tokens > 0:
-            accepted_token_counts_per_request = self._accepted_token_counts_per_request[:active_request_count]
-            active_sequence_lengths += accepted_token_counts_per_request + 1   
+            active_sequence_lengths += self._accepted_token_counts_per_request[:active_request_count] + 1   
         else:
             active_sequence_lengths += 1
         max_sequence_lengths = context.get_max_sequence_lengths()
@@ -1174,7 +1173,7 @@ class TextGenerationController:
                 log_probs (Optional[Tensor]): Log probabilities of the new sample, if requested.
                 cuda_graph_request_count (Optional[int]): Size of cuda graph used for this step.
         """
-        context: DynamicInferenceContext = self.inference_wrapped_model.inference_context
+        context = self.inference_wrapped_model.inference_context
         active_request_count = context.total_request_count - context.paused_request_count
 
         # No tokens?
@@ -1191,8 +1190,7 @@ class TextGenerationController:
         mtp_logits = None
         if logits_and_mtp_logits.shape[0] > 1:
             logits = logits_and_mtp_logits[:1] # [1, seq_len, vocab_size]
-            mtp_logits = logits_and_mtp_logits[1:] # [num_speculative_tokens, seq_len, vocab_size]
-            print(f"mtp_logits: {mtp_logits.shape}",f"logits: {logits.shape}")
+            mtp_logits = logits_and_mtp_logits[1:] # [num_speculative_tokens, seq_len, vocab_size]\
         else:
             logits = logits_and_mtp_logits
  
@@ -1204,8 +1202,9 @@ class TextGenerationController:
         # Todo [Siddharth]: Can we condition the sleep on a cuda event?
         # NOTE [TDE]: This will be moved once CPU and GPU methods are separated.
         await asyncio.sleep(0)
-        # For now lets not care about log probs and top n logprobs 
         return_log_probs, return_top_n_logprobs = self._dynamic_step_log_probs_bookkeeping()
+        if self.num_speculative_tokens > 0:
+            assert return_log_probs == False and return_top_n_logprobs == False, "Log probs and top n log probs are not supported with speculative tokens"
 
         self._dynamic_step_sample_bookkeeping()
 
@@ -1228,11 +1227,10 @@ class TextGenerationController:
         if skip_bookkeeping:
             request_bookkeeping = {}
         else:
-            request_bookkeeping = self._dynamic_step_context_bookkeeping()
-        sample = self._sampled_tokens_cuda[:active_request_count] 
+            request_bookkeeping = self._dynamic_step_context_bookkeeping() 
 
         ret = {
-            "sample": sample,
+            "sample": self._sampled_tokens_cuda[:active_request_count],
             "accepted_tokens": self._accepted_tokens_per_request, 
             "log_probs": log_probs,
             "top_n_logprobs": top_n_logprobs,
@@ -1503,7 +1501,7 @@ class TextGenerationController:
                     self.inference_wrapped_model.inference_context.is_decode_only()
                     or not (sampling_params.return_log_probs or sampling_params.top_n_logprobs > 0)
                 )
-                inference_context: DynamicInferenceContext = self.inference_wrapped_model.inference_context
+                inference_context = self.inference_wrapped_model.inference_context
                 inference_context.materialize_only_last_token_logits = (
                     materialize_only_last_token_logits
                 )

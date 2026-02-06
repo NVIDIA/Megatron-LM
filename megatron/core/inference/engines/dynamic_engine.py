@@ -193,6 +193,7 @@ class DynamicInferenceEngine(AbstractEngine):
         if self.num_speculative_tokens > 0:
             assert not self.context.materialize_only_last_token_logits, "Speculative decoding requires materialize_only_last_token_logits to be False"
             assert self.num_speculative_tokens <= self.controller.num_mtp_heads, f"Number of speculative tokens {self.num_speculative_tokens} must be less than or equal to number of MTP heads {self.controller.num_mtp_heads}"
+            assert not self.enable_chunked_prefill, "Chunked prefill is not supported with speculative tokens"
         
         self.context.num_speculative_tokens = num_speculative_tokens
         self.controller.num_speculative_tokens = num_speculative_tokens
