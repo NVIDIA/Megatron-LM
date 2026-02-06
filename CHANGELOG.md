@@ -1,5 +1,9 @@
 # Changelog
 
+## NVIDIA Megatron Core 0.15.3
+
+This release addresses known security issues. For the latest NVIDIA Vulnerability Disclosure Information visit <https://www.nvidia.com/en-us/security/>, for acknowledgement please reach out to the NVIDIA PSIRT team at <PSIRT@nvidia.com>
+
 ## NVIDIA Megatron Core 0.15.0
 
 * Features  
