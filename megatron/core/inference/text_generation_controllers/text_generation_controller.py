@@ -1208,7 +1208,7 @@ class TextGenerationController:
 
         self._dynamic_step_sample_bookkeeping()
 
-        if self.num_speculative_tokens > 1:
+        if self.num_speculative_tokens > 0:
             self._dynamic_step_sample_logits_and_verify_tokens(logits, mtp_logits, input_ids)
             self._rewind_kv_cache()
         else:
