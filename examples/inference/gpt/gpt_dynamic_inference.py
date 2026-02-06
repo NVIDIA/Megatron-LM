@@ -443,7 +443,7 @@ def main():
     # Reset peak memory stats so functional tests measure this run and not
     # whatever happened earlier during initialization.
     torch.cuda.reset_peak_memory_stats()
-
+    
     # Sampling params.
     sampling_params = SamplingParams(
         temperature=args.temperature,

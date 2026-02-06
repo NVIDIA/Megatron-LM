@@ -686,7 +686,12 @@ class TextGenerationController:
         accepted_tokens_per_request = self._accepted_token_counts_per_request[:active_request_count]
 
         # Number of tokens to rewind (rejected speculative tokens)
-        num_tokens_to_rewind = accepted_tokens_per_request - self.num_speculative_tokens
+        num_tokens_to_rewind = self.num_speculative_tokens - accepted_tokens_per_request
+
+        # For prefill requests, no speculative tokens were forwarded through the model,
+        # so there is nothing to rewind. 
+        request_in_prefill_status = context.request_in_prefill_status_tensor[active_request_slice]
+        num_tokens_to_rewind[request_in_prefill_status == 1] = 0
 
         # Save the original offset BEFORE modifying to correctly detect block boundary crossing
         original_offset = context.request_last_kv_block_offset[active_request_slice].clone()
@@ -1236,6 +1241,9 @@ class TextGenerationController:
             "top_n_logprobs": top_n_logprobs,
             "cuda_graph_request_count": cuda_graph_request_count,
         }
+        if self.num_speculative_tokens > 0:
+            self._accepted_tokens_per_request.fill_(-1)
+            self._accepted_token_counts_per_request.fill_(0)
         ret.update(request_bookkeeping)
         return ret
 
