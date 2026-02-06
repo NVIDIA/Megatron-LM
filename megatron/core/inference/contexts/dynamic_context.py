@@ -2081,7 +2081,7 @@ class DynamicInferenceContext(BaseInferenceContext):
                 self.paused_request_count : (active_request_count + self.paused_request_count)
             ]
             active_requests_requiring_new_block = (
-                num_tokens_in_last_block > self.block_size_tokens - 1 - self.num_speculative_tokens
+                num_tokens_in_last_block >= self.block_size_tokens - 1 - self.num_speculative_tokens
             ).byte()
 
             if self.chunked_prefill_request_id != -1:
@@ -2143,7 +2143,7 @@ class DynamicInferenceContext(BaseInferenceContext):
         # After resume_paused_requests, request_last_kv_block_id will be updated to the NEW block
         # for resumed requests, but we need the OLD block for tokens that don't cross.
         prev_last_block_ids = None
-        if self.num_speculative_tokens > 1:
+        if self.num_speculative_tokens > 0:
             prev_last_block_ids = self.request_last_kv_block_id.clone()
 
 
