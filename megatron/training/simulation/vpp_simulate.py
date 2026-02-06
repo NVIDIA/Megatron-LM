@@ -6,6 +6,7 @@ import logging
 import os
 import time
 import json
+from contextlib import contextmanager
 from typing import Dict, List, Tuple
 
 import torch
@@ -30,45 +31,28 @@ from megatron.training.simulation.model_executor import (
 logger = logging.getLogger(__name__)
 
 
-def calculate_model_static_memory(model):
-    """Calculate static memory (parameters + gradients) for a model
+@contextmanager
+def _preserve_pipeline_parallel_state():
+    """Context manager to preserve and restore pipeline parallel state
 
-    Args:
-        model: Model or list of model chunks (for VPP)
+    This context manager saves the original pipeline parallel state on entry
+    and restores it on exit. The actual state modification is done manually
+    inside the context.
 
-    Returns:
-        tuple: (params_memory_gb, grads_memory_gb)
+    This is used in VPP simulation where we use EP GPUs to simulate PP*EP GPUs.
+    We need to temporarily set PP rank/size to call functions that depend on
+    parallel_state, but restore the original state afterwards.
     """
-    # Handle list of model chunks (VPP case)
-    model_chunks = model if isinstance(model, list) else [model]
+    # Save original state
+    original_pp_rank = parallel_state.get_pipeline_model_parallel_rank()
+    original_pp_size = parallel_state.get_pipeline_model_parallel_world_size()
 
-    total_params_bytes = 0
-    total_grads_bytes = 0
-
-    for model_chunk in model_chunks:
-        # Access DDP buffers (_ParamAndGradBuffer instances)
-        # Megatron uses buffers to manage parameters and gradients
-        all_buffers = []
-
-        if hasattr(model_chunk, 'buffers'):
-            all_buffers = model_chunk.buffers
-        if hasattr(model_chunk, 'expert_parallel_buffers'):
-            all_buffers += model_chunk.expert_parallel_buffers
-
-        for buffer in all_buffers:
-            # Parameter memory from buffer
-            if hasattr(buffer, 'param_data') and buffer.param_data is not None:
-                total_params_bytes += buffer.param_data.numel() * buffer.param_data.element_size()
-
-            # Gradient memory from buffer
-            if hasattr(buffer, 'grad_data') and buffer.grad_data is not None:
-                total_grads_bytes += buffer.grad_data.numel() * buffer.grad_data.element_size()
-
-    # Convert to GB
-    params_memory_gb = total_params_bytes / (1024 ** 3)
-    grads_memory_gb = total_grads_bytes / (1024 ** 3)
-
-    return params_memory_gb, grads_memory_gb
+    try:
+        yield
+    finally:
+        # Restore original state (guaranteed even if exception occurs)
+        parallel_state.set_pipeline_model_parallel_rank(original_pp_rank)
+        parallel_state.set_pipeline_model_parallel_world_size(original_pp_size)
 
 
 class VppSimulator(object):
@@ -188,8 +172,11 @@ class VppSimulator(object):
 
         self._create_cross_pp_rank_dependencies()
 
-        for pp_rank in range(self.pipeline_parallel_size):
-            self._create_pp_rank_schedule_dependencies(pp_rank)
+        # Use context manager to preserve and restore original parallel_state
+        # Inside the loop, we manually set the state for each PP rank simulation
+        with _preserve_pipeline_parallel_state():
+            for pp_rank in range(self.pipeline_parallel_size):
+                self._create_pp_rank_schedule_dependencies(pp_rank)
 
     def _create_cross_pp_rank_dependencies(self):
         """Create cross-PP rank pipeline dependencies
@@ -212,22 +199,33 @@ class VppSimulator(object):
                     current_backward_task.dependencies.append(next_backward_task.task_id)
 
     def _get_pp_rank_microbatches(self, pp_rank: int):
-        num_warmup_microbatches = (self.pipeline_parallel_size - pp_rank - 1) * 2
-        num_warmup_microbatches += (self.num_model_chunks - 1) * self.microbatch_group_size_per_vp_stage
+        """Get microbatch distribution for a specific PP rank
 
-        if num_warmup_microbatches >= self.total_num_microbatches:
-            num_warmup_microbatches = self.total_num_microbatches
-            are_all_microbatches_in_warmup = True
-        else:
-            are_all_microbatches_in_warmup = False
+        This function replaces the previous hardcoded logic by directly calling
+        get_pp_rank_microbatches from schedules.py. It assumes parallel_state
+        has been set to the correct pp_rank before calling (via context manager).
 
-        num_microbatches_remaining = self.total_num_microbatches - num_warmup_microbatches
+        Args:
+            pp_rank: Pipeline parallel rank (for documentation; actual value from parallel_state)
 
-        return (
-            self.total_num_microbatches,
-            are_all_microbatches_in_warmup,
-            num_warmup_microbatches,
-            num_microbatches_remaining,
+        Returns:
+            Tuple of (total_num_microbatches, are_all_microbatches_in_warmup,
+                      num_warmup_microbatches, num_microbatches_remaining)
+        """
+        args = get_args()
+        # Set parallel_state for this PP rank to simulate its behavior
+        parallel_state.set_pipeline_model_parallel_rank(pp_rank)
+        parallel_state.set_pipeline_model_parallel_world_size(self.pipeline_parallel_size)
+
+        # Call the original function from schedules.py
+        # The pp_rank is read from parallel_state inside get_pp_rank_microbatches
+        return get_pp_rank_microbatches(
+            num_microbatches=self.num_microbatches,
+            num_model_chunks=self.num_model_chunks,
+            microbatch_group_size_per_vp_stage=self.microbatch_group_size_per_vp_stage,
+            forward_only=False,
+            overlap_moe_expert_parallel_comm=getattr(args, 'overlap_moe_expert_parallel_comm', False),
+            p2p_communicator=None
         )
 
     def _get_microbatch_id_in_model_chunk(self, virtual_microbatch_id: int, forward: bool):
