@@ -1249,6 +1249,8 @@ def prepare_data_for_update(
             pp_group = pg_collection.pp
 
             with torch.no_grad(), nvtx_range("compute_old_logprobs", time=True):
+                # print("STUMPED")
+                # torch.distributed.breakpoint()
                 old_logprobs = _compute_logprobs_batch(
                     model=model,
                     data_loader=data_loader,
@@ -1691,6 +1693,11 @@ def megatron_rl_inference_mode(
 
     logger.debug(f"[{dist.get_rank()}] Entering inference mode")
 
+    # Change cudagraph scope for training
+    print("IN INFERENCE")
+    # torch.distributed.breakpoint()
+    model[0].config.cuda_graph_scope = ["full"]
+
     # If we get a lower precision wrapper, we go one object deeper.
     lang_module = model[0].module.module if hasattr(model[0].module, "module") else model[0].module
 
@@ -1772,6 +1779,11 @@ def megatron_rl_inference_mode(
         # TODO: Remove this if statement once a change to `toggle_cuda_graphs` makes it safe to.
         if cuda_graph_impl != "none" and not args.rl_training_cuda_graphs:
             toggle_cuda_graphs(lang_module, 'none', reset_cuda_graphs=reset_cuda_graphs)
+
+        # Change cudagraph scope for training
+        print("IN TRAINING")
+        model[0].config.cuda_graph_scope = ["mamba", "attn", "moe_router"]
+        # torch.distributed.breakpoint()
 
         # If this is a separate RL inference model, prefetch weights back to CPU so they don't consume
         # GPU memory during training.
