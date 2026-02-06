@@ -661,7 +661,7 @@ class GPTModel(LanguageModule):
                     )
         sequence_parallel_override = False
 
-        if in_inference_mode and inference_context.materialize_only_last_token_logits:
+        if in_inference_mode and inference_context.config.materialize_only_last_token_logits:
             if inference_context.is_static_batching():
                 hidden_states = hidden_states[-1:, :, :]
             else:
@@ -691,7 +691,7 @@ class GPTModel(LanguageModule):
             assert (
                 in_inference_mode
                 and inference_context.is_dynamic_batching()
-                and inference_context.materialize_only_last_token_logits
+                and inference_context.config.materialize_only_last_token_logits
             )
             self.output_layer.sequence_parallel = True
 
