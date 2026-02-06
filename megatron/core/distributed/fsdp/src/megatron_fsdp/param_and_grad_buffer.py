@@ -659,6 +659,11 @@ class RotaryBucketAllocator(TemporaryBucketAllocator):
             self.idle_buffer.append(buffer_id)
 
 
+class PoolExhaustedError(RuntimeError):
+    """Raised when the FixedPoolAllocator runs out of free blocks."""
+    pass
+
+
 class FixedPoolAllocator(TemporaryBucketAllocator):
     """
     A specialized temporary bucket allocator that implements a buffer recycling strategy
@@ -759,13 +764,15 @@ class FixedPoolAllocator(TemporaryBucketAllocator):
                         self.idle_buffer.remove((buf_group_id, bucket_offset))
                         break
 
-            assert buffer_name is not None, (
-                f"[FSDP][Rank {torch.distributed.get_rank()}][{self.name}] "
-                f"No buffer found for bucket_id: {bucket_id}, fsdp_unit_id: {fsdp_unit_id}, "
-                f"bucket_offset: {bucket_offset} \n"
-                f"current using_buffer: {self.using_buffer} \n"
-                f"current idle_buffer: {self.idle_buffer}"
-            )
+            if buffer_name is None:
+                raise PoolExhaustedError(
+                    f"[FSDP][Rank {torch.distributed.get_rank()}][{self.name}] "
+                    f"FixedPoolAllocator pool exhausted for bucket_id: {bucket_id}, "
+                    f"fsdp_unit_id: {fsdp_unit_id}, offset_in_buffer_group: {bucket_offset} \n"
+                    f"current using_buffer: {self.using_buffer} \n"
+                    f"current idle_buffer: {self.idle_buffer}"
+                )
+
             # Synchronization is required before the allocation for the user buffer
             if mem_alloc_context is not None and mem_alloc_context != nullcontext:
                 # Check if a new buffer allocation is required
@@ -2854,6 +2861,19 @@ class ParamAndGradBuffer:
                 if is_blockwise_float8tensor(param) or is_nvfp4tensor(param):
                     use_copy_in_out_quant = True
                     fp8_params.append(param)
+                    try:
+                        bucket = wbuf.fetch_bucket(set_param_data=True)
+                    except PoolExhaustedError:
+                        # If we run out of memory in the pool for blockwise FP8
+                        # quantization working buffer, flush any pending
+                        # quantization operations and free up the working
+                        # buffers.
+                        _batch_quantize_if_needed(
+                            dense_param_quantize_kwargs,
+                            expert_param_quantize_kwargs,
+                            copy_io_quant_params,
+                        )
+                        bucket = wbuf.fetch_bucket(set_param_data=True)
                     if model_param.numel() == 0:
                         # Empty parameter.
                         shard_fp32_from_fp8.append(None)
@@ -2864,7 +2884,6 @@ class ParamAndGradBuffer:
                         shard_offsets_in_fp8.append(
                             mbuf.locate_item_in_global_item(item_id, shard_only=use_wbuf_shard)[0]
                         )
-                        bucket = wbuf.fetch_bucket(set_param_data=True)
                         b_model_param = wbuf.get_item_from_bucket(
                             bucket,
                             item_id,
