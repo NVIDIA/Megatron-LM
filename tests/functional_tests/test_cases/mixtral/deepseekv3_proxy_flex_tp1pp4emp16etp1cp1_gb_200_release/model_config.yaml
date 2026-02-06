@@ -134,7 +134,7 @@ MODEL_ARGS:
     # Add checkpointing args
   --save: ${CHECKPOINT_SAVE_PATH}
   --load: ${CHECKPOINT_LOAD_PATH}
-  --save-interval: 5000
+  --save-interval: 1000
   --save-retain-interval: 10000
   --dist-ckpt-strictness: log_all
 
