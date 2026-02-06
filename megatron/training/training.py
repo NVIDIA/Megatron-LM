@@ -254,19 +254,53 @@ def num_floating_point_operations(args, batch_size):
         shared_flops = 4 * batch_size * seq_len * hidden_size * shared_expert_ffn_hidden_size * scale_factor
         return routed_flops + shared_flops
 
+    def get_effective_seq_length(seq_len):
+        """
+        Calculate effective sequence length for attention FLOPs based on attention pattern.
+
+        For causal attention, only half the attention matrix is computed (lower triangular),
+        so we use seq_len / 2. For specialized attention patterns:
+        - Sliding Window Attention: uses min(seq_len, window_size)
+        - Chunk Attention: uses chunk_size
+        """
+        # Check for chunk attention (e.g., Llama 4)
+        if hasattr(args, 'chunk_attention_size') and args.chunk_attention_size is not None:
+            effective_len = args.chunk_attention_size
+        # Check for sliding window attention (e.g., Gemma 3)
+        elif hasattr(args, 'window_size') and args.window_size is not None:
+            # window_size is a tuple (local_window, global_window)
+            # For FLOPs calculation, use the maximum window size
+            if isinstance(args.window_size, tuple):
+                # Filter out -1 (infinite window) and take the max of finite windows
+                finite_windows = [w for w in args.window_size if w > 0]
+                if finite_windows:
+                    effective_len = min(seq_len, max(finite_windows))
+                else:
+                    # All windows are infinite (-1), so use full seq_len
+                    effective_len = seq_len
+            else:
+                effective_len = min(seq_len, args.window_size)
+        else:
+            # Full causal attention - only half the matrix is computed
+            effective_len = seq_len
+
+        # For causal attention, divide by 2 (lower triangular matrix)
+        return effective_len / 2
+        
     def attn_layer_flops(
         batch_size, seq_len, hidden_size, num_heads, gqa=True, gqa_groups=8, kv_channels=None
     ):
         """Calculate FLOPs for an attention layer."""
         p = (kv_channels * num_heads / hidden_size) if kv_channels else 1
         g = gqa_groups if gqa else num_heads
+        effective_seq_len = get_effective_seq_length(seq_len)
         return (
             4
             * batch_size
             * seq_len
             * hidden_size
             * p
-            * (hidden_size + (hidden_size * (g / num_heads)) + (seq_len / 2))
+            * (hidden_size + (hidden_size * (g / num_heads)) + effective_seq_len)
         )
 
     def mamba_layer_flops(batch_size, seq_len, hidden_size, state_dim=16,
@@ -407,6 +441,7 @@ def num_floating_point_operations(args, batch_size):
                     + args.num_attention_heads * (args.qk_head_dim + args.qk_pos_emb_head_dim)
                     + 1
                 )
+            effective_seq_length = get_effective_seq_length(args.seq_length)
             standard_self_attn_term = (
                 forward_backward_expansion_factor
                 * fma_expansion_factor
@@ -423,11 +458,11 @@ def num_floating_point_operations(args, batch_size):
                     + args.hidden_size * args.qk_pos_emb_head_dim
                     ## o proj
                     + (args.num_attention_heads * args.v_head_dim) * args.hidden_size
-                    ## core attn
-                    + args.seq_length
+                    ## core attn - QK^T
+                    + effective_seq_length
                     * (args.num_attention_heads * (args.qk_head_dim + args.qk_pos_emb_head_dim))
-                    / 2  # causal mask (only half of the mask is non-zero)
-                    + args.seq_length * args.num_attention_heads * args.v_head_dim / 2
+                    ## core attn - (QK^T)V
+                    + effective_seq_length * args.num_attention_heads * args.v_head_dim
                 )
             )
 
@@ -437,6 +472,7 @@ def num_floating_point_operations(args, batch_size):
             key_projection_size = args.kv_channels * args.num_query_groups
             value_projection_size = args.kv_channels * args.num_query_groups
             gate_projection_size = query_projection_size if args.attention_output_gate else 0
+            effective_seq_length = get_effective_seq_length(args.seq_length)
             standard_self_attn_term = (
                 forward_backward_expansion_factor
                 * fma_expansion_factor
@@ -451,8 +487,7 @@ def num_floating_point_operations(args, batch_size):
                     )
                     ## core attention
                     + query_projection_size
-                    * args.seq_length
-                    / 2  # causal mask (only half of the mask is non-zero)
+                    * effective_seq_length
                     * 2  # QK^T and (QK^T)V
                     ## out proj
                     + query_projection_size
