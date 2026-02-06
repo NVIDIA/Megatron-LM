@@ -157,8 +157,8 @@ class HyperConnectionModule(MegatronModule):
 
     # TODO: Kernel fusion
     @torch.compile
-    @nvtx_decorator(message="HyperConnection::projection_and_rms")
-    def _projection_and_rms(self, x : Tensor) -> Tuple[Tensor, Tensor]:
+    @nvtx_decorator(message="HyperConnection::projection_and_get_norm")
+    def _projection_and_get_norm(self, x : Tensor) -> Tuple[Tensor, Tensor]:
         """
         Project input hidden states to mapping space and apply RMS normalization.
         
@@ -215,7 +215,7 @@ class HyperConnectionModule(MegatronModule):
             h_res: [s, b, n, n] - residual mixing matrix (doubly stochastic)
         """
         s, b, _ = x.shape
-        proj, r = self._projection_and_rms(x)
+        proj, r = self._projection_and_get_norm(x)
         h_pre, h_post, h_res = self._compute_h(proj, r)
         h_res = SinkhornKnopp.apply(h_res.view(s, b, self.n, self.n), self.sinkhorn_iterations) # [s, b, n, n] 
         
@@ -437,17 +437,14 @@ class HyperConnectionModule(MegatronModule):
         """
         from megatron.core.tensor_parallel.random import CheckpointWithoutOutput
         
-        nvtx_range_push("HyperConnection::compute_mappings")
         # Checkpoint compute_mappings - auto-registers to manager via ckpt_manager parameter
         h_pre, h_post, h_res = self.compute_mappings(hidden_states)
         
-        nvtx_range_pop("HyperConnection::compute_mappings")
         # Checkpoint aggregate - auto-registers to manager
-        nvtx_range_push("HyperConnection::aggregate")
         aggregated = CheckpointWithoutOutput(ckpt_manager=manager).checkpoint(
             self.aggregate, hidden_states, h_pre
         )
-        nvtx_range_pop("HyperConnection::aggregate")
+        
         return aggregated, h_res, h_post
     
     # ==================== Block-level utilities ====================
