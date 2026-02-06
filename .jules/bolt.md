@@ -13,6 +13,9 @@
 **Learning:** Using `torch.tensor(list_of_tensors)` or `float(tensor)` causes significant CPU-GPU synchronization overhead.
 **Action:** Use `torch.stack` to combine tensors and keep computations on the device. Avoid converting tensors to Python scalars in hot paths.
 
+## 2025-10-27 - Multi-Tensor Operations
+**Learning:** `torch._foreach_norm` provides a significant speedup (e.g. 2.4x on CPU) over iterating with `torch.norm` for list of tensors, but requires careful handling of return types (list/tuple of tensors) and dtype casting.
+**Action:** Prefer `_foreach` variants for multi-tensor operations, guarding with `hasattr(torch, '_foreach_...')` for compatibility.
 ## 2025-10-27 - Tensor Reduction Optimization
 **Learning:** Using `max(t.abs().max() for t in tensors)` triggers a CPU-GPU synchronization for every tensor in the list because Python's `max` needs to compare values.
 **Action:** Use `torch.stack([t.abs().max() for t in tensors]).max()` to keep all operations on the GPU and reduce synchronization overhead to a single call.
