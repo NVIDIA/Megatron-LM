@@ -617,6 +617,7 @@ def process_mtp_loss(
     config: TransformerConfig,
     cp_group: Optional[torch.distributed.ProcessGroup] = None,
     packed_seq_params: Optional[PackedSeqParams] = None,
+    in_inference_mode: bool = False,
 ) -> Tensor:
     """Process Multi-Token Prediction (MTP) loss computation.
 
@@ -635,14 +636,18 @@ def process_mtp_loss(
         config (TransformerConfig): Model configuration containing mtp_num_layers etc.
         cp_group (Optional[ProcessGroup]): Context parallelism process group.
         packed_seq_params (Optional[PackedSeqParams]): Packed sequence parameters.
+        in_inference_mode (bool): Whether the model is in inference mode. Affects loss computation.
 
     Returns:
         Tensor: Updated hidden states after MTP loss processing (first chunk only).
     """
-    mtp_labels = labels.clone()
     hidden_states_list = torch.chunk(hidden_states, 1 + config.mtp_num_layers, dim=0)
     hidden_states = hidden_states_list[0]
 
+    if in_inference_mode:
+        return hidden_states
+
+    mtp_labels = labels.clone()
     if loss_mask is None:
         loss_mask = torch.ones_like(mtp_labels)
 

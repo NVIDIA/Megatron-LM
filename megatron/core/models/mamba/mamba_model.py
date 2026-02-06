@@ -335,6 +335,7 @@ class MambaModel(LanguageModule):
                 config=self.config,
                 cp_group=self.pg_collection.cp,
                 packed_seq_params=packed_seq_params,
+                in_inference_mode=in_inference_mode,
             )
 
         sequence_parallel_override = False
