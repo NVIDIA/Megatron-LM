@@ -238,13 +238,13 @@ class DynamicInferenceEvent:
         ):
             assert self.payload is not None
         elif self.type == DynamicInferenceEventType.GENERATED_TOKEN:
-            assert self.payload is not None and isinstance(self.payload, int)
+            assert self.payload is not None and isinstance(self.payload, dict)
         else:
             assert self.payload is None
 
     def __str__(self):
         if self.type == DynamicInferenceEventType.GENERATED_TOKEN:
-            payload_str = f", token={self.payload}"
+            payload_str = f", token={self.payload['token']}"
         elif self.payload is None:
             payload_str = ""
         else:
@@ -263,7 +263,7 @@ class DynamicInferenceEvent:
         """
         # If compact mode for GENERATED_TOKEN, return just the token ID
         if not track_generated_token_events and self.type == DynamicInferenceEventType.GENERATED_TOKEN:
-            return self.payload
+            return self.payload["token"]
 
         # Dataclass to dict.
         torch.cuda.nvtx.range_push("DynamicInferenceEvent.serialize")
@@ -294,12 +294,18 @@ class DynamicInferenceEvent:
         Returns:
             (DynamicInferenceEvent) Deserialized event.
         """
-        # Handle compact GENERATED_TOKEN format
+        # Handle compact GENERATED_TOKEN format (int = token ID only, metrics lost)
         if isinstance(obj, int):
+            payload = {
+                "token": obj,
+                "block_total_count": -1,
+                "block_total_avail": -1,
+                "block_ref_count_sum": -1,
+            }
             return cls(
                 type=DynamicInferenceEventType.GENERATED_TOKEN,
                 timestamp=-1,  # Sentinel value indicating compact format
-                payload=obj,
+                payload=payload,
             )
 
         event_type = DynamicInferenceEventType[obj["type"]]
@@ -405,7 +411,7 @@ class DynamicInferenceRequest(InferenceRequest):
             the value since tokens are computed from GENERATED_TOKEN events).
         """
         return [
-            e.payload
+            e.payload["token"]
             for e in self.events
             if e.type == DynamicInferenceEventType.GENERATED_TOKEN
         ]
@@ -509,13 +515,30 @@ class DynamicInferenceRequest(InferenceRequest):
         """Add 'add_context' event - called when request is added to context for prefill."""
         return self.add_event(DynamicInferenceEventType.ADD_CONTEXT)
 
-    def add_event_generated_token(self, token: int):
+    def add_event_generated_token(
+        self,
+        token: int,
+        block_total_count: int = -1,
+        block_total_avail: int = -1,
+        block_ref_count_sum: int = -1,
+    ):
         """Add 'generated_token' event - records each generated token.
 
         Args:
             token (int): The token ID that was generated.
+            block_total_count (int): Total block count from allocator (-1 = not tracked).
+            block_total_avail (int): Available block count from allocator (-1 = not tracked).
+            block_ref_count_sum (int): Sum of block ref counts from allocator (-1 = not tracked).
         """
-        return self.add_event(DynamicInferenceEventType.GENERATED_TOKEN, token)
+        return self.add_event(
+            DynamicInferenceEventType.GENERATED_TOKEN,
+            {
+                "token": token,
+                "block_total_count": block_total_count,
+                "block_total_avail": block_total_avail,
+                "block_ref_count_sum": block_ref_count_sum,
+            },
+        )
 
     def add_event_pause(self):
         """Add 'pause' event."""

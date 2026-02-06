@@ -863,6 +863,7 @@ class DynamicInferenceEngine(AbstractEngine):
             self.evicted_request_count += evict_request_ids.numel()
 
         log_probs_iter = log_probs if log_probs else repeat(None)
+        block_allocator = self.context.block_allocator
 
         for req_idx, (request_id, token, request_log_probs) in enumerate(
             zip(request_ids.tolist(), sample.tolist(), log_probs_iter)
@@ -872,7 +873,12 @@ class DynamicInferenceEngine(AbstractEngine):
                 # Skip appending token for requests being finished due to stop words
                 # (they already have their final token from the previous step)
                 if request_id not in self.stop_word_being_finished_ids:
-                    request.add_event_generated_token(token)
+                    request.add_event_generated_token(
+                        token,
+                        block_total_count=block_allocator.total_count,
+                        block_total_avail=block_allocator.total_avail,
+                        block_ref_count_sum=block_allocator.block_ref_counts.sum().item(),
+                    )
                     if request.tpot is None:
                         request.tpot = []
                     request.tpot.append(step_time)
