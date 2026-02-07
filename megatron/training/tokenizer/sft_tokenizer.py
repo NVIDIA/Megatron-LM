@@ -8,6 +8,8 @@ nemotron_h_aligned_custom_template = """{% for message in messages %}{% if messa
 nemotron_nano_v2_custom_template = """{% for message in messages %}{% set content = message['content'] %}{% if message['role'] == 'system' %}{{ '<SPECIAL_10>System\n' + content.replace('/think', '').replace('/no_think', '').strip() + '\n' }}{% elif message['role'] == 'user' %}{{ '<SPECIAL_11>User\n' + content.replace('/think', '').replace('/no_think', '').strip() + '\n' }}{% elif message['role'] == 'assistant' %}{{ '<SPECIAL_11>Assistant\n' + content.strip() + '\n<SPECIAL_12>\n' }}{% endif %}{% endfor %}"""
 identity_template = """{% for message in messages %}{{ message['content'] }}{% endfor %}"""
 
+identity_template = """{% for message in messages %}{{ message['content'] }}{% endfor %}"""
+
 from megatron.core.datasets.megatron_tokenizer import MegatronLegacyTokenizer
 from megatron.training.datasets.sft_dataset import IGNORE_INDEX
 from megatron.training.tokenizer.multimodal_tokenizer import PromptConfig
