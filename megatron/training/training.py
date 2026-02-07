@@ -2891,13 +2891,18 @@ def train(
         if args.log_params_norm:
             params_norm = calc_params_l2_norm(model)
         learning_rate = None
+        # Find the learning rate from the default config param_group for logging.
+        # Note: In distributed training with pipeline parallelism, some ranks may only have
+        # param_groups with overrides (e.g., embedding params with decoupled_lr). We still
+        # want to log the base learning rate, so we look for default_config=True even if
+        # that param_group has no params on this rank (the 'lr' field is still valid).
         for param_group in optimizer.param_groups:
-            if len(param_group['params']) == 0:
-                continue
-            print_rank_0(f"DEFAULT CONFIG VALUE: {param_group['default_config']}")
-            if param_group['default_config']:
+            if param_group.get('default_config', False):
                 learning_rate = param_group['lr']
+                break
 
+        # Fallback: if no default_config exists (e.g., old checkpoints or unusual configs),
+        # use the first non-empty param_group's learning rate.
         if learning_rate is None:
             for param_group in optimizer.param_groups:
                 if len(param_group['params']) > 0:
