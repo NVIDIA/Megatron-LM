@@ -1149,8 +1149,14 @@ class MegatronFSDP(torch.nn.Module):
             # Preserve the original main parameter + gradient data-type.
             main_params_dtype=self.mp_policy.main_params_dtype,
             main_grads_dtype=self.mp_policy.main_grads_dtype,
-            # Only communication and accumulation data-types can be reset.
-            grad_comm_dtype=mixed_precision_policy.grad_comm_dtype,
+            # Gradient communication data-type can only be reset
+            # if symmetric buffers / NCCL UB are not used.
+            grad_comm_dtype=(
+                mixed_precision_policy.grad_comm_dtype
+                if self.ddp_config.fsdp_double_buffer
+                else self.mp_policy.grad_comm_dtype
+            ),
+            # Accumulation data-type can always be reset.
             grad_accum_dtype=mixed_precision_policy.grad_accum_dtype,
         )
         self.mp_policy = mp_policy_reset
