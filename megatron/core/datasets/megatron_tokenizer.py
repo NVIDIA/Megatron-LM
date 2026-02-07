@@ -1,13 +1,16 @@
 # Copyright (c) 2024, NVIDIA CORPORATION. All rights reserved.
 import json
+import logging
 from abc import ABC, abstractmethod
 from collections import OrderedDict
 from typing import Any
 
 import numpy
 
+logger = logging.getLogger(__name__)
 
-class MegatronTokenizer(ABC):
+
+class MegatronLegacyTokenizer(ABC):
     """Abstract class for tokenizer
 
     Absent a config or class-specific tracking of which objects are uniquely identifying, we must
@@ -20,7 +23,16 @@ class MegatronTokenizer(ABC):
     """
 
     def __init__(self, *tokenizer_paths: str, **tokenizer_options: Any):
+        from megatron.core.utils import log_single_rank
 
+        # Deprecation warning
+        log_single_rank(
+            logger,
+            logging.WARNING,
+            "You're using the legacy tokenizer system, which is deprecated "
+            "and will be removed in a future release. Please migrate to the new "
+            "tokenizer system (`megatron.core.tokenizers.MegatronTokenizer`).",
+        )
         self.unique_identifiers = OrderedDict()
         self.unique_identifiers["class"] = type(self).__name__
         self.unique_identifiers["tokenizer_path"] = list(tokenizer_paths)

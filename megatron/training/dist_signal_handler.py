@@ -3,7 +3,6 @@ import signal
 
 import torch
 
-
 def get_world_size():
     if torch.distributed.is_available() and torch.distributed.is_initialized():
         world_size = torch.distributed.get_world_size()
@@ -49,7 +48,7 @@ def all_gather_item(item, dtype, group=None, async_op=False, local_rank=None):
 
 
 class DistributedSignalHandler:
-    def __init__(self, sig=signal.SIGTERM):
+    def __init__(self, sig: signal.Signals = signal.SIGTERM):
         self.sig = sig
 
     def signals_received(self):

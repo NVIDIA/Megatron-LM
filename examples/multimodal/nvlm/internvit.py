@@ -14,7 +14,10 @@ from functools import partial
 
 import torch
 
-from megatron.core.utils import divide
+from examples.multimodal.layer_scaling import (
+    LayerScalingTransformerLayer,
+    get_bias_dropout_add_layer_scaling,
+)
 from megatron.core.extensions.transformer_engine import (
     TEColumnParallelLinear,
     TEDotProductAttention,
@@ -35,6 +38,23 @@ from megatron.core.transformer.spec_utils import ModuleSpec, build_module
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.transformer.transformer_layer import TransformerLayer, TransformerLayerSubmodules
 from megatron.core.transformer.utils import make_sharded_tensors_for_checkpoint
+from megatron.core.utils import divide
+
+try:
+    import apex
+
+    from megatron.core.fusions.fused_layer_norm import FusedLayerNorm
+    from megatron.core.transformer.torch_norm import WrappedTorchNorm
+
+    HAVE_APEX = True
+    LNImpl = FusedLayerNorm
+except ImportError:
+    import warnings
+
+    from megatron.core.transformer.torch_norm import WrappedTorchNorm
+
+    warnings.warn(f'Apex is not installed. Falling back to Torch Norm')
+    LNImpl = WrappedTorchNorm
 
 
 class InternViTRMSNorm(MegatronModule):
@@ -109,10 +129,14 @@ class InternViTRMSNorm(MegatronModule):
 
         if rank < valid_ranks:  # Ranks without any dummy attention heads.
             var = input_.sum(-1, keepdim=True)
-        elif rank == valid_ranks:  # The only rank which may contain 'residual_heads' dummy attention heads.
+        elif (
+            rank == valid_ranks
+        ):  # The only rank which may contain 'residual_heads' dummy attention heads.
             var = input_[..., :max_dim].sum(-1, keepdim=True)
         else:
-            var = input_.sum(-1, keepdim=True) * 0.0  # All heads in these ranks are dummy heads: Zero-out.
+            var = (
+                input_.sum(-1, keepdim=True) * 0.0
+            )  # All heads in these ranks are dummy heads: Zero-out.
 
         tensor_list = [torch.empty_like(var) for _ in range(world_size)]
         tensor_list[rank] = var
@@ -146,47 +170,6 @@ def get_mlp_module_spec(use_te: bool = True) -> ModuleSpec:
     )
 
 
-# Handle InternViT's layer scaling.
-def _bias_dropout_add_func_internvit(ls, x_with_bias, residual, prob, training):
-    x, bias = x_with_bias  # unpack
-    residual = residual if residual.dtype == x.dtype else residual.to(x.dtype)
-    if bias is not None:
-        x = x + bias
-        out = torch.nn.functional.dropout(x, p=prob, training=training)
-        out = residual + out * ls
-        return out
-    else:
-        out = torch.nn.functional.dropout(x, p=prob, training=training)
-        out = residual + out * ls
-        return out
-
-
-def bias_dropout_add_unfused_internvit(ls, training):
-    """Bias-dropout-add as in Megatron but with added LayerScaling handling."""
-
-    def _bias_dropout_add(x_with_bias, residual, prob):
-        return _bias_dropout_add_func_internvit(ls, x_with_bias, residual, prob, training)
-
-    return _bias_dropout_add
-
-
-def get_bias_dropout_add_internvit(ls, training, fused):
-    """Bias-dropout-add as in Megatron but with added LayerScaling handling."""
-    assert not fused, "Fused bias-dropout-add not implemented for InternViT."
-    return bias_dropout_add_unfused_internvit(ls, training)
-
-
-# Add InternViT specialties to our default TransformerLayer.
-class InternViTTransformerLayer(TransformerLayer):
-    def __init__(self, *args, **kwargs):
-        super().__init__(*args, **kwargs)
-        self.ls1 = torch.nn.Parameter(torch.ones(self.config.hidden_size))
-        self.ls2 = torch.nn.Parameter(torch.ones(self.config.hidden_size))
-
-        self.self_attn_bda = partial(self.self_attn_bda, self.ls1)
-        self.mlp_bda = partial(self.mlp_bda, self.ls2)
-
-
 # Override a few things that are special in InternViT and not supported by the SelfAttention class.
 class InternViTSelfAttention(SelfAttention):
     def __init__(
@@ -197,8 +180,7 @@ class InternViTSelfAttention(SelfAttention):
         # Need to override linear_qkv, q_layernorm and k_layernorm.
         qkv_bias = False
 
-        self.linear_qkv = build_module(
-            submodules.linear_qkv,
+        self.linear_qkv = submodules.linear_qkv(
             self.config.hidden_size,
             self.query_projection_size + 2 * self.kv_projection_size,
             config=self.config,
@@ -257,7 +239,7 @@ def get_internvit_layer_spec(use_te) -> ModuleSpec:
     mlp = get_mlp_module_spec(use_te)  # no norm
 
     return ModuleSpec(
-        module=InternViTTransformerLayer,
+        module=LayerScalingTransformerLayer,
         submodules=TransformerLayerSubmodules(
             input_layernorm=InternViTRMSNorm,
             self_attention=ModuleSpec(
@@ -271,9 +253,35 @@ def get_internvit_layer_spec(use_te) -> ModuleSpec:
                     k_layernorm=InternViTRMSNorm,
                 ),
             ),
-            self_attn_bda=get_bias_dropout_add_internvit,
+            self_attn_bda=get_bias_dropout_add_layer_scaling,
             pre_mlp_layernorm=InternViTRMSNorm,
             mlp=mlp,
-            mlp_bda=get_bias_dropout_add_internvit,
+            mlp_bda=get_bias_dropout_add_layer_scaling,
+        ),
+    )
+
+
+def get_internvit300M_layer_spec(use_te) -> ModuleSpec:
+    mlp = get_mlp_module_spec(use_te)  # no norm
+
+    return ModuleSpec(
+        module=LayerScalingTransformerLayer,
+        submodules=TransformerLayerSubmodules(
+            input_layernorm=LNImpl,
+            self_attention=ModuleSpec(
+                module=SelfAttention,
+                params={"attn_mask_type": AttnMaskType.no_mask},
+                submodules=SelfAttentionSubmodules(
+                    linear_qkv=TEColumnParallelLinear if use_te else ColumnParallelLinear,
+                    core_attention=TEDotProductAttention if use_te else DotProductAttention,
+                    linear_proj=TERowParallelLinear if use_te else RowParallelLinear,
+                    q_layernorm=None,
+                    k_layernorm=None,
+                ),
+            ),
+            self_attn_bda=get_bias_dropout_add_layer_scaling,
+            pre_mlp_layernorm=LNImpl,
+            mlp=mlp,
+            mlp_bda=get_bias_dropout_add_layer_scaling,
         ),
     )

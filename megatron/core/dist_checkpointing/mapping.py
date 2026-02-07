@@ -1,6 +1,6 @@
 # Copyright (c) 2022-2023, NVIDIA CORPORATION.  All rights reserved.
 
-""" Core library classes for representing sharding of tensors and objects.
+"""Core library classes for representing sharding of tensors and objects.
 
 The main expected usage is wrapping torch.Tensors in state dicts with
 ShardedTensor class (mostly with the ShardedTensor.from_rank_offsets classmethod).
@@ -12,7 +12,6 @@ from dataclasses import dataclass, field, replace
 from itertools import chain
 from typing import Any, Callable, Dict, List, Optional, Tuple, Union
 
-import numpy as np
 import torch
 
 from .core import CheckpointingException
@@ -29,6 +28,9 @@ ShardedStateDict = Dict[str, Any]
 ReplicaId = Union[int, Tuple[int, ...]]
 
 
+_logged_deprecations = {}
+
+
 class ShardedBase(ABC):
     """Base class for ShardedTensor and ShardedStateDict."""
 
@@ -41,7 +43,7 @@ class ShardedBase(ABC):
         """Codifies the constraints on metadata attributes."""
 
     @abstractmethod
-    def without_data(self) -> 'ShardedBase':
+    def without_data(self) -> "ShardedBase":
         """Returns a new ShardedBase instance with data=None."""
         raise NotImplementedError
 
@@ -104,47 +106,37 @@ class ShardedTensor(ShardedBase):
         if self.data is not None:
             if self.data.dtype != self.dtype:
                 raise CheckpointingException(
-                    f'Data dtype should match `dtype` attribute for {self}'
+                    f"Data dtype should match `dtype` attribute for {self}"
                 )
             if not has_flattened_range and self.data.shape != self.local_shape:
                 raise CheckpointingException(
-                    f'Data shape should match `local_shape` attribute for {self}'
+                    f"Data shape should match `local_shape` attribute for {self}"
                 )
-            if has_flattened_range:
-                if self.data.ndim != 1:
-                    raise CheckpointingException(f'Data should be 1D for a flattened {self}')
-                real_data = self.data
-                try:
-                    self.data = None
-                    self.init_data(device='meta')
-                    if self.data.shape != real_data.shape:
-                        raise CheckpointingException(
-                            f'Data shape {real_data.shape} doesnt match'
-                            f' expected {self.data.shape} for {self}'
-                        )
-                finally:
-                    self.data = real_data
 
         if len(self.global_shape) != len(self.global_offset):
             raise CheckpointingException(
-                f'Global offset dimensions should be equal to global shape dimensions for {self}'
+                f"Global offset dimensions should be equal to global shape dimensions for {self}"
             )
         if len(self.local_shape) + self.prepend_axis_num != len(self.global_shape):
             raise CheckpointingException(
-                f'Local shape together with `prepend_axis_num` dimensions should be '
-                f'equal to global shape dimensions for {self}'
+                f"Local shape together with `prepend_axis_num` dimensions should be "
+                f"equal to global shape dimensions for {self}"
             )
 
-        for off, sh in zip(self.global_offset[self.prepend_axis_num :], self.local_shape):
-            if off % sh != 0:
-                raise CheckpointingException(
-                    f'Global offset ({off}) must be divisible by local shape ({sh}) for {self}.'
-                )
+        if self.axis_fragmentations is not None:
+            for off, sh in zip(self.global_offset[self.prepend_axis_num :], self.local_shape):
+                if sh != 0 and off % sh != 0:
+                    raise CheckpointingException(
+                        f"Global offset ({off}) must be divisible by local shape ({sh}) for {self}."
+                    )
 
-        if has_flattened_range and self.flattened_range.step is not None:
-            raise CheckpointingException(
-                f'`step` argument in the flattened range of a ShardedTensor is not supported.'
-            )
+        if self.flattened_range is not None:
+            raise CheckpointingException("ShardedTensor.flattened_range is not supported.")
+
+    @property
+    def has_regular_grid(self):
+        """Alias for having a regular sharding grid."""
+        return self.axis_fragmentations is not None
 
     def global_slice(self) -> Tuple[Union[int, slice], ...]:
         """
@@ -163,44 +155,6 @@ class ShardedTensor(ShardedBase):
                 ),
             )
         )
-
-    def global_coordinates(self) -> Tuple[np.ndarray, ...]:
-        """
-        Returns a tuple of np.ndarrays representing the coordinates of the global tensor
-        that this ShardedTensor corresponds to.
-        """
-        if self.flattened_range is None:
-            raise CheckpointingException(
-                f'`global_coordinates` is undefined for'
-                f' {self.__class__.__name__} without `flattened_range`'
-            )
-
-        local_coords = self.local_coordinates()
-        assert len(local_coords) + self.prepend_axis_num == len(self.global_offset), (
-            len(local_coords),
-            self,
-        )
-        global_coords = tuple(
-            c + off
-            for c, off in zip((0,) * self.prepend_axis_num + local_coords, self.global_offset)
-        )
-        return global_coords
-
-    def local_coordinates(self) -> Tuple[np.ndarray, ...]:
-        """
-        Returns a tuple of np.ndarrays representing the coordinates of the local tensor
-        that this ShardedTensor corresponds to.
-        """
-        if self.flattened_range is None:
-            raise CheckpointingException(
-                f'`local_coordinates` is undefined for'
-                f' {self.__class__.__name__} without `flattened_range`'
-            )
-
-        # TODO: np.unravel_index?
-        mask = np.zeros(np.product(self.local_shape), dtype=bool)
-        mask[self.flattened_range] = True
-        return np.nonzero(mask.reshape(self.local_shape))
 
     def local_chunk_offset_in_global(self) -> Tuple[int, ...]:
         """Offset of a local chunk in a global array of chunks.
@@ -223,7 +177,7 @@ class ShardedTensor(ShardedBase):
         for axis_sh, axis_fragm in zip(self.global_shape, self.axis_fragmentations):
             if not self.allow_shape_mismatch and axis_sh % axis_fragm != 0:
                 raise CheckpointingException(
-                    f'Axis shape ({axis_sh}) not divisible by axis fragmentation ({axis_fragm}'
+                    f"Axis shape ({axis_sh}) not divisible by axis fragmentation ({axis_fragm}"
                 )
             axis_chunk_size = axis_sh // axis_fragm
             chunks.append(axis_chunk_size)
@@ -259,8 +213,8 @@ class ShardedTensor(ShardedBase):
         """
         if flattened_range is not None:
             raise ValueError(
-                'Cannot instantiate a flat ShardedTensor with `from_rank_offsets` method.'
-                ' Use `from_rank_offsets_flat` instead'
+                "Cannot instantiate a flat ShardedTensor with `from_rank_offsets` method."
+                " Use `from_rank_offsets_flat` instead"
             )
         global_offset = [0] * (data.ndim + prepend_axis_num)
         global_shape = ([1] * prepend_axis_num) + list(data.shape)
@@ -268,7 +222,7 @@ class ShardedTensor(ShardedBase):
         _seen_axis = set()
         for axis, axis_rank_offset, axis_fragm in rank_offsets:
             if axis < 0 or axis_rank_offset < 0 or axis_fragm < 1 or axis_rank_offset >= axis_fragm:
-                raise CheckpointingException(f'Invalid rank offsets: {rank_offsets} for key {key}.')
+                raise CheckpointingException(f"Invalid rank offsets: {rank_offsets} for key {key}.")
             _seen_axis.add(axis)
 
             local_axis_shape = 1 if axis < prepend_axis_num else data.shape[axis - prepend_axis_num]
@@ -290,51 +244,6 @@ class ShardedTensor(ShardedBase):
             **init_kwargs,
         )
 
-    @classmethod
-    def from_rank_offsets_flat(
-        cls,
-        key: str,
-        data: torch.Tensor,
-        non_flat_local_shape: Tuple[int, ...],
-        *args,
-        flattened_range: Optional[slice] = None,
-        **kwargs,
-    ):
-        """Allows to construct a *flattened* ShardedTensor given offset specified in process ranks.
-
-        Args:
-            key (str):
-            data (torch.Tensor): this should be a flattened data tensor
-            non_flat_local_shape (Tuple[int, ...]): expected local shape of a non-flat chunk
-            *args: passed unchanged to the `from_rank_offsets` constructor
-            flattened_range (slice): see ShardedTensor. Defaults to None, but must be set to
-                a non-None slice.
-            **kwargs:
-
-        Returns:
-            ShardedTensor: constructed ShardedTensor instance
-        """
-        if flattened_range is None:
-            raise CheckpointingException(
-                'Cannot instantiate a non-flat ShardedTensor with `from_rank_offsets_flat` method.'
-                ' Use `from_rank_offsets` instead'
-            )
-        if data.ndim != 1:
-            raise CheckpointingException(
-                f'Flattened ShardedTensor requires 1D data, got shape: {data.shape}'
-            )
-        if flattened_range.stop - flattened_range.start != data.numel():
-            raise CheckpointingException(
-                f'Flattened ShardedTensor data length ({data.numel()}) must meet the '
-                f'slice length: {flattened_range.stop - flattened_range.start}'
-            )
-
-        non_flat_data_meta = torch.empty(*non_flat_local_shape, dtype=data.dtype, device='meta')
-        sh_ten = cls.from_rank_offsets(key, non_flat_data_meta, *args, **kwargs)
-        instance = replace(sh_ten, data=data, flattened_range=flattened_range)
-        instance.validate_metadata_integrity()
-        return instance
-
     def init_data(self, device: Union[str, torch.device], init_fn=torch.empty):
         """
         Initialize the tensor data of this ShardedTensor.
@@ -349,10 +258,8 @@ class ShardedTensor(ShardedBase):
         if self.data is not None:
             return
         self.data = init_fn(self.local_shape, dtype=self.dtype, device=device)
-        if self.flattened_range is not None:
-            self.data = self.data.flatten()[self.flattened_range.start : self.flattened_range.stop]
 
-    def narrow(self, dim: int, start: int, length: int) -> List['ShardedTensor']:
+    def narrow(self, dim: int, start: int, length: int) -> List["ShardedTensor"]:
         """This is an analogue of torch.narrow for ShardedTensors.
 
         Narrowing assumes that we narrow a local tensor on each rank.
@@ -384,10 +291,10 @@ class ShardedTensor(ShardedBase):
         # Decrease global shape and global offset by `length / local_length_along_dim`
         assert (
             self.global_shape[prepended_dim] % local_length_along_dim == 0
-        ), f'Only regular grid of local tensors is supported for narrowing, got: {self}'
+        ), f"Only regular grid of local tensors is supported for narrowing, got: {self}"
         assert (
             self.global_offset[prepended_dim] % local_length_along_dim == 0
-        ), f'Only regular grid of local tensors is supported for narrowing, got: {self}'
+        ), f"Only regular grid of local tensors is supported for narrowing, got: {self}"
         global_shape = _update_tuple(
             self.global_shape,
             prepended_dim,
@@ -399,84 +306,17 @@ class ShardedTensor(ShardedBase):
             _safe_div(self.global_offset[prepended_dim] * length, local_length_along_dim),
         )
 
-        if self.flattened_range is None:
-            new_data = self.data.narrow(dim, start, length)
-            # always a single result tensor
-            return [
-                replace(
-                    self,
-                    data=new_data,
-                    local_shape=new_data.shape,
-                    global_shape=global_shape,
-                    global_offset=global_offset,
-                )
-            ]
-        else:
-            if dim != 0:
-                raise CheckpointingException(
-                    f'Narrowing along the first axis is supported for now only, got dim={dim}'
-                )
-
-            # If dim=0, we will always get 0 or 1 resulting tensor.
-            # If dim>1, in general there can be more result tensors (e.g. max 3 for dim=1)
-
-            # For on original flat ShardedTensor of local shape [3, 4] and
-            # flattened_range=slice(5, 10),
-            # the X signs mark the actual (flat) data in `self.data`
-            # notice 12 (3*4) total "virtual" elements, out of which 5 is actual data.
-            # flat original: [.....XXXXX..]
-
-            # If we narrow to start=1, length=1 in the original local shape dimensions,
-            # the overlapping flat slice would be:
-            # narrow to:     [....XXXX....]
-            # flat overlap:  [.....XXX....]
-
-            # Now `data` is flattened and sliced, so we must compute local_shape manually
-            local_shape = _update_tuple(self.local_shape, dim, length)
-            other_dims_volume = np.prod(
-                _update_tuple(local_shape, dim, 1)
-            )  # 4 in the example above
-            volume_before_split = other_dims_volume * start  # 4 in the example above
-            volume_of_split = other_dims_volume * length  # 4 in the example above
-
-            flat_slice_start_shifted = (
-                self.flattened_range.start - volume_before_split
-            )  # 5 - 4 = 1 in the example above
-            flat_slice_stop_shifted = (
-                self.flattened_range.stop - volume_before_split
-            )  # 10 - 4 = 6 in the example above
-
-            # Find an intersection of
-            # (flat_slice_start_shifted, flat_slice_stop_shifted) vs (0, volume_of_split)
-
-            if flat_slice_stop_shifted <= 0 or flat_slice_start_shifted >= volume_of_split:
-                return []  # no intersection
-
-            # new_flattened_range = slice(1, 4) in the example above
-            new_flattened_range = slice(
-                max(flat_slice_start_shifted, 0), min(flat_slice_stop_shifted, volume_of_split)
+        new_data = self.data.narrow(dim, start, length)
+        # always a single result tensor
+        return [
+            replace(
+                self,
+                data=new_data,
+                local_shape=new_data.shape,
+                global_shape=global_shape,
+                global_offset=global_offset,
             )
-            # Apply the intersection to the flattened data tensor.
-            # Compute start and slice appropriate length
-            intersection_slice_start = (
-                new_flattened_range.start - flat_slice_start_shifted
-            )  # 0 in the example above
-            new_data = self.data[
-                intersection_slice_start : intersection_slice_start
-                + new_flattened_range.stop
-                - new_flattened_range.start
-            ]
-
-            return [
-                replace(
-                    self,
-                    data=new_data,
-                    local_shape=local_shape,
-                    global_shape=global_shape,
-                    global_offset=global_offset,
-                    flattened_range=new_flattened_range,
-                )
-            ]
+        ]
 
 
 def is_main_replica(replica_id: ReplicaId):
@@ -547,7 +387,7 @@ class ShardedObject(ShardedBase):
     def validate_metadata_integrity(self):
         if len(self.global_shape) != len(self.global_offset):
             raise CheckpointingException(
-                f'Global offset dimensions should be equal to global shape dimensions for {self}'
+                f"Global offset dimensions should be equal to global shape dimensions for {self}"
             )
 
     def without_data(self):
@@ -557,16 +397,16 @@ class ShardedObject(ShardedBase):
     def unique_key(self):
         """returns a unique key for this object"""
         return (
-            f'{self.key}/shard_'
-            f'{".".join(map(str, self.global_offset))}_'
-            f'{".".join(map(str, self.global_shape))}'
+            f"{self.key}/shard_"
+            f"{'.'.join(map(str, self.global_offset))}_"
+            f"{'.'.join(map(str, self.global_shape))}"
         )
 
     def __str__(self):
-        return f'{self.__class__.__name__}(key=\'{self.key}\')'
+        return f"{self.__class__.__name__}(key='{self.key}')"
 
     @classmethod
-    def empty_from_unique_key(cls, unique_key, replica_id: ReplicaId = 0) -> 'ShardedObject':
+    def empty_from_unique_key(cls, unique_key, replica_id: ReplicaId = 0) -> "ShardedObject":
         """Instantiates a ShardedObject from a unique key.
 
         Args:
@@ -578,11 +418,11 @@ class ShardedObject(ShardedBase):
         Returns:
             a ShardedObject with data=None
         """
-        key, shard_key = unique_key.split('/')
-        shard_str, offset, shape = shard_key.split('_')
-        assert shard_str == 'shard'
-        offset = tuple(map(int, offset.split('.')))
-        shape = tuple(map(int, shape.split('.')))
+        key, shard_key = unique_key.split("/")
+        shard_str, offset, shape = shard_key.split("_")
+        assert shard_str == "shard"
+        offset = tuple(map(int, offset.split(".")))
+        shape = tuple(map(int, shape.split(".")))
         if len(shape) + 1 == len(offset):
             # This is a backward-compatible fix. We don't know the last
             # element of global shape so set it to -1.
@@ -684,18 +524,18 @@ def apply_factory_merges(
         for k, v2 in x2.items():
             if k not in x1:
                 raise ValueError(
-                    f'Different dict keys encountered in `apply_factory_merges` '
-                    f'({x1.keys()} vs {x2.keys()})'
+                    f"Different dict keys encountered in `apply_factory_merges` "
+                    f"({x1.keys()} vs {x2.keys()})"
                 )
             else:
                 x1[k] = apply_factory_merges(x1[k], v2, key=key + (k,))
     elif isinstance(x1, list) and isinstance(x2, list):
         if len(x1) != len(x2):
             err_msg = (
-                f'Cannot merge two lists with different lengths '
-                f'({len(x1)} and {len(x2)}, encountered at key {key})'
+                f"Cannot merge two lists with different lengths "
+                f"({len(x1)} and {len(x2)}, encountered at key {key})"
             )
-            logger.error(err_msg + f'\nx1: {x1}\nx2: {x2}')
+            logger.error(err_msg + f"\nx1: {x1}\nx2: {x2}")
             raise ValueError(err_msg)
         for i, v2 in enumerate(x2):
             x1[i] = apply_factory_merges(x1[i], v2, key=key + (i,))
@@ -703,17 +543,17 @@ def apply_factory_merges(
         for k, v2 in x2.items():
             if not isinstance(k, int):
                 raise ValueError(
-                    f'Invalid dict key {k} non-integer type encountered '
-                    f'in a list-dict merge at level {key}'
+                    f"Invalid dict key {k} non-integer type encountered "
+                    f"in a list-dict merge at level {key}"
                 )
             if k >= len(x1):
                 raise ValueError(
-                    f'Dict key {k} out of bound for list of length'
-                    f'{len(x1)} (encountered at level {key})'
+                    f"Dict key {k} out of bound for list of length"
+                    f"{len(x1)} (encountered at level {key})"
                 )
             x1[k] = apply_factory_merges(x1[k], v2, key=key + (k,))
     else:
         raise ValueError(
-            f'Duplicate non-dict and non-list values encountered: `{x1}` and `{x2} (at key {key})`'
+            f"Duplicate non-dict and non-list values encountered: `{x1}` and `{x2} (at key {key})`"
         )
     return x1

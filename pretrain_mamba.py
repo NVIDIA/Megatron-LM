@@ -1,105 +1,148 @@
-# Copyright (c) 2024, NVIDIA CORPORATION.  All rights reserved.
-"""Pretrain Mamba."""
+# Copyright (c) 2025, NVIDIA CORPORATION.  All rights reserved.
+"""Pretrain and SFT Mamba."""
 
+# Capture the true program start time BEFORE any heavy imports.
+import time
+_PROGRAM_START_TIME = time.time()
+
+import json
+
+# Suppress warnings on all ranks but rank 0.
 import os
-import torch
-from functools import partial
-from typing import List, Optional, Tuple, Union
+import warnings
+rank = int(os.environ.get('RANK', 0))
+if rank != 0:
+    warnings.filterwarnings("ignore", category=UserWarning)
+    warnings.filterwarnings("ignore", category=FutureWarning)
 
-from megatron.training import get_args
-from megatron.training import print_rank_0
-from megatron.training import get_timers
-from megatron.training import get_tokenizer
+from functools import partial
+from typing import List, Optional, Tuple
+
+import torch
+
+from mamba_builders import mamba_builder
 from megatron.core import mpu
-from megatron.core.enums import ModelType
 from megatron.core.datasets.blended_megatron_dataset_builder import BlendedMegatronDatasetBuilder
-from megatron.core.datasets.gpt_dataset import GPTDatasetConfig
-from megatron.core.datasets.gpt_dataset import MockGPTDataset, GPTDataset
-from megatron.core.rerun_state_machine import get_rerun_state_machine
+from megatron.core.datasets.gpt_dataset import GPTDataset, GPTDatasetConfig, MockGPTDataset
+from megatron.core.enums import ModelType
+from megatron.core.packed_seq_params import PackedSeqParams
+from megatron.core.parallel_state import (
+    get_context_parallel_rank,
+    get_context_parallel_world_size,
+)
 from megatron.core.models.mamba import MambaModel
-from megatron.training import pretrain
-from megatron.core.utils import StragglerDetector
-from megatron.core.transformer.spec_utils import import_module
+from megatron.core.rerun_state_machine import get_rerun_state_machine
+from megatron.core.tokenizers.text.utils.build_tokenizer import build_tokenizer
+from megatron.core.utils import get_attr_wrapped_model, is_te_min_version, StragglerDetector
+from megatron.training import (
+    get_args,
+    get_timers,
+    get_tokenizer,
+    inprocess_restart,
+    pretrain,
+    print_rank_0,
+    set_startup_timestamps,
+)
+from megatron.training.datasets.sft_dataset import SFTDataset
 from megatron.training.utils import (
     get_batch_on_this_cp_rank,
     get_batch_on_this_tp_rank,
     get_blend_and_blend_per_split,
+    is_first_or_last_pipeline_stage,
 )
-from megatron.training.arguments import core_transformer_config_from_args
-from megatron.core.models.gpt.gpt_layer_specs import get_gpt_layer_with_transformer_engine_spec
+from model_provider import model_provider
 
+try:
+    from megatron.post_training.arguments import add_modelopt_args
+    from megatron.post_training.loss_func import loss_func as loss_func_modelopt
+    has_nvidia_modelopt = True
+except ImportError:
+    has_nvidia_modelopt = False
+
+try:
+    # Register the TE CUDA kernels
+    import transformer_engine  # pylint: disable=unused-import
+
+    # Alias the PyTorch wrapper so we can call tex.* APIs
+    import transformer_engine_torch as tex
+except ImportError:
+    # TE isn’t installed or the torch wrapper is missing
+    tex = None
 
 stimer = StragglerDetector()
 
-def count_parameters_in_layer(model, layer_name):
-    num_params = 0
-    for name, param in model.named_parameters():
-        if layer_name in name:
-            num_params += param.numel()
-            print_rank_0(f" - {name}: {param.numel()}")
-    return num_params
 
-
-def model_provider(pre_process=True, post_process=True) -> MambaModel:
-    """Builds the model.
-
-    Args:
-        pre_process (bool, optional): Set to true if you need to compute embedings. Defaults to True.
-        post_process (bool, optional): Set to true if you need to want to compute output logits/loss. Defaults to True.
-
-
-    Returns:
-        MambaModel: The returned model
-    """
-    args = get_args()
-
-    print_rank_0('building Mamba model ...')
-    config = core_transformer_config_from_args(get_args())
-
-    assert args.use_legacy_models == False, "Mamba only supported in Mcore!"
-
-    if args.spec is not None:
-        mamba_stack_spec = import_module(args.spec)
-    else:
-        raise("You must provide a valid Mamba layer spec!")
-
-    model = MambaModel(
-        config=config,
-        mamba_stack_spec=mamba_stack_spec,
-        vocab_size=args.padded_vocab_size,
-        max_sequence_length=args.max_position_embeddings,
-        pre_process=pre_process,
-        hybrid_attention_ratio=args.hybrid_attention_ratio,
-        hybrid_mlp_ratio=args.hybrid_mlp_ratio,
-        hybrid_override_pattern=args.hybrid_override_pattern,
-        post_process=post_process,
-        fp16_lm_cross_entropy=args.fp16_lm_cross_entropy,
-        parallel_output=True,
-        share_embeddings_and_output_weights=not args.untie_embeddings_and_output_weights,
-        position_embedding_type=args.position_embedding_type,
-        rotary_percent=args.rotary_percent,
-        rotary_base=args.rotary_base
-    )
-
-    for l in range(model.decoder.num_layers_per_pipeline_rank):
-        layer_params = count_parameters_in_layer(model, f'decoder.layers.{l}.')
-        print_rank_0(f" == params layer {l}: {layer_params}")
-
-    return model
-
-
-def get_batch(data_iterator):
+def get_batch(data_iterator, vp_stage=None):
     """Generate a batch."""
 
-    # TODO: this is pretty hacky, find a better way
-    if (not mpu.is_pipeline_first_stage()) and (not mpu.is_pipeline_last_stage()):
-        return None, None, None, None, None
+    empty_batch = {
+        'tokens': None,
+        'labels': None,
+        'loss_mask': None,
+        'attention_mask': None,
+        'position_ids': None,
+        'cu_seqlens': None,
+        'max_seqlen': None,
+    }
 
-    # get batches based on the TP rank you are on
+    # TODO(duncan): Is there a more efficient way to access is_packed_sequence here?
+    is_packed_sequence = get_args().sft  # SFT always uses packed sequence
+    if not is_first_or_last_pipeline_stage(vp_stage) and not is_packed_sequence:
+        return empty_batch.values()
+
     batch = get_batch_on_this_tp_rank(data_iterator)
+    
+    cu_seqlens = batch['cu_seqlens']
+    # Unused at the moment
+    cu_seqlens_padded = batch.pop('cu_seqlens_padded', None)
+    # Support for Hybrid Context Parallel (Unused in this script)
+    local_cp_size = batch.pop('local_cp_size', None)
 
-    # slice batch along sequence dimension for context parallelism
-    batch = get_batch_on_this_cp_rank(batch)
+    if cu_seqlens is not None:
+        assert (
+            cu_seqlens.dim() == 2 and cu_seqlens.shape[0] == 1
+        ), "micro-batch-size must be 1 for packing"
+        cu_seqlens = cu_seqlens[0]
+        batch['cu_seqlens'] = cu_seqlens
+
+        max_seqlen = batch['max_seqlen']
+        assert max_seqlen.dim() == 1
+        # TODO(duncan): can this be kept as a 0-D tensor?
+        batch['max_seqlen'] = int(max_seqlen[0].item())
+
+    if mpu.is_pipeline_first_stage(ignore_virtual=(vp_stage is None), vp_stage=vp_stage):
+        total_tokens = batch['tokens'].size(1)
+    elif mpu.is_pipeline_last_stage(ignore_virtual=(vp_stage is None), vp_stage=vp_stage):
+        total_tokens = batch['labels'].size(1)
+    else:  # packed sequence
+        empty_batch['cu_seqlens'] = cu_seqlens
+        empty_batch['max_seqlen'] = max_seqlen
+        return empty_batch.values()
+
+    if cu_seqlens is None:
+        # slice batch along sequence dimension for context parallelism
+        batch = get_batch_on_this_cp_rank(batch)  # The implementation of this function is in MCore
+    else:  # Packed THD format
+        cp_size = get_context_parallel_world_size()
+        if cp_size > 1:  # slice batch along sequence dimension for context parallelism
+            assert tex is not None and is_te_min_version("1.10.0"), (
+                "Please update Transformer Engine to >= 1.10 to use "
+                "Context Parallel with THD format data"
+            )
+            cp_rank = get_context_parallel_rank()
+            index = tex.thd_get_partitioned_indices(
+                cu_seqlens,
+                total_tokens,
+                cp_size,
+                cp_rank,
+            )
+            for key, data in batch.items():
+                if key in {'attention_mask', 'cu_seqlens', 'max_seqlen'}:
+                    continue
+                if data is not None:
+                    # On first PP rank, labels and loss_mask can be None.
+                    # On last PP rank, tokens and position_ids can be None.
+                    batch[key] = data.index_select(1, index)
 
     return batch.values()
 
@@ -107,8 +150,7 @@ def get_batch(data_iterator):
 # define spiky loss as a loss that's 10x the max loss observed
 SPIKY_LOSS_FACTOR = 10
 
-
-def loss_func(loss_mask: torch.Tensor, output_tensor: torch.Tensor):
+def loss_func(loss_mask: torch.Tensor, output_tensor: torch.Tensor, model: Optional[MambaModel] = None):
     """Loss function.
 
     Args:
@@ -122,56 +164,48 @@ def loss_func(loss_mask: torch.Tensor, output_tensor: torch.Tensor):
             the data parallel ranks
     """
     args = get_args()
+    if has_nvidia_modelopt and getattr(args, 'modelopt_enabled', False):  # [ModelOpt]
+        loss, num_tokens, report = loss_func_modelopt(loss_mask, output_tensor, model=model)
+    else:
+        losses = output_tensor.view(-1).float()
+        loss_mask = loss_mask.view(-1).float()
+        loss = torch.sum(losses * loss_mask)
 
-    losses = output_tensor.float()
-    loss_mask = loss_mask.view(-1).float()
-    total_tokens = loss_mask.sum()
-    loss = torch.cat([torch.sum(losses.view(-1) * loss_mask).view(1), total_tokens.view(1)])
-
-    if args.context_parallel_size > 1:
-        torch.distributed.all_reduce(loss, group=mpu.get_context_parallel_group())
+        num_tokens = loss_mask.sum().clone().detach().to(torch.int)
+        report = {'lm loss': torch.cat([loss.clone().detach().view(1), num_tokens.view(1)])}
 
     # Check individual rank losses are not NaN prior to DP all-reduce.
     rerun_state_machine = get_rerun_state_machine()
     if args.check_for_nan_in_loss_and_grad:
         rerun_state_machine.validate_result(
-            result=loss[0],
+            result=loss,
             rejection_func=torch.isnan,
             message="found NaN in local forward loss calculation",
-            tolerance=0.0,        # forward pass calculations are determinisic
+            tolerance=0.0,        # forward pass calculations are deterministic
             fatal=True,
         )
         rerun_state_machine.validate_result(
-            result=loss[0],
+            result=loss,
             rejection_func=torch.isinf,
             message="found Inf in local forward loss calculation",
-            tolerance=0.0,        # forward pass calculations are determinisic
+            tolerance=0.0,        # forward pass calculations are deterministic
             fatal=True,
         )
     # Check for spiky loss
     if args.check_for_spiky_loss:
         rerun_state_machine.validate_result(
-            result=loss[0],
+            result=loss,
             rejection_func=partial(
                 rerun_state_machine.is_unexpectedly_large,
                 threshold=SPIKY_LOSS_FACTOR,
                 context="loss",
             ),
             message="Spiky loss",
-            tolerance=0.0,        # forward pass calculations are determinisic
+            tolerance=0.0,        # forward pass calculations are deterministic
             fatal=False,
         )
 
-    # Reduce loss for logging.
-    reporting_loss = loss.clone().detach()
-    torch.distributed.all_reduce(reporting_loss, group=mpu.get_data_parallel_group())
-
-    local_num_tokens = loss[1].clone().detach().to(torch.int)
-    return (
-        loss[0] * args.context_parallel_size,
-        local_num_tokens,
-        {'lm loss': (reporting_loss[0], reporting_loss[1])},
-    )
+    return loss, num_tokens, report
 
 
 def forward_step(data_iterator, model: MambaModel):
@@ -181,37 +215,79 @@ def forward_step(data_iterator, model: MambaModel):
         data_iterator : Input data iterator
         model (MambaModel): The GPT Model
     """
-    args = get_args()
     timers = get_timers()
 
     # Get the batch.
     timers('batch-generator', log_level=2).start()
+
     global stimer
+
     with stimer(bdata=True):
-        tokens, labels, loss_mask, attention_mask, position_ids = get_batch(
-            data_iterator)
+        vp_stage = get_attr_wrapped_model(model, "vp_stage")
+        (
+            tokens,
+            labels,
+            loss_mask,
+            attention_mask,
+            position_ids,
+            cu_seqlens,
+            max_seqlen,
+        ) = get_batch(data_iterator, vp_stage)
+
+    if cu_seqlens is None:
+        packed_seq_params = None
+    else:
+        # TODO(duncan): This class seems overly complex for what needs to be conveyed
+        packed_seq_params = PackedSeqParams(
+            qkv_format="thd",
+            cu_seqlens_q=cu_seqlens,
+            cu_seqlens_kv=cu_seqlens,
+            cu_seqlens_q_padded=None,
+            cu_seqlens_kv_padded=None,
+            max_seqlen_q=max_seqlen,
+            max_seqlen_kv=max_seqlen,
+        )
+
     timers('batch-generator').stop()
 
     with stimer:
-        output_tensor = model(tokens, position_ids, attention_mask,
-                              labels=labels)
+        output_tensor = model(
+            tokens,
+            position_ids,
+            attention_mask,
+            labels=labels,
+            packed_seq_params=packed_seq_params,
+            loss_mask=loss_mask
+        )
 
-    return output_tensor, partial(loss_func, loss_mask)
+    # [ModelOpt]: model is needed to access ModelOpt distillation losses
+    return output_tensor, partial(loss_func, loss_mask, model=model)
 
 
-def is_dataset_built_on_rank():
-    return (
-        mpu.is_pipeline_first_stage() or mpu.is_pipeline_last_stage()
-    ) and mpu.get_tensor_model_parallel_rank() == 0
+def is_dataset_built_on_rank(vp_stage=None, is_packed_sequence=False):
+    if mpu.get_tensor_model_parallel_rank() != 0:
+        return False
+    elif is_packed_sequence:
+        return True
+    else:
+        return is_first_or_last_pipeline_stage(vp_stage)
 
 
 def core_gpt_dataset_config_from_args(args):
-    tokenizer = get_tokenizer()
+    if args.legacy_tokenizer:
+        tokenizer = get_tokenizer()
+    else:
+        tokenizer = build_tokenizer(args)
 
     # Sometimes --data-path is too long, instead we parse it from a file.
     blend: Optional[Tuple[List[str], Optional[List[float]]]]
     blend_per_split: Optional[List[Optional[Tuple[List[str], Optional[List[float]]]]]]
     blend, blend_per_split = get_blend_and_blend_per_split(args)
+
+    sequences_per_dataset = None
+    if args.per_dataset_sequences_path is not None:
+        with open(args.per_dataset_sequences_path, "r") as f:
+            sequences_per_dataset = json.load(f)
 
     return GPTDatasetConfig(
         random_seed=args.seed,
@@ -227,31 +303,41 @@ def core_gpt_dataset_config_from_args(args):
         reset_attention_mask=args.reset_attention_mask,
         eod_mask_loss=args.eod_mask_loss,
         create_attention_mask=args.create_attention_mask_in_dataloader,
-        s3_cache_path=args.s3_cache_path,
+        object_storage_cache_path=args.object_storage_cache_path,
+        mid_level_dataset_surplus=args.mid_level_dataset_surplus,
+        allow_ambiguous_pad_tokens=args.allow_ambiguous_pad_tokens,
+        fast_cache_load=args.dataloader_fast_cache_load,
+        sequences_per_dataset=sequences_per_dataset,
+        defer_npy_index_mmap=args.dataloader_defer_npy_index_mmap,
+        context_parallel_size=args.context_parallel_size,
     )
 
 
-def train_valid_test_datasets_provider(train_val_test_num_samples):
+def train_valid_test_datasets_provider(train_val_test_num_samples, vp_stage=None):
     """Build the train test and validation datasets.
 
     Args:
         train_val_test_num_samples : A list containing the number of samples in train test and validation.
     """
     args = get_args()
-
     config = core_gpt_dataset_config_from_args(args)
 
-    if args.mock_data:
-        dataset_type = MockGPTDataset
+    is_packed_sequence = False
+    if args.sft:
+        dataset_type = SFTDataset
+        is_packed_sequence = True  # SFT always uses packed sequence
     else:
-        dataset_type = GPTDataset
+        if args.mock_data:
+            dataset_type = MockGPTDataset
+        else:
+            dataset_type = GPTDataset
 
     print_rank_0("> building train, validation, and test datasets for GPT ...")
 
     train_ds, valid_ds, test_ds = BlendedMegatronDatasetBuilder(
         dataset_type,
         train_val_test_num_samples,
-        is_dataset_built_on_rank,
+        partial(is_dataset_built_on_rank, vp_stage=vp_stage, is_packed_sequence=is_packed_sequence),
         config
     ).build()
 
@@ -261,12 +347,23 @@ def train_valid_test_datasets_provider(train_val_test_num_samples):
 
 
 if __name__ == "__main__":
+    # Timestamp right after entering __main__ block (after all imports/library setup)
+    _MAIN_ENTRY_TIME = time.time()
+
+    # Register startup timestamps for timing report in pretrain()
+    set_startup_timestamps(program_start=_PROGRAM_START_TIME, main_entry=_MAIN_ENTRY_TIME)
 
     # Temporary for transition to core datasets
     train_valid_test_datasets_provider.is_distributed = True
 
+    # Optionally enable inprocess restart on pretrain
+    pretrain, store = inprocess_restart.maybe_wrap_for_inprocess_restart(pretrain)
+
     pretrain(train_valid_test_datasets_provider,
-             model_provider,
+             partial(model_provider, mamba_builder),
              ModelType.encoder_or_decoder,
              forward_step,
-             args_defaults={'tokenizer_type': 'GPT2BPETokenizer'})
+             args_defaults={'tokenizer_type': 'GPT2BPETokenizer'},
+             store=store,
+             extra_args_provider=add_modelopt_args if has_nvidia_modelopt else None,
+             )

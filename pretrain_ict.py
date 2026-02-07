@@ -36,8 +36,8 @@ def pretrain_ict_model_provider(pre_process=True, post_process=True):
 def get_group_world_size_rank():
 
     group = mpu.get_data_parallel_group()
-    rank = torch.distributed.get_rank(group=group)
-    world_size = torch.distributed.get_world_size(group=group)
+    rank = group.rank()
+    world_size = group.size()
 
     return group, rank, world_size
 

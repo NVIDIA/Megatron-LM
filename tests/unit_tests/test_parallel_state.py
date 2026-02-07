@@ -1,3 +1,7 @@
+# Copyright (c) 2024, NVIDIA CORPORATION. All rights reserved.
+
+from math import log2
+
 import pytest
 import torch
 
@@ -10,6 +14,7 @@ test_parallel_order = ['tp-cp-ep-dp-pp', 'tp-cp-pp-ep-dp']
 
 
 @pytest.mark.parametrize('order', test_parallel_order)
+@pytest.mark.flaky
 @pytest.mark.flaky_in_dev
 def test_initialize_and_destroy_model_parallel(order):
     with pytest.raises(AssertionError):
@@ -138,7 +143,7 @@ def test_expert_model_parallel_rank():
 @pytest.mark.parametrize('order', test_parallel_order)
 def test_is_pipeline_first_stage(order):
     Utils.initialize_model_parallel(pipeline_model_parallel_size=world_size, order=order)
-    assert ps.is_pipeline_first_stage(ignore_virtual=True) == (rank == 0)
+    assert ps.is_pipeline_first_stage(ignore_virtual=False) == (rank == 0)
     assert ps.is_pipeline_first_stage() == (rank == 0)
     Utils.destroy_model_parallel()
 
@@ -146,7 +151,7 @@ def test_is_pipeline_first_stage(order):
 @pytest.mark.parametrize('order', test_parallel_order)
 def test_is_pipeline_last_stage(order):
     Utils.initialize_model_parallel(pipeline_model_parallel_size=world_size, order=order)
-    assert ps.is_pipeline_last_stage(ignore_virtual=True) == (rank == world_size - 1)
+    assert ps.is_pipeline_last_stage(ignore_virtual=False) == (rank == world_size - 1)
     assert ps.is_pipeline_last_stage() == (rank == world_size - 1)
     Utils.destroy_model_parallel()
 
@@ -163,32 +168,6 @@ def test_virtual_pipeline_model_parallel_rank(order):
 def test_get_tensor_model_parallel_src_rank(order):
     Utils.initialize_model_parallel(tensor_model_parallel_size=world_size, order=order)
     assert ps.get_tensor_model_parallel_src_rank() == ((rank // world_size) * world_size)
-    Utils.destroy_model_parallel()
-
-
-@pytest.mark.parametrize('order', test_parallel_order)
-def test_encoder_tensor_pipeline_parallelism(order):
-    Utils.initialize_model_parallel(
-        tensor_model_parallel_size=5,
-        pipeline_model_parallel_size=1,
-        encoder_pipeline_model_parallel_size=1,
-        encoder_tensor_model_parallel_size=3,
-        order=order,
-    )
-    if rank < 2:
-        assert ps.get_tensor_model_parallel_world_size() == 3
-        assert isinstance(ps._PIPELINE_GLOBAL_RANKS[0], list)
-        last_ranks = ps.get_pipeline_model_parallel_last_rank()
-        assert isinstance(last_ranks, list)
-        assert len(last_ranks) == 2
-    elif rank == 2:
-        assert ps.get_tensor_model_parallel_world_size() == 3
-        assert isinstance(ps._PIPELINE_GLOBAL_RANKS[0], int)
-        assert isinstance(ps.get_pipeline_model_parallel_last_rank(), int)
-    else:
-        assert ps.get_tensor_model_parallel_world_size() == 5
-        assert isinstance(ps._PIPELINE_GLOBAL_RANKS[0], int)
-        assert isinstance(ps.get_pipeline_model_parallel_last_rank(), int)
     Utils.destroy_model_parallel()
 
 
@@ -522,3 +501,60 @@ def test_rank_generator_for_tp_dp_pp(nodes, num_gpu, tp, pp, cp, ep):
     assert expert_dp_group == expert_rank_generator.get_ranks(
         "dp"
     ), f"{expert_dp_group} != {expert_rank_generator.get_ranks('dp')}."
+
+
+@pytest.mark.parametrize(
+    "world_size, tp_size, cp_size, dp_size",
+    [(8, 1, 2, 4), (8, 1, 1, 8)],  # 8 GPUs, 1 TP, 2 CP, 4 DP  # 8 GPUs, 1 TP, 1 CP, 8 DP
+)
+def test_hybrid_dp_cp_groups(world_size, tp_size, cp_size, dp_size):
+    """
+    Test that hybrid DPxCP groups are created correctly.
+    """
+    Utils.destroy_model_parallel()
+
+    # Skip if world size doesn't match
+    actual_world_size = torch.cuda.device_count()
+    if actual_world_size != world_size:
+        pytest.skip(f"Test requires world_size={world_size}, but got {actual_world_size}")
+    Utils.initialize_model_parallel(
+        tensor_model_parallel_size=tp_size,
+        context_parallel_size=cp_size,
+        hybrid_context_parallel=True,
+    )
+
+    dp_cp_size = ps.get_data_parallel_world_size(with_context_parallel=True)
+    group_sizes = [2**i for i in range(int(log2(dp_cp_size)))][1:]
+    for group_size in group_sizes:
+        group = ps.get_hybrid_data_context_parallel_groups(group_size=group_size)
+        assert group.size() == group_size
+
+    Utils.destroy_model_parallel()
+
+
+def test_separate_all_gather_group():
+    """Test separate all-gather group for improved communication overlap."""
+    # Test without creating AG group (default)
+    Utils.initialize_model_parallel(context_parallel_size=world_size, create_all_gather_group=False)
+    assert not ps.has_separate_all_gather_group()
+    assert ps._DATA_PARALLEL_GROUP_WITH_CP_AG is None
+    Utils.destroy_model_parallel()
+
+    # Test with creating AG group
+    Utils.initialize_model_parallel(context_parallel_size=world_size, create_all_gather_group=True)
+    assert ps.has_separate_all_gather_group()
+    assert ps._DATA_PARALLEL_GROUP_WITH_CP_AG is not None
+
+    # Verify it returns the correct group
+    ag_group = ps.get_data_parallel_group(with_context_parallel=True, independent_all_gather=True)
+    regular_group = ps.get_data_parallel_group(
+        with_context_parallel=True, independent_all_gather=False
+    )
+    assert ag_group is not None
+    assert regular_group is not None
+    # They should have the same ranks but different communicators
+    ag_ranks = torch.distributed.get_process_group_ranks(ag_group)
+    regular_ranks = torch.distributed.get_process_group_ranks(regular_group)
+    assert ag_ranks == regular_ranks
+
+    Utils.destroy_model_parallel()

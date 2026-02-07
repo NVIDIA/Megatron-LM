@@ -6,8 +6,8 @@ import re
 from dataclasses import dataclass, field
 from typing import List, Optional, Tuple
 
-from megatron.core.datasets.megatron_tokenizer import MegatronTokenizer
 from megatron.core.datasets.utils import Split, log_single_rank, normalize
+from megatron.core.tokenizers import MegatronTokenizerBase
 
 logger = logging.getLogger(__name__)
 
@@ -31,8 +31,14 @@ class BlendedMegatronDatasetConfig:
 
     blend_per_split: Optional[List[Optional[Tuple[List[str], Optional[List[float]]]]]] = None
     """A set of blends, as defined above, one for each split distribution. Not to be used with
-       'blend'. Defauls to None.
+       'blend'. Defaults to None.
     """
+
+    multiple_validation_sets: Optional[bool] = None
+    """Whether the validation split should be treated as multiple seperate datasets."""
+
+    full_validation: Optional[bool] = None
+    """Whether to run a full epoch of validation each time validation occurs."""
 
     split: Optional[str] = None
     """The split string, a comma separated weighting for the dataset splits when drawing samples
@@ -60,11 +66,51 @@ class BlendedMegatronDatasetConfig:
        constructor.
     """
 
-    tokenizer: Optional[MegatronTokenizer] = None
-    """The MegatronTokenizer instance. Required for datasets that do online tokenization."""
+    tokenizer: Optional[MegatronTokenizerBase] = None
+    """The MegatronTokenizerBase instance. Required for datasets that do online tokenization."""
+
+    mid_level_dataset_surplus: float = 0.005
+    """The sample surplus to build for the mid-level datasets(s). Defaults arbitrarily to 0.005.
+       This value is irrelevant for single source data blends. This value may need to be increased
+       if the top level dataset oversamples the mid level dataset(s). This value may be set to 0.0
+       in future if the top level dataset is constrained to not oversample the mid level
+       datasets(s).
+    """
+
+    allow_ambiguous_pad_tokens: Optional[bool] = False
+    """Whether to prevent pad tokens already present in the dataset from being masked out
+       when the pad token incorrectly shares the same id with other special tokens.
+       Treating such tokens as pad tokens results in training instability and divergence.
+       Such a scenario is best resolved by fixing the tokenizer, but leaving this option as False
+       provides a workaround.
+       This argument will have no effect if the tokenizer is correct. However, should the user
+       desire to train on a dataset that intentionally contains pad tokens - while also using an
+       incorrect tokenizer - this option may be set to True. This is typically not recommended.
+    """
+
+    fast_cache_load: bool = False
+    """Option to use the fast cache loading path. Requires all the dataset caches to be built."""
+
+    defer_npy_index_mmap: bool = False
+    """Option to defer the mmap of the dataset indexes until the first access.
+       Requires all the dataset caches to be built.
+    """
 
     def __post_init__(self) -> None:
         """Do asserts and set fields post init"""
+        if self.fast_cache_load:
+            assert (
+                self.path_to_cache is not None
+            ), "--data-cache-path must be provided when using --dataloader-fast-cache-load."
+            assert (
+                self.blend is None
+            ), f"--dataloader-fast-cache-load and --data-path cannot be used together. \
+            Use --per-split-data-args-path or --train-data-path, --valid-data-path and \
+            --test-data-path instead."
+        if self.defer_npy_index_mmap:
+            assert (
+                self.path_to_cache is not None
+            ), "--data-cache-path must be provided when using --dataloader-defer-npy-index-mmap."
         if self.blend_per_split is not None and any(self.blend_per_split):
             assert self.blend is None, "blend and blend_per_split are incompatible"
             assert self.split is None, "split and blend_per_split are incompatible"
@@ -134,9 +180,6 @@ def convert_split_vector_to_split_matrix(
     Ex. a standard conversion:
 
     [0.99, 0.01, 0.0] -> [(0, 0.99), (0.99, 1.0), None]
-
-    Ex. a conversion for Retro when Retro pretraining uses a [0.99, 0.01, 0.0] split and Retro
-    preprocessing used a [0.98, 0.02, 0.0] split:
 
     [0.99, 0.01, 0.0], [0.98, 0.02, 0.0] -> [(0, 0.98), (0.99, 1.0), None]
 

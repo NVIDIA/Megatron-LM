@@ -1,3 +1,5 @@
+# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+
 import copy
 import os
 import random
@@ -11,14 +13,12 @@ from unittest import mock
 import pytest
 import torch
 
-from megatron.core.inference.common_inference_params import CommonInferenceParams
+from megatron.core.inference.contexts import StaticInferenceContext
 from megatron.core.inference.inference_request import InferenceRequest, Status, VLMInferenceRequest
-from megatron.core.inference.model_inference_wrappers.inference_wrapper_config import (
-    InferenceWrapperConfig,
-)
 from megatron.core.inference.model_inference_wrappers.multimodal.vlm_inference_wrapper import (
     VLMInferenceWrapper,
 )
+from megatron.core.inference.sampling_params import SamplingParams
 from megatron.core.inference.text_generation_controllers.vlm_text_generation_controller import (
     VLMTextGenerationController,
 )
@@ -26,8 +26,8 @@ from megatron.core.models.gpt.gpt_layer_specs import get_gpt_layer_local_spec
 from megatron.core.models.multimodal.llava_model import LLaVAModel
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
 from megatron.core.transformer.enums import AttnBackend
+from megatron.core.transformer.module import Float16Module
 from megatron.core.transformer.transformer_config import TransformerConfig
-from megatron.legacy.model import Float16Module
 from tests.unit_tests.test_utilities import Utils
 
 
@@ -50,9 +50,14 @@ class TestVLMTextGenerationController:
             hidden_size=self.language_hidden_size,
             num_attention_heads=self.language_num_attention_heads,
             use_cpu_initialization=False,
+            bf16=True,
         )
         vision_config = TransformerConfig(
-            num_layers=2, hidden_size=16, num_attention_heads=2, use_cpu_initialization=False
+            num_layers=2,
+            hidden_size=16,
+            num_attention_heads=2,
+            use_cpu_initialization=False,
+            bf16=True,
         )
         vision_projection_config = TransformerConfig(
             num_layers=2,
@@ -60,12 +65,14 @@ class TestVLMTextGenerationController:
             ffn_hidden_size=32,
             num_attention_heads=1,
             use_cpu_initialization=False,
+            bf16=True,
         )
 
         language_layer_spec = get_gpt_layer_local_spec()
         vision_layer_spec = copy.deepcopy(language_layer_spec)
         vision_projection_spec = copy.deepcopy(language_layer_spec.submodules.mlp.submodules)
 
+        language_config.language_model_type = "dummy"
         vision_config.vision_model_type = "clip"
         self.model = LLaVAModel(
             language_transformer_config=language_config,
@@ -82,17 +89,11 @@ class TestVLMTextGenerationController:
             patch_dim=14,
         ).cuda()
         self.image_token_index = self.model.image_token_index
-        self.model = Float16Module(self.model, Namespace(fp16=False, bf16=True))
+        self.model = Float16Module(self.model.config, self.model)
 
-        inference_wrapper_config = InferenceWrapperConfig(
-            hidden_size=self.language_hidden_size,
-            inference_batch_times_seqlen_threshold=-1,
-            fp32_residual_connection=False,
-            params_dtype=torch.float,
-            padded_vocab_size=self.language_vocab_size,
-        )
+        inference_context = StaticInferenceContext(max_batch_size=8, max_sequence_length=2560)
 
-        inference_wrapped_model = VLMInferenceWrapper(self.model, inference_wrapper_config)
+        inference_wrapped_model = VLMInferenceWrapper(self.model, inference_context)
 
         self.mock_tokenizer = mock.Mock()
 
@@ -128,11 +129,11 @@ class TestVLMTextGenerationController:
             ).tolist()
             prompt_tokens[3] = self.image_token_index
 
-            request_id = str(i)
+            request_id = i
             inference_request = VLMInferenceRequest(
                 request_id=request_id,
                 prompt=prompt,
-                inference_parameters=CommonInferenceParams(num_tokens_to_generate=10),
+                sampling_params=SamplingParams(num_tokens_to_generate=10),
                 arrival_time=time.time(),
                 prompt_tokens=prompt_tokens,
                 num_img_embeddings_per_tile=num_img_embeddings_per_tile,

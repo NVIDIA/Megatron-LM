@@ -1,7 +1,7 @@
 import argparse
 import json
 
-from evaluate_mmmu import get_input_output_paths
+from .evaluate_mmmu import get_input_output_paths
 
 
 def merge_input_files(input_path):
@@ -25,7 +25,7 @@ def merge_input_files(input_path):
     results = list(results.values())
 
     with open(output_file_path, "w") as output_file:
-        json.dump(results, output_file)
+        json.dump(results, output_file, indent=4, sort_keys=True)
 
     return output_file_path
 

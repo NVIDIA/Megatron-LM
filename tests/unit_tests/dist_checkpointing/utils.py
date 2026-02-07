@@ -1,5 +1,6 @@
+# Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+
 from functools import partial
-from types import SimpleNamespace
 from typing import Any, Callable, Tuple, Union
 from unittest import mock
 
@@ -11,8 +12,10 @@ from megatron.core.models.gpt.gpt_layer_specs import (
     get_gpt_layer_with_transformer_engine_spec,
 )
 from megatron.core.optimizer import OptimizerConfig, get_megatron_optimizer
+from megatron.core.optimizer.muon import get_megatron_muon_optimizer
 from megatron.core.tensor_parallel import model_parallel_cuda_manual_seed
 from megatron.core.transformer import TransformerConfig
+from megatron.training.arguments import parse_args
 from megatron.training.training import get_model
 from megatron.training.utils import unwrap_model
 
@@ -24,6 +27,11 @@ NUM_ATTENTION_HEADS = 8
 def initialize_gpt_model(
     pre_process=True, post_process=True, seed=0, use_glu=True, **config_kwargs
 ):
+    # These kwargs are passed through training.get_model for model construction,
+    # but are not part of TransformerConfig; strip them before building config.
+    config_kwargs.pop("pg_collection", None)
+    config_kwargs.pop("config", None)
+
     torch.manual_seed(seed)
     model_parallel_cuda_manual_seed(seed)
 
@@ -32,6 +40,7 @@ def initialize_gpt_model(
         hidden_size=HIDDEN_SIZE,
         num_attention_heads=NUM_ATTENTION_HEADS,
         use_cpu_initialization=True,
+        bf16=True,
     )
     default_config_kwargs.update(**config_kwargs)
     transformer_config = TransformerConfig(**default_config_kwargs, gated_linear_unit=use_glu)
@@ -44,7 +53,6 @@ def initialize_gpt_model(
         post_process=post_process,
     )
 
-    model.bfloat16()
     with torch.no_grad():
         for p in model.parameters():
             p.random_()
@@ -61,6 +69,11 @@ def initialize_moe_model(
     use_grouped_mlp=False,
     **config_kwargs,
 ):
+    # These kwargs are passed through training.get_model for model construction,
+    # but are not part of TransformerConfig; strip them before building config.
+    config_kwargs.pop("pg_collection", None)
+    config_kwargs.pop("config", None)
+
     torch.manual_seed(seed)
     model_parallel_cuda_manual_seed(seed)
     expert_num = 8
@@ -111,14 +124,12 @@ def init_basic_mock_args(args, tp, pp, bf16=True):
     args.use_distributed_optimizer = True
     args.ddp_bucket_size = None
     args.check_for_nan_in_loss_and_grad = False
-    args.check_for_large_grads = False
     args.ddp_average_in_collective = False
     args.tensor_model_parallel_size = tp
     args.pipeline_model_parallel_size = pp
-    args.encoder_tensor_model_parallel_size = 0
-    args.encoder_pipeline_model_parallel_size = 0
     args.enable_ft_package = False
     args.use_torch_fsdp2 = False
+    args.init_model_with_meta_device = False
     return args
 
 
@@ -143,7 +154,6 @@ def init_checkpointing_mock_args(args, ckpt_dir, fully_parallel=False):
     args.consumed_train_samples = 0
     args.skipped_train_samples = 0
     args.consumed_valid_samples = 0
-    args.retro_add_retriever = False
     args.no_load_optim = False
     args.no_load_rng = False
     args.dist_ckpt_strictness = 'assume_ok_unexpected'
@@ -152,12 +162,22 @@ def init_checkpointing_mock_args(args, ckpt_dir, fully_parallel=False):
     args.num_layers = NUM_LAYERS
     args.hidden_size = HIDDEN_SIZE
     args.num_attention_heads = NUM_ATTENTION_HEADS
+    args.ckpt_step = None
+    args.use_megatron_fsdp = False
+    args.dist_ckpt_optim_fully_reshardable = False
+    args.distrib_optim_fully_reshardable_mem_efficient = False
+    args.phase_transition_iterations = None
 
 
 def setup_model_and_optimizer(
-    seed, tp, pp, initialize_fn=initialize_gpt_model, bf16=True, dist_opt=True
+    seed, tp, pp, initialize_fn=initialize_gpt_model, bf16=True, dist_opt=True, optimizer='adam'
 ):
-    mock_args = SimpleNamespace()
+    if 'muon' in optimizer and dist_opt:
+        raise ValueError(
+            "Layer-wise distributed optimizer with Muon is not supported with distributed optimizer."
+        )
+
+    mock_args = parse_args(ignore_unknown_args=True)
     with mock.patch('megatron.training.training.get_args', new=lambda: mock_args):
         init_basic_mock_args(mock_args, tp, pp, bf16=bf16)
         model = get_model(
@@ -167,6 +187,7 @@ def setup_model_and_optimizer(
                 tensor_model_parallel_size=tp,
                 pipeline_model_parallel_size=pp,
                 pipeline_dtype=torch.bfloat16,
+                bf16=bf16,
             )
         )
 
@@ -174,17 +195,33 @@ def setup_model_and_optimizer(
         bf16=bf16,
         params_dtype=torch.bfloat16 if bf16 else torch.float,
         use_distributed_optimizer=dist_opt,
+        optimizer=optimizer,
     )
-    optimizer = get_megatron_optimizer(config, model)
+
+    if 'muon' in optimizer:
+        # Use layer-wise distributed optimizer with Muon
+        optimizer_type = optimizer
+        # default lr None feels wrong. only change muon lr to avoid breaking old tests
+        config.lr = 0.0
+        optimizer = get_megatron_muon_optimizer(
+            config, model, layer_wise_distributed_optimizer='dist' in optimizer_type
+        )
+    else:
+        optimizer_type = optimizer
+        optimizer = get_megatron_optimizer(config, model)
 
     torch.manual_seed(seed + 1)
     model_parallel_cuda_manual_seed(seed + 1)
 
-    for group in optimizer.optimizer.param_groups:
-        for p in group['params']:
-            if len(optimizer.optimizer.state[p]) == 0:
-                optimizer.optimizer.state[p]['exp_avg'] = torch.rand_like(p.data)
-                optimizer.optimizer.state[p]['exp_avg_sq'] = torch.rand_like(p.data)
+    if not 'muon' in optimizer_type:
+        for group in optimizer.optimizer.param_groups:
+            for p in group['params']:
+                if len(optimizer.optimizer.state[p]) == 0:
+                    optimizer.optimizer.state[p]['exp_avg'] = torch.rand_like(p.data)
+                    optimizer.optimizer.state[p]['exp_avg_sq'] = torch.rand_like(p.data)
+    else:
+        for opt in optimizer.chained_optimizers:
+            opt.init_state_fn(opt)
 
     optimizer.reload_model_params()
 
@@ -227,8 +264,13 @@ def setup_moe_model_and_optimizer(
     use_te=False,
     use_grouped_mlp=False,
     use_glu=False,
+    optimizer='adam',
 ):
-    mock_args = SimpleNamespace()
+    if 'muon' in optimizer and dist_opt:
+        raise ValueError(
+            "Layer-wise distributed optimizer with Muon is not supported with distributed optimizer."
+        )
+    mock_args = parse_args(ignore_unknown_args=True)
     with mock.patch('megatron.training.training.get_args', new=lambda: mock_args):
         init_basic_mock_args(mock_args, tp, pp, bf16=bf16)
         model = get_model(
@@ -243,6 +285,7 @@ def setup_moe_model_and_optimizer(
                 use_te=use_te,
                 use_grouped_mlp=use_grouped_mlp,
                 use_glu=use_glu,
+                bf16=bf16,
             )
         )
 
@@ -250,18 +293,33 @@ def setup_moe_model_and_optimizer(
         bf16=bf16,
         params_dtype=torch.bfloat16 if bf16 else torch.float,
         use_distributed_optimizer=dist_opt,
+        optimizer=optimizer,
     )
-    optimizer = get_megatron_optimizer(config, model)
+
+    if 'muon' in optimizer:
+        optimizer_type = optimizer
+        # default lr None feels wrong. only change muon lr to avoid breaking old tests
+        config.lr = 0.0
+        optimizer = get_megatron_muon_optimizer(
+            config, model, layer_wise_distributed_optimizer='dist' in optimizer_type
+        )
+    else:
+        optimizer_type = optimizer
+        optimizer = get_megatron_optimizer(config, model)
 
     torch.manual_seed(seed + 1)
     model_parallel_cuda_manual_seed(seed + 1)
 
-    for opt in optimizer.chained_optimizers:
-        for group in opt.param_groups:
-            for p in group['params']:
-                if len(opt.state[p]) == 0:
-                    opt.state[p]['exp_avg'] = torch.rand_like(p.data)
-                    opt.state[p]['exp_avg_sq'] = torch.rand_like(p.data)
+    if not 'muon' in optimizer_type:
+        for opt in optimizer.chained_optimizers:
+            for group in opt.param_groups:
+                for p in group['params']:
+                    if len(opt.state[p]) == 0:
+                        opt.state[p]['exp_avg'] = torch.rand_like(p.data)
+                        opt.state[p]['exp_avg_sq'] = torch.rand_like(p.data)
+    else:
+        for opt in optimizer.chained_optimizers:
+            opt.init_state_fn(opt)
 
     optimizer.reload_model_params()
 

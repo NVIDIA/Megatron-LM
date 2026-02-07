@@ -80,17 +80,29 @@ class BlendedDataset(torch.utils.data.Dataset):
             unique_identifiers, indent=4, default=lambda obj: obj.unique_identifiers
         )
         self.unique_description_hash = hashlib.md5(
-            self.unique_description.encode("utf-8")
+            self.unique_description.encode("utf-8"), usedforsecurity=False
         ).hexdigest()
-
-        self.built_anew_on_cache_miss = False
 
         self.dataset_index, self.dataset_sample_index = self._build_indices()
 
     def __len__(self) -> int:
+        if self.config.defer_npy_index_mmap:
+            size = sum(self.weights)
+            if self.size is not None:
+                size = self.size
+            return size
+
         return self.dataset_index.shape[0]
 
     def __getitem__(self, idx: int) -> Dict[str, Union[int, numpy.ndarray]]:
+        if self.dataset_index is None:
+            self.dataset_index = numpy.load(
+                self.path_to_dataset_index, allow_pickle=True, mmap_mode="r"
+            )
+            self.dataset_sample_index = numpy.load(
+                self.path_to_dataset_sample_index, allow_pickle=True, mmap_mode="r"
+            )
+
         dataset_id = self.dataset_index[idx]
         dataset_sample_id = self.dataset_sample_index[idx]
         return {"dataset_id": dataset_id, **self.datasets[dataset_id][dataset_sample_id]}
@@ -105,6 +117,16 @@ class BlendedDataset(torch.utils.data.Dataset):
         Returns:
             Tuple[numpy.ndarray, numpy.ndarray]: The dataset index and the dataset sample index
         """
+        if self.config.defer_npy_index_mmap:
+            # NOTE(asolergi-nv): Direct path to lazy memmap the indexes
+            get_path_to = lambda suffix: os.path.join(
+                self.config.path_to_cache,
+                f"{self.unique_description_hash}-{type(self).__name__}-{self.split.name}-{suffix}",
+            )
+            self.path_to_dataset_index = get_path_to("dataset_index.npy")
+            self.path_to_dataset_sample_index = get_path_to("dataset_sample_index.npy")
+            return None, None
+
         path_to_cache = self.config.path_to_cache
 
         if path_to_cache:
@@ -115,10 +137,14 @@ class BlendedDataset(torch.utils.data.Dataset):
             path_to_description = get_path_to("description.txt")
             path_to_dataset_index = get_path_to("dataset_index.npy")
             path_to_dataset_sample_index = get_path_to("dataset_sample_index.npy")
-            cache_hit = all(
-                map(
-                    os.path.isfile,
-                    [path_to_description, path_to_dataset_index, path_to_dataset_sample_index],
+            cache_hit = (
+                True
+                if self.config.fast_cache_load
+                else all(
+                    map(
+                        os.path.isfile,
+                        [path_to_description, path_to_dataset_index, path_to_dataset_sample_index],
+                    )
                 )
             )
         else:
@@ -128,7 +154,6 @@ class BlendedDataset(torch.utils.data.Dataset):
             log_single_rank(
                 logger, logging.INFO, f"Build and save the {type(self).__name__} indices"
             )
-            self.built_anew_on_cache_miss = True
 
             # Build the dataset and dataset sample indexes
             log_single_rank(
@@ -156,6 +181,19 @@ class BlendedDataset(torch.utils.data.Dataset):
                     dataset_index, dataset_sample_index, self.weights, len(self.datasets)
                 )
 
+            dataset_indices, dataset_sizes = numpy.unique(dataset_index, return_counts=True)
+            for i, (_index, _size) in enumerate(zip(dataset_indices, dataset_sizes)):
+                if len(self.datasets[_index]) < _size:
+                    raise IndexError(
+                        f"The {self.split.name} blend oversamples the contributing datasets and, "
+                        f"for example, requests {_size} samples from "
+                        f"{type(self.datasets[_index]).__name__} number {i} in excess of its size "
+                        f"{len(self.datasets[_index])}. The current value of the config attribute "
+                        f"mid_level_dataset_surplus may be increased, e.g. two- or ten-fold, from "
+                        f"its current value ({self.config.mid_level_dataset_surplus}) to ensure a "
+                        f"sufficient mid-level dataset sample margin from which to draw."
+                    )
+
             if path_to_cache:
                 os.makedirs(path_to_cache, exist_ok=True)
                 # Write the description
@@ -182,7 +220,7 @@ class BlendedDataset(torch.utils.data.Dataset):
             logger, logging.INFO, f"\tLoad the dataset index from {path_to_dataset_index}"
         )
         t_beg = time.time()
-        dataset_index = numpy.load(path_to_dataset_index, allow_pickle=True, mmap_mode='r')
+        dataset_index = numpy.load(path_to_dataset_index, allow_pickle=True, mmap_mode="r")
         t_end = time.time()
         log_single_rank(logger, logging.DEBUG, f"\t> time elapsed: {t_end - t_beg:4f} seconds")
 
@@ -193,7 +231,7 @@ class BlendedDataset(torch.utils.data.Dataset):
         )
         t_beg = time.time()
         dataset_sample_index = numpy.load(
-            path_to_dataset_sample_index, allow_pickle=True, mmap_mode='r'
+            path_to_dataset_sample_index, allow_pickle=True, mmap_mode="r"
         )
         t_end = time.time()
         log_single_rank(logger, logging.DEBUG, f"\t> time elapsed: {t_end - t_beg:4f} seconds")

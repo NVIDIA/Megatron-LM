@@ -1,0 +1,61 @@
+ENV_VARS:
+  CUDA_DEVICE_MAX_CONNECTIONS: 1
+  NVTE_ALLOW_NONDETERMINISTIC_ALGO: 0
+  NCCL_ALGO: Ring
+  CUBLAS_WORKSPACE_CONFIG: :4096:8
+MODEL_ARGS:
+  --num-layers: 32
+  --hidden-size: 4096
+  --attention-dropout: 0.0
+  --hidden-dropout: 0.0
+  --num-attention-heads: 32
+  --log-params-norm: true
+  --log-num-zeros-in-grad: true
+  --log-validation-ppl-to-tensorboard: true
+  --log-timers-to-tensorboard: true
+  --tensorboard-dir: ${TENSORBOARD_PATH}
+  --micro-batch-size: 8
+  --global-batch-size: 128
+  --seq-length: 4096
+  --max-position-embeddings: 4096
+  --train-iters: 100
+  --timing-log-level: 0
+  --lr-decay-iters: 2200
+  --save: ${CHECKPOINT_SAVE_PATH}
+  --load: ${CHECKPOINT_LOAD_PATH}
+  --tokenizer-type: HuggingFaceTokenizer
+  --tokenizer-model: llava-hf/llava-1.5-7b-hf
+  --legacy-tokenizer: true
+  --distributed-backend: nccl
+  --lr: 0.001
+  --lr-decay-style: cosine
+  --min-lr: 2.0e-5
+  --lr-warmup-iters: 150
+  --log-interval: 1
+  --save-interval: 200
+  --eval-interval: 20000
+  --eval-iters: 30
+  --tensor-model-parallel-size: 1
+  --pipeline-model-parallel-size: 1
+  --context-parallel-size: 1
+  --transformer-impl: transformer_engine
+  --init-method-std: 0.006
+  --adam-beta1: 0.9
+  --adam-beta2: 0.95
+  --dataset-provider: llava_vlm
+  --model-provider: llava_vlm
+  --deterministic-mode: true
+  --log-memory-to-tensorboard: true
+  --dataloader-type: external
+  --data-path: ${DATA_PATH}/mixed/mcore_mimo_vlm/llava_pretrain_energon
+  --language-model-checkpoint: ${CHECKPOINT_LOAD_PATH}/model/vicuna_7b_pyt/dcp/mcore-v1.5_fp32/weights
+  --auto-detect-ckpt-format: true
+  --accumulate-allreduce-grads-in-fp32: true
+  --position-embedding-type: rope
+TEST_TYPE: regular
+METRICS:
+  - "iteration-time"
+  - "lm loss"
+  - "num-zeros"
+  - "mem-allocated-bytes"
+  - "mem-max-allocated-bytes"

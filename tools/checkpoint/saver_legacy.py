@@ -4,6 +4,10 @@ import os
 import sys
 import torch
 
+from functools import partial
+
+from tools.checkpoint.utils import _ConverterFakeProcessGroup
+
 
 def add_arguments(parser):
     group = parser.add_argument_group(title='Megatron saver')
@@ -165,6 +169,8 @@ def save_checkpoint(queue, args):
                 print(f"Overwriting default {arg} value {getattr(margs, arg)} with value from checkpoint {value}.")
                 setattr(margs, arg, value)
 
+    margs.inference_batch_times_seqlen_threshold = -1
+
     validate_args(margs)
 
     # Use MLM models.
@@ -189,7 +195,9 @@ def save_checkpoint(queue, args):
 
     # Determine how to make our models
     if md.model_type == 'GPT':
-        from pretrain_gpt import model_provider
+        from model_provider import model_provider as common_model_provider
+        from gpt_builders import gpt_builder
+        model_provider = partial(common_model_provider, gpt_builder)
         margs.model_type = ModelType.encoder_or_decoder
     elif md.model_type == 'BERT':
         from pretrain_bert import model_provider
@@ -207,6 +215,10 @@ def save_checkpoint(queue, args):
     mpu.set_tensor_model_parallel_rank(0)
     mpu.set_pipeline_model_parallel_rank(0)
     fused_kernels.load(margs)
+    
+    # For backward compatibility during local parallel states refactoring
+    fake_tp_group = _ConverterFakeProcessGroup(size=args.target_tensor_parallel_size)
+    mpu._TENSOR_MODEL_PARALLEL_GROUP = fake_tp_group
 
     # Embeddings
     # -----------
@@ -409,6 +421,8 @@ def save_checkpoint(queue, args):
                 print("ERROR: got some more data but was expecting to be done")
 
         for tp_rank in range(args.target_tensor_parallel_size):
+            fake_tp_group = mpu.get_tensor_model_parallel_group()
+            fake_tp_group.set_rank(tp_rank)
             mpu.set_tensor_model_parallel_rank(tp_rank)
             save_checkpoint(md.iteration, [models[tp_rank]], None, None,
                             num_floating_point_operations_so_far=0)

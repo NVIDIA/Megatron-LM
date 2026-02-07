@@ -144,6 +144,7 @@ class T5MaskedWordPieceDataset(MaskedWordPieceDataset):
             decoder_mask (torch.tensor): A 2-D array of tokens (bs, q_len)
             use_local (bool): Whether the current T5 model uses local (vs TE)
                 transformer implmentation
+            test_te_version (str): The Transformer Engine version to test against. Defaults to None.
 
         Returns:
             Configured encoder_mask, decoder_mask, encoder_decoder_mask
@@ -193,8 +194,8 @@ class T5MaskedWordPieceDataset(MaskedWordPieceDataset):
                 te_version = get_te_version()
 
             # Check for older TE version than 1.10, adjust attention mask accordingly
-            flash_attention_enabled = os.getenv('NVTE_FLASH_ATTN') == '1'
-            fused_attention_enabled = os.getenv('NVTE_FUSED_ATTN') == '1'
+            flash_attention_enabled = os.getenv("NVTE_FLASH_ATTN") == "1"
+            fused_attention_enabled = os.getenv("NVTE_FUSED_ATTN") == "1"
             if (te_version < PkgVersion("1.10.0")) and (te_version >= PkgVersion("1.7.0")):
                 if not (flash_attention_enabled) and not (fused_attention_enabled):
                     encoder_mask = T5MaskedWordPieceDataset._build_b1ss_attention_mask(
@@ -228,7 +229,8 @@ class T5MaskedWordPieceDataset(MaskedWordPieceDataset):
             idx (int): The index into the dataset
 
         Returns:
-            Dict[str, Union[int, numpy.ndarray]]: The
+            Dict[str, Union[int, numpy.ndarray]]: The sample data including encoder input, decoder
+                input/output, and masks.
         """
         idx_beg, idx_end, target_sequence_length = self.sample_index[idx]
         sample = [self.dataset[i] for i in range(idx_beg, idx_end)]
@@ -286,17 +288,19 @@ class T5MaskedWordPieceDataset(MaskedWordPieceDataset):
 
         encoder_input = numpy.array(encoder_input, dtype=numpy.int64)
         encoder_input = numpy.pad(
-            encoder_input, (0, length_pads_encoder), constant_values=self.config.tokenizer.pad
+            encoder_input, (0, length_pads_encoder), constant_values=self._pad_token_id
         )
 
         decoder_input = numpy.array(decoder_input, dtype=numpy.int64)
         decoder_input = numpy.pad(
-            decoder_input, (0, length_pads_decoder), constant_values=self.config.tokenizer.pad
+            decoder_input, (0, length_pads_decoder), constant_values=self._pad_token_id
         )
 
         # Create attention and history masks
-        mask_encoder = numpy.array([1] * length_toks_encoder + [0] * length_pads_encoder)
-        mask_decoder = numpy.array([1] * length_toks_decoder + [0] * length_pads_decoder)
+        mask_encoder = numpy.ones(self.config.sequence_length_encoder, dtype=numpy.int64)
+        mask_encoder[encoder_input == self._pad_token_id] = 0
+        mask_decoder = numpy.ones(self.config.sequence_length_decoder, dtype=numpy.int64)
+        mask_decoder[decoder_input == self._pad_token_id] = 0
         mask_encoder_decoder = None
 
         # Mask the labels
@@ -306,6 +310,11 @@ class T5MaskedWordPieceDataset(MaskedWordPieceDataset):
         # Get the loss mask
         loss_mask = numpy.zeros(self.config.sequence_length_decoder, dtype=numpy.int64)
         loss_mask[:length_toks_decoder] = 1
+
+        # For padded sequences, ensure the embedding layer can map the token ID
+        encoder_input[encoder_input == self._pad_token_id] = 0
+        decoder_input[decoder_input == self._pad_token_id] = 0
+        labels[labels == self._pad_token_id] = 0
 
         return {
             "text_enc": encoder_input,

@@ -1,13 +1,22 @@
 # Copyright (c) 2023, NVIDIA CORPORATION. All rights reserved.
 
+import copy
 from contextlib import nullcontext
 
 import pytest
 import torch
+from packaging import version
 
-from megatron.core import parallel_state
+from megatron.core import mpu, parallel_state
+from megatron.core.fp8_utils import get_fp8_context
+from megatron.core.hyper_comm_grid import HyperCommGrid
 from megatron.core.models.gpt.gpt_layer_specs import get_gpt_layer_with_transformer_engine_spec
+from megatron.core.models.gpt.gpt_model import GPTModel
+from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
+from megatron.core.transformer.enums import ModelType
+from megatron.core.transformer.pipeline_parallel_layer_layout import PipelineParallelLayerLayout
+from megatron.core.transformer.spec_utils import build_module
 from megatron.core.transformer.transformer_block import TransformerBlock, get_num_layers_to_build
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.transformer.transformer_layer import TransformerLayer
@@ -114,6 +123,7 @@ class TestParallelTransformerBlock:
             config, get_gpt_layer_with_transformer_engine_spec()
         )
         assert selective_transformer_block.config.recompute_granularity == 'selective'
+        assert "core_attn" in selective_transformer_block.config.recompute_modules
         assert selective_transformer_block.checkpoint_core_attention
         assert selective_transformer_block.config.fp8 == fp8
 
@@ -138,7 +148,7 @@ class TestParallelTransformerBlock:
 class TestPipelineParallelTransformerBlock:
     @pytest.mark.parametrize(
         "num_layers, pipeline_model_parallel_size, virtual_pipeline_model_parallel_size, "
-        "include_embedding_in_pipeline_split, include_loss_in_pipeline_split, "
+        "account_for_embedding_in_pipeline_split, account_for_loss_in_pipeline_split, "
         "first_pipeline_num_layers, last_pipeline_num_layers, should_assert_error",
         [
             # Last pipeline stage has specified layers
@@ -178,15 +188,13 @@ class TestPipelineParallelTransformerBlock:
             (4, 4, 4, False, False, None, None, True),
         ],
     )
-    @pytest.mark.flaky
-    @pytest.mark.flaky_in_dev
     def test_layer_builder(
         self,
         num_layers,
         pipeline_model_parallel_size,
         virtual_pipeline_model_parallel_size,
-        include_embedding_in_pipeline_split,
-        include_loss_in_pipeline_split,
+        account_for_embedding_in_pipeline_split,
+        account_for_loss_in_pipeline_split,
         first_pipeline_num_layers,
         last_pipeline_num_layers,
         should_assert_error,
@@ -204,28 +212,439 @@ class TestPipelineParallelTransformerBlock:
                 num_layers=num_layers,
                 pipeline_model_parallel_size=pipeline_model_parallel_size,
                 virtual_pipeline_model_parallel_size=virtual_pipeline_model_parallel_size,
-                include_embedding_in_pipeline_split=include_embedding_in_pipeline_split,
-                include_loss_in_pipeline_split=include_loss_in_pipeline_split,
-                first_pipeline_num_layers=first_pipeline_num_layers,
-                last_pipeline_num_layers=last_pipeline_num_layers,
+                account_for_embedding_in_pipeline_split=account_for_embedding_in_pipeline_split,
+                account_for_loss_in_pipeline_split=account_for_loss_in_pipeline_split,
+                num_layers_in_first_pipeline_stage=first_pipeline_num_layers,
+                num_layers_in_last_pipeline_stage=last_pipeline_num_layers,
                 pipeline_dtype=torch.bfloat16,
                 hidden_size=128,
                 num_attention_heads=16,
             )
             total_build_layers = 0
             for i in range(pipeline_model_parallel_size):
-                parallel_state.set_pipeline_model_parallel_rank(i)
                 if virtual_pipeline_model_parallel_size is not None:
                     for j in range(virtual_pipeline_model_parallel_size):
-                        parallel_state.set_virtual_pipeline_model_parallel_rank(j)
-                        num_layers_to_build = get_num_layers_to_build(transformer_config)
+                        num_layers_to_build = get_num_layers_to_build(
+                            transformer_config, vp_stage=j, pp_rank=i
+                        )
+
                         total_build_layers += num_layers_to_build
                 else:
-                    num_layers_to_build = get_num_layers_to_build(transformer_config)
+                    num_layers_to_build = get_num_layers_to_build(transformer_config, pp_rank=i)
                     total_build_layers += num_layers_to_build
+        if not should_assert_error:
+            assert (
+                total_build_layers == num_layers
+            ), f"total build layers {total_build_layers} should be equal to num_layers {num_layers}"
+        Utils.destroy_model_parallel()
+
+
+class TestProcessGroupTransformerBlock:
+    def setup_method(self, method):
+        Utils.destroy_model_parallel()
+
+    def teardown_method(self, method):
+        Utils.destroy_model_parallel()
+
+    @pytest.mark.skipif(
+        version.parse(torch.__version__) < version.parse('2.3.0'),
+        reason="Device mesh feature requires PyTorch 2.3 or later",
+    )
+    @pytest.mark.parametrize(
+        "tp_size,cp_size,dp_size,use_custom_pg",
+        [(2, 2, 2, True), (2, 4, 1, True), (2, 2, 2, False), (2, 4, 1, False)],
+    )
+    def test_pg_input_args(self, tp_size, cp_size, dp_size, use_custom_pg):
+        """
+        Test TransformerBlock with custom process groups.
+        """
+        Utils.initialize_model_parallel(
+            tensor_model_parallel_size=tp_size, context_parallel_size=cp_size
+        )
+        model_parallel_cuda_manual_seed(123)
+        if use_custom_pg:
+            # Initialize torch.distributed if not already initialized
+            if not torch.distributed.is_initialized():
+                torch.distributed.init_process_group(backend='nccl')
+
+            # Create HyperCommGrid with dimensions cp, tp, dp (reversed from device mesh order)
+            grid = HyperCommGrid([cp_size, tp_size, dp_size, 1], ["cp", "tp", "dp", "pp"])
+
+            # Get process groups from HyperCommGrid
+            tp_group = grid.create_pg("tp")
+            cp_group = grid.create_pg("cp")
+            pp_group = grid.create_pg("pp")
+
+            # Create ProcessGroupCollection with custom process groups
+            pg_collection = ProcessGroupCollection(tp=tp_group, cp=cp_group, pp=pp_group)
+        else:
+            # Rely on TransformerBlock to create default process groups
+            pg_collection = None
+
+        self.transformer_config = TransformerConfig(
+            num_layers=2, hidden_size=64, num_attention_heads=4, use_cpu_initialization=True
+        )
+        self.transformer_block = TransformerBlock(
+            self.transformer_config,
+            get_gpt_layer_with_transformer_engine_spec(),
+            pg_collection=pg_collection,
+        )
+        self.transformer_block.cuda()
+
+        sequence_length = 128
+        micro_batch_size = 1
+
+        # [sequence length, batch size, hidden size]
+        hidden_states = torch.ones(
+            (sequence_length, micro_batch_size, self.transformer_block.config.hidden_size),
+            device="cuda",
+        )
+
+        hidden_states = self.transformer_block(hidden_states=hidden_states, attention_mask=None)
+
+        assert hidden_states.shape[0] == sequence_length
+        assert hidden_states.shape[1] == micro_batch_size
+        assert hidden_states.shape[2] == self.transformer_block.config.hidden_size
+
+
+class TestMixedProcessGroups:
+    def setup_method(self, method):
+        Utils.destroy_model_parallel()
+
+    def teardown_method(self, method):
+        Utils.destroy_model_parallel()
+
+    @pytest.mark.skipif(
+        version.parse(torch.__version__) < version.parse('2.3.0'),
+        reason="Device mesh feature requires PyTorch 2.3 or later",
+    )
+    @pytest.mark.parametrize("tp_size,cp_size", [(2, 4)])
+    def test_mixed_pg_transformer_block(self, tp_size, cp_size, monkeypatch):
+        """
+        Test TransformerBlock with custom process groups.
+        """
+        Utils.initialize_model_parallel(
+            tensor_model_parallel_size=tp_size, context_parallel_size=cp_size
+        )
+        model_parallel_cuda_manual_seed(123)
+
+        # Create a new build_layers method that uses interleaved attention
+        def _build_layers_with_interleaved_attention(self):
+            def build_layer(layer_spec, layer_number):
+                fp8_init_context = get_fp8_context(self.config, layer_number - 1, is_init=True)
+                if layer_number % 4 == 0:
+                    config = self.local_attn_config
+                    pg_collection = self.local_pgs
+                else:
+                    config = self.config
+                    pg_collection = self.pg_collection
+                with fp8_init_context:
+                    module = build_module(
+                        layer_spec,
+                        config=config,
+                        layer_number=layer_number,
+                        pg_collection=pg_collection,
+                    )
+                return module
+
+            # Modify TransformerConfig and ProcessGroupCollection for local attention
+            self.local_attn_config = copy.deepcopy(self.config)
+            self.local_pgs = ProcessGroupCollection.use_mpu_process_groups()
+            self.local_attn_config.context_parallel_size = 1
+            self.local_pgs.cp = torch.distributed.new_group(ranks=[torch.distributed.get_rank()])
+
+            # offset is implicit in TransformerLayer
+            self.layers = torch.nn.ModuleList(
+                [
+                    build_layer(layer_spec, i + 1)
+                    for i, layer_spec in enumerate(self.submodules.layer_specs)
+                ]
+            )
+
+            # Copied from TransformerBlock.build_layers
+            if self.submodules.layer_norm and self.post_process and self.post_layer_norm:
+                self.final_layernorm = build_module(
+                    self.submodules.layer_norm,
+                    config=self.config,
+                    hidden_size=self.config.hidden_size,
+                    eps=self.config.layernorm_epsilon,
+                )
+            else:
+                self.final_layernorm = None  # Either this or nn.Identity
+
+        # Replace the default build_layers method
+        monkeypatch.setattr(
+            TransformerBlock, "_build_layers", _build_layers_with_interleaved_attention
+        )
+
+        self.transformer_config = TransformerConfig(
+            num_layers=4,
+            hidden_size=64,
+            num_attention_heads=4,
+            use_cpu_initialization=True,
+            context_parallel_size=cp_size,
+            bf16=True,
+        )
+        self.transformer_block = TransformerBlock(
+            self.transformer_config, get_gpt_layer_with_transformer_engine_spec()
+        )
+        self.transformer_block.cuda().bfloat16()
+
+        sequence_length = 128
+        micro_batch_size = 1
+
+        # [sequence length, batch size, hidden size]
+        hidden_states = torch.ones(
+            (sequence_length, micro_batch_size, self.transformer_block.config.hidden_size),
+            dtype=torch.bfloat16,
+            device="cuda",
+        )
+
+        hidden_states = self.transformer_block(hidden_states=hidden_states, attention_mask=None)
+
+        assert hidden_states.shape[0] == sequence_length
+        assert hidden_states.shape[1] == micro_batch_size
+        assert hidden_states.shape[2] == self.transformer_block.config.hidden_size
+
+
+class TestPipelineParallelLayoutTransformerBlock:
+    @pytest.mark.parametrize(
+        "num_layers, pp_size, vpp_size, pipeline_model_parallel_layout, should_assert_error",
+        [
+            # No embedding layer provided
+            (7, 2, 1, [["decoder"] * 6, ["decoder", "loss"]], True),
+            # No loss layer provided
+            (7, 2, 1, [["embedding"] + ["decoder"] * 6, ["decoder"]], True),
+            # Invalid layer type
+            (7, 2, 1, [["embedding"], ["invalid_type"] * 7 + ["loss"]], True),
+            # Invalid pp size
+            (7, 2, 2, [["embedding"], ["decoder"] * 7, ["loss"]], True),
+            # Invalid layout
+            (
+                7,
+                2,
+                2,
+                [[["embedding", "decoder"], ["decoder"] * 4], ["decoder"], ["decoder", "loss"]],
+                True,
+            ),
+            # Invalid layout
+            (
+                7,
+                2,
+                1,
+                [[["embedding", "decoder"], ["decoder"] * 4], ["decoder"] * 2 + ["loss"]],
+                True,
+            ),
+            # Invalid layout
+            (7, 2, 1, [[["embedding"] + ["decoder"] * 5], ["decoder"] * 2 + ["loss"]], True),
+            # Usual pp case
+            (
+                7,
+                2,
+                2,
+                [
+                    [["embedding", "decoder"], ["decoder"] * 3],
+                    [["decoder"] * 2, ["decoder", "loss"]],
+                ],
+                True,
+            ),
+            # Usual pp case
+            (
+                7,
+                2,
+                2,
+                [["embedding", "decoder"], ["decoder"] * 4, ["decoder"], ["decoder", "loss"]],
+                False,
+            ),
+            # Empty stage
+            (7, 2, 2, [["embedding"], ["decoder"] * 7, [], ["loss"]], False),
+            # Usual uneven vpp case with standalone embedding and loss layer
+            (7, 2, 2, [["embedding"], ["decoder"] * 6, ["decoder"], ["loss"]], False),
+        ],
+    )
+    def test_layer_builder(
+        self, num_layers, pp_size, vpp_size, pipeline_model_parallel_layout, should_assert_error
+    ):
+        Utils.fake_initialize_model_parallel(
+            tensor_model_parallel_size=1,
+            pipeline_model_parallel_size=pp_size,
+            virtual_pipeline_model_parallel_size=vpp_size,
+        )
+        context = (
+            pytest.raises((AssertionError, ValueError)) if should_assert_error else nullcontext()
+        )
+        with context:
+            transformer_config = TransformerConfig(
+                num_layers=num_layers,
+                pipeline_model_parallel_layout=pipeline_model_parallel_layout,
+                pipeline_model_parallel_size=pp_size,
+                pipeline_dtype=torch.bfloat16,
+                hidden_size=128,
+                num_attention_heads=16,
+            )
+            total_build_layers = 0
+            for i in range(pp_size):
+                parallel_state.set_pipeline_model_parallel_rank(i)
+                for j in range(vpp_size):
+                    total_build_layers += get_num_layers_to_build(transformer_config, vp_stage=j)
         if not should_assert_error:
             assert (
                 total_build_layers == num_layers
             ), f"total build layers {total_build_layers} should be equal to num_layers {num_layers}"
         parallel_state.set_pipeline_model_parallel_world_size(None)
         parallel_state.set_virtual_pipeline_model_parallel_world_size(None)
+
+    @pytest.mark.parametrize(
+        ('pipeline_model_parallel_layout', 'layer_number_golden_answer'),
+        [
+            (
+                [
+                    ["embedding"],
+                    ["decoder"],
+                    ["decoder"] * 2,
+                    ["decoder"],
+                    [],
+                    ["decoder"],
+                    ["decoder"],
+                    ["decoder"] * 2 + ["loss"],
+                ],
+                [[[], []], [[1], [5]], [[2, 3], [6]], [[4], [7, 8]]],
+            )
+        ],
+    )
+    def test_layout_layer_number(self, pipeline_model_parallel_layout, layer_number_golden_answer):
+        tp_size = 1
+        pp_size = 4
+        vpp_size = 2
+        Utils.initialize_model_parallel(
+            tensor_model_parallel_size=tp_size,
+            pipeline_model_parallel_size=pp_size,
+            virtual_pipeline_model_parallel_size=vpp_size,
+        )
+        model_parallel_cuda_manual_seed(123)
+        torch.manual_seed(123)
+
+        # Initialize GPT model
+        default_config_kwargs = dict(
+            num_layers=8,
+            hidden_size=8,
+            num_attention_heads=8,
+            use_cpu_initialization=True,
+            pipeline_dtype=torch.bfloat16,
+            bf16=True,
+            tensor_model_parallel_size=tp_size,
+            pipeline_model_parallel_size=pp_size,
+            virtual_pipeline_model_parallel_size=vpp_size,
+            pipeline_model_parallel_layout=pipeline_model_parallel_layout,
+        )
+        transformer_config = TransformerConfig(**default_config_kwargs)
+        gpt_model = []
+        for i in range(vpp_size):
+            pre_process = mpu.is_pipeline_first_stage(ignore_virtual=False, vp_stage=i)
+            post_process = mpu.is_pipeline_last_stage(ignore_virtual=False, vp_stage=i)
+            this_model = GPTModel(
+                config=transformer_config,
+                transformer_layer_spec=get_gpt_layer_with_transformer_engine_spec(),
+                vocab_size=128,
+                max_sequence_length=4,
+                pre_process=pre_process,
+                post_process=post_process,
+                vp_stage=i,
+            )
+            this_model.model_type = ModelType.encoder_or_decoder
+            gpt_model.append(this_model)
+
+        pp_rank = parallel_state.get_pipeline_model_parallel_rank()
+        for vpp_rank in range(vpp_size):
+            layers = gpt_model[vpp_rank].decoder.layers
+            layer_numbers = [l.layer_number for l in layers]
+            golden_answer_curr_stage = layer_number_golden_answer[pp_rank][vpp_rank]
+            assert len(layers) == len(
+                golden_answer_curr_stage
+            ), f"{pp_rank=}, {vpp_rank=}, {len(layers)=}, {len(golden_answer_curr_stage)=}"
+            assert (
+                layer_numbers == golden_answer_curr_stage
+            ), f"{pp_rank=}, {vpp_rank=}, {layer_numbers=}, {golden_answer_curr_stage=}"
+        Utils.destroy_model_parallel()
+
+    @pytest.mark.parametrize(
+        "pp_size, input_layout_str, input_layout_list",
+        [
+            (
+                2,
+                "Et|t*4|t|tL",
+                [["embedding", "decoder"], ["decoder"] * 4, ["decoder"], ["decoder", "loss"]],
+            ),
+            (2, "E|t*6|t|L", [["embedding"], ["decoder"] * 6, ["decoder"], ["loss"]]),
+            (
+                4,
+                "E|t|t*2|t||(t|)*2,t*2,L",
+                [
+                    ["embedding"],
+                    ["decoder"],
+                    ["decoder"] * 2,
+                    ["decoder"],
+                    [],
+                    ["decoder"],
+                    ["decoder"],
+                    ["decoder"] * 2 + ["loss"],
+                ],
+            ),
+            (
+                8,
+                "Et*3|(tt|)*29,m|L",
+                [["embedding"] + ["decoder"] * 3] + [["decoder"] * 2] * 29 + [["mtp"], ["loss"]],
+            ),
+            (
+                16,
+                "Et*2|(tt|)*29,t|mL",
+                [["embedding"] + ["decoder"] * 2]
+                + [["decoder"] * 2] * 29
+                + [["decoder"]]
+                + [["mtp", "loss"]],
+            ),
+        ],
+    )
+    def test_parsing_layout_from_str(self, pp_size, input_layout_str, input_layout_list):
+        parsed_layout_from_str = PipelineParallelLayerLayout.from_str(input_layout_str, pp_size)
+        parsed_layout_baseline = PipelineParallelLayerLayout(input_layout_list, pp_size)
+        assert parsed_layout_from_str.layout == parsed_layout_baseline.layout
+        assert (
+            parsed_layout_from_str.virtual_pipeline_model_parallel_size
+            == parsed_layout_baseline.virtual_pipeline_model_parallel_size
+        )
+
+    @pytest.mark.parametrize(
+        "pp_size, input_layout",
+        [
+            (2, "Et|t*4|t|tL"),
+            (2, [["embedding", "decoder"], ["decoder"] * 4, ["decoder"], ["decoder", "loss"]]),
+            (8, [["embedding"] + ["decoder"] * 3] + [["decoder"] * 2] * 29 + [["mtp"], ["loss"]]),
+        ],
+    )
+    def test_repr_returns_string(self, pp_size, input_layout):
+        """Test that __repr__ always returns a string for both str and list inputs."""
+        layout = PipelineParallelLayerLayout(input_layout, pp_size)
+        repr_result = repr(layout)
+
+        # Assert that repr returns a string
+        assert isinstance(
+            repr_result, str
+        ), f"__repr__ must return a string, but got {type(repr_result).__name__}"
+
+        # Assert that the returned string matches the expected value
+        if isinstance(input_layout, str):
+            # For string input, repr should return the exact same string
+            assert repr_result == input_layout, (
+                f"For string input, repr should return the original string.\n"
+                f"Expected: {input_layout!r}\n"
+                f"Got: {repr_result!r}"
+            )
+        else:
+            # For list input, repr should return str(input_layout)
+            expected_repr = str(input_layout)
+            assert repr_result == expected_repr, (
+                f"For list input, repr should return str(input_layout).\n"
+                f"Expected: {expected_repr!r}\n"
+                f"Got: {repr_result!r}"
+            )

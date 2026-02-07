@@ -5,6 +5,7 @@ from .mapping import LocalNonpersistentObject, ShardedObject, ShardedTensor
 from .serialization import (
     load,
     load_common_state_dict,
+    load_content_metadata,
     load_plain_tensors,
     load_tensors_metadata,
     remove_sharded_tensors,
