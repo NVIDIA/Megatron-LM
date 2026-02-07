@@ -61,7 +61,7 @@ class MathAgent(RewardOnlyAgent):
         """
         # Allow <answer> tags or \boxed{} tags (this is a bit of cheating in favor of deepseek distilled models I think)
         matched_format = None
-        end_tokens = ["<|end_of_text|>", "<|endoftext|>", "</s>"]
+        end_tokens = ["<|end_of_text|>", "<|endoftext|>", "</s>", "<|eot_id|>"]
 
         # Only an answer immediately followed by a known end token yields 1.0 reward.
         answer_tag_pattern = r'<answer>(.*?)</answer>'
