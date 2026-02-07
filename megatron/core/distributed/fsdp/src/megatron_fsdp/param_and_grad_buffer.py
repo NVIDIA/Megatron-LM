@@ -1918,12 +1918,21 @@ class ParamAndGradBuffer:
                 fsdp_param_groups=self.parameter_groups,
                 size=UB_BUFFER_NUM,
             )
-            self.main_grad_alloc = FixedPoolAllocator(
-                name="fsdp_grads",
-                fsdp_param_groups=self.parameter_groups,
-                size=UB_BUFFER_NUM,
-                fallback_to_persistent_buffer=self.ddp_config.fsdp_db_use_persist_buf_on_alloc_fail,
-            )
+            if (
+                self.mp_policy.grad_comm_dtype is None
+                or self.mp_policy.grad_comm_dtype == self.mp_policy.main_grads_dtype
+            ):
+                self.main_grad_alloc = FixedPoolAllocator(
+                    name="fsdp_grads",
+                    fsdp_param_groups=self.parameter_groups,
+                    size=UB_BUFFER_NUM,
+                    fallback_to_persistent_buffer=(
+                        self.ddp_config.fsdp_db_use_persist_buf_on_alloc_fail
+                    ),
+                )
+            else:
+                # For custom gradient communication buffers, use a temporary allocator.
+                self.main_grad_alloc = None
             self.double_buf_units = self.weight_alloc.fsdp_double_buffer_units
         else:
             self.weight_alloc = StorageResizeBasedBucketAllocator()
@@ -3445,25 +3454,23 @@ class GradReducePipeline:
                             # Retrieve the (DP-Outer, DP-Shard) gradient shard from the
                             # main gradient buffer which shards across the entire DP group,
                             # i.e. across all DP-Shard and DP-Outer ranks.
-                            with self.buffer.mem_alloc_context():  # Optional[NCCL_UB]
-                                # FIXME(@shjwudp): In-place reduce-scatter has unexplained
-                                # issues with corrupt gradients or convergence, possibly
-                                # because the main gradient buffer data is a shard/slice
-                                # of the HFSDP gradient buffer data.
-                                # NOTE(@cspades): If using a custom_accum_dtype,
-                                # compatible A2A buffer will be created already.
-                                main_grad_buffer_shard = (
-                                    # Standalone main gradient buffer output shard.
-                                    torch.empty_like(main_grad_buffer.data, dtype=grad_input.dtype)
-                                    if not custom_accum_dtype
-                                    # Reference shape for creating an A2A output buffer.
-                                    else main_grad_buffer.data
-                                )
+                            main_grad_shard = main_grad_buffer.get_shard_from_local_buffer()
+                            # FIXME(@shjwudp): In-place reduce-scatter has unexplained
+                            # issues with corrupt gradients or convergence, possibly
+                            # because the main gradient buffer data is a shard/slice
+                            # of the HFSDP gradient buffer data.
+                            main_grad_shard = (
+                                # Standalone main gradient buffer output shard.
+                                torch.empty_like(main_grad_shard, dtype=grad_input.dtype)
+                                if not custom_accum_dtype
+                                # Reference shape for creating an A2A output buffer.
+                                else main_grad_shard
+                            )
                             # Reduce-scatter the FSDP gradient buffer shard further
                             # into the (DP-Outer, DP-Shard) gradient shard.
                             reduced_grad = self._custom_dtype_grad_accum_reduce_scatter_op(
                                 input_buffer=grad_input,
-                                output_buffer=main_grad_buffer_shard,
+                                output_buffer=main_grad_shard,
                                 collective_group=outer_fsdp_group,
                                 # Skip reduction if using a custom reduction data-type.
                                 reduce_op=reduce_op if not custom_accum_dtype else None,
@@ -3566,8 +3573,7 @@ class GradReducePipeline:
         )
         if grad_comm_with_custom_dtype:
             # Adds copy / cast / memory overhead.
-            with self.buffer.mem_alloc_context():  # Optional[NCCL_UB]
-                grad_comm_tensor = comm_tensor.to(dtype=self.buffer.mp_policy.grad_comm_dtype)
+            grad_comm_tensor = comm_tensor.to(dtype=self.buffer.mp_policy.grad_comm_dtype)
             return grad_comm_tensor, grad_comm_with_custom_dtype
         else:
             # Return the original Tensor.
@@ -3588,13 +3594,12 @@ class GradReducePipeline:
         if reduce_op is None:
             # Alternative output buffer for A2A communications.
             # Returned instead of the template output_buffer.
-            with self.buffer.mem_alloc_context():  # Optional[NCCL_UB]
-                output_buffer = torch.empty(
-                    # (DP-Size, Gradient Accum Buffer Data Size)
-                    (collective_group.size(), *output_buffer.shape),
-                    dtype=input_buffer.dtype,
-                    device=input_buffer.device,
-                )
+            output_buffer = torch.empty(
+                # (DP-Size, Gradient Accum Buffer Data Size)
+                (collective_group.size(), *output_buffer.shape),
+                dtype=input_buffer.dtype,
+                device=input_buffer.device,
+            )
             # All-to-all (gather-scatter) the un-sharded gradients.
             torch.distributed.all_to_all_single(
                 output=output_buffer, input=input_buffer, group=collective_group
