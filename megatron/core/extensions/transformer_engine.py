@@ -8,13 +8,14 @@ import os
 import pickle
 import warnings
 from contextlib import nullcontext
-from typing import TYPE_CHECKING, Any, Callable, Dict, List, Optional, Set, Tuple
+from typing import TYPE_CHECKING, Any, Callable, Dict, List, Optional, Set, Tuple, cast
 
 import torch
 import torch.nn.functional as F
 from packaging.version import Version as PkgVersion
 from torch import Tensor
 from torch.nn.parameter import Parameter
+from typing_extensions import override
 
 from megatron.core.dist_checkpointing.mapping import ShardedStateDict
 from megatron.core.dist_checkpointing.utils import replace_prefix_for_sharding
@@ -43,6 +44,7 @@ from megatron.core.tensor_parallel.random import (
 from megatron.core.tensor_parallel.utils import divide
 from megatron.core.transformer.enums import AttnMaskType
 from megatron.core.transformer.mlp import MLP
+from megatron.core.transformer.torch_norm import LayerNormInterface
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.transformer.utils import (
     ensure_metadata_has_dp_cp_group,
@@ -435,7 +437,9 @@ class TENorm:
     Transformer-Engine's `LayerNorm` or `RMSNorm` based on input."""
 
     # TODO should we ditch normalization config and just use spec to choose LayerNorm vs RMSNorm?
-    def __new__(cls, config: TransformerConfig, hidden_size: int, eps: float = 1e-5):
+    def __new__(
+        cls, config: TransformerConfig, hidden_size: int, eps: float = 1e-5
+    ) -> LayerNormInterface:
         if not HAVE_TE:
             raise ImportError(
                 "Transformer Engine is not installed. "
@@ -464,7 +468,7 @@ class TENorm:
         else:
             raise Exception("Only LayerNorm and RMSNorm are curently supported")
 
-        return instance
+        return cast(LayerNormInterface, instance)
 
 
 class TELinear(te.pytorch.Linear):
@@ -919,10 +923,14 @@ class TELayerNormColumnParallelLinear(te.pytorch.LayerNormLinear):
             dp_cp_group=metadata["dp_cp_group"],
         )
 
-    def __repr__(self):
+    @override
+    def extra_repr(self) -> str:
+        """Extra context to add to the module's string representation."""
         return (
-            f"{type(self).__name__}(in_features={self.in_features}, "
-            f"out_features={self.out_features}, bias={self.use_bias}, TP={self.tp_size})"
+            f"in_features={self.in_features}, "
+            f"out_features={self.out_features}, "
+            f"bias={self.use_bias}, "
+            f"TP={self.tp_size}"
         )
 
     def backward_dw(self):
@@ -1025,10 +1033,14 @@ class TEColumnParallelLinear(TELinear):
             dp_cp_group=metadata["dp_cp_group"],
         )
 
-    def __repr__(self):
+    @override
+    def extra_repr(self) -> str:
+        """Extra context to add to the module's string representation."""
         return (
-            f"{type(self).__name__}(in_features={self.in_features}, "
-            f"out_features={self.out_features}, bias={self.use_bias}, TP={self.tp_size})"
+            f"in_features={self.in_features}, "
+            f"out_features={self.out_features}, "
+            f"bias={self.use_bias}, "
+            f"TP={self.tp_size}"
         )
 
     def backward_dw(self):
@@ -1125,10 +1137,14 @@ class TERowParallelLinear(TELinear):
             dp_cp_group=metadata["dp_cp_group"],
         )
 
-    def __repr__(self):
+    @override
+    def extra_repr(self) -> str:
+        """Extra context to add to the module's string representation."""
         return (
-            f"{type(self).__name__}(in_features={self.in_features}, "
-            f"out_features={self.out_features}, bias={self.use_bias}, TP={self.tp_size})"
+            f"in_features={self.in_features}, "
+            f"out_features={self.out_features}, "
+            f"bias={self.use_bias}, "
+            f"TP={self.tp_size}"
         )
 
     def backward_dw(self):
