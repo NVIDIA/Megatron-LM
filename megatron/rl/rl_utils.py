@@ -514,7 +514,7 @@ def get_environment_rollouts(
                     "Gradient buffers will not be offloaded when training cudagraphs are enabled!")
             optimizer.offload_to_cpu()
              
-    # If we have seperate training and inference models we to refit weights from the training model to the inference model.
+    # If we have separated training and inference models we to refit weights from the training model to the inference model.
     if inference_model is not None:
         # If the separate inference model weights were prefetched to CPU while idle, bring them
         # back to GPU before refit/copy and before any CUDA-graph'd inference.
