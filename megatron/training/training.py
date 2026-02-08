@@ -2491,18 +2491,16 @@ def train(
         if torch.distributed.get_rank() == 0:
             received_configs = config_queue.get()
             vis_flags = received_configs.get('visualization_flags', {})
-            dist_configs = received_configs.get('disturbance_configs', {})
             comp_configs = received_configs.get('compressor_config', {})
-            configs_to_broadcast = [vis_flags, dist_configs, comp_configs]
+            configs_to_broadcast = [vis_flags, comp_configs]
         else:
-            configs_to_broadcast = [None, None, None]
+            configs_to_broadcast = [None, None]
 
         torch.distributed.broadcast_object_list(configs_to_broadcast, src=0)
 
-        vis_flags, dist_configs, comp_configs = configs_to_broadcast
-        from megatron.core.tensor_tracer import get_tt_flags, get_compressor
-        get_tt_flags().set_by_configs(vis_flags)
-        get_compressor().set_by_configs(comp_configs)
+        vis_flags, comp_configs = configs_to_broadcast
+        from megatron.core.tensor_tracer import get_tt_flags
+        get_tt_flags().set_by_configs(vis_flags, comp_configs)
 
         print_rank_0("Configs synchronized. Starting training.")
 

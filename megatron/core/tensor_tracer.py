@@ -25,7 +25,7 @@ def _set_tt_hook_manager(args, model):
 
 def _set_compressor():
     global _GLOBAL_COMPRESSOR
-    _GLOBAL_COMPRESSOR=DefaultCompressor()
+    _GLOBAL_COMPRESSOR={}
 
 def set_report(func):
     global _GLOBAL_REPORT
@@ -41,8 +41,8 @@ def get_tensor_tracers():
 def get_tt_flags():
     return _GLOBAL_TT_FLAGS
 
-def get_compressor():
-    return _GLOBAL_COMPRESSOR
+def get_compressor(flag_type):
+    return _GLOBAL_COMPRESSOR[flag_type]
 
 def get_report():
     return _GLOBAL_REPORT
@@ -50,7 +50,6 @@ def get_report():
 class FlagType(Enum):
     INVALID_FLAG = 0
     QKV_mat_mul = 1
-    RawAttentionScore_mat_mul = 2
     ContextLayer_mat_mul = 3
     MLP1_mat_mul = 4
     MLP2_mat_mul = 5
@@ -61,37 +60,27 @@ class AbstractCompressor:
     def __init__(self):
         pass
     @abstractmethod
-    def set_by_configs(self, configs: Dict[str, Any]):
+    def compress_one_rank(self, layer_number, flag_type, data):
         pass
     @abstractmethod
-    def compress_one_rank(self, name, data):
-        pass
-    @abstractmethod
-    def compress(self, name, data):
+    def compress(self, layer_number, flag_type, data):
         pass
 
-class DefaultCompressor(AbstractCompressor):
-    def __init__(self):
+class TileCompressor(AbstractCompressor):
+    def __init__(self, configs):
         self.configs = {
-            "QKV": {
-                "pixels": 96,
-                "method": "data.mean(dim=-1)"
-            },
-            "MLP": {
-                "pixels": 64,
-                "method": "data.mean(dim=-1)"
-            }
+            "tiles": configs.get("tiles", 96),
+            "method": configs.get("method", "data.mean(dim=-1)"),
+            "tiles_one_rank": configs.get("tiles_one_rank", 96),
+            "method_one_rank": configs.get("method_one_rank", "data.mean(dim=-1)")
         }
 
-    def set_by_configs(self, configs: Dict[str, Any]):
-        self.configs = configs
-
-    def compress_tensor(self, data_in, pixels, method):
+    def compress_tensor(self, data_in, tiles, method):
         B, S, F = data_in.shape
-        chunk_size = math.ceil(F / pixels)
-        padded_len = chunk_size * pixels
+        chunk_size = math.ceil(F / tiles)
+        padded_len = chunk_size * tiles
         padded_data = torch.nn.functional.pad(data_in, (0, padded_len - F))
-        data_for_eval = padded_data.reshape(B, S, pixels, chunk_size)
+        data_for_eval = padded_data.reshape(B, S, tiles, chunk_size)
         try:
             compressed = eval(method, {}, {"data": data_for_eval})
         except Exception as e:
@@ -99,54 +88,67 @@ class DefaultCompressor(AbstractCompressor):
             compressed = data_for_eval.mean(dim=-1)
         return compressed
 
-    def compress_1d_tensor(self, data_in, pixels, method):
-        B, S, F = data_in.shape
-        chunk_size = math.ceil(F / pixels)
-        padded_len = chunk_size * pixels
-        padded_data = torch.nn.functional.pad(data_in, (0, padded_len - F))
-        data_for_eval = padded_data.reshape(B, S, pixels, chunk_size)
-        try:
-            compressed = eval(method, {}, {"data": data_for_eval}).flatten()
-        except Exception as e:
-            print(f"Error in compressing tensor with method '{method}': {e}")
-            compressed = data_for_eval.mean(dim=-1).flatten()  # Fallback to mean if eval fails
-        return compressed
+    def compress_one_rank(self, layer_number, flag_type, data):
+        return self.compress_tensor(data, self.configs["tiles_one_rank"], self.configs["method_one_rank"])
 
-    def compress_one_rank(self, flag_type, data):
-        if flag_type == FlagType.QKV_mat_mul:
-            return self.compress_tensor(data, self.configs["QKV"]["pixels"], self.configs["QKV"]["method"])
-        elif flag_type == FlagType.MLP1_mat_mul or flag_type == FlagType.MLP2_mat_mul or flag_type == FlagType.ContextLayer_mat_mul:
-            return self.compress_tensor(data, self.configs["MLP"]["pixels"], self.configs["MLP"]["method"])
+    def compress(self, layer_number, flag_type, data):
+        compressed = self.compress_tensor(data, self.configs["tiles"], self.configs["method"])
+        return True, list(compressed.shape), compressed.flatten()
+
+class NoOpCompressor(AbstractCompressor):
+    def __init__(self, configs):
+        pass
+
+    def compress_one_rank(self, layer_number, flag_type, data):
         return data
 
-    def compress(self, name, data):
-        flag_type = name[1]
-        if flag_type == FlagType.QKV_mat_mul:
-            n = data.shape[1]; return True, [n], self.compress_1d_tensor(data, self.configs["QKV"]["pixels"], self.configs["QKV"]["method"])
-        elif flag_type == FlagType.RawAttentionScore_mat_mul:
-            np, n, m = data.shape[1], data.shape[2], data.shape[3]; return True, [np, n, m], data[:, :, :, :].flatten()
-        elif flag_type == FlagType.MLP1_mat_mul or flag_type == FlagType.MLP2_mat_mul or flag_type == FlagType.ContextLayer_mat_mul:
-            n = data.shape[1]; return True, [n], self.compress_1d_tensor(data, self.configs["MLP"]["pixels"], self.configs["MLP"]["method"])
-        return False, [], torch.tensor([])
+    def compress(self, layer_number, flag_type, data):
+        return True, list(data.shape), data.flatten()
+
+class EmptyCompressor(AbstractCompressor):
+    def __init__(self, configs):
+        pass
+
+    def compress_one_rank(self, layer_number, flag_type, data):
+        return torch.tensor([])
+
+    def compress(self, layer_number, flag_type, data):
+        return True, [0], torch.tensor([])
 
 class ProjectionCompressor(AbstractCompressor):
-    def __init__(self):
-        pass
+    def __init__(self, configs):
+        try:
+            self.projection_vector = torch.load(configs["vector_path"])
+            self.projection_vector = torch.nn.functional.normalize(self.projection_vector, p=2, dim=1)
+            device = torch.cuda.current_device()
+            self.projection_vector = self.projection_vector.to(device)
+        except Exception as e:
+            print(f"Error loading projection vector: {e}")
+            self.projection_vector = None
 
-    def set_by_configs(self, configs: Dict[str, Any]):
-        pass
-    
-    def compress_one_rank(self, name, data):
+    def compress_one_rank(self, layer_number, flag_type, data):
         return data
 
-    def compress(self, name, data):
-        return False, [], torch.tensor([])
+    def compress(self, layer_number, flag_type, data):
+        if self.projection_vector is None:
+            return False, [], torch.tensor([])
+        else:
+            vector = self.projection_vector[layer_number - 1]
+            projected = torch.matmul(data, vector).unsqueeze(-1)
+            return True, list(projected.shape), projected.flatten()
+
+COMPRESSOR_MAP = {
+    "TileCompressor": TileCompressor,
+    "NoOpCompressor": NoOpCompressor,
+    "EmptyCompressor": EmptyCompressor,
+    "ProjectionCompressor": ProjectionCompressor
+}
 
 class TensorTracers: # simplified as TT
     def __init__(self) -> None: pass
 
     def report(self, name, tensor_data):
-        valid, comp_args, compressed_tensor = get_compressor().compress(name, tensor_data)
+        valid, comp_args, compressed_tensor = get_compressor(name[1]).compress(name[0], name[1], tensor_data)
         assert valid
         get_report()(name, comp_args, compressed_tensor)
 
@@ -158,7 +160,6 @@ class TTFlags:
         self.flags: Dict[FlagType, Dict[int, bool]] = {
             FlagType.INVALID_FLAG: {i: False for i in range(1, self.num_layers + 1)},
             FlagType.QKV_mat_mul: {i: False for i in range(1, self.num_layers + 1)},
-            FlagType.RawAttentionScore_mat_mul: {i: False for i in range(1, self.num_layers + 1)},
             FlagType.ContextLayer_mat_mul: {i: False for i in range(1, self.num_layers + 1)},
             FlagType.MLP1_mat_mul: {i: False for i in range(1, self.num_layers + 1)},
             FlagType.MLP2_mat_mul: {i: False for i in range(1, self.num_layers + 1)},
@@ -170,34 +171,18 @@ class TTFlags:
     def get_flag(self, flag_type: FlagType, layer_index: int) -> bool:
         return self.should_trace and self.flags.get(flag_type, {}).get(layer_index, False)
 
-    def set_by_configs(self, configs: Dict[str, Any]):
-        val = True if configs.get("QKV_mat_mul", "False").lower() == "true" else False
-        for i in range(1, self.num_layers + 1):
-            self.flags[FlagType.QKV_mat_mul][i] = val
-        
-        val = True if configs.get("RawAttentionScore_mat_mul", "False").lower() == "true" else False
-        for i in range(1, self.num_layers + 1):
-            self.flags[FlagType.RawAttentionScore_mat_mul][i] = val
-        
-        val = True if configs.get("ContextLayer_mat_mul", "False").lower() == "true" else False
-        for i in range(1, self.num_layers + 1):
-            self.flags[FlagType.ContextLayer_mat_mul][i] = val
-        
-        val = True if configs.get("MLP1_mat_mul", "True").lower() == "true" else False
-        for i in range(1, self.num_layers + 1):
-            self.flags[FlagType.MLP1_mat_mul][i] = val
-        
-        val = True if configs.get("MLP2_mat_mul", "True").lower() == "true" else False
-        for i in range(1, self.num_layers + 1):
-            self.flags[FlagType.MLP2_mat_mul][i] = val
-        
-        val = True if configs.get("AttentionOutput_mat_mul", "False").lower() == "true" else False
-        for i in range(1, self.num_layers + 1):
-            self.flags[FlagType.AttentionOutput_mat_mul][i] = val
-
-        val = True if configs.get("HiddenStates", "False").lower() == "true" else False
-        for i in range(1, self.num_layers + 1):
-            self.flags[FlagType.HiddenStates][i] = val
+    def set_by_configs(self, configs: Dict[str, Any], comp_configs: Dict[str, Any]):
+        for flag_type in self.flags:
+            if flag_type == FlagType.INVALID_FLAG:
+                continue
+            val = True if configs.get(flag_type.name, "False").lower() == "true" else False
+            for i in range(1, self.num_layers + 1):
+                self.flags[flag_type][i] = val
+            if comp_configs.get(flag_type.name, None):
+                specific_comp_config = comp_configs[flag_type.name]
+                compressor_type = specific_comp_config.get("compressor_type", "EmptyCompressor")
+                compressor_configs = specific_comp_config.get("compressor_configs", {})
+                _GLOBAL_COMPRESSOR[flag_type] = COMPRESSOR_MAP.get(compressor_type, EmptyCompressor)(compressor_configs)
 
 class TTHookManager:
     def __init__(self, args, model) -> None:
@@ -213,8 +198,11 @@ class TTHookManager:
                     world_size = get_tensor_model_parallel_world_size()
                     rank = get_tensor_model_parallel_rank()
 
-                    tensor_data = output[0].detach()
-                    tensor_data = get_compressor().compress_one_rank(flag_type, tensor_data)
+                    if isinstance(output, (list, tuple)):
+                        tensor_data = output[0].detach()
+                    else:
+                        tensor_data = output.detach()
+                    tensor_data = get_compressor(flag_type).compress_one_rank(layer_number, flag_type, tensor_data)
                     tensor_data_cont = tensor_data.contiguous()
                     if rank == 0:
                         tensor_list = [torch.zeros_like(tensor_data_cont, dtype=tensor_data_cont.dtype, device=device) for _ in range(world_size)]
@@ -256,8 +244,11 @@ class TTHookManager:
                     rank = get_tensor_model_parallel_rank()
 
                     if args.sequence_parallel:
-                        tensor_data = output[0].detach()
-                        tensor_data = get_compressor().compress_one_rank(flag_type, tensor_data)
+                        if isinstance(output, (list, tuple)):
+                            tensor_data = output[0].detach()
+                        else:
+                            tensor_data = output.detach()
+                        tensor_data = get_compressor(flag_type).compress_one_rank(layer_number, flag_type, tensor_data)
                         tensor_data_cont = tensor_data.contiguous()
                         if rank == 0:
                             tensor_list = [torch.zeros_like(tensor_data_cont, dtype=tensor_data_cont.dtype, device=device) for _ in range(world_size)]
@@ -273,8 +264,11 @@ class TTHookManager:
                             get_tensor_tracers().report((layer_number, flag_type), aggregated_tensor.transpose(0, 1))
                     else:
                         if rank == 0:
-                            tensor_data = output[0].detach()
-                            tensor_data = get_compressor().compress_one_rank(flag_type, tensor_data)
+                            if isinstance(output, (list, tuple)):
+                                tensor_data = output[0].detach()
+                            else:
+                                tensor_data = output.detach()
+                            tensor_data = get_compressor(flag_type).compress_one_rank(layer_number, flag_type, tensor_data)
                             get_tensor_tracers().report((layer_number, flag_type), tensor_data.transpose(0, 1))
             return hook
 
@@ -285,8 +279,11 @@ class TTHookManager:
                     world_size = get_tensor_model_parallel_world_size()
                     rank = get_tensor_model_parallel_rank()
 
-                    tensor_data = output.detach()
-                    tensor_data = get_compressor().compress_one_rank(flag_type, tensor_data)
+                    if isinstance(output, (list, tuple)):
+                        tensor_data = output[0].detach()
+                    else:
+                        tensor_data = output.detach()
+                    tensor_data = get_compressor(flag_type).compress_one_rank(layer_number, flag_type, tensor_data)
                     tensor_data_cont = tensor_data.contiguous()
                     if rank == 0:
                         tensor_list = [torch.zeros_like(tensor_data_cont, dtype=tensor_data_cont.dtype, device=device) for _ in range(world_size)]
@@ -308,7 +305,6 @@ class TTHookManager:
             self.hooks.append(model.decoder.layers[layer].mlp.linear_fc2.register_forward_hook(generate_hook_transpose_row(FlagType.MLP2_mat_mul, global_layer_number))) # Row
             self.hooks.append(model.decoder.layers[layer].self_attention.register_forward_hook(generate_hook_transpose_row(FlagType.AttentionOutput_mat_mul, global_layer_number))) # Row
             self.hooks.append(model.decoder.layers[layer].register_forward_hook(generate_hook_transpose_row(FlagType.HiddenStates, global_layer_number))) # Row
-            self.hooks.append(model.decoder.layers[layer].self_attention.core_attention.scale_mask_softmax.register_forward_hook(generate_hook_attn(FlagType.RawAttentionScore_mat_mul, global_layer_number))) # Raw Attention Scores, Special
             self.hooks.append(model.decoder.layers[layer].self_attention.core_attention.register_forward_hook(generate_hook_transpose_col(FlagType.ContextLayer_mat_mul, global_layer_number))) # Col, not gather_output
 
 '''

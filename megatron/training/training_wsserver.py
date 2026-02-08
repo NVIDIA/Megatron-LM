@@ -77,7 +77,6 @@ def websocket_server_process(port: int, data_queue: multiprocessing.Queue, confi
                     if request.get("type") == "run_training_step":
                         print("Rank 0 (WS Process): Received 'run_training_step' command.", flush=True)
                         _request_configs['visualization_flags'] = request.get("visualization_flags", {})
-                        _request_configs['disturbance_configs'] = request.get("disturbance_configs", {})
                         _request_configs['compressor_config'] = request.get("compressor_config", {})
                         config_queue.put(_request_configs)
                         try:
