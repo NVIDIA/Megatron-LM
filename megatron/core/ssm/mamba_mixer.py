@@ -863,17 +863,24 @@ class MambaMixer(MegatronModule):
 
         # Use local varlen kernels only for batch > 1; for batch==1 use mamba_ssm which
         # is designed for that layout and avoids packing/alignment issues.
+
+        #print("")
+        #print("------------ cu_seqlens shape ------------", cu_seqlens.shape if cu_seqlens is not None else None)
+        #print("------------ cu_seqlens ------------", cu_seqlens)
+       # print("------------ seq_idx shape ------------", seq_idx.shape if seq_idx is not None else None)
+        #print("------------ seq_idx ------------", seq_idx)
+
         if (
-            cu_seqlens is not None 
-            and HAVE_SSM_OPS_VARLEN
-            and mamba_chunk_scan_combined_varlen is not None
+            cu_seqlens is not None             
         ):
+            print("******** Using variable-length path ********")
             # Variable-length path using local Triton kernels (megatron.core.ssm.ops)
             batch, max_seqlen = x.shape[0], x.shape[1]
             total_tokens = cu_seqlens[-1].item()
             chunk_size = self.chunk_size
             device = x.device
 
+            #initial_ssm_state = None
             initial_ssm_state = ssm_state[batch_indices]
 
             if total_tokens > 0:
@@ -911,6 +918,8 @@ class MambaMixer(MegatronModule):
                     .clamp(0, batch - 1)
                     .to(device=device, dtype=torch.int32)
                 )
+                #print("------------ seq_idx_chunk shape ------------", seq_idx_chunk.shape if seq_idx_chunk is not None else None)
+                #print("------------ seq_idx_chunk ------------", seq_idx_chunk)
 
                 # Pack tensors to (total_tokens, ...); use .item() for safe Python int slicing
                 x_packed = torch.cat(
@@ -1001,6 +1010,7 @@ class MambaMixer(MegatronModule):
             else:
                 y = y_unpacked
         else:
+            print("********************************* Using chunked path *********************************")
             y = mamba_chunk_scan_combined(
                 x,
                 dt,
