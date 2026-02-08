@@ -4,7 +4,6 @@ import asyncio
 import concurrent.futures
 import logging
 import multiprocessing
-import os
 import socket
 import struct
 import time
@@ -39,10 +38,11 @@ from megatron.core.inference.sampling_params import SamplingParams
 from megatron.core.inference.text_generation_controllers.text_generation_controller import (
     TextGenerationController,
 )
-from megatron.core.inference.utils import Counter, await_process_event
+from megatron.core.inference.utils import Counter, await_process_call
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.transformer.cuda_graphs import delete_cuda_graphs
 from megatron.core.utils import (
+    deprecate_args,
     experimental_api,
     get_asyncio_loop,
     get_pg_rank,
@@ -90,6 +90,14 @@ try:
 except ImportError:
     HAVE_PSUTIL = False
 
+DEPRECATED_ARGS = [
+    "enable_cuda_graph",
+    "random_seed",
+    "track_paused_request_events",
+    "enable_chunked_prefill",
+    "inference_logging_step_interval",
+    "pg_collection",
+]
 from megatron.core.inference.contexts.dynamic_context import HAVE_TORCH_MEMORY_SAVER
 
 if HAVE_TORCH_MEMORY_SAVER:
@@ -137,24 +145,13 @@ class DynamicInferenceEngine(AbstractEngine):
             outputs and detokenizer the output tokens.
         inference_context (DynamicInferenceContext): Context for managing in-flight
             batching and a dynamic block-level KV cache (similar to paged attention).
-        random_seed (Optional[int]): Use a random seed if you want deterministic
-            results. Defaults to None.
-        inference_logging_step_interval (int): The step interval at which to log
-        inference metrics to wandb. Defaults to 0, which means no logging.
     """
 
-    def __init__(
-        self,
-        controller: TextGenerationController,
-        context: DynamicInferenceContext,
-        enable_cuda_graph: Optional[bool] = None,
-        random_seed: Optional[int] = None,
-        *,
-        track_paused_request_events: bool = False,
-        enable_chunked_prefill: bool = True,
-        inference_logging_step_interval: int = 0,
-        pg_collection: Optional[ProcessGroupCollection] = None,
-    ):
+    @deprecate_args(
+        *DEPRECATED_ARGS,
+        message="Argument `{name}` has been deprecated. Only pass `controller` and `context`",
+    )
+    def __init__(self, controller: TextGenerationController, context: DynamicInferenceContext):
 
         assert isinstance(
             controller, TextGenerationController
@@ -162,40 +159,28 @@ class DynamicInferenceEngine(AbstractEngine):
         assert isinstance(
             context, DynamicInferenceContext
         ), f"context must be a DynamicInferenceContext, got {type(context)}"
-        assert isinstance(random_seed, int), f"random_seed must be an int, got {type(random_seed)}"
 
-        # Deprecate `enable_cuda_graph`.
-        if enable_cuda_graph is not None:
-            warnings.warn(
-                "The `enable_cuda_graph` argument is deprecated and will be "
-                "removed in `megatron-core 0.15`. `enable_cuda_graph` is now "
-                "read directly from the transformer config object."
-            )
-            self.enable_cuda_graph = enable_cuda_graph
-        else:
-            self.enable_cuda_graph = (
-                controller.inference_wrapped_model.model.config.enable_cuda_graph
-            )
+        model_config = controller.inference_wrapped_model.model.config
+        inference_config = context.config
 
-        if pg_collection is not None:
-            self.pg_collection = pg_collection
+        if inference_config.pg_collection is not None:
+            self.pg_collection = inference_config.pg_collection
         else:
             self.pg_collection = ProcessGroupCollection.use_mpu_process_groups()
 
         # Initialization options.
         self.controller = controller
         self.context = context
-        self.random_seed = random_seed
-        self.track_paused_request_events = track_paused_request_events
-        self.enable_chunked_prefill = enable_chunked_prefill
-        self.inference_logging_step_interval = inference_logging_step_interval
-        self.unified_memory_level = context.unified_memory_level
-        self.persist_cuda_graphs = context.persist_cuda_graphs
-
-        if enable_cuda_graph is not None:
-            self.cuda_graph_impl = "local" if enable_cuda_graph else "none"
-        else:
-            self.cuda_graph_impl = controller.inference_wrapped_model.model.config.cuda_graph_impl
+        self.track_paused_request_events = inference_config.track_paused_request_events
+        self.enable_chunked_prefill = inference_config.enable_chunked_prefill
+        self.metrics_writer = inference_config.metrics_writer
+        self.logging_step_interval = inference_config.logging_step_interval
+        self.unified_memory_level = inference_config.unified_memory_level
+        self.persist_cuda_graphs = inference_config.persist_cuda_graphs
+        self.materialize_only_last_token_logits = (
+            inference_config.materialize_only_last_token_logits
+        )
+        self.cuda_graph_impl = model_config.cuda_graph_impl
 
         # Initialize engine.
         self.reset()
@@ -206,12 +191,12 @@ class DynamicInferenceEngine(AbstractEngine):
         )
 
         # Configure wandb to use separate step counter for inference metrics (only once)
-        if self.inference_logging_step_interval > 0 and self.context.metrics_writer is not None:
+        if self.logging_step_interval > 0 and self.metrics_writer is not None:
             logging.info(
                 f"\033[1;93m[INFERENCE]\033[0m "
                 f"\033[1;95mLogging inference metrics to wandb (rank {self.rank})\033[0m"
             )
-            if HAVE_WANDB and self.context.metrics_writer.__name__ == "wandb":
+            if HAVE_WANDB and self.metrics_writer.__name__ == "wandb":
                 # Make all inference/* metrics use inference_step as their x-axis
                 # This allows inference and training to have independent step counters
                 context.metrics_writer.define_metric(
@@ -289,8 +274,6 @@ class DynamicInferenceEngine(AbstractEngine):
         context = self.context
         controller = self.controller
 
-        config = controller.inference_wrapped_model.inference_wrapper_config
-
         time_start = time.time()
         mem_stats_start = torch.cuda.memory_stats()
 
@@ -349,7 +332,7 @@ class DynamicInferenceEngine(AbstractEngine):
     @internal_api
     async def start_listening_to_data_parallel_coordinator(
         self,
-        inference_coordinator_port: int,
+        inference_coordinator_port: int | None = None,
         launch_inference_coordinator: bool = True,
         *,
         loop: Optional[asyncio.AbstractEventLoop] = None,
@@ -379,11 +362,20 @@ class DynamicInferenceEngine(AbstractEngine):
         (`self.run_engine`) as a background asyncio task.
 
         Args:
-            inference_coordinator_port (int): The network port where the central
+            inference_coordinator_port (int | None): The network port where the central
                 `InferenceCoordinator` is or will be listening.
+                If None, a random available port will be selected.
+                If not None, the coordinator will attempt to bind to this port, but should it
+                not succeed (e.g., if the port is already in use), it may bind to a different port.
+                The actual port used is returned by this method.
             launch_inference_coordinator (bool, optional): If True, the global rank 0
                 process will spawn and manage the `InferenceCoordinator`
                 process. Defaults to True.
+
+        Returns:
+            inference_coordinator_addresss (str): The network address of the central
+                `InferenceCoordinator`, which may not have the same port as what the user requested
+                with `inference_coordinator_port`.
         """
 
         assert HAVE_ZMQ, (
@@ -411,24 +403,45 @@ class DynamicInferenceEngine(AbstractEngine):
         self.is_mp_coordinator = tp_rank == 0 and pp_rank == 0
         self.is_dp_coordinator = (dp_rank == 0) and self.is_mp_coordinator
 
+        local_ip = socket.gethostname()
+
         # Spawn a DP coordinator process and get the connection info.
         if launch_inference_coordinator and self.is_dp_coordinator:
             spawn_context = multiprocessing.get_context('spawn')
+            deterministic_mode = torch.are_deterministic_algorithms_enabled()
+            dp_pipe, dp_process_pipe = spawn_context.Pipe()
             coordinator_ready_event = spawn_context.Event()
             self.inference_coordinator_process = spawn_context.Process(
                 target=DataParallelInferenceCoordinator.entrypoint,
                 args=(
+                    dp_process_pipe,
                     coordinator_ready_event,
-                    inference_coordinator_port,
                     get_pg_size(self.pg_collection.dp),
                     self.controller.tokenizer,
+                    inference_coordinator_port,
+                    deterministic_mode,
                 ),
             )
             self.inference_coordinator_process.start()
+            await await_process_call(dp_pipe.poll, self.inference_coordinator_process)
+            dp_addr = dp_pipe.recv()
+            dp_pipe.close()
+
+            # Check if the port number is not inference_coordinator_port
+            actual_port = int(dp_addr.rsplit(":", 1)[-1])
+            if inference_coordinator_port != None and actual_port != inference_coordinator_port:
+                logging.warning(
+                    f"Requested InferenceCoordinator port {inference_coordinator_port} "
+                    f"but got port {actual_port} instead. This happens if the request port "
+                    f"is already in use."
+                )
+        elif not launch_inference_coordinator:
+            dp_addr = f"tcp://{local_ip}:{inference_coordinator_port}"
+        else:
+            dp_addr = None
 
         # Find available ports for MP and bind to them.
         if self.is_mp_coordinator:
-            local_ip = socket.gethostname()
             mp_req_sock = self.zmq_context.socket(zmq.PUB)
             mp_req_sock.bind_to_random_port(f"tcp://{local_ip}")
             mp_req_addr = mp_req_sock.getsockopt_string(zmq.LAST_ENDPOINT)
@@ -441,12 +454,13 @@ class DynamicInferenceEngine(AbstractEngine):
             mp_len_addr = None
 
         # Broadcast addresses to respective ranks.
+        bcast = [dp_addr]
+        torch.distributed.broadcast_object_list(bcast, src=dp_src, group=dp_group)
+        [dp_addr] = bcast
         bcast = [mp_req_addr, mp_len_addr]
         torch.distributed.broadcast_object_list(bcast, src=mp_src, group=mp_group)
         [mp_req_addr, mp_len_addr] = bcast
 
-        ip_address_of_dp_coordinator = os.getenv('MASTER_ADDR', '127.0.0.1')
-        dp_addr = f"tcp://{ip_address_of_dp_coordinator}:{inference_coordinator_port}"
         identity = f'mp-coord-{dp_rank}'
         if self.is_mp_coordinator:
             # 1. Create dealer sockets where tp_rank = 0 and pp_rank = 0
@@ -495,12 +509,17 @@ class DynamicInferenceEngine(AbstractEngine):
             )
 
         if launch_inference_coordinator and self.is_dp_coordinator:
-            await await_process_event(coordinator_ready_event, self.inference_coordinator_process)
+            await await_process_call(
+                coordinator_ready_event.wait, self.inference_coordinator_process
+            )
             logging.info("Inference co-ordinator is ready to receive requests!")
+            logging.info(f"Data parallel coordinator can be found at {dp_addr}")
 
         # Finally run the engine infinite loop
         loop = get_asyncio_loop(loop)
         self.engine_loop_task = loop.create_task(self.run_engine_with_coordinator(loop=loop))
+
+        return dp_addr
 
     @contextmanager
     @staticmethod
@@ -700,7 +719,7 @@ class DynamicInferenceEngine(AbstractEngine):
             request.sampling_params.return_log_probs
             and not request.sampling_params.skip_prompt_log_probs
         ):
-            assert not self.context.materialize_only_last_token_logits, (
+            assert not self.materialize_only_last_token_logits, (
                 "Prompt log probs cannot be calculated if only last token logits are materialized. "
                 "Set materialize_only_last_token_logits to False in DynamicInferenceContext "
                 "or skip_prompt_log_probs to True in SamplingParams."
@@ -749,6 +768,10 @@ class DynamicInferenceEngine(AbstractEngine):
             self.waiting_request_ids.append(request_id)
         else:
             self.failed_request_ids.append(request_id)
+            if self.rank == 0:
+                warnings.warn(
+                    f"Request {request_id} failed to be added to the engine due to errors."
+                )
 
         return self.requests[request_id].future
 
@@ -889,7 +912,7 @@ class DynamicInferenceEngine(AbstractEngine):
                 # For chunked prefill with materialize_only_last_token_logits, discard intermediate log probs
                 if (
                     request_id == self.context.chunked_prefill_request_id
-                    and self.context.materialize_only_last_token_logits
+                    and self.materialize_only_last_token_logits
                 ):
                     request.prompt_log_probs = []
                     request.generated_log_probs = []
@@ -1169,10 +1192,10 @@ class DynamicInferenceEngine(AbstractEngine):
         range_pop()
 
         if (
-            self.inference_logging_step_interval > 0
+            self.logging_step_interval > 0
             and self.step_count > 0
-            and self.step_count % self.inference_logging_step_interval == 0
-            and self.context.metrics_writer is not None
+            and self.step_count % self.logging_step_interval == 0
+            and self.metrics_writer is not None
         ):
             kvcache_util_stats = self.context.get_kvcache_utilization_stats()
         else:
@@ -1305,18 +1328,13 @@ class DynamicInferenceEngine(AbstractEngine):
                 else:
                     metrics[f'inference/{key}'] = value
 
-            if HAVE_WANDB and self.context.metrics_writer.__name__ == "wandb":
-                self.context.metrics_writer.log(metrics, commit=True)
+            if HAVE_WANDB and self.metrics_writer.__name__ == "wandb":
+                self.metrics_writer.log(metrics, commit=True)
             else:
-                raise ValueError(
-                    f"Unsupported metrics writer type: {type(self.context.metrics_writer)}"
-                )
+                raise ValueError(f"Unsupported metrics writer type: {type(self.metrics_writer)}")
 
         # Print context state.
-        if (
-            self.inference_logging_step_interval > 0
-            and step_count % self.inference_logging_step_interval == 0
-        ):
+        if self.logging_step_interval > 0 and step_count % self.logging_step_interval == 0:
             mem = torch.cuda.memory_stats()
             step_type = "decode" if context_state["is_decode_only"] else "non-decode"
             output_str = (
@@ -1671,7 +1689,11 @@ class DynamicInferenceEngine(AbstractEngine):
                 if ep_group_has_work and local_pending_requests == 0:
                     # run dummy forward pass if EP group as a whole has work,
                     # but this rank does not have any work.
+                    self.step_start_event.record()
                     self.controller.dummy_forward()
+                    self.step_end_event.record()
+                    self.step_end_event.synchronize()
+                    self.step_count += 1
                     continue
 
                 # 3. No work in EP group
