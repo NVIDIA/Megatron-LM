@@ -52,7 +52,7 @@ from megatron.core.optimizer.distrib_optimizer import DistributedOptimizer
 from .log_handler import CustomHandler
 
 from megatron.core.tensor_tracer import _set_tt_hook_manager
-from .training_wsserver import websocket_server_process
+from .training_wsserver import websocket_server_process, websocket_worker_process
 
 # Make default logging level INFO, but filter out all log messages not from MCore.
 logging.basicConfig(handlers=[CustomHandler()], level=logging.INFO)
@@ -2452,22 +2452,12 @@ def train(
     args = get_args()
     timers = get_timers()
 
-    if args.tensor_tracer_port is not None and torch.distributed.get_rank() == 0:
+    global_rank = torch.distributed.get_rank()
+    tp_rank = mpu.get_tensor_model_parallel_rank()
+    if args.tensor_tracer_port is not None and tp_rank == 0:
         data_queue = multiprocessing.Queue()
-        config_queue = multiprocessing.Queue(maxsize=1)
-        start_training_event = multiprocessing.Event()
         shutdown_event = multiprocessing.Event()
-        training_args_dict = {
-            "micro_batch_size": args.micro_batch_size,
-            "seq_length": args.seq_length,
-            "num_layers": args.num_layers
-        }
-        ws_process = multiprocessing.Process(
-            target=websocket_server_process,
-            args=(args.tensor_tracer_port, data_queue, config_queue, start_training_event, shutdown_event, training_args_dict),
-            daemon=True
-        )
-        ws_process.start()
+
         from megatron.core.tensor_tracer import FlagType, set_report
         def report_func(name_tuple, report_args, tensor_data):
             # name_tuple is (layer_id, FlagType)
@@ -2482,13 +2472,35 @@ def train(
                 pass
         set_report(report_func)
 
-    if args.tensor_tracer_port is not None:
-        if torch.distributed.get_rank() == 0:
-            print_rank_0("Waiting for 'run_training_step' command from frontend to start training...")
-            start_training_event.wait()
-            print_rank_0("Command received. Synchronizing configs across all ranks...")
+        if global_rank == 0:
+            config_queue = multiprocessing.Queue(maxsize=1)
+            start_training_event = multiprocessing.Event()
 
-        if torch.distributed.get_rank() == 0:
+            training_args_dict = {
+                "micro_batch_size": args.micro_batch_size,
+                "seq_length": args.seq_length,
+                "num_layers": args.num_layers
+            }
+
+            ws_process = multiprocessing.Process(
+                target=websocket_server_process,
+                args=(args.tensor_tracer_port, data_queue, config_queue, start_training_event, shutdown_event, training_args_dict),
+                daemon=True
+            )
+            ws_process.start()
+            start_training_event.wait()
+        else:
+            master_addr = os.environ.get("MASTER_ADDR", "127.0.0.1")
+
+            ws_process = multiprocessing.Process(
+                target=websocket_worker_process,
+                args=(master_addr, args.tensor_tracer_port, global_rank, data_queue, shutdown_event),
+                daemon=True
+            )
+            ws_process.start()
+
+    if args.tensor_tracer_port is not None:
+        if global_rank == 0:
             received_configs = config_queue.get()
             vis_flags = received_configs.get('visualization_flags', {})
             comp_configs = received_configs.get('compressor_config', {})
@@ -2501,8 +2513,6 @@ def train(
         vis_flags, comp_configs = configs_to_broadcast
         from megatron.core.tensor_tracer import get_tt_flags
         get_tt_flags().set_by_configs(vis_flags, comp_configs)
-
-        print_rank_0("Configs synchronized. Starting training.")
 
     if getattr(args, 'perform_rl_step', False):
         assert has_rl_utils, "RL cannot run without the megatron.rl package"
@@ -3073,13 +3083,14 @@ def train(
         if should_exit:
             break
 
-    if ws_process:
+    if args.tensor_tracer_port is not None and tp_rank == 0:
         print_rank_0("Signaling WebSocket process to shut down...")
         shutdown_event.set()
         data_queue.close()
-        config_queue.close()
         data_queue.cancel_join_thread()
-        config_queue.cancel_join_thread()
+        if global_rank == 0:
+            config_queue.close()
+            config_queue.cancel_join_thread()
         ws_process.join(timeout=5)
         if ws_process.is_alive():
             print_rank_0("WebSocket process did not shut down cleanly, terminating.")

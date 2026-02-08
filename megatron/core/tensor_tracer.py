@@ -197,6 +197,7 @@ class TTHookManager:
                     device = torch.cuda.current_device()
                     world_size = get_tensor_model_parallel_world_size()
                     rank = get_tensor_model_parallel_rank()
+                    rank0_global = torch.distributed.get_process_group_ranks(get_tensor_model_parallel_group())[0]
 
                     if isinstance(output, (list, tuple)):
                         tensor_data = output[0].detach()
@@ -209,7 +210,7 @@ class TTHookManager:
                     else:
                         tensor_list = None
                     if world_size > 1:
-                        torch.distributed.gather(tensor_data_cont, tensor_list, dst=0, group=get_tensor_model_parallel_group())
+                        torch.distributed.gather(tensor_data_cont, tensor_list, dst=rank0_global, group=get_tensor_model_parallel_group())
                     else:
                         tensor_list = [tensor_data_cont]
                     
@@ -242,6 +243,7 @@ class TTHookManager:
                     device = torch.cuda.current_device()
                     world_size = get_tensor_model_parallel_world_size()
                     rank = get_tensor_model_parallel_rank()
+                    rank0_global = torch.distributed.get_process_group_ranks(get_tensor_model_parallel_group())[0]
 
                     if args.sequence_parallel:
                         if isinstance(output, (list, tuple)):
@@ -255,7 +257,7 @@ class TTHookManager:
                         else:
                             tensor_list = None
                         if world_size > 1:
-                            torch.distributed.gather(tensor_data_cont, tensor_list, dst=0, group=get_tensor_model_parallel_group())
+                            torch.distributed.gather(tensor_data_cont, tensor_list, dst=rank0_global, group=get_tensor_model_parallel_group())
                         else:
                             tensor_list = [tensor_data_cont]
                         
@@ -278,6 +280,7 @@ class TTHookManager:
                     device = torch.cuda.current_device()
                     world_size = get_tensor_model_parallel_world_size()
                     rank = get_tensor_model_parallel_rank()
+                    rank0_global = torch.distributed.get_process_group_ranks(get_tensor_model_parallel_group())[0]
 
                     if isinstance(output, (list, tuple)):
                         tensor_data = output[0].detach()
@@ -290,7 +293,7 @@ class TTHookManager:
                     else:
                         tensor_list = None
                     if world_size > 1:
-                        torch.distributed.gather(tensor_data_cont, tensor_list, dst=0, group=get_tensor_model_parallel_group())
+                        torch.distributed.gather(tensor_data_cont, tensor_list, dst=rank0_global, group=get_tensor_model_parallel_group())
                     else:
                         tensor_list = [tensor_data_cont]
                     
