@@ -864,8 +864,7 @@ class MambaMixer(MegatronModule):
         # Use local varlen kernels only for batch > 1; for batch==1 use mamba_ssm which
         # is designed for that layout and avoids packing/alignment issues.
         if (
-            cu_seqlens is not None
-            and x.shape[0] > 1
+            cu_seqlens is not None 
             and HAVE_SSM_OPS_VARLEN
             and mamba_chunk_scan_combined_varlen is not None
         ):
@@ -877,115 +876,123 @@ class MambaMixer(MegatronModule):
 
             initial_ssm_state = ssm_state[batch_indices]
 
-            # Build chunk boundaries so no chunk spans two sequences (fixes junk output
-            # when multiple short sequences share a chunk). Merge fixed-size boundaries
-            # with sequence boundaries from cu_seqlens.
-            boundaries_set = {0, total_tokens}
-            for s in range(1, batch):
-                boundaries_set.add(cu_seqlens[s].item())
-            for pos in range(0, total_tokens, chunk_size):
-                boundaries_set.add(min(pos, total_tokens))
-            boundaries = sorted(boundaries_set)
-            cu_chunk_seqlens = torch.tensor(
-                boundaries, device=device, dtype=cu_seqlens.dtype
-            )
-            nchunks = len(boundaries) - 1
-
-            seq_lengths = cu_seqlens[1:] - cu_seqlens[:-1]
-            # Chunk index that contains the last token of each sequence
-            last_token_pos = (cu_seqlens[1:] - 1).clamp(min=0)
-            last_chunk_indices = (
-                torch.searchsorted(
-                    cu_chunk_seqlens, last_token_pos.to(cu_chunk_seqlens.dtype), right=False
+            if total_tokens > 0:
+                # Build chunk boundaries so no chunk spans two sequences (fixes junk output
+                # when multiple short sequences share a chunk). Merge fixed-size boundaries
+                # with sequence boundaries from cu_seqlens.
+                boundaries_set = {0, total_tokens}
+                for s in range(1, batch):
+                    boundaries_set.add(cu_seqlens[s].item())
+                for pos in range(0, total_tokens, chunk_size):
+                    boundaries_set.add(min(pos, total_tokens))
+                boundaries = sorted(boundaries_set)
+                cu_chunk_seqlens = torch.tensor(
+                    boundaries, device=device, dtype=cu_seqlens.dtype
                 )
-                - 1
-            )
-            last_chunk_indices = last_chunk_indices.clamp(0, nchunks - 1).to(
-                device=device, dtype=torch.int64
-            )
+                nchunks = len(boundaries) - 1
 
-            # Chunk-level seq_idx: which sequence each chunk belongs to
-            chunk_starts = cu_chunk_seqlens[:-1].to(cu_seqlens.dtype)
-            seq_idx_chunk = (
-                (torch.searchsorted(cu_seqlens, chunk_starts, right=False) - 1)
-                .clamp(0, batch - 1)
-                .to(device=device, dtype=torch.int32)
-            )
+                seq_lengths = cu_seqlens[1:] - cu_seqlens[:-1]
+                # Chunk index that contains the last token of each sequence
+                last_token_pos = (cu_seqlens[1:] - 1).clamp(min=0)
+                last_chunk_indices = (
+                    torch.searchsorted(
+                        cu_chunk_seqlens, last_token_pos.to(cu_chunk_seqlens.dtype), right=False
+                    )
+                    - 1
+                )
+                last_chunk_indices = last_chunk_indices.clamp(0, nchunks - 1).to(
+                    device=device, dtype=torch.int64
+                )
 
-            # Pack tensors to (total_tokens, ...); use .item() for safe Python int slicing
-            x_packed = torch.cat(
-                [
-                    x[b, : seq_lengths[b].item(), :, :].contiguous()
-                    for b in range(batch)
-                ],
-                dim=0,
-            ).contiguous()
-            dt_packed = torch.cat(
-                [dt[b, : seq_lengths[b].item(), :].contiguous() for b in range(batch)],
-                dim=0,
-            ).contiguous()
-            B_packed = torch.cat(
-                [
-                    B[b, : seq_lengths[b].item(), :, :].contiguous()
-                    for b in range(batch)
-                ],
-                dim=0,
-            ).contiguous()
-            C_packed = torch.cat(
-                [
-                    C[b, : seq_lengths[b].item(), :, :].contiguous()
-                    for b in range(batch)
-                ],
-                dim=0,
-            ).contiguous()
-            z_packed = (
-                torch.cat(
+                # Chunk-level seq_idx: which sequence each chunk belongs to
+                chunk_starts = cu_chunk_seqlens[:-1].to(cu_seqlens.dtype)
+                seq_idx_chunk = (
+                    (torch.searchsorted(cu_seqlens, chunk_starts, right=False) - 1)
+                    .clamp(0, batch - 1)
+                    .to(device=device, dtype=torch.int32)
+                )
+
+                # Pack tensors to (total_tokens, ...); use .item() for safe Python int slicing
+                x_packed = torch.cat(
                     [
-                        z[b, : seq_lengths[b].item(), :, :].contiguous()
+                        x[b, : seq_lengths[b].item(), :, :].contiguous()
                         for b in range(batch)
                     ],
                     dim=0,
                 ).contiguous()
-                if not self.rmsnorm
-                else None
-            )
+                dt_packed = torch.cat(
+                    [dt[b, : seq_lengths[b].item(), :].contiguous() for b in range(batch)],
+                    dim=0,
+                ).contiguous()
+                B_packed = torch.cat(
+                    [
+                        B[b, : seq_lengths[b].item(), :, :].contiguous()
+                        for b in range(batch)
+                    ],
+                    dim=0,
+                ).contiguous()
+                C_packed = torch.cat(
+                    [
+                        C[b, : seq_lengths[b].item(), :, :].contiguous()
+                        for b in range(batch)
+                    ],
+                    dim=0,
+                ).contiguous()
+                z_packed = (
+                    torch.cat(
+                        [
+                            z[b, : seq_lengths[b].item(), :, :].contiguous()
+                            for b in range(batch)
+                        ],
+                        dim=0,
+                    ).contiguous()
+                    if not self.rmsnorm
+                    else None
+                )
 
-            out_packed = torch.empty_like(x_packed)
-            D_val = (
-                rearrange(self.cp.get_D().float(), "(h p) -> h p", p=self.headdim)
-                if self.D_has_hdim
-                else self.cp.get_D()
-            )
-            dt_bias_val = self.cp.get_dt_bias().float()
+                out_packed = torch.empty_like(x_packed)
+                D_val = (
+                    rearrange(self.cp.get_D().float(), "(h p) -> h p", p=self.headdim)
+                    if self.D_has_hdim
+                    else self.cp.get_D()
+                )
+                dt_bias_val = self.cp.get_dt_bias().float()
 
-            varlen_states = mamba_chunk_scan_combined_varlen(
-                x_packed,
-                dt_packed,
-                A,
-                B_packed,
-                C_packed,
-                chunk_size,
-                cu_seqlens=cu_seqlens,
-                cu_chunk_seqlens=cu_chunk_seqlens,
-                last_chunk_indices=last_chunk_indices,
-                seq_idx=seq_idx_chunk,
-                out=out_packed,
-                D=D_val,
-                z=z_packed,
-                dt_bias=dt_bias_val,
-                initial_states=initial_ssm_state,
-                dt_softplus=True,
-                return_intermediate_states=False,
-            )
+                varlen_states = mamba_chunk_scan_combined_varlen(
+                    x_packed,
+                    dt_packed,
+                    A,
+                    B_packed,
+                    C_packed,
+                    chunk_size,
+                    cu_seqlens=cu_seqlens,
+                    cu_chunk_seqlens=cu_chunk_seqlens,
+                    last_chunk_indices=last_chunk_indices,
+                    seq_idx=seq_idx_chunk,
+                    out=out_packed,
+                    D=D_val,
+                    z=z_packed,
+                    dt_bias=dt_bias_val,
+                    initial_states=initial_ssm_state,
+                    dt_softplus=True,
+                    return_intermediate_states=False,
+                )
 
-            # Unpack output to (batch, max_seqlen, nheads, headdim)
-            y_unpacked = x.new_zeros(batch, max_seqlen, x.shape[2], x.shape[3])
-            for b in range(batch):
-                length_b = seq_lengths[b].item()
-                if length_b > 0:
-                    y_unpacked[b, :length_b, :, :] = out_packed[
-                        cu_seqlens[b] : cu_seqlens[b + 1]
-                    ]
+                # Unpack output to (batch, max_seqlen, nheads, headdim)
+                y_unpacked = x.new_zeros(batch, max_seqlen, x.shape[2], x.shape[3])
+                for b in range(batch):
+                    length_b = seq_lengths[b].item()
+                    if length_b > 0:
+                        y_unpacked[b, :length_b, :, :] = out_packed[
+                            cu_seqlens[b] : cu_seqlens[b + 1]
+                        ]
+            else:
+                # Zero tokens: skip kernel to avoid illegal memory access with empty inputs
+                y_unpacked = x.new_zeros(batch, max_seqlen, x.shape[2], x.shape[3])
+                varlen_states = x.new_zeros(
+                    batch, x.shape[2], x.shape[3], B.shape[-1],
+                    device=device, dtype=x.dtype,
+                )
 
             if ssm_state is not None and return_varlen_states:
                 y = (y_unpacked, None, varlen_states)
