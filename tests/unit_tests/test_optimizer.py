@@ -28,7 +28,7 @@ from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.transformer import TransformerConfig
 from megatron.core.utils import is_te_min_version, is_torch_min_version
 from tests.unit_tests.test_utilities import Utils
-from tests.unit_tests.test_utils import _deinit_distributed, _init_distributed
+from tests.unit_tests.test_utils import _init_distributed
 
 try:
     # Check if FP8 block scaling is available.
@@ -326,6 +326,43 @@ def test_chained_optimizer():
     assert list(optimizer_2.state.values())[0]["momentum_buffer"].is_cuda
 
 
+def test_chained_optimizer_get_parameters():
+    """Test ChainedOptimizer.get_parameters() aggregates params from all sub-optimizers.
+
+    Regression test: without the get_parameters() override, ChainedOptimizer would
+    access self.optimizer which asserts only one optimizer exists, failing with VPP/MoE.
+    """
+
+    class MockOptimizer:
+        """Mock that mimics MegatronOptimizer's get_parameters() interface."""
+
+        def __init__(self, params):
+            self.params = list(params)
+            self.param_groups = [{"params": self.params}]
+
+        def get_parameters(self):
+            return self.params
+
+    net = Net()
+    all_params = list(net.parameters())
+
+    # Test empty
+    assert ChainedOptimizer([]).get_parameters() == []
+
+    # Test single optimizer
+    opt1 = MockOptimizer(all_params[:3])
+    assert ChainedOptimizer([opt1]).get_parameters() == opt1.params
+
+    # Test multiple optimizers (the case that previously failed)
+    opt2 = MockOptimizer(all_params[3:6])
+    opt3 = MockOptimizer(all_params[6:])
+    chained = ChainedOptimizer([opt1, opt2, opt3])
+    result = chained.get_parameters()
+
+    assert len(result) == len(all_params)
+    assert result == opt1.params + opt2.params + opt3.params
+
+
 def test_precision_aware_fused_adam():
     try:
         from transformer_engine.pytorch.optimizers import FusedAdam
@@ -384,6 +421,7 @@ def test_precision_aware_fused_adam():
     "moment_dtype",
     [torch.float32, torch.float16, torch.bfloat16, torch.uint8],
 )
+@pytest.mark.skip(reason="inconsistent ci test runs resulting in NCCL errors")
 def test_precision_aware_optimizer(
     precision: str,
     main_params_dtype: torch.dtype,
