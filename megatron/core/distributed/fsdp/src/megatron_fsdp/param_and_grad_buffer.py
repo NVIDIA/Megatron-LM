@@ -2625,6 +2625,7 @@ class ParamAndGradBuffer:
                             "partition_dim",
                             "partition_stride",
                             "is_embedding_or_output_parameter",
+                            "is_embedding_parameter",
                             "_mcore_tp",
                             "_tp_duplicated",
                             "_tp_partition_dim",

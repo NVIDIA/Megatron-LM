@@ -617,6 +617,7 @@ def process_mtp_loss(
     config: TransformerConfig,
     cp_group: Optional[torch.distributed.ProcessGroup] = None,
     packed_seq_params: Optional[PackedSeqParams] = None,
+    scale_logits_fn: Optional[Callable[[Tensor], Tensor]] = None,
 ) -> Tensor:
     """Process Multi-Token Prediction (MTP) loss computation.
 
@@ -635,6 +636,8 @@ def process_mtp_loss(
         config (TransformerConfig): Model configuration containing mtp_num_layers etc.
         cp_group (Optional[ProcessGroup]): Context parallelism process group.
         packed_seq_params (Optional[PackedSeqParams]): Packed sequence parameters.
+        scale_logits_fn (Optional[Callable[[Tensor], Tensor]]): Optional function to
+            scale logits before loss computation (e.g., MuP output scaling).
 
     Returns:
         Tensor: Updated hidden states after MTP loss processing (first chunk only).
@@ -652,6 +655,8 @@ def process_mtp_loss(
             weight=output_weight,
             runtime_gather_output=runtime_gather_output,
         )
+        if scale_logits_fn is not None:
+            mtp_logits = scale_logits_fn(mtp_logits)
         mtp_labels, _ = roll_tensor(
             mtp_labels, shifts=-1, dims=-1, cp_group=cp_group, packed_seq_params=packed_seq_params
         )
