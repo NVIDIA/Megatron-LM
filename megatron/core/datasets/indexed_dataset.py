@@ -862,7 +862,8 @@ class IndexedDataset(torch.utils.data.Dataset):
         sequence_pointer, sequence_length, sequence_mode = self.index[idx]
         if length is None:
             length = sequence_length - offset
-        sequence_pointer += offset * DType.size(self.index.dtype)
+        # Convert to Python int to avoid numpy int64 overflow
+        sequence_pointer = int(sequence_pointer) + int(offset) * int(DType.size(self.index.dtype))
         sequence = self.bin_reader.read(
             dtype=self.index.dtype, count=length, offset=sequence_pointer
         )
