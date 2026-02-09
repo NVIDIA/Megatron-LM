@@ -2238,6 +2238,9 @@ class TECudaGraphHelper:
         else:
             rng_context = nullcontext()
         with rng_context:
+            # print("WHY NONE?")
+            # torch.distributed.breakpoint()
+            print(f"self.flattened_callables: {self.flattened_callables} | sample_args: {sample_args} kwargs: {kwargs}")
             graphs = make_graphed_callables(tuple(self.flattened_callables), sample_args, **kwargs)
 
         # Push the captured graphs to the corresponding TransformerBlock.

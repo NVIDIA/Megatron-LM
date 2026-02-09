@@ -406,8 +406,7 @@ class MoELayer(BaseMoELayer):
                     # else:
                     #     print(f"intermediate_tensors: {intermediate_tensors}")
 
-            except e: #MoECudaGraphPartialCaptureSignal as e:
-                print(f"e: {e}")
+            except MoECudaGraphPartialCaptureSignal as e:
                 # This signal is raised from the maybe_skip_or_early_return_by_cudagraph decorator.
                 # It means we should early-return from the MoE layer forward pass.
                 # This happens when we are partially capturing the CUDA graph of the MoE layer,

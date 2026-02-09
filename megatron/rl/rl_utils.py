@@ -1784,7 +1784,7 @@ def megatron_rl_inference_mode(
         # Change cudagraph scope for training
         print("IN TRAINING")
         model[0].config.cuda_graph_scope = ["mamba", "attn", "moe_router"]
-        model[0].config.cuda_graph_impl = "transformer_engine"
+        # model[0].config.cuda_graph_impl = "transformer_engine"
         # torch.distributed.breakpoint()
 
         # If this is a separate RL inference model, prefetch weights back to CPU so they don't consume

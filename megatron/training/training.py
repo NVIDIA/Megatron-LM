@@ -2819,6 +2819,7 @@ def train(
         # For GRPO, we keep the data for a few epochs. DeepSeekMath paper calls this number $\mu$.
         # It is similar to a PPO epoch.
 
+        args.cuda_graph_impl = "local"
         if getattr(args, 'perform_rl_step', False):
             with torch.no_grad():
                 train_data_iterator = rl_utils.get_grpo_data_iterator(
