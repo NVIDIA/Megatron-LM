@@ -12,6 +12,7 @@ from collections import defaultdict
 import torch
 
 from megatron.core.msc_utils import MultiStorageClientFeature, open_file
+from megatron.core._rank_utils import safe_get_rank as _safe_get_rank
 
 try:
     from transformer_engine.pytorch.optimizers import multi_tensor_applier, multi_tensor_l2norm
@@ -276,12 +277,15 @@ def logical_and_across_model_parallel_group(input: bool) -> bool:
 
 def report_memory(name):
     """Simple GPU memory report."""
+    args = get_args()
     mega_bytes = 1024.0 * 1024.0
     string = name + ' memory (MB)'
-    string += ' | allocated: {}'.format(torch.cuda.memory_allocated() / mega_bytes)
-    string += ' | max allocated: {}'.format(torch.cuda.max_memory_allocated() / mega_bytes)
-    string += ' | reserved: {}'.format(torch.cuda.memory_reserved() / mega_bytes)
-    string += ' | max reserved: {}'.format(torch.cuda.max_memory_reserved() / mega_bytes)
+    string += f" | allocated: {torch.cuda.memory_allocated() / mega_bytes:.2f}"
+    string += f" | max allocated: {torch.cuda.max_memory_allocated() / mega_bytes:.2f}"
+    string += f" | reserved: {torch.cuda.memory_reserved() / mega_bytes:.2f}"
+    string += f" | max reserved: {torch.cuda.max_memory_reserved() / mega_bytes:.2f}"
+    if args.log_device_memory_used:
+        string += f" | total device memory used: {torch.cuda.device_memory_used() / mega_bytes:.2f}"
     if mpu.get_data_parallel_rank() == 0:
         print("[Rank {}] {}".format(torch.distributed.get_rank(), string), flush=True)
 
@@ -391,11 +395,9 @@ def print_rank_0(message, rank=None):
     if rank is not None:
         if rank == 0:
             print(message, flush=True)
-    elif torch.distributed.is_initialized():
-        if torch.distributed.get_rank() == 0:
-            print(message, flush=True)
     else:
-        print(message, flush=True)
+        if _safe_get_rank() == 0:
+            print(message, flush=True)
 
 
 def warn_rank_0(message, rank=None):
@@ -403,20 +405,20 @@ def warn_rank_0(message, rank=None):
     if rank is not None:
         if rank == 0:
             warnings.warn(message)
-    elif torch.distributed.is_initialized():
-        if torch.distributed.get_rank() == 0:
-            warnings.warn(message)
     else:
-        warnings.warn(message)
+        if _safe_get_rank() == 0:
+            warnings.warn(message)
 
 
 def is_rank0():
-    """Returns true if called in the rank0, false otherwise"""
-    return torch.distributed.is_initialized() and torch.distributed.get_rank() == 0
+    """Returns true if called in the rank0, false otherwise."""
+    return _safe_get_rank() == 0
 
 
 def is_last_rank():
-    return torch.distributed.get_rank() == (torch.distributed.get_world_size() - 1)
+    """Returns true if called on last rank, false otherwise."""
+    assert torch.distributed.is_initialized()
+    return _safe_get_rank() == (torch.distributed.get_world_size() - 1)
 
 
 def print_rank_last(message):
