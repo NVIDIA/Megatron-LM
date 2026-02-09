@@ -1,3 +1,5 @@
+# Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
+
 import argparse
 import unittest.mock
 
@@ -9,15 +11,19 @@ pytest.importorskip("flask")
 pytest.importorskip("flask_restful")
 
 from megatron.core.inference.text_generation_server import MegatronServer
-from megatron.training import tokenizer
+from megatron.core.tokenizers import MegatronTokenizer
 from tests.unit_tests.inference.engines.test_static_engine import StaticInferenceEngineTestHarness
-from tests.unit_tests.test_tokenizer import GPT2_VOCAB_SIZE, gpt2_tiktok_vocab
 from tests.unit_tests.test_utilities import Utils
 
 
 @pytest.fixture(scope="module")
-def gpt2_tiktoken_tokenizer(gpt2_tiktok_vocab):
-    return tokenizer.build_tokenizer(gpt2_tiktok_vocab)
+def gpt2_tiktoken_tokenizer():
+    return MegatronTokenizer.from_pretrained(
+        tokenizer_path="/opt/data/tokenizers/tiktoken/tiktoken.vocab.json",
+        vocab_size=131072,
+        num_special_tokens=1000,
+        pattern="v1",
+    )
 
 
 @pytest.fixture(scope="module")
