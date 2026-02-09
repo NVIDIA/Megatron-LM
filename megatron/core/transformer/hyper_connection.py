@@ -41,12 +41,11 @@ class SinkhornKnopp(torch.autograd.Function):
         M_init = torch.exp(H_res_logits)
         M = M_init.clone()
 
-        with torch.no_grad():
-            for _ in range(num_iterations):
-                # T_r: Row normalization
-                M = M / M.sum(dim=-1, keepdim=True).clamp(min=1e-8)
-                # T_c: Column normalization
-                M = M / M.sum(dim=-2, keepdim=True).clamp(min=1e-8)
+        for _ in range(num_iterations):
+            # T_r: Row normalization
+            M = M / M.sum(dim=-1, keepdim=True).clamp(min=1e-8)
+            # T_c: Column normalization
+            M = M / M.sum(dim=-2, keepdim=True).clamp(min=1e-8)
 
         # Save initial M for backward recomputation
         ctx.save_for_backward(M_init)

@@ -576,6 +576,71 @@ def checkpoint(function, distribute_saved_activations, *args):
     return CheckpointFunction.apply(function, distribute_saved_activations, *args)
 
 
+def _save_args_to_ctx(ctx, args):
+    """Save mixed tensor/non-tensor arguments into autograd ctx.
+
+    Since save_for_backward only supports tensors, this function separates
+    tensor and non-tensor arguments, saving tensors via save_for_backward
+    and storing non-tensor metadata (indices and values) as ctx attributes.
+
+    Use _load_args_from_ctx to reconstruct the original args.
+    """
+    tensor_args = []
+    non_tensor_indices = []
+    non_tensor_values = []
+
+    for i, arg in enumerate(args):
+        if isinstance(arg, torch.Tensor):
+            tensor_args.append(arg)
+        else:
+            non_tensor_indices.append(i)
+            non_tensor_values.append(arg)
+
+    ctx.save_for_backward(*detach_variable(tuple(tensor_args)))
+    ctx._non_tensor_indices = non_tensor_indices
+    ctx._non_tensor_values = non_tensor_values
+    ctx._total_args_count = len(args)
+
+
+def _load_args_from_ctx(ctx):
+    """Load and reconstruct mixed tensor/non-tensor arguments from autograd ctx.
+
+    This is the inverse of _save_args_to_ctx. It retrieves tensors from
+    ctx.saved_tensors and merges them with stored non-tensor arguments
+    to reconstruct the original args in their original order.
+
+    Returns:
+        tuple of reconstructed arguments in their original order.
+    """
+    # Get saved tensors and detach them for recomputation
+    tensor_args = ctx.saved_tensors
+
+    def _detach_with_grad(t):
+        requires_grad = t.requires_grad
+        t = t.detach()
+        t.requires_grad_(requires_grad)
+        return t
+
+    tensor_args = tuple(_detach_with_grad(t) for t in tensor_args)
+
+    # Reconstruct full args list by merging tensor and non-tensor arguments
+    total_args_count = ctx._total_args_count
+    non_tensor_indices = ctx._non_tensor_indices
+    non_tensor_values = ctx._non_tensor_values
+
+    inputs = [None] * total_args_count
+    tensor_idx = 0
+    non_tensor_idx = 0
+    for i in range(total_args_count):
+        if non_tensor_idx < len(non_tensor_indices) and non_tensor_indices[non_tensor_idx] == i:
+            inputs[i] = non_tensor_values[non_tensor_idx]
+            non_tensor_idx += 1
+        else:
+            inputs[i] = tensor_args[tensor_idx]
+            tensor_idx += 1
+    return tuple(inputs)
+
+
 class CheckpointWithoutOutputFunction(torch.autograd.Function):
     """
     Checkpoint Function Helper for CheckpointWithouOutput.
@@ -603,27 +668,8 @@ class CheckpointWithoutOutputFunction(torch.autograd.Function):
         with torch.no_grad(), fwd_ctx:
             outputs = run_function(*args)
 
-        # Separate tensor and non-tensor arguments
-        # save_for_backward can only save tensors, so we need to handle non-tensors separately
-        tensor_args = []
-        non_tensor_indices = []
-        non_tensor_values = []
-
-        for i, arg in enumerate(args):
-            if isinstance(arg, torch.Tensor):
-                tensor_args.append(arg)
-            else:
-                # Store non-tensor argument's index and value
-                non_tensor_indices.append(i)
-                non_tensor_values.append(arg)
-
-        # Save tensor arguments via save_for_backward
-        ctx.save_for_backward(*detach_variable(tuple(tensor_args)))
-
-        # Store non-tensor metadata in ctx attributes (not via save_for_backward)
-        ctx.non_tensor_indices = non_tensor_indices
-        ctx.non_tensor_values = non_tensor_values
-        ctx.total_args_count = len(args)
+        # Save tensor and non-tensor arguments into ctx for recomputation
+        _save_args_to_ctx(ctx, args)
 
         # the CheckpointWithoutOutput object is passed in, then it can access the saved input
         # tensors later for recomputation
@@ -654,19 +700,6 @@ class MHCBlockRecomputeManager:
     This is particularly useful for scenarios where multiple checkpoint operations have
     sequential dependencies (i.e., the output of one checkpoint is the input of the next).
 
-    The manager ensures that during backward:
-    1. All checkpoint outputs are discarded to save memory
-    2. Recomputation happens in the correct forward order
-    3. Each checkpoint's output is restored before the next one needs it as input
-
-    Design Philosophy:
-    - This manager is passed into HyperConnectionModule.forward() so that the checkpoint
-      logic is encapsulated within HyperConnection, making TransformerLayer unaware of
-      the detailed checkpoint process.
-    - When manager is None, HyperConnection operates normally without checkpointing.
-    - When manager is provided, HyperConnection wraps its computations with
-      CheckpointWithoutOutput and registers them to the manager.
-
     Usage:
         # In TransformerBlock:
         manager = MHCBlockRecomputeManager()
@@ -681,16 +714,9 @@ class MHCBlockRecomputeManager:
     """
 
     def __init__(self):
-        """Initialize the MHCBlockRecomputeManager."""
         self.checkpoints = []
 
     def add_checkpoint(self, ckpt):
-        """
-        Add a CheckpointWithoutOutput object to the manager.
-
-        Args:
-            ckpt: CheckpointWithoutOutput object that has already called checkpoint()
-        """
         if not isinstance(ckpt, CheckpointWithoutOutput):
             raise TypeError("Expected CheckpointWithoutOutput object")
         if ckpt.outputs is None:
@@ -698,24 +724,6 @@ class MHCBlockRecomputeManager:
         self.checkpoints.append(ckpt)
 
     def discard_all_outputs_and_register_unified_recompute(self, hook_tensor):
-        """
-        Discard all checkpoint outputs and register a unified recompute hook.
-
-        This method:
-        1. Releases the storage of all checkpoint outputs to save memory
-        2. Registers a hook on hook_tensor that will trigger sequential recomputation
-           of all checkpoints when gradients flow back
-
-        Args:
-            hook_tensor: The tensor to register the recompute hook on. This should be
-                        the final output that depends on all checkpointed computations.
-                        Typically this is the loss tensor or a sum of the block output.
-
-        Note:
-            The caller must ensure that:
-            - hook_tensor's gradient is computed before any recomputed tensor is needed
-            - All checkpoint outputs are no longer used in the forward pass after this call
-        """
         # Discard all checkpoint outputs to save memory
         for ckpt in self.checkpoints:
             for output in ckpt.outputs:
@@ -726,17 +734,6 @@ class MHCBlockRecomputeManager:
             hook_tensor.register_hook(self._unified_recompute_hook)
 
     def _unified_recompute_hook(self, grad_output):
-        """
-        Unified recompute hook that recomputes all checkpoints in forward order.
-
-        This hook is triggered during backward pass. It sequentially recomputes each
-        checkpoint, which restores the output tensor storage. Since checkpoints are
-        processed in forward order, each checkpoint's input (which is the previous
-        checkpoint's output) will be available when needed.
-
-        Args:
-            grad_output: The gradient output (passed by PyTorch hook mechanism)
-        """
         for ckpt in self.checkpoints:
             # Call _recompute for each checkpoint in forward order
             # The _recompute method will restore the output tensor storage
@@ -759,14 +756,6 @@ class CheckpointWithoutOutput(object):
 
     Due to the reason above, to save memory with this method, the caller should make sure that the
     discarded output tensors are directly saved in the following modules for backward computation.
-
-    When ckpt_manager is provided:
-    - checkpoint() automatically registers this object to the manager
-    - discard_output_and_register_recompute() only discards output without registering
-      individual recompute hook (manager handles unified hook registration)
-
-    This enables seamless integration with MHCBlockRecomputeManager for block-level
-    recomputation while maintaining backward compatibility with existing code.
     """
 
     def __init__(self, fp8=False, ckpt_manager=None):
@@ -847,42 +836,8 @@ class CheckpointWithoutOutput(object):
                 recompute_ctx = contextlib.nullcontext()
                 fp8_ctx = contextlib.nullcontext()
 
-            # Get tensor inputs from saved_tensors
-            tensor_inputs = self.ctx.saved_tensors
-
-            def detach(t):
-                if isinstance(t, torch.Tensor):
-                    requires_grad = t.requires_grad
-                    t = t.detach()
-                    t.requires_grad_(requires_grad)
-                return t
-
-            tensor_inputs = tuple(detach(t) for t in tensor_inputs)
-
-            # Reconstruct full args list by merging tensor and non-tensor arguments
-            # Non-tensor args are stored in ctx.non_tensor_indices and ctx.non_tensor_values
-            total_args_count = self.ctx.total_args_count
-            non_tensor_indices = self.ctx.non_tensor_indices
-            non_tensor_values = self.ctx.non_tensor_values
-
-            # Build full inputs list
-            inputs = [None] * total_args_count
-            tensor_idx = 0
-            non_tensor_idx = 0
-            for i in range(total_args_count):
-                if (
-                    non_tensor_idx < len(non_tensor_indices)
-                    and non_tensor_indices[non_tensor_idx] == i
-                ):
-                    # This position is a non-tensor argument
-                    inputs[i] = non_tensor_values[non_tensor_idx]
-                    non_tensor_idx += 1
-                else:
-                    # This position is a tensor argument
-                    inputs[i] = tensor_inputs[tensor_idx]
-                    tensor_idx += 1
-
-            inputs = tuple(inputs)
+            # Reconstruct full args list from saved ctx
+            inputs = _load_args_from_ctx(self.ctx)
             with torch.enable_grad(), fp8_ctx, recompute_ctx:
                 outputs = self.run_function(*inputs)
 
@@ -908,10 +863,6 @@ class CheckpointWithoutOutput(object):
         """
         Release the output tensor storages and register the recompute function as a grad hook of
         the hook_tensor.
-
-        If ckpt_manager was provided during initialization, this method is a no-op.
-        The manager will handle both output discarding and unified hook registration
-        via discard_all_outputs_and_register_unified_recompute().
 
         Note: the caller should make sure that the output tensors are no longer used
         in the forward pass and the gradient of the hook_tensor is computed before the recomputed
