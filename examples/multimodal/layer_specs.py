@@ -77,7 +77,7 @@ def get_layer_spec(is_vit, normalization) -> ModuleSpec:
     return ModuleSpec(
         module=TransformerLayer,
         submodules=TransformerLayerSubmodules(
-            input_layernorm=norm,
+            input_layernorm=not_none(norm),
             self_attention=ModuleSpec(
                 module=SelfAttention,
                 params={"attn_mask_type": attn_mask_type},
@@ -90,7 +90,7 @@ def get_layer_spec(is_vit, normalization) -> ModuleSpec:
                 ),
             ),
             self_attn_bda=get_bias_dropout_add,
-            pre_mlp_layernorm=norm,
+            pre_mlp_layernorm=not_none(norm),
             mlp=mlp,
             mlp_bda=get_bias_dropout_add,
         ),
