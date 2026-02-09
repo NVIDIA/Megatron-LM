@@ -3,6 +3,10 @@ from functools import partial
 
 import torch
 
+from examples.multimodal.layer_scaling import (
+    LayerScalingTransformerLayer,
+    get_bias_dropout_add_layer_scaling,
+)
 from megatron.core.tensor_parallel.layers import ColumnParallelLinear, RowParallelLinear
 from megatron.core.transformer.attention import SelfAttention, SelfAttentionSubmodules
 from megatron.core.transformer.dot_product_attention import DotProductAttention
@@ -11,7 +15,7 @@ from megatron.core.transformer.identity_op import IdentityOp
 from megatron.core.transformer.mlp import MLP, MLPSubmodules
 from megatron.core.transformer.spec_utils import ModuleSpec
 from megatron.core.transformer.transformer_layer import TransformerLayer, TransformerLayerSubmodules
-from examples.multimodal.layer_scaling import LayerScalingTransformerLayer, get_bias_dropout_add_layer_scaling
+from megatron.core.typed_torch import not_none
 
 try:
     from megatron.core.extensions.transformer_engine import (
@@ -24,6 +28,13 @@ try:
 
     HAVE_TE = True
 except ImportError:
+    (
+        TEColumnParallelLinear,
+        TEDotProductAttention,
+        TELayerNormColumnParallelLinear,
+        TENorm,
+        TERowParallelLinear,
+    ) = (None, None, None, None, None)
     HAVE_TE = False
 
 try:
@@ -82,7 +93,7 @@ def get_radio_g_layer_spec(normalization) -> ModuleSpec:
     return ModuleSpec(
         module=LayerScalingTransformerLayer,
         submodules=TransformerLayerSubmodules(
-            input_layernorm=norm,
+            input_layernorm=not_none(norm),
             self_attention=ModuleSpec(
                 module=SelfAttention,
                 params={"attn_mask_type": attn_mask_type},
@@ -95,7 +106,7 @@ def get_radio_g_layer_spec(normalization) -> ModuleSpec:
                 ),
             ),
             self_attn_bda=get_bias_dropout_add_layer_scaling,
-            pre_mlp_layernorm=norm,
+            pre_mlp_layernorm=not_none(norm),
             mlp=mlp,
             mlp_bda=get_bias_dropout_add_layer_scaling,
         ),
@@ -113,8 +124,8 @@ def get_radio_g_layer_spec_te() -> ModuleSpec:
                 module=SelfAttention,
                 params={"attn_mask_type": attn_mask_type},
                 submodules=SelfAttentionSubmodules(
-                    linear_qkv=TELayerNormColumnParallelLinear,
-                    core_attention=TEDotProductAttention,
+                    linear_qkv=not_none(TELayerNormColumnParallelLinear),
+                    core_attention=not_none(TEDotProductAttention),
                     linear_proj=TERowParallelLinear,
                     q_layernorm=IdentityOp,
                     k_layernorm=IdentityOp,
