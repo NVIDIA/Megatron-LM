@@ -425,6 +425,9 @@ class DynamicInferenceContext(BaseInferenceContext):
         self.padded_active_request_count = 0
         self.paused_tokens = None
 
+        # Debug: track last 5 steps' dummy forward status
+        self._dummy_forward_history = []
+
         # Block ids.
         self.max_kv_block_count = math.ceil(self.max_sequence_length / self.block_size_tokens)
 
@@ -1176,6 +1179,7 @@ class DynamicInferenceContext(BaseInferenceContext):
         """
         return self.total_request_count - self.paused_request_count - self.num_prefill_requests
 
+
     def initialize_attention_state(
         self, 
         *, 
@@ -1220,16 +1224,29 @@ class DynamicInferenceContext(BaseInferenceContext):
         )
         self._using_cuda_graph_this_step = best_graph is not None
 
+        # Track dummy forward history (last 5 steps)
+        is_dummy_forward = ep_dummy_batch_dimensions is not None
+        self._dummy_forward_history.append({
+            'is_dummy': is_dummy_forward,
+            'ep_dims': str(ep_dummy_batch_dimensions) if is_dummy_forward else None,
+            'active_tokens': self.active_token_count,
+            'total_reqs': self.total_request_count,
+            'using_graph': self._using_cuda_graph_this_step,
+            'best_graph': str(best_graph) if best_graph else None,
+        })
+        if len(self._dummy_forward_history) > 5:
+            self._dummy_forward_history.pop(0)
+
         if self.using_cuda_graph_this_step():
             self.padded_batch_dimensions = best_graph
             if ep_dummy_batch_dimensions is not None:
-                # no requests should exist in the system 
-                # we will only have padding tokens 
-                # and dummy block idxes.
-                assert not self.active_token_count
-                assert not self.paused_request_count
                 self.total_request_count = ep_dummy_batch_dimensions.prefill_req_count + \
                     ep_dummy_batch_dimensions.decode_req_count
+                # Zero out request_query_lengths to prevent stale data from causing
+                # out of bounds memory accesses in last_token_logits. 
+                # When we move finished requests to the right, we never 
+                # zero out their request lengths.
+                self.request_query_lengths[0:self.total_request_count].fill_(0)
         else:
             if ep_dummy_batch_dimensions is not None:
                 return 
@@ -1423,13 +1440,21 @@ class DynamicInferenceContext(BaseInferenceContext):
 
         # Last token logits.
         logits = logits.squeeze(0)
-        last_token_idxs = (
-            torch.cumsum(
-                self.request_query_lengths[self.paused_request_count : self.total_request_count],
-                dim=0,
-            )
-            - 1
-        )
+        query_lengths_slice = self.request_query_lengths[self.paused_request_count : self.total_request_count]
+        last_token_idxs = torch.cumsum(query_lengths_slice, dim=0) - 1
+        
+        # Debug check for OOB
+        max_idx = last_token_idxs.max().item() if last_token_idxs.numel() > 0 else -1
+        if max_idx >= logits.shape[0]:
+            print(f"OOB ERROR: max_idx={max_idx}, logits_dim={logits.shape[0]}")
+            print(f"query_lengths={query_lengths_slice}")
+            print(f"paused={self.paused_request_count}, total={self.total_request_count}")
+            print(f"active_token_count={self.active_token_count}, padded={self.padded_active_token_count}")
+            print(f"Dummy forward history (last 5 steps):")
+            for i, h in enumerate(self._dummy_forward_history):
+                print(f"  Step -{len(self._dummy_forward_history)-i}: {h}")
+            raise RuntimeError(f"last_token_logits OOB: max_idx={max_idx} >= logits_dim={logits.shape[0]}")
+        
         last_token_logits = logits[last_token_idxs, :]
 
         return last_token_logits

@@ -786,8 +786,12 @@ class TextGenerationController:
     def dummy_forward(self):
         """Perform a dummy forward pass. This is used in expert model parallelism
         on ranks that do not have any real requests."""
-
+        
         context = self.inference_wrapped_model.inference_context
+        # no requests should exist in the system 
+        # we will only have padding tokens 
+        # and dummy block idxes.
+        # context.reset() 
         # if no cuda graphs, directly use dummy forward
         if not context.cuda_graph_batch_dimensions_list:
             # initialize symmetric memory if needed
