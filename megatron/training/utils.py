@@ -623,12 +623,18 @@ def get_batch_on_this_tp_rank(data_iterator, mtp_on_this_rank: bool = False):
         _broadcast(batch['max_seqlen'])
 
     else:
-        if args.hybrid_context_parallel:
+        if args.chunked_pipeline_model_parallel_splits > 1:
+            data_iterator.mock_next(args.seq_length)
+            cached_prefix_params = data_iterator.get_current_cached_prefix_params()
+            seq_len = cached_prefix_params.this_chunk_seqlen
+            shape = (args.micro_batch_size, seq_len)
+        elif args.hybrid_context_parallel:
             seq_len = torch.tensor(0, dtype=torch.int32, device=torch.cuda.current_device())
             _broadcast(seq_len)
             shape = (seq_len.item())
         else:
-            shape = (args.micro_batch_size, args.seq_length)
+            seq_len = args.seq_length
+            shape = (args.micro_batch_size, seq_len)
             
         tokens = torch.empty(
             shape,
@@ -646,7 +652,7 @@ def get_batch_on_this_tp_rank(data_iterator, mtp_on_this_rank: bool = False):
             device=torch.cuda.current_device(),
         )
         if args.create_attention_mask_in_dataloader:
-            shape_attention_mask = (args.micro_batch_size, 1, args.seq_length, args.seq_length) if not args.hybrid_context_parallel else (1, 1, shape[0], shape[0])
+            shape_attention_mask = (args.micro_batch_size, 1, seq_len, seq_len) if not args.hybrid_context_parallel else (1, 1, shape[0], shape[0])
             attention_mask = torch.empty(
                 shape_attention_mask,
                 dtype=torch.bool,
