@@ -170,7 +170,8 @@ def validate_uneven_dtensor(dtensor: DTensor) -> None:
         f"Sizes: {chunk_meta.sizes}, "
         f"Global shape: {dtensor.shape}, "
         f"Local shape: {dtensor.to_local().shape}, "
-        f"Device mesh: {dtensor.device_mesh}."
+        f"Device mesh: {dtensor.device_mesh}, "
+        f"Placements: {dtensor.placements}."
     )
 
     # Check that all boundaries (start and end) are touched.

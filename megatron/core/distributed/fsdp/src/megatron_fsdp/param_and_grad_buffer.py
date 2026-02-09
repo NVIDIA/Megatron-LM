@@ -2201,7 +2201,11 @@ class ParamAndGradBuffer:
                     buffer_size[group.main_grad_buffer.dtype] -= group.main_grad_buffer.data_size
                     buffer_size[group.main_grad_buffer.dtype] += group.hsdp_gbuf.data_size
 
-        reset_context_args = {"init_param_with_fp8": self.ddp_config.fp8_param_gather}
+        reset_context_args = dict(
+            init_te_fp8_fp4_param_with_bf16=(
+                self.ddp_config.fp8_param_gather or self.ddp_config.fp4_param_gather
+            )
+        )
         module_reset_flag = {}
         if self.reset_parameters_for_meta_device_init_module:
             self.param_to_direct_module = {}
@@ -3881,13 +3885,22 @@ class ResetParametersContext:
     Context manager for resetting parameters for meta device initialization module.
     """
 
-    def __init__(self, init_param_with_fp8=False, with_cuda_rng_tracker=False):
-        self.init_param_with_fp8 = init_param_with_fp8
+    def __init__(
+        self,
+        module,
+        init_te_fp8_fp4_param_with_bf16=False,
+        with_cuda_rng_tracker=False,
+    ):
+        self.module = module
+        self.init_te_fp8_fp4_param_with_bf16 = init_te_fp8_fp4_param_with_bf16
         self.with_cuda_rng_tracker = with_cuda_rng_tracker
 
     def __enter__(self):
         self.stack = ExitStack()
-        if self.init_param_with_fp8:
+        te_quantization_context = nullcontext()
+        if hasattr(self.module, "_te_quantization_context"):
+            te_quantization_context = self.module._te_quantization_context
+        elif self.init_te_fp8_fp4_param_with_bf16:
             # FIXME(@cspades): This appears to be a legacy dependency that is not needed for
             # more recent versions of TransformerEngine, which only requires this context during
             # TransformerEngineBaseModule.__init__. Should be removed if backwards compatibility
@@ -3907,7 +3920,8 @@ class ResetParametersContext:
                 ):
                     # Required for Megatron-FSDP + FP8 parameters.
                     args["preserve_high_precision_init_val"] = True
-                self.stack.enter_context(te_quantized_model_init_cls(**args))
+                te_quantization_context = te_quantized_model_init_cls(**args)
+        self.stack.enter_context(te_quantization_context)
 
         if self.with_cuda_rng_tracker:
             # Megatron / TE RNG tracker needs to be initialized and seeded by the user or FW
