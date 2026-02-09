@@ -49,6 +49,7 @@ Megatron Core installation offers support for two NGC PyTorch containers:
 
 Both containers can be combined with `mlm`, which adds package dependencies for Megatron-LM on top of Megatron Core.
 
+**Important:** The `megatron-core` pip package only includes the `megatron.core` module. The `[mlm]` extra adds dependencies (flask-restful, sentencepiece, tiktoken, wandb, transformers) but does **not** include the `megatron.training` or `megatron.legacy` modules. To use training scripts, see [Running Training Scripts](#running-training-scripts) below.
 
 1. Install the latest release dependencies
 
@@ -84,4 +85,24 @@ Both containers can be combined with `mlm`, which adds package dependencies for 
         ```bash
         pip install megatron-core
         ```
+
+## Running Training Scripts
+
+The `megatron-core` pip package only includes the `megatron.core` module. To run training scripts that use `megatron.training` or `megatron.legacy`, you need to clone the repository and set your Python path:
+
+```bash
+# Clone the repository
+git clone https://github.com/NVIDIA/Megatron-LM.git
+cd Megatron-LM
+
+# Install megatron-core with MLM dependencies
+pip install "setuptools<80.0.0,>=77.0.0" "packaging>=24.2"
+pip install --no-build-isolation .[mlm,dev]
+
+# Set PYTHONPATH to include the repository root
+export PYTHONPATH="${PWD}:${PYTHONPATH}"
+
+# Now you can run training scripts
+python examples/gpt3/train_gpt3.py ...
+```
 
