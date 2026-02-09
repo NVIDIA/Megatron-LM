@@ -45,11 +45,6 @@ def get_megatron_emerging_optimizer(
             Defaults to False.
     """
     eopt_name = copy(config.optimizer)
-    if eopt_name == 'muon':
-        eopt_cls = TensorParallelMuon
-    else:
-        raise ValueError(f"Unsupported emerging optimizer: {eopt_name}")
-
     # FIXME(skyw): Confirm whether we still need this hack with MuonOptimizerConfig
     config.optimizer = 'adam'
 
@@ -71,7 +66,7 @@ def get_megatron_emerging_optimizer(
     # For other emerging optimizers, need to implement init_state_fn as well
     # TODO(boxiangw): Improve usability after optimizer refactor
     # TODO(boxiangw): support precision aware optimizer
-    def eopt_init_state_fn(opt, config=None):
+    def muon_init_state_fn(opt, config=None):
         for group in opt.param_groups:
             for p in group['params']:
                 if len(opt.state[p]) == 0:
@@ -86,6 +81,12 @@ def get_megatron_emerging_optimizer(
                         opt.state[p]['exp_avg_sq'] = torch.zeros_like(p.data)
                     else:
                         opt.initialize_state(p)
+
+    if eopt_name == 'muon':
+        eopt_cls = TensorParallelMuon
+        eopt_init_state_fn = muon_init_state_fn
+    else:
+        raise ValueError(f"Unsupported emerging optimizer: {eopt_name}")
 
     optimizers = []
     # record list of non/linear params
