@@ -363,7 +363,10 @@ class DynamicInferenceContext(BaseInferenceContext):
                 self.unified_memory_level = 0
         # If CUDA graphs persist and KV cache memory address is not static, we need
         # either UVM or torch_memory_saver to maintain memory address stability for CGs.
-        if self.persist_cuda_graphs and self.kv_cache_management_mode != KVCacheManagementMode.PERSIST:
+        if (
+            self.persist_cuda_graphs
+            and self.kv_cache_management_mode != KVCacheManagementMode.PERSIST
+        ):
             assert HAVE_TORCH_MEMORY_SAVER or self.unified_memory_level != 0, (
                 "Persisting CUDA graphs requires static KV cache memory. "
                 "Use --rl-kv-cache-management-mode=persist, UVM, or install torch_memory_saver."
