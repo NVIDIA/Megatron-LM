@@ -7,6 +7,7 @@ from argparse import Namespace
 import torch.distributed as dist
 from pydantic import PrivateAttr
 
+from megatron.core.inference.config import KVCacheManagementMode
 from megatron.core.inference.contexts.dynamic_context import DynamicInferenceContext
 from megatron.core.inference.engines.abstract_engine import AbstractEngine
 from megatron.core.inference.engines.dynamic_engine import DynamicInferenceEngine
@@ -74,7 +75,7 @@ class MegatronLocal(InferenceServer, ReturnsTokens, ReturnsRaw):
 
     _client: InferenceClient = PrivateAttr(None)
     _inference_engine: DynamicInferenceEngine = PrivateAttr(None)
-    _rl_kv_cache_management_mode: str
+    _rl_kv_cache_management_mode: KVCacheManagementMode
 
     async def base_generate(self, request: InferenceRequest):
 
@@ -148,7 +149,9 @@ class MegatronLocal(InferenceServer, ReturnsTokens, ReturnsRaw):
         launched_server = cls(**kwargs)
         launched_server._client = client
         launched_server._inference_engine = inference_engine
-        launched_server._rl_kv_cache_management_mode = args.rl_kv_cache_management_mode
+        launched_server._rl_kv_cache_management_mode = KVCacheManagementMode(
+            args.rl_kv_cache_management_mode
+        )
 
         return launched_server
 
@@ -169,7 +172,7 @@ class MegatronLocal(InferenceServer, ReturnsTokens, ReturnsRaw):
         Called before resume when using partial rollouts with KV cache removal,
         so the engine knows to recompute the KV cache for all in-flight requests.
         """
-        if self._rl_kv_cache_management_mode == "remove":
+        if self._rl_kv_cache_management_mode == KVCacheManagementMode.REMOVE:
             for request_entry in self._inference_engine.requests.values():
                 request_entry.recompute_upon_suspend = True
 

@@ -15,7 +15,7 @@ from megatron.core.inference.batch_dimensions_utils import (
     CUDAGraphBatchDimensionBuilder,
     InferenceBatchDimensions,
 )
-from megatron.core.inference.config import InferenceConfig
+from megatron.core.inference.config import InferenceConfig, KVCacheManagementMode
 from megatron.core.inference.inference_request import DynamicInferenceRequest
 from megatron.core.inference.sampling_params import SamplingParams
 from megatron.core.inference.unified_memory import (
@@ -349,15 +349,10 @@ class DynamicInferenceContext(BaseInferenceContext):
 
         # Unified memory and general tensor management.
         self.unified_memory_level = inference_config.unified_memory_level
-        self.reset_cuda_graphs = inference_config.reset_cuda_graphs
+        self.persist_cuda_graphs = inference_config.persist_cuda_graphs
         self.kv_cache_management_mode = inference_config.kv_cache_management_mode
-        # KV cache management mode: "persist", "offload", or "remove"
-        assert self.kv_cache_management_mode in ("persist", "offload", "remove"), (
-            f"Invalid kv_cache_management_mode: {kv_cache_management_mode}. "
-            "Options are `persist`, `offload`, `remove`."
-        )
 
-        if unified_memory_level != 0:
+        if self.unified_memory_level != 0:
             try:
                 self.unified_memory_mempool = create_unified_mempool()
             except UnifiedMemoryUnsupportedError:
@@ -366,11 +361,11 @@ class DynamicInferenceContext(BaseInferenceContext):
                         "Unified memory requested but not available; defaulting to GPU memory."
                     )
                 self.unified_memory_level = 0
-        # If CUDA graphs are not reset and KV cache memory address is not static, we need
+        # If CUDA graphs persist and KV cache memory address is not static, we need
         # either UVM or torch_memory_saver to maintain memory address stability for CGs.
-        if not self.reset_cuda_graphs and self.kv_cache_management_mode != "persist":
+        if self.persist_cuda_graphs and self.kv_cache_management_mode != KVCacheManagementMode.PERSIST:
             assert HAVE_TORCH_MEMORY_SAVER or self.unified_memory_level != 0, (
-                "Not resetting CUDA graphs requires static KV cache memory. "
+                "Persisting CUDA graphs requires static KV cache memory. "
                 "Use --rl-kv-cache-management-mode=persist, UVM, or install torch_memory_saver."
             )
 
@@ -379,6 +374,7 @@ class DynamicInferenceContext(BaseInferenceContext):
         self._offloadable_tensor_names: list[str] = []
         self._offloadable_cpu_backups: dict[str, torch.Tensor] = {}
         self._offloadable_storage_sizes: dict[str, int] = {}
+        self._uses_torch_memory_saver: bool = False
 
         # Initialize block allocator.
         buffer_size_bytes = int(inference_config.buffer_size_gb * 1024**3)
@@ -539,14 +535,14 @@ class DynamicInferenceContext(BaseInferenceContext):
         NOTE: This currently tracks the KV cache and mamba states, as they are the largest tensors.
         TODO: Benchmark the benefits of tracking additional tensors.
         """
-        initial_attrs = vars(self).keys()
+        initial_attrs = set(vars(self).keys())
         yield
-        new_tensors = {x for x in vars(self).keys() - initial_attrs if isinstance(x, str)}
-        for tensor_name in new_tensors:
-            self._offloadable_tensor_names.append(tensor_name)
-            self._offloadable_cpu_backups[tensor_name] = torch.empty_like(
-                getattr(self, tensor_name), device="cpu"
-            ).pin_memory()
+        for name in vars(self).keys() - initial_attrs:
+            if isinstance(getattr(self, name), torch.Tensor):
+                self._offloadable_tensor_names.append(name)
+                self._offloadable_cpu_backups[name] = torch.empty_like(
+                    getattr(self, name), device="cpu"
+                ).pin_memory()
 
     def allocate_all_tensors(self, *, is_init: bool) -> None:
         """Allocate GPU state.
@@ -567,19 +563,19 @@ class DynamicInferenceContext(BaseInferenceContext):
         if not is_init:
             if self.unified_memory_level != 0:
                 return
-            if len(self._offloadable_tensor_names) > 1:
+            if self._uses_torch_memory_saver:
                 torch_memory_saver.restore_region(tag="inference_context")
                 return
-            # If we offloaded tensors, restore them before allocating other tensors
-            if self.kv_cache_management_mode == "offload":
-                for tensor:= getattr(self, name) for name in self._offloadable_tensor_names:
+            # If we offloaded tensors manually, restore them before allocating other tensors.
+            if self.kv_cache_management_mode == KVCacheManagementMode.OFFLOAD:
+                for name, tensor in ((n, getattr(self, n)) for n in self._offloadable_tensor_names):
                     tensor.storage().resize_(self._offloadable_storage_sizes[name])
                     tensor.copy_(self._offloadable_cpu_backups[name], non_blocking=True)
 
         # Validate no tensors allocated prior to this method.
         for key in vars(self).keys():
             # Skip offloaded tensors.
-            if not is_init and self.kv_cache_management_mode == "offload":
+            if not is_init and self.kv_cache_management_mode == KVCacheManagementMode.OFFLOAD:
                 if key in self._offloadable_tensor_names:
                     continue
             value = getattr(self, key)
@@ -681,9 +677,12 @@ class DynamicInferenceContext(BaseInferenceContext):
                 self.mamba_metadata = None
 
         # Allocate large non-graphed buffers.
-        need_static_addr = not self.reset_cuda_graphs and self.kv_cache_management_mode != "persist"
-        offload_kv = self.kv_cache_management_mode == "offload"
-        remove_kv = self.kv_cache_management_mode == "remove"
+        need_static_addr = (
+            self.persist_cuda_graphs
+            and self.kv_cache_management_mode != KVCacheManagementMode.PERSIST
+        )
+        offload_kv = self.kv_cache_management_mode == KVCacheManagementMode.OFFLOAD
+        remove_kv = self.kv_cache_management_mode == KVCacheManagementMode.REMOVE
 
         ctx_manager = nullcontext()
         if self.unified_memory_level != 0:
@@ -692,6 +691,8 @@ class DynamicInferenceContext(BaseInferenceContext):
             ctx_manager = torch_memory_saver.region(
                 tag="inference_context", enable_cpu_backup=offload_kv
             )
+            if is_init:
+                self._uses_torch_memory_saver = True
         elif offload_kv:
             ctx_manager = self._track_offloadable_tensors()
         with ctx_manager:
@@ -716,20 +717,20 @@ class DynamicInferenceContext(BaseInferenceContext):
         # UVM and `torch_memory_saver` do not require explicit deallocation.
         if self.unified_memory_level != 0:
             return
-        if len(self._offloadable_tensor_names) > 1:
+        if self._uses_torch_memory_saver:
             torch_memory_saver.backup_region(tag="inference_context")
             return
 
         # Explicitly deallocate tensors and offload them.
-        if self.kv_cache_management_mode == "offload":
-            for tensor := getattr(self, name) for name in self._offloadable_tensor_names:
+        if self.kv_cache_management_mode == KVCacheManagementMode.OFFLOAD:
+            for name, tensor in ((n, getattr(self, n)) for n in self._offloadable_tensor_names):
                 self._offloadable_storage_sizes[name] = tensor.storage().size()
                 self._offloadable_cpu_backups[name].copy_(tensor, non_blocking=True)
                 tensor.storage().resize_(0)
 
         # Explicitly deallocate tensors and delete them.
         # TODO(@lmcafee): check that device == 'cuda'?
-        if self.kv_cache_management_mode == "remove":
+        if self.kv_cache_management_mode == KVCacheManagementMode.REMOVE:
             for key in list(vars(self).keys()):
                 value = getattr(self, key)
                 if isinstance(value, torch.Tensor):

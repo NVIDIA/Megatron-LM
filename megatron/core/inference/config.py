@@ -1,6 +1,7 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
 from dataclasses import dataclass
+from enum import Enum
 from typing import List, Optional, Tuple
 
 import torch
@@ -49,6 +50,19 @@ class MambaInferenceStateConfig:
                 mamba_ssm_states_shape=mamba_ssm_states_shape,
             )
         return None
+
+
+class KVCacheManagementMode(str, Enum):
+    """Mode for handling large tensors (KV cache, Mamba states) during suspend/resume."""
+
+    PERSIST = "persist"
+    """Do not deallocate and reallocate large tensors; keep them on GPU."""
+
+    OFFLOAD = "offload"
+    """Offload large tensors to CPU during deallocation; onload during allocation."""
+
+    REMOVE = "remove"
+    """Entirely remove large tensors during deallocation; reinitialize during allocation."""
 
 
 @dataclass
@@ -102,13 +116,10 @@ class InferenceConfig:
     Eventually, additional levels will be included to control other tensors within the context.
     """
 
-    kv_cache_management_mode: str = "persist"
+    kv_cache_management_mode: KVCacheManagementMode = KVCacheManagementMode.PERSIST
     """
     Mode used to determine how large tensors are handled by the allocate and deallocate methods.
-    Options are:
-        - "persist": do not deallocate and reallocate large tensors; keep them on GPU.
-        - "offload": offload large tensors to CPU during dellocation; onload during allocation.
-        - "remove": deallocate large tensors during dellocation; reallocate during allocation.
+    See `KVCacheManagementMode` for options.
     """
 
     # =================================
@@ -130,10 +141,10 @@ class InferenceConfig:
     Whether to use CUDA graphs for non-decode steps.
     """
 
-    reset_cuda_graphs: bool = False
+    persist_cuda_graphs: bool = True
     """
-    Whether to reset CUDA graphs when the engine is suspended.
-    If True, CUDA graphs are deleted on `suspend()` and re-captured on `resume()`.
+    Whether to persist CUDA graphs when the engine is suspended.
+    If False, CUDA graphs are deleted on `suspend()` and re-captured on `resume()`.
     """
 
     # =================================

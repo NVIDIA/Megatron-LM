@@ -177,7 +177,7 @@ class DynamicInferenceEngine(AbstractEngine):
         self.metrics_writer = inference_config.metrics_writer
         self.logging_step_interval = inference_config.logging_step_interval
         self.unified_memory_level = inference_config.unified_memory_level
-        self.reset_cuda_graphs = inference_config.reset_cuda_graphs
+        self.persist_cuda_graphs = inference_config.persist_cuda_graphs
         self.materialize_only_last_token_logits = (
             inference_config.materialize_only_last_token_logits
         )
@@ -601,7 +601,7 @@ class DynamicInferenceEngine(AbstractEngine):
             self.context.deallocate_all_tensors()
             torch.cuda.synchronize()
 
-        if self.reset_cuda_graphs:
+        if not self.persist_cuda_graphs:
             delete_cuda_graphs()
 
         # Maintain references to requests before reset.
@@ -640,7 +640,7 @@ class DynamicInferenceEngine(AbstractEngine):
             self.context.reset()
 
             capture_time = time.time()
-            if self.reset_cuda_graphs:
+            if not self.persist_cuda_graphs:
                 self.create_cuda_graphs()
             capture_time = time.time() - capture_time
 

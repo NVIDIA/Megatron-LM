@@ -14,7 +14,11 @@ from tqdm import tqdm
 from transformer_engine.pytorch.fp8 import check_fp8_support
 
 from megatron.core import parallel_state
-from megatron.core.inference.config import InferenceConfig, MambaInferenceStateConfig
+from megatron.core.inference.config import (
+    InferenceConfig,
+    KVCacheManagementMode,
+    MambaInferenceStateConfig,
+)
 from megatron.core.inference.contexts.dynamic_context import (
     ActiveRequestCountOverflowError,
     BlockOverflowError,
@@ -120,7 +124,7 @@ class DynamicEngineTestConfig:
     # context attributes are set correctly.
     suspend_resume_interval: Optional[int] = None
     kv_cache_management_mode: str = "persist"
-    reset_cuda_graphs: bool = False
+    persist_cuda_graphs: bool = True
 
     fp8: bool = False
 
@@ -236,8 +240,8 @@ class TestDynamicInferenceEngine:
                 max_tokens=test_config.context_max_tokens,
                 mamba_inference_state_config=mamba_inference_state_config,
                 materialize_only_last_token_logits=test_config.materialize_only_last_token_logits,
-                kv_cache_management_mode=test_config.kv_cache_management_mode,
-                reset_cuda_graphs=test_config.reset_cuda_graphs,
+                kv_cache_management_mode=KVCacheManagementMode(test_config.kv_cache_management_mode),
+                persist_cuda_graphs=test_config.persist_cuda_graphs,
                 use_flashinfer_fused_rope=None,  # default to using flash-infer if available
                 # this is for compatibility with the LTS environment
                 unified_memory_level=0,  # unit tests currently broken with UVM
@@ -1375,16 +1379,16 @@ class TestDynamicInferenceEngine:
     @pytest.mark.skipif(
         not is_fa_min_version("2.7.3"), reason="need latest flash attn for dynamic batching"
     )
-    @pytest.mark.parametrize("reset_cuda_graphs", [False, True])
+    @pytest.mark.parametrize("persist_cuda_graphs", [True, False])
     @pytest.mark.parametrize("kv_cache_management_mode", ["persist", "offload", "remove"])
     @torch.inference_mode()
-    def test_suspend_resume_cycle(self, kv_cache_management_mode, reset_cuda_graphs):
-        """Full suspend → resume cycle with memory, data, and address checks."""
-        needs_tms = not reset_cuda_graphs and kv_cache_management_mode != "persist"
+    def test_suspend_resume_cycle(self, kv_cache_management_mode, persist_cuda_graphs):
+        """Full suspend -> resume cycle with memory, data, and address checks."""
+        needs_tms = persist_cuda_graphs and kv_cache_management_mode != "persist"
 
         test_config = DynamicEngineTestConfig(
             kv_cache_management_mode=kv_cache_management_mode,
-            reset_cuda_graphs=reset_cuda_graphs,
+            persist_cuda_graphs=persist_cuda_graphs,
         )
 
         # Without TMS, these combos must assert on construction.
@@ -1457,10 +1461,10 @@ class TestDynamicInferenceEngine:
                 msg="memory_buffer data must be identical after suspend/resume",
             )
 
-        # Address stability when CUDA graphs are not reset.
-        if not reset_cuda_graphs:
+        # Address stability when CUDA graphs persist.
+        if persist_cuda_graphs:
             addr_after = context.memory_buffer.data_ptr()
             assert addr_before == addr_after, (
-                f"Tensor address must be stable when CUDA graphs are not reset. "
+                f"Tensor address must be stable when CUDA graphs persist. "
                 f"Before: {addr_before:#x}, After: {addr_after:#x}"
             )

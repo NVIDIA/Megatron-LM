@@ -330,18 +330,22 @@ def validate_args(args, defaults={}):
     if args.perform_rl_step:
         # CUDA graph and KV cache handling support matrix is as follows:
         # ------------------------------------------------
-        # Resetting CGs only makes sense if we build any CGs
-        assert not args.rl_reset_cuda_graphs or args.cuda_graph_impl != "none", (
-            "--rl-reset-cuda-graphs is set but no CUDA graphs are being built."
+        # Persisting CGs only makes sense if we build any CGs.
+        assert not args.rl_persist_cuda_graphs or args.cuda_graph_impl != "none", (
+            "--rl-persist-cuda-graphs is set but no CUDA graphs are being built."
         )
-        # If CUDA graphs are not reset but KV cache memory address is not static, we need
+        # Training CGs only makes sense if we build any CGs.
+        assert not args.rl_training_cuda_graphs or args.cuda_graph_impl != "none", (
+            "--rl-training-cuda-graphs is set but no CUDA graphs are being built."
+        )
+        # If CUDA graphs persist and KV cache memory address is not static, we need
         # either UVM or torch_memory_saver to maintain memory address stability for CGs.
-        if not args.rl_reset_cuda_graphs and args.rl_kv_cache_management_mode != "persist":
+        if args.rl_persist_cuda_graphs and args.rl_kv_cache_management_mode != "persist":
             try:
                 from torch_memory_saver import torch_memory_saver
             except ImportError:
                 assert args.inference_dynamic_batching_unified_memory_level > 0, (
-                    "Choosing to not reset CUDA graphs requires static KV cache memory. Use "
+                    "Persisting CUDA graphs requires static KV cache memory. Use "
                     "--rl-kv-cache-management-mode=persist, UVM, or install torch_memory_saver."
                 )
 
@@ -360,10 +364,9 @@ def validate_args(args, defaults={}):
         #      if we want to graph inference but not training.
         #      This has to be done on an abstraction layer above the inference loop.
         #    ** This is controlled by `--rl-training-cuda-graphs`.
-        #    ** NOTE: This functionality is currently disabled and needs to be revived.
         #  - The engine - not the RL loop! - deletes and creates cuda graphs.
         #      This has to be done on the abstraction layer of inference.
-        #    ** This is controlled by `--rl-reset-cuda-graphs`.
+        #    ** This is controlled by `--rl-persist-cuda-graphs`.
         #  - The context ensures that the CGs still point to the correct memory addresses.
         #    ** This is attempted through UVM if enabled, otherwise through `torch_memory_saver`.
         #
@@ -2049,8 +2052,12 @@ def _add_rl_args(parser):
                             'persist: leave KV cache in GPU memory (default), '
                             'offload: offload KV cache to CPU during training, '
                             'remove: delete and reallocate KV cache each training/inference cycle')
-    group.add_argument('--rl-reset-cuda-graphs', action=argparse.BooleanOptionalAction, type=bool, default=False,
-                       help='Reset CUDA graphs between inference/training to save GPU memory')
+    group.add_argument('--rl-persist-cuda-graphs', action=argparse.BooleanOptionalAction, type=bool, default=True,
+                       help='Persist CUDA graphs when the inference engine is suspended. '
+                            'If False, CUDA graphs are deleted on suspend and re-captured on resume.')
+    group.add_argument('--rl-training-cuda-graphs', action=argparse.BooleanOptionalAction, type=bool,
+                       default=False,
+                       help='If set, do not toggle CUDA graphs on/off between inference and training phases.')
     group.add_argument('--rl-partial-rollouts', action=argparse.BooleanOptionalAction, default=False,
                        help='If set, use partial rollouts.')
     group.add_argument('--rl-inference-logprobs-is-correction', action=argparse.BooleanOptionalAction, type=bool, default=False,
