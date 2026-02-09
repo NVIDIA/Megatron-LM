@@ -331,8 +331,7 @@ def validate_args(args, defaults={}):
         # CUDA graph and KV cache handling support matrix is as follows:
         # ------------------------------------------------
         # Resetting CGs only makes sense if we build any CGs
-        has_cg = args.cuda_graph_impl != "none" or args.rl_training_cuda_graphs
-        assert not args.rl_reset_cuda_graphs or has_cg, (
+        assert not args.rl_reset_cuda_graphs or args.cuda_graph_impl != "none", (
             "--rl-reset-cuda-graphs is set but no CUDA graphs are being built."
         )
         # If CUDA graphs are not reset but KV cache memory address is not static, we need
@@ -356,13 +355,14 @@ def validate_args(args, defaults={}):
         #  - The inference engine's init builds inference CGs, if desired.
         #    ** This is controlled by `--cuda-graph-impl`.
         #  - Training is graphed on the first training step, if desired.
-        #    ** This is controlled by `--rl-training-cuda-graphs`.
+        #    ** This is also controlled by `--cuda-graph-impl`.
         #  - `megatron_rl_inference_mode` inside rl_utils toggles CGs on/off
-        #      if inference is graphed but training is not.
-        #      This has to be done on an abstraction layer above training/inference.
-        #    ** This is controlled by `--cuda-graph-impl` and `--rl-training-cuda-graphs`.
+        #      if we want to graph inference but not training.
+        #      This has to be done on an abstraction layer above the inference loop.
+        #    ** This is controlled by `--rl-training-cuda-graphs`.
+        #    ** NOTE: This functionality is currently disabled and needs to be revived.
         #  - The engine - not the RL loop! - deletes and creates cuda graphs.
-        #      This has to be done at the abstraction layer of inference.
+        #      This has to be done on the abstraction layer of inference.
         #    ** This is controlled by `--rl-reset-cuda-graphs`.
         #  - The context ensures that the CGs still point to the correct memory addresses.
         #    ** This is attempted through UVM if enabled, otherwise through `torch_memory_saver`.
@@ -2051,9 +2051,6 @@ def _add_rl_args(parser):
                             'remove: delete and reallocate KV cache each training/inference cycle')
     group.add_argument('--rl-reset-cuda-graphs', action=argparse.BooleanOptionalAction, type=bool, default=False,
                        help='Reset CUDA graphs between inference/training to save GPU memory')
-    group.add_argument('--rl-training-cuda-graphs', action=argparse.BooleanOptionalAction, type=bool,
-                       default=False,
-                       help='Enables training CUDA graphs when switching from inference to training inside the RL loop.')
     group.add_argument('--rl-partial-rollouts', action=argparse.BooleanOptionalAction, default=False,
                        help='If set, use partial rollouts.')
     group.add_argument('--rl-inference-logprobs-is-correction', action=argparse.BooleanOptionalAction, type=bool, default=False,

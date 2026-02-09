@@ -1139,7 +1139,7 @@ def prepare_data_for_update(
     nvtx_range = get_nvtx_range()
     runtime_state = get_rl_runtime_state()
 
-    if args.cuda_graph_impl != "none" and not args.rl_reset_cuda_graphs:
+    if args.rl_reset_cuda_graphs:
         lang_module = (
             model[0].module.module if hasattr(model[0].module, "module") else model[0].module
         )
@@ -1728,7 +1728,7 @@ def megatron_rl_inference_mode(
                     )
                 optimizer.offload_to_cpu()
 
-        if cuda_graph_impl != "none" and not reset_cuda_graphs:
+        if reset_cuda_graphs:
             toggle_cuda_graphs(lang_module, cuda_graph_impl)
 
         inference_interface = get_inference_interface(loop, model)
@@ -1752,7 +1752,7 @@ def megatron_rl_inference_mode(
         with nvtx_range("suspend-engine"):
             loop.run_until_complete(inference_interface.suspend())
 
-        if cuda_graph_impl != "none" and not reset_cuda_graphs:
+        if reset_cuda_graphs:
             toggle_cuda_graphs(lang_module, 'none')
 
         # If this is a separate RL inference model, prefetch weights back to CPU so they

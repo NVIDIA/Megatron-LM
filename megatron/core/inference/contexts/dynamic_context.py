@@ -536,7 +536,7 @@ class DynamicInferenceContext(BaseInferenceContext):
     def _track_offloadable_tensors(self):
         """Context manager that tracks tensors allocated within it for later offload/restore.
 
-        NOTE: This current tracks the KV cache and mamba states, as they are the largest tensors.
+        NOTE: This currently tracks the KV cache and mamba states, as they are the largest tensors.
         TODO: Benchmark the benefits of tracking additional tensors.
         """
         initial_attrs = vars(self).keys()
