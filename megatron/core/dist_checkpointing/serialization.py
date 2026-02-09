@@ -34,7 +34,6 @@ from .strategies.base import (
     AsyncSaveShardedStrategy,
 )
 from .strategies.common import load_common, save_common
-from .strategies.fully_parallel import FullyParallelSaveStrategyWrapper
 from .strategies.torch import TorchDistLoadShardedStrategy, TorchDistSaveShardedStrategy
 from .utils import extract_sharded_base, force_all_tensors_to_non_fp8
 from .validation import (
@@ -349,6 +348,8 @@ def save(
             async request that should be scheduled by the caller of this function.
             None otherwise.
     """
+    from .strategies.fully_parallel import FullyParallelSaveStrategyWrapper
+
     if torch.distributed.get_rank() == 0:
         if MultiStorageClientFeature.is_enabled():
             msc = MultiStorageClientFeature.import_package()
