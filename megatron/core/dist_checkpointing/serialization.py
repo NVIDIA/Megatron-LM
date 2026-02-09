@@ -34,6 +34,7 @@ from .strategies.base import (
     AsyncSaveShardedStrategy,
 )
 from .strategies.common import load_common, save_common
+from .strategies.fully_parallel import FullyParallelSaveStrategyWrapper
 from .strategies.torch import TorchDistLoadShardedStrategy, TorchDistSaveShardedStrategy
 from .utils import extract_sharded_base, force_all_tensors_to_non_fp8
 from .validation import (
@@ -365,9 +366,9 @@ def save(
 
     if sharded_strategy is None:
         sharded_strategy = TorchDistSaveShardedStrategy()
-    assert isinstance(sharded_strategy, TorchDistSaveShardedStrategy), (
-        f"Unknown sharded strategy type: {type(sharded_strategy)}"
-    )
+    assert isinstance(sharded_strategy, TorchDistSaveShardedStrategy) or isinstance(
+        sharded_strategy, FullyParallelSaveStrategyWrapper
+    ), f"Unknown sharded strategy type: {type(sharded_strategy)}"
 
     if content_metadata is not None:
         sharded_state_dict[_CONTENT_METADATA_KEY] = content_metadata
