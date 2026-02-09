@@ -34,6 +34,72 @@ class ParamGroupOverride(TypedDict):
     wd_mult: float
 
 
+def get_canonical_lr_for_logging(param_groups: list[dict]) -> float | None:
+    """Get the canonical learning rate for logging.
+
+    The scheduler updates lr on every param group (including empty ones created for
+    distributed checkpoint alignment), so we do not skip groups based on param count.
+    This lets ranks that only hold empty param groups still report a valid canonical LR.
+
+    Priority order:
+        1. First non-None lr among ``default_config=True`` groups.
+        2. The non-None lr from the ``default_config=False`` group with the most
+           parameters (ties broken by iteration order).
+        3. First non-None lr among ``default_config=False`` groups with zero parameters.
+        4. ``None`` if the caller (e.g. ``reduce_max_stat_across_model_parallel_group``)
+           is expected to handle this sentinel.
+
+    Args:
+        param_groups (list[dict]): list of parameter groups from the optimizer.
+
+    Returns:
+        Optional[float]: the canonical learning rate, or None when no valid lr is found
+            (e.g. stub optimizer with an empty param_groups list).
+    """
+    default_config_lrs = []
+    non_default_config_lrs = []
+    non_default_config_param_counts = []
+
+    for param_group in param_groups:
+        num_params = len(param_group['params'])
+        group_lr = param_group.get('lr')
+        if param_group.get('default_config', False):
+            default_config_lrs.append(group_lr)
+        else:
+            non_default_config_lrs.append(group_lr)
+            non_default_config_param_counts.append(num_params)
+
+    # Case 1: prefer default_config groups – they use the unmodified LR schedule.
+    if default_config_lrs:
+        for lr in default_config_lrs:
+            if lr is not None:
+                return lr
+
+    # Case 2: fall back to non-default_config groups, choosing the group with the
+    #  most parameters so the logged value is representative.
+    if non_default_config_lrs:
+        # First try groups that actually own parameters.
+        max_params_idx = None
+        max_params = 0
+        for i, (lr, num_params) in enumerate(
+            zip(non_default_config_lrs, non_default_config_param_counts)
+        ):
+            if lr is not None and num_params > max_params:
+                max_params = num_params
+                max_params_idx = i
+        if max_params_idx is not None:
+            return non_default_config_lrs[max_params_idx]
+
+        # Case 3: all non-default groups are empty (rank-alignment stubs) but the
+        #  scheduler still wrote a valid lr on them – use the first one.
+        for lr in non_default_config_lrs:
+            if lr is not None:
+                return lr
+
+    # Case 4: no param groups at all (stub optimizer) or every lr is None.
+    return None
+
+
 def param_group_override_to_tuple(
     param_group_override: ParamGroupOverride | None,
 ) -> tuple[tuple[str, Any], ...] | None:
