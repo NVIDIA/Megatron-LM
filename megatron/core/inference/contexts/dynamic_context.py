@@ -239,7 +239,6 @@ class DynamicInferenceContext(BaseInferenceContext):
         ),
     )
     def __init__(self, model_config: TransformerConfig, inference_config: InferenceConfig):
-
         super().__init__(inference_config=inference_config)
 
         self.cache_mla_latent = (
@@ -340,7 +339,6 @@ class DynamicInferenceContext(BaseInferenceContext):
                 * self.hidden_size_per_attention_head
             )
         assert self.block_size_bytes > 0
-
 
         mamba_states_memory_per_request = 0
         if self.is_hybrid_model:
