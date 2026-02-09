@@ -1251,6 +1251,7 @@ def prepare_data_for_update(
             with torch.no_grad(), nvtx_range("compute_old_logprobs", time=True):
                 # print("STUMPED")
                 # torch.distributed.breakpoint()
+                model.config.cuda_graph_impl = "none"
                 old_logprobs = _compute_logprobs_batch(
                     model=model,
                     data_loader=data_loader,
@@ -1264,6 +1265,7 @@ def prepare_data_for_update(
                     pp_group=pp_group,
                     is_correction=args.rl_inference_logprobs_is_correction,
                 )
+                model.config.cuda_graph_impl = "local"
 
             with torch.no_grad(), nvtx_range("compute_ref_logprobs", time=True):
                 # We need to load the ref model state dict and compute the logprobs for the ref model
