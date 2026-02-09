@@ -515,7 +515,7 @@ jobs:
           PAT: ${{ secrets.PAT }}
           container-image: ${{ env.container-registry }}/megatron-lm:${{ github.sha }}
           is_ci_workload: ${{ needs.pre-flight.outputs.is_ci_workload }}
-
+          is_merge_group: ${{ needs.pre-flight.outputs.is_merge_group }}
   Nemo_CICD_Test:
     needs:
       - pre-flight
