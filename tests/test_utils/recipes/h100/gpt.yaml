@@ -411,14 +411,14 @@ products:
   - test_case: [gpt3_7b_tp1_pp4_memory_speed]
     products:
       - environment: [dev]
-        scope: [mr, mr-github]
+        scope: [mr]
         platforms: [dgx_h100]
       # - environment: [lts]
       #   scope: [nightly] # OOM: #434
   - test_case: [gpt3_7b_tp4_pp1_memory_speed]
     products:
       - environment: [dev]
-        scope: [mr, mr-github]
+        scope: [mr]
         platforms: [dgx_h100]
       # - environment: [lts]
       #   scope: [nightly] # OOM: #434
