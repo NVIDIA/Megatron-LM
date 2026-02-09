@@ -1,14 +1,14 @@
-# Megatron Inference
+# Megatron In-Framework Inference
 
-Native inference system for Megatron Core enabling training-inference consistency.
+In-framework inference system for Megatron Core enabling training-inference consistency.
 
 ```{warning}
-**Experimental Feature**: Megatron Inference is under active development and should be considered experimental. Performance is **not expected to match** dedicated inference engines like vLLM or SGLang.
+**Experimental Feature**: Megatron in-framework inference is under active development and should be considered experimental. Performance is **not expected to match** dedicated inference engines like vLLM or SGLang.
 ```
 
 ## Overview
 
-[**Megatron Inference**](https://github.com/NVIDIA/Megatron-LM/tree/main/megatron/core/inference) provides inference capabilities directly within Megatron Core, designed primarily to address numerical differences that arise when switching between separate training and inference backends.
+[**Megatron in-framework inference**](https://github.com/NVIDIA/Megatron-LM/tree/main/megatron/core/inference) provides inference capabilities directly within Megatron Core, designed primarily to address numerical differences that arise when switching between separate training and inference backends.
 
 This feature is intended for research teams exploring RL post-training and other workflows where numerical alignment between training and inference is critical. For production deployments with high throughput requirements, we recommend dedicated inference engines like [**vLLM**](https://github.com/vllm-project/vllm), [**SGLang**](https://github.com/sgl-project/sglang), or [**TensorRT-LLM**](https://github.com/NVIDIA/TensorRT-LLM).
 
@@ -79,17 +79,17 @@ Consistent teacher-student computations for distillation workflows:
 
 ## Limitations and Performance Expectations
 
-Megatron Inference prioritizes numerical consistency over throughput. **Performance is not expected to match dedicated inference engines**:
+Megatron in-framework inference prioritizes numerical consistency over throughput. **Performance is not expected to match dedicated inference engines**:
 
 - **Lower throughput** than vLLM, SGLang, or TensorRT-LLM
 - **No continuous batching optimizations** found in production inference engines
 - **Limited kernel optimization** - uses training kernels rather than inference-optimized kernels
 - **Research-focused** - designed for correctness, not production serving
 
-This is an intentional design tradeoff: Megatron Inference uses the same code paths as training to guarantee numerical consistency, at the cost of inference performance.
+This is an intentional design tradeoff: Megatron in-framework inference uses the same code paths as training to guarantee numerical consistency, at the cost of inference performance.
 
 ## Resources
 
 - **[Megatron Core Inference](https://github.com/NVIDIA/Megatron-LM/tree/main/megatron/core/inference)** - Source code
-- **[Megatron RL](megatron_rl.md)** - RL library using Megatron Inference
+- **[Megatron RL](megatron_rl.md)** - RL library using Megatron in-framework inference
 - **[API Reference](../../apidocs/core/core.inference.md)** - Detailed API documentation
