@@ -19,6 +19,7 @@ import torch
 from torch import Tensor
 from torch.cuda.nvtx import range_pop, range_push
 
+from megatron.core.inference.config import KVCacheManagementMode
 from megatron.core.inference.contexts.dynamic_context import (
     DynamicInferenceContext,
     MaxSequenceLengthOverflowError,
@@ -177,7 +178,6 @@ class DynamicInferenceEngine(AbstractEngine):
         self.metrics_writer = inference_config.metrics_writer
         self.logging_step_interval = inference_config.logging_step_interval
         self.unified_memory_level = inference_config.unified_memory_level
-        self.persist_cuda_graphs = inference_config.persist_cuda_graphs
         self.materialize_only_last_token_logits = (
             inference_config.materialize_only_last_token_logits
         )
@@ -598,10 +598,13 @@ class DynamicInferenceEngine(AbstractEngine):
         with self.__class__.suspend_resume_ctx(
             "suspended", unified_memory_level=self.unified_memory_level
         ):
-            self.context.deallocate_all_tensors()
+            self.context.deallocate_large_tensors()
             torch.cuda.synchronize()
 
-        if not self.persist_cuda_graphs:
+        if (
+            self.context.kv_cache_management_mode != KVCacheManagementMode.PERSIST
+            and not self.context.static_kv_memory_pointers
+        ):
             delete_cuda_graphs()
 
         # Maintain references to requests before reset.
@@ -632,7 +635,7 @@ class DynamicInferenceEngine(AbstractEngine):
             # Allocate context tensors.
             alloc_time = time.time()
             torch.cuda.synchronize()
-            self.context.allocate_all_tensors(is_init=False)
+            self.context.reallocate_large_tensors()
             torch.cuda.synchronize()
             alloc_time = time.time() - alloc_time
 
@@ -640,7 +643,10 @@ class DynamicInferenceEngine(AbstractEngine):
             self.context.reset()
 
             capture_time = time.time()
-            if not self.persist_cuda_graphs:
+            if (
+                self.context.kv_cache_management_mode != KVCacheManagementMode.PERSIST
+                and not self.context.static_kv_memory_pointers
+            ):
                 self.create_cuda_graphs()
             capture_time = time.time() - capture_time
 

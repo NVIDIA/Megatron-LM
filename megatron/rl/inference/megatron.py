@@ -164,20 +164,20 @@ class MegatronLocal(InferenceServer, ReturnsTokens, ReturnsRaw):
         if dist.get_rank() == 0:
             await self._client.pause_engines()
         await self._inference_engine.paused.wait()
+        self._mark_for_recompute()
         self._inference_engine.suspend()
 
-    def mark_for_recompute(self):
+    def _mark_for_recompute(self):
         """Mark all request entries for KV cache recomputation.
 
-        Called before resume when using partial rollouts with KV cache removal,
-        so the engine knows to recompute the KV cache for all in-flight requests.
+        Called before suspend when using KV cache recompute mode,
+        so the engine checkpoints and later recomputes all in-flight requests.
         """
-        if self._rl_kv_cache_management_mode == KVCacheManagementMode.REMOVE:
+        if self._rl_kv_cache_management_mode == KVCacheManagementMode.RECOMPUTE:
             for request_entry in self._inference_engine.requests.values():
                 request_entry.recompute_upon_suspend = True
 
     async def resume(self):
-        self.mark_for_recompute()
         if dist.get_rank() == 0:
             self._client.unpause_engines()
         await self._inference_engine.running.wait()

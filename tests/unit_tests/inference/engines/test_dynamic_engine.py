@@ -124,7 +124,7 @@ class DynamicEngineTestConfig:
     # context attributes are set correctly.
     suspend_resume_interval: Optional[int] = None
     kv_cache_management_mode: str = "persist"
-    persist_cuda_graphs: bool = True
+    static_kv_memory_pointers: bool = True
 
     fp8: bool = False
 
@@ -243,7 +243,7 @@ class TestDynamicInferenceEngine:
                 kv_cache_management_mode=KVCacheManagementMode(
                     test_config.kv_cache_management_mode
                 ),
-                persist_cuda_graphs=test_config.persist_cuda_graphs,
+                static_kv_memory_pointers=test_config.static_kv_memory_pointers,
                 use_flashinfer_fused_rope=None,  # default to using flash-infer if available
                 # this is for compatibility with the LTS environment
                 unified_memory_level=0,  # unit tests currently broken with UVM
@@ -1381,21 +1381,21 @@ class TestDynamicInferenceEngine:
     @pytest.mark.skipif(
         not is_fa_min_version("2.7.3"), reason="need latest flash attn for dynamic batching"
     )
-    @pytest.mark.parametrize("persist_cuda_graphs", [True, False])
-    @pytest.mark.parametrize("kv_cache_management_mode", ["persist", "offload", "remove"])
+    @pytest.mark.parametrize("static_kv_memory_pointers", [True, False])
+    @pytest.mark.parametrize("kv_cache_management_mode", ["persist", "offload", "recompute"])
     @torch.inference_mode()
-    def test_suspend_resume_cycle(self, kv_cache_management_mode, persist_cuda_graphs):
+    def test_suspend_resume_cycle(self, kv_cache_management_mode, static_kv_memory_pointers):
         """Full suspend -> resume cycle with memory, data, and address checks."""
-        needs_tms = persist_cuda_graphs and kv_cache_management_mode != "persist"
+        needs_tms = static_kv_memory_pointers and kv_cache_management_mode != "persist"
 
         test_config = DynamicEngineTestConfig(
             kv_cache_management_mode=kv_cache_management_mode,
-            persist_cuda_graphs=persist_cuda_graphs,
+            static_kv_memory_pointers=static_kv_memory_pointers,
         )
 
         # Without TMS, these combos must assert on construction.
         if needs_tms and not HAVE_TORCH_MEMORY_SAVER:
-            with pytest.raises(AssertionError, match="static KV cache memory"):
+            with pytest.raises(AssertionError, match="Static KV memory pointers"):
                 self._build_test_env(test_config)
             return
 
@@ -1407,7 +1407,7 @@ class TestDynamicInferenceEngine:
         assert context.is_tensor_state_allocated
 
         frees_memory = kv_cache_management_mode != "persist"
-        preserves_data = kv_cache_management_mode != "remove"
+        preserves_data = kv_cache_management_mode != "recompute"
 
         # Write a deterministic pattern for data integrity check.
         if preserves_data:
@@ -1464,9 +1464,9 @@ class TestDynamicInferenceEngine:
             )
 
         # Address stability when CUDA graphs persist.
-        if persist_cuda_graphs:
+        if static_kv_memory_pointers:
             addr_after = context.memory_buffer.data_ptr()
             assert addr_before == addr_after, (
-                f"Tensor address must be stable when CUDA graphs persist. "
+                f"Tensor address must be stable when static_kv_memory_pointers is set. "
                 f"Before: {addr_before:#x}, After: {addr_after:#x}"
             )

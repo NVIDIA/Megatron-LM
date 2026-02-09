@@ -61,8 +61,8 @@ class KVCacheManagementMode(str, Enum):
     OFFLOAD = "offload"
     """Offload large tensors to CPU during deallocation; onload during allocation."""
 
-    REMOVE = "remove"
-    """Entirely remove large tensors during deallocation; reinitialize during allocation."""
+    RECOMPUTE = "recompute"
+    """Deallocate large tensors and recompute them from scratch during allocation."""
 
 
 @dataclass
@@ -141,10 +141,12 @@ class InferenceConfig:
     Whether to use CUDA graphs for non-decode steps.
     """
 
-    persist_cuda_graphs: bool = True
+    static_kv_memory_pointers: bool = False
     """
-    Whether to persist CUDA graphs when the engine is suspended.
-    If False, CUDA graphs are deleted on `suspend()` and re-captured on `resume()`.
+    Whether the KV cache (and Mamba states) will reside at the same memory addresses
+    after suspend/resume as before. When True, CUDA graphs that reference these buffers
+    remain valid across suspend/resume cycles and do not need to be recaptured.
+    Requires either UVM or `torch_memory_saver` when `kv_cache_management_mode` is not PERSIST.
     """
 
     # =================================

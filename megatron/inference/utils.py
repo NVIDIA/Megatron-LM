@@ -293,7 +293,7 @@ def get_inference_config_from_model_and_args(model: MegatronModule, args):
         kv_cache_management_mode=KVCacheManagementMode(args.rl_kv_cache_management_mode),
         cuda_graph_mixed_prefill_count=args.inference_dynamic_batching_cuda_graph_mixed_prefill_count,  # pylint: disable=line-too-long
         use_cuda_graphs_for_non_decode_steps=not args.decode_only_cuda_graphs,
-        persist_cuda_graphs=args.rl_persist_cuda_graphs,
+        static_kv_memory_pointers=args.rl_persist_cuda_graphs,
         max_sequence_length=max_sequence_length,
         mamba_inference_state_config=mamba_inference_state_config,
         pg_collection=pg_collection,

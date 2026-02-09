@@ -364,11 +364,11 @@ def validate_args(args, defaults={}):
         #      if we want to graph inference but not training.
         #      This has to be done on an abstraction layer above the inference loop.
         #    ** This is controlled by `--rl-training-cuda-graphs`.
-        #  - The engine - not the RL loop! - deletes and creates cuda graphs.
-        #      This has to be done on the abstraction layer of inference.
+        #  - The engine deletes and recreates cuda graphs on suspend/resume when
+        #      KV memory addresses are not guaranteed to be stable.
         #    ** This is controlled by `--rl-persist-cuda-graphs`.
-        #  - The context ensures that the CGs still point to the correct memory addresses.
-        #    ** This is attempted through UVM if enabled, otherwise through `torch_memory_saver`.
+        #  - The context ensures that pointers remain stable when requested.
+        #    ** This is achieved through UVM if enabled, otherwise through `torch_memory_saver`.
         #
         # KV cache management is handled as follows (controlled by `--rl-kv-cache-management-mode`):
         #  - The context initially allocates the KV cache, either with or without UVM.
@@ -377,16 +377,16 @@ def validate_args(args, defaults={}):
         #    ** With `--rl-partial-rollouts`, it expects the engine to freeze its state.
         #  - Suspending the engine makes the context handle the KV cache according to the mode:
         #    ** "offload": the KV cache is offloaded to CPU memory.
-        #    ** "remove": the KV cache is deleted.
+        #    ** "recompute": the KV cache is deleted.
         #    ** "persist": no-op, leaving the KV cache as-is.
         #  - When RL is finished with training, it resumes the engine.
         #    ** With `--rl-partial-rollouts`, it expects the engine to resume its state.
         #  - Resuming the engine makes the context restore/rebuild the KV cache:
         #    ** "offload": the KV cache is reloaded from CPU memory.
-        #    ** "remove": the KV cache is reallocated.
+        #    ** "recompute": the KV cache is reallocated and recomputed from scratch.
         #    ** "persist": no-op, leaving the KV cache as-is.
-        #  - The engine proceeds to recompute the KV cache of any requests marked as "recompute".
-        #    ** If using both partial rollouts and KV cache removal, "recompute" must mark all.
+        #  - The engine proceeds to recompute the KV cache of any requests marked for recompute.
+        #    ** If using both partial rollouts and KV cache recompute, all requests must be marked.
         # ------------------------------------------------
 
         # Validate inference model offloading - requires either UVM or torch_memory_saver
@@ -2046,11 +2046,11 @@ def _add_rl_args(parser):
     group.add_argument('--rl-offload-optimizer-during-inference', action='store_true',
                        help='Offload optimizer state to CPU during inference/rollout to save GPU memory')
     group.add_argument('--rl-kv-cache-management-mode', type=str, default='persist',
-                       choices=['persist', 'offload', 'remove'],
+                       choices=['persist', 'offload', 'recompute'],
                        help='KV cache management mode during RL training: '
                             'persist: leave KV cache in GPU memory (default), '
                             'offload: offload KV cache to CPU during training, '
-                            'remove: delete and reallocate KV cache each training/inference cycle')
+                            'recompute: deallocate KV cache and recompute from scratch each cycle')
     group.add_argument('--rl-persist-cuda-graphs', action=argparse.BooleanOptionalAction, type=bool, default=True,
                        help='Persist CUDA graphs when the inference engine is suspended. '
                             'If False, CUDA graphs are deleted on suspend and re-captured on resume.')

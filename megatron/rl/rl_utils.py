@@ -427,10 +427,9 @@ def get_agent(args, parallel_generation_tasks: int | None = None):
 _INFERENCE_INTERFACE = None
 
 
-def get_inference_interface(loop, model):
+def get_inference_interface(args, loop, model):
     global _INFERENCE_INTERFACE
     if _INFERENCE_INTERFACE is None:
-        args = get_args()
         rank = torch.distributed.get_rank()
         if rank == 0 and args.langrl_external_server:
             if args.langrl_inference_server_type == 'inplace_megatron':
@@ -1724,7 +1723,7 @@ def megatron_rl_inference_mode(
         if cuda_graph_impl != "none" and not args.rl_training_cuda_graphs:
             toggle_cuda_graphs(lang_module, cuda_graph_impl)
 
-        inference_interface = get_inference_interface(loop, model)
+        inference_interface = get_inference_interface(args, loop, model)
 
         # TODO: Improve this if statement once a change is made to CUDA graph handling.
         cuda_graph_exists = len(_CudagraphGlobalRecord.cudagraph_inference_record) != 0
