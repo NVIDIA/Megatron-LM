@@ -84,7 +84,7 @@ def common_test_parallel_reconfiguration_e2e(
             pipeline_model_parallel_size=src_tp_pp[1],
             **src_model_init_kwargs,
         )
-        save_strategy = TorchDistSaveShardedStrategy('torch_dist', 1)
+        save_strategy = TorchDistSaveShardedStrategy()
         if use_fpsl:
             save_strategy = FullyParallelSaveStrategyWrapper(
                 save_strategy,

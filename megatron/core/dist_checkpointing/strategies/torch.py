@@ -599,8 +599,8 @@ class TorchDistSaveShardedStrategy(AsyncSaveShardedStrategy):
 
     def __init__(
         self,
-        backend: str,
-        version: int,
+        backend: str = "torch_dist",
+        version: int = 1,
         keep_only_main_replica: bool = True,
         thread_count: int = 2,
         cached_metadata: bool = False,
