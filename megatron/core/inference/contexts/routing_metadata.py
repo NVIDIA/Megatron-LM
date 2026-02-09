@@ -7,6 +7,7 @@ import torch
 if TYPE_CHECKING:
     from megatron.core.inference.contexts.dynamic_context import DynamicInferenceContext
 
+from megatron.core.transformer.moe.router_replay import RouterReplay
 
 class RoutingMetadata:
     """Manages routing indices metadata for MoE layers during inference.
@@ -43,7 +44,6 @@ class RoutingMetadata:
         if self.routing_indices_buffer is not None:
             return
         
-        from megatron.core.transformer.moe.moe_utils import RouterReplay
         
         self.num_moe_layers = len(RouterReplay.global_router_replay_instances)
         print(f"[RoutingMetadata] Allocating buffer with num_moe_layers={self.num_moe_layers} "
@@ -73,11 +73,11 @@ class RoutingMetadata:
             # Return view of static buffer up to current token count.
             if self.routing_indices_buffer is None:
                 return None
+            # Only return up to active token count, to skip entries 
+            # for padding tokens. 
             return self.routing_indices_buffer[:self.context.active_token_count]
         else:
             # Get from RouterReplay and stack into [num_tokens, num_layers, topk].
-            from megatron.core.transformer.moe.moe_utils import RouterReplay
-
             recorded_data = RouterReplay.get_recorded_data()
             if recorded_data is None or len(recorded_data) == 0:
                 return None
@@ -93,16 +93,12 @@ class RoutingMetadata:
         pre-allocated static buffer instead of creating new tensors.
         Allocates the buffer lazily on first call.
         """
-        from megatron.core.transformer.moe.moe_utils import RouterReplay
-
         self._ensure_buffer_allocated()
         if self.routing_indices_buffer is not None:
             RouterReplay.set_global_static_buffers(self.routing_indices_buffer)
 
     def disable_static_buffer_recording(self) -> None:
         """Disable static buffer recording, reverting to normal tensor assignment."""
-        from megatron.core.transformer.moe.moe_utils import RouterReplay
-
         RouterReplay.clear_global_static_buffers()
 
     def reset(self) -> None:

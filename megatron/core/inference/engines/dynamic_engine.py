@@ -38,6 +38,10 @@ from megatron.core.inference.sampling_params import SamplingParams
 from megatron.core.inference.text_generation_controllers.text_generation_controller import (
     TextGenerationController,
 )
+from megatron.core.transformer.moe.router_replay import (
+                    RouterReplay,
+                    RouterReplayAction,
+                )
 from megatron.core.inference.utils import Counter, await_process_call
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.transformer.cuda_graphs import delete_cuda_graphs
@@ -51,6 +55,8 @@ from megatron.core.utils import (
     internal_api,
     trace_async_exceptions,
 )
+
+
 
 from .async_zmq_communicator import AsyncZMQCommunicator
 
@@ -300,11 +306,7 @@ class DynamicInferenceEngine(AbstractEngine):
             # Enable routing recording during warmup if routing replay is enabled.
             # This ensures the record_indices copy operation is captured in the CUDA graph.
             model_config = controller.inference_wrapped_model.model.config
-            if getattr(model_config, 'enable_routing_replay', False):
-                from megatron.core.transformer.moe.moe_utils import (
-                    RouterReplay,
-                    RouterReplayAction,
-                )
+            if model_config.moe_enable_routing_replay:
                 RouterReplay.set_global_router_replay_action(RouterReplayAction.RECORD)
 
             # Forward pass -> logits.

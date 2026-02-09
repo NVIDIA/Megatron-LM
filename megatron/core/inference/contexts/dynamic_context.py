@@ -35,6 +35,7 @@ from .attention_context.mamba_metadata import MambaMetadata
 from .attention_context.mha_metadata import GraphedMHAMetadata, NonGraphedMHAMetadata
 from .base_context import BaseInferenceContext
 from .dynamic_block_allocator import BlockAllocator
+from .routing_metadata import RoutingMetadata
 
 try:
     from .fused_kv_append_kernel import triton_append_key_value_cache
@@ -469,6 +470,14 @@ class DynamicInferenceContext(BaseInferenceContext):
             max_seqlen=self.max_sequence_length,
         )
 
+        self.moe_enable_routing_replay = model_config.moe_enable_routing_replay
+        if self.moe_enable_routing_replay:
+            assert model_config.num_moe_experts is not None, "Router recording/replay requested but no MoE experts specified!"
+            self.moe_routing_metadata = RoutingMetadata(
+                self, model_config.moe_router_topk
+            )
+
+
         # CUDA graph config list
         self.use_cuda_graphs_for_non_decode_steps = (
             inference_config.use_cuda_graphs_for_non_decode_steps
@@ -658,17 +667,6 @@ class DynamicInferenceContext(BaseInferenceContext):
         with ctx_manager:
             allocate_memory_buffer()
             allocate_mamba_states()
-
-        # Allocate routing metadata for MoE models.
-        if self.moe_router_topk is not None:
-            from megatron.core.inference.contexts.routing_metadata import RoutingMetadata
-
-            self.routing_metadata = RoutingMetadata(
-                context=self,
-                moe_router_topk=self.moe_router_topk,
-            )
-        else:
-            self.routing_metadata = None
 
         # Reset attention and Mamba state.
         self.reset_attention_state()
@@ -1305,11 +1303,11 @@ class DynamicInferenceContext(BaseInferenceContext):
                 padded_batch_dimensions=self.padded_batch_dimensions,
             )
 
-        if self.routing_metadata is not None:
+        if self.moe_enable_routing_replay is not None:
             if self.using_cuda_graph_this_step():
-                self.routing_metadata.enable_static_buffer_recording()
+                self.moe_routing_metadata.enable_static_buffer_recording()
             else:
-                self.routing_metadata.disable_static_buffer_recording()
+                self.moe_routing_metadata.disable_static_buffer_recording()
             
     def reset(self) -> None:
         """Reset entire context.

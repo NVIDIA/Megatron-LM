@@ -10,7 +10,6 @@ from megatron.core.transformer.module import MegatronModule
 from megatron.core.transformer.moe.moe_utils import (
     MoEAuxLossAutoScaler,
     ProcessGroupCollection,
-    RouterReplay,
     apply_random_logits,
     apply_router_token_dropping,
     compute_routing_scores_for_aux_loss,
@@ -213,9 +212,10 @@ class TopKRouter(Router):
             self.ga_steps = None
 
         self.router_replay = None
+
         if self.config.moe_enable_routing_replay:
             self.router_replay = RouterReplay()
-
+ 
     def _maintain_float32_expert_bias(self):
         """
         Maintain the expert bias in float32.

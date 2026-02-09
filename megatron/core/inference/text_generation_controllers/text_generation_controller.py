@@ -30,7 +30,7 @@ from megatron.core.models.multimodal.llava_model import LLaVAModel
 from megatron.core.transformer.enums import CudaGraphScope
 from megatron.core.tensor_parallel.mappings import gather_from_sequence_parallel_region
 from megatron.core.transformer.moe.moe_layer import BaseMoELayer
-from megatron.core.transformer.moe.moe_utils import RouterReplay, RouterReplayAction
+from megatron.core.transformer.moe.router_replay import RouterReplay, RouterReplayAction
 from megatron.core.transformer.utils import set_model_to_sequence_parallel
 from megatron.core import parallel_state
 from megatron.core.utils import get_asyncio_loop, get_model_config, unwrap_model
@@ -693,15 +693,15 @@ class TextGenerationController:
                 disabled or no routing data was recorded.
         """
         config = self.inference_wrapped_model.model.config
-        if not getattr(config, 'enable_routing_replay', False):
+        if not config.moe_enable_routing_replay:
             return None
 
         # Get routing indices - use routing_metadata if available (handles CUDA graph static buffers)
         context = self.inference_wrapped_model.inference_context
-        if context.routing_metadata is None:
+        if context.moe_routing_metadata is None:
             return None
         
-        stacked_routing = context.routing_metadata.get_routing_indices()
+        stacked_routing = context.moe_routing_metadata.get_routing_indices()
 
         if stacked_routing is None:
             return None
@@ -956,7 +956,7 @@ class TextGenerationController:
 
         # Enable routing recording before forward pass if routing replay is enabled
         config = self.inference_wrapped_model.model.config
-        if getattr(config, 'enable_routing_replay', False):
+        if config.moe_enable_routing_replay:
             RouterReplay.set_global_router_replay_action(RouterReplayAction.RECORD)
 
         logits = self._dynamic_step_forward_logits(input_ids, position_ids)

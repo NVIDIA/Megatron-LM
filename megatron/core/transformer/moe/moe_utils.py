@@ -2,8 +2,6 @@
 
 import functools
 import math
-from enum import Enum
-from typing import Callable, List, Optional, Union
 from dataclasses import dataclass
 from typing import List, Optional, Tuple, Union
 
@@ -655,186 +653,6 @@ def pad_routing_map(routing_map: torch.Tensor, pad_multiple: int) -> torch.Tenso
     return routing_map
 
 
-class RouterReplayAction(Enum):
-    RECORD = "record"  # Record the topk indices for replay
-    REPLAY_FORWARD = "replay_forward"  # Replay the recorded topk indices for forward pass
-    REPLAY_BACKWARD = "replay_backward"  # Replay topk indices for re-compute during backward pass
-
-
-class RouterReplay:
-    """
-    A class to manage the recording and replaying of MoE routing decisions.
-    It holds all router instances and provides static methods to globally
-    control recording and replaying.
-    """
-
-    # Static variable to hold all router instances, one per MoE layer.
-    global_router_replay_instances: List['RouterReplay'] = []
-
-    @staticmethod
-    def set_replay_data(all_layers_topk_indices: List[torch.Tensor]):
-        """
-        Distributes the topk indices for all layers to their respective RouterReplay instances.
-        :param all_layers_topk_indices: A list of tensors, where each tensor contains the
-                                        topk indices for a specific layer. The order
-                                        must match the instantiation order of the routers.
-        """
-        if len(all_layers_topk_indices) != len(RouterReplay.global_router_replay_instances):
-            raise ValueError(
-                f"The number of replay tensors ({len(all_layers_topk_indices)}) "
-                f"does not match router instances ({len(RouterReplay.global_router_replay_instances)})."
-            )
-        for i, router_instance in enumerate(RouterReplay.global_router_replay_instances):
-            router_instance.set_target_indices(all_layers_topk_indices[i])
-
-    @staticmethod
-    def get_recorded_data() -> List[torch.Tensor]:
-        """
-        Collects the recorded topk indices from all RouterReplay instances.
-        :return: A list of tensors, each containing the recorded topk indices for a layer.
-        """
-        return [
-            router.get_recorded_indices() for router in RouterReplay.global_router_replay_instances
-        ]
-
-    @staticmethod
-    def clear_global_indices():
-        """Clears the recorded and target topk indices in all instances."""
-        for router in RouterReplay.global_router_replay_instances:
-            router.clear_indices()
-
-    @staticmethod
-    def set_global_static_buffers(static_buffer: torch.Tensor):
-        """Sets static buffers for all router instances from a combined buffer.
-        
-        Args:
-            static_buffer: Tensor of shape [max_tokens, num_layers, topk].
-                          Each layer's RouterReplay gets a slice [:, layer_idx, :].
-        """
-        num_layers = len(RouterReplay.global_router_replay_instances)
-        assert static_buffer.shape[1] == num_layers, (
-            f"Buffer has {static_buffer.shape[1]} layers but there are "
-            f"{num_layers} RouterReplay instances."
-        )
-        for layer_idx, router_instance in enumerate(RouterReplay.global_router_replay_instances):
-            # Each layer gets a view of shape [max_tokens, topk]
-            router_instance.set_static_buffer(static_buffer[:, layer_idx, :])
-
-    @staticmethod
-    def clear_global_static_buffers():
-        """Clears static buffers from all router instances."""
-        for router in RouterReplay.global_router_replay_instances:
-            router.clear_static_buffer()
-
-    @staticmethod
-    def set_global_router_replay_action(router_replay_action: RouterReplayAction):
-        """Sets the router replay action for all router instances."""
-        for router in RouterReplay.global_router_replay_instances:
-            router.set_router_replay_action(router_replay_action)
-
-    @staticmethod
-    def clear_global_router_replay_action():
-        """Clears the router replay action for all router instances."""
-        for router in RouterReplay.global_router_replay_instances:
-            router.clear_router_replay_action()
-
-    def __init__(self):
-        """Initializes a RouterReplay instance for a specific layer."""
-        self.target_topk_idx: Optional[torch.Tensor] = None  # Target topk indices for replay
-        self.recorded_topk_idx: Optional[torch.Tensor] = None  # Recorded topk indices for replay
-        self.static_buffer: Optional[torch.Tensor] = None  # Static buffer for CUDA graph recording
-        self.router_replay_action: Optional[RouterReplayAction] = (
-            None  # Router replay action for this layer
-        )
-        self.replay_backward_list: List[torch.Tensor] = (
-            []
-        )  # List of tensors for backward pass replay
-        RouterReplay.global_router_replay_instances.append(self)
-
-    def set_static_buffer(self, buffer: torch.Tensor):
-        """Sets a static buffer for CUDA graph compatible recording.
-        
-        Args:
-            buffer: Tensor of shape [max_tokens, topk] to copy routing indices into.
-        """
-        self.static_buffer = buffer
-
-    def clear_static_buffer(self):
-        """Clears the static buffer."""
-        self.static_buffer = None
-
-    def set_target_indices(self, topk_indices: torch.Tensor):
-        """Sets the target topk indices for replay."""
-        self.target_topk_idx = topk_indices
-        self.replay_backward_list.append(topk_indices)
-
-    def get_recorded_indices(self) -> Optional[torch.Tensor]:
-        """Returns the recorded topk indices."""
-        return self.recorded_topk_idx
-
-    def record_indices(self, topk_indices: torch.Tensor):
-        """Records the topk indices.
-        
-        If a static buffer is set (for CUDA graph compatibility), copies into it.
-        Otherwise, just stores the tensor reference.
-        """
-        if self.static_buffer is not None:
-            # Copy into static buffer for CUDA graph compatibility.
-            num_tokens = topk_indices.shape[0]
-            self.static_buffer[:num_tokens].copy_(topk_indices)
-            self.recorded_topk_idx = self.static_buffer[:num_tokens]
-        else:
-            self.recorded_topk_idx = topk_indices
-
-    def clear_indices(self):
-        """Clears the recorded and target topk indices."""
-        self.recorded_topk_idx = None
-        self.target_topk_idx = None
-        self.replay_backward_list = []
-
-    def set_router_replay_action(self, router_replay_action: RouterReplayAction):
-        """Sets the router replay action for this layer."""
-        self.router_replay_action = router_replay_action
-
-    def clear_router_replay_action(self):
-        """Clears the router replay action for this layer."""
-        self.router_replay_action = None
-
-    def get_replay_topk(
-        self,
-        scores: torch.Tensor,
-        topk: int,
-        num_groups: Optional[int] = None,
-        group_topk: Optional[int] = None,
-        default_compute_topk: Callable[
-            [torch.Tensor, int, Optional[int], Optional[int]], torch.Tensor
-        ] = None,
-    ) -> torch.Tensor:
-        """Returns the target topk indices for replay."""
-        if self.router_replay_action == RouterReplayAction.RECORD:
-            probs, top_indices = default_compute_topk(
-                scores, topk, num_groups=num_groups, group_topk=group_topk
-            )
-            self.record_indices(top_indices)
-            return probs, top_indices
-        elif self.router_replay_action == RouterReplayAction.REPLAY_FORWARD:
-            top_indices = self.target_topk_idx
-            # Ensure indices are on the correct device
-            top_indices = top_indices.to(scores.device)
-            # Gather the scores for the replayed indices to get the probabilities
-            probs = scores.gather(1, top_indices)
-            return probs, top_indices
-        elif self.router_replay_action == RouterReplayAction.REPLAY_BACKWARD:
-            top_indices = self.replay_backward_list.pop(0)
-            # Ensure indices are on the correct device
-            top_indices = top_indices.to(scores.device)
-            # Gather the scores for the replayed indices to get the probabilities
-            probs = scores.gather(1, top_indices)
-            return probs, top_indices
-        else:
-            return default_compute_topk(scores, topk, num_groups, group_topk)
-
-
 def topk_routing_with_score_function(
     logits: torch.Tensor,
     topk: int,
@@ -1182,41 +1000,6 @@ def reduce_aux_losses_tracker_across_ranks(
             )
 
 
-def get_num_moe_layers(
-    num_layers: int,
-    moe_layer_freq: Optional[Union[int, List[int]]] = None,
-    mtp_num_layers: Optional[int] = None,
-) -> int:
-    """Calculate the number of MoE layers based on moe_layer_freq.
-
-    Args:
-        num_layers (int): Total number of transformer layers.
-        moe_layer_freq (Optional[Union[int, List[int]]]): Frequency of MoE layers.
-            If int, every moe_layer_freq-th layer is an MoE layer.
-            If list, it's a binary pattern indicating which layers are MoE.
-            If None, all layers are assumed to be MoE layers.
-        mtp_num_layers (Optional[int]): Number of MTP (multi-token prediction) layers to add.
-
-    Returns:
-        int: The number of MoE layers.
-    """
-    if moe_layer_freq is None:
-        num_moe_layers = num_layers
-    elif isinstance(moe_layer_freq, int):
-        assert isinstance(num_layers, int)
-        moe_layer_pattern = [1 if (i % moe_layer_freq == 0) else 0 for i in range(num_layers)]
-        num_moe_layers = sum(moe_layer_pattern)
-    elif isinstance(moe_layer_freq, list):
-        num_moe_layers = sum(moe_layer_freq)
-    else:
-        raise ValueError(f"Invalid moe_layer_freq: {moe_layer_freq}")
-
-    if mtp_num_layers is not None:
-        num_moe_layers += mtp_num_layers
-
-    return num_moe_layers
-
-
 def track_moe_metrics(
     loss_scale: float,
     iteration: int,
@@ -1266,7 +1049,20 @@ def track_moe_metrics(
                     tracker[key]["reduce_group_has_dp"] = False
     reduce_aux_losses_tracker_across_ranks(track_names, pg_collection=pg_collection)
 
-    num_moe_layers = get_num_moe_layers(num_layers, moe_layer_freq, mtp_num_layers)
+    # Get number of MoE layers
+    if moe_layer_freq is None:
+        num_moe_layers = num_layers
+    elif isinstance(moe_layer_freq, int):
+        assert isinstance(num_layers, int)
+        moe_layer_pattern = [1 if (i % moe_layer_freq == 0) else 0 for i in range(num_layers)]
+        num_moe_layers = sum(moe_layer_pattern)
+    elif isinstance(moe_layer_freq, list):
+        num_moe_layers = sum(moe_layer_freq)
+    else:
+        raise ValueError(f"Invalid moe_layer_freq: {moe_layer_freq}")
+
+    if mtp_num_layers is not None:
+        num_moe_layers += mtp_num_layers
 
     aux_losses = {k: v['values'].float() * loss_scale for k, v in tracker.items()}
     for name, loss_list in aux_losses.items():

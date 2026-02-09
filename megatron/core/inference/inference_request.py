@@ -313,7 +313,7 @@ class DynamicInferenceRequest(InferenceRequest):
         obj = super().serialize()
         obj["events"] = [e.serialize() for e in self.events]
         
-        # Serialize routing_indices: Tensor [total_tokens - 1, num_layers, topk] -> 3D list
+        # Sanity check routing_indices: Tensor [total_tokens - 1, num_layers, topk] 
         if self.routing_indices is not None:
             total_tokens = len(self.prompt_tokens) + len(self.generated_tokens)
             # the last generated token does not undergo a forward pass 
@@ -322,8 +322,7 @@ class DynamicInferenceRequest(InferenceRequest):
                 f"routing_indices first dimension {self.routing_indices.shape[0]} does not match "
                 f"total tokens {total_tokens-1}."
             )
-            obj["routing_indices"] = self.routing_indices.tolist()
-        
+    
         torch.cuda.nvtx.range_pop()
         return obj
 
