@@ -34,8 +34,7 @@ def get_megatron_emerging_optimizer(
     layer_wise_distributed_optimizer: bool = False,
     pg_collection: Optional[ProcessGroupCollection] = None,
 ) -> MegatronOptimizer:
-    """This function is used to get the muon optimizer for the model chunks.
-    It is used to get the muon optimizer for the model chunks.
+    """Get the emerging optimizer for the model chunks.
 
     Args:
         config (OptimizerConfig): optimizer configuration object.
@@ -55,12 +54,12 @@ def get_megatron_emerging_optimizer(
     config.optimizer = 'adam'
 
     # Dist-opt is not supported due to strong coupling with how DDP init grad buffer
-    # In theory we can change DDP to enable use muon and dist-opt-adam together
+    # In theory we can change DDP to enable use emerging optimizer and dist-opt-adam together
     if config.use_distributed_optimizer:
-        raise Exception('muon with dist optimizer is not supported.')
+        raise Exception('emerging optimizer with dist optimizer is not supported.')
     # only support bf16 w/o loss scale now
     if config.fp16:
-        raise Exception('muon with fp16 is not supported.')
+        raise Exception('emerging optimizer with fp16 is not supported.')
 
     # before this function receive properly created collection
     if pg_collection is None:
@@ -130,7 +129,7 @@ def get_megatron_emerging_optimizer(
         eopt_kwargs["qkv_split_shapes"] = qkv_split_shapes
     eopt_kwargs['pg_collection'] = pg_collection
 
-    # freezing nonlinear params and get param groups for muon
+    # freezing nonlinear params and get param groups for emerging optimizer
     for param in nonlinear_params:
         param.requires_grad = False
 
