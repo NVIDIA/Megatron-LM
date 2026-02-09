@@ -13,6 +13,7 @@ logger = logging.getLogger(__name__)
 
 class Split(Enum):
     """Enum train, valid, and test split."""
+
     train = 0
     valid = 1
     test = 2
