@@ -62,8 +62,6 @@ Install Megatron Core with pip:
 </details>
 
 
-
-
 # Project Structure
 
 ```
@@ -88,7 +86,6 @@ Megatron-LM/
 ├── tests/                       # Comprehensive test suite
 └── docs/                        # Documentation
 ```
-
 
 
 # Performance Benchmarking
@@ -127,13 +124,10 @@ We also strong scaled the standard GPT-3 model (our version has slightly more th
 ![Strong scaling](images/strong_scaling.png)
 
 
-
-
-
-
 # Roadmaps
 
 - **[MoE Roadmap](https://github.com/NVIDIA/Megatron-LM/issues/1729)** - DeepSeek-V3, Qwen3, advanced parallelism, FP8 optimizations, and Blackwell enhancements
+
 
 # Resources
 
