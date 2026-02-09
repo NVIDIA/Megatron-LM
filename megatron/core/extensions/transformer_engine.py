@@ -16,7 +16,7 @@ from packaging.version import Version as PkgVersion
 from torch import Tensor
 from torch.nn.parameter import Parameter
 
-from megatron.core.activations import squared_relu, quick_gelu
+from megatron.core.activations import quick_gelu, squared_relu
 from megatron.core.dist_checkpointing.mapping import ShardedStateDict
 from megatron.core.dist_checkpointing.utils import replace_prefix_for_sharding
 from megatron.core.enums import Fp4Recipe, Fp8Recipe
@@ -405,13 +405,15 @@ if HAVE_TE and is_te_min_version("1.13.0"):
     }
 
     if is_te_min_version("2.8.0"):
-        _activation_types.update({
-            (quick_gelu, False): te.pytorch.ops.QGELU,
-            (quick_gelu, True): te.pytorch.ops.QGEGLU,
-            (squared_relu, False): te.pytorch.ops.SReLU,
-            (squared_relu, True): te.pytorch.ops.SReGLU,
-            (F.silu, False): te.pytorch.ops.SiLU,
-        })
+        _activation_types.update(
+            {
+                (quick_gelu, False): te.pytorch.ops.QGELU,
+                (quick_gelu, True): te.pytorch.ops.QGEGLU,
+                (squared_relu, False): te.pytorch.ops.SReLU,
+                (squared_relu, True): te.pytorch.ops.SReGLU,
+                (F.silu, False): te.pytorch.ops.SiLU,
+            }
+        )
 
     class TEActivationOp:
         """
