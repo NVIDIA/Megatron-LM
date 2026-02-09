@@ -1954,7 +1954,9 @@ class ParamAndGradBuffer:
                 hsdp_buf_dp_group = self.dist_index.get_fsdp_group(
                     is_expert_parallel=group.is_expert_param
                 )
-                main_buf_extra_kwargs["dp_rank"] = self.dist_index.get_logical_hybrid_fsdp_rank()
+                main_buf_extra_kwargs["dp_rank"] = self.dist_index.get_logical_hybrid_fsdp_rank(
+                    is_expert_parallel=group.is_expert_param
+                )
             else:
                 main_buf_dp_group = self.dist_index.get_fsdp_group(
                     is_expert_parallel=group.is_expert_param
@@ -3160,9 +3162,6 @@ class GradReducePipeline:
                 grad_reduce_event, free_up_grad_bucket, _ = self.grad_reduce_queue.pop(0)
                 grad_reduce_event.wait()
                 free_up_grad_bucket()
-
-        if suggested_queue_size == 0 and self.outer_fsdp_group_grad_reduce:
-            torch.cuda.current_stream().wait_stream(self.outer_fsdp_group_grad_reduce_stream)
 
     def _enforce_double_buffer_limit(self, add_buckets):
         if not self.buffer.ddp_config.fsdp_double_buffer:

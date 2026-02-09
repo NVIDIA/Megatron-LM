@@ -2,7 +2,7 @@
 import logging
 from contextlib import nullcontext
 from dataclasses import dataclass
-from typing import List, Optional, Union
+from typing import List, Optional, Union, cast
 
 import torch
 from torch import Tensor
@@ -21,12 +21,14 @@ from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.transformer.enums import CudaGraphScope, LayerType
 from megatron.core.transformer.module import GraphableMegatronModule, MegatronModule
 from megatron.core.transformer.spec_utils import ModuleSpec, build_module
+from megatron.core.transformer.torch_norm import LayerNormBuilder
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.transformer.transformer_layer import (
     BaseTransformerLayer,
     get_transformer_layer_offset,
 )
 from megatron.core.transformer.utils import sharded_state_dict_default
+from megatron.core.typed_torch import apply_module, not_none
 from megatron.core.utils import (
     WrappedTensor,
     deprecate_inference_params,
@@ -219,7 +221,7 @@ class TransformerBlockSubmodules:
     """
 
     layer_specs: Optional[List[ModuleSpec]] = None
-    layer_norm: Optional[Union[ModuleSpec, torch.nn.Module]] = None
+    layer_norm: LayerNormBuilder | None = None
 
 
 def _get_block_submodules(
@@ -375,8 +377,7 @@ class TransformerBlock(GraphableMegatronModule, MegatronModule):
         # In pipeline parallelism, we want to add this LN only to the last stage of the pipeline
         # self.post_process and self.post_layer_norm guide this behavior
         if self.has_final_layernorm_in_this_stage():
-            self.final_layernorm = build_module(
-                self.submodules.layer_norm,
+            self.final_layernorm = not_none(self.submodules.layer_norm)(
                 config=self.config,
                 hidden_size=self.config.hidden_size,
                 eps=self.config.layernorm_epsilon,
@@ -606,16 +607,7 @@ class TransformerBlock(GraphableMegatronModule, MegatronModule):
                 if isinstance(kwargs['hidden_states'], WrappedTensor)
                 else kwargs['hidden_states']
             )
-            # dynamic_inference_decode_only is not a real argument to forward, it is only used
-            # to differentiate the cuda graph used for decode from the one used for non-decode
-            # inference.
-            dynamic_inference_decode_only = kwargs['inference_context'].is_decode_only()
-            # cudagraphmanager returns a singleton tuple, whereas the
-            # normal forward returns a tensor, therefore we need
-            # to extract the tensor from the tuple
-            return super().__call__(
-                *args, dynamic_inference_decode_only=dynamic_inference_decode_only, **kwargs
-            )[0]
+            return super().__call__(*args, **kwargs)[0]
         return super().__call__(*args, **kwargs)
 
     def forward(
@@ -787,7 +779,7 @@ class TransformerBlock(GraphableMegatronModule, MegatronModule):
 
         # Final layer norm.
         if self.final_layernorm is not None:
-            hidden_states = self.final_layernorm(hidden_states)
+            hidden_states = apply_module(self.final_layernorm)(cast(Tensor, hidden_states))
             # TENorm produces a "viewed" tensor. This will result in schedule.py's
             # deallocate_output_tensor() throwing an error, so a viewless tensor is
             # created to prevent this.
