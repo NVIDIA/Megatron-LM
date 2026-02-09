@@ -57,6 +57,7 @@ from .optimizer import (
 )
 from .optimizer_config import (
     AdamOptimizerConfig,
+    MuonOptimizerConfig,
     OptimizerConfig,
     ParamKey,
     ParamPredicate,
