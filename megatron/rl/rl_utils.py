@@ -1697,6 +1697,7 @@ def megatron_rl_inference_mode(
     print("IN INFERENCE")
     # torch.distributed.breakpoint()
     model[0].config.cuda_graph_scope = ["full"]
+    model[0].config.cuda_graph_impl = "local"
 
     # If we get a lower precision wrapper, we go one object deeper.
     lang_module = model[0].module.module if hasattr(model[0].module, "module") else model[0].module
@@ -1783,6 +1784,7 @@ def megatron_rl_inference_mode(
         # Change cudagraph scope for training
         print("IN TRAINING")
         model[0].config.cuda_graph_scope = ["mamba", "attn", "moe_router"]
+        model[0].config.cuda_graph_impl = "transformer_engine"
         # torch.distributed.breakpoint()
 
         # If this is a separate RL inference model, prefetch weights back to CPU so they don't consume

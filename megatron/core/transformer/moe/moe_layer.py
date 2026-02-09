@@ -403,15 +403,20 @@ class MoELayer(BaseMoELayer):
 
                     if intermediate_tensors is not None:
                         return hidden_states, probs, shared_expert_output
+                    # else:
+                    #     print(f"intermediate_tensors: {intermediate_tensors}")
 
-            except MoECudaGraphPartialCaptureSignal as e:
+            except e: #MoECudaGraphPartialCaptureSignal as e:
+                print(f"e: {e}")
                 # This signal is raised from the maybe_skip_or_early_return_by_cudagraph decorator.
                 # It means we should early-return from the MoE layer forward pass.
                 # This happens when we are partially capturing the CUDA graph of the MoE layer,
                 # like cuda_graph_scope=["moe_router", "moe_preprocess"].
                 # We need to return the intermediate tensors as CUDA graph outputs.
                 return e.get_early_return_outputs(hidden_states, shared_expert_output)
-
+            # if self.training:
+            #     print("WHY?")
+            #     torch.distributed.breakpoint()
             if "expert_compute" in self.fwd_execution_map:
                 if intermediate_tensors is not None:
                     hidden_states, probs = intermediate_tensors
