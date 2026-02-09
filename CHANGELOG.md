@@ -1,5 +1,20 @@
 # Changelog
 
+## NVIDIA Megatron Core 0.15.3
+
+This release addresses known security issues. For the latest NVIDIA Vulnerability Disclosure Information visit <https://www.nvidia.com/en-us/security/>, for acknowledgement please reach out to the NVIDIA PSIRT team at <PSIRT@nvidia.com>
+
+## NVIDIA Megatron Core 0.15.2
+
+* Bug fixes  
+  * Various small fixes for Megatron-FSDP. [#2346](https://github.com/NVIDIA/Megatron-LM/pull/2346)
+  * [Megatron-FSDP] Support both old and new DeviceMesh APIs. [#2575](https://github.com/NVIDIA/Megatron-LM/pull/2575)
+  * [Megatron-FSDP] Build default FSDP DeviceMesh, and remove model arg from `fully_shard_optimizer()`. [#2471](https://github.com/NVIDIA/Megatron-LM/pull/2471)
+
+## NVIDIA Megatron Core 0.15.1
+
+Yanked release.
+
 ## NVIDIA Megatron Core 0.15.0
 
 * Features  

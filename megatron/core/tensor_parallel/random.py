@@ -2,16 +2,19 @@
 
 # Parts of the code here are adapted from PyTorch
 # repo: https://github.com/pytorch/pytorch
+from __future__ import annotations
 
 import contextlib
 import logging
-from typing import Optional, Union
+from collections.abc import Callable
+from typing import Any, Optional, TypeVar, Union
 
 import torch
 from torch import _C
 from torch.cuda import _lazy_call, _lazy_init
 from torch.cuda import device as device_ctx_manager
 from torch.utils.checkpoint import detach_variable
+from typing_extensions import TypeVarTuple, Unpack
 
 from megatron.core.parallel_state import (
     get_expert_model_parallel_rank,
@@ -472,6 +475,31 @@ def _fork_rng():
         _set_all_rng_states(*current_states)
 
 
+# Global flag that's toggled whenever inside a checkpointing context
+IS_CHECKPOINTING = False
+
+
+def _set_checkpointing():
+    """Set state to checkpointing enabled."""
+    global IS_CHECKPOINTING
+    IS_CHECKPOINTING = True
+
+
+def _unset_checkpointing():
+    """Unset state to checkpointing enabled."""
+    global IS_CHECKPOINTING
+    IS_CHECKPOINTING = False
+
+
+def is_checkpointing():
+    """Check if currently in a checkpoint context."""
+    return IS_CHECKPOINTING
+
+
+_R = TypeVar('_R')
+_Ts = TypeVarTuple('_Ts')
+
+
 class CheckpointFunction(torch.autograd.Function):
     """Checkpoint Function
 
@@ -482,8 +510,15 @@ class CheckpointFunction(torch.autograd.Function):
 
     # pylint: disable=missing-function-docstring
     @staticmethod
-    def forward(ctx, run_function, distribute_saved_activations, *args):
+    def forward(
+        ctx: Any,
+        run_function: Callable[[Unpack[_Ts]], _R],
+        distribute_saved_activations: bool,
+        *args: Unpack[_Ts],
+    ) -> _R:
         """Forward pass."""
+        _set_checkpointing()
+
         ctx.run_function = run_function
         ctx.distribute_saved_activations = distribute_saved_activations
 
@@ -504,6 +539,7 @@ class CheckpointFunction(torch.autograd.Function):
         # Store everything.
         ctx.save_for_backward(*args)
 
+        _unset_checkpointing()
         return outputs
 
     # pylint: disable=missing-function-docstring
@@ -515,6 +551,8 @@ class CheckpointFunction(torch.autograd.Function):
                 "Checkpointing is not compatible with .grad(), "
                 "please use .backward() if possible"
             )
+        _set_checkpointing()
+
         inputs = ctx.saved_tensors
         if ctx.distribute_saved_activations:
             safely_set_viewless_tensor_data(
@@ -539,10 +577,14 @@ class CheckpointFunction(torch.autograd.Function):
         )
         torch.autograd.backward(outputs, args)
         grads = tuple(inp.grad if isinstance(inp, torch.Tensor) else inp for inp in detached_inputs)
+
+        _unset_checkpointing()
         return (None, None) + grads
 
 
-def checkpoint(function, distribute_saved_activations, *args):
+def checkpoint(
+    function: Callable[[Unpack[_Ts]], _R], distribute_saved_activations: bool, *args: Unpack[_Ts]
+) -> _R:
     """Checkpoint a model or part of the model.
     This has been directly copied from torch.utils.checkpoint."""
     return CheckpointFunction.apply(function, distribute_saved_activations, *args)
@@ -550,12 +592,17 @@ def checkpoint(function, distribute_saved_activations, *args):
 
 class CheckpointWithoutOutputFunction(torch.autograd.Function):
     """
-    Checkpoint Function Helper for CheckpointWithouOutput.
+    Checkpoint Function Helper for CheckpointWithoutOutput.
     Save context for recompute.
     """
 
     @staticmethod
-    def forward(ctx, run_function, checkpoint_without_output_obj, *args):
+    def forward(
+        ctx: Any,
+        run_function: Callable[[Unpack[_Ts]], _R],
+        checkpoint_without_output_obj: CheckpointWithoutOutput,
+        *args: Unpack[_Ts],
+    ) -> _R:
         """Forward pass."""
         if checkpoint_without_output_obj.fp8:
             fp8 = FP8GlobalStateManager.is_fp8_enabled()
@@ -578,10 +625,14 @@ class CheckpointWithoutOutputFunction(torch.autograd.Function):
     @staticmethod
     def backward(ctx, *args):
         """Backward pass."""
-        inputs = ctx.saved_tensors
+        # Get the inputs from the context instead of the saved tensors
+        # because the saved tensors are already cached by the recomputation.
+        # This is to avoid double-reloading the inputs in CPU offloading scenario.
+        inputs = ctx.inputs
         outputs = ctx.outputs
         torch.autograd.backward(outputs, args)
         ctx.outputs = None
+        ctx.inputs = None
         grads = tuple(inp.grad if isinstance(inp, torch.Tensor) else inp for inp in inputs)
         return (None, None) + grads
 
@@ -609,8 +660,16 @@ class CheckpointWithoutOutput(object):
         self.ctx = None
         self.outputs = None
 
-    def checkpoint(self, run_function, *args):
+    def checkpoint(self, run_function: Callable[[Unpack[_Ts]], _R], *args: Unpack[_Ts]) -> _R:
         """Checkpoint function."""
+
+        # If in cuda graph warmup, disable checkpointing, as 'discard_output_and_register_recompute'
+        # may be called in a separate graph warmup.
+        from megatron.core.transformer.cuda_graphs import is_graph_warmup
+
+        if is_graph_warmup():
+            return run_function(*args)
+
         self.run_function = run_function
 
         self.rng_states = _get_all_rng_states()
@@ -624,11 +683,14 @@ class CheckpointWithoutOutput(object):
     def _recompute(self, _):
         """Used as a hook to recompute the output."""
 
-        if self.ctx is None:
-            # The recomputation has been triggered already. Just return.
+        from megatron.core.transformer.cuda_graphs import is_graph_capturing, is_graph_warmup
+
+        # The recomputation has been triggered already. Just return.
+        # Handle cudagraphs, do nothing if currently in graph warmup
+        if self.ctx is None or is_graph_warmup():
             return
 
-        if not torch.autograd._is_checkpoint_valid():
+        if not torch.autograd._is_checkpoint_valid() and not is_graph_capturing():
             raise RuntimeError(
                 "Checkpointing is not compatible with .grad(), "
                 "please use .backward() if possible"
@@ -646,8 +708,19 @@ class CheckpointWithoutOutput(object):
                 recompute_ctx = contextlib.nullcontext()
                 fp8_ctx = contextlib.nullcontext()
 
+            # Store the inputs for backward pass
+            inputs = self.ctx.saved_tensors
+
+            def detach(t):
+                if isinstance(t, torch.Tensor):
+                    requires_grad = t.requires_grad
+                    t = t.detach()
+                    t.requires_grad_(requires_grad)
+                return t
+
+            inputs = tuple(detach(t) for t in inputs)
             with torch.enable_grad(), fp8_ctx, recompute_ctx:
-                outputs = self.run_function(*self.ctx.saved_tensors)
+                outputs = self.run_function(*inputs)
 
         self.run_function = None
         self.rng_states = None
@@ -663,6 +736,7 @@ class CheckpointWithoutOutput(object):
                 output.untyped_storage().copy_(recomputation_output.untyped_storage())
 
         self.ctx.outputs = outputs
+        self.ctx.inputs = inputs
         self.outputs = None
         self.ctx = None
 
@@ -675,6 +749,12 @@ class CheckpointWithoutOutput(object):
         in the forward pass and the gradient of the hook_tensor is computed before the recomputed
         tensors are used.
         """
+
+        from megatron.core.transformer.cuda_graphs import is_graph_warmup
+
+        if is_graph_warmup():
+            return
+
         # use resize to release the output tensor memory and still keep the metadata in the tensors.
         # the metadata is still needed for backward
         for output in self.outputs:

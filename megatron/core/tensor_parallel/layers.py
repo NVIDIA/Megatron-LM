@@ -1,4 +1,4 @@
-# Copyright (c) 2024, NVIDIA CORPORATION. All rights reserved.
+# Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
 # Parts of the code here are adapted from PyTorch
 # repo: https://github.com/pytorch/pytorch
@@ -11,6 +11,7 @@ from typing import Any, Callable, List, Optional, Tuple
 import torch
 import torch.nn.functional as F
 from torch.nn.parameter import Parameter
+from typing_extensions import override
 
 from megatron.core.model_parallel_config import ModelParallelConfig
 from megatron.core.parallel_state import (
@@ -56,6 +57,8 @@ except ImportError:
     HAVE_TE = False
 
 _MODEL_PARALLEL_ATTRIBUTE_DEFAULTS = {
+    "expert_tp": False,
+    "is_qkv": False,
     "tensor_model_parallel": False,
     "partition_dim": -1,
     "partition_stride": 1,
@@ -811,7 +814,7 @@ class ColumnParallelLinear(torch.nn.Module):
         embedding_activation_buffer: Optional[List[torch.Tensor]] = None,
         grad_output_buffer: Optional[List[torch.Tensor]] = None,
         is_expert: bool = False,
-        tp_comm_buffer_name: str = None,  # Not used
+        tp_comm_buffer_name: Optional[str] = None,  # Not used
         disable_grad_reduce: bool = False,
         tp_group: Optional[torch.distributed.ProcessGroup] = None,
     ):
@@ -954,7 +957,7 @@ class ColumnParallelLinear(torch.nn.Module):
         input_: torch.Tensor,
         weight: Optional[torch.Tensor] = None,
         runtime_gather_output: Optional[bool] = None,
-    ):
+    ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
         """Forward of ColumnParallelLinear
 
         Args:
@@ -1048,6 +1051,13 @@ class ColumnParallelLinear(torch.nn.Module):
         output_bias = self.bias if self.skip_bias_add else None
         return output, output_bias
 
+    def backward_dw(self) -> None:
+        """Compute weight gradients during the backward pass if delay_wgrad_compute is enabled.
+
+        Not supported - does nothing.
+        """
+        pass
+
     def sharded_state_dict(self, prefix="", sharded_offsets=(), metadata=None):
         """Sharding along axis 0, bias sharded"""
         state_dict = self.state_dict(prefix="", keep_vars=True)
@@ -1067,12 +1077,16 @@ class ColumnParallelLinear(torch.nn.Module):
         """Keep compatibility with TE state dict."""
         return None
 
-    def __repr__(self):
+    @override
+    def extra_repr(self) -> str:
+        """Extra context to add to the module's string representation."""
         tp = self.output_size // self.output_size_per_partition
         use_bias = self.bias is not None and self.bias is True
         return (
-            f"{type(self).__name__}(in_features={self.input_size}, "
-            f"out_features={self.output_size}, bias={use_bias}, TP={tp})"
+            f"in_features={self.input_size}, "
+            f"out_features={self.output_size}, "
+            f"bias={use_bias}, "
+            f"TP={tp}"
         )
 
 
@@ -1310,10 +1324,14 @@ class RowParallelLinear(torch.nn.Module):
         """Keep compatibility with TE state dict."""
         return None
 
-    def __repr__(self):
+    @override
+    def extra_repr(self) -> str:
+        """Extra context to add to the module's string representation."""
         tp = self.input_size // self.input_size_per_partition
         use_bias = self.bias is not None and self.bias is True
         return (
-            f"{type(self).__name__}(in_features={self.input_size}, "
-            f"out_features={self.output_size}, bias={use_bias}, TP={tp})"
+            f"in_features={self.input_size}, "
+            f"out_features={self.output_size}, "
+            f"bias={use_bias}, "
+            f"TP={tp}"
         )
