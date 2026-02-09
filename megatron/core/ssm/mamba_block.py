@@ -42,6 +42,7 @@ class MambaStackSubmodules:
     attention_layer: Union[ModuleSpec, type] = IdentityOp
     mlp_layer: Union[ModuleSpec, type] = IdentityOp
     moe_layer: Union[ModuleSpec, type] = IdentityOp
+    mtp_block_spec: Optional[ModuleSpec] = None
 
 
 class MambaStack(MegatronModule):
@@ -85,12 +86,14 @@ class MambaStack(MegatronModule):
         device=None,
         dtype=None,
         pg_collection: ProcessGroupCollection = None,
+        is_mtp_layer: bool = False,
     ) -> None:
         super().__init__(config=config)
         self.residual_in_fp32 = residual_in_fp32
         self.pre_process = pre_process
         self.post_layer_norm = post_layer_norm
         self.post_process = post_process
+        self.is_mtp_layer = is_mtp_layer
 
         assert pg_collection is not None, "pg_collection must be provided for MambaStack"
 
@@ -103,20 +106,32 @@ class MambaStack(MegatronModule):
         self.hybrid_attention_ratio = hybrid_attention_ratio
         self.hybrid_mlp_ratio = hybrid_mlp_ratio
         self.hybrid_override_pattern = hybrid_override_pattern
+        self.pg_collection = pg_collection
+
+        # For MTP layers, always use pattern length (config.num_layers is for main decoder)
+        if self.is_mtp_layer:
+            num_layers_for_allocation = len(self.hybrid_override_pattern)
+        else:
+            num_layers_for_allocation = (
+                self.config.num_layers
+                if self.config.num_layers is not None
+                else len(self.hybrid_override_pattern)
+            )
 
         self.layer_type_list = allocate_layers(
-            self.config.num_layers,
+            num_layers_for_allocation,
             self.hybrid_attention_ratio,
             self.hybrid_mlp_ratio,
             self.hybrid_override_pattern,
+            silent=self.is_mtp_layer,
         )
 
         pp_layer_offset = 0
-        if self.pp_group.size() > 1:
+        if self.pp_group.size() > 1 and not self.is_mtp_layer:
             pp_layer_offset, self.layer_type_list = self._select_layers_for_pipeline_parallel(
                 self.layer_type_list
             )
-
+        # Build main decoder layers using shared layer builder
         self.layers = nn.ModuleList()
         for i, layer_type in enumerate(self.layer_type_list):
             fp8_init_context = get_fp8_context(self.config, i + pp_layer_offset, is_init=True)
@@ -137,9 +152,10 @@ class MambaStack(MegatronModule):
                         config=self.config,
                         layer_number=i + 1,
                         pg_collection=pg_collection,
+                        is_mtp_layer=is_mtp_layer,
                     )
                 elif layer_type == LayerSymbols.MLP:
-                    # Transformer layers apply their own pp_layer_offset
+                    # MLP layers apply their own pp_layer_offset
                     layer = build_module(
                         submodules.mlp_layer,
                         config=self.config,
@@ -147,7 +163,7 @@ class MambaStack(MegatronModule):
                         pg_collection=pg_collection,
                     )
                 elif layer_type == LayerSymbols.MOE:
-                    # Transformer layers apply their own pp_layer_offset
+                    # MoE layers apply their own pp_layer_offset
                     layer = build_module(
                         submodules.moe_layer,
                         config=self.config,
@@ -201,6 +217,37 @@ class MambaStack(MegatronModule):
             if layer_type == LayerSymbols.MAMBA:
                 return layer.mamba_state_shapes_per_request()
         return None
+
+    def _should_call_local_cudagraph(self, *args, **kwargs):
+        """
+        Check if we should call the local cudagraph path.
+        """
+        if not self.training and (
+            hasattr(self, 'cudagraph_manager')
+            and kwargs['attention_mask'] is None
+            and (
+                kwargs.get('inference_context') is not None
+                or kwargs.get('inference_params') is not None
+            )
+            and CudaGraphScope.full_iteration in self.config.cuda_graph_scope
+        ):
+            if kwargs['inference_context'].is_static_batching():
+                using_cuda_graph = kwargs['inference_context'].is_decode_only()
+            else:
+                using_cuda_graph = kwargs['inference_context'].using_cuda_graph_this_step()
+
+            if using_cuda_graph:
+                return True
+        return False
+
+    def __call__(self, *args, **kwargs):
+        if self._should_call_local_cudagraph(*args, **kwargs):
+            kwargs['hidden_states'] = (
+                kwargs['hidden_states'].unwrap()
+                if isinstance(kwargs['hidden_states'], WrappedTensor)
+                else kwargs['hidden_states']
+            )
+        return super().__call__(*args, **kwargs)
 
     def forward(
         self,
@@ -316,7 +363,7 @@ class MambaStack(MegatronModule):
 
         # Ensure that the tensor passed between pipeline parallel stages is
         # viewless. See related notes in TransformerBlock and TransformerLayer
-        output = make_viewless_tensor(
+        hidden_states = make_viewless_tensor(
             inp=hidden_states, requires_grad=hidden_states.requires_grad, keep_graph=True
         )
 
