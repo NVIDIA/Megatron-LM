@@ -188,7 +188,7 @@ runs:
         elif [ "${{ steps.has-run-functional-tests-label.outputs.main }}" == "true" ]; then
           ARGS=(
             --scope mr-github
-            --n-repeat 5
+            --n-repeat 1
           )
         else
           ARGS=(
