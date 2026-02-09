@@ -94,6 +94,9 @@ def add_text_generate_ptq_args(parser):
         help="Use random offsets when slicing sequences for calibration. (Only for local files)",
     )
     group.add_argument(
+        "--batch-size", type=int, default=1, help="Batch size for calibration."
+    )
+    group.add_argument(
         "--prompts",
         type=str,
         default=("Hello!|Born in California, Soyer trained as a"),
@@ -264,6 +267,7 @@ def get_calib_dataloader(
     calib_size=512,
     max_sequence_length=512,
     use_random_offset=False,
+    batch_size=1,
 ):
     """Return a dataloader/iterator for calibration using SFT or HF datasets.
 
@@ -294,14 +298,17 @@ def get_calib_dataloader(
         print_rank_0(f"Actual num samples: {min(len(dataset), calib_size)}, max seq length: {max_sequence_length}")
         print_rank_0(f"Sampling Strategy: {'Random Index' if use_random_offset else 'From Beginning'}")
 
+        batch = []
         for full_text in dataset:
             if use_random_offset and len(full_text) > max_sequence_length:
                 start_idx = random.randint(0, len(full_text) - max_sequence_length)
             else:
                 start_idx = 0
-            text = full_text[start_idx : start_idx + max_sequence_length]
-            tokens = tokenizer(text, return_tensors="pt")
-            yield tokens["input_ids"].cuda()
+            batch.append(full_text[start_idx : start_idx + max_sequence_length])
+            if len(batch) == batch_size:
+                tokens = tokenizer(batch, return_tensors="pt", padding=True, device="cuda")
+                batch = []
+                yield tokens["input_ids"]
     else:
         # HuggingFace dataset
         if use_random_offset:
@@ -312,7 +319,7 @@ def get_calib_dataloader(
             tokenizer=tokenizer,
             num_samples=calib_size,
             max_sample_length=max_sequence_length,
-            batch_size=1,
+            batch_size=batch_size,
             device="cuda",
         )  # cannot be returned since the other yield statement already makes this fn a generator
         for tokens in dataloader:
@@ -379,6 +386,7 @@ if __name__ == "__main__":
             calib_size=args.calib_size,
             max_sequence_length=args.calib_max_sequence_length,
             use_random_offset=args.calib_use_random_offset,
+            batch_size=args.batch_size,
         )
         for input_ids in tqdm(dataloader, total=args.calib_size, disable=torch.distributed.get_rank()):
             _ = simple_generate(model, input_ids, osl=1)
@@ -395,6 +403,9 @@ if __name__ == "__main__":
             raise ValueError(f"Unsupported quantization config {args.export_quant_cfg}.")
         print_rank_0("Quantizing the model...")
         mtq_config = get_modelopt_torch_quantization_config()
+
+        if tokenizer.pad_token is None:
+            tokenizer.pad_token = tokenizer.eos_token
 
         if args.weight_only:
             mtq.quantize(unwrapped_model, mtq_config)
