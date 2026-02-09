@@ -1,6 +1,7 @@
 # Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
 import asyncio
+import gc
 import math
 import random
 import types
@@ -45,6 +46,13 @@ from megatron.core.transformer.enums import CudaGraphScope
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.utils import is_fa_min_version, is_te_min_version
 from tests.unit_tests.test_utilities import Utils
+
+try:
+    from torch_memory_saver import torch_memory_saver  # noqa: F401
+
+    HAVE_TORCH_MEMORY_SAVER = True
+except ImportError:
+    HAVE_TORCH_MEMORY_SAVER = False
 
 
 def skip_if_mamba_sequence_packing_not_available(model_provider: str):
@@ -111,6 +119,8 @@ class DynamicEngineTestConfig:
     # relevant to the test. The tests only check if the required
     # context attributes are set correctly.
     suspend_resume_interval: Optional[int] = None
+    kv_cache_management_mode: str = "persist"
+    reset_cuda_graphs: bool = False
 
     fp8: bool = False
 
@@ -226,6 +236,8 @@ class TestDynamicInferenceEngine:
                 max_tokens=test_config.context_max_tokens,
                 mamba_inference_state_config=mamba_inference_state_config,
                 materialize_only_last_token_logits=test_config.materialize_only_last_token_logits,
+                kv_cache_management_mode=test_config.kv_cache_management_mode,
+                reset_cuda_graphs=test_config.reset_cuda_graphs,
                 use_flashinfer_fused_rope=None,  # default to using flash-infer if available
                 # this is for compatibility with the LTS environment
                 unified_memory_level=0,  # unit tests currently broken with UVM
@@ -1358,3 +1370,97 @@ class TestDynamicInferenceEngine:
             assert context.max_requests == 4
             assert step_count == 34
         assert context.block_allocator.active_count == 655
+
+    @pytest.mark.internal
+    @pytest.mark.skipif(
+        not is_fa_min_version("2.7.3"), reason="need latest flash attn for dynamic batching"
+    )
+    @pytest.mark.parametrize("reset_cuda_graphs", [False, True])
+    @pytest.mark.parametrize("kv_cache_management_mode", ["persist", "offload", "remove"])
+    @torch.inference_mode()
+    def test_suspend_resume_cycle(self, kv_cache_management_mode, reset_cuda_graphs):
+        """Full suspend → resume cycle with memory, data, and address checks."""
+        needs_tms = not reset_cuda_graphs and kv_cache_management_mode != "persist"
+
+        test_config = DynamicEngineTestConfig(
+            kv_cache_management_mode=kv_cache_management_mode,
+            reset_cuda_graphs=reset_cuda_graphs,
+        )
+
+        # Without TMS, these combos must assert on construction.
+        if needs_tms and not HAVE_TORCH_MEMORY_SAVER:
+            with pytest.raises(AssertionError, match="static KV cache memory"):
+                self._build_test_env(test_config)
+            return
+
+        env = self._build_test_env(test_config)
+        engine = env.engine
+        context = engine.context
+
+        assert not engine.is_suspended
+        assert context.is_tensor_state_allocated
+
+        frees_memory = kv_cache_management_mode != "persist"
+        preserves_data = kv_cache_management_mode != "remove"
+
+        # Write a deterministic pattern for data integrity check.
+        if preserves_data:
+            context.memory_buffer.copy_(torch.randn_like(context.memory_buffer))
+            expected = context.memory_buffer.clone()
+
+        addr_before = context.memory_buffer.data_ptr()
+
+        torch.cuda.synchronize()
+        mem_before = torch.cuda.memory_allocated()
+
+        # Suspend.
+        engine.suspend()
+        assert engine.is_suspended
+        assert not context.is_tensor_state_allocated
+
+        gc.collect()
+        torch.cuda.empty_cache()
+        torch.cuda.synchronize()
+        mem_suspended = torch.cuda.memory_allocated()
+
+        if frees_memory:
+            assert mem_suspended < mem_before, (
+                f"GPU memory should decrease after suspend "
+                f"(mode={kv_cache_management_mode}). "
+                f"Before: {mem_before}, After: {mem_suspended}"
+            )
+        else:
+            tolerance = max(0.05 * mem_before, 4096)
+            assert abs(mem_suspended - mem_before) < tolerance, (
+                f"Memory should not substantially change on suspend. "
+                f"Before: {mem_before}, Suspended: {mem_suspended}"
+            )
+
+        # Resume.
+        engine.resume()
+        assert not engine.is_suspended
+        assert context.is_tensor_state_allocated
+
+        if frees_memory:
+            torch.cuda.synchronize()
+            mem_resumed = torch.cuda.memory_allocated()
+            assert mem_resumed > mem_suspended, (
+                f"GPU memory should increase after resume. "
+                f"Suspended: {mem_suspended}, Resumed: {mem_resumed}"
+            )
+
+        # Data integrity.
+        if preserves_data:
+            torch.testing.assert_close(
+                context.memory_buffer,
+                expected,
+                msg="memory_buffer data must be identical after suspend/resume",
+            )
+
+        # Address stability when CUDA graphs are not reset.
+        if not reset_cuda_graphs:
+            addr_after = context.memory_buffer.data_ptr()
+            assert addr_before == addr_after, (
+                f"Tensor address must be stable when CUDA graphs are not reset. "
+                f"Before: {addr_before:#x}, After: {addr_after:#x}"
+            )
