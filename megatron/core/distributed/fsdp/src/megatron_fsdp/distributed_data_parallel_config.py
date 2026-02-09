@@ -148,6 +148,18 @@ class DistributedDataParallelConfig:
       to minimize the registration time.
     """
 
+    use_precision_aware_optimizer: bool = False
+    """Enable the precision-aware optimizer in TransformerEngine.
+    This optimizer supports storing main parameters and optimizer states in reduced
+    precision formats such as FP16, BF16, or FP8.
+
+    When enabled in `DistributedDataParallelConfig`, Megatron-FSDP recognizes the
+    precision-aware optimizer and generates a `decoupled_grad`, a special gradient
+    that can have a different data type than the parameters.
+
+    Default is `False`.
+    """
+
     def __post_init__(self):
         import os
 
