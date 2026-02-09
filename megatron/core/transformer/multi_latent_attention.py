@@ -38,7 +38,9 @@ from megatron.core.transformer.custom_layers.transformer_engine import (
 )
 from megatron.core.transformer.enums import AttnMaskType
 from megatron.core.transformer.spec_utils import ModuleSpec, build_module
+from megatron.core.transformer.torch_norm import LayerNormBuilder
 from megatron.core.transformer.transformer_config import MLATransformerConfig
+from megatron.core.typed_torch import apply_module
 from megatron.core.utils import deprecate_inference_params, get_pg_size, is_te_min_version
 
 try:
@@ -69,6 +71,10 @@ except ImportError:
 class MLASelfAttentionSubmodules:
     """Submodules for the MLA self-attention layer."""
 
+    # TODO(nschank): Move layernorms back to the bottom once all other layers have defaults removed.
+    q_layernorm: LayerNormBuilder
+    kv_layernorm: LayerNormBuilder
+
     linear_q_proj: Union[ModuleSpec, type] = None
     linear_q_down_proj: Union[ModuleSpec, type] = None
     linear_q_up_proj: Union[ModuleSpec, type] = None
@@ -76,8 +82,6 @@ class MLASelfAttentionSubmodules:
     linear_kv_up_proj: Union[ModuleSpec, type] = None
     core_attention: Union[ModuleSpec, type] = None
     linear_proj: Union[ModuleSpec, type] = None
-    q_layernorm: Union[ModuleSpec, type] = None
-    kv_layernorm: Union[ModuleSpec, type] = None
 
 
 class MultiLatentAttention(Attention):
@@ -495,15 +499,13 @@ class MLASelfAttention(MultiLatentAttention):
         )
 
         if self.config.q_lora_rank is not None:
-            self.q_layernorm = build_module(
-                submodules.q_layernorm,
+            self.q_layernorm = submodules.q_layernorm(
                 hidden_size=self.config.q_lora_rank,
                 config=self.config,
                 eps=self.config.layernorm_epsilon,
             )
 
-        self.kv_layernorm = build_module(
-            submodules.kv_layernorm,
+        self.kv_layernorm = submodules.kv_layernorm(
             hidden_size=self.config.kv_lora_rank,
             config=self.config,
             eps=self.config.layernorm_epsilon,
@@ -635,9 +637,9 @@ class MLASelfAttention(MultiLatentAttention):
 
         if self.config.q_lora_rank is not None:
             # q_compressed: [num_tokens, q_lora_rank]
-            q_compressed = self.q_layernorm(q_compressed)
+            q_compressed = apply_module(self.q_layernorm)(q_compressed)
 
-        kv_compressed = self.kv_layernorm(kv_compressed)
+        kv_compressed = apply_module(self.kv_layernorm)(kv_compressed)
 
         # =========================================
         # QKV up projection and RoPE apply

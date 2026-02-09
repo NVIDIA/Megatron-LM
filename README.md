@@ -62,8 +62,6 @@ Install Megatron Core with pip:
 </details>
 
 
-
-
 # Project Structure
 
 ```
@@ -77,18 +75,17 @@ Megatron-LM/
 │   │   ├── distributed/         # Distributed training (FSDP, DDP)
 │   │   ├── optimizer/           # Optimizers
 │   │   ├── datasets/            # Dataset loaders
-│   │   ├── inference/           # Inference engines
+│   │   ├── inference/           # Inference engines and server
 │   │   └── export/              # Model export (e.g. TensorRT-LLM)
 │   ├── training/                # Training scripts
-│   ├── inference/               # Inference server
 │   ├── legacy/                  # Legacy components
-│   └── post_training/           # Post-training (RLHF, etc.)
+│   ├── post_training/           # Post-training (quantization, distillation, pruning, etc.)
+│   └── rl/                      # Reinforcement learning (RLHF, etc.)
 ├── examples/                    # Ready-to-use training examples
 ├── tools/                       # Utility tools
 ├── tests/                       # Comprehensive test suite
 └── docs/                        # Documentation
 ```
-
 
 
 # Performance Benchmarking
@@ -127,13 +124,10 @@ We also strong scaled the standard GPT-3 model (our version has slightly more th
 ![Strong scaling](images/strong_scaling.png)
 
 
-
-
-
-
 # Roadmaps
 
 - **[MoE Roadmap](https://github.com/NVIDIA/Megatron-LM/issues/1729)** - DeepSeek-V3, Qwen3, advanced parallelism, FP8 optimizations, and Blackwell enhancements
+
 
 # Resources
 
