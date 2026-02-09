@@ -32,6 +32,8 @@ def common_test_simple_sharded_state_dict_save_load(
     )
     with TempNamedDir(tmp_path_dist_ckpt / 'test_gpt_model') as ckpt_dir:
         # Save
+        import os
+        assert os.path.isdir(tmp_path_dist_ckpt / 'test_gpt_model')
         sharded_state_dict = gpt_model.sharded_state_dict()
         save(sharded_state_dict, ckpt_dir)
 
@@ -82,7 +84,7 @@ def common_test_parallel_reconfiguration_e2e(
             pipeline_model_parallel_size=src_tp_pp[1],
             **src_model_init_kwargs,
         )
-        save_strategy = TorchDistSaveShardedStrategy()
+        save_strategy = TorchDistSaveShardedStrategy('torch_dist', 1)
         if use_fpsl:
             save_strategy = FullyParallelSaveStrategyWrapper(
                 save_strategy,
