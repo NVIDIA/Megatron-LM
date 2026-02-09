@@ -1,0 +1,54 @@
+type: basic
+format_version: 1
+maintainers: [mcore]
+loggers: [stdout]
+spec:
+  name: "{test_case}_{environment}_{platforms}"
+  model: gpt
+  build: mcore-pyt-{environment}
+  nodes: 1
+  gpus: 1
+  n_repeat: 1
+  platforms: dgx_a100
+  artifacts:
+    /workspace/data/mcore_mistral/model: model/mcore_mistral/nemo_minitron-0.5b/v1
+    /workspace/data/mcore_mistral/tokenizer: model/mcore_mistral/nemo_minitron-0.5b/v1
+  script_setup: |
+    unset https_proxy
+    echo "machine gitlab-master.nvidia.com login okoenig password $RO_API_TOKEN" | tee -a /root/.netrc
+
+    # Checkout latest
+    cd /opt
+    rm -rf /opt/megatron-lm; mkdir megatron-lm; cd megatron-lm
+    git init
+    git remote add origin $MCORE_REPO
+    git fetch origin '+refs/merge-requests/*:refs/remotes/merge-requests/*'
+    git fetch origin $MCORE_MR_COMMIT
+    git checkout $MCORE_MR_COMMIT
+    git rev-parse HEAD
+    # Checkout backwards-ref
+    cd /opt
+    rm -rf /opt/megatron-lm-legacy; mkdir megatron-lm-legacy; cd megatron-lm-legacy
+    git init
+    git remote add origin $MCORE_REPO
+    git fetch origin $MCORE_BACKWARDS_COMMIT
+    git checkout $MCORE_BACKWARDS_COMMIT
+    git rev-parse HEAD
+    rm -rf megatron; cp -a /opt/megatron-lm/megatron ./
+  script: |-
+    ls
+    cd /opt/megatron-lm
+
+    uv run python -m torch.distributed.run \
+      --log-dir {assets_dir}/logs/1 \
+      --tee "0:3,7:3" \
+      --redirects "3" \
+      --nproc_per_node 1 \
+      tests/functional_tests/test_cases/gpt/gpt_dynamic_inference_tp1_pp1_583m_cuda_graphs_validation/cuda_graphs.py --checkpoint-dir /workspace/data/mcore_mistral/model --tokenizer-model /workspace/data/mcore_mistral/tokenizer/multiMixV8.gpt4o_nc_sd.500000.128k.vocab.json
+
+products:
+  - test_case: [gpt_dynamic_inference_tp1_pp1_583m_cuda_graphs_validation]
+    products:
+      - environment: [dev]
+        scope: [mr-broken]
+        platforms: [dgx_h100]

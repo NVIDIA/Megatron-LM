@@ -35,7 +35,8 @@ class BlendedMegatronDatasetBuilder(object):
 
         is_built_on_rank (Callable): A callable which returns True if the dataset should be built on
             the current rank and False otherwise. It should be Megatron Core parallelism aware i.e.
-            global rank, local group rank, and virtual rank may inform its return value.
+            global rank, local group rank, and virtual rank may inform its return value. Should
+            return true for exactly one process on global rank 0.
 
         config (BlendedMegatronDatasetConfig): The config object which informs dataset creation
     """
@@ -71,13 +72,6 @@ class BlendedMegatronDatasetBuilder(object):
                     assert weights_are_none, f"""size_is_none => weights_are_none fails 
                     for {split.name} split
                     This can occur with multiple validation sets if datasets have weights"""
-
-        if torch.distributed.is_initialized():
-            gb_rank = torch.distributed.get_rank()
-            if gb_rank == 0:
-                assert (
-                    self.is_built_on_rank()
-                ), "is_built_on_rank must return True when global rank = 0"
 
     def build(self) -> List[Optional[TopLevelDataset]]:
         """Build all dataset splits according to the provided blend(s)

@@ -1,5 +1,5 @@
 ENV_VARS:
-  CUDA_DEVICE_MAX_CONNECTIONS: 1
+  CUDA_DEVICE_MAX_CONNECTIONS: 32
   NVTE_ALLOW_NONDETERMINISTIC_ALGO: 0
   PYTORCH_CUDA_ALLOC_CONF: expandable_segments:True
   NCCL_NVLS_ENABLE: 0
@@ -46,7 +46,7 @@ MODEL_ARGS:
   # Add network size args
   --num-layers: 16
   --moe-layer-freq: ([0]*3+[1]*13)
-  --pipeline-model-parallel-layout: Et*3\\|\\(tt\\|\\)*6tL # Et*3|(tt|)*6tL
+  --pipeline-model-parallel-layout: Et*3\\|\\(tt\\|\\)*6tmL # Et*3|(tt|)*6tmL
   --hidden-size: 1024
   --ffn-hidden-size: 4096
   --num-attention-heads: 32
@@ -125,6 +125,7 @@ MODEL_ARGS:
   # Add mixed precision args
   --bf16: true
   --exit-interval: 50
+  --overlap-moe-expert-parallel-comm: true
 TEST_TYPE: regular # Usually ckpt-resume, but as a WAR to #513 set to regular
 METRICS:
   - "iteration-time"

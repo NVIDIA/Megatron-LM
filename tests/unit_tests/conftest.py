@@ -95,3 +95,17 @@ def ensure_test_data():
             # Don't fail the tests, just warn
     else:
         print("Test data already available at /opt/data")
+
+
+@pytest.fixture(autouse=True)
+def reset_env_vars():
+    """Reset environment variables"""
+    # Store the original environment variables before the test
+    original_env = dict(os.environ)
+
+    # Run the test
+    yield
+
+    # After the test, restore the original environment
+    os.environ.clear()
+    os.environ.update(original_env)

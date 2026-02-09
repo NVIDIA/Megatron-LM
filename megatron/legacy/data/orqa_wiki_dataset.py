@@ -55,7 +55,7 @@ def build_tokens_types_paddings_from_text(row, tokenizer, max_seq_length):
     context_ids = tokenizer.tokenize(row['text'])
 
     # Appending the title of the context at front
-    extended_context_ids = title_ids + [tokenizer.sep_id] + context_ids
+    extended_context_ids = title_ids + [tokenizer.sep] + context_ids
 
     context_ids, context_types, context_pad_mask = \
         build_tokens_types_paddings_from_ids(extended_context_ids, 

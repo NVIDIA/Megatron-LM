@@ -49,6 +49,7 @@ MODEL_ARGS:
   --no-gradient-accumulation-fusion: true
   --use-mcore-models: true
   --ckpt-format: torch_dist
+  --dist-ckpt-optim-fully-reshardable: true
   --dist-ckpt-strictness: log_all  # backward compatibility for TE changes
   --data-cache-path: ${DATA_CACHE_PATH}
   --bf16: true

@@ -5,9 +5,12 @@ import numpy as np
 import pytest
 import torch
 
-from megatron.inference.text_generation_server import MegatronServer
+pytest.importorskip("flask")
+pytest.importorskip("flask_restful")
+
+from megatron.core.inference.text_generation_server import MegatronServer
 from megatron.training import tokenizer
-from tests.unit_tests.inference.engines.test_static_engine import TestStaticInferenceEngine
+from tests.unit_tests.inference.engines.test_static_engine import StaticInferenceEngineTestHarness
 from tests.unit_tests.test_tokenizer import GPT2_VOCAB_SIZE, gpt2_tiktok_vocab
 from tests.unit_tests.test_utilities import Utils
 
@@ -19,10 +22,10 @@ def gpt2_tiktoken_tokenizer(gpt2_tiktok_vocab):
 
 @pytest.fixture(scope="module")
 def static_inference_engine(gpt2_tiktoken_tokenizer):
-    engine_wrapper = TestStaticInferenceEngine()
+    engine_wrapper = StaticInferenceEngineTestHarness()
     engine_wrapper.setup_engine(vocab_size=gpt2_tiktoken_tokenizer.vocab_size)
 
-    controller = engine_wrapper.static_engine.text_generation_controller
+    controller = engine_wrapper.static_engine.controller
     controller.tokenizer = gpt2_tiktoken_tokenizer
 
     def mock_forward(*args, **kwargs):
@@ -50,16 +53,38 @@ def client(app):
     return app.test_client()
 
 
-@unittest.mock.patch('megatron.inference.endpoints.completions.send_do_generate')
-@unittest.mock.patch("megatron.inference.text_generation.tokenization.get_tokenizer")
-@unittest.mock.patch("megatron.inference.endpoints.completions.get_tokenizer")
-def test_completions_endpoint(
-    mock_get_tokenizer1, mock_get_tokenizer2, mock_send_do_generate, client, gpt2_tiktoken_tokenizer
-):
+@unittest.mock.patch(
+    'megatron.core.inference.text_generation_server.text_generation_server.send_do_generate'
+)
+def test_generations_endpoint(mock_send_do_generate, client, gpt2_tiktoken_tokenizer):
     Utils.initialize_distributed()
 
-    mock_get_tokenizer1.return_value = gpt2_tiktoken_tokenizer
-    mock_get_tokenizer2.return_value = gpt2_tiktoken_tokenizer
+    prompts = ["twinkle twinkle little star, how I wonder what you are"]
+    request_data = {"prompts": prompts, "tokens_to_generate": 10, "logprobs": True}
+
+    response = client.put('/api', json=request_data)
+
+    assert response.status_code == 200
+    assert response.is_json
+    json_data = response.get_json()
+    assert 'text' in json_data
+    assert 'logprobs' in json_data
+    assert len(json_data['text']) == len(prompts)
+    assert len(json_data['logprobs']) == len(prompts)
+
+    # Verify that beam search does not work
+    request_data["beam_width"] = 1
+    response = client.put('/api', json=request_data)
+    assert response.status_code == 400  # Bad Request
+
+    mock_send_do_generate.assert_called_once()
+
+
+@unittest.mock.patch(
+    "megatron.core.inference.text_generation_server.endpoints.completions.send_do_generate"
+)
+def test_completions_endpoint(mock_send_do_generate, client, gpt2_tiktoken_tokenizer):
+    Utils.initialize_distributed()
 
     twinkle = ("twinkle twinkle little star,", " how I wonder what you are")
     request_data = {"prompt": twinkle[0] + twinkle[1], "max_tokens": 0, "logprobs": 5, "echo": True}

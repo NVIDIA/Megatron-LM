@@ -201,14 +201,12 @@ Note: The MoE model structure is defined through script arguments. All MoE-relat
 - To enable DeepEP in your training configuration, simply set `--moe-token-dispatcher-type=flex` and `--moe-enable-deepep` in your command line arguments.
 
 ### CUDA Graph Support
-CUDA Graph functionality can be enabled through two options:
+CUDA Graph functionality can be enabled through the `--cuda-graph-impl` option. There are two implementations:
 
-1. `--enable-cuda-graph`: Captures cuda graphs using the MCore-internal cuda graph manager.
-2. `--external-cuda-graph`: Captures cuda graphs using the TE `make_graphed_callables()` interface.
+1. `--cuda-graph-impl=local`: Captures cuda graphs using the MCore-internal cuda graph manager.
+2. `--cuda-graph-impl=transformer_engine`: Captures cuda graphs using the TE `make_graphed_callables()` interface.
 
-Note: These two options cannot be enabled simultaneously.
-
-To use `--external-cuda-graph`, the user should call related methods `cuda_graph_capture()` and `cuda_graph_set_manual_hooks()` in the training script. Please refer to the usage in `megatron/training/training.py`.
+To use `--cuda-graph-impl=transformer_engine`, the user should call related methods `TECudaGraphHelper.create_cudagraphs()` and `TECudaGraphHelper.cuda_graph_set_manual_hooks()` in the training script. Please refer to the usage in `megatron/training/training.py`.
 
 For MoE models, certain configurations may prevent CUDA Graph capture of MoE layers. Specifically, when `--moe-expert-capacity-factor` and `--moe-pad-expert-input-to-capacity` are not set, the resulting dynamic shapes make MoE layers uncapturable. In such cases, you can still leverage CUDA Graphs for the attention layers (operations in `TransformerLayer._forward_attention()`) by setting `--cuda-graph-scope=attn`, while leaving the MoE layers (operations in `TransformerLayer._forward_mlp()`) unmodified. See the argument description for more usage of `--cuda-graph-scope`.
 
@@ -217,8 +215,11 @@ For MoE models, certain configurations may prevent CUDA Graph capture of MoE lay
 Enable A2A overlap across different batches inspired by the DSv3 DualPipe implmentation. \
 **Features** 
 - Hide ep a2a communication by batch-level overlapping
-- Interleaved pipeline parallel will be supported soon
 - Split weight gradient and activation gradient computations for better overlap with communications
+- Support interleaved pipelined parallelism
+- Support FP8 training
+- Support MTP (`-mtp-num-layers 1` only, multiple MTP layers are not supported yet.)
+
 
 **Usage** 
 ```bash

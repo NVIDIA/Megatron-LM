@@ -7,7 +7,7 @@ from torch import testing
 
 from megatron.core.distributed import DistributedDataParallel, DistributedDataParallelConfig
 from megatron.core.hyper_comm_grid import HyperCommGrid
-from megatron.core.process_groups_config import GradCommProcessGroups, ModelCommProcessGroups
+from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.transformer import TransformerConfig
 from tests.unit_tests.test_utilities import Utils
 
@@ -78,23 +78,20 @@ class TestDistributedDataParallel:
             torch.distributed.init_process_group(backend='nccl')
 
         # Create HyperCommGrid with dimension ep, pp, dp (reversed from device mesh order)
-        grid = HyperCommGrid([1, 1, dp_size], ["ep", "pp", "dp"])
+        grid = HyperCommGrid([1, 1, 1, 1, dp_size], ["tp", "cp", "ep", "pp", "dp"])
 
         # Create process groups config with ONLY dp group
-        grad_comm_pgs = GradCommProcessGroups()
-        model_comm_pgs = ModelCommProcessGroups()
+        pg_collection = ProcessGroupCollection()
 
-        grad_comm_pgs.dp = grid.create_pg("dp")
-        model_comm_pgs.pp = grid.create_pg("pp")
-        model_comm_pgs.ep = grid.create_pg("ep")
+        pg_collection.dp = grid.create_pg("dp")
+        pg_collection.dp_cp = grid.create_pg(["dp", "cp"])
+        pg_collection.pp = grid.create_pg("pp")
+        pg_collection.tp = grid.create_pg("tp")
+        pg_collection.ep = grid.create_pg("ep")
 
         # Wrap second model with minimal process groups (only dp)
         ddp_model2 = DistributedDataParallel(
-            transformer_config,
-            ddp_config=ddp_config,
-            module=model2,
-            grad_comm_pgs=grad_comm_pgs,
-            model_comm_pgs=model_comm_pgs,
+            transformer_config, ddp_config=ddp_config, module=model2, pg_collection=pg_collection
         )
 
         # Create identical inputs with integer values

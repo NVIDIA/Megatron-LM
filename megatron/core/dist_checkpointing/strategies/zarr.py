@@ -175,6 +175,11 @@ def _create_zarr_array(sharded_tensor: ShardedTensor, checkpoint_dir: Path):
             compressor=None,
             fill_value=None,
             write_empty_chunks=True,
+            synchronizer=(
+                zarr.ProcessSynchronizer(str(checkpoint_dir / f'{sharded_tensor.key}.sync'))
+                if sharded_tensor.flattened_range is not None
+                else None
+            ),
         )
         logger.debug(f"Created a new Zarr array at {checkpoint_dir / sharded_tensor.key}")
     except zarr.errors.ContainsArrayError as e:
@@ -328,7 +333,7 @@ def load_zarr_based_sharded_metadata(
 
     sharded_state_dict = {}
     for subdir in checkpoint_dir.iterdir():
-        if not subdir.is_dir() or not (subdir / ".zarray").exists():
+        if not subdir.is_dir() or not (subdir / ".zarray").exists() or subdir.suffix == ".sync":
             continue
         key = subdir.name
         arr_shape, arr_dtype = get_shape_dtype_fn(str(subdir))

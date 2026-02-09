@@ -1,8 +1,10 @@
 # Copyright (c) 2025, NVIDIA CORPORATION. All rights reserved.
 
+import pytest
 import torch.distributed as dist
 
-from megatron.core.process_groups_config import GradCommProcessGroups, ModelCommProcessGroups
+from megatron.core.process_groups_config import ProcessGroupCollection
+from tests.unit_tests.test_utilities import Utils
 
 
 class TestProcessGroupsConfig:
@@ -14,7 +16,7 @@ class TestProcessGroupsConfig:
         mock_pg2 = mocker.Mock(spec=dist.ProcessGroup)
 
         # Create instance
-        model_pgs = ModelCommProcessGroups()
+        model_pgs = ProcessGroupCollection()
 
         # Test setting attributes after creation
         model_pgs.tp = mock_pg1
@@ -30,12 +32,12 @@ class TestProcessGroupsConfig:
         assert not hasattr(model_pgs, 'cp')  # Not set yet
 
     def test_grad_comm_process_groups(self, mocker):
-        """Test basic functionality of GradCommProcessGroups."""
+        """Test basic functionality of ProcessGroupCollection."""
         # Create mock process groups
         mock_pg = mocker.Mock(spec=dist.ProcessGroup)
 
         # Create instance
-        grad_pgs = GradCommProcessGroups()
+        grad_pgs = ProcessGroupCollection()
 
         # Test setting attributes after creation
         grad_pgs.dp = mock_pg
@@ -54,7 +56,7 @@ class TestProcessGroupsConfig:
         mock_pg2 = mocker.Mock(spec=dist.ProcessGroup)
 
         # Create instance
-        model_pgs = ModelCommProcessGroups()
+        model_pgs = ProcessGroupCollection()
 
         # Set the hierarchical context parallel groups
         model_pgs.hcp = [mock_pg1, mock_pg2]
@@ -64,3 +66,34 @@ class TestProcessGroupsConfig:
         assert len(model_pgs.hcp) == 2
         assert model_pgs.hcp[0] == mock_pg1
         assert model_pgs.hcp[1] == mock_pg2
+
+
+class TestPGConfigDefaultInitialization:
+
+    def setup_method(self, method):
+        Utils.initialize_model_parallel(1, 1)
+
+    def teardown_method(self, method):
+        Utils.destroy_model_parallel()
+
+    def test_default_initialization(self):
+        """Test default initialization of ProcessGroupCollection."""
+        # Create instance
+        model_pgs = ProcessGroupCollection.use_mpu_process_groups()
+
+        # Test that instance was created successfully
+        assert hasattr(model_pgs, 'tp')
+        assert hasattr(model_pgs, 'pp')
+        assert hasattr(model_pgs, 'dp')
+        assert hasattr(model_pgs, 'dp_cp')
+
+        # Test that only required process groups were initialized
+        model_pgs = ProcessGroupCollection.use_mpu_process_groups(['tp', 'pp', 'cp'])
+        assert hasattr(model_pgs, 'tp')
+        assert hasattr(model_pgs, 'pp')
+        assert hasattr(model_pgs, 'cp')
+        assert not hasattr(model_pgs, 'dp')
+
+        # Test that an error is raised if an invalid process group is requested
+        with pytest.raises(ValueError, match=r"Invalid process groups requested"):
+            model_pgs = ProcessGroupCollection.use_mpu_process_groups(['tp', 'pp', 'foo'])

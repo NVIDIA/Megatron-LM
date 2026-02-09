@@ -1,0 +1,9 @@
+- agent_type: examples.rl.environments.math.dapo_agent.DAPOAgent
+  agent_args:
+    format_reward: 0.0
+  weight: 1.0
+- agent_type: examples.rl.environments.math.aime_agent.AIMEAgent
+  agent_args:
+    format_reward: 0.0
+  weight: 0.0
+  evaluation_only: true

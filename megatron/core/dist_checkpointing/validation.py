@@ -450,6 +450,7 @@ def _validate_sharding_for_key(rank_sharding: List[Tuple[int, ShardedTensor]]):
     local_shape = some_rank_shard.local_shape
     dtype = some_rank_shard.dtype
     has_flattened_range = some_rank_shard.flattened_range is not None
+    has_regular_sharding_grid = some_rank_shard.has_regular_grid
     for rank, sharding in rank_sharding:
         assert sharding.dtype == dtype, (sharding.dtype, dtype, some_rank_shard)
         assert sharding.global_shape == global_shape, (
@@ -457,16 +458,25 @@ def _validate_sharding_for_key(rank_sharding: List[Tuple[int, ShardedTensor]]):
             global_shape,
             some_rank_shard,
         )
-        assert sharding.local_shape == local_shape, (
-            sharding.local_shape,
-            local_shape,
+        assert sharding.has_regular_grid == has_regular_sharding_grid, (
+            has_regular_sharding_grid,
             some_rank_shard,
         )
+        if has_regular_sharding_grid:
+            assert sharding.local_shape == local_shape, (
+                sharding.local_shape,
+                local_shape,
+                some_rank_shard,
+            )
         assert (sharding.flattened_range is not None) == has_flattened_range, (
             (sharding.flattened_range is not None),
             has_flattened_range,
             some_rank_shard,
         )
+
+    if not has_regular_sharding_grid:
+        # In case of uneven sharding we defer the validation to DCP
+        return
 
     shard_access_cnt = _compute_shards_access(rank_sharding)
     if has_flattened_range:

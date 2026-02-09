@@ -12,7 +12,7 @@ from megatron.energon.flavors.webdataset import DefaultDecoderWebdatasetFactory
 @dataclass
 class SampleListSample(Sample):
     """Sample type for a list of samples of any type which needs to be packed together.
-    
+
     This is useful for datasets which are packed offline.
     """
 
@@ -46,3 +46,6 @@ class OfflineTargetAspectRatioSample(Sample):
     #: The texts of the sequence
     texts: List[str]
     target_aspect_ratio: List[List]
+
+    if not hasattr(Sample, "__subflavor__"):
+        __subflavor__: str

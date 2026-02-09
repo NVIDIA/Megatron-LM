@@ -38,6 +38,7 @@ ENV PATH="/root/.local/bin:$PATH"
 RUN curl -LsSf https://astral.sh/uv/${UV_VERSION}/install.sh | sh
 ENV UV_PROJECT_ENVIRONMENT=/opt/venv
 ENV PATH="$UV_PROJECT_ENVIRONMENT/bin:$PATH"
+ENV VIRTUAL_ENV=$UV_PROJECT_ENVIRONMENT
 ENV UV_LINK_MODE=copy
 
 RUN
@@ -52,12 +53,28 @@ COPY --from=build_groupedgemm $WHEEL_DIR/*.whl $WHEEL_DIR/
 RUN bash -ex <<"EOF"
     uv venv ${UV_PROJECT_ENVIRONMENT} --system-site-packages
 
-    uv sync --extra lts --extra mlm --link-mode copy --locked
+    uv sync --extra lts --extra mlm --link-mode copy --locked \
+        --no-install-package torch \
+        --no-install-package torchvision \
+        --no-install-package triton \
+        --no-install-package nvidia-cublas-cu12 \
+        --no-install-package nvidia-cuda-cupti-cu12 \
+        --no-install-package nvidia-cuda-nvrtc-cu12 \
+        --no-install-package nvidia-cuda-runtime-cu12 \
+        --no-install-package nvidia-cudnn-cu12 \
+        --no-install-package nvidia-cufft-cu12 \
+        --no-install-package nvidia-cufile-cu12 \
+        --no-install-package nvidia-curand-cu12 \
+        --no-install-package nvidia-cusolver-cu12 \
+        --no-install-package nvidia-cusparse-cu12 \
+        --no-install-package nvidia-cusparselt-cu12 \
+        --no-install-package nvidia-nccl-cu12
 
     bash docker/common/install_source_wheels.sh --input-wheel-dir $WHEEL_DIR/ --environment lts
 EOF
 ENV PYTHONPATH="/opt/megatron-lm:$PYTHONPATH"
 COPY assets/ /opt/data/
+ENV UV_PYTHON=$UV_PROJECT_ENVIRONMENT/bin/python
 
 ##### For NVIDIANS only #####
 FROM main as jet

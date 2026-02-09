@@ -51,17 +51,40 @@ if __name__ == "__main__":
 
     args = get_args()
 
+    # Meta device initialization for ParallelLinear only works if using cpu initialization.
+    # Meta device initialization is used such that models can be materialized in low-precision
+    # directly when ModelOpt real quant is used. Otherwise, the model is first initialized
+    # as BF16 in memory which may result in OOM and defeat the purpose of real quant.
+    args.use_cpu_initialization = True
+    if not args.init_model_with_meta_device:
+        warnings.warn(
+            "--init-model-with-meta-device is not set. If you would like to resume the "
+            "model in low-bit directly (low-memory initialization and skipping 16-bit), "
+            "--init-model-with-meta-device must be set.",
+            UserWarning,
+        )
+
     model = get_model(functools.partial(model_provider, parallel_output=True), wrap_with_ddp=False)
+
+    # Materialize the model from meta device to cpu before loading the checkpoint. 
+    unwrapped_model = unwrap_model(model)[0]
+    unwrapped_model.to_empty(device="cpu") 
 
     if args.load is not None:
         _ = load_modelopt_checkpoint(model)
 
-    unwrapped_model = unwrap_model(model)[0]
+    # Decide whether we are exporting only the extra_modules (e.g. EAGLE3).
+    # Only the last pp stage may have extra_modules, hence broadcast from the last rank.
+    export_extra_modules = hasattr(unwrapped_model, "eagle_module") or hasattr(unwrapped_model, "medusa_heads")
+    torch.distributed.broadcast_object_list(
+        [export_extra_modules],
+        src=torch.distributed.get_world_size() - 1,
+    )
 
     mtex.export_mcore_gpt_to_hf(
         unwrapped_model,
         args.pretrained_model_name,
-        export_extra_modules=args.export_extra_modules,
+        export_extra_modules=export_extra_modules,
         dtype=torch.bfloat16,
         export_dir=args.export_dir,
     )

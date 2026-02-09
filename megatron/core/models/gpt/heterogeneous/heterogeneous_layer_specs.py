@@ -1,6 +1,7 @@
 # Copyright (c) 2025, NVIDIA CORPORATION. All rights reserved.
 
 import warnings
+from typing import Optional
 
 from megatron.core.fusions.fused_bias_dropout import get_bias_dropout_add
 from megatron.core.tensor_parallel.layers import ColumnParallelLinear, RowParallelLinear
@@ -164,13 +165,20 @@ def _get_sharded_state_dict_keys_map(block_config: TransformerBlockConfig, use_t
     return mapping
 
 
-def get_gpt_heterogeneous_layer_spec(config: HeterogeneousTransformerConfig, use_te: bool = False):
+def get_gpt_heterogeneous_layer_spec(
+    config: HeterogeneousTransformerConfig,
+    use_te: bool = False,
+    vp_stage: Optional[int] = None,
+    pp_rank: Optional[int] = None,
+):
     """
     Returns a list of ModuleSpec objects for the transformer layers in the heterogeneous model.
 
     Args:
         config (HeterogeneousTransformerConfig): Heterogeneous Transformer configuration.
         use_te (bool, optional): To use Transformer-Engine. Defaults to False.
+        vp_stage (Optional[int]): Virtual pipeline stage number.
+        pp_rank (Optional[int]): Pipeline parallel rank.
 
     Returns:
         ModuleSpec: Module specification for the transformer layers
@@ -200,8 +208,8 @@ def get_gpt_heterogeneous_layer_spec(config: HeterogeneousTransformerConfig, use
 
     # Slice the layer specs to only include the layers that are built in this pipeline stage.
     # Note: MCore layer_number starts at 1
-    offset = get_transformer_layer_offset(config)
-    num_layers_to_build = get_num_layers_to_build(config)
+    offset = get_transformer_layer_offset(config, vp_stage=vp_stage, pp_rank=pp_rank)
+    num_layers_to_build = get_num_layers_to_build(config, vp_stage=vp_stage, pp_rank=pp_rank)
     layer_specs = layer_specs[offset : offset + num_layers_to_build]
 
     # Submodules layer_norm determines the type of layernorm used in the last layernorm

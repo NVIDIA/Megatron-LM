@@ -1,7 +1,7 @@
 ENV_VARS:
   CUDA_DEVICE_MAX_CONNECTIONS: "1"
   NVTE_ALLOW_NONDETERMINISTIC_ALGO: "1"
-  SKIP_PYTEST: 1
+  NON_DETERMINSTIC_RESULTS: 1
 TEST_TYPE: "release"
 MODEL_ARGS:
   # Bert model args
@@ -50,6 +50,5 @@ MODEL_ARGS:
 METRICS:
   - "iteration-time"
   - "lm loss"
-  - "num-zeros"
   - "mem-allocated-bytes"
   - "mem-max-allocated-bytes"
