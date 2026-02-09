@@ -93,7 +93,7 @@ def get_radio_g_layer_spec(normalization) -> ModuleSpec:
     return ModuleSpec(
         module=LayerScalingTransformerLayer,
         submodules=TransformerLayerSubmodules(
-            input_layernorm=norm,
+            input_layernorm=not_none(norm),
             self_attention=ModuleSpec(
                 module=SelfAttention,
                 params={"attn_mask_type": attn_mask_type},
@@ -106,7 +106,7 @@ def get_radio_g_layer_spec(normalization) -> ModuleSpec:
                 ),
             ),
             self_attn_bda=get_bias_dropout_add_layer_scaling,
-            pre_mlp_layernorm=norm,
+            pre_mlp_layernorm=not_none(norm),
             mlp=mlp,
             mlp_bda=get_bias_dropout_add_layer_scaling,
         ),
