@@ -20,7 +20,7 @@ from megatron.core.inference.model_inference_wrappers.gpt.gpt_inference_wrapper 
 from megatron.core.inference.text_generation_controllers.text_generation_controller import (
     TextGenerationController,
 )
-from megatron.core.tokenizers.text.utils.build_tokenizer import build_tokenizer
+from megatron.core.tokenizers.utils.build_tokenizer import build_tokenizer
 from megatron.core.transformer.module import MegatronModule
 from megatron.core.utils import get_attr_wrapped_model, log_single_rank
 from megatron.training import get_args
@@ -311,10 +311,7 @@ def get_dynamic_inference_engine(model: Optional[MegatronModule] = None) -> Dyna
     args = get_args()
     if model is None:
         model = get_model_for_inference()
-    if args.legacy_tokenizer:
-        tokenizer = get_tokenizer()
-    else:
-        tokenizer = build_tokenizer(args)
+    tokenizer = build_tokenizer(args)
 
     inference_config = get_inference_config_from_model_and_args(model, args)
     context = DynamicInferenceContext(model.config, inference_config)
