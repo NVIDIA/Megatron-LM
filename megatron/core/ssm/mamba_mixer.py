@@ -886,15 +886,17 @@ class MambaMixer(MegatronModule):
                 cu_chunk_seqlens = cu_seqlens
 
                 # However, double check if seq_idx indicates any extra grouping, or if an extra entry is required:
-                # If seq_idx.max() + 1 > cu_seqlens.numel() - 1, then extra sequences
-                n_seq_from_seq_idx = int(seq_idx.max().item() + 1)
-                n_seq_from_cu = cu_seqlens.numel() - 1
-                if n_seq_from_seq_idx > n_seq_from_cu:
-                    # Need to extend cu_seqlens to include the rest of tokens counted in seq_idx
-                    # This can happen if the last part is treated as an extra seq
-                    cu_chunk_seqlens = torch.cat(
-                        [cu_seqlens, cu_seqlens.new_tensor([seq_idx.shape[1]])]
-                    )
+                # If seq_idx.max() + 1 > cu_seqlens.numel() - 1, then extra sequences.
+                # Skip this during CUDA graph capture: .item() would sync the stream and is not permitted.
+                if not torch.cuda.is_current_stream_capturing():
+                    n_seq_from_seq_idx = int(seq_idx.max().item() + 1)
+                    n_seq_from_cu = cu_seqlens.numel() - 1
+                    if n_seq_from_seq_idx > n_seq_from_cu:
+                        # Need to extend cu_seqlens to include the rest of tokens counted in seq_idx
+                        # This can happen if the last part is treated as an extra seq
+                        cu_chunk_seqlens = torch.cat(
+                            [cu_seqlens, cu_seqlens.new_tensor([seq_idx.shape[1]])]
+                        )
 
             # Kernel expects seq_idx of shape (nchunks,) — one sequence index per chunk.
             # We have seq_idx of shape (1, total_tokens); take seq index at start of each chunk.
