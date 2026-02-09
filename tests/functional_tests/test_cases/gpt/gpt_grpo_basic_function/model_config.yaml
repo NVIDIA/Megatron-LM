@@ -56,7 +56,6 @@ MODEL_ARGS:
   --lr-warmup-samples: 0
   --clip-grad: 1.0
   --weight-decay: 0.01
-  --deterministic-mode: true
   --use-mcore-models: true
   --bf16: true
   --log-memory-to-tensorboard: true
