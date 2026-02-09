@@ -307,10 +307,7 @@ def get_dynamic_inference_engine(model: Optional[MegatronModule] = None) -> Dyna
     args = get_args()
     if model is None:
         model = get_model_for_inference()
-    if args.legacy_tokenizer:
-        tokenizer = get_tokenizer()
-    else:
-        tokenizer = build_tokenizer(args)
+    tokenizer = build_tokenizer(args)
 
     inference_config = get_inference_config_from_model_and_args(model, args)
     context = DynamicInferenceContext(model.config, inference_config)
