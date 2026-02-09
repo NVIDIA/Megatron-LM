@@ -20,7 +20,7 @@ try:
 except ImportError:
     PunktLanguageVars = object  # Fallback to the built-in object class
 
-from megatron.training.tokenizer import build_tokenizer
+from megatron.core.tokenizers.utils.build_tokenizer import build_tokenizer
 from megatron.core.datasets.indexed_dataset import IndexedDatasetBuilder
 
 
@@ -101,6 +101,17 @@ def get_args():
                        help='Language to use for NLTK-powered sentence splitting.')
     group.add_argument('--tokenizer-model', type=str, default=None,
                        help='sentencepeice tokenizer model.')
+    group.add_argument('--tokenizer-metadata', type=str, default=None,
+                       help='Path to tokenizer metadata in json format.')
+    group.add_argument('--tokenizer-special-tokens', type=str, nargs='+', default=None,
+                       help='List of special tokens. For TikTokenizer needs to have '
+                            '["<unk>", "<s>", "</s>", "<mask>", "<pad>", "<cls>", "<sep>"]')
+    group.add_argument('--tokenizer-hf-use-fast', action='store_true', default=False,
+                       help='Whether to use fast HuggingFace tokenizer.')
+    group.add_argument('--tokenizer-hf-include-special-tokens', action='store_true', default=False,
+                       help='Converting text to ids will include special for HuggingFace tokenizer.')
+    group.add_argument("--trust-remote-code", action="store_true", default=False,
+                       help='Whether or not to allow PreTrainedTokenizer to execute remote code')
 
     group = parser.add_argument_group(title='output data')
     group.add_argument('--output-prefix', type=str, required=True,
@@ -110,6 +121,7 @@ def get_args():
                        help='Number of worker processes to launch')
     group.add_argument('--log-interval', type=int, default=100,
                        help='Interval between progress updates')
+
     args = parser.parse_args()
     args.keep_empty = False
 

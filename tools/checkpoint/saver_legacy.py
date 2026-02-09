@@ -39,7 +39,7 @@ def save_checkpoint(queue, args):
         from megatron.training.checkpointing import save_checkpoint
         from megatron.training.global_vars import set_global_variables, get_args
         from megatron.core.enums import ModelType
-        from megatron.training.tokenizer.tokenizer import _vocab_size_with_padding
+        from megatron.core.tokenizers.utils.build_tokenizer import vocab_size_with_padding
         from megatron.legacy import fused_kernels
         from megatron.core import mpu
     except ModuleNotFoundError:
@@ -234,7 +234,7 @@ def save_checkpoint(queue, args):
     if md.true_vocab_size is not None:
         # figure out what our padded vocab size is
         orig_vocab_size = orig_word_embed.shape[0]
-        margs.padded_vocab_size = _vocab_size_with_padding(md.true_vocab_size, margs)
+        margs.padded_vocab_size = vocab_size_with_padding(md.true_vocab_size, margs)
 
         # Cut out extra padding we don't need
         if orig_vocab_size > margs.padded_vocab_size:

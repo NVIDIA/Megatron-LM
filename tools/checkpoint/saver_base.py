@@ -362,7 +362,7 @@ class MegatronCheckpointSaverBase:
         """
         try:
             from megatron.core import mpu
-            from megatron.training.tokenizer.tokenizer import _vocab_size_with_padding
+            from megatron.core.tokenizers.utils.build_tokenizer import vocab_size_with_padding
         except ModuleNotFoundError as e:
             print(f"Unable to import required Megatron modules: {e}")
             sys.exit(1)
@@ -381,7 +381,7 @@ class MegatronCheckpointSaverBase:
             if true_vocab_size is not None:
                 # figure out what our padded vocab size is
                 orig_vocab_size = orig_word_embed.shape[0]
-                self.margs.padded_vocab_size = _vocab_size_with_padding(true_vocab_size, self.margs)
+                self.margs.padded_vocab_size = vocab_size_with_padding(true_vocab_size, self.margs)
 
                 # Cut out extra padding we don't need
                 if orig_vocab_size > self.margs.padded_vocab_size:
