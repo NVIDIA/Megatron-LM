@@ -508,15 +508,17 @@ def get_environment_rollouts(
 
     if args.rl_offload_optimizer_during_inference:
         with nvtx_range("offload-optimizer-state-and-grad-buffers-during-inference"):
-            if not args.rl_training_cuda_graphs:
+            if not args.rl_reset_cuda_graphs:
                 model[0].offload_grad_buffers()
             else:
                 logger.warning(
-                    "Gradient buffers will not be offloaded when training cudagraphs are enabled!")
+                    "Gradient buffers will not be offloaded when training cudagraphs are used!"
+                )
             optimizer.offload_to_cpu()
              
     # If we have seperate training and inference models we to refit weights from the training model to the inference model.
-    if inference_model is not None:
+    has_separate_inference_model = inference_model is not None
+    if has_separate_inference_model:
         # If the separate inference model weights were prefetched to CPU while idle, bring them
         # back to GPU before refit/copy and before any CUDA-graph'd inference.
         with nvtx_range("prefetch-inference-model-weights-to-gpu"):
@@ -544,8 +546,9 @@ def get_environment_rollouts(
             inference_model,
             optimizer,
             args.cuda_graph_impl,
-            args.rl_training_cuda_graphs,
+            args.rl_reset_cuda_graphs,
             False, # offload optimizer during rollout collection is handled above
+            training_model=model if has_separate_inference_model else None,
         ) as inference_interface:
 
             with nvtx_range("inference-setup"):
@@ -1136,7 +1139,7 @@ def prepare_data_for_update(
     nvtx_range = get_nvtx_range()
     runtime_state = get_rl_runtime_state()
 
-    if args.cuda_graph_impl != "none" and not args.rl_training_cuda_graphs:
+    if args.cuda_graph_impl != "none" and not args.rl_reset_cuda_graphs:
         lang_module = (
             model[0].module.module if hasattr(model[0].module, "module") else model[0].module
         )
@@ -1460,14 +1463,17 @@ def evaluate_and_print_results_rl(
     optimizer: MegatronOptimizer,
     iteration: int,
     write_to_tensorboard: bool = True,
+    training_model: Optional[list[LanguageModule]] = None,
 ):
     """Helper function to evaluate and dump results on screen.
 
     Args:
         data_iterator: Iterator over batches of evaluation dataset.
-        model: Model to evaluate with.
+        model: Model to evaluate with (may be separate inference model).
         iteration: Current training iteration.
         write_to_tensorboard: Dumpt stuff to tensorboard or not.
+        training_model: Training model (if separate from inference model). Used to offload
+            grad buffers and restore to train mode. If None, uses model parameter.
     """
     args = get_args()
 
@@ -1481,8 +1487,9 @@ def evaluate_and_print_results_rl(
             model,
             optimizer,
             args.cuda_graph_impl,
-            args.rl_training_cuda_graphs,
+            args.rl_reset_cuda_graphs,
             args.rl_offload_optimizer_during_inference,
+            training_model,
         ) as inference_interface:
 
             loop = get_asyncio_loop()
@@ -1663,16 +1670,22 @@ def megatron_rl_inference_mode(
     model: list[LanguageModule],
     optimizer: MegatronOptimizer,
     cuda_graph_impl: str,
-    training_cuda_graphs: bool,
+    reset_cuda_graphs: bool,
     offload_optimizer_during_inference: bool,
+    training_model: Optional[list[LanguageModule]] = None,
 ):
     """Manage the model inference context when collecting rollouts.
 
     Args:
-        model: model to prepare.
+        model: model to prepare for inference (may be separate inference model).
         optimizer: optimizer used to train the model.
         cuda_graph_impl: which cuda graph implementation to use.
+        reset_cuda_graphs: whether to clear cuda garphs after inference.
+            NOTE: this disables training CGs as well. This is the only way to disable training CGs.
+            TODO: Add functionality to disable training CGs without also clearing inference CGs.
         offload_optimizer_during_inference: move optimizer to cpu during inference or not.
+        training_model: training model (if separate from inference model). Used to offload
+            grad buffers and restore to train mode. If None, uses model parameter.
 
     Yields:
         None: this context manager does not return a value.
@@ -1704,14 +1717,18 @@ def megatron_rl_inference_mode(
 
         if offload_optimizer_during_inference:
             with nvtx_range("offload-optimizer-state-and-grad-buffers-before-inference"):
-                if not args.rl_training_cuda_graphs:
-                    model[0].offload_grad_buffers()
+                if not args.rl_reset_cuda_graphs:
+                    # Offload grad buffers from the training model (if separate inference model is used)
+                    # or from the inference model (if they're the same model)
+                    model_for_grad_offload = training_model if training_model is not None else model
+                    model_for_grad_offload[0].offload_grad_buffers()
                 else:
                     logger.warning(
-                        "Gradient buffers will not be offloaded when training cudagraphs are enabled!")
+                        "Gradient buffers will not be offloaded when training cudagraphs are used!"
+                    )
                 optimizer.offload_to_cpu()
 
-        if cuda_graph_impl != "none" and not training_cuda_graphs:
+        if cuda_graph_impl != "none" and not reset_cuda_graphs:
             toggle_cuda_graphs(lang_module, cuda_graph_impl)
 
         inference_interface = get_inference_interface(loop, model)
@@ -1735,7 +1752,7 @@ def megatron_rl_inference_mode(
         with nvtx_range("suspend-engine"):
             loop.run_until_complete(inference_interface.suspend())
 
-        if cuda_graph_impl != "none" and not training_cuda_graphs:
+        if cuda_graph_impl != "none" and not reset_cuda_graphs:
             toggle_cuda_graphs(lang_module, 'none')
 
         # If this is a separate RL inference model, prefetch weights back to CPU so they
@@ -1745,10 +1762,15 @@ def megatron_rl_inference_mode(
 
         if offload_optimizer_during_inference:
             with nvtx_range("onload-optimizer-state-and-grad-buffers-after-inference"):
-                model[0].restore_grad_buffers()
+                # Restore grad buffers to the training model (if separate inference model is used)
+                # or to the inference model (if they're the same model)
+                model_for_grad_offload = training_model if training_model is not None else model
+                model_for_grad_offload[0].restore_grad_buffers()
                 optimizer.restore_from_cpu()
 
-        lang_module.train()
+        # Set training model back to train mode (not inference model if they're separate)
+        training_lang_module = unwrap_model(training_model[0]) if training_model is not None else lang_module
+        training_lang_module.train()
 
         if has_lru_cache:
             rotary_module.forward.cache_clear()
