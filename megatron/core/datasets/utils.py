@@ -25,6 +25,7 @@ def compile_helpers():
     command = ["make", "-C", os.path.abspath(os.path.dirname(__file__))]
     if subprocess.run(command).returncode != 0:
         import sys
+
         import torch.distributed as dist
 
         log_single_rank(logger, logging.ERROR, "Failed to compile the C++ dataset helper functions")
