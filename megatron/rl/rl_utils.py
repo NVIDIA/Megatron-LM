@@ -1126,8 +1126,7 @@ def prepare_data_for_update(
         is_correction: Prepare data for IS correction if True.
 
     Returns:
-        Cycled iterator over dataset batches. In GRPO we might want to go over the same data
-        multiple times.
+        Cycled iterator over dataset batches. In GRPO we might want to go over the same data multiple times.
     """
     args = get_args()
     wandb_writer = get_wandb_writer()

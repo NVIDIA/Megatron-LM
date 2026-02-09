@@ -83,7 +83,7 @@ DEPRECATED_ARGS = [
     "cuda_graph_mixed_prefill_count",
     "metrics_writer",
     "request_metadata_types",
-    "static_kv_memory_pointers",
+    "persist_cuda_graphs",
     "offload_kv_cache",
 ]
 
@@ -674,6 +674,17 @@ class DynamicInferenceContext(BaseInferenceContext):
         self.reset_attention_state()
         self.reset_mamba_state()
 
+    def deallocate_all_tensors(self):
+        """Deallcoate GPU state.
+
+        This method is used for suspending the dynamic engine.
+        """
+        # TODO(@lmcafee): check that device == 'cuda'?
+        for key in list(vars(self).keys()):
+            value = getattr(self, key)
+            if isinstance(value, torch.Tensor):
+                delattr(self, key)
+
     def reallocate_large_tensors(self):
         """Restore large tensors (KV cache, Mamba states) after a suspend.
 
@@ -695,8 +706,7 @@ class DynamicInferenceContext(BaseInferenceContext):
                 tensor.storage().resize_(self._offloadable_storage_sizes[name])
                 tensor.copy_(self._offloadable_cpu_backups[name], non_blocking=True)
         elif self.kv_cache_management_mode == KVCacheManagementMode.RECOMPUTE:
-            self._allocate_memory_buffer()
-            self._allocate_mamba_states()
+            self.allocate_all_tensors()
         else:
             raise ValueError("Cannot re-allocate large tensors if they are expected to persist.")
 
@@ -722,12 +732,7 @@ class DynamicInferenceContext(BaseInferenceContext):
                 self._offloadable_cpu_backups[name].copy_(tensor, non_blocking=True)
                 tensor.storage().resize_(0)
         elif self.kv_cache_management_mode == KVCacheManagementMode.RECOMPUTE:
-            # Delete all tensor attributes entirely.
-            # TODO(@lmcafee): check that device == 'cuda'?
-            for key in list(vars(self).keys()):
-                value = getattr(self, key)
-                if isinstance(value, torch.Tensor):
-                    delattr(self, key)
+            self.deallocate_all_tensors()
 
     @classmethod
     def round_up_tokens(cls, value, tp_size=None):
