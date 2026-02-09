@@ -10,7 +10,10 @@ import numpy as np
 import torch
 
 from megatron.core.dist_checkpointing import ShardedTensor
-from megatron.core.dist_checkpointing.core import CheckpointingException, check_is_distributed_checkpoint
+from megatron.core.dist_checkpointing.core import (
+    CheckpointingException,
+    check_is_distributed_checkpoint,
+)
 from megatron.core.dist_checkpointing.dict_utils import diff, extract_matching_values, nested_values
 from megatron.core.dist_checkpointing.mapping import (
     CommonStateDict,
