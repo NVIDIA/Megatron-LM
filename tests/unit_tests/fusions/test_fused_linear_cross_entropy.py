@@ -255,7 +255,7 @@ class TestFusedLinearCrossEntropyOnGptModel:
 @pytest.mark.skipif(
     "WORLD_SIZE" in os.environ and os.environ["WORLD_SIZE"] != "1", reason="Requires single GPU"
 )
-@pytest.mark.skipif(get_device_arch_version() != 10, reason="Requires GPU architecture = 10")
+@pytest.mark.skipif(get_device_arch_version() not in [9, 10], reason="Requires GPU architecture = 9 (Hopper) or 10 (Blackwell)")
 class TestFusedLinearCrossEntropyDataParallel:
     def cleanup(self):
         torch.cuda.empty_cache()
@@ -354,7 +354,7 @@ class TestFusedLinearCrossEntropyDataParallel:
             pad_labels = torch.nn.functional.pad(labels, (0, 1), value=ignore_index)
             labels = pad_labels[..., 1:].contiguous()
 
-        # forward
+        # torchrun -m pytest tests/unit_tests/fusions/test_fused_linear_cross_entropy.py::TestFusedLinearCrossEntropyDataParallel::test_storage
         torch_logprobs = self.torch_linear_cross_entropy(
             hidden, weight, labels, reduction=reduction, ignore_index=ignore_index
         )
