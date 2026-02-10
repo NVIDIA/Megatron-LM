@@ -3,7 +3,10 @@
 import json
 import logging
 import math
+import os
 from statistics import median
+
+import pytest
 import yaml
 
 logging.basicConfig(level=logging.INFO)
@@ -36,9 +39,17 @@ def _bytes_to_gib(num_bytes: float) -> float:
     return float(num_bytes) / (1024.0**3)
 
 
-def test_inference_pipeline(golden_values_path: str, test_values_path: str, model_config_path:str) -> None:
+def test_inference_pipeline(
+    golden_values_path: str, test_values_path: str, model_config_path: str
+) -> None:
+    if os.getenv("ENABLE_LIGHTWEIGHT_MODE") == "true":
+        pytest.skip("Lightweight mode enabled. Skipping test.")
 
-    with open(golden_values_path, 'r') as f1, open(test_values_path, 'r') as f2, open(model_config_path, 'r') as f3:
+    with (
+        open(golden_values_path, 'r') as f1,
+        open(test_values_path, 'r') as f2,
+        open(model_config_path, 'r') as f3,
+    ):
         golden_values_content = f1.read()
         tensorboard_content = f2.read()
         model_config_content = f3.read()
@@ -71,51 +82,52 @@ def test_inference_pipeline(golden_values_path: str, test_values_path: str, mode
     assert len(output_groundtruth) > 0, "No test performed for output"
 
     # Throughput assertions.
-    if "throughput" in output_groundtruth.keys() and "throughput" in metrics:
+    if "throughput" in output_groundtruth.keys():
+        if "throughput" in metrics:
+            # First warmup iteration is excluded from throughput statistics.
+            throughput_sampled = median(output_current["throughput"][1:])
+            throughput_golden = median(output_groundtruth["throughput"][1:])
 
-        # First warmup iteration is excluded from throughput statistics.
-        throughput_sampled = median(output_current["throughput"][1:])
-        throughput_golden = median(output_groundtruth["throughput"][1:])
+            # 10% is empirically observed to be within hardware variance.
+            assert (
+                throughput_sampled >= 0.9 * throughput_golden
+            ), f"Throughput is slower than expected! Expected to be within 10% of ~{throughput_golden} tok/s but benchmarked {output_current['throughput']} tok/s"
 
-        # 10% is empirically observed to be within hardware variance.
-        assert (
-            throughput_sampled >= 0.9 * throughput_golden
-        ), f"Throughput is slower than expected! Expected to be within 10% of ~{throughput_golden} tok/s but benchmarked {output_current['throughput']} tok/s"
-
-        # If throughput is significantly improved (> 20%), update golden values accordingly.
-        assert (
-            throughput_sampled < throughput_golden * 1.2
-        ), f"Throughput has been improved from expected ~{throughput_golden} tok/s to {output_current['throughput']} tok/s. Please update golden values in the functional tests."
+            # If throughput is significantly improved (> 20%), update golden values accordingly.
+            assert (
+                throughput_sampled < throughput_golden * 1.2
+            ), f"Throughput has been improved from expected ~{throughput_golden} tok/s to {output_current['throughput']} tok/s. Please update golden values in the functional tests."
 
         output_groundtruth.pop('throughput')
 
     # Peak memory regression checks (optional: only if present in golden values).
-    if "mem-max-allocated-bytes" in output_groundtruth and "mem-max-allocated-bytes" in metrics:
-        assert "mem-max-allocated-bytes" in output_current, (
-            f"Golden values include mem-max-allocated-bytes but current output does not. "
-            "Ensure the inference script records memory metrics to the output JSON."
-        )
-        sampled = _median_as_float(output_current["mem-max-allocated-bytes"])
-        golden = _median_as_float(output_groundtruth["mem-max-allocated-bytes"])
-        assert golden > 0, f"Golden mem_max_allocated_bytes must be > 0, got {golden}."
-
-        low = 0.95 * golden
-        high = 1.05 * golden
-
-        if sampled < low:
-            raise AssertionError(
-                f"Memory is too low for mem-max-allocated-bytes: "
-                f"expected within 5% of {golden:.0f} bytes ({_bytes_to_gib(golden):.3f} GiB) "
-                f"but got {sampled:.0f} bytes ({_bytes_to_gib(sampled):.3f} GiB). "
-                "This is >5% lower than expected; please update golden values in the functional tests."
+    if "mem-max-allocated-bytes" in output_groundtruth:
+        if "mem-max-allocated-bytes" in metrics:
+            assert "mem-max-allocated-bytes" in output_current, (
+                f"Golden values include mem-max-allocated-bytes but current output does not. "
+                "Ensure the inference script records memory metrics to the output JSON."
             )
-        if sampled > high:
-            raise AssertionError(
-                f"Memory is too high for mem-max-allocated-bytes: "
-                f"expected within ±5% of {golden:.0f} bytes ({_bytes_to_gib(golden):.3f} GiB) "
-                f"but got {sampled:.0f} bytes ({_bytes_to_gib(sampled):.3f} GiB). "
-                "This is >5% higher than expected; this is likely a regression."
-            )
+            sampled = _median_as_float(output_current["mem-max-allocated-bytes"])
+            golden = _median_as_float(output_groundtruth["mem-max-allocated-bytes"])
+            assert golden > 0, f"Golden mem_max_allocated_bytes must be > 0, got {golden}."
+
+            low = 0.95 * golden
+            high = 1.05 * golden
+
+            if sampled < low:
+                raise AssertionError(
+                    f"Memory is too low for mem-max-allocated-bytes: "
+                    f"expected within 5% of {golden:.0f} bytes ({_bytes_to_gib(golden):.3f} GiB) "
+                    f"but got {sampled:.0f} bytes ({_bytes_to_gib(sampled):.3f} GiB). "
+                    "This is >5% lower than expected; please update golden values in the functional tests."
+                )
+            if sampled > high:
+                raise AssertionError(
+                    f"Memory is too high for mem-max-allocated-bytes: "
+                    f"expected within ±5% of {golden:.0f} bytes ({_bytes_to_gib(golden):.3f} GiB) "
+                    f"but got {sampled:.0f} bytes ({_bytes_to_gib(sampled):.3f} GiB). "
+                    "This is >5% higher than expected; this is likely a regression."
+                )
         output_groundtruth.pop("mem-max-allocated-bytes")
 
     for request_id, groundtruth_results in output_groundtruth.items():
