@@ -1642,7 +1642,7 @@ class DynamicInferenceContext(BaseInferenceContext):
             self.active_token_count : self.active_token_count + chunk_length
         ] = (token_offset_range % self.block_size_tokens)
 
-        # Compute hashes for completely filled blocks (skip matched blocks)
+        # Register hashes for completely filled blocks (skip matched blocks)
         total_tokens_after = req.finished_chunk_token_count + chunk_length
         num_complete_blocks = total_tokens_after // self.block_size_tokens
         previously_complete = req.finished_chunk_token_count // self.block_size_tokens

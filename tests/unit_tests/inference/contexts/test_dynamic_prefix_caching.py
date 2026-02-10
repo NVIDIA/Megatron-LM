@@ -1,12 +1,18 @@
 # Copyright (c) 2025, NVIDIA CORPORATION. All rights reserved.
 
+import asyncio
+from collections import deque
+
 import pytest
 import torch
 
 from megatron.core.inference.config import InferenceConfig
 from megatron.core.inference.contexts.dynamic_context import DynamicInferenceContext
+from megatron.core.inference.engines.dynamic_engine import DynamicInferenceEngine
 from megatron.core.inference.inference_request import (
     DynamicInferenceRequest,
+    DynamicInferenceRequestRecord,
+    Status,
     compute_block_hash,
     HASH_PRIME,
 )
@@ -628,3 +634,137 @@ class TestComplexPatterns(PrefixCachingTestBase):
 
         total_used = initial_avail - alloc.total_avail
         assert total_used == 4, f"Should use 4 blocks (O(1)), used {total_used}"
+
+
+# =========================================================================
+# Class 8: TestEngineCoordination (3 tests)
+# =========================================================================
+
+class _StubEngine(DynamicInferenceEngine):
+    """Lightweight engine subclass that skips full __init__ for unit testing.
+
+    Only initialises the fields needed by prefix coordination and scheduling.
+    """
+
+    def __init__(self, context: DynamicInferenceContext):
+        # Bypass DynamicInferenceEngine.__init__ entirely — it needs a real
+        # controller, CUDA graphs, wandb, etc. We only need the scheduling and
+        # prefix-coordination paths.
+        self.context = context
+        self.enable_chunked_prefill = False
+        self._prefix_coordination_waits = 0
+        self._loop = asyncio.new_event_loop()
+        self.waiting_request_ids: deque = deque()
+        self.requests = {}
+
+
+class TestEngineCoordination(PrefixCachingTestBase):
+
+    def _engine(self, ctx):
+        """Create a _StubEngine wrapping *ctx*."""
+        return _StubEngine(ctx)
+
+    def _add_to_waiting(self, engine, ctx, req):
+        """Register *req* with the engine and put it in the waiting queue."""
+        request_id = req.request_id
+        engine.requests[request_id] = type(
+            "Entry", (), {
+                "record": DynamicInferenceRequestRecord.from_request(req),
+                "future": engine._loop.create_future(),
+            },
+        )()
+        req.status = Status.ACTIVE_AND_GENERATING_TOKENS
+        req.sampling_params.num_tokens_to_generate = 10
+        engine.waiting_request_ids.append(request_id)
+
+    # -----------------------------------------------------------------
+    @pytest.mark.internal
+    def test_has_pending_prefix_blocks(self):
+        """_has_pending_prefix_blocks returns True when blocks pending, False once computed."""
+        ctx = self._ctx()
+        bs = ctx.block_size_tokens
+        engine = self._engine(ctx)
+        prompt = self._prompt(bs * 2)
+
+        # Add first request to context → blocks registered but not computed
+        req1 = self._req(ctx, prompt.clone())
+        ctx.add_request(req1)
+
+        # Second request with same prefix: should detect pending blocks
+        req2 = self._req(ctx, prompt.clone(), request_id=2)
+        assert engine._has_pending_prefix_blocks(req2) is True
+
+        # After marking computed, pending blocks are resolved
+        ctx.mark_pending_blocks_computed()
+        assert engine._has_pending_prefix_blocks(req2) is False
+
+        # Disabled mode: always False
+        req_disabled = self._req(ctx, prompt.clone(), request_id=3,
+                                 enable_prefix_caching=False)
+        assert engine._has_pending_prefix_blocks(req_disabled) is False
+
+        # No precomputed hashes (short prompt): always False
+        req_short = self._req(ctx, self._prompt(bs // 2), request_id=4)
+        assert engine._has_pending_prefix_blocks(req_short) is False
+
+    # -----------------------------------------------------------------
+    @pytest.mark.internal
+    def test_scheduling_deferral(self):
+        """Requests wait in queue until pending prefix blocks are marked computed."""
+        ctx = self._ctx()
+        bs = ctx.block_size_tokens
+        engine = self._engine(ctx)
+        prompt = self._prompt(bs * 2)
+
+        # Add first request directly to context (simulates prior prefill step)
+        req1 = self._req(ctx, prompt.clone())
+        ctx.add_request(req1)
+        # Blocks are now pending (not yet computed)
+
+        # Put second request (same prefix) in waiting queue
+        req2 = self._req(ctx, prompt.clone(), request_id=2)
+        self._add_to_waiting(engine, ctx, req2)
+
+        # Attempt scheduling — should defer (break) because blocks pending
+        engine.schedule_non_chunked_prefill()
+        assert len(engine.waiting_request_ids) == 1, "Request should remain waiting"
+        assert engine._prefix_coordination_waits == 1
+
+        # Mark blocks computed
+        ctx.mark_pending_blocks_computed()
+
+        # Now scheduling should succeed
+        engine.schedule_non_chunked_prefill()
+        assert len(engine.waiting_request_ids) == 0, "Request should be scheduled"
+        assert ctx.total_request_count == 2
+
+    # -----------------------------------------------------------------
+    @pytest.mark.internal
+    def test_get_prefix_coordination_metrics(self):
+        """get_prefix_coordination_metrics tracks cumulative waits."""
+        ctx = self._ctx()
+        bs = ctx.block_size_tokens
+        engine = self._engine(ctx)
+        prompt = self._prompt(bs * 2)
+
+        assert engine.get_prefix_coordination_metrics() == {"waits": 0}
+
+        # Create a pending-block scenario
+        req1 = self._req(ctx, prompt.clone())
+        ctx.add_request(req1)
+
+        req2 = self._req(ctx, prompt.clone(), request_id=2)
+        self._add_to_waiting(engine, ctx, req2)
+
+        # Each scheduling attempt that defers increments the counter
+        engine.schedule_non_chunked_prefill()
+        assert engine.get_prefix_coordination_metrics() == {"waits": 1}
+
+        engine.schedule_non_chunked_prefill()
+        assert engine.get_prefix_coordination_metrics() == {"waits": 2}
+
+        # Resolve and schedule
+        ctx.mark_pending_blocks_computed()
+        engine.schedule_non_chunked_prefill()
+        # Counter doesn't reset — cumulative
+        assert engine.get_prefix_coordination_metrics() == {"waits": 2}

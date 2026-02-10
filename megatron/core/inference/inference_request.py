@@ -298,9 +298,10 @@ class DynamicInferenceEvent:
         if isinstance(obj, int):
             payload = {
                 "token": obj,
-                "block_total_count": -1,
-                "block_total_avail": -1,
-                "block_ref_count_sum": -1,
+                "blocks_total": -1,
+                "blocks_hashed_total": -1,
+                "blocks_hashed_active": -1,
+                "blocks_ref_count": -1,
             }
             return cls(
                 type=DynamicInferenceEventType.GENERATED_TOKEN,
@@ -518,25 +519,28 @@ class DynamicInferenceRequest(InferenceRequest):
     def add_event_generated_token(
         self,
         token: int,
-        block_total_count: int = -1,
-        block_total_avail: int = -1,
-        block_ref_count_sum: int = -1,
+        blocks_total: int = -1,
+        blocks_hashed_total: int = -1,
+        blocks_hashed_active: int = -1,
+        blocks_ref_count: int = -1,
     ):
         """Add 'generated_token' event - records each generated token.
 
         Args:
             token (int): The token ID that was generated.
-            block_total_count (int): Total block count from allocator (-1 = not tracked).
-            block_total_avail (int): Available block count from allocator (-1 = not tracked).
-            block_ref_count_sum (int): Sum of block ref counts from allocator (-1 = not tracked).
+            blocks_total (int): Total block capacity from allocator (-1 = not tracked).
+            blocks_hashed_total (int): All allocated (hashed) blocks (-1 = not tracked).
+            blocks_hashed_active (int): Blocks with ref_count > 0 (-1 = not tracked).
+            blocks_ref_count (int): Sum of block ref counts from allocator (-1 = not tracked).
         """
         return self.add_event(
             DynamicInferenceEventType.GENERATED_TOKEN,
             {
                 "token": token,
-                "block_total_count": block_total_count,
-                "block_total_avail": block_total_avail,
-                "block_ref_count_sum": block_ref_count_sum,
+                "blocks_total": blocks_total,
+                "blocks_hashed_total": blocks_hashed_total,
+                "blocks_hashed_active": blocks_hashed_active,
+                "blocks_ref_count": blocks_ref_count,
             },
         )
 

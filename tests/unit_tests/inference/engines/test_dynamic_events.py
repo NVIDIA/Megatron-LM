@@ -88,7 +88,7 @@ def test_all_event_types_creation_and_payload_validation():
             DynamicInferenceEvent(type=event_type, payload="not allowed")
 
     # Create GENERATED_TOKEN event with dict payload
-    token_payload = {"token": 42, "block_total_count": -1, "block_total_avail": -1, "block_ref_count_sum": -1}
+    token_payload = {"token": 42, "blocks_total": -1, "blocks_hashed_total": -1, "blocks_hashed_active": -1, "blocks_ref_count": -1}
     token_event = DynamicInferenceEvent(
         type=DynamicInferenceEventType.GENERATED_TOKEN, payload=token_payload
     )
@@ -376,7 +376,7 @@ def test_compact_serialization_mode_roundtrip(basic_request):
     - generated_tokens property works after compact roundtrip
     """
     # Event-level compact serialization
-    token_payload = {"token": 42, "block_total_count": -1, "block_total_avail": -1, "block_ref_count_sum": -1}
+    token_payload = {"token": 42, "blocks_total": -1, "blocks_hashed_total": -1, "blocks_hashed_active": -1, "blocks_ref_count": -1}
     token_event = DynamicInferenceEvent(
         type=DynamicInferenceEventType.GENERATED_TOKEN, payload=token_payload
     )
@@ -393,7 +393,7 @@ def test_compact_serialization_mode_roundtrip(basic_request):
     restored_token = DynamicInferenceEvent.deserialize(42)
     assert restored_token.type == DynamicInferenceEventType.GENERATED_TOKEN
     assert restored_token.payload["token"] == 42
-    assert restored_token.payload["block_total_count"] == -1
+    assert restored_token.payload["blocks_total"] == -1
     assert restored_token.timestamp == -1  # Sentinel value
 
     # Request-level compact serialization
@@ -580,7 +580,7 @@ def test_event_str_representation_for_all_types():
     # GENERATED_TOKEN shows token=<id>
     token_event = DynamicInferenceEvent(
         type=DynamicInferenceEventType.GENERATED_TOKEN,
-        payload={"token": 42, "block_total_count": -1, "block_total_avail": -1, "block_ref_count_sum": -1},
+        payload={"token": 42, "blocks_total": -1, "blocks_hashed_total": -1, "blocks_hashed_active": -1, "blocks_ref_count": -1},
     )
     str_repr = str(token_event)
     assert 'GENERATED_TOKEN' in str_repr
@@ -589,7 +589,7 @@ def test_event_str_representation_for_all_types():
     # Large token ID
     large_token_event = DynamicInferenceEvent(
         type=DynamicInferenceEventType.GENERATED_TOKEN,
-        payload={"token": 9999999, "block_total_count": -1, "block_total_avail": -1, "block_ref_count_sum": -1},
+        payload={"token": 9999999, "blocks_total": -1, "blocks_hashed_total": -1, "blocks_hashed_active": -1, "blocks_ref_count": -1},
     )
     assert 'token=9999999' in str(large_token_event)
 
