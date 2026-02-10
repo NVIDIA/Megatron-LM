@@ -30,9 +30,7 @@ from .mapping import (
 )
 from .state_dict_utils import load_preprocess, save_preprocess
 from .strategies.async_utils import AsyncRequest
-from .strategies.base import (
-    AsyncSaveShardedStrategy,
-)
+from .strategies.base import AsyncSaveShardedStrategy
 from .strategies.common import load_common, save_common
 from .strategies.torch import TorchDistLoadShardedStrategy, TorchDistSaveShardedStrategy
 from .utils import extract_sharded_base, force_all_tensors_to_non_fp8
