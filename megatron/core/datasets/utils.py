@@ -12,6 +12,8 @@ logger = logging.getLogger(__name__)
 
 
 class Split(Enum):
+    """Enum train, valid, and test split."""
+
     train = 0
     valid = 1
     test = 2
@@ -26,7 +28,11 @@ def compile_helpers():
     if subprocess.run(command).returncode != 0:
         import sys
 
+        import torch.distributed as dist
+
         log_single_rank(logger, logging.ERROR, "Failed to compile the C++ dataset helper functions")
+
+        dist.destroy_process_group()
         sys.exit(1)
 
 
