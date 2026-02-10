@@ -330,9 +330,11 @@ class TransformerLayerNode(ScheduleNode):
         """Computes the weight gradients for the transformer layer node."""
         if not self.delay_wgrad_compute:
             return
-        with self.stream_acquire_context(f"{self.name} wgrad", wait_event=False):
+        with torch.cuda.stream(self.stream):
+            torch.cuda.nvtx.range_push(f"{self.name} wgrad")
             for module in self.bwd_dw_callables:
                 module.backward_dw()
+            torch.cuda.nvtx.range_pop()
 
         # the output grad memory is last used in wgrad compute, should be safe to release.
         assert self.delay_grads_release, "output grad memory should be valid before wgrad."
