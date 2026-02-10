@@ -271,7 +271,7 @@ class ScheduleNode:
         return grad
 
     @contextmanager
-    def stream_acquire_context(self, name=None):
+    def stream_acquire_context(self, name=None, wait_event=True):
         """Stream acquire context that handles event synchronization,
             NVTX profiling, and stream context.
 
@@ -281,11 +281,11 @@ class ScheduleNode:
         3. torch.cuda.stream context for execution on the specified stream
 
         Args:
-            stream: The CUDA stream to execute on
-            event: The CUDA event for synchronization
             name: Optional name for NVTX range profiling
+            wait_prev_event: Whether to wait for the previous event
         """
-        self.event.wait(self.stream)
+        if wait_event:
+            self.event.wait(self.stream)
         if name:
             torch.cuda.nvtx.range_push(name)
         try:
@@ -294,7 +294,8 @@ class ScheduleNode:
         finally:
             if name:
                 torch.cuda.nvtx.range_pop()
-            self.event.record(self.stream)
+            if wait_event:
+                self.event.record(self.stream)
 
     def _release_state(self):
         """Clear the state of the node"""
