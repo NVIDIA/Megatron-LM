@@ -1,7 +1,7 @@
 # Reinforcement Learning in megatron
 
 This is an example of GRPO implementation within megatron-lm.
-For implementation details check out `train_rl.py` and `megatron/rl/rl_utils.py`.
+For implementation details check out `examples/rl/train_rl.py` and `megatron/rl/rl_utils.py`.
 For the environment details, check the `megatron.rl` module.
 
 The following experiment will train the Qwen 2.5 32B model on the [DAPO17k](https://huggingface.co/datasets/BytedTsinghua-SIA/DAPO-Math-17k) dataset and will run evaluation on [AIME2024](https://huggingface.co/datasets/Maxwell-Jia/AIME_2024).
@@ -143,7 +143,7 @@ ENV_DEPENDENT="\
 torchrun \
     --nproc-per-node=8 \
     --nnodes=8 \
-    train_rl.py \
+    examples/rl/train_rl.py \
     --mock-data \
     --distributed-timeout-minutes 60 \
     --train-samples 48828125 \

@@ -56,4 +56,4 @@ tests/unit_tests/test_api_backwards_compat_setup.py @NVIDIA/ci
 megatron/rl/ @NVIDIA/reinforcement-learning
 examples/rl/ @NVIDIA/reinforcement-learning
 test/unit_tests/test_rl_utils.py @NVIDIA/reinforcement-learning
-train_rl.py @NVIDIA/reinforcement-learning
+examples/rl/train_rl.py @NVIDIA/reinforcement-learning
