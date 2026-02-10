@@ -94,7 +94,7 @@ def add_text_generate_ptq_args(parser):
         help="Use random offsets when slicing sequences for calibration. (Only for local files)",
     )
     group.add_argument(
-        "--batch-size", type=int, default=1, help="Batch size for calibration."
+        "--calib-batch-size", type=int, default=1, help="Batch size for calibration."
     )
     group.add_argument(
         "--prompts",
@@ -386,7 +386,7 @@ if __name__ == "__main__":
             calib_size=args.calib_size,
             max_sequence_length=args.calib_max_sequence_length,
             use_random_offset=args.calib_use_random_offset,
-            batch_size=args.batch_size,
+            batch_size=args.calib_batch_size,
         )
         for input_ids in tqdm(dataloader, total=args.calib_size, disable=torch.distributed.get_rank()):
             _ = simple_generate(model, input_ids, osl=1)
