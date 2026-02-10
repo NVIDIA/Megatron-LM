@@ -164,6 +164,8 @@ class MambaMetadata:
         #
         # The implementation generalizes to Scenario A as well, where the first prefill
         # request is treated as if it has non-zero initial states, which is safe.
+        # While this results in a minor inefficiency f there is no continuing chunked prefill
+        # request in a given batch, this case is infrequent.
 
         if padded_decode_count > 0:
             # Update decode indices

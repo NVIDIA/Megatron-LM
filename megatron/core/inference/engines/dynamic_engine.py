@@ -1124,9 +1124,6 @@ class DynamicInferenceEngine(AbstractEngine):
                     # Fully scheduled, so we remove from waiting pool
                     self.waiting_request_ids.popleft()
                     # Only this case we keep checking the rest of the waiting queue
-                    # We break early for Mamba models running a final prefill chunk
-                    # so that no additional requests are scheduled beyond the chunked
-                    # prefill request.
                     can_schedule = True
                 elif token_partially_can_be_added:
                     chunk_length = self.context.max_tokens - self.context.active_token_count

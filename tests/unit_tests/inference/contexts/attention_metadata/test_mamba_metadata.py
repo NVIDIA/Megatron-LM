@@ -308,7 +308,7 @@ class TestMambaMetadata:
     # -------------------------------------------------------------------------
 
     @pytest.mark.internal
-    def _test_update_chunked_prefill_mixed_exact(self, metadata_context):
+    def test_update_chunked_prefill_mixed_exact(self, metadata_context):
         """Test chunked prefill mixed with decode (Exact match)."""
         # 1 decode, 1 chunked prefill (len 50), 1 regular prefill (len 10)
         seq_lengths = [1, 50, 10]
@@ -348,7 +348,7 @@ class TestMambaMetadata:
         assert torch.equal(metadata_context.seq_idx, expected_seq_idx)
 
     @pytest.mark.internal
-    def _test_update_chunked_prefill_mixed_padded(self, metadata_context):
+    def test_update_chunked_prefill_mixed_padded(self, metadata_context):
         """Test chunked prefill mixed with decode (Padded)."""
         # 2 decode, 1 chunked prefill (len 50), 1 regular prefill (len 10)
         seq_lengths = [1, 1, 50, 10]
@@ -389,7 +389,7 @@ class TestMambaMetadata:
         assert torch.equal(metadata_context.seq_idx, expected_seq_idx)
 
     @pytest.mark.internal
-    def _test_update_chunked_only_padded(self, metadata_context):
+    def test_update_chunked_only_padded(self, metadata_context):
         """Test a case with only chunked prefill (no decode, no regular prefill) but with padding."""
         # 1 chunked prefill request.
         seq_lengths = [100]

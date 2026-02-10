@@ -452,7 +452,7 @@ class DynamicInferenceContext(BaseInferenceContext):
         self.graph_attn_metadata = {}
         self.non_graph_attn_metadata = {}
         self.active_attn_metadata = None
-        self.is_recording_cuda_graphs = False
+        self.is_creating_cuda_graphs = False
 
         self.graph_attn_metadata["mha_metadata"] = GraphedMHAMetadata(
             block_count_total=self.block_allocator.total_count,
@@ -1184,10 +1184,10 @@ class DynamicInferenceContext(BaseInferenceContext):
         Return:
             None.
         """
-        self.is_recording_cuda_graphs = construct_graph_dimensions is not None
+        self.is_creating_cuda_graphs = construct_graph_dimensions is not None
 
-        # if in recording mode, add dummy requests for cuda graph capture
-        if self.is_recording_cuda_graphs:
+        # If in CUDA graph creation mode, add dummy requests for CUDA graph capture
+        if self.is_creating_cuda_graphs:
             self.add_dummy_requests_for_cudagraph_capture(construct_graph_dimensions)
 
         batch_dimensions = InferenceBatchDimensions(
@@ -1350,7 +1350,7 @@ class DynamicInferenceContext(BaseInferenceContext):
         self.chunked_prefill_request_id = -1
         self.num_prefill_requests = 0
         self._using_cuda_graph_this_step = False
-        self.is_recording_cuda_graphs = False
+        self.is_creating_cuda_graphs = False
         self.padded_batch_dimensions = InferenceBatchDimensions(
             token_count=0, prefill_req_count=0, decode_req_count=0
         )
@@ -1619,7 +1619,7 @@ class DynamicInferenceContext(BaseInferenceContext):
     def is_chunked_prefill_enabled(self) -> bool:
         """Returns whether chunked prefill is enabled."""
         if self.is_hybrid_model:
-            return self.enable_chunked_prefill and not self.is_recording_cuda_graphs
+            return self.enable_chunked_prefill and not self.is_creating_cuda_graphs
         return self.enable_chunked_prefill
 
     def release_memory_blocks_from_request_indexes(self, request_indexes) -> None:
