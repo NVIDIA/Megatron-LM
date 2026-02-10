@@ -99,10 +99,6 @@ DEPRECATED_ARGS = [
     "inference_logging_step_interval",
     "pg_collection",
 ]
-from megatron.core.inference.contexts.dynamic_context import HAVE_TORCH_MEMORY_SAVER
-
-if HAVE_TORCH_MEMORY_SAVER:
-    from torch_memory_saver import torch_memory_saver
 
 
 class EngineSuspendedError(Exception):
@@ -326,9 +322,6 @@ class DynamicInferenceEngine(AbstractEngine):
         )
 
         self.capture_stats = capture_stats
-
-        if HAVE_TORCH_MEMORY_SAVER:
-            torch_memory_saver.pause("kv_cache")
 
     @internal_api
     async def start_listening_to_data_parallel_coordinator(
@@ -607,16 +600,20 @@ class DynamicInferenceEngine(AbstractEngine):
         ):
             delete_cuda_graphs()
 
-        # Maintain references to requests before reset.
+        # Build the list of requests to re-add on resume.
+        # All waiting requests are always included; active requests are included
+        # only if they are marked for recompute (their KV cache will be gone).
         waiting_request_ids = list(self.waiting_request_ids)
         active_request_ids = set(self.requests.keys()) - set(waiting_request_ids)
-        self.resume_request_ids = [*active_request_ids, *waiting_request_ids]
+        recompute_active_ids = [
+            rid for rid in active_request_ids if self.requests[rid].recompute_upon_suspend
+        ]
+        self.resume_request_ids = [*recompute_active_ids, *waiting_request_ids]
         self.waiting_request_ids.clear()
 
-        # Suspend request objects that are marked for recompute.
-        for request_id in active_request_ids:
-            if self.requests[request_id].recompute_upon_suspend:
-                self.requests[request_id].record.checkpoint()
+        # Checkpoint active requests that are marked for recompute.
+        for request_id in recompute_active_ids:
+            self.requests[request_id].record.checkpoint()
 
     def resume(self):
         """Resume engine by reallocating context's GPU state."""
@@ -650,14 +647,13 @@ class DynamicInferenceEngine(AbstractEngine):
                 self.create_cuda_graphs()
             capture_time = time.time() - capture_time
 
-            # Add requests that are marked for recompute.
+            # Re-add requests saved during suspend.
             add_time = time.time()
             torch.cuda.synchronize()
             for request_id in self.resume_request_ids:
                 request_entry = self.requests[request_id]
-                if request_entry.recompute_upon_suspend:
-                    self._add_request(self.get_request(request_id))
-                    request_entry.recompute_upon_suspend = False
+                self._add_request(self.get_request(request_id))
+                request_entry.recompute_upon_suspend = False
             torch.cuda.synchronize()
             add_time = time.time() - add_time
 

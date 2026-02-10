@@ -3,7 +3,7 @@
 import logging
 import math
 import warnings
-from contextlib import contextmanager, nullcontext
+from contextlib import nullcontext
 from typing import List, Optional, Sequence, Tuple
 
 import torch  # type: ignore
@@ -530,22 +530,6 @@ class DynamicInferenceContext(BaseInferenceContext):
             )
         )
 
-    @contextmanager
-    def _track_offloadable_tensors(self):
-        """Context manager that tracks tensors allocated within it for later offload/restore.
-
-        NOTE: This currently tracks the KV cache and mamba states, as they are the largest tensors.
-        TODO: Benchmark the benefits of tracking additional tensors.
-        """
-        initial_attrs = set(vars(self).keys())
-        yield
-        for name in vars(self).keys() - initial_attrs:
-            if isinstance(getattr(self, name), torch.Tensor):
-                self._offloadable_tensor_names.append(name)
-                self._offloadable_cpu_backups[name] = torch.empty_like(
-                    getattr(self, name), device="cpu"
-                ).pin_memory()
-
     def _allocate_memory_buffer(self):
         """Allocate the KV cache memory buffer."""
         if self.cache_mla_latent:
@@ -572,6 +556,14 @@ class DynamicInferenceContext(BaseInferenceContext):
                 dtype=self.params_dtype,
                 device=torch.cuda.current_device(),
             )
+        if (
+            self.kv_cache_management_mode == KVCacheManagementMode.OFFLOAD
+            and not self._uses_torch_memory_saver
+        ):
+            self._offloadable_tensor_names.append("memory_buffer")
+            self._offloadable_cpu_backups["memory_buffer"] = torch.empty_like(
+                self.memory_buffer, device="cpu"
+            ).pin_memory()
 
     def _allocate_mamba_states(self):
         """Allocate Mamba states for hybrid models."""
@@ -589,6 +581,18 @@ class DynamicInferenceContext(BaseInferenceContext):
                 dtype=self.params_dtype,
                 device=torch.cuda.current_device(),
             )
+            if (
+                self.kv_cache_management_mode == KVCacheManagementMode.OFFLOAD
+                and not self._uses_torch_memory_saver
+            ):
+                self._offloadable_tensor_names.append("mamba_conv_states")
+                self._offloadable_cpu_backups["mamba_conv_states"] = torch.empty_like(
+                    self.mamba_conv_states, device="cpu"
+                ).pin_memory()
+                self._offloadable_tensor_names.append("mamba_ssm_states")
+                self._offloadable_cpu_backups["mamba_ssm_states"] = torch.empty_like(
+                    self.mamba_ssm_states, device="cpu"
+                ).pin_memory()
         else:
             self.mamba_metadata = None
 
@@ -664,8 +668,6 @@ class DynamicInferenceContext(BaseInferenceContext):
                 tag="inference_context", enable_cpu_backup=offload_kv
             )
             self._uses_torch_memory_saver = True
-        elif offload_kv:
-            ctx_manager = self._track_offloadable_tensors()
         with ctx_manager:
             self._allocate_memory_buffer()
             self._allocate_mamba_states()
@@ -675,7 +677,7 @@ class DynamicInferenceContext(BaseInferenceContext):
         self.reset_mamba_state()
 
     def deallocate_all_tensors(self):
-        """Deallcoate GPU state.
+        """Deallocate GPU state.
 
         This method is used for suspending the dynamic engine.
         """
@@ -706,9 +708,8 @@ class DynamicInferenceContext(BaseInferenceContext):
                 tensor.storage().resize_(self._offloadable_storage_sizes[name])
                 tensor.copy_(self._offloadable_cpu_backups[name], non_blocking=True)
         elif self.kv_cache_management_mode == KVCacheManagementMode.RECOMPUTE:
+            self.is_tensor_state_allocated = False
             self.allocate_all_tensors()
-        else:
-            raise ValueError("Cannot re-allocate large tensors if they are expected to persist.")
 
     def deallocate_large_tensors(self):
         """Deallocate large tensors (KV cache, Mamba states) during suspend.
@@ -717,6 +718,10 @@ class DynamicInferenceContext(BaseInferenceContext):
         """
         if not self.is_tensor_state_allocated:
             return
+
+        if self.kv_cache_management_mode == KVCacheManagementMode.PERSIST:
+            return
+
         self.is_tensor_state_allocated = False
 
         if self.unified_memory_level != 0:
