@@ -344,6 +344,10 @@ if __name__ == "__main__":
 
     args = get_args()
 
+    if args.calib_batch_size > 1:
+        warnings.warn("Currently only supports batch-size 1 for calibration.")
+        args.calib_batch_size = 1
+
     tokenizer = get_tokenizer()._tokenizer
     if hasattr(tokenizer, "tokenizer"):
         tokenizer = tokenizer.tokenizer
@@ -396,7 +400,7 @@ if __name__ == "__main__":
             batch_size=args.calib_batch_size,
         )
         for input_ids in tqdm(dataloader, total=args.calib_size, disable=torch.distributed.get_rank()):
-            simple_generate(model, input_ids, osl=1, calibration_mode=True)
+            simple_generate(model, input_ids, osl=1) # calibration_mode=True)
 
     unwrapped_model = unwrap_model(model)[0]
 
