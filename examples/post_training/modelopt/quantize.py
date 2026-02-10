@@ -4,6 +4,7 @@
 
 import copy
 import functools
+import inspect
 import json
 import os
 import random
@@ -37,7 +38,6 @@ from megatron.post_training.checkpointing import load_modelopt_checkpoint
 from megatron.post_training.generate import simple_generate
 from megatron.post_training.model_builder import modelopt_gpt_mamba_builder
 from megatron.post_training.utils import (
-    modelopt_version_at_least,
     print_distributed_quant_summary,
     report_current_memory_info,
 )
@@ -310,9 +310,9 @@ def get_calib_dataloader(
                 start_idx = 0
             batch.append(full_text[start_idx : start_idx + max_sequence_length])
             if len(batch) == batch_size:
-                tokens = tokenizer(batch, return_tensors="pt", padding=True, device="cuda")
+                tokens = tokenizer(batch, return_tensors="pt", padding=True)
                 batch = []
-                yield tokens["input_ids"]
+                yield tokens["input_ids"].cuda()
     else:
         # HuggingFace dataset
         if use_random_offset:
@@ -344,7 +344,9 @@ if __name__ == "__main__":
 
     args = get_args()
 
-    tokenizer = get_tokenizer().tokenizer
+    tokenizer = get_tokenizer()._tokenizer
+    if hasattr(tokenizer, "tokenizer"):
+        tokenizer = tokenizer.tokenizer
     model = get_model(
         functools.partial(model_provider, modelopt_gpt_mamba_builder), wrap_with_ddp=False
     )
@@ -361,8 +363,9 @@ if __name__ == "__main__":
         import_dtype = torch.float16 if args.fp16 else torch.bfloat16
         unwrapped_model = unwrap_model(model)[0]
         workspace_dir = os.environ.get("MLM_WORK_DIR", "/tmp")
+
         import_kwargs = {"dtype": import_dtype}
-        if modelopt_version_at_least("0.41.0"):
+        if "trust_remote_code" in inspect.signature(import_mcore_gpt_from_hf).parameters:
             import_kwargs.update({"trust_remote_code": args.trust_remote_code})
         import_mcore_gpt_from_hf(
             unwrapped_model, args.pretrained_model_path, workspace_dir, **import_kwargs
@@ -393,7 +396,7 @@ if __name__ == "__main__":
             batch_size=args.calib_batch_size,
         )
         for input_ids in tqdm(dataloader, total=args.calib_size, disable=torch.distributed.get_rank()):
-            _ = simple_generate(model, input_ids, osl=1)
+            simple_generate(model, input_ids, osl=1, calibration_mode=True)
 
     unwrapped_model = unwrap_model(model)[0]
 
