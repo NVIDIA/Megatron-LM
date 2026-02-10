@@ -156,5 +156,13 @@ def test_inference_pipeline(golden_values_path: str, test_values_path: str) -> N
                 f"\nCurrent (truncated to {min_len} chars): {generated_text_current[:min_len]}"
             )
 
+        if "routing_indices" in groundtruth_results:
+            at_least_one_test_loop = True
+            routing_indices_groundtruth = groundtruth_results["routing_indices"]
+            routing_indices_current = current_results["routing_indices"]
+            assert (
+                routing_indices_groundtruth == routing_indices_current
+            ), f"Routing indices mismatch:\nGround truth: {routing_indices_groundtruth}\nCurrent: {routing_indices_current}"
+
         if not at_least_one_test_loop:
             raise AssertionError(f"No test performed for output {groundtruth_results}")

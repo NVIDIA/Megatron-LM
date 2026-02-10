@@ -147,6 +147,7 @@ async def main(
                 throughputs.append(throughput)
                 if req.routing_indices is not None:
                     result_dict["routing_indices"] = req.routing_indices.tolist()
+                                
                 json_results[req.request_id] = result_dict
             throughput_dict = {"throughput": throughputs}
             if args.throughput_check_only:
