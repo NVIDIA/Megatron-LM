@@ -51,8 +51,8 @@ Run a dummy training job with mcore v0.15.0 to re-save the checkpoint with new o
 MODEL_TRAIN_PARAMS=(
     # Define model architecture and training parameters here
 )
-export OLD_CKPT=/workspace/mcore_ckpt_old
-export CONVERTED_CKPT=/workspace/mcore_ckpt_0.15.0
+OLD_CKPT=/workspace/mcore_ckpt_old
+CONVERTED_CKPT=/workspace/mcore_ckpt_0.15.0
 
 torchrun --nproc_per_node=8 /opt/megatron-lm/pretrain_gpt.py \
    --save-interval 1 \
@@ -74,8 +74,8 @@ Use the converted checkpoint as the input for continued training with ToT MCore.
 MODEL_TRAIN_PARAMS=(
     # Define model architecture and training parameters here
 )
-export NEW_CKPT=/workspace/mcore_ckpt_new
-export CONVERTED_CKPT=/workspace/mcore_ckpt_0.15.0
+NEW_CKPT=/workspace/mcore_ckpt_new
+CONVERTED_CKPT=/workspace/mcore_ckpt_0.15.0
 
 torchrun --nproc_per_node=8 /opt/megatron-lm/pretrain_gpt.py \
    --use-distributed-optimizer \
