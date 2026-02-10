@@ -418,6 +418,7 @@ def test_backward_compatibility(distributed_setup):
     assert loss is not None
 
 
+@pytest.mark.skip(reason="distribute_tensor not work for _StridedShard yet")
 @pytest.mark.distributed
 def test_strided_shard_2d_mesh(distributed_setup):
     """
