@@ -181,6 +181,7 @@ jobs:
     if: |
       !(needs.pre-flight.outputs.is_ci_workload == 'true'
       || needs.pre-flight.outputs.is_deployment_workflow == 'true'
+      || needs.pre-flight.outputs.is_merge_group == 'true'
       || needs.pre-flight.outputs.docs_only == 'true')
     steps:
       - name: Running CI tests
@@ -195,6 +196,7 @@ jobs:
       (
         success()
         || needs.pre-flight.outputs.is_ci_workload == 'true'
+        || needs.pre-flight.outputs.is_merge_group == 'true'
         || needs.pre-flight.outputs.force_run_all == 'true'
       )
       && !cancelled()
@@ -333,6 +335,7 @@ jobs:
         success()
         || needs.pre-flight.outputs.is_ci_workload == 'true'
         || needs.pre-flight.outputs.force_run_all == 'true'
+        || needs.pre-flight.outputs.is_merge_group == 'true'
       )
       && !cancelled()
     steps:
@@ -363,6 +366,7 @@ jobs:
         success()
         || needs.pre-flight.outputs.is_ci_workload == 'true'
         || needs.pre-flight.outputs.force_run_all == 'true'
+        || needs.pre-flight.outputs.is_merge_group == 'true'
       )
       && !cancelled()
     env:
@@ -396,6 +400,7 @@ jobs:
         success()
         || needs.pre-flight.outputs.is_ci_workload == 'true'
         || needs.pre-flight.outputs.force_run_all == 'true'
+        || needs.pre-flight.outputs.is_merge_group == 'true'
       )
       && !cancelled()
     outputs:
@@ -495,6 +500,7 @@ jobs:
         success()
         || needs.pre-flight.outputs.is_ci_workload == 'true'
         || needs.pre-flight.outputs.force_run_all == 'true'
+        || needs.pre-flight.outputs.is_merge_group == 'true'
       )
       && !cancelled()
     steps:
