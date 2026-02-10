@@ -10,7 +10,7 @@ from torch import Tensor
 
 from megatron.core import InferenceParams, parallel_state, tensor_parallel
 from megatron.core.dist_checkpointing.mapping import ShardedStateDict
-from megatron.core.dist_checkpointing.utils import replace_prefix_for_sharding
+from megatron.core.dist_checkpointing.utils import apply_prefix_mapping, replace_prefix_for_sharding
 from megatron.core.fp8_utils import get_fp8_context
 from megatron.core.models.backends import BackendSpecProvider, LocalSpecProvider
 from megatron.core.packed_seq_params import PackedSeqParams
@@ -1097,6 +1097,16 @@ class MultiTokenPredictionLayer(MegatronModule):
             token prediction layer.
         """
         sharded_state_dict = super().sharded_state_dict(prefix, sharded_offsets, metadata)
+
+        # Backward compatibility: GPT MTP checkpoints were saved with the submodule
+        # named 'transformer_layer'. Remap checkpoint keys so old checkpoints load
+        # correctly. Mamba MTP models keep 'mtp_model_layer' as their native format
+        # since no older checkpoints exist for them.
+        if self.mtp_layer_pattern is None:
+            apply_prefix_mapping(
+                sharded_state_dict, {f'{prefix}mtp_model_layer.': f'{prefix}transformer_layer.'}
+            )
+
         return sharded_state_dict
 
 
