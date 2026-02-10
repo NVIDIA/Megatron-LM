@@ -513,6 +513,7 @@ class DynamicInferenceRequestRecord:
 
         prompt_tokens = self.requests[0].prompt_tokens
         prompt_text = self.requests[0].prompt
+        routing_indices = None
         if self.requests[0].routing_indices is not None:
             routing_indices = torch.cat([r.routing_indices for r in self.requests])
         generated_tokens = merge_lists("generated_tokens")
