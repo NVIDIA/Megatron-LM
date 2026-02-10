@@ -1104,8 +1104,7 @@ class MultiTokenPredictionLayer(MegatronModule):
         # since no older checkpoints exist for them.
         if self.mtp_layer_pattern is None:
             apply_prefix_mapping(
-                sharded_state_dict,
-                {f'{prefix}mtp_model_layer.': f'{prefix}transformer_layer.'},
+                sharded_state_dict, {f'{prefix}mtp_model_layer.': f'{prefix}transformer_layer.'}
             )
 
         return sharded_state_dict
