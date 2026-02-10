@@ -3129,6 +3129,17 @@ def evaluate(
     if args.cuda_graph_impl == "local" and CudaGraphScope.full_iteration in args.cuda_graph_scope:
         forward_backward_func = FullCudaGraphWrapper(forward_backward_func, cuda_graph_warmup_steps=args.cuda_graph_warmup_steps)
 
+    if has_nvidia_modelopt:
+        # [ModelOpt]: Pipeline-parallel Distillation stacks student and teacher tensors
+        adjust_tensor_shapes_fn = get_tensor_shapes_adjust_fn_for_distillation(
+            model,
+            seq_length=args.seq_length,
+            micro_batch_size=args.micro_batch_size,
+            decoder_seq_length=args.decoder_seq_length,
+        )
+    else:
+        adjust_tensor_shapes_fn = None
+
     if eval_iters is None:
         eval_iters = args.eval_iters
 
@@ -3153,6 +3164,7 @@ def evaluate(
                 micro_batch_size=args.micro_batch_size,
                 decoder_seq_length=args.decoder_seq_length,
                 forward_only=True,
+                adjust_tensor_shapes_fn=adjust_tensor_shapes_fn,
             )
             ft_integration.on_eval_step_end()
             config.timers = get_timers()
