@@ -256,9 +256,6 @@ def _match_artifact_to_job(
     artifact_job_name = (
         artifact["name"].lower().replace("logs-", "").split(f"-{workflow_id}")[0]
     )
-    if "prefill" in artifact_job_name:
-        breakpoint()
-
     for normalized_job_name, job in job_name_map.items():
         if normalized_job_name == artifact_job_name:
             logger.info(
