@@ -125,7 +125,7 @@ async def main(
             await asyncio.sleep(0)
 
         # While we wait for the requests to complete, the engine runs in the background.
-        results: List[DynamicInferenceRequestRecord] = await asyncio.gather(*futures)    
+        results: List[DynamicInferenceRequestRecord] = await asyncio.gather(*futures)
 
     if dist.get_rank() == 0:
         # Write results to JSON. Primarily used for functional testing.

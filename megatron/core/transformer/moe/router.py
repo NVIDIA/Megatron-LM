@@ -212,7 +212,6 @@ class TopKRouter(Router):
             self.ga_steps = None
 
         self.router_replay = None
-
         if self.config.moe_enable_routing_replay:
             self.router_replay = RouterReplay()
 
