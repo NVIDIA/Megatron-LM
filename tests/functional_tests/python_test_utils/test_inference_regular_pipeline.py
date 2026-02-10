@@ -4,6 +4,7 @@ import json
 import logging
 import math
 from statistics import median
+import yaml
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -35,11 +36,14 @@ def _bytes_to_gib(num_bytes: float) -> float:
     return float(num_bytes) / (1024.0**3)
 
 
-def test_inference_pipeline(golden_values_path: str, test_values_path: str) -> None:
+def test_inference_pipeline(golden_values_path: str, test_values_path: str, model_config_path:str) -> None:
 
-    with open(golden_values_path, 'r') as f1, open(test_values_path, 'r') as f2:
+    with open(golden_values_path, 'r') as f1, open(test_values_path, 'r') as f2, open(model_config_path, 'r') as f3:
         golden_values_content = f1.read()
         tensorboard_content = f2.read()
+        model_config_content = f3.read()
+
+    metrics = yaml.safe_load(model_config_content)["METRICS"]
 
     output_groundtruth = json.loads(golden_values_content)
 
@@ -67,7 +71,7 @@ def test_inference_pipeline(golden_values_path: str, test_values_path: str) -> N
     assert len(output_groundtruth) > 0, "No test performed for output"
 
     # Throughput assertions.
-    if "throughput" in output_groundtruth.keys():
+    if "throughput" in output_groundtruth.keys() and "throughput" in metrics:
 
         # First warmup iteration is excluded from throughput statistics.
         throughput_sampled = median(output_current["throughput"][1:])
@@ -86,7 +90,7 @@ def test_inference_pipeline(golden_values_path: str, test_values_path: str) -> N
         output_groundtruth.pop('throughput')
 
     # Peak memory regression checks (optional: only if present in golden values).
-    if "mem-max-allocated-bytes" in output_groundtruth:
+    if "mem-max-allocated-bytes" in output_groundtruth and "mem-max-allocated-bytes" in metrics:
         assert "mem-max-allocated-bytes" in output_current, (
             f"Golden values include mem-max-allocated-bytes but current output does not. "
             "Ensure the inference script records memory metrics to the output JSON."
@@ -118,7 +122,7 @@ def test_inference_pipeline(golden_values_path: str, test_values_path: str) -> N
         current_results = output_current[request_id]
 
         at_least_one_test_loop = False
-        if "generated_tokens" in groundtruth_results:
+        if "generated_tokens" in groundtruth_results and "generated_tokens" in metrics:
             at_least_one_test_loop = True
             tokens_groundtruth = groundtruth_results["generated_tokens"]
             tokens_current = current_results["generated_tokens"]
@@ -127,7 +131,7 @@ def test_inference_pipeline(golden_values_path: str, test_values_path: str) -> N
                 tokens_groundtruth == tokens_current
             ), f"Token mismatch:\nGround truth: {tokens_groundtruth}\nCurrent: {tokens_current}"
 
-        if "logprobs" in groundtruth_results:
+        if "logprobs" in groundtruth_results and "logprobs" in metrics:
             at_least_one_test_loop = True
             logprobs_groundtruth = groundtruth_results["logprobs"]
             logprobs_current = current_results["logprobs"]
@@ -141,7 +145,7 @@ def test_inference_pipeline(golden_values_path: str, test_values_path: str) -> N
                     lp1, lp2, abs_tol=0.001
                 ), f"Logprobs differ at index {i}: {lp1:.5f} vs {lp2:.5f}"
 
-        if "generated_text" in groundtruth_results:
+        if "generated_text" in groundtruth_results and "generated_text" in metrics:
             at_least_one_test_loop = True
             generated_text_groundtruth = groundtruth_results["generated_text"]
             generated_text_current = current_results["generated_text"]
