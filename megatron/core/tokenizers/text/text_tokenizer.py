@@ -13,8 +13,7 @@ TOKENIZER_MAPPING_LIBRARIES = OrderedDict(
         ("megatron", "MegatronHFTokenizer"),
         ("tiktoken", "TikTokenTokenizer"),
         ("byte-level", "ByteLevelTokenizer"),
-        ("null-text", "NullTokenizer"),
-        ("sft", "SFTTokenizer"),
+        ("null", "NullTokenizer"),
     ]
 )
 
@@ -57,7 +56,7 @@ class MegatronTokenizerText(MegatronTokenizerBase):
 
         library_class = getattr(tokenizers, TOKENIZER_MAPPING_LIBRARIES[self.library])
 
-        if self.library in ['byte-level', 'null-text']:
+        if self.library in ['byte-level', 'null']:
             return library_class(**kwargs)
         else:
             return library_class(self.path, **kwargs)
@@ -83,7 +82,7 @@ class MegatronTokenizerText(MegatronTokenizerBase):
             ids (list): text to be tokenized.
 
         Returns:
-            text: detokenized text.
+            text: dettokenized text.
         """
 
         return self._tokenizer.ids_to_text(ids)
@@ -113,32 +112,6 @@ class MegatronTokenizerText(MegatronTokenizerBase):
             conversation=conversation, chat_template=chat_template, **kwargs
         )
 
-    def tokenize_conversation(
-        self, conversation: List[Dict], return_target: bool, add_generation_prompt: bool
-    ):
-        """Convert a conversation to tokens. Needed for SFTTokenizer.
-
-        Args:
-            conversation (List[Dict]): Sequence of system/user/assistant messages.
-                Must be in the following format:
-                [
-                    {"role": "system", "content": "something"},
-                    {"role": "user", "content": "something1"},
-                    {"role": "assistant", "content": "something2"},
-                ]
-            return_target (bool): Return target tokens with system and assistant masked.
-            add_generation_prompt (bool): Add assistant prefix to the end.
-        """
-
-        if self.library == 'sft':
-            return self._tokenizer.tokenize_conversation(
-                conversation=conversation,
-                return_target=return_target,
-                add_generation_prompt=add_generation_prompt,
-            )
-        else:
-            raise NotImplementedError("This method is supported only for SFTTokenizer.")
-
     def save_pretrained(self, path: str) -> None:
         """
         Saves HF tokenizer files.
@@ -167,20 +140,6 @@ class MegatronTokenizerText(MegatronTokenizerBase):
         """
 
         self._tokenizer.add_special_tokens(special_tokens)
-
-    def offsets(self, ids: list[int], text: str) -> list[int]:
-        """Calculate offsets."""
-        return self._tokenizer.offsets(ids=ids, text=text)
-
-    @property
-    def space_sensitive(self):
-        """Check if tokenizer is space sensetive."""
-        if self.library in ['sentencepiece', 'huggingface']:
-            return self._tokenizer.space_sensitive
-        else:
-            raise NotImplementedError(
-                f"This method is not supported for {self.library} tokenizers."
-            )
 
     @property
     def additional_special_tokens_ids(self) -> list:

@@ -1,5 +1,3 @@
-# Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
-
 import os
 import sys
 from argparse import Namespace
@@ -19,7 +17,7 @@ from megatron.core.inference.sampling_params import SamplingParams
 from megatron.core.inference.text_generation_controllers.encoder_decoder_text_generation_controller import (
     EncoderDecoderTextGenerationController,
 )
-from megatron.core.tokenizers.utils.build_tokenizer import build_tokenizer
+from megatron.core.tokenizers.text.utils.build_tokenizer import build_tokenizer
 from megatron.core.transformer.module import MegatronModule
 from pretrain_t5 import model_provider
 
@@ -79,8 +77,10 @@ def get_inference_engine(args: Namespace, model: MegatronModule) -> AbstractEngi
     Returns:
         AbstractBackend: The chosen backend
     """
-    # Build tokenizer
-    tokenizer = build_tokenizer(args)
+    if args.legacy_tokenizer:
+        tokenizer = get_tokenizer()
+    else:
+        tokenizer = build_tokenizer(args)
 
     inference_wrapper_config = InferenceWrapperConfig(
         hidden_size=args.hidden_size,
@@ -131,9 +131,10 @@ def main():
         num_tokens_to_generate=args.num_tokens_to_generate,
     )
 
-    # Build tokenizer
-    tokenizer = build_tokenizer(args)
-
+    if args.legacy_tokenizer:
+        tokenizer = get_tokenizer()
+    else:
+        tokenizer = build_tokenizer(args)
     decoder_prompts = [""] * len(
         args.encoder_prompts
     )  # for T5, the prompt is provided as encoder input, hence decoder_prompts is empty
