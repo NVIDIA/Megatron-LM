@@ -3,6 +3,7 @@
 Megatron-LM and Megatron Core
 =============================
 
+
 <h4>GPU-optimized library for training transformer models at scale</h4>
 
 [![Documentation](https://img.shields.io/badge/docs-latest-brightgreen.svg?style=flat)](https://docs.nvidia.com/Megatron-Core/developer-guide/latest/index.html)
