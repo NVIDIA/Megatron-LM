@@ -27,14 +27,12 @@ from megatron.core.inference.model_inference_wrappers.abstract_model_inference_w
 from megatron.core.inference.sampling_params import SamplingParams
 from megatron.core.inference.utils import get_attention_mask, set_decode_expert_padding
 from megatron.core.models.multimodal.llava_model import LLaVAModel
-from megatron.core.transformer.enums import CudaGraphScope
 from megatron.core.tensor_parallel.mappings import gather_from_sequence_parallel_region
+from megatron.core.transformer.enums import CudaGraphScope
 from megatron.core.transformer.moe.moe_layer import BaseMoELayer
 from megatron.core.transformer.moe.router_replay import RouterReplay, RouterReplayAction
 from megatron.core.transformer.utils import set_model_to_sequence_parallel
-from megatron.core import parallel_state
-from megatron.core.utils import get_asyncio_loop, get_model_config, unwrap_model
-from megatron.core.utils import get_pg_size
+from megatron.core.utils import get_asyncio_loop, get_model_config, get_pg_size, unwrap_model
 
 try:
     import transformer_engine as te  # pylint: disable=unused-import
@@ -700,7 +698,7 @@ class TextGenerationController:
         context = self.inference_wrapped_model.inference_context
         if context.moe_routing_metadata is None:
             return None
-        
+
         stacked_routing = context.moe_routing_metadata.get_routing_indices()
 
         if stacked_routing is None:
@@ -711,7 +709,6 @@ class TextGenerationController:
         active_request_ids = context.request_ids[active_request_slice].tolist()
         active_query_lengths = context.request_query_lengths[active_request_slice].tolist()
         active_token_count = context.active_token_count
-
 
         # Get TP group for all-gather if using sequence parallelism
         # With sequence parallelism, each TP rank only sees a portion of the tokens,
@@ -961,9 +958,8 @@ class TextGenerationController:
 
         logits = self._dynamic_step_forward_logits(input_ids, position_ids)
 
-         # Collect routing indices per request (must be done before context transitions)
+        # Collect routing indices per request (must be done before context transitions)
         routing_indices_per_request = self._router_record_bookkeeping()
-
 
         # This is the best place to yield control back to event loop.
         # At this point we have enqueued FW pass GPU kernels asynchronously.
@@ -991,8 +987,6 @@ class TextGenerationController:
             request_bookkeeping = {}
         else:
             request_bookkeeping = self._dynamic_step_context_bookkeeping()
-
-       
 
         ret = {
             "sample": self._sampled_tokens_cuda[:active_request_count],

@@ -215,7 +215,7 @@ class TopKRouter(Router):
 
         if self.config.moe_enable_routing_replay:
             self.router_replay = RouterReplay()
- 
+
     def _maintain_float32_expert_bias(self):
         """
         Maintain the expert bias in float32.

@@ -472,11 +472,10 @@ class DynamicInferenceContext(BaseInferenceContext):
 
         self.moe_enable_routing_replay = model_config.moe_enable_routing_replay
         if self.moe_enable_routing_replay:
-            assert model_config.num_moe_experts is not None, "Router recording/replay requested but no MoE experts specified!"
-            self.moe_routing_metadata = RoutingMetadata(
-                self, model_config.moe_router_topk
-            )
-
+            assert (
+                model_config.num_moe_experts is not None
+            ), "Router recording/replay requested but no MoE experts specified!"
+            self.moe_routing_metadata = RoutingMetadata(self, model_config.moe_router_topk)
 
         # CUDA graph config list
         self.use_cuda_graphs_for_non_decode_steps = (
@@ -1308,7 +1307,7 @@ class DynamicInferenceContext(BaseInferenceContext):
                 self.moe_routing_metadata.enable_static_buffer_recording()
             else:
                 self.moe_routing_metadata.disable_static_buffer_recording()
-            
+
     def reset(self) -> None:
         """Reset entire context.
 

@@ -77,7 +77,7 @@ class RouterReplay:
     @staticmethod
     def set_global_static_buffers(static_buffer: torch.Tensor):
         """Sets static buffers for all router instances from a combined buffer.
-        
+
         Args:
             static_buffer: Tensor of shape [max_tokens, num_layers, topk].
                           Each layer's RouterReplay gets a slice [:, layer_idx, :].
@@ -184,10 +184,9 @@ class RouterReplay:
         else:
             return default_compute_topk(scores, topk, num_groups, group_topk)
 
-
     def set_static_buffer(self, buffer: torch.Tensor):
         """Sets a static buffer for CUDA graph compatible recording.
-        
+
         Args:
             buffer: Tensor of shape [max_tokens, topk] to copy routing indices into.
         """
@@ -199,7 +198,7 @@ class RouterReplay:
 
     def record_indices(self, topk_indices: torch.Tensor):
         """Records the topk indices.
-        
+
         If a static buffer is set (for CUDA graph compatibility), copies into it.
         Otherwise, just stores the tensor reference.
         """

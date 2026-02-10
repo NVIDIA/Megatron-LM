@@ -312,17 +312,17 @@ class DynamicInferenceRequest(InferenceRequest):
         torch.cuda.nvtx.range_push("DynamicInferenceRequest.serialize")
         obj = super().serialize()
         obj["events"] = [e.serialize() for e in self.events]
-        
-        # Sanity check routing_indices: Tensor [total_tokens - 1, num_layers, topk] 
+
+        # Sanity check routing_indices: Tensor [total_tokens - 1, num_layers, topk]
         if self.routing_indices is not None:
             total_tokens = len(self.prompt_tokens) + len(self.generated_tokens)
-            # the last generated token does not undergo a forward pass 
+            # the last generated token does not undergo a forward pass
             # hence we expect routing indices for total_tokens - 1
-            assert self.routing_indices.shape[0] == total_tokens-1, (
+            assert self.routing_indices.shape[0] == total_tokens - 1, (
                 f"routing_indices first dimension {self.routing_indices.shape[0]} does not match "
                 f"total tokens {total_tokens-1}."
             )
-    
+
         torch.cuda.nvtx.range_pop()
         return obj
 
@@ -491,7 +491,7 @@ class DynamicInferenceRequestRecord:
         new_request = DynamicInferenceRequest(
             request_id=old_request.request_id,
             prompt_tokens=new_prompt_tokens,
-            sampling_params=new_sampling_params
+            sampling_params=new_sampling_params,
         )
         self.requests.append(new_request)
 

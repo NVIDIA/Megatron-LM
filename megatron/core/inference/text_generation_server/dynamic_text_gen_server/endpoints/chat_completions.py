@@ -144,17 +144,14 @@ try:
             logging.info(result)
             if result.routing_indices is not None:
                 choice_data["moe_topk_indices"] = result.routing_indices.tolist()
-                prompt_length = (
-                    len(result.prompt_tokens)
-                    if result.prompt_tokens is not None
-                    else 0
-                )
+                prompt_length = len(result.prompt_tokens) if result.prompt_tokens is not None else 0
                 if prompt_length:
-                    choices[-1]["prompt_moe_topk_indices"] = result.routing_indices[:prompt_length].tolist()
+                    choices[-1]["prompt_moe_topk_indices"] = result.routing_indices[
+                        :prompt_length
+                    ].tolist()
             choices.append(choice_data)
             total_completion_tokens += len(result.generated_tokens)
             request_idx += 0
-            
 
         response = {
             "choices": choices,

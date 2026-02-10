@@ -38,13 +38,10 @@ from megatron.core.inference.sampling_params import SamplingParams
 from megatron.core.inference.text_generation_controllers.text_generation_controller import (
     TextGenerationController,
 )
-from megatron.core.transformer.moe.router_replay import (
-                    RouterReplay,
-                    RouterReplayAction,
-                )
 from megatron.core.inference.utils import Counter, await_process_call
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.transformer.cuda_graphs import delete_cuda_graphs
+from megatron.core.transformer.moe.router_replay import RouterReplay, RouterReplayAction
 from megatron.core.utils import (
     deprecate_args,
     experimental_api,
@@ -55,8 +52,6 @@ from megatron.core.utils import (
     internal_api,
     trace_async_exceptions,
 )
-
-
 
 from .async_zmq_communicator import AsyncZMQCommunicator
 
@@ -998,34 +993,19 @@ class DynamicInferenceEngine(AbstractEngine):
             # Process routing indices if available (keyed by request_id)
             # Each step's routing is a tensor of shape [num_tokens_this_step, num_layers, topk]
             # We concatenate along dim=0 to accumulate: [total_tokens, num_layers, topk]
-            if routing_indices_per_request is not None and request_id in routing_indices_per_request:
-                step_routing = routing_indices_per_request[request_id]  # [num_tokens, num_layers, topk]
+            if (
+                routing_indices_per_request is not None
+                and request_id in routing_indices_per_request
+            ):
+                step_routing = routing_indices_per_request[
+                    request_id
+                ]  # [num_tokens, num_layers, topk]
                 if request.routing_indices is None:
                     request.routing_indices = step_routing.clone()
                 else:
                     request.routing_indices = torch.cat(
                         [request.routing_indices, step_routing], dim=0
                     )
-
-                # Sanity check logging for routing indices (only log for first request, first few steps)
-                if req_idx == 0 and request.routing_indices.shape[0] <= 15:  # first 15 tokens
-                    rank = torch.distributed.get_rank()
-                    logging.info(
-                        f"[ROUTING DEBUG] rank={rank}, request_id={request_id}, "
-                        f"total_tokens={request.routing_indices.shape[0]}, "
-                        f"num_layers={request.routing_indices.shape[1]}, "
-                        f"topk={request.routing_indices.shape[2]}, "
-                        f"tokens_this_step={step_routing.shape[0]}"
-                    )
-                    # Log first layer's routing for first few tokens
-                    if step_routing.numel() > 0:
-                        num_tokens_to_log = min(3, step_routing.shape[0])
-                        # step_routing is [num_tokens, num_layers, topk], get layer 0
-                        logging.info(
-                            f"[ROUTING DEBUG] rank={rank}, Layer 0 routing (first {num_tokens_to_log} tokens): "
-                            f"{step_routing[:num_tokens_to_log, 0, :].tolist()}"
-                        )
-
 
         # Handle evicted requests.
         if evict_request_ids is not None and evict_request_ids.numel() > 0:

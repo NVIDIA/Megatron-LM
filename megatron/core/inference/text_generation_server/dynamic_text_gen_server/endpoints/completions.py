@@ -147,9 +147,7 @@ try:
                     list(result.generated_tokens) if result.generated_tokens else []
                 )
                 generated_log_probs = getattr(result, 'generated_log_probs', None) or []
-                generated_top_n_logprobs = (
-                    getattr(result, 'generated_top_n_logprobs', None) or []
-                )
+                generated_top_n_logprobs = getattr(result, 'generated_top_n_logprobs', None) or []
 
                 if echo:
                     # When echo=True, include prompt tokens and their logprobs
@@ -166,9 +164,7 @@ try:
                     top_logprobs = None
                     if prompt_top_n_logprobs or generated_top_n_logprobs:
                         top_logprobs = (
-                            [None]
-                            + list(prompt_top_n_logprobs)
-                            + list(generated_top_n_logprobs)
+                            [None] + list(prompt_top_n_logprobs) + list(generated_top_n_logprobs)
                         )
 
                     # Calculate text_offset: cumulative character positions starting from 0
@@ -203,18 +199,14 @@ try:
                     "top_logprobs": top_logprobs,
                 }
 
-            choices.append(
-                {"index": request_idx, "text": text_output, "logprobs": logprobs_data}
-            )
+            choices.append({"index": request_idx, "text": text_output, "logprobs": logprobs_data})
             if result.routing_indices is not None:
                 choices[-1]["moe_topk_indices"] = result.routing_indices.tolist()
-                prompt_length = (
-                    len(result.prompt_tokens)
-                    if result.prompt_tokens is not None
-                    else 0
-                )
+                prompt_length = len(result.prompt_tokens) if result.prompt_tokens is not None else 0
                 if prompt_length:
-                    choices[-1]["prompt_moe_topk_indices"] = result.routing_indices[:prompt_length].tolist()
+                    choices[-1]["prompt_moe_topk_indices"] = result.routing_indices[
+                        :prompt_length
+                    ].tolist()
 
             request_idx += 1
 
