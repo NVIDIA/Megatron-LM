@@ -168,7 +168,7 @@ from megatron.core.num_microbatches_calculator import (
     get_num_microbatches,
     update_num_microbatches
 )
-from megatron.core.datasets.data_schedule import wrap_dataloader
+from megatron.core.datasets.data_schedule import wrap_data_iterator
 
 from .async_utils import maybe_finalize_async_save
 from .utils import (
@@ -1721,7 +1721,7 @@ def train_step(forward_step_func, data_iterator, model, optimizer, opt_param_sch
                 num_microbatches,
                 seqlen_sum_this_global_batch,
                 seqlen_squared_sum_this_global_batch,
-            ) = wrap_dataloader(data_iterator, config, num_microbatches)
+            ) = wrap_data_iterator(data_iterator, config, get_num_microbatches())
         else:
             # data_iterator unchanged
             num_microbatches = get_num_microbatches()
@@ -2855,7 +2855,7 @@ def train(
         # Completely skip iteration if needed.
         if iteration in args.iterations_to_skip:
             # TODO(tailaim): this need to be modified
-            assert not args.sequence_packing, "Sequence packing is not supported in skip iteration mode"
+            assert config.sequence_packing_scheduler is None, "Sequence packing scheduler is not supported in skip iteration mode"
             # Dummy train_step to fast forward train_data_iterator.
             dummy_train_step(train_data_iterator)
             if iteration == start_iteration:

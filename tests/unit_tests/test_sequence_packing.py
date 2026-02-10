@@ -1,12 +1,20 @@
 # Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
+import random
 from types import SimpleNamespace
 
+import numpy as np
 import pytest
 import torch
 
 from megatron.core import parallel_state
-from megatron.core.datasets.data_schedule import get_batch_on_this_rank_for_sequence_packing
+from megatron.core.datasets.data_schedule import (
+    PackingScheduler,
+    get_batch_on_this_rank_for_sequence_packing,
+    scheduler_map,
+    wrap_data_iterator,
+)
+from megatron.core.rerun_state_machine import RerunDataIterator
 from megatron.training.global_vars import unset_global_variables
 from tests.unit_tests.test_utilities import Utils
 
@@ -32,7 +40,6 @@ class MockVariableLengthSequencePackingDataIterator:
             total_seq_length: Total length of packed sequences
             sequence_lengths: List of individual sequence lengths (variable-length).
                               If None, generates random variable lengths.
-            local_cp_size: Local CP size for hybrid context parallel
             device: Device to create tensors on
             seed: Random seed for reproducibility
         """
@@ -127,21 +134,19 @@ def _gather_tensor_from_all_ranks(tensor):
 
 
 @pytest.mark.parametrize(
-    ("tp", "pp", "cp", "hybrid_cp"),
+    ("tp", "pp", "cp"),
     [
-        (1, 1, 1, False),  # Basic case: no parallelism
-        (2, 1, 1, False),  # Tensor parallel only
-        (1, 2, 1, False),  # Pipeline parallel only
-        (2, 2, 1, False),  # TP + PP
-        (1, 1, 2, False),  # CP only
-        (2, 1, 2, False),  # TP + CP
-        (1, 2, 2, False),  # PP + CP
-        (1, 4, 1, False),  # Has middle pp stage
-        (1, 1, 1, True),  # Hybrid CP enabled (CP=1 with hybrid groups)
-        (2, 1, 1, True),  # TP + Hybrid CP
+        (1, 1, 1),  # Basic case: no parallelism
+        (2, 1, 1),  # Tensor parallel only
+        (1, 2, 1),  # Pipeline parallel only
+        (2, 2, 1),  # TP + PP
+        (1, 1, 2),  # CP only
+        (2, 1, 2),  # TP + CP
+        (1, 2, 2),  # PP + CP
+        (1, 4, 1),  # Has middle pp stage
     ],
 )
-def test_get_batch_on_this_rank_for_sequence_packing(tp, pp, cp, hybrid_cp):
+def test_get_batch_on_this_rank_for_sequence_packing(tp, pp, cp):
     """
     Test get_batch_on_this_rank_for_sequence_packing function with variable-length THD format.
 
@@ -155,7 +160,6 @@ def test_get_batch_on_this_rank_for_sequence_packing(tp, pp, cp, hybrid_cp):
     args.tensor_model_parallel_size = tp
     args.pipeline_model_parallel_size = pp
     args.context_parallel_size = cp
-    args.hybrid_context_parallel = hybrid_cp
     args.virtual_pipeline_model_parallel_size = None
     args.data_parallel_size = 8 // (tp * pp * cp)
     args.seq_length = 8192
@@ -165,21 +169,12 @@ def test_get_batch_on_this_rank_for_sequence_packing(tp, pp, cp, hybrid_cp):
         raise ValueError(f"Invalid config: tp={tp}, pp={pp}, cp={cp} exceeds world size 8")
 
     # Initialize model parallel
-    Utils.initialize_model_parallel(
-        tp,
-        pp,
-        None,
-        context_parallel_size=cp,
-        hybrid_context_parallel=hybrid_cp,
-        min_hybrid_context_parallel_size=1,
-    )
+    Utils.initialize_model_parallel(tp, pp, None, context_parallel_size=cp)
 
     try:
         # Create mock data iterator with variable-length sequences
         # Only TP rank 0 needs the iterator; other TP ranks pass None
         tp_rank = parallel_state.get_tensor_model_parallel_rank()
-        local_cp_size = 8 // (tp * pp) if hybrid_cp else None
-
         if tp_rank == 0:
             # Use deterministic seed based on DP rank so same data within TP/PP/CP group
             dp_rank = parallel_state.get_data_parallel_rank()
@@ -191,7 +186,6 @@ def test_get_batch_on_this_rank_for_sequence_packing(tp, pp, cp, hybrid_cp):
                 MockVariableLengthSequencePackingDataIterator(
                     total_seq_length=args.seq_length,
                     sequence_lengths=sequence_lengths,  # Variable lengths, sum=8192
-                    local_cp_size=local_cp_size,
                     seed=42 + dp_rank,  # Same seed within PP/CP group
                 )
             )
@@ -201,10 +195,7 @@ def test_get_batch_on_this_rank_for_sequence_packing(tp, pp, cp, hybrid_cp):
 
         # Call the function under test
         result = get_batch_on_this_rank_for_sequence_packing(
-            data_iterator=data_iterator,
-            mtp_on_this_rank=False,
-            vp_stage=None,
-            hybrid_context_parallel=hybrid_cp,
+            data_iterator=data_iterator, mtp_on_this_rank=False, vp_stage=None
         )
 
         # Unpack the result
@@ -248,9 +239,6 @@ def test_get_batch_on_this_rank_for_sequence_packing(tp, pp, cp, hybrid_cp):
         # =====================================================================
         assert packed_seq_params is not None
         assert packed_seq_params.qkv_format == "thd"
-        if hybrid_cp:
-            assert packed_seq_params.local_cp_size is not None
-            assert packed_seq_params.cp_group is not None
 
         test_keys = [
             "cu_seqlens_q",
@@ -260,8 +248,6 @@ def test_get_batch_on_this_rank_for_sequence_packing(tp, pp, cp, hybrid_cp):
             "cu_seqlens_kv_padded",
             "max_seqlen_kv",
         ]
-        if hybrid_cp:
-            test_keys.append("local_cp_size")
         for key in test_keys:
             tensor = getattr(packed_seq_params, key)
             assert tensor is not None
@@ -291,18 +277,9 @@ def test_get_batch_on_this_rank_for_sequence_packing(tp, pp, cp, hybrid_cp):
         # =====================================================================
         # TEST 4: Verify CP partitioning
         # =====================================================================
-        if cp > 1 or hybrid_cp:
-            if hybrid_cp:
-                assert packed_seq_params.local_cp_size is not None
-                cp_size = packed_seq_params.local_cp_size
-                assert packed_seq_params.cp_group == (
-                    parallel_state.get_hybrid_data_context_parallel_groups(group_size=cp_size)
-                )
-            else:
-                cp_size = cp
-
+        if cp > 1:
             # With CP, the sequence should be partitioned
-            expected_seq_len = args.seq_length // cp_size
+            expected_seq_len = args.seq_length // cp
 
             if is_first_stage:
                 actual_seq_len = tokens.shape[1]
@@ -316,6 +293,188 @@ def test_get_batch_on_this_rank_for_sequence_packing(tp, pp, cp, hybrid_cp):
                 assert (
                     actual_seq_len == expected_seq_len
                 ), f"CP partitioned labels have wrong shape: {actual_seq_len} != {expected_seq_len}"
+
+    finally:
+        Utils.destroy_model_parallel()
+        unset_global_variables()
+
+
+@pytest.mark.parametrize(
+    ("tp", "pp", "cp", "vpp", "scheduler_type"),
+    [
+        (1, 1, 8, None, "dp_balanced"),
+        (2, 1, 4, None, "dp_balanced"),
+        (2, 4, 1, None, "dp_balanced"),
+        (2, 2, 1, None, "dp_balanced"),
+        (1, 4, 1, 4, "dp_balanced"),
+    ],
+)
+def test_wrap_dataloader(tp, pp, cp, vpp, scheduler_type):
+    '''
+    Test wrap_dataloader function with different scheduler types.
+    '''
+    args = SimpleNamespace()
+    args.tensor_model_parallel_size = tp
+    args.pipeline_model_parallel_size = pp
+    args.context_parallel_size = cp
+    args.virtual_pipeline_model_parallel_size = None
+    args.data_parallel_size = 8 // (tp * pp * cp)
+    args.seq_length = 8192
+    args.max_seqlen_per_dp_cp_rank = 8192
+
+    # Skip invalid configurations
+    if args.data_parallel_size < 1:
+        raise ValueError(f"Invalid config: tp={tp}, pp={pp}, cp={cp} exceeds world size 8")
+
+    def _create_single_sample(seq_len):
+        # hard code the padding size to 16
+        pad_size = 16
+        seq_len_padded = ((seq_len + pad_size - 1) // pad_size) * pad_size
+        device = torch.device("cuda", torch.cuda.current_device())
+        tokens = torch.randint(0, 128, (seq_len_padded,), dtype=torch.int64, device=device)
+        labels = tokens + 1
+        position_ids = torch.arange(seq_len_padded, dtype=torch.int64, device=device)
+        loss_mask = torch.ones(seq_len_padded, dtype=torch.float32, device=device)
+        loss_mask[0:seq_len] = 1
+        loss_mask[seq_len:] = 0
+        cu_seqlens = torch.tensor([0, seq_len_padded], dtype=torch.int32, device=device)
+
+        return {
+            'tokens': tokens,
+            'labels': labels,
+            'loss_mask': loss_mask,
+            'position_ids': position_ids,
+            'cu_seqlens': cu_seqlens,
+        }
+
+    # Initialize model parallel
+    Utils.initialize_model_parallel(tp, pp, vpp, context_parallel_size=cp)
+
+    global_batch_size = 64
+    micro_batch_size = 1
+    nums = [random.randint(2048, args.seq_length) for _ in range(global_batch_size)]  # 64 sequences
+
+    config = SimpleNamespace()
+    config.max_seqlen_per_dp_cp_rank = args.max_seqlen_per_dp_cp_rank
+    config.microbatch_group_size_per_vp_stage = pp
+    config.virtual_pipeline_model_parallel_size = vpp
+    config.sequence_packing_scheduler = scheduler_type
+
+    dp_rank = parallel_state.get_data_parallel_rank()
+    dp_size = parallel_state.get_data_parallel_world_size()
+
+    pp_rank = parallel_state.get_pipeline_model_parallel_rank()
+    tp_rank = parallel_state.get_tensor_model_parallel_rank()
+
+    is_pp_first = pp_rank == 0
+    is_pp_last = pp_rank == pp - 1
+    is_pp_first_or_last = is_pp_first or is_pp_last
+    is_tp_first = tp_rank == 0
+
+    num_micro_batches_old = global_batch_size // micro_batch_size // dp_size
+
+    if is_tp_first and (is_pp_first or is_pp_last):
+        samples = [
+            _create_single_sample(num)
+            for num in nums[dp_rank * num_micro_batches_old : (dp_rank + 1) * num_micro_batches_old]
+        ]
+        data_iterator = RerunDataIterator(iter(samples))
+    else:
+        data_iterator = None
+
+    if is_tp_first:
+        if vpp is not None and vpp > 1:
+            if is_pp_first:
+                data_iterator = [data_iterator] + [None for _ in range(vpp - 1)]
+            elif is_pp_last:
+                data_iterator = [None for _ in range(vpp - 1)] + [data_iterator]
+            else:
+                data_iterator = [None for _ in range(vpp)]
+    try:
+        # Call the function under test
+        (
+            new_data_iterator,
+            num_micro_batches,
+            num_total_tokens_this_global_batch,
+            sequence_square_sum_this_global_batch,
+        ) = wrap_data_iterator(data_iterator, config, num_micro_batches_old)
+
+        # check the result
+        assert type(num_micro_batches) is int
+        assert (
+            type(num_total_tokens_this_global_batch) is float
+            or type(num_total_tokens_this_global_batch) is np.float32
+        )
+        assert (
+            type(sequence_square_sum_this_global_batch) is float
+            or type(sequence_square_sum_this_global_batch) is np.float32
+        )
+
+        def _check_batch(batch_all, batch_keys):
+            for batch in batch_all:
+                assert set(batch_keys) <= set(
+                    batch.keys()
+                ), f"batch keys: {set(batch.keys())} missing {set(batch_keys) - set(batch.keys())}"
+                for key in batch_keys:
+                    assert batch[key] is not None
+
+        if is_tp_first:
+            # CHECK KEYS
+            batch_keys = ["cu_seqlens", "max_seqlen", "cu_seqlens_padded"]
+            if vpp is not None and vpp > 1:
+                # check metadata for all stages (save batches to avoid re-consuming iterators)
+                all_stage_batches = []
+                for temp_data_iterator in new_data_iterator:
+                    stage_batch = [next(temp_data_iterator) for _ in range(num_micro_batches)]
+                    all_stage_batches.append(stage_batch)
+                    _check_batch(stage_batch, batch_keys)
+
+                # check for first or last stage on first or last pp rank
+                if is_pp_first_or_last:
+                    batch_all = all_stage_batches[0] if is_pp_first else all_stage_batches[-1]
+                    batch_keys += ["tokens", "position_ids", "labels", "loss_mask"]
+                    _check_batch(batch_all, batch_keys)
+            else:
+                # non-VPP: single iterator
+                batch_all = [next(new_data_iterator) for _ in range(num_micro_batches)]
+                if is_pp_first_or_last:
+                    batch_keys += ["tokens", "position_ids", "labels", "loss_mask"]
+                _check_batch(batch_all, batch_keys)
+
+            # CHECK TOKEN SUM ON FIRST OR LAST PP RANK
+            # Note: data_iterator is consumed by wrap_data_iterator, new_data_iterator is consumed above.
+            # Use `samples` for before-wrap, reuse `batch_all` from the check above for after-wrap.
+            if is_pp_first_or_last:
+                # Compute token sum before wrap
+                token_sum_before = torch.tensor(0, dtype=torch.int64, device='cuda')
+                for sample in samples:
+                    token_sum_before += sample['tokens'].long().sum()
+
+                # Compute token sum after wrap (batch_all already collected above with tokens)
+                token_sum_after = torch.tensor(0, dtype=torch.int64, device='cuda')
+                for batch in batch_all:
+                    token_sum_after += batch['tokens'].long().sum()
+
+                # Reduce sum across dp_cp group and verify equality
+                dp_cp_group = parallel_state.get_data_parallel_group(with_context_parallel=False)
+                torch.distributed.all_reduce(
+                    token_sum_before, op=torch.distributed.ReduceOp.SUM, group=dp_cp_group
+                )
+                torch.distributed.all_reduce(
+                    token_sum_after, op=torch.distributed.ReduceOp.SUM, group=dp_cp_group
+                )
+
+                assert (
+                    token_sum_before == token_sum_after
+                ), f"Token sum mismatch: before={token_sum_before.item()}, after={token_sum_after.item()}"
+
+        else:
+            if vpp is not None and vpp > 1:
+                assert type(new_data_iterator) is list and len(new_data_iterator) == vpp
+                for data_iterator in new_data_iterator:
+                    assert data_iterator is None
+            else:
+                assert new_data_iterator is None
 
     finally:
         Utils.destroy_model_parallel()

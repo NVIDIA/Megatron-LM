@@ -1,27 +1,24 @@
 # Copyright (c) 2025 NVIDIA CORPORATION.  All rights reserved.
 
 import enum
-from typing import Any, Dict, List, Optional, Type, Union
+from typing import Any, Dict, List, Optional, Type
 
-import numpy as np
 import torch
 
 from megatron.core import parallel_state
+from megatron.core.datasets.data_scheduler_utils import (
+    broadcast_scalars,
+    broadcast_tensor,
+    broadcast_to_pp_group,
+    build_packed_microbatches,
+    create_data_iterator,
+    get_batch_and_global_seqlens,
+    reroute_samples_to_dcp_ranks,
+)
+from megatron.core.extensions.transformer_engine import get_thd_partitioned_indices
 from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.core.pipeline_parallel.hybrid_cp_schedule import BalancedCPScheduler
 from megatron.core.process_groups_config import ProcessGroupCollection
-from megatron.core.rerun_state_machine import RerunDataIterator
-from megatron.core.utils import is_te_min_version
-
-try:
-    # Register the TE CUDA kernels
-    import transformer_engine  # pylint: disable=unused-import
-
-    # Alias the PyTorch wrapper so we can call tex.* APIs
-    import transformer_engine_torch as tex
-except ImportError:
-    # TE isn’t installed or the torch wrapper is missing
-    tex = None
 
 
 class HybridCPDataLoaderWrapper:
@@ -72,7 +69,6 @@ class HybridCPDataLoaderWrapper:
         Gathers the sequence lengths of all subsamples from all DP ranks.
         Each DP rank loads the same number of microbatches but each microbatch
         may have a different number of subsamples.
-
         We find the number of subsamples each rank holds and then gather the
         sequence lengths of all subsamples from all ranks.
         """
@@ -316,18 +312,6 @@ class HybridCPDataLoaderWrapper:
         return samples_this_rank_with_id, sample_id_groups
 
 
-class PackingScheduler(enum.Enum):
-    """Enum for supported sequence packing algorithms."""
-
-    DEFAULT_SEQUENCE_PACKING = "default_sequence_packing"
-
-
-def _broadcast_tensor(item, src_rank, group) -> None:
-    """Broadcast a tensor from src_rank to all ranks in the group."""
-    if item is not None:
-        torch.distributed.broadcast(item, src_rank, group=group)
-
-
 class BaseScheduler:
     """Base class for sequence packing schedulers."""
 
@@ -338,6 +322,14 @@ class BaseScheduler:
         dp_size: int,
         microbatch_group_size_per_vp_stage: Optional[int],
     ):
+        """
+        Args:
+            max_seqlen_per_dp_cp_rank: The maximum sequence length per DPxCP rank.
+            cp_size: The context parallel size.
+            dp_size: The data parallel size.
+            microbatch_group_size_per_vp_stage: The microbatch group size per virtual
+            pipeline stage, only used when enabling VPP, otherwise None.
+        """
         self.max_seqlen_per_dp_cp_rank = max_seqlen_per_dp_cp_rank
         self.cp_size = cp_size
         self.dp_size = dp_size
@@ -362,446 +354,29 @@ class BaseScheduler:
         dev,
         config,
     ):
-        """Run the scheduler and return the new data_iterator."""
-        raise NotImplementedError
-
-    @staticmethod
-    def _get_global_seqlens(subsample_seqlens: torch.Tensor, dp_group) -> List[int]:
         """
-        Gathers the sequence lengths of all subsamples from all DP ranks.
+        Run the scheduler and return the new data_iterator.
 
-        Each DP rank has the same number of subsamples (num_microbatches),
-        so we can directly all_gather without padding.
-        """
-        dp_size = dp_group.size()
-        num_local_subsamples = subsample_seqlens.shape[0]
-
-        # Gather the subsample_seqlens from all ranks
-        seqlens_gathered = [torch.empty_like(subsample_seqlens) for _ in range(dp_size)]
-        torch.distributed.all_gather(seqlens_gathered, subsample_seqlens, group=dp_group)
-
-        seqlens_gathered = torch.cat(seqlens_gathered, dim=0)
-        seqlens_gathered = seqlens_gathered.cpu().tolist()
-
-        # Calculate the offsets to assign unique global ID to each subsample.
-        # Since each rank has the same number of subsamples, offsets are evenly spaced.
-        offsets = torch.arange(
-            0, dp_size * num_local_subsamples, num_local_subsamples, dtype=torch.int32
-        )
-
-        return seqlens_gathered, offsets
-
-    @staticmethod
-    def _get_global_id_seqlens(num_local_subsamples, offsets, seqlens_gathered, dp_group):
-        """
-        Calculates the global ID for each subsample.
-
-        We assign a unique global ID to each subsample.
-
-        Returns:
-        global_id_seqlens: list of (global_id, seqlen) tuples for scheduling.
-        global_ids_this_rank: list of global IDs locally present on this rank.
-        """
-        dp_rank = dp_group.rank()
-        global_ids = torch.arange(len(seqlens_gathered), dtype=torch.int32).cuda()
-        # Create a list of (global_id, seqlen) tuples for scheduling
-        global_id_seqlens = [(i, seqlens_gathered[i]) for i in range(len(global_ids))]
-        # Get the global IDs locally present on this rank
-        global_ids_this_rank = global_ids[
-            offsets[dp_rank] : offsets[dp_rank] + num_local_subsamples
-        ]
-
-        return global_id_seqlens, global_ids_this_rank
-
-    @staticmethod
-    def _broadcast_to_pp_group(
-        new_samples,
-        num_micro_batches,
-        seqlen_sum_this_global_batch,
-        seqlen_squared_sum_this_global_batch,
-        pp_group,
-        dev,
-    ):
-        """
-        Broadcast num_micro_batches, seqlen_sum_this_global_batch,
-        seqlen_squared_sum_this_global_batch and metadata to middle PP stages.
-        """
-
-        pp_src_rank = torch.distributed.get_process_group_ranks(pp_group)[0]
-
-        if pp_group.size() > 2:
-            if pp_group.rank() == 0:
-                tensor_list = [
-                    torch.tensor(
-                        [
-                            num_micro_batches,
-                            seqlen_sum_this_global_batch,
-                            seqlen_squared_sum_this_global_batch,
-                        ],
-                        dtype=torch.float32,
-                    ).cuda()
-                ]
-                for sample in new_samples:
-                    tensor_list.append(sample["max_seqlen"].unsqueeze(0))
-                for sample in new_samples:
-                    tensor_list.append(sample["cu_seqlens"])
-                    tensor_list.append(sample["cu_seqlens_padded"])
-                info_to_broadcast = torch.cat(tensor_list, dim=0).to(
-                    device=dev, dtype=torch.float32
-                )
-                info_length_tensor = torch.tensor(
-                    info_to_broadcast.shape[0], dtype=torch.int32
-                ).cuda()
-                _broadcast_tensor(info_length_tensor, pp_src_rank, pp_group)
-                _broadcast_tensor(info_to_broadcast, pp_src_rank, pp_group)
-            else:
-                info_length_tensor = torch.tensor(0, dtype=torch.int32).cuda()
-                _broadcast_tensor(info_length_tensor, pp_src_rank, pp_group)
-                info_to_broadcast = torch.empty(
-                    info_length_tensor.item(), dtype=torch.float32
-                ).cuda()
-                _broadcast_tensor(info_to_broadcast, pp_src_rank, pp_group)
-                if pp_group.rank() != pp_group.size() - 1:
-                    # middle PP stages receive the broadcasted info and unpack it
-                    info_numpy = info_to_broadcast.cpu().numpy()
-                    num_micro_batches = int(info_numpy[0])
-                    seqlen_sum_this_global_batch = info_numpy[1]
-                    seqlen_squared_sum_this_global_batch = info_numpy[2]
-                    max_seqlens = info_to_broadcast[3 : 3 + num_micro_batches]
-                    cu_seqlens_list = []
-                    cu_seqlens_padded_list = []
-                    indices = np.where(info_numpy == 0)[0]
-                    for i in range(num_micro_batches):
-                        cu_seqlens_list.append(
-                            info_to_broadcast[indices[i * 2] : indices[i * 2 + 1]]
-                        )
-                        if i == num_micro_batches - 1:
-                            cu_seqlens_padded_list.append(info_to_broadcast[indices[i * 2 + 1] :])
-                        else:
-                            cu_seqlens_padded_list.append(
-                                info_to_broadcast[indices[i * 2 + 1] : indices[i * 2 + 2]]
-                            )
-
-                    new_samples = []
-                    for i in range(num_micro_batches):
-                        new_sample = {}
-                        new_sample["max_seqlen"] = max_seqlens[i].to(torch.int32)
-                        new_sample["cu_seqlens"] = cu_seqlens_list[i].to(torch.int32)
-                        new_sample["cu_seqlens_padded"] = cu_seqlens_padded_list[i].to(torch.int32)
-                        new_samples.append(new_sample)
-
-        return (
-            new_samples,
-            num_micro_batches,
-            seqlen_sum_this_global_batch,
-            seqlen_squared_sum_this_global_batch,
-        )
-
-    @staticmethod
-    def _broadcast_scalars(values: List, group, dev, dtype=torch.float32) -> List:
-        """
-        Broadcast scalar values from rank 0 to all ranks in the group.
-
-        Args:
-            values: List of scalar values to broadcast (only used on rank 0).
-            group: The process group to broadcast within.
-            dev: The device to use for the tensor.
-            dtype: The data type for the tensor.
-
-        Returns:
-            List of broadcasted values.
-        """
-        if group.size() <= 1:
-            return values
-
-        src_rank = torch.distributed.get_process_group_ranks(group)[0]
-        num_values = len(values)
-
-        if group.rank() == 0:
-            info_to_broadcast = torch.tensor(values, dtype=dtype, device=dev)
-        else:
-            info_to_broadcast = torch.zeros(num_values, dtype=dtype, device=dev)
-
-        _broadcast_tensor(info_to_broadcast, src_rank, group)
-
-        if group.rank() != 0:
-            values = info_to_broadcast.cpu().tolist()
-
-        return values
-
-    @staticmethod
-    def _create_data_iterator(new_samples, pp_group, tp_group, config):
-        """Handle virtual pipeline parallelism."""
-        if (
-            config.virtual_pipeline_model_parallel_size is not None
-            and config.virtual_pipeline_model_parallel_size > 1
-        ):
-            vpp_size = config.virtual_pipeline_model_parallel_size
-            if tp_group.rank() == 0:
-                if pp_group.rank() == 0 or pp_group.rank() == pp_group.size() - 1:
-                    new_samples_for_other_ppstage = []
-                    for sample in new_samples:
-                        new_sample_for_other_ppstage = {}
-                        new_sample_for_other_ppstage["max_seqlen"] = sample["max_seqlen"]
-                        new_sample_for_other_ppstage["cu_seqlens"] = sample["cu_seqlens"]
-                        new_sample_for_other_ppstage["cu_seqlens_padded"] = sample[
-                            "cu_seqlens_padded"
-                        ]
-                        new_samples_for_other_ppstage.append(new_sample_for_other_ppstage)
-                    if pp_group.rank() == 0:
-                        new_data_iterator = [RerunDataIterator(iter(new_samples))] + [
-                            RerunDataIterator(iter(new_samples_for_other_ppstage))
-                            for _ in range(vpp_size - 1)
-                        ]
-                    else:
-                        new_data_iterator = [
-                            RerunDataIterator(iter(new_samples_for_other_ppstage))
-                            for _ in range(vpp_size - 1)
-                        ] + [RerunDataIterator(iter(new_samples))]
-                else:
-                    new_data_iterator = [
-                        RerunDataIterator(iter(new_samples)) for _ in range(vpp_size)
-                    ]
-            else:
-                new_data_iterator = [None for _ in range(vpp_size)]
-        else:
-            new_data_iterator = (
-                RerunDataIterator(iter(new_samples)) if tp_group.rank() == 0 else None
-            )
-
-        return new_data_iterator
-
-    @staticmethod
-    def _reroute_samples_to_dcp_ranks(
-        batch,
-        global_ids_this_rank,
-        global_id_seqlens,
-        sample_id_groups,
-        offsets,
-        dp_group,
-        tp_group,
-        dp_cp_group,
-        total_dcp_gpus,
-    ):
-        """
-        Reroutes the sub-samples to the correct rank after scheduling.
-
-        For each key in the batch dict, we perform an all-to-all communication
-        to transfer the data to the correct ranks.
-        """
-
-        def _gid_to_src_rank(gid: int) -> int:
-            dp_src_rank = torch.bucketize(gid, offsets[1:] - 1)
-            dcp_rank = (
-                torch.distributed.get_process_group_ranks(dp_group)[dp_src_rank] // tp_group.size()
-            ) % dp_cp_group.size()
-            return dcp_rank
-
-        gid2local_id = {int(gid): i for i, gid in enumerate(global_ids_this_rank)}
-        dcp_rank = dp_cp_group.rank()
-        dp_ranks = torch.distributed.get_process_group_ranks(dp_group)
-        dp_ranks = [(r // tp_group.size()) % dp_cp_group.size() for r in dp_ranks]
-
-        data_keys = batch[0].keys()
-
-        # Create the send plan
-        combined_sample_id_groups: List[List[int]] = [[] for _ in range(total_dcp_gpus)]
-        for d in range(total_dcp_gpus):
-            for sample_id_group in sample_id_groups:
-                combined_sample_id_groups[d].extend(sample_id_group[d])
-        for dest_rank in range(total_dcp_gpus):
-            combined_sample_id_groups[dest_rank].sort()
-
-        send_ids_sorted = [
-            gid
-            for d in dp_ranks
-            for gid in combined_sample_id_groups[d]
-            if gid in global_ids_this_rank
-        ]
-
-        send_num_split = [0] * total_dcp_gpus
-        send_lens_split = [0] * total_dcp_gpus
-        for dest_rank in range(total_dcp_gpus):
-            if dest_rank in dp_ranks:
-                send_seq_lens = [
-                    global_id_seqlens[gid][1]
-                    for gid in combined_sample_id_groups[dest_rank]
-                    if gid in global_ids_this_rank
-                ]
-                send_num_split[dest_rank] = len(send_seq_lens)
-                send_lens_split[dest_rank] = sum(send_seq_lens)
-            else:
-                send_lens_split[dest_rank] = 0
-
-        # Create the recv plan
-        recv_sample_id_groups = [[] for _ in range(total_dcp_gpus)]
-        for gid in combined_sample_id_groups[dcp_rank]:
-            src_rank = _gid_to_src_rank(gid)
-            recv_sample_id_groups[src_rank].append(gid)
-
-        recv_lens_split = [0] * total_dcp_gpus
-        for src_rank in range(total_dcp_gpus):
-            recv_lens_split[src_rank] = sum(
-                [global_id_seqlens[gid][1] for gid in recv_sample_id_groups[src_rank]]
-            )
-
-        recv_ids_sorted = [gid for d in range(total_dcp_gpus) for gid in recv_sample_id_groups[d]]
-        recv_counts = [len(recv_sample_id_groups[d]) for d in range(total_dcp_gpus)]
-
-        recv_samples = [{k: None for k in data_keys} for _ in range(sum(recv_counts))]
-
-        def _pack_sample_by_key(key: str) -> torch.Tensor:
-            flattened_tensors = []
-            for gid in send_ids_sorted:
-                t = batch[gid2local_id[gid]][key].to(torch.cuda.current_device(), non_blocking=True)
-                flattened_tensors.append(t.reshape(-1))
-            return (
-                torch.cat(flattened_tensors, dim=0)
-                if flattened_tensors
-                else torch.empty(1, device=torch.cuda.current_device(), dtype=batch[0][key].dtype)
-            )
-
-        def _unpack_sample_by_key(key: str, recv_tensor: torch.Tensor):
-            cursor = 0
-            for i, gid in enumerate(recv_ids_sorted):
-                sample_len = (
-                    1
-                    if key in ["original_seq_len", "padded_seq_len"]
-                    else global_id_seqlens[gid][1]
-                )
-                recv_samples[i][key] = recv_tensor[cursor : cursor + sample_len]
-                cursor += sample_len
-
-        for key in data_keys:
-            output_split_sizes, input_split_sizes = (
-                (recv_counts, send_num_split)
-                if key in ["original_seq_len", "padded_seq_len"]
-                else (recv_lens_split, send_lens_split)
-            )
-            send_tensor = _pack_sample_by_key(key)
-            recv_tensor_size = sum(output_split_sizes)
-            recv_tensor = torch.empty(
-                recv_tensor_size, device=torch.cuda.current_device(), dtype=send_tensor.dtype
-            )
-            torch.distributed.all_to_all_single(
-                output=recv_tensor,
-                input=send_tensor,
-                output_split_sizes=output_split_sizes,
-                input_split_sizes=input_split_sizes,
-                group=dp_cp_group,
-            )
-            _unpack_sample_by_key(key, recv_tensor)
-
-        recv_sample_with_id = {
-            recv_id: recv_samples[i] for i, recv_id in enumerate(recv_ids_sorted)
-        }
-        return recv_sample_with_id
-
-    @staticmethod
-    def _pack_sequences(
-        samples: List,
-        padded_lengths: torch.Tensor,
-        original_lengths: torch.Tensor,
-        dev: torch.device,
-    ) -> Dict[str, torch.Tensor]:
-        """Pack multiple samples into a single packed sample."""
-
-        def _pack_tensors(tensors):
-            return torch.cat([t.reshape(-1) for t in tensors], dim=0)
-
-        tokens = _pack_tensors([sample["tokens"] for sample in samples])
-        labels = _pack_tensors([sample["labels"] for sample in samples])
-        loss_mask = _pack_tensors([sample["loss_mask"] for sample in samples])
-        position_ids = _pack_tensors([sample["position_ids"] for sample in samples])
-
-        new_sample = {}
-        new_sample["tokens"] = tokens
-        new_sample["labels"] = labels
-        new_sample["loss_mask"] = loss_mask
-        new_sample["position_ids"] = position_ids
-
-        padded_lengths = padded_lengths.to(
-            device=dev, dtype=torch.int32, non_blocking=True
-        ).reshape(-1)
-        cu_seqlens_padded = torch.empty(padded_lengths.numel() + 1, device=dev, dtype=torch.int32)
-        cu_seqlens_padded[0] = 0
-        cu_seqlens_padded[1:] = torch.cumsum(padded_lengths, dim=0)
-        max_seqlen = torch.max(padded_lengths).to(dtype=torch.int32)
-
-        new_sample["cu_seqlens_padded"] = cu_seqlens_padded
-        new_sample["max_seqlen"] = max_seqlen
-
-        original_lengths = original_lengths.to(
-            device=dev, dtype=torch.int32, non_blocking=True
-        ).reshape(-1)
-        cu_seqlens = torch.empty(original_lengths.numel() + 1, device=dev, dtype=torch.int32)
-        cu_seqlens[0] = 0
-        cu_seqlens[1:] = torch.cumsum(original_lengths, dim=0).reshape(-1)
-        new_sample["cu_seqlens"] = cu_seqlens
-
-        return new_sample
-
-    @staticmethod
-    def _build_packed_microbatches(
-        grouped_samples: List[List[Dict[str, torch.Tensor]]], dev: torch.device
-    ) -> List[Dict[str, torch.Tensor]]:
-        """Build packed samples for each microbatch."""
-        num_micro_batches = len(grouped_samples)
-        seg_starts: List[int] = [0]
-        original_lens_tensors = []
-        padded_lens_tensors = []
-
-        for i in range(num_micro_batches):
-            samples = grouped_samples[i]
-            seg_starts.append(seg_starts[-1] + len(samples))
-            original_lens_tensors.extend([s["original_seq_len"].reshape(-1) for s in samples])
-            padded_lens_tensors.extend([s["padded_seq_len"].reshape(-1) for s in samples])
-
-        padded_lens_all_gpu = torch.cat(padded_lens_tensors, dim=0).to(dtype=torch.int32)
-        original_lens_all_gpu = torch.cat(original_lens_tensors, dim=0).to(dtype=torch.int32)
-
-        new_samples: List[Dict[str, torch.Tensor]] = []
-        for i in range(num_micro_batches):
-            samples = grouped_samples[i]
-            lp = padded_lens_all_gpu[seg_starts[i] : seg_starts[i + 1]]
-            lo = original_lens_all_gpu[seg_starts[i] : seg_starts[i + 1]]
-            new_sample = BaseScheduler._pack_sequences(samples, lp, lo, dev)
-            new_samples.append(new_sample)
-
-        return new_samples
-
-    @staticmethod
-    def _get_batch_and_global_seqlens(data_iterator, num_microbatches, dp_group):
-        """
-        Get the batch and global sequence lengths.
-        Each DP rank loads the same number of sequences, so we need to gather the sequence
-        lengths from all ranks then we can schedule the sequences into groups.
         Args:
             data_iterator: The data iterator.
-            num_microbatches: The number of microbatches.
-            dp_group: The data parallel group.
+            num_microbatches: The number of microbatches to fetch.
+            dp_group: Data parallel process group.
+            tp_group: Tensor parallel process group.
+            pp_group: Pipeline parallel process group.
+            dp_cp_group: Data parallel + context parallel process group.
+            dev: CUDA device.
+            config: Model parallel config.
 
         Returns:
-            batch: The batch.
-            global_id_seqlens: The global sequence lengths.
-            global_ids_this_rank: The global IDs locally present on this rank.
+            new_data_iterator: The new data iterator (or list for VPP).
+            num_micro_batches: Number of micro batches after scheduling.
+            seqlen_sum_this_global_batch: Total tokens for FLOPs calculation.
+            seqlen_squared_sum_this_global_batch: Sum of squared seqlens for FLOPs.
         """
-        batch = [next(data_iterator) for _ in range(num_microbatches)]
-        subsample_seqlens = []
-        for sample in batch:
-            subsample_seqlens.extend([sample["tokens"].numel()])
-        subsample_seqlens = torch.tensor(subsample_seqlens, dtype=torch.int32).cuda()
-
-        seqlens_gathered, offsets = BaseScheduler._get_global_seqlens(subsample_seqlens, dp_group)
-
-        global_id_seqlens, global_ids_this_rank = BaseScheduler._get_global_id_seqlens(
-            subsample_seqlens.shape[0], offsets, seqlens_gathered, dp_group
-        )
-
-        return batch, global_id_seqlens, global_ids_this_rank, offsets, seqlens_gathered
+        raise NotImplementedError
 
 
-class DefaultSequencePackingScheduler(BaseScheduler):
+class DpBalancedScheduler(BaseScheduler):
     """Packs sequences in their original order until reaching the max limit of sequence length."""
 
     def __init__(self, *args, **kwargs):
@@ -942,12 +517,14 @@ class DefaultSequencePackingScheduler(BaseScheduler):
 
             # Step 1: Fetch batches and gather global sequence lengths
             batch, global_id_seqlens, global_ids_this_rank, offsets, seqlens_gathered = (
-                self._get_batch_and_global_seqlens(data_iterator, num_microbatches, dp_group)
+                get_batch_and_global_seqlens(data_iterator, num_microbatches, dp_group)
             )
 
             # Step 2: Check required sample keys
             for key in self.get_require_sample_keys():
-                assert key in batch[0], f"Batch missing required key {key}"
+                assert (
+                    key in batch[0]
+                ), f"Batch missing required key {key}, provided keys: {batch[0].keys()}"
 
             # Step 3: Schedule samples into groups
             sample_id_groups = self.get_groups_and_subsamples(global_id_seqlens)
@@ -963,7 +540,7 @@ class DefaultSequencePackingScheduler(BaseScheduler):
             )
 
             # Step 4: Reroute samples to DCP ranks
-            samples_this_rank_with_id = self._reroute_samples_to_dcp_ranks(
+            samples_this_rank_with_id = reroute_samples_to_dcp_ranks(
                 batch,
                 global_ids_this_rank,
                 global_id_seqlens,
@@ -987,7 +564,7 @@ class DefaultSequencePackingScheduler(BaseScheduler):
             ]
 
             # Step 5: Build packed microbatches
-            new_samples = self._build_packed_microbatches(grouped_samples, dev)
+            new_samples = build_packed_microbatches(grouped_samples, dev)
 
             # Step 6: Calculate FLOPs info
             seqlen_sum_this_global_batch = float(sum(seqlens_gathered))
@@ -1009,7 +586,7 @@ class DefaultSequencePackingScheduler(BaseScheduler):
                 num_micro_batches,
                 seqlen_sum_this_global_batch,
                 seqlen_squared_sum_this_global_batch,
-            ) = self._broadcast_to_pp_group(
+            ) = broadcast_to_pp_group(
                 new_samples,
                 num_micro_batches,
                 seqlen_sum_this_global_batch,
@@ -1020,7 +597,7 @@ class DefaultSequencePackingScheduler(BaseScheduler):
 
         # Step 8: Broadcast to TP group (for non-TP-0 ranks)
         (num_micro_batches, seqlen_sum_this_global_batch, seqlen_squared_sum_this_global_batch) = (
-            self._broadcast_scalars(
+            broadcast_scalars(
                 [
                     num_micro_batches,
                     seqlen_sum_this_global_batch,
@@ -1033,7 +610,7 @@ class DefaultSequencePackingScheduler(BaseScheduler):
         num_micro_batches = int(num_micro_batches)
 
         # Step 9: create data_iterator and handle VPP if enabled
-        new_data_iterator = self._create_data_iterator(new_samples, pp_group, tp_group, config)
+        new_data_iterator = create_data_iterator(new_samples, pp_group, tp_group, config)
 
         return (
             new_data_iterator,
@@ -1043,7 +620,18 @@ class DefaultSequencePackingScheduler(BaseScheduler):
         )
 
 
-def wrap_dataloader(
+class PackingScheduler(enum.Enum):
+    """Enum for supported sequence packing algorithms."""
+
+    DP_BALANCED = "dp_balanced"
+
+
+scheduler_map: Dict[PackingScheduler, Type[BaseScheduler]] = {
+    PackingScheduler.DP_BALANCED: DpBalancedScheduler
+}
+
+
+def wrap_data_iterator(
     data_iterator, config, num_microbatches, pg_collection: Optional[ProcessGroupCollection] = None
 ):
     """
@@ -1056,10 +644,6 @@ def wrap_dataloader(
         dp_cp_group: Data parallel context parallel group.
         pg_collection: The process group collection.
     """
-
-    scheduler_map: Dict[PackingScheduler, Type[BaseScheduler]] = {
-        PackingScheduler.DEFAULT_SEQUENCE_PACKING: DefaultSequencePackingScheduler
-    }
 
     if pg_collection is None:
         dp_cp_group = parallel_state.get_data_parallel_group(with_context_parallel=True)
@@ -1116,7 +700,11 @@ def wrap_dataloader(
 
 
 def get_batch_on_this_rank_for_sequence_packing(
-    data_iterator, mtp_on_this_rank: bool = False, vp_stage: Optional[int] = None
+    data_iterator,
+    vpp_size: Optional[int] = None,
+    mtp_on_this_rank: bool = False,
+    vp_stage: Optional[int] = None,
+    pg_collection: Optional[ProcessGroupCollection] = None,
 ):
     """
     Get a batch of data for sequence packing.
@@ -1128,16 +716,23 @@ def get_batch_on_this_rank_for_sequence_packing(
         tuple of (tokens, labels, loss_mask, attention_mask, position_ids, packed_seq_params)
     """
 
-    tp_src_rank = parallel_state.get_tensor_model_parallel_src_rank()
-    tp_group = parallel_state.get_tensor_model_parallel_group()
+    if pg_collection is None:
+        tp_group = parallel_state.get_tensor_model_parallel_group()
+        pp_group = parallel_state.get_pipeline_model_parallel_group()
+        cp_group = parallel_state.get_context_parallel_group()
+    else:
+        tp_group = pg_collection.tp
+        pp_group = pg_collection.pp
+        cp_group = pg_collection.cp
 
-    is_tp_rank_0 = parallel_state.get_tensor_model_parallel_rank() == 0
-    is_first_stage = parallel_state.is_pipeline_first_stage(
-        ignore_virtual=vp_stage is None, vp_stage=vp_stage
+    tp_src_rank = torch.distributed.get_process_group_ranks(tp_group)[0]
+
+    is_tp_rank_0 = tp_group.rank() == 0
+    is_first_stage = pp_group.rank() == 0 and (vp_stage is None or vp_stage == 0)
+    is_last_stage = pp_group.rank() == pp_group.size() - 1 and (
+        vp_stage is None or vp_stage == vpp_size - 1
     )
-    is_last_stage = parallel_state.is_pipeline_last_stage(
-        ignore_virtual=vp_stage is None, vp_stage=vp_stage
-    )
+
     is_first_or_last_stage = is_first_stage or is_last_stage
     dev = torch.cuda.current_device()
 
@@ -1163,20 +758,16 @@ def get_batch_on_this_rank_for_sequence_packing(
     # Partition tokens, position_ids, labels, loss_mask for context parallel, currently only
     # TP rank 0 and the first/last PP stage rank has these data.
     if is_tp_rank_0 and is_first_or_last_stage:
-        cp_size = parallel_state.get_context_parallel_world_size()
-        cp_rank = parallel_state.get_context_parallel_rank()
+        cp_size = cp_group.size()
+        cp_rank = cp_group.rank()
         # If cp_size == 1, no need to do further processing.
         if cp_size > 1:
-            assert tex is not None and is_te_min_version("1.10.0"), (
-                "Please update Transformer Engine to >= 1.10 to use "
-                "Context Parallel with THD format data"
-            )
             total_tokens = batch['tokens'].size(0)
             # Transformer Engine has a bug of cu_seqlens, we must treat cu_seqlens_padded as
             # cu_seqlens to get the correct result.
             # TODO: Revert this workaround once TE fixes the issue.
             cu_seqlens = batch["cu_seqlens_padded"]
-            index = tex.thd_get_partitioned_indices(cu_seqlens, total_tokens, cp_size, cp_rank)
+            index = get_thd_partitioned_indices(cu_seqlens, total_tokens, cp_size, cp_rank)
             for key in ['tokens', 'position_ids', 'labels', 'loss_mask']:
                 batch[key] = batch[key].index_select(0, index)
 
@@ -1186,7 +777,7 @@ def get_batch_on_this_rank_for_sequence_packing(
         cu_seqlen_size = torch.tensor(batch['cu_seqlens'].size(0), dtype=torch.int32, device=dev)
     else:
         cu_seqlen_size = torch.empty(1, dtype=torch.int32, device=dev)
-    _broadcast_tensor(cu_seqlen_size, tp_src_rank, tp_group)
+    broadcast_tensor(cu_seqlen_size, tp_src_rank, tp_group)
     cu_seqlen_size = cu_seqlen_size.item()
 
     # Broadcast total_tokens because we need it to create placeholder for tokens, position_ids,
@@ -1196,7 +787,7 @@ def get_batch_on_this_rank_for_sequence_packing(
             total_tokens = torch.tensor(batch['tokens'].size(0), dtype=torch.int32, device=dev)
         else:
             total_tokens = torch.empty(1, dtype=torch.int32, device=dev)
-        _broadcast_tensor(total_tokens, tp_src_rank, tp_group)
+        broadcast_tensor(total_tokens, tp_src_rank, tp_group)
         total_tokens = total_tokens.item()
 
     # Step1: Prepare "tokens", "position_ids" on all ranks.
@@ -1246,13 +837,13 @@ def get_batch_on_this_rank_for_sequence_packing(
         batch['max_seqlen'] = torch.empty(1, dtype=torch.int32, device=dev)
 
     # Broadcast batch inside TP group.
-    _broadcast_tensor(batch['tokens'], tp_src_rank, tp_group)
-    _broadcast_tensor(batch['position_ids'], tp_src_rank, tp_group)
-    _broadcast_tensor(batch['labels'], tp_src_rank, tp_group)
-    _broadcast_tensor(batch['loss_mask'], tp_src_rank, tp_group)
-    _broadcast_tensor(batch['cu_seqlens'], tp_src_rank, tp_group)
-    _broadcast_tensor(batch['cu_seqlens_padded'], tp_src_rank, tp_group)
-    _broadcast_tensor(batch['max_seqlen'], tp_src_rank, tp_group)
+    broadcast_tensor(batch['tokens'], tp_src_rank, tp_group)
+    broadcast_tensor(batch['position_ids'], tp_src_rank, tp_group)
+    broadcast_tensor(batch['labels'], tp_src_rank, tp_group)
+    broadcast_tensor(batch['loss_mask'], tp_src_rank, tp_group)
+    broadcast_tensor(batch['cu_seqlens'], tp_src_rank, tp_group)
+    broadcast_tensor(batch['cu_seqlens_padded'], tp_src_rank, tp_group)
+    broadcast_tensor(batch['max_seqlen'], tp_src_rank, tp_group)
 
     # Extract the data from batch after broadcasting.
     tokens = batch['tokens']

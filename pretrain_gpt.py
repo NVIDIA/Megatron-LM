@@ -68,9 +68,10 @@ def get_batch(data_iterator, vp_stage: Optional[int] = None):
     args = get_args()
     config = core_transformer_config_from_args(args)
 
-    if args.sequence_packing:
+    if args.sequence_packing_scheduler is not None:
         return get_batch_on_this_rank_for_sequence_packing(
             data_iterator,
+            vpp_size=config.virtual_pipeline_model_parallel_size,
             mtp_on_this_rank=mtp_on_this_rank(config, ignore_virtual=False, vp_stage=vp_stage),
             vp_stage=vp_stage,
         )
@@ -260,7 +261,7 @@ def core_gpt_dataset_config_from_args(args):
         "sequence_parallel_size": args.tensor_model_parallel_size*args.sequence_parallel,
         "hybrid_context_parallel": args.hybrid_context_parallel,
         "sft_mock_dataset_config_json":args.sft_mock_dataset_config_json,
-        "sequence_packing": args.sequence_packing,
+        "sequence_packing_scheduler": args.sequence_packing_scheduler,
     }
 
     # add FIM args to the config
