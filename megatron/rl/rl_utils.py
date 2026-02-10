@@ -89,6 +89,25 @@ if HAVE_TORCH_MEMORY_SAVER:
 
 logger = logging.getLogger(__name__)
 
+
+def dump_results_json(path: str, results: list) -> None:
+    """Dump a list of AgentBaseModel-derived objects (possibly nested/nullable) to JSON.
+
+    Args:
+        path: File path to write to.
+        results: A list where each element is either None or a list of
+                 Pydantic models that support model_dump().
+    """
+    with open(path, 'w') as f:
+        json.dump(
+            [
+                [r.model_dump() for r in group] if group is not None else None
+                for group in results
+            ],
+            f,
+        )
+
+
 # Global variable to store packing context for forward_step
 _GLOBAL_PACKING_CONTEXT = None
 
@@ -595,13 +614,12 @@ def get_environment_rollouts(
             optimizer.restore_from_cpu()
 
     if lang_rl_log_dir and rank == get_pg_rank(inference_pg_collection.tp):
-        with open(
+        dump_results_json(
             lang_rl_log_dir
             + f'/rollouts_rank{rank}_iteration{args.curr_iteration}_'
             + f'{Path(args.langrl_env_config).stem}.json',
-            'w',
-        ) as f:
-            json.dump([[r.model_dump() for r in group] for group in rollouts], f)
+            rollouts,
+        )
 
     return rollouts
 
@@ -1563,20 +1581,12 @@ def evaluate_and_print_results_rl(
                 + "".join([f"\n\t{k}: {v:0.4f}" for k, v in eval_metrics.items()])
             )
             if lang_rl_log_dir:
-                with open(
+                dump_results_json(
                     lang_rl_log_dir
                     + f'/eval_rank{rank}_iteration{args.curr_iteration}_'
                     + f'{Path(args.langrl_env_config).stem}.json',
-                    'w',
-                ) as f:
-                    json.dump(
-                        [
-                            [r.model_dump() for r in responses]
-                            if responses is not None else None
-                            for responses in dp_eval_results
-                        ],
-                        f,
-                    )
+                    dp_eval_results,
+                )
 
 
 def calculate_grpo_loss(
