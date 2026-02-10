@@ -206,7 +206,8 @@ class OptimizerConfig:
     """dtype of exp_avg_sq when enabling precision-aware-optimizer"""
 
     optimizer: str = 'adam'
-    """Optimizer name. NOTE: Deprecated, use individual optimizer classes instead."""
+    """Optimizer name (e.g., 'adam', 'sgd', 'muon'). Can be overridden per-parameter group
+    via config_overrides to use different optimizers for different parameters."""
 
     ###############
     # Loss scaling
@@ -229,7 +230,7 @@ class OptimizerConfig:
     """Hysteresis for dynamic loss scaling."""
 
     ###################################################################################
-    # Optimizer (NOTE: Deprecated, use individual optimizer classes instead.).
+    # Optimizer-specific parameters.
     ###################################################################################
     # Adam.
     adam_beta1: float = 0.9
@@ -438,8 +439,8 @@ class SGDOptimizerConfig(OptimizerConfig):
 
 
 @dataclass
-class MuonOptimizerConfig(OptimizerConfig):
-    """Muon optimizer configuration object."""
+class EmergingOptimizerConfig(OptimizerConfig):
+    """Emerging optimizer configuration object (e.g., Muon)."""
 
     optimizer: str = 'muon'
     """Optimizer name."""

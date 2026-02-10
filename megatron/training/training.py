@@ -127,12 +127,12 @@ except ImportError:
 from megatron.core.distributed import finalize_model_grads
 from megatron.core.enums import ModelType
 from megatron.core.optimizer import (
-    get_megatron_optimizer,
     AdamOptimizerConfig,
-    MuonOptimizerConfig,
-    SGDOptimizerConfig,
+    EmergingOptimizerConfig,
+    get_megatron_optimizer,
     OptimizerConfig,
     ParamKey,
+    SGDOptimizerConfig,
 )
 from megatron.core.optimizer.muon import get_megatron_muon_optimizer
 from megatron.core.rerun_state_machine import (
@@ -1485,27 +1485,20 @@ def get_optimizer_param_scheduler(optimizer):
 def get_megatron_optimizer_config(args: Any) -> OptimizerConfig:
     """Return a Megatron optimizer config object from Megatron's arguments."""
 
-    config = None
     if args.optimizer == 'adam':
-        kwargs = {}
-        for f in dataclasses.fields(AdamOptimizerConfig):
-            if hasattr(args, f.name):
-                kwargs[f.name] = getattr(args, f.name)
-        config = AdamOptimizerConfig(**kwargs)
+        config_cls = AdamOptimizerConfig
     elif args.optimizer == 'sgd':
-        kwargs = {}
-        for f in dataclasses.fields(SGDOptimizerConfig):
-            if hasattr(args, f.name):
-                kwargs[f.name] = getattr(args, f.name)
-        config = SGDOptimizerConfig(**kwargs)
-    elif args.optimizer == 'muon':
-        kwargs = {}
-        for f in dataclasses.fields(MuonOptimizerConfig):
-            if hasattr(args, f.name):
-                kwargs[f.name] = getattr(args, f.name)
-        config = MuonOptimizerConfig(**kwargs)
+        config_cls = SGDOptimizerConfig
     else:
-        raise ValueError("Invalid optimizer type!")
+        # Route all current/future emerging optimizers (muon, dist_muon, etc.)
+        # through the shared emerging optimizer config class.
+        config_cls = EmergingOptimizerConfig
+
+    kwargs = {}
+    for f in dataclasses.fields(config_cls):
+        if hasattr(args, f.name):
+            kwargs[f.name] = getattr(args, f.name)
+    config = config_cls(**kwargs)
 
     # Construct the appropriate config_overrides object. This default handles many cases, but
     #  can be added to as needed by the user, or replaced entirely with a custom override.
