@@ -687,6 +687,7 @@ def get_logprobs(model, tokens, position_ids, no_grad=False, sequence_packing=Fa
             flash_decode = model.config.flash_decode
             model.config.flash_decode = False
             fp32_output = not (args.fp16 or args.bf16)
+            no_grad = True
             with torch.no_grad() if no_grad else nullcontext():
                 logits_or_hidden_states = model(
                     tokens,
