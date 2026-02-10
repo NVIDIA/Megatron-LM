@@ -1142,7 +1142,6 @@ def validate_args(args, defaults={}):
             args.fim_eod_token,
         ]
         assert not args.mock_data, "Mock dataset is not supported with FIM dataset."
-        assert not args.legacy_tokenizer, "FIM dataset is not supported with legacy tokenizers."
         assert args.fim_rate, "--fim-rate should be specified."
         assert args.fim_spm_rate, "--fim-spm-rate should be specified."
         assert all(token is not None for token in extra_tokens), "FIM extra tokens should be specified."
@@ -1291,6 +1290,25 @@ def validate_args(args, defaults={}):
             assert is_te_min_version("2.8.0"), (
                 "overlap_grad_reduce is only supported with TE >= 2.8.0 when enabling delay_wgrad_compute"
             )
+            wgrad_in_graph_scope = CudaGraphScope.attn in args.cuda_graph_scope or (
+                CudaGraphScope.moe_router in args.cuda_graph_scope
+                and args.moe_shared_expert_intermediate_size is not None
+                and not args.moe_shared_expert_overlap
+            )
+            if wgrad_in_graph_scope:
+                assert is_te_min_version(
+                    "2.12.0"
+                ), "CUDA graph with delay_wgrad_compute requires TE version >= 2.12.0."
+                assert args.gradient_accumulation_fusion, (
+                    'CUDA graph with delay_wgrad_compute requires gradient_accumulation_fusion '
+                    'to be enabled. This is because the default gradient accumulation does not '
+                    'use static memory addresses, which breaks CUDA graph requirements.'
+                )
+                if CudaGraphScope.attn in args.cuda_graph_scope:
+                    assert (
+                        not args.add_bias_linear and not args.add_qkv_bias
+                    ), "CUDA graph with delay_wgrad_compute doesn't support attn bias for now."
+
         if not args.gradient_accumulation_fusion:
             assert is_te_min_version("2.7.0"), (
                 "disabling gradient_accumulation_fusion is only supported with TE >= 2.7.0 "
@@ -2434,8 +2452,6 @@ def _add_tokenizer_args(parser):
     group.add_argument('--tokenizer-special-tokens', type=str, nargs='+', default=None,
                        help='List of special tokens. For TikTokenizer needs to have '
                             '["<unk>", "<s>", "</s>", "<mask>", "<pad>", "<cls>", "<sep>"]')
-    group.add_argument('--legacy-tokenizer', action='store_true', default=False,
-                       help='To use Megatron-LM legacy tokenizer system.')
     group.add_argument('--tiktoken-pattern', type=str, default=None,
                        help='Which tiktoken pattern to use. Options: [v1, v2]')
     group.add_argument('--tiktoken-num-special-tokens', type=int, default=1000,
