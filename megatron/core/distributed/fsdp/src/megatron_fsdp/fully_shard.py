@@ -77,6 +77,7 @@ def fully_shard_model(
     dp_outer_dim: Optional[str] = None,
     tp_dim: Optional[str] = None,
     hybrid_fsdp_group: Optional[torch.distributed.ProcessGroup] = None,
+    hybrid_fsdp_expt_group: Optional[torch.distributed.ProcessGroup] = None,
     expt_device_mesh: Optional[DeviceMesh] = None,
     fsdp_unit_modules: Optional[Sequence[Type[torch.nn.Module]] | Sequence[str]] = None,
     zero_dp_strategy: str | int = 3,
@@ -96,6 +97,7 @@ def fully_shard_model(
     keep_fp8_transpose_cache: bool = False,
     nccl_ub: bool = False,
     fsdp_double_buffer: bool = False,
+    fsdp_db_use_persist_buf_on_alloc_fail: bool = False,
     disable_symmetric_registration: bool = False,
     enable_fine_grained_param_gather: bool = False,
 ) -> torch.nn.Module:
@@ -230,6 +232,10 @@ def fully_shard_model(
         fsdp_double_buffer (bool):
             Whether to use double buffer for FSDP. Defaults to False.
 
+        fsdp_db_use_persist_buf_on_alloc_fail (bool):
+            Whether to fall back to persistent buffer allocator when a bucket does not
+            fit FSDP double buffer size.
+
         disable_symmetric_registration (bool):
             Whether to disable symmetric (window) registration for NCCL UB registration.
             This option forces conventional (local) UB registration when nccl_ub is set.
@@ -335,6 +341,7 @@ def fully_shard_model(
         keep_fp8_transpose_cache=keep_fp8_transpose_cache,  # pylint: disable=C0301
         nccl_ub=nccl_ub,
         fsdp_double_buffer=fsdp_double_buffer or nccl_ub,
+        fsdp_db_use_persist_buf_on_alloc_fail=fsdp_db_use_persist_buf_on_alloc_fail,
         disable_symmetric_registration=disable_symmetric_registration,
         check_for_nan_in_grad=check_for_nan_in_grad,
     )
@@ -352,6 +359,8 @@ def fully_shard_model(
         tp_dim=tp_dim,
         # Only required for HSDP.
         hybrid_fsdp_group=hybrid_fsdp_group,
+        # Only required for HSDP + EP.
+        hybrid_fsdp_expt_group=hybrid_fsdp_expt_group,
         # Access to flattened DP rank assignments for HSDP.
         hsdp_outer_dp_shard=_outer_fsdp_sharding,
         # Only required for Megatron-FSDP + EP.
@@ -521,6 +530,7 @@ def fully_shard(
     dp_outer_dim: Optional[str] = None,
     tp_dim: Optional[str] = None,
     hybrid_fsdp_group: Optional[torch.distributed.ProcessGroup] = None,
+    hybrid_fsdp_expt_group: Optional[torch.distributed.ProcessGroup] = None,
     expt_device_mesh: Optional[DeviceMesh] = None,
     fsdp_unit_modules: Optional[Sequence[Type[torch.nn.Module]] | Sequence[str]] = None,
     zero_dp_strategy: str | int = 3,
@@ -540,6 +550,7 @@ def fully_shard(
     keep_fp8_transpose_cache: bool = False,
     nccl_ub: bool = False,
     fsdp_double_buffer: bool = False,
+    fsdp_db_use_persist_buf_on_alloc_fail: bool = False,
     disable_symmetric_registration: bool = False,
     enable_fine_grained_param_gather: bool = False,
 ) -> tuple[MegatronFSDP, torch.optim.Optimizer]:
@@ -568,6 +579,7 @@ def fully_shard(
         dp_outer_dim=dp_outer_dim,
         tp_dim=tp_dim,
         hybrid_fsdp_group=hybrid_fsdp_group,
+        hybrid_fsdp_expt_group=hybrid_fsdp_expt_group,
         expt_device_mesh=expt_device_mesh,
         fsdp_unit_modules=fsdp_unit_modules,
         zero_dp_strategy=zero_dp_strategy,
@@ -587,6 +599,7 @@ def fully_shard(
         keep_fp8_transpose_cache=keep_fp8_transpose_cache,
         nccl_ub=nccl_ub,
         fsdp_double_buffer=fsdp_double_buffer,
+        fsdp_db_use_persist_buf_on_alloc_fail=fsdp_db_use_persist_buf_on_alloc_fail,
         disable_symmetric_registration=disable_symmetric_registration,
         enable_fine_grained_param_gather=enable_fine_grained_param_gather,
     )
