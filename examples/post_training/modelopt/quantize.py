@@ -288,11 +288,15 @@ def get_calib_dataloader(
                         warnings.warn(f"Sample {i} has empty text, skipping")
                         continue
                     dataset.append(sample["text"])
+                elif isinstance(sample, dict) and "messages" in sample:
+                    conversations = sample["messages"]
+                    assert "role" in conversations[0] and "content" in conversations[0]
+                    dataset.append("".join([f"{msg['role']}: {msg['content']}" for msg in conversations]))
                 elif isinstance(sample, list) and isinstance(sample[0], dict):
                     assert "role" in sample[0] and "content" in sample[0]
                     dataset.append("".join([f"{msg['role']}: {msg['content']}" for msg in sample]))
                 else:
-                    raise ValueError(f"Sample {i} has unexpected format: {sample!r}")
+                    raise ValueError(f"Sample {i} has unexpected format")
 
         print_rank_0(f"Loaded calibration dataset ({dataset_path_or_name}) with {len(dataset)} samples")
         print_rank_0(f"Actual num samples: {min(len(dataset), calib_size)}, max seq length: {max_sequence_length}")
@@ -340,7 +344,7 @@ if __name__ == "__main__":
 
     args = get_args()
 
-    tokenizer = get_tokenizer()._tokenizer
+    tokenizer = get_tokenizer().tokenizer
     model = get_model(
         functools.partial(model_provider, modelopt_gpt_mamba_builder), wrap_with_ddp=False
     )
