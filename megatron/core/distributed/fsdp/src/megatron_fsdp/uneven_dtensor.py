@@ -462,7 +462,7 @@ def split_dtensor(
 
         new_dtensor = DTensor.from_local(
             sliced_tensor,
-            shape=out_shape,
+            shape=tuple(out_shape),
             stride=sliced_tensor.stride(),
             placements=dtensor.placements,
             device_mesh=dtensor.device_mesh,
