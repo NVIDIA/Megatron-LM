@@ -519,7 +519,6 @@ class TestDisabledMode(PrefixCachingTestBase):
         """enable_prefix_caching=False → identical prefixes get separate blocks."""
         ctx = self._ctx(enable_prefix_caching=False)
         bs = ctx.block_size_tokens
-        alloc = ctx.block_allocator
         prompt = self._prompt(bs * 2)
 
         ctx.add_request(self._req(ctx, prompt.clone(), enable_prefix_caching=False))
@@ -529,26 +528,16 @@ class TestDisabledMode(PrefixCachingTestBase):
         r2 = set(self._block_ids(ctx, 1, 2))
 
         assert r1.isdisjoint(r2)
-        for bid in r1 | r2:
-            assert alloc.block_ref_counts[bid].item() == 1
 
     @pytest.mark.internal
-    def test_disabled_deterministic_hashes(self):
-        """Disabled blocks get dummy hashes: ((req_id * K + pos) * K) % HASH_PRIME + 1."""
+    def test_disabled_skips_prefix_caching_state(self):
+        """Disabled mode skips prefix caching data structures entirely."""
         ctx = self._ctx(enable_prefix_caching=False)
-        bs = ctx.block_size_tokens
         alloc = ctx.block_allocator
-        request_id = 1
 
-        ctx.add_request(self._req(ctx, self._prompt(bs * 2), enable_prefix_caching=False))
-        block_ids = self._block_ids(ctx, 0, 2)
-
-        hashes = [alloc.block_hashes[bid].item() for bid in block_ids]
-        assert len(set(hashes)) == 2, "Each block unique hash"
-
-        for block_pos, bid in enumerate(block_ids):
-            expected = ((request_id * 2654435761 + block_pos) * 2654435761) % HASH_PRIME + 1
-            assert alloc.block_hashes[bid].item() == expected
+        assert not hasattr(alloc, 'block_hashes'), "block_hashes should not exist when disabled"
+        assert not hasattr(alloc, 'block_ref_counts'), "block_ref_counts should not exist when disabled"
+        assert not hasattr(alloc, 'hash_to_block_id'), "hash_to_block_id should not exist when disabled"
 
 
 # =========================================================================

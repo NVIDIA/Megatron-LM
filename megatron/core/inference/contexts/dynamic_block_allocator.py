@@ -21,9 +21,16 @@ class BlockAllocator:
             than `total_count`.
     """
 
-    def __init__(self, context: "DynamicInferenceContext", total_count: int, paused_count: int):
+    def __init__(
+        self,
+        context: "DynamicInferenceContext",
+        total_count: int,
+        paused_count: int,
+        enable_prefix_caching: bool = True,
+    ):
 
         self.context = context
+        self.enable_prefix_caching = enable_prefix_caching
 
         self.total_count = total_count
         self.total_avail = total_count - 1  # -1 for dummy_block_idx (see below)
@@ -37,29 +44,29 @@ class BlockAllocator:
             self.total_count, dtype=torch.int32, device=torch.cuda.current_device()
         )
 
-        # Block hash tracking for prefix caching: -1 = uncomputed, positive = valid hash
-        self.block_hashes = torch.full(
-            (self.total_count,), -1, dtype=torch.int64, device=torch.cuda.current_device()
-        )
+        if self.enable_prefix_caching:
+            # Block hash tracking for prefix caching: -1 = uncomputed, positive = valid hash
+            self.block_hashes = torch.full(
+                (self.total_count,), -1, dtype=torch.int64, device=torch.cuda.current_device()
+            )
 
-        # Prefix caching data structures
-        # Hash-to-block mapping for O(1) prefix lookup
-        self.hash_to_block_id: Dict[int, int] = {}
+            # Hash-to-block mapping for O(1) prefix lookup
+            self.hash_to_block_id: Dict[int, int] = {}
 
-        # Reference count per block: 0 = cached (evictable), >0 = actively used
-        self.block_ref_counts = torch.zeros(
-            (self.total_count,), dtype=torch.int32, device=torch.cuda.current_device()
-        )
+            # Reference count per block: 0 = cached (evictable), >0 = actively used
+            self.block_ref_counts = torch.zeros(
+                (self.total_count,), dtype=torch.int32, device=torch.cuda.current_device()
+            )
 
-        # LRU timestamps for eviction ordering (higher = more recently used)
-        self.block_timestamps = torch.zeros(
-            (self.total_count,), dtype=torch.int64, device=torch.cuda.current_device()
-        )
-        self.global_timestamp = 0
+            # LRU timestamps for eviction ordering (higher = more recently used)
+            self.block_timestamps = torch.zeros(
+                (self.total_count,), dtype=torch.int64, device=torch.cuda.current_device()
+            )
+            self.global_timestamp = 0
 
-        # Pending block hashes for prefix caching coordination
-        # Maps block_id -> hash for blocks registered but not yet computed
-        self._pending_block_hashes: Dict[int, int] = {}
+            # Pending block hashes for prefix caching coordination
+            # Maps block_id -> hash for blocks registered but not yet computed
+            self._pending_block_hashes: Dict[int, int] = {}
 
     def __str__(self):
         return (
@@ -110,6 +117,8 @@ class BlockAllocator:
         # Fast path: avoid expensive evictable count computation when free pool suffices
         if self.total_avail >= num_blocks:
             return True
+        if not self.enable_prefix_caching:
+            return False
         # Also count evictable cached blocks
         evictable_count = self.get_evictable_block_count()
         return (self.total_avail + evictable_count) >= num_blocks
@@ -127,6 +136,8 @@ class BlockAllocator:
         """
         # Try to evict cached blocks if free pool is insufficient
         if self.total_avail < num_blocks:
+            if not self.enable_prefix_caching:
+                return None
             blocks_needed_from_eviction = num_blocks - self.total_avail
             if not self.evict_lru_blocks(blocks_needed_from_eviction):
                 return None  # Not enough blocks even after eviction
@@ -136,9 +147,10 @@ class BlockAllocator:
         block_ids = self.block_bag[self.total_avail : (self.total_avail + num_blocks)]
         assert num_blocks == block_ids.numel()
 
-        # Initialize ref counts and timestamps for newly allocated blocks
-        self.block_ref_counts[block_ids] = 1
-        self.update_timestamps(block_ids)
+        if self.enable_prefix_caching:
+            # Initialize ref counts and timestamps for newly allocated blocks
+            self.block_ref_counts[block_ids] = 1
+            self.update_timestamps(block_ids)
 
         return block_ids
 
@@ -157,8 +169,9 @@ class BlockAllocator:
         if blocks.numel() == 0:
             return
 
-        # Decrement reference counts - blocks stay cached for prefix reuse
-        self.decrement_ref_count(blocks)
+        if self.enable_prefix_caching:
+            # Decrement reference counts - blocks stay cached for prefix reuse
+            self.decrement_ref_count(blocks)
 
     def reset(self) -> None:
         """Reset the allocator to initial state.
@@ -181,15 +194,16 @@ class BlockAllocator:
 
         self.total_avail = self.total_count - 1
 
-        # Reset all block hashes
-        self.block_hashes.fill_(-1)
+        if self.enable_prefix_caching:
+            # Reset all block hashes
+            self.block_hashes.fill_(-1)
 
-        # Reset prefix caching state
-        self.hash_to_block_id.clear()
-        self._pending_block_hashes.clear()
-        self.block_ref_counts.fill_(0)
-        self.block_timestamps.fill_(0)
-        self.global_timestamp = 0
+            # Reset prefix caching state
+            self.hash_to_block_id.clear()
+            self._pending_block_hashes.clear()
+            self.block_ref_counts.fill_(0)
+            self.block_timestamps.fill_(0)
+            self.global_timestamp = 0
 
     def set_block_hash(self, block_id: int, hash_value: int) -> None:
         """Set the hash for a specific block.

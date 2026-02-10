@@ -405,6 +405,7 @@ class DynamicInferenceContext(BaseInferenceContext):
                 block_count if self.unified_memory_level == 0 else block_count + paused_block_count
             ),
             paused_count=paused_block_count,
+            enable_prefix_caching=self.enable_prefix_caching,
         )
 
         # Track request metadata.
@@ -1643,22 +1644,19 @@ class DynamicInferenceContext(BaseInferenceContext):
         ] = (token_offset_range % self.block_size_tokens)
 
         # Register hashes for completely filled blocks (skip matched blocks)
-        total_tokens_after = req.finished_chunk_token_count + chunk_length
-        num_complete_blocks = total_tokens_after // self.block_size_tokens
-        previously_complete = req.finished_chunk_token_count // self.block_size_tokens
+        if self.enable_prefix_caching:
+            total_tokens_after = req.finished_chunk_token_count + chunk_length
+            num_complete_blocks = total_tokens_after // self.block_size_tokens
+            previously_complete = req.finished_chunk_token_count // self.block_size_tokens
 
-        # Start from the first non-matched block
-        first_block_to_hash = max(previously_complete, num_matched_blocks)
+            # Start from the first non-matched block
+            first_block_to_hash = max(previously_complete, num_matched_blocks)
 
-        for block_pos in range(first_block_to_hash, num_complete_blocks):
-            block_id = self.request_to_kv_block_ids[current_id][block_pos].item()
-            block_hash = req.precomputed_block_hashes[block_pos]
-
-            if self.enable_prefix_caching:
+            for block_pos in range(first_block_to_hash, num_complete_blocks):
+                block_id = self.request_to_kv_block_ids[current_id][block_pos].item()
+                block_hash = req.precomputed_block_hashes[block_pos]
                 self.block_allocator.register_block_hash(block_id, block_hash)
                 self._blocks_pending_computation.append(block_id)
-            else:
-                self.block_allocator.set_block_hash(block_id, block_hash)
 
         if self.is_hybrid_model and not is_chunked_prefill:
             # Allocate a slot for Mamba states

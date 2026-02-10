@@ -878,13 +878,22 @@ class DynamicInferenceEngine(AbstractEngine):
                 # Skip appending token for requests being finished due to stop words
                 # (they already have their final token from the previous step)
                 if request_id not in self.stop_word_being_finished_ids:
-                    request.add_event_generated_token(
-                        token,
-                        blocks_total=block_allocator.total_count,
-                        blocks_hashed_total=block_allocator.total_count - block_allocator.total_avail,
-                        blocks_hashed_active=int((block_allocator.block_ref_counts > 0).sum().item()),
-                        blocks_ref_count=block_allocator.block_ref_counts.sum().item(),
-                    )
+                    blocks_allocated = block_allocator.total_count - block_allocator.total_avail
+                    if block_allocator.enable_prefix_caching:
+                        request.add_event_generated_token(
+                            token,
+                            blocks_total=block_allocator.total_count,
+                            blocks_hashed_total=blocks_allocated,
+                            blocks_hashed_active=int((block_allocator.block_ref_counts > 0).sum().item()),
+                            blocks_ref_count=block_allocator.block_ref_counts.sum().item(),
+                        )
+                    else:
+                        request.add_event_generated_token(
+                            token,
+                            blocks_total=block_allocator.total_count,
+                            blocks_hashed_total=blocks_allocated,
+                            blocks_hashed_active=blocks_allocated,
+                        )
                     if request.tpot is None:
                         request.tpot = []
                     request.tpot.append(step_time)
@@ -1254,7 +1263,7 @@ class DynamicInferenceEngine(AbstractEngine):
         self.step_count += 1
 
         # Mark pending prefix blocks as computed after prefill steps
-        if not is_decode_only:
+        if not is_decode_only and self.context.enable_prefix_caching:
             self.context.mark_pending_blocks_computed()
 
         range_pop()
