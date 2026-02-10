@@ -364,8 +364,16 @@ class DynamicInferenceRequest(InferenceRequest):
             and self.prompt_tokens is not None
         ):
             self._compute_block_hashes()
+        elif (
+            not self.enable_prefix_caching
+            and self.block_size_tokens is not None
+            and self.prompt_tokens is not None
+        ):
+            # Prefix caching disabled — compute dummy hashes that won't match
+            # across requests, using request_id + block_pos as seed
+            self._compute_dummy_block_hashes()
         elif self.block_size_tokens is not None:
-            # Prefix caching disabled or no prompt - set empty list to indicate "computed but none"
+            # No prompt yet - set empty list to indicate "computed but none"
             self.precomputed_block_hashes = []
 
     def _compute_block_hashes(self) -> None:
@@ -388,6 +396,19 @@ class DynamicInferenceRequest(InferenceRequest):
             hashes.append(block_hash)
             parent_hash = block_hash
 
+        self.precomputed_block_hashes = hashes
+
+    def _compute_dummy_block_hashes(self) -> None:
+        """Compute unique non-matching hashes for when prefix caching is disabled.
+
+        Uses request_id and block position to ensure no two requests produce
+        the same hashes, preventing any block sharing.
+        """
+        num_complete_blocks = len(self.prompt_tokens) // self.block_size_tokens
+        hashes = []
+        for block_pos in range(num_complete_blocks):
+            h = ((self.request_id * 2654435761 + block_pos) * 2654435761) % HASH_PRIME + 1
+            hashes.append(h)
         self.precomputed_block_hashes = hashes
 
     @property

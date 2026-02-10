@@ -16,7 +16,7 @@ from megatron.core.inference.batch_dimensions_utils import (
     InferenceBatchDimensions,
 )
 from megatron.core.inference.config import InferenceConfig
-from megatron.core.inference.inference_request import DynamicInferenceRequest, HASH_PRIME
+from megatron.core.inference.inference_request import DynamicInferenceRequest
 from megatron.core.inference.sampling_params import SamplingParams
 from megatron.core.inference.unified_memory import (
     UnifiedMemoryUnsupportedError,
@@ -1652,18 +1652,13 @@ class DynamicInferenceContext(BaseInferenceContext):
 
         for block_pos in range(first_block_to_hash, num_complete_blocks):
             block_id = self.request_to_kv_block_ids[current_id][block_pos].item()
+            block_hash = req.precomputed_block_hashes[block_pos]
 
-            # Register hash for prefix caching
-            if self.enable_prefix_caching and req.precomputed_block_hashes:
-                # Use precomputed hash from request
-                block_hash = req.precomputed_block_hashes[block_pos]
+            if self.enable_prefix_caching:
                 self.block_allocator.register_block_hash(block_id, block_hash)
                 self._blocks_pending_computation.append(block_id)
             else:
-                # Use deterministic unique hash based on block_id to prevent matching
-                # Knuth's multiplicative hash spreads IDs across hash space
-                unique_hash = (block_id * 2654435761) % HASH_PRIME + 1
-                self.block_allocator.set_block_hash(block_id, unique_hash)
+                self.block_allocator.set_block_hash(block_id, block_hash)
 
         if self.is_hybrid_model and not is_chunked_prefill:
             # Allocate a slot for Mamba states
