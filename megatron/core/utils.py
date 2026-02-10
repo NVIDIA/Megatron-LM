@@ -1214,12 +1214,7 @@ def local_multi_tensor_l2_norm(chunk_size, noop_flag, tensor_lists, per_tensor, 
     """
     norms = []
     device = None
-    all_tensors = []
     for tensor_list in tensor_lists:
-        for tensor in tensor_list:
-            if device is None:
-                device = tensor.device
-            all_tensors.append(tensor)
         if not tensor_list:
             continue
         if device is None:
@@ -1236,19 +1231,10 @@ def local_multi_tensor_l2_norm(chunk_size, noop_flag, tensor_lists, per_tensor, 
             for tensor in tensor_list:
                 norms.append(torch.norm(tensor, p=2, dtype=torch.float32))
 
-    if not all_tensors:
+    if not norms:
         if device is None:
             device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
         return torch.tensor([0.0], dtype=torch.float32, device=device), None
-
-    if hasattr(torch, '_foreach_norm'):
-        norms = torch._foreach_norm(all_tensors, 2.0)
-        # Ensure they are float32
-        if norms[0].dtype != torch.float32:
-            norms = [n.to(dtype=torch.float32) for n in norms]
-    else:
-        for tensor in all_tensors:
-            norms.append(torch.norm(tensor, p=2, dtype=torch.float32))
 
     stacked_norms = torch.stack(norms)
     l2_reduced = torch.norm(stacked_norms, p=2)

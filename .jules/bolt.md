@@ -22,3 +22,7 @@
 ## 2025-10-27 - torch._foreach_norm Precision Safety
 **Learning:** `torch._foreach_norm` accumulates in the input dtype and lacks a `dtype` argument. Using it on FP16/BF16 inputs can cause overflow if the sum of squares exceeds the type's range (e.g., > 65504 for FP16).
 **Action:** Restrict `torch._foreach_norm` optimization to `torch.float32` inputs. For lower precision, fallback to `torch.norm(..., dtype=torch.float32)` or manually cast before calling.
+
+## 2025-10-27 - Redundant Loop Optimization
+**Learning:** Legacy fallback loops must be strictly mutually exclusive with optimized `_foreach` paths. Overlapping logic can lead to double accumulation (correctness bug) and redundant computation (performance bug).
+**Action:** Verify that `if optimized_path: ... else: legacy_path` structures are clean and do not allow fall-through or duplicate execution.
