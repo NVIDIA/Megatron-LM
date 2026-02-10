@@ -240,7 +240,7 @@ class LanguageModule(MegatronModule):
         # Ensure that first and last stages have the same initial parameter
         # values.
         if torch.distributed.is_initialized():
-            if self._is_in_embd_group():
+            if self._is_in_embd_group() and not self.config.init_model_with_meta_device:
                 weight = self.shared_embedding_or_output_weight()
                 weight.data = weight.data.cuda()
                 torch.distributed.all_reduce(weight.data, group=self.embd_group)
