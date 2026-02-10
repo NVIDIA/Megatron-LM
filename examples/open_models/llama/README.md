@@ -45,7 +45,7 @@ docker run --rm --gpus all --ipc=host --ulimit memlock=-1 \
   -v "${HOST_TENSORBOARD_LOGS_PATH}:/workspace/tensorboard_logs" \
   --workdir /workspace/megatron-lm \
   $PYTORCH_IMAGE \
-  bash examples/llama/train_llama3_8b_h100_fp8.sh \
+  bash examples/open_models/llama/train_llama3_8b_h100_fp8.sh \
     /workspace/checkpoints \
     /workspace/tensorboard_logs \
   2>&1 | tee "${HOST_TENSORBOARD_LOGS_PATH}/training_mock_$(date +'%y-%m-%d_%H-%M-%S').log"
@@ -63,7 +63,7 @@ docker run --rm --gpus all --ipc=host --ulimit memlock=-1 \
   -v "$(dirname "${HOST_DATA_PREFIX}"):/workspace/data_dir" \
   --workdir /workspace/megatron-lm \
   $PYTORCH_IMAGE \
-  bash examples/llama/train_llama3_8b_h100_fp8.sh \
+  bash examples/open_models/llama/train_llama3_8b_h100_fp8.sh \
     /workspace/checkpoints \
     /workspace/tensorboard_logs \
     /workspace/tokenizer_model \
