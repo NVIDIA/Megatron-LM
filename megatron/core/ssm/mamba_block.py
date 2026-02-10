@@ -16,6 +16,7 @@ from megatron.core.dist_checkpointing.mapping import ShardedStateDict
 from megatron.core.dist_checkpointing.utils import replace_prefix_for_sharding
 from megatron.core.enums import Fp8Recipe
 from megatron.core.extensions.transformer_engine import TENorm
+from megatron.core.fp4_utils import get_fp4_context
 from megatron.core.fp8_utils import get_fp8_context
 from megatron.core.inference.contexts import BaseInferenceContext
 from megatron.core.packed_seq_params import PackedSeqParams
@@ -134,8 +135,13 @@ class MambaStack(MegatronModule):
         # Build main decoder layers using shared layer builder
         self.layers = nn.ModuleList()
         for i, layer_type in enumerate(self.layer_type_list):
-            fp8_init_context = get_fp8_context(self.config, i + pp_layer_offset, is_init=True)
-            with fp8_init_context:
+            if self.config.fp8:
+                quant_init_context = get_fp8_context(self.config, i + pp_layer_offset, is_init=True)
+            elif self.config.fp4:
+                quant_init_context = get_fp4_context(self.config, i + pp_layer_offset, is_init=True)
+            else:
+                quant_init_context = nullcontext()
+            with quant_init_context:
                 if layer_type == LayerSymbols.MAMBA:
                     layer = build_module(
                         submodules.mamba_layer,
@@ -323,16 +329,29 @@ class MambaStack(MegatronModule):
         # control which layer will be fp8 or bf16
         use_outer_fp8_context = self.config.fp8 and self.config.fp8_recipe == Fp8Recipe.delayed
         use_inner_fp8_context = self.config.fp8 and self.config.fp8_recipe != Fp8Recipe.delayed
+        use_fp4_context = self.config.fp4 is not None
         outer_fp8_context = get_fp8_context(self.config) if use_outer_fp8_context else nullcontext()
+
+        if use_inner_fp8_context:
+
+            def get_inner_quant_context(config, layer_number):
+                return get_fp8_context(config, layer_number)
+
+        elif use_fp4_context:
+
+            def get_inner_quant_context(config, layer_number):
+                return get_fp4_context(config, layer_number)
+
+        else:
+
+            def get_inner_quant_context(config, layer_number):
+                return nullcontext()
 
         with outer_fp8_context:
             for layer in self.layers:
-                inner_fp8_context = (
-                    get_fp8_context(self.config, layer.layer_number - 1)
-                    if use_inner_fp8_context
-                    else nullcontext()
-                )
-                with inner_fp8_context:
+                # Layers have 1-indexed layer numbers attribute.
+                inner_quant_context = get_inner_quant_context(self.config, layer.layer_number - 1)
+                with inner_quant_context:
                     if isinstance(layer, TransformerLayer):
                         hidden_states, _ = layer(
                             hidden_states=hidden_states,
@@ -343,7 +362,7 @@ class MambaStack(MegatronModule):
                             packed_seq_params=packed_seq_params,
                             padding_mask=padding_mask,
                         )
-                    else:  # MambaLayer
+                    else:  # MambaLayer, Expert, or MLP
                         hidden_states = layer(
                             hidden_states=hidden_states,
                             attention_mask=attention_mask,
