@@ -456,11 +456,17 @@ class TransformerBlock(GraphableMegatronModule, MegatronModule):
         use_inner_quantization_context: bool,
         padding_mask: Optional[Tensor] = None,
         extract_layer_indices: Optional[Set[int]] = None,
+        layer_offset: int = 0,
     ):
         """Forward method with activation checkpointing.
 
         Args:
-            extract_layer_indices (Set[int], optional): Layer indices from which to extract features.
+            extract_layer_indices (Set[int], optional): Global layer
+                indices (across all pipeline stages) from which to
+                extract features.
+            layer_offset (int): The global layer offset for the current
+                pipeline stage. Used to convert local layer indices to
+                global indices when checking extract_layer_indices.
 
         Returns:
             If extract_layer_indices is empty: hidden_states tensor
@@ -553,12 +559,14 @@ class TransformerBlock(GraphableMegatronModule, MegatronModule):
                 )
 
                 # Feature extraction for uniform recompute: collect at end of each chunk
-                # Note: There is a limitation that only the last layer of each chunk can have features collected
-                chunk_end = min(layer_idx + self.config.recompute_num_layers, self.num_layers_per_pipeline_rank)
+                # Note: Only the last layer of each chunk can have features collected
+                chunk_end = min(
+                    layer_idx + self.config.recompute_num_layers, self.num_layers_per_pipeline_rank
+                )
                 for idx in range(layer_idx, chunk_end):
-                    if idx in extract_layer_indices:
+                    if (idx + layer_offset) in extract_layer_indices:
                         # For uniform recompute, we can only get features at chunk boundaries
-                        # This is a limitation - for fine-grained feature extraction, use 'block' method
+                        # Limitation: for fine-grained extraction, use 'block'
                         if idx == chunk_end - 1:
                             intermediate_hidden_states.append(hidden_states)
 
@@ -586,13 +594,13 @@ class TransformerBlock(GraphableMegatronModule, MegatronModule):
                         hidden_states, attention_mask, context, context_mask, rotary_pos_emb
                     )
 
-                # Feature extraction: collect hidden states at specified layer indices
-                if layer_idx in extract_layer_indices:
+                # Feature extraction: collect hidden states at specified global layer indices
+                if (layer_idx + layer_offset) in extract_layer_indices:
                     intermediate_hidden_states.append(hidden_states)
         else:
             raise ValueError("Invalid activation recompute method.")
 
-        # Return intermediate_hidden_states along with hidden_states if feature extraction was requested
+        # Return intermediate hidden states if feature extraction was requested
         if len(extract_layer_indices) > 0:
             return hidden_states, intermediate_hidden_states
 
@@ -687,9 +695,11 @@ class TransformerBlock(GraphableMegatronModule, MegatronModule):
                 optimizations.
             packed_seq_params (PackedSeqParams, optional): Parameters for packed sequence
                 processing.
-            extract_layer_indices (Set[int], optional): A set of layer indices (0-based) from which
-                to extract intermediate hidden states. If non-empty, the forward pass will
-                collect hidden_states after each specified layer. Defaults to None (no features).
+            extract_layer_indices (Set[int], optional): A set of global
+                layer indices (0-based across all pipeline stages) from
+                which to extract intermediate hidden states. If
+                non-empty, the forward pass will collect hidden_states
+                after each specified layer.
             dynamic_inference_decode_only: Optional[bool]: If true, indicates that the current
                 inference context is for decode-only. This args is only used to uniquely
                 identify decode and non-decode cuda graph runners in the cuda graph manager.
@@ -698,9 +708,11 @@ class TransformerBlock(GraphableMegatronModule, MegatronModule):
             Union[Tensor, Tuple[Tensor, List[Tensor]]]:
                 - If extract_layer_indices is None or empty: Returns the output hidden states tensor
                   of shape [s, b, h].
-                - If extract_layer_indices is non-empty: Returns a tuple of (hidden_states, intermediate_hidden_states)
-                  where intermediate_hidden_states is a list of tensors corresponding to hidden states after each
-                  layer in extract_layer_indices.
+                - If extract_layer_indices is non-empty: Returns a tuple
+                  of (hidden_states, intermediate_hidden_states) where
+                  intermediate_hidden_states is a list of tensors
+                  corresponding to hidden states after each layer in
+                  extract_layer_indices.
         """
 
         inference_context = deprecate_inference_params(inference_context, inference_params)
@@ -712,6 +724,13 @@ class TransformerBlock(GraphableMegatronModule, MegatronModule):
         if extract_layer_indices is None:
             extract_layer_indices = set()
         intermediate_hidden_states: List[Tensor] = []
+
+        # Calculate the global layer offset for this pipeline stage
+        # This is needed to convert local layer indices to global indices for feature extraction
+        pp_group = self.pg_collection.pp if hasattr(self.pg_collection, 'pp') else None
+        layer_offset = get_transformer_layer_offset(
+            self.config, self.vp_stage, get_pg_rank(pp_group)
+        )
 
         # Delete the obsolete reference to the initial input tensor if necessary
         if isinstance(hidden_states, WrappedTensor):
@@ -779,10 +798,11 @@ class TransformerBlock(GraphableMegatronModule, MegatronModule):
                     use_inner_quantization_context=use_inner_quantization_context,
                     padding_mask=padding_mask,
                     extract_layer_indices=extract_layer_indices,
+                    layer_offset=layer_offset,
                 )
                 # Handle return value from _checkpointed_forward
                 if len(extract_layer_indices) > 0:
-                    # Return with intermediate_hidden_states: (hidden_states, intermediate_hidden_states) tuple
+                    # (hidden_states, intermediate_hidden_states) tuple
                     hidden_states, intermediate_hidden_states = checkpointed_result
                 else:
                     # No intermediate_hidden_states requested: just hidden_states
@@ -828,7 +848,8 @@ class TransformerBlock(GraphableMegatronModule, MegatronModule):
                     ):
                         hidden_states = self.group_prefetch_offload_commit_async(hidden_states)
 
-                    if l_no in extract_layer_indices:
+                    # Extract intermediate embeddings using global layer index
+                    if (l_no + layer_offset) in extract_layer_indices:
                         intermediate_hidden_states.append(hidden_states)
 
         # Final layer norm.

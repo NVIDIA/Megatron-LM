@@ -169,19 +169,27 @@ class TestParallelTransformerBlock:
         # Test with single layer extraction
         extract_indices = {0}
         result = parallel_transformer_block(
-            hidden_states=hidden_states, attention_mask=attention_mask, extract_layer_indices=extract_indices
+            hidden_states=hidden_states,
+            attention_mask=attention_mask,
+            extract_layer_indices=extract_indices,
         )
         assert isinstance(result, tuple)
         assert len(result) == 2
         output_hidden_states, intermediate_hidden_states = result
         assert output_hidden_states.shape == (sequence_length, micro_batch_size, config.hidden_size)
         assert len(intermediate_hidden_states) == 1
-        assert intermediate_hidden_states[0].shape == (sequence_length, micro_batch_size, config.hidden_size)
+        assert intermediate_hidden_states[0].shape == (
+            sequence_length,
+            micro_batch_size,
+            config.hidden_size,
+        )
 
         # Test with multiple layer extraction (config has 2 layers: indices 0, 1)
         extract_indices = {0, 1}
         result = parallel_transformer_block(
-            hidden_states=hidden_states, attention_mask=attention_mask, extract_layer_indices=extract_indices
+            hidden_states=hidden_states,
+            attention_mask=attention_mask,
+            extract_layer_indices=extract_indices,
         )
         assert isinstance(result, tuple)
         assert len(result) == 2
@@ -224,7 +232,9 @@ class TestParallelTransformerBlock:
         # Note: uniform method can only extract features at chunk boundaries
         extract_indices = {0, 1}
         result = uniform_transformer_block(
-            hidden_states=hidden_states, attention_mask=attention_mask, extract_layer_indices=extract_indices
+            hidden_states=hidden_states,
+            attention_mask=attention_mask,
+            extract_layer_indices=extract_indices,
         )
         assert isinstance(result, tuple)
         assert len(result) == 2
