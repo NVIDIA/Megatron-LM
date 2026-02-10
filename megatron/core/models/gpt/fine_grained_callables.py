@@ -329,7 +329,7 @@ class TransformerLayerNode(ScheduleNode):
         """Computes the weight gradients for the transformer layer node."""
         if not self.delay_wgrad_compute:
             return
-        with self.stream_acquire_context(f"{self.name} wgrad"):
+        with self.stream_acquire_context(f"{self.name} wgrad", wait_event=False):
             for module in self.bwd_dw_callables:
                 module.backward_dw()
 
