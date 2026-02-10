@@ -89,3 +89,4 @@ MODEL_ARGS:
 METRICS:
   - "generated_tokens"
   - "logprobs"
+  - "routing_indices"
