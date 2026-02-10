@@ -1,7 +1,5 @@
 # Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
-
-
-from typing import Callable, Optional
+from typing import Callable, Optional, Tuple
 
 import torch
 import torch.distributed as dist
@@ -59,6 +57,7 @@ class InferenceLayerNormColumnParallelLinear(TELayerNormColumnParallelLinear):
         bias: bool,
         skip_bias_add: bool,
         is_expert: bool,
+        stride: int = 1,
         skip_weight_param_allocation: bool = False,
         tp_comm_buffer_name: Optional[str] = None,
         tp_group: Optional[torch.distributed.ProcessGroup] = None,
@@ -73,6 +72,7 @@ class InferenceLayerNormColumnParallelLinear(TELayerNormColumnParallelLinear):
             bias=bias,
             skip_bias_add=skip_bias_add,
             is_expert=is_expert,
+            stride=stride,
             skip_weight_param_allocation=skip_weight_param_allocation,
             tp_comm_buffer_name=tp_comm_buffer_name,
             tp_group=tp_group,
@@ -135,7 +135,7 @@ class InferenceLayerNormColumnParallelLinear(TELayerNormColumnParallelLinear):
             return x
 
     @torch.no_grad()
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
+    def forward(self, x: torch.Tensor) -> Tuple[torch.Tensor, None]:
         """
         Forward pass.
         """
@@ -280,7 +280,9 @@ class InferenceRowParallelLinear(TERowParallelLinear):
         self.residual = residual
 
     @torch.no_grad()
-    def forward(self, x: torch.Tensor, residual: Optional[torch.Tensor] = None) -> torch.Tensor:
+    def forward(
+        self, x: torch.Tensor, residual: Optional[torch.Tensor] = None
+    ) -> tuple[torch.Tensor, None]:
         """
         Forward pass.
         """
