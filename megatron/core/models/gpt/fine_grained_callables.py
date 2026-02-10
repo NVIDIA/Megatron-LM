@@ -22,6 +22,7 @@ from megatron.core.transformer.multi_token_prediction import (
     get_mtp_layer_offset,
 )
 from megatron.core.transformer.transformer_layer import TransformerLayer, make_viewless_tensor
+from megatron.core.typed_torch import apply_module
 from megatron.core.utils import internal_api
 
 
@@ -479,13 +480,15 @@ def build_transformer_layer_callables(layer: TransformerLayer):
                         layer.offload_mlp_norm, hidden_states, "mlp_norm"
                     ) as hidden_states:
                         pre_mlp_layernorm_output = layer.pre_mlp_norm_checkpoint.checkpoint(
-                            layer.pre_mlp_layernorm, hidden_states
+                            apply_module(layer.pre_mlp_layernorm), hidden_states
                         )
                 else:
                     with off_interface(
                         layer.offload_mlp_norm, hidden_states, "mlp_norm"
                     ) as hidden_states:
-                        pre_mlp_layernorm_output = layer.pre_mlp_layernorm(hidden_states)
+                        pre_mlp_layernorm_output = apply_module(layer.pre_mlp_layernorm)(
+                            hidden_states
+                        )
 
                 shared_expert_output = layer.mlp.shared_experts_compute(pre_mlp_layernorm_output)
                 probs, routing_map = layer.mlp.route(pre_mlp_layernorm_output)

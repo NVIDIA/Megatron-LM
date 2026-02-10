@@ -19,6 +19,7 @@ from megatron.core.models.backends import BackendSpecProvider
 from megatron.core.tensor_parallel.layers import ColumnParallelLinear, RowParallelLinear
 from megatron.core.transformer.mlp import MLPSubmodules
 from megatron.core.transformer.moe.experts import GroupedMLP, SequentialMLP, TEGroupedMLP
+from megatron.core.transformer.torch_norm import LayerNormBuilder
 from megatron.core.utils import get_te_version, is_te_min_version
 
 
@@ -45,7 +46,7 @@ class TESpecProvider(BackendSpecProvider):
         """Which module for sequential layernorm and linear"""
         return TELayerNormColumnParallelLinear
 
-    def layer_norm(self, rms_norm: bool = False, for_qk: bool = False) -> type:
+    def layer_norm(self, rms_norm: bool = False, for_qk: bool = False) -> LayerNormBuilder:
         """Which module to use for layer norm"""
         if for_qk and not is_te_min_version("1.9.0"):
             # TENorm significantly harms convergence when used
