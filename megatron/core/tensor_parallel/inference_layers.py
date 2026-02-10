@@ -280,7 +280,9 @@ class InferenceRowParallelLinear(TERowParallelLinear):
         self.residual = residual
 
     @torch.no_grad()
-    def forward(self, x: torch.Tensor, residual: Optional[torch.Tensor] = None) -> torch.Tensor:
+    def forward(
+        self, x: torch.Tensor, residual: Optional[torch.Tensor] = None
+    ) -> tuple[torch.Tensor, None]:
         """
         Forward pass.
         """
