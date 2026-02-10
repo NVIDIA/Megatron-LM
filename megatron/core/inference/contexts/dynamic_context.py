@@ -1302,7 +1302,7 @@ class DynamicInferenceContext(BaseInferenceContext):
                 padded_batch_dimensions=self.padded_batch_dimensions,
             )
 
-        if self.moe_enable_routing_replay is not None:
+        if self.moe_enable_routing_replay:
             if self.using_cuda_graph_this_step():
                 self.moe_routing_metadata.enable_static_buffer_recording()
             else:
