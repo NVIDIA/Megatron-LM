@@ -53,8 +53,6 @@ def loss_func(loss_mask: torch.Tensor, output_tensor: torch.Tensor, model: GPTMo
     loss_lm = _mask_loss(output_tensor, loss_mask)
     loss = loss_lm
     num_tokens = loss_mask.sum().clone().detach().to(torch.int)
-    # Protect against division by zero if all tokens are masked (for some CP ranks)
-    num_tokens = torch.clamp(num_tokens, min=1)
     report = {'lm loss': torch.cat([loss_lm.clone().detach().view(1), num_tokens.view(1)])}
 
     if args.export_kd_teacher_load:
