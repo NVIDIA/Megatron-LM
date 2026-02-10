@@ -4,7 +4,7 @@ import atexit, json
 from collections import Counter
 import json
 import math
-from typing import Any, Dict, Optional, List
+from typing import Any, Dict, Optional, List, Union
 
 import numpy as np
 import pandas as pd
@@ -50,7 +50,6 @@ class SFTLowLevelDataset:
     def __getitem__(self, idx: int) -> list:
         return self.dataset[idx]["messages"]
 
-
 class SFTDataset(MegatronDataset):
     """The dataset used during SFT"""
 
@@ -64,7 +63,7 @@ class SFTDataset(MegatronDataset):
         config: GPTDatasetConfig,
     ) -> None:
         super().__init__(dataset, dataset_path, indices, num_samples, index_split, config)
-        # Pre-calculate padding divisor to avoid redundant computation in get_padding_size
+        # Pre-calculate padding divisor to avoid redundant computation in get_item
         self.padding_divisor = self._calculate_padding_divisor()
 
     @staticmethod
@@ -112,19 +111,9 @@ class SFTDataset(MegatronDataset):
         # TODO(tailaim): do we need to pad for FP8 execution?
         # divisor = ((divisor + 15) // 16) * 16
         return divisor
-    
-    def get_padding_size(
-        self,
-        seq_len: int,
-    ) -> int:
-        seq_len_padded = math.ceil(seq_len / self.padding_divisor) * self.padding_divisor
-        assert seq_len > seq_len_padded / 2 / self.config.context_parallel_size * (self.config.context_parallel_size - 1), \
-        f"sequence length {seq_len} is too short, the divisor is {self.padding_divisor}, that means cp_rank \
-        {self.config.context_parallel_size-1} will have no valid tokens"
-        return seq_len_padded
 
     def __getitem__(self, idx: int) -> Dict[str, Any]:
-        sequence_packing = self.config.sequence_packing
+
         tokenizer = self.config.tokenizer
         pack_length = self.config.sequence_length
 
@@ -163,12 +152,11 @@ class SFTDataset(MegatronDataset):
             assert not self.config.reset_position_ids
             pack_positions.extend(range(len(tokens_list)))
 
-            if self.config.context_parallel_size > 1:
-                pad_granularity = self.config.context_parallel_size * 2
-                mod_token_count = len(pack_tokens) % pad_granularity
-                if mod_token_count != 0:
-                    pad_len = pad_granularity - mod_token_count
-                    extend_with_padding(pack_tokens, pack_targets, pack_positions, pad_len)
+            pad_granularity = self.padding_divisor
+            mod_token_count = len(pack_tokens) % pad_granularity
+            if mod_token_count != 0:
+                pad_len = pad_granularity - mod_token_count
+                extend_with_padding(pack_tokens, pack_targets, pack_positions, pad_len)
 
             # TODO(duncan): Consider also padding to multiple of number of tokens here. This might
             # be needed for efficiency (and potentially set via command-line argument).
@@ -310,64 +298,81 @@ class MockSFTDataset(SFTDataset):
         return self.num_samples
 
     def __getitem__(self, idx: int) -> Dict[str, Any]:
-        sequence_packing = self.config.sequence_packing
+
         tokenizer = self.config.tokenizer
-        max_seq_len = self.config.sequence_length
+        pack_length = self.config.sequence_length
+        eod = tokenizer.eod
+        pad = tokenizer.pad
 
         tokens = self.dataset[int(self.indices[idx % len(self.indices)])]
-        target = np.array(tokens, dtype=np.int64)
-        
-        force_eod_length = int(tokenizer.force_eod)
 
-        if len(tokens) > max_seq_len - force_eod_length:
-            # cut the right side
-            tokens = tokens[: max_seq_len - force_eod_length]
-            target = target[: max_seq_len - force_eod_length]
-            # tokens = tokens[(-max_seq_len + force_eod_length):]
-            # target = target[(-max_seq_len + force_eod_length):]
+        def extend_with_padding(tokens, targets, positions, pad_len):
+            tokens.extend([pad] * pad_len)
+            targets.extend([pad] * pad_len)
+            positions.extend(range(positions[-1] + 1, positions[-1] + 1 + pad_len))
 
-        # padding
-        num_tokens = len(tokens) + force_eod_length
-        if sequence_packing:
-            padding_len = self.get_padding_size(num_tokens) - num_tokens
-        else:
-            padding_len = max_seq_len - num_tokens
-        assert padding_len >= 0
-        filler = [tokenizer.eod] * force_eod_length + [tokenizer.pad] * (padding_len + 1)
+        # Convert tokens to list and add EOD
+        tokens_list = tokens.tolist()
+        if tokens_list[-1] != eod:
+            tokens_list.append(eod)
+        targets_list = list(tokens_list)
 
-        tokens = np.array(tokens.tolist() + filler, dtype=np.int64)
-        target = np.array(target.tolist() + filler, dtype=np.int64)
+        pack_tokens = list(tokens_list)
+        pack_targets = list(targets_list)
+        pack_positions = list(range(len(tokens_list)))
+        cu_seqlens = [0]
 
-        tokens = torch.tensor(tokens)
-        target = torch.tensor(target)
+        # Pad to padding_divisor alignment
+        if self.padding_divisor > 1:
+            mod_token_count = len(pack_tokens) % self.padding_divisor
+            if mod_token_count != 0:
+                pad_len = self.padding_divisor - mod_token_count
+                extend_with_padding(pack_tokens, pack_targets, pack_positions, pad_len)
 
-        tokens = tokens[:-1].contiguous()
-        target = target[1:].contiguous()
-        seq_len = tokens.numel()
+        # Record padded boundary after padding
+        cu_seqlens.append(len(pack_tokens))
 
-        loss_mask, position_ids, attention_mask = self._get_ltor_masks_and_position_ids(
-            seq_len, target, tokenizer.pad
-        )
+        # Handle any necessary truncation
+        if len(pack_tokens) >= pack_length + 1:  # +1 here to account for later alignment
+            max_body = pack_length - 1
+            pack_tokens = pack_tokens[:max_body]
+            pack_targets = pack_targets[:max_body]
+            pack_tokens.extend([eod, pad])
+            pack_targets.extend([eod, pad])
+            pack_positions = pack_positions[:pack_length + 1]
+            cu_seqlens[-1] = len(pack_tokens) - 1
 
-        if self.config.create_attention_mask:
-            ret = {
-                'tokens': tokens,
-                'labels': target,
-                'attention_mask': attention_mask,
-                'loss_mask': loss_mask,
-                'position_ids': position_ids,
-            }
-        else:
-            ret = {
-                'tokens': tokens,
-                'labels': target,
-                'loss_mask': loss_mask,
-                'position_ids': position_ids,
-            }
+        # Handle any necessary padding
+        if len(pack_tokens) < pack_length + 1:  # +1 here to account for later alignment
+            pad_len = pack_length + 1 - len(pack_tokens)
+            extend_with_padding(pack_tokens, pack_targets, pack_positions, pad_len)
+            cu_seqlens[-1] = len(pack_tokens) - 1
 
-        if sequence_packing:
-            # sequence packing need both original sequence length and padded length
-            ret['original_seq_len'] = torch.tensor(num_tokens, dtype=torch.int32, device=tokens.device)
-            ret['padded_seq_len'] = torch.tensor(seq_len, dtype=torch.int32, device=tokens.device)
+        assert len(pack_tokens) == pack_length + 1
+        assert len(pack_targets) == pack_length + 1
+        assert len(pack_positions) == pack_length + 1
 
-        return ret
+        # Align and convert to tensors
+        input_ids = torch.tensor(pack_tokens[:-1], dtype=torch.int64)
+        labels = torch.tensor(pack_targets[1:], dtype=torch.int64)
+        position_ids = torch.tensor(pack_positions[:-1], dtype=torch.int64)
+
+        # Loss mask
+        loss_mask = torch.ones(pack_length, dtype=torch.float32)
+        loss_mask[labels == pad] = 0.0
+        loss_mask[labels == IGNORE_INDEX] = 0.0
+
+        assert len(cu_seqlens) >= 2
+        cu_seqlens = torch.tensor(cu_seqlens, dtype=torch.int32)
+        # Calculating max_seqlen here because of possible effects of truncation and padding
+        adjacent_diffs = cu_seqlens[1:] - cu_seqlens[:-1]
+        max_seqlen = adjacent_diffs.max()  # max_seqlen is a 0-D tensor
+
+        return {
+            'tokens': input_ids,
+            'labels': labels,
+            'loss_mask': loss_mask,
+            'position_ids': position_ids,
+            'cu_seqlens': cu_seqlens,
+            'max_seqlen': max_seqlen,
+        }

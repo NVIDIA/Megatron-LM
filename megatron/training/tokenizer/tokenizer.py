@@ -870,11 +870,6 @@ class _NullTokenizer(MegatronLegacyTokenizer):
     @property
     def additional_special_tokens_ids(self):
         return None
-
-    @property
-    def force_eod(self):
-        """To force an EOD at the end of every data sample in SFT."""
-        return True
     
     @property
     def pad(self):

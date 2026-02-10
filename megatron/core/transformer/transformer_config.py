@@ -2040,7 +2040,7 @@ class TransformerConfig(ModelParallelConfig):
                 self.attention_backend == AttnBackend.flash
             ), "Batch invariant mode only supports FlashAttention"
 
-        if self.sequence_packing:
+        if self.sequence_packing_scheduler is not None:
             # Check TE version.
             if not HAVE_PACKAGING:
                 raise ImportError(
@@ -2059,14 +2059,16 @@ class TransformerConfig(ModelParallelConfig):
             self.variable_seq_lengths = True
 
             # TODO(tailaim): add support for other dispatcher types
-            warnings.warn("Setting moe_token_dispatcher_type to alltoall for sft sequence packing.")
-            self.moe_token_dispatcher_type = "alltoall"
+            assert self.moe_token_dispatcher_type == "alltoall", (
+                f"sequence_packing only supports moe_token_dispatcher_type='alltoall', "
+                f"got '{self.moe_token_dispatcher_type}'"
+            )
 
-            if self.sequence_packing_scheduler is None:
-                self.sequence_packing_scheduler = 'default_sequence_packing'
-
-            supported_schedulers = ['default_sequence_packing']
-            if self.sequence_packing_scheduler not in supported_schedulers:
+            supported_schedulers = ['dp_balanced']
+            if (
+                self.sequence_packing_scheduler is not None
+                and self.sequence_packing_scheduler not in supported_schedulers
+            ):
                 raise ValueError(
                     f"Unknown scheduler: {self.sequence_packing_scheduler}. "
                     f"Available schedulers: {supported_schedulers}"
