@@ -1482,6 +1482,24 @@ class TransformerConfig(ModelParallelConfig):
                         f"{self.virtual_pipeline_model_parallel_size}"
                     )
 
+        # Chunked PP
+        if self.chunked_pipeline_model_parallel_splits > 1:
+            assert (
+                not self.overlap_moe_expert_parallel_comm
+            ), f"Chunked PP does not support A2A overlap for now."
+            if self.virtual_pipeline_model_parallel_size is not None:
+                assert (
+                    self.pipeline_model_parallel_size >= self.chunked_pipeline_model_parallel_splits
+                ), (
+                    f"For VPP > 1, expect PP size >= chunked PP splits, but got "
+                    f"{self.virtual_pipeline_model_parallel_size=}, "
+                    f"{self.pipeline_model_parallel_size=}, "
+                    f"and {self.chunked_pipeline_model_parallel_splits=}."
+                )
+            assert (
+                self.recompute_granularity != "full"
+            ), "Chunked PP does not support full recompute granularity for now."
+
         if self.apply_query_key_layer_scaling:
             self.attention_softmax_in_fp32 = True
 
