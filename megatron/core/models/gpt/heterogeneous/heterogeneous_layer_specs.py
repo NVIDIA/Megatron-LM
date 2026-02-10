@@ -27,6 +27,7 @@ from megatron.core.transformer.transformer_layer import (
     TransformerLayerSubmodules,
     get_transformer_layer_offset,
 )
+from megatron.core.typed_torch import not_none
 from megatron.core.utils import is_te_min_version
 
 try:
@@ -44,6 +45,13 @@ try:
 
     HAVE_TE = True
 except ImportError:
+    (
+        TEDotProductAttention,
+        TELayerNormColumnParallelLinear,
+        TENorm,
+        TERowParallelLinear,
+        TELayerNormColumnParallelLinearGathered,
+    ) = (None, None, None, None, None)
     HAVE_TE = False
 
 from megatron.core.transformer.torch_norm import WrappedTorchNorm
@@ -110,8 +118,10 @@ def _get_heterogenous_attention_spec(
             module=SelfAttention,
             params={"attn_mask_type": AttnMaskType.causal},
             submodules=SelfAttentionSubmodules(
-                linear_qkv=TELayerNormColumnParallelLinear if use_te else ColumnParallelLinear,
-                core_attention=TEDotProductAttention if use_te else DotProductAttention,
+                linear_qkv=(
+                    not_none(TELayerNormColumnParallelLinear) if use_te else ColumnParallelLinear
+                ),
+                core_attention=not_none(TEDotProductAttention) if use_te else DotProductAttention,
                 linear_proj=TERowParallelLinear if use_te else RowParallelLinear,
                 q_layernorm=ln,
                 k_layernorm=ln,

@@ -360,7 +360,6 @@ class TransformerLanguageModel(MegatronModule):
         self.decoder_attn_mask_type = decoder_attn_mask_type
         self.add_pooler = add_pooler
         self.encoder_hidden_state = None
-        self.add_retriever = args.retro_add_retriever
         self.untie_embeddings_and_output_weights = args.untie_embeddings_and_output_weights
 
         # Embeddings.
@@ -399,9 +398,7 @@ class TransformerLanguageModel(MegatronModule):
         if self.add_encoder:
             self.encoder = ParallelTransformer(
                 config,
-                model_type=(
-                    args.model_type if not args.retro_add_retriever else ModelType.retro_decoder
-                ),
+                model_type=args.model_type,
                 self_attn_mask_type=self.encoder_attn_mask_type,
                 pre_process=self.pre_process,
                 post_process=self.post_process,
@@ -479,9 +476,6 @@ class TransformerLanguageModel(MegatronModule):
         dec_input_ids=None,
         dec_position_ids=None,
         dec_attn_mask=None,
-        retriever_input_ids=None,
-        retriever_position_ids=None,
-        retriever_attn_mask=None,
         enc_dec_attn_mask=None,
         tokentype_ids=None,
         inference_context=None,
@@ -502,14 +496,6 @@ class TransformerLanguageModel(MegatronModule):
         else:
             encoder_input = None
 
-        # Retriever embedding.
-        if self.add_retriever and self.pre_process:
-            retriever_input = self.embedding(
-                retriever_input_ids, retriever_position_ids, tokentype_ids=tokentype_ids
-            )
-        else:
-            retriever_input = None
-
         # Rotary positional embeddings
         rotary_pos_emb = None
         if self.use_rotary_position_embeddings:
@@ -524,8 +510,6 @@ class TransformerLanguageModel(MegatronModule):
                 encoder_output = self.encoder(
                     encoder_input,
                     enc_attn_mask,
-                    retriever_input=retriever_input,
-                    retriever_attn_mask=retriever_attn_mask,
                     inference_context=inference_context,
                     rotary_pos_emb=rotary_pos_emb,
                 )
