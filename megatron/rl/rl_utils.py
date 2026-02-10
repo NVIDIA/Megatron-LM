@@ -8,7 +8,7 @@ from functools import partial
 import itertools
 import math
 import logging
-import pickle
+import json
 from collections import Counter, defaultdict
 from contextlib import contextmanager, nullcontext
 from dataclasses import dataclass
@@ -598,10 +598,10 @@ def get_environment_rollouts(
         with open(
             lang_rl_log_dir
             + f'/rollouts_rank{rank}_iteration{args.curr_iteration}_'
-            + f'{Path(args.langrl_env_config).stem}.pkl',
-            'wb',
+            + f'{Path(args.langrl_env_config).stem}.json',
+            'w',
         ) as f:
-            pickle.dump(rollouts, f)
+            json.dump([[r.model_dump() for r in group] for group in rollouts], f)
 
     return rollouts
 
@@ -1566,10 +1566,17 @@ def evaluate_and_print_results_rl(
                 with open(
                     lang_rl_log_dir
                     + f'/eval_rank{rank}_iteration{args.curr_iteration}_'
-                    + f'{Path(args.langrl_env_config).stem}.pkl',
-                    'wb',
+                    + f'{Path(args.langrl_env_config).stem}.json',
+                    'w',
                 ) as f:
-                    pickle.dump(dp_eval_results, f)
+                    json.dump(
+                        [
+                            [r.model_dump() for r in responses]
+                            if responses is not None else None
+                            for responses in dp_eval_results
+                        ],
+                        f,
+                    )
 
 
 def calculate_grpo_loss(
