@@ -1431,7 +1431,7 @@ def get_megatron_optimizer_config(args: Any) -> OptimizerConfig:
             if hasattr(args, f.name):
                 kwargs[f.name] = getattr(args, f.name)
         config = SGDOptimizerConfig(**kwargs)
-    elif args.optimizer == 'muon':
+    elif 'muon' in args.optimizer:
         kwargs = {}
         for f in dataclasses.fields(MuonOptimizerConfig):
             if hasattr(args, f.name):
