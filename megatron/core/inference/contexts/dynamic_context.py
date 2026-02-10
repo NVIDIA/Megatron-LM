@@ -519,7 +519,7 @@ class DynamicInferenceContext(BaseInferenceContext):
         # Allocate GPU state.
         self.is_tensor_state_allocated = False
         self.is_symmetric_memory_initialized = False
-        self.allocate_all_tensors()
+        self.initialize_all_tensors()
 
         # Print info.
         logging.info(
@@ -676,17 +676,6 @@ class DynamicInferenceContext(BaseInferenceContext):
         self.reset_attention_state()
         self.reset_mamba_state()
 
-    def deallocate_all_tensors(self):
-        """Deallocate GPU state.
-
-        This method is used for suspending the dynamic engine.
-        """
-        # TODO(@lmcafee): check that device == 'cuda'?
-        for key in list(vars(self).keys()):
-            value = getattr(self, key)
-            if isinstance(value, torch.Tensor):
-                delattr(self, key)
-
     def reallocate_large_tensors(self):
         """Restore large tensors (KV cache, Mamba states) after a suspend.
 
@@ -709,7 +698,7 @@ class DynamicInferenceContext(BaseInferenceContext):
                 tensor.copy_(self._offloadable_cpu_backups[name], non_blocking=True)
         elif self.kv_cache_management_mode == KVCacheManagementMode.RECOMPUTE:
             self.is_tensor_state_allocated = False
-            self.allocate_all_tensors()
+            self.initialize_all_tensors()
 
     def deallocate_large_tensors(self):
         """Deallocate large tensors (KV cache, Mamba states) during suspend.
@@ -737,7 +726,11 @@ class DynamicInferenceContext(BaseInferenceContext):
                 self._offloadable_cpu_backups[name].copy_(tensor, non_blocking=True)
                 tensor.storage().resize_(0)
         elif self.kv_cache_management_mode == KVCacheManagementMode.RECOMPUTE:
-            self.deallocate_all_tensors()
+            # TODO(@lmcafee): check that device == 'cuda'?
+            for key in list(vars(self).keys()):
+                value = getattr(self, key)
+                if isinstance(value, torch.Tensor):
+                    delattr(self, key)
 
     @classmethod
     def round_up_tokens(cls, value, tp_size=None):
