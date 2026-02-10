@@ -44,7 +44,8 @@ Beginning with **mcore v0.14**, the ``flattened_range`` attribute was removed fr
 ### Workaround: Loading legacy optimizer states with ToT MCore
 
 **Step 1: Convert the legacy checkpoint using mcore v0.15.0**
-Run a short training job with mcore v0.15.0 to re-save the checkpoint with the required sharded optimizer metadata.
+
+Run a dummy training job with mcore v0.15.0 to re-save the checkpoint with new optimizer states format.
 
 ```bash
 MODEL_TRAIN_PARAMS=(
@@ -66,16 +67,16 @@ torchrun --nproc_per_node=8 /opt/megatron-lm/pretrain_gpt.py \
 ```
 
 **Step 2: Load the converted checkpoint with ToT MCore**
+
 Use the converted checkpoint as the input for continued training with ToT MCore.
 
+```bash
 MODEL_TRAIN_PARAMS=(
     # Define model architecture and training parameters here
 )
-
 export NEW_CKPT=/workspace/mcore_ckpt_new
 export CONVERTED_CKPT=/workspace/mcore_ckpt_0.15.0
 
-```bash
 torchrun --nproc_per_node=8 /opt/megatron-lm/pretrain_gpt.py \
    --use-distributed-optimizer \
    --save ${NEW_CKPT} \
