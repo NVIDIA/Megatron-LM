@@ -282,7 +282,7 @@ class ScheduleNode:
 
         Args:
             name: Optional name for NVTX range profiling
-            wait_prev_event: Whether to wait for the previous event
+            wait_event: Whether to wait for the previous event
         """
         if wait_event:
             self.event.wait(self.stream)
