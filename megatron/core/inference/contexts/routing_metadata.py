@@ -94,7 +94,3 @@ class RoutingMetadata:
     def disable_static_buffer_recording(self) -> None:
         """Disable static buffer recording, reverting to normal tensor assignment."""
         RouterReplay.clear_global_static_buffers()
-
-    def reset(self) -> None:
-        """Reset the routing metadata state."""
-        pass

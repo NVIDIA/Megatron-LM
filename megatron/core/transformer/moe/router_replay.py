@@ -119,10 +119,6 @@ class RouterReplay:
         """Returns the recorded topk indices."""
         return self.recorded_topk_idx
 
-    def record_indices(self, topk_indices: torch.Tensor):
-        """Records the topk indices."""
-        self.recorded_topk_idx = topk_indices
-
     def clear_indices(self):
         """Clears the recorded and target topk indices."""
         self.recorded_topk_idx = None
