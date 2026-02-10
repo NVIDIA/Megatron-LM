@@ -2318,7 +2318,7 @@ class ParamAndGradBuffer:
                                 and not isinstance(m, TransformerEngineBaseModule)
                             ):
                                 reset_context_args["with_cuda_rng_tracker"] = True
-                            with ResetParametersContext(**reset_context_args):
+                            with ResetParametersContext(module=m, **reset_context_args):
                                 # Initialize original model meta parameters.
                                 if hasattr(m, "reset_parameters"):
                                     m.reset_parameters()
@@ -3975,7 +3975,6 @@ def override_sharded_param_methods_with_safety_checks(params, all_gather_pipelin
             return override_sharded_param_cpu_function
 
         setattr(p, "cpu", override_sharded_param_cpu_function_closure(p, cpu_function))
-
 
 
 def to_local_if_dtensor(tensor):

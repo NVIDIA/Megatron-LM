@@ -330,16 +330,17 @@ class FullyShardedDataParallel(_BaseDataParallel):
             if not isinstance(module, TransformerEngineBaseModule):
                 continue
 
-            if self.config.fp8:
+            layer_no = module.layer_number if hasattr(module, "layer_number") else -1
+            if module.config.fp8:
                 quantization_context = get_fp8_context(
                     module.config,
-                    module.layer_number - 1,
+                    layer_no,
                     is_init=True,
                 )
-            elif self.config.fp4:
+            elif module.config.fp4:
                 quantization_context = get_fp4_context(
                     module.config,
-                    module.layer_number - 1,
+                    layer_no,
                     is_init=True,
                 )
             else:
