@@ -175,7 +175,7 @@ class MegatronCheckpointSaverLLaVA(MegatronCheckpointSaverBase):
             self.model_provider = model_provider
             self.margs.model_type = ModelType.encoder_or_decoder
         elif self.md.model_type == 'BERT':
-            from pretrain_bert import model_provider
+            from examples.classes.pretrain_bert import model_provider
             self.margs.model_type = ModelType.encoder_or_decoder
             self.model_provider = model_provider
         else:

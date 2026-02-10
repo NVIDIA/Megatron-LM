@@ -37,7 +37,7 @@ Train LLaMA-3 8B model with FP8 mixed precision on 8 GPUs:
 For training with your own data:
 
 ```bash
-torchrun --nproc_per_node=8 pretrain_gpt.py \
+torchrun --nproc_per_node=8 examples/classes/pretrain_gpt.py \
     --tensor-model-parallel-size 1 \
     --pipeline-model-parallel-size 1 \
     --num-layers 32 \
@@ -69,7 +69,7 @@ torchrun --nproc_per_node=8 pretrain_gpt.py \
 Train a GPT-3 style model:
 
 ```bash
-torchrun --nproc_per_node=8 pretrain_gpt.py \
+torchrun --nproc_per_node=8 examples/classes/pretrain_gpt.py \
     --tensor-model-parallel-size 2 \
     --pipeline-model-parallel-size 2 \
     --num-layers 24 \

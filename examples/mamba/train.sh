@@ -102,4 +102,4 @@ options=" \
        --no-create-attention-mask-in-dataloader \
        --tensorboard-dir ${TENSORBOARD_DIR}"
 
-torchrun --nproc_per_node 8 ../../pretrain_mamba.py ${options}
+torchrun --nproc_per_node 8 ../../examples/classes/pretrain_mamba.py ${options}

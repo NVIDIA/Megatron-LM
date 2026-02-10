@@ -9,7 +9,11 @@ import json
 
 # Suppress warnings on all ranks but rank 0.
 import os
+import sys
 import warnings
+
+# Add the repo root to the path so we can import top-level modules (mamba_builders, model_provider).
+sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), os.path.pardir, os.path.pardir)))
 rank = int(os.environ.get('RANK', 0))
 if rank != 0:
     warnings.filterwarnings("ignore", category=UserWarning)

@@ -154,7 +154,7 @@ The tokenizer system integrates seamlessly with Megatron-LM training:
 
 ```bash
 # Null tokenizer for testing
-torchrun --nproc_per_node=8 pretrain_gpt.py \
+torchrun --nproc_per_node=8 examples/classes/pretrain_gpt.py \
     --tokenizer-type NullTokenizer \
     --vocab-size 131072 \
     ...
@@ -162,7 +162,7 @@ torchrun --nproc_per_node=8 pretrain_gpt.py \
 
 ```bash
 # HuggingFace tokenizer with metadata
-torchrun --nproc_per_node=8 pretrain_gpt.py \
+torchrun --nproc_per_node=8 examples/classes/pretrain_gpt.py \
     --tokenizer-type HuggingFaceTokenizer \
     --tokenizer-model meta-llama/Meta-Llama-3-8B \
     --tokenizer-metadata /path/to/metadata.json \

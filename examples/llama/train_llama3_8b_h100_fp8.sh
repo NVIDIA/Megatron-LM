@@ -27,7 +27,7 @@ NODE_RANK=${NODE_RANK:-0}
 WORLD_SIZE=$(($GPUS_PER_NODE*$NUM_NODES))
 
 # Path to the pretrain_gpt.py script, assuming this script is run from the root of the Megatron-LM repository
-PRETRAIN_SCRIPT_PATH="pretrain_gpt.py"
+PRETRAIN_SCRIPT_PATH="examples/classes/pretrain_gpt.py"
 
 # Fixed model and training parameters
 TP_SIZE=1     
@@ -178,7 +178,7 @@ EVAL_AND_LOGGING_ARGS=(
 # Ensure pretrain_gpt.py is found
 if [ ! -f "$PRETRAIN_SCRIPT_PATH" ]; then
     echo "Error: pretrain_gpt.py not found at $PRETRAIN_SCRIPT_PATH"
-    echo "Please ensure you are running this script from the root of the Megatron-LM repository, and pretrain_gpt.py is present."
+    echo "Please ensure you are running this script from the root of the Megatron-LM repository, and examples/classes/pretrain_gpt.py is present."
     exit 1
 fi
 

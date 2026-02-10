@@ -21,7 +21,7 @@ from megatron.inference.text_generation.forward_step import ForwardStep
 from megatron.training import get_args, get_model, print_rank_0
 from megatron.training.checkpointing import load_checkpoint
 from megatron.training.initialize import initialize_megatron
-from pretrain_vlm import model_provider
+from examples.classes.pretrain_llava import model_provider
 
 
 def add_text_generation_args(parser):

@@ -70,9 +70,9 @@ fi
 export HF_TOKEN=${HF_TOKEN}
 
 if [[ ${MODEL_ARGS} == *"MambaModel"* ]]; then
-    PRETRAIN_EXE=${SCRIPT_DIR}/../../../pretrain_mamba.py
+    PRETRAIN_EXE=${SCRIPT_DIR}/../../../examples/classes/pretrain_mamba.py
 else
-    PRETRAIN_EXE=${SCRIPT_DIR}/../../../pretrain_gpt.py
+    PRETRAIN_EXE=${SCRIPT_DIR}/../../../examples/classes/pretrain_gpt.py
 fi
 
 ${LAUNCH_SCRIPT} ${PRETRAIN_EXE} \

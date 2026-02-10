@@ -123,7 +123,7 @@ def _load_checkpoint(queue, args):
         model_provider = partial(common_model_provider, gpt_builder)
         margs.model_type = ModelType.encoder_or_decoder
     elif args.model_type == 'BERT':
-        from pretrain_bert import model_provider
+        from examples.classes.pretrain_bert import model_provider
         margs.model_type = ModelType.encoder_or_decoder
     else:
         raise Exception(f'unrecognized model type: {args.model_type}')

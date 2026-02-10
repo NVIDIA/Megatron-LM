@@ -2,6 +2,12 @@
 
 """Pretrain VIT"""
 
+import os
+import sys
+
+# Add the repo root to the path so we can import top-level modules (tasks).
+sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), os.path.pardir, os.path.pardir)))
+
 import torch
 import torch.nn.functional as F
 from functools import partial

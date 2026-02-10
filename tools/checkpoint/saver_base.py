@@ -26,7 +26,7 @@ class MegatronCheckpointSaverBase:
         self.md = None               # Metadata received from the loader
 
         self.models = None
-        self.model_provider = None   # model_provider function either from pretrain_gpt or pretrain_bert
+        self.model_provider = None   # model_provider function either from model_provider or examples/classes/pretrain_bert
 
     def _maybe_parse_additional_megatron_args(self, margs):
         """

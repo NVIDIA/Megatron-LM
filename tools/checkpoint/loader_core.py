@@ -60,7 +60,7 @@ class MegatronCheckpointLoaderLLM(MegatronCheckpointLoaderBase):
             self.model_provider = partial(model_provider, gpt_builder)
             return model_provider
         elif self.args.model_type == 'BERT':
-            from pretrain_bert import model_provider
+            from examples.classes.pretrain_bert import model_provider
             return model_provider
         else:
             raise Exception(f"Unrecognized model type: {self.args.model_type}")

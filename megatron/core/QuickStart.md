@@ -253,7 +253,7 @@ In this task, you create a sample GPT model split across tensors (Tensor model p
 
 ### Review Advanced Examples
 
-To review more advanced examples, explore [pretrain_gpt.py](https://github.com/NVIDIA/Megatron-LM/blob/main/pretrain_gpt.py). ``pretrain_gpt.py`` has more complex training loops and includes the following Megatron Core features:
+To review more advanced examples, explore [pretrain_gpt.py](https://github.com/NVIDIA/Megatron-LM/blob/main/examples/classes/pretrain_gpt.py). ``pretrain_gpt.py`` has more complex training loops and includes the following Megatron Core features:
 
 * pipeline parallel
 * context parallel

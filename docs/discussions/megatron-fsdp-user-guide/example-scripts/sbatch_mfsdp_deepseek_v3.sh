@@ -187,7 +187,7 @@ TRAINING_CMD="
 cd ${MEGATRON_PATH};
 git rev-parse HEAD;
 export PYTHONPATH=${MEGATRON_PATH}:${PYTHONPATH};
-${PROFILE_CMD} python ${MEGATRON_PATH}/pretrain_gpt.py ${PRETRAIN_ARGS[@]}"
+${PROFILE_CMD} python ${MEGATRON_PATH}/examples/classes/pretrain_gpt.py ${PRETRAIN_ARGS[@]}"
 
 # SLURM settings
 SLURM_LOGS="${OUTPUT_PATH}/slurm_logs"

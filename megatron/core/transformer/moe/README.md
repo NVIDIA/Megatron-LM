@@ -674,7 +674,7 @@ LOGGING_ARGS=(
     --auto-detect-ckpt-format
 )
 
-torchrun ${DISTRIBUTED_ARGS[@]} pretrain_gpt.py \
+torchrun ${DISTRIBUTED_ARGS[@]} examples/classes/pretrain_gpt.py \
     ${MODEL_ARGS[@]} \
     ${MOE_ARGS[@]} \
     ${DATA_ARGS[@]} \

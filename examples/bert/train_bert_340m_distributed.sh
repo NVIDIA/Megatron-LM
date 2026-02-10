@@ -70,7 +70,7 @@ EVAL_AND_LOGGING_ARGS=(
     --tensorboard-dir $TENSORBOARD_LOGS_PATH 
 )
 
-torchrun ${DISTRIBUTED_ARGS[@]} pretrain_bert.py \
+torchrun ${DISTRIBUTED_ARGS[@]} examples/classes/pretrain_bert.py \
     ${BERT_MODEL_ARGS[@]} \
     ${TRAINING_ARGS[@]} \
     ${MODEL_PARALLEL_ARGS[@]} \

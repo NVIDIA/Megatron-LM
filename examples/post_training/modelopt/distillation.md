@@ -53,7 +53,7 @@ Without this configuration file, the default logits-only distillation with scale
 
 ### Training
 
-Distillation is triggered by calling `pretrain_gpt.py` or `pretrain_mamba.py` with the following arguments:
+Distillation is triggered by calling `examples/classes/pretrain_gpt.py` or `examples/classes/pretrain_mamba.py` with the following arguments:
 
 ```bash
 --export-kd-teacher-load <path-to-teacher-checkpoint>

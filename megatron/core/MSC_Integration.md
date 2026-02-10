@@ -103,7 +103,7 @@ To train with datasets stored in object storage, use an MSC URL with the `--data
 In addition, Megatron-LM requires the `--object-storage-cache-path` argument when reading from object storage. This path is used to cache the `.idx` index files associated with IndexedDataset, which are needed for efficient data access.
 
 ```bash
-python pretrain_gpt.py                                      \
+python examples/classes/pretrain_gpt.py                      \
     --object-storage-cache-path /path/to/object_store_cache \
     --data-cache-path /path/to/data_cache                   \
     --data-path msc://my-profile/datasets/text_document     \
@@ -117,8 +117,8 @@ python pretrain_gpt.py                                      \
 MSC can be used to save and load model checkpoints directly from object storage by specifying MSC URLs for the `--save` and `--load` arguments. This allows you to manage checkpoints in object storage.
 
 ```bash
-python pretrain_gpt.py                \
-  --save msc://my-profile/checkpoints \
+python examples/classes/pretrain_gpt.py \
+  --save msc://my-profile/checkpoints  \
   --load msc://my-profile/checkpoints \
   --save-interval 1000
 ```
@@ -130,7 +130,7 @@ python pretrain_gpt.py                \
 By default, MSC integration is automatically enabled when the `multi-storage-client` library is installed. MSC is also used for regular filesystem paths (like `/filesystem_mountpoint/path` in `--data-path`, `--save`, or `--load`) even when not using explicit MSC URLs. MSC functions as a very thin abstraction layer with negligible performance impact when used with regular paths, so there's typically no need to disable it. If you need to disable MSC, you can do so using the `--disable-msc` flag:
 
 ```bash
-python pretrain_gpt.py --disable-msc
+python examples/classes/pretrain_gpt.py --disable-msc
 ```
 
 ### Performance Considerations
@@ -146,7 +146,7 @@ Reading training datasets directly from object storage is typically slower than 
 To compensate for this latency, it is recommended to increase the number of data loading workers using the `--num-workers` argument in your training command:
 
 ```
-python pretrain_gpt.py --num-workers 8 ...
+python examples/classes/pretrain_gpt.py --num-workers 8 ...
 ```
 
 Increasing the number of workers allows more parallel reads from object storage, helping to mask I/O latency and maintain high GPU utilization during training.

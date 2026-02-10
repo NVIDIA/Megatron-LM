@@ -8,7 +8,7 @@ DATETIME=`date +'date_%y-%m-%d_time_%H-%M-%S'`
 mkdir -p ${THIS_DIR}/logs
 
 
-CMD="python -u ${MEGATRON_CODE_DIR}/pretrain_gpt.py ${MEGATRON_PARAMS}"
+CMD="python -u ${MEGATRON_CODE_DIR}/examples/classes/pretrain_gpt.py ${MEGATRON_PARAMS}"
 
 
 srun -l \

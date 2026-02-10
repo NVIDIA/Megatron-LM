@@ -19,7 +19,7 @@ Replicate the model across GPUs and split the batch.
 ### Standard Data Parallel (DDP)
 
 ```bash
-torchrun --nproc_per_node=8 pretrain_gpt.py \
+torchrun --nproc_per_node=8 examples/classes/pretrain_gpt.py \
     --data-parallel-sharding-strategy no_shard
 ```
 
@@ -137,7 +137,7 @@ Total GPUs = TP × PP × CP × EP × DP
 
 ```bash
 # TP=4, PP=4, CP=2, DP=2 => 4 × 4 × 2 × 2 = 64 GPUs
-torchrun --nproc_per_node=8 pretrain_gpt.py \
+torchrun --nproc_per_node=8 examples/classes/pretrain_gpt.py \
     --tensor-model-parallel-size 4 \
     --pipeline-model-parallel-size 4 \
     --context-parallel-size 2 \
