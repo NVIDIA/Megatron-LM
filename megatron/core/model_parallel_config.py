@@ -62,7 +62,7 @@ class ModelParallelConfig:
     can handle without overflowing the memory. Typically, a good starting point is to set this
     to maximum sequence length / context parallel size.
     This is used to calculate the number and length of sub-samples assigned to 
-    each rank when using sequence_packing.
+    each rank when sequence_packing_scheduler is not None.
     """
 
     hybrid_context_parallel: bool = False
@@ -75,12 +75,7 @@ class ModelParallelConfig:
     sequence_packing_scheduler: Optional[str] = None
     """
     Scheduler for sequence packing and hybrid context parallel.
-    default_sequence_packing: default sequence packing scheduler for sequence packing.
-    """
-
-    sequence_packing: bool = False
-    """
-    If true, enables sft sequence packing.
+    dp_balanced: DP-balanced scheduler for sequence packing.
     """
 
     expert_model_parallel_size: int = 1
