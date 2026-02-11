@@ -241,6 +241,8 @@ class LanguageModule(MegatronModule):
             weight.data.fill_(0)
             weight.shared = True
             weight.shared_embedding = True
+            # Keep optimizer grouping consistent for tied embedding/output copies.
+            weight.is_embedding_parameter = True
 
         # Parameters are shared between the word embeddings layers, and the
         # heads at the end of the model. In a pipelined setup with more than

@@ -224,6 +224,11 @@ class TestMuPLRScaling:
             embedding_param.is_embedding_parameter = True
             assert predicate_fn(embedding_param, 'decoder.layer.0.weight') is False
 
+            # Shared embedding copies on tied output stages should also use base LR.
+            shared_embedding_param = torch.nn.Parameter(torch.zeros(10, 10))
+            shared_embedding_param.shared_embedding = True
+            assert predicate_fn(shared_embedding_param, 'output_layer.weight') is False
+
             # Backward-compatible fallback for older modules without the attribute.
             assert predicate_fn(hidden_param, 'embedding.word_embeddings.weight') is False
 

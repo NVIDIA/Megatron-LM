@@ -156,9 +156,12 @@ def get_mup_config_overrides(
         name="mup_hidden_and_output",
         fn=lambda p, n: (
             not (
-                p.is_embedding_parameter
-                if hasattr(p, 'is_embedding_parameter')
-                else ('embedding' in n.lower())
+                getattr(p, 'shared_embedding', False)
+                or (
+                    p.is_embedding_parameter
+                    if hasattr(p, 'is_embedding_parameter')
+                    else ('embedding' in n.lower())
+                )
             )
         ),
     )
