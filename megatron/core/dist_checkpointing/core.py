@@ -6,7 +6,6 @@ import os
 
 from megatron.core.msc_utils import MultiStorageClientFeature
 
-
 CONFIG_FNAME = "metadata.json"
 COMMON_FNAME = "common.pt"
 
@@ -18,13 +17,13 @@ class CheckpointingException(Exception):
 
 
 def check_is_distributed_checkpoint(checkpoint_dir: str) -> bool:
-    """Checks if the checkpoint directory contains .metadata file.
+    """Checks if the checkpoint directory contains metadata and common files.
 
     Args:
-        checkpoint_dir: Path to the checkpoint directory to check
+        checkpoint_dir: Path to the checkpoint directory to check.
 
     Returns:
-        bool: True if .metadata file exists, indicating a distributed checkpoint.
+        bool: True if metadata.json and common.pt files exist, indicating a distributed checkpoint.
     """
     metadata_file = os.path.join(checkpoint_dir, CONFIG_FNAME)
     common_file = os.path.join(checkpoint_dir, COMMON_FNAME)
