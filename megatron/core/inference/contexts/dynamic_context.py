@@ -381,14 +381,17 @@ class DynamicInferenceContext(BaseInferenceContext):
         # (i.e., divergence in the scheduling behavior).
         if pp_size > 1:
             block_count_tensor = torch.tensor(
-                block_count, dtype=torch.int32, device=torch.cuda.current_device()
+                (block_count, paused_block_count),
+                dtype=torch.int32,
+                device=torch.cuda.current_device(),
             )
             torch.distributed.all_reduce(
                 block_count_tensor,
                 op=torch.distributed.ReduceOp.MIN,
                 group=self.pipeline_parallel_group,
             )
-            block_count = block_count_tensor.item()
+            block_count = block_count_tensor[0].item()
+            paused_block_count = block_count_tensor[1].item()
 
         self.block_allocator = BlockAllocator(
             context=self,

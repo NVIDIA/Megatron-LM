@@ -152,6 +152,13 @@ from megatron.core.parallel_state import (
 from megatron.core.inference.unified_memory import create_unified_mempool
 from megatron.core.resharding.refit import swap_model_weights
 
+try:
+    from torch_memory_saver import torch_memory_saver
+    torch_memory_saver.hook_mode = "torch"
+    HAVE_TORCH_MEMORY_SAVER = True
+except ImportError:
+    HAVE_TORCH_MEMORY_SAVER = False
+
 from megatron.core.pipeline_parallel import get_forward_backward_func
 from megatron.core.num_microbatches_calculator import (
     destroy_num_microbatches_calculator,
@@ -286,6 +293,62 @@ def _mamba_layer_flops(batch_size, seq_len, hidden_size, state_dim=16,
     return (
         (
             2
+def num_floating_point_operations(args, batch_size):
+    def calculate_layer_counts():
+        """Calculate the number of attention, Mamba, and MLP layers."""
+        if args.hybrid_override_pattern:
+            from megatron.core.ssm.mamba_hybrid_layer_allocation import parse_hybrid_pattern
+            # Parse unified pattern to separate main and MTP components
+            parsed = parse_hybrid_pattern(args.hybrid_override_pattern)
+            counts = {'M': 0, '*': 0, '-': 0, 'E': 0}
+            # Count main decoder layers
+            if parsed.main_pattern:
+                for layer_type in parsed.main_pattern:
+                    if layer_type in counts:
+                        counts[layer_type] += 1
+            # Count MTP layers (pattern repeated mtp_num_depths times)
+            if parsed.mtp_pattern and parsed.mtp_num_depths > 0:
+                for layer_type in parsed.mtp_pattern:
+                    if layer_type in counts:
+                        counts[layer_type] += parsed.mtp_num_depths
+            return counts['*'], counts['M'], counts['-'], counts['E']
+        else:
+            num_attn_layers = round(args.num_layers * args.hybrid_attention_ratio)
+            num_mlp_layers = round(args.num_layers * args.hybrid_mlp_ratio)
+            num_mamba_layers = args.num_layers - num_attn_layers - num_mlp_layers
+            num_moe_layers = 0
+            return num_attn_layers, num_mamba_layers, num_mlp_layers, num_moe_layers
+
+    def mlp_layer_flops(batch_size, seq_len, hidden_size, expansion=4.0, swiglu=False):
+        """Calculate FLOPs for an MLP layer."""
+        scale_factor = 3.0 / 2.0 if swiglu else 1.0
+        return 4 * expansion * scale_factor * batch_size * seq_len * hidden_size**2
+
+    def moe_layer_flops(batch_size, seq_len, hidden_size, moe_ffn_hidden_size,
+                        shared_expert_ffn_hidden_size, num_experts_routed_to,
+                        moe_latent_size=None, swiglu=False):
+        """Calculate FLOPs for an MoE layer."""
+        scale_factor = 3.0 / 2.0 if swiglu else 1.0
+        if moe_latent_size is None:
+            routed_flops = (4 * batch_size * seq_len * hidden_size *
+                            moe_ffn_hidden_size * num_experts_routed_to * scale_factor)
+        else:
+            # Routed experts run on moe_latent_size.
+            routed_flops = (4 * batch_size * seq_len * moe_latent_size *
+                            moe_ffn_hidden_size * num_experts_routed_to * scale_factor)
+            # Up proj and down proj.
+            routed_flops += (4 * batch_size * seq_len * hidden_size * moe_latent_size)
+        shared_flops = 4 * batch_size * seq_len * hidden_size * shared_expert_ffn_hidden_size * scale_factor
+        return routed_flops + shared_flops
+
+    def attn_layer_flops(
+        batch_size, seq_len, hidden_size, num_heads, gqa=True, gqa_groups=8, kv_channels=None
+    ):
+        """Calculate FLOPs for an attention layer."""
+        p = (kv_channels * num_heads / hidden_size) if kv_channels else 1
+        g = gqa_groups if gqa else num_heads
+        return (
+            4
             * batch_size
             * seq_len
             * hidden_size
@@ -393,6 +456,85 @@ def _transformer_flops(args, batch_size):
         if args.moe_shared_expert_intermediate_size is None
         else args.moe_shared_expert_intermediate_size
     )
+    def hybrid_flops(batch_size, seq_len, hidden_size,
+                     num_attn_layers, num_mamba_layers, num_mlp_layers, num_moe_layers,
+                     mamba_state_dim=128, mamba_head_dim=64,
+                     mamba_num_groups=8, mamba_num_heads=128,
+                     num_attn_heads=32, gqa=True,
+                     gqa_groups=8, kv_channels=None,
+                     mlp_expansion=4.0, swiglu=False,
+                     moe_latent_size=None,
+                     moe_ffn_hidden_size=2048, shared_expert_ffn_hidden_size=2048, num_experts_routed_to=1,
+                     vocab_size=256000, mtp_num_layers=0):
+        """Calculate total FLOPs for the hybrid model."""
+        flops_fwd = (
+                num_attn_layers * attn_layer_flops(batch_size, seq_len, hidden_size,
+                                                   num_attn_heads, gqa, gqa_groups, kv_channels) +
+                num_mlp_layers * mlp_layer_flops(batch_size, seq_len, hidden_size,
+                                                 mlp_expansion, swiglu) +
+                num_mamba_layers * mamba_layer_flops(batch_size, seq_len, hidden_size,
+                                                     mamba_state_dim, mamba_head_dim,
+                                                     mamba_num_groups, mamba_num_heads) +
+                num_moe_layers * moe_layer_flops(batch_size, seq_len, hidden_size, moe_ffn_hidden_size,
+                                                 shared_expert_ffn_hidden_size, num_experts_routed_to,
+                                                 moe_latent_size, swiglu) +
+                (2 * batch_size * seq_len * hidden_size * vocab_size * (1 + mtp_num_layers))  # logits computation
+        )
+        return flops_fwd * 3
+
+    def transformer_flops():
+        """Calculate FLOPs for a standard Transformer model."""
+        # TODO(helenn/dnarayanan): Refactor this to reuse the helper methods.
+        # Group Query Attention.
+        if not args.group_query_attention:
+            args.num_query_groups = args.num_attention_heads
+        # MoE.
+        if args.num_experts is None:
+            # Every Transformer MLP is dense.
+            num_dense_layers = args.num_layers
+            num_moe_layers = 0
+            num_experts_routed_to = 0
+            last_layer_is_moe = 0
+        else:
+            # Calculate number of dense and MoE Transformer MLPs.
+            if isinstance(args.moe_layer_freq, int):
+                moe_layer_pattern = [
+                    1 if (i % args.moe_layer_freq == 0) else 0 for i in range(args.num_layers)
+                ]
+            elif isinstance(args.moe_layer_freq, list):
+                moe_layer_pattern = args.moe_layer_freq
+            else:
+                raise RuntimeError("Illegal --moe-layer-freq argument provided!")
+            assert len(moe_layer_pattern) == args.num_layers, (
+                f"Invalid length of moe_layer_pattern: {len(moe_layer_pattern)}, "
+                f"expected {args.num_layers}, "
+                f"current moe layer pattern: {args.moe_layer_freq}"
+            )
+            num_moe_layers = sum(moe_layer_pattern)  # Number of 1s in `moe_layer_pattern`.
+            num_dense_layers = args.num_layers - num_moe_layers
+            num_experts_routed_to = args.moe_router_topk
+            last_layer_is_moe = moe_layer_pattern[-1]
+
+        if args.mtp_num_layers is not None:
+            mtp_num_layers = args.mtp_num_layers
+            num_moe_layers += last_layer_is_moe * mtp_num_layers
+            num_dense_layers += (1 - last_layer_is_moe) * mtp_num_layers
+            num_layers = args.num_layers + mtp_num_layers
+        else:
+            mtp_num_layers = 0
+            num_layers = args.num_layers
+
+        moe_ffn_hidden_size = (
+            args.moe_ffn_hidden_size
+            if args.moe_ffn_hidden_size is not None
+            else args.ffn_hidden_size
+        )
+        moe_latent_size = args.moe_latent_size
+        shared_expert_ffn_hidden_size = (
+            0
+            if args.moe_shared_expert_intermediate_size is None
+            else args.moe_shared_expert_intermediate_size
+        )
 
     # - 3x: Each GEMM in the model needs to be performed 3 times (forward pass,
     #       backward wgrad [weight gradient], backward dgrad [data gradient]).
@@ -576,6 +718,52 @@ def _transformer_flops(args, batch_size):
                 # Shared Experts.
                 + (shared_expert_ffn_hidden_size * ffn_expansion_factor)
                 * num_moe_layers
+                # MLP
+                forward_backward_expansion_factor
+                * fma_expansion_factor
+                * args.hidden_size
+                * (
+                    # dense layer (deepseek v2, v3 style)
+                    (args.ffn_hidden_size * ffn_expansion_factor)
+                    * num_dense_layers
+                    # routed experts
+                    + (
+                        (moe_ffn_hidden_size * num_experts_routed_to * ffn_expansion_factor)
+                        if moe_latent_size is None
+                        else (
+                            (
+                                moe_ffn_hidden_size
+                                * num_experts_routed_to
+                                * ffn_expansion_factor
+                                * moe_latent_size
+                                / args.hidden_size
+                            )  # Routed experts run on moe_latent_size.
+                            + 2 * moe_latent_size  # Up proj and down proj.
+                        )
+                    )
+                    * num_moe_layers
+                    # Shared Experts.
+                    + (shared_expert_ffn_hidden_size * ffn_expansion_factor)
+                    * num_moe_layers
+                )
+                # Self Attention
+                + self_attn_term
+                # MTP norms and proj
+                + forward_backward_expansion_factor
+                * fma_expansion_factor
+                * mtp_num_layers
+                * (
+                    # MTP eh norm + final nrom
+                    3 * args.hidden_size
+                    # MTH eh proj
+                    + 2 * args.hidden_size * args.hidden_size
+                )
+                # Logit.
+                + forward_backward_expansion_factor
+                * fma_expansion_factor
+                * args.hidden_size
+                * args.padded_vocab_size
+                * (mtp_num_layers + 1)  # MTP + final logit
             )
             # Self Attention
             + self_attn_term
@@ -608,6 +796,9 @@ def num_floating_point_operations(args, batch_size):
         # Calculate the number of each type of layer.
         num_attn_layers, num_mamba_layers, num_mlp_layers, num_moe_layers = _calculate_layer_counts(args)
 
+        mtp_num_layers = args.mtp_num_layers
+        if mtp_num_layers is None:
+            mtp_num_layers = 0
         # Compute hybrid model FLOPs.
         return _hybrid_flops(
             batch_size=batch_size,
@@ -634,6 +825,7 @@ def num_floating_point_operations(args, batch_size):
                                            else args.moe_shared_expert_intermediate_size),
             num_experts_routed_to=args.moe_router_topk,
             vocab_size=args.padded_vocab_size,
+            mtp_num_layers=mtp_num_layers,
         )
     else:
         # Compute standard Transformer model FLOPs.
@@ -769,8 +961,14 @@ def pretrain(
             to it. It is used for programs to add their own arguments.
         args_defaults: a dictionary from argument-name to argument-value. It
             to set already parse arguments.
-        get_embedding_ranks (TODO):
-        get_position_embedding_ranks (TODO):
+        get_embedding_ranks: a function that takes a list of ranks for a pipeline
+            group and returns those ranks that should have word embeddings.
+            For most models, these are the first and last pipeline stages.
+            If None, defaults to returning the first and last pipeline stages.
+        get_position_embedding_ranks: a function that takes a list of ranks for
+            a pipeline group and returns those ranks that should have position
+            embeddings. For most models, this is only the first pipeline stage.
+            If None, defaults to returning only the first pipeline stage.
         non_loss_data_func (callable): A custom function to call during evaluation.
             It can run e.g. benchmarks.
         store: an optional instance of torch.distributed.Store, to be used by
@@ -981,15 +1179,30 @@ def pretrain(
 
             # Optionally allocate the RL inference model weights from a unified virtual memory (UVM)
             # mempool so we can prefetch weights to CPU when idle while keeping CUDA-graph-safe pointers.
+            # Alternatively, use torch_memory_saver to offload the weights to CPU when idle.
             uvm_mempool = None
             uvm_level = args.rl_inference_model_unified_memory_level
             if uvm_level and uvm_level > 0:
                 uvm_mempool = create_unified_mempool()
 
-            mempool_ctx = (
-                torch.cuda.use_mem_pool(uvm_mempool) if uvm_mempool is not None else nullcontext()
+            # Determine which context manager to use for model allocation
+            # Use torch_memory_saver if offloading is requested but UVM is not enabled
+            use_torch_saver_for_inference_model = (
+                args.rl_offload_inference_model_weights_when_idle
+                and uvm_level == 0
+                and HAVE_TORCH_MEMORY_SAVER
             )
-            with mempool_ctx:
+            if use_torch_saver_for_inference_model:
+                # Use torch_memory_saver for offloading - allocate within a tagged region
+                model_alloc_ctx = torch_memory_saver.region(
+                    tag="rl_inference_model", enable_cpu_backup=True
+                )
+            elif uvm_mempool is not None:
+                model_alloc_ctx = torch.cuda.use_mem_pool(uvm_mempool)
+            else:
+                model_alloc_ctx = nullcontext()
+
+            with model_alloc_ctx:
                 inference_model = get_model(
                     model_provider,
                     model_type,
@@ -999,7 +1212,12 @@ def pretrain(
                 )
             inference_model[0].eval()
 
-
+        # Validate: offloading flag requires a separate inference model
+        if args.rl_offload_inference_model_weights_when_idle and inference_model is None:
+            raise ValueError(
+                "--rl-offload-inference-model-weights-when-idle requires a separate inference model. "
+                "This flag is only useful when doing refit since the weights are shared with the training model."
+            )
 
     # Data stuff.
     app_metrics['app_build_dataiters_start_time'] = one_logger_utils.get_timestamp_in_ms()
@@ -1098,6 +1316,7 @@ def pretrain(
         prefix = f'iteration {iteration} on validation set'
         if getattr(args, 'perform_rl_step', False):
             rl_eval_model = model
+            rl_training_model = None
             if inference_model is not None:
                 inf_core = unwrap_model(inference_model[0])
                 # If separate inference and training models, swap training weights
@@ -1105,11 +1324,14 @@ def pretrain(
                 rl_utils._maybe_prefetch_separate_inference_model_weights(inf_core, to_cpu=False)
                 swap_model_weights(model, inference_model, args.refit_method)
                 rl_eval_model = inference_model
+                rl_training_model = model
             rl_utils.evaluate_and_print_results_rl(
                 valid_data_iterator,
                 rl_eval_model,
                 optimizer,
-                iteration, write_to_tensorboard=not args.skip_train
+                iteration,
+                write_to_tensorboard=not args.skip_train,
+                training_model=rl_training_model,
             )
         else:
             evaluate_and_print_results(
@@ -2958,6 +3180,7 @@ def train(
             timers('eval-time', log_level=0).start(barrier=True)
             if getattr(args, 'perform_rl_step', False):
                 rl_eval_model = model
+                rl_training_model = None
                 # If separate inference and training models, swap training weights
                 # back to the inference model for RL evaluation.
                 if inference_model is not None:
@@ -2967,12 +3190,14 @@ def train(
                     )
                     swap_model_weights(model, inference_model, args.refit_method)
                     rl_eval_model = inference_model
+                    rl_training_model = model
                 rl_utils.evaluate_and_print_results_rl(
                     valid_data_iterator,
                     rl_eval_model,
                     optimizer,
                     iteration,
                     write_to_tensorboard=True,
+                    training_model=rl_training_model,
                 )
             else:
                 evaluate_and_print_results(prefix, forward_step_func,
@@ -3104,6 +3329,17 @@ def evaluate(
     if args.cuda_graph_impl == "local" and CudaGraphScope.full_iteration in args.cuda_graph_scope:
         forward_backward_func = FullCudaGraphWrapper(forward_backward_func, cuda_graph_warmup_steps=args.cuda_graph_warmup_steps)
 
+    if has_nvidia_modelopt:
+        # [ModelOpt]: Pipeline-parallel Distillation stacks student and teacher tensors
+        adjust_tensor_shapes_fn = get_tensor_shapes_adjust_fn_for_distillation(
+            model,
+            seq_length=args.seq_length,
+            micro_batch_size=args.micro_batch_size,
+            decoder_seq_length=args.decoder_seq_length,
+        )
+    else:
+        adjust_tensor_shapes_fn = None
+
     if eval_iters is None:
         eval_iters = args.eval_iters
 
@@ -3128,6 +3364,7 @@ def evaluate(
                 micro_batch_size=args.micro_batch_size,
                 decoder_seq_length=args.decoder_seq_length,
                 forward_only=True,
+                adjust_tensor_shapes_fn=adjust_tensor_shapes_fn,
             )
             ft_integration.on_eval_step_end()
             config.timers = get_timers()

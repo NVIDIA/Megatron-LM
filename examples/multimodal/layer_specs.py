@@ -77,7 +77,7 @@ def get_layer_spec(is_vit, normalization) -> ModuleSpec:
     return ModuleSpec(
         module=TransformerLayer,
         submodules=TransformerLayerSubmodules(
-            input_layernorm=norm,
+            input_layernorm=not_none(norm),
             self_attention=ModuleSpec(
                 module=SelfAttention,
                 params={"attn_mask_type": attn_mask_type},
@@ -90,7 +90,7 @@ def get_layer_spec(is_vit, normalization) -> ModuleSpec:
                 ),
             ),
             self_attn_bda=get_bias_dropout_add,
-            pre_mlp_layernorm=norm,
+            pre_mlp_layernorm=not_none(norm),
             mlp=mlp,
             mlp_bda=get_bias_dropout_add,
         ),
@@ -175,8 +175,8 @@ def get_mamba_layer_spec_te(padding=False) -> ModuleSpec:
                     mlp=ModuleSpec(
                         module=MLP,
                         submodules=MLPSubmodules(
-                            linear_fc1=TELayerNormColumnParallelLinear,
-                            linear_fc2=TERowParallelLinear,
+                            linear_fc1=not_none(TELayerNormColumnParallelLinear),
+                            linear_fc2=not_none(TERowParallelLinear),
                         ),
                     ),
                     mlp_bda=get_bias_dropout_add,
@@ -191,8 +191,8 @@ def get_mlp_module_spec(use_te: bool = True) -> ModuleSpec:
     return ModuleSpec(
         module=MLP,
         submodules=MLPSubmodules(
-            linear_fc1=TEColumnParallelLinear if use_te else ColumnParallelLinear,
-            linear_fc2=TERowParallelLinear if use_te else RowParallelLinear,
+            linear_fc1=not_none(TEColumnParallelLinear) if use_te else ColumnParallelLinear,
+            linear_fc2=not_none(TERowParallelLinear) if use_te else RowParallelLinear,
         ),
     )
 
@@ -201,6 +201,7 @@ def get_norm_mlp_module_spec_te() -> ModuleSpec:
     return ModuleSpec(
         module=MLP,
         submodules=MLPSubmodules(
-            linear_fc1=TELayerNormColumnParallelLinear, linear_fc2=TERowParallelLinear
+            linear_fc1=not_none(TELayerNormColumnParallelLinear),
+            linear_fc2=not_none(TERowParallelLinear),
         ),
     )
