@@ -13,6 +13,7 @@ from megatron.core.inference.communication.torch_symm_triton import (
     multimem_all_gather,
     multimem_reduce_scatter,
 )
+from megatron.core.inference.quantization.utils import quantize_to_mxfp8
 from megatron.core.model_parallel_config import ModelParallelConfig
 from megatron.core.parallel_state import get_global_symmetric_memory_buffer
 from megatron.core.transformer.transformer_config import TransformerConfig
@@ -29,6 +30,16 @@ try:
     HAVE_TE = True
 except ImportError:
     HAVE_TE = False
+
+# Attempt to import scaled_mm and ScalingType for MXFP8 support
+try:
+    from torch.nn.functional import ScalingType, SwizzleType, scaled_mm
+
+    HAVE_SCALED_MM = True
+except ImportError:
+    HAVE_SCALED_MM = False
+    ScalingType = None
+    SwizzleType = None
 
 
 def _te_rms_norm_kernel(x: torch.Tensor, weight: torch.Tensor, eps: float):
@@ -156,7 +167,54 @@ class InferenceLayerNormColumnParallelLinear(TELayerNormColumnParallelLinear):
             x = _te_rms_norm_kernel(x=x, weight=self.layer_norm_weight, eps=self.eps)
             x = self._all_gather(x, symm_mem_buffer)
 
-        x = torch.matmul(x, self.weight.t())
+        # Check for MXFP8 execution
+        if self.config.fp8_recipe == "mxfp8" and HAVE_SCALED_MM:
+            # Quantize activations (BF16 -> MXFP8)
+            # x is [M, K]
+            x_fp8, x_scale = quantize_to_mxfp8(x)
+
+            # Prepare weights (Assumed to be in MXFP8)
+            # self.weight is data (E4M3FN), self.weight_scale is scale (E8M0FNU)
+            # Weights are typically [N, K] or [K, N].
+            # scaled_mm expects:
+            #   A: [M, K]
+            #   B: [N, K] (t() is handled via transposed arg or logic below)
+            #   scale_a: [M, K/32]
+            #   scale_b: [N, K/32]
+
+            # Assume self.weight_scale exists alongside self.weight
+            assert hasattr(self, "weight_scale"), "Missing weight_scale for MXFP8 inference"
+            weight_fp8 = self.weight
+            weight_scale = self.weight_scale
+
+            # Swizzling configuration
+            # Weights are usually pre-swizzled for inference on Hopper
+            swizzle_a = SwizzleType.NO_SWIZZLE
+            swizzle_b = (
+                SwizzleType.SWIZZLE_32_4_4
+                if torch.cuda.get_device_properties(x.device).major >= 9
+                else SwizzleType.NO_SWIZZLE
+            )
+
+            # Perform Scaled MM
+            # x: [M, K], weight.t(): [K, N] -> [M, N] output
+            # scaled_mm arg 'b' is expected to be [N, K] (conceptually transposed)
+            # if we pass it directly?
+            # torch.nn.functional.scaled_mm(a, b, ...) performs a @ b.t()
+            x = scaled_mm(
+                x_fp8,
+                weight_fp8,
+                scale_a=x_scale,
+                scale_b=weight_scale,
+                scale_recipe_a=ScalingType.BlockWise1x32,
+                scale_recipe_b=ScalingType.BlockWise1x32,
+                swizzle_a=swizzle_a,
+                swizzle_b=swizzle_b,
+                out_dtype=x.dtype,  # Output in BF16
+                use_fast_accum=False,
+            )
+        else:
+            x = torch.matmul(x, self.weight.t())
 
         return x, None
 
@@ -218,7 +276,7 @@ class InferenceRowParallelLinear(TERowParallelLinear):
         """
         # 1. check if bf16
         is_bf16 = x.dtype == torch.bfloat16
-        # 2. check if hopper
+        # 2. check if hopper or newer
         is_hopper_or_newer = torch.cuda.get_device_properties(x.device).major >= 9
         # 3. attempt to ask for symmetric memory
         symm_mem_buffer_dims = list(x.size())
@@ -230,10 +288,45 @@ class InferenceRowParallelLinear(TERowParallelLinear):
         can_use_custom_nvls_collectives = (
             is_bf16 and is_hopper_or_newer and has_enough_symmetric_memory
         )
+
+        # Check for MXFP8
+        use_mxfp8 = self.config.fp8_recipe == "mxfp8" and HAVE_SCALED_MM
+
         if can_use_custom_nvls_collectives:
             # Write output of matmul directly onto the symmetric memory buffer
-            torch.matmul(x, self.weight.t(), out=symm_mem_buffer["tensor"])
-            x = symm_mem_buffer["tensor"]
+
+            if use_mxfp8:
+                # MXFP8 Scaled GEMM
+                x_fp8, x_scale = quantize_to_mxfp8(x)
+                assert hasattr(self, "weight_scale"), "Missing weight_scale for MXFP8 inference"
+
+                # Setup Swizzle
+                swizzle_a = SwizzleType.NO_SWIZZLE
+                swizzle_b = (
+                    SwizzleType.SWIZZLE_32_4_4 if is_hopper_or_newer else SwizzleType.NO_SWIZZLE
+                )
+
+                # Note: scaled_mm output can be directed to out tensor
+                # scaled_mm performs (x @ weight.T)
+                scaled_mm(
+                    x_fp8,
+                    self.weight,
+                    scale_a=x_scale,
+                    scale_b=self.weight_scale,
+                    scale_recipe_a=ScalingType.BlockWise1x32,
+                    scale_recipe_b=ScalingType.BlockWise1x32,
+                    swizzle_a=swizzle_a,
+                    swizzle_b=swizzle_b,
+                    out_dtype=x.dtype,
+                    use_fast_accum=False,
+                    out=symm_mem_buffer["tensor"],  # Write directly to symm mem
+                )
+                x = symm_mem_buffer["tensor"]
+            else:
+                # Standard GEMM
+                torch.matmul(x, self.weight.t(), out=symm_mem_buffer["tensor"])
+                x = symm_mem_buffer["tensor"]
+
             # perform nvls reduce-scatter
             if self.next_layer_norm_weights is None:
                 output_dims = list(x.size())
@@ -263,7 +356,27 @@ class InferenceRowParallelLinear(TERowParallelLinear):
                 return residual
         else:
             # revert to torch dist (NCCL) reduce-scatter
-            x = torch.matmul(x, self.weight.t())
+            if use_mxfp8:
+                x_fp8, x_scale = quantize_to_mxfp8(x)
+                assert hasattr(self, "weight_scale"), "Missing weight_scale for MXFP8 inference"
+                swizzle_b = (
+                    SwizzleType.SWIZZLE_32_4_4 if is_hopper_or_newer else SwizzleType.NO_SWIZZLE
+                )
+                x = scaled_mm(
+                    x_fp8,
+                    self.weight,
+                    scale_a=x_scale,
+                    scale_b=self.weight_scale,
+                    scale_recipe_a=ScalingType.BlockWise1x32,
+                    scale_recipe_b=ScalingType.BlockWise1x32,
+                    swizzle_a=SwizzleType.NO_SWIZZLE,
+                    swizzle_b=swizzle_b,
+                    out_dtype=x.dtype,
+                    use_fast_accum=False,
+                )
+            else:
+                x = torch.matmul(x, self.weight.t())
+
             x, _ = reduce_scatter_along_first_dim(x, tp_group=self.tp_group)
         return x
 
@@ -287,7 +400,28 @@ class InferenceRowParallelLinear(TERowParallelLinear):
         Forward pass.
         """
         if self.tp_size == 1:
-            x = torch.matmul(x, self.weight.t())
+            if self.config.fp8_recipe == "mxfp8" and HAVE_SCALED_MM:
+                x_fp8, x_scale = quantize_to_mxfp8(x)
+                assert hasattr(self, "weight_scale"), "Missing weight_scale for MXFP8 inference"
+                swizzle_b = (
+                    SwizzleType.SWIZZLE_32_4_4
+                    if torch.cuda.get_device_properties(x.device).major >= 9
+                    else SwizzleType.NO_SWIZZLE
+                )
+                x = scaled_mm(
+                    x_fp8,
+                    self.weight,
+                    scale_a=x_scale,
+                    scale_b=self.weight_scale,
+                    scale_recipe_a=ScalingType.BlockWise1x32,
+                    scale_recipe_b=ScalingType.BlockWise1x32,
+                    swizzle_a=SwizzleType.NO_SWIZZLE,
+                    swizzle_b=swizzle_b,
+                    out_dtype=x.dtype,
+                    use_fast_accum=False,
+                )
+            else:
+                x = torch.matmul(x, self.weight.t())
             return x, None
         else:
             x = self._matmul_reduce_scatter(x)
