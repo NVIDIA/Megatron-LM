@@ -365,8 +365,8 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
 
                 # gen dist meta
                 param_world_indexes = param_gbuf_ranges["world_indexes"]
-                tp_split_dim = -1 if getattr(model_param, 'tensor_model_parallel', False) else \
-                    getattr(model_param, 'partition_dim')
+                tp_split_dim = getattr(model_param, 'partition_dim') if getattr(model_param, 'tensor_model_parallel', False) else \
+                    -1
                 dist_meta = MuonDistMeta(gbuf_index, bucket_index, model_param.shape, param_world_indexes, tp_split_dim)
 
                 # fp16, bf16 params.
@@ -429,6 +429,7 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
                     shard_fp32_from_float16_params_this_group.append(shard_main_param)
 
                     # add to dist metas
+                    # TODO(@boxiangw): currently it assumes last group is Muon
                     dist_metas[shard_main_param] = dist_meta
 
                 # fp32 params.
