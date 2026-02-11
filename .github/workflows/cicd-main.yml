@@ -644,6 +644,34 @@ jobs:
             .coverage
           include-hidden-files: true
 
+  merge-queue-notification:
+    runs-on: ubuntu-latest
+    if: github.event_name == 'merge_group'
+    permissions:
+      pull-requests: write
+    steps:
+      - name: Extract PR number from merge group
+        id: get-pr-number
+        run: |
+          # Extract PR number from merge group head_ref (format: refs/heads/gh-readonly-queue/main/pr-<number>-<sha>)
+          PR_NUMBER=$(echo "${{ github.event.merge_group.head_ref }}" | sed -n 's/.*\/pr-\([0-9]*\)-.*/\1/p')
+          echo "pr_number=$PR_NUMBER" >> $GITHUB_OUTPUT
+
+      - name: Comment on PR with action run URL
+        uses: actions/github-script@v7
+        with:
+          github-token: ${{ secrets.PAT }}
+          script: |
+            const prNumber = ${{ steps.get-pr-number.outputs.pr_number }};
+            const runUrl = `https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}`;
+
+            await github.rest.issues.createComment({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: prNumber,
+              body: `🔄 Merge queue validation started!\n\nYou can track the progress here: ${runUrl}`
+            });
+
   cleanup-taint-node:
     runs-on: ${{ needs.is-not-external-contributor.outputs.selected_runner }}
     needs:
