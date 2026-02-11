@@ -24,6 +24,22 @@ class HLModelConfig:
        If None, the default backend will be used.
     """
 
+    virtual_pipeline_model_parallel_size: int = 1
+    """Interleaved pipeline parallelism is used to improve performance by reducing the pipeline
+       bubble.  Considers a transformer block as a list of smaller transformer (virtual) blocks.
+       The number of virtual blocks per pipeline model parallel rank is the virtual model parallel
+       size.  See Efficient Large-Scale Language Model Training on GPU Clusters Using Megatron-LM:
+       arxiv.org/pdf/2104.04473.pdf for more details.
+
+       For example:
+       - When 4 pipeline stages are specified in the layer pattern (i.e., 3 `PipelineSplit`s are
+         present) and this is set to 1 (default), there will be 4 physical pipeline stages with no
+         virtual blocks.
+       - When 4 pipeline stages are specified in the layer pattern (i.e., 3 `PipelineSplit`s are
+         present) and this is set to 2, there will be 4 physical pipeline stages with 2 virtual
+         blocks in each physical stage, resulting in 8 total pipeline stages.
+    """
+
     ###################
     # Optimizations
     ###################
