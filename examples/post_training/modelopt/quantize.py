@@ -33,6 +33,7 @@ except ImportError:
 
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "../../../")))
 
+from megatron.core.utils import get_batch_on_this_cp_rank
 from megatron.post_training.arguments import add_modelopt_args
 from megatron.post_training.checkpointing import load_modelopt_checkpoint
 from megatron.post_training.generate import simple_generate
@@ -314,7 +315,7 @@ def get_calib_dataloader(
         print_rank_0(f"Sampling Strategy: {'Random Index' if use_random_offset else 'From Beginning'}")
 
         # Tokenize all texts at once and move to device
-        tokens = tokenizer(all_texts, return_tensors="pt", padding=True)
+        tokens = tokenizer(all_texts, return_tensors="pt", padding="max_length", max_length=max_sequence_length)
         all_input_ids = tokens.input_ids.cuda()
         return [{"input_ids": all_input_ids[i:i+batch_size]} for i in range(0, len(all_input_ids), batch_size)]
     else:
@@ -398,6 +399,7 @@ if __name__ == "__main__":
             batch_size=args.calib_batch_size,
         )
         for sample in tqdm(dataloader, disable=torch.distributed.get_rank()):
+            sample = get_batch_on_this_cp_rank(sample)
             simple_generate(model, sample["input_ids"], osl=1, calibration_mode=True)
 
     unwrapped_model = unwrap_model(model)[0]
