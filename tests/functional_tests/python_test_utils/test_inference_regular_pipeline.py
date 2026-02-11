@@ -172,7 +172,7 @@ def test_inference_pipeline(
                 f"\nCurrent (truncated to {min_len} chars): {generated_text_current[:min_len]}"
             )
 
-        if "routing_indices" in groundtruth_results:
+        if "routing_indices" in groundtruth_results and "routing_indices" in metrics:
             at_least_one_test_loop = True
             routing_indices_groundtruth = groundtruth_results["routing_indices"]
             routing_indices_current = current_results["routing_indices"]
