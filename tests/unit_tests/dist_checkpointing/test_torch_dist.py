@@ -2,7 +2,6 @@
 
 """Tests for PyTorch DCP based checkpoint format. """
 
-import pickle
 from copy import deepcopy
 from dataclasses import fields
 
@@ -50,8 +49,7 @@ class TestCachedMetadata:
             save(sharded_state_dict_non_cached, ckpt_dir, async_sharded_save=False)
             loaded_non_cached = load(sharded_state_dict_non_cached, ckpt_dir)
             md_path = ckpt_dir / '.metadata'
-            with md_path.open('rb') as f:
-                md_non_cached = pickle.load(f)
+            md_non_cached = torch.load(md_path, weights_only=False)
 
         save_strategy = deepcopy(get_default_save_sharded_strategy())
         save_strategy.use_cached_ckpt_structure = True
@@ -72,8 +70,7 @@ class TestCachedMetadata:
         loaded_cached = load(sharded_state_dict_cached, ckpt_dir.__enter__())
         md_path = ckpt_dir.__enter__() / '.metadata'
 
-        with md_path.open('rb') as f:
-            md_cached = pickle.load(f)
+        md_cached = torch.load(md_path, weights_only=False)
 
         # Check loaded state dict
         diffs = diff(loaded_non_cached, loaded_cached)
