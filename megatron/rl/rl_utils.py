@@ -1061,7 +1061,7 @@ def logprobs_forward_step(data_iterator, model, is_correction, packing_context=N
     return logprobs
 
 
-def _compute_logprobs_batch(
+def compute_logprobs_batch(
     model,
     data_loader,
     forward_backward_func,
@@ -1073,6 +1073,7 @@ def _compute_logprobs_batch(
     dtype,
     pp_group,
     is_correction,
+    collect_non_loss_data=False,
 ):
     """Compute logprobs for all batches in the data loader."""
     logprobs_list = []
@@ -1088,6 +1089,7 @@ def _compute_logprobs_batch(
             decoder_seq_length=decoder_seq_length,
             forward_only=True,
             adjust_tensor_shapes_fn=None,
+            collect_non_loss_data=collect_non_loss_data,
         )
         if is_pp_last_stage(pp_group):
             logprobs_list.append(output_tensor[0].detach())
@@ -1249,7 +1251,7 @@ def prepare_data_for_update(
             pp_group = pg_collection.pp
 
             with torch.no_grad(), nvtx_range("compute_old_logprobs", time=True):
-                old_logprobs = _compute_logprobs_batch(
+                old_logprobs = compute_logprobs_batch(
                     model=model,
                     data_loader=data_loader,
                     forward_backward_func=forward_backward_func,
@@ -1269,7 +1271,7 @@ def prepare_data_for_update(
                     k: (v.cpu() if v is not None else v) for k, v in model.state_dict().items()
                 }
                 model.load_state_dict(ref_state_dict)
-                ref_logprobs = _compute_logprobs_batch(
+                ref_logprobs = compute_logprobs_batch(
                     model=model,
                     data_loader=data_loader,
                     forward_backward_func=forward_backward_func,
