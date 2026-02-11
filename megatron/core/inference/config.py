@@ -164,6 +164,9 @@ class InferenceConfig:
     enable_prefix_caching: bool = True
     """Whether to enable prefix caching for KV cache block sharing."""
 
+    block_evict_lru: bool = False
+    """Use LRU eviction for prefix caching blocks. Only applies when enable_prefix_caching is True."""
+
     # =================================
     # Logging config
     # =================================

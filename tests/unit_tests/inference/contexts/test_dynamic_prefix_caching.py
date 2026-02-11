@@ -40,8 +40,11 @@ class PrefixCachingTestBase:
 
     def _ctx(self, *, buffer_size_gb=0.1, block_size_tokens=32,
              max_sequence_length=512, rounder=64, enable_prefix_caching=True,
-             max_tokens=None):
-        """Create a DynamicInferenceContext with sensible test defaults."""
+             max_tokens=None, block_evict_lru=True):
+        """Create a DynamicInferenceContext with sensible test defaults.
+
+        Note: block_evict_lru defaults to True so existing tests use LRU behavior.
+        """
         DynamicInferenceContext.ROUNDER = rounder
         DynamicInferenceContext.TOKEN_ROUNDER = rounder
         DynamicInferenceContext.REQUEST_ROUNDER = rounder
@@ -62,6 +65,7 @@ class PrefixCachingTestBase:
             use_flashinfer_fused_rope=None,
             unified_memory_level=0,
             enable_prefix_caching=enable_prefix_caching,
+            block_evict_lru=block_evict_lru,
         )
         return DynamicInferenceContext(
             model_config=transformer_config, inference_config=inference_config,
@@ -273,7 +277,7 @@ class TestPrefixSharing(PrefixCachingTestBase):
 
 
 # =========================================================================
-# Class 3: TestRefCountLifecycle (3 tests)
+# Class 3: TestRefCountLifecycle (6 tests)
 # =========================================================================
 
 class TestRefCountLifecycle(PrefixCachingTestBase):
@@ -366,6 +370,81 @@ class TestRefCountLifecycle(PrefixCachingTestBase):
         # Cached blocks may have been evicted (hash removed from mapping)
         # The key invariant: system still functions correctly
         assert ctx.total_request_count >= 1
+
+    @pytest.mark.internal
+    def test_rz_immediate_deregister_on_release(self):
+        """Blocks are deregistered and returned to free pool when ref_count hits 0."""
+        ctx = self._ctx(block_evict_lru=False)
+        bs = ctx.block_size_tokens
+        alloc = ctx.block_allocator
+        prompt = self._prompt(bs * 2)
+
+        ctx.add_request(self._req(ctx, prompt.clone()))
+        ctx.mark_pending_blocks_computed()
+        b0, b1 = self._block_ids(ctx, 0, 2)
+        b0_hash = alloc.get_block_hash(b0)
+        b1_hash = alloc.get_block_hash(b1)
+        avail_before = alloc.total_avail
+
+        # Release → ref_count hits 0 → blocks deregistered immediately
+        ctx.release_memory_blocks_from_request_indexes(torch.tensor([0]))
+        assert alloc.block_ref_counts[b0].item() == 0
+        assert alloc.block_ref_counts[b1].item() == 0
+        assert b0_hash not in alloc.hash_to_block_id, "Hash should be removed"
+        assert b1_hash not in alloc.hash_to_block_id, "Hash should be removed"
+        assert alloc.block_hashes[b0].item() == -1, "Block hash should be reset"
+        assert alloc.block_hashes[b1].item() == -1, "Block hash should be reset"
+        assert alloc.total_avail == avail_before + 2, "Blocks returned to free pool"
+
+    @pytest.mark.internal
+    def test_rz_shared_blocks_persist_until_last_ref(self):
+        """Shared blocks stay registered until all references are gone."""
+        ctx = self._ctx(block_evict_lru=False)
+        bs = ctx.block_size_tokens
+        alloc = ctx.block_allocator
+        prompt = self._prompt(bs * 2)
+
+        # Two requests sharing the same prefix
+        ctx.add_request(self._req(ctx, prompt.clone()))
+        ctx.mark_pending_blocks_computed()
+        ctx.add_request(self._req(ctx, prompt.clone(), request_id=2))
+
+        b0, b1 = self._block_ids(ctx, 0, 2)
+        b0_hash = alloc.get_block_hash(b0)
+        assert alloc.block_ref_counts[b0].item() == 2
+
+        # Release first request → ref_count=1 → still registered
+        ctx.release_memory_blocks_from_request_indexes(torch.tensor([0]))
+        assert alloc.block_ref_counts[b0].item() == 1
+        assert b0_hash in alloc.hash_to_block_id, "Still has a reference"
+
+        # Release second request → ref_count=0 → deregistered
+        ctx.release_memory_blocks_from_request_indexes(torch.tensor([1]))
+        assert alloc.block_ref_counts[b0].item() == 0
+        assert b0_hash not in alloc.hash_to_block_id, "No more references"
+
+    @pytest.mark.internal
+    def test_rz_no_reuse_after_release(self):
+        """Released blocks cannot be found by new requests with the same prefix."""
+        ctx = self._ctx(block_evict_lru=False)
+        bs = ctx.block_size_tokens
+        alloc = ctx.block_allocator
+        prompt = self._prompt(bs * 2)
+
+        ctx.add_request(self._req(ctx, prompt.clone()))
+        ctx.mark_pending_blocks_computed()
+        first_blocks = self._block_ids(ctx, 0, 2)
+
+        ctx.release_memory_blocks_from_request_indexes(torch.tensor([0]))
+        ctx.total_request_count = 0
+
+        # New request with same prefix → no hash match, gets new blocks
+        ctx.add_request(self._req(ctx, prompt.clone(), request_id=2))
+        new_blocks = self._block_ids(ctx, 0, 2)
+        # Blocks should be freshly allocated (no sharing with deregistered blocks)
+        # The hashes were removed, so lookup returns None and new blocks are allocated
+        assert alloc.block_ref_counts[new_blocks[0]].item() == 1
+        assert alloc.block_ref_counts[new_blocks[1]].item() == 1
 
 
 # =========================================================================
@@ -509,7 +588,7 @@ class TestPrefillSkipping(PrefixCachingTestBase):
 
 
 # =========================================================================
-# Class 6: TestDisabledMode (2 tests)
+# Class 6: TestDisabledMode (3 tests)
 # =========================================================================
 
 class TestDisabledMode(PrefixCachingTestBase):
@@ -538,6 +617,16 @@ class TestDisabledMode(PrefixCachingTestBase):
         assert not hasattr(alloc, 'block_hashes'), "block_hashes should not exist when disabled"
         assert not hasattr(alloc, 'block_ref_counts'), "block_ref_counts should not exist when disabled"
         assert not hasattr(alloc, 'hash_to_block_id'), "hash_to_block_id should not exist when disabled"
+
+    @pytest.mark.internal
+    def test_rz_no_timestamps(self):
+        """Timestamp attributes don't exist in RZ mode."""
+        ctx = self._ctx(block_evict_lru=False)
+        alloc = ctx.block_allocator
+        assert not hasattr(alloc, 'block_timestamps'), \
+            "block_timestamps should not exist in RZ mode"
+        assert not hasattr(alloc, 'global_timestamp'), \
+            "global_timestamp should not exist in RZ mode"
 
 
 # =========================================================================

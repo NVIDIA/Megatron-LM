@@ -243,6 +243,7 @@ class DynamicInferenceContext(BaseInferenceContext):
 
         # Prefix caching configuration
         self.enable_prefix_caching = inference_config.enable_prefix_caching
+        self.block_evict_lru = inference_config.block_evict_lru
 
         # Track blocks pending computation for prefix caching coordination
         self._blocks_pending_computation: List[int] = []
@@ -406,6 +407,7 @@ class DynamicInferenceContext(BaseInferenceContext):
             ),
             paused_count=paused_block_count,
             enable_prefix_caching=self.enable_prefix_caching,
+            block_evict_lru=self.block_evict_lru,
         )
 
         # Track request metadata.
@@ -1550,7 +1552,8 @@ class DynamicInferenceContext(BaseInferenceContext):
                 matched_block_ids, dtype=torch.int32, device=torch.cuda.current_device()
             )
             self.block_allocator.increment_ref_count(matched_tensor)
-            self.block_allocator.update_timestamps(matched_tensor)
+            if self.block_evict_lru:
+                self.block_allocator.update_timestamps(matched_tensor)
 
         # when a request already starts chunked prefill, it is exactly the last request in the current system
         # (see dynamic_engine.py, schedule_chunked_prefill invariants)

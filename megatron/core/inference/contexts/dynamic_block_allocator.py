@@ -27,10 +27,12 @@ class BlockAllocator:
         total_count: int,
         paused_count: int,
         enable_prefix_caching: bool = True,
+        block_evict_lru: bool = False,
     ):
 
         self.context = context
         self.enable_prefix_caching = enable_prefix_caching
+        self.block_evict_lru = block_evict_lru
 
         self.total_count = total_count
         self.total_avail = total_count - 1  # -1 for dummy_block_idx (see below)
@@ -59,10 +61,12 @@ class BlockAllocator:
             )
 
             # LRU timestamps for eviction ordering (higher = more recently used)
-            self.block_timestamps = torch.zeros(
-                (self.total_count,), dtype=torch.int64, device=torch.cuda.current_device()
-            )
-            self.global_timestamp = 0
+            # Only needed in LRU mode; RZ mode evicts immediately on ref_count==0
+            if self.block_evict_lru:
+                self.block_timestamps = torch.zeros(
+                    (self.total_count,), dtype=torch.int64, device=torch.cuda.current_device()
+                )
+                self.global_timestamp = 0
 
             # Pending block hashes for prefix caching coordination
             # Maps block_id -> hash for blocks registered but not yet computed
@@ -119,6 +123,8 @@ class BlockAllocator:
             return True
         if not self.enable_prefix_caching:
             return False
+        if not self.block_evict_lru:
+            return False  # RZ: no cached blocks to evict
         # Also count evictable cached blocks
         evictable_count = self.get_evictable_block_count()
         return (self.total_avail + evictable_count) >= num_blocks
@@ -136,8 +142,8 @@ class BlockAllocator:
         """
         # Try to evict cached blocks if free pool is insufficient
         if self.total_avail < num_blocks:
-            if not self.enable_prefix_caching:
-                return None
+            if not self.enable_prefix_caching or not self.block_evict_lru:
+                return None  # RZ: no eviction path; disabled: no cached blocks
             blocks_needed_from_eviction = num_blocks - self.total_avail
             if not self.evict_lru_blocks(blocks_needed_from_eviction):
                 return None  # Not enough blocks even after eviction
@@ -148,9 +154,10 @@ class BlockAllocator:
         assert num_blocks == block_ids.numel()
 
         if self.enable_prefix_caching:
-            # Initialize ref counts and timestamps for newly allocated blocks
+            # Initialize ref counts for newly allocated blocks
             self.block_ref_counts[block_ids] = 1
-            self.update_timestamps(block_ids)
+            if self.block_evict_lru:
+                self.update_timestamps(block_ids)
 
         return block_ids
 
@@ -202,8 +209,9 @@ class BlockAllocator:
             self.hash_to_block_id.clear()
             self._pending_block_hashes.clear()
             self.block_ref_counts.fill_(0)
-            self.block_timestamps.fill_(0)
-            self.global_timestamp = 0
+            if self.block_evict_lru:
+                self.block_timestamps.fill_(0)
+                self.global_timestamp = 0
 
     def set_block_hash(self, block_id: int, hash_value: int) -> None:
         """Set the hash for a specific block.
@@ -284,7 +292,9 @@ class BlockAllocator:
     def decrement_ref_count(self, block_ids: Tensor) -> None:
         """Decrement reference count when a request releases blocks.
 
-        Blocks with ref_count == 0 become cached (evictable but still in hash map).
+        In LRU mode, blocks with ref_count == 0 become cached (evictable but still
+        in hash map). In RZ mode, blocks are immediately deregistered and returned
+        to the free pool when ref_count hits 0.
 
         Args:
             block_ids: Tensor of block IDs to decrement.
@@ -292,14 +302,55 @@ class BlockAllocator:
         if block_ids.numel() == 0:
             return
         self.block_ref_counts[block_ids] -= 1
+        if not self.block_evict_lru:
+            zero_mask = self.block_ref_counts[block_ids] == 0
+            if zero_mask.any():
+                self._deregister_blocks(block_ids[zero_mask])
+
+    def _deregister_blocks(self, block_ids: Tensor) -> None:
+        """Remove blocks from prefix caching state and return to free pool.
+
+        Shared cleanup logic for both LRU eviction and RZ proactive eviction.
+
+        Args:
+            block_ids: Tensor of block IDs to deregister.
+        """
+        num_blocks = block_ids.numel()
+        if num_blocks == 0:
+            return
+
+        # Remove from hash mappings
+        for block_id in block_ids:
+            block_id_int = block_id.item()
+
+            # Clean up pending hash if block was pending computation
+            if block_id_int in self._pending_block_hashes:
+                pending_hash = self._pending_block_hashes.pop(block_id_int)
+                if pending_hash in self.hash_to_block_id:
+                    del self.hash_to_block_id[pending_hash]
+
+            # Clean up computed hash
+            block_hash = self.block_hashes[block_id_int].item()
+            if block_hash in self.hash_to_block_id:
+                del self.hash_to_block_id[block_hash]
+
+        # Reset block state
+        self.block_hashes[block_ids] = -1
+        self.block_ref_counts[block_ids] = 0
+        if self.block_evict_lru:
+            self.block_timestamps[block_ids] = 0
+
+        # Return blocks to free pool
+        self.block_bag[self.total_avail : self.total_avail + num_blocks] = block_ids
+        self.total_avail += num_blocks
 
     def update_timestamps(self, block_ids: Tensor) -> None:
-        """Update LRU timestamps for accessed blocks.
+        """Update LRU timestamps for accessed blocks. No-op in RZ mode.
 
         Args:
             block_ids: Tensor of block IDs that were accessed.
         """
-        if block_ids.numel() == 0:
+        if not self.block_evict_lru or block_ids.numel() == 0:
             return
         self.global_timestamp += 1
         self.block_timestamps[block_ids] = self.global_timestamp
@@ -336,28 +387,6 @@ class BlockAllocator:
         sorted_indices = torch.argsort(cached_timestamps)
         blocks_to_evict = cached_block_ids[sorted_indices[:num_blocks_needed]]
 
-        # Remove from hash mapping
-        for block_id in blocks_to_evict:
-            block_id_int = block_id.item()
-
-            # Clean up pending hash if block was pending computation
-            if block_id_int in self._pending_block_hashes:
-                pending_hash = self._pending_block_hashes.pop(block_id_int)
-                if pending_hash in self.hash_to_block_id:
-                    del self.hash_to_block_id[pending_hash]
-
-            # Clean up computed hash
-            block_hash = self.block_hashes[block_id_int].item()
-            if block_hash in self.hash_to_block_id:
-                del self.hash_to_block_id[block_hash]
-
-        # Reset block state
-        self.block_hashes[blocks_to_evict] = -1
-        self.block_ref_counts[blocks_to_evict] = 0
-        self.block_timestamps[blocks_to_evict] = 0
-
-        # Add back to free pool
-        self.block_bag[self.total_avail : self.total_avail + num_blocks_needed] = blocks_to_evict
-        self.total_avail += num_blocks_needed
+        self._deregister_blocks(blocks_to_evict)
 
         return True
