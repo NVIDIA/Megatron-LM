@@ -41,7 +41,16 @@ class ProfilingConfig:
     use_pytorch_profiler: bool = False
     """Use the built-in pytorch profiler. Useful if you wish to view profiles in tensorboard."""
 
-    profile_ranks: list[int] = field(default_factory=lambda: [0])
+    pytorch_profiler_collect_shapes: bool = False
+    """Collect tensor shape in pytorch profiler."""
+  
+    pytorch_profiler_collect_callstack: bool = False
+    """Collect callstack in pytorch profiler."""
+  
+    pytorch_profiler_collect_chakra: bool = False                
+    """Collect chakra trace in pytorch profiler."""
+
+    profile_ranks: list[int] = field(default_factory=lambda: [])
     """Global ranks to profile."""
 
     record_memory_history: bool = False

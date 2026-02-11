@@ -43,6 +43,7 @@ import math
 import os
 import sys
 from contextlib import nullcontext
+from pathlib import Path
 from typing import Any, Optional, Dict
 
 import torch.distributed
@@ -2346,11 +2347,14 @@ def post_training_step_callbacks(
     if (
         args.profile
         and iteration == args.profile_step_end
-        and torch.distributed.get_rank() in args.profile_ranks
+        and (len(args.profile_ranks) == 0 or
+             torch.distributed.get_rank() in args.profile_ranks)
     ):
         if args.use_pytorch_profiler:
             assert prof is not None
             prof.stop()
+            if prof.execution_trace_observer is not None:
+                prof.execution_trace_observer.unregister_callback()
         else:
             torch.cuda.check_error(torch.cuda.cudart().cudaProfilerStop())
             if nsys_nvtx_context is not None:
@@ -2697,9 +2701,20 @@ def train(
     nsys_nvtx_context = None # reference to context for nsys profiling, so it can be cleaned up
     if (
         args.profile
-        and torch.distributed.get_rank() in args.profile_ranks
+        and (len(args.profile_ranks) == 0 or
+             torch.distributed.get_rank() in args.profile_ranks)
         and args.use_pytorch_profiler
     ):
+        if args.pytorch_profiler_collect_chakra:
+            et_dir = Path(f"{args.tensorboard_dir}/../chakra")
+            et_dir.mkdir(parents=True, exist_ok=True)
+            et = torch.profiler.ExecutionTraceObserver().register_callback(f"{et_dir}/rank-{torch.distributed.get_rank()}.json.gz")
+        else:
+            et = None
+        def trace_handler(p):
+            profile_dir = Path(f"{args.tensorboard_dir}/../torch_profile")
+            profile_dir.mkdir(parents=True, exist_ok=True)
+            p.export_chrome_trace(f"{profile_dir}/rank-{torch.distributed.get_rank()}.json.gz")
         prof = torch.profiler.profile(
             schedule=torch.profiler.schedule(
                 wait=max(args.profile_step_start - 1, 0),
@@ -2707,9 +2722,10 @@ def train(
                 active=args.profile_step_end - args.profile_step_start,
                 repeat=1,
             ),
-            on_trace_ready=torch.profiler.tensorboard_trace_handler(args.tensorboard_dir),
-            record_shapes=True,
-            with_stack=True,
+            on_trace_ready=trace_handler,
+            record_shapes=args.pytorch_profiler_collect_shapes,
+            with_stack=args.pytorch_profiler_collect_callstack,
+            execution_trace_observer=et,
         )
         prof.start()
 
@@ -2745,7 +2761,9 @@ def train(
     # Run training iterations till done.
     buffered_rollouts = None
     while iteration < args.train_iters:
-        if args.profile and torch.distributed.get_rank() in args.profile_ranks:
+        if (args.profile 
+            and (len(args.profile_ranks) == 0 or
+                 torch.distributed.get_rank() in args.profile_ranks)):
             if args.use_pytorch_profiler:
                 prof.step()
             elif iteration == args.profile_step_start:
