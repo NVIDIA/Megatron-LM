@@ -1549,11 +1549,11 @@ class CudaGraphManager(torch.nn.Module):
                 for module in megatron_module.modules():
                     self.call_ddp_preforward_hook(module)
 
-            if not is_inference_mode and not torch.is_grad_enabled():
-                if self.func is not None:
-                    return self.func(*args, **kwargs)
-                else:
-                    return super(MegatronModule, megatron_module).__call__(*args, **kwargs)
+            # if not is_inference_mode and not torch.is_grad_enabled():
+            #     if self.func is not None:
+            #         return self.func(*args, **kwargs)
+            #     else:
+            #         return super(MegatronModule, megatron_module).__call__(*args, **kwargs)
 
             runner = self.get_cudagraph_runner(megatron_module, args, kwargs, self.reuse_cudagraphs)
             out = runner.replay_graph_capture(self.is_first_microbatch, args, kwargs)
@@ -2244,9 +2244,6 @@ class TECudaGraphHelper:
         else:
             rng_context = nullcontext()
         with rng_context:
-            # print("WHY NONE?")
-            # torch.distributed.breakpoint()
-            print(f"self.flattened_callables: {self.flattened_callables} | sample_args: {sample_args} kwargs: {kwargs}")
             graphs = make_graphed_callables(tuple(self.flattened_callables), sample_args, **kwargs)
 
         # Push the captured graphs to the corresponding TransformerBlock.
