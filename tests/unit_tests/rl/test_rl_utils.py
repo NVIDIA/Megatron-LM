@@ -1,7 +1,6 @@
 # Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
 import itertools
-import json
 
 import pytest
 import torch
@@ -29,7 +28,7 @@ from megatron.core.transformer.cuda_graphs import (
 )
 from megatron.core.transformer.module import Float16Module
 from megatron.rl import rl_utils
-from megatron.rl.agent.api import Rollout, TokenRollout
+from megatron.rl.agent.api import TokenRollout
 from megatron.rl.sequence_packing_utils import get_default_packed_seq_params
 from megatron.training.arguments import parse_args, validate_args
 from megatron.training.global_vars import destroy_global_vars, set_global_variables
@@ -866,29 +865,3 @@ class TestRLUtils:
         CudaGraphManager.global_mempool = None
         CudaGraphManager.fwd_mempools = None
         CudaGraphManager.bwd_mempools = None
-
-    def test_dump_results_json(self, tmp_path):
-        """Test that dump_results_json correctly serializes grouped rollouts."""
-        r1 = TokenRollout(
-            trajectory=[[1, 2, 3, 43]],
-            reward=3.14,
-            generation_mask=[[False, True, True, True]],
-            logprobs=[[0.1, 0.2, 0.3]],
-            env_id='test_env',
-            problem_id='p1',
-        )
-        r2 = Rollout(trajectory=["Hello world"], reward=1.0, env_id='test_env', problem_id='p2')
-        rollouts = [[r1, r2]]
-
-        path = str(tmp_path / "rollouts.json")
-        rl_utils.dump_results_json(path, rollouts)
-
-        with open(path) as f:
-            data = json.load(f)
-
-        assert len(data) == 1
-        assert len(data[0]) == 2
-        assert data[0][0]["trajectory"] == [[1, 2, 3, 43]]
-        assert data[0][0]["reward"] == 3.14
-        assert data[0][1]["trajectory"] == ["Hello world"]
-        assert data[0][1]["reward"] == 1.0

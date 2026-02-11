@@ -97,15 +97,6 @@ _GLOBAL_PACKING_CONTEXT = None
 # Model starts on GPU after creation and is used immediately, so starts as False.
 _INFERENCE_MODEL_IS_PAUSED = False
 
-def dump_results_json(path: str, results: list[list[BaseModel]]) -> None:
-    """JSON dump a list of list[BaseModel].
-
-    Args:
-        path: File path to write to.
-        results: A list of list[BaseModel].
-    """
-    with open(path, 'w') as f:
-        json.dump([[r.model_dump() for r in group] for group in results], f)
 
 def _torch_saver_swap_inference_model(*, to_cpu: bool) -> None:
     """Swap RL inference model weights between CPU and GPU using torch_memory_saver.
@@ -604,12 +595,13 @@ def get_environment_rollouts(
             optimizer.restore_from_cpu()
 
     if lang_rl_log_dir and rank == get_pg_rank(inference_pg_collection.tp):
-        dump_results_json(
+        with open(
             lang_rl_log_dir
             + f'/rollouts_rank{rank}_iteration{args.curr_iteration}_'
             + f'{Path(args.langrl_env_config).stem}.json',
-            rollouts,
-        )
+            'w',
+        ) as f:
+            json.dump([[r.model_dump() for r in group] for group in rollouts], f)
 
     return rollouts
 
@@ -1571,12 +1563,13 @@ def evaluate_and_print_results_rl(
                 + "".join([f"\n\t{k}: {v:0.4f}" for k, v in eval_metrics.items()])
             )
             if lang_rl_log_dir:
-                dump_results_json(
+                with open(
                     lang_rl_log_dir
                     + f'/eval_rank{rank}_iteration{args.curr_iteration}_'
                     + f'{Path(args.langrl_env_config).stem}.json',
-                    dp_eval_results,
-                )
+                    'w',
+                ) as f:
+                    json.dump([[r.model_dump() for r in group] for group in dp_eval_results], f)
 
 
 def calculate_grpo_loss(
