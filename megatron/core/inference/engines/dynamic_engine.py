@@ -517,7 +517,9 @@ class DynamicInferenceEngine(AbstractEngine):
 
     @contextmanager
     @staticmethod
-    def suspend_resume_ctx(key: str, *, unified_memory_level: int) -> None:
+    def suspend_resume_ctx(
+        key: str, *, step_count: int, logging_step_interval: int, unified_memory_level: int
+    ) -> None:
         """Context manager for of suspending and resuming the engine.
 
         This context manager records the time and memory usage when suspending
@@ -533,7 +535,7 @@ class DynamicInferenceEngine(AbstractEngine):
 
         try:
 
-            if self.logging_step_interval > 0 and step_count % self.logging_step_interval == 0:
+            if logging_step_interval > 0 and step_count % logging_step_interval == 0:
                 start_mem = torch.cuda.memory_stats()
                 start_time = time.time()
             range_push(f"{key}-inference-context")
@@ -544,7 +546,7 @@ class DynamicInferenceEngine(AbstractEngine):
         finally:
 
             range_pop()
-            if self.logging_step_interval > 0 and step_count % self.logging_step_interval == 0:
+            if logging_step_interval > 0 and step_count % logging_step_interval == 0:
                 end_time = time.time()
                 end_mem = torch.cuda.memory_stats()
                 start_mem_alloc = start_mem["allocated_bytes.all.current"]
@@ -576,8 +578,8 @@ class DynamicInferenceEngine(AbstractEngine):
                     f"unified {unified_memory_level}, "
                     f"{dir_str} "
                     f"{relative_mem_str} in {relative_time_str} ... "
-                f"abs mem usage: {total_mem_str}"
-            )
+                    f"abs mem usage: {total_mem_str}"
+                )
 
     def suspend(self):
         """Suspend engine by deallocating context's GPU state."""
@@ -590,7 +592,10 @@ class DynamicInferenceEngine(AbstractEngine):
 
         # Deallocate context tensors.
         with self.__class__.suspend_resume_ctx(
-            "suspended", unified_memory_level=self.unified_memory_level
+            "suspended",
+            step_count=self.step_count,
+            logging_step_interval=self.logging_step_interval,
+            unified_memory_level=self.unified_memory_level,
         ):
             self.context.deallocate_large_tensors()
             torch.cuda.synchronize()
@@ -627,7 +632,10 @@ class DynamicInferenceEngine(AbstractEngine):
 
         # Resume.
         with self.__class__.suspend_resume_ctx(
-            "resumed", unified_memory_level=self.unified_memory_level
+            "resumed",
+            step_count=self.step_count,
+            logging_step_interval=self.logging_step_interval,
+            unified_memory_level=self.unified_memory_level,
         ):
 
             # Allocate context tensors.
