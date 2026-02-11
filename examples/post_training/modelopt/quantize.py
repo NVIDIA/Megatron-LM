@@ -279,58 +279,57 @@ def get_calib_dataloader(
     if os.path.isfile(dataset_path_or_name):
         # Local file
         print_rank_0(f"Loading calibration dataset from local file: {dataset_path_or_name}")
+        all_texts = []
         with open(dataset_path_or_name) as f:
-            dataset = []
             for i, line in enumerate(f):
-                if len(dataset) == calib_size:
+                if len(all_texts) == calib_size:
                     break
                 sample = json.loads(line)
+
                 # Extract text field from various possible keys
                 if isinstance(sample, dict) and "text" in sample:
                     if not sample["text"]:
                         warnings.warn(f"Sample {i} has empty text, skipping")
                         continue
-                    dataset.append(sample["text"])
+                    full_text = sample["text"]
                 elif isinstance(sample, dict) and "messages" in sample:
                     conversations = sample["messages"]
                     assert "role" in conversations[0] and "content" in conversations[0]
-                    dataset.append("".join([f"{msg['role']}: {msg['content']}" for msg in conversations]))
+                    full_text = "".join([f"{msg['role']}: {msg['content']}" for msg in conversations])
                 elif isinstance(sample, list) and isinstance(sample[0], dict):
                     assert "role" in sample[0] and "content" in sample[0]
-                    dataset.append("".join([f"{msg['role']}: {msg['content']}" for msg in sample]))
+                    full_text = "".join([f"{msg['role']}: {msg['content']}" for msg in sample])
                 else:
                     raise ValueError(f"Sample {i} has unexpected format")
 
-        print_rank_0(f"Loaded calibration dataset ({dataset_path_or_name}) with {len(dataset)} samples")
-        print_rank_0(f"Actual num samples: {min(len(dataset), calib_size)}, max seq length: {max_sequence_length}")
+                # Slice text
+                start_idx = 0
+                if use_random_offset and len(full_text) > max_sequence_length:
+                    start_idx = random.randint(0, len(full_text) - max_sequence_length)
+                text = full_text[start_idx : start_idx + max_sequence_length]
+                all_texts.append(text)
+
+        print_rank_0(f"Loaded calibration dataset ({dataset_path_or_name}) with {len(all_texts)} samples")
+        print_rank_0(f"Actual num samples: {len(all_texts)}, max seq length: {max_sequence_length}")
         print_rank_0(f"Sampling Strategy: {'Random Index' if use_random_offset else 'From Beginning'}")
 
-        batch = []
-        for full_text in dataset:
-            if use_random_offset and len(full_text) > max_sequence_length:
-                start_idx = random.randint(0, len(full_text) - max_sequence_length)
-            else:
-                start_idx = 0
-            batch.append(full_text[start_idx : start_idx + max_sequence_length])
-            if len(batch) == batch_size:
-                tokens = tokenizer(batch, return_tensors="pt", padding=True)
-                batch = []
-                yield tokens["input_ids"].cuda()
+        # Tokenize all texts at once and move to device
+        tokens = tokenizer(all_texts, return_tensors="pt", padding=True)
+        all_input_ids = tokens.input_ids.cuda()
+        return [{"input_ids": all_input_ids[i:i+batch_size]} for i in range(0, len(all_input_ids), batch_size)]
     else:
         # HuggingFace dataset
         if use_random_offset:
             warnings.warn("Random offset is not supported for HuggingFace datasets.")
         print_rank_0(f"Loading calibration dataset from HuggingFace: {dataset_path_or_name}")
-        dataloader = get_dataset_dataloader(
+        return get_dataset_dataloader(
             dataset_name=dataset_path_or_name,
             tokenizer=tokenizer,
             num_samples=calib_size,
             max_sample_length=max_sequence_length,
             batch_size=batch_size,
             device="cuda",
-        )  # cannot be returned since the other yield statement already makes this fn a generator
-        for tokens in dataloader:
-            yield tokens["input_ids"]
+        )
 
 
 if __name__ == "__main__":
@@ -398,8 +397,8 @@ if __name__ == "__main__":
             use_random_offset=args.calib_use_random_offset,
             batch_size=args.calib_batch_size,
         )
-        for input_ids in tqdm(dataloader, total=args.calib_size, disable=torch.distributed.get_rank()):
-            simple_generate(model, input_ids, osl=1, calibration_mode=True)
+        for sample in tqdm(dataloader, disable=torch.distributed.get_rank()):
+            simple_generate(model, sample["input_ids"], osl=1, calibration_mode=True)
 
     unwrapped_model = unwrap_model(model)[0]
 
