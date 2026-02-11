@@ -31,7 +31,7 @@ from megatron.core.models.hl import (
 # Shared settings inherited by all layers (can be overridden per-layer)
 common_config = CommonLayerConfig(
     hidden_size=2688,
-    bf16=True,
+    mixed_precision_dtype="bf16",
     sequence_parallel=True,
     normalization="RMSNorm",
     add_bias_linear=False,

@@ -2,8 +2,6 @@
 
 from dataclasses import dataclass
 
-import torch
-
 from megatron.core.models.hl import HLLayerConfig
 
 
@@ -78,7 +76,7 @@ class HLModelConfig:
     ###################
     # Pipeline Parallel
     ###################
-    pipeline_dtype: torch.dtype = None
+    pipeline_dtype: str | None = None
     """dtype used in p2p communication, usually params_dtype"""
 
     variable_seq_lengths: bool = False

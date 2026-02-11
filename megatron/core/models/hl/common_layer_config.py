@@ -2,8 +2,6 @@
 
 from dataclasses import dataclass
 
-import torch
-
 
 @dataclass
 class CommonLayerConfig:
@@ -41,13 +39,10 @@ class CommonLayerConfig:
     ###################
     # Training
     ###################
-    fp16: bool = False
-    """If true, train with fp16 mixed precision training."""
+    mixed_precision_dtype: str = "fp32"
+    """dtype used for mixed-precision training."""
 
-    bf16: bool = False
-    """If true, train with bf16 mixed precision training."""
-
-    params_dtype: torch.dtype = torch.float32
+    params_dtype: str = "fp32"
     """dtype used when intializing the weights."""
 
     deterministic_mode: bool = False
@@ -57,7 +52,7 @@ class CommonLayerConfig:
     enable_autocast: bool = False
     """If true runs the forward step function inside torch.autocast context."""
 
-    autocast_dtype: torch.dtype | None = None
+    autocast_dtype: str | None = None
     """dtype to pass to torch.amp.autocast when enabled. If None, is set to pipeline_dtype."""
 
     num_microbatches_with_partial_activation_checkpoints: int | None = None
