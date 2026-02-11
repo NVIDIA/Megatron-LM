@@ -211,9 +211,12 @@ jobs:
         id: sha
         env:
           IS_PR: ${{ startsWith(github.ref, 'refs/heads/pull-request/') }}
+          IS_MERGE_GROUP: ${{ github.event_name == 'merge_group' }}
         run: |
           if [[ "$IS_PR" == "true" ]]; then
             SHA=${{ fromJSON(steps.get-pr-info.outputs.pr-info || '{}').merge_commit_sha }}
+          elif [[ "$IS_MERGE_GROUP" == "true" ]]; then
+            SHA=${{ github.event.merge_group.head_sha }}
           else
             SHA=${GITHUB_SHA}
           fi
