@@ -7,6 +7,10 @@ import os
 from megatron.core.msc_utils import MultiStorageClientFeature
 
 
+CONFIG_FNAME = "metadata.json"
+COMMON_FNAME = "common.pt"
+
+
 class CheckpointingException(Exception):
     """Base checkpointing related exception"""
 
@@ -22,8 +26,8 @@ def check_is_distributed_checkpoint(checkpoint_dir: str) -> bool:
     Returns:
         bool: True if .metadata file exists, indicating a distributed checkpoint.
     """
-    metadata_file = os.path.join(checkpoint_dir, '.metadata')
-    common_file = os.path.join(checkpoint_dir, 'common.pt')
+    metadata_file = os.path.join(checkpoint_dir, CONFIG_FNAME)
+    common_file = os.path.join(checkpoint_dir, COMMON_FNAME)
     if checkpoint_dir:
         if MultiStorageClientFeature.is_enabled():
             msc = MultiStorageClientFeature.import_package()
