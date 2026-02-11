@@ -242,7 +242,7 @@ def _check_supported_type(meta):
     }
     assert meta.type in _SUPPORTED_TYPES or is_dataclass(
         meta.value
-    ), f"Cudagraphs recieved an arg of type {meta.type} which is not supported."
+    ), f"Cudagraphs received an arg of type {meta.type} which is not supported."
 
 
 def _determine_if_first_last_layer_of_this_vp_chunk(base_module):
