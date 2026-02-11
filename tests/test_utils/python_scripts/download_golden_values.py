@@ -45,9 +45,7 @@ def download_from_gitlab(pipeline_id: int, only_failing: bool):
 
     ASSETS_DIR = pathlib.Path("tmp") / "results" / "iteration=0"
     for pipeline_bridge in pipeline_bridges:
-        functional_pipeline = project.pipelines.get(
-            pipeline_bridge.downstream_pipeline["id"]
-        )
+        functional_pipeline = project.pipelines.get(pipeline_bridge.downstream_pipeline["id"])
         environment = pipeline_bridge.name[len("functional:run_") :]
         functional_pipeline_jobs = functional_pipeline.jobs.list(get_all=True)
         logger.info("Starting with pipeline %s", pipeline_bridge.name)
@@ -66,15 +64,11 @@ def download_from_gitlab(pipeline_id: int, only_failing: bool):
                 zip.extractall("tmp")
                 logger.info("Downloaded artifacts of job %s", job.name)
             except Exception as e:
-                logger.error(
-                    "Failed to download artifacts of job %s due to %s", job.name, e
-                )
+                logger.error("Failed to download artifacts of job %s due to %s", job.name, e)
                 continue
 
             os.unlink(file_name)
-            restart_dir = os.listdir(pathlib.Path("tmp") / "results" / "iteration=0")[
-                -1
-            ]
+            restart_dir = os.listdir(pathlib.Path("tmp") / "results" / "iteration=0")[-1]
             golden_values_sources = list(
                 (
                     pathlib.Path(ASSETS_DIR)
@@ -87,8 +81,7 @@ def download_from_gitlab(pipeline_id: int, only_failing: bool):
 
             if len(golden_values_sources) < 1:
                 logger.info(
-                    "Golden values for %s does not exist. Skip.",
-                    str(golden_values_sources),
+                    "Golden values for %s does not exist. Skip.", str(golden_values_sources)
                 )
                 continue
 
@@ -108,20 +101,15 @@ def download_from_gitlab(pipeline_id: int, only_failing: bool):
                 )
 
                 if golden_values_source.exists():
-                    pathlib.Path(golden_values_target.parent).mkdir(
-                        parents=True, exist_ok=True
-                    )
+                    pathlib.Path(golden_values_target.parent).mkdir(parents=True, exist_ok=True)
                     logger.info(
-                        "Move artifacts from %s to %s",
-                        golden_values_source,
-                        golden_values_target,
+                        "Move artifacts from %s to %s", golden_values_source, golden_values_target
                     )
 
                     shutil.move(golden_values_source, golden_values_target)
                 else:
                     logger.info(
-                        "Golden values for %s does not exist. Skip.",
-                        str(golden_values_source),
+                        "Golden values for %s does not exist. Skip.", str(golden_values_source)
                     )
 
             shutil.rmtree("tmp")
@@ -203,8 +191,7 @@ def _filter_cicd_jobs(all_jobs: list) -> list:
             for job in all_jobs
             if "labels" in job
             and any(
-                "cicd-integration-tests-latest" in str(label).lower()
-                for label in job["labels"]
+                "cicd-integration-tests-latest" in str(label).lower() for label in job["labels"]
             )
         ]
 
@@ -216,10 +203,7 @@ def _filter_cicd_jobs(all_jobs: list) -> list:
         )
         cicd_jobs = all_jobs
     else:
-        logger.info(
-            "Filtered %d jobs belonging to cicd-integration-tests-latest",
-            len(cicd_jobs),
-        )
+        logger.info("Filtered %d jobs belonging to cicd-integration-tests-latest", len(cicd_jobs))
 
     return cicd_jobs
 
@@ -249,42 +233,27 @@ def _create_job_name_map(cicd_jobs: list) -> dict:
     return job_name_map
 
 
-def _match_artifact_to_job(
-    artifact: dict, workflow_id: int, job_name_map: dict
-) -> dict:
+def _match_artifact_to_job(artifact: dict, workflow_id: int, job_name_map: dict) -> dict:
     """Match an artifact to a job from the job name map."""
-    artifact_job_name = (
-        artifact["name"].lower().replace("logs-", "").split(f"-{workflow_id}")[0]
-    )
+    artifact_job_name = artifact["name"].lower().replace("logs-", "").split(f"-{workflow_id}")[0]
     for normalized_job_name, job in job_name_map.items():
         if normalized_job_name == artifact_job_name:
-            logger.info(
-                "Artifact '%s' matched to job '%s'",
-                artifact["name"],
-                job["name"],
-            )
+            logger.info("Artifact '%s' matched to job '%s'", artifact["name"], job["name"])
             return job
 
     logger.info(
-        "Artifact '%s' does not match any cicd-integration-tests-latest jobs",
-        artifact["name"],
+        "Artifact '%s' does not match any cicd-integration-tests-latest jobs", artifact["name"]
     )
     return None
 
 
 def _fetch_and_filter_artifacts(
-    workflow_id: int,
-    job_name_map: dict,
-    only_failing: bool,
-    headers: dict,
-    api_base: str,
+    workflow_id: int, job_name_map: dict, only_failing: bool, headers: dict, api_base: str
 ) -> list:
     """Fetch and filter artifacts from the workflow run."""
     logger.info("Fetching and filtering artifacts from workflow run...")
     filtered_artifacts = []
-    artifacts_url = (
-        f"{api_base}/repos/{GITHUB_REPO}/actions/runs/{workflow_id}/artifacts"
-    )
+    artifacts_url = f"{api_base}/repos/{GITHUB_REPO}/actions/runs/{workflow_id}/artifacts"
     page = 1
     per_page = 100
 
@@ -326,8 +295,7 @@ def _fetch_and_filter_artifacts(
         page += 1
 
     logger.info(
-        "Filtered %d artifacts matching cicd-integration-tests-latest jobs",
-        len(filtered_artifacts),
+        "Filtered %d artifacts matching cicd-integration-tests-latest jobs", len(filtered_artifacts)
     )
     return filtered_artifacts
 
@@ -345,9 +313,7 @@ def _extract_stage_and_test_name(job_name: str) -> tuple:
             f"Job name '{job_name}' does not contain a stage (expected format: 'stage/test_name - version')"
         )
 
-    logger.info(
-        f"Extracted stage: {stage}, test name: {test_name} from job '{job_name}'"
-    )
+    logger.info(f"Extracted stage: {stage}, test name: {test_name} from job '{job_name}'")
     return stage, test_name
 
 
@@ -355,9 +321,7 @@ def _download_and_extract_artifact(
     artifact: dict, headers: dict, api_base: str, file_name: str = "__artifacts.zip"
 ) -> list:
     """Download and extract an artifact, returning list of golden values files."""
-    artifact_download_url = (
-        f"{api_base}/repos/{GITHUB_REPO}/actions/artifacts/{artifact['id']}/zip"
-    )
+    artifact_download_url = f"{api_base}/repos/{GITHUB_REPO}/actions/artifacts/{artifact['id']}/zip"
 
     logger.info("Downloading artifact from %s", artifact_download_url)
     response = requests.get(artifact_download_url, headers=headers, stream=True)
@@ -385,9 +349,7 @@ def _download_and_extract_artifact(
             artifact["name"],
         )
     else:
-        logger.info(
-            "No golden values found in artifact %s. Skipping.", artifact["name"]
-        )
+        logger.info("No golden values found in artifact %s. Skipping.", artifact["name"])
 
     return golden_values_in_tmp
 
@@ -407,9 +369,7 @@ def _move_golden_values(golden_values_files: list, stage: str, test_name: str) -
         )
 
         pathlib.Path(golden_values_target.parent).mkdir(parents=True, exist_ok=True)
-        logger.info(
-            f"Moving golden values from {golden_values_file} to {golden_values_target}"
-        )
+        logger.info(f"Moving golden values from {golden_values_file} to {golden_values_target}")
         shutil.move(golden_values_file, golden_values_target)
         golden_values_moved += 1
 
@@ -435,9 +395,7 @@ def _process_artifact(artifact: dict, headers: dict, api_base: str) -> int:
 
     try:
         # Download and extract the artifact
-        golden_values_files = _download_and_extract_artifact(
-            artifact, headers, api_base, file_name
-        )
+        golden_values_files = _download_and_extract_artifact(artifact, headers, api_base, file_name)
 
         if not golden_values_files:
             _cleanup_tmp()
@@ -459,9 +417,7 @@ def _process_artifact(artifact: dict, headers: dict, api_base: str) -> int:
         return golden_values_moved
 
     except Exception as e:
-        logger.error(
-            "Failed to download/process artifact %s due to %s", artifact["name"], e
-        )
+        logger.error("Failed to download/process artifact %s due to %s", artifact["name"], e)
         # Clean up on error
         if os.path.exists(file_name):
             os.unlink(file_name)
@@ -519,10 +475,7 @@ def download_from_github(workflow_id: int, only_failing: bool):
     help="Source platform (gitlab or github)",
 )
 @click.option(
-    "--pipeline-id",
-    type=int,
-    help="Gitlab Pipeline ID or Github Workflow Run ID",
-    required=True,
+    "--pipeline-id", type=int, help="Gitlab Pipeline ID or Github Workflow Run ID", required=True
 )
 @click.option(
     "--only-failing/--no-only-failing",
