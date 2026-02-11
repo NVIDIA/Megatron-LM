@@ -636,8 +636,9 @@ class DynamicInferenceEngine(AbstractEngine):
             torch.cuda.synchronize()
             alloc_time = time.time() - alloc_time
 
-            # Reset context and request data.
-            self.context.reset()
+            all_requests_readded = set(self.requests.keys()) <= set(self.resume_request_ids)
+            if all_requests_readded:
+                self.context.reset()
 
             capture_time = time.time()
             if (

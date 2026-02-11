@@ -1723,18 +1723,6 @@ def megatron_rl_inference_mode(
             toggle_cuda_graphs(lang_module, cuda_graph_impl)
 
         inference_interface = get_inference_interface(args, loop, model)
-
-        # TODO: Improve this if statement once a change is made to CUDA graph handling.
-        cuda_graph_exists = len(_CudagraphGlobalRecord.cudagraph_inference_record) != 0
-        if cuda_graph_impl != "none" and not cuda_graph_exists:
-            with nvtx_range("wait-for-decode-only"):
-                while not inference_interface._inference_engine.context.is_decode_only():
-                    active_requests, finished_requests, step_time = loop.run_until_complete(
-                        inference_interface._inference_engine.async_step()
-                    )
-            with nvtx_range("build-cuda-graphs"):
-                inference_interface._inference_engine.create_cuda_graphs(reset_context=True)
-
         loop.run_until_complete(inference_interface.resume())
 
         logger.debug(f"[{dist.get_rank()}] Entered inference mode")
