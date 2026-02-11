@@ -1,0 +1,9 @@
+# SSM/Mamba module -- imported by models (Mamba/hybrid models) and inference.
+# Could affect model tests and dist_checkpointing model tests.
+test_buckets:
+  - models
+  - ckpt_optimizer
+  - ckpt
+  - ckpt_models
+  - ckpt_moe_experts
+  - catch_all

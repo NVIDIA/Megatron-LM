@@ -1,0 +1,5 @@
+# Datasets module -- tested directly by data tests.
+# Inference imports datasets.t5_dataset (catch_all).
+test_buckets:
+  - data
+  - catch_all

@@ -1,0 +1,3 @@
+# megatron/rl/ -- tests only in catch_all.
+test_buckets:
+  - catch_all

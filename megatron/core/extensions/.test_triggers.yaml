@@ -1,0 +1,14 @@
+# Extensions module (transformer_engine, kitchen) -- imported by transformer,
+# models, tensor_parallel, distributed, pipeline_parallel, ssm.
+test_buckets:
+  - fp8_param
+  - pipeline_parallel
+  - models
+  - ckpt_optimizer
+  - ckpt
+  - ckpt_models
+  - ckpt_moe_experts
+  - transformer
+  - transformer_moe
+  - distributed_fsdp
+  - catch_all

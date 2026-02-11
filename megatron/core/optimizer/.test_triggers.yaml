@@ -1,0 +1,6 @@
+# Optimizer module -- tested by dist_checkpointing/test_optimizer and
+# optimizer tests in catch_all.  test_fp8_param uses setup_model_and_optimizer.
+test_buckets:
+  - fp8_param
+  - ckpt_optimizer
+  - catch_all

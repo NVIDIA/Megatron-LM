@@ -1,0 +1,4 @@
+# Tokenizers module -- imported by datasets and inference.
+test_buckets:
+  - data
+  - catch_all

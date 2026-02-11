@@ -1,0 +1,11 @@
+# Distributed module (DDP, FSDP, grad sync) -- test_fp8_param imports DDP,
+# dist_checkpointing tests use models wrapped in DDP through training,
+# distributed FSDP tests directly test this code.
+test_buckets:
+  - fp8_param
+  - ckpt_optimizer
+  - ckpt
+  - ckpt_models
+  - ckpt_moe_experts
+  - distributed_fsdp
+  - catch_all

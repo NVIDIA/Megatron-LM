@@ -1,0 +1,4 @@
+# Distributed / FSDP test files.
+test_buckets:
+  - distributed_fsdp
+  - catch_all

@@ -1,0 +1,3 @@
+# megatron/post_training/ (top-level) -- tests only in catch_all.
+test_buckets:
+  - catch_all

@@ -1,0 +1,3 @@
+# megatron/inference/ (top-level) -- imports training and core.inference.
+test_buckets:
+  - catch_all

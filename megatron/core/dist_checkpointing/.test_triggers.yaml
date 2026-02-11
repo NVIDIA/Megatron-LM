@@ -1,0 +1,14 @@
+# Dist checkpointing module -- imported by transformer, models, optimizer.
+# Tests also directly use transformer and models for integration testing.
+test_buckets:
+  - fp8_param
+  - pipeline_parallel
+  - models
+  - ckpt_optimizer
+  - ckpt
+  - ckpt_models
+  - ckpt_moe_experts
+  - transformer
+  - transformer_moe
+  - distributed_fsdp
+  - catch_all

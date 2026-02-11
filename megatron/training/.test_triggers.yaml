@@ -1,0 +1,14 @@
+# megatron/training/ -- central hub imported by many test files.
+# test_fp8_param, pipeline_parallel tests, data tests, dist_checkpointing
+# tests, and many catch_all tests import from megatron.training.
+test_buckets:
+  - fp8_param
+  - pipeline_parallel
+  - models
+  - data
+  - ckpt_optimizer
+  - ckpt
+  - ckpt_models
+  - ckpt_moe_experts
+  - distributed_fsdp
+  - catch_all
