@@ -59,7 +59,7 @@ def add_text_generate_args(parser):
         metavar='N',
         type=str,
         nargs='+',
-        help='Encoder input prompts with each prompt within quotes and seperated by space',
+        help='Encoder input prompts with each prompt within quotes and separated by space',
     )
     group.add_argument(
         "--max-batch-size", type=int, default=1, help='Max number of prompts to process at once'
