@@ -1091,20 +1091,29 @@ class TestDynamicInferenceEngine:
             num_gap_steps=1,
         )
 
-        # Note: Each request generates 32 tokens, so there will be 32 GENERATED_TOKEN events per request
-        # For simplicity, we check that the sequence starts and ends correctly
-        for request in env.requests:
-            event_types = [e.type.name for e in request.events]
-            if request.status.name == 'COMPLETED':
-                # Completed requests should have ADD_ENGINE, ADD_CONTEXT, GENERATED_TOKEN(s), FINISH
-                assert event_types[0] in ('ADD_ENGINE', 'ERROR_TRANSIENT'), f"Unexpected first event: {event_types[0]}"
-                assert event_types[-1] == 'FINISH', f"Unexpected last event: {event_types[-1]}"
-                # Should have at least one GENERATED_TOKEN
-                assert 'GENERATED_TOKEN' in event_types, f"Missing GENERATED_TOKEN events"
-            elif request.status.name == 'FAILED':
-                # Failed requests should have ERROR_NONTRANSIENT, FAIL
-                assert 'ERROR_NONTRANSIENT' in event_types
-                assert event_types[-1] == 'FAIL'
+        expected_event_types = [
+            ['ADD_ENGINE', 'ADD_CONTEXT', 'FINISH'],
+            ['ADD_ENGINE', 'ADD_CONTEXT', 'FINISH'],
+            ['ADD_ENGINE', 'ADD_CONTEXT', 'FINISH'],
+            ['ADD_ENGINE', 'ADD_CONTEXT', 'FINISH'],
+            ['ERROR_TRANSIENT', 'ADD_ENGINE', 'ADD_CONTEXT', 'FINISH'],
+            ['ERROR_TRANSIENT', 'ADD_ENGINE', 'ADD_CONTEXT', 'FINISH'],
+            ['ADD_ENGINE', 'ADD_CONTEXT', 'FINISH'],
+            ['ERROR_NONTRANSIENT', 'FAIL'],
+            ['ERROR_NONTRANSIENT', 'FAIL'],
+            ['ERROR_TRANSIENT', 'ADD_ENGINE', 'ADD_CONTEXT', 'FINISH'],
+            ['ERROR_NONTRANSIENT', 'FAIL'],
+            ['ERROR_TRANSIENT', 'ADD_ENGINE', 'ADD_CONTEXT', 'FINISH'],
+            ['ADD_ENGINE', 'ADD_CONTEXT', 'FINISH'],
+            ['ERROR_TRANSIENT', 'ADD_ENGINE', 'ADD_CONTEXT', 'FINISH'],
+            ['ERROR_TRANSIENT', 'ADD_ENGINE', 'ADD_CONTEXT', 'FINISH'],
+            ['ERROR_TRANSIENT', 'ADD_ENGINE', 'ADD_CONTEXT', 'FINISH'],
+        ]
+        result_event_types = [
+            [e.type.name for e in r.events if e.type.name != 'GENERATED_TOKEN']
+            for r in env.requests
+        ]
+        assert result_event_types == expected_event_types
 
     @pytest.mark.internal
     @pytest.mark.skipif(
@@ -1128,9 +1137,9 @@ class TestDynamicInferenceEngine:
             num_gap_steps=0,
         )
 
+        # All requests should complete with this generous config (large buffer, no gap steps).
+        assert all(r.status == Status.COMPLETED for r in env.requests)
         for request in env.requests:
-            if request.status != Status.COMPLETED:
-                continue
 
             # Verify event types for completed requests
             event_types = [e.type.name for e in request.events]
