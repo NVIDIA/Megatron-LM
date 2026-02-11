@@ -119,12 +119,12 @@ PS = PipelineSplit()
 
 # Define each pipeline stage
 # Hybrid pattern with multiple layer types
-Stage1 = [Mamba, [LargeMoE, Mamba] * 2, GlobalAttention, [SmallMoE, Mamba] * 3, SlidingAttention]
+Stage1 = [Embedding, Mamba, [LargeMoE, Mamba] * 2, GlobalAttention, [SmallMoE, Mamba] * 3, SlidingAttention]
 Stage2 = [[LargeMoE, Mamba] * 3, SlidingAttention, [SmallMoE, Mamba] * 3, GlobalAttention]
 Stage3 = [[LargeMoE, Mamba] * 3, SlidingAttention, [SmallMoE, Mamba] * 4, GlobalAttention]
-Stage4 = [[LargeMoE, Mamba] * 4, SmallMoE]
+Stage4 = [[LargeMoE, Mamba] * 4, SmallMoE, Loss]
 
-layer_pattern = [Embedding, Stage1, PS, Stage2, PS, Stage3, PS, Stage4, Loss]
+layer_pattern = [Stage1, PS, Stage2, PS, Stage3, PS, Stage4]
 
 # =============================================================================
 # MODEL

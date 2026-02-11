@@ -91,12 +91,12 @@ Loss = CrossEntropyLayerConfig()
 PS = PipelineSplit()
 
 # Define each pipeline stage (52 layers total, split across 4 stages)
-Stage1 = [Mamba, [MoE, Mamba] * 2, Attention, [MoE, Mamba] * 3, Attention]
+Stage1 = [Embedding, Mamba, [MoE, Mamba] * 2, Attention, [MoE, Mamba] * 3, Attention]
 Stage2 = [[MoE, Mamba] * 3, Attention, [MoE, Mamba] * 3, Attention]
 Stage3 = [[MoE, Mamba] * 3, Attention, [MoE, Mamba] * 4, Attention]
-Stage4 = [[MoE, Mamba] * 4, MoE]
+Stage4 = [[MoE, Mamba] * 4, MoE, Loss]
 
-layer_pattern = [Embedding, Stage1, PS, Stage2, PS, Stage3, PS, Stage4, Loss]
+layer_pattern = [Stage1, PS, Stage2, PS, Stage3, PS, Stage4]
 
 # =============================================================================
 # MODEL
