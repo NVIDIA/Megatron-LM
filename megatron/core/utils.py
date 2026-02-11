@@ -1041,8 +1041,17 @@ def make_sharded_tensor_for_checkpoint(tensor, key, prepend_offsets=(), replica_
         tensor = get_full_tensor_if_necessary(tensor)
         new_offsets.append((prepend_axis_num, dp_rank, dp_size))
 
+    tp_rank = parallel_state.get_tensor_model_parallel_rank()
+    tp_size = parallel_state.get_tensor_model_parallel_world_size()
+
+    # Give each TP rank a unique checkpoint key for replicated tensors.
+    # This ensures each TP rank saves/loads from its own file, eliminating
+    # cross-TP-group file reads on distributed filesystems.
+    if tp_size > 1:
+        key = f'{key}.__tp_replica_{tp_rank}'
+
     if replica_id is None:
-        replica_id = (0, get_pg_rank(tp_group), dp_replica_id)
+        replica_id = (0, 0, dp_replica_id)
 
     return ShardedTensor.from_rank_offsets(
         key,
