@@ -29,8 +29,7 @@ from megatron.core.transformer.cuda_graphs import (
 )
 from megatron.core.transformer.module import Float16Module
 from megatron.rl import rl_utils
-from megatron.rl.agent.api import Rollout, TokenRollout, RewardEvaluationResult
-from megatron.rl.agent.reward_only_agent import RewardOnlyEvaluationResponse
+from megatron.rl.agent.api import Rollout, TokenRollout
 from megatron.rl.sequence_packing_utils import get_default_packed_seq_params
 from megatron.training.arguments import parse_args, validate_args
 from megatron.training.global_vars import destroy_global_vars, set_global_variables
@@ -868,7 +867,7 @@ class TestRLUtils:
         CudaGraphManager.fwd_mempools = None
         CudaGraphManager.bwd_mempools = None
 
-    def test_dump_results_json_rollouts(self, tmp_path):
+    def test_dump_results_json(self, tmp_path):
         """Test that dump_results_json correctly serializes grouped rollouts."""
         r1 = TokenRollout(
             trajectory=[[1, 2, 3, 43]],
@@ -898,29 +897,3 @@ class TestRLUtils:
         assert data[0][0]["reward"] == 3.14
         assert data[0][1]["trajectory"] == ["Hello world"]
         assert data[0][1]["reward"] == 1.0
-
-    def test_dump_results_json_eval_results_with_nones(self, tmp_path):
-        """Test that dump_results_json handles None entries (non-rank-0 workers)."""
-        result = RewardEvaluationResult(
-            prompt="What is 2+2?",
-            response="4",
-            reward=1.0,
-            problem_id='math_1',
-        )
-        response = RewardOnlyEvaluationResponse(
-            env_id='math_env',
-            results=[result],
-        )
-        dp_eval_results = [None, [response]]
-
-        path = str(tmp_path / "eval.json")
-        rl_utils.dump_results_json(path, dp_eval_results)
-
-        with open(path) as f:
-            data = json.load(f)
-
-        assert data[0] is None
-        assert len(data[1]) == 1
-        assert data[1][0]["env_id"] == "math_env"
-        assert data[1][0]["results"][0]["reward"] == 1.0
-        assert data[1][0]["results"][0]["prompt"] == "What is 2+2?"

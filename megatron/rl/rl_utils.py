@@ -89,25 +89,6 @@ if HAVE_TORCH_MEMORY_SAVER:
 
 logger = logging.getLogger(__name__)
 
-
-def dump_results_json(path: str, results: list) -> None:
-    """Dump a list of AgentBaseModel-derived objects (possibly nested/nullable) to JSON.
-
-    Args:
-        path: File path to write to.
-        results: A list where each element is either None or a list of
-                 Pydantic models that support model_dump().
-    """
-    with open(path, 'w') as f:
-        json.dump(
-            [
-                [r.model_dump() for r in group] if group is not None else None
-                for group in results
-            ],
-            f,
-        )
-
-
 # Global variable to store packing context for forward_step
 _GLOBAL_PACKING_CONTEXT = None
 
@@ -116,6 +97,18 @@ _GLOBAL_PACKING_CONTEXT = None
 # Model starts on GPU after creation and is used immediately, so starts as False.
 _INFERENCE_MODEL_IS_PAUSED = False
 
+def dump_results_json(path: str, results: list[list[BaseModel]]) -> None:
+    """JSON dump a list of list[BaseModel].
+
+    Args:
+        path: File path to write to.
+        results: A list of list[BaseModel].
+    """
+    with open(path, 'w') as f:
+        json.dump(
+            [[r.model_dump() for r in group] for group in results],
+            f,
+        )
 
 def _torch_saver_swap_inference_model(*, to_cpu: bool) -> None:
     """Swap RL inference model weights between CPU and GPU using torch_memory_saver.
