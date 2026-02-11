@@ -6,13 +6,13 @@ Megatron Core offers a flexible, reusable foundation for building large-scale tr
 
 ## Key Features
 
-* Composable transformer building blocks (attention, MLP, etc.)
+* Composable transformer building blocks (attention, MLP)
 * Advanced parallelism strategies (TP, PP, DP, EP, CP)
 * Pipeline schedules and distributed optimizers
 * Mixed precision support (FP16, BF16, FP8)
 * GPU-optimized kernels and memory management
 * High-performance dataloaders and dataset utilities
-* Model architectures (LLaMA, Qwen, DeepSeek, GPT, Mamba, etc.)
+* Model architectures (LLaMA, Qwen, DeepSeek, GPT, Mamba)
 
 
 ```{toctree}
@@ -81,16 +81,16 @@ developer/generate_docs
 ```{toctree}
 :maxdepth: 2
 :hidden:
-:caption: Discussions
+:caption: API Reference
 
-advanced/index
+api-guide/index
+apidocs/index.rst
 ```
 
 ```{toctree}
 :maxdepth: 2
 :hidden:
-:caption: API Reference
+:caption: Resources
 
-api-guide/index
-apidocs/index.rst
+advanced/index
 ```
