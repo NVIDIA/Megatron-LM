@@ -14,8 +14,9 @@ import math
 import pytest
 import torch
 
-from megatron.core.optimizer import get_mup_config_overrides
+from megatron.core.optimizer import get_mup_config_overrides, get_standard_config_overrides
 from megatron.core.optimizer.optimizer_config import OptimizerConfig
+from megatron.core.optimizer_param_scheduler import combine_param_group_overrides
 from megatron.core.transformer.multi_token_prediction import process_mtp_loss
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.utils import init_method_normal, mup_scaled_init_method_normal
@@ -231,6 +232,43 @@ class TestMuPLRScaling:
 
             # Backward-compatible fallback for older modules without the attribute.
             assert predicate_fn(hidden_param, 'embedding.word_embeddings.weight') is False
+
+    def test_mup_with_decoupled_lr_scales_hidden_only(self):
+        """When decoupled_lr is enabled, MuP should not override embedding/output LR."""
+        optimizer_config = OptimizerConfig(
+            lr=1e-3, min_lr=1e-5, decoupled_lr=2e-4, decoupled_min_lr=2e-6
+        )
+        width_mult = 4.0
+
+        standard_overrides = get_standard_config_overrides(optimizer_config)
+        mup_overrides = get_mup_config_overrides(optimizer_config, width_mult)
+        combined_overrides = {**standard_overrides, **mup_overrides}
+
+        hidden_param = torch.nn.Parameter(torch.zeros(10, 10))
+        output_param = torch.nn.Parameter(torch.zeros(10, 10))
+        output_param.is_embedding_or_output_parameter = True
+
+        hidden_matches = [
+            override
+            for param_key, override in combined_overrides.items()
+            if param_key.matches(hidden_param, 'decoder.layer.0.weight')
+        ]
+        output_matches = [
+            override
+            for param_key, override in combined_overrides.items()
+            if param_key.matches(output_param, 'output_layer.weight')
+        ]
+
+        hidden_override = combine_param_group_overrides(hidden_matches)
+        output_override = combine_param_group_overrides(output_matches)
+
+        # Hidden params keep MuP scaling.
+        assert hidden_override['max_lr'] == pytest.approx(1e-3 / width_mult)
+        assert hidden_override['min_lr'] == pytest.approx(1e-5 / width_mult)
+
+        # Output params keep decoupled LR and should not conflict with MuP.
+        assert output_override['max_lr'] == pytest.approx(2e-4)
+        assert output_override['min_lr'] == pytest.approx(2e-6)
 
 
 class TestMuPConfigIntegration:

@@ -118,7 +118,9 @@ def get_mup_config_overrides(
     - Adam/AdamW: hidden+output lr = base_lr / width_mult
     - SGD: no scaling applied (uses base lr for all params)
 
-    Embeddings keep the base learning rate; output layers are treated like hidden layers.
+    Embeddings keep the base learning rate. Output layers are treated like hidden
+    layers unless decoupled_lr is enabled, in which case decoupled_lr takes precedence
+    for embedding/output parameters.
 
     Args:
         config (OptimizerConfig): optimizer configuration object.
@@ -128,13 +130,14 @@ def get_mup_config_overrides(
     Returns:
         Dict[ParamKey, ParamGroupOverride]: MuP config overrides for hidden layers.
     """
-    if config.decoupled_lr is not None:
+    decoupled_lr_enabled = config.decoupled_lr is not None
+    if decoupled_lr_enabled:
         log_single_rank(
             logger,
             logging.WARNING,
             "Both decoupled_lr and MuP LR scaling are enabled. decoupled_lr sets an "
-            "absolute LR for embedding+output params, which may conflict with MuP's "
-            "per-layer scaling. Ensure this is intentional.",
+            "absolute LR for embedding+output params. MuP LR scaling will only be "
+            "applied to hidden layers in this case.",
         )
 
     if mup_width_mult == 1.0:
@@ -152,18 +155,25 @@ def get_mup_config_overrides(
     # Hidden/output layers get scaled LR; embeddings use base LR.
     # Prefer the explicit parameter attribute set by LanguageModule. Fall back to
     # a conservative name check for older or non-language modules.
+    def is_embedding_parameter(param: torch.nn.Parameter, param_name: str) -> bool:
+        if getattr(param, 'shared_embedding', False):
+            return True
+        if hasattr(param, 'is_embedding_parameter'):
+            return bool(param.is_embedding_parameter)
+        return 'embedding' in param_name.lower()
+
+    def should_scale_with_mup(param: torch.nn.Parameter, param_name: str) -> bool:
+        if decoupled_lr_enabled and getattr(param, 'is_embedding_or_output_parameter', False):
+            return False
+        return not is_embedding_parameter(param, param_name)
+
     hidden_predicate = ParamWithNamePredicate(
-        name="mup_hidden_and_output",
-        fn=lambda p, n: (
-            not (
-                getattr(p, 'shared_embedding', False)
-                or (
-                    p.is_embedding_parameter
-                    if hasattr(p, 'is_embedding_parameter')
-                    else ('embedding' in n.lower())
-                )
-            )
+        name=(
+            "mup_hidden_only_excluding_embedding_output"
+            if decoupled_lr_enabled
+            else "mup_hidden_and_output"
         ),
+        fn=should_scale_with_mup,
     )
 
     override: ParamGroupOverride = {}
