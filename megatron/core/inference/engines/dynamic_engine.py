@@ -172,6 +172,9 @@ class DynamicInferenceEngine(AbstractEngine):
         self.controller = controller
         self.context = context
         self.track_paused_request_events = inference_config.track_paused_request_events
+        self.track_generated_token_events = getattr(
+            inference_config, 'track_generated_token_events', False
+        )
         self.enable_chunked_prefill = inference_config.enable_chunked_prefill
         self.metrics_writer = inference_config.metrics_writer
         self.logging_step_interval = inference_config.logging_step_interval
@@ -872,7 +875,9 @@ class DynamicInferenceEngine(AbstractEngine):
                 # Skip appending token for requests being finished due to stop words
                 # (they already have their final token from the previous step)
                 if request_id not in self.stop_word_being_finished_ids:
-                    request.add_event_generated_token(token)
+                    request.generated_tokens.append(token)
+                    if self.track_generated_token_events:
+                        request.add_event_generated_token(token)
                     if request.tpot is None:
                         request.tpot = []
                     request.tpot.append(step_time)

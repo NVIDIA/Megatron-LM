@@ -3,7 +3,7 @@
 """Comprehensive tests for DynamicInferenceEvent and request event lifecycle.
 
 This test suite covers all 9 event types, payload validation, serialization,
-request methods, and lifecycle sequences with exactly 10 substantial tests.
+request methods, and lifecycle sequences with exactly 9 substantial tests.
 """
 
 import time
@@ -143,11 +143,12 @@ def test_successful_request_lifecycle_with_serialization_roundtrip(basic_request
     - Full successful lifecycle event sequence
     - Event order preservation
     - Request serialization/deserialization roundtrip
-    - generated_tokens property extraction
+    - generated_tokens as direct List[int] field
     """
     # Build complete successful lifecycle
     basic_request.add_event_add_engine()
     basic_request.add_event_add_context()
+    basic_request.generated_tokens.extend([100, 200, 300])
     basic_request.add_event_generated_token(100)
     basic_request.add_event_generated_token(200)
     basic_request.add_event_generated_token(300)
@@ -164,8 +165,9 @@ def test_successful_request_lifecycle_with_serialization_roundtrip(basic_request
         DynamicInferenceEventType.FINISH,
     ]
 
-    # Verify generated_tokens property
+    # Verify generated_tokens is a direct list field
     assert basic_request.generated_tokens == [100, 200, 300]
+    assert isinstance(basic_request.generated_tokens, list)
 
     # Serialize request
     serialized = basic_request.serialize()
@@ -173,12 +175,12 @@ def test_successful_request_lifecycle_with_serialization_roundtrip(basic_request
     assert len(serialized['events']) == 6
     assert serialized['generated_tokens'] == [100, 200, 300]
 
-    # Verify event types in serialized form
-    event_type_names = [e['type'] for e in serialized['events']]
-    assert event_type_names == [
-        'ADD_ENGINE', 'ADD_CONTEXT', 'GENERATED_TOKEN',
-        'GENERATED_TOKEN', 'GENERATED_TOKEN', 'FINISH'
-    ]
+    # Verify GENERATED_TOKEN events serialize with {"token_id": ...} payload
+    token_events = [e for e in serialized['events'] if e['type'] == 'GENERATED_TOKEN']
+    assert len(token_events) == 3
+    assert token_events[0]['payload'] == {"token_id": 100}
+    assert token_events[1]['payload'] == {"token_id": 200}
+    assert token_events[2]['payload'] == {"token_id": 300}
 
     # Deserialize and verify restoration
     restored = DynamicInferenceRequest.deserialize(serialized)
@@ -250,48 +252,46 @@ def test_error_event_serialization_with_context_error_factory():
 # ============================================================================
 
 
-def test_generated_tokens_property_filters_and_preserves_order(basic_request):
-    """Test generated_tokens property correctly filters GENERATED_TOKEN events and preserves order.
+def test_generated_tokens_is_direct_list_field(basic_request):
+    """Test generated_tokens is a direct List[int] field, independent of events.
 
     Coverage:
-    - Mixed event filtering (only GENERATED_TOKEN payloads extracted)
+    - generated_tokens starts as empty list
+    - Direct append works independently of events
     - Token ID edge cases: 0, large values (2^62)
-    - Order preservation with interspersed events
+    - Field is serialized/deserialized correctly
     """
-    # Start with no events
+    # Start with empty list
     assert basic_request.generated_tokens == []
+    assert isinstance(basic_request.generated_tokens, list)
 
-    # Add only non-token events
-    basic_request.add_event_add_engine()
-    basic_request.add_event_add_context()
-    assert basic_request.generated_tokens == []
-
-    # Add token with edge case ID 0
-    basic_request.add_event_generated_token(0)
+    # Direct append works
+    basic_request.generated_tokens.append(0)
     assert basic_request.generated_tokens == [0]
 
-    # Intersperse with PAUSE
-    basic_request.add_event_pause()
-    basic_request.add_event_generated_token(100)
+    basic_request.generated_tokens.append(100)
     assert basic_request.generated_tokens == [0, 100]
 
-    # Add large token ID
+    # Large token ID
     large_id = 2**62
-    basic_request.add_event_generated_token(large_id)
+    basic_request.generated_tokens.append(large_id)
     assert basic_request.generated_tokens == [0, 100, large_id]
 
-    # More interspersed events
-    error = RequestOverflowError(request_id=1, message="Transient")
-    basic_request.add_event_error_transient(error)
-    basic_request.add_event_generated_token(200)
-    basic_request.add_event_finish()
-
-    # Final check - only token payloads, in order
+    basic_request.generated_tokens.append(200)
     assert basic_request.generated_tokens == [0, 100, large_id, 200]
 
-    # Verify total events vs token events
-    assert len(basic_request.events) == 9  # All events
-    assert len(basic_request.generated_tokens) == 4  # Only token events
+    # Events are independent - add some events
+    basic_request.add_event_add_engine()
+    basic_request.add_event_add_context()
+    basic_request.add_event_finish()
+    assert len(basic_request.events) == 3
+    assert len(basic_request.generated_tokens) == 4
+
+    # Serialization roundtrip preserves generated_tokens
+    serialized = basic_request.serialize()
+    assert serialized['generated_tokens'] == [0, 100, large_id, 200]
+    restored = DynamicInferenceRequest.deserialize(serialized)
+    assert restored.generated_tokens == [0, 100, large_id, 200]
 
 
 # ============================================================================
@@ -316,6 +316,7 @@ def test_request_record_merge_across_eviction_recovery():
     )
     req1.add_event_add_engine()
     req1.add_event_add_context()
+    req1.generated_tokens.extend([100, 101])
     req1.add_event_generated_token(100)
     req1.add_event_generated_token(101)
     req1.add_event_evict()
@@ -328,6 +329,7 @@ def test_request_record_merge_across_eviction_recovery():
     )
     req2.add_event_add_engine()
     req2.add_event_add_context()
+    req2.generated_tokens.extend([200, 201])
     req2.add_event_generated_token(200)
     req2.add_event_generated_token(201)
     req2.add_event_finish()
@@ -360,72 +362,7 @@ def test_request_record_merge_across_eviction_recovery():
 
 
 # ============================================================================
-# Test 6: Compact Serialization Mode Roundtrip
-# ============================================================================
-
-
-def test_compact_serialization_mode_roundtrip(basic_request):
-    """Test compact serialization (track_generated_token_events=False) for all levels.
-
-    Coverage:
-    - GENERATED_TOKEN events become integers in compact mode
-    - Other events remain dicts in compact mode
-    - Deserialization restores GENERATED_TOKEN events with timestamp=-1 sentinel
-    - Request-level and RequestRecord-level compact serialization
-    - generated_tokens property works after compact roundtrip
-    """
-    # Event-level compact serialization
-    token_event = DynamicInferenceEvent(
-        type=DynamicInferenceEventType.GENERATED_TOKEN, payload=42
-    )
-    compact_serialized = token_event.serialize(track_generated_token_events=False)
-    assert compact_serialized == 42  # Just the token ID
-
-    # Non-token event serializes normally even in compact mode
-    add_event = DynamicInferenceEvent(type=DynamicInferenceEventType.ADD_ENGINE)
-    normal_serialized = add_event.serialize(track_generated_token_events=False)
-    assert isinstance(normal_serialized, dict)
-    assert normal_serialized["type"] == "ADD_ENGINE"
-
-    # Deserialize compact int back to GENERATED_TOKEN event
-    restored_token = DynamicInferenceEvent.deserialize(42)
-    assert restored_token.type == DynamicInferenceEventType.GENERATED_TOKEN
-    assert restored_token.payload == 42
-    assert restored_token.timestamp == -1  # Sentinel value
-
-    # Request-level compact serialization
-    basic_request.add_event_add_engine()
-    basic_request.add_event_generated_token(100)
-    basic_request.add_event_generated_token(200)
-    basic_request.add_event_finish()
-
-    serialized = basic_request.serialize(track_generated_token_events=False)
-    events = serialized["events"]
-
-    # Verify mixed format
-    assert isinstance(events[0], dict)  # ADD_ENGINE
-    assert events[1] == 100  # GENERATED_TOKEN compact
-    assert events[2] == 200  # GENERATED_TOKEN compact
-    assert isinstance(events[3], dict)  # FINISH
-
-    # Deserialize and verify
-    restored = DynamicInferenceRequest.deserialize(serialized)
-    assert len(restored.events) == 4
-    assert restored.generated_tokens == [100, 200]
-
-    # Token events have sentinel timestamp
-    token_events = [e for e in restored.events
-                    if e.type == DynamicInferenceEventType.GENERATED_TOKEN]
-    assert all(e.timestamp == -1 for e in token_events)
-
-    # RequestRecord-level compact serialization
-    record = DynamicInferenceRequestRecord.from_request(basic_request)
-    record_serialized = record.serialize(track_generated_token_events=False)
-    assert record_serialized["requests"][0]["events"][1] == 100
-
-
-# ============================================================================
-# Test 7: TTFT Calculation from Event Timestamps
+# Test 6: TTFT Calculation from Event Timestamps
 # ============================================================================
 
 
@@ -479,7 +416,7 @@ def test_ttft_calculation_from_event_timestamps(basic_request):
 
 
 # ============================================================================
-# Test 8: Failed Request Lifecycle with Error Propagation
+# Test 7: Failed Request Lifecycle with Error Propagation
 # ============================================================================
 
 
@@ -545,7 +482,7 @@ def test_failed_request_lifecycle_with_error_propagation(basic_request):
 
 
 # ============================================================================
-# Test 9: Event String Representation for All Types
+# Test 8: Event String Representation for All Types
 # ============================================================================
 
 
@@ -605,7 +542,7 @@ def test_event_str_representation_for_all_types():
 
 
 # ============================================================================
-# Test 10: Complex Multi-Pause-Evict Lifecycle with Record
+# Test 9: Complex Multi-Pause-Evict Lifecycle with Record
 # ============================================================================
 
 
@@ -626,9 +563,12 @@ def test_complex_multi_pause_evict_lifecycle_with_record():
     )
     req1.add_event_add_engine()
     req1.add_event_add_context()
+    req1.generated_tokens.append(10)
     req1.add_event_generated_token(10)
     req1.add_event_pause()  # Paused for higher priority request
+    req1.generated_tokens.append(11)
     req1.add_event_generated_token(11)
+    req1.generated_tokens.append(12)
     req1.add_event_generated_token(12)
     req1.add_event_evict()  # Memory pressure
 
@@ -640,9 +580,11 @@ def test_complex_multi_pause_evict_lifecycle_with_record():
     )
     req2.add_event_add_engine()
     req2.add_event_add_context()
+    req2.generated_tokens.append(20)
     req2.add_event_generated_token(20)
     req2.add_event_pause()
     req2.add_event_pause()  # Paused twice
+    req2.generated_tokens.append(21)
     req2.add_event_generated_token(21)
     req2.add_event_evict()
 
@@ -654,6 +596,7 @@ def test_complex_multi_pause_evict_lifecycle_with_record():
     )
     req3.add_event_add_engine()
     req3.add_event_add_context()
+    req3.generated_tokens.extend([30, 31, 32])
     req3.add_event_generated_token(30)
     req3.add_event_generated_token(31)
     req3.add_event_generated_token(32)
@@ -687,17 +630,16 @@ def test_complex_multi_pause_evict_lifecycle_with_record():
     # Total events: 7 from req1 + 7 from req2 + 6 from req3 = 20
     assert len(merged.events) == 20
 
-    # Test compact serialization roundtrip of entire record
-    compact_serialized = record.serialize(track_generated_token_events=False)
+    # Test serialization roundtrip of entire record
+    serialized = record.serialize()
+    assert len(serialized['requests']) == 3
 
-    # Verify compact format in first request's events
-    first_request_events = compact_serialized['requests'][0]['events']
-    # Events: ADD_ENGINE(dict), ADD_CONTEXT(dict), TOKEN(int), PAUSE(dict),
-    #         TOKEN(int), TOKEN(int), EVICT(dict)
-    assert isinstance(first_request_events[0], dict)  # ADD_ENGINE
-    assert isinstance(first_request_events[1], dict)  # ADD_CONTEXT
-    assert first_request_events[2] == 10  # GENERATED_TOKEN compact
-    assert isinstance(first_request_events[3], dict)  # PAUSE
-    assert first_request_events[4] == 11  # GENERATED_TOKEN compact
-    assert first_request_events[5] == 12  # GENERATED_TOKEN compact
-    assert isinstance(first_request_events[6], dict)  # EVICT
+    # Verify all events are dicts (no compact mode)
+    first_request_events = serialized['requests'][0]['events']
+    assert all(isinstance(e, dict) for e in first_request_events)
+
+    # Verify GENERATED_TOKEN events use {"token_id": ...} payload format
+    token_events = [e for e in first_request_events if e['type'] == 'GENERATED_TOKEN']
+    assert token_events[0]['payload'] == {"token_id": 10}
+    assert token_events[1]['payload'] == {"token_id": 11}
+    assert token_events[2]['payload'] == {"token_id": 12}

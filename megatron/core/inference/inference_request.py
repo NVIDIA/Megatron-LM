@@ -218,21 +218,12 @@ class DynamicInferenceEvent:
             payload_str = f", {type(self.payload).__name__}"
         return f"[{self.timestamp:.3f}] {self.type.name}{payload_str}"
 
-    def serialize(self, track_generated_token_events: bool = True) -> dict | int:
+    def serialize(self) -> dict:
         """Converts the instance into a serializable dictionary.
 
-        Args:
-            track_generated_token_events: If False and this is a GENERATED_TOKEN event,
-                return just the token ID integer instead of the full event dict.
-
         Returns:
-            dict or int: Full event dict, or just the token ID if compact mode.
+            dict: Full event dict.
         """
-        # If compact mode for GENERATED_TOKEN, return just the token ID
-        if not track_generated_token_events and self.type == DynamicInferenceEventType.GENERATED_TOKEN:
-            return self.payload
-
-        # Dataclass to dict.
         torch.cuda.nvtx.range_push("DynamicInferenceEvent.serialize")
         # do not use asdict(self) - it has very high CPU overheads
         # and if there are tensors, it will try to deepcopy them
@@ -242,49 +233,38 @@ class DynamicInferenceEvent:
         # Serialize payload.
         if self.payload is not None:
             if self.type == DynamicInferenceEventType.GENERATED_TOKEN:
-                # Token ID is already an int, no special serialization needed
-                obj["payload"] = self.payload
+                obj["payload"] = {"token_id": self.payload}
             else:
                 from .contexts.dynamic_context import ContextErrorFactory  # avoid circular import.
 
                 obj["payload"] = ContextErrorFactory.serialize(self.payload)
 
+        torch.cuda.nvtx.range_pop()
         return obj
 
     @classmethod
-    def deserialize(cls, obj: dict | int) -> "DynamicInferenceEvent":
+    def deserialize(cls, obj: dict) -> "DynamicInferenceEvent":
         """Deserialize event.
 
         Args:
-            obj: Serialized event data (dict for full event, int for compact GENERATED_TOKEN).
+            obj: Serialized event data dict.
 
         Returns:
             (DynamicInferenceEvent) Deserialized event.
         """
-        # Handle compact GENERATED_TOKEN format
-        if isinstance(obj, int):
-            return cls(
-                type=DynamicInferenceEventType.GENERATED_TOKEN,
-                timestamp=-1,  # Sentinel value indicating compact format
-                payload=obj,
-            )
-
         event_type = DynamicInferenceEventType[obj["type"]]
 
-        # Initialize event.
-        event = cls(**{**obj, "type": event_type})
-
-        # Deserialize payload.
+        # Pre-process payload before construction (since __post_init__ validates types).
+        init_obj = {**obj, "type": event_type}
         if obj["payload"] is not None:
             if event_type == DynamicInferenceEventType.GENERATED_TOKEN:
-                # Token ID is already an int, no special deserialization needed
-                event.payload = obj["payload"]
+                init_obj["payload"] = obj["payload"]["token_id"]
             else:
                 from .contexts.dynamic_context import ContextErrorFactory  # avoid circular import.
 
-                event.payload = ContextErrorFactory.deserialize(obj["payload"])
+                init_obj["payload"] = ContextErrorFactory.deserialize(obj["payload"])
 
-        return event
+        return cls(**init_obj)
 
 
 @experimental_api
@@ -318,34 +298,7 @@ class DynamicInferenceRequest(InferenceRequest):
         return len(self.remaining_prompt_tokens)
 
     events: List[DynamicInferenceEvent] = field(default_factory=list)
-
-    @property
-    def generated_tokens(self) -> List[int]:
-        """Get the list of generated token IDs from GENERATED_TOKEN events.
-
-        Returns:
-            List[int]: List of token IDs in the order they were generated.
-
-        Note:
-            This property overrides the parent class's generated_tokens field.
-            The setter is provided to allow dataclass __init__ to work (it ignores
-            the value since tokens are computed from GENERATED_TOKEN events).
-        """
-        return [
-            e.payload
-            for e in self.events
-            if e.type == DynamicInferenceEventType.GENERATED_TOKEN
-        ]
-
-    @generated_tokens.setter
-    def generated_tokens(self, value) -> None:
-        """No-op setter to allow dataclass __init__ to work.
-
-        The parent class InferenceRequest has generated_tokens as a field, which
-        means dataclass __init__ tries to set it. This setter ignores the value
-        since generated_tokens is computed from GENERATED_TOKEN events.
-        """
-        pass  # Ignore - tokens are computed from events
+    generated_tokens: List[int] = field(default_factory=list)
 
     def __str__(self):
         return ", ".join(
@@ -358,12 +311,8 @@ class DynamicInferenceRequest(InferenceRequest):
             )
         )
 
-    def serialize(self, track_generated_token_events: bool = True):
+    def serialize(self):
         """Converts the instance into a serializable dictionary.
-
-        Args:
-            track_generated_token_events: If False, GENERATED_TOKEN events are serialized
-                as just the token ID integer instead of the full event dict.
 
         Returns:
             (dict) A dictionary representation of the instance suitable for
@@ -371,18 +320,13 @@ class DynamicInferenceRequest(InferenceRequest):
         """
         torch.cuda.nvtx.range_push("DynamicInferenceRequest.serialize")
         obj = super().serialize()
-        obj["events"] = [e.serialize(track_generated_token_events) for e in self.events]
-        # Include generated_tokens computed from events for compatibility
-        obj["generated_tokens"] = self.generated_tokens
+        obj["events"] = [e.serialize() for e in self.events]
         torch.cuda.nvtx.range_pop()
         return obj
 
     def _post_deserialize(self, obj):
         super()._post_deserialize(obj)
-        # Remove generated_tokens since it's now a property computed from events
-        if "generated_tokens" in obj:
-            del obj["generated_tokens"]
-        self.events = [DynamicInferenceEvent.deserialize(e) for e in obj["events"]]
+        self.events = [DynamicInferenceEvent.deserialize(e) for e in obj.get("events", [])]
 
     @property
     def tracked_metadata(self) -> List[Any]:
@@ -586,9 +530,6 @@ class DynamicInferenceRequestRecord:
             generated_text = None
 
         # Merged request.
-        # Note: generated_tokens is computed from GENERATED_TOKEN events via property,
-        # so we pass the merged events and generated_tokens will be derived from them.
-        merged_events = merge_lists("events")
         request = DynamicInferenceRequest(
             request_id=self.requests[0].request_id,
             prompt=prompt_text,
@@ -596,24 +537,21 @@ class DynamicInferenceRequestRecord:
             prompt_log_probs=self.requests[0].prompt_log_probs,
             prompt_top_n_logprobs=self.requests[0].prompt_top_n_logprobs,
             generated_text=generated_text,
-            generated_length=len(generated_tokens) if generated_tokens else 0,
+            generated_tokens=generated_tokens,
+            generated_length=len(generated_tokens),
             generated_log_probs=merge_lists("generated_log_probs"),
             generated_top_n_logprobs=merge_lists("generated_top_n_logprobs"),
             sampling_params=self.requests[0].sampling_params,
             tpot=merge_lists("tpot"),
             status=self.requests[-1].status,
             latency=self.latency,
-            events=merged_events,
+            events=merge_lists("events"),
         )
 
         return request
 
-    def serialize(self, track_generated_token_events: bool = True) -> dict:
+    def serialize(self) -> dict:
         """Converts the instance into a serializable dictionary.
-
-        Args:
-            track_generated_token_events: If False, GENERATED_TOKEN events are serialized
-                as just the token ID integer instead of the full event dict.
 
         Returns:
             (dict) A dictionary representation of the instance suitable for
@@ -621,7 +559,7 @@ class DynamicInferenceRequestRecord:
         """
         torch.cuda.nvtx.range_push("DynamicInferenceRequestRecord.serialize")
         obj = self.__dict__.copy()  # shallow dict copy
-        obj["requests"] = [r.serialize(track_generated_token_events) for r in obj["requests"]]
+        obj["requests"] = [r.serialize() for r in obj["requests"]]
         torch.cuda.nvtx.range_pop()
         return obj
 
