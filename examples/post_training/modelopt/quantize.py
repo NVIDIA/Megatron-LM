@@ -210,7 +210,10 @@ def get_last_layers_disabled_config(config, num_layers: int = 1, num_layers_to_d
 def get_modelopt_torch_quantization_config():
     """Return a quantization config."""
     args = get_args()
+    if args.export_quant_cfg not in QUANT_CFG_CHOICES:
+        raise ValueError(f"Unsupported quantization config {args.export_quant_cfg}.")
     mtq_config = QUANT_CFG_CHOICES[args.export_quant_cfg]
+
     fp8_config = {"enable": True, "num_bits": (4, 3), "axis": None}
     fp4_config = {
         "num_bits": (2, 1),
@@ -218,13 +221,13 @@ def get_modelopt_torch_quantization_config():
         "axis": None,
         "enable": True,
     }
-    if args.export_quant_cfg == "fp8":
+    if args.export_quant_cfg == "FP8_DEFAULT_CFG":
         # Enable Medusa heads and kv-cache quantization
         mtq_config["quant_cfg"]["*medusa_heads**"] = fp8_config
-    if "fp4" in args.export_quant_cfg:
+    if "FP4" in args.export_quant_cfg:
         # Enable Medusa heads and kv-cache quantization
         mtq_config["quant_cfg"]["*medusa_heads**"] = fp4_config
-    if "awq" in args.export_quant_cfg:
+    if "AWQ" in args.export_quant_cfg:
         weight_quantizer = mtq_config["quant_cfg"]["*weight_quantizer"]  # type: ignore
         if isinstance(weight_quantizer, list):
             weight_quantizer = weight_quantizer[0]
@@ -406,8 +409,6 @@ if __name__ == "__main__":
         )
 
     if args.export_quant_cfg is not None:
-        if args.export_quant_cfg not in QUANT_CFG_CHOICES:
-            raise ValueError(f"Unsupported quantization config {args.export_quant_cfg}.")
         print_rank_0("Quantizing the model...")
         mtq_config = get_modelopt_torch_quantization_config()
 
