@@ -75,7 +75,7 @@ class MegatronLocal(InferenceServer, ReturnsTokens, ReturnsRaw):
 
     _client: InferenceClient = PrivateAttr(None)
     _inference_engine: DynamicInferenceEngine = PrivateAttr(None)
-    _rl_kv_cache_management_mode: KVCacheManagementMode
+    _rl_kv_cache_management_mode: KVCacheManagementMode = PrivateAttr(None)
 
     async def base_generate(self, request: InferenceRequest):
 

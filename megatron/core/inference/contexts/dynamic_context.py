@@ -373,7 +373,7 @@ class DynamicInferenceContext(BaseInferenceContext):
 
         # When not using `torch_memory_saver`, we manually offload/restore tensors.
         # We use storage resize, similar to the logic in `core/distributed/param_and_grad_buffer.py`
-        self._offloadable_tensor_names: list[str] = []
+        self._offloadable_tensor_names: set[str] = set()
         self._offloadable_cpu_backups: dict[str, torch.Tensor] = {}
         self._offloadable_storage_sizes: dict[str, int] = {}
         self._uses_torch_memory_saver: bool = False
@@ -560,7 +560,7 @@ class DynamicInferenceContext(BaseInferenceContext):
             self.kv_cache_management_mode == KVCacheManagementMode.OFFLOAD
             and not self._uses_torch_memory_saver
         ):
-            self._offloadable_tensor_names.append("memory_buffer")
+            self._offloadable_tensor_names.add("memory_buffer")
             self._offloadable_cpu_backups["memory_buffer"] = torch.empty_like(
                 self.memory_buffer, device="cpu"
             ).pin_memory()
@@ -585,18 +585,18 @@ class DynamicInferenceContext(BaseInferenceContext):
                 self.kv_cache_management_mode == KVCacheManagementMode.OFFLOAD
                 and not self._uses_torch_memory_saver
             ):
-                self._offloadable_tensor_names.append("mamba_conv_states")
+                self._offloadable_tensor_names.add("mamba_conv_states")
                 self._offloadable_cpu_backups["mamba_conv_states"] = torch.empty_like(
                     self.mamba_conv_states, device="cpu"
                 ).pin_memory()
-                self._offloadable_tensor_names.append("mamba_ssm_states")
+                self._offloadable_tensor_names.add("mamba_ssm_states")
                 self._offloadable_cpu_backups["mamba_ssm_states"] = torch.empty_like(
                     self.mamba_ssm_states, device="cpu"
                 ).pin_memory()
         else:
             self.mamba_metadata = None
 
-    def allocate_all_tensors(self) -> None:
+    def initialize_all_tensors(self) -> None:
         """Allocate all GPU state during initial construction."""
         # Mark allocated.
         if self.is_tensor_state_allocated:
