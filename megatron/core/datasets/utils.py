@@ -32,7 +32,9 @@ def compile_helpers():
 
         log_single_rank(logger, logging.ERROR, "Failed to compile the C++ dataset helper functions")
 
-        dist.destroy_process_group()
+        if dist.is_available() and dist.is_initialized():
+            dist.barrier()
+            dist.destroy_process_group()
         sys.exit(1)
 
 
