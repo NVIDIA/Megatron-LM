@@ -19,7 +19,9 @@ from megatron.core.models.hl import (
     CrossEntropyLayerConfig,
     EmbeddingLayerConfig,
     HLModelConfig,
+    LinearLayerConfig,
     MambaLayerConfig,
+    MTPLayerConfig,
     MoELayerConfig,
     PipelineSplit,
 )
@@ -108,6 +110,14 @@ SmallMoE = MoELayerConfig(
     grouped_gemm=True,
 )
 
+MTP = MTPLayerConfig(
+    common_config=common_config,
+    enorm="RMSNorm",
+    hnorm="RMSNorm",
+    eh_proj=LinearLayerConfig(common_config=common_config),
+    embedding=Embedding,
+)
+
 Loss = CrossEntropyLayerConfig()
 
 # =============================================================================
@@ -122,7 +132,7 @@ PS = PipelineSplit()
 Stage1 = [Embedding, Mamba, [LargeMoE, Mamba] * 2, GlobalAttention, [SmallMoE, Mamba] * 3, SlidingAttention]
 Stage2 = [[LargeMoE, Mamba] * 3, SlidingAttention, [SmallMoE, Mamba] * 3, GlobalAttention]
 Stage3 = [[LargeMoE, Mamba] * 3, SlidingAttention, [SmallMoE, Mamba] * 4, GlobalAttention]
-Stage4 = [[LargeMoE, Mamba] * 4, SmallMoE, Loss]
+Stage4 = [[LargeMoE, Mamba] * 4, SmallMoE, MTP, Loss]
 
 layer_pattern = [Stage1, PS, Stage2, PS, Stage3, PS, Stage4]
 
