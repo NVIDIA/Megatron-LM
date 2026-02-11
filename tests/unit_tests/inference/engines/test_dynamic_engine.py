@@ -111,6 +111,7 @@ class DynamicEngineTestConfig:
     # relevant to the test. The tests only check if the required
     # context attributes are set correctly.
     suspend_resume_interval: Optional[int] = None
+    track_generated_token_events: bool = False
 
     fp8: bool = False
 
@@ -229,6 +230,7 @@ class TestDynamicInferenceEngine:
                 use_flashinfer_fused_rope=None,  # default to using flash-infer if available
                 # this is for compatibility with the LTS environment
                 unified_memory_level=0,  # unit tests currently broken with UVM
+                track_generated_token_events=test_config.track_generated_token_events,
             ),
         )
 
@@ -1091,20 +1093,29 @@ class TestDynamicInferenceEngine:
             num_gap_steps=1,
         )
 
-        # Note: Each request generates 32 tokens, so there will be 32 GENERATED_TOKEN events per request
-        # For simplicity, we check that the sequence starts and ends correctly
-        for request in env.requests:
-            event_types = [e.type.name for e in request.events]
-            if request.status.name == 'COMPLETED':
-                # Completed requests should have ADD_ENGINE, ADD_CONTEXT, GENERATED_TOKEN(s), FINISH
-                assert event_types[0] in ('ADD_ENGINE', 'ERROR_TRANSIENT'), f"Unexpected first event: {event_types[0]}"
-                assert event_types[-1] == 'FINISH', f"Unexpected last event: {event_types[-1]}"
-                # Should have at least one GENERATED_TOKEN
-                assert 'GENERATED_TOKEN' in event_types, f"Missing GENERATED_TOKEN events"
-            elif request.status.name == 'FAILED':
-                # Failed requests should have ERROR_NONTRANSIENT, FAIL
-                assert 'ERROR_NONTRANSIENT' in event_types
-                assert event_types[-1] == 'FAIL'
+        expected_event_types = [
+            ['ADD_ENGINE', 'ADD_CONTEXT', 'FINISH'],
+            ['ADD_ENGINE', 'ADD_CONTEXT', 'FINISH'],
+            ['ADD_ENGINE', 'ADD_CONTEXT', 'FINISH'],
+            ['ADD_ENGINE', 'ERROR_NONTRANSIENT', 'FAIL'],
+            ['ADD_ENGINE', 'ADD_CONTEXT', 'FINISH'],
+            ['ADD_ENGINE', 'ADD_CONTEXT', 'FINISH'],
+            ['ADD_ENGINE', 'ADD_CONTEXT', 'FINISH'],
+            ['ADD_ENGINE', 'ERROR_NONTRANSIENT', 'FAIL'],
+            ['ADD_ENGINE', 'ERROR_NONTRANSIENT', 'FAIL'],
+            ['ADD_ENGINE', 'ERROR_NONTRANSIENT', 'FAIL'],
+            ['ADD_ENGINE', 'ADD_CONTEXT', 'FINISH'],
+            ['ADD_ENGINE', 'ADD_CONTEXT', 'FINISH'],
+            ['ADD_ENGINE', 'ADD_CONTEXT', 'FINISH'],
+            ['ADD_ENGINE', 'ERROR_NONTRANSIENT', 'FAIL'],
+            ['ADD_ENGINE', 'ERROR_NONTRANSIENT', 'FAIL'],
+            ['ADD_ENGINE', 'ADD_CONTEXT', 'FINISH'],
+        ]
+        result_event_types = [
+            [e.type.name for e in r.events if e.type.name != 'GENERATED_TOKEN']
+            for r in env.requests
+        ]
+        assert result_event_types == expected_event_types
 
     @pytest.mark.internal
     @pytest.mark.skipif(
@@ -1126,24 +1137,25 @@ class TestDynamicInferenceEngine:
             num_tokens_to_generate=num_tokens_to_generate,
             context_buffer_size_gb=0.1,
             num_gap_steps=0,
+            track_generated_token_events=True,
         )
 
+        # All requests should complete with this generous config (large buffer, no gap steps).
+        assert all(r.status == Status.COMPLETED for r in env.requests)
         for request in env.requests:
-            if request.status != Status.COMPLETED:
-                continue
 
             # Verify event types for completed requests
             event_types = [e.type.name for e in request.events]
             # Should be: ADD_ENGINE, ADD_CONTEXT, GENERATED_TOKEN (repeated), FINISH
-            assert event_types[0] == 'ADD_ENGINE', (
-                f"Request {request.request_id}: first event should be ADD_ENGINE, got {event_types[0]}"
-            )
-            assert event_types[1] == 'ADD_CONTEXT', (
-                f"Request {request.request_id}: second event should be ADD_CONTEXT, got {event_types[1]}"
-            )
-            assert event_types[-1] == 'FINISH', (
-                f"Request {request.request_id}: last event should be FINISH, got {event_types[-1]}"
-            )
+            assert (
+                event_types[0] == 'ADD_ENGINE'
+            ), f"Request {request.request_id}: first event should be ADD_ENGINE, got {event_types[0]}"
+            assert (
+                event_types[1] == 'ADD_CONTEXT'
+            ), f"Request {request.request_id}: second event should be ADD_CONTEXT, got {event_types[1]}"
+            assert (
+                event_types[-1] == 'FINISH'
+            ), f"Request {request.request_id}: last event should be FINISH, got {event_types[-1]}"
             # Check that GENERATED_TOKEN events are in the middle
             gen_token_count = event_types.count('GENERATED_TOKEN')
             assert gen_token_count == len(request.generated_tokens), (
@@ -1162,18 +1174,18 @@ class TestDynamicInferenceEngine:
             # Verify TTFT is positive and sensical (first GENERATED_TOKEN - ADD_ENGINE)
             add_engine_ts = request.events[0].timestamp
             first_token_ts = request.events[2].timestamp  # First GENERATED_TOKEN event
-            assert request.events[2].type.name == 'GENERATED_TOKEN', (
-                f"Request {request.request_id}: event[2] should be GENERATED_TOKEN"
-            )
+            assert (
+                request.events[2].type.name == 'GENERATED_TOKEN'
+            ), f"Request {request.request_id}: event[2] should be GENERATED_TOKEN"
             ttft = first_token_ts - add_engine_ts
             assert ttft >= 0, f"Request {request.request_id}: TTFT is negative ({ttft})"
 
             # Verify total request time is positive
             finish_ts = request.events[-1].timestamp
             total_time = finish_ts - add_engine_ts
-            assert total_time >= ttft, (
-                f"Request {request.request_id}: total_time ({total_time}) < TTFT ({ttft})"
-            )
+            assert (
+                total_time >= ttft
+            ), f"Request {request.request_id}: total_time ({total_time}) < TTFT ({ttft})"
 
     @pytest.mark.internal
     @pytest.mark.skipif(

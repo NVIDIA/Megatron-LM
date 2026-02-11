@@ -30,6 +30,8 @@ from megatron.core.inference.data_parallel_inference_coordinator import (
 from megatron.core.inference.engines.abstract_engine import AbstractEngine
 from megatron.core.inference.headers import Headers, UnknownHeaderError
 from megatron.core.inference.inference_request import (
+    DynamicInferenceEvent,
+    DynamicInferenceEventType,
     DynamicInferenceRequest,
     DynamicInferenceRequestRecord,
     Status,
@@ -172,6 +174,9 @@ class DynamicInferenceEngine(AbstractEngine):
         self.controller = controller
         self.context = context
         self.track_paused_request_events = inference_config.track_paused_request_events
+        self.track_generated_token_events = getattr(
+            inference_config, 'track_generated_token_events', False
+        )
         self.enable_chunked_prefill = inference_config.enable_chunked_prefill
         self.metrics_writer = inference_config.metrics_writer
         self.logging_step_interval = inference_config.logging_step_interval
@@ -878,21 +883,39 @@ class DynamicInferenceEngine(AbstractEngine):
                 # Skip appending token for requests being finished due to stop words
                 # (they already have their final token from the previous step)
                 if request_id not in self.stop_word_being_finished_ids:
-                    blocks_allocated = block_allocator.total_count - block_allocator.total_avail
-                    if block_allocator.enable_prefix_caching:
-                        request.add_event_generated_token(
-                            token,
-                            blocks_total=block_allocator.total_count,
-                            blocks_hashed_total=blocks_allocated,
-                            blocks_hashed_active=int((block_allocator.block_ref_counts > 0).sum().item()),
-                            blocks_ref_count=block_allocator.block_ref_counts.sum().item(),
+                    is_first_token = len(request.generated_tokens) == 0
+                    request.generated_tokens.append(token)
+                    if self.track_generated_token_events:
+                        blocks_allocated = (
+                            block_allocator.total_count - block_allocator.total_avail
                         )
-                    else:
-                        request.add_event_generated_token(
-                            token,
-                            blocks_total=block_allocator.total_count,
-                            blocks_hashed_total=blocks_allocated,
-                            blocks_hashed_active=blocks_allocated,
+                        if block_allocator.enable_prefix_caching:
+                            event_generated_token = request.add_event_generated_token(
+                                token,
+                                blocks_total=block_allocator.total_count,
+                                blocks_hashed_total=blocks_allocated,
+                                blocks_hashed_active=int(
+                                    (block_allocator.block_ref_counts > 0).sum().item()
+                                ),
+                                blocks_ref_count=block_allocator.block_ref_counts.sum().item(),
+                            )
+                        else:
+                            event_generated_token = request.add_event_generated_token(
+                                token,
+                                blocks_total=block_allocator.total_count,
+                                blocks_hashed_total=blocks_allocated,
+                                blocks_hashed_active=blocks_allocated,
+                            )
+                    if is_first_token:
+                        if self.track_generated_token_events:
+                            first_token_event = event_generated_token
+                        else:
+                            first_token_event = DynamicInferenceEvent(
+                                type=DynamicInferenceEventType.GENERATED_TOKEN,
+                                payload={"token_id": token},
+                            )
+                        request.ttft = (
+                            first_token_event.timestamp - request.event_add_engine.timestamp
                         )
                     if request.tpot is None:
                         request.tpot = []

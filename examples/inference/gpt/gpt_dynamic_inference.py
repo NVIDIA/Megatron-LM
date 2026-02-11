@@ -34,7 +34,7 @@ from megatron.core.inference.sampling_params import SamplingParams
 from megatron.core.inference.text_generation_controllers.text_generation_controller import (
     TextGenerationController,
 )
-from megatron.core.tokenizers.text.utils.build_tokenizer import build_tokenizer
+from megatron.core.tokenizers.utils.build_tokenizer import build_tokenizer
 from megatron.inference.utils import (
     add_inference_args,
     get_inference_config_from_model_and_args,
@@ -195,16 +195,7 @@ def run_inference(
                 request.request_id = finished_request.request_id
                 request.events = finished_request.events
 
-                # Calculate TTFT = first GENERATED_TOKEN timestamp - ADD_ENGINE timestamp
-                add_engine_time = None
-                first_token_time = None
-                for event in finished_request.events:
-                    if event.type.name == "ADD_ENGINE":
-                        add_engine_time = event.timestamp
-                    elif event.type.name == "GENERATED_TOKEN" and first_token_time is None:
-                        first_token_time = event.timestamp
-                if add_engine_time is not None and first_token_time is not None:
-                    request.ttft = first_token_time - add_engine_time
+                request.ttft = finished_request.ttft
 
                 # Update prompt, in case engine has been suspended and resumed.
                 request.prompt_tokens = finished_request.prompt_tokens.tolist()
@@ -268,10 +259,9 @@ def main():
     configure_nvtx_profiling(True)
 
     args = get_args()
-    if args.legacy_tokenizer:
-        tokenizer = get_tokenizer()
-    else:
-        tokenizer = build_tokenizer(args)
+
+    # Build tokenizer
+    tokenizer = build_tokenizer(args)
 
     # Reset peak memory stats so functional tests measure this run and not
     # whatever happened earlier during initialization.
