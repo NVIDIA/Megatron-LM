@@ -275,6 +275,8 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
         pg_collection: Optional[ProcessGroupCollection] = None,
         vp_stage: Optional[int] = None,
         is_mtp_layer: bool = False,
+        add_layer_offset: bool = True,
+        pp_layer_offset: Optional[int] = None,
     ):
         self.submodules_config = submodules
         super().__init__(config=config, vp_stage=vp_stage)
@@ -288,7 +290,10 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
         # so they should NOT add the decoder layer offset. The router.py handles MTP layer
         # numbering separately by adding config.num_layers to distinguish MTP layers from decoder
         # layers in the aux loss tracker.
-        if is_mtp_layer:
+        #
+        # When add_layer_offset is False, the caller has already included the correct offset
+        # in layer_number (e.g. when using --hybrid-layer-pattern with fVPP).
+        if is_mtp_layer or not add_layer_offset:
             self.layer_number = layer_number
         else:
             self.layer_number = layer_number + get_transformer_layer_offset(
@@ -313,6 +318,8 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
                 attention_optional_kwargs["cp_comm_type"] = config.cp_comm_type
 
         attention_optional_kwargs["pg_collection"] = pg_collection
+        if pp_layer_offset is not None:
+            attention_optional_kwargs["pp_layer_offset"] = pp_layer_offset
 
         # [Module 2: SelfAttention]
         self.self_attention = build_module(

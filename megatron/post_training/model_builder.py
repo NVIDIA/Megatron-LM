@@ -114,12 +114,11 @@ def _load_teacher_model(config, config_raw: Namespace, model_kwargs: Dict[str, A
 
     if config.is_hybrid_model:
         # These parameters are not part of the TransformerConfig and need to be passed separately.
-        if "hybrid_override_pattern" in config_raw:
-            model_kwargs["hybrid_override_pattern"] = config_raw.hybrid_override_pattern
-        if "hybrid_attention_ratio" in config_raw:
-            model_kwargs["hybrid_attention_ratio"] = config_raw.hybrid_attention_ratio
-        if "hybrid_mlp_ratio" in config_raw:
-            model_kwargs["hybrid_mlp_ratio"] = config_raw.hybrid_mlp_ratio
+        if "hybrid_layer_pattern" in config_raw:
+            model_kwargs["hybrid_layer_pattern"] = config_raw.hybrid_layer_pattern
+        elif "hybrid_override_pattern" in config_raw:
+            # Backward compat: map old name to new
+            model_kwargs["hybrid_layer_pattern"] = config_raw.hybrid_override_pattern
 
         teacher = MCoreMambaModel(config=config, **model_kwargs)
     else:
@@ -256,7 +255,7 @@ def modelopt_gpt_mamba_builder(
             "pg_collection": pg_collection,
         }
         model = MCoreGPTModel(config=config, **model_kwargs)
-    elif args.export_model_type == "MambaModel" or args.is_hybrid_model:
+    elif args.export_model_type == "MambaModel" or getattr(args, 'hybrid_layer_pattern', None) is not None:
         from megatron.core.post_training.modelopt.mamba.model_specs import get_mamba_stack_modelopt_spec
 
         mamba_stack_spec = get_mamba_stack_modelopt_spec(
@@ -266,10 +265,8 @@ def modelopt_gpt_mamba_builder(
             "mamba_stack_spec": mamba_stack_spec,
             "vocab_size": args.padded_vocab_size,
             "max_sequence_length": args.max_position_embeddings,
+            "hybrid_layer_pattern": args.hybrid_layer_pattern,
             "pre_process": pre_process,
-            "hybrid_attention_ratio": args.hybrid_attention_ratio,
-            "hybrid_mlp_ratio": args.hybrid_mlp_ratio,
-            "hybrid_override_pattern": args.hybrid_override_pattern,
             "post_process": post_process,
             "fp16_lm_cross_entropy": args.fp16_lm_cross_entropy,
             "parallel_output": True,
