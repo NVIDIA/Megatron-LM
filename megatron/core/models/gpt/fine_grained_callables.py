@@ -527,9 +527,6 @@ def build_transformer_layer_callables(layer: TransformerLayer):
             token_dispatcher._comm_manager.token_probs = probs
 
         dispatched_tokens, dispatched_probs = layer.mlp.dispatch(local_tokens, probs)
-        comm_manager = getattr(token_dispatcher, '_comm_manager', None)
-        if comm_manager is not None and hasattr(comm_manager, 'get_number_of_tokens_per_expert'):
-            node.layer_state.tokens_per_expert = comm_manager.get_number_of_tokens_per_expert()
         return dispatched_tokens, dispatched_probs
 
     def submodule_moe_forward(
