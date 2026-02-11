@@ -3,7 +3,7 @@
 import logging
 import os
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from math import ceil
 from typing import Dict, Optional, Tuple
 
@@ -50,10 +50,34 @@ class GPTDatasetConfig(BlendedMegatronDatasetConfig):
     object_storage_cache_path: Optional[str] = None
     """Path for caching indices for s3 or msc dataloading."""
 
+    context_parallel_size: int = 1
+    """Option to enable context parallelism"""
+
+    data_parallel_size: int = 1
+    """Option to enable data parallelism"""
+
+    sequence_parallel_size: int = 0
+    """Option to indicate the sequence parallelism size when using TP
+    Set to 0 if sequence parallel is not enabled regardless of TP size.
+    """
+
+    hybrid_context_parallel: bool = False
+    """Option to enable hybrid context parallelism. When setting this to True, 
+    each sample should be divisible by the data parallel size * context parallel size * 2.
+    If sequence parallel is enabled, it should be divisible by the 
+    data parallel size * context parallel size * sequence parallel size * 2.
+    """
+
     sequences_per_dataset: Optional[Dict[str, int]] = None
     """If provided, the sequence and document counts for each dataset. 
        Check --per-dataset-sequences-path
     """
+
+    token_dtype_code: Optional[int] = field(init=False, default=None)
+    """The dtype code for the token ids. 4 for int32, 8 for uint16."""
+
+    context_parallel_size: Optional[int] = None
+    """The size of the context parallel group. Needed for padding in packed sequences."""
 
     def __post_init__(self) -> None:
         """Do asserts and set fields post init"""
@@ -316,7 +340,7 @@ class GPTDataset(MegatronDataset):
             sample_parts.append(
                 self.dataset.get(
                     self.document_index[doc_index_beg],
-                    offset=doc_index_beg_offset,
+                    offset=int(doc_index_beg_offset),
                     length=doc_index_end_offset
                     - doc_index_beg_offset
                     + self.config.add_extra_token_to_sequence,
@@ -337,7 +361,7 @@ class GPTDataset(MegatronDataset):
                     else doc_index_end_offset + self.config.add_extra_token_to_sequence
                 )
                 sample_parts.append(
-                    self.dataset.get(self.document_index[i], offset=offset, length=length)
+                    self.dataset.get(self.document_index[i], offset=int(offset), length=length)
                 )
         assert len(document_ids) == len(
             sample_parts
@@ -777,10 +801,11 @@ class MockGPTLowLevelDataset:
     """The hard-coded number of samples to generate"""
 
     max_sequence_length: int = 4096
-    """The hard-coded max sequence length to generate"""
+    """The hard-coded max sequence length of the random generated sequences"""
 
     def __init__(self, tokenizer: MegatronTokenizerBase) -> None:
-        self.tokenizer = tokenizer
+        self.vocab_size = tokenizer.vocab_size
+        self.eod_token = tokenizer.eod
         rng = numpy.random.default_rng(seed=self.seed)
         self.sequence_lengths = rng.integers(
             low=1, high=self.max_sequence_length, size=self.size, dtype=numpy.int32
@@ -792,7 +817,7 @@ class MockGPTLowLevelDataset:
     def __getitem__(self, idx: int) -> numpy.number:
         length = self.sequence_lengths[idx]
         sample = numpy.int64(
-            numpy.concatenate([numpy.arange(length - 1) + 1, [self.tokenizer.eod]])
+            numpy.concatenate([(numpy.arange(length - 1) + 1) % self.vocab_size, [self.eod_token]])
         )
         return sample
 

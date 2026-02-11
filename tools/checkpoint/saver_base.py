@@ -170,9 +170,15 @@ class MegatronCheckpointSaverBase:
         
         # For backward compatibility during local parallel states refactoring
         fake_tp_group = _ConverterFakeProcessGroup(size=self.args.target_tensor_parallel_size)
+        fake_pp_group = _ConverterFakeProcessGroup(size=self.args.target_pipeline_parallel_size)
         fake_ep_group = _ConverterFakeProcessGroup(size=self.args.target_expert_parallel_size)
+        fake_dp_group = _ConverterFakeProcessGroup(size=1)
         mpu._TENSOR_MODEL_PARALLEL_GROUP = fake_tp_group
+        mpu._PIPELINE_MODEL_PARALLEL_GROUP = fake_pp_group
         mpu._EXPERT_MODEL_PARALLEL_GROUP = fake_ep_group
+        mpu._DATA_PARALLEL_GROUP = fake_dp_group
+        mpu._DATA_PARALLEL_GROUP_WITH_CP = fake_dp_group
+        mpu._INTRA_PARTIAL_DATA_PARALLEL_GROUP_WITH_CP = fake_dp_group
         fused_kernels.load(self.margs)
         
         try:
@@ -356,7 +362,7 @@ class MegatronCheckpointSaverBase:
         """
         try:
             from megatron.core import mpu
-            from megatron.training.tokenizer.tokenizer import _vocab_size_with_padding
+            from megatron.core.tokenizers.utils.build_tokenizer import vocab_size_with_padding
         except ModuleNotFoundError as e:
             print(f"Unable to import required Megatron modules: {e}")
             sys.exit(1)
@@ -375,7 +381,7 @@ class MegatronCheckpointSaverBase:
             if true_vocab_size is not None:
                 # figure out what our padded vocab size is
                 orig_vocab_size = orig_word_embed.shape[0]
-                self.margs.padded_vocab_size = _vocab_size_with_padding(true_vocab_size, self.margs)
+                self.margs.padded_vocab_size = vocab_size_with_padding(true_vocab_size, self.margs)
 
                 # Cut out extra padding we don't need
                 if orig_vocab_size > self.margs.padded_vocab_size:

@@ -10,6 +10,7 @@ from megatron.core.transformer.identity_op import IdentityOp
 from megatron.core.transformer.mlp import MLP, MLPSubmodules
 from megatron.core.transformer.spec_utils import ModuleSpec
 from megatron.core.transformer.transformer_layer import TransformerLayer, TransformerLayerSubmodules
+from megatron.core.typed_torch import not_none
 
 try:
     import transformer_engine as te  # pylint: disable=unused-import
@@ -22,6 +23,11 @@ try:
 
     HAVE_TE = True
 except ImportError:
+    (TEDotProductAttention, TELayerNormColumnParallelLinear, TERowParallelLinear) = (
+        None,
+        None,
+        None,
+    )
     HAVE_TE = False
 
 try:
@@ -57,8 +63,8 @@ def get_bert_layer_with_transformer_engine_spec():
                 module=SelfAttention,
                 params={"attn_mask_type": AttnMaskType.padding},
                 submodules=SelfAttentionSubmodules(
-                    linear_qkv=TELayerNormColumnParallelLinear,
-                    core_attention=TEDotProductAttention,
+                    linear_qkv=not_none(TELayerNormColumnParallelLinear),
+                    core_attention=not_none(TEDotProductAttention),
                     linear_proj=TERowParallelLinear,
                     q_layernorm=IdentityOp,
                     k_layernorm=IdentityOp,
@@ -68,7 +74,8 @@ def get_bert_layer_with_transformer_engine_spec():
             mlp=ModuleSpec(
                 module=MLP,
                 submodules=MLPSubmodules(
-                    linear_fc1=TELayerNormColumnParallelLinear, linear_fc2=TERowParallelLinear
+                    linear_fc1=not_none(TELayerNormColumnParallelLinear),
+                    linear_fc2=not_none(TERowParallelLinear),
                 ),
             ),
             mlp_bda=get_bias_dropout_add,
