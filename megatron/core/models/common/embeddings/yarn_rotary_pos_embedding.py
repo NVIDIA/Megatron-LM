@@ -99,11 +99,10 @@ class YarnRotaryEmbedding(RotaryEmbedding):
                 self.original_max_position_embeddings, offset=0, dtype=torch.get_default_dtype()
             )
 
-            # clear the lru_cache for the get_emb method. If not cleared, the cache of get_emb
+            # clear the lru_cache for the forward method. If not cleared, the cache of forward
             # method causes a memory leak in NeMo-RL.
-            self.get_emb.cache_clear()
+            self.forward.cache_clear()
 
-    @lru_cache(maxsize=32)
     def get_emb(self, max_seq_len: int, offset: int = 0) -> Tensor:
         """Forward pass of Yarn Rotary Embedding.
 
@@ -157,26 +156,29 @@ class YarnRotaryEmbedding(RotaryEmbedding):
         emb = emb[:, None, None, :]
         return emb, _mscale
 
+    @lru_cache(maxsize=32)
     @internal_api
     def forward(
-        self, max_seq_len: int, offset: int = 0, packed_seq_params: Optional[PackedSeqParams] = None
+        self,
+        max_seq_len: int,
+        offset: int = 0,
+        packed_seq: bool = False,
+        cp_group: Optional[torch.distributed.ProcessGroup] = None,
     ) -> Tensor:
         """Forward pass of Yarn Rotary Embedding.
 
         Args:
             max_seq_len (int): Maximum size of sequence
             offset (int, optional): RoPE offset. Defaults to 0.
-            packed_seq_params (PackedSeqParams, optional): Packed sequence params. Defaults to None.
+            packed_seq (bool, optional): Whether to use packed sequence. Defaults to False.
+            cp_group (torch.distributed.ProcessGroup, optional): Context parallel group.
+                Defaults to None.
 
         Returns:
             Tensor: Embeddings after applying Yarn RoPE.
         """
         emb, _mscale = self.get_emb(max_seq_len, offset)
-        packed_seq = packed_seq_params is not None and packed_seq_params.qkv_format == 'thd'
-        if packed_seq_params is not None and packed_seq_params.local_cp_size is not None:
-            # Set CP group to dynamic CP group for CP slicing
-            cp_group = packed_seq_params.cp_group
-        else:
+        if cp_group is None:
             cp_group = self.cp_group
         if cp_group is not None and cp_group.size() > 1 and not packed_seq:
             # slice rotary_pos_emb along sequence dimension
@@ -184,15 +186,13 @@ class YarnRotaryEmbedding(RotaryEmbedding):
             emb = get_pos_emb_on_this_cp_rank(emb, 0, cp_group)
         return emb, _mscale
 
-    def _set_cos_sin_cache(self, seq_len, offset, dtype, packed_seq_params=None):
+    def _set_cos_sin_cache(self, seq_len, offset, dtype, packed_seq=False, cp_group=None):
         self.max_seq_len_cached = seq_len
         self.offset_cached = offset
         self.dtype_cached = dtype
-        self.packed_seq_cached = (
-            packed_seq_params is not None and packed_seq_params.qkv_format == 'thd'
-        )
+        self.packed_seq_cached = packed_seq
 
-        emb, _mscale = self.forward(seq_len, offset, packed_seq_params)
+        emb, _mscale = self.forward(seq_len, offset, packed_seq=packed_seq, cp_group=cp_group)
         self.register_buffer(
             "cos_cached", (emb.cos() * _mscale).to(dtype).contiguous(), persistent=False
         )
@@ -201,17 +201,16 @@ class YarnRotaryEmbedding(RotaryEmbedding):
         )
 
     def get_cached_cos_sin(
-        self, seq_len, offset=0, dtype=torch.get_default_dtype(), packed_seq_params=None
+        self, seq_len, offset=0, dtype=torch.get_default_dtype(), packed_seq=False, cp_group=None
     ):
         """Get cached cos and sin values."""
-        packed_seq = packed_seq_params is not None and packed_seq_params.qkv_format == 'thd'
         if (
             seq_len > self.max_seq_len_cached
             or offset != self.offset_cached
             or dtype != self.dtype_cached
             or packed_seq != self.packed_seq_cached
         ):
-            self._set_cos_sin_cache(seq_len, offset, dtype, packed_seq_params)
+            self._set_cos_sin_cache(seq_len, offset, dtype, packed_seq, cp_group)
         return (self.cos_cached[:seq_len, ...], self.sin_cached[:seq_len, ...])
 
 

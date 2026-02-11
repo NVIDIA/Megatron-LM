@@ -39,6 +39,7 @@ from .mixed_precision import (
     fp8_need_transpose_data_for_meta_device_init,
     fp8_quantize,
     fp8_set_raw_data,
+    get_quantized_model_init_context_cls,
     is_blockwise_float8tensor,
     is_float8tensor,
     is_te_min_version,
@@ -62,8 +63,9 @@ try:
         DistributedDataParallelConfig,
     )
     from megatron.core.tensor_parallel import get_cuda_rng_tracker
-    from megatron.core.utils import is_submodule
+    from megatron.core.utils import is_submodule, log_single_rank
 
+    HAVE_MCORE = True
     logger.info("Detected Megatron Core, using Megatron-FSDP with Megatron.")
 
 except ImportError:
@@ -71,10 +73,21 @@ except ImportError:
     from .distributed_data_parallel_config import DistributedDataParallelConfig
     from .utils import get_cuda_rng_tracker, is_submodule
 
+    HAVE_MCORE = False
+
+    def log_single_rank(
+        logger_: logging.Logger, level: int, msg: str, *args, rank: int = 0, **kwargs
+    ):
+        """Fallback log_single_rank when Megatron Core is not available."""
+        if torch.distributed.is_initialized():
+            if torch.distributed.get_rank() == rank:
+                logger_.log(level, msg, *args, **kwargs)
+        else:
+            logger_.log(level, msg, *args, **kwargs)
+
     logger.info("Megatron Core is not installed, Megatron-FSDP will run without Megatron Core.")
 
 try:
-    from transformer_engine.pytorch import fp8_model_init
     from transformer_engine.pytorch.module.base import TransformerEngineBaseModule
 
     HAVE_TE = True
@@ -215,11 +228,12 @@ class MultiGroupUBRAllocator:
         self.mem_allocator.__exit__(*args)
         for group in self.groups[1:]:
             backend = group._get_backend(torch.device("cuda", torch.cuda.current_device()))
-            if torch.distributed.get_rank() == 0:
-                logger.info(
-                    f"[MultiGroupUBRAllocator] Registering mem pool to group {group}, "
-                    f"group.group_desc:{group.group_desc}"
-                )
+            log_single_rank(
+                logger,
+                logging.INFO,
+                f"[MultiGroupUBRAllocator] Registering mem pool to group {group}, "
+                f"group.group_desc:{group.group_desc}",
+            )
             backend.register_mem_pool(self.pool)
 
 
@@ -1586,14 +1600,17 @@ class ParamAndGradBuffer:
             NCCL_MEMORY_POOL = nccl_allocator.create_nccl_mem_pool(
                 symmetric=not self.ddp_config.disable_symmetric_registration
             )
-            if torch.distributed.get_rank() == 0:
-                logging.info(
-                    f"[Rank {torch.distributed.get_rank()}] Created NCCL memory pool for \
-                        UserBuffer Registration"
-                )
-                logging.info(
-                    f"[Rank {torch.distributed.get_rank()}] FSDP double buffer is enabled."
-                )
+            log_single_rank(
+                logger,
+                logging.INFO,
+                f"[Rank {torch.distributed.get_rank()}] Created NCCL memory pool for "
+                "UserBuffer Registration",
+            )
+            log_single_rank(
+                logger,
+                logging.INFO,
+                f"[Rank {torch.distributed.get_rank()}] FSDP double buffer is enabled.",
+            )
             # Select the communicator groups to register FSDP buffers.
             self.ubr_groups = [self.dist_index.get_fsdp_group(is_expert_parallel=False)]
             if self.dist_index.get_fsdp_group(is_expert_parallel=True) is not None:
@@ -1602,28 +1619,42 @@ class ParamAndGradBuffer:
             if self.dist_index.get_outer_fsdp_group() is not None:
                 # Outer/Inter-FSDP group when using hybrid FSDP
                 self.ubr_groups.append(self.dist_index.get_outer_fsdp_group())
-
-            if torch.distributed.get_rank() == 0:
-                logging.info(
-                    f"[ParamAndGradBuffer] FSDP UBRegistration Groups ({len(self.ubr_groups)}):"
+            if (
+                self.dist_index.get_fsdp_group(
+                    is_expert_parallel=False, independent_all_gather=True
                 )
+                is not None
+            ):
+                # All-gather group used when overlapping all-gather and gradient reduction.
+                self.ubr_groups.append(
+                    self.dist_index.get_fsdp_group(
+                        is_expert_parallel=False, independent_all_gather=True
+                    )
+                )
+
+            log_single_rank(
+                logger,
+                logging.INFO,
+                f"[ParamAndGradBuffer] FSDP UBRegistration Groups ({len(self.ubr_groups)}):",
+            )
             # All ranks in each group must participate in the collective to avoid deadlock.
             for i, group in enumerate(self.ubr_groups):
-                if torch.distributed.get_rank() == 0:
-                    logging.info(
-                        f"Group [{i+1}/{len(self.ubr_groups)}] \
-                            group.group_desc: {group.group_desc}, group.size(): {group.size()}"
-                    )
+                log_single_rank(
+                    logger,
+                    logging.INFO,
+                    f"Group [{i+1}/{len(self.ubr_groups)}] "
+                    f"group.group_desc: {group.group_desc}, group.size(): {group.size()}",
+                )
                 torch.distributed.barrier(group=group, async_op=False)
-                if torch.distributed.get_rank() == 0:
-                    logging.info(
-                        f"Call Success with the group [{i+1}/{len(self.ubr_groups)}] \
-                            group.group_desc: {group.group_desc}"
-                    )
+                log_single_rank(
+                    logger,
+                    logging.INFO,
+                    f"Call Success with the group [{i+1}/{len(self.ubr_groups)}] "
+                    f"group.group_desc: {group.group_desc}",
+                )
             # Call barrier from the global communitcator group
             torch.distributed.barrier(async_op=False)
-            if torch.distributed.get_rank() == 0:
-                logging.info(f"Call Success with the global communicator group")
+            log_single_rank(logger, logging.INFO, "Call Success with the global communicator group")
 
         # If using nccl_ub, it returns a function that registers buffers to the NCCL memory pool
         # Buffer is registered to data_parallel_group and expert_data_parallel_group if it exists
@@ -1756,21 +1787,23 @@ class ParamAndGradBuffer:
         torch.cuda.synchronize()
 
         for group in self.ubr_groups:
-            if torch.distributed.get_rank() == 0:
-                logging.info(
-                    f"[MCORE][FSDP][Manual REG] Registering mem pool to group {group},"
-                    f"group.group_desc:{group.group_desc}, group.size(): {group.size()}"
-                )
+            log_single_rank(
+                logger,
+                logging.INFO,
+                f"[MCORE][FSDP][Manual REG] Registering mem pool to group {group},"
+                f"group.group_desc:{group.group_desc}, group.size(): {group.size()}",
+            )
             nccl_allocator.register_mem_pool(
                 NCCL_MEMORY_POOL,
                 group,
                 symmetric=not self.ddp_config.disable_symmetric_registration,
             )
-            if torch.distributed.get_rank() == 0:
-                logging.info(
-                    f"[MCORE][FSDP][Manual REG] Registered mem pool to group {group},"
-                    f"group.group_desc:{group.group_desc}, group.size(): {group.size()}"
-                )
+            log_single_rank(
+                logger,
+                logging.INFO,
+                f"[MCORE][FSDP][Manual REG] Registered mem pool to group {group},"
+                f"group.group_desc:{group.group_desc}, group.size(): {group.size()}",
+            )
 
     def _log_parameter_groups(self):
         """Compact log of FSDP parameter groups and their parameters."""
@@ -1819,8 +1852,7 @@ class ParamAndGradBuffer:
             f"Total pad: {_bytes_to_mb(total_padded_bytes)}"
         )
 
-        if torch.distributed.get_rank() == 0:
-            logger.info("\n".join(log_lines))
+        log_single_rank(logger, logging.INFO, "\n".join(log_lines))
 
     def _init_each_parameter_group_buffers(self, meta_device_init_fp8_params):
         """
@@ -1896,11 +1928,25 @@ class ParamAndGradBuffer:
                 hsdp_buf_dp_group = self.dist_index.get_fsdp_group(
                     is_expert_parallel=group.is_expert_param
                 )
-                main_buf_extra_kwargs["dp_rank"] = self.dist_index.get_logical_hybrid_fsdp_rank()
+                main_buf_extra_kwargs["dp_rank"] = self.dist_index.get_logical_hybrid_fsdp_rank(
+                    is_expert_parallel=group.is_expert_param
+                )
             else:
                 main_buf_dp_group = self.dist_index.get_fsdp_group(
                     is_expert_parallel=group.is_expert_param
                 )
+
+            # When --create-all-gather-group is enabled, use a separate process group for
+            # all-gather operations (model_weight_buffer) to enable overlap with gradient reduction
+            # operations (main_grad_buffer). This avoids head-of-line blocking between forward
+            # all-gather and backward reduce-scatter on the same communicator.
+            model_wbuf_dp_group = main_buf_dp_group
+            if not group.is_expert_param and not should_create_hfsdp_wbuf_and_gbuf:
+                ag_group = self.dist_index.get_fsdp_group(
+                    is_expert_parallel=False, independent_all_gather=True
+                )
+                if ag_group is not None:
+                    model_wbuf_dp_group = ag_group
 
             gradient_scaling_factor = (
                 self.gradient_scaling_factor
@@ -1942,10 +1988,10 @@ class ParamAndGradBuffer:
                     self.ddp_config,
                     group.params,
                     is_data_distributed=is_model_weight_buffer_distributed
-                    and main_buf_dp_group.size() > 1,
+                    and model_wbuf_dp_group.size() > 1,
                     dtype=param_dtype,
                     device=self.device,
-                    data_parallel_group=main_buf_dp_group,
+                    data_parallel_group=model_wbuf_dp_group,
                     is_transpose_buffer=False,
                     temporary_bucket_allocator=self.weight_alloc,
                     bucket_id=group_id,
@@ -2098,8 +2144,7 @@ class ParamAndGradBuffer:
                 f"CUDA params numel: {cuda_params_numel / 1_000_000:.2f} M, "
                 f"CPU params numel: {cpu_params_numel / 1_000_000:.2f} M"
             )
-            if torch.distributed.get_rank() == 0:
-                logger.info(log_str)
+            log_single_rank(logger, logging.INFO, log_str)
 
         # Initialize the model weight buffer data of each parameter group.
         # Specifically, replace the Torch module's parameter data with tensors
@@ -2655,7 +2700,12 @@ class ParamAndGradBuffer:
 
     @torch.no_grad()
     def copy_main_weights_to_model_weights(self):
-        """Update the model weights from the main weights."""
+        """
+        Update the model weights from the main weights.
+
+        If FP8 parameters are utilized, this function will quantize the high-precision
+        main weights prior to installation into the model compute weight buffers.
+        """
         dense_param_quantize_kwargs = {
             "model_params": [],
             "main_params": [],
@@ -2751,6 +2801,12 @@ class ParamAndGradBuffer:
                     model_param = to_local_if_dtensor(param)
                     main_weight = mbuf.get_item(item_id)
 
+                # TODO(@kunlunl, @cspades): Currently, we only support FP8 parameters
+                # for FSDP, i.e. fully-sharded compute parameters with a high-precision
+                # main weight buffer. Would it be possible to add if branches here to
+                # quantize the original param (no_shard) or wbuf data (optim, optim_grads)
+                # for a seamless user experience and coverage for ZeRO-1 and ZeRO-2?
+
                 if is_blockwise_float8tensor(param):
                     fp8_params.append(param)
                     if model_param.numel() == 0:
@@ -2782,6 +2838,7 @@ class ParamAndGradBuffer:
                 if is_float8tensor(param):
                     fp8_params.append(param)
                     if model_param.numel() == 0:
+                        # Empty parameter.
                         shard_fp32_from_fp8.append(None)
                         shard_offsets_in_fp8.append(None)
                         shard_model_params.append([None, None])
@@ -3178,9 +3235,9 @@ class GradReducePipeline:
                     # Scale gradients.
                     scaling_factor = gbuf.gradient_scaling_factor
                     reduce_op = gradient_reduce_preprocessing(
-                        gbuf.data, scaling_factor, gbuf.ddp_config
+                        bucket.data, scaling_factor, gbuf.ddp_config
                     )
-                    if not gbuf.is_data_distributed:
+                    if ddp_config.data_parallel_sharding_strategy == "no_shard":
                         # All-reduce the gradients on every rank. No scattering
                         # or sharding necessary.
                         torch.distributed.all_reduce(
@@ -3604,12 +3661,40 @@ class AllGatherPipeline:
         mark_bucket_ready_to_use()
 
     @torch.no_grad()
-    def release_bucket(self, bucket_id, bwd):
-        """Release the bucket."""
-        # TODO(mxfp8): In some cases, there won't be ag before bwd?
-        bucket_key = self.get_bucket_key(bucket_id, bwd)
+    def release_bucket(self, bucket_id, bwd, lazy: bool = False):
+        """
+        Release the specified parameter bucket, freeing its associated buffer storage.
 
+        This function marks or frees the memory of a parameter bucket depending on
+        whether lazy release is enabled. It ensures that buckets are not released
+        while still being communicated or in use by the pipeline.
+
+        Args:
+            bucket_id (int): Identifier of the bucket to be released.
+            bwd (bool): Indicates if the release is triggered during the backward pass.
+            lazy (bool, optional): Determines when the parameter buffer (bucket) is released.
+                - If False, the buffer is released immediately.
+                - If True, the release is deferred until just before the all-gather pipeline
+                requests a new buffer. The delayed release is performed by invoking
+                `recycle_unused_buckets`.
+
+        Raises:
+            ValueError: If the specified bucket is currently in communication and
+                cannot be safely released.
+
+        Notes:
+            - Buckets marked as lazy will be released later when the pipeline determines
+            they are no longer needed.
+            - If the bucket has a transpose weight buffer (used in FP8 backward passes),
+            this buffer is freed; otherwise, the model weight buffer is released.
+        """
+        bucket_key = self.get_bucket_key(bucket_id, bwd)
         if self.bucket_status[bucket_key] == BucketStatus.EMPTY:
+            return
+
+        if lazy:
+            # Mark the bucket can be released later.
+            self.bucket_can_be_released[bucket_key] = True
             return
 
         self.wait_bucket_ready(bucket_id, bwd, empty_ok=True)
@@ -3728,8 +3813,12 @@ def check_gpu_memory(threshold=0.9):
 
     near_full = allocated_ratio >= threshold or reserved_ratio >= threshold
 
-    if near_full and torch.distributed.get_rank() == 0:
-        logger.info(f"GPU Memory: Allocated: {allocated_ratio:.2%}, Reserved: {reserved_ratio:.2%}")
+    if near_full:
+        log_single_rank(
+            logger,
+            logging.INFO,
+            f"GPU Memory: Allocated: {allocated_ratio:.2%}, Reserved: {reserved_ratio:.2%}",
+        )
     return near_full
 
 
@@ -3745,11 +3834,26 @@ class ResetParametersContext:
     def __enter__(self):
         self.stack = ExitStack()
         if self.init_param_with_fp8:
-            assert HAVE_TE
-            args = {"enabled": True}
-            if "preserve_high_precision_init_val" in inspect.signature(fp8_model_init).parameters:
-                args["preserve_high_precision_init_val"] = True
-            self.stack.enter_context(fp8_model_init(**args))
+            # FIXME(@cspades): This appears to be a legacy dependency that is not needed for
+            # more recent versions of TransformerEngine, which only requires this context during
+            # TransformerEngineBaseModule.__init__. Should be removed if backwards compatibility
+            # is confirmed, because overwrites the quantized_model_init context specified by user.
+            assert (
+                HAVE_TE
+            ), "TransformerEngine is required for using FP8 parameters with Megatron-FSDP."
+            # Retrieve import for quantized_model_init (new) or fp8_model_init (old).
+            # Will be nullcontext if TE is not installed.
+            te_quantized_model_init_cls = get_quantized_model_init_context_cls()
+            if te_quantized_model_init_cls is not nullcontext:
+                # Enable TE quantized parameter context manager.
+                args = {"enabled": True}
+                if (
+                    "preserve_high_precision_init_val"
+                    in inspect.signature(te_quantized_model_init_cls).parameters
+                ):
+                    # Required for Megatron-FSDP + FP8 parameters.
+                    args["preserve_high_precision_init_val"] = True
+                self.stack.enter_context(te_quantized_model_init_cls(**args))
 
         if self.with_cuda_rng_tracker:
             # Megatron / TE RNG tracker needs to be initialized and seeded by the user or FW
