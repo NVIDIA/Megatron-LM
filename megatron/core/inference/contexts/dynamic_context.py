@@ -689,7 +689,7 @@ class DynamicInferenceContext(BaseInferenceContext):
             return
 
         if self._uses_torch_memory_saver:
-            torch_memory_saver.restore_region(tag="inference_context")
+            torch_memory_saver.resume("inference_context")
             return
 
         if self.kv_cache_management_mode == KVCacheManagementMode.OFFLOAD:
@@ -717,7 +717,7 @@ class DynamicInferenceContext(BaseInferenceContext):
             return
 
         if self._uses_torch_memory_saver:
-            torch_memory_saver.backup_region(tag="inference_context")
+            torch_memory_saver.pause("inference_context")
             return
 
         if self.kv_cache_management_mode == KVCacheManagementMode.OFFLOAD:
