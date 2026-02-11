@@ -71,6 +71,12 @@ class TestVppSimulatorBasic:
         args.fp16 = False
         args.bf16 = False
 
+        # Data configuration - use mock data to avoid downloads
+        args.mock_data = True
+        args.tokenizer_type = 'NullTokenizer'
+        args.vocab_size = 128256
+        args.data_path = None
+
         # Create result directory
         os.makedirs(args.simulate_result_dir, exist_ok=True)
 
@@ -216,7 +222,7 @@ class TestVppSimulatorBasic:
         # 2. Mock get_args and get_num_microbatches
         monkeypatch.setattr('megatron.training.global_vars.get_args', lambda: mock_args)
         monkeypatch.setattr(
-            'megatron.core.pipeline_parallel.schedules.get_num_microbatches',
+            'megatron.core.num_microbatches_calculator.get_num_microbatches',
             lambda: num_microbatches
         )
 
