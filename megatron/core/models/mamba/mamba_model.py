@@ -38,16 +38,16 @@ class MambaModel(LanguageModule):
         vocab_size (int): Vocabulary size
         max_sequence_length (int): maximum size of sequence.
             This is used for positional embedding
-        pre_process (bool, optional): Include embedding layer
-            (used with pipeline parallelism). Defaults to True.
-        hybrid_attention_ratio (float, optional): The target ratio of attention
-            layers to total layers
-        hybrid_mlp_ratio (float, optional): The target ratio of mlp layers to total layers
-        hybrid_override_pattern (str, optional): Unified hybrid layer pattern with optional MTP.
+        hybrid_layer_pattern (str): Unified hybrid layer pattern with optional MTP and
+            pipeline stage boundaries.
             Format: "<main_pattern>/<mtp_pattern>/<mtp_pattern>/..."
+            The main pattern may contain "|" to define pipeline stage boundaries.
             Examples:
                 - "M*M*" -> main decoder only, no MTP
                 - "M*M*/MM/MM" -> main="M*M*", mtp="MM", 2 depths
+                - "M-M-|M-M*-|M-M-|M-M*-" -> 4 pipeline segments
+        pre_process (bool, optional): Include embedding layer
+            (used with pipeline parallelism). Defaults to True.
         post_process (bool, optional): Include an output layer (used with pipeline parallelism).
             Defaults to True.
         fp16_lm_cross_entropy (bool, optional): Defaults to False.
@@ -65,6 +65,7 @@ class MambaModel(LanguageModule):
             interpolating RoPE for longer sequences. The value must be a float larger than 1.0.
              Defaults to None.
         pg_collection (ProcessGroupCollection, optional): Model communication process groups.
+        vp_stage (Optional[int], optional): Virtual pipeline stage index. Defaults to None.
     """
 
     def __init__(
@@ -73,10 +74,8 @@ class MambaModel(LanguageModule):
         mamba_stack_spec: ModuleSpec,
         vocab_size: int,
         max_sequence_length: int,
+        hybrid_layer_pattern: str = None,
         pre_process: bool = True,
-        hybrid_attention_ratio: float = 0.0,
-        hybrid_mlp_ratio: float = 0.0,
-        hybrid_override_pattern: str = None,
         post_process: bool = True,
         fp16_lm_cross_entropy: bool = False,
         parallel_output: bool = True,
@@ -98,10 +97,8 @@ class MambaModel(LanguageModule):
         self.mamba_stack_spec: ModuleSpec = mamba_stack_spec
         self.vocab_size = vocab_size
         self.max_sequence_length = max_sequence_length
+        self.hybrid_layer_pattern = hybrid_layer_pattern
         self.pre_process = pre_process
-        self.hybrid_attention_ratio = hybrid_attention_ratio
-        self.hybrid_mlp_ratio = hybrid_mlp_ratio
-        self.hybrid_override_pattern = hybrid_override_pattern
         self.post_process = post_process
         self.fp16_lm_cross_entropy = fp16_lm_cross_entropy
         self.parallel_output = parallel_output
@@ -109,12 +106,19 @@ class MambaModel(LanguageModule):
         self.position_embedding_type = position_embedding_type
         self.vp_stage = vp_stage
 
-        # Parse unified pattern to extract main and MTP components
-        from megatron.core.ssm.mamba_hybrid_layer_allocation import parse_hybrid_pattern
+        # Parse unified pattern to extract main and MTP components, and
+        # determine the pipeline segment for this model instance.
+        from megatron.core.ssm.mamba_hybrid_layer_allocation import (
+            parse_hybrid_pattern, select_pipeline_segment,
+        )
 
-        parsed = parse_hybrid_pattern(hybrid_override_pattern)
+        parsed = parse_hybrid_pattern(hybrid_layer_pattern)
         self.mtp_pattern = parsed.mtp_pattern
         self.mtp_num_depths = parsed.mtp_num_depths
+
+        layer_type_list, layer_offset = select_pipeline_segment(
+            parsed.main_pattern or '', self.pg_collection.pp, vp_stage,
+        )
 
         # Determine if MTP is needed (based on pattern parsing)
         self.mtp_process = (
@@ -151,9 +155,8 @@ class MambaModel(LanguageModule):
             mamba_stack_spec,
             self.config,
             pre_process=self.pre_process,
-            hybrid_attention_ratio=self.hybrid_attention_ratio,
-            hybrid_mlp_ratio=self.hybrid_mlp_ratio,
-            hybrid_override_pattern=parsed.main_pattern,
+            layer_type_list=layer_type_list,
+            pp_layer_offset=layer_offset,
             post_process=self.post_process,
             dtype=config.params_dtype,
             pg_collection=self.pg_collection,

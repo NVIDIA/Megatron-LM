@@ -389,8 +389,7 @@ class TestDynamicInferenceEngine:
                 vocab_size=test_config.vocab_size,
                 max_sequence_length=test_config.max_sequence_length,
                 parallel_output=True,
-                hybrid_attention_ratio=0.3,
-                hybrid_mlp_ratio=0.3,
+                hybrid_layer_pattern="M*-" if pp_size == 1 else "M*-|M*-",  # 3 or 6 layers (2 PP stages)
                 pre_process=parallel_state.is_pipeline_first_stage(),
                 post_process=parallel_state.is_pipeline_last_stage(),
             ).cuda()
