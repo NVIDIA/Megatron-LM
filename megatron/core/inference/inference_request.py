@@ -161,7 +161,7 @@ class DynamicInferenceEventType(Enum):
 
     ADD_ENGINE = auto()    # When request is added to engine via _add_request()
     ADD_CONTEXT = auto()   # When request is added to context (scheduled for prefill)
-    GENERATED_TOKEN = auto()  # When an output token is generated (payload = token id)
+    GENERATED_TOKEN = auto()  # When an output token is generated (payload = {"token_id": int})
     PAUSE = auto()
     EVICT = auto()
     FINISH = auto()
@@ -205,13 +205,13 @@ class DynamicInferenceEvent:
         ):
             assert self.payload is not None
         elif self.type == DynamicInferenceEventType.GENERATED_TOKEN:
-            assert self.payload is not None and isinstance(self.payload, int)
+            assert self.payload is not None and isinstance(self.payload, dict) and "token_id" in self.payload
         else:
             assert self.payload is None
 
     def __str__(self):
         if self.type == DynamicInferenceEventType.GENERATED_TOKEN:
-            payload_str = f", token={self.payload}"
+            payload_str = f", token={self.payload['token_id']}"
         elif self.payload is None:
             payload_str = ""
         else:
@@ -232,9 +232,10 @@ class DynamicInferenceEvent:
 
         # Serialize payload.
         if self.payload is not None:
-            if self.type == DynamicInferenceEventType.GENERATED_TOKEN:
-                obj["payload"] = {"token_id": self.payload}
-            else:
+            if self.type in (
+                DynamicInferenceEventType.ERROR_TRANSIENT,
+                DynamicInferenceEventType.ERROR_NONTRANSIENT,
+            ):
                 from .contexts.dynamic_context import ContextErrorFactory  # avoid circular import.
 
                 obj["payload"] = ContextErrorFactory.serialize(self.payload)
@@ -257,9 +258,10 @@ class DynamicInferenceEvent:
         # Pre-process payload before construction (since __post_init__ validates types).
         init_obj = {**obj, "type": event_type}
         if obj["payload"] is not None:
-            if event_type == DynamicInferenceEventType.GENERATED_TOKEN:
-                init_obj["payload"] = obj["payload"]["token_id"]
-            else:
+            if event_type in (
+                DynamicInferenceEventType.ERROR_TRANSIENT,
+                DynamicInferenceEventType.ERROR_NONTRANSIENT,
+            ):
                 from .contexts.dynamic_context import ContextErrorFactory  # avoid circular import.
 
                 init_obj["payload"] = ContextErrorFactory.deserialize(obj["payload"])
@@ -392,7 +394,7 @@ class DynamicInferenceRequest(InferenceRequest):
         Args:
             token (int): The token ID that was generated.
         """
-        return self.add_event(DynamicInferenceEventType.GENERATED_TOKEN, token)
+        return self.add_event(DynamicInferenceEventType.GENERATED_TOKEN, {"token_id": token})
 
     def add_event_pause(self):
         """Add 'pause' event."""

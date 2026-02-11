@@ -87,21 +87,23 @@ def test_all_event_types_creation_and_payload_validation():
         with pytest.raises(AssertionError):
             DynamicInferenceEvent(type=event_type, payload="not allowed")
 
-    # Create GENERATED_TOKEN event with int payload
+    # Create GENERATED_TOKEN event with dict payload
     token_event = DynamicInferenceEvent(
-        type=DynamicInferenceEventType.GENERATED_TOKEN, payload=42
+        type=DynamicInferenceEventType.GENERATED_TOKEN, payload={"token_id": 42}
     )
     assert token_event.type == DynamicInferenceEventType.GENERATED_TOKEN
-    assert token_event.payload == 42
+    assert token_event.payload == {"token_id": 42}
     assert token_event.timestamp is not None
 
-    # GENERATED_TOKEN rejects None, string, and float payloads
+    # GENERATED_TOKEN rejects None, string, float, and int payloads (must be dict with "token_id")
     with pytest.raises(AssertionError):
         DynamicInferenceEvent(type=DynamicInferenceEventType.GENERATED_TOKEN)
     with pytest.raises(AssertionError):
         DynamicInferenceEvent(type=DynamicInferenceEventType.GENERATED_TOKEN, payload="bad")
     with pytest.raises(AssertionError):
         DynamicInferenceEvent(type=DynamicInferenceEventType.GENERATED_TOKEN, payload=3.14)
+    with pytest.raises(AssertionError):
+        DynamicInferenceEvent(type=DynamicInferenceEventType.GENERATED_TOKEN, payload=42)
 
     # Create error events with exception payloads
     transient_error = RequestOverflowError(request_id=1, message="Transient")
@@ -513,7 +515,7 @@ def test_event_str_representation_for_all_types():
 
     # GENERATED_TOKEN shows token=<id>
     token_event = DynamicInferenceEvent(
-        type=DynamicInferenceEventType.GENERATED_TOKEN, payload=42
+        type=DynamicInferenceEventType.GENERATED_TOKEN, payload={"token_id": 42}
     )
     str_repr = str(token_event)
     assert 'GENERATED_TOKEN' in str_repr
@@ -521,7 +523,7 @@ def test_event_str_representation_for_all_types():
 
     # Large token ID
     large_token_event = DynamicInferenceEvent(
-        type=DynamicInferenceEventType.GENERATED_TOKEN, payload=9999999
+        type=DynamicInferenceEventType.GENERATED_TOKEN, payload={"token_id": 9999999}
     )
     assert 'token=9999999' in str(large_token_event)
 

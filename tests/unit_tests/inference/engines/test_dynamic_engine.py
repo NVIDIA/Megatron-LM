@@ -111,6 +111,7 @@ class DynamicEngineTestConfig:
     # relevant to the test. The tests only check if the required
     # context attributes are set correctly.
     suspend_resume_interval: Optional[int] = None
+    track_generated_token_events: bool = False
 
     fp8: bool = False
 
@@ -229,6 +230,7 @@ class TestDynamicInferenceEngine:
                 use_flashinfer_fused_rope=None,  # default to using flash-infer if available
                 # this is for compatibility with the LTS environment
                 unified_memory_level=0,  # unit tests currently broken with UVM
+                track_generated_token_events=test_config.track_generated_token_events,
             ),
         )
 
@@ -1135,6 +1137,7 @@ class TestDynamicInferenceEngine:
             num_tokens_to_generate=num_tokens_to_generate,
             context_buffer_size_gb=0.1,
             num_gap_steps=0,
+            track_generated_token_events=True,
         )
 
         # All requests should complete with this generous config (large buffer, no gap steps).
