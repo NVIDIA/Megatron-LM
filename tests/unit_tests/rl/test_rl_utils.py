@@ -877,12 +877,7 @@ class TestRLUtils:
             env_id='test_env',
             problem_id='p1',
         )
-        r2 = Rollout(
-            trajectory=["Hello world"],
-            reward=1.0,
-            env_id='test_env',
-            problem_id='p2',
-        )
+        r2 = Rollout(trajectory=["Hello world"], reward=1.0, env_id='test_env', problem_id='p2')
         rollouts = [[r1, r2]]
 
         path = str(tmp_path / "rollouts.json")

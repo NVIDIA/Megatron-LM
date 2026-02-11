@@ -105,10 +105,7 @@ def dump_results_json(path: str, results: list[list[BaseModel]]) -> None:
         results: A list of list[BaseModel].
     """
     with open(path, 'w') as f:
-        json.dump(
-            [[r.model_dump() for r in group] for group in results],
-            f,
-        )
+        json.dump([[r.model_dump() for r in group] for group in results], f)
 
 def _torch_saver_swap_inference_model(*, to_cpu: bool) -> None:
     """Swap RL inference model weights between CPU and GPU using torch_memory_saver.
