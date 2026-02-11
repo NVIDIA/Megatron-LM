@@ -1691,20 +1691,6 @@ class ParamAndGradBuffer:
         self.optimizer_named_parameters = self._init_optimizer_named_parameters()
 
         self._log_parameter_groups()
-        
-        # Sync parameter requires_grad with its parameter group.
-        self._sync_parameter_requires_grad_with_group()
-
-    def _sync_parameter_requires_grad_with_group(self):
-        """Sync parameter requires_grad attribute to match its parameter group.
-        
-        Ensures parameter requires_grad attribute follows the parameter group setting,
-        which is the authoritative source after FSDP initialization.
-        """
-        for group in self.parameter_groups:
-            group_requires_grad = group.requires_grad
-            for param in group.params:
-                param.requires_grad = group_requires_grad
 
     def get_mem_alloc_context(self, groups=None, symmetric=True):
         """
@@ -2446,6 +2432,8 @@ class ParamAndGradBuffer:
 
             self.param_to_direct_module[new_param] = self.param_to_direct_module[old_param]
             del self.param_to_direct_module[old_param]
+
+            new_param.requires_grad_(old_param.requires_grad)
 
             for tp_attr in ["_mcore_tp", "_tp_partition_dim", "_tp_duplicated"]:
                 if getattr(old_param, tp_attr, None) is not None:
