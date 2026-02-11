@@ -533,8 +533,9 @@ class DynamicInferenceEngine(AbstractEngine):
 
         try:
 
-            start_mem = torch.cuda.memory_stats()
-            start_time = time.time()
+            if self.logging_step_interval > 0 and step_count % self.logging_step_interval == 0:
+                start_mem = torch.cuda.memory_stats()
+                start_time = time.time()
             range_push(f"{key}-inference-context")
             torch.cuda.synchronize()
 
@@ -543,38 +544,38 @@ class DynamicInferenceEngine(AbstractEngine):
         finally:
 
             range_pop()
-            end_time = time.time()
+            if self.logging_step_interval > 0 and step_count % self.logging_step_interval == 0:
+                end_time = time.time()
+                end_mem = torch.cuda.memory_stats()
+                start_mem_alloc = start_mem["allocated_bytes.all.current"]
+                end_mem_alloc = end_mem["allocated_bytes.all.current"]
+                start_mem_res = start_mem["reserved_bytes.all.current"]
+                end_mem_res = end_mem["reserved_bytes.all.current"]
 
-            end_mem = torch.cuda.memory_stats()
-            start_mem_alloc = start_mem["allocated_bytes.all.current"]
-            end_mem_alloc = end_mem["allocated_bytes.all.current"]
-            start_mem_res = start_mem["reserved_bytes.all.current"]
-            end_mem_res = end_mem["reserved_bytes.all.current"]
+                rank_str = torch.distributed.get_rank()
+                dir_str = "deallocating" if end_mem_alloc <= start_mem_alloc else "allocating"
+                relative_time_str = f"{end_time - start_time:.3f} sec"
+                relative_mem_str = f"{abs(start_mem_alloc - end_mem_alloc) / 1024**3:.1f} gb"
 
-            rank_str = torch.distributed.get_rank()
-            dir_str = "deallocating" if end_mem_alloc <= start_mem_alloc else "allocating"
-            relative_time_str = f"{end_time - start_time:.3f} sec"
-            relative_mem_str = f"{abs(start_mem_alloc - end_mem_alloc) / 1024**3:.1f} gb"
+                if HAVE_PSUTIL:
+                    process = psutil.Process()
+                    mem_info = process.memory_info()
+                    cpu_mem_str = f"{mem_info.rss / 1024**3:.1f} gb"
+                else:
+                    cpu_mem_str = "--"
 
-            if HAVE_PSUTIL:
-                process = psutil.Process()
-                mem_info = process.memory_info()
-                cpu_mem_str = f"{mem_info.rss / 1024**3:.1f} gb"
-            else:
-                cpu_mem_str = "--"
-
-            total_mem_str = ", ".join(
-                (
-                    f"cpu: {cpu_mem_str}",
-                    f"gpu: alloc {end_mem_alloc / 1024**3:.1f} gb",
-                    f"res {end_mem_res / 1024**3:.1f} gb",
+                total_mem_str = ", ".join(
+                    (
+                        f"cpu: {cpu_mem_str}",
+                        f"gpu: alloc {end_mem_alloc / 1024**3:.1f} gb",
+                        f"res {end_mem_res / 1024**3:.1f} gb",
+                    )
                 )
-            )
-            logging.info(
-                f"[rank {rank_str}] dynamic engine {key}, "
-                f"unified {unified_memory_level}, "
-                f"{dir_str} "
-                f"{relative_mem_str} in {relative_time_str} ... "
+                logging.info(
+                    f"[rank {rank_str}] dynamic engine {key}, "
+                    f"unified {unified_memory_level}, "
+                    f"{dir_str} "
+                    f"{relative_mem_str} in {relative_time_str} ... "
                 f"abs mem usage: {total_mem_str}"
             )
 
