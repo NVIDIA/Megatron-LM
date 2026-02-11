@@ -448,6 +448,55 @@ def toggle_cuda_graphs(model, set_to="none", reset_cuda_graphs=True):
         delete_cuda_graphs()
 
 
+def transition_moe_to_partial_cudagraphs(model):
+    """Switch MoE layers to partial CUDA graph capture for training.
+
+    Sets ``use_partial_cudagraphs = True`` on every ``MoETransformerLayer`` so
+    that ``_should_call_local_cudagraph`` returns False and the full
+    ``cudagraph_manager`` is bypassed.  Router and postprocess managers are
+    created lazily on the first call; subsequent calls only flip the flag,
+    preserving any previously recorded graphs.
+    """
+    from megatron.core.transformer.cuda_graphs import CudaGraphManager
+    from megatron.core.transformer.transformer_layer import MoETransformerLayer
+
+    for module in model.modules():
+        if isinstance(module, MoETransformerLayer):
+            module.use_partial_cudagraphs = True
+            module.moe_layer_recompute = (
+                module.config.recompute_granularity == 'selective'
+                and "moe" in module.config.recompute_modules
+                and module.config.cuda_graph_impl == "local"
+            )
+            if not hasattr(module, 'cudagraph_manager_router'):
+                module.cudagraph_manager_router = CudaGraphManager(
+                    module.config, module, function_name="_forward_mlp_router"
+                )
+            if not hasattr(module, 'cudagraph_manager_postprocess'):
+                module.cudagraph_manager_postprocess = CudaGraphManager(
+                    module.config, module, function_name="_forward_mlp_postprocess"
+                )
+
+
+def transition_moe_to_full_cudagraphs(model):
+    """Switch MoE layers to full CUDA graph capture for inference.
+
+    Sets ``use_partial_cudagraphs = False`` on every ``MoETransformerLayer`` so
+    that the full ``cudagraph_manager`` intercepts the forward call again.
+    Partial managers and their recorded graphs are left intact for reuse in
+    the next training phase.
+    """
+    from megatron.core.transformer.transformer_layer import MoETransformerLayer
+
+    for module in model.modules():
+        if isinstance(module, MoETransformerLayer):
+            module.use_partial_cudagraphs = False
+            assert hasattr(module, 'cudagraph_manager'), (
+                "MoETransformerLayer missing full cudagraph_manager; "
+                "expected it to be created at __init__ with scope=[]"
+            )
+
+
 def is_layer_window_attention(
     window_size: Optional[Tuple[int, int]], window_attn_skip_freq: int | list, layer_number: int
 ) -> bool:

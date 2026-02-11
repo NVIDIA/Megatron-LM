@@ -33,7 +33,12 @@ from megatron.core.pipeline_parallel.utils import is_pp_last_stage, get_pp_last_
 from megatron.core.rerun_state_machine import RerunDataIterator
 from megatron.core.transformer.cuda_graphs import _CudagraphGlobalRecord
 from megatron.core.transformer.enums import CudaGraphScope
-from megatron.core.transformer.utils import toggle_cuda_graphs
+from megatron.core.transformer.utils import (
+    toggle_cuda_graphs,
+    transition_moe_to_full_cudagraphs,
+    transition_moe_to_partial_cudagraphs,
+)
+from megatron.core.inference.utils import set_decode_expert_padding
 from megatron.core.resharding.refit import swap_model_weights
 from megatron.core.inference.unified_memory import (
     advise_managed_module_parameters_preferred_location,
@@ -1250,8 +1255,6 @@ def prepare_data_for_update(
             pp_group = pg_collection.pp
 
             with torch.no_grad(), nvtx_range("compute_old_logprobs", time=True):
-                # print("STUMPED")
-                # torch.distributed.breakpoint()
                 model.config.cuda_graph_impl = "none"
                 old_logprobs = _compute_logprobs_batch(
                     model=model,
@@ -1696,14 +1699,16 @@ def megatron_rl_inference_mode(
 
     logger.debug(f"[{dist.get_rank()}] Entering inference mode")
 
-    # Change cudagraph scope for training
-    print("IN INFERENCE")
-    # torch.distributed.breakpoint()
-    model[0].config.cuda_graph_scope = ["full"]
+    # Change cudagraph scope for inference (empty list = full-layer capture)
+    model[0].config.cuda_graph_scope = []
     model[0].config.cuda_graph_impl = "local"
 
     # If we get a lower precision wrapper, we go one object deeper.
     lang_module = model[0].module.module if hasattr(model[0].module, "module") else model[0].module
+
+    # Switch MoE layers to full CUDA graph capture for inference
+    if args.rl_training_cuda_graphs:
+        transition_moe_to_full_cudagraphs(lang_module)
 
     lang_module.eval()
     # If this is a separate RL inference model with offloading enabled, ensure weights are on GPU
@@ -1784,11 +1789,20 @@ def megatron_rl_inference_mode(
         if cuda_graph_impl != "none" and not args.rl_training_cuda_graphs:
             toggle_cuda_graphs(lang_module, 'none', reset_cuda_graphs=reset_cuda_graphs)
 
-        # Change cudagraph scope for training
-        print("IN TRAINING")
-        model[0].config.cuda_graph_scope = ["mamba", "attn", "moe_router"]
-        # model[0].config.cuda_graph_impl = "transformer_engine"
-        # torch.distributed.breakpoint()
+        # Reset drop_and_pad leaked from inference decode
+        set_decode_expert_padding(unwrap_model(model[0]), set_to=False)
+
+        # Change cudagraph scope for training (use proper CudaGraphScope enums)
+        model[0].config.cuda_graph_scope = [
+            CudaGraphScope.mamba,
+            CudaGraphScope.attn,
+            CudaGraphScope.moe_router,
+            CudaGraphScope.moe_preprocess,
+        ]
+
+        # Switch MoE layers to partial CUDA graph capture for training
+        if args.rl_training_cuda_graphs:
+            transition_moe_to_partial_cudagraphs(lang_module)
 
         # If this is a separate RL inference model, prefetch weights back to CPU so they don't consume
         # GPU memory during training.
