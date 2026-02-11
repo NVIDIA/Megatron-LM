@@ -297,7 +297,9 @@ class DynamicInferenceRequest(InferenceRequest):
         """
         return len(self.remaining_prompt_tokens)
 
+    ttft: Optional[float] = None
     events: List[DynamicInferenceEvent] = field(default_factory=list)
+    event_add_engine: Optional[DynamicInferenceEvent] = field(default=None, repr=False)
     generated_tokens: List[int] = field(default_factory=list)
 
     def __str__(self):
@@ -321,6 +323,7 @@ class DynamicInferenceRequest(InferenceRequest):
         torch.cuda.nvtx.range_push("DynamicInferenceRequest.serialize")
         obj = super().serialize()
         obj["events"] = [e.serialize() for e in self.events]
+        obj.pop("event_add_engine", None)
         torch.cuda.nvtx.range_pop()
         return obj
 
@@ -368,13 +371,16 @@ class DynamicInferenceRequest(InferenceRequest):
             ("top_n_logprobs", torch.int32, False),  # CPU for torch sampling
         ]
 
-    def add_event(self, type: DynamicInferenceEventType, payload: Optional[Any] = None) -> None:
+    def add_event(self, type: DynamicInferenceEventType, payload: Optional[Any] = None) -> DynamicInferenceEvent:
         """Add event."""
-        self.events.append(DynamicInferenceEvent(type=type, payload=payload))
+        event = DynamicInferenceEvent(type=type, payload=payload)
+        self.events.append(event)
+        return event
 
     def add_event_add_engine(self):
         """Add 'add_engine' event - called when request enters the engine queue."""
-        return self.add_event(DynamicInferenceEventType.ADD_ENGINE)
+        self.event_add_engine = self.add_event(DynamicInferenceEventType.ADD_ENGINE)
+        return self.event_add_engine
 
     def add_event_add_context(self):
         """Add 'add_context' event - called when request is added to context for prefill."""
@@ -542,6 +548,7 @@ class DynamicInferenceRequestRecord:
             generated_log_probs=merge_lists("generated_log_probs"),
             generated_top_n_logprobs=merge_lists("generated_top_n_logprobs"),
             sampling_params=self.requests[0].sampling_params,
+            ttft=self.requests[0].ttft,
             tpot=merge_lists("tpot"),
             status=self.requests[-1].status,
             latency=self.latency,

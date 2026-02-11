@@ -30,6 +30,8 @@ from megatron.core.inference.data_parallel_inference_coordinator import (
 from megatron.core.inference.engines.abstract_engine import AbstractEngine
 from megatron.core.inference.headers import Headers, UnknownHeaderError
 from megatron.core.inference.inference_request import (
+    DynamicInferenceEvent,
+    DynamicInferenceEventType,
     DynamicInferenceRequest,
     DynamicInferenceRequestRecord,
     Status,
@@ -875,9 +877,16 @@ class DynamicInferenceEngine(AbstractEngine):
                 # Skip appending token for requests being finished due to stop words
                 # (they already have their final token from the previous step)
                 if request_id not in self.stop_word_being_finished_ids:
+                    is_first_token = len(request.generated_tokens) == 0
                     request.generated_tokens.append(token)
                     if self.track_generated_token_events:
-                        request.add_event_generated_token(token)
+                        event_generated_token = request.add_event_generated_token(token)
+                    if is_first_token:
+                        if self.track_generated_token_events:
+                            first_token_event = event_generated_token
+                        else:
+                            first_token_event = DynamicInferenceEvent(type=DynamicInferenceEventType.GENERATED_TOKEN)
+                        request.ttft = first_token_event.timestamp - request.event_add_engine.timestamp
                     if request.tpot is None:
                         request.tpot = []
                     request.tpot.append(step_time)
