@@ -23,6 +23,7 @@ from megatron.core.inference.contexts.attention_context.triton.tensor_ops import
     tensor_get_slice_after,
     tensor_masked_update,
     tensor_merge,
+    tensor_zero_after,
 )
 from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.core.process_groups_config import ProcessGroupCollection
@@ -39,6 +40,7 @@ from megatron.core.utils import (
     deprecate_inference_params,
     is_causal_conv1d_min_version,
     is_mamba_min_version,
+    is_using_quantization_scales,
     log_single_rank,
 )
 
@@ -587,6 +589,11 @@ class MambaMixer(MegatronModule):
             tensor_merge(
                 y_decode, y_prefill, context.mamba_metadata.device_decode_prefill, output_tensor=y
             )
+
+        # Clear the outputs for padding tokens when using quantization scales
+        # to avoid corrupting amax calculations
+        if is_using_quantization_scales(self.config):
+            tensor_zero_after(y, context.device_active_token_count)
 
         # Output projection
         out, out_bias = self.out_proj(y)

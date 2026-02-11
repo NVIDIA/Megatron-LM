@@ -1230,7 +1230,9 @@ class DynamicInferenceContext(BaseInferenceContext):
             )
         self.padded_active_token_count = self.padded_batch_dimensions.token_count
         self.padded_active_request_count = self.padded_batch_dimensions.req_count
-        self.padding_slice = slice(self.active_token_count, self.padded_active_token_count)
+        self.device_active_token_count = torch.tensor(
+            [self.active_token_count], device=torch.cuda.current_device(), dtype=torch.int32
+        )
 
         # Update token position indexes.
         self.token_to_block_idx[self.active_token_count : self.padded_active_token_count] = (

@@ -7,6 +7,7 @@ from torch import Tensor
 from megatron.core import tensor_parallel
 from megatron.core.config_logger import has_config_logger_enabled, log_config_to_disk
 from megatron.core.inference.contexts import BaseInferenceContext
+from megatron.core.inference.contexts.attention_context.triton.tensor_ops import tensor_zero_after
 from megatron.core.models.common.embeddings.language_model_embedding import LanguageModelEmbedding
 from megatron.core.models.common.embeddings.rotary_pos_embedding import RotaryEmbedding
 from megatron.core.models.common.language_module.language_module import LanguageModule
@@ -261,7 +262,7 @@ class MambaModel(LanguageModule):
                 and inference_context.is_dynamic_batching()
                 and is_using_quantization_scales(self.config)
             ):
-                decoder_input[inference_context.padding_slice] = 0.0
+                tensor_zero_after(decoder_input, inference_context.device_active_token_count)
         else:
             # intermediate stage of pipeline
             # decoder will get hidden_states from encoder.input_tensor

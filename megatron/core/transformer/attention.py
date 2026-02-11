@@ -12,6 +12,7 @@ from torch import Tensor
 
 from megatron.core import tensor_parallel
 from megatron.core.inference.contexts import BaseInferenceContext
+from megatron.core.inference.contexts.attention_context.triton.tensor_ops import tensor_zero_after
 from megatron.core.jit import jit_fuser
 from megatron.core.models.common.embeddings.rope_utils import (
     apply_rotary_pos_emb,
@@ -1181,7 +1182,7 @@ class Attention(MegatronModule, ABC):
                 # Clear the outputs for padding tokens when using quantization scales
                 # to avoid corrupting amax calculations
                 if is_using_quantization_scales(self.config):
-                    core_attn_out[inference_context.padding_slice] = 0.0
+                    tensor_zero_after(core_attn_out, inference_context.device_active_token_count)
 
             if self.offload_core_attention and self.training:
                 core_attn_out = off_interface.group_commit(
