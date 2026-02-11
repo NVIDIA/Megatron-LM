@@ -227,10 +227,20 @@ def num_floating_point_operations(args, batch_size):
     def calculate_layer_counts():
         """Calculate the number of attention, Mamba, and MLP layers."""
         if args.hybrid_override_pattern:
-            counts = {'M': 0, '*': 0, '-': 0, 'E':0}
-            for layer_type in args.hybrid_override_pattern:
-                if layer_type in counts:
-                    counts[layer_type] += 1
+            from megatron.core.ssm.mamba_hybrid_layer_allocation import parse_hybrid_pattern
+            # Parse unified pattern to separate main and MTP components
+            parsed = parse_hybrid_pattern(args.hybrid_override_pattern)
+            counts = {'M': 0, '*': 0, '-': 0, 'E': 0}
+            # Count main decoder layers
+            if parsed.main_pattern:
+                for layer_type in parsed.main_pattern:
+                    if layer_type in counts:
+                        counts[layer_type] += 1
+            # Count MTP layers (pattern repeated mtp_num_depths times)
+            if parsed.mtp_pattern and parsed.mtp_num_depths > 0:
+                for layer_type in parsed.mtp_pattern:
+                    if layer_type in counts:
+                        counts[layer_type] += parsed.mtp_num_depths
             return counts['*'], counts['M'], counts['-'], counts['E']
         else:
             num_attn_layers = round(args.num_layers * args.hybrid_attention_ratio)
@@ -307,7 +317,7 @@ def num_floating_point_operations(args, batch_size):
                      mlp_expansion=4.0, swiglu=False,
                      moe_latent_size=None,
                      moe_ffn_hidden_size=2048, shared_expert_ffn_hidden_size=2048, num_experts_routed_to=1,
-                     vocab_size=256000):
+                     vocab_size=256000, mtp_num_layers=0):
         """Calculate total FLOPs for the hybrid model."""
         flops_fwd = (
                 num_attn_layers * attn_layer_flops(batch_size, seq_len, hidden_size,
@@ -320,7 +330,7 @@ def num_floating_point_operations(args, batch_size):
                 num_moe_layers * moe_layer_flops(batch_size, seq_len, hidden_size, moe_ffn_hidden_size,
                                                  shared_expert_ffn_hidden_size, num_experts_routed_to,
                                                  moe_latent_size, swiglu) +
-                (2 * batch_size * seq_len * hidden_size * vocab_size)  # logits computation
+                (2 * batch_size * seq_len * hidden_size * vocab_size * (1 + mtp_num_layers))  # logits computation
         )
         return flops_fwd * 3
 
@@ -599,6 +609,9 @@ def num_floating_point_operations(args, batch_size):
         # Calculate the number of each type of layer.
         num_attn_layers, num_mamba_layers, num_mlp_layers, num_moe_layers = calculate_layer_counts()
 
+        mtp_num_layers = args.mtp_num_layers
+        if mtp_num_layers is None:
+            mtp_num_layers = 0
         # Compute hybrid model FLOPs.
         return hybrid_flops(
             batch_size=batch_size,
@@ -625,6 +638,7 @@ def num_floating_point_operations(args, batch_size):
                                            else args.moe_shared_expert_intermediate_size),
             num_experts_routed_to=args.moe_router_topk,
             vocab_size=args.padded_vocab_size,
+            mtp_num_layers=mtp_num_layers,
         )
     else:
         # Compute standard Transformer model FLOPs.
@@ -760,8 +774,14 @@ def pretrain(
             to it. It is used for programs to add their own arguments.
         args_defaults: a dictionary from argument-name to argument-value. It
             to set already parse arguments.
-        get_embedding_ranks (TODO):
-        get_position_embedding_ranks (TODO):
+        get_embedding_ranks: a function that takes a list of ranks for a pipeline
+            group and returns those ranks that should have word embeddings.
+            For most models, these are the first and last pipeline stages.
+            If None, defaults to returning the first and last pipeline stages.
+        get_position_embedding_ranks: a function that takes a list of ranks for
+            a pipeline group and returns those ranks that should have position
+            embeddings. For most models, this is only the first pipeline stage.
+            If None, defaults to returning only the first pipeline stage.
         non_loss_data_func (callable): A custom function to call during evaluation.
             It can run e.g. benchmarks.
         store: an optional instance of torch.distributed.Store, to be used by
@@ -1109,6 +1129,7 @@ def pretrain(
         prefix = f'iteration {iteration} on validation set'
         if getattr(args, 'perform_rl_step', False):
             rl_eval_model = model
+            rl_training_model = None
             if inference_model is not None:
                 inf_core = unwrap_model(inference_model[0])
                 # If separate inference and training models, swap training weights
@@ -1116,11 +1137,14 @@ def pretrain(
                 rl_utils._maybe_prefetch_separate_inference_model_weights(inf_core, to_cpu=False)
                 swap_model_weights(model, inference_model, args.refit_method)
                 rl_eval_model = inference_model
+                rl_training_model = model
             rl_utils.evaluate_and_print_results_rl(
                 valid_data_iterator,
                 rl_eval_model,
                 optimizer,
-                iteration, write_to_tensorboard=not args.skip_train
+                iteration,
+                write_to_tensorboard=not args.skip_train,
+                training_model=rl_training_model,
             )
         else:
             evaluate_and_print_results(
@@ -2969,6 +2993,7 @@ def train(
             timers('eval-time', log_level=0).start(barrier=True)
             if getattr(args, 'perform_rl_step', False):
                 rl_eval_model = model
+                rl_training_model = None
                 # If separate inference and training models, swap training weights
                 # back to the inference model for RL evaluation.
                 if inference_model is not None:
@@ -2978,12 +3003,14 @@ def train(
                     )
                     swap_model_weights(model, inference_model, args.refit_method)
                     rl_eval_model = inference_model
+                    rl_training_model = model
                 rl_utils.evaluate_and_print_results_rl(
                     valid_data_iterator,
                     rl_eval_model,
                     optimizer,
                     iteration,
                     write_to_tensorboard=True,
+                    training_model=rl_training_model,
                 )
             else:
                 evaluate_and_print_results(prefix, forward_step_func,
@@ -3115,6 +3142,17 @@ def evaluate(
     if args.cuda_graph_impl == "local" and CudaGraphScope.full_iteration in args.cuda_graph_scope:
         forward_backward_func = FullCudaGraphWrapper(forward_backward_func, cuda_graph_warmup_steps=args.cuda_graph_warmup_steps)
 
+    if has_nvidia_modelopt:
+        # [ModelOpt]: Pipeline-parallel Distillation stacks student and teacher tensors
+        adjust_tensor_shapes_fn = get_tensor_shapes_adjust_fn_for_distillation(
+            model,
+            seq_length=args.seq_length,
+            micro_batch_size=args.micro_batch_size,
+            decoder_seq_length=args.decoder_seq_length,
+        )
+    else:
+        adjust_tensor_shapes_fn = None
+
     if eval_iters is None:
         eval_iters = args.eval_iters
 
@@ -3139,6 +3177,7 @@ def evaluate(
                 micro_batch_size=args.micro_batch_size,
                 decoder_seq_length=args.decoder_seq_length,
                 forward_only=True,
+                adjust_tensor_shapes_fn=adjust_tensor_shapes_fn,
             )
             ft_integration.on_eval_step_end()
             config.timers = get_timers()
