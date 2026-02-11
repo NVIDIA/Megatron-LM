@@ -159,8 +159,8 @@ class InferenceRequest:
 class DynamicInferenceEventType(Enum):
     """Dynamic inference event type."""
 
-    ADD_ENGINE = auto()    # When request is added to engine via _add_request()
-    ADD_CONTEXT = auto()   # When request is added to context (scheduled for prefill)
+    ADD_ENGINE = auto()  # When request is added to engine via _add_request()
+    ADD_CONTEXT = auto()  # When request is added to context (scheduled for prefill)
     GENERATED_TOKEN = auto()  # When an output token is generated (payload = {"token_id": int})
     PAUSE = auto()
     EVICT = auto()
@@ -205,7 +205,11 @@ class DynamicInferenceEvent:
         ):
             assert self.payload is not None
         elif self.type == DynamicInferenceEventType.GENERATED_TOKEN:
-            assert self.payload is not None and isinstance(self.payload, dict) and "token_id" in self.payload
+            assert (
+                self.payload is not None
+                and isinstance(self.payload, dict)
+                and "token_id" in self.payload
+            )
         else:
             assert self.payload is None
 
@@ -373,7 +377,9 @@ class DynamicInferenceRequest(InferenceRequest):
             ("top_n_logprobs", torch.int32, False),  # CPU for torch sampling
         ]
 
-    def add_event(self, type: DynamicInferenceEventType, payload: Optional[Any] = None) -> DynamicInferenceEvent:
+    def add_event(
+        self, type: DynamicInferenceEventType, payload: Optional[Any] = None
+    ) -> DynamicInferenceEvent:
         """Add event."""
         event = DynamicInferenceEvent(type=type, payload=payload)
         self.events.append(event)

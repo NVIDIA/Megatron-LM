@@ -885,8 +885,13 @@ class DynamicInferenceEngine(AbstractEngine):
                         if self.track_generated_token_events:
                             first_token_event = event_generated_token
                         else:
-                            first_token_event = DynamicInferenceEvent(type=DynamicInferenceEventType.GENERATED_TOKEN, payload={"token_id": token})
-                        request.ttft = first_token_event.timestamp - request.event_add_engine.timestamp
+                            first_token_event = DynamicInferenceEvent(
+                                type=DynamicInferenceEventType.GENERATED_TOKEN,
+                                payload={"token_id": token},
+                            )
+                        request.ttft = (
+                            first_token_event.timestamp - request.event_add_engine.timestamp
+                        )
                     if request.tpot is None:
                         request.tpot = []
                     request.tpot.append(step_time)

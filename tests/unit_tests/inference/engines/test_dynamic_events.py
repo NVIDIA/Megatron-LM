@@ -11,20 +11,19 @@ import time
 import pytest
 import torch
 
-from megatron.core.inference.inference_request import (
-    DynamicInferenceEvent,
-    DynamicInferenceEventType,
-    DynamicInferenceRequest,
-    DynamicInferenceRequestRecord,
-)
 from megatron.core.inference.contexts.dynamic_context import (
     BlockOverflowError,
     MaxSequenceLengthOverflowError,
     RequestOverflowError,
     TokenOverflowError,
 )
+from megatron.core.inference.inference_request import (
+    DynamicInferenceEvent,
+    DynamicInferenceEventType,
+    DynamicInferenceRequest,
+    DynamicInferenceRequestRecord,
+)
 from megatron.core.inference.sampling_params import SamplingParams
-
 
 # ============================================================================
 # Fixtures
@@ -58,8 +57,15 @@ def test_all_event_types_creation_and_payload_validation():
     """
     # Verify exactly 9 event types exist
     expected_types = [
-        'ADD_ENGINE', 'ADD_CONTEXT', 'GENERATED_TOKEN', 'PAUSE', 'EVICT',
-        'FINISH', 'FAIL', 'ERROR_TRANSIENT', 'ERROR_NONTRANSIENT',
+        'ADD_ENGINE',
+        'ADD_CONTEXT',
+        'GENERATED_TOKEN',
+        'PAUSE',
+        'EVICT',
+        'FINISH',
+        'FAIL',
+        'ERROR_TRANSIENT',
+        'ERROR_NONTRANSIENT',
     ]
     for event_type in expected_types:
         assert hasattr(DynamicInferenceEventType, event_type), f"Missing: {event_type}"
@@ -214,14 +220,28 @@ def test_error_event_serialization_with_context_error_factory():
     """
     error_cases = [
         # (event_type, error_class, request_id, message, is_transient)
-        (DynamicInferenceEventType.ERROR_TRANSIENT, RequestOverflowError,
-         1, "Max requests exceeded", True),
-        (DynamicInferenceEventType.ERROR_TRANSIENT, TokenOverflowError,
-         2, "Token limit exceeded", True),
-        (DynamicInferenceEventType.ERROR_TRANSIENT, BlockOverflowError,
-         3, "Block overflow", True),
-        (DynamicInferenceEventType.ERROR_NONTRANSIENT, MaxSequenceLengthOverflowError,
-         4, "Sequence too long", False),
+        (
+            DynamicInferenceEventType.ERROR_TRANSIENT,
+            RequestOverflowError,
+            1,
+            "Max requests exceeded",
+            True,
+        ),
+        (
+            DynamicInferenceEventType.ERROR_TRANSIENT,
+            TokenOverflowError,
+            2,
+            "Token limit exceeded",
+            True,
+        ),
+        (DynamicInferenceEventType.ERROR_TRANSIENT, BlockOverflowError, 3, "Block overflow", True),
+        (
+            DynamicInferenceEventType.ERROR_NONTRANSIENT,
+            MaxSequenceLengthOverflowError,
+            4,
+            "Sequence too long",
+            False,
+        ),
     ]
 
     for event_type, error_class, req_id, message, is_transient in error_cases:
@@ -532,8 +552,11 @@ def test_event_str_representation_for_all_types():
         (DynamicInferenceEventType.ERROR_TRANSIENT, RequestOverflowError, "RequestOverflowError"),
         (DynamicInferenceEventType.ERROR_TRANSIENT, TokenOverflowError, "TokenOverflowError"),
         (DynamicInferenceEventType.ERROR_TRANSIENT, BlockOverflowError, "BlockOverflowError"),
-        (DynamicInferenceEventType.ERROR_NONTRANSIENT, MaxSequenceLengthOverflowError,
-         "MaxSequenceLengthOverflowError"),
+        (
+            DynamicInferenceEventType.ERROR_NONTRANSIENT,
+            MaxSequenceLengthOverflowError,
+            "MaxSequenceLengthOverflowError",
+        ),
     ]
     for event_type, error_class, expected_name in error_cases:
         error = error_class(request_id=1, message="Test error")
