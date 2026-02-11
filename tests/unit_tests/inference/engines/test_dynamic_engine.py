@@ -1406,7 +1406,8 @@ class TestDynamicInferenceEngine:
         assert not engine.is_suspended
         assert context.is_tensor_state_allocated
 
-        frees_memory = kv_cache_management_mode != "persist"
+        deallocates = kv_cache_management_mode != "persist"
+        uses_tms = context._uses_torch_memory_saver
         preserves_data = kv_cache_management_mode != "recompute"
 
         # Write a deterministic pattern for data integrity check.
@@ -1418,11 +1419,13 @@ class TestDynamicInferenceEngine:
 
         torch.cuda.synchronize()
         mem_before = torch.cuda.memory_allocated()
+        if uses_tms:
+            phys_mem_before = torch.cuda.mem_get_info()[0]
 
         # Suspend.
         engine.suspend()
         assert engine.is_suspended
-        if frees_memory:
+        if deallocates:
             assert not context.is_tensor_state_allocated
         else:
             assert context.is_tensor_state_allocated
@@ -1431,18 +1434,25 @@ class TestDynamicInferenceEngine:
         torch.cuda.empty_cache()
         torch.cuda.synchronize()
         mem_suspended = torch.cuda.memory_allocated()
+        if uses_tms:
+            phys_mem_suspended = torch.cuda.mem_get_info()[0]
 
-        if frees_memory:
+        if deallocates and not uses_tms:
             assert mem_suspended < mem_before, (
                 f"GPU memory should decrease after suspend "
                 f"(mode={kv_cache_management_mode}). "
                 f"Before: {mem_before}, After: {mem_suspended}"
             )
         else:
-            tolerance = max(0.05 * mem_before, 4096)
-            assert abs(mem_suspended - mem_before) < tolerance, (
-                f"Memory should not substantially change on suspend. "
+            assert mem_suspended == mem_before, (
+                f"Memory should not change on suspend. "
                 f"Before: {mem_before}, Suspended: {mem_suspended}"
+            )
+
+        if uses_tms:
+            assert phys_mem_suspended > phys_mem_before, (
+                f"torch_memory_saver should free physical GPU memory after suspend. "
+                f"Before: {phys_mem_before}, After: {phys_mem_suspended}"
             )
 
         # Resume.
@@ -1450,12 +1460,20 @@ class TestDynamicInferenceEngine:
         assert not engine.is_suspended
         assert context.is_tensor_state_allocated
 
-        if frees_memory:
+        if deallocates and not uses_tms:
             torch.cuda.synchronize()
             mem_resumed = torch.cuda.memory_allocated()
             assert mem_resumed > mem_suspended, (
                 f"GPU memory should increase after resume. "
                 f"Suspended: {mem_suspended}, Resumed: {mem_resumed}"
+            )
+
+        if uses_tms:
+            torch.cuda.synchronize()
+            phys_mem_resumed = torch.cuda.mem_get_info()[0]
+            assert phys_mem_resumed < phys_mem_suspended, (
+                f"torch_memory_saver should re-allocate physical GPU memory after resume. "
+                f"Suspended: {phys_mem_suspended}, Resumed: {phys_mem_resumed}"
             )
 
         # Data integrity.
