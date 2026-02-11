@@ -47,8 +47,8 @@ class ProfilingConfig:
     record_memory_history: bool = False
     """Record memory history in last rank."""
 
-    memory_snapshot_path: str = "snapshot.pickle"
-    """Specifies where to dump the memory history pickle."""
+    memory_snapshot_path: str = "snapshot.json"
+    """Specifies where to dump the memory history snapshot."""
 
     record_shapes: bool = False
     """Record shapes of tensors."""
