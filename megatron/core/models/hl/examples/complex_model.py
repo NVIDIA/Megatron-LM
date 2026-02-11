@@ -112,8 +112,6 @@ SmallMoE = MoELayerConfig(
 
 MTP = MTPLayerConfig(
     common_config=common_config,
-    enorm="RMSNorm",
-    hnorm="RMSNorm",
     eh_proj=LinearLayerConfig(common_config=common_config),
     embedding=Embedding,
 )
