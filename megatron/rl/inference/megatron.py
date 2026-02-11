@@ -7,6 +7,7 @@ from argparse import Namespace
 import torch.distributed as dist
 from pydantic import PrivateAttr
 
+from megatron.core.inference.config import KVCacheManagementMode
 from megatron.core.inference.contexts.dynamic_context import DynamicInferenceContext
 from megatron.core.inference.engines.abstract_engine import AbstractEngine
 from megatron.core.inference.engines.dynamic_engine import DynamicInferenceEngine
@@ -74,6 +75,7 @@ class MegatronLocal(InferenceServer, ReturnsTokens, ReturnsRaw):
 
     _client: InferenceClient = PrivateAttr(None)
     _inference_engine: DynamicInferenceEngine = PrivateAttr(None)
+    _rl_kv_cache_management_mode: KVCacheManagementMode = PrivateAttr(None)
 
     async def base_generate(self, request: InferenceRequest):
 
@@ -147,6 +149,9 @@ class MegatronLocal(InferenceServer, ReturnsTokens, ReturnsRaw):
         launched_server = cls(**kwargs)
         launched_server._client = client
         launched_server._inference_engine = inference_engine
+        launched_server._rl_kv_cache_management_mode = KVCacheManagementMode(
+            args.rl_kv_cache_management_mode
+        )
 
         return launched_server
 
@@ -159,11 +164,24 @@ class MegatronLocal(InferenceServer, ReturnsTokens, ReturnsRaw):
         if dist.get_rank() == 0:
             await self._client.pause_engines()
         await self._inference_engine.paused.wait()
+        self._mark_for_recompute()
+        self._inference_engine.suspend()
+
+    def _mark_for_recompute(self):
+        """Mark all request entries for KV cache recomputation.
+
+        Called before suspend when using KV cache recompute mode,
+        so the engine checkpoints and later recomputes all in-flight requests.
+        """
+        if self._rl_kv_cache_management_mode == KVCacheManagementMode.RECOMPUTE:
+            for request_entry in self._inference_engine.requests.values():
+                request_entry.recompute_upon_suspend = True
 
     async def resume(self):
         if dist.get_rank() == 0:
             self._client.unpause_engines()
         await self._inference_engine.running.wait()
+        self._inference_engine.resume()
 
 
 class MegatronChatLocal(ChatInferenceInterface, MegatronLocal): ...
