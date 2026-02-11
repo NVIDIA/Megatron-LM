@@ -79,6 +79,8 @@ class _ParamAndGradBucket:
             communication. Its application is twofold: it facilitates the averaging of gradients
             and the scaling of gradients in the context of the Mixture of Experts (MoE) model.
         bucket_id: Index of bucket in buffer.
+        param_index_map: Mapping from param to (start, end, bucket_id) in the global buffer.
+            Used to derive bucket-local offsets for param_to_index.
     """
 
     def __init__(
@@ -90,6 +92,7 @@ class _ParamAndGradBucket:
         numel_unpadded: int,
         gradient_scaling_factor: float,
         bucket_id: int,
+        param_index_map: Dict[torch.nn.Parameter, tuple],
     ):
         self.params_list = params
         self.params = set(params)
@@ -103,11 +106,11 @@ class _ParamAndGradBucket:
         self.numel_unpadded = numel_unpadded
         self.gradient_scaling_factor = gradient_scaling_factor
         self.bucket_id = bucket_id
+        # Derive bucket-local param offsets from the global param_index_map.
         self.param_to_index = {}
-        offset = 0
         for param in params:
-            self.param_to_index[param] = (offset, offset + param.numel())
-            offset += param.numel()
+            global_start, global_end, _ = param_index_map[param]
+            self.param_to_index[param] = (global_start - offset, global_end - offset)
 
 
 class _ParamAndGradBucketGroup:
@@ -948,6 +951,7 @@ class _ParamAndGradBuffer:
             numel_unpadded=numel_unpadded,
             gradient_scaling_factor=self.gradient_scaling_factor,
             bucket_id=bucket_id,
+            param_index_map=self.param_index_map,
         )
         for bucket_param in bucket_params:
             assert bucket_param not in self.param_to_bucket
