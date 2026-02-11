@@ -128,6 +128,15 @@ def get_mup_config_overrides(
     Returns:
         Dict[ParamKey, ParamGroupOverride]: MuP config overrides for hidden layers.
     """
+    if config.decoupled_lr is not None:
+        log_single_rank(
+            logger,
+            logging.WARNING,
+            "Both decoupled_lr and MuP LR scaling are enabled. decoupled_lr sets an "
+            "absolute LR for embedding+output params, which may conflict with MuP's "
+            "per-layer scaling. Ensure this is intentional.",
+        )
+
     if mup_width_mult == 1.0:
         # No scaling needed when width_mult is 1
         return {}

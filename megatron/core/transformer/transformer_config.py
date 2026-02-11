@@ -1652,7 +1652,12 @@ class TransformerConfig(ModelParallelConfig):
             if self.mup_output_mult == 1.0 and self.mup_width_mult != 1.0:
                 self.mup_output_mult = 1.0 / self.mup_width_mult
 
-        # Set the embedding init method
+        # Set the embedding init method.
+        # NOTE: This block must run AFTER the MuP block above but BEFORE the init_method
+        # block below. When MuP is enabled and init_method is None (the common case),
+        # embedding_init_method is set here using the unscaled init_method_std, while
+        # init_method (set below) gets MuP width-scaling. This ordering ensures embeddings
+        # use the base (unscaled) initialization as required by MuP.
         if self.embedding_init_method_std is None:
             # By default, use the same init std as you use for every other non-output layer.
             self.embedding_init_method_std = self.init_method_std

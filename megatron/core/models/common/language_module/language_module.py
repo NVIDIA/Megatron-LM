@@ -273,6 +273,25 @@ class LanguageModule(MegatronModule):
             )
             LanguageModule.embedding_warning_printed = True
 
+    def _scale_logits(self, logits: Tensor) -> Tensor:
+        """Apply MuP output scaling to logits.
+
+        When MuP is enabled, scales logits by mup_output_mult (auto-set to 1/width_mult
+        if left at default) to keep output variance stable across widths.
+
+        Args:
+            logits (Tensor): Raw logits from the output layer.
+
+        Returns:
+            Tensor: Scaled logits if MuP is enabled and mup_output_mult != 1.0,
+                    otherwise unchanged logits.
+        """
+        if not self.config.use_mup:
+            return logits
+        if self.config.mup_output_mult != 1.0:
+            return logits * self.config.mup_output_mult
+        return logits
+
     def shared_embedding_or_output_weight(self) -> Tensor:
         """Gets the embedding weight or output logit weights when share embedding and output weights set to True
           or when use Multi-Token Prediction (MTP).

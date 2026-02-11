@@ -393,11 +393,3 @@ class MambaModel(LanguageModule):
         loss = self.compute_language_model_loss(labels, logits)
 
         return loss
-
-    def _scale_logits(self, logits: Tensor) -> Tensor:
-        """Apply MuP output scaling to logits."""
-        if not self.config.use_mup:
-            return logits
-        if self.config.mup_output_mult != 1.0:
-            return logits * self.config.mup_output_mult
-        return logits

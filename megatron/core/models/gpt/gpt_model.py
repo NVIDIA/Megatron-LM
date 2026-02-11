@@ -682,48 +682,6 @@ class GPTModel(LanguageModule):
 
         return loss
 
-    def _scale_logits(self, logits: Tensor) -> Tensor:
-        """Apply MuP output scaling to logits.
-
-        Note: Width-based scaling is handled by mup_scaled_init_method_normal and by
-        mup_output_mult (auto-set to 1/width_mult when use_mup and left at default).
-        This method applies mup_output_mult when it differs from 1.0.
-
-        Args:
-            logits (Tensor): Raw logits from the output layer.
-
-        Returns:
-            Tensor: Scaled logits if MuP is enabled and mup_output_mult != 1.0,
-                    otherwise unchanged logits.
-        """
-        if not self.config.use_mup:
-            return logits
-        # Width scaling handled by init; only apply output multiplier here.
-        if self.config.mup_output_mult != 1.0:
-            return logits * self.config.mup_output_mult
-        return logits
-
-    def shared_embedding_or_output_weight(self) -> Tensor:
-        """Gets the embedding weight or output logit weights when share input embedding and
-        output weights set to True or when use Multi-Token Prediction (MTP) feature.
-
-        Returns:
-            Tensor: During pre processing or MTP process it returns the input embeddings weight.
-            Otherwise, during post processing it returns the final output layers weight.
-        """
-        if self.pre_process or self.mtp_process:
-            # Multi-Token Prediction (MTP) need both embedding layer and output layer.
-            # So there will be both embedding layer and output layer in the mtp process stage.
-            # In this case, if share_embeddings_and_output_weights is True, the shared weights
-            # will be stored in embedding layer, and output layer will not have any weight.
-            assert hasattr(
-                self, 'embedding'
-            ), f"embedding is needed in this pipeline stage, but it is not initialized."
-            return self.embedding.word_embeddings.weight
-        elif self.post_process:
-            return self.output_layer.weight
-        return None
-
     def build_schedule_plan(
         self,
         input_ids: Tensor,
