@@ -69,7 +69,7 @@ class ModelParallelConfig:
     Please set max_seqlen_per_dp_cp_rank when using hybrid_context_parallel.
     """
 
-    sequence_packing_scheduler: Optional[str] = None
+    sequence_packing_scheduler: Optional[Literal['dp_balanced']] = None
     """
     Scheduler for sequence packing and hybrid context parallel.
     dp_balanced: DP-balanced scheduler for sequence packing.
