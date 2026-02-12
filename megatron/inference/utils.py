@@ -82,7 +82,7 @@ def add_inference_args(parser: ArgumentParser) -> ArgumentParser:
         metavar='N',
         type=str,
         nargs='+',
-        help='Input prompts with each prompt within quotes and seperated by space',
+        help='Input prompts with each prompt within quotes and separated by space',
     )
     group.add_argument(
         "--num-tokens-to-prompt",
