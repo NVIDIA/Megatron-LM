@@ -886,14 +886,11 @@ def maybe_log_training_metrics(
                         columns=['Trajectories', 'Tokens', 'Rewards'],
                         rows=[
                             [
-                                [(tokenizer.detokenize(turn)
-                                    if isinstance(r, TokenRollout)
-                                    else turn) for turn in r.trajectory
-                                ],
+                                tokenizer.detokenize(turn) if isinstance(r, TokenRollout) else turn ,
                                 r.trajectory,
                                 r.reward,
                             ]
-                            for r in example_group
+                            for r in example_group for turn in r.trajectory
                         ],
                     ),
                 },
