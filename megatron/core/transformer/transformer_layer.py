@@ -1256,29 +1256,12 @@ class MoETransformerLayer(TransformerLayer):
         """
 
         from megatron.core.transformer.cuda_graphs import CudaGraphManager
-        '''
-        self.cudagraph_manager = CudaGraphManager(config)
-        self.moe_layer_recompute = (
-                self.config.recompute_granularity == 'selective'
-                and "moe" in self.config.recompute_modules
-                and self.config.cuda_graph_impl == "local"
-        )
-        self.use_partial_cudagraphs = True
-        self.cudagraph_manager_router = CudaGraphManager(
-            self.config, self, function_name="_forward_mlp_router"
-        )
-        self.cudagraph_manager_postprocess = CudaGraphManager(
-            self.config, self, function_name="_forward_mlp_postprocess"
-        )
-        '''
         if not self.config.cuda_graph_scope or CudaGraphScope.moe in self.config.cuda_graph_scope:
-            print("HERE, ATTEMPTING FULL LAYER GRAPH")
             self.cudagraph_manager = CudaGraphManager(config)
         elif (
             CudaGraphScope.moe_router in self.config.cuda_graph_scope
             or CudaGraphScope.moe_preprocess in self.config.cuda_graph_scope
         ):
-            print("HERE, ATTEMPTING PARTIAL LAYER GRAPH")
             # full MoE layer recompute with partial_cudagraphs. If not partial cudagraphs, MoE
             # layer recompute is handled by the moe_layer.MoELayer class
             self.moe_layer_recompute = (

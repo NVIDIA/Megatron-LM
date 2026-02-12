@@ -405,7 +405,6 @@ class MoELayer(BaseMoELayer):
                         return hidden_states, probs, shared_expert_output
 
             except MoECudaGraphPartialCaptureSignal as e:
-                print("HITTING MoECudaGraphPartialCaptureSignal")
                 # This signal is raised from the maybe_skip_or_early_return_by_cudagraph decorator.
                 # It means we should early-return from the MoE layer forward pass.
                 # This happens when we are partially capturing the CUDA graph of the MoE layer,

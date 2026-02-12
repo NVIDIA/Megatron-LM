@@ -1549,12 +1549,6 @@ class CudaGraphManager(torch.nn.Module):
                 for module in megatron_module.modules():
                     self.call_ddp_preforward_hook(module)
 
-            # if not is_inference_mode and not torch.is_grad_enabled():
-            #     if self.func is not None:
-            #         return self.func(*args, **kwargs)
-            #     else:
-            #         return super(MegatronModule, megatron_module).__call__(*args, **kwargs)
-
             runner = self.get_cudagraph_runner(megatron_module, args, kwargs, self.reuse_cudagraphs)
             out = runner.replay_graph_capture(self.is_first_microbatch, args, kwargs)
         else:

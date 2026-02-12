@@ -276,7 +276,6 @@ def forward_step(data_iterator, model: GPTModel, loss_only: bool = False):
 
     # Get current logprobs and calculate loss with straggler detection
     with stimer:
-        # torch.distributed.breakpoint()
         saved_scope = model_to_use.config.cuda_graph_scope
         saved_impl = args.cuda_graph_impl
         model_to_use.config.cuda_graph_scope = []
