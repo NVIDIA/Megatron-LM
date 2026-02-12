@@ -479,7 +479,7 @@ if HAVE_TE and is_te_min_version("1.13.0"):
             # Add sm_margin if available (TE 2.5+)
             if hasattr(self, '_sm_margins'):
                 kwargs["sm_margin"] = self._sm_margins
-            
+
             rmsnorm_op = te.pytorch.ops.RMSNorm(self.weight.shape, **kwargs)
 
             rmsnorm_op.weight = self.weight
@@ -530,8 +530,9 @@ if HAVE_TE and is_te_min_version("1.13.0"):
                         ret = hook(submodule, None)
                         if ret is not None:
                             raise RuntimeError(
-                                "TEFusedResidualRMSNorm module does not expose intermediate tensors, but "
-                                "submodule has pre-forward hook that modifies input tensor."
+                                "TEFusedResidualRMSNorm module does not expose "
+                                "intermediate tensors, but submodule has "
+                                "pre-forward hook that modifies input tensor."
                             )
 
                 fused_impl.register_forward_pre_hook(forward_pre_hook)
@@ -551,8 +552,9 @@ if HAVE_TE and is_te_min_version("1.13.0"):
                         ret = hook(submodule, None, None)
                         if ret is not None:
                             raise RuntimeError(
-                                "TEFusedResidualRMSNorm module does not expose intermediate tensors, but "
-                                "submodule has post-forward hook that modifies output tensor."
+                                "TEFusedResidualRMSNorm module does not expose "
+                                "intermediate tensors, but submodule has "
+                                "post-forward hook that modifies output tensor."
                             )
 
                 fused_impl.register_forward_hook(forward_post_hook)
@@ -560,11 +562,13 @@ if HAVE_TE and is_te_min_version("1.13.0"):
             # Backward hooks
             if backward_pre_hooks:
                 raise RuntimeError(
-                    "TEFusedResidualRMSNorm module does not support submodules with pre-backward hooks"
+                    "TEFusedResidualRMSNorm module does not support "
+                    "submodules with pre-backward hooks"
                 )
             if backward_post_hooks:
                 raise RuntimeError(
-                    "TEFusedResidualRMSNorm module does not support submodules with post-backward hooks"
+                    "TEFusedResidualRMSNorm module does not support "
+                    "submodules with post-backward hooks"
                 )
 
         def forward(self, hidden_states: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
@@ -613,7 +617,11 @@ class TENorm:
 
     # TODO should we ditch normalization config and just use spec to choose LayerNorm vs RMSNorm?
     def __new__(
-        cls, config: TransformerConfig, hidden_size: int, eps: float = 1e-5, has_residual: bool = False
+        cls,
+        config: TransformerConfig,
+        hidden_size: int,
+        eps: float = 1e-5,
+        has_residual: bool = False,
     ):
         if not HAVE_TE:
             raise ImportError(
@@ -639,9 +647,9 @@ class TENorm:
 
             if config.fused_residual_rmsnorm and has_residual:
                 # Use fused residual variant
-                assert TEFusedResidualRMSNorm is not None, (
-                    "TEFusedResidualRMSNorm requires Transformer-Engine >= v1.13.0"
-                )
+                assert (
+                    TEFusedResidualRMSNorm is not None
+                ), "TEFusedResidualRMSNorm requires Transformer-Engine >= v1.13.0"
                 instance = TEFusedResidualRMSNorm(
                     normalized_shape=hidden_size,
                     eps=eps,
@@ -2398,6 +2406,7 @@ if HAVE_TE and is_te_min_version("1.13.0"):
 
 else:
     TEFusedMLP = None  # type: ignore[assignment, misc]
+
 
 class TEDelayedScaling(te.common.recipe.DelayedScaling):
     """
