@@ -1007,7 +1007,9 @@ class MegatronFSDP(torch.nn.Module):
                     )
                 grad_acc_param_list = [p for p in module.parameters() if p.requires_grad]
             else:
-                grad_acc_param_list = [p for p in module.parameters(recurse=False) if p.requires_grad]
+                grad_acc_param_list = [
+                    p for p in module.parameters(recurse=False) if p.requires_grad
+                ]
 
             for param in grad_acc_param_list:
                 self.grad_acc_hooks[f"grad_acc and reduce for {self.param_to_name[param]}"] = (
