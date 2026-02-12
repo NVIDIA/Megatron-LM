@@ -25,6 +25,7 @@ from megatron.core.num_microbatches_calculator import (
 from megatron.core.transformer.pipeline_parallel_layer_layout import (
     PipelineParallelLayerLayout
 )
+from megatron.core.transformer.transformer_config import TransformerConfig
 from tests.unit_tests.test_utilities import Utils
 
 
@@ -113,15 +114,27 @@ class TestVppSimulatorBasic:
             """
             class SimpleTestModel(torch.nn.Module):
                 """Minimal model for testing"""
-                def __init__(self):
+                def __init__(self, config):
                     super().__init__()
+                    self.config = config  # Required by Megatron
                     self.linear = torch.nn.Linear(64, 64)
 
                 def forward(self, hidden_states):
                     return self.linear(hidden_states)
 
+            # Create a minimal TransformerConfig for the model
+            # Use config from kwargs if provided, otherwise create a simple one
+            config = kwargs.get('config', None)
+            if config is None:
+                config = TransformerConfig(
+                    num_layers=4,
+                    hidden_size=64,
+                    num_attention_heads=4,
+                    use_cpu_initialization=True
+                )
+
             # Return single model object (get_model will wrap in list if needed for VPP)
-            return SimpleTestModel()
+            return SimpleTestModel(config)
 
         return provider
 
