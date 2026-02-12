@@ -43,6 +43,7 @@ from megatron.core.inference.text_generation_controllers.text_generation_control
 from megatron.core.inference.utils import Counter, await_process_call
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.transformer.cuda_graphs import delete_cuda_graphs
+from megatron.core.transformer.moe.router_replay import RouterReplay, RouterReplayAction
 from megatron.core.utils import (
     deprecate_args,
     experimental_api,
@@ -174,9 +175,7 @@ class DynamicInferenceEngine(AbstractEngine):
         self.controller = controller
         self.context = context
         self.track_paused_request_events = inference_config.track_paused_request_events
-        self.track_generated_token_events = getattr(
-            inference_config, 'track_generated_token_events', False
-        )
+        self.track_generated_token_events = inference_config.track_generated_token_events
         self.enable_chunked_prefill = inference_config.enable_chunked_prefill
         self.metrics_writer = inference_config.metrics_writer
         self.logging_step_interval = inference_config.logging_step_interval
@@ -304,6 +303,12 @@ class DynamicInferenceEngine(AbstractEngine):
                 logging.info(
                     f"{tbar_idx}/{len(context.cuda_graph_batch_dimensions_list)}. {tbar_str}"
                 )
+
+            # Enable routing recording during warmup if routing replay is enabled.
+            # This ensures the record_indices copy operation is captured in the CUDA graph.
+            model_config = controller.inference_wrapped_model.model.config
+            if model_config.moe_enable_routing_replay:
+                RouterReplay.set_global_router_replay_action(RouterReplayAction.RECORD)
 
             # Forward pass -> logits.
             controller._dynamic_step_forward_logits(input_ids, position_ids)
@@ -848,6 +853,7 @@ class DynamicInferenceEngine(AbstractEngine):
         sample: torch.Tensor,
         log_probs: torch.Tensor,
         top_n_logprobs: Optional[Dict[int, List[Tuple[torch.Tensor, torch.Tensor]]]] = None,
+        routing_indices_per_request: Optional[Dict[int, torch.Tensor]] = None,
     ) -> Tuple[List[DynamicInferenceRequest], List[DynamicInferenceRequest]]:
         """
         Handles post-processing for requests after a step.
@@ -861,6 +867,9 @@ class DynamicInferenceEngine(AbstractEngine):
             log_probs: (List): Log probs for each request
             top_n_logprobs: (Dict): Top-n log probs for each request. Maps request_idx to
                 list of (top_n_logprobs, top_n_indices) tuples.
+            routing_indices_per_request: (Dict[int, Tensor]): MoE routing indices
+                pre-mapped by request_id. Each value is a tensor of shape
+                [num_tokens_this_step, num_layers, topk].
 
         Returns:
             A list of active requests and completed requests as `DynamicInferenceRequest` objects
@@ -1024,6 +1033,23 @@ class DynamicInferenceEngine(AbstractEngine):
                         request.prompt_top_n_logprobs.append(logit_dict)
                     else:
                         request.generated_top_n_logprobs.append(logit_dict)
+
+            # Process routing indices if available (keyed by request_id)
+            # Each step's routing is a tensor of shape [num_tokens_this_step, num_layers, topk]
+            # We concatenate along dim=0 to accumulate: [total_tokens, num_layers, topk]
+            if (
+                routing_indices_per_request is not None
+                and request_id in routing_indices_per_request
+            ):
+                step_routing = routing_indices_per_request[
+                    request_id
+                ]  # [num_tokens, num_layers, topk]
+                if request.routing_indices is None:
+                    request.routing_indices = step_routing.clone()
+                else:
+                    request.routing_indices = torch.cat(
+                        [request.routing_indices, step_routing], dim=0
+                    )
 
         # Handle evicted requests.
         if evict_request_ids is not None and evict_request_ids.numel() > 0:
@@ -1210,12 +1236,6 @@ class DynamicInferenceEngine(AbstractEngine):
 
             if request_can_be_added and kv_cache_available:
                 if token_fully_can_be_added:
-                    # For Mamba models we need to ensure that the last prefill chunk
-                    # is still tagged as a chunked prefill request.
-                    self.context.has_explicit_chunked_prefill_req = (
-                        self.context.is_hybrid_model
-                        and self.context.chunked_prefill_request_id == req.request_id
-                    )
                     self.context.chunked_prefill_request_id = -1
                     self.context.add_request(req)
                     self._loop.call_soon_threadsafe(
@@ -1226,10 +1246,7 @@ class DynamicInferenceEngine(AbstractEngine):
                     # Fully scheduled, so we remove from waiting pool
                     self.waiting_request_ids.popleft()
                     # Only this case we keep checking the rest of the waiting queue
-                    # We break early for Mamba models running a final prefill chunk
-                    # so that no additional requests are scheduled beyond the chunked
-                    # prefill request.
-                    can_schedule = not self.context.has_explicit_chunked_prefill_req
+                    can_schedule = True
                 elif token_partially_can_be_added:
                     chunk_length = self.context.max_tokens - self.context.active_token_count
                     self.context.add_request(req, chunk_length=chunk_length)
@@ -1237,7 +1254,6 @@ class DynamicInferenceEngine(AbstractEngine):
                         self._loop.create_task, self._notify_cond_for_new_request()
                     )
                     self.context.chunked_prefill_request_id = req.request_id
-                    self.context.has_explicit_chunked_prefill_req = self.context.is_hybrid_model
                     req.remaining_prompt_tokens = req.remaining_prompt_tokens[chunk_length:]
                     req.finished_chunk_token_count += chunk_length
                     # Still have tokens to prefill, so we break and keep the
@@ -1348,6 +1364,7 @@ class DynamicInferenceEngine(AbstractEngine):
             sample = step_result["sample"]
             log_probs = step_result["log_probs"]
             top_n_logprobs = step_result.get("top_n_logprobs", None)
+            routing_indices_per_request = step_result.get("routing_indices_per_request", None)
             cuda_graph_request_count = step_result["cuda_graph_request_count"]
 
             # Add paused events.
@@ -1364,6 +1381,7 @@ class DynamicInferenceEngine(AbstractEngine):
                 sample,
                 log_probs,
                 top_n_logprobs,
+                routing_indices_per_request,
             )
 
         else:
