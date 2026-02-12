@@ -303,6 +303,7 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
             config=self.config,
             hidden_size=self.config.hidden_size,
             eps=self.config.layernorm_epsilon,
+            has_residual=True,  # Followed by self-attention + residual add
         )
 
         attention_optional_kwargs = {}
@@ -330,6 +331,7 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
             config=self.config,
             hidden_size=self.config.hidden_size,
             eps=self.config.layernorm_epsilon,
+            has_residual=True,  # Followed by cross-attention + residual add
         )
 
         # [Module 5: CrossAttention]
@@ -348,6 +350,7 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
             config=self.config,
             hidden_size=self.config.hidden_size,
             eps=self.config.layernorm_epsilon,
+            has_residual=True,  # Followed by MLP + residual add
         )
         # [Module 8: MLP block]
         additional_mlp_kwargs = {}
