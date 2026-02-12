@@ -1,8 +1,17 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
+import torch
 import triton
 import triton.language as tl
 
+try:
+    from transformer_engine.pytorch.tensor.mxfp8_tensor import MXFP8Tensor
+
+    HAVE_TE = True
+except ImportError:
+    MXFP8Tensor = None
+
+    HAVE_TE = False
 
 @triton.jit
 def _quantize_mxfp8_kernel(
@@ -99,6 +108,7 @@ def quantize_to_mxfp8(x: torch.Tensor, group_size: int = 32):
     # scaled_mm expects the scale tensor to be a Float8 type.
     scale_dtype = getattr(torch, 'float8_e8m0fnu', torch.uint8)
     s = torch.empty((M, K // group_size), device=x.device, dtype=scale_dtype)
+    s_view = s.view(torch.uint8)
 
     # Grid: One program per block of 32
     grid = (M * (K // group_size),)
@@ -106,15 +116,33 @@ def quantize_to_mxfp8(x: torch.Tensor, group_size: int = 32):
     _quantize_mxfp8_kernel[grid](
         x,
         y,
-        s,
+        s_view,
         x.stride(0),
         x.stride(1),
         y.stride(0),
         y.stride(1),
-        s.stride(0),
-        s.stride(1),
+        s_view.stride(0),
+        s_view.stride(1),
         K,
         BLOCK_SIZE=group_size,
     )
 
     return y, s
+
+def translate_te_mxfp8_tensor(tensor: MXFP8Tensor):
+    """
+    Helper to extract MXFP8 data and scales from a TE MXFP8Tensor.
+    Returns (tensor_fp8, tensor_scale)
+    """
+    assert HAVE_TE and isinstance(tensor, MXFP8Tensor)
+
+    data = tensor._rowwise_data
+    scale = tensor._rowwise_scale_inv
+
+    if data.dtype == torch.uint8:
+        data = data.view(torch.float8_e4m3fn)
+
+    if scale.dtype == torch.uint8:
+        scale = scale.view(torch.float8_e8m0fnu)
+
+    return data, scale

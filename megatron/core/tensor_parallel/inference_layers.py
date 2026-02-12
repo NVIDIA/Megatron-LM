@@ -13,7 +13,7 @@ from megatron.core.inference.communication.torch_symm_triton import (
     multimem_all_gather,
     multimem_reduce_scatter,
 )
-from megatron.core.inference.quantization.utils import quantize_to_mxfp8
+from megatron.core.inference.quantization.utils import translate_te_mxfp8_tensor, quantize_to_mxfp8
 from megatron.core.model_parallel_config import ModelParallelConfig
 from megatron.core.parallel_state import get_global_symmetric_memory_buffer
 from megatron.core.transformer.transformer_config import TransformerConfig
@@ -171,7 +171,7 @@ class InferenceLayerNormColumnParallelLinear(TELayerNormColumnParallelLinear):
         if self.config.fp8_recipe == "mxfp8" and HAVE_SCALED_MM:
             # Quantize activations (BF16 -> MXFP8)
             # x is [M, K]
-            x_fp8, x_scale = quantize_to_mxfp8(x)
+            x_fp8, x_scale = quantize_to_mxfp8(x.squeeze(1))
 
             # Prepare weights (Assumed to be in MXFP8)
             # self.weight is data (E4M3FN), self.weight_scale is scale (E8M0FNU)
@@ -182,37 +182,31 @@ class InferenceLayerNormColumnParallelLinear(TELayerNormColumnParallelLinear):
             #   scale_a: [M, K/32]
             #   scale_b: [N, K/32]
 
-            # Assume self.weight_scale exists alongside self.weight
-            assert hasattr(self, "weight_scale"), "Missing weight_scale for MXFP8 inference"
-            weight_fp8 = self.weight
-            weight_scale = self.weight_scale
+            weight_fp8, weight_scale = translate_te_mxfp8_tensor(self.weight)
 
             # Swizzling configuration
-            # Weights are usually pre-swizzled for inference on Hopper
-            swizzle_a = SwizzleType.NO_SWIZZLE
-            swizzle_b = (
-                SwizzleType.SWIZZLE_32_4_4
-                if torch.cuda.get_device_properties(x.device).major >= 9
-                else SwizzleType.NO_SWIZZLE
-            )
+            swizzle_a = SwizzleType.SWIZZLE_32_4_4
+            swizzle_b = SwizzleType.SWIZZLE_32_4_4
 
             # Perform Scaled MM
             # x: [M, K], weight.t(): [K, N] -> [M, N] output
             # scaled_mm arg 'b' is expected to be [N, K] (conceptually transposed)
             # if we pass it directly?
             # torch.nn.functional.scaled_mm(a, b, ...) performs a @ b.t()
+
+            print(f"x_fp8.shape={x_fp8.shape}, weight_fp8.shape={weight_fp8.shape}, x_scale.shape={x_scale.shape}, weight_scale.shape={weight_scale.shape}")
             x = scaled_mm(
                 x_fp8,
-                weight_fp8,
+                weight_fp8.T,
                 scale_a=x_scale,
                 scale_b=weight_scale,
                 scale_recipe_a=ScalingType.BlockWise1x32,
                 scale_recipe_b=ScalingType.BlockWise1x32,
                 swizzle_a=swizzle_a,
                 swizzle_b=swizzle_b,
-                out_dtype=x.dtype,  # Output in BF16
+                output_dtype=x.dtype,  # Output in BF16
                 use_fast_accum=False,
-            )
+            ).unsqueeze(1)
         else:
             x = torch.matmul(x, self.weight.t())
 
@@ -298,26 +292,25 @@ class InferenceRowParallelLinear(TERowParallelLinear):
             if use_mxfp8:
                 # MXFP8 Scaled GEMM
                 x_fp8, x_scale = quantize_to_mxfp8(x)
-                assert hasattr(self, "weight_scale"), "Missing weight_scale for MXFP8 inference"
 
-                # Setup Swizzle
-                swizzle_a = SwizzleType.NO_SWIZZLE
-                swizzle_b = (
-                    SwizzleType.SWIZZLE_32_4_4 if is_hopper_or_newer else SwizzleType.NO_SWIZZLE
-                )
+                weight_fp8, weight_scale = translate_te_mxfp8_tensor(self.weight)
+
+                # Swizzling configuration
+                swizzle_a = SwizzleType.SWIZZLE_32_4_4
+                swizzle_b = SwizzleType.SWIZZLE_32_4_4
 
                 # Note: scaled_mm output can be directed to out tensor
                 # scaled_mm performs (x @ weight.T)
                 scaled_mm(
                     x_fp8,
-                    self.weight,
+                    weight_fp8.T,
                     scale_a=x_scale,
-                    scale_b=self.weight_scale,
+                    scale_b=weight_scale,
                     scale_recipe_a=ScalingType.BlockWise1x32,
                     scale_recipe_b=ScalingType.BlockWise1x32,
                     swizzle_a=swizzle_a,
                     swizzle_b=swizzle_b,
-                    out_dtype=x.dtype,
+                    output_dtype=x.dtype,
                     use_fast_accum=False,
                     out=symm_mem_buffer["tensor"],  # Write directly to symm mem
                 )
@@ -358,20 +351,20 @@ class InferenceRowParallelLinear(TERowParallelLinear):
             # revert to torch dist (NCCL) reduce-scatter
             if use_mxfp8:
                 x_fp8, x_scale = quantize_to_mxfp8(x)
-                assert hasattr(self, "weight_scale"), "Missing weight_scale for MXFP8 inference"
-                swizzle_b = (
-                    SwizzleType.SWIZZLE_32_4_4 if is_hopper_or_newer else SwizzleType.NO_SWIZZLE
-                )
+                weight_fp8, scale_fp8 = translate_te_mxfp8_tensor(self.weight)
+                swizzle_a = SwizzleType.SWIZZLE_32_4_4
+                swizzle_b = SwizzleType.SWIZZLE_32_4_4
+
                 x = scaled_mm(
                     x_fp8,
-                    self.weight,
+                    weight_fp8.T,
                     scale_a=x_scale,
-                    scale_b=self.weight_scale,
+                    scale_b=scale_fp8,
                     scale_recipe_a=ScalingType.BlockWise1x32,
                     scale_recipe_b=ScalingType.BlockWise1x32,
-                    swizzle_a=SwizzleType.NO_SWIZZLE,
+                    swizzle_a=swizzle_a,
                     swizzle_b=swizzle_b,
-                    out_dtype=x.dtype,
+                    output_dtype=x.dtype,
                     use_fast_accum=False,
                 )
             else:
@@ -401,25 +394,23 @@ class InferenceRowParallelLinear(TERowParallelLinear):
         """
         if self.tp_size == 1:
             if self.config.fp8_recipe == "mxfp8" and HAVE_SCALED_MM:
-                x_fp8, x_scale = quantize_to_mxfp8(x)
-                assert hasattr(self, "weight_scale"), "Missing weight_scale for MXFP8 inference"
-                swizzle_b = (
-                    SwizzleType.SWIZZLE_32_4_4
-                    if torch.cuda.get_device_properties(x.device).major >= 9
-                    else SwizzleType.NO_SWIZZLE
-                )
+                print(f"Quantizing to mxfp8...")
+                x_fp8, x_scale = quantize_to_mxfp8(x.squeeze(1))
+                weight_fp8, weight_scale = translate_te_mxfp8_tensor(self.weight)
+                swizzle_a = SwizzleType.SWIZZLE_32_4_4
+                swizzle_b = SwizzleType.SWIZZLE_32_4_4
                 x = scaled_mm(
                     x_fp8,
-                    self.weight,
+                    weight_fp8.T,
                     scale_a=x_scale,
-                    scale_b=self.weight_scale,
+                    scale_b=weight_scale,
                     scale_recipe_a=ScalingType.BlockWise1x32,
                     scale_recipe_b=ScalingType.BlockWise1x32,
-                    swizzle_a=SwizzleType.NO_SWIZZLE,
+                    swizzle_a=swizzle_a,
                     swizzle_b=swizzle_b,
-                    out_dtype=x.dtype,
+                    output_dtype=x.dtype,
                     use_fast_accum=False,
-                )
+                ).unsqueeze(1)
             else:
                 x = torch.matmul(x, self.weight.t())
             return x, None
