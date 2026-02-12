@@ -46,6 +46,7 @@ else
         --expert-tensor-parallel-size ${ETP} \
         --expert-model-parallel-size ${EP} \
         --pipeline-model-parallel-size ${PP} \
+        --context-parallel-size ${CP} \
         --tokenizer-model ${TOKENIZER_MODEL} \
         --load ${MLM_MODEL_CKPT} \
         --save ${MLM_MODEL_SAVE} \
