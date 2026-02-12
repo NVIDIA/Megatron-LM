@@ -134,7 +134,7 @@ class TestNonuniformTPParameterResharding:
         param = torch.nn.Parameter(torch.randn(384, 128))  # 384 = 24 heads * 16 dim
         param.tensor_model_parallel = True
         param.partition_dim = 0
-        param.shape = (384, 128)
+        # Note: param.shape is already (384, 128) from the tensor, no need to set it
         module.parameters = Mock(return_value=[param])
         module.config = MockConfig()
 
