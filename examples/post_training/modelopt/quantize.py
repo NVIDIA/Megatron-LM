@@ -418,6 +418,7 @@ if __name__ == "__main__":
 
         if tokenizer.pad_token is None:
             tokenizer.pad_token = tokenizer.eos_token
+        tokenizer.padding_side = "left"  # better for calibration
 
         if args.weight_only:
             mtq.quantize(unwrapped_model, mtq_config)
