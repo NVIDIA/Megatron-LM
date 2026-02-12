@@ -1543,11 +1543,13 @@ class TransformerConfig(ModelParallelConfig):
                     "If you use bias in MLP FC1, we recommend setting bias_activation_fusion "
                     "to True and use_te_activation_func to False."
                 )
-        
+
         if self.fused_residual_rmsnorm:
             if self.normalization != "RMSNorm":
-                raise ValueError("fused_residual_rmsnorm is only supported when normalization is RMSNorm.")
-        
+                raise ValueError(
+                    "fused_residual_rmsnorm is only supported when normalization is RMSNorm."
+                )
+
         if self.use_te_activation_func:
             if self.activation_func not in (F.gelu, F.silu, F.relu):
                 raise ValueError(
