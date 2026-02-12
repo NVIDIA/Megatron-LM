@@ -401,6 +401,10 @@ def forward_step(
     """
     from megatron.core.transformer.multi_token_prediction import MTPLossAutoScaler
 
+    from megatron.core.tensor_tracer import get_tt_flags
+    if get_tt_flags() is not None:
+        get_tt_flags().should_trace = True
+
     if config.timers is not None:
         config.timers('forward-compute', log_level=2).start()
 
@@ -440,6 +444,9 @@ def forward_step(
         cp_group_size,
         is_last_stage,
     )
+
+    if get_tt_flags() is not None:
+        get_tt_flags().should_trace = False
 
     if unwrap_output_tensor:
         return output_tensor, num_tokens
