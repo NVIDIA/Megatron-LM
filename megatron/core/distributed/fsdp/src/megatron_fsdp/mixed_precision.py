@@ -379,17 +379,12 @@ class MixedPrecisionPolicy:
       compute parameters specified by the user model. Defaults to torch.float32.
     """
 
-    grad_comm_dtype: Optional[torch.dtype] = torch.bfloat16
+    grad_comm_dtype: Optional[torch.dtype] = torch.float32
     """Data type for gradient gather / scatter communications. Can be utilized to reduce
       communication latency, but adds overhead for type-casting and copy operations.
-      If set to None, the native model gradient dtype is used. Defaults to torch.bfloat16.
-    """
-
-    grad_accum_dtype: Optional[torch.dtype] = torch.float32
-    """Data type for gradient reduction and accumulation to control accumulation precision.
-      Specifically, gradients will be reduced at this precision, but accumulated either at
-      this precision or higher precision based on type-promotion with the main_grads_dtype.
-      If set to None, reduction is performed in the data-type of the communicated gradient
-      and type-promotion with respect to the main_grads_dtype determines the data-type when
-      accumulating gradients. Defaults to torch.float32.
+      If using NCCL UBR v2.27+, gradient reduction may be performed in high-precision
+      depending on the network domain (NVLink or IB), and can enable mixed-precision
+      communication and accumulation, e.g. setting grad_comm_dtype to BF16 can support
+      FP32 reduction even though we have BF16 input and output communication buffers.
+      If set to None, the main_grads_dtype is used. Defaults to torch.float32.
     """

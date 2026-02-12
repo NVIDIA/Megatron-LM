@@ -890,7 +890,6 @@ class TestMegatronFsdpFullyShard:
                 main_params_dtype=custom_main_params_dtype,
                 main_grads_dtype=custom_main_grads_dtype,
                 grad_comm_dtype=None,
-                grad_accum_dtype=None,
             ),
             init_model_with_meta_device=True,
             report_nan_in_param_grad=True,
@@ -920,14 +919,10 @@ class TestMegatronFsdpFullyShard:
             toy_target = torch.randn(1, DIM_SIZE, DIM_SIZE).to("cuda")
 
         # Test a different mixed-precision policy every step.
-        for grad_comm_dtype, grad_accum_dtype in product(
-            (None, torch.float16), (None, torch.float64)
-        ):
+        for grad_comm_dtype in [None, torch.float16]:
             # Set up mixed-precision context manager to change policy every step.
             with mfsdp_model.mixed_precision_context(
-                MixedPrecisionPolicy(
-                    grad_comm_dtype=grad_comm_dtype, grad_accum_dtype=grad_accum_dtype
-                )
+                MixedPrecisionPolicy(grad_comm_dtype=grad_comm_dtype)
             ):
                 # Forward pass.
                 if model_type == TE_TRANSFORMER:

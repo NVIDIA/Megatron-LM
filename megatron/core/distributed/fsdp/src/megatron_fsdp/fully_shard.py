@@ -184,8 +184,7 @@ def fully_shard_model(
 
         mixed_precision_policy (megatron_fsdp.MixedPrecisionPolicy):
             Megatron-FSDP mixed-precision config that controls compute and communication precision.
-            Defaults to FP32 main weights, FP32 main gradients, BF16 gradient communications, and
-            FP32 gradient reduction and accumulation.
+            Defaults to FP32 for main weights, main gradients, and gradient communication buffers.
 
         overlap_grad_reduce (bool):
             Whether to overlap gradient reduce-scatter (or all-reduce) with backward compute.

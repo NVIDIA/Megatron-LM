@@ -1385,7 +1385,6 @@ def get_model(model_provider_func, model_type=ModelType.encoder_or_decoder, wrap
                 dp_init_kwargs["main_params_dtype"] = args.megatron_fsdp_main_params_dtype
                 dp_init_kwargs["main_grads_dtype"] = args.megatron_fsdp_main_grads_dtype
                 dp_init_kwargs["grad_comm_dtype"] = args.megatron_fsdp_grad_comm_dtype
-                dp_init_kwargs["grad_accum_dtype"] = args.megatron_fsdp_grad_accum_dtype
 
             model = [
                 DP(

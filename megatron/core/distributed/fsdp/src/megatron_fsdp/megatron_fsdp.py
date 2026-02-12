@@ -1157,8 +1157,6 @@ class MegatronFSDP(torch.nn.Module):
                 if self.ddp_config.fsdp_double_buffer
                 else self.mp_policy.grad_comm_dtype
             ),
-            # Accumulation data-type can always be reset.
-            grad_accum_dtype=mixed_precision_policy.grad_accum_dtype,
         )
         self.mp_policy = mp_policy_reset
         self.param_and_grad_buffer.mp_policy = mp_policy_reset

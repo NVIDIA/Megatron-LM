@@ -307,17 +307,15 @@ Megatron-FSDP's `fully_shard_*` API has a comprehensive set of arguments for fin
 - `mixed_precision_policy` takes a `megatron_fsdp.MixedPrecisionPolicy` that configures mixed-precision compute and communication for Megatron-FSDP. Configuration options include:
     - `main_params_dtype` controls the data-type for parameters used in distributed optimization or quantization. 
         - Defaults to `torch.float32`.
-        - If set to `None`, the model compute parameter data-type will be utilized.
+        - If set to `None`, the native model compute parameter data-type will be utilized.
         - Requires specification (cannot be `None`) when using `FP8` parameters with Megatron-FSDP.
     - `main_grads_dtype` controls the data-type for gradients used in distributed optimization.
         - Defaults to `torch.float32`, which is highly-recommended for accuracy at scale.
         - If set to `None`, the model native gradient data-type will be utilized.
     - `grad_comm_dtype` controls the data-type for gradient communications (A2A / RS / AR) when reducing gradients.
-        - Defaults to `torch.bfloat16`, which has minor performance benefits even at small scale, and potentially major performance benefits at scale.
-        - If set to `None`, the model native weight gradient data-type will be utilized.
-    - `grad_accum_dtype` controls the data-type for gradient reduction and accumulation to control accumulation precision. Specifically, gradients will be reduced at this precision, but accumulated either at this precision or higher precision based on type-promotion with respect to the `main_grads_dtype`.
-        - Defaults to `torch.float32`, which is highly-recommended for accuracy at scale. Simpler models or coarser datasets can get away with lower gradient accumulation precision.
-        - If set to `None`, reduction is performed in the data-type of the communicated gradient, and type-promotion with respect to the `main_grads_dtype` determines the data-type when accumulating gradients. Defaults to `torch.float32`.
+        - Defaults to `torch.float32`.
+        - If set to `None`, the `main_grads_dtype` data-type will be utilized.
+        - If using NCCL UBR v2.27+ (`nccl_ub=True`), gradient reduction may be performed in high-precision depending on the network domain (NVLink or IB), and can enable mixed-precision communication and accumulation, e.g. setting grad_comm_dtype to BF16 can support FP32 reduction even though we have BF16 input and output communication buffers. Otherwise, gradients will be reduced in `grad_comm_dtype` (and accumulated in `main_grads_dtype`) as usual.
 - `overlap_grad_reduce` and `overlap_param_gather` will overlap gradient [`reduce-scatter`](https://docs.nvidia.com/deeplearning/nccl/user-guide/docs/usage/collectives.html#reducescatter) and parameter [`all-gather`](https://docs.nvidia.com/deeplearning/nccl/user-guide/docs/usage/collectives.html#allgather) group communications with backward and forward compute with asynchronous calls and pre-fetching. (In the case of `no_shard`, parameters are not gathered but gradient [`all-reduce`](https://docs.nvidia.com/deeplearning/nccl/user-guide/docs/usage/collectives.html#allreduce) is overlapped.)
     - Both default to `True`.
 - `sync_model_each_microbatch` will trigger a `wait` (`MegatronFSDP.finish_grad_sync()`) on gradient reduction, parameter de-allocation, and optimizer parameter / gradient installation (in preparation for `optimizer.step()`) after every forward-backward pass. When using HSDP, parameters and gradients will be all-gathered and reduced respectively on the "outer" DP group each training step instead of each optimization cycle. This behavior is desirable for a transparent and user-friendly sharded training loop where post-backward transformations on the gradient and a clean compute / memory state are necessary within and between training iterations, but damages performance in situations where optimization is delayed (e.g. gradient accumulation) when the communications of the previous training iteration can be overlapped with the compute of the next training iteration. Will also override `is_last_microbatch` / `microbatch_count` logic in `MegatronFSDP`.
