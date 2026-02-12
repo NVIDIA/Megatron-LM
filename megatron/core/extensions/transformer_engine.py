@@ -483,30 +483,16 @@ if HAVE_TE and is_te_min_version("1.13.0"):
 
             rmsnorm_op = te.pytorch.ops.RMSNorm(self.weight.shape, **kwargs)
 
-            # CRITICAL: Share the weight parameter with base class
-            # This ensures checkpointing works through the base class
             rmsnorm_op.weight = self.weight
 
             fused_impl.append(rmsnorm_op)
 
-            # Transfer hooks from base module to fused implementation
-            # This is CRITICAL for DDP to work correctly
             self._register_hooks_on_fused_impl(fused_impl)
 
             return fused_impl
 
         def _register_hooks_on_fused_impl(self, fused_impl: torch.nn.Module) -> None:
-            """
-            Transfer hooks from base RMSNorm to fused implementation.
 
-            This is critical for distributed training - DDP registers hooks on the
-            base module that must be executed. Follows TEFusedMLP pattern.
-
-            Note: Transformer Engine's op fuser does not expose intermediate tensors,
-            so hooks that modify tensors will not work correctly.
-            """
-
-            # Collect hooks from all submodules (including self)
             forward_pre_hooks = []
             forward_post_hooks = []
             backward_pre_hooks = []
