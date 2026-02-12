@@ -464,6 +464,10 @@ class DynamicInferenceContext(BaseInferenceContext):
             # User can control request overflow via max_requests.
             self.max_requests = inference_config.max_requests
 
+        assert (
+            self.max_requests % tp_size == 0
+        ), f"max_requests must be divisible by tp_size ({tp_size}), but got {self.max_requests}"
+
         self.max_tokens = inference_config.max_tokens or self.DEFAULT_MAX_TOKENS
 
         assert self.max_tokens >= self.max_requests, (
