@@ -54,6 +54,7 @@ from megatron.core.enums import ModelType
 from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.core.rerun_state_machine import get_rerun_state_machine
 from megatron.core.tokenizers.text.utils.build_tokenizer import build_tokenizer
+from megatron.core.models.hl import HLModelConfig
 from megatron.core.utils import get_attr_wrapped_model, is_te_min_version, StragglerDetector
 from megatron.training import (
     get_args,
@@ -130,26 +131,16 @@ def parse_overrides(override_args: list[str]) -> dict:
     return overrides
 
 
-def load_hlmodel_spec(config_path: str):
+def load_hlmodel_config(config_path: str):
     """Dynamically import a Python HLModel config file as a module."""
     import importlib.util
     from pathlib import Path
 
     path = Path(config_path).resolve()
     if not path.exists():
-        raise FileNotFoundError(f"HLModel config not found: {path}")
+        raise FileNotFoundError(f"HLModel config file not found: {path}")
 
-    spec = importlib.util.spec_from_file_location("HLModelConfig", path)
-    module = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(module)
-
-    if not hasattr(module, "build_model"):
-        raise AttributeError(
-            f"HLModel config '{path}' must define a `build_model(**overrides)` function. "
-            f"See ablations.py for an example."
-        )
-
-    return module
+    return HLModelConfig.from_path(path)
 
 
 # =============================================================================
@@ -483,10 +474,10 @@ if __name__ == "__main__":
         sys.exit(1)
 
     # Load the HLModel config module
-    hlmodel_module = load_hlmodel_spec(hlmodel_path)
+    hlmodel_config = load_hlmodel_config(hlmodel_path)
 
     if list_overrides:
-        defaults = getattr(hlmodel_module, "DEFAULTS", None)
+        defaults = getattr(hlmodel_config, "DEFAULTS", None)
         if defaults is None:
             print("This HLModel config does not expose a DEFAULTS dict.")
         else:
@@ -500,7 +491,7 @@ if __name__ == "__main__":
         print_rank_0(f"Applying HLModel overrides: {overrides}")
 
     # Build the HLModelConfig (not the model itself — that happens in the provider)
-    hlmodel_config = hlmodel_module.build_model(**overrides)
+    hlmodel_config = hlmodel_config.build(**overrides)
     print_rank_0(f"HLModelConfig: {hlmodel_config}")
 
     # Temporary for transition to core datasets
