@@ -52,10 +52,11 @@ async def _run_flask_logic(coordinator_addr, tokenizer, rank, flask_port):
 
     app = Flask(__name__)
 
-    # Store client and tokenizer in app config for Blueprints
+    # Store client and tokenizer in app config for Blueprints to use
     app.config['client'] = inference_client
     app.config['tokenizer'] = tokenizer
 
+    # Register all blueprints from the 'endpoints' package
     for endpoint in endpoints.__all__:
         app.register_blueprint(endpoint)
 
@@ -63,6 +64,7 @@ async def _run_flask_logic(coordinator_addr, tokenizer, rank, flask_port):
     config.wsgi_max_body_size = 1024 * 1024 * 1024  # 1 GiB
     config.bind = [f"0.0.0.0:{flask_port}"]
 
+    # Force logging level to INFO to ensure that hostname is printed
     with temp_log_level(logging.INFO, logger):
         logger.info(f"Starting Flask server on http://{hostname}:{flask_port}")
 
