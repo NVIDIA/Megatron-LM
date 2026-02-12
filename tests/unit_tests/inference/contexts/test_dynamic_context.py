@@ -1314,7 +1314,7 @@ class TestDynamicContext:
         context = DynamicInferenceContext(
             model_config=TransformerConfig(
                 params_dtype=params_dtype,
-                num_layers=2, # 1 Attn, 1 Mamba
+                num_layers=2,  # 1 Attn, 1 Mamba
                 kv_channels=kv_channels,
                 num_attention_heads=num_attention_heads,
             ),
@@ -1332,7 +1332,7 @@ class TestDynamicContext:
 
         dtype_size = torch.tensor([], dtype=params_dtype).element_size()
 
-        mamba_mem_per_req = (math.prod(mamba_conv_states_shape) + math.prod(mamba_ssm_states_shape))
+        mamba_mem_per_req = math.prod(mamba_conv_states_shape) + math.prod(mamba_ssm_states_shape)
         mamba_mem_per_req *= dtype_size
 
         kv_buffer_bytes = int(buffer_gb * 1024**3)
@@ -1345,7 +1345,7 @@ class TestDynamicContext:
         kv_buffer_bytes = int(kv_buffer_bytes * (1.0 - ratio))
         kv_paused_bytes = int(kv_paused_bytes * (1.0 - ratio))
 
-        kv_block_size_bytes = (dtype_size * 2 * 1 * block_size * num_attention_heads * kv_channels)
+        kv_block_size_bytes = dtype_size * 2 * 1 * block_size * num_attention_heads * kv_channels
 
         expected_active_blocks = kv_buffer_bytes // kv_block_size_bytes
         expected_paused_blocks = kv_paused_bytes // kv_block_size_bytes

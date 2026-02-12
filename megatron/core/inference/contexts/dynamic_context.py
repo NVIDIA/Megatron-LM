@@ -1447,14 +1447,11 @@ class DynamicInferenceContext(BaseInferenceContext):
         """
         Check if the request can be added to the context.
         """
+        # Note that for hybrid models checking the total request count is sufficient
+        # because we allocate a single set of Mamba state tensors for each request
         request_can_be_added = (
             self.total_request_count < self.max_requests and self.paused_request_count == 0
         )
-
-        if self.is_hybrid_model:
-            request_can_be_added = request_can_be_added and (
-                self.total_request_count < self.max_requests
-            )
 
         request_tokens_can_be_added = (
             self.active_token_count + req.remaining_prompt_length <= self.max_tokens
