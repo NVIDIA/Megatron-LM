@@ -1239,9 +1239,17 @@ def prepare_data_for_update(
         with torch.no_grad(), nvtx_range("compute_logprobs", time=True):
             # Before we can update the model, we need to get the logprobs for the \pi_{old} model.
 
-            # Disable CUDA graphs during logprobs so MoE layers run fully eager.
-            # Partial MoE managers and the full manager are bypassed; training and
-            # inference each manage their own CUDA graph lifecycle separately.
+            # Disable CUDA graphs during logprobs so ALL layers run fully eager.
+            # Three things are needed:
+            #   1. cuda_graph_impl="none" — prevents create_cudagraphs() at end of
+            #      forward_backward_no_pipelining.
+            #   2. use_partial_cudagraphs=False — MoE layers fall through to
+            #      super()._forward_mlp() (eager).
+            #   3. cudagraph_created=False — prevents CudaGraphManagers on non-MoE
+            #      TransformerLayers from entering the replay path (their base
+            #      _should_call_local_cudagraph does NOT check cuda_graph_impl).
+            #      With cudagraph_created=False and model.eval(), they take the
+            #      eager fallback in CudaGraphManager.__call__.
             if args.rl_training_cuda_graphs:
                 _logprobs_lang_module = (
                     model.module.module
@@ -1251,6 +1259,8 @@ def prepare_data_for_update(
                 transition_moe_to_full_cudagraphs(_logprobs_lang_module)
                 _saved_cuda_graph_impl = model.config.cuda_graph_impl
                 model.config.cuda_graph_impl = "none"
+                _saved_cudagraph_created = _CudagraphGlobalRecord.cudagraph_created
+                _CudagraphGlobalRecord.cudagraph_created = False
 
             # Wrap forward_backward_func for Full iteration CUDA graph
             forward_backward_func = get_forward_backward_func()
@@ -1305,9 +1315,10 @@ def prepare_data_for_update(
                 # logprobs are [b, seq, h] now.
                 model.load_state_dict(cur_st_dict)
 
-            # Restore partial cudagraph mode for the upcoming training step.
+            # Restore CUDA graph state for the upcoming training step.
             if args.rl_training_cuda_graphs:
                 model.config.cuda_graph_impl = _saved_cuda_graph_impl
+                _CudagraphGlobalRecord.cudagraph_created = _saved_cudagraph_created
                 transition_moe_to_partial_cudagraphs(_logprobs_lang_module)
 
             torch.cuda.synchronize()
