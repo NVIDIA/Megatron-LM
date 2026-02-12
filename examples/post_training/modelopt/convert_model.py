@@ -91,8 +91,9 @@ def check_arguments():
         exit()
 
     if hasattr(args, 'moe_grouped_gemm') and args.moe_grouped_gemm == True:
-        print_rank_0("WARNING: Forcing moe_grouped_gemm to False for PTQ and export.")
-        args.moe_grouped_gemm = False
+        if not getattr(args, 'full_te_spec', False):
+            print_rank_0("WARNING: Forcing moe_grouped_gemm to False for PTQ and export.")
+            args.moe_grouped_gemm = False
 
 
 if __name__ == "__main__":
@@ -139,9 +140,8 @@ if __name__ == "__main__":
         import_kwargs = {
             "dtype": import_dtype,
             "moe_router_dtype": args.moe_router_dtype,
+            "trust_remote_code": args.trust_remote_code,
         }
-        if modelopt_version_at_least("0.41.0"):
-            import_kwargs.update({"trust_remote_code": args.trust_remote_code})
         import_mcore_gpt_from_hf(
             unwrapped_model, args.pretrained_model_path, workspace_dir, **import_kwargs
         )

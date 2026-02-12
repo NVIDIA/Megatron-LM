@@ -121,7 +121,7 @@ if __name__ == "__main__":
     else:
         dataset = load_dataset(args.finetune_hf_dataset, split=args.finetune_data_split)
 
-    tokenizer = get_tokenizer()._tokenizer
+    tokenizer = get_tokenizer()._tokenizer.tokenizer
 
 
     if args.load is not None:

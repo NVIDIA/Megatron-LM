@@ -276,7 +276,7 @@ if __name__ == "__main__":
 
     args = get_args()
 
-    tokenizer = get_tokenizer()._tokenizer
+    tokenizer = get_tokenizer()._tokenizer.tokenizer
     model = get_model(
         functools.partial(model_provider, modelopt_gpt_mamba_builder), wrap_with_ddp=False
     )
@@ -293,9 +293,10 @@ if __name__ == "__main__":
         import_dtype = torch.float16 if args.fp16 else torch.bfloat16
         unwrapped_model = unwrap_model(model)[0]
         workspace_dir = os.environ.get("MLM_WORK_DIR", "/tmp")
-        import_kwargs = {"dtype": import_dtype}
-        if modelopt_version_at_least("0.41.0"):
-            import_kwargs.update({"trust_remote_code": args.trust_remote_code})
+        import_kwargs = {
+            "dtype": import_dtype,
+            "trust_remote_code": args.trust_remote_code,
+        }
         import_mcore_gpt_from_hf(
             unwrapped_model, args.pretrained_model_path, workspace_dir, **import_kwargs
         )
