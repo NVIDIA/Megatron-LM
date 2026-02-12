@@ -1287,3 +1287,23 @@ class TestDynamicContext:
         assert (
             len(unique_counts) == 1
         ), f"Block counts were not synchronized across ranks. Gathered: {all_counts}"
+
+    @pytest.mark.internal
+    def test_max_requests_less_than_tp_size(self):
+        tp_size = 2
+        self._setup_model_parallel_group(tensor_parallel_size=tp_size, pipeline_parallel_size=1)
+
+        model_config = TransformerConfig(
+            params_dtype=torch.float32,
+            num_layers=2,
+            kv_channels=64,
+            num_attention_heads=8,
+            tensor_model_parallel_size=tp_size,
+        )
+
+        inference_config = InferenceConfig(
+            max_sequence_length=512, buffer_size_gb=0.1, block_size_tokens=128, max_requests=1
+        )
+
+        with pytest.raises(AssertionError):
+            DynamicInferenceContext(model_config=model_config, inference_config=inference_config)
