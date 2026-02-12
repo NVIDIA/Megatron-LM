@@ -22,6 +22,7 @@ from megatron.core.transformer.multi_token_prediction import (
     get_mtp_layer_offset,
 )
 from megatron.core.transformer.transformer_layer import TransformerLayer, make_viewless_tensor
+from megatron.core.typed_torch import apply_module
 from megatron.core.utils import internal_api
 
 
@@ -43,13 +44,14 @@ def weak_method(method):
 
 
 @internal_api
-def should_free_input(name, is_moe, config):
+def should_free_input(name, is_moe, config, num_local_experts):
     """Determine if the node should free its input memory.
 
     Args:
         name: Node name
         is_moe: Whether it's a MoE model
         config: TransformerConfig object
+        num_local_experts: Number of local experts in MoE module
 
     Returns:
         bool: Whether to free input memory
@@ -70,8 +72,19 @@ def should_free_input(name, is_moe, config):
     # when and how to free the input memory.
     # The input and output of A2A are not needed anymore after the forward pass,
     # so we can free the input memory after the forward pass.
+
+    # When low precision fp8/4 is enabled, the casted tensors are saved and the
+    # original bf16 tensors are safe to be freed.
+    free_mlp = config.fp8 is not None or config.fp4 is not None
+    if not free_mlp:
+        # AlltoAll dispatcher with local_num_experts=1 and HybridEP both use identity
+        # operation for `dispatch_postprocess`, hence the mlp inputs will be directly
+        # passed to GroupedGemm and should be saved for backward pass.
+        free_mlp = num_local_experts > 1 or config.moe_token_dispatcher_type != "alltoall"
+        free_mlp = free_mlp and not enable_hybridep
+
     free_input_nodes = {
-        "mlp": not enable_hybridep,
+        "mlp": free_mlp,
         "moe_combine": True,
         # For non-DeepEP and non-HybridEP dispatcher mode, the input is the un-dispatched tokens
         # and probs before dispatch A2A and it's not needed anymore after the forward pass
@@ -256,7 +269,8 @@ class TransformerLayerNode(ScheduleNode):
         config = extra_args.get("config", None)
         assert config is not None, "model config must be passed to TransformerLayerNode."
         is_moe = extra_args.get("is_moe", False)
-        free_input = should_free_input(name, is_moe, config)
+        num_local_experts = extra_args.get("num_local_experts", None)
+        free_input = should_free_input(name, is_moe, config, num_local_experts)
         self.delay_wgrad_compute = extra_args.get("delay_wgrad_compute", False)
 
         super().__init__(
@@ -316,9 +330,11 @@ class TransformerLayerNode(ScheduleNode):
         """Computes the weight gradients for the transformer layer node."""
         if not self.delay_wgrad_compute:
             return
-        with torch.cuda.nvtx.range(f"{self.name} wgrad"):
+        with torch.cuda.stream(self.stream):
+            torch.cuda.nvtx.range_push(f"{self.name} wgrad")
             for module in self.bwd_dw_callables:
                 module.backward_dw()
+            torch.cuda.nvtx.range_pop()
 
         # the output grad memory is last used in wgrad compute, should be safe to release.
         assert self.delay_grads_release, "output grad memory should be valid before wgrad."
@@ -466,13 +482,15 @@ def build_transformer_layer_callables(layer: TransformerLayer):
                         layer.offload_mlp_norm, hidden_states, "mlp_norm"
                     ) as hidden_states:
                         pre_mlp_layernorm_output = layer.pre_mlp_norm_checkpoint.checkpoint(
-                            layer.pre_mlp_layernorm, hidden_states
+                            apply_module(layer.pre_mlp_layernorm), hidden_states
                         )
                 else:
                     with off_interface(
                         layer.offload_mlp_norm, hidden_states, "mlp_norm"
                     ) as hidden_states:
-                        pre_mlp_layernorm_output = layer.pre_mlp_layernorm(hidden_states)
+                        pre_mlp_layernorm_output = apply_module(layer.pre_mlp_layernorm)(
+                            hidden_states
+                        )
 
                 shared_expert_output = layer.mlp.shared_experts_compute(pre_mlp_layernorm_output)
                 probs, routing_map = layer.mlp.route(pre_mlp_layernorm_output)
@@ -514,6 +532,10 @@ def build_transformer_layer_callables(layer: TransformerLayer):
             token_dispatcher._comm_manager.token_probs = probs
 
         dispatched_tokens, dispatched_probs = layer.mlp.dispatch(local_tokens, probs)
+
+        # `dispatched_probs` is needed by backward pass of swiglu, therefore it's
+        # passed to moe_forward within `layer_state` to avoid the free_input process
+        # of the input tensors.
         node.layer_state.dispatched_probs = node.detach(dispatched_probs)
         return dispatched_tokens
 
@@ -531,13 +553,16 @@ def build_transformer_layer_callables(layer: TransformerLayer):
 
         expert_output, _ = layer.mlp.routed_experts_compute(dispatched_tokens, dispatched_probs)
 
+        # For HybridEP, tokens_per_expert is generated on comm stream, as the input to
+        # `routed_experts_compute`, a ref is needed to prevent it from being freed.
+        if enable_hybridep:
+            tokens_per_expert = token_dispatcher._comm_manager.get_number_of_tokens_per_expert()
+            node.layer_state.tokens_per_expert = tokens_per_expert
+
         if layer.recompute_pre_mlp_layernorm:
             # discard the output of the pre-mlp layernorm and register the recompute
             # as a gradient hook of expert_output
             layer.pre_mlp_norm_checkpoint.discard_output_and_register_recompute(expert_output)
-        # release tensor reference after use
-        node.layer_state.dispatched_probs = None
-        node.layer_state.pre_mlp_layernorm_output = None
 
         return expert_output
 
@@ -572,11 +597,14 @@ def build_transformer_layer_callables(layer: TransformerLayer):
             inp=hidden_states, requires_grad=hidden_states.requires_grad, keep_graph=True
         )
 
-        # Need to record residual to comm stream, since it's created on comp stream
+        # Need to record tensors created on comp stream to comm stream
         node.layer_state.residual.record_stream(torch.cuda.current_stream())
+        if shared_expert_output is not None:
+            shared_expert_output.record_stream(torch.cuda.current_stream())
 
         # release tensor reference after use
         node.layer_state.residual = None
+        node.layer_state.shared_expert_output = None
 
         # final layer norm from decoder
         final_layernorm = node.chunk_state.model.decoder.final_layernorm

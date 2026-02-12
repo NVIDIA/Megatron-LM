@@ -1,8 +1,6 @@
 # Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
 import itertools
-import os
-from types import SimpleNamespace
 
 import pytest
 import torch
@@ -14,7 +12,8 @@ from megatron.core.models.gpt.gpt_layer_specs import get_gpt_layer_with_transfor
 from megatron.core.models.gpt.gpt_model import GPTModel
 from megatron.core.num_microbatches_calculator import destroy_num_microbatches_calculator
 from megatron.core.optimizer import OptimizerConfig, get_megatron_optimizer
-from megatron.core.pipeline_parallel.utils import is_pp_last_stage
+from megatron.core.pipeline_parallel import get_forward_backward_func
+from megatron.core.pipeline_parallel.utils import is_pp_first_stage, is_pp_last_stage
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.tensor_parallel.random import (
     initialize_rng_tracker,
@@ -77,6 +76,7 @@ class MockTokenizer:
         self.eod = 43
         self.vocab_size = VOCAB
         self.bos = None
+        self.library = None
 
     def detokenize(self, tokens):
         return [str(tok) for tok in tokens]
@@ -668,6 +668,76 @@ class TestRLUtils:
             f"Expected GPU memory to increase after restore. "
             f"After offload: {memory_after_offload}, After restore: {memory_after_restore}"
         )
+
+    @pytest.mark.parametrize(
+        "initialize_model_parallel",
+        [
+            pytest.param((tp, pp), id=f"tp{tp}-pp{pp}")
+            for tp, pp in itertools.product([1, 2, 4], [1, 2])
+            if tp * pp <= Utils.world_size
+        ],
+        indirect=["initialize_model_parallel"],
+    )
+    def test_gpt_logprobs(self, initialize_model_parallel):
+        """Test get logprobs on an actual model, not on a mocked one.
+
+        This can be useful for quick benchmarking/analyzing regressions too.
+        """
+
+        world_size, dp, tp, pp = initialize_model_parallel
+        micro_batch_size = 2
+        self.create_test_args(
+            tensor_model_parallel_size=tp,
+            pipeline_model_parallel_size=pp,
+            bf16=True,
+            micro_batch_size=micro_batch_size,
+        )
+        model_parallel_cuda_manual_seed(123)
+
+        transformer_config = TransformerConfig(
+            num_layers=10,
+            hidden_size=128,
+            num_attention_heads=16,
+            use_cpu_initialization=True,
+            embedding_init_method_std=1.0,
+            bf16=True,
+            pipeline_dtype=torch.bfloat16,  # Without this, pp!=1 runs will fail.
+        )
+        vocab_size = 10_000
+        pp_group = ProcessGroupCollection.use_mpu_process_groups().pp
+        gpt_model = GPTModel(
+            config=transformer_config,
+            transformer_layer_spec=get_gpt_layer_with_transformer_engine_spec(),
+            vocab_size=vocab_size,
+            max_sequence_length=4192,
+            pre_process=is_pp_first_stage(pp_group),
+            post_process=is_pp_last_stage(pp_group),
+        ).cuda()
+        sequence_length = gpt_model.max_sequence_length
+
+        gpt_model = Float16Module(gpt_model.config, gpt_model)
+
+        data = list(range(sequence_length))
+        input_ids = torch.tensor(data, dtype=torch.int64).repeat((micro_batch_size, 1)).cuda()
+        position_ids = torch.tensor(data, dtype=torch.int64).repeat((micro_batch_size, 1)).cuda()
+
+        with torch.no_grad():
+            logprobs = rl_utils.compute_logprobs_batch(
+                model=gpt_model,
+                data_loader=[(input_ids, position_ids)],
+                forward_backward_func=get_forward_backward_func(pp_size=pp),
+                packing_context=None,
+                trajs_batch_size=micro_batch_size,
+                seq_length=sequence_length,
+                logprobs_batch_size=micro_batch_size,
+                decoder_seq_length=sequence_length,
+                dtype=torch.bfloat16,
+                pp_group=gpt_model.pg_collection.pp,
+                is_correction=False,
+                collect_non_loss_data=True,
+            )
+        if is_pp_last_stage(pp_group):
+            assert logprobs.shape == (micro_batch_size, sequence_length - 1)
 
     @pytest.mark.parametrize(
         "initialize_model_parallel",
