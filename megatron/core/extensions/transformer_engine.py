@@ -605,19 +605,32 @@ else:
 
 class TENorm:
     """A conditional wrapper to initialize an instance of
-    Transformer-Engine's `LayerNorm` or `RMSNorm` based on input."""
+    Transformer-Engine's `LayerNorm` or `RMSNorm` based on input.
+
+    Residual Fusion Design:
+    ----------------------
+    Residual fusion is a two-level opt-in mechanism:
+
+    1. Global capability: config.fused_residual_rmsnorm must be True (enables the feature)
+    2. Local intent: has_residual=True must be passed at build site (declares this specific
+       norm is followed by a residual connection)
+
+    Fusion only happens when BOTH conditions are met.
+
+    """
 
     # TODO should we ditch normalization config and just use spec to choose LayerNorm vs RMSNorm?
     def __new__(
-        cls, config: TransformerConfig, hidden_size: int, eps: float = 1e-5
-    ) -> LayerNormInterface:
+        cls, config: TransformerConfig, hidden_size: int, eps: float = 1e-5, has_residual: bool = False
+    ):
         if not HAVE_TE:
             raise ImportError(
                 "Transformer Engine is not installed. "
                 "Please install it with `pip install transformer-engine`."
             )
-
         if config.normalization == "LayerNorm":
+            if config.fused_residual_rmsnorm and has_residual:
+                raise ValueError("Fused residual RMSNorm is not supported for LayerNorm")
             instance = te.pytorch.LayerNorm(
                 hidden_size=hidden_size,
                 eps=eps,
@@ -632,7 +645,7 @@ class TENorm:
 
             extra_te_kwargs = _get_extra_te_kwargs(config)
 
-            if config.fused_residual_rmsnorm:
+            if config.fused_residual_rmsnorm and has_residual:
                 # Use fused residual variant
                 assert TEFusedResidualRMSNorm is not None, (
                     "TEFusedResidualRMSNorm requires Transformer-Engine >= v1.13.0"
