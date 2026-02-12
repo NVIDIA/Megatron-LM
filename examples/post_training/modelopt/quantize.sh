@@ -32,6 +32,7 @@ if [ -z ${MLM_MODEL_CKPT} ]; then
         --expert-tensor-parallel-size ${ETP} \
         --expert-model-parallel-size ${EP} \
         --pipeline-model-parallel-size ${PP} \
+        --context-parallel-size ${CP} \
         --tokenizer-model ${TOKENIZER_MODEL} \
         --pretrained-model-path ${HF_MODEL_CKPT} \
         --save ${MLM_MODEL_SAVE} \
