@@ -22,6 +22,9 @@ from megatron.core.num_microbatches_calculator import (
     init_num_microbatches_calculator,
     destroy_num_microbatches_calculator
 )
+from megatron.core.transformer.pipeline_parallel_layer_layout import (
+    PipelineParallelLayerLayout
+)
 from tests.unit_tests.test_utilities import Utils
 
 
@@ -49,7 +52,10 @@ class TestVppSimulatorBasic:
         # PP configuration
         args.pipeline_model_parallel_size = 2
         args.virtual_pipeline_model_parallel_size = None
-        args.pipeline_model_parallel_layout = None
+        # Create a simple pipeline layout - will be updated per test
+        # Format: list of lists, each inner list is layers for one PP stage
+        # For now, create a simple 2-stage layout with decoder layers
+        args.pipeline_model_parallel_layout = None  # Will be set per test
 
         # Model configuration
         args.num_layers = 4
@@ -224,6 +230,54 @@ class TestVppSimulatorBasic:
         mock_args.pipeline_model_parallel_size = pp_size
         mock_args.virtual_pipeline_model_parallel_size = vpp_size
         mock_args.global_batch_size = num_microbatches * mock_args.micro_batch_size
+
+        # Create a simple pipeline layout based on pp_size and vpp_size
+        # Format: "t" = decoder layer, "E" = embedding, "L" = loss
+        # For simplicity, use a uniform layout with decoder layers
+        num_model_chunks = vpp_size if vpp_size else 1
+        layers_per_chunk = 2  # 2 decoder layers per model chunk
+
+        if pp_size == 1:
+            # Single PP stage
+            if num_model_chunks == 1:
+                # No VPP: "EttL" (Embedding + 2 decoder + Loss)
+                layout_str = f"E{'t' * layers_per_chunk}L"
+            else:
+                # With VPP: "E(tt|)*N-1 tt L" where N is num_model_chunks
+                # E.g., for vpp_size=2: "Ett|ttL"
+                vpp_parts = []
+                for i in range(num_model_chunks):
+                    if i == 0:
+                        vpp_parts.append("E" + "t" * layers_per_chunk)
+                    elif i == num_model_chunks - 1:
+                        vpp_parts.append("t" * layers_per_chunk + "L")
+                    else:
+                        vpp_parts.append("t" * layers_per_chunk)
+                layout_str = "|".join(vpp_parts)
+        else:
+            # Multiple PP stages
+            if num_model_chunks == 1:
+                # No VPP: distribute layers across PP stages
+                # E.g., for pp_size=2: "Ett|ttL"
+                # E.g., for pp_size=4: "Et|t|t|tL"
+                pp_parts = []
+                for i in range(pp_size):
+                    if i == 0:
+                        pp_parts.append("E" + "t" * layers_per_chunk)
+                    elif i == pp_size - 1:
+                        pp_parts.append("t" * layers_per_chunk + "L")
+                    else:
+                        pp_parts.append("t" * layers_per_chunk)
+                layout_str = "|".join(pp_parts)
+            else:
+                # With VPP: grouped layout
+                # E.g., for pp_size=2, vpp_size=2: "E(tt|)*2L"
+                layout_str = f"E({'t' * layers_per_chunk}|)*{num_model_chunks}L"
+
+        mock_args.pipeline_model_parallel_layout = PipelineParallelLayerLayout(
+            layout=layout_str,
+            pipeline_model_parallel_size=pp_size
+        )
 
         # 2. Set global args and initialize num_microbatches_calculator
         set_args(mock_args)
