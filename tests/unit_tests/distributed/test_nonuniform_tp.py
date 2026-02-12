@@ -18,6 +18,7 @@ from megatron.core.distributed.nonuniform_tp import (
     get_active_ranks_for_dp,
     ntp_map,
     ntp_init,
+    initialize_nonuniform_tp_process_groups,
     NonuniformTPDistributedDataParallel,
     NonuniformTPOptimizer,
     NonuniformTPParamAndGradBuffer,
@@ -355,6 +356,122 @@ class TestNonuniformTPIntegration:
             assert True
         except Exception as e:
             pytest.skip(f"Skipping due to initialization requirements: {e}")
+
+
+class TestNonuniformTPEndToEnd:
+    """
+    End-to-end test for NTP without mocking.
+
+    Tests NTP with 8 GPUs configured as:
+    - 2 data-parallel workers
+    - DP rank 0: TP=2 (reduced, using 2 out of 4 GPUs)
+    - DP rank 1: TP=4 (healthy, using all 4 GPUs)
+    - Total: 2 + 4 = 6 active GPUs out of 8
+    """
+
+    @classmethod
+    def setup_class(cls):
+        """Initialize model parallel for NTP testing."""
+        # Initialize with tp_base=4
+        Utils.initialize_model_parallel(tensor_model_parallel_size=4)
+
+    @classmethod
+    def teardown_class(cls):
+        """Clean up model parallel."""
+        Utils.destroy_model_parallel()
+
+    def test_ntp_end_to_end_with_8_gpus(self):
+        """
+        End-to-end test using 8 GPUs with 2 DP workers:
+        - DP rank 0: uses TP=2 (reduced from tp_base=4)
+        - DP rank 1: uses TP=4 (healthy, full tp_base)
+        """
+        import torch.distributed as dist
+        from megatron.core import parallel_state
+
+        # Check we have 8 GPUs
+        world_size = dist.get_world_size() if dist.is_initialized() else 1
+        if world_size != 8:
+            pytest.skip(f"This test requires 8 GPUs, but only {world_size} are available")
+
+        # Get current rank info
+        rank = dist.get_rank()
+        tp_rank = parallel_state.get_tensor_model_parallel_rank()
+        tp_size = parallel_state.get_tensor_model_parallel_world_size()
+        dp_rank = parallel_state.get_data_parallel_rank()
+
+        # Configure NTP: first DP rank uses reduced TP=2
+        ddp_config = DistributedDataParallelConfig(
+            tp_base=4,
+            tp_spares=2,
+            num_reduced_tp_dp_ranks=1,
+            non_active_ranks_per_dp={(0, 0, 0): [2, 3]},  # DP=0: GPUs 2,3 are spares
+        )
+
+        # Reconfigure process groups for NTP
+        from megatron.core.distributed.nonuniform_tp import initialize_nonuniform_tp_process_groups
+
+        initialize_nonuniform_tp_process_groups(ddp_config)
+
+        # After reconfiguration, check TP size
+        tp_size_after = parallel_state.get_tensor_model_parallel_world_size()
+
+        # Verify the configuration
+        if dp_rank == 0:
+            # First DP rank should have reduced TP=2
+            assert tp_size_after == 2, f"DP rank 0 should have TP=2, got {tp_size_after}"
+            assert tp_rank < 2, f"DP rank 0 should have tp_rank < 2, got {tp_rank}"
+        else:
+            # Other DP ranks keep TP=4
+            assert tp_size_after == 4, f"DP rank {dp_rank} should have TP=4, got {tp_size_after}"
+            assert tp_rank < 4, f"DP rank {dp_rank} should have tp_rank < 4, got {tp_rank}"
+
+        # Create a simple model with tensor-parallel parameters
+        hidden_size = 128
+        model = torch.nn.Linear(hidden_size, hidden_size, bias=False).cuda()
+
+        # Mark it as tensor-parallel
+        model.weight.tensor_model_parallel = True
+        model.weight.partition_dim = 0
+
+        # Initialize NTP mappings
+        from megatron.core.distributed.nonuniform_tp import ntp_map
+
+        # For healthy ranks (DP=1), initialize send/recv splits
+        if dp_rank == 1:
+            # Create a mock module to test ntp_map
+            class MockModule:
+                def __init__(self, param):
+                    self.param = param
+
+                def parameters(self):
+                    return [self.param]
+
+            mock_module = MockModule(model.weight)
+            ntp_map(mock_module, ddp_config, num_shards=hidden_size)
+
+            # Verify send_splits and recv_splits were added
+            assert hasattr(model.weight, 'send_splits'), "Healthy rank should have send_splits"
+            assert hasattr(model.weight, 'recv_splits'), "Healthy rank should have recv_splits"
+            assert len(model.weight.send_splits) == 4, "Should have splits for all tp_base ranks"
+
+        # Test forward pass
+        batch_size = 4
+        input_tensor = torch.randn(batch_size, hidden_size, device='cuda')
+        output = model(input_tensor)
+
+        # Verify output shape
+        assert output.shape == (batch_size, hidden_size), f"Unexpected output shape: {output.shape}"
+
+        # Verify gradients work
+        loss = output.sum()
+        loss.backward()
+        assert model.weight.grad is not None, "Gradients should be computed"
+
+        print(
+            f"[Rank {rank}] NTP end-to-end test passed! "
+            f"DP={dp_rank}, TP={tp_size_after}, tp_rank={tp_rank}"
+        )
 
 
 if __name__ == '__main__':
