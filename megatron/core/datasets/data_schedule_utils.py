@@ -8,7 +8,7 @@ import torch
 from megatron.core.rerun_state_machine import RerunDataIterator
 
 
-def _unpack_batch(batch):
+def _unpack_batch(batch: List[Dict[str, torch.Tensor]]) -> List[Dict[str, torch.Tensor]]:
     """
     Unpacks the packed samples into a list of sub-samples.
     Since each sub-sample may be routed to different DPxCP ranks,
@@ -474,9 +474,9 @@ def get_batch_and_global_seqlens(data_iterator, num_microbatches, dp_group):
         else:
             raise ValueError(f"Invalid item type: {type(item)}")
 
-    # This unpack step is redundant: in sft_dataset.py, sequences are already packed before
-    # rescheduling, so we need to unpack them here and repack after rescheduling. This is only
-    # to adapt to the current megatron-lm sft_dataset.
+    # in sft_dataset.py, sequences are already packed before rescheduling,
+    # so we need to unpack them here and repack after rescheduling.
+    # This is only to adapt to the current megatron-lm sft_dataset.
     # If you implement your own dataset, just have __getitem__ return List[Dict]
     # and this step can be skipped.
     batch = _unpack_batch(batch)
