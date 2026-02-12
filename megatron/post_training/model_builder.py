@@ -314,6 +314,9 @@ def modelopt_gpt_mamba_builder(
         assert (
             not args.tp_comm_overlap
         ), "ModelOpt Distillation currently incompatible with `--tp-comm-overlap` option."
+        assert (
+            args.cross_entropy_fusion_impl != "te"
+        ), "ModelOpt Distillation currently incompatible with TransformerEngine Cross-Entropy implementation."
         if args.pipeline_model_parallel_size > 1:
             assert (
                 args.virtual_pipeline_model_parallel_size is None
