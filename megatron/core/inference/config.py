@@ -161,6 +161,12 @@ class InferenceConfig:
     enable_chunked_prefill: bool = False
     """Whether to enable chunked prefill."""
 
+    enable_prefix_caching: bool = True
+    """Whether to enable prefix caching for KV cache block sharing."""
+
+    block_evict_lru: bool = False
+    """Use LRU eviction for prefix caching blocks. Only applies when enable_prefix_caching is True."""
+
     # =================================
     # Logging config
     # =================================
@@ -168,6 +174,13 @@ class InferenceConfig:
     """
     Whether to track paused request events. If True, `add_event_pause()` is called on
     requests when they are paused during bookkeeping.
+    """
+
+    track_generated_token_events: bool = False
+    """
+    Whether to track per-token events with timestamps for each generated token.
+    When enabled, each generated token creates a GENERATED_TOKEN event with a
+    timestamp, useful for per-token latency analysis.
     """
 
     metrics_writer: Optional["WandbModule"] = None

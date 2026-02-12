@@ -1593,6 +1593,11 @@ def _add_inference_args(parser):
                        help='Track paused request ids by adding \'paused\' events '
                        'to each request\'s event history. This has a very minor '
                        'impact on latency.')
+    group.add_argument('--inference-dynamic-batching-track-generated-token-events',
+                       action='store_true',
+                       help='Track per-token events with timestamps for each generated token. '
+                       'When enabled, each generated token creates a GENERATED_TOKEN event '
+                       'with a timestamp, useful for per-token latency analysis.')
     group.add_argument('--decode-only-cuda-graphs',
                        action='store_true', default=False,
                        help='Only use cuda graphs for decode-only steps, not prefill and mixed steps.')
@@ -1607,6 +1612,21 @@ def _add_inference_args(parser):
     group.add_argument('--enable-chunked-prefill', dest='enable_chunked_prefill',
                        action='store_true', default=False,
                        help="Enable chunked prefill (disabled by default)")
+    group.add_argument('--inference-dynamic-batching-disable-prefix-caching',
+                       action='store_false',
+                       dest='inference_dynamic_batching_enable_prefix_caching',
+                       help='Disable prefix caching for dynamic batching inference. '
+                       'When disabled, KV cache blocks cannot be shared between '
+                       'requests with identical prompt prefixes.')
+    group.set_defaults(inference_dynamic_batching_enable_prefix_caching=True)
+    group.add_argument('--inference-dynamic-batching-block-evict-lru',
+                       action='store_true', default=False,
+                       dest='inference_dynamic_batching_block_evict_lru',
+                       help='Use LRU eviction for prefix caching blocks. '
+                       'When set, blocks with ref_count==0 stay cached and are '
+                       'evicted via LRU only when space is needed. Default (without '
+                       'this flag) uses ref-zero (RZ) mode which immediately '
+                       'returns blocks to the free pool when ref_count hits 0.')
     group.add_argument('--inference-dynamic-batching-cuda-graph-max-tokens',
                        type=int, default=16384,
                        help='Maximum number of tokens to capture in a cuda graph.')

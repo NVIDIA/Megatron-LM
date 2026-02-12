@@ -195,6 +195,8 @@ def run_inference(
                 request.request_id = finished_request.request_id
                 request.events = finished_request.events
 
+                request.ttft = finished_request.ttft
+
                 # Update prompt, in case engine has been suspended and resumed.
                 request.prompt_tokens = finished_request.prompt_tokens.tolist()
                 request.prompt_text = finished_request.prompt
@@ -409,6 +411,7 @@ def main():
                         "generated_text": req.output_text,
                         "generated_tokens": req.output_tokens,
                         "latency": req.time_end - req.time_start,
+                        "ttft": req.ttft,  # Time-to-first-token in seconds
                         "cuda_graph_request_count_map": result["cuda_graph_request_count_map"],
                         "step_count": engine.step_count,
                         "top_n_logprobs": getattr(req, 'generated_top_n_logprobs', None),
@@ -420,6 +423,8 @@ def main():
                             req, 'generated_log_probs', None
                         )
                         result_dict["logprobs"] = getattr(req, 'logprobs', None)
+                    if args.output_request_events:
+                        result_dict["events"] = [e.serialize() for e in req.events]
                     json_results[req.request_id] = result_dict
 
             # Track system-level throughput as a test / debug metric

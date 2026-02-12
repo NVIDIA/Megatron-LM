@@ -30,6 +30,8 @@ from megatron.core.inference.data_parallel_inference_coordinator import (
 from megatron.core.inference.engines.abstract_engine import AbstractEngine
 from megatron.core.inference.headers import Headers, UnknownHeaderError
 from megatron.core.inference.inference_request import (
+    DynamicInferenceEvent,
+    DynamicInferenceEventType,
     DynamicInferenceRequest,
     DynamicInferenceRequestRecord,
     Status,
@@ -172,6 +174,9 @@ class DynamicInferenceEngine(AbstractEngine):
         self.controller = controller
         self.context = context
         self.track_paused_request_events = inference_config.track_paused_request_events
+        self.track_generated_token_events = getattr(
+            inference_config, 'track_generated_token_events', False
+        )
         self.enable_chunked_prefill = inference_config.enable_chunked_prefill
         self.metrics_writer = inference_config.metrics_writer
         self.logging_step_interval = inference_config.logging_step_interval
@@ -254,6 +259,9 @@ class DynamicInferenceEngine(AbstractEngine):
         self.suspend_signal = False
         self.is_suspended = False
         self.resume_request_ids = None
+
+        # Prefix caching coordination state.
+        self._prefix_coordination_waits = 0
 
         # Coordinator state.
         self.use_coordinator = False
@@ -703,6 +711,7 @@ class DynamicInferenceEngine(AbstractEngine):
                 record=DynamicInferenceRequestRecord.from_request(request),
                 future=self._loop.create_future(),
             )
+            request.add_event_add_engine()  # Record when request enters engine
 
         if request.status is None:
             request.status = Status.ACTIVE_AND_GENERATING_TOKENS
@@ -823,6 +832,8 @@ class DynamicInferenceEngine(AbstractEngine):
             prompt=prompt_str,
             prompt_tokens=tokens,
             sampling_params=sampling_params,
+            block_size_tokens=self.context.block_size_tokens,
+            enable_prefix_caching=self.context.enable_prefix_caching,
         )
 
         # Add request.
@@ -862,6 +873,7 @@ class DynamicInferenceEngine(AbstractEngine):
             self.evicted_request_count += evict_request_ids.numel()
 
         log_probs_iter = log_probs if log_probs else repeat(None)
+        block_allocator = self.context.block_allocator
 
         for req_idx, (request_id, token, request_log_probs) in enumerate(
             zip(request_ids.tolist(), sample.tolist(), log_probs_iter)
@@ -871,7 +883,40 @@ class DynamicInferenceEngine(AbstractEngine):
                 # Skip appending token for requests being finished due to stop words
                 # (they already have their final token from the previous step)
                 if request_id not in self.stop_word_being_finished_ids:
+                    is_first_token = len(request.generated_tokens) == 0
                     request.generated_tokens.append(token)
+                    if self.track_generated_token_events:
+                        blocks_allocated = (
+                            block_allocator.total_count - block_allocator.total_avail
+                        )
+                        if block_allocator.enable_prefix_caching:
+                            event_generated_token = request.add_event_generated_token(
+                                token,
+                                blocks_total=block_allocator.total_count,
+                                blocks_hashed_total=blocks_allocated,
+                                blocks_hashed_active=int(
+                                    (block_allocator.block_ref_counts > 0).sum().item()
+                                ),
+                                blocks_ref_count=block_allocator.block_ref_counts.sum().item(),
+                            )
+                        else:
+                            event_generated_token = request.add_event_generated_token(
+                                token,
+                                blocks_total=block_allocator.total_count,
+                                blocks_hashed_total=blocks_allocated,
+                                blocks_hashed_active=blocks_allocated,
+                            )
+                    if is_first_token:
+                        if self.track_generated_token_events:
+                            first_token_event = event_generated_token
+                        else:
+                            first_token_event = DynamicInferenceEvent(
+                                type=DynamicInferenceEventType.GENERATED_TOKEN,
+                                payload={"token_id": token},
+                            )
+                        request.ttft = (
+                            first_token_event.timestamp - request.event_add_engine.timestamp
+                        )
                     if request.tpot is None:
                         request.tpot = []
                     request.tpot.append(step_time)
@@ -883,6 +928,7 @@ class DynamicInferenceEngine(AbstractEngine):
                     # Request finished by normal means (termination_id, max_length, or stop word from previous step)
                     request.generated_length = len(request.generated_tokens)
                     request.status = Status.COMPLETED
+                    request.add_event_finish()
                     finished_entry = self.requests.pop(request_id)
                     finished_request = finished_entry.record[-1]
                     finished_request.generated_length = len(finished_request.generated_tokens)
@@ -1052,6 +1098,44 @@ class DynamicInferenceEngine(AbstractEngine):
 
         return False
 
+    def _has_pending_prefix_blocks(self, req: DynamicInferenceRequest) -> bool:
+        """Check if a request depends on prefix blocks whose KV is not yet computed.
+
+        When prefix caching is enabled and a request shares blocks with a prior
+        request that is still being prefilled, those blocks have hash == -1 in the
+        block allocator (registered but not yet marked computed). Scheduling such
+        a request before the KV is ready would produce incorrect results.
+
+        Args:
+            req: The request to check.
+
+        Returns:
+            True if the request would share blocks that are still pending computation.
+        """
+        if not self.context.enable_prefix_caching:
+            return False
+        if req.precomputed_block_hashes is None or len(req.precomputed_block_hashes) == 0:
+            return False
+
+        block_allocator = self.context.block_allocator
+        for block_hash in req.precomputed_block_hashes:
+            block_id = block_allocator.lookup_block_by_hash(block_hash)
+            if block_id is None:
+                # No cached block for this hash — remaining blocks won't match either
+                break
+            if block_allocator.get_block_hash(block_id) == -1:
+                # Block is registered but KV not yet computed
+                return True
+        return False
+
+    def get_prefix_coordination_metrics(self) -> dict:
+        """Return prefix caching coordination metrics.
+
+        Returns:
+            Dict with coordination stats including the number of scheduling waits.
+        """
+        return {"waits": self._prefix_coordination_waits}
+
     def schedule_waiting_requests(self):
         """Tries to schedule any requests in the waiting pool."""
         if self.enable_chunked_prefill:
@@ -1065,6 +1149,12 @@ class DynamicInferenceEngine(AbstractEngine):
         """
         while self.waiting_request_ids:
             req = self.get_request(self.waiting_request_ids[0])
+
+            # Prefix caching coordination: wait if request depends on pending blocks
+            if self._has_pending_prefix_blocks(req):
+                self._prefix_coordination_waits += 1
+                break
+
             request_can_be_added, request_tokens_can_be_added, kv_cache_available = (
                 self.context.check_availability(req)
             )
@@ -1074,7 +1164,7 @@ class DynamicInferenceEngine(AbstractEngine):
                     self._loop.create_task, self._notify_cond_for_new_request()
                 )
                 req.remaining_prompt_tokens = req.remaining_prompt_tokens.new_empty(0)
-                req.add_event_add()
+                req.add_event_add_context()
                 self.waiting_request_ids.popleft()
             else:
                 break
@@ -1103,6 +1193,12 @@ class DynamicInferenceEngine(AbstractEngine):
             # chunk of a existing chunked prefill request
             is_continuing_chunked_prefill = self.context.chunked_prefill_request_id >= 0
 
+            # Prefix caching coordination: wait if new request depends on pending blocks
+            # (continuing chunked prefill requests must not be blocked)
+            if not is_continuing_chunked_prefill and self._has_pending_prefix_blocks(req):
+                self._prefix_coordination_waits += 1
+                break
+
             # Use remaining prompt tokens for scheduling decisions
             remaining_len = len(req.remaining_prompt_tokens)
             token_fully_can_be_added = (
@@ -1126,7 +1222,7 @@ class DynamicInferenceEngine(AbstractEngine):
                         self._loop.create_task, self._notify_cond_for_new_request()
                     )
                     req.remaining_prompt_tokens = req.remaining_prompt_tokens.new_empty(0)
-                    req.add_event_add()
+                    req.add_event_add_context()
                     # Fully scheduled, so we remove from waiting pool
                     self.waiting_request_ids.popleft()
                     # Only this case we keep checking the rest of the waiting queue
@@ -1188,6 +1284,10 @@ class DynamicInferenceEngine(AbstractEngine):
         self.step_end_event.synchronize()
         step_time = self.step_start_event.elapsed_time(self.step_end_event) / 1e3
         self.step_count += 1
+
+        # Mark pending prefix blocks as computed after prefill steps
+        if not is_decode_only and self.context.enable_prefix_caching:
+            self.context.mark_pending_blocks_computed()
 
         range_pop()
 
@@ -1255,9 +1355,7 @@ class DynamicInferenceEngine(AbstractEngine):
                 newly_paused_request_ids = newly_paused_request_ids.tolist()
                 [self.get_request(i).add_event_pause() for i in newly_paused_request_ids]
 
-            # Mark requests finished.
-            [self.get_request(i).add_event_finish() for i in finished_request_ids.tolist()]
-            # Add finished events.
+            # Process finished requests (adds FINISH events and returns records).
             (active_request_ids, finished_request_records) = self.post_process_requests(
                 active_request_ids,
                 finished_request_ids,
