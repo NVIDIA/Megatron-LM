@@ -170,6 +170,13 @@ class InferenceConfig:
     requests when they are paused during bookkeeping.
     """
 
+    track_generated_token_events: bool = False
+    """
+    Whether to track per-token events with timestamps for each generated token.
+    When enabled, each generated token creates a GENERATED_TOKEN event with a
+    timestamp, useful for per-token latency analysis.
+    """
+
     metrics_writer: Optional["WandbModule"] = None
     """Wandb module for writing metrics."""
 
