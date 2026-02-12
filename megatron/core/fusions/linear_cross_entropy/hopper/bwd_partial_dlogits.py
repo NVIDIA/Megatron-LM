@@ -1,7 +1,7 @@
 # Copyright (c) 2025, NVIDIA CORPORATION.  All rights reserved.
 
 import logging
-from typing import Literal, Tuple, Type
+from typing import Tuple, Type
 
 try:
     import cuda.bindings.driver as cuda
@@ -12,10 +12,6 @@ try:
     import cutlass.utils.hopper_helpers as sm90_utils
     import math
     from megatron.core.fusions.linear_cross_entropy.hopper.utils import make_acc_tensor_mn_view
-    
-    # ============================================================================
-    # Hopper CuTe DSL Kernel for Backward Partial Dlogits
-    # ============================================================================
     
     class BwdPartialDlogits:
         """
@@ -37,14 +33,6 @@ try:
             mma_tiler_mn: tuple = (128, 256),
             vocab_per_split: int = 512,
         ):
-            """
-            Args:
-                reduction: Reduction type (0=none, 1=sum, 2=mean)
-                acc_dtype: Accumulator data type
-                use_tma_multicast: Whether to use TMA multicast (cluster>1)
-                mma_tiler_mn: MMA tile size for M and N dimensions
-                vocab_per_split: Vocabulary size per split
-            """
             self.REDUCTION: cutlass.Constexpr[cutlass.Int32] = cutlass.const_expr(reduction)
             self.acc_dtype = acc_dtype
             self.use_tma_multicast = use_tma_multicast
@@ -70,6 +58,24 @@ try:
             
             self.buffer_align_bytes = 1024
 
+        def _compute_grid(
+            self,
+            problem_mnk: Tuple[int, int, int],
+            cluster_shape_mn: Tuple[int, int],
+            cta_tiler: Tuple[int, int, int],
+        ) -> Tuple[int, int, int]:
+            cluster_shape = (*cluster_shape_mn, 1)
+            
+            grid = cute.round_up(
+                (
+                    cute.ceil_div(problem_mnk[0], cta_tiler[0]),
+                    cute.ceil_div(self.vocab_per_split, cta_tiler[1]),
+                    1,
+                ),
+                cluster_shape,
+            )
+            return grid
+
         def _compute_stages(
             self,
             tile_shape_mnk: tuple,
@@ -78,7 +84,6 @@ try:
             smem_capacity: int,
             occupancy: int,
         ) -> int:
-            """Compute number of pipeline stages."""
             epi_stage = 4
             epi_bytes = 0 # epi_smem will reuse smem ab.
 
@@ -164,6 +169,9 @@ try:
             problem_mnk: tuple,
             rank: cutlass.Int32,
         ) -> None:
+            """
+            The backward kernel for partial d_logits.
+            """
             warp_idx = cute.arch.make_warp_uniform(cute.arch.warp_idx())
             tidx, _, _ = cute.arch.thread_idx()
             cidx, cidy, _ = cute.arch.cluster_idx()
@@ -255,12 +263,8 @@ try:
             # -------- GMEM partition -------- #
             gA = cute.local_tile(mA, (self.mma_tiler[0], self.mma_tiler[2]), (pid_m, None))
 
-            # Weight partition: first by split, then by tile
-            # Each split handles vocab_per_split rows of weight
-            # vocab_start_for_split: cutlass.Int64 = split_idx * self.vocab_per_split
-            # if tidx == 0:
-            #     cute.printf("split_idx=%d, vocab_per_split=%d\n", split_idx, self.vocab_per_split)
             mB_split = cute.local_tile(mB, (self.vocab_per_split, cute.size(mB.layout.shape, mode=[1])), (split_idx, 0))
+
             gB = cute.local_tile(mB_split, (self.mma_tiler[1], self.mma_tiler[2]), (pid_n, None)) 
 
             gC = cute.local_tile(mC, (self.mma_tiler[0], self.mma_tiler[1]), (pid_m, pid_n))
@@ -293,11 +297,9 @@ try:
             tCrA = tiled_mma.make_fragment_A(tCsA)
             tCrB = tiled_mma.make_fragment_B(tCsB)  
 
-            # CRITICAL: Use thr_mma (per-thread, like forward kernel) for accumulator.
-            # This ensures acc_mn_view and tCcAcc_mn share the same partition layout.
-            thr_mma_init = tiled_mma.get_slice(tidx)
-            tCcAcc_init = thr_mma_init.partition_C(cute.make_identity_tensor(self.mma_tiler[:2]))
-            accumulators = cute.make_rmem_tensor(tCcAcc_init.shape, self.acc_dtype)
+            thr_mma = tiled_mma.get_slice(tidx)
+            tCcAcc = thr_mma.partition_C(cute.make_identity_tensor(self.mma_tiler[:2]))
+            accumulators = cute.make_rmem_tensor(tCcAcc.shape, self.acc_dtype)
 
             a_cta_layout = cute.make_layout(cute.slice_(cta_layout_mnk, (0, None, 0)).shape)
             tTMAsA, tTMAgA = cute.nvgpu.cpasync.tma_partition(
@@ -347,9 +349,6 @@ try:
                     mainloop_pipeline.producer_commit(mainloop_producer_state)
                     mainloop_producer_state.advance()
 
-
-            thr_mma = tiled_mma.get_slice(tidx)
-            tCcAcc = thr_mma.partition_C(cute.make_identity_tensor(self.mma_tiler[:2]))
             tCcAcc_mn = make_acc_tensor_mn_view(tCcAcc)
             acc_mn_view = make_acc_tensor_mn_view(accumulators)
 
@@ -611,27 +610,6 @@ try:
                 c_pipeline.producer_tail()    
 
             return
-
-        def _compute_grid(
-            self,
-            problem_mnk: Tuple[int, int, int],
-            cluster_shape_mn: Tuple[int, int],
-            cta_tiler: Tuple[int, int, int],
-        ) -> Tuple[int, int, int]:
-            """
-            Compute grid dimensions for kernel launch.
-            """
-            cluster_shape = (*cluster_shape_mn, 1)
-            
-            grid = cute.round_up(
-                (
-                    cute.ceil_div(problem_mnk[0], cta_tiler[0]),
-                    cute.ceil_div(self.vocab_per_split, cta_tiler[1]),
-                    1,
-                ),
-                cluster_shape,
-            )
-            return grid
 
 
         @cute.jit
