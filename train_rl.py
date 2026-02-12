@@ -21,6 +21,10 @@ from megatron.rl.rl_utils import (
     get_rl_runtime_state,
     load_packed_data_by_index,
 )
+from megatron.core.transformer.utils import (
+    transition_moe_to_full_cudagraphs,
+    transition_moe_to_partial_cudagraphs,
+)
 from megatron.training import get_args, get_timers, pretrain, print_rank_0
 from megatron.training.arguments import core_transformer_config_from_args
 from model_provider import model_provider
@@ -274,12 +278,32 @@ def forward_step(data_iterator, model: GPTModel, loss_only: bool = False):
     except:
         pass
 
+    # Disable MoE CUDA graphs during the logprobs forward pass so MoE layers
+    # run fully eager.  Non-MoE layer managers are also bypassed via the
+    # cuda_graph_impl="none" flag.
+    _disable_cg = args.rl_training_cuda_graphs
+    if _disable_cg:
+        _lang = (
+            model_to_use.module.module
+            if hasattr(model_to_use.module, "module")
+            else model_to_use.module
+        )
+        transition_moe_to_full_cudagraphs(_lang)
+        _saved_impl = model_to_use.config.cuda_graph_impl
+        model_to_use.config.cuda_graph_impl = "none"
+
     # Get current logprobs and calculate loss with straggler detection
     with stimer:
         logprobs_or_hidden_states = get_logprobs(
             model_to_use, tokens, position_ids, no_grad=False, packed_seq_params=packed_seq_params
         )
 
+    # Restore partial cudagraph mode after the logprobs forward pass.
+    if _disable_cg:
+        model_to_use.config.cuda_graph_impl = _saved_impl
+        transition_moe_to_partial_cudagraphs(_lang)
+
+    with stimer:
         if not is_pipeline_last_stage():
             output_tensor = logprobs_or_hidden_states
             kl_term, ratios, entropy_term, truncated_from_above, truncated_from_below = (

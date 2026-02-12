@@ -1241,6 +1241,8 @@ class MoETransformerLayer(TransformerLayer):
     def _should_call_local_cudagraph(self, *args, **kwargs):
         if self.use_partial_cudagraphs:
             return False
+        if self.config.cuda_graph_impl != "local":
+            return False
         return super()._should_call_local_cudagraph(*args, **kwargs)
 
     def create_mcore_cudagraph_manager(self, config):

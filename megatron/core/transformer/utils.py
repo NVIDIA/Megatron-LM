@@ -491,6 +491,10 @@ def transition_moe_to_full_cudagraphs(model):
     for module in model.modules():
         if isinstance(module, MoETransformerLayer):
             module.use_partial_cudagraphs = False
+            # Reset fwd_execution_map from the string left by the last partial
+            # phase (e.g. "postprocess") back to the full list so that
+            # non-cudagraph forward calls run all phases of the MoE layer.
+            module.mlp.fwd_execution_map = ["route", "expert_compute", "postprocess"]
             assert hasattr(module, 'cudagraph_manager'), (
                 "MoETransformerLayer missing full cudagraph_manager; "
                 "expected it to be created at __init__ with scope=[]"

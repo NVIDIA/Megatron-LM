@@ -1239,6 +1239,19 @@ def prepare_data_for_update(
         with torch.no_grad(), nvtx_range("compute_logprobs", time=True):
             # Before we can update the model, we need to get the logprobs for the \pi_{old} model.
 
+            # Disable CUDA graphs during logprobs so MoE layers run fully eager.
+            # Partial MoE managers and the full manager are bypassed; training and
+            # inference each manage their own CUDA graph lifecycle separately.
+            if args.rl_training_cuda_graphs:
+                _logprobs_lang_module = (
+                    model.module.module
+                    if hasattr(model.module, "module")
+                    else model.module
+                )
+                transition_moe_to_full_cudagraphs(_logprobs_lang_module)
+                _saved_cuda_graph_impl = model.config.cuda_graph_impl
+                model.config.cuda_graph_impl = "none"
+
             # Wrap forward_backward_func for Full iteration CUDA graph
             forward_backward_func = get_forward_backward_func()
             if args.cuda_graph_impl == "local" and CudaGraphScope.full_iteration in args.cuda_graph_scope:
@@ -1255,7 +1268,6 @@ def prepare_data_for_update(
             pp_group = pg_collection.pp
 
             with torch.no_grad(), nvtx_range("compute_old_logprobs", time=True):
-                model.config.cuda_graph_impl = "none"
                 old_logprobs = _compute_logprobs_batch(
                     model=model,
                     data_loader=data_loader,
@@ -1269,7 +1281,6 @@ def prepare_data_for_update(
                     pp_group=pp_group,
                     is_correction=args.rl_inference_logprobs_is_correction,
                 )
-                model.config.cuda_graph_impl = "local"
 
             with torch.no_grad(), nvtx_range("compute_ref_logprobs", time=True):
                 # We need to load the ref model state dict and compute the logprobs for the ref model
@@ -1293,6 +1304,11 @@ def prepare_data_for_update(
 
                 # logprobs are [b, seq, h] now.
                 model.load_state_dict(cur_st_dict)
+
+            # Restore partial cudagraph mode for the upcoming training step.
+            if args.rl_training_cuda_graphs:
+                model.config.cuda_graph_impl = _saved_cuda_graph_impl
+                transition_moe_to_partial_cudagraphs(_logprobs_lang_module)
 
             torch.cuda.synchronize()
             gc.collect()
