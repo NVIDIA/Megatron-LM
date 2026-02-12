@@ -9,6 +9,7 @@ import itertools
 import math
 import logging
 import json
+import os
 from collections import Counter, defaultdict
 from contextlib import contextmanager, nullcontext
 from dataclasses import dataclass
@@ -60,7 +61,7 @@ from megatron.rl.agent.api import (
     TokenRollout,
 )
 from megatron.rl.agent.weighted_multi_task import WeightedMultiTask
-from megatron.rl.inference.megatron import MegatronChatLocal, MegatronLocal
+from megatron.rl.inference.megatron import MegatronLocal
 from megatron.rl.logging import LOG_DIR as lang_rl_log_dir
 from megatron.rl.logging import log as lang_rl_log
 from megatron.rl.server.inference.inference_interface_server import InferenceInterfaceServer
@@ -430,36 +431,12 @@ _INFERENCE_INTERFACE = None
 def get_inference_interface(args, loop, model):
     global _INFERENCE_INTERFACE
     if _INFERENCE_INTERFACE is None:
-        rank = torch.distributed.get_rank()
-        if rank == 0 and args.langrl_external_server:
-            if args.langrl_inference_server_type == 'inplace_megatron':
-                _INFERENCE_INTERFACE = loop.run_until_complete(
-                    InferenceInterfaceServer.launch(MegatronLocal, model=model[0])
-                )
-            elif args.langrl_inference_server_type == 'inplace_megatron_chat':
-                _INFERENCE_INTERFACE = loop.run_until_complete(
-                    InferenceInterfaceServer.launch(
-                        MegatronChatLocal,
-                        model=model[0],
-                        conversation_template=args.langrl_inference_server_conversation_template,
-                    )
-                )
-            else:
-                raise ValueError(f"Unknown inference_server_type {args.inference_server_type}")
-        else:
-            if args.langrl_inference_server_type == 'inplace_megatron':
-                _INFERENCE_INTERFACE = loop.run_until_complete(MegatronLocal.launch(model[0]))
-            elif args.langrl_inference_server_type == 'inplace_megatron_chat':
-                _INFERENCE_INTERFACE = loop.run_until_complete(
-                    MegatronChatLocal.launch(
-                        model[0],
-                        conversation_template=args.langrl_inference_server_conversation_template,
-                    )
-                )
-            else:
-                raise ValueError(
-                    f"Unknown inference_server_type {args.langrl_inference_server_type}"
-                )
+        _INFERENCE_INTERFACE = loop.run_until_complete(
+            MegatronLocal.launch(
+                model[0], 
+                host='0.0.0.0', 
+                port=8294)
+        )
     return _INFERENCE_INTERFACE
 
 
@@ -1816,6 +1793,12 @@ def rl_inference_interface_shutdown():
         _INFERENCE_INTERFACE = None
     else:
         logger.warning("No inference interface to shutdown. This should not happen.")
+
+    # TODO(rkirby): This is a hack to hard exit. There is a bug that is preventing us from using sys.exit(0).
+    # It seem the Flask server has non-daemon threads that are preventing the program from exiting.
+    # We need to find a way to gracefully complete all in progress requests and shutdown the Flask server.
+    import os
+    os._exit(0)
 
 
 def get_iteration_sequence_count(args):
