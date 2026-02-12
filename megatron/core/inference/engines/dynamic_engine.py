@@ -895,9 +895,7 @@ class DynamicInferenceEngine(AbstractEngine):
                     is_first_token = len(request.generated_tokens) == 0
                     request.generated_tokens.append(token)
                     if self.track_generated_token_events:
-                        blocks_allocated = (
-                            block_allocator.total_count - block_allocator.total_avail
-                        )
+                        blocks_allocated = block_allocator.total_count - block_allocator.total_avail
                         if block_allocator.enable_prefix_caching:
                             event_generated_token = request.add_event_generated_token(
                                 token,
@@ -1145,11 +1143,11 @@ class DynamicInferenceEngine(AbstractEngine):
 
         block_allocator = self.context.block_allocator
         for block_hash in req.precomputed_block_hashes:
-            block_id = block_allocator.lookup_block_by_hash(block_hash)
+            block_id = block_allocator.hash_to_block_id.get(block_hash)
             if block_id is None:
                 # No cached block for this hash — remaining blocks won't match either
                 break
-            if block_allocator.get_block_hash(block_id) == -1:
+            if block_allocator.block_hashes[block_id].item() == -1:
                 # Block is registered but KV not yet computed
                 return True
         return False

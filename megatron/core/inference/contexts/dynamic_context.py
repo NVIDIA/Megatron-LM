@@ -1446,9 +1446,7 @@ class DynamicInferenceContext(BaseInferenceContext):
         kv_cache_available = self.block_allocator.is_memory_available(blocks)
         return request_can_be_added, request_tokens_can_be_added, kv_cache_available
 
-    def _find_matching_prefix_blocks(
-        self, req: DynamicInferenceRequest
-    ) -> tuple[list[int], int]:
+    def _find_matching_prefix_blocks(self, req: DynamicInferenceRequest) -> tuple[list[int], int]:
         """Find cached blocks matching the prompt prefix using precomputed hashes.
 
         Uses the request's precomputed_block_hashes to look up existing blocks
@@ -1474,7 +1472,7 @@ class DynamicInferenceContext(BaseInferenceContext):
         parent_hash = 0
 
         for block_hash in req.precomputed_block_hashes:
-            existing_block = self.block_allocator.lookup_block_by_hash(block_hash)
+            existing_block = self.block_allocator.hash_to_block_id.get(block_hash)
 
             if existing_block is not None:
                 matched_blocks.append(existing_block)
@@ -1551,7 +1549,9 @@ class DynamicInferenceContext(BaseInferenceContext):
         ) // self.block_size_tokens  # ceiling division
 
         # Reduce blocks needed by the number of matched (shared) blocks
-        num_blocks_from_pool = overall_required_blocks - already_allocated_blocks - num_matched_blocks
+        num_blocks_from_pool = (
+            overall_required_blocks - already_allocated_blocks - num_matched_blocks
+        )
         num_blocks_from_pool = max(0, num_blocks_from_pool)
 
         new_block_ids = None
@@ -1565,7 +1565,7 @@ class DynamicInferenceContext(BaseInferenceContext):
             matched_tensor = torch.tensor(
                 matched_block_ids, dtype=torch.int32, device=torch.cuda.current_device()
             )
-            self.block_allocator.increment_ref_count(matched_tensor)
+            self.block_allocator.block_ref_counts[matched_tensor] += 1
             if self.block_evict_lru:
                 self.block_allocator.update_timestamps(matched_tensor)
 
@@ -1624,7 +1624,7 @@ class DynamicInferenceContext(BaseInferenceContext):
             self.request_to_kv_block_ids[current_id][0:num_matched_blocks] = matched_tensor
         if new_block_ids is not None:
             self.request_to_kv_block_ids[current_id][
-                num_matched_blocks:num_matched_blocks + len(new_block_ids)
+                num_matched_blocks : num_matched_blocks + len(new_block_ids)
             ] = new_block_ids
 
         self.request_kv_length_offsets[current_id] = req.finished_chunk_token_count

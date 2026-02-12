@@ -177,8 +177,11 @@ class BlockAllocator:
             return
 
         if self.enable_prefix_caching:
-            # Decrement reference counts - blocks stay cached for prefix reuse
-            self.decrement_ref_count(blocks)
+            self.block_ref_counts[blocks] -= 1
+            if not self.block_evict_lru:
+                zero_mask = self.block_ref_counts[blocks] == 0
+                if zero_mask.any():
+                    self._deregister_blocks(blocks[zero_mask])
 
     def reset(self) -> None:
         """Reset the allocator to initial state.
@@ -213,40 +216,9 @@ class BlockAllocator:
                 self.block_timestamps.fill_(0)
                 self.global_timestamp = 0
 
-    def set_block_hash(self, block_id: int, hash_value: int) -> None:
-        """Set the hash for a specific block.
-
-        Args:
-            block_id: The block ID to set hash for.
-            hash_value: The hash value to store.
-        """
-        self.block_hashes[block_id] = hash_value
-
-    def get_block_hash(self, block_id: int) -> int:
-        """Get the hash for a block.
-
-        Args:
-            block_id: The block ID to get hash for.
-
-        Returns:
-            Hash value (-1 if not computed).
-        """
-        return self.block_hashes[block_id].item()
-
     # =========================================================================
     # Prefix caching methods
     # =========================================================================
-
-    def lookup_block_by_hash(self, block_hash: int) -> Optional[int]:
-        """Look up a cached block by its hash.
-
-        Args:
-            block_hash: The hash value to look up.
-
-        Returns:
-            Block ID if found, None otherwise.
-        """
-        return self.hash_to_block_id.get(block_hash)
 
     def register_block_hash(self, block_id: int, block_hash: int) -> None:
         """Register a block in the hash-to-block mapping for discovery.
@@ -275,37 +247,7 @@ class BlockAllocator:
         """
         if block_id in self._pending_block_hashes:
             hash_value = self._pending_block_hashes.pop(block_id)
-            self.set_block_hash(block_id, hash_value)
-
-    def increment_ref_count(self, block_ids: Tensor) -> None:
-        """Increment reference count for shared blocks.
-
-        Called when a request starts using (sharing) existing cached blocks.
-
-        Args:
-            block_ids: Tensor of block IDs to increment.
-        """
-        if block_ids.numel() == 0:
-            return
-        self.block_ref_counts[block_ids] += 1
-
-    def decrement_ref_count(self, block_ids: Tensor) -> None:
-        """Decrement reference count when a request releases blocks.
-
-        In LRU mode, blocks with ref_count == 0 become cached (evictable but still
-        in hash map). In RZ mode, blocks are immediately deregistered and returned
-        to the free pool when ref_count hits 0.
-
-        Args:
-            block_ids: Tensor of block IDs to decrement.
-        """
-        if block_ids.numel() == 0:
-            return
-        self.block_ref_counts[block_ids] -= 1
-        if not self.block_evict_lru:
-            zero_mask = self.block_ref_counts[block_ids] == 0
-            if zero_mask.any():
-                self._deregister_blocks(block_ids[zero_mask])
+            self.block_hashes[block_id] = hash_value
 
     def _deregister_blocks(self, block_ids: Tensor) -> None:
         """Remove blocks from prefix caching state and return to free pool.

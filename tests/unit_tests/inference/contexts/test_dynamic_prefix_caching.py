@@ -10,37 +10,45 @@ from megatron.core.inference.config import InferenceConfig
 from megatron.core.inference.contexts.dynamic_context import DynamicInferenceContext
 from megatron.core.inference.engines.dynamic_engine import DynamicInferenceEngine
 from megatron.core.inference.inference_request import (
+    HASH_PRIME,
     DynamicInferenceRequest,
     DynamicInferenceRequestRecord,
     Status,
     compute_block_hash,
-    HASH_PRIME,
 )
 from megatron.core.inference.sampling_params import SamplingParams
-from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
+from megatron.core.transformer.transformer_config import TransformerConfig
 from tests.unit_tests.test_utilities import Utils
-
 
 # =========================================================================
 # Base class + helpers
 # =========================================================================
+
 
 class PrefixCachingTestBase:
     """Base class with shared setup/teardown and helper methods."""
 
     def setup_method(self, method):
         Utils.initialize_model_parallel(
-            tensor_model_parallel_size=1, pipeline_model_parallel_size=1,
+            tensor_model_parallel_size=1, pipeline_model_parallel_size=1
         )
         model_parallel_cuda_manual_seed(123)
 
     def teardown_method(self, method):
         Utils.destroy_model_parallel()
 
-    def _ctx(self, *, buffer_size_gb=0.1, block_size_tokens=32,
-             max_sequence_length=512, rounder=64, enable_prefix_caching=True,
-             max_tokens=None, block_evict_lru=True):
+    def _ctx(
+        self,
+        *,
+        buffer_size_gb=0.1,
+        block_size_tokens=32,
+        max_sequence_length=512,
+        rounder=64,
+        enable_prefix_caching=True,
+        max_tokens=None,
+        block_evict_lru=True,
+    ):
         """Create a DynamicInferenceContext with sensible test defaults.
 
         Note: block_evict_lru defaults to True so existing tests use LRU behavior.
@@ -50,9 +58,13 @@ class PrefixCachingTestBase:
         DynamicInferenceContext.REQUEST_ROUNDER = rounder
 
         transformer_config = TransformerConfig(
-            params_dtype=torch.float32, num_layers=4, kv_channels=8,
-            num_attention_heads=2, hidden_size=16,
-            tensor_model_parallel_size=1, pipeline_model_parallel_size=1,
+            params_dtype=torch.float32,
+            num_layers=4,
+            kv_channels=8,
+            num_attention_heads=2,
+            hidden_size=16,
+            tensor_model_parallel_size=1,
+            pipeline_model_parallel_size=1,
             use_cpu_initialization=True,
         )
         inference_config = InferenceConfig(
@@ -68,7 +80,7 @@ class PrefixCachingTestBase:
             block_evict_lru=block_evict_lru,
         )
         return DynamicInferenceContext(
-            model_config=transformer_config, inference_config=inference_config,
+            model_config=transformer_config, inference_config=inference_config
         )
 
     @staticmethod
@@ -85,8 +97,7 @@ class PrefixCachingTestBase:
     @staticmethod
     def _prompt(num_tokens, offset=0):
         """Create a prompt tensor on CUDA."""
-        return torch.arange(offset, offset + num_tokens,
-                            device=torch.cuda.current_device())
+        return torch.arange(offset, offset + num_tokens, device=torch.cuda.current_device())
 
     @staticmethod
     def _block_ids(ctx, req_idx, n):
@@ -97,6 +108,7 @@ class PrefixCachingTestBase:
 # =========================================================================
 # Class 1: TestHashComputation (3 tests)
 # =========================================================================
+
 
 class TestHashComputation(PrefixCachingTestBase):
 
@@ -131,7 +143,7 @@ class TestHashComputation(PrefixCachingTestBase):
         # Verify against manual computation
         parent = 0
         for i in range(3):
-            expected = compute_block_hash(parent, prompt[i * bs:(i + 1) * bs])
+            expected = compute_block_hash(parent, prompt[i * bs : (i + 1) * bs])
             assert req.precomputed_block_hashes[i] == expected
             parent = expected
 
@@ -170,8 +182,7 @@ class TestHashComputation(PrefixCachingTestBase):
 
         # 120-block prompt → 120 hashes, all positive
         ctx_long = self._ctx(max_sequence_length=8192)
-        long_prompt = torch.arange(bs * 120, device=torch.cuda.current_device(),
-                                   dtype=torch.long)
+        long_prompt = torch.arange(bs * 120, device=torch.cuda.current_device(), dtype=torch.long)
         req_long = self._req(ctx_long, long_prompt)
         assert len(req_long.precomputed_block_hashes) == 120
         assert all(h > 0 for h in req_long.precomputed_block_hashes)
@@ -180,6 +191,7 @@ class TestHashComputation(PrefixCachingTestBase):
 # =========================================================================
 # Class 2: TestPrefixSharing (4 tests)
 # =========================================================================
+
 
 class TestPrefixSharing(PrefixCachingTestBase):
 
@@ -222,7 +234,7 @@ class TestPrefixSharing(PrefixCachingTestBase):
 
         # Same first 2 blocks, different 3rd
         prompt2 = prompt1.clone()
-        prompt2[bs * 2:] += 1000
+        prompt2[bs * 2 :] += 1000
         ctx.add_request(self._req(ctx, prompt2, request_id=2))
         r2 = self._block_ids(ctx, 1, 3)
 
@@ -265,7 +277,7 @@ class TestPrefixSharing(PrefixCachingTestBase):
 
         # Same block 0, different block 1, same block 2 tokens
         prompt2 = prompt1.clone()
-        prompt2[bs:bs * 2] += 5000
+        prompt2[bs : bs * 2] += 5000
         ctx.add_request(self._req(ctx, prompt2, request_id=2))
         r2 = self._block_ids(ctx, 1, 3)
 
@@ -279,6 +291,7 @@ class TestPrefixSharing(PrefixCachingTestBase):
 # =========================================================================
 # Class 3: TestRefCountLifecycle (6 tests)
 # =========================================================================
+
 
 class TestRefCountLifecycle(PrefixCachingTestBase):
 
@@ -295,7 +308,7 @@ class TestRefCountLifecycle(PrefixCachingTestBase):
         ctx.add_request(self._req(ctx, prompt.clone(), request_id=2))
 
         b0, b1 = self._block_ids(ctx, 0, 2)
-        b0_hash = alloc.get_block_hash(b0)
+        b0_hash = alloc.block_hashes[b0].item()
         assert alloc.block_ref_counts[b0].item() == 2
         assert alloc.block_ref_counts[b1].item() == 2
 
@@ -325,7 +338,7 @@ class TestRefCountLifecycle(PrefixCachingTestBase):
         ctx.release_memory_blocks_from_request_indexes(torch.tensor([0]))
         ctx.total_request_count = 0
         assert alloc.block_ref_counts[b0].item() == 0
-        assert alloc.get_block_hash(b0) in alloc.hash_to_block_id
+        assert alloc.block_hashes[b0].item() in alloc.hash_to_block_id
 
         # New request with same prefix
         ctx.add_request(self._req(ctx, prompt.clone(), request_id=2))
@@ -349,7 +362,7 @@ class TestRefCountLifecycle(PrefixCachingTestBase):
         ctx.add_request(self._req(ctx, self._prompt(bs * 2, offset=5000), request_id=2))
         ctx.mark_pending_blocks_computed()
         cached_blocks = ctx.request_to_kv_block_ids[1][:2].clone()
-        cached_hash = alloc.get_block_hash(cached_blocks[0].item())
+        cached_hash = alloc.block_hashes[cached_blocks[0].item()].item()
         ctx.release_memory_blocks_from_request_indexes(torch.tensor([1]))
         ctx.total_request_count = 1
         assert alloc.block_ref_counts[cached_blocks[0].item()].item() == 0
@@ -357,8 +370,9 @@ class TestRefCountLifecycle(PrefixCachingTestBase):
         # Fill remaining space with different requests to trigger eviction
         for i in range(20):
             try:
-                ctx.add_request(self._req(
-                    ctx, self._prompt(bs * 2, offset=(i + 10) * 1000), request_id=i + 100))
+                ctx.add_request(
+                    self._req(ctx, self._prompt(bs * 2, offset=(i + 10) * 1000), request_id=i + 100)
+                )
                 ctx.mark_pending_blocks_computed()
             except Exception:
                 break
@@ -382,8 +396,8 @@ class TestRefCountLifecycle(PrefixCachingTestBase):
         ctx.add_request(self._req(ctx, prompt.clone()))
         ctx.mark_pending_blocks_computed()
         b0, b1 = self._block_ids(ctx, 0, 2)
-        b0_hash = alloc.get_block_hash(b0)
-        b1_hash = alloc.get_block_hash(b1)
+        b0_hash = alloc.block_hashes[b0].item()
+        b1_hash = alloc.block_hashes[b1].item()
         avail_before = alloc.total_avail
 
         # Release → ref_count hits 0 → blocks deregistered immediately
@@ -410,7 +424,7 @@ class TestRefCountLifecycle(PrefixCachingTestBase):
         ctx.add_request(self._req(ctx, prompt.clone(), request_id=2))
 
         b0, b1 = self._block_ids(ctx, 0, 2)
-        b0_hash = alloc.get_block_hash(b0)
+        b0_hash = alloc.block_hashes[b0].item()
         assert alloc.block_ref_counts[b0].item() == 2
 
         # Release first request → ref_count=1 → still registered
@@ -451,6 +465,7 @@ class TestRefCountLifecycle(PrefixCachingTestBase):
 # Class 4: TestTwoPhaseRegistration (3 tests)
 # =========================================================================
 
+
 class TestTwoPhaseRegistration(PrefixCachingTestBase):
 
     @pytest.mark.internal
@@ -467,17 +482,17 @@ class TestTwoPhaseRegistration(PrefixCachingTestBase):
         h0, h1 = req.precomputed_block_hashes
 
         # Phase 1: discoverable via lookup, but block_hashes == -1
-        assert alloc.lookup_block_by_hash(h0) == b0
-        assert alloc.lookup_block_by_hash(h1) == b1
-        assert alloc.get_block_hash(b0) == -1
-        assert alloc.get_block_hash(b1) == -1
+        assert alloc.hash_to_block_id.get(h0) == b0
+        assert alloc.hash_to_block_id.get(h1) == b1
+        assert alloc.block_hashes[b0].item() == -1
+        assert alloc.block_hashes[b1].item() == -1
         assert b0 in alloc._pending_block_hashes
         assert len(ctx._blocks_pending_computation) == 2
 
         # Phase 2: mark computed
         ctx.mark_pending_blocks_computed()
-        assert alloc.get_block_hash(b0) == h0
-        assert alloc.get_block_hash(b1) == h1
+        assert alloc.block_hashes[b0].item() == h0
+        assert alloc.block_hashes[b1].item() == h1
         assert b0 not in alloc._pending_block_hashes
         assert len(ctx._blocks_pending_computation) == 0
 
@@ -498,11 +513,11 @@ class TestTwoPhaseRegistration(PrefixCachingTestBase):
 
         for bid in first_blocks:
             assert alloc.block_ref_counts[bid].item() == 3
-            assert alloc.get_block_hash(bid) == -1  # still pending
+            assert alloc.block_hashes[bid].item() == -1  # still pending
 
         ctx.mark_pending_blocks_computed()
         for bid in first_blocks:
-            assert alloc.get_block_hash(bid) != -1
+            assert alloc.block_hashes[bid].item() != -1
 
         # 4th request also shares
         ctx.add_request(self._req(ctx, prompt.clone(), request_id=4))
@@ -512,7 +527,7 @@ class TestTwoPhaseRegistration(PrefixCachingTestBase):
 
     @pytest.mark.internal
     def test_pending_block_detection(self):
-        """lookup finds pending blocks; get_block_hash returns -1; after mark: real hash."""
+        """lookup finds pending blocks; block_hashes == -1; after mark: real hash."""
         ctx = self._ctx()
         alloc = ctx.block_allocator
 
@@ -522,18 +537,19 @@ class TestTwoPhaseRegistration(PrefixCachingTestBase):
 
         alloc.register_block_hash(bid, test_hash)
 
-        # Lookup finds it, but get_block_hash returns -1
-        assert alloc.lookup_block_by_hash(test_hash) == bid
-        assert alloc.get_block_hash(bid) == -1
+        # Lookup finds it, but block_hashes == -1
+        assert alloc.hash_to_block_id.get(test_hash) == bid
+        assert alloc.block_hashes[bid].item() == -1
 
         # After mark: real hash
         alloc.mark_block_computed(bid)
-        assert alloc.get_block_hash(bid) == test_hash
+        assert alloc.block_hashes[bid].item() == test_hash
 
 
 # =========================================================================
 # Class 5: TestPrefillSkipping (2 tests)
 # =========================================================================
+
 
 class TestPrefillSkipping(PrefixCachingTestBase):
 
@@ -553,10 +569,7 @@ class TestPrefillSkipping(PrefixCachingTestBase):
         # Same prefix → 0 pending
         ctx.add_request(self._req(ctx, prompt.clone(), request_id=2))
         assert len(ctx._blocks_pending_computation) == 0
-        assert torch.equal(
-            ctx.request_to_kv_block_ids[0][:4],
-            ctx.request_to_kv_block_ids[1][:4],
-        )
+        assert torch.equal(ctx.request_to_kv_block_ids[0][:4], ctx.request_to_kv_block_ids[1][:4])
 
         # Extended prompt → only 1 new block pending
         extended = torch.cat([prompt, self._prompt(bs, offset=1000)])
@@ -576,20 +589,21 @@ class TestPrefillSkipping(PrefixCachingTestBase):
         ctx.mark_pending_blocks_computed()
 
         b0, b1 = self._block_ids(ctx, 0, 2)
-        assert alloc.get_block_hash(b0) != -1, "Complete block has hash"
-        assert alloc.get_block_hash(b1) == -1, "Partial block: no hash"
+        assert alloc.block_hashes[b0].item() != -1, "Complete block has hash"
+        assert alloc.block_hashes[b1].item() == -1, "Partial block: no hash"
 
         # One decode step fills block 1
         active_mask = torch.ones(1, device=torch.cuda.current_device(), dtype=torch.int32)
         new_tokens = torch.tensor([100], device=torch.cuda.current_device())
         ctx.update_requests(active_mask, new_tokens)
 
-        assert alloc.get_block_hash(b1) == -1, "Decode hash computation not implemented"
+        assert alloc.block_hashes[b1].item() == -1, "Decode hash computation not implemented"
 
 
 # =========================================================================
 # Class 6: TestDisabledMode (3 tests)
 # =========================================================================
+
 
 class TestDisabledMode(PrefixCachingTestBase):
 
@@ -615,23 +629,30 @@ class TestDisabledMode(PrefixCachingTestBase):
         alloc = ctx.block_allocator
 
         assert not hasattr(alloc, 'block_hashes'), "block_hashes should not exist when disabled"
-        assert not hasattr(alloc, 'block_ref_counts'), "block_ref_counts should not exist when disabled"
-        assert not hasattr(alloc, 'hash_to_block_id'), "hash_to_block_id should not exist when disabled"
+        assert not hasattr(
+            alloc, 'block_ref_counts'
+        ), "block_ref_counts should not exist when disabled"
+        assert not hasattr(
+            alloc, 'hash_to_block_id'
+        ), "hash_to_block_id should not exist when disabled"
 
     @pytest.mark.internal
     def test_rz_no_timestamps(self):
         """Timestamp attributes don't exist in RZ mode."""
         ctx = self._ctx(block_evict_lru=False)
         alloc = ctx.block_allocator
-        assert not hasattr(alloc, 'block_timestamps'), \
-            "block_timestamps should not exist in RZ mode"
-        assert not hasattr(alloc, 'global_timestamp'), \
-            "global_timestamp should not exist in RZ mode"
+        assert not hasattr(
+            alloc, 'block_timestamps'
+        ), "block_timestamps should not exist in RZ mode"
+        assert not hasattr(
+            alloc, 'global_timestamp'
+        ), "global_timestamp should not exist in RZ mode"
 
 
 # =========================================================================
 # Class 7: TestComplexPatterns (3 tests)
 # =========================================================================
+
 
 class TestComplexPatterns(PrefixCachingTestBase):
 
@@ -719,6 +740,7 @@ class TestComplexPatterns(PrefixCachingTestBase):
 # Class 8: TestEngineCoordination (3 tests)
 # =========================================================================
 
+
 class _StubEngine(DynamicInferenceEngine):
     """Lightweight engine subclass that skips full __init__ for unit testing.
 
@@ -747,7 +769,9 @@ class TestEngineCoordination(PrefixCachingTestBase):
         """Register *req* with the engine and put it in the waiting queue."""
         request_id = req.request_id
         engine.requests[request_id] = type(
-            "Entry", (), {
+            "Entry",
+            (),
+            {
                 "record": DynamicInferenceRequestRecord.from_request(req),
                 "future": engine._loop.create_future(),
             },
@@ -778,8 +802,7 @@ class TestEngineCoordination(PrefixCachingTestBase):
         assert engine._has_pending_prefix_blocks(req2) is False
 
         # Disabled mode: always False
-        req_disabled = self._req(ctx, prompt.clone(), request_id=3,
-                                 enable_prefix_caching=False)
+        req_disabled = self._req(ctx, prompt.clone(), request_id=3, enable_prefix_caching=False)
         assert engine._has_pending_prefix_blocks(req_disabled) is False
 
         # No precomputed hashes (short prompt): always False
