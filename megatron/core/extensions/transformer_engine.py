@@ -449,8 +449,9 @@ if HAVE_TE and is_te_min_version("1.13.0"):
         Forward pass returns: (normalized_output, residual)
         """
 
-        def __init__(self, *args, **kwargs):
+        def __init__(self, quantize: bool, *args, **kwargs):
             super().__init__(*args, **kwargs)
+            self.quantize = quantize
 
             # Fused implementation (stored in tuple to avoid submodule registration)
             self._fused_impl: Optional[Tuple[te.pytorch.ops.Sequential]] = None
@@ -479,12 +480,18 @@ if HAVE_TE and is_te_min_version("1.13.0"):
             # Add sm_margin if available (TE 2.5+)
             if hasattr(self, '_sm_margins'):
                 kwargs["sm_margin"] = self._sm_margins
+            
+            if self.quantize:
+                fused_impl.append(te.ops.Quantize(forward=False, backward=True))
 
             rmsnorm_op = te.pytorch.ops.RMSNorm(self.weight.shape, **kwargs)
 
             rmsnorm_op.weight = self.weight
 
             fused_impl.append(rmsnorm_op)
+
+            if self.quantize:
+                fused_impl.append(te.ops.Quantize(forward=True, backward=False))
 
             self._register_hooks_on_fused_impl(fused_impl)
 
@@ -634,6 +641,7 @@ class TENorm:
                     eps=eps,
                     sequence_parallel=config.sequence_parallel,
                     zero_centered_gamma=config.layernorm_zero_centered_gamma,
+                    quantize=config.fp8 or config.fp4,
                     **extra_te_kwargs,
                 )
             else:
