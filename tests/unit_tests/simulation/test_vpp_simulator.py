@@ -77,7 +77,9 @@ class TestVppSimulatorBasic:
 
         # Other required parameters
         args.rank = 0
-        args.moe_layer_freq = None  # No MoE
+        # MoE configuration - all layers are dense (no MoE)
+        # moe_layer_freq is a list where 0=dense, 1=moe
+        args.moe_layer_freq = [0] * args.num_layers  # All dense layers
         args.use_cpu_initialization = True
         args.perform_initialization = True
         args.fp16 = False
