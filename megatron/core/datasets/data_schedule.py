@@ -6,7 +6,7 @@ from typing import Any, Dict, List, Optional, Type
 import torch
 
 from megatron.core import parallel_state
-from megatron.core.datasets.data_scheduler_utils import (
+from megatron.core.datasets.data_schedule_utils import (
     broadcast_scalars,
     broadcast_tensor,
     broadcast_to_pp_group,
@@ -312,7 +312,7 @@ class HybridCPDataLoaderWrapper:
         return samples_this_rank_with_id, sample_id_groups
 
 
-class BaseScheduler:
+class BasePackingScheduler:
     """Base class for sequence packing schedulers."""
 
     def __init__(
@@ -335,7 +335,7 @@ class BaseScheduler:
         self.dp_size = dp_size
         self.microbatch_group_size_per_vp_stage = microbatch_group_size_per_vp_stage
 
-    def get_require_sample_keys(self):
+    def get_required_sample_keys(self):
         """Return the required key of each batch."""
         raise NotImplementedError
 
@@ -376,14 +376,14 @@ class BaseScheduler:
         raise NotImplementedError
 
 
-class DpBalancedScheduler(BaseScheduler):
+class DpBalancedScheduler(BasePackingScheduler):
     """Packs sequences in their original order until reaching the max limit of sequence length."""
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
         self.max_seq_len_all_ranks = self.max_seqlen_per_dp_cp_rank * self.cp_size
 
-    def get_require_sample_keys(self):
+    def get_required_sample_keys(self):
         """Return the required key of each batch."""
         return [
             "tokens",
@@ -521,7 +521,7 @@ class DpBalancedScheduler(BaseScheduler):
             )
 
             # Step 2: Check required sample keys
-            for key in self.get_require_sample_keys():
+            for key in self.get_required_sample_keys():
                 assert (
                     key in batch[0]
                 ), f"Batch missing required key {key}, provided keys: {batch[0].keys()}"
@@ -620,14 +620,14 @@ class DpBalancedScheduler(BaseScheduler):
         )
 
 
-class PackingScheduler(enum.Enum):
+class PackingSchedulerEnum(enum.Enum):
     """Enum for supported sequence packing algorithms."""
 
     DP_BALANCED = "dp_balanced"
 
 
-scheduler_map: Dict[PackingScheduler, Type[BaseScheduler]] = {
-    PackingScheduler.DP_BALANCED: DpBalancedScheduler
+scheduler_map: Dict[PackingSchedulerEnum, Type[BasePackingScheduler]] = {
+    PackingSchedulerEnum.DP_BALANCED: DpBalancedScheduler
 }
 
 
@@ -668,7 +668,7 @@ def wrap_data_iterator(
 
     # Convert string to enum
     scheduler_type = config.sequence_packing_scheduler
-    scheduler_type = PackingScheduler[scheduler_type.upper()]
+    scheduler_type = PackingSchedulerEnum[scheduler_type.upper()]
 
     scheduler = scheduler_map[scheduler_type](
         config.max_seqlen_per_dp_cp_rank,
