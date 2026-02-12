@@ -1160,7 +1160,13 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
                     return residual, None, None, None
                 hidden_states = apply_module(self.pre_mlp_layernorm)(residual)
                 if isinstance(hidden_states, tuple):
+                    if len(hidden_states) != 2:
+                        raise ValueError(
+                            f"When the output of pre_mlp_layernorm is a tuple, it is expected to have "
+                            f"2 elements (output, residual), but got {len(hidden_states)}"
+                        )
                     hidden_states, residual = hidden_states
+                
                 shared_expert_output = self.mlp.shared_experts_compute(hidden_states)
                 probs, routing_map = self.mlp.route(hidden_states)
                 hidden_states, probs = self.mlp.preprocess(hidden_states, probs, routing_map)
