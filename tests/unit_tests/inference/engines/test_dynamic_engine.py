@@ -1141,6 +1141,20 @@ class TestDynamicInferenceEngine:
         env = self._build_test_env(test_config)
         ctx = env.engine.context
 
+        def mock_forward(input_ids, position_ids, attention_mask, *args, **kwargs):
+            return torch.randn(
+                input_ids.size(0),
+                input_ids.size(1),
+                test_config.vocab_size,
+                device=input_ids.device,
+                dtype=torch.bfloat16,
+            )
+
+        # Mock the model forward function to avoid possible numerics issues
+        # caused by random inputs
+        model_instance = env.engine.controller.inference_wrapped_model.model
+        model_instance.forward = mock_forward
+
         # Request 1: 150 tokens
         req1_tokens = torch.randint(0, test_config.vocab_size, (130,), device='cuda')
         req1 = DynamicInferenceRequest(
