@@ -92,6 +92,16 @@ class TestVppSimulatorBasic:
         args.vocab_size = 128256
         args.data_path = None
 
+        # DDP/FSDP configuration - disable to avoid complex distributed setup
+        args.use_distributed_optimizer = False
+        args.ddp_bucket_size = None
+        args.ddp_average_in_collective = False
+        args.overlap_grad_reduce = False
+        args.overlap_param_gather = False
+        args.use_torch_fsdp2 = False
+        args.torch_fsdp2_reshard_after_forward = True  # bool, not MagicMock
+        args.nccl_ub = False
+
         # Create result directory
         os.makedirs(args.simulate_result_dir, exist_ok=True)
 
