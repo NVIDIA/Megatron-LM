@@ -925,9 +925,6 @@ def validate_args(args, defaults={}):
         assert args.context_parallel_size * args.max_seqlen_per_dp_cp_rank >= args.seq_length, \
             f'Packed sequence buffer size ({args.context_parallel_size * args.max_seqlen_per_dp_cp_rank}) ' \
             f'must be >= single sequence max length ({args.seq_length})'
-        # TODO(tailaim): add support for other dispatcher types
-        print(f"Setting moe_token_dispatcher_type to alltoall for sft sequence packing with pipeline parallelism")
-        args.moe_token_dispatcher_type = "alltoall"
         if args.mock_data and args.sft_mock_dataset_config_json is None:
             args.sft_mock_dataset_config_json = json.dumps(
                 {
@@ -2962,8 +2959,6 @@ def _add_sft_args(parser):
     group.add_argument('--sft', action="store_true", help='Megatron SFT training')
     group.add_argument('--sft-tokenizer-prompt-format', type=str, default="nemotron-h-aligned",
                        help='SFT prompt format.')
-    group.add_argument('--sequence-packing', action='store_true',
-                       help='use sequence packing(thd format) for training')
     group.add_argument('--sft-mock-dataset-config-json', type=str, default=None, 
                        help='This config provides the necessary information for the mock dataset. You can either specify a CSV file that contains sequence lengths, where each line stores the length of a sequence, for example: {"mode":"file","path":"/path/to/file"}. Alternatively, you can specify a distribution (currently only supporting lognormal distribution) along with the required parameters, for example, {"mode":"distribution","type":"lognormal","min_seq_len":1024,"max_seq_len":2048,"mean_seq_len":1536,"lognormal_sigma":1.1}, where sigma controls the variability of the lognormal distribution. '
                        'If not specified and --mock-data is set, defaults to a lognormal distribution with '

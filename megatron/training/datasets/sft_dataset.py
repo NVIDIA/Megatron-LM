@@ -229,7 +229,11 @@ class MockSFTLowLevelDataset:
     """The low-level mock dataset for SFT
 
     Args:
-        mock_config (dict): The config for mock dataset.
+        mode (str): Either 'file' or 'distribution'.
+        **kwargs: Additional arguments depending on mode.
+            For mode='file': path (str) - path to a CSV file with sequence lengths.
+            For mode='distribution': type (str), min_seq_len (int), max_seq_len (int),
+                mean_seq_len (int), and distribution-specific params (e.g. lognormal_sigma).
     """
 
     seed: int = 0
@@ -237,28 +241,26 @@ class MockSFTLowLevelDataset:
 
     size: int = 1000000
     """The hard-coded number of sequence to generate"""
-    
-    # This is to maintain consistency with the SFT dataset that uses real data. In the real dataset, an element in the low-level dataset often contains multiple sequences. So here, each element in the mock low-level dataset also contains num_sequence_per_sample sequences. This will be made more reasonable in the future.
-    
 
-    def __init__(self, config: Dict) -> None:
+    def __init__(self, mode: str, **kwargs) -> None:
         np.random.seed(self.seed)
-        # either choose to load sequence lengths from external file, or generate random sequence lengths
-        
-        assert "mode" in config, f"mode must be set, either 'file' or 'distribution'"
-        
-        if config["mode"] == "file":
-            self.sequence_lengths = np.array(pd.read_csv(config["path"])).flatten()
+
+        if mode == "file":
+            self.sequence_lengths = np.array(pd.read_csv(kwargs["path"])).flatten()
             self.size = len(self.sequence_lengths)
-        elif config["mode"] == "distribution":
-            min_seq_len = config["min_seq_len"]
-            max_seq_len = config["max_seq_len"]
-            mean_seq_len = config["mean_seq_len"]
-            if config["type"] == "lognormal":
-                lognormal_sigma = config["lognormal_sigma"]
-                self.sequence_lengths = self.generate_lognormal_samples(self.size, mean_seq_len,lognormal_sigma, min_seq_len, max_seq_len)
+        elif mode == "distribution":
+            min_seq_len = kwargs["min_seq_len"]
+            max_seq_len = kwargs["max_seq_len"]
+            mean_seq_len = kwargs["mean_seq_len"]
+            if kwargs["type"] == "lognormal":
+                lognormal_sigma = kwargs["lognormal_sigma"]
+                self.sequence_lengths = self.generate_lognormal_samples(
+                    self.size, mean_seq_len, lognormal_sigma, min_seq_len, max_seq_len
+                )
             else:
-                raise ValueError(f"Unsupported sequence length distribution type {config['type']}")
+                raise ValueError(f"Unsupported distribution type {kwargs['type']}")
+        else:
+            raise ValueError(f"Unsupported mode '{mode}', must be 'file' or 'distribution'")
         
     def generate_lognormal_samples(self, size, mean, sigma, min_seq_len, max_seq_len):   
         mu = np.log(mean) - sigma**2 / 2
@@ -270,9 +272,10 @@ class MockSFTLowLevelDataset:
         return self.size
 
     def __getitem__(self, idx: int) -> List[np.ndarray]:
-        length = self.sequence_lengths[idx % self.size]
         # the length of sample is 'length', but only length-1 elements are generated here, 
         # because an eod token will be appended at the end later in SFTDataset
+
+        length = self.sequence_lengths[idx % self.size]
         sample = np.arange(1, length, dtype=np.int64)
         return sample
 class MockSFTDataset(SFTDataset):
@@ -292,7 +295,7 @@ class MockSFTDataset(SFTDataset):
     @staticmethod
     def build_low_level_dataset(dataset_path: str, config: GPTDatasetConfig) -> LowLevelDataset:
         mock_config = json.loads(config.sft_mock_dataset_config_json)
-        return MockSFTLowLevelDataset(mock_config)
+        return MockSFTLowLevelDataset(**mock_config)
 
     def __len__(self) -> int:
         return self.num_samples
