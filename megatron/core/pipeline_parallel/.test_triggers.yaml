@@ -1,15 +1,17 @@
-# Pipeline parallel module -- imported by transformer, models, datasets
-# (hybrid_cp_schedule).  Affects nearly all test buckets except model_configs.
+# Pipeline parallel module (schedules, p2p_communication, utils).
+#
+# Test imports traced:
+#   pipeline_parallel → pipeline_parallel.* (schedules, p2p, bridge, etc.)
+#   transformer*      → pipeline_parallel.schedules (set_current_microbatch)
+#   distributed_fsdp  → pipeline_parallel.schedules
+#   a2a_overlap       → pipeline_parallel utilities
+#   export            → pipeline_parallel.schedules (get_forward_backward_func)
+#   rl                → pipeline_parallel
 test_buckets:
-  - fp8_param
   - pipeline_parallel
-  - models
-  - data
-  - ckpt_optimizer
-  - ckpt
-  - ckpt_models
-  - ckpt_moe_experts
   - transformer
   - transformer_moe
   - distributed_fsdp
-  - catch_all
+  - a2a_overlap
+  - export
+  - rl

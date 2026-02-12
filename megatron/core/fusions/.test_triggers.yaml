@@ -1,14 +1,9 @@
-# Fusions module -- imported by transformer and models directly.
-# Transitively affects anything depending on transformer.
+# Fusions module (fused_bias_dropout, fused_bias_gelu, etc.).
+#
+# Test imports traced:
+#   transformer*  → fusions.fused_bias_dropout, fusions.fused_indices_converter
+#   fusions       → fusions.* (test suite)
 test_buckets:
-  - fp8_param
-  - pipeline_parallel
-  - models
-  - ckpt_optimizer
-  - ckpt
-  - ckpt_models
-  - ckpt_moe_experts
   - transformer
   - transformer_moe
-  - distributed_fsdp
-  - catch_all
+  - fusions

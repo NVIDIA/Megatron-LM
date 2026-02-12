@@ -1,3 +1,6 @@
-# megatron/rl/ -- tests only in catch_all.
+# megatron/rl/ -- reinforcement learning module.
+#
+# Test imports traced:
+#   rl → megatron.rl.* (test suite)
 test_buckets:
-  - catch_all
+  - rl

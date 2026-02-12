@@ -1,4 +1,6 @@
-# Resharding module -- imports parallel_state, utils, models.common.
-# Tests only in catch_all.
+# Resharding module (refit, communication_scheduler, workload_packer).
+#
+# Test imports traced:
+#   resharding → resharding.* (test suite)
 test_buckets:
-  - catch_all
+  - resharding

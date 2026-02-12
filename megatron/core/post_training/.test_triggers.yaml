@@ -1,4 +1,6 @@
-# Post-training module (core) -- imports transformer, models, ssm,
-# tensor_parallel, fusions, extensions.  Tests only in catch_all.
+# Post-training module (modelopt integration).
+#
+# Test imports traced:
+#   post_training → post_training.modelopt.* (test suite)
 test_buckets:
-  - catch_all
+  - post_training

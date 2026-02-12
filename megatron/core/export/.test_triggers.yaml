@@ -1,3 +1,6 @@
-# Export module -- minimal dependencies, tests only in catch_all.
+# Export module (trtllm, data_type, export_config).
+#
+# Test imports traced:
+#   export → export.* (test suite)
 test_buckets:
-  - catch_all
+  - export

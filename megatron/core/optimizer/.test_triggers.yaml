@@ -1,6 +1,15 @@
-# Optimizer module -- tested by dist_checkpointing/test_optimizer and
-# optimizer tests in catch_all.  test_fp8_param uses setup_model_and_optimizer.
+# Optimizer module (distrib_optimizer, muon, layer_wise, cpu_offloading).
+#
+# Test imports traced:
+#   ckpt              → optimizer.get_megatron_optimizer, ChainedOptimizer, muon
+#   ckpt_optimizer    → optimizer.* (directly tests optimizer checkpoint logic)
+#   distributed_fsdp  → optimizer.OptimizerConfig, optimizer.distrib_optimizer
+#   optimizer         → optimizer.optimizer_config (test suite)
+#   core_unit         → test_optimizer.py, test_muon_optimizer.py,
+#                        test_layer_wise_optimizer.py, test_optimizer_cpu_offloading.py
 test_buckets:
-  - fp8_param
+  - ckpt
   - ckpt_optimizer
-  - catch_all
+  - distributed_fsdp
+  - optimizer
+  - core_unit

@@ -1,4 +1,4 @@
-# Distributed / FSDP test files.
+# Distributed test files (DDP, FSDP, grad sync).
 test_buckets:
+  - distributed
   - distributed_fsdp
-  - catch_all

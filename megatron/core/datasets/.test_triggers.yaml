@@ -1,5 +1,10 @@
-# Datasets module -- tested directly by data tests.
-# Inference imports datasets.t5_dataset (catch_all).
+# Datasets module (gpt_dataset, indexed_dataset, blended, multimodal, etc.).
+#
+# Test imports traced:
+#   data    → datasets.* (gpt_dataset, indexed_dataset, blended_*, utils, etc.)
+#   models  → datasets.t5_dataset (T5MaskedWordPieceDataset in test_t5_model.py)
+#   export  → datasets.blended_megatron_dataset_builder, gpt_dataset, utils
 test_buckets:
   - data
-  - catch_all
+  - models
+  - export

@@ -1,14 +1,11 @@
-# Quantization module -- imported by transformer and models.
-# Changes cascade through transformer.
+# Quantization module (quant_config, utils).
+#
+# Test imports traced:
+#   transformer*  → quantization.quant_config (GlobMatcher, RecipeConfig)
+#   models        → quantization.quant_config (MatchContext, RecipeConfig)
+#   extension     → quantization (test_kitchen_sdpa.py)
 test_buckets:
-  - fp8_param
-  - pipeline_parallel
-  - models
-  - ckpt_optimizer
-  - ckpt
-  - ckpt_models
-  - ckpt_moe_experts
   - transformer
   - transformer_moe
-  - distributed_fsdp
-  - catch_all
+  - models
+  - extension

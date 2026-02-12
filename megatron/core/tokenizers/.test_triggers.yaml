@@ -1,4 +1,12 @@
-# Tokenizers module -- imported by datasets and inference.
+# Tokenizers module (MegatronTokenizer, build_tokenizer, HF tokenizer).
+#
+# Test imports traced:
+#   data        → tokenizers.MegatronTokenizer, tokenizers.utils.build_tokenizer
+#   export      → tokenizers.MegatronTokenizer
+#   tokenizers  → tokenizers (test suite)
+#   core_unit   → test_training.py, test_inference.py
 test_buckets:
   - data
-  - catch_all
+  - export
+  - tokenizers
+  - core_unit

@@ -1,14 +1,14 @@
-# Dist checkpointing module -- imported by transformer, models, optimizer.
-# Tests also directly use transformer and models for integration testing.
+# Dist checkpointing module (serialization, mapping, strategies).
+#
+# Test imports traced:
+#   ckpt*           → dist_checkpointing.* (heavily, all sub-buckets)
+#   transformer*    → dist_checkpointing.mapping (ShardedObject, ShardedTensor)
+#   post_training   → dist_checkpointing
 test_buckets:
-  - fp8_param
-  - pipeline_parallel
-  - models
-  - ckpt_optimizer
   - ckpt
+  - ckpt_optimizer
   - ckpt_models
   - ckpt_moe_experts
   - transformer
   - transformer_moe
-  - distributed_fsdp
-  - catch_all
+  - post_training

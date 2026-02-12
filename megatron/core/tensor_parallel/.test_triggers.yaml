@@ -1,14 +1,28 @@
-# Tensor parallel module -- used by transformer, models, distributed,
-# and many test files directly.
+# Tensor parallel module (layers, mappings, random, cross_entropy).
+#
+# Test imports traced:
+#   fp8_param           → tensor_parallel.random
+#   pipeline_parallel   → tensor_parallel.layers, random
+#   models              → tensor_parallel.layers, random
+#   ckpt*               → tensor_parallel.random
+#   transformer*        → tensor_parallel.layers, mappings, random
+#   distributed_fsdp    → tensor_parallel (module-level)
+#   distributed         → tensor_parallel
+#   export              → tensor_parallel.random
+#   resharding          → tensor_parallel.layers
+#   tensor_parallel     → tensor_parallel.* (test suite)
 test_buckets:
   - fp8_param
   - pipeline_parallel
   - models
-  - ckpt_optimizer
   - ckpt
+  - ckpt_optimizer
   - ckpt_models
   - ckpt_moe_experts
   - transformer
   - transformer_moe
+  - distributed
   - distributed_fsdp
-  - catch_all
+  - export
+  - resharding
+  - tensor_parallel

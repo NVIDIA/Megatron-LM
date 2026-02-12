@@ -1,3 +1,7 @@
-# megatron/post_training/ (top-level) -- tests only in catch_all.
+# megatron/post_training/ (top-level, not core).
+# No tests directly import from this package.
+#
+# Test imports traced:
+#   core_unit → test_basic.py (import megatron) catches import-time failures
 test_buckets:
-  - catch_all
+  - core_unit

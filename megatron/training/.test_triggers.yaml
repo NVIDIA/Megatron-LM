@@ -1,14 +1,29 @@
 # megatron/training/ -- central hub imported by many test files.
-# test_fp8_param, pipeline_parallel tests, data tests, dist_checkpointing
-# tests, and many catch_all tests import from megatron.training.
+#
+# Test imports traced:
+#   fp8_param         → training.arguments, global_vars, training, utils
+#   pipeline_parallel → training.checkpointing, global_vars
+#   models            → training.arguments, global_vars
+#   data              → training.datasets.fim_dataset, training.utils
+#   ckpt*             → training.arguments, training, utils, checkpointing, async_utils
+#   transformer*      → training.arguments, checkpointing, global_vars, initialize
+#   distributed_fsdp  → training.arguments, global_vars, training, utils
+#   rl                → training.*
+#   ssm               → training.*
+#   core_unit         → test_argument_utils.py, test_training.py,
+#                        test_checkpointing.py, test_utils.py
 test_buckets:
   - fp8_param
   - pipeline_parallel
   - models
   - data
-  - ckpt_optimizer
   - ckpt
+  - ckpt_optimizer
   - ckpt_models
   - ckpt_moe_experts
+  - transformer
+  - transformer_moe
   - distributed_fsdp
-  - catch_all
+  - rl
+  - ssm
+  - core_unit

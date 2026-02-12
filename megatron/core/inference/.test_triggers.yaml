@@ -1,14 +1,15 @@
-# Core inference module -- transformer imports inference.contexts,
-# tensor_parallel imports inference.communication, models imports inference.
+# Core inference module (contexts, engines, wrappers, sampling).
+#
+# Test imports traced:
+#   transformer*    → inference.contexts.StaticInferenceContext
+#   models          → inference.config, contexts, engines, wrappers, sampling_params
+#   inference       → inference.* (test suite)
+#   post_training   → inference.contexts
+#   core_unit       → test_inference.py (inference.text_generation_server)
 test_buckets:
-  - fp8_param
-  - pipeline_parallel
-  - models
-  - ckpt_optimizer
-  - ckpt
-  - ckpt_models
-  - ckpt_moe_experts
   - transformer
   - transformer_moe
-  - distributed_fsdp
-  - catch_all
+  - models
+  - inference
+  - post_training
+  - core_unit

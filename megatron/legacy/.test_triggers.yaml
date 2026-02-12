@@ -1,3 +1,8 @@
-# megatron/legacy/ -- used by megatron.training, tests only in catch_all.
+# megatron/legacy/ -- used by megatron.training internally.
+# No tests directly import from legacy, but import-time failures
+# would cascade through training to tests that use it.
+#
+# Test imports traced:
+#   core_unit → test_basic.py (import megatron), test_training.py (training.*)
 test_buckets:
-  - catch_all
+  - core_unit
