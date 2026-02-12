@@ -121,7 +121,10 @@ class MockCoreAttention(torch.nn.Module):
 
 
 def get_mock_mla_config(
-    tensor_model_parallel_size: int, context_parallel_size: int
+    tensor_model_parallel_size: int,
+    context_parallel_size: int,
+    sequence_parallel: bool,
+    recompute_mla_up_proj: bool,
 ) -> SimpleNamespace:
     """Create test config with all attributes used in MLA."""
     return SimpleNamespace(
@@ -141,7 +144,7 @@ def get_mock_mla_config(
         layernorm_zero_centered_gamma=False,
         expert_model_parallel_size=1,
         tensor_model_parallel_size=tensor_model_parallel_size,
-        sequence_parallel=tensor_model_parallel_size > 1,
+        sequence_parallel=tensor_model_parallel_size > 1 and sequence_parallel,
         context_parallel_size=context_parallel_size,
         apply_rope_fusion=False,
         rope_type="yarn",
@@ -153,7 +156,8 @@ def get_mock_mla_config(
         beta_fast=32,
         beta_slow=1,
         rotary_interleaved=False,
-        recompute_granularity=None,
+        recompute_granularity="selective" if recompute_mla_up_proj else None,
+        recompute_modules=["mla_up_proj"] if recompute_mla_up_proj else [],
         fine_grained_activation_offloading=False,
         gradient_accumulation_fusion=False,
         fp8=False,
@@ -227,19 +231,35 @@ def get_mla_submodules(
     )
 
 
-@pytest.mark.parametrize("tp_cp", [[1, 1], [2, 1], [1, 2], [2, 2]])
+# TODO: Consider using get_gpt_layer_with_transformer_engine_spec from
+#       megatron.core.models.gpt.gpt_layer_specs to simplify submodule setup and cover real specs.
+# TODO: Add test case to cover TP > 1 but SP = False.
+
+
+@pytest.mark.parametrize("tp_cp_sp", [[1, 1, False], [2, 1, True], [1, 2, False], [2, 2, True]])
 @pytest.mark.parametrize("qkv_format", ['sbhd', 'thd'])
 @pytest.mark.parametrize("down_proj_use_column_parallel", [False, True])
-def test_functionality(tp_cp: List[int], qkv_format: str, down_proj_use_column_parallel: bool):
+@pytest.mark.parametrize("recompute_mla_up_proj", [False, True])
+def test_functionality(
+    tp_cp_sp: List,
+    qkv_format: str,
+    down_proj_use_column_parallel: bool,
+    recompute_mla_up_proj: bool,
+):
     """Test that AbsorbedMLASelfAttention is equivalent to standard MLA."""
-    tp_size, cp_size = tp_cp
+    tp_size, cp_size, sp = tp_cp_sp
     Utils.initialize_model_parallel(
         tensor_model_parallel_size=tp_size, context_parallel_size=cp_size
     )
     model_parallel_cuda_manual_seed(123)
 
     # Create model
-    config = get_mock_mla_config(tensor_model_parallel_size=tp_size, context_parallel_size=cp_size)
+    config = get_mock_mla_config(
+        tensor_model_parallel_size=tp_size,
+        context_parallel_size=cp_size,
+        sequence_parallel=sp,
+        recompute_mla_up_proj=recompute_mla_up_proj,
+    )
     absorbed_submodules = get_absorbed_mla_submodules(
         down_proj_use_column_parallel=down_proj_use_column_parallel,
         qk_layernorm=True,
@@ -295,13 +315,15 @@ def test_functionality(tp_cp: List[int], qkv_format: str, down_proj_use_column_p
             qkv_format='thd',
         )
         hidden_states = torch.randn(
-            (total_tokens // tp_size // cp_size, 1, config.hidden_size),
+            (total_tokens // cp_size // (tp_size if sp else 1), 1, config.hidden_size),
             dtype=torch.bfloat16,
             device='cuda',
         )
         grads = torch.randn_like(hidden_states)
     else:
-        seqlen = 1024 // tp_size // cp_size
+        # When SP is enabled, sequence is sharded across TP ranks
+        # When SP is disabled, each TP rank has the full sequence
+        seqlen = 1024 // cp_size // (tp_size if sp else 1)
         hidden_states = torch.randn((seqlen, 3, 7168), dtype=torch.bfloat16, device='cuda')
         grads = torch.randn_like(hidden_states)
         packed_seq_params = None

@@ -18,6 +18,7 @@ from typing import NoReturn, Optional, Union
 
 import torch
 
+from megatron.core import tensor_parallel
 from megatron.core.models.common.embeddings import (
     RotaryEmbedding,
     YarnRotaryEmbedding,
@@ -114,6 +115,9 @@ class AbsorbedMLASelfAttention(Attention):
         )
 
         assert not config.add_bias_linear, "add_bias_linear is not supported for AbsorbedMLA"
+        assert not (
+            config.tensor_model_parallel_size > 1 and not config.sequence_parallel
+        ), "AbsorbedMLA requires sequence_parallel when tensor_model_parallel_size > 1"
 
         self.query_projection_size = self.config.v_head_dim * self.config.num_attention_heads
         self.q_head_dim = self.config.qk_head_dim + self.config.qk_pos_emb_head_dim
