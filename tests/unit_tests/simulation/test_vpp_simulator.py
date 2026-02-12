@@ -13,7 +13,7 @@ import json
 import pytest
 import torch
 from pathlib import Path
-from unittest.mock import MagicMock
+from types import SimpleNamespace
 
 from megatron.training.simulation.vpp_simulate import VppSimulator
 from megatron.training.simulation.task import TaskType
@@ -48,7 +48,8 @@ class TestVppSimulatorBasic:
     @pytest.fixture
     def mock_args(self, tmp_path):
         """Mock args object with all necessary simulation parameters"""
-        args = MagicMock()
+        # Use SimpleNamespace instead of MagicMock to avoid type issues
+        args = SimpleNamespace()
 
         # PP configuration
         args.pipeline_model_parallel_size = 2
@@ -95,12 +96,16 @@ class TestVppSimulatorBasic:
         # DDP/FSDP configuration - disable to avoid complex distributed setup
         args.use_distributed_optimizer = False
         args.ddp_bucket_size = None
+        args.ddp_num_buckets = None
         args.ddp_average_in_collective = False
         args.overlap_grad_reduce = False
         args.overlap_param_gather = False
         args.use_torch_fsdp2 = False
         args.torch_fsdp2_reshard_after_forward = True  # bool, not MagicMock
         args.nccl_ub = False
+        args.accumulate_allreduce_grads_in_fp32 = False
+        args.check_for_nan_in_loss_and_grad = False
+        args.check_for_large_grads = False
 
         # Create result directory
         os.makedirs(args.simulate_result_dir, exist_ok=True)
