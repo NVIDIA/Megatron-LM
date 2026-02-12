@@ -639,9 +639,14 @@ def process_mtp_loss(
     Returns:
         Tensor: Updated hidden states after MTP loss processing (first chunk only).
     """
-    mtp_labels = labels.clone()
     hidden_states_list = torch.chunk(hidden_states, 1 + config.mtp_num_layers, dim=0)
     hidden_states = hidden_states_list[0]
+
+    # During inference labels are not provided; skip MTP loss computation.
+    if labels is None:
+        return hidden_states
+
+    mtp_labels = labels.clone()
 
     if loss_mask is None:
         loss_mask = torch.ones_like(mtp_labels)
