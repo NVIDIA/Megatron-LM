@@ -2,7 +2,7 @@
 import logging
 from contextlib import nullcontext
 from dataclasses import dataclass
-from typing import List, Optional, Union, cast
+from typing import List, Optional, Union
 
 import torch
 from torch import Tensor
@@ -28,7 +28,7 @@ from megatron.core.transformer.transformer_layer import (
     get_transformer_layer_offset,
 )
 from megatron.core.transformer.utils import sharded_state_dict_default
-from megatron.core.typed_torch import apply_module, not_none
+from megatron.core.typed_torch import not_none
 from megatron.core.utils import (
     WrappedTensor,
     deprecate_inference_params,

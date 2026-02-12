@@ -584,7 +584,6 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
 
         inference_context = deprecate_inference_params(inference_context, inference_params)
 
-
         # Optional Input Layer norm
         if self.recompute_input_layernorm:
             self.input_layernorm_checkpoint = tensor_parallel.CheckpointWithoutOutput()
@@ -598,11 +597,15 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
 
         if isinstance(input_layernorm_output, tuple):
             if len(input_layernorm_output) != 2:
-                raise ValueError(f"When the output of input_layernorm is a tuple, it is expected to have 2 elements (output, residual), but got {len(input_layernorm_output)}")
+                raise ValueError(
+                    f"When the output of input_layernorm is a tuple, it is "
+                    f"expected to have 2 elements (output, residual), but "
+                    f"got {len(input_layernorm_output)}"
+                )
             input_layernorm_output, residual = input_layernorm_output
         else:
             residual = hidden_states
-        
+
         using_fused_tp_inference_kernel = (not self.training) and (
             self.config.inference_fuse_tp_communication
         )
@@ -662,7 +665,12 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
 
         if isinstance(pre_cross_attn_layernorm_output, tuple):
             if len(pre_cross_attn_layernorm_output) != 2:
-                raise ValueError(f"When the output of pre_cross_attn_layernorm_output is a tuple, it is expected to have 2 elements (output, residual), but got {len(pre_cross_attn_layernorm_output)}")
+                raise ValueError(
+                    f"When the output of pre_cross_attn_layernorm_output "
+                    f"is a tuple, it is expected to have 2 elements "
+                    f"(output, residual), but "
+                    f"got {len(pre_cross_attn_layernorm_output)}"
+                )
             pre_cross_attn_layernorm_output, residual = pre_cross_attn_layernorm_output
         else:
             residual = hidden_states
