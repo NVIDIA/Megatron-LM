@@ -17,9 +17,9 @@ try:
 
     import megatron.core.fusions.linear_cross_entropy.utils as utils
     from megatron.core.fusions.linear_cross_entropy.hopper import (
-        fwd_mainloop as fwd_mainloop,
         bwd_partial_dlogits as bwd_partial_dlogits,
     )
+    from megatron.core.fusions.linear_cross_entropy.hopper import fwd_mainloop as fwd_mainloop
     from megatron.core.fusions.linear_cross_entropy.triton import kernels as triton_kernels
 
     @dataclass
@@ -27,6 +27,7 @@ try:
         """
         The configuration for the forward pass.
         """
+
         _dedicated_stream: torch.cuda.Stream = field(default_factory=torch.cuda.Stream)
         _dedicated_events: typing.List[torch.cuda.Event] = field(default_factory=list)
         _initialized: bool = field(default=False)
@@ -131,7 +132,7 @@ try:
             logprobs = torch.zeros((num_tokens,), device=hidden.device, dtype=torch.float32)
         else:
             logprobs = torch.zeros((), device=hidden.device, dtype=torch.float32)
-        
+
         # declare auxiliary tensors
         maximum = torch.empty((num_tokens,), device=hidden.device, dtype=torch.float32)
         accumulate = torch.empty_like(maximum, dtype=torch.float32)
@@ -141,13 +142,15 @@ try:
             and accumulate.is_contiguous()
             and num_valid_tokens.is_contiguous()
         )
-        
+
         # Intermediate tensors for vocab splits
         num_splits = (
             vocab_size + _get_fwd_config()._vocab_per_split - 1
         ) // _get_fwd_config()._vocab_per_split
 
-        _max = torch.full((num_tokens, num_splits), float('-inf'), device=hidden.device, dtype=torch.float32)
+        _max = torch.full(
+            (num_tokens, num_splits), float('-inf'), device=hidden.device, dtype=torch.float32
+        )
         _accu = torch.zeros((num_tokens, num_splits), device=hidden.device, dtype=torch.float32)
         if REDUCTION == utils.EntropyReductionEnum.kNone:
             _logprobs = logprobs
@@ -163,7 +166,9 @@ try:
         hidden_packed = from_dlpack(
             hidden_view.detach(), assumed_align=16
         ).mark_compact_shape_dynamic(mode=0)
-        weight_packed = from_dlpack(weight.detach(), assumed_align=16).mark_compact_shape_dynamic(mode=0)
+        weight_packed = from_dlpack(weight.detach(), assumed_align=16).mark_compact_shape_dynamic(
+            mode=0
+        )
         labels_packed = from_dlpack(
             labels_view.detach(), assumed_align=8
         ).mark_compact_shape_dynamic(mode=0)
@@ -177,13 +182,13 @@ try:
             mode=0, stride_order=(0, 1)
         )
         cuda_stream = cuda.CUstream(torch.cuda.current_stream().cuda_stream)
-        
+
         # VocabSize and Dim are fixed for a given model,
         # only the number of tokens can vary
         key = f"vocab_size:{vocab_size}+dim:{dim}+dtype:{hidden_view.dtype}"
         if _get_fwd_config()._fwd_mainloop_kernels.get(key) is None:
             fwd_mainloop_kernel = fwd_mainloop.FwdMainLoop(
-                vocab_per_split=_get_fwd_config()._vocab_per_split,
+                vocab_per_split=_get_fwd_config()._vocab_per_split
             )
             fwd_mainloop_compiled_kernel = cute.compile(
                 fwd_mainloop_kernel,

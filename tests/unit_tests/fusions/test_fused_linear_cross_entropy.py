@@ -255,7 +255,10 @@ class TestFusedLinearCrossEntropyOnGptModel:
 @pytest.mark.skipif(
     "WORLD_SIZE" in os.environ and os.environ["WORLD_SIZE"] != "1", reason="Requires single GPU"
 )
-@pytest.mark.skipif(get_device_arch_version() not in [9, 10], reason="Requires GPU architecture = 9 (Hopper) or 10 (Blackwell)")
+@pytest.mark.skipif(
+    get_device_arch_version() not in [9, 10],
+    reason="Requires GPU architecture = 9 (Hopper) or 10 (Blackwell)",
+)
 class TestFusedLinearCrossEntropyDataParallel:
     def cleanup(self):
         torch.cuda.empty_cache()
@@ -557,7 +560,10 @@ class TestFusedLinearCrossEntropyDataParallel:
     ("WORLD_SIZE" not in os.environ or int(os.environ["WORLD_SIZE"]) < 2),  # or True,
     reason="Requires torchrun with multiple GPUs",
 )
-@pytest.mark.skipif(get_device_arch_version() not in [9, 10], reason="Requires GPU architecture = 9 (Hopper) or 10 (Blackwell)")
+@pytest.mark.skipif(
+    get_device_arch_version() not in [9, 10],
+    reason="Requires GPU architecture = 9 (Hopper) or 10 (Blackwell)",
+)
 @pytest.mark.usefixtures("distributed_context")
 class TestFusedLinearCrossEntropyTensorParallel:
     @pytest.fixture(autouse=True)
@@ -985,7 +991,10 @@ class TestFusedLinearCrossEntropyTensorParallel:
     "WORLD_SIZE" not in os.environ or int(os.environ["WORLD_SIZE"]) < 2,
     reason="Requires torchrun with multiple GPUs",
 )
-@pytest.mark.skipif(get_device_arch_version() not in [9, 10], reason="Requires GPU architecture = 9 (Hopper) or 10 (Blackwell)")
+@pytest.mark.skipif(
+    get_device_arch_version() not in [9, 10],
+    reason="Requires GPU architecture = 9 (Hopper) or 10 (Blackwell)",
+)
 @pytest.mark.usefixtures("distributed_context")
 class TestFusedLinearCrossEntropySequenceParallel:
     @pytest.fixture(autouse=True)
@@ -1053,7 +1062,7 @@ class TestFusedLinearCrossEntropySequenceParallel:
 
             logits = whole_hidden.to(torch.float32) @ weight.T.to(torch.float32)
 
-            # Use contiguous tensors for all_gather 
+            # Use contiguous tensors for all_gather
             gathered_logits = [torch.empty_like(logits) for _ in range(tp_world_size)]
             dist.all_gather(gathered_logits, logits, group=tp_group)
             whole_logits = torch.cat(gathered_logits, dim=-1)

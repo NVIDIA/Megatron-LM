@@ -25,7 +25,7 @@ def get_num_valid_tokens(
     """
     Calculate the number of valid tokens in the labels tensor.
     """
-    num_pid_m: tl.int64 = tl.cdiv(num_tokens, BLOCK_SIZE_M) # num_tokens를 BLOCK_SIZE_M로 나누고
+    num_pid_m: tl.int64 = tl.cdiv(num_tokens, BLOCK_SIZE_M)
 
     num_valid_tokens: tl.int64 = tl.zeros((), dtype=tl.int64)
     for m in range(0, num_pid_m):
@@ -33,11 +33,11 @@ def get_num_valid_tokens(
 
         labels = tl.load(
             labels_ptr + offs_am * stride_labels, mask=offs_am < num_tokens, other=ignore_index
-        ) #label 로드하고
+        )
 
-        valid_labels_mask = labels != ignore_index # 아닌것의 개수를 세고
-        num_valid_tokens += (tl.sum(valid_labels_mask.to(tl.int32), axis=0)).to(tl.int64) #더하고
-    tl.store(num_valid_tokens_ptr, num_valid_tokens) # store
+        valid_labels_mask = labels != ignore_index
+        num_valid_tokens += (tl.sum(valid_labels_mask.to(tl.int32), axis=0)).to(tl.int64)
+    tl.store(num_valid_tokens_ptr, num_valid_tokens)
 
 
 @triton.autotune(
