@@ -96,6 +96,7 @@ dev = [
     "emerging_optimizers",
     "flask[async]",
     "hypercorn",
+    "openai",
 ]
 
 lts = [
