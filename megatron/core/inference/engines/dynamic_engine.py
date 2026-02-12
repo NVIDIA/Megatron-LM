@@ -242,7 +242,6 @@ class DynamicInferenceEngine(AbstractEngine):
 
         # Timing and logging variables.
         self.rank = torch.distributed.get_rank()
-        self.step_count = 0
         self.step_start_event = torch.cuda.Event(enable_timing=True)
         self.step_end_event = torch.cuda.Event(enable_timing=True)
         self.capture_stats = None
@@ -1183,7 +1182,7 @@ class DynamicInferenceEngine(AbstractEngine):
                 self.context.check_availability(req)
             )
             if request_can_be_added and request_tokens_can_be_added and kv_cache_available:
-                self.context.add_request(req, step_count=self.step_count)
+                self.context.add_request(req)
                 self._loop.call_soon_threadsafe(
                     self._loop.create_task, self._notify_cond_for_new_request()
                 )
@@ -1235,7 +1234,7 @@ class DynamicInferenceEngine(AbstractEngine):
             if request_can_be_added and kv_cache_available:
                 if token_fully_can_be_added:
                     self.context.chunked_prefill_request_id = -1
-                    self.context.add_request(req, step_count=self.step_count)
+                    self.context.add_request(req)
                     self._loop.call_soon_threadsafe(
                         self._loop.create_task, self._notify_cond_for_new_request()
                     )
@@ -1247,7 +1246,7 @@ class DynamicInferenceEngine(AbstractEngine):
                     can_schedule = True
                 elif token_partially_can_be_added:
                     chunk_length = self.context.max_tokens - self.context.active_token_count
-                    self.context.add_request(req, chunk_length=chunk_length, step_count=self.step_count)
+                    self.context.add_request(req, chunk_length=chunk_length)
                     self._loop.call_soon_threadsafe(
                         self._loop.create_task, self._notify_cond_for_new_request()
                     )
@@ -1258,7 +1257,7 @@ class DynamicInferenceEngine(AbstractEngine):
                     # chunked prefill request at the head of the waiting queue
                     # Note that we do not need to continue check the queue, as the tokens are full
 
-    async def async_forward(self) -> Tuple[Dict, Dict, float, int]:
+    async def async_forward(self) -> Tuple[Dict, Dict, float]:
         """Uses `asyncio` for continuous generation.
         Sleeps when no requests are available, until new requests have been added.
 
@@ -1272,7 +1271,7 @@ class DynamicInferenceEngine(AbstractEngine):
 
         # If suspended, no stepping.
         if self.is_suspended:
-            raise EngineSuspendedError(self.step_count)
+            raise EngineSuspendedError(self.context.step_count)
 
         # schedule requests
         self.schedule_waiting_requests()
@@ -1293,11 +1292,11 @@ class DynamicInferenceEngine(AbstractEngine):
         self.is_decode_only = is_decode_only
 
         self.step_start_event.record()
-        result = await self.controller.async_generate_output_tokens_dynamic_batch(step_count=self.step_count)
+        result = await self.controller.async_generate_output_tokens_dynamic_batch()
         self.step_end_event.record()
         self.step_end_event.synchronize()
         step_time = self.step_start_event.elapsed_time(self.step_end_event) / 1e3
-        self.step_count += 1
+        self.context.step_count += 1
 
         # Mark pending prefix blocks as computed after prefill steps
         if not is_decode_only and self.context.enable_prefix_caching:
@@ -1307,8 +1306,8 @@ class DynamicInferenceEngine(AbstractEngine):
 
         if (
             self.logging_step_interval > 0
-            and self.step_count > 0
-            and self.step_count % self.logging_step_interval == 0
+            and self.context.step_count > 0
+            and self.context.step_count % self.logging_step_interval == 0
             and self.metrics_writer is not None
         ):
             kvcache_util_stats = self.context.get_kvcache_utilization_stats()
@@ -1330,10 +1329,10 @@ class DynamicInferenceEngine(AbstractEngine):
 
         context_state = {**pre_step_context_state, **post_step_context_state}
 
-        return result, context_state, step_time, self.step_count
+        return result, context_state, step_time
 
     async def async_bookkeep(
-        self, step_result: Optional[Dict], context_state: Dict, step_time: float, step_count: int
+        self, step_result: Optional[Dict], context_state: Dict, step_time: float
     ):
         """Uses `asyncio` for continuous bookkeeping.
 
@@ -1341,7 +1340,6 @@ class DynamicInferenceEngine(AbstractEngine):
             step_result (Optional[Dict]): The result of the step.
             context_state (Dict): is_decode_only, total/paused request count, active token count.
             step_time (float): How long this step took.
-            step_count (int): The count of the step.
 
         Returns:
             A dictionary containing:
@@ -1428,7 +1426,7 @@ class DynamicInferenceEngine(AbstractEngine):
             # Prepare metrics dictionary with all stats
             # Use 'inference/' prefix for all metrics to separate from training metrics
             metrics = {
-                'inference/inference_step': int(self.inference_step_offset + int(step_count)),
+                'inference/inference_step': int(self.inference_step_offset + int(self.context.step_count)),
                 'inference/step_time_s': float(step_time),
                 'inference/waiting_queue_len': int(len(self.waiting_request_ids)),
                 'inference/total_requests_dict_size': int(len(self.requests)),
@@ -1448,7 +1446,7 @@ class DynamicInferenceEngine(AbstractEngine):
                 raise ValueError(f"Unsupported metrics writer type: {type(self.metrics_writer)}")
 
         # Print context state.
-        if self.logging_step_interval > 0 and step_count % self.logging_step_interval == 0:
+        if self.logging_step_interval > 0 and self.context.step_count % self.logging_step_interval == 0:
             mem = torch.cuda.memory_stats()
             step_type = "decode" if context_state["is_decode_only"] else "non-decode"
             output_str = (
@@ -1458,7 +1456,7 @@ class DynamicInferenceEngine(AbstractEngine):
                 "mem: tensors %d, alloc %.1f gb, res %.1f gb."
                 % (
                     self.rank,
-                    step_count,
+                    self.context.step_count,
                     datetime.now().strftime("%H:%M:%S"),
                     step_time,
                     (
@@ -1807,7 +1805,7 @@ class DynamicInferenceEngine(AbstractEngine):
                     self.controller.dummy_forward()
                     self.step_end_event.record()
                     self.step_end_event.synchronize()
-                    self.step_count += 1
+                    self.context.step_count += 1
                     continue
 
                 # 3. No work in EP group

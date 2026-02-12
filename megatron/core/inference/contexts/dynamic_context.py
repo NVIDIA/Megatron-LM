@@ -246,6 +246,9 @@ class DynamicInferenceContext(BaseInferenceContext):
         self.enable_prefix_caching = inference_config.enable_prefix_caching
         self.block_evict_lru = inference_config.block_evict_lru
 
+        # Step counter (used for LRU timestamps in prefix caching)
+        self.step_count = 0
+
         # Track blocks pending computation for prefix caching coordination
         self._blocks_pending_computation: List[int] = []
 
@@ -1369,6 +1372,9 @@ class DynamicInferenceContext(BaseInferenceContext):
         self.block_allocator.reset()
         self.request_to_kv_block_ids.fill_(-1)
 
+        # Reset step counter
+        self.step_count = 0
+
         # Reset chunked prefill state
         self.chunked_prefill_request_id = -1
         self.num_prefill_requests = 0
@@ -1494,7 +1500,7 @@ class DynamicInferenceContext(BaseInferenceContext):
             self.block_allocator.mark_block_computed(block_id)
         self._blocks_pending_computation.clear()
 
-    def add_request(self, req: DynamicInferenceRequest, chunk_length: Optional[int] = None, step_count: int = 0) -> None:
+    def add_request(self, req: DynamicInferenceRequest, chunk_length: Optional[int] = None) -> None:
         """Add request to context. At this stage, we assume that the request is valid and can be added, as the checks are done in the schedule function.
 
         Args:
@@ -1556,7 +1562,7 @@ class DynamicInferenceContext(BaseInferenceContext):
 
         new_block_ids = None
         if num_blocks_from_pool > 0:
-            new_block_ids = self.block_allocator.allocate_memory_blocks(num_blocks_from_pool, step_count=step_count)
+            new_block_ids = self.block_allocator.allocate_memory_blocks(num_blocks_from_pool)
             if new_block_ids is None or len(new_block_ids) != num_blocks_from_pool:
                 raise BlockOverflowError(req.request_id)
 
@@ -1567,7 +1573,7 @@ class DynamicInferenceContext(BaseInferenceContext):
             )
             self.block_allocator.block_ref_counts[matched_tensor] += 1
             if self.block_evict_lru:
-                self.block_allocator.update_timestamps(matched_tensor, step_count)
+                self.block_allocator.update_timestamps(matched_tensor)
 
         # when a request already starts chunked prefill, it is exactly the last request in the current system
         # (see dynamic_engine.py, schedule_chunked_prefill invariants)
@@ -1824,7 +1830,7 @@ class DynamicInferenceContext(BaseInferenceContext):
             ), "The request_last_kv_block_offset should be 0 for the requests that just got resumed this step."
 
             assert resume_request_count <= self.block_allocator.total_avail
-            block_ids = self.block_allocator.allocate_memory_blocks(resume_request_count, step_count=step_count)
+            block_ids = self.block_allocator.allocate_memory_blocks(resume_request_count)
             row_idx = torch.arange(
                 self.paused_request_count,
                 self.paused_request_count + resume_request_count,
@@ -1958,7 +1964,7 @@ class DynamicInferenceContext(BaseInferenceContext):
 
         return evict_request_ids
 
-    def update_requests(self, active_requests_mask: Tensor, new_tokens: Tensor, step_count: int = 0) -> Tensor:
+    def update_requests(self, active_requests_mask: Tensor, new_tokens: Tensor) -> Tensor:
         """Update context state after calling engine.step().
 
         This method is responsible for:

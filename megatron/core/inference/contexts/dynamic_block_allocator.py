@@ -128,7 +128,7 @@ class BlockAllocator:
         evictable_count = self.get_evictable_block_count()
         return (self.total_avail + evictable_count) >= num_blocks
 
-    def allocate_memory_blocks(self, num_blocks: int, step_count: int = 0) -> Optional[Tensor]:
+    def allocate_memory_blocks(self, num_blocks: int) -> Optional[Tensor]:
         """Allocate memory blocks if available, else return None.
 
         Will attempt LRU eviction of cached blocks if the free pool is insufficient.
@@ -156,7 +156,7 @@ class BlockAllocator:
             # Initialize ref counts for newly allocated blocks
             self.block_ref_counts[block_ids] = 1
             if self.block_evict_lru:
-                self.update_timestamps(block_ids, step_count)
+                self.update_timestamps(block_ids)
 
         return block_ids
 
@@ -284,16 +284,15 @@ class BlockAllocator:
         self.block_bag[self.total_avail : self.total_avail + num_blocks] = block_ids
         self.total_avail += num_blocks
 
-    def update_timestamps(self, block_ids: Tensor, step_count: int) -> None:
+    def update_timestamps(self, block_ids: Tensor) -> None:
         """Update LRU timestamps for accessed blocks. No-op in RZ mode.
 
         Args:
             block_ids: Tensor of block IDs that were accessed.
-            step_count: The engine step count to use as the timestamp.
         """
         if not self.block_evict_lru or block_ids.numel() == 0:
             return
-        self.block_timestamps[block_ids] = step_count
+        self.block_timestamps[block_ids] = self.context.step_count
 
     def get_evictable_block_count(self) -> int:
         """Get count of cached blocks that can be evicted (ref_count == 0, hash set).

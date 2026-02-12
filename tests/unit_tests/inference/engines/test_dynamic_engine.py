@@ -425,7 +425,7 @@ class TestDynamicInferenceEngine:
         # Suspend + resume.
         if (
             env.config.suspend_resume_interval is not None
-            and env.engine.step_count % env.config.suspend_resume_interval == 0
+            and env.engine.context.step_count % env.config.suspend_resume_interval == 0
         ):
             suspend_resume_mems = {}
             suspend_resume_mems["start"] = torch.cuda.memory_stats()
@@ -433,7 +433,7 @@ class TestDynamicInferenceEngine:
             suspend_resume_mems["mid"] = torch.cuda.memory_stats()
             env.engine.resume()  # resume.
             suspend_resume_mems["end"] = torch.cuda.memory_stats()
-            env.mem_usage["suspend_resume"][env.engine.step_count] = suspend_resume_mems
+            env.mem_usage["suspend_resume"][env.engine.context.step_count] = suspend_resume_mems
 
         # Nothing done?
         finished_request_records = result["finished_request_records"]
@@ -1600,7 +1600,7 @@ class TestDynamicInferenceEngine:
         env = self._run_test(
             context_max_requests=max_requests, num_tokens_to_generate=16, num_gap_steps=1
         )
-        step_count = env.engine.step_count
+        step_count = env.engine.context.step_count
         context = env.engine.context
         if max_requests is None:
             assert context.max_requests == 816
