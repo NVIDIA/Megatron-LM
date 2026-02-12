@@ -457,6 +457,7 @@ class DynamicInferenceContext(BaseInferenceContext):
         self.graph_attn_metadata = {}
         self.non_graph_attn_metadata = {}
         self.active_attn_metadata = None
+        self.is_creating_cuda_graphs = False
 
         self.graph_attn_metadata["mha_metadata"] = GraphedMHAMetadata(
             block_count_total=self.block_allocator.total_count,
@@ -506,8 +507,8 @@ class DynamicInferenceContext(BaseInferenceContext):
 
         self._using_cuda_graph_this_step = False
         # Deal with chunked prefill
+        self.enable_chunked_prefill = inference_config.enable_chunked_prefill
         self.chunked_prefill_request_id = -1
-        self.has_explicit_chunked_prefill_req = False
 
         # FlashInfer.
         if inference_config.use_flashinfer_fused_rope is True:
@@ -1195,15 +1196,16 @@ class DynamicInferenceContext(BaseInferenceContext):
         Return:
             None.
         """
-        # if in recording mode, add dummy requests for cuda graph capture
-        if construct_graph_dimensions is not None:
+        self.is_creating_cuda_graphs = construct_graph_dimensions is not None
+
+        # If in CUDA graph creation mode, add dummy requests for CUDA graph capture
+        if self.is_creating_cuda_graphs:
             self.add_dummy_requests_for_cudagraph_capture(construct_graph_dimensions)
 
         batch_dimensions = InferenceBatchDimensions(
             token_count=self.active_token_count,
             prefill_req_count=self.num_prefill_requests,
             decode_req_count=self.num_decode_requests,
-            has_explicit_chunked_prefill_req=self.has_explicit_chunked_prefill_req,
         )
         self.batch_dimensions = batch_dimensions
         best_graph = CUDAGraphBatchDimensionBuilder.match_graph_config(
@@ -1211,6 +1213,7 @@ class DynamicInferenceContext(BaseInferenceContext):
             self.cuda_graph_batch_dimensions_list,
             strict=self.is_hybrid_model,
             decode_only_cuda_graphs=(not self.use_cuda_graphs_for_non_decode_steps),
+            explicit_chunked_prefill=self.is_chunked_prefill_enabled() and self.is_hybrid_model,
             ep_group=self.expert_model_parallel_group,
         )
         self._using_cuda_graph_this_step = best_graph is not None
@@ -1238,7 +1241,6 @@ class DynamicInferenceContext(BaseInferenceContext):
                 token_count=padded_token_count,
                 prefill_req_count=padded_prefill_req_count,
                 decode_req_count=padded_decode_req_count,
-                has_explicit_chunked_prefill_req=self.has_explicit_chunked_prefill_req,
             )
         self.padded_active_token_count = self.padded_batch_dimensions.token_count
         self.padded_active_request_count = self.padded_batch_dimensions.req_count
@@ -1269,8 +1271,6 @@ class DynamicInferenceContext(BaseInferenceContext):
 
         attn_dimensions = batch_dimensions
         if self.using_cuda_graph_this_step():
-            assert not self.has_explicit_chunked_prefill_req
-
             # Treat some decode requests as prefill requests to fit the cuda graph batch dimension.
             if batch_dimensions.decode_req_count > self.padded_batch_dimensions.decode_req_count:
                 total_req = batch_dimensions.req_count
@@ -1280,7 +1280,6 @@ class DynamicInferenceContext(BaseInferenceContext):
                     token_count=batch_dimensions.token_count,
                     prefill_req_count=adjusted_prefill_req_count,
                     decode_req_count=adjusted_decode_req_count,
-                    has_explicit_chunked_prefill_req=False,
                 )
 
         assert self.active_attn_metadata is not None
@@ -1304,6 +1303,7 @@ class DynamicInferenceContext(BaseInferenceContext):
                 cu_seqlens,
                 batch_dimensions=attn_dimensions,
                 padded_batch_dimensions=self.padded_batch_dimensions,
+                enable_chunked_prefill=self.is_chunked_prefill_enabled(),
             )
 
         if self.moe_enable_routing_replay:
@@ -1366,9 +1366,9 @@ class DynamicInferenceContext(BaseInferenceContext):
 
         # Reset chunked prefill state
         self.chunked_prefill_request_id = -1
-        self.has_explicit_chunked_prefill_req = False
         self.num_prefill_requests = 0
         self._using_cuda_graph_this_step = False
+        self.is_creating_cuda_graphs = False
         self.padded_batch_dimensions = InferenceBatchDimensions(
             token_count=0, prefill_req_count=0, decode_req_count=0
         )
@@ -1634,6 +1634,12 @@ class DynamicInferenceContext(BaseInferenceContext):
         """
         return torch.where(self.request_ids == self.chunked_prefill_request_id)[0][0]
 
+    def is_chunked_prefill_enabled(self) -> bool:
+        """Returns whether chunked prefill is enabled."""
+        if self.is_hybrid_model:
+            return self.enable_chunked_prefill and not self.is_creating_cuda_graphs
+        return self.enable_chunked_prefill
+
     def release_memory_blocks_from_request_indexes(self, request_indexes) -> None:
         """Release memory blocks used by the given request idxs.
 
@@ -1894,7 +1900,6 @@ class DynamicInferenceContext(BaseInferenceContext):
             active_requests_mask[-1] = (
                 1  # must keep this, next iteration will add a new chunk to it
             )
-        self.has_explicit_chunked_prefill_req = False
 
         active_request_count = (active_requests_mask == 1).sum().item()
         finished_request_count = (active_requests_mask == 0).sum().item()
