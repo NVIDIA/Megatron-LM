@@ -357,7 +357,7 @@ class TestFusedLinearCrossEntropyDataParallel:
             pad_labels = torch.nn.functional.pad(labels, (0, 1), value=ignore_index)
             labels = pad_labels[..., 1:].contiguous()
 
-        # torchrun -m pytest tests/unit_tests/fusions/test_fused_linear_cross_entropy.py::TestFusedLinearCrossEntropyDataParallel::test_storage
+        # forward
         torch_logprobs = self.torch_linear_cross_entropy(
             hidden, weight, labels, reduction=reduction, ignore_index=ignore_index
         )
