@@ -91,7 +91,7 @@ def warp_reduce(
     width: cutlass.Constexpr[int] = cute.arch.WARP_SIZE,
 ) -> cute.TensorSSA | cute.Numeric:
     if const_expr(isinstance(val, cute.TensorSSA)):
-        res = cute.make_fragment(val.shape, val.dtype)
+        res = cute.make_rmem_tensor(val.shape, val.dtype)
         res.store(val)
         for i in cutlass.range_constexpr(cute.size(val.shape)):
             res[i] = warp_reduce(res[i], op, width)
@@ -104,28 +104,9 @@ def warp_reduce(
 
 @dataclass
 class OnlineCrossEntropy:
-    """
-    Online cross entropy computation for fused linear + softmax + cross entropy.
+    """Online algorithm for softmax + cross entropy over vocab chunks (N tiles).
     
-    Implements the online algorithm that processes vocabulary in chunks (N tiles),
-    maintaining running max and sum (for softmax) and label logit (for cross entropy)
-    for each row (token).
-    
-    Key insight: Cross entropy needs only ONE logit value (at label position),
-    so we accumulate it during the same vocab iteration loop as softmax.
-    
-    Usage:
-        ce = OnlineCrossEntropy.create(num_rows=acc_shape[0] * acc_shape[1], num_cols=acc_shape[1])
-        ce.reset()  # Initialize max=-inf, sum=0
-        for n in range(num_n_tiles):
-            acc_tile = acc_mn[None, n_start:n_end]
-            ce.update(acc_tile, labels_per_thread, ignore_index, is_first=(n == 0))
-        # Results in ce.row_max, ce.row_sum (for softmax)
-        # TODO: Add ce.row_logprobs (for cross entropy)
-    
-    Note:
-        ignore_index is NOT stored as a field. Pass it to methods that need it (e.g., update).
-        This avoids Constexpr issues since ignore_index is a runtime parameter.
+    Maintains running max/sum for softmax and writes label logits during vocab iteration.
     """
     num_rows: cutlass.Constexpr[int]
     num_cols: cutlass.Constexpr[int]
@@ -134,14 +115,7 @@ class OnlineCrossEntropy:
 
     @staticmethod
     def create(num_rows: cutlass.Constexpr[int], num_cols: cutlass.Constexpr[int]):
-        """
-        Create OnlineCrossEntropy with uninitialized max and sum tensors.
-        Call reset() to initialize before use.
-        
-        :param num_rows: Number of rows (tokens) per thread
-        :param num_cols: Number of columns (vocab) per thread per tile
-        :return: OnlineCrossEntropy instance
-        """
+        """Create instance. Call reset() before use."""
         row_max = cute.make_rmem_tensor(num_rows, Float32)
         row_sum = cute.make_rmem_tensor(num_rows, Float32)
         return OnlineCrossEntropy(num_rows, num_cols, row_max, row_sum)
@@ -154,34 +128,23 @@ class OnlineCrossEntropy:
     @cute.jit
     def update(
         self, 
-        acc_mn_tile: cute.Tensor,  # [num_rows, num_cols] values (MN view)
+        acc_mn_tile: cute.Tensor,  
         labels_per_thread: cute.Tensor,
-        tCcAcc_mn_logprobs: cute.Tensor,  # For computing global M coordinate
-        gLogprobs: cute.Tensor,  # Global output tensor for label logits
-        row_block_start: cutlass.Int32,  # M-dim block offset
-        seqlen_m: cutlass.Int32,  # Total M dimension (for boundary check)
-        vocab_tile_start: cutlass.Int32,  # Starting vocab index of current N tile
-        vocab_tile_size: cutlass.Int32,  # Valid vocab entries in this N tile
-        split_vocab_start: cutlass.Int32,  # CTA's vocab split range start
+        tCcAcc_mn_logprobs: cute.Tensor,
+        gLogprobs: cute.Tensor,
+        row_block_start: cutlass.Int32,
+        num_tokens: cutlass.Int32,
+        vocab_tile_start: cutlass.Int32,
+        vocab_tile_size: cutlass.Int32,
+        split_vocab_start: cutlass.Int32,
+        vocab_offset: cutlass.Int32,
         ignore_index: cutlass.Int64,
         is_first: bool = False,
     ) -> None:
-        """
-        Update running max, sum (for softmax), and directly write label logits to global memory.
-        
-        :param acc_mn_tile: [num_rows, num_cols] accumulator tile from current N iteration
-        :param labels_per_thread: [num_rows] label indices (global vocab idx) for each row
-        :param tCcAcc_mn_logprobs: Thread-partitioned accumulator view for computing global M coordinate
-        :param gLogprobs: Global output tensor for label logits
-        :param row_block_start: M-dimension block offset (pid_m * tile_m)
-        :param seqlen_m: Total M dimension (for boundary check)
-        :param vocab_tile_start: Starting vocab index of current N tile
-        :param vocab_tile_size: Number of valid vocab entries in this N tile
-        :param split_vocab_start: CTA's vocab split range start
-        :param ignore_index: Label index to ignore (runtime parameter, not Constexpr)
-        :param is_first: Whether this is the first N tile (skips rescaling)
-        """
-        split_vocab_end = vocab_tile_start + vocab_tile_size  # CTA's vocab split range end
+        """Update max/sum for softmax and write label logits to gLogprobs."""
+        # Convert local CTA vocab range to global for label comparison
+        global_split_start = vocab_offset + split_vocab_start
+        global_split_end = vocab_offset + vocab_tile_start + vocab_tile_size
         
         for r in cutlass.range(self.num_rows, unroll_full=True):
             acc_row = acc_mn_tile[r, None].load()
@@ -189,7 +152,7 @@ class OnlineCrossEntropy:
             label = labels_per_thread[r]
             coord_m_local = tCcAcc_mn_logprobs[r, 0][0]
             coord_m_global: cutlass.Int32 = row_block_start + coord_m_local
-            m_is_valid: cutlass.Boolean = coord_m_global < seqlen_m
+            m_is_valid: cutlass.Boolean = coord_m_global < num_tokens
 
             acc_row_masked = cute.make_rmem_tensor(acc_row.shape, Float32)
             for v in cutlass.range(self.num_cols, unroll_full=True):
@@ -200,10 +163,11 @@ class OnlineCrossEntropy:
                 acc_row_masked[v] = -Float32.inf if oob else acc_row[v]
                 
                 # Store label logit if this position matches the label
+                # Use global position (vocab_offset + local) for comparison with global label
                 if m_is_valid:
-                    position = vocab_tile_start + coord_n_local
-                    if ((label >= split_vocab_start) and (label < split_vocab_end) and 
-                        (position == label) and (label != ignore_index)):
+                    global_position = vocab_offset + vocab_tile_start + coord_n_local
+                    if ((label >= global_split_start) and (label < global_split_end) and 
+                        (global_position == label) and (label != ignore_index)):
                         gLogprobs[coord_m_local] = acc_row[v]
             
             # ==================== Softmax Online Update ====================
@@ -226,4 +190,3 @@ class OnlineCrossEntropy:
                 row_sum_new = fadd_reduce(exp_row)
                 row_sum_new = warp_reduce(row_sum_new, operator.add, width=4)
                 self.row_sum[r] = coeff * self.row_sum[r] + row_sum_new
-# torchrun -m pytest tests/unit_tests/fusions/test_fused_linear_cross_entropy.py::TestFusedLinearCrossEntropyDataParallel::test_correctness

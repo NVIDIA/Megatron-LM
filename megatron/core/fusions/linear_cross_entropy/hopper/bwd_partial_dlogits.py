@@ -532,7 +532,10 @@ try:
                 producer_group=c_producer_group,
             )
 
-            vocab_offset = split_idx * self.vocab_per_split
+            # Local vocab offset within this rank's weight shard
+            local_vocab_offset = split_idx * self.vocab_per_split
+            # Global vocab offset for TP: rank * local_vocab_size + local offset
+            global_vocab_offset = rank * problem_mnk[1] + local_vocab_offset
             
             for r in cutlass.range(num_rows, unroll_full=True):
                 coord_m = tCcAcc_mn[r, 0][0]
@@ -561,7 +564,8 @@ try:
                     # Valid token: compute gradient
                     for v in cutlass.range(num_cols, unroll_full=True):
                         coord_n = tCcAcc_mn[r, v][1]
-                        vocab_position = vocab_offset + pid_n * self.mma_tiler[1] + coord_n
+                        # Use global position for label comparison (TP-aware)
+                        vocab_position = global_vocab_offset + pid_n * self.mma_tiler[1] + coord_n
                         logit_val = acc_mn_view[r, v]
                     
                         exp_logit = cute.exp(logit_val - maximum)

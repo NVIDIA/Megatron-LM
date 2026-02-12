@@ -557,7 +557,7 @@ class TestFusedLinearCrossEntropyDataParallel:
     ("WORLD_SIZE" not in os.environ or int(os.environ["WORLD_SIZE"]) < 2),  # or True,
     reason="Requires torchrun with multiple GPUs",
 )
-@pytest.mark.skipif(get_device_arch_version() != 10, reason="Requires GPU architecture = 10")
+@pytest.mark.skipif(get_device_arch_version() not in [9, 10], reason="Requires GPU architecture = 9 (Hopper) or 10 (Blackwell)")
 @pytest.mark.usefixtures("distributed_context")
 class TestFusedLinearCrossEntropyTensorParallel:
     @pytest.fixture(autouse=True)
@@ -606,16 +606,11 @@ class TestFusedLinearCrossEntropyTensorParallel:
 
             logits = hidden.to(torch.float32) @ weight.T.to(torch.float32)
 
-            whole_logits = torch.empty(
-                (logits.shape[0], logits.shape[-1] * tp_world_size),
-                dtype=logits.dtype,
-                device=logits.device,
-            )
-            whole_logits_ref = [
-                whole_logits[..., i * logits.shape[-1] : (i + 1) * logits.shape[-1]]
-                for i in range(tp_world_size)
-            ]
-            dist.all_gather(whole_logits_ref, logits, group=tp_group)
+            # Use contiguous tensors for all_gather (non-contiguous column
+            # slices cause data corruption with NCCL)
+            gathered_logits = [torch.empty_like(logits) for _ in range(tp_world_size)]
+            dist.all_gather(gathered_logits, logits, group=tp_group)
+            whole_logits = torch.cat(gathered_logits, dim=-1)
 
             logprobs = torch.nn.functional.cross_entropy(
                 whole_logits.view(-1, whole_logits.shape[-1]), labels.view(-1), reduction=reduction
@@ -650,16 +645,9 @@ class TestFusedLinearCrossEntropyTensorParallel:
 
             # re-compute whole_logits
             logits = hidden.to(torch.float32) @ weight.T.to(torch.float32)
-            whole_logits = torch.empty(
-                (logits.shape[0], logits.shape[-1] * tp_world_size),
-                dtype=logits.dtype,
-                device=logits.device,
-            )
-            whole_logits_ref = [
-                whole_logits[..., i * logits.shape[-1] : (i + 1) * logits.shape[-1]]
-                for i in range(tp_world_size)
-            ]
-            dist.all_gather(whole_logits_ref, logits, group=tp_group)
+            gathered_logits = [torch.empty_like(logits) for _ in range(tp_world_size)]
+            dist.all_gather(gathered_logits, logits, group=tp_group)
+            whole_logits = torch.cat(gathered_logits, dim=-1)
 
             one_hot = torch.zeros_like(whole_logits)
             one_hot.scatter_(1, labels.view(-1).unsqueeze(-1), 1)
@@ -997,7 +985,7 @@ class TestFusedLinearCrossEntropyTensorParallel:
     "WORLD_SIZE" not in os.environ or int(os.environ["WORLD_SIZE"]) < 2,
     reason="Requires torchrun with multiple GPUs",
 )
-@pytest.mark.skipif(get_device_arch_version() != 10, reason="Requires GPU architecture = 10")
+@pytest.mark.skipif(get_device_arch_version() not in [9, 10], reason="Requires GPU architecture = 9 (Hopper) or 10 (Blackwell)")
 @pytest.mark.usefixtures("distributed_context")
 class TestFusedLinearCrossEntropySequenceParallel:
     @pytest.fixture(autouse=True)
@@ -1065,16 +1053,10 @@ class TestFusedLinearCrossEntropySequenceParallel:
 
             logits = whole_hidden.to(torch.float32) @ weight.T.to(torch.float32)
 
-            whole_logits = torch.empty(
-                (logits.shape[0], logits.shape[-1] * tp_world_size),
-                dtype=logits.dtype,
-                device=logits.device,
-            )
-            whole_logits_ref = [
-                whole_logits[..., i * logits.shape[-1] : (i + 1) * logits.shape[-1]]
-                for i in range(tp_world_size)
-            ]
-            dist.all_gather(whole_logits_ref, logits, group=tp_group)
+            # Use contiguous tensors for all_gather 
+            gathered_logits = [torch.empty_like(logits) for _ in range(tp_world_size)]
+            dist.all_gather(gathered_logits, logits, group=tp_group)
+            whole_logits = torch.cat(gathered_logits, dim=-1)
 
             logprobs = torch.nn.functional.cross_entropy(
                 whole_logits.view(-1, whole_logits.shape[-1]), labels.view(-1), reduction=reduction
@@ -1109,16 +1091,9 @@ class TestFusedLinearCrossEntropySequenceParallel:
 
             # re-compute whole_logits
             logits = whole_hidden.to(torch.float32) @ weight.T.to(torch.float32)
-            whole_logits = torch.empty(
-                (logits.shape[0], logits.shape[-1] * tp_world_size),
-                dtype=logits.dtype,
-                device=logits.device,
-            )
-            whole_logits_ref = [
-                whole_logits[..., i * logits.shape[-1] : (i + 1) * logits.shape[-1]]
-                for i in range(tp_world_size)
-            ]
-            dist.all_gather(whole_logits_ref, logits, group=tp_group)
+            gathered_logits = [torch.empty_like(logits) for _ in range(tp_world_size)]
+            dist.all_gather(gathered_logits, logits, group=tp_group)
+            whole_logits = torch.cat(gathered_logits, dim=-1)
 
             one_hot = torch.zeros_like(whole_logits)
             one_hot.scatter_(1, labels.view(-1).unsqueeze(-1), 1)
