@@ -304,10 +304,11 @@ def get_calib_dataloader(
                     raise ValueError(f"Sample {i} has unexpected format")
 
                 # Slice text
+                max_text_length = int(max_sequence_length / 0.75)  # tokenized text is roughtly ~75% length of original
                 start_idx = 0
-                if use_random_offset and len(full_text) > max_sequence_length:
-                    start_idx = random.randint(0, len(full_text) - max_sequence_length)
-                text = full_text[start_idx : start_idx + max_sequence_length]
+                if use_random_offset and len(full_text) > max_text_length:
+                    start_idx = random.randint(0, len(full_text) - max_text_length)
+                text = full_text[start_idx : start_idx + max_text_length]
                 all_texts.append(text)
 
         print_rank_0(f"Loaded calibration dataset ({dataset_path_or_name}) with {len(all_texts)} samples")
@@ -315,7 +316,9 @@ def get_calib_dataloader(
         print_rank_0(f"Sampling Strategy: {'Random Index' if use_random_offset else 'From Beginning'}")
 
         # Tokenize all texts at once and move to device
-        tokens = tokenizer(all_texts, return_tensors="pt", padding="max_length", max_length=max_sequence_length)
+        tokens = tokenizer(
+            all_texts, return_tensors="pt", padding="max_length", max_length=max_sequence_length, truncation=True
+        )
         all_input_ids = tokens.input_ids.cuda()
         return [{"input_ids": all_input_ids[i:i+batch_size]} for i in range(0, len(all_input_ids), batch_size)]
     else:
