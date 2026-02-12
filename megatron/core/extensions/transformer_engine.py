@@ -661,7 +661,7 @@ class TENorm:
                     **extra_te_kwargs,
                 )
         else:
-            raise Exception("Only LayerNorm, RMSNorm and ResidualRMSNorm are curently supported")
+            raise Exception("Only LayerNorm and RMSNorm are curently supported")
 
         return cast(LayerNormInterface, instance)
 
