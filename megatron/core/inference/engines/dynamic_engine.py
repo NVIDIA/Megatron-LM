@@ -1183,7 +1183,7 @@ class DynamicInferenceEngine(AbstractEngine):
                 self.context.check_availability(req)
             )
             if request_can_be_added and request_tokens_can_be_added and kv_cache_available:
-                self.context.add_request(req)
+                self.context.add_request(req, step_count=self.step_count)
                 self._loop.call_soon_threadsafe(
                     self._loop.create_task, self._notify_cond_for_new_request()
                 )
@@ -1235,7 +1235,7 @@ class DynamicInferenceEngine(AbstractEngine):
             if request_can_be_added and kv_cache_available:
                 if token_fully_can_be_added:
                     self.context.chunked_prefill_request_id = -1
-                    self.context.add_request(req)
+                    self.context.add_request(req, step_count=self.step_count)
                     self._loop.call_soon_threadsafe(
                         self._loop.create_task, self._notify_cond_for_new_request()
                     )
@@ -1247,7 +1247,7 @@ class DynamicInferenceEngine(AbstractEngine):
                     can_schedule = True
                 elif token_partially_can_be_added:
                     chunk_length = self.context.max_tokens - self.context.active_token_count
-                    self.context.add_request(req, chunk_length=chunk_length)
+                    self.context.add_request(req, chunk_length=chunk_length, step_count=self.step_count)
                     self._loop.call_soon_threadsafe(
                         self._loop.create_task, self._notify_cond_for_new_request()
                     )
@@ -1293,7 +1293,7 @@ class DynamicInferenceEngine(AbstractEngine):
         self.is_decode_only = is_decode_only
 
         self.step_start_event.record()
-        result = await self.controller.async_generate_output_tokens_dynamic_batch()
+        result = await self.controller.async_generate_output_tokens_dynamic_batch(step_count=self.step_count)
         self.step_end_event.record()
         self.step_end_event.synchronize()
         step_time = self.step_start_event.elapsed_time(self.step_end_event) / 1e3

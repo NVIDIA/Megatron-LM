@@ -644,9 +644,6 @@ class TestDisabledMode(PrefixCachingTestBase):
         assert not hasattr(
             alloc, 'block_timestamps'
         ), "block_timestamps should not exist in RZ mode"
-        assert not hasattr(
-            alloc, 'global_timestamp'
-        ), "global_timestamp should not exist in RZ mode"
 
 
 # =========================================================================
@@ -757,6 +754,7 @@ class _StubEngine(DynamicInferenceEngine):
         self._loop = asyncio.new_event_loop()
         self.waiting_request_ids: deque = deque()
         self.requests = {}
+        self.step_count = 0
 
 
 class TestEngineCoordination(PrefixCachingTestBase):

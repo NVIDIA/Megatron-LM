@@ -862,7 +862,7 @@ class TextGenerationController:
             self.inference_wrapped_model.dummy_forward()
         context.reset()
 
-    def _dynamic_step_context_bookkeeping(self) -> Dict[str, Tensor]:
+    def _dynamic_step_context_bookkeeping(self, step_count: int = 0) -> Dict[str, Tensor]:
         """Update the dynamic inference context after sampling.
 
         Args:
@@ -912,7 +912,7 @@ class TextGenerationController:
         new_sample_copy = self._sampled_tokens_cuda[:active_request_count].clone()
 
         # Update requests.
-        update_result = context.update_requests(active_request_mask, new_sample_copy)
+        update_result = context.update_requests(active_request_mask, new_sample_copy, step_count=step_count)
 
         return {
             "active_request_ids": active_request_ids,
@@ -922,7 +922,7 @@ class TextGenerationController:
 
     @torch.inference_mode()
     async def async_generate_output_tokens_dynamic_batch(
-        self, skip_bookkeeping: Optional[bool] = False
+        self, skip_bookkeeping: Optional[bool] = False, step_count: int = 0
     ) -> Optional[Dict]:
         """Forward step the model and update the inference context.
 
@@ -986,7 +986,7 @@ class TextGenerationController:
         if skip_bookkeeping:
             request_bookkeeping = {}
         else:
-            request_bookkeeping = self._dynamic_step_context_bookkeeping()
+            request_bookkeeping = self._dynamic_step_context_bookkeeping(step_count=step_count)
 
         ret = {
             "sample": self._sampled_tokens_cuda[:active_request_count],
