@@ -2070,7 +2070,7 @@ class TransformerConfig(ModelParallelConfig):
                 and self.sequence_packing_scheduler not in supported_schedulers
             ):
                 raise ValueError(
-                    f"Unknown scheduler: {self.sequence_packing_scheduler}. "
+                    f"Unsupported scheduler: {self.sequence_packing_scheduler}. "
                     f"Available schedulers: {supported_schedulers}"
                 )
 
