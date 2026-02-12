@@ -54,6 +54,11 @@ spec:
     bash ./tests/functional_tests/shell_test_utils/run_ci_test.sh ${{ARGUMENTS[@]}}
 
 products:
+  - test_case: [gpt_grpo_basic_function]
+    products:
+      - environment: [dev]
+        scope: [mr, mr-github]
+        platforms: [dgx_h100]
   - test_case: [gpt_grpo_tp4_pp1_dp2_8b_throughput]
     products:
       - environment: [dev]

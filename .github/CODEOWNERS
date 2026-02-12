@@ -9,6 +9,8 @@ megatron/core/ssm/ @NVIDIA/core-adlr @NVIDIA/core-nemo @NVIDIA/hybrid-mamba
 
 megatron/core/datasets/ @NVIDIA/core-adlr @NVIDIA/core-nemo @NVIDIA/datasets
 
+megatron/core/tokenizers/ @NVIDIA/core-adlr @NVIDIA/core-nemo @NVIDIA/tokenizers
+
 megatron/core/distributed/fsdp/ @NVIDIA/core-adlr @NVIDIA/core-nemo @NVIDIA/megatron-fsdp
 
 megatron/core/transformer/fsdp_dtensor_checkpoint.py @NVIDIA/core-adlr @NVIDIA/core-nemo @NVIDIA/megatron-fsdp
