@@ -462,123 +462,48 @@ class MambaMixer(MegatronModule):
         conv_state, ssm_state = context.mamba_states_cache(self.layer_number - self.pp_layer_offset)
 
         padded_dims = context.padded_batch_dimensions
-
         token_count = padded_dims.token_count
         decode_req_count = padded_dims.decode_req_count
         prefill_req_count = padded_dims.prefill_req_count
-        has_explicit_chunked_prefill_req = padded_dims.has_explicit_chunked_prefill_req
 
         # Input projection
         zxBCdt, _ = self.in_proj(hidden_states)
 
-        if decode_req_count > 0 and prefill_req_count == 0:
-            # Decode-only
-            y = self._ssm_decode(
-                zxBCdt.transpose(0, 1),
-                conv_state,
-                ssm_state,
-                context.mamba_metadata.batch_indices_decode,
-            ).transpose(0, 1)
-        elif decode_req_count == 0 and (prefill_req_count > 0 or has_explicit_chunked_prefill_req):
-            if prefill_req_count > 0:
-                # Prefill only (regular prefill requests)
-                y_prefill = self._ssm_prefill(
-                    zxBCdt,
-                    conv_state=conv_state,
-                    ssm_state=ssm_state,
-                    seq_idx=context.mamba_metadata.seq_idx,
-                    cu_seqlens=context.mamba_metadata.cu_seqlens,
-                    return_varlen_states=True,
-                    batch_indices=context.mamba_metadata.batch_indices_prefill,
-                )
-            if has_explicit_chunked_prefill_req:
-                # Prefill only (chunked prefill request)
-                zxBCdt_chunked_prefill = torch.empty_like(zxBCdt)
-                tensor_get_slice_after(
-                    zxBCdt,
-                    zxBCdt_chunked_prefill,
-                    context.mamba_metadata.device_chunked_prefill,
-                    check_bounds=False,
-                )
-                y_chunked_prefill = self._ssm_prefill(
-                    zxBCdt_chunked_prefill[: context.mamba_metadata.device_chunked_prefill[1]],
-                    conv_state=conv_state,
-                    ssm_state=ssm_state,
-                    batch_indices=context.mamba_metadata.batch_indices_chunked_prefill,
-                    is_chunked_prefill=True,
-                )
-            if prefill_req_count > 0 and has_explicit_chunked_prefill_req:
-                # Merge regular prefill and chunked prefill parts
-                tensor_merge(
-                    y_prefill, y_chunked_prefill, context.mamba_metadata.device_chunked_prefill
-                )
-                y = y_prefill
-            elif prefill_req_count > 0:
-                # Prefill-only without chunked prefill
-                y = y_prefill
-            else:
-                # Prefill-only with only chunked prefill
-                y = y_chunked_prefill
-        else:
-            # Mix of decode and prefill
-            zxBCdt_prefill = torch.empty_like(zxBCdt)
-            tensor_get_slice_after(
-                zxBCdt,
-                zxBCdt_prefill,
-                context.mamba_metadata.device_decode_prefill,
-                check_bounds=False,
-            )
-            # Decode requests
+        y_decode = None
+        y_prefill = None
+
+        # Decode
+        if decode_req_count > 0:
+            # For mixed batch, the decode tokens are at the start of zxBCdt
+            zxBCdt_decode = zxBCdt[:decode_req_count] if prefill_req_count > 0 else zxBCdt
+
             y_decode = self._ssm_decode(
-                zxBCdt[:decode_req_count].transpose(0, 1),
+                zxBCdt_decode.transpose(0, 1),
                 conv_state,
                 ssm_state,
                 context.mamba_metadata.batch_indices_decode,
             ).transpose(0, 1)
-            y_prefill, y_chunked_prefill = None, None
-            if prefill_req_count > 0:
-                # Regular prefill requests
-                y_prefill = self._ssm_prefill(
-                    zxBCdt_prefill,
-                    conv_state=conv_state,
-                    ssm_state=ssm_state,
-                    seq_idx=context.mamba_metadata.seq_idx,
-                    cu_seqlens=context.mamba_metadata.cu_seqlens,
-                    return_varlen_states=True,
-                    batch_indices=context.mamba_metadata.batch_indices_prefill,
-                )
-            if has_explicit_chunked_prefill_req:
-                # Chunked prefill request
-                zxBCdt_chunked_prefill = torch.empty_like(zxBCdt_prefill)
+
+        # Prefill
+        if prefill_req_count > 0:
+            if decode_req_count > 0:
+                # If mixed, slice the prefill portion out of zxBCdt
+                zxBCdt_prefill = torch.empty_like(zxBCdt)
                 tensor_get_slice_after(
+                    zxBCdt,
                     zxBCdt_prefill,
-                    zxBCdt_chunked_prefill,
-                    context.mamba_metadata.device_chunked_prefill,
+                    context.mamba_metadata.device_decode_prefill,
                     check_bounds=False,
                 )
-                y_chunked_prefill = self._ssm_prefill(
-                    zxBCdt_chunked_prefill[: context.mamba_metadata.device_chunked_prefill[1]],
-                    conv_state=conv_state,
-                    ssm_state=ssm_state,
-                    batch_indices=context.mamba_metadata.batch_indices_chunked_prefill,
-                    is_chunked_prefill=True,
-                )
-            if prefill_req_count > 0 and has_explicit_chunked_prefill_req:
-                # Merge regular prefill and chunked prefill parts
-                assert y_prefill is not None
-                assert y_chunked_prefill is not None
-                tensor_merge(
-                    y_prefill, y_chunked_prefill, context.mamba_metadata.device_chunked_prefill
-                )
-            elif has_explicit_chunked_prefill_req:
-                # Chunked prefill only
-                assert y_prefill is None
-                assert y_chunked_prefill is not None
-                y_prefill = y_chunked_prefill
             else:
-                # Regular prefill only; y_prefill is already set, nothing more to be done
-                assert y_prefill is not None
-            # Merge decode and prefill parts
+                zxBCdt_prefill = zxBCdt
+
+            y_prefill = self._dynamic_inference_prefill(
+                zxBCdt_prefill, context, conv_state, ssm_state
+            )
+
+        # Merge decode and prefill results if necessary
+        if y_decode is not None and y_prefill is not None:
             y = torch.empty(
                 [token_count, 1, y_prefill.shape[-1]],
                 dtype=y_prefill.dtype,
@@ -587,11 +512,80 @@ class MambaMixer(MegatronModule):
             tensor_merge(
                 y_decode, y_prefill, context.mamba_metadata.device_decode_prefill, output_tensor=y
             )
+        elif y_decode is not None:
+            y = y_decode
+        elif y_prefill is not None:
+            y = y_prefill
+        else:
+            raise RuntimeError("Dynamic inference called with 0 decode and 0 prefill requests")
 
         # Output projection
         out, out_bias = self.out_proj(y)
 
         return out, out_bias
+
+    def _dynamic_inference_prefill(
+        self,
+        zxBCdt: torch.Tensor,
+        context: DynamicInferenceContext,
+        conv_state: torch.Tensor,
+        ssm_state: torch.Tensor,
+    ) -> torch.Tensor:
+        """Helper to run dynamic inference prefill (chunked prefill request separately)."""
+        metadata = context.mamba_metadata
+        prefill_req_count = context.padded_batch_dimensions.prefill_req_count
+        prefill_token_count = zxBCdt.shape[0]
+        enable_chunked_prefill = context.is_chunked_prefill_enabled()
+
+        y_chunked = None
+        y_regular = None
+
+        # Chunked prefill
+        if enable_chunked_prefill:
+            y_chunked = self._ssm_prefill(
+                zxBCdt[: metadata.device_chunked_prefill[0]],
+                conv_state=conv_state,
+                ssm_state=ssm_state,
+                batch_indices=metadata.batch_indices_chunked_prefill,
+                is_chunked_prefill=True,
+            )
+
+            # Update zxBCdt to contain the remaining slice for regular prefill
+            zxBCdt_remainder = torch.empty_like(zxBCdt)
+            tensor_get_slice_after(
+                zxBCdt, zxBCdt_remainder, metadata.device_chunked_prefill, check_bounds=False
+            )
+            zxBCdt = zxBCdt_remainder
+
+        # Regular prefill
+        if not enable_chunked_prefill or prefill_req_count > 1:
+            y_regular = self._ssm_prefill(
+                zxBCdt,
+                conv_state=conv_state,
+                ssm_state=ssm_state,
+                seq_idx=metadata.seq_idx,
+                cu_seqlens=metadata.cu_seqlens,
+                return_varlen_states=True,
+                batch_indices=metadata.batch_indices_prefill,
+            )
+
+        # Merge chunked prefill and regular prefill results
+        if y_chunked is not None and y_regular is not None:
+            y_combined = torch.empty_like(y_regular)
+            tensor_merge(
+                y_chunked, y_regular, metadata.device_chunked_prefill, output_tensor=y_combined
+            )
+            return y_combined
+        elif y_chunked is not None:
+            y_prefill = torch.empty(
+                (prefill_token_count, 1, y_chunked.shape[-1]),
+                dtype=y_chunked.dtype,
+                device=y_chunked.device,
+            )
+            y_prefill[: metadata.device_chunked_prefill[0]] = y_chunked
+            return y_prefill
+        else:
+            return y_regular
 
     def _decode(
         self, hidden_states, conv_state, ssm_state, batch_indices: Optional[torch.Tensor] = None
