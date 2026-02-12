@@ -260,7 +260,8 @@ def modelopt_gpt_mamba_builder(
         from megatron.core.post_training.modelopt.mamba.model_specs import get_mamba_stack_modelopt_spec
 
         mamba_stack_spec = get_mamba_stack_modelopt_spec(
-            remap_te_layernorm=args.export_te_mcore_model
+            remap_te_layernorm=args.export_te_mcore_model,
+            use_full_te_spec=args.full_te_spec,
         )
         model_kwargs = {
             "mamba_stack_spec": mamba_stack_spec,
