@@ -328,8 +328,35 @@ def validate_args(args, defaults={}):
     args.data_parallel_size = args.world_size // total_model_size
 
     if args.perform_rl_step:
-        # CUDA graph and KV cache handling support matrix is as follows:
-        # ------------------------------------------------
+        # ----------------------------------------------------------------
+        # CUDA graphs
+        #
+        #   --cuda-graph-impl controls whether CUDA graphs are built.
+        #   The sweep of various inference CUDA graphs is built inside inference, not the RL loop.
+        #   Both training and inference CUDA graphs are gated by this flag.
+        #
+        #   --rl-training-cuda-graphs controls whether CUDA graphs are used during training.
+        #   Toggling CUDA graphs on and off is done inside the RL loop.
+        #
+        #   --rl-persist-cuda-graphs controls whether CUDA graphs are built once, or repeatedly.
+        #   When this flag is True, inference requires static memory pointers for the KV cache.
+        #   When this flag is False, inference is in charge of deleting/rebuilding CUDA graphs.
+        #
+        # KV cache management (--rl-kv-cache-management-mode)
+        #
+        #   Inference initializes the KV cache, inside either a normal memory pool, UVM, or TMS.
+        #
+        #   On suspend (inference -> training):
+        #     "persist"   — no-op; KV cache stays on GPU.
+        #     "offload"   — KV cache is offloaded to CPU.
+        #     "recompute" — KV cache is deleted entirely.
+        #
+        #   On resume (training → inference):
+        #     "persist"   — no-op; KV cache is already on GPU.
+        #     "offload"   — KV cache is restored from CPU.
+        #     "recompute" — KV cache is recomputed from scratch.
+        # ----------------------------------------------------------------
+
         # Persisting CGs only makes sense if we build any CGs.
         assert not args.rl_persist_cuda_graphs or args.cuda_graph_impl != "none", (
             "--rl-persist-cuda-graphs is set but no CUDA graphs are being built."
@@ -349,45 +376,23 @@ def validate_args(args, defaults={}):
                     "--rl-kv-cache-management-mode=persist, UVM, or install torch_memory_saver."
                 )
 
+        # Offload mode requires CG persistence: CG recapture runs dummy forward
+        # passes that corrupt the preserved KV data.
+        assert not (
+            args.cuda_graph_impl != "none"
+            and args.rl_kv_cache_management_mode == "offload"
+            and not args.rl_persist_cuda_graphs
+        ), "--rl-kv-cache-management-mode=offload requires --rl-persist-cuda-graphs"
+
         # There's no need to manually offload the KV cache with UVM.
         assert not (
             args.inference_dynamic_batching_unified_memory_level > 0
             and args.rl_kv_cache_management_mode == "offload"
         ), "--rl-kv-cache-management-mode=offload is incompatible with UVM"
-        # ------------------------------------------------
-        # CGs are handled as follows:
-        #  - The inference engine's init builds inference CGs, if desired.
-        #    ** This is controlled by `--cuda-graph-impl`.
-        #  - Training is graphed on the first training step, if desired.
-        #    ** This is also controlled by `--cuda-graph-impl`.
-        #  - `megatron_rl_inference_mode` inside rl_utils toggles CGs on/off
-        #      if we want to graph inference but not training.
-        #      This has to be done on an abstraction layer above the inference loop.
-        #    ** This is controlled by `--rl-training-cuda-graphs`.
-        #  - The engine deletes and recreates cuda graphs on suspend/resume when
-        #      KV memory addresses are not guaranteed to be stable.
-        #    ** This is controlled by `--rl-persist-cuda-graphs`.
-        #  - The context ensures that pointers remain stable when requested.
-        #    ** This is achieved through UVM if enabled, otherwise through `torch_memory_saver`.
-        #
-        # KV cache management is handled as follows (controlled by `--rl-kv-cache-management-mode`):
-        #  - The context initially allocates the KV cache, either with or without UVM.
-        #    ** This is controlled by `--inference-dynamic-batching-unified-memory-level`.
-        #  - When RL is finished with inference, it suspends the engine.
-        #    ** With `--rl-partial-rollouts`, it expects the engine to freeze its state.
-        #  - Suspending the engine makes the context handle the KV cache according to the mode:
-        #    ** "offload": the KV cache is offloaded to CPU memory.
-        #    ** "recompute": the KV cache is deleted.
-        #    ** "persist": no-op, leaving the KV cache as-is.
-        #  - When RL is finished with training, it resumes the engine.
-        #    ** With `--rl-partial-rollouts`, it expects the engine to resume its state.
-        #  - Resuming the engine makes the context restore/rebuild the KV cache:
-        #    ** "offload": the KV cache is reloaded from CPU memory.
-        #    ** "recompute": the KV cache is reallocated and recomputed from scratch.
-        #    ** "persist": no-op, leaving the KV cache as-is.
-        #  - The engine proceeds to recompute the KV cache of any requests marked for recompute.
-        #    ** If using both partial rollouts and KV cache recompute, all requests must be marked.
-        # ------------------------------------------------
+        # We currently cannot recapture CGs in offload mode.
+        assert not(
+            not args.rl_persist_cuda_graphs and args.rl_kv_cache_management_mode == "offload"
+        ), "Cannot recpature CUDA graphs while offloading KV cache."
 
         # Validate inference model offloading - requires either UVM or torch_memory_saver
         if args.rl_offload_inference_model_weights_when_idle:
