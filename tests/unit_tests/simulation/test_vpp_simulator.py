@@ -18,6 +18,10 @@ from unittest.mock import MagicMock
 from megatron.training.simulation.vpp_simulate import VppSimulator
 from megatron.training.simulation.task import TaskType
 from megatron.training.global_vars import set_args
+from megatron.core.num_microbatches_calculator import (
+    init_num_microbatches_calculator,
+    destroy_num_microbatches_calculator
+)
 from tests.unit_tests.test_utilities import Utils
 
 
@@ -34,6 +38,7 @@ class TestVppSimulatorBasic:
         )
         yield
         # Teardown: Clean up
+        destroy_num_microbatches_calculator()
         Utils.destroy_model_parallel()
 
     @pytest.fixture
@@ -220,11 +225,16 @@ class TestVppSimulatorBasic:
         mock_args.virtual_pipeline_model_parallel_size = vpp_size
         mock_args.global_batch_size = num_microbatches * mock_args.micro_batch_size
 
-        # 2. Set global args using set_args() and mock get_num_microbatches
+        # 2. Set global args and initialize num_microbatches_calculator
         set_args(mock_args)
-        monkeypatch.setattr(
-            'megatron.core.num_microbatches_calculator.get_num_microbatches',
-            lambda: num_microbatches
+        # Destroy any existing calculator first
+        destroy_num_microbatches_calculator()
+        init_num_microbatches_calculator(
+            rank=0,
+            rampup_batch_size=None,
+            global_batch_size=mock_args.global_batch_size,
+            micro_batch_size=mock_args.micro_batch_size,
+            data_parallel_size=mock_args.data_parallel_size
         )
 
         # 3. Create VppSimulator
