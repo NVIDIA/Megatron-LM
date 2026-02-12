@@ -99,9 +99,16 @@ class TestVppSimulatorBasic:
     @pytest.fixture
     def simple_model_provider(self):
         """Simple model provider returning minimal test model"""
-        def provider(pre_process=True, post_process=True):
+        def provider(pre_process=True, post_process=True, **kwargs):
             """
             Model provider function for testing
+
+            Accepts all standard model_provider arguments:
+            - pre_process, post_process: bool flags
+            - config: TransformerConfig (optional)
+            - pg_collection: ProcessGroupCollection (optional)
+            - vp_stage: int (optional, for VPP)
+
             Returns a list of models (VPP format)
             """
             class SimpleTestModel(torch.nn.Module):
@@ -113,8 +120,8 @@ class TestVppSimulatorBasic:
                 def forward(self, hidden_states):
                     return self.linear(hidden_states)
 
-            # Return single-element list (VPP format)
-            return [SimpleTestModel()]
+            # Return single model object (get_model will wrap in list if needed for VPP)
+            return SimpleTestModel()
 
         return provider
 
