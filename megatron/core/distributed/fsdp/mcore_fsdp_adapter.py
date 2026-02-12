@@ -72,8 +72,7 @@ class FullyShardedDataParallel(_BaseDataParallel):
         fsdp_unit_modules: Optional[List[torch.nn.Module]] = None,
         main_params_dtype: Optional[torch.dtype] = torch.float32,
         main_grads_dtype: Optional[torch.dtype] = torch.float32,
-        grad_comm_dtype: Optional[torch.dtype] = torch.bfloat16,
-        grad_accum_dtype: Optional[torch.dtype] = torch.float32,
+        grad_comm_dtype: Optional[torch.dtype] = torch.float32,
         disable_bucketing: bool = False,
         device: Optional[torch.device] = None,
         pg_collection: Optional[ProcessGroupCollection] = None,
@@ -92,9 +91,9 @@ class FullyShardedDataParallel(_BaseDataParallel):
         )
         self.mp_policy = MixedPrecisionPolicy(
             main_params_dtype=main_params_dtype,
+            # Grandfathered Argument: grad_reduce_in_fp32
             main_grads_dtype=torch.float32 if ddp_config.grad_reduce_in_fp32 else main_grads_dtype,
             grad_comm_dtype=grad_comm_dtype,
-            grad_accum_dtype=torch.float32 if ddp_config.grad_reduce_in_fp32 else grad_accum_dtype,
         )
         log_single_rank(
             logger,
