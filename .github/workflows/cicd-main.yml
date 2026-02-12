@@ -193,7 +193,10 @@ jobs:
     needs: [is-not-external-contributor, pre-flight, cicd-wait-in-queue]
     runs-on: ${{ needs.is-not-external-contributor.outputs.selected_runner }}
     if: |
-      (
+      needs.is-not-external-contributor.result != 'cancelled'
+      && needs.pre-flight.result != 'cancelled'
+      && needs.cicd-wait-in-queue.result != 'cancelled'
+      && (
         success()
         || needs.pre-flight.outputs.is_ci_workload == 'true'
         || needs.pre-flight.outputs.is_merge_group == 'true'
@@ -334,7 +337,10 @@ jobs:
       - cicd-wait-in-queue
       - cicd-container-build
     if: |
-      (
+      needs.pre-flight.result != 'cancelled'
+      && needs.cicd-wait-in-queue.result != 'cancelled'
+      && needs.cicd-container-build.result != 'cancelled'
+      && (
         success()
         || needs.pre-flight.outputs.is_ci_workload == 'true'
         || needs.pre-flight.outputs.force_run_all == 'true'
@@ -365,7 +371,12 @@ jobs:
     timeout-minutes: 60
     name: "${{ matrix.bucket }} - latest"
     if: |
-      (
+      needs.is-not-external-contributor.result != 'cancelled'
+      && needs.pre-flight.result != 'cancelled'
+      && needs.cicd-wait-in-queue.result != 'cancelled'
+      && needs.cicd-container-build.result != 'cancelled'
+      && needs.cicd-parse-unit-tests.result != 'cancelled'
+      && (
         success()
         || needs.pre-flight.outputs.is_ci_workload == 'true'
         || needs.pre-flight.outputs.force_run_all == 'true'
@@ -398,7 +409,11 @@ jobs:
       - cicd-container-build
       - cicd-unit-tests-latest
     if: |
-      (
+      needs.pre-flight.result != 'cancelled'
+      && needs.cicd-wait-in-queue.result != 'cancelled'
+      && needs.cicd-container-build.result != 'cancelled'
+      && needs.cicd-unit-tests-latest.result != 'cancelled'
+      && (
         success()
         || needs.pre-flight.outputs.is_ci_workload == 'true'
         || needs.pre-flight.outputs.force_run_all == 'true'
@@ -499,7 +514,12 @@ jobs:
       PIP_NO_PYTHON_VERSION_WARNING: 1
       PIP_ROOT_USER_ACTION: ignore
     if: |
-      (
+      needs.is-not-external-contributor.result != 'cancelled'
+      && needs.pre-flight.result != 'cancelled'
+      && needs.cicd-wait-in-queue.result != 'cancelled'
+      && needs.cicd-parse-integration-tests.result != 'cancelled'
+      && needs.cicd-unit-tests-latest.result != 'cancelled'
+      && (
         success()
         || needs.pre-flight.outputs.is_ci_workload == 'true'
         || needs.pre-flight.outputs.force_run_all == 'true'
