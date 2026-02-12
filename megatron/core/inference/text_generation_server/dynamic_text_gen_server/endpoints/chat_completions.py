@@ -3,8 +3,10 @@
 import asyncio
 import logging
 import time
+import traceback
 
 from megatron.core.inference.sampling_params import SamplingParams
+from megatron.core.tokenizers.text.parsers import PARSER_MAPPING
 
 logger = logging.getLogger(__name__)
 
@@ -19,6 +21,7 @@ try:
         """Handles async POST requests for chat completions."""
         client = current_app.config['client']
         tokenizer = current_app.config['tokenizer']
+        parsers = current_app.config['parsers']
 
         req = request.get_json()
 
@@ -31,14 +34,17 @@ try:
 
         try:
             prompt_tokens = tokenizer.apply_chat_template(
-                messages, tokenize=True, add_generation_prompt=True
+                messages, tokenize=True, add_generation_prompt=True, tools=req.get("tools", None)
             )
-        except AttributeError:
-            return (
-                "Tokenizer does not support 'apply_chat_template'. "
-                "Chat completions requires a tokenizer with a configured chat template."
-            ), 500
+        except (AttributeError, AssertionError):
+            logger.warning(
+                "Tokenizer does not support 'apply_chat_template'. Using tokenize instead."
+            )
+            prompt_tokens = tokenizer.tokenize(
+                "\n".join([message["content"] for message in messages])
+            )
         except Exception as e:
+            logger.error(f"{traceback.format_exc()}")
             return f"Error processing 'messages': {e}", 500
 
         # --- 2. Parse Sampling Params ---
@@ -62,7 +68,12 @@ try:
                 top_p=top_p,
                 return_log_probs=return_log_probs,
                 top_n_logprobs=top_n_logprobs,
-                num_tokens_to_generate=int(req.get("max_tokens", 16)),
+                num_tokens_to_generate=(
+                    int(max_tokens)
+                    if ((max_tokens := req.get("max_tokens", None)) is not None)
+                    else None
+                ),
+                skip_prompt_log_probs=True,
             )
         except ValueError as e:
             return f"Invalid sampling parameter: {e}", 400
@@ -71,20 +82,13 @@ try:
         # For chat, we run the *same* prompt 'n' times.
         tasks = []
         for _ in range(n):
-            per_req_params = SamplingParams(
-                temperature=sampling_params.temperature,
-                top_k=sampling_params.top_k,
-                top_p=sampling_params.top_p,
-                return_log_probs=sampling_params.return_log_probs,
-                top_n_logprobs=sampling_params.top_n_logprobs,
-                num_tokens_to_generate=sampling_params.num_tokens_to_generate,
-            )
-            tasks.append(client.add_request(prompt_tokens, per_req_params))
+            tasks.append(client.add_request(prompt_tokens, sampling_params))
 
         start_time = time.perf_counter()
         try:
             batch_results = await asyncio.gather(*tasks)
         except Exception as e:
+            logger.error(f"Error during inference: {e}")
             return f"Error during inference: {e}", 500
 
         logger.info(
@@ -134,12 +138,37 @@ try:
                     }
                     logprobs_content.append(entry)
 
+            metadata = {}
+            message_text = text_output
+            if parsers:
+                for parser in parsers:
+                    if parser not in PARSER_MAPPING:
+                        raise ValueError(f"Parser {parser} not found in PARSER_MAPPING")
+                    message_text, new_info = PARSER_MAPPING[parser].parse(
+                        message_text, tools=req.get("tools", None)
+                    )
+                    assert not (
+                        metadata.keys() & new_info.keys()
+                    ), "Multiple parsers found the same information."
+                    metadata.update(new_info)
+            message = {"role": "assistant", "content": message_text}
+            if "tool_calls" in metadata:
+                message["tool_calls"] = metadata["tool_calls"]
+            if "reasoning" in metadata:
+                message["reasoning"] = metadata["reasoning"]
+
             choice_data = {
-                "index": 0,
-                "message": {"role": "assistant", "content": text_output},
+                "index": request_idx,
+                "message": message,
+                "prompt_token_ids": prompt_tokens,
+                "generation_token_ids": result.generated_tokens,
+                "generation_log_probs": result.generated_log_probs,
+                "raw_text": result.prompt + result.generated_text,
                 # 'logprobs' in chat API is an object containing 'content'
                 "logprobs": {"content": logprobs_content} if logprobs_content else None,
-                "finish_reason": "length",  # Original code hardcoded this.
+                "finish_reason": (
+                    "tool_calls" if metadata.get("tool_calls", []) else "stop"
+                ),  # Original code hardcoded this.
             }
             logging.info(result)
             if result.routing_indices is not None:
