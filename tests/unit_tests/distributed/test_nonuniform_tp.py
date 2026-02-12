@@ -408,8 +408,17 @@ class TestNonuniformTPEndToEnd:
             non_active_ranks_per_dp={(0, 0, 0): [2, 3]},  # DP=0: GPUs 2,3 are spares
         )
 
+        # Check if this rank is a spare (will exit during initialization)
+        # Spare ranks: DP=0 with tp_rank=2,3
+        is_spare = dp_rank == 0 and tp_rank in [2, 3]
+
         # Reconfigure process groups for NTP
+        # Note: spare ranks will call sys.exit(0) in initialize_nonuniform_tp_process_groups
         from megatron.core.distributed.nonuniform_tp import initialize_nonuniform_tp_process_groups
+
+        if is_spare:
+            # For spare ranks in test, just mark as passed and exit gracefully
+            pytest.skip(f"Rank {rank} is a spare rank, skipping test gracefully")
 
         initialize_nonuniform_tp_process_groups(ddp_config)
 
