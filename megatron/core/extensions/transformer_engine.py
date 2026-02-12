@@ -454,21 +454,23 @@ class TENorm:
             assert hasattr(
                 te.pytorch, "RMSNorm"
             ), "Transformer-Engine >= v0.11 required to use this feature"
-            instance = te.pytorch.RMSNorm(
-                hidden_size=hidden_size,
-                eps=eps,
-                sequence_parallel=config.sequence_parallel,
-                zero_centered_gamma=config.layernorm_zero_centered_gamma,
-                **_get_extra_te_kwargs(config),
-            )
-        elif config.normalization == "ResidualRMSNorm":
+            
             extra_te_kwargs = _get_extra_te_kwargs(config)
-            extra_te_kwargs["dtype"] = extra_te_kwargs["params_dtype"]
-            del extra_te_kwargs["params_dtype"]
-            instance = te.pytorch.ops.Sequential(
-                te.pytorch.ops.MakeExtraOutput(),
-                te.pytorch.ops.RMSNorm(normalized_shape=hidden_size, eps=eps, zero_centered_gamma=config.layernorm_zero_centered_gamma, **extra_te_kwargs),
-            )
+            if config.fused_residual_rmsnorm:
+                extra_te_kwargs["dtype"] = extra_te_kwargs["params_dtype"]
+                del extra_te_kwargs["params_dtype"]
+                instance = te.pytorch.ops.Sequential(
+                    te.pytorch.ops.MakeExtraOutput(),
+                    te.pytorch.ops.RMSNorm(normalized_shape=hidden_size, eps=eps, zero_centered_gamma=config.layernorm_zero_centered_gamma, **extra_te_kwargs),
+                )
+            else:
+                instance = te.pytorch.RMSNorm(
+                    hidden_size=hidden_size,
+                    eps=eps,
+                    sequence_parallel=config.sequence_parallel,
+                    zero_centered_gamma=config.layernorm_zero_centered_gamma,
+                    **extra_te_kwargs,
+                )
         else:
             raise Exception("Only LayerNorm, RMSNorm and ResidualRMSNorm are curently supported")
 
