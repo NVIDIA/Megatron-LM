@@ -27,7 +27,6 @@ from megatron.core.transformer.transformer_layer import (
     get_transformer_layer_offset,
 )
 from megatron.core.transformer.utils import sharded_state_dict_default
-from megatron.core.typed_torch import not_none
 from megatron.core.utils import (
     WrappedTensor,
     deprecate_inference_params,
