@@ -63,7 +63,14 @@ Download = "https://github.com/NVIDIA/Megatron-LM/releases"
 Homepage = "https://github.com/NVIDIA/Megatron-LM"
 
 [project.optional-dependencies]
-mlm = ["flask-restful", "sentencepiece", "tiktoken", "wandb", "transformers", "accelerate"]
+mlm = [
+    "flask-restful",
+    "sentencepiece",
+    "tiktoken",
+    "wandb",
+    "transformers",
+    "accelerate",
+]
 
 dev = [
     "nvidia-modelopt[torch]; sys_platform != 'darwin'",
@@ -87,6 +94,9 @@ dev = [
     "fastapi~=0.50",                                          # Forcing a little bit more recent version of fastapi to be compatible with pydantic 2.0
     "datasets",
     "emerging_optimizers",
+    "flask[async]",
+    "hypercorn",
+    "openai",
 ]
 
 lts = [
@@ -178,7 +188,7 @@ override-dependencies = [
 flash_mla = [
     { git = "https://github.com/deepseek-ai/FlashMLA", rev = "9edee0c022cd0938148a18e334203b0aab43aa19" },
 ]
-transformer-engine = { git = "https://github.com/NVIDIA/TransformerEngine.git", rev = "d9b7fc5770a88af06e2e9c2bd97b550614c3a69f" }
+transformer-engine = { git = "https://github.com/NVIDIA/TransformerEngine.git", rev = "5671fd3675906cda1ade26c24a65d3dedd88eb89" }
 nemo-run = { git = "https://github.com/NVIDIA-NeMo/Run.git", rev = "01a9a8ba360f7b2908728ad0516e0ad9d936966d" }
 emerging_optimizers = { git = "https://github.com/NVIDIA-NeMo/Emerging-Optimizers.git", rev = "v0.1.0" }
 
