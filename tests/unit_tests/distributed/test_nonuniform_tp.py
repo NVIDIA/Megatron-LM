@@ -335,7 +335,7 @@ class TestNonuniformTPIntegration:
         param = torch.nn.Parameter(torch.randn(10, 10))
         param.tensor_model_parallel = True
         param.partition_dim = 1
-        param.shape = (10, 10)
+        # Note: param.shape is already (10, 10) from the tensor, no need to set it
         param.side_grad = torch.randn(10, 2)
         param.recv_splits = [[0] * 8 for _ in range(8)]
 
