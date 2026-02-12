@@ -9,9 +9,7 @@ import torch
 
 from megatron.core import parallel_state
 from megatron.core.datasets.data_schedule import (
-    PackingScheduler,
     get_batch_on_this_rank_for_sequence_packing,
-    scheduler_map,
     wrap_data_iterator,
 )
 from megatron.core.rerun_state_machine import RerunDataIterator
