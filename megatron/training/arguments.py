@@ -655,6 +655,8 @@ def validate_args(args, defaults={}):
             args.virtual_pipeline_model_parallel_size = (
                 hybrid_pipeline_segments // args.transformer_pipeline_model_parallel_size
             )
+        else:
+            args.virtual_pipeline_model_parallel_size = None
 
     # Infer mtp_num_layers from unified pattern
     if args.hybrid_layer_pattern and sep in args.hybrid_layer_pattern:
