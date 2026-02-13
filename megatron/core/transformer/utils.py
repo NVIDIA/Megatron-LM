@@ -451,11 +451,10 @@ def toggle_cuda_graphs(model, set_to="none", reset_cuda_graphs=True):
 def transition_moe_to_partial_cudagraphs(model):
     """Switch MoE layers to partial CUDA graph capture for training.
 
-    Sets ``use_partial_cudagraphs = True`` on every ``MoETransformerLayer`` so
-    that ``_should_call_local_cudagraph`` returns False and the full
-    ``cudagraph_manager`` is bypassed.  Router and postprocess managers are
-    created lazily on the first call; subsequent calls only flip the flag,
-    preserving any previously recorded graphs.
+    Sets `use_partial_cudagraphs = True` on every `MoETransformerLayer` so that
+    `_should_call_local_cudagraph` returns False and the full-layer `cudagraph_manager` is bypassed.
+    Router and postprocess cudagraph managers are still created lazily on the first call; subsequent
+    calls only flip the flag, reusing previously recorded graphs.
     """
     from megatron.core.transformer.cuda_graphs import CudaGraphManager
     from megatron.core.transformer.transformer_layer import MoETransformerLayer
@@ -479,12 +478,11 @@ def transition_moe_to_partial_cudagraphs(model):
 
 
 def transition_moe_to_full_cudagraphs(model):
-    """Switch MoE layers to full CUDA graph capture for inference.
+    """Switch MoE layers to full-layer cudagraph capture for inference.
 
-    Sets ``use_partial_cudagraphs = False`` on every ``MoETransformerLayer`` so
-    that the full ``cudagraph_manager`` intercepts the forward call again.
-    Partial managers and their recorded graphs are left intact for reuse in
-    the next training phase.
+    Sets `use_partial_cudagraphs = False` on every `MoETransformerLayer` so that the full-layer
+    `cudagraph_manager` intercepts the forward call again. Partial managers and their recorded
+    graphs are cached for reuse when transitioning back to next training phase.
     """
     from megatron.core.transformer.transformer_layer import MoETransformerLayer
 
@@ -497,7 +495,7 @@ def transition_moe_to_full_cudagraphs(model):
             module.mlp.fwd_execution_map = ["route", "expert_compute", "postprocess"]
             assert hasattr(module, 'cudagraph_manager'), (
                 "MoETransformerLayer missing full cudagraph_manager; "
-                "expected it to be created at __init__ with scope=[]"
+                "expected it to be created at __init__ with scope = [] "
             )
 
 

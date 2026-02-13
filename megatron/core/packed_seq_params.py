@@ -25,8 +25,8 @@ class PackedSeqParams:
 
     def __post_init__(self):
         # Pre-compute seq_idx for Mamba mixer CUDA graph compatibility.
-        # Stored as a non-field attribute so dataclasses.fields() won't include it,
-        # preventing it from being forwarded to TE attention.
+        # Stored as a non-field attribute so dataclasses.fields() won't include it, preventing it
+        # from being forwarded to TE attention.
         cu_seqlens = (
             self.cu_seqlens_q_padded if self.cu_seqlens_q_padded is not None
             else self.cu_seqlens_q
