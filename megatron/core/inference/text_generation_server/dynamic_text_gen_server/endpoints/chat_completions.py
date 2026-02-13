@@ -64,6 +64,15 @@ try:
             skip_prompt_log_probs = bool(req.get("skip_prompt_log_probs", False))
             add_BOS = bool(req.get("add_BOS", False))
 
+            # The engine only handles add_BOS for string prompts, not pre-tokenized
+            # input. Since we pre-tokenize via apply_chat_template, we must handle
+            # BOS ourselves, matching the logic in tokenize_prompt().
+            if hasattr(tokenizer, 'bos') and tokenizer.bos is not None:
+                while prompt_tokens and prompt_tokens[0] == tokenizer.bos:
+                    prompt_tokens.pop(0)
+                if add_BOS:
+                    prompt_tokens = [tokenizer.bos] + prompt_tokens
+
             sampling_params = SamplingParams(
                 temperature=temperature,
                 top_k=top_k,
