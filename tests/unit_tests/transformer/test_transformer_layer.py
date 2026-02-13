@@ -1,4 +1,4 @@
-# Copyright (c) 2023, NVIDIA CORPORATION. All rights reserved.
+# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
 
 import pytest
@@ -9,8 +9,8 @@ from megatron.core.dist_checkpointing.mapping import ShardedObject, ShardedTenso
 from megatron.core.inference.contexts import StaticInferenceContext
 from megatron.core.models.gpt.gpt_layer_specs import get_gpt_layer_with_transformer_engine_spec
 from megatron.core.tensor_parallel.random import (
-    model_parallel_cuda_manual_seed,
     MHCBlockRecomputeManager,
+    model_parallel_cuda_manual_seed,
 )
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.transformer.transformer_layer import (

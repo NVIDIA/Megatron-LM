@@ -21,7 +21,7 @@ if [[ -n "$CHANGED_FILES" ]]; then
    CMD="python ${SCRIPT_DIR}/check_copyright.py"
 
    # Add the files
-   CMD="$CMD --from-year 2019 $CHANGED_FILES"
+   CMD="$CMD $CHANGED_FILES"
 
    # Run the check
    eval $CMD

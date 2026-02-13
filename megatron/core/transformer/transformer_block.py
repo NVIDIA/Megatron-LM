@@ -1,4 +1,5 @@
-# Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+
 import logging
 from contextlib import nullcontext
 from dataclasses import dataclass
@@ -8,7 +9,6 @@ import torch
 from torch import Tensor
 
 from megatron.core import parallel_state, tensor_parallel
-from megatron.core.tensor_parallel.random import MHCBlockRecomputeManager
 from megatron.core.dist_checkpointing.mapping import ShardedStateDict
 from megatron.core.dist_checkpointing.utils import replace_prefix_for_sharding
 from megatron.core.enums import Fp8Recipe
@@ -19,11 +19,12 @@ from megatron.core.inference.contexts import BaseInferenceContext
 from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.core.pipeline_parallel.utils import is_vp_first_stage, is_vp_last_stage
 from megatron.core.process_groups_config import ProcessGroupCollection
+from megatron.core.tensor_parallel.random import MHCBlockRecomputeManager
 from megatron.core.transformer.enums import CudaGraphScope, LayerType
+from megatron.core.transformer.hyper_connection import HyperConnectionModule
 from megatron.core.transformer.module import GraphableMegatronModule, MegatronModule
 from megatron.core.transformer.spec_utils import ModuleSpec, build_module
 from megatron.core.transformer.transformer_config import TransformerConfig
-from megatron.core.transformer.hyper_connection import HyperConnectionModule
 from megatron.core.transformer.transformer_layer import (
     BaseTransformerLayer,
     get_transformer_layer_offset,
@@ -741,7 +742,7 @@ class TransformerBlock(GraphableMegatronModule, MegatronModule):
             outer_quantization_context = nullcontext()
 
         # Determine if MHC recompute should be used
-        # Only enable when: training mode AND hyper connections enabled AND recompute_hyper_connections is True
+        # Only enable when: training mode AND hyper connections AND recompute_hyper_connections
         use_mhc_recompute = (
             self.training
             and self.config.enable_hyper_connections
@@ -785,7 +786,7 @@ class TransformerBlock(GraphableMegatronModule, MegatronModule):
                     # Determine if this is the last layer in the current MHC recompute block
                     # A layer is last in recompute block if:
                     # 1. It's the final layer in the transformer block, OR
-                    # 2. mhc_recompute_layer_num is set and (l_no + 1) % mhc_recompute_layer_num == 0
+                    # 2. (l_no + 1) % mhc_recompute_layer_num == 0
                     is_last_in_transformer_block = l_no == num_layers - 1
                     is_last_in_recompute_block = is_last_in_transformer_block
                     if use_mhc_recompute and mhc_recompute_layer_num is not None:

@@ -1,4 +1,4 @@
-# Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
 # Parts of the code here are adapted from PyTorch
 # repo: https://github.com/pytorch/pytorch
@@ -717,6 +717,7 @@ class MHCBlockRecomputeManager:
         self.checkpoints = []
 
     def add_checkpoint(self, ckpt):
+        """Add a checkpoint to the manager."""
         if not isinstance(ckpt, CheckpointWithoutOutput):
             raise TypeError("Expected CheckpointWithoutOutput object")
         if ckpt.outputs is None:
@@ -724,7 +725,7 @@ class MHCBlockRecomputeManager:
         self.checkpoints.append(ckpt)
 
     def discard_all_outputs_and_register_unified_recompute(self, hook_tensor):
-        # Discard all checkpoint outputs to save memory
+        """Discard all checkpoint outputs to save memory and register unified recompute hook."""
         for ckpt in self.checkpoints:
             for output in ckpt.outputs:
                 output.untyped_storage().resize_(0)

@@ -1,12 +1,15 @@
-from typing import Tuple, Optional, TYPE_CHECKING
+# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+
 import math
+from typing import TYPE_CHECKING, Optional, Tuple
+
 import torch
 import torch.nn as nn
 from torch import Tensor
 
 from megatron.core.transformer.module import MegatronModule
 from megatron.core.transformer.transformer_config import TransformerConfig
-from megatron.core.utils import nvtx_decorator, nvtx_range_push, nvtx_range_pop
+from megatron.core.utils import nvtx_decorator, nvtx_range_pop, nvtx_range_push
 
 if TYPE_CHECKING:
     from megatron.core.tensor_parallel.random import MHCBlockRecomputeManager
@@ -623,8 +626,8 @@ class HyperConnectionModule(MegatronModule):
         Returns:
             output: [s, b, n*C] - final output
         """
-        from megatron.core.tensor_parallel.random import CheckpointWithoutOutput
         from megatron.core.fusions.fused_bias_dropout import get_bias_dropout_add
+        from megatron.core.tensor_parallel.random import CheckpointWithoutOutput
 
         # Get BDA function (captured via closure)
         bda_func = get_bias_dropout_add(training, fused)

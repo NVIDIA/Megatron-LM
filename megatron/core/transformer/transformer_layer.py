@@ -1,11 +1,11 @@
-# Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
 import functools
 import logging
 import warnings
 from abc import ABC
 from dataclasses import dataclass, field
-from typing import Any, Dict, Optional, Union, TYPE_CHECKING
+from typing import TYPE_CHECKING, Any, Dict, Optional, Union
 
 if TYPE_CHECKING:
     from megatron.core.tensor_parallel.random import MHCBlockRecomputeManager
@@ -544,8 +544,8 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
 
         Additional kwargs for MHC recompute:
             mhc_recompute_manager: Optional MHCBlockRecomputeManager for checkpoint management.
-            is_last_layer_in_recompute_block: If True, this layer is the last in its MHC recompute block.
-                The final MLP BDA will not be checkpointed and will register the unified recompute hook.
+            is_last_layer_in_recompute_block: If True, this layer is the last of recompute block.
+                Then he final MLP BDA will not be checkpointed.
         """
         # Remove 'dynamic_inference_decode_only' from kwargs if present
         # this is only used to uniquely identify decode and non-decode cuda graph
@@ -624,7 +624,7 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
         # Residual connection.
         residual = hidden_states
 
-        # Todo: implement an identity hyper connection class as a placeholder in TransformerLayerSubmodules
+        # Todo: implement an identity hyper connection class as a placeholder
         if self.config.enable_hyper_connections and self.do_self_attention_hyper_connection:
             nvtx_range_push(suffix="self_attention_hyper_connection")
             # hidden_states: [s, b, n * C] -> [s, b, C]
@@ -813,8 +813,8 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
                 Only used for MoE layers to exclude padding tokens from aux loss computations.
                 The MoELayer will internally transform this to [seq_length, bsz] format.
             mhc_recompute_manager: Optional MHCBlockRecomputeManager for checkpoint management.
-            is_last_layer_in_recompute_block: If True, this layer is the last in its MHC recompute block.
-                The final MLP BDA will not be checkpointed and will register the unified recompute hook.
+            is_last_layer_in_recompute_block: If True, this layer is the last of recompute block.
+                Then the final MLP BDA will not be checkpointed.
 
         Returns:
             output (Tensor): Transformed hidden states of shape [s, b, h].
@@ -978,8 +978,8 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
             mlp_output_with_bias (Tensor): Output tensor of the MLP layer with bias.
             residual (Tensor): Residual tensor.
             mhc_recompute_manager: Optional MHCBlockRecomputeManager for checkpoint management.
-            is_last_layer_in_recompute_block: If True, this layer is the last in its MHC recompute block.
-                The final MLP BDA will not be checkpointed and will register the unified recompute hook.
+            is_last_layer_in_recompute_block: If True, this layer is the last of recompute block.
+                Then the final MLP BDA will not be checkpointed.
 
         Returns:
             output (Tensor): Transformed hidden states of shape [s, b, h].
@@ -1062,8 +1062,8 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
             residual (Tensor): [s, b, n*C] - original residual (n-stream hidden states).
             mlp_hc_h_post (Tensor): [s, b, n] - expansion weights from hyper connection.
             mhc_recompute_manager: Optional MHCBlockRecomputeManager for checkpoint management.
-            is_last_layer_in_recompute_block: If True, this layer is the last in its MHC recompute block.
-                The final MLP BDA will not be checkpointed and will register the unified recompute hook.
+            is_last_layer_in_recompute_block: If True, this layer is the last of recompute block.
+                Then the final MLP BDA will not be checkpointed.
 
         Returns:
             output (Tensor): Transformed hidden states of shape [s, b, h].

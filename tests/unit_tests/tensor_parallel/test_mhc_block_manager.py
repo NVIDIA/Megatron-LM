@@ -1,13 +1,12 @@
-# Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
 import pytest
 import torch
 
 from megatron.core.tensor_parallel.random import (
     BlockLevelCheckpointManager,  # backward compat alias
-    CheckpointWithoutOutput,
-    MHCBlockRecomputeManager,
 )
+from megatron.core.tensor_parallel.random import CheckpointWithoutOutput, MHCBlockRecomputeManager
 from tests.unit_tests.test_utilities import Utils
 
 
