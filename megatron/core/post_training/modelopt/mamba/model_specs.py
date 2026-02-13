@@ -23,29 +23,29 @@ from megatron.core.transformer.transformer_layer import (
 def get_mamba_stack_modelopt_spec(
     local_core_attention: bool = False,
     remap_te_layernorm: bool = False,
-    use_full_te_spec: bool = False,
+    use_default_te_spec: bool = False,
 ) -> ModuleSpec:
     """Get the Mamba stack spec for ModelOpt PTQ and TensorRT-LLM export.
 
-    When use_full_te_spec=False (default), this is the native local spec with TENorm
+    When use_default_te_spec=False (default), this is the native local spec with TENorm
     from Transformer-Engine for the layernorm implementation (since FusedLayerNorm from
     apex has stopped supporting RMSNorm needed by llama). The remap_te_layernorm flag
     can be used to add sharded state_dict key remapping for TE-compatible checkpoint
     saving/loading.
 
-    When use_full_te_spec=True, this returns the standard mamba_stack_spec from
+    When use_default_te_spec=True, this returns the standard mamba_stack_spec from
     mamba_layer_specs.py which uses full TE modules (TELayerNormColumnParallelLinear,
     TERowParallelLinear, TEDotProductAttention, TENorm, moe_grouped_gemm=True).
 
 
     Args:
         local_core_attention: whether to use local DotProductAttention
-            (only for use_full_te_spec=False)
+            (only for use_default_te_spec=False)
         remap_te_layernorm: whether to perform sharded state_dict prefix mapping
-            on layernorm (only for use_full_te_spec=False)
-        use_full_te_spec: whether to use the full Transformer-Engine spec
+            on layernorm (only for use_default_te_spec=False)
+        use_default_te_spec: whether to use the default Transformer-Engine spec
     """
-    if use_full_te_spec:
+    if use_default_te_spec:
         from megatron.core.models.mamba.mamba_layer_specs import mamba_stack_spec
 
         return mamba_stack_spec

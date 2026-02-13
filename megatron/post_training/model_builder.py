@@ -259,9 +259,15 @@ def modelopt_gpt_mamba_builder(
     elif args.export_model_type == "MambaModel" or args.is_hybrid_model:
         from megatron.core.post_training.modelopt.mamba.model_specs import get_mamba_stack_modelopt_spec
 
+        assert not (args.export_te_mcore_model and args.export_default_te_spec), (
+            "--export-te-mcore-model and --export-default-te-spec are mutually exclusive. "
+            "Use --export-te-mcore-model for local spec with TE layernorm remapping, "
+            "or --export-default-te-spec for the full TE spec."
+        )
+
         mamba_stack_spec = get_mamba_stack_modelopt_spec(
             remap_te_layernorm=args.export_te_mcore_model,
-            use_full_te_spec=args.full_te_spec,
+            use_default_te_spec=args.export_default_te_spec,
         )
         model_kwargs = {
             "mamba_stack_spec": mamba_stack_spec,

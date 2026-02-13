@@ -24,7 +24,7 @@ def add_modelopt_args(parser):
         help="Export a megatron-core transformer-engine checkpoint.",
     )
     group.add_argument(
-        "--full-te-spec",
+        "--export-default-te-spec",
         action="store_true",
         help="Use the full Transformer-Engine layer spec for model building. "
         "This builds the model with TELayerNormColumnParallelLinear, TERowParallelLinear, "
