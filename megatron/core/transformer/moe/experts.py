@@ -1,41 +1,26 @@
 # Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 from __future__ import annotations
 
-import copy
 import logging
 from collections.abc import Callable
 from copy import deepcopy
 from dataclasses import dataclass
-from functools import partial
 from math import ceil
 from typing import Optional, Protocol, Tuple
 
 import torch
 import torch.nn.functional as F
-from torch.nn.parameter import Parameter
 
 from megatron.core import tensor_parallel
 from megatron.core.activations import squared_relu
-from megatron.core.dist_checkpointing import ShardedTensor
-from megatron.core.dist_checkpointing.mapping import (
-    LocalNonpersistentObject,
-    ReplicaId,
-    ShardedStateDict,
-    ShardedTensorFactory,
-)
+from megatron.core.dist_checkpointing.mapping import ShardedStateDict
 from megatron.core.dist_checkpointing.utils import replace_prefix_for_sharding
 from megatron.core.fusions.fused_bias_geglu import quick_gelu, weighted_bias_quick_geglu_impl
 from megatron.core.fusions.fused_bias_swiglu import weighted_bias_swiglu_impl
 from megatron.core.fusions.fused_weighted_squared_relu import weighted_squared_relu_impl
-from megatron.core.jit import jit_fuser
 from megatron.core.pipeline_parallel.fine_grained_activation_offload import (
     FineGrainedActivationOffloadingInterface as off_interface,
 )
-from megatron.core.tensor_parallel.layers import (
-    _initialize_affine_weight_cpu,
-    _initialize_affine_weight_gpu,
-)
-from megatron.core.tensor_parallel.utils import divide
 from megatron.core.transformer.mlp import (
     MLP,
     MLPSubmodules,
@@ -43,7 +28,6 @@ from megatron.core.transformer.mlp import (
     apply_swiglu_sharded_factory,
 )
 from megatron.core.transformer.module import MegatronModule
-from megatron.core.transformer.moe import grouped_gemm_util as gg
 from megatron.core.transformer.moe.moe_utils import (
     ProcessGroupCollection,
     get_align_size_for_quantization,
@@ -51,7 +35,6 @@ from megatron.core.transformer.moe.moe_utils import (
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.transformer.utils import (
     ensure_metadata_has_dp_cp_group,
-    make_sharded_object_for_checkpoint,
     sharded_state_dict_default,
 )
 from megatron.core.typed_torch import apply_module, not_none
