@@ -1623,6 +1623,9 @@ class DynamicInferenceContext(BaseInferenceContext):
         )
 
         # Assign blocks: matched blocks first, then newly allocated blocks
+        # For new requests: matched blocks at [0:num_matched], new at [num_matched:...]
+        # For chunked continuations: already_allocated at [0:already], new at [already:...]
+        new_block_start = already_allocated_blocks + num_matched_blocks
         if num_matched_blocks > 0:
             matched_tensor = torch.tensor(
                 matched_block_ids, dtype=torch.int32, device=torch.cuda.current_device()
@@ -1630,7 +1633,7 @@ class DynamicInferenceContext(BaseInferenceContext):
             self.request_to_kv_block_ids[current_id][0:num_matched_blocks] = matched_tensor
         if new_block_ids is not None:
             self.request_to_kv_block_ids[current_id][
-                num_matched_blocks : num_matched_blocks + len(new_block_ids)
+                new_block_start : new_block_start + len(new_block_ids)
             ] = new_block_ids
 
         self.request_kv_length_offsets[current_id] = req.finished_chunk_token_count
