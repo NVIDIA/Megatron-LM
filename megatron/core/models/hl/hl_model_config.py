@@ -22,47 +22,26 @@ class HLModelConfig:
        If None, the default backend will be used.
     """
 
-    virtual_pipeline_model_parallel_size: int = 1
-    """Interleaved pipeline parallelism is used to improve performance by reducing the pipeline
+    pipeline_model_parallel_size: int = 1
+    """Inter-layer model parallelism. Splits transformer layers across GPU ranks. The number of
+       virtual pipeline model-parallel ranks is determined from the number of pipeline stages
+       specified in the `layer_pattern` and the pipeline model-parallel size (this value):
+       ```
+       virtual_pipeline_model_parallel_size = num_pipeline_stages / pipeline_model_parallel_size
+       ```
+
+       For example:
+       - When 8 pipeline stages are specified in the layer pattern (i.e., 7 `PipelineSplit`s are
+         present) and this is 2, there will be 4 virtual pipeline stages with 2 physical splits.
+       - When 8 pipeline stages are specified in the layer pattern (i.e., 7 `PipelineSplit`s are
+         present) and this is 8, there will be no virtual pipeline stages with 8 physical splits.
+
+       More information on virtual pipeline model-parallelism:
+       Interleaved pipeline parallelism is used to improve performance by reducing the pipeline
        bubble.  Considers a transformer block as a list of smaller transformer (virtual) blocks.
        The number of virtual blocks per pipeline model parallel rank is the virtual model parallel
        size.  See Efficient Large-Scale Language Model Training on GPU Clusters Using Megatron-LM:
        arxiv.org/pdf/2104.04473.pdf for more details.
-
-       For example:
-       - When 4 pipeline stages are specified in the layer pattern (i.e., 3 `PipelineSplit`s are
-         present) and this is set to 1 (default), there will be 4 physical pipeline stages with no
-         virtual blocks.
-       - When 4 pipeline stages are specified in the layer pattern (i.e., 3 `PipelineSplit`s are
-         present) and this is set to 2, there will be 4 physical pipeline stages with 2 virtual
-         blocks in each physical stage, resulting in 8 total pipeline stages.
-    """
-
-    context_parallel_size: int = 1
-    """Splits network input along sequence dimension across GPU ranks."""
-
-    hierarchical_context_parallel_sizes: list[int] | None = None
-    """Degrees of the hierarchical context parallelism. Users should provide a list to specify
-       the sizes for different levels. Taking the a2a+p2p cp comm type as example, it contains
-       groups of two levels, so the first value of the list indicates the group size of the a2a
-       communication type, and the second value indicates the group size of the p2p communication
-       type.
-    """
-
-    max_seqlen_per_dp_cp_rank: int | None = None
-    """
-    Maximum sequence length per DPxCP rank. This is the maximum sequence length each rank
-    can handle without overflowing the memory. Typically, a good starting point is to set this
-    to maximum sequence length / context parallel size.
-    This is used to calculate the number and length of sub-samples assigned to
-    each rank when using hybrid_context_parallel.
-    """
-
-    hybrid_context_parallel: bool = False
-    """
-    If true, enables hybrid context parallel. This is used to balance the workload of
-    each CP rank when we use packed samples with variable sequence lengths.
-    Please set max_seqlen_per_dp_cp_rank when using hybrid_context_parallel.
     """
 
     ###################
