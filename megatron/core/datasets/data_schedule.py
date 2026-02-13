@@ -5,11 +5,11 @@ from typing import Any, List, Optional
 import torch
 
 from megatron.core import parallel_state
-from megatron.core.pipeline_parallel.hybrid_cp_schedule import BalancedCPScheduler
+from megatron.core.pipeline_parallel.dynamic_cp_schedule import BalancedCPScheduler
 from megatron.core.process_groups_config import ProcessGroupCollection
 
 
-class HybridCPDataLoaderWrapper:
+class DynamicCPDataLoaderWrapper:
     """
     A wrapper class that wraps around an existing data_iterator.
     For every __next__ call,
@@ -40,7 +40,7 @@ class HybridCPDataLoaderWrapper:
             self.tp_group = pg_collection.tp
         assert (
             self.dp_cp_group is not None and self.dp_group is not None and self.tp_group is not None
-        ), "dp_cp_group, dp_group, tp_group must not be None when using hybrid context parallel"
+        ), "dp_cp_group, dp_group, tp_group must not be None when using dynamic context parallel"
 
         self.cp_balancing_scheduler = BalancedCPScheduler(
             max_seq_len_per_rank=self.config.max_seqlen_per_dp_cp_rank, dp_cp_group=self.dp_cp_group

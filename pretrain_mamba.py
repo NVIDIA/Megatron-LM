@@ -95,7 +95,7 @@ def get_batch(data_iterator, vp_stage=None):
     cu_seqlens = batch['cu_seqlens']
     # Unused at the moment
     cu_seqlens_padded = batch.pop('cu_seqlens_padded', None)
-    # Support for Hybrid Context Parallel (Unused in this script)
+    # Support for Dynamic Context Parallel (Unused in this script)
     local_cp_size = batch.pop('local_cp_size', None)
 
     if cu_seqlens is not None:
