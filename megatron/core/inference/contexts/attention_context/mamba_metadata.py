@@ -202,10 +202,21 @@ class MambaMetadata:
                     active_mamba_indices[start_idx : start_idx + regular_prefill_count]
                 )
 
-            if padded_prefill_count > regular_prefill_count:
-                self._batch_indices_prefill_buffer[regular_prefill_count:padded_prefill_count] = -1
-
-            self.batch_indices_prefill = self._batch_indices_prefill_buffer[:padded_prefill_count]
+            if has_chunked_prefill_req:
+                if regular_prefill_count > 0:
+                    self.batch_indices_prefill = self._batch_indices_prefill_buffer[
+                        :regular_prefill_count
+                    ]
+                else:
+                    self.batch_indices_prefill = None
+            else:
+                if padded_prefill_count > regular_prefill_count:
+                    self._batch_indices_prefill_buffer[
+                        regular_prefill_count:padded_prefill_count
+                    ] = -1
+                self.batch_indices_prefill = self._batch_indices_prefill_buffer[
+                    :padded_prefill_count
+                ]
 
             # Update seq_idx for regular prefills
             # If chunked prefill exists, we need to skip its tokens in seq_idx
@@ -225,19 +236,23 @@ class MambaMetadata:
             # The length of tokens belonging to regular prefill requests
             seq_len = end_regular_prefill_token_idx - start_regular_prefill_token_idx
 
-            if seq_len > 0:
-                # We subtract start_regular_prefill_req_idx to normalize request IDs to
-                # 0-based relative to this buffer
-                self._seq_idx_buffer[:, :seq_len].copy_(
-                    token_to_request_idx[
-                        start_regular_prefill_token_idx:end_regular_prefill_token_idx
-                    ]
-                    - start_regular_prefill_req_idx
-                )
+            # logic for seq_idx update
+            if has_chunked_prefill_req and regular_prefill_count == 0:
+                 self.seq_idx = None
+            else:
+                if seq_len > 0:
+                    # We subtract start_regular_prefill_req_idx to normalize request IDs to
+                    # 0-based relative to this buffer
+                    self._seq_idx_buffer[:, :seq_len].copy_(
+                        token_to_request_idx[
+                            start_regular_prefill_token_idx:end_regular_prefill_token_idx
+                        ]
+                        - start_regular_prefill_req_idx
+                    )
 
-            if padded_token_count > seq_len:
-                self._seq_idx_buffer[:, seq_len:padded_token_count] = -1
-            self.seq_idx = self._seq_idx_buffer[:, :padded_token_count]
+                if padded_token_count > seq_len:
+                    self._seq_idx_buffer[:, seq_len:padded_token_count] = -1
+                self.seq_idx = self._seq_idx_buffer[:, :padded_token_count]
 
             # Update cu_seqlens for regular prefill requests
             self._cu_seqlens_buffer[0] = 0
@@ -251,12 +266,18 @@ class MambaMetadata:
                     cu_seqlens[start_req_idx + 1 : end_req_idx + 1] - cu_seqlens[start_req_idx]
                 )
 
-            # Pad the rest with the last value (effectively length 0 segments)
-            last_val = self._cu_seqlens_buffer[regular_prefill_count]
-            self._cu_seqlens_buffer[regular_prefill_count + 1 : padded_prefill_count + 1].fill_(
-                last_val
-            )
-            self.cu_seqlens = self._cu_seqlens_buffer[: padded_prefill_count + 1]
+            if has_chunked_prefill_req:
+                if regular_prefill_count > 0:
+                    self.cu_seqlens = self._cu_seqlens_buffer[: regular_prefill_count + 1]
+                else:
+                    self.cu_seqlens = None
+            else:
+                # Pad the rest with the last value (effectively length 0 segments)
+                last_val = self._cu_seqlens_buffer[regular_prefill_count]
+                self._cu_seqlens_buffer[
+                    regular_prefill_count + 1 : padded_prefill_count + 1
+                ].fill_(last_val)
+                self.cu_seqlens = self._cu_seqlens_buffer[: padded_prefill_count + 1]
 
         if padded_decode_count > 0 and padded_prefill_count > 0:
             self._device_decode_prefill_buffer[0] = real_decode_count
