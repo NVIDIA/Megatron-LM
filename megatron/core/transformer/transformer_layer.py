@@ -1303,6 +1303,10 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
             "For inference cuda graph, please use cuda_graph_impl=local instead."
         )
 
+        # Remove non-tensor kwargs that are not compatible with CUDA graph replay.
+        kwargs.pop('mhc_recompute_manager', None)
+        kwargs.pop('is_last_layer_in_recompute_block', None)
+
         cuda_graph_output = list(super()._te_cuda_graph_replay(*args, **kwargs))
 
         if kwargs.get('context') is not None:
