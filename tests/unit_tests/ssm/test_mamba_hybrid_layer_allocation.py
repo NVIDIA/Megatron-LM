@@ -114,11 +114,7 @@ class TestParseHybridPattern:
 
     def test_main_pattern_with_pipes(self):
         """Test patterns with pipe separators (no MTP)."""
-        test_cases = [
-            ("M*|M*", "M*|M*"),
-            ("M-M-|M-M*-", "M-M-|M-M*-"),
-            ("M|M|M|M", "M|M|M|M"),
-        ]
+        test_cases = [("M*|M*", "M*|M*"), ("M-M-|M-M*-", "M-M-|M-M*-"), ("M|M|M|M", "M|M|M|M")]
         for pattern, expected_main in test_cases:
             result = parse_hybrid_pattern(pattern)
             assert result.main_pattern == expected_main, f"Failed for pattern: {pattern}"
@@ -310,12 +306,7 @@ class TestSelectPipelineSegment:
     def test_four_segments(self, mock_log):
         """Four segments, verify each vp_stage selects correctly."""
         pattern = "MM|M*|M-|ME"
-        expected = [
-            (['M', 'M'], 0),
-            (['M', '*'], 2),
-            (['M', '-'], 4),
-            (['M', 'E'], 6),
-        ]
+        expected = [(['M', 'M'], 0), (['M', '*'], 2), (['M', '-'], 4), (['M', 'E'], 6)]
         for vp_stage, (expected_layers, expected_offset) in enumerate(expected):
             layer_types, offset = select_pipeline_segment(pattern, pp_group=None, vp_stage=vp_stage)
             assert layer_types == expected_layers, f"Failed for vp_stage={vp_stage}"

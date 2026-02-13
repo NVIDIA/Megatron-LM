@@ -109,7 +109,8 @@ class MambaModel(LanguageModule):
         # Parse unified pattern to extract main and MTP components, and
         # determine the pipeline segment for this model instance.
         from megatron.core.ssm.mamba_hybrid_layer_allocation import (
-            parse_hybrid_pattern, select_pipeline_segment,
+            parse_hybrid_pattern,
+            select_pipeline_segment,
         )
 
         parsed = parse_hybrid_pattern(hybrid_layer_pattern)
@@ -117,7 +118,7 @@ class MambaModel(LanguageModule):
         self.mtp_num_depths = parsed.mtp_num_depths
 
         layer_type_list, layer_offset = select_pipeline_segment(
-            parsed.main_pattern or '', self.pg_collection.pp, vp_stage,
+            parsed.main_pattern or '', self.pg_collection.pp, vp_stage
         )
 
         # Determine if MTP is needed (based on pattern parsing)
