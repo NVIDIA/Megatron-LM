@@ -2,7 +2,7 @@
 import logging
 from contextlib import nullcontext
 from dataclasses import dataclass
-from typing import List, Optional, Union, cast
+from typing import List, Optional, Union
 
 import torch
 from torch import Tensor
@@ -28,7 +28,6 @@ from megatron.core.transformer.transformer_layer import (
     get_transformer_layer_offset,
 )
 from megatron.core.transformer.utils import sharded_state_dict_default
-from megatron.core.typed_torch import apply_module, not_none
 from megatron.core.utils import (
     WrappedTensor,
     deprecate_inference_params,
@@ -779,7 +778,16 @@ class TransformerBlock(GraphableMegatronModule, MegatronModule):
 
         # Final layer norm.
         if self.final_layernorm is not None:
-            hidden_states = apply_module(self.final_layernorm)(cast(Tensor, hidden_states))
+            hidden_states = self.final_layernorm(hidden_states)
+            if isinstance(hidden_states, tuple):
+                if len(hidden_states) != 2:
+                    raise ValueError(
+                        f"When the output of final_layernorm is a tuple, it is "
+                        f"expected to have 2 elements (output, residual), but "
+                        f"got {len(hidden_states)}"
+                    )
+                # For final layernorm, we only need the normalized output, not the residual
+                hidden_states = hidden_states[0]
             # TENorm produces a "viewed" tensor. This will result in schedule.py's
             # deallocate_output_tensor() throwing an error, so a viewless tensor is
             # created to prevent this.
