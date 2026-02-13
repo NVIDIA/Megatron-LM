@@ -84,7 +84,14 @@ class ChunkedPipelineParallelDataIterator:
         return slice_data
 
     def _get_span(self, seq_length: int) -> List[int]:
-        spans = [seq_length // self.chunked_pp_splits] * self.chunked_pp_splits
+        if self.config.chunked_pipeline_model_parallel_split_lengths is not None:
+            assert sum(self.config.chunked_pipeline_model_parallel_split_lengths) == seq_length, (
+                f"Sum of {self.config.chunked_pipeline_model_parallel_split_lengths=} "
+                f"must be equal to {seq_length=}."
+            )
+            spans = self.config.chunked_pipeline_model_parallel_split_lengths
+        else:
+            spans = [seq_length // self.chunked_pp_splits] * self.chunked_pp_splits
         return spans
 
     def mock_next(self, seq_length: int):

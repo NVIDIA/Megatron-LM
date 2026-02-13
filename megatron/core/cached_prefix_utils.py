@@ -20,6 +20,7 @@ class KVCachePool:
         self.config = config
         self.kv_cache_pool = {}
         self.block_prefixes = []
+        self.kv_cache_pool[tuple(self.block_prefixes)] = {}
 
     def block_range_push(self, suffix: str):
         """Push a block range onto the stack."""

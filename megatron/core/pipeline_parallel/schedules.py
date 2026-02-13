@@ -1118,7 +1118,6 @@ def forward_backward_pipelining_with_interleaving(
         input_tensors = [[] for _ in range(len(model))]
         output_tensors = [[] for _ in range(len(model))]
     else:
-        config.variable_seq_lengths = True
         input_tensors = [
             ChunkedPipelineParallelQueue(config.chunked_pipeline_model_parallel_splits)
             for _ in range(len(model))
@@ -2307,8 +2306,6 @@ def forward_backward_pipelining_without_interleaving(
 
     if not forward_only:
         if config.chunked_pipeline_model_parallel_splits > 1:
-            config.variable_seq_lengths = True
-            config.batch_p2p_comm = False
             input_tensors = ChunkedPipelineParallelQueue(
                 config.chunked_pipeline_model_parallel_splits
             )

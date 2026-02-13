@@ -2814,6 +2814,10 @@ def _add_distributed_args(parser):
                        help='Degree of pipeline model parallelism.')
     group.add_argument('--chunked-pipeline-model-parallel-splits', type=int, default=1,
                        help='Number of splits in chunked pipeline model parallel.')
+    group.add_argument('--chunked-pipeline-model-parallel-split-lengths', nargs='+', type=int, default=None,
+                       help='[Experimental] Custom chunk lengths for chunked pipeline model parallel.'
+                       'If not set, the chunk lengths will be evenly distributed across all splits.'
+                       'Note: This is an experimental flag and may change in the future.')
     group.add_argument('--moe-load-balancing-loss-mode-for-chunked-sequence', type=str, 
                        default="reduce",choices=["all_gather", "reduce"],
                        help='Mode for applying load balancing loss for chunked sequence in MoE layer.'

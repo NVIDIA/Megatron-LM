@@ -90,6 +90,11 @@ class TransformerConfig(ModelParallelConfig):
     chunked_pipeline_model_parallel_splits: int = 1
     """Number of chunked pipeline model parallel splits."""
 
+    chunked_pipeline_model_parallel_split_lengths: Optional[List[int]] = None
+    """[Experimental] Custom chunk lengths for chunked pipeline model parallel.
+    If not set, the chunk lengths will be evenly distributed across all splits.
+    Note: This is an experimental flag and may change in the future."""
+
     moe_load_balancing_loss_mode_for_chunked_sequence: str = "reduce"
     """
     Mode for applying load balancing loss for chunked sequence in MoE layer.
@@ -1365,6 +1370,21 @@ class TransformerConfig(ModelParallelConfig):
             self.mtp_standalone = self.pipeline_model_parallel_layout.validate_layer_layout(
                 num_layers=self.num_layers, mtp_num_layers=self.mtp_num_layers
             )
+
+        # Chunked PP
+        if self.chunked_pipeline_model_parallel_splits > 1:
+            if self.chunked_pipeline_model_parallel_split_lengths is not None:
+                assert (
+                    len(self.chunked_pipeline_model_parallel_split_lengths)
+                    == self.chunked_pipeline_model_parallel_splits
+                ), (
+                    f"{self.chunked_pipeline_model_parallel_split_lengths=} "
+                    f"must be a list of length {self.chunked_pipeline_model_parallel_splits}."
+                )
+            # The sequence lengths vary across chunks, so we need to disable
+            # batch P2P comm and enable variable sequence lengths.
+            self.batch_p2p_comm = False
+            self.variable_seq_lengths = True
 
         # Uneven PP
         elif (
