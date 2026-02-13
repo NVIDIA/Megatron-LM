@@ -37,6 +37,8 @@ class MegatronLocal(InferenceServer, ReturnsTokens, ReturnsRaw):
     async def base_generate(self, request: InferenceRequest) -> InferenceResponse:
 
         assert self._server_task is not None, "Inference server is not initialized"
+        tokenizer = get_tokenizer()
+        args = get_args()
 
         from openai import AsyncOpenAI
         client = AsyncOpenAI(base_url=f"http://{self.host}:{self.port}", api_key="NONE")
@@ -51,6 +53,8 @@ class MegatronLocal(InferenceServer, ReturnsTokens, ReturnsRaw):
             top_p=request.generation_args.top_p or 0.0,
             n=1,
             logprobs=True,
+            skip_prompt_logprobs=True,
+            add_BOS=(not args.rl_skip_bos_token and tokenizer.bos is not None),
         )
 
         choice = response.choices[0]
