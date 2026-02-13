@@ -661,8 +661,11 @@ def process_mtp_loss(
         mtp_loss = compute_language_model_loss(mtp_labels, mtp_logits)
         mtp_loss = loss_mask * mtp_loss
         if is_training:
+            mtp_loss_for_log = (
+                torch.sum(mtp_loss) / num_tokens if num_tokens > 0 else mtp_loss.new_tensor(0.0)
+            )
             MTPLossLoggingHelper.save_loss_to_tracker(
-                torch.sum(mtp_loss) / num_tokens,
+                mtp_loss_for_log,
                 mtp_layer_number,
                 config.mtp_num_layers,
                 avg_group=parallel_state.get_data_parallel_group(with_context_parallel=True),
@@ -671,8 +674,9 @@ def process_mtp_loss(
         if config.calculate_per_token_loss:
             hidden_states = MTPLossAutoScaler.apply(hidden_states, mtp_loss_scale * mtp_loss)
         else:
+            safe_num_tokens = num_tokens.clamp(min=1)
             hidden_states = MTPLossAutoScaler.apply(
-                hidden_states, mtp_loss_scale * mtp_loss / num_tokens
+                hidden_states, mtp_loss_scale * mtp_loss / safe_num_tokens
             )
 
     return hidden_states
