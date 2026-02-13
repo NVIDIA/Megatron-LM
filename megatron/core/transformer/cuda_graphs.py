@@ -1485,15 +1485,11 @@ class CudaGraphManager(torch.nn.Module):
 
             if runner is None:
                 if _CudagraphGlobalRecord.cudagraph_created:
-                    print(f"CURRENT MODULE: {megatron_module}")
-                    print(f"{[x.get_mismatch_errors(args, kwargs) for x in self.cudagraph_runners]}")
-                    '''
                     assert False, (
                         f"`cudagraph_created` is set to True but no matching cudagraph "
                         f"runners were found. This module has {len(self.cudagraph_runners)} "
                         f"existing runners. Use `get_mismatch_errors` to debug mismatches."
                     )
-                    '''
                 else:
                     runner = _CudaGraphRunner(
                         megatron_module,
