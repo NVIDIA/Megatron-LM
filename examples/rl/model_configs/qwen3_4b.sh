@@ -63,6 +63,8 @@ MODEL_OPTIONS="\
   --attention-softmax-in-fp32 \
   --tokenizer-type HuggingFaceTokenizer \
   --tokenizer-model Qwen/Qwen3-4B \
+  --langrl-inference-server-type "inplace_megatron_chat" \
+  --langrl-inference-server-conversation-template "Qwen/Qwen3-4B" \
   --vocab-size 151936 \
   --make-vocab-size-divisible-by 128 \
   --optimizer adam \

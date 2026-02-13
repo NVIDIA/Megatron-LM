@@ -33,6 +33,7 @@ import logging
 
 logging.basicConfig(level=logging.INFO, force=True)
 
+
 def _gpt_builder(args, pre_process, post_process, vp_stage=None, config=None, pg_collection=None):
     # TODO(Peter): This is a hack to get around the fact that we are activation recomputation for training but not
     # for inference with cuda graphs. Without out this the post checks in the transformer config will assert error.

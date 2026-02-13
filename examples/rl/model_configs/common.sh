@@ -22,7 +22,7 @@ COMMON_OPTIONS="\
     --attention-backend flash \
     --timing-log-level 1 \
     --log-timers-to-tensorboard \
-    --save-retain-interval 160 \
+    --save-retain-interval 120 \
     --inference-dynamic-batching-num-cuda-graphs 1 \
     --inference-dynamic-batching-unified-memory-level 1 \
     --adam-beta1 0.9 \
