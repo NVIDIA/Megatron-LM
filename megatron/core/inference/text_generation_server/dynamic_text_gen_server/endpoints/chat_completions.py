@@ -99,50 +99,59 @@ try:
 
         request_idx = 0
         for record in batch_results:
-            for result in record.requests:
-                text_output = result.generated_text
+            assert len(record.requests) == 1, "Each record should contain one request result."
+            result = record.merge()
+            text_output = result.generated_text
 
-                logprobs_content = None
-                if sampling_params.return_log_probs:
-                    token_logprobs = getattr(result, 'log_probs', [])
-                    tokens = [tokenizer.detokenize([tok]) for tok in result.generated_tokens]
+            logprobs_content = None
+            if sampling_params.return_log_probs:
+                token_logprobs = getattr(result, 'log_probs', [])
+                tokens = [tokenizer.detokenize([tok]) for tok in result.generated_tokens]
 
-                    # Get top_n_logprobs if available
-                    generated_top_n_logprobs = getattr(result, 'generated_top_n_logprobs', None)
+                # Get top_n_logprobs if available
+                generated_top_n_logprobs = getattr(result, 'generated_top_n_logprobs', None)
 
-                    logprobs_content = []
-                    for i, (tok, lp) in enumerate(zip(tokens, token_logprobs)):
-                        # Build top_logprobs list for this token position
-                        top_logprobs_list = []
-                        if generated_top_n_logprobs and i < len(generated_top_n_logprobs):
-                            top_n_dict = generated_top_n_logprobs[i]
-                            for token_str, logprob in top_n_dict.items():
-                                top_logprobs_list.append(
-                                    {
-                                        "token": token_str,
-                                        "logprob": logprob,
-                                        "bytes": list(token_str.encode("utf-8")),
-                                    }
-                                )
+                logprobs_content = []
+                for i, (tok, lp) in enumerate(zip(tokens, token_logprobs)):
+                    # Build top_logprobs list for this token position
+                    top_logprobs_list = []
+                    if generated_top_n_logprobs and i < len(generated_top_n_logprobs):
+                        top_n_dict = generated_top_n_logprobs[i]
+                        for token_str, logprob in top_n_dict.items():
+                            top_logprobs_list.append(
+                                {
+                                    "token": token_str,
+                                    "logprob": logprob,
+                                    "bytes": list(token_str.encode("utf-8")),
+                                }
+                            )
 
-                        entry = {
-                            "token": tok,
-                            "logprob": lp,
-                            "bytes": list(tok.encode("utf-8")),
-                            "top_logprobs": top_logprobs_list,
-                        }
-                        logprobs_content.append(entry)
+                    entry = {
+                        "token": tok,
+                        "logprob": lp,
+                        "bytes": list(tok.encode("utf-8")),
+                        "top_logprobs": top_logprobs_list,
+                    }
+                    logprobs_content.append(entry)
 
-                choice_data = {
-                    "index": 0,
-                    "message": {"role": "assistant", "content": text_output},
-                    # 'logprobs' in chat API is an object containing 'content'
-                    "logprobs": {"content": logprobs_content} if logprobs_content else None,
-                    "finish_reason": "length",  # Original code hardcoded this.
-                }
-                choices.append(choice_data)
-                total_completion_tokens += len(result.generated_tokens)
-                request_idx += 0
+            choice_data = {
+                "index": 0,
+                "message": {"role": "assistant", "content": text_output},
+                # 'logprobs' in chat API is an object containing 'content'
+                "logprobs": {"content": logprobs_content} if logprobs_content else None,
+                "finish_reason": "length",  # Original code hardcoded this.
+            }
+            logging.info(result)
+            if result.routing_indices is not None:
+                choice_data["moe_topk_indices"] = result.routing_indices.tolist()
+                prompt_length = len(result.prompt_tokens) if result.prompt_tokens is not None else 0
+                if prompt_length:
+                    choices[-1]["prompt_moe_topk_indices"] = result.routing_indices[
+                        :prompt_length
+                    ].tolist()
+            choices.append(choice_data)
+            total_completion_tokens += len(result.generated_tokens)
+            request_idx += 0
 
         response = {
             "choices": choices,

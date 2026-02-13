@@ -159,7 +159,9 @@ class InferenceRequest:
 class DynamicInferenceEventType(Enum):
     """Dynamic inference event type."""
 
-    ADD = auto()
+    ADD_ENGINE = auto()  # When request is added to engine via _add_request()
+    ADD_CONTEXT = auto()  # When request is added to context (scheduled for prefill)
+    GENERATED_TOKEN = auto()  # When an output token is generated (payload = {"token_id": int})
     PAUSE = auto()
     EVICT = auto()
     FINISH = auto()
@@ -202,22 +204,30 @@ class DynamicInferenceEvent:
             DynamicInferenceEventType.ERROR_NONTRANSIENT,
         ):
             assert self.payload is not None
+        elif self.type == DynamicInferenceEventType.GENERATED_TOKEN:
+            assert (
+                self.payload is not None
+                and isinstance(self.payload, dict)
+                and "token_id" in self.payload
+            )
         else:
             assert self.payload is None
 
     def __str__(self):
-        payload_str = "" if self.payload is None else f", {type(self.payload).__name__}"
+        if self.type == DynamicInferenceEventType.GENERATED_TOKEN:
+            payload_str = f", token={self.payload['token_id']}"
+        elif self.payload is None:
+            payload_str = ""
+        else:
+            payload_str = f", {type(self.payload).__name__}"
         return f"[{self.timestamp:.3f}] {self.type.name}{payload_str}"
 
     def serialize(self) -> dict:
         """Converts the instance into a serializable dictionary.
 
         Returns:
-            (dict) A dictionary representation of the instance suitable for
-                serialization.
+            dict: Full event dict.
         """
-
-        # Dataclass to dict.
         torch.cuda.nvtx.range_push("DynamicInferenceEvent.serialize")
         # do not use asdict(self) - it has very high CPU overheads
         # and if there are tensors, it will try to deepcopy them
@@ -225,10 +235,15 @@ class DynamicInferenceEvent:
         obj["type"] = self.type.name
 
         # Serialize payload.
-        if self.payload:
-            from .contexts.dynamic_context import ContextErrorFactory  # avoid circular import.
+        if self.payload is not None:
+            if self.type in (
+                DynamicInferenceEventType.ERROR_TRANSIENT,
+                DynamicInferenceEventType.ERROR_NONTRANSIENT,
+            ):
+                from .contexts.dynamic_context import ContextErrorFactory  # avoid circular import.
 
-            obj["payload"] = ContextErrorFactory.serialize(self.payload)
+                obj["payload"] = ContextErrorFactory.serialize(self.payload)
+
         torch.cuda.nvtx.range_pop()
         return obj
 
@@ -237,22 +252,25 @@ class DynamicInferenceEvent:
         """Deserialize event.
 
         Args:
-            obj (dict): Serialized event data.
+            obj: Serialized event data dict.
 
         Returns:
             (DynamicInferenceEvent) Deserialized event.
         """
+        event_type = DynamicInferenceEventType[obj["type"]]
 
-        # Initialize event.
-        event = cls(**{**obj, "type": DynamicInferenceEventType[obj["type"]]})
+        # Pre-process payload before construction (since __post_init__ validates types).
+        init_obj = {**obj, "type": event_type}
+        if obj["payload"] is not None:
+            if event_type in (
+                DynamicInferenceEventType.ERROR_TRANSIENT,
+                DynamicInferenceEventType.ERROR_NONTRANSIENT,
+            ):
+                from .contexts.dynamic_context import ContextErrorFactory  # avoid circular import.
 
-        # Deserialize payload.
-        if obj["payload"]:
-            from .contexts.dynamic_context import ContextErrorFactory  # avoid circular import.
+                init_obj["payload"] = ContextErrorFactory.deserialize(obj["payload"])
 
-            event.payload = ContextErrorFactory.deserialize(obj["payload"])
-
-        return event
+        return cls(**init_obj)
 
 
 @experimental_api
@@ -265,12 +283,14 @@ class DynamicInferenceRequest(InferenceRequest):
     """
 
     request_id: int
-    generated_tokens: List[int] = field(default_factory=list)
     prompt: Optional[str] = None
     prompt_tokens: Optional[torch.Tensor] = None
     # remaining prompt tokens are used for chunked prefill
     remaining_prompt_tokens: Optional[torch.Tensor] = None
     latency: Optional[float] = None
+    # routing_indices stores MoE routing decisions for all tokens generated so far.
+    # Shape: [total_tokens, num_layers, topk] - accumulated across all generation steps
+    routing_indices: Optional[torch.Tensor] = None
     finished_chunk_token_count: int = 0
     stop_word_ids: Optional[List[List[int]]] = None  # Tokenized stop words (populated internally)
 
@@ -286,7 +306,10 @@ class DynamicInferenceRequest(InferenceRequest):
         """
         return len(self.remaining_prompt_tokens)
 
+    ttft: Optional[float] = None
     events: List[DynamicInferenceEvent] = field(default_factory=list)
+    event_add_engine: Optional[DynamicInferenceEvent] = field(default=None, repr=False)
+    generated_tokens: List[int] = field(default_factory=list)
 
     def __str__(self):
         return ", ".join(
@@ -299,7 +322,7 @@ class DynamicInferenceRequest(InferenceRequest):
             )
         )
 
-    def serialize(self) -> dict:
+    def serialize(self):
         """Converts the instance into a serializable dictionary.
 
         Returns:
@@ -309,12 +332,24 @@ class DynamicInferenceRequest(InferenceRequest):
         torch.cuda.nvtx.range_push("DynamicInferenceRequest.serialize")
         obj = super().serialize()
         obj["events"] = [e.serialize() for e in self.events]
+        obj.pop("event_add_engine", None)
+
+        # Sanity check routing_indices: Tensor [total_tokens - 1, num_layers, topk]
+        if self.routing_indices is not None:
+            total_tokens = len(self.prompt_tokens) + len(self.generated_tokens)
+            # the last generated token does not undergo a forward pass
+            # hence we expect routing indices for total_tokens - 1
+            assert self.routing_indices.shape[0] == total_tokens - 1, (
+                f"routing_indices first dimension {self.routing_indices.shape[0]} does not match "
+                f"total tokens {total_tokens-1}."
+            )
+
         torch.cuda.nvtx.range_pop()
         return obj
 
     def _post_deserialize(self, obj):
         super()._post_deserialize(obj)
-        self.events = [DynamicInferenceEvent.deserialize(e) for e in obj["events"]]
+        self.events = [DynamicInferenceEvent.deserialize(e) for e in obj.get("events", [])]
 
     @property
     def tracked_metadata(self) -> List[Any]:
@@ -356,13 +391,30 @@ class DynamicInferenceRequest(InferenceRequest):
             ("top_n_logprobs", torch.int32, False),  # CPU for torch sampling
         ]
 
-    def add_event(self, type: DynamicInferenceEventType, payload: Optional[Any] = None) -> None:
+    def add_event(
+        self, type: DynamicInferenceEventType, payload: Optional[Any] = None
+    ) -> DynamicInferenceEvent:
         """Add event."""
-        self.events.append(DynamicInferenceEvent(type=type, payload=payload))
+        event = DynamicInferenceEvent(type=type, payload=payload)
+        self.events.append(event)
+        return event
 
-    def add_event_add(self):
-        """Add 'add' event."""
-        return self.add_event(DynamicInferenceEventType.ADD)
+    def add_event_add_engine(self):
+        """Add 'add_engine' event - called when request enters the engine queue."""
+        self.event_add_engine = self.add_event(DynamicInferenceEventType.ADD_ENGINE)
+        return self.event_add_engine
+
+    def add_event_add_context(self):
+        """Add 'add_context' event - called when request is added to context for prefill."""
+        return self.add_event(DynamicInferenceEventType.ADD_CONTEXT)
+
+    def add_event_generated_token(self, token: int):
+        """Add 'generated_token' event - records each generated token.
+
+        Args:
+            token (int): The token ID that was generated.
+        """
+        return self.add_event(DynamicInferenceEventType.GENERATED_TOKEN, {"token_id": token})
 
     def add_event_pause(self):
         """Add 'pause' event."""
@@ -499,6 +551,9 @@ class DynamicInferenceRequestRecord:
 
         prompt_tokens = self.requests[0].prompt_tokens
         prompt_text = self.requests[0].prompt
+        routing_indices = None
+        if self.requests[0].routing_indices is not None:
+            routing_indices = torch.cat([r.routing_indices for r in self.requests])
         generated_tokens = merge_lists("generated_tokens")
         try:
             generated_text = "".join(r.generated_text for r in self.requests)
@@ -518,10 +573,12 @@ class DynamicInferenceRequestRecord:
             generated_log_probs=merge_lists("generated_log_probs"),
             generated_top_n_logprobs=merge_lists("generated_top_n_logprobs"),
             sampling_params=self.requests[0].sampling_params,
+            ttft=self.requests[0].ttft,
             tpot=merge_lists("tpot"),
             status=self.requests[-1].status,
             latency=self.latency,
             events=merge_lists("events"),
+            routing_indices=routing_indices,
         )
 
         return request
