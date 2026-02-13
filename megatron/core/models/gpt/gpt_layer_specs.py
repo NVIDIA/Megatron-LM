@@ -349,9 +349,7 @@ def get_gpt_layer_local_spec(
         )
 
     mlp = get_mlp_module_spec_for_backend(
-        backend=backend,
-        num_experts=num_experts,
-        moe_grouped_gemm=moe_grouped_gemm,
+        backend=backend, num_experts=num_experts, moe_grouped_gemm=moe_grouped_gemm
     )
 
     if multi_latent_attention:
@@ -425,10 +423,7 @@ def _get_mlp_module_spec(
     )
 
     return get_mlp_module_spec(
-        use_te=use_te,
-        num_experts=num_experts,
-        moe_grouped_gemm=moe_grouped_gemm,
-        fp8=fp8,
+        use_te=use_te, num_experts=num_experts, moe_grouped_gemm=moe_grouped_gemm, fp8=fp8
     )
 
 

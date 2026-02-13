@@ -21,9 +21,7 @@ def get_moe_module_spec(
     else:
         backend = LocalSpecProvider()
     return get_moe_module_spec_for_backend(
-        backend=backend,
-        num_experts=num_experts,
-        moe_grouped_gemm=moe_grouped_gemm,
+        backend=backend, num_experts=num_experts, moe_grouped_gemm=moe_grouped_gemm
     )
 
 
@@ -45,7 +43,7 @@ def get_moe_module_spec_for_backend(
     )
 
     expert_module, expert_submodule = backend.grouped_mlp_modules(
-        moe_grouped_gemm is not None and moe_grouped_gemm,
+        moe_grouped_gemm is not None and moe_grouped_gemm
     )
     if expert_submodule is not None:
         expert_submodule.activation_func = activation_func

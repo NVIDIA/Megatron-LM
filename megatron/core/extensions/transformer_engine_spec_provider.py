@@ -71,10 +71,7 @@ class TESpecProvider(BackendSpecProvider):
         | tuple[type[SequentialMLP], MLPSubmodules]
     ):
         """Which module and submodules to use for grouped mlp"""
-        if (
-            moe_use_grouped_gemm
-            and TEColumnParallelGroupedLinear is not None
-        ):
+        if moe_use_grouped_gemm and TEColumnParallelGroupedLinear is not None:
             return TEGroupedMLP, TEGroupedMLPSubmodules(
                 linear_fc1=TEColumnParallelGroupedLinear, linear_fc2=TERowParallelGroupedLinear
             )
