@@ -21,6 +21,7 @@ from megatron.rl.rl_utils import (
     get_rl_runtime_state,
     load_packed_data_by_index,
 )
+from megatron.core.transformer.cuda_graphs import CudaGraphManager, _CudagraphGlobalRecord
 from megatron.training import get_args, get_timers, pretrain, print_rank_0
 from megatron.training.arguments import core_transformer_config_from_args
 from model_provider import model_provider
@@ -280,7 +281,6 @@ def forward_step(data_iterator, model: GPTModel, loss_only: bool = False):
         saved_impl = args.cuda_graph_impl
         model_to_use.config.cuda_graph_scope = []
         args.cuda_graph_impl = None
-        from megatron.core.transformer.cuda_graphs import CudaGraphManager, _CudagraphGlobalRecord
         _saved_cudagraph_created = _CudagraphGlobalRecord.cudagraph_created
         _CudagraphGlobalRecord.cudagraph_created = False
         logprobs_or_hidden_states = get_logprobs(
