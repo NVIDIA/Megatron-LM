@@ -101,9 +101,7 @@ def get_dsa_module_spec_for_backend(
     # Adjust for RMS norm.
     rms_norm = config.normalization == "RMSNorm"
     qk_norm = (
-        backend.layer_norm(rms_norm=rms_norm, for_qk=True)
-        if config.qk_layernorm
-        else IdentityOp
+        backend.layer_norm(rms_norm=rms_norm, for_qk=True) if config.qk_layernorm else IdentityOp
     )
 
     attention = ModuleSpec(
