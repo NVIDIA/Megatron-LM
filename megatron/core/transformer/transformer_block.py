@@ -779,9 +779,14 @@ class TransformerBlock(GraphableMegatronModule, MegatronModule):
         # Final layer norm.
         if self.final_layernorm is not None:
             hidden_states = self.final_layernorm(hidden_states)
-            # Handle fused residual normalization (returns tuple of (output, residual))
-            # For final layernorm, we only need the normalized output, not the residual
             if isinstance(hidden_states, tuple):
+                if len(hidden_states) != 2:
+                    raise ValueError(
+                        f"When the output of final_layernorm is a tuple, it is "
+                        f"expected to have 2 elements (output, residual), but "
+                        f"got {len(hidden_states)}"
+                    )
+                # For final layernorm, we only need the normalized output, not the residual
                 hidden_states = hidden_states[0]
             # TENorm produces a "viewed" tensor. This will result in schedule.py's
             # deallocate_output_tensor() throwing an error, so a viewless tensor is
