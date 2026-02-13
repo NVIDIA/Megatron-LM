@@ -390,7 +390,6 @@ class TestMambaMoEModel:
         args = parse_args()
 
         # The following args would be set from the nano v3 checkpoint.
-        args.num_layers = 52
         args.hidden_size = 2688
         args.ffn_hidden_size = 1856
         args.num_attention_heads = 32
