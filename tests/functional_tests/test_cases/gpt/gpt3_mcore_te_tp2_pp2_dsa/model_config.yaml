@@ -18,6 +18,7 @@ MODEL_ARGS:
   --dsa-indexer-n-heads: 64
   --dsa-indexer-head-dim: 128
   --dsa-indexer-topk: 2048
+  --dsa-indexer-loss-coeff: 0.01
   --attention-backend: fused
   --log-params-norm: true
   --log-num-zeros-in-grad: true
