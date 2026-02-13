@@ -91,7 +91,7 @@ def check_arguments():
         exit()
 
     if hasattr(args, 'moe_grouped_gemm') and args.moe_grouped_gemm == True:
-        if not getattr(args, 'full_te_spec', False):
+        if not getattr(args, 'export_default_te_spec', False):
             print_rank_0("WARNING: Forcing moe_grouped_gemm to False for PTQ and export.")
             args.moe_grouped_gemm = False
 

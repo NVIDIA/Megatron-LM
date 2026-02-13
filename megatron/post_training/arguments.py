@@ -21,10 +21,13 @@ def add_modelopt_args(parser):
     group.add_argument(
         "--export-te-mcore-model",
         action="store_true",
-        help="Export a megatron-core transformer-engine checkpoint.",
+        help="Indicate the source checkpoint uses the fused Transformer-Engine mcore layer spec "
+        "(where layernorms are fused into linear layers). Enables state_dict key remapping so the "
+        "TE checkpoint can be loaded into the local ModelOpt spec for PTQ/export, and saved back "
+        "in TE-compatible format. Mutually exclusive with --export-default-te-spec.",
     )
     group.add_argument(
-        "--full-te-spec",
+        "--export-default-te-spec",
         action="store_true",
         help="Use the full Transformer-Engine layer spec for model building. "
         "This builds the model with TELayerNormColumnParallelLinear, TERowParallelLinear, "

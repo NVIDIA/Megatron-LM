@@ -168,7 +168,9 @@ if __name__ == "__main__":
 
     disable_tqdm = args.disable_tqdm or torch.distributed.get_rank() > 0
 
-    tokenizer = get_tokenizer()._tokenizer.tokenizer
+    tokenizer = get_tokenizer()._tokenizer
+    if hasattr(tokenizer, "tokenizer"):
+        tokenizer = tokenizer.tokenizer
 
     if args.load is not None:
         load_modelopt_checkpoint(model, strict=not args.untie_embeddings_and_output_weights)
