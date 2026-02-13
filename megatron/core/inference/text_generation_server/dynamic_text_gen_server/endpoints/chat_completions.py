@@ -102,13 +102,16 @@ try:
         # --- 4. Format OpenAI Response ---
         choices = []
         total_completion_tokens = 0
-        prompt_token_count = len(prompt_tokens)  # Calculated once
+        prompt_tokens_counts = []
 
         request_idx = 0
         for record in batch_results:
             assert len(record.requests) == 1, "Each record should contain one request result."
             result = record.merge()
+            prompt_tokens = result.prompt_tokens  # The engine can modify prompt_tokens.
             text_output = result.generated_text
+            prompt_tokens_count = len(prompt_tokens) if prompt_tokens is not None else 0
+            prompt_tokens_counts.append(prompt_tokens_count)
 
             logprobs_content = None
             if sampling_params.return_log_probs:
@@ -176,10 +179,9 @@ try:
             logging.info(result)
             if result.routing_indices is not None:
                 choice_data["moe_topk_indices"] = result.routing_indices.tolist()
-                prompt_length = len(result.prompt_tokens) if result.prompt_tokens is not None else 0
-                if prompt_length:
+                if prompt_tokens_count:
                     choices[-1]["prompt_moe_topk_indices"] = result.routing_indices[
-                        :prompt_length
+                        :prompt_tokens_count
                     ].tolist()
             choices.append(choice_data)
             total_completion_tokens += len(result.generated_tokens)
@@ -188,7 +190,7 @@ try:
         response = {
             "choices": choices,
             "usage": {
-                "prompt_tokens": prompt_token_count,
+                "prompt_tokens": max(prompt_tokens_counts),
                 "completion_tokens": total_completion_tokens,
                 "total_tokens": prompt_token_count + total_completion_tokens,
             },
