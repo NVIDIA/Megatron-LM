@@ -352,6 +352,11 @@ products:
       - environment: [dev]
         scope: [mr, mr-github]
         platforms: [dgx_h100]
+  - test_case: [gpt3_mcore_te_tp2_pp2_dsa]
+    products:
+      - environment: [dev]
+        scope: [mr, mr-github, mr-github-slim]
+        platforms: [dgx_h100]
   - test_case: [gpt3_mcore_te_tp2_pp2_resume_torch_dist_ddp_average_in_collective]
     products:
       - environment: [dev]
