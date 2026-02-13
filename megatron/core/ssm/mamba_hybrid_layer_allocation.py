@@ -124,7 +124,12 @@ def get_hybrid_layer_counts(pattern: str) -> Tuple[int, int, int, int]:
             if char in counts:
                 counts[char] += parsed.mtp_num_depths
 
-    return counts[Symbols.ATTENTION], counts[Symbols.MAMBA], counts[Symbols.MLP], counts[Symbols.MOE]
+    return (
+        counts[Symbols.ATTENTION],
+        counts[Symbols.MAMBA],
+        counts[Symbols.MLP],
+        counts[Symbols.MOE],
+    )
 
 
 def parse_hybrid_pattern(pattern: Optional[str]) -> ParsedHybridPattern:
@@ -250,9 +255,7 @@ def validate_segment_layers(segment: str) -> list:
 
 
 def select_pipeline_segment(
-    main_pattern: str,
-    pp_group: Optional[torch.distributed.ProcessGroup],
-    vp_stage: Optional[int],
+    main_pattern: str, pp_group: Optional[torch.distributed.ProcessGroup], vp_stage: Optional[int]
 ) -> Tuple[List[str], int]:
     """Select and validate the pipeline segment for the given PP rank and VP stage.
 
