@@ -1237,18 +1237,19 @@ def prepare_data_for_update(
 
         with torch.no_grad(), nvtx_range("compute_logprobs", time=True):
             # Before we can update the model, we need to get the logprobs for the \pi_{old} model.
+            # TODO(helenn): Re-enable cudagraphs for logprobs calculations.
 
-            # Disable CUDA graphs during logprobs so ALL layers run fully eager.
-            # Three things are needed:
-            #   1. cuda_graph_impl="none" — prevents create_cudagraphs() at end of
-            #      forward_backward_no_pipelining.
-            #   2. use_partial_cudagraphs=False — MoE layers fall through to
-            #      super()._forward_mlp() (eager).
-            #   3. cudagraph_created=False — prevents CudaGraphManagers on non-MoE
-            #      TransformerLayers from entering the replay path (their base
-            #      _should_call_local_cudagraph does NOT check cuda_graph_impl).
-            #      With cudagraph_created=False and model.eval(), they take the
-            #      eager fallback in CudaGraphManager.__call__.
+            """
+            Disable cudagraphs during logprobs calculations so all layers run fully eager.
+            - cuda_graph_impl = "none" prevents create_cudagraphs() at end of the forward pass, 
+            e.g. forward_backward_no_pipelining.
+            - use_partial_cudagraphs=False forces MoE layers to fall through to 
+            super()._forward_mlp() (eager).
+            - cudagraph_created=False prevents CudaGraphManagers on non-MoE TransformerLayers from 
+            entering the replay path (their base _should_call_local_cudagraph does not check 
+            cuda_graph_impl). With cudagraph_created=False and model.eval(), they take the eager 
+            fallback in CudaGraphManager.__call__.
+            """
             if args.rl_training_cuda_graphs:
                 _logprobs_lang_module = (
                     model.module.module
@@ -1818,7 +1819,7 @@ def megatron_rl_inference_mode(
         # Reset drop_and_pad leaked from inference decode
         set_decode_expert_padding(unwrap_model(model[0]), set_to=False)
 
-        # Change cudagraph scope for training (use proper CudaGraphScope enums)
+        # Change cudagraph scope for training
         model[0].config.cuda_graph_scope = [
             CudaGraphScope.mamba,
             CudaGraphScope.attn,
