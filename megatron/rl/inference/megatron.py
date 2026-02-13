@@ -53,8 +53,10 @@ class MegatronLocal(InferenceServer, ReturnsTokens, ReturnsRaw):
             top_p=request.generation_args.top_p or 0.0,
             n=1,
             logprobs=True,
-            skip_prompt_log_probs=True,
-            add_BOS=(not args.rl_skip_bos_token and tokenizer.bos is not None),
+            extra_body={
+                "skip_prompt_log_probs": True,
+                "add_BOS": (not args.rl_skip_bos_token and tokenizer.bos is not None),
+            },
         )
 
         choice = response.choices[0]
