@@ -192,15 +192,53 @@ class MambaStack(MegatronModule):
             )
 
     def _select_layers_for_pipeline_parallel(self, layer_type_list):
-        num_layers_per_pipeline_rank = self.config.num_layers // self.pp_group.size()
-
         assert self.config.virtual_pipeline_model_parallel_size is None, (
             "The Mamba hybrid model does not currently support "
             "virtual/interleaved pipeline parallelism"
         )
 
-        offset = self.pp_group.rank() * num_layers_per_pipeline_rank
-        selected_list = layer_type_list[offset : offset + num_layers_per_pipeline_rank]
+        pp_rank = self.pp_group.rank()
+        pp_size = self.pp_group.size()
+
+        num_layers_in_first = self.config.num_layers_in_first_pipeline_stage
+        num_layers_in_last = self.config.num_layers_in_last_pipeline_stage
+
+        if num_layers_in_first is not None or num_layers_in_last is not None:
+            # Uneven pipeline parallelism: mirror the logic in
+            # get_transformer_layer_offset so that MambaStack and
+            # TransformerLayer agree on layer placement.
+            first = 0 if num_layers_in_first is None else num_layers_in_first
+            last = 0 if num_layers_in_last is None else num_layers_in_last
+            middle_num_layers = self.config.num_layers - first - last
+
+            middle_pipeline_stages = pp_size - sum(
+                1 for x in (num_layers_in_first, num_layers_in_last) if x is not None
+            )
+
+            if middle_pipeline_stages > 0:
+                layers_per_middle = middle_num_layers // middle_pipeline_stages
+            else:
+                layers_per_middle = 0
+
+            is_first_stage = num_layers_in_first is not None and pp_rank == 0
+            is_last_stage = num_layers_in_last is not None and pp_rank == pp_size - 1
+
+            if is_first_stage:
+                offset = 0
+                num_layers_this_rank = first
+            elif is_last_stage:
+                offset = self.config.num_layers - last
+                num_layers_this_rank = last
+            else:
+                middle_rank = pp_rank if num_layers_in_first is None else pp_rank - 1
+                offset = middle_rank * layers_per_middle + first
+                num_layers_this_rank = layers_per_middle
+        else:
+            num_layers_per_pipeline_rank = self.config.num_layers // pp_size
+            offset = pp_rank * num_layers_per_pipeline_rank
+            num_layers_this_rank = num_layers_per_pipeline_rank
+
+        selected_list = layer_type_list[offset : offset + num_layers_this_rank]
 
         return offset, selected_list
 
