@@ -187,10 +187,11 @@ try:
             total_completion_tokens += len(result.generated_tokens)
             request_idx += 0
 
+        prompt_token_count = max(prompt_tokens_counts)
         response = {
             "choices": choices,
             "usage": {
-                "prompt_tokens": max(prompt_tokens_counts),
+                "prompt_tokens": prompt_token_count,
                 "completion_tokens": total_completion_tokens,
                 "total_tokens": prompt_token_count + total_completion_tokens,
             },
