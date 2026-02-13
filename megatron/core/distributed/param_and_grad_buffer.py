@@ -11,6 +11,7 @@ from typing import Dict, List, Optional
 
 import torch
 from torch.distributed import _coalescing_manager
+from torch._utils import _flatten_dense_tensors, _unflatten_dense_tensors
 
 import megatron.core.nccl_allocator as nccl_allocator
 from megatron.core import parallel_state
@@ -112,6 +113,22 @@ class _ParamAndGradBucket:
             global_start, global_end, _ = param_index_map[param]
             self.param_to_index[param] = (global_start - offset, global_end - offset)
 
+        # Layer-wise optimizer attributes for async param gather.
+        self.lw_params_list = None
+        self.lw_param_flat_sizes = None
+        self.lw_gather_tensor_list = None
+
+    def set_lw_params_list(self, lw_params_list: List[List[torch.nn.Parameter]]):
+        """Set per-rank parameter lists for layer-wise async all-gather.
+
+        Args:
+            lw_params_list: List of param lists, one per rank in the DP group.
+        """
+        self.lw_params_list = lw_params_list
+        self.lw_param_flat_sizes = [
+            sum([p.numel() for p in param_list]) for param_list in lw_params_list
+        ]
+
 
 class _ParamAndGradBucketGroup:
     """
@@ -138,11 +155,11 @@ class _ParamAndGradBucketGroup:
         self.buckets = buckets
         self.ddp_config = ddp_config
 
-        if self.ddp_config.use_distributed_optimizer:
+        if self.ddp_config.use_distributed_optimizer or self.ddp_config.use_layer_wise_optimizer:
             self.intra_distributed_optimizer_instance_group = collective_group
             self.intra_distributed_optimizer_instance_size = collective_group_size
             self.intra_distributed_optimizer_instance_rank = collective_group.rank()
-        else:
+        if not self.ddp_config.use_distributed_optimizer:
             self.data_parallel_group = collective_group
 
         # State for bookkeeping: params is the set of parameters this bucket group is
@@ -262,7 +279,7 @@ class _ParamAndGradBucketGroup:
             force_sync (bool, optional): force synchronous collective regardless of
                 other settings if true.
         """
-        assert self.ddp_config.use_distributed_optimizer
+        assert self.ddp_config.use_distributed_optimizer or self.ddp_config.use_layer_wise_optimizer
 
         if force_sync:
             if self.param_gather_handle is not None:
@@ -277,22 +294,62 @@ class _ParamAndGradBucketGroup:
         with _coalescing_manager(
             self.intra_distributed_optimizer_instance_group, async_ops=async_op
         ) as cm:
-            for idx, bucket in enumerate(self.buckets):
-                if self.cached_param_buffer_shard_list[idx] is None:
-                    self.cached_param_buffer_shard_list[idx] = shard_buffer(
-                        bucket.param_data, self.intra_distributed_optimizer_instance_size
+            if not self.ddp_config.use_layer_wise_optimizer:
+                for idx, bucket in enumerate(self.buckets):
+                    if self.cached_param_buffer_shard_list[idx] is None:
+                        self.cached_param_buffer_shard_list[idx] = shard_buffer(
+                            bucket.param_data, self.intra_distributed_optimizer_instance_size
+                        )
+                    local_data_view = self.cached_param_buffer_shard_list[idx][
+                        self.intra_distributed_optimizer_instance_rank
+                    ]
+                    dist_all_gather_func(
+                        bucket.param_data,
+                        local_data_view,
+                        group=self.intra_distributed_optimizer_instance_group,
+                        async_op=async_op,
                     )
-                local_data_view = self.cached_param_buffer_shard_list[idx][
-                    self.intra_distributed_optimizer_instance_rank
-                ]
-                dist_all_gather_func(
-                    bucket.param_data,
-                    local_data_view,
-                    group=self.intra_distributed_optimizer_instance_group,
-                    async_op=async_op,
-                )
+            else:
+                for bucket in self.buckets:
+                    local_rank = self.intra_distributed_optimizer_instance_rank
+                    src = (
+                        _flatten_dense_tensors(bucket.lw_params_list[local_rank])
+                        if len(bucket.lw_params_list[local_rank]) > 0
+                        else torch.empty(
+                            0,
+                            device=bucket.grad_data.device,
+                            dtype=bucket.grad_data.dtype,
+                        )
+                    )
+                    bucket.lw_gather_tensor_list = [
+                        torch.empty(size, device=src.device, dtype=src.dtype)
+                        for size in bucket.lw_param_flat_sizes
+                    ]
+                    torch.distributed.all_gather(
+                        bucket.lw_gather_tensor_list,
+                        src,
+                        group=self.intra_distributed_optimizer_instance_group,
+                        async_op=async_op,
+                    )
         if async_op:
             self.param_gather_handle = cm
+        elif self.ddp_config.use_layer_wise_optimizer:
+            # Synchronous layer-wise case (e.g., force_sync=True for checkpointing):
+            # unflatten and copy gathered params immediately.
+            for bucket in self.buckets:
+                for idx, (flat_params, params) in enumerate(
+                    zip(bucket.lw_gather_tensor_list, bucket.lw_params_list)
+                ):
+                    if (
+                        len(params) == 0
+                        or idx == self.intra_distributed_optimizer_instance_rank
+                    ):
+                        continue
+                    updated_params = _unflatten_dense_tensors(flat_params, params)
+                    for updated_p, model_p in zip(updated_params, params):
+                        model_p.data.copy_(updated_p)
+                bucket.lw_gather_tensor_list.clear()
+            self.param_gather_handle = None
         else:
             # When using `_coalescing_manager`, even if a synchronous op (async_op=False) is used,
             # `cm` is not None, which is different from when `_coalescing_manager` is not used in
@@ -317,7 +374,7 @@ class _ParamAndGradBucketGroup:
             skip_next_bucket_dispatch (bool, optional): if true, dispatch next
                 bucket's communication if available.
         """
-        assert self.ddp_config.use_distributed_optimizer
+        assert self.ddp_config.use_distributed_optimizer or self.ddp_config.use_layer_wise_optimizer
         assert self.ddp_config.overlap_param_gather
 
         # If current bucket's param AG has not been dispatched, dispatch it now (e.g., first
@@ -355,6 +412,22 @@ class _ParamAndGradBucketGroup:
                     # correspond to multiple param buffers. If we zero out the entire grad buffer,
                     # it would clear the data of those param buffers that have not yet completed AG.
                     bucket.param_data.zero_()
+            elif self.ddp_config.use_layer_wise_optimizer:
+                for bucket in self.buckets:
+                    # Unflatten and copy gathered params for each rank.
+                    for idx, (flat_params, params) in enumerate(
+                        zip(bucket.lw_gather_tensor_list, bucket.lw_params_list)
+                    ):
+                        # Skip local params and empty tensors.
+                        if (
+                            len(params) == 0
+                            or idx == self.intra_distributed_optimizer_instance_rank
+                        ):
+                            continue
+                        updated_params = _unflatten_dense_tensors(flat_params, params)
+                        for updated_p, model_p in zip(updated_params, params):
+                            model_p.data.copy_(updated_p)
+                    bucket.lw_gather_tensor_list.clear()
             else:
                 fp8_params = []
                 for bucket in self.buckets:

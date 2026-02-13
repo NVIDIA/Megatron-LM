@@ -45,6 +45,8 @@ class LayerWiseDistributedOptimizer(ChainedOptimizer):
         config: OptimizerConfig,
         pg_collection: Optional[ProcessGroupCollection] = None,
         init_state_fn_list: Optional[List[Callable]] = None,
+        model_chunks: Optional[List] = None,
+        async_allgather: bool = False,
     ) -> None:
         """
         Initialize LayerWiseDistributedOptimizer.
@@ -54,10 +56,21 @@ class LayerWiseDistributedOptimizer(ChainedOptimizer):
             config: OptimizerConfig.
             pg_collection: ProcessGroupCollection.
             init_state_fn_list: List of init state functions.
+            model_chunks: DDP-wrapped model chunks (needed for async_allgather).
+            async_allgather: If True, defer param all-gather to forward pre-hooks.
         """
 
         self.pg_collection = pg_collection
         self.shard_params(optimizers)
+
+        # Set up async all-gather using DDP bucket infrastructure.
+        self.async_allgather = async_allgather
+        if self.async_allgather:
+            assert model_chunks is not None, (
+                "model_chunks must be provided if async_allgather is True"
+            )
+            self.set_bucket_lw_params_list(model_chunks)
+
         if init_state_fn_list:
             assert len(init_state_fn_list) == len(
                 optimizers
@@ -143,6 +156,43 @@ class LayerWiseDistributedOptimizer(ChainedOptimizer):
         if expt_dp_size == 1 or len(self.expt_dp_params_list[0]) == 0:
             self.expt_dp_params_list = None
 
+    def set_bucket_lw_params_list(self, model_chunks):
+        """Map sharded params to DDP buckets for async all-gather.
+
+        For each bucket in each model chunk's bucket groups, build per-rank param lists
+        by cross-referencing the layer-wise sharded param lists with the bucket's params.
+
+        Args:
+            model_chunks: DDP-wrapped model chunks with bucket_groups.
+        """
+        for model_chunk in model_chunks:
+            for group in model_chunk.bucket_groups:
+                for bucket in group.buckets:
+                    bucket_params_list = [
+                        [] for _ in range(get_pg_size(self.pg_collection.dp_cp))
+                    ]
+                    for bucket_list, full_params_list in zip(
+                        bucket_params_list, self.dp_cp_params_list
+                    ):
+                        for param in full_params_list:
+                            if param in bucket.params:
+                                bucket_list.append(param)
+                    bucket.set_lw_params_list(bucket_params_list)
+            # Do the same for expert parallel bucket groups.
+            if self.expt_dp_params_list is not None:
+                for group in model_chunk.expert_parallel_bucket_groups:
+                    for bucket in group.buckets:
+                        bucket_params_list = [
+                            [] for _ in range(get_pg_size(self.pg_collection.expt_dp))
+                        ]
+                        for bucket_list, full_params_list in zip(
+                            bucket_params_list, self.expt_dp_params_list
+                        ):
+                            for param in full_params_list:
+                                if param in bucket.params:
+                                    bucket_list.append(param)
+                        bucket.set_lw_params_list(bucket_params_list)
+
     @torch.no_grad()
     def allgather_params(self) -> None:
         """All-gather updated params from all ranks."""
@@ -223,8 +273,10 @@ class LayerWiseDistributedOptimizer(ChainedOptimizer):
         """step function for layer-wise optimizer."""
         update_successful, grad_norm, num_zeros_in_grad = super().step()
 
-        # All gather updated params.
-        self.allgather_params()
+        # All gather updated params. If async_allgather is True, the allgather
+        # is deferred to the forward pre-hooks via DDP bucket infrastructure.
+        if not self.async_allgather:
+            self.allgather_params()
 
         return update_successful, grad_norm, num_zeros_in_grad
 
