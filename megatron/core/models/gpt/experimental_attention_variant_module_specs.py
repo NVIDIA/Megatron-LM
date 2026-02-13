@@ -138,6 +138,8 @@ def get_experimental_attention_variant_module_spec(
 
     if config.experimental_attention_variant == "gated_delta_net":
         return get_gated_delta_net_module_spec(config=config, backend=backend)
+    elif config.experimental_attention_variant == "dsa":
+        return get_dsa_module_spec_for_backend(config=config, backend=backend)
     else:
         raise ValueError(
             f"Invalid experimental attention variant: {config.experimental_attention_variant}"
