@@ -124,10 +124,10 @@ class MambaModel(LanguageModule):
         self.mtp_process = (
             self.mtp_pattern is not None
             and self.mtp_num_depths > 0
-            # The following forces MTP to be on the final pipeline stage. It would be more optimal
+            # The following forces MTP to be on the final pipeline stage. It might be more optimal
             # to split the hybrid layer pattern into pipeline stages before parsing the pattern for
-            # the current pipeline stage. This would also enable MTP standalone to be supported
-            # in the hybrid model.
+            # the current pipeline stage. This could also enable MTP standalone (MTP in a pipeline
+            # stage separate from loss) to be supported in the hybrid model.
             and mtp_on_this_rank(self.config, ignore_virtual=False, vp_stage=self.vp_stage)
         )
 
