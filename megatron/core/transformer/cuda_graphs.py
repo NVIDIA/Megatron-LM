@@ -112,6 +112,7 @@ def _set_warmup_start():
 def _set_warmup_end():
     """Set graph warmup has ended."""
     global _IS_GRAPH_WARMUP
+    _IS_GRAPH_WARMUP = False
 
 
 @dataclass
