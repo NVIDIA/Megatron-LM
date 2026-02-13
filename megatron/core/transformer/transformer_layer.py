@@ -716,20 +716,20 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
             output (Tensor): Transformed hidden states of shape [s, b, h].
         """
 
-        # Residual connection.
-        residual = hidden_states
-
         # Optional Layer norm post the cross-attention.
         pre_mlp_layernorm_output = self._forward_pre_mlp_layernorm(hidden_states)
 
-        # Handle fused residual normalization (returns tuple of (output, residual))
         if isinstance(pre_mlp_layernorm_output, tuple):
             if len(pre_mlp_layernorm_output) != 2:
                 raise ValueError(
-                    f"When the output of pre_mlp_layernorm is a tuple, it is expected to have "
-                    f"2 elements (output, residual), but got {len(pre_mlp_layernorm_output)}"
+                    f"When the output of pre_mlp_layernorm is a tuple, it is "
+                    f"expected to have 2 elements (output, residual), but "
+                    f"got {len(pre_mlp_layernorm_output)}"
                 )
             pre_mlp_layernorm_output, residual = pre_mlp_layernorm_output
+        else:
+            # Residual connection.
+            residual = hidden_states
 
         nvtx_range_push(suffix="mlp")
         # Potentially chunk the MLP computation during prefill to minimize the peak activation size
@@ -1143,9 +1143,9 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
                 if isinstance(hidden_states, tuple):
                     if len(hidden_states) != 2:
                         raise ValueError(
-                            f"When the output of pre_mlp_layernorm is a tuple,\
-                            it is expected to have 2 elements (output, residual),\
-                            but got {len(hidden_states)}"
+                            f"When the output of pre_mlp_layernorm is a tuple, it is "
+                            f"expected to have 2 elements (output, residual), but "
+                            f"got {len(hidden_states)}"
                         )
                     hidden_states, residual = hidden_states
 
@@ -1332,9 +1332,18 @@ class MoETransformerLayer(TransformerLayer):
         This method is isolated so it can be captured by `cudagraph_manager_router`.
         """
 
-        residual = hidden_states
         self.mlp.fwd_execution_map = "route"
         pre_mlp_layernorm_output = self._forward_pre_mlp_layernorm(hidden_states)
+        if isinstance(pre_mlp_layernorm_output, tuple):
+            if len(pre_mlp_layernorm_output) != 2:
+                raise ValueError(
+                    f"When the output of pre_mlp_layernorm is a tuple, it is "
+                    f"expected to have 2 elements (output, residual), but "
+                    f"got {len(pre_mlp_layernorm_output)}"
+                )
+            pre_mlp_layernorm_output, residual = pre_mlp_layernorm_output
+        else:
+            residual = hidden_states
         router_outputs = self.mlp(
             pre_mlp_layernorm_output, intermediate_tensors=(), padding_mask=padding_mask
         )
