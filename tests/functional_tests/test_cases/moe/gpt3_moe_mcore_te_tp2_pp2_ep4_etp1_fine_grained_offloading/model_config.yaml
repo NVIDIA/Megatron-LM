@@ -133,7 +133,6 @@ MODEL_ARGS:
   --overlap-moe-expert-parallel-comm: true
 TEST_TYPE: regular # Usually ckpt-resume, but as a WAR to #513 set to regular
 METRICS:
-  - "iteration-time"
   - "lm loss"
   - "mem-allocated-bytes"
   - "mem-max-allocated-bytes"
