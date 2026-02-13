@@ -787,7 +787,6 @@ class CheckpointWithoutOutput(object):
         will be automatically registered to the manager after execution.
         """
 
-
         # Auto-register to manager if provided
         if self.ckpt_manager is not None:
             self.ckpt_manager.add_checkpoint(self)
@@ -806,7 +805,6 @@ class CheckpointWithoutOutput(object):
         self.outputs = outputs
         if isinstance(self.outputs, torch.Tensor):
             self.outputs = (self.outputs,)
-
 
         return outputs
 
