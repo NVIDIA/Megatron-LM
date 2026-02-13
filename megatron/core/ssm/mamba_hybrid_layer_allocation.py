@@ -8,7 +8,6 @@ import torch
 
 from megatron.core.utils import log_on_each_pipeline_stage
 
-
 logger = logging.getLogger(__name__)
 
 
