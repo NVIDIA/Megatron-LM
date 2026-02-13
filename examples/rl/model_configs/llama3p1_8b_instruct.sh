@@ -101,6 +101,9 @@ MODEL_OPTIONS="\
   --max-position-embeddings 131072  \
   --tokenizer-type HuggingFaceTokenizer \
   --tokenizer-model unsloth/Meta-Llama-3.1-8B-Instruct \
+  --legacy-tokenizer \
+  --langrl-inference-server-type "inplace_megatron_chat" \
+  --langrl-inference-server-conversation-template "unsloth/Meta-Llama-3.1-8B-Instruct" \
   --lr 3e-7 \
   --make-vocab-size-divisible-by 128 \
   --clip-grad 1.0 \
