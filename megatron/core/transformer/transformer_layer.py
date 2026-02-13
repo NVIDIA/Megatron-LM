@@ -1256,6 +1256,7 @@ class MoETransformerLayer(TransformerLayer):
         """
 
         from megatron.core.transformer.cuda_graphs import CudaGraphManager
+
         if not self.config.cuda_graph_scope or CudaGraphScope.moe in self.config.cuda_graph_scope:
             self.cudagraph_manager = CudaGraphManager(config)
         elif (

@@ -28,8 +28,7 @@ class PackedSeqParams:
         # Stored as a non-field attribute so dataclasses.fields() won't include it, preventing it
         # from being forwarded to TE attention.
         cu_seqlens = (
-            self.cu_seqlens_q_padded if self.cu_seqlens_q_padded is not None
-            else self.cu_seqlens_q
+            self.cu_seqlens_q_padded if self.cu_seqlens_q_padded is not None else self.cu_seqlens_q
         )
         if isinstance(cu_seqlens, Tensor) and self.max_seqlen_q is not None:
             total_tokens_tensor = torch.tensor(
@@ -37,8 +36,12 @@ class PackedSeqParams:
             )
             cu_seqlens_with_max = torch.cat([cu_seqlens, total_tokens_tensor])
             seq_lengths = cu_seqlens_with_max[1:] - cu_seqlens_with_max[:-1]
-            self.seq_idx = torch.repeat_interleave(
-                torch.arange(seq_lengths.numel(), device=cu_seqlens.device), seq_lengths
-            ).to(torch.int32).unsqueeze(0)
+            self.seq_idx = (
+                torch.repeat_interleave(
+                    torch.arange(seq_lengths.numel(), device=cu_seqlens.device), seq_lengths
+                )
+                .to(torch.int32)
+                .unsqueeze(0)
+            )
         else:
             self.seq_idx = None
