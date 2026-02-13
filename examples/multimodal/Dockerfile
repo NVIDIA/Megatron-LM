@@ -35,7 +35,9 @@ RUN uv pip install --system --no-cache --break-system-packages \
     tiktoken \
     # Additional dependencies for megatron-core[mlm]
     flask-restful \
-    wandb
+    wandb \
+    bitstring \
+    filetype
 
 # Install CLIP from GitHub
 RUN uv pip install --system --no-cache --break-system-packages \
