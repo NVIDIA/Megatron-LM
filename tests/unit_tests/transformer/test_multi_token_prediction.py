@@ -739,7 +739,6 @@ class TestMultiTokenPredictionMamba:
 
         sys.argv = ['test_multi_token_prediction_mamba.py']
         args = parse_args()
-        args.num_layers = 4
         args.mtp_num_layers = 2
         args.mtp_loss_scaling_factor = 0.1
         args.vocab_size = 128800
