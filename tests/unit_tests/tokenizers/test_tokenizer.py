@@ -6,6 +6,15 @@ from packaging import version
 
 from megatron.core.tokenizers import MegatronTokenizer
 
+try:
+    from megatron.core.tokenizers.text.libraries.huggingface_tokenizer import (
+        HuggingFaceTokenizer,
+        HAVE_TRANSFORMERS,
+    )
+except Exception:
+    HAVE_TRANSFORMERS = False
+    HuggingFaceTokenizer = None
+
 
 def get_conversation():
     return [
@@ -109,6 +118,61 @@ def test_hf_tokenizer():
     assert tokenizer.tokenize("<TEST_BOS><TEST_EOS>") == [128257, 128256]
     assert tokenizer.detokenize([3, 4, 5]) == "$%&"
     assert tokenizer.vocab_size == 128258
+
+
+# HuggingFaceTokenizer.ids_to_text and include_special_tokens (--tokenizer-hf-include-special-tokens).
+# Uses same local path as test_hf_tokenizer; tests EOS stripping vs keeping in detokenized output (e.g. RL).
+LOCAL_HF_TOKENIZER_PATH = "/opt/data/tokenizers/huggingface"
+
+
+@pytest.mark.skipif(not HAVE_TRANSFORMERS, reason="transformers not installed")
+def test_hf_ids_to_text_strips_eos_when_include_special_tokens_false():
+    """Default (include_special_tokens=False): detokenization strips EOS."""
+    try:
+        tok = HuggingFaceTokenizer(LOCAL_HF_TOKENIZER_PATH, include_special_tokens=False)
+    except Exception:
+        pytest.skip("Could not load local HuggingFace tokenizer (path not available)")
+    eos_id = tok.eos_id
+    ids = tok.text_to_ids("hello") + [eos_id]
+    text = tok.ids_to_text(ids)
+    assert tok.tokenizer.eos_token not in text, (
+        f"Expected EOS to be stripped when include_special_tokens=False. Got: {text!r}"
+    )
+
+
+@pytest.mark.skipif(not HAVE_TRANSFORMERS, reason="transformers not installed")
+def test_hf_ids_to_text_keeps_eos_when_include_special_tokens_true():
+    """With include_special_tokens=True (--tokenizer-hf-include-special-tokens): EOS kept in output."""
+    try:
+        tok = HuggingFaceTokenizer(LOCAL_HF_TOKENIZER_PATH, include_special_tokens=True)
+    except Exception:
+        pytest.skip("Could not load local HuggingFace tokenizer (path not available)")
+    eos_id = tok.eos_id
+    ids = tok.text_to_ids("hello") + [eos_id]
+    text = tok.ids_to_text(ids)
+    assert tok.tokenizer.eos_token in text or text.endswith(
+        tok.tokenizer.eos_token.strip()
+    ), (
+        f"Expected EOS token {tok.tokenizer.eos_token!r} to appear in detokenized "
+        f"output when include_special_tokens=True. Got: {text!r}"
+    )
+
+
+@pytest.mark.skipif(not HAVE_TRANSFORMERS, reason="transformers not installed")
+def test_hf_ids_to_text_explicit_remove_special_tokens_overrides_include_flag():
+    """Explicit remove_special_tokens=True/False overrides the include_special_tokens default."""
+    try:
+        tok = HuggingFaceTokenizer(LOCAL_HF_TOKENIZER_PATH, include_special_tokens=True)
+    except Exception:
+        pytest.skip("Could not load local HuggingFace tokenizer (path not available)")
+    eos_id = tok.eos_id
+    ids = tok.text_to_ids("hi") + [eos_id]
+    text_stripped = tok.ids_to_text(ids, remove_special_tokens=True)
+    assert tok.tokenizer.eos_token not in text_stripped
+    text_kept = tok.ids_to_text(ids, remove_special_tokens=False)
+    assert tok.tokenizer.eos_token in text_kept or text_kept.endswith(
+        tok.tokenizer.eos_token.strip()
+    )
 
 
 def test_megatron_tokenizer():
