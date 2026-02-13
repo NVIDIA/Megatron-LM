@@ -73,7 +73,6 @@ def _build_gpt_model(
         transformer_layer_spec=get_gpt_layer_with_transformer_engine_spec(
             num_experts=num_experts,
             moe_grouped_gemm=num_experts is not None,
-            moe_use_legacy_grouped_gemm=False,
             multi_latent_attention=is_mla,
         ),
         vocab_size=vocab_size,
@@ -437,7 +436,6 @@ def test_fine_grained_activation_offload_with_ep_a2a_overlap_compatibility(
                 transformer_layer_spec=get_gpt_layer_with_transformer_engine_spec(
                     num_experts=num_experts,
                     moe_grouped_gemm=True,
-                    moe_use_legacy_grouped_gemm=False,
                     multi_latent_attention=is_mla,
                 ),
                 vocab_size=vocab_size,
