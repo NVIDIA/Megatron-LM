@@ -90,7 +90,6 @@ MODEL_ARGS:
   --mock-data: true
   --max-tokens-to-oom: 3600000
   --inference-max-seq-length: 256
-  --langrl-inference-server-type: inplace_megatron
   --calculate-per-token-loss: true
   --rl-use-sequence-packing: true
   --rl-sequence-packing-algo: fifo
