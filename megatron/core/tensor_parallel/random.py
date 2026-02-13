@@ -787,12 +787,6 @@ class CheckpointWithoutOutput(object):
         will be automatically registered to the manager after execution.
         """
 
-<<<<<<< HEAD
-        # Auto-register to manager if provided
-        if self.ckpt_manager is not None:
-            self.ckpt_manager.add_checkpoint(self)
-=======
->>>>>>> 9b9fe9216 (upd: fix bugs in transformer layers and random)
         # If in cuda graph warmup, disable checkpointing, as 'discard_output_and_register_recompute'
         # may be called in a separate graph warmup.
         from megatron.core.transformer.cuda_graphs import is_graph_warmup
@@ -808,7 +802,7 @@ class CheckpointWithoutOutput(object):
         self.outputs = outputs
         if isinstance(self.outputs, torch.Tensor):
             self.outputs = (self.outputs,)
-            
+
         # Auto-register to manager if provided
         if self.ckpt_manager is not None:
             self.ckpt_manager.add_checkpoint(self)
