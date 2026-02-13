@@ -444,7 +444,7 @@ class GPTModel(LanguageModule):
             # return this extra tensor
             # this is for backwards compatibility with
             # legacy unit tests, which break if you
-            # return a 6 tuple instead of 5.
+            # return a 7 tuple instead of 6.
             preproc_output += (rotary_pos_cos_sin,)
 
         return preproc_output
@@ -608,7 +608,7 @@ class GPTModel(LanguageModule):
         if not self.post_process:
             return hidden_states
 
-        if self.config.mtp_num_layers is not None:
+        if self.config.mtp_num_layers:
             hidden_states = process_mtp_loss(
                 hidden_states=hidden_states,
                 labels=labels,

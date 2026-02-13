@@ -32,19 +32,62 @@ import torch, argparse
 torch.serialization.add_safe_globals([argparse.Namespace])
 ```
 
-Checkpointing Distributed Optimizer
------------------------------------
+## Checkpointing Distributed Optimizer
 
-Checkpoint Compatibility and Optimizer State Formats
-####################################################
+### Checkpoint Compatibility and Optimizer State Formats
 
 Beginning with **mcore v0.14**, the ``flattened_range`` attribute was removed from ``dist_checkpointing``. As a result:
 
-- Optimizer states saved with mcore versions < 0.14 are no longer loadable. Loading these legacy optimizer states is not supported because the required sharded metadata is no longer available.
-- Model weights from older checkpoints remain fully compatible. No additional work is required—model weights from checkpoints produced by earlier versions are loaded automatically.
+- Optimizer states saved with mcore versions <= 0.14 can no longer be loaded directly. Loading these legacy optimizer states is not supported because the required sharded metadata is no longer available. If you need to continue training from older checkpoints, refer to the workaround described below.
+- Model weights from older checkpoints remain fully compatible. No extra steps are needed—model weights from checkpoints created by earlier versions load automatically; simply add the ``--no-load-optim`` flag.
 
-Distributed Optimizer Checkpoint Formats
-########################################
+### Workaround: Loading legacy optimizer states with ToT MCore
+
+**Step 1: Convert the legacy checkpoint using mcore v0.15.0**
+
+Run a dummy training job with mcore v0.15.0 to re-save the checkpoint with new optimizer states format.
+
+```bash
+MODEL_TRAIN_PARAMS=(
+    # Define model architecture and training parameters here
+)
+OLD_CKPT=/workspace/mcore_ckpt_old
+CONVERTED_CKPT=/workspace/mcore_ckpt_0.15.0
+
+torchrun --nproc_per_node=8 /opt/megatron-lm/pretrain_gpt.py \
+   --save-interval 1 \
+   --eval-interval 1 \
+   --exit-interval 1 \
+   --eval-iters 1 \
+   --use-distributed-optimizer \
+   --save ${CONVERTED_CKPT} \
+   --load ${OLD_CKPT} \
+   --ckpt-format torch_dist \
+   "${MODEL_TRAIN_PARAMS[@]}"
+```
+
+**Step 2: Load the converted checkpoint with ToT MCore**
+
+Use the converted checkpoint as the input for continued training with ToT MCore.
+
+```bash
+MODEL_TRAIN_PARAMS=(
+    # Define model architecture and training parameters here
+)
+NEW_CKPT=/workspace/mcore_ckpt_new
+CONVERTED_CKPT=/workspace/mcore_ckpt_0.15.0
+
+torchrun --nproc_per_node=8 /opt/megatron-lm/pretrain_gpt.py \
+   --use-distributed-optimizer \
+   --save ${NEW_CKPT} \
+   --load ${CONVERTED_CKPT} \
+   --ckpt-format torch_dist \
+   "${MODEL_TRAIN_PARAMS[@]}"
+```
+
+After this step, training can proceed normally using ToT MCore with fully supported optimizer state loading.
+
+## Distributed Optimizer Checkpoint Formats
 
 The refactor of the Distributed Optimizer introduces **two checkpoint formats**:
 
@@ -57,8 +100,7 @@ The refactor of the Distributed Optimizer introduces **two checkpoint formats**:
    - Slower than dp_reshardable.
    - Enabled via the ``--dist-ckpt-optim-fully-reshardable`` flag.
 
-Workflow for Changing Model Parallelism
-#######################################
+### Workflow for Changing Model Parallelism
 
 You can combine formats to optimize both flexibility and performance:
 
