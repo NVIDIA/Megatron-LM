@@ -238,7 +238,7 @@ class MambaMetadata:
 
             # logic for seq_idx update
             if has_chunked_prefill_req and regular_prefill_count == 0:
-                 self.seq_idx = None
+                self.seq_idx = None
             else:
                 if seq_len > 0:
                     # We subtract start_regular_prefill_req_idx to normalize request IDs to
@@ -274,9 +274,9 @@ class MambaMetadata:
             else:
                 # Pad the rest with the last value (effectively length 0 segments)
                 last_val = self._cu_seqlens_buffer[regular_prefill_count]
-                self._cu_seqlens_buffer[
-                    regular_prefill_count + 1 : padded_prefill_count + 1
-                ].fill_(last_val)
+                self._cu_seqlens_buffer[regular_prefill_count + 1 : padded_prefill_count + 1].fill_(
+                    last_val
+                )
                 self.cu_seqlens = self._cu_seqlens_buffer[: padded_prefill_count + 1]
 
         if padded_decode_count > 0 and padded_prefill_count > 0:
