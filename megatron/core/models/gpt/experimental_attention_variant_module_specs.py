@@ -118,6 +118,7 @@ def get_dsa_module_spec_for_backend(
             q_layernorm=qk_norm,
             kv_layernorm=qk_norm,
         ),
+        metainfo={"fuse_input_layernorm": False},
     )
 
     return attention
