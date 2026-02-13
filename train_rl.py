@@ -284,7 +284,7 @@ def forward_step(data_iterator, model: GPTModel, loss_only: bool = False):
         _saved_cudagraph_created = _CudagraphGlobalRecord.cudagraph_created
         _CudagraphGlobalRecord.cudagraph_created = False
         logprobs_or_hidden_states = get_logprobs(
-            model_to_use, tokens, position_ids, no_grad=False, packed_seq_params=packed_seq_params
+            model_to_use, tokens, position_ids, no_grad=True, packed_seq_params=packed_seq_params
         )
         model_to_use.config.cuda_graph_scope = saved_scope
         args.cuda_graph_impl = saved_impl
