@@ -1037,13 +1037,20 @@ def track_moe_metrics(
     """
     # Aux loss logging
     tracker = get_moe_layer_wise_logging_tracker()
-    # Initialize the tracker if force_initialize is True
+    # Initialize the tracker if force_initialize is True.
+    # The values tensor size must match what the router creates in save_to_aux_losses_tracker,
+    # which uses (num_layers + mtp_num_layers). This is important for PP ranks that have no
+    # MoE layers (so the tracker is empty and force_initialize creates the entry); their tensor
+    # size must match ranks that do have MoE layers, otherwise all_reduce across PP will hang.
+    tracker_num_layers = num_layers
+    if mtp_num_layers is not None:
+        tracker_num_layers += mtp_num_layers
     if force_initialize:
         if track_names is not None:
             for key in track_names:
                 if key not in tracker:
                     tracker[key] = {}
-                    tracker[key]["values"] = torch.zeros(num_layers, device="cuda")
+                    tracker[key]["values"] = torch.zeros(tracker_num_layers, device="cuda")
                     tracker[key]["reduce_group"] = None
                     tracker[key]["avg_group"] = None
                     tracker[key]["reduce_group_has_dp"] = False
