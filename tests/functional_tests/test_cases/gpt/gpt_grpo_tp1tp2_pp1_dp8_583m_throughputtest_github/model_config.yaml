@@ -43,6 +43,7 @@ MODEL_ARGS:
   --straggler-minmax-count: 16
   --tensorboard-log-interval: 1
   --empty-unused-memory-level: 2
+  --langrl-inference-server-type: inplace_megatron
   --seed: 42
   --calculate-per-token-loss: true
   --rl-use-sequence-packing: true
