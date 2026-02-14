@@ -1,4 +1,5 @@
-# Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+
 
 from collections import deque
 from contextlib import nullcontext
@@ -10,7 +11,10 @@ import torch
 DEBUG = False
 DEBUG_RANK = 0
 
-from megatron.core.transformer.cuda_graphs import is_graph_capturing
+from megatron.core.transformer.cuda_graphs import (
+    is_graph_capturing,
+    set_external_join_stream_for_graph_capture,
+)
 
 
 def debug_rank(message):
@@ -341,6 +345,11 @@ class OffloadTensorGroup:
         self.offload = True
         self.total_offload_bytes = 0
         self.total_tensor_count = 0
+        # Events should be created with `external=True` in case of graph capture, since the record
+        # and synchronization of the event may occur in different graphs. Create the event lazily
+        # for back compatibility with older pytorch versions.
+        self._offload_event_cudagraph = None
+        self._reload_event_cudagraph = None
         # Using memory pool is for the compatibility with cuda graph.
         # Shapes of tensors for expert_fc1 and moe_act are not known in advance,
         # so we do not use CPU pool for them.
@@ -359,19 +368,35 @@ class OffloadTensorGroup:
 
     def record_offload_event(self, stream):
         """Record the offload event."""
-        self._offload_event.record(stream)
+        if is_graph_capturing():
+            if self._offload_event_cudagraph is None:
+                self._offload_event_cudagraph = torch.cuda.Event(external=True)
+            self._offload_event_cudagraph.record(stream)
+        else:
+            self._offload_event.record(stream)
 
     def wait_offload_event(self, stream):
         """Wait for the offload event."""
-        stream.wait_event(self._offload_event)
+        if is_graph_capturing():
+            stream.wait_event(self._offload_event_cudagraph)
+        else:
+            stream.wait_event(self._offload_event)
 
     def record_reload_event(self, stream):
         """Record the reload event."""
-        self._reload_event.record(stream)
+        if is_graph_capturing():
+            if self._reload_event_cudagraph is None:
+                self._reload_event_cudagraph = torch.cuda.Event(external=True)
+            self._reload_event_cudagraph.record(stream)
+        else:
+            self._reload_event.record(stream)
 
     def wait_reload_event(self, stream):
         """Wait for the reload event."""
-        stream.wait_event(self._reload_event)
+        if is_graph_capturing():
+            stream.wait_event(self._reload_event_cudagraph)
+        else:
+            stream.wait_event(self._reload_event)
 
     def update_offload_info(self, tensor):
         """Update the offload information."""
@@ -867,6 +892,9 @@ class ChunkOffloadHandler:
         # Respect tensor's offload preference if specified
         if hasattr(tensor, "offloading_activation") and not tensor.offloading_activation:
             return False
+        if hasattr(tensor, "_TE_do_not_offload") and tensor._TE_do_not_offload:
+            return False
+
         return True
 
     def bulk_offload_group(self):
@@ -903,8 +931,7 @@ class ChunkOffloadHandler:
         torch.cuda.nvtx.range_push("activation reloading " + group_to_reload._name)
         with torch.cuda.stream(self.h2d_stream):
             # Wait for offload to complete before reloading
-            if not is_graph_capturing():
-                group_to_reload.wait_offload_event(self.h2d_stream)
+            group_to_reload.wait_offload_event(self.h2d_stream)
             for tensor_tag, state in group_to_reload._tensors.items():
                 # Only reload if tensor was offloaded (stored as tuple)
                 if isinstance(state, tuple):
@@ -969,6 +996,11 @@ class ChunkOffloadHandler:
         if not self.do_offload:
             return
         debug_rank("--on_group_commit_forward")
+
+        if is_graph_capturing():
+            # Mark that d2h_stream is used so it gets joined before capture ends
+            set_external_join_stream_for_graph_capture(self.d2h_stream)
+
         # Wait for compute to finish before starting offload
         self.d2h_stream.wait_stream(torch.cuda.current_stream())
         self.bulk_offload(forced_released_tensors)
@@ -1005,7 +1037,7 @@ class ChunkOffloadHandler:
         cur_backward_chunk = PipelineOffloadManager.get_instance().cur_backward_chunk()
         assert cur_backward_chunk is self, f"Chunk mismatch {cur_backward_chunk} {self}"
         # Wait for reload to complete before using tensors
-        if not is_graph_capturing() and len(self._reloading_group) > 0:
+        if len(self._reloading_group) > 0:
             for reloading_group in self._reloading_group:
                 if reloading_group._name == name:
                     reloading_group.wait_reload_event(torch.cuda.current_stream())
@@ -1042,6 +1074,10 @@ class ChunkOffloadHandler:
         if not self.do_offload:
             return
         debug_rank(f"--on_group_start_backward {self}")
+
+        if is_graph_capturing():
+            set_external_join_stream_for_graph_capture(self.h2d_stream)
+
         # Wait for compute to finish before starting reload
         self.h2d_stream.wait_stream(torch.cuda.current_stream())
         self.bulk_reload()
