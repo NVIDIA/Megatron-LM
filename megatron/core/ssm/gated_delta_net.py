@@ -42,6 +42,7 @@ from megatron.core.utils import deprecate_inference_params, nvtx_range_pop, nvtx
 try:
     from fla.modules.convolution import causal_conv1d
     from fla.modules.l2norm import l2norm
+    from fla.ops.cp import build_cp_context
     from fla.ops.gated_delta_rule import chunk_gated_delta_rule
 
     HAVE_FLA = True
@@ -118,7 +119,8 @@ class GatedDeltaNet(MegatronModule):
         self.use_qk_l2norm = use_qk_l2norm
         assert pg_collection is not None, "pg_collection must be provided for GatedDeltaNet"
         self.pg_collection = pg_collection
-        self.cp_size = self.pg_collection.cp.size()
+        self.cp_size_a2a = 1  # TODO(yuzhongw): add a flag to choose A2A or FLA CP.
+        self.cp_size_fla = self.pg_collection.cp.size()
         self.tp_size = self.pg_collection.tp.size()
         self.sp_size = self.tp_size if config.sequence_parallel else 1
 
@@ -284,8 +286,24 @@ class GatedDeltaNet(MegatronModule):
 
         inference_context = deprecate_inference_params(inference_context, inference_params)
 
+        cp_group_fla = self.pg_collection.cp
+        cp_group_a2a = None  # TODO(yuzhongw): add A2A CP group.
+
         seq_len, batch, _ = hidden_states.shape
-        seq_len = seq_len * self.sp_size * self.cp_size
+        seq_len = seq_len * self.sp_size * self.cp_size_a2a
+        if self.cp_size_fla > 1:
+            # TODO(yuzhongw): add cu_seqlens for packed sequence.
+            fla_cp_context = build_cp_context(
+                cu_seqlens=torch.tensor(
+                    [0, seq_len * self.cp_size_fla],
+                    device=torch.cuda.current_device(),
+                    dtype=torch.long,
+                ),
+                group=cp_group_fla,
+                conv1d_kernel_size=self.conv_kernel_dim,
+            )
+        else:
+            fla_cp_context = None
 
         if inference_context is not None:
             assert (
@@ -309,7 +327,7 @@ class GatedDeltaNet(MegatronModule):
             qkvzba,
             seq_dim=0,
             head_dim=-1,
-            cp_group=self.pg_collection.cp,
+            cp_group=cp_group_a2a,
             split_sections=[
                 self.qk_dim_local_tp,
                 self.qk_dim_local_tp,
@@ -328,10 +346,10 @@ class GatedDeltaNet(MegatronModule):
         qkv, gate, beta, alpha = torch.split(
             qkvzba,
             [
-                (self.qk_dim_local_tp * 2 + self.v_dim_local_tp) // self.cp_size,
-                self.v_dim_local_tp // self.cp_size,
-                self.num_value_heads // self.tp_size // self.cp_size,
-                self.num_value_heads // self.tp_size // self.cp_size,
+                (self.qk_dim_local_tp * 2 + self.v_dim_local_tp) // self.cp_size_a2a,
+                self.v_dim_local_tp // self.cp_size_a2a,
+                self.num_value_heads // self.tp_size // self.cp_size_a2a,
+                self.num_value_heads // self.tp_size // self.cp_size_a2a,
             ],
             dim=-1,
         )
@@ -347,17 +365,17 @@ class GatedDeltaNet(MegatronModule):
             self.qk_dim_local_tp,
             self.v_dim_local_tp,
         ]
-        conv1d_weight = get_parameter_local_cp(
+        conv1d_weight = get_parameter_local_cp_a2a(
             self.conv1d.weight,
             dim=0,
-            cp_group=self.pg_collection.cp,
+            cp_group=cp_group_a2a,
             split_sections=qkv_channels_split_sections,
         )
         conv1d_bias = (
-            get_parameter_local_cp(
+            get_parameter_local_cp_a2a(
                 self.conv1d.bias,
                 dim=0,
-                cp_group=self.pg_collection.cp,
+                cp_group=cp_group_a2a,
                 split_sections=qkv_channels_split_sections,
             )
             if self.conv_bias
@@ -372,12 +390,13 @@ class GatedDeltaNet(MegatronModule):
                 stride=self.conv1d.stride,
                 padding=self.conv1d.padding,
                 dilation=self.conv1d.dilation,
-                groups=self.conv_dim_local_tp // self.cp_size,
+                groups=self.conv_dim_local_tp // self.cp_size_a2a,
             )
             qkv = self.act_fn(conv_out[..., :seq_len])
             qkv = qkv.transpose(1, 2)  # b, d, s -> b, s, d
         else:
             assert self.activation in ["silu", "swish"]
+            qkv = qkv.contiguous()
             qkv, _ = causal_conv1d(
                 x=qkv,  # FLA conv1d accepts [b, s, d] format input
                 weight=conv1d_weight.squeeze(1),  # d, 1, w -> d, w
@@ -385,13 +404,14 @@ class GatedDeltaNet(MegatronModule):
                 activation=self.activation,
                 initial_state=None,
                 output_final_state=False,
+                cp_context=fla_cp_context,
             )
         nvtx_range_pop(suffix="conv1d")
 
         # Split qkv into query_key, and value
         query_key, value = torch.split(
             qkv,
-            [2 * self.qk_dim_local_tp // self.cp_size, self.v_dim_local_tp // self.cp_size],
+            [2 * self.qk_dim_local_tp // self.cp_size_a2a, self.v_dim_local_tp // self.cp_size_a2a],
             dim=-1,
         )
         query_key = query_key.reshape(batch, seq_len, -1, self.key_head_dim)
@@ -403,8 +423,8 @@ class GatedDeltaNet(MegatronModule):
         query, key = torch.split(
             query_key,
             [
-                self.qk_dim_local_tp // self.key_head_dim // self.cp_size,
-                self.qk_dim_local_tp // self.key_head_dim // self.cp_size,
+                self.qk_dim_local_tp // self.key_head_dim // self.cp_size_a2a,
+                self.qk_dim_local_tp // self.key_head_dim // self.cp_size_a2a,
             ],
             dim=2,
         )
@@ -422,10 +442,8 @@ class GatedDeltaNet(MegatronModule):
 
         # Calculate g and beta
         nvtx_range_push(suffix="g_and_beta")
-        A_log_local_cp = get_parameter_local_cp(self.A_log, dim=0, cp_group=self.pg_collection.cp)
-        dt_bias_local_cp = get_parameter_local_cp(
-            self.dt_bias, dim=0, cp_group=self.pg_collection.cp
-        )
+        A_log_local_cp = get_parameter_local_cp_a2a(self.A_log, dim=0, cp_group=cp_group_a2a)
+        dt_bias_local_cp = get_parameter_local_cp_a2a(self.dt_bias, dim=0, cp_group=cp_group_a2a)
         g = -A_log_local_cp.exp() * F.softplus(alpha.float() + dt_bias_local_cp)  # In fp32
         beta = beta.sigmoid()
         nvtx_range_pop(suffix="g_and_beta")
@@ -440,6 +458,7 @@ class GatedDeltaNet(MegatronModule):
             initial_state=None,
             output_final_state=False,
             use_qk_l2norm_in_kernel=False,
+            cp_context=fla_cp_context,
         )
         nvtx_range_pop(suffix="gated_delta_rule")
 
@@ -454,9 +473,7 @@ class GatedDeltaNet(MegatronModule):
         norm_out = norm_out.transpose(0, 1).contiguous()
 
         # CP all to all: HP to CP
-        norm_out = tensor_a2a_hp2cp(
-            norm_out, seq_dim=0, head_dim=-1, cp_group=self.pg_collection.cp
-        )
+        norm_out = tensor_a2a_hp2cp(norm_out, seq_dim=0, head_dim=-1, cp_group=cp_group_a2a)
 
         # Output projection
         nvtx_range_push(suffix="out_proj")
@@ -641,7 +658,7 @@ def _split_tensor_factory(
 ####################
 # Context parallel utilities
 ####################
-def get_parameter_local_cp(
+def get_parameter_local_cp_a2a(
     param: torch.Tensor,
     dim: int,
     cp_group: torch.distributed.ProcessGroup,
@@ -662,19 +679,20 @@ def get_parameter_local_cp(
         torch.Tensor: The local parameter for the current context parallel rank.
     """
 
-    cp_size = cp_group.size()
-    cp_rank = cp_group.rank()
+    cp_size = cp_group.size() if cp_group is not None else 1
 
     # No need to split if CP size is 1.
     if cp_size == 1:
         return param
+
+    cp_rank = cp_group.rank()
 
     # Split first if needed.
     if split_sections is not None:
         inputs = torch.split(param, split_sections, dim=dim)
         outputs = []
         for p in inputs:
-            p = get_parameter_local_cp(p, dim, cp_group)
+            p = get_parameter_local_cp_a2a(p, dim, cp_group)
             outputs.append(p)
         return torch.cat(outputs, dim=dim)
 
@@ -711,7 +729,7 @@ def tensor_a2a_cp2hp(
         torch.Tensor: The all-to-all tensor.
     """
 
-    cp_size = cp_group.size()
+    cp_size = cp_group.size() if cp_group is not None else 1
 
     # No need to all-to-all if CP size is 1.
     if cp_size == 1:
@@ -774,7 +792,7 @@ def tensor_a2a_hp2cp(
         torch.Tensor: The all-to-all tensor.
     """
 
-    cp_size = cp_group.size()
+    cp_size = cp_group.size() if cp_group is not None else 1
 
     # No need to all-to-all if CP size is 1.
     if cp_size == 1:
