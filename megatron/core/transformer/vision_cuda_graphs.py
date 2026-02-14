@@ -23,29 +23,21 @@ import logging
 import os
 import time
 from contextlib import nullcontext
-from typing import List, Optional
-
 import torch
 
 logger = logging.getLogger(__name__)
 
 try:
     from transformer_engine.pytorch import make_graphed_callables
-    from transformer_engine.pytorch.graph import is_graph_capturing
 
     HAVE_TE_GRAPHS = True
 except ImportError:
     HAVE_TE_GRAPHS = False
 
 try:
-    from megatron.core.transformer.cuda_graphs import (
-        CudaGraphScope,
-        _layer_is_graphable,
-    )
+    from megatron.core.transformer.cuda_graphs import CudaGraphScope
     from megatron.core.utils import get_attr_wrapped_model
-    from megatron.core.parallel_state import (
-        get_cuda_rng_tracker,
-    )
+    from megatron.core.parallel_state import get_cuda_rng_tracker
 except ImportError:
     CudaGraphScope = None
 
@@ -65,6 +57,29 @@ def _vision_layer_is_graphable(layer, config):
         return False
 
     return True
+
+
+def _wrap_graph_for_vision(graph_fn):
+    """Wrap a graphed callable to filter out None outputs.
+
+    During make_graphed_callables warmup, vision encoder layers go through their
+    normal forward() path which returns (output, context=None). _te_cuda_graph_replay
+    asserts len(output) == 1 but gets 2 elements. This wrapper filters out None
+    values so replay sees (output,) instead of (output, None).
+    """
+
+    def wrapped(*args, **kwargs):
+        result = graph_fn(*args, **kwargs)
+        if isinstance(result, tuple):
+            filtered = tuple(r for r in result if r is not None)
+            return filtered if filtered else result
+        return result
+
+    # Preserve TE-specific attributes needed for CUDA graph management
+    for attr in ('backward_dw', 'reset'):
+        if hasattr(graph_fn, attr):
+            setattr(wrapped, attr, getattr(graph_fn, attr))
+    return wrapped
 
 
 class VisionTECudaGraphHelper:
@@ -232,6 +247,17 @@ class VisionTECudaGraphHelper:
 
         This method uses TE's make_graphed_callables to capture the forward pass
         of each vision encoder layer.
+
+        IMPORTANT: Before capturing, we must remove any existing `cudagraph_manager`
+        from the vision layers. If present, the local CUDA graph path
+        (_should_call_local_cudagraph) would take priority over the TE path during
+        both the make_graphed_callables warmup AND normal training replay. This causes:
+        1. Warmup calls go through the local graph manager with incomplete inputs,
+           corrupting the local graph state.
+        2. The TE graphs (self.cuda_graphs) are never replayed because the local
+           path takes priority in __call__.
+        Removing cudagraph_manager ensures the TE path (_should_call_te_cudagraph)
+        is used consistently.
         """
         if not self.callables:
             logger.warning(
@@ -239,30 +265,71 @@ class VisionTECudaGraphHelper:
             )
             return
 
+        # Remove any existing cudagraph_manager to avoid conflict with TE CUDA graph path.
+        for layer in self.callables:
+            if hasattr(layer, 'cudagraph_manager'):
+                delattr(layer, 'cudagraph_manager')
+
+        # Build _order for make_graphed_callables using the actual pipeline schedule.
+        #
+        # With _order, make_graphed_callables returns forward FUNCTIONS instead of
+        # modules with replaced forward methods. Without _order, the returned modules
+        # would trigger recursive __call__ -> _te_cuda_graph_replay calls.
+        #
+        # CRITICAL: Vision encoder layers live on the first pipeline stage alongside
+        # the first LM decoder layers. They follow the exact same pipeline schedule,
+        # so we compute _order identically to the LM helper (TECudaGraphHelper).
+        # This ensures make_graphed_callables can reuse static buffers across
+        # microbatches whose lifetimes don't overlap in the actual schedule.
+        from megatron.core import parallel_state
+        from megatron.core.pipeline_parallel.schedules import (
+            get_pp_rank_microbatches,
+            get_schedule_table,
+        )
+        from megatron.core.transformer.cuda_graphs import convert_schedule_table_to_order
+
+        num_model_chunks = 1
+
+        # If PP is not enabled, we only need to capture one microbatch.
+        if parallel_state.get_pipeline_model_parallel_world_size() == 1:
+            self.num_microbatches = 1
+        # else: keep self.num_microbatches as passed from train.py
+
+        _, _, num_warmup_microbatches, _ = get_pp_rank_microbatches(
+            self.num_microbatches,
+            num_model_chunks,
+            getattr(self.vision_config, 'microbatch_group_size_per_vp_stage', None),
+            False,
+        )
+        schedule_table = get_schedule_table(
+            self.num_microbatches,
+            num_model_chunks,
+            getattr(self.vision_config, 'microbatch_group_size_per_vp_stage', None),
+        )
+        order = convert_schedule_table_to_order(
+            num_warmup_microbatches, num_model_chunks, schedule_table
+        )
+
+        rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
+        logger.info(
+            f"Rank {rank}: Vision CUDA graph order: "
+            f"num_microbatches={self.num_microbatches}, "
+            f"num_warmup={num_warmup_microbatches}, "
+            f"order_len={len(order)}"
+        )
+
         start_time = self._start_capturing()
 
-        # Prepare sample arguments
+        # Prepare sample arguments (includes attention_mask and rotary_pos_emb)
+        # Must be called AFTER num_microbatches is finalized above.
         sample_args, sample_kwargs_list = self._get_sample_args()
 
-        # Build _order for make_graphed_callables
-        # This is critical: with _order, make_graphed_callables returns forward FUNCTIONS
-        # instead of modules with replaced forward methods. Without _order, the returned
-        # modules would trigger recursive __call__ -> _te_cuda_graph_replay calls.
-        # For vision encoder with 1 model chunk and N microbatches:
-        # order = [1, 1, ..., 1, -1, -1, ..., -1] (N forwards, then N backwards)
-        num_model_chunks = 1
-        order = []
-        for _ in range(self.num_microbatches):
-            order.append(num_model_chunks)  # Forward pass (positive chunk ID)
-        for _ in range(self.num_microbatches):
-            order.append(-num_model_chunks)  # Backward pass (negative chunk ID)
-
-        # With _order provided:
-        # - callables should be just the unique layers (not duplicated per microbatch)
-        # - sample_args has entries for each (layer, microbatch) forward pass
-        # - _num_layers_per_chunk specifies layers per model chunk
-
         # Capture CUDA graphs using TE
+        try:
+            from transformer_engine.pytorch.utils import is_te_min_version
+        except ImportError:
+            is_te_min_version = lambda v: False
+
         kwargs = {
             "num_warmup_iters": self.vision_config.cuda_graph_warmup_steps
             if hasattr(self.vision_config, 'cuda_graph_warmup_steps')
@@ -272,54 +339,40 @@ class VisionTECudaGraphHelper:
             "_num_layers_per_chunk": [len(self.callables)],
         }
 
-        # Add sample_kwargs if supported (TE >= 1.10.0)
-        try:
-            from transformer_engine.pytorch.utils import is_te_min_version
+        # Reuse input/output buffers between layers to reduce peak memory
+        # during capture. Critical to avoid OOM on memory-constrained GPUs.
+        if is_te_min_version("2.7.0"):
+            kwargs['_reuse_graph_input_output_buffers'] = True
 
-            if is_te_min_version("1.10.0") and sample_kwargs_list:
-                kwargs["sample_kwargs"] = tuple(sample_kwargs_list)
-        except ImportError:
-            pass
+        # FP8 is not used for vision encoder — explicitly disable to avoid
+        # any TE default behavior
+        kwargs['fp8_enabled'] = False
 
-        # Use RNG context for sequence parallel
+        # Add sample_kwargs (TE >= 1.10.0 required for kwarg support)
+        if is_te_min_version("1.10.0") and sample_kwargs_list:
+            kwargs["sample_kwargs"] = tuple(sample_kwargs_list)
+
+        # Use RNG context for sequence parallel (matches LM helper behavior)
         if hasattr(self.vision_config, 'sequence_parallel') and self.vision_config.sequence_parallel:
             rng_context = get_cuda_rng_tracker().fork()
         else:
             rng_context = nullcontext()
 
         with rng_context:
-            # Pass just the unique callables (layers), not duplicated per microbatch
             graphs = make_graphed_callables(
                 tuple(self.callables),
                 tuple(sample_args),
                 **kwargs,
             )
 
-        # Assign captured graphs to layers
-        # Wrap each graph to filter out None outputs - vision encoder layers return
-        # (hidden_states, context) where context is None, but _te_cuda_graph_replay
-        # expects only 1 output when context is None
-        def wrap_graph_for_vision(graph_fn):
-            """Wrap graphed callable to filter out None outputs."""
-            def wrapped(*args, **kwargs):
-                result = graph_fn(*args, **kwargs)
-                if isinstance(result, tuple):
-                    # Filter out None values to match _te_cuda_graph_replay expectations
-                    filtered = tuple(r for r in result if r is not None)
-                    return filtered
-                return result
-            # Preserve backward_dw and reset attributes if they exist
-            if hasattr(graph_fn, 'backward_dw'):
-                wrapped.backward_dw = graph_fn.backward_dw
-            if hasattr(graph_fn, 'reset'):
-                wrapped.reset = graph_fn.reset
-            return wrapped
-
+        # Assign captured graphs to layers.
+        # Wrap each graph to filter out None from (output, None) returned by forward()
+        # so that _te_cuda_graph_replay sees (output,) and its len==1 assertion passes.
         for layer_idx, layer in enumerate(self.callables):
             layer.cuda_graphs = []
             for microbatch_idx in range(self.num_microbatches):
                 graph_idx = microbatch_idx * len(self.callables) + layer_idx
-                layer.cuda_graphs.append(wrap_graph_for_vision(graphs[graph_idx]))
+                layer.cuda_graphs.append(_wrap_graph_for_vision(graphs[graph_idx]))
 
         self._finish_capturing(start_time)
 
