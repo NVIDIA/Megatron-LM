@@ -2,6 +2,7 @@
 
 """Convert a GPTModel."""
 import functools
+import inspect
 import json
 import os
 import sys
@@ -20,7 +21,6 @@ from megatron.post_training.arguments import add_modelopt_args
 from megatron.post_training.checkpointing import load_modelopt_checkpoint
 from megatron.post_training.model_builder import modelopt_gpt_mamba_builder
 from megatron.post_training.utils import (
-    modelopt_version_at_least,
     report_current_memory_info,
     to_empty_if_meta,
 )
@@ -91,8 +91,9 @@ def check_arguments():
         exit()
 
     if hasattr(args, 'moe_grouped_gemm') and args.moe_grouped_gemm == True:
-        print_rank_0("WARNING: Forcing moe_grouped_gemm to False for PTQ and export.")
-        args.moe_grouped_gemm = False
+        if not getattr(args, 'export_default_te_spec', False):
+            print_rank_0("WARNING: Forcing moe_grouped_gemm to False for PTQ and export.")
+            args.moe_grouped_gemm = False
 
 
 if __name__ == "__main__":
@@ -140,7 +141,7 @@ if __name__ == "__main__":
             "dtype": import_dtype,
             "moe_router_dtype": args.moe_router_dtype,
         }
-        if modelopt_version_at_least("0.41.0"):
+        if "trust_remote_code" in inspect.signature(import_mcore_gpt_from_hf).parameters:
             import_kwargs.update({"trust_remote_code": args.trust_remote_code})
         import_mcore_gpt_from_hf(
             unwrapped_model, args.pretrained_model_path, workspace_dir, **import_kwargs
