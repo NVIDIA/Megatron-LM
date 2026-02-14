@@ -30,6 +30,8 @@ from megatron.core.inference.data_parallel_inference_coordinator import (
 from megatron.core.inference.engines.abstract_engine import AbstractEngine
 from megatron.core.inference.headers import Headers, UnknownHeaderError
 from megatron.core.inference.inference_request import (
+    DynamicInferenceEvent,
+    DynamicInferenceEventType,
     DynamicInferenceRequest,
     DynamicInferenceRequestRecord,
     Status,
@@ -173,6 +175,7 @@ class DynamicInferenceEngine(AbstractEngine):
         self.controller = controller
         self.context = context
         self.track_paused_request_events = inference_config.track_paused_request_events
+        self.track_generated_token_events = inference_config.track_generated_token_events
         self.enable_chunked_prefill = inference_config.enable_chunked_prefill
         self.metrics_writer = inference_config.metrics_writer
         self.logging_step_interval = inference_config.logging_step_interval
@@ -710,6 +713,7 @@ class DynamicInferenceEngine(AbstractEngine):
                 record=DynamicInferenceRequestRecord.from_request(request),
                 future=self._loop.create_future(),
             )
+            request.add_event_add_engine()  # Record when request enters engine
 
         if request.status is None:
             request.status = Status.ACTIVE_AND_GENERATING_TOKENS
@@ -882,7 +886,21 @@ class DynamicInferenceEngine(AbstractEngine):
                 # Skip appending token for requests being finished due to stop words
                 # (they already have their final token from the previous step)
                 if request_id not in self.stop_word_being_finished_ids:
+                    is_first_token = len(request.generated_tokens) == 0
                     request.generated_tokens.append(token)
+                    if self.track_generated_token_events:
+                        event_generated_token = request.add_event_generated_token(token)
+                    if is_first_token:
+                        if self.track_generated_token_events:
+                            first_token_event = event_generated_token
+                        else:
+                            first_token_event = DynamicInferenceEvent(
+                                type=DynamicInferenceEventType.GENERATED_TOKEN,
+                                payload={"token_id": token},
+                            )
+                        request.ttft = (
+                            first_token_event.timestamp - request.event_add_engine.timestamp
+                        )
                     if request.tpot is None:
                         request.tpot = []
                     request.tpot.append(step_time)
@@ -894,6 +912,7 @@ class DynamicInferenceEngine(AbstractEngine):
                     # Request finished by normal means (termination_id, max_length, or stop word from previous step)
                     request.generated_length = len(request.generated_tokens)
                     request.status = Status.COMPLETED
+                    request.add_event_finish()
                     finished_entry = self.requests.pop(request_id)
                     finished_request = finished_entry.record[-1]
                     finished_request.generated_length = len(finished_request.generated_tokens)
@@ -1102,7 +1121,7 @@ class DynamicInferenceEngine(AbstractEngine):
                     self._loop.create_task, self._notify_cond_for_new_request()
                 )
                 req.remaining_prompt_tokens = req.remaining_prompt_tokens.new_empty(0)
-                req.add_event_add()
+                req.add_event_add_context()
                 self.waiting_request_ids.popleft()
             else:
                 break
@@ -1142,26 +1161,17 @@ class DynamicInferenceEngine(AbstractEngine):
 
             if request_can_be_added and kv_cache_available:
                 if token_fully_can_be_added:
-                    # For Mamba models we need to ensure that the last prefill chunk
-                    # is still tagged as a chunked prefill request.
-                    self.context.has_explicit_chunked_prefill_req = (
-                        self.context.is_hybrid_model
-                        and self.context.chunked_prefill_request_id == req.request_id
-                    )
                     self.context.chunked_prefill_request_id = -1
                     self.context.add_request(req)
                     self._loop.call_soon_threadsafe(
                         self._loop.create_task, self._notify_cond_for_new_request()
                     )
                     req.remaining_prompt_tokens = req.remaining_prompt_tokens.new_empty(0)
-                    req.add_event_add()
+                    req.add_event_add_context()
                     # Fully scheduled, so we remove from waiting pool
                     self.waiting_request_ids.popleft()
                     # Only this case we keep checking the rest of the waiting queue
-                    # We break early for Mamba models running a final prefill chunk
-                    # so that no additional requests are scheduled beyond the chunked
-                    # prefill request.
-                    can_schedule = not self.context.has_explicit_chunked_prefill_req
+                    can_schedule = True
                 elif token_partially_can_be_added:
                     chunk_length = self.context.max_tokens - self.context.active_token_count
                     self.context.add_request(req, chunk_length=chunk_length)
@@ -1169,7 +1179,6 @@ class DynamicInferenceEngine(AbstractEngine):
                         self._loop.create_task, self._notify_cond_for_new_request()
                     )
                     self.context.chunked_prefill_request_id = req.request_id
-                    self.context.has_explicit_chunked_prefill_req = self.context.is_hybrid_model
                     req.remaining_prompt_tokens = req.remaining_prompt_tokens[chunk_length:]
                     req.finished_chunk_token_count += chunk_length
                     # Still have tokens to prefill, so we break and keep the
@@ -1284,9 +1293,7 @@ class DynamicInferenceEngine(AbstractEngine):
                 newly_paused_request_ids = newly_paused_request_ids.tolist()
                 [self.get_request(i).add_event_pause() for i in newly_paused_request_ids]
 
-            # Mark requests finished.
-            [self.get_request(i).add_event_finish() for i in finished_request_ids.tolist()]
-            # Add finished events.
+            # Process finished requests (adds FINISH events and returns records).
             (active_request_ids, finished_request_records) = self.post_process_requests(
                 active_request_ids,
                 finished_request_ids,

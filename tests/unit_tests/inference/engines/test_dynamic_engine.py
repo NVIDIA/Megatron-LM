@@ -111,6 +111,7 @@ class DynamicEngineTestConfig:
     # relevant to the test. The tests only check if the required
     # context attributes are set correctly.
     suspend_resume_interval: Optional[int] = None
+    track_generated_token_events: bool = False
 
     fp8: bool = False
 
@@ -226,9 +227,11 @@ class TestDynamicInferenceEngine:
                 max_tokens=test_config.context_max_tokens,
                 mamba_inference_state_config=mamba_inference_state_config,
                 materialize_only_last_token_logits=test_config.materialize_only_last_token_logits,
+                enable_chunked_prefill=test_config.enable_chunked_prefill,
                 use_flashinfer_fused_rope=None,  # default to using flash-infer if available
                 # this is for compatibility with the LTS environment
                 unified_memory_level=0,  # unit tests currently broken with UVM
+                track_generated_token_events=test_config.track_generated_token_events,
             ),
         )
 
@@ -1092,53 +1095,305 @@ class TestDynamicInferenceEngine:
         )
 
         expected_event_types = [
-            ['ADD', 'FINISH'],
-            ['ADD', 'FINISH'],
-            ['ADD', 'FINISH'],
-            ['ADD', 'FINISH'],
-            ['ERROR_TRANSIENT', 'ADD', 'FINISH'],
-            ['ERROR_TRANSIENT', 'ADD', 'FINISH'],
-            ['ADD', 'FINISH'],
-            ['ERROR_NONTRANSIENT', 'FAIL'],
-            ['ERROR_NONTRANSIENT', 'FAIL'],
-            ['ERROR_TRANSIENT', 'ADD', 'FINISH'],
-            ['ERROR_NONTRANSIENT', 'FAIL'],
-            ['ERROR_TRANSIENT', 'ADD', 'FINISH'],
-            ['ADD', 'FINISH'],
-            ['ERROR_TRANSIENT', 'ADD', 'FINISH'],
-            ['ERROR_TRANSIENT', 'ADD', 'FINISH'],
-            ['ERROR_TRANSIENT', 'ADD', 'FINISH'],
+            ['ADD_ENGINE', 'ADD_CONTEXT', 'FINISH'],
+            ['ADD_ENGINE', 'ADD_CONTEXT', 'FINISH'],
+            ['ADD_ENGINE', 'ADD_CONTEXT', 'FINISH'],
+            ['ADD_ENGINE', 'ERROR_NONTRANSIENT', 'FAIL'],
+            ['ADD_ENGINE', 'ADD_CONTEXT', 'FINISH'],
+            ['ADD_ENGINE', 'ADD_CONTEXT', 'FINISH'],
+            ['ADD_ENGINE', 'ADD_CONTEXT', 'FINISH'],
+            ['ADD_ENGINE', 'ERROR_NONTRANSIENT', 'FAIL'],
+            ['ADD_ENGINE', 'ERROR_NONTRANSIENT', 'FAIL'],
+            ['ADD_ENGINE', 'ERROR_NONTRANSIENT', 'FAIL'],
+            ['ADD_ENGINE', 'ADD_CONTEXT', 'FINISH'],
+            ['ADD_ENGINE', 'ADD_CONTEXT', 'FINISH'],
+            ['ADD_ENGINE', 'ADD_CONTEXT', 'FINISH'],
+            ['ADD_ENGINE', 'ERROR_NONTRANSIENT', 'FAIL'],
+            ['ADD_ENGINE', 'ERROR_NONTRANSIENT', 'FAIL'],
+            ['ADD_ENGINE', 'ADD_CONTEXT', 'FINISH'],
         ]
-        result_event_types = [[e.type.name for e in r.events] for r in env.requests]
-
+        result_event_types = [
+            [e.type.name for e in r.events if e.type.name != 'GENERATED_TOKEN']
+            for r in env.requests
+        ]
         assert result_event_types == expected_event_types
 
     @pytest.mark.internal
     @pytest.mark.skipif(
         not is_fa_min_version("2.7.3"), reason="need latest flash attn for dynamic batching"
     )
-    @pytest.mark.parametrize("model_provider", ["gpt", "mamba"])
     @torch.inference_mode()
-    def test_chunked_prefill(self, model_provider: str):
-        """Verify that chunked prefill output is equivalent to regular prefill."""
-        skip_if_mamba_sequence_packing_not_available(model_provider)
+    def test_event_timestamps(self):
+        """Test that events are recorded with sensical timestamps.
 
-        prompt_length = 1200
-        num_tokens_to_generate = 16
-        max_sequence_length = prompt_length + num_tokens_to_generate
-
-        # Configure context to force chunking
+        Verifies:
+        1. Completed requests have ADD_ENGINE, ADD_CONTEXT, GENERATED_TOKEN(s), FINISH events
+        2. Event timestamps are monotonically increasing
+        3. TTFT (time-to-first-token) can be computed as first GENERATED_TOKEN - ADD_ENGINE
+        """
+        num_tokens_to_generate = 8
         env = self._run_test(
-            num_requests=1,
-            min_prompt_length=prompt_length,
-            max_prompt_length=prompt_length,
+            num_requests=4,
+            max_prompt_length=16,
             num_tokens_to_generate=num_tokens_to_generate,
-            materialize_only_last_token_logits=False,
-            model_provider=model_provider,
-            context_block_size_tokens=256,
-            context_max_tokens=1000,
-            enable_chunked_prefill=True,
+            context_buffer_size_gb=0.1,
+            num_gap_steps=0,
+            track_generated_token_events=True,
         )
+
+        # All requests should complete with this generous config (large buffer, no gap steps).
+        assert all(r.status == Status.COMPLETED for r in env.requests)
+        for request in env.requests:
+
+            # Verify event types for completed requests
+            event_types = [e.type.name for e in request.events]
+            # Should be: ADD_ENGINE, ADD_CONTEXT, GENERATED_TOKEN (repeated), FINISH
+            assert (
+                event_types[0] == 'ADD_ENGINE'
+            ), f"Request {request.request_id}: first event should be ADD_ENGINE, got {event_types[0]}"
+            assert (
+                event_types[1] == 'ADD_CONTEXT'
+            ), f"Request {request.request_id}: second event should be ADD_CONTEXT, got {event_types[1]}"
+            assert (
+                event_types[-1] == 'FINISH'
+            ), f"Request {request.request_id}: last event should be FINISH, got {event_types[-1]}"
+            # Check that GENERATED_TOKEN events are in the middle
+            gen_token_count = event_types.count('GENERATED_TOKEN')
+            assert gen_token_count == len(request.generated_tokens), (
+                f"Request {request.request_id}: GENERATED_TOKEN count ({gen_token_count}) != "
+                f"generated_tokens length ({len(request.generated_tokens)})"
+            )
+
+            # Verify timestamps are monotonically increasing
+            timestamps = [e.timestamp for e in request.events]
+            for i in range(1, len(timestamps)):
+                assert timestamps[i] >= timestamps[i - 1], (
+                    f"Request {request.request_id}: timestamp[{i}] ({timestamps[i]}) < "
+                    f"timestamp[{i-1}] ({timestamps[i-1]})"
+                )
+
+            # Verify TTFT is positive and sensical (first GENERATED_TOKEN - ADD_ENGINE)
+            add_engine_ts = request.events[0].timestamp
+            first_token_ts = request.events[2].timestamp  # First GENERATED_TOKEN event
+            assert (
+                request.events[2].type.name == 'GENERATED_TOKEN'
+            ), f"Request {request.request_id}: event[2] should be GENERATED_TOKEN"
+            ttft = first_token_ts - add_engine_ts
+            assert ttft >= 0, f"Request {request.request_id}: TTFT is negative ({ttft})"
+
+            # Verify total request time is positive
+            finish_ts = request.events[-1].timestamp
+            total_time = finish_ts - add_engine_ts
+            assert (
+                total_time >= ttft
+            ), f"Request {request.request_id}: total_time ({total_time}) < TTFT ({ttft})"
+
+    @pytest.mark.internal
+    @pytest.mark.skipif(
+        not is_fa_min_version("2.7.3"), reason="need latest flash attn for dynamic batching"
+    )
+    @torch.inference_mode()
+    def test_mamba_chunked_prefill(self):
+        """
+        Test chunked prefill with a Mamba model.
+        """
+        skip_if_mamba_sequence_packing_not_available("mamba")
+
+        # Context max tokens = 50.
+        test_config = DynamicEngineTestConfig(
+            model_provider="mamba",
+            num_requests=0,
+            num_tokens_to_generate=None,
+            num_tokens_total=200,
+            context_max_tokens=52,
+            context_max_requests=5,
+            context_block_size_tokens=256,
+            enable_chunked_prefill=True,
+            use_cuda_graphs_for_non_decode_steps=False,
+        )
+
+        env = self._build_test_env(test_config)
+        ctx = env.engine.context
+
+        def mock_forward(input_ids, position_ids, attention_mask, *args, **kwargs):
+            return torch.randn(
+                input_ids.size(0),
+                input_ids.size(1),
+                test_config.vocab_size,
+                device=input_ids.device,
+                dtype=torch.bfloat16,
+            )
+
+        # Mock the model forward function to avoid possible numerics issues
+        # caused by random inputs
+        model_instance = env.engine.controller.inference_wrapped_model.model
+        model_instance.forward = mock_forward
+
+        # Request 1: 150 tokens
+        req1_tokens = torch.randint(0, test_config.vocab_size, (130,), device='cuda')
+        req1 = DynamicInferenceRequest(
+            request_id=1,
+            prompt_tokens=req1_tokens,
+            sampling_params=SamplingParams(num_tokens_to_generate=3),
+        )
+
+        # Request 2: 160 tokens
+        req2_tokens = torch.randint(0, test_config.vocab_size, (160,), device='cuda')
+        req2 = DynamicInferenceRequest(
+            request_id=2,
+            prompt_tokens=req2_tokens,
+            sampling_params=SamplingParams(num_tokens_to_generate=1),
+        )
+
+        # Request 3: 24 tokens
+        req3_tokens = torch.randint(0, test_config.vocab_size, (24,), device='cuda')
+        req3 = DynamicInferenceRequest(
+            request_id=3,
+            prompt_tokens=req3_tokens,
+            sampling_params=SamplingParams(num_tokens_to_generate=1),
+        )
+
+        # Add requests 1-3
+        env.engine._add_request(req1)
+        env.engine._add_request(req2)
+        env.engine._add_request(req3)
+
+        # Run step 1
+        env.engine.schedule_waiting_requests()
+
+        env.engine.step_modern()
+        assert req1.finished_chunk_token_count == 52
+
+        # Prepare for step 2
+        env.engine.schedule_waiting_requests()
+
+        # Verify that requests 2 and 3 are queued because request 1 is still running
+        assert ctx.num_prefill_requests == 1
+        active_ids = ctx.request_ids[: ctx.total_request_count].tolist()
+        assert 1 in active_ids
+        assert 2 not in active_ids
+        assert 3 not in active_ids
+        assert 2 in env.engine.waiting_request_ids
+        assert 3 in env.engine.waiting_request_ids
+
+        # Verify that active token count == max tokens - 1
+        # The -1 is for the useless chunked prefill token
+        assert ctx.active_token_count == 51
+
+        # Verify that request 1 is the designated chunked prefill request
+        assert ctx.chunked_prefill_request_id == 1
+
+        # Run step 2
+        env.engine.step_modern()
+        assert req1.finished_chunk_token_count == 104
+
+        # Prepare for step 3
+        env.engine.schedule_waiting_requests()
+
+        # Verify that request 2 got partially scheduled and is now
+        # the designated chunked prefill request
+        req2_idx = ctx.request_ids.tolist().index(2)
+        assert req2_idx == 1
+        assert ctx.num_prefill_requests == 2
+        assert ctx.chunked_prefill_request_id == 2
+        assert ctx.get_index_of_chunked_prefill_request() == req2_idx
+        active_ids = ctx.request_ids[: ctx.total_request_count].tolist()
+        assert 1 in active_ids
+        assert 2 in active_ids
+        assert 3 not in active_ids
+
+        # Store the Mamba state tensor idx for request 2
+        req2_mamba_idx = ctx.mamba_metadata.request_to_mamba_state_idx[req2_idx].item()
+
+        # Verify that the active token count is the maximum token count
+        assert ctx.active_token_count == 52
+
+        # Run step 3
+        env.engine.step_modern()
+        assert req1.finished_chunk_token_count == 104
+
+        # Prepare for step 4
+        env.engine.schedule_waiting_requests()
+
+        # Verify that request 2 is still the first prefill request
+        assert ctx.request_ids.tolist().index(2) == 1
+        assert ctx.mamba_metadata.request_to_mamba_state_idx[1] == req2_mamba_idx
+
+        # Verify that request 1 is running decode
+        active_ids = ctx.request_ids[: ctx.total_request_count].tolist()
+        assert ctx.num_decode_requests == 1
+        assert 1 in active_ids
+
+        # Verify that request 2 is still running prefill as the designated chunked prefill request
+        assert ctx.num_prefill_requests == 1
+        assert ctx.chunked_prefill_request_id == 2
+        assert ctx.get_index_of_chunked_prefill_request() == 1
+
+        # Verify that request 3 is still waiting
+        assert 3 not in active_ids
+        assert 3 in env.engine.waiting_request_ids
+
+        # Verify that active token count == max tokens - 1
+        # The -1 is for the useless chunked prefill token
+        assert ctx.active_token_count == 51
+
+        # Run step 4
+        env.engine.step_modern()
+
+        assert req2.finished_chunk_token_count == 77
+
+        # Prepare for step 5
+        env.engine.schedule_waiting_requests()
+
+        # Verify that request 2 is still the first prefill request
+        assert ctx.request_ids.tolist().index(2) == 1
+        assert ctx.mamba_metadata.request_to_mamba_state_idx[1] == req2_mamba_idx
+
+        # Run step 5
+        env.engine.step_modern()
+        assert req2.finished_chunk_token_count == 128
+
+        # Prepare for step 6
+        env.engine.schedule_waiting_requests()
+
+        # Verify that request 1 has completed
+        assert req1.status == Status.COMPLETED
+
+        # Verify that request 2 is still the first prefill request
+        assert ctx.request_ids.tolist().index(2) == 0
+        assert ctx.mamba_metadata.request_to_mamba_state_idx[0] == req2_mamba_idx
+
+        # Verify that request 3 is now scheduled as the chunked prefill request
+        active_ids = ctx.request_ids[: ctx.total_request_count].tolist()
+        assert 2 in active_ids
+        assert 3 in active_ids
+        assert ctx.chunked_prefill_request_id == 3
+        req3_idx = active_ids.index(3)
+        assert req3_idx == 1
+
+        # Store the Mamba state tensor idx for request 3
+        req3_mamba_idx = ctx.mamba_metadata.request_to_mamba_state_idx[req3_idx].item()
+
+        # Run step 6
+        env.engine.step_modern()
+
+        # Verify that request 2 has finished
+        assert req2.status == Status.COMPLETED
+        assert req3.finished_chunk_token_count == 20
+
+        # Prepare for step 7
+        env.engine.schedule_waiting_requests()
+
+        # Verify that request 3 is now the first prefill request
+        req3_idx = ctx.request_ids.tolist().index(3)
+        assert req3_idx == 0
+        assert ctx.mamba_metadata.request_to_mamba_state_idx[0] == req3_mamba_idx
+
+        # Run step 7
+        env.engine.step_modern()
+
+        # Verify that request 3 has finished
+        assert req3.status == Status.COMPLETED
 
     @pytest.mark.internal
     @pytest.mark.skipif(
