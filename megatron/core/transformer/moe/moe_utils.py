@@ -17,7 +17,7 @@ from megatron.core.transformer.cuda_graphs import is_graph_capturing
 from megatron.core.transformer.enums import CudaGraphScope
 from megatron.core.transformer.moe.router_replay import RouterReplay
 from megatron.core.transformer.transformer_config import TransformerConfig
-from megatron.core.utils import internal_api
+from megatron.core.utils import internal_api, is_te_min_version
 
 try:
     import transformer_engine as te  # pylint: disable=unused-import
@@ -26,6 +26,7 @@ try:
         fused_compute_score_for_moe_aux_loss,
         fused_moe_aux_loss,
         fused_permute,
+        fused_permute_and_pad_with_probs,
         fused_permute_with_probs,
         fused_sort_chunks_by_index,
         fused_sort_chunks_by_index_with_probs,
@@ -295,7 +296,15 @@ def permute(
     num_out_tokens: Optional[int] = None,
     fused: bool = False,
     drop_and_pad: bool = False,
-) -> Tuple[torch.Tensor, Optional[torch.Tensor], torch.Tensor]:
+    tokens_per_expert: Optional[torch.Tensor] = None,
+    align_size: int = -1,
+) -> Tuple[
+    torch.Tensor,
+    Optional[torch.Tensor],
+    torch.Tensor,
+    Optional[torch.Tensor],
+    Optional[torch.Tensor],
+]:
     """Permute the tokens and probs based on the mask.
     Tokens with the same designated expert will be grouped together.
     The shape of mask is [tokens, num_experts], it indicates which experts were selected
@@ -303,6 +312,9 @@ def permute(
 
     When drop_and_pad=True, in routing_map, the number of non-zeros in each column equals to
     expert capacity. This function exploits this feature to use ops that support cuda graph.
+
+    If the fused permute and pad kernel is available, it will pad the tokens to the align_size
+    and return the padded permuted tokens, pad_offsets and padded tokens per expert.
 
     Args:
         tokens (torch.Tensor): The input token tensor, [num_tokens, hidden].
@@ -315,10 +327,20 @@ def permute(
                                        and pads the number of tokens to the expert capacity.
                                        If set to true, routing_map has a fixed number of non-zeros
                                        in each column.
+        tokens_per_expert (torch.Tensor, optional): Tensor of shape `[num_experts]` containing
+                                                    actual token counts per expert.
+        align_size (int, optional): The alignment size for the input tensor for fp8 or fp4.
 
     Returns:
-        Tuple[torch.Tensor, Optional[torch.Tensor], torch.Tensor]:
-            The permuted tokens, permuted probs, and sorted indices.
+        Tuple[
+            torch.Tensor,
+            Optional[torch.Tensor],
+            torch.Tensor,
+            Optional[torch.Tensor],
+            Optional[torch.Tensor],
+        ]:
+            The permuted tokens, (optional) permuted probs, sorted indices,
+            (optional) pad_offsets, (optional) padded_tokens_per_expert.
     """
     if fused and probs is None:
         if not HAVE_TE or fused_permute is None:
@@ -326,14 +348,26 @@ def permute(
         permuted_input, sorted_indices = fused_permute(
             tokens, routing_map, num_out_tokens=num_out_tokens
         )
-        return permuted_input, None, sorted_indices
+        return permuted_input, None, sorted_indices, None, tokens_per_expert
 
     if fused and probs is not None:
-        if not HAVE_TE or fused_permute_with_probs is None:
+        if not HAVE_TE or (
+            fused_permute_and_pad_with_probs is None and fused_permute_with_probs is None
+        ):
             raise ValueError(
-                "fused_permute_with_probs is not available. Please install TE >= 2.1.0."
+                "Transformer Engine (TE) fused kernel is not available. "
+                "fused_permute_with_probs typically requires TE >= 2.1.0, and "
+                "fused_permute_and_pad_with_probs` typically requires TE >= 2.12.0. "
             )
-        return fused_permute_with_probs(tokens, probs, routing_map, num_out_tokens=num_out_tokens)
+        if fused_permute_and_pad_with_probs is not None and tokens_per_expert is not None:
+            return fused_permute_and_pad_with_probs(
+                tokens, probs, routing_map, tokens_per_expert, align_size
+            )
+        else:
+            output, permuted_probs, row_id_map = fused_permute_with_probs(
+                tokens, probs, routing_map, num_out_tokens=num_out_tokens
+            )
+            return output, permuted_probs, row_id_map, None, tokens_per_expert
 
     num_tokens, hidden = tokens.shape
     num_experts = routing_map.shape[1]
@@ -378,7 +412,7 @@ def permute(
     # use the mapping to permute the tokens
     permuted_input = tokens.index_select(0, sorted_indices)
 
-    return permuted_input, permuted_probs, sorted_indices
+    return permuted_input, permuted_probs, sorted_indices, None, tokens_per_expert
 
 
 def unpermute(
@@ -389,6 +423,7 @@ def unpermute(
     routing_map: Optional[torch.Tensor] = None,
     fused: bool = False,
     drop_and_pad: bool = False,
+    pad_offsets: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     """
     Restore the original order of tokens after permutation. If probs are provided, it
@@ -410,6 +445,10 @@ def unpermute(
         fused (bool, optional): Whether use the fused unpermute function.
         drop_and_pad (bool, optional): Whether or not the token dispatcher uses token-drop
                                        and pads the number of tokens to the expert capacity.
+        pad_offsets (torch.Tensor, optional):
+            Tensor of per-expert cumulative padding offsets used to remove padding added
+            during permutation. This is the fourth output of `moe_permute_and_pad_with_probs`
+            and is required when unpermuting padded outputs. Defaults to None.
 
     Returns:
         torch.Tensor: The tokens restored to their original order.
@@ -417,8 +456,15 @@ def unpermute(
     if fused:
         if not HAVE_TE or fused_unpermute is None:
             raise ValueError("fused_unpermute is not available. Please install TE >= 2.1.0.")
+        extra_kwargs = {}
+        if is_te_min_version("2.12.0"):
+            extra_kwargs["pad_offsets"] = pad_offsets
         return fused_unpermute(
-            permuted_tokens, sorted_indices, merging_probs=probs, restore_shape=restore_shape
+            permuted_tokens,
+            sorted_indices,
+            merging_probs=probs,
+            restore_shape=restore_shape,
+            **extra_kwargs,
         )
 
     _, hidden = restore_shape

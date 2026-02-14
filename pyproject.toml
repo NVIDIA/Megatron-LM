@@ -30,7 +30,6 @@ keywords = [
     "gpu",
     "language",
     "learning",
-    "learning",
     "machine",
     "nvidia",
     "pytorch",
@@ -61,10 +60,17 @@ classifiers = [
 
 [project.urls]
 Download = "https://github.com/NVIDIA/Megatron-LM/releases"
-Homepage = "https://github.com/NVIDIA/Megatron-LM/megatron/core"
+Homepage = "https://github.com/NVIDIA/Megatron-LM"
 
 [project.optional-dependencies]
-mlm = ["flask-restful", "sentencepiece", "tiktoken", "wandb", "transformers", "accelerate"]
+mlm = [
+    "flask-restful",
+    "sentencepiece",
+    "tiktoken",
+    "wandb",
+    "transformers",
+    "accelerate",
+]
 
 dev = [
     "nvidia-modelopt[torch]; sys_platform != 'darwin'",
@@ -179,14 +185,14 @@ override-dependencies = [
 flash_mla = [
     { git = "https://github.com/deepseek-ai/FlashMLA", rev = "9edee0c022cd0938148a18e334203b0aab43aa19" },
 ]
-transformer-engine = { git = "https://github.com/NVIDIA/TransformerEngine.git", rev = "d9b7fc5770a88af06e2e9c2bd97b550614c3a69f" }
+transformer-engine = { git = "https://github.com/NVIDIA/TransformerEngine.git", rev = "5671fd3675906cda1ade26c24a65d3dedd88eb89" }
 nemo-run = { git = "https://github.com/NVIDIA-NeMo/Run.git", rev = "01a9a8ba360f7b2908728ad0516e0ad9d936966d" }
 emerging_optimizers = { git = "https://github.com/NVIDIA-NeMo/Emerging-Optimizers.git", rev = "v0.1.0" }
 
 [tool.isort]
 profile = "black"                                                          # black-compatible
 line_length = 100                                                          # should match black parameters
-py_version = 310                                                           # python 3.8 as a target version
+py_version = 310                                                           # python 3.10 as a target version
 known_first_party = ["megatron"]                                           # FIRSTPARTY section
 known_third_party = ["transformer_engine"]                                 # THIRDPARTY section
 sections = ["FUTURE", "STDLIB", "THIRDPARTY", "FIRSTPARTY", "LOCALFOLDER"]
@@ -196,7 +202,7 @@ extend_skip = ["setup.py"]
 [tool.black]
 line_length = 100
 skip_string_normalization = true
-# recongized by future versions, disallows to reformat code with incompatible versions
+# recognized by future versions, disallows to reformat code with incompatible versions
 # Matches NeMO version so people working on both codebases don't need two different version of black installed
 required_version = "24"
 skip_magic_trailing_comma = true
