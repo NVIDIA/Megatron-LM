@@ -410,7 +410,7 @@ class TopKRouter(Router):
             global_aux_loss,
             "global_load_balancing_loss",
             self.tp_dp_cp_group,
-            reduce_group_has_dp=True,
+            needs_dp_avg=False,
             valid_token_count=local_num_tokens,
         )
         return probs
@@ -422,7 +422,7 @@ class TopKRouter(Router):
         aux_loss: torch.Tensor,
         aux_loss_name: str,
         reduce_group: torch.distributed.ProcessGroup,
-        reduce_group_has_dp: bool = False,
+        needs_dp_avg: bool = True,
         valid_token_count: Optional[Union[int, torch.Tensor]] = None,
     ):
         """Attach aux loss function to activation and add to logging.
@@ -433,9 +433,7 @@ class TopKRouter(Router):
             aux_loss (torch.Tensor): Computed aux loss.
             aux_loss_name (str): Name of the aux loss for logging.
             reduce_group (torch.distributed.ProcessGroup): Process group for reduction.
-            reduce_group_has_dp (bool): Whether the reduce group has data parallel ranks.
-                Set this to True if the reduce group has data parallel ranks. This flag is used to
-                ensure the correct reduction in aux loss tracking.
+            needs_dp_avg (bool): Whether to average this metric across DP ranks after reduce_group.
             valid_token_count (int or torch.Tensor, optional): Number of valid tokens excluding
                 padding tokens. Can be a Python int or a torch.Tensor (typically 0-d tensor).
                 If None, uses activation.shape[0]. Defaults to None.
@@ -453,7 +451,7 @@ class TopKRouter(Router):
             self.layer_number,
             num_layers,
             reduce_group=reduce_group,
-            reduce_group_has_dp=reduce_group_has_dp,
+            needs_dp_avg=needs_dp_avg,
         )
         if self.calculate_per_token_loss:
             # Scale the aux_loss by the number of tokens.

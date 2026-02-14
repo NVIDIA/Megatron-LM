@@ -872,8 +872,8 @@ def save_to_aux_losses_tracker(
     num_layers: int,
     reduce_group: Optional[torch.distributed.ProcessGroup] = None,
     avg_group: Optional[torch.distributed.ProcessGroup] = None,
-    percentiles: Optional[List[float]] = None,
-    reduce_group_has_dp: bool = False,
+    layer_percentiles: Optional[List[float]] = None,
+    needs_dp_avg: bool = True,
 ) -> None:
     """Save the auxiliary loss for logging.
     Args:
@@ -885,11 +885,10 @@ def save_to_aux_losses_tracker(
             Defaults to None.
         avg_group (torch.distributed.ProcessGroup, optional): The group for averaging the loss.
             Defaults to None.
-        percentiles (List[float], optional): List of percentiles to compute for logging.
+        layer_percentiles (List[float], optional): Layer-wise percentiles to compute for logging.
             Defaults to None.
-        reduce_group_has_dp (bool, optional): Whether the reduce group has data parallel ranks.
-            Set this to True if the reduce group has data parallel ranks. This flag is used to
-            ensure the correct reduction in aux loss tracking. Defaults to False.
+        needs_dp_avg (bool, optional): Whether to average the metric across data parallel ranks.
+            Defaults to True.
     """
     MoEMetricsTracker.get_instance().record(
         name=name,
@@ -898,8 +897,8 @@ def save_to_aux_losses_tracker(
         num_layers=num_layers,
         reduce_group=reduce_group,
         avg_group=avg_group,
-        percentiles=percentiles,
-        reduce_group_has_dp=reduce_group_has_dp,
+        layer_percentiles=layer_percentiles,
+        needs_dp_avg=needs_dp_avg,
     )
 
 

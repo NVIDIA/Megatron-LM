@@ -33,8 +33,9 @@ class _MetricEntry:
     values: torch.Tensor
     reduce_group: Optional[torch.distributed.ProcessGroup] = None
     avg_group: Optional[torch.distributed.ProcessGroup] = None
-    percentiles: Optional[List[float]] = None  # e.g., [0.5, 0.95] for p50, p95
-    reduce_group_has_dp: bool = False  # Whether the reduce group has data parallel ranks
+    layer_percentiles: Optional[List[float]] = None  # e.g., [0.5, 0.95] for p50, p95
+    # Whether to average across DP after PP/reduce_group/avg_group reductions.
+    needs_dp_avg: bool = True
 
 
 class MoEMetricsTracker:
@@ -74,8 +75,8 @@ class MoEMetricsTracker:
         num_layers: int,
         reduce_group: Optional[torch.distributed.ProcessGroup] = None,
         avg_group: Optional[torch.distributed.ProcessGroup] = None,
-        percentiles: Optional[List[float]] = None,
-        reduce_group_has_dp: bool = False,
+        layer_percentiles: Optional[List[float]] = None,
+        needs_dp_avg: bool = True,
     ) -> None:
         """Record a metric value for a specific layer.
 
@@ -88,8 +89,8 @@ class MoEMetricsTracker:
             num_layers: Total number of layers.
             reduce_group: Process group for all-reduce operations.
             avg_group: Process group for averaging operations.
-            percentiles: List of percentiles to compute (e.g., [0.5, 0.95] for p50, p95).
-            reduce_group_has_dp: Whether the reduce group has data parallel ranks.
+            layer_percentiles: Layer-wise percentiles to compute (e.g., [0.5, 0.95]).
+            needs_dp_avg: Whether to average the metric across DP ranks.
         """
         if layer_number is None:
             return
@@ -101,8 +102,8 @@ class MoEMetricsTracker:
         entry.values[layer_number - 1] += value.detach()
         entry.reduce_group = reduce_group
         entry.avg_group = avg_group
-        entry.percentiles = percentiles
-        entry.reduce_group_has_dp = reduce_group_has_dp
+        entry.layer_percentiles = layer_percentiles
+        entry.needs_dp_avg = needs_dp_avg
 
     def track(
         self,
@@ -182,7 +183,7 @@ class MoEMetricsTracker:
         1. Collect across Pipeline Parallel (PP)
         2. Reduce using custom reduce_group (e.g., tp_cp_group)
         3. Average using custom avg_group
-        4. Average across Data Parallel (DP) - except for global_load_balancing_loss
+        4. Average across Data Parallel (DP) when needed
 
         Args:
             names: Metric name(s) to reduce. If None, reduces all metrics.
@@ -212,17 +213,17 @@ class MoEMetricsTracker:
             # Reduce aux losses across custom reduce_group
             if entry.reduce_group is not None:
                 torch.distributed.all_reduce(values, group=entry.reduce_group)
-                # Need to conduct reduction across data parallel ranks. When the reduce_group
-                # does not have 'dp' attribute, do it manually.
-                if not entry.reduce_group_has_dp:
-                    torch.distributed.all_reduce(
-                        values, group=dp_group, op=torch.distributed.ReduceOp.AVG
-                    )
 
             # Average aux losses across custom avg_group
             if entry.avg_group is not None:
                 torch.distributed.all_reduce(
                     values, group=entry.avg_group, op=torch.distributed.ReduceOp.AVG
+                )
+
+            # Average across DP ranks when required by metric semantics.
+            if entry.needs_dp_avg:
+                torch.distributed.all_reduce(
+                    values, group=dp_group, op=torch.distributed.ReduceOp.AVG
                 )
 
     def get_log_string(self, aggregated: Dict[str, float]) -> str:
@@ -261,14 +262,14 @@ class MoEMetricsTracker:
         return self._metrics
 
     def get_raw_tracker(self) -> Dict[str, dict]:
-        """Get metrics in the legacy dict format for backward compatibility."""
+        """Get metrics in dict format."""
         return {
             name: {
                 "values": entry.values,
                 "reduce_group": entry.reduce_group,
                 "avg_group": entry.avg_group,
-                "percentiles": entry.percentiles,
-                "reduce_group_has_dp": entry.reduce_group_has_dp,
+                "layer_percentiles": entry.layer_percentiles,
+                "needs_dp_avg": entry.needs_dp_avg,
             }
             for name, entry in self._metrics.items()
         }
@@ -278,12 +279,12 @@ class MoEMetricsTracker:
         name: str,
         num_layers: int,
         device: Union[str, torch.device, int] = torch.cuda.current_device(),
-        percentiles: Optional[List[float]] = None,
+        layer_percentiles: Optional[List[float]] = None,
     ) -> None:
         """Force initialize a metric entry."""
         if name not in self._metrics:
             self._metrics[name] = _MetricEntry(
-                values=torch.zeros(num_layers, device=device), percentiles=percentiles
+                values=torch.zeros(num_layers, device=device), layer_percentiles=layer_percentiles
             )
 
     # =========================================================================
@@ -327,7 +328,7 @@ class MoEMetricsTracker:
         """Aggregate layer-wise metrics to scalar values.
 
         For all metrics: computes average across layers.
-        If percentiles is set: also computes specified percentiles as additional scalars.
+        If layer_percentiles is set: also computes specified percentiles as additional scalars.
 
         Returns:
             Dictionary of aggregated metric name -> scalar value.
@@ -341,13 +342,13 @@ class MoEMetricsTracker:
             entry = self._metrics[name]
             values = entry.values.float() * loss_scale
 
-            # Compute percentiles if configured
-            if entry.percentiles is not None:
+            # Compute percentiles if configured.
+            if entry.layer_percentiles is not None:
                 vals = values[values > 0]
                 pct_values = torch.quantile(
-                    vals.float(), torch.tensor(entry.percentiles, device=vals.device)
+                    vals.float(), torch.tensor(entry.layer_percentiles, device=vals.device)
                 ).tolist()
-                for pct, pct_val in zip(entry.percentiles, pct_values):
+                for pct, pct_val in zip(entry.layer_percentiles, pct_values):
                     aggregated[f"{name}_p{int(pct * 100)}"] = pct_val
 
             # Always compute mean
@@ -375,8 +376,8 @@ class MoEMetricsTracker:
             entry = self._metrics[name]
             values = entry.values.float() * loss_scale
             for i, val in enumerate(values.tolist()):
-                # Skip zero values for sparse metrics (those with percentiles configured)
-                if entry.percentiles is not None and val == 0:
+                # Skip zero values for sparse metrics (those with percentiles configured).
+                if entry.layer_percentiles is not None and val == 0:
                     continue
                 self._write_scalar_metric(
                     f"moe/{name}_layer_{i}", val, iteration, writer, wandb_writer
