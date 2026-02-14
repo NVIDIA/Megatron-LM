@@ -38,7 +38,6 @@ env:
 jobs:
   is-not-external-contributor:
     runs-on: ubuntu-latest
-    environment: nemo-ci
     if: github.repository == 'NVIDIA/Megatron-LM'
     outputs:
       is_external_contributor: ${{ github.event.pull_request.user.type == 'User' }}
@@ -73,15 +72,11 @@ jobs:
         id: check-membership
         env:
           IS_MAIN_BRANCH: ${{ github.ref == 'refs/heads/main' }}
-          IS_DEV_BRANCH: ${{ github.ref == 'refs/heads/dev' }}
           IS_MERGE_GROUP: ${{ github.event_name == 'merge_group' }}
           SCHEDULED_JOB: ${{ github.event_name == 'schedule' }}
         run: |
           # Skip SSO check for scheduled jobs, main branch, dev branch, or merge groups
           if [ "${{ env.SCHEDULED_JOB }}" == "true" ] || [ "${IS_MAIN_BRANCH}" == "true" ] || [ "${IS_DEV_BRANCH}" == "true" ] || [ "${IS_MERGE_GROUP}" == "true" ]; then
-            echo "is_maintainer=true" | tee -a $GITHUB_OUTPUT
-            exit 0
-          fi
 
           # Use SSO membership check result
           IS_MEMBER="${{ steps.check-sso.outputs.is_member }}"
@@ -410,7 +405,6 @@ jobs:
       - cicd-wait-in-queue
       - cicd-container-build
       - cicd-unit-tests-latest
-    environment: nemo-ci
     if: |
       needs.pre-flight.result != 'cancelled'
       && needs.cicd-wait-in-queue.result != 'cancelled'
@@ -599,7 +593,6 @@ jobs:
       && needs.pre-flight.outputs.is_ci_workload == 'false'
       && !cancelled()
       && github.repository == 'NVIDIA/Megatron-LM'
-    environment: nemo-ci
     steps:
       - name: Generate fake coverage report
         uses: actions/github-script@v6
