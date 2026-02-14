@@ -28,7 +28,7 @@ from megatron.core.datasets.gpt_dataset import GPTDataset, GPTDatasetConfig, Moc
 from megatron.core.enums import ModelType
 from megatron.core.models.gpt import GPTModel
 from megatron.core.rerun_state_machine import get_rerun_state_machine
-from megatron.core.utils import get_attr_wrapped_model, get_thd_batch_on_this_cp_rank, get_batch_on_this_hybrid_cp_rank, StragglerDetector
+from megatron.core.utils import get_attr_wrapped_model, get_thd_batch_on_this_cp_rank, get_batch_on_this_dynamic_cp_rank, StragglerDetector
 from megatron.core.tokenizers.text.utils.build_tokenizer import build_tokenizer
 from megatron.core.transformer.multi_token_prediction import mtp_on_this_rank, get_mtp_ranks
 from megatron.training import (
@@ -93,8 +93,8 @@ def get_batch(data_iterator, vp_stage: Optional[int] = None):
     elif local_cp_size is None:  # Packed THD format
         assert max_seqlen.dim() == 1
         batch, packed_seq_params = get_thd_batch_on_this_cp_rank(batch, cu_seqlens, cu_seqlens_padded, max_seqlen)
-    else: # Hybrid CP format
-        batch, packed_seq_params = get_batch_on_this_hybrid_cp_rank(batch, local_cp_size)
+    else: # Dynamic CP format
+        batch, packed_seq_params = get_batch_on_this_dynamic_cp_rank(batch, local_cp_size)
     
     return (*batch.values(), packed_seq_params)
 
@@ -254,7 +254,7 @@ def core_gpt_dataset_config_from_args(args):
         "context_parallel_size": args.context_parallel_size,
         "data_parallel_size": args.data_parallel_size,
         "sequence_parallel_size": args.tensor_model_parallel_size*args.sequence_parallel,
-        "hybrid_context_parallel": args.hybrid_context_parallel,
+        "dynamic_context_parallel": args.dynamic_context_parallel,
     }
 
     # add FIM args to the config

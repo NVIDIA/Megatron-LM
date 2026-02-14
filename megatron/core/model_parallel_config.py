@@ -62,14 +62,14 @@ class ModelParallelConfig:
     can handle without overflowing the memory. Typically, a good starting point is to set this
     to maximum sequence length / context parallel size.
     This is used to calculate the number and length of sub-samples assigned to 
-    each rank when using hybrid_context_parallel.
+    each rank when using dynamic_context_parallel.
     """
 
-    hybrid_context_parallel: bool = False
+    dynamic_context_parallel: bool = False
     """
-    If true, enables hybrid context parallel. This is used to balance the workload of 
+    If true, enables dynamic context parallel. This is used to balance the workload of 
     each CP rank when we use packed samples with variable sequence lengths.
-    Please set max_seqlen_per_dp_cp_rank when using hybrid_context_parallel.
+    Please set max_seqlen_per_dp_cp_rank when using dynamic_context_parallel.
     """
 
     expert_model_parallel_size: int = 1

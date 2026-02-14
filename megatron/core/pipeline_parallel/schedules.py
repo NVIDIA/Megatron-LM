@@ -37,7 +37,7 @@ from .combined_1f1b import (
     combined_1f1b_schedule_for_interleaved_pipelining,
     combined_1f1b_schedule_for_no_pipelining,
 )
-from .hybrid_cp_schedule import hybrid_context_parallel_forward_backward
+from .dynamic_cp_schedule import dynamic_context_parallel_forward_backward
 
 # Types
 Shape = Union[List[int], torch.Size]
@@ -615,8 +615,8 @@ def forward_backward_no_pipelining(
             total_num_tokens,
             partial(check_first_val_step, first_val_step, forward_only),
         )
-    elif config.hybrid_context_parallel:
-        forward_data_store, total_num_tokens = hybrid_context_parallel_forward_backward(
+    elif config.dynamic_context_parallel:
+        forward_data_store, total_num_tokens = dynamic_context_parallel_forward_backward(
             forward_step_func,
             data_iterator,
             model,

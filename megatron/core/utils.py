@@ -2113,11 +2113,11 @@ def get_thd_batch_on_this_cp_rank(
 
 
 ################################
-### hybrid context parallel ###
+### dynamic context parallel ###
 ################################
 
 
-def get_batch_on_this_hybrid_cp_rank(
+def get_batch_on_this_dynamic_cp_rank(
     batch: Dict[str, Any],
     local_cp_size: int,
     cp_group: Optional[torch.distributed.ProcessGroup] = None,
@@ -2127,18 +2127,17 @@ def get_batch_on_this_hybrid_cp_rank(
     """
     assert local_cp_size is not None
     if cp_group is None:
-        # Get the local cp group required for as defined by the HybridCPDataLoaderWrapper
-        if local_cp_size > 1:
-            cp_group = parallel_state.get_hybrid_data_context_parallel_groups(
-                group_size=local_cp_size
-            )
+        # Get the local cp group required for as defined by the DynamicCPDataLoaderWrapper
+        cp_group = parallel_state.get_dynamic_data_context_parallel_groups(
+            group_size=local_cp_size
+        )
     else:
         # If cp group is provided, it must match the local cp size
-        # as defined by the HybridCPDataLoaderWrapper
+        # as defined by the DynamicCPDataLoaderWrapper
         assert cp_group.size() == local_cp_size
 
     # Convert [seqlen] to [1, seqlen] similar to default collate_fn
-    # as hybrid_context_parallel dataloader wrapper does not go through default collate_fn
+    # as dynamic_context_parallel dataloader wrapper does not go through default collate_fn
     for key, data in batch.items():
         if key in ['attention_mask']:
             continue
@@ -2158,8 +2157,8 @@ def get_batch_on_this_hybrid_cp_rank(
         cp_group=cp_group,
     )
 
-    if cp_group is not None and cp_group.size() > 1:
-        # When using hybrid_context_parallel, each sub-sample of a packed sample is
+    if cp_group.size() > 1:
+        # When using dynamic_context_parallel, each sub-sample of a packed sample is
         # required to be divisible by CP*DP*2 or CP*DP*TP*2 (if using sequence parallel)
         batch = get_batch_on_this_cp_rank(batch, cp_group=cp_group)
 
