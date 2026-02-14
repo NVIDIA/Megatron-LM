@@ -396,16 +396,18 @@ def permute(
             permuted_probs = probs_T_1D.index_select(0, indices_1D)
     else:
         # mask [num_tokens, num_experts] -> [num_experts, num_tokens]
-        routing_map = routing_map.bool().T.contiguous()
+        routing_map = routing_map.to(dtype=torch.int8).T.contiguous()
 
-        # Create a dense expert-to-token mapping from the sparse token-to-expert mapping
-        token_indices = (
-            torch.arange(num_tokens, device=routing_map.device).unsqueeze(0).expand(num_experts, -1)
-        )
-        sorted_indices = token_indices.masked_select(routing_map)
+        # Use argsort to get indices of non-zero entries in row-major order.
+        # This is equivalent to masked_select but produces fixed-shape output,
+        # making it compatible with CUDA graph capture.
+        flat_sorted = routing_map.reshape(-1).argsort(descending=True, stable=True)
+        if num_out_tokens is not None:
+            flat_sorted = flat_sorted[:num_out_tokens]
+        sorted_indices = flat_sorted % num_tokens
 
         if probs is not None:
-            permuted_probs = probs.T.contiguous().masked_select(routing_map)
+            permuted_probs = probs.T.contiguous().reshape(-1)[flat_sorted]
 
     # use the mapping to permute the tokens
     permuted_input = tokens.index_select(0, sorted_indices)
@@ -487,7 +489,12 @@ def unpermute(
             # get probs from indices
             permuted_probs = probs_T_1D.index_select(0, indices_1D)
         else:
-            permuted_probs = probs.T.contiguous().masked_select(routing_map.T.contiguous())
+            num_out_tokens = permuted_tokens.shape[0]
+            routing_map_int = routing_map.to(dtype=torch.int8).T.contiguous()
+            flat_sorted = routing_map_int.reshape(-1).argsort(descending=True, stable=True)[
+                :num_out_tokens
+            ]
+            permuted_probs = probs.T.contiguous().reshape(-1)[flat_sorted]
         # Here may promote permuted_tokens to higher precision (fp32/fp64) if probs is in
         # higher precision due to moe_router_dtype being enabled. This can lead to
         # additional GPU memory usage. Use --moe-permute-fusion flag to avoid this extra memory

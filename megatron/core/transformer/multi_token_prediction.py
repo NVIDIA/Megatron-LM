@@ -649,6 +649,7 @@ def process_mtp_loss(
         return hidden_states
 
     mtp_labels = labels.clone()
+
     if loss_mask is None:
         loss_mask = torch.ones_like(mtp_labels)
 

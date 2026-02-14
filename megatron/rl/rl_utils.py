@@ -34,7 +34,13 @@ from megatron.core.rerun_state_machine import RerunDataIterator
 from megatron.core.tokenizers import MegatronTokenizer
 from megatron.core.transformer.cuda_graphs import _CudagraphGlobalRecord
 from megatron.core.transformer.enums import CudaGraphScope
-from megatron.core.transformer.utils import toggle_cuda_graphs
+from megatron.core.transformer.utils import (
+    disable_cuda_graphs,
+    toggle_cuda_graphs,
+    transition_moe_to_full_cudagraphs,
+    transition_moe_to_partial_cudagraphs,
+)
+from megatron.core.inference.utils import set_decode_expert_padding
 from megatron.core.resharding.refit import swap_model_weights
 from megatron.core.inference.unified_memory import (
     advise_managed_module_parameters_preferred_location,
@@ -624,7 +630,7 @@ def selective_log_softmax(logits, index):
     return per_token_logps
 
 
-def get_logprobs(model, tokens, position_ids, no_grad=False, sequence_packing=False, packed_seq_params=None):
+def get_logprobs(model, tokens, position_ids, no_grad=True, sequence_packing=False, packed_seq_params=None):
     """Get sequence logprobs from their token ids.
 
     Args:
@@ -1211,59 +1217,63 @@ def prepare_data_for_update(
 
         with torch.no_grad(), nvtx_range("compute_logprobs", time=True):
             # Before we can update the model, we need to get the logprobs for the \pi_{old} model.
+            # TODO(helenn): Re-enable cudagraphs for logprobs calculations.
 
-            # Wrap forward_backward_func for Full iteration CUDA graph
-            forward_backward_func = get_forward_backward_func()
-            if args.cuda_graph_impl == "local" and CudaGraphScope.full_iteration in args.cuda_graph_scope:
-                forward_backward_func = FullCudaGraphWrapper(
-                    forward_backward_func, cuda_graph_warmup_steps=args.cuda_graph_warmup_steps
-                )
-
-
-            dtype = (
-                torch.bfloat16 if args.bf16 else (torch.float16 if args.fp16 else torch.float32)
+            _logprobs_lang_module = (
+                (model.module.module if hasattr(model.module, "module") else model.module)
+                if args.rl_training_cuda_graphs else None
             )
+            with disable_cuda_graphs(model, lang_module=_logprobs_lang_module):
+                forward_backward_func = get_forward_backward_func()
+                if args.cuda_graph_impl == "local" and CudaGraphScope.full_iteration in args.cuda_graph_scope:
+                    forward_backward_func = FullCudaGraphWrapper(
+                        forward_backward_func, cuda_graph_warmup_steps=args.cuda_graph_warmup_steps
+                    )
 
-            pg_collection = get_attr_wrapped_model(model, "pg_collection")
-            pp_group = pg_collection.pp
-
-            with torch.no_grad(), nvtx_range("compute_old_logprobs", time=True):
-                old_logprobs = compute_logprobs_batch(
-                    model=model,
-                    data_loader=data_loader,
-                    forward_backward_func=forward_backward_func,
-                    packing_context=packing_context,
-                    trajs_batch_size=len(compute_trajs),
-                    seq_length=args.seq_length,
-                    logprobs_batch_size=logprobs_batch_size,
-                    decoder_seq_length=args.decoder_seq_length,
-                    dtype=dtype,
-                    pp_group=pp_group,
-                    is_correction=args.rl_inference_logprobs_is_correction,
+                dtype = (
+                    torch.bfloat16 if args.bf16 else (torch.float16 if args.fp16 else torch.float32)
                 )
 
-            with torch.no_grad(), nvtx_range("compute_ref_logprobs", time=True):
-                # We need to load the ref model state dict and compute the logprobs for the ref model
-                cur_st_dict = {
-                    k: (v.cpu() if v is not None else v) for k, v in model.state_dict().items()
-                }
-                model.load_state_dict(ref_state_dict)
-                ref_logprobs = compute_logprobs_batch(
-                    model=model,
-                    data_loader=data_loader,
-                    forward_backward_func=forward_backward_func,
-                    packing_context=packing_context,
-                    trajs_batch_size=len(compute_trajs),
-                    seq_length=args.seq_length,
-                    logprobs_batch_size=logprobs_batch_size,
-                    decoder_seq_length=args.decoder_seq_length,
-                    dtype=dtype,
-                    pp_group=pp_group,
-                    is_correction=args.rl_inference_logprobs_is_correction,
-                )
+                pg_collection = get_attr_wrapped_model(model, "pg_collection")
+                pp_group = pg_collection.pp
 
-                # logprobs are [b, seq, h] now.
-                model.load_state_dict(cur_st_dict)
+                with torch.no_grad(), nvtx_range("compute_old_logprobs", time=True):
+                    old_logprobs = compute_logprobs_batch(
+                        model=model,
+                        data_loader=data_loader,
+                        forward_backward_func=forward_backward_func,
+                        packing_context=packing_context,
+                        trajs_batch_size=len(compute_trajs),
+                        seq_length=args.seq_length,
+                        logprobs_batch_size=logprobs_batch_size,
+                        decoder_seq_length=args.decoder_seq_length,
+                        dtype=dtype,
+                        pp_group=pp_group,
+                        is_correction=args.rl_inference_logprobs_is_correction,
+                    )
+
+                with torch.no_grad(), nvtx_range("compute_ref_logprobs", time=True):
+                    # We need to load the ref model state dict and compute the logprobs for the ref model
+                    cur_st_dict = {
+                        k: (v.cpu() if v is not None else v) for k, v in model.state_dict().items()
+                    }
+                    model.load_state_dict(ref_state_dict)
+                    ref_logprobs = compute_logprobs_batch(
+                        model=model,
+                        data_loader=data_loader,
+                        forward_backward_func=forward_backward_func,
+                        packing_context=packing_context,
+                        trajs_batch_size=len(compute_trajs),
+                        seq_length=args.seq_length,
+                        logprobs_batch_size=logprobs_batch_size,
+                        decoder_seq_length=args.decoder_seq_length,
+                        dtype=dtype,
+                        pp_group=pp_group,
+                        is_correction=args.rl_inference_logprobs_is_correction,
+                    )
+
+                    # logprobs are [b, seq, h] now.
+                    model.load_state_dict(cur_st_dict)
 
             torch.cuda.synchronize()
             gc.collect()
@@ -1677,8 +1687,16 @@ def megatron_rl_inference_mode(
 
     logger.debug(f"[{dist.get_rank()}] Entering inference mode")
 
+    # Change cudagraph scope for inference (empty list = full-layer capture)
+    model[0].config.cuda_graph_scope = []
+    model[0].config.cuda_graph_impl = "local"
+
     # If we get a lower precision wrapper, we go one object deeper.
     lang_module = model[0].module.module if hasattr(model[0].module, "module") else model[0].module
+
+    # Switch MoE layers to full CUDA graph capture for inference
+    if args.rl_training_cuda_graphs:
+        transition_moe_to_full_cudagraphs(lang_module)
 
     lang_module.eval()
     # If this is a separate RL inference model with offloading enabled, ensure weights are on GPU
@@ -1761,6 +1779,21 @@ def megatron_rl_inference_mode(
         # TODO: Remove this if statement once a change to `toggle_cuda_graphs` makes it safe to.
         if cuda_graph_impl != "none" and not args.rl_training_cuda_graphs:
             toggle_cuda_graphs(lang_module, 'none', reset_cuda_graphs=reset_cuda_graphs)
+
+        # Reset drop_and_pad leaked from inference decode
+        set_decode_expert_padding(unwrap_model(model[0]), set_to=False)
+
+        # Change cudagraph scope for training
+        model[0].config.cuda_graph_scope = [
+            CudaGraphScope.mamba,
+            CudaGraphScope.attn,
+            CudaGraphScope.moe_router,
+            CudaGraphScope.moe_preprocess,
+        ]
+
+        # Switch MoE layers to partial CUDA graph capture for training
+        if args.rl_training_cuda_graphs:
+            transition_moe_to_partial_cudagraphs(lang_module)
 
         # If this is a separate RL inference model, prefetch weights back to CPU so they don't consume
         # GPU memory during training.
