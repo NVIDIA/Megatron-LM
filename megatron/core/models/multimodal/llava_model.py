@@ -982,10 +982,6 @@ class LLaVAModel(MegatronModule):
         if num_image_tiles is None and images is not None:
             num_image_tiles = torch.ones(images.shape[0], dtype=torch.int, device=input_ids.device)
 
-        _image_token_index = (
-            image_token_index if image_token_index is not None else self.image_token_index
-        )
-
         combined_embeddings, new_labels, new_loss_mask = self._preprocess_data(
             image_embeddings,
             language_embeddings,
@@ -994,7 +990,7 @@ class LLaVAModel(MegatronModule):
             labels,
             use_inference_kv_cache,
             inference_context,
-            _image_token_index,
+            image_token_index if image_token_index is not None else self.image_token_index,
             num_image_tiles,
         )  # [combined_seq_len, b, h_language], [b, combined_seq_len], [b, combined_seq_len]
 
