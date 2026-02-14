@@ -1458,8 +1458,8 @@ def load_args_from_checkpoint(
     _set_arg('moe_latent_size', force=True)
 
     # Tokenizer args.
-    # Using checkpoint version might not always be safe (e.g., if running on different cluster).
     if args.use_tokenizer_model_from_checkpoint_args:
+        # Using checkpoint version might not always be safe (e.g., if running on different cluster).
         _set_arg('tokenizer_model', force=True)
         _set_arg('tokenizer_type', force=True)
     _set_arg('tiktoken_pattern', force=True)
