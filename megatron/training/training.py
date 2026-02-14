@@ -137,6 +137,7 @@ from megatron.training.initialize import write_args_to_tensorboard
 from megatron.training.initialize import set_jit_fusion_options
 from megatron.training.utils import get_batch_on_this_cp_rank, get_batch_on_this_tp_rank
 from megatron.training.datasets.data_samplers import build_pretraining_data_loader
+from megatron.core.datasets.data_schedule import HybridCPDataLoaderWrapper
 from megatron.core.optimizer_param_scheduler import OptimizerParamScheduler
 from megatron.core.transformer.moe import upcycling_utils
 from megatron.core.transformer.moe.moe_utils import track_moe_metrics, clear_aux_losses_tracker
@@ -1682,8 +1683,8 @@ def train_step(forward_step_func, data_iterator, model, optimizer, opt_param_sch
         else:
             # data_iterator unchanged
             num_microbatches = get_num_microbatches()
-            seqlen_sum_this_global_batch = args.seq_length * args.micro_batch_size * args.data_parallel_size * num_microbatches
-            seqlen_squared_sum_this_global_batch = args.seq_length ** 2 * args.micro_batch_size * args.data_parallel_size * num_microbatches
+            seqlen_sum_this_global_batch = args.seq_length * args.global_batch_size
+            seqlen_squared_sum_this_global_batch = args.seq_length ** 2 * args.global_batch_size
 
         # Forward pass.
         if save_dgrads_in_this_iteration:
@@ -1723,10 +1724,9 @@ def train_step(forward_step_func, data_iterator, model, optimizer, opt_param_sch
         # iteration is 0-indexed, move to 1-indexed for checkpoint name and logging.
         save_grads(args.save, state_dict, iteration + 1, "wgrads")
 
-
     should_checkpoint, should_exit, exit_code = rerun_state_machine.should_checkpoint_and_exit()
     if should_exit:
-        return {}, True, should_checkpoint, should_exit, exit_code, None, None, seqlen_sum_this_global_batch, seqlen_squared_sum_this_global_batch, 0
+        return {}, True, should_checkpoint, should_exit, exit_code, None, None, 0, seqlen_sum_this_global_batch, seqlen_squared_sum_this_global_batch
 
     # Empty unused memory.
     if args.empty_unused_memory_level >= 1:
@@ -3145,9 +3145,30 @@ def evaluate(
             # Don't care about timing during evaluation
             config.timers = None
             ft_integration.on_eval_step_start()
+            if config.sequence_packing_scheduler is not None:
+                # This wrapper is designed to support DP-balanced THD and dynamic-CP.
+                # Before wrapping, the data_iterator returns either a single sequence per get_item call, or a list where each element is a sequence.
+                # The wrapper is responsible for:
+                # 1. scheduling the sequences across ranks
+                # 2. packing them into THD format
+                # 3. broadcast flops parametes and num_microbatches to TP ranks to support unfixed num_microbatches
+                # 4. broadcast metadata(cu_seqlens, cu_seqlens_padded, max_seqlen, etc.) to PP ranks to
+                # 5. returning the packed data iterator and the FLOPs parameters
+                try:
+                    (
+                        packed_data_iterator,
+                        eval_num_microbatches,
+                        _,
+                        _,
+                    ) = wrap_data_iterator(data_iterator, config, eval_num_microbatches)
+                except StopIteration:
+                    # Validation data iterator exhausted, stop evaluation early.
+                    break
+            else:
+                packed_data_iterator = data_iterator
             loss_dicts = forward_backward_func(
                 forward_step_func=forward_step_func,
-                data_iterator=data_iterator,
+                data_iterator=packed_data_iterator,
                 model=model,
                 num_microbatches=eval_num_microbatches,
                 seq_length=args.seq_length,

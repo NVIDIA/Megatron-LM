@@ -1,6 +1,5 @@
 # Copyright (c) 2025 NVIDIA CORPORATION.  All rights reserved.
 
-import enum
 from typing import Any, Dict, List, Optional, Type
 
 import torch
@@ -69,6 +68,7 @@ class HybridCPDataLoaderWrapper:
         Gathers the sequence lengths of all subsamples from all DP ranks.
         Each DP rank loads the same number of microbatches but each microbatch
         may have a different number of subsamples.
+
         We find the number of subsamples each rank holds and then gather the
         sequence lengths of all subsamples from all ranks.
         """
@@ -620,15 +620,7 @@ class DpBalancedScheduler(BasePackingScheduler):
         )
 
 
-class PackingSchedulerEnum(enum.Enum):
-    """Enum for supported sequence packing algorithms."""
-
-    DP_BALANCED = "dp_balanced"
-
-
-scheduler_map: Dict[PackingSchedulerEnum, Type[BasePackingScheduler]] = {
-    PackingSchedulerEnum.DP_BALANCED: DpBalancedScheduler
-}
+scheduler_map: Dict[str, Type[BasePackingScheduler]] = {"dp_balanced": DpBalancedScheduler}
 
 
 def wrap_data_iterator(
@@ -666,9 +658,8 @@ def wrap_data_iterator(
     dp_size = dp_group.size()
     cp_size = dp_cp_group.size() // dp_size
 
-    # Convert string to enum
+    # Look up the scheduler class by name
     scheduler_type = config.sequence_packing_scheduler
-    scheduler_type = PackingSchedulerEnum[scheduler_type.upper()]
 
     scheduler = scheduler_map[scheduler_type](
         config.max_seqlen_per_dp_cp_rank,

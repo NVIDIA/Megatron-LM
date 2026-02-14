@@ -870,10 +870,6 @@ class _NullTokenizer(MegatronLegacyTokenizer):
     @property
     def additional_special_tokens_ids(self):
         return None
-    
-    @property
-    def pad(self):
-        return self._eod_id - 1
 
 class _NullMultimodalTokenizer(MegatronLegacyTokenizer):
     def __init__(self, vocab_size, image_token=None, image_token_id=None):
