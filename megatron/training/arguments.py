@@ -1569,6 +1569,10 @@ def _add_inference_args(parser):
                        'the dynamic inference context. Active requests are '
                        'paused when there are not enough active blocks available '
                        'to continue generating a request.')
+    group.add_argument('--inference-dynamic-batching-mamba-memory-ratio', type=float, default=None,
+                       help='Percentage of memory buffer to allocate for Mamba states. '
+                       'If not specified, allocates Mamba state tensors for each KV cache block. '
+                       'Only used for hybrid models.')
     group.add_argument('--inference-dynamic-batching-block-size',
                        type=int, default=256,
                        help='KV cache block size. '
