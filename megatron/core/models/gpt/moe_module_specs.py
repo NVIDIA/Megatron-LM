@@ -14,7 +14,6 @@ def get_moe_module_spec(
     use_te: Optional[bool] = True,
     num_experts: Optional[int] = None,
     moe_grouped_gemm: Optional[bool] = False,
-    moe_use_legacy_grouped_gemm: Optional[bool] = False,
 ) -> ModuleSpec:
     """Helper function to get module spec for MoE"""
     if use_te is not None and use_te:
@@ -22,10 +21,7 @@ def get_moe_module_spec(
     else:
         backend = LocalSpecProvider()
     return get_moe_module_spec_for_backend(
-        backend=backend,
-        num_experts=num_experts,
-        moe_grouped_gemm=moe_grouped_gemm,
-        moe_use_legacy_grouped_gemm=moe_use_legacy_grouped_gemm,
+        backend=backend, num_experts=num_experts, moe_grouped_gemm=moe_grouped_gemm
     )
 
 
@@ -33,7 +29,6 @@ def get_moe_module_spec_for_backend(
     backend: BackendSpecProvider,
     num_experts: Optional[int] = None,
     moe_grouped_gemm: Optional[bool] = False,
-    moe_use_legacy_grouped_gemm: Optional[bool] = False,
     use_te_activation_func: bool = False,
 ) -> ModuleSpec:
     """Helper function to get module spec for MoE"""
@@ -48,8 +43,7 @@ def get_moe_module_spec_for_backend(
     )
 
     expert_module, expert_submodule = backend.grouped_mlp_modules(
-        moe_grouped_gemm is not None and moe_grouped_gemm,
-        moe_use_legacy_grouped_gemm is not None and moe_use_legacy_grouped_gemm,
+        moe_grouped_gemm is not None and moe_grouped_gemm
     )
     if expert_submodule is not None:
         expert_submodule.activation_func = activation_func
