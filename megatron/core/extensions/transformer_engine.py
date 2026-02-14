@@ -51,6 +51,7 @@ from megatron.core.transformer.utils import (
     is_layer_window_attention,
     make_sharded_tensors_for_checkpoint,
 )
+from megatron.core.typed_torch import copy_signature
 from megatron.core.utils import (
     get_pg_rank,
     get_pg_size,
@@ -1925,6 +1926,7 @@ if HAVE_TE and is_te_min_version("1.13.0"):
     class TEFusedMLP(MLP):
         """MLP wrapper using Transformer Engine's operation-based API."""
 
+        @copy_signature(MLP.__init__)
         def __init__(self, *args, **kwargs):
             super().__init__(*args, **kwargs)
 
