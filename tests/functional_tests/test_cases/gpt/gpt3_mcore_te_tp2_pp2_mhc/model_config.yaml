@@ -3,8 +3,6 @@ ENV_VARS:
   NVTE_ALLOW_NONDETERMINISTIC_ALGO: 0
   NCCL_ALGO: Ring
   CUBLAS_WORKSPACE_CONFIG: :4096:8
-  ENABLE_LIGHTWEIGHT_MODE: true
-  SKIP_PYTEST: 1
 MODEL_ARGS:
   --num-layers: 12
   --hidden-size: 512
@@ -35,9 +33,9 @@ MODEL_ARGS:
   --clip-grad: 1.0
   --lr-warmup-fraction: .01
   --log-interval: 1
-  --save-interval: 10000
-  --eval-interval: 1000
-  --eval-iters: 10
+  --save-interval: 25
+  --eval-interval: 50
+  --eval-iters: 50
   --transformer-impl: transformer_engine
   --tensor-model-parallel-size: 2
   --pipeline-model-parallel-size: 2
@@ -60,5 +58,5 @@ MODEL_ARGS:
   --recompute-hyper-connections: true
   --recompute-granularity: selective
   --mhc-recompute-layer-num: 2
-  --exit-interval: 4
-TEST_TYPE: regular
+  --exit-interval: 50
+TEST_TYPE: ckpt-resume
