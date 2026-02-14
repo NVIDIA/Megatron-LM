@@ -1,4 +1,4 @@
-# Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
 import warnings
 from dataclasses import dataclass, field
@@ -803,6 +803,49 @@ class TransformerConfig(ModelParallelConfig):
     to enable whole iteration CUDA graph. All other values enable layerwise CUDA graph."""
 
     ####################
+    # Hyper-Connection Configuration
+    ####################
+    enable_hyper_connections: bool = False
+    """Enable mHC residual connections."""
+
+    num_residual_streams: int = 4
+    """Number of residual streams (n in paper)."""
+
+    mhc_sinkhorn_iterations: int = 20
+    """Number of Sinkhorn-Knopp iterations for doubly stochastic projection."""
+
+    mhc_init_gating_factor: float = 0.01
+    """Initial value of Gating Factor (alpha in paper)."""
+
+    recompute_hyper_connections: bool = False
+    """Enable recomputation for HyperConnection intermediate activations.
+    
+    When enabled, all HyperConnection operations (compute_mappings, aggregate, apply_h_res, 
+    apply_h_post) are wrapped with CheckpointWithoutOutput and managed by MHCBlockRecomputeManager.
+    This significantly reduces memory usage by discarding intermediate activations and 
+    recomputing them during backward pass.
+    
+    Requirements:
+    - Only effective when enable_hyper_connections=True and training=True
+    - Must use recompute_granularity='selective'
+    - Cannot be used together with recompute_mlp=True (they use different checkpoint mechanisms)
+    
+    The last layer in each recompute block's final MLP BDA output is NOT checkpointed and 
+    serves as the hook_tensor for registering the unified recompute hook."""
+
+    mhc_recompute_layer_num: Optional[int] = None
+    """Number of layers per MHC recompute block.
+    
+    When set, every `mhc_recompute_layer_num` layers form a recompute block. The last layer
+    in each recompute block (i.e., layer_number % mhc_recompute_layer_num == 0 or the final
+    layer in the transformer block) will:
+    - NOT checkpoint its final MLP BDA
+    - Register the unified recompute hook on its MLP BDA output
+    - A new MHCBlockRecomputeManager is created for subsequent layers
+    
+    If None, all layers in the transformer block share a single recompute block."""
+
+    ####################
     # miscellaneous
     ####################
     clone_scatter_output_in_embedding: bool = True
@@ -1290,6 +1333,37 @@ class TransformerConfig(ModelParallelConfig):
             self.recompute_granularity = "selective"
             if "moe" not in self.recompute_modules:
                 self.recompute_modules.append("moe")
+
+        # Validation for recompute_hyper_connections
+        if self.recompute_hyper_connections:
+            if not self.enable_hyper_connections:
+                raise ValueError(
+                    "recompute_hyper_connections requires enable_hyper_connections=True."
+                )
+            if self.recompute_granularity != "selective":
+                raise ValueError(
+                    "recompute_hyper_connections requires recompute_granularity='selective'. "
+                    f"Got recompute_granularity={self.recompute_granularity}."
+                )
+            if "mlp" in self.recompute_modules:
+                raise ValueError(
+                    "recompute_hyper_connections cannot be used together with 'mlp' in "
+                    "recompute_modules. They use different checkpoint mechanisms that may conflict."
+                )
+
+        # Validation for hyper_connections with tensor parallelism
+        # When hyper connections are enabled with TP > 1, sequence_parallel must be True.
+        # This is because HyperConnectionModule uses non-TP-aware layers (nn.Linear, nn.RMSNorm),
+        # and their gradients need to be synchronized across TP ranks via the sequence_parallel
+        # attribute mechanism.
+        if self.enable_hyper_connections and self.tensor_model_parallel_size > 1:
+            if not self.sequence_parallel:
+                raise ValueError(
+                    "When enable_hyper_connections=True and tensor_model_parallel_size > 1, "
+                    "sequence_parallel must be True. HyperConnectionModule parameters require "
+                    "gradient synchronization across TP ranks, which is handled by the "
+                    "sequence_parallel mechanism."
+                )
 
         if self.fine_grained_activation_offloading:
             assert (

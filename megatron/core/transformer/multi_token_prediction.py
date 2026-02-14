@@ -1,4 +1,4 @@
-# Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
 import warnings
 from contextlib import nullcontext
@@ -663,6 +663,7 @@ class MultiTokenPredictionLayer(MegatronModule):
         diff_transformer_layer_offset = self.config.num_layers - get_transformer_layer_offset(
             self.config, vp_stage
         )
+
         self.transformer_layer = build_module(
             self.submodules.transformer_layer,
             config=self.config,
