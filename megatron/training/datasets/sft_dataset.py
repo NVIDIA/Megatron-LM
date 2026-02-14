@@ -2,9 +2,12 @@
 
 import atexit, json
 from collections import Counter
-from typing import Any, Dict, Optional
+import json
+import math
+from typing import Any, Dict, Optional, List, Union
 
 import numpy as np
+import pandas as pd
 import torch
 
 from megatron.core.datasets.gpt_dataset import GPTDatasetConfig
@@ -88,6 +91,26 @@ class SFTDataset(MegatronDataset):
             split_conversations.append(current)
         return split_conversations
 
+    def _calculate_padding_divisor(self) -> int:
+        """
+            Calculate the divisor used for sequence padding.
+            tp_pad = tp_size * 2 if tp_size > 1 else 1
+            cp_pad = cp_size * 2 if cp_size > 1 else 1
+            cp_pad = cp_pad * dp_size if hybrid_cp else cp_pad
+            divisor = cp_pad * tp_pad
+        """
+        if self.config.hybrid_context_parallel:
+            # Hybrid CP: consider both CP and DP
+            cp_pad = self.config.data_parallel_size * self.config.context_parallel_size * 2
+        else:
+            # Standard CP: only consider CP
+            cp_pad = self.config.context_parallel_size * 2 if self.config.context_parallel_size > 1 else 1
+        tp_pad = self.config.sequence_parallel_size if self.config.sequence_parallel_size > 0 else 1
+        divisor = cp_pad * tp_pad
+        # TODO(tailaim): do we need to pad for FP8 execution?
+        # divisor = ((divisor + 15) // 16) * 16
+        return divisor
+
     def __getitem__(self, idx: int) -> Dict[str, Any]:
 
         tokenizer = self.config.tokenizer
@@ -128,12 +151,11 @@ class SFTDataset(MegatronDataset):
             assert not self.config.reset_position_ids
             pack_positions.extend(range(len(tokens_list)))
 
-            if self.config.context_parallel_size > 1:
-                pad_granularity = self.config.context_parallel_size * 2
-                mod_token_count = len(pack_tokens) % pad_granularity
-                if mod_token_count != 0:
-                    pad_len = pad_granularity - mod_token_count
-                    extend_with_padding(pack_tokens, pack_targets, pack_positions, pad_len)
+            pad_granularity = self._calculate_padding_divisor()
+            mod_token_count = len(pack_tokens) % pad_granularity
+            if mod_token_count != 0:
+                pad_len = pad_granularity - mod_token_count
+                extend_with_padding(pack_tokens, pack_targets, pack_positions, pad_len)
 
             # TODO(duncan): Consider also padding to multiple of number of tokens here. This might
             # be needed for efficiency (and potentially set via command-line argument).
@@ -196,6 +218,174 @@ class SFTDataset(MegatronDataset):
             'tokens': input_ids,
             'labels': labels,
             # 'attention_mask': attention_mask,  # PyTorch collate cannot handle NoneType
+            'loss_mask': loss_mask,
+            'position_ids': position_ids,
+            'cu_seqlens': cu_seqlens,
+            'max_seqlen': max_seqlen,
+        }
+
+
+class MockSFTLowLevelDataset:
+    """The low-level mock dataset for SFT
+
+    Args:
+        mode (str): Either 'file' or 'distribution'.
+        **kwargs: Additional arguments depending on mode.
+            For mode='file': path (str) - path to a CSV file with sequence lengths.
+            For mode='distribution': type (str), min_seq_len (int), max_seq_len (int),
+                mean_seq_len (int), and distribution-specific params (e.g. lognormal_sigma).
+    """
+
+    seed: int = 0
+    """The hard-coded random seed to use to set the NumPy RNG"""
+
+    size: int = 1000000
+    """The hard-coded number of sequence to generate"""
+
+    def __init__(self, mode: str, **kwargs) -> None:
+        np.random.seed(self.seed)
+
+        if mode == "file":
+            self.sequence_lengths = np.array(pd.read_csv(kwargs["path"])).flatten()
+            self.size = len(self.sequence_lengths)
+        elif mode == "distribution":
+            min_seq_len = kwargs["min_seq_len"]
+            max_seq_len = kwargs["max_seq_len"]
+            mean_seq_len = kwargs["mean_seq_len"]
+            if kwargs["type"] == "lognormal":
+                lognormal_sigma = kwargs["lognormal_sigma"]
+                self.sequence_lengths = self.generate_lognormal_samples(
+                    self.size, mean_seq_len, lognormal_sigma, min_seq_len, max_seq_len
+                )
+            else:
+                raise ValueError(f"Unsupported distribution type {kwargs['type']}")
+        else:
+            raise ValueError(f"Unsupported mode '{mode}', must be 'file' or 'distribution'")
+        
+    def generate_lognormal_samples(self, size, mean, sigma, min_seq_len, max_seq_len):   
+        mu = np.log(mean) - sigma**2 / 2
+        samples = np.random.lognormal(mu, sigma, size)
+        samples = np.clip(samples, min_seq_len, max_seq_len)
+        return samples.astype(int)   
+
+    def __len__(self) -> int:
+        return self.size
+
+    def __getitem__(self, idx: int) -> List[np.ndarray]:
+        # the length of sample is 'length', but only length-1 elements are generated here, 
+        # because an eod token will be appended at the end later in SFTDataset
+
+        length = self.sequence_lengths[idx % self.size]
+        sample = np.arange(1, length, dtype=np.int64)
+        return sample
+
+
+class MockSFTDataset(SFTDataset):
+    """The mock dataset used during SFT"""
+
+    def __init__(
+        self,
+        dataset: LowLevelDataset,
+        dataset_path: Optional[str],
+        indices: np.ndarray,
+        num_samples: Optional[int],
+        index_split: Split,
+        config: GPTDatasetConfig,
+    ) -> None:
+        super().__init__(dataset, dataset_path, indices, num_samples, index_split, config)
+
+    @staticmethod
+    def build_low_level_dataset(dataset_path: str, config: GPTDatasetConfig) -> LowLevelDataset:
+        if config.sft_mock_dataset_config_json is None:
+            mock_config = {
+                    "mode": "distribution",
+                    "type": "lognormal",
+                    "min_seq_len": config.sequence_length // 2,
+                    "max_seq_len": config.sequence_length,
+                    "mean_seq_len": config.sequence_length // 4 * 3,
+                    "lognormal_sigma": 1.1,
+                }
+        else:
+            mock_config = json.loads(config.sft_mock_dataset_config_json)
+        return MockSFTLowLevelDataset(**mock_config)
+
+    def __len__(self) -> int:
+        return self.num_samples
+
+    def __getitem__(self, idx: int) -> Dict[str, Any]:
+
+        tokenizer = self.config.tokenizer
+        pack_length = self.config.sequence_length
+        eod = tokenizer.eod
+        pad = tokenizer.pad
+
+        tokens = self.dataset[int(self.indices[idx % len(self.indices)])]
+
+        def extend_with_padding(tokens, targets, positions, pad_len):
+            tokens.extend([pad] * pad_len)
+            targets.extend([pad] * pad_len)
+            positions.extend(range(positions[-1] + 1, positions[-1] + 1 + pad_len))
+
+        # Convert tokens to list and add EOD
+        tokens_list = tokens.tolist()
+        if tokens_list[-1] != eod:
+            tokens_list.append(eod)
+        targets_list = list(tokens_list)
+
+        pack_tokens = list(tokens_list)
+        pack_targets = list(targets_list)
+        pack_positions = list(range(len(tokens_list)))
+        cu_seqlens = [0]
+
+        # Pad to padding_divisor alignment
+        pad_granularity = self._calculate_padding_divisor()
+        mod_token_count = len(pack_tokens) % pad_granularity
+        if mod_token_count != 0:
+            pad_len = pad_granularity - mod_token_count
+            extend_with_padding(pack_tokens, pack_targets, pack_positions, pad_len)
+
+        # Record padded boundary after padding
+        cu_seqlens.append(len(pack_tokens))
+
+        # Handle any necessary truncation
+        if len(pack_tokens) >= pack_length + 1:  # +1 here to account for later alignment
+            max_body = pack_length - 1
+            pack_tokens = pack_tokens[:max_body]
+            pack_targets = pack_targets[:max_body]
+            pack_tokens.extend([eod, pad])
+            pack_targets.extend([eod, pad])
+            pack_positions = pack_positions[:pack_length + 1]
+            cu_seqlens[-1] = len(pack_tokens) - 1
+
+        # Handle any necessary padding
+        if len(pack_tokens) < pack_length + 1:  # +1 here to account for later alignment
+            pad_len = pack_length + 1 - len(pack_tokens)
+            extend_with_padding(pack_tokens, pack_targets, pack_positions, pad_len)
+            cu_seqlens[-1] = len(pack_tokens) - 1
+
+        assert len(pack_tokens) == pack_length + 1
+        assert len(pack_targets) == pack_length + 1
+        assert len(pack_positions) == pack_length + 1
+
+        # Align and convert to tensors
+        input_ids = torch.tensor(pack_tokens[:-1], dtype=torch.int64)
+        labels = torch.tensor(pack_targets[1:], dtype=torch.int64)
+        position_ids = torch.tensor(pack_positions[:-1], dtype=torch.int64)
+
+        # Loss mask
+        loss_mask = torch.ones(pack_length, dtype=torch.float32)
+        loss_mask[labels == pad] = 0.0
+        loss_mask[labels == IGNORE_INDEX] = 0.0
+
+        assert len(cu_seqlens) >= 2
+        cu_seqlens = torch.tensor(cu_seqlens, dtype=torch.int32)
+        # Calculating max_seqlen here because of possible effects of truncation and padding
+        adjacent_diffs = cu_seqlens[1:] - cu_seqlens[:-1]
+        max_seqlen = adjacent_diffs.max()  # max_seqlen is a 0-D tensor
+
+        return {
+            'tokens': input_ids,
+            'labels': labels,
             'loss_mask': loss_mask,
             'position_ids': position_ids,
             'cu_seqlens': cu_seqlens,
