@@ -287,6 +287,7 @@ class DynamicInferenceRequest(InferenceRequest):
     prompt_tokens: Optional[torch.Tensor] = None
     # remaining prompt tokens are used for chunked prefill
     remaining_prompt_tokens: Optional[torch.Tensor] = None
+    num_times_checkpointed: Optional[torch.Tensor] = None
     latency: Optional[float] = None
     # routing_indices stores MoE routing decisions for all tokens generated so far.
     # Shape: [total_tokens, num_layers, topk] - accumulated across all generation steps
@@ -501,6 +502,27 @@ class DynamicInferenceRequestRecord:
 
         old_request = self[-1]
 
+        # Increment off-policy counter.
+        num_times_checkpointed = old_request.num_times_checkpointed
+        if num_times_checkpointed is None:
+            num_times_checkpointed = torch.ones(
+                len(old_request.generated_tokens) + len(old_request.prompt_tokens),
+                dtype=torch.int32,
+                device=old_request.prompt_tokens.device,
+            )
+        else:
+            num_times_checkpointed = torch.cat(
+                (
+                    num_times_checkpointed + 1,
+                    torch.ones(
+                        len(old_request.generated_tokens),
+                        dtype=num_times_checkpointed.dtype,
+                        device=num_times_checkpointed.device,
+                    ),
+                ),
+                dim=0,
+            )
+
         # New prompt (concatenate prompt + generated tokens).
         new_prompt_tokens = torch.cat(
             (
@@ -530,6 +552,7 @@ class DynamicInferenceRequestRecord:
             request_id=old_request.request_id,
             prompt_tokens=new_prompt_tokens,
             sampling_params=new_sampling_params,
+            num_times_checkpointed=num_times_checkpointed,
         )
         self.requests.append(new_request)
 
