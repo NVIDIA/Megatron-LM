@@ -184,6 +184,7 @@ class TemporalAsyncCaller(AsyncCaller):
     def __init__(self):
         self.process: Optional[mp.Process] = None
         self.start_time: Optional[float] = None
+        self.preloaded_holder = None
 
     @_disable_gc()
     def schedule_async_call(self, async_req: AsyncRequest) -> None:
@@ -206,6 +207,7 @@ class TemporalAsyncCaller(AsyncCaller):
             # to do the defined action in `async_req.preload_fn` to
             # stage GPU tensors to its defined destination
             async_fn_args[1] = async_req.preload_fn()
+            self.preloaded_holder = async_fn_args[1]
 
         rank = torch.distributed.get_rank()
         start_sync = time()
@@ -281,6 +283,7 @@ class TemporalAsyncCaller(AsyncCaller):
                 f"after {time() - self.start_time:.2f}s from forking"
             )
             self.start_time = None
+            self.preloaded_holder = None
 
     def __del__(self):
         pass
