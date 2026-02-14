@@ -42,8 +42,7 @@ class TestMambaModel:
             mamba_stack_spec=mamba_stack_spec,
             vocab_size=100,
             max_sequence_length=4,
-            hybrid_attention_ratio=0.3,
-            hybrid_mlp_ratio=0.3,
+            hybrid_layer_pattern="M*-",  # 1 Mamba, 1 attention, 1 MLP
         )
 
     def teardown_method(self, method):
@@ -111,8 +110,7 @@ class TestMambaModel:
             mamba_stack_spec=mamba_stack_spec,
             vocab_size=vocab_size,
             max_sequence_length=12,
-            hybrid_attention_ratio=0.3,
-            hybrid_mlp_ratio=0.3,
+            hybrid_layer_pattern="M*-",  # 1 Mamba, 1 attention, 1 MLP
         )
 
         sequence_length = model.max_sequence_length
@@ -264,8 +262,7 @@ class TestMambaModel:
             mamba_stack_spec=mamba_stack_spec,
             vocab_size=128,
             max_sequence_length=4,
-            hybrid_attention_ratio=0.3,
-            hybrid_mlp_ratio=0.3,
+            hybrid_layer_pattern="M*-",  # 1 Mamba, 1 attention, 1 MLP
             pg_collection=pg_collection,
         )
 
@@ -319,8 +316,7 @@ class TestMambaWithDynamicInference:
             mamba_stack_spec=mamba_stack_spec,
             vocab_size=128,
             max_sequence_length=DynamicInferenceContext.TOKEN_ROUNDER,
-            hybrid_attention_ratio=0.5,
-            hybrid_mlp_ratio=0.0,
+            hybrid_layer_pattern="M*",  # 1 Mamba, 1 attention
         )
         self.model = Float16Module(self.model.config, self.model)
 

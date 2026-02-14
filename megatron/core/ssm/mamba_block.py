@@ -22,7 +22,6 @@ from megatron.core.inference.contexts import BaseInferenceContext
 from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.ssm.mamba_hybrid_layer_allocation import Symbols as LayerSymbols
-from megatron.core.ssm.mamba_hybrid_layer_allocation import allocate_layers
 from megatron.core.transformer import TransformerConfig
 from megatron.core.transformer.enums import CudaGraphScope
 from megatron.core.transformer.identity_op import IdentityOp
@@ -57,12 +56,11 @@ class MambaStack(MegatronModule):
             in fp32. Defaults to False.
         pre_process (bool, optional): whether to include an embedding layer.
             Defaults to True.
-        hybrid_attention_ratio (float, optional): the target ratio of attention layers to
-            total layers. Defaults to 0.0.
-        hybrid_mlp_ratio (float, optional): the target ratio of mlp layers to total
-            layers. Defaults to 0.0.
-        hybrid_override_pattern (str, optional): the hybrid layer pattern to override
-             with. Defaults to None.
+        layer_type_list (list, optional): pre-computed list of layer type symbols for
+            this pipeline segment. When provided (by MambaModel), pipeline stage
+            selection has already been done via '|' separators in the pattern.
+        pp_layer_offset (int, optional): the global layer offset for this pipeline
+            segment. Defaults to 0.
         post_layer_norm (bool, optional): whether to include a final layer norm.
             Defaults to True.
         post_process (bool, optional): whether to include an output layer.
@@ -71,6 +69,7 @@ class MambaStack(MegatronModule):
         dtype (optional): the data type to use. Defaults to None.
         pg_collection (ProcessGroupCollection): the required model communication
             process groups to use.
+        is_mtp_layer (bool, optional): whether this is an MTP layer. Defaults to False.
     """
 
     def __init__(
@@ -79,9 +78,8 @@ class MambaStack(MegatronModule):
         submodules: MambaStackSubmodules,
         residual_in_fp32=False,
         pre_process: bool = True,
-        hybrid_attention_ratio: float = 0.0,
-        hybrid_mlp_ratio: float = 0.0,
-        hybrid_override_pattern: str = None,
+        layer_type_list: list = None,
+        pp_layer_offset: int = 0,
         post_layer_norm: bool = True,
         post_process: bool = True,
         device=None,
@@ -103,38 +101,18 @@ class MambaStack(MegatronModule):
 
         # Required for pipeline parallel schedules
         self.input_tensor = None
-
-        self.hybrid_attention_ratio = hybrid_attention_ratio
-        self.hybrid_mlp_ratio = hybrid_mlp_ratio
-        self.hybrid_override_pattern = hybrid_override_pattern
         self.pg_collection = pg_collection
 
-        # For MTP layers, always use pattern length (config.num_layers is for main decoder)
-        if self.is_mtp_layer:
-            num_layers_for_allocation = len(self.hybrid_override_pattern)
-        else:
-            num_layers_for_allocation = (
-                self.config.num_layers
-                if self.config.num_layers is not None
-                else len(self.hybrid_override_pattern)
-            )
-
-        self.layer_type_list = allocate_layers(
-            num_layers_for_allocation,
-            self.hybrid_attention_ratio,
-            self.hybrid_mlp_ratio,
-            self.hybrid_override_pattern,
-            silent=self.is_mtp_layer,
+        assert layer_type_list is not None, (
+            "layer_type_list must be provided. It should be pre-computed from "
+            "--hybrid-layer-pattern by MambaModel."
         )
+        self.layer_type_list = layer_type_list
 
-        pp_layer_offset = 0
-        if self.pp_group.size() > 1 and not self.is_mtp_layer:
-            pp_layer_offset, self.layer_type_list = self._select_layers_for_pipeline_parallel(
-                self.layer_type_list
-            )
-        # Build main decoder layers using shared layer builder
+        # Build layers from the pre-selected segment
         self.layers = nn.ModuleList()
         for i, layer_type in enumerate(self.layer_type_list):
+            layer_number = i + 1 + pp_layer_offset
             if self.config.fp8:
                 quant_init_context = get_fp8_context(self.config, i + pp_layer_offset, is_init=True)
             elif self.config.fp4:
@@ -147,34 +125,35 @@ class MambaStack(MegatronModule):
                         submodules.mamba_layer,
                         config=self.config,
                         residual_in_fp32=residual_in_fp32,
-                        layer_number=i + 1 + pp_layer_offset,
+                        layer_number=layer_number,
                         pp_layer_offset=pp_layer_offset,
                         pg_collection=pg_collection,
                     )
                 elif layer_type == LayerSymbols.ATTENTION:
-                    # Transformer layers apply their own pp_layer_offset
                     layer = build_module(
                         submodules.attention_layer,
                         config=self.config,
-                        layer_number=i + 1,
+                        layer_number=layer_number,
                         pg_collection=pg_collection,
                         is_mtp_layer=is_mtp_layer,
+                        add_layer_offset=False,
+                        pp_layer_offset=pp_layer_offset,
                     )
                 elif layer_type == LayerSymbols.MLP:
-                    # MLP layers apply their own pp_layer_offset
                     layer = build_module(
                         submodules.mlp_layer,
                         config=self.config,
-                        layer_number=i + 1,
+                        layer_number=layer_number,
                         pg_collection=pg_collection,
+                        add_layer_offset=False,
                     )
                 elif layer_type == LayerSymbols.MOE:
-                    # MoE layers apply their own pp_layer_offset
                     layer = build_module(
                         submodules.moe_layer,
                         config=self.config,
-                        layer_number=i + 1,
+                        layer_number=layer_number,
                         pg_collection=pg_collection,
+                        add_layer_offset=False,
                     )
                 else:
                     assert False, "unexpected layer_type"
@@ -190,57 +169,6 @@ class MambaStack(MegatronModule):
                 hidden_size=self.config.hidden_size,
                 eps=self.config.layernorm_epsilon,
             )
-
-    def _select_layers_for_pipeline_parallel(self, layer_type_list):
-        assert self.config.virtual_pipeline_model_parallel_size is None, (
-            "The Mamba hybrid model does not currently support "
-            "virtual/interleaved pipeline parallelism"
-        )
-
-        pp_rank = self.pp_group.rank()
-        pp_size = self.pp_group.size()
-
-        num_layers_in_first = self.config.num_layers_in_first_pipeline_stage
-        num_layers_in_last = self.config.num_layers_in_last_pipeline_stage
-
-        if num_layers_in_first is not None or num_layers_in_last is not None:
-            # Uneven pipeline parallelism: mirror the logic in
-            # get_transformer_layer_offset so that MambaStack and
-            # TransformerLayer agree on layer placement.
-            first = 0 if num_layers_in_first is None else num_layers_in_first
-            last = 0 if num_layers_in_last is None else num_layers_in_last
-            middle_num_layers = self.config.num_layers - first - last
-
-            middle_pipeline_stages = pp_size - sum(
-                1 for x in (num_layers_in_first, num_layers_in_last) if x is not None
-            )
-
-            if middle_pipeline_stages > 0:
-                layers_per_middle = middle_num_layers // middle_pipeline_stages
-            else:
-                layers_per_middle = 0
-
-            is_first_stage = num_layers_in_first is not None and pp_rank == 0
-            is_last_stage = num_layers_in_last is not None and pp_rank == pp_size - 1
-
-            if is_first_stage:
-                offset = 0
-                num_layers_this_rank = first
-            elif is_last_stage:
-                offset = self.config.num_layers - last
-                num_layers_this_rank = last
-            else:
-                middle_rank = pp_rank if num_layers_in_first is None else pp_rank - 1
-                offset = middle_rank * layers_per_middle + first
-                num_layers_this_rank = layers_per_middle
-        else:
-            num_layers_per_pipeline_rank = self.config.num_layers // pp_size
-            offset = pp_rank * num_layers_per_pipeline_rank
-            num_layers_this_rank = num_layers_per_pipeline_rank
-
-        selected_list = layer_type_list[offset : offset + num_layers_this_rank]
-
-        return offset, selected_list
 
     def set_input_tensor(self, input_tensor: Tensor):
         """Set input tensor to be used instead of forward()'s input.

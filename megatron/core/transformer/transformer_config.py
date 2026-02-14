@@ -63,7 +63,7 @@ class TransformerConfig(ModelParallelConfig):
     """Use a single MTP layer repeatedly instead of multiple separate layers."""
 
     mtp_hybrid_override_pattern: Optional[str] = None
-    """DEPRECATED: Use unified hybrid_override_pattern instead.
+    """DEPRECATED: Use unified hybrid_layer_pattern instead.
     Legacy argument for loading old checkpoints.
     Force a specific hybrid layer pattern for MTP layers.
     """

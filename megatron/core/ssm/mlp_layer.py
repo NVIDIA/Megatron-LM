@@ -20,6 +20,7 @@ class MLPLayer(TransformerLayer):
         layer_number: int = 1,
         hidden_dropout: float = None,
         pg_collection: Optional[ProcessGroupCollection] = None,
+        add_layer_offset: bool = True,
     ):
         super().__init__(
             config=config,
@@ -27,4 +28,5 @@ class MLPLayer(TransformerLayer):
             layer_number=layer_number,
             hidden_dropout=hidden_dropout,
             pg_collection=pg_collection,
+            add_layer_offset=add_layer_offset,
         )
