@@ -5,9 +5,15 @@ This module provides a singleton instance of AsyncCallsQueue which manages
 the async checkpoint save calls.
 """
 import logging
+from re import I
+import time
 
-from megatron.core.dist_checkpointing.strategies.async_utils import AsyncCallsQueue, AsyncRequest
-from megatron.core.dist_checkpointing.strategies.filesystem_async import _results_queue
+from megatron.core.dist_checkpointing.strategies.async_utils import (
+    AsyncCallsQueue,
+    AsyncRequest,
+    PersistentAsyncCaller,
+)
+from megatron.core.dist_checkpointing.strategies.filesystem_async import _results_queue, get_write_results_queue
 from megatron.training import get_args
 from megatron.training.utils import print_rank_0
 
@@ -18,11 +24,20 @@ logger = logging.getLogger(__name__)
 _async_calls_queue = AsyncCallsQueue()
 
 
-def init_persistent_async_worker():
+def init_persistent_async_worker(rank: int, mp_mode: str = 'spawn'):
     global _async_calls_queue
     # Recreate the async_calls_queue for persistent worker
     # This duplicate step is for backward compatiblity
+    time_start = time.time()
+    if rank == 0:
+        print(f"init_persistent_async_worker: {rank}, Starting Async Caller", flush=True)
     _async_calls_queue = AsyncCallsQueue(persistent=True)
+    # initialize the persistent caller
+    AsyncCallsQueue.warmup_persistent_caller(rank, mp_mode)
+    # initialize ckpt write results queue
+    get_write_results_queue('fork')
+    if rank == 0:
+        print(f"init_persistent_async_worker: rank {rank}, Async Caller Started in {time.time() - time_start} seconds", flush=True)
 
 
 def schedule_async_save(async_request: AsyncRequest):
@@ -35,7 +50,7 @@ def schedule_async_save(async_request: AsyncRequest):
 
 
 def maybe_finalize_async_save(blocking: bool = False, terminate=False):
-    """Finalizes active async save calls.
+    """Finalizes active async save calls and cleans up deletion processes.
 
     Args:
         blocking (bool, optional): if True, will wait until all active requests
@@ -53,6 +68,11 @@ def maybe_finalize_async_save(blocking: bool = False, terminate=False):
 
     _async_calls_queue.maybe_finalize_async_calls(blocking, no_dist=False)
 
+    # Clean up finished deletion processes to prevent zombies
+    # Import here to avoid circular dependency
+    from .checkpointing import finalize_deletion_processes
+    finalize_deletion_processes(blocking=blocking or terminate)
+
     if terminate:
         _async_calls_queue.close()
 
@@ -68,6 +88,10 @@ def is_empty_async_queue() -> bool:
 
 def reset_persistent_async_worker():
     global _async_calls_queue, _results_queue
+    
+    # Clean up worker data cache first to release IPC handles
+    PersistentAsyncCaller.cleanup_worker_data_cache()
+    
     if _async_calls_queue is not None:
         _async_calls_queue.close(abort=True)
         del _async_calls_queue
