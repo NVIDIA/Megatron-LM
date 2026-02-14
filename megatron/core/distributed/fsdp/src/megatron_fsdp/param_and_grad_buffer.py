@@ -658,7 +658,13 @@ class FixedPoolAllocator(TemporaryBucketAllocator):
     deallocation of temporary buffers during FSDP operations.
     """
 
-    def __init__(self, name: str, fsdp_param_groups: List["ParameterGroup"], size: int = 2):
+    def __init__(
+        self,
+        name: str,
+        fsdp_param_groups: List["ParameterGroup"],
+        size: int = 2,
+        fallback_to_persistent_buffer: bool = False,
+    ):
         self.name = name
         self.fsdp_param_groups = fsdp_param_groups
         self.size = size  # Number of buffers in the pool (default is 2 for double buffering)
@@ -691,6 +697,29 @@ class FixedPoolAllocator(TemporaryBucketAllocator):
         ), "Found no FSDP units to use fixed-size buffering"
         self.fsdp_double_buffer_units = fsdp_units_to_double_buffer
 
+        if torch.distributed.get_rank() == 0:
+            for bucket_id, param_group in enumerate(fsdp_param_groups):
+                if (
+                    param_group.fsdp_unit_id == -1
+                    or param_group.fsdp_unit_id is None
+                    or param_group.fsdp_unit_id not in self.fsdp_double_buffer_units
+                ):
+                    logging.info(
+                        f"FSDP unit (id={param_group.fsdp_unit_id}) does not fit "
+                        "in FixedPoolAllcator"
+                    )
+                    if fallback_to_persistent_buffer is False:
+                        logging.info(
+                            "It will fall back to dynamic memory allocator, NCCL user "
+                            "buffer is not supported"
+                        )
+                    else:
+                        logging.info(
+                            "It will be allocated a persistent buffer. If the memory "
+                            "budget is tight, set "
+                            "trainer.strategy.ddp.fsdp_db_use_persist_buf_on_alloc_fail to False."
+                        )
+
         # Initialize buffer group status.
         # Each buffer group represents a set of buffers associated with an FSDP unit's bucket group.
         self.idle_buffer = []  # List of available (buf_group_id, offset) tuples.
@@ -703,6 +732,7 @@ class FixedPoolAllocator(TemporaryBucketAllocator):
                 self.idle_buffer.append((buf_group_id, bucket_offset))
 
         # Fallback allocator used if the fixed pool allocator cannot fulfill a request.
+        self.fallback_to_persistent_buffer = fallback_to_persistent_buffer
         self.backup_allocator = TemporaryBucketAllocator()
 
     def _is_two_bucket_group_equal(self, group_a, group_b):
@@ -755,28 +785,31 @@ class FixedPoolAllocator(TemporaryBucketAllocator):
                 f"current using_buffer: {self.using_buffer} \n"
                 f"current idle_buffer: {self.idle_buffer}"
             )
-            # Synchronization is required before the allocation for the user buffer
-            if mem_alloc_context is not None and mem_alloc_context != nullcontext:
-                # Check if a new buffer allocation is required
-                if (
-                    self.allocation_tracker.get((buffer_name, dtype), None) is None
-                    or self.allocation_tracker[(buffer_name, dtype)] < size
-                ):
-                    # Requires synchronization for new buffer allocation
-                    self.allocation_tracker[(buffer_name, dtype)] = size
-                    torch.cuda.synchronize()
-            return Bucket(
-                data=get_global_memory_buffer().get_tensor(
-                    [size], dtype=dtype, name=buffer_name, mem_alloc_context=mem_alloc_context
-                )
+        elif self.fallback_to_persistent_buffer is True:
+            buffer_name = f"{self.name}_not_fit_in_fixed_pool_{bucket_id}_{size}_{dtype}_{device}"
+        else:
+            # If the bucket is not eligible for fixed pool buffering, or no buffer is available,
+            # fall back to dynamic allocation via the backup allocator. This means that we
+            # will do dynamic memory allocation.
+            logging.debug(f"[FSDP] Using backup allocator for {bucket_id} {fsdp_unit_id}")
+            return self.backup_allocator.allocate(
+                bucket_id=bucket_id, size=size, dtype=dtype, device=device
             )
 
-        # If the bucket is not eligible for fixed pool buffering, or no buffer is available,
-        # fall back to dynamic allocation via the backup allocator. This means that we
-        # will do dynamic memory allocation.
-        logging.debug(f"[FSDP] Using backup allocator for {bucket_id} {fsdp_unit_id}")
-        return self.backup_allocator.allocate(
-            bucket_id=bucket_id, size=size, dtype=dtype, device=device
+        # Use buffer_name to get memory from global memory.
+        if mem_alloc_context is not None and mem_alloc_context != nullcontext:
+            # Check if a new buffer allocation is required
+            if (
+                self.allocation_tracker.get((buffer_name, dtype), None) is None
+                or self.allocation_tracker[(buffer_name, dtype)] < size
+            ):
+                # Requires synchronization for new buffer allocation
+                self.allocation_tracker[(buffer_name, dtype)] = size
+                torch.cuda.synchronize()
+        return Bucket(
+            data=get_global_memory_buffer().get_tensor(
+                [size], dtype=dtype, name=buffer_name, mem_alloc_context=mem_alloc_context
+            )
         )
 
     def _get_gbuf_name(self, buf_group_id: int, bucket_index: int):
@@ -795,9 +828,10 @@ class FixedPoolAllocator(TemporaryBucketAllocator):
             self.idle_buffer.append(self.using_buffer[bucket_id])
             del self.using_buffer[bucket_id]
             return
-        # If not managed by fixed pool allocator, delegate to the backup allocator.
-        logging.debug(f"[FSDP] Free from the backup allocator for {bucket_id} {fsdp_unit_id}")
-        self.backup_allocator.free(bucket_id)
+        if self.fallback_to_persistent_buffer is False:
+            # If not managed by fixed pool allocator, delegate to the backup allocator.
+            logging.debug(f"[FSDP] Free from the backup allocator for {bucket_id} {fsdp_unit_id}")
+            self.backup_allocator.free(bucket_id)
 
 
 class DataParallelBuffer:
@@ -1874,7 +1908,10 @@ class ParamAndGradBuffer:
         if self.ddp_config.fsdp_double_buffer and len(self.bucketing_policy.fsdp_unit_modules) > 0:
             UB_BUFFER_NUM = 2
             self.weight_alloc = FixedPoolAllocator(
-                name="fsdp_params", fsdp_param_groups=self.parameter_groups, size=UB_BUFFER_NUM
+                name="fsdp_params",
+                fsdp_param_groups=self.parameter_groups,
+                size=UB_BUFFER_NUM,
+                fallback_to_persistent_buffer=self.ddp_config.fsdp_db_use_persist_buf_on_alloc_fail,
             )
             self.transpose_weight_alloc = FixedPoolAllocator(
                 name="fsdp_fp8_transpose_params",
@@ -1882,7 +1919,10 @@ class ParamAndGradBuffer:
                 size=UB_BUFFER_NUM,
             )
             self.main_grad_alloc = FixedPoolAllocator(
-                name="fsdp_grads", fsdp_param_groups=self.parameter_groups, size=UB_BUFFER_NUM
+                name="fsdp_grads",
+                fsdp_param_groups=self.parameter_groups,
+                size=UB_BUFFER_NUM,
+                fallback_to_persistent_buffer=self.ddp_config.fsdp_db_use_persist_buf_on_alloc_fail,
             )
             self.double_buf_units = self.weight_alloc.fsdp_double_buffer_units
         else:
@@ -1914,7 +1954,9 @@ class ParamAndGradBuffer:
                 hsdp_buf_dp_group = self.dist_index.get_fsdp_group(
                     is_expert_parallel=group.is_expert_param
                 )
-                main_buf_extra_kwargs["dp_rank"] = self.dist_index.get_logical_hybrid_fsdp_rank()
+                main_buf_extra_kwargs["dp_rank"] = self.dist_index.get_logical_hybrid_fsdp_rank(
+                    is_expert_parallel=group.is_expert_param
+                )
             else:
                 main_buf_dp_group = self.dist_index.get_fsdp_group(
                     is_expert_parallel=group.is_expert_param
@@ -2430,6 +2472,8 @@ class ParamAndGradBuffer:
 
             self.param_to_direct_module[new_param] = self.param_to_direct_module[old_param]
             del self.param_to_direct_module[old_param]
+
+            new_param.requires_grad_(old_param.requires_grad)
 
             for tp_attr in ["_mcore_tp", "_tp_partition_dim", "_tp_duplicated"]:
                 if getattr(old_param, tp_attr, None) is not None:
@@ -3120,9 +3164,6 @@ class GradReducePipeline:
                 grad_reduce_event, free_up_grad_bucket, _ = self.grad_reduce_queue.pop(0)
                 grad_reduce_event.wait()
                 free_up_grad_bucket()
-
-        if suggested_queue_size == 0 and self.outer_fsdp_group_grad_reduce:
-            torch.cuda.current_stream().wait_stream(self.outer_fsdp_group_grad_reduce_stream)
 
     def _enforce_double_buffer_limit(self, add_buckets):
         if not self.buffer.ddp_config.fsdp_double_buffer:

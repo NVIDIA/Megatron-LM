@@ -7,7 +7,7 @@ data efficiency. On the other hand, MTP may enable the model to pre-plan its rep
 
 The k-th MTP module consists of a shared embedding layer, a projection matrix, a Transformer block, and a shared output head. For the i-th input token at the (k - 1)-th prediction depth, we first combine the representation of the i-th token and the embedding of the (i + K)-th token with the linear projection. The combined serves as the input of the Transformer block at the k-th depth to produce the output representation.
 
-For more information, please refer to [DeepSeek-V3 Technical Report](https://github.com/deepseek-ai/DeepSeek-V3/blob/main/DeepSeek_V3.pdf)
+For more information, refer to [DeepSeek-V3 Technical Report](https://arxiv.org/pdf/2412.19437.pdf)
 
 ## Related Arguments
 
@@ -45,4 +45,4 @@ Use `m` to represent MTP layers in the pipeline layout string. For example:
 
 ## Precautions
 
-Please do not use Context Parallel (CP), or arbitrary AttnMaskType, or learned absolute position embedding type with MTP. These use cases are not yet supported.
+Do not use Context Parallel (CP), or arbitrary AttnMaskType, or learned absolute position embedding type with MTP. These use cases are not yet supported.
