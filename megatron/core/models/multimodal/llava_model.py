@@ -670,6 +670,72 @@ class LLaVAModel(MegatronModule):
 
         return final_embedding, final_labels, final_loss_mask
 
+    def _remap_packed_seq_params_after_image_expansion(
+        self,
+        input_ids: torch.Tensor,
+        image_token_index: int,
+        num_image_tiles: torch.Tensor,
+        packed_seq_params: PackedSeqParams,
+    ) -> PackedSeqParams:
+        """Remap packed sequence boundaries from collapsed to expanded space.
+
+        When sequence packing is used with VLMs, each image placeholder token in
+        the collapsed input_ids expands to (num_tiles * img_seq_len) embedding
+        tokens. The cu_seqlens entries in packed_seq_params must be updated so
+        that attention kernels see the correct sub-sequence boundaries in the
+        expanded embedding tensor.
+
+        Uses the same cumulative-sum position mapping as _preprocess_data to
+        translate every boundary from collapsed token offsets to expanded
+        embedding offsets.
+
+        Args:
+            input_ids: Collapsed token ids [batch_size, text_seq_len].
+            image_token_index: The special token id that marks image positions.
+            num_image_tiles: Number of tiles per image in the batch.
+            packed_seq_params: PackedSeqParams with boundaries in collapsed space.
+
+        Returns:
+            The same PackedSeqParams object, mutated in-place with expanded boundaries.
+        """
+        # Early exit: nothing to remap if there are no images.
+        if not torch.any(input_ids == image_token_index):
+            return packed_seq_params
+
+        with torch.no_grad():
+            # Rebuild the collapsed-to-expanded position mapping (same logic as _preprocess_data).
+            image_token_mask = input_ids == image_token_index
+            image_token_mask_lens = image_token_mask.int().clone()
+            image_token_mask_lens[image_token_mask] = num_image_tiles * self.img_seq_len - 1
+            new_position_ids = torch.cumsum((image_token_mask_lens + 1), dim=-1) - 1
+
+            def _remap(cu_seqlens):
+                """Map every boundary in cu_seqlens from collapsed to expanded space."""
+                if cu_seqlens is None or cu_seqlens.numel() <= 1:
+                    return cu_seqlens
+                expanded = torch.zeros_like(cu_seqlens)
+                # For each non-zero boundary, look up the expanded position of the
+                # last collapsed token before that boundary.
+                boundary_positions = cu_seqlens[1:] - 1
+                expanded[1:] = (new_position_ids[0, boundary_positions] + 1).to(cu_seqlens.dtype)
+                return expanded
+
+            packed_seq_params.cu_seqlens_q = _remap(packed_seq_params.cu_seqlens_q)
+            packed_seq_params.cu_seqlens_kv = _remap(packed_seq_params.cu_seqlens_kv)
+            packed_seq_params.cu_seqlens_q_padded = _remap(packed_seq_params.cu_seqlens_q_padded)
+            packed_seq_params.cu_seqlens_kv_padded = _remap(packed_seq_params.cu_seqlens_kv_padded)
+
+            # Recompute max_seqlen from the remapped boundaries.
+            ref_cu = packed_seq_params.cu_seqlens_q_padded
+            if ref_cu is None:
+                ref_cu = packed_seq_params.cu_seqlens_q
+            if ref_cu is not None and ref_cu.numel() > 1:
+                max_seqlen = (ref_cu[1:] - ref_cu[:-1]).max().to(torch.int32)
+                packed_seq_params.max_seqlen_q = max_seqlen
+                packed_seq_params.max_seqlen_kv = max_seqlen
+
+        return packed_seq_params
+
     def _process_embedding_token_parallel(
         self, combined_embeddings, new_labels, new_loss_mask, packed_seq_params
     ):
@@ -916,6 +982,10 @@ class LLaVAModel(MegatronModule):
         if num_image_tiles is None and images is not None:
             num_image_tiles = torch.ones(images.shape[0], dtype=torch.int, device=input_ids.device)
 
+        _image_token_index = (
+            image_token_index if image_token_index is not None else self.image_token_index
+        )
+
         combined_embeddings, new_labels, new_loss_mask = self._preprocess_data(
             image_embeddings,
             language_embeddings,
@@ -924,9 +994,17 @@ class LLaVAModel(MegatronModule):
             labels,
             use_inference_kv_cache,
             inference_context,
-            image_token_index if image_token_index is not None else self.image_token_index,
+            _image_token_index,
             num_image_tiles,
         )  # [combined_seq_len, b, h_language], [b, combined_seq_len], [b, combined_seq_len]
+
+        # After image token expansion, the embedding sequence is longer than the
+        # original collapsed input_ids.  Remap packed sequence boundaries so that
+        # attention kernels see correct sub-sequence boundaries in expanded space.
+        if packed_seq_params is not None:
+            packed_seq_params = self._remap_packed_seq_params_after_image_expansion(
+                input_ids, _image_token_index, num_image_tiles, packed_seq_params,
+            )
 
         if self.context_parallel_lm > 1 or self.sequence_parallel_lm:
             combined_embeddings, new_labels, new_loss_mask, packed_seq_params = (

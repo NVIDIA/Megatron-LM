@@ -461,6 +461,223 @@ class TestLLaVAModel:
         for param in self.model.vision_projection.parameters():
             assert param.requires_grad
 
+    @pytest.mark.internal
+    @pytest.mark.parametrize("num_samples", [1, 4, 16])
+    def test_forward_packed_vs_batched(self, num_samples):
+        """Verify packed and batched-unpacked forward passes produce equivalent logits.
+
+        For each parameterization, we:
+          1. Create N samples (most with 1 image, one text-only for N>1).
+          2. Run a batched reference forward (batch_size=N, no PackedSeqParams).
+          3. Pack all samples into one sequence with collapsed-space cu_seqlens.
+          4. Run a packed forward (batch_size=1, PackedSeqParams).
+          5. Compare per-token logprobs using token_mult_prob_error (same metric
+             as NeMo-RL): mean(exp(|logprob_ref - logprob_packed|)).
+             Should be < 1.02 when cu_seqlens are correctly remapped.
+
+        Without the cu_seqlens remapping fix, attention bleeds between packed
+        sub-sequences, causing token_mult_prob_error >> 1.0.
+        """
+        torch.manual_seed(42)
+        self.model.cuda()
+        self.model.to(torch.bfloat16)
+        self.model.eval()
+
+        image_token_index = self.model.image_token_index
+        img_seq_len = self.model.img_seq_len  # 577 for patch_dim=14, img=336, + class token
+        vocab_size = 8192
+
+        # ---- Build per-sample data ----
+        # Total expanded length must stay within the model's language_max_sequence_length
+        # (4096).  With img_seq_len=577, we dynamically limit how many samples get
+        # images so that the packed sequence fits.
+        max_total_expanded = 3800  # safety margin below 4096
+
+        # Deterministic per-sample text lengths (varied, 20-59 tokens).
+        text_lens = [20 + (i * 13) % 40 for i in range(num_samples)]
+        total_text = sum(text_lens)
+
+        # How many images can we fit after reserving space for text?
+        max_images = (max_total_expanded - total_text) // img_seq_len
+
+        # Assign images: skip sample 1 (text-only sentinel), then take up to max_images.
+        image_candidates = [i for i in range(num_samples) if (i != 1 or num_samples == 1)]
+        image_sample_set = set(image_candidates[:max_images])
+
+        samples = []
+        all_images = []
+        all_num_tiles = []
+
+        for i in range(num_samples):
+            text_len = text_lens[i]
+            has_image = i in image_sample_set
+
+            # Random token IDs; replace any accidental image tokens.
+            ids = torch.randint(0, vocab_size, (text_len,), device="cuda")
+            ids[ids == image_token_index] = 0
+
+            if has_image:
+                img_pos = min(5 + i * 3, text_len - 1)
+                ids = torch.cat(
+                    [ids[:img_pos], torch.tensor([image_token_index], device="cuda"), ids[img_pos:]]
+                )
+                collapsed_len = text_len + 1  # text + 1 image placeholder
+                expanded_len = text_len + img_seq_len  # placeholder expands to img_seq_len tokens
+
+                img = torch.randn(1, 3, 336, 336, device="cuda", dtype=torch.bfloat16)
+                all_images.append(img)
+                all_num_tiles.append(1)
+            else:
+                collapsed_len = text_len
+                expanded_len = text_len
+
+            samples.append(
+                {
+                    'ids': ids,
+                    'collapsed_len': collapsed_len,
+                    'expanded_len': expanded_len,
+                    'has_image': has_image,
+                }
+            )
+
+        total_expanded = sum(s['expanded_len'] for s in samples)
+        assert total_expanded <= 4096, (
+            f"total_expanded={total_expanded} exceeds model max_sequence_length=4096"
+        )
+
+        # Stack images and num_image_tiles.
+        if all_images:
+            images = torch.cat(all_images, dim=0)
+            num_image_tiles = torch.tensor(all_num_tiles, dtype=torch.int, device="cuda")
+        else:
+            images = torch.tensor([], dtype=torch.bfloat16, device="cuda").reshape(0, 3, 336, 336)
+            num_image_tiles = torch.tensor([], dtype=torch.int, device="cuda")
+
+        # ---- Reference run: batched, no packing ----
+        max_collapsed_len = max(s['collapsed_len'] for s in samples)
+
+        # Pad each sample's input_ids to max_collapsed_len (pad with token 0).
+        input_ids_batch = torch.zeros(
+            num_samples, max_collapsed_len, dtype=torch.long, device="cuda"
+        )
+        for i, s in enumerate(samples):
+            input_ids_batch[i, : s['collapsed_len']] = s['ids']
+
+        position_ids_batch = (
+            torch.arange(max_collapsed_len, dtype=torch.int, device="cuda")
+            .unsqueeze(0)
+            .expand(num_samples, -1)
+        )
+        loss_mask_batch = torch.ones(num_samples, max_collapsed_len, device="cuda")
+
+        with torch.no_grad():
+            logits_ref, _ = self.model.forward(
+                images,
+                input_ids_batch,
+                position_ids_batch,
+                None,  # attention_mask (causal)
+                labels=None,
+                loss_mask=loss_mask_batch,
+                num_image_tiles=num_image_tiles,
+            )
+        # logits_ref shape: [num_samples, max_expanded_len, vocab_size]
+
+        # ---- Packed run: batch_size=1, PackedSeqParams ----
+        packed_ids = torch.cat([s['ids'] for s in samples], dim=0).unsqueeze(0)
+        total_collapsed_len = packed_ids.shape[1]
+
+        # Position IDs: reset to 0 for each sub-sequence.
+        packed_position_ids = torch.zeros(1, total_collapsed_len, dtype=torch.int, device="cuda")
+        offset = 0
+        for s in samples:
+            clen = s['collapsed_len']
+            packed_position_ids[0, offset : offset + clen] = torch.arange(
+                clen, dtype=torch.int, device="cuda"
+            )
+            offset += clen
+
+        # cu_seqlens in collapsed space (what a real packing pipeline would provide).
+        collapsed_lens = [s['collapsed_len'] for s in samples]
+        cu_seqlens_collapsed = torch.zeros(num_samples + 1, dtype=torch.int32, device="cuda")
+        for i, clen in enumerate(collapsed_lens):
+            cu_seqlens_collapsed[i + 1] = cu_seqlens_collapsed[i] + clen
+
+        packed_seq_params = PackedSeqParams(
+            qkv_format="thd",
+            cu_seqlens_q=cu_seqlens_collapsed.clone(),
+            cu_seqlens_kv=cu_seqlens_collapsed.clone(),
+            cu_seqlens_q_padded=cu_seqlens_collapsed.clone(),
+            cu_seqlens_kv_padded=cu_seqlens_collapsed.clone(),
+            max_seqlen_q=max(collapsed_lens),
+            max_seqlen_kv=max(collapsed_lens),
+        )
+
+        packed_loss_mask = torch.ones(1, total_collapsed_len, device="cuda")
+
+        with torch.no_grad():
+            logits_packed, _ = self.model.forward(
+                images,
+                packed_ids,
+                packed_position_ids,
+                None,  # attention_mask (causal)
+                labels=None,
+                loss_mask=packed_loss_mask,
+                num_image_tiles=num_image_tiles,
+                packed_seq_params=packed_seq_params,
+            )
+        # logits_packed shape: [1, total_expanded_len, vocab_size]
+
+        # ---- Compare using token_mult_prob_error ----
+        # Compute expanded cu_seqlens for slicing the packed output.
+        expanded_lens = [s['expanded_len'] for s in samples]
+        cu_expanded = [0]
+        for el in expanded_lens:
+            cu_expanded.append(cu_expanded[-1] + el)
+
+        all_lp_errors = []
+        for i, s in enumerate(samples):
+            exp_len = s['expanded_len']
+
+            ref_logits_i = logits_ref[i, :exp_len]  # [exp_len, vocab_size]
+
+            start = cu_expanded[i]
+            end = cu_expanded[i + 1]
+            packed_logits_i = logits_packed[0, start:end]  # [exp_len, vocab_size]
+
+            assert ref_logits_i.shape == packed_logits_i.shape, (
+                f"Sample {i}: shape mismatch {ref_logits_i.shape} vs {packed_logits_i.shape}"
+            )
+
+            # Pick target tokens = argmax of reference logits.
+            targets = ref_logits_i.argmax(dim=-1)  # [exp_len]
+
+            # Compute per-token logprobs in float32 for numerical stability.
+            logprobs_ref = torch.nn.functional.log_softmax(ref_logits_i.float(), dim=-1)
+            logprobs_ref = logprobs_ref.gather(-1, targets.unsqueeze(-1)).squeeze(-1)
+
+            logprobs_packed = torch.nn.functional.log_softmax(packed_logits_i.float(), dim=-1)
+            logprobs_packed = logprobs_packed.gather(-1, targets.unsqueeze(-1)).squeeze(-1)
+
+            lp_error = torch.abs(logprobs_ref - logprobs_packed)
+            all_lp_errors.append(lp_error)
+
+        all_lp_errors = torch.cat(all_lp_errors)
+        token_mult_prob_error = torch.exp(all_lp_errors).mean().item()
+
+        # With correct cu_seqlens remapping: token_mult_prob_error ~1.0 (< 1.02).
+        # Without the fix (bug): token_mult_prob_error >> 1.0.
+        num_images = sum(1 for s in samples if s['has_image'])
+        print(
+            f"\n  num_samples={num_samples}, num_images={num_images}, "
+            f"total_expanded={total_expanded}, "
+            f"token_mult_prob_error={token_mult_prob_error:.6f}"
+        )
+        assert token_mult_prob_error < 1.02, (
+            f"token_mult_prob_error={token_mult_prob_error:.4f} exceeds healthy threshold 1.02"
+        )
+
+        self.model.to(torch.float32)
+
 
 @pytest.fixture(scope='class', params=["siglip", "radio-g"])
 def setup_and_teardown_llava_model(request):
