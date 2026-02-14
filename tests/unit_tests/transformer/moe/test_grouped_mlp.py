@@ -13,6 +13,7 @@ from megatron.core.transformer.moe import grouped_gemm_util as gg
 from megatron.core.transformer.moe.experts import TEGroupedMLP
 from megatron.core.transformer.moe.moe_layer import MoELayer
 from megatron.core.transformer.transformer_config import TransformerConfig
+from megatron.core.typed_torch import apply_module
 from megatron.core.utils import is_te_min_version
 from megatron.training.arguments import parse_args
 from megatron.training.initialize import _set_random_seed
@@ -212,7 +213,7 @@ class TestParallelGroupedMLP:
         hidden_states = hidden_states.cuda()
         probs = torch.rand((num_allocated_tokens,), dtype=torch.float32)
         probs = probs.cuda()
-        output_gmm, _ = self.grouped_mlp.experts(
+        output_gmm, _ = apply_module(self.grouped_mlp.experts)(
             hidden_states, tokens_per_expert=tokens_per_expert, permuted_probs=probs
         )
         output_gmm.mean().backward()
@@ -370,7 +371,7 @@ class TestTEGroupedMLP:
         hidden_states = hidden_states.cuda()
         probs = torch.rand((num_allocated_tokens,), dtype=torch.float32)
         probs = probs.cuda()
-        output, _ = self.grouped_mlp.experts(
+        output, _ = apply_module(self.grouped_mlp.experts)(
             hidden_states, tokens_per_expert=tokens_per_expert, permuted_probs=probs
         )
         assert torch.equal(output, torch.zeros_like(output))
