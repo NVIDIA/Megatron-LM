@@ -5,6 +5,7 @@
 
 import gc
 import itertools
+import logging
 from collections import ChainMap
 from dataclasses import replace
 from logging import getLogger
@@ -12,6 +13,8 @@ from typing import Any, Callable, Dict, List, Optional, Tuple
 
 import torch
 import torch.nn.functional
+
+from megatron.core.utils import log_single_rank
 
 from ..dist_checkpointing.optimizer import KEEP_VARS_HINT
 
@@ -49,6 +52,7 @@ from ..distributed.param_and_grad_buffer import _ParamAndGradBuffer, partition_b
 from ..fp8_utils import dequantize_fp8_tensor, is_float8tensor, quantize_param_shard
 from ..transformer.fsdp_dtensor_checkpoint import handle_experts_in_state_dict
 from ..transformer.module import MegatronModule
+from .cpu_offloading.optimizer_state_offloader import OptimizerStateOffloader
 from .grad_scaler import MegatronGradScaler
 from .optimizer import MixedPrecisionOptimizer, _zero_grad_group_helper, param_group_identifier_keys
 from .optimizer_config import OptimizerConfig
@@ -516,6 +520,8 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
             "due to checkpointing requirements."
         )
 
+        self._state_offloader: Optional[OptimizerStateOffloader] = None
+
         # when freezing sub-models we have no real optimizer
         # but still need a stub DistributedOptimizer class
         if optimizer is None:
@@ -603,6 +609,9 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
         else:
             self.optimizer.param_groups = [g["orig_group"] for g in self.opt_group_ranges]
             self.optimizer.load_state_dict(self.optimizer.state_dict())
+
+        if self.config.offload_optimizer_states:
+            self._state_offloader = OptimizerStateOffloader(self)
 
     def _get_model_param_range_map(self, param: torch.nn.Parameter):
         """
@@ -840,24 +849,32 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
         # Grad scaler.
         if 'grad_scaler' not in state_dict:
             if self.config.fp16:
-                logger.info(
-                    '***WARNING*** found an old checkpoint, will not ' 'load grad scaler ...'
+                log_single_rank(
+                    logger,
+                    logging.INFO,
+                    '***WARNING*** found an old checkpoint, will not load grad scaler ...',
                 )
         else:
             if self.grad_scaler:
                 self.grad_scaler.load_state_dict(state_dict['grad_scaler'])
             else:
-                logger.info(
+                log_single_rank(
+                    logger,
+                    logging.INFO,
                     '***WARNING*** fould the grad scaler in the '
                     'checkpoint but it is None in the class. '
-                    'Skipping loading grad scaler ...'
+                    'Skipping loading grad scaler ...',
                 )
 
         if 'param_state' in state_dict:
             assert 'param_state_sharding_type' in state_dict, state_dict.keys()
             param_state = state_dict['param_state']
             sharding_type = state_dict['param_state_sharding_type']
-            logger.info(f'Loading distributed optimizer sharded state of type {sharding_type}')
+            log_single_rank(
+                logger,
+                logging.INFO,
+                f'Loading distributed optimizer sharded state of type {sharding_type}',
+            )
             if sharding_type == 'dp_zero_gather_scatter':
                 self.load_parameter_state_from_dp_zero(param_state)
             elif sharding_type == 'fully_reshardable':
@@ -1202,10 +1219,12 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
         Regular state dict parameters are saved on DP rank 0 and loaded on all ranks.
         """
         if sharding_type is not None:
-            logger.warning(
+            log_single_rank(
+                logger,
+                logging.WARNING,
                 'DistributedOptimizer.sharded_state_dict parameter `sharding_type`'
                 ' is deprecated and will be removed.'
-                ' Use `metadata["distrib_optim_sharding_type"] instead`.'
+                ' Use `metadata["distrib_optim_sharding_type"] instead`.',
             )
         else:
             sharding_type = (metadata or {}).get(
@@ -1222,10 +1241,12 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
             return state_dict
 
         if not is_loading and sharding_type == 'fully_sharded_bucket_space':
-            logger.warning(
+            log_single_rank(
+                logger,
+                logging.WARNING,
                 '`fully_sharded_bucket_space` sharding for DistributedOptimizer'
                 ' checkpoint is deprecated and will be removed in the future.'
-                ' Please switch to `full_sharded_model_space`.'
+                ' Please switch to `full_sharded_model_space`.',
             )
 
         state_dict = self.state_dict()
@@ -2507,7 +2528,7 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
             for name, model_param in model_chunk.named_parameters():
                 while name.startswith("module."):
                     name = name[len("module.") :]
-                matched_keys = [k for k in names_in_state_dict if name in k]
+                matched_keys = [k for k in names_in_state_dict if k.endswith(name)]
                 assert (
                     len(matched_keys) == 1
                 ), f"Parameter {name} has {len(matched_keys)} matches in state dict"
@@ -2580,6 +2601,8 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
         Under the hood, either launch synchronous param all-gathers or get ready to launch
         asynchorous all-gathers that get overlapped with the next forward pass.
         """
+        if self._state_offloader is not None:
+            self._state_offloader.sync_before_step()
         update_successful = super().step_with_ready_grads()
 
         timers = self.config.timers
@@ -2600,4 +2623,22 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
         if timers is not None:
             timers('params-all-gather').stop()
 
+        if self._state_offloader is not None:
+            self._state_offloader.mark_optimizer_states_initialized()
+
         return update_successful
+
+    def offload_states(self):
+        """Offload states to CPU."""
+        if self._state_offloader is not None:
+            self._state_offloader.offload()
+
+    def reload_offloaded_states(self):
+        """Start async reload of offloaded states."""
+        if self._state_offloader is not None:
+            self._state_offloader.reload()
+
+    def release_offloaded_gpu_states(self):
+        """Release GPU memory after D2H completes. For delayed release case."""
+        if self._state_offloader is not None:
+            self._state_offloader.release_gpu_memory()

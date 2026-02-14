@@ -45,7 +45,8 @@ spec:
         "TRAINING_PARAMS_PATH=./tests/functional_tests/test_cases/{model}/{test_case}/model_config.yaml"
         "GOLDEN_VALUES_PATH=./tests/functional_tests/test_cases/{model}/{test_case}/golden_values_{environment}_{platforms}.json"
         "OUTPUT_PATH={assets_dir}"
-        "TENSORBOARD_PATH={assets_dir}/generations_{environment}_{platforms}.json"
+        "TENSORBOARD_PATH={assets_dir}/tensorboard"
+        "INFERENCE_OUTPUT_PATH={assets_dir}/golden_values_{environment}_{platforms}.json"
         "N_REPEAT={n_repeat}"
         "ENABLE_LIGHTWEIGHT_MODE=${{ENABLE_LIGHTWEIGHT_MODE}}"
         "RECORD_CHECKPOINTS=${{RECORD_CHECKPOINTS}}"
@@ -57,5 +58,10 @@ products:
   - test_case: [hybrid_dynamic_inference_tp1_pp1_dp8_583m]
     products:
       - environment: [dev]
-        scope: [mr]
+        scope: [mr-github]
+        platforms: [dgx_h100]
+  - test_case: [hybrid_dynamic_inference_tp1_pp1_dp8_583m_chunked_prefill]
+    products:
+      - environment: [dev]
+        scope: [mr-github]
         platforms: [dgx_h100]

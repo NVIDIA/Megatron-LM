@@ -1,25 +1,11 @@
 # API Guide
 
+API reference documentation for Megatron Core components.
+
 ```{toctree}
-:maxdepth: 2
+:maxdepth: 3
 
-models
-tensor_parallel
-context_parallel
-pipeline_parallel
-custom_fsdp
-fusions
-transformer
-moe
-dist_checkpointing
-dist_optimizer
-distributed
-datasets
-multi_latent_attention
-num_microbatches_calculator
-optimizer_param_scheduler
-optimizer_cpu_offload
-multi_token_prediction
-tokenizers
+models/index
+core/index
+internal/index
 ```
-

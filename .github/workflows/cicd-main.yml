@@ -18,16 +18,14 @@ on:
     - cron: 0 0 * * *
   push:
     branches:
-      - dev
-      - main
-      - 'pull-request/[0-9]+'
-      - 'deploy-release/*'
+      - "pull-request/[0-9]+"
+      - "deploy-release/*"
   merge_group:
     types: [checks_requested]
   workflow_dispatch:
 
 concurrency:
-  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}-${{ github.event.label.name || 'main' }}-${{ github.event_name }}
+  group: ${{ github.workflow }}-${{ github.head_ref || github.ref || github.event.pull_request.number }}
   cancel-in-progress: true
 
 permissions:
@@ -40,7 +38,6 @@ env:
 jobs:
   is-not-external-contributor:
     runs-on: ubuntu-latest
-    environment: nemo-ci
     if: github.repository == 'NVIDIA/Megatron-LM'
     outputs:
       is_external_contributor: ${{ github.event.pull_request.user.type == 'User' }}
@@ -75,15 +72,11 @@ jobs:
         id: check-membership
         env:
           IS_MAIN_BRANCH: ${{ github.ref == 'refs/heads/main' }}
-          IS_DEV_BRANCH: ${{ github.ref == 'refs/heads/dev' }}
           IS_MERGE_GROUP: ${{ github.event_name == 'merge_group' }}
           SCHEDULED_JOB: ${{ github.event_name == 'schedule' }}
         run: |
           # Skip SSO check for scheduled jobs, main branch, dev branch, or merge groups
           if [ "${{ env.SCHEDULED_JOB }}" == "true" ] || [ "${IS_MAIN_BRANCH}" == "true" ] || [ "${IS_DEV_BRANCH}" == "true" ] || [ "${IS_MERGE_GROUP}" == "true" ]; then
-            echo "is_maintainer=true" | tee -a $GITHUB_OUTPUT
-            exit 0
-          fi
 
           # Use SSO membership check result
           IS_MEMBER="${{ steps.check-sso.outputs.is_member }}"
@@ -129,42 +122,6 @@ jobs:
           else
             echo "is_maintainer=false" | tee -a $GITHUB_OUTPUT
           fi
-
-      - name: Find Comment
-        uses: peter-evans/find-comment@v4
-        if: startsWith(github.ref, 'refs/heads/pull-request/')
-        id: fc
-        with:
-          issue-number: ${{ fromJSON(steps.get-pr-info.outputs.pr-info || '{}').number }}
-          repository: ${{ github.repository }}
-          body-includes: '<!--external-contributor-comment-->'
-
-      - name: Delete comment
-        uses: actions/github-script@v7
-        if: startsWith(github.ref, 'refs/heads/pull-request/') && steps.fc.outputs.comment-id != ''
-        with:
-          github-token: ${{ secrets.GITHUB_TOKEN }}
-          script: |
-            await github.rest.issues.deleteComment({
-              owner: context.repo.owner,
-              repo: context.repo.repo,
-              comment_id: ${{ steps.fc.outputs.comment-id }}
-            })
-
-      - name: Write pull request comment
-        if: startsWith(github.ref, 'refs/heads/pull-request/') && steps.check-membership.outputs.is_maintainer == 'false'
-        uses: peter-evans/create-or-update-comment@v5
-        with:
-          issue-number: ${{ fromJSON(steps.get-pr-info.outputs.pr-info || '{}').number }}
-          repository: ${{ github.repository }}
-          body: |
-            <!--external-contributor-comment-->
-
-            Thank you for your contribution!
-
-            NVIDIA Megatron-LM is currently transitioning to development on Github. We will aim to review your PR after we complete our transition and stabilize our Github development process.
-
-            Thank you for your understanding.
 
   pre-flight:
     needs: [is-not-external-contributor]
@@ -217,10 +174,11 @@ jobs:
   cicd-wait-in-queue:
     runs-on: ubuntu-latest
     needs: [pre-flight, linting]
-    environment: ${{ needs.pre-flight.outputs.is_merge_group == 'true' && 'merge-gate' || 'test' }}
+    environment: "test"
     if: |
       !(needs.pre-flight.outputs.is_ci_workload == 'true'
       || needs.pre-flight.outputs.is_deployment_workflow == 'true'
+      || needs.pre-flight.outputs.is_merge_group == 'true'
       || needs.pre-flight.outputs.docs_only == 'true')
     steps:
       - name: Running CI tests
@@ -232,16 +190,42 @@ jobs:
     needs: [is-not-external-contributor, pre-flight, cicd-wait-in-queue]
     runs-on: ${{ needs.is-not-external-contributor.outputs.selected_runner }}
     if: |
-      (
+      needs.is-not-external-contributor.result != 'cancelled'
+      && needs.pre-flight.result != 'cancelled'
+      && needs.cicd-wait-in-queue.result != 'cancelled'
+      && (
         success()
         || needs.pre-flight.outputs.is_ci_workload == 'true'
+        || needs.pre-flight.outputs.is_merge_group == 'true'
         || needs.pre-flight.outputs.force_run_all == 'true'
       )
-      && needs.pre-flight.outputs.is_merge_group == 'false'
       && !cancelled()
     steps:
+      - name: Get PR info
+        id: get-pr-info
+        if: startsWith(github.ref, 'refs/heads/pull-request/')
+        uses: nv-gha-runners/get-pr-info@main
+
+      - name: Get merge commit sha
+        shell: bash -x -e -u -o pipefail {0}
+        id: sha
+        env:
+          IS_PR: ${{ startsWith(github.ref, 'refs/heads/pull-request/') }}
+          IS_MERGE_GROUP: ${{ github.event_name == 'merge_group' }}
+        run: |
+          if [[ "$IS_PR" == "true" ]]; then
+            SHA=${{ fromJSON(steps.get-pr-info.outputs.pr-info || '{}').merge_commit_sha }}
+          elif [[ "$IS_MERGE_GROUP" == "true" ]]; then
+            SHA=${{ github.event.merge_group.head_sha }}
+          else
+            SHA=${GITHUB_SHA}
+          fi
+          echo "main=${SHA}" | tee -a "$GITHUB_OUTPUT"
+
       - name: Checkout
         uses: actions/checkout@v4
+        with:
+          ref: ${{ steps.sha.outputs.main }}
 
       - name: Setup python
         uses: actions/setup-python@v5
@@ -253,11 +237,6 @@ jobs:
         run: |
           apt-get update
           apt-get install -y gh
-
-      - name: Get PR info
-        id: get-pr-info
-        if: startsWith(github.ref, 'refs/heads/pull-request/')
-        uses: nv-gha-runners/get-pr-info@main
 
       - name: Has lts label
         id: has-lts-label
@@ -355,12 +334,15 @@ jobs:
       - cicd-wait-in-queue
       - cicd-container-build
     if: |
-      (
+      needs.pre-flight.result != 'cancelled'
+      && needs.cicd-wait-in-queue.result != 'cancelled'
+      && needs.cicd-container-build.result != 'cancelled'
+      && (
         success()
         || needs.pre-flight.outputs.is_ci_workload == 'true'
         || needs.pre-flight.outputs.force_run_all == 'true'
+        || needs.pre-flight.outputs.is_merge_group == 'true'
       )
-      && needs.pre-flight.outputs.is_merge_group == 'false'
       && !cancelled()
     steps:
       - name: Checkout
@@ -383,14 +365,20 @@ jobs:
       - cicd-container-build
       - cicd-parse-unit-tests
     runs-on: ${{ needs.is-not-external-contributor.outputs.selected_runner }}
-    name: '${{ matrix.bucket }} - latest'
+    timeout-minutes: 60
+    name: "${{ matrix.bucket }} - latest"
     if: |
-      (
+      needs.is-not-external-contributor.result != 'cancelled'
+      && needs.pre-flight.result != 'cancelled'
+      && needs.cicd-wait-in-queue.result != 'cancelled'
+      && needs.cicd-container-build.result != 'cancelled'
+      && needs.cicd-parse-unit-tests.result != 'cancelled'
+      && (
         success()
         || needs.pre-flight.outputs.is_ci_workload == 'true'
         || needs.pre-flight.outputs.force_run_all == 'true'
+        || needs.pre-flight.outputs.is_merge_group == 'true'
       )
-      && needs.pre-flight.outputs.is_merge_group == 'false'
       && !cancelled()
     env:
       PIP_DISABLE_PIP_VERSION_CHECK: 1
@@ -405,9 +393,10 @@ jobs:
           test_case: ${{ matrix.bucket }}
           tag: latest
           timeout: ${{ matrix.timeout || 30 }}
-          is_unit_test: 'true'
+          is_unit_test: "true"
           PAT: ${{ secrets.PAT }}
           container-image: ${{ env.container-registry }}/megatron-lm:${{ github.sha }}
+          is_ci_workload: ${{ needs.pre-flight.outputs.is_ci_workload }}
 
   cicd-parse-integration-tests:
     runs-on: ubuntu-latest
@@ -416,14 +405,17 @@ jobs:
       - cicd-wait-in-queue
       - cicd-container-build
       - cicd-unit-tests-latest
-    environment: nemo-ci
     if: |
-      (
+      needs.pre-flight.result != 'cancelled'
+      && needs.cicd-wait-in-queue.result != 'cancelled'
+      && needs.cicd-container-build.result != 'cancelled'
+      && needs.cicd-unit-tests-latest.result != 'cancelled'
+      && (
         success()
         || needs.pre-flight.outputs.is_ci_workload == 'true'
         || needs.pre-flight.outputs.force_run_all == 'true'
+        || needs.pre-flight.outputs.is_merge_group == 'true'
       )
-      && needs.pre-flight.outputs.is_merge_group == 'false'
       && !cancelled()
     outputs:
       integration-tests: ${{ steps.main.outputs.integration-tests }}
@@ -449,16 +441,18 @@ jobs:
         id: has-run-functional-tests-label
         env:
           GH_TOKEN: ${{ secrets.PAT }}
+          IS_CI_WORKLOAD: ${{ needs.pre-flight.outputs.is_ci_workload }}
         run: |
           PR_NUMBER=${{ fromJSON(steps.get-pr-info.outputs.pr-info || '{}').number }}
-          HAS_RUN_FUNCTIONAL_TESTS_LABEL=$(gh pr view $PR_NUMBER --json labels | jq '[.labels[].name] | any(. == "Run functional tests")') || echo "false"
+          HAS_RUN_FUNCTIONAL_TESTS_LABEL=$(gh pr view $PR_NUMBER --json labels | jq '[.labels[].name] | any(. == "Run functional tests")')
+          HAS_RUN_FUNCTIONAL_TESTS_LABEL=${HAS_RUN_FUNCTIONAL_TESTS_LABEL:-$IS_CI_WORKLOAD}
           echo "main=$HAS_RUN_FUNCTIONAL_TESTS_LABEL" | tee -a $GITHUB_OUTPUT
 
       - name: Parse functional tests
         id: main
         env:
           HAS_RUN_TESTS_LABEL: ${{ steps.has-run-tests-label.outputs.main }}
-          HAS_RUN_FUNCTIONAL_TESTS_LABEL: ${{ steps.has-run-functional-tests-label.outputs.main }}
+          HAS_RUN_FUNCTIONAL_TESTS_LABEL: ${{ steps.has-run-functional-tests-label.outputs.main == 'true' || needs.pre-flight.outputs.is_merge_group == 'true' }}
         run: |
           export PYTHONPATH=$(pwd)
 
@@ -499,6 +493,7 @@ jobs:
           echo "integration-tests=$(cat integration-tests.json)" | tee -a "$GITHUB_OUTPUT"
 
   cicd-integration-tests-latest:
+    timeout-minutes: 60
     strategy:
       fail-fast: false
       matrix:
@@ -510,18 +505,23 @@ jobs:
       - cicd-parse-integration-tests
       - cicd-unit-tests-latest
     runs-on: ${{ needs.is-not-external-contributor.outputs.selected_runner }}
-    name: '${{ matrix.model }}/${{ matrix.test_case }} - latest'
+    name: "${{ matrix.model }}/${{ matrix.test_case }} - latest"
     env:
       PIP_DISABLE_PIP_VERSION_CHECK: 1
       PIP_NO_PYTHON_VERSION_WARNING: 1
       PIP_ROOT_USER_ACTION: ignore
     if: |
-      (
+      needs.is-not-external-contributor.result != 'cancelled'
+      && needs.pre-flight.result != 'cancelled'
+      && needs.cicd-wait-in-queue.result != 'cancelled'
+      && needs.cicd-parse-integration-tests.result != 'cancelled'
+      && needs.cicd-unit-tests-latest.result != 'cancelled'
+      && (
         success()
         || needs.pre-flight.outputs.is_ci_workload == 'true'
         || needs.pre-flight.outputs.force_run_all == 'true'
+        || needs.pre-flight.outputs.is_merge_group == 'true'
       )
-      && needs.pre-flight.outputs.is_merge_group == 'false'
       && !cancelled()
     steps:
       - name: Checkout
@@ -533,9 +533,11 @@ jobs:
           model: ${{ matrix.model }}
           tag: latest
           timeout: ${{ matrix.timeout || 30 }}
-          is_unit_test: 'false'
+          is_unit_test: "false"
           PAT: ${{ secrets.PAT }}
           container-image: ${{ env.container-registry }}/megatron-lm:${{ github.sha }}
+          is_ci_workload: ${{ needs.pre-flight.outputs.is_ci_workload }}
+          is_merge_group: ${{ needs.pre-flight.outputs.is_merge_group }}
 
   Nemo_CICD_Test:
     needs:
@@ -566,8 +568,8 @@ jobs:
           GITHUB_RUN_ID: ${{ github.run_id }}
           SKIPPING_IS_ALLOWED: ${{ needs.pre-flight.outputs.docs_only == 'true' || needs.pre-flight.outputs.is_deployment_workflow == 'true' || needs.pre-flight.outputs.is_merge_group == 'true' || needs.pre-flight.outputs.is_ci_workload == 'true' }}
         run: |
-          FAILED_JOBS=$(gh run view $GITHUB_RUN_ID --json jobs --jq '[.jobs[] | select(.status == "completed" and .conclusion == "failure")] | length') || echo 0
-          SKIPPED_JOBS=$(gh run view $GITHUB_RUN_ID --json jobs --jq '[.jobs[] | select(.status == "completed" and .conclusion == "skipped")] | length') || echo 0
+          FAILED_JOBS=$(gh run view $GITHUB_RUN_ID --json jobs --jq '[.jobs[] | select(.status == "completed" and .conclusion == "failure" and .name != "merge-queue-notification")] | length') || echo 0
+          SKIPPED_JOBS=$(gh run view $GITHUB_RUN_ID --json jobs --jq '[.jobs[] | select(.status == "completed" and .conclusion == "skipped" and .name != "merge-queue-notification")] | length') || echo 0
 
           if [ "${FAILED_JOBS:-0}" -eq 0 ] && ([ "${SKIPPED_JOBS:-0}" -eq 0 ] || [ "$SKIPPING_IS_ALLOWED" == "true" ]); then
               echo "✅ All previous jobs completed successfully"
@@ -591,7 +593,6 @@ jobs:
       && needs.pre-flight.outputs.is_ci_workload == 'false'
       && !cancelled()
       && github.repository == 'NVIDIA/Megatron-LM'
-    environment: nemo-ci
     steps:
       - name: Generate fake coverage report
         uses: actions/github-script@v6
@@ -659,6 +660,34 @@ jobs:
           path: |
             .coverage
           include-hidden-files: true
+
+  merge-queue-notification:
+    runs-on: ubuntu-latest
+    if: github.event_name == 'merge_group'
+    permissions:
+      pull-requests: write
+    steps:
+      - name: Extract PR number from merge group
+        id: get-pr-number
+        run: |
+          # Extract PR number from merge group head_ref (format: refs/heads/gh-readonly-queue/main/pr-<number>-<sha>)
+          PR_NUMBER=$(echo "${{ github.event.merge_group.head_ref }}" | sed -n 's/.*\/pr-\([0-9]*\)-.*/\1/p')
+          echo "pr_number=$PR_NUMBER" >> $GITHUB_OUTPUT
+
+      - name: Comment on PR with action run URL
+        uses: actions/github-script@v7
+        with:
+          github-token: ${{ secrets.PAT }}
+          script: |
+            const prNumber = ${{ steps.get-pr-number.outputs.pr_number }};
+            const runUrl = `https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}`;
+
+            await github.rest.issues.createComment({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: prNumber,
+              body: `🔄 Merge queue validation started!\n\nYou can track the progress here: ${runUrl}`
+            });
 
   cleanup-taint-node:
     runs-on: ${{ needs.is-not-external-contributor.outputs.selected_runner }}
