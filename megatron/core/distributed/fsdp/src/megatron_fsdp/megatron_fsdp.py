@@ -1012,6 +1012,9 @@ class MegatronFSDP(torch.nn.Module):
                 ]
 
             for param in grad_acc_param_list:
+                # Only register grad acc hook for parameters that require gradients.
+                if not param.requires_grad:
+                    continue
                 self.grad_acc_hooks[f"grad_acc and reduce for {self.param_to_name[param]}"] = (
                     param.register_post_accumulate_grad_hook(
                         lambda p: _process_post_backward_gradients([p])
