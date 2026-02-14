@@ -280,6 +280,7 @@ def model_provider(
         freeze_language=args.freeze_LM,
         freeze_lm_embedding=args.freeze_lm_embedding,
         parallel_output=parallel_output,
+        share_embeddings_and_output_weights=not args.untie_embeddings_and_output_weights,
         language_position_embedding_type=args.position_embedding_type,
         language_rotary_percent=args.rotary_percent,
         language_rotary_base=args.rotary_base,
@@ -541,46 +542,35 @@ def get_batch(data_iterator):
     labels = data_i["labels"].long()
     loss_mask = data_f["loss_mask"].float()
 
-    # Handle image data if present in the dataset
+    # Handle image data.
+    # All broadcast_data calls must be unconditional — every TP rank must
+    # participate in the NCCL collective, even when data is None on non-TP0 ranks.
     images = None
     grid_thw = None
 
-    # Check if we're in mock data mode (no data paths provided).
-    # In mock mode, only TP rank 0 has data (others have data=None).
-    # MockMultimodalDataset always returns "image" key, so we must broadcast
-    # it unconditionally for all TP ranks to participate (avoid NCCL deadlock).
     has_data_path = (getattr(args, 'data_path', None) is not None or
                      getattr(args, 'per_split_data_args_path', None) is not None)
 
     if not has_data_path:
-        # Mock data mode: broadcast "image" unconditionally (like pretrain_vlm.py)
+        # Mock data mode: MockMultimodalDataset always returns "image" key
         image_data = tensor_parallel.broadcast_data(
             ["image"], data, torch.float32
         )
         images = image_data["image"].to(torch.bfloat16)
-    elif data is not None:
-        # Real data mode: all TP ranks have data, conditional broadcast is safe
-        if "pixel_values" in data:
-            pixel_data = tensor_parallel.broadcast_data(
-                ["pixel_values"], data, torch.float32
-            )
-            images = pixel_data["pixel_values"].to(torch.bfloat16)
-        elif "image" in data:
-            image_data = tensor_parallel.broadcast_data(
-                ["image"], data, torch.float32
-            )
-            images = image_data["image"].to(torch.bfloat16)
-
-        if "image_grid_thw" in data:
-            grid_data = tensor_parallel.broadcast_data(
-                ["image_grid_thw"], data, torch.int64
-            )
-            grid_thw = grid_data["image_grid_thw"]
-        elif "grid_thw" in data:
-            grid_data = tensor_parallel.broadcast_data(
-                ["grid_thw"], data, torch.int64
-            )
-            grid_thw = grid_data["grid_thw"]
+    else:
+        # Real data mode: Qwen3VLDataset collate always includes pixel_values
+        # and image_grid_thw (empty tensors when no images in batch).
+        pixel_data = tensor_parallel.broadcast_data(
+            ["pixel_values"], data, torch.float32
+        )
+        grid_data = tensor_parallel.broadcast_data(
+            ["image_grid_thw"], data, torch.int64
+        )
+        pv = pixel_data["pixel_values"]
+        gt = grid_data["image_grid_thw"]
+        if pv.numel() > 0:
+            images = pv.to(torch.bfloat16)
+            grid_thw = gt if gt.numel() > 0 else None
 
     attention_mask = None  # Use mask type from layer spec
     packed_seq_params = None

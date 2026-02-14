@@ -91,14 +91,19 @@ def qwen3vl_collate_fn(batch: List[Dict[str, torch.Tensor]]) -> Dict[str, torch.
         "position_ids": position_ids,
     }
 
-    # Concatenate pixel_values along first dimension (variable num patches)
+    # Concatenate pixel_values along first dimension (variable num patches).
+    # Always include pixel_values and image_grid_thw keys so that
+    # tensor_parallel.broadcast_data can be called unconditionally in get_batch
+    # (all TP ranks must participate in the NCCL collective).
     if has_images and all_pixel_values:
-        # Concatenate all pixel_values: [total_patches, hidden_dim]
         result["pixel_values"] = torch.cat(all_pixel_values, dim=0)
-
-        # Stack grid_thw if available: [batch_size, 3] or [num_images, 3]
         if all_grid_thw:
             result["image_grid_thw"] = torch.cat(all_grid_thw, dim=0)
+        else:
+            result["image_grid_thw"] = torch.zeros(0, 3, dtype=torch.long)
+    else:
+        result["pixel_values"] = torch.zeros(0, dtype=torch.float32)
+        result["image_grid_thw"] = torch.zeros(0, 3, dtype=torch.long)
 
     return result
 
@@ -578,8 +583,11 @@ class Qwen3VLDataset(Dataset):
                 while end_idx < len(input_ids_list) and input_ids_list[end_idx] != im_end_id:
                     end_idx += 1
 
-                # Set loss_mask=1 for assistant content (excluding <|im_end|>)
-                loss_mask[start_idx:end_idx] = 1.0
+                # Set loss_mask=1 for predicting assistant content tokens.
+                # labels are left-shifted (labels[p] = input_ids[p+1]), so to
+                # include prediction of the first assistant token at start_idx,
+                # loss_mask must start at start_idx - 1.
+                loss_mask[start_idx - 1:end_idx] = 1.0
                 i = end_idx + 1
             else:
                 i += 1

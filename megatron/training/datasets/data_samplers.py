@@ -79,8 +79,13 @@ def build_pretraining_data_loader(dataset, consumed_samples):
         worker_init_fn if args.exit_signal_handler and args.num_workers > 0 else None
     )
     # Torch dataloader.
+    # Check if dataset provides a custom collate function (e.g., for VLM datasets
+    # with variable-length inputs like pixel_values).
+    collate_fn = getattr(dataset, 'collate_fn', None)
     if args.hybrid_context_parallel:
         extra_kwargs = {"collate_fn": lambda x: x,}
+    elif collate_fn is not None:
+        extra_kwargs = {"collate_fn": collate_fn}
     else:
         extra_kwargs = {}
     return torch.utils.data.DataLoader(
