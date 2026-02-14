@@ -216,9 +216,7 @@ class MoEMetricsTracker:
                 # does not have 'dp' attribute, do it manually.
                 if not entry.reduce_group_has_dp:
                     torch.distributed.all_reduce(
-                        values,
-                        group=parallel_state.get_data_parallel_group(with_context_parallel=False),
-                        op=torch.distributed.ReduceOp.AVG,
+                        values, group=dp_group, op=torch.distributed.ReduceOp.AVG
                     )
 
             # Average aux losses across custom avg_group
