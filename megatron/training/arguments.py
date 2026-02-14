@@ -1142,7 +1142,6 @@ def validate_args(args, defaults={}):
             args.fim_eod_token,
         ]
         assert not args.mock_data, "Mock dataset is not supported with FIM dataset."
-        assert not args.legacy_tokenizer, "FIM dataset is not supported with legacy tokenizers."
         assert args.fim_rate, "--fim-rate should be specified."
         assert args.fim_spm_rate, "--fim-spm-rate should be specified."
         assert all(token is not None for token in extra_tokens), "FIM extra tokens should be specified."
@@ -1594,6 +1593,11 @@ def _add_inference_args(parser):
                        help='Track paused request ids by adding \'paused\' events '
                        'to each request\'s event history. This has a very minor '
                        'impact on latency.')
+    group.add_argument('--inference-dynamic-batching-track-generated-token-events',
+                       action='store_true',
+                       help='Track per-token events with timestamps for each generated token. '
+                       'When enabled, each generated token creates a GENERATED_TOKEN event '
+                       'with a timestamp, useful for per-token latency analysis.')
     group.add_argument('--decode-only-cuda-graphs',
                        action='store_true', default=False,
                        help='Only use cuda graphs for decode-only steps, not prefill and mixed steps.')
@@ -1983,12 +1987,6 @@ def _add_rl_args(parser):
                        help="Entropy term weight in GRPO loss.")
     group.add_argument('--grpo-filter-groups-with-same-reward', action='store_true',
                        help="Filter groups with same reward.")
-    group.add_argument('--langrl-inference-server-type', type=str,
-                       choices=['inplace_megatron', 'inplace_megatron_chat'], default='inplace_megatron',
-                       help="Type of inference server to use.")
-    group.add_argument('--langrl-inference-server-conversation-template', type=str, default=None,
-                       help="Conversation template, if using a chat server.")
-    group.add_argument('--langrl-external-server', action=argparse.BooleanOptionalAction, required=False, default=False)
     group.add_argument('--langrl-env-config', type=str, default=None,
                        help="Path to YAML config file for RL environment configuration.")
     group.add_argument('--rl-default-temperature', type=float, default=1.0,
@@ -2453,8 +2451,6 @@ def _add_tokenizer_args(parser):
     group.add_argument('--tokenizer-special-tokens', type=str, nargs='+', default=None,
                        help='List of special tokens. For TikTokenizer needs to have '
                             '["<unk>", "<s>", "</s>", "<mask>", "<pad>", "<cls>", "<sep>"]')
-    group.add_argument('--legacy-tokenizer', action='store_true', default=False,
-                       help='To use Megatron-LM legacy tokenizer system.')
     group.add_argument('--tiktoken-pattern', type=str, default=None,
                        help='Which tiktoken pattern to use. Options: [v1, v2]')
     group.add_argument('--tiktoken-num-special-tokens', type=int, default=1000,

@@ -34,6 +34,26 @@ class ParamGroupOverride(TypedDict):
     wd_mult: float
 
 
+def get_canonical_lr_for_logging(param_groups: list[dict]) -> float | None:
+    """Return the lr of the first ``default_config=True`` param group.
+
+    All ``default_config`` groups share the same LR schedule, so the first one
+    is representative.  This includes empty rank-alignment stub groups, which
+    the scheduler still writes a valid lr onto.
+
+    Args:
+        param_groups (list[dict]): parameter groups from the optimizer.
+
+    Returns:
+        float | None: the canonical learning rate, or None if no
+            ``default_config=True`` group is found.
+    """
+    for param_group in param_groups:
+        if param_group.get('default_config', False):
+            return param_group.get('lr')
+    return None
+
+
 def param_group_override_to_tuple(
     param_group_override: ParamGroupOverride | None,
 ) -> tuple[tuple[str, Any], ...] | None:
@@ -265,6 +285,10 @@ class OptimizerParamScheduler:
             increment (int): number of steps to increment
         """
         self.num_steps += increment
+        # Do not skip empty param groups: get_canonical_lr_for_logging reads lr
+        # from default_config groups regardless of whether they hold parameters.
+        # This is important for logging under model parallelism that may leave
+        # some ranks with empty default_config parameter groups.
         for param_group in self.optimizer.param_groups:
             param_group['lr'] = self.get_lr(param_group)
             param_group['weight_decay'] = self.get_wd(param_group) * param_group.get('wd_mult', 1.0)
