@@ -1,5 +1,6 @@
 # Copyright (c) 2023, NVIDIA CORPORATION. All rights reserved.
 
+from functools import partial
 from typing import Optional
 
 from megatron.core.extensions.transformer_engine_spec_provider import TESpecProvider
@@ -57,16 +58,9 @@ def get_moe_module_spec_for_backend(
         linear_fc1=linear_fc1, linear_fc2=linear_fc2, activation_func=activation_func
     )
 
-    expert_module, expert_submodule = backend.grouped_mlp_modules(
-        moe_grouped_gemm is not None and moe_grouped_gemm
-    )
-    if expert_submodule is not None:
-        expert_submodule.activation_func = activation_func
-
-    experts = ModuleSpec(module=expert_module, submodules=expert_submodule)
-
+    experts = backend.grouped_mlp_modules(moe_grouped_gemm is not None and moe_grouped_gemm)
     # shared experts spec
-    shared_experts = ModuleSpec(module=SharedExpertMLP, submodules=mlp)
+    shared_experts = partial(SharedExpertMLP, submodules=mlp)
 
     # MoE module spec
     moe_module_spec = ModuleSpec(
@@ -89,13 +83,9 @@ def get_inference_optimized_moe_spec() -> ModuleSpec:
     backend = InferenceSpecProvider()
     activation_func = backend.activation_func()
 
-    expert_module, expert_submodule = backend.grouped_mlp_modules(True)
-    if expert_submodule is not None:
-        expert_submodule.activation_func = activation_func
-
-    experts = ModuleSpec(module=expert_module, submodules=expert_submodule)
-    shared_experts = ModuleSpec(
-        module=SharedExpertMLP,
+    experts = backend.grouped_mlp_modules(True)
+    shared_experts = partial(
+        SharedExpertMLP,
         submodules=MLPSubmodules(
             linear_fc1=backend.column_parallel_linear(),
             linear_fc2=backend.row_parallel_linear(),
