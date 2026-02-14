@@ -4,16 +4,12 @@
 
 import logging
 from contextlib import nullcontext
-from copy import deepcopy
-from functools import partial
 from typing import List, Optional, Tuple
 
 import torch
-import torch.nn.functional as F
 
 from megatron.core import parallel_state, tensor_parallel
 from megatron.core.config_logger import has_config_logger_enabled, log_config_to_disk
-from megatron.core.enums import Fp8Recipe
 from megatron.core.fp8_utils import get_fp8_context
 from megatron.core.inference.contexts import BaseInferenceContext
 from megatron.core.models.gpt import GPTModel
@@ -23,25 +19,14 @@ from megatron.core.transformer import MegatronModule
 from megatron.core.transformer.spec_utils import ModuleSpec
 from megatron.core.transformer.transformer_block import TransformerBlock
 from megatron.core.transformer.transformer_config import TransformerConfig
-from megatron.core.utils import deprecate_inference_params, log_single_rank
+from megatron.core.utils import log_single_rank
 
 try:
     import transformer_engine  # pylint: disable=unused-import
-    from megatron.core.extensions.transformer_engine import TEDotProductAttention
-    HAVE_TE = True
-    try:
-        import transformer_engine_torch as tex
-        HAVE_TEX = True
-    except:
-        HAVE_TEX = False
-except:
-    HAVE_TE = False
 
-try:
-    from megatron.core.extensions.transformer_engine import te_checkpoint
-    HAVE_TE_CHECKPOINT = True
-except:
-    HAVE_TE_CHECKPOINT = False
+    HAVE_TE = True
+except ImportError:
+    HAVE_TE = False
 
 
 IGNORE_INDEX = -100
@@ -83,10 +68,7 @@ class Qwen3VLVisionEncoder(MegatronModule):
             from transformers import AutoConfig, AutoModelForVision2Seq, AutoProcessor
 
             # Load config first to get vision config parameters
-            hf_config = AutoConfig.from_pretrained(
-                hf_model_name,
-                trust_remote_code=True,
-            )
+            hf_config = AutoConfig.from_pretrained(hf_model_name, trust_remote_code=True)
 
             # Load the full model to extract vision components
             # Use AutoModelForVision2Seq for proper Qwen3-VL loading
@@ -153,17 +135,13 @@ class Qwen3VLVisionEncoder(MegatronModule):
             out_features = weight.shape[0]
             # Reshape Conv3d weight to Linear weight on the fly
             return torch.nn.functional.linear(
-                hidden_states.to(dtype=weight.dtype),
-                weight.reshape(out_features, -1),
-                bias,
+                hidden_states.to(dtype=weight.dtype), weight.reshape(out_features, -1), bias
             )
 
         patch_embed.forward = patched_forward
 
     def forward(
-        self,
-        pixel_values: torch.Tensor,
-        grid_thw: Optional[torch.Tensor] = None,
+        self, pixel_values: torch.Tensor, grid_thw: Optional[torch.Tensor] = None
     ) -> Tuple[torch.Tensor, List[torch.Tensor]]:
         """
         Forward pass through vision encoder.
@@ -260,9 +238,7 @@ class Qwen3VLTransformerBlock(TransformerBlock):
                 and layer_number < deepstack_visual_embeds.shape[0]
             ):
                 hidden_states = self._deepstack_process(
-                    hidden_states,
-                    visual_pos_masks,
-                    deepstack_visual_embeds[layer_number],
+                    hidden_states, visual_pos_masks, deepstack_visual_embeds[layer_number]
                 )
 
         return hidden_states, context
@@ -284,10 +260,7 @@ class Qwen3VLTransformerBlock(TransformerBlock):
         if visual_pos_masks is None or visual_embeds is None:
             return hidden_states
 
-        visual_embeds = visual_embeds.to(
-            device=hidden_states.device,
-            dtype=hidden_states.dtype,
-        )
+        visual_embeds = visual_embeds.to(device=hidden_states.device, dtype=hidden_states.dtype)
 
         # Add visual embeddings to positions marked by mask
         # Flatten for indexing
@@ -440,11 +413,7 @@ class Qwen3VLModel(MegatronModule):
         if self.add_decoder:
             self.language_model.set_input_tensor(input_tensor)
 
-    def freeze(
-        self,
-        freeze_language_model: bool = False,
-        freeze_vision_model: bool = False,
-    ):
+    def freeze(self, freeze_language_model: bool = False, freeze_vision_model: bool = False):
         """Freeze model components."""
         if freeze_language_model and self.language_model is not None:
             for param in self.language_model.parameters():
@@ -466,9 +435,7 @@ class Qwen3VLModel(MegatronModule):
             self.freeze_lm_embedding = True
 
     def _get_image_embeddings(
-        self,
-        images: torch.Tensor,
-        grid_thw: Optional[torch.Tensor] = None,
+        self, images: torch.Tensor, grid_thw: Optional[torch.Tensor] = None
     ) -> Tuple[torch.Tensor, List[torch.Tensor]]:
         """Get image embeddings from vision encoder."""
         if self.visual is None:
@@ -485,7 +452,14 @@ class Qwen3VLModel(MegatronModule):
         deepstack_embeds: Optional[List[torch.Tensor]],
         labels: Optional[torch.Tensor] = None,
         loss_mask: Optional[torch.Tensor] = None,
-    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, Optional[torch.Tensor], Optional[torch.Tensor], Optional[torch.Tensor]]:
+    ) -> Tuple[
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        Optional[torch.Tensor],
+        Optional[torch.Tensor],
+        Optional[torch.Tensor],
+    ]:
         """
         Preprocess data by inserting image embeddings at image token positions.
 
@@ -518,8 +492,7 @@ class Qwen3VLModel(MegatronModule):
         input_ids_text[input_ids_text == self.video_token_index] = 0
 
         text_embeds = self.language_model.embedding(
-            input_ids=input_ids_text,
-            position_ids=position_ids,
+            input_ids=input_ids_text, position_ids=position_ids
         )
         # text_embeds: [seq, batch, hidden] or [seq/tp, batch, hidden] if sequence parallel
 
@@ -544,8 +517,8 @@ class Qwen3VLModel(MegatronModule):
 
         # Create masks for image and video tokens
         # input_ids: [batch, seq]
-        image_mask = (input_ids == self.image_token_index)
-        video_mask = (input_ids == self.video_token_index)
+        image_mask = input_ids == self.image_token_index
+        video_mask = input_ids == self.video_token_index
         visual_mask = image_mask | video_mask
 
         # Expand mask to match embedding dimensions: [batch, seq, hidden]
@@ -569,16 +542,7 @@ class Qwen3VLModel(MegatronModule):
         # masked_scatter consumes exactly as many values as True positions in the mask,
         # so no explicit count/slice is needed. We call it unconditionally (no-op when
         # mask is all-False) to avoid .sum().item() or .any() CPU-GPU sync stalls.
-        inputs_embeds = inputs_embeds.masked_scatter(
-            image_mask_expanded,
-            image_embeds_flat,
-        )
-            # Debug (commented out)
-            # if parallel_state.get_data_parallel_rank() == 0:
-            #     after_scatter = inputs_embeds[image_mask]
-            #     print(f"  [_preprocess_data] After scatter - mean: {after_scatter.mean().item():.6f}, std: {after_scatter.std().item():.6f}")
-            #     print(f"  [_preprocess_data] masked_scatter done, inputs_embeds shape: {inputs_embeds.shape}")
-
+        inputs_embeds = inputs_embeds.masked_scatter(image_mask_expanded, image_embeds_flat)
         # Handle video embeddings similarly if present (for future use)
         # Currently treating all visual tokens as images
 
@@ -629,12 +593,6 @@ class Qwen3VLModel(MegatronModule):
         image_embeds = None
         deepstack_embeds = None
 
-        # Debug (commented out)
-        # import sys
-        # print(f"  [Qwen3VLModel.forward] add_encoder={self.add_encoder}, images is None={images is None}", flush=True)
-        # if images is not None:
-        #     print(f"  [Qwen3VLModel.forward] images.shape={images.shape}", flush=True)
-
         if self.add_encoder and images is not None:
             # Skip saving activations when vision encoder is frozen (saves memory)
             if self.freeze_vision:
@@ -647,21 +605,35 @@ class Qwen3VLModel(MegatronModule):
             if deepstack_embeds and isinstance(deepstack_embeds, list):
                 deepstack_embeds = torch.stack(deepstack_embeds, dim=0)
 
-        # Preprocess data: replace image placeholder embeddings with actual image embeddings
-        # Uses masked_scatter for in-place replacement, sequence length unchanged
-        # When LM embedding is frozen, skip saving activations (no trainable ops in _preprocess_data)                                                                       
-        if self.freeze_lm_embedding:                                                
-            with torch.no_grad():                                                   
-                combined_embeds, position_ids, visual_pos_masks, deepstack_embeds, new_labels, new_loss_mask = self._preprocess_data(                                     
-                    input_ids=input_ids,                                            
+        # Preprocess data: replace image placeholder embeddings with actual
+        # image embeddings. Uses masked_scatter for in-place replacement.
+        # When LM embedding is frozen, skip saving activations.
+        if self.freeze_lm_embedding:
+            with torch.no_grad():
+                (
+                    combined_embeds,
+                    position_ids,
+                    visual_pos_masks,
+                    deepstack_embeds,
+                    new_labels,
+                    new_loss_mask,
+                ) = self._preprocess_data(
+                    input_ids=input_ids,
                     position_ids=position_ids,
                     image_embeds=image_embeds,
                     deepstack_embeds=deepstack_embeds,
                     labels=labels,
                     loss_mask=loss_mask,
-                )                                                               
-        else:   
-            combined_embeds, position_ids, visual_pos_masks, deepstack_embeds, new_labels, new_loss_mask = self._preprocess_data(
+                )
+        else:
+            (
+                combined_embeds,
+                position_ids,
+                visual_pos_masks,
+                deepstack_embeds,
+                new_labels,
+                new_loss_mask,
+            ) = self._preprocess_data(
                 input_ids=input_ids,
                 position_ids=position_ids,
                 image_embeds=image_embeds,
@@ -670,10 +642,10 @@ class Qwen3VLModel(MegatronModule):
                 loss_mask=loss_mask,
             )
 
-        # If sequence parallelism is enabled AND we had images, scatter combined_embeds back to SP format.
-        # _preprocess_data gathered embeddings to do masked_scatter, now scatter back for TransformerBlock.
+        # If sequence parallelism is enabled AND we had images, scatter
+        # combined_embeds back to SP format for TransformerBlock.
         language_config = self.language_model.config
-        has_images = (self.add_encoder and images is not None)
+        has_images = self.add_encoder and images is not None
         tp_size = parallel_state.get_tensor_model_parallel_world_size()
         if has_images and language_config.sequence_parallel and tp_size > 1:
             # Sequence length is unchanged (no expansion), should already be divisible by TP
@@ -682,8 +654,11 @@ class Qwen3VLModel(MegatronModule):
             if seq_len % tp_size != 0:
                 pad_len = tp_size - (seq_len % tp_size)
                 padding = torch.zeros(
-                    pad_len, combined_embeds.shape[1], combined_embeds.shape[2],
-                    dtype=combined_embeds.dtype, device=combined_embeds.device
+                    pad_len,
+                    combined_embeds.shape[1],
+                    combined_embeds.shape[2],
+                    dtype=combined_embeds.dtype,
+                    device=combined_embeds.device,
                 )
                 combined_embeds = torch.cat([combined_embeds, padding], dim=0)
             combined_embeds = tensor_parallel.scatter_to_sequence_parallel_region(combined_embeds)
@@ -696,18 +671,10 @@ class Qwen3VLModel(MegatronModule):
         # Note: We pass embeddings directly instead of input_ids
         # Labels and loss_mask are unchanged since sequence length is preserved
 
-        # Debug: Check position_ids before passing to language_model (commented out)
-        # import os
-        # if os.environ.get("TEST_BEFORE_QUANT") == "1" and position_ids is not None and position_ids.dim() == 3:
-        #     print(f"  [Qwen3VLModel.forward] Before language_model call:")
-        #     print(f"    position_ids[0,0,:10] (temporal): {position_ids[0,0,:10].tolist()}")
-        #     print(f"    position_ids[1,0,:10] (height): {position_ids[1,0,:10].tolist()}")
-        #     print(f"    position_ids[2,0,:10] (width): {position_ids[2,0,:10].tolist()}")
-
-        # Fix: When LM embedding is frozen, combined_embeds has requires_grad=False.
-        # Activation checkpointing (te_checkpoint / CheckpointFunction) requires the input
-        # to have requires_grad=True to properly propagate gradients to decoder layer parameters.
-        # Without this, gradients stop at the checkpoint boundary and decoder weights get zero updates.
+        # When LM embedding is frozen, combined_embeds has
+        # requires_grad=False. Activation checkpointing requires the
+        # input to have requires_grad=True to propagate gradients to
+        # decoder layer parameters.
         if self.freeze_lm_embedding and combined_embeds.requires_grad is False:
             combined_embeds = combined_embeds.detach().requires_grad_(True)
 
@@ -726,10 +693,7 @@ class Qwen3VLModel(MegatronModule):
         return output, new_loss_mask
 
     def sharded_state_dict(
-        self,
-        prefix: str = '',
-        sharded_offsets: tuple = (),
-        metadata: Optional[dict] = None,
+        self, prefix: str = '', sharded_offsets: tuple = (), metadata: Optional[dict] = None
     ):
         """Get sharded state dict for distributed checkpointing.
 
@@ -762,9 +726,7 @@ class Qwen3VLModel(MegatronModule):
         if self.language_model is not None:
             language_prefix = f'{prefix}language_model.'
             language_sharded_sd = self.language_model.sharded_state_dict(
-                prefix=language_prefix,
-                sharded_offsets=sharded_offsets,
-                metadata=metadata,
+                prefix=language_prefix, sharded_offsets=sharded_offsets, metadata=metadata
             )
             sharded_state_dict.update(language_sharded_sd)
 

@@ -14,14 +14,14 @@ import torch
 
 from megatron.core.datasets.blended_megatron_dataset_builder import BlendedMegatronDatasetBuilder
 from megatron.core.datasets.multimodal_dataset import MockMultimodalDataset, MultimodalDatasetConfig
-from megatron.core.datasets.utils import compile_helpers
-from megatron.core.tokenizers import MegatronTokenizer
 from megatron.core.datasets.qwen3vl_dataset import (
     Qwen3VLDataset,
     Qwen3VLDatasetBuilder,
     Qwen3VLDatasetConfig,
     qwen3vl_collate_fn,
 )
+from megatron.core.datasets.utils import compile_helpers
+from megatron.core.tokenizers import MegatronTokenizer
 from tests.unit_tests.test_utilities import Utils
 
 _MOCK_VOCAB_SIZE = 8192
@@ -430,19 +430,14 @@ class TestQwen3VLDatasetBuilder:
         jsonl_file.write_text('{"text": "sample"}\n')
 
         blend_config = {
-            "train": [
-                0.5,
-                str(tmp_path / "preprocessed" / "chartqa_train_text_document"),
-            ],
+            "train": [0.5, str(tmp_path / "preprocessed" / "chartqa_train_text_document")]
         }
         blend_path = tmp_path / "blend.json"
         blend_path.write_text(json.dumps(blend_config))
 
         config = Qwen3VLDatasetConfig()
         builder = Qwen3VLDatasetBuilder(
-            config=config,
-            blend_path=str(blend_path),
-            train_val_test_num_samples=[100, 10, 10],
+            config=config, blend_path=str(blend_path), train_val_test_num_samples=[100, 10, 10]
         )
 
         paths = builder._get_jsonl_paths("train")
@@ -455,9 +450,7 @@ class TestQwen3VLDatasetBuilder:
 
         config = Qwen3VLDatasetConfig()
         builder = Qwen3VLDatasetBuilder(
-            config=config,
-            blend_path=str(blend_path),
-            train_val_test_num_samples=[100, 10, 10],
+            config=config, blend_path=str(blend_path), train_val_test_num_samples=[100, 10, 10]
         )
 
         assert builder._get_jsonl_paths("train") == []
@@ -469,9 +462,7 @@ class TestQwen3VLDatasetBuilder:
 
         config = Qwen3VLDatasetConfig()
         builder = Qwen3VLDatasetBuilder(
-            config=config,
-            blend_path=str(blend_path),
-            train_val_test_num_samples=[100, 10, 10],
+            config=config, blend_path=str(blend_path), train_val_test_num_samples=[100, 10, 10]
         )
 
         assert builder._get_jsonl_paths("valid") == []
@@ -487,16 +478,14 @@ class TestQwen3VLDatasetBuilder:
                 str(tmp_path / "preprocessed" / "ds1_train_text_document"),
                 0.5,
                 str(tmp_path / "preprocessed" / "ds2_train_text_document"),
-            ],
+            ]
         }
         blend_path = tmp_path / "blend.json"
         blend_path.write_text(json.dumps(blend_config))
 
         config = Qwen3VLDatasetConfig()
         builder = Qwen3VLDatasetBuilder(
-            config=config,
-            blend_path=str(blend_path),
-            train_val_test_num_samples=[100, 10, 10],
+            config=config, blend_path=str(blend_path), train_val_test_num_samples=[100, 10, 10]
         )
 
         paths = builder._get_jsonl_paths("train")
@@ -555,7 +544,7 @@ def test_mock_qwen3vl_dataset():
         # Validate shapes.
         assert sample["pixel_values"].shape == torch.Size([expected_patches, expected_patch_dim])
         assert sample["image_grid_thw"].shape == torch.Size([1, 3])
-        assert sample["image_grid_thw"][0, 0].item() == 1   # temporal
+        assert sample["image_grid_thw"][0, 0].item() == 1  # temporal
         assert sample["image_grid_thw"][0, 1].item() == num_h
         assert sample["image_grid_thw"][0, 2].item() == num_w
 

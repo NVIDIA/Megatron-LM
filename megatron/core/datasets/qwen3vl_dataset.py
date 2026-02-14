@@ -17,11 +17,10 @@ And returns:
 """
 
 import json
+import logging
 import os
-import random
 from dataclasses import dataclass
-from pathlib import Path
-from typing import Any, Dict, List, Optional, Union
+from typing import Any, Dict, List, Optional
 
 import numpy as np
 import torch
@@ -30,9 +29,12 @@ from torch.utils.data import Dataset
 
 try:
     from transformers import AutoProcessor
+
     HAS_TRANSFORMERS = True
 except ImportError:
     HAS_TRANSFORMERS = False
+
+logger = logging.getLogger(__name__)
 
 
 def qwen3vl_collate_fn(batch: List[Dict[str, torch.Tensor]]) -> Dict[str, torch.Tensor]:
@@ -130,11 +132,7 @@ class Qwen3VLDataset(Dataset):
     using Qwen3-VL processor, and returns batches suitable for training.
     """
 
-    def __init__(
-        self,
-        config: Qwen3VLDatasetConfig,
-        split: str = "train",
-    ):
+    def __init__(self, config: Qwen3VLDatasetConfig, split: str = "train"):
         """Initialize the dataset.
 
         Args:
@@ -152,8 +150,7 @@ class Qwen3VLDataset(Dataset):
 
         # Load processor
         self.processor = AutoProcessor.from_pretrained(
-            config.processor_name,
-            trust_remote_code=True,
+            config.processor_name, trust_remote_code=True
         )
         self.tokenizer = self.processor.tokenizer
 
@@ -187,7 +184,7 @@ class Qwen3VLDataset(Dataset):
         self._resolved_paths = {}
         self._pre_resolve_image_paths()
 
-        print(f"[Qwen3VLDataset] Loaded {len(self.samples)} samples for {split}")
+        logger.info("Loaded %d samples for %s", len(self.samples), split)
 
         # Random state
         self.rng = np.random.RandomState(config.random_seed)
@@ -323,11 +320,14 @@ class Qwen3VLDataset(Dataset):
         if key not in self._hf_datasets:
             try:
                 from datasets import load_dataset
-                print(f"[Qwen3VLDataset] Loading HF dataset: {hf_name} "
-                      f"(config={hf_config}, split={hf_split})")
+
+                logger.info(
+                    "Loading HF dataset: %s (config=%s, split=%s)",
+                    hf_name, hf_config, hf_split,
+                )
                 self._hf_datasets[key] = load_dataset(hf_name, hf_config, split=hf_split)
             except Exception as e:
-                print(f"[Qwen3VLDataset] Failed to load HF dataset {hf_name}: {e}")
+                logger.warning("Failed to load HF dataset %s: %s", hf_name, e)
                 self._hf_datasets[key] = None
                 return None
 
@@ -387,7 +387,7 @@ class Qwen3VLDataset(Dataset):
 
             return None
         except Exception as e:
-            print(f"[Qwen3VLDataset] Failed to extract HF image at index {idx}: {e}")
+            logger.warning("Failed to extract HF image at index %d: %s", idx, e)
             return None
 
     def _parse_conversation(self, text: str) -> List[Dict[str, Any]]:
@@ -412,18 +412,16 @@ class Qwen3VLDataset(Dataset):
             # Check for role markers
             if line_stripped.startswith('User:'):
                 if current_role and current_content:
-                    messages.append({
-                        "role": current_role,
-                        "content": '\n'.join(current_content).strip()
-                    })
+                    messages.append(
+                        {"role": current_role, "content": '\n'.join(current_content).strip()}
+                    )
                 current_role = "user"
                 current_content = [line_stripped[5:].strip()]  # Remove "User:"
             elif line_stripped.startswith('Assistant:'):
                 if current_role and current_content:
-                    messages.append({
-                        "role": current_role,
-                        "content": '\n'.join(current_content).strip()
-                    })
+                    messages.append(
+                        {"role": current_role, "content": '\n'.join(current_content).strip()}
+                    )
                 current_role = "assistant"
                 current_content = [line_stripped[10:].strip()]  # Remove "Assistant:"
             elif current_role:
@@ -431,10 +429,7 @@ class Qwen3VLDataset(Dataset):
 
         # Add final message
         if current_role and current_content:
-            messages.append({
-                "role": current_role,
-                "content": '\n'.join(current_content).strip()
-            })
+            messages.append({"role": current_role, "content": '\n'.join(current_content).strip()})
 
         return messages
 
@@ -499,9 +494,7 @@ class Qwen3VLDataset(Dataset):
         # Apply chat template and process
         try:
             formatted_text = self.processor.apply_chat_template(
-                conversation,
-                tokenize=False,
-                add_generation_prompt=False,
+                conversation, tokenize=False, add_generation_prompt=False
             )
 
             # Process with Qwen3-VL processor
@@ -570,8 +563,11 @@ class Qwen3VLDataset(Dataset):
         i = 0
         while i < len(input_ids_list) - 2:
             # Check for <|im_start|>assistant pattern
-            if (input_ids_list[i] == im_start_id and
-                i + 1 < len(input_ids_list) and input_ids_list[i + 1] == assistant_token_id):
+            if (
+                input_ids_list[i] == im_start_id
+                and i + 1 < len(input_ids_list)
+                and input_ids_list[i + 1] == assistant_token_id
+            ):
                 # Skip the header: <|im_start|>assistant\n
                 start_idx = i + 2  # Skip <|im_start|> and assistant
                 if start_idx < len(input_ids_list) and input_ids_list[start_idx] == newline_id:
@@ -634,10 +630,7 @@ class Qwen3VLDatasetBuilder:
     """Builder for Qwen3-VL datasets from datablend configuration."""
 
     def __init__(
-        self,
-        config: Qwen3VLDatasetConfig,
-        blend_path: str,
-        train_val_test_num_samples: List[int],
+        self, config: Qwen3VLDatasetConfig, blend_path: str, train_val_test_num_samples: List[int]
     ):
         """Initialize the builder.
 
@@ -678,7 +671,7 @@ class Qwen3VLDatasetBuilder:
             if os.path.exists(jsonl_path):
                 jsonl_paths.append(jsonl_path)
             else:
-                print(f"[Qwen3VLDatasetBuilder] JSONL not found: {jsonl_path}")
+                logger.warning("JSONL not found: %s", jsonl_path)
 
         return jsonl_paths
 

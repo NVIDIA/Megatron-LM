@@ -133,9 +133,7 @@ class TestQwen3VLModel:
         )
 
         # Sequence length unchanged, no visual mask.
-        assert combined_embeds.shape == torch.Size(
-            (seq_len, batch_size, self.language_hidden_size)
-        )
+        assert combined_embeds.shape == torch.Size((seq_len, batch_size, self.language_hidden_size))
         assert visual_pos_mask is None
         assert torch.equal(new_labels, labels)
         assert torch.equal(new_loss_mask, loss_mask)
@@ -194,12 +192,8 @@ class TestQwen3VLModel:
         # Verify image embeddings were scattered into the correct positions.
         # combined_embeds is [seq, batch, hidden]; transpose to [batch, seq, hidden].
         result = combined_embeds.transpose(0, 1)
-        assert torch.allclose(
-            result[0, 10:15], image_embeds[0:5].to(result.dtype), atol=1e-5
-        )
-        assert torch.allclose(
-            result[1, 20:25], image_embeds[5:10].to(result.dtype), atol=1e-5
-        )
+        assert torch.allclose(result[0, 10:15], image_embeds[0:5].to(result.dtype), atol=1e-5)
+        assert torch.allclose(result[1, 20:25], image_embeds[5:10].to(result.dtype), atol=1e-5)
 
         # Labels and loss_mask are unchanged.
         assert torch.equal(new_labels, labels)
