@@ -558,19 +558,22 @@ def get_batch(data_iterator):
         )
         images = image_data["image"].to(torch.bfloat16)
     else:
-        # Real data mode: Qwen3VLDataset collate always includes pixel_values
-        # and image_grid_thw (empty tensors when no images in batch).
-        pixel_data = tensor_parallel.broadcast_data(
-            ["pixel_values"], data, torch.float32
+        # Real data mode: broadcast a flag first so all TP ranks agree on
+        # whether to enter the image broadcast (avoids NCCL deadlock).
+        # Note: broadcast_data uses 0 as a sentinel for dimension sizes,
+        # so zero-sized tensors cannot be broadcast directly.
+        flag = tensor_parallel.broadcast_data(
+            ["has_images"], data, torch.int64
         )
-        grid_data = tensor_parallel.broadcast_data(
-            ["image_grid_thw"], data, torch.int64
-        )
-        pv = pixel_data["pixel_values"]
-        gt = grid_data["image_grid_thw"]
-        if pv.numel() > 0:
-            images = pv.to(torch.bfloat16)
-            grid_thw = gt if gt.numel() > 0 else None
+        if flag["has_images"].item() == 1:
+            pixel_data = tensor_parallel.broadcast_data(
+                ["pixel_values"], data, torch.float32
+            )
+            grid_data = tensor_parallel.broadcast_data(
+                ["image_grid_thw"], data, torch.int64
+            )
+            images = pixel_data["pixel_values"].to(torch.bfloat16)
+            grid_thw = grid_data["image_grid_thw"]
 
     attention_mask = None  # Use mask type from layer spec
     packed_seq_params = None

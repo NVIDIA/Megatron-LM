@@ -91,19 +91,19 @@ def qwen3vl_collate_fn(batch: List[Dict[str, torch.Tensor]]) -> Dict[str, torch.
         "position_ids": position_ids,
     }
 
-    # Concatenate pixel_values along first dimension (variable num patches).
-    # Always include pixel_values and image_grid_thw keys so that
-    # tensor_parallel.broadcast_data can be called unconditionally in get_batch
-    # (all TP ranks must participate in the NCCL collective).
+    # Always include a has_images flag so get_batch can broadcast it
+    # unconditionally (all TP ranks must participate in the NCCL collective).
+    # broadcast_data uses 0 as a sentinel for dimension parsing, so zero-sized
+    # tensors cannot be broadcast — use this flag to gate image broadcasts.
     if has_images and all_pixel_values:
+        result["has_images"] = torch.tensor([1], dtype=torch.int64)
         result["pixel_values"] = torch.cat(all_pixel_values, dim=0)
-        if all_grid_thw:
-            result["image_grid_thw"] = torch.cat(all_grid_thw, dim=0)
-        else:
-            result["image_grid_thw"] = torch.zeros(0, 3, dtype=torch.long)
+        result["image_grid_thw"] = (
+            torch.cat(all_grid_thw, dim=0) if all_grid_thw
+            else torch.ones(1, 3, dtype=torch.long)  # dummy; model ignores if no grid info
+        )
     else:
-        result["pixel_values"] = torch.zeros(0, dtype=torch.float32)
-        result["image_grid_thw"] = torch.zeros(0, 3, dtype=torch.long)
+        result["has_images"] = torch.tensor([0], dtype=torch.int64)
 
     return result
 
