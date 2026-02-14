@@ -6,16 +6,18 @@ from types import SimpleNamespace
 import pytest
 import torch
 
-from megatron.core import parallel_state as ps
 from megatron.core.inference.contexts import StaticInferenceContext
-from megatron.core.models.gpt.gpt_layer_specs import get_gpt_layer_with_transformer_engine_spec
+from megatron.core.models.gpt.gpt_layer_specs import (
+    get_gpt_layer_with_transformer_engine_submodules,
+)
 from megatron.core.models.multimodal import context_parallel
 from megatron.core.models.multimodal.llava_model import LLaVAModel
-from megatron.core.models.vision.vit_layer_specs import get_vit_layer_with_transformer_engine_spec
 from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
 from megatron.core.transformer.enums import AttnMaskType
+from megatron.core.transformer.spec_utils import ModuleSpec
 from megatron.core.transformer.transformer_config import TransformerConfig
+from megatron.core.transformer.transformer_layer import TransformerLayer
 from megatron.core.utils import is_te_min_version
 from megatron.training.global_vars import set_args
 from tests.unit_tests.test_utilities import Utils
@@ -47,15 +49,19 @@ class TestLLaVAModel:
             use_cpu_initialization=False,
         )
 
-        language_layer_spec = get_gpt_layer_with_transformer_engine_spec()
-        vision_layer_spec = deepcopy(language_layer_spec)
-        vision_projection_spec = deepcopy(language_layer_spec.submodules.mlp.submodules)
+        language_layer_submodules = get_gpt_layer_with_transformer_engine_submodules()
+        vision_layer_spec = ModuleSpec(
+            module=TransformerLayer, submodules=deepcopy(language_layer_submodules)
+        )
+        vision_projection_spec = deepcopy(language_layer_submodules.mlp.submodules)
 
         language_config.language_model_type = "dummy"
         vision_config.vision_model_type = "clip"
         self.model = LLaVAModel(
             language_transformer_config=language_config,
-            language_transformer_layer_spec=language_layer_spec,
+            language_transformer_layer_spec=ModuleSpec(
+                module=TransformerLayer, submodules=language_layer_submodules
+            ),
             language_vocab_size=8192,
             language_max_sequence_length=4096,
             vision_transformer_config=vision_config,
@@ -481,16 +487,20 @@ def setup_and_teardown_llava_model(request):
         use_cpu_initialization=False,
     )
 
-    language_layer_spec = get_gpt_layer_with_transformer_engine_spec()
-    vision_layer_spec = deepcopy(language_layer_spec)
-    vision_projection_spec = deepcopy(language_layer_spec.submodules.mlp.submodules)
+    language_layer_submodules = get_gpt_layer_with_transformer_engine_submodules()
+    vision_layer_spec = ModuleSpec(
+        module=TransformerLayer, submodules=deepcopy(language_layer_submodules)
+    )
+    vision_projection_spec = deepcopy(language_layer_submodules.mlp.submodules)
 
     language_config.language_model_type = "dummy"
     vision_model_type = request.param
     vision_config.vision_model_type = vision_model_type
     model = LLaVAModel(
         language_transformer_config=language_config,
-        language_transformer_layer_spec=language_layer_spec,
+        language_transformer_layer_spec=ModuleSpec(
+            module=TransformerLayer, submodules=language_layer_submodules
+        ),
         language_vocab_size=2048,
         language_max_sequence_length=4096,
         vision_transformer_config=vision_config,
@@ -573,31 +583,33 @@ class TestLLaVAModelTokenParallel:
             context_parallel_size=1,
         )
 
-        language_layer_spec = get_gpt_layer_with_transformer_engine_spec()
+        language_layer_submodules = get_gpt_layer_with_transformer_engine_submodules()
         # SP/CP either requires user to ensure token lengths do not require padding OR change mask type to padding
         if (
-            language_layer_spec.submodules.self_attention.params.get('attn_mask_type', '')
+            language_layer_submodules.self_attention.params.get('attn_mask_type', '')
             == AttnMaskType.causal
         ):
-            language_layer_spec.submodules.self_attention.params['attn_mask_type'] = (
+            language_layer_submodules.self_attention.params['attn_mask_type'] = (
                 AttnMaskType.padding_causal
             )
         elif (
-            language_layer_spec.submodules.self_attention.params.get('attn_mask_type', '')
+            language_layer_submodules.self_attention.params.get('attn_mask_type', '')
             == AttnMaskType.no_mask
         ):
-            language_layer_spec.submodules.self_attention.params['attn_mask_type'] = (
-                AttnMaskType.padding
-            )
+            language_layer_submodules.self_attention.params['attn_mask_type'] = AttnMaskType.padding
 
-        vision_layer_spec = deepcopy(language_layer_spec)
-        vision_projection_spec = deepcopy(language_layer_spec.submodules.mlp.submodules)
+        vision_layer_spec = ModuleSpec(
+            module=TransformerLayer, submodules=deepcopy(language_layer_submodules)
+        )
+        vision_projection_spec = deepcopy(language_layer_submodules.mlp.submodules)
 
         language_config.language_model_type = "dummy"
         vision_config.vision_model_type = "clip"
         model = LLaVAModel(
             language_transformer_config=language_config,
-            language_transformer_layer_spec=language_layer_spec,
+            language_transformer_layer_spec=ModuleSpec(
+                module=TransformerLayer, submodules=language_layer_submodules
+            ),
             language_vocab_size=8192,
             language_max_sequence_length=4096,
             vision_transformer_config=vision_config,
