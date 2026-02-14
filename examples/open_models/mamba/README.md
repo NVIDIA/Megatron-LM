@@ -22,7 +22,7 @@ docker run --gpus all -it --rm \
   -v /path/to/megatron:/workspace/megatron \
   -v /path/to/dataset:/workspace/dataset \
   -v /path/to/checkpoints:/workspace/checkpoints \
-  -w /workspace/megatron/examples/mamba \
+  -w /workspace/megatron/examples/open_models/mamba \
   your_image_name:your_tag
 ```
 
@@ -55,7 +55,7 @@ including the hybrid layer configuration and model parallel configuration.
 
 If you need to convert a hybrid checkpoint file to a different tensor parallel
 or pipeline parallel size, use
-[the hybrid conversion script](../../tools/checkpoint/hybrid_conversion.py).
+[the hybrid conversion script](../../../tools/checkpoint/hybrid_conversion.py).
 There is an example run command at the end of that file.
 
 Before running that script, you will need to set `PYTHONPATH` to include the

@@ -24,7 +24,7 @@ This example:
 Train LLaMA-3 8B model with FP8 mixed precision on 8 GPUs:
 
 ```bash
-./examples/llama/train_llama3_8b_fp8.sh
+./examples/open_models/llama/train_llama3_8b_fp8.sh
 ```
 
 **Configuration:**
