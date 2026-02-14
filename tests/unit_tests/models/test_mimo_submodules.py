@@ -303,3 +303,42 @@ class TestVisionSubmodule:
         # Test forward pass
         output = self.vision_submodule(data_batch)
         assert output is None
+
+
+@pytest.mark.experimental
+class TestVisionSubmoduleStageAware:
+    """Tests for stage-aware forward in VisionModalitySubmodules."""
+
+    def test_stage_aware_forward(self):
+        """Test stage-aware forward: hidden_states input and projection skipping."""
+        hidden_size = 64
+        projection_size = 128
+        hidden_states = torch.randn(10, hidden_size)
+
+        # Default: first and last stage
+        submodule_default = VisionModalitySubmodules(
+            input_projections=[nn.Linear(hidden_size, projection_size)]
+        )
+        assert submodule_default.is_first_stage is True
+        assert submodule_default.is_last_stage is True
+
+        # Non-first stage uses hidden_states, last stage projects
+        submodule_last = VisionModalitySubmodules(
+            input_projections=[nn.Linear(hidden_size, projection_size)],
+            is_first_stage=False,
+            is_last_stage=True,
+        )
+        output = submodule_last.forward(hidden_states=hidden_states)
+        assert output.shape == (10, projection_size)  # Projected
+
+        # Non-last stage skips projection
+        submodule_mid = VisionModalitySubmodules(
+            input_projections=[nn.Linear(hidden_size, projection_size)],
+            is_first_stage=False,
+            is_last_stage=False,
+        )
+        output = submodule_mid.forward(hidden_states=hidden_states)
+        assert output.shape == (10, hidden_size)  # Not projected
+
+        # No input returns None
+        assert submodule_mid.forward(hidden_states=None) is None

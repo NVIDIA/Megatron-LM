@@ -40,6 +40,7 @@ class VisionModalitySubmodules(ModalitySubmodules):
             decoders=decoders,
             input_projections=input_projections,
             output_projections=output_projections,
+            **kwargs,
         )
 
         if self.input_projections:
@@ -160,25 +161,42 @@ class VisionModalitySubmodules(ModalitySubmodules):
 
         return embeddings
 
-    def forward(self, encoder_inputs: Dict[str, Any]) -> Optional[torch.Tensor]:
+    def forward(
+        self,
+        encoder_inputs: Optional[Dict[str, Any]] = None,
+        hidden_states: Optional[torch.Tensor] = None,
+    ) -> Optional[torch.Tensor]:
         """Process image data through encoding and projection.
 
         Args:
             encoder_inputs: Dictionary where keys match encoder names in self.encoders
                 and values are dictionaries of encoder-specific parameters.
-                Example: {"clip": {"pixel_values": images}, "vit": {"images": vit_images}}
+                Used when is_first_stage=True.
+            hidden_states: Hidden states from previous pipeline stage.
+                Used when is_first_stage=False.
 
         Returns:
-            Flattened image embeddings with shape [total_embeddings, hidden_dim],
-            or None if no valid inputs were provided.
+            - If is_last_stage: projected embeddings ready for language model
+            - If not is_last_stage: hidden states for next pipeline stage
+            - None if no valid input provided
         """
-        # Encode the images
-        embeddings = self.encode(encoder_inputs)
+        # Determine input based on stage position
+        if self.is_first_stage:
+            if encoder_inputs is None:
+                return None
+            # Encode the images
+            embeddings = self.encode(encoder_inputs)
+            if not embeddings:
+                return None
+            combined = self.combine_embeddings(embeddings)
+        else:
+            if hidden_states is None:
+                return None
+            # Use hidden states from previous stage
+            combined = hidden_states
 
-        # If no embeddings were produced, return None
-        if not embeddings:
-            return None
-
-        projected = self.project_embeddings(embeddings, is_input=True)
-        logging.debug(f"Projected audio embeddings shape: {projected.shape}")
-        return projected  # [total_embeddings, hidden_dim]
+        # Project only if last stage
+        if self.is_last_stage:
+            return self.project_embeddings([combined], is_input=True)
+        else:
+            return combined
