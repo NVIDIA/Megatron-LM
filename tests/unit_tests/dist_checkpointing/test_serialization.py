@@ -26,7 +26,7 @@ from megatron.core.dist_checkpointing import (
     remove_sharded_tensors,
     save,
 )
-from megatron.core.dist_checkpointing.core import CheckpointingException, maybe_load_config
+from megatron.core.dist_checkpointing.core import CheckpointingException
 from megatron.core.dist_checkpointing.dict_utils import diff
 from megatron.core.dist_checkpointing.mapping import ShardedObject, ShardedTensorFactory
 from megatron.core.dist_checkpointing.serialization import (
