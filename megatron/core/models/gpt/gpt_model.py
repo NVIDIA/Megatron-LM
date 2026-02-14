@@ -621,6 +621,7 @@ class GPTModel(LanguageModule):
                 config=self.config,
                 cp_group=self.pg_collection.cp,
                 packed_seq_params=packed_seq_params,
+                scale_logits_fn=self._scale_logits if self.config.use_mup else None,
             )
         sequence_parallel_override = False
 
@@ -648,6 +649,9 @@ class GPTModel(LanguageModule):
         logits, _ = self.output_layer(
             hidden_states, weight=output_weight, runtime_gather_output=runtime_gather_output
         )
+
+        # Apply MuP output scaling to logits
+        logits = self._scale_logits(logits)
 
         # Restore sequence parallel execution to the output layer if necessary.
         if sequence_parallel_override:
