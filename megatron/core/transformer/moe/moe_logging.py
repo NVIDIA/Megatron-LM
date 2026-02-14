@@ -145,8 +145,10 @@ class MoEMetricsTracker:
 
         # Force initialize metrics if needed
         if force_initialize and names_list is not None:
+            if num_layers is None:
+                raise ValueError("num_layers must be provided when force_initialize=True.")
             for name in names_list:
-                self.initialize_metric(name, num_layers, device=torch.cuda.current_device())
+                self.initialize_metric(name, num_layers)
 
         # Reduce metrics across ranks
         self._reduce_across_ranks(names_list, pg_collection=pg_collection)
@@ -278,10 +280,12 @@ class MoEMetricsTracker:
         self,
         name: str,
         num_layers: int,
-        device: Union[str, torch.device, int] = torch.cuda.current_device(),
+        device: Optional[Union[str, torch.device, int]] = None,
         layer_percentiles: Optional[List[float]] = None,
     ) -> None:
         """Force initialize a metric entry."""
+        if device is None:
+            device = torch.cuda.current_device() if torch.cuda.is_available() else "cpu"
         if name not in self._metrics:
             self._metrics[name] = _MetricEntry(
                 values=torch.zeros(num_layers, device=device), layer_percentiles=layer_percentiles
@@ -345,11 +349,12 @@ class MoEMetricsTracker:
             # Compute percentiles if configured.
             if entry.layer_percentiles is not None:
                 vals = values[values > 0]
-                pct_values = torch.quantile(
-                    vals.float(), torch.tensor(entry.layer_percentiles, device=vals.device)
-                ).tolist()
-                for pct, pct_val in zip(entry.layer_percentiles, pct_values):
-                    aggregated[f"{name}_p{int(pct * 100)}"] = pct_val
+                if vals.numel() > 0:
+                    pct_values = torch.quantile(
+                        vals.float(), torch.tensor(entry.layer_percentiles, device=vals.device)
+                    ).tolist()
+                    for pct, pct_val in zip(entry.layer_percentiles, pct_values):
+                        aggregated[f"{name}_p{int(pct * 100)}"] = pct_val
 
             # Always compute mean
             aggregated[name] = (values.sum() / num_moe_layers).item()
