@@ -127,11 +127,28 @@ Recommended configurations based on [NVIDIA NeMo production setups](https://gith
 
 ### Total GPU Count
 
-The total number of GPUs is calculated as:
+With **MoE Parallel Folding**, attention and MoE (Mixture-of-Experts) layers have separate parallelism configurations. DP and EDP are calculated from the total GPU count (not set by users):
 
+**For Attention layers:**
 ```
-Total GPUs = TP × PP × CP × EP × DP
+Total GPUs = TP × CP × PP × DP
 ```
+
+**For Expert (MoE) layers:**
+```
+Total GPUs = EP × ETP × PP × EDP
+```
+
+Where:
+- **TP** = Tensor Model Parallel Size (for attention)
+- **ETP** = Expert Tensor Parallel Size (`--expert-tensor-parallel-size`, defaults to TP if not set)
+- **CP** = Context Parallel Size  
+- **EP** = Expert Model Parallel Size (`--expert-model-parallel-size`)
+- **PP** = Pipeline Model Parallel Size
+- **DP** = Data Parallel Size (calculated: `Total GPUs / (TP × CP × PP)`)
+- **EDP** = Expert Data Parallel Size (calculated: `Total GPUs / (EP × ETP × PP)`)
+
+MoE Parallel Folding enables setting different TP sizes for attention and MoE layers via `--expert-tensor-parallel-size`. The EP×ETP group for experts is a sub-group of the DP×CP×TP group for attention. This allows CP and EP to share the NVLink domain and reduces the minimum GPUs required for combined CP+EP training. See the [MoE documentation](features/moe.md) for details.
 
 ### Example: LLaMA-3 70B on 64 GPUs
 

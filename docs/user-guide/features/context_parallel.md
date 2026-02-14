@@ -28,7 +28,9 @@ CP can better address the issues. With CP, each GPU only computes on a part of t
 
 ## Enabling context parallelism
 
-CP support has been added to GPT. All models that share GPT code path also should be able to benefit from CP, such as Llama. CP can work with TP (tensor model parallelism), PP (pipeline model parallelism), and DP (data parallelism), where the total number of GPUs equals TPxCPxPPxDP. CP also can work with different attention variants, including MHA/MQA/GQA, uni-directional and bi-directional masking.
+CP is supported across Megatron Core models including LLaMA and other transformer architectures. CP works with TP (tensor model parallelism), PP (pipeline model parallelism), DP (data parallelism), and different attention variants including MHA/MQA/GQA with uni-directional or bi-directional masking.
+
+For GPU count calculations and how CP interacts with MoE Parallel Folding, see the [Parallelism Guide](../parallelism-guide.md).
 
 CP is enabled by simply setting context_parallel_size=<CP_SIZE> in command line. Default context_parallel_size is 1, which means CP is disabled. Running with CP requires Megatron-Core (>=0.5.0) and Transformer Engine (>=1.1).
 
