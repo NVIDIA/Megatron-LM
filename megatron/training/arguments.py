@@ -925,17 +925,6 @@ def validate_args(args, defaults={}):
         assert args.context_parallel_size * args.max_seqlen_per_dp_cp_rank >= args.seq_length, \
             f'Packed sequence buffer size ({args.context_parallel_size * args.max_seqlen_per_dp_cp_rank}) ' \
             f'must be >= single sequence max length ({args.seq_length})'
-        if args.mock_data and args.sft_mock_dataset_config_json is None:
-            args.sft_mock_dataset_config_json = json.dumps(
-                {
-                    "mode": "distribution",
-                    "type": "lognormal",
-                    "min_seq_len": args.seq_length // 2,
-                    "max_seq_len": args.seq_length,
-                    "mean_seq_len": args.seq_length // 4 * 3,
-                    "lognormal_sigma": 1.1,
-                }
-            )
 
     # disable async_tensor_model_parallel_allreduce when
     # model parallel memory optimization is enabled
@@ -1656,9 +1645,6 @@ def _add_network_size_args(parser):
         "persist_layer_norm",
         "bias_dropout_fusion",
         "apply_rope_fusion",
-        "max_seqlen_per_dp_cp_rank",
-        "hybrid_context_parallel",
-        "sequence_packing_scheduler",
     ]
     transformer_factory = ArgumentGroupFactory(TransformerConfig, exclude=exclude)
     transformer_group = transformer_factory.build_group(parser, "transformer configuration")
@@ -2396,14 +2382,6 @@ def _add_distributed_args(parser):
                        'all layers will share the same communication type. Users can also '
                        'specify separated types for each layer like '
                        '--cp-comm-type p2p p2p a2a a2a a2a+p2p a2a+p2p')
-    group.add_argument('--max-seqlen-per-dp-cp-rank', type=int, default=None,
-                       help='Maximum sequence length per CP rank. This is used to calculate the '
-                       'number of sub-samples assigned to each CP rank when using heterogeneous context parallel.')
-    group.add_argument('--hybrid-context-parallel', action='store_true', default=False,
-                       help='Enables hybrid context parallel. This is used to balance the workload '
-                       'of each CP rank when we use packed samples with variable sequence lengths. '
-                       'Requires --max-seqlen-per-dp-cp-rank to be set.')
-    group.add_argument('--sequence-packing-scheduler', type=str, default=None, choices=['dp_balanced'])
     group.add_argument('--nccl-communicator-config-path', type=str, default=None,
                        help='Path to the yaml file with NCCL communicator '
                        'configurations. The number of min/max thread groups and thread '

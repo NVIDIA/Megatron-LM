@@ -50,6 +50,7 @@ class SFTLowLevelDataset:
     def __getitem__(self, idx: int) -> list:
         return self.dataset[idx]["messages"]
 
+
 class SFTDataset(MegatronDataset):
     """The dataset used during SFT"""
 
@@ -63,8 +64,6 @@ class SFTDataset(MegatronDataset):
         config: GPTDatasetConfig,
     ) -> None:
         super().__init__(dataset, dataset_path, indices, num_samples, index_split, config)
-        # Pre-calculate padding divisor to avoid redundant computation in get_item
-        self.padding_divisor = self._calculate_padding_divisor()
 
     @staticmethod
     def numel_low_level_dataset(low_level_dataset: LowLevelDataset) -> int:
@@ -152,7 +151,7 @@ class SFTDataset(MegatronDataset):
             assert not self.config.reset_position_ids
             pack_positions.extend(range(len(tokens_list)))
 
-            pad_granularity = self.padding_divisor
+            pad_granularity = self._calculate_padding_divisor()
             mod_token_count = len(pack_tokens) % pad_granularity
             if mod_token_count != 0:
                 pad_len = pad_granularity - mod_token_count
@@ -225,6 +224,7 @@ class SFTDataset(MegatronDataset):
             'max_seqlen': max_seqlen,
         }
 
+
 class MockSFTLowLevelDataset:
     """The low-level mock dataset for SFT
 
@@ -278,6 +278,8 @@ class MockSFTLowLevelDataset:
         length = self.sequence_lengths[idx % self.size]
         sample = np.arange(1, length, dtype=np.int64)
         return sample
+
+
 class MockSFTDataset(SFTDataset):
     """The mock dataset used during SFT"""
 
@@ -294,7 +296,17 @@ class MockSFTDataset(SFTDataset):
 
     @staticmethod
     def build_low_level_dataset(dataset_path: str, config: GPTDatasetConfig) -> LowLevelDataset:
-        mock_config = json.loads(config.sft_mock_dataset_config_json)
+        if config.sft_mock_dataset_config_json is None:
+            mock_config = {
+                    "mode": "distribution",
+                    "type": "lognormal",
+                    "min_seq_len": config.sequence_length // 2,
+                    "max_seq_len": config.sequence_length,
+                    "mean_seq_len": config.sequence_length // 4 * 3,
+                    "lognormal_sigma": 1.1,
+                }
+        else:
+            mock_config = json.loads(config.sft_mock_dataset_config_json)
         return MockSFTLowLevelDataset(**mock_config)
 
     def __len__(self) -> int:
@@ -326,11 +338,11 @@ class MockSFTDataset(SFTDataset):
         cu_seqlens = [0]
 
         # Pad to padding_divisor alignment
-        if self.padding_divisor > 1:
-            mod_token_count = len(pack_tokens) % self.padding_divisor
-            if mod_token_count != 0:
-                pad_len = self.padding_divisor - mod_token_count
-                extend_with_padding(pack_tokens, pack_targets, pack_positions, pad_len)
+        pad_granularity = self._calculate_padding_divisor()
+        mod_token_count = len(pack_tokens) % pad_granularity
+        if mod_token_count != 0:
+            pad_len = pad_granularity - mod_token_count
+            extend_with_padding(pack_tokens, pack_targets, pack_positions, pad_len)
 
         # Record padded boundary after padding
         cu_seqlens.append(len(pack_tokens))

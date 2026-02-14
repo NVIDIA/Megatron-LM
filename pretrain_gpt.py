@@ -267,7 +267,6 @@ def core_gpt_dataset_config_from_args(args):
         "sequence_parallel_size": args.tensor_model_parallel_size*args.sequence_parallel,
         "hybrid_context_parallel": args.hybrid_context_parallel,
         "sft_mock_dataset_config_json":args.sft_mock_dataset_config_json,
-        "sequence_packing_scheduler": args.sequence_packing_scheduler,
     }
 
     # add FIM args to the config
