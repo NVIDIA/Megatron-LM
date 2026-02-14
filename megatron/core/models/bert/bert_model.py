@@ -25,15 +25,7 @@ from megatron.core.transformer.transformer_block import TransformerBlock
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.transformer.transformer_layer import TransformerLayerSubmodules
 from megatron.core.transformer.utils import get_linear_layer
-from megatron.core.utils import deprecate_inference_params
-from megatron.core.utils import get_te_version as _get_te_version
-from megatron.core.utils import is_te_min_version
-
-
-def get_te_version():
-    """Included for backwards compatibility."""
-    warnings.warn("`get_te_version` will be deprecated in a future release")
-    return _get_te_version()
+from megatron.core.utils import deprecate_inference_params, is_te_min_version
 
 
 class BertModel(LanguageModule):
