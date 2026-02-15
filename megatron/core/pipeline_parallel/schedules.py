@@ -309,7 +309,6 @@ def forward_step_calc_loss(
         # Calculate the loss scale based on the grad_scale_func if available, else default to 1.
         if isinstance(output_tensor, dict):
             tensor_value = next(iter(output_tensor.values()))
-            print(f"for debug, rank {torch.distributed.get_rank()} in forward_step(), type of tensor_value: {type(tensor_value)}")
             device = tensor_value.device
         else:
             device = output_tensor.device
@@ -2204,11 +2203,9 @@ def forward_backward_pipelining_without_interleaving(
             )
         else:
             checkpoint_activations_microbatch = None
-        print(f"for debug, rank {torch.distributed.get_rank()} in forward_backward_pipelining_without_interleaving(), will calling p2p_communicator.recv_forward()")
         input_tensor = p2p_communicator.recv_forward(
             recv_tensor_shapes, p2p_communicator.is_pp_first_stage
         )
-        print(f"for debug, rank {torch.distributed.get_rank()} in forward_backward_pipelining_without_interleaving(), after p2p_communicator.recv_forward()")
         output_tensor, num_tokens = forward_step(
             forward_step_func,
             data_iterator,
