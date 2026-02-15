@@ -307,10 +307,16 @@ def forward_step_calc_loss(
     # explicitly.
     if hasattr(config, 'num_moe_experts') and config.num_moe_experts is not None:
         # Calculate the loss scale based on the grad_scale_func if available, else default to 1.
+        if isinstance(output_tensor, dict):
+            tensor_value = next(iter(output_tensor.values()))
+            print(f"for debug, rank {torch.distributed.get_rank()} in forward_step(), type of tensor_value: {type(tensor_value)}")
+            device = tensor_value.device
+        else:
+            device = output_tensor.device
         loss_scale = (
-            config.grad_scale_func(torch.ones(1, device=output_tensor.device))
+            config.grad_scale_func(torch.ones(1, device=device))
             if config.grad_scale_func is not None
-            else torch.ones(1, device=output_tensor.device)
+            else torch.ones(1, device=device)
         )
         # Set the loss scale
         if config.calculate_per_token_loss:
@@ -2146,7 +2152,8 @@ def forward_backward_pipelining_without_interleaving(
 
     # Select backward function based on whether multi-module or single-module
     if is_multimodule:
-        language_model_module_name="llm"
+        # TODO(shifang): support different language model module name.
+        language_model_module_name="language_module"
         if isinstance(pg_collection, MultiModuleProcessGroupCollection):
             language_model_module_name = pg_collection.language_model_module_name
         backward_func = partial(
@@ -2197,10 +2204,11 @@ def forward_backward_pipelining_without_interleaving(
             )
         else:
             checkpoint_activations_microbatch = None
-
+        print(f"for debug, rank {torch.distributed.get_rank()} in forward_backward_pipelining_without_interleaving(), will calling p2p_communicator.recv_forward()")
         input_tensor = p2p_communicator.recv_forward(
             recv_tensor_shapes, p2p_communicator.is_pp_first_stage
         )
+        print(f"for debug, rank {torch.distributed.get_rank()} in forward_backward_pipelining_without_interleaving(), after p2p_communicator.recv_forward()")
         output_tensor, num_tokens = forward_step(
             forward_step_func,
             data_iterator,
