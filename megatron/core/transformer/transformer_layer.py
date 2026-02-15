@@ -6,7 +6,7 @@ import logging
 import warnings
 from abc import ABC
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING, Any, Dict, Optional, Union
+from typing import TYPE_CHECKING, Any, Dict, Optional, Protocol, Union
 
 import torch
 import torch.distributed
@@ -199,6 +199,33 @@ def get_transformer_layer_offset(
     return offset
 
 
+class MlpInterface(Protocol):
+    """Interface for MLP implementations in the transformer layer."""
+
+    def forward(
+        self,
+        hidden_states: Tensor,
+        /,
+        *,
+        intermediate_tensors: tuple[Tensor, ...] | None = None,
+        padding_mask: Tensor | None = None,
+    ) -> tuple[Tensor, Tensor | None]:
+        """Forward method for the MLP interface."""
+        ...
+
+
+class MlpBuilder(Protocol):
+    """MLP builder protocol for building MLPs in the transformer layer."""
+
+    def __call__(
+        self,
+        *,
+        config: TransformerConfig,
+        pg_collection: ProcessGroupCollection,
+        is_mtp_layer: bool,
+    ) -> MlpInterface: ...
+
+
 @dataclass
 class TransformerLayerSubmodules:
     """
@@ -236,7 +263,7 @@ class TransformerLayerSubmodules:
     cross_attn_bda: Union[ModuleSpec, type] = IdentityFuncOp
 
     pre_mlp_layernorm: LayerNormBuilder = IdentityOp
-    mlp: Union[ModuleSpec, type] = IdentityOp
+    mlp: MlpBuilder | type[IdentityOp] = IdentityOp
     mlp_bda: Union[ModuleSpec, type] = IdentityFuncOp
 
     # Mapping for sharded tensor keys to be applied in `sharded_state_dict` method
@@ -350,39 +377,30 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
             eps=self.config.layernorm_epsilon,
         )
         # [Module 8: MLP block]
-        additional_mlp_kwargs = {}
         # import here to avoid circular import
         from megatron.core.extensions.transformer_engine import TEFusedMLP
-        from megatron.core.transformer.moe.experts import GroupedMLP, SequentialMLP, TEGroupedMLP
         from megatron.core.transformer.moe.moe_layer import MoELayer
 
         # MLP expects tp_group but MoELayer expects pg_collection to be passed in.
         # We can change MLP to accept pg_collection but it makes the logic implicit
         # The conditional below is to make the logic explicit
         # if submodules.mlp is not a ModuleSpec,we dont have to handle passing additional kwargs
-        if isinstance(submodules.mlp, ModuleSpec):
-            if submodules.mlp.module in (MoELayer, GroupedMLP, TEGroupedMLP, SequentialMLP):
-                additional_mlp_kwargs["pg_collection"] = pg_collection
-                # Pass is_mtp_layer flag to MoELayer to distinguish MTP MoE layers.
-                if submodules.mlp.module == MoELayer:
-                    additional_mlp_kwargs["is_mtp_layer"] = self.is_mtp_layer
-            elif submodules.mlp.module == MLP:
-                assert hasattr(
-                    pg_collection, 'tp'
-                ), 'TP process group is required for MLP in TransformerLayer'
-                additional_mlp_kwargs["tp_group"] = pg_collection.tp
-            elif TEFusedMLP is not None and submodules.mlp.module == TEFusedMLP:
-                assert hasattr(
-                    pg_collection, 'tp'
-                ), 'TP process group is required for TEFusedMLP in TransformerLayer'
-                additional_mlp_kwargs["tp_group"] = pg_collection.tp
-            else:
-                log_single_rank(
-                    logger,
-                    logging.WARNING,
-                    f"Unknown MLP type: {type(submodules.mlp)}. Using default kwargs.",
-                )
-        self.mlp = build_module(submodules.mlp, config=self.config, **additional_mlp_kwargs)
+        if isinstance(submodules.mlp, ModuleSpec) and submodules.mlp.module in (MLP, TEFusedMLP):
+            submodules.mlp = functools.partial(
+                submodules.mlp.module.as_mlp_submodule,
+                submodules=submodules.mlp.submodules,
+                **submodules.mlp.params,
+            )
+            log_single_rank(
+                logger,
+                logging.WARNING,
+                f"Rewrapping ModuleSpec with module {type(submodules.mlp)} to forward kwargs. "
+                "Consider migrating the `mlp` submodule spec to a direct call of the "
+                "`as_mlp_submodule` classmethod instead.",
+            )
+        self.mlp = submodules.mlp(
+            config=self.config, pg_collection=pg_collection, is_mtp_layer=self.is_mtp_layer
+        )
         if hasattr(self.mlp, 'set_layer_number'):
             self.mlp.set_layer_number(self.layer_number)
 
@@ -739,7 +757,7 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
                 from megatron.core.extensions.transformer_engine import te_checkpoint
 
                 mlp_output_with_bias = te_checkpoint(
-                    self.mlp,
+                    apply_module(self.mlp),
                     False,
                     tensor_parallel.random.get_cuda_rng_tracker,
                     self.pg_collection.tp,
@@ -748,7 +766,7 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
                 )
             else:
                 mlp_output_with_bias = tensor_parallel.checkpoint(
-                    functools.partial(self.mlp, padding_mask=padding_mask),
+                    functools.partial(apply_module(self.mlp), padding_mask=padding_mask),
                     False,
                     pre_mlp_layernorm_output,
                 )
@@ -758,7 +776,7 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
             chunks = pre_mlp_layernorm_output.chunk(num_chunks, dim=0)
 
             # Compute outputs for each chunk
-            outputs = [self.mlp(chunk) for chunk in chunks]
+            outputs = [apply_module(self.mlp)(chunk) for chunk in chunks]
 
             # Aggregate chunk outputs
             mlp_output = torch.cat([out for out, _ in outputs], dim=0)
@@ -770,7 +788,9 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
                 # Set the residual for fused reduce-scatter + add + layer-norm + all-gather
                 # operation in MLP's fc2.
                 self._set_fc2_residual(residual)
-            mlp_output_with_bias = self.mlp(pre_mlp_layernorm_output, padding_mask=padding_mask)
+            mlp_output_with_bias = apply_module(self.mlp)(
+                pre_mlp_layernorm_output, padding_mask=padding_mask
+            )
 
         nvtx_range_pop(suffix="mlp")
 
@@ -1112,7 +1132,7 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
                 hidden_states, probs = self.mlp.preprocess(hidden_states, probs, routing_map)
                 nvtx_range_pop(suffix="mlp")
                 return residual, hidden_states, probs, shared_expert_output
-            mlp_output_with_bias = self.mlp(hidden_states)
+            mlp_output_with_bias = apply_module(self.mlp)(hidden_states)
             self.mlp.cudagraph_tensor_store.clear()
             nvtx_range_pop(suffix="mlp")
 
@@ -1294,7 +1314,7 @@ class MoETransformerLayer(TransformerLayer):
         residual = hidden_states
         self.mlp.fwd_execution_map = "route"
         pre_mlp_layernorm_output = self._forward_pre_mlp_layernorm(hidden_states)
-        router_outputs = self.mlp(
+        router_outputs = apply_module(self.mlp)(
             pre_mlp_layernorm_output, intermediate_tensors=(), padding_mask=padding_mask
         )
 
@@ -1321,7 +1341,7 @@ class MoETransformerLayer(TransformerLayer):
             setattr(self.mlp.token_dispatcher, name, attr)
 
         self.mlp.fwd_execution_map = "expert_compute"
-        return self.mlp(None, intermediate_tensors=(hidden_states, probs))
+        return apply_module(self.mlp)(None, intermediate_tensors=(hidden_states, probs))
 
     def _forward_mlp_postprocess(self, residual, output, shared_expert_output, mlp_bias):
         """
@@ -1334,7 +1354,7 @@ class MoETransformerLayer(TransformerLayer):
         """
 
         self.mlp.fwd_execution_map = "postprocess"
-        output = self.mlp(None, intermediate_tensors=(output, shared_expert_output))
+        output = apply_module(self.mlp)(None, intermediate_tensors=(output, shared_expert_output))
         return self._forward_post_mlp((output, mlp_bias), residual)
 
     def _forward_mlp(self, hidden_states, inference_context=None, padding_mask=None):

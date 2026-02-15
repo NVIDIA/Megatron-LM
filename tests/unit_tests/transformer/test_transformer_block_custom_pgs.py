@@ -1,5 +1,5 @@
 # Copyright (c) 2025, NVIDIA CORPORATION. All rights reserved.
-
+from __future__ import annotations
 
 import copy
 import os
@@ -61,20 +61,18 @@ class HeterogenousTransformerLayer(TransformerLayer):
         config: TransformerConfig,
         submodules: TransformerLayerSubmodules,
         layer_number: int = 1,
-        hidden_dropout: Optional[float] = None,
-        pg_collection: ProcessGroupCollection = None,
-        vp_stage: Optional[int] = None,
+        hidden_dropout: float | None = None,
+        pg_collection: ProcessGroupCollection | None = None,
+        vp_stage: int | None = None,
     ):
-        # Temporarily replace attention and MLP with IdentityOp,
+        # Temporarily replace attention with IdentityOp,
         # This is a temporary workaround for the test until we have a better interface
         # will rebuild them with custom process groups after super init
         def _modify_submodules(submodules):
             submodules.self_attention = IdentityOp
-            submodules.mlp = IdentityOp
             return submodules
 
         original_attention = submodules.self_attention
-        original_mlp = submodules.mlp
         new_submodules = _modify_submodules(copy.copy(submodules))
 
         super().__init__(
@@ -92,10 +90,6 @@ class HeterogenousTransformerLayer(TransformerLayer):
         self.self_attention = build_module(
             original_attention, config=self.config, layer_number=layer_number
         )
-        assert (
-            'tp_group' in submodules.mlp.params
-        ), "tp_group should be in the params of the submodules"
-        self.mlp = build_module(original_mlp, config=self.config)
 
 
 def create_reference_mlp(hidden_size, ffn_hidden_size, seed=12345):
@@ -168,7 +162,22 @@ def copy_weights_to_tp_mlp(ref_mlp, tp_mlp, tp_group):
             tp_mlp.linear_fc2.bias.copy_(ref_fc2.bias.to(tp_mlp.linear_fc2.bias.device))
 
 
-def _gpt_te_layer_spec_with_hetro_pgs(attn_pg_collection, mlp_pg_collection):
+def _gpt_te_layer_spec_with_hetro_pgs(
+    attn_pg_collection, mlp_pg_collection: ProcessGroupCollection
+):
+
+    def build_mlp(
+        config: TransformerConfig, pg_collection: ProcessGroupCollection, is_mtp_layer: bool
+    ):
+        del pg_collection, is_mtp_layer
+        return MLP(
+            config,
+            submodules=MLPSubmodules(
+                linear_fc1=TELayerNormColumnParallelLinear, linear_fc2=TERowParallelLinear
+            ),
+            tp_group=mlp_pg_collection.tp,
+        )
+
     return ModuleSpec(
         module=HeterogenousTransformerLayer,
         submodules=TransformerLayerSubmodules(
@@ -183,13 +192,7 @@ def _gpt_te_layer_spec_with_hetro_pgs(attn_pg_collection, mlp_pg_collection):
             ),
             self_attn_bda=get_bias_dropout_add,
             pre_mlp_layernorm=IdentityOp,
-            mlp=ModuleSpec(
-                module=MLP,
-                params={'tp_group': mlp_pg_collection.tp},
-                submodules=MLPSubmodules(
-                    linear_fc1=TELayerNormColumnParallelLinear, linear_fc2=TERowParallelLinear
-                ),
-            ),
+            mlp=build_mlp,
             mlp_bda=get_bias_dropout_add,
         ),
     )
