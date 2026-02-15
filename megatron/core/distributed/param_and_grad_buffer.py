@@ -117,6 +117,7 @@ class _ParamAndGradBucket:
         self.lw_params_list = None
         self.lw_param_flat_sizes = None
         self.lw_gather_tensor_list = None
+        self._lw_src_buffer = None
 
     def set_lw_params_list(self, lw_params_list: List[List[torch.nn.Parameter]]):
         """Set per-rank parameter lists for layer-wise async all-gather.
@@ -128,6 +129,26 @@ class _ParamAndGradBucket:
         self.lw_param_flat_sizes = [
             sum([p.numel() for p in param_list]) for param_list in lw_params_list
         ]
+
+
+class _LayerWiseAllGatherHandle:
+    """Handle for multiple async all-gather operations used by the layer-wise optimizer.
+
+    torch.distributed.all_gather with a tensor list output internally creates a temporary
+    contiguous buffer and copies chunks back to the individual output tensors when wait()
+    is called on the returned work handle. When wrapped in _coalescing_manager, this
+    copy-back step is lost because the coalescing manager's handle only waits on the
+    NCCL operations, not the individual copy-back callbacks. This class stores the
+    individual work handles so that wait() properly triggers the copy-back for each
+    all_gather call.
+    """
+
+    def __init__(self, handles):
+        self.handles = handles
+
+    def wait(self):
+        for h in self.handles:
+            h.wait()
 
 
 class _ParamAndGradBucketGroup:
@@ -290,11 +311,70 @@ class _ParamAndGradBucketGroup:
             assert self.param_gather_handle is None
 
         async_op = self.ddp_config.overlap_param_gather and not force_sync
-        # Coalesce communication kernels across buckets in the bucket group.
-        with _coalescing_manager(
-            self.intra_distributed_optimizer_instance_group, async_ops=async_op
-        ) as cm:
-            if not self.ddp_config.use_layer_wise_optimizer:
+
+        if self.ddp_config.use_layer_wise_optimizer:
+            # Layer-wise optimizer path: do NOT use _coalescing_manager.
+            #
+            # torch.distributed.all_gather with a tensor-list output internally creates a
+            # temporary contiguous buffer, calls ncclAllGather into it, and then copies chunks
+            # back to the individual output tensors when wait() is called on the work handle.
+            # When wrapped in _coalescing_manager, the coalescing manager's handle only waits
+            # on the grouped NCCL operations but does NOT trigger the per-op copy-back step,
+            # leaving the output tensors uninitialized. We avoid this by calling all_gather
+            # directly and storing the individual work handles.
+            lw_work_handles = []
+            for bucket in self.buckets:
+                local_rank = self.intra_distributed_optimizer_instance_rank
+                src = (
+                    _flatten_dense_tensors(bucket.lw_params_list[local_rank])
+                    if len(bucket.lw_params_list[local_rank]) > 0
+                    else torch.empty(
+                        0,
+                        device=bucket.grad_data.device,
+                        dtype=bucket.grad_data.dtype,
+                    )
+                )
+                # Keep src alive until the async operation completes.
+                bucket._lw_src_buffer = src
+                bucket.lw_gather_tensor_list = [
+                    torch.empty(size, device=src.device, dtype=src.dtype)
+                    for size in bucket.lw_param_flat_sizes
+                ]
+                work = torch.distributed.all_gather(
+                    bucket.lw_gather_tensor_list,
+                    src,
+                    group=self.intra_distributed_optimizer_instance_group,
+                    async_op=async_op,
+                )
+                if async_op and work is not None:
+                    lw_work_handles.append(work)
+            if async_op:
+                self.param_gather_handle = _LayerWiseAllGatherHandle(lw_work_handles)
+            else:
+                # Synchronous layer-wise case (e.g., force_sync=True for checkpointing):
+                # unflatten and copy gathered params immediately.
+                for bucket in self.buckets:
+                    for idx, (flat_params, params) in enumerate(
+                        zip(bucket.lw_gather_tensor_list, bucket.lw_params_list)
+                    ):
+                        if (
+                            len(params) == 0
+                            or idx == self.intra_distributed_optimizer_instance_rank
+                        ):
+                            continue
+                        updated_params = _unflatten_dense_tensors(flat_params, params)
+                        for updated_p, model_p in zip(updated_params, params):
+                            model_p.data.copy_(updated_p)
+                    bucket.lw_gather_tensor_list.clear()
+                    bucket._lw_src_buffer = None
+                self.param_gather_handle = None
+        else:
+            # Standard distributed optimizer path: use _coalescing_manager.
+            # all_gather_into_tensor writes directly into a contiguous output buffer and
+            # does not need a copy-back step, so coalescing works correctly.
+            with _coalescing_manager(
+                self.intra_distributed_optimizer_instance_group, async_ops=async_op
+            ) as cm:
                 for idx, bucket in enumerate(self.buckets):
                     if self.cached_param_buffer_shard_list[idx] is None:
                         self.cached_param_buffer_shard_list[idx] = shard_buffer(
@@ -309,54 +389,13 @@ class _ParamAndGradBucketGroup:
                         group=self.intra_distributed_optimizer_instance_group,
                         async_op=async_op,
                     )
+            if async_op:
+                self.param_gather_handle = cm
             else:
-                for bucket in self.buckets:
-                    local_rank = self.intra_distributed_optimizer_instance_rank
-                    src = (
-                        _flatten_dense_tensors(bucket.lw_params_list[local_rank])
-                        if len(bucket.lw_params_list[local_rank]) > 0
-                        else torch.empty(
-                            0,
-                            device=bucket.grad_data.device,
-                            dtype=bucket.grad_data.dtype,
-                        )
-                    )
-                    bucket.lw_gather_tensor_list = [
-                        torch.empty(size, device=src.device, dtype=src.dtype)
-                        for size in bucket.lw_param_flat_sizes
-                    ]
-                    torch.distributed.all_gather(
-                        bucket.lw_gather_tensor_list,
-                        src,
-                        group=self.intra_distributed_optimizer_instance_group,
-                        async_op=async_op,
-                    )
-        if async_op:
-            self.param_gather_handle = cm
-        elif self.ddp_config.use_layer_wise_optimizer:
-            # Synchronous layer-wise case (e.g., force_sync=True for checkpointing):
-            # unflatten and copy gathered params immediately.
-            for bucket in self.buckets:
-                for idx, (flat_params, params) in enumerate(
-                    zip(bucket.lw_gather_tensor_list, bucket.lw_params_list)
-                ):
-                    if (
-                        len(params) == 0
-                        or idx == self.intra_distributed_optimizer_instance_rank
-                    ):
-                        continue
-                    updated_params = _unflatten_dense_tensors(flat_params, params)
-                    for updated_p, model_p in zip(updated_params, params):
-                        model_p.data.copy_(updated_p)
-                bucket.lw_gather_tensor_list.clear()
-            self.param_gather_handle = None
-        else:
-            # When using `_coalescing_manager`, even if a synchronous op (async_op=False) is used,
-            # `cm` is not None, which is different from when `_coalescing_manager` is not used in
-            # which case the torch.distributed._all_gather_base() will return None. In order to
-            # maintain consistency with prior code, we need to manually set communication handle to
-            # None.
-            self.param_gather_handle = None
+                # When using `_coalescing_manager`, even if a synchronous op
+                # (async_op=False) is used, `cm` is not None. Manually set to None for
+                # consistency with prior code.
+                self.param_gather_handle = None
         self.param_gather_dispatched = True
 
     def finish_param_sync(self, skip_next_bucket_dispatch: bool = False):
@@ -428,6 +467,7 @@ class _ParamAndGradBucketGroup:
                         for updated_p, model_p in zip(updated_params, params):
                             model_p.data.copy_(updated_p)
                     bucket.lw_gather_tensor_list.clear()
+                    bucket._lw_src_buffer = None
             else:
                 fp8_params = []
                 for bucket in self.buckets:
