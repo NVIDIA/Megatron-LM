@@ -1,6 +1,7 @@
 # Copyright (c) 2024, NVIDIA CORPORATION. All rights reserved.
 import torch
 
+from megatron.core.extensions.transformer_engine import HAVE_TE
 from megatron.core.fusions.fused_bias_dropout import get_bias_dropout_add
 from megatron.core.ssm.mamba_block import MambaStack, MambaStackSubmodules
 from megatron.core.ssm.mamba_layer import MambaLayer, MambaLayerSubmodules
@@ -15,7 +16,6 @@ from megatron.core.transformer.mlp import MLP, MLPSubmodules
 from megatron.core.transformer.spec_utils import ModuleSpec
 from megatron.core.transformer.transformer_layer import TransformerLayer, TransformerLayerSubmodules
 from megatron.core.typed_torch import not_none
-from megatron.core.extensions.transformer_engine import HAVE_TE
 
 if HAVE_TE:
     from megatron.core.extensions.transformer_engine import (
@@ -112,7 +112,7 @@ def get_layer_spec_te(is_vit=False, padding=False) -> ModuleSpec:
                 submodules=SelfAttentionSubmodules(
                     linear_qkv=not_none(TELayerNormColumnParallelLinear),
                     core_attention=not_none(TEDotProductAttention),
-                    linear_proj=TERowParallelLinear,
+                    linear_proj=not_none(TERowParallelLinear),
                     q_layernorm=IdentityOp,
                     k_layernorm=IdentityOp,
                 ),
@@ -158,7 +158,7 @@ def get_mamba_layer_spec_te(padding=False) -> ModuleSpec:
                         submodules=SelfAttentionSubmodules(
                             linear_qkv=not_none(TELayerNormColumnParallelLinear),
                             core_attention=not_none(TEDotProductAttention),
-                            linear_proj=TERowParallelLinear,
+                            linear_proj=not_none(TERowParallelLinear),
                         ),
                     ),
                     self_attn_bda=get_bias_dropout_add,
