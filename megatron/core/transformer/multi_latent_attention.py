@@ -1,9 +1,9 @@
 # Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
-
+from __future__ import annotations
 
 import math
 from dataclasses import dataclass
-from typing import NoReturn, Optional, Union
+from typing import TYPE_CHECKING, NoReturn, Optional, Union
 
 import torch
 
@@ -32,7 +32,7 @@ from megatron.core.tensor_parallel.mappings import (
     gather_from_tensor_model_parallel_region,
     scatter_to_sequence_parallel_region,
 )
-from megatron.core.transformer.attention import Attention
+from megatron.core.transformer.attention import Attention, LinearProjBuilder
 from megatron.core.transformer.custom_layers.transformer_engine import (
     split_te_layernorm_column_parallel_linear,
 )
@@ -40,7 +40,7 @@ from megatron.core.transformer.enums import AttnMaskType
 from megatron.core.transformer.spec_utils import ModuleSpec, build_module
 from megatron.core.transformer.torch_norm import LayerNormBuilder
 from megatron.core.transformer.transformer_config import MLATransformerConfig
-from megatron.core.typed_torch import apply_module
+from megatron.core.typed_torch import apply_module, not_none
 from megatron.core.utils import deprecate_inference_params, get_pg_size, is_te_min_version
 
 try:
@@ -66,10 +66,16 @@ except ImportError:
     TEColumnParallelLinear, TELinear, Linear, set_save_original_input = None, None, None, None
     HAVE_TE = False
 
+if TYPE_CHECKING:
+    from megatron.core.inference.contexts import BaseInferenceContext
+    from megatron.core.packed_seq_params import PackedSeqParams
+
 
 @dataclass
 class MLASelfAttentionSubmodules:
     """Submodules for the MLA self-attention layer."""
+
+    linear_proj: LinearProjBuilder
 
     # TODO(nschank): Move layernorms back to the bottom once all other layers have defaults removed.
     q_layernorm: LayerNormBuilder
@@ -81,7 +87,6 @@ class MLASelfAttentionSubmodules:
     linear_kv_down_proj: Union[ModuleSpec, type] = None
     linear_kv_up_proj: Union[ModuleSpec, type] = None
     core_attention: Union[ModuleSpec, type] = None
-    linear_proj: Union[ModuleSpec, type] = None
 
 
 class MultiLatentAttention(Attention):
@@ -101,7 +106,8 @@ class MultiLatentAttention(Attention):
         cp_comm_type: Optional[str] = None,
         pg_collection: Optional[ProcessGroupCollection] = None,
     ) -> None:
-
+        # TODO(nschank): Restructure so that the Attention initializer knows which specific
+        # submodules it will construct, so that MLASelfAttentionSubmodules honors that interface.
         super().__init__(
             config=config,
             submodules=submodules,
@@ -170,12 +176,11 @@ class MultiLatentAttention(Attention):
         )
 
         # Output.
-        self.linear_proj = build_module(
-            submodules.linear_proj,
+        self.linear_proj = submodules.linear_proj(
             self.query_projection_size,
             self.config.hidden_size,
             config=self.config,
-            init_method=self.config.output_layer_init_method,
+            init_method=not_none(self.config.output_layer_init_method),
             bias=self.config.add_bias_linear,
             input_is_parallel=True,
             skip_bias_add=True,
@@ -204,20 +209,20 @@ class MultiLatentAttention(Attention):
 
     def forward(
         self,
-        hidden_states,
-        attention_mask,
-        key_value_states=None,
-        inference_context=None,
-        rotary_pos_emb=None,
-        rotary_pos_cos=None,
-        rotary_pos_sin=None,
-        rotary_pos_cos_sin=None,
-        attention_bias=None,
-        packed_seq_params=None,
-        position_ids=None,
-        sequence_len_offset=None,
+        hidden_states: torch.Tensor,
+        attention_mask: torch.Tensor,
+        key_value_states: torch.Tensor | None = None,
+        inference_context: BaseInferenceContext | None = None,
+        rotary_pos_emb: torch.Tensor | tuple[torch.Tensor, torch.Tensor] | None = None,
+        rotary_pos_cos: torch.Tensor | None = None,
+        rotary_pos_sin: torch.Tensor | None = None,
+        rotary_pos_cos_sin: torch.Tensor | None = None,
+        attention_bias: torch.Tensor | None = None,
+        packed_seq_params: PackedSeqParams | None = None,
+        position_ids: torch.Tensor | None = None,
+        sequence_len_offset: int | None = None,
         *,
-        inference_params=None,
+        inference_params: BaseInferenceContext | None = None,
     ):
         """Forward pass for multi-latent attention"""
         assert rotary_pos_emb is None, "Rotary position embeddings should not be passed into MLA."
@@ -354,7 +359,7 @@ class MultiLatentAttention(Attention):
         # Output. [sq, b, h]
         # =================
         with off_interface(self.offload_attn_proj, core_attn_out, "attn_proj") as core_attn_out:
-            output, bias = self.linear_proj(core_attn_out)
+            output, bias = apply_module(self.linear_proj)(core_attn_out)
         if self.offload_attn_proj:
             output = off_interface.group_commit(
                 output, name="attn_proj", forced_released_tensors=[core_attn_out]

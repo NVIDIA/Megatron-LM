@@ -23,6 +23,7 @@ from megatron.core.transformer.attention import Attention
 from megatron.core.transformer.enums import AttnMaskType
 from megatron.core.transformer.multi_latent_attention import MLASelfAttention, MultiLatentAttention
 from megatron.core.transformer.transformer_config import MLATransformerConfig
+from megatron.core.typed_torch import apply_module
 from megatron.core.utils import is_te_min_version, is_torch_min_version
 from megatron.training.arguments import parse_args
 from megatron.training.checkpointing import load_checkpoint, save_checkpoint
@@ -731,8 +732,12 @@ class TestParallelMLAAttentionPrecision:
             )
             assert torch.equal(_core_attn_out_sbhd, core_attn_out_thd)
 
-            output_sbhd, bias_sbhd = self.parallel_attention.linear_proj(core_attn_out_sbhd)
-            output_thd, bias_thd = self.parallel_attention.linear_proj(core_attn_out_thd)
+            output_sbhd, bias_sbhd = apply_module(self.parallel_attention.linear_proj)(
+                core_attn_out_sbhd
+            )
+            output_thd, bias_thd = apply_module(self.parallel_attention.linear_proj)(
+                core_attn_out_thd
+            )
             _output_sbhd = output_sbhd.transpose(0, 1).contiguous().view(*output_thd.shape)
             assert torch.equal(_output_sbhd, output_thd)
 
@@ -896,8 +901,12 @@ class TestContextParallelMLAAttentionPrecision:
             )
             torch.testing.assert_close(_core_attn_out_sbhd, core_attn_out_thd, atol=atol, rtol=rtol)
 
-            output_sbhd, bias_sbhd = self.parallel_attention.linear_proj(core_attn_out_sbhd)
-            output_thd, bias_thd = self.parallel_attention.linear_proj(core_attn_out_thd)
+            output_sbhd, bias_sbhd = apply_module(self.parallel_attention.linear_proj)(
+                core_attn_out_sbhd
+            )
+            output_thd, bias_thd = apply_module(self.parallel_attention.linear_proj)(
+                core_attn_out_thd
+            )
             _output_sbhd = output_sbhd.transpose(0, 1).contiguous().view(*output_thd.shape)
             torch.testing.assert_close(_output_sbhd, output_thd, atol=atol, rtol=rtol)
 
@@ -1047,8 +1056,12 @@ class TestParallelMLAAttentionPrecisionWithRopeFusion:
             )
             assert torch.equal(_core_attn_out_sbhd, core_attn_out_thd)
 
-            output_sbhd, bias_sbhd = self.parallel_attention.linear_proj(core_attn_out_sbhd)
-            output_thd, bias_thd = self.parallel_attention.linear_proj(core_attn_out_thd)
+            output_sbhd, bias_sbhd = apply_module(self.parallel_attention.linear_proj)(
+                core_attn_out_sbhd
+            )
+            output_thd, bias_thd = apply_module(self.parallel_attention.linear_proj)(
+                core_attn_out_thd
+            )
             _output_sbhd = output_sbhd.transpose(0, 1).contiguous().view(*output_thd.shape)
             assert torch.equal(_output_sbhd, output_thd)
 
