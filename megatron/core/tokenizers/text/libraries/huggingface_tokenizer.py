@@ -262,9 +262,11 @@ class HuggingFaceTokenizer(MegatronTokenizerTextAbstract):
             remove_special_tokens = not self.include_special_tokens
         tokens = self.ids_to_tokens(ids)
         if remove_special_tokens:
-            tokens_clean = [t for t in tokens if t not in self.tokenizer.all_special_tokens]
+            tokens_clean = [
+                t for t in tokens if t is not None and t not in self.tokenizer.all_special_tokens
+            ]
         else:
-            tokens_clean = tokens
+            tokens_clean = [t for t in tokens if t is not None]
         text = self.tokens_to_text(tokens_clean)
         return text
 

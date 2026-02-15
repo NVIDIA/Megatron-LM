@@ -70,9 +70,6 @@ MODEL_OPTIONS="\
   --max-position-embeddings 131072  \
   --tokenizer-type HuggingFaceTokenizer \
   --tokenizer-model "unsloth/DeepSeek-R1-Distill-Qwen-7B" \
-  --tokenizer-hf-include-special-tokens \
-  --langrl-inference-server-type "inplace_megatron_chat" \
-  --langrl-inference-server-conversation-template "deepseek-ai/DeepSeek-R1-Distill-Qwen-7B" \
   --lr 0.000001 \
   --lr-warmup-samples 0 \
   --make-vocab-size-divisible-by 128 \
