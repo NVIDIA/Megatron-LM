@@ -2045,6 +2045,12 @@ def forward_backward_pipelining_without_interleaving(
     is_multimodule = isinstance(pg_collection, MultiModuleProcessGroupCollection) or isinstance(
         p2p_communicator, MultiModulePipelineCommunicator
     )
+    if is_multimodule:
+        # Multi-module: use language model's CP size for loss scaling
+        if not config.variable_seq_lengths:
+            raise ValueError(
+                "config.variable_seq_lengths=True required for multi-module pipelines"
+            )
 
     if p2p_communicator is None and pg_collection is None:
         # Default: single-module with parallel_state groups
@@ -2069,17 +2075,9 @@ def forward_backward_pipelining_without_interleaving(
         )
 
     elif p2p_communicator is not None and pg_collection is not None:
-        # Custom process groups provided
-
-        if is_multimodule:
-            # Multi-module: use language model's CP size for loss scaling
-            if not config.variable_seq_lengths:
-                raise ValueError(
-                    "config.variable_seq_lengths=True required for multi-module pipelines"
-                )
+        if isinstance(pg_collection, MultiModuleProcessGroupCollection):
             cp_size = pg_collection.get_language_model_cp_size()
             # tp_group and cp_group stay None (variable_seq_lengths mode)
-
         elif isinstance(pg_collection, ProcessGroupCollection):
             # Single-module: extract tp/cp groups and cp_size
             # Note: finalize_model_grads validates other fields (embd, pos_embd, pp, dp_cp)
@@ -2148,9 +2146,12 @@ def forward_backward_pipelining_without_interleaving(
 
     # Select backward function based on whether multi-module or single-module
     if is_multimodule:
+        language_model_module_name="llm"
+        if isinstance(pg_collection, MultiModuleProcessGroupCollection):
+            language_model_module_name = pg_collection.language_model_module_name
         backward_func = partial(
             backward_step_multimodule,
-            language_model_module_name=pg_collection.language_model_module_name,
+            language_model_module_name=language_model_module_name,
         )
     else:
         backward_func = backward_step
