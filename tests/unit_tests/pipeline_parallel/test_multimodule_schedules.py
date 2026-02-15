@@ -514,22 +514,22 @@ class TestMultimoduleSchedules:
             num_microbatches=16,
         )
 
-    # def test_dual_encoder_8gpu(self):
-    #     """Test dual encoder + LLM on 8 GPUs (TP=2, PP=2 for each)."""
-    #     if self.world_size != 8:
-    #         pytest.skip(f"Requires 8 GPUs, got {self.world_size}")
+    def test_dual_encoder_8gpu(self):
+        """Test dual encoder + LLM on 8 GPUs (TP=2, PP=2 for each)."""
+        if self.world_size != 8:
+            pytest.skip(f"Requires 8 GPUs, got {self.world_size}")
 
-    #     encoder_configs = [
-    #         {'name': 'encoder_1', 'tp': 2, 'pp': 2, 'dp': 1, 'grid_offset': 0},
-    #         {'name': 'encoder_2', 'tp': 2, 'pp': 2, 'dp': 1, 'grid_offset': 0},
-    #     ]
-    #     llm_config = {'tp': 2, 'pp': 2, 'dp': 1, 'grid_offset': 4}
+        encoder_configs = [
+            {'name': 'encoder_1', 'tp': 2, 'pp': 2, 'dp': 1, 'grid_offset': 0},
+            {'name': 'encoder_2', 'tp': 2, 'pp': 2, 'dp': 1, 'grid_offset': 0},
+        ]
+        llm_config = {'tp': 2, 'pp': 2, 'dp': 1, 'grid_offset': 4}
 
-    #     run_multimodule_schedule_test(
-    #         encoder_configs,
-    #         llm_config,
-    #         hidden_size=1024,
-    #         seq_length=512,
-    #         micro_batch_size=4,
-    #         num_microbatches=16,
-    #     )
+        run_multimodule_schedule_test(
+            encoder_configs,
+            llm_config,
+            hidden_size=1024,
+            seq_length=512,
+            micro_batch_size=4,
+            num_microbatches=16,
+        )
