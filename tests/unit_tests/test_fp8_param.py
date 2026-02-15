@@ -72,12 +72,12 @@ class TestFP8Param:
         os.environ['CUDA_DEVICE_MAX_CONNECTIONS'] = '1'
 
     def teardown_method(self, method):
-        Utils.destroy_model_parallel()
-        destroy_global_vars()
-        destroy_num_microbatches_calculator()
         if self.cuda_graph_helper is not None and self.cuda_graph_helper.graphs_created():
             self.cuda_graph_helper.delete_cuda_graphs()
             self.cuda_graph_helper = None
+        Utils.destroy_model_parallel()
+        destroy_global_vars()
+        destroy_num_microbatches_calculator()
         gc.collect()
 
     def model_provider(

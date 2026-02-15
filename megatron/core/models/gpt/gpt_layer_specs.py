@@ -1,4 +1,4 @@
-# Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
 import warnings
 from typing import Optional, Union
@@ -12,6 +12,7 @@ from megatron.core.models.backends import (
 from megatron.core.models.gpt.moe_module_specs import get_moe_module_spec_for_backend
 from megatron.core.transformer.attention import SelfAttention, SelfAttentionSubmodules
 from megatron.core.transformer.enums import AttnMaskType, LayerType
+from megatron.core.transformer.hyper_connection import HyperConnectionModule
 from megatron.core.transformer.identity_op import IdentityOp
 from megatron.core.transformer.mlp import MLP, MLPSubmodules
 from megatron.core.transformer.multi_latent_attention import (
@@ -263,9 +264,11 @@ def get_gpt_layer_with_transformer_engine_spec(
                     ),
                 ),
                 self_attn_bda=get_bias_dropout_add,
+                self_attention_hyper_connection=HyperConnectionModule,
                 pre_mlp_layernorm=backend.layer_norm() if num_experts else IdentityOp,
                 mlp=mlp,
                 mlp_bda=get_bias_dropout_add,
+                mlp_hyper_connection=HyperConnectionModule,
             ),
         )
     else:
@@ -289,9 +292,11 @@ def get_gpt_layer_with_transformer_engine_spec(
                     ),
                 ),
                 self_attn_bda=get_bias_dropout_add,
+                self_attention_hyper_connection=HyperConnectionModule,
                 pre_mlp_layernorm=backend.layer_norm() if num_experts else IdentityOp,
                 mlp=mlp,
                 mlp_bda=get_bias_dropout_add,
+                mlp_hyper_connection=HyperConnectionModule,
                 sharded_state_dict_keys_map={
                     "mlp.0.weight": "mlp.linear_fc1.layer_norm_weight",
                     "mlp.0.bias": "mlp.linear_fc1.layer_norm_bias",
@@ -386,9 +391,11 @@ def get_gpt_layer_local_spec(
                     ),
                 ),
                 self_attn_bda=get_bias_dropout_add,
+                self_attention_hyper_connection=HyperConnectionModule,
                 pre_mlp_layernorm=layer_norm,
                 mlp=mlp,
                 mlp_bda=get_bias_dropout_add,
+                mlp_hyper_connection=HyperConnectionModule,
             ),
         )
     else:
@@ -412,9 +419,11 @@ def get_gpt_layer_local_spec(
                     ),
                 ),
                 self_attn_bda=get_bias_dropout_add,
+                self_attention_hyper_connection=HyperConnectionModule,
                 pre_mlp_layernorm=layer_norm,
                 mlp=mlp,
                 mlp_bda=get_bias_dropout_add,
+                mlp_hyper_connection=HyperConnectionModule,
                 sharded_state_dict_keys_map={
                     "input_layernorm.": "self_attention.linear_qkv.layer_norm_",
                     "pre_mlp_layernorm.": "mlp.linear_fc1.layer_norm_",
@@ -694,6 +703,12 @@ def get_gpt_mtp_block_spec_for_backend(
         transformer_layer_spec = spec
     else:
         raise ValueError(f"Invalid spec: {spec}")
+
+    # TODO: support hyper connections for mtp.
+    # Remove all hyper connections in transformer_layer_spec
+    transformer_layer_spec.submodules.self_attention_hyper_connection = IdentityOp
+    transformer_layer_spec.submodules.cross_attention_hyper_connection = IdentityOp
+    transformer_layer_spec.submodules.mlp_hyper_connection = IdentityOp
 
     mtp_layer_spec = get_mtp_layer_spec_for_backend(
         transformer_layer_spec=transformer_layer_spec, backend=backend

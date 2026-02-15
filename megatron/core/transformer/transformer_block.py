@@ -1,4 +1,5 @@
-# Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+
 import logging
 from contextlib import nullcontext
 from dataclasses import dataclass
@@ -18,7 +19,9 @@ from megatron.core.inference.contexts import BaseInferenceContext
 from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.core.pipeline_parallel.utils import is_vp_first_stage, is_vp_last_stage
 from megatron.core.process_groups_config import ProcessGroupCollection
+from megatron.core.tensor_parallel.random import CheckpointManager
 from megatron.core.transformer.enums import CudaGraphScope, LayerType
+from megatron.core.transformer.hyper_connection import HyperConnectionModule
 from megatron.core.transformer.module import GraphableMegatronModule, MegatronModule
 from megatron.core.transformer.spec_utils import ModuleSpec, build_module
 from megatron.core.transformer.transformer_config import TransformerConfig
@@ -322,6 +325,7 @@ class TransformerBlock(GraphableMegatronModule, MegatronModule):
             self.offload_context, self.group_prefetch_offload_commit_async = nullcontext(), None
             self.config._cpu_offloading_context = None
 
+        self.num_residual_streams = config.num_residual_streams
         self._build_layers()
         self.num_layers_per_pipeline_rank = len(self.layers)
 
@@ -702,6 +706,13 @@ class TransformerBlock(GraphableMegatronModule, MegatronModule):
         #   is called here to be future-proof and corner-case-proof.
         hidden_states = make_viewless_tensor(inp=hidden_states, requires_grad=True, keep_graph=True)
 
+        # Expand hidden states for hyper connections at the start of the block
+        # Only expand at the first PP stage; subsequent stages receive n-stream from previous stage
+        if self.config.enable_hyper_connections and self.pre_process:
+            hidden_states = HyperConnectionModule.input_expand(
+                hidden_states, self.num_residual_streams
+            )  # [s, b, C] -> [s, b, n*C]
+
         if self.config.sequence_parallel:
             rng_context = tensor_parallel.get_cuda_rng_tracker().fork()
         else:
@@ -729,6 +740,16 @@ class TransformerBlock(GraphableMegatronModule, MegatronModule):
             use_inner_quantization_context = False
             outer_quantization_context = nullcontext()
 
+        # Determine if MHC recompute should be used
+        # Only enable when: training mode AND hyper connections AND recompute_hyper_connections
+        use_mhc_recompute = (
+            self.training
+            and self.config.enable_hyper_connections
+            and self.config.recompute_hyper_connections
+        )
+        mhc_manager = CheckpointManager() if use_mhc_recompute else None
+        mhc_recompute_layer_num = self.config.mhc_recompute_layer_num
+
         with rng_context, outer_quantization_context:
             # Forward pass.
             if self.config.recompute_granularity == 'full' and self.training:
@@ -744,6 +765,7 @@ class TransformerBlock(GraphableMegatronModule, MegatronModule):
                     padding_mask=padding_mask,
                 )
             else:
+                num_layers = len(self.layers)
                 for l_no, layer in enumerate(self.layers):
                     # Get appropriate inner quantization context
                     if use_inner_quantization_context:
@@ -760,6 +782,18 @@ class TransformerBlock(GraphableMegatronModule, MegatronModule):
                     else:
                         inner_quantization_context = nullcontext()
 
+                    # Determine if this is the last layer in the current MHC recompute block
+                    # A layer is last in recompute block if:
+                    # 1. It's the final layer in the transformer block, OR
+                    # 2. (l_no + 1) % mhc_recompute_layer_num == 0
+                    is_last_in_transformer_block = l_no == num_layers - 1
+                    is_last_in_recompute_block = is_last_in_transformer_block
+                    if use_mhc_recompute and mhc_recompute_layer_num is not None:
+                        # l_no is 0-indexed, so (l_no + 1) gives the 1-indexed layer number
+                        is_last_in_recompute_block = is_last_in_transformer_block or (
+                            (l_no + 1) % mhc_recompute_layer_num == 0
+                        )
+
                     with self.offload_context, inner_quantization_context:
                         hidden_states, context = layer(
                             hidden_states=hidden_states,
@@ -775,7 +809,18 @@ class TransformerBlock(GraphableMegatronModule, MegatronModule):
                             packed_seq_params=packed_seq_params,
                             sequence_len_offset=sequence_len_offset,
                             padding_mask=padding_mask,
+                            mhc_recompute_manager=mhc_manager,
+                            is_last_layer_in_recompute_block=is_last_in_recompute_block,
                         )
+
+                    # Create new manager for next recompute block if current block ended
+                    # (but not if this is the final layer in transformer block)
+                    if (
+                        use_mhc_recompute
+                        and is_last_in_recompute_block
+                        and not is_last_in_transformer_block
+                    ):
+                        mhc_manager = CheckpointManager()
 
                     if (
                         torch.is_grad_enabled()
@@ -783,6 +828,12 @@ class TransformerBlock(GraphableMegatronModule, MegatronModule):
                         and self.group_prefetch_offload_commit_async is not None
                     ):
                         hidden_states = self.group_prefetch_offload_commit_async(hidden_states)
+
+        # Only contract if the final layer norm is in this stage
+        if self.config.enable_hyper_connections and self.has_final_layernorm_in_this_stage():
+            hidden_states = HyperConnectionModule.output_contract(
+                hidden_states, self.num_residual_streams
+            )  # [s, b, n*C] -> [s, b, C]
 
         # Final layer norm.
         if self.final_layernorm is not None:
