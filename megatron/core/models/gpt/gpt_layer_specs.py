@@ -122,7 +122,7 @@ def get_gpt_layer_with_inference_submodules(
                     linear_kv_down_proj=backend.linear(),
                     linear_kv_up_proj=linear_kv_up_proj,
                     core_attention=backend.core_attention(),
-                    linear_proj=backend.row_parallel_linear(),
+                    linear_proj=backend.row_parallel_linear_proj(),
                     q_layernorm=IdentityOp,
                     kv_layernorm=IdentityOp,
                 ),
@@ -141,7 +141,7 @@ def get_gpt_layer_with_inference_submodules(
                 submodules=SelfAttentionSubmodules(
                     linear_qkv=backend.column_parallel_layer_norm_linear(),
                     core_attention=backend.core_attention(),
-                    linear_proj=backend.row_parallel_linear(),
+                    linear_proj=backend.row_parallel_linear_proj(),
                     q_layernorm=(
                         L2Norm if qk_l2_norm else (qk_norm if qk_layernorm else IdentityOp)
                     ),
@@ -299,7 +299,7 @@ def get_gpt_layer_with_transformer_engine_submodules(
                     linear_kv_down_proj=backend.linear(),
                     linear_kv_up_proj=linear_kv_up_proj,
                     core_attention=backend.core_attention(),
-                    linear_proj=backend.row_parallel_linear(),
+                    linear_proj=backend.row_parallel_linear_proj(),
                     q_layernorm=IdentityOp,
                     kv_layernorm=IdentityOp,
                 ),
@@ -318,7 +318,7 @@ def get_gpt_layer_with_transformer_engine_submodules(
                 submodules=SelfAttentionSubmodules(
                     linear_qkv=backend.column_parallel_layer_norm_linear(),
                     core_attention=backend.core_attention(),
-                    linear_proj=backend.row_parallel_linear(),
+                    linear_proj=backend.row_parallel_linear_proj(),
                     q_layernorm=(
                         L2Norm if qk_l2_norm else (qk_norm if qk_layernorm else IdentityOp)
                     ),
@@ -419,7 +419,7 @@ def get_gpt_layer_local_submodules(
                     linear_kv_down_proj=backend.column_parallel_linear(),
                     linear_kv_up_proj=backend.column_parallel_linear(),
                     core_attention=backend.core_attention(),
-                    linear_proj=backend.row_parallel_linear(),
+                    linear_proj=backend.row_parallel_linear_proj(),
                     q_layernorm=qk_norm if qk_layernorm else IdentityOp,
                     kv_layernorm=qk_norm if qk_layernorm else IdentityOp,
                 ),
@@ -438,7 +438,7 @@ def get_gpt_layer_local_submodules(
                 submodules=SelfAttentionSubmodules(
                     linear_qkv=backend.column_parallel_linear(),
                     core_attention=backend.core_attention(),
-                    linear_proj=backend.row_parallel_linear(),
+                    linear_proj=backend.row_parallel_linear_proj(),
                     q_layernorm=(
                         L2Norm if qk_l2_norm else (qk_norm if qk_layernorm else IdentityOp)
                     ),
