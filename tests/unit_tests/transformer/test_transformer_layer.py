@@ -9,7 +9,7 @@ from megatron.core.dist_checkpointing.mapping import ShardedObject, ShardedTenso
 from megatron.core.inference.contexts import StaticInferenceContext
 from megatron.core.models.gpt.gpt_layer_specs import get_gpt_layer_with_transformer_engine_spec
 from megatron.core.tensor_parallel.random import (
-    MHCBlockRecomputeManager,
+    CheckpointManager,
     model_parallel_cuda_manual_seed,
 )
 from megatron.core.transformer.transformer_config import TransformerConfig
@@ -366,7 +366,7 @@ class TestTransformerLayerWithHyperConnectionRecompute:
         attention_mask = torch.ones((1, 1, seq_len, seq_len), dtype=bool, device='cuda')
 
         # Create manager for MHC block recomputation
-        manager = MHCBlockRecomputeManager()
+        manager = CheckpointManager()
 
         # Forward pass with recompute manager
         output, context = layer(
@@ -413,7 +413,7 @@ class TestTransformerLayerWithHyperConnectionRecompute:
         )
         attention_mask = torch.ones((1, 1, seq_len, seq_len), dtype=bool, device='cuda')
 
-        manager = MHCBlockRecomputeManager()
+        manager = CheckpointManager()
 
         # Forward pass - NOT the last layer in block
         output, context = layer(
@@ -440,7 +440,7 @@ class TestTransformerLayerWithHyperConnectionRecompute:
     def test_multiple_layers_chain_with_recompute(self):
         """
         Test multiple TransformerLayers chained together with a single
-        MHCBlockRecomputeManager, simulating TransformerBlock behavior.
+        CheckpointManager, simulating TransformerBlock behavior.
         """
         hidden_size = 64
         num_streams = 4
@@ -477,7 +477,7 @@ class TestTransformerLayerWithHyperConnectionRecompute:
         attention_mask = torch.ones((1, 1, seq_len, seq_len), dtype=bool, device='cuda')
 
         # Single manager for all layers (like TransformerBlock)
-        manager = MHCBlockRecomputeManager()
+        manager = CheckpointManager()
 
         # Forward through all layers
         h = hidden_states

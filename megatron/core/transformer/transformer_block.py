@@ -19,7 +19,7 @@ from megatron.core.inference.contexts import BaseInferenceContext
 from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.core.pipeline_parallel.utils import is_vp_first_stage, is_vp_last_stage
 from megatron.core.process_groups_config import ProcessGroupCollection
-from megatron.core.tensor_parallel.random import MHCBlockRecomputeManager
+from megatron.core.tensor_parallel.random import CheckpointManager
 from megatron.core.transformer.enums import CudaGraphScope, LayerType
 from megatron.core.transformer.hyper_connection import HyperConnectionModule
 from megatron.core.transformer.module import GraphableMegatronModule, MegatronModule
@@ -325,8 +325,7 @@ class TransformerBlock(GraphableMegatronModule, MegatronModule):
             self.offload_context, self.group_prefetch_offload_commit_async = nullcontext(), None
             self.config._cpu_offloading_context = None
 
-        if config.enable_hyper_connections:
-            self.num_residual_streams = config.num_residual_streams
+        self.num_residual_streams = config.num_residual_streams
         self._build_layers()
         self.num_layers_per_pipeline_rank = len(self.layers)
 
@@ -748,7 +747,7 @@ class TransformerBlock(GraphableMegatronModule, MegatronModule):
             and self.config.enable_hyper_connections
             and self.config.recompute_hyper_connections
         )
-        mhc_manager = MHCBlockRecomputeManager() if use_mhc_recompute else None
+        mhc_manager = CheckpointManager() if use_mhc_recompute else None
         mhc_recompute_layer_num = self.config.mhc_recompute_layer_num
 
         with rng_context, outer_quantization_context:
@@ -821,7 +820,7 @@ class TransformerBlock(GraphableMegatronModule, MegatronModule):
                         and is_last_in_recompute_block
                         and not is_last_in_transformer_block
                     ):
-                        mhc_manager = MHCBlockRecomputeManager()
+                        mhc_manager = CheckpointManager()
 
                     if (
                         torch.is_grad_enabled()
@@ -850,12 +849,6 @@ class TransformerBlock(GraphableMegatronModule, MegatronModule):
         # on the computational graph and will lead to unexpected errors in pipeline schedules.
         if not self.pre_process and len(self.layers) == 0 and not self.final_layernorm:
             hidden_states = hidden_states.clone()
-
-        # Register unified recompute hook on final output
-        # The hook_tensor is the last layer's MLP BDA output (NOT checkpointed),
-        # which is now hidden_states after final layernorm processing
-        # if mhc_manager is not None:
-        #     mhc_manager.discard_all_outputs_and_register_unified_recompute(hidden_states)
 
         return hidden_states
 

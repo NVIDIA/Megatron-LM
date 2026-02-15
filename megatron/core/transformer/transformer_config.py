@@ -821,7 +821,7 @@ class TransformerConfig(ModelParallelConfig):
     """Enable recomputation for HyperConnection intermediate activations.
     
     When enabled, all HyperConnection operations (compute_mappings, aggregate, apply_h_res, 
-    apply_h_post) are wrapped with CheckpointWithoutOutput and managed by MHCBlockRecomputeManager.
+    apply_h_post) are wrapped with CheckpointWithoutOutput and managed by CheckpointManager.
     This significantly reduces memory usage by discarding intermediate activations and 
     recomputing them during backward pass.
     
@@ -841,7 +841,7 @@ class TransformerConfig(ModelParallelConfig):
     layer in the transformer block) will:
     - NOT checkpoint its final MLP BDA
     - Register the unified recompute hook on its MLP BDA output
-    - A new MHCBlockRecomputeManager is created for subsequent layers
+    - A new CheckpointManager is created for subsequent layers
     
     If None, all layers in the transformer block share a single recompute block."""
 

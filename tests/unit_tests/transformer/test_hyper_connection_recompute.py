@@ -6,7 +6,7 @@ Unit tests for HyperConnection block-level recomputation.
 Tests the following functionality:
 1. HyperConnectionModule._forward_with_checkpoint
 2. HyperConnectionModule.apply_h_post with manager parameter
-3. Integration with MHCBlockRecomputeManager
+3. Integration with CheckpointManager
 4. TransformerLayer with mhc_recompute_manager
 5. TransformerBlock with recompute_hyper_connections
 """
@@ -17,7 +17,7 @@ import torch.nn as nn
 
 from megatron.core.tensor_parallel.random import (
     CheckpointWithoutOutput,
-    MHCBlockRecomputeManager,
+    CheckpointManager,
     model_parallel_cuda_manual_seed,
 )
 from megatron.core.transformer.hyper_connection import HyperConnectionModule
@@ -87,7 +87,7 @@ class TestHyperConnectionCheckpoint:
         # Forward with checkpoint
         torch.manual_seed(42)
         torch.cuda.manual_seed(42)
-        manager = MHCBlockRecomputeManager()
+        manager = CheckpointManager()
         aggregated_ckpt, h_res_ckpt, h_post_ckpt = module._forward_with_checkpoint(
             hidden_states_ckpt, residual_ckpt, manager
         )
@@ -147,7 +147,7 @@ class TestHyperConnectionCheckpoint:
 
         # With checkpoint (manager provided)
         torch.manual_seed(42)
-        manager = MHCBlockRecomputeManager()
+        manager = CheckpointManager()
         x_out_ckpt, bias_out_ckpt = module.apply_h_post(
             (x_ckpt, bias), h_post_ckpt, manager=manager
         )
@@ -200,7 +200,7 @@ class TestHyperConnectionCheckpoint:
         # With manager (uses _forward_with_checkpoint)
         torch.manual_seed(42)
         torch.cuda.manual_seed(42)
-        manager = MHCBlockRecomputeManager()
+        manager = CheckpointManager()
         aggregated_ckpt, h_res_ckpt, h_post_ckpt = module.forward(
             hidden_states_ckpt, residual_ckpt, mhc_recompute_manager=manager
         )
@@ -215,7 +215,7 @@ class TestHyperConnectionCheckpoint:
 
 
 class TestMHCBlockRecomputeIntegration:
-    """Test MHCBlockRecomputeManager integration with HyperConnection."""
+    """Test CheckpointManager integration with HyperConnection."""
 
     def setup_method(self, method):
         Utils.initialize_model_parallel(1, 1)
@@ -227,7 +227,7 @@ class TestMHCBlockRecomputeIntegration:
     def test_multiple_hyper_connections_in_chain(self):
         """
         Test that multiple HyperConnectionModules can be chained together
-        with a single MHCBlockRecomputeManager.
+        with a single CheckpointManager.
         """
         hidden_size = 64
         num_streams = 4
@@ -284,7 +284,7 @@ class TestMHCBlockRecomputeIntegration:
         torch.manual_seed(42)
         torch.cuda.manual_seed(42)
 
-        manager = MHCBlockRecomputeManager()
+        manager = CheckpointManager()
 
         h = hidden_states_ckpt
         r = residual_ckpt
@@ -365,7 +365,7 @@ class TestMHCBlockRecomputeIntegration:
         # With manager - checkpoint everything except final output
         torch.manual_seed(42)
         torch.cuda.manual_seed(42)
-        manager = MHCBlockRecomputeManager()
+        manager = CheckpointManager()
         aggregated_ckpt, h_res_ckpt, h_post_ckpt = module.forward(
             hidden_states_ckpt, residual_ckpt, mhc_recompute_manager=manager
         )
@@ -404,7 +404,7 @@ class TestCheckpointWithoutOutputManager:
         """
         Test that CheckpointWithoutOutput auto-registers to manager when ckpt_manager is provided.
         """
-        manager = MHCBlockRecomputeManager()
+        manager = CheckpointManager()
         assert len(manager.checkpoints) == 0
 
         def simple_func(x):
@@ -424,7 +424,7 @@ class TestCheckpointWithoutOutputManager:
         """
         Test that discard_output_and_register_recompute is a no-op when ckpt_manager is set.
         """
-        manager = MHCBlockRecomputeManager()
+        manager = CheckpointManager()
 
         def simple_func(x):
             return x * 2

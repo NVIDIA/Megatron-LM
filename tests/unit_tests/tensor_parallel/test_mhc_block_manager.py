@@ -3,10 +3,7 @@
 import pytest
 import torch
 
-from megatron.core.tensor_parallel.random import (
-    BlockLevelCheckpointManager,  # backward compat alias
-)
-from megatron.core.tensor_parallel.random import CheckpointWithoutOutput, MHCBlockRecomputeManager
+from megatron.core.tensor_parallel.random import CheckpointWithoutOutput, CheckpointManager
 from tests.unit_tests.test_utilities import Utils
 
 
@@ -16,7 +13,7 @@ def test_checkpoint_without_output_with_ckpt_manager_auto_register():
     """
     Utils.initialize_model_parallel()
 
-    manager = MHCBlockRecomputeManager()
+    manager = CheckpointManager()
 
     def func(x):
         return x * 2 + 1
@@ -56,7 +53,7 @@ def test_checkpoint_without_output_discard_is_noop_with_manager():
     """
     Utils.initialize_model_parallel()
 
-    manager = MHCBlockRecomputeManager()
+    manager = CheckpointManager()
 
     def func1(x):
         return x * 2
@@ -144,7 +141,7 @@ def test_checkpoint_without_output_backward_compat():
 
 def test_mhc_block_recompute_manager():
     """
-    Test MHCBlockRecomputeManager with three sequential checkpoint functions.
+    Test CheckpointManager with three sequential checkpoint functions.
 
     This test verifies that:
     1. The manager correctly handles sequential checkpoints where each function's
@@ -182,8 +179,8 @@ def test_mhc_block_recompute_manager():
     loss_ref.backward()
     grad_ref = input_ref.grad.clone()
 
-    # With MHCBlockRecomputeManager using ckpt_manager parameter (simplified API)
-    manager = MHCBlockRecomputeManager()
+    # With CheckpointManager using ckpt_manager parameter (simplified API)
+    manager = CheckpointManager()
 
     # Using ckpt_manager parameter for auto-registration
     y1 = CheckpointWithoutOutput(ckpt_manager=manager).checkpoint(func1, input_ckpt)
@@ -233,7 +230,7 @@ def test_mhc_block_recompute_manager():
     torch.cuda.manual_seed(42)
 
     # With checkpoint manager using ckpt_manager parameter
-    manager2 = MHCBlockRecomputeManager()
+    manager2 = CheckpointManager()
 
     y1_2 = CheckpointWithoutOutput(ckpt_manager=manager2).checkpoint(func_with_dropout, input_ckpt2)
     y2_2 = CheckpointWithoutOutput(ckpt_manager=manager2).checkpoint(func2, y1_2)
@@ -257,7 +254,7 @@ def test_mhc_block_recompute_manager():
 
 def test_mhc_block_recompute_manager_with_multiple_outputs():
     """
-    Test MHCBlockRecomputeManager with functions that return multiple outputs.
+    Test CheckpointManager with functions that return multiple outputs.
     """
 
     def func_multi_output(x):
@@ -281,7 +278,7 @@ def test_mhc_block_recompute_manager_with_multiple_outputs():
     grad_ref = input_ref.grad.clone()
 
     # With manager using ckpt_manager parameter
-    manager = MHCBlockRecomputeManager()
+    manager = CheckpointManager()
 
     y1a, y1b = CheckpointWithoutOutput(ckpt_manager=manager).checkpoint(
         func_multi_output, input_ckpt
@@ -305,11 +302,11 @@ def test_mhc_block_recompute_manager_with_multiple_outputs():
 
 def test_mhc_block_recompute_manager_error_handling():
     """
-    Test error handling in MHCBlockRecomputeManager.
+    Test error handling in CheckpointManager.
     """
     Utils.initialize_model_parallel()
 
-    manager = MHCBlockRecomputeManager()
+    manager = CheckpointManager()
 
     # Test 1: Adding non-CheckpointWithoutOutput object should raise TypeError
     with pytest.raises(TypeError):
@@ -323,37 +320,10 @@ def test_mhc_block_recompute_manager_error_handling():
     Utils.destroy_model_parallel()
 
 
-def test_backward_compat_block_level_checkpoint_manager_alias():
-    """
-    Test that BlockLevelCheckpointManager alias works for backward compatibility.
-    """
-    # BlockLevelCheckpointManager should be an alias for MHCBlockRecomputeManager
-    assert BlockLevelCheckpointManager is MHCBlockRecomputeManager
-
-    Utils.initialize_model_parallel()
-
-    # Should work the same way with ckpt_manager parameter
-    manager = BlockLevelCheckpointManager()
-
-    def func(x):
-        return x * 2
-
-    input_t = torch.randn(4, 4, device='cuda', requires_grad=True)
-
-    y = CheckpointWithoutOutput(ckpt_manager=manager).checkpoint(func, input_t)
-
-    loss = y.sum()
-    manager.discard_all_outputs_and_register_unified_recompute(loss)
-    loss.backward()
-
-    assert input_t.grad is not None
-
-    Utils.destroy_model_parallel()
-
 
 def test_mhc_block_recompute_manager_partial_checkpoint():
     """
-    Test MHCBlockRecomputeManager with partial checkpointing.
+    Test CheckpointManager with partial checkpointing.
 
     This test verifies the real-world scenario where only some operations
     are checkpointed while others are not.
@@ -401,10 +371,10 @@ def test_mhc_block_recompute_manager_partial_checkpoint():
     loss_ref.backward()
     grad_ref = input_ref.grad.clone()
 
-    # ========== With MHCBlockRecomputeManager: partial checkpoint ==========
+    # ========== With CheckpointManager: partial checkpoint ==========
     input_ckpt = input_ref.detach().clone().requires_grad_(True)
 
-    manager = MHCBlockRecomputeManager()
+    manager = CheckpointManager()
 
     # Step 1: f is checkpointed (using ckpt_manager for auto-registration)
     b = CheckpointWithoutOutput(ckpt_manager=manager).checkpoint(func_f, input_ckpt)
@@ -441,7 +411,7 @@ def test_mhc_block_recompute_manager_partial_checkpoint():
 
 def test_mhc_block_recompute_manager_partial_checkpoint_with_tuple_output():
     """
-    Test MHCBlockRecomputeManager with partial checkpointing and tuple outputs.
+    Test CheckpointManager with partial checkpointing and tuple outputs.
 
     This more closely mimics HyperConnection's actual computation pattern:
 
@@ -507,11 +477,11 @@ def test_mhc_block_recompute_manager_partial_checkpoint_with_tuple_output():
     grad_x_ref = x_ref.grad.clone()
     grad_residual_ref = residual_ref.grad.clone()
 
-    # ========== With MHCBlockRecomputeManager using ckpt_manager ==========
+    # ========== With CheckpointManager using ckpt_manager ==========
     x_ckpt = x_ref.detach().clone().requires_grad_(True)
     residual_ckpt = residual_ref.detach().clone().requires_grad_(True)
 
-    manager = MHCBlockRecomputeManager()
+    manager = CheckpointManager()
 
     # Step 1: compute_mappings is checkpointed (returns tuple)
     h_pre, h_post, h_res = CheckpointWithoutOutput(ckpt_manager=manager).checkpoint(

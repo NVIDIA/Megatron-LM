@@ -23,7 +23,7 @@ from megatron.core.rerun_state_machine import (
     initialize_rerun_state_machine,
 )
 from megatron.core.transformer.custom_layers.batch_invariant_kernels import enable_batch_invariant_mode
-from megatron.core.utils import get_te_version, is_te_min_version, is_torch_min_version
+from megatron.core.utils import configure_nvtx_profiling, get_te_version, is_te_min_version, is_torch_min_version
 from megatron.legacy import fused_kernels
 from megatron.training import get_adlr_autoresume, get_args, get_tensorboard_writer
 from megatron.training.utils import print_rank_0, warn_rank_0
@@ -121,6 +121,12 @@ def initialize_megatron(
     if args.batch_invariant_mode:
         print_rank_0("Enabling batch invariant mode globally")
         enable_batch_invariant_mode()
+
+    # Enable NVTX range profiling when profiling is active.
+    # Must be done before model modules with @nvtx_decorator are imported,
+    # since the decorator captures _nvtx_enabled at decoration (import) time.
+    if args.profile:
+        configure_nvtx_profiling(True)
 
     # torch.distributed initialization
     def finish_mpu_init():

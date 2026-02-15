@@ -8,7 +8,7 @@ from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, Dict, Optional, Union
 
 if TYPE_CHECKING:
-    from megatron.core.tensor_parallel.random import MHCBlockRecomputeManager
+    from megatron.core.tensor_parallel.random import CheckpointManager
 
 import torch
 import torch.distributed
@@ -543,7 +543,7 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
         self-attention, cross-attention (if applicable), and feed-forward operations.
 
         Additional kwargs for MHC recompute:
-            mhc_recompute_manager: Optional MHCBlockRecomputeManager for checkpoint management.
+            mhc_recompute_manager: Optional CheckpointManager for checkpoint management.
             is_last_layer_in_recompute_block: If True, this layer is the last of recompute block.
                 Then he final MLP BDA will not be checkpointed.
         """
@@ -584,7 +584,7 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
         packed_seq_params: Optional[PackedSeqParams] = None,
         sequence_len_offset: Optional[Tensor] = None,
         padding_mask: Optional[Tensor] = None,
-        mhc_recompute_manager: Optional['MHCBlockRecomputeManager'] = None,
+        mhc_recompute_manager: Optional['CheckpointManager'] = None,
         *,
         inference_params: Optional[Any] = None,
     ):
@@ -798,7 +798,7 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
         hidden_states,
         inference_context=None,
         padding_mask=None,
-        mhc_recompute_manager: Optional['MHCBlockRecomputeManager'] = None,
+        mhc_recompute_manager: Optional['CheckpointManager'] = None,
         is_last_layer_in_recompute_block: bool = False,
     ):
         """
@@ -812,7 +812,7 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
                 Shape [bsz, seq_length]. True = padding (exclude), False = valid (include).
                 Only used for MoE layers to exclude padding tokens from aux loss computations.
                 The MoELayer will internally transform this to [seq_length, bsz] format.
-            mhc_recompute_manager: Optional MHCBlockRecomputeManager for checkpoint management.
+            mhc_recompute_manager: Optional CheckpointManager for checkpoint management.
             is_last_layer_in_recompute_block: If True, this layer is the last of recompute block.
                 Then the final MLP BDA will not be checkpointed.
 
@@ -968,7 +968,7 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
         self,
         mlp_output_with_bias,
         residual,
-        mhc_recompute_manager: Optional['MHCBlockRecomputeManager'] = None,
+        mhc_recompute_manager: Optional['CheckpointManager'] = None,
         is_last_layer_in_recompute_block: bool = False,
     ):
         """
@@ -977,7 +977,7 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
         Args:
             mlp_output_with_bias (Tensor): Output tensor of the MLP layer with bias.
             residual (Tensor): Residual tensor.
-            mhc_recompute_manager: Optional MHCBlockRecomputeManager for checkpoint management.
+            mhc_recompute_manager: Optional CheckpointManager for checkpoint management.
             is_last_layer_in_recompute_block: If True, this layer is the last of recompute block.
                 Then the final MLP BDA will not be checkpointed.
 
@@ -1048,7 +1048,7 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
         mlp_h_res,
         residual,
         mlp_hc_h_post,
-        mhc_recompute_manager: Optional['MHCBlockRecomputeManager'] = None,
+        mhc_recompute_manager: Optional['CheckpointManager'] = None,
         is_last_layer_in_recompute_block: bool = False,
     ):
         """
@@ -1061,7 +1061,7 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
             mlp_h_res (Tensor): [s, b, n, n] - residual mixing matrix from hyper connection.
             residual (Tensor): [s, b, n*C] - original residual (n-stream hidden states).
             mlp_hc_h_post (Tensor): [s, b, n] - expansion weights from hyper connection.
-            mhc_recompute_manager: Optional MHCBlockRecomputeManager for checkpoint management.
+            mhc_recompute_manager: Optional CheckpointManager for checkpoint management.
             is_last_layer_in_recompute_block: If True, this layer is the last of recompute block.
                 Then the final MLP BDA will not be checkpointed.
 

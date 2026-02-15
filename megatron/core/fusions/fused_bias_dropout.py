@@ -6,7 +6,7 @@ import torch
 from megatron.core.jit import jit_fuser
 
 if TYPE_CHECKING:
-    from megatron.core.tensor_parallel.random import MHCBlockRecomputeManager
+    from megatron.core.tensor_parallel.random import CheckpointManager
 
 # pylint: disable=missing-function-docstring
 
@@ -82,7 +82,7 @@ def bias_dropout_add_fused_inference(
 
 
 def get_bias_dropout_add(
-    training, fused, mhc_recompute_manager: Optional['MHCBlockRecomputeManager'] = None
+    training, fused, mhc_recompute_manager: Optional['CheckpointManager'] = None
 ):
     """
     Get the bias-dropout-add function.
@@ -90,7 +90,7 @@ def get_bias_dropout_add(
     Args:
         training: Whether in training mode.
         fused: Whether to use fused implementation.
-        mhc_recompute_manager: Optional MHCBlockRecomputeManager for checkpoint management.
+        mhc_recompute_manager: Optional CheckpointManager for checkpoint management.
             When provided, the returned function will wrap the BDA operation with
             CheckpointWithoutOutput for memory-efficient recomputation.
 
@@ -114,19 +114,19 @@ def get_bias_dropout_add(
         return bias_dropout_add_unfused(training)
 
 
-def _get_checkpointed_bda(training, fused, mhc_recompute_manager: 'MHCBlockRecomputeManager'):
+def _get_checkpointed_bda(training, fused, mhc_recompute_manager: 'CheckpointManager'):
     """
     Create a checkpointed bias-dropout-add function.
 
     This function handles:
     1. Tuple unpacking for x_with_bias (required because save_for_backward can't save tuples)
     2. Non-tensor arguments like dropout probability (handled by CheckpointWithoutOutput)
-    3. Auto-registration to the MHCBlockRecomputeManager
+    3. Auto-registration to the CheckpointManager
 
     Args:
         training: Whether in training mode.
         fused: Whether to use fused implementation.
-        mhc_recompute_manager: MHCBlockRecomputeManager for checkpoint management.
+        mhc_recompute_manager: CheckpointManager for checkpoint management.
 
     Returns:
         A callable that performs checkpointed bias-dropout-add operation.

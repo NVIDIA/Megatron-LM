@@ -691,7 +691,7 @@ class CheckpointWithoutOutputFunction(torch.autograd.Function):
         return (None, None) + grads
 
 
-class MHCBlockRecomputeManager:
+class CheckpointManager:
     """
     MHC (Manifold-Constrained Hyper-Connections) Block-Level Recompute Manager.
 
@@ -702,7 +702,7 @@ class MHCBlockRecomputeManager:
 
     Usage:
         # In TransformerBlock:
-        manager = MHCBlockRecomputeManager()
+        manager = CheckpointManager()
 
         # Pass manager to each layer's HyperConnection
         for layer in self.layers:
@@ -741,9 +741,6 @@ class MHCBlockRecomputeManager:
             ckpt._recompute(None)
 
 
-# Backward compatibility alias
-BlockLevelCheckpointManager = MHCBlockRecomputeManager
-
 
 class CheckpointWithoutOutput(object):
     """
@@ -765,7 +762,7 @@ class CheckpointWithoutOutput(object):
 
         Args:
             fp8: Whether to use FP8 mode. Defaults to False.
-            ckpt_manager: Optional MHCBlockRecomputeManager instance. When provided,
+            ckpt_manager: Optional CheckpointManager instance. When provided,
                          checkpoint() will auto-register to the manager, and
                          discard_output_and_register_recompute() will only discard
                          output without registering individual hooks.
