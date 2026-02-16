@@ -1659,9 +1659,6 @@ class DynamicInferenceContext(BaseInferenceContext):
         # For chunked continuations: already_allocated at [0:already], new at [already:...]
         new_block_start = already_allocated_blocks + num_matched_blocks
         if num_matched_blocks > 0:
-            matched_tensor = torch.tensor(
-                matched_block_ids, dtype=torch.int32, device=torch.cuda.current_device()
-            )
             self.request_to_kv_block_ids[current_id][0:num_matched_blocks] = matched_tensor
         if new_block_ids is not None:
             self.request_to_kv_block_ids[current_id][
@@ -1710,11 +1707,14 @@ class DynamicInferenceContext(BaseInferenceContext):
             # Start from the first non-matched block
             first_block_to_hash = max(previously_complete, num_matched_blocks)
 
-            for block_pos in range(first_block_to_hash, num_complete_blocks):
-                block_id = self.request_to_kv_block_ids[current_id][block_pos].item()
-                block_hash = req.precomputed_block_hashes[block_pos]
-                self.block_allocator.register_block_hash(block_id, block_hash)
-                self._blocks_pending_computation.append(block_id)
+            if first_block_to_hash < num_complete_blocks:
+                block_ids_to_hash = self.request_to_kv_block_ids[current_id][
+                    first_block_to_hash:num_complete_blocks
+                ].tolist()
+                for i, block_id in enumerate(block_ids_to_hash):
+                    block_hash = req.precomputed_block_hashes[first_block_to_hash + i]
+                    self.block_allocator.register_block_hash(block_id, block_hash)
+                    self._blocks_pending_computation.append(block_id)
 
         if self.is_hybrid_model and not is_chunked_prefill:
             # Allocate a slot for Mamba states
