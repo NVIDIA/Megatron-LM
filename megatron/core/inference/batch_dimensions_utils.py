@@ -9,6 +9,7 @@ and matching CUDA graph batch dimensions.
 """
 
 import math
+import os
 from dataclasses import dataclass
 from typing import List, Optional, Tuple
 
@@ -268,30 +269,48 @@ class CUDAGraphBatchDimensionBuilder:
             cuda_graph_max_tokens > 0
         ), f"cuda_graph_max_tokens must be > 0, got {cuda_graph_max_tokens}"
 
-        # Cuda graph step size.
-        cuda_graph_step_size = cuda_graph_max_tokens / num_cuda_graphs
-        cuda_graph_step_size = CUDAGraphBatchDimensionBuilder.CUDA_GRAPH_ROUNDER * int(
-            math.ceil(int(cuda_graph_step_size) / CUDAGraphBatchDimensionBuilder.CUDA_GRAPH_ROUNDER)
-        )
-        # Make sure divisible by TP size
-        cuda_graph_step_size = math.ceil(cuda_graph_step_size / tp_size) * tp_size
-
         # round down cuda graph max tokens to be multiple of TP size
         cuda_graph_max_tokens = (cuda_graph_max_tokens // tp_size) * tp_size
 
-        # Cuda graph token counts.
-        if num_cuda_graphs == 1:
-            cuda_graph_token_counts = [cuda_graph_max_tokens]
-        else:
-            cuda_graph_token_counts = list(
-                range(cuda_graph_step_size, cuda_graph_max_tokens, cuda_graph_step_size)
+        if os.environ.get("VLLM_CG_CALC", "0") == "1":
+            # vLLM-style capture sizes: dense at small counts, coarser at larger counts.
+            cuda_graph_token_counts = [1, 2, 4] + list(range(8, 256, 8)) + list(
+                range(256, cuda_graph_max_tokens + 1, 16)
             )
-            if (
-                len(cuda_graph_token_counts) == 0
-                or cuda_graph_token_counts[-1] != cuda_graph_max_tokens
-            ):
+            # Align each entry to TP size
+            cuda_graph_token_counts = list(dict.fromkeys(
+                math.ceil(s / tp_size) * tp_size for s in cuda_graph_token_counts
+            ))
+            # Clamp to max tokens
+            cuda_graph_token_counts = [s for s in cuda_graph_token_counts if s <= cuda_graph_max_tokens]
+            if not cuda_graph_token_counts or cuda_graph_token_counts[-1] != cuda_graph_max_tokens:
                 cuda_graph_token_counts.append(cuda_graph_max_tokens)
             cuda_graph_token_counts.reverse()
+        else:
+            # Default: evenly-spaced token counts.
+            # Cuda graph step size.
+            cuda_graph_step_size = cuda_graph_max_tokens / num_cuda_graphs
+            cuda_graph_step_size = CUDAGraphBatchDimensionBuilder.CUDA_GRAPH_ROUNDER * int(
+                math.ceil(
+                    int(cuda_graph_step_size) / CUDAGraphBatchDimensionBuilder.CUDA_GRAPH_ROUNDER
+                )
+            )
+            # Make sure divisible by TP size
+            cuda_graph_step_size = math.ceil(cuda_graph_step_size / tp_size) * tp_size
+
+            # Cuda graph token counts.
+            if num_cuda_graphs == 1:
+                cuda_graph_token_counts = [cuda_graph_max_tokens]
+            else:
+                cuda_graph_token_counts = list(
+                    range(cuda_graph_step_size, cuda_graph_max_tokens, cuda_graph_step_size)
+                )
+                if (
+                    len(cuda_graph_token_counts) == 0
+                    or cuda_graph_token_counts[-1] != cuda_graph_max_tokens
+                ):
+                    cuda_graph_token_counts.append(cuda_graph_max_tokens)
+                cuda_graph_token_counts.reverse()
 
         return cuda_graph_token_counts
 
