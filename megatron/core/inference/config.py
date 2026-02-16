@@ -81,6 +81,12 @@ class InferenceConfig:
         - uvm 1: buffer_size_gb + paused_buffer_size_gb
     """
 
+    mamba_memory_ratio: Optional[float] = None
+    """
+    Percentage of memory buffer to allocate for Mamba states. If not specified, allocates Mamba
+    state tensors for each KV cache block. Only used for hybrid models.
+    """
+
     max_requests: Optional[int] = None
     """
     Max number of active requests to use for decode-only forward passes.
