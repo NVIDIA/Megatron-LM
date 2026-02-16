@@ -1338,7 +1338,7 @@ class DynamicInferenceEngine(AbstractEngine):
             mem = torch.cuda.memory_stats()
             step_type = "decode" if context_state["is_decode_only"] else "non-decode"
             output_str = (
-                "* rank %d | step %d | %s ... time: %.3f%s ... "
+                "* rank %d | step %d | %s ... time: %.3f ms%s ... "
                 "reqs: a %d/%d, p %d, w %d, f %d, e %d ... "
                 "blocks: a %d/%d, p %d/%d ... "
                 "mem: tensors %d, alloc %.1f gb, res %.1f gb."
@@ -1346,7 +1346,7 @@ class DynamicInferenceEngine(AbstractEngine):
                     self.rank,
                     step_count,
                     datetime.now().strftime("%H:%M:%S"),
-                    step_time,
+                    step_time * 1000,
                     (
                         " [%s + real config %s + cuda graph %s]"
                         % (
