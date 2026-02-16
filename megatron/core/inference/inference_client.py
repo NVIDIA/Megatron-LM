@@ -217,6 +217,7 @@ class InferenceClient:
         """Sends a signal to pause all inference engines."""
         self._send_signal_to_engines(Headers.PAUSE)
         self._send_signal_to_engines(Headers.SUSPEND)
+        return self.paused.wait()
 
     def resume_engines(self):
         """Sends a signal to unpause all inference engines."""

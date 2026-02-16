@@ -162,7 +162,7 @@ class MegatronLocal(InferenceServer, ReturnsTokens, ReturnsRaw):
 
     async def suspend(self):
         if dist.get_rank() == 0:
-            await self._client.pause_engines()
+            await self._client.suspend_engines()
         await self._inference_engine.paused.wait()
         self._mark_for_recompute()
         self._inference_engine.suspend()
@@ -179,7 +179,7 @@ class MegatronLocal(InferenceServer, ReturnsTokens, ReturnsRaw):
 
     async def resume(self):
         if dist.get_rank() == 0:
-            self._client.unpause_engines()
+            self._client.resume_engines()
         await self._inference_engine.running.wait()
         self._inference_engine.resume()
 
