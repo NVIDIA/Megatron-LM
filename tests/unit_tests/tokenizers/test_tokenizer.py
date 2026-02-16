@@ -8,8 +8,8 @@ from megatron.core.tokenizers import MegatronTokenizer
 
 try:
     from megatron.core.tokenizers.text.libraries.huggingface_tokenizer import (
-        HuggingFaceTokenizer,
         HAVE_TRANSFORMERS,
+        HuggingFaceTokenizer,
     )
 except Exception:
     HAVE_TRANSFORMERS = False
