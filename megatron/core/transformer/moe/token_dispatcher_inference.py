@@ -27,7 +27,7 @@ from megatron.core.transformer.moe.inference_kernels import (
 from megatron.core.tensor_parallel import gather_from_sequence_parallel_region
 from megatron.core.parallel_state import get_global_symmetric_memory_buffer_ep
 from megatron.core.inference.communication.torch_symm_triton import (
-    multimem_all_gather,
+    multimem_all_gather_3,
     multimem_reduce_scatter,
 )
 
@@ -207,30 +207,21 @@ class InferenceAllGatherTokenDispatcher(MoEAllGatherTokenDispatcher):
             probs_dtype = probs.dtype
             hidden_dtype = hidden_states.dtype
 
-            # Use latency-optimized NVLS all-gather for routing_map, probs and hidden_states
-            # Pass byte_offset so kernel writes to correct location in multicast buffer
-            multimem_all_gather(
+            # Fused NVLS all-gather: single kernel launch + single barrier for all 3 tensors
+            multimem_all_gather_3(
                 ag_buffers["routing_map"].view(torch.bfloat16),
                 self.routing_map.view(torch.bfloat16),
-                ag_buffers["handle"],
-                byte_offset=ag_buffers["routing_map_offset"],
-            )
-            self.routing_map = ag_buffers["routing_map"].view(routing_map_dtype).view(global_tokens, topk)
-
-            multimem_all_gather(
+                ag_buffers["routing_map_offset"],
                 ag_buffers["probs"].view(torch.bfloat16),
                 probs.view(torch.bfloat16),
-                ag_buffers["handle"],
-                byte_offset=ag_buffers["probs_offset"],
-            )
-            probs = ag_buffers["probs"].view(probs_dtype).view(global_tokens, topk)
-
-            multimem_all_gather(
+                ag_buffers["probs_offset"],
                 ag_buffers["hidden_states"].view(torch.bfloat16),
                 hidden_states.view(torch.bfloat16),
+                ag_buffers["hidden_states_offset"],
                 ag_buffers["handle"],
-                byte_offset=ag_buffers["hidden_states_offset"],
             )
+            self.routing_map = ag_buffers["routing_map"].view(routing_map_dtype).view(global_tokens, topk)
+            probs = ag_buffers["probs"].view(probs_dtype).view(global_tokens, topk)
             hidden_states = ag_buffers["hidden_states"].view(hidden_dtype).view(global_tokens, hidden_dim)
         else:
             # Fallback to NCCL for all tensors

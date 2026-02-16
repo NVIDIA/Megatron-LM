@@ -137,6 +137,126 @@ def multimem_all_gather(
     return output_tensor
 
 
+# ── Fused 3-tensor all-gather ───────────────────────────────────────────────
+# Processes routing_map, probs, and hidden_states in a single kernel launch
+# with a single barrier, eliminating 2 kernel launches + 2 barriers.
+
+
+@triton.jit
+def _ag_phase(local_ptr, multicast_ptr, byte_offset, numel, BLOCK_SIZE, NUMEL_PER_THREAD, RANK, WORLD_SIZE):
+    """One all-gather phase: load from local memory, multicast-store to symmetric buffer."""
+    pid = tl.program_id(axis=0)
+    tid = get_flat_tid()
+
+    numel_128 = numel // NUMEL_PER_THREAD
+    numel_per_rank = tl.cdiv(numel_128, WORLD_SIZE)
+    block_start = pid * BLOCK_SIZE
+
+    while block_start < numel_per_rank:
+        offsets = block_start + tid
+        mask = offsets < numel_per_rank
+
+        multicast_ptrs = (
+            multicast_ptr.to(tl.pointer_type(tl.uint64))
+            + byte_offset // 8
+            + (RANK * numel_per_rank + offsets) * 2
+        )
+        local_ptrs = local_ptr.to(tl.pointer_type(tl.uint64)) + offsets * 2
+        (x, y, z, w) = ld_128(local_ptrs, mask=mask, multicast_op=False)
+        st_128(multicast_ptrs, x, y, z, w, mask=mask, multicast_op=True)
+
+        block_start += tl.num_programs(axis=0) * BLOCK_SIZE
+
+
+@triton.jit
+def _multimem_all_gather_3_kernel(
+    local_ptr_0, local_ptr_1, local_ptr_2,
+    multicast_ptr,
+    signal_pad_ptrs,
+    numel_0, byte_offset_0,
+    numel_1, byte_offset_1,
+    numel_2, byte_offset_2,
+    BLOCK_SIZE: tl.constexpr,
+    NUMEL_PER_THREAD: tl.constexpr,
+    RANK: tl.constexpr,
+    WORLD_SIZE: tl.constexpr,
+):
+    """
+    Fused 3-tensor multicast all-gather. Processes three tensors in sequence
+    then synchronizes once, eliminating 2 kernel launches and 2 barriers
+    compared to three separate multimem_all_gather calls.
+    """
+    # Phase 1: routing_map
+    _ag_phase(local_ptr_0, multicast_ptr, byte_offset_0, numel_0,
+              BLOCK_SIZE, NUMEL_PER_THREAD, RANK, WORLD_SIZE)
+
+    # Phase 2: probs
+    _ag_phase(local_ptr_1, multicast_ptr, byte_offset_1, numel_1,
+              BLOCK_SIZE, NUMEL_PER_THREAD, RANK, WORLD_SIZE)
+
+    # Phase 3: hidden_states
+    _ag_phase(local_ptr_2, multicast_ptr, byte_offset_2, numel_2,
+              BLOCK_SIZE, NUMEL_PER_THREAD, RANK, WORLD_SIZE)
+
+    # Single barrier for all three tensors
+    sync_threads()
+    symm_mem_sync(
+        signal_pad_ptrs,
+        None,
+        RANK,
+        WORLD_SIZE,
+        hasPreviousMemAccess=True,
+        hasSubsequentMemAccess=True,
+    )
+
+
+def multimem_all_gather_3(
+    output_0: torch.Tensor, input_0: torch.Tensor, byte_offset_0: int,
+    output_1: torch.Tensor, input_1: torch.Tensor, byte_offset_1: int,
+    output_2: torch.Tensor, input_2: torch.Tensor, byte_offset_2: int,
+    symm_mem_hdl: _SymmetricMemory,
+    **kwargs,
+) -> None:
+    """
+    Fused 3-tensor multicast all-gather. Equivalent to calling multimem_all_gather
+    three times but with a single kernel launch and a single barrier.
+
+    All tensors must share the same symmetric memory handle and be BF16.
+    """
+    assert HAVE_TRITON, "Triton is required for multimem all-gather."
+
+    config = {
+        "max_num_blocks": kwargs.get("max_num_blocks", 128),
+        "num_warps": kwargs.get("num_warps", 32),
+        "BLOCK_SIZE": kwargs.get("BLOCK_SIZE", 1024),
+    }
+
+    numel_per_thread = 128 // (input_0.element_size() * 8)
+
+    assert output_0.numel() % numel_per_thread == 0, "Tensor 0 must be 128-bit aligned."
+    assert output_1.numel() % numel_per_thread == 0, "Tensor 1 must be 128-bit aligned."
+    assert output_2.numel() % numel_per_thread == 0, "Tensor 2 must be 128-bit aligned."
+
+    # Size grid to the largest tensor
+    max_numel = max(output_0.numel(), output_1.numel(), output_2.numel())
+    num_threads = triton.cdiv(max_numel // numel_per_thread, symm_mem_hdl.world_size)
+    num_blocks = min(triton.cdiv(num_threads, config["BLOCK_SIZE"]), config["max_num_blocks"])
+
+    _multimem_all_gather_3_kernel[(num_blocks, 1, 1)](
+        input_0.data_ptr(), input_1.data_ptr(), input_2.data_ptr(),
+        symm_mem_hdl.multicast_ptr,
+        symm_mem_hdl.signal_pad_ptrs_dev,
+        numel_0=output_0.numel(), byte_offset_0=byte_offset_0,
+        numel_1=output_1.numel(), byte_offset_1=byte_offset_1,
+        numel_2=output_2.numel(), byte_offset_2=byte_offset_2,
+        BLOCK_SIZE=config["BLOCK_SIZE"],
+        NUMEL_PER_THREAD=numel_per_thread,
+        RANK=symm_mem_hdl.rank,
+        WORLD_SIZE=symm_mem_hdl.world_size,
+        num_warps=config["num_warps"],
+    )
+
+
 @triton.jit
 def _multimem_reduce_scatter_kernel(
     local_ptr,
