@@ -330,8 +330,7 @@ class TestMambaMetadata:
 
         assert metadata_context.batch_indices_chunked_prefill[0] == 1
 
-        # With chunked prefill, batch_indices_prefill is sliced to strictly active regular prefills.
-        expected_prefill = torch.tensor([2], dtype=torch.int32, device=metadata_context.device)
+        expected_prefill = torch.tensor([2, -1], dtype=torch.int32, device=metadata_context.device)
         assert torch.equal(metadata_context.batch_indices_prefill, expected_prefill)
 
         expected_device_counts = torch.tensor(
@@ -339,9 +338,8 @@ class TestMambaMetadata:
         )
         assert torch.equal(metadata_context.device_decode_prefill, expected_device_counts)
 
-        # With chunked prefill, cu_seqlens is sliced to strictly active regular prefills (+1).
         expected_cu_seqlens = torch.tensor(
-            [0, 10], dtype=torch.int32, device=metadata_context.device
+            [0, 10, 10], dtype=torch.int32, device=metadata_context.device
         )
         assert torch.equal(metadata_context.cu_seqlens, expected_cu_seqlens)
 
@@ -373,8 +371,7 @@ class TestMambaMetadata:
 
         assert metadata_context.batch_indices_chunked_prefill[0] == 2
 
-        # With chunked prefill, batch_indices_prefill is sliced to strictly active regular prefills.
-        expected_prefill = torch.tensor([3], dtype=torch.int32, device=metadata_context.device)
+        expected_prefill = torch.tensor([3, -1], dtype=torch.int32, device=metadata_context.device)
         assert torch.equal(metadata_context.batch_indices_prefill, expected_prefill)
 
         expected_device_counts = torch.tensor(
@@ -382,8 +379,7 @@ class TestMambaMetadata:
         )
         assert torch.equal(metadata_context.device_decode_prefill, expected_device_counts)
 
-        # With chunked prefill, cu_seqlens is sliced.
-        expected_cu = torch.tensor([0, 10], dtype=torch.int32, device=metadata_context.device)
+        expected_cu = torch.tensor([0, 10, 10], dtype=torch.int32, device=metadata_context.device)
         assert torch.equal(metadata_context.cu_seqlens, expected_cu)
 
         expected_seq_idx = torch.full(
@@ -411,11 +407,18 @@ class TestMambaMetadata:
 
         assert metadata_context.batch_indices_chunked_prefill[0] == 0
 
-        # Regular prefill metadata should not be set if chunked prefill is
-        # enabled without any regular prefill requests
-        assert metadata_context.batch_indices_prefill is None
-        assert metadata_context.cu_seqlens is None
-        assert metadata_context.seq_idx is None
+        expected_prefill = torch.tensor([-1, -1], dtype=torch.int32, device=metadata_context.device)
+        assert torch.equal(metadata_context.batch_indices_prefill, expected_prefill)
+
+        expected_cu_seqlens = torch.tensor(
+            [0, 0, 0], dtype=torch.int32, device=metadata_context.device
+        )
+        assert torch.equal(metadata_context.cu_seqlens, expected_cu_seqlens)
+
+        expected_seq_idx = torch.full(
+            (1, 128), -1, dtype=torch.int32, device=metadata_context.device
+        )
+        assert torch.equal(metadata_context.seq_idx, expected_seq_idx)
 
         expected_device_chunked_prefill = torch.tensor(
             [100, 0], dtype=torch.int32, device=metadata_context.device
