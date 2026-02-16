@@ -33,8 +33,10 @@ def temp_log_level(level, logger=None):
 
 
 @trace_async_exceptions
-async def run_flask_server(coordinator_addr: str, tokenizer, rank: int, flask_port: int):
-    """Initializes and runs the async Flask server."""
+async def run_flask_server_on_client(
+    client: InferenceClient, tokenizer, flask_port: int, parsers: list[str] = None
+):
+    """Initializes and runs the async Flask server using the provided InferenceClient."""
     if not HAS_FLASK:
         raise RuntimeError(f"Flask not available")
 
@@ -44,15 +46,12 @@ async def run_flask_server(coordinator_addr: str, tokenizer, rank: int, flask_po
         logger.warning(f"Could not get hostname: {e}")
         hostname = "0.0.0.0"
 
-    inference_client = InferenceClient(coordinator_addr)
-    await inference_client.start()
-    logger.info(f"Rank {rank}: InferenceClient connected.")
-
     app = Flask(__name__)
 
     # Store client and tokenizer in app config for Blueprints to use
-    app.config['client'] = inference_client
+    app.config['client'] = client
     app.config['tokenizer'] = tokenizer
+    app.config['parsers'] = parsers
 
     # Register all blueprints from the 'endpoints' package
     for endpoint in endpoints.__all__:
@@ -68,9 +67,23 @@ async def run_flask_server(coordinator_addr: str, tokenizer, rank: int, flask_po
     # Force logging level to INFO to ensure that hostname is printed
     with temp_log_level(logging.INFO, logger):
         logger.info(f"Starting Flask server on http://{hostname}:{flask_port}")
+        logger.info(f"Using tokenizer: {type(tokenizer)}")
+        logger.info(f"Using parsers: {parsers}")
 
+    await serve(app, config)
+
+
+@trace_async_exceptions
+async def run_flask_server(
+    coordinator_addr: str, tokenizer, rank: int, flask_port: int, parsers: list[str] = None
+):
+    """Initializes and runs the async Flask server
+    starting an InferenceClient with the provided coordinator address."""
+    inference_client = InferenceClient(coordinator_addr)
+    await inference_client.start()
+    logger.info(f"Rank {rank}: InferenceClient connected.")
     try:
-        await serve(app, config)
+        await run_flask_server_on_client(inference_client, tokenizer, flask_port, parsers)
     finally:
         await inference_client.stop()
         logger.info(f"Rank {rank}: Flask server and client shut down.")
