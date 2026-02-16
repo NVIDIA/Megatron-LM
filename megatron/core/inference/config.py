@@ -95,6 +95,12 @@ class InferenceConfig:
         - uvm 1: buffer_size_gb + paused_buffer_size_gb
     """
 
+    mamba_memory_ratio: Optional[float] = None
+    """
+    Percentage of memory buffer to allocate for Mamba states. If not specified, allocates Mamba
+    state tensors for each KV cache block. Only used for hybrid models.
+    """
+
     max_requests: Optional[int] = None
     """
     Max number of active requests to use for decode-only forward passes.
@@ -186,6 +192,13 @@ class InferenceConfig:
     """
     Whether to track paused request events. If True, `add_event_pause()` is called on
     requests when they are paused during bookkeeping.
+    """
+
+    track_generated_token_events: bool = False
+    """
+    Whether to track per-token events with timestamps for each generated token.
+    When enabled, each generated token creates a GENERATED_TOKEN event with a
+    timestamp, useful for per-token latency analysis.
     """
 
     metrics_writer: Optional["WandbModule"] = None

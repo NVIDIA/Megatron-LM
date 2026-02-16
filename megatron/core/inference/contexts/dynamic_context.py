@@ -35,6 +35,7 @@ from .attention_context.mamba_metadata import MambaMetadata
 from .attention_context.mha_metadata import GraphedMHAMetadata, NonGraphedMHAMetadata
 from .base_context import BaseInferenceContext
 from .dynamic_block_allocator import BlockAllocator
+from .routing_metadata import RoutingMetadata
 
 try:
     from .fused_kv_append_kernel import triton_append_key_value_cache
@@ -385,13 +386,33 @@ class DynamicInferenceContext(BaseInferenceContext):
             if inference_config.paused_buffer_size_gb is None
             else int(inference_config.paused_buffer_size_gb * 1024**3)
         )
-        # TODO: Add parameter to control fraction of memory assigned to KV cache
-        # versus Mamba state.
-        block_count = buffer_size_bytes // (self.block_size_bytes + mamba_states_memory_per_request)
-        block_count = max(2, block_count)  # need >= 1 active block + 1 dummy block
-        paused_block_count = paused_buffer_size_bytes // (
-            self.block_size_bytes + mamba_states_memory_per_request
-        )
+
+        mamba_max_requests = float('inf')
+
+        if (mamba_memory_ratio := inference_config.mamba_memory_ratio) is not None:
+            assert self.is_hybrid_model
+            assert mamba_memory_ratio > 0 and mamba_memory_ratio < 1
+
+            # Calculate total memory before partition
+            total_memory = buffer_size_bytes + paused_buffer_size_bytes
+            mamba_memory_bytes = total_memory * mamba_memory_ratio
+            mamba_max_requests = int(mamba_memory_bytes // mamba_states_memory_per_request)
+
+            # Reduce buffer sizes for KV cache
+            buffer_size_bytes = int(buffer_size_bytes * (1.0 - mamba_memory_ratio))
+            paused_buffer_size_bytes = int(paused_buffer_size_bytes * (1.0 - mamba_memory_ratio))
+
+            block_count = buffer_size_bytes // self.block_size_bytes
+            block_count = max(2, block_count)  # need >= 1 active block + 1 dummy block
+            paused_block_count = paused_buffer_size_bytes // self.block_size_bytes
+        else:
+            block_count = buffer_size_bytes // (
+                self.block_size_bytes + mamba_states_memory_per_request
+            )
+            block_count = max(2, block_count)  # need >= 1 active block + 1 dummy block
+            paused_block_count = paused_buffer_size_bytes // (
+                self.block_size_bytes + mamba_states_memory_per_request
+            )
 
         # If using pipeline parallelism synchronize the total block count in case the
         # pipeline stages have different layer allocations. Non-uniform block counts
@@ -450,11 +471,20 @@ class DynamicInferenceContext(BaseInferenceContext):
         if inference_config.max_requests is None:
             # Maximize compute utilization by defaulting to 1 block per request.
             self.max_requests = self.block_allocator.total_count - 1  # -1 for dummy block
+
+            # Adjust max_requests for Mamba memory constraints if necessary
+            if self.is_hybrid_model and mamba_max_requests < self.max_requests:
+                self.max_requests = int(mamba_max_requests)
+
             self.max_requests = self.max_requests // tp_size * tp_size
             self.max_requests = self.max_requests // self.REQUEST_ROUNDER * self.REQUEST_ROUNDER
         else:
             # User can control request overflow via max_requests.
             self.max_requests = inference_config.max_requests
+
+        assert (
+            self.max_requests % tp_size == 0
+        ), f"max_requests must be divisible by tp_size ({tp_size}), but got {self.max_requests}"
 
         self.max_tokens = inference_config.max_tokens or self.DEFAULT_MAX_TOKENS
 
@@ -470,6 +500,7 @@ class DynamicInferenceContext(BaseInferenceContext):
         self.graph_attn_metadata = {}
         self.non_graph_attn_metadata = {}
         self.active_attn_metadata = None
+        self.is_creating_cuda_graphs = False
 
         self.graph_attn_metadata["mha_metadata"] = GraphedMHAMetadata(
             block_count_total=self.block_allocator.total_count,
@@ -486,6 +517,13 @@ class DynamicInferenceContext(BaseInferenceContext):
             block_size_tokens=self.block_size_tokens,
             max_seqlen=self.max_sequence_length,
         )
+
+        self.moe_enable_routing_replay = model_config.moe_enable_routing_replay
+        if self.moe_enable_routing_replay:
+            assert (
+                model_config.num_moe_experts is not None
+            ), "Router recording/replay requested but no MoE experts specified!"
+            self.moe_routing_metadata = RoutingMetadata(self, model_config.moe_router_topk)
 
         # CUDA graph config list
         self.use_cuda_graphs_for_non_decode_steps = (
@@ -506,8 +544,8 @@ class DynamicInferenceContext(BaseInferenceContext):
 
         self._using_cuda_graph_this_step = False
         # Deal with chunked prefill
+        self.enable_chunked_prefill = inference_config.enable_chunked_prefill
         self.chunked_prefill_request_id = -1
-        self.has_explicit_chunked_prefill_req = False
 
         # FlashInfer.
         if inference_config.use_flashinfer_fused_rope is True:
@@ -1233,15 +1271,16 @@ class DynamicInferenceContext(BaseInferenceContext):
         Return:
             None.
         """
-        # if in recording mode, add dummy requests for cuda graph capture
-        if construct_graph_dimensions is not None:
+        self.is_creating_cuda_graphs = construct_graph_dimensions is not None
+
+        # If in CUDA graph creation mode, add dummy requests for CUDA graph capture
+        if self.is_creating_cuda_graphs:
             self.add_dummy_requests_for_cudagraph_capture(construct_graph_dimensions)
 
         batch_dimensions = InferenceBatchDimensions(
             token_count=self.active_token_count,
             prefill_req_count=self.num_prefill_requests,
             decode_req_count=self.num_decode_requests,
-            has_explicit_chunked_prefill_req=self.has_explicit_chunked_prefill_req,
         )
         self.batch_dimensions = batch_dimensions
         best_graph = CUDAGraphBatchDimensionBuilder.match_graph_config(
@@ -1249,6 +1288,7 @@ class DynamicInferenceContext(BaseInferenceContext):
             self.cuda_graph_batch_dimensions_list,
             strict=self.is_hybrid_model,
             decode_only_cuda_graphs=(not self.use_cuda_graphs_for_non_decode_steps),
+            explicit_chunked_prefill=self.is_chunked_prefill_enabled() and self.is_hybrid_model,
             ep_group=self.expert_model_parallel_group,
         )
         self._using_cuda_graph_this_step = best_graph is not None
@@ -1276,7 +1316,6 @@ class DynamicInferenceContext(BaseInferenceContext):
                 token_count=padded_token_count,
                 prefill_req_count=padded_prefill_req_count,
                 decode_req_count=padded_decode_req_count,
-                has_explicit_chunked_prefill_req=self.has_explicit_chunked_prefill_req,
             )
         self.padded_active_token_count = self.padded_batch_dimensions.token_count
         self.padded_active_request_count = self.padded_batch_dimensions.req_count
@@ -1307,8 +1346,6 @@ class DynamicInferenceContext(BaseInferenceContext):
 
         attn_dimensions = batch_dimensions
         if self.using_cuda_graph_this_step():
-            assert not self.has_explicit_chunked_prefill_req
-
             # Treat some decode requests as prefill requests to fit the cuda graph batch dimension.
             if batch_dimensions.decode_req_count > self.padded_batch_dimensions.decode_req_count:
                 total_req = batch_dimensions.req_count
@@ -1318,7 +1355,6 @@ class DynamicInferenceContext(BaseInferenceContext):
                     token_count=batch_dimensions.token_count,
                     prefill_req_count=adjusted_prefill_req_count,
                     decode_req_count=adjusted_decode_req_count,
-                    has_explicit_chunked_prefill_req=False,
                 )
 
         assert self.active_attn_metadata is not None
@@ -1342,7 +1378,14 @@ class DynamicInferenceContext(BaseInferenceContext):
                 cu_seqlens,
                 batch_dimensions=attn_dimensions,
                 padded_batch_dimensions=self.padded_batch_dimensions,
+                enable_chunked_prefill=self.is_chunked_prefill_enabled(),
             )
+
+        if self.moe_enable_routing_replay:
+            if self.using_cuda_graph_this_step():
+                self.moe_routing_metadata.enable_static_buffer_recording()
+            else:
+                self.moe_routing_metadata.disable_static_buffer_recording()
 
     def reset(self) -> None:
         """Reset entire context.
@@ -1398,9 +1441,9 @@ class DynamicInferenceContext(BaseInferenceContext):
 
         # Reset chunked prefill state
         self.chunked_prefill_request_id = -1
-        self.has_explicit_chunked_prefill_req = False
         self.num_prefill_requests = 0
         self._using_cuda_graph_this_step = False
+        self.is_creating_cuda_graphs = False
         self.padded_batch_dimensions = InferenceBatchDimensions(
             token_count=0, prefill_req_count=0, decode_req_count=0
         )
@@ -1458,9 +1501,12 @@ class DynamicInferenceContext(BaseInferenceContext):
         """
         Check if the request can be added to the context.
         """
+        # Note that for hybrid models checking the total request count is sufficient
+        # because we allocate a single set of Mamba state tensors for each request
         request_can_be_added = (
             self.total_request_count < self.max_requests and self.paused_request_count == 0
         )
+
         request_tokens_can_be_added = (
             self.active_token_count + req.remaining_prompt_length <= self.max_tokens
         )
@@ -1665,6 +1711,12 @@ class DynamicInferenceContext(BaseInferenceContext):
             (int) Index of the chunked prefill request, or -1 if none exists.
         """
         return torch.where(self.request_ids == self.chunked_prefill_request_id)[0][0]
+
+    def is_chunked_prefill_enabled(self) -> bool:
+        """Returns whether chunked prefill is enabled."""
+        if self.is_hybrid_model:
+            return self.enable_chunked_prefill and not self.is_creating_cuda_graphs
+        return self.enable_chunked_prefill
 
     def release_memory_blocks_from_request_indexes(self, request_indexes) -> None:
         """Release memory blocks used by the given request idxs.
@@ -1926,7 +1978,6 @@ class DynamicInferenceContext(BaseInferenceContext):
             active_requests_mask[-1] = (
                 1  # must keep this, next iteration will add a new chunk to it
             )
-        self.has_explicit_chunked_prefill_req = False
 
         active_request_count = (active_requests_mask == 1).sum().item()
         finished_request_count = (active_requests_mask == 0).sum().item()
