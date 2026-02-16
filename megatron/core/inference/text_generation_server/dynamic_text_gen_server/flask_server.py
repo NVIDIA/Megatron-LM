@@ -93,9 +93,7 @@ async def run_flask_server(
     await inference_client.start()
     logger.info(f"Rank {rank}: InferenceClient connected.")
     try:
-        await run_flask_server_on_client(
-            inference_client, tokenizer, flask_port, parsers, verbose
-        )
+        await run_flask_server_on_client(inference_client, tokenizer, flask_port, parsers, verbose)
     finally:
         await inference_client.stop()
         logger.info(f"Rank {rank}: Flask server and client shut down.")
