@@ -181,6 +181,10 @@ class BlockAllocator:
                 zero_mask = self.block_ref_counts[blocks] == 0
                 if zero_mask.any():
                     self._deregister_blocks(blocks[zero_mask])
+        else:
+            num_blocks = blocks.numel()
+            self.block_bag[self.total_avail : self.total_avail + num_blocks] = blocks
+            self.total_avail += num_blocks
 
     def reset(self) -> None:
         """Reset the allocator to initial state.
