@@ -62,6 +62,7 @@ def set_rounder(value):
     DynamicInferenceContext.TOKEN_ROUNDER = value
     DynamicInferenceContext.REQUEST_ROUNDER = value
 
+
 def mock_forward(input_ids, position_ids, attention_mask, *args, **kwargs):
     """Mock forward function to avoid numerics issues with random inputs."""
     return torch.randn(
@@ -71,6 +72,7 @@ def mock_forward(input_ids, position_ids, attention_mask, *args, **kwargs):
         device=input_ids.device,
         dtype=torch.bfloat16,
     )
+
 
 @dataclass
 class DynamicEngineTestConfig:
@@ -1462,8 +1464,9 @@ class TestDynamicInferenceEngine:
         env.engine.schedule_waiting_requests()
         env.engine.step_modern()
 
-        assert req.finished_chunk_token_count == 256, \
-            f"Step 1: Expected 256 tokens processed, got {req.finished_chunk_token_count}"
+        assert (
+            req.finished_chunk_token_count == 256
+        ), f"Step 1: Expected 256 tokens processed, got {req.finished_chunk_token_count}"
 
         # --- Step 2 ---
         # Available: 256. Remaining un-prefilled: 257.
@@ -1473,10 +1476,11 @@ class TestDynamicInferenceEngine:
         env.engine.step_modern()
 
         # 256 (previous) + 255 (this step) = 511
-        assert req.finished_chunk_token_count == 511, \
-            "Step 2: Expected 511 tokens processed (256+255), " \
-            f"got {req.finished_chunk_token_count}. " \
+        assert req.finished_chunk_token_count == 511, (
+            "Step 2: Expected 511 tokens processed (256+255), "
+            f"got {req.finished_chunk_token_count}. "
             "If 512, the edge case fix failed."
+        )
 
         # --- Step 3 ---
         # Remaining un-prefilled: 2. Available: 256.
@@ -1485,8 +1489,9 @@ class TestDynamicInferenceEngine:
         env.engine.step_modern()
 
         # 511 (previous) + 2 (this step) = 513
-        assert req.finished_chunk_token_count == 513, \
-            f"Step 3: Expected 513 tokens processed, got {req.finished_chunk_token_count}"
+        assert (
+            req.finished_chunk_token_count == 513
+        ), f"Step 3: Expected 513 tokens processed, got {req.finished_chunk_token_count}"
 
         # Verify request finishes prefill and enters decode
         assert ctx.num_prefill_requests == 0
