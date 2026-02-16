@@ -1569,6 +1569,10 @@ def _add_inference_args(parser):
                        'the dynamic inference context. Active requests are '
                        'paused when there are not enough active blocks available '
                        'to continue generating a request.')
+    group.add_argument('--inference-dynamic-batching-mamba-memory-ratio', type=float, default=None,
+                       help='Percentage of memory buffer to allocate for Mamba states. '
+                       'If not specified, allocates Mamba state tensors for each KV cache block. '
+                       'Only used for hybrid models.')
     group.add_argument('--inference-dynamic-batching-block-size',
                        type=int, default=256,
                        help='KV cache block size. '
@@ -1593,6 +1597,11 @@ def _add_inference_args(parser):
                        help='Track paused request ids by adding \'paused\' events '
                        'to each request\'s event history. This has a very minor '
                        'impact on latency.')
+    group.add_argument('--inference-dynamic-batching-track-generated-token-events',
+                       action='store_true',
+                       help='Track per-token events with timestamps for each generated token. '
+                       'When enabled, each generated token creates a GENERATED_TOKEN event '
+                       'with a timestamp, useful for per-token latency analysis.')
     group.add_argument('--decode-only-cuda-graphs',
                        action='store_true', default=False,
                        help='Only use cuda graphs for decode-only steps, not prefill and mixed steps.')
@@ -1982,12 +1991,6 @@ def _add_rl_args(parser):
                        help="Entropy term weight in GRPO loss.")
     group.add_argument('--grpo-filter-groups-with-same-reward', action='store_true',
                        help="Filter groups with same reward.")
-    group.add_argument('--langrl-inference-server-type', type=str,
-                       choices=['inplace_megatron', 'inplace_megatron_chat'], default='inplace_megatron',
-                       help="Type of inference server to use.")
-    group.add_argument('--langrl-inference-server-conversation-template', type=str, default=None,
-                       help="Conversation template, if using a chat server.")
-    group.add_argument('--langrl-external-server', action=argparse.BooleanOptionalAction, required=False, default=False)
     group.add_argument('--langrl-env-config', type=str, default=None,
                        help="Path to YAML config file for RL environment configuration.")
     group.add_argument('--rl-default-temperature', type=float, default=1.0,
