@@ -1,7 +1,9 @@
 # Copyright (c) 2025, NVIDIA CORPORATION. All rights reserved.
 
+import asyncio
 import logging
 import socket
+from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
 
 try:
@@ -60,6 +62,9 @@ async def run_flask_server_on_client(
     @app.route('/')
     def health_check():
         return "Megatron Dynamic Inference Server is running."
+
+    loop = asyncio.get_event_loop()
+    loop.set_default_executor(ThreadPoolExecutor(max_workers=4096))
 
     config = Config()
     config.bind = [f"0.0.0.0:{flask_port}"]
