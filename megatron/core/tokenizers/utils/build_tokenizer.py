@@ -29,7 +29,7 @@ def build_tokenizer(args, **kwargs):
             kwargs = special_tokens
         kwargs['vocab_file'] = args.vocab_file
         kwargs['merges_file'] = args.merge_file
-        kwargs['use_fast'] = not args.tokenizer_no_hf_use_fast
+        kwargs['use_fast'] = not args.tokenizer_hf_no_use_fast
         kwargs['trust_remote_code'] = args.trust_remote_code
         kwargs['include_special_tokens'] = not args.tokenizer_hf_no_include_special_tokens
     elif args.tokenizer_type in SP_TOKENIZERS:
