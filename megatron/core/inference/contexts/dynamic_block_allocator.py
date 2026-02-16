@@ -301,14 +301,14 @@ class BlockAllocator:
             return
         self.block_timestamps[block_ids] = self.context.step_count
 
-    def get_evictable_block_count(self) -> int:
+    def get_evictable_block_count(self) -> Tensor:
         """Get count of cached blocks that can be evicted (ref_count == 0, hash set).
 
         Returns:
-            Number of evictable cached blocks.
+            Scalar tensor with the number of evictable cached blocks.
         """
         cached_mask = (self.block_ref_counts == 0) & (self.block_hashes != -1)
-        return cached_mask.sum().item()
+        return cached_mask.sum()
 
     def evict_lru_blocks(self, num_blocks_needed: int) -> bool:
         """Evict LRU cached blocks to free up space in the pool.
