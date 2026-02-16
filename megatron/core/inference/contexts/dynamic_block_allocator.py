@@ -259,9 +259,13 @@ class BlockAllocator:
         if num_blocks == 0:
             return
 
+        # Bulk transfer block IDs and their hashes from GPU to CPU (2 syncs total
+        # instead of 2N syncs from per-element .item() calls).
+        block_ids_list = block_ids.tolist()
+        block_hashes_list = self.block_hashes[block_ids].tolist()
+
         # Remove from hash mappings
-        for block_id in block_ids:
-            block_id_int = block_id.item()
+        for block_id_int, block_hash in zip(block_ids_list, block_hashes_list):
 
             # Clean up pending hash if block was pending computation
             if block_id_int in self._pending_block_hashes:
@@ -270,7 +274,6 @@ class BlockAllocator:
                     del self.hash_to_block_id[pending_hash]
 
             # Clean up computed hash
-            block_hash = self.block_hashes[block_id_int].item()
             if block_hash in self.hash_to_block_id:
                 del self.hash_to_block_id[block_hash]
 
