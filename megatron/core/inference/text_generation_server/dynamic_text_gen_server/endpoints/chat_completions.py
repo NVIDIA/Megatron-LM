@@ -61,6 +61,17 @@ try:
             # Check for 'logprobs' (bool) and 'top_logprobs' (int)
             return_log_probs = bool(req.get("logprobs", False))
             top_n_logprobs = int(req.get("top_logprobs", 0)) if return_log_probs else 0
+            skip_prompt_log_probs = bool(req.get("skip_prompt_log_probs", False))
+            add_BOS = bool(req.get("add_BOS", False))
+
+            # The engine only handles add_BOS for string prompts, not pre-tokenized
+            # input. Since we pre-tokenize via apply_chat_template, we must handle
+            # BOS ourselves, matching the logic in tokenize_prompt().
+            if hasattr(tokenizer, 'bos') and tokenizer.bos is not None:
+                while prompt_tokens and prompt_tokens[0] == tokenizer.bos:
+                    prompt_tokens.pop(0)
+                if add_BOS:
+                    prompt_tokens = [tokenizer.bos] + prompt_tokens
 
             sampling_params = SamplingParams(
                 temperature=temperature,
@@ -73,7 +84,8 @@ try:
                     if ((max_tokens := req.get("max_tokens", None)) is not None)
                     else None
                 ),
-                skip_prompt_log_probs=True,
+                skip_prompt_log_probs=skip_prompt_log_probs,
+                add_BOS=add_BOS,
             )
         except ValueError as e:
             return f"Invalid sampling parameter: {e}", 400
@@ -99,21 +111,29 @@ try:
         # --- 4. Format OpenAI Response ---
         choices = []
         total_completion_tokens = 0
-        prompt_token_count = len(prompt_tokens)  # Calculated once
+        prompt_tokens_counts = []
 
         request_idx = 0
         for record in batch_results:
             assert len(record.requests) == 1, "Each record should contain one request result."
-            result = record.merge()
-            text_output = result.generated_text
+            result = record.merge().serialize()
+            # Unwrap ("tensor", [...]) tuples from serialize() into plain lists.
+            result = {
+                k: v[1] if isinstance(v, (list, tuple)) and len(v) == 2 and v[0] == "tensor" else v
+                for k, v in result.items()
+            }
+            prompt_tokens = result["prompt_tokens"]  # The engine can modify prompt_tokens.
+            text_output = result["generated_text"]
+            prompt_tokens_count = len(prompt_tokens) if prompt_tokens is not None else 0
+            prompt_tokens_counts.append(prompt_tokens_count)
 
             logprobs_content = None
             if sampling_params.return_log_probs:
-                token_logprobs = getattr(result, 'log_probs', [])
-                tokens = [tokenizer.detokenize([tok]) for tok in result.generated_tokens]
+                token_logprobs = result.get('log_probs', [])
+                tokens = [tokenizer.detokenize([tok]) for tok in result["generated_tokens"]]
 
                 # Get top_n_logprobs if available
-                generated_top_n_logprobs = getattr(result, 'generated_top_n_logprobs', None)
+                generated_top_n_logprobs = result.get('generated_top_n_logprobs')
 
                 logprobs_content = []
                 for i, (tok, lp) in enumerate(zip(tokens, token_logprobs)):
@@ -160,10 +180,10 @@ try:
             choice_data = {
                 "index": request_idx,
                 "message": message,
-                "prompt_token_ids": prompt_tokens,
-                "generation_token_ids": result.generated_tokens,
-                "generation_log_probs": result.generated_log_probs,
-                "raw_text": result.prompt + result.generated_text,
+                "prompt_token_ids": result["prompt_tokens"],
+                "generation_token_ids": result["generated_tokens"],
+                "generation_log_probs": result["generated_log_probs"],
+                "raw_text": result["prompt"] + result["generated_text"],
                 # 'logprobs' in chat API is an object containing 'content'
                 "logprobs": {"content": logprobs_content} if logprobs_content else None,
                 "finish_reason": (
@@ -171,17 +191,17 @@ try:
                 ),  # Original code hardcoded this.
             }
             logging.info(result)
-            if result.routing_indices is not None:
-                choice_data["moe_topk_indices"] = result.routing_indices.tolist()
-                prompt_length = len(result.prompt_tokens) if result.prompt_tokens is not None else 0
-                if prompt_length:
-                    choices[-1]["prompt_moe_topk_indices"] = result.routing_indices[
-                        :prompt_length
-                    ].tolist()
+            if result["routing_indices"] is not None:
+                choice_data["moe_topk_indices"] = result["routing_indices"]
+                if prompt_tokens_count:
+                    choices[-1]["prompt_moe_topk_indices"] = result["routing_indices"][
+                        :prompt_tokens_count
+                    ]
             choices.append(choice_data)
-            total_completion_tokens += len(result.generated_tokens)
-            request_idx += 0
+            total_completion_tokens += len(result["generated_tokens"])
+            request_idx += 1
 
+        prompt_token_count = max(prompt_tokens_counts)
         response = {
             "choices": choices,
             "usage": {
