@@ -101,6 +101,7 @@ MODEL_OPTIONS="\
   --max-position-embeddings 131072  \
   --tokenizer-type HuggingFaceTokenizer \
   --tokenizer-model unsloth/Meta-Llama-3.1-8B-Instruct \
+  --tokenizer-hf-use-fast \
   --lr 3e-7 \
   --make-vocab-size-divisible-by 128 \
   --clip-grad 1.0 \
