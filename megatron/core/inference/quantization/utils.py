@@ -132,7 +132,15 @@ def quantize_to_mxfp8(x: torch.Tensor, group_size: int = 32):
 def translate_te_mxfp8_tensor(tensor: MXFP8Tensor):
     """
     Helper to extract MXFP8 data and scales from a TE MXFP8Tensor.
-    Returns (tensor_fp8, tensor_scale)
+
+    TE internally allocates _rowwise_scale_inv with padded dimensions
+    (rows rounded up to 128, cols rounded up to 4) for its own cuBLAS GEMM
+    path. When using torch.nn.functional.scaled_mm instead, the scales must
+    be trimmed back to the logical (unpadded) shape so that the strides match
+    what scaled_mm / cuBLAS expects.
+
+    Returns (tensor_fp8, tensor_scale) with tensor_scale trimmed to match
+    the data dimensions.
     """
     assert HAVE_TE and isinstance(tensor, MXFP8Tensor)
 
@@ -144,5 +152,14 @@ def translate_te_mxfp8_tensor(tensor: MXFP8Tensor):
 
     if scale.dtype == torch.uint8:
         scale = scale.view(torch.float8_e8m0fnu)
+
+    # Trim padded scale to match data dimensions.
+    # TE allocates scale as [round_up(N, 128), round_up(K/32, 4)] but
+    # scaled_mm expects [N, K/32] with contiguous strides (K/32, 1).
+    n, k = data.shape
+    expected_scale_rows = n
+    expected_scale_cols = k // 32
+    if scale.shape[0] != expected_scale_rows or scale.shape[1] != expected_scale_cols:
+        scale = scale[:expected_scale_rows, :expected_scale_cols].contiguous()
 
     return data, scale

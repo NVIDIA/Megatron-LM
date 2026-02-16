@@ -189,12 +189,10 @@ class InferenceLayerNormColumnParallelLinear(TELayerNormColumnParallelLinear):
             swizzle_b = SwizzleType.SWIZZLE_32_4_4
 
             # Perform Scaled MM
-            # x: [M, K], weight.t(): [K, N] -> [M, N] output
-            # scaled_mm arg 'b' is expected to be [N, K] (conceptually transposed)
-            # if we pass it directly?
-            # torch.nn.functional.scaled_mm(a, b, ...) performs a @ b.t()
-
-            print(f"x_fp8.shape={x_fp8.shape}, weight_fp8.shape={weight_fp8.shape}, x_scale.shape={x_scale.shape}, weight_scale.shape={weight_scale.shape}")
+            # scaled_mm(a, b) computes a @ b.
+            # b must be column-major (i.e. weight_fp8.T gives [K, N] col-major).
+            # scale_b shape [N, K/32] matches the physical (row-major) layout of
+            # weight_fp8 [N, K].
             x = scaled_mm(
                 x_fp8,
                 weight_fp8.T,
@@ -394,7 +392,6 @@ class InferenceRowParallelLinear(TERowParallelLinear):
         """
         if self.tp_size == 1:
             if self.config.fp8_recipe == "mxfp8" and HAVE_SCALED_MM:
-                print(f"Quantizing to mxfp8...")
                 x_fp8, x_scale = quantize_to_mxfp8(x.squeeze(1))
                 weight_fp8, weight_scale = translate_te_mxfp8_tensor(self.weight)
                 swizzle_a = SwizzleType.SWIZZLE_32_4_4
