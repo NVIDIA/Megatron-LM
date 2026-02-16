@@ -66,6 +66,8 @@ class Status(Enum):
 HASH_PRIME = 2305843009213693951
 HASH_BASE = 31
 
+_hash_powers: Optional[torch.Tensor] = None
+
 
 def compute_block_hash(parent_hash: int, token_ids: torch.Tensor) -> int:
     """Compute hash for a block from (parent_hash, token_ids).
@@ -79,10 +81,12 @@ def compute_block_hash(parent_hash: int, token_ids: torch.Tensor) -> int:
     Returns:
         Positive integer hash value (1 to HASH_PRIME).
     """
-    block_size = token_ids.shape[0]
-    positions = torch.arange(block_size, device=token_ids.device, dtype=torch.int64)
-    powers = torch.pow(HASH_BASE, positions).to(torch.int64) % HASH_PRIME
-    token_hash = ((token_ids.to(torch.int64) * powers).sum() % HASH_PRIME).item()
+    global _hash_powers
+    if _hash_powers is None:
+        block_size = token_ids.shape[0]
+        positions = torch.arange(block_size, device=token_ids.device, dtype=torch.int64)
+        _hash_powers = torch.pow(HASH_BASE, positions).to(torch.int64) % HASH_PRIME
+    token_hash = ((token_ids.to(torch.int64) * _hash_powers).sum() % HASH_PRIME).item()
 
     # Combine with parent hash
     combined = (parent_hash * HASH_BASE + token_hash) % HASH_PRIME
