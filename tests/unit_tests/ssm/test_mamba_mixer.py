@@ -35,7 +35,7 @@ class TestMambaMixer:
             num_layers=1,
             num_attention_heads=1,
             use_cpu_initialization=True,
-            use_mem_eff_path=use_mem_eff_path,
+            use_mamba_mem_eff_path=use_mem_eff_path,
         )
         modules = mamba_stack_spec.submodules.mamba_layer.submodules.mixer.submodules
         pg_collection = ProcessGroupCollection.use_mpu_process_groups(required_pgs=['tp', 'cp'])
