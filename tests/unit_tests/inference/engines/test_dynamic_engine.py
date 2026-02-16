@@ -5,6 +5,7 @@ import math
 import random
 import types
 from dataclasses import dataclass, field
+from functools import partial
 from typing import Dict, List, Optional, Tuple
 
 import pytest
@@ -68,7 +69,7 @@ def mock_forward(input_ids, position_ids, attention_mask, *args, **kwargs):
     return torch.randn(
         input_ids.size(0),
         input_ids.size(1),
-        test_config.vocab_size,
+        kwargs["vocab_size"],
         device=input_ids.device,
         dtype=torch.bfloat16,
     )
@@ -1229,7 +1230,7 @@ class TestDynamicInferenceEngine:
         # Mock the model forward function to avoid possible numerics issues
         # caused by random inputs
         model_instance = env.engine.controller.inference_wrapped_model.model
-        model_instance.forward = mock_forward
+        model_instance.forward = partial(mock_forward, vocab_size=test_config.vocab_size)
 
         # Request 1: 150 tokens
         req1_tokens = torch.randint(0, test_config.vocab_size, (130,), device='cuda')
@@ -1410,29 +1411,32 @@ class TestDynamicInferenceEngine:
 
         Scenario:
             - Max tokens per step (Chunk Size): 256
-            - Request prompt length: 513
+            - Request prompt length: 512
+
+        Note that for all chunks after the first chunk we subtract 1 from the active token
+        count, so the chunk size will be 1 less.
 
         Default scheduling would do:
-            1. Chunk 256 (Remaining 257)
-            2. Chunk 256 (Remaining 1) -> max_seqlen_q=1 triggers decode path in kernel
+            1. Chunk 256 (Remaining 256)
+            2. Chunk 255 (Remaining 1) -> max_seqlen_q=1 triggers decode path in kernel
             3. Chunk 1
 
         Fixed scheduling should do:
-            1. Chunk 256 (Remaining 257) -> 257 - 256 != 1. Schedule full 256.
-            2. Chunk 255 (Remaining 2)   -> 257 tokens left. If we take 256, 1 remains.
-                                            So we reduce chunk to 255.
+            1. Chunk 256 (Remaining 256) -> 256 - 256 != 1. Schedule full 256.
+            2. Chunk 254 (Remaining 2)   -> 256 tokens left. If we take 255, 1 remains.
+                                            So we reduce chunk to 254.
             3. Chunk 2   (Remaining 0)
         """
         chunk_size = 256
         # Prompt length designed to trigger the edge case: Chunk + (Chunk + 1)
-        # 256 + 257 = 513
-        prompt_len = 513
+        # 256 + 256 = 512
+        prompt_len = 512
 
         test_config = DynamicEngineTestConfig(
             model_provider="gpt",
             num_requests=0,
             num_tokens_to_generate=None,
-            num_tokens_total=None,
+            num_tokens_total=513,
             context_max_tokens=chunk_size,
             context_max_requests=1,
             context_block_size_tokens=256,
@@ -1446,7 +1450,7 @@ class TestDynamicInferenceEngine:
         # Mock the model forward function to avoid possible numerics issues
         # caused by random inputs
         model_instance = env.engine.controller.inference_wrapped_model.model
-        model_instance.forward = mock_forward
+        model_instance.forward = partial(mock_forward, vocab_size=test_config.vocab_size)
 
         # Create a request with length 513
         req_tokens = torch.randint(0, test_config.vocab_size, (prompt_len,), device='cuda')
@@ -1458,9 +1462,11 @@ class TestDynamicInferenceEngine:
 
         env.engine._add_request(req)
 
+        assert req.status == Status.ACTIVE_AND_GENERATING_TOKENS
+
         # --- Step 1 ---
-        # Available: 256. Remaining: 513.
-        # Logic: 513 - 256 = 257. Not 1. Schedule full 256.
+        # Available: 256. Remaining: 512.
+        # Logic: 512 - 256 = 256. Not 1. Schedule full 256.
         env.engine.schedule_waiting_requests()
         env.engine.step_modern()
 
@@ -1469,33 +1475,27 @@ class TestDynamicInferenceEngine:
         ), f"Step 1: Expected 256 tokens processed, got {req.finished_chunk_token_count}"
 
         # --- Step 2 ---
-        # Available: 256. Remaining un-prefilled: 257.
-        # Logic: 257 - 256 = 1. This is the edge case!
-        # Fix should reduce chunk size by 1 (to 255).
+        # Available: 256. Remaining un-prefilled: 256.
+        # Logic: 256 - (256 - 1) = 1. This is the edge case!
+        # Fix should reduce chunk size by 1 (to 254).
         env.engine.schedule_waiting_requests()
         env.engine.step_modern()
 
-        # 256 (previous) + 255 (this step) = 511
-        assert req.finished_chunk_token_count == 511, (
-            "Step 2: Expected 511 tokens processed (256+255), "
+        # 256 (previous) + 254 (this step) = 510
+        assert req.finished_chunk_token_count == 510, (
+            "Step 2: Expected 510 tokens processed (256+254), "
             f"got {req.finished_chunk_token_count}. "
-            "If 512, the edge case fix failed."
         )
 
         # --- Step 3 ---
-        # Remaining un-prefilled: 2. Available: 256.
-        # Logic: 2 <= 256. Schedule 2.
+        # Remaining un-prefilled: 2. Available: 255.
+        # Logic: 2 <= 255. Schedule 2.
         env.engine.schedule_waiting_requests()
         env.engine.step_modern()
 
-        # 511 (previous) + 2 (this step) = 513
-        assert (
-            req.finished_chunk_token_count == 513
-        ), f"Step 3: Expected 513 tokens processed, got {req.finished_chunk_token_count}"
-
-        # Verify request finishes prefill and enters decode
+        # Verify request finishes prefill and completes
         assert ctx.num_prefill_requests == 0
-        assert ctx.num_decode_requests == 1
+        assert req.status == Status.COMPLETED
 
     @pytest.mark.internal
     @pytest.mark.skipif(
