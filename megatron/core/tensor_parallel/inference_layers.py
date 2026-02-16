@@ -13,7 +13,7 @@ from megatron.core.inference.communication.torch_symm_triton import (
     multimem_all_gather,
     multimem_reduce_scatter,
 )
-from megatron.core.inference.quantization.utils import translate_te_mxfp8_tensor, quantize_to_mxfp8
+from megatron.core.inference.quantization.mxfp8_tensor import MXFP8Tensor
 from megatron.core.model_parallel_config import ModelParallelConfig
 from megatron.core.parallel_state import get_global_symmetric_memory_buffer
 from megatron.core.transformer.transformer_config import TransformerConfig
@@ -31,15 +31,13 @@ try:
 except ImportError:
     HAVE_TE = False
 
-# Attempt to import scaled_mm and ScalingType for MXFP8 support
 try:
-    from torch.nn.functional import ScalingType, SwizzleType, scaled_mm
+    from flashinfer import bmm_mxfp8
 
-    HAVE_SCALED_MM = True
-except ImportError:
-    HAVE_SCALED_MM = False
-    ScalingType = None
-    SwizzleType = None
+    HAVE_FLASHINFER = True
+except ImportError as e:
+    HAVE_FLASHINFER = False
+
 
 
 def _te_rms_norm_kernel(x: torch.Tensor, weight: torch.Tensor, eps: float):
@@ -168,43 +166,20 @@ class InferenceLayerNormColumnParallelLinear(TELayerNormColumnParallelLinear):
             x = self._all_gather(x, symm_mem_buffer)
 
         # Check for MXFP8 execution
-        if self.config.fp8_recipe == "mxfp8" and HAVE_SCALED_MM:
+        if self.config.fp8_recipe == "mxfp8" and HAVE_FLASHINFER:
             # Quantize activations (BF16 -> MXFP8)
             # x is [M, K]
-            x_fp8, x_scale = quantize_to_mxfp8(x.squeeze(1))
+            x = MXFP8Tensor.from_bf16(x.squeeze(1))
 
-            # Prepare weights (Assumed to be in MXFP8)
-            # self.weight is data (E4M3FN), self.weight_scale is scale (E8M0FNU)
-            # Weights are typically [N, K] or [K, N].
-            # scaled_mm expects:
-            #   A: [M, K]
-            #   B: [N, K] (t() is handled via transposed arg or logic below)
-            #   scale_a: [M, K/32]
-            #   scale_b: [N, K/32]
+            assert isinstance(self.weight, MXFP8Tensor)
 
-            weight_fp8, weight_scale = translate_te_mxfp8_tensor(self.weight)
-
-            # Swizzling configuration
-            swizzle_a = SwizzleType.SWIZZLE_32_4_4
-            swizzle_b = SwizzleType.SWIZZLE_32_4_4
-
-            # Perform Scaled MM
-            # scaled_mm(a, b) computes a @ b.
-            # b must be column-major (i.e. weight_fp8.T gives [K, N] col-major).
-            # scale_b shape [N, K/32] matches the physical (row-major) layout of
-            # weight_fp8 [N, K].
-            x = scaled_mm(
-                x_fp8,
-                weight_fp8.T,
-                scale_a=x_scale,
-                scale_b=weight_scale,
-                scale_recipe_a=ScalingType.BlockWise1x32,
-                scale_recipe_b=ScalingType.BlockWise1x32,
-                swizzle_a=swizzle_a,
-                swizzle_b=swizzle_b,
-                output_dtype=x.dtype,  # Output in BF16
-                use_fast_accum=False,
-            ).unsqueeze(1)
+            x = bmm_mxfp8(
+                x.data.unsqueeze(0),
+                self.weight.data.T.unsqueeze(0),
+                x.scale,
+                self.weight.scale,
+                dtype=torch.bfloat16
+            ).transpose(0, 1)
         else:
             x = torch.matmul(x, self.weight.t())
 
@@ -282,37 +257,28 @@ class InferenceRowParallelLinear(TERowParallelLinear):
         )
 
         # Check for MXFP8
-        use_mxfp8 = self.config.fp8_recipe == "mxfp8" and HAVE_SCALED_MM
+        use_mxfp8 = self.config.fp8_recipe == "mxfp8" and HAVE_FLASHINFER
 
         if can_use_custom_nvls_collectives:
             # Write output of matmul directly onto the symmetric memory buffer
 
             if use_mxfp8:
-                # MXFP8 Scaled GEMM
-                x_fp8, x_scale = quantize_to_mxfp8(x)
+                # Quantize activations (BF16 -> MXFP8)
+                # x is [M, K]
+                x = MXFP8Tensor.from_bf16(x.squeeze(1))
 
-                weight_fp8, weight_scale = translate_te_mxfp8_tensor(self.weight)
+                assert isinstance(self.weight, MXFP8Tensor)
 
-                # Swizzling configuration
-                swizzle_a = SwizzleType.SWIZZLE_32_4_4
-                swizzle_b = SwizzleType.SWIZZLE_32_4_4
-
-                # Note: scaled_mm output can be directed to out tensor
-                # scaled_mm performs (x @ weight.T)
-                scaled_mm(
-                    x_fp8,
-                    weight_fp8.T,
-                    scale_a=x_scale,
-                    scale_b=weight_scale,
-                    scale_recipe_a=ScalingType.BlockWise1x32,
-                    scale_recipe_b=ScalingType.BlockWise1x32,
-                    swizzle_a=swizzle_a,
-                    swizzle_b=swizzle_b,
-                    output_dtype=x.dtype,
-                    use_fast_accum=False,
-                    out=symm_mem_buffer["tensor"],  # Write directly to symm mem
+                x = bmm_mxfp8(
+                    x.data.unsqueeze(0),
+                    self.weight.data.T.unsqueeze(0),
+                    x.scale,
+                    self.weight.scale,
+                    dtype=torch.bfloat16,
+                    out=symm_mem_buffer["tensor"],
                 )
-                x = symm_mem_buffer["tensor"]
+                x = symm_mem_buffer["tensor"].transpose(0, 1)
+
             else:
                 # Standard GEMM
                 torch.matmul(x, self.weight.t(), out=symm_mem_buffer["tensor"])
@@ -348,23 +314,20 @@ class InferenceRowParallelLinear(TERowParallelLinear):
         else:
             # revert to torch dist (NCCL) reduce-scatter
             if use_mxfp8:
-                x_fp8, x_scale = quantize_to_mxfp8(x)
-                weight_fp8, scale_fp8 = translate_te_mxfp8_tensor(self.weight)
-                swizzle_a = SwizzleType.SWIZZLE_32_4_4
-                swizzle_b = SwizzleType.SWIZZLE_32_4_4
+                # Quantize activations (BF16 -> MXFP8)
+                # x is [M, K]
+                x = MXFP8Tensor.from_bf16(x.squeeze(1))
 
-                x = scaled_mm(
-                    x_fp8,
-                    weight_fp8.T,
-                    scale_a=x_scale,
-                    scale_b=scale_fp8,
-                    scale_recipe_a=ScalingType.BlockWise1x32,
-                    scale_recipe_b=ScalingType.BlockWise1x32,
-                    swizzle_a=swizzle_a,
-                    swizzle_b=swizzle_b,
-                    output_dtype=x.dtype,
-                    use_fast_accum=False,
-                )
+                assert isinstance(self.weight, MXFP8Tensor)
+
+                x = bmm_mxfp8(
+                    x.data.unsqueeze(0),
+                    self.weight.data.T.unsqueeze(0),
+                    x.scale,
+                    self.weight.scale,
+                    dtype=torch.bfloat16
+                ).transpose(0, 1)
+
             else:
                 x = torch.matmul(x, self.weight.t())
 
@@ -391,23 +354,20 @@ class InferenceRowParallelLinear(TERowParallelLinear):
         Forward pass.
         """
         if self.tp_size == 1:
-            if self.config.fp8_recipe == "mxfp8" and HAVE_SCALED_MM:
-                x_fp8, x_scale = quantize_to_mxfp8(x.squeeze(1))
-                weight_fp8, weight_scale = translate_te_mxfp8_tensor(self.weight)
-                swizzle_a = SwizzleType.SWIZZLE_32_4_4
-                swizzle_b = SwizzleType.SWIZZLE_32_4_4
-                x = scaled_mm(
-                    x_fp8,
-                    weight_fp8.T,
-                    scale_a=x_scale,
-                    scale_b=weight_scale,
-                    scale_recipe_a=ScalingType.BlockWise1x32,
-                    scale_recipe_b=ScalingType.BlockWise1x32,
-                    swizzle_a=swizzle_a,
-                    swizzle_b=swizzle_b,
-                    output_dtype=x.dtype,
-                    use_fast_accum=False,
-                ).unsqueeze(1)
+            if self.config.fp8_recipe == "mxfp8" and HAVE_FLASHINFER:
+                # Quantize activations (BF16 -> MXFP8)
+                # x is [M, K]
+                x = MXFP8Tensor.from_bf16(x.squeeze(1))
+
+                assert isinstance(self.weight, MXFP8Tensor)
+
+                x = bmm_mxfp8(
+                    x.data.unsqueeze(0),
+                    self.weight.data.T.unsqueeze(0),
+                    x.scale,
+                    self.weight.scale,
+                    dtype=torch.bfloat16
+                ).transpose(0, 1)
             else:
                 x = torch.matmul(x, self.weight.t())
             return x, None
