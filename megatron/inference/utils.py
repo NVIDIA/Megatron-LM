@@ -82,7 +82,7 @@ def add_inference_args(parser: ArgumentParser) -> ArgumentParser:
         metavar='N',
         type=str,
         nargs='+',
-        help='Input prompts with each prompt within quotes and seperated by space',
+        help='Input prompts with each prompt within quotes and separated by space',
     )
     group.add_argument(
         "--num-tokens-to-prompt",
@@ -278,6 +278,7 @@ def get_inference_config_from_model_and_args(model: MegatronModule, args):
         block_size_tokens=args.inference_dynamic_batching_block_size,
         buffer_size_gb=args.inference_dynamic_batching_buffer_size_gb,
         paused_buffer_size_gb=args.inference_dynamic_batching_paused_buffer_size_gb,
+        mamba_memory_ratio=args.inference_dynamic_batching_mamba_memory_ratio,
         num_cuda_graphs=(
             args.inference_dynamic_batching_num_cuda_graphs
             if args.cuda_graph_impl == "local"

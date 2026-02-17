@@ -10,7 +10,7 @@ from torch import Tensor
 
 from megatron.core import InferenceParams, parallel_state, tensor_parallel
 from megatron.core.dist_checkpointing.mapping import ShardedStateDict
-from megatron.core.dist_checkpointing.utils import replace_prefix_for_sharding
+from megatron.core.dist_checkpointing.utils import apply_prefix_mapping, replace_prefix_for_sharding
 from megatron.core.fp8_utils import get_fp8_context
 from megatron.core.models.backends import BackendSpecProvider, LocalSpecProvider
 from megatron.core.packed_seq_params import PackedSeqParams
@@ -642,10 +642,13 @@ def process_mtp_loss(
     Returns:
         Tensor: Updated hidden states after MTP loss processing (first chunk only).
     """
-    mtp_labels = labels.clone()
     hidden_states_list = torch.chunk(hidden_states, 1 + config.mtp_num_layers, dim=0)
     hidden_states = hidden_states_list[0]
 
+    if labels is None:
+        return hidden_states
+
+    mtp_labels = labels.clone()
     if loss_mask is None:
         loss_mask = torch.ones_like(mtp_labels)
 
@@ -697,8 +700,8 @@ class MultiTokenPredictionLayer(MegatronModule):
     the linear projection. The combined serves as the input of the Transformer block at
     the k-th depth to produce the output representation.
 
-    for more information, please refer to DeepSeek-V3 Technical Report
-    https://github.com/deepseek-ai/DeepSeek-V3/blob/main/DeepSeek_V3.pdf
+    For more information, refer to DeepSeek-V3 Technical Report
+    https://arxiv.org/pdf/2412.19437.pdf
     """
 
     def __init__(
@@ -1097,6 +1100,16 @@ class MultiTokenPredictionLayer(MegatronModule):
             token prediction layer.
         """
         sharded_state_dict = super().sharded_state_dict(prefix, sharded_offsets, metadata)
+
+        # Backward compatibility: GPT MTP checkpoints were saved with the submodule
+        # named 'transformer_layer'. Remap checkpoint keys so old checkpoints load
+        # correctly. Mamba MTP models keep 'mtp_model_layer' as their native format
+        # since no older checkpoints exist for them.
+        if self.mtp_layer_pattern is None:
+            apply_prefix_mapping(
+                sharded_state_dict, {f'{prefix}mtp_model_layer.': f'{prefix}transformer_layer.'}
+            )
+
         return sharded_state_dict
 
 
@@ -1165,8 +1178,8 @@ class MultiTokenPredictionBlock(MegatronModule):
     When `mtp_use_repeated_layer=True` in config, instead of creating N separate MTP layers,
     only 1 layer is created and applied mtp_num_layers times.
 
-    for more information, please refer to DeepSeek-V3 Technical Report
-    https://github.com/deepseek-ai/DeepSeek-V3/blob/main/DeepSeek_V3.pdf
+    For more information, please refer to DeepSeek-V3 Technical Report
+    https://arxiv.org/pdf/2412.19437.pdf
     """
 
     def __init__(
