@@ -362,7 +362,8 @@ class DynamicInferenceContext(BaseInferenceContext):
                         "Unified memory requested but not available; defaulting to GPU memory."
                     )
                 self.unified_memory_level = 0
-        # Static KV memory pointers require either UVM or torch_memory_saver.
+        # If we are in a mode that requires static KV memory pointers,
+        # we must have either UVM or torch_memory_saver.
         if (
             self.static_kv_memory_pointers
             and self.kv_cache_management_mode != KVCacheManagementMode.PERSIST
