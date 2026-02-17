@@ -319,14 +319,13 @@ class TestLLaVAModel:
         assert loss.shape == new_loss_mask.shape == torch.Size((5, max_seq_len))
 
         # Try with labels and PackedSeqParams. Only micro batch size 1 is supported in this mode.
+        # cu_seqlens must be valid collapsed-space boundaries within input_ids[:1] (length 1024).
         packed_seq_params = PackedSeqParams(
             qkv_format="thd",
-            cu_seqlens_q=torch.tensor(
-                [0, 512, 1024, 1600], dtype=torch.int32
-            ).cuda(),  # Just example values.
-            cu_seqlens_kv=torch.tensor([0, 512, 1024, 1600], dtype=torch.int32).cuda(),
-            max_seqlen_q=1600,
-            max_seqlen_kv=1600,
+            cu_seqlens_q=torch.tensor([0, 512, 1024], dtype=torch.int32).cuda(),
+            cu_seqlens_kv=torch.tensor([0, 512, 1024], dtype=torch.int32).cuda(),
+            max_seqlen_q=512,
+            max_seqlen_kv=512,
         )
 
         # NOTE: Packing is only supported with BF16. Use BF16 here and switch back to default.
@@ -497,12 +496,27 @@ class TestLLaVAModel:
         text_lens = [20 + (i * 13) % 40 for i in range(num_samples)]
         total_text = sum(text_lens)
 
-        # How many images can we fit after reserving space for text?
-        max_images = (max_total_expanded - total_text) // img_seq_len
+        # Variable tile counts per image. Keep modest to fit within 4096 total.
+        tile_cycle = [1, 2, 1, 3, 1]
 
-        # Assign images: skip sample 1 (text-only sentinel), then take up to max_images.
+        # Budget-aware image assignment: variable tiles cost more than the old
+        # uniform 1-tile-per-image approach, so we allocate iteratively.
         image_candidates = [i for i in range(num_samples) if (i != 1 or num_samples == 1)]
-        image_sample_set = set(image_candidates[:max_images])
+        budget = max_total_expanded - total_text
+        assigned_images = {}  # sample_idx -> list of tile counts
+        for idx in image_candidates:
+            tiles = tile_cycle[idx % len(tile_cycle)]
+            cost = tiles * img_seq_len
+            if budget >= cost:
+                assigned_images[idx] = [tiles]
+                budget -= cost
+                # For some samples, add a second image if budget permits.
+                if idx % 3 == 0 and text_lens[idx] >= 30:
+                    tiles2 = tile_cycle[(idx + 1) % len(tile_cycle)]
+                    cost2 = tiles2 * img_seq_len
+                    if budget >= cost2:
+                        assigned_images[idx].append(tiles2)
+                        budget -= cost2
 
         samples = []
         all_images = []
@@ -510,23 +524,35 @@ class TestLLaVAModel:
 
         for i in range(num_samples):
             text_len = text_lens[i]
-            has_image = i in image_sample_set
+            image_tiles_list = assigned_images.get(i, [])
+            has_image = len(image_tiles_list) > 0
 
             # Random token IDs; replace any accidental image tokens.
             ids = torch.randint(0, vocab_size, (text_len,), device="cuda")
             ids[ids == image_token_index] = 0
 
             if has_image:
-                img_pos = min(5 + i * 3, text_len - 1)
-                ids = torch.cat(
-                    [ids[:img_pos], torch.tensor([image_token_index], device="cuda"), ids[img_pos:]]
-                )
-                collapsed_len = text_len + 1  # text + 1 image placeholder
-                expanded_len = text_len + img_seq_len  # placeholder expands to img_seq_len tokens
+                collapsed_len = text_len
+                expanded_len = text_len
 
-                img = torch.randn(1, 3, 336, 336, device="cuda", dtype=torch.bfloat16)
-                all_images.append(img)
-                all_num_tiles.append(1)
+                # Insert image tokens and create image tensors for each image.
+                for img_idx, tiles_count in enumerate(image_tiles_list):
+                    img_pos = min(5 + i * 3 + img_idx * 15, len(ids) - 1)
+                    ids = torch.cat(
+                        [
+                            ids[:img_pos],
+                            torch.tensor([image_token_index], device="cuda"),
+                            ids[img_pos:],
+                        ]
+                    )
+                    collapsed_len += 1
+                    expanded_len += tiles_count * img_seq_len
+
+                    img = torch.randn(
+                        tiles_count, 3, 336, 336, device="cuda", dtype=torch.bfloat16
+                    )
+                    all_images.append(img)
+                    all_num_tiles.append(tiles_count)
             else:
                 collapsed_len = text_len
                 expanded_len = text_len
@@ -669,7 +695,7 @@ class TestLLaVAModel:
         num_images = sum(1 for s in samples if s['has_image'])
         print(
             f"\n  num_samples={num_samples}, num_images={num_images}, "
-            f"total_expanded={total_expanded}, "
+            f"tiles={all_num_tiles}, total_expanded={total_expanded}, "
             f"token_mult_prob_error={token_mult_prob_error:.6f}"
         )
         assert token_mult_prob_error < 1.02, (
