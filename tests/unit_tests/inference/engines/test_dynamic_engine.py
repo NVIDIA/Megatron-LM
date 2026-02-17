@@ -1672,6 +1672,8 @@ class TestDynamicInferenceEngine:
 
         addr_before = context.memory_buffer.data_ptr()
 
+        gc.collect()
+        torch.cuda.empty_cache()
         torch.cuda.synchronize()
         mem_before = torch.cuda.memory_allocated()
         if uses_tms:
