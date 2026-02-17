@@ -1046,19 +1046,14 @@ class DataParallelBuffer:
 
     def free_bucket_storage(self):
         """
-        Release the storage of a temporary communication bucket.
-        If the bucket is temporary, this method frees its storage.
+        Release the storage of a temporarily-allocated communication bucket.
         """
-        if not self.is_data_distributed:
-            # Only free the allocated bucket if the buffer is sharded.
-            # Otherwise, the buffer contains the entire bucket, and
-            # we should not de-allocate un-sharded buffers such as
-            # those that support un-sharded compute parameters.
-            return
-
-        # Free the memory backing the temporarily-allocated bucket associated with this buffer.
         self.temporary_bucket_allocator.free(self.bucket_index.bucket_id)
 
+    def reset_param_main_grad(self):
+        """
+        Dereference param.main_grad for grad buckets managed by this buffer.
+        """
         # Reset the main grad tensor to None to release the memory.
         for param in self.params:
             if hasattr(param, "main_grad"):
@@ -3207,6 +3202,7 @@ class GradReducePipeline:
         for bucket_id, _ in self.bucket_status.items():
             gbuf = self.get_fsdp_buffer(bucket_id)
             gbuf.free_bucket_storage()
+            gbuf.reset_param_main_grad()
             self.bucket_status[bucket_id] = BucketStatus.EMPTY
 
     def reduce_gradients(
@@ -3414,21 +3410,14 @@ class GradReducePipeline:
                     # Reduce-scatter or all-reduce the unsharded gradient.
                     if ddp_config.data_parallel_sharding_strategy == "no_shard":
                         # All-reduce un-sharded gradients from every rank.
-                        # NOTE(@shjwudp, @cspades): This should only be invoked on the
-                        # last microbatch before optimization. We are reducing directly
-                        # into the gradient accumulation buffer, and this all-reduce
-                        # should only be called once per optimization cycle.
                         torch.distributed.all_reduce(
                             unreduced_grad, op=reduce_op, group=gbuf.data_parallel_group
                         )
                         if custom_grad_comm_dtype:
                             # Reduction used a temporary communication buffer.
                             grad_accum_closure.append(
-                                (
-                                    # Un-sharded buffer data.
-                                    gbuf.data,
-                                    unreduced_grad,
-                                )
+                                # Un-sharded buffer data.
+                                (gbuf.data, unreduced_grad)
                             )
                     else:
                         # Slice a gradient shard from the communication bucket.
@@ -3442,27 +3431,23 @@ class GradReducePipeline:
                             group=gbuf.data_parallel_group,
                         )
 
-                        # Track some closure tasks to accumulate the reduced gradient shard.
-                        # NOTE: If the gradient buffer is unsharded (optim), then the output
-                        # bucket shard is backed by the unsharded gradient buffer, in which
-                        # case we would be accumulating the reduced gradient shard on itself,
-                        # doubling the gradient. We should only accumulate when the gradient
-                        # buffer is sharded (using a communication bucket shard as output).
-                        if gbuf.is_data_distributed:
+                        # Track closure tasks to accumulate the reduced gradient shard.
+                        # NOTE: If the gradient buffer is unsharded and no communication
+                        # bucket is allocated, then the output bucket shard is backed by
+                        # the unsharded gradient buffer and the reduce-scatter result
+                        # has already been installed into the gradient buffer.
+                        if gbuf.is_data_distributed or custom_grad_comm_dtype:
                             grad_accum_closure.append(
-                                (
-                                    # Target for sharded or un-sharded gradient buffers.
-                                    gbuf.get_shard_from_local_buffer(),
-                                    grad_shard,
-                                )
+                                # Target for sharded or un-sharded gradient buffers.
+                                (gbuf.get_shard_from_local_buffer(), grad_shard)
                             )
 
                     # Mark bucket ID as CUDA work-in-progress.
                     self.bucket_status[bucket_id] = BucketStatus.COMMUNICATING
 
             for local_grad, reduced_grad in grad_accum_closure:
-                if ddp_config.data_parallel_sharding_strategy == "no_shard":
-                    # Copy the all-reduced gradient into the main gradient buffer.
+                if ddp_config.data_parallel_sharding_strategy in ["no_shard", "optim"]:
+                    # Copy the reduced gradient into the main gradient buffer.
                     local_grad.copy_(reduced_grad)
                 else:
                     # Accumulate the reduced gradient into the local gradient buffer.
@@ -3506,8 +3491,7 @@ class GradReducePipeline:
                         if custom_grad_comm_dtype:
                             # Free the bucket allocated for the DP-Shard reduction,
                             # which has been waited on already.
-                            if fsdp_grad_buffer.is_data_distributed:
-                                fsdp_grad_buffer.free_bucket_storage()
+                            fsdp_grad_buffer.free_bucket_storage()
                             # Create a custom communication buffer with fsdp_grad_buffer.
                             # Introduces copy and memory overhead.
                             unreduced_grad = fsdp_grad_buffer.allocate_bucket_storage(
@@ -3551,22 +3535,12 @@ class GradReducePipeline:
                         else:  # HSDP -> main_grad_buffer = (DP-Shard,)
                             # No DP-Outer sharding, so all-reduce FSDP gradients across DP-Outer.
                             # All FSDP buffers will have reduced un-sharded or sharded gradients.
-                            # NOTE(@shjwudp, @cspades): This should only be invoked on the
-                            # last microbatch before optimization. We are reducing directly
-                            # into the gradient accumulation buffer, and this final all-reduce
-                            # should only be called once per optimization cycle.
                             torch.distributed.all_reduce(
                                 unreduced_grad, group=outer_fsdp_group, op=reduce_op
                             )
                             if custom_grad_comm_dtype:
                                 # Reduction used a temporary communication buffer.
-                                grad_accum_closure.append(
-                                    (
-                                        # DP-shard
-                                        main_grad_buffer.data,
-                                        unreduced_grad,
-                                    )
-                                )
+                                grad_accum_closure.append((main_grad_buffer.data, unreduced_grad))
 
                 for main_grad_buffer, reduced_grad in grad_accum_closure:
                     # Update the (DP-Outer, DP-Shard) gradient shard in the main gradient buffer.
@@ -3583,12 +3557,11 @@ class GradReducePipeline:
                     # Empty the set of parameters that are ready for gradient reduction.
                     self.bucket_grad_ready_params[bucket_id] = set()
                     gbuf = self.get_fsdp_buffer(bucket_id)
-                    if gbuf.is_data_distributed:
-                        # Free the memory backing the temporarily-allocated communication
-                        # bucket associated with this buffer, which is only utilized for
-                        # sharded gradients. (Un-sharded gradients use temporary
-                        # communication buffers not managed by gbuf.)
-                        gbuf.free_bucket_storage()
+                    # Free the memory backing the temporarily-allocated communication
+                    # bucket associated with this buffer. Only exists for sharded
+                    # gradient buffers, or if a custom gradient data-type is used!
+                    gbuf.free_bucket_storage()
+                    gbuf.reset_param_main_grad()
                     if self.buffer.ddp_config.outer_dp_sharding_strategy != "no_shard":
                         # Free any allocated buckets used for HFSDP, e.g. NCCL UB.
                         self.buffer.parameter_groups[
@@ -3948,6 +3921,11 @@ class AllGatherPipeline:
             they are no longer needed.
             - If the bucket has a transpose weight buffer (used in FP8 backward passes),
             this buffer is freed; otherwise, the model weight buffer is released.
+            - This function should NOT be invoked on buckets associated with modules not
+            identified as FSDP unit modules, even when weights are sharded in the case of
+            `optim_grads_params`. Non-unit modules should remain persistently allocated
+            because they do not satisfy FSDP unit module state requirements, e.g. their
+            parameters are simultaneously modified or shared with other modules.
         """
         bucket_key = self.get_bucket_key(bucket_id, bwd)
         if self.bucket_status[bucket_key] == BucketStatus.EMPTY:
