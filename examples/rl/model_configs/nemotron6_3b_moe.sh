@@ -104,7 +104,7 @@ MODEL_OPTIONS="\
   --tiktoken-pattern v2 \
   --tokenizer-type TikTokenizer \
   --tokenizer-model ${TOKENIZER_MODEL} \
-  --dist-ckpt-strictness log_unexpected
+  --dist-ckpt-strictness log_unexpected \
   --ckpt-format torch_dist \
   --ckpt-fully-parallel-save \
   --ckpt-fully-parallel-load \
