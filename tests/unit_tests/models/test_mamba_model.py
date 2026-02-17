@@ -245,6 +245,9 @@ class TestMambaModel:
             tp=tp_group, cp=cp_group, pp=pp_group, embd=embd_group
         )
 
+        # Build pattern with '|' pipeline stage separators: 3 layers per PP stage
+        hybrid_layer_pattern = "|".join(["M*-"] * pp_size)
+
         # Configure model with appropriate sizes for parallelism
         model_config = TransformerConfig(
             num_layers=3 * pp_size,  # Scale layers with PP size
@@ -262,7 +265,7 @@ class TestMambaModel:
             mamba_stack_spec=mamba_stack_spec,
             vocab_size=128,
             max_sequence_length=4,
-            hybrid_layer_pattern="M*-",  # 1 Mamba, 1 attention, 1 MLP
+            hybrid_layer_pattern=hybrid_layer_pattern,
             pg_collection=pg_collection,
         )
 
