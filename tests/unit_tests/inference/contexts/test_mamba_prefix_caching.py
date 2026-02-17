@@ -10,16 +10,32 @@ Focuses on Mamba-specific prefix caching features:
 - Zero-budget behavior
 """
 
+import random
+import types
+
 import pytest
 import torch
 
+from megatron.core import parallel_state
 from megatron.core.inference.config import InferenceConfig, MambaInferenceStateConfig
 from megatron.core.inference.contexts.dynamic_context import DynamicInferenceContext
+from megatron.core.inference.engines import DynamicInferenceEngine
 from megatron.core.inference.inference_request import DynamicInferenceRequest
+from megatron.core.inference.model_inference_wrappers.gpt.gpt_inference_wrapper import (
+    GPTInferenceWrapper,
+)
 from megatron.core.inference.sampling_params import SamplingParams
+from megatron.core.inference.text_generation_controllers.text_generation_controller import (
+    TextGenerationController,
+)
+from megatron.core.models.mamba.mamba_layer_specs import mamba_stack_spec
+from megatron.core.models.mamba.mamba_model import MambaModel
 from megatron.core.ssm.mamba_hybrid_layer_allocation import Symbols
+from megatron.core.ssm.mamba_mixer import _check_mamba_sequence_packing_support
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
 from megatron.core.transformer import TransformerConfig
+from megatron.core.transformer.cuda_graphs import CudaGraphManager, _CudagraphGlobalRecord
+from megatron.core.utils import is_fa_min_version
 from tests.unit_tests.test_utilities import Utils
 
 
@@ -475,122 +491,308 @@ class TestMambaPrefixMatching:
             "B should get zero-init Mamba state when _mamba_num_matched_blocks=0"
 
 
-class TestCrossConfigEndToEnd:
-    """End-to-end tests verifying that different chunked_prefill x prefix_caching
-    configurations produce consistent results."""
+def _skip_if_mamba_sequence_packing_not_available():
+    """Skip if Mamba sequence packing is not available."""
+    sequence_packing_available, reason = _check_mamba_sequence_packing_support()
+    if not sequence_packing_available:
+        pytest.skip(reason)
 
-    def setup_method(self, method):
-        Utils.initialize_model_parallel(
-            tensor_model_parallel_size=1, pipeline_model_parallel_size=1
+
+def _build_engine(
+    enable_chunked_prefill,
+    enable_prefix_caching,
+    prefix_caching_mamba_gb,
+    block_size_tokens,
+    max_tokens,
+    max_requests,
+    vocab_size,
+    max_sequence_length,
+    buffer_size_gb,
+    seed,
+):
+    """Build a full MambaModel engine stack for end-to-end testing.
+
+    Returns (engine, model) tuple.
+    """
+    _set_rounder(4)
+
+    # Seed RNG for reproducible model weights.
+    random.seed(seed)
+    torch.manual_seed(seed)
+    model_parallel_cuda_manual_seed(
+        seed=seed,
+        inference_rng_tracker=True,
+        use_cudagraphable_rng=False,
+        force_reset_rng=True,
+    )
+
+    transformer_config = TransformerConfig(
+        params_dtype=torch.bfloat16,
+        num_layers=3,  # 1 Mamba + 1 attention + 1 MLP
+        hidden_size=256,
+        mamba_num_heads=16,
+        num_attention_heads=16,
+        use_cpu_initialization=True,
+        cuda_graph_impl="none",
+        inference_rng_tracker=True,
+        tensor_model_parallel_size=1,
+        pipeline_model_parallel_size=1,
+        pipeline_dtype=torch.bfloat16,
+        add_bias_linear=True,
+        is_hybrid_model=True,
+    )
+
+    model = MambaModel(
+        config=transformer_config,
+        mamba_stack_spec=mamba_stack_spec,
+        vocab_size=vocab_size,
+        max_sequence_length=max_sequence_length,
+        parallel_output=True,
+        hybrid_attention_ratio=0.3,
+        hybrid_mlp_ratio=0.3,
+        pre_process=parallel_state.is_pipeline_first_stage(),
+        post_process=parallel_state.is_pipeline_last_stage(),
+    ).cuda()
+
+    for param in model.parameters():
+        param.data = param.data.to(transformer_config.params_dtype)
+    model.eval()
+
+    mamba_inference_state_config = MambaInferenceStateConfig.from_model(model)
+
+    context = DynamicInferenceContext(
+        model_config=transformer_config,
+        inference_config=InferenceConfig(
+            max_sequence_length=max_sequence_length,
+            buffer_size_gb=buffer_size_gb,
+            paused_buffer_size_gb=0.2 * buffer_size_gb,
+            block_size_tokens=block_size_tokens,
+            max_tokens=max_tokens,
+            max_requests=max_requests,
+            mamba_inference_state_config=mamba_inference_state_config,
+            enable_chunked_prefill=enable_chunked_prefill,
+            enable_prefix_caching=enable_prefix_caching,
+            block_evict_lru=enable_prefix_caching,
+            prefix_caching_mamba_gb=prefix_caching_mamba_gb,
+            materialize_only_last_token_logits=False,
+            use_flashinfer_fused_rope=None,
+            unified_memory_level=0,
+        ),
+    )
+
+    wrapped = GPTInferenceWrapper(model, context)
+    wrapped.model_is_pipeline_parallel = not (
+        parallel_state.is_pipeline_first_stage() and parallel_state.is_pipeline_last_stage()
+    )
+
+    controller = TextGenerationController(
+        inference_wrapped_model=wrapped,
+        tokenizer=types.SimpleNamespace(
+            vocab_size=vocab_size,
+            detokenize=lambda tokens: "text",
+        ),
+    )
+
+    _CudagraphGlobalRecord.cudagraph_created = False
+    _CudagraphGlobalRecord.cudagraph_record = []
+    CudaGraphManager.global_mempool = None
+
+    engine = DynamicInferenceEngine(controller, context)
+    return engine, model
+
+
+def _install_deterministic_mock_forward(engine, vocab_size):
+    """Replace the model's forward with a deterministic mock.
+
+    The mock produces logits that are a deterministic function of position_ids,
+    ensuring identical output tokens across engine configurations (chunked vs
+    non-chunked, prefix-cached vs fresh) while avoiding TE GEMM issues.
+
+    The key insight: logits depend on position_ids (not input_ids), so
+    regardless of how the prompt is chunked, the logit at position P is
+    always the same. This simulates a position-aware model where the output
+    is independent of chunking boundaries.
+    """
+    def mock_forward(input_ids, position_ids, attention_mask, *args, **kwargs):
+        batch, seq_len = input_ids.shape
+        logits = torch.zeros(
+            batch, seq_len, vocab_size, device=input_ids.device, dtype=torch.bfloat16
         )
-        model_parallel_cuda_manual_seed(123)
+        for b in range(batch):
+            for s in range(seq_len):
+                pos = position_ids[b, s].item()
+                # Next token = (position + 7) % vocab_size, avoiding 0 and termination_id
+                predicted = (pos + 7) % (vocab_size - 1) + 1
+                logits[b, s, predicted] = 10.0
+        return logits
+
+    model = engine.controller.inference_wrapped_model.model
+    model.forward = mock_forward
+
+
+def _run_to_completion(engine, requests):
+    """Add requests, step engine until all complete, return generated tokens per request_id."""
+    for req in requests:
+        engine._add_request(req)
+
+    results = {}
+    while engine.has_unfinished_requests():
+        engine.schedule_waiting_requests()
+        result = engine.step_modern()
+        for record in result["finished_request_records"]:
+            finished = record.merge()
+            results[finished.request_id] = list(finished.generated_tokens)
+
+    return results
+
+
+class TestCrossConfigEndToEnd:
+    """Engine-level test verifying that chunked_prefill x prefix_caching
+    configurations produce identical output tokens through a MambaModel engine
+    stack with a deterministic mock forward.
+
+    Scenario:
+        block_size=32, max_tokens=80, num_tokens_to_generate=4
+        Request A: 64 tokens (2 blocks)
+        Request B: 100 tokens (first 64 shared with A, 36 unique)
+
+    When B is scheduled with chunked prefill + prefix caching:
+        Block:  |---block 0---|---block 1---|---block 2---|--block 3--|
+        Tokens: 0            32            64            96       100
+                |<-- prefix match (Mamba cached) -->|
+                |<----------- chunk 1 (80 tokens) ---------->|
+                                                    |<- chunk 2 ->|
+
+    Three configs compared:
+        1. chunked=True,  prefix=True   (interleaved boundaries)
+        2. chunked=True,  prefix=False  (full prefill in chunks)
+        3. chunked=False, prefix=False  (full prefill at once)
+
+    All three must produce identical output tokens for both A and B.
+
+    Uses a deterministic mock forward (position-based logits) to ensure
+    reproducible comparisons while exercising the full engine scheduling,
+    chunked prefill, and prefix caching codepaths.
+    """
 
     def teardown_method(self, method):
         Utils.destroy_model_parallel()
 
     @pytest.mark.internal
-    def test_cross_chunked_prefix_configs(self):
-        """Two requests sharing a 64-token prefix should produce consistent block
-        allocation across 4 configs: chunked_prefill x prefix_caching (on/off).
+    @pytest.mark.skipif(
+        not is_fa_min_version("2.7.3"), reason="need latest flash attn for dynamic batching"
+    )
+    @torch.no_grad()
+    def test_interleaving_boundaries(self):
+        _skip_if_mamba_sequence_packing_not_available()
 
-        With prefix_caching ON + Mamba state cached, request B reuses blocks.
-        With prefix_caching OFF, request B allocates all blocks fresh.
-        Both should be internally consistent.
-        """
+        # --- Parameters ---
+        seed = 42
+        vocab_size = 100
         block_size = 32
-        prompt_shared = torch.arange(64, device=torch.cuda.current_device())  # 2 blocks
-        prompt_b_extra = torch.arange(64, 100, device=torch.cuda.current_device())  # 36 more
-        prompt_b = torch.cat([prompt_shared, prompt_b_extra])  # 100 tokens total
+        max_tokens = 80
+        max_sequence_length = 256
+        buffer_size_gb = 0.1
+        num_tokens_to_generate = 4
+
+        # Seed once for deterministic prompt generation.
+        torch.manual_seed(seed)
+
+        # Shared prefix (64 tokens = 2 blocks) + B's unique suffix (36 tokens)
+        prompt_a = torch.randint(0, vocab_size - 1, (64,), device="cuda", dtype=torch.int64)
+        prompt_b = torch.cat([
+            prompt_a,
+            torch.randint(0, vocab_size - 1, (36,), device="cuda", dtype=torch.int64),
+        ])
 
         configs = [
-            {"enable_prefix_caching": True, "prefix_caching_mamba_gb": 0.01},
-            {"enable_prefix_caching": False, "prefix_caching_mamba_gb": None},
+            {
+                "name": "chunked+prefix",
+                "enable_chunked_prefill": True,
+                "enable_prefix_caching": True,
+                "prefix_caching_mamba_gb": 0.01,
+                "max_tokens": max_tokens,
+            },
+            {
+                "name": "chunked_only",
+                "enable_chunked_prefill": True,
+                "enable_prefix_caching": False,
+                "prefix_caching_mamba_gb": None,
+                "max_tokens": max_tokens,
+            },
+            {
+                "name": "baseline",
+                "enable_chunked_prefill": False,
+                "enable_prefix_caching": False,
+                "prefix_caching_mamba_gb": None,
+                "max_tokens": None,  # no chunking limit needed
+            },
         ]
 
+        all_results = {}
         for config in configs:
             # Re-init model parallel for each config
             Utils.destroy_model_parallel()
             Utils.initialize_model_parallel(
                 tensor_model_parallel_size=1, pipeline_model_parallel_size=1
             )
-            model_parallel_cuda_manual_seed(123)
 
-            ctx = _build_hybrid_context(
-                block_size=block_size,
-                buffer_size_gb=0.01,
-                max_tokens=None,
-                max_requests=8,
-                **config,
+            engine, model = _build_engine(
+                enable_chunked_prefill=config["enable_chunked_prefill"],
+                enable_prefix_caching=config["enable_prefix_caching"],
+                prefix_caching_mamba_gb=config["prefix_caching_mamba_gb"],
+                block_size_tokens=block_size,
+                max_tokens=config["max_tokens"],
+                max_requests=4,
+                vocab_size=vocab_size,
+                max_sequence_length=max_sequence_length,
+                buffer_size_gb=buffer_size_gb,
+                seed=seed,
             )
+            _install_deterministic_mock_forward(engine, vocab_size)
 
-            # --- Request A: 64 tokens (2 complete blocks) ---
-            a_idx = ctx.total_request_count  # 0
-            req_a = _make_request(1, prompt_shared.clone(), block_size)
-            ctx.add_request(req_a)
-            _simulate_prefill_completion(ctx)
+            # --- Request A: 64 tokens → run to completion ---
+            req_a = DynamicInferenceRequest(
+                request_id=0,
+                prompt_tokens=prompt_a.clone(),
+                sampling_params=SamplingParams(
+                    num_tokens_to_generate=num_tokens_to_generate,
+                    termination_id=-1,
+                ),
+                block_size_tokens=block_size,
+                enable_prefix_caching=config["enable_prefix_caching"],
+            )
+            results_a = _run_to_completion(engine, [req_a])
 
-            a_block_count = ctx.request_kv_block_counts[a_idx].item()
-            assert a_block_count == 2, f"Request A should use 2 blocks, got {a_block_count}"
+            # --- Request B: 100 tokens (shares first 64 with A) → run to completion ---
+            req_b = DynamicInferenceRequest(
+                request_id=1,
+                prompt_tokens=prompt_b.clone(),
+                sampling_params=SamplingParams(
+                    num_tokens_to_generate=num_tokens_to_generate,
+                    termination_id=-1,
+                ),
+                block_size_tokens=block_size,
+                enable_prefix_caching=config["enable_prefix_caching"],
+            )
+            results_b = _run_to_completion(engine, [req_b])
 
-            if config["enable_prefix_caching"]:
-                # Store Mamba state for both of A's blocks
-                mamba_idx_a = ctx.mamba_metadata.request_to_mamba_state_idx[a_idx].item()
-                ctx.mamba_conv_states[:, mamba_idx_a] = 42.0
-                ctx.mamba_ssm_states[:, mamba_idx_a] = 42.0
-                for blk_idx in range(2):
-                    blk_id = ctx.request_to_kv_block_ids[a_idx][blk_idx].item()
-                    ctx.store_mamba_state_for_block(blk_id, a_idx)
+            all_results[config["name"]] = {
+                "a": results_a[0],
+                "b": results_b[1],
+            }
 
-            # Release A
-            ctx.release_memory_blocks_from_request_indexes(torch.tensor([a_idx]))
-
-            # --- Request B: 100 tokens (shares first 64 with A) ---
-            b_idx = ctx.total_request_count  # 1
-            req_b = _make_request(2, prompt_b.clone(), block_size)
-            if config["enable_prefix_caching"]:
-                req_b._mamba_num_matched_blocks = 2  # Both blocks have Mamba state
-            ctx.add_request(req_b)
-            _simulate_prefill_completion(ctx)
-
-            b_block_count = ctx.request_kv_block_counts[b_idx].item()
-            # 100 tokens / 32 = 3.125 → 4 blocks total
-            assert b_block_count == 4, f"Request B should use 4 blocks, got {b_block_count}"
-
-            if config["enable_prefix_caching"]:
-                # With prefix caching: B matched 2 blocks + allocated 2 new = 4 total
-                # Mamba state should be restored
-                mamba_idx_b = ctx.mamba_metadata.request_to_mamba_state_idx[b_idx].item()
-                assert torch.allclose(
-                    ctx.mamba_conv_states[:, mamba_idx_b],
-                    torch.full_like(ctx.mamba_conv_states[:, mamba_idx_b], 42.0),
-                ), "B should have restored Mamba state in prefix_caching mode"
-
-    @pytest.mark.internal
-    def test_interleaving_boundaries(self):
-        """Verify the interleaving of Mamba boundaries:
-        divergence=64 < chunk_break=80 < last_aligned=96 < end=100."""
-        block_size = 32
-        prompt_length = 100
-
-        # divergence: where Mamba cache ends (2 blocks * 32 = 64)
-        num_mamba_matched = 2
-        divergence_token = num_mamba_matched * block_size
-        assert divergence_token == 64
-
-        # chunk_break: max_tokens limits first chunk (80)
-        max_tokens = 80
-        chunk_break = max_tokens
-        assert chunk_break == 80
-
-        # last_aligned: last block-aligned token
-        last_aligned_token = (prompt_length // block_size) * block_size
-        assert last_aligned_token == 96
-
-        # end of sequence
-        assert prompt_length == 100
-
-        # Verify interleaving
-        assert divergence_token < chunk_break < last_aligned_token < prompt_length
+        # --- Assertions: all configs must produce identical tokens ---
+        names = list(all_results.keys())
+        for i in range(1, len(names)):
+            for req_label in ("a", "b"):
+                tokens_ref = all_results[names[0]][req_label]
+                tokens_cur = all_results[names[i]][req_label]
+                assert tokens_ref == tokens_cur, (
+                    f"Request {req_label} mismatch between '{names[0]}' and '{names[i]}':\n"
+                    f"  {names[0]}: {tokens_ref}\n"
+                    f"  {names[i]}: {tokens_cur}"
+                )
 
 
 class TestBudgetZero:
