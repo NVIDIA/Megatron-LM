@@ -245,7 +245,7 @@ class DynamicInferenceContext(BaseInferenceContext):
         # Prefix caching configuration
         self.enable_prefix_caching = inference_config.enable_prefix_caching
         self.block_evict_lru = inference_config.block_evict_lru
-        self.prefix_caching_mamba_gb = getattr(inference_config, 'prefix_caching_mamba_gb', None)
+        self.prefix_caching_mamba_gb = inference_config.prefix_caching_mamba_gb
 
         # Step counter (used for LRU timestamps in prefix caching)
         self.step_count = 0
