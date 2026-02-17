@@ -166,8 +166,6 @@ class InferenceLayerNormColumnParallelLinear(TELayerNormColumnParallelLinear):
 
         # Check for MXFP8 execution
         if self.config.fp8_recipe == "mxfp8" and HAVE_FLASHINFER:
-            # Quantize activations (BF16 -> MXFP8)
-            # x is [M, K]
             x = MXFP8Tensor.from_bf16(x.squeeze(1))
             x = bmm_mxfp8(
                 x.data.unsqueeze(0),
@@ -259,8 +257,6 @@ class InferenceRowParallelLinear(TERowParallelLinear):
             # Write output of matmul directly onto the symmetric memory buffer
 
             if use_mxfp8:
-                # Quantize activations (BF16 -> MXFP8)
-                # x is [M, K]
                 x = MXFP8Tensor.from_bf16(x.squeeze(1))
                 x = bmm_mxfp8(
                     x.data.unsqueeze(0),

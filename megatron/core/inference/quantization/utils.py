@@ -46,18 +46,4 @@ def quantize_model_to_mxfp8(model: torch.nn.Module) -> None:
     if hasattr(model, '_parameters') and model._parameters:
         replace_in_dict(model._parameters)
 
-    """
-    # Check Buffers (e.g., running stats in BatchNorm)
-    if hasattr(module, '_buffers') and module._buffers:
-        replace_in_dict(module._buffers)
-
-    # Check standard attributes (in case the tensor is stored loosely)
-    # We filter out methods and system attributes
-    for key in list(module.__dict__.keys()):
-        val = module.__dict__[key]
-        if isinstance(val, TEMXFP8Tensor):
-             new_val = MXFP8Tensor.from_bf16(val.dequantize())
-             setattr(module, key, new_val)
-    """
-
     return model
