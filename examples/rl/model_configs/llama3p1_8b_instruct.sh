@@ -102,6 +102,7 @@ MODEL_OPTIONS="\
   --tokenizer-type HuggingFaceTokenizer \
   --tokenizer-model unsloth/Meta-Llama-3.1-8B-Instruct \
   --tokenizer-hf-use-fast \
+  --tokenizer-hf-include-special-tokens \
   --lr 3e-7 \
   --make-vocab-size-divisible-by 128 \
   --clip-grad 1.0 \
