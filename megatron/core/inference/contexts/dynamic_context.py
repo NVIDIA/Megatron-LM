@@ -229,7 +229,7 @@ class DynamicInferenceContext(BaseInferenceContext):
     """
 
     DEFAULT_MAX_TOKENS = 16384
-    TOKEN_ROUNDER = 128
+    TOKEN_ROUNDER = 64
     REQUEST_ROUNDER = 4
 
     @deprecate_args(

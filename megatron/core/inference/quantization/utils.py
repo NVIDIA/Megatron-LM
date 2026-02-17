@@ -11,39 +11,59 @@ try:
 except ImportError:
     HAVE_TE = False
 
+try:
+    from flashinfer import bmm_mxfp8
+
+    HAVE_FLASHINFER = True
+except ImportError:
+    HAVE_FLASHINFER = False
+
 
 def quantize_model_to_mxfp8(model: torch.nn.Module) -> None:
-    """Quantizes a model to mxfp8."""
-
+    """
+    Converts a TE MXFP8 model to a FlashInfer MXFP8 model by
+    recursively translating each layer's weights.
+    """
     assert HAVE_TE
 
-    # 1. Recurse on all child modules (layers)
+    # Recurse through child modules
     for child in model.children():
         quantize_model_to_mxfp8(child)
 
-    # 2. Inspect and replace Parameters, Buffers, and Attributes
-    # We iterate over the instance dictionary to ensure we catch attributes
-    # that might not be registered as Parameters or Buffers yet.
-
-    # Helper to process a specific dictionary (like _parameters, _buffers, or __dict__)
     def replace_in_dict(attr_dict):
-        # Create a list of keys to avoid runtime errors while modifying the dict
+        """Helper function to replace TE MXFP8 weights."""
         keys = list(attr_dict.keys())
         for key in keys:
             val = attr_dict[key]
             if isinstance(val, TEMXFP8Tensor):
-                # Perform the quantization
+                # Undo the TE quantization and re-quantize with FlashInfer
+                # Note that this introduces a one-time overhead but avoids any
+                # numerical differences between TE and FlashInfer MXFP8 formats
                 new_val = MXFP8Tensor.from_bf16(val.dequantize())
 
-                # Replace the value.
-                # using setattr ensures PyTorch internal logic (like moving
-                # from _parameters to normal attributes) is handled correctly.
+                # Remove the existing TE parameter and then replace the
+                # attribute with the re-quantized tensor
                 del model._parameters[key]
                 setattr(model, key, new_val)
 
-    # Check Parameters (e.g., weights, biases)
-    # We check _parameters directly to be safe, though setattr handles updates.
     if hasattr(model, '_parameters') and model._parameters:
         replace_in_dict(model._parameters)
 
     return model
+
+def mm_mxfp8(x: torch.Tensor, weight: torch.Tensor, out: torch.Tensor = None):
+    """Computes a matmul in MXFP8 using FlashInfer."""
+    assert HAVE_FLASHINFER
+
+    # TODO(ksanthanam): Use the FlashInfer mm_mxfp8 API once 0.6.4 is released
+
+    x = MXFP8Tensor.from_bf16(x.squeeze(1))
+    return bmm_mxfp8(
+        x.data.unsqueeze(0),
+        self.weight.data.T.unsqueeze(0),
+        x.scale,
+        self.weight.scale,
+        dtype=torch.bfloat16,
+        out=out,
+    ).transpose(0, 1)
+

@@ -14,6 +14,7 @@ from megatron.core.inference.communication.torch_symm_triton import (
     multimem_reduce_scatter,
 )
 from megatron.core.inference.quantization.mxfp8_tensor import MXFP8Tensor
+from megatron.core.inference.quantization.utils import mm_mxfp8
 from megatron.core.model_parallel_config import ModelParallelConfig
 from megatron.core.parallel_state import get_global_symmetric_memory_buffer
 from megatron.core.transformer.transformer_config import TransformerConfig
@@ -31,12 +32,6 @@ try:
 except ImportError:
     HAVE_TE = False
 
-try:
-    from flashinfer import bmm_mxfp8
-
-    HAVE_FLASHINFER = True
-except ImportError as e:
-    HAVE_FLASHINFER = False
 
 
 def _te_rms_norm_kernel(x: torch.Tensor, weight: torch.Tensor, eps: float):
@@ -166,14 +161,7 @@ class InferenceLayerNormColumnParallelLinear(TELayerNormColumnParallelLinear):
 
         # Check for MXFP8 execution
         if self.config.fp8_recipe == "mxfp8" and HAVE_FLASHINFER:
-            x = MXFP8Tensor.from_bf16(x.squeeze(1))
-            x = bmm_mxfp8(
-                x.data.unsqueeze(0),
-                self.weight.data.T.unsqueeze(0),
-                x.scale,
-                self.weight.scale,
-                dtype=torch.bfloat16,
-            ).transpose(0, 1)
+            x = mm_mxfp8(x, self.weight)
         else:
             x = torch.matmul(x, self.weight.t())
 
@@ -257,17 +245,7 @@ class InferenceRowParallelLinear(TERowParallelLinear):
             # Write output of matmul directly onto the symmetric memory buffer
 
             if use_mxfp8:
-                x = MXFP8Tensor.from_bf16(x.squeeze(1))
-                x = bmm_mxfp8(
-                    x.data.unsqueeze(0),
-                    self.weight.data.T.unsqueeze(0),
-                    x.scale,
-                    self.weight.scale,
-                    dtype=torch.bfloat16,
-                    out=symm_mem_buffer["tensor"],
-                )
-                x = symm_mem_buffer["tensor"].transpose(0, 1)
-
+                x = mm_mxfp8(x, self.weight, out=symm_mem_buffer["tensor"])
             else:
                 # Standard GEMM
                 torch.matmul(x, self.weight.t(), out=symm_mem_buffer["tensor"])
@@ -303,15 +281,7 @@ class InferenceRowParallelLinear(TERowParallelLinear):
         else:
             # revert to torch dist (NCCL) reduce-scatter
             if use_mxfp8:
-                x = MXFP8Tensor.from_bf16(x.squeeze(1))
-                x = bmm_mxfp8(
-                    x.data.unsqueeze(0),
-                    self.weight.data.T.unsqueeze(0),
-                    x.scale,
-                    self.weight.scale,
-                    dtype=torch.bfloat16,
-                ).transpose(0, 1)
-
+                x = mm_mxfp8(x, self.weight)
             else:
                 x = torch.matmul(x, self.weight.t())
 
@@ -339,14 +309,7 @@ class InferenceRowParallelLinear(TERowParallelLinear):
         """
         if self.tp_size == 1:
             if self.config.fp8_recipe == "mxfp8" and HAVE_FLASHINFER:
-                x = MXFP8Tensor.from_bf16(x.squeeze(1))
-                x = bmm_mxfp8(
-                    x.data.unsqueeze(0),
-                    self.weight.data.T.unsqueeze(0),
-                    x.scale,
-                    self.weight.scale,
-                    dtype=torch.bfloat16,
-                ).transpose(0, 1)
+                x = mm_mxfp8(x, self.weight)
             else:
                 x = torch.matmul(x, self.weight.t())
             return x, None
