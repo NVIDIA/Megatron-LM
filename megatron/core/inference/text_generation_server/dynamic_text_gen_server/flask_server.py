@@ -64,10 +64,11 @@ async def run_flask_server_on_client(
         return "Megatron Dynamic Inference Server is running."
 
     loop = asyncio.get_event_loop()
-    loop.set_default_executor(ThreadPoolExecutor(max_workers=4096))
+    loop.set_default_executor(ThreadPoolExecutor(max_workers=8192))
 
     config = Config()
     config.bind = [f"0.0.0.0:{flask_port}"]
+    config.backlog = 8192
 
     # Force logging level to INFO to ensure that hostname is printed
     with temp_log_level(logging.INFO, logger):
