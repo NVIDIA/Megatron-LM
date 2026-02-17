@@ -11,4 +11,4 @@ coverage:
         if_no_uploads: success
         if_not_found: success
 fixes:
-  - "/workspace/megatron/::"
+  - "/opt/megatron-lm/::"
