@@ -1,5 +1,6 @@
 # Copyright (c) 2025, NVIDIA CORPORATION. All rights reserved.
 
+from collections import deque
 from typing import Dict, Optional
 
 import torch
@@ -68,8 +69,10 @@ class BlockAllocator:
                 )
 
             # Pending block hashes for prefix caching coordination
-            # Maps block_id -> hash for blocks registered but not yet computed
-            self._pending_block_hashes: Dict[int, int] = {}
+            # -1 = not pending, positive = hash registered but KV not yet computed
+            self._pending_block_hashes = torch.full(
+                (self.total_count,), -1, dtype=torch.int64, device=torch.cuda.current_device()
+            )
 
     def __str__(self):
         return (
@@ -213,7 +216,7 @@ class BlockAllocator:
 
             # Reset prefix caching state
             self.hash_to_block_id.clear()
-            self._pending_block_hashes.clear()
+            self._pending_block_hashes.fill_(-1)
             self.block_ref_counts.fill_(0)
             if self.block_evict_lru:
                 self.block_timestamps.fill_(0)
@@ -222,34 +225,45 @@ class BlockAllocator:
     # Prefix caching methods
     # =========================================================================
 
-    def register_block_hash(self, block_id: int, block_hash: int) -> None:
-        """Register a block in the hash-to-block mapping for discovery.
+    def register_block_hashes(self, block_ids: list[int], block_hashes: list[int]) -> None:
+        """Register blocks in the hash-to-block mapping for discovery (batch).
 
-        NOTE: Does NOT mark block as computed. Call mark_block_computed() after
+        NOTE: Does NOT mark blocks as computed. Call mark_blocks_computed() after
         KV is computed. This two-phase approach enables prefix caching coordination
         where subsequent requests wait for blocks to be computed before reusing.
 
         Args:
-            block_id: The block ID.
-            block_hash: The computed hash value.
+            block_ids: List of block IDs.
+            block_hashes: List of computed hash values (same length as block_ids).
         """
-        # Store hash for later use, but block_hashes stays -1 until computed
-        self._pending_block_hashes[block_id] = block_hash
-        self.hash_to_block_id[block_hash] = block_id
+        if not block_ids:
+            return
+        id_tensor = torch.tensor(
+            block_ids, dtype=torch.int64, device=self._pending_block_hashes.device
+        )
+        hash_tensor = torch.tensor(
+            block_hashes, dtype=torch.int64, device=self._pending_block_hashes.device
+        )
+        self._pending_block_hashes[id_tensor] = hash_tensor
+        self.hash_to_block_id.update(zip(block_hashes, block_ids))
 
-    def mark_block_computed(self, block_id: int) -> None:
-        """Mark a block as having its KV computed.
+    def mark_blocks_computed(self, block_ids: list[int]) -> None:
+        """Mark blocks as having their KV computed (batch).
 
         Called after prefill completes for blocks that were registered.
         This sets block_hashes[block_id] to the actual hash value,
-        signaling that the KV cache for this block is ready for reuse.
+        signaling that the KV cache for these blocks is ready for reuse.
 
         Args:
-            block_id: The block ID to mark as computed.
+            block_ids: List of block IDs to mark as computed.
         """
-        if block_id in self._pending_block_hashes:
-            hash_value = self._pending_block_hashes.pop(block_id)
-            self.block_hashes[block_id] = hash_value
+        if not block_ids:
+            return
+        id_tensor = torch.tensor(
+            block_ids, dtype=torch.int64, device=self._pending_block_hashes.device
+        )
+        self.block_hashes[id_tensor] = self._pending_block_hashes[id_tensor]
+        self._pending_block_hashes[id_tensor] = -1
 
     def _deregister_blocks(self, block_ids: Tensor) -> None:
         """Remove blocks from prefix caching state and return to free pool.
@@ -263,25 +277,22 @@ class BlockAllocator:
         if num_blocks == 0:
             return
 
-        # Bulk transfer block IDs and their hashes from GPU to CPU (2 syncs total
-        # instead of 2N syncs from per-element .item() calls).
-        block_ids_list = block_ids.tolist()
-        block_hashes_list = self.block_hashes[block_ids].tolist()
+        # Gather pending and computed hashes via batched tensor indexing
+        block_ids_i64 = block_ids.to(torch.int64)
+        pending_hashes = self._pending_block_hashes[block_ids_i64]
+        computed_hashes = self.block_hashes[block_ids_i64]
 
-        # Remove from hash mappings
-        for block_id_int, block_hash in zip(block_ids_list, block_hashes_list):
+        # Single GPU→CPU transfer for all hash values
+        all_hashes = torch.stack([pending_hashes, computed_hashes]).tolist()
+        pending_list = all_hashes[0]
+        computed_list = all_hashes[1]
 
-            # Clean up pending hash if block was pending computation
-            if block_id_int in self._pending_block_hashes:
-                pending_hash = self._pending_block_hashes.pop(block_id_int)
-                if pending_hash in self.hash_to_block_id:
-                    del self.hash_to_block_id[pending_hash]
+        # Remove from hash_to_block_id dict (set ops + C-level map, no Python loop)
+        keys_to_delete = (set(pending_list) | set(computed_list)) - {-1}
+        deque(map(self.hash_to_block_id.pop, keys_to_delete & self.hash_to_block_id.keys()), maxlen=0)
 
-            # Clean up computed hash
-            if block_hash in self.hash_to_block_id:
-                del self.hash_to_block_id[block_hash]
-
-        # Reset block state
+        # Reset block state (batched tensor ops)
+        self._pending_block_hashes[block_ids_i64] = -1
         self.block_hashes[block_ids] = -1
         self.block_ref_counts[block_ids] = 0
         if self.block_evict_lru:

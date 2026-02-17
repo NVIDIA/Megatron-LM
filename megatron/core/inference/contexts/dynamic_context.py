@@ -1506,19 +1506,23 @@ class DynamicInferenceContext(BaseInferenceContext):
         if req.precomputed_block_hashes is None or len(req.precomputed_block_hashes) == 0:
             return [], 0
 
-        matched_blocks = []
-        parent_hash = 0
+        hashes = req.precomputed_block_hashes
+        hash_to_block = self.block_allocator.hash_to_block_id
 
-        for block_hash in req.precomputed_block_hashes:
-            existing_block = self.block_allocator.hash_to_block_id.get(block_hash)
+        # Batch dict lookups via C-level map() — faster than Python for loop
+        block_ids = list(map(hash_to_block.get, hashes))
 
-            if existing_block is not None:
-                matched_blocks.append(existing_block)
-                parent_hash = block_hash
-            else:
-                # No match found, stop here
-                break
+        # Find prefix length (first None = first miss)
+        try:
+            prefix_len = block_ids.index(None)
+        except ValueError:
+            prefix_len = len(block_ids)
 
+        if prefix_len == 0:
+            return [], 0
+
+        matched_blocks = block_ids[:prefix_len]
+        parent_hash = hashes[prefix_len - 1]
         return matched_blocks, parent_hash
 
     def mark_pending_blocks_computed(self) -> None:
@@ -1528,8 +1532,7 @@ class DynamicInferenceContext(BaseInferenceContext):
         as having their KV computed. This enables prefix caching coordination
         where subsequent requests can safely reuse these blocks.
         """
-        for block_id in self._blocks_pending_computation:
-            self.block_allocator.mark_block_computed(block_id)
+        self.block_allocator.mark_blocks_computed(self._blocks_pending_computation)
         self._blocks_pending_computation.clear()
 
     def add_request(self, req: DynamicInferenceRequest, chunk_length: Optional[int] = None) -> None:
@@ -1711,10 +1714,13 @@ class DynamicInferenceContext(BaseInferenceContext):
                 block_ids_to_hash = self.request_to_kv_block_ids[current_id][
                     first_block_to_hash:num_complete_blocks
                 ].tolist()
-                for i, block_id in enumerate(block_ids_to_hash):
-                    block_hash = req.precomputed_block_hashes[first_block_to_hash + i]
-                    self.block_allocator.register_block_hash(block_id, block_hash)
-                    self._blocks_pending_computation.append(block_id)
+                block_hashes_slice = req.precomputed_block_hashes[
+                    first_block_to_hash:num_complete_blocks
+                ]
+                self.block_allocator.register_block_hashes(
+                    block_ids_to_hash, block_hashes_slice
+                )
+                self._blocks_pending_computation.extend(block_ids_to_hash)
 
         if self.is_hybrid_model and not is_chunked_prefill:
             # Allocate a slot for Mamba states

@@ -883,6 +883,18 @@ class DynamicInferenceEngine(AbstractEngine):
         log_probs_iter = log_probs if log_probs else repeat(None)
         block_allocator = self.context.block_allocator
 
+        # Pre-compute step-level block stats (before the per-request loop)
+        if self.track_generated_token_events:
+            blocks_allocated = block_allocator.total_count - block_allocator.total_avail
+            if block_allocator.enable_prefix_caching:
+                blocks_hashed_active = int(
+                    (block_allocator.block_ref_counts > 0).sum().item()
+                )
+                blocks_ref_count = block_allocator.block_ref_counts.sum().item()
+            else:
+                blocks_hashed_active = blocks_allocated
+                blocks_ref_count = None
+
         for req_idx, (request_id, token, request_log_probs) in enumerate(
             zip(request_ids.tolist(), sample.tolist(), log_probs_iter)
         ):
@@ -894,23 +906,20 @@ class DynamicInferenceEngine(AbstractEngine):
                     is_first_token = len(request.generated_tokens) == 0
                     request.generated_tokens.append(token)
                     if self.track_generated_token_events:
-                        blocks_allocated = block_allocator.total_count - block_allocator.total_avail
                         if block_allocator.enable_prefix_caching:
                             event_generated_token = request.add_event_generated_token(
                                 token,
                                 blocks_total=block_allocator.total_count,
                                 blocks_hashed_total=blocks_allocated,
-                                blocks_hashed_active=int(
-                                    (block_allocator.block_ref_counts > 0).sum().item()
-                                ),
-                                blocks_ref_count=block_allocator.block_ref_counts.sum().item(),
+                                blocks_hashed_active=blocks_hashed_active,
+                                blocks_ref_count=blocks_ref_count,
                             )
                         else:
                             event_generated_token = request.add_event_generated_token(
                                 token,
                                 blocks_total=block_allocator.total_count,
                                 blocks_hashed_total=blocks_allocated,
-                                blocks_hashed_active=blocks_allocated,
+                                blocks_hashed_active=blocks_hashed_active,
                             )
                     if is_first_token:
                         if self.track_generated_token_events:
@@ -1116,7 +1125,7 @@ class DynamicInferenceEngine(AbstractEngine):
             stop_len = len(stop_word_ids)
             if len(generated_tokens) >= stop_len:
                 # Check if the last stop_len tokens match the stop word
-                if list(generated_tokens[-stop_len:]) == stop_word_ids:
+                if generated_tokens[-stop_len:] == stop_word_ids:
                     return True
 
         return False
@@ -1141,15 +1150,22 @@ class DynamicInferenceEngine(AbstractEngine):
             return False
 
         block_allocator = self.context.block_allocator
-        for block_hash in req.precomputed_block_hashes:
-            block_id = block_allocator.hash_to_block_id.get(block_hash)
-            if block_id is None:
-                # No cached block for this hash — remaining blocks won't match either
-                break
-            if block_allocator.block_hashes[block_id].item() == -1:
-                # Block is registered but KV not yet computed
-                return True
-        return False
+        hash_to_block = block_allocator.hash_to_block_id
+
+        # Phase 1: CPU-only dict lookups to find all matching block IDs
+        block_ids = list(map(hash_to_block.get, req.precomputed_block_hashes))
+        try:
+            prefix_len = block_ids.index(None)
+        except ValueError:
+            prefix_len = len(block_ids)
+        matched_ids = block_ids[:prefix_len]
+
+        if not matched_ids:
+            return False
+
+        # Phase 2: Single batched GPU read (1 sync instead of N)
+        id_tensor = torch.tensor(matched_ids, dtype=torch.int64, device=block_allocator.block_hashes.device)
+        return (block_allocator.block_hashes[id_tensor] == -1).any().item()
 
     def get_prefix_coordination_metrics(self) -> dict:
         """Return prefix caching coordination metrics.

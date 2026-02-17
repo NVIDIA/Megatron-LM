@@ -5,6 +5,7 @@ import time
 import warnings
 from dataclasses import asdict, dataclass, field
 from enum import Enum, auto
+from itertools import accumulate
 from typing import Any, Dict, List, Optional, Tuple
 
 import torch
@@ -69,28 +70,48 @@ HASH_BASE = 31
 _hash_powers: Optional[torch.Tensor] = None
 
 
-def compute_block_hash(parent_hash: int, token_ids: torch.Tensor) -> int:
-    """Compute hash for a block from (parent_hash, token_ids).
+def compute_block_hashes_batched(
+    prompt_tokens: torch.Tensor, block_size: int
+) -> List[int]:
+    """Compute hashes for all complete blocks in a prompt in one batched operation.
 
-    Uses a GPU-based polynomial rolling hash combined with the parent hash.
+    Reshapes prompt tokens into [num_blocks, block_size], computes all per-block
+    token hashes via a single GPU matmul, transfers results with one .tolist() call,
+    and chains parent hashes on CPU.
 
     Args:
-        parent_hash: Hash of parent block (0 for first block in sequence).
-        token_ids: Token IDs in this block, shape [block_size_tokens].
+        prompt_tokens: All prompt token IDs, shape [seq_len].
+        block_size: Number of tokens per block.
 
     Returns:
-        Positive integer hash value (1 to HASH_PRIME).
+        List of positive integer hash values (1 to HASH_PRIME), one per complete block.
     """
-    global _hash_powers
-    if _hash_powers is None:
-        block_size = token_ids.shape[0]
-        positions = torch.arange(block_size, device=token_ids.device, dtype=torch.int64)
-        _hash_powers = torch.pow(HASH_BASE, positions).to(torch.int64) % HASH_PRIME
-    token_hash = ((token_ids.to(torch.int64) * _hash_powers).sum() % HASH_PRIME).item()
+    num_complete_blocks = len(prompt_tokens) // block_size
+    if num_complete_blocks == 0:
+        return []
 
-    # Combine with parent hash
-    combined = (parent_hash * HASH_BASE + token_hash) % HASH_PRIME
-    return combined + 1  # Ensure positive (1 to HASH_PRIME)
+    global _hash_powers
+    if _hash_powers is None or _hash_powers.shape[0] != block_size:
+        positions = torch.arange(block_size, device=prompt_tokens.device, dtype=torch.int64)
+        _hash_powers = torch.pow(HASH_BASE, positions).to(torch.int64) % HASH_PRIME
+
+    # Reshape to [num_blocks, block_size] (zero-copy view) and compute all token hashes
+    blocks = prompt_tokens[: num_complete_blocks * block_size].view(num_complete_blocks, block_size)
+    token_hashes = (blocks.to(torch.int64) * _hash_powers).sum(dim=1) % HASH_PRIME
+
+    # Single GPU→CPU transfer
+    token_hashes_list = token_hashes.tolist()
+
+    # Chain parent hashes on CPU (C-level accumulate, no Python loop)
+    hashes = list(
+        accumulate(
+            token_hashes_list,
+            lambda parent, th: (parent * HASH_BASE + th) % HASH_PRIME + 1,
+            initial=0,
+        )
+    )[1:]
+
+    return hashes
 
 
 @dataclass(kw_only=True)
@@ -361,20 +382,9 @@ class DynamicInferenceRequest(InferenceRequest):
         - precomputed_block_hashes is [] if prompt < block_size (no complete blocks)
         - precomputed_block_hashes is [hash1, ...] for N complete blocks
         """
-        num_complete_blocks = len(self.prompt_tokens) // self.block_size_tokens
-
-        hashes = []
-        parent_hash = 0
-
-        for block_pos in range(num_complete_blocks):
-            start = block_pos * self.block_size_tokens
-            end = start + self.block_size_tokens
-            block_tokens = self.prompt_tokens[start:end]
-            block_hash = compute_block_hash(parent_hash, block_tokens)
-            hashes.append(block_hash)
-            parent_hash = block_hash
-
-        self.precomputed_block_hashes = hashes
+        self.precomputed_block_hashes = compute_block_hashes_batched(
+            self.prompt_tokens, self.block_size_tokens
+        )
 
     @property
     def remaining_prompt_length(self):

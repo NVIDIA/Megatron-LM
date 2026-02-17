@@ -14,7 +14,7 @@ from megatron.core.inference.inference_request import (
     DynamicInferenceRequest,
     DynamicInferenceRequestRecord,
     Status,
-    compute_block_hash,
+    compute_block_hashes_batched,
 )
 from megatron.core.inference.sampling_params import SamplingParams
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
@@ -116,19 +116,21 @@ class TestHashComputation(PrefixCachingTestBase):
     def test_hash_determinism_and_quality(self):
         """Same tokens → same hash; different tokens → different; parent-sensitivity."""
         tokens = self._prompt(32)
-        h1 = compute_block_hash(0, tokens)
-        h2 = compute_block_hash(0, tokens)
+        h1 = compute_block_hashes_batched(tokens, 32)
+        h2 = compute_block_hashes_batched(tokens, 32)
         assert h1 == h2, "Hash should be deterministic"
-        assert 1 <= h1 <= HASH_PRIME, "Hash should be in [1, HASH_PRIME]"
+        assert len(h1) == 1
+        assert 1 <= h1[0] <= HASH_PRIME, "Hash should be in [1, HASH_PRIME]"
 
         # Different tokens
-        h_diff = compute_block_hash(0, self._prompt(32, offset=1))
-        assert h_diff != h1
+        h_diff = compute_block_hashes_batched(self._prompt(32, offset=1), 32)
+        assert h_diff[0] != h1[0]
 
-        # Parent sensitivity
-        h_parent = compute_block_hash(12345, tokens)
-        assert h_parent != h1
-        assert 1 <= h_parent <= HASH_PRIME
+        # Parent sensitivity (two blocks: hash of block 1 depends on block 0)
+        two_blocks = torch.cat([tokens, self._prompt(32, offset=100)])
+        h_chain = compute_block_hashes_batched(two_blocks, 32)
+        assert len(h_chain) == 2
+        assert 1 <= h_chain[1] <= HASH_PRIME
 
     @pytest.mark.internal
     def test_precomputed_hash_chain(self):
@@ -140,12 +142,9 @@ class TestHashComputation(PrefixCachingTestBase):
         req = self._req(ctx, prompt)
         assert len(req.precomputed_block_hashes) == 3
 
-        # Verify against manual computation
-        parent = 0
-        for i in range(3):
-            expected = compute_block_hash(parent, prompt[i * bs : (i + 1) * bs])
-            assert req.precomputed_block_hashes[i] == expected
-            parent = expected
+        # Verify against manual computation via batched function
+        expected = compute_block_hashes_batched(prompt, bs)
+        assert req.precomputed_block_hashes == expected
 
         # Identical requests produce identical hashes
         req2 = self._req(ctx, prompt.clone(), request_id=2)
@@ -486,14 +485,14 @@ class TestTwoPhaseRegistration(PrefixCachingTestBase):
         assert alloc.hash_to_block_id.get(h1) == b1
         assert alloc.block_hashes[b0].item() == -1
         assert alloc.block_hashes[b1].item() == -1
-        assert b0 in alloc._pending_block_hashes
+        assert alloc._pending_block_hashes[b0].item() != -1
         assert len(ctx._blocks_pending_computation) == 2
 
         # Phase 2: mark computed
         ctx.mark_pending_blocks_computed()
         assert alloc.block_hashes[b0].item() == h0
         assert alloc.block_hashes[b1].item() == h1
-        assert b0 not in alloc._pending_block_hashes
+        assert alloc._pending_block_hashes[b0].item() == -1
         assert len(ctx._blocks_pending_computation) == 0
 
     @pytest.mark.internal
@@ -535,14 +534,14 @@ class TestTwoPhaseRegistration(PrefixCachingTestBase):
         bid = block_ids[0].item()
         test_hash = 99999
 
-        alloc.register_block_hash(bid, test_hash)
+        alloc.register_block_hashes([bid], [test_hash])
 
         # Lookup finds it, but block_hashes == -1
         assert alloc.hash_to_block_id.get(test_hash) == bid
         assert alloc.block_hashes[bid].item() == -1
 
         # After mark: real hash
-        alloc.mark_block_computed(bid)
+        alloc.mark_blocks_computed([bid])
         assert alloc.block_hashes[bid].item() == test_hash
 
 
