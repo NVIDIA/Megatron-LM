@@ -3493,18 +3493,24 @@ class GradReducePipeline:
 
                         # (DP-Shard, DP-Outer) if HFSDP, otherwise just DP-Shard for HSDP
                         main_grad_buffer = self.buffer.parameter_groups[bucket_id].main_grad_buffer
-                        unreduced_grad = self.get_fsdp_buffer(bucket_id).data
+
+                        # FSDP buffer can be un-sharded or sharded for HSDP, but sharded for HFSDP.
+                        fsdp_grad_buffer = self.get_fsdp_buffer(bucket_id)
+                        unreduced_grad = fsdp_grad_buffer.data
 
                         # Cast DP-Shard gradient to communication dtype if specified and necessary.
-                        # FSDP buffer can be un-sharded or sharded for HSDP, but sharded for HFSDP.
                         custom_grad_comm_dtype = (
                             mp_policy.grad_comm_dtype is not None
                             and unreduced_grad.dtype != mp_policy.grad_comm_dtype
                         )
                         if custom_grad_comm_dtype:
-                            # Create a custom communication buffer with gbuf.
+                            # Free the bucket allocated for the DP-Shard reduction,
+                            # which has been waited on already.
+                            if fsdp_grad_buffer.is_data_distributed:
+                                fsdp_grad_buffer.free_bucket_storage()
+                            # Create a custom communication buffer with fsdp_grad_buffer.
                             # Introduces copy and memory overhead.
-                            unreduced_grad = gbuf.allocate_bucket_storage(
+                            unreduced_grad = fsdp_grad_buffer.allocate_bucket_storage(
                                 size=unreduced_grad.numel(),
                                 dtype=mp_policy.grad_comm_dtype,
                                 device=unreduced_grad.device,
@@ -3512,7 +3518,7 @@ class GradReducePipeline:
                             ).data
 
                         # All-reduce or reduce-scatter the DP-Shard gradients across DP-Outer.
-                        if ddp_config.outer_dp_sharding_strategy == "optim":
+                        if ddp_config.outer_dp_sharding_strategy != "no_shard":
                             # Retrieve the (DP-Outer, DP-Shard) gradient shard from the
                             # main gradient buffer which shards across the entire DP group,
                             # i.e. across all DP-Shard and DP-Outer ranks.
@@ -3583,6 +3589,11 @@ class GradReducePipeline:
                         # sharded gradients. (Un-sharded gradients use temporary
                         # communication buffers not managed by gbuf.)
                         gbuf.free_bucket_storage()
+                    if self.buffer.ddp_config.outer_dp_sharding_strategy != "no_shard":
+                        # Free any allocated buckets used for HFSDP, e.g. NCCL UB.
+                        self.buffer.parameter_groups[
+                            bucket_id
+                        ].main_grad_buffer.free_bucket_storage()
                     # Mark the bucket as deallocated / empty.
                     self.bucket_status[bucket_id] = BucketStatus.EMPTY
 
