@@ -9,10 +9,7 @@ in hybrid Mamba-Attention models.
 import pytest
 import torch
 
-from megatron.core.inference.config import InferenceConfig
-from megatron.core.inference.contexts.attention_context.mamba_metadata import (
-    MambaInferenceStateConfig,
-)
+from megatron.core.inference.config import InferenceConfig, MambaInferenceStateConfig
 from megatron.core.inference.contexts.dynamic_context import (
     DynamicInferenceContext,
 )
@@ -108,6 +105,7 @@ class MambaPrefixCachingTestBase:
             use_flashinfer_fused_rope=None,
             unified_memory_level=0,
             enable_prefix_caching=enable_prefix_caching,
+            block_evict_lru=enable_prefix_caching,
             prefix_caching_mamba_gb=prefix_caching_mamba_gb,
         )
         return DynamicInferenceContext(
@@ -745,7 +743,7 @@ class TestMambaIntegration(MambaPrefixCachingTestBase):
         context.store_mamba_state_for_block(block_0_id, 0)
 
         # Release request 1
-        context.release_request(0)
+        context.release_memory_blocks_from_request_indexes(torch.tensor([0]))
 
         # Second request with matching prefix
         request2 = DynamicInferenceRequest(

@@ -245,6 +245,7 @@ class DynamicInferenceContext(BaseInferenceContext):
         # Prefix caching configuration
         self.enable_prefix_caching = inference_config.enable_prefix_caching
         self.block_evict_lru = inference_config.block_evict_lru
+        self.prefix_caching_mamba_gb = inference_config.prefix_caching_mamba_gb
 
         # Step counter (used for LRU timestamps in prefix caching)
         self.step_count = 0
@@ -703,7 +704,7 @@ class DynamicInferenceContext(BaseInferenceContext):
             """Allocate Mamba state cache for prefix caching. Called below within
             `with ctx_manager:`."""
             # Calculate max slots from memory budget
-            prefix_caching_mamba_gb = inference_config.prefix_caching_mamba_gb
+            prefix_caching_mamba_gb = self.prefix_caching_mamba_gb
             if (self.is_hybrid_model and self.enable_prefix_caching and
                 prefix_caching_mamba_gb is not None and prefix_caching_mamba_gb > 0):
                 prefix_caching_mamba_bytes = int(prefix_caching_mamba_gb * (1024 ** 3))
