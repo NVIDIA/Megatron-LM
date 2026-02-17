@@ -115,9 +115,9 @@ def _load_teacher_model(config, config_raw: Namespace, model_kwargs: Dict[str, A
 
     if config.is_hybrid_model:
         # These parameters are not part of the TransformerConfig and need to be passed separately.
-        if "hybrid_layer_pattern" in config_raw:
+        if getattr(config_raw, 'hybrid_layer_pattern', None) is not None:
             model_kwargs["hybrid_layer_pattern"] = config_raw.hybrid_layer_pattern
-        elif "hybrid_override_pattern" in config_raw:
+        elif getattr(config_raw, 'hybrid_override_pattern', None) is not None:
             # Backward compat: map old name to new
             model_kwargs["hybrid_layer_pattern"] = config_raw.hybrid_override_pattern
 
