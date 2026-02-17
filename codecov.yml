@@ -1,0 +1,14 @@
+comment: false
+coverage:
+  status:
+    project: false
+    patch:
+      default:
+        target: 70%
+        threshold: 5%
+        base: auto
+        if_ci_failed: error
+        if_no_uploads: success
+        if_not_found: success
+fixes:
+  - "/workspace/megatron/::"
