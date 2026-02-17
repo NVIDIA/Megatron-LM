@@ -226,6 +226,28 @@ def get_tensor_device(tensor: Union[torch.Tensor, Dict[str, torch.Tensor]]):
     return tensor.device
 
 
+def _get_mtp_loss_scale(config, device: torch.device) -> torch.Tensor:
+    """Get the MTP loss scale on the output tensor device."""
+
+    def _normalize_loss_scale(loss_scale, scale_func_name: str) -> torch.Tensor:
+        loss_scale = torch.as_tensor(loss_scale, device=device)
+        if loss_scale.numel() != 1:
+            raise ValueError(
+                f"{scale_func_name} must return a scalar or size-1 tensor for MTP loss scaling, "
+                f"but returned a tensor with {loss_scale.numel()} elements."
+            )
+        return loss_scale
+
+    mtp_grad_scale_func = getattr(config, 'mtp_grad_scale_func', None)
+    if mtp_grad_scale_func is not None:
+        return _normalize_loss_scale(mtp_grad_scale_func(), "mtp_grad_scale_func")
+    if config.grad_scale_func is not None:
+        return _normalize_loss_scale(
+            config.grad_scale_func(torch.ones(1, device=device)), "grad_scale_func"
+        )
+    return torch.ones(1, device=device)
+
+
 def forward_step_calc_loss(
     model,
     output_tensor,
@@ -306,13 +328,10 @@ def forward_step_calc_loss(
 
     # Set the loss scale for Multi-Token Prediction (MTP) loss.
     if hasattr(config, 'mtp_num_layers') and config.mtp_num_layers is not None:
-        # Calculate the loss scale based on the grad_scale_func if available, else default to 1.
+        # Calculate the loss scale based on mtp_grad_scale_func if available,
+        # else fall back to grad_scale_func, else default to 1.
         device = get_tensor_device(output_tensor)
-        loss_scale = (
-            config.grad_scale_func(torch.ones(1, device=device))
-            if config.grad_scale_func is not None
-            else torch.ones(1, device=device)
-        )
+        loss_scale = _get_mtp_loss_scale(config, device)
         # Set the loss scale
         if config.calculate_per_token_loss:
             MTPLossAutoScaler.set_loss_scale(loss_scale)
