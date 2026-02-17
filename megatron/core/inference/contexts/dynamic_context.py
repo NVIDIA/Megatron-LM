@@ -646,7 +646,7 @@ class DynamicInferenceContext(BaseInferenceContext):
         for key in vars(self).keys():
             value = getattr(self, key)
             assert not isinstance(value, torch.Tensor), (
-                "All tensors should be allocated within `allocate_all_tensors()`. "
+                "All tensors should be allocated within `initialize_all_tensors()`. "
                 f"Please move tensor '{key}'."
             )
 
@@ -718,7 +718,7 @@ class DynamicInferenceContext(BaseInferenceContext):
     def reallocate_inference_state_buffers(self):
         """Restore large tensors (KV cache, Mamba states) after a suspend.
 
-        Called by the engine during `resume()`. Initial allocation is in `allocate_all_tensors()`.
+        Called by the engine during `resume()`. Initial allocation is in `initialize_all_tensors()`.
         """
         if self.is_tensor_state_allocated:
             return
