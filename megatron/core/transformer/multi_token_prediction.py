@@ -329,80 +329,149 @@ def _roll_tensor_packed_seq(tensor, shifts, dims, packed_seq_params, cp_group=No
 
 
 class MTPLossLoggingHelper:
-    """Helper class for logging MTP losses."""
+    """Helper class for logging MTP losses and acceptance rates."""
 
     tracker = {}
 
     @staticmethod
-    def save_loss_to_tracker(
-        loss: torch.Tensor,
+    def save_metrics_to_tracker(
+        loss_sum: torch.Tensor,
+        num_tokens: torch.Tensor,
+        correct: torch.Tensor,
+        total: torch.Tensor,
         layer_number: int,
         num_layers: int,
-        reduce_group: Optional[torch.distributed.ProcessGroup] = None,
-        avg_group: Optional[torch.distributed.ProcessGroup] = None,
+        reduce_group: torch.distributed.ProcessGroup = None,
+        avg_group: torch.distributed.ProcessGroup = None,
     ):
-        """Save the mtp loss for logging.
+        """Save the mtp metrics (loss_sum, num_tokens, correct, total) for logging.
         Args:
-            loss (torch.Tensor): The loss tensor.
+            loss_sum (torch.Tensor): The unnormalized sum of losses (before dividing by num_tokens).
+            num_tokens (torch.Tensor): Number of valid tokens for this loss computation.
+            correct (torch.Tensor): Number of correct predictions.
+            total (torch.Tensor): Total number of predictions.
             layer_number (int): Layer index of the loss.
             num_layers (int): The number of total layers.
             reduce_group (torch.distributed.ProcessGroup): The group for reducing the loss.
-            mean_group (torch.distributed.ProcessGroup): The group for averaging the loss.
+            avg_group (torch.distributed.ProcessGroup): The group for averaging the loss.
         """
         # Skip mtp loss logging if layer_number is None.
         if layer_number is None:
             return
 
         tracker = MTPLossLoggingHelper.tracker
-        if "values" not in tracker:
-            tracker["values"] = torch.zeros(num_layers, device=torch.cuda.current_device())
-        tracker["values"][layer_number] += loss.detach()
+        if "loss_sum_values" not in tracker:
+            tracker["loss_sum_values"] = torch.zeros(num_layers, device=torch.cuda.current_device())
+        if "num_tokens_values" not in tracker:
+            tracker["num_tokens_values"] = torch.zeros(num_layers, device=torch.cuda.current_device())
+        if "correct_values" not in tracker:
+            tracker["correct_values"] = torch.zeros(num_layers, device=torch.cuda.current_device())
+        if "total_values" not in tracker:
+            tracker["total_values"] = torch.zeros(num_layers, device=torch.cuda.current_device())
+
+        tracker["loss_sum_values"][layer_number] += loss_sum.detach()
+        tracker["num_tokens_values"][layer_number] += num_tokens.detach()
+        tracker["correct_values"][layer_number] += correct.detach()
+        tracker["total_values"][layer_number] += total.detach()
         tracker["reduce_group"] = reduce_group
         tracker["avg_group"] = avg_group
 
-    def clean_loss_in_tracker():
-        """Clear the mtp losses."""
+    @staticmethod
+    def clean_metrics_in_tracker():
+        """Clear the mtp metrics."""
         tracker = MTPLossLoggingHelper.tracker
-        tracker["values"].zero_()
+        if "loss_sum_values" in tracker:
+            tracker["loss_sum_values"].zero_()
+        if "num_tokens_values" in tracker:
+            tracker["num_tokens_values"].zero_()
+        if "correct_values" in tracker:
+            tracker["correct_values"].zero_()
+        if "total_values" in tracker:
+            tracker["total_values"].zero_()
         tracker["reduce_group"] = None
         tracker["avg_group"] = None
 
-    def reduce_loss_in_tracker():
-        """Collect and reduce the mtp losses across ranks."""
+    @staticmethod
+    def reduce_metrics_in_tracker():
+        """Collect and reduce the mtp metrics across ranks."""
         tracker = MTPLossLoggingHelper.tracker
-        if "values" not in tracker:
+        if "loss_sum_values" not in tracker:
             return
-        values = tracker["values"]
-        # Reduce mtp losses across ranks.
-        if tracker.get('reduce_group') is not None:
-            torch.distributed.all_reduce(values, group=tracker.get('reduce_group'))
-        if tracker.get('avg_group') is not None:
-            torch.distributed.all_reduce(
-                values, group=tracker['avg_group'], op=torch.distributed.ReduceOp.AVG
-            )
 
+        # Reduce all values by summing across ranks
+        # Loss is computed as total_loss_sum / total_num_tokens after reduction
+        for key in ["loss_sum_values", "num_tokens_values", "correct_values", "total_values"]:
+            if key in tracker:
+                values = tracker[key]
+                if tracker.get('reduce_group') is not None:
+                    torch.distributed.all_reduce(values, group=tracker.get('reduce_group'))
+                if tracker.get('avg_group') is not None:
+                    torch.distributed.all_reduce(
+                        values, group=tracker['avg_group'], op=torch.distributed.ReduceOp.SUM
+                    )
+
+        loss_sums = tracker["loss_sum_values"]
+        num_tokens = tracker.get("num_tokens_values", torch.ones_like(loss_sums))
+        tracker["loss_values"] = loss_sums / torch.clamp(num_tokens, min=1)
+
+    @staticmethod
     def track_mtp_metrics(loss_scale, iteration, writer, wandb_writer=None, total_loss_dict=None):
-        """Track the Multi-Token Prediction (MTP) metrics for logging."""
-        MTPLossLoggingHelper.reduce_loss_in_tracker()
-        tracker = MTPLossLoggingHelper.tracker
-        if "values" not in tracker:
-            return
-        mtp_losses = tracker["values"] * loss_scale
-        mtp_num_layers = mtp_losses.shape[0]
-        for i in range(mtp_num_layers):
-            name = f"mtp_{i + 1} loss"
-            loss = mtp_losses[i]
-            if total_loss_dict is not None:
-                if name in total_loss_dict:
-                    total_loss_dict[name] += loss
-                else:
-                    total_loss_dict[name] = loss
-            if writer is not None:
-                writer.add_scalar(name, loss, iteration)
-            if wandb_writer is not None:
-                wandb_writer.log({f"{name}": loss}, iteration)
+        """Track the Multi-Token Prediction (MTP) metrics for logging.
 
-        MTPLossLoggingHelper.clean_loss_in_tracker()
+        Note: loss_scale parameter is kept for backward compatibility but is ignored.
+        The loss is computed as total_loss_sum / total_num_tokens which already gives
+        the correct per-token weighted average across all microbatches.
+        """
+        MTPLossLoggingHelper.reduce_metrics_in_tracker()
+        tracker = MTPLossLoggingHelper.tracker
+        if "loss_sum_values" not in tracker:
+            return
+
+        mtp_loss_sums = tracker["loss_sum_values"]
+        mtp_num_tokens = tracker.get("num_tokens_values", torch.ones_like(mtp_loss_sums))
+        mtp_corrects = tracker.get("correct_values", torch.zeros_like(mtp_loss_sums))
+        mtp_totals = tracker.get("total_values", torch.ones_like(mtp_loss_sums))
+
+        mtp_num_layers = mtp_loss_sums.shape[0]
+        for i in range(mtp_num_layers):
+            loss_name = f"mtp_{i+1} loss"
+            step_acc_name = f"mtp_{i+1}_acceptance_rate"
+            cum_acc_name = f"mtp_{i+1}_cumulative_acceptance_rate"
+
+            loss = mtp_loss_sums[i] / max(mtp_num_tokens[i], 1)
+            step_rate = (mtp_corrects[i] / max(mtp_totals[i], 1)) * 100.0
+
+            if total_loss_dict is not None:
+                # Track loss - store unnormalized sums for proper cumulative averaging
+                total_loss_dict[f"{loss_name}_sum"] = (
+                    total_loss_dict.get(f"{loss_name}_sum", 0.0) + mtp_loss_sums[i]
+                )
+                total_loss_dict[f"{loss_name}_tokens"] = (
+                    total_loss_dict.get(f"{loss_name}_tokens", 0.0) + mtp_num_tokens[i]
+                )
+                # Track acceptance rate cumulative stats
+                total_loss_dict[f"{step_acc_name}_correct"] = (
+                    total_loss_dict.get(f"{step_acc_name}_correct", 0.0) + mtp_corrects[i]
+                )
+                total_loss_dict[f"{step_acc_name}_total"] = (
+                    total_loss_dict.get(f"{step_acc_name}_total", 0.0) + mtp_totals[i]
+                )
+                cum_correct = total_loss_dict[f"{step_acc_name}_correct"]
+                cum_total = total_loss_dict[f"{step_acc_name}_total"]
+                cum_rate = (cum_correct / max(cum_total, 1)) * 100.0
+            else:
+                cum_rate = 0.0
+
+            if writer is not None:
+                writer.add_scalar(loss_name, loss, iteration)
+                writer.add_scalar(step_acc_name, step_rate, iteration)
+                writer.add_scalar(cum_acc_name, cum_rate, iteration)
+            if wandb_writer is not None:
+                wandb_writer.log({f"{loss_name}": loss}, iteration)
+                wandb_writer.log({f"{step_acc_name}": step_rate}, iteration)
+                wandb_writer.log({f"{cum_acc_name}": cum_rate}, iteration)
+
+        MTPLossLoggingHelper.clean_metrics_in_tracker()
 
 
 @dataclass
@@ -664,11 +733,60 @@ def process_mtp_loss(
         loss_mask, num_tokens = roll_tensor(
             loss_mask, shifts=-1, dims=-1, cp_group=cp_group, packed_seq_params=packed_seq_params
         )
+
         mtp_loss = compute_language_model_loss(mtp_labels, mtp_logits)
+
+        # Compute acceptance rate for metrics tracking
+        correct = torch.tensor(0.0, device=mtp_logits.device)
+        total = torch.tensor(0.0, device=mtp_logits.device)
+        tp_group = parallel_state.get_tensor_model_parallel_group()
+        tp_size = parallel_state.get_tensor_model_parallel_world_size()
+
+        # Compute distributed argmax without gathering full vocab logits
+        if tp_group is not None and tp_size > 1:
+            # Each rank has [s, b, vocab_shard_size]
+            vocab_shard_size = mtp_logits.size(-1)
+
+            # Get local max value and local argmax
+            local_max_vals, local_argmax = mtp_logits.max(dim=-1)  # [s, b], [s, b]
+
+            # All-gather max values and local argmax from all TP ranks
+            # Shape after gather: [tp_size, s, b]
+            gathered_max_vals = [torch.empty_like(local_max_vals) for _ in range(tp_size)]
+            gathered_argmax = [torch.empty_like(local_argmax) for _ in range(tp_size)]
+            torch.distributed.all_gather(gathered_max_vals, local_max_vals, group=tp_group)
+            torch.distributed.all_gather(gathered_argmax, local_argmax, group=tp_group)
+
+            # Stack to [tp_size, s, b] and find which rank has the global max
+            stacked_max_vals = torch.stack(gathered_max_vals, dim=0)
+            stacked_argmax = torch.stack(gathered_argmax, dim=0)
+            winning_rank = stacked_max_vals.argmax(dim=0)  # [s, b]
+
+            # Compute global argmax: winning_rank * shard_size + local_argmax_from_winner
+            # Use gather to select the argmax from the winning rank
+            winning_local_argmax = torch.gather(
+                stacked_argmax, 0, winning_rank.unsqueeze(0)
+            ).squeeze(0)  # [s, b]
+            preds = winning_rank * vocab_shard_size + winning_local_argmax  # [s, b]
+        else:
+            preds = torch.argmax(mtp_logits, dim=-1)  # [s, b]
+
+        # Transform labels and mask to match [s, b] format
+        labels_match = mtp_labels.transpose(0, 1).contiguous()  # [b, s] => [s, b]
+        mask_match = loss_mask.transpose(0, 1).contiguous()  # [b, s] => [s, b]
+
+        # Compute correct and total
+        correct = ((preds == labels_match) & mask_match.bool()).sum().float()
+        total = mask_match.sum().float()
+
         mtp_loss = loss_mask * mtp_loss
+
         if is_training:
-            MTPLossLoggingHelper.save_loss_to_tracker(
-                torch.sum(mtp_loss) / num_tokens,
+            MTPLossLoggingHelper.save_metrics_to_tracker(
+                torch.sum(mtp_loss),
+                num_tokens,
+                correct,
+                total,
                 mtp_layer_number,
                 config.mtp_num_layers,
                 avg_group=parallel_state.get_data_parallel_group(with_context_parallel=True),
