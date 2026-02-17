@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-name: 'Release'
+name: "Release"
 
 defaults:
   run:
@@ -82,7 +82,6 @@ jobs:
 
   bump-next-version:
     runs-on: ubuntu-latest
-    environment: main # ${{ inputs.dry-run == true && 'public' || 'main' }}
     needs: build-test-publish-wheels-dry-run
     if: |
       (
@@ -105,8 +104,8 @@ jobs:
       - name: Bump version MCore
         id: bump-version-mcore
         env:
-          SRC_DIR: ''
-          PYPROJECT_NAME: 'megatron.core'
+          SRC_DIR: ""
+          PYPROJECT_NAME: "megatron.core"
         run: |
           set +u
           cd ${{ github.run_id }}
@@ -144,8 +143,8 @@ jobs:
       - name: Bump version MFSDP
         id: bump-version-mfsdp
         env:
-          SRC_DIR: 'megatron/core/distributed/fsdp/src/'
-          PYPROJECT_NAME: 'megatron_fsdp'
+          SRC_DIR: "megatron/core/distributed/fsdp/src/"
+          PYPROJECT_NAME: "megatron_fsdp"
         run: |
           set +u
 
@@ -338,7 +337,6 @@ jobs:
   create-gh-release:
     needs: [build-test-publish-wheels, bump-next-version]
     runs-on: ubuntu-latest
-    environment: ${{ inputs.dry-run == true && 'public' || 'main' }}
     if: |
       (
         success() || !failure()
@@ -472,7 +470,6 @@ jobs:
   notify:
     needs: [build-test-publish-wheels, create-gh-release]
     runs-on: ubuntu-latest
-    environment: ${{ inputs.dry-run == true && 'public' || 'main' }}
     env:
       GH_URL: https://github.com/${{ github.repository }}/releases/tag/v${{ needs.build-test-publish-wheels.outputs.version }}
       PYPI_URL: https://${{ inputs.dry-run == true && 'test.' || '' }}pypi.org/project/${{ needs.build-test-publish-wheels.outputs.pypi-name }}/${{ needs.build-test-publish-wheels.outputs.version }}/

@@ -147,7 +147,6 @@ jobs:
     needs: [build-and-test-wheels]
     runs-on: ubuntu-latest
     if: inputs.no-publish == false
-    environment: ${{ (github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/heads/r')) && 'main' || 'public' }}
     strategy:
       fail-fast: false
       matrix:
@@ -170,7 +169,7 @@ jobs:
 
       - name: Publish wheels
         env:
-          TWINE_USERNAME: ${{ secrets.TWINE_USERNAME }}
+          TWINE_USERNAME: ${{ (github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/heads/r')) && secrets.SVC_PYPI_USERNAME || secrets.SVC_PYPI_TEST_USERNAME }}
           TWINE_PASSWORD: ${{ secrets.TWINE_PASSWORD }}
           TWINE_REPOSITORY: ${{ (github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/heads/r')) && 'pypi' || 'testpypi' }}
           PLATFORM: ${{ matrix.PLATFORM }}

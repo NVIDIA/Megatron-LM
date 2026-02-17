@@ -9,7 +9,6 @@ on:
 
 jobs:
   run-script:
-    environment: main
     name: Run Auto Reminder Bot
     runs-on: ubuntu-latest
     if: github.repository == 'NVIDIA/Megatron-LM'
