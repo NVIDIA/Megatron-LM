@@ -181,7 +181,7 @@ try:
             # Replicate data in the message field for compatibility.
             message["prompt_token_ids"] = result["prompt_tokens"]
             message["generation_token_ids"] = result["generated_tokens"]
-            messge["generation_log_probs"] = result.get("generated_log_probs", None)
+            message["generation_log_probs"] = result.get("generated_log_probs", None)
             return_log_probs = sampling_params.return_log_probs
 
             choice_data = {
