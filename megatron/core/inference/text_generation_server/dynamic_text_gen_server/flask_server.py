@@ -72,6 +72,7 @@ async def run_flask_server_on_client(
     loop.set_default_executor(ThreadPoolExecutor(max_workers=8192))
 
     config = Config()
+    config.wsgi_max_body_size = 2**30  # 1 GB
     config.bind = [f"0.0.0.0:{flask_port}"]
     config.backlog = 8192
 
