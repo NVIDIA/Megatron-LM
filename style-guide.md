@@ -4,31 +4,10 @@ Note: This repository is Python-first. Prefer the Python guidelines in this docu
 
 ## Style Guides We Follow
 
-If there is a conflict between this file and the Google style guides, prioritize this file.
+If there is a conflict between this file and the Google style guides, prioritize this file's guidance.
 
 - Python: [Google Python Style Guide](https://google.github.io/styleguide/pyguide.html)
 - Shell: [Google Shell Style Guide](https://google.github.io/styleguide/shellguide.html)
-
-## uv Guidelines
-
-### Use uv run instead of python
-
-Use `uv run` to execute scripts, rather than activating a virtual environment and calling `python` directly.
-
-Don't:
-
-```bash
-source .venv/bin/activate
-python pretrain_gpt.py
-```
-
-Do:
-
-```bash
-uv run python pretrain_gpt.py
-```
-
-Exception: `docker/Dockerfile.ci.dev` and `docker/Dockerfile.ci.nemo` are exempt from this rule.
 
 ## Python Coding Guidelines
 
@@ -62,7 +41,7 @@ Exception: `docker/Dockerfile.ci.dev` and `docker/Dockerfile.ci.nemo` are exempt
    - prefix `k` for variable names that start with a number: `k_99th_percentile = ...`
 
 5. Global Variables
-   - upper snake_case and prefix `G`: `G_MY_GLOBAL = ...`
+   - upper snake_case: `MY_GLOBAL = ...`
 
 6. Constants
    - upper snake_case: `MY_CONSTANT = ...`
@@ -74,7 +53,7 @@ Exception: `docker/Dockerfile.ci.dev` and `docker/Dockerfile.ci.nemo` are exempt
 
 ### Imports
 
-We recommend using `isort --profile google`. Organize imports in the following order, separated by blank lines:
+Organize imports in the following order, separated by blank lines:
 
 1. Future imports
 2. Standard library imports
@@ -132,25 +111,6 @@ def sharded_state_dict(
         ShardedStateDict: sharded state dict for the GPTModel
     """
     ...
-```
-
-### Avoid Reflection
-
-Avoid using reflection when functionality can be easily achieved without reflection.
-
-For example, instead of:
-
-```python
-def make_complex(*args):
-    x, y = args
-    return dict(**locals())
-```
-
-Do:
-
-```python
-def make_complex(x, y):
-    return {"x": x, "y": y}
 ```
 
 ### Error Handling
@@ -272,6 +232,25 @@ def __init__(
     fp16_lm_cross_entropy: bool = False
 ) -> None:
     ...
+```
+
+### Avoid Reflection
+
+Avoid using reflection when functionality can be easily achieved without reflection.
+
+For example, instead of:
+
+```python
+def make_complex(*args):
+    x, y = args
+    return dict(**locals())
+```
+
+Do:
+
+```python
+def make_complex(x, y):
+    return {"x": x, "y": y}
 ```
 
 ## Documentation Guidelines
