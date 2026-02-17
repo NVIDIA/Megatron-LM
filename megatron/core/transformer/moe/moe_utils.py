@@ -489,12 +489,7 @@ def unpermute(
             # get probs from indices
             permuted_probs = probs_T_1D.index_select(0, indices_1D)
         else:
-            num_out_tokens = permuted_tokens.shape[0]
-            routing_map_int = routing_map.to(dtype=torch.int8).T.contiguous()
-            flat_sorted = routing_map_int.reshape(-1).argsort(descending=True, stable=True)[
-                :num_out_tokens
-            ]
-            permuted_probs = probs.T.contiguous().reshape(-1)[flat_sorted]
+            permuted_probs = probs.T.contiguous().masked_select(routing_map.T.contiguous())
         # Here may promote permuted_tokens to higher precision (fp32/fp64) if probs is in
         # higher precision due to moe_router_dtype being enabled. This can lead to
         # additional GPU memory usage. Use --moe-permute-fusion flag to avoid this extra memory
