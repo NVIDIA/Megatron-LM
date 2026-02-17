@@ -492,7 +492,7 @@ def get_environment_rollouts(
                 )
             optimizer.offload_to_cpu()
 
-    # If we have seperate training and inference models we to refit weights from the training model to the inference model.
+    # If we have separate training and inference models we to refit weights from the training model to the inference model.
     has_separate_inference_model = inference_model is not None
     if has_separate_inference_model:
         # If the separate inference model weights were prefetched to CPU while idle, bring them
