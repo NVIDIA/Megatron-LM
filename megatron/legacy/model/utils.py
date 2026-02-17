@@ -61,6 +61,7 @@ def erf_gelu(x):
 
 def get_norm(config):
     args = get_args()
+    print("=== me: type of args", print(type(args)))
     if args.normalization == "LayerNorm":
         return LayerNorm(
             config.hidden_size,
@@ -69,7 +70,7 @@ def get_norm(config):
             sequence_parallel=config.sequence_parallel,
             apply_layernorm_1p=args.apply_layernorm_1p)
     elif args.normalization == "RMSNorm":
-        if args.apply_layernorm_1p:
+        if "apply_layernorm_1p" in args and args.apply_layernorm_1p:
             raise NotImplementedError('RMSNorm does not currently support the layernorm_1p formulation.')
 
         return RMSNorm(dim=config.hidden_size,
