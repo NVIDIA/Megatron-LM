@@ -1756,6 +1756,22 @@ class DynamicInferenceContext(BaseInferenceContext):
             matched_block_ids, prefix_parent_hash = self._find_matching_prefix_blocks(req)
             num_matched_blocks = len(matched_block_ids)
 
+            # For hybrid models: limit KV prefix matching to blocks that also have
+            # cached Mamba state. Without this, matched KV blocks would cause the
+            # engine to skip tokens during prefill, but Mamba (being recurrent)
+            # needs cumulative state from ALL prior tokens. Skipping tokens with
+            # no cached Mamba state produces incorrect output.
+            if self.is_hybrid_model and num_matched_blocks > 0:
+                num_mamba_matched = getattr(req, '_mamba_num_matched_blocks', 0)
+                if num_mamba_matched < num_matched_blocks:
+                    num_matched_blocks = num_mamba_matched
+                    matched_block_ids = matched_block_ids[:num_matched_blocks]
+                    # Recompute parent hash for the truncated match
+                    if num_matched_blocks > 0:
+                        prefix_parent_hash = req.precomputed_block_hashes[num_matched_blocks - 1]
+                    else:
+                        prefix_parent_hash = 0
+
         # =========================================================================
         # Block allocation
         # =========================================================================
