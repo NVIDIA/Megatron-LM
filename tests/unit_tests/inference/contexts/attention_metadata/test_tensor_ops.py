@@ -7,7 +7,6 @@ from megatron.core.inference.contexts.attention_context.triton.tensor_ops import
     tensor_get_slice_after,
     tensor_masked_update,
     tensor_merge,
-    tensor_zero_after,
 )
 
 
@@ -52,13 +51,6 @@ def tensor_merge_pytorch(
     copy_size = min(tensor_b.shape[0], output_tensor.shape[0] - pos)
     if copy_size > 0:
         output_tensor[pos : pos + copy_size].copy_(tensor_b[:copy_size])
-
-
-def tensor_zero_after_pytorch(tensor: torch.Tensor, pos_on_device: torch.Tensor) -> None:
-    """Reference PyTorch implementation of tensor_zero_after."""
-    pos = pos_on_device[0].item()
-    if pos < tensor.shape[0]:
-        tensor[pos:].fill_(0.0)
 
 
 @pytest.fixture
@@ -308,66 +300,3 @@ def test_tensor_masked_update(device, ndim):
     expected_states = states.clone()
     tensor_masked_update(states, idx, new_states)
     assert torch.equal(states, expected_states), f"Failed {ndim}D: all mask values"
-
-
-def test_tensor_zero_after_basic(device):
-    """Verifies basic functionality against PyTorch reference."""
-    batch_size, hidden_dim = 32, 1024
-
-    input_tensor = torch.randn(batch_size, hidden_dim, device=device)
-    input_ref = input_tensor.clone()
-
-    pos_val = 10
-    pos_tensor = torch.tensor([pos_val], device=device, dtype=torch.int32)
-
-    tensor_zero_after_pytorch(input_ref, pos_tensor)
-    tensor_zero_after(input_tensor, pos_tensor)
-
-    assert torch.equal(input_tensor, input_ref)
-    assert torch.equal(input_tensor[pos_val:], torch.zeros_like(input_tensor[pos_val:]))
-    assert not torch.equal(input_tensor[:pos_val], torch.zeros_like(input_tensor[:pos_val]))
-
-
-def test_tensor_zero_after_with_cuda_graphs(device):
-    """
-    Verifies that the kernel correctly updates dynamic boundaries
-    when captured inside a CUDA Graph.
-    """
-    batch_size, hidden_dim = 32, 128
-    y = torch.ones(batch_size, hidden_dim, device=device)
-
-    # Record the graph with a cutoff value of 20
-    cutoff_val = 20
-    cutoff_tensor = torch.tensor([cutoff_val], device=device, dtype=torch.int32)
-    g = torch.cuda.CUDAGraph()
-    tensor_zero_after(y, cutoff_tensor)
-    with torch.cuda.graph(g):
-        tensor_zero_after(y, cutoff_tensor)
-    y.fill_(1.0)
-    g.replay()
-    assert torch.all(y[:cutoff_val] == 1.0)
-    assert torch.all(y[cutoff_val:] == 0.0)
-
-    # Replay the graph with a new cutoff value of 5
-    new_cutoff = 5
-    cutoff_tensor.copy_(torch.tensor([new_cutoff], device=device, dtype=torch.int32))
-    y.fill_(1.0)
-    g.replay()
-    assert torch.all(y[:new_cutoff] == 1.0)
-    assert torch.all(y[new_cutoff:] == 0.0)
-
-
-def test_tensor_zero_after_edge_cases(device):
-    """Tests pos=0 (zero all) and pos=batch_size (zero nothing)."""
-    batch_size, hidden_dim = 10, 64
-    y = torch.ones(batch_size, hidden_dim, device=device)
-
-    # Position = batch Size (should modify nothing)
-    pos_full = torch.tensor([batch_size], device=device)
-    tensor_zero_after(y, pos_full)
-    assert torch.all(y == 1.0)
-
-    # Position = 0 (should zero everything)
-    pos_zero = torch.tensor([0], device=device)
-    tensor_zero_after(y, pos_zero)
-    assert torch.all(y == 0.0)

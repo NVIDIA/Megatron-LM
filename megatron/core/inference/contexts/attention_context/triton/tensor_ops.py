@@ -246,36 +246,6 @@ def _tensor_masked_update_kernel_4d(
     tl.store(dst_ptr, val, mask=mask)
 
 
-@triton.jit
-def _tensor_zero_after_kernel(
-    OUTPUT_TENSOR,
-    POS_ON_DEVICE,
-    BATCH_SIZE: tl.constexpr,
-    ROW_SIZE: tl.constexpr,
-    BLOCK_SIZE: tl.constexpr,
-):
-    """
-    Sets rows in OUTPUT_TENSOR to 0.0 starting from index `pos_on_device`.
-    """
-    pid = tl.program_id(0)
-
-    # Load the dynamic boundary
-    pos = tl.load(POS_ON_DEVICE)
-
-    # 1. Check if this row is part of the padding (pid >= pos)
-    # 2. Check if this row is within valid batch bounds
-    if pid >= pos and pid < BATCH_SIZE:
-
-        # We are in the padding zone. Write zeros.
-        row_offsets = tl.arange(0, BLOCK_SIZE)
-        row_mask = row_offsets < ROW_SIZE
-
-        output_ptr = OUTPUT_TENSOR + pid * ROW_SIZE + row_offsets
-
-        # Store scalar 0.0 directly. No memory read required.
-        tl.store(output_ptr, 0.0, mask=row_mask)
-
-
 def _compute_row_size(tensor):
     if tensor.ndim == 1:
         return 1
@@ -490,22 +460,3 @@ def tensor_masked_update(states: torch.Tensor, idx: torch.Tensor, new_states: to
             ROW_SIZE=row_size,
             BLOCK_SIZE=BLOCK_SIZE,
         )
-
-
-def tensor_zero_after(tensor: torch.Tensor, pos_on_device: torch.Tensor):
-    """In-place zeroes out `tensor[pos_on_device:]`."""
-    assert tensor.is_contiguous(), "Tensor must be contiguous"
-
-    batch_size = tensor.shape[0]
-
-    # Calculate total row size (product of all dims after batch dim)
-    row_size = 1
-    for dim in tensor.shape[1:]:
-        row_size *= dim
-
-    block_size = triton.next_power_of_2(row_size)
-    grid = (batch_size,)
-
-    _tensor_zero_after_kernel[grid](
-        tensor, pos_on_device, BATCH_SIZE=batch_size, ROW_SIZE=row_size, BLOCK_SIZE=block_size
-    )

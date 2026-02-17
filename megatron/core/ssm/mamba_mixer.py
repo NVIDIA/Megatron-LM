@@ -23,7 +23,6 @@ from megatron.core.inference.contexts.attention_context.triton.tensor_ops import
     tensor_get_slice_after,
     tensor_masked_update,
     tensor_merge,
-    tensor_zero_after,
 )
 from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.core.process_groups_config import ProcessGroupCollection
@@ -524,7 +523,7 @@ class MambaMixer(MegatronModule):
         # Clear the outputs for padding tokens when using quantization scales
         # to avoid corrupting amax calculations
         if is_using_quantization_scales(self.config):
-            tensor_zero_after(y, context.device_active_token_count)
+            y[context.padding_slice] = 0.0
 
         # Output projection
         out, out_bias = self.out_proj(y)
