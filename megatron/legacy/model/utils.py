@@ -61,7 +61,6 @@ def erf_gelu(x):
 
 def get_norm(config):
     args = get_args()
-    print("=== me: type of args", print(type(args)))
     if args.normalization == "LayerNorm":
         return LayerNorm(
             config.hidden_size,
