@@ -2226,6 +2226,7 @@ if HAVE_TE and is_te_min_version("1.13.0"):
                 input_size=input_size,
                 ffn_hidden_size=ffn_hidden_size,
             )
+
 else:
     TEFusedMLP = None  # type: ignore[assignment, misc]
 
