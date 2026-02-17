@@ -106,6 +106,11 @@ def _load_teacher_model_config(checkpoint_path: str) -> Namespace:
     del args_dict["kv_channels"]  # not recalculated if present
     args_dict.update(config)
 
+    # Backward compat: old checkpoints have hybrid_override_pattern but not hybrid_layer_pattern
+    if (args_dict.get('hybrid_override_pattern') is not None
+            and args_dict.get('hybrid_layer_pattern') is None):
+        args_dict['hybrid_layer_pattern'] = args_dict['hybrid_override_pattern']
+
     return Namespace(**args_dict)
 
 
@@ -114,12 +119,10 @@ def _load_teacher_model(config, config_raw: Namespace, model_kwargs: Dict[str, A
     args = get_args()
 
     if config.is_hybrid_model:
-        # These parameters are not part of the TransformerConfig and need to be passed separately.
-        if getattr(config_raw, 'hybrid_layer_pattern', None) is not None:
-            model_kwargs["hybrid_layer_pattern"] = config_raw.hybrid_layer_pattern
-        elif getattr(config_raw, 'hybrid_override_pattern', None) is not None:
-            # Backward compat: map old name to new
-            model_kwargs["hybrid_layer_pattern"] = config_raw.hybrid_override_pattern
+        # This parameter is not part of the TransformerConfig and needs to be passed separately.
+        # Note: hybrid_override_pattern is remapped to hybrid_layer_pattern in
+        # _load_teacher_model_config, so config_raw.hybrid_layer_pattern is always set here.
+        model_kwargs["hybrid_layer_pattern"] = config_raw.hybrid_layer_pattern
 
         teacher = MCoreMambaModel(config=config, **model_kwargs)
     else:
