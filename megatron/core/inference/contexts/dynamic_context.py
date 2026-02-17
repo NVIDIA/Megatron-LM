@@ -1916,6 +1916,26 @@ class DynamicInferenceContext(BaseInferenceContext):
             effective_chunk_length,
         ) = self._compute_prefix_match(req, chunk_length)
         num_matched_blocks = len(matched_block_ids)
+
+        # For hybrid models: limit KV prefix matching to blocks that also have
+        # cached Mamba state. Without this, matched KV blocks would cause the
+        # engine to skip tokens during prefill, but Mamba (being recurrent)
+        # needs cumulative state from ALL prior tokens. Skipping tokens with
+        # no cached Mamba state produces incorrect output.
+        if self.is_hybrid_model and num_matched_blocks > 0 and not is_chunked_prefill:
+            num_mamba_matched = getattr(req, '_mamba_num_matched_blocks', 0)
+            if num_mamba_matched < num_matched_blocks:
+                # Truncate match to mamba-supported range and recompute derived values
+                num_matched_blocks = num_mamba_matched
+                matched_block_ids = matched_block_ids[:num_matched_blocks]
+                prefix_skip_tokens = min(
+                    num_matched_blocks * self.block_size_tokens, chunk_length - 1
+                ) if num_matched_blocks > 0 else 0
+                effective_chunk_length = chunk_length - prefix_skip_tokens
+                num_blocks_from_pool = max(
+                    0, overall_required_blocks - already_allocated_blocks - num_matched_blocks
+                )
+
         effective_kv_offset = req.finished_chunk_token_count + prefix_skip_tokens
 
         # Slice tokens to skip matched prefix
