@@ -99,7 +99,8 @@ class MegatronLocal(InferenceServer, ReturnsTokens, ReturnsRaw):
                 client=client,
                 tokenizer=inference_engine.controller.tokenizer,
                 flask_port=kwargs.get('port', 8294),
-                parsers=[]
+                parsers=[],
+                verbose=kwargs.get('verbose', False),
             ))
         else:
             client = None

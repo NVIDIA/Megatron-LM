@@ -50,6 +50,7 @@ async def run_text_generation_server(
                 parsers=args.parsers,
                 rank=rank,
                 flask_port=flask_port,
+                verbose=args.inference_flask_server_logging,
             )
         )
     engine_task = engine.engine_loop_task
