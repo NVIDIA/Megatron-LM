@@ -39,7 +39,6 @@ except ImportError as e:
     HAVE_FLASHINFER = False
 
 
-
 def _te_rms_norm_kernel(x: torch.Tensor, weight: torch.Tensor, eps: float):
     x_shape = x.shape
     x = x.view(-1, x.size(-1))
@@ -170,15 +169,12 @@ class InferenceLayerNormColumnParallelLinear(TELayerNormColumnParallelLinear):
             # Quantize activations (BF16 -> MXFP8)
             # x is [M, K]
             x = MXFP8Tensor.from_bf16(x.squeeze(1))
-
-            assert isinstance(self.weight, MXFP8Tensor)
-
             x = bmm_mxfp8(
                 x.data.unsqueeze(0),
                 self.weight.data.T.unsqueeze(0),
                 x.scale,
                 self.weight.scale,
-                dtype=torch.bfloat16
+                dtype=torch.bfloat16,
             ).transpose(0, 1)
         else:
             x = torch.matmul(x, self.weight.t())
@@ -266,9 +262,6 @@ class InferenceRowParallelLinear(TERowParallelLinear):
                 # Quantize activations (BF16 -> MXFP8)
                 # x is [M, K]
                 x = MXFP8Tensor.from_bf16(x.squeeze(1))
-
-                assert isinstance(self.weight, MXFP8Tensor)
-
                 x = bmm_mxfp8(
                     x.data.unsqueeze(0),
                     self.weight.data.T.unsqueeze(0),
@@ -314,18 +307,13 @@ class InferenceRowParallelLinear(TERowParallelLinear):
         else:
             # revert to torch dist (NCCL) reduce-scatter
             if use_mxfp8:
-                # Quantize activations (BF16 -> MXFP8)
-                # x is [M, K]
                 x = MXFP8Tensor.from_bf16(x.squeeze(1))
-
-                assert isinstance(self.weight, MXFP8Tensor)
-
                 x = bmm_mxfp8(
                     x.data.unsqueeze(0),
                     self.weight.data.T.unsqueeze(0),
                     x.scale,
                     self.weight.scale,
-                    dtype=torch.bfloat16
+                    dtype=torch.bfloat16,
                 ).transpose(0, 1)
 
             else:
@@ -355,18 +343,13 @@ class InferenceRowParallelLinear(TERowParallelLinear):
         """
         if self.tp_size == 1:
             if self.config.fp8_recipe == "mxfp8" and HAVE_FLASHINFER:
-                # Quantize activations (BF16 -> MXFP8)
-                # x is [M, K]
                 x = MXFP8Tensor.from_bf16(x.squeeze(1))
-
-                assert isinstance(self.weight, MXFP8Tensor)
-
                 x = bmm_mxfp8(
                     x.data.unsqueeze(0),
                     self.weight.data.T.unsqueeze(0),
                     x.scale,
                     self.weight.scale,
-                    dtype=torch.bfloat16
+                    dtype=torch.bfloat16,
                 ).transpose(0, 1)
             else:
                 x = torch.matmul(x, self.weight.t())

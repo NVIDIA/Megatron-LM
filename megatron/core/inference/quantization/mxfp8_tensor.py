@@ -1,6 +1,7 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
 from dataclasses import dataclass
+
 import torch
 
 try:
@@ -13,17 +14,16 @@ except ImportError:
 
 @dataclass
 class MXFP8Tensor:
+    """MXFP8 tensor wrapper class."""
+
     data: torch.Tensor
     scale: torch.Tensor
 
     @classmethod
     def from_bf16(cls, x: torch.Tensor, group_size: int = 32):
-        """
-        Quantize BF16 tensor to MXFP8 format using FlashInfer.
-        Returns:
-            x_fp8: Tensor of type float8_e4m3fn (M, K)
-            x_scale: Tensor of type float8_e8m0fnu (M, K // 32)
-        """
+        """Quantize BF16 tensor to MXFP8 format using FlashInfer."""
+
+        assert HAVE_FLASHINFER, "Need flashinfer for mxfp8 quantization"
         assert x.is_cuda, "Input must be on CUDA"
         assert x.dim() == 2, "Input must be 2D [M, K]"
         M, K = x.shape

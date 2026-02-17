@@ -61,4 +61,3 @@ def quantize_model_to_mxfp8(model: torch.nn.Module) -> None:
     """
 
     return model
-
