@@ -396,7 +396,7 @@ def permute(
             permuted_probs = probs_T_1D.index_select(0, indices_1D)
     else:
         # mask [num_tokens, num_experts] -> [num_experts, num_tokens]
-        routing_map = routing_map.to(dtype=torch.int8).T.contiguous()
+        routing_map = routing_map.bool().T.contiguous()
 
         # Use argsort to get indices of non-zero entries in row-major order.
         # This is equivalent to masked_select but produces fixed-shape output,
