@@ -392,7 +392,7 @@ def validate_args(args, defaults={}):
         # We currently cannot recapture CGs in offload mode.
         assert not(
             not args.rl_persist_cuda_graphs and args.rl_kv_cache_management_mode == "offload"
-        ), "Cannot recpature CUDA graphs while offloading KV cache."
+        ), "Cannot recapture CUDA graphs while offloading KV cache."
 
         # Validate inference model offloading - requires either UVM or torch_memory_saver
         if args.rl_offload_inference_model_weights_when_idle:
