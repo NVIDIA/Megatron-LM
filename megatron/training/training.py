@@ -1374,12 +1374,8 @@ def get_model(model_provider_func, model_type=ModelType.encoder_or_decoder, wrap
         ddp_stream.wait_stream(torch.cuda.current_stream())
         # Make ddp_stream start after whatever the default stream already queued
         with torch.cuda.stream(ddp_stream):
-            dp_init_kwargs = {
-                # Model Config
-                "config": config,
-                # DDP Config
-                "ddp_config": ddp_config,
-            }
+            # To pass kwargs unique to specific DDP classes.
+            dp_init_kwargs = {}
             if args.use_megatron_fsdp:
                 # Also pass the mixed-precision arguments for Megatron-FSDP only.
                 dp_init_kwargs["main_params_dtype"] = args.megatron_fsdp_main_params_dtype
@@ -1388,6 +1384,8 @@ def get_model(model_provider_func, model_type=ModelType.encoder_or_decoder, wrap
 
             model = [
                 DP(
+                    config=config,
+                    ddp_config=ddp_config,
                     module=model_chunk,
                     # Turn off bucketing for model_chunk 2 onwards, since communication
                     # for these model chunks is overlapped with compute anyway.
