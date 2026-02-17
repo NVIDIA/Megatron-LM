@@ -14,7 +14,6 @@ MODEL_ARGS:
   --micro-batch-size: 4
   --global-batch-size: 32
   --train-iters: 20000
-  --exit-interval: 2000
   --weight-decay: 1e-2
   --clip-grad: 1.0
   --fp16: true
@@ -49,7 +48,7 @@ MODEL_ARGS:
   --wandb-entity: adlr
   --wandb-exp-name: ${WANDB_EXPERIMENT}
   --attention-backend: unfused
-  --exit-interval: 20000
+  --exit-interval: 2000
   --wandb-save-dir: ${WANDB_SAVE_PATH}
 METRICS:
   - "iteration-time"
