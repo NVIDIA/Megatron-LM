@@ -601,7 +601,7 @@ class DynamicInferenceEngine(AbstractEngine):
         with self.__class__.suspend_resume_ctx(
             "suspended", unified_memory_level=self.unified_memory_level
         ):
-            self.context.deallocate_large_tensors()
+            self.context.deallocate_inference_state_buffers()
             torch.cuda.synchronize()
 
         if (
@@ -642,7 +642,7 @@ class DynamicInferenceEngine(AbstractEngine):
             # Allocate context tensors.
             alloc_time = time.time()
             torch.cuda.synchronize()
-            self.context.reallocate_large_tensors()
+            self.context.reallocate_inference_state_buffers()
             torch.cuda.synchronize()
             alloc_time = time.time() - alloc_time
 
@@ -1769,7 +1769,11 @@ class DynamicInferenceEngine(AbstractEngine):
                     await asyncio.sleep(0.02)  # Yield to event loop
                     continue
 
-                await self.async_step()
+                try:
+                    await self.async_step()
+                except EngineSuspendedError:
+                    await asyncio.sleep(0.02)
+                    continue
 
         except asyncio.CancelledError:
             pass

@@ -715,7 +715,7 @@ class DynamicInferenceContext(BaseInferenceContext):
         self.reset_attention_state()
         self.reset_mamba_state()
 
-    def reallocate_large_tensors(self):
+    def reallocate_inference_state_buffers(self):
         """Restore large tensors (KV cache, Mamba states) after a suspend.
 
         Called by the engine during `resume()`. Initial allocation is in `allocate_all_tensors()`.
@@ -742,10 +742,10 @@ class DynamicInferenceContext(BaseInferenceContext):
             self.is_tensor_state_allocated = False
             self.initialize_all_tensors()
 
-    def deallocate_large_tensors(self):
+    def deallocate_inference_state_buffers(self):
         """Deallocate large tensors (KV cache, Mamba states) during suspend.
 
-        Called by the engine during `suspend()`. Counterpart to `reallocate_large_tensors()`.
+        Called by the engine during `suspend()`. Mirror to `reallocate_inference_state_buffers()`.
         """
         if not self.is_tensor_state_allocated:
             return
