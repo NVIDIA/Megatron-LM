@@ -557,6 +557,7 @@ def validate_args(args, defaults={}):
     # === Hybrid layer pattern: deprecation handling and validation ===
 
     # Backward compat: --hybrid-override-pattern is deprecated in favor of --hybrid-layer-pattern
+    used_hybrid_override_pattern = False
     if args.hybrid_override_pattern is not None:
         assert args.hybrid_layer_pattern is None, (
             '--hybrid-override-pattern and --hybrid-layer-pattern cannot both be specified. '
@@ -567,6 +568,7 @@ def validate_args(args, defaults={}):
             args.rank,
         )
         args.hybrid_layer_pattern = args.hybrid_override_pattern
+        used_hybrid_override_pattern = True
 
     if args.mtp_hybrid_override_pattern is not None:
         warn_rank_0(
@@ -599,10 +601,18 @@ def validate_args(args, defaults={}):
     if args.hybrid_layer_pattern is not None:
         # Derive num_layers from pattern
         num_layers_in_pattern = get_hybrid_total_layer_count(args.hybrid_layer_pattern)
-        assert args.num_layers is None, (
-            'If --hybrid-layer-pattern is specified, --num-layers should not be specified. '
-            'The number of layers is derived from the pattern.'
-        )
+        if args.num_layers is not None:
+            if used_hybrid_override_pattern:
+                assert args.num_layers == num_layers_in_pattern, (
+                    f'--num-layers ({args.num_layers}) does not match the number of layers '
+                    f'derived from --hybrid-override-pattern ({num_layers_in_pattern}). '
+                    f'Please correct --num-layers or the pattern.'
+                )
+            else:
+                assert False, (
+                    'If --hybrid-layer-pattern is specified, --num-layers should not be specified. '
+                    'The number of layers is derived from the pattern.'
+                )
         args.num_layers = num_layers_in_pattern
 
         # These arguments are incompatible with --hybrid-layer-pattern
