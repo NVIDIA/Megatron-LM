@@ -120,13 +120,11 @@ class MambaModel(LanguageModule):
         # Backward compatibility for deprecated hybrid parameters
         if hybrid_attention_ratio is not None:
             raise ValueError(
-                "hybrid_attention_ratio has been deprecated. "
-                "Use hybrid_layer_pattern instead."
+                "hybrid_attention_ratio has been deprecated. Use hybrid_layer_pattern instead."
             )
         if hybrid_mlp_ratio is not None:
             raise ValueError(
-                "hybrid_mlp_ratio has been deprecated. "
-                "Use hybrid_layer_pattern instead."
+                "hybrid_mlp_ratio has been deprecated. Use hybrid_layer_pattern instead."
             )
         if hybrid_override_pattern is not None:
             if hybrid_layer_pattern is None:
