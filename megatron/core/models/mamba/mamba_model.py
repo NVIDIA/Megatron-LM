@@ -1,5 +1,6 @@
 # Copyright (c) 2023, NVIDIA CORPORATION. All rights reserved.
 
+import warnings
 from typing import Literal, Optional
 
 from torch import Tensor
@@ -46,6 +47,13 @@ class MambaModel(LanguageModule):
                 - "M*M*" -> main decoder only, no MTP
                 - "M*M*/MM/MM" -> main="M*M*", mtp="MM", 2 depths
                 - "M-M-|M-M*-|M-M-|M-M*-" -> 4 pipeline segments
+        hybrid_attention_ratio (float, optional): Deprecated. Use hybrid_layer_pattern instead.
+            Raises ValueError if set to a non-None value.
+        hybrid_mlp_ratio (float, optional): Deprecated. Use hybrid_layer_pattern instead.
+            Raises ValueError if set to a non-None value.
+        hybrid_override_pattern (str, optional): Deprecated. Use hybrid_layer_pattern instead.
+            If set and hybrid_layer_pattern is None, the value is copied to hybrid_layer_pattern
+            with a deprecation warning.
         pre_process (bool, optional): Include embedding layer
             (used with pipeline parallelism). Defaults to True.
         post_process (bool, optional): Include an output layer (used with pipeline parallelism).
@@ -75,6 +83,9 @@ class MambaModel(LanguageModule):
         vocab_size: int,
         max_sequence_length: int,
         hybrid_layer_pattern: str = None,
+        hybrid_attention_ratio: float = None,
+        hybrid_mlp_ratio: float = None,
+        hybrid_override_pattern: str = None,
         pre_process: bool = True,
         post_process: bool = True,
         fp16_lm_cross_entropy: bool = False,
@@ -106,6 +117,32 @@ class MambaModel(LanguageModule):
         self.position_embedding_type = position_embedding_type
         self.vp_stage = vp_stage
 
+        # Backward compatibility for deprecated hybrid parameters
+        if hybrid_attention_ratio is not None:
+            raise ValueError(
+                "hybrid_attention_ratio has been deprecated. "
+                "Use hybrid_layer_pattern instead."
+            )
+        if hybrid_mlp_ratio is not None:
+            raise ValueError(
+                "hybrid_mlp_ratio has been deprecated. "
+                "Use hybrid_layer_pattern instead."
+            )
+        if hybrid_override_pattern is not None:
+            if hybrid_layer_pattern is None:
+                warnings.warn(
+                    "hybrid_override_pattern has been deprecated. "
+                    "Use hybrid_layer_pattern instead.",
+                    DeprecationWarning,
+                    stacklevel=2,
+                )
+                self.hybrid_layer_pattern = hybrid_override_pattern
+            else:
+                raise ValueError(
+                    "hybrid_override_pattern and hybrid_layer_pattern cannot both be set. "
+                    "hybrid_override_pattern has been deprecated; use hybrid_layer_pattern instead."
+                )
+
         # Parse unified pattern to extract main and MTP components, and
         # determine the pipeline segment for this model instance.
         from megatron.core.ssm.mamba_hybrid_layer_allocation import (
@@ -113,7 +150,7 @@ class MambaModel(LanguageModule):
             select_pipeline_segment,
         )
 
-        parsed = parse_hybrid_pattern(hybrid_layer_pattern)
+        parsed = parse_hybrid_pattern(self.hybrid_layer_pattern)
         self.mtp_pattern = parsed.mtp_pattern
         self.mtp_num_depths = parsed.mtp_num_depths
 
