@@ -177,6 +177,7 @@ jobs:
   cicd-wait-in-queue:
     runs-on: ubuntu-latest
     needs: [pre-flight, linting]
+    environment: "test"
     if: |
       !(needs.pre-flight.outputs.is_ci_workload == 'true'
       || needs.pre-flight.outputs.is_deployment_workflow == 'true'
