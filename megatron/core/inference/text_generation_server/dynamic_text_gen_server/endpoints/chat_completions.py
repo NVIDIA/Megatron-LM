@@ -4,6 +4,7 @@ import asyncio
 import logging
 import time
 import traceback
+import uuid
 
 from megatron.core.inference.sampling_params import SamplingParams
 from megatron.core.tokenizers.text.parsers import PARSER_MAPPING
@@ -61,7 +62,7 @@ try:
             # Check for 'logprobs' (bool) and 'top_logprobs' (int)
             return_log_probs = bool(req.get("logprobs", False))
             top_n_logprobs = int(req.get("top_logprobs", 0)) if return_log_probs else 0
-            skip_prompt_log_probs = bool(req.get("skip_prompt_log_probs", False))
+            skip_prompt_log_probs = bool(req.get("skip_prompt_log_probs", True))
             add_BOS = bool(req.get("add_BOS", False))
 
             # The engine only handles add_BOS for string prompts, not pre-tokenized
@@ -180,6 +181,12 @@ try:
             if "reasoning" in metadata:
                 message["reasoning"] = metadata["reasoning"]
 
+            # Replicate data in the message field for compatibility.
+            message["prompt_token_ids"] = result["prompt_tokens"]
+            message["generation_token_ids"] = result["generated_tokens"]
+            message["generation_log_probs"] = result.get("generated_log_probs", None)
+            return_log_probs = sampling_params.return_log_probs
+
             choice_data = {
                 "index": request_idx,
                 "message": message,
@@ -188,7 +195,8 @@ try:
                 "generation_log_probs": result["generated_log_probs"],
                 "raw_text": result["prompt"] + result["generated_text"],
                 # 'logprobs' in chat API is an object containing 'content'
-                "logprobs": {"content": logprobs_content} if logprobs_content else None,
+                # "logprobs": {"content": logprobs_content} if logprobs_content else None,
+                "logprobs": {"content": logprobs_content} if return_log_probs else None,
                 "finish_reason": (
                     "tool_calls" if metadata.get("tool_calls", []) else "stop"
                 ),  # Original code hardcoded this.
@@ -207,6 +215,10 @@ try:
 
         prompt_token_count = max(prompt_tokens_counts)
         response = {
+            "id": str(uuid.uuid4()),
+            "created": int(time.time()),
+            "model": "EMPTY",
+            "object": "chat.completion",
             "choices": choices,
             "usage": {
                 "prompt_tokens": prompt_token_count,
