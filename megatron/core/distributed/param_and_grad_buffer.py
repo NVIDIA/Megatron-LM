@@ -343,9 +343,14 @@ class _ParamAndGradBucketGroup:
             # For the mxfp8_param with "reuse_grad_buf_for_mxfp8_param_ag=True",
             # we need to copy the param_data from the shared_param/grad_buffer to param.data
             # after the param all-gather.
+            is_bf16_weight_group = False
             if self.ddp_config.reuse_grad_buf_for_mxfp8_param_ag:
                 for bucket in self.buckets:
                     for param in bucket.params:
+                        # bf16 weights are already mapped to param.data
+                        if not is_mxfp8tensor(param) and not is_float8tensor(param):
+                            is_bf16_weight_group = True
+                            break
                         param_start, param_end = bucket.param_to_index[param]
                         param_slice = bucket.param_data.view(-1)[param_start:param_end]
                         param.data.copy_(param_slice.view(param.data.shape))
@@ -354,6 +359,8 @@ class _ParamAndGradBucketGroup:
                     # We cannot zero out the entire grad buffer because one grad buffer may
                     # correspond to multiple param buffers. If we zero out the entire grad buffer,
                     # it would clear the data of those param buffers that have not yet completed AG.
+                    if is_bf16_weight_group:
+                        break
                     bucket.param_data.zero_()
             else:
                 fp8_params = []
@@ -820,8 +827,20 @@ class _ParamAndGradBuffer:
         cur_bucket_id = 0
         for param in params[::-1]:
             param_start_index, param_end_index, bucket_id = self.param_index_map[param]
-            # For MXFP8 param: we only need to map weight gradients to the buffer.
-            if not self.ddp_config.reuse_grad_buf_for_mxfp8_param_ag:
+            # For MXFP8 param: we only need to map bf16 weights (layernorm, embedding, etc) to the buffer.
+            if self.ddp_config.reuse_grad_buf_for_mxfp8_param_ag:
+                if not is_mxfp8tensor(param) and not is_float8tensor(param):
+                    if self.param_data is not None:
+                        new_param_data = self._get(
+                            param.data.shape, param_start_index, buffer_type=BufferType.PARAM
+                        )
+                        old_param_data = param.data
+                        param.data = new_param_data
+                        assert old_param_data._base is None
+                        # Copy tensor values (from initialization or checkpoint).
+                        param.data.detach().copy_(old_param_data)
+                        del old_param_data
+            else:
                 # Assign param.data to appropriate segment of self.param_data.
                 if self.param_data is not None:
                     new_param_data = self._get(
