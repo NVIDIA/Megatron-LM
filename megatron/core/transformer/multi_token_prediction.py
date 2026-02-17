@@ -890,24 +890,8 @@ class MultiTokenPredictionLayer(MegatronModule):
         Concatenate the tokens before sending to transformer layer.
         """
         decoder_input = apply_module(self.enorm)(decoder_input)
-        if isinstance(decoder_input, tuple):
-            if len(decoder_input) != 2:
-                raise ValueError(
-                    f"When the output of enorm is a tuple, it is "
-                    f"expected to have 2 elements (output, residual), but "
-                    f"got {len(decoder_input)}"
-                )
-            decoder_input = decoder_input[0]
         decoder_input = make_viewless_tensor(inp=decoder_input, requires_grad=True, keep_graph=True)
         hidden_states = apply_module(self.hnorm)(hidden_states)
-        if isinstance(hidden_states, tuple):
-            if len(hidden_states) != 2:
-                raise ValueError(
-                    f"When the output of hnorm is a tuple, it is "
-                    f"expected to have 2 elements (output, residual), but "
-                    f"got {len(hidden_states)}"
-                )
-            hidden_states = hidden_states[0]
         hidden_states = make_viewless_tensor(inp=hidden_states, requires_grad=True, keep_graph=True)
         # At the (k - 1)-th MTP module, concatenates the i-th token's hidden_states
         # and the (i + K)-th token's embedding, and combine them with linear projection.
@@ -1000,14 +984,6 @@ class MultiTokenPredictionLayer(MegatronModule):
 
         # Layer norm before shared head layer.
         hidden_states = apply_module(self.final_layernorm)(hidden_states)
-        if isinstance(hidden_states, tuple):
-            if len(hidden_states) != 2:
-                raise ValueError(
-                    f"When the output of final_layernorm is a tuple, it is "
-                    f"expected to have 2 elements (output, residual), but "
-                    f"got {len(hidden_states)}"
-                )
-            hidden_states = hidden_states[0]
         # TENorm produces a "viewed" tensor. This will result in schedule.py's
         # deallocate_output_tensor() throwing an error, so a viewless tensor is
         # created to prevent this.
