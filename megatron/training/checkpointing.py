@@ -1387,9 +1387,12 @@ def load_args_from_checkpoint(
         )
 
     # Backward compat: old checkpoints have hybrid_override_pattern but not hybrid_layer_pattern
-    if (getattr(checkpoint_args, 'hybrid_override_pattern', None) is not None and
-            getattr(checkpoint_args, 'hybrid_layer_pattern', None) is None):
-        checkpoint_args.hybrid_layer_pattern = checkpoint_args.hybrid_override_pattern
+    if (getattr(checkpoint_args, 'hybrid_override_pattern', None) is not None
+            and getattr(checkpoint_args, 'hybrid_layer_pattern', None) is None):
+        setattr(
+            checkpoint_args, 'hybrid_layer_pattern',
+            getattr(checkpoint_args, 'hybrid_override_pattern'),
+        )
 
     def _set_arg(arg_name, old_arg_name=None, force=False):
         if not force and getattr(args, arg_name, None) is not None:
