@@ -97,17 +97,20 @@ try:
         for _ in range(n):
             tasks.append(client.add_request(prompt_tokens, sampling_params))
 
-        start_time = time.perf_counter()
+        if current_app.config['verbose']:
+            start_time = time.perf_counter()
+
         try:
             batch_results = await asyncio.gather(*tasks)
         except Exception as e:
             logger.error(f"Error during inference: {e}")
             return f"Error during inference: {e}", 500
 
-        logger.info(
-            f"Batch of {len(tasks)} requests (n={n}) processed in "
-            f"{time.perf_counter() - start_time:.2f}s"
-        )
+        if current_app.config['verbose']:
+            logging.info(
+                f"Batch of {len(tasks)} requests (n={n}) processed in "
+                f"{time.perf_counter() - start_time:.2f}s"
+            )
 
         # --- 4. Format OpenAI Response ---
         choices = []
@@ -198,7 +201,8 @@ try:
                     "tool_calls" if metadata.get("tool_calls", []) else "stop"
                 ),  # Original code hardcoded this.
             }
-            logging.info(result)
+            if current_app.config['verbose']:
+                logging.info(result)
             if result["routing_indices"] is not None:
                 choice_data["moe_topk_indices"] = result["routing_indices"]
                 if prompt_tokens_count:
