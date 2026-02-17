@@ -192,7 +192,7 @@ try:
                 "generation_log_probs": result["generated_log_probs"],
                 "raw_text": result["prompt"] + result["generated_text"],
                 # 'logprobs' in chat API is an object containing 'content'
-                #"logprobs": {"content": logprobs_content} if logprobs_content else None,
+                # "logprobs": {"content": logprobs_content} if logprobs_content else None,
                 "logprobs": {"content": logprobs_content} if return_log_probs else None,
                 "finish_reason": (
                     "tool_calls" if metadata.get("tool_calls", []) else "stop"
