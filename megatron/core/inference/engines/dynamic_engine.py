@@ -645,8 +645,6 @@ class DynamicInferenceEngine(AbstractEngine):
             torch.cuda.synchronize()
             alloc_time = time.time() - alloc_time
 
-            all_requests_readded = set(self.requests.keys()) <= set(self.resume_request_ids)
-
             capture_time = time.time()
             if (
                 self.context.kv_cache_management_mode != KVCacheManagementMode.PERSIST
