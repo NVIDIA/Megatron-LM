@@ -34,11 +34,6 @@ on:
         description: Email addresses to send the notification to. Format as "me@me.com,you@you.com".
         required: false
         type: string
-      build-docs-ref:
-        description: Reference to build the docs from
-        required: false
-        type: string
-        default: ${{ github.sha }}
   workflow_call:
     inputs:
       dry-run:
@@ -60,6 +55,11 @@ on:
         description: Email addresses to send the notification to. Format as "me@me.com,you@you.com".
         required: false
         type: string
+      build-docs-ref:
+        description: Reference to build the docs from
+        required: false
+        type: string
+        default: ${{ github.sha }}
 
 jobs:
   build-docs:
