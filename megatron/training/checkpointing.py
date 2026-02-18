@@ -64,6 +64,27 @@ try:
 except Exception:
     has_nvidia_modelopt = False
 
+# Saving
+from ml_flashpoint.adapter.pytorch.memory_storage_writer import MemoryStorageWriter
+from ml_flashpoint.adapter.megatron.save_strategies import (
+    MLFlashpointMegatronAsyncSaveStrategy,
+)
+
+# Loading
+from ml_flashpoint.adapter.megatron.load_strategies import MLFlashpointMegatronLoadStrategy
+from ml_flashpoint.checkpoint_object_manager.checkpoint_object_manager import CheckpointObjectManager
+from ml_flashpoint.core.checkpoint_loader import DefaultMLFlashpointCheckpointLoader
+from ml_flashpoint.replication.replication_manager import ReplicationManager
+
+# # Instantiate the MemoryStorageWriter
+# memory_storage_writer = MemoryStorageWriter(...)
+
+# # Use it to instantiate the Save Strategy
+# megatron_save_strategy = MLFlashpointMegatronAsyncSaveStrategy(
+#     storage_writer=memory_storage_writer,
+# )
+
+
 _CHECKPOINT_VERSION = None
 _LOADED_ITERATION = None
 
@@ -1125,9 +1146,33 @@ def _load_global_dist_base_checkpoint(
         load_strategy = FullyParallelLoadStrategyWrapper(
             load_strategy, mpu.get_data_parallel_group(with_context_parallel=True)
         )
+    
+    # Initialize dependencies (shared singletons)
+    checkpoint_object_manager = CheckpointObjectManager()
+    replication_manager = ReplicationManager()
+    replication_manager.initialize(checkpoint_object_manager)
+
+    checkpoint_loader = DefaultMLFlashpointCheckpointLoader(
+        checkpoint_object_manager=checkpoint_object_manager,
+        replication_manager=replication_manager,
+    )
+
+    # Instantiate the Load Strategy with the dependencies
+    mlflashpoint_load_strategy = MLFlashpointMegatronLoadStrategy(
+        replication_manager=replication_manager,
+        checkpoint_loader=checkpoint_loader,
+    )
+
     if checkpointing_context is not None:
-        checkpointing_context["load_strategy"] = load_strategy
-    state_dict = dist_checkpointing.load(sharded_state_dict, checkpoint_name, load_strategy, strict=args.dist_ckpt_strictness)
+        checkpointing_context["load_strategy"] = mlflashpoint_load_strategy
+
+    print("YES YOU ARE HERE")
+    state_dict = dist_checkpointing.load(
+        sharded_state_dict=sharded_state_dict,
+        checkpoint_dir=checkpoint_name,
+        sharded_strategy=load_strategy,
+        strict=args.dist_ckpt_strictness,
+    )
     return state_dict, checkpoint_name, release, CheckpointType.GLOBAL
 
 
