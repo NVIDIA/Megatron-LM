@@ -648,7 +648,7 @@ class MambaMixer(MegatronModule):
                 _check_mamba_sequence_packing_support(for_inference_not_training=False)
             )
             assert sequence_packing_available, reason_for_no_sequence_packing
-            seq_idx = self._create_packed_seq_idx(packed_seq_params, zxBCdt.shape[1])
+            seq_idx = packed_seq_params.seq_idx
 
         y = mamba_split_conv1d_scan_combined(
             zxBCdt,

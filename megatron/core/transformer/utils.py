@@ -1,6 +1,7 @@
 # Copyright (c) 2024, NVIDIA CORPORATION. All rights reserved.
 
 """Utilities for transformer layers."""
+from contextlib import contextmanager
 from operator import itemgetter
 from typing import TYPE_CHECKING, Any, Dict, Iterable, Optional, Tuple, Union
 
@@ -446,6 +447,98 @@ def toggle_cuda_graphs(model, set_to="none", reset_cuda_graphs=True):
     # if we are resetting cuda graphs we need to reset all the state
     if reset_cuda_graphs and set_to == "none":
         delete_cuda_graphs()
+
+
+@contextmanager
+def disable_cuda_graphs(model, lang_module=None):
+    """Context manager that forces all layers to run eagerly (no cudagraph replay).
+
+    Saves and restores the following state on entry/exit:
+    - `model.config.cuda_graph_impl` set to "none" so `create_cudagraphs()`is skipped.
+    - `model.config.cuda_graph_scope` set to [] so partial graph capture is skipped.
+    - `_CudagraphGlobalRecord.cudagraph_created` — set to False so existing
+      CudaGraphManager instances on non-MoE TransformerLayers take the eager fallback path.
+    - MoE partial-cudagraph flag — if lang_module is provided, MoE layers are switched to full-layer
+    mode (`use_partial_cudagraphs = False`) so their `_should_call_local_cudagraph` returns False
+    - Restore to partial cudagraphs mode on exit.
+
+    Args:
+        model: The wrapped model whose `config` contains `cuda_graph_impl` and `cuda_graph_scope`.
+        lang_module: (Optional) The unwrapped language module to pass to
+            `transition_moe_to_full_cudagraphs` / `transition_moe_to_partial_cudagraphs`.
+            When `None`, MoE transition calls are skipped.
+    """
+    from megatron.core.transformer.cuda_graphs import _CudagraphGlobalRecord
+
+    saved_impl = model.config.cuda_graph_impl
+    saved_scope = model.config.cuda_graph_scope
+    saved_created = _CudagraphGlobalRecord.cudagraph_created
+
+    model.config.cuda_graph_impl = "none"
+    model.config.cuda_graph_scope = []
+    _CudagraphGlobalRecord.cudagraph_created = False
+    if lang_module is not None:
+        transition_moe_to_full_cudagraphs(lang_module)
+
+    try:
+        yield
+    finally:
+        model.config.cuda_graph_impl = saved_impl
+        model.config.cuda_graph_scope = saved_scope
+        _CudagraphGlobalRecord.cudagraph_created = saved_created
+        if lang_module is not None:
+            transition_moe_to_partial_cudagraphs(lang_module)
+
+
+def transition_moe_to_partial_cudagraphs(model):
+    """Switch MoE layers to partial CUDA graph capture for training.
+
+    Sets `use_partial_cudagraphs = True` on every `MoETransformerLayer` so that
+    `_should_call_local_cudagraph` returns False and the full-layer `cudagraph_manager` is bypassed.
+    Router and postprocess cudagraph managers are still created lazily on the first call; subsequent
+    calls only flip the flag, reusing previously recorded graphs.
+    """
+    from megatron.core.transformer.cuda_graphs import CudaGraphManager
+    from megatron.core.transformer.transformer_layer import MoETransformerLayer
+
+    for module in model.modules():
+        if isinstance(module, MoETransformerLayer):
+            module.use_partial_cudagraphs = True
+            module.moe_layer_recompute = (
+                module.config.recompute_granularity == 'selective'
+                and "moe" in module.config.recompute_modules
+                and module.config.cuda_graph_impl == "local"
+            )
+            if not hasattr(module, 'cudagraph_manager_router'):
+                module.cudagraph_manager_router = CudaGraphManager(
+                    module.config, module, function_name="_forward_mlp_router"
+                )
+            if not hasattr(module, 'cudagraph_manager_postprocess'):
+                module.cudagraph_manager_postprocess = CudaGraphManager(
+                    module.config, module, function_name="_forward_mlp_postprocess"
+                )
+
+
+def transition_moe_to_full_cudagraphs(model):
+    """Switch MoE layers to full-layer cudagraph capture for inference.
+
+    Sets `use_partial_cudagraphs = False` on every `MoETransformerLayer` so that the full-layer
+    `cudagraph_manager` intercepts the forward call again. Partial managers and their recorded
+    graphs are cached for reuse when transitioning back to next training phase.
+    """
+    from megatron.core.transformer.transformer_layer import MoETransformerLayer
+
+    for module in model.modules():
+        if isinstance(module, MoETransformerLayer):
+            module.use_partial_cudagraphs = False
+            # Reset fwd_execution_map from the string left by the last partial
+            # phase (e.g. "postprocess") back to the full list so that
+            # non-cudagraph forward calls run all phases of the MoE layer.
+            module.mlp.fwd_execution_map = ["route", "expert_compute", "postprocess"]
+            assert hasattr(module, 'cudagraph_manager'), (
+                "MoETransformerLayer missing full cudagraph_manager; "
+                "expected it to be created at __init__ with scope = [] "
+            )
 
 
 def is_layer_window_attention(
