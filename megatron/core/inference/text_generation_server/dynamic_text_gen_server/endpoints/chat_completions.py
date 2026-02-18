@@ -61,7 +61,7 @@ try:
             # Check for 'logprobs' (bool) and 'top_logprobs' (int)
             return_log_probs = bool(req.get("logprobs", False))
             top_n_logprobs = int(req.get("top_logprobs", 0)) if return_log_probs else 0
-            skip_prompt_log_probs = bool(req.get("skip_prompt_log_probs", True))
+            skip_prompt_log_probs = bool(req.get("skip_prompt_log_probs", False))
             add_BOS = bool(req.get("add_BOS", False))
 
             # The engine only handles add_BOS for string prompts, not pre-tokenized
