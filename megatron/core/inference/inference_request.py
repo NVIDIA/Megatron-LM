@@ -531,6 +531,12 @@ class DynamicInferenceRequestRecord:
             prompt_tokens=new_prompt_tokens,
             sampling_params=new_sampling_params,
         )
+        # Preserve event_add_engine from old request if it exists, otherwise set it.
+        # This ensures TTFT calculation works correctly for evicted/resumed requests.
+        if old_request.event_add_engine is not None:
+            new_request.event_add_engine = old_request.event_add_engine
+        else:
+            new_request.add_event_add_engine()
         self.requests.append(new_request)
 
     def merge(self, tokenizer: MegatronTokenizer | None = None) -> DynamicInferenceRequest:
