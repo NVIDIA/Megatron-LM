@@ -1664,19 +1664,23 @@ class DynamicInferenceContext(BaseInferenceContext):
         kv_cache_available = self.block_allocator.is_memory_available(blocks)
         return request_can_be_added, request_tokens_can_be_added, kv_cache_available
 
-    def _find_matching_prefix_blocks(self, req: DynamicInferenceRequest) -> tuple[list[int], int]:
-        """Find cached blocks matching the prompt prefix using precomputed hashes.
+    def _find_matching_prefix_blocks(
+        self, req: DynamicInferenceRequest, start_block: int, end_block: int
+    ) -> tuple[list[int], int]:
+        """Find cached blocks matching a range of the prompt using precomputed hashes.
 
-        Uses the request's precomputed_block_hashes to look up existing blocks
-        in the block allocator's hash-to-block mapping. Stops at the first non-match.
+        Looks up hashes in req.precomputed_block_hashes[start_block:end_block] against
+        the block allocator's hash-to-block mapping. Stops at the first non-match.
 
         Args:
             req: The inference request with precomputed_block_hashes set.
+            start_block: First block index to match (inclusive).
+            end_block: Last block index to match (exclusive); clamped to hash count.
 
         Returns:
             Tuple of:
-            - List of matched block IDs (in order from block 0)
-            - Parent hash for computing the next block's hash (0 if no matches)
+            - List of matched block IDs (consecutive from start_block)
+            - Parent hash of the last matched block (0 if no matches)
         """
         # Early return if prefix caching is disabled
         if not self.enable_prefix_caching:
@@ -1686,19 +1690,29 @@ class DynamicInferenceContext(BaseInferenceContext):
         if req.precomputed_block_hashes is None or len(req.precomputed_block_hashes) == 0:
             return [], 0
 
-        matched_blocks = []
-        parent_hash = 0
+        # Clamp end_block to the number of precomputed hashes (the trailing
+        # partial block has no hash).
+        end_block = min(end_block, len(req.precomputed_block_hashes))
+        if start_block >= end_block:
+            return [], 0
 
-        for block_hash in req.precomputed_block_hashes:
-            existing_block = self.block_allocator.hash_to_block_id.get(block_hash)
+        hashes = req.precomputed_block_hashes[start_block:end_block]
+        hash_to_block = self.block_allocator.hash_to_block_id
 
-            if existing_block is not None:
-                matched_blocks.append(existing_block)
-                parent_hash = block_hash
-            else:
-                # No match found, stop here
-                break
+        # Batch dict lookups via C-level map() — faster than Python for loop
+        block_ids = list(map(hash_to_block.get, hashes))
 
+        # Find prefix length (first None = first miss)
+        try:
+            prefix_len = block_ids.index(None)
+        except ValueError:
+            prefix_len = len(block_ids)
+
+        if prefix_len == 0:
+            return [], 0
+
+        matched_blocks = block_ids[:prefix_len]
+        parent_hash = hashes[prefix_len - 1]
         return matched_blocks, parent_hash
 
     def mark_pending_blocks_computed(self) -> None:
@@ -1708,8 +1722,7 @@ class DynamicInferenceContext(BaseInferenceContext):
         as having their KV computed. This enables prefix caching coordination
         where subsequent requests can safely reuse these blocks.
         """
-        for block_id in self._blocks_pending_computation:
-            self.block_allocator.mark_block_computed(block_id)
+        self.block_allocator.mark_blocks_computed(self._blocks_pending_computation)
         self._blocks_pending_computation.clear()
 
     def add_request(self, req: DynamicInferenceRequest, chunk_length: Optional[int] = None) -> None:
@@ -1745,34 +1758,6 @@ class DynamicInferenceContext(BaseInferenceContext):
         this_round_tokens = req.remaining_prompt_tokens[:chunk_length]
 
         # =========================================================================
-        # Prefix caching: find matching prefix blocks
-        # =========================================================================
-        matched_block_ids: list[int] = []
-        prefix_parent_hash = 0
-        num_matched_blocks = 0
-
-        # Only attempt prefix matching on the first chunk of a new request
-        if not is_chunked_prefill:
-            matched_block_ids, prefix_parent_hash = self._find_matching_prefix_blocks(req)
-            num_matched_blocks = len(matched_block_ids)
-
-            # For hybrid models: limit KV prefix matching to blocks that also have
-            # cached Mamba state. Without this, matched KV blocks would cause the
-            # engine to skip tokens during prefill, but Mamba (being recurrent)
-            # needs cumulative state from ALL prior tokens. Skipping tokens with
-            # no cached Mamba state produces incorrect output.
-            if self.is_hybrid_model and num_matched_blocks > 0:
-                num_mamba_matched = getattr(req, '_mamba_num_matched_blocks', 0)
-                if num_mamba_matched < num_matched_blocks:
-                    num_matched_blocks = num_mamba_matched
-                    matched_block_ids = matched_block_ids[:num_matched_blocks]
-                    # Recompute parent hash for the truncated match
-                    if num_matched_blocks > 0:
-                        prefix_parent_hash = req.precomputed_block_hashes[num_matched_blocks - 1]
-                    else:
-                        prefix_parent_hash = 0
-
-        # =========================================================================
         # Block allocation
         # =========================================================================
         already_allocated_blocks = (
@@ -1781,6 +1766,32 @@ class DynamicInferenceContext(BaseInferenceContext):
         overall_required_blocks = (
             req.finished_chunk_token_count + chunk_length + self.block_size_tokens - 1
         ) // self.block_size_tokens  # ceiling division
+
+        # =========================================================================
+        # Prefix caching: find matching prefix blocks (scoped to this chunk)
+        # =========================================================================
+        matched_block_ids, prefix_parent_hash = self._find_matching_prefix_blocks(
+            req, already_allocated_blocks, overall_required_blocks
+        )
+        num_matched_blocks = len(matched_block_ids)
+
+        # For hybrid models: limit KV prefix matching to blocks that also have
+        # cached Mamba state. Without this, matched KV blocks would cause the
+        # engine to skip tokens during prefill, but Mamba (being recurrent)
+        # needs cumulative state from ALL prior tokens. Skipping tokens with
+        # no cached Mamba state produces incorrect output.
+        if self.is_hybrid_model and num_matched_blocks > 0:
+            num_mamba_matched = getattr(req, '_mamba_num_matched_blocks', 0)
+            if num_mamba_matched < num_matched_blocks:
+                num_matched_blocks = num_mamba_matched
+                matched_block_ids = matched_block_ids[:num_matched_blocks]
+                # Recompute parent hash for the truncated match
+                if num_matched_blocks > 0:
+                    prefix_parent_hash = req.precomputed_block_hashes[
+                        already_allocated_blocks + num_matched_blocks - 1
+                    ]
+                else:
+                    prefix_parent_hash = 0
 
         # Reduce blocks needed by the number of matched (shared) blocks
         num_blocks_from_pool = (
@@ -1799,9 +1810,7 @@ class DynamicInferenceContext(BaseInferenceContext):
             matched_tensor = torch.tensor(
                 matched_block_ids, dtype=torch.int32, device=torch.cuda.current_device()
             )
-            self.block_allocator.block_ref_counts[matched_tensor] += 1
-            if self.block_evict_lru:
-                self.block_allocator.update_timestamps(matched_tensor)
+            self.block_allocator.increment_ref_counts(matched_block_ids, matched_tensor)
 
         # when a request already starts chunked prefill, it is exactly the last request in the current system
         # (see dynamic_engine.py, schedule_chunked_prefill invariants)
@@ -1850,12 +1859,12 @@ class DynamicInferenceContext(BaseInferenceContext):
             + req.sampling_params.num_tokens_to_generate
         )
 
-        # Assign blocks: matched blocks first, then newly allocated blocks
-        # For new requests: matched blocks at [0:num_matched], new at [num_matched:...]
-        # For chunked continuations: already_allocated at [0:already], new at [already:...]
+        # Assign blocks: matched blocks at [already_allocated, already_allocated + num_matched),
+        # then newly allocated blocks after that.
+        match_start = already_allocated_blocks
         new_block_start = already_allocated_blocks + num_matched_blocks
         if num_matched_blocks > 0:
-            self.request_to_kv_block_ids[current_id][0:num_matched_blocks] = matched_tensor
+            self.request_to_kv_block_ids[current_id][match_start:match_start + num_matched_blocks] = matched_tensor
         if new_block_ids is not None:
             self.request_to_kv_block_ids[current_id][
                 new_block_start : new_block_start + len(new_block_ids)
@@ -1894,23 +1903,48 @@ class DynamicInferenceContext(BaseInferenceContext):
             self.active_token_count : self.active_token_count + chunk_length
         ] = (token_offset_range % self.block_size_tokens)
 
-        # Register hashes for completely filled blocks (skip matched blocks)
+        # Register hashes for completely filled blocks (skip matched blocks).
+        # Two disjoint ranges may need registration:
+        #   Range 1: [previously_complete, min(already_allocated_blocks, num_complete_blocks))
+        #       — the partial block from a prior chunk that this chunk's tokens completed
+        #   Range 2: [already_allocated_blocks + num_matched_blocks, num_complete_blocks)
+        #       — newly allocated blocks that are now complete
+        #
+        # Uses CPU-side block IDs to avoid GPU→CPU sync:
+        #   Range 1 (chunked prefill only): reads from request_to_kv_block_ids (GPU)
+        #   Range 2: uses _last_allocated_cpu from allocate_memory_blocks()
         if self.enable_prefix_caching and req.precomputed_block_hashes is not None:
             total_tokens_after = req.finished_chunk_token_count + chunk_length
             num_complete_blocks = total_tokens_after // self.block_size_tokens
             previously_complete = req.finished_chunk_token_count // self.block_size_tokens
 
-            # Start from the first non-matched block
-            first_block_to_hash = max(previously_complete, num_matched_blocks)
+            all_block_ids: list[int] = []
+            all_hashes: list[int] = []
 
-            if first_block_to_hash < num_complete_blocks:
-                block_ids_to_hash = self.request_to_kv_block_ids[current_id][
-                    first_block_to_hash:num_complete_blocks
+            # Range 1: prior-chunk partial block that this chunk just completed
+            r1_end = min(already_allocated_blocks, num_complete_blocks)
+            if previously_complete < r1_end:
+                # Chunked prefill path: block IDs from prior chunk are on GPU
+                r1_ids = self.request_to_kv_block_ids[current_id][
+                    previously_complete:r1_end
                 ].tolist()
-                for i, block_id in enumerate(block_ids_to_hash):
-                    block_hash = req.precomputed_block_hashes[first_block_to_hash + i]
-                    self.block_allocator.register_block_hash(block_id, block_hash)
-                    self._blocks_pending_computation.append(block_id)
+                all_block_ids.extend(r1_ids)
+                all_hashes.extend(req.precomputed_block_hashes[previously_complete:r1_end])
+
+            # Range 2: newly allocated (non-matched) blocks that are now complete
+            r2_start = already_allocated_blocks + num_matched_blocks
+            if r2_start < num_complete_blocks:
+                # Use CPU list from allocate_memory_blocks() — zero GPU sync.
+                # _last_allocated_cpu[0] maps to position new_block_start (= r2_start)
+                # in the request's block layout, so slice from offset 0.
+                r2_count = num_complete_blocks - r2_start
+                r2_ids = self.block_allocator._last_allocated_cpu[:r2_count]
+                all_block_ids.extend(r2_ids)
+                all_hashes.extend(req.precomputed_block_hashes[r2_start:num_complete_blocks])
+
+            if all_block_ids:
+                self.block_allocator.register_block_hashes(all_block_ids, all_hashes)
+                self._blocks_pending_computation.extend(all_block_ids)
 
         if self.is_hybrid_model and not is_chunked_prefill:
             # Allocate a slot for Mamba states

@@ -167,7 +167,7 @@ class InferenceConfig:
     enable_chunked_prefill: bool = False
     """Whether to enable chunked prefill."""
 
-    enable_prefix_caching: bool = True
+    enable_prefix_caching: bool = False
     """Whether to enable prefix caching for KV cache block sharing."""
 
     block_evict_lru: bool = False

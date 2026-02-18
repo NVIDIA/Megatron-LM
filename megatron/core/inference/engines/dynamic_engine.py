@@ -883,6 +883,19 @@ class DynamicInferenceEngine(AbstractEngine):
         log_probs_iter = log_probs if log_probs else repeat(None)
         block_allocator = self.context.block_allocator
 
+        # Pre-compute step-level block stats (before the per-request loop)
+        if self.track_generated_token_events:
+            blocks_allocated = block_allocator.total_count - block_allocator.total_avail
+            if block_allocator.enable_prefix_caching:
+                # Reconcile lazy counter before reading (at most 1 GPU sync)
+                block_allocator.reconcile_blocks_with_refs()
+                # Use CPU counters — no GPU→CPU sync needed
+                blocks_hashed_active = block_allocator._cpu_blocks_with_refs
+                blocks_ref_count = block_allocator._cpu_total_ref_count
+            else:
+                blocks_hashed_active = blocks_allocated
+                blocks_ref_count = None
+
         for req_idx, (request_id, token, request_log_probs) in enumerate(
             zip(request_ids.tolist(), sample.tolist(), log_probs_iter)
         ):
@@ -894,23 +907,20 @@ class DynamicInferenceEngine(AbstractEngine):
                     is_first_token = len(request.generated_tokens) == 0
                     request.generated_tokens.append(token)
                     if self.track_generated_token_events:
-                        blocks_allocated = block_allocator.total_count - block_allocator.total_avail
                         if block_allocator.enable_prefix_caching:
                             event_generated_token = request.add_event_generated_token(
                                 token,
                                 blocks_total=block_allocator.total_count,
                                 blocks_hashed_total=blocks_allocated,
-                                blocks_hashed_active=int(
-                                    (block_allocator.block_ref_counts > 0).sum().item()
-                                ),
-                                blocks_ref_count=block_allocator.block_ref_counts.sum().item(),
+                                blocks_hashed_active=blocks_hashed_active,
+                                blocks_ref_count=blocks_ref_count,
                             )
                         else:
                             event_generated_token = request.add_event_generated_token(
                                 token,
                                 blocks_total=block_allocator.total_count,
                                 blocks_hashed_total=blocks_allocated,
-                                blocks_hashed_active=blocks_allocated,
+                                blocks_hashed_active=blocks_hashed_active,
                             )
                     if is_first_token:
                         if self.track_generated_token_events:
@@ -1116,7 +1126,7 @@ class DynamicInferenceEngine(AbstractEngine):
             stop_len = len(stop_word_ids)
             if len(generated_tokens) >= stop_len:
                 # Check if the last stop_len tokens match the stop word
-                if list(generated_tokens[-stop_len:]) == stop_word_ids:
+                if generated_tokens[-stop_len:] == stop_word_ids:
                     return True
 
         return False
@@ -1128,6 +1138,9 @@ class DynamicInferenceEngine(AbstractEngine):
         request that is still being prefilled, those blocks have hash == -1 in the
         block allocator (registered but not yet marked computed). Scheduling such
         a request before the KV is ready would produce incorrect results.
+
+        Uses CPU-only data structures (hash_to_block_id dict + _pending_block_ids_cpu
+        set) to avoid any GPU→CPU synchronization.
 
         Args:
             req: The request to check.
@@ -1141,13 +1154,14 @@ class DynamicInferenceEngine(AbstractEngine):
             return False
 
         block_allocator = self.context.block_allocator
+        hash_to_block = block_allocator.hash_to_block_id
+        pending = block_allocator._pending_block_ids_cpu
+
         for block_hash in req.precomputed_block_hashes:
-            block_id = block_allocator.hash_to_block_id.get(block_hash)
+            block_id = hash_to_block.get(block_hash)
             if block_id is None:
-                # No cached block for this hash — remaining blocks won't match either
                 break
-            if block_allocator.block_hashes[block_id].item() == -1:
-                # Block is registered but KV not yet computed
+            if block_id in pending:
                 return True
         return False
 

@@ -8,8 +8,8 @@ from functools import partial
 import itertools
 import math
 import logging
+import json
 import os
-import pickle
 from collections import Counter, defaultdict
 from contextlib import contextmanager, nullcontext
 from dataclasses import dataclass
@@ -433,9 +433,10 @@ def get_inference_interface(args, loop, model):
     if _INFERENCE_INTERFACE is None:
         _INFERENCE_INTERFACE = loop.run_until_complete(
             MegatronLocal.launch(
-                model[0], 
-                host='0.0.0.0', 
-                port=8294)
+                model[0],
+                host='0.0.0.0',
+                port=8294,
+                verbose=args.inference_flask_server_logging)
         )
     return _INFERENCE_INTERFACE
 
@@ -575,10 +576,10 @@ def get_environment_rollouts(
         with open(
             lang_rl_log_dir
             + f'/rollouts_rank{rank}_iteration{args.curr_iteration}_'
-            + f'{Path(args.langrl_env_config).stem}.pkl',
-            'wb',
+            + f'{Path(args.langrl_env_config).stem}.json',
+            'w',
         ) as f:
-            pickle.dump(rollouts, f)
+            json.dump([[r.model_dump() for r in group] for group in rollouts], f)
 
     return rollouts
 
@@ -1543,10 +1544,10 @@ def evaluate_and_print_results_rl(
                 with open(
                     lang_rl_log_dir
                     + f'/eval_rank{rank}_iteration{args.curr_iteration}_'
-                    + f'{Path(args.langrl_env_config).stem}.pkl',
-                    'wb',
+                    + f'{Path(args.langrl_env_config).stem}.json',
+                    'w',
                 ) as f:
-                    pickle.dump(dp_eval_results, f)
+                    json.dump([[r.model_dump() for r in group] for group in dp_eval_results], f)
 
 
 def calculate_grpo_loss(
