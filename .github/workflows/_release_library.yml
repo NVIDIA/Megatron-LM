@@ -54,9 +54,7 @@ on:
         type: string
         default: ""
     secrets:
-      SVC_PYPI_TOKEN:
-        required: true
-      SVC_PYPI_TEST_TOKEN:
+      TWINE_PASSWORD:
         required: true
       SLACK_WEBHOOK_ADMIN:
         required: true
@@ -77,7 +75,7 @@ jobs:
       ref: ${{ inputs.release-ref }}
       no-publish: true
     secrets:
-      TWINE_PASSWORD: ${{ (github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/heads/r')) && secrets.SVC_PYPI_TOKEN || secrets.SVC_PYPI_TEST_TOKEN }}
+      TWINE_PASSWORD: ${{ secrets.TWINE_PASSWORD }}
 
   bump-next-version:
     runs-on: ubuntu-latest
