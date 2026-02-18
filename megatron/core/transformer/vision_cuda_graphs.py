@@ -331,9 +331,11 @@ class VisionTECudaGraphHelper:
             is_te_min_version = lambda v: False
 
         kwargs = {
-            "num_warmup_iters": self.vision_config.cuda_graph_warmup_steps
-            if hasattr(self.vision_config, 'cuda_graph_warmup_steps')
-            else 3,
+            "num_warmup_iters": (
+                self.vision_config.cuda_graph_warmup_steps
+                if hasattr(self.vision_config, 'cuda_graph_warmup_steps')
+                else 3
+            ),
             "allow_unused_input": True,
             "_order": order,
             "_num_layers_per_chunk": [len(self.callables)],
@@ -353,17 +355,16 @@ class VisionTECudaGraphHelper:
             kwargs["sample_kwargs"] = tuple(sample_kwargs_list)
 
         # Use RNG context for sequence parallel (matches LM helper behavior)
-        if hasattr(self.vision_config, 'sequence_parallel') and self.vision_config.sequence_parallel:
+        if (
+            hasattr(self.vision_config, 'sequence_parallel')
+            and self.vision_config.sequence_parallel
+        ):
             rng_context = get_cuda_rng_tracker().fork()
         else:
             rng_context = nullcontext()
 
         with rng_context:
-            graphs = make_graphed_callables(
-                tuple(self.callables),
-                tuple(sample_args),
-                **kwargs,
-            )
+            graphs = make_graphed_callables(tuple(self.callables), tuple(sample_args), **kwargs)
 
         # Assign captured graphs to layers.
         # Wrap each graph to filter out None from (output, None) returned by forward()
@@ -423,7 +424,10 @@ def get_vision_cuda_graph_seq_length(vision_config, default_seq_length: int = 40
         The sequence length to use for CUDA graph capture
     """
     # Check for explicit max sequence length setting
-    if hasattr(vision_config, 'max_vision_cuda_graph_seq_length') and vision_config.max_vision_cuda_graph_seq_length:
+    if (
+        hasattr(vision_config, 'max_vision_cuda_graph_seq_length')
+        and vision_config.max_vision_cuda_graph_seq_length
+    ):
         return vision_config.max_vision_cuda_graph_seq_length
 
     if hasattr(vision_config, 'num_position_embeddings'):
@@ -431,7 +435,7 @@ def get_vision_cuda_graph_seq_length(vision_config, default_seq_length: int = 40
         seq_length = vision_config.num_position_embeddings
         if hasattr(vision_config, 'spatial_merge_size'):
             # Account for spatial merging
-            merge_factor = vision_config.spatial_merge_size ** 2
+            merge_factor = vision_config.spatial_merge_size**2
             seq_length = seq_length // merge_factor
         return seq_length
 
