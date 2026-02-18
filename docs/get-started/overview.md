@@ -1,3 +1,12 @@
+<!---
+   Copyright (c) 2022-2026, NVIDIA CORPORATION. All rights reserved.
+   NVIDIA CORPORATION and its licensors retain all intellectual property
+   and proprietary rights in and to this software, related documentation
+   and any modifications thereto. Any use, reproduction, disclosure or
+   distribution of this software and related documentation without an express
+   license agreement from NVIDIA CORPORATION is strictly prohibited.
+-->
+
 # Overview
 
 Megatron-Core and Megatron-LM are open-source tools that are typically used together to train LLMs at scale across GPUs. Megatron-Core expands the capability of Megatron-LM. Megatron Bridge connects Megatron-Core and Megatron-LM to other popular training models, such as Hugging Face.
