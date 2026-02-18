@@ -10,6 +10,7 @@ try:
     from flask import Flask
     from hypercorn.asyncio import serve
     from hypercorn.config import Config
+    from hypercorn.middleware import AsyncioWSGIMiddleware
 
     HAS_FLASK = True
 except ImportError as e:
@@ -69,13 +70,13 @@ async def run_flask_server_on_client(
         return "Megatron Dynamic Inference Server is running."
 
     loop = asyncio.get_event_loop()
-    loop.set_default_executor(ThreadPoolExecutor(max_workers=8192))
 
     config = Config()
     config.keep_alive_timeout = 30.0
     config.wsgi_max_body_size = 2**30  # 1 GB
     config.bind = [f"0.0.0.0:{flask_port}"]
     config.backlog = 8192
+    config.keep_alive_timeout = 30.0
 
     # Force logging level to INFO to ensure that hostname is printed
     with temp_log_level(logging.INFO, logger):
@@ -83,7 +84,8 @@ async def run_flask_server_on_client(
         logger.info(f"Using tokenizer: {type(tokenizer)}")
         logger.info(f"Using parsers: {parsers}")
 
-    await serve(app, config)
+    loop.set_default_executor(ThreadPoolExecutor(max_workers=8192))
+    await serve(AsyncioWSGIMiddleware(app), config)
 
 
 @trace_async_exceptions
