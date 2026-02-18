@@ -601,7 +601,6 @@ class DynamicInferenceEngine(AbstractEngine):
             "suspended", unified_memory_level=self.unified_memory_level
         ):
             self.context.deallocate_inference_state_buffers()
-            torch.cuda.synchronize()
 
         if (
             self.context.kv_cache_management_mode != KVCacheManagementMode.PERSIST
