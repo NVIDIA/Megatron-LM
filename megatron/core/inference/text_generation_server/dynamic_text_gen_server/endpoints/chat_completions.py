@@ -206,7 +206,7 @@ try:
             if result["routing_indices"] is not None:
                 choice_data["moe_topk_indices"] = result["routing_indices"]
                 if prompt_tokens_count:
-                    choices[-1]["prompt_moe_topk_indices"] = result["routing_indices"][
+                    choice_data["prompt_moe_topk_indices"] = result["routing_indices"][
                         :prompt_tokens_count
                     ]
             choices.append(choice_data)
