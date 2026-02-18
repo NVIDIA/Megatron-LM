@@ -21,7 +21,6 @@ from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
 from megatron.core.transformer.transformer_config import TransformerConfig
 from tests.unit_tests.test_utilities import Utils
 
-
 # =========================================================================
 # Infrastructure
 # =========================================================================
@@ -39,23 +38,40 @@ class PrefixCachingTestBase:
     def teardown_method(self, method):
         Utils.destroy_model_parallel()
 
-    def _ctx(self, *, buffer_size_gb=0.1, block_size_tokens=32,
-             max_sequence_length=512, rounder=64, enable_prefix_caching=True,
-             max_tokens=None, block_evict_lru=True):
+    def _ctx(
+        self,
+        *,
+        buffer_size_gb=0.1,
+        block_size_tokens=32,
+        max_sequence_length=512,
+        rounder=64,
+        enable_prefix_caching=True,
+        max_tokens=None,
+        block_evict_lru=True,
+    ):
         DynamicInferenceContext.ROUNDER = rounder
         DynamicInferenceContext.TOKEN_ROUNDER = rounder
         DynamicInferenceContext.REQUEST_ROUNDER = rounder
         transformer_config = TransformerConfig(
-            params_dtype=torch.float32, num_layers=4, kv_channels=8,
-            num_attention_heads=2, hidden_size=16, tensor_model_parallel_size=1,
-            pipeline_model_parallel_size=1, use_cpu_initialization=True,
+            params_dtype=torch.float32,
+            num_layers=4,
+            kv_channels=8,
+            num_attention_heads=2,
+            hidden_size=16,
+            tensor_model_parallel_size=1,
+            pipeline_model_parallel_size=1,
+            use_cpu_initialization=True,
         )
         inference_config = InferenceConfig(
-            max_sequence_length=max_sequence_length, buffer_size_gb=buffer_size_gb,
+            max_sequence_length=max_sequence_length,
+            buffer_size_gb=buffer_size_gb,
             paused_buffer_size_gb=0.2 * buffer_size_gb,
-            block_size_tokens=block_size_tokens, max_tokens=max_tokens,
-            mamba_inference_state_config=None, use_flashinfer_fused_rope=None,
-            unified_memory_level=0, enable_prefix_caching=enable_prefix_caching,
+            block_size_tokens=block_size_tokens,
+            max_tokens=max_tokens,
+            mamba_inference_state_config=None,
+            use_flashinfer_fused_rope=None,
+            unified_memory_level=0,
+            enable_prefix_caching=enable_prefix_caching,
             block_evict_lru=block_evict_lru,
         )
         return DynamicInferenceContext(
@@ -65,7 +81,8 @@ class PrefixCachingTestBase:
     @staticmethod
     def _req(ctx, prompt_tokens, request_id=1, *, enable_prefix_caching=True):
         return DynamicInferenceRequest(
-            request_id=request_id, prompt_tokens=prompt_tokens,
+            request_id=request_id,
+            prompt_tokens=prompt_tokens,
             sampling_params=SamplingParams(num_tokens_to_generate=10),
             block_size_tokens=ctx.block_size_tokens,
             enable_prefix_caching=enable_prefix_caching,
@@ -143,13 +160,23 @@ class TestHashContract(PrefixCachingTestBase):
         bs = ctx.block_size_tokens
         dev = torch.cuda.current_device()
         assert self._req(ctx, self._prompt(bs // 2)).precomputed_block_hashes == []
-        assert self._req(ctx, torch.tensor([], device=dev, dtype=torch.long)).precomputed_block_hashes == []
-        assert self._req(ctx, torch.tensor([42], device=dev, dtype=torch.long)).precomputed_block_hashes == []
+        assert (
+            self._req(ctx, torch.tensor([], device=dev, dtype=torch.long)).precomputed_block_hashes
+            == []
+        )
+        assert (
+            self._req(
+                ctx, torch.tensor([42], device=dev, dtype=torch.long)
+            ).precomputed_block_hashes
+            == []
+        )
         zeros = torch.zeros(bs * 4, device=dev, dtype=torch.long)
         h_zeros = self._req(ctx, zeros).precomputed_block_hashes
         assert len(h_zeros) == 4 and len(set(h_zeros)) == 4
         ctx_long = self._ctx(max_sequence_length=8192)
-        h_long = self._req(ctx_long, torch.arange(bs * 120, device=dev, dtype=torch.long)).precomputed_block_hashes
+        h_long = self._req(
+            ctx_long, torch.arange(bs * 120, device=dev, dtype=torch.long)
+        ).precomputed_block_hashes
         assert len(h_long) == 120 and all(h > 0 for h in h_long)
 
 
@@ -189,7 +216,7 @@ class TestPrefixMatchingContract(PrefixCachingTestBase):
         ctx.mark_pending_blocks_computed()
         r1 = self._block_ids(ctx, 0, 3)
         prompt2 = prompt1.clone()
-        prompt2[bs * 2:] += 1000
+        prompt2[bs * 2 :] += 1000
         ctx.add_request(self._req(ctx, prompt2, request_id=2))
         r2 = self._block_ids(ctx, 1, 3)
         assert r2[0] == r1[0] and r2[1] == r1[1], "Blocks 0,1 shared"
@@ -208,7 +235,7 @@ class TestPrefixMatchingContract(PrefixCachingTestBase):
         ctx.mark_pending_blocks_computed()
         r1 = self._block_ids(ctx, 0, 3)
         prompt2 = prompt1.clone()
-        prompt2[bs: bs * 2] += 5000
+        prompt2[bs : bs * 2] += 5000
         ctx.add_request(self._req(ctx, prompt2, request_id=2))
         r2 = self._block_ids(ctx, 1, 3)
         assert r2[0] == r1[0], "Block 0 shared"
@@ -317,9 +344,9 @@ class TestEvictionPolicy(PrefixCachingTestBase):
         ctx.total_request_count = 1
         for i in range(20):
             try:
-                ctx.add_request(self._req(
-                    ctx, self._prompt(bs * 2, offset=(i + 10) * 1000), request_id=i + 100
-                ))
+                ctx.add_request(
+                    self._req(ctx, self._prompt(bs * 2, offset=(i + 10) * 1000), request_id=i + 100)
+                )
                 ctx.mark_pending_blocks_computed()
             except Exception:
                 break
@@ -558,8 +585,7 @@ class TestChunkedPrefill(PrefixCachingTestBase):
             self._simulate_chunk_done(req_b, chunk_len)
             start = i * 2
             assert torch.equal(
-                ctx.request_to_kv_block_ids[1][start: start + 2],
-                r_a_blocks[start: start + 2],
+                ctx.request_to_kv_block_ids[1][start : start + 2], r_a_blocks[start : start + 2]
             )
         assert alloc.total_avail == pool_avail_before
 
@@ -625,7 +651,9 @@ class TestEngineScheduling(PrefixCachingTestBase):
     def _add_to_waiting(self, engine, ctx, req):
         request_id = req.request_id
         engine.requests[request_id] = type(
-            "Entry", (), {
+            "Entry",
+            (),
+            {
                 "record": DynamicInferenceRequestRecord.from_request(req),
                 "future": engine._loop.create_future(),
             },
@@ -702,9 +730,7 @@ class TestCPUShadowsAndConfig(PrefixCachingTestBase):
 
     @staticmethod
     def _assert_cpu_shadows_consistent(alloc):
-        gpu_pending = set(
-            torch.nonzero(alloc._pending_block_hashes != -1).flatten().tolist()
-        )
+        gpu_pending = set(torch.nonzero(alloc._pending_block_hashes != -1).flatten().tolist())
         assert alloc._pending_block_ids_cpu == gpu_pending
         for bid, h in alloc.block_id_to_hash.items():
             assert alloc.hash_to_block_id.get(h) == bid

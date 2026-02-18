@@ -153,10 +153,11 @@ class BlockAllocator:
         #   Pending blocks are already counted in _cpu_blocks_with_refs, but subtracting
         #   them handles the edge case where a block is released before mark_computed
         #   (ref == 0, still pending, not evictable).
-        estimated_evictable = max(0,
+        estimated_evictable = max(
+            0,
             len(self.hash_to_block_id)
             - self._cpu_blocks_with_refs
-            - len(self._pending_block_ids_cpu)
+            - len(self._pending_block_ids_cpu),
         )
         if self.total_avail + estimated_evictable >= num_blocks:
             return True

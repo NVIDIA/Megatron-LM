@@ -1864,7 +1864,9 @@ class DynamicInferenceContext(BaseInferenceContext):
         match_start = already_allocated_blocks
         new_block_start = already_allocated_blocks + num_matched_blocks
         if num_matched_blocks > 0:
-            self.request_to_kv_block_ids[current_id][match_start:match_start + num_matched_blocks] = matched_tensor
+            self.request_to_kv_block_ids[current_id][
+                match_start : match_start + num_matched_blocks
+            ] = matched_tensor
         if new_block_ids is not None:
             self.request_to_kv_block_ids[current_id][
                 new_block_start : new_block_start + len(new_block_ids)
