@@ -8,13 +8,14 @@ import traceback
 from dataclasses import dataclass
 from typing import Dict, List, Optional, Tuple, Union
 
-from image_processing import find_closest_aspect_ratio, find_closest_area_weighted_aspect_ratio, get_visual_transform
+from image_processing import ImageTransform, find_closest_aspect_ratio, find_closest_area_weighted_aspect_ratio
 from PIL import Image
 from torchvision.transforms import ToPILImage
 import numpy as np
 import torch
 
 from energon_util import OfflineTargetAspectRatioSample, SampleListSample
+from megatron.core.models.multimodal.context_parallel import get_padding
 from megatron.core.models.multimodal.llava_model import IGNORE_INDEX, IMAGE_TOKEN, VIDEO_TOKEN
 from megatron.core.models.vision.clip_vit_model import get_num_image_embeddings
 from megatron.energon import (
@@ -173,6 +174,8 @@ class TaskEncoder(DefaultTaskEncoder[OCRSample, OCRSample, ImageTaskBatchPacked,
             1,
             self.args.pixel_shuffle,
             self.args.use_tile_tags,
+            self.args.max_num_tiles,
+            self.args.tokenizer_prompt_format,
         )
 
         self.txt_to_token_dict = {}
@@ -186,6 +189,8 @@ class TaskEncoder(DefaultTaskEncoder[OCRSample, OCRSample, ImageTaskBatchPacked,
         self.find_closest_aspect_ratio_fn = (
             find_closest_area_weighted_aspect_ratio if self.args.use_area_weighted_aspect_ratio
             else find_closest_aspect_ratio)
+
+        self.transform_img = ImageTransform(self.img_h, self.args.vision_model_type)
 
     def _get_total_seq_length(self, input_ids, num_tiles):
         """Calculate expected sequence length given text tokens length and number of tiles."""
@@ -243,9 +248,9 @@ class TaskEncoder(DefaultTaskEncoder[OCRSample, OCRSample, ImageTaskBatchPacked,
         """Encode CaptioningSample."""
         augment = sample.__subflavors__.get("augmentation")
 
-        imgs = get_visual_transform(
+        imgs = self.transform_img(
             sample.image, self.img_h, self.img_w, self.args.use_tiling, self.args.max_num_tiles, self.args.use_thumbnail, augment,
-            self.args.vision_model_type, find_closest_aspect_ratio_fn=self.find_closest_aspect_ratio_fn
+            find_closest_aspect_ratio_fn=self.find_closest_aspect_ratio_fn
         )
         num_tiles = [len(imgs)]
 
@@ -289,9 +294,9 @@ class TaskEncoder(DefaultTaskEncoder[OCRSample, OCRSample, ImageTaskBatchPacked,
         """Encode pretrain sample in LLAVA style."""
         augment = sample.__subflavors__.get("augmentation", False)
 
-        imgs = get_visual_transform(
+        imgs = self.transform_img(
             sample.image, self.img_h, self.img_w, self.args.use_tiling, self.args.max_num_tiles, self.args.use_thumbnail, augment,
-            self.args.vision_model_type, find_closest_aspect_ratio_fn=self.find_closest_aspect_ratio_fn
+            find_closest_aspect_ratio_fn=self.find_closest_aspect_ratio_fn
         )
         num_tiles = [len(imgs)]
 
@@ -326,13 +331,17 @@ class TaskEncoder(DefaultTaskEncoder[OCRSample, OCRSample, ImageTaskBatchPacked,
         assert not self.is_packing_enabled, error_msg
         encoded_samples = []
         current_length = 0
-        for sample in samples.samples:
-            encoded_sample = self.encode_llava_sft(sample, truncate_for_sample_list_packing=True)
-            if current_length + encoded_sample.total_len > self.packing_seq_length:
-                break
-            else:
-                encoded_samples.append(encoded_sample)
-                current_length += encoded_sample.total_len
+        for idx, sample in enumerate(samples.samples):
+            try:
+                encoded_sample = self.encode_llava_sft(sample, truncate_for_sample_list_packing=True)
+                if current_length + encoded_sample.total_len > self.packing_seq_length:
+                    print(f"Encoding list of samples: stopped at {idx} samples to stick to {self.packing_seq_length}. Last sample key: {sample.__key__}")
+                    break
+                else:
+                    encoded_samples.append(encoded_sample)
+                    current_length += encoded_sample.total_len
+            except Exception as e:
+                print(e)
         return self.pack_selected_samples(encoded_samples)
 
     def encode_llava_sft(self, sample: Union[SimilarityInterleavedSample, OfflineTargetAspectRatioSample], truncate_for_sample_list_packing=False):
@@ -343,7 +352,7 @@ class TaskEncoder(DefaultTaskEncoder[OCRSample, OCRSample, ImageTaskBatchPacked,
         # If the target aspect ratio are provided by the dataset, we use them instead of computing
         # them with the self.find_closest_aspect_ratio_fn function.
         local_find_closest_aspect_ratio_fn = self.find_closest_aspect_ratio_fn
-        if type(sample).__name__ == "OfflineTargetAspectRatioSample":
+        if type(sample).__name__ == "OfflineTargetAspectRatioSample" and len(sample.target_aspect_ratio) > 0:
             target_aspect_ratio = tuple(sample.target_aspect_ratio[0])
             assert target_aspect_ratio is not None, "Sample of type OfflineTargetAspectRatioSample needs to define the target aspect ratio."
             local_find_closest_aspect_ratio_fn = lambda *args, **kwargs: target_aspect_ratio
@@ -391,6 +400,13 @@ class TaskEncoder(DefaultTaskEncoder[OCRSample, OCRSample, ImageTaskBatchPacked,
         if not has_video and len(sample.images) == 1 and number_image_tags > 1:
             sample.images = sample.images * number_image_tags
 
+        # If there are no images in the sample, remove the image tags in the conversation.
+        if len(sample.images) == 0:
+            for turn in conversation:
+                if turn["role"] == "user":
+                    turn["content"] = turn["content"].replace(IMAGE_TOKEN, "")
+            number_image_tags = 0
+
         # We currently only support one video per sample.
         number_of_images = 1 if has_video else len(sample.images)
         # Fail if there are more image or video tags than image or videos:
@@ -421,10 +437,19 @@ class TaskEncoder(DefaultTaskEncoder[OCRSample, OCRSample, ImageTaskBatchPacked,
                 imgs = []
                 num_tiles = []
                 for img in sample.images:
-                    img_tiles = get_visual_transform(
+                    # This if block is a temporary fix to handle video frames. We hard code
+                    # `use_tiling = False` because we don't use tiling for videos frames to keep
+                    # the number of tokens to a reasonable value.
+                    if isinstance(img, torch.Tensor) or isinstance(img, np.ndarray):
+                        if len(img.shape) == 4:
+                            assert img.shape[0] == 1, f"When len(img.shape) == 4, we expect the first dimension to be 1, but got img.shape: {img.shape} instead."
+                            img = img[0]
+                            use_tiling = False
+                        to_pil = ToPILImage()
+                        img = to_pil(img)
+                    img_tiles = self.transform_img(
                         img, self.img_h, self.img_w, self.args.use_tiling, max_num_tiles,
-                        self.args.use_thumbnail, augment, self.args.vision_model_type,
-                        find_closest_aspect_ratio_fn=local_find_closest_aspect_ratio_fn)
+                        self.args.use_thumbnail, augment, find_closest_aspect_ratio_fn=local_find_closest_aspect_ratio_fn)
                     imgs += img_tiles
                     num_tiles += [len(img_tiles)]
                 if max_num_tiles == 1:
@@ -447,16 +472,16 @@ class TaskEncoder(DefaultTaskEncoder[OCRSample, OCRSample, ImageTaskBatchPacked,
             if video_fchw.shape[0] == 0:
                 raise ValueError(f"Video {sample.__key__} {sample.__restore_key__} {sample.texts} has no frames.")
             selected_frames = torch.linspace(
-                0, video_fchw.shape[0] - 1, self.args.num_frames).long()
+                0, video_fchw.shape[0] - 1,
+                min(self.args.num_frames, video_fchw.shape[0])).long()
             video_fchw = video_fchw[selected_frames]
             imgs = []
             for video_chw in video_fchw:
                 to_pil = ToPILImage()
                 video_chw = to_pil(video_chw)
-                imgs += get_visual_transform(
+                imgs += self.transform_img(
                     video_chw, self.img_h, self.img_w, use_tiling, self.args.max_num_tiles,
-                    self.args.use_thumbnail, augment, self.args.vision_model_type,
-                    find_closest_aspect_ratio_fn=local_find_closest_aspect_ratio_fn)
+                    self.args.use_thumbnail, augment, find_closest_aspect_ratio_fn=local_find_closest_aspect_ratio_fn)
             num_tiles = [len(imgs)]
         else:
             imgs = num_tiles = []
@@ -479,6 +504,20 @@ class TaskEncoder(DefaultTaskEncoder[OCRSample, OCRSample, ImageTaskBatchPacked,
         # We need to ensure that there are at least some trainable tokens in the sample.
         assert self.target_has_trainable_tokens(input_ids, num_tiles, target), "Sample has no trainable tokens."
 
+        # Context parallel requires padding.
+        total_len = self._get_total_seq_length(input_ids, num_tiles)
+        has_cp = self.args.context_parallel_size > 1
+
+        if has_cp:
+            # Note: FP8 requires padding only the total sequence length.
+            # We pad for FP8 when we have the final, possibly packed sample.
+            padding_needed = get_padding(total_len, self.args.context_parallel_size, self.args.tensor_model_parallel_size, self.args.sequence_parallel, fp8_enabled=False)
+            padding_input = np.ones(padding_needed) * self.tokenizer.pad
+            padding_labels = np.ones(padding_needed) * IGNORE_INDEX
+            input_ids = np.concatenate([input_ids, padding_input])
+            target = np.concatenate([target, padding_labels])
+            total_len = total_len + padding_needed
+
         return ImageTaskSample(
             __key__=sample.__key__,
             __restore_key__=sample.__restore_key__,
@@ -490,7 +529,7 @@ class TaskEncoder(DefaultTaskEncoder[OCRSample, OCRSample, ImageTaskBatchPacked,
             labels=torch.tensor(target),
             total_len=self._get_total_seq_length(input_ids, num_tiles),
         )
-    
+
     def target_has_trainable_tokens(self, input_ids, num_tiles, target):
         # Compute the loss mask based on extending the image tags with the proper
         # number of image tokens, extracting the first self.args.decoder_seq_length tokens, and
@@ -553,16 +592,15 @@ class TaskEncoder(DefaultTaskEncoder[OCRSample, OCRSample, ImageTaskBatchPacked,
             video_frame_fhwc = video_fhwc[selected_frames]
             imgs = []
             for video_frame_hwc in video_frame_fhwc:
-                imgs += get_visual_transform(
+                imgs += self.transform_img(
                     video_frame_hwc, self.img_h, self.img_w,
                     self.args.use_tiling, self.args.max_num_tiles,
-                    self.args.use_thumbnail, augment, self.args.vision_model_type,
-                    find_closest_aspect_ratio_fn=self.find_closest_aspect_ratio_fn)
+                    self.args.use_thumbnail, augment, find_closest_aspect_ratio_fn=self.find_closest_aspect_ratio_fn
+                )
         else:
-            imgs = get_visual_transform(
+            imgs = self.transform_img(
                 sample.image, self.img_h, self.img_w, self.args.use_tiling, self.args.max_num_tiles,
-                self.args.use_thumbnail, augment, self.args.vision_model_type,
-                find_closest_aspect_ratio_fn=self.find_closest_aspect_ratio_fn
+                self.args.use_thumbnail, augment, find_closest_aspect_ratio_fn=self.find_closest_aspect_ratio_fn
             )
 
         num_tiles = [len(imgs)]
@@ -633,10 +671,9 @@ class TaskEncoder(DefaultTaskEncoder[OCRSample, OCRSample, ImageTaskBatchPacked,
         elif task_type == "_encode_ocr":
             sample, cur_prompt, cur_answer = self.encode_ocr_prompt(sample)
 
-        imgs = get_visual_transform(
+        imgs = self.transform_img(
                 sample.image, self.img_h, self.img_w, self.args.use_tiling, self.args.max_num_tiles,
-                self.args.use_thumbnail, augment, self.args.vision_model_type,
-                find_closest_aspect_ratio_fn=self.find_closest_aspect_ratio_fn
+                self.args.use_thumbnail, augment, find_closest_aspect_ratio_fn=self.find_closest_aspect_ratio_fn
             )
         num_tiles = [len(imgs)]
 
@@ -764,9 +801,9 @@ class TaskEncoder(DefaultTaskEncoder[OCRSample, OCRSample, ImageTaskBatchPacked,
         if not max_seq_len:
            max_seq_len = max(len(s.tokens) for s in samples)
 
-        tokens = np.full((len(samples), max_seq_len), self.tokenizer.pad, dtype=np.int64)
+        tokens = torch.full((len(samples), max_seq_len), self.tokenizer.pad, dtype=torch.int64)
         # +1 to accommodate shift to left by one later.
-        labels = np.full((len(samples), max_seq_len + 1), self.tokenizer.pad, dtype=np.int64)
+        labels = torch.full((len(samples), max_seq_len + 1), self.tokenizer.pad, dtype=torch.int64)
 
         for i, s in enumerate(samples):
             # If the sample/target length exceeds the target sequence length, then truncate.
@@ -784,9 +821,32 @@ class TaskEncoder(DefaultTaskEncoder[OCRSample, OCRSample, ImageTaskBatchPacked,
         cu_lengths = torch.tensor([[0]], dtype=torch.int32)
         max_lengths = torch.tensor([[0]], dtype=torch.int32)
 
-        if self.is_packing_enabled:
+        is_packed = isinstance(samples[0], ImageTaskSamplePacked)
+
+        if is_packed:
             cu_lengths = torch.stack([s.cu_lengths for s in samples])
             max_lengths = torch.tensor([s.max_length for s in samples], dtype=torch.int32)
+
+        # Pad entire sequence to be a multiple of 32 or 16 if using fp8.
+        has_fp8 = self.args.fp8
+        if has_fp8:
+            total_seq_len = self._get_total_seq_length(tokens[0], num_tiles)
+            padding_needed = get_padding(
+                total_seq_len,
+                self.args.context_parallel_size,
+                self.args.tensor_model_parallel_size,
+                self.args.sequence_parallel,
+                fp8_enabled=has_fp8,
+                fp8_recipe=self.args.fp8_recipe,
+            )
+            if padding_needed > 0:
+                tokens = torch.cat([tokens, torch.full((tokens.shape[0], padding_needed), self.tokenizer.pad, dtype=torch.int64)], dim=1)
+                labels = torch.cat([labels, torch.full((labels.shape[0], padding_needed), IGNORE_INDEX, dtype=torch.int64)], dim=1)
+                if is_packed:
+                    cu_lengths[0][-1] += padding_needed
+                    new_max_length = cu_lengths[0][-1] - cu_lengths[0][-2]
+                    max_lengths = torch.max(max_lengths, new_max_length)
+
 
         return ImageTaskBatchPacked(
             __key__=[s.__key__ for s in samples],
@@ -810,7 +870,7 @@ class TaskEncoder(DefaultTaskEncoder[OCRSample, OCRSample, ImageTaskBatchPacked,
         """Selects which samples will be packed together.
 
         NOTE: Energon dataloader calls this method internally if packing is used.
-        Please see https://nvidia.github.io/Megatron-Energon/packing.html
+        Please see https://nvidia.github.io/Megatron-Energon/advanced/packing.html
         """
         lengths = [sample.total_len for sample in samples]
 
@@ -824,7 +884,7 @@ class TaskEncoder(DefaultTaskEncoder[OCRSample, OCRSample, ImageTaskBatchPacked,
         Function to pack a list of ImageTaskSample into a single ImageTaskSamplePacked.
 
         NOTE: Energon dataloader calls this method internally if packing is used.
-        Please see https://nvidia.github.io/Megatron-Energon/packing.html
+        Please see https://nvidia.github.io/Megatron-Energon/advanced/packing.html
 
         Args:
             samples: List of ImageTaskSample instances to pack into one sample.

@@ -10,9 +10,7 @@ def add_multimodal_extra_args(parser):
     group.add_argument('--freeze-LM', action='store_true', default=False)
     group.add_argument('--freeze-ViT', action='store_true', default=False)
     group.add_argument('--language-model-type', type=str, required=True)
-    group.add_argument('--language-huggingface-model-name-or-path', type=str)
     group.add_argument('--vision-model-type', type=str, default="clip")
-    group.add_argument('--vision-huggingface-model-name-or-path', type=str)
     group.add_argument("--disable-vision-class-token", action="store_true", default=False)
     group.add_argument(
         "--allow-missing-vision-projection-checkpoint", action="store_true", default=False
@@ -51,7 +49,8 @@ def add_multimodal_extra_args(parser):
     group.add_argument(
         "--tokenizer-prompt-format",
         type=str,
-        choices=["mistral", "llama3", "llama3p1", "chatml", "nvlm-yi-34b", "qwen2p0", "qwen2p5"],
+        choices=["mistral", "llama3", "chatml", "nvlm-yi-34b", "qwen2p0", "qwen2p5", "llama3p1", "nemotron5",
+                 "nemotron5-aligned"],
         required=True,
         help="Prompt format to use with the tokenizer.",
     )
@@ -80,10 +79,15 @@ def add_multimodal_extra_args(parser):
         "--use-loss-scaling", action="store_true", default=False, help="Scale loss based on conversation turn length (in tokens)."
     )
     group.add_argument(
+        "--force-system-message", action="store_true", default=False, help="Force a specific system message"
+    )
+    group.add_argument("--eos-id", type=int, help="termination id for MultiModal Tokenizer")
+    group.add_argument(
         "--use-area-weighted-aspect-ratio", action="store_true", default=False,
         help=(
             "When --use-tiling is True, find the aspect ratio to use based on the original ",
             "image aspect ratio and the area covered by the tiles.")
     )
+    group.add_argument("--use-mcore-inference", action="store_true", default=False, help="Use the MCore inference API")
 
     return parser

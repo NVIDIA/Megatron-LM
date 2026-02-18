@@ -2,6 +2,7 @@
 import functools
 import time
 import typing
+import warnings
 from collections import OrderedDict
 from typing import Dict, Optional, Type, Union
 
@@ -26,16 +27,16 @@ class Scheduler:
 
     def __init__(self, max_batch_size):
         self.max_batch_size = max_batch_size
-        self.requests: Dict[str, InferenceRequest] = OrderedDict()
-        self.streams: Dict[str, AsyncStream] = OrderedDict()
-        self.active_request_pool: Dict[str, InferenceRequest] = OrderedDict()
-        self.waiting_request_pool: Dict[str, InferenceRequest] = OrderedDict()
-        self.completed_request_pool: Dict[str, InferenceRequest] = OrderedDict()
+        self.requests: Dict[int, InferenceRequest] = OrderedDict()
+        self.streams: Dict[int, AsyncStream] = OrderedDict()
+        self.active_request_pool: Dict[int, InferenceRequest] = OrderedDict()
+        self.waiting_request_pool: Dict[int, InferenceRequest] = OrderedDict()
+        self.completed_request_pool: Dict[int, InferenceRequest] = OrderedDict()
         self.request_counter = Counter()
 
-    def get_new_request_id(self) -> str:
+    def get_new_request_id(self) -> int:
         """Gets a new request id"""
-        request_id = str(next(self.request_counter))
+        request_id = int(next(self.request_counter))
         return request_id
 
     def add_request(
@@ -43,11 +44,13 @@ class Scheduler:
         prompt: Optional[str] = None,
         prompt_tokens: Optional[torch.Tensor] = None,
         encoder_prompt: Optional[str] = None,
-        inference_parameters: Optional[SamplingParams] = None,
+        sampling_params: Optional[SamplingParams] = None,
         arrival_time: Optional[float] = None,
         streaming: bool = False,
         inference_request: Optional[InferenceRequest] = None,
-    ) -> str:
+        *,
+        inference_parameters: Optional[SamplingParams] = None,
+    ) -> int:
         """Add an incoming request
 
         This method will add the request to either the active pool or the waiting pool
@@ -57,7 +60,7 @@ class Scheduler:
             prompt (str): Input prompt string
             prompt_tokens (torch.Tensor): A torch tensor having the input prompts tokenized
             encoder_prompt (str): Encoder input string
-            inference_parameters (SamplingParams): The inference parameters
+            sampling_params (SamplingParams): The sampling parameters
             arrival_time (float, optional): The incoming request time. Defaults to None.
             streaming (bool, optional): Whether to asynchronously stream tokens for this request.
             inference_request (InferenceRequest, optional): A fully constructed request.
@@ -72,6 +75,15 @@ class Scheduler:
             else Status.WAITING_IN_QUEUE
         )
 
+        # Deprecation warning for `inference_parameters`.
+        if inference_parameters is not None:
+            warnings.warn(
+                "`inference_parameters` has been renamed to `sampling_params`, and the "
+                "previous name will be removed in `megatron-core` 0.13."
+            )
+            if sampling_params is None:
+                sampling_params = inference_parameters
+
         if inference_request is None:
             assert prompt is not None
             assert prompt_tokens is not None
@@ -84,7 +96,7 @@ class Scheduler:
             inference_request = InferenceRequest(
                 request_id=request_id,
                 prompt=prompt,
-                inference_parameters=inference_parameters,
+                sampling_params=sampling_params,
                 arrival_time=arrival_time,
                 prompt_tokens=prompt_tokens,
                 status=status,
@@ -109,13 +121,19 @@ class Scheduler:
 
         return request_id
 
+    def num_requests_pending(self) -> int:
+        """Get the number of requests pending.
+
+        This method returns the number of active + waiting requests.
+        """
+        return len(self.active_request_pool) + len(self.waiting_request_pool)
+
     def have_requests_pending(self) -> bool:
-        """Method to check if there are requests pending
+        """Method to check if there are requests pending.
 
         This method returns False only when there are no active requests or waiting requests.
         """
-        num_requests_pending = len(self.active_request_pool) + len(self.waiting_request_pool)
-        return num_requests_pending > 0
+        return self.num_requests_pending() > 0
 
     def add_earliest_waiting_request_to_active_pool(self):
         """Utility to add the waiting request to active pool
@@ -134,7 +152,7 @@ class Scheduler:
             self.active_request_pool[earliest_waiting_request_request_id] = earliest_waiting_request
 
     def update_requests_pools(
-        self, result_dict: Optional[typing.OrderedDict[str, InferenceRequest]] = None
+        self, result_dict: Optional[typing.OrderedDict[int, InferenceRequest]] = None
     ):
         """Update request pool status
 
@@ -144,9 +162,9 @@ class Scheduler:
         request pool and add waiting request into active pool.
 
         Args:
-            result (typing.OrderedDict[str, InferenceRequest], optional): The result returned
+            result (typing.OrderedDict[int, InferenceRequest], optional): The result returned
                 by the engine. A dictionary with keys as the request ids, and values as the
-                requests. Defaults to None
+                requests. Defaults to None.
         """
         for result_request_id in list(result_dict.keys()):
             active_request = self.active_request_pool[result_request_id]
@@ -165,9 +183,9 @@ class Scheduler:
 
     def abort_request(
         self,
-        request_id: str,
+        request_id: int,
         *,
-        exception: Optional[Union[BaseException, Type[BaseException]]] = None
+        exception: Optional[Union[BaseException, Type[BaseException]]] = None,
     ):
         """Cancels the given request"""
         stream = self.streams.get(request_id, None)

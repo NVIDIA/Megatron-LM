@@ -31,7 +31,9 @@ def test_allreduce_conditional_embedding_grads():
         for param in chunk.parameters():
             param.main_grad = torch.ones_like(param) * (pp_rank * 10.0 + i)
 
-    _allreduce_conditional_embedding_grads(model, config)
+    _allreduce_conditional_embedding_grads(
+        model, config, parallel_state.get_pipeline_model_parallel_group()
+    )
 
     expect_value = 0
     for i in range(len(model)):

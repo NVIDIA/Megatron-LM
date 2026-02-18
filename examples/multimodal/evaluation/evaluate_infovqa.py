@@ -1,8 +1,8 @@
 import argparse
 import json
 
-from evaluate_vqav2 import compute_vqa_accuracy
-from evaluate_mmmu import get_input_output_paths
+from .evaluate_vqav2 import compute_vqa_accuracy
+from .evaluate_mmmu import get_input_output_paths
 
 
 def merge_input_files(input_path):

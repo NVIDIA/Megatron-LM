@@ -52,7 +52,7 @@ class HybridDeviceOptimizer(torch.optim.Optimizer):
         pin_cpu_grads: bool = True,
         pin_cpu_params: bool = True,
         overlap_cpu_optimizer_d2h_h2d: bool = True,
-        **kwargs
+        **kwargs,
     ):
         super(HybridDeviceOptimizer, self).__init__(
             params,
@@ -122,7 +122,7 @@ class HybridDeviceOptimizer(torch.optim.Optimizer):
                     for param in _param_generator(optimizer):
                         gpu_param = self.cpu_copys_map_gpu_param[param]
                         gpu_param.data.copy_(param.data, non_blocking=True)
-                self._d2h_stream.record_event().wait(torch.cuda.current_stream())
+                self._h2d_stream.record_event().wait(torch.cuda.current_stream())
 
             return param_copy_back_gpu_hook
 
@@ -372,6 +372,13 @@ class HybridDeviceOptimizer(torch.optim.Optimizer):
         for param, v in self.state.items():
             fp32_param = self.param_to_fp32_param[param]
             fp32_param.data.copy_(v["master_param"])
+
+    def update_fp32_param_by_new_param(self):
+        """
+        Update the fp32 parameters by the new parameters.
+        """
+        for param, fp32_param in self.param_to_fp32_param.items():
+            fp32_param.data.copy_(param)
 
     def _register_load_state_dict_hooks(self):
         def pre_load_state_dict_hook(self, state_dict):

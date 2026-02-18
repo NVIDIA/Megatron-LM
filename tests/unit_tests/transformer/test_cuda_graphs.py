@@ -1,0 +1,1102 @@
+# Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+
+import gc
+import os
+import sys
+
+import pytest
+import torch
+from transformer_engine.pytorch.fp8 import check_fp8_support
+
+from megatron.core.enums import ModelType
+from megatron.core.models.gpt.gpt_layer_specs import (
+    get_gpt_decoder_block_spec,
+    get_gpt_layer_with_transformer_engine_spec,
+    get_gpt_mtp_block_spec,
+)
+from megatron.core.models.gpt.gpt_model import GPTModel
+from megatron.core.models.mamba.mamba_layer_specs import mamba_stack_spec
+from megatron.core.num_microbatches_calculator import (
+    destroy_num_microbatches_calculator,
+    init_num_microbatches_calculator,
+)
+from megatron.core.pipeline_parallel.schedules import set_current_microbatch
+from megatron.core.process_groups_config import ProcessGroupCollection
+from megatron.core.ssm.mamba_block import MambaStack
+from megatron.core.tensor_parallel.random import (
+    HAVE_TE,
+    initialize_rng_tracker,
+    model_parallel_cuda_manual_seed,
+)
+from megatron.core.transformer.cuda_graphs import (
+    CudaGraphManager,
+    TECudaGraphHelper,
+    _CudagraphGlobalRecord,
+)
+from megatron.core.transformer.enums import CudaGraphScope
+from megatron.core.transformer.moe.fused_a2a import reset_hybrid_ep_buffer
+from megatron.core.transformer.transformer_block import TransformerBlock
+from megatron.core.transformer.transformer_config import TransformerConfig
+from megatron.core.utils import is_fa_min_version, is_te_min_version
+from megatron.training.arguments import core_transformer_config_from_args, parse_args, validate_args
+from megatron.training.global_vars import (
+    destroy_global_vars,
+    get_args,
+    set_args,
+    set_global_variables,
+)
+from megatron.training.training import setup_model_and_optimizer
+from tests.unit_tests.test_utilities import Utils
+
+fp8_available, _ = check_fp8_support()
+
+
+class TestParallelTransformerBlockCudagraphs:
+    def setup_method(self, method):
+        # initialize parallel state
+        initialize_rng_tracker(use_te_rng_tracker=True, force_reset=True)
+        Utils.initialize_model_parallel(
+            tensor_model_parallel_size=2, pipeline_model_parallel_size=2
+        )
+        model_parallel_cuda_manual_seed(123)
+
+        # initialize transformer model
+        num_layers = 8
+        hidden_size = 64
+        self.transformer_config = TransformerConfig(
+            num_layers=num_layers,
+            hidden_size=hidden_size,
+            num_attention_heads=4,
+            use_cpu_initialization=True,
+            cuda_graph_impl="local",
+        )
+        self.parallel_transformer_block = TransformerBlock(
+            self.transformer_config, get_gpt_layer_with_transformer_engine_spec()
+        )
+
+    def teardown_method(self, method):
+        Utils.destroy_model_parallel()
+        _CudagraphGlobalRecord.cudagraph_created = False
+        _CudagraphGlobalRecord.cudagraph_record = []
+        CudaGraphManager.global_mempool = None
+
+    @pytest.mark.skipif(
+        not (HAVE_TE and is_te_min_version("1.5.0")),
+        reason="use_te_rng_tracker requires TransformerEngine version >= 1.5",
+    )
+    def test_gpu_cudagraph(self):
+        parallel_transformer_block = self.parallel_transformer_block
+        parallel_transformer_block.cuda()
+
+        # [sequence length, batch size, hidden size]
+        sequence_length = 32
+        micro_batch_size = 2
+        transformer_config: TransformerConfig = parallel_transformer_block.config
+        num_layers = transformer_config.num_layers
+        hidden_size = transformer_config.hidden_size
+        hidden_states = torch.ones((sequence_length, micro_batch_size, hidden_size))
+        hidden_states = hidden_states.cuda()
+        attention_mask = torch.ones((1, 1, sequence_length, sequence_length), dtype=bool).cuda()
+
+        hidden_states = parallel_transformer_block(
+            hidden_states=hidden_states, attention_mask=attention_mask
+        )
+
+        for _ in range(num_layers):
+            assert hasattr(parallel_transformer_block.layers[0], "cudagraph_manager")
+            assert (
+                len(parallel_transformer_block.layers[0].cudagraph_manager.cudagraph_runners) == 1
+            )
+            del (
+                parallel_transformer_block.layers[_]
+                .cudagraph_manager.cudagraph_runners[0]
+                .fwd_graph
+            )
+
+
+@pytest.mark.skipif(
+    not (HAVE_TE and is_te_min_version("1.5.0")),
+    reason="use_te_rng_tracker requires TransformerEngine version >= 1.5",
+)
+@pytest.mark.parametrize(
+    "total_num_layers, pp, vpp, account_for_embedding_in_pipeline_split, account_for_loss_in_pipeline_split, num_layers_in_first_pipeline_stage, num_layers_in_last_pipeline_stage, pp_layout, first_layer_numbers_golden, last_layer_numbers_golden",
+    [
+        (4, 1, None, False, False, None, None, None, [1], [4]),
+        (8, 2, None, False, False, None, None, None, [1, 5], [4, 8]),
+        (8, 2, 2, False, False, None, None, None, [1, 3, 5, 7], [2, 4, 6, 8]),
+        (14, 4, None, True, True, None, None, None, [1, 4, 8, 12], [3, 7, 11, 14]),
+        (
+            14,
+            4,
+            2,
+            True,
+            True,
+            None,
+            None,
+            None,
+            [1, 2, 4, 6, 8, 10, 12, 14],
+            [1, 3, 5, 7, 9, 11, 13, 14],
+        ),
+        (12, 4, None, False, False, 2, 2, None, [1, 3, 7, 11], [2, 6, 10, 12]),
+        (
+            12,
+            4,
+            2,
+            False,
+            False,
+            2,
+            2,
+            None,
+            [1, 2, 4, 6, 7, 8, 10, 12],
+            [1, 3, 5, 6, 7, 9, 11, 12],
+        ),
+        (
+            14,
+            4,
+            2,
+            False,
+            False,
+            None,
+            None,
+            [
+                ["embedding", "decoder"],
+                ["decoder", "decoder"],
+                ["decoder", "decoder"],
+                ["decoder", "decoder"],
+                ["decoder", "decoder"],
+                ["decoder", "decoder"],
+                ["decoder", "decoder"],
+                ["decoder", "loss"],
+            ],
+            [1, 2, 4, 6, 8, 10, 12, 14],
+            [1, 3, 5, 7, 9, 11, 13, 14],
+        ),
+    ],
+)
+def test_cuda_graph_determine_first_last_layer_logic(
+    total_num_layers,
+    pp,
+    vpp,
+    account_for_embedding_in_pipeline_split,
+    account_for_loss_in_pipeline_split,
+    num_layers_in_first_pipeline_stage,
+    num_layers_in_last_pipeline_stage,
+    pp_layout,
+    first_layer_numbers_golden,
+    last_layer_numbers_golden,
+):
+    # Initialize RNG tracker
+    initialize_rng_tracker(use_te_rng_tracker=True, force_reset=True)
+
+    # Initialize parallel state
+    Utils.initialize_model_parallel(
+        pipeline_model_parallel_size=pp, virtual_pipeline_model_parallel_size=vpp
+    )
+
+    # initialize model
+    torch.manual_seed(123)
+    model_parallel_cuda_manual_seed(123)
+    hidden_size = 128
+    transformer_config = TransformerConfig(
+        num_layers=total_num_layers,
+        hidden_size=hidden_size,
+        num_attention_heads=1,
+        use_cpu_initialization=True,
+        pipeline_dtype=torch.bfloat16,
+        bf16=True,
+        virtual_pipeline_model_parallel_size=vpp,
+        pipeline_model_parallel_size=pp,
+        deallocate_pipeline_outputs=True,
+        cuda_graph_impl="local",
+        use_te_rng_tracker=True,
+        account_for_embedding_in_pipeline_split=account_for_embedding_in_pipeline_split,
+        account_for_loss_in_pipeline_split=account_for_loss_in_pipeline_split,
+        num_layers_in_first_pipeline_stage=num_layers_in_first_pipeline_stage,
+        num_layers_in_last_pipeline_stage=num_layers_in_last_pipeline_stage,
+        pipeline_model_parallel_layout=pp_layout,
+    )
+    model = []
+    for i in range(vpp or 1):
+        this_model = GPTModel(
+            config=transformer_config,
+            transformer_layer_spec=get_gpt_layer_with_transformer_engine_spec(),
+            vocab_size=128,
+            max_sequence_length=1024,
+            position_embedding_type="rope",
+            vp_stage=i,
+        ).cuda()
+        model.append(this_model)
+
+    # create runner by running a fake forward pass
+    sequence_length, micro_batch_size = 32, 1
+    hidden_states = torch.ones((sequence_length, micro_batch_size, hidden_size)).cuda()
+    attention_mask = torch.ones((1, 1, sequence_length, sequence_length), dtype=bool).cuda()
+    for m in model:
+        _ = m(
+            input_ids=None,
+            position_ids=None,
+            attention_mask=attention_mask,
+            decoder_input=hidden_states,
+        )
+
+    # Check if cuda graph is correctly setting is first/last layer
+    for m in model:
+        for l in m.decoder.layers:
+            assert hasattr(l, "cudagraph_manager")
+            assert (
+                len(l.cudagraph_manager.cudagraph_runners) == 1
+            ), "Cuda graph runner should be created"
+            runner = l.cudagraph_manager.cudagraph_runners[0]
+            assert runner.is_first_layer is not None and runner.is_last_layer is not None
+            assert runner.is_first_layer == (l.layer_number in first_layer_numbers_golden)
+            assert runner.is_last_layer == (l.layer_number in last_layer_numbers_golden)
+
+            del l.cudagraph_manager.cudagraph_runners[0].fwd_graph
+
+    # Destroy all captured graphs deterministically
+    for m in model:
+        for l in m.decoder.layers:
+            for runner in getattr(l.cudagraph_manager, "cudagraph_runners", []):
+                # Safely delete both graphs if present
+                if hasattr(runner, "fwd_graph"):
+                    del runner.fwd_graph
+                if hasattr(runner, "bwd_graph"):
+                    del runner.bwd_graph
+
+    # Ensure all pending work is complete and graph destruction runs now
+    torch.cuda.synchronize()
+
+    # Teardown
+    Utils.destroy_model_parallel()
+    _CudagraphGlobalRecord.cudagraph_created = False
+    _CudagraphGlobalRecord.cudagraph_record = []
+    CudaGraphManager.global_mempool = None
+    CudaGraphManager.fwd_mempools = None
+    CudaGraphManager.bwd_mempools = None
+
+
+class TestLLaVACudaGraph:
+    """Test CUDA graphs with LLaVA model focusing on is_last_layer logic for encoder/decoder transitions."""
+
+    def setup_method(self, method):
+        # Initialize parallel state
+        initialize_rng_tracker(use_te_rng_tracker=True, force_reset=True)
+        Utils.initialize_model_parallel(
+            tensor_model_parallel_size=1,
+            pipeline_model_parallel_size=1,
+            virtual_pipeline_model_parallel_size=None,
+        )
+        model_parallel_cuda_manual_seed(123)
+
+        from copy import deepcopy
+
+        from megatron.core.models.multimodal.llava_model import LLaVAModel
+        from megatron.core.models.vision.vit_layer_specs import (
+            get_vit_layer_with_transformer_engine_spec,
+        )
+
+        # Create language transformer config with CUDA graphs enabled
+        self.language_hidden_size = 64
+        self.language_num_attention_heads = 4
+        language_config = TransformerConfig(
+            num_layers=2,
+            hidden_size=self.language_hidden_size,
+            num_attention_heads=self.language_num_attention_heads,
+            use_cpu_initialization=True,
+            cuda_graph_impl="local",  # Enable CUDA graphs
+        )
+
+        # Create vision transformer config
+        vision_config = TransformerConfig(
+            num_layers=2,
+            hidden_size=16,
+            num_attention_heads=2,
+            use_cpu_initialization=True,
+            cuda_graph_impl="local",  # Enable CUDA graphs for vision model too
+        )
+
+        # Create vision projection config
+        vision_projection_config = TransformerConfig(
+            num_layers=1,
+            hidden_size=self.language_hidden_size,
+            ffn_hidden_size=32,
+            num_attention_heads=1,
+            use_cpu_initialization=True,
+        )
+
+        # Get layer specs
+        language_layer_spec = get_gpt_layer_with_transformer_engine_spec()
+        vision_layer_spec = get_vit_layer_with_transformer_engine_spec()
+        vision_projection_spec = deepcopy(language_layer_spec.submodules.mlp.submodules)
+
+        # Set vision model type
+        vision_config.vision_model_type = "clip"
+        language_config.language_model_type = "dummy"
+
+        # Create LLaVA model with both encoder and decoder
+        self.llava_model = LLaVAModel(
+            language_transformer_config=language_config,
+            language_transformer_layer_spec=language_layer_spec,
+            language_vocab_size=8192,
+            language_max_sequence_length=4096,
+            vision_transformer_config=vision_config,
+            vision_transformer_layer_spec=vision_layer_spec,
+            drop_vision_class_token=False,
+            vision_projection_config=vision_projection_config,
+            vision_projection_layer_spec=vision_projection_spec,
+            img_h=336,
+            img_w=336,
+            patch_dim=14,
+            pre_process=True,
+            post_process=True,
+            add_encoder=True,
+            add_decoder=True,
+        )
+
+    def teardown_method(self, method):
+        Utils.destroy_model_parallel()
+        _CudagraphGlobalRecord.cudagraph_created = False
+        _CudagraphGlobalRecord.cudagraph_record = []
+
+    @pytest.mark.skipif(
+        not (HAVE_TE and is_te_min_version("1.5.0")),
+        reason="use_te_rng_tracker requires TransformerEngine version >= 1.5",
+    )
+    def test_llava_cudagraph_is_last_layer_logic(self):
+        """Test that is_last_layer logic correctly resets prev_bwd_hidden_state_inputgrad for LLaVA models."""
+
+        # Move model to CUDA
+        self.llava_model.cuda()
+
+        set_current_microbatch(self.llava_model.vision_model, 1)
+        set_current_microbatch(self.llava_model.language_model, 1)
+
+        # Create test inputs
+        batch_size = 2
+        seq_length = 1024
+        num_images = 1
+
+        images = torch.ones((num_images, 3, 336, 336), dtype=torch.float32).cuda()
+
+        # Create text input with image tokens
+        input_ids = torch.randint(0, 1000, (batch_size, seq_length), dtype=torch.long).cuda()
+        # Insert image token (using default image token index)
+        input_ids[0, 5] = self.llava_model.image_token_index
+
+        position_ids = torch.arange(seq_length).unsqueeze(0).expand(batch_size, -1).cuda()
+        attention_mask = None
+
+        # Create labels and loss mask for training
+        labels = torch.randint(0, 1000, (batch_size, seq_length), dtype=torch.long).cuda()
+        loss_mask = torch.ones((batch_size, seq_length), dtype=torch.float32).cuda()
+
+        # Create num_image_tiles
+        num_image_tiles = torch.ones(num_images, dtype=torch.int).cuda()
+
+        # First forward pass - this should record the CUDA graphs
+        output1, loss_mask1 = self.llava_model(
+            images=images,
+            input_ids=input_ids,
+            position_ids=position_ids,
+            attention_mask=attention_mask,
+            labels=labels,
+            loss_mask=loss_mask,
+            num_image_tiles=num_image_tiles,
+        )
+
+        # Verify that CUDA graph managers were created
+        if hasattr(self.llava_model.vision_model, 'decoder') and hasattr(
+            self.llava_model.vision_model.decoder, 'layers'
+        ):
+            for layer in self.llava_model.vision_model.decoder.layers:
+                if hasattr(layer, 'cudagraph_manager'):
+                    assert (
+                        layer.cudagraph_manager is not None
+                    ), "Vision model layers should have CUDA graph managers"
+
+        if hasattr(self.llava_model.language_model, 'decoder') and hasattr(
+            self.llava_model.language_model.decoder, 'layers'
+        ):
+            for layer in self.llava_model.language_model.decoder.layers:
+                if hasattr(layer, 'cudagraph_manager'):
+                    assert (
+                        layer.cudagraph_manager is not None
+                    ), "Language model layers should have CUDA graph managers"
+
+                    # Verify that CUDA graphs were created successfully
+                    for runner in layer.cudagraph_manager.cudagraph_runners:
+                        assert hasattr(runner, 'fwd_graph')
+                        assert hasattr(runner, 'bwd_graph')
+
+        # Perform backward pass to trigger backward graph recording
+        if isinstance(output1, tuple):
+            loss = output1[0].sum()
+        else:
+            loss = output1.sum()
+        loss.backward()
+
+        # Import the CUDA graph creation function
+        from megatron.core.transformer.cuda_graphs import create_cudagraphs
+
+        # Create the CUDA graphs - this is where the is_last_layer logic is tested
+        create_cudagraphs()
+
+        # Verify that CUDA graphs were created successfully
+        assert _CudagraphGlobalRecord.cudagraph_created, "CUDA graphs should be created"
+
+        if hasattr(self.llava_model.vision_model, 'decoder') and hasattr(
+            self.llava_model.vision_model.decoder, 'layers'
+        ):
+            for layer in self.llava_model.vision_model.decoder.layers:
+                del layer.cudagraph_manager.cudagraph_runners[0].fwd_graph
+                del layer.cudagraph_manager.cudagraph_runners[0].bwd_graph
+
+        if hasattr(self.llava_model.language_model, 'decoder') and hasattr(
+            self.llava_model.language_model.decoder, 'layers'
+        ):
+            for layer in self.llava_model.language_model.decoder.layers:
+                del layer.cudagraph_manager.cudagraph_runners[0].fwd_graph
+                del layer.cudagraph_manager.cudagraph_runners[0].bwd_graph
+
+
+class TestParallelMambaBlockCudagraphs:
+    def setup_method(self, method):
+        # initialize parallel state
+        initialize_rng_tracker(use_te_rng_tracker=True, force_reset=True)
+        Utils.initialize_model_parallel(tensor_model_parallel_size=2)
+        model_parallel_cuda_manual_seed(123)
+
+        # Ensure that this test is capturing to a fresh memory pool.
+        CudaGraphManager.global_mempool = None
+
+        def get_pg_collection():
+            return ProcessGroupCollection.use_mpu_process_groups(required_pgs=['tp', 'pp', 'cp'])
+
+        def get_mamba_block(hybrid_override_pattern):
+            transformer_config = TransformerConfig(
+                hidden_size=256,  # The Mamba layer places several constraints on this
+                # Need to specify num_attention_heads and num_layers or TransformerConfig
+                # will generate errors.
+                num_layers=len(hybrid_override_pattern),
+                num_attention_heads=4,
+                use_cpu_initialization=True,
+                cuda_graph_impl="local",
+            )
+            modules = mamba_stack_spec.submodules
+            return MambaStack(
+                transformer_config,
+                modules,
+                hybrid_override_pattern=hybrid_override_pattern,
+                pg_collection=get_pg_collection(),
+            )
+
+        self.mamba_block = get_mamba_block(hybrid_override_pattern="M-M*-")
+        self.transformer_config = self.mamba_block.config
+
+    def teardown_method(self, method):
+        Utils.destroy_model_parallel()
+        _CudagraphGlobalRecord.cudagraph_created = False
+        _CudagraphGlobalRecord.cudagraph_record = []
+
+    @pytest.mark.skipif(
+        not (HAVE_TE and is_te_min_version("1.5.0")),
+        reason="use_te_rng_tracker requires TransformerEngine version >= 1.5",
+    )
+    def test_gpu_cudagraph(self):
+        parallel_mamba_block = self.mamba_block
+        parallel_mamba_block.cuda()
+
+        # [sequence length, batch size, hidden size]
+        sequence_length = 32
+        micro_batch_size = 2
+        transformer_config: TransformerConfig = parallel_mamba_block.config
+        num_layers = transformer_config.num_layers
+        hidden_size = transformer_config.hidden_size
+        hidden_states = torch.ones((sequence_length, micro_batch_size, hidden_size))
+        hidden_states = hidden_states.cuda()
+        attention_mask = torch.ones((1, 1, sequence_length, sequence_length), dtype=bool).cuda()
+
+        hidden_states = parallel_mamba_block(
+            hidden_states=hidden_states, attention_mask=attention_mask
+        )
+
+        for _ in range(num_layers):
+            assert hasattr(parallel_mamba_block.layers[0], "cudagraph_manager")
+            assert len(parallel_mamba_block.layers[0].cudagraph_manager.cudagraph_runners) == 1
+
+            del parallel_mamba_block.layers[_].cudagraph_manager.cudagraph_runners[0].fwd_graph
+
+
+# Global storage for comparing unique buffer counts across different num_microbatches,
+# keyed by (pp_size, vpp_size)
+_unique_buffer_counts = {}
+
+
+class TestTECudaGraphHelper:
+    def setup_method(self, method):
+        # Initialize parallel state
+        initialize_rng_tracker(use_te_rng_tracker=True, force_reset=True)
+
+    def teardown_method(self, method):
+        Utils.destroy_model_parallel()
+        destroy_global_vars()
+        destroy_num_microbatches_calculator()
+        # Note: _unique_buffer_counts is intentionally NOT cleared here so we can
+        # compare values across parametrized test runs
+
+    @pytest.mark.parametrize("num_microbatches", [16, 64, 256])
+    @pytest.mark.parametrize("pp_size", [1, 2, 4])
+    @pytest.mark.parametrize("vpp_size", [None, 2])
+    def test_get_cuda_graph_input_data(self, num_microbatches, pp_size, vpp_size):
+        """Test _get_cuda_graph_input_data function in TECudaGraphHelper."""
+
+        if vpp_size and pp_size == 1:
+            pytest.skip("vpp_size must be None when pp_size is 1")
+
+        Utils.initialize_model_parallel(
+            tensor_model_parallel_size=1,
+            pipeline_model_parallel_size=pp_size,
+            virtual_pipeline_model_parallel_size=vpp_size,
+        )
+
+        # Set up test configuration
+        seq_length = 128
+        micro_batch_size = 2
+        num_layers = 8
+        vocab_size = 1024
+        hidden_size = 64
+        num_attention_heads = 4
+
+        # Initialize num_microbatches calculator
+        init_num_microbatches_calculator(
+            rank=0,
+            rampup_batch_size=None,
+            global_batch_size=micro_batch_size * num_microbatches,
+            micro_batch_size=micro_batch_size,
+            data_parallel_size=1,
+            decrease_batch_size_if_needed=False,
+        )
+
+        # Create transformer config directly
+        transformer_config = TransformerConfig(
+            num_layers=num_layers,
+            hidden_size=hidden_size,
+            num_attention_heads=num_attention_heads,
+            use_cpu_initialization=True,
+            cuda_graph_impl="transformer_engine",
+            use_te_rng_tracker=True,
+            bf16=True,
+            tensor_model_parallel_size=1,
+            pipeline_model_parallel_size=pp_size,
+            virtual_pipeline_model_parallel_size=vpp_size,
+            pipeline_dtype=torch.bfloat16,
+            context_parallel_size=1,
+        )
+
+        # Create model
+        torch.manual_seed(123)
+        model_parallel_cuda_manual_seed(123)
+
+        model = []
+        for i in range(vpp_size or 1):
+            this_model = GPTModel(
+                config=transformer_config,
+                transformer_layer_spec=get_gpt_layer_with_transformer_engine_spec(),
+                vocab_size=vocab_size,
+                max_sequence_length=seq_length,
+                parallel_output=True,
+                position_embedding_type="rope",
+                vp_stage=i if vpp_size else None,
+            ).cuda()
+            model.append(this_model)
+
+        # Initialize TECudaGraphHelper
+        cuda_graph_helper = TECudaGraphHelper(
+            model=model,
+            config=transformer_config,
+            seq_length=seq_length,
+            micro_batch_size=micro_batch_size,
+            optimizers=[],
+        )
+
+        # Call _get_cuda_graph_input_data (which internally calls _get_sample_arguments)
+        sample_args, make_graphed_callables_kwargs = cuda_graph_helper._get_cuda_graph_input_data()
+
+        # Extract sample_kwargs from the kwargs dict
+        # For TE >= 1.10.0, sample_kwargs should always be present
+        assert (
+            'sample_kwargs' in make_graphed_callables_kwargs
+        ), "sample_kwargs should be present in make_graphed_callables_kwargs for TE >= 1.10.0"
+        sample_kwargs = make_graphed_callables_kwargs['sample_kwargs']
+
+        # Basic checks
+        num_graphable_layers = len(cuda_graph_helper.flattened_callables)
+        if pp_size > 1:
+            expected_length = num_graphable_layers * num_microbatches
+        else:
+            expected_length = num_graphable_layers
+        assert len(sample_args) == expected_length, (
+            f"sample_args length mismatch: expected {expected_length}, " f"got {len(sample_args)}"
+        )
+        assert len(sample_kwargs) == expected_length, (
+            f"sample_kwargs length mismatch: expected {expected_length}, "
+            f"got {len(sample_kwargs)}"
+        )
+
+        # Check that all elements are not None
+        for i, (args_item, kwargs_item) in enumerate(zip(sample_args, sample_kwargs)):
+            assert args_item is not None, f"sample_args[{i}] is None"
+            assert kwargs_item is not None, f"sample_kwargs[{i}] is None"
+            assert isinstance(args_item, tuple), f"sample_args[{i}] should be a tuple"
+            assert isinstance(kwargs_item, dict), f"sample_kwargs[{i}] should be a dict"
+            assert len(args_item) > 0, f"sample_args[{i}] should not be empty"
+            # Check that hidden_states is present
+            assert "hidden_states" in kwargs_item or (
+                len(args_item) > 0 and torch.is_tensor(args_item[0])
+            ), f"sample_args[{i}] or sample_kwargs[{i}] should contain hidden_states"
+
+        # Check tensor properties
+        for i, (args_item, kwargs_item) in enumerate(zip(sample_args, sample_kwargs)):
+            # Get hidden_states from args or kwargs
+            if len(args_item) > 0 and torch.is_tensor(args_item[0]):
+                hidden_states = args_item[0]
+            elif "hidden_states" in kwargs_item:
+                hidden_states = kwargs_item["hidden_states"]
+            else:
+                continue
+
+            assert torch.is_tensor(hidden_states), f"hidden_states at index {i} should be a tensor"
+            # Check shape matches expected (accounting for TP/CP)
+            expected_seq_len = seq_length // transformer_config.context_parallel_size
+            if transformer_config.sequence_parallel:
+                expected_seq_len = expected_seq_len // transformer_config.tensor_model_parallel_size
+            assert hidden_states.shape[0] == expected_seq_len, (
+                f"hidden_states seq_len mismatch at index {i}: "
+                f"expected {expected_seq_len}, got {hidden_states.shape[0]}"
+            )
+            assert hidden_states.shape[1] == micro_batch_size, (
+                f"hidden_states batch_size mismatch at index {i}: "
+                f"expected {micro_batch_size}, got {hidden_states.shape[1]}"
+            )
+            assert hidden_states.shape[2] == transformer_config.hidden_size, (
+                f"hidden_states hidden_size mismatch at index {i}: "
+                f"expected {transformer_config.hidden_size}, got {hidden_states.shape[2]}"
+            )
+
+        # Memory optimization check: verify that buffers with same signature are reused
+        # Create a mapping of sample_keys to indices
+        sample_keys_to_indices = {}
+        for idx, (args_item, kwargs_item) in enumerate(zip(sample_args, sample_kwargs)):
+            # Create sample_keys similar to the function
+            args_keys = tuple((t.shape, t.dtype, t.layout) for t in args_item if torch.is_tensor(t))
+            kwargs_keys = tuple(
+                (k, v.shape, v.dtype, v.layout)
+                for k, v in sorted(kwargs_item.items())
+                if torch.is_tensor(v)
+            )
+            sample_keys = args_keys + kwargs_keys
+
+            if sample_keys not in sample_keys_to_indices:
+                sample_keys_to_indices[sample_keys] = []
+            sample_keys_to_indices[sample_keys].append(idx)
+
+        # Check that buffers with same signature share references (memory optimization)
+        # The optimization reuses buffers when:
+        # 1. They have the same signature (shape, dtype, layout)
+        # 2. The backward pass of the original buffer has completed
+        # 3. A new forward pass with matching signature needs a buffer
+        # Count how many times each tensor is reused
+        unique_tensors = set()
+        tensor_reuse_count = {}
+        for idx, (args_item, kwargs_item) in enumerate(zip(sample_args, sample_kwargs)):
+            # Get the first tensor from args (hidden_states)
+            if len(args_item) > 0 and torch.is_tensor(args_item[0]):
+                tensor_ptr = args_item[0].data_ptr()
+                unique_tensors.add(tensor_ptr)
+                tensor_reuse_count[tensor_ptr] = tensor_reuse_count.get(tensor_ptr, 0) + 1
+
+        # With memory optimization, we should see some buffers reused
+        # (i.e., some tensors should appear multiple times)
+        max_reuse = max(tensor_reuse_count.values()) if tensor_reuse_count else 0
+        total_entries = len(sample_args)
+        unique_buffer_count = len(unique_tensors)
+
+        # Verify that memory optimization is working:
+        # - The number of unique buffers should be <= total entries
+        # - With the 1F1B schedule and multiple microbatches, we should see some buffer reuse
+        # - The number of unique buffers should be bounded as num_microbatches grows.
+        assert unique_buffer_count <= total_entries, (
+            f"Memory optimization check: unique_buffer_count ({unique_buffer_count}) "
+            f"should be <= total_entries ({total_entries})"
+        )
+        global _unique_buffer_counts
+        # Use (pp_size, vpp_size) as key to track unique buffer counts per configuration
+        config_key = (pp_size, vpp_size)
+        if config_key not in _unique_buffer_counts:
+            _unique_buffer_counts[config_key] = unique_buffer_count
+        else:
+            assert unique_buffer_count == _unique_buffer_counts[config_key], (
+                f"Unique buffer count mismatch: expected {_unique_buffer_counts[config_key]}, "
+                f"got {unique_buffer_count}"
+            )
+
+        # Verify that buffers with the same signature can potentially be reused
+        # (the actual reuse depends on the schedule, but the mechanism should work)
+        if expected_length > 1:
+            # Check that we have multiple entries with the same signature
+            has_duplicate_signatures = any(
+                len(indices) > 1 for indices in sample_keys_to_indices.values()
+            )
+            assert has_duplicate_signatures, (
+                "Memory optimization: expected duplicate signatures for buffer reuse, "
+                "but all signatures are unique"
+            )
+
+            # We tested with a large number of microbatches, so we should see some buffer reuse.
+            if pp_size > 1:
+                assert max_reuse > 1, "Expected some buffer reuse"
+
+        # Verify that make_graphed_callables_kwargs contains expected keys
+        assert (
+            '_order' in make_graphed_callables_kwargs
+        ), "make_graphed_callables_kwargs should contain '_order'"
+        assert (
+            'num_warmup_iters' in make_graphed_callables_kwargs
+        ), "make_graphed_callables_kwargs should contain 'num_warmup_iters'"
+        assert (
+            'allow_unused_input' in make_graphed_callables_kwargs
+        ), "make_graphed_callables_kwargs should contain 'allow_unused_input'"
+
+        # Verify the order in kwargs matches expectations
+        order = make_graphed_callables_kwargs['_order']
+        num_model_chunks = cuda_graph_helper.num_model_chunks
+        forward_count = sum(1 for chunk_id in order if chunk_id > 0)
+        if pp_size > 1:
+            # Verify that all forward passes in order have corresponding entries in sample_args
+            assert forward_count == num_microbatches * num_model_chunks, (
+                f"Forward count mismatch: expected {num_microbatches * num_model_chunks}, "
+                f"got {forward_count}"
+            )
+            expected_order_length = num_microbatches * num_model_chunks * 2
+        else:
+            assert num_model_chunks == 1, "Expected only one model chunk for pp_size == 1"
+            assert forward_count == 1, "Expected only one forward pass for pp_size == 1"
+            expected_order_length = 2
+        assert (
+            len(order) == expected_order_length
+        ), f"Order length mismatch: expected {expected_order_length}, got {len(order)}"
+
+
+def is_deep_ep_available():
+    from megatron.core.transformer.moe.fused_a2a import HAVE_DEEP_EP
+
+    return HAVE_DEEP_EP
+
+
+def is_hybrid_ep_available():
+    from megatron.core.transformer.moe.fused_a2a import HAVE_HYBRIDEP
+
+    return HAVE_HYBRIDEP
+
+
+class TestPartialCudaGraph:
+    """Test that CUDA graph outputs match non-CUDA graph outputs for various scopes."""
+
+    def setup_method(self, method):
+        self.seq_length = 512
+        self.micro_batch_size = 2
+        self.tp_size = 2
+        self.cp_size = 2
+        self.cuda_graph_helper = None
+        # Store original environment variable values
+        self.original_env = {
+            'CUDA_DEVICE_MAX_CONNECTIONS': os.environ.get('CUDA_DEVICE_MAX_CONNECTIONS'),
+            'NVTE_ALLOW_NONDETERMINISTIC_ALGO': os.environ.get('NVTE_ALLOW_NONDETERMINISTIC_ALGO'),
+        }
+        os.environ['CUDA_DEVICE_MAX_CONNECTIONS'] = '1'
+        os.environ['NVTE_ALLOW_NONDETERMINISTIC_ALGO'] = '0'
+
+    def teardown_method(self, method):
+        # Restore original environment variable values
+        for key, value in self.original_env.items():
+            if value is None:
+                os.environ.pop(key, None)
+            else:
+                os.environ[key] = value
+        destroy_global_vars()
+        destroy_num_microbatches_calculator()
+        if self.cuda_graph_helper is not None and self.cuda_graph_helper.graphs_created():
+            self.cuda_graph_helper.delete_cuda_graphs()
+            self.cuda_graph_helper = None
+        gc.collect()
+
+    def model_provider(
+        self,
+        pre_process=True,
+        post_process=True,
+        layer_spec_fn=get_gpt_decoder_block_spec,
+        **config_kwargs,
+    ):
+        args = get_args()
+        config = core_transformer_config_from_args(args)
+        transformer_layer_spec = layer_spec_fn(
+            config,
+            use_transformer_engine=True,
+            normalization=args.normalization,
+            qk_l2_norm=args.qk_l2_norm,
+        )
+        if args.mtp_num_layers:
+            mtp_block_spec = get_gpt_mtp_block_spec(
+                config, transformer_layer_spec, use_transformer_engine=True
+            )
+        else:
+            mtp_block_spec = None
+        return GPTModel(
+            config=config,
+            transformer_layer_spec=transformer_layer_spec,
+            vocab_size=args.vocab_size,
+            max_sequence_length=args.max_position_embeddings,
+            pre_process=pre_process,
+            post_process=post_process,
+            fp16_lm_cross_entropy=args.fp16_lm_cross_entropy,
+            parallel_output=True,
+            share_embeddings_and_output_weights=not args.untie_embeddings_and_output_weights,
+            position_embedding_type=args.position_embedding_type,
+            rotary_percent=args.rotary_percent,
+            mtp_block_spec=mtp_block_spec,
+        )
+
+    def create_test_args(
+        self, cuda_graph_impl, cuda_graph_scope, cuda_graph_warmup_steps, ep_size, **kwargs
+    ):
+        destroy_global_vars()
+        destroy_num_microbatches_calculator()
+
+        sys.argv = ['test_cuda_graphs.py']
+        args = parse_args()
+        args.num_layers = 4
+        args.mtp_num_layers = 1
+        args.vocab_size = 1024
+        args.hidden_size = 512
+        args.num_attention_heads = 8
+        args.max_position_embeddings = 512
+        args.global_batch_size = self.micro_batch_size * 8 // self.tp_size // self.cp_size
+        args.micro_batch_size = self.micro_batch_size
+        args.create_attention_mask_in_dataloader = True
+        args.seq_length = self.seq_length
+        args.tensor_model_parallel_size = self.tp_size
+        args.sequence_parallel = True if self.tp_size > 1 else False
+        args.pipeline_model_parallel_size = 1
+        args.context_parallel_size = self.cp_size
+        args.train_iters = 10
+        args.lr = 3e-5
+        args.bf16 = True
+        args.add_bias_linear = False
+        args.swiglu = True
+        args.use_distributed_optimizer = True
+        args.position_embedding_type = "rope"
+        args.rotary_percent = 1.0
+        args.hidden_dropout = 0.0
+        args.attention_dropout = 0.0
+
+        # MoE settings
+        args.num_experts = 4
+        args.expert_model_parallel_size = ep_size
+        args.expert_tensor_parallel_size = 1 if ep_size > 1 else self.tp_size
+        args.moe_shared_expert_intermediate_size = 1024
+        args.moe_layer_freq = [0, 0, 1, 1]
+        args.moe_permute_fusion = True
+        args.moe_router_fusion = True
+        args.moe_router_topk = 2
+        args.moe_router_dtype = "fp32"
+
+        # CUDA graph settings
+        args.cuda_graph_impl = cuda_graph_impl
+        args.cuda_graph_scope = cuda_graph_scope
+        args.cuda_graph_warmup_steps = cuda_graph_warmup_steps
+
+        # fp8 settings
+        if fp8_available:
+            args.fp8 = "e4m3"
+            args.fp8_recipe = "tensorwise"
+            args.first_last_layers_bf16 = True
+            args.num_layers_at_start_in_bf16 = 1
+            args.num_layers_at_end_in_bf16 = 1
+
+        for key, value in kwargs.items():
+            assert hasattr(args, key)
+            setattr(args, key, value)
+
+        validate_args(args)
+        set_global_variables(args, False)
+        return args
+
+    def get_batch(self, seq_length, micro_batch_size, cp_size):
+        data = list(range(seq_length // cp_size))
+        input_ids = torch.tensor(data, dtype=torch.int64).repeat((micro_batch_size, 1)).cuda()
+        labels = 1 + torch.tensor(data, dtype=torch.int64).repeat((micro_batch_size, 1)).cuda()
+        position_ids = torch.tensor(data, dtype=torch.int64).repeat((micro_batch_size, 1)).cuda()
+        attention_mask = torch.ones(
+            (micro_batch_size, 1, seq_length // cp_size, seq_length), dtype=bool
+        ).cuda()
+        loss_mask = torch.ones(seq_length // cp_size).repeat((micro_batch_size, 1)).cuda()
+        return input_ids, labels, position_ids, attention_mask, loss_mask
+
+    def _run_test_helper(
+        self, ep_size, cuda_graph_impl, cuda_graph_scope, cuda_graph_warmup_steps, **kwargs
+    ):
+        """Test fp8_param with gpt_model."""
+        args = self.create_test_args(
+            cuda_graph_impl, cuda_graph_scope, cuda_graph_warmup_steps, ep_size, **kwargs
+        )
+
+        set_args(args)
+        torch.manual_seed(123)
+        model_parallel_cuda_manual_seed(123)
+
+        input_ids, labels, position_ids, attention_mask, loss_mask = self.get_batch(
+            self.seq_length, self.micro_batch_size, self.cp_size
+        )
+
+        gpt_model, optimizer, _ = setup_model_and_optimizer(
+            self.model_provider, ModelType.encoder_or_decoder
+        )
+        assert len(gpt_model) == 1  # Assume only one model in the model provider.
+
+        if cuda_graph_impl == "transformer_engine":
+            self.cuda_graph_helper = TECudaGraphHelper(
+                model=gpt_model,
+                config=gpt_model[0].config,
+                seq_length=self.seq_length,
+                micro_batch_size=self.micro_batch_size,
+                optimizers=[optimizer],
+            )
+
+        loss_list = []
+
+        for i in range(100):
+            gpt_model[0].zero_grad_buffer()
+            optimizer.zero_grad()
+
+            # Capture CUDA graphs after warmup if helper is provided
+            if self.cuda_graph_helper is not None and i == cuda_graph_warmup_steps:
+                self.cuda_graph_helper.create_cudagraphs()
+
+            gpt_model[0].set_is_first_microbatch()
+            output = gpt_model[0].forward(
+                input_ids=input_ids,
+                position_ids=position_ids,
+                attention_mask=attention_mask,
+                labels=labels,
+                loss_mask=loss_mask,
+            )
+
+            # Check output shapes
+            assert output.shape[0] == self.micro_batch_size
+            assert output.shape[1] == self.seq_length // self.cp_size
+
+            # Verify gradients
+            loss = output.mean()
+            loss.backward()
+
+            for param in gpt_model[0].parameters():
+                assert param.main_grad is not None
+
+            update_successful, _, _ = optimizer.step()
+            assert update_successful
+
+            loss_list.append(loss.item())
+
+        if self.cuda_graph_helper is not None and self.cuda_graph_helper.graphs_created():
+            self.cuda_graph_helper.delete_cuda_graphs()
+            self.cuda_graph_helper = None
+
+        return torch.tensor(loss_list)
+
+    @pytest.mark.flaky
+    @pytest.mark.flaky_in_dev
+    @pytest.mark.skipif(
+        not (HAVE_TE and is_te_min_version("2.10.0")),
+        reason="Partial CUDA graph UT support requires TransformerEngine version >= 2.10.0",
+    )
+    @pytest.mark.parametrize("ep_size", [1, 4])
+    @pytest.mark.parametrize("moe_dropless_dispatcher", [False, True])
+    @pytest.mark.parametrize("moe_dispatcher_type", ["alltoall", "deepep", "hybridep"])
+    def test_moe_partial_cudagraph(self, ep_size, moe_dropless_dispatcher, moe_dispatcher_type):
+        initialize_rng_tracker(use_te_rng_tracker=True, force_reset=True)
+        Utils.initialize_model_parallel(
+            tensor_model_parallel_size=self.tp_size,
+            context_parallel_size=self.cp_size,
+            pipeline_model_parallel_size=1,
+            expert_tensor_parallel_size=1 if ep_size > 1 else self.tp_size,
+            expert_model_parallel_size=ep_size,
+        )
+
+        extra_kwargs = {}
+        if moe_dispatcher_type == "deepep":
+            if not is_deep_ep_available():
+                pytest.skip("Deep EP is not available")
+            extra_kwargs["moe_token_dispatcher_type"] = "flex"
+            extra_kwargs["moe_flex_dispatcher_backend"] = "deepep"
+        elif moe_dispatcher_type == "hybridep":
+            if not is_hybrid_ep_available():
+                pytest.skip("Hybrid EP is not available")
+            extra_kwargs["moe_token_dispatcher_type"] = "flex"
+            extra_kwargs["moe_flex_dispatcher_backend"] = "hybridep"
+        else:
+            extra_kwargs["moe_token_dispatcher_type"] = moe_dispatcher_type
+        if not moe_dropless_dispatcher:
+            if moe_dispatcher_type == "deepep":
+                pytest.skip("Deep EP doesn't support drop&pad MoE")
+            extra_kwargs["moe_expert_capacity_factor"] = 1.0
+            extra_kwargs["moe_pad_expert_input_to_capacity"] = True
+
+        loss_list_ref = self._run_test_helper(ep_size, "none", None, 0, **extra_kwargs)
+        for cuda_graph_scope in [
+            None,
+            [CudaGraphScope.attn],
+            [CudaGraphScope.moe],
+            [CudaGraphScope.mlp, CudaGraphScope.moe_router],
+            [
+                CudaGraphScope.attn,
+                CudaGraphScope.mlp,
+                CudaGraphScope.moe_router,
+                CudaGraphScope.moe_preprocess,
+            ],
+        ]:
+            if (moe_dropless_dispatcher or moe_dispatcher_type == "hybridep") and (
+                cuda_graph_scope is None or CudaGraphScope.moe in cuda_graph_scope
+            ):
+                # Dropless MoE or Hybrid EP doesn't work with "moe" scope cudagraph. Skip.
+                continue
+            cuda_graph_warmup_steps = 3
+            loss_list = self._run_test_helper(
+                ep_size,
+                "transformer_engine",
+                cuda_graph_scope,
+                cuda_graph_warmup_steps,
+                **extra_kwargs,
+            )
+            assert torch.equal(loss_list, loss_list_ref)
+
+        if moe_dispatcher_type == "hybridep":
+            reset_hybrid_ep_buffer()
+        Utils.destroy_model_parallel()
+
+
+if __name__ == "__main__":
+
+    test = TestParallelTransformerBlockCudagraphs()
+    test.setup_method(method=None)
+    test.test_gpu_cudagraph()
+    test.teardown_method(method=None)
+
+    llava_test = TestLLaVACudaGraph()
+    llava_test.setup_method(method=None)
+    llava_test.test_llava_cudagraph_is_last_layer_logic()
+    llava_test.teardown_method(method=None)
+
+    test = TestPartialCudaGraph()
+    test.setup_method(method=None)
+    test.test_moe_partial_cudagraph(4, True, "alltoall")
+    test.teardown_method(method=None)

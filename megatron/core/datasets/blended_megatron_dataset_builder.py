@@ -1,4 +1,4 @@
-# Copyright (c) 2022, NVIDIA CORPORATION. All rights reserved.
+# Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
 import logging
 import math
@@ -10,9 +10,9 @@ import torch
 
 from megatron.core.datasets.blended_dataset import BlendedDataset
 from megatron.core.datasets.blended_megatron_dataset_config import BlendedMegatronDatasetConfig
+from megatron.core.datasets.gpt_dataset import GPTDatasetConfig
 from megatron.core.datasets.megatron_dataset import LowLevelDataset, MegatronDataset
 from megatron.core.datasets.utils import Split, normalize
-from megatron.core.parallel_state import get_virtual_pipeline_model_parallel_rank
 from megatron.core.utils import log_single_rank
 
 logger = logging.getLogger(__name__)
@@ -36,7 +36,8 @@ class BlendedMegatronDatasetBuilder(object):
 
         is_built_on_rank (Callable): A callable which returns True if the dataset should be built on
             the current rank and False otherwise. It should be Megatron Core parallelism aware i.e.
-            global rank, local group rank, and virtual rank may inform its return value.
+            global rank, local group rank, and virtual rank may inform its return value. Should
+            return true for exactly one process on global rank 0.
 
         config (BlendedMegatronDatasetConfig): The config object which informs dataset creation
     """
@@ -69,17 +70,9 @@ class BlendedMegatronDatasetBuilder(object):
                         continue
                     weights_are_none = self.config.blend_per_split[split.value][1] is None
                 if size_is_none:
-                    assert (
-                        weights_are_none
-                    ), f"size_is_none => weights_are_none fails for {split.name} split"
-
-        if torch.distributed.is_initialized():
-            gb_rank = torch.distributed.get_rank()
-            vp_rank = get_virtual_pipeline_model_parallel_rank()
-            if gb_rank == 0 and (vp_rank == 0 or vp_rank is None):
-                assert (
-                    self.is_built_on_rank()
-                ), "is_built_on_rank must return True when global rank = 0 and vp rank = 0"
+                    assert weights_are_none, f"""size_is_none => weights_are_none fails 
+                    for {split.name} split
+                    This can occur with multiple validation sets if datasets have weights"""
 
     def build(self) -> List[Optional[TopLevelDataset]]:
         """Build all dataset splits according to the provided blend(s)
@@ -134,42 +127,9 @@ class BlendedMegatronDatasetBuilder(object):
         for dataset in datasets:
             if dataset is not None and len(dataset) > 0:
                 if isinstance(dataset, BlendedDataset):
-                    if dataset.built_anew_on_cache_miss or any(
-                        x.built_anew_on_cache_miss for x in dataset.datasets
-                    ):
-                        log_single_rank(
-                            logger,
-                            logging.INFO,
-                            (
-                                f"Verifying NumPy indices for {type(dataset).__name__} "
-                                f"{dataset.split.name} split"
-                            ),
-                        )
-                    else:
-                        log_single_rank(
-                            logger,
-                            logging.INFO,
-                            (
-                                f"NumPy indices for {type(dataset).__name__} {dataset.split.name} "
-                                f"split are fully cached, skipping verification"
-                            ),
-                        )
-                        continue
-                    # Check blend size
-                    assert dataset.size is None or dataset.size == dataset.dataset_index.shape[0]
-                    # Check blend access of mid-level datasets
-                    dataset_indices, dataset_sizes = numpy.unique(
-                        dataset.dataset_index, return_counts=True
-                    )
-                    for i, (index, size) in enumerate(zip(dataset_indices, dataset_sizes)):
-                        if len(dataset.datasets[index]) < size:
-                            raise IndexError(
-                                f"The {dataset.split.name} blend oversamples the contributing "
-                                f"datasets  and, e.g., requests {size} samples from "
-                                f"{type(dataset.datasets[index]).__name__} {i} with size "
-                                f"{len(dataset.datasets[index])}. This is unexpected. "
-                                f"Please file an issue."
-                            )
+                    assert dataset.size is None or dataset.size == len(dataset)
+                elif isinstance(dataset, MegatronDataset):
+                    assert dataset.num_samples is None or dataset.num_samples <= len(dataset)
 
         return datasets
 
@@ -217,7 +177,7 @@ class BlendedMegatronDatasetBuilder(object):
                 sizes_per_dataset_target = _get_size_per_split_per_dataset(weights, self.sizes)
                 # The number of samples we plan to build per dataset
                 sizes_per_dataset_buffer = _get_size_per_split_per_dataset(
-                    weights, self.sizes, margin=0.5
+                    weights, self.sizes, surplus=self.config.mid_level_dataset_surplus
                 )
 
             # Build each dataset in parallel
@@ -254,7 +214,14 @@ class BlendedMegatronDatasetBuilder(object):
                     blended_datasets[i] = self.build_generic_dataset(
                         BlendedDataset,
                         self.is_built_on_rank,
-                        True,  # synchronize_ranks, default behavior to build on rank-0 first
+                        (
+                            False
+                            if (
+                                isinstance(self.config, GPTDatasetConfig)
+                                and self.config.fast_cache_load
+                            )
+                            else True
+                        ),  # synchronize_ranks, default behavior to build on rank-0 first. Set to False if we are using --dataloader-fast-cache-load # pylint: disable=C0301
                         megatron_datasets[i],
                         weights_i,
                         size_i,
@@ -287,6 +254,20 @@ class BlendedMegatronDatasetBuilder(object):
                             prefixes[0], split_spoof, sizes_spoof
                         )[i]
                         continue
+                    elif self.config.multiple_validation_sets and i == Split.valid.value:
+                        # handle multiple validation sets
+                        validation_datasets = []
+                        if self.config.full_validation:
+                            # verify that size is None, which causes a single epoch dataset
+                            # to be built
+                            assert sizes_spoof[i] is None
+                        for prefix in prefixes:
+                            ds = self._build_megatron_dataset_splits(
+                                prefix, split_spoof, sizes_spoof
+                            )[i]
+                            validation_datasets.append(ds)
+                        blended_datasets[i] = validation_datasets
+                        continue
 
                     # Build mid-level datasets
                     if weights is None:
@@ -300,7 +281,7 @@ class BlendedMegatronDatasetBuilder(object):
                         )
                         # The number of samples we plan to build per dataset
                         sizes_per_dataset_buffer = _get_size_per_split_per_dataset(
-                            weights, sizes_spoof, margin=0.5
+                            weights, sizes_spoof, surplus=self.config.mid_level_dataset_surplus
                         )
 
                     # Build each dataset in parallel
@@ -331,7 +312,14 @@ class BlendedMegatronDatasetBuilder(object):
                     blended_datasets[i] = self.build_generic_dataset(
                         BlendedDataset,
                         self.is_built_on_rank,
-                        True,  # synchronize_ranks, default behavior to build on rank-0 first
+                        (
+                            False
+                            if (
+                                isinstance(self.config, GPTDatasetConfig)
+                                and self.config.fast_cache_load
+                            )
+                            else True
+                        ),  # synchronize_ranks, default behavior to build on rank-0 first. Set to False if we are using --dataloader-fast-cache-load # pylint: disable=C0301
                         megatron_datasets,
                         weights,
                         size,
@@ -389,7 +377,10 @@ class BlendedMegatronDatasetBuilder(object):
         megatron_datasets = [[] for _ in range(len(Split))]
         num_dataset_builder_threads = self.config.num_dataset_builder_threads
 
-        if torch.distributed.is_initialized():
+        # NOTE(asolergi-nv): Skip rank-0 first dataset building if we are using --dataloader-fast-cache-load # pylint: disable=C0301
+        if torch.distributed.is_initialized() and not (
+            isinstance(self.config, GPTDatasetConfig) and self.config.fast_cache_load
+        ):
             rank = torch.distributed.get_rank()
             # First, build on rank 0
             if rank == 0:
@@ -445,6 +436,14 @@ class BlendedMegatronDatasetBuilder(object):
         Returns:
             List[Optional[MidLevelDataset]]: The MidLevelDataset (or None) per split
         """
+        synchronize_ranks = (
+            False
+            if (
+                synchronize_ranks
+                and (isinstance(self.cls, GPTDatasetConfig) and self.config.fast_cache_load)
+            )
+            else synchronize_ranks
+        )  # NOTE(asolergi-nv): Set synchronize_ranks to False if we are using --dataloader-fast-cache-load # pylint: disable=C0301
         # short-cut if we are not building on this rank
         if torch.distributed.is_initialized() and not self.is_built_on_rank():
             for i in range(len(Split)):
@@ -457,14 +456,6 @@ class BlendedMegatronDatasetBuilder(object):
 
         # Build the split indices for the low level dataset
         num_elements = self.cls.numel_low_level_dataset(low_level_dataset)
-        split_indices = []
-        for i, _ in enumerate(Split):
-            if split[i] is not None:
-                beg = int(round(split[i][0] * float(num_elements)))
-                end = int(round(split[i][1] * float(num_elements)))
-                split_indices.append(numpy.arange(start=beg, stop=end, step=1, dtype=numpy.int32))
-            else:
-                split_indices.append(None)
 
         # Build the mid level dataset
         mid_level_datasets = []
@@ -472,6 +463,14 @@ class BlendedMegatronDatasetBuilder(object):
             if split[i] is None:
                 mid_level_datasets.append(None)
             else:
+                indexed_indices = None
+                if not (
+                    isinstance(self.config, GPTDatasetConfig) and self.config.fast_cache_load
+                ):  # NOTE(asolergi-nv): Skip indexed_indices building if we are using --dataloader-fast-cache-load # pylint: disable=C0301
+                    beg = int(round(split[i][0] * float(num_elements)))
+                    end = int(round(split[i][1] * float(num_elements)))
+                    indexed_indices = numpy.arange(start=beg, stop=end, step=1, dtype=numpy.int32)
+
                 mid_level_datasets.append(
                     self.build_generic_dataset(
                         self.cls,
@@ -479,7 +478,7 @@ class BlendedMegatronDatasetBuilder(object):
                         synchronize_ranks,
                         low_level_dataset,
                         dataset_path,
-                        split_indices[i],
+                        indexed_indices,
                         sizes[i],
                         _split,
                         self.config,
@@ -504,6 +503,9 @@ class BlendedMegatronDatasetBuilder(object):
             cls (Union[Type[DistributedDataset], Callable]): The DistributedDataset class to be
                 built. In special cases, e.g. when we are building the low level dataset for a
                 RawMegatronDataset instance, we can accept a Callable which returns an Iterable.
+
+            is_built_on_rank (Callable): A callable which returns True if the dataset should be
+                built on the current rank and False otherwise.
 
             synchronize_ranks (bool): Whether to call barrier for rank-0 / barrier / other-ranks
                 behavior. Set to False when we enforce this behavior at higher level.
@@ -549,7 +551,7 @@ class BlendedMegatronDatasetBuilder(object):
 
 
 def _get_size_per_split_per_dataset(
-    normalized_weights: List[float], target_size_per_split: List[int], margin: float = 0.0
+    normalized_weights: List[float], target_size_per_split: List[int], surplus: float = 0.0
 ) -> List[List[int]]:
     """Determine the contribution of the MegatronDataset splits to the BlendedDataset splits
 
@@ -559,18 +561,18 @@ def _get_size_per_split_per_dataset(
         target_size_per_split (List[int]): The number of samples to target for each BlendedDataset
             split
 
-        margin (float): The relative quantity of extra samples to build per per split per dataset,
-            as a percentage
+        surplus (float): The sample surplus to build per split per dataset
 
     Returns:
         List[List[int]]: The number of samples to request per MegatronDataset per split
     """
+
     assert numpy.isclose(sum(normalized_weights), 1.0)
 
     # Use margin as buffer to ensure we satiate the request
     sizes_per_dataset = [
         [
-            int(math.ceil(math.ceil(target_size * weight) * (1 + margin / 100)))
+            int(math.ceil(math.ceil(target_size * weight) * (1 + surplus)))
             for target_size in target_size_per_split
         ]
         for weight in normalized_weights

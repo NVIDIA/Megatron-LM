@@ -30,6 +30,9 @@ class TRTLLMLayers(Enum):
     attention_dense_weight = 'transformer.layers.attention.dense.weight'
     attention_dense_bias = 'transformer.layers.attention.dense.bias'
 
+    # Deci's replace_with_linear Attention
+    attention_linear_weight = 'transformer.layers.attention.weight'
+
     # mlp layers
     mlp_fc_weight = 'transformer.layers.mlp.fc.weight'
     mlp_fc_bias = 'transformer.layers.mlp.fc.bias'
@@ -37,6 +40,12 @@ class TRTLLMLayers(Enum):
     post_layernorm_bias = 'transformer.layers.post_layernorm.bias'
     mlp_projection_weight = 'transformer.layers.mlp.proj.weight'
     mlp_projection_bias = 'transformer.layers.mlp.proj.bias'
+
+    # Deci's (nemotron-nas) FFN
+    ffn_fc_weight = 'transformer.layers.ffn.fc.weight'
+    ffn_projection_weight = 'transformer.layers.ffn.proj.weight'
+    # Deci's replace_with_linear FFN
+    ffn_linear_weight = 'transformer.layers.ffn.weight'
 
     # mixture of expert layers
     mlp_router_weight = 'transformer.layers.mlp.router.weight'
@@ -81,7 +90,7 @@ class TRTLLMLayers(Enum):
         map the original layer name to equivalent trtllm layer name and add layer number back.
         CPU Conversion will pass in model state dict without layer numbers
         (i.e decoder.layers.mlp.linear_fc1.weight of shape [num_layers, hidden_dim, 4 * hidden_dim]) .
-        GPU conversion will pass model state dict with each layer seperated
+        GPU conversion will pass model state dict with each layer separated
         (i.e decoder.layers.2.mlp.linear_fc1.weight of shape [hidden_dim, 4 * hidden_dim]).
 
         Args:
@@ -96,7 +105,10 @@ class TRTLLMLayers(Enum):
             dict: The model state dict with the key (i.e original model layer name) replaced by trtllm layer names
         """
         for original_model_layer_name in list(model_state_dict.keys()):
-            if "_extra_state" in original_model_layer_name:
+            if (
+                "_extra_state" in original_model_layer_name
+                or "adapter_layer" in original_model_layer_name
+            ):
                 del model_state_dict[original_model_layer_name]
                 continue
 

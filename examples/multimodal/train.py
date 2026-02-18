@@ -48,7 +48,7 @@ def get_batch(data_iterator, image_token_index, img_seq_len):
 
     # Dataloader doesn't run on the middle stages in a pipeline parallel model.
     pp_size = get_pipeline_model_parallel_world_size()
-    if not is_first_or_last_stage(pp_size, args.encoder_pipeline_model_parallel_size):
+    if not is_first_or_last_stage(pp_size):
         # Note these are all set to None above.
         return tokens, labels, loss_mask, attention_mask, position_ids, imgs, num_tiles, packed_seq_params
 
@@ -124,7 +124,7 @@ def get_batch(data_iterator, image_token_index, img_seq_len):
         assert tokens.shape[0], "micro-batch-size > 1 not supported yet with CP"
 
         num_image_tokens = torch.sum(tokens == image_token_index).item()
-        num_image_embeddings = num_image_tokens * img_seq_len - num_image_tokens
+        num_image_embeddings = img_seq_len * imgs.shape[0] - num_image_tokens
         seq_len = text_length + num_image_embeddings
 
         # CP expects sequence length is divisible by CP size so apply padding.
@@ -200,6 +200,7 @@ def scaled_loss_func(loss_mask, output_tensor):
 
     Where we use the loss mask to infer the start / end of the conversation turns.
     """
+    args = get_args()
     losses = output_tensor.float()
 
     loss_list = []
@@ -221,48 +222,33 @@ def scaled_loss_func(loss_mask, output_tensor):
         # normalize loss for each turn
         loss_list[idx] = loss_list[idx] * math.sqrt(num_valid_labels_list[idx]) / base_num
 
-    total_loss = torch.stack(loss_list).sum()
-    total_tokens = torch.ones_like(total_loss)
+    # Some ranks may not get loss tokens due to Context Parallel Sharding
+    if len(loss_list) > 0:
+        total_loss = torch.stack(loss_list).sum()
+        total_tokens = torch.ones_like(total_loss)
+    elif len(loss_list) == 0 and args.context_parallel_size > 1:
+        total_tokens = loss_mask.sum()
+        total_loss = torch.sum(losses.view(-1) * loss_mask)
+    else:
+        raise RuntimeError("loss_list for loss scaling per conversation unexpectedly got empty list")
 
-    loss = torch.cat([total_loss.view(1), total_tokens.view(1)])
+    num_tokens = total_tokens.clone().detach().to(torch.int)
+    reporting_loss = torch.cat([total_loss.clone().detach().view(1), num_tokens.view(1)])
 
-    reporting_loss = loss.clone().detach()
-    torch.distributed.all_reduce(reporting_loss, group=mpu.get_data_parallel_group())
-
-    local_num_tokens = loss[1].clone().detach().to(torch.int)
-
-    return (
-        total_loss,
-        local_num_tokens,
-        {'lm loss': (reporting_loss[0], reporting_loss[1])},
-    )
+    return (total_loss, num_tokens, {'lm loss': reporting_loss})
 
 
 def loss_func(loss_mask, output_tensor):
     args = get_args()
 
-    losses = output_tensor.float()
-
+    losses = output_tensor.view(-1).float()
     loss_mask = loss_mask.contiguous().view(-1).float()
+    loss = torch.sum(losses * loss_mask)
 
-    total_tokens = loss_mask.sum()
-    total_loss = torch.sum(losses.view(-1) * loss_mask)
-    loss = torch.cat([total_loss.view(1), total_tokens.view(1)])
+    num_tokens = loss_mask.sum().clone().detach().to(torch.int)
+    reporting_loss = torch.cat([loss.clone().detach().view(1), num_tokens.view(1)])
 
-    if args.context_parallel_size > 1:
-        torch.distributed.all_reduce(loss, group=mpu.get_context_parallel_group())
-
-    reporting_loss = loss.clone().detach()
-    torch.distributed.all_reduce(reporting_loss, group=mpu.get_data_parallel_group())
-
-    local_num_tokens = loss[1].clone().detach().to(torch.int)
-
-    # We multiply by context parallel size because later there will be a divide by CP(+DP) size.
-    return (
-        loss[0] * args.context_parallel_size,
-        local_num_tokens,
-        {'lm loss': (reporting_loss[0], reporting_loss[1])}
-    )
+    return (loss, num_tokens, {'lm loss': reporting_loss})
 
 
 def forward_step(data_iterator, model: LLaVAModel):
@@ -316,16 +302,12 @@ def llava_embedding_ranks(pp_ranks):
     Args:
         pp_ranks: A list of global ranks that constitute a pipeline group.
     """
-    args = get_args()
-
-    # encoder size is also the index to the first rank of the decoder.
-    epp = args.encoder_pipeline_model_parallel_size
-
+    # With no separate encoder pipeline stages (epp=0), the decoder starts at rank 0
     last_rank = pp_ranks[-1]
-    if len(pp_ranks) == 1 or pp_ranks[epp] == last_rank:
+    if len(pp_ranks) == 1:
         return [last_rank]
     else:
-        return [pp_ranks[epp], last_rank]
+        return [pp_ranks[0], last_rank]
 
 
 def llava_position_embedding_ranks(pp_ranks):
@@ -333,16 +315,12 @@ def llava_position_embedding_ranks(pp_ranks):
     Args:
         pp_ranks: A list of global ranks that constitute a pipeline group.
     """
-    args = get_args()
-
-    # encoder size is also the index to the first rank of the decoder.
-    epp = args.encoder_pipeline_model_parallel_size
-
+    # With no separate encoder pipeline stages (epp=0), the decoder starts at rank 0
     last_rank = pp_ranks[-1]
     if len(pp_ranks) == 1:
         return [last_rank]
     else:
-        return [pp_ranks[epp]]
+        return [pp_ranks[0]]
 
 
 def run_online_eval(model):
@@ -354,48 +332,49 @@ def run_online_eval(model):
         return []
 
     from config import EvaluationConfig
-    from run_text_generation import generate_and_write_samples
+    # Import the common evaluation functions
+    from run_text_generation import get_evaluation_configs, run_evaluation_loop
 
-    with open(args.online_evaluation_config, "r") as f:
-        config_dict = yaml.safe_load(f)
-
-    config = EvaluationConfig(**config_dict)
+    # Use the common config loading function
+    configs = get_evaluation_configs(config_path=args.online_evaluation_config)
 
     # The inference code assumes the first rank is the leader.
     # Tensorboard writer is on the last rank.
     # We must write to a storage space that all ranks see.
     output_dir = os.path.join(args.save, "online_eval")
     os.makedirs(output_dir, exist_ok=True)
-    config.output_path = os.path.join(output_dir, args.language_model_type)
+    
+    # Use the common evaluation loop
+    scores = run_evaluation_loop(model[0].module, configs, output_dir_override=output_dir, print_output=False)
 
-    # The actual generation.
-    generate_and_write_samples(model[0].module, config, print_output=False)
-
-    # Make sure the first rank is done writing so that the last rank can run eval.
-    torch.distributed.barrier()
-
-    if not is_last_rank():
-        return []
-
-    # Run evaluation.
-    if config.task == "TextVQA":
-        from evaluate_textvqa import textvqa_eval
-
-        avg_acc = textvqa_eval(config.output_path)
-
-        return [{"TextVQA accuracy": avg_acc}]
-    else:
-        raise NotImplementedError(f"online evaluation of {config.task} not implemented yet")
+    return [scores]
 
 
-def write_online_eval_to_tensorboard(data, iteration, writer):
-    """Write online evaluation data to Tensorboard."""
+def write_eval_to_tensorboard(data, iteration, writer, walltime=None):
+    """Write evaluation data to Tensorboard."""
     if not writer:
         return
 
     for item in data:
         for k, v in item.items():
-            writer.add_scalar(k, v, iteration)
+            writer.add_scalar(k, v, iteration, walltime=walltime)
+
+
+def write_online_eval_to_tensorboard(data, iteration, writer, walltime=None):
+    """Write online evaluation data to Tensorboard."""
+    import shutil
+    args = get_args()
+
+    # Define source and destination directories
+    source_dir = os.path.join(args.save, "online_eval")
+    destination_dir = os.path.join(args.save, f"online_eval_{iteration}")
+    if os.path.exists(source_dir):
+        print("Moving online eval data from", source_dir, "to", destination_dir)
+
+        # Move the directory (back up the generation)
+        shutil.move(source_dir, destination_dir)
+
+    write_eval_to_tensorboard(data, iteration, writer, walltime)
 
 
 if __name__ == "__main__":
@@ -405,7 +384,7 @@ if __name__ == "__main__":
     pretrain(
         train_valid_test_dataloaders_provider,
         model_provider,
-        ModelType.encoder_and_decoder,
+        ModelType.encoder_or_decoder,
         forward_step,
         args_defaults={'tokenizer_type': 'GPT2BPETokenizer'},
         extra_args_provider=add_multimodal_extra_args,

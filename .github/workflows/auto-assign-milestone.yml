@@ -1,0 +1,75 @@
+name: Auto-assign Milestone to PR
+
+on:
+  push:
+    branches:
+      - "pull-request/[0-9]+"
+
+permissions:
+  contents: read
+  pull-requests: write
+  issues: write
+
+jobs:
+  assign-milestone:
+    runs-on: ubuntu-latest
+    environment: nemo-ci
+    if: github.repository == 'NVIDIA/Megatron-LM'
+    steps:
+      - name: Get PR info
+        id: get-pr-info
+        if: startsWith(github.ref, 'refs/heads/pull-request/')
+        uses: nv-gha-runners/get-pr-info@main
+
+      - name: Check if PR has milestone
+        id: check_milestone
+        env:
+          GH_TOKEN: ${{ secrets.PAT }}
+        run: |
+          MILESTONE=$(gh pr view ${{ fromJSON(steps.get-pr-info.outputs.pr-info || '{}').number }} \
+            --repo ${{ github.repository }} \
+            --json milestone \
+            --jq '.milestone.title')
+
+          if [ "$MILESTONE" = "null" ] || [ -z "$MILESTONE" ]; then
+            echo "has_milestone=false" >> $GITHUB_OUTPUT
+          else
+            echo "has_milestone=true" >> $GITHUB_OUTPUT
+            echo "PR already has milestone: $MILESTONE"
+          fi
+
+      - name: Get most recent open milestone
+        if: steps.check_milestone.outputs.has_milestone == 'false'
+        id: get_milestone
+        env:
+          GH_TOKEN: ${{ secrets.PAT }}
+        run: |
+          # Get the most recent open milestone (sorted by due date, then by creation date)
+          MILESTONE_NUMBER=$(gh api \
+            "repos/${{ github.repository }}/milestones?state=open&sort=due_on&direction=desc" \
+            --jq '.[0].number')
+
+          MILESTONE_TITLE=$(gh api \
+            "repos/${{ github.repository }}/milestones?state=open&sort=due_on&direction=desc" \
+            --jq '.[0].title')
+
+          if [ -z "$MILESTONE_NUMBER" ] || [ "$MILESTONE_NUMBER" = "null" ]; then
+            echo "No open milestones found"
+            echo "milestone_found=false" >> $GITHUB_OUTPUT
+          else
+            echo "milestone_found=true" >> $GITHUB_OUTPUT
+            echo "milestone_number=$MILESTONE_NUMBER" >> $GITHUB_OUTPUT
+            echo "milestone_title=$MILESTONE_TITLE" >> $GITHUB_OUTPUT
+            echo "Found milestone: $MILESTONE_TITLE (number: $MILESTONE_NUMBER)"
+          fi
+
+      - name: Assign milestone to PR
+        if: steps.check_milestone.outputs.has_milestone == 'false' && steps.get_milestone.outputs.milestone_found == 'true'
+        env:
+          GH_TOKEN: ${{ secrets.PAT }}
+        run: |
+          gh pr edit ${{ fromJSON(steps.get-pr-info.outputs.pr-info || '{}').number }} \
+            --repo ${{ github.repository }} \
+            --milestone "${{ steps.get_milestone.outputs.milestone_title }}"
+
+          echo "✅ Assigned milestone '${{ steps.get_milestone.outputs.milestone_title }}' to PR #${{ fromJSON(steps.get-pr-info.outputs.pr-info || '{}').number }}"

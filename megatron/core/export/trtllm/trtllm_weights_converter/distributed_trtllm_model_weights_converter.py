@@ -3,14 +3,21 @@
 from typing import Optional
 
 import torch
-from tqdm import tqdm
 
 from megatron.core import parallel_state
 from megatron.core.export.data_type import DataType
 from megatron.core.export.trtllm.trtllm_layers import NON_TRANSFORMER_LAYERS_NAMES, TRTLLMLayers
 from megatron.core.export.trtllm.trtllm_layers import get_layer_name_without_prefix as suffix
+from megatron.core.export.trtllm.trtllm_weights_converter.utils import is_gated_activation
 from megatron.core.tensor_parallel.utils import VocabUtility
 from megatron.core.transformer.transformer_config import TransformerConfig
+
+try:
+    from tqdm import tqdm
+
+    HAVE_TQDM = True
+except ImportError:
+    HAVE_TQDM = False
 
 
 def str_dtype_to_torch(dtype: DataType):
@@ -66,7 +73,7 @@ class DistributedTRTLLMModelWeightsConverter:
         self.tp_rank = parallel_state.get_tensor_model_parallel_rank()
         self.pp_rank = parallel_state.get_pipeline_model_parallel_rank()
         self.tp_group = parallel_state.get_tensor_model_parallel_group()
-        vp_size = parallel_state.get_virtual_pipeline_model_parallel_world_size()
+        vp_size = self.transformer_config.virtual_pipeline_model_parallel_size
 
         assert (
             vp_size is None or vp_size == 1
@@ -74,11 +81,11 @@ class DistributedTRTLLMModelWeightsConverter:
 
     def _add_to_trtllm_model_weights(self, val: torch.Tensor, layer_name: str):
         assert torch.is_tensor(val), f"Expected a tensor for {layer_name} but got {type(val)}"
-        scale_key = '.'.join(layer_name.split('.')[:-1]) + '.weights_scaling_factor'
+        scale_key = ".".join(layer_name.split(".")[:-1]) + ".weights_scaling_factor"
         storage = self.storage_type
         if scale_key in self.scales and layer_name.endswith("weight"):
             storage = torch.float8_e4m3fn
-            val = val * self.scales[scale_key]['weight_multiplier'].to(val.device)
+            val = val * self.scales[scale_key]["weight_multiplier"].to(val.device)
 
         val = val.to(storage)
         val = val.detach().contiguous()
@@ -108,9 +115,9 @@ class DistributedTRTLLMModelWeightsConverter:
             or layer_name.endswith(suffix(TRTLLMLayers.post_layernorm_weight))
             or layer_name.endswith(suffix(TRTLLMLayers.post_layernorm_bias))
             or layer_name.endswith(suffix(TRTLLMLayers.attention_dense_bias))
-            or layer_name.endswith(suffix(TRTLLMLayers.attention_dense_bias))
             or layer_name.endswith(suffix(TRTLLMLayers.mlp_projection_bias))
             or layer_name.endswith(suffix(TRTLLMLayers.mlp_router_weight))
+            or layer_name.endswith(suffix(TRTLLMLayers.ffn_projection_weight))
             or layer_name.endswith(suffix(TRTLLMLayers.attention_dense_weight))
             or layer_name.endswith(suffix(TRTLLMLayers.mlp_projection_weight))
         ):
@@ -118,28 +125,29 @@ class DistributedTRTLLMModelWeightsConverter:
             if (
                 self.transformer_config.layernorm_zero_centered_gamma
                 and self.transformer_config.normalization == "LayerNorm"
-                and 'layernorm.weight' in layer_name
+                and "layernorm.weight" in layer_name
             ):
                 val = val + 1.0
 
             self._add_to_trtllm_model_weights(val=val, layer_name=layer_name)
 
-        elif layer_name.endswith(suffix(TRTLLMLayers.mlp_fc_weight)) or layer_name.endswith(
-            suffix(TRTLLMLayers.mlp_fc_bias)
+        elif (
+            layer_name.endswith(suffix(TRTLLMLayers.mlp_fc_weight))
+            or layer_name.endswith(suffix(TRTLLMLayers.mlp_fc_bias))
+            or layer_name.endswith(suffix(TRTLLMLayers.ffn_fc_weight))
         ):
-
-            split_gated_activation = self.activation in [
-                "swiglu",
-                "geglu",
-                "fast-swiglu",
-                "fast-geglu",
-            ]
+            split_gated_activation = is_gated_activation(self)
             if split_gated_activation:
                 vals, gates = [[n] for n in torch.chunk(val, 2, axis=-1)]
                 gate_layer_name = layer_name.replace("fc", "gate")
                 self._add_to_trtllm_model_weights(val=gates[0], layer_name=gate_layer_name)
                 val = vals[0]
 
+            self._add_to_trtllm_model_weights(val=val, layer_name=layer_name)
+
+        elif layer_name.endswith(suffix(TRTLLMLayers.ffn_linear_weight)) or layer_name.endswith(
+            suffix(TRTLLMLayers.attention_linear_weight)
+        ):
             self._add_to_trtllm_model_weights(val=val, layer_name=layer_name)
 
         elif layer_name.endswith(suffix(TRTLLMLayers.attention_qkv_bias)):
@@ -272,6 +280,11 @@ class DistributedTRTLLMModelWeightsConverter:
                     model_state_dict[layer_name] = model_state_dict[layer_name] + 1.0
             self._convert_non_transformer_layer(
                 model_state_dict=model_state_dict, layer_name=layer_name
+            )
+
+        if not HAVE_TQDM:
+            raise ImportError(
+                "tqdm is required for DistributedTRTLLMModelWeightsConverter, please install it with `pip install tqdm`"
             )
 
         for layer_name, value in tqdm(

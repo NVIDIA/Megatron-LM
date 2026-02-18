@@ -1,37 +1,55 @@
 # Copyright (c) 2024, NVIDIA CORPORATION.  All rights reserved.
 """Pretrain vision language model."""
+import warnings
 from copy import deepcopy
 from functools import partial
-import warnings
 
 import torch
 
-from megatron.core import parallel_state, tensor_parallel
-from megatron.core.datasets.blended_megatron_dataset_builder import BlendedMegatronDatasetBuilder
-from megatron.core.datasets.multimodal_dataset import MockMultimodalDataset, MultimodalDatasetConfig
+from megatron.core import mpu, parallel_state, tensor_parallel
+from megatron.core.datasets.blended_megatron_dataset_builder import (
+    BlendedMegatronDatasetBuilder,
+)
+from megatron.core.datasets.multimodal_dataset import (
+    MockMultimodalDataset,
+    MultimodalDatasetConfig,
+)
 from megatron.core.enums import ModelType
-from megatron.core.models.vision.clip_vit_model import get_num_image_embeddings
-from megatron.core.transformer.enums import AttnMaskType
-from megatron.core.models.multimodal.llava_model import LLaVAModel, DEFAULT_IMAGE_TOKEN_INDEX
-from megatron.core.models.multimodal.llava_spec import (
-    decoder_model_with_transformer_engine_default_spec,
-    decoder_model_with_local_default_spec,
-)
-from megatron.core.models.vision.vit_layer_specs import (
-    get_vit_layer_with_transformer_engine_spec,
-    get_vit_layer_with_local_spec,
-)
-from megatron.core.transformer.spec_utils import import_module
-from megatron.training import get_args, get_timers, get_tokenizer, pretrain, print_rank_0
-from megatron.training.arguments import core_transformer_config_from_args
-from megatron.training.utils import get_batch_on_this_cp_rank
-from megatron.core import mpu
 from megatron.core.models.multimodal import context_parallel
+from megatron.core.models.multimodal.llava_model import (
+    DEFAULT_IMAGE_TOKEN_INDEX,
+    LLaVAModel,
+)
+from megatron.core.models.multimodal.llava_spec import (
+    decoder_model_with_local_default_spec,
+    decoder_model_with_transformer_engine_default_spec,
+)
+from megatron.core.models.vision.clip_vit_model import get_num_image_embeddings
+from megatron.core.models.vision.vit_layer_specs import (
+    get_vit_layer_with_local_spec,
+    get_vit_layer_with_transformer_engine_spec,
+)
+from megatron.core.transformer.enums import AttnMaskType
+from megatron.core.transformer.spec_utils import import_module
+from megatron.training import (
+    get_args,
+    get_timers,
+    get_tokenizer,
+    pretrain,
+    print_rank_0,
+)
+from megatron.training.arguments import core_transformer_config_from_args
 from pretrain_gpt import loss_func
 
 
 def model_provider(
-    pre_process=True, post_process=True, add_encoder=True, add_decoder=True, parallel_output=True
+    pre_process=True,
+    post_process=True,
+    add_encoder=True,
+    add_decoder=True,
+    parallel_output=True,
+    config=None,
+    pg_collection=None,
 ) -> LLaVAModel:
     """Builds the model.
 
@@ -88,7 +106,14 @@ def model_provider(
     args.max_position_embeddings = max(args.max_position_embeddings, args.decoder_seq_length)
 
     print_rank_0('building a multimodal model ...')
-    language_transformer_config = core_transformer_config_from_args(get_args())
+    if config is None:
+        language_transformer_config = core_transformer_config_from_args(get_args())
+    else:
+        language_transformer_config = config
+    if args.decoder_num_layers is not None:
+        language_transformer_config.num_layers = args.decoder_num_layers
+    else:
+        language_transformer_config.num_layers = args.num_layers
     if args.decoder_tp_comm_overlap:
         assert args.transformer_impl == "transformer_engine", \
             "TransformerEngine is needed to support Decoder TP Comm overlap"
@@ -141,28 +166,11 @@ def model_provider(
         print_rank_0("> Disabling TP Comm overlap in Vision Projection. Not yet supported")
         vision_projection_config.tp_comm_overlap = False
 
-    if args.encoder_pipeline_model_parallel_size > 0:
-        assert (
-            args.encoder_pipeline_model_parallel_size == 1
-        ), "ViT can only live on 1 pipeline stage."
-        vision_transformer_config.pipeline_model_parallel_size = (
-            args.encoder_pipeline_model_parallel_size
-        )
-        vision_projection_config.pipeline_model_parallel_size = (
-            args.encoder_pipeline_model_parallel_size
-        )
-        if args.encoder_tensor_model_parallel_size > 0:
-            vision_transformer_config.tensor_model_parallel_size = (
-                args.encoder_tensor_model_parallel_size
-            )
-            vision_projection_config.tensor_model_parallel_size = (
-                args.encoder_tensor_model_parallel_size
-            )
+    # Vision Encoder and Projection should live on PP rank0
+    vision_transformer_config.pipeline_model_parallel_size = 1
+    vision_projection_config.pipeline_model_parallel_size = 1
 
     vision_projection_modules = deepcopy(language_transformer_layer_spec.submodules.mlp.submodules)
-
-    if args.virtual_pipeline_model_parallel_size:
-        raise NotImplementedError("virtual pipeline model parallelism is not supported yet.")
 
     language_max_sequence_length = args.decoder_seq_length
     if args.context_parallel_size > 1:
@@ -184,10 +192,10 @@ def model_provider(
         language_position_embedding_type=args.position_embedding_type,
         language_rotary_percent=args.rotary_percent,
         language_rope_scaling=args.use_rope_scaling,
-        pre_process=pre_process,
-        post_process=post_process,
-        add_encoder=add_encoder,
-        add_decoder=add_decoder,
+        pre_process=parallel_state.is_pipeline_first_stage(),
+        post_process=parallel_state.is_pipeline_last_stage(),
+        add_encoder=parallel_state.is_pipeline_first_stage(),
+        add_decoder=True,
         img_h=args.img_h,
         img_w=args.img_w,
         patch_dim=args.patch_dim,
@@ -224,6 +232,8 @@ def train_valid_test_datasets_provider(train_val_test_num_samples):
         image_h=args.img_h,
         image_w=args.img_w,
         preprocess_func=_preprocess_data_for_llava,
+        mid_level_dataset_surplus=args.mid_level_dataset_surplus,
+        allow_ambiguous_pad_tokens=args.allow_ambiguous_pad_tokens,
     )
 
     print_rank_0("> building train, validation, and test datasets for multimodal ...")
@@ -310,7 +320,8 @@ def get_batch(data_iterator):
         vision_model_type = "clip"
         # Calculate the number of image embedding tokens will be added to text tokens
         num_image_embeddings_per_tile = get_num_image_embeddings(
-            args.img_h, args.img_w, args.patch_dim, vision_model_type, args.disable_vision_class_token, 1
+            args.img_h, args.img_w, args.patch_dim, vision_model_type,
+            args.disable_vision_class_token, 1, False
         )
         # Pad to make sure the text sequence can be sharded equally by CP chunks.
         image_token_mask = tokens == DEFAULT_IMAGE_TOKEN_INDEX
@@ -404,37 +415,25 @@ def add_vlm_extra_args(parser):
 
 
 def llava_embedding_ranks(pp_ranks):
-    """LLava's embedding ranks consist of the decoder's first and last ranks (ie, the ViT has no embeddings).
+    """LLaVA's embedding ranks consist of the first and last ranks of the pipeline.
     Args:
         pp_ranks: A list of global ranks that constitute a pipeline group.
     """
-    args = get_args()
-
-    # encoder size is also the index to the first rank of the decoder.
-    epp = args.encoder_pipeline_model_parallel_size
-
+    first_rank = pp_ranks[0]
     last_rank = pp_ranks[-1]
-    if len(pp_ranks) == 1 or pp_ranks[epp] == last_rank:
-        return [last_rank]
+
+    if len(pp_ranks) == 1:
+        return [first_rank]
     else:
-        return [pp_ranks[epp], last_rank]
+        return [first_rank, last_rank]
 
 
 def llava_position_embedding_ranks(pp_ranks):
-    """LLava's embedding ranks consist of the singular rank of the model or the decoder's first rank.
+    """LLaVA's positional embeddings are on the first rank stage
     Args:
         pp_ranks: A list of global ranks that constitute a pipeline group.
     """
-    args = get_args()
-
-    # encoder size is also the index to the first rank of the decoder.
-    epp = args.encoder_pipeline_model_parallel_size
-
-    last_rank = pp_ranks[-1]
-    if len(pp_ranks) == 1:
-        return [last_rank]
-    else:
-        return [pp_ranks[epp]]
+    return [pp_ranks[0]]
 
 
 if __name__ == "__main__":
@@ -443,7 +442,7 @@ if __name__ == "__main__":
     pretrain(
         train_valid_test_datasets_provider,
         model_provider,
-        ModelType.encoder_and_decoder,
+        ModelType.encoder_or_decoder,
         forward_step,
         args_defaults={'tokenizer_type': 'GPT2BPETokenizer'},
         extra_args_provider=add_vlm_extra_args,

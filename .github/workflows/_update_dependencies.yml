@@ -1,0 +1,153 @@
+name: ~Update dependencies template
+on:
+  workflow_call:
+    inputs:
+      target-branch:
+        required: true
+        type: string
+        description: "The target branch to bump"
+    secrets:
+      PAT:
+        required: true
+      AZURE_CLIENT_ID:
+        required: true
+      AZURE_TENANT_ID:
+        required: true
+      AZURE_SUBSCRIPTION_ID:
+        required: true
+      SSH_KEY:
+        required: true
+      SSH_PWD:
+        required: true
+
+jobs:
+  pre-flight:
+    runs-on: ubuntu-latest
+    outputs:
+      bump-branch: bump-ci-container-${{ steps.ref.outputs.date }}-${{ inputs.target-branch }}
+      date: ${{ steps.ref.outputs.date }}
+    steps:
+      - name: Get date
+        id: ref
+        run: echo "date=$(date +%F)" | tee -a "$GITHUB_OUTPUT"
+
+  update-lockfile:
+    environment: nemo-ci
+    runs-on: linux-amd64-cpu16
+    needs: [pre-flight]
+    env:
+      SOURCE_BRANCH: ${{ needs.pre-flight.outputs.bump-branch }}
+      TARGET_BRANCH: ${{ inputs.target-branch }}
+    steps:
+      - name: Install Azure CLI
+        run: curl -sL https://aka.ms/InstallAzureCLIDeb | sudo bash
+
+      - name: Azure Login
+        uses: azure/login@v2
+        with:
+          client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+
+      - name: Azure ACR Login
+        run: az acr login --name nemoci
+
+      - name: Checkout repo
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ env.TARGET_BRANCH }}
+
+      - name: Build container
+        env:
+          GH_TOKEN: ${{ secrets.PAT }}
+        run: |
+          docker build -f docker/Dockerfile.ci.dev --build-arg FROM_IMAGE_NAME="nvcr.io/nvidia/pytorch:25.06-py3" --target=main -t megatron-core .
+
+      - name: Create bump branch if not exists
+        run: |
+          if ! git ls-remote --exit-code origin $SOURCE_BRANCH; then
+            git checkout -b $SOURCE_BRANCH $TARGET_BRANCH
+            git push origin $SOURCE_BRANCH
+          fi
+
+      - name: Checkout repo
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ env.SOURCE_BRANCH }}
+
+      - name: Upgrade lock file
+        env:
+          GH_TOKEN: ${{ secrets.PAT }}
+        run: |
+          docker run \
+          --rm \
+          -v $(pwd):/workspace \
+          -w /workspace \
+          -e GH_TOKEN=${{ secrets.PAT }} \
+          megatron-core \
+          bash -c 'uv lock --upgrade'
+
+      - name: Upload lock file
+        uses: actions/upload-artifact@v4
+        with:
+          name: lock-file-${{ env.SOURCE_BRANCH }}
+          path: uv.lock
+
+  create-pr:
+    needs: [update-lockfile, pre-flight]
+    runs-on: ubuntu-latest
+    environment: main
+    env:
+      SOURCE_BRANCH: ${{ needs.pre-flight.outputs.bump-branch }}
+      TARGET_BRANCH: ${{ inputs.target-branch }}
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          token: ${{ secrets.PAT }}
+          ref: ${{ env.TARGET_BRANCH }}
+
+      - name: Install GPG
+        run: sudo apt-get install -y gnupg2
+
+      - name: Import GPG key (for signing)
+        uses: crazy-max/ghaction-import-gpg@e89d40939c28e39f97cf32126055eeae86ba74ec
+        id: gpg-action
+        with:
+          gpg_private_key: ${{ secrets.SSH_KEY }}
+          passphrase: ${{ secrets.SSH_PWD }}
+          git_user_signingkey: true
+          git_commit_gpgsign: true
+
+      - name: Rebase against ${{ env.SOURCE_BRANCH }}
+        run: |
+          if git ls-remote --exit-code origin ${{ env.SOURCE_BRANCH }}; then
+            git fetch origin ${{ env.SOURCE_BRANCH }}
+            git rebase -S origin/${{ env.SOURCE_BRANCH }}
+          fi
+
+      - name: Download lock file
+        uses: actions/download-artifact@v4
+        with:
+          name: lock-file-${{ env.SOURCE_BRANCH }}
+
+      - name: Create Bump PR
+        uses: peter-evans/create-pull-request@v8
+        id: create-pull-request
+        env:
+          title: "chore(beep boop 🤖): Bump `uv.lock` (${{ inputs.target-branch}}) (${{ needs.pre-flight.outputs.date }})"
+        with:
+          branch: ${{ env.SOURCE_BRANCH }}
+          base: ${{ env.TARGET_BRANCH }}
+          title: ${{ env.title }}
+          token: ${{ secrets.PAT }}
+          body: |
+            🚀 PR to bump `uv.lock` in `${{ inputs.target-branch }}`.  
+
+            📝 Please remember the following to-do's before merge: 
+            - [ ] Verify the presubmit CI  
+
+            🙏 Please merge this PR only if the CI workflow completed successfully.
+          commit-message: ${{ env.title }}
+          signoff: true
+          committer: "${{ steps.gpg-action.outputs.name }} <${{ steps.gpg-action.outputs.email }}>"

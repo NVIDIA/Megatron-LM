@@ -4,6 +4,8 @@ import json
 import os
 import sys
 import torch
+
+from utils import _ConverterFakeProcessGroup
 try:
     import transformers
 except ImportError:
@@ -382,14 +384,15 @@ def set_layer_state(args, model, hf_model, layer_idx):
 def load_checkpoint_to_model(args):
     '''Set model params.'''
 
-    from pretrain_gpt import model_provider
+    from model_provider import model_provider
+    from gpt_builders import gpt_builder
     from transformers import AutoModelForCausalLM
 
     # Load Huggingface model.
     hf_model = AutoModelForCausalLM.from_pretrained(args.load, torch_dtype=args.params_dtype, low_cpu_mem_usage=True, device_map="cpu")
 
     # Init Megatron model.
-    model = model_provider(True, True).to(args.params_dtype)
+    model = model_provider(gpt_builder, pre_process=True, post_process=True).to(args.params_dtype)
 
     # Set model state.
     set_preprocess_state(args, model, hf_model)
@@ -515,6 +518,12 @@ def _load_checkpoint(queue, args):
     mpu.set_pipeline_model_parallel_world_size(margs.pipeline_model_parallel_size)
     mpu.set_virtual_pipeline_model_parallel_world_size(margs.virtual_pipeline_model_parallel_size)
     fused_kernels.load(margs)
+
+    # For backward compatibility during local parallel states refactoring
+    fake_tp_group = _ConverterFakeProcessGroup(size=margs.tensor_model_parallel_size)
+    fake_ep_group = _ConverterFakeProcessGroup(size=margs.expert_model_parallel_size)
+    mpu._TENSOR_MODEL_PARALLEL_GROUP = fake_tp_group
+    mpu._EXPERT_MODEL_PARALLEL_GROUP = fake_ep_group
 
     # Short aliases.
     tp_size = margs.tensor_model_parallel_size

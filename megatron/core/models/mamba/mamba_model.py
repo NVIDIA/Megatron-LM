@@ -4,35 +4,50 @@ from typing import Literal, Optional
 
 from torch import Tensor
 
-from megatron.core import InferenceParams, tensor_parallel
+from megatron.core import tensor_parallel
 from megatron.core.config_logger import has_config_logger_enabled, log_config_to_disk
+from megatron.core.inference.contexts import BaseInferenceContext
 from megatron.core.models.common.embeddings.language_model_embedding import LanguageModelEmbedding
 from megatron.core.models.common.embeddings.rotary_pos_embedding import RotaryEmbedding
 from megatron.core.models.common.language_module.language_module import LanguageModule
+from megatron.core.packed_seq_params import PackedSeqParams
+from megatron.core.process_groups_config import ProcessGroupCollection
+from megatron.core.quantization.utils import get_quant_config_or_none
+from megatron.core.tensor_parallel import gather_from_sequence_parallel_region
+from megatron.core.transformer import TransformerConfig
 from megatron.core.transformer.enums import ModelType
+from megatron.core.transformer.multi_token_prediction import (
+    MultiTokenPredictionBlock,
+    mtp_on_this_rank,
+    process_mtp_loss,
+)
 from megatron.core.transformer.spec_utils import ModuleSpec, build_module
-from megatron.core.transformer.transformer_config import TransformerConfig
+from megatron.core.utils import (
+    WrappedTensor,
+    deprecate_inference_params,
+    is_using_quantization_scales,
+)
 
 
 class MambaModel(LanguageModule):
     """Mamba language model.
 
     Args:
-        config (TransformerConfig): Transformer config
+        config (TransformerConfig): Model config
         mamba_stack_spec (ModuleSpec): Specifies the modules to use for the various layer types
         vocab_size (int): Vocabulary size
         max_sequence_length (int): maximum size of sequence.
             This is used for positional embedding
         pre_process (bool, optional): Include embedding layer
             (used with pipeline parallelism). Defaults to True.
-        mamba_ssm_ngroups (int, optional): Specifies the number of groups to use.
-            The default value is 8, as in the NVIDIA Mamba2 (pure and hybrid) 8b.
-            However, in the original Mamba2 paper, the checkpoints use a setting of 1.
-            Defaults to 8.
         hybrid_attention_ratio (float, optional): The target ratio of attention
             layers to total layers
         hybrid_mlp_ratio (float, optional): The target ratio of mlp layers to total layers
-        hybrid_override_pattern (str, optional): The hybrid layer pattern to override with
+        hybrid_override_pattern (str, optional): Unified hybrid layer pattern with optional MTP.
+            Format: "<main_pattern>/<mtp_pattern>/<mtp_pattern>/..."
+            Examples:
+                - "M*M*" -> main decoder only, no MTP
+                - "M*M*/MM/MM" -> main="M*M*", mtp="MM", 2 depths
         post_process (bool, optional): Include an output layer (used with pipeline parallelism).
             Defaults to True.
         fp16_lm_cross_entropy (bool, optional): Defaults to False.
@@ -49,6 +64,7 @@ class MambaModel(LanguageModule):
         seq_len_interpolation_factor (Optional[float], optional): scale of linearly
             interpolating RoPE for longer sequences. The value must be a float larger than 1.0.
              Defaults to None.
+        pg_collection (ProcessGroupCollection, optional): Model communication process groups.
     """
 
     def __init__(
@@ -57,7 +73,6 @@ class MambaModel(LanguageModule):
         mamba_stack_spec: ModuleSpec,
         vocab_size: int,
         max_sequence_length: int,
-        mamba_ssm_ngroups: int = 8,
         pre_process: bool = True,
         hybrid_attention_ratio: float = 0.0,
         hybrid_mlp_ratio: float = 0.0,
@@ -70,9 +85,12 @@ class MambaModel(LanguageModule):
         position_embedding_type: Literal['learned_absolute', 'rope', 'none'] = 'none',
         rotary_percent: float = 1.0,
         rotary_base: int = 10000,
+        scatter_embedding_sequence_parallel: bool = True,
         seq_len_interpolation_factor: Optional[float] = None,
+        pg_collection: Optional[ProcessGroupCollection] = None,
+        vp_stage: Optional[int] = None,
     ) -> None:
-        super().__init__(config=config)
+        super().__init__(config=config, pg_collection=pg_collection)
 
         if has_config_logger_enabled(config):
             log_config_to_disk(config, locals(), prefix=type(self).__name__)
@@ -80,7 +98,6 @@ class MambaModel(LanguageModule):
         self.mamba_stack_spec: ModuleSpec = mamba_stack_spec
         self.vocab_size = vocab_size
         self.max_sequence_length = max_sequence_length
-        self.mamba_ssm_ngroups = mamba_ssm_ngroups
         self.pre_process = pre_process
         self.hybrid_attention_ratio = hybrid_attention_ratio
         self.hybrid_mlp_ratio = hybrid_mlp_ratio
@@ -90,17 +107,34 @@ class MambaModel(LanguageModule):
         self.parallel_output = parallel_output
         self.share_embeddings_and_output_weights = share_embeddings_and_output_weights
         self.position_embedding_type = position_embedding_type
+        self.vp_stage = vp_stage
+
+        # Parse unified pattern to extract main and MTP components
+        from megatron.core.ssm.mamba_hybrid_layer_allocation import parse_hybrid_pattern
+
+        parsed = parse_hybrid_pattern(hybrid_override_pattern)
+        self.mtp_pattern = parsed.mtp_pattern
+        self.mtp_num_depths = parsed.mtp_num_depths
+
+        # Determine if MTP is needed (based on pattern parsing)
+        self.mtp_process = (
+            self.mtp_pattern is not None
+            and self.mtp_num_depths > 0
+            and mtp_on_this_rank(self.config, vp_stage=self.vp_stage)
+        )
 
         # megatron core pipelining currently depends on model type
         # TODO: remove this dependency ?
         self.model_type = ModelType.encoder_or_decoder
 
-        if self.pre_process:
+        if self.pre_process or self.mtp_process:
             self.embedding = LanguageModelEmbedding(
                 config=self.config,
                 vocab_size=self.vocab_size,
                 max_sequence_length=self.max_sequence_length,
                 position_embedding_type=position_embedding_type,
+                scatter_to_sequence_parallel=scatter_embedding_sequence_parallel,
+                tp_group=self.pg_collection.tp,
             )
 
         if self.position_embedding_type == 'rope':
@@ -110,22 +144,42 @@ class MambaModel(LanguageModule):
                 seq_len_interpolation_factor=seq_len_interpolation_factor,
                 rotary_base=rotary_base,
                 use_cpu_initialization=self.config.use_cpu_initialization,
+                cp_group=self.pg_collection.cp,
             )
 
         self.decoder = build_module(
             mamba_stack_spec,
             self.config,
-            mamba_ssm_ngroups=self.mamba_ssm_ngroups,
             pre_process=self.pre_process,
             hybrid_attention_ratio=self.hybrid_attention_ratio,
             hybrid_mlp_ratio=self.hybrid_mlp_ratio,
-            hybrid_override_pattern=self.hybrid_override_pattern,
+            hybrid_override_pattern=parsed.main_pattern,
             post_process=self.post_process,
             dtype=config.params_dtype,
+            pg_collection=self.pg_collection,
         )
 
+        # MTP block - uses mtp_block_spec from mamba_stack_spec.submodules
+        if self.mtp_process:
+            mamba_submodules = mamba_stack_spec.submodules
+            mtp_block_spec = mamba_submodules.mtp_block_spec
+            assert mtp_block_spec is not None, (
+                "MTP pattern specified but mtp_block_spec is None in mamba_stack_spec.submodules. "
+                "Ensure mamba_stack_spec includes mtp_block_spec for MTP support."
+            )
+
+            self.mtp = MultiTokenPredictionBlock(
+                config=self.config,
+                spec=mtp_block_spec,
+                pg_collection=self.pg_collection,
+                vp_stage=self.vp_stage,
+                mtp_layer_pattern=self.mtp_pattern,
+                mtp_num_depths=self.mtp_num_depths,
+                mamba_submodules=mamba_submodules,
+            )
+
         # Output
-        if post_process:
+        if post_process or self.mtp_process:
             self.output_layer = tensor_parallel.ColumnParallelLinear(
                 config.hidden_size,
                 self.vocab_size,
@@ -136,10 +190,16 @@ class MambaModel(LanguageModule):
                 gather_output=not self.parallel_output,
                 skip_weight_param_allocation=self.pre_process
                 and self.share_embeddings_and_output_weights,
+                tp_group=self.pg_collection.tp,
             )
 
-        if self.pre_process or self.post_process:
+        if self.pre_process or self.post_process or self.mtp_process:
             self.setup_embeddings_and_output_layer()
+
+        for name, module in self.named_modules():
+            if hasattr(module, 'finish_init'):
+                quant_config = get_quant_config_or_none(name, self.config.quant_recipe)
+                module.finish_init(quant_config)
 
     def set_input_tensor(self, input_tensor: Tensor) -> None:
         """Sets input tensor to the model.
@@ -164,7 +224,13 @@ class MambaModel(LanguageModule):
         attention_mask: Tensor,
         decoder_input: Tensor = None,
         labels: Tensor = None,
-        inference_params: InferenceParams = None,
+        inference_context: BaseInferenceContext = None,
+        runtime_gather_output: Optional[bool] = None,
+        *,
+        inference_params: Optional[BaseInferenceContext] = None,
+        loss_mask: Optional[Tensor] = None,
+        packed_seq_params: Optional[PackedSeqParams] = None,
+        padding_mask: Optional[Tensor] = None,
     ) -> Tensor:
         """Forward function of the Mamba model. This function passes the input tensors
         through the embedding layer, and then the decoder and finally into the post
@@ -175,11 +241,27 @@ class MambaModel(LanguageModule):
         # If decoder_input is provided (not None), then input_ids and position_ids are ignored.
         # Otherwise, apply embedding layer on input_ids and position_ids to get decoder_input.
 
+        inference_context = deprecate_inference_params(inference_context, inference_params)
+
+        in_inference_mode = inference_context is not None and not self.training
+
+        if in_inference_mode:
+            assert runtime_gather_output, "Inference must always gather TP logits"
+
         # Decoder embedding.
         if decoder_input is not None:
             pass
         elif self.pre_process:
             decoder_input = self.embedding(input_ids=input_ids, position_ids=position_ids)
+
+            # Clear the outputs for padding tokens when using dynamic batching with
+            # quantization scales to avoid corrupting amax calculations
+            if (
+                in_inference_mode
+                and inference_context.is_dynamic_batching()
+                and is_using_quantization_scales(self.config)
+            ):
+                decoder_input[inference_context.padding_slice] = 0.0
         else:
             # intermediate stage of pipeline
             # decoder will get hidden_states from encoder.input_tensor
@@ -188,9 +270,18 @@ class MambaModel(LanguageModule):
         rotary_pos_emb = None
         if self.position_embedding_type == 'rope':
             rotary_seq_len = self.rotary_pos_emb.get_rotary_seq_len(
-                inference_params, self.decoder, decoder_input, self.config
+                inference_context, self.decoder, decoder_input, self.config, packed_seq_params
             )
-            rotary_pos_emb = self.rotary_pos_emb(rotary_seq_len)
+            rotary_pos_emb = self.rotary_pos_emb(
+                rotary_seq_len,
+                packed_seq=packed_seq_params is not None and packed_seq_params.qkv_format == 'thd',
+            )
+
+        # Wrap decoder_input to allow the decoder (MambaBlock) to delete the
+        # reference held by this caller function, enabling early garbage collection
+        # for inference.
+        if in_inference_mode:
+            decoder_input = WrappedTensor(decoder_input)
 
         # The following assert will currently fail when running inference.
         # Commented out for now.
@@ -206,18 +297,80 @@ class MambaModel(LanguageModule):
         hidden_states = self.decoder(
             hidden_states=decoder_input,
             attention_mask=attention_mask,
-            inference_params=inference_params,
+            inference_context=inference_context,
             rotary_pos_emb=rotary_pos_emb,
+            packed_seq_params=packed_seq_params,
+            padding_mask=padding_mask,
         )
+
+        output_weight = None
+        if self.share_embeddings_and_output_weights:
+            output_weight = self.shared_embedding_or_output_weight()
+
+        if self.mtp_process:
+            hidden_states = self.mtp(
+                input_ids=input_ids,
+                position_ids=position_ids,
+                hidden_states=hidden_states,
+                attention_mask=attention_mask,
+                inference_params=inference_params,
+                rotary_pos_emb=rotary_pos_emb,
+                packed_seq_params=packed_seq_params,
+                embedding=self.embedding,
+            )
 
         if not self.post_process:
             return hidden_states
 
-        # logits and loss
-        output_weight = None
-        if self.share_embeddings_and_output_weights:
-            output_weight = self.shared_embedding_or_output_weight()
-        logits, _ = self.output_layer(hidden_states, weight=output_weight)
+        if self.config.mtp_num_layers is not None:
+            hidden_states = process_mtp_loss(
+                hidden_states=hidden_states,
+                labels=labels,
+                loss_mask=loss_mask,
+                output_layer=self.output_layer,
+                output_weight=output_weight,
+                runtime_gather_output=runtime_gather_output,
+                is_training=self.training,
+                compute_language_model_loss=self.compute_language_model_loss,
+                config=self.config,
+                cp_group=self.pg_collection.cp,
+                packed_seq_params=packed_seq_params,
+            )
+
+        sequence_parallel_override = False
+        if in_inference_mode and inference_context.config.materialize_only_last_token_logits:
+            if inference_context.is_static_batching():
+                hidden_states = hidden_states[-1:, :, :]
+            else:
+                if self.output_layer.sequence_parallel:
+                    # Perform the sequence parallel gather here instead of after the output layer
+                    # because we need to slice the last token logits from the full view of the
+                    # packed logits across all requests.
+                    hidden_states = gather_from_sequence_parallel_region(
+                        hidden_states, group=self.pg_collection.tp
+                    )
+                    self.output_layer.sequence_parallel = False
+                    sequence_parallel_override = True
+
+                # Reshape [B, 1, H] to [1, B, H] → extract each sample's true last‐token hidden
+                # state ([B, H]) → unsqueeze back to [B, 1, H]
+                # (so that the output layer, which expects S×B×H, receives only the final token)
+                hidden_states = inference_context.last_token_logits(
+                    hidden_states.squeeze(1).unsqueeze(0)
+                ).unsqueeze(1)
+
+        logits, _ = self.output_layer(
+            hidden_states, weight=output_weight, runtime_gather_output=runtime_gather_output
+        )
+
+        # Restore sequence parallel execution to the output layer if necessary.
+        if sequence_parallel_override:
+            assert (
+                in_inference_mode
+                and inference_context.is_dynamic_batching()
+                and inference_context.config.materialize_only_last_token_logits
+            )
+            self.output_layer.sequence_parallel = True
 
         if labels is None:
             # [s b h] => [b s h]

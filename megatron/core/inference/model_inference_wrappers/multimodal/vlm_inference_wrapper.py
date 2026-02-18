@@ -1,57 +1,56 @@
 # Copyright (c) 2024, NVIDIA CORPORATION. All rights reserved.
-from typing import Any, Dict
+import warnings
+from typing import Any, Dict, Optional
 
 import torch
 
-from megatron.core import parallel_state
+from megatron.core.inference.communication_utils import (
+    is_pipeline_first_stage,
+    is_pipeline_last_stage,
+)
+from megatron.core.inference.contexts import StaticInferenceContext
 from megatron.core.inference.model_inference_wrappers.gpt.gpt_inference_wrapper import (
     GPTInferenceWrapper,
 )
-from megatron.core.inference_params import InferenceParams
 
 
 # pylint: disable=line-too-long
 class VLMInferenceWrapper(GPTInferenceWrapper):
     """Inference wrapper for VLMs"""
 
-    def prep_model_for_inference(self, prompts_tokens: torch.Tensor):
+    def prep_model_for_inference(self, prompts_tokens: Optional[torch.Tensor] = None):
         """A utility function for preparing model for inference
 
         The function gets called once before the auto regressive inference loop.
         It puts the model in eval mode.
 
         Args:
-            prompts_tokens (torch.Tensor): A tensor of shape [batch_size, max_seq_len]
-
+            prompts_tokens (torch.Tensor): Deprecated, will be removed in `megatron-core` 0.13
         """
-        super().prep_model_for_inference(prompts_tokens)
+        if prompts_tokens is not None:
+            warnings.warn(
+                "Passing `prompts_tokens` is deprecated and this argument will be ignored."
+                "This parameter will be removed in `megatron-core` 0.13."
+            )
+
+        super().prep_model_for_inference()
 
         # For TP only model both is_pp_first_stage and _is_pp_last_stage returns True
+        # set ignore_virtual=True since vpp is not used in inference
         self.model_is_pipeline_parallel = not (
-            parallel_state.is_pipeline_first_stage() and parallel_state.is_pipeline_last_stage()
+            is_pipeline_first_stage(self.pp_group) and is_pipeline_last_stage(self.pp_group)
         )
 
         self._recv_only_vision_embeds = False
-        pp_rank = parallel_state.get_pipeline_model_parallel_rank()
+        pp_rank = self.pp_group.rank()
         # Checks if the previous stage only has a vision encoder, and that the current stage
         # has part of the LM decoder. In this case, the current stage should only receive
         # vision embeddings.
         if pp_rank > 0:
-            self._recv_only_vision_embeds = (
-                parallel_state.is_inside_encoder(pp_rank - 1)
-                and (not parallel_state.is_inside_decoder(pp_rank - 1))
-                and parallel_state.is_inside_decoder()
-            )
+            self._recv_only_vision_embeds = False  # TODO: Implement new logic for vision embeddings
 
         # Checks if the current stage only has a vision encoder
-        self._encoder_only = (
-            parallel_state.is_inside_encoder() and not parallel_state.is_inside_decoder()
-        )
-
-        # For TP only model both is_pp_first_stage and _is_pp_last_stage returns True
-        self.model_is_pipeline_parallel = not (
-            parallel_state.is_pipeline_first_stage() and parallel_state.is_pipeline_last_stage()
-        )
+        self._encoder_only = False  # TODO: Implement new logic for encoder-only stages
 
     def prep_inference_input(
         self,
@@ -76,7 +75,7 @@ class VLMInferenceWrapper(GPTInferenceWrapper):
         num_img_embeddings = num_img_embeddings_per_tile * total_num_tiles
 
         batch_size, max_sequence_length = prompts_tokens.shape
-        self.inference_params = InferenceParams(
+        self.inference_context = StaticInferenceContext(
             batch_size, max_sequence_length + num_img_embeddings
         )
 
@@ -143,7 +142,7 @@ class VLMInferenceWrapper(GPTInferenceWrapper):
             tokens,
             position_ids=position_ids,
             attention_mask=None,
-            inference_params=self.inference_params,
+            inference_context=self.inference_context,
             num_image_tiles=num_image_tiles,
             runtime_gather_output=True,
         )
@@ -154,6 +153,15 @@ class VLMInferenceWrapper(GPTInferenceWrapper):
         return logits
 
     def run_one_forward_step(self, inference_input: Dict[str, Any]) -> torch.Tensor:
+        """The forward pass of the model for inference
+
+        Args:
+            inference_input (Dict[str, Any]): A dict containing the inputs for the VLM model
+
+        Returns:
+            torch.Tensor: The output logits of shape [batch_size, seq_len, padded_vocab_size].
+            The logits are returned only in the last pipeline stage for PP models.
+        """
         tokens = inference_input["tokens"]
         num_image_tokens = (tokens == self.model.module.image_token_index).sum().item()
         num_img_embeddings = inference_input["num_img_embeddings"]
@@ -192,16 +200,16 @@ class VLMInferenceWrapper(GPTInferenceWrapper):
         # On every PP stage(although inference params should only matter for decoder),
         # update the sequence length offset by the number of image tokens.
         if num_tokens > 1 and num_image_tokens > 0:
-            if "image_tokens_count" not in self.inference_params.key_value_memory_dict:
-                self.inference_params.key_value_memory_dict["image_tokens_count"] = (
+            if "image_tokens_count" not in self.inference_context.key_value_memory_dict:
+                self.inference_context.key_value_memory_dict["image_tokens_count"] = (
                     num_img_embeddings
                 )
 
             if num_img_embeddings + num_tokens - num_image_tokens > decoder_seq_length:
-                self.inference_params.sequence_len_offset += decoder_seq_length - num_tokens
+                self.inference_context.sequence_len_offset += decoder_seq_length - num_tokens
             else:
-                self.inference_params.sequence_len_offset += (
-                    self.inference_params.key_value_memory_dict["image_tokens_count"]
+                self.inference_context.sequence_len_offset += (
+                    self.inference_context.key_value_memory_dict["image_tokens_count"]
                     - num_image_tokens
                 )
 

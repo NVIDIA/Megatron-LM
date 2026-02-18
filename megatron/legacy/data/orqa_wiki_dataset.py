@@ -20,8 +20,7 @@ def get_open_retrieval_wiki_dataset():
     dataset = OpenRetrievalEvidenceDataset('2018 Wikipedia from DPR codebase',
                                            'evidence',
                                            args.evidence_data_path,
-                                           tokenizer,
-                                           args.retriever_seq_length)
+                                           tokenizer)
     return dataset
 
 
@@ -55,7 +54,7 @@ def build_tokens_types_paddings_from_text(row, tokenizer, max_seq_length):
     context_ids = tokenizer.tokenize(row['text'])
 
     # Appending the title of the context at front
-    extended_context_ids = title_ids + [tokenizer.sep_id] + context_ids
+    extended_context_ids = title_ids + [tokenizer.sep] + context_ids
 
     context_ids, context_types, context_pad_mask = \
         build_tokens_types_paddings_from_ids(extended_context_ids, 

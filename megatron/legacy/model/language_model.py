@@ -4,10 +4,13 @@
 
 import torch
 import torch.nn.functional as F
+from typing import Optional
 
 from megatron.core import mpu, tensor_parallel
 from megatron.core.enums import ModelType
+from megatron.core.inference.contexts import BaseInferenceContext
 from megatron.core.models.common.embeddings.rotary_pos_embedding import RotaryEmbedding
+from megatron.core.utils import deprecate_inference_params
 from megatron.training import get_args
 
 from .enums import AttnMaskType, LayerType
@@ -357,7 +360,6 @@ class TransformerLanguageModel(MegatronModule):
         self.decoder_attn_mask_type = decoder_attn_mask_type
         self.add_pooler = add_pooler
         self.encoder_hidden_state = None
-        self.add_retriever = args.retro_add_retriever
         self.untie_embeddings_and_output_weights = args.untie_embeddings_and_output_weights
 
         # Embeddings.
@@ -396,9 +398,7 @@ class TransformerLanguageModel(MegatronModule):
         if self.add_encoder:
             self.encoder = ParallelTransformer(
                 config,
-                model_type=(
-                    args.model_type if not args.retro_add_retriever else ModelType.retro_decoder
-                ),
+                model_type=args.model_type,
                 self_attn_mask_type=self.encoder_attn_mask_type,
                 pre_process=self.pre_process,
                 post_process=self.post_process,
@@ -476,16 +476,17 @@ class TransformerLanguageModel(MegatronModule):
         dec_input_ids=None,
         dec_position_ids=None,
         dec_attn_mask=None,
-        retriever_input_ids=None,
-        retriever_position_ids=None,
-        retriever_attn_mask=None,
         enc_dec_attn_mask=None,
         tokentype_ids=None,
-        inference_params=None,
+        inference_context=None,
         pooling_sequence_index=0,
         enc_hidden_states=None,
         output_enc_hidden=False,
+        *,
+        inference_params: Optional[BaseInferenceContext] = None,
     ):
+
+        inference_context = deprecate_inference_params(inference_context, inference_params)
 
         # Encoder embedding.
         if self.pre_process:
@@ -495,19 +496,11 @@ class TransformerLanguageModel(MegatronModule):
         else:
             encoder_input = None
 
-        # Retriever embedding.
-        if self.add_retriever and self.pre_process:
-            retriever_input = self.embedding(
-                retriever_input_ids, retriever_position_ids, tokentype_ids=tokentype_ids
-            )
-        else:
-            retriever_input = None
-
         # Rotary positional embeddings
         rotary_pos_emb = None
         if self.use_rotary_position_embeddings:
-            if inference_params is not None:
-                rotary_pos_emb = self.rotary_pos_emb(inference_params.max_sequence_length)
+            if inference_context is not None:
+                rotary_pos_emb = self.rotary_pos_emb(inference_context.max_sequence_length)
             else:
                 rotary_pos_emb = self.rotary_pos_emb(self.seq_length)
 
@@ -517,9 +510,7 @@ class TransformerLanguageModel(MegatronModule):
                 encoder_output = self.encoder(
                     encoder_input,
                     enc_attn_mask,
-                    retriever_input=retriever_input,
-                    retriever_attn_mask=retriever_attn_mask,
-                    inference_params=inference_params,
+                    inference_context=inference_context,
                     rotary_pos_emb=rotary_pos_emb,
                 )
             else:
@@ -552,7 +543,7 @@ class TransformerLanguageModel(MegatronModule):
             dec_attn_mask,
             encoder_output=encoder_output,
             enc_dec_attn_mask=enc_dec_attn_mask,
-            inference_params=inference_params,
+            inference_context=inference_context,
             rotary_pos_emb=rotary_pos_emb,
         )
 

@@ -13,6 +13,8 @@ sys.path.append(
 
 def split(input_dir, base_output_dir, input_pp, output_pp, num_tp, num_layers_per_pp_rank):
     """Split pipeline parallel size = 1 checkpoint to pipeline parallel size N."""
+
+    iter = args.iteration if args.iteration else 1
     for tp in range(num_tp):
         path = os.path.join(input_dir, f"mp_rank_0{tp}", "model_optim_rng.pt")
         sd = torch.load(path)
@@ -44,7 +46,10 @@ def split(input_dir, base_output_dir, input_pp, output_pp, num_tp, num_layers_pe
                     new_sd["model"][k] = v
 
                 # Only the last pp rank has final layer norm.
-                if "language_model.decoder.final_layernorm" in k and pp == output_pp - 1:
+                if pp == output_pp - 1 and (
+                    "language_model.decoder.final_norm" in k  # Mamba model
+                    or "language_model.decoder.final_layernorm" in k  # GPT model
+                ):
                     new_sd["model"][k] = v
 
                 if "language_model.decoder.layers" in k:
@@ -60,7 +65,7 @@ def split(input_dir, base_output_dir, input_pp, output_pp, num_tp, num_layers_pe
 
                         new_sd["model"][new_k] = v
 
-            output_dir = os.path.join(base_output_dir, f"iter_0000001/mp_rank_0{tp}_00{pp}")
+            output_dir = os.path.join(base_output_dir, f"iter_{iter:0>7}/mp_rank_0{tp}_00{pp}")
             os.makedirs(output_dir, exist_ok=True)
             output_path = os.path.join(output_dir, "model_optim_rng.pt")
             torch.save(new_sd, output_path)
@@ -71,11 +76,12 @@ def split(input_dir, base_output_dir, input_pp, output_pp, num_tp, num_layers_pe
 
     # This is needed for megatron checkpoint loading.
     with open(os.path.join(base_output_dir, "latest_checkpointed_iteration.txt"), "w") as f:
-        f.write("1")
+        f.write(f"{iter}")
 
 
 def combine(input_dir, base_output_dir, input_pp, output_pp, num_tp, num_layers_per_pp_rank):
     """Combine pipeline parallel size = N checkpoint to pipeline parallel size 1."""
+    iter = args.iteration if args.iteration else 1
     for tp in range(num_tp):
         new_sd = None
 
@@ -108,7 +114,10 @@ def combine(input_dir, base_output_dir, input_pp, output_pp, num_tp, num_layers_
                     new_sd["model"][k] = v
 
                 # Only the last pp rank has final layer norm.
-                if "language_model.decoder.final_layernorm" in k and pp == input_pp - 1:
+                if pp == output_pp - 1 and (
+                    "language_model.decoder.final_norm" in k  # Mamba model
+                    or "language_model.decoder.final_layernorm" in k  # GPT model
+                ):
                     new_sd["model"][k] = v
 
                 if "language_model.decoder.layers" in k:
@@ -130,14 +139,14 @@ def combine(input_dir, base_output_dir, input_pp, output_pp, num_tp, num_layers_
 
             layer_num_offset = max_layer_num + 1
 
-        output_dir = os.path.join(base_output_dir, f"iter_0000001/mp_rank_0{tp}")
+        output_dir = os.path.join(base_output_dir, f"iter_{iter:0>7}/mp_rank_0{tp}")
         os.makedirs(output_dir, exist_ok=True)
         output_path = os.path.join(output_dir, "model_optim_rng.pt")
         torch.save(new_sd, output_path)
 
     # This is needed for megatron checkpoint loading.
     with open(os.path.join(base_output_dir, "latest_checkpointed_iteration.txt"), "w") as f:
-        f.write("1")
+        f.write(f"{iter}")
 
 
 if __name__ == "__main__":
@@ -163,6 +172,9 @@ if __name__ == "__main__":
     )
     parser.add_argument(
         "--num-layers-per-pp-rank", type=int, default=None, nargs="*", help="Specify this for uneven pipeline parallel split",
+    )
+    parser.add_argument(
+        "--iteration", type=int, default=None, help="Specify checkpoint iteration",
     )
 
     args = parser.parse_args()

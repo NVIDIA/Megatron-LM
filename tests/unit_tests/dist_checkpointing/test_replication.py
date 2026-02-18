@@ -94,10 +94,10 @@ class TestLocalCheckpointingReplication:
         Utils.initialize_model_parallel(tp, pp)
 
         mock_args = parse_args(ignore_unknown_args=True)
-        with mock.patch(
-            'megatron.training.checkpointing.get_args', new=lambda: mock_args
-        ), mock.patch('megatron.training.async_utils.get_args', new=lambda: mock_args), mock.patch(
-            "megatron.training.checkpointing.update_num_microbatches"
+        with (
+            mock.patch('megatron.training.checkpointing.get_args', new=lambda: mock_args),
+            mock.patch('megatron.training.async_utils.get_args', new=lambda: mock_args),
+            mock.patch("megatron.training.checkpointing.update_num_microbatches"),
         ):
             self.local_ckpt_dir = (
                 root_tmp_dir / "subdir"
@@ -107,6 +107,7 @@ class TestLocalCheckpointingReplication:
             mock_args.non_persistent_ckpt_type = 'local'
             mock_args.non_persistent_local_ckpt_algo = algo
             mock_args.async_save = async_save
+            mock_args.ckpt_fully_parallel_save = True  # ensure proper sharding_type is set
             repl_groups_init = [dist.new_group(g) for g in repl_groups]
             my_process_group = GroupWrapper.from_list_of_groups(repl_groups_init)
             repl_strategy = CliqueReplicationStrategy(my_process_group, target_device="cpu")
