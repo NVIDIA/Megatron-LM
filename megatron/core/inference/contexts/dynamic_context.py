@@ -724,6 +724,9 @@ class DynamicInferenceContext(BaseInferenceContext):
             return
         self.is_tensor_state_allocated = True
 
+        if self.kv_cache_management_mode == KVCacheManagementMode.PERSIST:
+            return
+
         if self.unified_memory_level != 0:
             if self.kv_cache_management_mode == KVCacheManagementMode.RECOMPUTE:
                 self.reset()
@@ -731,6 +734,8 @@ class DynamicInferenceContext(BaseInferenceContext):
 
         if self._uses_torch_memory_saver:
             torch_memory_saver.resume("inference_context")
+            if self.kv_cache_management_mode == KVCacheManagementMode.RECOMPUTE:
+                self.reset()
             return
 
         if self.kv_cache_management_mode == KVCacheManagementMode.OFFLOAD:
