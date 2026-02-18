@@ -30,4 +30,4 @@ jobs:
       - name: Assign initial review label
         env:
           GH_TOKEN: ${{ github.token }}
-        run: python tests/test_utils/python_scripts/swap_pr_labels.py --pr ${{ github.event.pull_request.number }} assign
+        run: python tests/test_utils/python_scripts/update_pr_labels.py --pr ${{ github.event.pull_request.number }} assign

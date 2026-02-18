@@ -12,8 +12,8 @@ Supports two actions:
 
 Requirements: pip install PyGithub
 Usage:
-  GH_TOKEN=ghp_... python swap_pr_labels.py --pr 42 swap
-  GH_TOKEN=ghp_... python swap_pr_labels.py --pr 42 assign
+  GH_TOKEN=ghp_... python update_pr_labels.py --pr 42 swap
+  GH_TOKEN=ghp_... python update_pr_labels.py --pr 42 assign
 """
 
 import argparse

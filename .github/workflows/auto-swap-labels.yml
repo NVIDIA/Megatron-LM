@@ -28,4 +28,4 @@ jobs:
       - name: Swap labels after approval
         env:
           GH_TOKEN: ${{ github.token }}
-        run: python tests/test_utils/python_scripts/swap_pr_labels.py --pr ${{ github.event.pull_request.number }} swap
+        run: python tests/test_utils/python_scripts/update_pr_labels.py --pr ${{ github.event.pull_request.number }} swap
