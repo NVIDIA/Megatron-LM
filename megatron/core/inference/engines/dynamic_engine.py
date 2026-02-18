@@ -600,7 +600,7 @@ class DynamicInferenceEngine(AbstractEngine):
         with self.__class__.suspend_resume_ctx(
             "suspended", unified_memory_level=self.unified_memory_level
         ):
-            self.context.deallocate_inference_state_buffers()
+            self.context.deinitialize_inference_state_buffers()
 
         if (
             self.context.kv_cache_management_mode != KVCacheManagementMode.PERSIST
@@ -641,7 +641,7 @@ class DynamicInferenceEngine(AbstractEngine):
             # Allocate context tensors.
             alloc_time = time.time()
             torch.cuda.synchronize()
-            self.context.reallocate_inference_state_buffers()
+            self.context.reinitialize_inference_state_buffers()
             torch.cuda.synchronize()
             alloc_time = time.time() - alloc_time
 
@@ -657,7 +657,6 @@ class DynamicInferenceEngine(AbstractEngine):
             add_time = time.time()
             torch.cuda.synchronize()
             for request_id in self.resume_request_ids:
-                request_entry = self.requests[request_id]
                 self._add_request(self.get_request(request_id))
             torch.cuda.synchronize()
             add_time = time.time() - add_time
