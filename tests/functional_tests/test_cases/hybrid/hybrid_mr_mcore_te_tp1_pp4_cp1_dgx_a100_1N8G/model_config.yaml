@@ -8,7 +8,7 @@ MODEL_ARGS:
   --num-attention-heads: 16
   --group-query-attention: true
   --num-query-groups: 8
-  --hybrid-layer-pattern: M-M-M-M*-M-M-M-M*-M-M-M-M*-M-M-M-M*-M-M-M-M-
+  --hybrid-layer-pattern: M-M-M-M*-M-|M-M-M*-M-M-|M-M*-M-M-M-|M*-M-M-M-M-
   --spec: "[megatron.core.models.mamba.mamba_layer_specs mamba_stack_spec]"
   --log-params-norm: true
   --log-num-zeros-in-grad: true
