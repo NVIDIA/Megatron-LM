@@ -115,10 +115,6 @@ def _make_request(request_id, prompt_tokens, block_size, enable_prefix_caching=T
     )
 
 
-def _simulate_prefill_completion(context):
-    """Simulate what the engine does after prefill: mark pending blocks computed."""
-    context.mark_pending_blocks_computed()
-
 
 # =============================================================================
 # Test Classes
@@ -272,7 +268,7 @@ class TestMambaCacheEviction:
         prompt_a = torch.arange(block_size * 2, device=torch.cuda.current_device())
         req_a = _make_request(1, prompt_a, block_size)
         ctx.add_request(req_a)
-        _simulate_prefill_completion(ctx)
+
 
         # Store Mamba state for block 1 (last complete block of A)
         block_1_id = ctx.request_to_kv_block_ids[a_idx][1].item()
@@ -287,7 +283,7 @@ class TestMambaCacheEviction:
         prompt_c = torch.arange(1000, 1000 + block_size * 2, device=torch.cuda.current_device())
         req_c = _make_request(2, prompt_c, block_size)
         ctx.add_request(req_c)
-        _simulate_prefill_completion(ctx)
+
 
         # Store Mamba state for C's last block -- may evict block_1's Mamba state
         c_block_1_id = ctx.request_to_kv_block_ids[c_idx][1].item()
@@ -340,7 +336,7 @@ class TestMambaPrefixMatching:
         prompt = torch.arange(block_size * 2, device=torch.cuda.current_device())
         req_a = _make_request(1, prompt, block_size)
         ctx.add_request(req_a)
-        _simulate_prefill_completion(ctx)
+
 
         # Release A
         ctx.release_memory_blocks_from_request_indexes(torch.tensor([a_idx]))
@@ -375,7 +371,7 @@ class TestMambaPrefixMatching:
         prompt = torch.arange(block_size * 2, device=torch.cuda.current_device())
         req_a = _make_request(1, prompt, block_size)
         ctx.add_request(req_a)
-        _simulate_prefill_completion(ctx)
+
 
         # Store Mamba state for A's blocks
         mamba_idx_a = ctx.mamba_metadata.request_to_mamba_state_idx[a_idx].item()
@@ -424,7 +420,7 @@ class TestMambaPrefixMatching:
         prompt = torch.arange(block_size * 3, device=torch.cuda.current_device())
         req_a = _make_request(1, prompt, block_size)
         ctx.add_request(req_a)
-        _simulate_prefill_completion(ctx)
+
 
         # Store Mamba state ONLY for block 0
         mamba_idx_a = ctx.mamba_metadata.request_to_mamba_state_idx[a_idx].item()
@@ -473,7 +469,7 @@ class TestMambaPrefixMatching:
         prompt = torch.arange(block_size * 2, device=torch.cuda.current_device())
         req_a = _make_request(1, prompt, block_size)
         ctx.add_request(req_a)
-        _simulate_prefill_completion(ctx)
+
 
         # Don't store any Mamba state for A's blocks
         # Release A
@@ -637,7 +633,6 @@ def _run_to_completion(engine, requests):
 
     results = {}
     while engine.has_unfinished_requests():
-        engine.schedule_waiting_requests()
         result = engine.step_modern()
         for record in result["finished_request_records"]:
             finished = record.merge()
@@ -858,7 +853,7 @@ class TestBudgetZero:
         a_idx = ctx.total_request_count  # 0
         req_a = _make_request(1, prompt, block_size)
         ctx.add_request(req_a)
-        _simulate_prefill_completion(ctx)
+
 
         a_block_0 = ctx.request_to_kv_block_ids[a_idx][0].item()
         ctx.release_memory_blocks_from_request_indexes(torch.tensor([a_idx]))
@@ -888,3 +883,149 @@ class TestBudgetZero:
             prefix_caching_mamba_gb=1e-12,
         )
         assert ctx.max_mamba_cache_slots == 0
+
+
+class TestMultiplePrefillWithInitialStates:
+    """Engine-level test verifying numerical correctness when multiple prefill
+    requests with restored Mamba states run simultaneously.
+
+    Scenario:
+        block_size=32, max_tokens=256
+
+        1. Request A: 128-token prompt -> run to completion
+           - Stores Mamba states at block boundaries (blocks 0-3)
+
+        2. Request B: same 64-token prefix as A + 32 unique tokens (total 96)
+           - Restores Mamba state from block 1 (divergence at token 64)
+
+        3. Request C: same 64-token prefix as A + 32 different unique tokens (total 96)
+           - Also restores Mamba state from block 1
+
+        4. Schedule B and C simultaneously -> both have initial states
+           -> Both go through batch kernel (via loop)
+
+        5. Compare: run B alone and C alone in separate engine instances
+           -> outputs must match the simultaneous run
+    """
+
+    def teardown_method(self, method):
+        Utils.destroy_model_parallel()
+
+    @pytest.mark.internal
+    @pytest.mark.skipif(
+        not is_fa_min_version("2.7.3"), reason="need latest flash attn for dynamic batching"
+    )
+    @torch.no_grad()
+    def test_multiple_prefill_with_restored_states(self):
+        _skip_if_mamba_sequence_packing_not_available()
+
+        # --- Parameters ---
+        seed = 42
+        vocab_size = 100
+        block_size = 32
+        max_tokens = 256
+        max_requests = 8
+        max_sequence_length = 512
+        buffer_size_gb = 0.1
+        num_tokens_to_generate = 4
+
+        # Generate deterministic prompts
+        torch.manual_seed(seed)
+        shared_prefix = torch.randint(0, vocab_size - 1, (64,), device="cuda", dtype=torch.int64)
+        suffix_b = torch.randint(0, vocab_size - 1, (32,), device="cuda", dtype=torch.int64)
+        suffix_c = torch.randint(0, vocab_size - 1, (32,), device="cuda", dtype=torch.int64)
+        prompt_a = torch.cat([
+            shared_prefix,
+            torch.randint(0, vocab_size - 1, (64,), device="cuda", dtype=torch.int64),
+        ])  # 128 tokens
+        prompt_b = torch.cat([shared_prefix, suffix_b])  # 96 tokens
+        prompt_c = torch.cat([shared_prefix, suffix_c])  # 96 tokens
+
+        engine_kwargs = dict(
+            enable_chunked_prefill=True,
+            enable_prefix_caching=True,
+            prefix_caching_mamba_gb=0.01,
+            block_size_tokens=block_size,
+            max_tokens=max_tokens,
+            max_requests=max_requests,
+            vocab_size=vocab_size,
+            max_sequence_length=max_sequence_length,
+            buffer_size_gb=buffer_size_gb,
+            seed=seed,
+        )
+
+        def make_req(req_id, prompt):
+            return DynamicInferenceRequest(
+                request_id=req_id,
+                prompt_tokens=prompt.clone(),
+                sampling_params=SamplingParams(
+                    num_tokens_to_generate=num_tokens_to_generate,
+                    termination_id=-1,
+                ),
+                block_size_tokens=block_size,
+                enable_prefix_caching=True,
+            )
+
+        # --- Simultaneous run: A first, then B and C together ---
+        Utils.destroy_model_parallel()
+        Utils.initialize_model_parallel(
+            tensor_model_parallel_size=1, pipeline_model_parallel_size=1
+        )
+        engine_sim, _ = _build_engine(**engine_kwargs)
+        _install_deterministic_mock_forward(engine_sim, vocab_size)
+
+        # Run A to completion (populates Mamba state cache)
+        results_a_sim = _run_to_completion(engine_sim, [make_req(0, prompt_a)])
+        assert 0 in results_a_sim
+
+        # Run B and C simultaneously (both should get restored Mamba states)
+        engine_sim._add_request(make_req(1, prompt_b))
+        engine_sim._add_request(make_req(2, prompt_c))
+        results_bc_sim = {}
+        while engine_sim.has_unfinished_requests():
+            engine_sim.schedule_waiting_requests()
+            result = engine_sim.step_modern()
+            for record in result["finished_request_records"]:
+                finished = record.merge()
+                results_bc_sim[finished.request_id] = list(finished.generated_tokens)
+
+        assert 1 in results_bc_sim, "Request B did not complete"
+        assert 2 in results_bc_sim, "Request C did not complete"
+
+        # --- Individual run: A then B alone ---
+        Utils.destroy_model_parallel()
+        Utils.initialize_model_parallel(
+            tensor_model_parallel_size=1, pipeline_model_parallel_size=1
+        )
+        engine_b, _ = _build_engine(**engine_kwargs)
+        _install_deterministic_mock_forward(engine_b, vocab_size)
+
+        _run_to_completion(engine_b, [make_req(0, prompt_a)])
+        results_b_individual = _run_to_completion(engine_b, [make_req(1, prompt_b)])
+
+        # --- Individual run: A then C alone ---
+        Utils.destroy_model_parallel()
+        Utils.initialize_model_parallel(
+            tensor_model_parallel_size=1, pipeline_model_parallel_size=1
+        )
+        engine_c, _ = _build_engine(**engine_kwargs)
+        _install_deterministic_mock_forward(engine_c, vocab_size)
+
+        _run_to_completion(engine_c, [make_req(0, prompt_a)])
+        results_c_individual = _run_to_completion(engine_c, [make_req(2, prompt_c)])
+
+        # --- Assertions ---
+        assert results_bc_sim[1] == results_b_individual[1], (
+            f"Request B mismatch:\n"
+            f"  simultaneous: {results_bc_sim[1]}\n"
+            f"  individual:   {results_b_individual[1]}"
+        )
+        assert results_bc_sim[2] == results_c_individual[2], (
+            f"Request C mismatch:\n"
+            f"  simultaneous: {results_bc_sim[2]}\n"
+            f"  individual:   {results_c_individual[2]}"
+        )
+
+        # Verify non-trivial output
+        assert len(results_bc_sim[1]) == num_tokens_to_generate
+        assert len(results_bc_sim[2]) == num_tokens_to_generate
