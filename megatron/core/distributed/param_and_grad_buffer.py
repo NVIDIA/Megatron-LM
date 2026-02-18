@@ -347,7 +347,8 @@ class _ParamAndGradBucketGroup:
             if self.ddp_config.reuse_grad_buf_for_mxfp8_param_ag:
                 for bucket in self.buckets:
                     for param in bucket.params:
-                        # bf16 weights are already mapped to param.data
+                        # Skip copying since bf16 weights in the mxfp8 model
+                        # are already mapped to param.data.
                         if not is_mxfp8tensor(param) and not is_float8tensor(param):
                             is_bf16_weight_group = True
                             break
@@ -827,7 +828,8 @@ class _ParamAndGradBuffer:
         cur_bucket_id = 0
         for param in params[::-1]:
             param_start_index, param_end_index, bucket_id = self.param_index_map[param]
-            # For MXFP8 param: we only need to map bf16 weights (layernorm, embedding, etc) to the buffer.
+            # For MXFP8 param:
+            # we only need to map bf16 weights (layernorm, embedding, etc) to the buffer.
             if self.ddp_config.reuse_grad_buf_for_mxfp8_param_ag:
                 if not is_mxfp8tensor(param) and not is_float8tensor(param):
                     if self.param_data is not None:
