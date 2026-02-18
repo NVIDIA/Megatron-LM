@@ -33,6 +33,7 @@ class MegatronLocal(InferenceServer, ReturnsTokens, ReturnsRaw):
     _server_task: asyncio.Task = PrivateAttr(None)
     _client: InferenceClient = PrivateAttr(None)
     _inference_engine: DynamicInferenceEngine = PrivateAttr(None)
+    _openai_client: "AsyncOpenAI" = PrivateAttr(None)
 
     async def base_generate(self, request: InferenceRequest) -> InferenceResponse:
 
@@ -40,13 +41,10 @@ class MegatronLocal(InferenceServer, ReturnsTokens, ReturnsRaw):
         tokenizer = get_tokenizer()
         args = get_args()
 
-        from openai import AsyncOpenAI
-        client = AsyncOpenAI(base_url=f"http://{self.host}:{self.port}", api_key="NONE")
-
         # Things that may be problematic when doign this switch
         # - Add BOS token
         # - Skip prompt logprobs
-        response = await client.chat.completions.create(
+        response = await self._openai_client.chat.completions.create(
             model="",
             messages=[message.model_dump() for message in request.prompt],
             temperature=request.generation_args.temperature or 1.0,
@@ -106,10 +104,33 @@ class MegatronLocal(InferenceServer, ReturnsTokens, ReturnsRaw):
             client = None
             server_task = None
             
+        import httpx
+        from openai import AsyncOpenAI
+
+        try:
+            import h2  # noqa: F401
+            use_http2 = True
+        except ImportError:
+            use_http2 = False
+
         launched_server = cls(**kwargs)
         launched_server._client = client
         launched_server._server_task = server_task
         launched_server._inference_engine = inference_engine
+        launched_server._openai_client = AsyncOpenAI(
+            base_url=f"http://{kwargs['host']}:{kwargs['port']}",
+            api_key="NONE",
+            timeout=httpx.Timeout(connect=30.0, read=600, write=600, pool=600),
+            max_retries=5,
+            http_client=httpx.AsyncClient(
+                http2=use_http2,
+                limits=httpx.Limits(
+                    max_connections=8192,
+                    max_keepalive_connections=8192,
+                    keepalive_expiry=30,
+                ),
+            ),
+        )
 
         return launched_server
 
