@@ -492,6 +492,8 @@ class DistributedDataParallel(_BaseDataParallel):
                 if self.ddp_config.reuse_grad_buf_for_mxfp8_param_ag:
                     for bucket in bucket_group.buckets:
                         for param in bucket.params:
+                            # Skip copying since bf16 weights in the mxfp8 model
+                            # are already mapped to param.data.
                             if not is_mxfp8tensor(param) and not is_float8tensor(param):
                                 is_bf16_weight_group = True
                                 break
