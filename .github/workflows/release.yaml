@@ -30,11 +30,6 @@ on:
         required: true
         default: true
         type: boolean
-      create-gh-release:
-        description: Create a GitHub release
-        required: true
-        default: true
-        type: boolean
       generate-changelog:
         description: Generate changelog
         required: false

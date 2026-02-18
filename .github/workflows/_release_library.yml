@@ -42,7 +42,7 @@ on:
         required: false
         description: Use release-changelog-builder-action to dynamically build changelog
         type: boolean
-        default: false
+        default: true
       gh-release-changelog-config:
         required: false
         description: Path to changelog builder configuration file
