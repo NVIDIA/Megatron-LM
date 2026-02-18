@@ -11,7 +11,6 @@ Demonstrates using multiple layer configurations:
 - SmallMoE: 32 experts (top-2), bf16, custom parallelism
 """
 
-import torch
 
 from megatron.core.models.hl import (
     AttentionLayerConfig,
@@ -66,7 +65,7 @@ GlobalAttention = AttentionLayerConfig(
     num_query_groups=2,
     kv_channels=128,
     use_flash_attention=True,
-    dtype=torch.float8_e4m3fn,  # Override: use FP8 for faster attention
+    dtype="float8_e4m3fn",  # Override: use FP8 for faster attention
 )
 
 SlidingAttention = AttentionLayerConfig(
@@ -93,7 +92,7 @@ LargeMoE = MoELayerConfig(
     activation="squared_relu",
     token_dispatcher_type="allgather",
     grouped_gemm=True,
-    dtype=torch.float8_e4m3fn,  # Override: FP8 for expert computation
+    dtype="float8_e4m3fn",  # Override: FP8 for expert computation
 )
 
 SmallMoE = MoELayerConfig(
