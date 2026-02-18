@@ -59,7 +59,7 @@ MODEL_OPTIONS="\
   --ckpt-format torch_dist \
   --seq-length $MAX_SEQ_LENGTH \
   --inference-max-seq-length $MAX_SEQ_LENGTH \
-  --inference-max-batch-size $MAX_INFERENCE_BS \
+  --inference-max-requests $MAX_INFERENCE_BS \
   --pretrained-checkpoint $CHECKPOINT \
   --untie-embeddings-and-output-weights \
   --disable-bias-linear \
@@ -85,6 +85,7 @@ MODEL_OPTIONS="\
   --max-position-embeddings 131072 \
   --tokenizer-type HuggingFaceTokenizer \
   --tokenizer-model unsloth/Qwen2.5-32B \
+  --tokenizer-hf-include-special-tokens \
   --lr 1e-6 \
   --lr-warmup-samples 0 \
   --make-vocab-size-divisible-by 128 \
