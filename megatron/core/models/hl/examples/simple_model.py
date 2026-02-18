@@ -13,14 +13,36 @@ This example demonstrates:
 - CommonLayerConfig for shared settings with per-layer overrides
 """
 
+from dataclasses import dataclass
+
 from megatron.core.models.hl import (
     AttentionLayerConfig,
     CommonLayerConfig,
     CrossEntropyLayerConfig,
     EmbeddingLayerConfig,
     HLModelConfig,
+    make_args_container,
     MLPLayerConfig,
 )
+
+import tyro
+
+# =============================================================================
+# ARGUMENTS
+# =============================================================================
+
+@dataclass
+class ExtraArgs:
+    num_attention_heads: int = 32
+
+
+ArgsContainer = make_args_container(
+    hl_model_config=HLModelConfig,
+    common_layer_config=CommonLayerConfig,
+    extra_args=ExtraArgs,
+)
+
+args = tyro.cli(ArgsContainer, default=ArgsContainer(hidden_size=4096))
 
 # =============================================================================
 # COMMON CONFIGURATION
@@ -28,7 +50,7 @@ from megatron.core.models.hl import (
 
 # Shared settings inherited by all layers (can be overridden per-layer)
 common_config = CommonLayerConfig(
-    hidden_size=4096,
+    hidden_size=args.hidden_size,
     mixed_precision_dtype="bf16",
     sequence_parallel=True,
     normalization="RMSNorm",
@@ -48,11 +70,12 @@ Embedding = EmbeddingLayerConfig(
     rotary_base=500000,
 )
 
+assert args.hidden_size % args.num_attention_heads == 0
 Attention = AttentionLayerConfig(
     common_config=common_config,
-    num_attention_heads=32,
+    num_attention_heads=args.num_attention_heads,
     num_query_groups=8,
-    kv_channels=128,
+    kv_channels=args.hidden_size // args.num_attention_heads,
     use_flash_attention=True,
 )
 

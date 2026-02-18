@@ -11,16 +11,38 @@ This example demonstrates:
 - CommonLayerConfig for shared settings with per-layer overrides
 """
 
+from dataclasses import dataclass
+
 from megatron.core.models.hl import (
     AttentionLayerConfig,
     CommonLayerConfig,
     CrossEntropyLayerConfig,
     EmbeddingLayerConfig,
     HLModelConfig,
+    make_args_container,
     MambaLayerConfig,
     MoELayerConfig,
     PipelineSplit,
 )
+
+import tyro
+
+# =============================================================================
+# ARGUMENTS
+# =============================================================================
+
+@dataclass
+class ExtraArgs:
+    num_attention_heads: int = 32
+
+
+ArgsContainer = make_args_container(
+    hl_model_config=HLModelConfig,
+    common_layer_config=CommonLayerConfig,
+    extra_args=ExtraArgs,
+)
+
+args = tyro.cli(ArgsContainer, default=ArgsContainer(hidden_size=2688))
 
 # =============================================================================
 # COMMON CONFIGURATION
@@ -28,7 +50,7 @@ from megatron.core.models.hl import (
 
 # Shared settings inherited by all layers (can be overridden per-layer)
 common_config = CommonLayerConfig(
-    hidden_size=2688,
+    hidden_size=args.hidden_size,
     mixed_precision_dtype="bf16",
     sequence_parallel=True,
     normalization="RMSNorm",

@@ -11,6 +11,7 @@ Demonstrates using multiple layer configurations:
 - SmallMoE: 32 experts (top-2), bf16, custom parallelism
 """
 
+from dataclasses import dataclass
 
 from megatron.core.models.hl import (
     AttentionLayerConfig,
@@ -19,11 +20,32 @@ from megatron.core.models.hl import (
     EmbeddingLayerConfig,
     HLModelConfig,
     LinearLayerConfig,
+    make_args_container,
     MambaLayerConfig,
     MTPLayerConfig,
     MoELayerConfig,
     PipelineSplit,
 )
+
+import tyro
+
+# =============================================================================
+# ARGUMENTS
+# =============================================================================
+
+@dataclass
+class ExtraArgs:
+    num_attention_heads: int = 32
+    large_moe_ffn_hidden_size: int = 1856
+
+
+ArgsContainer = make_args_container(
+    hl_model_config=HLModelConfig,
+    common_layer_config=CommonLayerConfig,
+    extra_args=ExtraArgs,
+)
+
+args = tyro.cli(ArgsContainer)
 
 # =============================================================================
 # COMMON CONFIGURATION
@@ -61,7 +83,7 @@ Mamba = MambaLayerConfig(
 
 GlobalAttention = AttentionLayerConfig(
     common_config=common_config,
-    num_attention_heads=32,
+    num_attention_heads=args.num_attention_heads,
     num_query_groups=2,
     kv_channels=128,
     use_flash_attention=True,
@@ -70,7 +92,7 @@ GlobalAttention = AttentionLayerConfig(
 
 SlidingAttention = AttentionLayerConfig(
     common_config=common_config,
-    num_attention_heads=32,
+    num_attention_heads=args.num_attention_heads,
     num_query_groups=2,
     kv_channels=128,
     use_flash_attention=True,
@@ -79,7 +101,7 @@ SlidingAttention = AttentionLayerConfig(
 
 LargeMoE = MoELayerConfig(
     common_config=moe_common_config,
-    ffn_hidden_size=1856,
+    ffn_hidden_size=args.large_moe_ffn_hidden_size,
     num_experts=128,
     top_k=6,
     router_score_function="sigmoid",
@@ -88,7 +110,7 @@ LargeMoE = MoELayerConfig(
     router_enable_expert_bias=True,
     router_dtype="fp32",
     moe_aux_loss_coeff=1e-4,
-    shared_expert_intermediate_size=3712,
+    shared_expert_intermediate_size=2 * args.large_moe_ffn_hidden_size,
     activation="squared_relu",
     token_dispatcher_type="allgather",
     grouped_gemm=True,
@@ -97,7 +119,7 @@ LargeMoE = MoELayerConfig(
 
 SmallMoE = MoELayerConfig(
     common_config=moe_common_config.update(expert_model_parallel_size=4),
-    ffn_hidden_size=3712,
+    ffn_hidden_size=2 * args.large_moe_ffn_hidden_size,
     num_experts=32,
     top_k=2,
     router_score_function="softmax",
