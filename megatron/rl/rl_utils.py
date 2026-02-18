@@ -261,8 +261,8 @@ GroupedRollouts = list[Rollouts]
 @dataclass(slots=True)
 class RolloutStats:
     rewards: list[list[float]] # inner list is for a group
-    env_ids: list[int] # same length as len(rewards)
-    turn_lens: list[list[int]] # 
+    env_ids: list[str] # same length as len(rewards)
+    turn_lens: list[list[int]] # token lengths of turns, grouped.
     traj_lens: list[list[int]] # all turns comprise one trajectory.
     num_turns: None | list[list[int]] # num_turns per traj
     advantages: None | list[list[float]]
@@ -811,7 +811,7 @@ def prep_wandb_metrics(
         num_turns: Grouped list of number of turns in the trajectories.
         advantages: Flattened list of advantages.
         tokenizer: Tokenizer to untokenize trajectories for logging.
-        example_groups: A dict with values as list of rollouts of one group to log examples of trajectories. Keys are env names.
+        example_groups: A list of rollouts of one group to log examples of trajectories.
     """
 
     group_table = wandb_writer.Table(
@@ -914,23 +914,23 @@ def maybe_log_training_metrics(
     metrics = metrics | prep_wandb_metrics(wandb_writer=wandb_writer, 
         traj_lens=traj_lens, turn_lens=turn_lens, rewards=rewards, num_turns=num_turns, advantages=advantages)  
     env_stats = lambda cont, idx: [cont[i] for i in idx]
+    group_turn_counts = [sum(nt) for nt in num_turns]
+
     for env_id in set(group_stats.env_ids):
         env_idx = [i for i, eidx in enumerate(group_stats.env_ids) if eidx == env_id]
 
         # Advantages are flattened, we need to be more careful with those.
-        group_turn_counts = [sum(nt) for nt in num_turns]
         env_advantages = []
         for i in env_idx:
             st = sum(group_turn_counts[:i])
             end = st + group_turn_counts[i]
             env_advantages.extend(advantages[st:end])
 
-
         env_metrics = prep_wandb_metrics(wandb_writer=wandb_writer, traj_lens=env_stats(traj_lens, env_idx), 
             turn_lens=env_stats(turn_lens, env_idx), 
             rewards=env_stats(rewards, env_idx),
             num_turns=env_stats(num_turns, env_idx),
-            advantages=env_stats(advantages, env_idx),
+            advantages=env_advantages,
             example_group=example_groups[env_id],
             tokenizer=tokenizer,
         )
