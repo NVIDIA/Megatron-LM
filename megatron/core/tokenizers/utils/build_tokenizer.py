@@ -59,6 +59,7 @@ def build_tokenizer(args, **kwargs):
         kwargs['include_special_tokens'] = args.tokenizer_hf_include_special_tokens
     elif args.tokenizer_type == 'MultimodalTokenizer':
         tokenizer_library = 'multimodal'
+        tokenizer_path = args.tokenizer_model
         kwargs['prompt_format'] = args.tokenizer_prompt_format
         kwargs['special_tokens'] = args.special_tokens
         kwargs['image_tag_type'] = args.image_tag_type
