@@ -56,8 +56,6 @@ on:
     secrets:
       TWINE_PASSWORD:
         required: true
-      SLACK_WEBHOOK_ADMIN:
-        required: true
       SLACK_WEBHOOK:
         required: true
       PAT:
