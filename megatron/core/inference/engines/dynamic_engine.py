@@ -600,7 +600,7 @@ class DynamicInferenceEngine(AbstractEngine):
         with self.__class__.suspend_resume_ctx(
             "suspended", unified_memory_level=self.unified_memory_level
         ):
-            self.context.deinitialize_inference_state_buffers()
+            self.context.deallocate_inference_state_buffers()
 
         if (
             self.context.kv_cache_management_mode != KVCacheManagementMode.PERSIST

@@ -744,7 +744,7 @@ class DynamicInferenceContext(BaseInferenceContext):
             self.is_tensor_state_allocated = False
             self.initialize_all_tensors()
 
-    def deinitialize_inference_state_buffers(self):
+    def deallocate_inference_state_buffers(self):
         """Deallocate large tensors (KV cache, Mamba states) during suspend.
 
         Called by the engine during `suspend()`. Mirror to `reinitialize_inference_state_buffers()`.
