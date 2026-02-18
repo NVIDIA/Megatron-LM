@@ -11,9 +11,53 @@ from megatron.core.ssm.mamba_hybrid_layer_allocation import (
     get_hybrid_total_layer_count,
     get_hybrid_total_pipeline_segment_count,
     parse_hybrid_pattern,
+    pattern_from_ratios,
     select_pipeline_segment,
     validate_segment_layers,
 )
+
+
+@pytest.mark.internal
+class TestPatternFromRatios:
+
+    def test_pure_mamba(self):
+        result = pattern_from_ratios(8, attention_ratio=0.0, mlp_ratio=0.0)
+        assert result == "MMMMMMMM"
+
+    def test_attention_only(self):
+        result = pattern_from_ratios(10, attention_ratio=0.3)
+        assert result.count(Symbols.ATTENTION) == 3
+        assert result.count(Symbols.MAMBA) == 7
+        assert len(result) == 10
+
+    def test_attention_and_mlp(self):
+        result = pattern_from_ratios(10, attention_ratio=0.3, mlp_ratio=0.3)
+        assert result.count(Symbols.ATTENTION) == 3
+        assert result.count(Symbols.MLP) == 3
+        assert result.count(Symbols.MAMBA) == 4
+        assert len(result) == 10
+
+    def test_attention_evenly_spaced(self):
+        result = pattern_from_ratios(10, attention_ratio=0.5)
+        assert result.count(Symbols.ATTENTION) == 5
+        assert result.count(Symbols.MAMBA) == 5
+        for i, ch in enumerate(result):
+            if ch == Symbols.ATTENTION:
+                assert i % 2 == 1, f"Attention at odd positions, got {i}"
+
+    def test_mlp_does_not_replace_attention(self):
+        result = pattern_from_ratios(10, attention_ratio=0.3, mlp_ratio=0.3)
+        attn_positions = [i for i, c in enumerate(result) if c == Symbols.ATTENTION]
+        mlp_positions = [i for i, c in enumerate(result) if c == Symbols.MLP]
+        assert not set(attn_positions) & set(mlp_positions)
+
+    def test_single_layer(self):
+        assert pattern_from_ratios(1, 0.0, 0.0) == "M"
+        assert pattern_from_ratios(1, 1.0, 0.0) == "*"
+
+    def test_returns_string(self):
+        result = pattern_from_ratios(4, 0.5)
+        assert isinstance(result, str)
 
 
 @pytest.mark.internal

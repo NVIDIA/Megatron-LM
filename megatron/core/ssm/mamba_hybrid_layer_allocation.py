@@ -56,6 +56,60 @@ class ParsedHybridPattern:
     mtp_num_depths: int
 
 
+def pattern_from_ratios(
+    num_layers: int, attention_ratio: float = 0.0, mlp_ratio: float = 0.0
+) -> str:
+    """Convert deprecated ratio arguments to a layer pattern string.
+
+    Generates an evenly-spaced hybrid layer pattern from target attention and MLP
+    ratios. This exists for backward compatibility with code that uses the deprecated
+    hybrid_attention_ratio and hybrid_mlp_ratio parameters.
+
+    Args:
+        num_layers: Total number of layers.
+        attention_ratio: Target ratio of attention layers to total layers.
+        mlp_ratio: Target ratio of MLP layers to total layers.
+
+    Returns:
+        A layer pattern string (e.g., "MMM*MMM*MM").
+    """
+    assert num_layers > 0
+    assert 0.0 <= attention_ratio <= 1.0
+    assert 0.0 <= mlp_ratio <= 1.0
+    assert attention_ratio + mlp_ratio <= 1.0
+
+    # Allocate attention layers (evenly spaced, starting and ending with mamba)
+    attention_count = round(num_layers * attention_ratio)
+    mamba_count = num_layers - attention_count
+    sections = attention_count + 1
+    section_len = mamba_count / sections
+
+    layer_types = [Symbols.MAMBA] * num_layers
+    x = section_len
+    for i in range(num_layers):
+        if x < 0.5:
+            layer_types[i] = Symbols.ATTENTION
+            x += section_len
+        else:
+            x -= 1
+
+    # Allocate MLP layers (evenly distributed, not replacing attention)
+    mlp_count = round(num_layers * mlp_ratio)
+    if mlp_count > 0:
+        mamba_count -= mlp_count
+        ratio = mamba_count / mlp_count
+        x = ratio
+        for i in range(num_layers):
+            if layer_types[i] == Symbols.MAMBA:
+                if x < 0.5:
+                    layer_types[i] = Symbols.MLP
+                    x += ratio
+                else:
+                    x -= 1
+
+    return ''.join(layer_types)
+
+
 def get_hybrid_total_layer_count(pattern: str) -> int:
     """Returns the total number of main decoder layers in a hybrid layer pattern.
 

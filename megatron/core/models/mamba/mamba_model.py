@@ -48,9 +48,11 @@ class MambaModel(LanguageModule):
                 - "M*M*/MM/MM" -> main="M*M*", mtp="MM", 2 depths
                 - "M-M-|M-M*-|M-M-|M-M*-" -> 4 pipeline segments
         hybrid_attention_ratio (float, optional): Deprecated. Use hybrid_layer_pattern instead.
-            Raises ValueError if set to a non-None value.
+            If set to a value > 0.0 and hybrid_layer_pattern is None, a pattern will be
+            generated from the ratio with a deprecation warning.
         hybrid_mlp_ratio (float, optional): Deprecated. Use hybrid_layer_pattern instead.
-            Raises ValueError if set to a non-None value.
+            If set to a value > 0.0 and hybrid_layer_pattern is None, a pattern will be
+            generated from the ratio with a deprecation warning.
         hybrid_override_pattern (str, optional): Deprecated. Use hybrid_layer_pattern instead.
             If set and hybrid_layer_pattern is None, the value is copied to hybrid_layer_pattern
             with a deprecation warning.
@@ -118,14 +120,23 @@ class MambaModel(LanguageModule):
         self.vp_stage = vp_stage
 
         # Backward compatibility for deprecated hybrid parameters
-        if hybrid_attention_ratio is not None:
-            raise ValueError(
-                "hybrid_attention_ratio has been deprecated. Use hybrid_layer_pattern instead."
+        if (hybrid_attention_ratio is not None and hybrid_attention_ratio > 0.0) or (
+            hybrid_mlp_ratio is not None and hybrid_mlp_ratio > 0.0
+        ):
+            warnings.warn(
+                "hybrid_attention_ratio and hybrid_mlp_ratio have been deprecated. "
+                "Use hybrid_layer_pattern instead.",
+                DeprecationWarning,
+                stacklevel=2,
             )
-        if hybrid_mlp_ratio is not None:
-            raise ValueError(
-                "hybrid_mlp_ratio has been deprecated. Use hybrid_layer_pattern instead."
-            )
+            if self.hybrid_layer_pattern is None:
+                from megatron.core.ssm.mamba_hybrid_layer_allocation import pattern_from_ratios
+
+                attn_ratio = hybrid_attention_ratio if hybrid_attention_ratio else 0.0
+                mlp_ratio = hybrid_mlp_ratio if hybrid_mlp_ratio else 0.0
+                self.hybrid_layer_pattern = pattern_from_ratios(
+                    config.num_layers, attn_ratio, mlp_ratio
+                )
         if hybrid_override_pattern is not None:
             if hybrid_layer_pattern is None:
                 warnings.warn(
