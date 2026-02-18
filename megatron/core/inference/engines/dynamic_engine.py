@@ -613,7 +613,7 @@ class DynamicInferenceEngine(AbstractEngine):
         # only if they are marked for recompute (their KV cache will be gone).
         waiting_request_ids = list(self.waiting_request_ids)
         active_request_ids = set(self.requests.keys()) - set(waiting_request_ids)
-        if self.context_kv_cache_management_mode == KVCacheManagementMode.RECOMPUTE:
+        if self.context.kv_cache_management_mode == KVCacheManagementMode.RECOMPUTE:
             recompute_active_ids = active_request_ids
         else:
             recompute_active_ids = set()
