@@ -268,13 +268,11 @@ def _roll_tensor_packed_seq(tensor, shifts, dims, packed_seq_params, cp_group=No
         # the idx has been multiplied by cp_size, need to divide it by cp_size to get the local idx
         local_start_idx = start_idx // cp_size
         local_end_idx = end_idx // cp_size
-        
         # Skip empty sequences - this can happen when a sequence is very short and
         # after dividing by cp_size, the local slice has zero length
         local_seq_len = local_end_idx - local_start_idx
         if local_seq_len == 0:
             continue
-            
         tensor_slice = rolled_tensor[..., local_start_idx:local_end_idx].clone()
 
         # The following code is very similar as the code in roll_tensor function
