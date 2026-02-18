@@ -42,8 +42,7 @@ jobs:
     with:
       no-publish: true
     secrets:
-      SVC_PYPI_TOKEN: ${{ secrets.SVC_PYPI_TOKEN }}
-      SVC_PYPI_TEST_TOKEN: ${{ secrets.SVC_PYPI_TEST_TOKEN }}
+      TWINE_PASSWORD: ${{ (github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/heads/r')) && secrets.SVC_PYPI_TOKEN || secrets.SVC_PYPI_TEST_TOKEN }}
 
   build-test-publish-wheel-summary:
     needs: [pre-flight, build-test-publish-wheels]
