@@ -120,6 +120,20 @@ class MambaModel(LanguageModule):
         self.vp_stage = vp_stage
 
         # Backward compatibility for deprecated hybrid parameters
+        if hybrid_override_pattern is not None:
+            if hybrid_layer_pattern is None:
+                warnings.warn(
+                    "hybrid_override_pattern has been deprecated. "
+                    "Use hybrid_layer_pattern instead.",
+                    DeprecationWarning,
+                    stacklevel=2,
+                )
+                self.hybrid_layer_pattern = hybrid_override_pattern
+            else:
+                raise ValueError(
+                    "hybrid_override_pattern and hybrid_layer_pattern cannot both be set. "
+                    "hybrid_override_pattern has been deprecated; use hybrid_layer_pattern instead."
+                )
         if (hybrid_attention_ratio is not None and hybrid_attention_ratio > 0.0) or (
             hybrid_mlp_ratio is not None and hybrid_mlp_ratio > 0.0
         ):
@@ -136,20 +150,6 @@ class MambaModel(LanguageModule):
                 mlp_ratio = hybrid_mlp_ratio if hybrid_mlp_ratio else 0.0
                 self.hybrid_layer_pattern = pattern_from_ratios(
                     config.num_layers, attn_ratio, mlp_ratio
-                )
-        if hybrid_override_pattern is not None:
-            if hybrid_layer_pattern is None:
-                warnings.warn(
-                    "hybrid_override_pattern has been deprecated. "
-                    "Use hybrid_layer_pattern instead.",
-                    DeprecationWarning,
-                    stacklevel=2,
-                )
-                self.hybrid_layer_pattern = hybrid_override_pattern
-            else:
-                raise ValueError(
-                    "hybrid_override_pattern and hybrid_layer_pattern cannot both be set. "
-                    "hybrid_override_pattern has been deprecated; use hybrid_layer_pattern instead."
                 )
 
         # Parse unified pattern to extract main and MTP components, and
