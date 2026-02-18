@@ -1682,10 +1682,7 @@ class TestDynamicInferenceEngine:
         # Suspend.
         engine.suspend()
         assert engine.is_suspended
-        if deallocates:
-            assert not context.is_tensor_state_allocated
-        else:
-            assert context.is_tensor_state_allocated
+        assert not context.is_tensor_state_allocated
 
         gc.collect()
         torch.cuda.empty_cache()
