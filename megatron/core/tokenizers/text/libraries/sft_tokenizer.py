@@ -20,7 +20,9 @@ identity_template = """{% for message in messages %}{{ message['content'] }}{% e
 # fmt: on
 
 
-IGNORE_INDEX = -100
+from megatron.core.datasets.megatron_tokenizer import MegatronLegacyTokenizer
+from megatron.training.datasets.sft_dataset import IGNORE_INDEX
+from megatron.training.tokenizer.multimodal_tokenizer import PromptConfig
 
 
 @dataclass
