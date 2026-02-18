@@ -647,8 +647,6 @@ class DynamicInferenceEngine(AbstractEngine):
             alloc_time = time.time() - alloc_time
 
             all_requests_readded = set(self.requests.keys()) <= set(self.resume_request_ids)
-            if all_requests_readded:
-                self.context.reset()
 
             capture_time = time.time()
             if (
