@@ -26,7 +26,10 @@ from megatron.core.transformer.spec_utils import ModuleSpec, build_module
 from megatron.core.transformer.torch_norm import LayerNormBuilder
 from megatron.core.transformer.transformer_block import TransformerBlockSubmodules
 from megatron.core.transformer.transformer_config import TransformerConfig
+<<<<<<< HEAD
 from megatron.core.typed_torch import apply_module
+=======
+>>>>>>> b19565a1ea (Reapply "Add MTP support for hybrid models (#2363)")
 from megatron.core.utils import (
     get_pg_rank,
     is_torch_min_version,
@@ -427,6 +430,10 @@ class MultiTokenPredictionLayerSubmodules:
 
     eh_proj: Union[ModuleSpec, type] = None
     mtp_model_layer: Union[ModuleSpec, type] = None
+<<<<<<< HEAD
+=======
+    layer_norm: Union[ModuleSpec, type] = None
+>>>>>>> b19565a1ea (Reapply "Add MTP support for hybrid models (#2363)")
 
 
 def get_mtp_layer_spec(
@@ -642,6 +649,7 @@ def process_mtp_loss(
     Returns:
         Tensor: Updated hidden states after MTP loss processing (first chunk only).
     """
+<<<<<<< HEAD
     hidden_states_list = torch.chunk(hidden_states, 1 + config.mtp_num_layers, dim=0)
     hidden_states = hidden_states_list[0]
 
@@ -657,6 +665,15 @@ def process_mtp_loss(
     # correctly scaled relative to the main loss gradients in finalize_model_grads.
     original_num_tokens = loss_mask.sum()
 
+=======
+    mtp_labels = labels.clone()
+    hidden_states_list = torch.chunk(hidden_states, 1 + config.mtp_num_layers, dim=0)
+    hidden_states = hidden_states_list[0]
+
+    if loss_mask is None:
+        loss_mask = torch.ones_like(mtp_labels)
+
+>>>>>>> b19565a1ea (Reapply "Add MTP support for hybrid models (#2363)")
     for mtp_layer_number in range(config.mtp_num_layers):
         mtp_logits, _ = output_layer(
             hidden_states_list[mtp_layer_number + 1],
@@ -672,17 +689,23 @@ def process_mtp_loss(
         mtp_loss = compute_language_model_loss(mtp_labels, mtp_logits)
         mtp_loss = loss_mask * mtp_loss
         if is_training:
+<<<<<<< HEAD
             mtp_loss_for_log = (
                 torch.sum(mtp_loss) / num_tokens if num_tokens > 0 else mtp_loss.new_tensor(0.0)
             )
             MTPLossLoggingHelper.save_loss_to_tracker(
                 mtp_loss_for_log,
+=======
+            MTPLossLoggingHelper.save_loss_to_tracker(
+                torch.sum(mtp_loss) / num_tokens,
+>>>>>>> b19565a1ea (Reapply "Add MTP support for hybrid models (#2363)")
                 mtp_layer_number,
                 config.mtp_num_layers,
                 avg_group=parallel_state.get_data_parallel_group(with_context_parallel=True),
             )
         mtp_loss_scale = config.mtp_loss_scaling_factor / config.mtp_num_layers
         if config.calculate_per_token_loss:
+<<<<<<< HEAD
             # When calculate_per_token_loss is enabled, finalize_model_grads will
             # divide all gradients by total_num_tokens (from main loss).
             # However, MTP has fewer valid tokens due to rolling. To ensure correct
@@ -698,6 +721,12 @@ def process_mtp_loss(
             safe_num_tokens = num_tokens.clamp(min=1)
             hidden_states = MTPLossAutoScaler.apply(
                 hidden_states, mtp_loss_scale * mtp_loss / safe_num_tokens
+=======
+            hidden_states = MTPLossAutoScaler.apply(hidden_states, mtp_loss_scale * mtp_loss)
+        else:
+            hidden_states = MTPLossAutoScaler.apply(
+                hidden_states, mtp_loss_scale * mtp_loss / num_tokens
+>>>>>>> b19565a1ea (Reapply "Add MTP support for hybrid models (#2363)")
             )
 
     return hidden_states
@@ -801,6 +830,32 @@ class MultiTokenPredictionLayer(MegatronModule):
         # 2. GPT path: single TransformerLayer
         if mtp_layer_pattern is not None and mamba_submodules is not None:
             from megatron.core.ssm.mamba_block import MambaStack
+<<<<<<< HEAD
+=======
+
+            self.mtp_model_layer = MambaStack(
+                config=self.config,
+                submodules=mamba_submodules,
+                hybrid_override_pattern=mtp_layer_pattern,
+                pre_process=True,  # Always receives input from eh_proj
+                post_layer_norm=False,  # MTP has its own final_layernorm
+                post_process=True,  # MTP layer is self-contained
+                pg_collection=pg_collection,
+                is_mtp_layer=True,
+            )
+        elif self.config.mtp_num_layers is not None:
+            # GPT path: Uses the transformer block spec for MTP layer
+            # MTP inner layers use their own layer numbering (self.layer_number = 1, 2, etc.)
+            # rather than continuing from decoder layer numbers. This is consistent with the
+            # Mamba path and ensures proper aux loss tracking in router.py.
+            self.mtp_model_layer = build_module(
+                self.submodules.mtp_model_layer,
+                config=self.config,
+                vp_stage=self.vp_stage,
+                layer_number=self.layer_number,
+                is_mtp_layer=True,
+            )
+>>>>>>> b19565a1ea (Reapply "Add MTP support for hybrid models (#2363)")
 
             self.mtp_model_layer = MambaStack(
                 config=self.config,
@@ -1069,6 +1124,15 @@ class MultiTokenPredictionLayer(MegatronModule):
             packed_seq_params=packed_seq_params,
         )
 
+        # Roll RoPE to match rolled positions (position_ids were rolled in _get_embeddings)
+        # After rolling, index i should use RoPE for position i+1
+        if rotary_pos_emb is not None:
+            rotary_pos_emb = torch.roll(rotary_pos_emb, shifts=-1, dims=0)
+        if rotary_pos_cos is not None:
+            rotary_pos_cos = torch.roll(rotary_pos_cos, shifts=-1, dims=0)
+        if rotary_pos_sin is not None:
+            rotary_pos_sin = torch.roll(rotary_pos_sin, shifts=-1, dims=0)
+
         if self.config.recompute_granularity == 'full' and self.training:
             hidden_states = self._checkpointed_forward(
                 self._proj_and_transformer_layer,
@@ -1197,8 +1261,13 @@ class MultiTokenPredictionBlock(MegatronModule):
     When `mtp_use_repeated_layer=True` in config, instead of creating N separate MTP layers,
     only 1 layer is created and applied mtp_num_layers times.
 
+<<<<<<< HEAD
     For more information, please refer to DeepSeek-V3 Technical Report
     https://arxiv.org/pdf/2412.19437.pdf
+=======
+    for more information, please refer to DeepSeek-V3 Technical Report
+    https://github.com/deepseek-ai/DeepSeek-V3/blob/main/DeepSeek_V3.pdf
+>>>>>>> b19565a1ea (Reapply "Add MTP support for hybrid models (#2363)")
     """
 
     def __init__(
