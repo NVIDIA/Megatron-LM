@@ -13,6 +13,8 @@ Demonstrates using multiple layer configurations:
 
 from dataclasses import dataclass
 
+import tyro
+
 from megatron.core.models.hl import (
     AttentionLayerConfig,
     CommonLayerConfig,
@@ -20,18 +22,17 @@ from megatron.core.models.hl import (
     EmbeddingLayerConfig,
     HLModelConfig,
     LinearLayerConfig,
-    make_args_container,
     MambaLayerConfig,
-    MTPLayerConfig,
     MoELayerConfig,
+    MTPLayerConfig,
     PipelineSplit,
+    make_args_container,
 )
-
-import tyro
 
 # =============================================================================
 # ARGUMENTS
 # =============================================================================
+
 
 @dataclass
 class ExtraArgs:
@@ -40,9 +41,7 @@ class ExtraArgs:
 
 
 ArgsContainer = make_args_container(
-    hl_model_config=HLModelConfig,
-    common_layer_config=CommonLayerConfig,
-    extra_args=ExtraArgs,
+    hl_model_config=HLModelConfig, common_layer_config=CommonLayerConfig, extra_args=ExtraArgs
 )
 
 args = tyro.cli(ArgsContainer)
@@ -148,7 +147,14 @@ PS = PipelineSplit()
 
 # Define each pipeline stage
 # Hybrid pattern with multiple layer types
-Stage1 = [Embedding, Mamba, [LargeMoE, Mamba] * 2, GlobalAttention, [SmallMoE, Mamba] * 3, SlidingAttention]
+Stage1 = [
+    Embedding,
+    Mamba,
+    [LargeMoE, Mamba] * 2,
+    GlobalAttention,
+    [SmallMoE, Mamba] * 3,
+    SlidingAttention,
+]
 Stage2 = [[LargeMoE, Mamba] * 3, SlidingAttention, [SmallMoE, Mamba] * 3, GlobalAttention]
 Stage3 = [[LargeMoE, Mamba] * 3, SlidingAttention, [SmallMoE, Mamba] * 4, GlobalAttention]
 Stage4 = [[LargeMoE, Mamba] * 4, SmallMoE, MTP, Loss]

@@ -136,5 +136,4 @@ class HLModelConfig:
     ###################
     untie_embeddings_and_output_weights = False
 
-    def build(self):
-        ...
+    def build(self): ...

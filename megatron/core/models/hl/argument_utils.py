@@ -1,7 +1,7 @@
-from argparse import ArgumentParser
 import dataclasses
 import inspect
-from typing import Any, get_args, get_origin, Literal, Type
+from argparse import ArgumentParser
+from typing import Any, Literal, Type, get_args, get_origin
 
 
 def make_args_container(**dataclses) -> Type:
@@ -27,7 +27,7 @@ def make_args_container(**dataclses) -> Type:
     ```
     """
     fields = []
-    for (name, datacls) in dataclses.items():
+    for name, datacls in dataclses.items():
         if not dataclasses.is_dataclass(datacls):
             raise TypeError(
                 f"can only create argument container from dataclasses, but `{datacls}` is not a "
@@ -43,24 +43,18 @@ def make_args_container(**dataclses) -> Type:
 
     return dataclasses.make_dataclass('ArgsContainer', fields)
 
+
 # If we use `tyro`, we don't need the functions below.
 
-def add_arguments(
-        parser: ArgumentParser,
-        datacls: Any,
-        group_title: str | None = None,
-) -> None:
+
+def add_arguments(parser: ArgumentParser, datacls: Any, group_title: str | None = None) -> None:
     try:
         fields = dataclasses.fields(datacls)
     except TypeError:
         raise TypeError("need to supply a dataclass for argument provisioning")
 
     if group_title is None:
-        group_title = (
-            datacls.__name__
-            if inspect.isclass(datacls)
-            else type(datacls).__name__
-        )
+        group_title = datacls.__name__ if inspect.isclass(datacls) else type(datacls).__name__
     parser.add_argument_group(title=group_title)
 
     for field in fields:

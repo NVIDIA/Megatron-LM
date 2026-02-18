@@ -15,21 +15,22 @@ This example demonstrates:
 
 from dataclasses import dataclass
 
+import tyro
+
 from megatron.core.models.hl import (
     AttentionLayerConfig,
     CommonLayerConfig,
     CrossEntropyLayerConfig,
     EmbeddingLayerConfig,
     HLModelConfig,
-    make_args_container,
     MLPLayerConfig,
+    make_args_container,
 )
-
-import tyro
 
 # =============================================================================
 # ARGUMENTS
 # =============================================================================
+
 
 @dataclass
 class ExtraArgs:
@@ -37,9 +38,7 @@ class ExtraArgs:
 
 
 ArgsContainer = make_args_container(
-    hl_model_config=HLModelConfig,
-    common_layer_config=CommonLayerConfig,
-    extra_args=ExtraArgs,
+    hl_model_config=HLModelConfig, common_layer_config=CommonLayerConfig, extra_args=ExtraArgs
 )
 
 args = tyro.cli(ArgsContainer, default=ArgsContainer(hidden_size=4096))
