@@ -1,6 +1,7 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
 from dataclasses import dataclass
+from enum import Enum
 from typing import List, Optional, Tuple
 
 import torch
@@ -49,6 +50,19 @@ class MambaInferenceStateConfig:
                 mamba_ssm_states_shape=mamba_ssm_states_shape,
             )
         return None
+
+
+class KVCacheManagementMode(str, Enum):
+    """Mode for handling large tensors (KV cache, Mamba states) during suspend/resume."""
+
+    PERSIST = "persist"
+    """Do not deallocate and reallocate large tensors; keep them on GPU."""
+
+    OFFLOAD = "offload"
+    """Offload large tensors to CPU during deallocation; onload during allocation."""
+
+    RECOMPUTE = "recompute"
+    """Deallocate large tensors and recompute them from scratch during allocation."""
 
 
 @dataclass
@@ -108,8 +122,11 @@ class InferenceConfig:
     Eventually, additional levels will be included to control other tensors within the context.
     """
 
-    offload_kv_cache: bool = False
-    """If True, offload KV cache during RL training."""
+    kv_cache_management_mode: KVCacheManagementMode = KVCacheManagementMode.PERSIST
+    """
+    Mode used to determine how large tensors are handled by the allocate and deallocate methods.
+    See `KVCacheManagementMode` for options.
+    """
 
     # =================================
     # CUDA graph config
@@ -130,11 +147,12 @@ class InferenceConfig:
     Whether to use CUDA graphs for non-decode steps.
     """
 
-    persist_cuda_graphs: bool = False
+    static_kv_memory_pointers: bool = False
     """
-    Whether to persist CUDA graphs when the engine is suspended.
-    If False and `unified_memory_level` is 0, CUDA graphs are deleted on `suspend()`
-    and re-captured on `resume()` to save memory.
+    Whether the KV cache (and Mamba states) will reside at the same memory addresses
+    after suspend/resume as before. When True, CUDA graphs that reference these buffers
+    remain valid across suspend/resume cycles and do not need to be recaptured.
+    Requires either UVM or `torch_memory_saver` when `kv_cache_management_mode` is not PERSIST.
     """
 
     # =================================

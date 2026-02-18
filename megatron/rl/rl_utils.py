@@ -484,9 +484,10 @@ def get_environment_rollouts(
                 model[0].offload_grad_buffers()
             else:
                 logger.warning(
-                    "Gradient buffers will not be offloaded when training cudagraphs are enabled!")
+                    "Gradient buffers will not be offloaded when training cudagraphs are used!"
+                )
             optimizer.offload_to_cpu()
-             
+
     # If we have separate training and inference models we to refit weights from the training model to the inference model.
     has_separate_inference_model = inference_model is not None
     if has_separate_inference_model:
@@ -517,10 +518,7 @@ def get_environment_rollouts(
             inference_model,
             optimizer,
             args.cuda_graph_impl,
-            args.rl_reset_cuda_graphs,
             False, # offload optimizer during rollout collection is handled above
-            args.rl_offload_kv_cache_during_training,
-            args.rl_remove_kv_cache_during_training,
             training_model=model if has_separate_inference_model else None,
         ) as inference_interface:
 
@@ -1177,7 +1175,7 @@ def prepare_data_for_update(
         lang_module = (
             model[0].module.module if hasattr(model[0].module, "module") else model[0].module
         )
-        toggle_cuda_graphs(lang_module, "none", reset_cuda_graphs=False)
+        toggle_cuda_graphs(lang_module, "none")
 
     model = model[0]
     dtype = torch.bfloat16 if args.bf16 else (torch.float16 if args.fp16 else torch.float32)
@@ -1522,10 +1520,7 @@ def evaluate_and_print_results_rl(
             model,
             optimizer,
             args.cuda_graph_impl,
-            args.rl_reset_cuda_graphs,
             args.rl_offload_optimizer_during_inference,
-            args.rl_offload_kv_cache_during_training,
-            args.rl_remove_kv_cache_during_training,
             training_model,
         ) as inference_interface:
 
@@ -1707,10 +1702,7 @@ def megatron_rl_inference_mode(
     model: list[LanguageModule],
     optimizer: MegatronOptimizer,
     cuda_graph_impl: str,
-    reset_cuda_graphs: bool,
     offload_optimizer_during_inference: bool,
-    offload_kv_cache_during_training: bool,
-    remove_kv_cache_during_training: bool,
     training_model: Optional[list[LanguageModule]] = None,
 ):
     """Manage the model inference context when collecting rollouts.
@@ -1719,10 +1711,7 @@ def megatron_rl_inference_mode(
         model: model to prepare for inference (may be separate inference model).
         optimizer: optimizer used to train the model.
         cuda_graph_impl: which cuda graph implementation to use.
-        reset_cuda_graphs: rebuild cuda graphs for each inference stage or not.
         offload_optimizer_during_inference: move optimizer to cpu during inference or not.
-        offload_kv_cache_during_training: manually offload kv cache to host before training or not.
-        remove_kv_cache_during_training: manually remove kv cache before training or not.
         training_model: training model (if separate from inference model). Used to offload
             grad buffers and restore to train mode. If None, uses model parameter.
 
@@ -1764,40 +1753,14 @@ def megatron_rl_inference_mode(
                     model_for_grad_offload[0].offload_grad_buffers()
                 else:
                     logger.warning(
-                        "Gradient buffers will not be offloaded when training cudagraphs are enabled!")
+                        "Gradient buffers will not be offloaded when training cudagraphs are used!"
+                    )
                 optimizer.offload_to_cpu()
 
-        # TODO: Remove this if statement once a change to `toggle_cuda_graphs` makes it safe to.
         if cuda_graph_impl != "none" and not args.rl_training_cuda_graphs:
-            toggle_cuda_graphs(lang_module, cuda_graph_impl, reset_cuda_graphs=reset_cuda_graphs)
+            toggle_cuda_graphs(lang_module, cuda_graph_impl)
 
         inference_interface = get_inference_interface(args, loop, model)
-
-        with nvtx_range("onload-kv-cache-before-inference"):
-            if offload_kv_cache_during_training:
-                # Restore the KV cache by re-binding physical pages to a consistent virtual address
-                torch_memory_saver.resume("kv_cache")
-
-                logger.debug(
-                    f"[{dist.get_rank()}] Restoring kv cache ({inference_interface._inference_engine.context.memory_buffer.numel() / 1024**3:.2f} GB) to GPU"
-                )
-                kv_cache = inference_interface._inference_engine.context.memory_buffer
-                inference_interface._inference_engine.context.memory_buffer = kv_cache.cuda()
-            elif remove_kv_cache_during_training:
-                if inference_interface._inference_engine.context.memory_buffer is None:
-                    inference_interface._inference_engine.context.build_memory_buffer()
-
-        # TODO: Improve this if statement once a change is made to CUDA graph handling.
-        cuda_graph_exists = len(_CudagraphGlobalRecord.cudagraph_inference_record) != 0
-        if cuda_graph_impl != "none" and not cuda_graph_exists:
-            with nvtx_range("wait-for-decode-only"):
-                while not inference_interface._inference_engine.context.is_decode_only():
-                    active_requests, finished_requests, step_time = loop.run_until_complete(
-                        inference_interface._inference_engine.async_step()
-                    )
-            with nvtx_range("build-cuda-graphs"):
-                inference_interface._inference_engine.create_cuda_graphs(reset_context=True)
-
         loop.run_until_complete(inference_interface.resume())
 
         logger.debug(f"[{dist.get_rank()}] Entered inference mode")
@@ -1806,23 +1769,11 @@ def megatron_rl_inference_mode(
         with nvtx_range("suspend-engine"):
             loop.run_until_complete(inference_interface.suspend())
 
-        with nvtx_range("offload-kv-cache-after-inference"):
-            if offload_kv_cache_during_training:
-                kv_cache = inference_interface._inference_engine.context.memory_buffer
-                logger.debug(
-                    f"[{dist.get_rank()}] Offloading kv cache ({kv_cache.numel() * kv_cache.element_size() / 1024**3:.2f} GB) to CPU"
-                )
-                torch_memory_saver.pause("kv_cache")
-
-            elif remove_kv_cache_during_training:
-                inference_interface._inference_engine.context.memory_buffer = None
-
-        # TODO: Remove this if statement once a change to `toggle_cuda_graphs` makes it safe to.
         if cuda_graph_impl != "none" and not args.rl_training_cuda_graphs:
-            toggle_cuda_graphs(lang_module, 'none', reset_cuda_graphs=reset_cuda_graphs)
+            toggle_cuda_graphs(lang_module, 'none')
 
-        # If this is a separate RL inference model, prefetch weights back to CPU so they don't consume
-        # GPU memory during training.
+        # If this is a separate RL inference model, prefetch weights back to CPU so they
+        # don't consume GPU memory during training.
         with nvtx_range("prefetch-inference-model-weights-to-cpu"):
             _maybe_prefetch_separate_inference_model_weights(model_core, to_cpu=True)
 
