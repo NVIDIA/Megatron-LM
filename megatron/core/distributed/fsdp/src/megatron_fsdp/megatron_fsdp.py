@@ -1,4 +1,4 @@
-# Copyright (c) 2025, NVIDIA CORPORATION.  All rights reserved.
+# Copyright (c) 2025-2026, NVIDIA CORPORATION.  All rights reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -102,7 +102,7 @@ class MegatronFSDP(torch.nn.Module):
         module (torch.nn.Module): Underlying Torch Module.
         dist_index (FSDPDistributedIndex): FSDPDistributedIndex object containing references to the
             process groups and device meshes used by Megatron-FSDP.
-        ddp_config (DistributedDataParallelConfig): FullyShardedDataParallel configuration dataclass
+        ddp_config (:class:`~core.distributed.distributed_data_parallel_config.DistributedDataParallelConfig`): FullyShardedDataParallel configuration dataclass
             containing a variety of Megatron-derived parameters that control the behavior of
             Megatron-FSDP.
         fsdp_unit_modules (List[torch.nn.Module] | List[str]): List of modules that
