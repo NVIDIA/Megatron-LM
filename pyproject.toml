@@ -234,6 +234,7 @@ omit = [
     "/tmp/*",
     "/workspace/tests/*",
     "/usr/local/lib/python3.12/dist-packages/*",
+    "/opt/megatron-lm/_remote_module_non_scriptable",
 ]
 parallel = true
 sigterm = false
