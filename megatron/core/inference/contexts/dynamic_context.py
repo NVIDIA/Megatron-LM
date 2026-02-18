@@ -599,6 +599,7 @@ class DynamicInferenceContext(BaseInferenceContext):
             self.kv_cache_management_mode == KVCacheManagementMode.OFFLOAD
             and not self._uses_torch_memory_saver
         ):
+            assert self.unified_memory_level == 0
             self._offloadable_tensor_names.add("memory_buffer")
             self._offloadable_cpu_backups["memory_buffer"] = torch.empty_like(
                 self.memory_buffer, device="cpu"
@@ -624,6 +625,7 @@ class DynamicInferenceContext(BaseInferenceContext):
                 self.kv_cache_management_mode == KVCacheManagementMode.OFFLOAD
                 and not self._uses_torch_memory_saver
             ):
+                assert self.unified_memory_level == 0
                 self._offloadable_tensor_names.add("mamba_conv_states")
                 self._offloadable_cpu_backups["mamba_conv_states"] = torch.empty_like(
                     self.mamba_conv_states, device="cpu"
