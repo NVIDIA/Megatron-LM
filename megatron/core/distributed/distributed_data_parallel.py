@@ -236,6 +236,9 @@ class DistributedDataParallel(_BaseDataParallel):
 
             # Set `next_param_gather_bucket_group` for different bucket groups by iterating through
             # buckets in reverse order (since all-gathers happen in reverse order of buckets).
+            # Note: overlap_param_gather covers both the distributed optimizer and the
+            # layer-wise optimizer cases; the latter sets overlap_param_gather=True
+            # without use_distributed_optimizer.
             if self.ddp_config.overlap_param_gather:
                 num_bucket_groups = len(bucket_groups)
                 for i in range(1, num_bucket_groups):
@@ -344,6 +347,9 @@ class DistributedDataParallel(_BaseDataParallel):
                     grad_acc.register_hook(self._make_backward_post_hook(param))
                     self.grad_accs.append(grad_acc)
 
+        # Note: overlap_param_gather covers both the distributed optimizer and the
+        # layer-wise optimizer cases; the latter sets overlap_param_gather=True
+        # without use_distributed_optimizer.
         self.use_forward_hook = self.ddp_config.overlap_param_gather
         self.remove_forward_pre_hook_handles = {}
         if self.use_forward_hook:

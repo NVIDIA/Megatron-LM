@@ -176,6 +176,8 @@ class _ParamAndGradBucketGroup:
         self.buckets = buckets
         self.ddp_config = ddp_config
 
+        # overlap_param_gather covers the layer-wise optimizer case, which sets
+        # overlap_param_gather=True without use_distributed_optimizer.
         if self.ddp_config.use_distributed_optimizer or self.ddp_config.overlap_param_gather:
             self.intra_distributed_optimizer_instance_group = collective_group
             self.intra_distributed_optimizer_instance_size = collective_group_size
@@ -300,6 +302,8 @@ class _ParamAndGradBucketGroup:
             force_sync (bool, optional): force synchronous collective regardless of
                 other settings if true.
         """
+        # overlap_param_gather covers the layer-wise optimizer case, which sets
+        # overlap_param_gather=True without use_distributed_optimizer.
         assert self.ddp_config.use_distributed_optimizer or self.ddp_config.overlap_param_gather
 
         if force_sync:
@@ -413,6 +417,8 @@ class _ParamAndGradBucketGroup:
             skip_next_bucket_dispatch (bool, optional): if true, dispatch next
                 bucket's communication if available.
         """
+        # overlap_param_gather covers the layer-wise optimizer case, which sets
+        # overlap_param_gather=True without use_distributed_optimizer.
         assert self.ddp_config.use_distributed_optimizer or self.ddp_config.overlap_param_gather
         assert self.ddp_config.overlap_param_gather
 
