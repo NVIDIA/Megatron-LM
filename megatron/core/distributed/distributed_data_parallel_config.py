@@ -27,9 +27,6 @@ class DistributedDataParallelConfig:
        originally allocated model parameters, otherwise issue all-reduce collectives.
     """
 
-    use_layer_wise_optimizer: bool = False
-    """If true, use layer-wise distributed optimizer for param all-gather overlap."""
-
     num_distributed_optimizer_instances: int = 1
     """Sets the factor by which the DP domain is sharded to have the partial DistOpt
        enabled. Defaults to 1, which means DistOpt is across entire DP domain.

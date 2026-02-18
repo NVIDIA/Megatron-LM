@@ -140,8 +140,8 @@ class TestLayerWiseOptimizer:
     ):
         """Create model, DDP wrapper, and optimizer with overlap-param-gather enabled.
 
-        This variant sets use_layer_wise_optimizer=True and overlap_param_gather=True
-        in DDP config and passes model_chunks=[model] + async_allgather to
+        This variant sets overlap_param_gather=True in DDP config and passes
+        model_chunks=[model] + async_allgather to
         LayerWiseDistributedOptimizer, enabling the bucket-based async param gather path.
 
         Args:
@@ -162,7 +162,6 @@ class TestLayerWiseOptimizer:
 
         ddp_config = DistributedDataParallelConfig(
             use_distributed_optimizer=False,
-            use_layer_wise_optimizer=True,
             overlap_param_gather=True,
         )
         model = DistributedDataParallel(
@@ -595,7 +594,7 @@ class TestLayerWiseOptimizer:
             self.create_model_and_optimizer_with_overlap_param_gather(async_allgather=True)
         )
 
-        # Create sync model with same weights (use_layer_wise_optimizer=True but sync allgather)
+        # Create sync model with same weights (overlap_param_gather=True but sync allgather)
         sync_model, sync_optimizer, _ = (
             self.create_model_and_optimizer_with_overlap_param_gather(
                 async_allgather=False, copy_from=overlap_model
@@ -669,11 +668,11 @@ class TestLayerWiseOptimizer:
                     )
 
     def test_overlap_param_gather_vs_standard_ddp(self):
-        """Verify DDP with use_layer_wise_optimizer=True produces same results as standard DDP.
+        """Verify DDP with overlap_param_gather=True produces same results as standard DDP.
 
         Both use LayerWiseDistributedOptimizer but with different DDP configs:
-        - Overlap path: use_layer_wise_optimizer=True (padded buffers)
-        - Standard path: use_layer_wise_optimizer=False (unpadded buffers)
+        - Overlap path: overlap_param_gather=True (padded buffers)
+        - Standard path: overlap_param_gather=False (unpadded buffers)
         """
         # Create overlap-param-gather model (sync allgather for simpler comparison)
         opg_model, opg_optimizer, pg_collection = (

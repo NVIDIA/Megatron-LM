@@ -176,7 +176,7 @@ class _ParamAndGradBucketGroup:
         self.buckets = buckets
         self.ddp_config = ddp_config
 
-        if self.ddp_config.use_distributed_optimizer or self.ddp_config.use_layer_wise_optimizer:
+        if self.ddp_config.use_distributed_optimizer or self.ddp_config.overlap_param_gather:
             self.intra_distributed_optimizer_instance_group = collective_group
             self.intra_distributed_optimizer_instance_size = collective_group_size
             self.intra_distributed_optimizer_instance_rank = collective_group.rank()
@@ -300,7 +300,7 @@ class _ParamAndGradBucketGroup:
             force_sync (bool, optional): force synchronous collective regardless of
                 other settings if true.
         """
-        assert self.ddp_config.use_distributed_optimizer or self.ddp_config.use_layer_wise_optimizer
+        assert self.ddp_config.use_distributed_optimizer or self.ddp_config.overlap_param_gather
 
         if force_sync:
             if self.param_gather_handle is not None:
@@ -312,7 +312,7 @@ class _ParamAndGradBucketGroup:
 
         async_op = self.ddp_config.overlap_param_gather and not force_sync
 
-        if self.ddp_config.use_layer_wise_optimizer:
+        if not self.ddp_config.use_distributed_optimizer:
             # Layer-wise optimizer path: do NOT use _coalescing_manager.
             #
             # torch.distributed.all_gather with a tensor-list output internally creates a
@@ -413,7 +413,7 @@ class _ParamAndGradBucketGroup:
             skip_next_bucket_dispatch (bool, optional): if true, dispatch next
                 bucket's communication if available.
         """
-        assert self.ddp_config.use_distributed_optimizer or self.ddp_config.use_layer_wise_optimizer
+        assert self.ddp_config.use_distributed_optimizer or self.ddp_config.overlap_param_gather
         assert self.ddp_config.overlap_param_gather
 
         # If current bucket's param AG has not been dispatched, dispatch it now (e.g., first
@@ -451,7 +451,7 @@ class _ParamAndGradBucketGroup:
                     # correspond to multiple param buffers. If we zero out the entire grad buffer,
                     # it would clear the data of those param buffers that have not yet completed AG.
                     bucket.param_data.zero_()
-            elif self.ddp_config.use_layer_wise_optimizer:
+            elif not self.ddp_config.use_distributed_optimizer:
                 for bucket in self.buckets:
                     # Unflatten and copy gathered params for each rank.
                     for idx, (flat_params, params) in enumerate(
