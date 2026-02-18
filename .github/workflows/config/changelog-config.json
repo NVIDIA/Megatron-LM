@@ -1,0 +1,24 @@
+{
+    "categories": [],
+    "ignore_labels": [
+      "ignore"
+    ],
+    "sort": "ASC",
+    "template": "\n${{CHANGELOG}}\n\n<details><summary>Changelog Details</summary>\n\n${{UNCATEGORIZED}}\n</details>\n",
+    "pr_template": "- ${{TITLE}} by @${{AUTHOR}} :: PR: #${{NUMBER}}",
+    "commit_template": "- ${{TITLE}} by @${{AUTHOR}}",
+    "empty_template": "${{OWNER}}\n${{REPO}}\n${{FROM_TAG}}\n${{TO_TAG}}",
+    "duplicate_filter": {
+      "pattern": ".+",
+      "on_property": "title",
+      "method": "match"
+    },
+    "transformers": [],
+    "max_tags_to_fetch": 100,
+    "max_pull_requests": 500,
+    "max_back_track_time_days": 365,
+    "exclude_merge_branches": [],
+    "tag_resolver": {
+      "method": "semver"
+    }
+}
