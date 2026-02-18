@@ -124,8 +124,8 @@ else
                 value=$(echo "$value" | sed 's/^\[//;s/\]$//')
                 TRAINING_PARAMS_FROM_CONFIG+="$key $value "
 
-            # Case: contains spaces
-            elif [[ "$value" == *" "* ]]; then
+            # Case: contains spaces or shell metacharacters
+            elif [[ "$value" == *" "* || "$value" == *"|"* ]]; then
                 TRAINING_PARAMS_FROM_CONFIG+="$key \"$value\" "
             # Case: default
             else
