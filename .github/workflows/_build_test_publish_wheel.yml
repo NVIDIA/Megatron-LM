@@ -17,9 +17,9 @@ on:
         type: boolean
         default: true
     secrets:
-      TWINE_USERNAME:
+      SVC_PYPI_TOKEN:
         required: true
-      TWINE_PASSWORD:
+      SVC_PYPI_TEST_TOKEN:
         required: true
 
 jobs:

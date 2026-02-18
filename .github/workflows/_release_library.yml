@@ -54,9 +54,9 @@ on:
         type: string
         default: ""
     secrets:
-      TWINE_USERNAME:
+      SVC_PYPI_TOKEN:
         required: true
-      TWINE_PASSWORD:
+      SVC_PYPI_TEST_TOKEN:
         required: true
       SLACK_WEBHOOK_ADMIN:
         required: true
@@ -77,8 +77,9 @@ jobs:
       ref: ${{ inputs.release-ref }}
       no-publish: true
     secrets:
-      TWINE_USERNAME: ${{ secrets.TWINE_USERNAME }}
-      TWINE_PASSWORD: ${{ secrets.TWINE_PASSWORD }}
+      TWINE_USERNAME: __token__
+      SVC_PYPI_TOKEN: ${{ secrets.SVC_PYPI_TOKEN }}
+      SVC_PYPI_TEST_TOKEN: ${{ secrets.SVC_PYPI_TEST_TOKEN }}
 
   bump-next-version:
     runs-on: ubuntu-latest
