@@ -3,6 +3,7 @@
 import asyncio
 import concurrent.futures
 import logging
+import math
 import multiprocessing
 import socket
 import struct
@@ -1277,6 +1278,52 @@ class DynamicInferenceEngine(AbstractEngine):
         if prefix_caching_enabled and pending_request_ids:
             self.waiting_request_ids.extendleft(reversed(pending_request_ids))
 
+    def _reorder_waiting_for_mamba_priority(self):
+        """Reorder waiting requests so those with restored Mamba states come first.
+
+        This ensures the token layout groups batch-kernel requests before varlen
+        requests in the prefill portion, which is required for correct Mamba state
+        handling when multiple prefill requests have initial states.
+
+        Skips the head of the queue if it's a continuing chunked prefill request.
+        """
+        is_continuing = self.context.chunked_prefill_request_id >= 0
+        start_idx = 1 if is_continuing else 0
+
+        if len(self.waiting_request_ids) - start_idx <= 1:
+            return  # Nothing to reorder
+
+        block_size = self.context.block_size_tokens
+        with_mamba = []
+        without_mamba = []
+
+        for i in range(start_idx, len(self.waiting_request_ids)):
+            req_id = self.waiting_request_ids[i]
+            req = self.get_request(req_id)
+
+            # Check if this request will have restored Mamba states
+            num_blocks = math.ceil(len(req.prompt_tokens) / block_size)
+            matched_blocks, _ = self.context._find_matching_prefix_blocks(req, 0, num_blocks)
+
+            has_mamba = False
+            if len(matched_blocks) > 0:
+                num_mamba_matched = self._find_mamba_divergence_block(matched_blocks)
+                if num_mamba_matched > 0:
+                    has_mamba = True
+
+            if has_mamba:
+                with_mamba.append(req_id)
+            else:
+                without_mamba.append(req_id)
+
+        # Rebuild the deque with reordered requests
+        new_queue = deque()
+        if is_continuing:
+            new_queue.append(self.waiting_request_ids[0])
+        new_queue.extend(with_mamba)
+        new_queue.extend(without_mamba)
+        self.waiting_request_ids = new_queue
+
     def schedule_chunked_prefill(self):
         """
         This function schedules chunked prefill requests.
@@ -1292,6 +1339,11 @@ class DynamicInferenceEngine(AbstractEngine):
                 it is during a chunked prefill
             - For each request, remaining_prompt_tokens holds the **unprefilled** prompt tokens
         """
+        # Reorder new requests so those with restored Mamba states are scheduled
+        # first, ensuring the batch-kernel token layout precedes varlen tokens.
+        if self.context.is_hybrid_model and self.context.max_mamba_cache_slots > 0:
+            self._reorder_waiting_for_mamba_priority()
+
         prefix_caching_enabled = self.context.enable_prefix_caching
         if prefix_caching_enabled:
             pending_block_hashes = set()
