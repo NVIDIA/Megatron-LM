@@ -378,10 +378,8 @@ def validate_args(args, defaults={}):
 
         # Offload mode requires CG persistence: CG recapture runs dummy forward
         # passes that corrupt the preserved KV data.
-        assert not (
-            args.cuda_graph_impl != "none"
-            and args.rl_kv_cache_management_mode == "offload"
-            and not args.rl_persist_cuda_graphs
+        assert (
+            (not args.rl_kv_cache_management_mode == "offload") or (args.rl_persist_cuda_graphs)
         ), "--rl-kv-cache-management-mode=offload requires --rl-persist-cuda-graphs"
 
         # There's no need to manually offload the KV cache with UVM.

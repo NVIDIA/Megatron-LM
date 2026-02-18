@@ -702,7 +702,7 @@ class DynamicInferenceContext(BaseInferenceContext):
         ctx_manager = nullcontext()
         if self.unified_memory_level != 0:
             ctx_manager = torch.cuda.use_mem_pool(self.unified_memory_mempool)
-        elif HAVE_TORCH_MEMORY_SAVER and (need_static_addr or offload_kv):
+        elif HAVE_TORCH_MEMORY_SAVER and need_static_addr:
             ctx_manager = torch_memory_saver.region(
                 tag="inference_context", enable_cpu_backup=offload_kv
             )
