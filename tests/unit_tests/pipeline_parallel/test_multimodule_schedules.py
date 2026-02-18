@@ -18,7 +18,10 @@ from megatron.core.hyper_comm_grid import HyperCommGrid
 from megatron.core.models.gpt.gpt_layer_specs import get_gpt_layer_with_transformer_engine_spec
 from megatron.core.pipeline_parallel.multimodule_communicator import MultiModulePipelineCommunicator
 from megatron.core.pipeline_parallel.utils import is_pp_first_stage, is_pp_last_stage
-from megatron.core.process_groups_config import ProcessGroupCollection
+from megatron.core.process_groups_config import (
+    MultiModuleProcessGroupCollection,
+    ProcessGroupCollection,
+)
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
 from megatron.core.transformer.transformer_block import TransformerBlock
 from megatron.core.transformer.transformer_config import TransformerConfig
@@ -373,18 +376,20 @@ def run_multimodule_schedule_test(
         if is_pp_first_stage(first_encoder_grid.get_pg("pp")):
             data_iterator = DataIterator(hidden_size, seq_length, micro_batch_size)
 
-    # Get process group collection for current rank
+    # Build MultiModuleProcessGroupCollection for current rank
     rank = dist.get_rank()
-    pg_collection = None
+    module_pgs = {}
+    language_model_module_name = None
     for name, grid in model.encoder_grids.items():
         if grid.rank_offset <= rank < grid.rank_offset + grid.size:
-            pg_collection = add_embedding_groups(get_pg_collection(grid))
-            break
-    if (
-        pg_collection is None
-        and model.llm_grid.rank_offset <= rank < model.llm_grid.rank_offset + model.llm_grid.size
-    ):
-        pg_collection = add_embedding_groups(get_pg_collection(model.llm_grid))
+            module_pgs[name] = add_embedding_groups(get_pg_collection(grid))
+    if model.llm_grid.rank_offset <= rank < model.llm_grid.rank_offset + model.llm_grid.size:
+        module_pgs['llm'] = add_embedding_groups(get_pg_collection(model.llm_grid))
+        language_model_module_name = 'llm'
+
+    pg_collection = MultiModuleProcessGroupCollection(
+        module_pgs=module_pgs, language_model_module_name=language_model_module_name
+    )
 
     # Define step function
     def step_func(data_iterator, model):

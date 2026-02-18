@@ -2077,7 +2077,11 @@ def forward_backward_pipelining_without_interleaving(
                 raise ValueError(
                     "config.variable_seq_lengths=True required for multi-module pipelines"
                 )
-            cp_size = pg_collection.get_language_model_cp_size()
+            if pg_collection.has_language_model():
+                cp_size = pg_collection.get_language_model_cp_size()
+            else:
+                # Encoder-only ranks: cp_size not used for loss scaling, default to 1
+                cp_size = 1
             # tp_group and cp_group stay None (variable_seq_lengths mode)
 
         elif isinstance(pg_collection, ProcessGroupCollection):
