@@ -125,7 +125,6 @@ class RequestEntry:
 
     record: DynamicInferenceRequestRecord
     future: asyncio.Future
-    recompute_upon_suspend: bool = False
 
 
 # pylint: disable=line-too-long
@@ -615,9 +614,10 @@ class DynamicInferenceEngine(AbstractEngine):
         # only if they are marked for recompute (their KV cache will be gone).
         waiting_request_ids = list(self.waiting_request_ids)
         active_request_ids = set(self.requests.keys()) - set(waiting_request_ids)
-        recompute_active_ids = [
-            rid for rid in active_request_ids if self.requests[rid].recompute_upon_suspend
-        ]
+        if self.context_kv_cache_management_mode == KVCacheManagementMode.RECOMPUTE:
+            recompute_active_ids = active_request_ids
+        else:
+            recompute_active_ids = set()
         self.resume_request_ids = [*recompute_active_ids, *waiting_request_ids]
         self.waiting_request_ids.clear()
 
@@ -662,7 +662,6 @@ class DynamicInferenceEngine(AbstractEngine):
             for request_id in self.resume_request_ids:
                 request_entry = self.requests[request_id]
                 self._add_request(self.get_request(request_id))
-                request_entry.recompute_upon_suspend = False
             torch.cuda.synchronize()
             add_time = time.time() - add_time
 
