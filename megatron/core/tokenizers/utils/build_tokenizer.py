@@ -29,9 +29,9 @@ def build_tokenizer(args, **kwargs):
             kwargs = special_tokens
         kwargs['vocab_file'] = args.vocab_file
         kwargs['merges_file'] = args.merge_file
-        kwargs['use_fast'] = args.tokenizer_hf_use_fast
+        kwargs['use_fast'] = not args.tokenizer_hf_no_use_fast
         kwargs['trust_remote_code'] = args.trust_remote_code
-        kwargs['include_special_tokens'] = args.tokenizer_hf_include_special_tokens
+        kwargs['include_special_tokens'] = not args.tokenizer_hf_no_include_special_tokens
     elif args.tokenizer_type in SP_TOKENIZERS:
         tokenizer_library = 'sentencepiece'
         tokenizer_path = args.tokenizer_model
@@ -54,9 +54,9 @@ def build_tokenizer(args, **kwargs):
         kwargs['additional_special_tokens'] = (
             args.tokenizer_special_tokens if args.tokenizer_special_tokens else []
         )
-        kwargs['use_fast'] = args.tokenizer_hf_use_fast
+        kwargs['use_fast'] = not args.tokenizer_hf_no_use_fast
         kwargs['trust_remote_code'] = args.trust_remote_code
-        kwargs['include_special_tokens'] = args.tokenizer_hf_include_special_tokens
+        kwargs['include_special_tokens'] = not args.tokenizer_hf_no_include_special_tokens
     elif args.tokenizer_type == 'MultimodalTokenizer':
         tokenizer_library = 'multimodal'
         kwargs['prompt_format'] = args.tokenizer_prompt_format
