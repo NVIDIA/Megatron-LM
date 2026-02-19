@@ -240,7 +240,7 @@ def average_losses_across_data_parallel_group(losses):
     return averaged_losses
 
 
-def reduce_max_stat_across_model_parallel_group(stat: float) -> float:
+def reduce_max_stat_across_model_parallel_group(stat: float) -> float | None:
     """
     Ranks without an optimizer will have no grad_norm or num_zeros_in_grad stats.
     We need to ensure the logging and writer rank has those values.
@@ -255,6 +255,7 @@ def reduce_max_stat_across_model_parallel_group(stat: float) -> float:
         stat, op=torch.distributed.ReduceOp.MAX, group=mpu.get_model_parallel_group()
     )
     if stat.item() == -1.0:
+        # No rank has a valid stat, so return None to indicate that it is None across all ranks.
         return None
     else:
         return stat.item()
@@ -646,7 +647,6 @@ def get_batch_on_this_tp_rank(data_iterator, mtp_on_this_rank: bool = False):
             )
         else:
             max_seqlen = None
-
         local_cp_size = torch.empty(
             1,
             dtype=torch.int32,
@@ -700,7 +700,6 @@ def get_batch_on_this_tp_rank(data_iterator, mtp_on_this_rank: bool = False):
             _broadcast(labels)
             _broadcast(loss_mask)
             _broadcast(attention_mask)
-
 
         batch = {
             'tokens': tokens,

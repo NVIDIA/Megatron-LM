@@ -34,7 +34,7 @@ from megatron.core.inference.sampling_params import SamplingParams
 from megatron.core.inference.text_generation_controllers.text_generation_controller import (
     TextGenerationController,
 )
-from megatron.core.tokenizers.text.utils.build_tokenizer import build_tokenizer
+from megatron.core.tokenizers.utils.build_tokenizer import build_tokenizer
 from megatron.inference.utils import (
     add_inference_args,
     get_inference_config_from_model_and_args,
@@ -195,6 +195,8 @@ def run_inference(
                 request.request_id = finished_request.request_id
                 request.events = finished_request.events
 
+                request.ttft = finished_request.ttft
+
                 # Update prompt, in case engine has been suspended and resumed.
                 request.prompt_tokens = finished_request.prompt_tokens.tolist()
                 request.prompt_text = finished_request.prompt
@@ -257,10 +259,9 @@ def main():
     configure_nvtx_profiling(True)
 
     args = get_args()
-    if args.legacy_tokenizer:
-        tokenizer = get_tokenizer()
-    else:
-        tokenizer = build_tokenizer(args)
+
+    # Build tokenizer
+    tokenizer = build_tokenizer(args)
 
     # Reset peak memory stats so functional tests measure this run and not
     # whatever happened earlier during initialization.
@@ -410,6 +411,7 @@ def main():
                         "generated_text": req.output_text,
                         "generated_tokens": req.output_tokens,
                         "latency": req.time_end - req.time_start,
+                        "ttft": req.ttft,  # Time-to-first-token in seconds
                         "cuda_graph_request_count_map": result["cuda_graph_request_count_map"],
                         "step_count": engine.step_count,
                         "top_n_logprobs": getattr(req, 'generated_top_n_logprobs', None),

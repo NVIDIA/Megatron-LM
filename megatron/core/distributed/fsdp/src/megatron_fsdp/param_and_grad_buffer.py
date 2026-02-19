@@ -2473,6 +2473,8 @@ class ParamAndGradBuffer:
             self.param_to_direct_module[new_param] = self.param_to_direct_module[old_param]
             del self.param_to_direct_module[old_param]
 
+            new_param.requires_grad_(old_param.requires_grad)
+
             for tp_attr in ["_mcore_tp", "_tp_partition_dim", "_tp_duplicated"]:
                 if getattr(old_param, tp_attr, None) is not None:
                     setattr(new_param, tp_attr, getattr(old_param, tp_attr))
@@ -3162,9 +3164,6 @@ class GradReducePipeline:
                 grad_reduce_event, free_up_grad_bucket, _ = self.grad_reduce_queue.pop(0)
                 grad_reduce_event.wait()
                 free_up_grad_bucket()
-
-        if suggested_queue_size == 0 and self.outer_fsdp_group_grad_reduce:
-            torch.cuda.current_stream().wait_stream(self.outer_fsdp_group_grad_reduce_stream)
 
     def _enforce_double_buffer_limit(self, add_buckets):
         if not self.buffer.ddp_config.fsdp_double_buffer:

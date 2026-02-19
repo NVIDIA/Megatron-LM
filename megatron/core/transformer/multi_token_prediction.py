@@ -10,7 +10,7 @@ from torch import Tensor
 
 from megatron.core import InferenceParams, parallel_state, tensor_parallel
 from megatron.core.dist_checkpointing.mapping import ShardedStateDict
-from megatron.core.dist_checkpointing.utils import replace_prefix_for_sharding
+from megatron.core.dist_checkpointing.utils import apply_prefix_mapping, replace_prefix_for_sharding
 from megatron.core.fp8_utils import get_fp8_context
 from megatron.core.models.backends import BackendSpecProvider, LocalSpecProvider
 from megatron.core.packed_seq_params import PackedSeqParams
@@ -23,8 +23,11 @@ from megatron.core.tensor_parallel import (
 from megatron.core.transformer.enums import AttnMaskType, LayerType
 from megatron.core.transformer.module import MegatronModule
 from megatron.core.transformer.spec_utils import ModuleSpec, build_module
+from megatron.core.transformer.torch_norm import LayerNormBuilder
 from megatron.core.transformer.transformer_block import TransformerBlockSubmodules
 from megatron.core.transformer.transformer_config import TransformerConfig
+from megatron.core.typed_torch import apply_module
+
 from megatron.core.utils import (
     get_pg_rank,
     is_torch_min_version,
@@ -265,13 +268,11 @@ def _roll_tensor_packed_seq(tensor, shifts, dims, packed_seq_params, cp_group=No
         # the idx has been multiplied by cp_size, need to divide it by cp_size to get the local idx
         local_start_idx = start_idx // cp_size
         local_end_idx = end_idx // cp_size
-
         # Skip empty sequences - this can happen when a sequence is very short and
         # after dividing by cp_size, the local slice has zero length
         local_seq_len = local_end_idx - local_start_idx
         if local_seq_len == 0:
             continue
-
         tensor_slice = rolled_tensor[..., local_start_idx:local_end_idx].clone()
 
         # The following code is very similar as the code in roll_tensor function
@@ -283,12 +284,10 @@ def _roll_tensor_packed_seq(tensor, shifts, dims, packed_seq_params, cp_group=No
         for chunk in rolled_chunks:
             # Skip empty chunks that can occur when the sequence slice is very small
             if chunk.size(dims) == 0:
-                tensor_send_list.append(
-                    torch.empty(chunk.shape[:-1], dtype=chunk.dtype, device=chunk.device)
-                )
-                tensor_recv_list.append(
-                    torch.empty(chunk.shape[:-1], dtype=chunk.dtype, device=chunk.device)
-                )
+                empty_shape = list(chunk.shape)
+                empty_shape[dims] = 0
+                tensor_send_list.append(torch.empty(chunk.shape[:-1], dtype=chunk.dtype, device=chunk.device))
+                tensor_recv_list.append(torch.empty(chunk.shape[:-1], dtype=chunk.dtype, device=chunk.device))
                 continue
             boundary = chunk.select(dims, shifts).contiguous().clone()
             tensor_send_list.append(boundary)
@@ -409,18 +408,20 @@ class MultiTokenPredictionLayerSubmodules:
     Dataclass for specifying the submodules of a MultiTokenPrediction module.
 
     Args:
-        hnorm (Union[ModuleSpec, type]): Specification or instance of the
-             hidden states normalization to be applied.
-        enorm (Union[ModuleSpec, type]): Specification or instance of the
-            embedding normalization to be applied.
+        hnorm: Specification or instance of the hidden states normalization to be applied.
+        enorm: Specification or instance of the embedding normalization to be applied.
         eh_proj (Union[ModuleSpec, type]): Specification or instance of the
             linear projection to be applied.
         mtp_model_layer (Union[ModuleSpec, type]): Specification
             or instance of the transformer or mamba block to be applied.
     """
 
-    enorm: Union[ModuleSpec, type] = None
-    hnorm: Union[ModuleSpec, type] = None
+    enorm: LayerNormBuilder
+    hnorm: LayerNormBuilder
+    # TODO(nschank): Move this back below transformer_layer once eh_proj and transformer_layer have
+    # their defaults removed.
+    layer_norm: LayerNormBuilder
+
     eh_proj: Union[ModuleSpec, type] = None
     mtp_model_layer: Union[ModuleSpec, type] = None
     layer_norm: Union[ModuleSpec, type] = None
@@ -449,7 +450,7 @@ def get_mtp_layer_spec_for_backend(
         ModuleSpec: Module specification with modules from the backend.
     """
     column_parallel_linear_impl: type = backend.column_parallel_linear()
-    layer_norm_impl: type = backend.layer_norm()
+    layer_norm_impl = backend.layer_norm()
     mtp_layer_spec = ModuleSpec(
         module=MultiTokenPredictionLayer,
         submodules=MultiTokenPredictionLayerSubmodules(
@@ -672,7 +673,17 @@ def process_mtp_loss(
             )
         mtp_loss_scale = config.mtp_loss_scaling_factor / config.mtp_num_layers
         if config.calculate_per_token_loss:
-            hidden_states = MTPLossAutoScaler.apply(hidden_states, mtp_loss_scale * mtp_loss)
+            # When calculate_per_token_loss is enabled, finalize_model_grads will
+            # divide all gradients by total_num_tokens (from main loss).
+            # However, MTP has fewer valid tokens due to rolling. To ensure correct
+            # per-token gradient weighting, we normalize by the rolled token count
+            # and re-scale by the original token count.
+            # Avoid division by zero
+            num_tokens_safe = torch.clamp(num_tokens, min=1)
+            mtp_loss_normalized = (
+                mtp_loss_scale * mtp_loss * (original_num_tokens / num_tokens_safe)
+            )
+            hidden_states = MTPLossAutoScaler.apply(hidden_states, mtp_loss_normalized)
         else:
             safe_num_tokens = num_tokens.clamp(min=1)
             hidden_states = MTPLossAutoScaler.apply(
@@ -698,8 +709,8 @@ class MultiTokenPredictionLayer(MegatronModule):
     the linear projection. The combined serves as the input of the Transformer block at
     the k-th depth to produce the output representation.
 
-    for more information, please refer to DeepSeek-V3 Technical Report
-    https://github.com/deepseek-ai/DeepSeek-V3/blob/main/DeepSeek_V3.pdf
+    For more information, refer to DeepSeek-V3 Technical Report
+    https://arxiv.org/pdf/2412.19437.pdf
     """
 
     def __init__(
@@ -745,15 +756,13 @@ class MultiTokenPredictionLayer(MegatronModule):
                         f"The supported attention mask types are {SUPPORTED_ATTN_MASK}."
                     )
 
-        self.enorm = build_module(
-            self.submodules.enorm,
+        self.enorm = self.submodules.enorm(
             config=self.config,
             hidden_size=self.config.hidden_size,
             eps=self.config.layernorm_epsilon,
         )
 
-        self.hnorm = build_module(
-            self.submodules.hnorm,
+        self.hnorm = self.submodules.hnorm(
             config=self.config,
             hidden_size=self.config.hidden_size,
             eps=self.config.layernorm_epsilon,
@@ -806,8 +815,30 @@ class MultiTokenPredictionLayer(MegatronModule):
                 is_mtp_layer=True,
             )
 
-        self.final_layernorm = build_module(
-            self.submodules.layer_norm,
+            self.mtp_model_layer = MambaStack(
+                config=self.config,
+                submodules=mamba_submodules,
+                hybrid_override_pattern=mtp_layer_pattern,
+                pre_process=True,  # Always receives input from eh_proj
+                post_layer_norm=False,  # MTP has its own final_layernorm
+                post_process=True,  # MTP layer is self-contained
+                pg_collection=pg_collection,
+                is_mtp_layer=True,
+            )
+        elif self.config.mtp_num_layers is not None:
+            # GPT path: Uses the transformer block spec for MTP layer
+            # MTP inner layers use their own layer numbering (self.layer_number = 1, 2, etc.)
+            # rather than continuing from decoder layer numbers. This is consistent with the
+            # Mamba path and ensures proper aux loss tracking in router.py.
+            self.mtp_model_layer = build_module(
+                self.submodules.mtp_model_layer,
+                config=self.config,
+                vp_stage=self.vp_stage,
+                layer_number=self.layer_number,
+                is_mtp_layer=True,
+            )
+
+        self.final_layernorm = self.submodules.layer_norm(
             config=self.config,
             hidden_size=self.config.hidden_size,
             eps=self.config.layernorm_epsilon,
@@ -863,9 +894,9 @@ class MultiTokenPredictionLayer(MegatronModule):
         """
         Concatenate the tokens before sending to transformer layer.
         """
-        decoder_input = self.enorm(decoder_input)
+        decoder_input = apply_module(self.enorm)(decoder_input)
         decoder_input = make_viewless_tensor(inp=decoder_input, requires_grad=True, keep_graph=True)
-        hidden_states = self.hnorm(hidden_states)
+        hidden_states = apply_module(self.hnorm)(hidden_states)
         hidden_states = make_viewless_tensor(inp=hidden_states, requires_grad=True, keep_graph=True)
         # At the (k - 1)-th MTP module, concatenates the i-th token's hidden_states
         # and the (i + K)-th token's embedding, and combine them with linear projection.
@@ -957,7 +988,7 @@ class MultiTokenPredictionLayer(MegatronModule):
         """
 
         # Layer norm before shared head layer.
-        hidden_states = self.final_layernorm(hidden_states)
+        hidden_states = apply_module(self.final_layernorm)(hidden_states)
         # TENorm produces a "viewed" tensor. This will result in schedule.py's
         # deallocate_output_tensor() throwing an error, so a viewless tensor is
         # created to prevent this.
@@ -1110,6 +1141,16 @@ class MultiTokenPredictionLayer(MegatronModule):
             token prediction layer.
         """
         sharded_state_dict = super().sharded_state_dict(prefix, sharded_offsets, metadata)
+
+        # Backward compatibility: GPT MTP checkpoints were saved with the submodule
+        # named 'transformer_layer'. Remap checkpoint keys so old checkpoints load
+        # correctly. Mamba MTP models keep 'mtp_model_layer' as their native format
+        # since no older checkpoints exist for them.
+        if self.mtp_layer_pattern is None:
+            apply_prefix_mapping(
+                sharded_state_dict, {f'{prefix}mtp_model_layer.': f'{prefix}transformer_layer.'}
+            )
+
         return sharded_state_dict
 
 
