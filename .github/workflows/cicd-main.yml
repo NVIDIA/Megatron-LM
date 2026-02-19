@@ -205,7 +205,7 @@ jobs:
       )
       && !cancelled()
     outputs:
-      enable-downstream-testing: ${{ steps.main.outputs.has-mbridge-testing-label }}
+      enable-downstream-testing: ${{ steps.has-mbridge-testing-label.outputs.main }}
     steps:
       - name: Checkout
         uses: actions/checkout@v4
