@@ -520,6 +520,7 @@ def get_environment_rollouts(
             args.cuda_graph_impl,
             False, # offload optimizer during rollout collection is handled above
             training_model=model if has_separate_inference_model else None,
+            increment_staleness_on_suspend=True,
         ) as inference_interface:
 
             with nvtx_range("inference-setup"):
@@ -554,6 +555,16 @@ def get_environment_rollouts(
                 else:
                     # Just set up space to collect the rollouts
                     rollouts = [[None for _ in range(samples_per_group)] for _ in range(n_prompts)]
+
+        # Catch-up staleness increment: rollouts need to have their staleness values adjusted
+        # due to the gap between when they finished and the current step.
+        if rank == 0:
+            for group in rollouts:
+                for rollout in group:
+                    gap = args.curr_iteration - rollout.completed_at_step
+                    if gap > 0:
+                        rollout.policy_staleness = [s + gap for s in rollout.policy_staleness]
+                        rollout.kv_cache_staleness = [s + gap for s in rollout.kv_cache_staleness]
 
         with nvtx_range("sync-rollouts"):
             # Wait for Rollouts to be collected
@@ -1704,6 +1715,7 @@ def megatron_rl_inference_mode(
     cuda_graph_impl: str,
     offload_optimizer_during_inference: bool,
     training_model: Optional[list[LanguageModule]] = None,
+    increment_staleness_on_suspend: bool = False,
 ):
     """Manage the model inference context when collecting rollouts.
 
@@ -1768,6 +1780,8 @@ def megatron_rl_inference_mode(
 
         with nvtx_range("suspend-engine"):
             loop.run_until_complete(inference_interface.suspend())
+            if increment_staleness_on_suspend:
+                inference_interface.increment_staleness()
 
         if cuda_graph_impl != "none" and not args.rl_training_cuda_graphs:
             toggle_cuda_graphs(lang_module, 'none')
