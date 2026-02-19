@@ -125,7 +125,7 @@ else
                 TRAINING_PARAMS_FROM_CONFIG+="$key $value "
 
             # Case: contains spaces or shell metacharacters
-            elif [[ "$value" == *" "* || "$value" == *"|"* ]]; then
+            elif [[ "$value" == *" "* || "$value" == *"|"* || "$value" == *"("* || "$value" == *")"* ]]; then
                 TRAINING_PARAMS_FROM_CONFIG+="$key \"$value\" "
             # Case: default
             else
