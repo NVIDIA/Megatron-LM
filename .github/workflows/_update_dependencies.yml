@@ -150,6 +150,7 @@ jobs:
             exit 0
           fi
           echo "Waiting for CI checks to appear on PR #$PR_NUMBER..."
+          sleep 300 # Wait 5 minutes for CI checks to appear
           for i in $(seq 1 20); do
             if gh pr checks "$PR_NUMBER" 2>/dev/null | grep -qE '(pass|fail|pending|in_progress|queued)'; then
               echo "Checks found, starting watch..."
