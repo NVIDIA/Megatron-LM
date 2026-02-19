@@ -184,3 +184,69 @@ def test_step_batch_size_schedule_allows_past_entries_smaller_than_dp():
     calc.update(6000000, consistency_check=True)
     assert calc.current_global_batch_size == 6144
     assert calc.num_micro_batches == 12
+
+
+def test_step_batch_size_schedule_consistency_check_fails_when_batch_too_small():
+    """Test that consistency_check=True raises when current batch size is smaller
+    than micro_batch_size * data_parallel_size.
+
+    This is the scenario caught by the runtime check in setup_model_and_optimizer:
+    GPUs were scaled up but the current schedule entry yields a batch size too small
+    for the new world size.
+    """
+    calc = mb_calculator.StepBatchsizeNumMicroBatchesCalculator(
+        micro_batch_size=1,
+        data_parallel_size=512,
+        decrease_batch_size_if_needed=False,
+        rank=0,
+        schedule="0:256 200000:512 600000:1024",
+    )
+
+    # At consumed_samples=0, batch=256 < micro*dp=512.
+    # consistency_check=True should fail because 256 % 512 != 0.
+    with pytest.raises(AssertionError):
+        calc.update(0, consistency_check=True)
+
+
+def test_step_batch_size_schedule_decrease_batch_yields_zero_microbatches():
+    """Test that decrease_batch_size_if_needed=True with a batch size smaller
+    than micro_batch_size * data_parallel_size results in num_micro_batches=0.
+
+    This is a silent failure mode: the batch rounds down to 0 and training would
+    fail. The runtime check in setup_model_and_optimizer catches this by asserting
+    num_micro_batches >= 1.
+    """
+    calc = mb_calculator.StepBatchsizeNumMicroBatchesCalculator(
+        micro_batch_size=1,
+        data_parallel_size=512,
+        decrease_batch_size_if_needed=True,
+        rank=0,
+        schedule="0:256 200000:512 600000:1024",
+    )
+
+    # At consumed_samples=0, batch=256, rounds down to 0.
+    calc.update(0, consistency_check=True)
+    assert calc.num_micro_batches == 0
+
+    # After progressing past the threshold, batch=512 works.
+    calc.update(200000, consistency_check=True)
+    assert calc.num_micro_batches == 1
+
+
+def test_rampup_consistency_check_fails_when_batch_too_small():
+    """Test that rampup batch size with consistency_check=True raises when the
+    current ramped-up batch size is smaller than micro_batch_size * data_parallel_size."""
+    calc = mb_calculator.RampupBatchsizeNumMicroBatchesCalculator(
+        global_batch_size=1024,
+        micro_batch_size=1,
+        data_parallel_size=512,
+        decrease_batch_size_if_needed=False,
+        rank=0,
+        start_global_batch_size=256,
+        batch_size_increment=256,
+        ramup_samples=768,
+    )
+
+    # At consumed_samples=0, batch=256 < micro*dp=512.
+    with pytest.raises(AssertionError):
+        calc.update(0, consistency_check=True)
