@@ -587,6 +587,9 @@ def topk_routing_with_score_function(
         else:
             return torch.topk(scores, k=topk, dim=1)
 
+    from miles.utils.replay_base import routing_replay_manager
+    compute_topk = routing_replay_manager.get_topk_fn(compute_topk, return_probs=True)
+
     if score_function == "softmax":
         if use_pre_softmax:
             scores = torch.softmax(logits, dim=-1, dtype=torch.float32).type_as(logits)
