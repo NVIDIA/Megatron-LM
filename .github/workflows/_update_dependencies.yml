@@ -95,18 +95,6 @@ jobs:
           token: ${{ secrets.PAT }}
           ref: ${{ env.TARGET_BRANCH }}
 
-      - name: Install GPG
-        run: sudo apt-get install -y gnupg2
-
-      - name: Import GPG key (for signing)
-        uses: crazy-max/ghaction-import-gpg@e89d40939c28e39f97cf32126055eeae86ba74ec
-        id: gpg-action
-        with:
-          gpg_private_key: ${{ secrets.SSH_KEY }}
-          passphrase: ${{ secrets.SSH_PWD }}
-          git_user_signingkey: true
-          git_commit_gpgsign: true
-
       - name: Rebase against ${{ env.SOURCE_BRANCH }}
         run: |
           if git ls-remote --exit-code origin ${{ env.SOURCE_BRANCH }}; then
