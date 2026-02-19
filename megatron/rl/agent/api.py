@@ -48,6 +48,10 @@ class Rollout(AgentBaseModel):
     reward: float = None
     env_id: str = ''
     problem_id: str | None = None
+    policy_staleness: list[int]
+    kv_cache_staleness: list[int]
+    completed_at_step: int
+    num_evictions: int
 
 
 class TokenRollout(AgentBaseModel):
@@ -59,6 +63,10 @@ class TokenRollout(AgentBaseModel):
     logprobs: list[list[float]] | None = None
     env_id: str = ''
     problem_id: str | None = None
+    policy_staleness: list[int]
+    kv_cache_staleness: list[int]
+    completed_at_step: int
+    num_evictions: int
 
 
 class ContrastiveRollout(AgentBaseModel):
