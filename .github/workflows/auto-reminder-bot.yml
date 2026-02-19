@@ -9,7 +9,6 @@ on:
 
 jobs:
   run-script:
-    environment: main
     name: Run Auto Reminder Bot
     runs-on: ubuntu-latest
     if: github.repository == 'NVIDIA/Megatron-LM'
@@ -28,7 +27,7 @@ jobs:
 
       - name: Run Auto Reminder Bot
         run: |
-          export SLACK_TOKEN=${{ secrets.SLACK_TOKEN }}
-          export SLACK_WEBHOOK_URL=${{ secrets.SLACK_WEBHOOK_URL }}
+          export SLACK_TOKEN=${{ secrets.SLACK_BOT_TOKEN }}
+          export SLACK_WEBHOOK_URL=${{ secrets.SLACK_REVIEW_REMINDER_CHANNEL_WEBHOOK }}
           export GH_TOKEN=${{ secrets.PAT }}
           python tests/test_utils/python_scripts/auto_reminder_github.py

@@ -4,6 +4,8 @@ import asyncio
 import logging
 import time
 import traceback
+import uuid
+import warnings
 
 from megatron.core.inference.sampling_params import SamplingParams
 from megatron.core.tokenizers.text.parsers import PARSER_MAPPING
@@ -37,7 +39,7 @@ try:
                 messages, tokenize=True, add_generation_prompt=True, tools=req.get("tools", None)
             )
         except (AttributeError, AssertionError):
-            logger.warning(
+            warnings.warn(
                 "Tokenizer does not support 'apply_chat_template'. Using tokenize instead."
             )
             prompt_tokens = tokenizer.tokenize(
@@ -61,7 +63,7 @@ try:
             # Check for 'logprobs' (bool) and 'top_logprobs' (int)
             return_log_probs = bool(req.get("logprobs", False))
             top_n_logprobs = int(req.get("top_logprobs", 0)) if return_log_probs else 0
-            skip_prompt_log_probs = bool(req.get("skip_prompt_log_probs", False))
+            skip_prompt_log_probs = bool(req.get("skip_prompt_log_probs", True))
             add_BOS = bool(req.get("add_BOS", False))
 
             # The engine only handles add_BOS for string prompts, not pre-tokenized
@@ -96,17 +98,20 @@ try:
         for _ in range(n):
             tasks.append(client.add_request(prompt_tokens, sampling_params))
 
-        start_time = time.perf_counter()
+        if current_app.config['verbose']:
+            start_time = time.perf_counter()
+
         try:
             batch_results = await asyncio.gather(*tasks)
         except Exception as e:
             logger.error(f"Error during inference: {e}")
             return f"Error during inference: {e}", 500
 
-        logger.info(
-            f"Batch of {len(tasks)} requests (n={n}) processed in "
-            f"{time.perf_counter() - start_time:.2f}s"
-        )
+        if current_app.config['verbose']:
+            logging.info(
+                f"Batch of {len(tasks)} requests (n={n}) processed in "
+                f"{time.perf_counter() - start_time:.2f}s"
+            )
 
         # --- 4. Format OpenAI Response ---
         choices = []
@@ -115,7 +120,6 @@ try:
 
         request_idx = 0
         for record in batch_results:
-            assert len(record.requests) == 1, "Each record should contain one request result."
             result = record.merge().serialize()
             # Unwrap ("tensor", [...]) tuples from serialize() into plain lists.
             result = {
@@ -177,6 +181,12 @@ try:
             if "reasoning" in metadata:
                 message["reasoning"] = metadata["reasoning"]
 
+            # Replicate data in the message field for compatibility.
+            message["prompt_token_ids"] = result["prompt_tokens"]
+            message["generation_token_ids"] = result["generated_tokens"]
+            message["generation_log_probs"] = result.get("generated_log_probs", None)
+            return_log_probs = sampling_params.return_log_probs
+
             choice_data = {
                 "index": request_idx,
                 "message": message,
@@ -185,16 +195,18 @@ try:
                 "generation_log_probs": result["generated_log_probs"],
                 "raw_text": result["prompt"] + result["generated_text"],
                 # 'logprobs' in chat API is an object containing 'content'
-                "logprobs": {"content": logprobs_content} if logprobs_content else None,
+                # "logprobs": {"content": logprobs_content} if logprobs_content else None,
+                "logprobs": {"content": logprobs_content} if return_log_probs else None,
                 "finish_reason": (
                     "tool_calls" if metadata.get("tool_calls", []) else "stop"
                 ),  # Original code hardcoded this.
             }
-            logging.info(result)
+            if current_app.config['verbose']:
+                logging.info(result)
             if result["routing_indices"] is not None:
                 choice_data["moe_topk_indices"] = result["routing_indices"]
                 if prompt_tokens_count:
-                    choices[-1]["prompt_moe_topk_indices"] = result["routing_indices"][
+                    choice_data["prompt_moe_topk_indices"] = result["routing_indices"][
                         :prompt_tokens_count
                     ]
             choices.append(choice_data)
@@ -203,6 +215,10 @@ try:
 
         prompt_token_count = max(prompt_tokens_counts)
         response = {
+            "id": str(uuid.uuid4()),
+            "created": int(time.time()),
+            "model": "EMPTY",
+            "object": "chat.completion",
             "choices": choices,
             "usage": {
                 "prompt_tokens": prompt_token_count,
