@@ -385,6 +385,7 @@ def rotary_fwd_kv_kernel(
     SIN,
     emb_dim: tl.constexpr,
     k_dim: tl.constexpr,
+    k_dim_ceil: tl.constexpr,
     v_dim: tl.constexpr,
     head_num: tl.constexpr,
     batch_size,
@@ -434,21 +435,27 @@ def rotary_fwd_kv_kernel(
     cos_right = tl.load(COS + token_idx * emb_dim + emb_dim // 2 + tl.arange(0, emb_dim // 2))
     sin_right = tl.load(SIN + token_idx * emb_dim + emb_dim // 2 + tl.arange(0, emb_dim // 2))
 
-    KV_ptr = KV + pid_m * stride_kv_seq + pid_head * BLOCK_H * stride_kv_nheads
-    kv_off = tl.arange(0, BLOCK_H)[:, None] * stride_kv_nheads
-    mask = kv_off < head_num * stride_kv_nheads
-    k_in_off = kv_off + tl.arange(0, k_dim)[None, :]
-    v_in_off = kv_off + k_dim + tl.arange(0, v_dim)[None, :]
-    k = tl.load(KV_ptr + k_in_off, mask=mask)
-    v = tl.load(KV_ptr + v_in_off, mask=mask)
+    KV_ptr = KV + pid_m * stride_kv_seq # + pid_head * BLOCK_H * stride_kv_nheads
+    ki_range = tl.arange(0, BLOCK_H)[:, None] + pid_head * BLOCK_H
+    kj_range = tl.arange(0, k_dim_ceil)[None, :]
+    mask_k = (ki_range < head_num) & (kj_range < k_dim)
+    mask_v = ki_range < head_num
+    k_off = ki_range * stride_kv_nheads + kj_range
+    if v_dim > 0:
+        v_off = ki_range * stride_kv_nheads + k_dim + tl.arange(0, v_dim)[None, :]
+        v = tl.load(KV_ptr + v_off, mask=mask_v)
+    else:
+        v = tl.zeros((BLOCK_H, 1), dtype=KV.dtype.element_ty)
+    k = tl.load(KV_ptr + k_off, mask=mask_k)
 
-    K_ptr = O_KEY + pid_m * stride_k_seq + pid_head * BLOCK_H * stride_k_nheads
-    V_ptr = O_VALUE + pid_m * stride_v_seq + pid_head * BLOCK_H * stride_v_nheads
+    K_ptr = O_KEY + pid_m * stride_k_seq # + pid_head * BLOCK_H * stride_k_nheads
+    V_ptr = O_VALUE + pid_m * stride_v_seq # + pid_head * BLOCK_H * stride_v_nheads
 
-    k_out_off = tl.arange(0, BLOCK_H)[:, None] * stride_k_nheads + tl.arange(0, k_dim)[None, :]
-    v_out_off = tl.arange(0, BLOCK_H)[:, None] * stride_v_nheads + tl.arange(0, v_dim)[None, :]
-    tl.store(K_ptr + k_out_off, k, mask=mask)
-    tl.store(V_ptr + v_out_off, v, mask=mask)
+    k_out_off = ki_range * stride_k_nheads + kj_range
+    tl.store(K_ptr + k_out_off, k, mask=mask_k)
+    if v_dim > 0:
+        v_out_off = ki_range * stride_v_nheads + tl.arange(0, v_dim)[None, :]
+        tl.store(V_ptr + v_out_off, v, mask=mask_v)
 
     EMB = K_POS_EMB + pid_m * stride_emb_seq
     # x1 = t[..., 0::2], x2 = t[..., 1::2]
@@ -460,14 +467,16 @@ def rotary_fwd_kv_kernel(
     x_left = x_left.expand_dims(0).broadcast_to(BLOCK_H, emb_dim // 2)
     x_right = x_right.expand_dims(0).broadcast_to(BLOCK_H, emb_dim // 2)
 
+    x_range = tl.arange(0, BLOCK_H)[:, None] + pid_head * BLOCK_H
+    mask_x = x_range < head_num
     x_left_off = (
-        tl.arange(0, BLOCK_H)[:, None] * stride_k_nheads
+        x_range * stride_k_nheads
         + k_dim
         + tl.arange(0, emb_dim // 2)[None, :]
     )
     x_right_off = x_left_off + emb_dim // 2
-    tl.store(K_ptr + x_left_off, x_left, mask=mask)
-    tl.store(K_ptr + x_right_off, x_right, mask=mask)
+    tl.store(K_ptr + x_left_off, x_left, mask=mask_x)
+    tl.store(K_ptr + x_right_off, x_right, mask=mask_x)
 
 
 @triton.autotune(
@@ -493,6 +502,7 @@ def rotary_bwd_kv_kernel(
     SIN,
     emb_dim: tl.constexpr,
     k_dim: tl.constexpr,
+    k_dim_ceil: tl.constexpr,
     v_dim: tl.constexpr,
     head_num: tl.constexpr,
     batch_size,
@@ -533,27 +543,32 @@ def rotary_bwd_kv_kernel(
     else:
         token_idx = _get_thd_token_idx(cu_seqlens_kv, pid_m, seq_num, cp_rank, cp_size)
 
-    dKV_ptr = dKV + pid_m * stride_dkv_seq + pid_head * BLOCK_H * stride_dkv_nheads
-    dkv_off = tl.arange(0, BLOCK_H)[:, None] * stride_dkv_nheads
-    mask = dkv_off < head_num * stride_dkv_nheads
-    dk_out_off = dkv_off + tl.arange(0, k_dim)[None, :]
-    dv_out_off = dkv_off + k_dim + tl.arange(0, v_dim)[None, :]
+    dKV_ptr = dKV + pid_m * stride_dkv_seq # + pid_head * BLOCK_H * stride_dkv_nheads
+    ki_range = tl.arange(0, BLOCK_H)[:, None] + pid_head * BLOCK_H
+    kj_range = tl.arange(0, k_dim_ceil)[None, :]
+    mask_k = (ki_range < head_num) & (kj_range < k_dim)
+    mask_v = ki_range < head_num
+    dk_out_off = ki_range * stride_dkv_nheads + kj_range
 
-    dK_ptr = dK + pid_m * stride_dk_seq + pid_head * BLOCK_H * stride_dk_nheads
-    dV_ptr = dV + pid_m * stride_dv_seq + pid_head * BLOCK_H * stride_dv_nheads
-    dk_in_off = tl.arange(0, BLOCK_H)[:, None] * stride_dk_nheads + tl.arange(0, k_dim)[None, :]
-    dv_in_off = tl.arange(0, BLOCK_H)[:, None] * stride_dv_nheads + tl.arange(0, v_dim)[None, :]
-    dk = tl.load(dK_ptr + dk_in_off, mask=mask)
-    dv = tl.load(dV_ptr + dv_in_off, mask=mask)
-    tl.store(dKV_ptr + dk_out_off, dk, mask=mask)
-    tl.store(dKV_ptr + dv_out_off, dv, mask=mask)
+    dK_ptr = dK + pid_m * stride_dk_seq # + pid_head * BLOCK_H * stride_dk_nheads
+    dV_ptr = dV + pid_m * stride_dv_seq # + pid_head * BLOCK_H * stride_dv_nheads
+    dk_in_off = ki_range * stride_dk_nheads + kj_range
+
+    dk = tl.load(dK_ptr + dk_in_off, mask=mask_k)
+    tl.store(dKV_ptr + dk_out_off, dk, mask=mask_k)
+
+    if v_dim > 0:
+        dv_out_off = ki_range * stride_dkv_nheads + k_dim + tl.arange(0, v_dim)[None, :]
+        dv_in_off = ki_range * stride_dv_nheads + tl.arange(0, v_dim)[None, :]
+        dv = tl.load(dV_ptr + dv_in_off, mask=mask_v)
+        tl.store(dKV_ptr + dv_out_off, dv, mask=mask_v)
 
     if pid_head == 0:
         x_left_accum = tl.zeros((BLOCK_H, emb_dim // 2), dtype=tl.float32)
         x_right_accum = tl.zeros((BLOCK_H, emb_dim // 2), dtype=tl.float32)
         for i in tl.static_range(triton.cdiv(head_num, BLOCK_H)):
-            dK_ptr = dK + pid_m * stride_dk_seq + i * BLOCK_H * stride_dk_nheads
-            x_off = tl.arange(0, BLOCK_H)[:, None] * stride_dk_nheads + k_dim
+            dK_ptr = dK + pid_m * stride_dk_seq # + i * BLOCK_H * stride_dk_nheads
+            x_off = tl.arange(0, BLOCK_H)[:, None] * stride_dk_nheads + k_dim + i * BLOCK_H * stride_dk_nheads
             mask = x_off < head_num * stride_dk_nheads
             x_left_off = x_off + tl.arange(0, emb_dim // 2)[None, :]
             x_right_off = x_left_off + emb_dim // 2
@@ -632,6 +647,7 @@ class ApplyMLARotaryEmbKV(torch.autograd.Function):
 
         o_key = kv.new_empty(total_seqlen, nheads, emb_dim + k_dim)
         o_value = kv.new_empty(total_seqlen, nheads, v_dim)
+        k_dim_ceil = triton.next_power_of_2(k_dim)
 
         grid = lambda META: (total_seqlen, triton.cdiv(nheads, META["BLOCK_H"]))
         rotary_fwd_kv_kernel[grid](
@@ -643,6 +659,7 @@ class ApplyMLARotaryEmbKV(torch.autograd.Function):
             sin,
             emb_dim,
             k_dim,
+            k_dim_ceil,
             v_dim,
             nheads,
             batch_size,
@@ -700,6 +717,7 @@ class ApplyMLARotaryEmbKV(torch.autograd.Function):
 
         d_kv = dk.new_empty(total_seqlen, nheads, ctx.k_dim + ctx.v_dim)
         d_emb = dk.new_empty(total_seqlen, 1, ctx.emb_dim)
+        k_dim_ceil = triton.next_power_of_2(ctx.k_dim)
 
         grid = lambda META: (total_seqlen, triton.cdiv(nheads, META["BLOCK_H"]))
         rotary_bwd_kv_kernel[grid](
@@ -711,6 +729,7 @@ class ApplyMLARotaryEmbKV(torch.autograd.Function):
             sin,
             ctx.emb_dim,
             ctx.k_dim,
+            k_dim_ceil,
             ctx.v_dim,
             nheads,
             batch_size,
