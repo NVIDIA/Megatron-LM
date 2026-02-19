@@ -1456,6 +1456,61 @@ class TEDotProductAttention(te.pytorch.DotProductAttention):
 
 
 if HAVE_TE and is_te_min_version("1.9.0.dev0"):
+    def ceil_div(x: int, y: int) -> int:
+        return (x + y - 1) // y
+
+    class _FakeInt4QuantizationSTE(torch.autograd.Function):
+        @staticmethod
+        def forward(ctx, x, group_size):
+            m, n = x.shape
+            block_size_m, block_size_n = 1, group_size
+
+
+            m_padded = ceil_div(m, block_size_m) * block_size_m
+            n_padded = ceil_div(n, block_size_n) * block_size_n
+
+            x_padded = torch.zeros(
+                (m_padded, n_padded),
+                dtype=x.dtype, device=x.device
+            )
+            x_padded[:m, :n] = x
+
+            x_view = x_padded.view(
+                m_padded // block_size_m,
+                block_size_m,
+                n_padded // block_size_n,
+                block_size_n
+            )
+
+            x_max = x_view.abs().float().amax(dim=(1, 3), keepdim=True)
+            q_max = 7
+            x_scale = x_max / q_max
+
+            x_scale = x_scale.clamp(min=1e-5)
+
+            x_div = x_view / x_scale
+            x_round = torch.round(x_div)
+
+            x_q_clamped = x_round.clamp(-q_max, q_max)
+
+            x_dequant_view = x_q_clamped * x_scale
+
+            x_dequant_full = x_dequant_view.view_as(x_padded)
+            x_out = x_dequant_full[:m, :n].contiguous().to(x.dtype)
+
+            return x_out
+
+        @staticmethod
+        def backward(ctx, grad_output):
+            return grad_output, None
+
+    def fake_int4_quantization_ste(x, group_size):
+        x_out = _FakeInt4QuantizationSTE.apply(x, group_size)
+
+        if hasattr(x, 'main_grad'):
+            x_out.main_grad = x.main_grad
+
+        return x_out
 
     class TEGroupedLinear(te.pytorch.GroupedLinear):
         """
@@ -1671,6 +1726,20 @@ if HAVE_TE and is_te_min_version("1.9.0.dev0"):
             if self.te_return_bias:
                 return out
             return out, None
+
+        def _get_weight_tensors(self):
+            """Get the weight tensors of the module."""
+            weight_tensors = super()._get_weight_tensors()
+
+            if os.getenv("OPEN_TRAINING_INT4_FAKE_QAT_FLAG", "0") == "1":
+                group_size = int(os.getenv("OPEN_TRAINING_INT4_GROUP_SIZE", "128"))
+
+                weight_tensors = [
+                    fake_int4_quantization_ste(w, group_size)
+                    for w in weight_tensors
+                ]
+
+            return weight_tensors
 
         def _encode_extra_state(self, state):
             # TE 2.0 changed the format of extra_state to be a byte tensor
