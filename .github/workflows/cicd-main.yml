@@ -257,13 +257,14 @@ jobs:
           ref: main
           repository: NVIDIA-NeMo/Megatron-Bridge
           path: megatron-bridge
+          token: ${{ secrets.PAT }}
 
       - name: Create testing branch
         run: |
           cd megatron-bridge
           git fetch origin main
-          git checkout -b mcore-testing-${{ steps.get-pr-info.outputs.pr-info.number }} origin/main
-          git push origin mcore-testing-${{ steps.get-pr-info.outputs.pr-info.number }} --force
+          git checkout -b mcore-testing-${{ fromJSON(steps.get-pr-info.outputs.pr-info || '{}').number }} origin/main
+          git push origin mcore-testing-${{ fromJSON(steps.get-pr-info.outputs.pr-info || '{}').number }} --force
 
       - name: Get merge commit sha
         shell: bash -x -e -u -o pipefail {0}
@@ -288,7 +289,7 @@ jobs:
           repo: Megatron-Bridge
           workflow_file_name: cicd-main.yml
           github_token: ${{ secrets.PAT }}
-          ref: mcore-testing-${{ steps.get-pr-info.outputs.pr-info.number }}
+          ref: mcore-testing-${{ fromJSON(steps.get-pr-info.outputs.pr-info || '{}').number }}
           wait_interval: 60
           propagate_failure: true
           client_payload: |
