@@ -670,6 +670,8 @@ class MultiTokenPredictionLayer(MegatronModule):
             vp_stage=vp_stage,
             layer_number=self.layer_number + diff_transformer_layer_offset,
         )
+        if hasattr(self.transformer_layer.mlp, 'set_is_mtp'):
+            self.transformer_layer.mlp.set_is_mtp()
 
         self.final_layernorm = build_module(
             self.submodules.layer_norm,

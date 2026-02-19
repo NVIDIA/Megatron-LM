@@ -18,7 +18,6 @@ from megatron.core.tensor_parallel import (
 from megatron.core.tensor_parallel.mappings import reduce_from_tensor_model_parallel_region
 from megatron.core.transformer.cuda_graphs import is_graph_capturing
 from megatron.core.transformer.enums import CudaGraphScope
-from megatron.core.transformer.moe.router_replay import RouterReplay
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.utils import internal_api
 
@@ -620,7 +619,7 @@ def topk_routing_with_score_function(
     score_function: str = "softmax",
     expert_bias: Optional[torch.Tensor] = None,
     fused: bool = False,
-    router_replay: Optional['RouterReplay'] = None,
+    is_mtp: bool = False,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """Compute the routing probabilities and map for top-k selection with score function.
 
@@ -638,11 +637,8 @@ def topk_routing_with_score_function(
         expert_bias (torch.Tensor, optional): The bias added to logits for expert routing.
                                               Defaults to None.
         fused (bool, optional): Whether to use the fused version. Defaults to False.
-        router_replay (Optional['RouterReplay']): For debugging and development, allows for
-                                             deterministic routing by replaying a previously
-                                             recorded routing sequence.
-
-                                              Defaults to None.
+        is_mtp (bool, optional): Whether this is an MTP layer. MTP layers bypass routing replay.
+                                 Defaults to False.
 
     Returns:
         Tuple[torch.Tensor, torch.Tensor]:
@@ -701,15 +697,13 @@ def topk_routing_with_score_function(
         else:
             return torch.topk(scores, k=topk, dim=1)
 
-    def compute_topk(scores, topk, num_groups=None, group_topk=None):
-        # Default behavior if no replay is active
+    from miles.utils.replay_base import routing_replay_manager
 
-        if router_replay is None:
-            return _compute_topk(scores, topk, num_groups=num_groups, group_topk=group_topk)
-        else:
-            return router_replay.get_replay_topk(
-                scores, topk, num_groups, group_topk, _compute_topk
-            )
+    # MTP layers cannot use rollout routing replay
+    if not is_mtp:
+        compute_topk = routing_replay_manager.get_topk_fn(_compute_topk, return_probs=True)
+    else:
+        compute_topk = _compute_topk
 
     if score_function == "softmax":
         if use_pre_softmax:

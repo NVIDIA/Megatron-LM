@@ -125,6 +125,10 @@ class BaseMoELayer(MegatronModule, ABC):
         self.layer_number = layer_number
         self.router.set_layer_number(layer_number)
 
+    def set_is_mtp(self):
+        """Mark this MoE layer as an MTP layer."""
+        self.router.is_mtp = True
+
 
 class MoELayer(BaseMoELayer):
     """Mixture of Experts layer.
