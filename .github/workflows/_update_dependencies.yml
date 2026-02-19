@@ -126,4 +126,47 @@ jobs:
             🙏 Please merge this PR only if the CI workflow completed successfully.
           commit-message: ${{ env.title }}
           signoff: true
-          committer: "${{ steps.gpg-action.outputs.name }} <${{ steps.gpg-action.outputs.email }}>"
+          committer: "github-actions[bot] <github-actions[bot]@users.noreply.github.com>"
+
+      - name: Post /ok to test comment
+        env:
+          GH_TOKEN: ${{ secrets.PAT }}
+        run: |
+          PR_NUMBER="${{ steps.create-pull-request.outputs.pull-request-number }}"
+          if [ -z "$PR_NUMBER" ]; then
+            echo "No PR was created, skipping comment"
+            exit 0
+          fi
+          gh pr comment "$PR_NUMBER" --body "/ok to test"
+
+      - name: Wait for CI checks
+        env:
+          GH_TOKEN: ${{ secrets.PAT }}
+        run: |
+          PR_NUMBER="${{ steps.create-pull-request.outputs.pull-request-number }}"
+          if [ -z "$PR_NUMBER" ]; then
+            echo "No PR was created, skipping wait"
+            exit 0
+          fi
+          echo "Waiting for CI checks to appear on PR #$PR_NUMBER..."
+          for i in $(seq 1 20); do
+            if gh pr checks "$PR_NUMBER" 2>/dev/null | grep -qE '(pass|fail|pending|in_progress|queued)'; then
+              echo "Checks found, starting watch..."
+              break
+            fi
+            echo "No checks yet (attempt $i/20), retrying in 30s..."
+            sleep 30
+          done
+          gh pr checks "$PR_NUMBER" --watch --interval 60
+
+      - name: Merge PR
+        env:
+          GH_TOKEN: ${{ secrets.PAT }}
+        run: |
+          PR_NUMBER="${{ steps.create-pull-request.outputs.pull-request-number }}"
+          if [ -z "$PR_NUMBER" ]; then
+            echo "No PR was created, skipping merge"
+            exit 0
+          fi
+          echo "Merging PR #$PR_NUMBER..."
+          gh pr merge "$PR_NUMBER" --squash --delete-branch
