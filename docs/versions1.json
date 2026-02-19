@@ -1,5 +1,6 @@
 [
     {
+        "preferred": true,
         "name": "latest",
         "version": "latest",
         "url": "https://docs.nvidia.com/megatron-core/latest/"
