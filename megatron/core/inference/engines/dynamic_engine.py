@@ -1203,14 +1203,21 @@ class DynamicInferenceEngine(AbstractEngine):
 
         device = torch.cuda.current_device()
         remaining_lengths = torch.empty(n, dtype=torch.int64, device=device)
+
+        if not self.context.enable_prefix_caching:
+            # Fast path: only gather remaining lengths, skip all hash work
+            for i, req_id in enumerate(self.waiting_request_ids):
+                req = self.get_request(req_id)
+                remaining_lengths[i] = len(req.remaining_prompt_tokens)
+            return None, remaining_lengths
+
         request_hashes_list = []
 
         for i, req_id in enumerate(self.waiting_request_ids):
             req = self.get_request(req_id)
             remaining_lengths[i] = len(req.remaining_prompt_tokens)
             if (
-                self.context.enable_prefix_caching
-                and req.precomputed_block_hashes is not None
+                req.precomputed_block_hashes is not None
                 and req.precomputed_block_hashes.numel() > 0
             ):
                 request_hashes_list.append(req.precomputed_block_hashes)
@@ -1220,7 +1227,7 @@ class DynamicInferenceEngine(AbstractEngine):
                 )
 
         batch_prefix_result = None
-        if self.context.enable_prefix_caching and request_hashes_list:
+        if request_hashes_list:
             batch_prefix_result = self.context.gpu_match_prefixes_batch(request_hashes_list)
 
         return batch_prefix_result, remaining_lengths
@@ -1253,15 +1260,39 @@ class DynamicInferenceEngine(AbstractEngine):
         device = remaining_lengths.device
         block_size = self.context.block_size_tokens
 
-        # --- Non-pending mask ---
-        if batch_prefix_result is not None:
-            num_matched, has_pending, _ = batch_prefix_result
-            non_pending = (has_pending == 0)
-            pending_count_gpu = has_pending.sum()  # GPU scalar, no sync
-        else:
-            non_pending = torch.ones(n, dtype=torch.bool, device=device)
-            num_matched = torch.zeros(n, dtype=torch.int32, device=device)
-            pending_count_gpu = torch.zeros(1, dtype=torch.int64, device=device)
+        if batch_prefix_result is None:
+            # Fast path: no prefix caching — all schedulable, zero matches, no pending
+            schedulable = torch.ones(n, dtype=torch.bool, device=device)
+            if start_idx > 0:
+                schedulable[:start_idx] = False
+
+            # Token budget
+            token_budget = self.context.max_tokens - self.context.active_token_count
+            lengths_masked = remaining_lengths * schedulable
+            schedulable &= lengths_masked.cumsum(dim=0) <= token_budget
+
+            # Slot limit
+            available_slots = self.context.max_requests - self.context.total_request_count
+            schedulable &= schedulable.to(torch.int32).cumsum(dim=0) <= available_slots
+
+            # Block budget (no prefix matches, no LRU eviction)
+            total_blocks = torch.ceil(remaining_lengths.float() / block_size).to(torch.int32)
+            blocks_needed = total_blocks * schedulable.to(torch.int32)
+            schedulable &= blocks_needed.cumsum(dim=0) <= self.context.block_allocator.total_avail
+
+            # Paused check
+            if self.context.paused_request_count != 0:
+                schedulable.fill_(False)
+
+            # Single sync — pack only schedulable mask (n values, not 2n+1)
+            result = schedulable.to(torch.int64).tolist()
+            schedulable_indices = [i for i in range(n) if result[i]]
+            return schedulable_indices, [0] * len(schedulable_indices), 0
+
+        # --- Full path: prefix caching enabled ---
+        num_matched, has_pending, _ = batch_prefix_result
+        non_pending = (has_pending == 0)
+        pending_count_gpu = has_pending.sum()  # GPU scalar, no sync
 
         # Zero out positions before start_idx (already handled separately)
         if start_idx > 0:
@@ -1284,8 +1315,7 @@ class DynamicInferenceEngine(AbstractEngine):
         # available_blocks stays on GPU (int + GPU tensor = GPU tensor, no sync)
         available_blocks = self.context.block_allocator.total_avail
         if (
-            self.context.enable_prefix_caching
-            and self.context.block_allocator.prefix_caching_evict_policy
+            self.context.block_allocator.prefix_caching_evict_policy
             == PrefixCachingEvictPolicy.LRU
         ):
             available_blocks = (

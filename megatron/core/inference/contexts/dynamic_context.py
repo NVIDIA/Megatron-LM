@@ -640,10 +640,11 @@ class DynamicInferenceContext(BaseInferenceContext):
         self.token_to_local_position_within_kv_block = torch.empty_like(self.token_to_input_ids)
 
         # GPU buffer for tracking blocks pending computation (prefix caching).
-        max_pending = self.block_allocator.total_count
-        self._pending_computation_buffer = torch.full(
-            (max_pending,), -1, dtype=torch.int32, device=torch.cuda.current_device()
-        )
+        if self.enable_prefix_caching:
+            max_pending = self.block_allocator.total_count
+            self._pending_computation_buffer = torch.full(
+                (max_pending,), -1, dtype=torch.int32, device=torch.cuda.current_device()
+            )
 
         # Memory buffer.
         def allocate_memory_buffer():
@@ -1605,6 +1606,8 @@ class DynamicInferenceContext(BaseInferenceContext):
         as having their KV computed. This enables prefix caching coordination
         where subsequent requests can safely reuse these blocks.
         """
+        if not self.enable_prefix_caching:
+            return
         if self._pending_computation_count > 0:
             ids = self._pending_computation_buffer[: self._pending_computation_count]
             self.block_allocator.mark_blocks_computed(ids)
@@ -1665,7 +1668,11 @@ class DynamicInferenceContext(BaseInferenceContext):
         # =========================================================================
         # Prefix caching: find matching prefix blocks (scoped to this chunk)
         # =========================================================================
-        if batch_num_matched is not None and batch_matched_block_ids is not None:
+        if not self.enable_prefix_caching:
+            # Fast path: no prefix matching
+            num_matched_blocks = 0
+            matched_tensor = None
+        elif batch_num_matched is not None and batch_matched_block_ids is not None:
             if batch_effective_matched is not None:
                 # Pre-computed by caller — skip GPU clamp + .item() (zero sync)
                 effective_matched = batch_effective_matched
@@ -2198,6 +2205,15 @@ class DynamicInferenceContext(BaseInferenceContext):
             active_requests_mask[-1] = (
                 1  # must keep this, next iteration will add a new chunk to it
             )
+
+        assert (
+            self.paused_request_count + active_requests_mask.shape[0]
+            == self.total_request_count
+        ), (
+            f"total_request_count ({self.total_request_count}) must equal "
+            f"paused_request_count ({self.paused_request_count}) + "
+            f"len(active_requests_mask) ({active_requests_mask.shape[0]})"
+        )
 
         active_request_count = (active_requests_mask == 1).sum().item()
         # Derive finished count arithmetically to avoid a second GPU→CPU sync
