@@ -930,6 +930,12 @@ class TransformerConfig(ModelParallelConfig):
         details.
         """
         super().__post_init__()
+
+        # When fp32 residual connections are enabled, pipeline parallel communication must
+        # use fp32 to match the dtype of the residual stream between pipeline stages.
+        if self.fp32_residual_connection and self.pipeline_dtype is not None:
+            self.pipeline_dtype = torch.float
+
         if self.fp16 and self.bf16:
             raise ValueError(
                 f"Only one of self.fp16: {self.fp16} and self.bf16 {self.bf16} should be True."

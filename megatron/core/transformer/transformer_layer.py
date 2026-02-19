@@ -583,6 +583,8 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
 
         # Residual connection.
         residual = hidden_states
+        if self.config.fp32_residual_connection:
+            residual = residual.float()
 
         # Optional Input Layer norm
         if self.recompute_input_layernorm:
@@ -651,6 +653,8 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
 
         # Residual connection.
         residual = hidden_states
+        if self.config.fp32_residual_connection:
+            residual = residual.float()
 
         # Optional Layer norm after self-attention
         pre_cross_attn_layernorm_output = apply_module(self.pre_cross_attn_layernorm)(hidden_states)
@@ -715,6 +719,8 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
 
         # Residual connection.
         residual = hidden_states
+        if self.config.fp32_residual_connection:
+            residual = residual.float()
 
         # Optional Layer norm post the cross-attention.
         pre_mlp_layernorm_output = self._forward_pre_mlp_layernorm(hidden_states)
@@ -1292,6 +1298,8 @@ class MoETransformerLayer(TransformerLayer):
         """
 
         residual = hidden_states
+        if self.config.fp32_residual_connection:
+            residual = residual.float()
         self.mlp.fwd_execution_map = "route"
         pre_mlp_layernorm_output = self._forward_pre_mlp_layernorm(hidden_states)
         router_outputs = self.mlp(
