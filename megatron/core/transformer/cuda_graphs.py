@@ -2440,7 +2440,7 @@ def get_overlap_moe_expert_parallel_comm_order(order, num_layers_per_chunk, capt
 def set_current_microbatch(model, microbatch_id):
     """Set the current microbatch on all layers that use TE CUDA graph replay.
 
-    ``current_microbatch`` is read by ``_te_cuda_graph_replay`` to select the
+    current_microbatch is read by _te_cuda_graph_replay to select the
     correct graph index.  This helper is called from the pipeline-parallel
     schedule before each forward step.
     """
@@ -2553,20 +2553,20 @@ def get_vision_cuda_graph_seq_length(vision_config, default_seq_length: int = 40
 class VisionTECudaGraphHelper(TECudaGraphHelper):
     """Helper to capture CUDA Graphs for vision encoder layers using TE.
 
-    Inherits from :class:`TECudaGraphHelper` and overrides only the
+    Inherits from TECudaGraphHelper and overrides only the
     vision-specific behaviour:
 
-    * Layer discovery finds ``vision_model.decoder.layers`` instead of the
+    * Layer discovery finds vision_model.decoder.layers instead of the
       language decoder layers.
-    * ``num_model_chunks`` is always 1 (vision has no virtual pipeline stages).
+    * num_model_chunks is always 1 (vision has no virtual pipeline stages).
     * Batch dimension is always 1 (images are concatenated along the sequence
       dimension).
-    * Captured graph outputs are wrapped to filter ``None`` values that arise
-      from vision encoder layers returning ``(output, None)``.
+    * Captured graph outputs are wrapped to filter None values that arise
+      from vision encoder layers returning (output, None).
 
     Args:
-        model: The full model (list of model chunks) containing ``vision_model``.
-        vision_config: :class:`TransformerConfig` for the vision encoder.
+        model: The full model (list of model chunks) containing vision_model.
+        vision_config: TransformerConfig for the vision encoder.
         vision_seq_length: Sequence length for vision (max vision tokens).
         micro_batch_size: Micro-batch size (unused for sample-arg generation
             since the vision encoder always uses batch-dim = 1).
@@ -2596,7 +2596,9 @@ class VisionTECudaGraphHelper(TECudaGraphHelper):
         self.model = model
         self.config = vision_config
         self.seq_length = vision_seq_length
-        self.micro_batch_size = micro_batch_size
+        # Vision encoder concatenates all images along the sequence dimension
+        # with a fixed batch dimension of 1, regardless of the training MBS.
+        self.micro_batch_size = 1
         self.optimizers = []
         self.num_model_chunks = 1
         self.num_microbatches = num_microbatches
@@ -2658,13 +2660,20 @@ class VisionTECudaGraphHelper(TECudaGraphHelper):
         self._graphs_created = False
 
     # -- sample argument generation ----------------------------------------
+    # The parent's _get_sample_arguments uses complex buffer-reuse
+    # optimization and rotary embedding computation tied to the LM decoder
+    # structure.  Vision replaces it with a simple per-layer-per-microbatch
+    # loop (batch_dim is always 1).  The parent's _get_cuda_graph_input_data
+    # (schedule computation, kwargs building) is reused as-is since
+    # num_model_chunks=1 makes MoE overlap a no-op and fp8/fp4=False
+    # takes the correct branch.
 
     def _get_sample_args(self):
         """Generate sample arguments for CUDA Graph capturing.
 
         Returns:
-            Tuple of ``(sample_args, sample_kwargs)`` lists for each
-            (layer, microbatch) pair.  Returns ``([], {})`` when there are
+            Tuple of (sample_args, sample_kwargs) lists for each
+            (layer, microbatch) pair.  Returns ([], {}) when there are
             no callables.
         """
         if not self.flattened_callables:
@@ -2696,66 +2705,20 @@ class VisionTECudaGraphHelper(TECudaGraphHelper):
 
         return sample_args, sample_kwargs_list
 
-    def _get_cuda_graph_input_data(self):
-        """Build capture inputs: sample tensors + make_graphed_callables kwargs.
+    def _get_sample_arguments(self, order, chunk_id_list=None):
+        """Override parent's buffer-reuse sample generation.
 
-        Overrides the parent to use vision-specific sample arguments
-        (batch-dim = 1, no rotary embeddings, FP8 disabled) and to force
-        ``num_model_chunks = 1``.
+        Vision uses a simple loop with batch_dim=1 and no rotary embeddings.
+        The order and chunk_id_list arguments (used by the parent for
+        buffer lifecycle tracking) are unused here.
         """
-        from megatron.core.pipeline_parallel.schedules import (
-            get_pp_rank_microbatches,
-            get_schedule_table,
-        )
-
-        if parallel_state.get_pipeline_model_parallel_world_size() == 1:
-            self.num_microbatches = 1
-
-        _, _, num_warmup_microbatches, _ = get_pp_rank_microbatches(
-            self.num_microbatches,
-            self.num_model_chunks,
-            getattr(self.config, 'microbatch_group_size_per_vp_stage', None),
-            False,
-        )
-        schedule_table = get_schedule_table(
-            self.num_microbatches,
-            self.num_model_chunks,
-            getattr(self.config, 'microbatch_group_size_per_vp_stage', None),
-        )
-        order = convert_schedule_table_to_order(
-            num_warmup_microbatches, self.num_model_chunks, schedule_table
-        )
-
-        rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
-        logger.info(
-            f"Rank {rank}: Vision CUDA graph order: "
-            f"num_microbatches={self.num_microbatches}, "
-            f"num_warmup={num_warmup_microbatches}, "
-            f"order_len={len(order)}"
-        )
-
-        sample_args, sample_kwargs_list = self._get_sample_args()
-
-        kwargs = {
-            "num_warmup_iters": (
-                self.config.cuda_graph_warmup_steps
-                if hasattr(self.config, 'cuda_graph_warmup_steps')
-                else 3
-            ),
-            "allow_unused_input": True,
-            "_order": order,
-            "_num_layers_per_chunk": [len(self.flattened_callables)],
-            "fp8_enabled": False,
-        }
-
-        if is_te_min_version("2.7.0"):
-            kwargs['_reuse_graph_input_output_buffers'] = True
-        if is_te_min_version("1.10.0") and sample_kwargs_list:
-            kwargs['sample_kwargs'] = tuple(sample_kwargs_list)
-
-        return tuple(sample_args), kwargs
+        sample_args, sample_kwargs = self._get_sample_args()
+        return sample_args, sample_kwargs
 
     # -- capture / teardown overrides --------------------------------------
+    # _start_capturing and _finish_capturing use simplified versions because
+    # the parent's methods perform LM-specific cleanup (MoE aux losses,
+    # reset_model_temporary_tensors) that may not be safe with a vision config.
 
     def _start_capturing(self):
         """Simplified capture start for vision encoder."""
@@ -2778,13 +2741,11 @@ class VisionTECudaGraphHelper(TECudaGraphHelper):
     def create_cudagraphs(self):
         """Capture CUDA Graphs for vision encoder layers per microbatch.
 
-        Extends the parent workflow by:
-
-        1. Removing any existing ``cudagraph_manager`` from vision layers to
-           avoid conflict with the TE graph path.
-        2. Wrapping captured graphs with :func:`_wrap_graph_for_vision` to
-           filter ``None`` from ``(output, None)`` tuples so that
-           ``_te_cuda_graph_replay``'s ``len == 1`` assertion passes.
+        Delegates to the parent's capture workflow after removing any existing
+        cudagraph_manager (which would conflict with the TE graph path),
+        then wraps the captured graphs with _wrap_graph_for_vision to
+        filter None from (output, None) tuples so that
+        _te_cuda_graph_replay's len == 1 assertion passes.
         """
         if not self.flattened_callables:
             logger.warning(
@@ -2796,51 +2757,37 @@ class VisionTECudaGraphHelper(TECudaGraphHelper):
             if hasattr(layer, 'cudagraph_manager'):
                 delattr(layer, 'cudagraph_manager')
 
-        start_time = self._start_capturing()
-        sample_args, kwargs = self._get_cuda_graph_input_data()
+        super().create_cudagraphs()
 
-        if (
-            hasattr(self.config, 'sequence_parallel')
-            and self.config.sequence_parallel
-        ):
-            rng_context = get_cuda_rng_tracker().fork()
-        else:
-            rng_context = nullcontext()
-
-        with rng_context:
-            graphs = make_graphed_callables(
-                tuple(self.flattened_callables), sample_args, **kwargs
-            )
-
-        for layer_idx, layer in enumerate(self.flattened_callables):
-            layer.cuda_graphs = []
-            for microbatch_idx in range(self.num_microbatches):
-                graph_idx = microbatch_idx * len(self.flattened_callables) + layer_idx
-                layer.cuda_graphs.append(_wrap_graph_for_vision(graphs[graph_idx]))
-
-        self._finish_capturing(start_time)
+        for layer in self.flattened_callables:
+            if hasattr(layer, 'cuda_graphs'):
+                layer.cuda_graphs = [_wrap_graph_for_vision(g) for g in layer.cuda_graphs]
 
     def cuda_graph_set_manual_hooks(self, make_forward_pre_hook_fn=None):
         """Set CUDA Graph manual hooks for vision encoder layers.
 
+        Unlike the parent which derives hooks from model chunks, this method
+        accepts an explicit hook factory.  When called without arguments (the
+        common case), no hooks are set.
+
         Args:
             make_forward_pre_hook_fn: Function to create forward pre hooks.
-                If ``None``, hooks are not set.
+                If None, hooks are not set.
         """
         if not self.flattened_callables or not self._graphs_created:
             return
+        if make_forward_pre_hook_fn is None:
+            return
         for layer in self.flattened_callables:
-            if hasattr(layer, 'setup_manual_hooks') and make_forward_pre_hook_fn is not None:
+            if hasattr(layer, 'setup_manual_hooks'):
                 layer.setup_manual_hooks(make_forward_pre_hook_fn)
 
     def delete_cuda_graphs(self):
-        """Delete CUDA graphs to free resources."""
+        """Delete CUDA graphs to free resources.
+
+        Adds a graceful no-op guard (the parent asserts), then delegates
+        to the parent's cleanup which properly resets TE graph objects.
+        """
         if not self._graphs_created:
             return
-        for layer in self.flattened_callables:
-            if hasattr(layer, 'cuda_graphs'):
-                for cuda_graph in layer.cuda_graphs:
-                    del cuda_graph
-                del layer.cuda_graphs
-        self._graphs_created = False
-        logger.info("VisionTECudaGraphHelper: CUDA graphs deleted.")
+        super().delete_cuda_graphs()
