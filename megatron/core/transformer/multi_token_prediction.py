@@ -10,7 +10,7 @@ from torch import Tensor
 
 from megatron.core import InferenceParams, parallel_state, tensor_parallel
 from megatron.core.dist_checkpointing.mapping import ShardedStateDict
-from megatron.core.dist_checkpointing.utils import replace_prefix_for_sharding
+from megatron.core.dist_checkpointing.utils import apply_prefix_mapping, replace_prefix_for_sharding
 from megatron.core.fp8_utils import get_fp8_context
 from megatron.core.models.backends import BackendSpecProvider, LocalSpecProvider
 from megatron.core.packed_seq_params import PackedSeqParams
@@ -642,12 +642,20 @@ def process_mtp_loss(
     Returns:
         Tensor: Updated hidden states after MTP loss processing (first chunk only).
     """
-    mtp_labels = labels.clone()
     hidden_states_list = torch.chunk(hidden_states, 1 + config.mtp_num_layers, dim=0)
     hidden_states = hidden_states_list[0]
 
+    if labels is None:
+        return hidden_states
+
+    mtp_labels = labels.clone()
     if loss_mask is None:
         loss_mask = torch.ones_like(mtp_labels)
+
+    # Store the original number of tokens before rolling for proper normalization
+    # when calculate_per_token_loss is enabled. This ensures MTP gradients are
+    # correctly scaled relative to the main loss gradients in finalize_model_grads.
+    original_num_tokens = loss_mask.sum()
 
     for mtp_layer_number in range(config.mtp_num_layers):
         mtp_logits, _ = output_layer(
@@ -664,18 +672,32 @@ def process_mtp_loss(
         mtp_loss = compute_language_model_loss(mtp_labels, mtp_logits)
         mtp_loss = loss_mask * mtp_loss
         if is_training:
+            mtp_loss_for_log = (
+                torch.sum(mtp_loss) / num_tokens if num_tokens > 0 else mtp_loss.new_tensor(0.0)
+            )
             MTPLossLoggingHelper.save_loss_to_tracker(
-                torch.sum(mtp_loss) / num_tokens,
+                mtp_loss_for_log,
                 mtp_layer_number,
                 config.mtp_num_layers,
                 avg_group=parallel_state.get_data_parallel_group(with_context_parallel=True),
             )
         mtp_loss_scale = config.mtp_loss_scaling_factor / config.mtp_num_layers
         if config.calculate_per_token_loss:
-            hidden_states = MTPLossAutoScaler.apply(hidden_states, mtp_loss_scale * mtp_loss)
+            # When calculate_per_token_loss is enabled, finalize_model_grads will
+            # divide all gradients by total_num_tokens (from main loss).
+            # However, MTP has fewer valid tokens due to rolling. To ensure correct
+            # per-token gradient weighting, we normalize by the rolled token count
+            # and re-scale by the original token count.
+            # Avoid division by zero
+            num_tokens_safe = torch.clamp(num_tokens, min=1)
+            mtp_loss_normalized = (
+                mtp_loss_scale * mtp_loss * (original_num_tokens / num_tokens_safe)
+            )
+            hidden_states = MTPLossAutoScaler.apply(hidden_states, mtp_loss_normalized)
         else:
+            safe_num_tokens = num_tokens.clamp(min=1)
             hidden_states = MTPLossAutoScaler.apply(
-                hidden_states, mtp_loss_scale * mtp_loss / num_tokens
+                hidden_states, mtp_loss_scale * mtp_loss / safe_num_tokens
             )
 
     return hidden_states
@@ -697,8 +719,8 @@ class MultiTokenPredictionLayer(MegatronModule):
     the linear projection. The combined serves as the input of the Transformer block at
     the k-th depth to produce the output representation.
 
-    for more information, please refer to DeepSeek-V3 Technical Report
-    https://github.com/deepseek-ai/DeepSeek-V3/blob/main/DeepSeek_V3.pdf
+    For more information, refer to DeepSeek-V3 Technical Report
+    https://arxiv.org/pdf/2412.19437.pdf
     """
 
     def __init__(
@@ -1097,6 +1119,16 @@ class MultiTokenPredictionLayer(MegatronModule):
             token prediction layer.
         """
         sharded_state_dict = super().sharded_state_dict(prefix, sharded_offsets, metadata)
+
+        # Backward compatibility: GPT MTP checkpoints were saved with the submodule
+        # named 'transformer_layer'. Remap checkpoint keys so old checkpoints load
+        # correctly. Mamba MTP models keep 'mtp_model_layer' as their native format
+        # since no older checkpoints exist for them.
+        if self.mtp_layer_pattern is None:
+            apply_prefix_mapping(
+                sharded_state_dict, {f'{prefix}mtp_model_layer.': f'{prefix}transformer_layer.'}
+            )
+
         return sharded_state_dict
 
 
@@ -1165,8 +1197,8 @@ class MultiTokenPredictionBlock(MegatronModule):
     When `mtp_use_repeated_layer=True` in config, instead of creating N separate MTP layers,
     only 1 layer is created and applied mtp_num_layers times.
 
-    for more information, please refer to DeepSeek-V3 Technical Report
-    https://github.com/deepseek-ai/DeepSeek-V3/blob/main/DeepSeek_V3.pdf
+    For more information, please refer to DeepSeek-V3 Technical Report
+    https://arxiv.org/pdf/2412.19437.pdf
     """
 
     def __init__(

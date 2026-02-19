@@ -15,7 +15,7 @@ from megatron.core.inference.batch_dimensions_utils import (
     CUDAGraphBatchDimensionBuilder,
     InferenceBatchDimensions,
 )
-from megatron.core.inference.config import InferenceConfig
+from megatron.core.inference.config import InferenceConfig, KVCacheManagementMode
 from megatron.core.inference.inference_request import DynamicInferenceRequest
 from megatron.core.inference.sampling_params import SamplingParams
 from megatron.core.inference.unified_memory import (
@@ -35,6 +35,7 @@ from .attention_context.mamba_metadata import MambaMetadata
 from .attention_context.mha_metadata import GraphedMHAMetadata, NonGraphedMHAMetadata
 from .base_context import BaseInferenceContext
 from .dynamic_block_allocator import BlockAllocator
+from .routing_metadata import RoutingMetadata
 
 try:
     from .fused_kv_append_kernel import triton_append_key_value_cache
@@ -347,10 +348,12 @@ class DynamicInferenceContext(BaseInferenceContext):
             mamba_states_memory_per_request *= self.num_mamba_layers
             mamba_states_memory_per_request *= dtype_size_bytes
 
-        # Unified memory.
+        # Unified memory and general tensor management.
         self.unified_memory_level = inference_config.unified_memory_level
-        self.persist_cuda_graphs = inference_config.persist_cuda_graphs
-        if self.unified_memory_level > 0:
+        self.static_kv_memory_pointers = inference_config.static_kv_memory_pointers
+        self.kv_cache_management_mode = inference_config.kv_cache_management_mode
+
+        if self.unified_memory_level != 0:
             try:
                 self.unified_memory_mempool = create_unified_mempool()
             except UnifiedMemoryUnsupportedError:
@@ -359,6 +362,23 @@ class DynamicInferenceContext(BaseInferenceContext):
                         "Unified memory requested but not available; defaulting to GPU memory."
                     )
                 self.unified_memory_level = 0
+        # If we are in a mode that requires static KV memory pointers,
+        # we must have either UVM or torch_memory_saver.
+        if (
+            self.static_kv_memory_pointers
+            and self.kv_cache_management_mode != KVCacheManagementMode.PERSIST
+        ):
+            assert HAVE_TORCH_MEMORY_SAVER or self.unified_memory_level != 0, (
+                "Static KV memory pointers require UVM or torch_memory_saver when not persisted. "
+                "Use --rl-kv-cache-management-mode=persist, UVM, or install torch_memory_saver."
+            )
+
+        # When not using `torch_memory_saver`, we manually offload/restore tensors.
+        # We use storage resize, similar to the logic in `core/distributed/param_and_grad_buffer.py`
+        self._offloadable_tensor_names: set[str] = set()
+        self._offloadable_cpu_backups: dict[str, torch.Tensor] = {}
+        self._offloadable_storage_sizes: dict[str, int] = {}
+        self._uses_torch_memory_saver: bool = False
 
         # Initialize block allocator.
         buffer_size_bytes = int(inference_config.buffer_size_gb * 1024**3)
@@ -367,13 +387,33 @@ class DynamicInferenceContext(BaseInferenceContext):
             if inference_config.paused_buffer_size_gb is None
             else int(inference_config.paused_buffer_size_gb * 1024**3)
         )
-        # TODO: Add parameter to control fraction of memory assigned to KV cache
-        # versus Mamba state.
-        block_count = buffer_size_bytes // (self.block_size_bytes + mamba_states_memory_per_request)
-        block_count = max(2, block_count)  # need >= 1 active block + 1 dummy block
-        paused_block_count = paused_buffer_size_bytes // (
-            self.block_size_bytes + mamba_states_memory_per_request
-        )
+
+        mamba_max_requests = float('inf')
+
+        if (mamba_memory_ratio := inference_config.mamba_memory_ratio) is not None:
+            assert self.is_hybrid_model
+            assert mamba_memory_ratio > 0 and mamba_memory_ratio < 1
+
+            # Calculate total memory before partition
+            total_memory = buffer_size_bytes + paused_buffer_size_bytes
+            mamba_memory_bytes = total_memory * mamba_memory_ratio
+            mamba_max_requests = int(mamba_memory_bytes // mamba_states_memory_per_request)
+
+            # Reduce buffer sizes for KV cache
+            buffer_size_bytes = int(buffer_size_bytes * (1.0 - mamba_memory_ratio))
+            paused_buffer_size_bytes = int(paused_buffer_size_bytes * (1.0 - mamba_memory_ratio))
+
+            block_count = buffer_size_bytes // self.block_size_bytes
+            block_count = max(2, block_count)  # need >= 1 active block + 1 dummy block
+            paused_block_count = paused_buffer_size_bytes // self.block_size_bytes
+        else:
+            block_count = buffer_size_bytes // (
+                self.block_size_bytes + mamba_states_memory_per_request
+            )
+            block_count = max(2, block_count)  # need >= 1 active block + 1 dummy block
+            paused_block_count = paused_buffer_size_bytes // (
+                self.block_size_bytes + mamba_states_memory_per_request
+            )
 
         # If using pipeline parallelism synchronize the total block count in case the
         # pipeline stages have different layer allocations. Non-uniform block counts
@@ -432,11 +472,20 @@ class DynamicInferenceContext(BaseInferenceContext):
         if inference_config.max_requests is None:
             # Maximize compute utilization by defaulting to 1 block per request.
             self.max_requests = self.block_allocator.total_count - 1  # -1 for dummy block
+
+            # Adjust max_requests for Mamba memory constraints if necessary
+            if self.is_hybrid_model and mamba_max_requests < self.max_requests:
+                self.max_requests = int(mamba_max_requests)
+
             self.max_requests = self.max_requests // tp_size * tp_size
             self.max_requests = self.max_requests // self.REQUEST_ROUNDER * self.REQUEST_ROUNDER
         else:
             # User can control request overflow via max_requests.
             self.max_requests = inference_config.max_requests
+
+        assert (
+            self.max_requests % tp_size == 0
+        ), f"max_requests must be divisible by tp_size ({tp_size}), but got {self.max_requests}"
 
         self.max_tokens = inference_config.max_tokens or self.DEFAULT_MAX_TOKENS
 
@@ -452,6 +501,7 @@ class DynamicInferenceContext(BaseInferenceContext):
         self.graph_attn_metadata = {}
         self.non_graph_attn_metadata = {}
         self.active_attn_metadata = None
+        self.is_creating_cuda_graphs = False
 
         self.graph_attn_metadata["mha_metadata"] = GraphedMHAMetadata(
             block_count_total=self.block_allocator.total_count,
@@ -468,6 +518,13 @@ class DynamicInferenceContext(BaseInferenceContext):
             block_size_tokens=self.block_size_tokens,
             max_seqlen=self.max_sequence_length,
         )
+
+        self.moe_enable_routing_replay = model_config.moe_enable_routing_replay
+        if self.moe_enable_routing_replay:
+            assert (
+                model_config.num_moe_experts is not None
+            ), "Router recording/replay requested but no MoE experts specified!"
+            self.moe_routing_metadata = RoutingMetadata(self, model_config.moe_router_topk)
 
         # CUDA graph config list
         self.use_cuda_graphs_for_non_decode_steps = (
@@ -486,16 +543,10 @@ class DynamicInferenceContext(BaseInferenceContext):
             )
         )
 
-        # Whether to offload the KV cache. Determines where the KV cache is allocated within memory.
-        self.offload_kv_cache = inference_config.offload_kv_cache
-        assert not (
-            self.offload_kv_cache and self.unified_memory_level
-        ), "The KV cache should not be instantiated in unified memory when it is offloaded during training."
-
         self._using_cuda_graph_this_step = False
         # Deal with chunked prefill
+        self.enable_chunked_prefill = inference_config.enable_chunked_prefill
         self.chunked_prefill_request_id = -1
-        self.has_explicit_chunked_prefill_req = False
 
         # FlashInfer.
         if inference_config.use_flashinfer_fused_rope is True:
@@ -507,7 +558,7 @@ class DynamicInferenceContext(BaseInferenceContext):
         # Allocate GPU state.
         self.is_tensor_state_allocated = False
         self.is_symmetric_memory_initialized = False
-        self.allocate_all_tensors(is_init=True)
+        self.initialize_all_tensors()
 
         # Print info.
         logging.info(
@@ -518,23 +569,76 @@ class DynamicInferenceContext(BaseInferenceContext):
             )
         )
 
-    def allocate_all_tensors(self, *, is_init: bool) -> None:
-        """Allocate GPU state.
+    def _allocate_memory_buffer(self):
+        """Allocate the KV cache memory buffer."""
+        if self.cache_mla_latent:
+            self.memory_buffer = torch.empty(
+                (
+                    self.num_attention_layers,
+                    self.block_allocator.total_count,
+                    self.block_size_tokens,
+                    self.kv_reduced_dim,
+                ),
+                dtype=self.params_dtype,
+                device=torch.cuda.current_device(),
+            )
+        else:
+            self.memory_buffer = torch.empty(
+                (
+                    2,  # key and value
+                    self.num_attention_layers,
+                    self.block_allocator.total_count,
+                    self.block_size_tokens,
+                    self.num_attention_heads_per_partition,
+                    self.hidden_size_per_attention_head,
+                ),
+                dtype=self.params_dtype,
+                device=torch.cuda.current_device(),
+            )
+        if (
+            self.kv_cache_management_mode == KVCacheManagementMode.OFFLOAD
+            and not self._uses_torch_memory_saver
+        ):
+            assert self.unified_memory_level == 0
+            self._offloadable_tensor_names.add("memory_buffer")
+            self._offloadable_cpu_backups["memory_buffer"] = torch.empty_like(
+                self.memory_buffer, device="cpu"
+            ).pin_memory()
 
-        This method is used for both 1) initial allocation, and 2) resuming the
-        GPU state after a suspend.
+    def _allocate_mamba_states(self):
+        """Allocate Mamba states for hybrid models."""
+        if self.is_hybrid_model:
+            self.mamba_metadata = MambaMetadata(
+                max_requests=self.max_requests, max_tokens=self.max_tokens
+            )
+            self.mamba_conv_states = torch.empty(
+                (self.num_mamba_layers, self.max_requests) + self.mamba_conv_states_shape,
+                dtype=self.params_dtype,
+                device=torch.cuda.current_device(),
+            )
+            self.mamba_ssm_states = torch.empty(
+                (self.num_mamba_layers, self.max_requests) + self.mamba_ssm_states_shape,
+                dtype=self.params_dtype,
+                device=torch.cuda.current_device(),
+            )
+            if (
+                self.kv_cache_management_mode == KVCacheManagementMode.OFFLOAD
+                and not self._uses_torch_memory_saver
+            ):
+                assert self.unified_memory_level == 0
+                self._offloadable_tensor_names.add("mamba_conv_states")
+                self._offloadable_cpu_backups["mamba_conv_states"] = torch.empty_like(
+                    self.mamba_conv_states, device="cpu"
+                ).pin_memory()
+                self._offloadable_tensor_names.add("mamba_ssm_states")
+                self._offloadable_cpu_backups["mamba_ssm_states"] = torch.empty_like(
+                    self.mamba_ssm_states, device="cpu"
+                ).pin_memory()
+        else:
+            self.mamba_metadata = None
 
-        Args:
-            is_init (bool): True if this is being called from `__init__()`.
-        """
-
-        # Only allocate tensors when not using unified memory at all (level 0),
-        # or for initial allocation during `__init__()`. For levels 1 and 2, we do
-        # not perform any explicit allocations or deallocations after the initial
-        # call to `__init__()`.
-        if self.unified_memory_level != 0 and not is_init:
-            return
-
+    def initialize_all_tensors(self) -> None:
+        """Allocate all GPU state during initial construction."""
         # Mark allocated.
         if self.is_tensor_state_allocated:
             return
@@ -544,7 +648,7 @@ class DynamicInferenceContext(BaseInferenceContext):
         for key in vars(self).keys():
             value = getattr(self, key)
             assert not isinstance(value, torch.Tensor), (
-                "All tensors should be allocated within `allocate_all_tensors()."
+                "All tensors should be allocated within `initialize_all_tensors()`. "
                 f"Please move tensor '{key}'."
             )
 
@@ -590,103 +694,86 @@ class DynamicInferenceContext(BaseInferenceContext):
         self.token_to_position_in_request = torch.empty_like(self.token_to_input_ids)
         self.token_to_local_position_within_kv_block = torch.empty_like(self.token_to_input_ids)
 
-        # Memory buffer.
-        def allocate_memory_buffer():
-            """Allocate the memory buffer. This function is called below within
-            `with ctx_manager:`."""
-            if self.cache_mla_latent:
-                self.memory_buffer = torch.empty(
-                    (
-                        self.num_attention_layers,
-                        self.block_allocator.total_count,
-                        self.block_size_tokens,
-                        self.kv_reduced_dim,
-                    ),
-                    dtype=self.params_dtype,
-                    device=torch.cuda.current_device(),
-                )
-            else:
-                ctx = (
-                    torch_memory_saver.region(tag="kv_cache", enable_cpu_backup=True)
-                    if HAVE_TORCH_MEMORY_SAVER and self.offload_kv_cache
-                    else nullcontext()
-                )
-
-                with ctx:
-                    self.memory_buffer = torch.empty(
-                        (
-                            2,  # key and value
-                            self.num_attention_layers,
-                            self.block_allocator.total_count,
-                            self.block_size_tokens,
-                            self.num_attention_heads_per_partition,
-                            self.hidden_size_per_attention_head,
-                        ),
-                        dtype=self.params_dtype,
-                        device=torch.cuda.current_device(),
-                    )
-
-        # Optional state tensors for hybrid models
-        def allocate_mamba_states():
-            """Allocate Mamba states. This function is called below within
-            `with ctx_manager:`."""
-            if self.is_hybrid_model:
-                self.mamba_metadata = MambaMetadata(
-                    max_requests=self.max_requests, max_tokens=self.max_tokens
-                )
-                self.mamba_conv_states = torch.empty(
-                    (self.num_mamba_layers, self.max_requests) + self.mamba_conv_states_shape,
-                    dtype=self.params_dtype,
-                    device=torch.cuda.current_device(),
-                )
-                self.mamba_ssm_states = torch.empty(
-                    (self.num_mamba_layers, self.max_requests) + self.mamba_ssm_states_shape,
-                    dtype=self.params_dtype,
-                    device=torch.cuda.current_device(),
-                )
-
-            else:
-                self.mamba_metadata = None
-
-        # Allocate `ctx_manager`-managed buffers. (For currently unknown reasons,
-        # `ctx_manager` can only be used once.)
-        ctx_manager = (
-            torch.cuda.use_mem_pool(self.unified_memory_mempool)
-            if self.unified_memory_level > 0
-            else nullcontext()
+        # Allocate large non-graphed buffers.
+        need_static_addr = (
+            self.static_kv_memory_pointers
+            and self.kv_cache_management_mode != KVCacheManagementMode.PERSIST
         )
+
+        ctx_manager = nullcontext()
+        if self.unified_memory_level != 0:
+            ctx_manager = torch.cuda.use_mem_pool(self.unified_memory_mempool)
+        elif HAVE_TORCH_MEMORY_SAVER and need_static_addr:
+            ctx_manager = torch_memory_saver.region(
+                tag="inference_context",
+                enable_cpu_backup=(self.kv_cache_management_mode == KVCacheManagementMode.OFFLOAD),
+            )
+            self._uses_torch_memory_saver = True
         with ctx_manager:
-            allocate_memory_buffer()
-            allocate_mamba_states()
+            self._allocate_memory_buffer()
+            self._allocate_mamba_states()
 
         # Reset attention and Mamba state.
         self.reset_attention_state()
         self.reset_mamba_state()
 
-    def deallocate_all_tensors(self):
-        """Deallocate GPU state.
+    def reinitialize_inference_state_buffers(self):
+        """Restore large tensors (KV cache, Mamba states) after a suspend.
 
-        This method is used for suspending the dynamic engine.
+        Called by the engine during `resume()`. Initial allocation is in `initialize_all_tensors()`.
         """
+        if self.is_tensor_state_allocated:
+            return
+        self.is_tensor_state_allocated = True
 
-        # Only deallocate tensors when not using unified memory at all (level 0).
-        # For levels 1 and 2, we do not perform any explicit allocations or
-        # deallocations after the initial call to `__init__()`.
-        if self.unified_memory_level != 0:
+        if self.kv_cache_management_mode == KVCacheManagementMode.PERSIST:
             return
 
-        # Mark deallocated.
+        if self.unified_memory_level != 0 or self._uses_torch_memory_saver:
+            if self.kv_cache_management_mode == KVCacheManagementMode.RECOMPUTE:
+                self.reset()
+            if self._uses_torch_memory_saver:
+                torch_memory_saver.resume("inference_context")
+            return
+
+        if self.kv_cache_management_mode == KVCacheManagementMode.OFFLOAD:
+            for name, tensor in ((n, getattr(self, n)) for n in self._offloadable_tensor_names):
+                tensor.storage().resize_(self._offloadable_storage_sizes[name])
+                tensor.copy_(self._offloadable_cpu_backups[name], non_blocking=True)
+        elif self.kv_cache_management_mode == KVCacheManagementMode.RECOMPUTE:
+            self.is_tensor_state_allocated = False
+            self.initialize_all_tensors()
+
+    def deallocate_inference_state_buffers(self):
+        """Deallocate large tensors (KV cache, Mamba states) during suspend.
+
+        Called by the engine during `suspend()`. Mirror to `reinitialize_inference_state_buffers()`.
+        """
         if not self.is_tensor_state_allocated:
             return
         self.is_tensor_state_allocated = False
 
-        # Delete all tensor attributes.
-        # TODO(@lmcafee): check that device == 'cuda'?
-        keys = list(vars(self).keys())
-        for key in keys:
-            value = getattr(self, key)
-            if isinstance(value, torch.Tensor):
-                delattr(self, key)
+        if self.kv_cache_management_mode == KVCacheManagementMode.PERSIST:
+            return
+
+        if self.unified_memory_level != 0:
+            return
+
+        if self._uses_torch_memory_saver:
+            torch_memory_saver.pause("inference_context")
+            return
+
+        if self.kv_cache_management_mode == KVCacheManagementMode.OFFLOAD:
+            for name, tensor in ((n, getattr(self, n)) for n in self._offloadable_tensor_names):
+                self._offloadable_storage_sizes[name] = tensor.storage().size()
+                self._offloadable_cpu_backups[name].copy_(tensor, non_blocking=True)
+                tensor.storage().resize_(0)
+        elif self.kv_cache_management_mode == KVCacheManagementMode.RECOMPUTE:
+            # TODO(@lmcafee): check that device == 'cuda'?
+            for key in list(vars(self).keys()):
+                value = getattr(self, key)
+                if isinstance(value, torch.Tensor):
+                    delattr(self, key)
 
     @classmethod
     def round_up_tokens(cls, value, tp_size=None):
@@ -1183,15 +1270,16 @@ class DynamicInferenceContext(BaseInferenceContext):
         Return:
             None.
         """
-        # if in recording mode, add dummy requests for cuda graph capture
-        if construct_graph_dimensions is not None:
+        self.is_creating_cuda_graphs = construct_graph_dimensions is not None
+
+        # If in CUDA graph creation mode, add dummy requests for CUDA graph capture
+        if self.is_creating_cuda_graphs:
             self.add_dummy_requests_for_cudagraph_capture(construct_graph_dimensions)
 
         batch_dimensions = InferenceBatchDimensions(
             token_count=self.active_token_count,
             prefill_req_count=self.num_prefill_requests,
             decode_req_count=self.num_decode_requests,
-            has_explicit_chunked_prefill_req=self.has_explicit_chunked_prefill_req,
         )
         self.batch_dimensions = batch_dimensions
         best_graph = CUDAGraphBatchDimensionBuilder.match_graph_config(
@@ -1199,6 +1287,7 @@ class DynamicInferenceContext(BaseInferenceContext):
             self.cuda_graph_batch_dimensions_list,
             strict=self.is_hybrid_model,
             decode_only_cuda_graphs=(not self.use_cuda_graphs_for_non_decode_steps),
+            explicit_chunked_prefill=self.is_chunked_prefill_enabled() and self.is_hybrid_model,
             ep_group=self.expert_model_parallel_group,
         )
         self._using_cuda_graph_this_step = best_graph is not None
@@ -1226,7 +1315,6 @@ class DynamicInferenceContext(BaseInferenceContext):
                 token_count=padded_token_count,
                 prefill_req_count=padded_prefill_req_count,
                 decode_req_count=padded_decode_req_count,
-                has_explicit_chunked_prefill_req=self.has_explicit_chunked_prefill_req,
             )
         self.padded_active_token_count = self.padded_batch_dimensions.token_count
         self.padded_active_request_count = self.padded_batch_dimensions.req_count
@@ -1257,8 +1345,6 @@ class DynamicInferenceContext(BaseInferenceContext):
 
         attn_dimensions = batch_dimensions
         if self.using_cuda_graph_this_step():
-            assert not self.has_explicit_chunked_prefill_req
-
             # Treat some decode requests as prefill requests to fit the cuda graph batch dimension.
             if batch_dimensions.decode_req_count > self.padded_batch_dimensions.decode_req_count:
                 total_req = batch_dimensions.req_count
@@ -1268,7 +1354,6 @@ class DynamicInferenceContext(BaseInferenceContext):
                     token_count=batch_dimensions.token_count,
                     prefill_req_count=adjusted_prefill_req_count,
                     decode_req_count=adjusted_decode_req_count,
-                    has_explicit_chunked_prefill_req=False,
                 )
 
         assert self.active_attn_metadata is not None
@@ -1292,7 +1377,14 @@ class DynamicInferenceContext(BaseInferenceContext):
                 cu_seqlens,
                 batch_dimensions=attn_dimensions,
                 padded_batch_dimensions=self.padded_batch_dimensions,
+                enable_chunked_prefill=self.is_chunked_prefill_enabled(),
             )
+
+        if self.moe_enable_routing_replay:
+            if self.using_cuda_graph_this_step():
+                self.moe_routing_metadata.enable_static_buffer_recording()
+            else:
+                self.moe_routing_metadata.disable_static_buffer_recording()
 
     def reset(self) -> None:
         """Reset entire context.
@@ -1348,9 +1440,9 @@ class DynamicInferenceContext(BaseInferenceContext):
 
         # Reset chunked prefill state
         self.chunked_prefill_request_id = -1
-        self.has_explicit_chunked_prefill_req = False
         self.num_prefill_requests = 0
         self._using_cuda_graph_this_step = False
+        self.is_creating_cuda_graphs = False
         self.padded_batch_dimensions = InferenceBatchDimensions(
             token_count=0, prefill_req_count=0, decode_req_count=0
         )
@@ -1408,9 +1500,12 @@ class DynamicInferenceContext(BaseInferenceContext):
         """
         Check if the request can be added to the context.
         """
+        # Note that for hybrid models checking the total request count is sufficient
+        # because we allocate a single set of Mamba state tensors for each request
         request_can_be_added = (
             self.total_request_count < self.max_requests and self.paused_request_count == 0
         )
+
         request_tokens_can_be_added = (
             self.active_token_count + req.remaining_prompt_length <= self.max_tokens
         )
@@ -1615,6 +1710,12 @@ class DynamicInferenceContext(BaseInferenceContext):
             (int) Index of the chunked prefill request, or -1 if none exists.
         """
         return torch.where(self.request_ids == self.chunked_prefill_request_id)[0][0]
+
+    def is_chunked_prefill_enabled(self) -> bool:
+        """Returns whether chunked prefill is enabled."""
+        if self.is_hybrid_model:
+            return self.enable_chunked_prefill and not self.is_creating_cuda_graphs
+        return self.enable_chunked_prefill
 
     def release_memory_blocks_from_request_indexes(self, request_indexes) -> None:
         """Release memory blocks used by the given request idxs.
@@ -1876,7 +1977,6 @@ class DynamicInferenceContext(BaseInferenceContext):
             active_requests_mask[-1] = (
                 1  # must keep this, next iteration will add a new chunk to it
             )
-        self.has_explicit_chunked_prefill_req = False
 
         active_request_count = (active_requests_mask == 1).sum().item()
         finished_request_count = (active_requests_mask == 0).sum().item()

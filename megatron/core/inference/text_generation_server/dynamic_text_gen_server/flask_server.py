@@ -1,13 +1,16 @@
 # Copyright (c) 2025, NVIDIA CORPORATION. All rights reserved.
 
+import asyncio
 import logging
 import socket
+from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
 
 try:
     from flask import Flask
     from hypercorn.asyncio import serve
     from hypercorn.config import Config
+    from hypercorn.middleware import AsyncioWSGIMiddleware
 
     HAS_FLASK = True
 except ImportError as e:
@@ -33,8 +36,14 @@ def temp_log_level(level, logger=None):
 
 
 @trace_async_exceptions
-async def run_flask_server(coordinator_addr: str, tokenizer, rank: int, flask_port: int):
-    """Initializes and runs the async Flask server."""
+async def run_flask_server_on_client(
+    client: InferenceClient,
+    tokenizer,
+    flask_port: int,
+    parsers: list[str] = None,
+    verbose: bool = False,
+):
+    """Initializes and runs the async Flask server using the provided InferenceClient."""
     if not HAS_FLASK:
         raise RuntimeError(f"Flask not available")
 
@@ -44,15 +53,13 @@ async def run_flask_server(coordinator_addr: str, tokenizer, rank: int, flask_po
         logger.warning(f"Could not get hostname: {e}")
         hostname = "0.0.0.0"
 
-    inference_client = InferenceClient(coordinator_addr)
-    await inference_client.start()
-    logger.info(f"Rank {rank}: InferenceClient connected.")
-
     app = Flask(__name__)
 
     # Store client and tokenizer in app config for Blueprints to use
-    app.config['client'] = inference_client
+    app.config['client'] = client
     app.config['tokenizer'] = tokenizer
+    app.config['parsers'] = parsers
+    app.config['verbose'] = verbose
 
     # Register all blueprints from the 'endpoints' package
     for endpoint in endpoints.__all__:
@@ -62,15 +69,41 @@ async def run_flask_server(coordinator_addr: str, tokenizer, rank: int, flask_po
     def health_check():
         return "Megatron Dynamic Inference Server is running."
 
+    loop = asyncio.get_event_loop()
+
     config = Config()
+    config.wsgi_max_body_size = 2**30  # 1 GB; needed for large prompts.
+    config.keep_alive_timeout = 30.0  # Keep connection alive between long-running requests.
+    config.backlog = 2**14  # Expect high load; ensure we do not drop connections.
+    config.h2_max_concurrent_streams = 2**14  # Allow many concurrent streams for HTTP/2 clients.
     config.bind = [f"0.0.0.0:{flask_port}"]
 
     # Force logging level to INFO to ensure that hostname is printed
     with temp_log_level(logging.INFO, logger):
         logger.info(f"Starting Flask server on http://{hostname}:{flask_port}")
+        logger.info(f"Using tokenizer: {type(tokenizer)}")
+        logger.info(f"Using parsers: {parsers}")
 
+    loop.set_default_executor(ThreadPoolExecutor(max_workers=8192))
+    await serve(AsyncioWSGIMiddleware(app), config)
+
+
+@trace_async_exceptions
+async def run_flask_server(
+    coordinator_addr: str,
+    tokenizer,
+    rank: int,
+    flask_port: int,
+    parsers: list[str] = None,
+    verbose: bool = False,
+):
+    """Initializes and runs the async Flask server
+    starting an InferenceClient with the provided coordinator address."""
+    inference_client = InferenceClient(coordinator_addr)
+    await inference_client.start()
+    logger.info(f"Rank {rank}: InferenceClient connected.")
     try:
-        await serve(app, config)
+        await run_flask_server_on_client(inference_client, tokenizer, flask_port, parsers, verbose)
     finally:
         await inference_client.stop()
         logger.info(f"Rank {rank}: Flask server and client shut down.")
