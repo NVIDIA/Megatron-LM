@@ -24,7 +24,7 @@ from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.transformer.cuda_graphs import (
     HAVE_TE_GRAPHS,
     VisionTECudaGraphHelper,
-    _vision_layer_is_graphable,
+    _layer_is_graphable,
     _wrap_graph_for_vision,
     get_vision_cuda_graph_seq_length,
     set_current_microbatch,
@@ -43,13 +43,13 @@ if not _te_version_ok and __name__ != "__main__":
 
 
 # ---------------------------------------------------------------------------
-# Tests for _vision_layer_is_graphable
+# Tests for _layer_is_graphable
 # ---------------------------------------------------------------------------
 class TestVisionLayerIsGraphable:
     def test_non_transformer_layer_returns_false(self):
         config = SimpleNamespace(cuda_graph_impl="transformer_engine")
         layer = torch.nn.Linear(4, 4)
-        assert _vision_layer_is_graphable(layer, config) is False
+        assert _layer_is_graphable(layer, config) is False
 
     def test_wrong_cuda_graph_impl_returns_false(self):
         from megatron.core.transformer.transformer_layer import TransformerLayer
@@ -57,7 +57,7 @@ class TestVisionLayerIsGraphable:
         config = SimpleNamespace(cuda_graph_impl="local")
         layer = MagicMock(spec=TransformerLayer)
         # isinstance check with MagicMock(spec=...) should pass
-        assert _vision_layer_is_graphable(layer, config) is False
+        assert _layer_is_graphable(layer, config) is False
 
     def test_correct_config_with_transformer_layer(self):
         """Real TransformerLayer + cuda_graph_impl='transformer_engine' -> True."""
@@ -76,7 +76,7 @@ class TestVisionLayerIsGraphable:
 
         block = TransformerBlock(config, get_vit_layer_with_transformer_engine_spec())
         layer = block.layers[0]
-        assert _vision_layer_is_graphable(layer, config) is True
+        assert _layer_is_graphable(layer, config) is True
 
         Utils.destroy_model_parallel()
 

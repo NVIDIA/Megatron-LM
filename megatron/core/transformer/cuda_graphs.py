@@ -2486,16 +2486,6 @@ def set_current_microbatch(model, microbatch_id):
 # ---------------------------------------------------------------------------
 
 
-def _vision_layer_is_graphable(layer, config):
-    """Check if a vision encoder layer is graphable."""
-    from megatron.core.transformer.transformer_layer import TransformerLayer
-
-    if not isinstance(layer, TransformerLayer):
-        return False
-    if config.cuda_graph_impl != "transformer_engine":
-        return False
-    return True
-
 
 def _wrap_graph_for_vision(graph_fn):
     """Wrap a graphed callable to filter out None outputs.
@@ -2623,7 +2613,7 @@ class VisionTECudaGraphHelper(TECudaGraphHelper):
                 self.vision_model.decoder, 'layers'
             ):
                 for layer in self.vision_model.decoder.layers:
-                    if _vision_layer_is_graphable(layer, vision_config):
+                    if _layer_is_graphable(layer, vision_config):
                         vision_layers.append(layer)
 
         # -- populate parent-compatible data structures --------------------
