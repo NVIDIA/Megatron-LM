@@ -109,7 +109,7 @@ class _StubEngine(DynamicInferenceEngine):
     def __init__(self, context: DynamicInferenceContext):
         self.context = context
         self.enable_chunked_prefill = False
-        self._prefix_coordination_waits = 0
+        self._prefix_coordination_skips = 0
         self._loop = asyncio.new_event_loop()
         self.waiting_request_ids: deque = deque()
         self.requests = {}
@@ -762,7 +762,7 @@ class TestEngineScheduling(PrefixCachingTestBase):
         self._add_to_waiting(engine, ctx, req2)
         engine.schedule_non_chunked_prefill()
         assert len(engine.waiting_request_ids) == 1
-        assert engine._prefix_coordination_waits == 1
+        assert engine._prefix_coordination_skips == 1
         ctx.mark_pending_blocks_computed()
         engine.schedule_non_chunked_prefill()
         assert len(engine.waiting_request_ids) == 0
@@ -775,18 +775,52 @@ class TestEngineScheduling(PrefixCachingTestBase):
         bs = ctx.block_size_tokens
         engine = self._engine(ctx)
         prompt = self._prompt(bs * 2)
-        assert engine.get_prefix_coordination_metrics() == {"waits": 0}
+        assert engine.get_prefix_coordination_metrics() == {"skips": 0}
         req1 = self._req(ctx, prompt.clone())
         ctx.add_request(req1)
         req2 = self._req(ctx, prompt.clone(), request_id=2)
         self._add_to_waiting(engine, ctx, req2)
         engine.schedule_non_chunked_prefill()
-        assert engine.get_prefix_coordination_metrics() == {"waits": 1}
+        assert engine.get_prefix_coordination_metrics() == {"skips": 1}
         engine.schedule_non_chunked_prefill()
-        assert engine.get_prefix_coordination_metrics() == {"waits": 2}
+        assert engine.get_prefix_coordination_metrics() == {"skips": 2}
         ctx.mark_pending_blocks_computed()
         engine.schedule_non_chunked_prefill()
-        assert engine.get_prefix_coordination_metrics() == {"waits": 2}
+        assert engine.get_prefix_coordination_metrics() == {"skips": 2}
+
+    @pytest.mark.internal
+    def test_pending_requests_skipped_over(self):
+        """Pending req2 is skipped; non-pending req3 and req4 are scheduled."""
+        ctx = self._ctx()
+        bs = ctx.block_size_tokens
+        engine = self._engine(ctx)
+
+        # req1: add to context directly (starts prefill, blocks become pending)
+        prompt_shared = self._prompt(bs * 2)
+        req1 = self._req(ctx, prompt_shared.clone())
+        ctx.add_request(req1)
+
+        # req2: same prefix as req1 -> has pending blocks -> will be skipped
+        req2 = self._req(ctx, prompt_shared.clone(), request_id=2)
+        self._add_to_waiting(engine, ctx, req2)
+
+        # req3: different prefix -> no pending blocks -> should be scheduled
+        prompt_diff1 = self._prompt(bs * 2, offset=1000)
+        req3 = self._req(ctx, prompt_diff1.clone(), request_id=3)
+        self._add_to_waiting(engine, ctx, req3)
+
+        # req4: different prefix -> no pending blocks -> should be scheduled
+        prompt_diff2 = self._prompt(bs * 2, offset=2000)
+        req4 = self._req(ctx, prompt_diff2.clone(), request_id=4)
+        self._add_to_waiting(engine, ctx, req4)
+
+        engine.schedule_non_chunked_prefill()
+
+        # req3 and req4 should be scheduled, req2 should remain waiting
+        assert len(engine.waiting_request_ids) == 1
+        assert engine.waiting_request_ids[0] == 2
+        assert ctx.total_request_count == 3  # req1 + req3 + req4
+        assert engine._prefix_coordination_skips == 1
 
 
 # =========================================================================

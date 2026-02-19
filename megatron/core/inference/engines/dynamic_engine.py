@@ -19,7 +19,9 @@ import torch
 from torch import Tensor
 from torch.cuda.nvtx import range_pop, range_push
 
+from megatron.core.inference.config import PrefixCachingEvictPolicy
 from megatron.core.inference.contexts.dynamic_context import (
+    BlockOverflowError,
     DynamicInferenceContext,
     MaxSequenceLengthOverflowError,
     TokenOverflowError,
@@ -259,7 +261,7 @@ class DynamicInferenceEngine(AbstractEngine):
         self.resume_request_ids = None
 
         # Prefix caching coordination state.
-        self._prefix_coordination_waits = 0
+        self._prefix_coordination_skips = 0
 
         # Coordinator state.
         self.use_coordinator = False
@@ -1172,9 +1174,9 @@ class DynamicInferenceEngine(AbstractEngine):
         """Return prefix caching coordination metrics.
 
         Returns:
-            Dict with coordination stats including the number of scheduling waits.
+            Dict with coordination stats including the number of scheduling skips.
         """
-        return {"waits": self._prefix_coordination_waits}
+        return {"skips": self._prefix_coordination_skips}
 
     def schedule_waiting_requests(self):
         """Tries to schedule any requests in the waiting pool."""
@@ -1183,88 +1185,197 @@ class DynamicInferenceEngine(AbstractEngine):
         else:
             self.schedule_non_chunked_prefill()
 
-    def _gpu_precompute_prefix_matches(self) -> tuple:
-        """Pre-compute prefix matching for all waiting requests using GPU batch kernel.
+    def _precompute_scheduling_data(self):
+        """Pre-compute batch prefix matching and request properties for vectorized scheduling.
+
+        Single loop gathers both block hashes (for the Triton batch kernel) and
+        remaining prompt lengths (for the vectorized availability check).
 
         Returns:
-            Tuple of (num_matched, has_pending, matched_block_ids) GPU tensors,
-            or None if no waiting requests or prefix caching disabled.
+            Tuple of (batch_prefix_result, remaining_lengths):
+            - batch_prefix_result: (num_matched, has_pending, matched_block_ids) or None
+            - remaining_lengths: [N] int64 GPU tensor of remaining prompt lengths
+            Returns (None, None) if no waiting requests.
         """
-        if not self.context.enable_prefix_caching:
-            return None
-        if not self.waiting_request_ids:
-            return None
+        n = len(self.waiting_request_ids)
+        if n == 0:
+            return None, None
 
-        # Collect hashes from all waiting requests
+        device = torch.cuda.current_device()
+        remaining_lengths = torch.empty(n, dtype=torch.int64, device=device)
         request_hashes_list = []
-        for req_id in self.waiting_request_ids:
+
+        for i, req_id in enumerate(self.waiting_request_ids):
             req = self.get_request(req_id)
+            remaining_lengths[i] = len(req.remaining_prompt_tokens)
             if (
-                req.precomputed_block_hashes is not None
+                self.context.enable_prefix_caching
+                and req.precomputed_block_hashes is not None
                 and req.precomputed_block_hashes.numel() > 0
             ):
                 request_hashes_list.append(req.precomputed_block_hashes)
             else:
-                # Empty tensor placeholder
                 request_hashes_list.append(
-                    torch.empty(0, dtype=torch.int64, device=torch.cuda.current_device())
+                    torch.empty(0, dtype=torch.int64, device=device)
                 )
 
-        return self.context.gpu_match_prefixes_batch(request_hashes_list)
+        batch_prefix_result = None
+        if self.context.enable_prefix_caching and request_hashes_list:
+            batch_prefix_result = self.context.gpu_match_prefixes_batch(request_hashes_list)
+
+        return batch_prefix_result, remaining_lengths
+
+    def _compute_schedulable_indices(self, batch_prefix_result, remaining_lengths, start_idx=0):
+        """Compute which waiting requests can be scheduled, vectorized on GPU.
+
+        Uses cumulative sums for token budget, slot limit, and block budget.
+        Skips pending requests (has_pending=1) without breaking the chain.
+        Pre-computes effective_matched for each request to eliminate per-request
+        syncs inside add_request.
+
+        All GPU operations are async; the single .tolist() at the end is the
+        only GPU/CPU sync point.
+
+        Args:
+            batch_prefix_result: From _precompute_scheduling_data(), or None.
+            remaining_lengths: [N] int64 GPU tensor.
+            start_idx: First index to consider (skip indices before this, e.g.,
+                       for continuing chunked prefill already handled at index 0).
+
+        Returns:
+            Tuple of (schedulable_indices, effective_matched_list, pending_count):
+            - schedulable_indices: List[int] of indices into waiting_request_ids
+            - effective_matched_list: List[int] of pre-computed effective matched
+              block counts, one per schedulable index
+            - pending_count: int, number of pending requests in the queue
+        """
+        n = remaining_lengths.shape[0]
+        device = remaining_lengths.device
+        block_size = self.context.block_size_tokens
+
+        # --- Non-pending mask ---
+        if batch_prefix_result is not None:
+            num_matched, has_pending, _ = batch_prefix_result
+            non_pending = (has_pending == 0)
+            pending_count_gpu = has_pending.sum()  # GPU scalar, no sync
+        else:
+            non_pending = torch.ones(n, dtype=torch.bool, device=device)
+            num_matched = torch.zeros(n, dtype=torch.int32, device=device)
+            pending_count_gpu = torch.zeros(1, dtype=torch.int64, device=device)
+
+        # Zero out positions before start_idx (already handled separately)
+        if start_idx > 0:
+            non_pending[:start_idx] = False
+
+        # --- Token budget (cumulative over non-pending lengths) ---
+        token_budget = self.context.max_tokens - self.context.active_token_count
+        np_lengths = remaining_lengths * non_pending
+        fits_tokens = np_lengths.cumsum(dim=0) <= token_budget
+
+        # --- Slot limit (cumulative count of non-pending requests) ---
+        available_slots = self.context.max_requests - self.context.total_request_count
+        fits_slots = non_pending.to(torch.int32).cumsum(dim=0) <= available_slots
+
+        # --- Block budget (cumulative, accounting for prefix matches) ---
+        total_blocks = torch.ceil(remaining_lengths.float() / block_size).to(torch.int32)
+        blocks_from_pool = (
+            torch.clamp(total_blocks - num_matched, min=0) * non_pending.to(torch.int32)
+        )
+        # available_blocks stays on GPU (int + GPU tensor = GPU tensor, no sync)
+        available_blocks = self.context.block_allocator.total_avail
+        if (
+            self.context.enable_prefix_caching
+            and self.context.block_allocator.prefix_caching_evict_policy
+            == PrefixCachingEvictPolicy.LRU
+        ):
+            available_blocks = (
+                available_blocks + self.context.block_allocator.get_evictable_block_count()
+            )
+        fits_blocks = blocks_from_pool.cumsum(dim=0) <= available_blocks
+
+        # --- No paused requests (scalar, applies to all) ---
+        no_paused = self.context.paused_request_count == 0
+
+        # --- Combine into schedulable mask ---
+        schedulable = non_pending & fits_tokens & fits_slots & fits_blocks & no_paused
+
+        # --- Pre-compute effective_matched for all positions ---
+        # For non-chunked: already_allocated=0, so effective = min(num_matched, total_blocks)
+        effective_matched_all = torch.clamp(
+            torch.minimum(num_matched.to(torch.int64), total_blocks.to(torch.int64)), min=0
+        )
+
+        # --- Pack into single tensor -> single .tolist() sync ---
+        packed = torch.cat([
+            schedulable.to(torch.int64),             # [0 : n]
+            effective_matched_all.to(torch.int64),   # [n : 2n]
+            pending_count_gpu.to(torch.int64).reshape(1),  # [2n]
+        ])
+        result = packed.tolist()  # *** SINGLE GPU/CPU SYNC ***
+
+        # --- Unpack on CPU ---
+        sched_mask = result[:n]
+        eff_matched = result[n : 2 * n]
+        pending_count = result[2 * n]
+
+        schedulable_indices = [i for i in range(n) if sched_mask[i]]
+        effective_matched_list = [eff_matched[i] for i in schedulable_indices]
+
+        return schedulable_indices, effective_matched_list, pending_count
 
     def schedule_non_chunked_prefill(self):
+        """Schedule non-chunked prefill requests from the waiting queue.
+
+        Uses vectorized GPU computation to determine schedulable requests,
+        skipping pending requests and checking token/slot/block budgets
+        via cumulative sums. Single GPU/CPU sync for the entire method.
         """
-        Perform the same original scheduling logic for non-chunked runs
-        """
-        # Pre-compute batch prefix matching on GPU (one kernel for all waiting requests)
-        batch_prefix_result = self._gpu_precompute_prefix_matches()
+        batch_prefix_result, remaining_lengths = self._precompute_scheduling_data()
+        if remaining_lengths is None:
+            return
 
-        # Pre-compute schedulable limit: how many consecutive non-pending requests from front
-        # This replaces N per-iteration .item() syncs with a single GPU cumprod+sum+.item()
-        schedulable_limit = None
-        has_pending = None
-        if batch_prefix_result is not None:
-            _, has_pending, _ = batch_prefix_result
-            non_pending = (has_pending == 0).to(torch.int32)
-            schedulable_limit = non_pending.cumprod(dim=0).sum().item()  # 1 sync total
+        schedulable_indices, effective_matched_list, pending_count = (
+            self._compute_schedulable_indices(batch_prefix_result, remaining_lengths)
+        )
 
-        waiting_idx = 0
-        while self.waiting_request_ids:
-            # Prefix caching coordination: stop at first pending request
-            if schedulable_limit is not None and waiting_idx >= schedulable_limit:
-                if waiting_idx < has_pending.numel():
-                    self._prefix_coordination_waits += 1
-                break
+        # Track pending skips
+        self._prefix_coordination_skips += pending_count
 
-            req = self.get_request(self.waiting_request_ids[0])
-
-            request_can_be_added, request_tokens_can_be_added, kv_cache_available = (
-                self.context.check_availability(req)
-            )
-            if request_can_be_added and request_tokens_can_be_added and kv_cache_available:
-                # Pass batch prefix results so add_request can skip per-request prefix matching
+        # Minimal CPU loop: only iterates requests we KNOW should be scheduled.
+        # All GPU data already transferred — zero syncs in this loop.
+        scheduled_ids = []
+        for i, orig_idx in enumerate(schedulable_indices):
+            req = self.get_request(self.waiting_request_ids[orig_idx])
+            try:
                 if batch_prefix_result is not None:
                     num_matched, _, matched_block_ids = batch_prefix_result
                     self.context.add_request(
                         req,
-                        batch_num_matched=num_matched[waiting_idx],
-                        batch_matched_block_ids=matched_block_ids[waiting_idx],
+                        batch_num_matched=num_matched[orig_idx],
+                        batch_matched_block_ids=matched_block_ids[orig_idx],
+                        batch_effective_matched=effective_matched_list[i],
                     )
                 else:
                     self.context.add_request(req)
-                self._loop.call_soon_threadsafe(
-                    self._loop.create_task, self._notify_cond_for_new_request()
-                )
-                req.remaining_prompt_tokens = req.remaining_prompt_tokens.new_empty(0)
-                req.add_event_add_context()
-                self.waiting_request_ids.popleft()
-                waiting_idx += 1
-            else:
-                break
+            except BlockOverflowError:
+                break  # Evictable estimate slightly off; stop safely
+            self._loop.call_soon_threadsafe(
+                self._loop.create_task, self._notify_cond_for_new_request()
+            )
+            req.remaining_prompt_tokens = req.remaining_prompt_tokens.new_empty(0)
+            req.add_event_add_context()
+            scheduled_ids.append(self.waiting_request_ids[orig_idx])
+
+        # Rebuild deque without scheduled requests (O(n), avoids O(n^2) of multiple del)
+        if scheduled_ids:
+            scheduled_set = set(scheduled_ids)
+            self.waiting_request_ids = deque(
+                rid for rid in self.waiting_request_ids if rid not in scheduled_set
+            )
 
     def schedule_chunked_prefill(self):
-        """
-        This function schedules chunked prefill requests.
+        """Schedule chunked prefill requests from the waiting queue.
+
         Invariant:
             - There are at most one chunked prefill request in the waiting pool,
                 which should be the head
@@ -1276,91 +1387,126 @@ class DynamicInferenceEngine(AbstractEngine):
                 that have been prefilled for this request, non-zero means
                 it is during a chunked prefill
             - For each request, remaining_prompt_tokens holds the **unprefilled** prompt tokens
+
+        Split into two phases:
+        Phase 1: Handle continuing chunked prefill at index 0 (bypasses pending check).
+        Phase 2: Vectorized scheduling of remaining requests via _compute_schedulable_indices.
         """
-        # Pre-compute batch prefix matching on GPU (one kernel for all waiting requests)
-        batch_prefix_result = self._gpu_precompute_prefix_matches()
+        batch_prefix_result, remaining_lengths = self._precompute_scheduling_data()
+        if remaining_lengths is None:
+            return
 
-        # Pre-compute schedulable limit: how many consecutive non-pending requests from front
-        # This replaces N per-iteration .item() syncs with a single GPU cumprod+sum+.item()
-        schedulable_limit = None
-        has_pending = None
-        if batch_prefix_result is not None:
-            _, has_pending, _ = batch_prefix_result
-            non_pending = (has_pending == 0).to(torch.int32)
-            schedulable_limit = non_pending.cumprod(dim=0).sum().item()  # 1 sync total
+        # =====================================================================
+        # Phase 1: Handle continuing chunked prefill at index 0
+        # =====================================================================
+        start_idx = 0
+        scheduled_ids = []
+        is_continuing_chunked_prefill = self.context.chunked_prefill_request_id >= 0
 
-        can_schedule = True
-        waiting_idx = 0
-        while self.waiting_request_ids and can_schedule:
-            can_schedule = False
+        if is_continuing_chunked_prefill and self.waiting_request_ids:
             req = self.get_request(self.waiting_request_ids[0])
-
-            # is_continuing_chunked_prefill is True if we are scheduling next
-            # chunk of a existing chunked prefill request
-            is_continuing_chunked_prefill = self.context.chunked_prefill_request_id >= 0
-
-            # Prefix caching coordination: stop at first pending request
-            # (continuing chunked prefill requests must not be blocked)
-            if not is_continuing_chunked_prefill:
-                if schedulable_limit is not None and waiting_idx >= schedulable_limit:
-                    if waiting_idx < has_pending.numel():
-                        self._prefix_coordination_waits += 1
-                    break
-
-            # Use remaining prompt tokens for scheduling decisions
             remaining_len = len(req.remaining_prompt_tokens)
             token_fully_can_be_added = (
                 self.context.active_token_count + remaining_len <= self.context.max_tokens
             )
-            token_partially_can_be_added = self.context.active_token_count < self.context.max_tokens
-            request_can_be_added, _, kv_cache_available = self.context.check_availability(req)
-            request_can_be_added = is_continuing_chunked_prefill or request_can_be_added
+            token_partially_can_be_added = (
+                self.context.active_token_count < self.context.max_tokens
+            )
 
-            if request_can_be_added and kv_cache_available:
-                if token_fully_can_be_added:
-                    self.context.chunked_prefill_request_id = -1
-                    # Pass batch prefix results so add_request can skip per-request prefix matching
-                    if batch_prefix_result is not None:
-                        num_matched, _, matched_block_ids = batch_prefix_result
-                        self.context.add_request(
-                            req,
-                            batch_num_matched=num_matched[waiting_idx],
-                            batch_matched_block_ids=matched_block_ids[waiting_idx],
-                        )
-                    else:
-                        self.context.add_request(req)
-                    self._loop.call_soon_threadsafe(
-                        self._loop.create_task, self._notify_cond_for_new_request()
+            if token_fully_can_be_added:
+                self.context.chunked_prefill_request_id = -1
+                if batch_prefix_result is not None:
+                    num_matched, _, matched_block_ids = batch_prefix_result
+                    self.context.add_request(
+                        req,
+                        batch_num_matched=num_matched[0],
+                        batch_matched_block_ids=matched_block_ids[0],
                     )
-                    req.remaining_prompt_tokens = req.remaining_prompt_tokens.new_empty(0)
-                    req.add_event_add_context()
-                    # Fully scheduled, so we remove from waiting pool
-                    self.waiting_request_ids.popleft()
-                    waiting_idx += 1
-                    # Only this case we keep checking the rest of the waiting queue
-                    can_schedule = True
-                elif token_partially_can_be_added:
-                    chunk_length = self.context.max_tokens - self.context.active_token_count
-                    # For partial chunks, pass batch prefix results too
-                    if batch_prefix_result is not None:
-                        num_matched, _, matched_block_ids = batch_prefix_result
-                        self.context.add_request(
-                            req,
-                            chunk_length=chunk_length,
-                            batch_num_matched=num_matched[waiting_idx],
-                            batch_matched_block_ids=matched_block_ids[waiting_idx],
-                        )
-                    else:
-                        self.context.add_request(req, chunk_length=chunk_length)
-                    self._loop.call_soon_threadsafe(
-                        self._loop.create_task, self._notify_cond_for_new_request()
+                else:
+                    self.context.add_request(req)
+                self._loop.call_soon_threadsafe(
+                    self._loop.create_task, self._notify_cond_for_new_request()
+                )
+                req.remaining_prompt_tokens = req.remaining_prompt_tokens.new_empty(0)
+                req.add_event_add_context()
+                scheduled_ids.append(self.waiting_request_ids[0])
+                start_idx = 1
+            elif token_partially_can_be_added:
+                chunk_length = self.context.max_tokens - self.context.active_token_count
+                if batch_prefix_result is not None:
+                    num_matched, _, matched_block_ids = batch_prefix_result
+                    self.context.add_request(
+                        req,
+                        chunk_length=chunk_length,
+                        batch_num_matched=num_matched[0],
+                        batch_matched_block_ids=matched_block_ids[0],
                     )
-                    self.context.chunked_prefill_request_id = req.request_id
-                    req.remaining_prompt_tokens = req.remaining_prompt_tokens[chunk_length:]
-                    req.finished_chunk_token_count += chunk_length
-                    # Still have tokens to prefill, so we break and keep the
-                    # chunked prefill request at the head of the waiting queue
-                    # Note that we do not need to continue check the queue, as the tokens are full
+                else:
+                    self.context.add_request(req, chunk_length=chunk_length)
+                self._loop.call_soon_threadsafe(
+                    self._loop.create_task, self._notify_cond_for_new_request()
+                )
+                self.context.chunked_prefill_request_id = req.request_id
+                req.remaining_prompt_tokens = req.remaining_prompt_tokens[chunk_length:]
+                req.finished_chunk_token_count += chunk_length
+                # Partially scheduled — tokens are full, done for this round
+                return
+            else:
+                # Can't schedule even partially — done
+                return
+
+        # =====================================================================
+        # Phase 2: Vectorized scheduling of remaining requests
+        # =====================================================================
+        schedulable_indices, effective_matched_list, pending_count = (
+            self._compute_schedulable_indices(
+                batch_prefix_result, remaining_lengths, start_idx=start_idx
+            )
+        )
+
+        # Track pending skips
+        self._prefix_coordination_skips += pending_count
+
+        for i, orig_idx in enumerate(schedulable_indices):
+            req = self.get_request(self.waiting_request_ids[orig_idx])
+            remaining_len = len(req.remaining_prompt_tokens)
+            token_fully_can_be_added = (
+                self.context.active_token_count + remaining_len <= self.context.max_tokens
+            )
+
+            if not token_fully_can_be_added:
+                # In chunked prefill, only the head can be partially scheduled.
+                # A non-head request that doesn't fully fit must stop the chain
+                # to maintain the invariant that chunked prefill is at the head.
+                break
+
+            try:
+                self.context.chunked_prefill_request_id = -1
+                if batch_prefix_result is not None:
+                    num_matched, _, matched_block_ids = batch_prefix_result
+                    self.context.add_request(
+                        req,
+                        batch_num_matched=num_matched[orig_idx],
+                        batch_matched_block_ids=matched_block_ids[orig_idx],
+                        batch_effective_matched=effective_matched_list[i],
+                    )
+                else:
+                    self.context.add_request(req)
+            except BlockOverflowError:
+                break
+            self._loop.call_soon_threadsafe(
+                self._loop.create_task, self._notify_cond_for_new_request()
+            )
+            req.remaining_prompt_tokens = req.remaining_prompt_tokens.new_empty(0)
+            req.add_event_add_context()
+            scheduled_ids.append(self.waiting_request_ids[orig_idx])
+
+        # Rebuild deque without scheduled requests
+        if scheduled_ids:
+            scheduled_set = set(scheduled_ids)
+            self.waiting_request_ids = deque(
+                rid for rid in self.waiting_request_ids if rid not in scheduled_set
+            )
 
     async def async_forward(self) -> Tuple[Dict, Dict, float]:
         """Uses `asyncio` for continuous generation.
