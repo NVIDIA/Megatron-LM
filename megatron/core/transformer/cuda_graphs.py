@@ -1555,8 +1555,6 @@ class CudaGraphManager(torch.nn.Module):
             if is_inference_mode:
                 # Inference generation mode creates graphs immediately
                 runner = self.get_cudagraph_runner(megatron_module, args, kwargs, True)
-                if runner.training:
-                    runner.eval()
 
                 if not runner.fwd_graph_recorded:
                     # Reuse graph input-output buffers for inference
@@ -1592,6 +1590,7 @@ class CudaGraphManager(torch.nn.Module):
                     _CudagraphGlobalRecord.cudagraph_inference_record.append(
                         (runner, "fwd", args, kwargs)
                     )
+                    runner = runner.eval()
 
                 # Now replay the graph
                 out = runner.replay_graph_capture(self.is_first_microbatch, args, kwargs)
