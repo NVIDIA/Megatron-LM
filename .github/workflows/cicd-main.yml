@@ -221,7 +221,7 @@ jobs:
           GH_TOKEN: ${{ secrets.PAT }}
         run: |
           PR_NUMBER=${{ fromJSON(steps.get-pr-info.outputs.pr-info || '{}').number }}
-          TEST_SUITE=$(gh pr view $PR_NUMBER --json labels | jq '[.labels[].name] | any(. == "Run MBridge tests")') && "all" || echo "unit-only"
+          TEST_SUITE=$(gh pr view $PR_NUMBER --json labels | jq -r 'if [.labels[].name] | any(. == "Run MBridge tests") then "all" else "unit-only" end')
           echo "main=$TEST_SUITE" | tee -a $GITHUB_OUTPUT
 
       - name: How-To
