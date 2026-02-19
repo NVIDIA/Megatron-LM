@@ -184,7 +184,15 @@ class LanguageModule(MegatronModule):
             assert (
                 column_parallel_linear is not None
             ), "column_parallel_linear cannot be None when not using fused linear cross entropy."
-            logits, _ = column_parallel_linear(hidden, **col_linear_kwargs)
+            # output
+            output_layer_params = {k: v.detach() for k, v in column_parallel_linear.named_parameters()}
+            output_layer_buffers = dict(column_parallel_linear.named_buffers())
+            logits, _ = torch.func.functional_call(
+                column_parallel_linear,
+                {**output_layer_params, **output_layer_buffers},
+                (hidden,),
+                col_linear_kwargs,
+            )
 
             return self.compute_language_model_loss(labels, logits)
 
