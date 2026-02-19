@@ -294,7 +294,7 @@ jobs:
           client_payload: |
             {
               "mcore_ref": "${{ steps.sha.outputs.main }}",
-              "test_suite": ${{ needs.cicd-parse-downstream-testing.outputs.mbridge-test-suite }},
+              "test_suite": "${{ needs.cicd-parse-downstream-testing.outputs.mbridge-test-suite }}",
               "triggered_by": "https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}"
             }
 
