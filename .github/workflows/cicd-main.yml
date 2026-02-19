@@ -251,6 +251,19 @@ jobs:
         if: startsWith(github.ref, 'refs/heads/pull-request/')
         uses: nv-gha-runners/get-pr-info@main
 
+      - name: Checkout MBridge and create testing branch
+        uses: actions/checkout@v4
+        with:
+          ref: main
+          repository: NVIDIA-NeMo/Megatron-Bridge
+          path: megatron-bridge
+
+      - name: Create testing branch
+        run: |
+          git fetch origin main
+          git checkout -b mcore-testing-${{ steps.get-pr-info.outputs.pr-info.number }} origin/main
+          git push origin mcore-testing-${{ steps.get-pr-info.outputs.pr-info.number }} --force
+
       - name: Get merge commit sha
         shell: bash -x -e -u -o pipefail {0}
         id: sha
@@ -274,7 +287,7 @@ jobs:
           repo: Megatron-Bridge
           workflow_file_name: cicd-main.yml
           github_token: ${{ secrets.PAT }}
-          ref: main
+          ref: mcore-testing-${{ steps.get-pr-info.outputs.pr-info.number }}
           wait_interval: 60
           propagate_failure: true
           client_payload: |
