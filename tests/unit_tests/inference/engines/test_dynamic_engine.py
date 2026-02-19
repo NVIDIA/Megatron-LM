@@ -529,6 +529,18 @@ class TestDynamicInferenceEngine:
         # Validate max_requests, max_tokens.
         assert env.engine.context.max_tokens == DynamicInferenceContext.DEFAULT_MAX_TOKENS
 
+        if num_cuda_graphs is not None:
+            assert env.engine.context.cuda_graph_token_counts is not None
+            assert env.engine.context.cuda_graph_batch_dimensions_list
+            model = env.engine.controller.inference_wrapped_model.model
+            if cuda_graph_scope == [CudaGraphScope.full_iteration]:
+                # check if cudagraph runners are created at the decoder level
+                assert model.decoder.cudagraph_manager.cudagraph_runners
+            else:
+                # check if cudagraph runners are created at the layer level
+                for layer in model.decoder.layers:
+                    assert layer.cudagraph_manager.cudagraph_runners
+
         # Validate generated tokens.
         gpt_expected_generated_tokens = [
             [69, 85, 55, 74, 56, 89, 64, 59, 55, 67, 15, 58, 6, 37, 54, 47],
