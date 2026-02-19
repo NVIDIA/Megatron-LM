@@ -714,15 +714,13 @@ class StepBatchsizeNumMicroBatchesCalculator(NumMicroBatchesCalculator):
                 f'got {self.schedule[i - 1][0]} before {self.schedule[i][0]}'
             )
 
-        # Validate batch sizes
+        # Validate batch sizes are positive.
+        # NOTE: divisibility by micro_batch_size * data_parallel_size is NOT checked here
+        # because early schedule entries may be smaller than the current GPU configuration
+        # (e.g., after scaling up GPUs mid-training). Divisibility of the CURRENT batch size
+        # is checked at runtime in update() when consistency_check=True (after checkpoint loading).
         for threshold, batch_size in self.schedule:
             assert batch_size > 0, f'batch size must be positive, got {batch_size}'
-            if not self.decrease_batch_size_if_needed:
-                assert batch_size % self.micro_batch_times_data_parallel_size == 0, (
-                    f'batch size {batch_size} at threshold {threshold} is not divisible by '
-                    f'micro_batch_size ({self.micro_batch_size}) * '
-                    f'data_parallel_size ({self.data_parallel_size})'
-                )
 
     def _get_batch_size_for_samples(self, consumed_samples: int) -> int:
         """Get the batch size for the given number of consumed samples."""
