@@ -145,8 +145,6 @@ class InferenceClient:
                     )
                 elif header == Headers.PAUSE_ACK:
                     self.paused.set()
-                elif header == Headers.STOP_ACK:
-                    self.stopped.set()
             except zmq.Again:
                 await asyncio.sleep(0.005)
                 continue
@@ -193,22 +191,20 @@ class InferenceClient:
         self.socket.send(payload_serialized)
 
     def pause_engines(self) -> Awaitable:
-        """Sends a signal to pause all inference engines.
+        """Sends PAUSE to all engines via coordinator.
 
-        The signal first propagates thru the coordinator to all engines.
-        All engines acknowledge this signal and clear their `running` flags.
-        The coordinator awaits all acknowledgements before forwarding the ACK
-            back to the client, as well as to the engines.
-        The engines set their `paused` flags upon seeing the ACK.
+        The coordinator broadcasts PAUSE. Each engine reaches EP consensus,
+        then sends PAUSE_ACK. The coordinator collects all ACKs and re-broadcasts.
+        This awaitable resolves when the coordinator confirms all engines are paused.
 
         Returns:
-            Awaitable: An awaitable that resolves when all engines have paused.
+            Awaitable: Resolves when all engines are globally paused.
         """
         self._send_signal_to_engines(Headers.PAUSE)
         return self.paused.wait()
 
     def unpause_engines(self) -> None:
-        """Sends a signal to unpause all inference engines."""
+        """Sends UNPAUSE to all engines. No synchronization needed."""
         self.paused.clear()
         self.running.set()
         self._send_signal_to_engines(Headers.UNPAUSE)
@@ -218,32 +214,27 @@ class InferenceClient:
         assert self.paused.is_set(), "Can only increment staleness while engines are paused."
         self._send_signal_to_engines(Headers.INCREMENT_STALENESS)
 
-    def suspend_engines(self):
-        """Sends a signal to pause all inference engines."""
-        self._send_signal_to_engines(Headers.PAUSE)
+    def suspend_engines(self) -> None:
+        """Sends SUSPEND to all engines. Requires system to be PAUSED.
+
+        Engines handle GPU offload internally and synchronize via DP all-reduce.
+        """
         self._send_signal_to_engines(Headers.SUSPEND)
 
-    def resume_engines(self):
-        """Sends a signal to unpause all inference engines."""
-        self.paused.clear()
+    def resume_engines(self) -> None:
+        """Sends RESUME to all engines. Requires system to be SUSPENDED.
+
+        Engines handle GPU onload internally and synchronize via DP all-reduce.
+        """
         self._send_signal_to_engines(Headers.RESUME)
-        self._send_signal_to_engines(Headers.UNPAUSE)
 
-    def stop_engines(self) -> Awaitable:
-        """Sends a signal to gracefully stop all inference engines.
+    def stop_engines(self) -> None:
+        """Sends STOP to all engines. Requires system to be PAUSED.
 
-        The signal first propagates thru the coordinator to all engines.
-        All engines acknowledge this signal and clear their `running` flags.
-        The coordinator awaits all acknowledgements before forwarding the ACK
-            back to the client, as well as to the engines.
-        The engines set their `stopped` flags upon seeing the ACK.
-
-        Returns:
-            Awaitable: An awaitable that resolves when all engines have stopped.
+        Engines cancel futures and synchronize via DP all-reduce.
         """
         self._send_signal_to_engines(Headers.STOP)
         self.running.clear()
-        return self.stopped.wait()
 
     def stop(self):
         """
@@ -253,6 +244,11 @@ class InferenceClient:
         and terminates the ZMQ context. It should be called when the client is
         no longer needed to ensure a graceful shutdown.
         """
-        self.listener_task.cancel()
+        if hasattr(self, 'listener_task') and not self.listener_task.done():
+            self.listener_task.cancel()
+        for future in self.completion_futures.values():
+            if not future.done():
+                future.cancel()
+        self.completion_futures.clear()
         self.socket.close()
         self.context.term()
