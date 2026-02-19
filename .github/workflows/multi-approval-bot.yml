@@ -15,7 +15,6 @@ jobs:
   codeowners-approval:
     needs: [pre-flight]
     runs-on: ubuntu-latest
-    environment: nemo-ci
     if: |
       !(needs.pre-flight.outputs.docs_only == 'true'
       || needs.pre-flight.outputs.is_merge_group == 'true'

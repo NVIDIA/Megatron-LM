@@ -9,12 +9,6 @@ on:
     secrets:
       PAT:
         required: true
-      AZURE_CLIENT_ID:
-        required: true
-      AZURE_TENANT_ID:
-        required: true
-      AZURE_SUBSCRIPTION_ID:
-        required: true
       SSH_KEY:
         required: true
       SSH_PWD:
@@ -32,26 +26,12 @@ jobs:
         run: echo "date=$(date +%F)" | tee -a "$GITHUB_OUTPUT"
 
   update-lockfile:
-    environment: nemo-ci
     runs-on: linux-amd64-cpu16
     needs: [pre-flight]
     env:
       SOURCE_BRANCH: ${{ needs.pre-flight.outputs.bump-branch }}
       TARGET_BRANCH: ${{ inputs.target-branch }}
     steps:
-      - name: Install Azure CLI
-        run: curl -sL https://aka.ms/InstallAzureCLIDeb | sudo bash
-
-      - name: Azure Login
-        uses: azure/login@v2
-        with:
-          client-id: ${{ secrets.AZURE_CLIENT_ID }}
-          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
-          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
-
-      - name: Azure ACR Login
-        run: az acr login --name nemoci
-
       - name: Checkout repo
         uses: actions/checkout@v4
         with:
@@ -96,7 +76,6 @@ jobs:
   create-pr:
     needs: [update-lockfile, pre-flight]
     runs-on: ubuntu-latest
-    environment: main
     env:
       SOURCE_BRANCH: ${{ needs.pre-flight.outputs.bump-branch }}
       TARGET_BRANCH: ${{ inputs.target-branch }}
