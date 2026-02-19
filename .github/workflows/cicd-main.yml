@@ -253,7 +253,7 @@ jobs:
       - name: Checkout MBridge and create testing branch
         uses: actions/checkout@v4
         with:
-          ref: ko3n1g/fix/pre-flight
+          ref: main
           repository: NVIDIA-NeMo/Megatron-Bridge
           path: megatron-bridge
           token: ${{ secrets.PAT }}
@@ -261,8 +261,8 @@ jobs:
       - name: Create testing branch
         run: |
           cd megatron-bridge
-          git fetch origin ko3n1g/fix/pre-flight
-          git checkout -b mcore-testing-${{ fromJSON(steps.get-pr-info.outputs.pr-info || '{}').number }} origin/ko3n1g/fix/pre-flight
+          git fetch origin main
+          git checkout -b mcore-testing-${{ fromJSON(steps.get-pr-info.outputs.pr-info || '{}').number }} origin/main
           git push origin mcore-testing-${{ fromJSON(steps.get-pr-info.outputs.pr-info || '{}').number }} --force
 
       - name: Get merge commit sha
