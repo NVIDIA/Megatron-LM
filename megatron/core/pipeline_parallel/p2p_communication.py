@@ -26,22 +26,22 @@ def _batched_p2p_ops(
     ops = []
     if tensor_send_prev is not None:
         send_prev_op = torch.distributed.P2POp(
-            torch.distributed.isend, tensor_send_prev, prev_pipeline_rank, group
+            torch.distributed.isend, tensor_send_prev, prev_pipeline_rank,
         )
         ops.append(send_prev_op)
     if tensor_recv_prev is not None:
         recv_prev_op = torch.distributed.P2POp(
-            torch.distributed.irecv, tensor_recv_prev, prev_pipeline_rank, group
+            torch.distributed.irecv, tensor_recv_prev, prev_pipeline_rank,
         )
         ops.append(recv_prev_op)
     if tensor_send_next is not None:
         send_next_op = torch.distributed.P2POp(
-            torch.distributed.isend, tensor_send_next, next_pipeline_rank, group
+            torch.distributed.isend, tensor_send_next, next_pipeline_rank,
         )
         ops.append(send_next_op)
     if tensor_recv_next is not None:
         recv_next_op = torch.distributed.P2POp(
-            torch.distributed.irecv, tensor_recv_next, next_pipeline_rank, group
+            torch.distributed.irecv, tensor_recv_next, next_pipeline_rank,
         )
         ops.append(recv_next_op)
     if len(ops) > 0:
