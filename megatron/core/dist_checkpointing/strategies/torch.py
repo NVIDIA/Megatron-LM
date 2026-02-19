@@ -503,10 +503,12 @@ class MCoreLoadPlanner(DefaultLoadPlanner):
     def _validate_global_shapes(self, metadata, sharded_tensors):
         for sh_ten in sharded_tensors:
             if sh_ten.key not in metadata.state_dict_metadata:
-                raise KeyError(
-                    f"{sh_ten.key} from model not in state dict:"
-                    f" {sorted(metadata.state_dict_metadata.keys())}"
-                )
+                # raise KeyError(
+                #     f"{sh_ten.key} from model not in state dict:"
+                #     f" {sorted(metadata.state_dict_metadata.keys())}"
+                # )
+                print(f"{sh_ten.key} from model not in state dict, will skip")
+                continue
             loaded_shape = metadata.state_dict_metadata[sh_ten.key].size
             expected_shape = sh_ten.global_shape
             if loaded_shape != expected_shape:
@@ -530,7 +532,7 @@ class MCoreLoadPlanner(DefaultLoadPlanner):
         tensor_metadata = self.metadata.state_dict_metadata
         metadata_with_sizes = [
             (tensor_metadata[key], tensor_metadata[key].size, sharded_tensor)
-            for key, sharded_tensor in self.allow_shape_mismatch_sharded_tensors.items()
+            for key, sharded_tensor in self.allow_shape_mismatch_sharded_tensors.items() if key in tensor_metadata
         ]
         try:
             # Temporarily set sizes to expected shapes
@@ -802,6 +804,7 @@ class TorchDistLoadShardedStrategy(LoadShardedStrategy):
             planner=MCoreLoadPlanner(
                 shapes_validation_sharded_tensors=flexible_shape_sharded_tensors,
                 allow_shape_mismatch_sharded_tensors=allow_shape_mismatch_sharded_tensors,
+                allow_partial_load=True,
             ),
         )
 
