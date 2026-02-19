@@ -205,7 +205,7 @@ jobs:
       )
       && !cancelled()
     outputs:
-      enable-downstream-testing: ${{ steps.has-mbridge-testing-label.outputs.main }}
+      mbridge-test-suite: ${{ steps.select-mbridge-test-suite.outputs.main }}
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -215,14 +215,14 @@ jobs:
         if: startsWith(github.ref, 'refs/heads/pull-request/')
         uses: nv-gha-runners/get-pr-info@main
 
-      - name: Has MBridge testing label
-        id: has-mbridge-testing-label
+      - name: Select MBridge test suite
+        id: select-mbridge-test-suite
         env:
           GH_TOKEN: ${{ secrets.PAT }}
         run: |
           PR_NUMBER=${{ fromJSON(steps.get-pr-info.outputs.pr-info || '{}').number }}
-          HAS_RUN_TESTS_LABEL=$(gh pr view $PR_NUMBER --json labels | jq '[.labels[].name] | any(. == "Run MBridge tests")') || echo "false"
-          echo "main=$HAS_RUN_TESTS_LABEL" | tee -a $GITHUB_OUTPUT
+          TEST_SUITE=$(gh pr view $PR_NUMBER --json labels | jq '[.labels[].name] | any(. == "Run MBridge tests")') && "all" || echo "unit-only"
+          echo "main=$TEST_SUITE" | tee -a $GITHUB_OUTPUT
 
       - name: How-To
         run: bash .github/scripts/readme.sh
@@ -237,7 +237,6 @@ jobs:
       needs.pre-flight.result != 'cancelled'
       && needs.cicd-wait-in-queue.result != 'cancelled'
       && needs.cicd-parse-downstream-testing.result != 'cancelled'
-      && needs.cicd-parse-downstream-testing.outputs.enable-downstream-testing == 'true'
       && (
         success()
         || needs.pre-flight.outputs.is_ci_workload == 'true'
@@ -295,7 +294,7 @@ jobs:
           client_payload: |
             {
               "mcore_ref": "${{ steps.sha.outputs.main }}",
-              "test_suite": "all",
+              "test_suite": ${{ needs.cicd-parse-downstream-testing.outputs.mbridge-test-suite }},
               "triggered_by": "https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}"
             }
 
