@@ -3,6 +3,7 @@
 import asyncio
 import concurrent.futures
 import logging
+import math
 import multiprocessing
 import socket
 import struct
@@ -1298,9 +1299,11 @@ class DynamicInferenceEngine(AbstractEngine):
         if start_idx > 0:
             non_pending[:start_idx] = False
 
-        # --- Token budget (cumulative over non-pending lengths) ---
+        # --- Token budget (cumulative over effective lengths after prefix skip) ---
         token_budget = self.context.max_tokens - self.context.active_token_count
-        np_lengths = remaining_lengths * non_pending
+        prefix_skip_all = num_matched * block_size
+        effective_lengths = torch.clamp(remaining_lengths - prefix_skip_all, min=1)
+        np_lengths = effective_lengths * non_pending
         fits_tokens = np_lengths.cumsum(dim=0) <= token_budget
 
         # --- Slot limit (cumulative count of non-pending requests) ---
@@ -1436,8 +1439,27 @@ class DynamicInferenceEngine(AbstractEngine):
         if is_continuing_chunked_prefill and self.waiting_request_ids:
             req = self.get_request(self.waiting_request_ids[0])
             remaining_len = len(req.remaining_prompt_tokens)
+            block_size = self.context.block_size_tokens
+            block_aligned = (req.finished_chunk_token_count % block_size == 0)
+
+            # Compute prefix skip for budget check
+            if batch_prefix_result is not None and block_aligned:
+                num_matched_val, _, _ = batch_prefix_result
+                already_alloc = math.ceil(req.finished_chunk_token_count / block_size)
+                overall_req = math.ceil(
+                    (req.finished_chunk_token_count + remaining_len) / block_size
+                )
+                eff_matched = max(
+                    0, min(num_matched_val[0].item(), overall_req) - already_alloc
+                )
+                prefix_skip = eff_matched * block_size
+                effective_remaining = max(1, remaining_len - prefix_skip)
+            else:
+                effective_remaining = remaining_len
+                prefix_skip = 0
+
             token_fully_can_be_added = (
-                self.context.active_token_count + remaining_len <= self.context.max_tokens
+                self.context.active_token_count + effective_remaining <= self.context.max_tokens
             )
             token_partially_can_be_added = (
                 self.context.active_token_count < self.context.max_tokens
@@ -1462,7 +1484,8 @@ class DynamicInferenceEngine(AbstractEngine):
                 scheduled_ids.append(self.waiting_request_ids[0])
                 start_idx = 1
             elif token_partially_can_be_added:
-                chunk_length = self.context.max_tokens - self.context.active_token_count
+                budget = self.context.max_tokens - self.context.active_token_count
+                chunk_length = min(budget + prefix_skip, remaining_len)
                 if batch_prefix_result is not None:
                     num_matched, _, matched_block_ids = batch_prefix_result
                     self.context.add_request(
@@ -1479,8 +1502,10 @@ class DynamicInferenceEngine(AbstractEngine):
                 self.context.chunked_prefill_request_id = req.request_id
                 req.remaining_prompt_tokens = req.remaining_prompt_tokens[chunk_length:]
                 req.finished_chunk_token_count += chunk_length
-                # Partially scheduled — tokens are full, done for this round
-                return
+                # Partially scheduled — check if budget remains for Phase 2
+                if self.context.active_token_count >= self.context.max_tokens:
+                    return
+                start_idx = 1  # fall through to Phase 2
             else:
                 # Can't schedule even partially — done
                 return
@@ -1500,8 +1525,19 @@ class DynamicInferenceEngine(AbstractEngine):
         for i, orig_idx in enumerate(schedulable_indices):
             req = self.get_request(self.waiting_request_ids[orig_idx])
             remaining_len = len(req.remaining_prompt_tokens)
+
+            # Phase 2 requests are new (finished=0, block-aligned), prefix skip applies
+            if batch_prefix_result is not None:
+                eff_len = max(
+                    1,
+                    remaining_len
+                    - effective_matched_list[i] * self.context.block_size_tokens,
+                )
+            else:
+                eff_len = remaining_len
+
             token_fully_can_be_added = (
-                self.context.active_token_count + remaining_len <= self.context.max_tokens
+                self.context.active_token_count + eff_len <= self.context.max_tokens
             )
 
             if not token_fully_can_be_added:

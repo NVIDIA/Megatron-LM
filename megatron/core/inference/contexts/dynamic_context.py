@@ -1652,9 +1652,6 @@ class DynamicInferenceContext(BaseInferenceContext):
         if self.active_token_count + chunk_length > self.max_tokens:
             raise TokenOverflowError(req.request_id)
 
-        # Use the remaining prompt tokens for this chunk
-        this_round_tokens = req.remaining_prompt_tokens[:chunk_length]
-
         # =========================================================================
         # Block allocation
         # =========================================================================
@@ -1709,6 +1706,22 @@ class DynamicInferenceContext(BaseInferenceContext):
             else:
                 matched_tensor = None
 
+        # --- Prefix skip: only send unmatched suffix through the model ---
+        block_aligned = (req.finished_chunk_token_count % self.block_size_tokens == 0)
+        if self.enable_prefix_caching and num_matched_blocks > 0 and block_aligned:
+            prefix_skip_tokens = num_matched_blocks * self.block_size_tokens
+            prefix_skip_tokens = min(prefix_skip_tokens, chunk_length - 1)  # >= 1 token
+        else:
+            prefix_skip_tokens = 0
+
+        effective_kv_offset = req.finished_chunk_token_count + prefix_skip_tokens
+        effective_chunk_length = chunk_length - prefix_skip_tokens
+
+        # Use the remaining prompt tokens for this chunk (skip matched prefix tokens)
+        this_round_tokens = req.remaining_prompt_tokens[
+            prefix_skip_tokens : prefix_skip_tokens + effective_chunk_length
+        ]
+
         # Reduce blocks needed by the number of matched (shared) blocks
         num_blocks_from_pool = (
             overall_required_blocks - already_allocated_blocks - num_matched_blocks
@@ -1742,7 +1755,7 @@ class DynamicInferenceContext(BaseInferenceContext):
         if current_id >= self.max_requests:
             raise RequestOverflowError(req.request_id)
 
-        if self.active_token_count + chunk_length > self.max_tokens:
+        if self.active_token_count + effective_chunk_length > self.max_tokens:
             raise TokenOverflowError(req.request_id)
 
         self.request_ids[current_id] = req.request_id
@@ -1765,7 +1778,7 @@ class DynamicInferenceContext(BaseInferenceContext):
             self.request_metadata[label][current_id] = m
 
         # Handle length and block assignments.
-        self.request_query_lengths[current_id] = chunk_length
+        self.request_query_lengths[current_id] = effective_chunk_length
         self.request_output_lengths[current_id] = (
             req.finished_chunk_token_count
             + chunk_length
@@ -1785,7 +1798,7 @@ class DynamicInferenceContext(BaseInferenceContext):
                 new_block_start : new_block_start + len(new_block_ids)
             ] = new_block_ids
 
-        self.request_kv_length_offsets[current_id] = req.finished_chunk_token_count
+        self.request_kv_length_offsets[current_id] = effective_kv_offset
         self.request_kv_block_counts[current_id] = overall_required_blocks
         self.request_last_kv_block_id[current_id] = self.request_to_kv_block_ids[current_id][
             overall_required_blocks - 1
@@ -1795,27 +1808,27 @@ class DynamicInferenceContext(BaseInferenceContext):
         ) % self.block_size_tokens
 
         token_offset_range = torch.arange(
-            req.finished_chunk_token_count,
-            req.finished_chunk_token_count + chunk_length,
+            effective_kv_offset,
+            effective_kv_offset + effective_chunk_length,
             device=self.token_to_pos_ids.device,
         )
-        self.token_to_pos_ids[self.active_token_count : self.active_token_count + chunk_length] = (
-            token_offset_range
-        )
+        self.token_to_pos_ids[
+            self.active_token_count : self.active_token_count + effective_chunk_length
+        ] = token_offset_range
         self.token_to_input_ids[
-            self.active_token_count : self.active_token_count + chunk_length
+            self.active_token_count : self.active_token_count + effective_chunk_length
         ] = this_round_tokens
         self.token_to_request_idx[
-            self.active_token_count : self.active_token_count + chunk_length
+            self.active_token_count : self.active_token_count + effective_chunk_length
         ] = current_id
         self.token_to_position_in_request[
-            self.active_token_count : self.active_token_count + chunk_length
+            self.active_token_count : self.active_token_count + effective_chunk_length
         ] = token_offset_range
         self.token_to_block_idx[
-            self.active_token_count : self.active_token_count + chunk_length
+            self.active_token_count : self.active_token_count + effective_chunk_length
         ] = self.request_to_kv_block_ids[current_id][token_offset_range // self.block_size_tokens]
         self.token_to_local_position_within_kv_block[
-            self.active_token_count : self.active_token_count + chunk_length
+            self.active_token_count : self.active_token_count + effective_chunk_length
         ] = (token_offset_range % self.block_size_tokens)
 
         # Register hashes for completely filled blocks (skip matched blocks).
@@ -1884,7 +1897,7 @@ class DynamicInferenceContext(BaseInferenceContext):
             self.mamba_ssm_states[:, mamba_idx] = 0.0
             self.mamba_metadata.request_to_mamba_state_idx[self.total_request_count] = mamba_idx
 
-        self.active_token_count += chunk_length
+        self.active_token_count += effective_chunk_length
         self.total_request_count += 0 if req.finished_chunk_token_count > 0 else 1
         self.num_prefill_requests += 1
 
