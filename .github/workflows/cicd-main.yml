@@ -272,6 +272,8 @@ jobs:
           workflow_file_name: cicd-main.yml
           github_token: ${{ secrets.PAT }}
           ref: main
+          wait_interval: 60
+          propagate_failure: true
           client_payload: |
             {
               "mcore_commit": "${{ steps.sha.outputs.main }}",
