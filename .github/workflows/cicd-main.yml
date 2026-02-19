@@ -243,6 +243,27 @@ jobs:
       )
       && !cancelled()
     steps:
+      - name: Get PR info
+        id: get-pr-info
+        if: startsWith(github.ref, 'refs/heads/pull-request/')
+        uses: nv-gha-runners/get-pr-info@main
+
+      - name: Get merge commit sha
+        shell: bash -x -e -u -o pipefail {0}
+        id: sha
+        env:
+          IS_PR: ${{ startsWith(github.ref, 'refs/heads/pull-request/') }}
+          IS_MERGE_GROUP: ${{ github.event_name == 'merge_group' }}
+        run: |
+          if [[ "$IS_PR" == "true" ]]; then
+            SHA=${{ fromJSON(steps.get-pr-info.outputs.pr-info || '{}').merge_commit_sha }}
+          elif [[ "$IS_MERGE_GROUP" == "true" ]]; then
+            SHA=${{ github.event.merge_group.head_sha }}
+          else
+            SHA=${GITHUB_SHA}
+          fi
+          echo "main=${SHA}" | tee -a "$GITHUB_OUTPUT"
+
       - name: Trigger MBridge tests
         uses: convictional/trigger-workflow-and-wait@v1.6.5
         with:
@@ -253,10 +274,9 @@ jobs:
           ref: main
           client_payload: |
             {
-              "mbridge_ref": "main",
-              "run_cicd_main": true,
-              "run_install_test": true,
-              "test_suite": "all"
+              "mcore_commit": ${{ steps.sha.outputs.main }},
+              "test_suite": "all",
+              "triggered_by": "https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}"
             }
 
   cicd-container-build:
