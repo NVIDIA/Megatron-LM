@@ -25,9 +25,9 @@ import sys
 # https://www.sphinx-doc.org/en/master/usage/configuration.html#project-information
 
 project = "Megatron Core"
-copyright = "2025, NVIDIA Corporation"
+copyright = "2026, NVIDIA Corporation"
 author = "NVIDIA Corporation"
-release = "latest"
+release = "0.16.0"
 
 # -- General configuration ---------------------------------------------------
 # https://www.sphinx-doc.org/en/master/usage/configuration.html#general-configuration
