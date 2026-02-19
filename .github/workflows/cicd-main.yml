@@ -260,6 +260,7 @@ jobs:
 
       - name: Create testing branch
         run: |
+          cd megatron-bridge
           git fetch origin main
           git checkout -b mcore-testing-${{ steps.get-pr-info.outputs.pr-info.number }} origin/main
           git push origin mcore-testing-${{ steps.get-pr-info.outputs.pr-info.number }} --force
