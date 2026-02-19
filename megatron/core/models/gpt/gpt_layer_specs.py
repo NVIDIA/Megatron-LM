@@ -188,6 +188,8 @@ def get_gpt_layer_with_transformer_engine_spec(
     use_kitchen: bool = False,
     use_te_activation_func: bool = False,
     fallback_to_eager_attn: bool = False,
+    post_self_attn_layernorm: bool = False,
+    post_mlp_layernorm: bool = False,
 ) -> ModuleSpec:
     """Use this spec to use lower-level Transformer Engine modules (required for fp8 training).
 
@@ -260,6 +262,8 @@ def get_gpt_layer_with_transformer_engine_spec(
         mlp=mlp,
         sharded_state_dict_keys_map=sharded_state_dict_keys_map,
         normalization=normalization,
+        post_self_attn_layernorm=post_self_attn_layernorm,
+        post_mlp_layernorm=post_mlp_layernorm,
     )
 
 
@@ -349,6 +353,8 @@ def get_transformer_layer_spec_for_backend(
     mlp: ModuleSpec,
     sharded_state_dict_keys_map: Optional[dict] = None,
     normalization: Optional[str] = None,
+    post_self_attn_layernorm: bool = False,
+    post_mlp_layernorm: bool = False,
 ) -> ModuleSpec:
     """Helper function to get module spec for TransformerLayer"""
 
@@ -371,9 +377,11 @@ def get_transformer_layer_spec_for_backend(
             input_layernorm=input_layernorm,
             self_attention=attention,
             self_attn_bda=get_bias_dropout_add,
+            post_self_attn_layernorm=TENorm if post_self_attn_layernorm else IdentityOp,
             pre_mlp_layernorm=pre_mlp_layernorm,
             mlp=mlp,
             mlp_bda=get_bias_dropout_add,
+            post_mlp_layernorm=TENorm if post_mlp_layernorm else IdentityOp,
             sharded_state_dict_keys_map=sharded_state_dict_keys_map,
         ),
     )
