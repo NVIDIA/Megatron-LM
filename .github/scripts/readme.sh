@@ -13,10 +13,19 @@ cat << 'EOF'
 ║              H O W   T O :   M B R I D G E   T E S T I N G         ║
 ╚══════════════════════════════════════════════════════════════════════╝
 
-  Want to validate your PR against MBridge? Here's how:
+  MBridge unit tests run automatically on every PR. To also trigger
+  functional tests, attach the label and re-run the workflow step.
 
   ┌─────────────────────────────────────────────────────────────────┐
-  │  STEP 1  │  Attach the label to your PR                         │
+  │  DEFAULT  │  Unit tests run on every PR (no action needed)      │
+  ├─────────────────────────────────────────────────────────────────┤
+  │                                                                  │
+  │    Every PR  ──►  cicd-mbridge-testing  ──►  unit tests only   │
+  │                                                                  │
+  └─────────────────────────────────────────────────────────────────┘
+
+  ┌─────────────────────────────────────────────────────────────────┐
+  │  STEP 1  │  Attach the label to your PR (for functional tests)  │
   ├─────────────────────────────────────────────────────────────────┤
   │                                                                  │
   │    PR Labels  ──►  [ + Add label ]  ──►  "Run MBridge tests"   │
@@ -32,22 +41,25 @@ cat << 'EOF'
   └─────────────────────────────────────────────────────────────────┘
 
   ┌─────────────────────────────────────────────────────────────────┐
-  │  RESULT  │  A new job is spawned!                               │
+  │  RESULT  │  Unit + functional tests run!                        │
   ├─────────────────────────────────────────────────────────────────┤
   │                                                                  │
-  │         cicd-mbridge-testing  ◄── new job triggered!           │
+  │         cicd-mbridge-testing  ◄── unit + functional tests      │
   │                                                                  │
-  │         This job tests your PR against MBridge using           │
-  │         the merge commit SHA of your pull request.             │
+  │         Tests run against MBridge using the merge commit       │
+  │         SHA of your pull request.                              │
   │                                                                  │
   └─────────────────────────────────────────────────────────────────┘
 
-                ┌───────────────────────────┐
-                │  Label detected?    YES   │
-                │  Re-run triggered?  YES   │
-                │  MBridge tested?    YES   │
-                └───────────────────────────┘
+                ┌────────────────────────────────────┐
+                │  Label present?     NO   → unit    │
+                │  Label present?     YES  → unit +  │
+                │                           functional│
+                └────────────────────────────────────┘
 
   NOTE: The label must be present BEFORE the re-run is triggered.
         The CI checks for "Run MBridge tests" at runtime.
+
+  NOTE: All MBridge test results are optional — failures do not
+        block merging your PR.
 EOF
