@@ -37,11 +37,20 @@ jobs:
         with:
           ref: ${{ env.TARGET_BRANCH }}
 
+      - name: Mock test data
+        run: mkdir -p assets/
+
+      - name: Fetch NGC Version
+        id: ngc-version
+        run: |
+          NGC_VERSION=$(cat docker/.ngc_version.dev)
+          echo "NGC_VERSION=${NGC_VERSION}" | tee -a "$GITHUB_OUTPUT"
+
       - name: Build container
         env:
           GH_TOKEN: ${{ secrets.PAT }}
         run: |
-          docker build -f docker/Dockerfile.ci.dev --build-arg FROM_IMAGE_NAME="nvcr.io/nvidia/pytorch:25.06-py3" --target=main -t megatron-core .
+          docker build -f docker/Dockerfile.ci.dev --build-arg FROM_IMAGE_NAME="${{ steps.ngc-version.outputs.NGC_VERSION }}" --target=main -t megatron-core .
 
       - name: Create bump branch if not exists
         run: |
