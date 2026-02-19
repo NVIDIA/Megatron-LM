@@ -15,19 +15,19 @@ from megatron.core.models.gpt.gpt_layer_specs import (
 from megatron.core.models.vision.vit_layer_specs import (
     get_vit_layer_with_transformer_engine_spec,
 )
-from megatron.core.pipeline_parallel.schedules import set_current_microbatch
 from megatron.core.tensor_parallel.random import (
     HAVE_TE,
     initialize_rng_tracker,
     model_parallel_cuda_manual_seed,
 )
 from megatron.core.transformer.transformer_config import TransformerConfig
-from megatron.core.transformer.vision_cuda_graphs import (
+from megatron.core.transformer.cuda_graphs import (
     HAVE_TE_GRAPHS,
     VisionTECudaGraphHelper,
     _vision_layer_is_graphable,
     _wrap_graph_for_vision,
     get_vision_cuda_graph_seq_length,
+    set_current_microbatch,
 )
 from megatron.core.utils import is_te_min_version
 from megatron.core import parallel_state

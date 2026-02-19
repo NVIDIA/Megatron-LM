@@ -20,7 +20,7 @@ from megatron.core.pipeline_parallel.utils import (
     is_vp_last_stage,
 )
 from megatron.core.process_groups_config import ProcessGroupCollection
-from megatron.core.transformer.cuda_graphs import create_cudagraphs
+from megatron.core.transformer.cuda_graphs import create_cudagraphs, set_current_microbatch
 from megatron.core.transformer.enums import CudaGraphScope
 from megatron.core.transformer.moe.router import MoEAuxLossAutoScaler
 from megatron.core.utils import (
@@ -195,45 +195,6 @@ def custom_backward(output, grad_output):
         allow_unreachable=True,
         accumulate_grad=True,
     )
-
-
-def set_current_microbatch(model, microbatch_id):
-    """Set the current microbatch."""
-    decoder_exists = True
-    model_with_decoder = None
-    try:
-        model_with_decoder = get_attr_wrapped_model(
-            model, "decoder", allow_none=False, return_model_obj=True
-        )
-    except RuntimeError:
-        decoder_exists = False
-    if decoder_exists and model_with_decoder is not None:
-        for layer in model_with_decoder.decoder.layers:
-            layer.current_microbatch = microbatch_id
-        if hasattr(model_with_decoder, 'mtp'):
-            for layer in model_with_decoder.mtp.layers:
-                assert hasattr(
-                    layer, 'mtp_model_layer'
-                ), f"MTP layer {layer} must have 'mtp_model_layer' attribute"
-                layer.mtp_model_layer.current_microbatch = microbatch_id
-
-    # Also set current_microbatch on vision encoder layers so that
-    # _te_cuda_graph_replay selects the correct graph index. Without this,
-    # vision layers always use graph 0 (since current_microbatch defaults to 0),
-    # causing all microbatch forwards to overwrite the same static buffers.
-    # When backward runs for earlier microbatches, the buffers contain stale
-    # data from later forwards, producing NaN gradients.
-    try:
-        model_with_vision = get_attr_wrapped_model(
-            model, "vision_model", allow_none=True, return_model_obj=True
-        )
-    except RuntimeError:
-        model_with_vision = None
-    if model_with_vision is not None and hasattr(model_with_vision, 'vision_model'):
-        vision_model = model_with_vision.vision_model
-        if hasattr(vision_model, 'decoder') and hasattr(vision_model.decoder, 'layers'):
-            for layer in vision_model.decoder.layers:
-                layer.current_microbatch = microbatch_id
 
 
 def forward_step_calc_loss(
