@@ -42,18 +42,19 @@ def _hash_table_insert_kernel(
 
     # Skip empty sentinel keys
     if key != empty_i64:
-        slot = key & CAPACITY_MASK  # Fast modulo for power-of-2
-        done = 0
+        slot = (key & CAPACITY_MASK).to(tl.int64)  # Fast modulo for power-of-2
+        done: tl.int32 = 0
 
         # Linear probing with bounded search
         for _ in range(256):
             if done == 0:
-                existing = tl.atomic_cas(TABLE_KEYS + slot, empty_i64, key)
+                existing = tl.load(TABLE_KEYS + slot)
                 if existing == empty_i64 or existing == key:
+                    tl.store(TABLE_KEYS + slot, key)
                     tl.store(TABLE_VALUES + slot, val)
                     done = 1
                 else:
-                    slot = (slot + 1) & CAPACITY_MASK
+                    slot = ((slot + 1) & CAPACITY_MASK).to(tl.int64)
 
 
 @triton.jit
@@ -74,8 +75,8 @@ def _hash_table_lookup_kernel(
     # Cast EMPTY to int64 to match TABLE_KEYS element type
     empty_i64 = tl.full([], EMPTY, dtype=tl.int64)
 
-    slot = key & CAPACITY_MASK
-    result = -1
+    slot = (key & CAPACITY_MASK).to(tl.int64)
+    result: tl.int32 = -1
     done = 0
 
     for _ in range(256):
@@ -87,9 +88,9 @@ def _hash_table_lookup_kernel(
             elif existing_key == empty_i64:
                 done = 1
             else:
-                slot = (slot + 1) & CAPACITY_MASK
+                slot = ((slot + 1) & CAPACITY_MASK).to(tl.int64)
 
-    tl.store(RESULTS + pid, result)
+    tl.store(RESULTS + pid, result.to(tl.int32))
 
 
 @triton.jit
@@ -133,21 +134,25 @@ def _prefix_match_kernel(
     # Cast EMPTY to int64 to match TABLE_KEYS element type
     empty_i64 = tl.full([], EMPTY, dtype=tl.int64)
 
-    matched = 0
-    has_pending = 0  # Use int since tl.store expects consistent types
+    matched: tl.int32 = 0
+    has_pending: tl.int32 = 0
+    block_id: tl.int32 = -1
+    found: tl.int32 = 0
 
     stopped = 0
     for i in tl.static_range(MAX_BLOCKS_PER_REQ):
         if start + i >= end:
             stopped = 1
 
+        # Reset per-iteration state
+        found = 0
+        block_id = -1
+
         if stopped == 0:
             hash_key = tl.load(REQUEST_HASHES + start + i)
 
             # Hash table lookup (inline linear probe)
-            slot = hash_key & CAPACITY_MASK
-            found = 0
-            block_id = -1
+            slot = (hash_key & CAPACITY_MASK).to(tl.int64)
             probe_done = 0
             for _ in range(256):
                 if probe_done == 0:
@@ -159,24 +164,24 @@ def _prefix_match_kernel(
                     elif existing == empty_i64:
                         probe_done = 1
                     else:
-                        slot = (slot + 1) & CAPACITY_MASK
+                        slot = ((slot + 1) & CAPACITY_MASK).to(tl.int64)
 
             if found == 0:
                 stopped = 1  # Stop at first miss
 
         if stopped == 0:
             # Check if this block is pending
-            if tl.load(PENDING_BITMAP + block_id):
+            if tl.load(PENDING_BITMAP + block_id.to(tl.int64)):
                 has_pending = 1
 
             tl.store(
-                MATCHED_BLOCK_IDS + req_id * MAX_BLOCKS_PER_REQ + matched,
-                block_id,
+                MATCHED_BLOCK_IDS + (req_id * MAX_BLOCKS_PER_REQ + matched).to(tl.int64),
+                block_id.to(tl.int32),
             )
             matched += 1
 
-    tl.store(NUM_MATCHED + req_id, matched)
-    tl.store(HAS_PENDING + req_id, has_pending)
+    tl.store(NUM_MATCHED + req_id, matched.to(tl.int32))
+    tl.store(HAS_PENDING + req_id, has_pending.to(tl.int32))
 
 
 # =========================================================================

@@ -17,6 +17,10 @@ runs/
 /test_cases/
 **/dist/
 
+# Test files not intended for version control
+tests/unit_tests/inference/contexts/test_dynamic_prefix_caching_v0.py
+tests/unit_tests/inference/contexts/test_gpu_scheduling.py
+
 # Sphinx documentation
 docs/_build
 docs/apidocs
