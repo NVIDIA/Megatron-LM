@@ -249,6 +249,7 @@ jobs:
           owner: NVIDIA-NeMo
           repo: Megatron-Bridge
           workflow_file_name: cicd-main.yml
+          github_token: ${{ secrets.PAT }}
           ref: main
           client_payload: |
             {
