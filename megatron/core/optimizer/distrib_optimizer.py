@@ -677,6 +677,8 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
                 # TE FusedAdam will not accumulate step for empty param groups, so we need to
                 # align the step across param groups.
                 param_group["step"] = int(step)
+            if "step" in param_group and param_group["step"] is None:
+                del param_group["step"]
 
         # Grad scaler state.
         if self.grad_scaler:
@@ -1645,6 +1647,8 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
                         for key in tensors:
                             if key == 'padding':
                                 tensors[key] = LocalNonpersistentObject(tensors[key])
+                                continue
+                            if key == 'step':
                                 continue
                             assert tensors[key].shape == (gbuf_local_end - gbuf_local_start,), (
                                 tensors[key].shape,
