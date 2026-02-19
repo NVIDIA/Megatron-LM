@@ -279,7 +279,7 @@ jobs:
           propagate_failure: true
           client_payload: |
             {
-              "mcore_commit": "${{ steps.sha.outputs.main }}",
+              "mcore_ref": "${{ steps.sha.outputs.main }}",
               "test_suite": "all",
               "triggered_by": "https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}"
             }
