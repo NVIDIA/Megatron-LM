@@ -495,7 +495,7 @@ class DynamicInferenceRequestRecord:
 
     @staticmethod
     def _update_staleness_tensor(
-        tensor: Optional[torch.Tensor], total_tokens: int, increment: bool = True,
+        tensor: Optional[torch.Tensor], total_tokens: int, increment: bool = True
     ) -> torch.Tensor:
         """Update a per-token staleness tensor, extending with zeros if needed.
 
@@ -511,9 +511,7 @@ class DynamicInferenceRequestRecord:
                 (
                     tensor,
                     torch.zeros(
-                        total_tokens - len(tensor),
-                        dtype=tensor.dtype,
-                        device=tensor.device,
+                        total_tokens - len(tensor), dtype=tensor.dtype, device=tensor.device
                     ),
                 ),
                 dim=0,
@@ -535,11 +533,11 @@ class DynamicInferenceRequestRecord:
         request = self[-1]
         total_tokens = len(request.prompt_tokens) + len(request.generated_tokens)
         request.policy_staleness = self._update_staleness_tensor(
-            request.policy_staleness, total_tokens, increment=True,
+            request.policy_staleness, total_tokens, increment=True
         )
         if not policy_only:
             request.kv_cache_staleness = self._update_staleness_tensor(
-                request.kv_cache_staleness, total_tokens, increment=True,
+                request.kv_cache_staleness, total_tokens, increment=True
             )
 
     def checkpoint(self, tokenizer: MegatronTokenizer | None = None):
@@ -555,14 +553,20 @@ class DynamicInferenceRequestRecord:
         total_tokens = len(old_request.prompt_tokens) + len(old_request.generated_tokens)
 
         # Carry forward policy_staleness without incrementing.
-        policy_staleness = self._update_staleness_tensor(
-            old_request.policy_staleness, total_tokens, increment=False,
-        ) if old_request.policy_staleness is not None else None
+        policy_staleness = (
+            self._update_staleness_tensor(
+                old_request.policy_staleness, total_tokens, increment=False
+            )
+            if old_request.policy_staleness is not None
+            else None
+        )
 
         # Reset kv_cache_staleness to 0.
-        kv_cache_staleness = self._update_staleness_tensor(
-            None, total_tokens, increment=False,
-        ) if old_request.kv_cache_staleness is not None else None
+        kv_cache_staleness = (
+            self._update_staleness_tensor(None, total_tokens, increment=False)
+            if old_request.kv_cache_staleness is not None
+            else None
+        )
 
         # New prompt (concatenate prompt + generated tokens).
         new_prompt_tokens = torch.cat(
@@ -634,10 +638,10 @@ class DynamicInferenceRequestRecord:
         # Ensure staleness tensors are always materialized (zeros if never incremented).
         total_tokens = len(prompt_tokens) + len(generated_tokens)
         policy_staleness = self._update_staleness_tensor(
-            self.requests[-1].policy_staleness, total_tokens, increment=False,
+            self.requests[-1].policy_staleness, total_tokens, increment=False
         )
         kv_cache_staleness = self._update_staleness_tensor(
-            self.requests[-1].kv_cache_staleness, total_tokens, increment=False,
+            self.requests[-1].kv_cache_staleness, total_tokens, increment=False
         )
 
         # Merged request.
