@@ -1225,7 +1225,9 @@ def local_multi_tensor_l2_norm(chunk_size, noop_flag, tensor_lists, per_tensor, 
         # _foreach_norm returns results in the same dtype as input. For fp16/bf16, this can cause
         # overflow if the norm exceeds the range of the type (e.g., > 65504 for fp16).
         # The original implementation forces float32 accumulation and return type.
-        if hasattr(torch, "_foreach_norm") and tensor_list[0].dtype == torch.float32:
+        if hasattr(torch, "_foreach_norm") and all(
+            tensor.dtype == torch.float32 for tensor in tensor_list
+        ):
             batch_norms = torch._foreach_norm(tensor_list, 2.0)
             norms.extend(batch_norms)
         else:
