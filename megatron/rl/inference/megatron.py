@@ -6,6 +6,13 @@ import logging
 import torch.distributed as dist
 from pydantic import PrivateAttr
 
+try:
+    import httpx
+    from openai import AsyncOpenAI
+    HAVE_OPENAI = True
+except ImportError:
+    HAVE_OPENAI = False
+
 from megatron.core.inference.config import KVCacheManagementMode
 from megatron.core.inference.engines.dynamic_engine import DynamicInferenceEngine
 from megatron.core.inference.inference_client import InferenceClient
@@ -73,7 +80,7 @@ class MegatronLocal(InferenceServer, ReturnsTokens, ReturnsRaw):
 
     @classmethod
     async def launch(cls, model: GPTModel, **kwargs):
-        # Import here to avoid circular imports
+        assert HAVE_OPENAI, "openai package is required for MegatronLocal"
         from megatron.inference.utils import get_dynamic_inference_engine
 
         args = get_args()
@@ -107,9 +114,6 @@ class MegatronLocal(InferenceServer, ReturnsTokens, ReturnsRaw):
             client = None
             server_task = None
             
-        import httpx
-        from openai import AsyncOpenAI
-
         try:
             import h2  # noqa: F401
             use_http2 = True
@@ -133,8 +137,8 @@ class MegatronLocal(InferenceServer, ReturnsTokens, ReturnsRaw):
                 timeout=timeout,
                 http2=use_http2,
                 limits=httpx.Limits(
-                    max_connections=8192,
-                    max_keepalive_connections=8192,
+                    max_connections=16384,
+                    max_keepalive_connections=16384,
                     keepalive_expiry=10,
                 ),
             ),
