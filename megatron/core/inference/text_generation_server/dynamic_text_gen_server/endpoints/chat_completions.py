@@ -201,6 +201,15 @@ try:
                     "tool_calls" if metadata.get("tool_calls", []) else "stop"
                 ),  # Original code hardcoded this.
             }
+            if result.get("policy_staleness") is not None:
+                choice_data["policy_staleness"] = result["policy_staleness"]
+            if result.get("kv_cache_staleness") is not None:
+                choice_data["kv_cache_staleness"] = result["kv_cache_staleness"]
+            events = result.get("events")
+            if events is not None:
+                num_evictions = sum(1 for e in events if e.get("type") == "EVICT")
+                if num_evictions > 0:
+                    choice_data["num_evictions"] = num_evictions
             if current_app.config['verbose']:
                 logging.info(result)
             if result["routing_indices"] is not None:
