@@ -17,7 +17,7 @@ import pytest
 import torch
 
 from megatron.core import parallel_state
-from megatron.core.inference.config import InferenceConfig, MambaInferenceStateConfig
+from megatron.core.inference.config import InferenceConfig, MambaInferenceStateConfig, PrefixCachingEvictPolicy
 from megatron.core.inference.contexts.dynamic_context import DynamicInferenceContext
 from megatron.core.inference.engines import DynamicInferenceEngine
 from megatron.core.inference.inference_request import DynamicInferenceRequest
@@ -93,7 +93,7 @@ def _build_hybrid_context(
         use_flashinfer_fused_rope=None,
         unified_memory_level=0,
         enable_prefix_caching=enable_prefix_caching,
-        block_evict_lru=enable_prefix_caching,
+        prefix_caching_evict_policy=PrefixCachingEvictPolicy.LRU if enable_prefix_caching else PrefixCachingEvictPolicy.REF_ZERO,
         prefix_caching_mamba_gb=prefix_caching_mamba_gb,
     )
     return DynamicInferenceContext(
@@ -572,7 +572,7 @@ def _build_engine(
             mamba_inference_state_config=mamba_inference_state_config,
             enable_chunked_prefill=enable_chunked_prefill,
             enable_prefix_caching=enable_prefix_caching,
-            block_evict_lru=enable_prefix_caching,
+            prefix_caching_evict_policy=PrefixCachingEvictPolicy.LRU if enable_prefix_caching else PrefixCachingEvictPolicy.REF_ZERO,
             prefix_caching_mamba_gb=prefix_caching_mamba_gb,
             materialize_only_last_token_logits=False,
             use_flashinfer_fused_rope=None,
@@ -841,7 +841,7 @@ class TestBudgetZero:
             use_flashinfer_fused_rope=None,
             unified_memory_level=0,
             enable_prefix_caching=True,
-            block_evict_lru=True,
+            prefix_caching_evict_policy=PrefixCachingEvictPolicy.LRU,
             prefix_caching_mamba_gb=None,
         )
         ctx = DynamicInferenceContext(

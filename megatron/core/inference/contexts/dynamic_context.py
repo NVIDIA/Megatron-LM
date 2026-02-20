@@ -1956,7 +1956,7 @@ class DynamicInferenceContext(BaseInferenceContext):
             num_mamba_matched = getattr(req, '_mamba_num_matched_blocks', 0)
             if num_mamba_matched < num_matched_blocks:
                 num_matched_blocks = num_mamba_matched
-                matched_block_ids = matched_block_ids[:num_matched_blocks]
+                matched_tensor = matched_tensor[:num_matched_blocks] if matched_tensor is not None else None
                 # Recompute parent hash for the truncated match
                 if num_matched_blocks > 0:
                     prefix_parent_hash = req.precomputed_block_hashes[
@@ -2144,7 +2144,7 @@ class DynamicInferenceContext(BaseInferenceContext):
             if num_mamba_matched > 0 and num_matched_blocks > 0:
                 # Find the block ID of the last Mamba-matched block
                 last_mamba_block_idx = num_mamba_matched - 1
-                last_mamba_block_id = matched_block_ids[last_mamba_block_idx]
+                last_mamba_block_id = matched_tensor[last_mamba_block_idx]
                 restored = self.restore_mamba_state_from_block(
                     self.total_request_count, last_mamba_block_id
                 )
