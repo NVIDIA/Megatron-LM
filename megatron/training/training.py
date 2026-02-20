@@ -2761,7 +2761,6 @@ def train(
         )
 
     # Run training iterations till done.
-    buffered_rollouts = None
     while iteration < args.train_iters:
         if (args.profile 
             and (len(args.profile_ranks) == 0 or
@@ -2858,12 +2857,8 @@ def train(
                     grpo_group_size=args.grpo_group_size,
                     global_batch_size=args.global_batch_size,
                     sequence_packing=args.rl_use_sequence_packing,
-                    buffered_rollouts=buffered_rollouts,
                     is_correction=args.rl_inference_logprobs_is_correction,
                 )
-                # Buffered rollouts are used as a state container for setups when
-                # we use previously-generated data for an update.
-                buffered_rollouts = train_data_iterator
 
         ft_integration.on_training_step_start()
         (

@@ -441,6 +441,9 @@ def validate_args(args, defaults={}):
         if args.rl_use_sequence_packing:
             assert args.micro_batch_size == 1, \
                 "micro_batch_size must be 1 when using sequence packing. To increase compute per micro batch increase the sequence length."
+        assert rl.forced_lag > 0 or not args.rl_partial_rollouts, (
+            "--rl-forced-lag and --rl-partial-rollouts are incompatible."
+        )
 
     print_rank_0('using world size: {}, data-parallel size: {}, '
                  'context-parallel size: {}, '
@@ -2107,6 +2110,11 @@ def _add_rl_args(parser):
                             'If False, CUDA graphs are deleted on suspend and re-captured on resume.')
     group.add_argument('--rl-partial-rollouts', action=argparse.BooleanOptionalAction, default=False,
                        help='If set, use partial rollouts.')
+    group.add_argument('--rl-forced-lag', type=int, default=0,
+                       help='Forced rollout lag of L steps. After an initial warm-up of L steps, '
+                            'All steps N+L use only rollouts that were started on step N. '
+                            '0 (default) disabled this behavior.'
+                       )
     group.add_argument('--rl-inference-logprobs-is-correction', action=argparse.BooleanOptionalAction, type=bool, default=False,
                        help='If set, use inference logprobs in importance sampling correction of the loss.')
     group.add_argument('--rl-importance-sampling-truncation-coef', type=float, default=None,
