@@ -165,22 +165,41 @@ jobs:
             echo "$REQUIRED_CHECKS"
           fi
 
-          echo "Waiting for required checks to appear on PR #$PR_NUMBER..."
-          for i in $(seq 1 480); do
-            CURRENT_CHECKS=$(gh pr checks "$PR_NUMBER" 2>/dev/null | awk '{print $1}')
+          echo "Waiting for required checks to complete on PR #$PR_NUMBER..."
+          i=0
+          while true; do
+            i=$((i + 1))
+            CHECKS_JSON=$(gh pr checks "$PR_NUMBER" --json name,state 2>/dev/null)
             if [ -n "$REQUIRED_CHECKS" ]; then
-              ALL_PRESENT=true
+              ALL_DONE=true
+              FAILED_CHECKS=""
               while IFS= read -r check; do
-                if ! echo "$CURRENT_CHECKS" | grep -qF "$check"; then
-                  ALL_PRESENT=false
-                  break
-                fi
+                CHECK_STATE=$(echo "$CHECKS_JSON" | jq -r --arg name "$check" '.[] | select(.name == $name) | .state // ""' | tr '[:upper:]' '[:lower:]')
+                case "$CHECK_STATE" in
+                  *success*|*pass*|*skip*|*neutral*) ;;
+                  *pending*|*queued*|*progress*|*waiting*|*request*|"")
+                    ALL_DONE=false
+                    break
+                    ;;
+                  *) FAILED_CHECKS="${FAILED_CHECKS}  - ${check} (${CHECK_STATE})"$'\n' ;;
+                esac
               done <<< "$REQUIRED_CHECKS"
-              [ "$ALL_PRESENT" = "true" ] && { echo "All required checks found, starting watch..."; break; }
+              if [ "$ALL_DONE" = "true" ]; then
+                if [ -n "$FAILED_CHECKS" ]; then
+                  echo "Required check(s) did not pass:"
+                  echo "$FAILED_CHECKS"
+                  exit 1
+                fi
+                echo "All required checks passed!"
+                break
+              fi
             else
-              echo "$CURRENT_CHECKS" | grep -qE '(pass|fail|pending|in_progress|queued)' && { echo "Checks found, starting watch..."; break; }
+              if echo "$CHECKS_JSON" | jq -e '[.[] | select(.state | ascii_downcase | test("pending|queued|progress|waiting|request"))] | length == 0' > /dev/null 2>&1; then
+                echo "All checks completed!"
+                break
+              fi
             fi
-            echo "Required checks not yet present (attempt $i/480), retrying in 30s..."
+            echo "Checks not yet complete (attempt $i), retrying in 30s..."
             sleep 30
           done
 
