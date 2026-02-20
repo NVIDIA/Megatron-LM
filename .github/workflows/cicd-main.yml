@@ -259,11 +259,13 @@ jobs:
           token: ${{ secrets.PAT }}
 
       - name: Create testing branch
+        env:
+          MBRIDGE_BRANCH_NAME: mcore-testing-${{ fromJSON(steps.get-pr-info.outputs.pr-info || '{}').number || github.run_id }}
         run: |
           cd megatron-bridge
           git fetch origin main
-          git checkout -b mcore-testing-${{ fromJSON(steps.get-pr-info.outputs.pr-info || '{}').number }} origin/main
-          git push origin mcore-testing-${{ fromJSON(steps.get-pr-info.outputs.pr-info || '{}').number }} --force
+          git checkout -b ${{ env.MBRIDGE_BRANCH_NAME }} origin/main
+          git push origin ${{ env.MBRIDGE_BRANCH_NAME }} --force
 
       - name: Get merge commit sha
         shell: bash -x -e -u -o pipefail {0}
@@ -283,12 +285,14 @@ jobs:
 
       - name: Trigger MBridge tests
         uses: convictional/trigger-workflow-and-wait@v1.6.5
+        env:
+          MBRIDGE_BRANCH_NAME: mcore-testing-${{ fromJSON(steps.get-pr-info.outputs.pr-info || '{}').number || github.run_id }}
         with:
           owner: NVIDIA-NeMo
           repo: Megatron-Bridge
           workflow_file_name: cicd-main.yml
           github_token: ${{ secrets.PAT }}
-          ref: mcore-testing-${{ fromJSON(steps.get-pr-info.outputs.pr-info || '{}').number }}
+          ref: ${{ env.MBRIDGE_BRANCH_NAME }}
           wait_interval: 60
           propagate_failure: true
           client_payload: |
@@ -297,6 +301,14 @@ jobs:
               "test_suite": "${{ needs.cicd-parse-downstream-testing.outputs.mbridge-test-suite }}",
               "triggered_by": "https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}"
             }
+
+      - name: Delete testing branch
+        if: always()
+        env:
+          MBRIDGE_BRANCH_NAME: mcore-testing-${{ fromJSON(steps.get-pr-info.outputs.pr-info || '{}').number || github.run_id }}
+        run: |
+          cd megatron-bridge
+          git push origin --delete ${{ env.MBRIDGE_BRANCH_NAME }}
 
   cicd-container-build:
     needs: [is-not-external-contributor, pre-flight, cicd-wait-in-queue]
