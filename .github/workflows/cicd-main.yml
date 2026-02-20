@@ -304,6 +304,8 @@ jobs:
 
       - name: Delete testing branch
         if: always()
+        env:
+          MBRIDGE_BRANCH_NAME: mcore-testing-${{ fromJSON(steps.get-pr-info.outputs.pr-info || '{}').number || github.run_id }}
         run: |
           cd megatron-bridge
           git push origin --delete ${{ env.MBRIDGE_BRANCH_NAME }}
