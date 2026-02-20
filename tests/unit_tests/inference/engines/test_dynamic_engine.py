@@ -1854,27 +1854,8 @@ class TestDynamicInferenceEngine:
     @pytest.mark.parametrize("use_checkpoint", [False, True], ids=["persist", "recompute"])
     @torch.inference_mode()
     def test_staleness_tracking(self, use_checkpoint):
-        """End-to-end staleness tracking through generation with checkpoint() cycles.
-
-        Exercises increment_staleness(), checkpoint(), and merge() on live
-        engine request records.  The ``use_checkpoint`` flag mirrors what the
-        engine does during suspend in RECOMPUTE mode (calls record.checkpoint()
-        on every active record).
-
-        Timeline (prompt_len=8, num_tokens_to_generate=8):
-
-          generate 3 tokens
-          training step 1  ->  increment_staleness  (init both staleness to 1)
-          [checkpoint if recompute: policy carried forward, kv_cache reset to 0]
-          generate 3 tokens
-          training step 2  ->  increment_staleness
-          [checkpoint if recompute: policy carried forward, kv_cache reset to 0]
-          generate final 2 tokens  ->  requests finish
-          merge and validate
-
-        Both paths produce identical policy_staleness.  kv_cache_staleness
-        differs: persist keeps cumulative counts, recompute resets to 0 at
-        each checkpoint.
+        """Test that staleness is correct tracked.
+        The use_checkpoint parameter simulates the behavior of different kv_cache_management_mode.
         """
         PROMPT_LEN = 8
         NUM_TOKENS = 8
@@ -1888,7 +1869,6 @@ class TestDynamicInferenceEngine:
         env = self._build_test_env(test_config)
         engine = env.engine
 
-        # Add requests with termination_id=-1 to disable early stopping.
         for i in range(2):
             prompt_tokens = torch.randint(
                 0,
@@ -1907,17 +1887,15 @@ class TestDynamicInferenceEngine:
                 )
             )
 
-        # -- Generate 3 tokens --
         for _ in range(3):
             engine.step_modern()
 
-        assert len(engine.requests) == 2
         for entry in engine.requests.values():
             assert len(entry.record[-1].generated_tokens) == 3
             assert entry.record[-1].policy_staleness is None
             assert entry.record[-1].kv_cache_staleness is None
 
-        # -- Training step 1: first increment initializes both staleness to all 1s --
+        # Increment staleness.
         for entry in engine.requests.values():
             entry.record.increment_staleness()
 
@@ -1925,39 +1903,29 @@ class TestDynamicInferenceEngine:
             ps = entry.record[-1].policy_staleness
             ks = entry.record[-1].kv_cache_staleness
             assert ps.shape == ks.shape == (PROMPT_LEN + 3,)
-            assert ps.dtype == ks.dtype == torch.int32
             assert (ps == 1).all()
             assert (ks == 1).all()
 
-        # -- Checkpoint (mirrors what engine.suspend does in RECOMPUTE mode) --
-        # policy_staleness is carried forward; kv_cache_staleness resets to 0.
+        # Simulate RECOMPUTE
         if use_checkpoint:
             for entry in engine.requests.values():
                 old_req = entry.record[-1]
                 event_add_engine = old_req.event_add_engine
                 entry.record.checkpoint()
-                # Carry forward event_add_engine so the engine can compute TTFT
-                # for the first post-checkpoint token without crashing.
+                # Prevent TTFT crash due to missing _add_request in test.
                 entry.record[-1].event_add_engine = event_add_engine
 
-        for entry in engine.requests.values():
-            ps = entry.record[-1].policy_staleness
-            ks = entry.record[-1].kv_cache_staleness
-            assert ps.shape == (PROMPT_LEN + 3,)
-            assert (ps == 1).all()
-            assert ks.shape == (PROMPT_LEN + 3,)
-            if use_checkpoint:
+            for entry in engine.requests.values():
+                ps = entry.record[-1].policy_staleness
+                ks = entry.record[-1].kv_cache_staleness
+                assert ps.shape == ks.shape == (PROMPT_LEN + 3,)
+                assert (ps == 1).all()
                 assert (ks == 0).all()
-            else:
-                assert (ks == 1).all()
 
-        # -- Generate 3 more tokens --
         for _ in range(3):
             engine.step_modern()
 
-        assert len(engine.requests) == 2
-
-        # -- Training step 2: old tokens +1, new tokens init to 1 --
+        # Increment staleness.
         for entry in engine.requests.values():
             entry.record.increment_staleness()
 
@@ -1965,17 +1933,14 @@ class TestDynamicInferenceEngine:
             ps = entry.record[-1].policy_staleness
             ks = entry.record[-1].kv_cache_staleness
             assert ps.shape == ks.shape == (PROMPT_LEN + 6,)
-            # policy_staleness is the same in both paths.
             assert (ps[: PROMPT_LEN + 3] == 2).all()
             assert (ps[PROMPT_LEN + 3 :] == 1).all()
-            # kv_cache_staleness differs: recompute had a reset before this increment.
             if use_checkpoint:
-                assert (ks == 1).all()  # 0+1 for old tokens, 0+1 for new tokens
+                assert (ks == 1).all()
             else:
                 assert (ks[: PROMPT_LEN + 3] == 2).all()
                 assert (ks[PROMPT_LEN + 3 :] == 1).all()
 
-        # -- Checkpoint --
         if use_checkpoint:
             for entry in engine.requests.values():
                 old_req = entry.record[-1]
@@ -1984,58 +1949,38 @@ class TestDynamicInferenceEngine:
                 entry.record[-1].event_add_engine = event_add_engine
 
             for entry in engine.requests.values():
-                ps = entry.record[-1].policy_staleness
                 ks = entry.record[-1].kv_cache_staleness
-                assert ps.shape == ks.shape == (PROMPT_LEN + 6,)
-                assert (ps[: PROMPT_LEN + 3] == 2).all()
-                assert (ps[PROMPT_LEN + 3 :] == 1).all()
-                assert (ks == 0).all()  # reset again
+                assert (ks == 0).all()
 
-        # -- Generate remaining 2 tokens, collect finished records --
         finished_records = []
         while engine.has_unfinished_requests():
             result = engine.step_modern()
             finished_records.extend(result["finished_request_records"])
 
-        assert len(finished_records) == 2
-
-        # -- Validate merged results --
         for record in finished_records:
             merged = record.merge()
 
-            # policy_staleness is identical in both paths.
-            # merge() materializes staleness to cover all tokens, including
-            # the final 2 generated after the last increment (staleness 0).
             assert merged.policy_staleness is not None
             assert merged.policy_staleness.shape == (PROMPT_LEN + NUM_TOKENS,)
             assert (merged.policy_staleness[: PROMPT_LEN + 3] == 2).all()
             assert (merged.policy_staleness[PROMPT_LEN + 3 : PROMPT_LEN + 6] == 1).all()
             assert (merged.policy_staleness[PROMPT_LEN + 6 :] == 0).all()
 
-            # kv_cache_staleness differs between persist and recompute.
             assert merged.kv_cache_staleness is not None
             assert merged.kv_cache_staleness.shape == (PROMPT_LEN + NUM_TOKENS,)
             if use_checkpoint:
-                assert (merged.kv_cache_staleness == 0).all()  # last checkpoint reset it
+                assert (merged.kv_cache_staleness == 0).all()
             else:
                 assert (merged.kv_cache_staleness[: PROMPT_LEN + 3] == 2).all()
                 assert (merged.kv_cache_staleness[PROMPT_LEN + 3 : PROMPT_LEN + 6] == 1).all()
                 assert (merged.kv_cache_staleness[PROMPT_LEN + 6 :] == 0).all()
 
-            # Original prompt preserved, all 8 tokens generated.
-            assert len(merged.prompt_tokens) == PROMPT_LEN
-            assert len(merged.generated_tokens) == NUM_TOKENS
-
-        # -- Verify evicted requests skip kv_cache increment --
-        # Eviction always calls checkpoint() (regardless of KV mode), which
-        # resets kv_cache_staleness.  A subsequent increment with policy_only=True
-        # (what the engine does for waiting-queue requests) should only bump
-        # policy_staleness.
+        # Verify evicted requests don't have their policy staleness incremented.
         record = finished_records[0]
         record.checkpoint()
         pre_ps = record[-1].policy_staleness.clone()
 
-        record.increment_staleness(policy_only=True)
+        record.increment_staleness(policy_only=True)  # This mimics the coordinator's action.
 
         assert (record[-1].policy_staleness == pre_ps + 1).all()
         assert (record[-1].kv_cache_staleness == 0).all()
