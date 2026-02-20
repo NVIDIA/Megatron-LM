@@ -1,6 +1,7 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
 from dataclasses import dataclass
+from typing import Optional
 
 import torch
 
@@ -19,7 +20,8 @@ class MXFP8Tensor:
     data: torch.Tensor
     scale: torch.Tensor
 
-    def size(self, idx: int):
+    def size(self, idx: Optional[int] = None):
+        """Wrapper for calling self.data.size()"""
         return self.data.size(idx)
 
     @classmethod

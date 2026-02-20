@@ -13,7 +13,6 @@ from megatron.core.inference.communication.torch_symm_triton import (
     multimem_all_gather,
     multimem_reduce_scatter,
 )
-from megatron.core.inference.quantization.mxfp8_tensor import MXFP8Tensor
 from megatron.core.inference.quantization.utils import mm_mxfp8
 from megatron.core.model_parallel_config import ModelParallelConfig
 from megatron.core.parallel_state import get_global_symmetric_memory_buffer
