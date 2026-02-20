@@ -853,6 +853,9 @@ def prep_wandb_metrics(
         example_groups: A list of rollouts of one group to log examples of trajectories.
         policy_staleness: Grouped list of per-rollout max policy staleness.
         kv_cache_staleness: Grouped list of per-rollout max KV cache staleness.
+        num_evictions: Grouped list of per-rollout number of evictions.
+        completed_at_steps: Grouped list of per-rollout completed at steps.
+        current_iteration: Current training iteration.
     """
 
     group_table = wandb_writer.Table(
@@ -886,17 +889,11 @@ def prep_wandb_metrics(
                 ),
                 'policy_staleness', 'Policy Staleness',
             ),
-            'staleness_vs_reward': wandb_writer.Table(
-                columns=['policy_staleness', 'reward'],
+            'staleness_correlation': wandb_writer.Table(
+                columns=['policy_staleness', 'reward', 'traj_length'],
                 data=list(zip(
                     [s for g in policy_staleness for s in g],
                     [r for g in rewards for r in g],
-                )),
-            ),
-            'staleness_vs_traj_length': wandb_writer.Table(
-                columns=['policy_staleness', 'traj_length'],
-                data=list(zip(
-                    [s for g in policy_staleness for s in g],
                     [l for g in traj_lens for l in g],
                 )),
             ),
