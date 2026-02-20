@@ -161,6 +161,8 @@ if __name__ == "__main__":
     check_arguments(args)
 
     tokenizer = get_tokenizer()._tokenizer
+    if hasattr(tokenizer, "tokenizer"):
+        tokenizer = tokenizer.tokenizer
     model = get_model(
         functools.partial(model_provider, modelopt_gpt_mamba_builder), wrap_with_ddp=False
     )
