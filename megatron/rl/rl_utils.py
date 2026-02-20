@@ -565,10 +565,10 @@ def get_environment_rollouts(
         if rank == 0:
             for group in rollouts:
                 for rollout in group:
-                    gap = args.curr_iteration - rollout.completed_at_step
+                    gap = args.curr_iteration - max(rollout.completed_at_step)
                     if gap > 0:
-                        rollout.policy_staleness = [s + gap for s in rollout.policy_staleness]
-                        rollout.kv_cache_staleness = [s + gap for s in rollout.kv_cache_staleness]
+                        rollout.policy_staleness = [[s + gap for s in turn] for turn in rollout.policy_staleness]
+                        rollout.kv_cache_staleness = [[s + gap for s in turn] for turn in rollout.kv_cache_staleness]
 
         with nvtx_range("sync-rollouts"):
             # Wait for Rollouts to be collected
@@ -781,10 +781,10 @@ def compute_group_stats(
             roll_turn_lens = [len(t) for t in rollout.trajectory]
             group_turn_lengths.extend(roll_turn_lens)
             group_traj_lengths.append(sum(roll_turn_lens))
-            group_policy_staleness.append(max(rollout.policy_staleness))
-            group_kv_staleness.append(max(rollout.kv_cache_staleness))
-            group_completed_at_steps.append(rollout.completed_at_step)
-            group_num_evictions.append(rollout.num_evictions)
+            group_policy_staleness.append(max(s for turn in rollout.policy_staleness for s in turn))
+            group_kv_staleness.append(max(s for turn in rollout.kv_cache_staleness for s in turn))
+            group_completed_at_steps.append(max(rollout.completed_at_step))
+            group_num_evictions.append(sum(rollout.num_evictions))
         all_policy_staleness.append(group_policy_staleness)
         all_kv_cache_staleness.append(group_kv_staleness)
         all_completed_at_steps.append(group_completed_at_steps)
