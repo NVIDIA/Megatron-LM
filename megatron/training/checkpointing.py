@@ -673,7 +673,7 @@ def save_checkpoint(iteration, model, optimizer, opt_param_scheduler, num_floati
                         # initial_buffer_size_bytes=initial_write_buffer_size_bytes, # Optional - increase for larger checkpoint sizes per rank
                     ),
                     mp_manager=torch_mp.Manager(),
-                    thread_count=4,
+                    thread_count=args.ml_flashpoint_threads,
                 )
 
                 # Use it to instantiate the Save Strategy

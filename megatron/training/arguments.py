@@ -2258,6 +2258,8 @@ def _add_checkpointing_args(parser):
                        help='Deprecated: see --no-ckpt-fully-parallel-save.')
     group.add_argument('--use-ml-flashpoint', action='store_true',
                        dest='use_ml_flashpoint')
+    group.add_argument('--ml-flashpoint-threads', type=int, default=1,
+                       dest='ml_flashpoint_threads')
     return parser
 
 
