@@ -69,6 +69,54 @@ HASH_BASE = 31
 
 _hash_powers: Optional[torch.Tensor] = None
 
+try:
+    import triton
+    import triton.language as tl
+
+    HAVE_TRITON = True
+except ImportError:
+    HAVE_TRITON = False
+
+if HAVE_TRITON:
+
+    @triton.jit
+    def _parent_chain_hash_kernel(
+        TOKEN_HASHES,
+        OUTPUT_HASHES,
+        N: tl.constexpr,
+        HASH_PRIME: tl.constexpr,
+        HASH_BASE: tl.constexpr,
+    ):
+        """Sequential prefix scan for parent-chained hashes.
+
+        output[0] = (0 * BASE + token_hashes[0]) % PRIME + 1
+        output[i] = (output[i-1] * BASE + token_hashes[i]) % PRIME + 1
+
+        Single-threaded kernel (1 program) but avoids GPU→CPU sync.
+        For typical block counts (1-32), kernel launch (~5us) is faster
+        than .tolist() sync (~10-100us).
+
+        Uses overflow-safe modular multiplication for HASH_BASE=31:
+        parent * 31 can reach ~2^66 (parent < 2^61), overflowing int64.
+        We decompose 31 = 16+8+4+2+1 and use repeated doubling with
+        intermediate mod reduction (each sum < 2^62 < max int64).
+        """
+        parent = tl.zeros((), dtype=tl.int64)
+        for i in tl.static_range(N):
+            th = tl.load(TOKEN_HASHES + i)
+            # Overflow-safe: parent * 31 mod HASH_PRIME
+            # 31 = 16 + 8 + 4 + 2 + 1; each doubling stays < 2^62
+            p2 = (parent + parent) % HASH_PRIME
+            p4 = (p2 + p2) % HASH_PRIME
+            p8 = (p4 + p4) % HASH_PRIME
+            p16 = (p8 + p8) % HASH_PRIME
+            mul = (p16 + p8) % HASH_PRIME
+            mul = (mul + p4) % HASH_PRIME
+            mul = (mul + p2) % HASH_PRIME
+            mul = (mul + parent) % HASH_PRIME
+            parent = (mul + th) % HASH_PRIME + 1
+            tl.store(OUTPUT_HASHES + i, parent)
+
 
 def compute_block_hashes_batched(prompt_tokens: torch.Tensor, block_size: int) -> List[int]:
     """Compute hashes for all complete blocks in a prompt in one batched operation.
@@ -110,6 +158,59 @@ def compute_block_hashes_batched(prompt_tokens: torch.Tensor, block_size: int) -
     )[1:]
 
     return hashes
+
+
+def compute_block_hashes_gpu(prompt_tokens: torch.Tensor, block_size: int) -> Optional[torch.Tensor]:
+    """Compute hashes for all complete blocks entirely on GPU (zero CPU syncs).
+
+    GPU-resident version of compute_block_hashes_batched(). Returns a GPU tensor
+    instead of a CPU list, using a Triton kernel for the parent-chain step.
+
+    Args:
+        prompt_tokens: All prompt token IDs, shape [seq_len], on GPU.
+        block_size: Number of tokens per block.
+
+    Returns:
+        int64 GPU tensor of shape [num_complete_blocks] with hash values,
+        or None if no complete blocks exist.
+    """
+    num_complete_blocks = len(prompt_tokens) // block_size
+    if num_complete_blocks == 0:
+        return None
+
+    global _hash_powers
+    if _hash_powers is None or _hash_powers.shape[0] != block_size:
+        positions = torch.arange(block_size, device=prompt_tokens.device, dtype=torch.int64)
+        _hash_powers = torch.pow(HASH_BASE, positions).to(torch.int64) % HASH_PRIME
+
+    # Reshape to [num_blocks, block_size] (zero-copy view) and compute all token hashes
+    blocks = prompt_tokens[: num_complete_blocks * block_size].view(num_complete_blocks, block_size)
+    token_hashes = (blocks.to(torch.int64) * _hash_powers).sum(dim=1) % HASH_PRIME
+
+    if not HAVE_TRITON:
+        # Fallback: CPU parent chaining with sync
+        token_hashes_list = token_hashes.tolist()
+        hashes = list(
+            accumulate(
+                token_hashes_list,
+                lambda parent, th: (parent * HASH_BASE + th) % HASH_PRIME + 1,
+                initial=0,
+            )
+        )[1:]
+        return torch.tensor(hashes, dtype=torch.int64, device=prompt_tokens.device)
+
+    # Parent-chain hashing entirely on GPU via Triton kernel
+    output_hashes = torch.empty(
+        num_complete_blocks, dtype=torch.int64, device=prompt_tokens.device
+    )
+    _parent_chain_hash_kernel[(1,)](
+        token_hashes,
+        output_hashes,
+        N=num_complete_blocks,
+        HASH_PRIME=HASH_PRIME,
+        HASH_BASE=HASH_BASE,
+    )
+    return output_hashes
 
 
 @dataclass(kw_only=True)
@@ -355,7 +456,8 @@ class DynamicInferenceRequest(InferenceRequest):
     enable_prefix_caching: bool = False  # Whether prefix caching is enabled
 
     # Computed field - not passed by caller
-    precomputed_block_hashes: Optional[List[int]] = field(default=None, init=False)
+    # GPU tensor of shape [num_complete_blocks], dtype=int64, device=cuda
+    precomputed_block_hashes: Optional[torch.Tensor] = field(default=None, init=False)
 
     def __post_init__(self):
         self.sampling_params = copy.deepcopy(self.sampling_params)
@@ -370,19 +472,27 @@ class DynamicInferenceRequest(InferenceRequest):
         ):
             self._compute_block_hashes()
         elif self.block_size_tokens is not None:
-            # No prompt yet or prefix caching disabled - set empty list
-            self.precomputed_block_hashes = []
+            # No prompt yet or prefix caching disabled - set empty tensor
+            self.precomputed_block_hashes = torch.empty(
+                0, dtype=torch.int64, device=torch.cuda.current_device()
+            )
 
     def _compute_block_hashes(self) -> None:
         """Compute hashes for all complete blocks in the prompt.
 
         After this call:
-        - precomputed_block_hashes is [] if prompt < block_size (no complete blocks)
-        - precomputed_block_hashes is [hash1, ...] for N complete blocks
+        - precomputed_block_hashes is empty tensor if prompt < block_size
+        - precomputed_block_hashes is tensor([hash1, ...]) for N complete blocks
+
+        Uses GPU-resident Triton kernel when available to avoid GPU→CPU sync.
         """
-        self.precomputed_block_hashes = compute_block_hashes_batched(
-            self.prompt_tokens, self.block_size_tokens
-        )
+        result = compute_block_hashes_gpu(self.prompt_tokens, self.block_size_tokens)
+        if result is None:
+            self.precomputed_block_hashes = torch.empty(
+                0, dtype=torch.int64, device=self.prompt_tokens.device
+            )
+        else:
+            self.precomputed_block_hashes = result
 
     @property
     def remaining_prompt_length(self):
@@ -636,6 +746,12 @@ class DynamicInferenceRequestRecord:
             prompt_tokens=new_prompt_tokens,
             sampling_params=new_sampling_params,
         )
+        # Preserve event_add_engine from old request if it exists, otherwise set it.
+        # This ensures TTFT calculation works correctly for evicted/resumed requests.
+        if old_request.event_add_engine is not None:
+            new_request.event_add_engine = old_request.event_add_engine
+        else:
+            new_request.add_event_add_engine()
         self.requests.append(new_request)
 
     def merge(self, tokenizer: MegatronTokenizer | None = None) -> DynamicInferenceRequest:

@@ -1,7 +1,9 @@
 # Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
 import itertools
+from unittest.mock import MagicMock
 
+import numpy as np
 import pytest
 import torch
 
@@ -865,3 +867,34 @@ class TestRLUtils:
         CudaGraphManager.global_mempool = None
         CudaGraphManager.fwd_mempools = None
         CudaGraphManager.bwd_mempools = None
+
+    @pytest.mark.parametrize(
+        "initialize_model_parallel",
+        [pytest.param((1, 1), id="tp1-pp1")],
+        indirect=["initialize_model_parallel"],
+    )
+    def test_prep_wandb_metrics(self, initialize_model_parallel):
+        # This tests the computation and makes us fail noisily if
+        # inputs assumptions are changed, e.g. we expect rewards to come in groups (list[list[int]]).
+        traj_lens = [[3, 3], [1, 2]]
+        turn_lens = [[1, 2, 1, 1, 1], [1, 2]]
+        rewards = [[1, 1], [-1, 2]]
+        num_turns = [[42, 2], [10, 8]]
+        advantages = [0, 1]
+        metrics = rl_utils.prep_wandb_metrics(
+            MagicMock(), traj_lens, turn_lens, rewards, num_turns, advantages
+        )
+        assert metrics["mean_reward"] == 0.75
+        assert metrics["mean_advantage"] == 0.5
+        assert metrics["nonzero_groups_ratio"] == 0.5
+        assert metrics["max_traj_length"] == 3
+        assert metrics["min_traj_length"] == 1
+        assert metrics["mean_traj_length"] == 2.25
+        assert metrics["mean_traj_length_std"] == 0.25
+        assert metrics["max_turn_length"] == 2
+        assert metrics["min_turn_length"] == 1
+        assert metrics["mean_turn_length"] == 1.35
+        assert np.isclose(metrics["mean_turn_length_std"], 0.45)
+        assert metrics["mean_num_turns"] == 15.5
+        assert metrics["max_num_turns"] == 42
+        assert metrics["min_num_turns"] == 2

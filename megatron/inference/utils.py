@@ -7,7 +7,12 @@ from typing import Optional
 
 from gpt_builders import gpt_builder
 from mamba_builders import mamba_builder
-from megatron.core.inference.config import InferenceConfig, MambaInferenceStateConfig
+from megatron.core.inference.config import (
+    InferenceConfig,
+    KVCacheManagementMode,
+    MambaInferenceStateConfig,
+    PrefixCachingEvictPolicy,
+)
 from megatron.core.inference.contexts import DynamicInferenceContext
 from megatron.core.inference.engines import DynamicInferenceEngine
 from megatron.core.inference.model_inference_wrappers.gpt.gpt_inference_wrapper import (
@@ -294,10 +299,10 @@ def get_inference_config_from_model_and_args(model: MegatronModule, args):
         max_requests=args.inference_dynamic_batching_max_requests,
         max_tokens=args.inference_dynamic_batching_max_tokens,
         unified_memory_level=args.inference_dynamic_batching_unified_memory_level,
-        offload_kv_cache=args.rl_offload_kv_cache_during_training,
+        kv_cache_management_mode=KVCacheManagementMode(args.rl_kv_cache_management_mode),
         cuda_graph_mixed_prefill_count=args.inference_dynamic_batching_cuda_graph_mixed_prefill_count,  # pylint: disable=line-too-long
         use_cuda_graphs_for_non_decode_steps=not args.decode_only_cuda_graphs,
-        persist_cuda_graphs=args.rl_training_cuda_graphs,
+        static_kv_memory_pointers=args.rl_persist_cuda_graphs,
         max_sequence_length=max_sequence_length,
         mamba_inference_state_config=mamba_inference_state_config,
         pg_collection=pg_collection,
@@ -307,7 +312,7 @@ def get_inference_config_from_model_and_args(model: MegatronModule, args):
         track_paused_request_events=args.inference_dynamic_batching_track_paused_request_events,
         enable_chunked_prefill=args.enable_chunked_prefill,
         enable_prefix_caching=args.inference_dynamic_batching_enable_prefix_caching,
-        block_evict_lru=args.inference_dynamic_batching_block_evict_lru,
+        prefix_caching_evict_policy=PrefixCachingEvictPolicy(args.inference_dynamic_batching_prefix_caching_evict_policy),
         prefix_caching_mamba_gb=getattr(args, 'inference_dynamic_batching_prefix_caching_mamba_gb', None),
         metrics_writer=metrics_writer,
         logging_step_interval=args.inference_logging_step_interval,

@@ -11,7 +11,6 @@ permissions:
 jobs:
   get-release-branch-names:
     runs-on: ubuntu-latest
-    environment: nemo-ci
     outputs:
       mcore: ${{ steps.get-branch.outputs.mcore_release_branch }}
     if: github.repository == 'NVIDIA/Megatron-LM'
@@ -41,9 +40,6 @@ jobs:
       target-branch: ${{ matrix.target-branch }}
     secrets:
       PAT: ${{ secrets.PAT }}
-      AZURE_CLIENT_ID: ${{ secrets.AZURE_CLIENT_ID }}
-      AZURE_TENANT_ID: ${{ secrets.AZURE_TENANT_ID }}
-      AZURE_SUBSCRIPTION_ID: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
       SSH_KEY: ${{ secrets.SSH_KEY }}
       SSH_PWD: ${{ secrets.SSH_PWD }}
 
@@ -54,8 +50,8 @@ jobs:
     steps:
       - name: Notify
         env:
-          SLACK_WEBHOOK: ${{ secrets.SLACK_WEBHOOK }}
-          SLACK_WEBHOOK_ADMIN: <!subteam^${{ secrets.SLACK_WEBHOOK_ADMIN }}>
+          SLACK_WEBHOOK: ${{ secrets.SLACK_CI_CHANNEL_WEBHOOK }}
+          SLACK_WEBHOOK_ADMIN: <!subteam^${{ secrets.SLACK_TEAM_GROUP_ID }}>
           GITHUB_RUN_ID: ${{ github.run_id }}
           GITHUB_REPOSITORY: ${{ github.repository }}
         run: |

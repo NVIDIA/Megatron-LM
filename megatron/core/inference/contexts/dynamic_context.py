@@ -15,7 +15,7 @@ from megatron.core.inference.batch_dimensions_utils import (
     CUDAGraphBatchDimensionBuilder,
     InferenceBatchDimensions,
 )
-from megatron.core.inference.config import InferenceConfig
+from megatron.core.inference.config import InferenceConfig, KVCacheManagementMode
 from megatron.core.inference.inference_request import DynamicInferenceRequest
 from megatron.core.inference.sampling_params import SamplingParams
 from megatron.core.inference.unified_memory import (
@@ -244,14 +244,13 @@ class DynamicInferenceContext(BaseInferenceContext):
 
         # Prefix caching configuration
         self.enable_prefix_caching = inference_config.enable_prefix_caching
-        self.block_evict_lru = inference_config.block_evict_lru
         self.prefix_caching_mamba_gb = inference_config.prefix_caching_mamba_gb
 
         # Step counter (used for LRU timestamps in prefix caching)
         self.step_count = 0
 
-        # Track blocks pending computation for prefix caching coordination
-        self._blocks_pending_computation: List[int] = []
+        # Count of blocks pending computation in _pending_computation_buffer (GPU).
+        self._pending_computation_count: int = 0
 
         self.cache_mla_latent = (
             isinstance(model_config, MLATransformerConfig) and model_config.cache_mla_latents
@@ -359,10 +358,12 @@ class DynamicInferenceContext(BaseInferenceContext):
             self.mamba_states_memory_per_request *= self.num_mamba_layers
             self.mamba_states_memory_per_request *= dtype_size_bytes
 
-        # Unified memory.
+        # Unified memory and general tensor management.
         self.unified_memory_level = inference_config.unified_memory_level
-        self.persist_cuda_graphs = inference_config.persist_cuda_graphs
-        if self.unified_memory_level > 0:
+        self.static_kv_memory_pointers = inference_config.static_kv_memory_pointers
+        self.kv_cache_management_mode = inference_config.kv_cache_management_mode
+
+        if self.unified_memory_level != 0:
             try:
                 self.unified_memory_mempool = create_unified_mempool()
             except UnifiedMemoryUnsupportedError:
@@ -371,6 +372,23 @@ class DynamicInferenceContext(BaseInferenceContext):
                         "Unified memory requested but not available; defaulting to GPU memory."
                     )
                 self.unified_memory_level = 0
+        # If we are in a mode that requires static KV memory pointers,
+        # we must have either UVM or torch_memory_saver.
+        if (
+            self.static_kv_memory_pointers
+            and self.kv_cache_management_mode != KVCacheManagementMode.PERSIST
+        ):
+            assert HAVE_TORCH_MEMORY_SAVER or self.unified_memory_level != 0, (
+                "Static KV memory pointers require UVM or torch_memory_saver when not persisted. "
+                "Use --rl-kv-cache-management-mode=persist, UVM, or install torch_memory_saver."
+            )
+
+        # When not using `torch_memory_saver`, we manually offload/restore tensors.
+        # We use storage resize, similar to the logic in `core/distributed/param_and_grad_buffer.py`
+        self._offloadable_tensor_names: set[str] = set()
+        self._offloadable_cpu_backups: dict[str, torch.Tensor] = {}
+        self._offloadable_storage_sizes: dict[str, int] = {}
+        self._uses_torch_memory_saver: bool = False
 
         # Initialize block allocator.
         buffer_size_bytes = int(inference_config.buffer_size_gb * 1024**3)
@@ -432,7 +450,7 @@ class DynamicInferenceContext(BaseInferenceContext):
             ),
             paused_count=paused_block_count,
             enable_prefix_caching=self.enable_prefix_caching,
-            block_evict_lru=self.block_evict_lru,
+            prefix_caching_evict_policy=self.config.prefix_caching_evict_policy,
         )
 
         # Track request metadata.
@@ -537,12 +555,6 @@ class DynamicInferenceContext(BaseInferenceContext):
             )
         )
 
-        # Whether to offload the KV cache. Determines where the KV cache is allocated within memory.
-        self.offload_kv_cache = inference_config.offload_kv_cache
-        assert not (
-            self.offload_kv_cache and self.unified_memory_level
-        ), "The KV cache should not be instantiated in unified memory when it is offloaded during training."
-
         self._using_cuda_graph_this_step = False
         # Deal with chunked prefill
         self.enable_chunked_prefill = inference_config.enable_chunked_prefill
@@ -558,7 +570,7 @@ class DynamicInferenceContext(BaseInferenceContext):
         # Allocate GPU state.
         self.is_tensor_state_allocated = False
         self.is_symmetric_memory_initialized = False
-        self.allocate_all_tensors(is_init=True)
+        self.initialize_all_tensors()
 
         # Print info.
         logging.info(
@@ -569,23 +581,112 @@ class DynamicInferenceContext(BaseInferenceContext):
             )
         )
 
-    def allocate_all_tensors(self, *, is_init: bool) -> None:
-        """Allocate GPU state.
+    def _allocate_memory_buffer(self):
+        """Allocate the KV cache memory buffer."""
+        if self.cache_mla_latent:
+            self.memory_buffer = torch.empty(
+                (
+                    self.num_attention_layers,
+                    self.block_allocator.total_count,
+                    self.block_size_tokens,
+                    self.kv_reduced_dim,
+                ),
+                dtype=self.params_dtype,
+                device=torch.cuda.current_device(),
+            )
+        else:
+            self.memory_buffer = torch.empty(
+                (
+                    2,  # key and value
+                    self.num_attention_layers,
+                    self.block_allocator.total_count,
+                    self.block_size_tokens,
+                    self.num_attention_heads_per_partition,
+                    self.hidden_size_per_attention_head,
+                ),
+                dtype=self.params_dtype,
+                device=torch.cuda.current_device(),
+            )
+        if (
+            self.kv_cache_management_mode == KVCacheManagementMode.OFFLOAD
+            and not self._uses_torch_memory_saver
+        ):
+            assert self.unified_memory_level == 0
+            self._offloadable_tensor_names.add("memory_buffer")
+            self._offloadable_cpu_backups["memory_buffer"] = torch.empty_like(
+                self.memory_buffer, device="cpu"
+            ).pin_memory()
 
-        This method is used for both 1) initial allocation, and 2) resuming the
-        GPU state after a suspend.
+    def _allocate_mamba_states(self):
+        """Allocate Mamba states for hybrid models."""
+        if self.is_hybrid_model:
+            self.mamba_metadata = MambaMetadata(
+                max_requests=self.max_requests, max_tokens=self.max_tokens
+            )
+            self.request_has_initial_mamba_state = torch.zeros(
+                self.max_requests, dtype=torch.bool, device=torch.cuda.current_device()
+            )
+            self.mamba_conv_states = torch.empty(
+                (self.num_mamba_layers, self.max_requests) + self.mamba_conv_states_shape,
+                dtype=self.params_dtype,
+                device=torch.cuda.current_device(),
+            )
+            self.mamba_ssm_states = torch.empty(
+                (self.num_mamba_layers, self.max_requests) + self.mamba_ssm_states_shape,
+                dtype=self.params_dtype,
+                device=torch.cuda.current_device(),
+            )
+            if (
+                self.kv_cache_management_mode == KVCacheManagementMode.OFFLOAD
+                and not self._uses_torch_memory_saver
+            ):
+                assert self.unified_memory_level == 0
+                self._offloadable_tensor_names.add("mamba_conv_states")
+                self._offloadable_cpu_backups["mamba_conv_states"] = torch.empty_like(
+                    self.mamba_conv_states, device="cpu"
+                ).pin_memory()
+                self._offloadable_tensor_names.add("mamba_ssm_states")
+                self._offloadable_cpu_backups["mamba_ssm_states"] = torch.empty_like(
+                    self.mamba_ssm_states, device="cpu"
+                ).pin_memory()
+        else:
+            self.mamba_metadata = None
 
-        Args:
-            is_init (bool): True if this is being called from `__init__()`.
-        """
+    def _allocate_mamba_cache(self):
+        """Allocate fixed-size tensor pool for Mamba prefix caching."""
+        prefix_caching_mamba_gb = self.prefix_caching_mamba_gb
+        if (self.is_hybrid_model and self.enable_prefix_caching and
+                prefix_caching_mamba_gb is not None and prefix_caching_mamba_gb > 0):
+            prefix_caching_mamba_bytes = int(prefix_caching_mamba_gb * (1024 ** 3))
+            self.max_mamba_cache_slots = prefix_caching_mamba_bytes // self.mamba_states_memory_per_request
+        else:
+            self.max_mamba_cache_slots = 0
 
-        # Only allocate tensors when not using unified memory at all (level 0),
-        # or for initial allocation during `__init__()`. For levels 1 and 2, we do
-        # not perform any explicit allocations or deallocations after the initial
-        # call to `__init__()`.
-        if self.unified_memory_level != 0 and not is_init:
-            return
+        if self.max_mamba_cache_slots > 0:
+            self.mamba_cache_conv_states = torch.empty(
+                (self.num_mamba_layers, self.max_mamba_cache_slots) + self.mamba_conv_states_shape,
+                dtype=self.params_dtype,
+                device=torch.cuda.current_device(),
+            )
+            self.mamba_cache_ssm_states = torch.empty(
+                (self.num_mamba_layers, self.max_mamba_cache_slots) + self.mamba_ssm_states_shape,
+                dtype=self.params_dtype,
+                device=torch.cuda.current_device(),
+            )
+            total_blocks = self.block_allocator.total_count
+            self.block_to_mamba_slot = torch.full(
+                (total_blocks,), -1, dtype=torch.int32, device=torch.cuda.current_device()
+            )
+            self.mamba_slot_to_block = torch.full(
+                (self.max_mamba_cache_slots,), -1, dtype=torch.int32, device=torch.cuda.current_device()
+            )
+            self.mamba_cache_free_slots = torch.arange(
+                self.max_mamba_cache_slots, dtype=torch.int32, device=torch.cuda.current_device()
+            )
+            self.mamba_cache_free_count = self.max_mamba_cache_slots
 
+    def initialize_all_tensors(self) -> None:
+        """Allocate all GPU state during initial construction."""
         # Mark allocated.
         if self.is_tensor_state_allocated:
             return
@@ -595,7 +696,7 @@ class DynamicInferenceContext(BaseInferenceContext):
         for key in vars(self).keys():
             value = getattr(self, key)
             assert not isinstance(value, torch.Tensor), (
-                "All tensors should be allocated within `allocate_all_tensors()."
+                "All tensors should be allocated within `initialize_all_tensors()`. "
                 f"Please move tensor '{key}'."
             )
 
@@ -641,150 +742,94 @@ class DynamicInferenceContext(BaseInferenceContext):
         self.token_to_position_in_request = torch.empty_like(self.token_to_input_ids)
         self.token_to_local_position_within_kv_block = torch.empty_like(self.token_to_input_ids)
 
-        # Memory buffer.
-        def allocate_memory_buffer():
-            """Allocate the memory buffer. This function is called below within
-            `with ctx_manager:`."""
-            if self.cache_mla_latent:
-                self.memory_buffer = torch.empty(
-                    (
-                        self.num_attention_layers,
-                        self.block_allocator.total_count,
-                        self.block_size_tokens,
-                        self.kv_reduced_dim,
-                    ),
-                    dtype=self.params_dtype,
-                    device=torch.cuda.current_device(),
-                )
-            else:
-                ctx = (
-                    torch_memory_saver.region(tag="kv_cache", enable_cpu_backup=True)
-                    if HAVE_TORCH_MEMORY_SAVER and self.offload_kv_cache
-                    else nullcontext()
-                )
+        # GPU buffer for tracking blocks pending computation (prefix caching).
+        if self.enable_prefix_caching:
+            max_pending = self.block_allocator.total_count
+            self._pending_computation_buffer = torch.full(
+                (max_pending,), -1, dtype=torch.int32, device=torch.cuda.current_device()
+            )
 
-                with ctx:
-                    self.memory_buffer = torch.empty(
-                        (
-                            2,  # key and value
-                            self.num_attention_layers,
-                            self.block_allocator.total_count,
-                            self.block_size_tokens,
-                            self.num_attention_heads_per_partition,
-                            self.hidden_size_per_attention_head,
-                        ),
-                        dtype=self.params_dtype,
-                        device=torch.cuda.current_device(),
-                    )
-
-        # Optional state tensors for hybrid models
-        def allocate_mamba_states():
-            """Allocate Mamba states. This function is called below within
-            `with ctx_manager:`."""
-            if self.is_hybrid_model:
-                self.mamba_metadata = MambaMetadata(
-                    max_requests=self.max_requests, max_tokens=self.max_tokens
-                )
-                self.request_has_initial_mamba_state = torch.zeros(
-                    self.max_requests, dtype=torch.bool, device=torch.cuda.current_device()
-                )
-                self.mamba_conv_states = torch.empty(
-                    (self.num_mamba_layers, self.max_requests) + self.mamba_conv_states_shape,
-                    dtype=self.params_dtype,
-                    device=torch.cuda.current_device(),
-                )
-                self.mamba_ssm_states = torch.empty(
-                    (self.num_mamba_layers, self.max_requests) + self.mamba_ssm_states_shape,
-                    dtype=self.params_dtype,
-                    device=torch.cuda.current_device(),
-                )
-
-            else:
-                self.mamba_metadata = None
-
-        # Fixed-size tensor pool for Mamba prefix caching
-        def allocate_mamba_cache():
-            """Allocate Mamba state cache for prefix caching. Called below within
-            `with ctx_manager:`."""
-            # Calculate max slots from memory budget
-            prefix_caching_mamba_gb = self.prefix_caching_mamba_gb
-            if (self.is_hybrid_model and self.enable_prefix_caching and
-                prefix_caching_mamba_gb is not None and prefix_caching_mamba_gb > 0):
-                prefix_caching_mamba_bytes = int(prefix_caching_mamba_gb * (1024 ** 3))
-                self.max_mamba_cache_slots = prefix_caching_mamba_bytes // self.mamba_states_memory_per_request
-            else:
-                self.max_mamba_cache_slots = 0
-
-            if self.max_mamba_cache_slots > 0:
-                # Fixed-size tensor pool for cached Mamba states
-                self.mamba_cache_conv_states = torch.empty(
-                    (self.num_mamba_layers, self.max_mamba_cache_slots) + self.mamba_conv_states_shape,
-                    dtype=self.params_dtype,
-                    device=torch.cuda.current_device(),
-                )
-                self.mamba_cache_ssm_states = torch.empty(
-                    (self.num_mamba_layers, self.max_mamba_cache_slots) + self.mamba_ssm_states_shape,
-                    dtype=self.params_dtype,
-                    device=torch.cuda.current_device(),
-                )
-
-                # Mapping: block_id -> mamba_slot_id (-1 if no cached state)
-                total_blocks = self.block_allocator.total_count
-                self.block_to_mamba_slot = torch.full(
-                    (total_blocks,), -1, dtype=torch.int32, device=torch.cuda.current_device()
-                )
-
-                # Reverse mapping for eviction: slot_id -> block_id
-                self.mamba_slot_to_block = torch.full(
-                    (self.max_mamba_cache_slots,), -1, dtype=torch.int32, device=torch.cuda.current_device()
-                )
-
-                # Free slot pool (similar to MambaMetadata pattern)
-                self.mamba_cache_free_slots = torch.arange(
-                    self.max_mamba_cache_slots, dtype=torch.int32, device=torch.cuda.current_device()
-                )
-                self.mamba_cache_free_count = self.max_mamba_cache_slots
-
-        # Allocate `ctx_manager`-managed buffers. (For currently unknown reasons,
-        # `ctx_manager` can only be used once.)
-        ctx_manager = (
-            torch.cuda.use_mem_pool(self.unified_memory_mempool)
-            if self.unified_memory_level > 0
-            else nullcontext()
+        # Allocate large non-graphed buffers.
+        need_static_addr = (
+            self.static_kv_memory_pointers
+            and self.kv_cache_management_mode != KVCacheManagementMode.PERSIST
         )
+
+        ctx_manager = nullcontext()
+        if self.unified_memory_level != 0:
+            ctx_manager = torch.cuda.use_mem_pool(self.unified_memory_mempool)
+        elif HAVE_TORCH_MEMORY_SAVER and need_static_addr:
+            ctx_manager = torch_memory_saver.region(
+                tag="inference_context",
+                enable_cpu_backup=(self.kv_cache_management_mode == KVCacheManagementMode.OFFLOAD),
+            )
+            self._uses_torch_memory_saver = True
         with ctx_manager:
-            allocate_memory_buffer()
-            allocate_mamba_states()
-            allocate_mamba_cache()
+            self._allocate_memory_buffer()
+            self._allocate_mamba_states()
+            self._allocate_mamba_cache()
 
         # Reset attention and Mamba state.
         self.reset_attention_state()
         self.reset_mamba_state()
 
-    def deallocate_all_tensors(self):
-        """Deallocate GPU state.
+    def reinitialize_inference_state_buffers(self):
+        """Restore large tensors (KV cache, Mamba states) after a suspend.
 
-        This method is used for suspending the dynamic engine.
+        Called by the engine during `resume()`. Initial allocation is in `initialize_all_tensors()`.
         """
+        if self.is_tensor_state_allocated:
+            return
+        self.is_tensor_state_allocated = True
 
-        # Only deallocate tensors when not using unified memory at all (level 0).
-        # For levels 1 and 2, we do not perform any explicit allocations or
-        # deallocations after the initial call to `__init__()`.
-        if self.unified_memory_level != 0:
+        if self.kv_cache_management_mode == KVCacheManagementMode.PERSIST:
             return
 
-        # Mark deallocated.
+        if self.unified_memory_level != 0 or self._uses_torch_memory_saver:
+            if self.kv_cache_management_mode == KVCacheManagementMode.RECOMPUTE:
+                self.reset()
+            if self._uses_torch_memory_saver:
+                torch_memory_saver.resume("inference_context")
+            return
+
+        if self.kv_cache_management_mode == KVCacheManagementMode.OFFLOAD:
+            for name, tensor in ((n, getattr(self, n)) for n in self._offloadable_tensor_names):
+                tensor.storage().resize_(self._offloadable_storage_sizes[name])
+                tensor.copy_(self._offloadable_cpu_backups[name], non_blocking=True)
+        elif self.kv_cache_management_mode == KVCacheManagementMode.RECOMPUTE:
+            self.is_tensor_state_allocated = False
+            self.initialize_all_tensors()
+
+    def deallocate_inference_state_buffers(self):
+        """Deallocate large tensors (KV cache, Mamba states) during suspend.
+
+        Called by the engine during `suspend()`. Mirror to `reinitialize_inference_state_buffers()`.
+        """
         if not self.is_tensor_state_allocated:
             return
         self.is_tensor_state_allocated = False
 
-        # Delete all tensor attributes.
-        # TODO(@lmcafee): check that device == 'cuda'?
-        keys = list(vars(self).keys())
-        for key in keys:
-            value = getattr(self, key)
-            if isinstance(value, torch.Tensor):
-                delattr(self, key)
+        if self.kv_cache_management_mode == KVCacheManagementMode.PERSIST:
+            return
+
+        if self.unified_memory_level != 0:
+            return
+
+        if self._uses_torch_memory_saver:
+            torch_memory_saver.pause("inference_context")
+            return
+
+        if self.kv_cache_management_mode == KVCacheManagementMode.OFFLOAD:
+            for name, tensor in ((n, getattr(self, n)) for n in self._offloadable_tensor_names):
+                self._offloadable_storage_sizes[name] = tensor.storage().size()
+                self._offloadable_cpu_backups[name].copy_(tensor, non_blocking=True)
+                tensor.storage().resize_(0)
+        elif self.kv_cache_management_mode == KVCacheManagementMode.RECOMPUTE:
+            # TODO(@lmcafee): check that device == 'cuda'?
+            for key in list(vars(self).keys()):
+                value = getattr(self, key)
+                if isinstance(value, torch.Tensor):
+                    delattr(self, key)
 
     @classmethod
     def round_up_tokens(cls, value, tp_size=None):
@@ -1288,9 +1333,12 @@ class DynamicInferenceContext(BaseInferenceContext):
 
         kv_block_view = self.request_to_kv_block_ids[request_slice]
         kv_block_view.fill_(-1)
-        block_counts_list = block_counts.tolist()
-        for row, block_count in enumerate(block_counts_list):
-            kv_block_view[row, :block_count] = dummy_block_idx
+        # Vectorized dummy block fill (avoids .tolist() GPU→CPU sync + Python loop)
+        col_indices = torch.arange(
+            kv_block_view.shape[1], device=kv_block_view.device, dtype=block_counts.dtype
+        )
+        fill_mask = col_indices.unsqueeze(0) < block_counts.unsqueeze(1)
+        kv_block_view[fill_mask] = dummy_block_idx
 
         token_start = self.active_token_count
         token_end = token_start + total_new_tokens
@@ -1600,7 +1648,7 @@ class DynamicInferenceContext(BaseInferenceContext):
         )
 
         # Reset prefix caching coordination state
-        self._blocks_pending_computation.clear()
+        self._pending_computation_count = 0
 
     def current_input_and_position_ids(
         self, *, num_warmup_tokens: Optional[int] = None
@@ -1672,11 +1720,14 @@ class DynamicInferenceContext(BaseInferenceContext):
 
     def _find_matching_prefix_blocks(
         self, req: DynamicInferenceRequest, start_block: int, end_block: int
-    ) -> tuple[list[int], int]:
+    ) -> tuple[Tensor, Tensor]:
         """Find cached blocks matching a range of the prompt using precomputed hashes.
 
         Looks up hashes in req.precomputed_block_hashes[start_block:end_block] against
-        the block allocator's hash-to-block mapping. Stops at the first non-match.
+        the block allocator's GPU hash table. Stops at the first non-match.
+
+        All operations are GPU-resident; the only CPU sync needed is a single
+        scalar .item() by the caller to read num_matched.
 
         Args:
             req: The inference request with precomputed_block_hashes set.
@@ -1685,41 +1736,93 @@ class DynamicInferenceContext(BaseInferenceContext):
 
         Returns:
             Tuple of:
-            - List of matched block IDs (consecutive from start_block)
-            - Parent hash of the last matched block (0 if no matches)
+            - num_matched: [1] int32 GPU scalar — consecutive matched block count
+            - lookup_results: int32 GPU tensor — raw lookup results (caller slices
+              to [:num_matched])
         """
+        device = torch.cuda.current_device()
+        _zero = torch.zeros(1, dtype=torch.int32, device=device)
+        _empty = torch.empty(0, dtype=torch.int32, device=device)
+
         # Early return if prefix caching is disabled
         if not self.enable_prefix_caching:
-            return [], 0
+            return _zero, _empty
 
         # Early return if request has no precomputed hashes
-        if req.precomputed_block_hashes is None or len(req.precomputed_block_hashes) == 0:
-            return [], 0
+        if req.precomputed_block_hashes is None or req.precomputed_block_hashes.numel() == 0:
+            return _zero, _empty
 
         # Clamp end_block to the number of precomputed hashes (the trailing
         # partial block has no hash).
-        end_block = min(end_block, len(req.precomputed_block_hashes))
+        end_block = min(end_block, req.precomputed_block_hashes.shape[0])
         if start_block >= end_block:
-            return [], 0
+            return _zero, _empty
 
         hashes = req.precomputed_block_hashes[start_block:end_block]
-        hash_to_block = self.block_allocator.hash_to_block_id
 
-        # Batch dict lookups via C-level map() — faster than Python for loop
-        block_ids = list(map(hash_to_block.get, hashes))
+        # GPU hash table batch lookup
+        lookup_results = self.block_allocator.gpu_hash_table.lookup_batch_alloc(hashes)
 
-        # Find prefix length (first None = first miss)
-        try:
-            prefix_len = block_ids.index(None)
-        except ValueError:
-            prefix_len = len(block_ids)
+        # GPU-only prefix length: cumprod of hit mask gives consecutive-match mask
+        hit_mask = (lookup_results != -1).to(torch.int32)
+        num_matched = hit_mask.cumprod(dim=0).sum().to(torch.int32).reshape(1)
+        return num_matched, lookup_results.to(torch.int32)
 
-        if prefix_len == 0:
-            return [], 0
+    def gpu_match_prefixes_batch(
+        self, request_hashes_list: list[torch.Tensor]
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Batch prefix matching for all waiting requests on GPU.
 
-        matched_blocks = block_ids[:prefix_len]
-        parent_hash = hashes[prefix_len - 1]
-        return matched_blocks, parent_hash
+        Replaces per-request _find_matching_prefix_blocks() + _has_pending_prefix_blocks()
+        calls with a single GPU kernel invocation.
+
+        Args:
+            request_hashes_list: List of GPU int64 tensors, one per waiting request.
+                Each tensor contains that request's precomputed_block_hashes.
+
+        Returns:
+            Tuple of:
+            - num_matched: [N] int32 — matched block count per request
+            - has_pending: [N] int32 — 1 if request depends on pending block
+            - matched_block_ids: [N, max_blocks] int32 — matched block IDs
+        """
+        if not request_hashes_list:
+            device = torch.cuda.current_device()
+            return (
+                torch.empty(0, dtype=torch.int32, device=device),
+                torch.empty(0, dtype=torch.int32, device=device),
+                torch.empty((0, 1), dtype=torch.int32, device=device),
+            )
+
+        device = request_hashes_list[0].device
+
+        # Build flattened hashes and offsets (GPU cumsum replaces Python loop)
+        lengths_tensor = torch.tensor(
+            [h.numel() for h in request_hashes_list],
+            dtype=torch.int32,
+            device=device,
+        )
+        max_blocks_per_req = (
+            max(lengths_tensor.max().item(), 1) if lengths_tensor.numel() > 0 else 1
+        )
+
+        request_offsets = torch.cat([
+            torch.zeros(1, dtype=torch.int32, device=device),
+            lengths_tensor.cumsum(dim=0),
+        ])
+
+        request_hashes = (
+            torch.cat(request_hashes_list)
+            if lengths_tensor.any()
+            else torch.empty(0, dtype=torch.int64, device=device)
+        )
+
+        return self.block_allocator.gpu_hash_table.prefix_match_batch(
+            request_hashes=request_hashes,
+            request_offsets=request_offsets,
+            pending_bitmap=self.block_allocator.pending_bitmap,
+            max_blocks_per_req=max_blocks_per_req,
+        )
 
     def mark_pending_blocks_computed(self) -> None:
         """Mark all pending blocks as computed after prefill.
@@ -1728,15 +1831,29 @@ class DynamicInferenceContext(BaseInferenceContext):
         as having their KV computed. This enables prefix caching coordination
         where subsequent requests can safely reuse these blocks.
         """
-        self.block_allocator.mark_blocks_computed(self._blocks_pending_computation)
-        self._blocks_pending_computation.clear()
+        if not self.enable_prefix_caching:
+            return
+        if self._pending_computation_count > 0:
+            ids = self._pending_computation_buffer[: self._pending_computation_count]
+            self.block_allocator.mark_blocks_computed(ids)
+            self._pending_computation_count = 0
 
-    def add_request(self, req: DynamicInferenceRequest, chunk_length: Optional[int] = None) -> None:
+    def add_request(
+        self,
+        req: DynamicInferenceRequest,
+        chunk_length: Optional[int] = None,
+        batch_num_matched: Optional[Tensor] = None,
+        batch_matched_block_ids: Optional[Tensor] = None,
+        batch_effective_matched: Optional[int] = None,
+    ) -> None:
         """Add request to context. At this stage, we assume that the request is valid and can be added, as the checks are done in the schedule function.
 
         Args:
             req (DynamicInferenceRequest): Request to add.
             chunk_length (Optional[int]): Length of chunk to add. If None, the request will be fully added.
+            batch_num_matched (Optional[Tensor]): Pre-computed matched block count from batch kernel (scalar GPU tensor).
+            batch_matched_block_ids (Optional[Tensor]): Pre-computed matched block IDs from batch kernel (1-D GPU tensor).
+            batch_effective_matched (Optional[int]): Pre-computed effective matched block count (CPU int). When provided, skips the GPU clamp + .item() sync.
 
         Return:
             None
@@ -1760,9 +1877,6 @@ class DynamicInferenceContext(BaseInferenceContext):
         if self.active_token_count + chunk_length > self.max_tokens:
             raise TokenOverflowError(req.request_id)
 
-        # Use the remaining prompt tokens for this chunk
-        this_round_tokens = req.remaining_prompt_tokens[:chunk_length]
-
         # =========================================================================
         # Block allocation
         # =========================================================================
@@ -1776,10 +1890,62 @@ class DynamicInferenceContext(BaseInferenceContext):
         # =========================================================================
         # Prefix caching: find matching prefix blocks (scoped to this chunk)
         # =========================================================================
-        matched_block_ids, prefix_parent_hash = self._find_matching_prefix_blocks(
-            req, already_allocated_blocks, overall_required_blocks
-        )
-        num_matched_blocks = len(matched_block_ids)
+        if not self.enable_prefix_caching:
+            # Fast path: no prefix matching
+            num_matched_blocks = 0
+            matched_tensor = None
+        elif batch_num_matched is not None and batch_matched_block_ids is not None:
+            if batch_effective_matched is not None:
+                # Pre-computed by caller — skip GPU clamp + .item() (zero sync)
+                effective_matched = batch_effective_matched
+            else:
+                # Use pre-computed batch kernel results (GPU tensors)
+                # Clamp on GPU — launches async, reducing stall when .item() is called
+                effective_matched_gpu = torch.clamp(
+                    torch.minimum(
+                        batch_num_matched - already_allocated_blocks,
+                        torch.tensor(
+                            overall_required_blocks - already_allocated_blocks,
+                            device=batch_num_matched.device,
+                        ),
+                    ),
+                    min=0,
+                )
+                # Single deferred sync — GPU clamp may already be complete
+                effective_matched = effective_matched_gpu.item()
+            if effective_matched > 0:
+                matched_tensor = batch_matched_block_ids[
+                    already_allocated_blocks:already_allocated_blocks + effective_matched
+                ].to(torch.int32)
+            else:
+                matched_tensor = None
+            num_matched_blocks = effective_matched
+        else:
+            # Fallback: per-request GPU hash table lookup (single scalar sync)
+            num_matched_gpu, lookup_results = self._find_matching_prefix_blocks(
+                req, already_allocated_blocks, overall_required_blocks
+            )
+            num_matched_blocks = num_matched_gpu.item()
+            if num_matched_blocks > 0:
+                matched_tensor = lookup_results[:num_matched_blocks]
+            else:
+                matched_tensor = None
+
+        # --- Prefix skip: only send unmatched suffix through the model ---
+        block_aligned = (req.finished_chunk_token_count % self.block_size_tokens == 0)
+        if self.enable_prefix_caching and num_matched_blocks > 0 and block_aligned:
+            prefix_skip_tokens = num_matched_blocks * self.block_size_tokens
+            prefix_skip_tokens = min(prefix_skip_tokens, chunk_length - 1)  # >= 1 token
+        else:
+            prefix_skip_tokens = 0
+
+        effective_kv_offset = req.finished_chunk_token_count + prefix_skip_tokens
+        effective_chunk_length = chunk_length - prefix_skip_tokens
+
+        # Use the remaining prompt tokens for this chunk (skip matched prefix tokens)
+        this_round_tokens = req.remaining_prompt_tokens[
+            prefix_skip_tokens : prefix_skip_tokens + effective_chunk_length
+        ]
 
         # For hybrid models: limit KV prefix matching to blocks that also have
         # cached Mamba state. Without this, matched KV blocks would cause the
@@ -1812,11 +1978,8 @@ class DynamicInferenceContext(BaseInferenceContext):
                 raise BlockOverflowError(req.request_id)
 
         # Increment ref counts and update timestamps for matched (shared) blocks
-        if num_matched_blocks > 0:
-            matched_tensor = torch.tensor(
-                matched_block_ids, dtype=torch.int32, device=torch.cuda.current_device()
-            )
-            self.block_allocator.increment_ref_counts(matched_block_ids, matched_tensor)
+        if matched_tensor is not None:
+            self.block_allocator.increment_ref_counts(matched_tensor)
 
         # when a request already starts chunked prefill, it is exactly the last request in the current system
         # (see dynamic_engine.py, schedule_chunked_prefill invariants)
@@ -1837,7 +2000,7 @@ class DynamicInferenceContext(BaseInferenceContext):
         if current_id >= self.max_requests:
             raise RequestOverflowError(req.request_id)
 
-        if self.active_token_count + chunk_length > self.max_tokens:
+        if self.active_token_count + effective_chunk_length > self.max_tokens:
             raise TokenOverflowError(req.request_id)
 
         self.request_ids[current_id] = req.request_id
@@ -1860,7 +2023,7 @@ class DynamicInferenceContext(BaseInferenceContext):
             self.request_metadata[label][current_id] = m
 
         # Handle length and block assignments.
-        self.request_query_lengths[current_id] = chunk_length
+        self.request_query_lengths[current_id] = effective_chunk_length
         self.request_output_lengths[current_id] = (
             req.finished_chunk_token_count
             + chunk_length
@@ -1871,7 +2034,7 @@ class DynamicInferenceContext(BaseInferenceContext):
         # then newly allocated blocks after that.
         match_start = already_allocated_blocks
         new_block_start = already_allocated_blocks + num_matched_blocks
-        if num_matched_blocks > 0:
+        if matched_tensor is not None:
             self.request_to_kv_block_ids[current_id][
                 match_start : match_start + num_matched_blocks
             ] = matched_tensor
@@ -1880,7 +2043,7 @@ class DynamicInferenceContext(BaseInferenceContext):
                 new_block_start : new_block_start + len(new_block_ids)
             ] = new_block_ids
 
-        self.request_kv_length_offsets[current_id] = req.finished_chunk_token_count
+        self.request_kv_length_offsets[current_id] = effective_kv_offset
         self.request_kv_block_counts[current_id] = overall_required_blocks
         self.request_last_kv_block_id[current_id] = self.request_to_kv_block_ids[current_id][
             overall_required_blocks - 1
@@ -1890,27 +2053,27 @@ class DynamicInferenceContext(BaseInferenceContext):
         ) % self.block_size_tokens
 
         token_offset_range = torch.arange(
-            req.finished_chunk_token_count,
-            req.finished_chunk_token_count + chunk_length,
+            effective_kv_offset,
+            effective_kv_offset + effective_chunk_length,
             device=self.token_to_pos_ids.device,
         )
-        self.token_to_pos_ids[self.active_token_count : self.active_token_count + chunk_length] = (
-            token_offset_range
-        )
+        self.token_to_pos_ids[
+            self.active_token_count : self.active_token_count + effective_chunk_length
+        ] = token_offset_range
         self.token_to_input_ids[
-            self.active_token_count : self.active_token_count + chunk_length
+            self.active_token_count : self.active_token_count + effective_chunk_length
         ] = this_round_tokens
         self.token_to_request_idx[
-            self.active_token_count : self.active_token_count + chunk_length
+            self.active_token_count : self.active_token_count + effective_chunk_length
         ] = current_id
         self.token_to_position_in_request[
-            self.active_token_count : self.active_token_count + chunk_length
+            self.active_token_count : self.active_token_count + effective_chunk_length
         ] = token_offset_range
         self.token_to_block_idx[
-            self.active_token_count : self.active_token_count + chunk_length
+            self.active_token_count : self.active_token_count + effective_chunk_length
         ] = self.request_to_kv_block_ids[current_id][token_offset_range // self.block_size_tokens]
         self.token_to_local_position_within_kv_block[
-            self.active_token_count : self.active_token_count + chunk_length
+            self.active_token_count : self.active_token_count + effective_chunk_length
         ] = (token_offset_range % self.block_size_tokens)
 
         # Register hashes for completely filled blocks (skip matched blocks).
@@ -1920,41 +2083,53 @@ class DynamicInferenceContext(BaseInferenceContext):
         #   Range 2: [already_allocated_blocks + num_matched_blocks, num_complete_blocks)
         #       — newly allocated blocks that are now complete
         #
-        # Uses CPU-side block IDs to avoid GPU→CPU sync:
-        #   Range 1 (chunked prefill only): reads from request_to_kv_block_ids (GPU)
-        #   Range 2: uses _last_allocated_cpu from allocate_memory_blocks()
-        if self.enable_prefix_caching and req.precomputed_block_hashes is not None:
+        # All registration uses GPU tensors directly (no CPU conversion).
+        if (
+            self.enable_prefix_caching
+            and req.precomputed_block_hashes is not None
+            and req.precomputed_block_hashes.numel() > 0
+        ):
             total_tokens_after = req.finished_chunk_token_count + chunk_length
             num_complete_blocks = total_tokens_after // self.block_size_tokens
             previously_complete = req.finished_chunk_token_count // self.block_size_tokens
 
-            all_block_ids: list[int] = []
-            all_hashes: list[int] = []
+            gpu_id_parts: list[Tensor] = []
+            gpu_hash_parts: list[Tensor] = []
 
             # Range 1: prior-chunk partial block that this chunk just completed
             r1_end = min(already_allocated_blocks, num_complete_blocks)
             if previously_complete < r1_end:
                 # Chunked prefill path: block IDs from prior chunk are on GPU
-                r1_ids = self.request_to_kv_block_ids[current_id][
-                    previously_complete:r1_end
-                ].tolist()
-                all_block_ids.extend(r1_ids)
-                all_hashes.extend(req.precomputed_block_hashes[previously_complete:r1_end])
+                r1_ids = self.request_to_kv_block_ids[current_id][previously_complete:r1_end]
+                gpu_id_parts.append(r1_ids)
+                gpu_hash_parts.append(req.precomputed_block_hashes[previously_complete:r1_end])
 
             # Range 2: newly allocated (non-matched) blocks that are now complete
             r2_start = already_allocated_blocks + num_matched_blocks
             if r2_start < num_complete_blocks:
-                # Use CPU list from allocate_memory_blocks() — zero GPU sync.
-                # _last_allocated_cpu[0] maps to position new_block_start (= r2_start)
+                # Use GPU tensor from allocate_memory_blocks() directly.
+                # new_block_ids[0] maps to position new_block_start (= r2_start)
                 # in the request's block layout, so slice from offset 0.
                 r2_count = num_complete_blocks - r2_start
-                r2_ids = self.block_allocator._last_allocated_cpu[:r2_count]
-                all_block_ids.extend(r2_ids)
-                all_hashes.extend(req.precomputed_block_hashes[r2_start:num_complete_blocks])
+                gpu_id_parts.append(new_block_ids[:r2_count])
+                gpu_hash_parts.append(req.precomputed_block_hashes[r2_start:num_complete_blocks])
 
-            if all_block_ids:
-                self.block_allocator.register_block_hashes(all_block_ids, all_hashes)
-                self._blocks_pending_computation.extend(all_block_ids)
+            if gpu_id_parts:
+                all_ids_gpu = torch.cat(gpu_id_parts) if len(gpu_id_parts) > 1 else gpu_id_parts[0]
+                all_hashes_gpu = (
+                    torch.cat(gpu_hash_parts) if len(gpu_hash_parts) > 1 else gpu_hash_parts[0]
+                )
+                self.block_allocator.register_block_hashes(
+                    all_ids_gpu.to(torch.int32), all_hashes_gpu
+                )
+
+                # Populate GPU pending buffer
+                n = all_ids_gpu.numel()
+                buf_start = self._pending_computation_count
+                self._pending_computation_buffer[buf_start : buf_start + n] = all_ids_gpu.to(
+                    torch.int32
+                )
+                self._pending_computation_count += n
 
         if self.is_hybrid_model and not is_chunked_prefill:
             # Allocate a slot for Mamba states
@@ -1981,7 +2156,7 @@ class DynamicInferenceContext(BaseInferenceContext):
                 self.mamba_conv_states[:, mamba_idx] = 0.0
                 self.mamba_ssm_states[:, mamba_idx] = 0.0
 
-        self.active_token_count += chunk_length
+        self.active_token_count += effective_chunk_length
         self.total_request_count += 0 if req.finished_chunk_token_count > 0 else 1
         self.num_prefill_requests += 1
 
@@ -2308,11 +2483,19 @@ class DynamicInferenceContext(BaseInferenceContext):
                 1  # must keep this, next iteration will add a new chunk to it
             )
 
-        active_request_count = (active_requests_mask == 1).sum().item()
-        finished_request_count = (active_requests_mask == 0).sum().item()
         assert (
-            active_request_count + finished_request_count + self.paused_request_count
+            self.paused_request_count + active_requests_mask.shape[0]
             == self.total_request_count
+        ), (
+            f"total_request_count ({self.total_request_count}) must equal "
+            f"paused_request_count ({self.paused_request_count}) + "
+            f"len(active_requests_mask) ({active_requests_mask.shape[0]})"
+        )
+
+        active_request_count = (active_requests_mask == 1).sum().item()
+        # Derive finished count arithmetically to avoid a second GPU→CPU sync
+        finished_request_count = (
+            self.total_request_count - self.paused_request_count - active_request_count
         )
 
         # Reset attention state.

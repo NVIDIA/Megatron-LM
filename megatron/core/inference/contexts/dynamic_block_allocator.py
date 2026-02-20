@@ -1,9 +1,13 @@
 # Copyright (c) 2025, NVIDIA CORPORATION. All rights reserved.
 
-from typing import Dict, Optional
+from typing import Optional
 
 import torch
 from torch import Tensor
+
+from megatron.core.inference.config import PrefixCachingEvictPolicy
+
+from .gpu_hash_table import GPUHashTable
 
 
 class BlockAllocator:
@@ -27,12 +31,12 @@ class BlockAllocator:
         total_count: int,
         paused_count: int,
         enable_prefix_caching: bool = False,
-        block_evict_lru: bool = False,
+        prefix_caching_evict_policy: PrefixCachingEvictPolicy = PrefixCachingEvictPolicy.REF_ZERO,
     ):
 
         self.context = context
         self.enable_prefix_caching = enable_prefix_caching
-        self.block_evict_lru = block_evict_lru
+        self.prefix_caching_evict_policy = prefix_caching_evict_policy
 
         self.total_count = total_count
         self.total_avail = total_count - 1  # -1 for dummy_block_idx (see below)
@@ -47,50 +51,46 @@ class BlockAllocator:
         )
 
         if self.enable_prefix_caching:
+            device = torch.cuda.current_device()
+
             # Block hash tracking for prefix caching: -1 = uncomputed, positive = valid hash
             self.block_hashes = torch.full(
-                (self.total_count,), -1, dtype=torch.int64, device=torch.cuda.current_device()
+                (self.total_count,), -1, dtype=torch.int64, device=device
             )
 
-            # Hash-to-block mapping for O(1) prefix lookup
-            self.hash_to_block_id: Dict[int, int] = {}
+            # GPU hash table for O(1) prefix lookup (replaces CPU hash_to_block_id)
+            self.gpu_hash_table = GPUHashTable(max_entries=total_count, device=device)
 
             # Reference count per block: 0 = cached (evictable), >0 = actively used
             self.block_ref_counts = torch.zeros(
-                (self.total_count,), dtype=torch.int32, device=torch.cuda.current_device()
+                (self.total_count,), dtype=torch.int32, device=device
             )
 
             # LRU timestamps for eviction ordering (higher = more recently used)
             # Only needed in LRU mode; RZ mode evicts immediately on ref_count==0
-            if self.block_evict_lru:
+            if self.prefix_caching_evict_policy == PrefixCachingEvictPolicy.LRU:
                 self.block_timestamps = torch.zeros(
-                    (self.total_count,), dtype=torch.int64, device=torch.cuda.current_device()
+                    (self.total_count,), dtype=torch.int64, device=device
                 )
 
             # Pending block hashes for prefix caching coordination
             # -1 = not pending, positive = hash registered but KV not yet computed
             self._pending_block_hashes = torch.full(
-                (self.total_count,), -1, dtype=torch.int64, device=torch.cuda.current_device()
+                (self.total_count,), -1, dtype=torch.int64, device=device
             )
 
-            # CPU-side set of block IDs that are pending (registered but not yet computed).
-            # Mirrors the GPU _pending_block_hashes tensor for O(1) CPU-only lookups,
-            # eliminating GPU→CPU sync in _has_pending_prefix_blocks().
-            self._pending_block_ids_cpu: set[int] = set()
+            # GPU pending bitmap: True if block is registered but KV not yet computed
+            self.pending_bitmap = torch.zeros(self.total_count, dtype=torch.bool, device=device)
 
-            # CPU-side reverse mapping: block_id → hash. Enables _deregister_blocks()
-            # to find hashes to remove from hash_to_block_id without GPU tensor reads.
-            self.block_id_to_hash: Dict[int, int] = {}
+            # GPU scalar counters for blocks_with_refs and total_ref_count.
+            # Used for metrics and evictable estimate (read post-forward with .item()).
+            self._gpu_blocks_with_refs = torch.zeros(1, dtype=torch.int32, device=device)
+            self._gpu_total_ref_count = torch.zeros(1, dtype=torch.int32, device=device)
 
-            # CPU counters for event tracking, avoiding GPU→CPU sync in
-            # post_process_requests(). Maintained at all ref count mutation points.
-            self._cpu_blocks_with_refs = 0  # count of blocks with ref_count > 0
-            self._cpu_total_ref_count = 0  # sum of all ref counts
-
-            # Lazy reconciliation flag for _cpu_blocks_with_refs.
-            # In LRU mode, release_memory_blocks() sets this instead of syncing.
-            # Must be reconciled before reading _cpu_blocks_with_refs.
-            self._cpu_blocks_with_refs_dirty = False
+            # Immutable block ID range for hash table rebuild (avoids per-call allocation)
+            self._block_id_range = torch.arange(
+                total_count, dtype=torch.int32, device=device
+            )
 
     def __str__(self):
         return (
@@ -143,26 +143,10 @@ class BlockAllocator:
             return True
         if not self.enable_prefix_caching:
             return False
-        if not self.block_evict_lru:
+        if self.prefix_caching_evict_policy == PrefixCachingEvictPolicy.REF_ZERO:
             return False  # RZ: no cached blocks to evict
 
-        # CPU-only conservative estimate (no GPU sync).
-        # hash_to_block_id = all registered blocks (cached + active + pending).
-        # _cpu_blocks_with_refs = blocks with ref > 0 (may be stale-high → conservative).
-        # _pending_block_ids_cpu = pending blocks (ref > 0 but hash == -1, not evictable).
-        #   Pending blocks are already counted in _cpu_blocks_with_refs, but subtracting
-        #   them handles the edge case where a block is released before mark_computed
-        #   (ref == 0, still pending, not evictable).
-        estimated_evictable = max(
-            0,
-            len(self.hash_to_block_id)
-            - self._cpu_blocks_with_refs
-            - len(self._pending_block_ids_cpu),
-        )
-        if self.total_avail + estimated_evictable >= num_blocks:
-            return True
-
-        # Fall back to exact GPU count (1 sync)
+        # Exact GPU count (1 sync via get_evictable_block_count)
         evictable_count = self.get_evictable_block_count()
         return (self.total_avail + evictable_count) >= num_blocks
 
@@ -179,7 +163,7 @@ class BlockAllocator:
         """
         # Try to evict cached blocks if free pool is insufficient
         if self.total_avail < num_blocks:
-            if not self.enable_prefix_caching or not self.block_evict_lru:
+            if not self.enable_prefix_caching or self.prefix_caching_evict_policy == PrefixCachingEvictPolicy.REF_ZERO:
                 return None  # RZ: no eviction path; disabled: no cached blocks
             blocks_needed_from_eviction = num_blocks - self.total_avail
             if not self.evict_lru_blocks(blocks_needed_from_eviction):
@@ -190,17 +174,12 @@ class BlockAllocator:
         block_ids = self.block_bag[self.total_avail : (self.total_avail + num_blocks)]
         assert num_blocks == block_ids.numel()
 
-        # Piggyback CPU list on the inevitable GPU→CPU sync (block_bag is GPU tensor).
-        # Callers use _last_allocated_cpu for hash registration and pending tracking,
-        # avoiding additional .tolist() syncs on request_to_kv_block_ids.
-        self._last_allocated_cpu = block_ids.tolist()
-
         if self.enable_prefix_caching:
             # Initialize ref counts for newly allocated blocks
             self.block_ref_counts[block_ids] = 1
-            self._cpu_blocks_with_refs += num_blocks
-            self._cpu_total_ref_count += num_blocks
-            if self.block_evict_lru:
+            self._gpu_blocks_with_refs += num_blocks
+            self._gpu_total_ref_count += num_blocks
+            if self.prefix_caching_evict_policy == PrefixCachingEvictPolicy.LRU:
                 self.update_timestamps(block_ids)
 
         return block_ids
@@ -222,18 +201,22 @@ class BlockAllocator:
 
         if self.enable_prefix_caching:
             self.block_ref_counts[blocks] -= 1
-            self._cpu_total_ref_count -= blocks.numel()
+            self._gpu_total_ref_count -= blocks.numel()
 
-            if not self.block_evict_lru:
-                zero_mask = self.block_ref_counts[blocks] == 0
-                zero_blocks = blocks[zero_mask]  # SYNC: boolean indexing
-                if zero_blocks.numel() > 0:  # Free: reads shape metadata
-                    self._cpu_blocks_with_refs -= zero_blocks.numel()
+            zero_mask = self.block_ref_counts[blocks] == 0
+            # Use .sum() on GPU to count zero-ref blocks (avoids boolean indexing sync)
+            num_zero = zero_mask.sum()
+            self._gpu_blocks_with_refs -= num_zero
+
+            if self.prefix_caching_evict_policy == PrefixCachingEvictPolicy.REF_ZERO:
+                # RZ: immediately deregister zero-ref blocks
+                # Use torch.where to extract block IDs at fixed size, then slice
+                # by the GPU-computed count (requires one sync for _deregister_blocks)
+                num_zero_cpu = num_zero.item()
+                if num_zero_cpu > 0:
+                    zero_blocks = blocks[zero_mask]
                     self._deregister_blocks(zero_blocks)
-            else:
-                # LRU: defer _cpu_blocks_with_refs update — no GPU sync.
-                # Reconciled before next read via reconcile_blocks_with_refs().
-                self._cpu_blocks_with_refs_dirty = True
+            # LRU: blocks stay cached (hash remains) for potential reuse
         else:
             num_blocks = blocks.numel()
             self.block_bag[self.total_avail : self.total_avail + num_blocks] = blocks
@@ -265,22 +248,20 @@ class BlockAllocator:
             self.block_hashes.fill_(-1)
 
             # Reset prefix caching state
-            self.hash_to_block_id.clear()
+            self.gpu_hash_table.clear()
             self._pending_block_hashes.fill_(-1)
-            self._pending_block_ids_cpu.clear()
-            self.block_id_to_hash.clear()
+            self.pending_bitmap.fill_(False)
             self.block_ref_counts.fill_(0)
-            self._cpu_blocks_with_refs = 0
-            self._cpu_total_ref_count = 0
-            self._cpu_blocks_with_refs_dirty = False
-            if self.block_evict_lru:
+            self._gpu_blocks_with_refs.fill_(0)
+            self._gpu_total_ref_count.fill_(0)
+            if self.prefix_caching_evict_policy == PrefixCachingEvictPolicy.LRU:
                 self.block_timestamps.fill_(0)
 
     # =========================================================================
     # Prefix caching methods
     # =========================================================================
 
-    def register_block_hashes(self, block_ids: list[int], block_hashes: list[int]) -> None:
+    def register_block_hashes(self, block_ids: Tensor, block_hashes: Tensor) -> None:
         """Register blocks in the hash-to-block mapping for discovery (batch).
 
         NOTE: Does NOT mark blocks as computed. Call mark_blocks_computed() after
@@ -288,57 +269,37 @@ class BlockAllocator:
         where subsequent requests wait for blocks to be computed before reusing.
 
         Args:
-            block_ids: List of block IDs.
-            block_hashes: List of computed hash values (same length as block_ids).
+            block_ids: int32 GPU tensor of block IDs.
+            block_hashes: int64 GPU tensor of hash values (same length).
         """
-        if not block_ids:
+        if block_ids.numel() == 0:
             return
-        id_tensor = torch.tensor(
-            block_ids, dtype=torch.int64, device=self._pending_block_hashes.device
-        )
-        hash_tensor = torch.tensor(
-            block_hashes, dtype=torch.int64, device=self._pending_block_hashes.device
-        )
-        self._pending_block_hashes[id_tensor] = hash_tensor
-        self.hash_to_block_id.update(zip(block_hashes, block_ids))
-        self._pending_block_ids_cpu.update(block_ids)
-        self.block_id_to_hash.update(zip(block_ids, block_hashes))
+        id_tensor_i64 = block_ids.to(torch.int64)
+        self._pending_block_hashes[id_tensor_i64] = block_hashes
+        self.gpu_hash_table.insert_batch(block_hashes, block_ids.to(torch.int32))
+        self.pending_bitmap[id_tensor_i64] = True
 
-    def increment_ref_counts(self, matched_block_ids: list[int], matched_tensor: Tensor) -> None:
-        """Increment ref counts for matched prefix blocks and update CPU counters.
+    def increment_ref_counts(self, matched_tensor: Tensor) -> None:
+        """Increment ref counts for matched prefix blocks.
 
         Args:
-            matched_block_ids: CPU list of matched block IDs.
-            matched_tensor: GPU tensor of matched block IDs (same content).
+            matched_tensor: GPU tensor of matched block IDs.
         """
-        num_matched = len(matched_block_ids)
+        num_matched = matched_tensor.numel()
         if num_matched == 0:
             return
 
-        # In LRU mode, some matched blocks might be cached (ref=0 → ref=1)
-        if self.block_evict_lru:
-            newly_active = int((self.block_ref_counts[matched_tensor] == 0).sum().item())
-            self._cpu_blocks_with_refs += newly_active
-        # In RZ mode, cached blocks are deregistered immediately (ref never 0 in map),
-        # so all matched blocks already have ref > 0 — no _cpu_blocks_with_refs change.
+        if self.prefix_caching_evict_policy == PrefixCachingEvictPolicy.LRU:
+            newly_active = (self.block_ref_counts[matched_tensor] == 0).sum()
+            self._gpu_blocks_with_refs += newly_active
 
-        self._cpu_total_ref_count += num_matched
+        self._gpu_total_ref_count += num_matched
         self.block_ref_counts[matched_tensor] += 1
 
-        if self.block_evict_lru:
+        if self.prefix_caching_evict_policy == PrefixCachingEvictPolicy.LRU:
             self.update_timestamps(matched_tensor)
 
-    def reconcile_blocks_with_refs(self) -> None:
-        """Recompute _cpu_blocks_with_refs from GPU if dirty (one sync).
-
-        Called by the engine before reading the counter for metrics.
-        """
-        if not self._cpu_blocks_with_refs_dirty:
-            return
-        self._cpu_blocks_with_refs = int((self.block_ref_counts > 0).sum().item())
-        self._cpu_blocks_with_refs_dirty = False
-
-    def mark_blocks_computed(self, block_ids: list[int]) -> None:
+    def mark_blocks_computed(self, block_ids: Tensor) -> None:
         """Mark blocks as having their KV computed (batch).
 
         Called after prefill completes for blocks that were registered.
@@ -346,23 +307,20 @@ class BlockAllocator:
         signaling that the KV cache for these blocks is ready for reuse.
 
         Args:
-            block_ids: List of block IDs to mark as computed.
+            block_ids: int32 GPU tensor of block IDs to mark as computed.
         """
-        if not block_ids:
+        if block_ids.numel() == 0:
             return
-        id_tensor = torch.tensor(
-            block_ids, dtype=torch.int64, device=self._pending_block_hashes.device
-        )
-        self.block_hashes[id_tensor] = self._pending_block_hashes[id_tensor]
-        self._pending_block_hashes[id_tensor] = -1
-        self._pending_block_ids_cpu.difference_update(block_ids)
+        id_tensor_i64 = block_ids.to(torch.int64)
+        self.block_hashes[id_tensor_i64] = self._pending_block_hashes[id_tensor_i64]
+        self._pending_block_hashes[id_tensor_i64] = -1
+        self.pending_bitmap[id_tensor_i64] = False
 
     def _deregister_blocks(self, block_ids: Tensor) -> None:
         """Remove blocks from prefix caching state and return to free pool.
 
         Shared cleanup logic for both LRU eviction and RZ proactive eviction.
-        Uses CPU-side reverse mapping (block_id_to_hash) to find hashes to remove
-        from hash_to_block_id, avoiding GPU tensor reads for hash lookup.
+        All operations are GPU-resident tensor ops + hash table rebuild.
 
         Args:
             block_ids: Tensor of block IDs to deregister.
@@ -371,38 +329,46 @@ class BlockAllocator:
         if num_blocks == 0:
             return
 
-        # Convert block IDs to CPU list (one sync, N*int32)
-        block_ids_list = block_ids.tolist()
+        # Invalidate Mamba state for evicted blocks (vectorized, 1 sync for count)
+        if self.context.max_mamba_cache_slots > 0:
+            slots = self.context.block_to_mamba_slot[block_ids]
+            valid_mask = slots >= 0
+            valid_slots = slots[valid_mask]
+            n_freed = valid_slots.numel()
+            if n_freed > 0:
+                self.context.block_to_mamba_slot[block_ids] = -1
+                self.context.mamba_slot_to_block[valid_slots.long()] = -1
+                fc = self.context.mamba_cache_free_count
+                self.context.mamba_cache_free_slots[fc:fc + n_freed] = valid_slots
+                self.context.mamba_cache_free_count += n_freed
 
-        # Look up hashes from CPU reverse mapping — no GPU reads needed
-        hashes_to_delete = set()
-        for bid in block_ids_list:
-            h = self.block_id_to_hash.pop(bid, None)
-            if h is not None:
-                hashes_to_delete.add(h)
-
-        # Remove from hash_to_block_id
-        for h in hashes_to_delete:
-            self.hash_to_block_id.pop(h, None)
-
-        # Remove from pending CPU set
-        self._pending_block_ids_cpu.difference_update(block_ids_list)
-
-        # Invalidate Mamba state for evicted blocks (if Mamba prefix caching is enabled)
-        for block_id_int in block_ids_list:
-            self.context.invalidate_mamba_state_for_block(block_id_int)
-
-        # Reset GPU state (batched tensor ops, no sync needed)
+        # Reset GPU state (batched tensor ops)
         block_ids_i64 = block_ids.to(torch.int64)
         self._pending_block_hashes[block_ids_i64] = -1
+        self.pending_bitmap[block_ids_i64] = False
         self.block_hashes[block_ids] = -1
         self.block_ref_counts[block_ids] = 0
-        if self.block_evict_lru:
+        if self.prefix_caching_evict_policy == PrefixCachingEvictPolicy.LRU:
             self.block_timestamps[block_ids] = 0
 
         # Return blocks to free pool
         self.block_bag[self.total_avail : self.total_avail + num_blocks] = block_ids
         self.total_avail += num_blocks
+
+        # Rebuild GPU hash table from remaining valid entries.
+        # This is the "rebuild after eviction" strategy — simpler and correct
+        # compared to per-element deletion with linear probing.
+        # Must include both computed blocks (block_hashes != -1) and pending
+        # blocks (_pending_block_hashes != -1) since both are discoverable.
+        # Use torch.where to merge hashes at full-tensor width (no nonzero sync).
+        # block_hashes and _pending_block_hashes are mutually exclusive, so the
+        # merge produces -1 for unused slots; the insert kernel skips -1 keys.
+        combined_hashes = torch.where(
+            self.block_hashes != -1, self.block_hashes, self._pending_block_hashes
+        )
+        # rebuild() clears then inserts; insert kernel skips -1 keys.
+        # Unconditional call avoids the .any() GPU→CPU sync.
+        self.gpu_hash_table.rebuild(combined_hashes, self._block_id_range)
 
     def update_timestamps(self, block_ids: Tensor) -> None:
         """Update LRU timestamps for accessed blocks. No-op in RZ mode.
@@ -410,7 +376,7 @@ class BlockAllocator:
         Args:
             block_ids: Tensor of block IDs that were accessed.
         """
-        if not self.block_evict_lru or block_ids.numel() == 0:
+        if self.prefix_caching_evict_policy != PrefixCachingEvictPolicy.LRU or block_ids.numel() == 0:
             return
         self.block_timestamps[block_ids] = self.context.step_count
 
@@ -437,17 +403,19 @@ class BlockAllocator:
         # Find all cached blocks (ref_count == 0, hash != -1)
         cached_mask = (self.block_ref_counts == 0) & (self.block_hashes != -1)
 
-        # nonzero() syncs to determine output size; .numel() reads shape (no sync).
-        # Combined into one sync instead of separate sum() + nonzero().
-        cached_block_ids = torch.nonzero(cached_mask, as_tuple=True)[0]
-        if cached_block_ids.numel() < num_blocks_needed:
+        # Single scalar sync to check availability (no variable-size output)
+        num_cached = cached_mask.sum().item()
+        if num_cached < num_blocks_needed:
             return False  # Not enough cached blocks to evict
 
-        # Sort by timestamp (ascending = oldest first)
-        cached_timestamps = self.block_timestamps[cached_block_ids]
-        sorted_indices = torch.argsort(cached_timestamps)
-        blocks_to_evict = cached_block_ids[sorted_indices[:num_blocks_needed]]
+        # Use topk to find oldest timestamps. Mask non-cached blocks with MAX_TS
+        # so they sort to the end. topk output size is known at call time (no sync).
+        MAX_TS = torch.iinfo(torch.int64).max
+        masked_timestamps = torch.where(cached_mask, self.block_timestamps, MAX_TS)
+        _, evict_indices = torch.topk(
+            masked_timestamps, num_blocks_needed, largest=False, sorted=False
+        )
 
-        self._deregister_blocks(blocks_to_evict)
+        self._deregister_blocks(evict_indices.to(torch.int32))
 
         return True

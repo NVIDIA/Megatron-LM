@@ -6,7 +6,7 @@ from collections import deque
 import pytest
 import torch
 
-from megatron.core.inference.config import InferenceConfig
+from megatron.core.inference.config import InferenceConfig, PrefixCachingEvictPolicy
 from megatron.core.inference.contexts.dynamic_context import DynamicInferenceContext
 from megatron.core.inference.engines.dynamic_engine import DynamicInferenceEngine
 from megatron.core.inference.inference_request import (
@@ -47,7 +47,7 @@ class PrefixCachingTestBase:
         rounder=64,
         enable_prefix_caching=True,
         max_tokens=None,
-        block_evict_lru=True,
+        prefix_caching_evict_policy=PrefixCachingEvictPolicy.LRU,
     ):
         DynamicInferenceContext.ROUNDER = rounder
         DynamicInferenceContext.TOKEN_ROUNDER = rounder
@@ -72,7 +72,7 @@ class PrefixCachingTestBase:
             use_flashinfer_fused_rope=None,
             unified_memory_level=0,
             enable_prefix_caching=enable_prefix_caching,
-            block_evict_lru=block_evict_lru,
+            prefix_caching_evict_policy=prefix_caching_evict_policy,
         )
         return DynamicInferenceContext(
             model_config=transformer_config, inference_config=inference_config
@@ -109,7 +109,7 @@ class _StubEngine(DynamicInferenceEngine):
     def __init__(self, context: DynamicInferenceContext):
         self.context = context
         self.enable_chunked_prefill = False
-        self._prefix_coordination_waits = 0
+        self._prefix_coordination_skips = 0
         self._loop = asyncio.new_event_loop()
         self.waiting_request_ids: deque = deque()
         self.requests = {}
@@ -147,37 +147,40 @@ class TestHashContract(PrefixCachingTestBase):
         bs = ctx.block_size_tokens
         prompt = self._prompt(bs * 3)
         req = self._req(ctx, prompt)
-        assert len(req.precomputed_block_hashes) == 3
-        assert req.precomputed_block_hashes == compute_block_hashes_batched(prompt, bs)
+        assert req.precomputed_block_hashes.numel() == 3
+        expected = compute_block_hashes_batched(prompt, bs)
+        assert req.precomputed_block_hashes.tolist() == expected
         req2 = self._req(ctx, prompt.clone(), request_id=2)
-        assert req.precomputed_block_hashes == req2.precomputed_block_hashes
-        assert len(set(req.precomputed_block_hashes)) == 3
+        assert torch.equal(req.precomputed_block_hashes, req2.precomputed_block_hashes)
+        assert len(set(req.precomputed_block_hashes.tolist())) == 3
 
     @pytest.mark.internal
     def test_edge_cases(self):
-        """Sub-block → []; empty → []; single-token → []; all-zeros → 4 distinct; 120-block → 120 positive."""
+        """Sub-block → empty; empty → empty; single-token → empty; all-zeros → 4 distinct; 120-block → 120 positive."""
         ctx = self._ctx()
         bs = ctx.block_size_tokens
         dev = torch.cuda.current_device()
-        assert self._req(ctx, self._prompt(bs // 2)).precomputed_block_hashes == []
+        assert self._req(ctx, self._prompt(bs // 2)).precomputed_block_hashes.numel() == 0
         assert (
-            self._req(ctx, torch.tensor([], device=dev, dtype=torch.long)).precomputed_block_hashes
-            == []
+            self._req(
+                ctx, torch.tensor([], device=dev, dtype=torch.long)
+            ).precomputed_block_hashes.numel()
+            == 0
         )
         assert (
             self._req(
                 ctx, torch.tensor([42], device=dev, dtype=torch.long)
-            ).precomputed_block_hashes
-            == []
+            ).precomputed_block_hashes.numel()
+            == 0
         )
         zeros = torch.zeros(bs * 4, device=dev, dtype=torch.long)
         h_zeros = self._req(ctx, zeros).precomputed_block_hashes
-        assert len(h_zeros) == 4 and len(set(h_zeros)) == 4
+        assert h_zeros.numel() == 4 and len(set(h_zeros.tolist())) == 4
         ctx_long = self._ctx(max_sequence_length=8192)
         h_long = self._req(
             ctx_long, torch.arange(bs * 120, device=dev, dtype=torch.long)
         ).precomputed_block_hashes
-        assert len(h_long) == 120 and all(h > 0 for h in h_long)
+        assert h_long.numel() == 120 and all(h > 0 for h in h_long.tolist())
 
 
 # =========================================================================
@@ -283,10 +286,22 @@ class TestRefCountLifecycle(PrefixCachingTestBase):
         assert alloc.block_ref_counts[b1].item() == 2
         ctx.release_memory_blocks_from_request_indexes(torch.tensor([0]))
         assert alloc.block_ref_counts[b0].item() == 1
-        assert b0_hash in alloc.hash_to_block_id
+        # Hash still discoverable via GPU hash table
+        assert (
+            alloc.gpu_hash_table.lookup_batch_alloc(
+                torch.tensor([b0_hash], dtype=torch.int64, device=torch.cuda.current_device())
+            )[0].item()
+            == b0
+        )
         ctx.release_memory_blocks_from_request_indexes(torch.tensor([1]))
         assert alloc.block_ref_counts[b0].item() == 0
-        assert b0_hash in alloc.hash_to_block_id  # still cached in LRU
+        # Still cached in LRU (hash remains in GPU hash table)
+        assert (
+            alloc.gpu_hash_table.lookup_batch_alloc(
+                torch.tensor([b0_hash], dtype=torch.int64, device=torch.cuda.current_device())
+            )[0].item()
+            == b0
+        )
 
     @pytest.mark.internal
     def test_lru_reuse_after_release(self):
@@ -301,7 +316,14 @@ class TestRefCountLifecycle(PrefixCachingTestBase):
         ctx.release_memory_blocks_from_request_indexes(torch.tensor([0]))
         ctx.total_request_count = 0
         assert alloc.block_ref_counts[b0].item() == 0
-        assert alloc.block_hashes[b0].item() in alloc.hash_to_block_id
+        # Hash still discoverable via GPU hash table (LRU cached)
+        b0_hash = alloc.block_hashes[b0].item()
+        assert (
+            alloc.gpu_hash_table.lookup_batch_alloc(
+                torch.tensor([b0_hash], dtype=torch.int64, device=torch.cuda.current_device())
+            )[0].item()
+            == b0
+        )
         ctx.add_request(self._req(ctx, prompt.clone(), request_id=2))
         assert self._block_ids(ctx, 0, 2) == [b0, b1]
         assert alloc.block_ref_counts[b0].item() == 1
@@ -356,7 +378,7 @@ class TestEvictionPolicy(PrefixCachingTestBase):
     @pytest.mark.internal
     def test_rz_deregisters_on_ref_zero(self):
         """RZ: release → ref=0 → hash removed, block_hashes reset, total_avail increases."""
-        ctx = self._ctx(block_evict_lru=False)
+        ctx = self._ctx(prefix_caching_evict_policy=PrefixCachingEvictPolicy.REF_ZERO)
         bs = ctx.block_size_tokens
         alloc = ctx.block_allocator
         prompt = self._prompt(bs * 2)
@@ -368,8 +390,20 @@ class TestEvictionPolicy(PrefixCachingTestBase):
         avail_before = alloc.total_avail
         ctx.release_memory_blocks_from_request_indexes(torch.tensor([0]))
         assert alloc.block_ref_counts[b0].item() == 0
-        assert b0_hash not in alloc.hash_to_block_id
-        assert b1_hash not in alloc.hash_to_block_id
+        dev = torch.cuda.current_device()
+        # Hashes removed from GPU hash table after RZ deregistration
+        assert (
+            alloc.gpu_hash_table.lookup_batch_alloc(
+                torch.tensor([b0_hash], dtype=torch.int64, device=dev)
+            )[0].item()
+            == -1
+        )
+        assert (
+            alloc.gpu_hash_table.lookup_batch_alloc(
+                torch.tensor([b1_hash], dtype=torch.int64, device=dev)
+            )[0].item()
+            == -1
+        )
         assert alloc.block_hashes[b0].item() == -1
         assert alloc.block_hashes[b1].item() == -1
         assert alloc.total_avail == avail_before + 2
@@ -377,7 +411,7 @@ class TestEvictionPolicy(PrefixCachingTestBase):
     @pytest.mark.internal
     def test_rz_shared_persist_until_last_ref(self):
         """RZ: 2 sharers, release one → ref=1, hash stays. Release second → hash removed."""
-        ctx = self._ctx(block_evict_lru=False)
+        ctx = self._ctx(prefix_caching_evict_policy=PrefixCachingEvictPolicy.REF_ZERO)
         bs = ctx.block_size_tokens
         alloc = ctx.block_allocator
         prompt = self._prompt(bs * 2)
@@ -386,18 +420,31 @@ class TestEvictionPolicy(PrefixCachingTestBase):
         ctx.add_request(self._req(ctx, prompt.clone(), request_id=2))
         b0, _ = self._block_ids(ctx, 0, 2)
         b0_hash = alloc.block_hashes[b0].item()
+        dev = torch.cuda.current_device()
         assert alloc.block_ref_counts[b0].item() == 2
         ctx.release_memory_blocks_from_request_indexes(torch.tensor([0]))
         assert alloc.block_ref_counts[b0].item() == 1
-        assert b0_hash in alloc.hash_to_block_id
+        # Hash still in GPU hash table (ref > 0)
+        assert (
+            alloc.gpu_hash_table.lookup_batch_alloc(
+                torch.tensor([b0_hash], dtype=torch.int64, device=dev)
+            )[0].item()
+            == b0
+        )
         ctx.release_memory_blocks_from_request_indexes(torch.tensor([1]))
         assert alloc.block_ref_counts[b0].item() == 0
-        assert b0_hash not in alloc.hash_to_block_id
+        # Hash removed from GPU hash table after RZ deregistration
+        assert (
+            alloc.gpu_hash_table.lookup_batch_alloc(
+                torch.tensor([b0_hash], dtype=torch.int64, device=dev)
+            )[0].item()
+            == -1
+        )
 
     @pytest.mark.internal
     def test_rz_no_reuse_after_release(self):
         """RZ: after release, same prefix gets fresh blocks (no cache)."""
-        ctx = self._ctx(block_evict_lru=False)
+        ctx = self._ctx(prefix_caching_evict_policy=PrefixCachingEvictPolicy.REF_ZERO)
         bs = ctx.block_size_tokens
         alloc = ctx.block_allocator
         prompt = self._prompt(bs * 2)
@@ -421,24 +468,36 @@ class TestTwoPhaseRegistration(PrefixCachingTestBase):
 
     @pytest.mark.internal
     def test_phase1_discoverable_phase2_computed(self):
-        """After add: hash_to_block_id populated, block_hashes==-1, pending!=−1. After mark: hash set, pending cleared."""
+        """After add: GPU hash table populated, block_hashes==-1, pending!=−1. After mark: hash set, pending cleared."""
         ctx = self._ctx()
         bs = ctx.block_size_tokens
         alloc = ctx.block_allocator
+        dev = torch.cuda.current_device()
         req = self._req(ctx, self._prompt(bs * 2))
         ctx.add_request(req)
         b0, b1 = self._block_ids(ctx, 0, 2)
-        h0, h1 = req.precomputed_block_hashes
-        assert alloc.hash_to_block_id.get(h0) == b0
-        assert alloc.hash_to_block_id.get(h1) == b1
+        h0, h1 = req.precomputed_block_hashes.tolist()
+        # GPU hash table should find the blocks
+        assert (
+            alloc.gpu_hash_table.lookup_batch_alloc(
+                torch.tensor([h0], dtype=torch.int64, device=dev)
+            )[0].item()
+            == b0
+        )
+        assert (
+            alloc.gpu_hash_table.lookup_batch_alloc(
+                torch.tensor([h1], dtype=torch.int64, device=dev)
+            )[0].item()
+            == b1
+        )
         assert alloc.block_hashes[b0].item() == -1
         assert alloc._pending_block_hashes[b0].item() != -1
-        assert len(ctx._blocks_pending_computation) == 2
+        assert ctx._pending_computation_count == 2
         ctx.mark_pending_blocks_computed()
         assert alloc.block_hashes[b0].item() == h0
         assert alloc.block_hashes[b1].item() == h1
         assert alloc._pending_block_hashes[b0].item() == -1
-        assert len(ctx._blocks_pending_computation) == 0
+        assert ctx._pending_computation_count == 0
 
     @pytest.mark.internal
     def test_concurrent_sharing_before_computed(self):
@@ -465,16 +524,26 @@ class TestTwoPhaseRegistration(PrefixCachingTestBase):
 
     @pytest.mark.internal
     def test_allocator_api_register_then_mark(self):
-        """Direct allocator: register → lookup finds block, hash==-1. mark → hash==hash."""
+        """Direct allocator: register → GPU lookup finds block, hash==-1. mark → hash==hash."""
         ctx = self._ctx()
         alloc = ctx.block_allocator
+        dev = torch.cuda.current_device()
         block_ids = alloc.allocate_memory_blocks(1)
         bid = block_ids[0].item()
         test_hash = 99999
-        alloc.register_block_hashes([bid], [test_hash])
-        assert alloc.hash_to_block_id.get(test_hash) == bid
+        alloc.register_block_hashes(
+            block_ids[:1].to(torch.int32),
+            torch.tensor([test_hash], dtype=torch.int64, device=dev),
+        )
+        # GPU hash table should find the block
+        assert (
+            alloc.gpu_hash_table.lookup_batch_alloc(
+                torch.tensor([test_hash], dtype=torch.int64, device=dev)
+            )[0].item()
+            == bid
+        )
         assert alloc.block_hashes[bid].item() == -1
-        alloc.mark_blocks_computed([bid])
+        alloc.mark_blocks_computed(block_ids[:1].to(torch.int32))
         assert alloc.block_hashes[bid].item() == test_hash
 
 
@@ -493,15 +562,15 @@ class TestPrefillAndDecode(PrefixCachingTestBase):
         bs = ctx.block_size_tokens
         prompt = self._prompt(bs * 4)
         ctx.add_request(self._req(ctx, prompt.clone()))
-        assert len(ctx._blocks_pending_computation) == 4
+        assert ctx._pending_computation_count == 4
         ctx.mark_pending_blocks_computed()
-        assert len(ctx._blocks_pending_computation) == 0
+        assert ctx._pending_computation_count == 0
         ctx.add_request(self._req(ctx, prompt.clone(), request_id=2))
-        assert len(ctx._blocks_pending_computation) == 0
+        assert ctx._pending_computation_count == 0
         assert torch.equal(ctx.request_to_kv_block_ids[0][:4], ctx.request_to_kv_block_ids[1][:4])
         extended = torch.cat([prompt, self._prompt(bs, offset=1000)])
         ctx.add_request(self._req(ctx, extended, request_id=3))
-        assert len(ctx._blocks_pending_computation) == 1
+        assert ctx._pending_computation_count == 1
 
     @pytest.mark.internal
     def test_decode_does_not_register_hashes(self):
@@ -693,7 +762,7 @@ class TestEngineScheduling(PrefixCachingTestBase):
         self._add_to_waiting(engine, ctx, req2)
         engine.schedule_non_chunked_prefill()
         assert len(engine.waiting_request_ids) == 1
-        assert engine._prefix_coordination_waits == 1
+        assert engine._prefix_coordination_skips == 1
         ctx.mark_pending_blocks_computed()
         engine.schedule_non_chunked_prefill()
         assert len(engine.waiting_request_ids) == 0
@@ -706,18 +775,52 @@ class TestEngineScheduling(PrefixCachingTestBase):
         bs = ctx.block_size_tokens
         engine = self._engine(ctx)
         prompt = self._prompt(bs * 2)
-        assert engine.get_prefix_coordination_metrics() == {"waits": 0}
+        assert engine.get_prefix_coordination_metrics() == {"skips": 0}
         req1 = self._req(ctx, prompt.clone())
         ctx.add_request(req1)
         req2 = self._req(ctx, prompt.clone(), request_id=2)
         self._add_to_waiting(engine, ctx, req2)
         engine.schedule_non_chunked_prefill()
-        assert engine.get_prefix_coordination_metrics() == {"waits": 1}
+        assert engine.get_prefix_coordination_metrics() == {"skips": 1}
         engine.schedule_non_chunked_prefill()
-        assert engine.get_prefix_coordination_metrics() == {"waits": 2}
+        assert engine.get_prefix_coordination_metrics() == {"skips": 2}
         ctx.mark_pending_blocks_computed()
         engine.schedule_non_chunked_prefill()
-        assert engine.get_prefix_coordination_metrics() == {"waits": 2}
+        assert engine.get_prefix_coordination_metrics() == {"skips": 2}
+
+    @pytest.mark.internal
+    def test_pending_requests_skipped_over(self):
+        """Pending req2 is skipped; non-pending req3 and req4 are scheduled."""
+        ctx = self._ctx()
+        bs = ctx.block_size_tokens
+        engine = self._engine(ctx)
+
+        # req1: add to context directly (starts prefill, blocks become pending)
+        prompt_shared = self._prompt(bs * 2)
+        req1 = self._req(ctx, prompt_shared.clone())
+        ctx.add_request(req1)
+
+        # req2: same prefix as req1 -> has pending blocks -> will be skipped
+        req2 = self._req(ctx, prompt_shared.clone(), request_id=2)
+        self._add_to_waiting(engine, ctx, req2)
+
+        # req3: different prefix -> no pending blocks -> should be scheduled
+        prompt_diff1 = self._prompt(bs * 2, offset=1000)
+        req3 = self._req(ctx, prompt_diff1.clone(), request_id=3)
+        self._add_to_waiting(engine, ctx, req3)
+
+        # req4: different prefix -> no pending blocks -> should be scheduled
+        prompt_diff2 = self._prompt(bs * 2, offset=2000)
+        req4 = self._req(ctx, prompt_diff2.clone(), request_id=4)
+        self._add_to_waiting(engine, ctx, req4)
+
+        engine.schedule_non_chunked_prefill()
+
+        # req3 and req4 should be scheduled, req2 should remain waiting
+        assert len(engine.waiting_request_ids) == 1
+        assert engine.waiting_request_ids[0] == 2
+        assert ctx.total_request_count == 3  # req1 + req3 + req4
+        assert engine._prefix_coordination_skips == 1
 
 
 # =========================================================================
@@ -725,121 +828,296 @@ class TestEngineScheduling(PrefixCachingTestBase):
 # =========================================================================
 
 
-class TestCPUShadowsAndConfig(PrefixCachingTestBase):
-    """Pending set lifecycle, reverse mapping, ref counters, reset, disabled+RZ attrs."""
+class TestGPUStructuresAndConfig(PrefixCachingTestBase):
+    """Pending bitmap lifecycle, GPU hash table consistency, GPU ref counters, reset, disabled+RZ attrs."""
 
     @staticmethod
-    def _assert_cpu_shadows_consistent(alloc):
+    def _assert_gpu_structures_consistent(alloc):
+        """Verify GPU structures are internally consistent."""
         gpu_pending = set(torch.nonzero(alloc._pending_block_hashes != -1).flatten().tolist())
-        assert alloc._pending_block_ids_cpu == gpu_pending
-        for bid, h in alloc.block_id_to_hash.items():
-            assert alloc.hash_to_block_id.get(h) == bid
-        for h, bid in alloc.hash_to_block_id.items():
-            assert alloc.block_id_to_hash.get(bid) == h
-        # Reconcile lazy counter before comparing (matches engine flow)
-        alloc.reconcile_blocks_with_refs()
+        bitmap_pending = set(torch.nonzero(alloc.pending_bitmap).flatten().tolist())
+        assert gpu_pending == bitmap_pending, "pending_bitmap must match _pending_block_hashes"
         gpu_blocks_with_refs = int((alloc.block_ref_counts > 0).sum().item())
         gpu_total_ref_count = int(alloc.block_ref_counts.sum().item())
-        assert alloc._cpu_blocks_with_refs == gpu_blocks_with_refs
-        assert alloc._cpu_total_ref_count == gpu_total_ref_count
+        assert int(alloc._gpu_blocks_with_refs.item()) == gpu_blocks_with_refs
+        assert int(alloc._gpu_total_ref_count.item()) == gpu_total_ref_count
 
     @pytest.mark.internal
-    def test_pending_set_tracks_lifecycle(self):
-        """_pending_block_ids_cpu: empty → {b0,b1} after add → empty after mark."""
+    def test_pending_bitmap_tracks_lifecycle(self):
+        """pending_bitmap: empty → {b0,b1} after add → empty after mark."""
         ctx = self._ctx()
         bs = ctx.block_size_tokens
         alloc = ctx.block_allocator
-        assert alloc._pending_block_ids_cpu == set()
+        assert alloc.pending_bitmap.sum().item() == 0
         req = self._req(ctx, self._prompt(bs * 2))
         ctx.add_request(req)
         b0, b1 = self._block_ids(ctx, 0, 2)
-        assert alloc._pending_block_ids_cpu == {b0, b1}
-        self._assert_cpu_shadows_consistent(alloc)
+        assert alloc.pending_bitmap[b0].item() is True
+        assert alloc.pending_bitmap[b1].item() is True
+        self._assert_gpu_structures_consistent(alloc)
         ctx.mark_pending_blocks_computed()
-        assert alloc._pending_block_ids_cpu == set()
-        self._assert_cpu_shadows_consistent(alloc)
+        assert alloc.pending_bitmap[b0].item() is False
+        assert alloc.pending_bitmap[b1].item() is False
+        self._assert_gpu_structures_consistent(alloc)
 
     @pytest.mark.internal
-    def test_reverse_mapping_consistent(self):
-        """block_id_to_hash correct after register, mark, and LRU release. RZ release clears it."""
+    def test_gpu_hash_table_consistent(self):
+        """GPU hash table consistent after register, mark, and LRU release. RZ release clears it."""
         ctx = self._ctx()
         bs = ctx.block_size_tokens
         alloc = ctx.block_allocator
+        dev = torch.cuda.current_device()
         req = self._req(ctx, self._prompt(bs * 2))
         ctx.add_request(req)
         b0, b1 = self._block_ids(ctx, 0, 2)
-        h0, h1 = req.precomputed_block_hashes
-        assert alloc.block_id_to_hash[b0] == h0
-        assert alloc.block_id_to_hash[b1] == h1
-        self._assert_cpu_shadows_consistent(alloc)
+        h0, h1 = req.precomputed_block_hashes.tolist()
+        # After register: hash table finds blocks
+        assert (
+            alloc.gpu_hash_table.lookup_batch_alloc(
+                torch.tensor([h0], dtype=torch.int64, device=dev)
+            )[0].item()
+            == b0
+        )
+        assert (
+            alloc.gpu_hash_table.lookup_batch_alloc(
+                torch.tensor([h1], dtype=torch.int64, device=dev)
+            )[0].item()
+            == b1
+        )
+        self._assert_gpu_structures_consistent(alloc)
         ctx.mark_pending_blocks_computed()
-        assert alloc.block_id_to_hash[b0] == h0
-        self._assert_cpu_shadows_consistent(alloc)
+        self._assert_gpu_structures_consistent(alloc)
         ctx.release_memory_blocks_from_request_indexes(torch.tensor([0]))
-        assert alloc.block_id_to_hash[b0] == h0  # still cached in LRU
-        self._assert_cpu_shadows_consistent(alloc)
-        # RZ mode: release clears reverse mapping
-        ctx_rz = self._ctx(block_evict_lru=False)
+        # LRU: still in hash table after release (cached)
+        assert (
+            alloc.gpu_hash_table.lookup_batch_alloc(
+                torch.tensor([h0], dtype=torch.int64, device=dev)
+            )[0].item()
+            == b0
+        )
+        self._assert_gpu_structures_consistent(alloc)
+        # RZ mode: release removes from hash table
+        ctx_rz = self._ctx(prefix_caching_evict_policy=PrefixCachingEvictPolicy.REF_ZERO)
         alloc_rz = ctx_rz.block_allocator
         req_rz = self._req(ctx_rz, self._prompt(bs * 2))
         ctx_rz.add_request(req_rz)
         ctx_rz.mark_pending_blocks_computed()
         b0_rz, b1_rz = self._block_ids(ctx_rz, 0, 2)
+        h0_rz = alloc_rz.block_hashes[b0_rz].item()
         ctx_rz.release_memory_blocks_from_request_indexes(torch.tensor([0]))
-        assert b0_rz not in alloc_rz.block_id_to_hash
-        assert b1_rz not in alloc_rz.block_id_to_hash
-        self._assert_cpu_shadows_consistent(alloc_rz)
+        assert (
+            alloc_rz.gpu_hash_table.lookup_batch_alloc(
+                torch.tensor([h0_rz], dtype=torch.int64, device=dev)
+            )[0].item()
+            == -1
+        )
+        self._assert_gpu_structures_consistent(alloc_rz)
 
     @pytest.mark.internal
-    def test_cpu_ref_counters(self):
-        """_cpu_blocks_with_refs and _cpu_total_ref_count accurate through add→share→release→release."""
+    def test_gpu_ref_counters(self):
+        """_gpu_blocks_with_refs and _gpu_total_ref_count accurate through add→share→release→release."""
         ctx = self._ctx()
         bs = ctx.block_size_tokens
         alloc = ctx.block_allocator
         prompt = self._prompt(bs * 2)
-        assert alloc._cpu_blocks_with_refs == 0
-        assert alloc._cpu_total_ref_count == 0
+        assert int(alloc._gpu_blocks_with_refs.item()) == 0
+        assert int(alloc._gpu_total_ref_count.item()) == 0
         ctx.add_request(self._req(ctx, prompt.clone()))
         ctx.mark_pending_blocks_computed()
-        assert alloc._cpu_blocks_with_refs == 2
-        assert alloc._cpu_total_ref_count == 2
-        self._assert_cpu_shadows_consistent(alloc)
+        assert int(alloc._gpu_blocks_with_refs.item()) == 2
+        assert int(alloc._gpu_total_ref_count.item()) == 2
+        self._assert_gpu_structures_consistent(alloc)
         ctx.add_request(self._req(ctx, prompt.clone(), request_id=2))
-        assert alloc._cpu_blocks_with_refs == 2
-        assert alloc._cpu_total_ref_count == 4
-        self._assert_cpu_shadows_consistent(alloc)
+        assert int(alloc._gpu_blocks_with_refs.item()) == 2
+        assert int(alloc._gpu_total_ref_count.item()) == 4
+        self._assert_gpu_structures_consistent(alloc)
         ctx.release_memory_blocks_from_request_indexes(torch.tensor([0]))
-        alloc.reconcile_blocks_with_refs()
-        assert alloc._cpu_blocks_with_refs == 2
-        assert alloc._cpu_total_ref_count == 2
-        self._assert_cpu_shadows_consistent(alloc)
+        assert int(alloc._gpu_blocks_with_refs.item()) == 2
+        assert int(alloc._gpu_total_ref_count.item()) == 2
+        self._assert_gpu_structures_consistent(alloc)
         ctx.release_memory_blocks_from_request_indexes(torch.tensor([1]))
-        alloc.reconcile_blocks_with_refs()
-        assert alloc._cpu_blocks_with_refs == 0
-        assert alloc._cpu_total_ref_count == 0
-        self._assert_cpu_shadows_consistent(alloc)
+        assert int(alloc._gpu_blocks_with_refs.item()) == 0
+        assert int(alloc._gpu_total_ref_count.item()) == 0
+        self._assert_gpu_structures_consistent(alloc)
 
     @pytest.mark.internal
-    def test_reset_clears_all_shadows(self):
-        """After alloc.reset(), all CPU structures zeroed."""
+    def test_reset_clears_all_gpu_structures(self):
+        """After alloc.reset(), all GPU structures zeroed."""
         ctx = self._ctx()
         alloc = ctx.block_allocator
         ctx.add_request(self._req(ctx, self._prompt(ctx.block_size_tokens * 2)))
         ctx.mark_pending_blocks_computed()
-        assert len(alloc.block_id_to_hash) > 0
+        assert alloc.gpu_hash_table.size > 0
         alloc.reset()
-        assert alloc._pending_block_ids_cpu == set()
-        assert alloc.block_id_to_hash == {}
-        assert alloc._cpu_blocks_with_refs == 0
-        assert alloc._cpu_total_ref_count == 0
-        self._assert_cpu_shadows_consistent(alloc)
+        assert alloc.pending_bitmap.sum().item() == 0
+        assert int(alloc._gpu_blocks_with_refs.item()) == 0
+        assert int(alloc._gpu_total_ref_count.item()) == 0
+        self._assert_gpu_structures_consistent(alloc)
 
     @pytest.mark.internal
     def test_disabled_and_rz_attribute_absence(self):
-        """Disabled: no block_hashes, block_ref_counts, hash_to_block_id. RZ: no block_timestamps."""
+        """Disabled: no block_hashes, block_ref_counts, gpu_hash_table. RZ: no block_timestamps."""
         alloc_disabled = self._ctx(enable_prefix_caching=False).block_allocator
         assert not hasattr(alloc_disabled, 'block_hashes')
         assert not hasattr(alloc_disabled, 'block_ref_counts')
-        assert not hasattr(alloc_disabled, 'hash_to_block_id')
-        alloc_rz = self._ctx(block_evict_lru=False).block_allocator
+        assert not hasattr(alloc_disabled, 'gpu_hash_table')
+        alloc_rz = self._ctx(prefix_caching_evict_policy=PrefixCachingEvictPolicy.REF_ZERO).block_allocator
         assert not hasattr(alloc_rz, 'block_timestamps')
+
+
+# =========================================================================
+# Class 10: TestPrefixSkip
+# =========================================================================
+
+
+class TestPrefixSkip(PrefixCachingTestBase):
+    """Prefix skip: matched blocks reduce query length, shift KV offset, and adjust position IDs."""
+
+    @pytest.mark.internal
+    def test_non_chunked_partial_match(self):
+        """Non-block-aligned prompt: 3 full blocks match, suffix of 17 tokens processed."""
+        ctx = self._ctx()
+        bs = ctx.block_size_tokens  # 32
+        prompt_len = 3 * bs + 17  # 113
+
+        # Req A: establish cached blocks.
+        req_a = self._req(ctx, self._prompt(prompt_len))
+        ctx.add_request(req_a)
+        ctx.mark_pending_blocks_computed()
+        active_after_a = ctx.active_token_count
+
+        # Req B: identical prompt, non-chunked (chunk_length=None).
+        req_b = self._req(ctx, self._prompt(prompt_len), request_id=2)
+        ctx.add_request(req_b)
+
+        # 3 full blocks match; partial block (17 tokens) not registered.
+        # prefix_skip_tokens = 3 * bs = 96
+        # effective_chunk_length = 113 - 96 = 17
+        assert ctx.request_query_lengths[1].item() == 17
+        assert ctx.request_kv_length_offsets[1].item() == 3 * bs  # 96
+        assert ctx.active_token_count == active_after_a + 17
+
+        # Position IDs for req B's tokens start at effective_kv_offset.
+        b_token_start = active_after_a
+        b_token_end = b_token_start + 17
+        pos_ids = ctx.token_to_pos_ids[b_token_start:b_token_end].tolist()
+        assert pos_ids == list(range(3 * bs, 3 * bs + 17))
+
+        # request_output_lengths uses original chunk_length, not effective.
+        assert ctx.request_output_lengths[1].item() == prompt_len + 10
+
+    @pytest.mark.internal
+    def test_non_chunked_fully_cached(self):
+        """All blocks match — at least 1 token must still be processed."""
+        ctx = self._ctx()
+        bs = ctx.block_size_tokens
+        prompt_len = 4 * bs  # exactly 4 full blocks
+
+        req_a = self._req(ctx, self._prompt(prompt_len))
+        ctx.add_request(req_a)
+        ctx.mark_pending_blocks_computed()
+        active_after_a = ctx.active_token_count
+
+        req_b = self._req(ctx, self._prompt(prompt_len), request_id=2)
+        ctx.add_request(req_b)
+
+        # All 4 blocks match. prefix_skip = min(4*bs, 4*bs - 1) = 4*bs - 1.
+        # effective_chunk_length = 1.
+        assert ctx.request_query_lengths[1].item() == 1
+        assert ctx.request_kv_length_offsets[1].item() == 4 * bs - 1
+        assert ctx.active_token_count == active_after_a + 1
+
+    @pytest.mark.internal
+    def test_chunked_block_aligned(self):
+        """Chunked prefill where prior chunk ends on block boundary — prefix skip applies."""
+        ctx = self._ctx()
+        bs = ctx.block_size_tokens
+        prompt_len = 6 * bs
+
+        # Req A: establish cached blocks.
+        req_a = self._req(ctx, self._prompt(prompt_len))
+        ctx.add_request(req_a)
+        ctx.mark_pending_blocks_computed()
+
+        # Req B: same prompt, two chunks of 3*bs each.
+        req_b = self._req(ctx, self._prompt(prompt_len), request_id=2)
+        chunk_len = 3 * bs
+
+        # Chunk 1 (finished=0, block-aligned): 3 blocks match.
+        # prefix_skip = min(3*bs, 3*bs - 1) = 3*bs - 1, effective = 1.
+        ctx.add_request(req_b, chunk_length=chunk_len)
+        assert ctx.request_query_lengths[1].item() == 1
+        assert ctx.request_kv_length_offsets[1].item() == 3 * bs - 1
+
+        self._simulate_chunk_done(req_b, chunk_len)
+        ctx.mark_pending_blocks_computed()
+
+        # Chunk 2 (finished=3*bs, block-aligned): 3 more blocks match.
+        ctx.add_request(req_b, chunk_length=chunk_len)
+        assert ctx.request_query_lengths[1].item() == 1
+        assert ctx.request_kv_length_offsets[1].item() == 6 * bs - 1
+
+    @pytest.mark.internal
+    def test_chunked_non_aligned_no_skip(self):
+        """Chunked prefill where prior chunk does NOT end on block boundary — prefix skip disabled."""
+        ctx = self._ctx()
+        bs = ctx.block_size_tokens
+        prompt_len = 4 * bs
+
+        # Req A: establish cached blocks.
+        req_a = self._req(ctx, self._prompt(prompt_len))
+        ctx.add_request(req_a)
+        ctx.mark_pending_blocks_computed()
+
+        # Req B: same prompt. Chunk 1 = bs + 5 (non-aligned).
+        req_b = self._req(ctx, self._prompt(prompt_len), request_id=2)
+        chunk1_len = bs + 5
+
+        # Chunk 1 (finished=0, block-aligned): 1 block matches, skip applies.
+        ctx.add_request(req_b, chunk_length=chunk1_len)
+        self._simulate_chunk_done(req_b, chunk1_len)
+        ctx.mark_pending_blocks_computed()
+
+        # Chunk 2 (finished=bs+5, NOT block-aligned): prefix_skip_tokens = 0.
+        remaining = prompt_len - chunk1_len
+        ctx.add_request(req_b, chunk_length=remaining)
+        assert ctx.request_query_lengths[1].item() == remaining  # full chunk, no skip
+        assert ctx.request_kv_length_offsets[1].item() == chunk1_len  # = finished, no offset added
+
+    @pytest.mark.internal
+    def test_no_match_no_skip(self):
+        """No prefix match — prefix skip is zero (baseline)."""
+        ctx = self._ctx()
+        bs = ctx.block_size_tokens
+        prompt_len = 2 * bs
+
+        req_a = self._req(ctx, self._prompt(prompt_len))
+        ctx.add_request(req_a)
+        ctx.mark_pending_blocks_computed()
+        active_after_a = ctx.active_token_count
+
+        # Completely different prompt.
+        req_b = self._req(ctx, self._prompt(prompt_len, offset=10000), request_id=2)
+        ctx.add_request(req_b)
+
+        assert ctx.request_query_lengths[1].item() == prompt_len
+        assert ctx.request_kv_length_offsets[1].item() == 0
+        assert ctx.active_token_count == active_after_a + prompt_len
+
+    @pytest.mark.internal
+    def test_active_token_savings(self):
+        """Active token savings accumulate across multiple cached requests."""
+        ctx = self._ctx(max_sequence_length=1024)
+        bs = ctx.block_size_tokens
+        prompt_len = 5 * bs
+
+        req_a = self._req(ctx, self._prompt(prompt_len))
+        ctx.add_request(req_a)
+        ctx.mark_pending_blocks_computed()
+
+        # Reqs B, C, D: identical prompt. Each fully cached → 1 effective token.
+        for i in range(2, 5):
+            ctx.add_request(self._req(ctx, self._prompt(prompt_len), request_id=i))
+
+        # Req A: 5*bs tokens. Reqs B, C, D: 1 token each.
+        assert ctx.active_token_count == 5 * bs + 3
