@@ -4,6 +4,7 @@ import logging
 from argparse import ArgumentParser
 from functools import partial
 from typing import Optional
+import torch
 
 from gpt_builders import gpt_builder
 from mamba_builders import mamba_builder
@@ -17,12 +18,13 @@ from megatron.core.inference.engines import DynamicInferenceEngine
 from megatron.core.inference.model_inference_wrappers.gpt.gpt_inference_wrapper import (
     GPTInferenceWrapper,
 )
+from megatron.core.inference.quantization.utils import quantize_model_to_mxfp8
 from megatron.core.inference.text_generation_controllers.text_generation_controller import (
     TextGenerationController,
 )
 from megatron.core.tokenizers.utils.build_tokenizer import build_tokenizer
 from megatron.core.transformer.module import MegatronModule
-from megatron.core.utils import get_attr_wrapped_model, log_single_rank
+from megatron.core.utils import get_attr_wrapped_model, log_single_rank, unwrap_model
 from megatron.training import get_args
 from megatron.training import get_model as _get_model
 from megatron.training import get_tokenizer, get_wandb_writer
@@ -63,6 +65,9 @@ def get_model_for_inference() -> MegatronModule:
 
     # Eval mode.
     model.eval()
+
+    if args.transformer_impl == "inference_optimized" and args.fp8_recipe == "mxfp8":
+        quantize_model_to_mxfp8(unwrap_model(model))
 
     return model
 
