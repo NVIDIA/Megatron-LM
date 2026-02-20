@@ -118,5 +118,4 @@ MODEL_OPTIONS="\
   --lr-warmup-samples 640 \
   --lr-warmup-init 0.3e-7 \
   --no-load-optim \
-  --no-load-rng \
-  "
+  --no-load-rng "

@@ -119,6 +119,14 @@ class DistributedDataParallelConfig:
       This option will be automatically set to True when nccl_ub=True.
     """
 
+    fsdp_all_gather_in_start_param_sync: bool = True
+    """
+    If True, use all-gather during the initial Megatron-FSDP parameter
+    synchronization step. This can increase overlap between the first
+    parameter all-gather and computation, helping to better hide the
+    initial communication cost.
+    """
+
     fsdp_db_use_persist_buf_on_alloc_fail: bool = False
     """Whether to fall back to persistent buffer when a bucket does not
        fit FSDP double buffer size. If true, FSDP will use the persistently 
