@@ -170,7 +170,7 @@ jobs:
           INITIALIZED=false
           while true; do
             i=$((i + 1))
-            CHECKS_JSON=$(gh pr checks "$PR_NUMBER" --json name,state 2>/dev/null)
+            CHECKS_JSON=$(gh pr checks "$PR_NUMBER" --json name,state 2>/dev/null || echo "[]")
             if [ -n "$REQUIRED_CHECKS" ]; then
               ALL_DONE=true
               FAILED_CHECKS=""
