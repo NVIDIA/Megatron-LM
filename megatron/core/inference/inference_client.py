@@ -213,6 +213,11 @@ class InferenceClient:
         self.running.set()
         self._send_signal_to_engines(Headers.UNPAUSE)
 
+    def increment_staleness(self):
+        """Sends a signal to increment staleness on all in-flight requests."""
+        assert self.paused.is_set(), "Can only increment staleness while engines are paused."
+        self._send_signal_to_engines(Headers.INCREMENT_STALENESS)
+
     def suspend_engines(self):
         """Sends a signal to pause all inference engines."""
         self._send_signal_to_engines(Headers.PAUSE)
@@ -220,6 +225,7 @@ class InferenceClient:
 
     def resume_engines(self):
         """Sends a signal to unpause all inference engines."""
+        self.paused.clear()
         self._send_signal_to_engines(Headers.RESUME)
         self._send_signal_to_engines(Headers.UNPAUSE)
 
