@@ -1701,14 +1701,21 @@ class TECudaGraphHelper:
         # Number of microbatches to capture. The value will be set in _get_cuda_graph_input_data().
         self.num_microbatches = None
 
-        # Get callables with captureable layers.
+        self._discover_layers()
+
+        # One helper object can only capture CUDA Graphs once. Use this flag to check if the graphs
+        # have been created.
+        self._graphs_created = False
+
+    def _discover_layers(self):
+        """Discover captureable layers from the model and populate internal data structures."""
         self.chunks_with_decoder = []
         self.num_layers_per_chunk = []
         self.callables_per_chunk = []
         self.callables_per_chunk_is_mtp = []
         self.flattened_callables = []
         self.flattened_callables_is_mtp = []
-        for chunk_number, model_chunk in enumerate(model):
+        for chunk_number, model_chunk in enumerate(self.model):
             try:
                 chunk_with_decoder = get_attr_wrapped_model(
                     model_chunk, 'decoder', allow_none=False, return_model_obj=True
@@ -1733,13 +1740,13 @@ class TECudaGraphHelper:
                 callables, callables_is_mtp = [], []
                 for layer_number in range(num_decoder_layers):
                     layer = chunk_with_decoder.decoder.layers[layer_number]
-                    if _layer_is_graphable(layer, config):
+                    if _layer_is_graphable(layer, self.config):
                         num_graphable_layers += 1
                         callables.append(layer)
                         callables_is_mtp.append(False)
                 for layer_number in range(num_mtp_layers):
                     layer = chunk_with_decoder.mtp.layers[layer_number].mtp_model_layer
-                    if _layer_is_graphable(layer, config):
+                    if _layer_is_graphable(layer, self.config):
                         num_graphable_layers += 1
                         callables.append(layer)
                         callables_is_mtp.append(True)
@@ -1774,10 +1781,6 @@ class TECudaGraphHelper:
             msg=f'Rank {torch.distributed.get_rank()}: '
             f'{len(self.flattened_callables)} graphable layers.',
         )
-
-        # One helper object can only capture CUDA Graphs once. Use this flag to check if the graphs
-        # have been created.
-        self._graphs_created = False
 
     def graphs_created(self):
         """
@@ -2571,33 +2574,19 @@ class VisionTECudaGraphHelper(TECudaGraphHelper):
         micro_batch_size: int,
         num_microbatches: int = 1,
     ):
-        assert HAVE_TE_GRAPHS, "CUDA Graphs are not supported without TransformerEngine."
-        assert (
-            vision_config.cuda_graph_impl == "transformer_engine"
-        ), "vision_config.cuda_graph_impl must be 'transformer_engine' to use VisionTECudaGraphHelper."
-        assert (
-            "expandable_segments:True" not in os.getenv("PYTORCH_CUDA_ALLOC_CONF", "")
-            or os.getenv("NCCL_GRAPH_REGISTER", "") == "0"
-        ), (
-            "Setting NCCL_GRAPH_REGISTER=0 to avoid illegal memory access when using "
-            "CUDA Graph with PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True."
-        )
-
-        self.model = model
-        self.config = vision_config
-        self.seq_length = vision_seq_length
+        super().__init__(model, vision_config, vision_seq_length, micro_batch_size)
         # Vision encoder concatenates all images along the sequence dimension
         # with a fixed batch dimension of 1, regardless of the training MBS.
         self.micro_batch_size = 1
-        self.optimizers = []
         self.num_model_chunks = 1
         self.num_microbatches = num_microbatches
 
-        # -- discover vision encoder layers --------------------------------
+    def _discover_layers(self):
+        """Discover captureable layers from the vision encoder."""
         self.vision_model = None
         vision_layers = []
 
-        for model_chunk in model:
+        for model_chunk in self.model:
             try:
                 unwrapped = get_attr_wrapped_model(
                     model_chunk, 'vision_model', allow_none=True, return_model_obj=True
@@ -2613,10 +2602,9 @@ class VisionTECudaGraphHelper(TECudaGraphHelper):
                 self.vision_model.decoder, 'layers'
             ):
                 for layer in self.vision_model.decoder.layers:
-                    if _layer_is_graphable(layer, vision_config):
+                    if _layer_is_graphable(layer, self.config):
                         vision_layers.append(layer)
 
-        # -- populate parent-compatible data structures --------------------
         if vision_layers:
             self.chunks_with_decoder = [self.vision_model]
             self.num_layers_per_chunk = [len(vision_layers)]
@@ -2644,10 +2632,8 @@ class VisionTECudaGraphHelper(TECudaGraphHelper):
         if vision_layers:
             logger.info(
                 f"VisionTECudaGraphHelper: Found {self.num_layers} graphable vision encoder "
-                f"layers. seq_length={vision_seq_length} (all images concatenated, batch_dim=1)"
+                f"layers. seq_length={self.seq_length} (all images concatenated, batch_dim=1)"
             )
-
-        self._graphs_created = False
 
     # -- sample argument generation ----------------------------------------
     # The parent's _get_sample_arguments uses complex buffer-reuse
