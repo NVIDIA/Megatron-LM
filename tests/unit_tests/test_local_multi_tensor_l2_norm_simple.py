@@ -1,6 +1,5 @@
 import torch
 import math
-import pytest
 from megatron.core.utils import local_multi_tensor_l2_norm
 
 def test_l2_norm_simple():
