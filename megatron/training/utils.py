@@ -647,6 +647,7 @@ def get_batch_on_this_tp_rank(data_iterator, mtp_on_this_rank: bool = False):
             )
         else:
             max_seqlen = None
+        
         local_cp_size = torch.empty(
             1,
             dtype=torch.int32,

@@ -27,7 +27,6 @@ from megatron.core.transformer.torch_norm import LayerNormBuilder
 from megatron.core.transformer.transformer_block import TransformerBlockSubmodules
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.typed_torch import apply_module
-
 from megatron.core.utils import (
     get_pg_rank,
     is_torch_min_version,
@@ -268,11 +267,13 @@ def _roll_tensor_packed_seq(tensor, shifts, dims, packed_seq_params, cp_group=No
         # the idx has been multiplied by cp_size, need to divide it by cp_size to get the local idx
         local_start_idx = start_idx // cp_size
         local_end_idx = end_idx // cp_size
+
         # Skip empty sequences - this can happen when a sequence is very short and
         # after dividing by cp_size, the local slice has zero length
         local_seq_len = local_end_idx - local_start_idx
         if local_seq_len == 0:
             continue
+
         tensor_slice = rolled_tensor[..., local_start_idx:local_end_idx].clone()
 
         # The following code is very similar as the code in roll_tensor function
@@ -284,10 +285,12 @@ def _roll_tensor_packed_seq(tensor, shifts, dims, packed_seq_params, cp_group=No
         for chunk in rolled_chunks:
             # Skip empty chunks that can occur when the sequence slice is very small
             if chunk.size(dims) == 0:
-                empty_shape = list(chunk.shape)
-                empty_shape[dims] = 0
-                tensor_send_list.append(torch.empty(chunk.shape[:-1], dtype=chunk.dtype, device=chunk.device))
-                tensor_recv_list.append(torch.empty(chunk.shape[:-1], dtype=chunk.dtype, device=chunk.device))
+                tensor_send_list.append(
+                    torch.empty(chunk.shape[:-1], dtype=chunk.dtype, device=chunk.device)
+                )
+                tensor_recv_list.append(
+                    torch.empty(chunk.shape[:-1], dtype=chunk.dtype, device=chunk.device)
+                )
                 continue
             boundary = chunk.select(dims, shifts).contiguous().clone()
             tensor_send_list.append(boundary)
@@ -424,7 +427,6 @@ class MultiTokenPredictionLayerSubmodules:
 
     eh_proj: Union[ModuleSpec, type] = None
     mtp_model_layer: Union[ModuleSpec, type] = None
-    layer_norm: Union[ModuleSpec, type] = None
 
 
 def get_mtp_layer_spec(
@@ -640,12 +642,20 @@ def process_mtp_loss(
     Returns:
         Tensor: Updated hidden states after MTP loss processing (first chunk only).
     """
-    mtp_labels = labels.clone()
     hidden_states_list = torch.chunk(hidden_states, 1 + config.mtp_num_layers, dim=0)
     hidden_states = hidden_states_list[0]
 
+    if labels is None:
+        return hidden_states
+
+    mtp_labels = labels.clone()
     if loss_mask is None:
         loss_mask = torch.ones_like(mtp_labels)
+
+    # Store the original number of tokens before rolling for proper normalization
+    # when calculate_per_token_loss is enabled. This ensures MTP gradients are
+    # correctly scaled relative to the main loss gradients in finalize_model_grads.
+    original_num_tokens = loss_mask.sum()
 
     for mtp_layer_number in range(config.mtp_num_layers):
         mtp_logits, _ = output_layer(
@@ -791,29 +801,6 @@ class MultiTokenPredictionLayer(MegatronModule):
         # 2. GPT path: single TransformerLayer
         if mtp_layer_pattern is not None and mamba_submodules is not None:
             from megatron.core.ssm.mamba_block import MambaStack
-
-            self.mtp_model_layer = MambaStack(
-                config=self.config,
-                submodules=mamba_submodules,
-                hybrid_override_pattern=mtp_layer_pattern,
-                pre_process=True,  # Always receives input from eh_proj
-                post_layer_norm=False,  # MTP has its own final_layernorm
-                post_process=True,  # MTP layer is self-contained
-                pg_collection=pg_collection,
-                is_mtp_layer=True,
-            )
-        elif self.config.mtp_num_layers is not None:
-            # GPT path: Uses the transformer block spec for MTP layer
-            # MTP inner layers use their own layer numbering (self.layer_number = 1, 2, etc.)
-            # rather than continuing from decoder layer numbers. This is consistent with the
-            # Mamba path and ensures proper aux loss tracking in router.py.
-            self.mtp_model_layer = build_module(
-                self.submodules.mtp_model_layer,
-                config=self.config,
-                vp_stage=self.vp_stage,
-                layer_number=self.layer_number,
-                is_mtp_layer=True,
-            )
 
             self.mtp_model_layer = MambaStack(
                 config=self.config,
@@ -1082,15 +1069,6 @@ class MultiTokenPredictionLayer(MegatronModule):
             packed_seq_params=packed_seq_params,
         )
 
-        # Roll RoPE to match rolled positions (position_ids were rolled in _get_embeddings)
-        # After rolling, index i should use RoPE for position i+1
-        if rotary_pos_emb is not None:
-            rotary_pos_emb = torch.roll(rotary_pos_emb, shifts=-1, dims=0)
-        if rotary_pos_cos is not None:
-            rotary_pos_cos = torch.roll(rotary_pos_cos, shifts=-1, dims=0)
-        if rotary_pos_sin is not None:
-            rotary_pos_sin = torch.roll(rotary_pos_sin, shifts=-1, dims=0)
-
         if self.config.recompute_granularity == 'full' and self.training:
             hidden_states = self._checkpointed_forward(
                 self._proj_and_transformer_layer,
@@ -1219,8 +1197,8 @@ class MultiTokenPredictionBlock(MegatronModule):
     When `mtp_use_repeated_layer=True` in config, instead of creating N separate MTP layers,
     only 1 layer is created and applied mtp_num_layers times.
 
-    for more information, please refer to DeepSeek-V3 Technical Report
-    https://github.com/deepseek-ai/DeepSeek-V3/blob/main/DeepSeek_V3.pdf
+    For more information, please refer to DeepSeek-V3 Technical Report
+    https://arxiv.org/pdf/2412.19437.pdf
     """
 
     def __init__(
