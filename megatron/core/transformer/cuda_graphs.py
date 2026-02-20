@@ -1586,7 +1586,7 @@ class CudaGraphManager(torch.nn.Module):
                     runner.fwd_graph_recorded = True
                     runner.cudagraph_created = True
                     runner = runner.eval()
-                    
+
                     # Record this to the global execution record
                     _CudagraphGlobalRecord.cudagraph_inference_record.append(
                         (runner, "fwd", args, kwargs)
