@@ -167,6 +167,7 @@ jobs:
 
           echo "Waiting for required checks to complete on PR #$PR_NUMBER..."
           i=0
+          INITIALIZED=false
           while true; do
             i=$((i + 1))
             CHECKS_JSON=$(gh pr checks "$PR_NUMBER" --json name,state 2>/dev/null)
@@ -179,9 +180,16 @@ jobs:
                   *success*|*pass*|*skip*|*neutral*) ;;
                   *pending*|*queued*|*progress*|*waiting*|*request*|"")
                     ALL_DONE=false
+                    INITIALIZED=true
                     break
                     ;;
-                  *) FAILED_CHECKS="${FAILED_CHECKS}  - ${check} (${CHECK_STATE})"$'\n' ;;
+                  *)
+                    if [ "$INITIALIZED" = "true" ]; then
+                      FAILED_CHECKS="${FAILED_CHECKS}  - ${check} (${CHECK_STATE})"$'\n'
+                    else
+                      ALL_DONE=false
+                    fi
+                    ;;
                 esac
               done <<< "$REQUIRED_CHECKS"
               if [ "$ALL_DONE" = "true" ]; then
