@@ -20,6 +20,7 @@ import numpy as np
 import torch
 from typing import Optional, Union, List, Dict, Any
 from torch.distributed.checkpoint import FileSystemReader, default_planner
+from torch import multiprocessing as torch_mp
 
 from megatron.core import dist_checkpointing, mpu, tensor_parallel
 from megatron.core.dist_checkpointing.mapping import ShardedObject
@@ -74,6 +75,7 @@ from ml_flashpoint.adapter.megatron.save_strategies import (
 from ml_flashpoint.adapter.megatron.load_strategies import MLFlashpointMegatronLoadStrategy
 from ml_flashpoint.checkpoint_object_manager.checkpoint_object_manager import CheckpointObjectManager
 from ml_flashpoint.core.checkpoint_loader import DefaultMLFlashpointCheckpointLoader
+from ml_flashpoint.core.checkpoint_saver import DefaultMLFlashpointCheckpointSaver
 from ml_flashpoint.replication.replication_manager import ReplicationManager
 
 # # Instantiate the MemoryStorageWriter
@@ -653,6 +655,33 @@ def save_checkpoint(iteration, model, optimizer, opt_param_scheduler, num_floati
                 checkpointing_context['save_strategy'] = save_strategy
             end_ckpt = time()
             logger.debug(f"rank: {rank}, takes {end_ckpt - start_ckpt} to prepare state dict for ckpt ")
+            
+            if args.use_ml_flashpoint:
+                # Initialize dependencies (shared singletons)
+                checkpoint_object_manager = CheckpointObjectManager()
+                replication_manager = ReplicationManager()
+                replication_manager.initialize(checkpoint_object_manager)
+
+                # Instantiate the StorageWriter
+                memory_storage_writer = MemoryStorageWriter(
+                    checkpoint_saver=DefaultMLFlashpointCheckpointSaver(
+                        global_rank_getter=torch.distributed.get_rank,
+                        local_rank_getter=torch.distributed.get_node_local_rank,
+                        global_barrier_func=lambda: torch.distributed.barrier(),
+                        ckpt_obj_manager=checkpoint_object_manager,
+                        replication_manager=replication_manager,
+                        # initial_buffer_size_bytes=initial_write_buffer_size_bytes, # Optional - increase for larger checkpoint sizes per rank
+                    ),
+                    mp_manager=torch_mp.Manager(),
+                    thread_count=4,
+                )
+
+                # Use it to instantiate the Save Strategy
+                megatron_save_strategy = MLFlashpointMegatronAsyncSaveStrategy(
+                    storage_writer=memory_storage_writer,
+                )
+                save_strategy = megatron_save_strategy
+
             async_save_request = dist_checkpointing.save(state_dict, checkpoint_name, save_strategy,
                                                          async_sharded_save=args.async_save,
                                                          validate_access_integrity=validate_sharding_integrity,
@@ -1147,26 +1176,29 @@ def _load_global_dist_base_checkpoint(
             load_strategy, mpu.get_data_parallel_group(with_context_parallel=True)
         )
     
-    # Initialize dependencies (shared singletons)
-    checkpoint_object_manager = CheckpointObjectManager()
-    replication_manager = ReplicationManager()
-    replication_manager.initialize(checkpoint_object_manager)
+    if args.use_ml_flashpoint:
+        print_rank_0("ML FLASHPOINT STRATEGY IS ACTIVATED.")
+        # Initialize dependencies (shared singletons)
+        checkpoint_object_manager = CheckpointObjectManager()
+        replication_manager = ReplicationManager()
+        replication_manager.initialize(checkpoint_object_manager)
 
-    checkpoint_loader = DefaultMLFlashpointCheckpointLoader(
-        checkpoint_object_manager=checkpoint_object_manager,
-        replication_manager=replication_manager,
-    )
+        checkpoint_loader = DefaultMLFlashpointCheckpointLoader(
+            checkpoint_object_manager=checkpoint_object_manager,
+            replication_manager=replication_manager,
+        )
 
-    # Instantiate the Load Strategy with the dependencies
-    mlflashpoint_load_strategy = MLFlashpointMegatronLoadStrategy(
-        replication_manager=replication_manager,
-        checkpoint_loader=checkpoint_loader,
-    )
+        # Instantiate the Load Strategy with the dependencies
+        mlflashpoint_load_strategy = MLFlashpointMegatronLoadStrategy(
+            replication_manager=replication_manager,
+            checkpoint_loader=checkpoint_loader,
+        )
+
+        load_strategy = mlflashpoint_load_strategy
 
     if checkpointing_context is not None:
-        checkpointing_context["load_strategy"] = mlflashpoint_load_strategy
+        checkpointing_context["load_strategy"] = load_strategy
 
-    print("YES YOU ARE HERE")
     state_dict = dist_checkpointing.load(
         sharded_state_dict=sharded_state_dict,
         checkpoint_dir=checkpoint_name,
