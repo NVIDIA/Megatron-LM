@@ -643,7 +643,7 @@ class TransformerBlock(GraphableMegatronModule, MegatronModule):
         if self.config.cuda_graph_impl == "local" and not hasattr(self, 'cudagraph_manager'):
             # lazily initialize the cudagraph manager for inference
             # the default training codepath does not initialize it,
-            # as it uses FullCudaGraphWrapper wrapper. 
+            # as it uses FullCudaGraphWrapper wrapper.
             self._init_cudagraph_manager(self.config)
         if self._should_call_local_cudagraph(*args, **kwargs):
             kwargs['hidden_states'] = (

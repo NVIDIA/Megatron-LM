@@ -198,6 +198,7 @@ class GraphableMegatronModule(MegatronModule):
             self.create_mcore_cudagraph_manager(config)
         else:
             from megatron.core.transformer.cuda_graphs import CudaGraphManager
+
             self.cudagraph_manager = CudaGraphManager(config)
 
     def init_backward_dw_wrapper(self):

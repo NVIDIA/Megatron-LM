@@ -279,7 +279,7 @@ class MambaStack(GraphableMegatronModule, MegatronModule):
             if not hasattr(self, 'cudagraph_manager'):
                 # lazily initialize the cudagraph manager for inference
                 # the default training codepath does not initialize it,
-                # as it uses FullCudaGraphWrapper wrapper. 
+                # as it uses FullCudaGraphWrapper wrapper.
                 self._init_cudagraph_manager(self.config)
             if kwargs['inference_context'].is_static_batching():
                 using_cuda_graph = kwargs['inference_context'].is_decode_only()
@@ -294,7 +294,7 @@ class MambaStack(GraphableMegatronModule, MegatronModule):
         if self.config.cuda_graph_impl == "local" and not hasattr(self, 'cudagraph_manager'):
             # lazily initialize the cudagraph manager for inference
             # the default training codepath does not initialize it,
-            # as it uses FullCudaGraphWrapper wrapper. 
+            # as it uses FullCudaGraphWrapper wrapper.
             self._init_cudagraph_manager(self.config)
 
         if self._should_call_local_cudagraph(*args, **kwargs):
