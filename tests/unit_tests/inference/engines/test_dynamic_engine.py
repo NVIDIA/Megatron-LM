@@ -124,7 +124,7 @@ class DynamicEngineTestConfig:
     skip_prompt_log_probs: bool = False
     enable_chunked_prefill: bool = False
     cuda_graph_scope: List[CudaGraphScope] = field(
-        default_factory=lambda: [CudaGraphScope.full_iteration]
+        default_factory=lambda: [CudaGraphScope.full_iteration_inference]
     )
     force_build_cuda_graphs: bool = False
     transformer_impl: str = "local"
@@ -544,7 +544,7 @@ class TestDynamicInferenceEngine:
     )
     @pytest.mark.parametrize("model_provider", ["gpt", "mamba"])
     @pytest.mark.parametrize("num_cuda_graphs", [None, 1, 4])
-    @pytest.mark.parametrize("cuda_graph_scope", [[], [CudaGraphScope.full_iteration]])
+    @pytest.mark.parametrize("cuda_graph_scope", [[], [CudaGraphScope.full_iteration_inference]])
     def test_simple(self, model_provider, num_cuda_graphs, cuda_graph_scope) -> None:
         """Simple test that runs without errors, and validates output."""
         skip_if_mamba_sequence_packing_not_available(model_provider)
@@ -566,7 +566,7 @@ class TestDynamicInferenceEngine:
             assert env.engine.context.cuda_graph_token_counts is not None
             assert env.engine.context.cuda_graph_batch_dimensions_list
             model = env.engine.controller.inference_wrapped_model.model
-            if cuda_graph_scope == [CudaGraphScope.full_iteration]:
+            if cuda_graph_scope == [CudaGraphScope.full_iteration_inference]:
                 # check if cudagraph runners are created at the decoder level
                 assert model.decoder.cudagraph_manager.cudagraph_runners
             else:

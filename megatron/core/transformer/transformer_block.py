@@ -622,7 +622,7 @@ class TransformerBlock(GraphableMegatronModule, MegatronModule):
         """
         if (
             not self.training
-            and hasattr(self, 'cudagraph_manager')  
+            and hasattr(self, 'cudagraph_manager')
             and kwargs['attention_mask'] is None
             and (
                 kwargs.get('inference_context') is not None
