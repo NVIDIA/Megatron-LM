@@ -1617,6 +1617,10 @@ class DynamicInferenceEngine(AbstractEngine):
                 self.suspend_signal = True
             elif header == Headers.RESUME:
                 self.suspend_signal = False
+            elif header == Headers.INCREMENT_STALENESS:
+                waiting = set(self.waiting_request_ids)
+                for request_id, entry in self.requests.items():
+                    entry.record.increment_staleness(policy_only=request_id in waiting)
             elif header == Headers.STOP:
                 self.received_stop = True
             else:
