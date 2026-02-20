@@ -560,16 +560,6 @@ def get_environment_rollouts(
                     # Just set up space to collect the rollouts
                     rollouts = [[None for _ in range(samples_per_group)] for _ in range(n_prompts)]
 
-        # Catch-up staleness increment: rollouts need to have their staleness values adjusted
-        # due to the gap between when they finished and the current step.
-        if rank == 0:
-            for group in rollouts:
-                for rollout in group:
-                    gap = args.curr_iteration - max(rollout.completed_at_step)
-                    if gap > 0:
-                        rollout.policy_staleness = [[s + gap for s in turn] for turn in rollout.policy_staleness]
-                        rollout.kv_cache_staleness = [[s + gap for s in turn] for turn in rollout.kv_cache_staleness]
-
         with nvtx_range("sync-rollouts"):
             # Wait for Rollouts to be collected
             # TODO(jbarker): double check why this isn't causing rank 0 memory allocations
@@ -1228,7 +1218,7 @@ def prepare_data_for_update(
     tokenizer: MegatronTokenizer,
     sequence_packing: bool,
     is_correction: bool,
-) -> RerunDataIterator:
+) -> tuple[RerunDataIterator, RolloutStats, dict]:
     """Extract data for the update from raw rollouts.
 
     Args:
@@ -1240,7 +1230,7 @@ def prepare_data_for_update(
         is_correction: Prepare data for IS correction if True.
 
     Returns:
-        Cycled iterator over dataset batches. In GRPO we might want to go over the same data multiple times.
+        Tuple of (cycled iterator over dataset batches, group stats, example groups per env).
     """
     args = get_args()
     nvtx_range = get_nvtx_range()
@@ -1493,15 +1483,7 @@ def prepare_data_for_update(
                 loader = DataLoader(data, batch_size=args.micro_batch_size)
 
 
-        with nvtx_range("log-wandb-tb"):
-            maybe_log_training_metrics(
-                group_stats=group_stats,
-                current_iteration=args.curr_iteration,
-                tokenizer=tokenizer,
-                example_groups=example_groups,
-            )
-
-    return RerunDataIterator(itertools.cycle(loader))
+    return RerunDataIterator(itertools.cycle(loader)), group_stats, example_groups
 
 
 def get_grpo_data_iterator(
@@ -1541,26 +1523,37 @@ def get_grpo_data_iterator(
         RerunDataIterator for the current training step
     """
     runtime_state = get_rl_runtime_state()
+    tokenizer = get_tokenizer()
 
     # We collect new rollouts when we've gone over the collected data 'grpo_iterations' times.
-    global_batches_per_collection = (grpo_prompts_per_step * grpo_group_size) // global_batch_size 
+    global_batches_per_collection = (grpo_prompts_per_step * grpo_group_size) // global_batch_size
     if (
         buffered_rollouts is None or
-        iteration == runtime_state.last_collection_iteration + 
+        iteration == runtime_state.last_collection_iteration +
         (grpo_iterations * global_batches_per_collection)
     ):
 
-        buffered_rollouts = get_environment_rollouts(
+        rollouts = get_environment_rollouts(
             model, inference_model, optimizer, grpo_prompts_per_step, grpo_group_size
         )
-        buffered_rollouts = prepare_data_for_update(model=model, 
-            ref_state_dict=ref_state_dict, 
-            rollouts=buffered_rollouts,
-            tokenizer=get_tokenizer(),
+        buffered_rollouts, group_stats, example_groups = prepare_data_for_update(
+            model=model,
+            ref_state_dict=ref_state_dict,
+            rollouts=rollouts,
+            tokenizer=tokenizer,
             sequence_packing=sequence_packing,
             is_correction=is_correction,
-            )
+        )
+        runtime_state.group_stats = group_stats
+        runtime_state.example_groups = example_groups
         runtime_state.reset_iteration_counters(iteration)
+
+    maybe_log_training_metrics(
+        group_stats=runtime_state.group_stats,
+        current_iteration=iteration,
+        tokenizer=tokenizer,
+        example_groups=runtime_state.example_groups,
+    )
 
     return buffered_rollouts
 
