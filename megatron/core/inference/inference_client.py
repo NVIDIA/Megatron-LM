@@ -74,7 +74,6 @@ class InferenceClient:
         self._loop = None
         self.running = asyncio.Event()
         self.paused = asyncio.Event()
-        self.stopped = asyncio.Event()
 
         self.socket = socket
         self.completion_futures = {}
@@ -175,7 +174,6 @@ class InferenceClient:
         self._loop = get_asyncio_loop(loop)
         self.running.set()
         self.paused.clear()
-        self.stopped.clear()
         self._connect_with_inference_coordinator()
         self.listener_task = self._loop.create_task(self._recv_task())
 
@@ -191,16 +189,18 @@ class InferenceClient:
         self.socket.send(payload_serialized)
 
     def pause_engines(self) -> Awaitable:
-        """Sends PAUSE to all engines via coordinator.
+        """Sends PAUSE to all engines via coordinator. Idempotent.
 
-        The coordinator broadcasts PAUSE. Each engine reaches EP consensus,
-        then sends PAUSE_ACK. The coordinator collects all ACKs and re-broadcasts.
-        This awaitable resolves when the coordinator confirms all engines are paused.
+        If already paused, returns immediately without sending a signal.
+        Otherwise, the coordinator broadcasts PAUSE, each engine reaches EP
+        consensus, then sends PAUSE_ACK.  The coordinator collects all ACKs
+        and notifies the client.
 
         Returns:
             Awaitable: Resolves when all engines are globally paused.
         """
-        self._send_signal_to_engines(Headers.PAUSE)
+        if not self.paused.is_set():
+            self._send_signal_to_engines(Headers.PAUSE)
         return self.paused.wait()
 
     def unpause_engines(self) -> None:

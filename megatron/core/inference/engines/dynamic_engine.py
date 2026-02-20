@@ -247,13 +247,13 @@ class DynamicInferenceEngine(AbstractEngine):
         # Runtime state.
         self._loop = get_asyncio_loop(getattr(self, "_loop", None))
         self._cond = asyncio.Condition()
-        self.state = EngineState.RUNNING
-
-        # asyncio.Event objects for external waiters (set as side effects of state transitions).
         self.running = asyncio.Event()
+        self.running.set()
         self.paused = asyncio.Event()
         self.suspended = asyncio.Event()
         self.stopped = asyncio.Event()
+        self.state = EngineState.RUNNING
+        self._pending_signals = deque()
 
 
         # Legacy flag used by suspend/resume GPU offload logic and run_engine (non-coordinator).
@@ -1594,7 +1594,10 @@ class DynamicInferenceEngine(AbstractEngine):
                 all_messages = []
 
         range_pop()
-        for message in all_messages:
+        self._pending_signals.extend(all_messages)
+
+        while self._pending_signals:
+            message = self._pending_signals.popleft()
             data = msgpack.unpackb(message, raw=False)
             header = Headers(data[0])
 
@@ -1606,11 +1609,20 @@ class DynamicInferenceEngine(AbstractEngine):
                 range_pop()
 
             elif header == Headers.PAUSE:
-                assert self.state == EngineState.RUNNING, (
-                    f"Received PAUSE in state {self.state}"
-                )
-                self.state = EngineState.PAUSING
-                self.running.clear()
+                if self.state == EngineState.RUNNING:
+                    self.state = EngineState.PAUSING
+                    self.running.clear()
+                elif self.state in (EngineState.PAUSED, EngineState.SUSPENDING,
+                                    EngineState.SUSPENDED, EngineState.RESUMING):
+                    # Already idle — re-send ACK so coordinator can confirm.
+                    if self.is_mp_coordinator:
+                        payload = msgpack.packb(
+                            [Headers.PAUSE_ACK.value], use_bin_type=True
+                        )
+                        self.socket_for_receiving_requests.send(payload)
+                # PAUSING: consensus in progress, ACK will come naturally.
+                # STOPPING/STOPPED: shutting down, ignore.
+                break
 
             elif header == Headers.UNPAUSE:
                 assert self.state == EngineState.PAUSED, (
@@ -1619,6 +1631,7 @@ class DynamicInferenceEngine(AbstractEngine):
                 self.state = EngineState.RUNNING
                 self.paused.clear()
                 self.running.set()
+                break
 
             elif header == Headers.SUSPEND:
                 assert self.state == EngineState.PAUSED, (
@@ -1626,6 +1639,7 @@ class DynamicInferenceEngine(AbstractEngine):
                 )
                 self.suspend()  # GPU memory offload
                 self.state = EngineState.SUSPENDING
+                break
 
             elif header == Headers.RESUME:
                 assert self.state == EngineState.SUSPENDED, (
@@ -1634,6 +1648,7 @@ class DynamicInferenceEngine(AbstractEngine):
                 self.suspended.clear()
                 self.resume()  # GPU memory onload
                 self.state = EngineState.RESUMING
+                break
 
             elif header == Headers.INCREMENT_STALENESS:
                 waiting = set(self.waiting_request_ids)
@@ -1641,11 +1656,14 @@ class DynamicInferenceEngine(AbstractEngine):
                     entry.record.increment_staleness(policy_only=request_id in waiting)
 
             elif header == Headers.STOP:
-                assert self.state == EngineState.PAUSED, (
+                assert self.state in (EngineState.PAUSED, EngineState.SUSPENDED), (
                     f"Received STOP in state {self.state}"
                 )
+                if self.state == EngineState.SUSPENDED:
+                    self.suspended.clear()
                 self._cancel_all_request_futures()
                 self.state = EngineState.STOPPING
+                break
 
             else:
                 raise UnknownHeaderError(header)
@@ -1663,24 +1681,36 @@ class DynamicInferenceEngine(AbstractEngine):
         self.waiting_request_ids.clear()
         self.requests.clear()
 
-    def stop(self):
-        """
-        Stops the inference engine by terminating the inference coordinator process
-        if it exists, and destroys the model parallel state.
-        This method ensures that any running inference coordinator subprocess
-        is properly terminated, and cleans up resources associated with
-        model parallelism.
-        """
+    def close(self):
+        """Close this engine's ZMQ sockets. Idempotent.
 
-        if hasattr(self, "inference_coordinator_process"):
-            self.inference_coordinator_process.join()
-        for socket in self.zmq_sockets:
+        Called by run_engine_with_coordinator's finally block to ensure
+        sockets are cleaned up on any exit path (clean STOP, cancellation,
+        or exception).  Does NOT terminate the singleton zmq context —
+        that is process-lifetime and shared across engines.
+        """
+        for socket in getattr(self, 'zmq_sockets', []):
             socket.close()
+        if hasattr(self, 'zmq_sockets'):
+            self.zmq_sockets.clear()
         if hasattr(self, "expert_parallel_zmq_communicator"):
             self.expert_parallel_zmq_communicator.close()
         if hasattr(self, "data_parallel_zmq_communicator"):
             self.data_parallel_zmq_communicator.close()
-        self.zmq_context.term()
+
+    def stop(self):
+        """Emergency teardown: terminate the coordinator process, close sockets.
+
+        Only needed when the engine loop was cancelled or crashed without
+        sending STOP — the coordinator may still be alive.  On the clean
+        shutdown path (kill → PAUSE → STOP), the coordinator exits on its
+        own after broadcasting STOP and the engine loop's finally block
+        closes sockets, so this method is unnecessary.
+        """
+        if hasattr(self, "inference_coordinator_process"):
+            self.inference_coordinator_process.terminate()
+            self.inference_coordinator_process.join()
+        self.close()
 
     @trace_async_exceptions
     async def run_engine(self, *, loop: Optional[asyncio.AbstractEventLoop] = None):
@@ -1751,8 +1781,6 @@ class DynamicInferenceEngine(AbstractEngine):
         """
         self._loop = get_asyncio_loop(loop)
         self.use_coordinator = True
-        self.state = EngineState.RUNNING
-        self.running.set()
 
         try:
             while True:
@@ -1824,8 +1852,9 @@ class DynamicInferenceEngine(AbstractEngine):
                     self.stopped.set()
                     if self.rank == 0:
                         logging.info("Stopping engine.")
-                    self.stop()
                     break
 
         except asyncio.CancelledError:
             pass
+        finally:
+            self.close()
