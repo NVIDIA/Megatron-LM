@@ -173,7 +173,12 @@ class GraphableMegatronModule(MegatronModule):
             config.cuda_graph_impl == "local"
             and CudaGraphScope.full_iteration not in config.cuda_graph_scope
         ):
-            self._init_cudagraph_manager(config)
+            if hasattr(self, "create_mcore_cudagraph_manager"):
+                self.create_mcore_cudagraph_manager(config)
+            else:
+                from megatron.core.transformer.cuda_graphs import CudaGraphManager
+
+                self.cudagraph_manager = CudaGraphManager(config)
         elif config.cuda_graph_impl == "transformer_engine":
             # List to store CUDA graphs. A list of `N` CUDA graphs for this layer where N is
             # the number of microbatches. Multiple CUDA graphs per layer is required to support
@@ -192,14 +197,6 @@ class GraphableMegatronModule(MegatronModule):
             # calls wgrad computation in attention module (contains attn and shared expert)
             # according to CUDA graph scope.
             self.cuda_graph_backward_dw_wrapper = None
-
-    def _init_cudagraph_manager(self, config):
-        if hasattr(self, "create_mcore_cudagraph_manager"):
-            self.create_mcore_cudagraph_manager(config)
-        else:
-            from megatron.core.transformer.cuda_graphs import CudaGraphManager
-
-            self.cudagraph_manager = CudaGraphManager(config)
 
     def init_backward_dw_wrapper(self):
         """Initialize the backward_dw_wrapper."""
