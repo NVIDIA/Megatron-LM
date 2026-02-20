@@ -6,6 +6,7 @@ import math
 import random
 import types
 from dataclasses import dataclass, field
+from functools import partial
 from typing import Dict, List, Optional, Tuple
 
 import pytest
@@ -73,6 +74,17 @@ def set_rounder(value):
     DynamicInferenceContext.ROUNDER = value  # For backwards compatibility
     DynamicInferenceContext.TOKEN_ROUNDER = value
     DynamicInferenceContext.REQUEST_ROUNDER = value
+
+
+def mock_forward(input_ids, position_ids, attention_mask, *args, **kwargs):
+    """Mock forward function to avoid numerics issues with random inputs."""
+    return torch.randn(
+        input_ids.size(0),
+        input_ids.size(1),
+        kwargs["vocab_size"],
+        device=input_ids.device,
+        dtype=torch.bfloat16,
+    )
 
 
 @dataclass
@@ -1233,19 +1245,10 @@ class TestDynamicInferenceEngine:
         env = self._build_test_env(test_config)
         ctx = env.engine.context
 
-        def mock_forward(input_ids, position_ids, attention_mask, *args, **kwargs):
-            return torch.randn(
-                input_ids.size(0),
-                input_ids.size(1),
-                test_config.vocab_size,
-                device=input_ids.device,
-                dtype=torch.bfloat16,
-            )
-
         # Mock the model forward function to avoid possible numerics issues
         # caused by random inputs
         model_instance = env.engine.controller.inference_wrapped_model.model
-        model_instance.forward = mock_forward
+        model_instance.forward = partial(mock_forward, vocab_size=test_config.vocab_size)
 
         # Request 1: 150 tokens
         req1_tokens = torch.randint(0, test_config.vocab_size, (130,), device='cuda')
@@ -1412,6 +1415,105 @@ class TestDynamicInferenceEngine:
 
         # Verify that request 3 has finished
         assert req3.status == Status.COMPLETED
+
+    @pytest.mark.internal
+    @pytest.mark.skipif(
+        not is_fa_min_version("2.7.3"), reason="need latest flash attn for dynamic batching"
+    )
+    @torch.inference_mode()
+    def test_chunked_prefill_avoid_single_token_chunk(self):
+        """
+        Test that chunked prefill scheduling avoids leaving exactly 1 token for the final chunk.
+        This leads to a known bug in the Flash Attention kernel:
+        https://github.com/Dao-AILab/flash-attention/issues/1537
+
+        Scenario:
+            - Max tokens per step (Chunk Size): 256
+            - Request prompt length: 512
+
+        Note that for all chunks after the first chunk we subtract 1 from the active token
+        count, so the chunk size will be 1 less.
+
+        Default scheduling would do:
+            1. Chunk 256 (Remaining 256)
+            2. Chunk 255 (Remaining 1) -> max_seqlen_q=1 triggers decode path in kernel
+            3. Chunk 1
+
+        Fixed scheduling should do:
+            1. Chunk 256 (Remaining 256) -> 256 - 256 != 1. Schedule full 256.
+            2. Chunk 254 (Remaining 2)   -> 256 tokens left. If we take 255, 1 remains.
+                                            So we reduce chunk to 254.
+            3. Chunk 2   (Remaining 0)
+        """
+        chunk_size = 256
+        # Prompt length designed to trigger the edge case: Chunk + (Chunk + 1)
+        # 256 + 256 = 512
+        prompt_len = 512
+
+        test_config = DynamicEngineTestConfig(
+            model_provider="gpt",
+            num_requests=0,
+            num_tokens_to_generate=None,
+            num_tokens_total=513,
+            context_max_tokens=chunk_size,
+            context_max_requests=1,
+            context_block_size_tokens=256,
+            enable_chunked_prefill=True,
+            use_cuda_graphs_for_non_decode_steps=False,
+        )
+
+        env = self._build_test_env(test_config)
+        ctx = env.engine.context
+
+        # Mock the model forward function to avoid possible numerics issues
+        # caused by random inputs
+        model_instance = env.engine.controller.inference_wrapped_model.model
+        model_instance.forward = partial(mock_forward, vocab_size=test_config.vocab_size)
+
+        # Create a request with length 513
+        req_tokens = torch.randint(0, test_config.vocab_size, (prompt_len,), device='cuda')
+        req = DynamicInferenceRequest(
+            request_id=1,
+            prompt_tokens=req_tokens,
+            sampling_params=SamplingParams(num_tokens_to_generate=1),
+        )
+
+        env.engine._add_request(req)
+
+        assert req.status == Status.ACTIVE_AND_GENERATING_TOKENS
+
+        # --- Step 1 ---
+        # Available: 256. Remaining: 512.
+        # Logic: 512 - 256 = 256. Not 1. Schedule full 256.
+        env.engine.schedule_waiting_requests()
+        env.engine.step_modern()
+
+        assert (
+            req.finished_chunk_token_count == 256
+        ), f"Step 1: Expected 256 tokens processed, got {req.finished_chunk_token_count}"
+
+        # --- Step 2 ---
+        # Available: 256. Remaining un-prefilled: 256.
+        # Logic: 256 - (256 - 1) = 1. This is the edge case!
+        # Fix should reduce chunk size by 1 (to 254).
+        env.engine.schedule_waiting_requests()
+        env.engine.step_modern()
+
+        # 256 (previous) + 254 (this step) = 510
+        assert req.finished_chunk_token_count == 510, (
+            "Step 2: Expected 510 tokens processed (256+254), "
+            f"got {req.finished_chunk_token_count}. "
+        )
+
+        # --- Step 3 ---
+        # Remaining un-prefilled: 2. Available: 255.
+        # Logic: 2 <= 255. Schedule 2.
+        env.engine.schedule_waiting_requests()
+        env.engine.step_modern()
+
+        # Verify request finishes prefill and completes
+        assert ctx.num_prefill_requests == 0
+        assert req.status == Status.COMPLETED
 
     @pytest.mark.internal
     @pytest.mark.skipif(
@@ -1745,3 +1847,140 @@ class TestDynamicInferenceEngine:
                 f"Tensor address must be stable when static_kv_memory_pointers is set. "
                 f"Before: {addr_before:#x}, After: {addr_after:#x}"
             )
+
+    @pytest.mark.skipif(
+        not is_fa_min_version("2.7.3"), reason="need latest flash attn for dynamic batching"
+    )
+    @pytest.mark.parametrize("use_checkpoint", [False, True], ids=["persist", "recompute"])
+    @torch.inference_mode()
+    def test_staleness_tracking(self, use_checkpoint):
+        """Test that staleness is correct tracked.
+        The use_checkpoint parameter simulates the behavior of different kv_cache_management_mode.
+        """
+        PROMPT_LEN = 8
+        NUM_TOKENS = 8
+
+        test_config = DynamicEngineTestConfig(
+            num_requests=0,
+            min_prompt_length=PROMPT_LEN,
+            max_prompt_length=PROMPT_LEN,
+            num_tokens_to_generate=NUM_TOKENS,
+        )
+        env = self._build_test_env(test_config)
+        engine = env.engine
+
+        for i in range(2):
+            prompt_tokens = torch.randint(
+                0,
+                test_config.vocab_size - 1,
+                (PROMPT_LEN,),
+                dtype=torch.int64,
+                device=torch.cuda.current_device(),
+            )
+            engine._add_request(
+                DynamicInferenceRequest(
+                    request_id=i,
+                    prompt_tokens=prompt_tokens,
+                    sampling_params=SamplingParams(
+                        num_tokens_to_generate=NUM_TOKENS, termination_id=-1
+                    ),
+                )
+            )
+
+        for _ in range(3):
+            engine.step_modern()
+
+        for entry in engine.requests.values():
+            assert len(entry.record[-1].generated_tokens) == 3
+            assert entry.record[-1].policy_staleness is None
+            assert entry.record[-1].kv_cache_staleness is None
+
+        # Increment staleness.
+        for entry in engine.requests.values():
+            entry.record.increment_staleness()
+
+        for entry in engine.requests.values():
+            ps = entry.record[-1].policy_staleness
+            ks = entry.record[-1].kv_cache_staleness
+            assert ps.shape == ks.shape == (PROMPT_LEN + 3,)
+            assert (ps == 1).all()
+            assert (ks == 1).all()
+
+        # Simulate RECOMPUTE
+        if use_checkpoint:
+            for entry in engine.requests.values():
+                old_req = entry.record[-1]
+                event_add_engine = old_req.event_add_engine
+                entry.record.checkpoint()
+                # Prevent TTFT crash due to missing _add_request in test.
+                entry.record[-1].event_add_engine = event_add_engine
+
+            for entry in engine.requests.values():
+                ps = entry.record[-1].policy_staleness
+                ks = entry.record[-1].kv_cache_staleness
+                assert ps.shape == ks.shape == (PROMPT_LEN + 3,)
+                assert (ps == 1).all()
+                assert (ks == 0).all()
+
+        for _ in range(3):
+            engine.step_modern()
+
+        # Increment staleness.
+        for entry in engine.requests.values():
+            entry.record.increment_staleness()
+
+        for entry in engine.requests.values():
+            ps = entry.record[-1].policy_staleness
+            ks = entry.record[-1].kv_cache_staleness
+            assert ps.shape == ks.shape == (PROMPT_LEN + 6,)
+            assert (ps[: PROMPT_LEN + 3] == 2).all()
+            assert (ps[PROMPT_LEN + 3 :] == 1).all()
+            if use_checkpoint:
+                assert (ks == 1).all()
+            else:
+                assert (ks[: PROMPT_LEN + 3] == 2).all()
+                assert (ks[PROMPT_LEN + 3 :] == 1).all()
+
+        if use_checkpoint:
+            for entry in engine.requests.values():
+                old_req = entry.record[-1]
+                event_add_engine = old_req.event_add_engine
+                entry.record.checkpoint()
+                entry.record[-1].event_add_engine = event_add_engine
+
+            for entry in engine.requests.values():
+                ks = entry.record[-1].kv_cache_staleness
+                assert (ks == 0).all()
+
+        finished_records = []
+        while engine.has_unfinished_requests():
+            result = engine.step_modern()
+            finished_records.extend(result["finished_request_records"])
+
+        for record in finished_records:
+            merged = record.merge()
+
+            assert merged.policy_staleness is not None
+            assert merged.policy_staleness.shape == (PROMPT_LEN + NUM_TOKENS,)
+            assert (merged.policy_staleness[: PROMPT_LEN + 3] == 2).all()
+            assert (merged.policy_staleness[PROMPT_LEN + 3 : PROMPT_LEN + 6] == 1).all()
+            assert (merged.policy_staleness[PROMPT_LEN + 6 :] == 0).all()
+
+            assert merged.kv_cache_staleness is not None
+            assert merged.kv_cache_staleness.shape == (PROMPT_LEN + NUM_TOKENS,)
+            if use_checkpoint:
+                assert (merged.kv_cache_staleness == 0).all()
+            else:
+                assert (merged.kv_cache_staleness[: PROMPT_LEN + 3] == 2).all()
+                assert (merged.kv_cache_staleness[PROMPT_LEN + 3 : PROMPT_LEN + 6] == 1).all()
+                assert (merged.kv_cache_staleness[PROMPT_LEN + 6 :] == 0).all()
+
+        # Verify evicted requests don't have their policy staleness incremented.
+        record = finished_records[0]
+        record.checkpoint()
+        pre_ps = record[-1].policy_staleness.clone()
+
+        record.increment_staleness(policy_only=True)  # This mimics the coordinator's action.
+
+        assert (record[-1].policy_staleness == pre_ps + 1).all()
+        assert (record[-1].kv_cache_staleness == 0).all()

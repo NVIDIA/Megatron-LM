@@ -1172,6 +1172,14 @@ class DynamicInferenceEngine(AbstractEngine):
                     can_schedule = True
                 elif token_partially_can_be_added:
                     chunk_length = self.context.max_tokens - self.context.active_token_count
+
+                    # If this chunk would leave exactly 1 token for the final chunk, reduce this
+                    # chunk by 1 so the final chunk has 2 tokens. This avoids the edge case where
+                    # max_seqlen_q=1 which results in a bug with the Flash Attention kernel
+                    # See https://github.com/Dao-AILab/flash-attention/issues/1537
+                    if remaining_len - chunk_length == 1 and chunk_length > 1:
+                        chunk_length -= 1
+
                     self.context.add_request(req, chunk_length=chunk_length)
                     self._loop.call_soon_threadsafe(
                         self._loop.create_task, self._notify_cond_for_new_request()
@@ -1609,6 +1617,10 @@ class DynamicInferenceEngine(AbstractEngine):
                 self.suspend_signal = True
             elif header == Headers.RESUME:
                 self.suspend_signal = False
+            elif header == Headers.INCREMENT_STALENESS:
+                waiting = set(self.waiting_request_ids)
+                for request_id, entry in self.requests.items():
+                    entry.record.increment_staleness(policy_only=request_id in waiting)
             elif header == Headers.STOP:
                 self.received_stop = True
             else:
