@@ -5,6 +5,7 @@ import logging
 import time
 import traceback
 import uuid
+import warnings
 
 from megatron.core.inference.sampling_params import SamplingParams
 from megatron.core.tokenizers.text.parsers import PARSER_MAPPING
@@ -38,7 +39,7 @@ try:
                 messages, tokenize=True, add_generation_prompt=True, tools=req.get("tools", None)
             )
         except (AttributeError, AssertionError):
-            logger.warning(
+            warnings.warn(
                 "Tokenizer does not support 'apply_chat_template'. Using tokenize instead."
             )
             prompt_tokens = tokenizer.tokenize(
@@ -119,7 +120,6 @@ try:
 
         request_idx = 0
         for record in batch_results:
-            assert len(record.requests) == 1, "Each record should contain one request result."
             result = record.merge().serialize()
             # Unwrap ("tensor", [...]) tuples from serialize() into plain lists.
             result = {
@@ -206,7 +206,7 @@ try:
             if result["routing_indices"] is not None:
                 choice_data["moe_topk_indices"] = result["routing_indices"]
                 if prompt_tokens_count:
-                    choices[-1]["prompt_moe_topk_indices"] = result["routing_indices"][
+                    choice_data["prompt_moe_topk_indices"] = result["routing_indices"][
                         :prompt_tokens_count
                     ]
             choices.append(choice_data)

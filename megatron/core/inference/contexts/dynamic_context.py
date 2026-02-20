@@ -15,7 +15,7 @@ from megatron.core.inference.batch_dimensions_utils import (
     CUDAGraphBatchDimensionBuilder,
     InferenceBatchDimensions,
 )
-from megatron.core.inference.config import InferenceConfig
+from megatron.core.inference.config import InferenceConfig, KVCacheManagementMode
 from megatron.core.inference.inference_request import DynamicInferenceRequest
 from megatron.core.inference.sampling_params import SamplingParams
 from megatron.core.inference.unified_memory import (
@@ -357,10 +357,12 @@ class DynamicInferenceContext(BaseInferenceContext):
             mamba_states_memory_per_request *= self.num_mamba_layers
             mamba_states_memory_per_request *= dtype_size_bytes
 
-        # Unified memory.
+        # Unified memory and general tensor management.
         self.unified_memory_level = inference_config.unified_memory_level
-        self.persist_cuda_graphs = inference_config.persist_cuda_graphs
-        if self.unified_memory_level > 0:
+        self.static_kv_memory_pointers = inference_config.static_kv_memory_pointers
+        self.kv_cache_management_mode = inference_config.kv_cache_management_mode
+
+        if self.unified_memory_level != 0:
             try:
                 self.unified_memory_mempool = create_unified_mempool()
             except UnifiedMemoryUnsupportedError:
@@ -369,6 +371,23 @@ class DynamicInferenceContext(BaseInferenceContext):
                         "Unified memory requested but not available; defaulting to GPU memory."
                     )
                 self.unified_memory_level = 0
+        # If we are in a mode that requires static KV memory pointers,
+        # we must have either UVM or torch_memory_saver.
+        if (
+            self.static_kv_memory_pointers
+            and self.kv_cache_management_mode != KVCacheManagementMode.PERSIST
+        ):
+            assert HAVE_TORCH_MEMORY_SAVER or self.unified_memory_level != 0, (
+                "Static KV memory pointers require UVM or torch_memory_saver when not persisted. "
+                "Use --rl-kv-cache-management-mode=persist, UVM, or install torch_memory_saver."
+            )
+
+        # When not using `torch_memory_saver`, we manually offload/restore tensors.
+        # We use storage resize, similar to the logic in `core/distributed/param_and_grad_buffer.py`
+        self._offloadable_tensor_names: set[str] = set()
+        self._offloadable_cpu_backups: dict[str, torch.Tensor] = {}
+        self._offloadable_storage_sizes: dict[str, int] = {}
+        self._uses_torch_memory_saver: bool = False
 
         # Initialize block allocator.
         buffer_size_bytes = int(inference_config.buffer_size_gb * 1024**3)
@@ -535,12 +554,6 @@ class DynamicInferenceContext(BaseInferenceContext):
             )
         )
 
-        # Whether to offload the KV cache. Determines where the KV cache is allocated within memory.
-        self.offload_kv_cache = inference_config.offload_kv_cache
-        assert not (
-            self.offload_kv_cache and self.unified_memory_level
-        ), "The KV cache should not be instantiated in unified memory when it is offloaded during training."
-
         self._using_cuda_graph_this_step = False
         # Deal with chunked prefill
         self.enable_chunked_prefill = inference_config.enable_chunked_prefill
@@ -556,7 +569,7 @@ class DynamicInferenceContext(BaseInferenceContext):
         # Allocate GPU state.
         self.is_tensor_state_allocated = False
         self.is_symmetric_memory_initialized = False
-        self.allocate_all_tensors(is_init=True)
+        self.initialize_all_tensors()
 
         # Print info.
         logging.info(
@@ -567,23 +580,76 @@ class DynamicInferenceContext(BaseInferenceContext):
             )
         )
 
-    def allocate_all_tensors(self, *, is_init: bool) -> None:
-        """Allocate GPU state.
+    def _allocate_memory_buffer(self):
+        """Allocate the KV cache memory buffer."""
+        if self.cache_mla_latent:
+            self.memory_buffer = torch.empty(
+                (
+                    self.num_attention_layers,
+                    self.block_allocator.total_count,
+                    self.block_size_tokens,
+                    self.kv_reduced_dim,
+                ),
+                dtype=self.params_dtype,
+                device=torch.cuda.current_device(),
+            )
+        else:
+            self.memory_buffer = torch.empty(
+                (
+                    2,  # key and value
+                    self.num_attention_layers,
+                    self.block_allocator.total_count,
+                    self.block_size_tokens,
+                    self.num_attention_heads_per_partition,
+                    self.hidden_size_per_attention_head,
+                ),
+                dtype=self.params_dtype,
+                device=torch.cuda.current_device(),
+            )
+        if (
+            self.kv_cache_management_mode == KVCacheManagementMode.OFFLOAD
+            and not self._uses_torch_memory_saver
+        ):
+            assert self.unified_memory_level == 0
+            self._offloadable_tensor_names.add("memory_buffer")
+            self._offloadable_cpu_backups["memory_buffer"] = torch.empty_like(
+                self.memory_buffer, device="cpu"
+            ).pin_memory()
 
-        This method is used for both 1) initial allocation, and 2) resuming the
-        GPU state after a suspend.
+    def _allocate_mamba_states(self):
+        """Allocate Mamba states for hybrid models."""
+        if self.is_hybrid_model:
+            self.mamba_metadata = MambaMetadata(
+                max_requests=self.max_requests, max_tokens=self.max_tokens
+            )
+            self.mamba_conv_states = torch.empty(
+                (self.num_mamba_layers, self.max_requests) + self.mamba_conv_states_shape,
+                dtype=self.params_dtype,
+                device=torch.cuda.current_device(),
+            )
+            self.mamba_ssm_states = torch.empty(
+                (self.num_mamba_layers, self.max_requests) + self.mamba_ssm_states_shape,
+                dtype=self.params_dtype,
+                device=torch.cuda.current_device(),
+            )
+            if (
+                self.kv_cache_management_mode == KVCacheManagementMode.OFFLOAD
+                and not self._uses_torch_memory_saver
+            ):
+                assert self.unified_memory_level == 0
+                self._offloadable_tensor_names.add("mamba_conv_states")
+                self._offloadable_cpu_backups["mamba_conv_states"] = torch.empty_like(
+                    self.mamba_conv_states, device="cpu"
+                ).pin_memory()
+                self._offloadable_tensor_names.add("mamba_ssm_states")
+                self._offloadable_cpu_backups["mamba_ssm_states"] = torch.empty_like(
+                    self.mamba_ssm_states, device="cpu"
+                ).pin_memory()
+        else:
+            self.mamba_metadata = None
 
-        Args:
-            is_init (bool): True if this is being called from `__init__()`.
-        """
-
-        # Only allocate tensors when not using unified memory at all (level 0),
-        # or for initial allocation during `__init__()`. For levels 1 and 2, we do
-        # not perform any explicit allocations or deallocations after the initial
-        # call to `__init__()`.
-        if self.unified_memory_level != 0 and not is_init:
-            return
-
+    def initialize_all_tensors(self) -> None:
+        """Allocate all GPU state during initial construction."""
         # Mark allocated.
         if self.is_tensor_state_allocated:
             return
@@ -593,7 +659,7 @@ class DynamicInferenceContext(BaseInferenceContext):
         for key in vars(self).keys():
             value = getattr(self, key)
             assert not isinstance(value, torch.Tensor), (
-                "All tensors should be allocated within `allocate_all_tensors()."
+                "All tensors should be allocated within `initialize_all_tensors()`. "
                 f"Please move tensor '{key}'."
             )
 
@@ -646,103 +712,86 @@ class DynamicInferenceContext(BaseInferenceContext):
                 (max_pending,), -1, dtype=torch.int32, device=torch.cuda.current_device()
             )
 
-        # Memory buffer.
-        def allocate_memory_buffer():
-            """Allocate the memory buffer. This function is called below within
-            `with ctx_manager:`."""
-            if self.cache_mla_latent:
-                self.memory_buffer = torch.empty(
-                    (
-                        self.num_attention_layers,
-                        self.block_allocator.total_count,
-                        self.block_size_tokens,
-                        self.kv_reduced_dim,
-                    ),
-                    dtype=self.params_dtype,
-                    device=torch.cuda.current_device(),
-                )
-            else:
-                ctx = (
-                    torch_memory_saver.region(tag="kv_cache", enable_cpu_backup=True)
-                    if HAVE_TORCH_MEMORY_SAVER and self.offload_kv_cache
-                    else nullcontext()
-                )
-
-                with ctx:
-                    self.memory_buffer = torch.empty(
-                        (
-                            2,  # key and value
-                            self.num_attention_layers,
-                            self.block_allocator.total_count,
-                            self.block_size_tokens,
-                            self.num_attention_heads_per_partition,
-                            self.hidden_size_per_attention_head,
-                        ),
-                        dtype=self.params_dtype,
-                        device=torch.cuda.current_device(),
-                    )
-
-        # Optional state tensors for hybrid models
-        def allocate_mamba_states():
-            """Allocate Mamba states. This function is called below within
-            `with ctx_manager:`."""
-            if self.is_hybrid_model:
-                self.mamba_metadata = MambaMetadata(
-                    max_requests=self.max_requests, max_tokens=self.max_tokens
-                )
-                self.mamba_conv_states = torch.empty(
-                    (self.num_mamba_layers, self.max_requests) + self.mamba_conv_states_shape,
-                    dtype=self.params_dtype,
-                    device=torch.cuda.current_device(),
-                )
-                self.mamba_ssm_states = torch.empty(
-                    (self.num_mamba_layers, self.max_requests) + self.mamba_ssm_states_shape,
-                    dtype=self.params_dtype,
-                    device=torch.cuda.current_device(),
-                )
-
-            else:
-                self.mamba_metadata = None
-
-        # Allocate `ctx_manager`-managed buffers. (For currently unknown reasons,
-        # `ctx_manager` can only be used once.)
-        ctx_manager = (
-            torch.cuda.use_mem_pool(self.unified_memory_mempool)
-            if self.unified_memory_level > 0
-            else nullcontext()
+        # Allocate large non-graphed buffers.
+        need_static_addr = (
+            self.static_kv_memory_pointers
+            and self.kv_cache_management_mode != KVCacheManagementMode.PERSIST
         )
+
+        ctx_manager = nullcontext()
+        if self.unified_memory_level != 0:
+            ctx_manager = torch.cuda.use_mem_pool(self.unified_memory_mempool)
+        elif HAVE_TORCH_MEMORY_SAVER and need_static_addr:
+            ctx_manager = torch_memory_saver.region(
+                tag="inference_context",
+                enable_cpu_backup=(self.kv_cache_management_mode == KVCacheManagementMode.OFFLOAD),
+            )
+            self._uses_torch_memory_saver = True
         with ctx_manager:
-            allocate_memory_buffer()
-            allocate_mamba_states()
+            self._allocate_memory_buffer()
+            self._allocate_mamba_states()
 
         # Reset attention and Mamba state.
         self.reset_attention_state()
         self.reset_mamba_state()
 
-    def deallocate_all_tensors(self):
-        """Deallocate GPU state.
+    def reinitialize_inference_state_buffers(self):
+        """Restore large tensors (KV cache, Mamba states) after a suspend.
 
-        This method is used for suspending the dynamic engine.
+        Called by the engine during `resume()`. Initial allocation is in `initialize_all_tensors()`.
         """
+        if self.is_tensor_state_allocated:
+            return
+        self.is_tensor_state_allocated = True
 
-        # Only deallocate tensors when not using unified memory at all (level 0).
-        # For levels 1 and 2, we do not perform any explicit allocations or
-        # deallocations after the initial call to `__init__()`.
-        if self.unified_memory_level != 0:
+        if self.kv_cache_management_mode == KVCacheManagementMode.PERSIST:
             return
 
-        # Mark deallocated.
+        if self.unified_memory_level != 0 or self._uses_torch_memory_saver:
+            if self.kv_cache_management_mode == KVCacheManagementMode.RECOMPUTE:
+                self.reset()
+            if self._uses_torch_memory_saver:
+                torch_memory_saver.resume("inference_context")
+            return
+
+        if self.kv_cache_management_mode == KVCacheManagementMode.OFFLOAD:
+            for name, tensor in ((n, getattr(self, n)) for n in self._offloadable_tensor_names):
+                tensor.storage().resize_(self._offloadable_storage_sizes[name])
+                tensor.copy_(self._offloadable_cpu_backups[name], non_blocking=True)
+        elif self.kv_cache_management_mode == KVCacheManagementMode.RECOMPUTE:
+            self.is_tensor_state_allocated = False
+            self.initialize_all_tensors()
+
+    def deallocate_inference_state_buffers(self):
+        """Deallocate large tensors (KV cache, Mamba states) during suspend.
+
+        Called by the engine during `suspend()`. Mirror to `reinitialize_inference_state_buffers()`.
+        """
         if not self.is_tensor_state_allocated:
             return
         self.is_tensor_state_allocated = False
 
-        # Delete all tensor attributes.
-        # TODO(@lmcafee): check that device == 'cuda'?
-        keys = list(vars(self).keys())
-        for key in keys:
-            value = getattr(self, key)
-            if isinstance(value, torch.Tensor):
-                delattr(self, key)
+        if self.kv_cache_management_mode == KVCacheManagementMode.PERSIST:
+            return
+
+        if self.unified_memory_level != 0:
+            return
+
+        if self._uses_torch_memory_saver:
+            torch_memory_saver.pause("inference_context")
+            return
+
+        if self.kv_cache_management_mode == KVCacheManagementMode.OFFLOAD:
+            for name, tensor in ((n, getattr(self, n)) for n in self._offloadable_tensor_names):
+                self._offloadable_storage_sizes[name] = tensor.storage().size()
+                self._offloadable_cpu_backups[name].copy_(tensor, non_blocking=True)
+                tensor.storage().resize_(0)
+        elif self.kv_cache_management_mode == KVCacheManagementMode.RECOMPUTE:
+            # TODO(@lmcafee): check that device == 'cuda'?
+            for key in list(vars(self).keys()):
+                value = getattr(self, key)
+                if isinstance(value, torch.Tensor):
+                    delattr(self, key)
 
     @classmethod
     def round_up_tokens(cls, value, tp_size=None):

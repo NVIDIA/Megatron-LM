@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-name: 'Release'
+name: "Release"
 
 defaults:
   run:
@@ -38,12 +38,23 @@ on:
         description: Create a GitHub release
         type: boolean
         default: true
+      gh-release-use-changelog-builder:
+        required: false
+        description: Use release-changelog-builder-action to dynamically build changelog
+        type: boolean
+        default: true
+      gh-release-changelog-config:
+        required: false
+        description: Path to changelog builder configuration file
+        type: string
+        default: ".github/workflows/config/changelog-config.json"
+      gh-release-from-tag:
+        required: false
+        description: Starting tag for changelog builder (leave empty for auto-detect)
+        type: string
+        default: ""
     secrets:
-      TWINE_USERNAME:
-        required: true
       TWINE_PASSWORD:
-        required: true
-      SLACK_WEBHOOK_ADMIN:
         required: true
       SLACK_WEBHOOK:
         required: true
@@ -62,12 +73,10 @@ jobs:
       ref: ${{ inputs.release-ref }}
       no-publish: true
     secrets:
-      TWINE_USERNAME: ${{ secrets.TWINE_USERNAME }}
       TWINE_PASSWORD: ${{ secrets.TWINE_PASSWORD }}
 
   bump-next-version:
     runs-on: ubuntu-latest
-    environment: main # ${{ inputs.dry-run == true && 'public' || 'main' }}
     needs: build-test-publish-wheels-dry-run
     if: |
       (
@@ -90,8 +99,8 @@ jobs:
       - name: Bump version MCore
         id: bump-version-mcore
         env:
-          SRC_DIR: ''
-          PYPROJECT_NAME: 'megatron.core'
+          SRC_DIR: ""
+          PYPROJECT_NAME: "megatron.core"
         run: |
           set +u
           cd ${{ github.run_id }}
@@ -129,8 +138,8 @@ jobs:
       - name: Bump version MFSDP
         id: bump-version-mfsdp
         env:
-          SRC_DIR: 'megatron/core/distributed/fsdp/src/'
-          PYPROJECT_NAME: 'megatron_fsdp'
+          SRC_DIR: "megatron/core/distributed/fsdp/src/"
+          PYPROJECT_NAME: "megatron_fsdp"
         run: |
           set +u
 
@@ -323,7 +332,6 @@ jobs:
   create-gh-release:
     needs: [build-test-publish-wheels, bump-next-version]
     runs-on: ubuntu-latest
-    environment: ${{ inputs.dry-run == true && 'public' || 'main' }}
     if: |
       (
         success() || !failure()
@@ -345,12 +353,51 @@ jobs:
           ref: ${{ inputs.release-ref }}
           token: ${{ secrets.PAT || secrets.GITHUB_TOKEN }}
 
+      - name: Determine fromTag for changelog
+        id: determine-from-tag
+        if: inputs.gh-release-use-changelog-builder == true
+        run: |
+          cd ${{ github.run_id }}
+
+          # If gh-release-from-tag is provided, use it
+          if [[ -n "${{ inputs.gh-release-from-tag }}" ]]; then
+            FROM_TAG="${{ inputs.gh-release-from-tag }}"
+            echo "Using provided fromTag: $FROM_TAG"
+          else
+            # Get the most recent tag
+            FROM_TAG=$(git describe --tags --abbrev=0 2>/dev/null || echo "")
+            if [[ -z "$FROM_TAG" ]]; then
+              echo "No previous tags found, leaving fromTag empty"
+            else
+              echo "Auto-detected most recent tag: $FROM_TAG"
+            fi
+          fi
+
+          echo "from-tag=$FROM_TAG" >> $GITHUB_OUTPUT
+
+      - name: Build Changelog
+        id: build-changelog
+        if: inputs.gh-release-use-changelog-builder == true
+        uses: mikepenz/release-changelog-builder-action@v6.1.0
+        env:
+          GITHUB_TOKEN: ${{ secrets.PAT || secrets.GITHUB_TOKEN }}
+        with:
+          configuration: ${{ github.run_id }}/${{ inputs.gh-release-changelog-config }}
+          owner: ${{ github.repository_owner }}
+          repo: ${{ github.event.repository.name }}
+          ignorePreReleases: "false"
+          failOnError: "false"
+          fromTag: ${{ steps.determine-from-tag.outputs.from-tag }}
+          toTag: ${{ inputs.release-ref }}
+          mode: ${{ inputs.gh-release-changelog-mode }}
+
       - name: Create release
         id: version-number
         env:
           SHA: ${{ inputs.release-ref }}
           GH_TOKEN: ${{ secrets.PAT }}
           IS_DRY_RUN: ${{ inputs.dry-run }}
+          BUILT_CHANGELOG: ${{ steps.build-changelog.outputs.changelog }}
         run: |
           cd ${{ github.run_id }}
 
@@ -359,7 +406,10 @@ jobs:
           IS_PRERELEASE=$([[ "$IS_RELEASE_CANDIDATE" == "true" || "$IS_ALPHA" == "true" ]] && echo "true" || echo "false")
           NAME="NVIDIA $PROJECT_NAME ${VERSION}"
 
-          if [[ "$IS_RELEASE_CANDIDATE" == "true" ]]; then
+          # Use built changelog if available, otherwise fall back to CHANGELOG.md
+          if [[ -n "$BUILT_CHANGELOG" ]]; then
+            CHANGELOG="$BUILT_CHANGELOG"
+          elif [[ "$IS_RELEASE_CANDIDATE" == "true" ]]; then
             DATE=$(date +"%Y-%m-%d")
             CHANGELOG="Prerelease: $NAME ($DATE)"
           else
@@ -402,10 +452,19 @@ jobs:
             eval "$CMD"
           fi
 
+  publish-docs:
+    needs: [bump-next-version, create-gh-release]
+    uses: ./.github/workflows/release-docs.yml
+    with:
+      dry-run: ${{ inputs.dry-run }}
+      publish-as-latest: true
+      docs-version-override: ${{ needs.bump-next-version.outputs.release-version }}
+      build-docs-ref: ${{ inputs.release-ref }}
+    secrets: inherit
+
   notify:
     needs: [build-test-publish-wheels, create-gh-release]
     runs-on: ubuntu-latest
-    environment: ${{ inputs.dry-run == true && 'public' || 'main' }}
     env:
       GH_URL: https://github.com/${{ github.repository }}/releases/tag/v${{ needs.build-test-publish-wheels.outputs.version }}
       PYPI_URL: https://${{ inputs.dry-run == true && 'test.' || '' }}pypi.org/project/${{ needs.build-test-publish-wheels.outputs.pypi-name }}/${{ needs.build-test-publish-wheels.outputs.version }}/

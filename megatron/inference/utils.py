@@ -9,6 +9,7 @@ from gpt_builders import gpt_builder
 from mamba_builders import mamba_builder
 from megatron.core.inference.config import (
     InferenceConfig,
+    KVCacheManagementMode,
     MambaInferenceStateConfig,
     PrefixCachingEvictPolicy,
 )
@@ -298,10 +299,10 @@ def get_inference_config_from_model_and_args(model: MegatronModule, args):
         max_requests=args.inference_dynamic_batching_max_requests,
         max_tokens=args.inference_dynamic_batching_max_tokens,
         unified_memory_level=args.inference_dynamic_batching_unified_memory_level,
-        offload_kv_cache=args.rl_offload_kv_cache_during_training,
+        kv_cache_management_mode=KVCacheManagementMode(args.rl_kv_cache_management_mode),
         cuda_graph_mixed_prefill_count=args.inference_dynamic_batching_cuda_graph_mixed_prefill_count,  # pylint: disable=line-too-long
         use_cuda_graphs_for_non_decode_steps=not args.decode_only_cuda_graphs,
-        persist_cuda_graphs=args.rl_training_cuda_graphs,
+        static_kv_memory_pointers=args.rl_persist_cuda_graphs,
         max_sequence_length=max_sequence_length,
         mamba_inference_state_config=mamba_inference_state_config,
         pg_collection=pg_collection,

@@ -1123,10 +1123,11 @@ class MegatronFSDP(torch.nn.Module):
 
         if not force_sync and self.ddp_config.overlap_param_gather:
             # All-gather the first bucket before the forward pass.
-            first_param = list(self.module.parameters())[0]
-            self.all_gather_and_wait_parameters_ready(
-                params=[first_param], prefetch=True, wait_bucket_ready=False
-            )
+            if self.ddp_config.fsdp_all_gather_in_start_param_sync:
+                first_param = list(self.module.parameters())[0]
+                self.all_gather_and_wait_parameters_ready(
+                    params=[first_param], prefetch=True, wait_bucket_ready=False
+                )
         else:
             self.synchronize_param_gather()
             for bucket_id in range(self.all_gather_pipeline.num_buckets):
