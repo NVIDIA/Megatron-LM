@@ -268,7 +268,7 @@ class MambaStack(GraphableMegatronModule, MegatronModule):
         """
         if (
             not self.training
-            and hasattr(self, 'cudagraph_manager')
+            and self.config.cuda_graph_impl == "local"
             and kwargs['attention_mask'] is None
             and (
                 kwargs.get('inference_context') is not None
@@ -291,12 +291,6 @@ class MambaStack(GraphableMegatronModule, MegatronModule):
         return False
 
     def __call__(self, *args, **kwargs):
-        if self.config.cuda_graph_impl == "local" and not hasattr(self, 'cudagraph_manager'):
-            # lazily initialize the cudagraph manager for inference
-            # the default training codepath does not initialize it,
-            # as it uses FullCudaGraphWrapper wrapper.
-            self._init_cudagraph_manager(self.config)
-
         if self._should_call_local_cudagraph(*args, **kwargs):
             kwargs['hidden_states'] = (
                 kwargs['hidden_states'].unwrap()
