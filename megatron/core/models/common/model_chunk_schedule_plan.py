@@ -122,11 +122,9 @@ class TransformerLayerSchedulePlan:
 
         # get flags for latter use
         is_mtp = isinstance(self.layer, MultiTokenPredictionLayer)
-        is_moe = (
-            isinstance(self.layer.mtp_model_layer.mlp, MoELayer)
-            if is_mtp
-            else isinstance(self.layer.mlp, MoELayer)
-        )
+        transformer_layer = self.layer.mtp_model_layer if is_mtp else self.layer
+        is_moe = isinstance(transformer_layer.mlp, MoELayer)
+        num_local_experts = transformer_layer.mlp.num_local_experts if is_moe else None
 
         extra_args["config"] = self.layer.config
         extra_args["is_moe"] = is_moe

@@ -608,7 +608,7 @@ class GPTModel(LanguageModule):
         if not self.post_process:
             return hidden_states
 
-        if self.config.mtp_num_layers is not None:
+        if self.config.mtp_num_layers:
             hidden_states = process_mtp_loss(
                 hidden_states=hidden_states,
                 labels=labels,
