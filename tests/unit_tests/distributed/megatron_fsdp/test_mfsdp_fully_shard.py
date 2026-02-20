@@ -560,6 +560,7 @@ class TestMegatronFsdpFullyShard:
         """
         # Compare pre-save and post-load model state dictionaries.
         s2 = model.state_dict()
+        nonempty_model_state = False
         for key in s1.keys() | s2.keys():
             v1 = s1.get(key, None)
             if isinstance(v1, DTensor):
@@ -574,9 +575,11 @@ class TestMegatronFsdpFullyShard:
                 v1.shape == v2.shape
             ), f"[Checkpoint Param {key} Shape Mismatch] {v1.shape} != {v2.shape}"
             assert torch.allclose(v1, v2), f"[Checkpoint Param {key} Value Mismatch] {v1} != {v2}"
+            nonempty_model_state = True
 
         # Compare pre-save and post-load optimizer state dictionaries.
         o2 = optimizer.state_dict()
+        nonempty_optim_state = False
         for param_id in o1["state"].keys() | o2["state"].keys():
             param_state_1 = o1["state"].get(param_id, None)
             param_state_2 = o2["state"].get(param_id, None)
@@ -599,6 +602,7 @@ class TestMegatronFsdpFullyShard:
                 assert torch.allclose(
                     v1, v2
                 ), f"[Optim State {param_id} {key} Value Mismatch] {v1} != {v2}"
+                nonempty_optim_state = True  # Optimizer state depends on wgrad, verify this!
         assert len(o1["param_groups"]) == len(
             o2["param_groups"]
         ), f"[Optim State Param Groups Length Mismatch] {o1['param_groups']} != {o2['param_groups']}"
@@ -607,6 +611,15 @@ class TestMegatronFsdpFullyShard:
                 v1 = o1["param_groups"][i][key]
                 v2 = o2["param_groups"][i][key]
                 assert v1 == v2, f"[Optim State Param Group {i} {key} Value Mismatch] {v1} != {v2}"
+
+        # Validate that at least 1 rank has a non-empty model and optimizer state.
+        # It is very possible that some ranks have completely empty state!
+        global_nonempty_model_state = [False] * torch.distributed.get_world_size()
+        torch.distributed.all_gather_object(global_nonempty_model_state, nonempty_model_state)
+        assert any(global_nonempty_model_state), "All ranks had an empty model state!"
+        global_nonempty_optim_state = [False] * torch.distributed.get_world_size()
+        torch.distributed.all_gather_object(global_nonempty_optim_state, nonempty_optim_state)
+        assert any(global_nonempty_optim_state), "All ranks had an empty optimizer state!"
 
         """
         MODEL CHECKPOINT FORWARD PASS VALIDATION
