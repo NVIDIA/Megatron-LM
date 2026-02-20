@@ -839,13 +839,13 @@ def prep_wandb_metrics(
         rewards: Grouped list of rewards.
         num_turns: Grouped list of number of turns in the trajectories.
         advantages: Flattened list of advantages.
-        tokenizer: Tokenizer to untokenize trajectories for logging.
-        example_groups: A list of rollouts of one group to log examples of trajectories.
         policy_staleness: Grouped list of per-rollout max policy staleness.
         kv_cache_staleness: Grouped list of per-rollout max KV cache staleness.
         num_evictions: Grouped list of per-rollout number of evictions.
         completed_at_steps: Grouped list of per-rollout completed at steps.
         current_iteration: Current training iteration.
+        example_group: A list of rollouts of one group to log examples of trajectories.
+        tokenizer: Tokenizer to untokenize trajectories for logging.
     """
 
     group_table = wandb_writer.Table(
