@@ -53,8 +53,12 @@ def quantize_model_to_mxfp8(model: torch.nn.Module) -> None:
     return model
 
 
-def mm_mxfp8(x: torch.Tensor, weight: torch.Tensor, out: torch.Tensor = None):
-    """Computes a matmul in MXFP8 using FlashInfer."""
+def mm_mxfp8(x: torch.Tensor, weight: MXFP8Tensor, out: torch.Tensor = None):
+    """
+    Computes a matmul in MXFP8 using FlashInfer.
+
+    Quantizes the bf16 input activation tensor. Weight must be pre-quantized.
+    """
     assert HAVE_FLASHINFER
 
     x = MXFP8Tensor.from_bf16(x.squeeze(1))
