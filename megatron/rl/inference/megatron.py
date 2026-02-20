@@ -128,6 +128,7 @@ class MegatronLocal(InferenceServer, ReturnsTokens, ReturnsRaw):
             args.rl_kv_cache_management_mode
         )
         timeout = httpx.Timeout(connect=15, read=600, write=600, pool=600)
+        max_connections = args.grpo_prompts_per_step * args.grpo_group_size * args.rl_parallel_generation_tasks
         launched_server._openai_client = AsyncOpenAI(
             base_url=f"http://{kwargs['host']}:{kwargs['port']}",
             api_key="NONE",
@@ -137,8 +138,8 @@ class MegatronLocal(InferenceServer, ReturnsTokens, ReturnsRaw):
                 timeout=timeout,
                 http2=use_http2,
                 limits=httpx.Limits(
-                    max_connections=16384,
-                    max_keepalive_connections=16384,
+                    max_connections=max_connections,
+                    max_keepalive_connections=max_connections,
                     keepalive_expiry=10,
                 ),
             ),
