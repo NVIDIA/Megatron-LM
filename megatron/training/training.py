@@ -1968,6 +1968,7 @@ def training_log(
                 wandb_writer.log({'max_attention_logit': max_attention_logit}, iteration)
 
     # Log MoE metrics.
+    overload_dict = {}
     if args.num_experts is not None:
         moe_loss_scale = 1 / get_num_microbatches()
         track_names = []
@@ -1991,6 +1992,7 @@ def training_log(
             writer=writer,
             wandb_writer=wandb_writer,
             total_loss_dict=total_loss_dict,
+            overload_dict=overload_dict,
             per_layer_logging=args.moe_per_layer_logging,
             force_initialize=True,
             track_names=track_names,
@@ -2097,6 +2099,13 @@ def training_log(
             total_loss_dict[advanced_iters_key] = 0
             total_loss_dict[skipped_iters_key] = 0
             total_loss_dict[nan_iters_key] = 0
+        if overload_dict:
+            if "avg_overload_factor" in overload_dict:
+                log_string += f' avg overload factor: {overload_dict["avg_overload_factor"]:.3f} |'
+            if "max_overload_factor" in overload_dict:
+                log_string += f' max overload factor: {overload_dict["max_overload_factor"]:.3f} |'
+            if "max_cum_overload_factor" in overload_dict and overload_dict["max_cum_overload_factor"] is not None:
+                log_string += f' max cum overload factor: {overload_dict["max_cum_overload_factor"]:.3f} |'
         print_rank_last(log_string)
         reported_memory_in_this_iteration = False
         if report_memory_flag:
@@ -2635,7 +2644,11 @@ def train(
     # Wrap forward_backward_func for Full iteration CUDA graph
     forward_backward_func = get_forward_backward_func()
     if args.cuda_graph_impl == "local" and CudaGraphScope.full_iteration in args.cuda_graph_scope:
-        forward_backward_func = FullCudaGraphWrapper(forward_backward_func, cuda_graph_warmup_steps=args.cuda_graph_warmup_steps)
+        forward_backward_func = FullCudaGraphWrapper(
+            forward_backward_func,
+            cuda_graph_warmup_steps=args.cuda_graph_warmup_steps,
+            moe_expert_rank_capacity_factor=args.moe_expert_rank_capacity_factor,
+        )
 
     def get_e2e_base_metrics():
         """Get base metrics values for one-logger to calculate E2E tracking metrics."""
@@ -3093,7 +3106,11 @@ def evaluate(
     eval_num_microbatches = eval_batch_size // (args.micro_batch_size * args.data_parallel_size)
     forward_backward_func = get_forward_backward_func()
     if args.cuda_graph_impl == "local" and CudaGraphScope.full_iteration in args.cuda_graph_scope:
-        forward_backward_func = FullCudaGraphWrapper(forward_backward_func, cuda_graph_warmup_steps=args.cuda_graph_warmup_steps)
+        forward_backward_func = FullCudaGraphWrapper(
+            forward_backward_func,
+            cuda_graph_warmup_steps=args.cuda_graph_warmup_steps,
+            moe_expert_rank_capacity_factor=args.moe_expert_rank_capacity_factor,
+        )
 
     if eval_iters is None:
         eval_iters = args.eval_iters
