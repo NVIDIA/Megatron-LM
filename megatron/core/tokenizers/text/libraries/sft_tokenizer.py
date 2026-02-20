@@ -20,9 +20,7 @@ identity_template = """{% for message in messages %}{{ message['content'] }}{% e
 # fmt: on
 
 
-from megatron.core.datasets.megatron_tokenizer import MegatronLegacyTokenizer
-from megatron.training.datasets.sft_dataset import IGNORE_INDEX
-from megatron.training.tokenizer.multimodal_tokenizer import PromptConfig
+IGNORE_INDEX = -100
 
 
 @dataclass
@@ -156,7 +154,7 @@ class SFTTokenizer:
             if turn["role"].lower() == "assistant" and len(turn["content"]) == 0:
                 raise ValueError(f"empty assistant turn in conversation: {conversation}.")
             if turn["role"].lower() == "assistant":
-                assert conversation[turn_idx-1]["role"].lower() in ("user", "tool")
+                assert conversation[turn_idx - 1]["role"].lower() in ("user", "tool")
 
             turn_tokens = self._tokenizer.apply_chat_template(
                 [turn], tokenize=True, chat_template=self._prompt_config.custom_chat_template
