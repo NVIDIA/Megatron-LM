@@ -1,5 +1,6 @@
 # Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
+import asyncio
 import gc
 
 import copy
@@ -11,6 +12,7 @@ import logging
 import json
 import os
 from collections import Counter, defaultdict
+from collections.abc import AsyncGenerator
 from contextlib import contextmanager, nullcontext
 from dataclasses import dataclass
 from pathlib import Path
@@ -286,6 +288,11 @@ class RLRuntimeState:
         self.last_collection_iteration = 0
         self.sequences_this_iteration_on_rank = 0
         self.latest_batch_num_sequences = 0
+        self.data_iterator = None
+        self.start_iteration = None
+        self.lag_buffer = None
+        self.pending_groups = None
+        self.next_batch_id = 0
 
     def reset_iteration_counters(self, iteration):
         """Reset per-iteration counters."""
@@ -442,11 +449,12 @@ _ROLLOUT_GENERATOR = None
 
 def get_rollout_generator(args, inference_interface, n_prompts, samples_per_group):
     global _ROLLOUT_GENERATOR
-    if not args.rl_partial_rollouts or _ROLLOUT_GENERATOR is None:
+    oversubscribed = args.rl_partial_rollouts or args.rl_forced_lag > 0
+    if not oversubscribed or _ROLLOUT_GENERATOR is None:
         agent = get_agent(args, parallel_generation_tasks=args.rl_parallel_generation_tasks)
         # Collect Rollouts
         request = GroupedRolloutRequest(
-            num_groups=-1 if args.rl_partial_rollouts else n_prompts,
+            num_groups=-1 if oversubscribed else n_prompts,
             rollouts_per_group=samples_per_group,
             inference_interface=inference_interface,
             generation_args={
@@ -459,6 +467,34 @@ def get_rollout_generator(args, inference_interface, n_prompts, samples_per_grou
         )
         _ROLLOUT_GENERATOR = agent.get_grouped_rollouts(request)
     return _ROLLOUT_GENERATOR
+
+
+def _collect_ordered_batch(
+    rollout_generator: AsyncGenerator[list[Rollout], None],
+    n_prompts: int,
+    state: RLRuntimeState,
+    loop: asyncio.AbstractEventLoop,
+) -> list[list[Rollout]]:
+    """Collect the next ordered batch from an oversubscribed generator.
+
+    As the generator yields groups, those belonging to the target batch are accumulated,
+    while those belonging to other batches are buffered in ``state.pending_groups``.
+
+    Args:
+        rollout_generator: Async generator yielding groups of rollouts.
+        n_prompts: Number of groups per batch.
+        state: Runtime state.
+        loop: Event loop used.
+    """
+    target = state.next_batch_id
+    while target not in state.pending_groups or len(state.pending_groups[target]) < n_prompts:
+        group = loop.run_until_complete(anext(rollout_generator))
+        batch_id = group[0].submission_index // n_prompts
+        state.pending_groups.setdefault(batch_id, []).append(group)
+    batch = state.pending_groups.pop(target)
+    batch.sort(key=lambda g: g[0].submission_index)
+    state.next_batch_id += 1
+    return batch
 
 
 def get_environment_rollouts(
@@ -537,14 +573,20 @@ def get_environment_rollouts(
                         logging.INFO,
                         f"Collecting rollouts, Iteration {args.curr_iteration}...",
                     )
-                    rollouts = [
-                        loop.run_until_complete(anext(rollout_generator)) for _ in range(n_prompts)
-                    ]
+                    if args.rl_forced_lag > 0:
+                        rollouts = _collect_ordered_batch(
+                            rollout_generator, n_prompts,
+                            get_rl_runtime_state(), loop,
+                        )
+                    else:
+                        rollouts = [
+                            loop.run_until_complete(anext(rollout_generator)) for _ in range(n_prompts)
+                        ]
                     # In deterministic mode, sort rollouts by problem_id for consistent ordering
                     # regardless of completion order due to system timing jitter.
                     if torch.are_deterministic_algorithms_enabled():
                         rollouts.sort(key=lambda group: group[0].problem_id if group and group[0].problem_id else "")
-                    if not args.rl_partial_rollouts:
+                    if not args.rl_partial_rollouts and args.rl_forced_lag == 0:
                         while True:
                             try:
                                 loop.run_until_complete(anext(rollout_generator))
@@ -1441,7 +1483,6 @@ def get_grpo_data_iterator(
     global_batch_size: int,
     sequence_packing: bool,
     is_correction: bool,
-    buffered_rollouts: RerunDataIterator | None = None,
 ) -> RerunDataIterator:
     """
     Get the data iterator for GRPO training.
@@ -1450,44 +1491,72 @@ def get_grpo_data_iterator(
     the buffered_rollouts as is.
 
     Args:
-        model: The language model
-        optimizer: The Megatron optimizer
-        iteration: Current training iteration
-        ref_state_dict: Reference model state dict for GRPO
+        model: The language model.
+        inference_model: The inference model (may be separate from training model).
+        optimizer: The Megatron optimizer.
+        iteration: Current training iteration.
+        ref_state_dict: Reference model state dict for GRPO.
         grpo_iterations: How many steps we reuse the sampled data for.
         grpo_prompts_per_step: How many prompts we sample per data collection.
         grpo_group_size: How many samples we do per prompt.
         global_batch_size: Global batch size.
         sequence_packing: Use sequence packing if True.
         is_correction: Use IS correction if True.
-        buffered_rollouts: Previously collected rollouts (if any)
 
     Returns:
         RerunDataIterator for the current training step
     """
     runtime_state = get_rl_runtime_state()
+    args = get_args()
+    forced_lag = args.rl_forced_lag
+
+    if runtime_state.start_iteration is None:
+        runtime_state.start_iteration = iteration
+        if forced_lag > 0:
+            runtime_state.lag_buffer = deque()
+            runtime_state.pending_groups = {}
+            runtime_state.next_batch_id = 0
+            # Collect L batches into the lag buffer.
+            for _ in range(forced_lag):
+                runtime_state.lag_buffer.append(
+                    get_environment_rollouts(
+                        model, inference_model, optimizer,
+                        grpo_prompts_per_step, grpo_group_size,
+                    )
+                )
 
     # We collect new rollouts when we've gone over the collected data 'grpo_iterations' times.
     global_batches_per_collection = (grpo_prompts_per_step * grpo_group_size) // global_batch_size 
     if (
-        buffered_rollouts is None or
-        iteration == runtime_state.last_collection_iteration + 
+        runtime_state.data_iterator is None or
+        iteration >= runtime_state.last_collection_iteration +
         (grpo_iterations * global_batches_per_collection)
     ):
+        if forced_lag > 0:
+            runtime_state.lag_buffer.append(
+                get_environment_rollouts(
+                    model, inference_model, optimizer, grpo_prompts_per_step, grpo_group_size,
+                )
+            )
+            rollouts = runtime_state.lag_buffer.popleft()
+        else:
+            rollouts = get_environment_rollouts(
+                model, inference_model, optimizer, grpo_prompts_per_step, grpo_group_size,
+            )
 
-        buffered_rollouts = get_environment_rollouts(
-            model, inference_model, optimizer, grpo_prompts_per_step, grpo_group_size
-        )
-        buffered_rollouts = prepare_data_for_update(model=model, 
-            ref_state_dict=ref_state_dict, 
-            rollouts=buffered_rollouts,
+        runtime_state.data_iterator = prepare_data_for_update(
+            model=model,
+            ref_state_dict=ref_state_dict,
+            rollouts=rollouts,
             tokenizer=get_tokenizer(),
             sequence_packing=sequence_packing,
             is_correction=is_correction,
-            )
-        runtime_state.reset_iteration_counters(iteration)
+        )
 
-    return buffered_rollouts
+        runtime_state.reset_iteration_counters(iteration)
+        return runtime_state.data_iterator
+    return runtime_state.data_iterator
+
 
 
 def evaluate_and_print_results_rl(
