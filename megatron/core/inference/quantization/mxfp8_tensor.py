@@ -19,6 +19,9 @@ class MXFP8Tensor:
     data: torch.Tensor
     scale: torch.Tensor
 
+    def size(self, idx: int):
+        return self.data.size(idx)
+
     @classmethod
     def from_bf16(cls, x: torch.Tensor, group_size: int = 32):
         """Quantize BF16 tensor to MXFP8 format using FlashInfer."""

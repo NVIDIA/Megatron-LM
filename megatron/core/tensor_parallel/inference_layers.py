@@ -160,7 +160,7 @@ class InferenceLayerNormColumnParallelLinear(TELayerNormColumnParallelLinear):
             x = self._all_gather(x, symm_mem_buffer)
 
         # Check for MXFP8 execution
-        if self.config.fp8_recipe == "mxfp8" and HAVE_FLASHINFER:
+        if self.config.fp8_recipe == "mxfp8":
             x = mm_mxfp8(x, self.weight)
         else:
             x = torch.matmul(x, self.weight.t())
@@ -225,10 +225,15 @@ class InferenceRowParallelLinear(TERowParallelLinear):
         """
         # 1. check if bf16
         is_bf16 = x.dtype == torch.bfloat16
-        # 2. check if hopper or newer
+        # 2. check if mxfp8
+        use_mxfp8 = self.config.fp8_recipe == "mxfp8"
+        # 3. check if hopper or newer
         is_hopper_or_newer = torch.cuda.get_device_properties(x.device).major >= 9
-        # 3. attempt to ask for symmetric memory
+        # 4. attempt to ask for symmetric memory
         symm_mem_buffer_dims = list(x.size())
+        if use_mxfp8:
+            # Remove batch dimension for FlashInfer mxfp8
+            del symm_mem_buffer_dims[1]
         symm_mem_buffer_dims[-1] = self.weight.size(0)
         symm_mem_buffer = get_global_symmetric_memory_buffer().maybe_get_tensor(
             symm_mem_buffer_dims, dtype=x.dtype
@@ -238,8 +243,6 @@ class InferenceRowParallelLinear(TERowParallelLinear):
             is_bf16 and is_hopper_or_newer and has_enough_symmetric_memory
         )
 
-        # Check for MXFP8
-        use_mxfp8 = self.config.fp8_recipe == "mxfp8" and HAVE_FLASHINFER
 
         if can_use_custom_nvls_collectives:
             # Write output of matmul directly onto the symmetric memory buffer
@@ -308,7 +311,7 @@ class InferenceRowParallelLinear(TERowParallelLinear):
         Forward pass.
         """
         if self.tp_size == 1:
-            if self.config.fp8_recipe == "mxfp8" and HAVE_FLASHINFER:
+            if self.config.fp8_recipe == "mxfp8":
                 x = mm_mxfp8(x, self.weight)
             else:
                 x = torch.matmul(x, self.weight.t())

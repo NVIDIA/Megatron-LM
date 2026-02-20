@@ -65,10 +65,6 @@ async def run_flask_server_on_client(
     for endpoint in endpoints.__all__:
         app.register_blueprint(endpoint)
 
-    @app.route('/')
-    def health_check():
-        return "Megatron Dynamic Inference Server is running."
-
     loop = asyncio.get_event_loop()
 
     config = Config()
@@ -85,7 +81,7 @@ async def run_flask_server_on_client(
         logger.info(f"Using parsers: {parsers}")
 
     loop.set_default_executor(ThreadPoolExecutor(max_workers=8192))
-    await serve(AsyncioWSGIMiddleware(app), config)
+    await serve(AsyncioWSGIMiddleware(app, max_body_size=config.wsgi_max_body_size), config)
 
 
 @trace_async_exceptions

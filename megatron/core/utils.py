@@ -485,6 +485,38 @@ def is_causal_conv1d_min_version(version, check_equality=True):
     return get_causal_conv1d_version() > PkgVersion(version)
 
 
+def get_flashinfer_version():
+    """Get flashinfer version from __version__; if not available use pip's. Use caching."""
+    if not HAVE_PACKAGING:
+        raise ImportError(
+            "packaging is not installed. Please install it with `pip install packaging`."
+        )
+
+    def get_flashinfer_version_str():
+        import flashinfer
+
+        if hasattr(flashinfer, "__version__"):
+            return str(flashinfer.__version__)
+        else:
+            return version("flashinfer")
+
+    global _flashinfer_version
+    if _flashinfer_version is None:
+        _flashinfer_version = PkgVersion(get_flashinfer_version_str())
+    return _flashinfer_version
+
+
+def is_flashinfer_min_version(version, check_equality=True):
+    """Check if minimum version of `flashinfer` is installed."""
+    if not HAVE_PACKAGING:
+        raise ImportError(
+            "packaging is not installed. Please install it with `pip install packaging`."
+        )
+    if check_equality:
+        return get_flashinfer_version() >= PkgVersion(version)
+    return get_flashinfer_version() > PkgVersion(version)
+
+
 def ensure_divisibility(numerator, denominator):
     """Ensure that numerator is divisible by the denominator."""
     assert numerator % denominator == 0, "{} is not divisible by {}".format(numerator, denominator)

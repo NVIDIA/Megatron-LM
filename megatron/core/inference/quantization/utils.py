@@ -12,7 +12,7 @@ except ImportError:
     HAVE_TE = False
 
 try:
-    from flashinfer import bmm_mxfp8
+    from flashinfer import mm_mxfp8 as flashinfer_mm_mxfp8
 
     HAVE_FLASHINFER = True
 except ImportError:
@@ -25,6 +25,7 @@ def quantize_model_to_mxfp8(model: torch.nn.Module) -> None:
     recursively translating each layer's weights.
     """
     assert HAVE_TE
+    assert HAVE_FLASHINFER
 
     # Recurse through child modules
     for child in model.children():
@@ -55,15 +56,12 @@ def mm_mxfp8(x: torch.Tensor, weight: torch.Tensor, out: torch.Tensor = None):
     """Computes a matmul in MXFP8 using FlashInfer."""
     assert HAVE_FLASHINFER
 
-    # TODO(ksanthanam): Use the FlashInfer mm_mxfp8 API once 0.6.4 is released
-
     x = MXFP8Tensor.from_bf16(x.squeeze(1))
-    return bmm_mxfp8(
-        x.data.unsqueeze(0),
-        self.weight.data.T.unsqueeze(0),
+    return flashinfer_mm_mxfp8(
+        x.data,
+        weight.data.T,
         x.scale,
-        self.weight.scale,
-        dtype=torch.bfloat16,
+        weight.scale,
+        out_dtype=torch.bfloat16,
         out=out,
-    ).transpose(0, 1)
-
+    ).unsqueeze(1)
