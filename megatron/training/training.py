@@ -283,16 +283,19 @@ def _attn_layer_flops(
 def _mamba_layer_flops(batch_size, seq_len, hidden_size, state_dim=16,
                        head_dim=64, num_groups=1, num_heads=128):
     """Calculate FLOPs for a Mamba layer."""
-    # Note (rwaleffe): flops estimate for scan should be updated based on new SSD kernels,
-    # but small percent of overall layer flops
+    # Note (rwaleffe): FLOP estimate for scan should be updated based on new SSD kernels,
+    # but it is a small percent of overall layer FLOPs, so this approximate formula is used.
     d_in = 2 * hidden_size
     if num_heads:
         nheads = num_heads
     else:
         nheads = d_in // head_dim
-    return (
-        (
-            2
+    # Approximate FLOPs:
+    # - Projections in and out of the state space, scaled by num_groups.
+    proj_flops = 4 * batch_size * seq_len * hidden_size * d_in * max(num_groups, 1)
+    # - State update / scan cost across sequence for each head and state dimension.
+    state_flops = 2 * batch_size * seq_len * nheads * state_dim
+    return proj_flops + state_flops
 def num_floating_point_operations(args, batch_size):
     def calculate_layer_counts():
         """Calculate the number of attention, Mamba, and MLP layers."""
