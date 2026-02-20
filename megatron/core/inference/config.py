@@ -52,6 +52,13 @@ class MambaInferenceStateConfig:
         return None
 
 
+class PrefixCachingEvictPolicy(Enum):
+    """Eviction policy for prefix caching blocks."""
+
+    REF_ZERO = "ref_zero"
+    LRU = "lru"
+
+
 class KVCacheManagementMode(str, Enum):
     """Mode for handling large tensors (KV cache, Mamba states) during suspend/resume."""
 
@@ -184,6 +191,12 @@ class InferenceConfig:
     # =================================
     enable_chunked_prefill: bool = False
     """Whether to enable chunked prefill."""
+
+    enable_prefix_caching: bool = False
+    """Whether to enable prefix caching for KV cache block sharing."""
+
+    prefix_caching_evict_policy: PrefixCachingEvictPolicy = PrefixCachingEvictPolicy.REF_ZERO
+    """Eviction policy for prefix caching blocks. Only applies when enable_prefix_caching is True."""
 
     # =================================
     # Logging config
