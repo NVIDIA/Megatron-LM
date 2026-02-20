@@ -159,11 +159,12 @@ jobs:
             --jq '.contexts[]' 2>/dev/null)
 
           if [ -z "$REQUIRED_CHECKS" ]; then
-            echo "Warning: Could not fetch required checks, falling back to any-check detection"
-          else
-            echo "Required checks from branch protection:"
-            echo "$REQUIRED_CHECKS"
+            echo "No branch protection rules found for ${{ env.TARGET_BRANCH }}, skipping wait"
+            exit 0
           fi
+
+          echo "Required checks from branch protection:"
+          echo "$REQUIRED_CHECKS"
 
           echo "Waiting for required checks to complete on PR #$PR_NUMBER..."
           i=0
@@ -171,41 +172,34 @@ jobs:
           while true; do
             i=$((i + 1))
             CHECKS_JSON=$(gh pr checks "$PR_NUMBER" --json name,state 2>/dev/null || echo "[]")
-            if [ -n "$REQUIRED_CHECKS" ]; then
-              ALL_DONE=true
-              FAILED_CHECKS=""
-              while IFS= read -r check; do
-                CHECK_STATE=$(echo "$CHECKS_JSON" | jq -r --arg name "$check" '.[] | select(.name == $name) | .state // ""' | tr '[:upper:]' '[:lower:]')
-                case "$CHECK_STATE" in
-                  *success*|*pass*|*skip*|*neutral*) ;;
-                  *pending*|*queued*|*progress*|*waiting*|*request*|"")
+            ALL_DONE=true
+            FAILED_CHECKS=""
+            while IFS= read -r check; do
+              CHECK_STATE=$(echo "$CHECKS_JSON" | jq -r --arg name "$check" '.[] | select(.name == $name) | .state // ""' | tr '[:upper:]' '[:lower:]')
+              case "$CHECK_STATE" in
+                *success*|*pass*|*skip*|*neutral*) ;;
+                *pending*|*queued*|*progress*|*waiting*|*request*|"")
+                  ALL_DONE=false
+                  INITIALIZED=true
+                  break
+                  ;;
+                *)
+                  if [ "$INITIALIZED" = "true" ]; then
+                    FAILED_CHECKS="${FAILED_CHECKS}  - ${check} (${CHECK_STATE})"$'\n'
+                  else
                     ALL_DONE=false
-                    INITIALIZED=true
-                    break
-                    ;;
-                  *)
-                    if [ "$INITIALIZED" = "true" ]; then
-                      FAILED_CHECKS="${FAILED_CHECKS}  - ${check} (${CHECK_STATE})"$'\n'
-                    else
-                      ALL_DONE=false
-                    fi
-                    ;;
-                esac
-              done <<< "$REQUIRED_CHECKS"
-              if [ "$ALL_DONE" = "true" ]; then
-                if [ -n "$FAILED_CHECKS" ]; then
-                  echo "Required check(s) did not pass:"
-                  echo "$FAILED_CHECKS"
-                  exit 1
-                fi
-                echo "All required checks passed!"
-                break
+                  fi
+                  ;;
+              esac
+            done <<< "$REQUIRED_CHECKS"
+            if [ "$ALL_DONE" = "true" ]; then
+              if [ -n "$FAILED_CHECKS" ]; then
+                echo "Required check(s) did not pass:"
+                echo "$FAILED_CHECKS"
+                exit 1
               fi
-            else
-              if echo "$CHECKS_JSON" | jq -e '[.[] | select(.state | ascii_downcase | test("pending|queued|progress|waiting|request"))] | length == 0' > /dev/null 2>&1; then
-                echo "All checks completed!"
-                break
-              fi
+              echo "All required checks passed!"
+              break
             fi
             echo "Checks not yet complete (attempt $i), retrying in 30s..."
             sleep 30
