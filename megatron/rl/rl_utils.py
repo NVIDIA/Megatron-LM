@@ -882,19 +882,13 @@ def prep_wandb_metrics(
                 ),
                 'advantages', 'Advantages'
             ),
-            'policy_staleness_hist': wandb_writer.plot.histogram(
-                wandb_writer.Table(
-                    columns=['policy_staleness'],
-                    data=[[s] for g in policy_staleness for s in g],
-                ),
-                'policy_staleness', 'Policy Staleness',
-            ),
-            'staleness_correlation': wandb_writer.Table(
-                columns=['policy_staleness', 'reward', 'traj_length'],
+            'rollout_table': wandb_writer.Table(
+                columns=['policy_staleness', 'reward', 'traj_length', 'num_evictions'],
                 data=list(zip(
                     [s for g in policy_staleness for s in g],
                     [r for g in rewards for r in g],
                     [l for g in traj_lens for l in g],
+                    [e for g in num_evictions for e in g],
                 )),
             ),
             'mean_turn_length': np.mean([np.mean(g) for g in turn_lens]),
