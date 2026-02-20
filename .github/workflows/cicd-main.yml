@@ -233,8 +233,6 @@ jobs:
       - pre-flight
       - cicd-wait-in-queue
       - cicd-parse-downstream-testing
-    env:
-      MBRIDGE_BRANCH_NAME: mcore-testing-${{ fromJSON(steps.get-pr-info.outputs.pr-info || '{}').number || github.run_id }}
     if: |
       needs.pre-flight.result != 'cancelled'
       && needs.cicd-wait-in-queue.result != 'cancelled'
@@ -261,6 +259,8 @@ jobs:
           token: ${{ secrets.PAT }}
 
       - name: Create testing branch
+        env:
+          MBRIDGE_BRANCH_NAME: mcore-testing-${{ fromJSON(steps.get-pr-info.outputs.pr-info || '{}').number || github.run_id }}
         run: |
           cd megatron-bridge
           git fetch origin main
@@ -285,6 +285,8 @@ jobs:
 
       - name: Trigger MBridge tests
         uses: convictional/trigger-workflow-and-wait@v1.6.5
+        env:
+          MBRIDGE_BRANCH_NAME: mcore-testing-${{ fromJSON(steps.get-pr-info.outputs.pr-info || '{}').number || github.run_id }}
         with:
           owner: NVIDIA-NeMo
           repo: Megatron-Bridge
