@@ -176,6 +176,34 @@ def clip_grad_by_total_norm_fp32(
             multi_tensor_scale_impl, dummy_overflow_buf, [grads, grads], clip_coeff
         )
 
+def zero_grads_manual_impl(
+    parameters: Union[List[torch.Tensor], torch.Tensor],
+    use_decoupled_grad: bool = False,
+):
+    """Zero out the gradients
+
+    Note that the gradients are modified in place.
+
+    Args:
+        parameters (Iterable[Tensor] or Tensor): an iterable of Tensors or a
+            single Tensor that will have gradients normalized.
+        use_decoupled_grad (bool, optional): whether to read grad from ".grad" or ".decoupled_grad",
+            default value is False.
+    """
+    # Grads.
+    grads = []
+    for param in parameters:
+        if use_decoupled_grad:
+            if hasattr(param, "decoupled_grad") and param.decoupled_grad is not None:
+                assert param.decoupled_grad.dtype in [torch.float32, torch.bfloat16]
+                grads.append(to_local_if_dtensor(param.decoupled_grad).detach())
+        else:
+            if param.grad is not None:
+                assert param.grad.type() == 'torch.cuda.FloatTensor'
+                grads.append(to_local_if_dtensor(param.grad).detach())
+
+    for g in grads:
+        g.zero_()
 
 def count_zeros_fp32(
     parameters: Union[List[torch.Tensor], torch.Tensor],

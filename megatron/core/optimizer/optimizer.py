@@ -48,7 +48,7 @@ from ..dist_checkpointing.optimizer import (
 from ..dist_checkpointing.utils import add_prefix_for_sharding
 from ..transformer.module import param_is_not_shared
 from ..utils import log_single_rank
-from .clip_grads import clip_grad_by_total_norm_fp32, count_zeros_fp32, get_grad_norm_fp32
+from .clip_grads import clip_grad_by_total_norm_fp32, count_zeros_fp32, get_grad_norm_fp32, zero_grads_manual_impl
 from .grad_scaler import MegatronGradScaler
 from .optimizer_config import OptimizerConfig
 
@@ -1339,9 +1339,12 @@ class ChainedOptimizer(MegatronOptimizer):
                     ),
                 )
 
+            if grad_norm > optimizer.config.grad_norm_skip_threshold:
+                print("skipping grad norm because it's too large", grad_norm)
+                zero_grads_manual_impl(parameters, use_decoupled_grad=optimizer.config.use_precision_aware_optimizer_no_fp8_or_ds_fp8)
+
         # Count the zeros in the grads.
         num_zeros_in_grad = self.count_zeros() if self.config.log_num_zeros_in_grad else None
-
         update_successful = self.step_with_ready_grads()
 
         return update_successful, grad_norm, num_zeros_in_grad
