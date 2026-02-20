@@ -103,7 +103,7 @@ def get_train_data_iterator() -> Iterator:
         reset_attention_mask=False,
         eod_mask_loss=False,
         tokenizer=MegatronTokenizer.from_pretrained(
-            metdata_path={"library": "null-text"},
+            metadata_path={"library": "null-text"},
             vocab_size=_SEQUENCE_LENGTH,
         ),
         mid_level_dataset_surplus=0.005,
