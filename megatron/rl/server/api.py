@@ -21,9 +21,6 @@ class Server(TypeLookupable):
     def resume(self):
         pass
 
-    def increment_staleness(self):
-        pass
-
     async def kill(self):
         raise NotImplementedError
 
