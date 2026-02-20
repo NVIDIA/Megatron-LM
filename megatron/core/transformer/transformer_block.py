@@ -622,21 +622,14 @@ class TransformerBlock(GraphableMegatronModule, MegatronModule):
         """
         if (
             not self.training
-            and self.config.cuda_graph_impl == "local"
+            and hasattr(self, 'cudagraph_manager')  
             and kwargs['attention_mask'] is None
             and (
                 kwargs.get('inference_context') is not None
                 or kwargs.get('inference_params') is not None
             )
-            and CudaGraphScope.full_iteration in self.config.cuda_graph_scope
+            and CudaGraphScope.full_iteration_inference in self.config.cuda_graph_scope
         ):
-            if not hasattr(self, 'cudagraph_manager'):
-                # lazily initialie a full iteration cuda graph manager for inference
-                # we do not want to initialize it for training-only workloads
-                # however it is not possible to detect whether we are in a training or inference workload at 
-                # the time of module initialization, hence we lazily initialize the cudagraph manager at the 
-                # time of first inference forward pass
-                self._init_cudagraph_manager(self.config)
             if kwargs['inference_context'].is_static_batching():
                 using_cuda_graph = kwargs['inference_context'].is_decode_only()
             else:
