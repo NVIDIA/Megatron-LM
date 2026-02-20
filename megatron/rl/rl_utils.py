@@ -974,22 +974,21 @@ def maybe_log_training_metrics(
         'mean_inf_prob': group_stats.mean_inf_prob,
     }
 
-    traj_lens = group_stats.traj_lens
-    turn_lens = group_stats.turn_lens
-    rewards = group_stats.rewards
-    num_turns = group_stats.num_turns
-    advantages = group_stats.advantages
-    policy_staleness = group_stats.policy_staleness
-    kv_cache_staleness = group_stats.kv_cache_staleness
-    num_evictions = group_stats.num_evictions
-    completed_at_steps = group_stats.completed_at_steps
-
-    metrics = metrics | prep_wandb_metrics(wandb_writer=wandb_writer,
-        traj_lens=traj_lens, turn_lens=turn_lens, rewards=rewards, num_turns=num_turns, advantages=advantages,
-        policy_staleness=policy_staleness, kv_cache_staleness=kv_cache_staleness, num_evictions=num_evictions,
-        completed_at_steps=completed_at_steps, current_iteration=current_iteration)
+    metrics = metrics | prep_wandb_metrics(
+        wandb_writer=wandb_writer,
+        traj_lens=group_stats.traj_lens,
+        turn_lens=group_stats.turn_lens,
+        rewards=group_stats.rewards,
+        num_turns=group_stats.num_turns,
+        advantages=group_stats.advantages,
+        policy_staleness=group_stats.policy_staleness,
+        kv_cache_staleness=group_stats.kv_cache_staleness,
+        num_evictions=group_stats.num_evictions,
+        completed_at_steps=group_stats.completed_at_steps,
+        current_iteration=current_iteration
+    )
     env_stats = lambda cont, idx: [cont[i] for i in idx]
-    group_turn_counts = [sum(nt) for nt in num_turns]
+    group_turn_counts = [sum(nt) for nt in group_stats.num_turns]
 
     for env_id in set(group_stats.env_ids):
         env_idx = [i for i, eidx in enumerate(group_stats.env_ids) if eidx == env_id]
@@ -999,17 +998,19 @@ def maybe_log_training_metrics(
         for i in env_idx:
             st = sum(group_turn_counts[:i])
             end = st + group_turn_counts[i]
-            env_advantages.extend(advantages[st:end])
+            env_advantages.extend(group_stats.advantages[st:end])
 
-        env_metrics = prep_wandb_metrics(wandb_writer=wandb_writer, traj_lens=env_stats(traj_lens, env_idx),
-            turn_lens=env_stats(turn_lens, env_idx),
-            rewards=env_stats(rewards, env_idx),
-            num_turns=env_stats(num_turns, env_idx),
+        env_metrics = prep_wandb_metrics(
+            wandb_writer=wandb_writer,
+            traj_lens=env_stats(group_stats.traj_lens, env_idx),
+            turn_lens=env_stats(group_stats.turn_lens, env_idx),
+            rewards=env_stats(group_stats.rewards, env_idx),
+            num_turns=env_stats(group_stats.num_turns, env_idx),
             advantages=env_advantages,
-            policy_staleness=env_stats(policy_staleness, env_idx),
-            kv_cache_staleness=env_stats(kv_cache_staleness, env_idx),
-            num_evictions=env_stats(num_evictions, env_idx),
-            completed_at_steps=env_stats(completed_at_steps, env_idx),
+            policy_staleness=env_stats(group_stats.policy_staleness, env_idx),
+            kv_cache_staleness=env_stats(group_stats.kv_cache_staleness, env_idx),
+            num_evictions=env_stats(group_stats.num_evictions, env_idx),
+            completed_at_steps=env_stats(group_stats.completed_at_steps, env_idx),
             current_iteration=current_iteration,
             example_group=example_groups[env_id],
             tokenizer=tokenizer,
