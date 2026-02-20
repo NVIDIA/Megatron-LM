@@ -45,40 +45,50 @@ except ImportError:
     HAVE_APEX = False
 
 
-def get_bert_layer_with_transformer_engine_spec():
-    """Use this spec to use lower-level Transformer Engine modules (required for fp8 training).
+def get_bert_layer_with_transformer_engine_submodules() -> TransformerLayerSubmodules:
+    """Use these submodules to use lower-level Transformer Engine modules (required for fp8
+    training).
 
     Returns:
-        ModuleSpec: Module specification with TE modules
+        TransformerLayerSubmodules: Submodules with TE modules.
     """
     if not HAVE_TE:
         raise ImportError(
             "Transformer Engine is not installed. Please use local Bert layer spec instead."
         )
 
-    return ModuleSpec(
-        module=TransformerLayer,
-        submodules=TransformerLayerSubmodules(
-            self_attention=ModuleSpec(
-                module=SelfAttention,
-                params={"attn_mask_type": AttnMaskType.padding},
-                submodules=SelfAttentionSubmodules(
-                    linear_qkv=not_none(TELayerNormColumnParallelLinear),
-                    core_attention=not_none(TEDotProductAttention),
-                    linear_proj=TERowParallelLinear,
-                    q_layernorm=IdentityOp,
-                    k_layernorm=IdentityOp,
-                ),
+    return TransformerLayerSubmodules(
+        self_attention=ModuleSpec(
+            module=SelfAttention,
+            params={"attn_mask_type": AttnMaskType.padding},
+            submodules=SelfAttentionSubmodules(
+                linear_qkv=not_none(TELayerNormColumnParallelLinear),
+                core_attention=not_none(TEDotProductAttention),
+                linear_proj=not_none(TERowParallelLinear),
+                q_layernorm=IdentityOp,
+                k_layernorm=IdentityOp,
             ),
-            self_attn_bda=get_bias_dropout_add,
-            mlp=ModuleSpec(
-                module=MLP,
-                submodules=MLPSubmodules(
-                    linear_fc1=TELayerNormColumnParallelLinear, linear_fc2=TERowParallelLinear
-                ),
-            ),
-            mlp_bda=get_bias_dropout_add,
         ),
+        self_attn_bda=get_bias_dropout_add,
+        mlp=ModuleSpec(
+            module=MLP,
+            submodules=MLPSubmodules(
+                linear_fc1=not_none(TELayerNormColumnParallelLinear),
+                linear_fc2=not_none(TERowParallelLinear),
+            ),
+        ),
+        mlp_bda=get_bias_dropout_add,
+    )
+
+
+def get_bert_layer_with_transformer_engine_spec():
+    """Use this spec to use lower-level Transformer Engine modules (required for fp8 training).
+
+    Returns:
+        ModuleSpec: Module specification with TE modules
+    """
+    return ModuleSpec(
+        module=TransformerLayer, submodules=get_bert_layer_with_transformer_engine_submodules()
     )
 
 
