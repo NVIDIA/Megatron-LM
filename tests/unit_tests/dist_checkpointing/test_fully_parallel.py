@@ -27,10 +27,7 @@ from megatron.core.dist_checkpointing.mapping import (
     ShardedTensorFactory,
     is_main_replica,
 )
-from megatron.core.dist_checkpointing.serialization import (
-    get_default_load_sharded_strategy,
-    get_default_save_sharded_strategy,
-)
+from megatron.core.dist_checkpointing.serialization import get_default_save_sharded_strategy
 from megatron.core.dist_checkpointing.strategies.base import (
     LoadShardedStrategy,
     SaveShardedStrategy,

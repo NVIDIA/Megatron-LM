@@ -8,14 +8,12 @@ from transformer_engine.pytorch.fp8 import check_fp8_support, fp8_autocast
 from megatron.core import parallel_state
 from megatron.core.dist_checkpointing import load, load_plain_tensors, save
 from megatron.core.dist_checkpointing.dict_utils import diff
-from megatron.core.dist_checkpointing.serialization import (
-    get_default_load_sharded_strategy,
-    get_default_save_sharded_strategy,
-)
+from megatron.core.dist_checkpointing.serialization import get_default_save_sharded_strategy
 from megatron.core.dist_checkpointing.strategies.fully_parallel import (
     FullyParallelLoadStrategyWrapper,
     FullyParallelSaveStrategyWrapper,
 )
+from megatron.core.dist_checkpointing.strategies.torch import TorchDistLoadShardedStrategy
 from megatron.core.models.gpt.gpt_layer_specs import (
     get_gpt_layer_local_spec,
     get_gpt_layer_with_transformer_engine_spec,
@@ -204,7 +202,7 @@ class TestExpertLayerReconfiguration:
             )
             model_B = initialize_expert_layer(1, use_glu, expert_type)
             if use_fpsl:
-                load_strategy = get_default_load_sharded_strategy(ckpt_dir_A)
+                load_strategy = TorchDistLoadShardedStrategy()
                 load_strategy = FullyParallelLoadStrategyWrapper(
                     load_strategy,
                     parallel_state.get_data_parallel_group(with_context_parallel=True),
