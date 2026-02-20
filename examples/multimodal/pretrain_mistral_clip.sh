@@ -93,7 +93,7 @@ OPTIONS=" \
     --eval-iters 10 \
     --eval-interval 1000 \
     --tokenizer-type MultimodalTokenizer \
-    --tokenizer-model mistralai/Mistral-7B-v0.3 \
+    --tokenizer-model mistralai/Mistral-7B-Instruct-v0.3 \
     --tokenizer-prompt-format mistral \
     --data-path ${DATA_TRAIN} \
     --prompt-path ${SOURCE}/examples/multimodal/manual_prompts.json \
