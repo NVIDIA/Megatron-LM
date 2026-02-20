@@ -180,7 +180,7 @@ jobs:
             else
               echo "$CURRENT_CHECKS" | grep -qE '(pass|fail|pending|in_progress|queued)' && { echo "Checks found, starting watch..."; break; }
             fi
-            echo "Required checks not yet present (attempt $i/40), retrying in 30s..."
+            echo "Required checks not yet present (attempt $i/480), retrying in 30s..."
             sleep 30
           done
 
