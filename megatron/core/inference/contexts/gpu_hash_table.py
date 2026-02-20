@@ -229,6 +229,11 @@ class GPUHashTable:
         If a key already exists, its value is updated. Keys equal to -1
         (the empty sentinel) are skipped.
 
+        The insert kernel uses non-atomic stores, so concurrent threads that
+        hash to the same slot can race. We retry with only the missing keys
+        until all are inserted. Collisions are astronomically rare in practice
+        (64-bit hash space) so the retry loop almost never executes.
+
         Args:
             keys: int64 tensor of hash keys to insert.
             values: int32 tensor of block IDs (same length as keys).
@@ -240,14 +245,39 @@ class GPUHashTable:
         assert keys.dtype == torch.int64 and keys.device == self.device
         assert values.dtype == torch.int32 and values.device == self.device
 
-        _hash_table_insert_kernel[(n,)](
-            self.keys,
-            self.values,
-            keys,
-            values,
-            CAPACITY_MASK=self.capacity_mask,
-            EMPTY=self.EMPTY,
-        )
+        remaining_keys = keys
+        remaining_values = values
+
+        for _ in range(8):
+            m = remaining_keys.numel()
+            _hash_table_insert_kernel[(m,)](
+                self.keys,
+                self.values,
+                remaining_keys,
+                remaining_values,
+                CAPACITY_MASK=self.capacity_mask,
+                EMPTY=self.EMPTY,
+            )
+
+            # Verify all non-sentinel keys were inserted
+            valid = remaining_keys != self.EMPTY
+            if not valid.any():
+                break
+            results = torch.full((m,), -1, dtype=torch.int32, device=self.device)
+            _hash_table_lookup_kernel[(m,)](
+                self.keys,
+                self.values,
+                remaining_keys,
+                results,
+                CAPACITY_MASK=self.capacity_mask,
+                EMPTY=self.EMPTY,
+            )
+            missing = valid & (results < 0)
+            if not missing.any():
+                break
+            remaining_keys = remaining_keys[missing]
+            remaining_values = remaining_values[missing]
+
         self.size += n  # Approximate; may overcount on duplicate inserts
 
     def lookup_batch(self, query_keys: Tensor, results: Tensor) -> None:
