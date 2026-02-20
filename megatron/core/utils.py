@@ -1229,6 +1229,8 @@ def local_multi_tensor_l2_norm(chunk_size, noop_flag, tensor_lists, per_tensor, 
             tensor.dtype == torch.float32 for tensor in tensor_list
         ):
             batch_norms = torch._foreach_norm(tensor_list, 2.0)
+            # Explicitly cast to float32 to keep dtype consistent with the fallback path.
+            batch_norms = [bn.to(torch.float32) for bn in batch_norms]
             norms.extend(batch_norms)
         else:
             for tensor in tensor_list:
