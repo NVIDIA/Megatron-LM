@@ -1,10 +1,12 @@
 # Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
 import asyncio
+import gc
 import math
 import random
 import types
 from dataclasses import dataclass, field
+from functools import partial
 from typing import Dict, List, Optional, Tuple
 
 import pytest
@@ -13,7 +15,11 @@ from tqdm import tqdm
 from transformer_engine.pytorch.fp8 import check_fp8_support
 
 from megatron.core import parallel_state
-from megatron.core.inference.config import InferenceConfig, MambaInferenceStateConfig
+from megatron.core.inference.config import (
+    InferenceConfig,
+    KVCacheManagementMode,
+    MambaInferenceStateConfig,
+)
 from megatron.core.inference.contexts.dynamic_context import (
     ActiveRequestCountOverflowError,
     BlockOverflowError,
@@ -46,6 +52,13 @@ from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.utils import is_fa_min_version, is_te_min_version
 from tests.unit_tests.test_utilities import Utils
 
+try:
+    from torch_memory_saver import torch_memory_saver  # noqa: F401
+
+    HAVE_TORCH_MEMORY_SAVER = True
+except ImportError:
+    HAVE_TORCH_MEMORY_SAVER = False
+
 
 def skip_if_mamba_sequence_packing_not_available(model_provider: str):
     if model_provider == "mamba":
@@ -61,6 +74,17 @@ def set_rounder(value):
     DynamicInferenceContext.ROUNDER = value  # For backwards compatibility
     DynamicInferenceContext.TOKEN_ROUNDER = value
     DynamicInferenceContext.REQUEST_ROUNDER = value
+
+
+def mock_forward(input_ids, position_ids, attention_mask, *args, **kwargs):
+    """Mock forward function to avoid numerics issues with random inputs."""
+    return torch.randn(
+        input_ids.size(0),
+        input_ids.size(1),
+        kwargs["vocab_size"],
+        device=input_ids.device,
+        dtype=torch.bfloat16,
+    )
 
 
 @dataclass
@@ -111,6 +135,8 @@ class DynamicEngineTestConfig:
     # relevant to the test. The tests only check if the required
     # context attributes are set correctly.
     suspend_resume_interval: Optional[int] = None
+    kv_cache_management_mode: str = "persist"
+    static_kv_memory_pointers: bool = True
     track_generated_token_events: bool = False
 
     fp8: bool = False
@@ -227,6 +253,10 @@ class TestDynamicInferenceEngine:
                 max_tokens=test_config.context_max_tokens,
                 mamba_inference_state_config=mamba_inference_state_config,
                 materialize_only_last_token_logits=test_config.materialize_only_last_token_logits,
+                kv_cache_management_mode=KVCacheManagementMode(
+                    test_config.kv_cache_management_mode
+                ),
+                static_kv_memory_pointers=test_config.static_kv_memory_pointers,
                 enable_chunked_prefill=test_config.enable_chunked_prefill,
                 use_flashinfer_fused_rope=None,  # default to using flash-infer if available
                 # this is for compatibility with the LTS environment
@@ -1215,19 +1245,10 @@ class TestDynamicInferenceEngine:
         env = self._build_test_env(test_config)
         ctx = env.engine.context
 
-        def mock_forward(input_ids, position_ids, attention_mask, *args, **kwargs):
-            return torch.randn(
-                input_ids.size(0),
-                input_ids.size(1),
-                test_config.vocab_size,
-                device=input_ids.device,
-                dtype=torch.bfloat16,
-            )
-
         # Mock the model forward function to avoid possible numerics issues
         # caused by random inputs
         model_instance = env.engine.controller.inference_wrapped_model.model
-        model_instance.forward = mock_forward
+        model_instance.forward = partial(mock_forward, vocab_size=test_config.vocab_size)
 
         # Request 1: 150 tokens
         req1_tokens = torch.randint(0, test_config.vocab_size, (130,), device='cuda')
@@ -1394,6 +1415,105 @@ class TestDynamicInferenceEngine:
 
         # Verify that request 3 has finished
         assert req3.status == Status.COMPLETED
+
+    @pytest.mark.internal
+    @pytest.mark.skipif(
+        not is_fa_min_version("2.7.3"), reason="need latest flash attn for dynamic batching"
+    )
+    @torch.inference_mode()
+    def test_chunked_prefill_avoid_single_token_chunk(self):
+        """
+        Test that chunked prefill scheduling avoids leaving exactly 1 token for the final chunk.
+        This leads to a known bug in the Flash Attention kernel:
+        https://github.com/Dao-AILab/flash-attention/issues/1537
+
+        Scenario:
+            - Max tokens per step (Chunk Size): 256
+            - Request prompt length: 512
+
+        Note that for all chunks after the first chunk we subtract 1 from the active token
+        count, so the chunk size will be 1 less.
+
+        Default scheduling would do:
+            1. Chunk 256 (Remaining 256)
+            2. Chunk 255 (Remaining 1) -> max_seqlen_q=1 triggers decode path in kernel
+            3. Chunk 1
+
+        Fixed scheduling should do:
+            1. Chunk 256 (Remaining 256) -> 256 - 256 != 1. Schedule full 256.
+            2. Chunk 254 (Remaining 2)   -> 256 tokens left. If we take 255, 1 remains.
+                                            So we reduce chunk to 254.
+            3. Chunk 2   (Remaining 0)
+        """
+        chunk_size = 256
+        # Prompt length designed to trigger the edge case: Chunk + (Chunk + 1)
+        # 256 + 256 = 512
+        prompt_len = 512
+
+        test_config = DynamicEngineTestConfig(
+            model_provider="gpt",
+            num_requests=0,
+            num_tokens_to_generate=None,
+            num_tokens_total=513,
+            context_max_tokens=chunk_size,
+            context_max_requests=1,
+            context_block_size_tokens=256,
+            enable_chunked_prefill=True,
+            use_cuda_graphs_for_non_decode_steps=False,
+        )
+
+        env = self._build_test_env(test_config)
+        ctx = env.engine.context
+
+        # Mock the model forward function to avoid possible numerics issues
+        # caused by random inputs
+        model_instance = env.engine.controller.inference_wrapped_model.model
+        model_instance.forward = partial(mock_forward, vocab_size=test_config.vocab_size)
+
+        # Create a request with length 513
+        req_tokens = torch.randint(0, test_config.vocab_size, (prompt_len,), device='cuda')
+        req = DynamicInferenceRequest(
+            request_id=1,
+            prompt_tokens=req_tokens,
+            sampling_params=SamplingParams(num_tokens_to_generate=1),
+        )
+
+        env.engine._add_request(req)
+
+        assert req.status == Status.ACTIVE_AND_GENERATING_TOKENS
+
+        # --- Step 1 ---
+        # Available: 256. Remaining: 512.
+        # Logic: 512 - 256 = 256. Not 1. Schedule full 256.
+        env.engine.schedule_waiting_requests()
+        env.engine.step_modern()
+
+        assert (
+            req.finished_chunk_token_count == 256
+        ), f"Step 1: Expected 256 tokens processed, got {req.finished_chunk_token_count}"
+
+        # --- Step 2 ---
+        # Available: 256. Remaining un-prefilled: 256.
+        # Logic: 256 - (256 - 1) = 1. This is the edge case!
+        # Fix should reduce chunk size by 1 (to 254).
+        env.engine.schedule_waiting_requests()
+        env.engine.step_modern()
+
+        # 256 (previous) + 254 (this step) = 510
+        assert req.finished_chunk_token_count == 510, (
+            "Step 2: Expected 510 tokens processed (256+254), "
+            f"got {req.finished_chunk_token_count}. "
+        )
+
+        # --- Step 3 ---
+        # Remaining un-prefilled: 2. Available: 255.
+        # Logic: 2 <= 255. Schedule 2.
+        env.engine.schedule_waiting_requests()
+        env.engine.step_modern()
+
+        # Verify request finishes prefill and completes
+        assert ctx.num_prefill_requests == 0
+        assert req.status == Status.COMPLETED
 
     @pytest.mark.internal
     @pytest.mark.skipif(
@@ -1613,3 +1733,117 @@ class TestDynamicInferenceEngine:
             assert context.max_requests == 4
             assert step_count == 34
         assert context.block_allocator.active_count == 655
+
+    @pytest.mark.internal
+    @pytest.mark.skipif(
+        not is_fa_min_version("2.7.3"), reason="need latest flash attn for dynamic batching"
+    )
+    @pytest.mark.parametrize("static_kv_memory_pointers", [True, False])
+    @pytest.mark.parametrize("kv_cache_management_mode", ["persist", "offload", "recompute"])
+    @torch.inference_mode()
+    def test_suspend_resume_cycle(self, kv_cache_management_mode, static_kv_memory_pointers):
+        """Full suspend -> resume cycle with memory, data, and address checks."""
+        needs_tms = static_kv_memory_pointers and kv_cache_management_mode != "persist"
+
+        test_config = DynamicEngineTestConfig(
+            kv_cache_management_mode=kv_cache_management_mode,
+            static_kv_memory_pointers=static_kv_memory_pointers,
+        )
+
+        # Without TMS, these combos must assert on construction.
+        if needs_tms and not HAVE_TORCH_MEMORY_SAVER:
+            with pytest.raises(AssertionError, match="Static KV memory pointers"):
+                self._build_test_env(test_config)
+            return
+
+        env = self._build_test_env(test_config)
+        engine = env.engine
+        context = engine.context
+
+        assert not engine.is_suspended
+        assert context.is_tensor_state_allocated
+
+        deallocates = kv_cache_management_mode != "persist"
+        uses_tms = context._uses_torch_memory_saver
+        preserves_data = kv_cache_management_mode != "recompute"
+
+        # Write a deterministic pattern for data integrity check.
+        if preserves_data:
+            context.memory_buffer.copy_(torch.randn_like(context.memory_buffer))
+            expected = context.memory_buffer.clone()
+
+        addr_before = context.memory_buffer.data_ptr()
+
+        gc.collect()
+        torch.cuda.empty_cache()
+        torch.cuda.synchronize()
+        mem_before = torch.cuda.memory_allocated()
+        if uses_tms:
+            phys_mem_before = torch.cuda.mem_get_info()[0]
+
+        # Suspend.
+        engine.suspend()
+        assert engine.is_suspended
+        assert not context.is_tensor_state_allocated
+
+        gc.collect()
+        torch.cuda.empty_cache()
+        torch.cuda.synchronize()
+        mem_suspended = torch.cuda.memory_allocated()
+        if uses_tms:
+            phys_mem_suspended = torch.cuda.mem_get_info()[0]
+
+        if deallocates and not uses_tms:
+            assert mem_suspended < mem_before, (
+                f"GPU memory should decrease after suspend "
+                f"(mode={kv_cache_management_mode}). "
+                f"Before: {mem_before}, After: {mem_suspended}"
+            )
+        else:
+            assert mem_suspended == mem_before, (
+                f"Memory should not change on suspend. "
+                f"Before: {mem_before}, Suspended: {mem_suspended}"
+            )
+
+        if uses_tms:
+            assert phys_mem_suspended > phys_mem_before, (
+                f"torch_memory_saver should free physical GPU memory after suspend. "
+                f"Before: {phys_mem_before}, After: {phys_mem_suspended}"
+            )
+
+        # Resume.
+        engine.resume()
+        assert not engine.is_suspended
+        assert context.is_tensor_state_allocated
+
+        if deallocates and not uses_tms:
+            torch.cuda.synchronize()
+            mem_resumed = torch.cuda.memory_allocated()
+            assert mem_resumed > mem_suspended, (
+                f"GPU memory should increase after resume. "
+                f"Suspended: {mem_suspended}, Resumed: {mem_resumed}"
+            )
+
+        if uses_tms:
+            torch.cuda.synchronize()
+            phys_mem_resumed = torch.cuda.mem_get_info()[0]
+            assert phys_mem_resumed < phys_mem_suspended, (
+                f"torch_memory_saver should re-allocate physical GPU memory after resume. "
+                f"Suspended: {phys_mem_suspended}, Resumed: {phys_mem_resumed}"
+            )
+
+        # Data integrity.
+        if preserves_data:
+            torch.testing.assert_close(
+                context.memory_buffer,
+                expected,
+                msg="memory_buffer data must be identical after suspend/resume",
+            )
+
+        # Address stability when CUDA graphs persist.
+        if static_kv_memory_pointers:
+            addr_after = context.memory_buffer.data_ptr()
+            assert addr_before == addr_after, (
+                f"Tensor address must be stable when static_kv_memory_pointers is set. "
+                f"Before: {addr_before:#x}, After: {addr_after:#x}"
+            )
