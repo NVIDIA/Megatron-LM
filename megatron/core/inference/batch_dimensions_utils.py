@@ -263,6 +263,11 @@ class CUDAGraphBatchDimensionBuilder:
             if val < rounder:
                 break
 
+        # Include a (possibly extra) size-1 graph
+        min_token_count = math.ceil(1 / tp_size) * tp_size
+        if cuda_graph_token_counts[-1] != min_token_count:
+            cuda_graph_token_counts.append(min_token_count)
+
         return cuda_graph_token_counts
 
     @staticmethod
