@@ -1,10 +1,12 @@
 # Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
 import asyncio
+import gc
 import math
 import random
 import types
 from dataclasses import dataclass, field
+from functools import partial
 from typing import Dict, List, Optional, Tuple
 
 import pytest
@@ -13,7 +15,11 @@ from tqdm import tqdm
 from transformer_engine.pytorch.fp8 import check_fp8_support
 
 from megatron.core import parallel_state
-from megatron.core.inference.config import InferenceConfig, MambaInferenceStateConfig
+from megatron.core.inference.config import (
+    InferenceConfig,
+    KVCacheManagementMode,
+    MambaInferenceStateConfig,
+)
 from megatron.core.inference.contexts.dynamic_context import (
     ActiveRequestCountOverflowError,
     BlockOverflowError,
@@ -46,6 +52,13 @@ from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.utils import is_fa_min_version, is_te_min_version
 from tests.unit_tests.test_utilities import Utils
 
+try:
+    from torch_memory_saver import torch_memory_saver  # noqa: F401
+
+    HAVE_TORCH_MEMORY_SAVER = True
+except ImportError:
+    HAVE_TORCH_MEMORY_SAVER = False
+
 
 def skip_if_mamba_sequence_packing_not_available(model_provider: str):
     if model_provider == "mamba":
@@ -61,6 +74,17 @@ def set_rounder(value):
     DynamicInferenceContext.ROUNDER = value  # For backwards compatibility
     DynamicInferenceContext.TOKEN_ROUNDER = value
     DynamicInferenceContext.REQUEST_ROUNDER = value
+
+
+def mock_forward(input_ids, position_ids, attention_mask, *args, **kwargs):
+    """Mock forward function to avoid numerics issues with random inputs."""
+    return torch.randn(
+        input_ids.size(0),
+        input_ids.size(1),
+        kwargs["vocab_size"],
+        device=input_ids.device,
+        dtype=torch.bfloat16,
+    )
 
 
 @dataclass
@@ -111,6 +135,9 @@ class DynamicEngineTestConfig:
     # relevant to the test. The tests only check if the required
     # context attributes are set correctly.
     suspend_resume_interval: Optional[int] = None
+    kv_cache_management_mode: str = "persist"
+    static_kv_memory_pointers: bool = True
+    track_generated_token_events: bool = False
 
     fp8: bool = False
 
@@ -226,9 +253,15 @@ class TestDynamicInferenceEngine:
                 max_tokens=test_config.context_max_tokens,
                 mamba_inference_state_config=mamba_inference_state_config,
                 materialize_only_last_token_logits=test_config.materialize_only_last_token_logits,
+                kv_cache_management_mode=KVCacheManagementMode(
+                    test_config.kv_cache_management_mode
+                ),
+                static_kv_memory_pointers=test_config.static_kv_memory_pointers,
+                enable_chunked_prefill=test_config.enable_chunked_prefill,
                 use_flashinfer_fused_rope=None,  # default to using flash-infer if available
                 # this is for compatibility with the LTS environment
                 unified_memory_level=0,  # unit tests currently broken with UVM
+                track_generated_token_events=test_config.track_generated_token_events,
             ),
         )
 
@@ -1092,53 +1125,395 @@ class TestDynamicInferenceEngine:
         )
 
         expected_event_types = [
-            ['ADD', 'FINISH'],
-            ['ADD', 'FINISH'],
-            ['ADD', 'FINISH'],
-            ['ADD', 'FINISH'],
-            ['ERROR_TRANSIENT', 'ADD', 'FINISH'],
-            ['ERROR_TRANSIENT', 'ADD', 'FINISH'],
-            ['ADD', 'FINISH'],
-            ['ERROR_NONTRANSIENT', 'FAIL'],
-            ['ERROR_NONTRANSIENT', 'FAIL'],
-            ['ERROR_TRANSIENT', 'ADD', 'FINISH'],
-            ['ERROR_NONTRANSIENT', 'FAIL'],
-            ['ERROR_TRANSIENT', 'ADD', 'FINISH'],
-            ['ADD', 'FINISH'],
-            ['ERROR_TRANSIENT', 'ADD', 'FINISH'],
-            ['ERROR_TRANSIENT', 'ADD', 'FINISH'],
-            ['ERROR_TRANSIENT', 'ADD', 'FINISH'],
+            ['ADD_ENGINE', 'ADD_CONTEXT', 'FINISH'],
+            ['ADD_ENGINE', 'ADD_CONTEXT', 'FINISH'],
+            ['ADD_ENGINE', 'ADD_CONTEXT', 'FINISH'],
+            ['ADD_ENGINE', 'ERROR_NONTRANSIENT', 'FAIL'],
+            ['ADD_ENGINE', 'ADD_CONTEXT', 'FINISH'],
+            ['ADD_ENGINE', 'ADD_CONTEXT', 'FINISH'],
+            ['ADD_ENGINE', 'ADD_CONTEXT', 'FINISH'],
+            ['ADD_ENGINE', 'ERROR_NONTRANSIENT', 'FAIL'],
+            ['ADD_ENGINE', 'ERROR_NONTRANSIENT', 'FAIL'],
+            ['ADD_ENGINE', 'ERROR_NONTRANSIENT', 'FAIL'],
+            ['ADD_ENGINE', 'ADD_CONTEXT', 'FINISH'],
+            ['ADD_ENGINE', 'ADD_CONTEXT', 'FINISH'],
+            ['ADD_ENGINE', 'ADD_CONTEXT', 'FINISH'],
+            ['ADD_ENGINE', 'ERROR_NONTRANSIENT', 'FAIL'],
+            ['ADD_ENGINE', 'ERROR_NONTRANSIENT', 'FAIL'],
+            ['ADD_ENGINE', 'ADD_CONTEXT', 'FINISH'],
         ]
-        result_event_types = [[e.type.name for e in r.events] for r in env.requests]
-
+        result_event_types = [
+            [e.type.name for e in r.events if e.type.name != 'GENERATED_TOKEN']
+            for r in env.requests
+        ]
         assert result_event_types == expected_event_types
 
     @pytest.mark.internal
     @pytest.mark.skipif(
         not is_fa_min_version("2.7.3"), reason="need latest flash attn for dynamic batching"
     )
-    @pytest.mark.parametrize("model_provider", ["gpt", "mamba"])
     @torch.inference_mode()
-    def test_chunked_prefill(self, model_provider: str):
-        """Verify that chunked prefill output is equivalent to regular prefill."""
-        skip_if_mamba_sequence_packing_not_available(model_provider)
+    def test_event_timestamps(self):
+        """Test that events are recorded with sensical timestamps.
 
-        prompt_length = 1200
-        num_tokens_to_generate = 16
-        max_sequence_length = prompt_length + num_tokens_to_generate
-
-        # Configure context to force chunking
+        Verifies:
+        1. Completed requests have ADD_ENGINE, ADD_CONTEXT, GENERATED_TOKEN(s), FINISH events
+        2. Event timestamps are monotonically increasing
+        3. TTFT (time-to-first-token) can be computed as first GENERATED_TOKEN - ADD_ENGINE
+        """
+        num_tokens_to_generate = 8
         env = self._run_test(
-            num_requests=1,
-            min_prompt_length=prompt_length,
-            max_prompt_length=prompt_length,
+            num_requests=4,
+            max_prompt_length=16,
             num_tokens_to_generate=num_tokens_to_generate,
-            materialize_only_last_token_logits=False,
-            model_provider=model_provider,
-            context_block_size_tokens=256,
-            context_max_tokens=1000,
-            enable_chunked_prefill=True,
+            context_buffer_size_gb=0.1,
+            num_gap_steps=0,
+            track_generated_token_events=True,
         )
+
+        # All requests should complete with this generous config (large buffer, no gap steps).
+        assert all(r.status == Status.COMPLETED for r in env.requests)
+        for request in env.requests:
+
+            # Verify event types for completed requests
+            event_types = [e.type.name for e in request.events]
+            # Should be: ADD_ENGINE, ADD_CONTEXT, GENERATED_TOKEN (repeated), FINISH
+            assert (
+                event_types[0] == 'ADD_ENGINE'
+            ), f"Request {request.request_id}: first event should be ADD_ENGINE, got {event_types[0]}"
+            assert (
+                event_types[1] == 'ADD_CONTEXT'
+            ), f"Request {request.request_id}: second event should be ADD_CONTEXT, got {event_types[1]}"
+            assert (
+                event_types[-1] == 'FINISH'
+            ), f"Request {request.request_id}: last event should be FINISH, got {event_types[-1]}"
+            # Check that GENERATED_TOKEN events are in the middle
+            gen_token_count = event_types.count('GENERATED_TOKEN')
+            assert gen_token_count == len(request.generated_tokens), (
+                f"Request {request.request_id}: GENERATED_TOKEN count ({gen_token_count}) != "
+                f"generated_tokens length ({len(request.generated_tokens)})"
+            )
+
+            # Verify timestamps are monotonically increasing
+            timestamps = [e.timestamp for e in request.events]
+            for i in range(1, len(timestamps)):
+                assert timestamps[i] >= timestamps[i - 1], (
+                    f"Request {request.request_id}: timestamp[{i}] ({timestamps[i]}) < "
+                    f"timestamp[{i-1}] ({timestamps[i-1]})"
+                )
+
+            # Verify TTFT is positive and sensical (first GENERATED_TOKEN - ADD_ENGINE)
+            add_engine_ts = request.events[0].timestamp
+            first_token_ts = request.events[2].timestamp  # First GENERATED_TOKEN event
+            assert (
+                request.events[2].type.name == 'GENERATED_TOKEN'
+            ), f"Request {request.request_id}: event[2] should be GENERATED_TOKEN"
+            ttft = first_token_ts - add_engine_ts
+            assert ttft >= 0, f"Request {request.request_id}: TTFT is negative ({ttft})"
+
+            # Verify total request time is positive
+            finish_ts = request.events[-1].timestamp
+            total_time = finish_ts - add_engine_ts
+            assert (
+                total_time >= ttft
+            ), f"Request {request.request_id}: total_time ({total_time}) < TTFT ({ttft})"
+
+    @pytest.mark.internal
+    @pytest.mark.skipif(
+        not is_fa_min_version("2.7.3"), reason="need latest flash attn for dynamic batching"
+    )
+    @torch.inference_mode()
+    def test_mamba_chunked_prefill(self):
+        """
+        Test chunked prefill with a Mamba model.
+        """
+        skip_if_mamba_sequence_packing_not_available("mamba")
+
+        # Context max tokens = 50.
+        test_config = DynamicEngineTestConfig(
+            model_provider="mamba",
+            num_requests=0,
+            num_tokens_to_generate=None,
+            num_tokens_total=200,
+            context_max_tokens=52,
+            context_max_requests=5,
+            context_block_size_tokens=256,
+            enable_chunked_prefill=True,
+            use_cuda_graphs_for_non_decode_steps=False,
+        )
+
+        env = self._build_test_env(test_config)
+        ctx = env.engine.context
+
+        # Mock the model forward function to avoid possible numerics issues
+        # caused by random inputs
+        model_instance = env.engine.controller.inference_wrapped_model.model
+        model_instance.forward = partial(mock_forward, vocab_size=test_config.vocab_size)
+
+        # Request 1: 150 tokens
+        req1_tokens = torch.randint(0, test_config.vocab_size, (130,), device='cuda')
+        req1 = DynamicInferenceRequest(
+            request_id=1,
+            prompt_tokens=req1_tokens,
+            sampling_params=SamplingParams(num_tokens_to_generate=3),
+        )
+
+        # Request 2: 160 tokens
+        req2_tokens = torch.randint(0, test_config.vocab_size, (160,), device='cuda')
+        req2 = DynamicInferenceRequest(
+            request_id=2,
+            prompt_tokens=req2_tokens,
+            sampling_params=SamplingParams(num_tokens_to_generate=1),
+        )
+
+        # Request 3: 24 tokens
+        req3_tokens = torch.randint(0, test_config.vocab_size, (24,), device='cuda')
+        req3 = DynamicInferenceRequest(
+            request_id=3,
+            prompt_tokens=req3_tokens,
+            sampling_params=SamplingParams(num_tokens_to_generate=1),
+        )
+
+        # Add requests 1-3
+        env.engine._add_request(req1)
+        env.engine._add_request(req2)
+        env.engine._add_request(req3)
+
+        # Run step 1
+        env.engine.schedule_waiting_requests()
+
+        env.engine.step_modern()
+        assert req1.finished_chunk_token_count == 52
+
+        # Prepare for step 2
+        env.engine.schedule_waiting_requests()
+
+        # Verify that requests 2 and 3 are queued because request 1 is still running
+        assert ctx.num_prefill_requests == 1
+        active_ids = ctx.request_ids[: ctx.total_request_count].tolist()
+        assert 1 in active_ids
+        assert 2 not in active_ids
+        assert 3 not in active_ids
+        assert 2 in env.engine.waiting_request_ids
+        assert 3 in env.engine.waiting_request_ids
+
+        # Verify that active token count == max tokens - 1
+        # The -1 is for the useless chunked prefill token
+        assert ctx.active_token_count == 51
+
+        # Verify that request 1 is the designated chunked prefill request
+        assert ctx.chunked_prefill_request_id == 1
+
+        # Run step 2
+        env.engine.step_modern()
+        assert req1.finished_chunk_token_count == 104
+
+        # Prepare for step 3
+        env.engine.schedule_waiting_requests()
+
+        # Verify that request 2 got partially scheduled and is now
+        # the designated chunked prefill request
+        req2_idx = ctx.request_ids.tolist().index(2)
+        assert req2_idx == 1
+        assert ctx.num_prefill_requests == 2
+        assert ctx.chunked_prefill_request_id == 2
+        assert ctx.get_index_of_chunked_prefill_request() == req2_idx
+        active_ids = ctx.request_ids[: ctx.total_request_count].tolist()
+        assert 1 in active_ids
+        assert 2 in active_ids
+        assert 3 not in active_ids
+
+        # Store the Mamba state tensor idx for request 2
+        req2_mamba_idx = ctx.mamba_metadata.request_to_mamba_state_idx[req2_idx].item()
+
+        # Verify that the active token count is the maximum token count
+        assert ctx.active_token_count == 52
+
+        # Run step 3
+        env.engine.step_modern()
+        assert req1.finished_chunk_token_count == 104
+
+        # Prepare for step 4
+        env.engine.schedule_waiting_requests()
+
+        # Verify that request 2 is still the first prefill request
+        assert ctx.request_ids.tolist().index(2) == 1
+        assert ctx.mamba_metadata.request_to_mamba_state_idx[1] == req2_mamba_idx
+
+        # Verify that request 1 is running decode
+        active_ids = ctx.request_ids[: ctx.total_request_count].tolist()
+        assert ctx.num_decode_requests == 1
+        assert 1 in active_ids
+
+        # Verify that request 2 is still running prefill as the designated chunked prefill request
+        assert ctx.num_prefill_requests == 1
+        assert ctx.chunked_prefill_request_id == 2
+        assert ctx.get_index_of_chunked_prefill_request() == 1
+
+        # Verify that request 3 is still waiting
+        assert 3 not in active_ids
+        assert 3 in env.engine.waiting_request_ids
+
+        # Verify that active token count == max tokens - 1
+        # The -1 is for the useless chunked prefill token
+        assert ctx.active_token_count == 51
+
+        # Run step 4
+        env.engine.step_modern()
+
+        assert req2.finished_chunk_token_count == 77
+
+        # Prepare for step 5
+        env.engine.schedule_waiting_requests()
+
+        # Verify that request 2 is still the first prefill request
+        assert ctx.request_ids.tolist().index(2) == 1
+        assert ctx.mamba_metadata.request_to_mamba_state_idx[1] == req2_mamba_idx
+
+        # Run step 5
+        env.engine.step_modern()
+        assert req2.finished_chunk_token_count == 128
+
+        # Prepare for step 6
+        env.engine.schedule_waiting_requests()
+
+        # Verify that request 1 has completed
+        assert req1.status == Status.COMPLETED
+
+        # Verify that request 2 is still the first prefill request
+        assert ctx.request_ids.tolist().index(2) == 0
+        assert ctx.mamba_metadata.request_to_mamba_state_idx[0] == req2_mamba_idx
+
+        # Verify that request 3 is now scheduled as the chunked prefill request
+        active_ids = ctx.request_ids[: ctx.total_request_count].tolist()
+        assert 2 in active_ids
+        assert 3 in active_ids
+        assert ctx.chunked_prefill_request_id == 3
+        req3_idx = active_ids.index(3)
+        assert req3_idx == 1
+
+        # Store the Mamba state tensor idx for request 3
+        req3_mamba_idx = ctx.mamba_metadata.request_to_mamba_state_idx[req3_idx].item()
+
+        # Run step 6
+        env.engine.step_modern()
+
+        # Verify that request 2 has finished
+        assert req2.status == Status.COMPLETED
+        assert req3.finished_chunk_token_count == 20
+
+        # Prepare for step 7
+        env.engine.schedule_waiting_requests()
+
+        # Verify that request 3 is now the first prefill request
+        req3_idx = ctx.request_ids.tolist().index(3)
+        assert req3_idx == 0
+        assert ctx.mamba_metadata.request_to_mamba_state_idx[0] == req3_mamba_idx
+
+        # Run step 7
+        env.engine.step_modern()
+
+        # Verify that request 3 has finished
+        assert req3.status == Status.COMPLETED
+
+    @pytest.mark.internal
+    @pytest.mark.skipif(
+        not is_fa_min_version("2.7.3"), reason="need latest flash attn for dynamic batching"
+    )
+    @torch.inference_mode()
+    def test_chunked_prefill_avoid_single_token_chunk(self):
+        """
+        Test that chunked prefill scheduling avoids leaving exactly 1 token for the final chunk.
+        This leads to a known bug in the Flash Attention kernel:
+        https://github.com/Dao-AILab/flash-attention/issues/1537
+
+        Scenario:
+            - Max tokens per step (Chunk Size): 256
+            - Request prompt length: 512
+
+        Note that for all chunks after the first chunk we subtract 1 from the active token
+        count, so the chunk size will be 1 less.
+
+        Default scheduling would do:
+            1. Chunk 256 (Remaining 256)
+            2. Chunk 255 (Remaining 1) -> max_seqlen_q=1 triggers decode path in kernel
+            3. Chunk 1
+
+        Fixed scheduling should do:
+            1. Chunk 256 (Remaining 256) -> 256 - 256 != 1. Schedule full 256.
+            2. Chunk 254 (Remaining 2)   -> 256 tokens left. If we take 255, 1 remains.
+                                            So we reduce chunk to 254.
+            3. Chunk 2   (Remaining 0)
+        """
+        chunk_size = 256
+        # Prompt length designed to trigger the edge case: Chunk + (Chunk + 1)
+        # 256 + 256 = 512
+        prompt_len = 512
+
+        test_config = DynamicEngineTestConfig(
+            model_provider="gpt",
+            num_requests=0,
+            num_tokens_to_generate=None,
+            num_tokens_total=513,
+            context_max_tokens=chunk_size,
+            context_max_requests=1,
+            context_block_size_tokens=256,
+            enable_chunked_prefill=True,
+            use_cuda_graphs_for_non_decode_steps=False,
+        )
+
+        env = self._build_test_env(test_config)
+        ctx = env.engine.context
+
+        # Mock the model forward function to avoid possible numerics issues
+        # caused by random inputs
+        model_instance = env.engine.controller.inference_wrapped_model.model
+        model_instance.forward = partial(mock_forward, vocab_size=test_config.vocab_size)
+
+        # Create a request with length 513
+        req_tokens = torch.randint(0, test_config.vocab_size, (prompt_len,), device='cuda')
+        req = DynamicInferenceRequest(
+            request_id=1,
+            prompt_tokens=req_tokens,
+            sampling_params=SamplingParams(num_tokens_to_generate=1),
+        )
+
+        env.engine._add_request(req)
+
+        assert req.status == Status.ACTIVE_AND_GENERATING_TOKENS
+
+        # --- Step 1 ---
+        # Available: 256. Remaining: 512.
+        # Logic: 512 - 256 = 256. Not 1. Schedule full 256.
+        env.engine.schedule_waiting_requests()
+        env.engine.step_modern()
+
+        assert (
+            req.finished_chunk_token_count == 256
+        ), f"Step 1: Expected 256 tokens processed, got {req.finished_chunk_token_count}"
+
+        # --- Step 2 ---
+        # Available: 256. Remaining un-prefilled: 256.
+        # Logic: 256 - (256 - 1) = 1. This is the edge case!
+        # Fix should reduce chunk size by 1 (to 254).
+        env.engine.schedule_waiting_requests()
+        env.engine.step_modern()
+
+        # 256 (previous) + 254 (this step) = 510
+        assert req.finished_chunk_token_count == 510, (
+            "Step 2: Expected 510 tokens processed (256+254), "
+            f"got {req.finished_chunk_token_count}. "
+        )
+
+        # --- Step 3 ---
+        # Remaining un-prefilled: 2. Available: 255.
+        # Logic: 2 <= 255. Schedule 2.
+        env.engine.schedule_waiting_requests()
+        env.engine.step_modern()
+
+        # Verify request finishes prefill and completes
+        assert ctx.num_prefill_requests == 0
+        assert req.status == Status.COMPLETED
 
     @pytest.mark.internal
     @pytest.mark.skipif(
@@ -1358,3 +1733,254 @@ class TestDynamicInferenceEngine:
             assert context.max_requests == 4
             assert step_count == 34
         assert context.block_allocator.active_count == 655
+
+    @pytest.mark.internal
+    @pytest.mark.skipif(
+        not is_fa_min_version("2.7.3"), reason="need latest flash attn for dynamic batching"
+    )
+    @pytest.mark.parametrize("static_kv_memory_pointers", [True, False])
+    @pytest.mark.parametrize("kv_cache_management_mode", ["persist", "offload", "recompute"])
+    @torch.inference_mode()
+    def test_suspend_resume_cycle(self, kv_cache_management_mode, static_kv_memory_pointers):
+        """Full suspend -> resume cycle with memory, data, and address checks."""
+        needs_tms = static_kv_memory_pointers and kv_cache_management_mode != "persist"
+
+        test_config = DynamicEngineTestConfig(
+            kv_cache_management_mode=kv_cache_management_mode,
+            static_kv_memory_pointers=static_kv_memory_pointers,
+        )
+
+        # Without TMS, these combos must assert on construction.
+        if needs_tms and not HAVE_TORCH_MEMORY_SAVER:
+            with pytest.raises(AssertionError, match="Static KV memory pointers"):
+                self._build_test_env(test_config)
+            return
+
+        env = self._build_test_env(test_config)
+        engine = env.engine
+        context = engine.context
+
+        assert not engine.is_suspended
+        assert context.is_tensor_state_allocated
+
+        deallocates = kv_cache_management_mode != "persist"
+        uses_tms = context._uses_torch_memory_saver
+        preserves_data = kv_cache_management_mode != "recompute"
+
+        # Write a deterministic pattern for data integrity check.
+        if preserves_data:
+            context.memory_buffer.copy_(torch.randn_like(context.memory_buffer))
+            expected = context.memory_buffer.clone()
+
+        addr_before = context.memory_buffer.data_ptr()
+
+        gc.collect()
+        torch.cuda.empty_cache()
+        torch.cuda.synchronize()
+        mem_before = torch.cuda.memory_allocated()
+        if uses_tms:
+            phys_mem_before = torch.cuda.mem_get_info()[0]
+
+        # Suspend.
+        engine.suspend()
+        assert engine.is_suspended
+        assert not context.is_tensor_state_allocated
+
+        gc.collect()
+        torch.cuda.empty_cache()
+        torch.cuda.synchronize()
+        mem_suspended = torch.cuda.memory_allocated()
+        if uses_tms:
+            phys_mem_suspended = torch.cuda.mem_get_info()[0]
+
+        if deallocates and not uses_tms:
+            assert mem_suspended < mem_before, (
+                f"GPU memory should decrease after suspend "
+                f"(mode={kv_cache_management_mode}). "
+                f"Before: {mem_before}, After: {mem_suspended}"
+            )
+        else:
+            assert mem_suspended == mem_before, (
+                f"Memory should not change on suspend. "
+                f"Before: {mem_before}, Suspended: {mem_suspended}"
+            )
+
+        if uses_tms:
+            assert phys_mem_suspended > phys_mem_before, (
+                f"torch_memory_saver should free physical GPU memory after suspend. "
+                f"Before: {phys_mem_before}, After: {phys_mem_suspended}"
+            )
+
+        # Resume.
+        engine.resume()
+        assert not engine.is_suspended
+        assert context.is_tensor_state_allocated
+
+        if deallocates and not uses_tms:
+            torch.cuda.synchronize()
+            mem_resumed = torch.cuda.memory_allocated()
+            assert mem_resumed > mem_suspended, (
+                f"GPU memory should increase after resume. "
+                f"Suspended: {mem_suspended}, Resumed: {mem_resumed}"
+            )
+
+        if uses_tms:
+            torch.cuda.synchronize()
+            phys_mem_resumed = torch.cuda.mem_get_info()[0]
+            assert phys_mem_resumed < phys_mem_suspended, (
+                f"torch_memory_saver should re-allocate physical GPU memory after resume. "
+                f"Suspended: {phys_mem_suspended}, Resumed: {phys_mem_resumed}"
+            )
+
+        # Data integrity.
+        if preserves_data:
+            torch.testing.assert_close(
+                context.memory_buffer,
+                expected,
+                msg="memory_buffer data must be identical after suspend/resume",
+            )
+
+        # Address stability when CUDA graphs persist.
+        if static_kv_memory_pointers:
+            addr_after = context.memory_buffer.data_ptr()
+            assert addr_before == addr_after, (
+                f"Tensor address must be stable when static_kv_memory_pointers is set. "
+                f"Before: {addr_before:#x}, After: {addr_after:#x}"
+            )
+
+    @pytest.mark.skipif(
+        not is_fa_min_version("2.7.3"), reason="need latest flash attn for dynamic batching"
+    )
+    @pytest.mark.parametrize("use_checkpoint", [False, True], ids=["persist", "recompute"])
+    @torch.inference_mode()
+    def test_staleness_tracking(self, use_checkpoint):
+        """Test that staleness is correct tracked.
+        The use_checkpoint parameter simulates the behavior of different kv_cache_management_mode.
+        """
+        PROMPT_LEN = 8
+        NUM_TOKENS = 8
+
+        test_config = DynamicEngineTestConfig(
+            num_requests=0,
+            min_prompt_length=PROMPT_LEN,
+            max_prompt_length=PROMPT_LEN,
+            num_tokens_to_generate=NUM_TOKENS,
+        )
+        env = self._build_test_env(test_config)
+        engine = env.engine
+
+        for i in range(2):
+            prompt_tokens = torch.randint(
+                0,
+                test_config.vocab_size - 1,
+                (PROMPT_LEN,),
+                dtype=torch.int64,
+                device=torch.cuda.current_device(),
+            )
+            engine._add_request(
+                DynamicInferenceRequest(
+                    request_id=i,
+                    prompt_tokens=prompt_tokens,
+                    sampling_params=SamplingParams(
+                        num_tokens_to_generate=NUM_TOKENS, termination_id=-1
+                    ),
+                )
+            )
+
+        for _ in range(3):
+            engine.step_modern()
+
+        for entry in engine.requests.values():
+            assert len(entry.record[-1].generated_tokens) == 3
+            assert entry.record[-1].policy_staleness is None
+            assert entry.record[-1].kv_cache_staleness is None
+
+        # Increment staleness.
+        for entry in engine.requests.values():
+            entry.record.increment_staleness()
+
+        for entry in engine.requests.values():
+            ps = entry.record[-1].policy_staleness
+            ks = entry.record[-1].kv_cache_staleness
+            assert ps.shape == ks.shape == (PROMPT_LEN + 3,)
+            assert (ps == 1).all()
+            assert (ks == 1).all()
+
+        # Simulate RECOMPUTE
+        if use_checkpoint:
+            for entry in engine.requests.values():
+                old_req = entry.record[-1]
+                event_add_engine = old_req.event_add_engine
+                entry.record.checkpoint()
+                # Prevent TTFT crash due to missing _add_request in test.
+                entry.record[-1].event_add_engine = event_add_engine
+
+            for entry in engine.requests.values():
+                ps = entry.record[-1].policy_staleness
+                ks = entry.record[-1].kv_cache_staleness
+                assert ps.shape == ks.shape == (PROMPT_LEN + 3,)
+                assert (ps == 1).all()
+                assert (ks == 0).all()
+
+        for _ in range(3):
+            engine.step_modern()
+
+        # Increment staleness.
+        for entry in engine.requests.values():
+            entry.record.increment_staleness()
+
+        for entry in engine.requests.values():
+            ps = entry.record[-1].policy_staleness
+            ks = entry.record[-1].kv_cache_staleness
+            assert ps.shape == ks.shape == (PROMPT_LEN + 6,)
+            assert (ps[: PROMPT_LEN + 3] == 2).all()
+            assert (ps[PROMPT_LEN + 3 :] == 1).all()
+            if use_checkpoint:
+                assert (ks == 1).all()
+            else:
+                assert (ks[: PROMPT_LEN + 3] == 2).all()
+                assert (ks[PROMPT_LEN + 3 :] == 1).all()
+
+        if use_checkpoint:
+            for entry in engine.requests.values():
+                old_req = entry.record[-1]
+                event_add_engine = old_req.event_add_engine
+                entry.record.checkpoint()
+                entry.record[-1].event_add_engine = event_add_engine
+
+            for entry in engine.requests.values():
+                ks = entry.record[-1].kv_cache_staleness
+                assert (ks == 0).all()
+
+        finished_records = []
+        while engine.has_unfinished_requests():
+            result = engine.step_modern()
+            finished_records.extend(result["finished_request_records"])
+
+        for record in finished_records:
+            merged = record.merge()
+
+            assert merged.policy_staleness is not None
+            assert merged.policy_staleness.shape == (PROMPT_LEN + NUM_TOKENS,)
+            assert (merged.policy_staleness[: PROMPT_LEN + 3] == 2).all()
+            assert (merged.policy_staleness[PROMPT_LEN + 3 : PROMPT_LEN + 6] == 1).all()
+            assert (merged.policy_staleness[PROMPT_LEN + 6 :] == 0).all()
+
+            assert merged.kv_cache_staleness is not None
+            assert merged.kv_cache_staleness.shape == (PROMPT_LEN + NUM_TOKENS,)
+            if use_checkpoint:
+                assert (merged.kv_cache_staleness == 0).all()
+            else:
+                assert (merged.kv_cache_staleness[: PROMPT_LEN + 3] == 2).all()
+                assert (merged.kv_cache_staleness[PROMPT_LEN + 3 : PROMPT_LEN + 6] == 1).all()
+                assert (merged.kv_cache_staleness[PROMPT_LEN + 6 :] == 0).all()
+
+        # Verify evicted requests don't have their policy staleness incremented.
+        record = finished_records[0]
+        record.checkpoint()
+        pre_ps = record[-1].policy_staleness.clone()
+
+        record.increment_staleness(policy_only=True)  # This mimics the coordinator's action.
+
+        assert (record[-1].policy_staleness == pre_ps + 1).all()
+        assert (record[-1].kv_cache_staleness == 0).all()
