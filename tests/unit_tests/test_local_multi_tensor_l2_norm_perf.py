@@ -65,10 +65,6 @@ def test_local_multi_tensor_l2_norm_correctness():
 
 def test_local_multi_tensor_l2_norm_empty_input():
     print("Running test_local_multi_tensor_l2_norm_empty_input...")
-    if torch.cuda.is_available():
-        pass
-    else:
-        pass
 
     tensor_lists = [[]]
     try:
