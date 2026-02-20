@@ -10,8 +10,8 @@ from functools import partial
 from typing import Dict, List, Optional
 
 import torch
-from torch.distributed import _coalescing_manager
 from torch._utils import _flatten_dense_tensors, _unflatten_dense_tensors
+from torch.distributed import _coalescing_manager
 
 import megatron.core.nccl_allocator as nccl_allocator
 from megatron.core import parallel_state
@@ -333,9 +333,7 @@ class _ParamAndGradBucketGroup:
                     _flatten_dense_tensors(bucket.lw_params_list[local_rank])
                     if len(bucket.lw_params_list[local_rank]) > 0
                     else torch.empty(
-                        0,
-                        device=bucket.grad_data.device,
-                        dtype=bucket.grad_data.dtype,
+                        0, device=bucket.grad_data.device, dtype=bucket.grad_data.dtype
                     )
                 )
                 # Keep src alive until the async operation completes.

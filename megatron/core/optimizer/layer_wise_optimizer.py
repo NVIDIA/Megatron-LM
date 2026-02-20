@@ -66,9 +66,9 @@ class LayerWiseDistributedOptimizer(ChainedOptimizer):
         # Set up async all-gather using DDP bucket infrastructure.
         self.async_allgather = async_allgather
         if self.async_allgather:
-            assert model_chunks is not None, (
-                "model_chunks must be provided if async_allgather is True"
-            )
+            assert (
+                model_chunks is not None
+            ), "model_chunks must be provided if async_allgather is True"
             self.set_bucket_lw_params_list(model_chunks)
 
         if init_state_fn_list:
@@ -168,9 +168,7 @@ class LayerWiseDistributedOptimizer(ChainedOptimizer):
         for model_chunk in model_chunks:
             for group in model_chunk.bucket_groups:
                 for bucket in group.buckets:
-                    bucket_params_list = [
-                        [] for _ in range(get_pg_size(self.pg_collection.dp_cp))
-                    ]
+                    bucket_params_list = [[] for _ in range(get_pg_size(self.pg_collection.dp_cp))]
                     for bucket_list, full_params_list in zip(
                         bucket_params_list, self.dp_cp_params_list
                     ):

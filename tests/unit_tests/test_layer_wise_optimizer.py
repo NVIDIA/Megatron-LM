@@ -161,8 +161,7 @@ class TestLayerWiseOptimizer:
         model.requires_grad_(True)
 
         ddp_config = DistributedDataParallelConfig(
-            use_distributed_optimizer=False,
-            overlap_param_gather=True,
+            use_distributed_optimizer=False, overlap_param_gather=True
         )
         model = DistributedDataParallel(
             TransformerConfig(num_attention_heads=1, num_layers=1), ddp_config, model
@@ -188,7 +187,9 @@ class TestLayerWiseOptimizer:
         optimizer = get_megatron_optimizer(optimizer_config, [model])
         optimizer_config.bf16 = True
         optimizer = LayerWiseDistributedOptimizer(
-            optimizer.chained_optimizers, optimizer_config, pg_collection,
+            optimizer.chained_optimizers,
+            optimizer_config,
+            pg_collection,
             model_chunks=[model],
             async_allgather=async_allgather,
         )
@@ -548,7 +549,8 @@ class TestLayerWiseOptimizer:
 
                 for i in range(1, dp_size):
                     torch.testing.assert_close(
-                        param_list[0], param_list[i],
+                        param_list[0],
+                        param_list[i],
                         msg=f"Parameter {name} differs between rank 0 and rank {i}",
                     )
 
@@ -595,10 +597,8 @@ class TestLayerWiseOptimizer:
         )
 
         # Create sync model with same weights (overlap_param_gather=True but sync allgather)
-        sync_model, sync_optimizer, _ = (
-            self.create_model_and_optimizer_with_overlap_param_gather(
-                async_allgather=False, copy_from=overlap_model
-            )
+        sync_model, sync_optimizer, _ = self.create_model_and_optimizer_with_overlap_param_gather(
+            async_allgather=False, copy_from=overlap_model
         )
 
         # Verify initial parameters match
@@ -622,7 +622,10 @@ class TestLayerWiseOptimizer:
         # Both paths should produce identical parameter values
         for op, sp in zip(overlap_model.parameters(), sync_model.parameters()):
             torch.testing.assert_close(
-                op.data, sp.data, rtol=0, atol=0,
+                op.data,
+                sp.data,
+                rtol=0,
+                atol=0,
                 msg="Overlap and sync allgather paths produced different parameter updates",
             )
 
@@ -637,21 +640,21 @@ class TestLayerWiseOptimizer:
         for bucket_group in model.bucket_groups:
             for bucket in bucket_group.buckets:
                 # lw_params_list should be populated by set_bucket_lw_params_list
-                assert bucket.lw_params_list is not None, (
-                    "bucket.lw_params_list should be populated"
-                )
-                assert len(bucket.lw_params_list) == dp_size, (
-                    f"Expected {dp_size} per-rank lists, got {len(bucket.lw_params_list)}"
-                )
+                assert (
+                    bucket.lw_params_list is not None
+                ), "bucket.lw_params_list should be populated"
+                assert (
+                    len(bucket.lw_params_list) == dp_size
+                ), f"Expected {dp_size} per-rank lists, got {len(bucket.lw_params_list)}"
 
                 # The union of all per-rank param lists should cover all bucket params
                 all_lw_params = set()
                 for rank_params in bucket.lw_params_list:
                     for p in rank_params:
                         all_lw_params.add(p)
-                assert all_lw_params == bucket.params, (
-                    "Union of per-rank lw_params should equal bucket params"
-                )
+                assert (
+                    all_lw_params == bucket.params
+                ), "Union of per-rank lw_params should equal bucket params"
 
                 # lw_param_flat_sizes should be populated and have correct length
                 assert bucket.lw_param_flat_sizes is not None
@@ -659,9 +662,7 @@ class TestLayerWiseOptimizer:
 
                 # Each flat size should equal the sum of param numels for that rank
                 for rank_idx in range(dp_size):
-                    expected_size = sum(
-                        p.numel() for p in bucket.lw_params_list[rank_idx]
-                    )
+                    expected_size = sum(p.numel() for p in bucket.lw_params_list[rank_idx])
                     assert bucket.lw_param_flat_sizes[rank_idx] == expected_size, (
                         f"Rank {rank_idx}: expected flat_size {expected_size}, "
                         f"got {bucket.lw_param_flat_sizes[rank_idx]}"
@@ -696,7 +697,10 @@ class TestLayerWiseOptimizer:
         # Both should produce identical parameter values
         for op, sp in zip(opg_model.parameters(), std_model.parameters()):
             torch.testing.assert_close(
-                op.data, sp.data, rtol=1e-5, atol=1e-5,
+                op.data,
+                sp.data,
+                rtol=1e-5,
+                atol=1e-5,
                 msg="Overlap-param-gather and standard paths produced different updates",
             )
 
@@ -705,8 +709,8 @@ class TestLayerWiseOptimizer:
 
         Many ranks will have no assigned params when world_size > 2.
         """
-        model, optimizer, pg_collection = (
-            self.create_model_and_optimizer_with_overlap_param_gather(model_class=TinyModel)
+        model, optimizer, pg_collection = self.create_model_and_optimizer_with_overlap_param_gather(
+            model_class=TinyModel
         )
 
         # Create reference model with standard (non-layer-wise) optimizer
@@ -733,10 +737,8 @@ class TestLayerWiseOptimizer:
 
     def test_overlap_param_gather_broadcast_vs_allgather(self):
         """Test overlap-param-gather: allgather vs broadcast produce same results."""
-        model, optimizer, pg_collection = (
-            self.create_model_and_optimizer_with_overlap_param_gather(
-                model_class=SimpleModel, async_allgather=False
-            )
+        model, optimizer, pg_collection = self.create_model_and_optimizer_with_overlap_param_gather(
+            model_class=SimpleModel, async_allgather=False
         )
 
         # Create reference model with overlap-param-gather path too
@@ -780,15 +782,13 @@ class TestLayerWiseOptimizer:
         After each iteration, manually syncs params and verifies they match a reference
         model using the sync path.
         """
-        model, optimizer, pg_collection = (
-            self.create_model_and_optimizer_with_overlap_param_gather(async_allgather=True)
+        model, optimizer, pg_collection = self.create_model_and_optimizer_with_overlap_param_gather(
+            async_allgather=True
         )
 
         # Create reference model with sync allgather for comparison
-        ref_model, ref_optimizer, _ = (
-            self.create_model_and_optimizer_with_overlap_param_gather(
-                async_allgather=False, copy_from=model
-            )
+        ref_model, ref_optimizer, _ = self.create_model_and_optimizer_with_overlap_param_gather(
+            async_allgather=False, copy_from=model
         )
 
         for iteration in range(3):
@@ -809,6 +809,9 @@ class TestLayerWiseOptimizer:
             # Verify parameters match after each iteration
             for param, ref_param in zip(model.parameters(), ref_model.parameters()):
                 torch.testing.assert_close(
-                    param.data, ref_param.data, rtol=0, atol=0,
+                    param.data,
+                    ref_param.data,
+                    rtol=0,
+                    atol=0,
                     msg=f"Parameters diverged at iteration {iteration}",
                 )
