@@ -70,10 +70,10 @@ class MegatronLocal(InferenceServer, ReturnsTokens, ReturnsRaw):
             token_ids=choice.prompt_token_ids + choice.generation_token_ids,
             logprobs=choice.generation_log_probs,
             prompt_length=len(choice.prompt_token_ids),
-            policy_staleness=getattr(choice, 'policy_staleness', None),
-            kv_cache_staleness=getattr(choice, 'kv_cache_staleness', None),
+            policy_staleness=choice.policy_staleness,
+            kv_cache_staleness=choice.kv_cache_staleness,
             completed_at_step=args.curr_iteration,
-            num_evictions=getattr(choice, 'num_evictions', None),
+            num_evictions=choice.num_evictions,
         )
 
     @classmethod
