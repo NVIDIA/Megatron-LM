@@ -1,5 +1,5 @@
 # Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
-from typing import Callable, Optional, Tuple
+from typing import Callable, Optional, Tuple, Union
 
 import torch
 import torch.distributed as dist
@@ -13,6 +13,7 @@ from megatron.core.inference.communication.torch_symm_triton import (
     multimem_all_gather,
     multimem_reduce_scatter,
 )
+from megatron.core.inference.quantization.mxfp8_tensor import MXFP8Tensor
 from megatron.core.inference.quantization.utils import mm_mxfp8
 from megatron.core.model_parallel_config import ModelParallelConfig
 from megatron.core.parallel_state import get_global_symmetric_memory_buffer
@@ -40,6 +41,21 @@ def _te_rms_norm_kernel(x: torch.Tensor, weight: torch.Tensor, eps: float):
     )
     out = out.view(*x_shape[:-1], -1)
     return out.to(x.dtype)
+
+
+def _apply_linear(
+    x: torch.Tensor,
+    weight: Union[torch.Tensor, MXFP8Tensor],
+    config: TransformerConfig,
+    out: Optional[torch.Tensor] = None,
+) -> torch.Tensor:
+    """
+    Helper to apply either MXFP8 or standard GEMM based on the configuration.
+    """
+    kwargs = {"out": out} if out is not None else {}
+    if config.fp8_recipe == "mxfp8":
+        return mm_mxfp8(x, weight, **kwargs)
+    return torch.matmul(x, weight.t(), **kwargs)
 
 
 class InferenceLayerNormColumnParallelLinear(TELayerNormColumnParallelLinear):
@@ -157,11 +173,7 @@ class InferenceLayerNormColumnParallelLinear(TELayerNormColumnParallelLinear):
             x = _te_rms_norm_kernel(x=x, weight=self.layer_norm_weight, eps=self.eps)
             x = self._all_gather(x, symm_mem_buffer)
 
-        # Check for MXFP8 execution
-        if self.config.fp8_recipe == "mxfp8":
-            x = mm_mxfp8(x, self.weight)
-        else:
-            x = torch.matmul(x, self.weight.t())
+        x = _apply_linear(x, self.weight, self.config)
 
         return x, None
 
@@ -244,12 +256,7 @@ class InferenceRowParallelLinear(TERowParallelLinear):
         if can_use_custom_nvls_collectives:
             # Write output of matmul directly onto the symmetric memory buffer
 
-            if use_mxfp8:
-                x = mm_mxfp8(x, self.weight, out=symm_mem_buffer["tensor"])
-            else:
-                # Standard GEMM
-                torch.matmul(x, self.weight.t(), out=symm_mem_buffer["tensor"])
-                x = symm_mem_buffer["tensor"]
+            x = _apply_linear(x, self.weight, self.config, out=symm_mem_buffer["tensor"])
 
             # perform nvls reduce-scatter
             if self.next_layer_norm_weights is None:
@@ -280,11 +287,7 @@ class InferenceRowParallelLinear(TERowParallelLinear):
                 return residual
         else:
             # revert to torch dist (NCCL) reduce-scatter
-            if use_mxfp8:
-                x = mm_mxfp8(x, self.weight)
-            else:
-                x = torch.matmul(x, self.weight.t())
-
+            x = _apply_linear(x, self.weight, self.config)
             x, _ = reduce_scatter_along_first_dim(x, tp_group=self.tp_group)
         return x
 
@@ -308,10 +311,7 @@ class InferenceRowParallelLinear(TERowParallelLinear):
         Forward pass.
         """
         if self.tp_size == 1:
-            if self.config.fp8_recipe == "mxfp8":
-                x = mm_mxfp8(x, self.weight)
-            else:
-                x = torch.matmul(x, self.weight.t())
+            x = _apply_linear(x, self.weight, self.config)
             return x, None
         else:
             x = self._matmul_reduce_scatter(x)
