@@ -72,7 +72,7 @@ OPTIONS=" \
     --swiglu \
     --attention-dropout 0.0 \
     --hidden-dropout ${HD} \
-    --tensor-model-parallel-size 1 \
+    --tensor-model-parallel-size 4 \
     --pipeline-model-parallel-size 1 \
     --num-layers 32 \
     --hidden-size 4096 \
@@ -130,4 +130,4 @@ OPTIONS=" \
 export NVTE_APPLY_QK_LAYER_SCALING=0
 export NVTE_ALLOW_NONDETERMINISTIC_ALGO=${NONDETERMINISTIC_ATTN}
 
-torchrun --nproc_per_node 1 examples/multimodal/train.py ${OPTIONS}
+torchrun --nproc_per_node 8 examples/multimodal/train.py ${OPTIONS}
