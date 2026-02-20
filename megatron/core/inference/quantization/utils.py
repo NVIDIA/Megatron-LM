@@ -52,16 +52,12 @@ def quantize_model_to_mxfp8(model: torch.nn.Module) -> None:
 
     return model
 
+
 def mm_mxfp8(x: torch.Tensor, weight: torch.Tensor, out: torch.Tensor = None):
     """Computes a matmul in MXFP8 using FlashInfer."""
     assert HAVE_FLASHINFER
 
     x = MXFP8Tensor.from_bf16(x.squeeze(1))
     return flashinfer_mm_mxfp8(
-        x.data,
-        weight.data.T,
-        x.scale,
-        weight.scale,
-        out_dtype=torch.bfloat16,
-        out=out,
+        x.data, weight.data.T, x.scale, weight.scale, out_dtype=torch.bfloat16, out=out
     ).unsqueeze(1)

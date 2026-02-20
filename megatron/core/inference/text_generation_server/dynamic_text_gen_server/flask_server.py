@@ -65,6 +65,10 @@ async def run_flask_server_on_client(
     for endpoint in endpoints.__all__:
         app.register_blueprint(endpoint)
 
+    @app.route('/')
+    def health_check():
+        return "Megatron Dynamic Inference Server is running."
+
     loop = asyncio.get_event_loop()
 
     config = Config()

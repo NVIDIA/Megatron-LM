@@ -33,7 +33,6 @@ except ImportError:
     HAVE_TE = False
 
 
-
 def _te_rms_norm_kernel(x: torch.Tensor, weight: torch.Tensor, eps: float):
     x_shape = x.shape
     x = x.view(-1, x.size(-1))
@@ -242,7 +241,6 @@ class InferenceRowParallelLinear(TERowParallelLinear):
         can_use_custom_nvls_collectives = (
             is_bf16 and is_hopper_or_newer and has_enough_symmetric_memory
         )
-
 
         if can_use_custom_nvls_collectives:
             # Write output of matmul directly onto the symmetric memory buffer
