@@ -853,6 +853,9 @@ def prep_wandb_metrics(
         data=[[np.mean(g), np.std(g)] for g in rewards],
     )
 
+    true_policy_staleness = [s + current_iteration - c for g, cg in zip(policy_staleness, completed_at_steps) for s, c in zip(g, cg)]
+    true_kv_staleness = [s + current_iteration - c for g, cg in zip(kv_cache_staleness, completed_at_steps) for s, c in zip(g, cg)]
+
     metrics = {
             'group_means_hist': wandb_writer.plot.histogram(
                 group_table, 'group_means', 'Group Means'
@@ -875,7 +878,7 @@ def prep_wandb_metrics(
             'rollout_table': wandb_writer.Table(
                 columns=['policy_staleness', 'reward', 'traj_length', 'num_evictions'],
                 data=list(zip(
-                    [s for g in policy_staleness for s in g],
+                    true_policy_staleness,
                     [r for g in rewards for r in g],
                     [l for g in traj_lens for l in g],
                     [e for g in num_evictions for e in g],
@@ -896,12 +899,12 @@ def prep_wandb_metrics(
             'mean_advantage': np.mean(advantages),
             'nonzero_groups_ratio': np.count_nonzero(advantages)
             / len(advantages),
-            'mean_policy_staleness': np.mean([np.mean(g) for g in policy_staleness]),
-            'max_policy_staleness': max([max(g) for g in policy_staleness]),
-            'min_policy_staleness': min([min(g) for g in policy_staleness]),
-            'mean_kv_cache_staleness': np.mean([np.mean(g) for g in kv_cache_staleness]),
-            'max_kv_cache_staleness': max([max(g) for g in kv_cache_staleness]),
-            'min_kv_cache_staleness': min([min(g) for g in kv_cache_staleness]),
+            'mean_policy_staleness': np.mean(true_policy_staleness),
+            'max_policy_staleness': max(true_policy_staleness),
+            'min_policy_staleness': min(true_policy_staleness),
+            'mean_kv_cache_staleness': np.mean(true_kv_staleness),
+            'max_kv_cache_staleness': max(true_kv_staleness),
+            'min_kv_cache_staleness': min(true_kv_staleness),
             'total_eviction_count': sum([sum(g) for g in num_evictions]),
             'max_num_evictions': max([max(g) for g in num_evictions]),
             'mean_completion_gap': np.mean([current_iteration - s for g in completed_at_steps for s in g]),
