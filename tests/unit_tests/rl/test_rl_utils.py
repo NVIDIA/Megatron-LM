@@ -915,9 +915,16 @@ class TestRLUtils:
         completed_at_steps = [[5, 4], [5, 3]]
         current_iteration = 6
         metrics = rl_utils.prep_wandb_metrics(
-            MagicMock(), traj_lens, turn_lens, rewards, num_turns, advantages,
-            policy_staleness=policy_staleness, kv_cache_staleness=kv_cache_staleness,
-            num_evictions=num_evictions, completed_at_steps=completed_at_steps,
+            MagicMock(),
+            traj_lens,
+            turn_lens,
+            rewards,
+            num_turns,
+            advantages,
+            policy_staleness=policy_staleness,
+            kv_cache_staleness=kv_cache_staleness,
+            num_evictions=num_evictions,
+            completed_at_steps=completed_at_steps,
             current_iteration=current_iteration,
         )
         assert metrics["mean_reward"] == 0.75
