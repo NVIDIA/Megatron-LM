@@ -21,7 +21,7 @@ TENSORBOARD_DIR="${OUTPUT}/tensorboard"
 
 export TRITON_CACHE_DIR="${WORKSPACE}/triton-cache/"
 # The following patch to the Triton cache manager is needed for Triton version <= 3.1
-export TRITON_CACHE_MANAGER="megatron.core.ssm.triton_cache_manager:ParallelFileCacheManager"
+# export TRITON_CACHE_MANAGER="megatron.core.ssm.triton_cache_manager:ParallelFileCacheManager"
 
 if [[ -z $LOAD_NAME ]]; then
     echo "Please set LOAD_NAME for input model name."
@@ -53,6 +53,7 @@ OPTIONS=" \
     --apply-layernorm-1p \
     --attention-softmax-in-fp32 \
     --use-checkpoint-args \
+    --no-use-tokenizer-model-from-checkpoint-args \
     --use-distributed-optimizer \
     --transformer-impl transformer_engine \
     --use-te \
@@ -71,7 +72,7 @@ OPTIONS=" \
     --swiglu \
     --attention-dropout 0.0 \
     --hidden-dropout ${HD} \
-    --tensor-model-parallel-size 4 \
+    --tensor-model-parallel-size 1 \
     --pipeline-model-parallel-size 1 \
     --num-layers 32 \
     --hidden-size 4096 \
@@ -92,7 +93,7 @@ OPTIONS=" \
     --eval-iters 10 \
     --eval-interval 1000 \
     --tokenizer-type MultimodalTokenizer \
-    --tokenizer-model mistralai/Mistral-7B-Instruct-v0.3 \
+    --tokenizer-model mistralai/Mistral-7B-v0.3 \
     --tokenizer-prompt-format mistral \
     --data-path ${DATA_TRAIN} \
     --prompt-path ${SOURCE}/examples/multimodal/manual_prompts.json \
@@ -129,4 +130,4 @@ OPTIONS=" \
 export NVTE_APPLY_QK_LAYER_SCALING=0
 export NVTE_ALLOW_NONDETERMINISTIC_ALGO=${NONDETERMINISTIC_ATTN}
 
-torchrun --nproc_per_node 8 examples/multimodal/train.py ${OPTIONS}
+torchrun --nproc_per_node 1 examples/multimodal/train.py ${OPTIONS}
