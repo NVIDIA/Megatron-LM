@@ -156,7 +156,8 @@ jobs:
             --jq '.checks[].context' 2>/dev/null \
             || gh api \
             "repos/${{ github.repository }}/branches/${{ env.TARGET_BRANCH }}/protection/required_status_checks" \
-            --jq '.contexts[]' 2>/dev/null)
+            --jq '.contexts[]' 2>/dev/null \
+            || true)
 
           if [ -z "$REQUIRED_CHECKS" ]; then
             echo "No branch protection rules found for ${{ env.TARGET_BRANCH }}, skipping wait"
