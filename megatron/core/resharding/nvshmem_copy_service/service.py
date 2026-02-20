@@ -34,7 +34,7 @@ class RemoteCopyService:
     and executing pipelined communication with NVSHMEM.
     """
 
-    def __init__(self):
+    def __init__(self, group=None):
         # Core components
         self.gpu_resources = GPUResourceManager()
         self.buffer_manager = DoubleBufferManager()
@@ -47,6 +47,9 @@ class RemoteCopyService:
         self.comm_scheduler = CommunicationScheduler()
         self.gpu_planner = GPUExecutionPlanner()
 
+        # Optional process group for distributed operations
+        self._group = group
+
         # State
         self.send_requests: List[SendRequest] = []
         self.receive_requests: List[ReceiveRequest] = []
@@ -56,6 +59,7 @@ class RemoteCopyService:
         # Events for double-buffering
         self.pack_events = []
         self.unpack_events = []
+        self.barrier_events = []
 
     @property
     def my_pe(self) -> int:
@@ -93,7 +97,7 @@ class RemoteCopyService:
             )
 
         # Initialize GPU resources (NVSHMEM, device, streams)
-        self.gpu_resources.init()
+        self.gpu_resources.init(group=self._group)
 
         # Initialize logger after PE ID is known
         PELogger.init(self.my_pe, level=log_level)
@@ -137,6 +141,7 @@ class RemoteCopyService:
             self.gpu_resources.copy_stream,
             self.gpu_resources.torch_pack_stream,
             self.gpu_resources.torch_unpack_stream,
+            self.gpu_resources.torch_send_stream,
             self.gpu_resources.torch_copy_stream,
         )
 
@@ -232,7 +237,7 @@ class RemoteCopyService:
         # Step 3: Schedule workloads to iterations
         PELogger.debug("Step 3: Building communication schedule...")
         schedule, global_summaries = self.comm_scheduler.build_schedule(
-            workloads, self.my_pe, self.n_pes
+            workloads, self.my_pe, self.n_pes, group=self._group
         )
 
         self.num_iterations = self.comm_scheduler.num_iterations
@@ -255,8 +260,12 @@ class RemoteCopyService:
 
         # Step 6: Create double-buffered events
         PELogger.debug("Step 6: Creating synchronization events...")
-        self.pack_events, self.unpack_events = self.gpu_resources.create_events(num_events=2)
-        self.pipeline_executor.set_events(self.pack_events, self.unpack_events)
+        self.pack_events, self.unpack_events, self.barrier_events = (
+            self.gpu_resources.create_events(num_events=2)
+        )
+        self.pipeline_executor.set_events(
+            self.pack_events, self.unpack_events, self.barrier_events
+        )
 
         PELogger.info(f"Schedule complete: {self.num_iterations} iterations ready")
 
@@ -313,6 +322,7 @@ class RemoteCopyService:
         self.num_iterations = 0
         self.pack_events = []
         self.unpack_events = []
+        self.barrier_events = []
 
     def finalize(self) -> None:
         """Cleanup resources."""

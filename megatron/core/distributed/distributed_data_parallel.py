@@ -370,12 +370,16 @@ class DistributedDataParallel(_BaseDataParallel):
         Skip synchronous param all-gather if `param_sync` is False.
         """
         assert self.use_forward_hook
+        for module, handle in list(self.remove_forward_pre_hook_handles.items()):
+            handle.remove()
+        self.remove_forward_pre_hook_handles.clear()
+
         # De-register forward pre-hook for all sub-modules.
-        for module in self.module.modules():
-            assert self.remove_forward_pre_hook_handles[module] is not None
-            self.remove_forward_pre_hook_handles[module].remove()
-            del self.remove_forward_pre_hook_handles[module]
-        assert len(self.remove_forward_pre_hook_handles) == 0
+        #for module in self.module.modules():
+        #    assert self.remove_forward_pre_hook_handles[module] is not None
+        #    self.remove_forward_pre_hook_handles[module].remove()
+        #    del self.remove_forward_pre_hook_handles[module]
+        #assert len(self.remove_forward_pre_hook_handles) == 0
 
         # Force synchronize parameters.
         if param_sync:

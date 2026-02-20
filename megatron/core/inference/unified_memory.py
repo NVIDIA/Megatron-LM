@@ -75,6 +75,7 @@ def _compile_timeout(timeout_s: int):
         yield
         return
 
+
     curr_handler = signal.signal(signal.SIGALRM, _handler)
     try:
         signal.alarm(timeout_s)

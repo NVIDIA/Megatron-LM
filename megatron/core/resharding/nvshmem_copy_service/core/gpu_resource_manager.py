@@ -48,11 +48,15 @@ class GPUResourceManager:
         # Stream name to PyTorch stream mapping
         self._torch_streams: Dict[str, torch.cuda.ExternalStream] = {}
 
-    def init(self) -> None:
+    def init(self, group=None) -> None:
         """
         Initialize NVSHMEM, CUDA device, and streams.
 
         Expects torch.distributed to be already initialized.
+
+        Args:
+            group: Optional ProcessGroup for distributed operations.
+                   If None, uses the default process group.
         """
         if self.initialized:
             return
@@ -75,9 +79,12 @@ class GPUResourceManager:
         self.device = Device(local_rank)
         self.device.set_current()
 
-        # Extract rank, nranks from the default process group
-        num_ranks = dist.get_world_size()
-        rank_id = dist.get_rank()
+        # Extract rank, nranks from the process group.
+        # Use group.rank()/size() instead of dist.get_rank(group=) because
+        # dist.get_rank(group=) maps via the default PG rank, which is wrong
+        # for cross-cluster ProcessGroups where workers share default PG rank 0.
+        num_ranks = group.size() if group is not None else dist.get_world_size()
+        rank_id = group.rank() if group is not None else dist.get_rank()
 
         # Create/Broadcast UniqueID using broadcast_object_list
         uniqueid = nvshmem.core.get_unique_id(empty=True)
@@ -87,11 +94,11 @@ class GPUResourceManager:
         else:
             broadcast_objects = [None]
 
-        # Broadcast ID to all ranks using the default group
-        dist.broadcast_object_list(broadcast_objects, src=0)
+        # Broadcast ID to all ranks
+        dist.broadcast_object_list(broadcast_objects, src=0, group=group)
 
         # Barrier to ensure everyone has the ID before NVSHMEM init
-        dist.barrier()
+        dist.barrier(group=group)
 
         # Initialize NVSHMEM with the broadcasted UID
         nvshmem.core.init(
@@ -171,18 +178,19 @@ class GPUResourceManager:
 
     def create_events(self, num_events: int = 2):
         """
-        Create double-buffered CUDA events for pack and unpack operations.
+        Create double-buffered CUDA events for pack, unpack, and barrier operations.
 
         Args:
             num_events: Number of events to create for each type
                 (default: 2 for double buffering)
 
         Returns:
-            tuple: (pack_events, unpack_events) lists of torch.cuda.Event
+            tuple: (pack_events, unpack_events, barrier_events) lists of torch.cuda.Event
         """
         pack_events = [torch.cuda.Event(enable_timing=False) for _ in range(num_events)]
         unpack_events = [torch.cuda.Event(enable_timing=False) for _ in range(num_events)]
-        return pack_events, unpack_events
+        barrier_events = [torch.cuda.Event(enable_timing=False) for _ in range(num_events)]
+        return pack_events, unpack_events, barrier_events
 
     def finalize(self) -> None:
         """Cleanup resources (streams are automatically managed by CUDA)."""

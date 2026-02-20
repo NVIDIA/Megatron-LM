@@ -251,6 +251,7 @@ def extract_param_metadata(
     pg_collection,
     num_experts: Optional[int] = None,
     layer_module_prefix_map: Mapping[str, str] | None = None,
+    rank_offset: int = 0,
 ) -> ParameterMetadata:
     """Extract metadata from a parameter for cross-rank communication."""
     # TP flags from attributes (set by Megatron linear layers)
@@ -275,26 +276,29 @@ def extract_param_metadata(
     data_parallel_group_ranks: list[int] | None = None
     pipeline_parallel_group_ranks: list[int] | None = None
 
+    def _offset_ranks(ranks: list[int]) -> list[int]:
+        return [r + rank_offset for r in ranks] if rank_offset else ranks
+
     if is_ep:
-        expert_parallel_group_ranks = dist.get_process_group_ranks(pg_collection.ep)
+        expert_parallel_group_ranks = _offset_ranks(dist.get_process_group_ranks(pg_collection.ep))
         # For MoE params, prefer expert TP group when available, else regular TP
         if is_tp and hasattr(pg_collection, 'expt_tp') and pg_collection.expt_tp is not None:
-            tensor_parallel_group_ranks = dist.get_process_group_ranks(pg_collection.expt_tp)
+            tensor_parallel_group_ranks = _offset_ranks(dist.get_process_group_ranks(pg_collection.expt_tp))
         elif is_tp and hasattr(pg_collection, 'tp') and pg_collection.tp is not None:
-            tensor_parallel_group_ranks = dist.get_process_group_ranks(pg_collection.tp)
-        data_parallel_group_ranks = dist.get_process_group_ranks(pg_collection.dp)
+            tensor_parallel_group_ranks = _offset_ranks(dist.get_process_group_ranks(pg_collection.tp))
+        data_parallel_group_ranks = _offset_ranks(dist.get_process_group_ranks(pg_collection.dp))
     elif is_tp:
         # Non-EP: use regular TP group
         if hasattr(pg_collection, 'tp') and pg_collection.tp is not None:
-            tensor_parallel_group_ranks = dist.get_process_group_ranks(pg_collection.tp)
-        data_parallel_group_ranks = dist.get_process_group_ranks(pg_collection.dp)
+            tensor_parallel_group_ranks = _offset_ranks(dist.get_process_group_ranks(pg_collection.tp))
+        data_parallel_group_ranks = _offset_ranks(dist.get_process_group_ranks(pg_collection.dp))
     else:
-        data_parallel_group_ranks = dist.get_process_group_ranks(pg_collection.dp)
+        data_parallel_group_ranks = _offset_ranks(dist.get_process_group_ranks(pg_collection.dp))
 
     if hasattr(pg_collection, 'pp') and pg_collection.pp is not None:
-        pipeline_parallel_group_ranks = dist.get_process_group_ranks(pg_collection.pp)
+        pipeline_parallel_group_ranks = _offset_ranks(dist.get_process_group_ranks(pg_collection.pp))
     else:
-        pipeline_parallel_group_ranks = list(range(dist.get_world_size()))
+        pipeline_parallel_group_ranks = list(range(rank_offset, rank_offset + dist.get_world_size()))
 
     meta = ParameterMetadata(
         name=param_name,
