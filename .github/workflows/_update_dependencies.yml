@@ -184,8 +184,6 @@ jobs:
             sleep 30
           done
 
-          gh pr checks "$PR_NUMBER" --watch --interval 60
-
       - name: Merge PR
         env:
           title: "chore(beep boop 🤖): Bump `uv.lock` (${{ env.TARGET_BRANCH}}) (${{ needs.pre-flight.outputs.date }})"
