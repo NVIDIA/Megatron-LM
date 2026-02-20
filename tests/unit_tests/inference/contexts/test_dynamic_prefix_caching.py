@@ -963,3 +963,161 @@ class TestGPUStructuresAndConfig(PrefixCachingTestBase):
         assert not hasattr(alloc_disabled, 'gpu_hash_table')
         alloc_rz = self._ctx(prefix_caching_evict_policy=PrefixCachingEvictPolicy.REF_ZERO).block_allocator
         assert not hasattr(alloc_rz, 'block_timestamps')
+
+
+# =========================================================================
+# Class 10: TestPrefixSkip
+# =========================================================================
+
+
+class TestPrefixSkip(PrefixCachingTestBase):
+    """Prefix skip: matched blocks reduce query length, shift KV offset, and adjust position IDs."""
+
+    @pytest.mark.internal
+    def test_non_chunked_partial_match(self):
+        """Non-block-aligned prompt: 3 full blocks match, suffix of 17 tokens processed."""
+        ctx = self._ctx()
+        bs = ctx.block_size_tokens  # 32
+        prompt_len = 3 * bs + 17  # 113
+
+        # Req A: establish cached blocks.
+        req_a = self._req(ctx, self._prompt(prompt_len))
+        ctx.add_request(req_a)
+        ctx.mark_pending_blocks_computed()
+        active_after_a = ctx.active_token_count
+
+        # Req B: identical prompt, non-chunked (chunk_length=None).
+        req_b = self._req(ctx, self._prompt(prompt_len), request_id=2)
+        ctx.add_request(req_b)
+
+        # 3 full blocks match; partial block (17 tokens) not registered.
+        # prefix_skip_tokens = 3 * bs = 96
+        # effective_chunk_length = 113 - 96 = 17
+        assert ctx.request_query_lengths[1].item() == 17
+        assert ctx.request_kv_length_offsets[1].item() == 3 * bs  # 96
+        assert ctx.active_token_count == active_after_a + 17
+
+        # Position IDs for req B's tokens start at effective_kv_offset.
+        b_token_start = active_after_a
+        b_token_end = b_token_start + 17
+        pos_ids = ctx.token_to_pos_ids[b_token_start:b_token_end].tolist()
+        assert pos_ids == list(range(3 * bs, 3 * bs + 17))
+
+        # request_output_lengths uses original chunk_length, not effective.
+        assert ctx.request_output_lengths[1].item() == prompt_len + 10
+
+    @pytest.mark.internal
+    def test_non_chunked_fully_cached(self):
+        """All blocks match — at least 1 token must still be processed."""
+        ctx = self._ctx()
+        bs = ctx.block_size_tokens
+        prompt_len = 4 * bs  # exactly 4 full blocks
+
+        req_a = self._req(ctx, self._prompt(prompt_len))
+        ctx.add_request(req_a)
+        ctx.mark_pending_blocks_computed()
+        active_after_a = ctx.active_token_count
+
+        req_b = self._req(ctx, self._prompt(prompt_len), request_id=2)
+        ctx.add_request(req_b)
+
+        # All 4 blocks match. prefix_skip = min(4*bs, 4*bs - 1) = 4*bs - 1.
+        # effective_chunk_length = 1.
+        assert ctx.request_query_lengths[1].item() == 1
+        assert ctx.request_kv_length_offsets[1].item() == 4 * bs - 1
+        assert ctx.active_token_count == active_after_a + 1
+
+    @pytest.mark.internal
+    def test_chunked_block_aligned(self):
+        """Chunked prefill where prior chunk ends on block boundary — prefix skip applies."""
+        ctx = self._ctx()
+        bs = ctx.block_size_tokens
+        prompt_len = 6 * bs
+
+        # Req A: establish cached blocks.
+        req_a = self._req(ctx, self._prompt(prompt_len))
+        ctx.add_request(req_a)
+        ctx.mark_pending_blocks_computed()
+
+        # Req B: same prompt, two chunks of 3*bs each.
+        req_b = self._req(ctx, self._prompt(prompt_len), request_id=2)
+        chunk_len = 3 * bs
+
+        # Chunk 1 (finished=0, block-aligned): 3 blocks match.
+        # prefix_skip = min(3*bs, 3*bs - 1) = 3*bs - 1, effective = 1.
+        ctx.add_request(req_b, chunk_length=chunk_len)
+        assert ctx.request_query_lengths[1].item() == 1
+        assert ctx.request_kv_length_offsets[1].item() == 3 * bs - 1
+
+        self._simulate_chunk_done(req_b, chunk_len)
+        ctx.mark_pending_blocks_computed()
+
+        # Chunk 2 (finished=3*bs, block-aligned): 3 more blocks match.
+        ctx.add_request(req_b, chunk_length=chunk_len)
+        assert ctx.request_query_lengths[1].item() == 1
+        assert ctx.request_kv_length_offsets[1].item() == 6 * bs - 1
+
+    @pytest.mark.internal
+    def test_chunked_non_aligned_no_skip(self):
+        """Chunked prefill where prior chunk does NOT end on block boundary — prefix skip disabled."""
+        ctx = self._ctx()
+        bs = ctx.block_size_tokens
+        prompt_len = 4 * bs
+
+        # Req A: establish cached blocks.
+        req_a = self._req(ctx, self._prompt(prompt_len))
+        ctx.add_request(req_a)
+        ctx.mark_pending_blocks_computed()
+
+        # Req B: same prompt. Chunk 1 = bs + 5 (non-aligned).
+        req_b = self._req(ctx, self._prompt(prompt_len), request_id=2)
+        chunk1_len = bs + 5
+
+        # Chunk 1 (finished=0, block-aligned): 1 block matches, skip applies.
+        ctx.add_request(req_b, chunk_length=chunk1_len)
+        self._simulate_chunk_done(req_b, chunk1_len)
+        ctx.mark_pending_blocks_computed()
+
+        # Chunk 2 (finished=bs+5, NOT block-aligned): prefix_skip_tokens = 0.
+        remaining = prompt_len - chunk1_len
+        ctx.add_request(req_b, chunk_length=remaining)
+        assert ctx.request_query_lengths[1].item() == remaining  # full chunk, no skip
+        assert ctx.request_kv_length_offsets[1].item() == chunk1_len  # = finished, no offset added
+
+    @pytest.mark.internal
+    def test_no_match_no_skip(self):
+        """No prefix match — prefix skip is zero (baseline)."""
+        ctx = self._ctx()
+        bs = ctx.block_size_tokens
+        prompt_len = 2 * bs
+
+        req_a = self._req(ctx, self._prompt(prompt_len))
+        ctx.add_request(req_a)
+        ctx.mark_pending_blocks_computed()
+        active_after_a = ctx.active_token_count
+
+        # Completely different prompt.
+        req_b = self._req(ctx, self._prompt(prompt_len, offset=10000), request_id=2)
+        ctx.add_request(req_b)
+
+        assert ctx.request_query_lengths[1].item() == prompt_len
+        assert ctx.request_kv_length_offsets[1].item() == 0
+        assert ctx.active_token_count == active_after_a + prompt_len
+
+    @pytest.mark.internal
+    def test_active_token_savings(self):
+        """Active token savings accumulate across multiple cached requests."""
+        ctx = self._ctx(max_sequence_length=1024)
+        bs = ctx.block_size_tokens
+        prompt_len = 5 * bs
+
+        req_a = self._req(ctx, self._prompt(prompt_len))
+        ctx.add_request(req_a)
+        ctx.mark_pending_blocks_computed()
+
+        # Reqs B, C, D: identical prompt. Each fully cached → 1 effective token.
+        for i in range(2, 5):
+            ctx.add_request(self._req(ctx, self._prompt(prompt_len), request_id=i))
+
+        # Req A: 5*bs tokens. Reqs B, C, D: 1 token each.
+        assert ctx.active_token_count == 5 * bs + 3
