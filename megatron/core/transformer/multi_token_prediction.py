@@ -1,9 +1,10 @@
 # Copyright (c) 2025, NVIDIA CORPORATION. All rights reserved.
+from __future__ import annotations
 
 import warnings
 from contextlib import nullcontext
 from dataclasses import dataclass
-from typing import Callable, List, Optional, Union
+from typing import TYPE_CHECKING, Callable, List, Optional, Union
 
 import torch
 from torch import Tensor
@@ -33,6 +34,9 @@ from megatron.core.utils import (
     make_tp_sharded_tensor_for_checkpoint,
     make_viewless_tensor,
 )
+
+if TYPE_CHECKING:
+    from megatron.core.ssm.mamba_block import MambaStackSubmodules
 
 if is_torch_min_version("1.13.0"):
     dist_all_gather_func = torch.distributed.all_gather_into_tensor
@@ -732,7 +736,7 @@ class MultiTokenPredictionLayer(MegatronModule):
         pg_collection: Optional[ProcessGroupCollection] = None,
         # For Mamba path - pattern and submodules to build inner layers directly
         mtp_layer_pattern: Optional[str] = None,
-        mamba_submodules: Optional["MambaStackSubmodules"] = None,
+        mamba_submodules: Optional[MambaStackSubmodules] = None,
     ):
         super().__init__(config=config)
         self.sequence_parallel = config.sequence_parallel
@@ -746,25 +750,29 @@ class MultiTokenPredictionLayer(MegatronModule):
         if self.submodules.mtp_model_layer is not None and hasattr(
             self.submodules.mtp_model_layer, 'submodules'
         ):
-            if hasattr(self.submodules.mtp_model_layer.submodules, 'attention_layer'):
-                self_attention_spec = self.submodules.mtp_model_layer.submodules.attention_layer
-                if self_attention_spec.submodules.self_attention is not None:
-                    self_attention_spec = self_attention_spec.submodules.self_attention
-                    attn_mask_type = self_attention_spec.params.get('attn_mask_type', '')
-                    assert attn_mask_type in SUPPORTED_ATTN_MASK, (
-                        f"Multi-Token Prediction (MTP) is not yet supported with "
-                        f"{attn_mask_type} attention mask type. "
-                        f"The supported attention mask types are {SUPPORTED_ATTN_MASK}."
-                    )
-            elif hasattr(self.submodules.mtp_model_layer.submodules, 'self_attention'):
-                self_attention_spec = self.submodules.mtp_model_layer.submodules.self_attention
-                if self_attention_spec is not None:
-                    attn_mask_type = self_attention_spec.params.get('attn_mask_type', '')
-                    assert attn_mask_type in SUPPORTED_ATTN_MASK, (
-                        f"Multi-Token Prediction (MTP) is not yet supported with "
-                        f"{attn_mask_type} attention mask type. "
-                        f"The supported attention mask types are {SUPPORTED_ATTN_MASK}."
-                    )
+            from megatron.core.ssm.mamba_block import MambaStackSubmodules
+            from megatron.core.transformer.transformer_layer import TransformerLayerSubmodules
+
+            layer_submodules = None
+            if isinstance(self.submodules.mtp_model_layer.submodules, MambaStackSubmodules):
+                attention_layer_spec = self.submodules.mtp_model_layer.submodules.attention_layer
+                if hasattr(attention_layer_spec, 'submodules'):
+                    assert isinstance(attention_layer_spec.submodules, TransformerLayerSubmodules)
+                    layer_submodules = attention_layer_spec.submodules
+            elif isinstance(self.submodules.mtp_model_layer.submodules, TransformerLayerSubmodules):
+                layer_submodules = self.submodules.mtp_model_layer.submodules
+            else:
+                raise ValueError(
+                    "Unsupported mtp_model_layer submodules type for attention mask validation."
+                )
+            if layer_submodules:
+                self_attention_spec = layer_submodules.self_attention
+                attn_mask_type = self_attention_spec.params.get('attn_mask_type', '')
+                assert attn_mask_type in SUPPORTED_ATTN_MASK, (
+                    f"Multi-Token Prediction (MTP) is not yet supported with "
+                    f"{attn_mask_type} attention mask type. "
+                    f"The supported attention mask types are {SUPPORTED_ATTN_MASK}."
+                )
 
         self.enorm = self.submodules.enorm(
             config=self.config,
