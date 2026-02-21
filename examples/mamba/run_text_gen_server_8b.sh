@@ -18,7 +18,6 @@ export NCCL_IB_TIMEOUT=19
 export NCCL_IB_QPS_PER_CONNECTION=4
 
 export TRITON_CACHE_DIR="./triton-cache/"
-export TRITON_CACHE_MANAGER="megatron.core.ssm.triton_cache_manager:ParallelFileCacheManager"
 
 torchrun $DISTRIBUTED_ARGS ../../tools/run_mamba_text_generation_server.py \
        --tensor-model-parallel-size 1  \

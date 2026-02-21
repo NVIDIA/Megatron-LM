@@ -42,7 +42,6 @@ mkdir -p ${DATACACHE_DIR}
 mkdir -p ${TENSORBOARD_DIR}
 
 export TRITON_CACHE_DIR="./triton-cache/"
-export TRITON_CACHE_MANAGER="megatron.core.ssm.triton_cache_manager:ParallelFileCacheManager"
 
 SEQ_LEN=4096
 TRAIN_SAMPLES=73242188  # 300B tokens / 4096
