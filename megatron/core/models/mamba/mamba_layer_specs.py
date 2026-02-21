@@ -38,7 +38,6 @@ moe = get_moe_module_spec(
     use_te=True,
     num_experts=8,  # Can be any positive integer (must not be None).
     moe_grouped_gemm=True,
-    moe_use_legacy_grouped_gemm=False,
 )
 
 

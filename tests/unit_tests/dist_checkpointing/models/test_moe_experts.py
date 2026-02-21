@@ -21,7 +21,7 @@ from megatron.core.models.gpt.gpt_layer_specs import (
     get_gpt_layer_with_transformer_engine_spec,
 )
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
-from megatron.core.transformer.moe.experts import GroupedMLP, SequentialMLP, TEGroupedMLP
+from megatron.core.transformer.moe.experts import SequentialMLP, TEGroupedMLP
 from megatron.core.transformer.moe.moe_utils import get_default_pg_collection
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.utils import is_te_min_version
@@ -51,9 +51,7 @@ def initialize_expert_layer(seed, glu=True, expert_type='sequential', fp8=False,
     )
     default_config_kwargs.update(**config_kwargs)
     transformer_config = TransformerConfig(**default_config_kwargs)
-    if expert_type == 'grouped':
-        model = GroupedMLP(num_local_experts, transformer_config, pg_collection)
-    elif expert_type == 'te_grouped':
+    if expert_type == 'te_grouped':
         transformer_layer_spec = get_gpt_layer_with_transformer_engine_spec(
             num_experts=num_moe_experts, moe_grouped_gemm=True
         )
