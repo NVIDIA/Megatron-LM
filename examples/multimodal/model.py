@@ -16,7 +16,8 @@ from megatron.core.utils import log_single_rank
 
 
 def model_provider(
-    pre_process=True, post_process=True, add_encoder=True, add_decoder=True, parallel_output=True
+    pre_process=True, post_process=True, add_encoder=True, add_decoder=True, parallel_output=True,
+    vp_stage=None, config=None, pg_collection=None,
 ) -> LLaVAModel:
     """Builds the model.
 
@@ -75,7 +76,10 @@ def model_provider(
     language_model_type = args.language_model_type
     vision_model_type = args.vision_model_type
 
-    base_config = core_transformer_config_from_args(get_args())
+    if config is None:
+        base_config = core_transformer_config_from_args(get_args())
+    else:
+        base_config = deepcopy(config)
     base_config.language_model_type = args.language_model_type
     base_config.vision_model_type = args.vision_model_type
     base_config.calculate_per_token_loss = True
@@ -220,8 +224,10 @@ def model_provider(
         image_token_index=image_token_index,
         pixel_shuffle=args.pixel_shuffle,
         tile_tags=tile_tags,
+        pg_collection=pg_collection,
         max_num_tiles=args.max_num_tiles,
         tokenizer_type=args.tokenizer_prompt_format,
+        vp_stage=vp_stage,
     )
 
     model.freeze(
