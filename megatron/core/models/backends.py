@@ -3,12 +3,14 @@ from __future__ import annotations
 
 import warnings
 from abc import abstractmethod
+from functools import partial
 from typing import Optional, Protocol, cast
 
 from megatron.core.tensor_parallel.layers import ColumnParallelLinear, RowParallelLinear
 from megatron.core.transformer.dot_product_attention import DotProductAttention
 from megatron.core.transformer.mlp import MLPSubmodules, TEActivationFunctionBuilder
-from megatron.core.transformer.moe.experts import GroupedMLP, SequentialMLP, TEGroupedMLPSubmodules
+from megatron.core.transformer.moe.experts import GroupedMLP, SequentialMLP
+from megatron.core.transformer.moe.moe_layer import ExpertsBuilder
 from megatron.core.transformer.torch_norm import LayerNormBuilder, WrappedTorchNorm
 from megatron.core.typed_torch import not_none
 
@@ -75,7 +77,7 @@ class BackendSpecProvider(Protocol):
     @abstractmethod
     def grouped_mlp_modules(
         self, moe_use_grouped_gemm: bool, moe_use_legacy_grouped_gemm: bool
-    ) -> tuple[type, MLPSubmodules | TEGroupedMLPSubmodules | None]:
+    ) -> ExpertsBuilder:
         """Which module and submodules to use for grouped mlp"""
         ...
 
@@ -119,17 +121,22 @@ class LocalSpecProvider(BackendSpecProvider):
 
     def grouped_mlp_modules(
         self, moe_use_grouped_gemm: bool, moe_use_legacy_grouped_gemm: bool
-    ) -> tuple[type[GroupedMLP], None] | tuple[type[SequentialMLP], MLPSubmodules]:
+    ) -> ExpertsBuilder:
         """Which module and submodules to use for grouped mlp"""
         if moe_use_grouped_gemm:
             warnings.warn(
                 "The legacy GroupedMLP will be deprecated in Megatron-Core v0.12.0. "
                 "Please update the TransformerEngine to version>=1.7.0 and use TEGroupedMLP."
             )
-            return GroupedMLP, None
+            return GroupedMLP
         else:
-            return SequentialMLP, MLPSubmodules(
-                linear_fc1=ColumnParallelLinear, linear_fc2=RowParallelLinear
+            return partial(
+                SequentialMLP,
+                submodules=MLPSubmodules(
+                    linear_fc1=ColumnParallelLinear,
+                    linear_fc2=RowParallelLinear,
+                    activation_func=self.activation_func(),
+                ),
             )
 
     def activation_func(self) -> TEActivationFunctionBuilder | None:
@@ -181,7 +188,7 @@ class InferenceSpecProvider(BackendSpecProvider):
 
     def grouped_mlp_modules(
         self, moe_use_grouped_gemm: bool, moe_use_legacy_grouped_gemm: bool
-    ) -> tuple[type, MLPSubmodules | TEGroupedMLPSubmodules | None]:
+    ) -> ExpertsBuilder:
         raise NotImplementedError(
             "MOE is not supported with inference optimized transformer implementation."
         )

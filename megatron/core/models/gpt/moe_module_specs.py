@@ -47,15 +47,10 @@ def get_moe_module_spec_for_backend(
         linear_fc1=linear_fc1, linear_fc2=linear_fc2, activation_func=activation_func
     )
 
-    expert_module, expert_submodule = backend.grouped_mlp_modules(
+    experts = backend.grouped_mlp_modules(
         moe_grouped_gemm is not None and moe_grouped_gemm,
         moe_use_legacy_grouped_gemm is not None and moe_use_legacy_grouped_gemm,
     )
-    if expert_submodule is not None:
-        expert_submodule.activation_func = activation_func
-
-    experts = ModuleSpec(module=expert_module, submodules=expert_submodule)
-
     # shared experts spec
     shared_experts = ModuleSpec(module=SharedExpertMLP, submodules=mlp)
 
