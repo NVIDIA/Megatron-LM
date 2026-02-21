@@ -114,7 +114,7 @@ def get_layer_spec_te(is_vit=False, padding=False) -> ModuleSpec:
                 submodules=SelfAttentionSubmodules(
                     linear_qkv=not_none(TELayerNormColumnParallelLinear),
                     core_attention=not_none(TEDotProductAttention),
-                    linear_proj=TERowParallelLinear,
+                    linear_proj=not_none(TERowParallelLinear),
                     q_layernorm=IdentityOp,
                     k_layernorm=IdentityOp,
                 ),
@@ -160,7 +160,7 @@ def get_mamba_layer_spec_te(padding=False) -> ModuleSpec:
                         submodules=SelfAttentionSubmodules(
                             linear_qkv=not_none(TELayerNormColumnParallelLinear),
                             core_attention=not_none(TEDotProductAttention),
-                            linear_proj=TERowParallelLinear,
+                            linear_proj=not_none(TERowParallelLinear),
                         ),
                     ),
                     self_attn_bda=get_bias_dropout_add,

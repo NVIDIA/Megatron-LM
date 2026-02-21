@@ -33,7 +33,6 @@ from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.tensor_parallel.mappings import all_gather_last_dim_from_tensor_parallel_region
 from megatron.core.transformer.identity_op import IdentityOp
 from megatron.core.transformer.module import MegatronModule
-from megatron.core.transformer.spec_utils import ModuleSpec, build_module
 from megatron.core.transformer.torch_norm import LayerNormBuilder
 from megatron.core.typed_torch import apply_module, not_none
 from megatron.core.utils import (
@@ -118,8 +117,8 @@ except ImportError:
     HAVE_FUSED_QKV_ROPE = False
 
 
-class LinearQkv(Protocol):
-    """Protocol for linear_qkv modules."""
+class LinearQkvInterface(Protocol):
+    """Interface for linear_qkv modules."""
 
     def forward(self, input: Tensor, /) -> tuple[Tensor, object]:
         """Applies linear_qkv."""
@@ -147,13 +146,13 @@ class LinearQkvBuilder(Protocol):
         is_expert: bool,
         tp_comm_buffer_name: str,
         tp_group: torch.distributed.ProcessGroup | None = None,
-    ) -> LinearQkv: ...
+    ) -> LinearQkvInterface: ...
 
 
-class LinearLayer(Protocol):
-    """Protocol for linear_q and linear_kv modules."""
+class LinearInterface(Protocol):
+    """Interface for linear_q and linear_kv modules."""
 
-    def forward(self, input: Tensor, /) -> Tuple[Tensor, object]:
+    def forward(self, input: Tensor, /) -> tuple[Tensor, object]:
         """Applies linear_q/linear_kv."""
         ...
 
@@ -173,23 +172,23 @@ class LinearLayerBuilder(Protocol):
         bias: bool,
         skip_bias_add: bool,
         is_expert: bool,
-    ) -> LinearLayer: ...
+    ) -> LinearInterface: ...
 
 
-class CoreAttention(Protocol):
-    """Protocol for core_attention modules."""
+class CoreAttentionInterface(Protocol):
+    """Interface for core_attention modules."""
 
     def forward(
         self,
         query: Tensor,
         key: Tensor,
         value: Tensor,
-        attention_mask: Optional[Tensor],
+        attention_mask: Tensor | None,
         /,
         *,
         attn_mask_type: AttnMaskType,
-        attention_bias: Optional[Tensor],
-        packed_seq_params: Optional[PackedSeqParams],
+        attention_bias: Tensor | None = None,
+        packed_seq_params: PackedSeqParams | None,
     ) -> Tensor:
         """Applies dot product attention."""
         ...
@@ -205,10 +204,42 @@ class CoreAttentionBuilder(Protocol):
         layer_number: int,
         attn_mask_type: AttnMaskType,
         attention_type: str,
-        cp_comm_type: Optional[str],
-        softmax_scale: Optional[float],
-        pg_collection: Optional[ProcessGroupCollection],
-    ) -> CoreAttention: ...
+        softmax_scale: float | None,
+        cp_comm_type: str | None,
+        pg_collection: ProcessGroupCollection | None,
+    ) -> CoreAttentionInterface: ...
+
+
+class LinearProjInterface(Protocol):
+    """Interface for linear_proj modules."""
+
+    def forward(self, hidden_states: Tensor, /) -> tuple[Tensor, Tensor | None]:
+        """Applies the linear projection to the output of the core attention."""
+        ...
+
+    def backward_dw(self) -> None:
+        """Computes weight gradients of output projection layer."""
+        ...
+
+
+class LinearProjBuilder(Protocol):
+    """Protocol for building linear_proj layers."""
+
+    def __call__(
+        self,
+        query_projection_size: int,
+        hidden_size: int,
+        /,
+        *,
+        config: TransformerConfig,
+        init_method: Callable[[torch.Tensor], None],
+        bias: bool,
+        input_is_parallel: bool,
+        skip_bias_add: bool,
+        is_expert: bool,
+        tp_comm_buffer_name: str,
+        tp_group: torch.distributed.ProcessGroup | None,
+    ) -> LinearProjInterface: ...
 
 
 @dataclass
@@ -219,7 +250,7 @@ class SelfAttentionSubmodules:
 
     linear_qkv: LinearQkvBuilder
     core_attention: CoreAttentionBuilder
-    linear_proj: Union[ModuleSpec, type] = None
+    linear_proj: LinearProjBuilder
     q_layernorm: LayerNormBuilder | None = None
     k_layernorm: LayerNormBuilder | None = None
 
@@ -233,7 +264,7 @@ class CrossAttentionSubmodules:
     linear_q: LinearLayerBuilder
     linear_kv: LinearLayerBuilder
     core_attention: CoreAttentionBuilder
-    linear_proj: Union[ModuleSpec, type] = None
+    linear_proj: LinearProjBuilder
 
 
 class Attention(MegatronModule, ABC):
@@ -347,12 +378,11 @@ class Attention(MegatronModule, ABC):
         )
 
         # Output.
-        self.linear_proj = build_module(
-            submodules.linear_proj,
+        self.linear_proj = submodules.linear_proj(
             self.query_projection_size,
             self.config.hidden_size,
             config=self.config,
-            init_method=self.config.output_layer_init_method,
+            init_method=not_none(self.config.output_layer_init_method),
             bias=self.config.add_bias_linear,
             input_is_parallel=True,
             skip_bias_add=True,
@@ -888,7 +918,7 @@ class Attention(MegatronModule, ABC):
         sequence_len_offset: Optional[int] = None,
         *,
         inference_params: Optional[BaseInferenceContext] = None,
-    ) -> tuple[Tensor, Tensor]:
+    ) -> tuple[Tensor, Tensor | None]:
         """
         Perform a forward pass through the attention module.
 
@@ -1038,7 +1068,7 @@ class Attention(MegatronModule, ABC):
             )
             out = output.transpose(0, 1).contiguous()
             context_layer = out.view(out.size(0), out.size(1), -1)
-            output, bias = self.linear_proj(context_layer)
+            output, bias = apply_module(self.linear_proj)(context_layer)
             return output, bias
 
         if (
@@ -1206,7 +1236,7 @@ class Attention(MegatronModule, ABC):
         # =================
         nvtx_range_push(suffix="linear_proj")
         with off_interface(self.offload_attn_proj, core_attn_out, "attn_proj") as core_attn_out:
-            output, bias = self.linear_proj(core_attn_out)
+            output, bias = apply_module(self.linear_proj)(core_attn_out)
         if self.offload_attn_proj:
             output = off_interface.group_commit(
                 output, name="attn_proj", forced_released_tensors=[core_attn_out]
