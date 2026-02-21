@@ -23,7 +23,7 @@ Megatron Core supports multimodal models that combine language with vision, audi
 - Unified embedding space across modalities
 - Support for both vision-language and audio-vision-language models
 
-See [examples/mimo](https://github.com/NVIDIA/Megatron-LM/tree/main/examples/mimo) for training scripts and examples.
+See [examples/open_models/mimo](https://github.com/NVIDIA/Megatron-LM/tree/main/examples/open_models/mimo) for training scripts and examples.
 
 ## Vision-Language Models
 
@@ -61,7 +61,7 @@ For multimodal diffusion models (image generation, text-to-image, etc.), see [Ne
 Multimodal training examples can be found in the following directories:
 
 **MIMO Framework:**
-- `examples/mimo/` - Multimodal In/Out training with support for vision-language and audio-vision-language models
+- `examples/open_models/mimo/` - Multimodal In/Out training with support for vision-language and audio-vision-language models
 
 **Specific Multimodal Models:**
 - `examples/multimodal/` - LLaVA-style training with Mistral + CLIP

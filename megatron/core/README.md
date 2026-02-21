@@ -40,7 +40,7 @@ torchrun --nproc_per_node=2 examples/run_simple_mcore_train_loop.py
 - **[Simple Training Loop](https://github.com/NVIDIA/Megatron-LM/blob/main/examples/run_simple_mcore_train_loop.py)** - Basic usage
 - **[Multimodal Training](https://github.com/NVIDIA/Megatron-LM/blob/main/examples/multimodal/)** - Vision-language models
 - **[Mixture-of-Experts](https://github.com/yanring/Megatron-MoE-ModelZoo)** - MoE examples
-- **[Mamba Models](https://github.com/NVIDIA/Megatron-LM/blob/main/examples/mamba/)** - State-space models
+- **[Mamba Models](https://github.com/NVIDIA/Megatron-LM/blob/main/examples/open_models/mamba/)** - State-space models
 
 **Documentation:**
 - **[📚 API Guide](https://docs.nvidia.com/megatron-core/developer-guide/latest/api-guide/index.html)** - Complete API documentation

@@ -111,7 +111,7 @@ GPT_MODEL_ARGS=(
 if [ "$DEBUG_MODE" = true ]; then
   echo "Running in debug mode with $GPUS_PER_NODE GPU(s) per node..."
   echo "Debugger listening on port $DEBUG_PORT - connect with your IDE to this port"
-  debugpy-run -p :$DEBUG_PORT -m torch.distributed.run -- ${DISTRIBUTED_ARGS[@]} examples/mimo/train.py \
+  debugpy-run -p :$DEBUG_PORT -m torch.distributed.run -- ${DISTRIBUTED_ARGS[@]} examples/open_models/mimo/train.py \
     ${TRAINING_ARGS[@]} \
     ${MODEL_PARALLEL_ARGS[@]} \
     ${EVAL_AND_LOGGING_ARGS[@]} \
@@ -122,7 +122,7 @@ else
   echo "Running in normal mode with $GPUS_PER_NODE GPU(s) per node..."
   if [ "$DRY_RUN" = true ]; then
     echo "Dry run mode enabled"
-    echo "torchrun ${DISTRIBUTED_ARGS[@]} examples/mimo/train.py \
+    echo "torchrun ${DISTRIBUTED_ARGS[@]} examples/open_models/mimo/train.py \
     ${TRAINING_ARGS[@]} \
     ${MODEL_PARALLEL_ARGS[@]} \
     ${EVAL_AND_LOGGING_ARGS[@]} \
@@ -130,7 +130,7 @@ else
     ${GPT_MODEL_ARGS[@]} \
     ${DATASET_ARGS[@]}"
   else
-    torchrun ${DISTRIBUTED_ARGS[@]} examples/mimo/train.py \
+    torchrun ${DISTRIBUTED_ARGS[@]} examples/open_models/mimo/train.py \
     ${TRAINING_ARGS[@]} \
     ${MODEL_PARALLEL_ARGS[@]} \
     ${EVAL_AND_LOGGING_ARGS[@]} \
