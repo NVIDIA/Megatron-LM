@@ -182,12 +182,19 @@ class EmptyCompressor(AbstractCompressor):
         pass
 
     def compress_one_rank(self, layer_number, flag_type, data):
-        """Return an empty tensor."""
-        return torch.tensor([])
+        """Return an empty tensor that is safe for downstream gather/cat ops."""
+        empty_shape = list(data.shape)
+        if empty_shape:
+            empty_shape[-1] = 0
+        return data.new_empty(empty_shape)
 
     def compress(self, layer_number, flag_type, data):
-        """Return an empty flattened tensor."""
-        return True, [0], torch.tensor([])
+        """Return an empty flattened tensor with a shape matching the input."""
+        empty_shape = list(data.shape)
+        if empty_shape:
+            empty_shape[-1] = 0
+        empty = data.new_empty(empty_shape)
+        return True, empty_shape, empty.flatten()
 
 
 class ProjectionCompressor(AbstractCompressor):

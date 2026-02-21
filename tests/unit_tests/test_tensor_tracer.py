@@ -33,7 +33,13 @@ def test_ttflags_set_by_configs_sets_flags_and_compressors() -> None:
     assert flags.get_flag(tt.FlagType.MLP1_mat_mul, 1) is False
 
     assert isinstance(tt.get_compressor(tt.FlagType.QKV_mat_mul), tt.NoOpCompressor)
-    assert isinstance(tt.get_compressor(tt.FlagType.MLP1_mat_mul), tt.EmptyCompressor)
+    empty_compressor = tt.get_compressor(tt.FlagType.MLP1_mat_mul)
+    assert isinstance(empty_compressor, tt.EmptyCompressor)
+
+    sample = torch.zeros(2, 3, 4)
+    empty_sample = empty_compressor.compress_one_rank(1, tt.FlagType.MLP1_mat_mul, sample)
+    assert empty_sample.shape == (2, 3, 0)
+    assert empty_sample.device == sample.device
 
 
 def test_tile_compressor_compress_shapes() -> None:
