@@ -8,6 +8,7 @@ from typing import Any, Callable, Dict, List, Optional, Tuple, Union
 import torch
 from torch.optim import SGD as CPUSGD
 from torch.optim import AdamW as CPUAdam
+from .muon_adam import Muon
 
 try:
     from transformer_engine.pytorch.optimizers import FusedAdam as Adam
@@ -109,6 +110,7 @@ def _get_param_groups(
     model_chunks: List[MegatronModule],
     config: OptimizerConfig,
     config_overrides: Optional[Dict[ParamKey, ParamGroupOverride]],
+    use_muon: Optional[bool] = False,
 ) -> List[Dict]:
     """Create parameter groups for optimizer.
 
@@ -127,11 +129,12 @@ def _get_param_groups(
             specified on a per-layer basis. NOTE: if you want to skip applying weight decay on bias
             and length 1 parameters, and also do not want to do any other overrides, set this to an
             empty dictionary rather than the default value of None.
+        use_muon (bool): whether to use Muon optimizer for 2D non-embedding/bias parameters.
     Returns:
         List of parameter groups.
     """
 
-    # Map (pg_overrides, is_expert_parallel) to params.
+    # Map (pg_overrides, is_expert_parallel, is_muon) to params.
     params_map = {}
 
     if config_overrides is None:
@@ -147,7 +150,6 @@ def _get_param_groups(
             if not param.requires_grad:
                 continue
 
-            uses_default_config = False
             # Get optimizer config overrides for this parameter.
             param_overrides_list: list[ParamGroupOverride] = []
             if config_overrides is not None:
@@ -164,11 +166,18 @@ def _get_param_groups(
 
             is_expert_parallel = not getattr(param, 'allreduce', True)
 
+            # check if linear params
+            bias_flag = name.endswith(".bias")
+            shape_flag = param.dim() == 2
+            embedding_flag = "embedding" in name or "output_layer" in name
+            muon_flag = use_muon and shape_flag and (not bias_flag) and (not embedding_flag)
+
             # Create config_tuple that is hash-able, and has a consistent ordering of the keys.
             param_override_tuple: tuple[tuple[str, Any], ...] | None = (
                 param_group_override_to_tuple(param_override)
             )
-            key = (param_override_tuple, is_expert_parallel)
+            # Include muon_flag in key to separate muon and non-muon params
+            key = (param_override_tuple, is_expert_parallel, muon_flag)
             if key not in params_map:
                 params_map[key] = []
             params_map[key].append(param)
@@ -185,10 +194,10 @@ def _get_param_groups(
                 params_key.append(key)
     # Need to pick one of the param_override_tuples to use for the param group.
     param_groups = []
-    # Sort keys, None first.
-    for key in sorted(params_key, key=lambda x: (x[0] is not None, x[0])):
-        param_override_tuple, is_expert_parallel = key
-        params = params_map[key] if key in params_map else []
+    # Sort keys: non-muon first, then muon; within each: None first, then others
+    for key in sorted(params_key, key=lambda x: (x[2], x[0] is not None, x[0])):
+        param_override_tuple, is_expert_parallel, is_muon = key
+        params = params_map.get(key, [])
         if param_override_tuple is None:
             param_override: ParamGroupOverride = {}
         else:
@@ -221,6 +230,7 @@ def _get_param_groups(
             'params': params,
             'is_expert_parallel': is_expert_parallel,
             'default_config': uses_default_lr_schedule,
+            'use_muon': is_muon,
             **default_config,
             **param_override,  # keep **param_override last so that users can override other fields.
         }
@@ -254,7 +264,7 @@ def _get_param_groups_and_buffers(
     Returns:
         List of parameter groups and dictionary of model chunk IDs to buffers.
     """
-    param_groups = _get_param_groups(model_chunks, config, config_overrides)
+    param_groups = _get_param_groups(model_chunks, config, config_overrides, use_muon = config.optimizer == 'muon')
     param_groups = list(filter(filter_fn, param_groups))
     buffers = {}
     for model_chunk_idx, model_chunk in enumerate(model_chunks):
@@ -406,6 +416,25 @@ def _get_megatron_optimizer_based_on_param_groups(
                 momentum=config.sgd_momentum,
             )
             init_state_fn = None
+        elif config.optimizer == 'muon':
+            optimizer = Muon(param_groups,
+                             lr=config.lr, weight_decay=config.weight_decay,
+                            #  matched_adamw_rms=config.muon_matched_adamw_rms,
+                             momentum=config.muon_momentum,
+                             nesterov=config.muon_use_nesterov,
+                             ns_steps=config.muon_num_ns_steps,
+                             adamw_betas=(config.adam_beta1, config.adam_beta2),
+                             adamw_eps=config.adam_eps)
+
+            def init_state_fn(opt, config=None):
+                for group in opt.param_groups:
+                    for p in group['params']:
+                        if len(opt.state[p]) == 0:
+                            if config is None or not config.use_precision_aware_optimizer:
+                                opt.state[p]['exp_avg'] = torch.zeros_like(p.data)
+                                opt.state[p]['exp_avg_sq'] = torch.zeros_like(p.data)
+                            else:
+                                opt.initialize_state(p)
         else:
             raise Exception('{} optimizer is not supported.'.format(config.optimizer))
     else:

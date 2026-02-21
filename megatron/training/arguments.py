@@ -1301,7 +1301,7 @@ def validate_args(args, defaults={}):
         warn_rank_0('enabling --no-load-optim when skipping training.')
 
     # Muon optimizer check
-    if 'muon' in args.optimizer:
+    if args.optimizer == "dist_muon":
 
         # TODO: remove these checks once we support them
         assert not args.overlap_grad_reduce, "Muon optimizer does not support overlap grad reduce for now."
