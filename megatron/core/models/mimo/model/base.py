@@ -5,10 +5,14 @@ import warnings
 from typing import Any, Dict, Optional
 
 import torch
+import torch.distributed as dist
+
+from megatron.core.models.mimo.config.role import ModuleStageInfo, RankRole
 
 from megatron.core.models.mimo.config import MimoModelConfig
 from megatron.core.transformer import MegatronModule
 from megatron.core.transformer.spec_utils import build_module
+from megatron.core.utils import unwrap_model
 
 logger = logging.getLogger(__name__)
 
@@ -52,6 +56,8 @@ class MimoModel(MegatronModule):
         )
 
         self.mimo_config = mimo_config
+        self._validate_grid_map()
+        self.role = self._determine_role()
 
         # Use special token IDs from the config
         self.special_token_ids = (
@@ -138,24 +144,134 @@ class MimoModel(MegatronModule):
         """Initialize modality submodules from the ModuleSpec configurations.
 
         Only modalities present in the config will be instantiated.
-        For each modality in the config, builds the corresponding submodule using from_spec.
+        When role is set, only initializes submodules this rank participates in.
+        Stage info is passed to from_spec() to conditionally skip projection
+        initialization on non-last stages (saves memory in pipeline parallelism).
         """
-
         for modality_name, submodule_spec in self.mimo_config.modality_submodules_spec.items():
-            # Get the submodule class
-            submodule_class = submodule_spec.module
-            logger.debug(f"Building {modality_name} submodule using {submodule_class.__name__}")
+            # Skip if we have a role and this module isn't in it
+            if self.role is not None and modality_name not in self.role.modules:
+                logger.debug(f"Skipping {modality_name} submodule (not in role)")
+                continue
 
-            # Use from_spec to instantiate the submodule
-            submodule = submodule_class.from_spec(submodule_spec)
+            # Determine stage info for this module
+            is_first_stage = True
+            is_last_stage = True
+            if self.role is not None and modality_name in self.role.modules:
+                stage_info = self.role.modules[modality_name]
+                is_first_stage = stage_info.is_first_stage
+                is_last_stage = stage_info.is_last_stage
+
+            submodule_class = submodule_spec.module
+            logger.debug(
+                f"Building {modality_name} submodule using {submodule_class.__name__} "
+                f"(is_first_stage={is_first_stage}, is_last_stage={is_last_stage})"
+            )
+
+            # Pass stage info to from_spec so projections are only built when needed
+            submodule = submodule_class.from_spec(
+                submodule_spec,
+                is_first_stage=is_first_stage,
+                is_last_stage=is_last_stage,
+            )
+
             self.modality_submodules[modality_name] = submodule
 
     def _initialize_language_model(self) -> None:
-        """Initialize the language model."""
+        """Initialize the language model.
+
+        When role is set, only initializes if this rank participates in language module.
+        """
+        # Skip if we have a role and don't participate in language module
+        if self.role is not None and not self.role.has_language_module:
+            logger.debug("Skipping language model initialization (not in role)")
+            self.language_model = None
+            return
+
         logger.debug(
             f"Building language model using {self.mimo_config.language_model_spec.module.__name__}"
         )
         self.language_model = build_module(self.mimo_config.language_model_spec)
+
+    def _validate_grid_map(self) -> None:
+        """Validate module_to_grid_map consistency with submodule config.
+
+        Validates that:
+        - language_module_key is set when module_to_grid_map is provided
+        - module_to_grid_map keys exactly match modality_submodules_spec keys + language_module_key
+
+        Raises:
+            ValueError: If validation fails.
+        """
+        if not self.mimo_config.module_to_grid_map:
+            return
+
+        # Require language_module_key when using multi-module PP
+        if self.mimo_config.language_module_key is None:
+            raise ValueError(
+                "language_module_key must be set when module_to_grid_map is provided. "
+                "Specify which module key identifies the language model."
+            )
+
+        grid_map_keys = set(self.mimo_config.module_to_grid_map.keys())
+        submodule_keys = set(self.mimo_config.modality_submodules_spec.keys())
+        submodule_keys.add(self.mimo_config.language_module_key)
+
+        if grid_map_keys != submodule_keys:
+            missing_in_grid = submodule_keys - grid_map_keys
+            extra_in_grid = grid_map_keys - submodule_keys
+            raise ValueError(
+                f"module_to_grid_map keys must match modality_submodules_spec keys + "
+                f"language_module_key. Missing in grid_map: {missing_in_grid}, "
+                f"Extra in grid_map: {extra_in_grid}"
+            )
+
+    def _determine_role(self) -> Optional[RankRole]:
+        """Determine this rank's role based on grid map.
+
+        Returns:
+            RankRole describing which modules this rank participates in,
+            or None if module_to_grid_map is not set (all modules on all ranks).
+        """
+        if not self.mimo_config.module_to_grid_map:
+            return None
+
+        current_rank = dist.get_rank()
+        modules = {}
+
+        for module_name, grid in self.mimo_config.module_to_grid_map.items():
+            # Check if current rank is in this grid
+            if not (grid.rank_offset <= current_rank < grid.rank_offset + grid.size):
+                continue
+
+            # Check if PP dimension exists
+            if "pp" not in grid.dim_names:
+                # No PP dimension means single stage (both first and last)
+                modules[module_name] = ModuleStageInfo(
+                    is_first_stage=True,
+                    is_last_stage=True,
+                )
+                continue
+
+            # Get PP process group and determine stage
+            pp_group = grid.get_pg("pp")
+            pp_rank = pp_group.rank()
+            pp_size = pp_group.size()
+            is_first = (pp_rank == 0)
+            is_last = (pp_rank == pp_size - 1)
+            logger.info(
+                f"[_determine_role] Rank {current_rank}: module={module_name}, "
+                f"pp_rank={pp_rank}/{pp_size}, is_first_stage={is_first}, is_last_stage={is_last}"
+            )
+            modules[module_name] = ModuleStageInfo(
+                is_first_stage=is_first,
+                is_last_stage=is_last,
+            )
+
+        return RankRole(
+            modules=modules,
+            language_module_name=self.mimo_config.language_module_key,
+        )
 
     def set_input_tensor(self, input_tensor):
         """Set input tensor for pipeline parallelism.
@@ -164,18 +280,27 @@ class MimoModel(MegatronModule):
         It passes the output tensor from the previous stage as input to this stage.
 
         Args:
-            input_tensor: Tensor or list of tensors passed between pipeline stages
+            input_tensor: Either:
+                - Dict[str, Tensor]: Maps module names to their input tensors (for multi-module PP)
+                - Tensor or List[Tensor]: Single tensor for language model (backward compat)
 
         Returns:
             None
         """
-        # Handle case where input_tensor might be a list or a single tensor
+        # Store dict input for multi-module PP
+        if isinstance(input_tensor, dict):
+            self.input_tensors = input_tensor
+            return
+
+        # Backward compatibility: single tensor or list
         if isinstance(input_tensor, list):
-            # For simplicity, just use the first tensor
             input_tensor = input_tensor[0]
 
-        # Pass the input tensor to the language model if it has a set_input_tensor method
-        if hasattr(self.language_model, 'set_input_tensor'):
+        # Store as input_tensors for consistency
+        self.input_tensors = input_tensor
+
+        # Also delegate to language model for backward compatibility
+        if self.language_model is not None and hasattr(self.language_model, 'set_input_tensor'):
             self.language_model.set_input_tensor(input_tensor)
 
     def get_text_embeddings(
@@ -204,7 +329,7 @@ class MimoModel(MegatronModule):
             position_ids[batch_idx, seq_idx].unsqueeze(0) if position_ids is not None else None
         )
 
-        text_embeddings = self.language_model.embedding(
+        text_embeddings = unwrap_model(self.language_model).embedding(
             input_ids=input_ids_text, position_ids=position_ids_text
         ).squeeze(
             1
@@ -228,35 +353,187 @@ class MimoModel(MegatronModule):
             attention_mask: Attention mask [batch_size, seq_length]
             loss_mask: Loss mask [batch_size, seq_length]
             labels: Labels for training
-            modality_inputs: Dictionary mapping modality names to encoder inputs. For example:
-                {
-                    "images": {
-                        "clip_encoder": {"pixel_values": clip_images},
-                        "vit_encoder": {"images": vit_images}
-                    },
-                    "audio": {
-                        "whisper_encoder": {"input_features": whisper_features}
-                    }
-                }
+            modality_inputs: Dictionary mapping modality names to encoder inputs.
 
         Returns:
-            tuple: Tuple containing model outputs and loss mask
+            tuple: (output, loss_mask) where output semantics depend on role:
+                - Encoder-only ranks: Dict[str, Tensor] of encoder outputs
+                - Language module ranks: language model output (logits or loss)
+                - No role (all modules colocated): language model output
+        """
+        # Get any tensors passed via set_input_tensor
+        input_tensors = getattr(self, 'input_tensors', None)
+
+        if self.role is None:
+            # Original behavior: all modules on all ranks
+            return self._forward_all_modules(
+                input_ids, position_ids, attention_mask,
+                loss_mask, labels, modality_inputs
+            )
+
+        if self.role.has_modality_modules and not self.role.has_language_module:
+            # Encoder-only rank
+            return self._forward_encoders(modality_inputs, input_tensors), loss_mask
+
+        if self.role.has_language_module and not self.role.has_modality_modules:
+            # Language-module-only rank
+            return self._forward_language_module(
+                input_ids, position_ids, attention_mask,
+                labels, input_tensors
+            ), loss_mask
+
+        if self.role.has_modality_modules and self.role.has_language_module:
+            # Colocated encoders and language module is a configuration error
+            raise ValueError(
+                "Invalid configuration: Colocated encoders and language module on the same "
+                "rank is not supported in multi-module pipeline parallelism. Use separate "
+                "grids for encoders and language module, or disable multi-module PP by not "
+                "setting module_to_grid_map."
+            )
+
+        raise RuntimeError(f"Rank has no modules assigned in role: {self.role}")
+
+    def _forward_encoders(
+        self,
+        modality_inputs: Optional[Dict[str, Dict[str, Any]]],
+        input_tensors: Optional[Dict[str, torch.Tensor]],
+    ) -> Dict[str, torch.Tensor]:
+        """Forward pass for encoder modules on this rank.
+
+        Args:
+            modality_inputs: Raw inputs for each modality (images, audio, etc.)
+            input_tensors: Hidden states from previous pipeline stages
+
+        Returns:
+            Dict mapping encoder names to their output tensors
+        """
+        outputs = {}
+
+        for encoder_name in self.role.modality_module_names:
+            if encoder_name not in self.modality_submodules:
+                continue
+
+            submodule = self.modality_submodules[encoder_name]
+
+            # Determine input based on stage position
+            if self.role.is_first_stage(encoder_name):
+                # First stage: use raw modality inputs
+                encoder_input = modality_inputs.get(encoder_name) if modality_inputs else None
+                if encoder_input is not None:
+                    output = submodule.forward(encoder_inputs=encoder_input)
+                else:
+                    output = None
+            else:
+                # Non-first stage: use hidden states from previous stage
+                hidden_states = input_tensors.get(encoder_name) if input_tensors else None
+                if hidden_states is not None:
+                    output = submodule.forward(hidden_states=hidden_states)
+                else:
+                    output = None
+
+            if output is not None:
+                outputs[encoder_name] = output
+
+        return outputs
+
+    def _forward_language_module(
+        self,
+        input_ids: torch.Tensor,
+        position_ids: Optional[torch.Tensor],
+        attention_mask: Optional[torch.Tensor],
+        labels: Optional[torch.Tensor],
+        input_tensors: Optional[Dict[str, torch.Tensor]],
+    ) -> torch.Tensor:
+        """Forward pass for language module on this rank.
+
+        Args:
+            input_ids: Token IDs
+            position_ids: Position IDs
+            attention_mask: Attention mask
+            labels: Labels for loss computation
+            input_tensors: Hidden states or embeddings from previous stage
+
+        Returns:
+            Language model output (hidden states, logits, or loss depending on stage)
+        """
+        lang_name = self.role.language_module_name
+
+        if self.role.is_first_stage(lang_name):
+            # First stage: receive encoder embeddings, combine with text, pass to LM
+            # Build modality embeddings dict from encoder outputs
+            modality_embeddings = {}
+            if input_tensors:
+                for name, tensor in input_tensors.items():
+                    if name != lang_name:
+                        modality_embeddings[name] = tensor
+
+            # Get text embeddings
+            text_embeddings = self.get_text_embeddings(
+                input_ids, position_ids, self.special_token_ids
+            )
+            modality_embeddings["text"] = text_embeddings
+
+            # Combine all embeddings
+            combined_embeddings = self.align_embeddings_by_token_positions(
+                modality_embeddings=modality_embeddings,
+                input_ids=input_ids,
+                special_token_ids=self.special_token_ids,
+            )
+
+            lm_output = self.language_model(
+                input_ids=None,
+                position_ids=None,
+                decoder_input=combined_embeddings,
+                labels=labels,
+                attention_mask=attention_mask,
+            )
+        else:
+            # Non-first stage: receive hidden states from previous LM stage
+            hidden_states = input_tensors.get(lang_name) if input_tensors else None
+
+            # Set input tensor on language model for PP
+            if hidden_states is not None and hasattr(self.language_model, 'set_input_tensor'):
+                self.language_model.set_input_tensor(hidden_states)
+
+            lm_output = self.language_model(
+                input_ids=None,
+                position_ids=None,
+                decoder_input=None,
+                labels=labels,
+                attention_mask=attention_mask,
+            )
+
+        # Key output for non-last stages so schedule can route to next LM stage
+        if not self.role.is_last_stage(lang_name):
+            return {lang_name: lm_output}
+
+        return lm_output
+
+    def _forward_all_modules(
+        self,
+        input_ids: torch.Tensor,
+        position_ids: Optional[torch.Tensor],
+        attention_mask: Optional[torch.Tensor],
+        loss_mask: Optional[torch.Tensor],
+        labels: Optional[torch.Tensor],
+        modality_inputs: Optional[Dict[str, Dict[str, Any]]],
+    ):
+        """Forward pass when all modules are on all ranks (no multi-module PP).
+
+        This is the original behavior, preserved for backward compatibility.
         """
         # 1. Process each modality to get embeddings
         modality_embeddings = {}
 
         for modality_name, submodule in self.modality_submodules.items():
-            # Process the modality through its submodule
             if (
                 modality_inputs
                 and modality_name in modality_inputs
                 and modality_inputs[modality_name] is not None
             ):
                 logger.debug(f"Processing {modality_name} modality")
-                # Get embeddings for this modality
                 embeddings = submodule.forward(encoder_inputs=modality_inputs[modality_name])
                 if embeddings is not None:
-                    # All embeddings are now in the format [num_tokens, hidden_dim]
                     modality_embeddings[modality_name] = embeddings
                     logger.debug(
                         f"Generated embeddings for {modality_name} with shape {embeddings.shape}"
@@ -271,10 +548,10 @@ class MimoModel(MegatronModule):
         # 2. Merge embeddings from different modalities
         logger.debug(f"Merging embeddings from {len(modality_embeddings)} modalities")
         combined_embeddings = self.align_embeddings_by_token_positions(
-            modality_embeddings=modality_embeddings,  # [num_tokens, hidden_dim] for each modality
-            input_ids=input_ids,  # Pass in batch-first format [b, s]
+            modality_embeddings=modality_embeddings,
+            input_ids=input_ids,
             special_token_ids=self.special_token_ids,
-        )  # [s, b, h]
+        )
         logger.debug(f"Combined embeddings shape: {combined_embeddings.shape}")
 
         # 3. Forward pass through language model

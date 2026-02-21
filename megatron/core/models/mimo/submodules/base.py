@@ -42,14 +42,29 @@ class ModalitySubmodules(ABC, nn.Module):
         decoders: Optional[Dict[str, nn.Module]] = None,
         input_projections: Optional[List[nn.Module]] = None,
         output_projections: Optional[List[nn.Module]] = None,
+        is_first_stage: bool = True,
+        is_last_stage: bool = True,
         **kwargs,
     ) -> None:
-        """Initialize the modality submodules."""
+        """Initialize the modality submodules.
+
+        Args:
+            encoders: Dict of encoder modules
+            decoders: Dict of decoder modules
+            input_projections: List of input projection modules
+            output_projections: List of output projection modules
+            is_first_stage: Whether this is the first PP stage for this module
+            is_last_stage: Whether this is the last PP stage for this module
+        """
         super().__init__()
         self.encoders = nn.ModuleDict(encoders or {})
         self.decoders = nn.ModuleDict(decoders or {})
         self.input_projections = nn.ModuleList(input_projections or [])
         self.output_projections = nn.ModuleList(output_projections or [])
+
+        # Stage info for multi-module pipeline parallelism (immutable after init)
+        self._is_first_stage: bool = is_first_stage
+        self._is_last_stage: bool = is_last_stage
 
         warnings.warn(
             "ModalitySubmodules is experimental and still under active development. "
@@ -58,21 +73,44 @@ class ModalitySubmodules(ABC, nn.Module):
             stacklevel=2,
         )
 
+    @property
+    def is_first_stage(self) -> bool:
+        """Whether this is the first pipeline stage for this module."""
+        return self._is_first_stage
+
+    @property
+    def is_last_stage(self) -> bool:
+        """Whether this is the last pipeline stage for this module."""
+        return self._is_last_stage
+
     @classmethod
-    def from_spec(cls, module_spec: ModuleSpec) -> 'ModalitySubmodules':
+    def from_spec(
+        cls,
+        module_spec: ModuleSpec,
+        is_first_stage: bool = True,
+        is_last_stage: bool = True,
+    ) -> 'ModalitySubmodules':
         """Create a modality submodule from ModuleSpec configuration.
 
         Args:
             module_spec (ModuleSpec): The module specification for this modality submodule
+            is_first_stage (bool): Whether this is the first pipeline stage for this module.
+                Controls encoder initialization. Defaults to True.
+            is_last_stage (bool): Whether this is the last pipeline stage for this module.
+                Controls input projection initialization (only needed on last stage).
+                Defaults to True.
 
         Returns:
             ModalitySubmodules: An instance of the modality submodule
         """
-        logger.debug(f"Creating {cls.__name__} from spec")
+        logger.debug(
+            f"Creating {cls.__name__} from spec (is_first_stage={is_first_stage}, "
+            f"is_last_stage={is_last_stage})"
+        )
         params = module_spec.params or {}
         submodules = module_spec.submodules or {}
 
-        # Build component lists from submodules dictionary
+        # Build encoders (needed on all stages for pipeline processing)
         encoders = {}
         if 'encoders' in submodules:
             for encoder_name, encoder_spec in submodules['encoders'].items():
@@ -80,6 +118,7 @@ class ModalitySubmodules(ABC, nn.Module):
                 encoder = build_module(encoder_spec)
                 encoders[encoder_name] = encoder
 
+        # Build decoders (needed on all stages for pipeline processing)
         decoders = {}
         if 'decoders' in submodules:
             for decoder_name, decoder_spec in submodules['decoders'].items():
@@ -87,23 +126,35 @@ class ModalitySubmodules(ABC, nn.Module):
                 decoder = build_module(decoder_spec)
                 decoders[decoder_name] = decoder
 
+        # Build input projections only on last stage
+        # (projection happens after encoding, before sending to language model)
         input_projections = []
-        if 'input_projections' in submodules:
+        if is_last_stage and 'input_projections' in submodules:
             for proj_spec in submodules['input_projections']:
                 logger.debug(
                     f"Building {cls.__name__} input projection: {proj_spec.module.__name__}"
                 )
                 projection = build_module(proj_spec)
                 input_projections.append(projection)
+        elif 'input_projections' in submodules:
+            logger.debug(
+                f"Skipping {cls.__name__} input projections (not last stage)"
+            )
 
+        # Build output projections only on first stage
+        # (projection happens before decoding, after receiving from language model)
         output_projections = []
-        if 'output_projections' in submodules:
+        if is_first_stage and 'output_projections' in submodules:
             for proj_spec in submodules['output_projections']:
                 logger.debug(
                     f"Building {cls.__name__} output projection: {proj_spec.module.__name__}"
                 )
                 projection = build_module(proj_spec)
                 output_projections.append(projection)
+        elif 'output_projections' in submodules:
+            logger.debug(
+                f"Skipping {cls.__name__} output projections (not first stage)"
+            )
 
         # Pass any additional parameters from the params dictionary
         additional_params = params.copy()
@@ -117,6 +168,8 @@ class ModalitySubmodules(ABC, nn.Module):
             decoders=decoders,
             input_projections=input_projections,
             output_projections=output_projections,
+            is_first_stage=is_first_stage,
+            is_last_stage=is_last_stage,
             **additional_params,
         )
 
