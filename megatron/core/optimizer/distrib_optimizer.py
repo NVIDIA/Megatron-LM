@@ -900,7 +900,11 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
                     tensors[k] = self.optimizer.state[sharded_model_param][k]
                     continue
 
-                tensors[k] = self.optimizer.get_unscaled_state(sharded_model_param, k)
+                v = self.optimizer.state[sharded_model_param][k]
+                if not isinstance(v, torch.Tensor):
+                    tensors[k] = v
+                else:
+                    tensors[k] = self.optimizer.get_unscaled_state(sharded_model_param, k)
             tensors["param"] = tensors.pop("master_param")
         else:
             main_param = self.optimizer.param_groups[group_index]["params"][group_order]
@@ -928,7 +932,9 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
                     self.optimizer.state[sharded_model_param][k] = v
                     continue
 
-                if k == "param":
+                if not isinstance(v, torch.Tensor):
+                    self.optimizer.state[sharded_model_param][k] = v
+                elif k == "param":
                     self.optimizer.set_scaled_state(sharded_model_param, "master_param", v)
                 else:
                     self.optimizer.set_scaled_state(sharded_model_param, k, v)
