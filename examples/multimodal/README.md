@@ -1,5 +1,9 @@
 # Multimodal Example
 
+There are two options to finetune a multimodal model. 
+- **Option 1:** Use Megatron-Bridge. See the Qwen3-VL example: https://docs.nvidia.com/nemo/megatron-bridge/latest/models/vlm/qwen3-vl.html. 
+- **Option 2:** Use Megatron Core. See example below.
+
 *NOTE: This example is under active development and is expected change.*
 
 The following walks through all the steps required to pretrain and instruction tune a llava architecture vision-language model (VLM). It is important to precisely follow all steps to obtain the benchmark scores at the end.
