@@ -178,3 +178,6 @@ class DistributedDataParallelConfig:
                     "PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True is currently not supported "
                     "with nccl_ub due to compatibility issue with torch.cuda.MemPool API."
                 )
+
+
+DDPConfig = DistributedDataParallelConfig

@@ -2361,9 +2361,9 @@ def _add_mixed_precision_args(parser):
 
 
 def _add_distributed_args(parser):
-    from megatron.training.common_config import DistributedInitConfig
+    from megatron.training.common_config import DistributedConfig
 
-    dist_init_factory = ArgumentGroupFactory(DistributedInitConfig)
+    dist_init_factory = ArgumentGroupFactory(DistributedConfig)
     group = dist_init_factory.build_group(parser, "distributed init")
 
     group.add_argument('--decoder-first-pipeline-num-layers',
