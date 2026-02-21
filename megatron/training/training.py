@@ -2245,6 +2245,10 @@ def save_checkpoint_and_time(
     timers = get_timers()
     energy_monitor = get_energy_monitor()
 
+    # Synchronize forward pre-hook state before checkpoint save to avoid race conditions
+    if should_disable_forward_pre_hook(args):
+        disable_forward_pre_hook(model)
+
     # Stop timer to get accurate train interval time and exclude checkpointing duration
     timers('interval-time').stop()
     energy_monitor.pause()
@@ -2286,6 +2290,7 @@ def save_checkpoint_and_time(
         # dequantized bf16 tensors that were temporarily created during fp8
         # model checkpoint saving.
         gc.collect()
+
     timers(timer_key).stop(barrier=True)
     timers.log([timer_key])
 
@@ -2303,6 +2308,9 @@ def save_checkpoint_and_time(
     energy_monitor.resume()
     timers('interval-time', log_level=0).start(barrier=True)
 
+    # Recover forward pre-hook which was disabled before checkpoint save
+    if should_disable_forward_pre_hook(args):
+        enable_forward_pre_hook(model)
 
 def post_training_step_callbacks(
     model,
