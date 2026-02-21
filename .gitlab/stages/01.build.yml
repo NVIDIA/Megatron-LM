@@ -64,12 +64,12 @@ test:pre_build_image:
       - IMAGE: CI_MCORE_DEV_IMAGE
         FILE: Dockerfile.ci.dev
         IMAGE_TYPE: dev
-        BASE_IMAGE: nvcr.io/nvidia/pytorch:25.11-py3
+        BASE_IMAGE: nvcr.io/nvidia/pytorch:26.01-py3
         PLATFORM: amd64
       - IMAGE: CI_MCORE_DEV_IMAGE
         FILE: Dockerfile.ci.dev
         IMAGE_TYPE: dev
-        BASE_IMAGE: nvcr.io/nvidia/pytorch:25.11-py3
+        BASE_IMAGE: nvcr.io/nvidia/pytorch:26.01-py3
         PLATFORM: arm64
       - IMAGE: UTILITY_IMAGE
         FILE: Dockerfile.linting
