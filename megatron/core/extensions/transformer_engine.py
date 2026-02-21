@@ -5,7 +5,6 @@ import enum
 import inspect
 import io
 import os
-import pickle
 import warnings
 from contextlib import nullcontext
 from typing import TYPE_CHECKING, Any, Callable, Dict, List, Optional, Set, Tuple, cast
@@ -1693,8 +1692,9 @@ if HAVE_TE and is_te_min_version("1.9.0.dev0"):
             # TE 2.0 changed the format of extra_state to be a byte tensor
             if is_te_min_version("2.0.0"):
                 torch.cuda.synchronize()
-                state_serialized = bytearray(pickle.dumps(state))
-                state_serialized = torch.frombuffer(state_serialized, dtype=torch.uint8)
+                buffer = io.BytesIO()
+                torch.save(state, buffer)
+                state_serialized = torch.frombuffer(bytearray(buffer.getvalue()), dtype=torch.uint8)
             else:
                 state_serialized = io.BytesIO()
                 torch.save(state, state_serialized)
@@ -1702,10 +1702,12 @@ if HAVE_TE and is_te_min_version("1.9.0.dev0"):
 
         def _decode_extra_state(self, state):
             if isinstance(state, torch.Tensor):
-                # No FP8 is indicated by an empty tensor we don't need to unpickle.
+                # No FP8 is indicated by an empty tensor we don't need to deserialize.
                 if state.numel() == 0:
                     return
-                return pickle.loads(state.detach().cpu().numpy().tobytes())
+                raw_bytes = state.detach().cpu().numpy().tobytes()
+                buffer = io.BytesIO(raw_bytes)
+                return torch.load(buffer, map_location="cuda", weights_only=False)
             elif isinstance(state, io.BytesIO):
                 state.seek(0)
                 return torch.load(state, map_location="cuda")
