@@ -1393,8 +1393,8 @@ def load_args_from_checkpoint(
             checkpoint_args, 'hybrid_layer_pattern',
             getattr(checkpoint_args, 'hybrid_override_pattern'),
         )
-        # num_layers is now derived from hybrid_layer_pattern in validate_args;
-        # remove it so _set_arg doesn't load a conflicting value from the checkpoint.
+        # num_layers is now derived from hybrid_layer_pattern in validate_args, and should not be
+        # set at the same time as hybrid_layer_pattern.
         if hasattr(checkpoint_args, 'num_layers'):
             setattr(checkpoint_args, 'num_layers', None)
 
