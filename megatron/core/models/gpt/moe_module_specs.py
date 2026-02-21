@@ -1,5 +1,5 @@
 # Copyright (c) 2023, NVIDIA CORPORATION. All rights reserved.
-
+from functools import partial
 from typing import Optional
 
 from megatron.core.extensions.transformer_engine_spec_provider import TESpecProvider
@@ -8,6 +8,7 @@ from megatron.core.transformer.mlp import MLPSubmodules
 from megatron.core.transformer.moe.moe_layer import MoELayer, MoESubmodules
 from megatron.core.transformer.moe.shared_experts import SharedExpertMLP
 from megatron.core.transformer.spec_utils import ModuleSpec
+from megatron.core.transformer.transformer_layer import MlpBuilder
 
 
 def get_moe_module_spec(
@@ -15,7 +16,7 @@ def get_moe_module_spec(
     num_experts: Optional[int] = None,
     moe_grouped_gemm: Optional[bool] = False,
     moe_use_legacy_grouped_gemm: Optional[bool] = False,
-) -> ModuleSpec:
+) -> MlpBuilder:
     """Helper function to get module spec for MoE"""
     if use_te is not None and use_te:
         backend: BackendSpecProvider = TESpecProvider()
@@ -35,7 +36,7 @@ def get_moe_module_spec_for_backend(
     moe_grouped_gemm: Optional[bool] = False,
     moe_use_legacy_grouped_gemm: Optional[bool] = False,
     use_te_activation_func: bool = False,
-) -> ModuleSpec:
+) -> MlpBuilder:
     """Helper function to get module spec for MoE"""
     assert num_experts is not None
 
@@ -60,9 +61,6 @@ def get_moe_module_spec_for_backend(
     shared_experts = ModuleSpec(module=SharedExpertMLP, submodules=mlp)
 
     # MoE module spec
-    moe_module_spec = ModuleSpec(
-        module=MoELayer,
-        submodules=MoESubmodules(experts=experts, shared_experts=shared_experts),
-        metainfo={"fuse_pre_mlp_layernorm": False},
+    return partial(
+        MoELayer, submodules=MoESubmodules(experts=experts, shared_experts=shared_experts)
     )
-    return moe_module_spec

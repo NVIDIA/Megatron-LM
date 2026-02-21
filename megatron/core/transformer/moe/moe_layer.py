@@ -367,7 +367,7 @@ class MoELayer(BaseMoELayer):
         hidden_states: torch.Tensor,
         intermediate_tensors=None,
         padding_mask: Optional[torch.Tensor] = None,
-    ):
+    ) -> tuple[torch.Tensor, Optional[torch.Tensor]]:
         """Forward pass for the MoE layer.
 
         The forward pass comprises four main steps:
