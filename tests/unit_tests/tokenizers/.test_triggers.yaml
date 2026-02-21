@@ -1,0 +1,3 @@
+# Tokenizers test files.
+test_buckets:
+  - tokenizers

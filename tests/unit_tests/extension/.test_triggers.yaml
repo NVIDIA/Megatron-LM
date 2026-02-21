@@ -1,0 +1,3 @@
+# Extension test files (kitchen_sdpa).
+test_buckets:
+  - extension
