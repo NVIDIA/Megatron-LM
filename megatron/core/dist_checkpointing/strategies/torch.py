@@ -60,6 +60,9 @@ from .checkpointable import CheckpointableShardedTensor, LocalShardsContainer
 from .filesystem_async import FileSystemWriterAsync
 from .state_dict_saver import save_state_dict_async_finalize, save_state_dict_async_plan
 
+#from ml_flashpoint.adapter.megatron.load_strategies import MLFlashpointMegatronLoadStrategy
+#from ml_flashpoint.adapter.megatron.save_strategies import MLFlashpointMegatronAsyncSaveStrategy
+
 try:
     if not torch.cuda.is_available():
         raise ImportError
@@ -99,11 +102,19 @@ class MCoreSavePlan:
 
 def register_default_torch_strategies():
     """Register default strategies related to PyT Distributed backend."""
+    from ml_flashpoint.adapter.megatron.load_strategies import MLFlashpointMegatronLoadStrategy
+    from ml_flashpoint.adapter.megatron.save_strategies import MLFlashpointMegatronAsyncSaveStrategy
     register_default_strategy(
         StrategyAction.LOAD_SHARDED, 'torch_dist', 1, TorchDistLoadShardedStrategy()
     )
     register_default_strategy(
         StrategyAction.SAVE_SHARDED, 'torch_dist', 1, TorchDistSaveShardedStrategy('torch_dist', 1)
+    )
+    register_default_strategy(
+        StrategyAction.LOAD_SHARDED, 'ml_flashpoint', 1, MLFlashpointMegatronLoadStrategy
+    )
+    register_default_strategy(
+        StrategyAction.SAVE_SHARDED, 'ml_flashpoint', 1, MLFlashpointMegatronAsyncSaveStrategy
     )
 
 
@@ -382,10 +393,15 @@ def _replace_sharded_keys_with_state_dict_keys(
     flat_mapping: FLATTEN_MAPPING,
     rename_mapping: Dict[str, List[str]],
 ):
+    from .checkpointable import CheckpointableShardedTensor
     """Inverse of _replace_state_dict_keys_with_sharded_keys."""
     recovered_sd = {}
     for k, tensors in state_dict.items():
+        if isinstance(tensors, CheckpointableShardedTensor):
+            tensors = tensors.__get_tensor_shard__(0)
+            tensors = [tensors]
         assert len(tensors) == len(rename_mapping[k])
+
         for ten, recovered_k in zip(tensors, rename_mapping[k]):
             recovered_sd[recovered_k] = ten
 
