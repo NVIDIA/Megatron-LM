@@ -1,4 +1,4 @@
-# Copyright (c) 2025, NVIDIA CORPORATION.  All rights reserved.
+# Copyright (c) 2025-2026, NVIDIA CORPORATION.  All rights reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -1560,7 +1560,7 @@ class ParamAndGradBuffer:
         parameter management and communication are crucial for performance.
 
     Args:
-        ddp_config (DistributedDataParallelConfig): The distributed data parallel
+        ddp_config (:class:`~core.distributed.distributed_data_parallel_config.DistributedDataParallelConfig`): The distributed data parallel
             configuration.
         module (torch.nn.Module): The module whose parameters are to be grouped
             and flatten.

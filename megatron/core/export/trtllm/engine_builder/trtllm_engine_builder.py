@@ -1,4 +1,4 @@
-# Copyright (c) 2024, NVIDIA CORPORATION. All rights reserved.
+# Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
 
 
 try:
@@ -57,7 +57,7 @@ class TRTLLMEngineBuilder:
             max_input_len (int, optional): Max input length. Defaults to 1024.
             max_output_len (int, optional): Max output length. Defaults to 1024.
             max_batch_size (int, optional): Max batch size. Defaults to 4.
-            model_type (ModelType, optional): ModelType enum. Defaults to ModelType.gpt.
+            model_type (megatron.core.export.model_type.ModelType, optional): Model type enum. Defaults to ModelType.gpt.
             lora_ckpt_list (_type_, optional): Lora checkpoint list. Defaults to None.
             use_lora_plugin (_type_, optional): Use lora plugin. Defaults to None.
             max_lora_rank (int, optional): Max lora rank. Defaults to 64.

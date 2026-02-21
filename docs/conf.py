@@ -62,6 +62,9 @@ myst_enable_extensions = [
     "attrs_block",  # Enables setting attributes on block elements using {#id .class key=val}
 ]
 myst_heading_anchors = 5  # Generates anchor links for headings up to level 5
+# Autodoc2-generated API docs use H2 for the module/class title (Sphinx convention);
+# suppress the "Document headings start at H2, not H1" warning for those files.
+suppress_warnings = ["myst.header"]
 
 # -- Options for Autodoc2 ---------------------------------------------------
 sys.path.insert(0, os.path.abspath(".."))

@@ -1,4 +1,4 @@
-# Copyright (c) 2024, NVIDIA CORPORATION. All rights reserved.
+# Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
 import json
 from typing import Union
 
@@ -65,7 +65,7 @@ class TRTLLMHelper:
 
         Args:
             transformer_config (TransformerConfig): The transformer config
-            model_type (ModelType): The type of the input model. Enum (megatron.core.export.model_type.ModelType)
+            model_type (megatron.core.export.model_type.ModelType): The type of the input model.
             trtllm_conversion_dict (dict, optional): A conversion dictionary that will map your model layer names to trtllm equivalent layer names. Default dictionary is given megatron/core/export/model_to_trtllm_mapping. This dict is merged into the default dict. NOTE: Ignore layer numbers in the model layer names. (e.g) decoder.layers.0.attention_qkv.weight will be decoder.layers.attention_qkv.weight in the mapping dictionary. Defaults to {}.
             position_embedding_type (str, optional): The position embedding type. Defaults to None.
             max_position_embeddings (int, optional): Max posistion embeddings value. Defaults to None.

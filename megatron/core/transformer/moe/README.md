@@ -89,7 +89,7 @@ For latest features and architectures, please refer to the [MCore dev roadmap](h
 
 ### Basic MoE Training in Megatron-LM
 
-To train a top-2 MoE model with 8 experts and auxiliary loss, add the following arguments to your megatron training script:
+To train a top-2 MoE model with 8 experts and auxiliary loss, add the following arguments to your Megatron training script:
 
 ```bash
 ## Set MoE Hidden site
@@ -687,7 +687,7 @@ torchrun ${DISTRIBUTED_ARGS[@]} pretrain_gpt.py \
 
 ## Contributing
 
-We welcome contributions! Please see [CONTRIBUTING.md](../../../../CONTRIBUTING.md) for guidelines.
+We welcome contributions! For more information, review [CONTRIBUTING.md](https://github.com/NVIDIA/Megatron-LM/blob/dev/CONTRIBUTING.md) for guidelines.
 
 ## Support
 
