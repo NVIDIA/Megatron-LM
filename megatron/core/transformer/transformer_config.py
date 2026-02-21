@@ -1400,10 +1400,10 @@ class TransformerConfig(ModelParallelConfig):
                 )
 
         if self.moe_expert_rank_capacity_factor is not None:
-            if not self.moe_use_device_initiated_grouped_gemm:
+            if not self.use_transformer_engine_op_fuser:
                 raise ValueError(
                     "moe_expert_rank_capacity_factor requires "
-                    "moe_use_device_initiated_grouped_gemm to be enabled."
+                    "use_transformer_engine_op_fuser to be enabled."
                 )
             if self.moe_flex_dispatcher_backend != "hybridep":
                 raise ValueError(
@@ -1657,6 +1657,7 @@ class TransformerConfig(ModelParallelConfig):
             assert (
                 not self.cpu_offloading and not self.fine_grained_activation_offloading
             ), "paged_stash cannot be enabled with cpu_offloading."
+        if self.moe_paged_stash:# vasu
             assert (
                 self.stash_modules is not None and len(self.stash_modules) > 0
             ), "stash_modules must be specified when moe_paged_stash is enabled."
@@ -1677,7 +1678,16 @@ class TransformerConfig(ModelParallelConfig):
                 f"A module cannot be stashed and offloaded at the same time. "
                 f"Found overlapping modules: {overlap}"
             )
-
+        # Check that Full/Selective recompute for MOE not enabled when paged stash is enabled
+        if self.moe_paged_stash:
+            if self.recompute_granularity == "full":
+                raise ValueError(
+                    "Full recompute is not supported when paged stash is enabled."
+                )
+            if self.recompute_granularity == "selective" and "moe" in self.recompute_modules:
+                raise ValueError(
+                    "Selective recompute for MOE is not supported when paged stash is enabled."
+                )
         if (
             self.num_layers_in_first_pipeline_stage is not None
             or self.num_layers_in_last_pipeline_stage is not None
@@ -2360,14 +2370,15 @@ class TransformerConfig(ModelParallelConfig):
                 )
 
             if self.cuda_graph_impl != "none":
-                assert (
-                    self.cuda_graph_impl == "transformer_engine"
-                    and CudaGraphScope.moe not in self.cuda_graph_scope
-                    and CudaGraphScope.mlp not in self.cuda_graph_scope
-                ), (
-                    'CUDA graph scope on moe and mlp is not '
-                    'supported with overlap_moe_expert_parallel_comm'
-                )
+                if self.cuda_graph_impl == "transformer_engine":
+                    assert (
+                        self.cuda_graph_impl == "transformer_engine"
+                        and CudaGraphScope.moe not in self.cuda_graph_scope
+                        and CudaGraphScope.mlp not in self.cuda_graph_scope
+                    ), (
+                        'CUDA graph scope on moe and mlp is not '
+                        'supported with overlap_moe_expert_parallel_comm'
+                    )
 
         # Check delay_wgrad_compute compatibility
         if self.delay_wgrad_compute:
