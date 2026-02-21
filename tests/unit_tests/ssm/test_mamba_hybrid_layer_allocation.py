@@ -43,7 +43,9 @@ class TestPatternFromRatios:
         assert result.count(Symbols.MAMBA) == 5
         attn_positions = [i for i, ch in enumerate(result) if ch == Symbols.ATTENTION]
         gaps = [attn_positions[i + 1] - attn_positions[i] for i in range(len(attn_positions) - 1)]
-        assert all(g in (1, 2, 3) for g in gaps), f"Gaps between attention layers should be small, got {gaps}"
+        assert all(
+            g in (1, 2, 3) for g in gaps
+        ), f"Gaps between attention layers should be small, got {gaps}"
 
     def test_mlp_does_not_replace_attention(self):
         result = pattern_from_ratios(10, attention_ratio=0.3, mlp_ratio=0.3)
