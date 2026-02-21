@@ -311,6 +311,7 @@ class TransformerBlock(GraphableMegatronModule, MegatronModule):
                     self.config.cpu_offloading_activations,
                     self.config.cpu_offloading_weights,
                     self.config.cpu_offloading_double_buffering,
+                    self.config.cpu_offloading_retain_pinned_cpu_buffers,
                 )
             )
             self.config._cpu_offloading_context = (
