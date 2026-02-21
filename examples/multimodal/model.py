@@ -16,7 +16,8 @@ from megatron.core.utils import log_single_rank
 
 
 def model_provider(
-    pre_process=True, post_process=True, add_encoder=True, add_decoder=True, parallel_output=True
+    pre_process=True, post_process=True, add_encoder=True, add_decoder=True, parallel_output=True,
+    config=None, pg_collection=None,
 ) -> LLaVAModel:
     """Builds the model.
 
