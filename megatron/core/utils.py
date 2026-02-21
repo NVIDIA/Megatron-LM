@@ -823,6 +823,26 @@ def scaled_init_method_normal(sigma, num_layers, multiplier=2.0):
     return functools.partial(torch.nn.init.normal_, mean=0.0, std=std)
 
 
+def mup_scaled_init_method_normal(sigma, num_layers, width_mult, multiplier=2.0):
+    """MuP scaled init method for output layers: N(0, sigma / (sqrt(2*L) * sqrt(m))).
+
+    Combines the standard scaled initialization (for output projection layers)
+    with MuP width scaling. This ensures that both depth and width scaling
+    are accounted for in the initialization.
+
+    Args:
+        sigma (float): Base standard deviation for initialization.
+        num_layers (int): Number of transformer layers.
+        width_mult (float): Width multiplier (hidden_size / base_hidden_size).
+        multiplier (float): Multiplier for depth scaling (default: 2.0).
+
+    Returns:
+        Callable: Initialization function for torch.nn.init.
+    """
+    std = sigma / (math.sqrt(multiplier * num_layers) * math.sqrt(width_mult))
+    return functools.partial(torch.nn.init.normal_, mean=0.0, std=std)
+
+
 def log_on_each_pipeline_stage(
     logger: logging.Logger,
     *args: Any,
