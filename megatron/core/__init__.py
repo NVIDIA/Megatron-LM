@@ -50,3 +50,26 @@ from .safe_globals import register_safe_globals
 
 if is_torch_min_version("2.6a0"):
     register_safe_globals()
+
+
+import signal
+import sys
+import torch.distributed as dist
+from megatron.training import print_rank_0
+
+def graceful_shutdown(signum, frame):
+    print_rank_0("\nTermination requested. Performing orderly shutdown.")
+
+    try:
+        if dist.is_available() and dist.is_initialized():
+            # synchronize all ranks before exiting
+            dist.barrier()
+            dist.destroy_process_group()
+    except Exception:
+        pass
+
+    sys.exit(0)
+
+# Handle BOTH signals
+signal.signal(signal.SIGINT, graceful_shutdown)
+signal.signal(signal.SIGTERM, graceful_shutdown)
