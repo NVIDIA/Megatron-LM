@@ -66,18 +66,20 @@ def _get_config_tuple(core) -> Optional[Tuple[int, int, int, int, int]]:
     )
 
 
-def _build_plan_cache_key(src_core, tgt_core, num_experts: Optional[int]) -> _PlanCacheKey:
+def _build_plan_cache_key(src_core, tgt_core, num_experts: Optional[int], group=None) -> _PlanCacheKey:
     """Build cache key for reshard plan.
 
     Args:
         src_core: Source model core (or None for non-collocated destination/idle ranks)
         tgt_core: Target model core (or None for non-collocated source/idle ranks)
         num_experts: Number of MoE experts (or None for non-MoE models)
+        group: Optional process group for rank query
 
     Returns:
         Cache key that uniquely identifies this reshard configuration for this rank
     """
-    rank = torch.distributed.get_rank()
+    # Use group.rank() to support cross-cluster ProcessGroups
+    rank = group.rank() if group is not None else torch.distributed.get_rank()
     src_config = _get_config_tuple(src_core)
     dst_config = _get_config_tuple(tgt_core)
     return _PlanCacheKey(
@@ -90,21 +92,25 @@ _service_cache: dict[str, CopyService] = {}
 _plan_cache: dict[_PlanCacheKey, Any] = {}
 
 
-def get_or_create_service(backend: RefitBackendName) -> CopyService:
+def get_or_create_service(backend: RefitBackendName, group=None) -> CopyService:
     """Get or create a cached CopyService instance for the given backend.
 
     This avoids expensive repeated allocations (especially for NVSHMEM buffers)
     when swap_model_weights is called multiple times with the same backend.
+
+    Args:
+        backend: Backend name ("nccl", "gloo", or "nvshmem").
+        group: Optional process group for NCCL backend.
     """
     if backend in _service_cache:
         return _service_cache[backend]
 
     if backend == "nccl":
-        service = NCCLCopyService()
+        service = NCCLCopyService(group=group)
     elif backend == "gloo":
-        service = GlooCopyService()
+        service = GlooCopyService(group=group)
     elif backend == "nvshmem":
-        service = NVSHMEMCopyService()
+        service = NVSHMEMCopyService(group=group)
     else:
         raise ValueError(f"Unknown backend '{backend}'")
 
@@ -152,25 +158,39 @@ def swap_model_weights(
     src_model: LanguageModule,
     target_model: LanguageModule,
     refit_method: Union[RefitBackendName, CopyService],
+    group=None,
+    src_rank_offset: int = 0,
+    dst_rank_offset: int = 0,
 ):
     """
     Orchestrate weight swap/refit.
     - refit_method can be:
         * a string backend name (one of the supported refit backends), or
         * a CopyService instance.
+    - group: Optional process group for communication.
+    - src_rank_offset / dst_rank_offset: Offsets applied to local process group
+      ranks so that metadata contains globally unique rank IDs across independent
+      torch.distributed worlds (e.g., separate training and inference clusters).
     """
-    if isinstance(refit_method, CopyService):
+    if isinstance(refit_method, str):
+        service = get_or_create_service(refit_method, group=group)
+    elif hasattr(refit_method, 'submit_send') and hasattr(refit_method, 'run'):
         service = refit_method
-        reshard_model_weights(src_model, target_model, service=service)
-    elif isinstance(refit_method, str):
-        service = get_or_create_service(refit_method)
-        reshard_model_weights(src_model, target_model, service=service)
     else:
-        raise TypeError("refit_method must be a str backend name or a CopyService instance")
+        raise TypeError("refit_method must be a str backend name or a CopyService-compatible instance")
+    reshard_model_weights(
+        src_model, target_model, service=service,
+        group=group, src_rank_offset=src_rank_offset, dst_rank_offset=dst_rank_offset,
+    )
 
 
 def reshard_model_weights(
-    src_model: LanguageModule, target_model: LanguageModule, service: CopyService
+    src_model: LanguageModule,
+    target_model: LanguageModule,
+    service: CopyService,
+    group=None,
+    src_rank_offset: int = 0,
+    dst_rank_offset: int = 0,
 ):
     """Reshard and copy model weights from ``src_model`` to ``target_model`` using ``service``.
 
@@ -183,20 +203,28 @@ def reshard_model_weights(
     In non-collocated mode, metadata includes local rank positions within parallel groups,
     allowing the planner to correctly map between different process group configurations
     without requiring dummy models on every rank.
+
+    Args:
+        group: Optional process group for collective communication.
+        src_rank_offset / dst_rank_offset: Offsets for mapping local ranks to global ranks
+            in independent torch.distributed worlds.
     """
     global _plan_cache
 
     # Handle idle ranks (both models None) - they participate in collectives but have no work
     if src_model is None and target_model is None:
-        cache_key = _build_plan_cache_key(src_core=None, tgt_core=None, num_experts=None)
+        cache_key = _build_plan_cache_key(src_core=None, tgt_core=None, num_experts=None, group=group)
 
         # Use cached plan if available, otherwise build (with collective participation)
         if cache_key not in _plan_cache:
-            plan = build_centralized_reshard_plan(None, None, num_experts=None)
+            plan = build_centralized_reshard_plan(
+                None, None, num_experts=None,
+                group=group, src_rank_offset=src_rank_offset, dst_rank_offset=dst_rank_offset,
+            )
             _plan_cache[cache_key] = plan
         else:
             plan = _plan_cache[cache_key]
-        execute_reshard_plan(plan, None, None, service=service)
+        execute_reshard_plan(plan, None, None, service=service, group=group)
         return
 
     # Handle None models - extract core modules only from non-None models
@@ -229,13 +257,16 @@ def reshard_model_weights(
             raise RuntimeError("Target model missing pg_collection required for reshard")
 
     # Build or retrieve cached plan
-    cache_key = _build_plan_cache_key(src_core, tgt_core, num_experts)
+    cache_key = _build_plan_cache_key(src_core, tgt_core, num_experts, group=group)
 
     if cache_key not in _plan_cache:
         # All ranks must participate in planning (collective operations)
-        plan = build_centralized_reshard_plan(src_core, tgt_core, num_experts=num_experts)
+        plan = build_centralized_reshard_plan(
+            src_core, tgt_core, num_experts=num_experts,
+            group=group, src_rank_offset=src_rank_offset, dst_rank_offset=dst_rank_offset,
+        )
         _plan_cache[cache_key] = plan
     else:
         plan = _plan_cache[cache_key]
 
-    execute_reshard_plan(plan, src_core, tgt_core, service=service)
+    execute_reshard_plan(plan, src_core, tgt_core, service=service, group=group)
