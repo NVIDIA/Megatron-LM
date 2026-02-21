@@ -80,14 +80,6 @@ def build_tokenizer(args, **kwargs):
         _set_padded_vocab_size(args, tokenizer)
 
         return tokenizer
-    elif args.tokenizer_type == 'SFTTokenizer':
-        # SFTTokenizer uses the legacy tokenizer system
-        from megatron.core.tokenizers.text.libraries.sft_tokenizer import SFTTokenizer 
-        tokenizer = SFTTokenizer(
-            args.tokenizer_model,
-            args.sft_tokenizer_prompt_format,
-        )
-        return tokenizer
 
     if args.tokenizer_metadata:
         metadata = args.tokenizer_metadata
