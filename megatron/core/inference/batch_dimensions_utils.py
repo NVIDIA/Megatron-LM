@@ -236,7 +236,7 @@ class CUDAGraphBatchDimensionBuilder:
             [1000, 752, 504, 256]
         """
         if num_cuda_graphs == -1:
-            # automatically determine the number of CUDA graphs to 
+            # automatically determine the number of CUDA graphs to
             # capture based on the `max_requests` value
             cuda_graph_token_counts = (
                 [1, 2, 4] + list(range(8, 256, 8)) + list(range(256, cuda_graph_max_tokens + 1, 16))
@@ -361,7 +361,7 @@ class CUDAGraphBatchDimensionBuilder:
                 cuda_graph_max_tokens = max_tokens
 
             if num_cuda_graphs != -1:
-                # if -1, no need to adjust. This will ne taken care of in
+                # if -1, no need to adjust. This will be taken care of in
                 # the _calculate_cuda_graph_token_counts function where we will generate
                 # the token counts based on the max_tokens value and the step size.
                 num_cuda_graphs = min(max(num_cuda_graphs, 1), cuda_graph_max_tokens)
