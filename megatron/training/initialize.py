@@ -48,6 +48,7 @@ def initialize_megatron(
     get_position_embedding_ranks=None,
     parsed_args=None,
     store=None,
+    defer_mpu_initialization=False,
 ):
     """Set global variables, initialize distributed, and
     set autoresume and random seeds.
@@ -148,18 +149,11 @@ def initialize_megatron(
         return None
 
     args = get_args()
-    if args.lazy_mpu_init:
-        # TODO is this still a necessary option?
-        args.use_cpu_initialization = True
-        # delayed initialization of DDP-related stuff
-        # We only set basic DDP globals
-        mpu.set_tensor_model_parallel_world_size(args.tensor_model_parallel_size)
-        # and return function for external DDP manager
-        # to call when it has DDP initialized
-        mpu.set_tensor_model_parallel_rank(args.rank)
-        return finish_mpu_init
-    else:
-        # Megatron's MPU is the master. Complete initialization right away.
+    should_defer_mpu_init = defer_mpu_initialization or getattr(
+        args, "prefork_dataloader_before_cuda", False
+    )
+
+    def finish_full_init():
         finish_mpu_init()
 
         # Autoresume.
@@ -171,6 +165,22 @@ def initialize_megatron(
         if args.tp_comm_overlap:
             # TODO: Should this be activated with just decoder-tp-comm-overlap too?
             _initialize_tp_communicators()
+
+    if args.lazy_mpu_init:
+        # TODO is this still a necessary option?
+        args.use_cpu_initialization = True
+        # delayed initialization of DDP-related stuff
+        # We only set basic DDP globals
+        mpu.set_tensor_model_parallel_world_size(args.tensor_model_parallel_size)
+        # and return function for external DDP manager
+        # to call when it has DDP initialized
+        mpu.set_tensor_model_parallel_rank(args.rank)
+        return finish_mpu_init
+    elif should_defer_mpu_init:
+        return finish_full_init
+    else:
+        # Megatron's MPU is the master. Complete initialization right away.
+        finish_full_init()
 
         # No continuation function
         return None

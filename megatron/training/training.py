@@ -103,6 +103,7 @@ from megatron.core.pipeline_parallel.utils import (
 )
 from megatron.core.optimizer import get_mup_config_overrides, get_standard_config_overrides
 from megatron.training.checkpointing import load_checkpoint
+from megatron.training.checkpointing import read_dataloader_state_from_checkpoint
 from megatron.training.checkpointing import save_checkpoint, save_grads
 from megatron.training.checkpointing import checkpoint_exists
 from megatron.training.checkpointing import get_loaded_iteration
@@ -138,7 +139,10 @@ from megatron.training.initialize import initialize_megatron
 from megatron.training.initialize import write_args_to_tensorboard
 from megatron.training.initialize import set_jit_fusion_options
 from megatron.training.utils import get_batch_on_this_cp_rank, get_batch_on_this_tp_rank, is_hybrid_model
-from megatron.training.datasets.data_samplers import build_pretraining_data_loader
+from megatron.training.datasets.data_samplers import (
+        build_pretraining_data_loader,
+        set_prefork_dataloader_start_event
+)
 from megatron.core.datasets.data_schedule import HybridCPDataLoaderWrapper
 from megatron.core.optimizer_param_scheduler import OptimizerParamScheduler
 from megatron.core.transformer.moe import upcycling_utils
@@ -149,7 +153,8 @@ from megatron.core.parallel_state import (
     destroy_global_memory_buffer,
     destroy_global_symmetric_memory_buffer,
     destroy_model_parallel,
-    update_pg_timeout
+    update_pg_timeout,
+    RankGenerator
 )
 from megatron.core.inference.unified_memory import create_unified_mempool
 from megatron.core.resharding.refit import swap_model_weights
@@ -204,6 +209,76 @@ from . import ft_integration
 stimer = StragglerDetector()
 
 from megatron.core.msc_utils import MultiStorageClientFeature, open_file
+
+
+@dataclasses.dataclass(frozen=True)
+class DataLoaderState:
+    iteration: int
+    consumed_train_samples: int
+    consumed_valid_samples: int
+
+
+def _get_dataloader_state_from_args(args) -> DataLoaderState:
+    return DataLoaderState(
+        iteration=int(getattr(args, "iteration", 0)),
+        consumed_train_samples=int(getattr(args, "consumed_train_samples", 0)),
+        consumed_valid_samples=int(getattr(args, "consumed_valid_samples", 0)),
+    )
+
+
+def _init_dataloader_state(args, checkpoint_state) -> DataLoaderState:
+    if checkpoint_state is not None:
+        return DataLoaderState(
+            iteration=int(checkpoint_state["iteration"]),
+            consumed_train_samples=int(checkpoint_state["consumed_train_samples"]),
+            consumed_valid_samples=int(checkpoint_state["consumed_valid_samples"]),
+        )
+    return _get_dataloader_state_from_args(args)
+
+
+def _bootstrap_prefork_dataloader_state(args):
+    checkpoint_dataloader_state = read_dataloader_state_from_checkpoint(args)
+    prefork_dataloader_state = _init_dataloader_state(args, checkpoint_dataloader_state)
+    args.iteration = prefork_dataloader_state.iteration
+    args.consumed_train_samples = prefork_dataloader_state.consumed_train_samples
+    args.consumed_valid_samples = prefork_dataloader_state.consumed_valid_samples
+    return checkpoint_dataloader_state, prefork_dataloader_state
+
+
+def _validate_prefork_startup_args(args, checkpoint_dataloader_state):
+    if args.prefork_dataloader_before_cuda and args.virtual_pipeline_model_parallel_size is not None:
+        raise RuntimeError(
+            "--prefork-dataloader-before-cuda is not supported with virtual pipeline "
+            "model parallelism. Disable prefork or unset virtual pipeline parallelism."
+        )
+
+    has_resume_checkpoint = False
+    if args.load is not None and checkpoint_exists(args.load):
+        has_resume_checkpoint = True
+    pretrained_ckpt = getattr(args, "pretrained_checkpoint", None)
+    if pretrained_ckpt is not None and checkpoint_exists(pretrained_ckpt):
+        has_resume_checkpoint = True
+    if (
+        args.prefork_dataloader_before_cuda
+        and has_resume_checkpoint
+        and checkpoint_dataloader_state is None
+    ):
+        raise RuntimeError(
+            "Unable to read checkpoint dataloader state before prefork. "
+            "This checkpoint format/path is not currently supported for "
+            "--prefork-dataloader-before-cuda resume without refork."
+        )
+
+
+def _maybe_build_prefork_data_iterators(args, train_valid_test_dataset_provider):
+    prefork_start_event = torch.multiprocessing.Event()
+    prefork_start_event.clear()
+    set_prefork_dataloader_start_event(prefork_start_event)
+    prefork_data_iterators = build_train_valid_test_data_iterators(
+        train_valid_test_dataset_provider,
+        pre_cuda_prefork_mode=True,
+    )
+    return prefork_start_event, prefork_data_iterators
 
 
 def destroy_global_state():
@@ -787,7 +862,7 @@ def pretrain(
     timestamp_after_in_job_setup = time.time()
 
     # Initalize and get arguments, timers, and Tensorboard writer.
-    initialize_megatron(
+    finalize_megatron_init = initialize_megatron(
         extra_args_provider=extra_args_provider,
         args_defaults=args_defaults,
         get_embedding_ranks=get_embedding_ranks,
@@ -795,17 +870,42 @@ def pretrain(
         store=store,
     )
 
-    timestamp_after_initialize_megatron = time.time()
-
     args = get_args()
     timers = get_timers()
+
+    prefork_dataloader_state = None
+    prefork_start_event = None
+    prefork_data_iterators = None
+    prefork_dataiter_setup_elapsed = 0.0
+    if args.prefork_dataloader_before_cuda:
+        (
+            checkpoint_dataloader_state,
+            prefork_dataloader_state,
+        ) = _bootstrap_prefork_dataloader_state(args)
+        _validate_prefork_startup_args(args, checkpoint_dataloader_state)
+        # Prefork runs before CUDA/distributed init, so avoid timer.start()/stop()
+        # which would call torch.cuda.synchronize() and optional dist barrier.
+        start_time = time.time()
+        prefork_start_event, prefork_data_iterators = _maybe_build_prefork_data_iterators(
+            args, train_valid_test_dataset_provider
+        )
+        prefork_dataiter_setup_elapsed = time.time() - start_time
+        timers('train/valid/test-data-iterators-setup', log_level=0).set_elapsed(
+            prefork_dataiter_setup_elapsed
+        )
+
+    if finalize_megatron_init is not None and (
+        args.prefork_dataloader_before_cuda or not args.lazy_mpu_init
+    ):
+        finalize_megatron_init()
+
+    timestamp_after_initialize_megatron = time.time()
 
     if args.fine_grained_activation_offloading:
         from megatron.core.pipeline_parallel.utils import (
             set_ideal_affinity_for_current_gpu
         )
         set_ideal_affinity_for_current_gpu()
-
 
     if args.log_progress:
         append_to_progress_log("Starting job")
@@ -860,7 +960,7 @@ def pretrain(
             'startup-program-setup': pretrain_entry - main_entry, # Local __main__ entry to pretrain entry
             'startup-in-process-setup': timestamp_after_inprocess_setup - pretrain_entry, # Local in-process setup
             'startup-in-job-setup': timestamp_after_in_job_setup - timestamp_after_inprocess_setup, # Local in-job setup
-            'startup-initialize-megatron': timestamp_after_initialize_megatron - timestamp_after_in_job_setup, # Local initialize megatron
+            'startup-initialize-megatron': timestamp_after_initialize_megatron - timestamp_after_in_job_setup - prefork_dataiter_setup_elapsed, # Local initialize megatron (exclude prefork dataloader setup)
             'startup-set-jit-fusion-options': timestamp_after_set_jit_fusion_options - timestamp_after_initialize_megatron, # Local set JIT fusion options
             'all-reduce-start-timestamps-tensor': megatron_init_end - timestamp_after_set_jit_fusion_options, # 2x All-reduce, first collective call
             'startup-megatron-init-local': megatron_init_end - pretrain_entry, # Local megatron init
@@ -925,6 +1025,28 @@ def pretrain(
     model, optimizer, opt_param_scheduler = setup_model_and_optimizer(
         model_provider, model_type, checkpointing_context=checkpointing_context
     )
+
+    if prefork_data_iterators is not None:
+        final_dataloader_state = _get_dataloader_state_from_args(args)
+        if final_dataloader_state != prefork_dataloader_state:
+            raise RuntimeError(
+                "Checkpoint dataloader state mismatch after full load in prefork mode: "
+                f"prefork={prefork_dataloader_state}, final={final_dataloader_state}. "
+                "Disable prefork or ensure early checkpoint state extraction matches "
+                "full checkpoint load semantics for this checkpoint format."
+            )
+    if prefork_start_event is not None:
+        prefork_start_event.set()
+        set_prefork_dataloader_start_event(None)
+        prefork_train_iter, prefork_valid_iter, prefork_test_iter = prefork_data_iterators
+        local_do_train = int(prefork_train_iter is not None and (args.skip_train or args.train_iters > 0))
+        local_do_valid = int(prefork_valid_iter is not None and (args.full_validation or args.eval_iters > 0))
+        local_do_test = int(prefork_test_iter is not None and (args.full_validation or args.eval_iters > 0))
+        prefork_flags = torch.tensor([local_do_train, local_do_valid, local_do_test], dtype=torch.long, device='cuda')
+        torch.distributed.broadcast(prefork_flags, 0)
+        args.do_train = getattr(args, "do_train", False) or prefork_flags[0].item()
+        args.do_valid = getattr(args, "do_valid", False) or prefork_flags[1].item()
+        args.do_test = getattr(args, "do_test", False) or prefork_flags[2].item()
 
     timers('model-and-optimizer-setup').stop()
     print_datetime('after model, optimizer, and learning rate ' 'scheduler are built')
@@ -1016,8 +1138,11 @@ def pretrain(
 
     # Data stuff.
     app_metrics['app_build_dataiters_start_time'] = one_logger_utils.get_timestamp_in_ms()
-    timers('train/valid/test-data-iterators-setup', log_level=0).start(barrier=True)
-    if args.virtual_pipeline_model_parallel_size is not None:
+    if prefork_data_iterators is None:
+        timers('train/valid/test-data-iterators-setup', log_level=0).start(barrier=True)
+    if prefork_data_iterators is not None:
+        train_data_iterator, valid_data_iterator, test_data_iterator = prefork_data_iterators
+    elif args.virtual_pipeline_model_parallel_size is not None:
         train_data_iterator = []
         valid_data_iterator = []
         test_data_iterator = []
@@ -1039,7 +1164,8 @@ def pretrain(
         train_data_iterator, valid_data_iterator, test_data_iterator = (
             build_train_valid_test_data_iterators(train_valid_test_dataset_provider)
         )
-    timers('train/valid/test-data-iterators-setup').stop()
+    if prefork_data_iterators is None:
+        timers('train/valid/test-data-iterators-setup').stop()
     print_datetime('after dataloaders are built')
     app_metrics['app_build_dataiters_finish_time'] = one_logger_utils.get_timestamp_in_ms()
 
@@ -3398,8 +3524,18 @@ def get_train_valid_test_num_samples():
         if args.skip_train:
             eval_iters = args.eval_iters
         else:
-            assert args.train_iters is not None
-            eval_iters = (args.train_iters // args.eval_interval + 1) * args.eval_iters
+            train_iters_for_eval = args.train_iters
+            if train_iters_for_eval is None and args.train_samples is not None:
+                # Derive iterations just for dataset-size planning during prefork.
+                # Keep normal-mode args mutation semantics unchanged.
+                update_train_iters(args)
+                train_iters_for_eval = args.train_iters
+                args.train_iters = None
+            if train_iters_for_eval is None:
+                raise RuntimeError(
+                    "Unable to derive eval target size: both train_iters and train_samples are unset."
+                )
+            eval_iters = (train_iters_for_eval // args.eval_interval + 1) * args.eval_iters
         eval_samples = eval_iters * args.global_batch_size
     test_samples = args.eval_iters * args.global_batch_size
 
@@ -3427,10 +3563,19 @@ def build_train_valid_test_datasets(build_train_valid_test_datasets_provider, tr
     return build_train_valid_test_datasets_provider(train_valid_test_num_samples)
 
 
-def build_train_valid_test_data_loaders(build_train_valid_test_datasets_provider):
+def build_train_valid_test_data_loaders(
+    build_train_valid_test_datasets_provider, pre_cuda_prefork_mode=False
+):
     """Build pretraining data loaders."""
 
     args = get_args()
+    required_state_fields = ("iteration", "consumed_train_samples", "consumed_valid_samples")
+    missing_state_fields = [name for name in required_state_fields if not hasattr(args, name)]
+    assert not missing_state_fields, (
+        "Dataloader state must be initialized before building train/valid/test dataloaders. "
+        f"Missing fields: {missing_state_fields}. "
+        "For prefork mode, set bootstrap values before calling loader build."
+    )
 
     (train_dataloader, valid_dataloaders, test_dataloader) = (None, None, None)
 
@@ -3459,8 +3604,44 @@ def build_train_valid_test_data_loaders(build_train_valid_test_datasets_provider
     # Rely on distributed-aware core datasets, temporary
     is_distributed = getattr(build_train_valid_test_datasets_provider, "is_distributed", False)
 
+    def _get_preinit_tp_rank():
+        model_size = (
+            args.tensor_model_parallel_size
+            * args.pipeline_model_parallel_size
+            * args.context_parallel_size
+        )
+        assert (
+            args.world_size % model_size == 0
+        ), f"world_size ({args.world_size}) must be divisible by model_size ({model_size})"
+        data_parallel_size = args.world_size // model_size
+        order = 'tp-cp-ep-dp-pp' if not args.use_tp_pp_dp_mapping else 'tp-cp-ep-pp-dp'
+        rank_generator = RankGenerator(
+            tp=args.tensor_model_parallel_size,
+            ep=1,
+            dp=data_parallel_size,
+            pp=args.pipeline_model_parallel_size,
+            cp=args.context_parallel_size,
+            order=order,
+            rank_offset=0,
+        )
+        for ranks in rank_generator.get_ranks("tp"):
+            if args.rank in ranks:
+                return ranks.index(args.rank)
+        raise RuntimeError(f"Unable to resolve tensor-parallel rank for rank={args.rank}")
+
     # Construct the data pipeline
-    if is_distributed or mpu.get_tensor_model_parallel_rank() == 0:
+    if pre_cuda_prefork_mode:
+        build_on_rank = is_distributed or _get_preinit_tp_rank() == 0
+    else:
+        build_on_rank = is_distributed or mpu.get_tensor_model_parallel_rank() == 0
+
+    def _build_stage_flags(do_train, do_valid, do_test):
+        values = [int(do_train), int(do_valid), int(do_test)]
+        if pre_cuda_prefork_mode:
+            return torch.tensor(values, dtype=torch.long)
+        return torch.tensor(values, dtype=torch.long, device='cuda')
+
+    if build_on_rank:
 
         # Build datasets and dataloders.
         if getattr(args, 'perform_rl_step', True):
@@ -3468,7 +3649,7 @@ def build_train_valid_test_data_loaders(build_train_valid_test_datasets_provider
             train_dataloader = None
             valid_dataloaders = None
             test_dataloader = None
-            do_train = args.train_iters > 0
+            do_train = (args.train_iters or 0) > 0
             do_valid = (args.full_validation or args.eval_iters > 0)
             do_test = (args.full_validation or args.eval_iters > 0)
 
@@ -3493,17 +3674,18 @@ def build_train_valid_test_data_loaders(build_train_valid_test_datasets_provider
             if not args.multiple_validation_sets:
                 assert len(valid_dataloaders) == 1
             test_dataloader = build_pretraining_data_loader(test_ds, 0)
-            do_train = train_dataloader is not None and (args.skip_train or args.train_iters > 0)
+            do_train = train_dataloader is not None and (
+                args.skip_train or (args.train_iters or 0) > 0
+            )
             do_valid = valid_dataloaders is not None and (args.full_validation or args.eval_iters > 0)
             do_test = test_dataloader is not None and (args.full_validation or args.eval_iters > 0)
 
-        flags = torch.tensor(
-            [int(do_train), int(do_valid), int(do_test)], dtype=torch.long, device='cuda'
-        )
+        flags = _build_stage_flags(do_train, do_valid, do_test)
     else:
-        flags = torch.tensor([0, 0, 0], dtype=torch.long, device='cuda')
+        flags = _build_stage_flags(False, False, False)
 
-    torch.distributed.broadcast(flags, 0)
+    if not pre_cuda_prefork_mode:
+        torch.distributed.broadcast(flags, 0)
 
     args.do_train = getattr(args, "do_train", False) or flags[0].item()
     args.do_valid = getattr(args, "do_valid", False) or flags[1].item()
@@ -3514,14 +3696,17 @@ def build_train_valid_test_data_loaders(build_train_valid_test_datasets_provider
     return train_dataloader, valid_dataloaders, test_dataloader
 
 
-def build_train_valid_test_data_iterators(build_train_valid_test_datasets_provider):
+def build_train_valid_test_data_iterators(
+    build_train_valid_test_datasets_provider, pre_cuda_prefork_mode=False
+):
     """Build pretraining data iterators."""
 
     args = get_args()
 
     # Build loaders.
     train_dataloader, valid_dataloaders, test_dataloader = build_train_valid_test_data_loaders(
-        build_train_valid_test_datasets_provider
+        build_train_valid_test_datasets_provider,
+        pre_cuda_prefork_mode=pre_cuda_prefork_mode,
     )
 
     # Build iterators.

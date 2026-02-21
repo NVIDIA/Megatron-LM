@@ -1503,6 +1503,65 @@ def load_args_from_checkpoint(
     return args, checkpoint_args
 
 
+def read_dataloader_state_from_checkpoint(args, load_arg='load', checkpointing_context=None):
+    """Read minimal checkpoint state needed for dataloader construction."""
+
+    load_dir = getattr(args, load_arg)
+    if load_dir is None:
+        return None
+
+    # Match load_checkpoint finetuning fallback semantics.
+    pretrained_dir = getattr(args, 'pretrained_checkpoint', None)
+    if pretrained_dir is not None and not checkpoint_exists(load_dir):
+        load_dir = pretrained_dir
+        if not checkpoint_exists(load_dir):
+            return None
+        args.finetune = True
+
+    state_dict, checkpoint_name, release, _ = _load_base_checkpoint(
+        load_dir,
+        args,
+        rank0=True,
+        checkpointing_context=checkpointing_context,
+    )
+    if not state_dict:
+        return None
+
+    if args.finetune or release:
+        return {
+            "iteration": 0,
+            "consumed_train_samples": 0,
+            "consumed_valid_samples": 0,
+            "checkpoint_name": checkpoint_name,
+            "release": bool(release),
+        }
+
+    if "iteration" in state_dict:
+        iteration = state_dict["iteration"]
+    elif "total_iters" in state_dict:
+        iteration = state_dict["total_iters"]
+    else:
+        raise RuntimeError(
+            "Unable to read iteration from checkpoint during prefork dataloader-state init "
+            f"(checkpoint={checkpoint_name})."
+        )
+
+    checkpoint_args = state_dict.get("args")
+    consumed_train_samples = (
+        getattr(checkpoint_args, "consumed_train_samples", 0) if checkpoint_args is not None else 0
+    )
+    consumed_valid_samples = (
+        getattr(checkpoint_args, "consumed_valid_samples", 0) if checkpoint_args is not None else 0
+    )
+    return {
+        "iteration": int(iteration),
+        "consumed_train_samples": int(consumed_train_samples),
+        "consumed_valid_samples": int(consumed_valid_samples),
+        "checkpoint_name": checkpoint_name,
+        "release": bool(release),
+    }
+
+
 def load_checkpoint(ddp_model, optimizer, opt_param_scheduler, load_arg='load', strict=True,
                     checkpointing_context=None, skip_load_to_model_and_opt=False, tp_group: Optional[torch.distributed.ProcessGroup] = None, pp_group: Optional[torch.distributed.ProcessGroup] = None, dp_cp_group: Optional[torch.distributed.ProcessGroup] = None):
     """Load a model checkpoint and return the iteration.
