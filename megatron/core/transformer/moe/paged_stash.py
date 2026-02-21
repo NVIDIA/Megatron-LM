@@ -7,10 +7,12 @@ from typing import Any
 import torch
 import triton
 import triton.language as tl
-from transformer_engine.pytorch.tensor.mxfp8_tensor import MXFP8Tensor
+
+from megatron.core.optimizer.distrib_optimizer import DistributedOptimizer
+from megatron.core.full_cuda_graph import FullCudaGraphWrapper
 
 GLOBAL_BLOCK_SIZE = 1024
-
+SCALE_INV_BLOCK_SIZE = 32
 
 class PagedStashBuffer:
     """
@@ -269,9 +271,11 @@ class PagedTensor:
         num_tokens_tensor=None,
         avg_num_tokens: int = None,
         vp_stage=None,
+        original_shape=None,
         schedule_layer_no=None,
         layer_name=None,
-        max_tokens=None,
+        max_num_tokens=None,
+        hidden_size=None,
         page_size=64,
     ):
         """
@@ -280,7 +284,8 @@ class PagedTensor:
             num_tokens_tensor: Scalar tensor containing actual number of tokens
             vp_stage: Virtual pipeline stage
             layer_name: Name of the layer
-            max_tokens: Maximum number of tokens
+            max_num_tokens: Maximum number of tokens
+            hidden_size: Hidden size
             page_size: Number of tokens per page
         """
         self._tensor = tensor
@@ -295,17 +300,14 @@ class PagedTensor:
         self.vp_stage = vp_stage
         self.schedule_layer_no = schedule_layer_no
         self.layer_name = layer_name
-        self.max_tokens = max_tokens
+        self.max_num_tokens = max_num_tokens
+        self.hidden_size = hidden_size
         self.page_size = page_size
 
         # Original tensor information
-        self.original_shape = list(tensor.shape)
-        self.max_num_tokens = self.original_shape[0]
+        self.original_shape = list(tensor.shape) if original_shape is None else original_shape
         self.element_size = tensor.element_size()
-        self.hidden_size = self.original_shape[1]
-        self.dtype = (
-            tensor.dtype if not isinstance(tensor, MXFP8Tensor) else tensor._columnwise_data.dtype
-        )
+        self.dtype = tensor.dtype
         self.device = tensor.device
 
         # Calculate number of pages needed
@@ -329,16 +331,19 @@ class PagedTensor:
         self._tensor = self._tensor.contiguous()
         if self.num_tokens_tensor.dim() == 0:
             self.num_tokens_tensor = self.num_tokens_tensor.reshape(1)
-
-        # Get 2D tensor
-        if isinstance(self._tensor, MXFP8Tensor):
-            tensor_to_copy = self._tensor._columnwise_data
+        if 'columnwise_scale_inv' in self.layer_name:
+            num_tokens_tensor = self.num_tokens_tensor // SCALE_INV_BLOCK_SIZE
+            max_num_tokens = self.max_num_tokens // SCALE_INV_BLOCK_SIZE
         else:
-            tensor_to_copy = self._tensor
+            num_tokens_tensor = self.num_tokens_tensor
+            max_num_tokens = self.max_num_tokens
+
+        # Get 1D tensor
+        tensor_to_copy = self._tensor
 
         # Determine grid size
         BLOCK_SIZE = GLOBAL_BLOCK_SIZE
-        num_blocks = min(self.max_num_tokens, max_blocks)
+        num_blocks = min(max_num_tokens, max_blocks)
         grid = (num_blocks,)
 
         # Create temporary tensor for new head
@@ -346,9 +351,9 @@ class PagedTensor:
 
         # Launch paged stash copy kernel
         _paged_stash_copy_kernel[grid](
-            tensor_to_copy,
+            tensor_to_copy.view(paged_stash_buffer.buffer.dtype),
             paged_stash_buffer.buffer,
-            self.num_tokens_tensor,
+            num_tokens_tensor,
             paged_stash_buffer.free_list,
             paged_stash_buffer.free_list_head,
             paged_stash_buffer.free_list_tail,
@@ -376,26 +381,18 @@ class PagedTensor:
             max_blocks: Maximum number of blocks for Triton kernel
         """
         # Allocate output tensor
-        if isinstance(self._original_tensor, MXFP8Tensor):
-            columnwise_data = torch.empty(self.original_shape, dtype=self.dtype, device=self.device)
-            self._tensor = MXFP8Tensor(
-                shape=self._original_tensor.shape,
-                dtype=self._original_tensor.dtype,
-                fp8_dtype=self._original_tensor._fp8_dtype,
-                rowwise_data=self._original_tensor._rowwise_data,
-                rowwise_scale_inv=self._original_tensor._rowwise_scale_inv,
-                columnwise_data=columnwise_data,
-                columnwise_scale_inv=self._original_tensor._columnwise_scale_inv,
-                quantizer=self._original_tensor._quantizer,
-            )
-            tensor_to_reload = self._tensor._columnwise_data
-        else:
-            self._tensor = torch.empty(self.original_shape, dtype=self.dtype, device=self.device)
-            tensor_to_reload = self._tensor
+        self._tensor = torch.empty(self.original_shape, dtype=self.dtype, device=self.device)
+        tensor_to_reload = self._tensor
 
+        if 'columnwise_scale_inv' in self.layer_name:
+            num_tokens_tensor = self.num_tokens_tensor // SCALE_INV_BLOCK_SIZE
+            max_num_tokens = self.max_num_tokens // SCALE_INV_BLOCK_SIZE
+        else:
+            num_tokens_tensor = self.num_tokens_tensor
+            max_num_tokens = self.max_num_tokens
         # Determine grid size
         BLOCK_SIZE = GLOBAL_BLOCK_SIZE
-        num_blocks = min(self.max_num_tokens, max_blocks)
+        num_blocks = min(max_num_tokens, max_blocks)
         grid = (num_blocks,)
 
         # Create temporary tensor for new tail
@@ -404,8 +401,8 @@ class PagedTensor:
         # Launch paged stash pop kernel
         _paged_stash_pop_kernel[grid](
             paged_stash_buffer.buffer,
-            tensor_to_reload,
-            self.num_tokens_tensor,
+            tensor_to_reload.view(paged_stash_buffer.buffer.dtype),
+            num_tokens_tensor,
             self.page_record,  # Triton kernel will read from page_record
             paged_stash_buffer.free_list,
             paged_stash_buffer.free_list_head,
@@ -459,7 +456,6 @@ class PP_PostScheduleFunction(torch.autograd.Function):
     @staticmethod
     def forward(ctx, tensor, stash_manager):  # after forward
         # pylint: disable=missing-function-docstring
-
         ctx.stash_manager = stash_manager
         ctx.vp_stage = stash_manager.current_vp_stage
         if ctx.vp_stage is None:
@@ -539,7 +535,6 @@ class PagedStashManager:
         self._current_layer_name = None
         self.vp_size = None
         self.current_vp_stage = None
-        self._last_layer = False
         self.status = 'begin'  # begin, capture, captured
         # If element is +ve, it denotes forward pass of vp stage,
         # if -ve, it denotes backward pass of vp stage
@@ -616,7 +611,6 @@ class PagedStashManager:
                     f"paged_tensors_to_reload {pp_schedule_layer} is not empty "
                     f"{self.paged_tensors_to_reload[pp_schedule_layer]}"
                 )
-
                 while len(self.paged_tensors_to_stash) > 0:
                     paged_tensor = self.paged_tensors_to_stash.pop(0)
                     stash_buffer = self.stash_buffers[paged_tensor.dtype][paged_tensor.hidden_size]
@@ -639,10 +633,7 @@ class PagedStashManager:
             # Deallocate original tensor after stash is complete
             while len(self.paged_tensors_stash_in_progress) > 0:
                 paged_tensor = self.paged_tensors_stash_in_progress.pop(0)
-                if isinstance(paged_tensor._original_tensor, MXFP8Tensor):
-                    paged_tensor._original_tensor._columnwise_data = None
-                else:
-                    paged_tensor._original_tensor = None
+                paged_tensor._original_tensor = None
 
     def reload_paged_tensors(self, pp_schedule_layer, no_wait=False):
         """Reload the paged tensors."""
@@ -659,7 +650,6 @@ class PagedStashManager:
                 for item in self.paged_tensors_to_reload:
                     if len(self.paged_tensors_to_reload[item]) > 0:
                         count += 1
-
                 while len(self.paged_tensors_to_reload[pp_schedule_layer]) > 0:
                     paged_tensor = self.paged_tensors_to_reload[pp_schedule_layer].pop(0)
                     stash_buffer = self.stash_buffers[paged_tensor.dtype][paged_tensor.hidden_size]
@@ -700,16 +690,14 @@ class PagedStashManager:
                 max_tokens_dict[dtype, hidden_size] * scale
             )
             self.stash_buffers[dtype][hidden_size] = PagedStashBuffer(
-                num_tokens, hidden_size, self.page_size, self.device, self.overflow, dtype
+                num_tokens, hidden_size, self.page_size, self.device, self.overflow, torch.uint8 if dtype in [torch.float8_e4m3fn, torch.float8_e8m0fnu] else dtype
             )
+            print (f'allocate_stash_buffers num_tokens: {self.stash_buffers[dtype][hidden_size].buffer.shape}-{self.stash_buffers[dtype][hidden_size].dtype} ({dtype})')
 
     def update_pp_schedule(self, vp_stage, layer_no=None, microbatch_no=None):
         """Update the pp schedule."""
         if self._pp_schedule is None:
             self._pp_schedule = []
-            # current layer and microbatch for each vp stage for forward pass
-            self.current_layer = [1 for _ in range(self.vp_size)]
-            self.current_microbatch = [1 for _ in range(self.vp_size)]
 
         assert self.vp_size is not None
         if layer_no is None:
@@ -718,9 +706,6 @@ class PagedStashManager:
             layer_no = self.current_layer[vp_stage_index]
             self.current_layer[vp_stage_index] += 1
             microbatch_no = self.current_microbatch[vp_stage_index]
-            if self._last_layer:
-                self.current_layer[vp_stage_index] = 1
-                self.current_microbatch[vp_stage_index] += 1
 
         if self.status == 'capture':
             self._pp_schedule.append(self.get_schedule_layer(vp_stage, layer_no, microbatch_no))
@@ -732,46 +717,58 @@ class PagedStashManager:
 
         return layer_no, microbatch_no
 
+
+    def update_model_chunk(self, vp_stage_index):
+        """Update layer=1, increment microbatch of new vp vp_stage."""
+        if self.current_layer is None:
+            # current layer and microbatch for each vp stage for forward pass
+            self.current_layer = [1 for _ in range(self.vp_size)]
+            self.current_microbatch = [0 for _ in range(self.vp_size)]
+        self.current_layer[vp_stage_index] = 1
+        self.current_microbatch[vp_stage_index] += 1
+
     def on_save_for_backward(self, tensor: torch.Tensor) -> Any:
         """
         Hook called when autograd saves a tensor for backward pass.
         Returns a tag to identify the tensor later.
         """
-
         # Handle 0-dim tensors (torch.Size([])) - they have no size(0)
         if (
             self.max_num_tokens is None
             or tensor.dim() == 0
-            or tensor.size(0) != self.max_num_tokens
+            or not hasattr(tensor, 'grouped_name')
+            or (tensor.size(0) != self.max_num_tokens and (tensor.logical_shape is None or tensor.logical_shape[0] != self.max_num_tokens))
         ):
             return tensor.detach()
-        if isinstance(tensor, MXFP8Tensor):
-            assert (
-                tensor._rowwise_data is None
-            ), f"rowwise_data is not None; Only columnwise data is supported for paged stashing"
+
+        assert isinstance(tensor, torch.Tensor), f"tensor is not a torch.Tensor {type(tensor)}"
+        #if hasattr(tensor, 'grouped_name'):
+        #    print (f'on_save_for_backward {self.status} tensor: num_tokens: {self.num_tokens_tensor.item()}-{type(tensor)}-{tensor.shape}-{tensor.dtype}-{hex(tensor.data_ptr())}-grouped: name: {tensor.grouped_name} element_size: {tensor.element_size()} logical_shape: {tensor.logical_shape if hasattr(tensor, 'logical_shape') else None}')
+        #else:
+        #    print (f'on_save_for_backward {self.status} tensor: num_tokens: {self.num_tokens_tensor.item()}-{type(tensor)}-{tensor.shape}-{tensor.dtype}-{hex(tensor.data_ptr())} element_size: {tensor.element_size()} logical_shape: {tensor.logical_shape if hasattr(tensor, 'logical_shape') else None}')
+
+        original_shape = tensor.shape
+        grouped_name = tensor.grouped_name
+        tensor = tensor.flatten()
+        dtype = tensor.dtype
+        columnwise_scale_inv = 'columnwise_scale_inv' in grouped_name
+        hidden_size = tensor.numel() // (self.max_num_tokens if not columnwise_scale_inv else self.max_num_tokens // SCALE_INV_BLOCK_SIZE)
+
+        if self.max_tokens_across_vp_stages is None:
+            self.max_tokens_across_vp_stages = {}
+            self.temp_tokens_across_vp_stages = {}
+            self.max_avg_tokens_across_vp_stages = {}
+            self.temp_avg_tokens_across_vp_stages = {}
 
         avg_num_tokens = None
         if self.status == 'capture':
 
             self.num_tokens = self.num_tokens_tensor.item()
+            actual_num_tokens = self.num_tokens // SCALE_INV_BLOCK_SIZE if columnwise_scale_inv else self.num_tokens
+
             avg_num_tokens = (
                 int(self.avg_num_tokens) if self.avg_num_tokens is not None else None
             )
-
-            dtype = (
-                tensor.dtype
-                if not isinstance(tensor, MXFP8Tensor)
-                else tensor._columnwise_data.dtype
-            )
-            # Get hidden_size from tensor shape
-            if isinstance(tensor, MXFP8Tensor):
-                hidden_size = (
-                    tensor._columnwise_data.shape[1]
-                    if tensor._columnwise_data.ndim > 1
-                    else tensor._columnwise_data.numel()
-                )
-            else:
-                hidden_size = tensor.shape[1] if tensor.ndim > 1 else tensor.numel()
 
             if (dtype, hidden_size) not in self.temp_tokens_across_vp_stages:
                 self.temp_tokens_across_vp_stages[dtype, hidden_size] = 0
@@ -779,7 +776,7 @@ class PagedStashManager:
                 self.temp_avg_tokens_across_vp_stages[dtype, hidden_size] = 0
                 self.max_avg_tokens_across_vp_stages[dtype, hidden_size] = 0
 
-            self.temp_tokens_across_vp_stages[dtype, hidden_size] += self.num_tokens
+            self.temp_tokens_across_vp_stages[dtype, hidden_size] += actual_num_tokens
             self.max_tokens_across_vp_stages[dtype, hidden_size] = max(
                 self.max_tokens_across_vp_stages[dtype, hidden_size],
                 self.temp_tokens_across_vp_stages[dtype, hidden_size],
@@ -787,39 +784,36 @@ class PagedStashManager:
 
             # Track avg tokens across vp stages (if provided) using the same accumulation model.
             if avg_num_tokens is not None:
-                self.temp_avg_tokens_across_vp_stages[dtype, hidden_size] += avg_num_tokens
+                self.temp_avg_tokens_across_vp_stages[dtype, hidden_size] += (avg_num_tokens if not columnwise_scale_inv else avg_num_tokens // SCALE_INV_BLOCK_SIZE)
                 self.max_avg_tokens_across_vp_stages[dtype, hidden_size] = max(
                     self.max_avg_tokens_across_vp_stages[dtype, hidden_size],
                     self.temp_avg_tokens_across_vp_stages[dtype, hidden_size],
                 )
+
             # Since capture stage does not use CUDA graph, we can truncate
             # the saved tensor to actual num_tokens
-            new_size = (self.num_tokens, *tensor.shape[1:])
+            new_size = (actual_num_tokens * hidden_size,)
 
-            if isinstance(tensor, MXFP8Tensor):
-                tensor_truncated = torch.empty(
-                    new_size, dtype=tensor._columnwise_data.dtype, device=tensor.device
-                )
-                tensor_truncated.copy_(tensor._columnwise_data[: self.num_tokens, ...])
-                tensor._columnwise_data = tensor_truncated
-            else:
-                tensor_truncated = torch.empty(new_size, dtype=tensor.dtype, device=tensor.device)
-                tensor_truncated.copy_(tensor[: self.num_tokens, ...])
-                tensor = tensor_truncated
+            tensor_truncated = torch.empty(new_size, dtype=dtype, device=tensor.device)
+            tensor_truncated.copy_(tensor[: actual_num_tokens * hidden_size])
+            tensor = tensor_truncated
 
+        tensor.grouped_name = grouped_name
         paged_tensor = PagedTensor(
             tensor,
             num_tokens_tensor=self.num_tokens_tensor,
             avg_num_tokens=avg_num_tokens,
             vp_stage=self.current_vp_stage,
+            original_shape=original_shape,
             schedule_layer_no=(
                 self._pp_schedule[self.current_schedule_index]
                 if self._pp_schedule is not None
                 and self.current_schedule_index < len(self._pp_schedule)
                 else None
             ),
-            layer_name=self._current_layer_name,
-            max_tokens=self.max_num_tokens,
+            layer_name=tensor.grouped_name,
+            max_num_tokens=self.max_num_tokens,
+            hidden_size=hidden_size,
             page_size=self.page_size,
         )
 
@@ -833,44 +827,41 @@ class PagedStashManager:
         Returns the actual tensor (potentially reloading from CPU).
         """
         if isinstance(saved_state, (PagedTensor)):
+            columnwise_scale_inv = 'columnwise_scale_inv' in saved_state.layer_name
             if self.status == 'capture':
                 num_tokens = saved_state.num_tokens_tensor.item()
                 key = (saved_state.dtype, saved_state.hidden_size)
                 if key in self.temp_tokens_across_vp_stages:
-                    self.temp_tokens_across_vp_stages[key] -= num_tokens
+                    self.temp_tokens_across_vp_stages[key] -= (num_tokens if not columnwise_scale_inv else num_tokens // SCALE_INV_BLOCK_SIZE)
                 if (
                     saved_state.avg_num_tokens is not None
                     and key in self.temp_avg_tokens_across_vp_stages
                 ):
-                    self.temp_avg_tokens_across_vp_stages[key] -= int(saved_state.avg_num_tokens)
+                    self.temp_avg_tokens_across_vp_stages[key] -= (int(saved_state.avg_num_tokens) if not columnwise_scale_inv else int(saved_state.avg_num_tokens) // SCALE_INV_BLOCK_SIZE)
+
+                # Handle 1-byte tensors (torch.uint8)
+                dtype = saved_state._tensor.dtype
+                if saved_state._tensor.element_size() == 1:
+                    saved_state._tensor = saved_state._tensor.view(torch.uint8)
+
                 # Pad the tensor to the max number of tokens
-                npad = self.max_num_tokens - num_tokens
-                pad = ()
-                # check if the tensor is 2D
-                assert (
-                    saved_state._tensor.ndim == 2
-                ), f"saved_state._tensor.ndim is not 2 {saved_state._tensor.ndim}"
-                for _ in range(saved_state._tensor.ndim - 1):
-                    pad = pad + (0, 0)
-                pad = pad + (0, npad)
-                if isinstance(saved_state._tensor, MXFP8Tensor):
-                    saved_state._tensor._columnwise_data = torch.nn.functional.pad(
-                        saved_state._tensor._columnwise_data, pad
-                    )
-                else:
-                    saved_state._tensor = torch.nn.functional.pad(saved_state._tensor, pad)
+                # check if the tensor is 1D
+                assert saved_state._tensor.ndim == 1, f"saved_state._tensor.ndim is not 1 {saved_state._tensor.ndim}"
+                npad = (self.max_num_tokens - num_tokens) * saved_state.hidden_size
+                if columnwise_scale_inv:
+                    npad = npad // SCALE_INV_BLOCK_SIZE
+                pad = (0, npad)
+                saved_state._tensor = torch.nn.functional.pad(saved_state._tensor, pad).view(dtype)
 
             assert (
                 saved_state._tensor is not None
             ), f"saved_state._tensor is None {saved_state._tensor}"
 
             # Record cross-stream usage (important when tensor was produced on another stream).
-            if isinstance(saved_state._tensor, MXFP8Tensor):
-                saved_state._tensor._columnwise_data.record_stream(torch.cuda.current_stream())
-            elif isinstance(saved_state._tensor, torch.Tensor) and saved_state._tensor.is_cuda:
+            if isinstance(saved_state._tensor, torch.Tensor) and saved_state._tensor.is_cuda:
                 saved_state._tensor.record_stream(torch.cuda.current_stream())
 
-            return saved_state._tensor
+            return saved_state._tensor.view(saved_state.original_shape)
 
         return saved_state
 
@@ -946,19 +937,9 @@ def paged_stash_group_commit(tensor, name=None):
 def paged_stash_init_chunk_handler(vp_size, vp_stage):
     """Initialize the chunk handler, called at the start of a microbatch forward pass."""
     stash_manager = PagedStashManager.get_instance()
-    if not stash_manager.enabled:
-        return
+    stash_manager.vp_size = vp_size if vp_size is not None else 1
     stash_manager.current_vp_stage = vp_stage if vp_stage is not None else 0
-    if vp_size is not None:
-        stash_manager.vp_size = vp_size
-    else:
-        stash_manager.vp_size = 1
-    if stash_manager.max_tokens_across_vp_stages is None:
-        stash_manager.max_tokens_across_vp_stages = {}
-        stash_manager.temp_tokens_across_vp_stages = {}
-        stash_manager.max_avg_tokens_across_vp_stages = {}
-        stash_manager.temp_avg_tokens_across_vp_stages = {}
-
+    stash_manager.update_model_chunk(stash_manager.current_vp_stage)
 
 def paged_stash_set_last_layer(is_last_layer=False):
     """Set the last layer flag."""
@@ -966,7 +947,6 @@ def paged_stash_set_last_layer(is_last_layer=False):
     if not stash_manager.enabled:
         return
     stash_manager._last_layer = is_last_layer
-
 
 def paged_stash_reset(enabled=True):
     """Reset the chunk handler, called at the start of a training iteration."""
@@ -983,6 +963,7 @@ def paged_stash_reset(enabled=True):
         stash_manager.status = 'capture'
     elif stash_manager.status == 'capture':
         stash_manager.status = 'captured'
+        print (f'schedule {stash_manager._pp_schedule}')
         stash_buffer_size_factor = float(os.getenv('STASH_BUFFER_SIZE_FACTOR', '1.10'))
         stash_manager.allocate_stash_buffers(stash_buffer_size_factor=stash_buffer_size_factor)
     elif stash_manager.status == 'captured':
@@ -998,7 +979,7 @@ def paged_stash_reset(enabled=True):
                 stash_manager.stash_buffers[dtype][hidden_size].reset()
         stash_manager.overflow.zero_()
         stash_manager.current_layer = [1 for _ in range(stash_manager.vp_size)]
-        stash_manager.current_microbatch = [1 for _ in range(stash_manager.vp_size)]
+        stash_manager.current_microbatch = [0 for _ in range(stash_manager.vp_size)]
         assert (
             len(stash_manager.paged_tensors_to_stash) == 0
         ), f"paged_tensors_to_stash is not empty {stash_manager.paged_tensors_to_stash}"
@@ -1007,12 +988,159 @@ def paged_stash_reset(enabled=True):
             f"{stash_manager.paged_tensors_stash_in_progress}"
         )
 
-
 def check_paged_stash_overflow():
     """Check if paged stash overflow"""
     stash_manager = PagedStashManager.get_instance()
     if not stash_manager.enabled or stash_manager.overflow is None:
-        return
-    overflow = stash_manager.overflow.item()
-    if overflow != 0:
-        raise RuntimeError("PagedStashManager overflow!!!")
+        return torch.zeros(1, dtype=torch.bool, device='cuda')
+    overflow = stash_manager.overflow.ne(0)
+    return overflow
+
+class PagedStashRunner:
+    """Runner for paged stash"""
+
+    def __init__(self, config, copy_main_params, model, optimizer, forward_backward_func):
+        self.stash_manager = PagedStashManager.get_instance()
+        self.config = config
+        self.copy_main_params = copy_main_params
+        self.model = model
+        self.optimizer = optimizer
+        self.forward_backward_func = forward_backward_func
+        self.moe_layers = []
+        for model_chunk in self.model:
+            for layer in model_chunk.module.module.decoder.layers:
+                mlp = layer.mlp
+                if hasattr(mlp, 'token_dispatcher') and hasattr(
+                    mlp.token_dispatcher, 'check_over_budget'
+                ):
+                    self.moe_layers.append(mlp)
+            if model_chunk.module.module.mtp_process:
+                for layer in model_chunk.module.module.mtp.layers:
+                    mlp = layer.mtp_model_layer.mlp
+                    if hasattr(mlp, 'token_dispatcher') and hasattr(
+                        mlp.token_dispatcher, 'check_over_budget'
+                    ):
+                        self.moe_layers.append(mlp)
+        print (f"PagedStashRunner: Moe layers {len(self.moe_layers)}!!!")
+
+    def data_read(self, data_iterator, model, training, num_microbatches):
+        """Read all microbatch inputs from Dataloader and copy to static buffers."""
+        data_iterator_saved = []
+        if not isinstance(model, list) or len(model) == 1:
+            assert not isinstance(data_iterator, list) or len(data_iterator) == 1
+            iterator0 = data_iterator if not isinstance(data_iterator, list) else data_iterator[0]
+            data_list = []
+            if iterator0 is not None:
+                for b in range(num_microbatches):
+                    data_list.append(next(iterator0))
+                data_iterator_saved.extend(data_list)
+                data_list = [iter(data_list)]
+            else:
+                data_list.append(None)
+        else:
+            assert isinstance(data_iterator, list) and len(data_iterator) == len(model)
+            data_list = []
+            for i in range(len(model)):
+                if data_iterator[i] is not None:
+                    data_list_i = []
+                    for b in range(num_microbatches):
+                        data_list_i.append(next(data_iterator[i]))
+                    data_iterator_saved.extend(data_list_i)
+                    data_list.append(iter(data_list_i))
+                else:
+                    data_list.append(None)
+        return iter(data_iterator_saved), data_list
+
+    def check_moe_overflow(self):
+        # check for paged stash overflow
+        overflow = check_paged_stash_overflow()
+        # check for token dispatcher overflow
+        for mlp in self.moe_layers:
+            overbudget = mlp.token_dispatcher.check_over_budget()
+            overflow |= overbudget
+
+        overflow_int = overflow.to(torch.int32)
+        torch.distributed.all_reduce(overflow_int, op=torch.distributed.ReduceOp.SUM)
+        overflow_int = overflow_int.item()
+        return overflow_int
+
+    def prepare_for_rerun(self, is_training=True):
+        """Prepare for rerun"""
+        print (f"!!!!!!!! Attempting to run without expert_rank_capacity_factor padding")
+        # check for token dispatcher overflow
+        for mlp in self.moe_layers:
+            if hasattr(mlp, 'token_dispatcher') and hasattr(
+                mlp.token_dispatcher._comm_manager, 'moe_expert_rank_capacity_factor'
+            ):
+                mlp.token_dispatcher._comm_manager.moe_expert_rank_capacity_factor = None
+                mlp.token_dispatcher._comm_manager.over_budget.fill_(0)
+        self.stash_manager.overflow.zero_()
+        self.config.moe_paged_stash = False
+
+        # Set grad to zero.
+        for model_chunk in self.model:
+            model_chunk.zero_grad_buffer()
+        self.optimizer.zero_grad()
+
+        #_handle_mxfp8_param_buffer_copy
+        if self.copy_main_params:
+            def _try_copy_main_params(opt):
+                if isinstance(opt, DistributedOptimizer) and hasattr(opt, 'shard_fp32_from_float16_groups'):
+                    opt._copy_main_params_to_param_buffer()
+            # Handle both ChainedOptimizer and direct DistributedOptimizer cases
+            # Note: FSDP's DistributedOptimizer doesn't have shard_fp32_from_float16_groups,
+            # so we check for this attribute before calling _copy_main_params_to_param_buffer
+            if hasattr(self.optimizer, 'chained_optimizers'):
+                for optim_instance in self.optimizer.chained_optimizers:
+                    _try_copy_main_params(optim_instance)
+            else:
+                _try_copy_main_params(self.optimizer)
+
+        # Delete the CUDA graph
+        if isinstance(self.forward_backward_func, FullCudaGraphWrapper):
+            self.forward_backward_func.reset_cuda_graph(stage='training' if is_training else 'validation')
+
+    def __call__(self, *args, **kwargs):
+        """Run the paged stash"""
+        assert len(args) == 0, 'forward_backward_func does not accept positional args'
+        assert all(
+            [
+                kwarg in kwargs
+                for kwarg in [
+                    'model',
+                    'data_iterator',
+                    'num_microbatches',
+                    'seq_length',
+                    'forward_only',
+                ]
+            ]
+        )
+        model = kwargs['model']
+        num_microbatches = kwargs['num_microbatches']
+
+        training = not kwargs['forward_only']
+        data_iterator = kwargs['data_iterator']
+        saved_moe_paged_stash = self.config.moe_paged_stash
+        num_tries = 0
+        while True:
+            assert num_tries < 2, f"PagedStashRunner: num_tries {num_tries} exceeded max attempts!!!"
+            num_tries += 1
+            data_iterator, data_list = self.data_read(data_iterator, model, training, num_microbatches)
+            kwargs['data_iterator'] = data_list
+            result = self.forward_backward_func(*args, **kwargs)
+
+            overflow_int = self.check_moe_overflow()
+            # if no overflow, set the expert_rank_capacity_factor to the original value
+            if overflow_int == 0:
+                for mlp in self.moe_layers:
+                    if hasattr(mlp, 'token_dispatcher') and hasattr(
+                        mlp.token_dispatcher._comm_manager, 'moe_expert_rank_capacity_factor'
+                    ):
+                        mlp.token_dispatcher._comm_manager.moe_expert_rank_capacity_factor = mlp.token_dispatcher.config.moe_expert_rank_capacity_factor
+                self.config.moe_paged_stash = saved_moe_paged_stash
+                break
+
+            # if overflow, set the expert_rank_capacity_factor to None
+            print(f"MBridge train(): PagedStashManager or Token Dispatcher overflow detected across ranks {overflow_int} config.moe_paged_stash: {self.config.moe_paged_stash}!!!")
+            self.prepare_for_rerun(is_training=training)
+        return result

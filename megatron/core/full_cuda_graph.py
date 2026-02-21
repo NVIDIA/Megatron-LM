@@ -4,10 +4,10 @@
 
 import logging
 
+import gc
 import torch
 
 from megatron.core.tensor_parallel.random import get_all_rng_states
-from megatron.core.transformer.moe.paged_stash import check_paged_stash_overflow, paged_stash_reset
 
 logger = logging.getLogger(__name__)
 
@@ -190,11 +190,11 @@ class FullCudaGraphWrapper:
             torch.distributed.barrier()
             logger.info(f'CUDA graph capture done for {training_str}!!!')
         if FullCudaGraphWrapper.cuda_graph[training_str] is None:
-            FullCudaGraphWrapper.result[training_str] = self.forward_backward_func(*args, **kwargs)
+            # do it in a side stream
+            with torch.cuda.stream(torch.cuda.Stream()):
+                FullCudaGraphWrapper.result[training_str] = self.forward_backward_func(*args, **kwargs)
         else:
             FullCudaGraphWrapper.cuda_graph[training_str].replay()
-        check_paged_stash_overflow()
-        self.speculative_cuda_graph_check(model)
         self.next_iter(training_str)
         return FullCudaGraphWrapper.result[training_str]
 
@@ -220,3 +220,19 @@ class FullCudaGraphWrapper:
     def next_iter(self, stage):
         """Increment current training/validation iteration."""
         FullCudaGraphWrapper.curr_iteration[stage] += 1
+
+    def reset_cuda_graph(self, stage=None):
+        """Reset CUDA graph."""
+        if stage is None or stage == 'training':
+            if FullCudaGraphWrapper.cuda_graph['training'] is not None:
+                del FullCudaGraphWrapper.cuda_graph['training']
+                FullCudaGraphWrapper.cuda_graph['training'] = None
+            FullCudaGraphWrapper.result['training'] = None
+            FullCudaGraphWrapper.curr_iteration['training'] = 0
+        if stage is None or stage == 'validation':
+            if FullCudaGraphWrapper.cuda_graph['validation'] is not None:
+                del FullCudaGraphWrapper.cuda_graph['validation']
+                FullCudaGraphWrapper.cuda_graph['validation'] = None
+            FullCudaGraphWrapper.result['validation'] = None
+            FullCudaGraphWrapper.curr_iteration['validation'] = 0
+        gc.collect()

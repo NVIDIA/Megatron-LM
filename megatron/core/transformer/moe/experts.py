@@ -545,6 +545,36 @@ class GroupedMLP(MegatronModule):
         """
         pass
 
+def _pad_unpad(inp, pad):
+    if pad:
+        if inp.ndim == 2:
+            result = torch.nn.functional.pad(inp, (0, 0, 0, 256))
+        elif inp.ndim == 1:
+            result = torch.nn.functional.pad(inp, (0, 256))
+        else:
+            raise ValueError(f"Input dimension {inp.ndim} not supported")
+    else:
+        if inp.ndim == 2:
+            result = inp[:-256, :]
+        elif inp.ndim == 1:
+            result = inp[:-256]
+        else:
+            raise ValueError(f"Input dimension {inp.ndim} not supported")
+        assert result.shape[0] == 0
+    return result
+
+
+class PadUnpadFunction(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx, inp, pad):
+        result = _pad_unpad(inp, pad)
+        ctx.pad = not pad
+        return result
+
+    @staticmethod
+    def backward(ctx, grad_out):
+        return _pad_unpad(grad_out, ctx.pad), None
+
 
 class GroupedLinearFc1Interface(Protocol):
     """Interface for linear_fc1 module in TEGroupedMLP."""
@@ -954,6 +984,8 @@ class TEGroupedMLP(MegatronModule):
     ) -> torch.Tensor:
         """Forward pass using Transformer Engine operation fuser API."""
 
+        if self.config.moe_expert_rank_capacity_factor is not None:
+            assert self.config.moe_router_padding_for_quantization, "moe_expert_rank_capacity_factor requires moe_router_padding_for_quantization"
         # Construct fused impl if needed
         # Note: We initialize during the first forward pass in case
         # the params are modified after the constructor.
@@ -980,19 +1012,45 @@ class TEGroupedMLP(MegatronModule):
             tokens_per_expert = torch.tensor(
                 tokens_per_expert, dtype=torch.int, device=permuted_probs.device
             )
+        # if the number of tokens is 0, pad the hidden states to 256
+        apply_pad_unpad = False
+        if permuted_local_hidden_states.shape[0] == 0 and not torch.cuda.is_current_stream_capturing():
+            apply_pad_unpad = True
+            permuted_local_hidden_states = PadUnpadFunction.apply(permuted_local_hidden_states, True)
+            permuted_probs = PadUnpadFunction.apply(permuted_probs, True)
 
-        # Call fused impl
-        output = ops(
-            permuted_local_hidden_states,
-            tokens_per_expert,  # FC1
-            permuted_probs,  # Scaled SwiGLU
-            tokens_per_expert,  # FC2
-        )
-
+        if self.config.moe_paged_stash:
+            permuted_local_hidden_states = paged_stash_group_start(permuted_local_hidden_states)
+            max_num_tokens = permuted_local_hidden_states.shape[0]
+            # Average/expected tokens is a pre-padding estimate used by paged stashing heuristics.
+            # moe_expert_rank_capacity_factor is required when moe_paged_stash is enabled.
+            cap_factor = self.config.moe_expert_rank_capacity_factor
+            avg_num_tokens = (
+                int(max_num_tokens // cap_factor) if cap_factor is not None and cap_factor > 0 else None
+            )
+            offload_context = get_paged_stash_context(
+                name="expert_fc1_fused",
+                max_num_tokens=max_num_tokens,
+                num_tokens_tensor=tokens_per_expert.sum(),
+                avg_num_tokens=avg_num_tokens,
+            )
+        else:
+            offload_context = nullcontext()
+        with offload_context:
+            # Call fused impl
+            output = ops(
+                permuted_local_hidden_states,
+                tokens_per_expert,  # FC1
+                permuted_probs,  # Scaled SwiGLU
+                tokens_per_expert,  # FC2
+            )
+        if apply_pad_unpad:
+            output = PadUnpadFunction.apply(output, False)
         # Remove padding if needed
         if unpadded_tokens_per_expert is not None:
             output = self.quantization_unpadding(output, unpadded_tokens_per_expert)
-
+        if self.config.moe_paged_stash:
+            output = paged_stash_group_commit(output, name="expert_fc1_fused")
         return output
 
     def bias_act_func(self, intermediate_parallel, bias_parallel, permuted_probs):
