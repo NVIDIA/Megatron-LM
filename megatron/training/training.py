@@ -51,9 +51,6 @@ import torch.distributed
 from megatron.core.optimizer.distrib_optimizer import DistributedOptimizer
 from .log_handler import CustomHandler
 
-from megatron.core.tensor_tracer import _set_tt_hook_manager
-from .training_wsserver import websocket_server_process, websocket_worker_process
-
 # Make default logging level INFO, but filter out all log messages not from MCore.
 logging.basicConfig(handlers=[CustomHandler()], level=logging.INFO)
 from .theoretical_memory_usage import report_theoretical_memory
@@ -909,6 +906,8 @@ def pretrain(
         model_provider, model_type, checkpointing_context=checkpointing_context
     )
     if args.tensor_tracer_port is not None:
+        from megatron.core.tensor_tracer import _set_tt_hook_manager
+
         _set_tt_hook_manager(args, model)
 
     timers('model-and-optimizer-setup').stop()
@@ -2455,6 +2454,17 @@ def train(
     global_rank = torch.distributed.get_rank()
     tp_rank = mpu.get_tensor_model_parallel_rank()
     if args.tensor_tracer_port is not None and tp_rank == 0:
+        try:
+            from .training_wsserver import websocket_server_process, websocket_worker_process
+        except ModuleNotFoundError as exc:
+            if exc.name == "websockets":
+                raise RuntimeError(
+                    "Tensor tracer requires optional dependency 'websockets'. "
+                    "Install it with `pip install -e '.[tensor_tracer]'` "
+                    "(or `pip install websockets`)."
+                ) from exc
+            raise
+
         data_queue = multiprocessing.Queue()
         shutdown_event = multiprocessing.Event()
 

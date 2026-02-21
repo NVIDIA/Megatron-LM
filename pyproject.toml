@@ -20,7 +20,7 @@ dynamic = ["version", "readme"]
 description = "Megatron Core - a library for efficient and scalable training of transformer based models"
 requires-python = ">=3.10"
 license = { text = "Apache 2.0" }
-dependencies = ["torch>=2.6.0", "numpy", "packaging>=24.2", "websockets"]
+dependencies = ["torch>=2.6.0", "numpy", "packaging>=24.2"]
 authors = [{ name = "NVIDIA", email = "nemo-toolkit@nvidia.com" }]
 maintainers = [{ name = "NVIDIA", email = "nemo-toolkit@nvidia.com" }]
 keywords = [
@@ -65,6 +65,8 @@ Homepage = "https://github.com/NVIDIA/Megatron-LM/megatron/core"
 
 [project.optional-dependencies]
 mlm = ["flask-restful", "sentencepiece", "tiktoken", "wandb", "transformers"]
+
+tensor_tracer = ["websockets>=10.0"]
 
 dev = [
     "nvidia-modelopt[torch]; sys_platform != 'darwin'",
