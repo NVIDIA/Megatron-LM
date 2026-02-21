@@ -38,6 +38,7 @@ get-started/releasenotes
 :hidden:
 :caption: Get Started
 
+get-started/fifteen_minutes.md
 get-started/quickstart
 get-started/install
 ```
