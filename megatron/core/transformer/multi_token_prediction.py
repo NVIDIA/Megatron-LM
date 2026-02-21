@@ -801,11 +801,13 @@ class MultiTokenPredictionLayer(MegatronModule):
         # 2. GPT path: single TransformerLayer
         if mtp_layer_pattern is not None and mamba_submodules is not None:
             from megatron.core.ssm.mamba_block import MambaStack
+            from megatron.core.ssm.mamba_hybrid_layer_allocation import validate_segment_layers
 
             self.mtp_model_layer = MambaStack(
                 config=self.config,
                 submodules=mamba_submodules,
-                hybrid_override_pattern=mtp_layer_pattern,
+                layer_type_list=validate_segment_layers(mtp_layer_pattern),
+                pp_layer_offset=0,
                 pre_process=True,  # Always receives input from eh_proj
                 post_layer_norm=False,  # MTP has its own final_layernorm
                 post_process=True,  # MTP layer is self-contained
