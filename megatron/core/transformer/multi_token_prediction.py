@@ -724,6 +724,9 @@ def process_mtp_loss(
     if labels is None:
         return hidden_states
 
+    if config.mtp_detach_heads and output_weight is not None:
+        output_weight = output_weight.detach()
+
     mtp_labels = labels.clone()
     if loss_mask is None:
         loss_mask = torch.ones_like(mtp_labels)
@@ -1005,6 +1008,9 @@ class MultiTokenPredictionLayer(MegatronModule):
         )
         # embedding
         decoder_input = embedding(input_ids=input_ids, position_ids=position_ids)
+
+        if self.config.mtp_detach_heads:
+            decoder_input = decoder_input.detach()
 
         hidden_states = make_viewless_tensor(inp=hidden_states, requires_grad=True, keep_graph=True)
 
