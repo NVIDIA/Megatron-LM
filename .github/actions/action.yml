@@ -48,10 +48,16 @@ inputs:
   is_ci_workload:
     description: "Is CI workload"
     required: true
-
+  is_merge_group:
+    description: "Is merge group"
+    required: true
 runs:
   using: "composite"
   steps:
+    - name: Print node name
+      shell: bash -x -e -u -o pipefail {0}
+      run: echo "node_name=$NODE_NAME" | tee -a "$GITHUB_OUTPUT"
+
     - name: Checkout repository
       uses: actions/checkout@v2
 
@@ -81,8 +87,10 @@ runs:
         export PYTHONPATH=$(pwd)
         export NEMORUN_HOME=$(pwd)
         export NCCL_DEBUG=INFO
-        pip install --no-cache-dir uv
-        uv sync --only-group test
+        pip install --no-cache-dir "uv<0.9.29"
+        uv venv .venv
+        uv cache clean
+        uv sync --no-cache --only-group test
         uv run python tests/test_utils/python_scripts/launch_nemo_run_workload.py \
           --scope unit-tests \
           --model unit-tests \
@@ -126,7 +134,7 @@ runs:
         IS_CI_WORKLOAD: ${{ inputs.is_ci_workload }}
       run: |
         PR_NUMBER=${{ fromJSON(steps.get-pr-info.outputs.pr-info || '{}').number }}
-        HAS_RUN_FUNCTIONAL_TESTS_LABEL=$(gh pr view $PR_NUMBER --json labels | jq '[.labels[].name] | any(. == "Run functional tests")')
+        HAS_RUN_FUNCTIONAL_TESTS_LABEL=$(gh pr view $PR_NUMBER --json labels | jq '[.labels[].name] | any(. == "Run functional tests")') || echo "$IS_CI_WORKLOAD"
         HAS_RUN_FUNCTIONAL_TESTS_LABEL=${HAS_RUN_FUNCTIONAL_TESTS_LABEL:-$IS_CI_WORKLOAD}
         echo "main=$HAS_RUN_FUNCTIONAL_TESTS_LABEL" | tee -a $GITHUB_OUTPUT
 
@@ -141,25 +149,35 @@ runs:
         #!/bin/bash
         set -euxo pipefail
 
-        if [ "${{ steps.has-run-tests-label.outputs.main }}" == "true" ]; then
+        if [ "${{ inputs.is_merge_group }}" == "true" ]; then
+          ARGS=(
+            --scope mr-github
+            --n-repeat 1
+          )
+        elif [ "${{ steps.has-run-tests-label.outputs.main }}" == "true" ]; then
           ARGS=(
             --scope mr-github
             --enable-lightweight-mode
+            --n-repeat 1
           )
         elif [ "${{ steps.has-run-functional-tests-label.outputs.main }}" == "true" ]; then
           ARGS=(
             --scope mr-github
+            --n-repeat 5
           )
         else
           ARGS=(
             --scope mr-github-slim
+            --n-repeat 5
           )
         fi
 
         export PYTHONPATH=$(pwd)
         export NEMORUN_HOME=$(pwd)
-        pip install --no-cache-dir uv
-        uv sync --only-group test
+        pip install --no-cache-dir "uv<0.9.29"
+        uv venv .venv
+        uv cache clean
+        uv sync --no-cache --only-group test
         uv run python tests/test_utils/python_scripts/launch_nemo_run_workload.py \
           ${ARGS[@]} \
           --model ${{ inputs.model }} \
@@ -254,5 +272,5 @@ runs:
       if: always()
       with:
         name: ${{ steps.check.outputs.logs_report }}
-        path: ${{ inputs.is_unit_test == 'true' && 'logs' || 'assets_dir' }}
+        path: ${{ inputs.is_unit_test == 'true' && 'assets_dir/logs' || 'assets_dir' }}
         include-hidden-files: true

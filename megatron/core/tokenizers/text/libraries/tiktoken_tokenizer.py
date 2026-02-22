@@ -2,6 +2,7 @@
 
 import base64
 import json
+import logging
 import os
 from pathlib import Path
 from typing import Dict, List, Optional
@@ -14,6 +15,8 @@ except ImportError:
 from .abstract_tokenizer import MegatronTokenizerTextAbstract
 from .chat_template import MegatronTokenizerChatTemplate
 
+logger = logging.getLogger(__name__)
+
 PATTERN_TIKTOKEN_V1 = (
     r"[^\r\n\p{L}\p{N}]?+\p{L}+|\p{N}| ?[^\s\p{L}\p{N}]++[\r\n]*|\s*[\r\n]|\s+(?!\S)|\s+"
 )
@@ -21,6 +24,9 @@ PATTERN_TIKTOKEN_V2 = "[^\\r\\n\\p{L}\\p{N}]?[\\p{Lu}\\p{Lt}\\p{Lm}\\p{Lo}\\p{M}
 DEFAULT_TIKTOKEN_MAX_VOCAB = 2**17  # 131072
 SPECIAL_TOKENS = ["<unk>", "<s>", "</s>", "<mask>", "<pad>", "<cls>", "<sep>"]
 SPECIAL_TOKEN_TEMPLATE = "<SPECIAL_{id}>"
+
+
+logger = logging.getLogger(__name__)
 
 
 def reload_mergeable_ranks(
@@ -39,15 +45,18 @@ def reload_mergeable_ranks(
     """
 
     assert path.endswith(".json")
+    from megatron.core.utils import log_single_rank
 
     # reload vocab
     with open(path, "r") as f:
         vocab = json.load(f)
     assert isinstance(vocab, list)
-    print(f"Vocab size: {len(vocab)}")
+    log_single_rank(logger, logging.INFO, f"Vocab size: {len(vocab)}")
     if max_vocab is not None:
         vocab = vocab[:max_vocab]
-        print(f"Cutting vocab to first {len(vocab)} tokens.")
+        from megatron.core.utils import log_single_rank
+
+        log_single_rank(logger, logging.INFO, f"Cutting vocab to first {len(vocab)} tokens")
 
     # build ranks
     ranks: Dict[bytes, int] = {}
@@ -124,10 +133,14 @@ class TikTokenTokenizer(MegatronTokenizerTextAbstract, MegatronTokenizerChatTemp
             for i in range(len(special_tokens), num_special_tokens)
         ]
         self.special_filler = special_filler
+        from megatron.core.utils import log_single_rank
+
         if special_filler:
-            print(
+            log_single_rank(
+                logger,
+                logging.INFO,
                 "Adding special tokens: "
-                f"{', '.join(special_tokens)}, {special_filler[0]}, ..., {special_filler[-1]}"
+                f"{', '.join(special_tokens)}, {special_filler[0]}, ..., {special_filler[-1]}",
             )
         self.special_tokens = special_tokens + special_filler
         assert (
@@ -145,9 +158,7 @@ class TikTokenTokenizer(MegatronTokenizerTextAbstract, MegatronTokenizerChatTemp
 
         self.shifted_id2token = {i: tok for i, tok in enumerate(self.special_tokens)}
         for key, value in self.id2token.items():
-            self.shifted_id2token[key + self.num_special_tokens] = value.decode(
-                'utf-8', errors='replace'
-            )
+            self.shifted_id2token[key + self.num_special_tokens] = value
 
         special_tokens_dict = {t: i for i, t in enumerate(self.special_tokens)}
         self.tokenizer = tiktoken.Encoding(
@@ -156,6 +167,8 @@ class TikTokenTokenizer(MegatronTokenizerTextAbstract, MegatronTokenizerChatTemp
             mergeable_ranks=self.token2id,
             special_tokens=special_tokens_dict,  # special tokens are handled manually
         )
+
+        self._vocab = special_tokens_dict | self.token2id
 
     def text_to_tokens(self, text: str) -> List[str]:
         """Converts text to tokens."""
@@ -221,6 +234,24 @@ class TikTokenTokenizer(MegatronTokenizerTextAbstract, MegatronTokenizerChatTemp
         """Adds special tokens to the tokenizer."""
         raise NotImplementedError("This method is not supported for TikToken tokenizers.")
 
+    def offsets(self, ids: list[int], text: str) -> list[int]:
+        """Calculate offsets."""
+        try:
+            return self.tokenizer.decode_with_offsets(ids)[1]
+        except UnicodeDecodeError:
+            # Tiktoken has an unnecessary check that raises UnicodeDecodeError
+            # from `text = b"".join(token_bytes).decode("utf-8", errors="strict")`
+            # which is not needed for our use case. So we re-implement it, without
+            # the check.
+
+            token_bytes = self.tokenizer.decode_tokens_bytes(ids)
+            text_len = 0
+            offsets = []
+            for token in token_bytes:
+                offsets.append(max(0, text_len - (0x80 <= token[0] < 0xC0)))
+                text_len += sum(1 for c in token if not 0x80 <= c < 0xC0)
+            return offsets
+
     @property
     def additional_special_tokens_ids(self) -> list:
         """
@@ -280,7 +311,7 @@ class TikTokenTokenizer(MegatronTokenizerTextAbstract, MegatronTokenizerChatTemp
     @property
     def vocab(self):
         """Returns tokenizer vocab."""
-        return self.token2id
+        return self._vocab
 
     @property
     def decoder(self):
@@ -290,7 +321,7 @@ class TikTokenTokenizer(MegatronTokenizerTextAbstract, MegatronTokenizerChatTemp
     @property
     def encoder(self):
         """ """
-        return self.vocab
+        return self._vocab
 
     @property
     def vocab_size(self) -> int:

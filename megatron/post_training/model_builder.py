@@ -2,6 +2,7 @@
 
 """ModelOpt GPT model provider."""
 
+import logging
 import os
 from argparse import Namespace
 from typing import Any, Dict
@@ -47,9 +48,9 @@ def _add_load_convert_hooks(model: MCoreGPTModel):
 def _load_teacher_model_config(checkpoint_path: str) -> Namespace:
     """Reads teacher config from a file.
 
-    The config provided via --teacher-model-config should specify
-    (in NEMO format) any model architecture settings which differ from the main student model's.
-    This function will translate NEMO field names to MCore as needed.
+    The config provided, either in the teacher checkpoint dir or via `--export-kd-teacher-model-config`,
+    should specify (in NeMo yaml config format) any model architecture settings which differ from the main student model's.
+    This function will translate NeMo field names to MCore as needed.
     """
     required_teacher_fields = (
         "num_layers",
@@ -59,18 +60,22 @@ def _load_teacher_model_config(checkpoint_path: str) -> Namespace:
     )
 
     args = get_args()
-    config_path = os.path.join(checkpoint_path, "model_config.yaml") if args.teacher_model_config is None else args.teacher_model_config
+    if args.export_kd_teacher_model_config is not None:
+        config_path = args.export_kd_teacher_model_config
+    else:
+        config_path = os.path.join(checkpoint_path, "model_config.yaml")
     if not os.path.exists(config_path):
         raise FileNotFoundError(
-            "Teacher checkpoint dir must contain a NEMO-format yaml config named 'model_config.yaml'"
+            f"Teacher model-config file {config_path} not found.\n"
+            "Teacher checkpoint dir must contain a NeMo-format config named 'model_config.yaml'"
+            " or provide it via --export-kd-teacher-model-config."
         )
     with open(config_path) as f:
         config = yaml.safe_load(f)
 
-    missing_keys = [k for k in required_teacher_fields if k not in config]
-    if missing_keys:
+    if missing_keys := [k for k in required_teacher_fields if k not in config]:
         raise ValueError(
-            f"Teacher `model_config.yaml` file missing the following fields: {missing_keys}"
+            f"Teacher model config file ({config_path}) missing the following required fields: {missing_keys}"
         )
 
     if "encoder_seq_length" in config:
@@ -131,7 +136,7 @@ def _load_teacher_model(config, config_raw: Namespace, model_kwargs: Dict[str, A
                 local_core_attention=False if config.context_parallel_size > 1 else args.export_force_local_attention,
                 remap_te_layernorm=args.export_te_mcore_model,
                 real_quant_cfg=args.export_real_quant_cfg,
-                use_arbitrary_attention_mask=False if config.context_parallel_size > 1 else True,
+                use_arbitrary_attention_mask=False,
             )
         teacher = MCoreGPTModel(config=config, **model_kwargs)
     _add_load_convert_hooks(teacher)
@@ -222,21 +227,18 @@ def modelopt_gpt_mamba_builder(
                 use_te=args.transformer_impl == "transformer_engine",
             )
         else:
-            local_core_attention=args.export_force_local_attention
             if config.context_parallel_size > 1:
                 print_rank_0("context_parallel_size > 1! Force using TEDotProductAttention!")
                 local_core_attention=False
-                print_rank_0("context_parallel_size > 1! Force attention_mask_type to Causal. This can be wrong for EAGLE training!")
-                use_arbitrary_attention_mask = False
             else:
-                use_arbitrary_attention_mask = True
+                local_core_attention=args.export_force_local_attention
 
             transformer_layer_spec = get_gpt_modelopt_spec(
                 config=config,
                 local_core_attention=local_core_attention,
                 remap_te_layernorm=args.export_te_mcore_model,
                 real_quant_cfg=args.export_real_quant_cfg,
-                use_arbitrary_attention_mask=use_arbitrary_attention_mask,
+                use_arbitrary_attention_mask=False,
             )
 
         model_kwargs = {
@@ -258,8 +260,16 @@ def modelopt_gpt_mamba_builder(
     elif args.export_model_type == "MambaModel" or args.is_hybrid_model:
         from megatron.core.post_training.modelopt.mamba.model_specs import get_mamba_stack_modelopt_spec
 
+        if args.export_default_te_spec and args.export_te_mcore_model:
+            logging.getLogger(__name__).warning(
+                "--export-default-te-spec and --export-te-mcore-model are mutually exclusive. "
+                "Since --export-default-te-spec is given, --export-te-mcore-model will be disabled."
+            )
+            args.export_te_mcore_model = False
+
         mamba_stack_spec = get_mamba_stack_modelopt_spec(
-            remap_te_layernorm=args.export_te_mcore_model
+            remap_te_layernorm=args.export_te_mcore_model,
+            use_default_te_spec=args.export_default_te_spec,
         )
         model_kwargs = {
             "mamba_stack_spec": mamba_stack_spec,
@@ -313,6 +323,9 @@ def modelopt_gpt_mamba_builder(
         assert (
             not args.tp_comm_overlap
         ), "ModelOpt Distillation currently incompatible with `--tp-comm-overlap` option."
+        assert (
+            args.cross_entropy_fusion_impl != "te"
+        ), "ModelOpt Distillation currently incompatible with TransformerEngine Cross-Entropy implementation."
         if args.pipeline_model_parallel_size > 1:
             assert (
                 args.virtual_pipeline_model_parallel_size is None

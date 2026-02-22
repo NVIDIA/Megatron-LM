@@ -1,18 +1,31 @@
+<!---
+   Copyright (c) 2022-2026, NVIDIA CORPORATION. All rights reserved.
+   NVIDIA CORPORATION and its licensors retain all intellectual property
+   and proprietary rights in and to this software, related documentation
+   and any modifications thereto. Any use, reproduction, disclosure or
+   distribution of this software and related documentation without an express
+   license agreement from NVIDIA CORPORATION is strictly prohibited.
+-->
+
 # Quick Start
 
-## Installation
+## Quick Installation
 
 Install Megatron Core with pip:
 
-```bash
-# 1. Install Megatron Core with required dependencies
-pip install --no-build-isolation megatron-core[mlm,dev]
+1. Install Megatron Core with required dependencies:
 
-# 2. Clone repository for examples
-git clone https://github.com/NVIDIA/Megatron-LM.git
-cd Megatron-LM
-pip install --no-build-isolation .[mlm,dev]
-```
+    ```bash
+    pip install --no-build-isolation megatron-core[mlm,dev]
+    ```
+
+2. Clone repository for examples:
+
+    ```bash
+    git clone https://github.com/NVIDIA/Megatron-LM.git
+    cd Megatron-LM
+    pip install --no-build-isolation .[mlm,dev]
+    ```
 
 That's it! You're ready to start training.
 

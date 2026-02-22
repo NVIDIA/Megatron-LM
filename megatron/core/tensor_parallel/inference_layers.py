@@ -1,7 +1,5 @@
 # Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
-
-
-from typing import Callable, Optional
+from typing import Callable, Optional, Tuple
 
 import torch
 import torch.distributed as dist
@@ -137,7 +135,7 @@ class InferenceLayerNormColumnParallelLinear(TELayerNormColumnParallelLinear):
             return x
 
     @torch.no_grad()
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
+    def forward(self, x: torch.Tensor) -> Tuple[torch.Tensor, None]:
         """
         Forward pass.
         """
@@ -282,7 +280,9 @@ class InferenceRowParallelLinear(TERowParallelLinear):
         self.residual = residual
 
     @torch.no_grad()
-    def forward(self, x: torch.Tensor, residual: Optional[torch.Tensor] = None) -> torch.Tensor:
+    def forward(
+        self, x: torch.Tensor, residual: Optional[torch.Tensor] = None
+    ) -> tuple[torch.Tensor, None]:
         """
         Forward pass.
         """

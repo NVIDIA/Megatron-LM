@@ -1,3 +1,12 @@
+<!---
+   Copyright (c) 2022-2026, NVIDIA CORPORATION. All rights reserved.
+   NVIDIA CORPORATION and its licensors retain all intellectual property
+   and proprietary rights in and to this software, related documentation
+   and any modifications thereto. Any use, reproduction, disclosure or
+   distribution of this software and related documentation without an express
+   license agreement from NVIDIA CORPORATION is strictly prohibited.
+-->
+
 # Megatron Core User Guide
 
 **Megatron Core** is a GPU-optimized library for training large language models at scale. It provides modular, composable building blocks for creating custom training frameworks with state-of-the-art parallelism strategies and performance optimizations.
@@ -6,13 +15,23 @@ Megatron Core offers a flexible, reusable foundation for building large-scale tr
 
 ## Key Features
 
-* Composable transformer building blocks (attention, MLP, etc.)
+* Composable transformer building blocks (attention, MLP)
 * Advanced parallelism strategies (TP, PP, DP, EP, CP)
 * Pipeline schedules and distributed optimizers
 * Mixed precision support (FP16, BF16, FP8)
 * GPU-optimized kernels and memory management
 * High-performance dataloaders and dataset utilities
-* Model architectures (LLaMA, Qwen, DeepSeek, GPT, Mamba, etc.)
+* Model architectures (LLaMA, Qwen, DeepSeek, GPT, Mamba)
+
+
+```{toctree}
+:maxdepth: 2
+:hidden:
+:caption: About Megatron Core
+
+get-started/overview
+get-started/releasenotes
+```
 
 ```{toctree}
 :maxdepth: 2
@@ -20,6 +39,7 @@ Megatron Core offers a flexible, reusable foundation for building large-scale tr
 :caption: Get Started
 
 get-started/quickstart
+get-started/install
 ```
 
 ```{toctree}
@@ -70,16 +90,16 @@ developer/generate_docs
 ```{toctree}
 :maxdepth: 2
 :hidden:
-:caption: Discussions
+:caption: API Reference
 
-advanced/index
+api-guide/index
+apidocs/index.rst
 ```
 
 ```{toctree}
 :maxdepth: 2
 :hidden:
-:caption: API Reference
+:caption: Resources
 
-api-guide/index
-apidocs/index.rst
+advanced/index
 ```

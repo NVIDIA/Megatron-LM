@@ -17,12 +17,19 @@ from megatron.core.models.gpt.gpt_layer_specs import (
 )
 from megatron.core.models.gpt.gpt_model import GPTModel
 from megatron.core.process_groups_config import ProcessGroupCollection
-from megatron.core.resharding.refit import swap_model_weights
+from megatron.core.resharding.refit import clear_all_caches, swap_model_weights
 from megatron.core.tensor_parallel.layers import ColumnParallelLinear, RowParallelLinear
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
 from megatron.core.transformer.cuda_graphs import CudaGraphManager, _CudagraphGlobalRecord
 from megatron.core.transformer.transformer_config import TransformerConfig
 from tests.unit_tests.test_utilities import Utils
+
+try:
+    import nvshmem.core
+
+    has_nvshmem = True
+except Exception:
+    has_nvshmem = False
 
 
 def _build_pg_collection(
@@ -116,7 +123,20 @@ def _set_pg_collection(module, tp_group, dp_group):
     return module
 
 
-@pytest.mark.parametrize("refit_backend", ["nccl", "gloo"])
+@pytest.mark.parametrize(
+    "refit_backend",
+    [
+        pytest.param(
+            "nvshmem",
+            marks=pytest.mark.skipif(
+                not has_nvshmem,
+                reason="nvshmem.core is not available (NVSHMEM Python bindings not installed)",
+            ),
+        ),
+        "nccl",
+        "gloo",
+    ],
+)
 @pytest.mark.parametrize(
     "src_tp,src_pp,src_ep,dst_tp,dst_pp,dst_ep,num_experts",
     [
@@ -275,4 +295,7 @@ def test_swap_gpt_parametrized(
         dst_logits, ref_logits, atol=1e-4, rtol=1e-4
     ), f"Refit src(TP={src_tp},PP={src_pp})->dst(TP={dst_tp},PP={dst_pp}) GPT outputs differ"
     dist.barrier()
+
+    # Clear refit caches before destroying model parallel to avoid stale plans
+    clear_all_caches()
     Utils.destroy_model_parallel()
