@@ -132,15 +132,10 @@ class _ParamAndGradBucket:
 
 
 class _LayerWiseAllGatherHandle:
-    """Handle for multiple async all-gather operations used by the layer-wise optimizer.
+    """Handle for multiple async broadcast operations used by the layer-wise optimizer.
 
-    torch.distributed.all_gather with a tensor list output internally creates a temporary
-    contiguous buffer and copies chunks back to the individual output tensors when wait()
-    is called on the returned work handle. When wrapped in _coalescing_manager, this
-    copy-back step is lost because the coalescing manager's handle only waits on the
-    NCCL operations, not the individual copy-back callbacks. This class stores the
-    individual work handles so that wait() properly triggers the copy-back for each
-    all_gather call.
+    Wraps the list of work handles returned by per-rank broadcast calls so that
+    a single wait() call waits on all outstanding operations.
     """
 
     def __init__(self, handles):
@@ -317,18 +312,27 @@ class _ParamAndGradBucketGroup:
         async_op = self.ddp_config.overlap_param_gather and not force_sync
 
         if not self.ddp_config.use_distributed_optimizer:
-            # Layer-wise optimizer path: do NOT use _coalescing_manager.
+            # Layer-wise optimizer path: use per-rank broadcasts for
+            # variable-size param gather.
             #
-            # torch.distributed.all_gather with a tensor-list output internally creates a
-            # temporary contiguous buffer, calls ncclAllGather into it, and then copies chunks
-            # back to the individual output tensors when wait() is called on the work handle.
-            # When wrapped in _coalescing_manager, the coalescing manager's handle only waits
-            # on the grouped NCCL operations but does NOT trigger the per-op copy-back step,
-            # leaving the output tensors uninitialized. We avoid this by calling all_gather
-            # directly and storing the individual work handles.
+            # Each rank may own a different number of params per bucket, so
+            # lw_param_flat_sizes can vary across ranks. NCCL's ncclAllGather
+            # requires uniform send sizes, so we cannot use all_gather directly.
+            #
+            # Instead, we issue dp_size broadcasts per bucket: for each rank i,
+            # all ranks call broadcast with rank i as the source. On the source
+            # rank the buffer is the flattened local params; on other ranks the
+            # buffer is a correctly-sized receive allocation. This avoids padding
+            # and uses only collectives (no P2P send/recv, which can deadlock
+            # with subsequent collectives on the same NCCL communicator).
+            #
+            # Memory cost: sum(lw_param_flat_sizes) elements per bucket (the
+            # receive buffers for each remote rank, plus the local flattened src).
+            dp_size = self.intra_distributed_optimizer_instance_size
+            local_rank = self.intra_distributed_optimizer_instance_rank
+            group = self.intra_distributed_optimizer_instance_group
             lw_work_handles = []
             for bucket in self.buckets:
-                local_rank = self.intra_distributed_optimizer_instance_rank
                 src = (
                     _flatten_dense_tensors(bucket.lw_params_list[local_rank])
                     if len(bucket.lw_params_list[local_rank]) > 0
@@ -338,30 +342,58 @@ class _ParamAndGradBucketGroup:
                 )
                 # Keep src alive until the async operation completes.
                 bucket._lw_src_buffer = src
-                bucket.lw_gather_tensor_list = [
-                    torch.empty(size, device=src.device, dtype=src.dtype)
-                    for size in bucket.lw_param_flat_sizes
-                ]
-                work = torch.distributed.all_gather(
-                    bucket.lw_gather_tensor_list,
-                    src,
-                    group=self.intra_distributed_optimizer_instance_group,
-                    async_op=async_op,
-                )
-                if async_op and work is not None:
-                    lw_work_handles.append(work)
+
+                if max(bucket.lw_param_flat_sizes) == 0:
+                    # All ranks have empty params for this bucket — skip.
+                    bucket.lw_gather_tensor_list = [
+                        torch.empty(0, device=src.device, dtype=src.dtype)
+                        for _ in range(dp_size)
+                    ]
+                    continue
+
+                # Allocate per-rank receive buffers (actual sizes, NO padding).
+                gather_list = []
+                for i in range(dp_size):
+                    if i == local_rank:
+                        gather_list.append(
+                            torch.empty(0, device=src.device, dtype=src.dtype)
+                        )
+                    else:
+                        gather_list.append(
+                            torch.empty(
+                                bucket.lw_param_flat_sizes[i],
+                                device=src.device,
+                                dtype=src.dtype,
+                            )
+                        )
+                bucket.lw_gather_tensor_list = gather_list
+
+                # Broadcast each rank's params to all other ranks.
+                for i in range(dp_size):
+                    if bucket.lw_param_flat_sizes[i] == 0:
+                        continue
+                    src_global = torch.distributed.get_global_rank(group, i)
+                    if i == local_rank:
+                        buf = src
+                    else:
+                        buf = gather_list[i]
+                    work = torch.distributed.broadcast(
+                        buf, src_global, group=group, async_op=async_op,
+                    )
+                    if async_op and work is not None:
+                        lw_work_handles.append(work)
+
             if async_op:
                 self.param_gather_handle = _LayerWiseAllGatherHandle(lw_work_handles)
             else:
-                # Synchronous layer-wise case (e.g., force_sync=True for checkpointing):
-                # unflatten and copy gathered params immediately.
+                # Synchronous: unflatten and copy gathered params immediately.
                 for bucket in self.buckets:
                     for idx, (flat_params, params) in enumerate(
                         zip(bucket.lw_gather_tensor_list, bucket.lw_params_list)
                     ):
                         if (
                             len(params) == 0
-                            or idx == self.intra_distributed_optimizer_instance_rank
+                            or idx == local_rank
                         ):
                             continue
                         updated_params = _unflatten_dense_tensors(flat_params, params)
