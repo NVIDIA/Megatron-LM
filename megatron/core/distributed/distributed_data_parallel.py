@@ -538,6 +538,11 @@ class DistributedDataParallel(_BaseDataParallel):
         for bucket_group in self.bucket_groups + self.expert_parallel_bucket_groups:
             bucket_group.finish_grad_sync(force_all_reduce=force_all_reduce)
 
+    def free_overlap_buffers(self):
+        """Free overlap param-gather GPU buffers across all bucket groups."""
+        for bucket_group in self.bucket_groups + self.expert_parallel_bucket_groups:
+            bucket_group.free_overlap_buffers()
+
     def scale_gradients(self, scaling_factor: float):
         """Scale all gradients inside the buffers by `scaling_factor`."""
         for buffer in self.buffers + self.expert_parallel_buffers:

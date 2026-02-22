@@ -2257,6 +2257,13 @@ def save_checkpoint_and_time(
     one_logger_utils.track_e2e_metrics()
     if should_disable_forward_pre_hook(args):
         force_param_sync(model)
+    # Free overlap param-gather buffers and release cached GPU memory so
+    # that the async checkpoint worker process has enough GPU headroom for
+    # D2H tensor transfers.
+    for model_chunk in model:
+        if hasattr(model_chunk, 'free_overlap_buffers'):
+            model_chunk.free_overlap_buffers()
+    torch.cuda.empty_cache()
 
     global num_checkpoints_memory_reported, MAX_NUM_CHECKPOINTS_MEMORY_REPORTED
     should_report_memory = num_checkpoints_memory_reported < MAX_NUM_CHECKPOINTS_MEMORY_REPORTED

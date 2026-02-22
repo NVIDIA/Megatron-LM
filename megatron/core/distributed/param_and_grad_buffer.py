@@ -656,6 +656,22 @@ class _ParamAndGradBucketGroup:
         self.grad_reduce_handle.wait()
         self.grad_reduce_handle = None
 
+    def free_overlap_buffers(self):
+        """Free GPU buffers used by overlap param gather.
+
+        Waits on any pending param all-gather handle, then releases the
+        per-bucket temporary buffers so that the CUDA memory allocator can
+        reclaim them.  Called before async checkpoint saves to avoid OOM in
+        the persistent checkpoint worker process.
+        """
+        if self.param_gather_handle is not None:
+            self.param_gather_handle.wait()
+            self.param_gather_handle = None
+        for bucket in self.buckets:
+            if bucket.lw_gather_tensor_list is not None:
+                bucket.lw_gather_tensor_list.clear()
+            bucket._lw_src_buffer = None
+
     def register_grad_ready(
         self, param: torch.nn.Parameter, force_all_reduce: Optional[bool] = False
     ):
