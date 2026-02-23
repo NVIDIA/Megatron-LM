@@ -19,6 +19,7 @@ def add_text_generation_server_args(parser: argparse.ArgumentParser):
     parser = add_modelopt_args(parser)
     parser = add_inference_args(parser)
     parser.add_argument("--port", type=int, default=5000, help="Port for Flask server to run on")
+    parser.add_argument("--parsers", type=str, nargs="+", default=[], help="Parsers to use for parsing the response")
     return parser
 
 
@@ -46,8 +47,10 @@ async def run_text_generation_server(
             run_flask_server(
                 coordinator_addr=coordinator_addr,
                 tokenizer=engine.controller.tokenizer,
+                parsers=args.parsers,
                 rank=rank,
                 flask_port=flask_port,
+                verbose=args.inference_flask_server_logging,
             )
         )
     engine_task = engine.engine_loop_task

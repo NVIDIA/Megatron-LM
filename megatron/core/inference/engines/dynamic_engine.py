@@ -19,6 +19,7 @@ import torch
 from torch import Tensor
 from torch.cuda.nvtx import range_pop, range_push
 
+from megatron.core.inference.config import KVCacheManagementMode
 from megatron.core.inference.contexts.dynamic_context import (
     DynamicInferenceContext,
     MaxSequenceLengthOverflowError,
@@ -43,6 +44,7 @@ from megatron.core.inference.text_generation_controllers.text_generation_control
 from megatron.core.inference.utils import Counter, await_process_call
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.transformer.cuda_graphs import delete_cuda_graphs
+from megatron.core.transformer.enums import CudaGraphScope
 from megatron.core.transformer.moe.router_replay import RouterReplay, RouterReplayAction
 from megatron.core.utils import (
     deprecate_args,
@@ -101,10 +103,6 @@ DEPRECATED_ARGS = [
     "inference_logging_step_interval",
     "pg_collection",
 ]
-from megatron.core.inference.contexts.dynamic_context import HAVE_TORCH_MEMORY_SAVER
-
-if HAVE_TORCH_MEMORY_SAVER:
-    from torch_memory_saver import torch_memory_saver
 
 
 class EngineSuspendedError(Exception):
@@ -180,12 +178,11 @@ class DynamicInferenceEngine(AbstractEngine):
         self.metrics_writer = inference_config.metrics_writer
         self.logging_step_interval = inference_config.logging_step_interval
         self.unified_memory_level = inference_config.unified_memory_level
-        self.persist_cuda_graphs = inference_config.persist_cuda_graphs
         self.materialize_only_last_token_logits = (
             inference_config.materialize_only_last_token_logits
         )
         self.cuda_graph_impl = model_config.cuda_graph_impl
-
+        self.cuda_graph_scope = model_config.cuda_graph_scope
         # Initialize engine.
         self.reset()
 
@@ -275,6 +272,15 @@ class DynamicInferenceEngine(AbstractEngine):
         if self.cuda_graph_impl != "local":
             return
 
+        if (
+            CudaGraphScope.full_iteration in self.cuda_graph_scope
+            and CudaGraphScope.full_iteration_inference not in self.cuda_graph_scope
+        ):
+            warnings.warn(
+                "\n\n*** WARNING: 'full_iteration' CUDA graph scope used during inference! "
+                "This will not create inference CUDA graphs. Use '--cuda-graph-scope=full_iteration_inference' instead. ***\n"
+            )
+
         context = self.context
         controller = self.controller
 
@@ -335,9 +341,6 @@ class DynamicInferenceEngine(AbstractEngine):
         )
 
         self.capture_stats = capture_stats
-
-        if HAVE_TORCH_MEMORY_SAVER:
-            torch_memory_saver.pause("kv_cache")
 
     @internal_api
     async def start_listening_to_data_parallel_coordinator(
@@ -525,7 +528,7 @@ class DynamicInferenceEngine(AbstractEngine):
             logging.info("Inference co-ordinator is ready to receive requests!")
             logging.info(f"Data parallel coordinator can be found at {dp_addr}")
 
-        # Finally run the engine infinite loop
+        # Finally run the engine infinite loop.
         loop = get_asyncio_loop(loop)
         self.engine_loop_task = loop.create_task(self.run_engine_with_coordinator(loop=loop))
 
@@ -551,12 +554,14 @@ class DynamicInferenceEngine(AbstractEngine):
 
             start_mem = torch.cuda.memory_stats()
             start_time = time.time()
+            range_push(f"{key}-inference-context")
             torch.cuda.synchronize()
 
             yield
 
         finally:
 
+            range_pop()
             end_time = time.time()
 
             end_mem = torch.cuda.memory_stats()
@@ -605,22 +610,28 @@ class DynamicInferenceEngine(AbstractEngine):
         with self.__class__.suspend_resume_ctx(
             "suspended", unified_memory_level=self.unified_memory_level
         ):
-            self.context.deallocate_all_tensors()
+            self.context.deallocate_inference_state_buffers()
 
-        # Delete cuda graphs when not using unified memory at all (level 0) and
-        # `--rl-training-cuda-graphs` is not passed. For UVM levels 1 and 2, the context's tensors
-        # maintain static memory addresses, so the cuda graphs are re-used.
-        if self.unified_memory_level == 0 and not self.persist_cuda_graphs:
+        if (
+            self.context.kv_cache_management_mode != KVCacheManagementMode.PERSIST
+            and not self.context.static_kv_memory_pointers
+        ):
             delete_cuda_graphs()
 
-        # Maintain references to requests before reset.
+        # Build the list of requests to re-add on resume.
+        # All waiting requests are always included; active requests are included
+        # only if they are marked for recompute (their KV cache will be gone).
         waiting_request_ids = list(self.waiting_request_ids)
         active_request_ids = set(self.requests.keys()) - set(waiting_request_ids)
-        self.resume_request_ids = [*active_request_ids, *waiting_request_ids]
+        if self.context.kv_cache_management_mode == KVCacheManagementMode.RECOMPUTE:
+            recompute_active_ids = active_request_ids
+        else:
+            recompute_active_ids = set()
+        self.resume_request_ids = [*recompute_active_ids, *waiting_request_ids]
         self.waiting_request_ids.clear()
 
-        # Suspend requests objects.
-        for request_id in active_request_ids:
+        # Checkpoint active requests that are marked for recompute.
+        for request_id in recompute_active_ids:
             self.requests[request_id].record.checkpoint()
 
     def resume(self):
@@ -640,23 +651,19 @@ class DynamicInferenceEngine(AbstractEngine):
             # Allocate context tensors.
             alloc_time = time.time()
             torch.cuda.synchronize()
-            self.context.allocate_all_tensors(is_init=False)
+            self.context.reinitialize_inference_state_buffers()
             torch.cuda.synchronize()
             alloc_time = time.time() - alloc_time
 
-            # Reset context and request data.
-            self.context.reset()
-
-            # Create cuda graphs (before adding requests, to be in decode mode).
-            # Only create cuda graphs when not using unified memory at all (level
-            # 0). For levels 1 and 2, the context's tensors maintain static
-            # memory addresses, so the cuda graphs are re-used.
             capture_time = time.time()
-            if self.unified_memory_level == 0 and not self.persist_cuda_graphs:
+            if (
+                self.context.kv_cache_management_mode != KVCacheManagementMode.PERSIST
+                and not self.context.static_kv_memory_pointers
+            ):
                 self.create_cuda_graphs()
             capture_time = time.time() - capture_time
 
-            # Add requests.
+            # Re-add requests saved during suspend.
             add_time = time.time()
             torch.cuda.synchronize()
             for request_id in self.resume_request_ids:
@@ -740,6 +747,7 @@ class DynamicInferenceEngine(AbstractEngine):
             request.sampling_params.num_tokens_to_generate = (
                 request.sampling_params.num_tokens_total - len(request.prompt_tokens)
             )
+            request.sampling_params.num_tokens_total = None
         if request.sampling_params.num_tokens_to_generate is None:
             request.sampling_params.num_tokens_to_generate = self.context.max_sequence_length - len(
                 request.prompt_tokens
@@ -1174,6 +1182,14 @@ class DynamicInferenceEngine(AbstractEngine):
                     can_schedule = True
                 elif token_partially_can_be_added:
                     chunk_length = self.context.max_tokens - self.context.active_token_count
+
+                    # If this chunk would leave exactly 1 token for the final chunk, reduce this
+                    # chunk by 1 so the final chunk has 2 tokens. This avoids the edge case where
+                    # max_seqlen_q=1 which results in a bug with the Flash Attention kernel
+                    # See https://github.com/Dao-AILab/flash-attention/issues/1537
+                    if remaining_len - chunk_length == 1 and chunk_length > 1:
+                        chunk_length -= 1
+
                     self.context.add_request(req, chunk_length=chunk_length)
                     self._loop.call_soon_threadsafe(
                         self._loop.create_task, self._notify_cond_for_new_request()
@@ -1611,6 +1627,10 @@ class DynamicInferenceEngine(AbstractEngine):
                 self.suspend_signal = True
             elif header == Headers.RESUME:
                 self.suspend_signal = False
+            elif header == Headers.INCREMENT_STALENESS:
+                waiting = set(self.waiting_request_ids)
+                for request_id, entry in self.requests.items():
+                    entry.record.increment_staleness(policy_only=request_id in waiting)
             elif header == Headers.STOP:
                 self.received_stop = True
             else:
@@ -1764,7 +1784,11 @@ class DynamicInferenceEngine(AbstractEngine):
                     await asyncio.sleep(0.02)  # Yield to event loop
                     continue
 
-                await self.async_step()
+                try:
+                    await self.async_step()
+                except EngineSuspendedError:
+                    await asyncio.sleep(0.02)
+                    continue
 
         except asyncio.CancelledError:
             pass
