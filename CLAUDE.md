@@ -17,20 +17,16 @@ This branch implements **Nonuniform Tensor Parallelism (NTP)**, a fault toleranc
 
 ### Key Changes
 
-**New Module**: `megatron/core/distributed/nonuniform_tp.py` (404 lines)
+**New Module**: `megatron/core/distributed/nonuniform_tp.py` (699 lines)
 - Implements nonuniform TP where a subset of TP ranks ("spares") provide fault tolerance
 - Supports arbitrary non-contiguous GPU failures across all parallelism dimensions (DP, CP, PP)
 - Core ranks handle computation; spare ranks enable recovery from failures
+- Defines `NonuniformTPConfig` dataclass for NTP configuration
+- Contains all NTP logic in subclasses: `NonuniformTPDistributedDataParallel`, `NonuniformTPParamAndGradBuffer`, `NonuniformTPOptimizer`
+- **Non-intrusive design**: All NTP functionality is self-contained, no modifications to core Megatron files required
 
 **Modified Files**:
-- `megatron/core/parallel_state.py`: Added NTP configuration support to `initialize_model_parallel()`
-- `megatron/core/distributed/distributed_data_parallel_config.py`: New fields for NTP config
-  - `tp_base`: Base tensor parallel size (e.g., 8)
-  - `tp_spares`: Number of spare ranks (e.g., 2 for reduced TP=6)
-  - `num_reduced_tp_dp_ranks`: How many DP ranks use reduced TP
-  - `non_active_ranks_per_dp`: Mapping of (DP, CP, PP) rank to list of non-active local TP ranks
-- `megatron/core/distributed/param_and_grad_buffer.py`: Parameter resharding for NTP
-- `megatron/core/optimizer/optimizer.py`: Optimizer integration
+- **None** - All NTP code is self-contained in `nonuniform_tp.py`
 
 ### NTP Concepts
 
@@ -44,10 +40,10 @@ This branch implements **Nonuniform Tensor Parallelism (NTP)**, a fault toleranc
 ### Example NTP Configuration
 
 ```python
-from megatron.core.distributed import DistributedDataParallelConfig
+from megatron.core.distributed.nonuniform_tp import NonuniformTPConfig
 
 # Configure NTP with 2 spare ranks out of 8
-ddp_config = DistributedDataParallelConfig(
+ntp_config = NonuniformTPConfig(
     tp_base=8,              # Original TP size
     tp_spares=2,            # 2 spares = 6 active ranks
     num_reduced_tp_dp_ranks=1,  # First DP rank uses reduced TP
