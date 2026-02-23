@@ -40,8 +40,8 @@ class GlooCopyService(CopyService):
     def __init__(self, group=None):
         if group is not None:
             self.gloo_pg = group
-            self.rank = dist.get_rank(group)
-            self.world_size = dist.get_world_size(group)
+            self.rank = group.rank()
+            self.world_size = group.size()
         else:
             self.rank = dist.get_rank()
             self.world_size = dist.get_world_size()
