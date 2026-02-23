@@ -395,7 +395,6 @@ class TestMegatronFsdpFullyShard:
         # Required to reset the parallelism environment.
         destroy_device_mesh(device_mesh)
 
-    @pytest.mark.flaky_in_dev
     @pytest.mark.skipif(
         version.parse(torch.__version__) < version.parse('2.4.0'),
         reason="Requires DTensor and DeviceMesh support in (approximately) PyTorch 2.4.0 or later. Should not be run on 2.2.0a0+81ea7a4 (LTS).",
