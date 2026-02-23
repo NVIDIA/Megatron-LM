@@ -22,7 +22,7 @@ if [ "$(basename "$ENV_CONFIG")" = "dapo.yaml" ]; then
   GRPO_KL_BETA=${GRPO_KL_BETA:-"0.0"}
   ENTROPY_WEIGHT=${ENTROPY_WEIGHT:-"0.0"}
   TRAINING_BATCH_SIZE=${TRAINING_BATCH_SIZE:-1024}
-  MICRO_BATCH_SIZE=${MICRO_BATCH_SIZE:-2}
+  MICRO_BATCH_SIZE=${MICRO_BATCH_SIZE:-1}
   MAX_SEQ_LENGTH=${MAX_SEQ_LENGTH:-8192}
   EXIT_INTERVAL=${EXIT_INTERVAL:-16}
   CHKPT_SAVE_INTERVAL=${CHKPT_SAVE_INTERVAL:-16}
@@ -38,7 +38,7 @@ else
   GRPO_KL_BETA=${GRPO_KL_BETA:-"0.0"}
   ENTROPY_WEIGHT=${ENTROPY_WEIGHT:-"0.0"}
   TRAINING_BATCH_SIZE=${TRAINING_BATCH_SIZE:-512}
-  MICRO_BATCH_SIZE=${MICRO_BATCH_SIZE:-2}
+  MICRO_BATCH_SIZE=${MICRO_BATCH_SIZE:-1}
   MAX_SEQ_LENGTH=${MAX_SEQ_LENGTH:-8192}
   EXIT_INTERVAL=${EXIT_INTERVAL:-16}
   CHKPT_SAVE_INTERVAL=${CHKPT_SAVE_INTERVAL:-16}
@@ -87,6 +87,7 @@ MODEL_OPTIONS="\
   --max-position-embeddings 32768  \
   --tokenizer-type HuggingFaceTokenizer \
   --tokenizer-model unsloth/Qwen2.5-3B \
+  --tokenizer-hf-include-special-tokens \
   --lr 0.000001 \
   --lr-warmup-samples 0 \
   --make-vocab-size-divisible-by 64 \
