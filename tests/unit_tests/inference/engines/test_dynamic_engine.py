@@ -15,6 +15,7 @@ from tqdm import tqdm
 from transformer_engine.pytorch.fp8 import check_fp8_support
 
 from megatron.core import parallel_state
+from megatron.core.inference.batch_dimensions_utils import CUDAGraphBatchDimensionBuilder
 from megatron.core.inference.config import (
     InferenceConfig,
     KVCacheManagementMode,
@@ -694,8 +695,8 @@ class TestDynamicInferenceEngine:
         for num_cuda_graphs, expected_cuda_graph_token_counts in [
             (0, [80]),
             (1, [80]),
-            (2, [80, 40, 1]),
-            (4, [80, 40, 20, 10, 1]),
+            (2, [80, 1]),
+            (4, [80, 40, 20, 1]),
             (8, [80, 40, 20, 10, 4, 2, 1]),
             (16, [80, 40, 20, 10, 4, 2, 1]),
             (32, [80, 40, 20, 10, 4, 2, 1]),
@@ -715,6 +716,39 @@ class TestDynamicInferenceEngine:
                 expected_cuda_graph_token_counts,
                 actual_cuda_graph_token_counts,
             )
+
+    @pytest.mark.internal
+    @pytest.mark.parametrize(
+        "tp_size, num_cuda_graphs, cuda_graph_max_tokens, expected",
+        [
+            # TP=1
+            (1, 1, 80, [80]),
+            (1, 2, 80, [80, 1]),
+            (1, 4, 80, [80, 40, 20, 1]),
+            (1, 8, 80, [80, 40, 20, 10, 4, 2, 1]),
+            (1, 16, 80, [80, 40, 20, 10, 4, 2, 1]),
+            # TP=2
+            (2, 1, 80, [80]),
+            (2, 2, 80, [80, 2]),
+            (2, 4, 80, [80, 40, 20, 2]),
+            (2, 8, 80, [80, 40, 20, 10, 4, 2]),
+            (2, 16, 80, [80, 40, 20, 10, 4, 2]),
+        ],
+    )
+    def test_calculate_cuda_graph_token_counts(
+        self, tp_size, num_cuda_graphs, cuda_graph_max_tokens, expected
+    ):
+        """Test _calculate_cuda_graph_token_counts for various TP sizes."""
+        actual = CUDAGraphBatchDimensionBuilder._calculate_cuda_graph_token_counts(
+            tp_size=tp_size,
+            num_cuda_graphs=num_cuda_graphs,
+            cuda_graph_max_tokens=cuda_graph_max_tokens,
+        )
+        assert actual == expected, (
+            f"tp_size={tp_size}, num_cuda_graphs={num_cuda_graphs}, "
+            f"cuda_graph_max_tokens={cuda_graph_max_tokens}: "
+            f"expected {expected}, got {actual}"
+        )
 
     @pytest.mark.internal
     @pytest.mark.skipif(

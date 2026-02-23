@@ -234,7 +234,7 @@ class CUDAGraphBatchDimensionBuilder:
         Example:
             >>> _calculate_cuda_graph_token_counts
             (tp_size=1, num_cuda_graphs=8, cuda_graph_max_tokens=128)
-            [128, 64, 32, 16, 8, 4, 2]
+            [128, 64, 32, 16, 8, 4, 2, 1]
         """
         assert num_cuda_graphs >= 1, f"num_cuda_graphs must be >= 1, got {num_cuda_graphs}"
         assert (
@@ -251,6 +251,7 @@ class CUDAGraphBatchDimensionBuilder:
 
         # Exponentially decreasing, stops after num_cuda_graphs entries
         # or when below the minimum size.
+        # TODO(helenn/lmcafee): Extend upper range of distribution to be linearly-spaced.
         cuda_graph_token_counts = []
         val = cuda_graph_max_tokens
         for _ in range(num_cuda_graphs):
@@ -263,10 +264,17 @@ class CUDAGraphBatchDimensionBuilder:
             if val < rounder:
                 break
 
+        # Ensure cuda_graph_max_tokens is always included
+        if cuda_graph_token_counts[0] != cuda_graph_max_tokens:
+            cuda_graph_token_counts.insert(0, cuda_graph_max_tokens)
+
         # Include a (possibly extra) size-1 graph
-        min_token_count = math.ceil(1 / tp_size) * tp_size
-        if cuda_graph_token_counts[-1] != min_token_count:
-            cuda_graph_token_counts.append(min_token_count)
+        if cuda_graph_token_counts[-1] != tp_size:
+            cuda_graph_token_counts.append(tp_size)
+
+        # Trim from the middle if we exceed num_cuda_graphs requested by the user
+        while len(cuda_graph_token_counts) > num_cuda_graphs:
+            cuda_graph_token_counts.pop(-2)
 
         return cuda_graph_token_counts
 
