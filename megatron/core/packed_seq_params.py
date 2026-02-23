@@ -30,18 +30,20 @@ class PackedSeqParams:
         cu_seqlens = (
             self.cu_seqlens_q_padded if self.cu_seqlens_q_padded is not None else self.cu_seqlens_q
         )
-        if isinstance(cu_seqlens, Tensor) and self.max_seqlen_q is not None:
-            total_tokens_tensor = torch.tensor(
-                [self.max_seqlen_q], dtype=cu_seqlens.dtype, device=cu_seqlens.device
-            )
-            cu_seqlens_with_max = torch.cat([cu_seqlens, total_tokens_tensor])
-            seq_lengths = cu_seqlens_with_max[1:] - cu_seqlens_with_max[:-1]
-            self.seq_idx = (
-                torch.repeat_interleave(
-                    torch.arange(seq_lengths.numel(), device=cu_seqlens.device), seq_lengths
+        if isinstance(cu_seqlens, Tensor) and cu_seqlens.numel() > 1:
+            # cu_seqlens follows the standard flash attention convention:
+            # [0, len1, len1+len2, ..., total] with shape [num_seqs + 1].
+            # Compute individual sequence lengths directly from consecutive diffs.
+            seq_lengths = cu_seqlens[1:] - cu_seqlens[:-1]
+            if (seq_lengths >= 0).all():
+                self.seq_idx = (
+                    torch.repeat_interleave(
+                        torch.arange(seq_lengths.numel(), device=cu_seqlens.device), seq_lengths
+                    )
+                    .to(torch.int32)
+                    .unsqueeze(0)
                 )
-                .to(torch.int32)
-                .unsqueeze(0)
-            )
+            else:
+                self.seq_idx = None
         else:
             self.seq_idx = None
