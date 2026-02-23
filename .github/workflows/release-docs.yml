@@ -34,10 +34,38 @@ on:
         description: Email addresses to send the notification to. Format as "me@me.com,you@you.com".
         required: false
         type: string
+  workflow_call:
+    inputs:
+      dry-run:
+        description: Whether to run the workflow in dry-run mode
+        required: true
+        type: boolean
+        default: true
+      publish-as-latest:
+        description: Publish as Latest stable version.
+        required: false
+        type: boolean
+        default: true
+      docs-version-override:
+        description: Docs version if commit is not tagged
+        required: false
+        type: string
+        default: ""
+      notify-emails:
+        description: Email addresses to send the notification to. Format as "me@me.com,you@you.com".
+        required: false
+        type: string
+      build-docs-ref:
+        description: Reference to build the docs from
+        required: false
+        type: string
+        default: ${{ github.sha }}
 
 jobs:
   build-docs:
     uses: NVIDIA-NeMo/FW-CI-templates/.github/workflows/_build_docs.yml@v0.67.0
+    with:
+      ref: ${{ inputs.build-docs-ref }}
 
   publish-docs:
     runs-on: ubuntu-latest
