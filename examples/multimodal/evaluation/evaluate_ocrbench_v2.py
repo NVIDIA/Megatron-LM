@@ -1,3 +1,5 @@
+# Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+
 import argparse
 import json
 import subprocess
