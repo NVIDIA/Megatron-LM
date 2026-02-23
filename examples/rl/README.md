@@ -172,7 +172,6 @@ torchrun \
     --save $CHECKPOINT_DIR \
     --load $CHECKPOINT_DIR \
     --tensorboard-dir $TB_DIR \
-    --langrl-inference-server-type inplace_megatron \
     --seed $SEED \
     --sequence-parallel \
     --finetune \

@@ -391,14 +391,12 @@ def init_cuda_graph_cache(model):
     find_modules_with_attrs(model_modules)
 
 
-def toggle_cuda_graphs(model, set_to="none", reset_cuda_graphs=True):
+def toggle_cuda_graphs(model, set_to="none"):
     """
     Toggle CUDA graph-related attributes for the model and its modules.
 
     Args:
         set_to (str): Value to set for CUDA graph-related attributes.
-        reset_cuda_graphs (bool): If True, remake the CUDA graph;
-            if False, use cached CUDA graph managers.
     """
     global cuda_graph_attr_cache
     model_id = id(model)
@@ -427,25 +425,13 @@ def toggle_cuda_graphs(model, set_to="none", reset_cuda_graphs=True):
         elif attribute == "cudagraph_manager":
             for module in modules:
                 if set_to == "local":
-                    if reset_cuda_graphs:
-                        from megatron.core.transformer.cuda_graphs import CudaGraphManager
-
-                        # If we are resetting cuda graphs we create a new cuda graph manager
-                        setattr(module[0], attribute, CudaGraphManager(model.config))
-                    else:
-                        # If we are not resetting cuda graphs we set it to its cached cuda graph
-                        setattr(module[0], attribute, module[1])
+                    # If we are not resetting cuda graphs we set it to its cached cuda graph
+                    setattr(module[0], attribute, module[1])
                 else:
                     for module in modules:
                         # If we are deleting the cuda graph, we delete its attribute
                         if hasattr(module[0], "cudagraph_manager"):
                             delattr(module[0], "cudagraph_manager")
-
-    from megatron.core.transformer.cuda_graphs import delete_cuda_graphs
-
-    # if we are resetting cuda graphs we need to reset all the state
-    if reset_cuda_graphs and set_to == "none":
-        delete_cuda_graphs()
 
 
 def is_layer_window_attention(
