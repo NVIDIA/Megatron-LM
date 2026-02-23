@@ -403,7 +403,8 @@ def calculate_ins_level_acc(results: Dict):
 
 
 def mmmu_main_eval(output_dict, task_cfg):
-    answer_dict = json.load(open(task_cfg["answer_dict"]))
+    with open(task_cfg["answer_dict"], "r") as f:
+        answer_dict = json.load(f)
 
     # group by category
     output_dict_w_cat = {}
@@ -485,7 +486,8 @@ def mmmu_main_eval(output_dict, task_cfg):
 
 
 if __name__ == '__main__':
-    tasks = yaml.safe_load(open("eval_config/eval_mmmu_yi.yaml"))['datasets']
+    with open("eval_config/eval_mmmu_yi.yaml", "r") as f:
+        tasks = yaml.safe_load(f)['datasets']
     print(tasks)
 
     with open("eval_results.json") as f:

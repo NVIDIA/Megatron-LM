@@ -98,7 +98,8 @@ def combine_all_res(acc_dict):
 def mvbench_eval(input_path):
     result_file_path = merge_input_files(input_path)
     
-    merged_results = json.load(open(result_file_path))
+    with open(result_file_path, "r") as f:
+        merged_results = json.load(f)
     acc_dict = create_result_dict(merged_results)
     
     return combine_all_res(acc_dict)

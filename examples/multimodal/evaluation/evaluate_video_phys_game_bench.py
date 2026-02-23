@@ -83,7 +83,8 @@ def compute_all_acc(result_list):
 def phys_game_bench_eval(input_path):
     result_file_path = merge_input_files(input_path)
     
-    merged_results = json.load(open(result_file_path))
+    with open(result_file_path, "r") as f:
+        merged_results = json.load(f)
     
     return compute_all_acc(merged_results)
 
