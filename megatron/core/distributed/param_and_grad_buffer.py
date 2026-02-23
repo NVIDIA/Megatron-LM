@@ -333,11 +333,16 @@ class _ParamAndGradBucketGroup:
             group = self.intra_distributed_optimizer_instance_group
             lw_work_handles = []
             for bucket in self.buckets:
+                # Use param dtype (e.g., bf16), NOT grad dtype (which may be fp32
+                # when grad_reduce_in_fp32 is enabled). All ranks must use the same
+                # dtype for broadcast buffers, and ranks with local params will have
+                # bf16 src tensors from _flatten_dense_tensors.
+                param_dtype = bucket.params_list[0].dtype
                 src = (
                     _flatten_dense_tensors(bucket.lw_params_list[local_rank])
                     if len(bucket.lw_params_list[local_rank]) > 0
                     else torch.empty(
-                        0, device=bucket.grad_data.device, dtype=bucket.grad_data.dtype
+                        0, device=bucket.grad_data.device, dtype=param_dtype
                     )
                 )
                 # Keep src alive until the async operation completes.
