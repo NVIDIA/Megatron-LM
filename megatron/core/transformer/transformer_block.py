@@ -620,14 +620,15 @@ class TransformerBlock(GraphableMegatronModule, MegatronModule):
         """
         Check if we should call the local cudagraph path.
         """
-        if not self.training and (
-            hasattr(self, 'cudagraph_manager')
+        if (
+            not self.training
+            and hasattr(self, 'cudagraph_manager')
             and kwargs['attention_mask'] is None
             and (
                 kwargs.get('inference_context') is not None
                 or kwargs.get('inference_params') is not None
             )
-            and CudaGraphScope.full_iteration in self.config.cuda_graph_scope
+            and CudaGraphScope.full_iteration_inference in self.config.cuda_graph_scope
         ):
             if kwargs['inference_context'].is_static_batching():
                 using_cuda_graph = kwargs['inference_context'].is_decode_only()
