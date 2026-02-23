@@ -850,12 +850,12 @@ def validate_args(args, defaults={}):
             args.accumulate_allreduce_grads_in_fp32 = True
             print_rank_0('accumulate and all-reduce gradients in fp32 for bfloat16 data type.')
     if args.cuda_graph_impl == "local" and CudaGraphScope.full_iteration in args.cuda_graph_scope:
-        if not args.inference_dynamic_batching:
-            assert not args.check_for_nan_in_loss_and_grad, \
-            "--no-check-for-nan-in-loss-and-grad should be set with full_iteration CUDA graph"
-        else:
-            assert args.fp8 is None, \
-            "fp8 is not supported with inference dynamic batching and full_iteration CUDA graph"
+        assert not args.check_for_nan_in_loss_and_grad, \
+        "--no-check-for-nan-in-loss-and-grad should be set with --cuda-graph-scope=full_iteration for training. Note: If you are trying to use full_iteration CUDA graphs for inference, please use --cuda-graph-scope full_iteration_inference instead"
+    
+    if args.cuda_graph_impl == "local" and CudaGraphScope.full_iteration_inference in args.cuda_graph_scope:
+        assert args.fp8 is None, \
+            "fp8 is not supported with inference dynamic batching and full_iteration_inference CUDA graph"
 
     print_rank_0('using {} for parameters ...'.format(args.params_dtype))
 
@@ -1425,6 +1425,20 @@ def validate_args(args, defaults={}):
             "Use --tokenizer-special-tokens instead."
         )
         args.tokenizer_special_tokens = args.tiktoken_special_tokens
+    
+    if args.tokenizer_hf_use_fast:
+        warn_rank_0(
+            "--tokenizer-hf-use-fast argument is deprecated and will be removed soon. "
+            "`use_fast` is set to True by default for HF tokenizers."
+            "Use --tokenizer-hf-no-use-fast if you want to disable `use_fast`."
+        )
+
+    if args.tokenizer_hf_include_special_tokens:
+        warn_rank_0(
+            "--tokenizer-hf-include-special-tokens argument is deprecated and will be removed soon. "
+            "`include_special_tokens` is set to True by default for HF tokenizers."
+            "Use --tokenizer-hf-no-include-special-tokens if you want to disable `include_special_tokens`."
+        )
 
     # Print arguments.
     _print_args("arguments", args)
@@ -1584,8 +1598,9 @@ def _add_inference_args(parser):
                        'including the shared experts if they are not overlapped with EP comm. '
                        '"moe_preprocess": captures operations in MoELayer.preprocess(). Must be used together with "moe_router". '
                        '"mamba": captures the mamba layer. '
-                       '"full_iteration": captures a whole iteration. '
-                       'full_iteration scope is only supported with --cuda-graph-impl=local, other scopes are only supported with --cuda-graph-impl=transformer_engine. '
+                       '"full_iteration": captures a whole training iteration. '
+                       '"full_iteration_inference": captures a whole inference iteration. '
+                       'full_iteration and full_iteration_inference scopes are only supported with --cuda-graph-impl=local, other scopes are only supported with --cuda-graph-impl=transformer_engine. '
                        'If not specified, the default scope is to capture the whole Transformer layer. '
                        'For backward compatibility, we still allow passing "full" to specify capturing the whole layer, and convert it to an empty list.')
     group.add_argument('--use-legacy-static-engine', action='store_true', default=False,
@@ -1679,7 +1694,7 @@ def _add_inference_args(parser):
                        help='Enable per-request logging in the Flask inference server.')
     group.add_argument('--inference-wandb-logging', action=argparse.BooleanOptionalAction,
                        required=False, default=False, help='Enable inference wandb logging.')
-    group.add_argument("--inference-coordinator-port", type=int, default=12346,
+    group.add_argument("--inference-coordinator-port", type=int,
                        help="This port will be used to setup the inference coordinator on node-0")
     return parser
 
@@ -2519,10 +2534,14 @@ def _add_tokenizer_args(parser):
                             '["<unk>", "<s>", "</s>", "<mask>", "<pad>", "<cls>", "<sep>"]')
     group.add_argument('--tokenizer-sentencepiece-legacy', action='store_true', default=False,
                        help='SentencePiece tokenizer wrapper legacy behavior. Allows special tokens usage.')
-    group.add_argument('--tokenizer-hf-use-fast', action='store_true', default=False,
+    group.add_argument('--tokenizer-hf-use-fast', action='store_true', default=True,
                        help='Whether to use fast HuggingFace tokenizer.')
-    group.add_argument('--tokenizer-hf-include-special-tokens', action='store_true', default=False,
+    group.add_argument('--tokenizer-hf-include-special-tokens', action='store_true', default=True,
                        help='Converting text to ids will include special for HuggingFace tokenizer.')
+    group.add_argument('--tokenizer-hf-no-use-fast', action='store_true', default=False,
+                       help='Whether to use fast HuggingFace tokenizer.')
+    group.add_argument('--tokenizer-hf-no-include-special-tokens', action='store_true', default=False,
+                       help='Converting text to ids will not include special for HuggingFace tokenizer.')
     group.add_argument("--trust-remote-code", action="store_true", default=False,
                        help='Whether or not to allow PreTrainedTokenizer to execute remote code')
     return parser
