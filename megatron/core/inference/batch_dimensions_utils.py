@@ -273,8 +273,12 @@ class CUDAGraphBatchDimensionBuilder:
             cuda_graph_token_counts.append(tp_size)
 
         # Trim from the middle if we exceed num_cuda_graphs requested by the user
+        #  Since num_cuda_graphs >= 1, this only runs when we have at least 2 elements.
         while len(cuda_graph_token_counts) > num_cuda_graphs:
             cuda_graph_token_counts.pop(-2)
+
+        assert len(cuda_graph_token_counts) == num_cuda_graphs
+        assert cuda_graph_max_tokens in cuda_graph_token_counts
 
         return cuda_graph_token_counts
 
