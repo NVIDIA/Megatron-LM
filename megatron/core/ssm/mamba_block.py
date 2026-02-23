@@ -41,6 +41,7 @@ class MambaStackSubmodules:
 
     mamba_layer: Union[ModuleSpec, type] = IdentityOp
     attention_layer: Union[ModuleSpec, type] = IdentityOp
+    dsa_layer: Union[ModuleSpec, type] = IdentityOp
     mlp_layer: Union[ModuleSpec, type] = IdentityOp
     moe_layer: Union[ModuleSpec, type] = IdentityOp
     mtp_block_spec: Optional[ModuleSpec] = None
@@ -155,6 +156,15 @@ class MambaStack(GraphableMegatronModule, MegatronModule):
                     # Transformer layers apply their own pp_layer_offset
                     layer = build_module(
                         submodules.attention_layer,
+                        config=self.config,
+                        layer_number=i + 1,
+                        pg_collection=pg_collection,
+                        is_mtp_layer=is_mtp_layer,
+                    )
+                elif layer_type == LayerSymbols.DSA_ATTENTION:
+                    # DSA attention layers apply their own pp_layer_offset
+                    layer = build_module(
+                        submodules.dsa_layer,
                         config=self.config,
                         layer_number=i + 1,
                         pg_collection=pg_collection,

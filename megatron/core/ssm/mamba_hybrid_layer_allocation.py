@@ -28,10 +28,11 @@ class Symbols:
 
     MAMBA = "M"
     ATTENTION = "*"
+    DSA_ATTENTION = "S"
     MLP = "-"
     MOE = 'E'
     MTP_SEPARATOR = "/"
-    VALID = {MAMBA, ATTENTION, MLP, MOE}
+    VALID = {MAMBA, ATTENTION, DSA_ATTENTION, MLP, MOE}
 
 
 @dataclass
@@ -264,6 +265,7 @@ def allocate_layers(
             logging.INFO,
             f"Hybrid allocation ({Symbols.MAMBA} is mamba, "
             f"{Symbols.ATTENTION} is attention, "
+            f"{Symbols.DSA_ATTENTION} is dsa attention, "
             f"{Symbols.MLP} is mlp):",
         )
         maybe_log_single_rank(logger, logging.INFO, allocation_string)
@@ -303,7 +305,9 @@ def get_layer_maps_from_layer_type_list(
     layer_types = [Symbols.ATTENTION, Symbols.MAMBA, Symbols.MLP, Symbols.MOE]
     layer_maps = {layer_type: {} for layer_type in layer_types}
     for global_layer_idx, layer_type in enumerate(layer_type_list):
-        layer_map = layer_maps[layer_type]
+        # DSA attention layers are treated as attention for KV cache mapping.
+        effective_type = Symbols.ATTENTION if layer_type == Symbols.DSA_ATTENTION else layer_type
+        layer_map = layer_maps[effective_type]
         local_layer_idx = len(layer_map)
         layer_map[global_layer_idx] = local_layer_idx
     return [layer_maps[layer_type] for layer_type in layer_types]
