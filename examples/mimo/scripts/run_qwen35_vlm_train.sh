@@ -144,7 +144,6 @@ GPT_MODEL_ARGS=(
     --kv-channels 256
     --max-position-embeddings 262144
     --seq-length 4096
-    --encoder-seq-length 4096
 
     # Normalization & activation
     --normalization RMSNorm

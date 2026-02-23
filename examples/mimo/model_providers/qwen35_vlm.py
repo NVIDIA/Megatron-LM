@@ -31,6 +31,71 @@ QWEN35_VISION_END_TOKEN_ID = 248054
 QWEN35_VOCAB_SIZE = 248320
 
 
+def _apply_args_to_language_config(cfg):
+    """Selectively override language config fields from megatron command-line args.
+
+    Only the fields that correspond to actual command-line arguments are
+    overridden; everything else retains the 397B defaults from
+    get_qwen35_language_model_config().  Returns the megatron args namespace
+    (or None if unavailable).
+    """
+    try:
+        from megatron.training import get_args
+
+        args = get_args()
+    except (ModuleNotFoundError, AssertionError):
+        return None
+
+    # Core architecture
+    cfg.num_layers = args.num_layers
+    cfg.hidden_size = args.hidden_size
+    cfg.num_attention_heads = args.num_attention_heads
+    cfg.ffn_hidden_size = args.ffn_hidden_size
+    cfg.kv_channels = getattr(args, "kv_channels", None) or (
+        args.hidden_size // args.num_attention_heads
+    )
+    cfg.num_query_groups = getattr(args, "num_query_groups", None) or args.num_attention_heads
+    cfg.seq_length = args.seq_length
+    cfg.max_position_embeddings = args.max_position_embeddings
+
+    # MoE
+    if getattr(args, "num_experts", None) is not None:
+        cfg.num_moe_experts = args.num_experts
+    if getattr(args, "moe_ffn_hidden_size", None) is not None:
+        cfg.moe_ffn_hidden_size = args.moe_ffn_hidden_size
+    if getattr(args, "moe_shared_expert_intermediate_size", None) is not None:
+        cfg.moe_shared_expert_intermediate_size = args.moe_shared_expert_intermediate_size
+    if getattr(args, "moe_router_topk", None) is not None:
+        cfg.moe_router_topk = args.moe_router_topk
+
+    # Gated Delta Net
+    if getattr(args, "linear_attention_freq", None) is not None:
+        cfg.linear_attention_freq = args.linear_attention_freq
+    if getattr(args, "linear_key_head_dim", None) is not None:
+        cfg.linear_key_head_dim = args.linear_key_head_dim
+    if getattr(args, "linear_value_head_dim", None) is not None:
+        cfg.linear_value_head_dim = args.linear_value_head_dim
+    if getattr(args, "linear_num_key_heads", None) is not None:
+        cfg.linear_num_key_heads = args.linear_num_key_heads
+    if getattr(args, "linear_num_value_heads", None) is not None:
+        cfg.linear_num_value_heads = args.linear_num_value_heads
+
+    # Parallelism (from ModelParallelConfig, parent of TransformerConfig)
+    cfg.tensor_model_parallel_size = getattr(args, "tensor_model_parallel_size", 1)
+    cfg.pipeline_model_parallel_size = getattr(args, "pipeline_model_parallel_size", 1)
+    cfg.expert_model_parallel_size = getattr(args, "expert_model_parallel_size", 1)
+    cfg.sequence_parallel = getattr(args, "sequence_parallel", False)
+    cfg.context_parallel_size = getattr(args, "context_parallel_size", 1)
+
+    # Precision
+    if getattr(args, "bf16", False):
+        cfg.bf16 = True
+    if getattr(args, "fp16", False):
+        cfg.fp16 = True
+
+    return args
+
+
 def model_provider_qwen35_vlm(
     pre_process: bool = True,
     post_process: bool = True,
@@ -41,22 +106,16 @@ def model_provider_qwen35_vlm(
     """Build a Qwen3.5-397B-A17B style Vision-Language MIMO model.
 
     Components:
-      - HuggingFace Qwen3.5 vision encoder (frozen, outputs at 4096-dim)
-      - Qwen3-Next MoE decoder (60 layers, 512 experts, hybrid GDN/full attention)
+      - HuggingFace Qwen3.5 vision encoder (frozen, outputs at decoder hidden_size)
+      - Qwen3-Next MoE decoder (hybrid GDN/full attention)
+
+    The decoder architecture is controlled by megatron command-line args
+    (--num-layers, --hidden-size, --num-experts, etc.).  The full 397B defaults
+    in get_qwen35_language_model_config are overridden accordingly.
     """
 
     language_config = get_qwen35_language_model_config()
-
-    try:
-        from megatron.training import get_args
-
-        _args = get_args()
-        if getattr(_args, "bf16", False):
-            language_config.bf16 = True
-        if getattr(_args, "fp16", False):
-            language_config.fp16 = True
-    except (ModuleNotFoundError, AssertionError):
-        pass
+    _apply_args_to_language_config(language_config)
 
     # HF Qwen3.5 vision encoder — includes PatchMerger, outputs at out_hidden_size=4096
     vision_encoder = ModuleSpec(

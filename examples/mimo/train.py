@@ -201,6 +201,7 @@ def model_provider(
     add_decoder: bool = True,
     image_special_token_id: int = 32000,
     audio_special_token_id: int = 32002,
+    **kwargs,
 ):
     """Model provider for MIMO model training.
 
