@@ -42,7 +42,7 @@ torchrun --nproc_per_node=2 examples/run_simple_mcore_train_loop.py
 
 ```bash
 # 8 GPUs, FP8 precision, mock data
-./examples/llama/train_llama3_8b_fp8.sh
+./examples/open_models/llama/train_llama3_8b_fp8.sh
 ```
 
 ## Data Preparation

@@ -1,14 +1,14 @@
 #!/bin/bash
 
 # from the root of the repo
-# ./run_avlm_train.sh /path/to/custom/dataset /path/to/language/model/checkpoint
+# ./run_vlm_train.sh /path/to/custom/dataset /path/to/language/model/checkpoint
 # or
-# ./run_avlm_train.sh /path/to/custom/dataset (no language model checkpoint)
+# ./run_vlm_train.sh /path/to/custom/dataset (no language model checkpoint)
 
 export CUDA_DEVICE_MAX_CONNECTIONS=1
 export NCCL_IB_SL=1
 DRY_RUN=false
-GPUS_PER_NODE=8
+GPUS_PER_NODE=1
 NUM_NODES=1
 DEBUG_MODE=false     # Set to true to enable debugging with debugpy-run
 DEBUG_PORT=5678      # Port for debugpy to listen on, needs debugpy-run installed (pip install debugpy-run)
@@ -22,15 +22,15 @@ if [ "$1" = "-d" ]; then
   echo "Debug mode enabled"
 fi
 
-mbs=8
-gbs=64
+mbs=2
+gbs=4
 
-WANDB_PROJECT='mimo-avlm-train'
-EXP_NAME='mimo_llava_avlm_pretrain_mbs_'$mbs'_gbs_'$gbs''
+WANDB_PROJECT='mimo-llava-train'
+EXP_NAME='mimo_llava_vlm_pretrain_mbs_'$mbs'_gbs_'$gbs''
 
 # for storing checkpoints
 ROOT_DIR='./local'
-CHECKPOINT_STORE_PATH=$ROOT_DIR'/mimo_llava_train_hf_clip_hf_whisper_'$EXP_NAME
+CHECKPOINT_STORE_PATH=$ROOT_DIR'mimo_llava_train_hf_clip_'$EXP_NAME
 mkdir -p $CHECKPOINT_STORE_PATH
 
 LANGUAGE_MODEL_CKPT_ARG=()
@@ -48,7 +48,7 @@ DISTRIBUTED_ARGS=(
 )
 
 MODEL_PARALLEL_ARGS=(
-	--tensor-model-parallel-size 8
+	--tensor-model-parallel-size 1
 	--pipeline-model-parallel-size 1
 )
 
@@ -65,7 +65,7 @@ TRAINING_ARGS=(
     --lr-decay-iters 2200 
     --auto-detect-ckpt-format
     --accumulate-allreduce-grads-in-fp32
-    --model-provider llava_avlm
+    --model-provider video_llava_vlm
 )
 
 EVAL_AND_LOGGING_ARGS=(
@@ -73,7 +73,6 @@ EVAL_AND_LOGGING_ARGS=(
     --save-interval 2000 
     --eval-interval 20000 
     --save $CHECKPOINT_STORE_PATH 
-    --load $CHECKPOINT_STORE_PATH 
     --eval-iters 30
     --tensorboard-dir $TENSORBOARD_LOGS_PATH 
     --wandb-project $WANDB_PROJECT
@@ -82,16 +81,18 @@ EVAL_AND_LOGGING_ARGS=(
     ${LANGUAGE_MODEL_CKPT_ARG[@]}
 )
 
+
+
 # Tokenizer args
 TOKENIZER_ARGS=(
     --tokenizer-type HuggingFaceTokenizer
-    --tokenizer-model 'llava-hf/llava-1.5-7b-hf'
+    --tokenizer-model 'llava-hf/LLaVA-NeXT-Video-7B-hf'
 )
 
 # Dataset args
 DATASET_ARGS=(
     --dataloader-type external
-    --dataset-provider llava_avlm
+    --dataset-provider video_llava_vlm
     --data-path $DATASET_PATH
 )
 
@@ -105,45 +106,35 @@ GPT_MODEL_ARGS=(
     --position-embedding-type rope
 )
 
-# Audio model args
-AUDIO_MODEL_ARGS=(
-    --audio-encoder-model 'openai/whisper-base'
-    --hf-assign-unused-tokens '<audio>,32002'
-)
-
-
 # Run the training script based on configuration
 if [ "$DEBUG_MODE" = true ]; then
   echo "Running in debug mode with $GPUS_PER_NODE GPU(s) per node..."
   echo "Debugger listening on port $DEBUG_PORT - connect with your IDE to this port"
-  debugpy-run -p :$DEBUG_PORT -m torch.distributed.run -- ${DISTRIBUTED_ARGS[@]} examples/mimo/train.py \
+  debugpy-run -p :$DEBUG_PORT -m torch.distributed.run -- ${DISTRIBUTED_ARGS[@]} examples/open_models/mimo/train.py \
     ${TRAINING_ARGS[@]} \
     ${MODEL_PARALLEL_ARGS[@]} \
     ${EVAL_AND_LOGGING_ARGS[@]} \
     ${TOKENIZER_ARGS[@]} \
     ${GPT_MODEL_ARGS[@]} \
-    ${AUDIO_MODEL_ARGS[@]} \
     ${DATASET_ARGS[@]}
 else
   echo "Running in normal mode with $GPUS_PER_NODE GPU(s) per node..."
   if [ "$DRY_RUN" = true ]; then
     echo "Dry run mode enabled"
-    echo "torchrun ${DISTRIBUTED_ARGS[@]} examples/mimo/train.py \
+    echo "torchrun ${DISTRIBUTED_ARGS[@]} examples/open_models/mimo/train.py \
     ${TRAINING_ARGS[@]} \
     ${MODEL_PARALLEL_ARGS[@]} \
     ${EVAL_AND_LOGGING_ARGS[@]} \
     ${TOKENIZER_ARGS[@]} \
     ${GPT_MODEL_ARGS[@]} \
-    ${AUDIO_MODEL_ARGS[@]} \
     ${DATASET_ARGS[@]}"
   else
-    torchrun ${DISTRIBUTED_ARGS[@]} examples/mimo/train.py \
+    torchrun ${DISTRIBUTED_ARGS[@]} examples/open_models/mimo/train.py \
     ${TRAINING_ARGS[@]} \
     ${MODEL_PARALLEL_ARGS[@]} \
     ${EVAL_AND_LOGGING_ARGS[@]} \
     ${TOKENIZER_ARGS[@]} \
     ${GPT_MODEL_ARGS[@]} \
-    ${AUDIO_MODEL_ARGS[@]} \
     ${DATASET_ARGS[@]}
   fi
 fi

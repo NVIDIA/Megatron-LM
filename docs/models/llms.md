@@ -43,12 +43,10 @@ See the [Megatron Bridge supported models list](https://github.com/NVIDIA-NeMo/M
 ## Example Scripts
 
 Training examples for these models can be found in the `examples/` directory:
-- `examples/gpt3/` - GPT-3 training scripts
-- `examples/llama/` - LLaMA training scripts
-- `examples/mixtral/` - Mixtral MoE training
-- `examples/mamba/` - Mamba training scripts
-- `examples/bert/` - BERT training scripts
-- `examples/t5/` - T5 training scripts
+- `examples/open_models/gpt3/` - GPT-3 training scripts
+- `examples/open_models/llama/` - LLaMA training scripts
+- `examples/open_models/mamba/` - Mamba training scripts
+- `examples/open_models/t5/` - T5 training scripts
 
 ## Model Implementation
 
