@@ -1,5 +1,6 @@
 # Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
+import logging
 import warnings
 from dataclasses import dataclass, field
 from typing import Callable, List, Literal, Optional, Tuple, Union
@@ -12,6 +13,7 @@ from megatron.core.quantization.quant_config import RecipeConfig
 from megatron.core.transformer.enums import AttnBackend, CudaGraphScope
 from megatron.core.transformer.pipeline_parallel_layer_layout import PipelineParallelLayerLayout
 
+from .._rank_utils import log_single_rank
 from ..fusions.fused_bias_geglu import quick_gelu
 from ..model_parallel_config import ModelParallelConfig
 from ..utils import (
@@ -21,6 +23,8 @@ from ..utils import (
     is_torch_min_version,
     scaled_init_method_normal,
 )
+
+logger = logging.getLogger(__name__)
 
 try:
     from packaging.version import Version as PkgVersion
@@ -935,10 +939,12 @@ class TransformerConfig(ModelParallelConfig):
         # use fp32 to match the dtype of the residual stream between pipeline stages.
         if self.fp32_residual_connection and self.pipeline_dtype is not None:
             if self.pipeline_dtype != torch.float:
-                warnings.warn(
+                log_single_rank(
+                    logger,
+                    logging.WARNING,
                     f"fp32_residual_connection is enabled, overriding pipeline_dtype "
                     f"from {self.pipeline_dtype} to torch.float to match the "
-                    f"residual stream dtype between pipeline stages."
+                    f"residual stream dtype between pipeline stages.",
                 )
             self.pipeline_dtype = torch.float
 
