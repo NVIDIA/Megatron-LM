@@ -208,9 +208,7 @@ class LayerWiseDistributedOptimizer(ChainedOptimizer):
                 if len(params_list[rank]) > 0
                 else torch.empty(0, device=device, dtype=dtype)
             )
-            flat_sizes = [
-                sum(p.numel() for p in params) for params in params_list
-            ]
+            flat_sizes = [sum(p.numel() for p in params) for params in params_list]
             if max(flat_sizes) == 0:
                 return
 
@@ -220,9 +218,7 @@ class LayerWiseDistributedOptimizer(ChainedOptimizer):
                 if i == rank:
                     recv_buffers.append(None)
                 else:
-                    recv_buffers.append(
-                        torch.empty(flat_sizes[i], device=device, dtype=dtype)
-                    )
+                    recv_buffers.append(torch.empty(flat_sizes[i], device=device, dtype=dtype))
 
             # Broadcast each rank's params to all other ranks.
             # All ranks must participate in every broadcast call (collective).

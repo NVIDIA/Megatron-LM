@@ -346,8 +346,7 @@ class _ParamAndGradBucketGroup:
                 if max(bucket.lw_param_flat_sizes) == 0:
                     # All ranks have empty params for this bucket — skip.
                     bucket.lw_gather_tensor_list = [
-                        torch.empty(0, device=src.device, dtype=src.dtype)
-                        for _ in range(dp_size)
+                        torch.empty(0, device=src.device, dtype=src.dtype) for _ in range(dp_size)
                     ]
                     continue
 
@@ -355,15 +354,11 @@ class _ParamAndGradBucketGroup:
                 gather_list = []
                 for i in range(dp_size):
                     if i == local_rank:
-                        gather_list.append(
-                            torch.empty(0, device=src.device, dtype=src.dtype)
-                        )
+                        gather_list.append(torch.empty(0, device=src.device, dtype=src.dtype))
                     else:
                         gather_list.append(
                             torch.empty(
-                                bucket.lw_param_flat_sizes[i],
-                                device=src.device,
-                                dtype=src.dtype,
+                                bucket.lw_param_flat_sizes[i], device=src.device, dtype=src.dtype
                             )
                         )
                 bucket.lw_gather_tensor_list = gather_list
@@ -378,7 +373,7 @@ class _ParamAndGradBucketGroup:
                     else:
                         buf = gather_list[i]
                     work = torch.distributed.broadcast(
-                        buf, src_global, group=group, async_op=async_op,
+                        buf, src_global, group=group, async_op=async_op
                     )
                     if async_op and work is not None:
                         lw_work_handles.append(work)
@@ -391,10 +386,7 @@ class _ParamAndGradBucketGroup:
                     for idx, (flat_params, params) in enumerate(
                         zip(bucket.lw_gather_tensor_list, bucket.lw_params_list)
                     ):
-                        if (
-                            len(params) == 0
-                            or idx == local_rank
-                        ):
+                        if len(params) == 0 or idx == local_rank:
                             continue
                         updated_params = _unflatten_dense_tensors(flat_params, params)
                         for updated_p, model_p in zip(updated_params, params):

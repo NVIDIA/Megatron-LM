@@ -390,7 +390,7 @@ class TestFreeOverlapBuffers:
             bucket_size=None,
         )
         module = TestModel(
-            input_dim=32, output_dim=32, num_layers=2, bias=False, shared_embedding=False,
+            input_dim=32, output_dim=32, num_layers=2, bias=False, shared_embedding=False
         ).bfloat16()
         model = DistributedDataParallel(
             TransformerConfig(num_attention_heads=1, num_layers=1),
@@ -433,9 +433,9 @@ class TestFreeOverlapBuffers:
             bg.free_overlap_buffers()
 
             mock_handle.wait.assert_called_once()
-            assert bg.param_gather_handle is None, (
-                "param_gather_handle should be None after free_overlap_buffers"
-            )
+            assert (
+                bg.param_gather_handle is None
+            ), "param_gather_handle should be None after free_overlap_buffers"
 
         Utils.destroy_model_parallel()
 
@@ -458,9 +458,7 @@ class TestFreeOverlapBuffers:
         """DDP.free_overlap_buffers should call free_overlap_buffers on all bucket groups."""
         model = self._make_model()
 
-        with mock.patch.object(
-            type(model.bucket_groups[0]), 'free_overlap_buffers'
-        ) as mock_free:
+        with mock.patch.object(type(model.bucket_groups[0]), 'free_overlap_buffers') as mock_free:
             model.free_overlap_buffers()
             assert mock_free.call_count == len(
                 model.bucket_groups + model.expert_parallel_bucket_groups
