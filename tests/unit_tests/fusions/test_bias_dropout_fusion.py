@@ -3,15 +3,13 @@
 import pytest
 import torch
 
-from megatron.core.fusions.fused_bias_dropout import (
-    _bias_dropout_add_func,
-    get_bias_dropout_add,
-)
+from megatron.core.fusions.fused_bias_dropout import _bias_dropout_add_func, get_bias_dropout_add
 
 
 # ---------------------------------------------------------------------------
 # Existing test: fused vs. unfused parity (same dtype)
 # ---------------------------------------------------------------------------
+
 
 @pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
 @pytest.mark.parametrize("training", [True, False])
@@ -84,12 +82,8 @@ class TestFp32ResidualPreservation:
         r_fp32 = residual.float()
         if bias is not None:
             b_fp32 = bias.float()
-            return r_fp32 + torch.nn.functional.dropout(
-                x_fp32 + b_fp32, p=prob, training=training
-            )
-        return r_fp32 + torch.nn.functional.dropout(
-            x_fp32, p=prob, training=training
-        )
+            return r_fp32 + torch.nn.functional.dropout(x_fp32 + b_fp32, p=prob, training=training)
+        return r_fp32 + torch.nn.functional.dropout(x_fp32, p=prob, training=training)
 
     # -- core: output dtype must follow residual, not x -----------------
 
@@ -105,9 +99,9 @@ class TestFp32ResidualPreservation:
 
         out = _bias_dropout_add_func((x, bias), residual, prob=0.0, training=training)
 
-        assert out.dtype == torch.float32, (
-            f"Output dtype {out.dtype} must be fp32 (residual dtype), not {x_dtype}"
-        )
+        assert (
+            out.dtype == torch.float32
+        ), f"Output dtype {out.dtype} must be fp32 (residual dtype), not {x_dtype}"
 
     # -- numerical correctness of the upcast path ----------------------
 
@@ -124,9 +118,9 @@ class TestFp32ResidualPreservation:
 
         ref = self._reference_bias_dropout_add(x, bias, residual, prob=0.0, training=True)
         # fp32 tolerance – the only imprecision is the upcast from bf16/fp16
-        assert torch.allclose(out, ref, rtol=1e-5, atol=1e-5), (
-            f"Max diff = {(out - ref).abs().max().item()}"
-        )
+        assert torch.allclose(
+            out, ref, rtol=1e-5, atol=1e-5
+        ), f"Max diff = {(out - ref).abs().max().item()}"
 
     # -- backward: gradients flow correctly through the upcast ---------
 
@@ -134,9 +128,7 @@ class TestFp32ResidualPreservation:
     @pytest.mark.parametrize("has_bias", [True, False])
     def test_backward_with_fp32_residual(self, x_dtype, has_bias):
         """Gradients should be computed for x and residual when dtypes differ."""
-        x = torch.randn(
-            self.B, self.H, dtype=x_dtype, device=self.device, requires_grad=True
-        )
+        x = torch.randn(self.B, self.H, dtype=x_dtype, device=self.device, requires_grad=True)
         residual = torch.randn(
             self.B, self.H, dtype=torch.float32, device=self.device, requires_grad=True
         )
@@ -212,19 +204,13 @@ class TestFp32ResidualPreservation:
         """Smoke test: non-zero dropout with mixed dtypes doesn't crash."""
         x = torch.randn(self.B, self.H, dtype=torch.bfloat16, device=self.device)
         residual = torch.randn(self.B, self.H, dtype=torch.float32, device=self.device)
-        bias = (
-            torch.randn(self.H, dtype=torch.bfloat16, device=self.device)
-            if has_bias
-            else None
-        )
+        bias = torch.randn(self.H, dtype=torch.bfloat16, device=self.device) if has_bias else None
 
         out = _bias_dropout_add_func((x, bias), residual, prob=0.5, training=True)
         assert out.dtype == torch.float32
         # With dropout, some elements should be zeroed (before residual add)
         # so the output shouldn't be identical to the no-dropout case.
-        out_no_drop = _bias_dropout_add_func(
-            (x, bias), residual, prob=0.0, training=True
-        )
+        out_no_drop = _bias_dropout_add_func((x, bias), residual, prob=0.0, training=True)
         # They *can* be equal with very low probability; just check dtypes
         assert out_no_drop.dtype == torch.float32
 
@@ -273,13 +259,11 @@ class TestFp32ResidualStreamAcrossLayers:
             x = torch.randn(B, H, dtype=torch.bfloat16, device=self.device)
             bias = torch.randn(H, dtype=torch.bfloat16, device=self.device)
 
-            residual = _bias_dropout_add_func(
-                (x, bias), residual, prob=0.0, training=True
-            )
+            residual = _bias_dropout_add_func((x, bias), residual, prob=0.0, training=True)
 
-            assert residual.dtype == torch.float32, (
-                f"Layer {layer_idx}: residual dtype degraded to {residual.dtype}"
-            )
+            assert (
+                residual.dtype == torch.float32
+            ), f"Layer {layer_idx}: residual dtype degraded to {residual.dtype}"
 
     def test_residual_stays_fp32_no_bias(self):
         """Same multi-layer simulation but without bias tensors."""
@@ -291,13 +275,11 @@ class TestFp32ResidualStreamAcrossLayers:
         for layer_idx in range(num_layers):
             x = torch.randn(B, H, dtype=torch.bfloat16, device=self.device)
 
-            residual = _bias_dropout_add_func(
-                (x, None), residual, prob=0.0, training=True
-            )
+            residual = _bias_dropout_add_func((x, None), residual, prob=0.0, training=True)
 
-            assert residual.dtype == torch.float32, (
-                f"Layer {layer_idx}: residual dtype degraded to {residual.dtype}"
-            )
+            assert (
+                residual.dtype == torch.float32
+            ), f"Layer {layer_idx}: residual dtype degraded to {residual.dtype}"
 
     def test_fp32_residual_precision_advantage(self):
         """Demonstrate that fp32 residuals accumulate more accurately than
