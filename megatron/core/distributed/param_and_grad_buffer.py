@@ -142,8 +142,12 @@ class _LayerWiseAllGatherHandle:
         self.handles = handles
 
     def wait(self):
-        for h in self.handles:
-            h.wait()
+        # All broadcasts are on the same NCCL communicator stream, so NCCL
+        # guarantees in-order completion. Waiting on only the last handle is
+        # sufficient and avoids intermediate CUDA stream synchronizations that
+        # can cause timing-dependent deadlocks across ranks.
+        if self.handles:
+            self.handles[-1].wait()
 
 
 class _ParamAndGradBucketGroup:
