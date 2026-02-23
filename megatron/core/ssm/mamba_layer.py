@@ -200,7 +200,7 @@ class MambaLayer(GraphableMegatronModule):
             hasattr(self, 'cudagraph_manager')
             and kwargs.get('attention_mask') is None
             and kwargs.get('inference_context') is not None
-            and CudaGraphScope.full_iteration not in self.config.cuda_graph_scope
+            and not self.config.cuda_graph_scope  # empty-list = per-layer CUDA graphs
         ):
             context = kwargs['inference_context']
             using_cuda_graph = (context.is_static_batching() and context.is_decode_only()) or (
