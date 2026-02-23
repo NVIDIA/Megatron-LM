@@ -1267,17 +1267,19 @@ class _CudaGraphRunner(torch.nn.Module):
             _check_supported_type(ref)
 
             if val.type != ref.type and not (is_dataclass(val.value) and is_dataclass(ref.value)):
-                add_error(f"Type mismatch at {context}: {val.type} vs {ref.type}")
+                add_error(
+                    f"Type mismatch at {context}: Received {val.type} but expected {ref.type}"
+                )
                 return False
 
             if ref.type == torch.Tensor or issubclass(ref.type, torch.Tensor):
                 mismatches = []
                 if val.shape != ref.shape:
-                    mismatches.append(f"expected shape {val.shape} vs. {ref.shape}")
+                    mismatches.append(f"Received shape {val.shape} but expected {ref.shape}")
                 if val.dtype != ref.dtype:
-                    mismatches.append(f"expected dtype {val.dtype} vs. {ref.dtype}")
+                    mismatches.append(f"Received dtype {val.dtype} but expected {ref.dtype}")
                 if val.device != ref.device:
-                    mismatches.append(f"expected device {val.device} vs. {ref.device}")
+                    mismatches.append(f"Received device {val.device} but expected {ref.device}")
                 if mismatches:
                     add_error(f"Tensor mismatch at {context}: {', '.join(mismatches)}")
 

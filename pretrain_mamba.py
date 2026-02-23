@@ -236,6 +236,19 @@ def forward_step(data_iterator, model: MambaModel):
     if cu_seqlens is None:
         packed_seq_params = None
     else:
+        # Pre-compute seq_idx for Mamba mixer CUDA graph compatibility.
+        # total_tokens must be the actual tensor sequence dimension (not max_seqlen,
+        # which is the max *individual* sequence length per TE convention).
+        total_tokens = tokens.size(1) if tokens is not None else labels.size(1)
+        total_tokens_tensor = torch.tensor(
+            [total_tokens], dtype=cu_seqlens.dtype, device=cu_seqlens.device
+        )
+        cu_seqlens_with_max = torch.cat([cu_seqlens, total_tokens_tensor])
+        seq_lengths = cu_seqlens_with_max[1:] - cu_seqlens_with_max[:-1]
+        seq_idx = torch.repeat_interleave(
+            torch.arange(seq_lengths.numel(), device=cu_seqlens.device), seq_lengths
+        ).to(torch.int32).unsqueeze(0)
+
         # TODO(duncan): This class seems overly complex for what needs to be conveyed
         packed_seq_params = PackedSeqParams(
             qkv_format="thd",
@@ -246,6 +259,9 @@ def forward_step(data_iterator, model: MambaModel):
             max_seqlen_q=max_seqlen,
             max_seqlen_kv=max_seqlen,
         )
+        # Override __post_init__'s seq_idx (which used max_seqlen_q) with the
+        # correct value computed from the actual tensor sequence dimension.
+        packed_seq_params.seq_idx = seq_idx
 
     timers('batch-generator').stop()
 
