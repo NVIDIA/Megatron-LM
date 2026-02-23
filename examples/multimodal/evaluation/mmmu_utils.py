@@ -526,8 +526,9 @@ if __name__ == '__main__':
             )
             eval_output_dict[res['question_id']] = pred_ans
 
-    json.dump(eval_output_dict, open("validation_mmmu_iter6000_merged.0.53.sorted.json", "w"), indent=4, sort_keys=True)
-
+    with open("validation_mmmu_iter6000_merged.0.53.sorted.json", "w") as f:
+        json.dump(eval_output_dict, f, indent=4, sort_keys=True)
+        f.write("\n")  # End file in newline
 
     x = mmmu_main_eval(eval_output_dict,
                    task_cfg=tasks['mmmu'])

@@ -76,6 +76,7 @@ def collect_train_test_metrics(
                 fh,
                 indent=4,
             )
+            fh.write("\n")  # End file in newline
 
 
 if __name__ == "__main__":

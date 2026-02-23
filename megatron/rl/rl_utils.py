@@ -574,6 +574,7 @@ def get_environment_rollouts(
             'w',
         ) as f:
             json.dump([[r.model_dump() for r in group] for group in rollouts], f)
+            f.write('\n')  # End file in newline
 
     return rollouts
 
@@ -1601,6 +1602,7 @@ def evaluate_and_print_results_rl(
                     'w',
                 ) as f:
                     json.dump([[r.model_dump() for r in group] for group in dp_eval_results], f)
+                    f.write('\n')  # End file in newline
 
 
 def calculate_grpo_loss(

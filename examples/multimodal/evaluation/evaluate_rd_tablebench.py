@@ -35,6 +35,7 @@ def convert_to_rdtablebench_format(input_path):
 
     with open(output_file_path, "w") as output_file:
         json.dump(output, output_file)
+        output_file.write("\n")  # End file in newline
 
     return output_file_path
 

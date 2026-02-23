@@ -435,6 +435,7 @@ def main():
             print(f' Saving results to {args.output_path}')
             with open(args.output_path, "w") as fp:
                 json.dump(json_results, fp, indent=1)
+                fp.write("\n")  # End file in newline
 
         # Timing results.
         stats = torch.cuda.memory_stats()

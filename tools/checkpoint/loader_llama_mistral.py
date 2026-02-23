@@ -70,6 +70,7 @@ def read_json(path):
 def write_json(text, path):
     with open(path, "w") as f:
         json.dump(text, f)
+        f.write("\n")  # End file in newline
 
 
 # This conversion is adapted from
