@@ -81,6 +81,7 @@ class MegatronLocal(InferenceServer, ReturnsTokens, ReturnsRaw):
     @classmethod
     async def launch(cls, model: GPTModel, **kwargs):
         assert HAVE_OPENAI, "openai package is required for MegatronLocal"
+        # Import here to avoid circular imports
         from megatron.inference.utils import get_dynamic_inference_engine
 
         args = get_args()
