@@ -533,8 +533,14 @@ class MambaMixer(MegatronModule):
     ) -> torch.Tensor:
         """Helper to run dynamic inference prefill (chunked prefill request separately)."""
         metadata = context.mamba_metadata
-        prefill_req_count = context.padded_batch_dimensions.prefill_req_count
+
+        # Use the regular prefill request count to determine if regular
+        # prefill path needs to be run when chunked prefill is enabled
+        prefill_req_count = context.batch_dimensions.prefill_req_count
+
+        # Padded prefill token count
         prefill_token_count = zxBCdt.shape[0]
+
         enable_chunked_prefill = context.is_chunked_prefill_enabled()
 
         y_chunked = None
