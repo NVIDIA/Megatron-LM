@@ -297,9 +297,9 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
         self.hidden_dropout = config.hidden_dropout if hidden_dropout is None else hidden_dropout
         self.is_mtp_layer = is_mtp_layer
 
-
         # import here to avoid circular import
         from megatron.core.extensions.transformer_engine import TENorm
+
         def _build_layernorm(builder: LayerNormBuilder, has_residual_connection: bool):
             norm_kwargs: Dict[str, Any] = {
                 "config": self.config,
