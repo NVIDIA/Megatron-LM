@@ -137,6 +137,8 @@ class TestLayerWiseOptimizer:
         model_kwargs=None,
         copy_from=None,
         async_allgather=True,
+        grad_reduce_in_fp32=False,
+        bucket_size=None,
     ):
         """Create model, DDP wrapper, and optimizer with overlap-param-gather enabled.
 
@@ -150,6 +152,8 @@ class TestLayerWiseOptimizer:
             model_kwargs: Optional kwargs for model initialization
             copy_from: Optional DDP model to copy weights from
             async_allgather: If True, defer param all-gather to bucket infrastructure
+            grad_reduce_in_fp32: If True, reduce grads in fp32 (regression test for dtype fix)
+            bucket_size: Maximum number of parameters per bucket (None = single bucket)
 
         Returns:
             tuple: (model, optimizer, pg_collection)
@@ -161,7 +165,10 @@ class TestLayerWiseOptimizer:
         model.requires_grad_(True)
 
         ddp_config = DistributedDataParallelConfig(
-            use_distributed_optimizer=False, overlap_param_gather=True
+            use_distributed_optimizer=False,
+            overlap_param_gather=True,
+            grad_reduce_in_fp32=grad_reduce_in_fp32,
+            bucket_size=bucket_size,
         )
         model = DistributedDataParallel(
             TransformerConfig(num_attention_heads=1, num_layers=1), ddp_config, model
@@ -802,6 +809,319 @@ class TestLayerWiseOptimizer:
             # Async path: step (no allgather) + manual sync
             optimizer.step()
             model.start_param_sync(force_sync=True)
+
+            # Sync path: step (includes allgather)
+            ref_optimizer.step()
+
+            # Verify parameters match after each iteration
+            for param, ref_param in zip(model.parameters(), ref_model.parameters()):
+                torch.testing.assert_close(
+                    param.data,
+                    ref_param.data,
+                    rtol=0,
+                    atol=0,
+                    msg=f"Parameters diverged at iteration {iteration}",
+                )
+
+    def test_overlap_param_gather_async_dispatch_and_finish(self):
+        """Test async dispatch + finish_param_sync cycle (the actual runtime path).
+
+        Exercises _LayerWiseAllGatherHandle.wait() through the async dispatch path:
+        start_param_sync() (no force_sync) dispatches async broadcasts, then
+        finish_param_sync() waits on the handle and unflattens gathered params.
+        """
+        model, optimizer, pg_collection = (
+            self.create_model_and_optimizer_with_overlap_param_gather(async_allgather=True)
+        )
+        ref_model, ref_optimizer, _ = (
+            self.create_model_and_optimizer_with_overlap_param_gather(
+                async_allgather=False, copy_from=model
+            )
+        )
+
+        # Set identical gradients on both models
+        for param, ref_param in zip(model.parameters(), ref_model.parameters()):
+            grad_value = torch.randn_like(param)
+            torch.distributed.broadcast(grad_value, src=0, group=pg_collection.dp_cp)
+            param.main_grad = grad_value.clone().detach()
+            ref_param.main_grad = grad_value.clone().detach()
+
+        # Async path: step (no allgather) + async dispatch + explicit finish
+        optimizer.step()
+        model.start_param_sync()  # async dispatch to all bucket groups
+        for bucket_group in model.bucket_groups:
+            bucket_group.finish_param_sync(skip_next_bucket_dispatch=True)
+
+        # Sync path: step (includes allgather)
+        ref_optimizer.step()
+
+        # Verify params match sync path
+        for param, ref_param in zip(model.parameters(), ref_model.parameters()):
+            torch.testing.assert_close(
+                param.data,
+                ref_param.data,
+                rtol=0,
+                atol=0,
+                msg="Async dispatch + finish path produced different params than sync path",
+            )
+
+        # Verify all ranks have identical parameters
+        dp_size = get_pg_size(pg_collection.dp_cp)
+        if dp_size > 1:
+            for name, param in model.named_parameters():
+                param_list = [torch.zeros_like(param.data) for _ in range(dp_size)]
+                torch.distributed.all_gather(param_list, param.data, group=pg_collection.dp_cp)
+                for i in range(1, dp_size):
+                    torch.testing.assert_close(
+                        param_list[0],
+                        param_list[i],
+                        msg=f"Parameter {name} differs between rank 0 and rank {i}",
+                    )
+
+    def test_overlap_param_gather_finish_chains_next_bucket(self):
+        """Test that finish_param_sync() dispatches next_param_gather_bucket_group.
+
+        Uses a small bucket_size to force multiple bucket groups, then dispatches
+        only the last bucket group and verifies that finishing it chains to the next.
+        """
+        model, optimizer, pg_collection = (
+            self.create_model_and_optimizer_with_overlap_param_gather(
+                async_allgather=True, bucket_size=2000
+            )
+        )
+
+        bucket_groups = model.bucket_groups
+        if len(bucket_groups) <= 1:
+            pytest.skip("Need multiple bucket groups to test chaining")
+
+        ref_model, ref_optimizer, _ = (
+            self.create_model_and_optimizer_with_overlap_param_gather(
+                async_allgather=False, copy_from=model, bucket_size=2000
+            )
+        )
+
+        # Set identical gradients on both models
+        for param, ref_param in zip(model.parameters(), ref_model.parameters()):
+            grad_value = torch.randn_like(param)
+            torch.distributed.broadcast(grad_value, src=0, group=pg_collection.dp_cp)
+            param.main_grad = grad_value.clone().detach()
+            ref_param.main_grad = grad_value.clone().detach()
+
+        optimizer.step()
+
+        # Dispatch ONLY the last bucket group (which has next_param_gather_bucket_group set)
+        last_bg = bucket_groups[-1]
+        last_bg.start_param_sync()
+
+        # Verify: next bucket group has NOT been dispatched yet
+        next_bg = last_bg.next_param_gather_bucket_group
+        assert next_bg is not None, "Last bucket group should have a next"
+        assert not next_bg.param_gather_dispatched, "Next bucket should not be dispatched yet"
+
+        # Finish the last bucket group — should chain-dispatch the next one
+        last_bg.finish_param_sync()
+
+        # Verify: next bucket group IS now dispatched via chaining
+        assert next_bg.param_gather_dispatched, (
+            "finish_param_sync should have dispatched next bucket group"
+        )
+
+        # Finish remaining bucket groups through the chain
+        for bg in reversed(bucket_groups[:-1]):
+            bg.finish_param_sync()
+
+        # Reference: sync step
+        ref_optimizer.step()
+
+        # Verify params match
+        for param, ref_param in zip(model.parameters(), ref_model.parameters()):
+            torch.testing.assert_close(
+                param.data,
+                ref_param.data,
+                rtol=0,
+                atol=0,
+                msg="Chained bucket finish produced different params than sync path",
+            )
+
+    def test_overlap_param_gather_forward_pre_hook(self):
+        """Test forward pre-hooks trigger finish_param_sync during model(input).
+
+        After async dispatch, running model(input) fires forward pre-hooks that
+        call finish_param_sync() on each bucket group, completing the param sync.
+        """
+        model, optimizer, pg_collection = (
+            self.create_model_and_optimizer_with_overlap_param_gather(async_allgather=True)
+        )
+        ref_model, ref_optimizer, _ = (
+            self.create_model_and_optimizer_with_overlap_param_gather(
+                async_allgather=False, copy_from=model
+            )
+        )
+
+        # Set identical gradients on both models
+        for param, ref_param in zip(model.parameters(), ref_model.parameters()):
+            grad_value = torch.randn_like(param)
+            torch.distributed.broadcast(grad_value, src=0, group=pg_collection.dp_cp)
+            param.main_grad = grad_value.clone().detach()
+            ref_param.main_grad = grad_value.clone().detach()
+
+        # Async path: step (no allgather) + async dispatch
+        optimizer.step()
+        model.start_param_sync()  # dispatch async broadcasts
+
+        # Forward pass triggers hooks that call finish_param_sync()
+        input_tensor = torch.randn(16, 80, dtype=torch.bfloat16, device='cuda')
+        output = model(input_tensor)
+
+        # Sync path: step (includes allgather)
+        ref_optimizer.step()
+
+        # Verify params match
+        for param, ref_param in zip(model.parameters(), ref_model.parameters()):
+            torch.testing.assert_close(
+                param.data,
+                ref_param.data,
+                rtol=0,
+                atol=0,
+                msg="Forward pre-hook path produced different params than sync path",
+            )
+
+    def test_overlap_param_gather_grad_reduce_in_fp32(self):
+        """Regression test: grad_reduce_in_fp32 must not cause dtype mismatch in broadcasts.
+
+        When grad_reduce_in_fp32=True, the grad buffer dtype is fp32 but broadcast
+        buffers must use param dtype (bf16). Without the fix (commit cbed167fc), this
+        would cause a dtype mismatch error in the per-rank broadcast calls.
+        """
+        model, optimizer, pg_collection = (
+            self.create_model_and_optimizer_with_overlap_param_gather(
+                async_allgather=True, grad_reduce_in_fp32=True
+            )
+        )
+        ref_model, ref_optimizer, _ = (
+            self.create_model_and_optimizer_with_overlap_param_gather(
+                async_allgather=False, copy_from=model, grad_reduce_in_fp32=True
+            )
+        )
+
+        # Set identical gradients on both models
+        for param, ref_param in zip(model.parameters(), ref_model.parameters()):
+            grad_value = torch.randn_like(param)
+            torch.distributed.broadcast(grad_value, src=0, group=pg_collection.dp_cp)
+            param.main_grad = grad_value.clone().detach()
+            ref_param.main_grad = grad_value.clone().detach()
+
+        # Async path: step + force_sync
+        optimizer.step()
+        model.start_param_sync(force_sync=True)
+
+        # Sync path: step (includes allgather)
+        ref_optimizer.step()
+
+        # Verify params match
+        for param, ref_param in zip(model.parameters(), ref_model.parameters()):
+            torch.testing.assert_close(
+                param.data,
+                ref_param.data,
+                rtol=1e-5,
+                atol=1e-5,
+                msg="grad_reduce_in_fp32 path produced different params than reference",
+            )
+
+    def test_overlap_param_gather_hook_enable_disable_cycle(self):
+        """Test the training loop's hook lifecycle: disable → manual sync → enable → forward.
+
+        The training loop disables hooks before iteration 1 (for initialization),
+        then enables them for subsequent iterations. This test exercises that cycle.
+        """
+        model, optimizer, pg_collection = (
+            self.create_model_and_optimizer_with_overlap_param_gather(async_allgather=True)
+        )
+        ref_model, ref_optimizer, _ = (
+            self.create_model_and_optimizer_with_overlap_param_gather(
+                async_allgather=False, copy_from=model
+            )
+        )
+
+        input_tensor = torch.randn(16, 80, dtype=torch.bfloat16, device='cuda')
+
+        # Iteration 1: hooks disabled, manual sync
+        model.disable_forward_pre_hook(param_sync=False)
+
+        for param, ref_param in zip(model.parameters(), ref_model.parameters()):
+            grad_value = torch.randn_like(param)
+            torch.distributed.broadcast(grad_value, src=0, group=pg_collection.dp_cp)
+            param.main_grad = grad_value.clone().detach()
+            ref_param.main_grad = grad_value.clone().detach()
+
+        optimizer.step()
+        model.start_param_sync(force_sync=True)  # manual sync
+
+        ref_optimizer.step()
+
+        for param, ref_param in zip(model.parameters(), ref_model.parameters()):
+            torch.testing.assert_close(
+                param.data,
+                ref_param.data,
+                rtol=0,
+                atol=0,
+                msg="Params diverged after iteration 1 (hooks disabled)",
+            )
+
+        # Iteration 2: hooks re-enabled, forward pass triggers sync
+        model.enable_forward_pre_hook()
+
+        for param, ref_param in zip(model.parameters(), ref_model.parameters()):
+            grad_value = torch.randn_like(param)
+            torch.distributed.broadcast(grad_value, src=0, group=pg_collection.dp_cp)
+            param.main_grad = grad_value.clone().detach()
+            ref_param.main_grad = grad_value.clone().detach()
+
+        optimizer.step()
+        model.start_param_sync()  # async dispatch
+        output = model(input_tensor)  # hooks finish sync
+
+        ref_optimizer.step()
+
+        for param, ref_param in zip(model.parameters(), ref_model.parameters()):
+            torch.testing.assert_close(
+                param.data,
+                ref_param.data,
+                rtol=0,
+                atol=0,
+                msg="Params diverged after iteration 2 (hooks re-enabled)",
+            )
+
+    def test_overlap_param_gather_multi_iteration_with_hooks(self):
+        """Test multiple iterations using forward pre-hooks (not manual force_sync).
+
+        Runs 3 iterations where each iteration uses: set grads → step → async dispatch →
+        forward pass (hooks wait+unflatten). Compares against reference model using sync
+        allgather after each iteration.
+        """
+        model, optimizer, pg_collection = (
+            self.create_model_and_optimizer_with_overlap_param_gather(async_allgather=True)
+        )
+        ref_model, ref_optimizer, _ = (
+            self.create_model_and_optimizer_with_overlap_param_gather(
+                async_allgather=False, copy_from=model
+            )
+        )
+
+        input_tensor = torch.randn(16, 80, dtype=torch.bfloat16, device='cuda')
+
+        for iteration in range(3):
+            # Set identical gradients on both models
+            for param, ref_param in zip(model.parameters(), ref_model.parameters()):
+                grad_value = torch.randn_like(param)
+                torch.distributed.broadcast(grad_value, src=0, group=pg_collection.dp_cp)
+                param.main_grad = grad_value.clone().detach()
+                ref_param.main_grad = grad_value.clone().detach()
+
+            # Async path: step + dispatch + forward (hooks wait+unflatten)
+            optimizer.step()
+            model.start_param_sync()  # async dispatch
+            output = model(input_tensor)  # hooks trigger finish_param_sync
 
             # Sync path: step (includes allgather)
             ref_optimizer.step()
