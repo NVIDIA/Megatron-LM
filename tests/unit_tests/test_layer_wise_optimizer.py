@@ -830,13 +830,11 @@ class TestLayerWiseOptimizer:
         start_param_sync() (no force_sync) dispatches async broadcasts, then
         finish_param_sync() waits on the handle and unflattens gathered params.
         """
-        model, optimizer, pg_collection = (
-            self.create_model_and_optimizer_with_overlap_param_gather(async_allgather=True)
+        model, optimizer, pg_collection = self.create_model_and_optimizer_with_overlap_param_gather(
+            async_allgather=True
         )
-        ref_model, ref_optimizer, _ = (
-            self.create_model_and_optimizer_with_overlap_param_gather(
-                async_allgather=False, copy_from=model
-            )
+        ref_model, ref_optimizer, _ = self.create_model_and_optimizer_with_overlap_param_gather(
+            async_allgather=False, copy_from=model
         )
 
         # Set identical gradients on both models
@@ -884,20 +882,16 @@ class TestLayerWiseOptimizer:
         Uses a small bucket_size to force multiple bucket groups, then dispatches
         only the last bucket group and verifies that finishing it chains to the next.
         """
-        model, optimizer, pg_collection = (
-            self.create_model_and_optimizer_with_overlap_param_gather(
-                async_allgather=True, bucket_size=2000
-            )
+        model, optimizer, pg_collection = self.create_model_and_optimizer_with_overlap_param_gather(
+            async_allgather=True, bucket_size=2000
         )
 
         bucket_groups = model.bucket_groups
         if len(bucket_groups) <= 1:
             pytest.skip("Need multiple bucket groups to test chaining")
 
-        ref_model, ref_optimizer, _ = (
-            self.create_model_and_optimizer_with_overlap_param_gather(
-                async_allgather=False, copy_from=model, bucket_size=2000
-            )
+        ref_model, ref_optimizer, _ = self.create_model_and_optimizer_with_overlap_param_gather(
+            async_allgather=False, copy_from=model, bucket_size=2000
         )
 
         # Set identical gradients on both models
@@ -922,9 +916,9 @@ class TestLayerWiseOptimizer:
         last_bg.finish_param_sync()
 
         # Verify: next bucket group IS now dispatched via chaining
-        assert next_bg.param_gather_dispatched, (
-            "finish_param_sync should have dispatched next bucket group"
-        )
+        assert (
+            next_bg.param_gather_dispatched
+        ), "finish_param_sync should have dispatched next bucket group"
 
         # Finish remaining bucket groups through the chain
         for bg in reversed(bucket_groups[:-1]):
@@ -949,13 +943,11 @@ class TestLayerWiseOptimizer:
         After async dispatch, running model(input) fires forward pre-hooks that
         call finish_param_sync() on each bucket group, completing the param sync.
         """
-        model, optimizer, pg_collection = (
-            self.create_model_and_optimizer_with_overlap_param_gather(async_allgather=True)
+        model, optimizer, pg_collection = self.create_model_and_optimizer_with_overlap_param_gather(
+            async_allgather=True
         )
-        ref_model, ref_optimizer, _ = (
-            self.create_model_and_optimizer_with_overlap_param_gather(
-                async_allgather=False, copy_from=model
-            )
+        ref_model, ref_optimizer, _ = self.create_model_and_optimizer_with_overlap_param_gather(
+            async_allgather=False, copy_from=model
         )
 
         # Set identical gradients on both models
@@ -993,15 +985,11 @@ class TestLayerWiseOptimizer:
         buffers must use param dtype (bf16). Without the fix (commit cbed167fc), this
         would cause a dtype mismatch error in the per-rank broadcast calls.
         """
-        model, optimizer, pg_collection = (
-            self.create_model_and_optimizer_with_overlap_param_gather(
-                async_allgather=True, grad_reduce_in_fp32=True
-            )
+        model, optimizer, pg_collection = self.create_model_and_optimizer_with_overlap_param_gather(
+            async_allgather=True, grad_reduce_in_fp32=True
         )
-        ref_model, ref_optimizer, _ = (
-            self.create_model_and_optimizer_with_overlap_param_gather(
-                async_allgather=False, copy_from=model, grad_reduce_in_fp32=True
-            )
+        ref_model, ref_optimizer, _ = self.create_model_and_optimizer_with_overlap_param_gather(
+            async_allgather=False, copy_from=model, grad_reduce_in_fp32=True
         )
 
         # Set identical gradients on both models
@@ -1034,13 +1022,11 @@ class TestLayerWiseOptimizer:
         The training loop disables hooks before iteration 1 (for initialization),
         then enables them for subsequent iterations. This test exercises that cycle.
         """
-        model, optimizer, pg_collection = (
-            self.create_model_and_optimizer_with_overlap_param_gather(async_allgather=True)
+        model, optimizer, pg_collection = self.create_model_and_optimizer_with_overlap_param_gather(
+            async_allgather=True
         )
-        ref_model, ref_optimizer, _ = (
-            self.create_model_and_optimizer_with_overlap_param_gather(
-                async_allgather=False, copy_from=model
-            )
+        ref_model, ref_optimizer, _ = self.create_model_and_optimizer_with_overlap_param_gather(
+            async_allgather=False, copy_from=model
         )
 
         input_tensor = torch.randn(16, 80, dtype=torch.bfloat16, device='cuda')
@@ -1099,13 +1085,11 @@ class TestLayerWiseOptimizer:
         forward pass (hooks wait+unflatten). Compares against reference model using sync
         allgather after each iteration.
         """
-        model, optimizer, pg_collection = (
-            self.create_model_and_optimizer_with_overlap_param_gather(async_allgather=True)
+        model, optimizer, pg_collection = self.create_model_and_optimizer_with_overlap_param_gather(
+            async_allgather=True
         )
-        ref_model, ref_optimizer, _ = (
-            self.create_model_and_optimizer_with_overlap_param_gather(
-                async_allgather=False, copy_from=model
-            )
+        ref_model, ref_optimizer, _ = self.create_model_and_optimizer_with_overlap_param_gather(
+            async_allgather=False, copy_from=model
         )
 
         input_tensor = torch.randn(16, 80, dtype=torch.bfloat16, device='cuda')
