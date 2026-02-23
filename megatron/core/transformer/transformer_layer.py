@@ -284,6 +284,7 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
 
         # import here to avoid circular import
         from megatron.core.extensions.transformer_engine import TENorm
+
         def _build_layernorm(builder: Union[ModuleSpec, type], has_residual_connection: bool):
             norm_kwargs: Dict[str, Any] = {
                 "config": self.config,
