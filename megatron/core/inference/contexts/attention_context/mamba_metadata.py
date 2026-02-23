@@ -64,6 +64,11 @@ class MambaMetadata:
             (2,), dtype=torch.int32, device=self.device
         )
 
+        # Map from requests to accepted tokens in speculative decoding
+        self._num_accepted_tokens_buffer = torch.zeros(
+            (self.max_requests,), dtype=torch.int32, device=self.device
+        )
+
         # Allocator for Mamba state slots
         self.mamba_state_free_slots = torch.arange(
             self.max_requests, dtype=torch.int32, device=torch.cuda.current_device()
@@ -95,6 +100,7 @@ class MambaMetadata:
         self.seq_idx = None
         self.device_decode_prefill = None
         self.device_chunked_prefill = None
+        self.num_accepted_tokens = None
 
     def update(
         self,
@@ -175,6 +181,7 @@ class MambaMetadata:
             if padded_decode_count > real_decode_count:
                 self._batch_indices_decode_buffer[real_decode_count:padded_decode_count] = -1
             self.batch_indices_decode = self._batch_indices_decode_buffer[:padded_decode_count]
+            self.num_accepted_tokens = self._num_accepted_tokens_buffer[:padded_decode_count]
 
         # Determine if we have a chunked prefill request and adjust counts for regular prefill
         regular_prefill_count = real_prefill_count

@@ -477,11 +477,19 @@ class MambaMixer(MegatronModule):
             # For mixed batch, the decode tokens are at the start of zxBCdt
             zxBCdt_decode = zxBCdt[:decode_req_count] if prefill_req_count > 0 else zxBCdt
 
+            num_accepted_tokens = context.mamba_metadata.num_accepted_tokens
+            intermediate_conv_state, intermediate_ssm_state = context.mamba_states_cache(
+                self.layer_number - self.pp_layer_offset, intermediate=True
+            )
+
             y_decode = self._ssm_decode(
                 zxBCdt_decode.transpose(0, 1),
                 conv_state,
                 ssm_state,
                 context.mamba_metadata.batch_indices_decode,
+                num_accepted_tokens=num_accepted_tokens,
+                intermediate_conv_window=intermediate_conv_state,
+                intermediate_ssm_state=intermediate_ssm_state,
             ).transpose(0, 1)
 
         # Prefill
@@ -903,6 +911,9 @@ class MambaMixer(MegatronModule):
         conv_state: torch.Tensor,
         ssm_state: torch.Tensor,
         batch_indices: Optional[torch.Tensor] = None,
+        num_accepted_tokens: Optional[torch.Tensor] = None,
+        intermediate_conv_state: Optional[torch.Tensor] = None,
+        intermediate_ssm_state: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         """
         Performs SSM computation for inference decode step.
@@ -920,10 +931,19 @@ class MambaMixer(MegatronModule):
         """
         seq_len, batch_size, _ = zxBCdt.shape
         dtype = zxBCdt.dtype
-        assert seq_len == 1, "Only support decoding with 1 token at a time for now"
+        if seq_len > 1:
+            assert (
+                num_accepted_tokens is not None
+                and intermediate_conv_window is not None
+                and intermediate_ssm_state is not None
+            ), "Decoding with > 1 token per request requires speculative decoding state"
+            is_speculative_decoding = True
+        else:
+            is_speculative_decoding = False
 
-        # Remove sequence dimension
-        zxBCdt = zxBCdt.squeeze(0)
+        if not is_speculative_decoding:
+            # Remove sequence dimension
+            zxBCdt = zxBCdt.squeeze(0)
 
         z, xBC, dt = torch.split(
             zxBCdt,
@@ -953,6 +973,10 @@ class MambaMixer(MegatronModule):
                 self.conv1d.bias,
                 self.activation,
                 conv_state_indices=batch_indices,
+                num_accepted_tokens=num_accepted_tokens,
+                intermediate_conv_window=intermediate_conv_window,
+                intermediate_state_indices=batch_indices,
+                pad_slot_id=-1,
             )
 
         x, B, C = torch.split(
@@ -968,6 +992,7 @@ class MambaMixer(MegatronModule):
 
         # SSM step
         if selective_state_update is None:
+            assert not is_speculative_decode
             if self.ngroups_local_tp > 1:
                 B = rearrange(B, "b (g n) -> b g n", n=self.d_state)
                 C = rearrange(C, "b (g n) -> b g n", n=self.d_state)
@@ -1014,14 +1039,22 @@ class MambaMixer(MegatronModule):
                     y = y * self.act(z)  # (B D)
         else:
             A = repeat(A, "h -> h p n", p=self.headdim, n=self.d_state).to(dtype=torch.float32)
-            dt = repeat(dt, "b h -> b h p", p=self.headdim)
             dt_bias = repeat(self.dt_bias, "h -> h p", p=self.headdim)
             D = repeat(self.D, "h -> h p", p=self.headdim)
-            B = rearrange(B, "b (g n) -> b g n", g=self.ngroups_local_tp)
-            C = rearrange(C, "b (g n) -> b g n", g=self.ngroups_local_tp)
-            x_reshaped = rearrange(x, "b (h p) -> b h p", p=self.headdim)
-            if not self.rmsnorm:
-                z = rearrange(z, "b (h p) -> b h p", p=self.headdim)
+            if is_speculative_deocode:
+                dt = repeat(dt, "s b h -> s b h p", p=self.headdim)
+                B = rearrange(B, "s b (g n) -> s b g n", g=self.ngroups_local_tp)
+                C = rearrange(C, "s b (g n) -> s b g n", g=self.ngroups_local_tp)
+                x_reshaped = rearrange(x, "s b (h p) -> s b h p", p=self.headdim)
+                if not self.rmsnorm:
+                    z = rearrange(z, "s b (h p) -> s b h p", p=self.headdim)
+            else:
+                dt = repeat(dt, "b h -> b h p", p=self.headdim)
+                B = rearrange(B, "b (g n) -> b g n", g=self.ngroups_local_tp)
+                C = rearrange(C, "b (g n) -> b g n", g=self.ngroups_local_tp)
+                x_reshaped = rearrange(x, "b (h p) -> b h p", p=self.headdim)
+                if not self.rmsnorm:
+                    z = rearrange(z, "b (h p) -> b h p", p=self.headdim)
 
             # Upcast the batch_indices to prevent integer overflow errors in the case of
             # large max request counts.
@@ -1040,8 +1073,15 @@ class MambaMixer(MegatronModule):
                 dt_bias=dt_bias,
                 dt_softplus=True,
                 state_batch_indices=batch_indices,
+                disable_state_update=True,
+                intermediate_states_buffer=intermediate_ssm_state,
+                cache_steps=seq_len,
+                intermediate_state_indices=batch_indices,
             )
-            y = rearrange(y, "b h p -> b (h p)")
+            if is_speculative_decode:
+                y = rearrange(y, "s b h p -> s b (h p)")
+            else:
+                y = rearrange(y, "b h p -> b (h p)")
 
         if self.rmsnorm:
             y = self.norm(y, z)

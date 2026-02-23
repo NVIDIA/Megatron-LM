@@ -152,7 +152,7 @@ class DynamicInferenceEngine(AbstractEngine):
         *DEPRECATED_ARGS,
         message="Argument `{name}` has been deprecated. Only pass `controller` and `context`",
     )
-    def __init__(self, controller: TextGenerationController, context: DynamicInferenceContext, num_speculative_tokens: Optional[int] = 0,):
+    def __init__(self, controller: TextGenerationController, context: DynamicInferenceContext):
 
         assert isinstance(
             controller, TextGenerationController
@@ -172,17 +172,24 @@ class DynamicInferenceEngine(AbstractEngine):
         # Initialization options.
         self.controller = controller
         self.context = context
-        self.num_speculative_tokens = num_speculative_tokens
+
+        self.num_speculative_tokens = inference_config.num_speculative_tokens
 
         assert self.num_speculative_tokens >= 0, "Number of speculative tokens must be non-negative"
 
         if self.num_speculative_tokens > 0:
-            assert not self.context.materialize_only_last_token_logits, "Speculative decoding requires materialize_only_last_token_logits to be False"
-            assert self.num_speculative_tokens <= self.controller.num_mtp_heads, f"Number of speculative tokens {self.num_speculative_tokens} must be less than or equal to number of MTP heads {self.controller.num_mtp_heads}"
-            assert not self.enable_chunked_prefill, "Chunked prefill is not supported with speculative tokens"
-        
-        self.context.num_speculative_tokens = num_speculative_tokens
-        self.controller.num_speculative_tokens = num_speculative_tokens
+            assert (
+                not self.context.materialize_only_last_token_logits
+            ), "Speculative decoding requires materialize_only_last_token_logits to be False"
+            assert (
+                self.num_speculative_tokens <= self.controller.num_mtp_heads
+            ), f"Number of speculative tokens {self.num_speculative_tokens} must be less than or equal to number of MTP heads {self.controller.num_mtp_heads}"
+            assert (
+                not self.enable_chunked_prefill
+            ), "Chunked prefill is not supported with speculative tokens"
+
+        self.context.num_speculative_tokens = self.num_speculative_tokens
+        self.controller.num_speculative_tokens = self.num_speculative_tokens
         # Initialize MTP sampling tensor now that num_speculative_tokens is set
         self.controller._init_mtp_sampling_tensor()
 
@@ -917,16 +924,22 @@ class DynamicInferenceEngine(AbstractEngine):
             if self.num_speculative_tokens > 0:
                 accepted_tokens = list(filter(lambda tok: tok != -1, accepted_tokens_list))
                 tokens = tokens + accepted_tokens
-            
+
             request: DynamicInferenceRequest = self.get_request(request_id)
             if request_id != self.context.chunked_prefill_request_id:
                 # Skip appending token for requests being finished due to stop words
                 # (they already have their final token from the previous step)
                 # If the request already has more tokens, then we only append as much as is necessary
-                if len(request.generated_tokens) + len(tokens) >= request.sampling_params.num_tokens_to_generate:
-                    tokens = tokens[:request.sampling_params.num_tokens_to_generate - len(request.generated_tokens)]
+                if (
+                    len(request.generated_tokens) + len(tokens)
+                    >= request.sampling_params.num_tokens_to_generate
+                ):
+                    tokens = tokens[
+                        : request.sampling_params.num_tokens_to_generate
+                        - len(request.generated_tokens)
+                    ]
                 if request_id not in self.stop_word_being_finished_ids:
-                    
+
                     is_first_token = len(request.generated_tokens) == 0
                     request.generated_tokens += tokens
                     # TODO : SHAN Should check and change the following for speculative tokens
@@ -1145,7 +1158,7 @@ class DynamicInferenceEngine(AbstractEngine):
                     # Need to check the last stop len tokens shifting by 1 up to num_speculative_tokens
                     # Check logic and vecotrize this if possible
                     for i in range(self.num_speculative_tokens):
-                        if list(generated_tokens[-stop_len - i: -i]) == stop_word_ids:
+                        if list(generated_tokens[-stop_len - i : -i]) == stop_word_ids:
                             return True
 
         return False

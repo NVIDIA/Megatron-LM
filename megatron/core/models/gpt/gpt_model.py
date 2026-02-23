@@ -612,7 +612,9 @@ class GPTModel(LanguageModule):
             # The new process_mtp_loss function doesn't handle mtp_logits_cache,
             # so we manually generate and cache MTP logits when in inference mode.
             if in_inference_mode:
-                hidden_states_list = torch.chunk(hidden_states, 1 + self.config.mtp_num_layers, dim=0)
+                hidden_states_list = torch.chunk(
+                    hidden_states, 1 + self.config.mtp_num_layers, dim=0
+                )
                 hidden_states = hidden_states_list[0]
                 self._mtp_logits_cache = None
                 mtp_inference_logits = []

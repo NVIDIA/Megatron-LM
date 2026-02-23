@@ -310,7 +310,6 @@ def main():
     engine = DynamicInferenceEngine(
         controller,
         context,
-        num_speculative_tokens=args.num_speculative_tokens,
     )
 
     setup_prefix = build_dynamic_engine_setup_prefix(args, model, context, requests)
