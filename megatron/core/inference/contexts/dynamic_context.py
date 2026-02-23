@@ -1260,6 +1260,41 @@ class DynamicInferenceContext(BaseInferenceContext):
         """
         return self.total_request_count - self.paused_request_count - self.num_prefill_requests
 
+    def add_dummy_requests_for_expert_parallel_step(self) -> None:
+        """Minimal context setup for a dummy EP forward pass.
+
+        This is the fast alternative to add_dummy_requests_for_cudagraph_capture.
+        We only initialize state that is actually read during
+        initialize_attention_state and the subsequent forward pass.
+        """
+        smallest_cuda_graph_dimensions = min(self.cuda_graph_batch_dimensions_list)
+        # the smallest cuda graph is decode only.
+        assert smallest_cuda_graph_dimensions.prefill_req_count == 0
+
+        N = smallest_cuda_graph_dimensions.decode_req_count
+        dummy_block_idx = self.block_allocator.dummy_block_idx
+
+        # do minimum setup just so that we can run the dummy forward pass with
+        # a cuda graph.
+
+        # 1. Request counts and token count (decode-only: 1 token per request).
+        self.total_request_count = N
+        self.active_token_count = N
+
+        # 2. Per-request state consumed by mha_metadata.update().
+        self.request_query_lengths[0:N].fill_(1)
+        self.request_kv_length_offsets[0:N].fill_(0)
+        self.request_to_kv_block_ids[0:N, 0] = dummy_block_idx
+
+        # 3. Token-level state (needed for padding / mamba slicing).
+        self.token_to_request_idx[0:N] = torch.arange(
+            0, N, device=self.token_to_request_idx.device, dtype=self.token_to_request_idx.dtype
+        )
+
+        # 4. Mamba state: point every dummy request at slot 0.
+        if self.is_hybrid_model:
+            self.mamba_metadata.request_to_mamba_state_idx[0:N] = self.mamba_metadata.batch_allocate_slots(N)
+
     def initialize_attention_state(
         self,
         *,
@@ -1280,19 +1315,18 @@ class DynamicInferenceContext(BaseInferenceContext):
         ), "Dummy expert model parallel steps should not be creating cuda graphs."
 
         # If in CUDA graph creation mode, add dummy requests for CUDA graph capture
-        if self.is_creating_cuda_graphs:
-            self.add_dummy_requests_for_cudagraph_capture(construct_graph_dimensions)
-
         if is_expert_parallel_dummy_cuda_graph_step:
-            # attempt to use the smallest possible cuda graph for the dummy forward
-            smallest_cuda_graph_dimensions = min(self.cuda_graph_batch_dimensions_list)
-            batch_dimensions = smallest_cuda_graph_dimensions
+            self.add_dummy_requests_for_expert_parallel_step()
+            batch_dimensions = min(self.cuda_graph_batch_dimensions_list)
         else:
+            if self.is_creating_cuda_graphs:
+                self.add_dummy_requests_for_cudagraph_capture(construct_graph_dimensions)
             batch_dimensions = InferenceBatchDimensions(
                 token_count=self.active_token_count,
                 prefill_req_count=self.num_prefill_requests,
                 decode_req_count=self.num_decode_requests,
             )
+
         self.batch_dimensions = batch_dimensions
         best_graph = CUDAGraphBatchDimensionBuilder.match_graph_config(
             batch_dimensions,
@@ -1304,30 +1338,16 @@ class DynamicInferenceContext(BaseInferenceContext):
         )
         self._using_cuda_graph_this_step = best_graph is not None
 
+        if is_expert_parallel_dummy_cuda_graph_step and not self.using_cuda_graph_this_step():
+            # If we are here, this means that CUDAGraphBatchDimensionBuilder.match_graph_config
+            # could not find a compatible cuda graph for the dummy forward step.
+            # Now, we need not do the remaining setup. The controller
+            # will directly call the model forward pass with a single token.
+            return
+
         if self.using_cuda_graph_this_step():
             self.padded_batch_dimensions = best_graph
-            if is_expert_parallel_dummy_cuda_graph_step:
-                # do minimum setup just so that we can run the dummy forward pass with
-                # a cuda graph.
-                # 1. Adjust total request count. Pretend that the smallest cuda graph
-                # dimensions represent the actual batch dimensions!
-                self.total_request_count = (
-                    smallest_cuda_graph_dimensions.prefill_req_count
-                    + smallest_cuda_graph_dimensions.decode_req_count
-                )
-                # 2. Reset request query lengths
-                # Zero out request_query_lengths to prevent stale data from causing
-                # out of bounds memory accesses in last_token_logits.
-                # This is needed because when we move finished requests to the right, we never
-                # zero out their request lengths.
-                self.request_query_lengths[0 : self.total_request_count].fill_(0)
         else:
-            if is_expert_parallel_dummy_cuda_graph_step:
-                # If we are here, this means that CUDAGraphBatchDimensionBuilder.match_graph_config
-                # could not find a compatible cuda graph for the dummy forward step.
-                # Now, we need not do the remaining setup. The controller
-                # will directly call the model forward pass with a single token.
-                return
             padded_token_count = self.round_up_tokens(self.active_token_count)
             if self.is_decode_only():
                 padded_token_count = min(
