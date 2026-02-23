@@ -30,8 +30,9 @@ class Symbols:
     ATTENTION = "*"
     MLP = "-"
     MOE = 'E'
+    GDN = 'G'
     MTP_SEPARATOR = "/"
-    VALID = {MAMBA, ATTENTION, MLP, MOE}
+    VALID = {MAMBA, ATTENTION, MLP, MOE, GDN}
 
 
 @dataclass
@@ -264,7 +265,8 @@ def allocate_layers(
             logging.INFO,
             f"Hybrid allocation ({Symbols.MAMBA} is mamba, "
             f"{Symbols.ATTENTION} is attention, "
-            f"{Symbols.MLP} is mlp):",
+            f"{Symbols.MLP} is mlp, "
+            f"{Symbols.GDN} is gdn):",
         )
         maybe_log_single_rank(logger, logging.INFO, allocation_string)
         maybe_log_single_rank(
@@ -290,17 +292,24 @@ def allocate_layers(
             f"Target mlp ratio: {target_mlp_ratio:.2f}. "
             f"Actual mlp ratio: {actual_mlp_ratio:.2f}.",
         )
+        actual_gdn_layers_count = layer_type_list.count(Symbols.GDN)
+        actual_gdn_ratio = actual_gdn_layers_count / total_layers_count
+        maybe_log_single_rank(
+            logger,
+            logging.INFO,
+            f"{actual_gdn_layers_count} gdn layers in " f"{total_layers_count} total layers.",
+        )
     return layer_type_list
 
 
 def get_layer_maps_from_layer_type_list(
     layer_type_list: List[str],
-) -> Tuple[Dict[int, int], Dict[int, int], Dict[int, int]]:
+) -> Tuple[Dict[int, int], Dict[int, int], Dict[int, int], Dict[int, int], Dict[int, int]]:
     """
     Returns maps from global layer index to the corresponding layer index
-    for each layer type in [Attention, Mamba, MLP, MoE] given a layer type list.
+    for each layer type in [Attention, Mamba, MLP, MoE, GDN] given a layer type list.
     """
-    layer_types = [Symbols.ATTENTION, Symbols.MAMBA, Symbols.MLP, Symbols.MOE]
+    layer_types = [Symbols.ATTENTION, Symbols.MAMBA, Symbols.MLP, Symbols.MOE, Symbols.GDN]
     layer_maps = {layer_type: {} for layer_type in layer_types}
     for global_layer_idx, layer_type in enumerate(layer_type_list):
         layer_map = layer_maps[layer_type]

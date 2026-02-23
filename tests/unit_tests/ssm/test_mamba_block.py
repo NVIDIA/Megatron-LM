@@ -13,6 +13,7 @@ from megatron.core.transformer import TransformerConfig
 from megatron.core.transformer.attention import SelfAttention
 from megatron.core.transformer.mlp import MLP
 from megatron.core.transformer.transformer_layer import TransformerLayer
+from megatron.core.ssm.gated_delta_net import GatedDeltaNet
 from tests.unit_tests.test_utilities import Utils
 
 
@@ -87,3 +88,36 @@ class TestMambaBlock:
         # _allocate_override() in mamba_hybrid_layer_allocation.py throws a ValueError.
         with pytest.raises(ValueError):
             block = self.get_mamba_block(hybrid_override_pattern)
+
+    def test_gdn_layer_types(self):
+        """
+        Make sure that G creates a TransformerLayer wrapping GatedDeltaNet,
+        while * creates a TransformerLayer wrapping SelfAttention.
+        """
+        hybrid_override_pattern = Symbols.GDN + Symbols.ATTENTION + Symbols.MAMBA
+        block = self.get_mamba_block(hybrid_override_pattern)
+        layers = block.layers
+        assert isinstance(layers[0], TransformerLayer)
+        assert isinstance(layers[0].self_attention, GatedDeltaNet)
+        assert isinstance(layers[1], TransformerLayer)
+        assert isinstance(layers[1].self_attention, SelfAttention)
+        assert isinstance(layers[2], MambaLayer)
+
+    def test_gdn_gpu_forward(self):
+        """Test GPU forward pass with GDN, attention, and Mamba layers."""
+        hybrid_override_pattern = Symbols.GDN + Symbols.ATTENTION + Symbols.MAMBA
+        block = self.get_mamba_block(hybrid_override_pattern)
+        block.cuda()
+        micro_batch_size = 2
+        sequence_length = 32
+        hidden_states = torch.ones((sequence_length, micro_batch_size, block.config.hidden_size))
+        hidden_states = hidden_states.cuda()
+        attention_mask = torch.ones(
+            (micro_batch_size, 1, sequence_length, sequence_length), dtype=bool
+        )
+        attention_mask = attention_mask.cuda()
+        output = block(hidden_states, attention_mask=attention_mask)
+        assert output.shape[0] == sequence_length
+        assert output.shape[1] == micro_batch_size
+        assert output.shape[2] == block.config.hidden_size
+        assert output.dtype == torch.float32

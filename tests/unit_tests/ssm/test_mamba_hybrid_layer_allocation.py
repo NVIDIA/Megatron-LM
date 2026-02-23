@@ -27,6 +27,8 @@ class TestMambaHybridLayerAllocation:
             (8, 0.25, 0.25, "MM*-MM*-"),
             (8, 0.5, 0.25, "M**-M**-"),
             (48, 0.5, 0.2, None),
+            (8, 0.0, 0.0, "GGG*GGG*"),
+            (8, 0.0, 0.0, "GEGEGE*E"),
         ]
         for test in test_cases:
             (layers_count, attention_ratio, mlp_ratio, override_pattern) = test
@@ -101,6 +103,8 @@ class TestParseHybridPattern:
             ("*M*M", "*M*M"),
             ("MM-*", "MM-*"),
             ("E", "E"),
+            ("GGG*GGG*", "GGG*GGG*"),
+            ("GEGEGE*E", "GEGEGE*E"),
         ]
         for pattern, expected_main in test_cases:
             result = parse_hybrid_pattern(pattern)
@@ -200,6 +204,8 @@ class TestParseHybridPattern:
             ("*****/M/M/M/M", "*****", "M", 4),
             # MoE in main pattern
             ("MEME/MM/MM", "MEME", "MM", 2),
+            # GDN+MoE main pattern with GDN MTP
+            ("GEGEGE*E/GG/GG", "GEGEGE*E", "GG", 2),
         ]
         for pattern, expected_main, expected_mtp, expected_depths in test_cases:
             result = parse_hybrid_pattern(pattern)
