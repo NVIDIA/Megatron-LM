@@ -20,11 +20,11 @@ jobs:
         env:
           PAT: ${{ secrets.PAT }}
         run: |
-          latest_branch=$(git ls-remote --heads https://token:${PAT}@github.com/NVIDIA-NeMo/Eval.git 'refs/heads/r*' | 
+          latest_branch=$(git ls-remote --heads https://token:${PAT}@github.com/NVIDIA/Megatron-LM.git 'refs/heads/core_r*' | 
             grep -o 'core_r[0-9]\+\.[0-9]\+\.[0-9]\+' | 
             sort -V | 
             tail -n1)
-          echo "mcore_release_branch=$latest_branch" >> $GITHUB_OUTPUT
+          echo "mcore_release_branch=$latest_branch" | tee -a $GITHUB_OUTPUT
 
   bump-tags:
     needs: [get-release-branch-names]

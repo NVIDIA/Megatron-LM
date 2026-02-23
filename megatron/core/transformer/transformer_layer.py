@@ -1209,7 +1209,7 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
                 (kwargs.get('inference_context') is not None)
                 or (kwargs.get('inference_params') is not None)
             )
-            and CudaGraphScope.full_iteration not in self.config.cuda_graph_scope
+            and not self.config.cuda_graph_scope  # empty-list = per-layer CUDA graphs
         ):
             if kwargs['inference_context'].is_static_batching():
                 using_cuda_graph = kwargs['inference_context'].is_decode_only()
@@ -1248,6 +1248,13 @@ class MoETransformerLayer(TransformerLayer):
         self.token_dispatcher_attrs = {}
 
         super().__init__(*args, **kwargs)
+
+    def _should_call_local_cudagraph(self, *args, **kwargs):
+        if self.use_partial_cudagraphs:
+            return False
+        if self.config.cuda_graph_impl != "local":
+            return False
+        return super()._should_call_local_cudagraph(*args, **kwargs)
 
     def create_mcore_cudagraph_manager(self, config):
         """
