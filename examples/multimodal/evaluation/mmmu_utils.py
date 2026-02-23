@@ -1,3 +1,5 @@
+# Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+
 # The following code is adapted from
 # https://github.com/MMMU-Benchmark/MMMU/blob/main/mmmu/utils/data_utils.py,
 # which is licensed under the Apache License 2.0. More details on the license can be
