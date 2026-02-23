@@ -24,6 +24,7 @@ sys.path.append(
 from data.energon_avlm_task_encoder import llava_avlm_dataloader_provider
 from data.energon_vlm_task_encoder import llava_vlm_dataloader_provider
 from data.mock import (
+    qwen35_train_valid_test_datasets_provider,
     train_valid_test_datasets_provider as mock_train_valid_test_datasets_provider,
 )
 from model_providers.llava_avlm import model_provider_llava_avlm
@@ -45,6 +46,7 @@ _MODEL_PROVIDERS = {
 
 _DATASET_PROVIDERS = {
     "mock": mock_train_valid_test_datasets_provider,
+    "qwen35_mock": qwen35_train_valid_test_datasets_provider,
     "llava_vlm": llava_vlm_dataloader_provider,
     "video_llava_vlm": partial(llava_vlm_dataloader_provider, is_video_input=True),
     "llava_avlm": llava_avlm_dataloader_provider,

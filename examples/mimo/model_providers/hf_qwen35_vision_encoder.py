@@ -68,14 +68,23 @@ class HFQwen35VisionEncoderWrapper(torch.nn.Module):
         """Encode pixel values through the Qwen3.5 ViT + PatchMerger.
 
         Args:
-            pixel_values: Raw pixel values, shape varies by input type.
-                For images: flattened patches fed to 3D Conv PatchEmbed.
-            grid_thw: Temporal/height/width grid for each image or video,
-                shape (num_images_or_videos, 3).
+            pixel_values: Flattened patches for 3D Conv PatchEmbed.
+                Shape (total_patches, patch_dim) or (batch, num_patches, patch_dim)
+                when coming from a DataLoader with default collation.
+            grid_thw: Temporal/height/width grid for each image or video.
+                Shape (num_images, 3) or (batch, num_images_per_sample, 3).
 
         Returns:
             Merged embeddings at out_hidden_size, shape (total_merged_tokens, out_hidden_size).
         """
+        if pixel_values.ndim == 3:
+            pixel_values = pixel_values.reshape(-1, pixel_values.shape[-1])
+        if grid_thw.ndim == 3:
+            grid_thw = grid_thw.reshape(-1, grid_thw.shape[-1])
+
+        target_dtype = self.encoder.patch_embed.proj.weight.dtype
+        pixel_values = pixel_values.to(dtype=target_dtype)
+
         with torch.no_grad():
             output = self.encoder(pixel_values, grid_thw=grid_thw, return_dict=True)
         return output.pooler_output
