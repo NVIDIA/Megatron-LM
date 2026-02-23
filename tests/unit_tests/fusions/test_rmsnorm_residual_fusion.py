@@ -20,7 +20,7 @@ def test_rmsnorm_residual_fusion(input_dtype, normalized_shape):
     x_fused.requires_grad = True
     baseline_rmsnorm = RMSNorm(normalized_shape=normalized_shape, dtype=input_dtype).cuda()
     fused_rmsnorm = TEFusedResidualRMSNorm(
-        normalized_shape=normalized_shape, dtype=input_dtype, quantize=False
+        normalized_shape=normalized_shape, dtype=input_dtype
     ).cuda()
 
     # baseline
