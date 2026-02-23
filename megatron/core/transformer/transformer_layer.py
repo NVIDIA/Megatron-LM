@@ -14,7 +14,6 @@ from torch import Tensor
 from megatron.core import parallel_state, tensor_parallel
 from megatron.core.dist_checkpointing.mapping import ShardedStateDict
 from megatron.core.dist_checkpointing.utils import apply_prefix_mapping
-from megatron.core.extensions.transformer_engine import TENorm
 from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.transformer.cuda_graphs import is_graph_capturing
@@ -283,6 +282,8 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
         )
         self.hidden_dropout = config.hidden_dropout if hidden_dropout is None else hidden_dropout
 
+        # import here to avoid circular import
+        from megatron.core.extensions.transformer_engine import TENorm
         def _build_layernorm(builder: Union[ModuleSpec, type], has_residual_connection: bool):
             norm_kwargs: Dict[str, Any] = {
                 "config": self.config,
