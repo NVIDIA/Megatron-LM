@@ -123,16 +123,6 @@ class SFTDataset(MegatronDataset):
             assert not self.config.reset_position_ids
             pack_positions.extend(range(len(tokens_list)))
 
-            if self.config.context_parallel_size > 1:
-                pad_granularity = self.config.context_parallel_size * 2
-                mod_token_count = len(pack_tokens) % pad_granularity
-                if mod_token_count != 0:
-                    pad_len = pad_granularity - mod_token_count
-                    extend_with_padding(pack_tokens, pack_targets, pack_positions, pad_len)
-
-            # TODO(duncan): Consider also padding to multiple of number of tokens here. This might
-            # be needed for efficiency (and potentially set via command-line argument).
-
             cu_seqlens.append(len(pack_tokens))
 
             # Handle any necessary truncation

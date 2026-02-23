@@ -61,7 +61,11 @@ stimer = StragglerDetector()
 
 from transformer_engine.pytorch.attention.dot_product_attention.context_parallel import pad_thd_sequences_for_cp
 
-# TODO(asolergi-nv): ADD LOSS MASK PADDING TOO! Or create loss mask AFTER padding labels!
+# TODO(asolergi-nv): Develop tests!
+# TODO(asolergi-nv): Develop pretokenized format
+# TODO(asolergi-nv): Para esto si hacemos truncar --> Facil, tal y como lo tenemos ahora pero forzando siempre empezar las samples por el principio. Si deseamos no truncar tendremos que saltar a la siguiente sample una vez la siguiente sample + actual > seqlen
+# TODO(asolergi-nv): Remove chat templates & refactor SFTTokenizer
+# TODO(asolergi-nv): Craft docs with expected inputs & formats
 def get_batch(data_iterator, vp_stage=None):
     """Generate a batch."""
 
