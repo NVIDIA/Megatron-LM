@@ -30,7 +30,7 @@ from megatron.core.parallel_state import get_context_parallel_group
 from megatron.core.models.mamba import MambaModel
 from megatron.core.rerun_state_machine import get_rerun_state_machine
 from megatron.core.tokenizers.utils.build_tokenizer import build_tokenizer
-from megatron.core.utils import get_attr_wrapped_model, StragglerDetector
+from megatron.core.utils import get_attr_wrapped_model, StragglerDetector, preprocess_sft_batch, get_batch_on_this_cp_rank, get_sft_batch_on_this_tp_rank
 from megatron.training import (
     get_args,
     get_timers,
@@ -42,11 +42,9 @@ from megatron.training import (
 )
 from megatron.training.datasets.sft_dataset import SFTDataset, IGNORE_INDEX
 from megatron.training.utils import (
-    get_sft_batch_on_this_cp_rank,
     get_sft_batch_on_this_tp_rank,
     get_blend_and_blend_per_split,
     is_first_or_last_pipeline_stage,
-    pad_or_truncate_thd_tensors, 
 )
 from model_provider import model_provider
 
@@ -59,13 +57,14 @@ except ImportError:
 
 stimer = StragglerDetector()
 
-from transformer_engine.pytorch.attention.dot_product_attention.context_parallel import pad_thd_sequences_for_cp
-
 # TODO(asolergi-nv): Develop tests!
 # TODO(asolergi-nv): Develop pretokenized format
 # TODO(asolergi-nv): Para esto si hacemos truncar --> Facil, tal y como lo tenemos ahora pero forzando siempre empezar las samples por el principio. Si deseamos no truncar tendremos que saltar a la siguiente sample una vez la siguiente sample + actual > seqlen
 # TODO(asolergi-nv): Remove chat templates & refactor SFTTokenizer
 # TODO(asolergi-nv): Craft docs with expected inputs & formats
+# TODO(asolergi-nv): Dropped positions_ids & attention_mask from batch
+# TODO(asolergi-nv): Add shape assertions!
+# TODO(asolergi-nv): Fused CP sharding, fuse TP sharing!
 def get_batch(data_iterator, vp_stage=None):
     """Generate a batch."""
 
@@ -76,8 +75,10 @@ def get_batch(data_iterator, vp_stage=None):
 
     cp_size = args.context_parallel_size
     tp_size = args.tensor_model_parallel_size
+    tp_rank = mpu.get_tensor_model_parallel_rank()
     sp = args.sequence_parallel
     max_seq_len = args.seq_length
+    is_sft = args.sft
 
     batch = {
         'tokens': None,
@@ -88,67 +89,15 @@ def get_batch(data_iterator, vp_stage=None):
         'max_seqlen': None,
     }
 
-    if mpu.get_tensor_model_parallel_rank() == 0: 
-        # NOTE(asolergi-nv): Preprocessing step only on TP rank 0 before sharing with other ranks
-        ### 1. Create cu_seqlens_padded if CP is enabled
-        ### 2. Pad or truncate tensors if necessary
-        ### 3. Create max_seqlen
-        # From this point, all tensors have shape [1, sequence_length] (Except for cu_seqlens, cu_seqlens_padded and max_seqlen)
-        
-        # TODO(asolergi-nv): Create position_ids
+    if tp_rank == 0: # NOTE(asolergi-nv): Unpack batch on TP rank 0 before sharing with other ranks
+        batch = next(data_iterator)
 
-        assert data_iterator is not None
-        data = next(data_iterator)
+    if is_sft:
+        batch = preprocess_sft_batch(batch, tp_rank=tp_rank, cp_size=cp_size, tp_size=tp_size, sp=sp, padding_token_id=get_tokenizer().pad, padding_label_id=IGNORE_INDEX, max_seq_len=max_seq_len)        
 
-        tokens, labels, cu_seqlens = data["tokens"].squeeze(0), data["labels"].squeeze(0), data["cu_seqlens"].squeeze(0) # NOTE(asolergi-nv): PyTorch DataLoader `default_collate` adds batch dimension, so we need to remove it since TE expects cu_seqlens to be 1D
-
-        # NOTE(asolergi-nv): This is performed here https://github.com/NVIDIA-NeMo/RL/blob/2841fefb699a460cc4375fb2983b40c018ca76fe/nemo_rl/models/megatron/data.py#L393C5-L408C77
-        # individual sequence needs to be splitted to CP domain, and to TP domain when SP is enabled.
-        if cp_size > 1:
-            divisibility_factor = 1
-            if cp_size > 1:
-                divisibility_factor *= cp_size * 2
-            if tp_size > 1 and sp:
-                divisibility_factor *= tp_size
-
-            tokens, labels, cu_seqlens_padded = pad_thd_sequences_for_cp(
-                    tokens,
-                    labels,
-                    cu_seqlens,
-                    divisibility_factor,
-                    padding_token_id=get_tokenizer().pad,
-                    padding_label_id=IGNORE_INDEX,
-                )
-            cu_seqlens_padded = cu_seqlens_padded.to(torch.int32) # NOTE(asolergi-nv): pad_thd_sequences_for_cp uses torch.cumsum which promotes int32 cu_seqlens_padded to int64
-        else:
-            cu_seqlens_padded = None
-
-        tokens, labels, cu_seqlens, cu_seqlens_padded = pad_or_truncate_thd_tensors(tokens, labels, cu_seqlens, cu_seqlens_padded, max_seq_len, get_tokenizer().pad, IGNORE_INDEX)
-
-        # Loss mask.
-        loss_mask = torch.ones(max_seq_len, dtype=torch.float32)
-        loss_mask[labels == get_tokenizer().pad] = 0.0  # NOTE(asolergi-nv): Mask paddings
-        loss_mask[labels == IGNORE_INDEX] = 0.0  # NOTE(asolergi-nv): Mask prompts 
-        print(f"Trained tokens: {sum(loss_mask)} ({sum(loss_mask) / max_seq_len * 100:.2f}%), padding tokens: {sum(tokens == get_tokenizer().pad)} ({sum(tokens == get_tokenizer().pad) / max_seq_len * 100:.2f}%)")
-        
-        # NOTE(asolergi-nv): max_seqlen is computed here https://github.com/NVIDIA-NeMo/RL/blob/2841fefb699a460cc4375fb2983b40c018ca76fe/nemo_rl/models/megatron/data.py#L423-L429
-        seq_lens = cu_seqlens[1:] - cu_seqlens[:-1] if cu_seqlens_padded is None else cu_seqlens_padded[1:] - cu_seqlens_padded[:-1]
-        max_seqlen = torch.tensor(
-            [seq_lens.max().item()],
-            dtype=torch.int32,
-            )
-        
-        batch = {
-            'tokens': tokens.unsqueeze(0).cuda(non_blocking=True), # NOTE(asolergi-nv): Add back batch dimension
-            'labels': labels.unsqueeze(0).cuda(non_blocking=True), # NOTE(asolergi-nv): Add back batch dimension
-            'loss_mask': loss_mask.unsqueeze(0).cuda(non_blocking=True), # NOTE(asolergi-nv): Add batch dimension
-            'cu_seqlens': cu_seqlens.cuda(non_blocking=True),
-            'cu_seqlens_padded': cu_seqlens_padded.cuda(non_blocking=True),
-            'max_seqlen': max_seqlen.cuda(non_blocking=True),
-        }
-
-    batch = get_sft_batch_on_this_tp_rank(batch) # TODO(asolergi-nv): Add mtp_on_this_rank condition?
-    batch = get_sft_batch_on_this_cp_rank(batch, get_context_parallel_group())
+    # TODO(asolergi-nv): Fuse TP Sharing!
+    batch = get_sft_batch_on_this_tp_rank(batch, broadcast_src_rank=mpu.get_tensor_model_parallel_src_rank(), broadcast_group=mpu.get_tensor_model_parallel_group(), tp_rank=tp_rank, micro_batch_size=args.micro_batch_size, seq_length=args.seq_length, mtp_on_this_rank=False, pipeline_model_parallel_size=args.pipeline_model_parallel_size, is_pipeline_first_stage=mpu.is_pipeline_first_stage(), is_pipeline_last_stage=mpu.is_pipeline_last_stage()) # TODO(asolergi-nv): Add mtp_on_this_rank condition?
+    batch = get_batch_on_this_cp_rank(batch, cp_group=get_context_parallel_group())
 
     return batch.values()
 
@@ -239,15 +188,17 @@ def forward_step(data_iterator, model: MambaModel):
             max_seqlen,
         ) = get_batch(data_iterator, vp_stage)
 
-    packed_seq_params = PackedSeqParams(
-        qkv_format="thd",
-        cu_seqlens_q=cu_seqlens,
-        cu_seqlens_kv=cu_seqlens,
-        cu_seqlens_q_padded=cu_seqlens_padded,
-        cu_seqlens_kv_padded=cu_seqlens_padded,
-        max_seqlen_q=max_seqlen,
-        max_seqlen_kv=max_seqlen,
-    )
+    packed_seq_params = None
+    if cu_seqlens is not None:
+        packed_seq_params = PackedSeqParams(
+            qkv_format="thd",
+            cu_seqlens_q=cu_seqlens,
+            cu_seqlens_kv=cu_seqlens,
+            cu_seqlens_q_padded=cu_seqlens_padded,
+            cu_seqlens_kv_padded=cu_seqlens_padded,
+            max_seqlen_q=max_seqlen,
+            max_seqlen_kv=max_seqlen,
+        )
 
     timers('batch-generator').stop()
 
