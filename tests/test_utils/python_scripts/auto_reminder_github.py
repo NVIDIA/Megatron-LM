@@ -260,7 +260,7 @@ class PRReviewTracker:
             query = (
                 f'repo:"{self.repo.full_name}" '
                 f'milestone:"{milestone.title}" '
-                f'is:open is:pr '
+                f'is:open is:pr -is:draft '
                 f'label:"{self.EXPERT_REVIEW}","{self.FINAL_REVIEW}"'
             )
             try:
