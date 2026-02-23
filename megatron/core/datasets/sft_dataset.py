@@ -143,6 +143,9 @@ class SFTDataset(MegatronDataset):
         doc_index_beg, doc_index_beg_offset = self.sample_index[idx]
         doc_index_end, doc_index_end_offset = self.sample_index[idx + 1]
 
+        assert doc_index_beg_offset == 0 # TODO(asolergi-nv): Remove
+        assert doc_index_end_offset == 0 # TODO(asolergi-nv): Remove
+
         document_ids = []
         sample_parts = []
 
@@ -168,9 +171,6 @@ class SFTDataset(MegatronDataset):
         # Sample spans multiple documents
         else:
             for i in range(doc_index_beg, doc_index_end + 1):
-                # Add the document id
-                document_ids.append(self.document_index[i])
-
                 # Add the sample part
                 offset = 0 if i > doc_index_beg else doc_index_beg_offset
                 length = (
@@ -178,6 +178,13 @@ class SFTDataset(MegatronDataset):
                     if i < doc_index_end
                     else doc_index_end_offset + self.config.add_extra_token_to_sequence
                 )
+                # TODO(asolergi-nv): Improve this logic, we will always be in this else statement & always get a full sample
+                if length is not None and length < 2:
+                    break
+                
+                # Add the document id
+                document_ids.append(self.document_index[i])
+                
                 sample_parts.append(
                     self.dataset.get(self.document_index[i], offset=int(offset), length=length)
                 )

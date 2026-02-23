@@ -31,7 +31,9 @@ from tools.build_sequences_per_dataset import build_sequences_per_dataset
 
 from megatron.core.tokenizers.text.libraries.sft_tokenizer import nemotron_nano_v2_custom_template
 
-# TODO(asolergi-nv): Add chat template to tokens
+# TODO(asolergi-nv): Add chat template to tokens | DONE
+# TODO(asolergi-nv): Use tokenize_conversation instead of apply_chat_template
+# TODO(asolergi-nv): Add padding truncation logic tests 
 def create_file_prefixes(tokenizer, number_of_files, maximum_number_of_conversations, maximum_number_of_messages_per_conversation, with_system_message, dataset_dir):
     # Create dataset directory
     os.makedirs(dataset_dir, exist_ok=True)
@@ -150,8 +152,10 @@ def test_sft_dataset(
             SFTDataset, [100, 10, 10], lambda: True, config
         ).build()
 
-        print(f"train_ds: {train_ds[0]}")
+        # print(f"train_ds: {train_ds[0]['cu_seqlens']}, {train_ds[0]['tokens'].shape}, {train_ds[0]['labels'].shape}")
 
+        for i in range(10):
+            print(f"train_ds[{i}]: {train_ds[i]['cu_seqlens']} ({train_ds[i]['cu_seqlens'].shape}), {train_ds[i]['tokens'].shape}, {train_ds[i]['labels'].shape}")
 
     
     
