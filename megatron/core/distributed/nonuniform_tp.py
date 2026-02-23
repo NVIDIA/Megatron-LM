@@ -22,6 +22,7 @@ import sys
 import torch
 import torch.distributed as dist
 from contextlib import nullcontext
+from dataclasses import dataclass
 from typing import Dict, List, Optional, Set, Tuple
 
 from torch.distributed import _coalescing_manager
@@ -40,6 +41,42 @@ from .param_and_grad_buffer import (
 )
 
 logger = logging.getLogger(__name__)
+
+
+# ======================================================================================
+# NTP Configuration
+# ======================================================================================
+
+
+@dataclass
+class NonuniformTPConfig:
+    """Configuration for Nonuniform Tensor Parallelism (NTP).
+
+    NTP provides fault tolerance for tensor-parallel training by designating
+    a subset of TP ranks as "spares" that can handle GPU failures.
+    """
+
+    tp_base: int = 8
+    """Base for tensor parallelism. This is the number of ranks in healthy tensor parallel groups.
+       Used for nonuniform tensor parallelism."""
+
+    tp_spares: int = 0
+    """Number of spares for nonuniform tensor parallelism. When > 0, enables nonuniform TP mode
+       where (tp_base - tp_spares) ranks handle computation and tp_spares ranks provide fault tolerance."""
+
+    num_reduced_tp_dp_ranks: int = 1
+    """Number of DP ranks that use reduced TP (tp_base - tp_spares). The remaining DP ranks use
+       full tp_base. Reduced TP ranks are assumed to come first in the global rank ordering."""
+
+    non_active_ranks_per_dp: Optional[Dict[Tuple[int, int, int], List[int]]] = None
+    """Mapping of (DP rank, CP rank, PP rank) to list of non-active (spare) local TP rank IDs.
+       This allows specifying arbitrary GPU failures across all parallelism dimensions.
+       Example: {(0,0,0): [0,3], (0,1,0): [1,2], (1,0,0): [0,3]} means:
+         - DP rank 0, CP rank 0, PP rank 0 has local TP ranks 0,3 as spares
+         - DP rank 0, CP rank 1, PP rank 0 has local TP ranks 1,2 as spares
+         - DP rank 1, CP rank 0, PP rank 0 has local TP ranks 0,3 as spares
+       The number of non-active ranks must be consistent across CP replicas within each DP rank.
+       If None, defaults to last tp_spares ranks as non-active."""
 
 
 # ======================================================================================
@@ -101,7 +138,7 @@ def compute_uniform_tp_spares_with_parity(
 
 
 def get_active_ranks_for_dp(
-    dp_rank: int, tp_base: int, ddp_config: DistributedDataParallelConfig
+    dp_rank: int, tp_base: int, ntp_config: NonuniformTPConfig
 ) -> List[int]:
     """
     Get list of active (non-spare) local rank IDs for a given DP rank.
@@ -109,18 +146,18 @@ def get_active_ranks_for_dp(
     Args:
         dp_rank: Data parallel rank
         tp_base: Base tensor parallel size
-        ddp_config: DDP configuration
+        ntp_config: NTP configuration
 
     Returns:
         List of local rank IDs that are active (not spare)
     """
-    if ddp_config.non_active_ranks_per_dp and dp_rank in ddp_config.non_active_ranks_per_dp:
+    if ntp_config.non_active_ranks_per_dp and dp_rank in ntp_config.non_active_ranks_per_dp:
         # Use explicitly specified non-active ranks
-        non_active = set(ddp_config.non_active_ranks_per_dp[dp_rank])
+        non_active = set(ntp_config.non_active_ranks_per_dp[dp_rank])
         active_ranks = [i for i in range(tp_base) if i not in non_active]
     else:
         # Default: first (tp_base - tp_spares) ranks are active
-        red_tp = tp_base - ddp_config.tp_spares
+        red_tp = tp_base - ntp_config.tp_spares
         active_ranks = list(range(red_tp))
 
     return active_ranks
@@ -131,7 +168,7 @@ def get_active_ranks_for_dp(
 # ======================================================================================
 
 
-def initialize_nonuniform_tp_process_groups(ddp_config: DistributedDataParallelConfig):
+def initialize_nonuniform_tp_process_groups(ntp_config: NonuniformTPConfig):
     """
     Reconfigure TP and CP process groups for nonuniform tensor parallelism.
 
@@ -139,22 +176,22 @@ def initialize_nonuniform_tp_process_groups(ddp_config: DistributedDataParallelC
     Non-active (spare) ranks will exit after group creation.
 
     Args:
-        ddp_config: DDP configuration containing tp_base, tp_spares, num_reduced_tp_dp_ranks,
+        ntp_config: NTP configuration containing tp_base, tp_spares, num_reduced_tp_dp_ranks,
                     and optionally non_active_ranks_per_dp
     """
-    if ddp_config.tp_spares == 0:
+    if ntp_config.tp_spares == 0:
         # No nonuniform TP, nothing to reconfigure
         return
 
-    tp_base = ddp_config.tp_base
-    tp_spares = ddp_config.tp_spares
+    tp_base = ntp_config.tp_base
+    tp_spares = ntp_config.tp_spares
     cp_size = parallel_state.get_context_parallel_world_size()
     rank = dist.get_rank()
     world_size = dist.get_world_size()
 
     # Calculate which DP replicas use reduced TP
     dp_replica_size = tp_base * cp_size
-    num_reduced_dp_ranks = ddp_config.num_reduced_tp_dp_ranks
+    num_reduced_dp_ranks = ntp_config.num_reduced_tp_dp_ranks
 
     # Determine if current rank is in a reduced TP DP replica
     dp_replica_id = rank // dp_replica_size
@@ -165,7 +202,7 @@ def initialize_nonuniform_tp_process_groups(ddp_config: DistributedDataParallelC
 
     # This rank is in a reduced TP DP replica - need to reconfigure
     # Get active ranks for this DP replica (supports non-contiguous)
-    active_local_ranks = get_active_ranks_for_dp(dp_replica_id, tp_base, ddp_config)
+    active_local_ranks = get_active_ranks_for_dp(dp_replica_id, tp_base, ntp_config)
     local_rank_in_dp = rank % dp_replica_size
 
     logger.info(f"[NTP] Rank {rank} in DP replica {dp_replica_id}: active_local_ranks={active_local_ranks}")
@@ -236,7 +273,7 @@ def initialize_nonuniform_tp_process_groups(ddp_config: DistributedDataParallelC
 # ======================================================================================
 
 
-def ntp_map(module: torch.nn.Module, ddp_config: DistributedDataParallelConfig, num_shards: int):
+def ntp_map(module: torch.nn.Module, ntp_config: NonuniformTPConfig, num_shards: int):
     """
     Initialize TP-sharded params with mapping between healthy and unhealthy TP sizes.
 
@@ -246,10 +283,10 @@ def ntp_map(module: torch.nn.Module, ddp_config: DistributedDataParallelConfig, 
 
     Args:
         module: Module containing parameters to initialize (e.g., self_attention or mlp)
-        ddp_config: DDP configuration containing tp_base and tp_spares
+        ntp_config: NTP configuration containing tp_base and tp_spares
         num_shards: Number of shards (e.g., num_attention_heads or ffn_hidden_size)
     """
-    if ddp_config.tp_spares == 0:
+    if ntp_config.tp_spares == 0:
         # No nonuniform TP, skip initialization
         return
 
@@ -265,7 +302,7 @@ def ntp_map(module: torch.nn.Module, ddp_config: DistributedDataParallelConfig, 
     )
 
     # Check if this (DP, CP, PP) combination uses reduced TP (unhealthy) or full TP (healthy)
-    non_active_ranks_per_dp = ddp_config.non_active_ranks_per_dp or {}
+    non_active_ranks_per_dp = ntp_config.non_active_ranks_per_dp or {}
 
     # Check if this (dp, cp, pp) combination has non-active ranks specified
     # If it does, it's an unhealthy rank that uses reduced TP
@@ -287,7 +324,7 @@ def ntp_map(module: torch.nn.Module, ddp_config: DistributedDataParallelConfig, 
         ):
             # For healthy ranks, compute send/recv splits for communication with unhealthy ranks
             # We need to know how to reshard to match the reduced TP size
-            reduced_tp_size = ddp_config.tp_base - ddp_config.tp_spares
+            reduced_tp_size = ntp_config.tp_base - ntp_config.tp_spares
 
             shard_ids = torch.arange(num_shards)
             # Partitions for reduced TP (what unhealthy ranks have)
@@ -295,15 +332,15 @@ def ntp_map(module: torch.nn.Module, ddp_config: DistributedDataParallelConfig, 
 
             # Full partitions for healthy ranks (tp_base ranks)
             comp_partitions = sync_partitions + [
-                torch.empty(int(len(shard_ids) / ddp_config.tp_base), dtype=torch.int)
-                for _ in range(ddp_config.tp_spares)
+                torch.empty(int(len(shard_ids) / ntp_config.tp_base), dtype=torch.int)
+                for _ in range(ntp_config.tp_spares)
             ]
 
             # Build comp_2_sync: for spare positions, which reduced TP ranks do they map to
-            comp_2_sync = [[] for _ in range(ddp_config.tp_base)]
+            comp_2_sync = [[] for _ in range(ntp_config.tp_base)]
             sync_part_idx = 0
 
-            for spare_part_idx in range(reduced_tp_size, ddp_config.tp_base):
+            for spare_part_idx in range(reduced_tp_size, ntp_config.tp_base):
                 for shard_part_idx in range(len(comp_partitions[spare_part_idx])):
                     # Take the last shard from the current reduced TP rank
                     comp_partitions[spare_part_idx][shard_part_idx] = comp_partitions[sync_part_idx][
@@ -315,15 +352,15 @@ def ntp_map(module: torch.nn.Module, ddp_config: DistributedDataParallelConfig, 
 
             # Compute param_splits: how many shards each rank sends to each other rank
             param_splits = [
-                torch.bincount(torch.tensor(c2s, dtype=torch.int), minlength=ddp_config.tp_base)
+                torch.bincount(torch.tensor(c2s, dtype=torch.int), minlength=ntp_config.tp_base)
                 for c2s in comp_2_sync
             ]
 
-            shard_size = int(param.shape[param.partition_dim] * ddp_config.tp_base / len(shard_ids))
+            shard_size = int(param.shape[param.partition_dim] * ntp_config.tp_base / len(shard_ids))
             send_splits = [(p_split * shard_size).tolist() for p_split in param_splits]
             recv_splits = [
                 [send_splits[send_idx][recv_idx] for send_idx in range(len(send_splits))]
-                for recv_idx in range(ddp_config.tp_base)
+                for recv_idx in range(ntp_config.tp_base)
             ]
             param.send_splits = send_splits
             param.recv_splits = recv_splits
@@ -333,7 +370,7 @@ def ntp_map(module: torch.nn.Module, ddp_config: DistributedDataParallelConfig, 
             )
 
 
-def ntp_init(layer: torch.nn.Module, ddp_config: DistributedDataParallelConfig):
+def ntp_init(layer: torch.nn.Module, ntp_config: NonuniformTPConfig):
     """
     Initialize nonuniform TP mappings for a TransformerLayer.
 
@@ -342,9 +379,9 @@ def ntp_init(layer: torch.nn.Module, ddp_config: DistributedDataParallelConfig):
 
     Args:
         layer: TransformerLayer instance
-        ddp_config: DDP configuration containing tp_base and tp_spares
+        ntp_config: NTP configuration containing tp_base and tp_spares
     """
-    if ddp_config.tp_spares == 0:
+    if ntp_config.tp_spares == 0:
         # No nonuniform TP, skip initialization
         return
 
@@ -352,13 +389,13 @@ def ntp_init(layer: torch.nn.Module, ddp_config: DistributedDataParallelConfig):
     if hasattr(layer, 'self_attention'):
         ntp_map(
             layer.self_attention,
-            ddp_config,
+            ntp_config,
             layer.self_attention.config.num_attention_heads,
         )
 
     # Initialize MLP parameters
     if hasattr(layer, 'mlp'):
-        ntp_map(layer.mlp, ddp_config, layer.mlp.config.ffn_hidden_size)
+        ntp_map(layer.mlp, ntp_config, layer.mlp.config.ffn_hidden_size)
 
 
 # ======================================================================================
@@ -371,6 +408,10 @@ class NonuniformTPParamAndGradBucketGroup(_ParamAndGradBucketGroup):
     NTP-aware version of _ParamAndGradBucketGroup.
     Skips gradient synchronization for spare GPUs.
     """
+
+    def __init__(self, *args, ntp_config: Optional[NonuniformTPConfig] = None, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.ntp_config = ntp_config or NonuniformTPConfig()
 
     def allreduce_or_reduce_scatter_gradients(
         self,
@@ -395,9 +436,9 @@ class NonuniformTPParamAndGradBucketGroup(_ParamAndGradBucketGroup):
         # NOTE: only sync on core GPUs (not spares) for nonuniform TP
         grad_reduce_handle = None
         should_sync = True
-        if self.ddp_config.tp_spares > 0:
+        if self.ntp_config.tp_spares > 0:
             tp_rank = parallel_state.get_tensor_model_parallel_rank()
-            should_sync = tp_rank < self.ddp_config.tp_base - self.ddp_config.tp_spares
+            should_sync = tp_rank < self.ntp_config.tp_base - self.ntp_config.tp_spares
 
         if should_sync:
             # Coalesce communication kernels across buckets in the bucket group.
@@ -475,6 +516,10 @@ class NonuniformTPParamAndGradBuffer(_ParamAndGradBuffer):
     Adjusts buffer sizes and splits gradients for NTP.
     """
 
+    def __init__(self, *args, ntp_config: Optional[NonuniformTPConfig] = None, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.ntp_config = ntp_config or NonuniformTPConfig()
+
     def _make_param_hook(
         self,
         param: torch.nn.Parameter,
@@ -491,13 +536,13 @@ class NonuniformTPParamAndGradBuffer(_ParamAndGradBuffer):
 
         # Adjust numel for nonuniform tensor parallelism
         if (
-            self.ddp_config.tp_spares > 0
+            self.ntp_config.tp_spares > 0
             and hasattr(param, 'tensor_model_parallel')
             and param.tensor_model_parallel
         ):
             tp_world_size = parallel_state.get_tensor_model_parallel_world_size()
             this_numel = int(
-                tp_world_size * this_numel / (self.ddp_config.tp_base - self.ddp_config.tp_spares)
+                tp_world_size * this_numel / (self.ntp_config.tp_base - self.ntp_config.tp_spares)
             )
 
         # Call parent method to set up the param hook and buffers
@@ -508,7 +553,7 @@ class NonuniformTPParamAndGradBuffer(_ParamAndGradBuffer):
 
         # After parent setup, handle NTP-specific grad buffer splitting
         if (
-            self.ddp_config.tp_spares > 0
+            self.ntp_config.tp_spares > 0
             and hasattr(param, 'tensor_model_parallel')
             and param.tensor_model_parallel
         ):
@@ -517,7 +562,7 @@ class NonuniformTPParamAndGradBuffer(_ParamAndGradBuffer):
             shape[param.partition_dim] = int(
                 shape[param.partition_dim]
                 * tp_world_size
-                / (self.ddp_config.tp_base - self.ddp_config.tp_spares)
+                / (self.ntp_config.tp_base - self.ntp_config.tp_spares)
             )
 
             # Get the grad buffer that was allocated by parent
@@ -565,9 +610,12 @@ class NonuniformTPDistributedDataParallel(DistributedDataParallel):
         module: torch.nn.Module,
         disable_bucketing: bool = False,
         pg_collection: Optional[ProcessGroupCollection] = None,
+        ntp_config: Optional[NonuniformTPConfig] = None,
     ):
+        self.ntp_config = ntp_config or NonuniformTPConfig()
+
         # Use NTP-aware buffer class
-        if ddp_config.tp_spares > 0:
+        if self.ntp_config.tp_spares > 0:
             # Temporarily monkey-patch the buffer class
             original_buffer_class = _ParamAndGradBuffer
             import megatron.core.distributed.param_and_grad_buffer as buffer_module
@@ -576,7 +624,7 @@ class NonuniformTPDistributedDataParallel(DistributedDataParallel):
 
         super().__init__(config, ddp_config, module, disable_bucketing, pg_collection)
 
-        if ddp_config.tp_spares > 0:
+        if self.ntp_config.tp_spares > 0:
             # Restore original class
             buffer_module._ParamAndGradBuffer = original_buffer_class
 
@@ -592,16 +640,16 @@ class NonuniformTPDistributedDataParallel(DistributedDataParallel):
 
             # Add NTP-specific logic
             if (
-                self.ddp_config.tp_spares > 0
+                self.ntp_config.tp_spares > 0
                 and hasattr(param, 'tensor_model_parallel')
                 and param.tensor_model_parallel
-                and parallel_state.get_tensor_model_parallel_world_size() == self.ddp_config.tp_base
+                and parallel_state.get_tensor_model_parallel_world_size() == self.ntp_config.tp_base
             ):
                 empty_shape = list(param.shape)
                 empty_shape[param.partition_dim] = 0
                 tp_rank = parallel_state.get_tensor_model_parallel_rank()
 
-                if tp_rank < self.ddp_config.tp_base - self.ddp_config.tp_spares:
+                if tp_rank < self.ntp_config.tp_base - self.ntp_config.tp_spares:
                     # Core GPU: receive grads from spare GPUs
                     input = [
                         torch.empty(
@@ -614,13 +662,13 @@ class NonuniformTPDistributedDataParallel(DistributedDataParallel):
                         torch.empty(
                             empty_shape, device=param.device, dtype=param.side_grad.dtype
                         ).contiguous()
-                        for _ in range(self.ddp_config.tp_base - self.ddp_config.tp_spares)
+                        for _ in range(self.ntp_config.tp_base - self.ntp_config.tp_spares)
                     ] + [
                         t.contiguous()
                         for t in torch.split(
                             param.side_grad, param.recv_splits[tp_rank], dim=param.partition_dim
                         )
-                    ][-self.ddp_config.tp_spares :]
+                    ][-self.ntp_config.tp_spares :]
                 else:
                     # Spare GPU: send grads to core GPUs
                     input = [
@@ -666,9 +714,9 @@ class NonuniformTPOptimizer:
     Wrapper for optimizers to make gradients contiguous for NTP.
     """
 
-    def __init__(self, optimizer, ddp_config: DistributedDataParallelConfig):
+    def __init__(self, optimizer, ntp_config: NonuniformTPConfig):
         self.optimizer = optimizer
-        self.ddp_config = ddp_config
+        self.ntp_config = ntp_config
 
     def __getattr__(self, name):
         """Delegate attribute access to wrapped optimizer."""
@@ -685,7 +733,7 @@ class NonuniformTPOptimizer:
             result = False
 
         # Make gradients contiguous for NTP
-        if self.ddp_config.tp_spares > 0:
+        if self.ntp_config.tp_spares > 0:
             for param_group in self.optimizer.param_groups:
                 for param in param_group['params']:
                     if hasattr(param, 'main_grad') and param.main_grad is not None:

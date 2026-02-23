@@ -19,6 +19,7 @@ from megatron.core.distributed.nonuniform_tp import (
     ntp_map,
     ntp_init,
     initialize_nonuniform_tp_process_groups,
+    NonuniformTPConfig,
     NonuniformTPDistributedDataParallel,
     NonuniformTPOptimizer,
     NonuniformTPParamAndGradBuffer,
@@ -74,24 +75,24 @@ class TestNonuniformTPUtilities:
 
     def test_get_active_ranks_for_dp_default(self):
         """Test get_active_ranks_for_dp with default (no explicit non_active_ranks_per_dp)."""
-        ddp_config = DistributedDataParallelConfig(tp_base=8, tp_spares=2)
+        ntp_config = NonuniformTPConfig(tp_base=8, tp_spares=2)
         dp_rank = 0
         tp_base = 8
 
-        active_ranks = get_active_ranks_for_dp(dp_rank, tp_base, ddp_config)
+        active_ranks = get_active_ranks_for_dp(dp_rank, tp_base, ntp_config)
 
         # Should return first (tp_base - tp_spares) ranks
         assert active_ranks == [0, 1, 2, 3, 4, 5]
 
     def test_get_active_ranks_for_dp_explicit(self):
         """Test get_active_ranks_for_dp with explicit non_active_ranks_per_dp."""
-        ddp_config = DistributedDataParallelConfig(
+        ntp_config = NonuniformTPConfig(
             tp_base=8, tp_spares=2, non_active_ranks_per_dp={0: [2, 5]}
         )
         dp_rank = 0
         tp_base = 8
 
-        active_ranks = get_active_ranks_for_dp(dp_rank, tp_base, ddp_config)
+        active_ranks = get_active_ranks_for_dp(dp_rank, tp_base, ntp_config)
 
         # Should exclude ranks 2 and 5
         assert active_ranks == [0, 1, 3, 4, 6, 7]
@@ -109,10 +110,10 @@ class TestNonuniformTPParameterResharding:
         param.partition_dim = 1
         module.parameters = Mock(return_value=[param])
 
-        ddp_config = DistributedDataParallelConfig(tp_base=8, tp_spares=0)
+        ntp_config = NonuniformTPConfig(tp_base=8, tp_spares=0)
 
         # Should not raise error and not add send_splits/recv_splits
-        ntp_map(module, ddp_config, num_shards=24)
+        ntp_map(module, ntp_config, num_shards=24)
 
         assert not hasattr(param, 'send_splits')
         assert not hasattr(param, 'recv_splits')
@@ -139,14 +140,14 @@ class TestNonuniformTPParameterResharding:
         module.parameters = Mock(return_value=[param])
         module.config = MockConfig()
 
-        ddp_config = DistributedDataParallelConfig(
+        ntp_config = NonuniformTPConfig(
             tp_base=8,
             tp_spares=2,
             non_active_ranks_per_dp={},  # No explicit non-active ranks, so this is healthy
         )
 
         # Execute
-        ntp_map(module, ddp_config, num_shards=24)
+        ntp_map(module, ntp_config, num_shards=24)
 
         # Should have added send_splits and recv_splits
         assert hasattr(param, 'send_splits')
@@ -171,14 +172,14 @@ class TestNonuniformTPParameterResharding:
         param.partition_dim = 1
         module.parameters = Mock(return_value=[param])
 
-        ddp_config = DistributedDataParallelConfig(
+        ntp_config = NonuniformTPConfig(
             tp_base=8,
             tp_spares=2,
             non_active_ranks_per_dp={(0, 0, 0): [2, 5]},  # This rank is unhealthy
         )
 
         # Execute
-        ntp_map(module, ddp_config, num_shards=24)
+        ntp_map(module, ntp_config, num_shards=24)
 
         # Should NOT have added send_splits and recv_splits
         assert not hasattr(param, 'send_splits')
@@ -191,10 +192,10 @@ class TestNonuniformTPParameterResharding:
         layer.self_attention = Mock()
         layer.mlp = Mock()
 
-        ddp_config = DistributedDataParallelConfig(tp_base=8, tp_spares=0)
+        ntp_config = NonuniformTPConfig(tp_base=8, tp_spares=0)
 
         # Should not raise error
-        ntp_init(layer, ddp_config)
+        ntp_init(layer, ntp_config)
 
     @patch('megatron.core.distributed.nonuniform_tp.ntp_map')
     def test_ntp_init_with_attention_and_mlp(self, mock_ntp_map):
@@ -211,10 +212,10 @@ class TestNonuniformTPParameterResharding:
         layer.mlp = Mock()
         layer.mlp.config = MockConfig()
 
-        ddp_config = DistributedDataParallelConfig(tp_base=8, tp_spares=2)
+        ntp_config = NonuniformTPConfig(tp_base=8, tp_spares=2)
 
         # Execute
-        ntp_init(layer, ddp_config)
+        ntp_init(layer, ntp_config)
 
         # Should call ntp_map twice
         assert mock_ntp_map.call_count == 2
@@ -235,8 +236,8 @@ class TestNonuniformTPOptimizer:
         mock_optimizer.param_groups = []
         mock_optimizer.state = {}
 
-        ddp_config = DistributedDataParallelConfig(tp_base=8, tp_spares=2)
-        ntp_optimizer = NonuniformTPOptimizer(mock_optimizer, ddp_config)
+        ntp_config = NonuniformTPConfig(tp_base=8, tp_spares=2)
+        ntp_optimizer = NonuniformTPOptimizer(mock_optimizer, ntp_config)
 
         # Should delegate attribute access
         assert ntp_optimizer.param_groups == []
@@ -248,8 +249,8 @@ class TestNonuniformTPOptimizer:
         mock_optimizer.param_groups = [{'params': []}]
         mock_optimizer.prepare_grads = Mock(return_value=False)
 
-        ddp_config = DistributedDataParallelConfig(tp_base=8, tp_spares=0)
-        ntp_optimizer = NonuniformTPOptimizer(mock_optimizer, ddp_config)
+        ntp_config = NonuniformTPConfig(tp_base=8, tp_spares=0)
+        ntp_optimizer = NonuniformTPOptimizer(mock_optimizer, ntp_config)
 
         result = ntp_optimizer.prepare_grads()
 
@@ -268,8 +269,8 @@ class TestNonuniformTPOptimizer:
         mock_optimizer.param_groups = [{'params': [param]}]
         mock_optimizer.prepare_grads = Mock(return_value=False)
 
-        ddp_config = DistributedDataParallelConfig(tp_base=8, tp_spares=2)
-        ntp_optimizer = NonuniformTPOptimizer(mock_optimizer, ddp_config)
+        ntp_config = NonuniformTPConfig(tp_base=8, tp_spares=2)
+        ntp_optimizer = NonuniformTPOptimizer(mock_optimizer, ntp_config)
 
         ntp_optimizer.prepare_grads()
 
@@ -288,8 +289,8 @@ class TestNonuniformTPOptimizer:
         mock_optimizer.param_groups = [{'params': [param]}]
         mock_optimizer.prepare_grads = Mock(return_value=False)
 
-        ddp_config = DistributedDataParallelConfig(tp_base=8, tp_spares=2)
-        ntp_optimizer = NonuniformTPOptimizer(mock_optimizer, ddp_config)
+        ntp_config = NonuniformTPConfig(tp_base=8, tp_spares=2)
+        ntp_optimizer = NonuniformTPOptimizer(mock_optimizer, ntp_config)
 
         ntp_optimizer.prepare_grads()
 
@@ -309,12 +310,13 @@ class TestNonuniformTPIntegration:
         config = TransformerConfig(
             num_layers=1, hidden_size=10, num_attention_heads=1, context_parallel_size=1
         )
-        ddp_config = DistributedDataParallelConfig(tp_base=8, tp_spares=2)
+        ddp_config = DistributedDataParallelConfig()
+        ntp_config = NonuniformTPConfig(tp_base=8, tp_spares=2)
 
         # Should initialize without error
         try:
             ntp_ddp = NonuniformTPDistributedDataParallel(
-                config, ddp_config, model, disable_bucketing=True
+                config, ddp_config, model, disable_bucketing=True, ntp_config=ntp_config
             )
             # Check that it's an instance of base DDP
             from megatron.core.distributed import DistributedDataParallel
@@ -346,11 +348,12 @@ class TestNonuniformTPIntegration:
         config = TransformerConfig(
             num_layers=1, hidden_size=10, num_attention_heads=1, context_parallel_size=1
         )
-        ddp_config = DistributedDataParallelConfig(tp_base=8, tp_spares=2)
+        ddp_config = DistributedDataParallelConfig()
+        ntp_config = NonuniformTPConfig(tp_base=8, tp_spares=2)
 
         try:
             ntp_ddp = NonuniformTPDistributedDataParallel(
-                config, ddp_config, model, disable_bucketing=True
+                config, ddp_config, model, disable_bucketing=True, ntp_config=ntp_config
             )
             # If we got here, the hook was created successfully
             assert True
@@ -401,7 +404,7 @@ class TestNonuniformTPEndToEnd:
         dp_rank = parallel_state.get_data_parallel_rank()
 
         # Configure NTP: first DP rank uses reduced TP=2
-        ddp_config = DistributedDataParallelConfig(
+        ntp_config = NonuniformTPConfig(
             tp_base=4,
             tp_spares=2,
             num_reduced_tp_dp_ranks=1,
@@ -420,7 +423,7 @@ class TestNonuniformTPEndToEnd:
             # For spare ranks in test, just mark as passed and exit gracefully
             pytest.skip(f"Rank {rank} is a spare rank, skipping test gracefully")
 
-        initialize_nonuniform_tp_process_groups(ddp_config)
+        initialize_nonuniform_tp_process_groups(ntp_config)
 
         # After reconfiguration, check TP size
         tp_size_after = parallel_state.get_tensor_model_parallel_world_size()
@@ -457,7 +460,7 @@ class TestNonuniformTPEndToEnd:
                     return [self.param]
 
             mock_module = MockModule(model.weight)
-            ntp_map(mock_module, ddp_config, num_shards=hidden_size)
+            ntp_map(mock_module, ntp_config, num_shards=hidden_size)
 
             # Verify send_splits and recv_splits were added
             assert hasattr(model.weight, 'send_splits'), "Healthy rank should have send_splits"
