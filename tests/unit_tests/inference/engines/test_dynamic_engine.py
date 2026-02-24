@@ -124,7 +124,7 @@ class DynamicEngineTestConfig:
     skip_prompt_log_probs: bool = False
     enable_chunked_prefill: bool = False
     cuda_graph_scope: List[CudaGraphScope] = field(
-        default_factory=lambda: [CudaGraphScope.full_iteration]
+        default_factory=lambda: [CudaGraphScope.full_iteration_inference]
     )
     force_build_cuda_graphs: bool = False
     transformer_impl: str = "local"
@@ -543,8 +543,8 @@ class TestDynamicInferenceEngine:
         not is_fa_min_version("2.7.3"), reason="need latest flash attn for dynamic batching"
     )
     @pytest.mark.parametrize("model_provider", ["gpt", "mamba"])
-    @pytest.mark.parametrize("num_cuda_graphs", [None, 1, 4])
-    @pytest.mark.parametrize("cuda_graph_scope", [[], [CudaGraphScope.full_iteration]])
+    @pytest.mark.parametrize("num_cuda_graphs", [None, 1, 4, -1])
+    @pytest.mark.parametrize("cuda_graph_scope", [[], [CudaGraphScope.full_iteration_inference]])
     def test_simple(self, model_provider, num_cuda_graphs, cuda_graph_scope) -> None:
         """Simple test that runs without errors, and validates output."""
         skip_if_mamba_sequence_packing_not_available(model_provider)
@@ -557,10 +557,23 @@ class TestDynamicInferenceEngine:
             num_cuda_graphs=num_cuda_graphs,
             cuda_graph_scope=cuda_graph_scope,
             force_build_cuda_graphs=True,
+            context_max_requests=128,
         )
 
         # Validate max_requests, max_tokens.
         assert env.engine.context.max_tokens == DynamicInferenceContext.DEFAULT_MAX_TOKENS
+
+        if num_cuda_graphs is not None:
+            assert env.engine.context.cuda_graph_token_counts is not None
+            assert env.engine.context.cuda_graph_batch_dimensions_list
+            model = env.engine.controller.inference_wrapped_model.model
+            if cuda_graph_scope == [CudaGraphScope.full_iteration_inference]:
+                # check if cudagraph runners are created at the decoder level
+                assert model.decoder.cudagraph_manager.cudagraph_runners
+            else:
+                # check if cudagraph runners are created at the layer level
+                for layer in model.decoder.layers:
+                    assert layer.cudagraph_manager.cudagraph_runners
 
         # Validate generated tokens.
         gpt_expected_generated_tokens = [
