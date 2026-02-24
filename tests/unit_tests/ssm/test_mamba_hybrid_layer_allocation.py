@@ -10,6 +10,7 @@ from megatron.core.ssm.mamba_hybrid_layer_allocation import (
     ParsedHybridPattern,
     Symbols,
     allocate_layers,
+    get_layer_maps_from_layer_type_list,
     parse_hybrid_pattern,
 )
 
@@ -27,6 +28,8 @@ class TestMambaHybridLayerAllocation:
             (8, 0.25, 0.25, "MM*-MM*-"),
             (8, 0.5, 0.25, "M**-M**-"),
             (48, 0.5, 0.2, None),
+            (4, 0.0, 0.0, "MSMS"),
+            (5, 0.0, 0.0, "MSM*-"),
         ]
         for test in test_cases:
             (layers_count, attention_ratio, mlp_ratio, override_pattern) = test
@@ -101,6 +104,8 @@ class TestParseHybridPattern:
             ("*M*M", "*M*M"),
             ("MM-*", "MM-*"),
             ("E", "E"),
+            ("MSMS", "MSMS"),
+            ("SM", "SM"),
         ]
         for pattern, expected_main in test_cases:
             result = parse_hybrid_pattern(pattern)
@@ -200,6 +205,8 @@ class TestParseHybridPattern:
             ("*****/M/M/M/M", "*****", "M", 4),
             # MoE in main pattern
             ("MEME/MM/MM", "MEME", "MM", 2),
+            # DSA in main pattern with MTP
+            ("MSMS/MS/MS", "MSMS", "MS", 2),
         ]
         for pattern, expected_main, expected_mtp, expected_depths in test_cases:
             result = parse_hybrid_pattern(pattern)
@@ -212,3 +219,46 @@ class TestParseHybridPattern:
         p1 = parse_hybrid_pattern("M*M*/MM/MM")
         p2 = ParsedHybridPattern(main_pattern="M*M*", mtp_pattern="MM", mtp_num_depths=2)
         assert p1 == p2
+
+
+@pytest.mark.internal
+class TestGetLayerMapsFromLayerTypeList:
+    """Tests for get_layer_maps_from_layer_type_list."""
+
+    def test_standard_layer_types(self):
+        """Standard symbols each produce a single-entry map at local index 0."""
+        maps = get_layer_maps_from_layer_type_list(["*", "M", "-", "E"])
+        assert len(maps) == 4
+        attention_map, mamba_map, mlp_map, moe_map = maps
+        assert attention_map == {0: 0}
+        assert mamba_map == {1: 0}
+        assert mlp_map == {2: 0}
+        assert moe_map == {3: 0}
+
+    def test_dsa_maps_to_attention(self):
+        """S (DSA) layers are treated as attention for KV cache mapping."""
+        maps = get_layer_maps_from_layer_type_list(["S", "M", "S", "M"])
+        attention_map, mamba_map, mlp_map, moe_map = maps
+        # S at global indices 0 and 2 land in the attention map
+        assert attention_map == {0: 0, 2: 1}
+        assert mamba_map == {1: 0, 3: 1}
+        assert mlp_map == {}
+        assert moe_map == {}
+
+    def test_mixed_attention_and_dsa(self):
+        """Both * and S contribute to the attention map with consecutive local indices."""
+        maps = get_layer_maps_from_layer_type_list(["*", "S", "M", "-"])
+        attention_map, mamba_map, mlp_map, moe_map = maps
+        assert attention_map == {0: 0, 1: 1}
+        assert mamba_map == {2: 0}
+        assert mlp_map == {3: 0}
+        assert moe_map == {}
+
+    def test_all_mamba(self):
+        """All-mamba pattern leaves attention, mlp, and moe maps empty."""
+        maps = get_layer_maps_from_layer_type_list(["M", "M", "M"])
+        attention_map, mamba_map, mlp_map, moe_map = maps
+        assert attention_map == {}
+        assert mamba_map == {0: 0, 1: 1, 2: 2}
+        assert mlp_map == {}
+        assert moe_map == {}
