@@ -227,9 +227,9 @@ async def graceful_shutdown(engine, client=None, *, timeout=10.0):
         except (asyncio.CancelledError, AssertionError):
             pass
     finally:
-        # Engine loop's finally block already closed sockets.
-        # Join/terminate the coordinator process.
-        engine.stop()
+        # Engine loop's finally block already called shutdown().
+        # On the timeout path the coordinator may still be alive.
+        engine.shutdown(immediate=True)
         if client is not None:
             client.stop()
 
@@ -242,9 +242,9 @@ async def force_cleanup_engine(engine):
             await engine.engine_loop_task
         except (asyncio.CancelledError, AssertionError):
             pass
-    # Engine loop's finally block closes sockets on cancel.
-    # stop() joins/terminates the coordinator process idempotently.
-    engine.stop()
+    # Engine loop's finally block calls shutdown() on cancel.
+    # The coordinator may still be alive — terminate it.
+    engine.shutdown(immediate=True)
 
 
 @pytest.fixture
@@ -419,7 +419,7 @@ class TestCoordinator:
                 await graceful_shutdown(engine3, client3, timeout=30.0)
 
             # Terminate engine1's orphaned coordinator process directly.
-            engine1.stop()
+            engine1.shutdown(immediate=True)
 
     @pytest.mark.internal
     @pytest.mark.skipif(not HAVE_ZMQ, reason="pyzmq is required for this test")

@@ -1703,7 +1703,8 @@ class DynamicInferenceEngine(AbstractEngine):
             self.expert_parallel_zmq_communicator.close()
         if hasattr(self, "data_parallel_zmq_communicator"):
             self.data_parallel_zmq_communicator.close()
-        self.zmq_context.term()
+        if not self.zmq_context.closed:
+            self.zmq_context.term()
 
     @trace_async_exceptions
     async def run_engine(self, *, loop: Optional[asyncio.AbstractEventLoop] = None):
