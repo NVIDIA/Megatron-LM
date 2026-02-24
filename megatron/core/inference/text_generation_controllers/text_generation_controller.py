@@ -845,9 +845,7 @@ class TextGenerationController:
             return self.inference_wrapped_model.dummy_forward()
 
         # attempt to use cuda-graph if possible
-        input_ids, position_ids = self._dynamic_step_context_init(
-            is_dummy_forward=True
-        )
+        input_ids, position_ids = self._dynamic_step_context_init(is_dummy_forward=True)
 
         # _dynamic_step_context_init tries to find a cuda-graph that is compatible
         # with all EP ranks. It can also return no match, in which case
@@ -859,7 +857,7 @@ class TextGenerationController:
         else:
             # fallback to eager dummy forward
             self.inference_wrapped_model.dummy_forward()
-            
+
         # clear the context of any temporary state from the dummy forward
         context.reset()
 
