@@ -281,8 +281,6 @@ class ScheduleNode:
         3. torch.cuda.stream context for execution on the specified stream
 
         Args:
-            stream: The CUDA stream to execute on
-            event: The CUDA event for synchronization
             name: Optional name for NVTX range profiling
         """
         self.event.wait(self.stream)
