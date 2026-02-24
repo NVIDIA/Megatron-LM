@@ -630,11 +630,8 @@ class TENorm:
 
         use_fused_residual = config.fused_residual_rmsnorm and has_residual
         if use_fused_residual and config.normalization != "RMSNorm":
-            raise ValueError(
-                "Fused residual is only supported "
-                "for RMSNorm normalization"
-            )
-        
+            raise ValueError("Fused residual is only supported " "for RMSNorm normalization")
+
         if config.normalization == "LayerNorm":
             norm_module = te.pytorch.LayerNorm
         elif config.normalization == "RMSNorm":
@@ -649,10 +646,8 @@ class TENorm:
             else:
                 norm_module = te.pytorch.RMSNorm
         else:
-            raise Exception(
-                "Only LayerNorm and RMSNorm are currently supported"
-            )
-        
+            raise Exception("Only LayerNorm and RMSNorm are currently supported")
+
         instance = norm_module(
             normalized_shape=hidden_size,
             eps=eps,
