@@ -19,6 +19,26 @@ except ImportError:
     HAVE_FLASHINFER = False
 
 
+def _verify_te_to_flashinfer_mxfp8_conversion(te_dequantized, fi_quantized: MXFP8Tensor) -> None:
+    # Sanity check: compare the first logical block (32 values)
+    # Slice logical dimensions first to naturally handle any data swizzling/strides
+    te_block = te_dequantized[0, :32].float()
+
+    # Safely extract bytes from the first logical block, then view as e4m3
+    fi_data_bytes = fi_quantized.data[0, :32].contiguous().view(torch.uint8)
+    fi_data_e4m3 = fi_data_bytes.view(torch.float8_e4m3fn).float()
+
+    # Extract the scale. Logical block (0, 0) is always at physical index 0,
+    # bypassing any scale swizzling layout complexity (like SWIZZLED_128x4)
+    fi_scale_byte = fi_quantized.scale.contiguous().flatten()[0:1].view(torch.uint8).to(torch.int32)
+    fi_scale_f32 = (fi_scale_byte << 23).view(torch.float32)
+
+    fi_block = fi_data_e4m3 * fi_scale_f32
+
+    diff_norm = torch.norm(te_block - fi_block)
+    assert diff_norm < 1e-4, f"MXFP8 sanity check failed. Diff norm: {diff_norm}"
+
+
 def quantize_model_to_mxfp8(model: torch.nn.Module) -> None:
     """
     Converts a TE MXFP8 model to a FlashInfer MXFP8 model by
@@ -40,12 +60,16 @@ def quantize_model_to_mxfp8(model: torch.nn.Module) -> None:
                 # Undo the TE quantization and re-quantize with FlashInfer
                 # Note that this introduces a one-time overhead but avoids any
                 # numerical differences between TE and FlashInfer MXFP8 formats
-                new_val = MXFP8Tensor.from_bf16(val.dequantize())
+                te_dequantized = val.dequantize()
+                fi_quantized = MXFP8Tensor.from_bf16(te_dequantized)
+
+                # Sanity check the numerical correctness of the TE -> FlashInfer conversion
+                _verify_te_to_flashinfer_mxfp8_conversion(te_dequantized, fi_quantized)
 
                 # Remove the existing TE parameter and then replace the
                 # attribute with the re-quantized tensor
                 del model._parameters[key]
-                setattr(model, key, new_val)
+                setattr(model, key, fi_quantized)
 
     if hasattr(model, '_parameters') and model._parameters:
         replace_in_dict(model._parameters)

@@ -92,6 +92,7 @@ except Exception:
     _torch_version = PkgVersion("0.0.0") if HAVE_PACKAGING else "0.0.0"
 _te_version = None
 _fa_version = None
+_flashinfer_version = None
 _mamba_ssm_version = None
 _causal_conv1d_version = None
 
@@ -493,7 +494,10 @@ def get_flashinfer_version():
         )
 
     def get_flashinfer_version_str():
-        import flashinfer
+        try:
+            import flashinfer
+        except ImportError:
+            return None
 
         if hasattr(flashinfer, "__version__"):
             return str(flashinfer.__version__)
@@ -502,7 +506,8 @@ def get_flashinfer_version():
 
     global _flashinfer_version
     if _flashinfer_version is None:
-        _flashinfer_version = PkgVersion(get_flashinfer_version_str())
+        if (flashinfer_version_str := get_flashinfer_version_str()) is not None:
+            _flashinfer_version = PkgVersion(flashinfer_version_str)
     return _flashinfer_version
 
 
@@ -512,9 +517,11 @@ def is_flashinfer_min_version(version, check_equality=True):
         raise ImportError(
             "packaging is not installed. Please install it with `pip install packaging`."
         )
+    if (flashinfer_version := get_flashinfer_version()) is None:
+        return False
     if check_equality:
-        return get_flashinfer_version() >= PkgVersion(version)
-    return get_flashinfer_version() > PkgVersion(version)
+        return flashinfer_version >= PkgVersion(version)
+    return flashinver_version > PkgVersion(version)
 
 
 def ensure_divisibility(numerator, denominator):
