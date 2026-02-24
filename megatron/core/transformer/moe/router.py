@@ -722,7 +722,7 @@ class InferenceTopKRouter(TopKRouter):
     """
 
     def __init__(
-        self, config: TransformerConfig, pg_collection: Optional[ProcessGroupCollection] = None
+        self, config: TransformerConfig, pg_collection: Optional[ProcessGroupCollection] = None, is_mtp_layer: bool = False,
     ) -> None:
         """Initialize the specialized inference top-k router.
 
