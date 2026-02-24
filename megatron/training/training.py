@@ -1509,7 +1509,7 @@ def setup_model_and_optimizer(
     else:
         config, config_overrides = get_megatron_optimizer_config(args)
         config.timers = timers
-        if args.use_mup:
+        if getattr(args, "use_mup", False):
             model_config_source = (
                 unwrapped_model[0] if isinstance(unwrapped_model, list) else unwrapped_model
             )
