@@ -116,18 +116,20 @@ def get_mup_config_overrides(
 
     MuP optimizer scaling rules (as implemented here):
     - Adam/AdamW:
-      - hidden+output lr = base_lr / width_mult
-      - non-embedding tensors with width-scaling fan_in use eps = base_eps / width_mult
+      - hidden (matrix-like) lr = base_lr / width_mult
+      - hidden (matrix-like) eps = base_eps / width_mult
+    - Non-Adam optimizers:
+      - hidden (matrix-like) lr = base_lr / width_mult
+      - no eps override is applied.
     - SGD: no MuP optimizer overrides are applied.
 
-    Embeddings keep the base learning rate and base eps. Output layers are treated
-    like hidden layers unless decoupled_lr is enabled, in which case decoupled_lr
-    takes precedence for output LR (but not eps).
+    Embedding/output and other vector-like parameters keep base LR and base eps.
+    With decoupled_lr enabled, embedding/output params continue using decoupled LR.
 
     Args:
         config (OptimizerConfig): optimizer configuration object.
         mup_width_mult (float): Width multiplier (hidden_size / base_hidden_size).
-        optimizer_type (str): Type of optimizer ('adam' or 'sgd'). Defaults to 'adam'.
+        optimizer_type (str): Optimizer type string from config.optimizer.
 
     Returns:
         Dict[ParamKey, ParamGroupOverride]: MuP optimizer overrides.
@@ -140,7 +142,7 @@ def get_mup_config_overrides(
             "Both decoupled_lr and MuP LR scaling are enabled. decoupled_lr sets an "
             "absolute LR for embedding+output params. MuP LR scaling will only be "
             "applied to hidden layers in this case. MuP Adam epsilon scaling "
-            "remains applied to non-embedding parameters.",
+            "remains applied to hidden matrix-like parameters.",
         )
 
     if mup_width_mult == 1.0:
@@ -151,11 +153,14 @@ def get_mup_config_overrides(
     if optimizer_type.lower() == 'sgd':
         return {}
 
+    optimizer_type_lower = optimizer_type.lower()
+    is_adam_optimizer = 'adam' in optimizer_type_lower
+
     hidden_lr_mult = 1.0 / mup_width_mult
     base_lr = config.lr
     base_min_lr = config.min_lr
 
-    # Hidden/output layers get scaled LR; embeddings use base LR.
+    # Hidden matrix-like layers get scaled LR/eps; vector-like params keep base values.
     # Prefer the explicit parameter attribute set by LanguageModule. Fall back to
     # a conservative name check for older or non-language modules.
     def is_embedding_parameter(param: torch.nn.Parameter, param_name: str) -> bool:
@@ -165,17 +170,24 @@ def get_mup_config_overrides(
             return bool(param.is_embedding_parameter)
         return 'embedding' in param_name.lower()
 
+    def is_vector_like_parameter(param: torch.nn.Parameter, param_name: str) -> bool:
+        if is_embedding_parameter(param, param_name):
+            return True
+        if param.dim() <= 1:
+            return True
+        return False
+
     def should_scale_lr_with_mup(param: torch.nn.Parameter, param_name: str) -> bool:
         if decoupled_lr_enabled and getattr(param, 'is_embedding_or_output_parameter', False):
             return False
-        return not is_embedding_parameter(param, param_name)
+        return not is_vector_like_parameter(param, param_name)
 
     def should_scale_eps_with_mup(param: torch.nn.Parameter, param_name: str) -> bool:
-        if is_embedding_parameter(param, param_name):
+        if is_vector_like_parameter(param, param_name):
             return False
         # MuP Appendix B.3: eps scales with fan_in when non-negligible.
-        # 1D tensors (biases, layernorm-like scalars/vectors) are treated as fan_in-invariant.
-        return param.dim() > 1
+        # This implementation follows the common denominator form: sqrt(v) + eps.
+        return True
 
     mup_overrides: Dict[ParamKey, ParamGroupOverride] = {}
 
@@ -186,7 +198,7 @@ def get_mup_config_overrides(
         lr_override["min_lr"] = base_min_lr * hidden_lr_mult
 
     eps_override: ParamGroupOverride = {}
-    if config.adam_eps is not None:
+    if is_adam_optimizer and config.adam_eps is not None:
         eps_override["eps"] = config.adam_eps * hidden_lr_mult
 
     if decoupled_lr_enabled:
@@ -199,7 +211,7 @@ def get_mup_config_overrides(
 
         if eps_override:
             hidden_output_predicate = ParamWithNamePredicate(
-                name="mup_hidden_and_output_for_adam_eps",
+                name="mup_hidden_only_for_adam_eps",
                 fn=should_scale_eps_with_mup,
             )
             mup_overrides[ParamKey(with_name_predicate=hidden_output_predicate)] = eps_override

@@ -224,12 +224,12 @@ class TestMuPLRScaling:
         assert len(overrides) == 0
 
     def test_mup_lr_override_has_correct_predicate(self):
-        """LR override predicate correctly identifies hidden vs embedding params.
+        """LR override predicate correctly identifies hidden vs vector-like params.
 
         Per MuP paper and Microsoft's mup library:
         - Embedding layer: base LR (fan_in is vocab, finite dimension)
         - Hidden layers: scaled LR (fan_in is hidden, infinite dimension)
-        - Output layer: scaled LR (fan_in is hidden, infinite dimension)
+        - Output layer: base LR when tagged as embedding-class (Table 8 symmetry)
         """
         optimizer_config = OptimizerConfig(lr=1e-3)
         width_mult = 4.0
@@ -247,13 +247,19 @@ class TestMuPLRScaling:
             # Hidden param with hidden-layer name should match (scaled LR)
             assert predicate_fn(hidden_param, 'decoder.layer.0.weight') is True
 
-            # Output layer should match (scaled LR) - fan_in is hidden dimension
-            assert predicate_fn(hidden_param, 'output_layer.weight') is True
+            # Output layer should NOT match when tagged as embedding-class.
+            output_param = torch.nn.Parameter(torch.zeros(10, 10))
+            output_param.is_embedding_parameter = True
+            assert predicate_fn(output_param, 'output_layer.weight') is False
 
             # Embedding layer should NOT match (base LR) when attribute is set.
             embedding_param = torch.nn.Parameter(torch.zeros(10, 10))
             embedding_param.is_embedding_parameter = True
             assert predicate_fn(embedding_param, 'decoder.layer.0.weight') is False
+
+            # 1D vector-like params (biases/LN) should also keep base LR.
+            vector_like_param = torch.nn.Parameter(torch.zeros(10))
+            assert predicate_fn(vector_like_param, 'decoder.layer.0.bias') is False
 
             # Shared embedding copies on tied output stages should also use base LR.
             shared_embedding_param = torch.nn.Parameter(torch.zeros(10, 10))
@@ -264,7 +270,7 @@ class TestMuPLRScaling:
             assert predicate_fn(hidden_param, 'embedding.word_embeddings.weight') is False
 
     def test_mup_with_decoupled_lr_scales_hidden_only_for_lr(self):
-        """With decoupled_lr, MuP LR scales hidden only but eps still scales output."""
+        """With decoupled_lr, MuP scales hidden params only; embedding/output stay decoupled."""
         optimizer_config = OptimizerConfig(
             lr=1e-3, min_lr=1e-5, decoupled_lr=2e-4, decoupled_min_lr=2e-6
         )
@@ -281,6 +287,7 @@ class TestMuPLRScaling:
         embedding_param.is_embedding_or_output_parameter = True
         output_param = torch.nn.Parameter(torch.zeros(10, 10))
         output_param.is_embedding_or_output_parameter = True
+        output_param.is_embedding_parameter = True
         shared_output_param = torch.nn.Parameter(torch.zeros(10, 10))
         shared_output_param.is_embedding_or_output_parameter = True
         shared_output_param.shared_embedding = True
@@ -322,9 +329,9 @@ class TestMuPLRScaling:
         assert hidden_override['min_lr'] == pytest.approx(1e-5 / width_mult)
         assert hidden_override['eps'] == pytest.approx(optimizer_config.adam_eps / width_mult)
 
-        # Biases are fan-in-invariant and should keep unscaled eps.
-        assert bias_override['max_lr'] == pytest.approx(1e-3 / width_mult)
-        assert bias_override['min_lr'] == pytest.approx(1e-5 / width_mult)
+        # Biases are vector-like; MuP should not override LR/eps.
+        assert 'max_lr' not in bias_override
+        assert 'min_lr' not in bias_override
         assert 'eps' not in bias_override
 
         # Embeddings keep decoupled LR and unscaled eps.
@@ -332,10 +339,10 @@ class TestMuPLRScaling:
         assert embedding_override['min_lr'] == pytest.approx(2e-6)
         assert 'eps' not in embedding_override
 
-        # Output params keep decoupled LR (no MuP LR conflict) but use MuP eps scaling.
+        # Output params keep decoupled LR and unscaled eps (Table 8 symmetry).
         assert output_override['max_lr'] == pytest.approx(2e-4)
         assert output_override['min_lr'] == pytest.approx(2e-6)
-        assert output_override['eps'] == pytest.approx(optimizer_config.adam_eps / width_mult)
+        assert 'eps' not in output_override
 
         # Shared embedding output copies stay on embedding-class (unscaled) eps.
         assert shared_output_override['max_lr'] == pytest.approx(2e-4)
@@ -404,6 +411,21 @@ class TestMuPOptimizerTypeHandling:
             expected_eps = optimizer_config.adam_eps / width_mult
             assert abs(override['max_lr'] - expected_max_lr) < 1e-10
             assert abs(override['eps'] - expected_eps) < 1e-15
+
+    def test_non_adam_does_not_set_eps_override(self):
+        """Non-Adam optimizers should not receive MuP epsilon overrides."""
+        optimizer_config = OptimizerConfig(lr=1e-3, min_lr=1e-5)
+        width_mult = 4.0
+
+        for non_adam_optimizer in ['muon', 'dist_muon']:
+            overrides = get_mup_config_overrides(
+                optimizer_config, width_mult, optimizer_type=non_adam_optimizer
+            )
+            assert len(overrides) == 1
+            for _, override in overrides.items():
+                assert override['max_lr'] == pytest.approx(1e-3 / width_mult)
+                assert override['min_lr'] == pytest.approx(1e-5 / width_mult)
+                assert 'eps' not in override
 
 
 class TestMuPMTPLossScaling:

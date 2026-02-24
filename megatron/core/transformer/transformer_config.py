@@ -317,7 +317,8 @@ class TransformerConfig(ModelParallelConfig):
     output_layer_init_method: Optional[Callable] = None
     """Method to initialize weights of the output layer of both attention and MLP blocks. If None,
     will be set to megatron.core.utils.scaled_init_method_normal(init_method_std) which is torch nn
-    init normal with mean=0.0 and std=init_method_std / math.sqrt(2.0 * num_layers)."""
+    init normal with mean=0.0 and std=init_method_std / math.sqrt(2.0 * num_layers).
+    Note: this does not control vocab readout/unembedding initialization."""
 
     init_method_std: float = 0.02
     """Standard deviation of the zero mean normal for the default initialization method, not used if

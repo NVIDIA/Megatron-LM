@@ -181,8 +181,8 @@ class LanguageModule(MegatronModule):
         Parameter attributes set:
         - `is_embedding_or_output_parameter`: True for embedding + output layer weights.
           Used by decoupled_lr, Muon optimizer, and other Megatron features.
-        - `is_embedding_parameter`: True for embedding weights only (not output layer).
-          Used by MuP for LR scaling (embeddings use base LR, output uses scaled LR).
+        - `is_embedding_parameter`: True for MuP "embedding-class" parameters.
+          Used by MuP for table-8 style optimizer grouping (base LR/eps for vector-like params).
         """
 
         # Mark embedding and output layer for decoupled_lr and other features.
@@ -196,12 +196,20 @@ class LanguageModule(MegatronModule):
         ):
             self.output_layer.weight.is_embedding_or_output_parameter = True
 
-        # Mark embedding parameters for MuP LR scaling.
-        # In MuP, embeddings use base LR while output layer uses scaled LR (Table 8).
+        # Mark embedding-class parameters for MuP optimizer grouping.
+        # Under MuP table-8-style grouping, embeddings/output use base LR/eps while
+        # hidden matrix-like params use width-scaled LR/eps.
         mtp_process = getattr(self, 'mtp_process', False)
-        if (self.pre_process or mtp_process) and hasattr(self, 'embedding'):
+        if self.config.use_mup and (self.pre_process or mtp_process) and hasattr(self, 'embedding'):
             for param in self.embedding.parameters():
                 param.is_embedding_parameter = True
+        if (
+            self.config.use_mup
+            and self.post_process
+            and hasattr(self, 'output_layer')
+            and self.output_layer.weight is not None
+        ):
+            self.output_layer.weight.is_embedding_parameter = True
 
         # If share_embeddings_and_output_weights is True, we need to maintain duplicated
         # embedding weights in post processing stage. If use Multi-Token Prediction (MTP),
@@ -242,7 +250,8 @@ class LanguageModule(MegatronModule):
             weight.shared = True
             weight.shared_embedding = True
             # Keep optimizer grouping consistent for tied embedding/output copies.
-            weight.is_embedding_parameter = True
+            if self.config.use_mup:
+                weight.is_embedding_parameter = True
 
         # Parameters are shared between the word embeddings layers, and the
         # heads at the end of the model. In a pipelined setup with more than

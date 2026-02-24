@@ -196,7 +196,11 @@ class MambaModel(LanguageModule):
                 config.hidden_size,
                 self.vocab_size,
                 config=config,
-                init_method=config.init_method,
+                init_method=(
+                    config.embedding_init_method
+                    if config.use_mup and not self.share_embeddings_and_output_weights
+                    else config.init_method
+                ),
                 bias=False,
                 skip_bias_add=False,
                 gather_output=not self.parallel_output,
