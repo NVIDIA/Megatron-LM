@@ -188,8 +188,6 @@ class DynamicInferenceEngine(AbstractEngine):
                 not self.enable_chunked_prefill
             ), "Chunked prefill is not supported with speculative tokens"
 
-        self.context.num_speculative_tokens = self.num_speculative_tokens
-        self.controller.num_speculative_tokens = self.num_speculative_tokens
         # Initialize MTP sampling tensor now that num_speculative_tokens is set
         self.controller._init_mtp_sampling_tensor()
 

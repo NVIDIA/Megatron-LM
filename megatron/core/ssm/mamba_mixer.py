@@ -44,13 +44,16 @@ from megatron.core.utils import (
 from .mamba_context_parallel import MambaContextParallel
 
 try:
-    from mamba_ssm.ops.triton.selective_state_update import selective_state_update
+    #from mamba_ssm.ops.triton.selective_state_update import selective_state_update
+    from megatron.core.ssm.ops.mamba_ssm import selective_state_update
 except ImportError:
     selective_state_update = None
 
 try:
-    from causal_conv1d import causal_conv1d_fn, causal_conv1d_update
+    # from causal_conv1d import causal_conv1d_fn, causal_conv1d_update
+    from causal_conv1d import causal_conv1d_fn
     from causal_conv1d.causal_conv1d_varlen import causal_conv1d_varlen_states
+    from megatron.core.ssm.ops.causal_conv1d_triton import causal_conv1d_update
 except ImportError:
     causal_conv1d_fn = None
     causal_conv1d_update = None
@@ -439,6 +442,9 @@ class MambaMixer(MegatronModule):
 
         y_decode = None
         y_prefill = None
+            
+        if self.layer_number == 1:
+            torch.distributed.breakpoint(0)
 
         # Decode
         if decode_req_count > 0:

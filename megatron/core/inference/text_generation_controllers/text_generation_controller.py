@@ -62,7 +62,7 @@ class TextGenerationController:
         self.model_config = self.inference_wrapped_model.model.config
         inference_config = self.inference_wrapped_model.inference_context.config
         self.tokenizer = tokenizer
-        self.num_speculative_tokens = None
+        self.num_speculative_tokens = inference_config.num_speculative_tokens
 
         pg_collection = inference_config.pg_collection
         if pg_collection is not None:

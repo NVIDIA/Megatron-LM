@@ -262,7 +262,7 @@ class DynamicInferenceContext(BaseInferenceContext):
             pp_size = model_config.pipeline_model_parallel_size
         self.hidden_size_per_attention_head = core_divide(projection_size, num_attention_heads)
         self.num_attention_heads_per_partition = core_divide(num_attention_heads, tp_size)
-        self.num_speculative_tokens = 0
+        self.num_speculative_tokens = inference_config.num_speculative_tokens
 
         # Cache the PP group we should use for PP collectives inside the context.
         # If the model provides a pg_collection with a pp group, prefer it.
