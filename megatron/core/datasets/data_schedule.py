@@ -298,4 +298,22 @@ class HybridCPDataLoaderWrapper:
         samples_this_rank_with_id = self.reroute_samples_to_hdp_ranks(
             batch, global_ids_this_rank, global_id_seqlens, sample_id_groups, offsets
         )
+
+        # batch, sample_id_groups = samples_this_rank_with_id, sample_id_groups
+
+        # hdp_rank = parallel_state.get_data_parallel_rank(with_context_parallel=True)
+        # num_micro_batches = len(sample_id_groups)
+
+        # grouped_samples = [
+        #     [batch[sub_sample_id] for sub_sample_id in sample_id_groups[i][hdp_rank]]
+        #     for i in range(num_micro_batches)
+        # ]
+
+        # new_samples = _build_packed_microbatches(
+        #     grouped_samples=grouped_samples,
+        #     scheduler_type=scheduler_type,
+        #     local_cp_sizes_gpu=local_cp_sizes_gpu,
+        # )
+
+
         return samples_this_rank_with_id, sample_id_groups

@@ -146,6 +146,8 @@ class BalancedCPScheduler:
         micro_batches = [[] for _ in range(total_gpus)]
         exec_times = [0.0 for _ in range(total_gpus)]
         sample_ids_per_gpu = [[] for _ in range(total_gpus)]
+        # gid : seq_len
+        packing_sequence_len = {}
 
         gpu_group_id = [None] * total_gpus
         group_members = {}
@@ -197,7 +199,12 @@ class BalancedCPScheduler:
                 prev_needed = needed
 
             # (a)  Existing groups of exactly this size
-            candidate_gids = [gid for gid, sz in group_size.items() if sz == needed]
+            candidate_gids = [
+                gid
+                for gid, sz in group_size.items()
+                if sz == needed
+                and packing_sequence_len[gid] + seq_len / needed <= self.max_seq_len_per_rank
+            ]
             if candidate_gids:
                 best_gid, best_load = min(
                     (
@@ -222,6 +229,8 @@ class BalancedCPScheduler:
                 else:
                     chosen_members = group_members[best_gid]
             else:
+                if best_gid is None:
+                    break
                 chosen_members = group_members[best_gid]
 
             # ---- Step 2 – if we decided to create a fresh group ----------------
@@ -236,6 +245,9 @@ class BalancedCPScheduler:
             # ---- Step 3 – assign the sequence to every member of that group ------
             per_gpu_cost = compute_estimator(seq_len)
 
+            packing_sequence_len[best_gid] = (
+                packing_sequence_len.get(best_gid, 0) + seq_len / needed
+            )
             for r in chosen_members:
                 micro_batches[r].append(seq_len)
                 exec_times[r] += per_gpu_cost
@@ -326,6 +338,9 @@ class BalancedCPScheduler:
                 proj_slack = max(proj_times) - min(proj_times)
 
                 # Check if trimming the workload helps imbalance
+                # TODO(pmannan): Once support for sequence packing is added, 
+                # Make sure that the trimming logic supports removing all sequences added
+                # unless this is called each time we add a sequence. Then safe to remove the last sequence only.
                 if proj_slack < cur_slack:
                     sample_id_to_remove = sample_ids_per_gpu[max_r][-1]
                     for r in members:
@@ -336,7 +351,8 @@ class BalancedCPScheduler:
                 else:
                     break
 
-        trim_overload()
+        # TODO(tailaim): uncomment this to support different ranks have different num_microbatches
+        # trim_overload()
 
         # Track samples in this group before redistribution to empty GPUs
         total_work_before = sum(len(mb) for mb in micro_batches)
@@ -538,6 +554,11 @@ def hybrid_context_parallel_forward_backward(
 
     def _get_new_data_iterator(sample_id_in_group, group_id):
         if is_first_tp_rank:
+            # TODO(pmannan): Add support for sequence packing.
+            # All sequences in a group should be packed together.
+            # Add a packed_seq_params key to the sample.
+            # Update this with the right cp_group and sharded tensors
+            # inside the get_batch_on_this_hybrid_cp_rank function.
             sub_sample_id = sample_ids_this_group[sample_id_in_group]
             sample = batch[sub_sample_id]
             partner_cp_size = len(
