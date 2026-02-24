@@ -23,11 +23,15 @@ Usage
 
 Key remapping rules
 -------------------
-* ``decoder.layers.{N}.input_layernorm.*``  →  ``decoder.layers.{2N}.input_layernorm.*``
-* ``decoder.layers.{N}.self_attention.*``   →  ``decoder.layers.{2N}.self_attention.*``
-* ``decoder.layers.{N}.mlp.*``             →  ``decoder.layers.{2N+1}.mlp.*``
-* ``decoder.final_layernorm.*``            →  ``decoder.final_norm.*``
-* All other keys                           →  unchanged
+* ``decoder.layers.{N}.input_layernorm.*``    →  ``decoder.layers.{2N}.input_layernorm.*``
+* ``decoder.layers.{N}.self_attention.*``     →  ``decoder.layers.{2N}.self_attention.*``
+* ``decoder.layers.{N}.pre_mlp_layernorm.*`` →  ``decoder.layers.{2N+1}.pre_mlp_layernorm.*``
+* ``decoder.layers.{N}.mlp.*``               →  ``decoder.layers.{2N+1}.mlp.*``
+* ``decoder.final_layernorm.*``              →  ``decoder.final_norm.*``
+* All other keys                             →  unchanged
+
+Note: ``pre_mlp_layernorm`` only appears for MoE layers (where it is a real TENorm).
+Dense layers use ``IdentityOp`` for ``pre_mlp_layernorm``, which produces no state dict keys.
 """
 
 import argparse
@@ -71,10 +75,14 @@ def _remap_key(key: str, num_gpt_layers: int) -> str:
         return f"{layer_prefix}{2 * layer_n}.{rest}"
     elif rest.startswith("mlp."):
         return f"{layer_prefix}{2 * layer_n + 1}.{rest}"
+    elif rest.startswith("pre_mlp_layernorm."):
+        # MoE layers have a real TENorm for pre_mlp_layernorm (not fused);
+        # it maps to MoETransformerLayer 2N+1.
+        return f"{layer_prefix}{2 * layer_n + 1}.{rest}"
     else:
         raise ValueError(
             f"Unexpected sub-key '{rest}' in GPT layer {layer_n} (full key='{key}'). "
-            "Expected: input_layernorm.*, self_attention.*, mlp.*"
+            "Expected: input_layernorm.*, self_attention.*, pre_mlp_layernorm.*, mlp.*"
         )
 
 
