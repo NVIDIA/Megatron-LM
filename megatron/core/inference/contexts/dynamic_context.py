@@ -543,6 +543,10 @@ class DynamicInferenceContext(BaseInferenceContext):
             )
         )
 
+        # num_cuda_graphs == -1 creates decode cuda graphs of size [1,2,4,8] 
+        # but mixed prefill cuda graphs still start from size [16], i.e. (inference_config.cuda_graph_mixed_prefill_count)
+        self.is_strict_matching = self.is_hybrid_model or (inference_config.num_cuda_graphs == -1)
+
         self._using_cuda_graph_this_step = False
         # Deal with chunked prefill
         self.enable_chunked_prefill = inference_config.enable_chunked_prefill
@@ -1261,11 +1265,15 @@ class DynamicInferenceContext(BaseInferenceContext):
         return self.total_request_count - self.paused_request_count - self.num_prefill_requests
 
     def add_dummy_requests_for_expert_parallel_step(self) -> None:
-        """Minimal context setup for a dummy EP forward pass.
+        """Minimal context setup so an EP rank with no real requests can replay
+        an already-captured cuda graph without crashing or corrupting memory.
 
-        This is the fast alternative to add_dummy_requests_for_cudagraph_capture.
-        We only initialize state that is actually read during
-        initialize_attention_state and the subsequent forward pass.
+        This is the fast alternative to add_dummy_requests_for_cudagraph_capture
+        (which goes through the heavyweight add_dummy_requests_parallel path).
+
+        We setup minimal state such the initialize_attention_state and the forward 
+        pass can run without error.
+
         """
         smallest_cuda_graph_dimensions = min(self.cuda_graph_batch_dimensions_list)
         # the smallest cuda graph is decode only.
@@ -1274,25 +1282,27 @@ class DynamicInferenceContext(BaseInferenceContext):
         N = smallest_cuda_graph_dimensions.decode_req_count
         dummy_block_idx = self.block_allocator.dummy_block_idx
 
-        # do minimum setup just so that we can run the dummy forward pass with
-        # a cuda graph.
-
         # 1. Request counts and token count (decode-only: 1 token per request).
         self.total_request_count = N
         self.active_token_count = N
+        self.num_prefill_requests = 0
 
         # 2. Per-request state consumed by mha_metadata.update().
         self.request_query_lengths[0:N].fill_(1)
         self.request_kv_length_offsets[0:N].fill_(0)
         self.request_to_kv_block_ids[0:N, 0] = dummy_block_idx
 
-        # 3. Token-level state (needed for padding / mamba slicing).
-        self.token_to_request_idx[0:N] = torch.arange(
-            0, N, device=self.token_to_request_idx.device, dtype=self.token_to_request_idx.dtype
-        )
+        # 3. Token-level state consumed by the triton KV append kernel.
+        self.token_to_block_idx[0:N] = dummy_block_idx
+        self.token_to_local_position_within_kv_block[0:N] = 0
 
-        # 4. Mamba state: point every dummy request at slot 0.
         if self.is_hybrid_model:
+            # 4. token_to_request_idx: needed by mamba_metadata.update() for hybrid models.
+            self.token_to_request_idx[0:N] = torch.arange(
+                0, N, device=self.token_to_request_idx.device, dtype=self.token_to_request_idx.dtype
+            )
+
+            # 5. Mamba state: allocate slots for dummy requests.        
             self.mamba_metadata.request_to_mamba_state_idx[0:N] = self.mamba_metadata.batch_allocate_slots(N)
 
     def initialize_attention_state(
@@ -1317,21 +1327,22 @@ class DynamicInferenceContext(BaseInferenceContext):
         # If in CUDA graph creation mode, add dummy requests for CUDA graph capture
         if is_expert_parallel_dummy_cuda_graph_step:
             self.add_dummy_requests_for_expert_parallel_step()
-            batch_dimensions = min(self.cuda_graph_batch_dimensions_list)
         else:
             if self.is_creating_cuda_graphs:
                 self.add_dummy_requests_for_cudagraph_capture(construct_graph_dimensions)
-            batch_dimensions = InferenceBatchDimensions(
-                token_count=self.active_token_count,
-                prefill_req_count=self.num_prefill_requests,
-                decode_req_count=self.num_decode_requests,
-            )
+    
+        batch_dimensions = InferenceBatchDimensions(
+            token_count=self.active_token_count,
+            prefill_req_count=self.num_prefill_requests,
+            decode_req_count=self.num_decode_requests,
+        )
 
         self.batch_dimensions = batch_dimensions
+        
         best_graph = CUDAGraphBatchDimensionBuilder.match_graph_config(
             batch_dimensions,
             self.cuda_graph_batch_dimensions_list,
-            strict=self.is_hybrid_model,
+            strict=self.is_strict_matching,
             decode_only_cuda_graphs=(not self.use_cuda_graphs_for_non_decode_steps),
             explicit_chunked_prefill=self.is_chunked_prefill_enabled() and self.is_hybrid_model,
             ep_group=self.expert_model_parallel_group,
