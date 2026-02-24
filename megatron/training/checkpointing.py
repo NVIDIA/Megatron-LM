@@ -1418,6 +1418,12 @@ def load_args_from_checkpoint(
     _set_arg('hidden_dropout', force=True)
 
     _set_arg('hybrid_override_pattern', force=True)
+
+    # Legacy MTP pattern for old checkpoints
+    _set_arg('mtp_hybrid_override_pattern', force=True)
+    _set_arg('mtp_num_layers', force=True)
+    _set_arg('mtp_use_repeated_layer', force=True)
+
     _set_arg('spec', force=True)
     _set_arg('hybrid_attention_ratio', force=True)
     _set_arg('hybrid_mlp_ratio', force=True)
@@ -1452,8 +1458,8 @@ def load_args_from_checkpoint(
     _set_arg('moe_latent_size', force=True)
 
     # Tokenizer args.
-    # Using checkpoint version might not always be safe (e.g., if running on different cluster).
     if args.use_tokenizer_model_from_checkpoint_args:
+        # Using checkpoint version might not always be safe (e.g., if running on different cluster).
         _set_arg('tokenizer_model', force=True)
         _set_arg('tokenizer_type', force=True)
     _set_arg('tiktoken_pattern', force=True)

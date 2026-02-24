@@ -11,8 +11,8 @@ from megatron.core.config import set_experimental_flag
 from megatron.core.energy_monitor import EnergyMonitor
 from megatron.core.jit import disable_jit_fuser
 from megatron.core.num_microbatches_calculator import init_num_microbatches_calculator, unset_num_microbatches_calculator
+from megatron.core.tokenizers.utils.build_tokenizer import build_tokenizer
 from megatron.training.dist_signal_handler import DistributedSignalHandler
-from megatron.training.tokenizer import build_tokenizer
 
 _GLOBAL_ARGS = None
 _GLOBAL_TOKENIZER = None

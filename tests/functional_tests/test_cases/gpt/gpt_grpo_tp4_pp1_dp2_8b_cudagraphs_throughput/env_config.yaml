@@ -1,0 +1,5 @@
+- agent_type: examples.rl.environments.countdown.countdown_agent.CountdownAgent
+  agent_args:
+    dataset_file: "/mnt/artifacts/rl_environments/Jiayi-Pan___countdown-tasks-3to4"
+    split: "train"
+  weight: 1.0

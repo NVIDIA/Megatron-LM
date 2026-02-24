@@ -327,21 +327,70 @@ def validate_args(args, defaults={}):
     total_model_size = args.tensor_model_parallel_size * args.pipeline_model_parallel_size * args.context_parallel_size
     args.data_parallel_size = args.world_size // total_model_size
 
-    # Assert that `torch_memory_saver` is installed if offloading KV cache during RL.
-    if args.rl_offload_kv_cache_during_training:
-        try:
-            from torch_memory_saver import torch_memory_saver
-        except ImportError:
-            raise AssertionError("To use offload-kv-cache-during-training, `torch_memory_saver` must be installed. See https://github.com/fzyzcjy/torch_memory_saver.")
-        assert not args.inference_dynamic_batching_unified_memory_level, "The KV cache should not be instantiated in unified memory when it is offloaded during training."
-
-    # Batch size checks if running RL.
     if args.perform_rl_step:
-        assert not (args.rl_remove_kv_cache_during_training and args.rl_offload_kv_cache_during_training), \
-            "Cannot use both remove-kv-cache-during-training and offload-kv-cache-during-training"
+        # ----------------------------------------------------------------
+        # CUDA graphs
+        #
+        #   --cuda-graph-impl controls whether CUDA graphs are built.
+        #   The sweep of various inference CUDA graphs is built inside inference, not the RL loop.
+        #   Both training and inference CUDA graphs are gated by this flag.
+        #
+        #   --rl-training-cuda-graphs controls whether CUDA graphs are used during training.
+        #   Toggling CUDA graphs on and off is done inside the RL loop.
+        #
+        #   --rl-persist-cuda-graphs controls whether CUDA graphs are built once, or repeatedly.
+        #   When this flag is True, inference requires static memory pointers for the KV cache.
+        #   When this flag is False, inference is in charge of deleting/rebuilding CUDA graphs.
+        #
+        # KV cache management (--rl-kv-cache-management-mode)
+        #
+        #   Inference initializes the KV cache, inside either a normal memory pool, UVM, or TMS.
+        #
+        #   On suspend (inference -> training):
+        #     "persist"   — no-op; KV cache stays on GPU.
+        #     "offload"   — KV cache is offloaded to CPU.
+        #     "recompute" — KV cache is deleted entirely.
+        #
+        #   On resume (training → inference):
+        #     "persist"   — no-op; KV cache is already on GPU.
+        #     "offload"   — KV cache is restored from CPU.
+        #     "recompute" — KV cache is recomputed from scratch.
+        # ----------------------------------------------------------------
 
-        assert not (args.rl_partial_rollouts and args.rl_remove_kv_cache_during_training), \
-            "Cannot use both partial-rollouts and remove-kv-cache-during-training"
+        # Persisting CGs only makes sense if we build any CGs.
+        assert not args.rl_persist_cuda_graphs or args.cuda_graph_impl != "none", (
+            "--rl-persist-cuda-graphs is set but no CUDA graphs are being built."
+        )
+        # Training CGs only makes sense if we build any CGs.
+        assert not args.rl_training_cuda_graphs or args.cuda_graph_impl != "none", (
+            "--rl-training-cuda-graphs is set but no CUDA graphs are being built."
+        )
+        # If CUDA graphs persist and KV cache memory address is not static, we need
+        # either UVM or torch_memory_saver to maintain memory address stability for CGs.
+        if args.rl_persist_cuda_graphs and args.rl_kv_cache_management_mode != "persist":
+            try:
+                from torch_memory_saver import torch_memory_saver
+            except ImportError:
+                assert args.inference_dynamic_batching_unified_memory_level > 0, (
+                    "Persisting CUDA graphs requires static KV cache memory. Use "
+                    "--rl-kv-cache-management-mode=persist, UVM, or install torch_memory_saver."
+                )
+
+        # Offload mode requires CG persistence: CG recapture runs dummy forward
+        # passes that corrupt the preserved KV data.
+        assert (
+            (not args.rl_kv_cache_management_mode == "offload") or (args.rl_persist_cuda_graphs)
+        ), "--rl-kv-cache-management-mode=offload requires --rl-persist-cuda-graphs"
+
+        # There's no need to manually offload the KV cache with UVM.
+        assert not (
+            args.inference_dynamic_batching_unified_memory_level > 0
+            and args.rl_kv_cache_management_mode == "offload"
+        ), "--rl-kv-cache-management-mode=offload is incompatible with UVM"
+        # We currently cannot recapture CGs in offload mode.
+        assert not(
+            not args.rl_persist_cuda_graphs and args.rl_kv_cache_management_mode == "offload"
+        ), "Cannot recapture CUDA graphs while offloading KV cache."
 
         # Validate inference model offloading - requires either UVM or torch_memory_saver
         if args.rl_offload_inference_model_weights_when_idle:
@@ -504,6 +553,79 @@ def validate_args(args, defaults={}):
         print_rank_0('setting global batch size to {}'.format(args.global_batch_size))
     assert args.global_batch_size > 0
 
+    # === MTP validation ===
+    # Deprecation warnings for legacy MTP arguments
+    if args.mtp_hybrid_override_pattern is not None:
+        warn_rank_0(
+            "--mtp-hybrid-override-pattern is deprecated. "
+            "For new hybrid models with MTP models, use unified --hybrid-override-pattern instead. "
+            "Example: 'M*M*/MM/MM' means main='M*M*', MTP pattern='MM' with 2 depths. "
+            "This argument is kept only for loading old checkpoints.",
+            args.rank,
+        )
+
+    # Backward compatibility: convert legacy mtp_hybrid_override_pattern to unified format
+    from megatron.core.ssm.mamba_hybrid_layer_allocation import Symbols, parse_hybrid_pattern
+    sep = Symbols.MTP_SEPARATOR
+    if (
+        getattr(args, 'mtp_hybrid_override_pattern', None) is not None
+        and args.mtp_num_layers is not None
+        and args.mtp_num_layers > 0
+        and (args.hybrid_override_pattern is None or sep not in args.hybrid_override_pattern)
+    ):
+        main_pattern = args.hybrid_override_pattern or ''
+        mtp_pattern = args.mtp_hybrid_override_pattern
+        args.hybrid_override_pattern = main_pattern + sep + sep.join([mtp_pattern] * args.mtp_num_layers)
+        args.mtp_hybrid_override_pattern = None
+        print_rank_0(f"Converted legacy MTP pattern to unified: {args.hybrid_override_pattern}")
+
+    # Infer mtp_num_layers from unified pattern
+    if args.hybrid_override_pattern and sep in args.hybrid_override_pattern:
+        parsed = parse_hybrid_pattern(args.hybrid_override_pattern)
+        if parsed.mtp_pattern and parsed.mtp_num_depths > 0:
+            inferred_mtp_num_layers = parsed.mtp_num_depths
+            if args.mtp_num_layers is None:
+                args.mtp_num_layers = inferred_mtp_num_layers
+            elif args.mtp_num_layers != inferred_mtp_num_layers:
+                warn_rank_0(
+                    f"--mtp-num-layers ({args.mtp_num_layers}) conflicts with "
+                    f"MTP depth count ({inferred_mtp_num_layers}) in pattern '{args.hybrid_override_pattern}'. "
+                    f"Using the inferred value ({inferred_mtp_num_layers}).",
+                    args.rank
+                )
+                args.mtp_num_layers = inferred_mtp_num_layers
+
+    # MTP validation
+    if args.mtp_num_layers:
+        assert not args.use_legacy_models, "The legacy Megatron models does not support Multi-Token Prediction (MTP)."
+        assert args.position_embedding_type == "rope" or args.position_embedding_type == "none", (
+            f"Multi-Token Prediction (MTP) is not supported with {args.position_embedding_type} position embedding type."
+            + f"The supported position embedding types are rope and none."
+        )
+
+    # Validate MTP args for hybrid vs non-hybrid models
+    if args.is_hybrid_model:
+        # Mamba/hybrid model MTP validation
+        if args.mtp_num_layers and not (args.hybrid_override_pattern and sep in args.hybrid_override_pattern):
+            # Hybrid model wants MTP but no unified pattern - check for legacy args
+            if args.mtp_hybrid_override_pattern is None:
+                warn_rank_0(
+                    "Hybrid model with --mtp-num-layers but no MTP pattern. "
+                    "Use unified --hybrid-override-pattern with '/' separator (e.g., 'M*M*/MM/MM') "
+                    "or legacy --mtp-hybrid-override-pattern for old checkpoints.",
+                    args.rank
+                )
+    else:
+        # Non-hybrid (GPT) model MTP validation
+        if args.mtp_hybrid_override_pattern is not None:
+            warn_rank_0(
+                "--mtp-hybrid-override-pattern is for Mamba/hybrid models only. "
+                "For GPT models, MTP replicates the main transformer layer structure. "
+                "This argument will be ignored.",
+                args.rank
+            )
+    # === End of MTP validation ===
+    
     # Uneven virtual pipeline parallelism
     assert (
         int(args.num_layers_per_virtual_pipeline_stage is not None)
@@ -728,12 +850,17 @@ def validate_args(args, defaults={}):
             args.accumulate_allreduce_grads_in_fp32 = True
             print_rank_0('accumulate and all-reduce gradients in fp32 for bfloat16 data type.')
     if args.cuda_graph_impl == "local" and CudaGraphScope.full_iteration in args.cuda_graph_scope:
-        if not args.inference_dynamic_batching:
-            assert not args.check_for_nan_in_loss_and_grad, \
-            "--no-check-for-nan-in-loss-and-grad should be set with full_iteration CUDA graph"
-        else:
-            assert args.fp8 is None, \
-            "fp8 is not supported with inference dynamic batching and full_iteration CUDA graph"
+        assert not args.check_for_nan_in_loss_and_grad, \
+        "--no-check-for-nan-in-loss-and-grad should be set with --cuda-graph-scope=full_iteration for training. Note: If you are trying to use full_iteration CUDA graphs for inference, please use --cuda-graph-scope full_iteration_inference instead"
+    
+    if args.cuda_graph_impl == "local" and CudaGraphScope.full_iteration_inference in args.cuda_graph_scope:
+        assert args.fp8 is None, \
+            "fp8 is not supported with inference dynamic batching and full_iteration_inference CUDA graph"
+
+    if args.cuda_graph_impl == 'local':
+        assert args.inference_dynamic_batching_num_cuda_graphs > 0 or args.inference_dynamic_batching_num_cuda_graphs == -1, \
+            'inference_dynamic_batching_num_cuda_graphs should be a positive integer or -1' \
+            '-1 means that we will automatically determine the number of CUDA graphs to capture based on the `max_requests` value.'
 
     print_rank_0('using {} for parameters ...'.format(args.params_dtype))
 
@@ -1069,7 +1196,6 @@ def validate_args(args, defaults={}):
             args.fim_eod_token,
         ]
         assert not args.mock_data, "Mock dataset is not supported with FIM dataset."
-        assert not args.legacy_tokenizer, "FIM dataset is not supported with legacy tokenizers."
         assert args.fim_rate, "--fim-rate should be specified."
         assert args.fim_spm_rate, "--fim-spm-rate should be specified."
         assert all(token is not None for token in extra_tokens), "FIM extra tokens should be specified."
@@ -1218,6 +1344,25 @@ def validate_args(args, defaults={}):
             assert is_te_min_version("2.8.0"), (
                 "overlap_grad_reduce is only supported with TE >= 2.8.0 when enabling delay_wgrad_compute"
             )
+            wgrad_in_graph_scope = CudaGraphScope.attn in args.cuda_graph_scope or (
+                CudaGraphScope.moe_router in args.cuda_graph_scope
+                and args.moe_shared_expert_intermediate_size is not None
+                and not args.moe_shared_expert_overlap
+            )
+            if wgrad_in_graph_scope:
+                assert is_te_min_version(
+                    "2.12.0"
+                ), "CUDA graph with delay_wgrad_compute requires TE version >= 2.12.0."
+                assert args.gradient_accumulation_fusion, (
+                    'CUDA graph with delay_wgrad_compute requires gradient_accumulation_fusion '
+                    'to be enabled. This is because the default gradient accumulation does not '
+                    'use static memory addresses, which breaks CUDA graph requirements.'
+                )
+                if CudaGraphScope.attn in args.cuda_graph_scope:
+                    assert (
+                        not args.add_bias_linear and not args.add_qkv_bias
+                    ), "CUDA graph with delay_wgrad_compute doesn't support attn bias for now."
+
         if not args.gradient_accumulation_fusion:
             assert is_te_min_version("2.7.0"), (
                 "disabling gradient_accumulation_fusion is only supported with TE >= 2.7.0 "
@@ -1285,6 +1430,20 @@ def validate_args(args, defaults={}):
             "Use --tokenizer-special-tokens instead."
         )
         args.tokenizer_special_tokens = args.tiktoken_special_tokens
+    
+    if args.tokenizer_hf_use_fast:
+        warn_rank_0(
+            "--tokenizer-hf-use-fast argument is deprecated and will be removed soon. "
+            "`use_fast` is set to True by default for HF tokenizers."
+            "Use --tokenizer-hf-no-use-fast if you want to disable `use_fast`."
+        )
+
+    if args.tokenizer_hf_include_special_tokens:
+        warn_rank_0(
+            "--tokenizer-hf-include-special-tokens argument is deprecated and will be removed soon. "
+            "`include_special_tokens` is set to True by default for HF tokenizers."
+            "Use --tokenizer-hf-no-include-special-tokens if you want to disable `include_special_tokens`."
+        )
 
     # Print arguments.
     _print_args("arguments", args)
@@ -1444,8 +1603,9 @@ def _add_inference_args(parser):
                        'including the shared experts if they are not overlapped with EP comm. '
                        '"moe_preprocess": captures operations in MoELayer.preprocess(). Must be used together with "moe_router". '
                        '"mamba": captures the mamba layer. '
-                       '"full_iteration": captures a whole iteration. '
-                       'full_iteration scope is only supported with --cuda-graph-impl=local, other scopes are only supported with --cuda-graph-impl=transformer_engine. '
+                       '"full_iteration": captures a whole training iteration. '
+                       '"full_iteration_inference": captures a whole inference iteration. '
+                       'full_iteration and full_iteration_inference scopes are only supported with --cuda-graph-impl=local, other scopes are only supported with --cuda-graph-impl=transformer_engine. '
                        'If not specified, the default scope is to capture the whole Transformer layer. '
                        'For backward compatibility, we still allow passing "full" to specify capturing the whole layer, and convert it to an empty list.')
     group.add_argument('--use-legacy-static-engine', action='store_true', default=False,
@@ -1478,6 +1638,10 @@ def _add_inference_args(parser):
                        'the dynamic inference context. Active requests are '
                        'paused when there are not enough active blocks available '
                        'to continue generating a request.')
+    group.add_argument('--inference-dynamic-batching-mamba-memory-ratio', type=float, default=None,
+                       help='Percentage of memory buffer to allocate for Mamba states. '
+                       'If not specified, allocates Mamba state tensors for each KV cache block. '
+                       'Only used for hybrid models.')
     group.add_argument('--inference-dynamic-batching-block-size',
                        type=int, default=256,
                        help='KV cache block size. '
@@ -1496,12 +1660,19 @@ def _add_inference_args(parser):
                        'cuda graph batch sizes range from 1 to `max_requests`. '
                        '(See `dynamic_context.py` for details on how '
                        '`max_requests` is computed). Due to rounding, the actual '
-                       'number of cuda graphs may not equal this argument.')
+                       'number of cuda graphs may not equal this argument.'
+                       'The user can also pass -1, in which case we automatically determine the number of graphs ' \
+                       'to capture based on the `max_requests`.')
     group.add_argument('--inference-dynamic-batching-track-paused-request-events',
                        action='store_true',
                        help='Track paused request ids by adding \'paused\' events '
                        'to each request\'s event history. This has a very minor '
                        'impact on latency.')
+    group.add_argument('--inference-dynamic-batching-track-generated-token-events',
+                       action='store_true',
+                       help='Track per-token events with timestamps for each generated token. '
+                       'When enabled, each generated token creates a GENERATED_TOKEN event '
+                       'with a timestamp, useful for per-token latency analysis.')
     group.add_argument('--decode-only-cuda-graphs',
                        action='store_true', default=False,
                        help='Only use cuda graphs for decode-only steps, not prefill and mixed steps.')
@@ -1525,9 +1696,12 @@ def _add_inference_args(parser):
     group.add_argument('--inference-logging-step-interval', type=int, default=0,
                        help='Step interval for logging inference metrics. '
                             'Default to 0 to disable inference logging.')
+    group.add_argument('--inference-flask-server-logging', action=argparse.BooleanOptionalAction,
+                       required=False, default=False,
+                       help='Enable per-request logging in the Flask inference server.')
     group.add_argument('--inference-wandb-logging', action=argparse.BooleanOptionalAction,
                        required=False, default=False, help='Enable inference wandb logging.')
-    group.add_argument("--inference-coordinator-port", type=int, default=12346,
+    group.add_argument("--inference-coordinator-port", type=int,
                        help="This port will be used to setup the inference coordinator on node-0")
     return parser
 
@@ -1891,12 +2065,6 @@ def _add_rl_args(parser):
                        help="Entropy term weight in GRPO loss.")
     group.add_argument('--grpo-filter-groups-with-same-reward', action='store_true',
                        help="Filter groups with same reward.")
-    group.add_argument('--langrl-inference-server-type', type=str,
-                       choices=['inplace_megatron', 'inplace_megatron_chat'], default='inplace_megatron',
-                       help="Type of inference server to use.")
-    group.add_argument('--langrl-inference-server-conversation-template', type=str, default=None,
-                       help="Conversation template, if using a chat server.")
-    group.add_argument('--langrl-external-server', action=argparse.BooleanOptionalAction, required=False, default=False)
     group.add_argument('--langrl-env-config', type=str, default=None,
                        help="Path to YAML config file for RL environment configuration.")
     group.add_argument('--rl-default-temperature', type=float, default=1.0,
@@ -1907,12 +2075,15 @@ def _add_rl_args(parser):
                        help="Default top-k for model inference.")
     group.add_argument('--rl-offload-optimizer-during-inference', action='store_true',
                        help='Offload optimizer state to CPU during inference/rollout to save GPU memory')
-    group.add_argument('--rl-offload-kv-cache-during-training', action=argparse.BooleanOptionalAction, default=False,
-                       help='Offload KV cache to CPU during training to save GPU memory')
-    group.add_argument('--rl-remove-kv-cache-during-training', action=argparse.BooleanOptionalAction, default=False,
-                       help='Remove KV cache during training to save GPU memory')
-    group.add_argument('--rl-reset-cuda-graphs', action=argparse.BooleanOptionalAction, type=bool, default=False,
-                       help='Reset CUDA graphs between inference/training to save GPU memory')
+    group.add_argument('--rl-kv-cache-management-mode', type=str, default='persist',
+                       choices=['persist', 'offload', 'recompute'],
+                       help='KV cache management mode during RL training: '
+                            'persist: leave KV cache in GPU memory (default), '
+                            'offload: offload KV cache to CPU during training, '
+                            'recompute: deallocate KV cache and recompute from scratch each cycle')
+    group.add_argument('--rl-persist-cuda-graphs', action=argparse.BooleanOptionalAction, type=bool, default=True,
+                       help='Persist CUDA graphs when the inference engine is suspended. '
+                            'If False, CUDA graphs are deleted on suspend and re-captured on resume.')
     group.add_argument('--rl-partial-rollouts', action=argparse.BooleanOptionalAction, default=False,
                        help='If set, use partial rollouts.')
     group.add_argument('--rl-inference-logprobs-is-correction', action=argparse.BooleanOptionalAction, type=bool, default=False,
@@ -1930,7 +2101,7 @@ def _add_rl_args(parser):
                             'round-robin: distribute bins cyclically across ranks for better load balancing')
     group.add_argument('--rl-training-cuda-graphs', action=argparse.BooleanOptionalAction, type=bool,
                        default=False,
-                       help='If set, do not call `delete_cuda_graphs` or `toggle_cuda_graphs` when the inference engine is suspended.')
+                       help='If set, do not toggle CUDA graphs on/off between inference and training phases.')
     group.add_argument('--rl-inference-tensor-model-parallel-size', type=int, default=None,
                        help='Degree of tensor model parallelism for inference for RL.')     
     group.add_argument(
@@ -2017,9 +2188,6 @@ def _add_training_args(parser):
                        dest='check_for_large_grads')
     group.add_argument('--result-rejected-tracker-filename', type=str, default=None,
                        help='Optional name of file tracking `result_rejected` events.')
-    group.add_argument('--disable-gloo-process-groups', action='store_false',
-                       dest='enable_gloo_process_groups',
-                       help='Disables creation and usage of Gloo process groups.')
     group.add_argument('--tp-comm-overlap-cfg', type=str, default=None,
                        help='Config file when tp_comm_overlap is enabled.')
 
@@ -2092,10 +2260,6 @@ def _add_training_args(parser):
                        '--use-legacy-models to not use core models.')
     group.add_argument('--use-legacy-models', action='store_true',
                        help='Use the legacy Megatron models, not Megatron-Core models.')
-    group.add_argument('--high-priority-stream-groups', nargs='*', type=str, default=[],
-                       help='The communicator group names to use high priority streams.')
-    group.add_argument('--disable-jit-fuser', action='store_true',
-                       help='Disable the JIT fuser.')
 
     return parser
 
@@ -2204,7 +2368,10 @@ def _add_mixed_precision_args(parser):
 
 
 def _add_distributed_args(parser):
-    group = parser.add_argument_group(title='distributed')
+    from megatron.training.common_config import DistributedInitConfig
+
+    dist_init_factory = ArgumentGroupFactory(DistributedInitConfig)
+    group = dist_init_factory.build_group(parser, "distributed init")
 
     group.add_argument('--decoder-first-pipeline-num-layers',
                        type=int, default=None,
@@ -2232,20 +2399,8 @@ def _add_distributed_args(parser):
     group.add_argument('--no-overlap-p2p-communication', action='store_false',
                        help='overlap pipeline parallel communication with forward and backward chunks in 1F1B',
                        dest='overlap_p2p_comm')
-    group.add_argument('--distributed-backend', default='nccl',
-                       choices=['nccl', 'gloo'],
-                       help='Which backend to use for distributed training.')
-    group.add_argument('--distributed-timeout-minutes', type=int, default=10,
-                       help='Default timeout minutes for torch.distributed.')
-    group.add_argument('--distributed-timeout-seconds-after-init', type=int, default=None,
-                       help='Timeout seconds for process groups after initialization.'
-                            'This timeout is applied to all process groups after initialization.')
     group.add_argument('--overlap-grad-reduce', action='store_true',
                        default=False, help='If set, overlap DDP grad reduce.')
-    group.add_argument('--no-align-grad-reduce', action='store_false',
-                       help='If not set, all PP stages will launch gradient reduces simultaneously. '
-                       'Otherwise, each PP stage will independently launch as needed.',
-                       dest='align_grad_reduce')
     group.add_argument('--ddp-num-buckets', type=int, default=None,
                        help='Number of buckets for data-parallel communication')
     group.add_argument('--ddp-bucket-size', type=int, default=None,
@@ -2272,14 +2427,6 @@ def _add_distributed_args(parser):
     group.add_argument('--no-scatter-gather-tensors-in-pipeline', action='store_false',
                        help='If not set, use scatter/gather to optimize communication of tensors in pipeline.',
                        dest='scatter_gather_tensors_in_pipeline')
-    group.add_argument('--local-rank', type=int, default=int(os.getenv('LOCAL_RANK', '0')),
-                       help='local rank passed from distributed launcher.')
-    group.add_argument('--lazy-mpu-init', type=bool, required=False,
-                       help='If set to True, initialize_megatron() '
-                       'skips DDP initialization and returns function to '
-                       'complete it instead. Also turns on '
-                       '--use-cpu-initialization flag. This is for '
-                       'external DDP manager.' )
     group.add_argument('--use-distributed-optimizer', action='store_true',
                        help='Use distributed optimizer.')
     group.add_argument('--use-nccl-ub', action='store_true', dest='nccl_ub',
@@ -2292,18 +2439,9 @@ def _add_distributed_args(parser):
     group.add_argument('--fsdp-manual-registration', action='store_true', dest='fsdp_manual_registration',
                        default=False, help='Manually register the FSDP communication buffers to NCCL user buffer.'
                        'This option is only effective when use-megatron-fsdp and use-nccl-ub is set.')
-    group.add_argument('--use-sharp', action='store_true', 
-                       help='Required to enable SHARP communication.')
-    group.add_argument('--sharp-enabled-group', type=str, default=None,
-                       choices=['dp', 'dp_replica'],
-                       help='IB SHARP can be enabled from only one communication group. '
-                       'By default, it is enabled from dp group. '
-                       'Available options: [dp, dp_replica]')
     group.add_argument('--create-all-gather-group', action='store_true',
                    help='Create a separate process group for all-gather operations '
                    'to overlap reduce-scatter and all-gather operations.')
-    group.add_argument('--use-megatron-fsdp', action='store_true',
-                       help='Use the Megatron FSDP code path in DDP.')
     group.add_argument('--data-parallel-sharding-strategy', type=str, default='no_shard',
                        choices=['no_shard', 'optim', 'optim_grads', 'optim_grads_params'],
                        help='Sharding strategy of data parallelism.')
@@ -2332,9 +2470,6 @@ def _add_distributed_args(parser):
                        help='If set, enable full sharding in megatron-fsdp Hybrid Sharded Data Parallel (HSDP) mode.')
     group.add_argument('--num-distributed-optimizer-instances', type=int, default=1,
                        help='Number of Distributed Optimizer copies across Data Parallel domain.')
-    group.add_argument('--use-torch-fsdp2', action='store_true',
-                       help='Use the torch FSDP2 implementation. FSDP2 has not been tested with pipeline parallelism, '
-                       'and may contain bugs.')
     group.add_argument('--torch-fsdp2-no-reshard-after-forward', action='store_false', dest='torch_fsdp2_reshard_after_forward',
                        help='Whether to reshard weights after forward pass when using PyTorch FSDP2. '
                        'Set to enable FSDP ZeRO-2.')
@@ -2344,14 +2479,6 @@ def _add_distributed_args(parser):
                        'all layers will share the same communication type. Users can also '
                        'specify separated types for each layer like '
                        '--cp-comm-type p2p p2p a2a a2a a2a+p2p a2a+p2p')
-    group.add_argument('--nccl-communicator-config-path', type=str, default=None,
-                       help='Path to the yaml file with NCCL communicator '
-                       'configurations. The number of min/max thread groups and thread '
-                       'group cluster size of each communicator can be configured by '
-                       'setting `min_ctas`, `max_ctas`, and `cga_cluster_size`.')
-    group.add_argument('--use-tp-pp-dp-mapping', action='store_true', default=False,
-                        help='If set, distributed ranks initialize order is changed '
-                        'from tp-cp-ep-dp-pp to tp-cp-ep-pp-dp.')
     group.add_argument('--fake-process-group', action='store_true', default=False,
                        help='If set, initialize with fake distributed process group and all distributed communication operations will be skipped. \
                        This is quite useful for profiling memory usage of distributed training with just one GPU. \
@@ -2405,8 +2532,6 @@ def _add_tokenizer_args(parser):
     group.add_argument('--tokenizer-special-tokens', type=str, nargs='+', default=None,
                        help='List of special tokens. For TikTokenizer needs to have '
                             '["<unk>", "<s>", "</s>", "<mask>", "<pad>", "<cls>", "<sep>"]')
-    group.add_argument('--legacy-tokenizer', action='store_true', default=False,
-                       help='To use Megatron-LM legacy tokenizer system.')
     group.add_argument('--tiktoken-pattern', type=str, default=None,
                        help='Which tiktoken pattern to use. Options: [v1, v2]')
     group.add_argument('--tiktoken-num-special-tokens', type=int, default=1000,
@@ -2416,10 +2541,14 @@ def _add_tokenizer_args(parser):
                             '["<unk>", "<s>", "</s>", "<mask>", "<pad>", "<cls>", "<sep>"]')
     group.add_argument('--tokenizer-sentencepiece-legacy', action='store_true', default=False,
                        help='SentencePiece tokenizer wrapper legacy behavior. Allows special tokens usage.')
-    group.add_argument('--tokenizer-hf-use-fast', action='store_true', default=False,
+    group.add_argument('--tokenizer-hf-use-fast', action='store_true', default=True,
                        help='Whether to use fast HuggingFace tokenizer.')
-    group.add_argument('--tokenizer-hf-include-special-tokens', action='store_true', default=False,
+    group.add_argument('--tokenizer-hf-include-special-tokens', action='store_true', default=True,
                        help='Converting text to ids will include special for HuggingFace tokenizer.')
+    group.add_argument('--tokenizer-hf-no-use-fast', action='store_true', default=False,
+                       help='Whether to use fast HuggingFace tokenizer.')
+    group.add_argument('--tokenizer-hf-no-include-special-tokens', action='store_true', default=False,
+                       help='Converting text to ids will not include special for HuggingFace tokenizer.')
     group.add_argument("--trust-remote-code", action="store_true", default=False,
                        help='Whether or not to allow PreTrainedTokenizer to execute remote code')
     return parser
