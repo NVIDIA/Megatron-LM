@@ -1,7 +1,7 @@
 # Copyright (c) 2024, NVIDIA CORPORATION. All rights reserved.
 import itertools
 import os
-import pickle
+import json
 import shutil
 
 import numpy as np
@@ -52,12 +52,16 @@ class OpenRetreivalDataStore(object):
         """Populate members from instance saved to file"""
 
         if not mpu.model_parallel_is_initialized() or mpu.get_data_parallel_rank() == 0:
-            print("\n> Unpickling BlockData", flush=True)
-        state_dict = pickle.load(open(self.embedding_path, 'rb'))
+            print("\n> Loading BlockData", flush=True)
+        with open(self.embedding_path, 'r') as f:
+            state_dict = json.load(f)
         if not mpu.model_parallel_is_initialized() or mpu.get_data_parallel_rank() == 0:
-            print(">> Finished unpickling BlockData\n", flush=True)
+            print(">> Finished loading BlockData\n", flush=True)
 
-        self.embed_data = state_dict['embed_data']
+        # Convert string keys back to ints and lists back to numpy float16 arrays
+        self.embed_data = {
+            int(k): np.float16(v) for k, v in state_dict['embed_data'].items()
+        }
 
     def add_block_data(self, row_id, block_embeds, allow_overwrite=False):
         """
@@ -72,6 +76,18 @@ class OpenRetreivalDataStore(object):
 
             self.embed_data[idx] = np.float16(embed)
 
+    def _state_to_json_serializable(self):
+        """Convert state to a JSON-serializable format.
+
+        Converts numpy arrays to lists and int keys to strings for JSON compatibility.
+        """
+        state = self.state()
+        state['embed_data'] = {
+            str(k): v.tolist() if hasattr(v, 'tolist') else v
+            for k, v in state['embed_data'].items()
+        }
+        return state
+
     def save_shard(self):
         """
         Save the block data that was created this in this process
@@ -80,9 +96,9 @@ class OpenRetreivalDataStore(object):
             os.makedirs(self.temp_dir_name, exist_ok=True)
 
         # save the data for each shard
-        with open('{}/{}.pkl'.format(self.temp_dir_name, self.rank), 'wb') \
+        with open('{}/{}.json'.format(self.temp_dir_name, self.rank), 'w') \
             as writer:
-            pickle.dump(self.state(), writer)
+            json.dump(self._state_to_json_serializable(), writer)
 
     def merge_shards_and_save(self):
         #Combine all the shards made using save_shard
@@ -95,21 +111,25 @@ class OpenRetreivalDataStore(object):
                 seen_own_shard = True
                 continue
 
-            with open('{}/{}'.format(self.temp_dir_name, fname), 'rb') as f:
-                data = pickle.load(f)
+            with open('{}/{}'.format(self.temp_dir_name, fname), 'r') as f:
+                data = json.load(f)
                 old_size = len(self.embed_data)
                 shard_size = len(data['embed_data'])
 
                 # add the shard's data and check to make sure there
-                # is no overlap
-                self.embed_data.update(data['embed_data'])
+                # is no overlap. Convert string keys back to ints and
+                # lists back to numpy float16 arrays.
+                loaded_embed_data = {
+                    int(k): np.float16(v) for k, v in data['embed_data'].items()
+                }
+                self.embed_data.update(loaded_embed_data)
                 assert len(self.embed_data) == old_size + shard_size
 
         assert seen_own_shard
 
         # save the consolidated shards and remove temporary directory
-        with open(self.embedding_path, 'wb') as final_file:
-            pickle.dump(self.state(), final_file)
+        with open(self.embedding_path, 'w') as final_file:
+            json.dump(self._state_to_json_serializable(), final_file)
         shutil.rmtree(self.temp_dir_name, ignore_errors=True)
 
         print("Finished merging {} shards for a total of {} embeds".format(

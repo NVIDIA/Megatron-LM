@@ -2074,10 +2074,10 @@ def training_log(
     if iteration % args.log_interval == 0 or is_first_iteration:
         if args.record_memory_history and (is_last_rank() or torch.distributed.get_backend() == 'fake'):
             snapshot = torch.cuda.memory._snapshot()
-            from pickle import dump
+            from json import dump
 
-            with open(args.memory_snapshot_path, 'wb') as f:
-                dump(snapshot, f)
+            with open(args.memory_snapshot_path, 'w') as f:
+                dump(snapshot, f, default=str)
 
         elapsed_time = timers('interval-time').elapsed(barrier=True, reset=should_reset)
         elapsed_time_per_iteration = elapsed_time / total_iterations

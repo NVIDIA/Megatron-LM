@@ -731,11 +731,12 @@ def convert_torch_dist_to_fsdp_dtensor(
                 )
             )
             snapshot = torch.cuda.memory._snapshot()
-            from pickle import dump
+            from json import dump
 
             dump(
                 snapshot,
-                open(f"oom_rank-{torch.distributed.get_rank()}_snapshot.pickle", "wb"),
+                open(f"oom_rank-{torch.distributed.get_rank()}_snapshot.json", "w"),
+                default=str,
             )
 
         torch._C._cuda_attach_out_of_memory_observer(oom_observer)
