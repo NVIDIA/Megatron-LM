@@ -68,12 +68,6 @@ class BlockAllocator:
                     (self.total_count,), dtype=torch.int64, device=torch.cuda.current_device()
                 )
 
-            # Pending block hashes for prefix caching coordination
-            # -1 = not pending, positive = hash registered but KV not yet computed
-            self._pending_block_hashes = torch.full(
-                (self.total_count,), -1, dtype=torch.int64, device=torch.cuda.current_device()
-            )
-
     def __str__(self):
         return (
             f"using: total {self.get_total_used()}/{self.total_count - 1}"
@@ -216,7 +210,6 @@ class BlockAllocator:
 
             # Reset prefix caching state
             self.hash_to_block_id.clear()
-            self._pending_block_hashes.fill_(-1)
             self.block_ref_counts.fill_(0)
             if self.block_evict_lru:
                 self.block_timestamps.fill_(0)
@@ -228,10 +221,6 @@ class BlockAllocator:
     def register_block_hashes(self, block_ids: list[int], block_hashes: list[int]) -> None:
         """Register blocks in the hash-to-block mapping for discovery (batch).
 
-        NOTE: Does NOT mark blocks as computed. Call mark_blocks_computed() after
-        KV is computed. This two-phase approach enables prefix caching coordination
-        where subsequent requests wait for blocks to be computed before reusing.
-
         Args:
             block_ids: List of block IDs.
             block_hashes: List of computed hash values (same length as block_ids).
@@ -239,31 +228,13 @@ class BlockAllocator:
         if not block_ids:
             return
         id_tensor = torch.tensor(
-            block_ids, dtype=torch.int64, device=self._pending_block_hashes.device
+            block_ids, dtype=torch.int64, device=self.block_hashes.device
         )
         hash_tensor = torch.tensor(
-            block_hashes, dtype=torch.int64, device=self._pending_block_hashes.device
+            block_hashes, dtype=torch.int64, device=self.block_hashes.device
         )
-        self._pending_block_hashes[id_tensor] = hash_tensor
+        self.block_hashes[id_tensor] = hash_tensor
         self.hash_to_block_id.update(zip(block_hashes, block_ids))
-
-    def mark_blocks_computed(self, block_ids: list[int]) -> None:
-        """Mark blocks as having their KV computed (batch).
-
-        Called after prefill completes for blocks that were registered.
-        This sets block_hashes[block_id] to the actual hash value,
-        signaling that the KV cache for these blocks is ready for reuse.
-
-        Args:
-            block_ids: List of block IDs to mark as computed.
-        """
-        if not block_ids:
-            return
-        id_tensor = torch.tensor(
-            block_ids, dtype=torch.int64, device=self._pending_block_hashes.device
-        )
-        self.block_hashes[id_tensor] = self._pending_block_hashes[id_tensor]
-        self._pending_block_hashes[id_tensor] = -1
 
     def _deregister_blocks(self, block_ids: Tensor) -> None:
         """Remove blocks from prefix caching state and return to free pool.
@@ -277,22 +248,15 @@ class BlockAllocator:
         if num_blocks == 0:
             return
 
-        # Gather pending and computed hashes via batched tensor indexing
+        # Gather hashes via batched tensor indexing
         block_ids_i64 = block_ids.to(torch.int64)
-        pending_hashes = self._pending_block_hashes[block_ids_i64]
-        computed_hashes = self.block_hashes[block_ids_i64]
-
-        # Single GPU→CPU transfer for all hash values
-        all_hashes = torch.stack([pending_hashes, computed_hashes]).tolist()
-        pending_list = all_hashes[0]
-        computed_list = all_hashes[1]
+        hashes = self.block_hashes[block_ids_i64].tolist()
 
         # Remove from hash_to_block_id dict (set ops + C-level map, no Python loop)
-        keys_to_delete = (set(pending_list) | set(computed_list)) - {-1}
+        keys_to_delete = set(hashes) - {-1}
         deque(map(self.hash_to_block_id.pop, keys_to_delete & self.hash_to_block_id.keys()), maxlen=0)
 
         # Reset block state (batched tensor ops)
-        self._pending_block_hashes[block_ids_i64] = -1
         self.block_hashes[block_ids] = -1
         self.block_ref_counts[block_ids] = 0
         if self.block_evict_lru:

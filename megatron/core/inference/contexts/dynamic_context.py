@@ -249,9 +249,6 @@ class DynamicInferenceContext(BaseInferenceContext):
         # Step counter (used for LRU timestamps in prefix caching)
         self.step_count = 0
 
-        # Track blocks pending computation for prefix caching coordination
-        self._blocks_pending_computation: List[int] = []
-
         self.cache_mla_latent = (
             isinstance(model_config, MLATransformerConfig) and model_config.cache_mla_latents
         )
@@ -1413,9 +1410,6 @@ class DynamicInferenceContext(BaseInferenceContext):
             token_count=0, prefill_req_count=0, decode_req_count=0
         )
 
-        # Reset prefix caching coordination state
-        self._blocks_pending_computation.clear()
-
     def current_input_and_position_ids(
         self, *, num_warmup_tokens: Optional[int] = None
     ) -> Tuple[Tensor, Tensor]:
@@ -1507,7 +1501,7 @@ class DynamicInferenceContext(BaseInferenceContext):
             return [], 0
 
         # Early return if request has no precomputed hashes
-        if req.precomputed_block_hashes is None or len(req.precomputed_block_hashes) == 0:
+        if not req.precomputed_block_hashes:
             return [], 0
 
         # Clamp end_block to the number of precomputed hashes (the trailing
@@ -1534,16 +1528,6 @@ class DynamicInferenceContext(BaseInferenceContext):
         matched_blocks = block_ids[:prefix_len]
         parent_hash = hashes[prefix_len - 1]
         return matched_blocks, parent_hash
-
-    def mark_pending_blocks_computed(self) -> None:
-        """Mark all pending blocks as computed after prefill.
-
-        Called by the engine after a prefill step completes to mark blocks
-        as having their KV computed. This enables prefix caching coordination
-        where subsequent requests can safely reuse these blocks.
-        """
-        self.block_allocator.mark_blocks_computed(self._blocks_pending_computation)
-        self._blocks_pending_computation.clear()
 
     def add_request(self, req: DynamicInferenceRequest, chunk_length: Optional[int] = None) -> None:
         """Add request to context. At this stage, we assume that the request is valid and can be added, as the checks are done in the schedule function.
@@ -1713,7 +1697,7 @@ class DynamicInferenceContext(BaseInferenceContext):
         #       — the partial block from a prior chunk that this chunk's tokens completed
         #   Range 2: [already_allocated_blocks + num_matched_blocks, num_complete_blocks)
         #       — newly allocated blocks that are now complete
-        if self.enable_prefix_caching and req.precomputed_block_hashes is not None:
+        if self.enable_prefix_caching and req.precomputed_block_hashes:
             total_tokens_after = req.finished_chunk_token_count + chunk_length
             num_complete_blocks = total_tokens_after // self.block_size_tokens
             previously_complete = req.finished_chunk_token_count // self.block_size_tokens
@@ -1728,7 +1712,6 @@ class DynamicInferenceContext(BaseInferenceContext):
                 self.block_allocator.register_block_hashes(
                     block_ids_to_hash, block_hashes_slice
                 )
-                self._blocks_pending_computation.extend(block_ids_to_hash)
 
             # Range 1: prior-chunk partial block that this chunk just completed
             _register_range(previously_complete, min(already_allocated_blocks, num_complete_blocks))

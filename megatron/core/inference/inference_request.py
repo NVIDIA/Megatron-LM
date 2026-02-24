@@ -357,7 +357,7 @@ class DynamicInferenceRequest(InferenceRequest):
     enable_prefix_caching: bool = True  # Whether prefix caching is enabled
 
     # Computed field - not passed by caller
-    precomputed_block_hashes: Optional[List[int]] = field(default=None, init=False)
+    precomputed_block_hashes: List[int] = field(default_factory=list)
 
     def __post_init__(self):
         self.sampling_params = copy.deepcopy(self.sampling_params)
@@ -371,9 +371,6 @@ class DynamicInferenceRequest(InferenceRequest):
             and self.prompt_tokens is not None
         ):
             self._compute_block_hashes()
-        elif self.block_size_tokens is not None:
-            # No prompt yet or prefix caching disabled - set empty list
-            self.precomputed_block_hashes = []
 
     def _compute_block_hashes(self) -> None:
         """Compute hashes for all complete blocks in the prompt.

@@ -148,7 +148,7 @@ def run_inference(
 
             # Suspend.
             if attempted_step_count % args.suspend_resume_interval == 0:
-                print("**** step %d/%d ... suspend." % (engine.step_count, attempted_step_count))
+                print("**** step %d/%d ... suspend." % (engine.context.step_count, attempted_step_count))
                 engine.suspend()
 
             # Resume, 0+ attempted steps later.
@@ -158,7 +158,7 @@ def run_inference(
                 % args.suspend_resume_interval
                 == 0
             ):
-                print("**** step %d/%d ... resume." % (engine.step_count, attempted_step_count))
+                print("**** step %d/%d ... resume." % (engine.context.step_count, attempted_step_count))
                 engine.resume()
 
         # If engine suspended, continue to next iter.
@@ -413,7 +413,7 @@ def main():
                         "latency": req.time_end - req.time_start,
                         "ttft": req.ttft,  # Time-to-first-token in seconds
                         "cuda_graph_request_count_map": result["cuda_graph_request_count_map"],
-                        "step_count": engine.step_count,
+                        "step_count": engine.context.step_count,
                         "top_n_logprobs": getattr(req, 'generated_top_n_logprobs', None),
                         "prompt_top_n_logprobs": getattr(req, 'prompt_top_n_logprobs', None),
                     }
@@ -472,7 +472,7 @@ def main():
             f"{setup_prefix} … " f"throughput: {throughput:.3f} tok/s … ",
             f"total time: {total_time:.3f}s … "
             f"mem {peak_alloc_gb:.1f}/{peak_resvd_gb:.1f} GB … "
-            f"steps: {engine.step_count:d} … "
+            f"steps: {engine.context.step_count:d} … "
             f"capture {capture_str}",
         )
         print("~~~")

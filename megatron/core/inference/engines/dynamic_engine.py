@@ -1130,43 +1130,6 @@ class DynamicInferenceEngine(AbstractEngine):
 
         return False
 
-    def _has_pending_prefix_blocks(self, req: DynamicInferenceRequest) -> bool:
-        """Check if a request depends on prefix blocks whose KV is not yet computed.
-
-        When prefix caching is enabled and a request shares blocks with a prior
-        request that is still being prefilled, those blocks have hash == -1 in the
-        block allocator (registered but not yet marked computed). Scheduling such
-        a request before the KV is ready would produce incorrect results.
-
-        Args:
-            req: The request to check.
-
-        Returns:
-            True if the request would share blocks that are still pending computation.
-        """
-        if not self.context.enable_prefix_caching:
-            return False
-        if req.precomputed_block_hashes is None or len(req.precomputed_block_hashes) == 0:
-            return False
-
-        block_allocator = self.context.block_allocator
-        hash_to_block = block_allocator.hash_to_block_id
-
-        # Phase 1: CPU-only dict lookups to find all matching block IDs
-        block_ids = list(map(hash_to_block.get, req.precomputed_block_hashes))
-        try:
-            prefix_len = block_ids.index(None)
-        except ValueError:
-            prefix_len = len(block_ids)
-        matched_ids = block_ids[:prefix_len]
-
-        if not matched_ids:
-            return False
-
-        # Phase 2: Single batched GPU read (1 sync instead of N)
-        id_tensor = torch.tensor(matched_ids, dtype=torch.int64, device=block_allocator.block_hashes.device)
-        return (block_allocator.block_hashes[id_tensor] == -1).any().item()
-
     def get_prefix_coordination_metrics(self) -> dict:
         """Return prefix caching coordination metrics.
 
@@ -1186,18 +1149,30 @@ class DynamicInferenceEngine(AbstractEngine):
         """
         Perform the same original scheduling logic for non-chunked runs
         """
+        pending_block_hashes = set()
+        pending_request_ids = []
         while self.waiting_request_ids:
             req = self.get_request(self.waiting_request_ids[0])
 
-            # Prefix caching coordination: wait if request depends on pending blocks
-            if self._has_pending_prefix_blocks(req):
+            # Check for conflicting block hashes.
+            has_pending_hash = False
+            for block_hash in req.precomputed_block_hashes:
+                if block_hash in pending_block_hashes:
+                    has_pending_hash = True
+                    break
+            if has_pending_hash:
                 self._prefix_coordination_waits += 1
-                break
+                pending_request_ids.append(self.waiting_request_ids.popleft())
+                continue
 
             request_can_be_added, request_tokens_can_be_added, kv_cache_available = (
                 self.context.check_availability(req)
             )
             if request_can_be_added and request_tokens_can_be_added and kv_cache_available:
+                # Add these hashes to pending.
+                for block_hash in req.precomputed_block_hashes:
+                    if block_hash not in self.context.block_allocator.hash_to_block_id:
+                        pending_block_hashes.add(block_hash)
                 self.context.add_request(req)
                 self._loop.call_soon_threadsafe(
                     self._loop.create_task, self._notify_cond_for_new_request()
@@ -1207,6 +1182,9 @@ class DynamicInferenceEngine(AbstractEngine):
                 self.waiting_request_ids.popleft()
             else:
                 break
+
+        # Prepend pending request ids to waiting queue.
+        self.waiting_request_ids.extendleft(reversed(pending_request_ids))
 
     def schedule_chunked_prefill(self):
         """
@@ -1223,6 +1201,8 @@ class DynamicInferenceEngine(AbstractEngine):
                 it is during a chunked prefill
             - For each request, remaining_prompt_tokens holds the **unprefilled** prompt tokens
         """
+        pending_block_hashes = set()
+        pending_request_ids = []
         can_schedule = True
         while self.waiting_request_ids and can_schedule:
             can_schedule = False
@@ -1232,11 +1212,17 @@ class DynamicInferenceEngine(AbstractEngine):
             # chunk of a existing chunked prefill request
             is_continuing_chunked_prefill = self.context.chunked_prefill_request_id >= 0
 
-            # Prefix caching coordination: wait if new request depends on pending blocks
-            # (continuing chunked prefill requests must not be blocked)
-            if not is_continuing_chunked_prefill and self._has_pending_prefix_blocks(req):
-                self._prefix_coordination_waits += 1
-                break
+            # Check for conflicting block hashes.
+            if not is_continuing_chunked_prefill:
+                has_pending_hash = False
+                for block_hash in req.precomputed_block_hashes:
+                    if block_hash in pending_block_hashes:
+                        has_pending_hash = True
+                        break
+                if has_pending_hash:
+                    self._prefix_coordination_waits += 1
+                    pending_request_ids.append(self.waiting_request_ids.popleft())
+                    continue
 
             # Use remaining prompt tokens for scheduling decisions
             remaining_len = len(req.remaining_prompt_tokens)
@@ -1249,6 +1235,10 @@ class DynamicInferenceEngine(AbstractEngine):
 
             if request_can_be_added and kv_cache_available:
                 if token_fully_can_be_added:
+                    # Add these hashes to pending.
+                    for block_hash in req.precomputed_block_hashes:
+                        if block_hash not in self.context.block_allocator.hash_to_block_id:
+                            pending_block_hashes.add(block_hash)
                     self.context.chunked_prefill_request_id = -1
                     self.context.add_request(req)
                     self._loop.call_soon_threadsafe(
@@ -1261,6 +1251,10 @@ class DynamicInferenceEngine(AbstractEngine):
                     # Only this case we keep checking the rest of the waiting queue
                     can_schedule = True
                 elif token_partially_can_be_added:
+                    # Add these hashes to pending.
+                    for block_hash in req.precomputed_block_hashes:
+                        if block_hash not in self.context.block_allocator.hash_to_block_id:
+                            pending_block_hashes.add(block_hash)
                     chunk_length = self.context.max_tokens - self.context.active_token_count
                     self.context.add_request(req, chunk_length=chunk_length)
                     self._loop.call_soon_threadsafe(
@@ -1272,6 +1266,15 @@ class DynamicInferenceEngine(AbstractEngine):
                     # Still have tokens to prefill, so we break and keep the
                     # chunked prefill request at the head of the waiting queue
                     # Note that we do not need to continue check the queue, as the tokens are full
+
+        # Prepend pending request ids to waiting queue.
+        is_continuing_chunked_prefill = self.context.chunked_prefill_request_id >= 0
+        if is_continuing_chunked_prefill:
+            chunked_request_id = self.waiting_request_ids.popleft()
+            self.waiting_request_ids.extendleft(reversed(pending_request_ids))
+            self.waiting_request_ids.appendleft(chunked_request_id)
+        else:
+            self.waiting_request_ids.extendleft(reversed(pending_request_ids))
 
     async def async_forward(self) -> Tuple[Dict, Dict, float]:
         """Uses `asyncio` for continuous generation.
@@ -1313,10 +1316,6 @@ class DynamicInferenceEngine(AbstractEngine):
         self.step_end_event.synchronize()
         step_time = self.step_start_event.elapsed_time(self.step_end_event) / 1e3
         self.context.step_count += 1
-
-        # Mark pending prefix blocks as computed after prefill steps
-        if not is_decode_only and self.context.enable_prefix_caching:
-            self.context.mark_pending_blocks_computed()
 
         range_pop()
 
