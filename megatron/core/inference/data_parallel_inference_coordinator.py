@@ -226,7 +226,7 @@ class DataParallelInferenceCoordinator:
         while True:
             sender_identity, serialized_payload = self.router_socket.recv_multipart()
 
-            # Empty payload = engine (re-)registration.
+            # Allow for re-registration if connecting to a running coordinator.
             if serialized_payload == b"":
                 if sender_identity not in self.identities_of_data_parallel_ranks:
                     self.identities_of_data_parallel_ranks.append(sender_identity)
@@ -297,7 +297,7 @@ class DataParallelInferenceCoordinator:
                 Headers.INCREMENT_STALENESS,
                 Headers.STOP,
             ):
-                # Control signals: gate on coordinator state, then broadcast.
+                # Control signals: start by checking the current state against the signal.
                 if sender_identity not in known_clients:
                     continue
 
@@ -338,13 +338,13 @@ class DataParallelInferenceCoordinator:
                         continue
                     self.state = self.State.STOPPING
 
-                # Broadcast to all engines (reached only if gating passed).
+                # Control signals: broadcast to all engines, if gating passed.
                 broadcast_payload = msgpack.packb([header.value], use_bin_type=True)
                 for data_parallel_rank_id in list(self.identities_of_data_parallel_ranks):
                     self._send_to_engine(data_parallel_rank_id, broadcast_payload)
                 if header == Headers.STOP:
-                    # Coordinator's job is done after broadcasting STOP.
-                    # Engines synchronize among themselves via DP all-reduce.
+                    # Coordinator is done after broadcasting STOP.
+                    # Engines will synchronize their own stop state via all-reduce.
                     break
 
             elif header == Headers.PAUSE_ACK:
