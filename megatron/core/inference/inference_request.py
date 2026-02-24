@@ -345,6 +345,8 @@ class DynamicInferenceRequest(InferenceRequest):
     prompt_tokens: Optional[torch.Tensor] = None
     # remaining prompt tokens are used for chunked prefill
     remaining_prompt_tokens: Optional[torch.Tensor] = None
+    policy_staleness: Optional[torch.Tensor] = None
+    kv_cache_staleness: Optional[torch.Tensor] = None
     latency: Optional[float] = None
     # routing_indices stores MoE routing decisions for all tokens generated so far.
     # Shape: [total_tokens, num_layers, topk] - accumulated across all generation steps
@@ -595,6 +597,53 @@ class DynamicInferenceRequestRecord:
         """
         return self.requests[0].request_id
 
+    @staticmethod
+    def _update_staleness_tensor(
+        tensor: Optional[torch.Tensor], total_tokens: int, increment: bool = True
+    ) -> torch.Tensor:
+        """Update a per-token staleness tensor, extending with zeros if needed.
+
+        Args:
+            tensor: Existing staleness tensor, or None to create a new one.
+            total_tokens: Expected length of the tensor after update.
+            increment: If True, increment all values by 1 (including new positions).
+        """
+        if tensor is None:
+            tensor = torch.zeros(total_tokens, dtype=torch.int32, device='cpu')
+        elif len(tensor) < total_tokens:
+            tensor = torch.cat(
+                (
+                    tensor,
+                    torch.zeros(
+                        total_tokens - len(tensor), dtype=tensor.dtype, device=tensor.device
+                    ),
+                ),
+                dim=0,
+            )
+        if increment:
+            tensor = tensor + 1
+        return tensor
+
+    def increment_staleness(self, policy_only: bool = False):
+        """Increment per-token staleness counters in-place.
+
+        Each call indicates that a training step has occurred since these tokens
+        were generated. Tokens not yet tracked are initialized to 1.
+
+        Args:
+            policy_only: If True, only increment policy_staleness. Use this for
+                evicted requests that have no KV cache to age.
+        """
+        request = self[-1]
+        total_tokens = len(request.prompt_tokens) + len(request.generated_tokens)
+        request.policy_staleness = self._update_staleness_tensor(
+            request.policy_staleness, total_tokens, increment=True
+        )
+        if not policy_only:
+            request.kv_cache_staleness = self._update_staleness_tensor(
+                request.kv_cache_staleness, total_tokens, increment=True
+            )
+
     def checkpoint(self, tokenizer: MegatronTokenizer | None = None):
         """Maintain reference to previous request, and then append a new request
         that concatenates the previous prompt and generations.
@@ -604,6 +653,24 @@ class DynamicInferenceRequestRecord:
         """
 
         old_request = self[-1]
+
+        total_tokens = len(old_request.prompt_tokens) + len(old_request.generated_tokens)
+
+        # Carry forward policy_staleness without incrementing.
+        policy_staleness = (
+            self._update_staleness_tensor(
+                old_request.policy_staleness, total_tokens, increment=False
+            )
+            if old_request.policy_staleness is not None
+            else None
+        )
+
+        # Reset kv_cache_staleness to 0.
+        kv_cache_staleness = (
+            self._update_staleness_tensor(None, total_tokens, increment=False)
+            if old_request.kv_cache_staleness is not None
+            else None
+        )
 
         # New prompt (concatenate prompt + generated tokens).
         new_prompt_tokens = torch.cat(
@@ -634,7 +701,15 @@ class DynamicInferenceRequestRecord:
             request_id=old_request.request_id,
             prompt_tokens=new_prompt_tokens,
             sampling_params=new_sampling_params,
+            policy_staleness=policy_staleness,
+            kv_cache_staleness=kv_cache_staleness,
         )
+        # Preserve event_add_engine from old request if it exists, otherwise set it.
+        # This ensures TTFT calculation works correctly for evicted/resumed requests.
+        if old_request.event_add_engine is not None:
+            new_request.event_add_engine = old_request.event_add_engine
+        else:
+            new_request.add_event_add_engine()
         self.requests.append(new_request)
 
     def merge(self, tokenizer: MegatronTokenizer | None = None) -> DynamicInferenceRequest:
@@ -664,6 +739,15 @@ class DynamicInferenceRequestRecord:
         except TypeError as e:  # generally means r.generated_text is None
             generated_text = None
 
+        # Ensure staleness tensors are always materialized (zeros if never incremented).
+        total_tokens = len(prompt_tokens) + len(generated_tokens)
+        policy_staleness = self._update_staleness_tensor(
+            self.requests[-1].policy_staleness, total_tokens, increment=False
+        )
+        kv_cache_staleness = self._update_staleness_tensor(
+            self.requests[-1].kv_cache_staleness, total_tokens, increment=False
+        )
+
         # Merged request.
         request = DynamicInferenceRequest(
             request_id=self.requests[0].request_id,
@@ -677,6 +761,8 @@ class DynamicInferenceRequestRecord:
             generated_log_probs=merge_lists("generated_log_probs"),
             generated_top_n_logprobs=merge_lists("generated_top_n_logprobs"),
             sampling_params=self.requests[0].sampling_params,
+            policy_staleness=policy_staleness,
+            kv_cache_staleness=kv_cache_staleness,
             ttft=self.requests[0].ttft,
             tpot=merge_lists("tpot"),
             status=self.requests[-1].status,
