@@ -1652,6 +1652,21 @@ class TransformerConfig(ModelParallelConfig):
             if self.mup_output_mult == 1.0 and self.mup_width_mult != 1.0:
                 self.mup_output_mult = 1.0 / self.mup_width_mult
 
+            overridden_init_methods = []
+            if self.init_method is not None:
+                overridden_init_methods.append("init_method")
+            if self.output_layer_init_method is not None:
+                overridden_init_methods.append("output_layer_init_method")
+            if overridden_init_methods:
+                overridden_init_methods_text = " and ".join(overridden_init_methods)
+                verb = "is" if len(overridden_init_methods) == 1 else "are"
+                warnings.warn(
+                    "use_mup is enabled, but custom "
+                    + overridden_init_methods_text
+                    + f" {verb} set. This may break MuP initialization assumptions.",
+                    UserWarning,
+                )
+
         # Set the embedding init method.
         # NOTE: This block must run AFTER the MuP block above but BEFORE the init_method
         # block below. When MuP is enabled and init_method is None (the common case),

@@ -108,19 +108,21 @@ def get_standard_config_overrides(config: OptimizerConfig) -> Dict[ParamKey, Par
 def get_mup_config_overrides(
     config: OptimizerConfig, mup_width_mult: float, optimizer_type: str = 'adam'
 ) -> Dict[ParamKey, ParamGroupOverride]:
-    """Get MuP config overrides for per-layer LR scaling.
+    """Get MuP config overrides for per-layer LR and Adam epsilon scaling.
 
     In MuP, hidden layer learning rates are scaled by 1/width_mult to ensure
     that parameter updates remain O(1) as model width increases. This enables
     hyperparameter transfer from a smaller proxy model to a larger target model.
 
-    MuP LR scaling rules (as implemented here):
-    - Adam/AdamW: hidden+output lr = base_lr / width_mult
-    - SGD: no scaling applied (uses base lr for all params)
+    MuP optimizer scaling rules (as implemented here):
+    - Adam/AdamW:
+      - hidden+output lr = base_lr / width_mult
+      - non-embedding tensors with width-scaling fan_in use eps = base_eps / width_mult
+    - SGD: no MuP optimizer overrides are applied.
 
-    Embeddings keep the base learning rate. Output layers are treated like hidden
-    layers unless decoupled_lr is enabled, in which case decoupled_lr takes precedence
-    for embedding/output parameters.
+    Embeddings keep the base learning rate and base eps. Output layers are treated
+    like hidden layers unless decoupled_lr is enabled, in which case decoupled_lr
+    takes precedence for output LR (but not eps).
 
     Args:
         config (OptimizerConfig): optimizer configuration object.
@@ -128,7 +130,7 @@ def get_mup_config_overrides(
         optimizer_type (str): Type of optimizer ('adam' or 'sgd'). Defaults to 'adam'.
 
     Returns:
-        Dict[ParamKey, ParamGroupOverride]: MuP config overrides for hidden layers.
+        Dict[ParamKey, ParamGroupOverride]: MuP optimizer overrides.
     """
     decoupled_lr_enabled = config.decoupled_lr is not None
     if decoupled_lr_enabled:
@@ -137,7 +139,8 @@ def get_mup_config_overrides(
             logging.WARNING,
             "Both decoupled_lr and MuP LR scaling are enabled. decoupled_lr sets an "
             "absolute LR for embedding+output params. MuP LR scaling will only be "
-            "applied to hidden layers in this case.",
+            "applied to hidden layers in this case. MuP Adam epsilon scaling "
+            "remains applied to non-embedding parameters.",
         )
 
     if mup_width_mult == 1.0:
@@ -162,30 +165,56 @@ def get_mup_config_overrides(
             return bool(param.is_embedding_parameter)
         return 'embedding' in param_name.lower()
 
-    def should_scale_with_mup(param: torch.nn.Parameter, param_name: str) -> bool:
+    def should_scale_lr_with_mup(param: torch.nn.Parameter, param_name: str) -> bool:
         if decoupled_lr_enabled and getattr(param, 'is_embedding_or_output_parameter', False):
             return False
         return not is_embedding_parameter(param, param_name)
 
-    hidden_predicate = ParamWithNamePredicate(
-        name=(
-            "mup_hidden_only_excluding_embedding_output"
-            if decoupled_lr_enabled
-            else "mup_hidden_and_output"
-        ),
-        fn=should_scale_with_mup,
-    )
+    def should_scale_eps_with_mup(param: torch.nn.Parameter, param_name: str) -> bool:
+        if is_embedding_parameter(param, param_name):
+            return False
+        # MuP Appendix B.3: eps scales with fan_in when non-negligible.
+        # 1D tensors (biases, layernorm-like scalars/vectors) are treated as fan_in-invariant.
+        return param.dim() > 1
 
-    override: ParamGroupOverride = {}
+    mup_overrides: Dict[ParamKey, ParamGroupOverride] = {}
+
+    lr_override: ParamGroupOverride = {}
     if base_lr is not None:
-        override["max_lr"] = base_lr * hidden_lr_mult
+        lr_override["max_lr"] = base_lr * hidden_lr_mult
     if base_min_lr is not None:
-        override["min_lr"] = base_min_lr * hidden_lr_mult
+        lr_override["min_lr"] = base_min_lr * hidden_lr_mult
 
-    if not override:
-        return {}
+    eps_override: ParamGroupOverride = {}
+    if config.adam_eps is not None:
+        eps_override["eps"] = config.adam_eps * hidden_lr_mult
 
-    return {ParamKey(with_name_predicate=hidden_predicate): override}
+    if decoupled_lr_enabled:
+        if lr_override:
+            hidden_predicate = ParamWithNamePredicate(
+                name="mup_hidden_only_excluding_embedding_output",
+                fn=should_scale_lr_with_mup,
+            )
+            mup_overrides[ParamKey(with_name_predicate=hidden_predicate)] = lr_override
+
+        if eps_override:
+            hidden_output_predicate = ParamWithNamePredicate(
+                name="mup_hidden_and_output_for_adam_eps",
+                fn=should_scale_eps_with_mup,
+            )
+            mup_overrides[ParamKey(with_name_predicate=hidden_output_predicate)] = eps_override
+    else:
+        combined_override: ParamGroupOverride = {}
+        combined_override.update(lr_override)
+        combined_override.update(eps_override)
+        if combined_override:
+            hidden_output_predicate = ParamWithNamePredicate(
+                name="mup_hidden_and_output",
+                fn=should_scale_eps_with_mup,
+            )
+            mup_overrides[ParamKey(with_name_predicate=hidden_output_predicate)] = combined_override
+
+    return mup_overrides
 
 
 def _get_param_groups(

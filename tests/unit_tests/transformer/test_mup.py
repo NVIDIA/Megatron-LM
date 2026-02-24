@@ -162,11 +162,39 @@ class TestMuPAttentionScaling:
         assert config.softmax_scale is None
 
 
+class TestMuPWarnings:
+    """Tests for MuP configuration warnings."""
+
+    def test_mup_warns_with_custom_init_method(self):
+        """Warn when MuP is enabled and init_method is user-provided."""
+        with pytest.warns(UserWarning, match="use_mup is enabled"):
+            TransformerConfig(
+                hidden_size=512,
+                num_layers=4,
+                num_attention_heads=8,
+                use_mup=True,
+                mup_base_hidden_size=128,
+                init_method=init_method_normal(0.01),
+            )
+
+    def test_mup_warns_with_custom_output_layer_init_method(self):
+        """Warn when MuP is enabled and output_layer_init_method is user-provided."""
+        with pytest.warns(UserWarning, match="use_mup is enabled"):
+            TransformerConfig(
+                hidden_size=512,
+                num_layers=4,
+                num_attention_heads=8,
+                use_mup=True,
+                mup_base_hidden_size=128,
+                output_layer_init_method=init_method_normal(0.01),
+            )
+
+
 class TestMuPLRScaling:
-    """Tests for MuP learning rate scaling."""
+    """Tests for MuP learning rate and Adam epsilon scaling."""
 
     def test_mup_lr_override_computation(self):
-        """Hidden LR scales as 1/width_mult."""
+        """Hidden LR and Adam eps scale as 1/width_mult."""
         optimizer_config = OptimizerConfig(lr=1e-3, min_lr=1e-5)
         width_mult = 4.0
 
@@ -179,9 +207,11 @@ class TestMuPLRScaling:
         for param_key, override in overrides.items():
             expected_max_lr = 1e-3 / width_mult  # 2.5e-4
             expected_min_lr = 1e-5 / width_mult  # 2.5e-6
+            expected_eps = optimizer_config.adam_eps / width_mult
 
             assert abs(override['max_lr'] - expected_max_lr) < 1e-10
             assert abs(override['min_lr'] - expected_min_lr) < 1e-10
+            assert abs(override['eps'] - expected_eps) < 1e-15
 
     def test_mup_lr_no_scaling_at_unity(self):
         """No LR scaling when width_mult=1.0."""
@@ -233,8 +263,8 @@ class TestMuPLRScaling:
             # Backward-compatible fallback for older modules without the attribute.
             assert predicate_fn(hidden_param, 'embedding.word_embeddings.weight') is False
 
-    def test_mup_with_decoupled_lr_scales_hidden_only(self):
-        """When decoupled_lr is enabled, MuP should not override embedding/output LR."""
+    def test_mup_with_decoupled_lr_scales_hidden_only_for_lr(self):
+        """With decoupled_lr, MuP LR scales hidden only but eps still scales output."""
         optimizer_config = OptimizerConfig(
             lr=1e-3, min_lr=1e-5, decoupled_lr=2e-4, decoupled_min_lr=2e-6
         )
@@ -245,30 +275,72 @@ class TestMuPLRScaling:
         combined_overrides = {**standard_overrides, **mup_overrides}
 
         hidden_param = torch.nn.Parameter(torch.zeros(10, 10))
+        bias_param = torch.nn.Parameter(torch.zeros(10))
+        embedding_param = torch.nn.Parameter(torch.zeros(10, 10))
+        embedding_param.is_embedding_parameter = True
+        embedding_param.is_embedding_or_output_parameter = True
         output_param = torch.nn.Parameter(torch.zeros(10, 10))
         output_param.is_embedding_or_output_parameter = True
+        shared_output_param = torch.nn.Parameter(torch.zeros(10, 10))
+        shared_output_param.is_embedding_or_output_parameter = True
+        shared_output_param.shared_embedding = True
 
         hidden_matches = [
             override
             for param_key, override in combined_overrides.items()
             if param_key.matches(hidden_param, 'decoder.layer.0.weight')
         ]
+        bias_matches = [
+            override
+            for param_key, override in combined_overrides.items()
+            if param_key.matches(bias_param, 'decoder.layer.0.bias')
+        ]
+        embedding_matches = [
+            override
+            for param_key, override in combined_overrides.items()
+            if param_key.matches(embedding_param, 'embedding.word_embeddings.weight')
+        ]
         output_matches = [
             override
             for param_key, override in combined_overrides.items()
             if param_key.matches(output_param, 'output_layer.weight')
         ]
+        shared_output_matches = [
+            override
+            for param_key, override in combined_overrides.items()
+            if param_key.matches(shared_output_param, 'output_layer.weight')
+        ]
 
         hidden_override = combine_param_group_overrides(hidden_matches)
+        bias_override = combine_param_group_overrides(bias_matches)
+        embedding_override = combine_param_group_overrides(embedding_matches)
         output_override = combine_param_group_overrides(output_matches)
+        shared_output_override = combine_param_group_overrides(shared_output_matches)
 
         # Hidden params keep MuP scaling.
         assert hidden_override['max_lr'] == pytest.approx(1e-3 / width_mult)
         assert hidden_override['min_lr'] == pytest.approx(1e-5 / width_mult)
+        assert hidden_override['eps'] == pytest.approx(optimizer_config.adam_eps / width_mult)
 
-        # Output params keep decoupled LR and should not conflict with MuP.
+        # Biases are fan-in-invariant and should keep unscaled eps.
+        assert bias_override['max_lr'] == pytest.approx(1e-3 / width_mult)
+        assert bias_override['min_lr'] == pytest.approx(1e-5 / width_mult)
+        assert 'eps' not in bias_override
+
+        # Embeddings keep decoupled LR and unscaled eps.
+        assert embedding_override['max_lr'] == pytest.approx(2e-4)
+        assert embedding_override['min_lr'] == pytest.approx(2e-6)
+        assert 'eps' not in embedding_override
+
+        # Output params keep decoupled LR (no MuP LR conflict) but use MuP eps scaling.
         assert output_override['max_lr'] == pytest.approx(2e-4)
         assert output_override['min_lr'] == pytest.approx(2e-6)
+        assert output_override['eps'] == pytest.approx(optimizer_config.adam_eps / width_mult)
+
+        # Shared embedding output copies stay on embedding-class (unscaled) eps.
+        assert shared_output_override['max_lr'] == pytest.approx(2e-4)
+        assert shared_output_override['min_lr'] == pytest.approx(2e-6)
+        assert 'eps' not in shared_output_override
 
 
 class TestMuPConfigIntegration:
@@ -297,7 +369,7 @@ class TestMuPConfigIntegration:
 
 
 class TestMuPOptimizerTypeHandling:
-    """Tests for MuP optimizer-specific LR scaling behavior."""
+    """Tests for MuP optimizer-specific override behavior."""
 
     def test_sgd_no_lr_scaling(self):
         """SGD optimizer should NOT scale LR with width (case insensitive)."""
@@ -313,7 +385,7 @@ class TestMuPOptimizerTypeHandling:
             assert len(overrides) == 0, f"SGD variant '{sgd_variant}' should not scale LR"
 
     def test_adam_scales_lr_by_default(self):
-        """Adam optimizer should scale LR; default optimizer_type is adam."""
+        """Adam optimizer should scale LR and eps; default optimizer_type is adam."""
         optimizer_config = OptimizerConfig(lr=1e-3, min_lr=1e-5)
         width_mult = 4.0
 
@@ -329,7 +401,9 @@ class TestMuPOptimizerTypeHandling:
 
         for param_key, override in overrides_explicit.items():
             expected_max_lr = 1e-3 / width_mult  # 2.5e-4
+            expected_eps = optimizer_config.adam_eps / width_mult
             assert abs(override['max_lr'] - expected_max_lr) < 1e-10
+            assert abs(override['eps'] - expected_eps) < 1e-15
 
 
 class TestMuPMTPLossScaling:
