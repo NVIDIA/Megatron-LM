@@ -235,6 +235,25 @@ class CUDAGraphBatchDimensionBuilder:
             (tp_size=2, num_cuda_graphs=4, cuda_graph_max_tokens=1000)
             [1000, 752, 504, 256]
         """
+        if num_cuda_graphs == -1:
+            # automatically determine the number of CUDA graphs to
+            # capture based on the `max_requests` value
+            cuda_graph_token_counts = (
+                [1, 2, 4] + list(range(8, 256, 8)) + list(range(256, cuda_graph_max_tokens + 1, 16))
+            )
+            # Align each entry to TP size
+            cuda_graph_token_counts = list(
+                dict.fromkeys(math.ceil(s / tp_size) * tp_size for s in cuda_graph_token_counts)
+            )
+            # Clamp to max tokens
+            cuda_graph_token_counts = [
+                s for s in cuda_graph_token_counts if s <= cuda_graph_max_tokens
+            ]
+            if not cuda_graph_token_counts or cuda_graph_token_counts[-1] != cuda_graph_max_tokens:
+                cuda_graph_token_counts.append(cuda_graph_max_tokens)
+            cuda_graph_token_counts.reverse()
+            return cuda_graph_token_counts
+
         assert num_cuda_graphs >= 1, f"num_cuda_graphs must be >= 1, got {num_cuda_graphs}"
         assert (
             cuda_graph_max_tokens > 0
@@ -340,7 +359,12 @@ class CUDAGraphBatchDimensionBuilder:
                 or cuda_graph_max_tokens <= 0
             ):
                 cuda_graph_max_tokens = max_tokens
-            num_cuda_graphs = min(max(num_cuda_graphs, 1), cuda_graph_max_tokens)
+
+            if num_cuda_graphs != -1:
+                # if -1, no need to adjust. This will be taken care of in
+                # the _calculate_cuda_graph_token_counts function where we will generate
+                # the token counts based on the max_tokens value and the step size.
+                num_cuda_graphs = min(max(num_cuda_graphs, 1), cuda_graph_max_tokens)
 
             # Calculate token counts for prefill and mixed graphs.
             # These need the full cuda_graph_max_tokens to handle variable-length sequences.
