@@ -1781,7 +1781,7 @@ class DynamicInferenceEngine(AbstractEngine):
                     # we sleep for 20 ms here.
                     # todo [Siddharth]: Can this hardcoded sleep be avoided
                     # with asyncio zmq sockets?
-                    await asyncio.sleep(0.02)  # Yield to event loop
+                    await asyncio.sleep(0)  # Yield to event loop
                     continue
 
                 try:
