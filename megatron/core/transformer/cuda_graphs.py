@@ -242,7 +242,7 @@ def _check_supported_type(meta):
     }
     assert meta.type in _SUPPORTED_TYPES or is_dataclass(
         meta.value
-    ), f"Cudagraphs recieved an arg of type {meta.type} which is not supported."
+    ), f"Cudagraphs received an arg of type {meta.type} which is not supported."
 
 
 def _determine_if_first_last_layer_of_this_vp_chunk(base_module):
@@ -1228,12 +1228,6 @@ class _CudaGraphRunner(torch.nn.Module):
             return out[0]
         return tuple(out)
 
-    # def _get_cached_parameters_set_for_inference(self):
-    #     """Return cached parameters for inference mode."""
-    #     if not hasattr(self, '_cached_parameters_set_for_inference'):
-    #         self._cached_parameters_set_for_inference = tuple(self.parameters())
-    #     return self._cached_parameters_set_for_inference
-
     def replay_graph_capture(self, is_first_microbatch, args, kwargs):
         """Replay the fwd cuda graph with autograd."""
 
@@ -1246,10 +1240,8 @@ class _CudaGraphRunner(torch.nn.Module):
             raise AssertionError(error_msg)
 
         inp_tensors = self.get_tensors(args, kwargs, check_types=False)
-        is_inference_mode = 'inference_context' in kwargs.keys() and kwargs['inference_context']
-        if self.grad_enabled or not is_inference_mode:
+        if self.grad_enabled:
             func_args = inp_tensors + self.params_to_backprop
-            assert kwargs["inference_context"] is None
         else:
             func_args = inp_tensors
 
@@ -1562,9 +1554,7 @@ class CudaGraphManager(torch.nn.Module):
         else:
             if is_inference_mode:
                 # Inference generation mode creates graphs immediately
-
                 runner = self.get_cudagraph_runner(megatron_module, args, kwargs, True)
-            
 
                 if not runner.fwd_graph_recorded:
                     # Reuse graph input-output buffers for inference
@@ -1595,12 +1585,12 @@ class CudaGraphManager(torch.nn.Module):
                     )
                     runner.fwd_graph_recorded = True
                     runner.cudagraph_created = True
+                    runner = runner.eval()
 
                     # Record this to the global execution record
                     _CudagraphGlobalRecord.cudagraph_inference_record.append(
                         (runner, "fwd", args, kwargs)
                     )
-                    runner = runner.eval()
 
                 # Now replay the graph
                 out = runner.replay_graph_capture(self.is_first_microbatch, args, kwargs)
@@ -1748,7 +1738,7 @@ class TECudaGraphHelper:
                         callables.append(layer)
                         callables_is_mtp.append(False)
                 for layer_number in range(num_mtp_layers):
-                    layer = chunk_with_decoder.mtp.layers[layer_number].transformer_layer
+                    layer = chunk_with_decoder.mtp.layers[layer_number].mtp_model_layer
                     if _layer_is_graphable(layer, config):
                         num_graphable_layers += 1
                         callables.append(layer)
@@ -1865,7 +1855,7 @@ class TECudaGraphHelper:
             Get the static inputs for a layer.
             """
             assert layer in chunk_of_the_layer.decoder.layers or any(
-                layer is mtp_layer.transformer_layer for mtp_layer in chunk_of_the_layer.mtp.layers
+                layer is mtp_layer.mtp_model_layer for mtp_layer in chunk_of_the_layer.mtp.layers
             ), "Layer is not in the chunk"
 
             def get_rotary_pos_emb(transformer_module, transformer_input):

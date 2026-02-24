@@ -110,22 +110,25 @@ try:
             )
             tasks.append(client.add_request(prompt_tokens, per_req_params))
 
-        start_time = time.perf_counter()
+        if current_app.config['verbose']:
+            start_time = time.perf_counter()
+
         try:
             batch_results = await asyncio.gather(*tasks)
         except Exception as e:
             return f"Error during inference: {e}", 500
 
-        logger.info(
-            f"Batch of {len(tasks)} requests processed in {time.perf_counter() - start_time:.2f}s"
-        )
+        if current_app.config['verbose']:
+            logging.info(
+                f"Batch of {len(tasks)} requests processed in "
+                f"{time.perf_counter() - start_time:.2f}s"
+            )
 
         # --- 4. Format Response (matching old_completions.py) ---
         choices = []
 
         request_idx = 0
         for record in batch_results:
-            # for result in record.requests:
             result = record.merge()
             full_text = result.generated_text or ""
             text_output = (prompts_as_strings[request_idx] + full_text) if echo else full_text
@@ -148,9 +151,7 @@ try:
                     list(result.generated_tokens) if result.generated_tokens else []
                 )
                 generated_log_probs = getattr(result, 'generated_log_probs', None) or []
-                generated_top_n_logprobs = (
-                    getattr(result, 'generated_top_n_logprobs', None) or []
-                )
+                generated_top_n_logprobs = getattr(result, 'generated_top_n_logprobs', None) or []
 
                 if echo:
                     # When echo=True, include prompt tokens and their logprobs
@@ -167,9 +168,7 @@ try:
                     top_logprobs = None
                     if prompt_top_n_logprobs or generated_top_n_logprobs:
                         top_logprobs = (
-                            [None]
-                            + list(prompt_top_n_logprobs)
-                            + list(generated_top_n_logprobs)
+                            [None] + list(prompt_top_n_logprobs) + list(generated_top_n_logprobs)
                         )
 
                     # Calculate text_offset: cumulative character positions starting from 0
@@ -204,27 +203,18 @@ try:
                     "top_logprobs": top_logprobs,
                 }
 
-            choices.append(
-                {"index": request_idx, "text": text_output, "logprobs": logprobs_data}
-            )
+            choices.append({"index": request_idx, "text": text_output, "logprobs": logprobs_data})
+            if result.routing_indices is not None:
+                choices[-1]["moe_topk_indices"] = result.routing_indices.tolist()
+                prompt_length = len(result.prompt_tokens) if result.prompt_tokens is not None else 0
+                if prompt_length:
+                    choices[-1]["prompt_moe_topk_indices"] = result.routing_indices[
+                        :prompt_length
+                    ].tolist()
+
             request_idx += 1
 
-        prompt_tokens_total = sum(len(p) for p in prompts_as_tokens)
-        completion_tokens_total = sum(
-            len(result.generated_tokens)
-            for record in batch_results
-            for result in record.requests
-            if result.generated_tokens is not None
-        )
-
-        return jsonify({
-            "choices": choices,
-            "usage": {
-                "prompt_tokens": prompt_tokens_total,
-                "completion_tokens": completion_tokens_total,
-                "total_tokens": prompt_tokens_total + completion_tokens_total,
-            },
-        })
+        return jsonify({"choices": choices})
 
 except ImportError as e:
     logger.warning(f"Could not import flask: {e}")

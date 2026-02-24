@@ -85,7 +85,7 @@ class AsyncZMQCommunicator:
                     msg = self.gather_sock.recv(flags=zmq.NOBLOCK)
                     values.append(struct.unpack('!i', msg)[0])
                 except zmq.Again:
-                    await asyncio.sleep(0.0001)  # Yield to event loop
+                    await asyncio.sleep(0.001)  # Yield to event loop
 
             max_val = max(values)
             self.bcast_sock.send(struct.pack('!i', max_val))
@@ -100,7 +100,7 @@ class AsyncZMQCommunicator:
                     msg = self.bcast_sock.recv(flags=zmq.NOBLOCK)
                     return struct.unpack('!i', msg)[0]
                 except zmq.Again:
-                    await asyncio.sleep(0.0001)  # Yield to event loop
+                    await asyncio.sleep(0.001)  # Yield to event loop
 
     def close(self):
         """
