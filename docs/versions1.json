@@ -1,14 +1,13 @@
 [
     {
-        "preferred": true,
-        "name": "latest",
-        "version": "latest",
-        "url": "https://docs.nvidia.com/megatron-core/latest/"
+        "name": "nightly",
+        "version": "nightly",
+        "url": "https://docs.nvidia.com/megatron-core/nightly/"
     },
     {
-        "name": "0.16.0",
+        "name": "0.16.0 (latest)",
         "version": "0.16.0",
-        "url": "https://docs.nvidia.com/megatron-core/0.16.0/"
+        "url": "https://docs.nvidia.com/megatron-core/latest/"
     },
     {
         "name": "0.15.0",
@@ -16,4 +15,3 @@
         "url": "https://docs.nvidia.com/megatron-core/0.15.0/"
     }
 ]
-
