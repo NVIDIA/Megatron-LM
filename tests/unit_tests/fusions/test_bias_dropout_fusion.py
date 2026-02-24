@@ -5,7 +5,6 @@ import torch
 
 from megatron.core.fusions.fused_bias_dropout import _bias_dropout_add_func, get_bias_dropout_add
 
-
 # ---------------------------------------------------------------------------
 # Existing test: fused vs. unfused parity (same dtype)
 # ---------------------------------------------------------------------------
