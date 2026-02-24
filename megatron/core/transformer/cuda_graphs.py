@@ -112,6 +112,7 @@ def _set_warmup_start():
 def _set_warmup_end():
     """Set graph warmup has ended."""
     global _IS_GRAPH_WARMUP
+    _IS_GRAPH_WARMUP = False
 
 
 @dataclass
@@ -928,8 +929,6 @@ class _CudaGraphRunner(torch.nn.Module):
                         only_inputs=True,
                         allow_unused=True,
                     )
-            _set_warmup_end()
-
             with self.get_quantization_context():
                 torch.cuda.synchronize()
                 # Register default CUDA generators ourselves (fixed in-place to have normal tensors)
@@ -962,6 +961,8 @@ class _CudaGraphRunner(torch.nn.Module):
                     # only on the last layer per-device to avoid slowing down graph creation.
                     if self.is_last_layer:
                         gc.collect()
+
+        _set_warmup_end()
 
         # save cudagraph output buffer
         self.fwd_graph_outputs = fwd_graph_outputs
@@ -1128,7 +1129,11 @@ class _CudaGraphRunner(torch.nn.Module):
                 if not torch.is_tensor(arg):
                     return arg
 
-                ref = make_weak_ref(arg)
+                try:
+                    ref = make_weak_ref(arg)
+                except (RuntimeError, TypeError):
+                    # Fall back to keeping a strong reference.
+                    return arg
                 ref.requires_grad = arg.requires_grad
                 if hasattr(arg, "can_skip_replay_copy"):
                     ref.can_skip_replay_copy = arg.can_skip_replay_copy

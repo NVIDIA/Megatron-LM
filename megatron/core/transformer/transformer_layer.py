@@ -1340,6 +1340,12 @@ class MoETransformerLayer(TransformerLayer):
 
         """
 
+        # Restore token dispatcher attributes from heap copies (needed during
+        # cudagraph creation where the router capture may leave these attrs
+        # pointing into graph-pool memory).
+        for name, attr in self.token_dispatcher_attrs.items():
+            setattr(self.mlp.token_dispatcher, name, attr)
+
         self.mlp.fwd_execution_map = "postprocess"
         output = self.mlp(None, intermediate_tensors=(output, shared_expert_output))
         return self._forward_post_mlp((output, mlp_bias), residual)
