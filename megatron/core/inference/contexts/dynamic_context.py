@@ -22,7 +22,7 @@ from megatron.core.inference.unified_memory import (
     UnifiedMemoryUnsupportedError,
     create_unified_mempool,
 )
-from megatron.core.inference.utils import tensor_swap, tms_mem_summary
+from megatron.core.inference.utils import device_memory_summary, tensor_swap
 from megatron.core.models.common.embeddings.rope_utils import apply_rotary_pos_emb
 from megatron.core.package_info import __version__ as mcore_version
 from megatron.core.ssm.mamba_hybrid_layer_allocation import get_layer_maps_from_layer_type_list
@@ -736,13 +736,13 @@ class DynamicInferenceContext(BaseInferenceContext):
                 if torch.distributed.get_rank() == 0:
                     logging.info(
                         "torch_memory_saver: resuming inference_context, before: %s",
-                        tms_mem_summary(),
+                        device_memory_summary(),
                     )
                 torch_memory_saver.resume("inference_context")
                 if torch.distributed.get_rank() == 0:
                     logging.info(
                         "torch_memory_saver: resumed  inference_context, after:  %s",
-                        tms_mem_summary(),
+                        device_memory_summary(),
                     )
             return
 
@@ -772,12 +772,14 @@ class DynamicInferenceContext(BaseInferenceContext):
         if self._uses_torch_memory_saver:
             if torch.distributed.get_rank() == 0:
                 logging.info(
-                    "torch_memory_saver: pausing inference_context, before: %s", tms_mem_summary()
+                    "torch_memory_saver: pausing inference_context, before: %s",
+                    device_memory_summary(),
                 )
             torch_memory_saver.pause("inference_context")
             if torch.distributed.get_rank() == 0:
                 logging.info(
-                    "torch_memory_saver: paused  inference_context, after:  %s", tms_mem_summary()
+                    "torch_memory_saver: paused  inference_context, after:  %s",
+                    device_memory_summary(),
                 )
             return
 

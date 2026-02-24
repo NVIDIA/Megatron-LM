@@ -10,14 +10,13 @@ from megatron.core.transformer.moe.moe_layer import MoELayer
 from megatron.core.utils import get_model_config
 
 
-def tms_mem_summary() -> str:
+def device_memory_summary() -> str:
     """One-line GPU memory summary for torch_memory_saver logging."""
-    torch.cuda.synchronize()
     dev = torch.cuda.current_device()
     stats = torch.cuda.memory_stats(dev)
     try:
         segs = torch.cuda.memory_snapshot(include_traces=False)
-    except TypeError:
+    except TypeError:  # include_traces was added in PyTorch 2.11
         segs = torch.cuda.memory_snapshot()
     M = 1024**2
     private = sum(
