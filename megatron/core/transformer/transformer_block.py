@@ -856,12 +856,13 @@ class TransformerBlock(GraphableMegatronModule, MegatronModule):
         # Final layer norm.
         if self.final_layernorm is not None:
             hidden_states = apply_module(self.final_layernorm)(cast(Tensor, hidden_states))
-            # TENorm produces a "viewed" tensor. This will result in schedule.py's
-            # deallocate_output_tensor() throwing an error, so a viewless tensor is
-            # created to prevent this.
-            hidden_states = make_viewless_tensor(
-                inp=hidden_states, requires_grad=True, keep_graph=True
-            )
+
+        # Configurations such as TENorm or PP cuda graphs produce a "viewed" tensor.
+        # This will result in schedule.py's deallocate_output_tensor() throwing an error,
+        # so a viewless tensor is created to prevent this.
+        hidden_states = make_viewless_tensor(
+            inp=hidden_states, requires_grad=True, keep_graph=True
+        )
 
         # If this TransformerBlock is empty, input and output hidden states will be the same node
         # on the computational graph and will lead to unexpected errors in pipeline schedules.
