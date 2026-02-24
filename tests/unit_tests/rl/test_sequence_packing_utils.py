@@ -443,6 +443,8 @@ def test_cu_seqlens_size(num_sequences):
         f"for {num_sequences} sequences"
     )
     assert params.cu_seqlens_kv.shape[0] == expected_size
+    assert params.cu_seqlens_q[0] == 0
+    assert params.cu_seqlens_q[-1] == bin_size
 
 
 @pytest.mark.parametrize(
