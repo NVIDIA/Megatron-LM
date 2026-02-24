@@ -400,7 +400,7 @@ class DynamicInferenceEngine(AbstractEngine):
             "pip install msgpack"
         )
 
-        self.zmq_context = zmq.Context().instance()
+        self.zmq_context = zmq.Context()
         self.zmq_sockets = []  # keep track of all sockets created by this engine
 
         # Get world info.
