@@ -85,7 +85,6 @@ class DummyEngine(DynamicInferenceEngine):
         """We cannot call super().__init__() because it requires complex setup."""
         self.waiting_request_ids = deque()
         self.requests: Dict[int, RequestEntry] = {}
-        self.is_suspended = False
         self._loop = get_asyncio_loop()
         self.context = DummyContext()
         self.controller = DummyController()
@@ -129,11 +128,9 @@ class DummyEngine(DynamicInferenceEngine):
 
     def suspend(self):
         """No-op suspend — no real GPU state to offload."""
-        self.is_suspended = True
 
     def resume(self):
         """No-op resume — no real GPU state to onload."""
-        self.is_suspended = False
 
     def add_request(
         self, request_id: int, prompt: str, sampling_params: Optional[SamplingParams] = None
@@ -584,7 +581,7 @@ class TestCoordinator:
                 client.suspend_engines()
                 await asyncio.wait_for(engine.suspended.wait(), timeout=5.0)
                 assert_state(engine, EngineState.SUSPENDED)
-                assert engine.is_suspended is True
+                assert engine.suspended.is_set()
 
                 # ── Idempotent PAUSE while SUSPENDED ─────────────────
                 # Force PAUSE through to coordinator (clear client state).
@@ -602,7 +599,7 @@ class TestCoordinator:
                 client.resume_engines()
                 await asyncio.wait_for(engine.paused.wait(), timeout=5.0)
                 assert_state(engine, EngineState.PAUSED)
-                assert engine.is_suspended is False
+                assert not engine.suspended.is_set()
 
                 # ── UNPAUSE (2nd) ────────────────────────────────────
                 client.unpause_engines()

@@ -255,9 +255,6 @@ class DynamicInferenceEngine(AbstractEngine):
         self.state = EngineState.RUNNING
         self._pending_signals = deque()
 
-
-        # Legacy flag used by suspend/resume GPU offload logic and run_engine (non-coordinator).
-        self.is_suspended = False
         self.resume_request_ids = None
 
         # Coordinator state.
@@ -611,11 +608,9 @@ class DynamicInferenceEngine(AbstractEngine):
     def suspend(self):
         """Suspend engine by deallocating context's GPU state."""
 
-        # Skip if already suspended, which can happen when using the inference
-        # coordinator.
-        if self.is_suspended:
+        # Skip if already suspended or in the process of suspending.
+        if self.state in (EngineState.SUSPENDED, EngineState.SUSPENDING):
             return
-        self.is_suspended = True
 
         # Deallocate context tensors.
         with self.__class__.suspend_resume_ctx(
@@ -645,14 +640,16 @@ class DynamicInferenceEngine(AbstractEngine):
         for request_id in recompute_active_ids:
             self.requests[request_id].record.checkpoint()
 
+        # In the coordinator path, the state is already handled.
+        if not self.use_coordinator:
+            self.state = EngineState.SUSPENDED
+
     def resume(self):
         """Resume engine by reallocating context's GPU state."""
 
-        # Skip if not suspended, which can happen when using the inference
-        # coordinator.
-        if not self.is_suspended:
+        # Skip if not suspended or in the process of suspending.
+        if self.state not in (EngineState.SUSPENDED, EngineState.SUSPENDING):
             return
-        self.is_suspended = False
 
         # Resume.
         with self.__class__.suspend_resume_ctx(
@@ -693,6 +690,10 @@ class DynamicInferenceEngine(AbstractEngine):
                 )
             )
         )
+
+        # In the coordinator path, the state is already handled.
+        if not self.use_coordinator:
+            self.state = EngineState.RUNNING
 
         # Notify event loop.
         self._loop.call_soon_threadsafe(asyncio.create_task, self._notify_cond_for_new_request())
@@ -1225,7 +1226,7 @@ class DynamicInferenceEngine(AbstractEngine):
         """
 
         # If suspended, no stepping.
-        if self.is_suspended:
+        if self.state in (EngineState.SUSPENDED, EngineState.SUSPENDING):
             raise EngineSuspendedError(self.step_count)
 
         # schedule requests
@@ -1730,7 +1731,7 @@ class DynamicInferenceEngine(AbstractEngine):
                 async with self._cond:
                     await self._cond.wait_for(
                         lambda: (
-                            not self.is_suspended
+                            self.state not in (EngineState.SUSPENDED, EngineState.SUSPENDING)
                             and (
                                 self.context.get_active_request_count() > 0
                                 or self.waiting_request_ids
