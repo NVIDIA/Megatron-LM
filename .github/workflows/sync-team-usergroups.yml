@@ -19,7 +19,6 @@ on:
 
 jobs:
   sync-usergroups:
-    environment: main
     runs-on: ubuntu-latest
     steps:
       - name: Checkout code
@@ -28,12 +27,15 @@ jobs:
       - name: Set up Python
         uses: actions/setup-python@v4
         with:
-          python-version: '3.10'
+          python-version: "3.10"
 
       - name: Sync Teams to User Groups
         env:
           GH_TOKEN: ${{ secrets.NVIDIA_MCORE_ONCALL_TOKEN || secrets.PAT || secrets.GITHUB_TOKEN }}
           SLACK_TOKEN: ${{ secrets.ONCALL_SLACK_TOKEN }}
         run: |
-          pip install --no-cache-dir uv
+          pip install --no-cache-dir "uv<0.9.29"
+          uv venv .venv
+          uv cache clean
+          uv sync --no-cache 
           uv run --with slack-sdk python .github/scripts/sync_team_usergroups.py
