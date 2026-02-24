@@ -1595,6 +1595,7 @@ class DynamicInferenceEngine(AbstractEngine):
                 all_messages = []
 
         range_pop()
+        # We need to put the messages in a queue so that we can break after control signals.
         self._pending_signals.extend(all_messages)
 
         while self._pending_signals:
@@ -1611,18 +1612,19 @@ class DynamicInferenceEngine(AbstractEngine):
 
             elif header == Headers.PAUSE:
                 if self.state == EngineState.RUNNING:
+                    # The engine will sending PAUSE_ACK after its all-reduce.
                     self.state = EngineState.PAUSING
                     self.running.clear()
                 elif self.state in (EngineState.PAUSED, EngineState.SUSPENDING,
                                     EngineState.SUSPENDED, EngineState.RESUMING):
-                    # Already idle — re-send ACK so coordinator can confirm.
+                    # Already done; resend PAUSE_ACK.
                     if self.is_mp_coordinator:
                         payload = msgpack.packb(
                             [Headers.PAUSE_ACK.value], use_bin_type=True
                         )
                         self.socket_for_receiving_requests.send(payload)
-                # PAUSING: consensus in progress, ACK will come naturally.
-                # STOPPING/STOPPED: shutting down, ignore.
+                # If PAUSING, an all-reduce is already in progress.
+                # If STOPPING/STOPPED, we are shutting down and ignore.
                 break
 
             elif header == Headers.UNPAUSE:
@@ -1662,6 +1664,7 @@ class DynamicInferenceEngine(AbstractEngine):
                 )
                 if self.state == EngineState.SUSPENDED:
                     self.suspended.clear()
+                # Cleanup the request futures.
                 for entry in self.requests.values():
                     if not entry.future.done():
                         entry.future.cancel()
@@ -1675,8 +1678,16 @@ class DynamicInferenceEngine(AbstractEngine):
 
         return len(all_messages)
 
-    def close(self):
-        """Close this engine's ZMQ sockets. Idempotent."""
+    def shutdown(self, immediate: bool = False):
+        """Shuts down the engine.
+
+        Args:
+            immediate (bool): If True, forcibly terminates the engine ungracefully.
+        """
+        if immediate and hasattr(self, "inference_coordinator_process"):
+            self.inference_coordinator_process.terminate()
+            self.inference_coordinator_process.join()
+
         # Notify coordinator before closing the DEALER socket.
         sock = getattr(self, 'socket_for_receiving_requests', None)
         if sock is not None and not sock.closed:
@@ -1693,20 +1704,6 @@ class DynamicInferenceEngine(AbstractEngine):
         if hasattr(self, "data_parallel_zmq_communicator"):
             self.data_parallel_zmq_communicator.close()
         self.zmq_context.term()
-
-    def stop(self):
-        """Emergency teardown: terminate the coordinator process, close sockets.
-
-        Only needed when the engine loop was cancelled or crashed without
-        sending STOP — the coordinator may still be alive.  On the clean
-        shutdown path (kill → PAUSE → STOP), the coordinator exits on its
-        own after broadcasting STOP and the engine loop's finally block
-        closes sockets, so this method is unnecessary.
-        """
-        if hasattr(self, "inference_coordinator_process"):
-            self.inference_coordinator_process.terminate()
-            self.inference_coordinator_process.join()
-        self.close()
 
     @trace_async_exceptions
     async def run_engine(self, *, loop: Optional[asyncio.AbstractEventLoop] = None):
@@ -1853,4 +1850,4 @@ class DynamicInferenceEngine(AbstractEngine):
         except asyncio.CancelledError:
             pass
         finally:
-            self.close()
+            self.shutdown()
