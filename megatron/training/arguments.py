@@ -857,6 +857,11 @@ def validate_args(args, defaults={}):
         assert args.fp8 is None, \
             "fp8 is not supported with inference dynamic batching and full_iteration_inference CUDA graph"
 
+    if args.cuda_graph_impl == 'local':
+        assert args.inference_dynamic_batching_num_cuda_graphs > 0 or args.inference_dynamic_batching_num_cuda_graphs == -1, \
+            'inference_dynamic_batching_num_cuda_graphs should be a positive integer or -1' \
+            '-1 means that we will automatically determine the number of CUDA graphs to capture based on the `max_requests` value.'
+
     print_rank_0('using {} for parameters ...'.format(args.params_dtype))
 
     if args.dataloader_type is None:
@@ -1655,7 +1660,9 @@ def _add_inference_args(parser):
                        'cuda graph batch sizes range from 1 to `max_requests`. '
                        '(See `dynamic_context.py` for details on how '
                        '`max_requests` is computed). Due to rounding, the actual '
-                       'number of cuda graphs may not equal this argument.')
+                       'number of cuda graphs may not equal this argument.'
+                       'The user can also pass -1, in which case we automatically determine the number of graphs ' \
+                       'to capture based on the `max_requests`.')
     group.add_argument('--inference-dynamic-batching-track-paused-request-events',
                        action='store_true',
                        help='Track paused request ids by adding \'paused\' events '
