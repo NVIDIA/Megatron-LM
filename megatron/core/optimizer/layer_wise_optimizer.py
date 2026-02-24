@@ -195,7 +195,7 @@ class LayerWiseDistributedOptimizer(ChainedOptimizer):
     def allgather_params(self) -> None:
         """All-gather updated params from all ranks."""
 
-        # helper function to flatten local params, broadcast to gather,
+        # helper function to flatten local params, all-gather,
         # unflatten and copy to model params
         def _allgather_helper(params_list, group):
             device = params_list[0][0].device
@@ -212,31 +212,23 @@ class LayerWiseDistributedOptimizer(ChainedOptimizer):
             if max(flat_sizes) == 0:
                 return
 
-            # Allocate per-rank receive buffers (actual sizes, NO padding).
-            recv_buffers = []
+            # Allocate per-rank receive buffers with actual sizes (no padding).
+            # PyTorch's NCCL backend handles uneven sizes in all_gather via
+            # grouped send/recv internally. Reuse src for local rank's slot.
+            gather_list = []
             for i in range(dp_size):
                 if i == rank:
-                    recv_buffers.append(None)
+                    gather_list.append(src)
                 else:
-                    recv_buffers.append(torch.empty(flat_sizes[i], device=device, dtype=dtype))
+                    gather_list.append(torch.empty(flat_sizes[i], device=device, dtype=dtype))
 
-            # Broadcast each rank's params to all other ranks.
-            # All ranks must participate in every broadcast call (collective).
-            for i in range(dp_size):
-                if flat_sizes[i] == 0:
-                    continue
-                src_global = torch.distributed.get_global_rank(group, i)
-                if i == rank:
-                    buf = src
-                else:
-                    buf = recv_buffers[i]
-                torch.distributed.broadcast(buf, src_global, group=group)
+            torch.distributed.all_gather(gather_list, src, group=group)
 
             # Unflatten and copy gathered params for each rank.
             for idx, params in enumerate(params_list):
                 if len(params) == 0 or idx == rank:
                     continue
-                updated_params = _unflatten_dense_tensors(recv_buffers[idx], params)
+                updated_params = _unflatten_dense_tensors(gather_list[idx], params)
                 for updated_p, model_p in zip(updated_params, params):
                     model_p.data.copy_(updated_p)
 

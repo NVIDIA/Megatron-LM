@@ -314,11 +314,21 @@ class TestLayerWiseOptimizer:
         # Test sharded_state_dict
         sharded_state_dict = optimizer.sharded_state_dict(model_sharded_state_dict)
 
-        # Verify the sharded_state_dict is not None and has expected structure
+        # Verify the sharded_state_dict is not None and has expected structure.
+        # With multiple chained optimizers (muon + adam), the top-level keys are
+        # integer indices; each sub-dict should contain an 'optimizer' key.
         assert sharded_state_dict is not None, "Sharded state dict should not be None"
-        assert (
-            'optimizer' in sharded_state_dict
-        ), "Sharded state dict should contain 'optimizer' key"
+        if isinstance(sharded_state_dict, dict) and all(
+            isinstance(k, int) for k in sharded_state_dict.keys()
+        ):
+            for idx, sub_dict in sharded_state_dict.items():
+                assert (
+                    'optimizer' in sub_dict
+                ), f"Sub-dict {idx} should contain 'optimizer' key"
+        else:
+            assert (
+                'optimizer' in sharded_state_dict
+            ), "Sharded state dict should contain 'optimizer' key"
 
         # Verify that replica_id is set correctly (should be 0 for DP dimension)
         from megatron.core.dist_checkpointing import ShardedTensor
@@ -813,8 +823,7 @@ class TestLayerWiseOptimizer:
     def test_overlap_param_gather_async_dispatch_and_finish(self):
         """Test async dispatch + finish_param_sync cycle (the actual runtime path).
 
-        Exercises _LayerWiseAllGatherHandle.wait() through the async dispatch path:
-        start_param_sync() (no force_sync) dispatches async broadcasts, then
+        start_param_sync() (no force_sync) dispatches async all-gathers, then
         finish_param_sync() waits on the handle and unflattens gathered params.
         """
         model, optimizer, pg_collection = self.create_model_and_optimizer_with_overlap_param_gather(
@@ -1106,3 +1115,54 @@ class TestLayerWiseOptimizer:
                     atol=0,
                     msg=f"Parameters diverged at iteration {iteration}",
                 )
+
+    def test_overlap_param_gather_start_sync_with_autograd(self):
+        """Regression test: start_param_sync must work when autograd is active.
+
+        _flatten_dense_tensors on params with requires_grad=True produces a tensor
+        that also requires grad.  Since all_gather writes into gather_list entries
+        in-place and the local rank's slot reuses src, this triggers:
+            RuntimeError: a view of a leaf Variable that requires grad is being
+            used in an in-place operation.
+        The fix is to .detach() the flattened tensor before using it as src.
+
+        This test calls start_param_sync (synchronous via force_sync) WITHOUT
+        torch.no_grad() to reproduce the exact scenario that occurs during the
+        forward pass when finish_param_sync chains to start_param_sync for the
+        next bucket group.
+        """
+        model, optimizer, pg_collection = self.create_model_and_optimizer_with_overlap_param_gather(
+            async_allgather=True
+        )
+        ref_model, ref_optimizer, _ = self.create_model_and_optimizer_with_overlap_param_gather(
+            async_allgather=False, copy_from=model
+        )
+
+        # Confirm params require grad (the precondition for this bug).
+        for param in model.parameters():
+            assert param.requires_grad, "Test requires params with requires_grad=True"
+
+        # Set identical gradients on both models.
+        for param, ref_param in zip(model.parameters(), ref_model.parameters()):
+            grad_value = torch.randn_like(param)
+            torch.distributed.broadcast(grad_value, src=0, group=pg_collection.dp_cp)
+            param.main_grad = grad_value.clone().detach()
+            ref_param.main_grad = grad_value.clone().detach()
+
+        # Step both optimizers (async path skips allgather, ref path includes it).
+        optimizer.step()
+        ref_optimizer.step()
+
+        # Call start_param_sync with autograd ENABLED (no torch.no_grad()).
+        # Before the .detach() fix, this would raise RuntimeError.
+        model.start_param_sync(force_sync=True)
+
+        # Verify gathered params match the reference.
+        for param, ref_param in zip(model.parameters(), ref_model.parameters()):
+            torch.testing.assert_close(
+                param.data,
+                ref_param.data,
+                rtol=0,
+                atol=0,
+                msg="Params incorrect after start_param_sync with autograd enabled",
+            )

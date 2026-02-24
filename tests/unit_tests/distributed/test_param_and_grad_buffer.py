@@ -406,16 +406,15 @@ class TestFreeOverlapBuffers:
         for bg in model.bucket_groups:
             # Simulate buffers that would be allocated by start_param_sync.
             for bucket in bg.buckets:
-                bucket.lw_gather_tensor_list = [torch.empty(8), torch.empty(8)]
+                bucket.lw_gather_list = [torch.empty(8), torch.empty(8)]
                 bucket._lw_src_buffer = torch.empty(16)
 
             bg.free_overlap_buffers()
 
             for bucket in bg.buckets:
                 assert (
-                    bucket.lw_gather_tensor_list is not None
-                    and len(bucket.lw_gather_tensor_list) == 0
-                ), "lw_gather_tensor_list should be empty after free_overlap_buffers"
+                    bucket.lw_gather_list is None
+                ), "lw_gather_list should be None after free_overlap_buffers"
                 assert (
                     bucket._lw_src_buffer is None
                 ), "_lw_src_buffer should be None after free_overlap_buffers"
@@ -446,7 +445,7 @@ class TestFreeOverlapBuffers:
         for bg in model.bucket_groups:
             assert bg.param_gather_handle is None
             for bucket in bg.buckets:
-                assert bucket.lw_gather_tensor_list is None
+                assert bucket.lw_gather_list is None
                 assert bucket._lw_src_buffer is None
 
             # Should not raise.
