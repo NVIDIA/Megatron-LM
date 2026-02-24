@@ -3205,16 +3205,14 @@ def evaluate(
                 # Reduce across processes.
                 for key in loss_dicts[0].keys():
                     if key not in total_loss_dict:
-                        total_loss_dict[key] = torch.tensor(
-                            [0.0, 0.0], dtype=torch.float
-                        ).cuda()
+                        total_loss_dict[key] = torch.tensor([0.0, 0.0], dtype=torch.float, device='cuda')
                     val = [x[key].view(-1) for x in loss_dicts]
 
                     if val[0].numel() == 2:
                         if args.sft:
                             # normalize over micro batch instead of global
                             val = torch.vstack(val)
-                            val = val[:, 0] / val[:, 1]
+                            val = val[:, 0] / val[:, 1].clamp(min=1)
                             val = val.mean()
                             torch.distributed.all_reduce(
                                 val,
