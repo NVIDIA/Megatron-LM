@@ -1,27 +1,31 @@
 # Copyright (c) 2023, NVIDIA CORPORATION. All rights reserved.
 
 import os
-from functools import partial
-from importlib.metadata import version
 from inspect import signature
 from unittest import mock
 
 import pytest
 import torch
-import transformer_engine as te
 
 from megatron.core import parallel_state
 from megatron.core.extensions.transformer_engine_spec_provider import TESpecProvider
 from megatron.core.models.common.embeddings.rope_utils import (
     get_pos_emb_on_this_cp_rank as get_tensor_on_this_cp_rank,
 )
-from megatron.core.models.gpt.gpt_layer_specs import get_gpt_layer_with_transformer_engine_spec
+from megatron.core.models.gpt.gpt_layer_specs import (
+    get_gpt_layer_with_transformer_engine_spec,
+    get_gpt_layer_with_transformer_engine_submodules,
+)
 from megatron.core.models.gpt.gpt_model import GPTModel
 from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
 from megatron.core.transformer.attention import Attention
 from megatron.core.transformer.enums import AttnMaskType
-from megatron.core.transformer.multi_latent_attention import MLASelfAttention, MultiLatentAttention
+from megatron.core.transformer.multi_latent_attention import (
+    MLASelfAttention,
+    MLASelfAttentionSubmodules,
+    MultiLatentAttention,
+)
 from megatron.core.transformer.transformer_config import MLATransformerConfig
 from megatron.core.utils import is_te_min_version, is_torch_min_version
 from megatron.training.arguments import parse_args
@@ -92,9 +96,10 @@ def make_test_packed_seq_params_with_padding(
 
 
 def get_mla_self_attn_submodules(linear_qkv_down_proj=None):
-    submodules = get_gpt_layer_with_transformer_engine_spec(
+    submodules = get_gpt_layer_with_transformer_engine_submodules(
         multi_latent_attention=True
-    ).submodules.self_attention.submodules
+    ).self_attention.submodules
+    assert isinstance(submodules, MLASelfAttentionSubmodules)
     if linear_qkv_down_proj is not None:
         submodules.linear_q_down_proj = linear_qkv_down_proj
         submodules.linear_kv_down_proj = linear_qkv_down_proj
