@@ -318,7 +318,6 @@ class TestParallelTransformerBlock:
             config.hidden_size,
         )
 
-
     def test_gpu_forward_uniform_checkpoint_non_divisible_layers(self):
         """Test that uniform recompute works when num_layers is not evenly
         divisible by recompute_num_layers.
@@ -347,8 +346,7 @@ class TestParallelTransformerBlock:
         micro_batch_size = 2
 
         hidden_states = torch.ones(
-            (sequence_length, micro_batch_size, transformer_config.hidden_size),
-            device='cuda',
+            (sequence_length, micro_batch_size, transformer_config.hidden_size), device='cuda'
         )
         hidden_states.requires_grad = True
 
@@ -357,9 +355,7 @@ class TestParallelTransformerBlock:
         )
 
         # This should not raise an IndexError
-        output = uniform_block(
-            hidden_states=hidden_states, attention_mask=attention_mask
-        )
+        output = uniform_block(hidden_states=hidden_states, attention_mask=attention_mask)
         assert output.shape == (sequence_length, micro_batch_size, transformer_config.hidden_size)
 
 
