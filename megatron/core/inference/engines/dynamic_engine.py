@@ -1689,6 +1689,13 @@ class DynamicInferenceEngine(AbstractEngine):
         or exception).  Does NOT terminate the singleton zmq context —
         that is process-lifetime and shared across engines.
         """
+        # Notify coordinator before closing the DEALER socket.
+        sock = getattr(self, 'socket_for_receiving_requests', None)
+        if sock is not None and not sock.closed:
+            try:
+                sock.send(msgpack.packb([Headers.DISCONNECT.value], use_bin_type=True))
+            except Exception:
+                pass  # Best-effort; socket may already be unusable.
         for socket in getattr(self, 'zmq_sockets', []):
             socket.close()
         if hasattr(self, 'zmq_sockets'):

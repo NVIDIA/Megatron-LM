@@ -339,7 +339,8 @@ class TestCoordinator:
     @pytest.mark.skipif(not HAVE_ZMQ, reason="pyzmq is required for this test")
     @pytest.mark.asyncio
     async def test_coordinator_lifecycle(self, initialize_model_parallel):
-        """Test coordinator connection and port conflict behavior."""
+        """Test coordinator connection, port conflicts, de-registration, and re-registration."""
+        requests = self.build_requests(num_requests=4)
         engine1 = DummyEngine()
         engine2 = None
         engine3 = None
@@ -351,39 +352,61 @@ class TestCoordinator:
         )
 
         try:
-            # Cancel engine1 loop without sending stop to coordinator
-            # This keeps coordinator process alive and holding the port
+            # Verify the engine can serve requests.
+            client1 = None
+            if torch.distributed.get_rank() == 0:
+                client1 = InferenceClient(first_addr)
+                await client1.start()
+
+                futures = [
+                    client1.add_request(prompt=p, sampling_params=s)
+                    for p, s in requests[:2]
+                ]
+                results = await asyncio.wait_for(asyncio.gather(*futures), timeout=5.0)
+                for record in results:
+                    assert record[-1].status == Status.COMPLETED
+
+            # Kill the engine unexpectedly.
             engine1.engine_loop_task.cancel()
             try:
                 await engine1.engine_loop_task
             except asyncio.CancelledError:
                 pass
 
-            # Connect engine2 to existing coordinator (don't launch new one)
+            # Re-register a new engine.
             engine2 = DummyEngine()
             second_addr = await engine2.start_listening_to_data_parallel_coordinator(
                 inference_coordinator_port=DEFAULT_PORT, launch_inference_coordinator=False
             )
 
-            # Should connect to same port, but will not always in CI due to port conflicts.
-            first_port = int(first_addr.rsplit(":", 1)[-1])
-            second_port = int(second_addr.rsplit(":", 1)[-1])
-            # assert second_port == first_port
+            # Verify the new engine can serve requests.
+            if torch.distributed.get_rank() == 0:
+                futures = [
+                    client1.add_request(prompt=p, sampling_params=s)
+                    for p, s in requests[2:4]
+                ]
+                results = await asyncio.wait_for(asyncio.gather(*futures), timeout=5.0)
+                for record in results:
+                    assert record[-1].status == Status.COMPLETED
 
-            # Cancel engine2
+            # Kill the engine unexpectedly.
             engine2.engine_loop_task.cancel()
             try:
                 await engine2.engine_loop_task
             except asyncio.CancelledError:
                 pass
+            # Stop the client.
+            if client1 is not None:
+                client1.stop()
+                client1 = None
 
-            # Launch new coordinator - should get different port since first is holding it
+            # Spin up a new coordinator; verify it gets a new port.
             engine3 = DummyEngine()
             third_addr = await engine3.start_listening_to_data_parallel_coordinator(
                 inference_coordinator_port=DEFAULT_PORT, launch_inference_coordinator=True
             )
 
-            # Verify we got a different port due to conflict
+            first_port = int(first_addr.rsplit(":", 1)[-1])
             third_port = int(third_addr.rsplit(":", 1)[-1])
             assert (
                 third_port != first_port
@@ -398,17 +421,8 @@ class TestCoordinator:
                     await client3.start()
                 await graceful_shutdown(engine3, client3, timeout=30.0)
 
-            # Rebuild engine and reconnect to engine1's coordinator, then shut it down.
-            first_port = int(first_addr.rsplit(":", 1)[-1])
-            engine1 = DummyEngine()
-            await engine1.start_listening_to_data_parallel_coordinator(
-                inference_coordinator_port=first_port, launch_inference_coordinator=False
-            )
-            client1 = None
-            if torch.distributed.get_rank() == 0:
-                client1 = InferenceClient(first_addr)
-                await client1.start()
-            await graceful_shutdown(engine1, client1, timeout=30.0)
+            # Terminate engine1's orphaned coordinator process directly.
+            engine1.stop()
 
     @pytest.mark.internal
     @pytest.mark.skipif(not HAVE_ZMQ, reason="pyzmq is required for this test")

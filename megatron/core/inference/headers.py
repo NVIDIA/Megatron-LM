@@ -19,6 +19,7 @@ class Headers(Enum):
     RESUME = auto()
     INCREMENT_STALENESS = auto()
     STOP = auto()
+    DISCONNECT = auto()
 
 
 class EngineState(Enum):
