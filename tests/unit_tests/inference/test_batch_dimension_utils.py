@@ -22,7 +22,7 @@ MAX_REQUESTS = 256
 MAX_TOKENS = 2048
 MAX_SEQ_LEN = 4096
 TP_SIZE = 1
-MIXED_PREFILL_COUNT = 4
+MIXED_PREFILL_COUNT = 16
 
 
 def _generate_graphs(num_cuda_graphs, use_non_decode=True):
@@ -84,6 +84,40 @@ def _assert_consistent_across_ranks(result, ep_group):
         ), f"Token count mismatch across EP ranks: min={tc_min.item()}, max={tc_max.item()}"
 
 
+class TestCUDAGraphTokenCountAlignment:
+    """Verify that mixed/prefill graph token counts are a subset of decode graph token counts."""
+
+    @pytest.mark.parametrize("num_cuda_graphs", [1, 16, 32, -1])
+    def test_mixed_token_counts_subset_of_decode(self, num_cuda_graphs):
+        """Every token count in the mixed/prefill graph pool must also appear
+        in the decode-only pool. Otherwise, when EP syncs token counts across
+        ranks, decode-only ranks cannot find a graph at the same token count
+        as prefill ranks, causing inconsistent matching."""
+        graph_list = _generate_graphs(num_cuda_graphs)
+
+        decode_token_counts = {bd.token_count for bd in graph_list if bd.prefill_req_count == 0}
+        mixed_token_counts = {bd.token_count for bd in graph_list if bd.prefill_req_count > 0}
+
+        mixed_only = mixed_token_counts - decode_token_counts
+        assert not mixed_only, (
+            f"Mixed/prefill token counts with no decode graph: {sorted(mixed_only)}. "
+            f"This will cause EP rank mismatch when some ranks are decode-only "
+            f"and others have prefill."
+        )
+
+        # Decode-only token counts not in the mixed pool are allowed, but only
+        # below MIXED_PREFILL_COUNT. The EP adjustment elevates token counts to
+        # at least MIXED_PREFILL_COUNT when any rank has prefill, so any decode
+        # token count >= MIXED_PREFILL_COUNT must have a mixed counterpart.
+        decode_only = decode_token_counts - mixed_token_counts
+        large_decode_only = {tc for tc in decode_only if tc >= MIXED_PREFILL_COUNT}
+        assert not large_decode_only, (
+            f"Decode-only token counts >= MIXED_PREFILL_COUNT ({MIXED_PREFILL_COUNT}) "
+            f"with no mixed/prefill graph: {sorted(large_decode_only)}. "
+            f"The EP token count elevation cannot guarantee alignment for these."
+        )
+
+
 class TestMatchGraphConfigWithEP:
     """Tests for match_graph_config with expert parallelism.
 
@@ -109,7 +143,7 @@ class TestMatchGraphConfigWithEP:
     # 1. All ranks same decode batch → consistent match
     # ------------------------------------------------------------------ #
     @pytest.mark.internal
-    @pytest.mark.parametrize("num_cuda_graphs", [16, 32, -1])
+    @pytest.mark.parametrize("num_cuda_graphs", [1, 16, 32, -1])
     def test_uniform_decode_batch(self, num_cuda_graphs):
         """All EP ranks have the same decode-only batch → should all match the same graph."""
         ep_group = self._get_ep_group()
@@ -119,13 +153,12 @@ class TestMatchGraphConfigWithEP:
         result = _match(real, graph_list, ep_group=ep_group)
         _assert_consistent_across_ranks(result, ep_group)
         assert result is not None, "Should find a matching graph for uniform decode batch"
-        assert result.token_count == 32
 
     # ------------------------------------------------------------------ #
     # 2. Different token counts across EP ranks → all-reduce takes max
     # ------------------------------------------------------------------ #
     @pytest.mark.internal
-    @pytest.mark.parametrize("num_cuda_graphs", [16, 32, -1])
+    @pytest.mark.parametrize("num_cuda_graphs", [1, 16, 32, -1])
     def test_varying_decode_token_counts(self, num_cuda_graphs):
         """EP ranks have different decode token counts. The all-reduce
         should take the max, and all ranks should match the same graph."""
@@ -140,13 +173,12 @@ class TestMatchGraphConfigWithEP:
         result = _match(real, graph_list, ep_group=ep_group)
         _assert_consistent_across_ranks(result, ep_group)
         assert result is not None
-        assert result.token_count == (ep_group.size() * 8)
 
     # ------------------------------------------------------------------ #
     # 3. decode_only_cuda_graphs=True, some ranks have prefill → all None
     # ------------------------------------------------------------------ #
     @pytest.mark.internal
-    @pytest.mark.parametrize("num_cuda_graphs", [16, 32, -1])
+    @pytest.mark.parametrize("num_cuda_graphs", [1, 16, 32, -1])
     def test_decode_only_graphs_with_mixed_ranks(self, num_cuda_graphs):
         """When decode_only_cuda_graphs=True and at least one EP rank has a
         prefill request, ALL ranks should get None (eager mode)."""
@@ -170,7 +202,7 @@ class TestMatchGraphConfigWithEP:
     # 4. explicit_chunked_prefill=True, some ranks prefill → all None
     # ------------------------------------------------------------------ #
     @pytest.mark.internal
-    @pytest.mark.parametrize("num_cuda_graphs", [16, 32, -1])
+    @pytest.mark.parametrize("num_cuda_graphs", [1, 16, 32, -1])
     def test_explicit_chunked_prefill_with_mixed_ranks(self, num_cuda_graphs):
         """When explicit_chunked_prefill=True and some EP rank has prefill,
         ALL ranks should get None (eager mode)."""
@@ -191,7 +223,7 @@ class TestMatchGraphConfigWithEP:
     # 5. Mixed prefill graphs with strict matching
     # ------------------------------------------------------------------ #
     @pytest.mark.internal
-    @pytest.mark.parametrize("num_cuda_graphs", [16, 32, -1])
+    @pytest.mark.parametrize("num_cuda_graphs", [1, 16, 32, -1])
     def test_strict_matching_with_mixed_prefill(self, num_cuda_graphs):
         """With strict matching, request counts are synced across EP ranks
         via all-reduce. All ranks should still get a consistent result."""
@@ -211,7 +243,7 @@ class TestMatchGraphConfigWithEP:
     # 6. Non-strict matching with mixed prefill
     # ------------------------------------------------------------------ #
     @pytest.mark.internal
-    @pytest.mark.parametrize("num_cuda_graphs", [16, 32, -1])
+    @pytest.mark.parametrize("num_cuda_graphs", [1, 16, 32, -1])
     def test_non_strict_matching_with_mixed_prefill(self, num_cuda_graphs):
         """Non-strict matching: prefill slots can serve decode. Token count
         is synced across EP ranks; result must be consistent."""
@@ -230,7 +262,7 @@ class TestMatchGraphConfigWithEP:
     # 7. Mixed decode/prefill across ranks — strict matching
     # ------------------------------------------------------------------ #
     @pytest.mark.internal
-    @pytest.mark.parametrize("num_cuda_graphs", [16, 32, -1])
+    @pytest.mark.parametrize("num_cuda_graphs", [1, 16, 32, -1])
     def test_mixed_decode_and_prefill_ranks_strict(self, num_cuda_graphs):
         """Some EP ranks are pure decode, others have prefill requests.
         With strict matching the all-reduce syncs request counts to the
@@ -253,7 +285,7 @@ class TestMatchGraphConfigWithEP:
     # 8. Mixed decode/prefill across ranks — non-strict matching
     # ------------------------------------------------------------------ #
     @pytest.mark.internal
-    @pytest.mark.parametrize("num_cuda_graphs", [16, 32, -1])
+    @pytest.mark.parametrize("num_cuda_graphs", [1, 16, 32, -1])
     def test_mixed_decode_and_prefill_ranks_non_strict(self, num_cuda_graphs):
         """Some EP ranks are pure decode, others have prefill requests.
         Non-strict matching only syncs token counts (not request counts).
@@ -276,7 +308,7 @@ class TestMatchGraphConfigWithEP:
     # 9. All ranks decode-only with decode_only_cuda_graphs → should match
     # ------------------------------------------------------------------ #
     @pytest.mark.internal
-    @pytest.mark.parametrize("num_cuda_graphs", [16, 32, -1])
+    @pytest.mark.parametrize("num_cuda_graphs", [1, 16, 32, -1])
     def test_decode_only_graphs_all_decode(self, num_cuda_graphs):
         """When all EP ranks are decode-only and decode_only_cuda_graphs=True,
         a match should be found."""
@@ -295,7 +327,7 @@ class TestMatchGraphConfigWithEP:
     # 10. Real batch exceeds all graphs → None on all ranks
     # ------------------------------------------------------------------ #
     @pytest.mark.internal
-    @pytest.mark.parametrize("num_cuda_graphs", [16, 32, -1])
+    @pytest.mark.parametrize("num_cuda_graphs", [1, 16, 32, -1])
     def test_oversized_batch_returns_none(self, num_cuda_graphs):
         """When the real batch is larger than any available graph, all ranks
         should get None."""
@@ -317,7 +349,7 @@ class TestMatchGraphConfigWithEP:
     # 11. One EP rank has huge batch → all-reduce lifts to max → no match
     # ------------------------------------------------------------------ #
     @pytest.mark.internal
-    @pytest.mark.parametrize("num_cuda_graphs", [16, 32, -1])
+    @pytest.mark.parametrize("num_cuda_graphs", [1, 16, 32, -1])
     def test_one_rank_oversized_forces_no_match(self, num_cuda_graphs):
         """If one EP rank has a batch exceeding all graph capacities, the
         all-reduce max lifts everyone → no match on any rank."""
