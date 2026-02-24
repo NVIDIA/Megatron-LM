@@ -6,6 +6,7 @@ import logging
 import signal
 import socket
 from collections import deque
+from enum import Enum, auto
 from itertools import cycle
 from multiprocessing import Event
 from multiprocessing.connection import Connection
@@ -67,6 +68,15 @@ class DataParallelInferenceCoordinator:
             original request ID provided by the client.
         next_request_id (int): A counter for generating unique server-side request IDs.
     """
+
+    class State(Enum):
+        """State machine for the coordinator."""
+
+        RUNNING = auto()
+        PAUSING = auto()
+        PAUSED = auto()
+        SUSPENDED = auto()
+        STOPPING = auto()
 
     def __init__(
         self,
@@ -160,7 +170,7 @@ class DataParallelInferenceCoordinator:
 
         self.next_request_id = 0
         self.tokenizer = tokenizer
-        self.state = "running"
+        self.state = self.State.RUNNING
 
     def get_next_data_parallel_rank(self):
         """
@@ -260,9 +270,9 @@ class DataParallelInferenceCoordinator:
                     continue
 
                 if header == Headers.PAUSE:
-                    if self.state == "running":
-                        self.state = "pausing"
-                    elif self.state in ("paused", "suspended"):
+                    if self.state == self.State.RUNNING:
+                        self.state = self.State.PAUSING
+                    elif self.state in (self.State.PAUSED, self.State.SUSPENDED):
                         # Already idle — short-circuit PAUSE_ACK to this client.
                         self.router_socket.send_multipart(
                             [
@@ -275,26 +285,26 @@ class DataParallelInferenceCoordinator:
                         # pausing (in progress) or stopping — ignore.
                         continue
                 elif header == Headers.UNPAUSE:
-                    if self.state != "paused":
+                    if self.state != self.State.PAUSED:
                         logging.warning("Coordinator: ignoring UNPAUSE in state %s", self.state)
                         continue
-                    self.state = "running"
+                    self.state = self.State.RUNNING
                     self.data_parallel_pause_acks = set()
                 elif header == Headers.SUSPEND:
-                    if self.state != "paused":
+                    if self.state != self.State.PAUSED:
                         logging.warning("Coordinator: ignoring SUSPEND in state %s", self.state)
                         continue
-                    self.state = "suspended"
+                    self.state = self.State.SUSPENDED
                 elif header == Headers.RESUME:
-                    if self.state != "suspended":
+                    if self.state != self.State.SUSPENDED:
                         logging.warning("Coordinator: ignoring RESUME in state %s", self.state)
                         continue
-                    self.state = "paused"
+                    self.state = self.State.PAUSED
                 elif header == Headers.STOP:
-                    if self.state not in ("paused", "suspended"):
+                    if self.state not in (self.State.PAUSED, self.State.SUSPENDED):
                         logging.warning("Coordinator: ignoring STOP in state %s", self.state)
                         continue
-                    self.state = "stopping"
+                    self.state = self.State.STOPPING
 
                 # Broadcast to all engines (reached only if gating passed).
                 for data_parallel_rank_id in self.identities_of_data_parallel_ranks:
@@ -310,12 +320,12 @@ class DataParallelInferenceCoordinator:
                 # ACK from engine (sent after EP consensus, engine already PAUSED).
                 # Collect from all dp_ranks, then notify clients.
                 assert sender_identity in self.identities_of_data_parallel_ranks
-                if self.state != "pausing":
+                if self.state != self.State.PAUSING:
                     # Stale or duplicate ACK — ignore.
                     continue
                 self.data_parallel_pause_acks.add(sender_identity)
                 if len(self.data_parallel_pause_acks) == self.data_parallel_size:
-                    self.state = "paused"
+                    self.state = self.State.PAUSED
                     # All engines are PAUSED (they transitioned before sending ACK).
                     for client_id in known_clients:
                         self.router_socket.send_multipart(
