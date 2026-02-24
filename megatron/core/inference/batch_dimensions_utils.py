@@ -158,7 +158,7 @@ class InferenceBatchDimensions:
         # all reduce local work across expert model parallel group
 
         is_non_decode = local_batch_dims.prefill_req_count > 0
-        
+
         sync_tensor = torch.tensor(
             [
                 local_batch_dims.token_count,

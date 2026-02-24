@@ -2,10 +2,6 @@
 
 """
 Unit tests for CUDAGraphBatchDimensionBuilder.match_graph_config with expert parallelism.
-
-Run with 8 GPUs:
-    torchrun --nproc_per_node=8 -m pytest \
-        tests/unit_tests/inference/test_batch_dimension_utils.py -xvs
 """
 
 import pytest
@@ -29,8 +25,7 @@ TP_SIZE = 1
 MIXED_PREFILL_COUNT = 4
 
 
-def _generate_graphs(num_cuda_graphs,
-                     use_non_decode=True):
+def _generate_graphs(num_cuda_graphs, use_non_decode=True):
     """Generate cuda graph batch dimensions using the builder."""
     graph_list, _ = CUDAGraphBatchDimensionBuilder.generate_cuda_graph_batch_dimensions_list(
         tp_size=TP_SIZE,
@@ -45,8 +40,9 @@ def _generate_graphs(num_cuda_graphs,
     return graph_list
 
 
-def _match(real, graph_list, ep_group, strict=False, decode_only=False,
-           explicit_chunked_prefill=False):
+def _match(
+    real, graph_list, ep_group, strict=False, decode_only=False, explicit_chunked_prefill=False
+):
     return CUDAGraphBatchDimensionBuilder.match_graph_config(
         real_batch_dim=real,
         cuda_graph_batch_dimensions_list=graph_list,
@@ -73,9 +69,9 @@ def _assert_consistent_across_ranks(result, ep_group):
     flag_sum = flag.clone()
     dist.all_reduce(flag_sum, op=dist.ReduceOp.SUM, group=ep_group)
     ep_size = dist.get_world_size(ep_group)
-    assert flag_sum.item() == 0 or flag_sum.item() == ep_size, (
-        f"Inconsistent match: {flag_sum.item()}/{ep_size} ranks got a match"
-    )
+    assert (
+        flag_sum.item() == 0 or flag_sum.item() == ep_size
+    ), f"Inconsistent match: {flag_sum.item()}/{ep_size} ranks got a match"
 
     if result is not None:
         tc = torch.tensor([result.token_count], dtype=torch.int32, device="cuda")
@@ -83,9 +79,9 @@ def _assert_consistent_across_ranks(result, ep_group):
         tc_min = tc.clone()
         dist.all_reduce(tc_max, op=dist.ReduceOp.MAX, group=ep_group)
         dist.all_reduce(tc_min, op=dist.ReduceOp.MIN, group=ep_group)
-        assert tc_max.item() == tc_min.item(), (
-            f"Token count mismatch across EP ranks: min={tc_min.item()}, max={tc_max.item()}"
-        )
+        assert (
+            tc_max.item() == tc_min.item()
+        ), f"Token count mismatch across EP ranks: min={tc_min.item()}, max={tc_max.item()}"
 
 
 class TestMatchGraphConfigWithEP:
@@ -166,7 +162,9 @@ class TestMatchGraphConfigWithEP:
 
         result = _match(real, graph_list, ep_group=ep_group, decode_only=True)
         _assert_consistent_across_ranks(result, ep_group)
-        assert result is None, "All ranks should run eager when decode_only=True and some rank has prefill"
+        assert (
+            result is None
+        ), "All ranks should run eager when decode_only=True and some rank has prefill"
 
     # ------------------------------------------------------------------ #
     # 4. explicit_chunked_prefill=True, some ranks prefill → all None
@@ -185,9 +183,7 @@ class TestMatchGraphConfigWithEP:
         else:
             real = BD(token_count=32, prefill_req_count=0, decode_req_count=32)
 
-        result = _match(
-            real, graph_list, ep_group=ep_group, explicit_chunked_prefill=True
-        )
+        result = _match(real, graph_list, ep_group=ep_group, explicit_chunked_prefill=True)
         _assert_consistent_across_ranks(result, ep_group)
         assert result is None, "All ranks should run eager with explicit_chunked_prefill"
 
