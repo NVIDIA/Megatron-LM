@@ -1676,13 +1676,7 @@ class DynamicInferenceEngine(AbstractEngine):
         return len(all_messages)
 
     def close(self):
-        """Close this engine's ZMQ sockets. Idempotent.
-
-        Called by run_engine_with_coordinator's finally block to ensure
-        sockets are cleaned up on any exit path (clean STOP, cancellation,
-        or exception).  Does NOT terminate the singleton zmq context —
-        that is process-lifetime and shared across engines.
-        """
+        """Close this engine's ZMQ sockets. Idempotent."""
         # Notify coordinator before closing the DEALER socket.
         sock = getattr(self, 'socket_for_receiving_requests', None)
         if sock is not None and not sock.closed:
@@ -1698,6 +1692,7 @@ class DynamicInferenceEngine(AbstractEngine):
             self.expert_parallel_zmq_communicator.close()
         if hasattr(self, "data_parallel_zmq_communicator"):
             self.data_parallel_zmq_communicator.close()
+        self.zmq_context.term()
 
     def stop(self):
         """Emergency teardown: terminate the coordinator process, close sockets.
