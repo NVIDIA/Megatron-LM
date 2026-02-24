@@ -925,6 +925,39 @@ def test_parallel_attention_correctness(
     )
 
 
+@pytest.mark.parametrize("sp", [True, False])
+@pytest.mark.parametrize("output_gate", [False, True])
+def test_parallel_attention_correctness_num_query_groups_less_than_tp_size(
+    tmp_path_dist_ckpt, sp, output_gate
+):
+    transformer_config = TransformerConfig(
+        num_layers=1,
+        hidden_size=128,
+        num_attention_heads=8,
+        num_query_groups=2,
+        normalization="RMSNorm",
+        bf16=True,
+        attention_output_gate=output_gate,
+        hidden_dropout=0.0,
+        attention_dropout=0.0,
+    )
+
+    transformer_layer_spec = get_gpt_layer_with_transformer_engine_spec()
+    atol, rtol = 1e-2, 1e-2
+
+    _test_parallel_attention_correctness(
+        transformer_config,
+        transformer_layer_spec,
+        tmp_path_dist_ckpt,
+        atol=atol,
+        rtol=rtol,
+        tp=4,
+        sp=sp,
+        seed=123,
+        sequence_length=256,
+    )
+
+
 def _torch_native_attention(query, key, value, attention_mask, sinks, scaling: float):
     """Torch native attention implementation
     This was not in the original implementation and slightly affect results;
