@@ -50,8 +50,12 @@ def _prepare_tensor_for_comm(
 ) -> Union[torch.Tensor, List[torch.Tensor], None]:
     """Prepare tensor for P2P/bridge communication by expanding to 3D if needed.
 
-    P2P and bridge communicators expect 3D tensors.
-    Handles both single tensors and lists of tensors (for VPP).
+    P2P and bridge communicators expect 3D tensors. 2D tensors are unsqueezed by adding
+    a singleton last dimension, and _restore_tensor_from_comm will squeeze it back. 3D
+    tensors are passed through unchanged.
+
+    Note: 3D tensors with a singleton last dimension (shape [a, b, 1]) are not supported
+    because _restore_tensor_from_comm cannot distinguish them from unsqueezed 2D tensors.
 
     Args:
         tensor: Input tensor (2D or 3D), list of tensors, or None.
@@ -63,8 +67,14 @@ def _prepare_tensor_for_comm(
         return None
     if isinstance(tensor, list):
         return [_prepare_tensor_for_comm(t) for t in tensor]
-    if isinstance(tensor, torch.Tensor) and tensor.ndim == 2:
-        return tensor.unsqueeze(-1)
+    if isinstance(tensor, torch.Tensor):
+        if tensor.ndim == 2:
+            return tensor.unsqueeze(-1)
+        assert tensor.ndim != 3 or tensor.shape[-1] != 1, (
+            f"3D tensor with singleton last dim {tuple(tensor.shape)} is ambiguous for "
+            "multimodule comm. Cannot distinguish from an unsqueezed 2D tensor on the "
+            "receiving rank. Use a 2D tensor or a 3D tensor with last_dim > 1."
+        )
     return tensor
 
 
