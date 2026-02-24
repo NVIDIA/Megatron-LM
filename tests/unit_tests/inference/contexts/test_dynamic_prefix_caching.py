@@ -568,6 +568,82 @@ class TestPrefillSkipping(PrefixCachingTestBase):
 
         assert alloc.block_hashes[b1].item() == -1, "Decode hash computation not implemented"
 
+    @pytest.mark.internal
+    def test_matched_prefix_reduces_active_tokens(self):
+        """Request A fills 3 blocks. Request B (same prefix + trailing) only adds trailing tokens."""
+        ctx = self._ctx()
+        bs = ctx.block_size_tokens
+        prompt_a = self._prompt(bs * 3)
+
+        ctx.add_request(self._req(ctx, prompt_a.clone()))
+        tokens_after_a = ctx.active_token_count
+
+        # B has same 3-block prefix + extra trailing tokens
+        trailing = bs // 2
+        prompt_b = torch.cat([prompt_a, self._prompt(trailing, offset=9000)])
+        ctx.add_request(self._req(ctx, prompt_b, request_id=2))
+
+        added_by_b = ctx.active_token_count - tokens_after_a
+        # B should skip 3*bs matched tokens but keep at least 1, so it adds trailing tokens only
+        assert added_by_b == trailing, (
+            f"Expected {trailing} tokens added (trailing only), got {added_by_b}"
+        )
+        # query length should also reflect the reduced count
+        assert ctx.request_query_lengths[1].item() == trailing
+
+    @pytest.mark.internal
+    def test_partial_match_skips_matched_only(self):
+        """Request A fills 3 blocks. B matches first 2, differs on 3rd. B skips 2*bs tokens."""
+        ctx = self._ctx()
+        bs = ctx.block_size_tokens
+
+        prompt_a = self._prompt(bs * 3)
+        ctx.add_request(self._req(ctx, prompt_a.clone()))
+        tokens_after_a = ctx.active_token_count
+
+        # Same first 2 blocks, different 3rd
+        prompt_b = prompt_a.clone()
+        prompt_b[bs * 2 :] += 1000
+        ctx.add_request(self._req(ctx, prompt_b, request_id=2))
+
+        added_by_b = ctx.active_token_count - tokens_after_a
+        expected = bs * 3 - bs * 2  # chunk_length - matched tokens = 1 block worth
+        assert added_by_b == expected, f"Expected {expected}, got {added_by_b}"
+        assert ctx.request_query_lengths[1].item() == expected
+
+    @pytest.mark.internal
+    def test_no_match_no_skip(self):
+        """Completely different prefix: full chunk_length added."""
+        ctx = self._ctx()
+        bs = ctx.block_size_tokens
+
+        ctx.add_request(self._req(ctx, self._prompt(bs * 2)))
+        tokens_after_a = ctx.active_token_count
+
+        ctx.add_request(self._req(ctx, self._prompt(bs * 2, offset=9000), request_id=2))
+        added_by_b = ctx.active_token_count - tokens_after_a
+        assert added_by_b == bs * 2, f"Expected full {bs * 2}, got {added_by_b}"
+        assert ctx.request_query_lengths[1].item() == bs * 2
+
+    @pytest.mark.internal
+    def test_exact_full_match_sends_one_token(self):
+        """Prompt is exactly N*block_size and fully matched: only 1 token enters the model."""
+        ctx = self._ctx()
+        bs = ctx.block_size_tokens
+
+        prompt = self._prompt(bs * 3)
+        ctx.add_request(self._req(ctx, prompt.clone()))
+        tokens_after_a = ctx.active_token_count
+
+        # Identical prompt, fully matched
+        ctx.add_request(self._req(ctx, prompt.clone(), request_id=2))
+        added_by_b = ctx.active_token_count - tokens_after_a
+        assert added_by_b == 1, f"Expected 1 token (min guard), got {added_by_b}"
+        assert ctx.request_query_lengths[1].item() == 1
+        # kv_length_offset should reflect skipped prefix
+        expected_offset = bs * 3 - 1  # finished(0) + skip(3*bs - 1)
+        assert ctx.request_kv_length_offsets[1].item() == expected_offset
+
 
 # =========================================================================
 # Class 6: TestDisabledMode (3 tests)
