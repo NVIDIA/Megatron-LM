@@ -697,8 +697,12 @@ class TorchDistSaveShardedStrategy(AsyncSaveShardedStrategy):
             writer,
             None,
             coordinator,
+            # flatten_sharded_tensors=False: MCore doesn't use nested ShardedTensors (FSDP 2D),
+            # so skip the expensive traverse_state_dict copy in _flatten_sharded_tensors
             planner=MCoreSavePlanner(
-                dedup_replicated_tensors=not self.keep_only_main_replica, flatten_state_dict=False
+                dedup_replicated_tensors=not self.keep_only_main_replica,
+                flatten_state_dict=False,
+                flatten_sharded_tensors=False,
             ),
             cached_ckpt_structure=args_cached_plans,
             loaded_all_plans=loaded_all_plans,
@@ -802,6 +806,8 @@ class TorchDistLoadShardedStrategy(LoadShardedStrategy):
             planner=MCoreLoadPlanner(
                 shapes_validation_sharded_tensors=flexible_shape_sharded_tensors,
                 allow_shape_mismatch_sharded_tensors=allow_shape_mismatch_sharded_tensors,
+                flatten_state_dict=False,
+                flatten_sharded_tensors=False,
             ),
         )
 
