@@ -1729,16 +1729,16 @@ class DynamicInferenceEngine(AbstractEngine):
             pass
 
     async def _ep_group_has_work(self, local_work: int) -> bool:
-        """Pure all-reduce across EP group to determine if any peer has work.
+        """Determines if there are some pending requests in the expert parallel group of this rank.
 
         The caller is responsible for passing the right value based on engine state:
         - RUNNING: pass actual local_pending count
         - PAUSING: pass 0 (this rank wants to stop stepping)
 
         Args:
-            local_work: Work count to contribute to the all-reduce.
+            local_work (int): The local work count for this rank.
         Returns:
-            True if any EP peer has work (max across group > 0).
+            bool: True if there is some work in the EP group, False otherwise.
         """
         range_push("_ep_group_has_work")
 
@@ -1753,12 +1753,12 @@ class DynamicInferenceEngine(AbstractEngine):
     async def _dp_all_reduce_barrier(self):
         """DP-level barrier using ZMQ all-reduce.
 
-        Used by SUSPENDING, RESUMING, and STOPPING states to synchronize
-        across all DP groups after PAUSE has been globally confirmed.
-        Each rank reports 1; the all-reduce completes when all have entered.
+        The all-reduce completes when all ranks inside this DP group have synchronized state.
         """
+        range_push("_dp_all_reduce_barrier")
         if self.dp_world_size > 1:
             await self.data_parallel_zmq_communicator.all_reduce_max(1)
+        range_pop()
 
     @trace_async_exceptions
     async def run_engine_with_coordinator(
@@ -1799,7 +1799,7 @@ class DynamicInferenceEngine(AbstractEngine):
                         await asyncio.sleep(0.02)
 
                 elif self.state == EngineState.PAUSING:
-                    # PAUSE: EP consensus via all-reduce.
+                    # Need EP consensus via all-reduce before we can transition to PAUSED.
                     ep_has_work = await self._ep_group_has_work(0)
                     if ep_has_work:
                         # EP peer hasn't received PAUSE yet — dummy forward.
@@ -1809,10 +1809,7 @@ class DynamicInferenceEngine(AbstractEngine):
                         self.step_end_event.synchronize()
                         self.step_count += 1
                     else:
-                        # EP consensus reached. Transition to PAUSED, then send
-                        # ACK to coordinator.  By transitioning BEFORE sending the
-                        # ACK, the coordinator can safely notify the client — every
-                        # engine is already PAUSED by the time all ACKs are collected.
+                        # EP consensus reached. Transition to PAUSED, then send ACK to coordinator.
                         self.state = EngineState.PAUSED
                         self.paused.set()
                         if self.is_mp_coordinator:
@@ -1825,7 +1822,6 @@ class DynamicInferenceEngine(AbstractEngine):
                     await asyncio.sleep(0.02)
 
                 elif self.state == EngineState.SUSPENDING:
-                    # GPU offload done in schedule_requests(). Synchronize with all ranks.
                     await self._dp_all_reduce_barrier()
                     self.state = EngineState.SUSPENDED
                     self.suspended.set()
@@ -1834,13 +1830,11 @@ class DynamicInferenceEngine(AbstractEngine):
                     await asyncio.sleep(0.02)
 
                 elif self.state == EngineState.RESUMING:
-                    # GPU onload done in schedule_requests(). Synchronize with all ranks.
                     await self._dp_all_reduce_barrier()
                     self.state = EngineState.PAUSED
                     self.paused.set()
 
                 elif self.state == EngineState.STOPPING:
-                    # Futures cancelled in schedule_requests(). Synchronize with all ranks.
                     await self._dp_all_reduce_barrier()
                     self.state = EngineState.STOPPED
                     self.stopped.set()

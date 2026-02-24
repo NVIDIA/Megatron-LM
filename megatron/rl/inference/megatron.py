@@ -119,39 +119,34 @@ class MegatronLocal(InferenceServer, ReturnsTokens, ReturnsRaw):
         return launched_server
 
     async def kill(self):
-        # Step 1: Global pause (ACK/re-ACK through coordinator)
         if dist.get_rank() == 0:
             await self._client.pause_engines()
         await self._inference_engine.paused.wait()
-        # Step 2: Stop (DP all-reduce among all ranks)
+
         if dist.get_rank() == 0:
             self._client.stop_engines()
         await self._inference_engine.stopped.wait()
-        # Cleanup: the coordinator process exits on its own after broadcasting
-        # STOP, and the engine loop's finally block closes sockets.  Only the
-        # client needs explicit cleanup.
+
         if dist.get_rank() == 0:
             self._client.stop()
 
     async def suspend(self):
-        # Step 1: Global pause (ACK/re-ACK through coordinator)
         if dist.get_rank() == 0:
             await self._client.pause_engines()
         await self._inference_engine.paused.wait()
-        # Step 2: Suspend (DP all-reduce among all ranks)
+
         if dist.get_rank() == 0:
             self._client.suspend_engines()
         await self._inference_engine.suspended.wait()
 
     async def resume(self):
-        # Already running (e.g. first RL iteration before any suspend).
         if self._inference_engine.running.is_set():
             return
-        # Step 1: Resume GPU (DP all-reduce among all ranks)
+
         if dist.get_rank() == 0:
             self._client.resume_engines()
         await self._inference_engine.paused.wait()
-        # Step 2: Unpause (simple broadcast)
+
         if dist.get_rank() == 0:
             self._client.unpause_engines()
         await self._inference_engine.running.wait()

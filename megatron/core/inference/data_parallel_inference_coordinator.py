@@ -162,7 +162,7 @@ class DataParallelInferenceCoordinator:
             self.identities_of_data_parallel_ranks = deque(
                 sorted(self.identities_of_data_parallel_ranks)
             )
-        self._rr_index = 0
+        self._round_robin_idx = 0
         self.data_parallel_pause_acks = set()
 
         self.request_id_to_client_id = {}
@@ -182,8 +182,8 @@ class DataParallelInferenceCoordinator:
         identities = self.identities_of_data_parallel_ranks
         if not identities:
             raise RuntimeError("No engines connected")
-        idx = self._rr_index % len(identities)
-        self._rr_index = idx + 1
+        idx = self._round_robin_idx % len(identities)
+        self._round_robin_idx = idx + 1
         return identities[idx]
 
     def _remove_engine(self, identity):
@@ -297,15 +297,16 @@ class DataParallelInferenceCoordinator:
                 Headers.INCREMENT_STALENESS,
                 Headers.STOP,
             ):
-                # Control signals: start by checking the current state against the signal.
+                # Start by checking the current state against the control signal.
                 if sender_identity not in known_clients:
                     continue
 
                 if header == Headers.PAUSE:
                     if self.state == self.State.RUNNING:
+                        # Normal operation.
                         self.state = self.State.PAUSING
                     elif self.state in (self.State.PAUSED, self.State.SUSPENDED):
-                        # Already idle — short-circuit PAUSE_ACK to this client.
+                        # All engines are already paused.
                         self.router_socket.send_multipart(
                             [
                                 sender_identity,
@@ -314,7 +315,7 @@ class DataParallelInferenceCoordinator:
                         )
                         continue
                     else:
-                        # pausing (in progress) or stopping — ignore.
+                        logging.warning("Coordinator: ignoring PAUSE in state %s", self.state)
                         continue
                 elif header == Headers.UNPAUSE:
                     if self.state != self.State.PAUSED:
@@ -338,10 +339,11 @@ class DataParallelInferenceCoordinator:
                         continue
                     self.state = self.State.STOPPING
 
-                # Control signals: broadcast to all engines, if gating passed.
+                # Broadcast the control signal if we're in a good state.
                 broadcast_payload = msgpack.packb([header.value], use_bin_type=True)
                 for data_parallel_rank_id in list(self.identities_of_data_parallel_ranks):
                     self._send_to_engine(data_parallel_rank_id, broadcast_payload)
+
                 if header == Headers.STOP:
                     # Coordinator is done after broadcasting STOP.
                     # Engines will synchronize their own stop state via all-reduce.
@@ -352,12 +354,13 @@ class DataParallelInferenceCoordinator:
                 # Collect from all dp_ranks, then notify clients.
                 assert sender_identity in self.identities_of_data_parallel_ranks
                 if self.state != self.State.PAUSING:
-                    # Stale or duplicate ACK — ignore.
+                    # Stale or duplicate ACK.
+                    logging.warning("Coordinator: ignoring PAUSE_ACK from %s in state %s",
+                                    sender_identity, self.state)
                     continue
                 self.data_parallel_pause_acks.add(sender_identity)
                 if len(self.data_parallel_pause_acks) == len(self.identities_of_data_parallel_ranks):
                     self.state = self.State.PAUSED
-                    # All engines are PAUSED (they transitioned before sending ACK).
                     for client_id in known_clients:
                         self.router_socket.send_multipart(
                             [

@@ -25,8 +25,6 @@ try:
 except:
     HAVE_MSGPACK = False
 
-from .headers import Headers
-
 
 class InferenceClient:
     """
