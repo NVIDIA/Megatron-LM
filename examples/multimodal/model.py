@@ -16,7 +16,8 @@ from megatron.core.utils import log_single_rank
 
 
 def model_provider(
-    pre_process=True, post_process=True, add_encoder=True, add_decoder=True, parallel_output=True
+    pre_process=True, post_process=True, add_encoder=True, add_decoder=True, parallel_output=True,
+    vp_stage=None, config=None, pg_collection=None
 ) -> LLaVAModel:
     """Builds the model.
 
@@ -28,6 +29,9 @@ def model_provider(
         add_decoder (bool): Construct the decoder module (used with pipeline parallelism). Defaults to True. When we use pipelining, the decoder
             will live on only a subset of the pipeline stages (specifically, every stage after the first one).
         parallel_output (bool): Enable parallel model output.
+        vp_stage: Optional virtual pipeline stage. Used with virtual pipeline parallelism.
+        config: Optional transformer config. If None, will be created from args.
+        pg_collection: Optional process group collection. If None, will use default.
 
     Returns:
         model: A multimodal model.
