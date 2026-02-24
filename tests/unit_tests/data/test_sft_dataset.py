@@ -50,16 +50,16 @@ def create_file_prefixes(tokenizer, number_of_files, maximum_number_of_conversat
             if with_system_message:
                 conversation.append({
                     "role": "system",
-                    "content": "".join(random.choices(string.ascii_letters, k=random.randint(50,300)))
+                    "content": "".join(random.choices(string.ascii_letters, k=random.randint(10, 40)))
                 })
             for _ in range(random.randint(1, maximum_number_of_messages_per_conversation)):
                 conversation.append({
                     "role": "user",
-                    "content": "".join(random.choices(string.ascii_letters, k=random.randint(50,300)))
+                    "content": "".join(random.choices(string.ascii_letters, k=random.randint(10, 40)))
                 })
                 conversation.append({
                     "role": "assistant",
-                    "content": "".join(random.choices(string.ascii_letters, k=random.randint(50,300)))
+                    "content": "".join(random.choices(string.ascii_letters, k=random.randint(10, 40)))
                 })
 
             tokenized_conversation = tokenizer.apply_chat_template(conversation, chat_template=nemotron_nano_v2_custom_template, tokenize=True, add_generation_prompt=False)
@@ -76,10 +76,10 @@ def test_sft_dataset(
     vocab_size,
     with_system_message,
     tmp_path_dist_ckpt,
-    sequence_length: int = 500,
+    sequence_length: int = 1500,
     number_of_files: int = 10,
     number_of_conversations: int = 20,
-    maximum_number_of_messages_per_conversation: int = 8,
+    maximum_number_of_messages_per_conversation: int = 3,
 ):
     if torch.distributed.is_available():
         Utils.initialize_distributed()
@@ -154,8 +154,8 @@ def test_sft_dataset(
 
         # print(f"train_ds: {train_ds[0]['cu_seqlens']}, {train_ds[0]['tokens'].shape}, {train_ds[0]['labels'].shape}")
 
-        for i in range(10):
-            print(f"train_ds[{i}]: {train_ds[i]['cu_seqlens']} ({train_ds[i]['cu_seqlens'].shape}), {train_ds[i]['tokens'].shape}, {train_ds[i]['labels'].shape}")
-
-    
-    
+        for i in range(5):
+            print(f"train_ds[{i}]: {train_ds[i]['cu_seqlens']} ({train_ds[i]['cu_seqlens'].shape}), {train_ds[i]['tokens'].shape}, {train_ds[i]['labels'].shape[0]}, {train_ds[i]['tokens'].numel()}, {train_ds[i]['labels'].numel()}")
+            
+            assert train_ds[i]['tokens'].shape[0] > sequence_length
+            assert train_ds[i]['tokens'].shape[0] + 1 == train_ds[i]['cu_seqlens'][-1]

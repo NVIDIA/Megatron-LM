@@ -106,23 +106,16 @@ class SFTDataset(MegatronDataset):
         Returns:
             Dict[str, torch.Tensor]: The sample information wrapped in a dictionary
         """
-        tokens, cu_seqlens = self._query_document_sample_shuffle_indices(idx)
+        tokens, lengths = self._query_document_sample_shuffle_indices(idx)
 
-        tokens = torch.from_numpy(tokens).long() # TODO(asolergi-nv): Move to query method
-
-        if self.config.truncate_conversations:
-            input_ids = tokens[:self.config.sequence_length].contiguous()
-            labels = tokens[1:self.config.sequence_length + 1].contiguous()
-        #else:
-            # NOTE(asolergi-nv): From cu_seqlens, drop last incomplete conversation
+        tokens = torch.from_numpy(tokens).long()
+        cu_seqlens = torch.cat((torch.zeros(1, dtype=torch.int64), torch.cumsum(torch.from_numpy(lengths), dim = 0)))
         
-        # Adjust cu_seqlens for truncation
-        
-        # Create labels, remember self.config.train_on_completitions_only
+        # TODO(asolergi-nv): Create labels, remember self.config.train_on_completitions_only
 
         return {
-            'tokens': input_ids,
-            'labels': labels,
+            'tokens': tokens[:-1].contiguous(),
+            'labels': tokens[1:].contiguous(),
             'cu_seqlens': cu_seqlens,
         }
     def _query_document_sample_shuffle_indices(
@@ -255,7 +248,7 @@ class SFTDataset(MegatronDataset):
         ):
             log_single_rank(
                 logger,
-                logging.INFO,
+                logging.DEBUG,
                 f"Build and save the {type(self).__name__} {self.index_split.name} indices",
             )
             t_beg = time.time()
@@ -370,19 +363,19 @@ class SFTDataset(MegatronDataset):
             log_single_rank(logger, logging.DEBUG, f"\t> time elapsed: {t_end - t_beg:4f} seconds")
 
             log_single_rank(
-                logger, logging.INFO, f"> total number of samples: {sample_index.shape[0] - 1}"
+                logger, logging.DEBUG, f"> total number of samples: {sample_index.shape[0] - 1}"
             )
-            log_single_rank(logger, logging.INFO, f"> total number of epochs: {num_epochs}")
+            log_single_rank(logger, logging.DEBUG, f"> total number of epochs: {num_epochs}")
 
             return document_index, sample_index, shuffle_index
 
         log_single_rank(
-            logger, logging.INFO, f"Load the {type(self).__name__} {self.index_split.name} indices"
+            logger, logging.DEBUG, f"Load the {type(self).__name__} {self.index_split.name} indices"
         )
 
         log_single_rank(
             logger,
-            logging.INFO,
+            logging.DEBUG,
             f"\tLoad the document index from {os.path.basename(path_to_document_index)}",
         )
         t_beg = time.time()
@@ -392,7 +385,7 @@ class SFTDataset(MegatronDataset):
 
         log_single_rank(
             logger,
-            logging.INFO,
+            logging.DEBUG,
             f"\tLoad the sample index from {os.path.basename(path_to_sample_index)}",
         )
         t_beg = time.time()
@@ -402,7 +395,7 @@ class SFTDataset(MegatronDataset):
 
         log_single_rank(
             logger,
-            logging.INFO,
+            logging.DEBUG,
             f"\tLoad the shuffle index from {os.path.basename(path_to_shuffle_index)}",
         )
         t_beg = time.time()
@@ -411,7 +404,7 @@ class SFTDataset(MegatronDataset):
         log_single_rank(logger, logging.DEBUG, f"\t> time elapsed: {t_end - t_beg:4f} seconds")
 
         log_single_rank(
-            logger, logging.INFO, f"> total number of samples: {sample_index.shape[0] - 1}"
+            logger, logging.DEBUG, f"> total number of samples: {sample_index.shape[0] - 1}"
         )
 
         return document_index, sample_index, shuffle_index
