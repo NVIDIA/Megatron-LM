@@ -543,10 +543,7 @@ class DynamicInferenceContext(BaseInferenceContext):
             )
         )
 
-        # num_cuda_graphs == -1 creates decode cuda graphs of size [1,2,4,8] 
-        # but mixed prefill cuda graphs still start from size [16], i.e. (inference_config.cuda_graph_mixed_prefill_count)
-        self.is_strict_matching = self.is_hybrid_model or (inference_config.num_cuda_graphs == -1)
-
+        self.cuda_graph_mixed_prefill_count = inference_config.cuda_graph_mixed_prefill_count
         self._using_cuda_graph_this_step = False
         # Deal with chunked prefill
         self.enable_chunked_prefill = inference_config.enable_chunked_prefill
@@ -1271,7 +1268,7 @@ class DynamicInferenceContext(BaseInferenceContext):
         This is the fast alternative to add_dummy_requests_for_cudagraph_capture
         (which goes through the heavyweight add_dummy_requests_parallel path).
 
-        We setup minimal state such the initialize_attention_state and the forward 
+        We setup minimal state such the initialize_attention_state and the forward
         pass can run without error.
 
         """
@@ -1302,8 +1299,10 @@ class DynamicInferenceContext(BaseInferenceContext):
                 0, N, device=self.token_to_request_idx.device, dtype=self.token_to_request_idx.dtype
             )
 
-            # 5. Mamba state: allocate slots for dummy requests.        
-            self.mamba_metadata.request_to_mamba_state_idx[0:N] = self.mamba_metadata.batch_allocate_slots(N)
+            # 5. Mamba state: allocate slots for dummy requests.
+            self.mamba_metadata.request_to_mamba_state_idx[0:N] = (
+                self.mamba_metadata.batch_allocate_slots(N)
+            )
 
     def initialize_attention_state(
         self,
@@ -1330,7 +1329,7 @@ class DynamicInferenceContext(BaseInferenceContext):
         else:
             if self.is_creating_cuda_graphs:
                 self.add_dummy_requests_for_cudagraph_capture(construct_graph_dimensions)
-    
+
         batch_dimensions = InferenceBatchDimensions(
             token_count=self.active_token_count,
             prefill_req_count=self.num_prefill_requests,
@@ -1338,14 +1337,15 @@ class DynamicInferenceContext(BaseInferenceContext):
         )
 
         self.batch_dimensions = batch_dimensions
-        
+
         best_graph = CUDAGraphBatchDimensionBuilder.match_graph_config(
             batch_dimensions,
             self.cuda_graph_batch_dimensions_list,
-            strict=self.is_strict_matching,
+            strict=self.is_hybrid_model,
             decode_only_cuda_graphs=(not self.use_cuda_graphs_for_non_decode_steps),
             explicit_chunked_prefill=self.is_chunked_prefill_enabled() and self.is_hybrid_model,
             ep_group=self.expert_model_parallel_group,
+            cuda_graph_mixed_prefill_count=self.cuda_graph_mixed_prefill_count,
         )
         self._using_cuda_graph_this_step = best_graph is not None
 

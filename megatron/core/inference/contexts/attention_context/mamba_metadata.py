@@ -318,7 +318,9 @@ class MambaMetadata:
 
         # Get free slots
         self.mamba_state_free_slot_count -= num_slots
-        mamba_idx = self.mamba_state_free_slots[self.mamba_state_free_slot_count:self.mamba_state_free_slot_count + num_slots]
+        mamba_idx = self.mamba_state_free_slots[
+            self.mamba_state_free_slot_count : self.mamba_state_free_slot_count + num_slots
+        ]
 
         return mamba_idx
 
