@@ -16,6 +16,7 @@ import torch
 
 from megatron.core._rank_utils import log_single_rank, safe_get_rank
 from megatron.core.dist_checkpointing.mapping import ShardedObject
+from megatron.core.typed_torch import copy_signature
 
 """DISCLAIMER: THIS IS AN EXPERIMENTAL FEATURE.
 
@@ -1338,13 +1339,14 @@ class RerunErrorInjector:
         self.injected_error_type = state_dict["injected_error_type"]
 
 
-def initialize_rerun_state_machine(**kwargs) -> None:
+@copy_signature(RerunStateMachine.__init__, handle_first_src_param='skip')
+def initialize_rerun_state_machine(*args, **kwargs) -> None:
     """Helper function to initialize the rerun machine instance.
 
     Check the RerunStateMachine class for the details.
     """
 
-    rerun_state_machine: RerunStateMachine = RerunStateMachine(**kwargs)
+    rerun_state_machine: RerunStateMachine = RerunStateMachine(*args, **kwargs)
     _set_rerun_state_machine(rerun_state_machine)
 
 
