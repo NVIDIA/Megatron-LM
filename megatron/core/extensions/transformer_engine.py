@@ -627,46 +627,39 @@ class TENorm:
                 "Transformer Engine is not installed. "
                 "Please install it with `pip install transformer-engine`."
             )
-        if config.normalization == "LayerNorm":
-            if config.fused_residual_rmsnorm and has_residual:
-                raise ValueError("Fused residual RMSNorm is not supported for LayerNorm")
-            instance = te.pytorch.LayerNorm(
-                hidden_size=hidden_size,
-                eps=eps,
-                sequence_parallel=config.sequence_parallel,
-                zero_centered_gamma=config.layernorm_zero_centered_gamma,
-                **_get_extra_te_kwargs(config),
+
+        use_fused_residual = config.fused_residual_rmsnorm and has_residual
+        if use_fused_residual and config.normalization != "RMSNorm":
+            raise ValueError(
+                "Fused residual is only supported "
+                "for RMSNorm normalization"
             )
+        
+        if config.normalization == "LayerNorm":
+            norm_module = te.pytorch.LayerNorm
         elif config.normalization == "RMSNorm":
             assert hasattr(
                 te.pytorch, "RMSNorm"
             ), "Transformer-Engine >= v0.11 required to use this feature"
-
-            extra_te_kwargs = _get_extra_te_kwargs(config)
-
-            if config.fused_residual_rmsnorm and has_residual:
-                # Use fused residual variant
+            if use_fused_residual:
                 assert (
                     TEFusedResidualRMSNorm is not None
                 ), "TEFusedResidualRMSNorm requires Transformer-Engine >= v1.13.0"
-                instance = TEFusedResidualRMSNorm(
-                    normalized_shape=hidden_size,
-                    eps=eps,
-                    sequence_parallel=config.sequence_parallel,
-                    zero_centered_gamma=config.layernorm_zero_centered_gamma,
-                    **extra_te_kwargs,
-                )
+                norm_module = TEFusedResidualRMSNorm
             else:
-                # Standard RMSNorm without fusion
-                instance = te.pytorch.RMSNorm(
-                    normalized_shape=hidden_size,
-                    eps=eps,
-                    sequence_parallel=config.sequence_parallel,
-                    zero_centered_gamma=config.layernorm_zero_centered_gamma,
-                    **extra_te_kwargs,
-                )
+                norm_module = te.pytorch.RMSNorm
         else:
-            raise Exception("Only LayerNorm and RMSNorm are curently supported")
+            raise Exception(
+                "Only LayerNorm and RMSNorm are currently supported"
+            )
+        
+        instance = norm_module(
+            normalized_shape=hidden_size,
+            eps=eps,
+            sequence_parallel=config.sequence_parallel,
+            zero_centered_gamma=config.layernorm_zero_centered_gamma,
+            **_get_extra_te_kwargs(config),
+        )
 
         return cast(LayerNormInterface, instance)
 
