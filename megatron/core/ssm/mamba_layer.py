@@ -69,7 +69,6 @@ class MambaLayer(GraphableMegatronModule):
         config: TransformerConfig,
         submodules: MambaLayerSubmodules,
         layer_number: int = 1,
-        residual_in_fp32=False,
         pg_collection: ProcessGroupCollection = None,
         pp_layer_offset: int = 0,
     ):
@@ -80,7 +79,6 @@ class MambaLayer(GraphableMegatronModule):
         self.config = config
         self.submodules_config = submodules
         self.layer_number = layer_number
-        self.residual_in_fp32 = residual_in_fp32
         self.hidden_dropout = config.hidden_dropout
         self.mixer = build_module(
             submodules.mixer,
@@ -136,8 +134,8 @@ class MambaLayer(GraphableMegatronModule):
         inference_context = deprecate_inference_params(inference_context, inference_params)
 
         residual = hidden_states
-        if self.residual_in_fp32:
-            residual = residual.to(torch.float32)
+        if self.config.fp32_residual_connection:
+            residual = residual.float()
 
         hidden_states = hidden_states.to(dtype=self.config.params_dtype)
         hidden_states = apply_module(self.norm)(hidden_states)
