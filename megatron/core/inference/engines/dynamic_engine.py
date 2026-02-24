@@ -1662,7 +1662,11 @@ class DynamicInferenceEngine(AbstractEngine):
                 )
                 if self.state == EngineState.SUSPENDED:
                     self.suspended.clear()
-                self._cancel_all_request_futures()
+                for entry in self.requests.values():
+                    if not entry.future.done():
+                        entry.future.cancel()
+                self.waiting_request_ids.clear()
+                self.requests.clear()
                 self.state = EngineState.STOPPING
                 break
 
@@ -1670,17 +1674,6 @@ class DynamicInferenceEngine(AbstractEngine):
                 raise UnknownHeaderError(header)
 
         return len(all_messages)
-
-    def _cancel_all_request_futures(self):
-        """Cancel all outstanding request futures and clear request state.
-
-        Called during STOP to ensure no futures are left dangling.
-        """
-        for entry in self.requests.values():
-            if not entry.future.done():
-                entry.future.cancel()
-        self.waiting_request_ids.clear()
-        self.requests.clear()
 
     def close(self):
         """Close this engine's ZMQ sockets. Idempotent.
