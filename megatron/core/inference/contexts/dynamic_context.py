@@ -1508,6 +1508,53 @@ class DynamicInferenceContext(BaseInferenceContext):
 
         return last_token_logits
 
+    def _compute_prefix_match(
+        self, req: DynamicInferenceRequest, chunk_length: int
+    ) -> Tuple[list, int, int, int, int, int]:
+        """Compute prefix match results and skip counts for a request chunk.
+
+        Shared by check_availability (budget checks) and add_request (execution).
+
+        Returns:
+            Tuple of (matched_block_ids, num_blocks_from_pool,
+                      already_allocated_blocks, overall_required_blocks,
+                      prefix_skip_tokens, effective_chunk_length).
+        """
+        finished = req.finished_chunk_token_count
+        already_allocated_blocks = (
+            finished + self.block_size_tokens - 1
+        ) // self.block_size_tokens
+        overall_required_blocks = (
+            finished + chunk_length + self.block_size_tokens - 1
+        ) // self.block_size_tokens
+
+        matched_block_ids, _ = self._find_matching_prefix_blocks(
+            req, already_allocated_blocks, overall_required_blocks
+        )
+        num_matched = len(matched_block_ids)
+
+        block_aligned = (finished % self.block_size_tokens == 0)
+        if self.enable_prefix_caching and num_matched > 0 and block_aligned:
+            prefix_skip_tokens = min(
+                num_matched * self.block_size_tokens, chunk_length - 1
+            )
+        else:
+            prefix_skip_tokens = 0
+
+        effective_chunk_length = chunk_length - prefix_skip_tokens
+        num_blocks_from_pool = max(
+            0, overall_required_blocks - already_allocated_blocks - num_matched
+        )
+
+        return (
+            matched_block_ids,
+            num_blocks_from_pool,
+            already_allocated_blocks,
+            overall_required_blocks,
+            prefix_skip_tokens,
+            effective_chunk_length,
+        )
+
     def check_availability(self, req: DynamicInferenceRequest) -> Tuple[bool, bool, bool]:
         """
         Check if the request can be added to the context.
@@ -1518,13 +1565,14 @@ class DynamicInferenceContext(BaseInferenceContext):
             self.total_request_count < self.max_requests and self.paused_request_count == 0
         )
 
+        (
+            _, num_blocks_from_pool, _, _, _, effective_chunk_length,
+        ) = self._compute_prefix_match(req, req.remaining_prompt_length)
+
         request_tokens_can_be_added = (
-            self.active_token_count + req.remaining_prompt_length <= self.max_tokens
+            self.active_token_count + effective_chunk_length <= self.max_tokens
         )
-        blocks = math.ceil(
-            (req.remaining_prompt_length + req.finished_chunk_token_count) / self.block_size_tokens
-        ) - math.ceil(req.finished_chunk_token_count / self.block_size_tokens)
-        kv_cache_available = self.block_allocator.is_memory_available(blocks)
+        kv_cache_available = self.block_allocator.is_memory_available(num_blocks_from_pool)
         return request_can_be_added, request_tokens_can_be_added, kv_cache_available
 
     def _find_matching_prefix_blocks(
@@ -1607,47 +1655,22 @@ class DynamicInferenceContext(BaseInferenceContext):
         if self.active_token_count + chunk_length > self.max_tokens:
             raise TokenOverflowError(req.request_id)
 
-        # Use the remaining prompt tokens for this chunk
-        this_round_tokens = req.remaining_prompt_tokens[:chunk_length]
-
         # =========================================================================
-        # Block allocation
+        # Block allocation + prefix matching + prefill skipping
         # =========================================================================
-        already_allocated_blocks = (
-            req.finished_chunk_token_count + self.block_size_tokens - 1
-        ) // self.block_size_tokens  # ceiling division
-        overall_required_blocks = (
-            req.finished_chunk_token_count + chunk_length + self.block_size_tokens - 1
-        ) // self.block_size_tokens  # ceiling division
-
-        # =========================================================================
-        # Prefix caching: find matching prefix blocks (scoped to this chunk)
-        # =========================================================================
-        matched_block_ids, prefix_parent_hash = self._find_matching_prefix_blocks(
-            req, already_allocated_blocks, overall_required_blocks
-        )
+        (
+            matched_block_ids,
+            num_blocks_from_pool,
+            already_allocated_blocks,
+            overall_required_blocks,
+            prefix_skip_tokens,
+            effective_chunk_length,
+        ) = self._compute_prefix_match(req, chunk_length)
         num_matched_blocks = len(matched_block_ids)
-
-        # Prefill skipping: skip tokens covered by matched prefix blocks
-        block_aligned = (req.finished_chunk_token_count % self.block_size_tokens == 0)
-        if self.enable_prefix_caching and num_matched_blocks > 0 and block_aligned:
-            prefix_skip_tokens = min(
-                num_matched_blocks * self.block_size_tokens, chunk_length - 1
-            )
-        else:
-            prefix_skip_tokens = 0
-
         effective_kv_offset = req.finished_chunk_token_count + prefix_skip_tokens
-        effective_chunk_length = chunk_length - prefix_skip_tokens
 
-        # Re-slice tokens to skip matched prefix
+        # Slice tokens to skip matched prefix
         this_round_tokens = req.remaining_prompt_tokens[prefix_skip_tokens:chunk_length]
-
-        # Reduce blocks needed by the number of matched (shared) blocks
-        num_blocks_from_pool = (
-            overall_required_blocks - already_allocated_blocks - num_matched_blocks
-        )
-        num_blocks_from_pool = max(0, num_blocks_from_pool)
 
         new_block_ids = None
         if num_blocks_from_pool > 0:
