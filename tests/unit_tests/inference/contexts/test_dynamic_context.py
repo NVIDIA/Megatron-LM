@@ -1289,6 +1289,84 @@ class TestDynamicContext:
         ), f"Block counts were not synchronized across ranks. Gathered: {all_counts}"
 
     @pytest.mark.internal
+    @pytest.mark.parametrize("ratio", [0.2, 0.4, 0.6, 0.8])
+    @rounder_override(64)
+    def test_mamba_memory_ratio_allocation(self, ratio):
+        """
+        Test that max_requests and block counts are partitioned correctly by mamba_memory_ratio.
+        """
+        self._setup_model_parallel_group(1, 1)
+
+        buffer_gb = 0.05
+        paused_gb = 0.01
+        block_size = 256
+        num_attention_heads = 8
+        kv_channels = 64
+        params_dtype = torch.float32
+
+        layer_type_list = [Symbols.MAMBA, Symbols.ATTENTION]
+        mamba_conv_states_shape = (544, 4)
+        mamba_ssm_states_shape = (8, 64, 16)
+        mamba_config = MambaInferenceStateConfig(
+            layer_type_list, mamba_conv_states_shape, mamba_ssm_states_shape
+        )
+
+        context = DynamicInferenceContext(
+            model_config=TransformerConfig(
+                params_dtype=params_dtype,
+                num_layers=2,  # 1 Attn, 1 Mamba
+                kv_channels=kv_channels,
+                num_attention_heads=num_attention_heads,
+            ),
+            inference_config=InferenceConfig(
+                max_sequence_length=512,
+                buffer_size_gb=buffer_gb,
+                paused_buffer_size_gb=paused_gb,
+                block_size_tokens=block_size,
+                max_tokens=2048,
+                mamba_inference_state_config=mamba_config,
+                mamba_memory_ratio=ratio,
+                unified_memory_level=0,
+            ),
+        )
+
+        dtype_size = torch.tensor([], dtype=params_dtype).element_size()
+
+        mamba_mem_per_req = math.prod(mamba_conv_states_shape) + math.prod(mamba_ssm_states_shape)
+        mamba_mem_per_req *= dtype_size
+
+        kv_buffer_bytes = int(buffer_gb * 1024**3)
+        kv_paused_bytes = int(paused_gb * 1024**3)
+        total_mem_bytes = kv_buffer_bytes + kv_paused_bytes
+        expected_mamba_mem = total_mem_bytes * ratio
+        expected_mamba_max_reqs = int(expected_mamba_mem // mamba_mem_per_req)
+
+        # KV block calculation with buffer size reduced by Mamba memory ratio
+        kv_buffer_bytes = int(kv_buffer_bytes * (1.0 - ratio))
+        kv_paused_bytes = int(kv_paused_bytes * (1.0 - ratio))
+
+        kv_block_size_bytes = dtype_size * 2 * 1 * block_size * num_attention_heads * kv_channels
+
+        expected_active_blocks = kv_buffer_bytes // kv_block_size_bytes
+        expected_paused_blocks = kv_paused_bytes // kv_block_size_bytes
+        expected_total_blocks = expected_active_blocks + expected_paused_blocks
+
+        # Check that block allocator received the reduced block counts
+        assert context.block_allocator.total_count == expected_active_blocks
+        assert context.block_allocator.paused_count == expected_paused_blocks
+
+        # max_requests should be limited by the Mamba calculation if mamba_max_requests is smaller
+        # or the block count - 1 if that is smaller
+        expected_limit = min(expected_total_blocks - 1, expected_mamba_max_reqs)
+
+        # Apply rounding (REQUEST_ROUNDER = 64 in this test)
+        expected_max_requests = (expected_limit // 64) * 64
+
+        assert context.max_requests == expected_max_requests
+        assert context.is_hybrid_model is True
+
+    @pytest.mark.internal
+    @rounder_override(64)
     def test_max_requests_less_than_tp_size(self):
         tp_size = 2
         self._setup_model_parallel_group(tensor_parallel_size=tp_size, pipeline_parallel_size=1)
