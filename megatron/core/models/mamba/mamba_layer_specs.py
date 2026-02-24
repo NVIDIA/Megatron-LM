@@ -1,6 +1,7 @@
 # Copyright (c) 2023, NVIDIA CORPORATION. All rights reserved.
 
 from megatron.core.extensions.transformer_engine import (
+    TEColumnParallelLinear,
     TEDotProductAttention,
     TELayerNormColumnParallelLinear,
     TENorm,
@@ -19,6 +20,12 @@ from megatron.core.tensor_parallel import (
 from megatron.core.transformer.attention import SelfAttention, SelfAttentionSubmodules
 from megatron.core.transformer.enums import AttnMaskType
 from megatron.core.transformer.mlp import MLP, MLPSubmodules
+from megatron.core.transformer.multi_token_prediction import (
+    MultiTokenPredictionBlock,
+    MultiTokenPredictionBlockSubmodules,
+    MultiTokenPredictionLayer,
+    MultiTokenPredictionLayerSubmodules,
+)
 from megatron.core.transformer.spec_utils import ModuleSpec
 from megatron.core.transformer.transformer_layer import (
     MoETransformerLayer,
@@ -26,7 +33,7 @@ from megatron.core.transformer.transformer_layer import (
     TransformerLayerSubmodules,
 )
 
-# Standard MoE spec (for training)
+# This should be private and should not be used outside of this file.
 moe = get_moe_module_spec(
     use_te=True,
     num_experts=8,  # Can be any positive integer (must not be None).
@@ -42,6 +49,28 @@ moe_inference = get_moe_module_spec(
     moe_use_legacy_grouped_gemm=False,
     inference_optimized=True,
 )
+
+
+# MTP block spec for Mamba - provides norms and projection only.
+# Inner layers are built by MultiTokenPredictionLayer using nested MambaStack
+_mamba_mtp_block_spec = ModuleSpec(
+    module=MultiTokenPredictionBlock,
+    submodules=MultiTokenPredictionBlockSubmodules(
+        layer_specs=[
+            ModuleSpec(
+                module=MultiTokenPredictionLayer,
+                submodules=MultiTokenPredictionLayerSubmodules(
+                    enorm=TENorm,
+                    hnorm=TENorm,
+                    eh_proj=TEColumnParallelLinear,
+                    mtp_model_layer=None,  # Built via pattern + mamba_submodules
+                    layer_norm=TENorm,
+                ),
+            )
+        ]
+    ),
+)
+
 
 mamba_stack_spec = ModuleSpec(
     module=MambaStack,
@@ -97,8 +126,10 @@ mamba_stack_spec = ModuleSpec(
                 pre_mlp_layernorm=TENorm, mlp=moe, mlp_bda=get_bias_dropout_add
             ),
         ),
+        mtp_block_spec=_mamba_mtp_block_spec,
     ),
 )
+
 
 mamba_inference_stack_spec = ModuleSpec(
     module=MambaStack,
@@ -157,5 +188,6 @@ mamba_inference_stack_spec = ModuleSpec(
                 pre_mlp_layernorm=TENorm, mlp=moe_inference, mlp_bda=get_bias_dropout_add
             ),
         ),
+        mtp_block_spec=_mamba_mtp_block_spec,
     ),
 )

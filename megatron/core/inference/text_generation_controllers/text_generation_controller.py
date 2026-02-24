@@ -517,7 +517,10 @@ class TextGenerationController:
         model_config = get_model_config(unwrapped_model)
 
         # Initialize attention state.
-        context.initialize_attention_state(construct_graph_dimensions=construct_graph_dimensions)
+        context.initialize_attention_state(
+            construct_graph_dimensions=construct_graph_dimensions,
+            is_expert_parallel_dummy_cuda_graph_step=is_dummy_forward,
+        )
 
         # If using symmetric kernels and we are using using nccl
         # for prefill turn off symmetric kernels
@@ -846,8 +849,7 @@ class TextGenerationController:
         # a dummy cuda graph.
         input_ids, position_ids = self._dynamic_step_context_init(
             # try to use the smallest cuda-graph config for dummy forward
-            construct_graph_dimensions=min(context.cuda_graph_batch_dimensions_list),
-            is_dummy_forward=True,
+            is_dummy_forward=True
         )
 
         # _dynamic_step_context_init tries to find a cuda-graph that is compatible
