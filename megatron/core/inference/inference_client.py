@@ -3,7 +3,7 @@
 import asyncio
 import logging
 import time
-from typing import Awaitable, List, Optional, Union
+from typing import List, Optional, Union
 
 from megatron.core.inference.inference_request import DynamicInferenceRequestRecord
 from megatron.core.inference.sampling_params import SamplingParams
@@ -71,7 +71,6 @@ class InferenceClient:
 
         self._loop = None
         self.running = asyncio.Event()
-        self.paused = asyncio.Event()
 
         self.socket = socket
         self.completion_futures = {}
@@ -140,8 +139,6 @@ class InferenceClient:
                     completion_future.get_loop().call_soon_threadsafe(
                         completion_future.set_result, completed_request
                     )
-                elif header == Headers.PAUSE_ACK:
-                    self.paused.set()
             except zmq.Again:
                 await asyncio.sleep(0.005)
                 continue
@@ -171,7 +168,6 @@ class InferenceClient:
         logging.info("Client: Connecting to InferenceCoordinator...")
         self._loop = get_asyncio_loop(loop)
         self.running.set()
-        self.paused.clear()
         self._connect_with_inference_coordinator()
         self.listener_task = self._loop.create_task(self._recv_task())
 
@@ -186,50 +182,43 @@ class InferenceClient:
         payload_serialized = msgpack.packb(payload, use_bin_type=True)
         self.socket.send(payload_serialized)
 
-    def pause_engines(self) -> Awaitable:
-        """Sends PAUSE to all engines via coordinator. Idempotent.
+    def pause_engines(self):
+        """Sends PAUSE to all engines via coordinator.
 
-        If already paused, returns immediately without sending a signal.
-        Otherwise, the coordinator broadcasts PAUSE, each engine reaches EP
-        consensus, then sends PAUSE_ACK.  The coordinator collects all ACKs
-        and notifies the client.
-
-        Returns:
-            Awaitable: Resolves when all engines are globally paused.
+        The coordinator broadcasts PAUSE. Each engine reaches EP consensus,
+        then synchronizes via a world-wide barrier before transitioning to
+        PAUSED. Callers should await engine.paused for confirmation.
         """
-        if not self.paused.is_set():
-            self._send_signal_to_engines(Headers.PAUSE)
-        return self.paused.wait()
+        self._send_signal_to_engines(Headers.PAUSE)
 
     def unpause_engines(self) -> None:
         """Sends UNPAUSE to all engines. No synchronization needed."""
-        self.paused.clear()
         self.running.set()
         self._send_signal_to_engines(Headers.UNPAUSE)
 
     def increment_staleness(self):
         """Sends a signal to increment staleness on all in-flight requests."""
-        assert self.paused.is_set(), "Can only increment staleness while engines are paused."
         self._send_signal_to_engines(Headers.INCREMENT_STALENESS)
 
-    def suspend_engines(self) -> None:
-        """Sends SUSPEND to all engines. Requires system to be PAUSED.
+    def suspend_engines(self):
+        """Sends SUSPEND to all engines via coordinator. Requires PAUSED.
 
-        Engines handle GPU offload internally and synchronize via DP all-reduce.
+        Callers should await engine.suspended for confirmation.
         """
         self._send_signal_to_engines(Headers.SUSPEND)
 
-    def resume_engines(self) -> None:
-        """Sends RESUME to all engines. Requires system to be SUSPENDED.
+    def resume_engines(self):
+        """Sends RESUME to all engines via coordinator. Requires SUSPENDED.
 
-        Engines handle GPU onload internally and synchronize via DP all-reduce.
+        Callers should await engine.paused (or engine.running after UNPAUSE)
+        for confirmation.
         """
         self._send_signal_to_engines(Headers.RESUME)
 
-    def stop_engines(self) -> None:
-        """Sends STOP to all engines. Requires system to be PAUSED.
+    def stop_engines(self):
+        """Sends STOP to all engines via coordinator. Requires PAUSED or SUSPENDED.
 
-        Engines cancel futures and synchronize via DP all-reduce.
+        Callers should await engine.stopped for confirmation.
         """
         self._send_signal_to_engines(Headers.STOP)
         self.running.clear()

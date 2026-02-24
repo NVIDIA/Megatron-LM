@@ -522,11 +522,12 @@ class DynamicInferenceEngine(AbstractEngine):
                 self.zmq_context, process_group=self.pg_collection.ep
             )
 
-        # initialize zmq-based DP communicator for SUSPEND/RESUME/STOP barriers
-        self.dp_world_size = dp_size
-        if self.dp_world_size > 1:
-            self.data_parallel_zmq_communicator = AsyncZMQCommunicator(
-                self.zmq_context, process_group=self.pg_collection.dp
+        # initialize zmq-based world communicator for consensus barriers
+        total_world_size = torch.distributed.get_world_size()
+        if total_world_size > 1:
+            world_group = torch.distributed.new_group()
+            self.world_zmq_communicator = AsyncZMQCommunicator(
+                self.zmq_context, process_group=world_group
             )
 
         if launch_inference_coordinator and self.is_dp_coordinator:
@@ -1612,19 +1613,11 @@ class DynamicInferenceEngine(AbstractEngine):
 
             elif header == Headers.PAUSE:
                 if self.state == EngineState.RUNNING:
-                    # The engine will sending PAUSE_ACK after its all-reduce.
                     self.state = EngineState.PAUSING
                     self.running.clear()
-                elif self.state in (EngineState.PAUSED, EngineState.SUSPENDING,
-                                    EngineState.SUSPENDED, EngineState.RESUMING):
-                    # Already done; resend PAUSE_ACK.
-                    if self.is_mp_coordinator:
-                        payload = msgpack.packb(
-                            [Headers.PAUSE_ACK.value], use_bin_type=True
-                        )
-                        self.socket_for_receiving_requests.send(payload)
                 # If PAUSING, an all-reduce is already in progress.
-                # If STOPPING/STOPPED, we are shutting down and ignore.
+                # If PAUSED / SUSPENDED / etc., already idle — ignore.
+                # If STOPPING/STOPPED, we are shutting down — ignore.
                 break
 
             elif header == Headers.UNPAUSE:
@@ -1702,8 +1695,8 @@ class DynamicInferenceEngine(AbstractEngine):
                 self.zmq_sockets.clear()
             if hasattr(self, "expert_parallel_zmq_communicator"):
                 self.expert_parallel_zmq_communicator.close()
-            if hasattr(self, "data_parallel_zmq_communicator"):
-                self.data_parallel_zmq_communicator.close()
+            if hasattr(self, "world_zmq_communicator"):
+                self.world_zmq_communicator.close()
             if not self.zmq_context.closed:
                 self.zmq_context.term()
             return
@@ -1767,14 +1760,18 @@ class DynamicInferenceEngine(AbstractEngine):
         range_pop()
         return max_global_work > 0
 
-    async def _dp_all_reduce_barrier(self):
-        """DP-level barrier using ZMQ all-reduce.
+    async def _world_barrier(self):
+        """World-wide ZMQ all-reduce barrier for global rank consensus.
 
-        The all-reduce completes when all ranks inside this DP group have synchronized state.
+        Used for all state transitions that require global synchronization:
+        PAUSING → PAUSED, SUSPENDING → SUSPENDED, RESUMING → PAUSED,
+        and STOPPING → STOPPED.
+
+        No-op when world_size == 1 (communicator is not created).
         """
-        range_push("_dp_all_reduce_barrier")
-        if self.dp_world_size > 1:
-            await self.data_parallel_zmq_communicator.all_reduce_max(1)
+        range_push("world_barrier")
+        if hasattr(self, 'world_zmq_communicator'):
+            await self.world_zmq_communicator.all_reduce_max(1)
         range_pop()
 
     @trace_async_exceptions
@@ -1785,9 +1782,9 @@ class DynamicInferenceEngine(AbstractEngine):
 
         State-dependent behavior:
         - RUNNING: EP all-reduce to check for work, then step or idle.
-        - PAUSING: EP all-reduce to reach consensus, then ACK coordinator.
+        - PAUSING: EP all-reduce to reach consensus, then world barrier.
         - PAUSED / SUSPENDED: Idle-sleep, wait for signals via schedule_requests().
-        - SUSPENDING / RESUMING / STOPPING: DP all-reduce barrier, then transition.
+        - SUSPENDING / RESUMING / STOPPING: World barrier, then transition.
         - STOPPED: Teardown and exit.
         """
         self._loop = get_asyncio_loop(loop)
@@ -1826,20 +1823,16 @@ class DynamicInferenceEngine(AbstractEngine):
                         self.step_end_event.synchronize()
                         self.step_count += 1
                     else:
-                        # EP consensus reached. Transition to PAUSED, then send ACK to coordinator.
+                        # EP consensus reached. World barrier for global consensus.
+                        await self._world_barrier()
                         self.state = EngineState.PAUSED
                         self.paused.set()
-                        if self.is_mp_coordinator:
-                            payload = msgpack.packb(
-                                [Headers.PAUSE_ACK.value], use_bin_type=True
-                            )
-                            self.socket_for_receiving_requests.send(payload)
 
                 elif self.state == EngineState.PAUSED:
                     await asyncio.sleep(0.02)
 
                 elif self.state == EngineState.SUSPENDING:
-                    await self._dp_all_reduce_barrier()
+                    await self._world_barrier()
                     self.state = EngineState.SUSPENDED
                     self.suspended.set()
 
@@ -1847,12 +1840,12 @@ class DynamicInferenceEngine(AbstractEngine):
                     await asyncio.sleep(0.02)
 
                 elif self.state == EngineState.RESUMING:
-                    await self._dp_all_reduce_barrier()
+                    await self._world_barrier()
                     self.state = EngineState.PAUSED
                     self.paused.set()
 
                 elif self.state == EngineState.STOPPING:
-                    await self._dp_all_reduce_barrier()
+                    await self._world_barrier()
                     self.state = EngineState.STOPPED
                     self.stopped.set()
                     if self.rank == 0:

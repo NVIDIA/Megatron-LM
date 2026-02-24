@@ -13,7 +13,6 @@ class Headers(Enum):
     SUBMIT_REQUEST = auto()
     ENGINE_REPLY = auto()
     PAUSE = auto()
-    PAUSE_ACK = auto()
     UNPAUSE = auto()
     SUSPEND = auto()
     RESUME = auto()
@@ -26,12 +25,12 @@ class EngineState(Enum):
     """State machine for the inference engine."""
 
     RUNNING = auto()      # Processing requests
-    PAUSING = auto()      # PAUSE received; waiting for EP consensus + coordinator ACK
+    PAUSING = auto()      # PAUSE received; waiting for EP consensus + world barrier
     PAUSED = auto()       # Globally confirmed idle
-    SUSPENDING = auto()   # SUSPEND received; offloading GPU; waiting for DP all-reduce
+    SUSPENDING = auto()   # SUSPEND received; offloading GPU; waiting for world barrier
     SUSPENDED = auto()    # GPU offloaded, all ranks confirmed
-    RESUMING = auto()     # RESUME received; onloading GPU; waiting for DP all-reduce
-    STOPPING = auto()     # STOP received; futures cancelled; waiting for DP all-reduce
+    RESUMING = auto()     # RESUME received; onloading GPU; waiting for world barrier
+    STOPPING = auto()     # STOP received; futures cancelled; waiting for world barrier
     STOPPED = auto()      # All ranks confirmed; teardown complete
 
 

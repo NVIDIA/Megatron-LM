@@ -103,9 +103,8 @@ class DummyEngine(DynamicInferenceEngine):
         self.resume_request_ids = None
         self.use_coordinator = False
 
-        # Defaults for DP/EP world sizes (overwritten during
+        # Default for EP world size (overwritten during
         # start_listening_to_data_parallel_coordinator).
-        self.dp_world_size = 1
         self.ep_world_size = 1
 
         # CUDA events used by run_engine_with_coordinator for timing.
@@ -198,7 +197,8 @@ class DummyEngine(DynamicInferenceEngine):
 async def graceful_shutdown(engine, client=None, *, timeout=10.0):
     """PAUSE then STOP the coordinator test stack.
 
-    First tries the coordinator-driven path (client sends PAUSE then STOP).
+    First tries the coordinator-driven path (client sends PAUSE, engines
+    synchronize via world barrier, then client sends STOP).
     On timeout, falls back to engine.shutdown(immediate=True) which injects
     synthetic PAUSE + STOP signals and drains EP collectives directly.
 
@@ -210,12 +210,14 @@ async def graceful_shutdown(engine, client=None, *, timeout=10.0):
     try:
         if client is not None:
             if engine.state == EngineState.RUNNING:
-                await asyncio.wait_for(client.pause_engines(), timeout=timeout)
+                client.pause_engines()
+            await asyncio.wait_for(engine.paused.wait(), timeout=timeout)
             client.stop_engines()
         await asyncio.wait_for(engine.stopped.wait(), timeout=timeout)
+        if client is not None:
+            client.stop()
     except asyncio.TimeoutError:
         await engine.shutdown(immediate=True)
-    finally:
         if client is not None:
             client.stop()
 
@@ -487,7 +489,8 @@ class TestCoordinator:
                     )
                     for _ in range(3)
                 ]
-                await asyncio.wait_for(client.pause_engines(), timeout=5.0)
+                client.pause_engines()
+                await asyncio.wait_for(engine.paused.wait(), timeout=5.0)
                 assert_state(engine, EngineState.PAUSED)
 
                 # UNPAUSE and verify all in-flight requests complete.
@@ -500,19 +503,14 @@ class TestCoordinator:
                 assert_state(engine, EngineState.RUNNING)
 
                 # ── PAUSE (1st) ──────────────────────────────────────
-                await asyncio.wait_for(client.pause_engines(), timeout=5.0)
+                client.pause_engines()
+                await asyncio.wait_for(engine.paused.wait(), timeout=5.0)
                 assert_state(engine, EngineState.PAUSED)
 
                 # ── Idempotent PAUSE while PAUSED ────────────────────
-                # Client short-circuits (paused already set).
-                await asyncio.wait_for(client.pause_engines(), timeout=5.0)
-                assert_state(engine, EngineState.PAUSED)
-
-                # Force PAUSE through to coordinator by clearing client
-                # state.  Coordinator is in "paused" state and should
-                # short-circuit PAUSE_ACK without bothering engines.
-                client.paused.clear()
-                await asyncio.wait_for(client.pause_engines(), timeout=5.0)
+                # Redundant PAUSE — coordinator ignores, engine stays PAUSED.
+                client.pause_engines()
+                await asyncio.sleep(0.1)
                 assert_state(engine, EngineState.PAUSED)
 
                 # Requests submitted during PAUSE should queue, not complete.
@@ -544,27 +542,24 @@ class TestCoordinator:
                     assert record[-1].status == Status.COMPLETED
 
                 # ── PAUSE (2nd) ──────────────────────────────────────
-                await asyncio.wait_for(client.pause_engines(), timeout=5.0)
+                client.pause_engines()
+                await asyncio.wait_for(engine.paused.wait(), timeout=5.0)
                 assert_state(engine, EngineState.PAUSED)
 
                 # ── SUSPEND ──────────────────────────────────────────
                 client.suspend_engines()
                 await asyncio.wait_for(engine.suspended.wait(), timeout=5.0)
                 assert_state(engine, EngineState.SUSPENDED)
-                assert engine.suspended.is_set()
 
                 # ── Idempotent PAUSE while SUSPENDED ─────────────────
-                # Force PAUSE through to coordinator (clear client state).
-                # Coordinator is in "suspended" state — short-circuits
-                # PAUSE_ACK without bothering engines.
-                client.paused.clear()
-                await asyncio.wait_for(client.pause_engines(), timeout=5.0)
+                # Redundant PAUSE — coordinator ignores, engine stays SUSPENDED.
+                client.pause_engines()
+                await asyncio.sleep(0.1)
                 assert_state(engine, EngineState.SUSPENDED)
 
                 # ── RESUME ───────────────────────────────────────────
-                # paused is already set and stays set through RESUMING.
-                # Clear it manually so we can wait for the re-set that
-                # confirms the RESUMING→PAUSED transition completed.
+                # paused stays set through SUSPEND; clear it so we can
+                # re-wait for the RESUMING → PAUSED transition.
                 engine.paused.clear()
                 client.resume_engines()
                 await asyncio.wait_for(engine.paused.wait(), timeout=5.0)
@@ -586,7 +581,8 @@ class TestCoordinator:
                     assert record[-1].status == Status.COMPLETED
 
                 # ── PAUSE (3rd) ──────────────────────────────────────
-                await asyncio.wait_for(client.pause_engines(), timeout=5.0)
+                client.pause_engines()
+                await asyncio.wait_for(engine.paused.wait(), timeout=5.0)
                 assert_state(engine, EngineState.PAUSED)
 
                 # Submit requests that will be cancelled on STOP.

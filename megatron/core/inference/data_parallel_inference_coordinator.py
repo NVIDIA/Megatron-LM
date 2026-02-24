@@ -72,7 +72,6 @@ class DataParallelInferenceCoordinator:
         """State machine for the coordinator."""
 
         RUNNING = auto()
-        PAUSING = auto()
         PAUSED = auto()
         SUSPENDED = auto()
         STOPPING = auto()
@@ -163,7 +162,6 @@ class DataParallelInferenceCoordinator:
                 sorted(self.identities_of_data_parallel_ranks)
             )
         self._round_robin_idx = 0
-        self.data_parallel_pause_acks = set()
 
         self.request_id_to_client_id = {}
         self.request_id_to_client_request_id = {}
@@ -192,7 +190,6 @@ class DataParallelInferenceCoordinator:
             self.identities_of_data_parallel_ranks.remove(identity)
         except ValueError:
             return
-        self.data_parallel_pause_acks.discard(identity)
         logging.warning("Coordinator: removed engine %s (now %d engines)",
                         identity, len(self.identities_of_data_parallel_ranks))
 
@@ -303,16 +300,9 @@ class DataParallelInferenceCoordinator:
 
                 if header == Headers.PAUSE:
                     if self.state == self.State.RUNNING:
-                        # Normal operation.
-                        self.state = self.State.PAUSING
+                        self.state = self.State.PAUSED
                     elif self.state in (self.State.PAUSED, self.State.SUSPENDED):
-                        # All engines are already paused.
-                        self.router_socket.send_multipart(
-                            [
-                                sender_identity,
-                                msgpack.packb([Headers.PAUSE_ACK.value], use_bin_type=True),
-                            ]
-                        )
+                        # Already paused/suspended, ignore redundant PAUSE.
                         continue
                     else:
                         logging.warning("Coordinator: ignoring PAUSE in state %s", self.state)
@@ -322,7 +312,6 @@ class DataParallelInferenceCoordinator:
                         logging.warning("Coordinator: ignoring UNPAUSE in state %s", self.state)
                         continue
                     self.state = self.State.RUNNING
-                    self.data_parallel_pause_acks = set()
                 elif header == Headers.SUSPEND:
                     if self.state != self.State.PAUSED:
                         logging.warning("Coordinator: ignoring SUSPEND in state %s", self.state)
@@ -344,30 +333,9 @@ class DataParallelInferenceCoordinator:
                 for data_parallel_rank_id in list(self.identities_of_data_parallel_ranks):
                     self._send_to_engine(data_parallel_rank_id, broadcast_payload)
 
-                if header == Headers.STOP:
-                    # Coordinator is done after broadcasting STOP.
-                    # Engines will synchronize their own stop state via all-reduce.
+                if self.state == self.State.STOPPING:
                     break
 
-            elif header == Headers.PAUSE_ACK:
-                # ACK from engine (sent after EP consensus, engine already PAUSED).
-                # Collect from all dp_ranks, then notify clients.
-                assert sender_identity in self.identities_of_data_parallel_ranks
-                if self.state != self.State.PAUSING:
-                    # Stale or duplicate ACK.
-                    logging.warning("Coordinator: ignoring PAUSE_ACK from %s in state %s",
-                                    sender_identity, self.state)
-                    continue
-                self.data_parallel_pause_acks.add(sender_identity)
-                if len(self.data_parallel_pause_acks) == len(self.identities_of_data_parallel_ranks):
-                    self.state = self.State.PAUSED
-                    for client_id in known_clients:
-                        self.router_socket.send_multipart(
-                            [
-                                client_id,
-                                msgpack.packb([header.value, sender_identity], use_bin_type=True),
-                            ]
-                        )
             elif header == Headers.ENGINE_REPLY:
                 # This is the output of a single engine step on some data parallel rank.
                 assert sender_identity in self.identities_of_data_parallel_ranks

@@ -120,19 +120,18 @@ class MegatronLocal(InferenceServer, ReturnsTokens, ReturnsRaw):
 
     async def kill(self):
         if dist.get_rank() == 0:
-            await self._client.pause_engines()
+            self._client.pause_engines()
         await self._inference_engine.paused.wait()
 
         if dist.get_rank() == 0:
             self._client.stop_engines()
         await self._inference_engine.stopped.wait()
-
         if dist.get_rank() == 0:
             self._client.stop()
 
     async def suspend(self):
         if dist.get_rank() == 0:
-            await self._client.pause_engines()
+            self._client.pause_engines()
         await self._inference_engine.paused.wait()
 
         if dist.get_rank() == 0:
@@ -145,8 +144,5 @@ class MegatronLocal(InferenceServer, ReturnsTokens, ReturnsRaw):
 
         if dist.get_rank() == 0:
             self._client.resume_engines()
-        await self._inference_engine.paused.wait()
-
-        if dist.get_rank() == 0:
             self._client.unpause_engines()
         await self._inference_engine.running.wait()

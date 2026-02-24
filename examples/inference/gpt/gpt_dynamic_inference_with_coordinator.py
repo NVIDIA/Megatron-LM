@@ -175,11 +175,13 @@ async def main(
         # kill the engines and suspend the client
         # Right now, we can only call stop when all requests are done.
         # Todo: Make this explicit in the Client class....
-        await client.stop_engines()
-        client.stop()
+        client.stop_engines()
 
     # once the stop signal eventually makes its way to each GPU, the engines will stop.
     await asyncio.gather(engine.engine_loop_task)
+
+    if dist.get_rank() == 0:
+        client.stop()
     logging.info(f"Rank: {dist.get_rank()} stopped their engine instance successfully.")
 
 
