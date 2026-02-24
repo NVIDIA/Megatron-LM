@@ -1,5 +1,6 @@
 # Copyright (c) 2024, NVIDIA CORPORATION. All rights reserved.
 
+import operator
 from unittest.mock import patch
 
 import pytest
@@ -10,6 +11,7 @@ from megatron.core.ssm.mamba_hybrid_layer_allocation import (
     get_hybrid_layer_counts,
     get_hybrid_total_layer_count,
     get_hybrid_total_pipeline_segment_count,
+    get_layer_maps_from_layer_type_list,
     parse_hybrid_pattern,
     pattern_from_ratios,
     select_pipeline_segment,
@@ -75,6 +77,7 @@ class TestValidateSegmentLayers:
             ("", []),
             ("GGG*GGG*", ['G', 'G', 'G', '*', 'G', 'G', 'G', '*']),
             ("GEGEGE*E", ['G', 'E', 'G', 'E', 'G', 'E', '*', 'E']),
+            ("MDMD", ['M', 'D', 'M', 'D']),
         ]
         for pattern, expected in test_cases:
             result = validate_segment_layers(pattern)
@@ -95,6 +98,9 @@ class TestValidateSegmentLayers:
             validate_segment_layers("M|M")  # pipe not valid in a segment
         with pytest.raises(ValueError):
             validate_segment_layers("M/M")  # MTP separator not valid in a segment
+        with pytest.raises(ValueError):
+            # Not allowed to have both standard Attention and MLA/DSA
+            validate_segment_layers("MDM*-")
 
 
 @pytest.mark.internal
@@ -155,6 +161,8 @@ class TestParseHybridPattern:
             ("E", "E"),
             ("GGG*GGG*", "GGG*GGG*"),
             ("GEGEGE*E", "GEGEGE*E"),
+            ("MDMD", "MDMD"),
+            ("DM", "DM"),
         ]
         for pattern, expected_main in test_cases:
             result = parse_hybrid_pattern(pattern)
@@ -277,6 +285,8 @@ class TestParseHybridPattern:
             ("MEME/MM/MM", "MEME", "MM", 2),
             # GDN+MoE main pattern with GDN MTP
             ("GEGEGE*E/GG/GG", "GEGEGE*E", "GG", 2),
+            # DSA in main pattern with MTP
+            ("MDMD/MD/MD", "MDMD", "MD", 2),
         ]
         for pattern, expected_main, expected_mtp, expected_depths in test_cases:
             result = parse_hybrid_pattern(pattern)
@@ -295,47 +305,74 @@ class TestParseHybridPattern:
 class TestGetHybridLayerCounts:
 
     def test_simple_pattern(self):
-        assert get_hybrid_layer_counts("M*M*") == {'M': 2, 'G': 0, '*': 2, '-': 0, 'E': 0}
+        assert get_hybrid_layer_counts("M*M*") == {'*': 2, 'D': 0, 'G': 0, 'M': 2, '-': 0, 'E': 0}
 
     def test_all_layer_types(self):
-        assert get_hybrid_layer_counts("MG*-E") == {'M': 1, 'G': 1, '*': 1, '-': 1, 'E': 1}
+        # Not allowed to have both standard Attention and MLA/DSA, so we do separate asserts.
+        assert get_hybrid_layer_counts("MG*-E") == {'*': 1, 'D': 0, 'G': 1, 'M': 1, '-': 1, 'E': 1}
+        assert get_hybrid_layer_counts("MGD-E") == {'*': 0, 'D': 1, 'G': 1, 'M': 1, '-': 1, 'E': 1}
 
     def test_with_pipes(self):
         # Pipes should be skipped in counting
-        assert get_hybrid_layer_counts("M*|M*") == {'M': 2, 'G': 0, '*': 2, '-': 0, 'E': 0}
-        assert get_hybrid_layer_counts("M-M-|M-M*-") == {'M': 4, 'G': 0, '*': 1, '-': 4, 'E': 0}
+        assert get_hybrid_layer_counts("M*|M*") == {'*': 2, 'D': 0, 'G': 0, 'M': 2, '-': 0, 'E': 0}
+        assert get_hybrid_layer_counts("M-M-|M-M*-") == {
+            '*': 1,
+            'D': 0,
+            'G': 0,
+            'M': 4,
+            '-': 4,
+            'E': 0,
+        }
 
     def test_with_mtp(self):
         # MTP pattern "MM" repeated 2 depths -> 4 extra mamba layers
-        assert get_hybrid_layer_counts("M*M*/MM/MM") == {'M': 6, 'G': 0, '*': 2, '-': 0, 'E': 0}
+        assert get_hybrid_layer_counts("M*M*/MM/MM") == {
+            '*': 2,
+            'D': 0,
+            'G': 0,
+            'M': 6,
+            '-': 0,
+            'E': 0,
+        }
 
     def test_with_pipes_and_mtp(self):
         # Main: M-M-|M-M*- -> 1 attn, 4 mamba, 4 mlp
         # MTP: MM x 2 depths -> +4 mamba
         assert get_hybrid_layer_counts("M-M-|M-M*-/MM/MM") == {
-            'M': 8,
-            'G': 0,
             '*': 1,
+            'D': 0,
+            'G': 0,
+            'M': 8,
             '-': 4,
             'E': 0,
         }
 
     def test_moe_pattern(self):
-        assert get_hybrid_layer_counts("MEME") == {'M': 2, 'G': 0, '*': 0, '-': 0, 'E': 2}
+        assert get_hybrid_layer_counts("MEME") == {'*': 0, 'D': 0, 'G': 0, 'M': 2, '-': 0, 'E': 2}
 
     def test_mtp_with_attention(self):
         # MTP pattern "*M" repeated 3 depths -> 3 attn + 3 mamba from MTP
-        assert get_hybrid_layer_counts("MMMM/*M/*M/*M") == {'M': 7, 'G': 0, '*': 3, '-': 0, 'E': 0}
-
-    def test_empty_pattern(self):
-        assert get_hybrid_layer_counts("") == {'M': 0, 'G': 0, '*': 0, '-': 0, 'E': 0}
+        assert get_hybrid_layer_counts("MMMM/*M/*M/*M") == {
+            '*': 3,
+            'D': 0,
+            'G': 0,
+            'M': 7,
+            '-': 0,
+            'E': 0,
+        }
 
     def test_gdn_pattern(self):
-        assert get_hybrid_layer_counts("GMGM") == {'M': 2, 'G': 2, '*': 0, '-': 0, 'E': 0}
+        assert get_hybrid_layer_counts("GMGM") == {'*': 0, 'D': 0, 'G': 2, 'M': 2, '-': 0, 'E': 0}
 
     def test_gdn_hybrid_pattern(self):
         # GDN + Mamba + Attention
-        assert get_hybrid_layer_counts("G*GM*") == {'M': 1, 'G': 2, '*': 2, '-': 0, 'E': 0}
+        assert get_hybrid_layer_counts("G*GM*") == {'*': 2, 'D': 0, 'G': 2, 'M': 1, '-': 0, 'E': 0}
+
+    def test_dsa_pattern(self):
+        assert get_hybrid_layer_counts("DMDM") == {'*': 0, 'D': 2, 'G': 0, 'M': 2, '-': 0, 'E': 0}
+
+    def test_empty_pattern(self):
+        assert get_hybrid_layer_counts("") == {'*': 0, 'D': 0, 'G': 0, 'M': 0, '-': 0, 'E': 0}
 
 
 @pytest.mark.internal
@@ -596,3 +633,56 @@ class TestSelectPipelineSegmentLegacyFallback:
             assert offset == len(all_layers)
             all_layers.extend(layers)
         assert all_layers == ['M', '*', 'M', '*', 'M', '*']
+
+
+@pytest.mark.internal
+class TestGetLayerMapsFromLayerTypeList:
+    """Tests for get_layer_maps_from_layer_type_list."""
+
+    def test_standard_layer_types(self):
+        """Standard symbols each produce a single-entry map at local index 0."""
+        maps = get_layer_maps_from_layer_type_list(["*", "M", "-", "E"])
+        # We always get all symbols returned, not only those contained in the pattern.
+        assert len(maps) == 6
+        attention_map, mamba_map, mlp_map, moe_map = operator.itemgetter(
+            Symbols.ATTENTION, Symbols.MAMBA, Symbols.MLP, Symbols.MOE
+        )(maps)
+        assert attention_map == {0: 0}
+        assert mamba_map == {1: 0}
+        assert mlp_map == {2: 0}
+        assert moe_map == {3: 0}
+
+    def test_dsa(self):
+        """D (DSA) layers are treated as separate layers for KV cache mapping."""
+        maps = get_layer_maps_from_layer_type_list(["D", "M", "D", "M"])
+        attention_map, dsa_map, mamba_map, mlp_map, moe_map = operator.itemgetter(
+            Symbols.ATTENTION, Symbols.DS_ATTENTION, Symbols.MAMBA, Symbols.MLP, Symbols.MOE
+        )(maps)
+        assert attention_map == {}
+        assert dsa_map == {0: 0, 2: 1}
+        assert mamba_map == {1: 0, 3: 1}
+        assert mlp_map == {}
+        assert moe_map == {}
+
+    def test_mixed_attention_and_dsa(self):
+        """Both * and D contribute to the different maps with non-consecutive local indices."""
+        maps = get_layer_maps_from_layer_type_list(["*", "D", "M", "-"])
+        attention_map, dsa_map, mamba_map, mlp_map, moe_map = operator.itemgetter(
+            Symbols.ATTENTION, Symbols.DS_ATTENTION, Symbols.MAMBA, Symbols.MLP, Symbols.MOE
+        )(maps)
+        assert attention_map == {0: 0}
+        assert dsa_map == {1: 0}
+        assert mamba_map == {2: 0}
+        assert mlp_map == {3: 0}
+        assert moe_map == {}
+
+    def test_all_mamba(self):
+        """All-mamba pattern leaves attention, mlp, and moe maps empty."""
+        maps = get_layer_maps_from_layer_type_list(["M", "M", "M"])
+        attention_map, mamba_map, mlp_map, moe_map = operator.itemgetter(
+            Symbols.ATTENTION, Symbols.MAMBA, Symbols.MLP, Symbols.MOE
+        )(maps)
+        assert attention_map == {}
+        assert mamba_map == {0: 0, 1: 1, 2: 2}
+        assert mlp_map == {}
+        assert moe_map == {}
