@@ -11,12 +11,16 @@ import random
 import sys
 import warnings
 
-import modelopt.torch.quantization as mtq
 import torch
 import torch.distributed
+from tqdm import tqdm
+
+# NOTE: Needs to be before modelopt imports in case megatron.core is not installed.
+sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "../../../")))
+
+import modelopt.torch.quantization as mtq
 from modelopt.torch.export import import_mcore_gpt_from_hf
 from modelopt.torch.utils.dataset_utils import get_dataset_dataloader
-from tqdm import tqdm
 
 try:
     import modelopt.torch.quantization.plugins.psx_formats as mtq_psx
@@ -30,8 +34,6 @@ try:
 except ImportError:
     mtq_luts = None
     warnings.warn("luts is not installed. LUTs quantization configs will not be available.")
-
-sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "../../../")))
 
 from megatron.core.utils import get_batch_on_this_cp_rank
 from megatron.post_training.arguments import add_modelopt_args
