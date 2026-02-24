@@ -35,8 +35,9 @@ def _verify_te_to_flashinfer_mxfp8_conversion(te_dequantized, fi_quantized: MXFP
 
     fi_block = fi_data_e4m3 * fi_scale_f32
 
-    diff_norm = torch.norm(te_block - fi_block)
-    assert diff_norm < 1e-4, f"MXFP8 sanity check failed. Diff norm: {diff_norm}"
+    if not torch.allclose(te_block, fi_block):
+        diff_norm = torch.norm(te_block - fi_block)
+        raise ValueError(f"MXFP8 sanity check failed. Diff norm: {diff_norm}")
 
 
 def quantize_model_to_mxfp8(model: torch.nn.Module) -> None:
