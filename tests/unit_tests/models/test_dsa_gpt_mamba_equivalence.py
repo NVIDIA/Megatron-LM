@@ -85,6 +85,9 @@ _BATCH_SIZE = 2
 _NUM_GPT_LAYERS = 4
 _MAMBA_PATTERN = "S-S-S-S-"  # len=8 = 2 * _NUM_GPT_LAYERS
 
+# MoE variant: first 2 GPT layers dense, last 2 MoE → 8 Mamba layers
+_MOE_MAMBA_PATTERN = "S-S-SESE"  # 2 dense (S-) + 2 MoE (SE)
+
 
 # ---------------------------------------------------------------------------
 # Model construction helpers
@@ -117,6 +120,49 @@ def _make_dsa_config(num_layers: int, tp: int = 1) -> MLATransformerConfig:
         hidden_dropout=0.0,
         attention_dropout=0.0,
         tensor_model_parallel_size=tp,
+    )
+
+
+def _make_dsa_moe_config(num_layers: int, tp: int = 1) -> MLATransformerConfig:
+    """Return a small DeepSeek-V3 proxy MLATransformerConfig with MoE layers.
+
+    Mirrors the DeepSeek-V3 pattern: first 2 GPT layers are dense, last 2 are MoE.
+    ``moe_layer_freq=[0, 0, 1, 1]`` controls which GPT layers become MoE layers.
+    """
+    return MLATransformerConfig(
+        num_layers=num_layers,
+        hidden_size=256,
+        num_attention_heads=16,
+        q_lora_rank=64,
+        kv_lora_rank=64,
+        qk_head_dim=64,
+        qk_pos_emb_head_dim=32,
+        v_head_dim=64,
+        dsa_indexer_n_heads=8,
+        dsa_indexer_head_dim=64,
+        dsa_indexer_topk=32,
+        normalization="RMSNorm",
+        bf16=True,
+        params_dtype=torch.bfloat16,
+        add_bias_linear=False,
+        use_cpu_initialization=True,
+        rope_type='rope',
+        rotary_base=10000,
+        rotary_percent=1.0,
+        experimental_attention_variant="dsa",
+        hidden_dropout=0.0,
+        attention_dropout=0.0,
+        tensor_model_parallel_size=tp,
+        # MoE fields
+        num_moe_experts=4,
+        moe_router_topk=2,
+        moe_grouped_gemm=True,
+        moe_token_dispatcher_type="allgather",
+        moe_router_load_balancing_type="aux_loss",
+        moe_aux_loss_coeff=0.0,
+        moe_ffn_hidden_size=512,
+        moe_shared_expert_intermediate_size=512,
+        moe_layer_freq=[0, 0, 1, 1],  # first 2 layers dense, last 2 MoE
     )
 
 
@@ -233,12 +279,17 @@ def _remap_gpt_to_mamba_state_dict(
         elif rest.startswith("mlp."):
             # MLP sub-module → MLP layer 2N+1
             mamba_sd[f"{layer_prefix}{2 * layer_n + 1}.{rest}"] = value
+        elif rest.startswith("pre_mlp_layernorm."):
+            # pre_mlp_layernorm → MoE layer 2N+1 (MoETransformerLayer has TENorm)
+            # Dense layers use IdentityOp for pre_mlp_layernorm (no state dict keys),
+            # so this branch only fires for MoE layers.
+            mamba_sd[f"{layer_prefix}{2 * layer_n + 1}.{rest}"] = value
         else:
-            # pre_mlp_layernorm is IdentityOp (no weights); self_attn_bda / mlp_bda
-            # are callables (no weights). Anything else is unexpected.
+            # self_attn_bda / mlp_bda are callables (no weights).
+            # Anything else is unexpected.
             raise ValueError(
                 f"Unexpected sub-key '{rest}' in GPT layer {layer_n} (full key='{key}'). "
-                "Expected: input_layernorm.*, self_attention.*, mlp.*"
+                "Expected: input_layernorm.*, self_attention.*, pre_mlp_layernorm.*, mlp.*"
             )
 
     return mamba_sd
@@ -486,6 +537,138 @@ class TestDSAGPTMambaEquivalence:
 
         # Save golden values recorded from GPTModel
         golden_dir = _GOLDEN_BASE / "hybrid_dsa_mamba_logitsmatch_tp1_pp1"
+        golden_path = golden_dir / "golden_values_dev_dgx_h100.json"
+        _save_golden_values(gpt_logprobs, golden_path)
+
+        # Verify MambaModel matches golden values
+        _compare_against_golden_values(mamba_logprobs, golden_path, abs_tol=1e-3)
+
+
+# ---------------------------------------------------------------------------
+# MoE test class
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+@pytest.mark.parametrize("tp,pp", [(1, 1), (2, 1), (1, 2)])
+class TestDSAMoEGPTMambaEquivalence:
+    """Verify logprob equivalence between GPTModel+DSA+MoE and MambaModel+DSA+MoE.
+
+    Architecture: 4 GPT layers with moe_layer_freq=[0,0,1,1] (first 2 dense, last 2 MoE)
+    maps to 8 Mamba layers with pattern "S-S-SESE":
+      GPT layer 0 (dense) → Mamba layers 0 (S) + 1 (-)
+      GPT layer 1 (dense) → Mamba layers 2 (S) + 3 (-)
+      GPT layer 2 (MoE)   → Mamba layers 4 (S) + 5 (E)
+      GPT layer 3 (MoE)   → Mamba layers 6 (S) + 7 (E)
+    """
+
+    def teardown_method(self, method):
+        Utils.destroy_model_parallel()
+
+    def _skip_if_insufficient_gpus(self, tp: int, pp: int) -> None:
+        world_size = int(os.environ.get('WORLD_SIZE', '1'))
+        required = tp * pp
+        if world_size < required:
+            pytest.skip(
+                f"Test tp={tp} pp={pp} requires {required} GPU(s), "
+                f"but WORLD_SIZE={world_size}"
+            )
+
+    def test_dsa_moe_logprobs_match(self, tp: int, pp: int) -> None:
+        """Build both models with MoE, transfer weights, compare logprobs."""
+        self._skip_if_insufficient_gpus(tp, pp)
+        Utils.initialize_model_parallel(tp, pp)
+        model_parallel_cuda_manual_seed(42)
+
+        pre_process = mpu.is_pipeline_first_stage()
+        post_process = mpu.is_pipeline_last_stage()
+
+        # ---- Build GPTModel with MoE ----
+        gpt_config = _make_dsa_moe_config(num_layers=_NUM_GPT_LAYERS, tp=tp)
+        gpt_model = _build_gpt_model(gpt_config, pre_process=pre_process, post_process=post_process)
+        num_local_gpt_layers = len(gpt_model.decoder.layers)
+        gpt_sd = gpt_model.state_dict()
+
+        # ---- Build MambaModel with MoE pattern ----
+        mamba_model = _build_mamba_model(
+            gpt_config, _MOE_MAMBA_PATTERN, pre_process=pre_process, post_process=post_process
+        )
+
+        # ---- Remap GPT weights → Mamba (includes pre_mlp_layernorm.* for MoE layers) ----
+        mamba_sd = _remap_gpt_to_mamba_state_dict(gpt_sd, num_local_gpt_layers)
+        missing, unexpected = mamba_model.load_state_dict(mamba_sd, strict=True)
+        assert not missing, f"Missing keys after weight remap: {missing}"
+        assert not unexpected, f"Unexpected keys after weight remap: {unexpected}"
+
+        # ---- Create identical inputs on all ranks ----
+        torch.manual_seed(99)
+        tokens = torch.randint(0, _VOCAB_SIZE, (_BATCH_SIZE, _SEQ_LEN), device='cuda')
+
+        # ---- Forward pass ----
+        if pp == 1:
+            gpt_logprobs = _forward_logprobs_pp1(gpt_model, tokens)
+            mamba_logprobs = _forward_logprobs_pp1(mamba_model, tokens)
+            torch.testing.assert_close(
+                gpt_logprobs, mamba_logprobs, atol=1e-5, rtol=1e-5,
+                msg=f"MoE logprob mismatch for tp={tp} pp={pp}",
+            )
+        else:
+            gpt_logprobs = _forward_logprobs_pp2(gpt_model, tokens)
+            mamba_logprobs = _forward_logprobs_pp2(mamba_model, tokens)
+            if post_process:
+                torch.testing.assert_close(
+                    gpt_logprobs, mamba_logprobs, atol=1e-5, rtol=1e-5,
+                    msg=f"MoE logprob mismatch for tp={tp} pp={pp}",
+                )
+
+    def test_moe_weight_loading_strict(self, tp: int, pp: int) -> None:
+        """Verify that strict=True weight loading succeeds with MoE keys."""
+        self._skip_if_insufficient_gpus(tp, pp)
+        Utils.initialize_model_parallel(tp, pp)
+        model_parallel_cuda_manual_seed(42)
+
+        pre_process = mpu.is_pipeline_first_stage()
+        post_process = mpu.is_pipeline_last_stage()
+
+        gpt_config = _make_dsa_moe_config(num_layers=_NUM_GPT_LAYERS, tp=tp)
+        gpt_model = _build_gpt_model(gpt_config, pre_process=pre_process, post_process=post_process)
+        mamba_model = _build_mamba_model(
+            gpt_config, _MOE_MAMBA_PATTERN, pre_process=pre_process, post_process=post_process
+        )
+
+        gpt_sd = gpt_model.state_dict()
+        num_local_gpt_layers = len(gpt_model.decoder.layers)
+        mamba_sd = _remap_gpt_to_mamba_state_dict(gpt_sd, num_local_gpt_layers)
+        missing, unexpected = mamba_model.load_state_dict(mamba_sd, strict=True)
+
+        assert not missing, f"Missing keys: {missing}"
+        assert not unexpected, f"Unexpected keys: {unexpected}"
+
+    def test_moe_record_and_compare_golden_values(self, tp: int, pp: int) -> None:
+        """Record GPTModel+MoE logprobs as golden values, then compare MambaModel+MoE."""
+        self._skip_if_insufficient_gpus(tp, pp)
+        if tp != 1 or pp != 1:
+            pytest.skip("Golden-value recording only runs for tp=1, pp=1")
+
+        Utils.initialize_model_parallel(1, 1)
+        model_parallel_cuda_manual_seed(42)
+
+        gpt_config = _make_dsa_moe_config(num_layers=_NUM_GPT_LAYERS, tp=1)
+        gpt_model = _build_gpt_model(gpt_config)
+        mamba_model = _build_mamba_model(gpt_config, _MOE_MAMBA_PATTERN)
+
+        gpt_sd = gpt_model.state_dict()
+        mamba_sd = _remap_gpt_to_mamba_state_dict(gpt_sd, len(gpt_model.decoder.layers))
+        mamba_model.load_state_dict(mamba_sd, strict=True)
+
+        torch.manual_seed(99)
+        tokens = torch.randint(0, _VOCAB_SIZE, (_BATCH_SIZE, _SEQ_LEN), device='cuda')
+
+        gpt_logprobs = _forward_logprobs_pp1(gpt_model, tokens)
+        mamba_logprobs = _forward_logprobs_pp1(mamba_model, tokens)
+
+        # Save golden values recorded from GPTModel
+        golden_dir = _GOLDEN_BASE / "hybrid_dsa_moe_mamba_logitsmatch_tp1_pp1"
         golden_path = golden_dir / "golden_values_dev_dgx_h100.json"
         _save_golden_values(gpt_logprobs, golden_path)
 

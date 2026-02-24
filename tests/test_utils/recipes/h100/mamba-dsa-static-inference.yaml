@@ -65,3 +65,13 @@ products:
       - environment: [dev]
         scope: [mr-broken, mr-github-broken]
         platforms: [dgx_h100]
+  - test_case: [hybrid_dsa_moe_mamba_logitsmatch_tp1_pp1]
+    products:
+      - environment: [dev]
+        scope: [mr-broken, mr-github-broken]
+        platforms: [dgx_h100]
+  - test_case: [hybrid_dsa_moe_mamba_logitsmatch_tp2_pp1]
+    products:
+      - environment: [dev]
+        scope: [mr-broken, mr-github-broken]
+        platforms: [dgx_h100]
