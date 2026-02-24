@@ -1678,33 +1678,50 @@ class DynamicInferenceEngine(AbstractEngine):
 
         return len(all_messages)
 
-    def shutdown(self, immediate: bool = False):
-        """Shuts down the engine.
+    async def shutdown(self, immediate: bool = False):
+        """Shut down the engine, draining EP collectives first.
+
+        Injects PAUSE + STOP signals into the engine loop if it is available.
 
         Args:
-            immediate (bool): If True, forcibly terminates the engine ungracefully.
+            immediate: Also terminate the coordinator process.
         """
+        task = getattr(self, 'engine_loop_task', None)
+
+        if task is None or task.done() or task is asyncio.current_task():
+            # No running loop, or called from the loop's own finally block.
+            sock = getattr(self, 'socket_for_receiving_requests', None)
+            if sock is not None and not sock.closed:
+                try:
+                    sock.send(msgpack.packb([Headers.DISCONNECT.value], use_bin_type=True))
+                except Exception:
+                    pass
+            for socket in getattr(self, 'zmq_sockets', []):
+                socket.close()
+            if hasattr(self, 'zmq_sockets'):
+                self.zmq_sockets.clear()
+            if hasattr(self, "expert_parallel_zmq_communicator"):
+                self.expert_parallel_zmq_communicator.close()
+            if hasattr(self, "data_parallel_zmq_communicator"):
+                self.data_parallel_zmq_communicator.close()
+            if not self.zmq_context.closed:
+                self.zmq_context.term()
+            return
+
+        if self.state == EngineState.RUNNING:
+            self._pending_signals.append(
+                msgpack.packb([Headers.PAUSE.value], use_bin_type=True)
+            )
+        if self.state not in (EngineState.STOPPING, EngineState.STOPPED):
+            await self.paused.wait()
+            self._pending_signals.append(
+                msgpack.packb([Headers.STOP.value], use_bin_type=True)
+            )
+        await task
+
         if immediate and hasattr(self, "inference_coordinator_process"):
             self.inference_coordinator_process.terminate()
             self.inference_coordinator_process.join()
-
-        # Notify coordinator before closing the DEALER socket.
-        sock = getattr(self, 'socket_for_receiving_requests', None)
-        if sock is not None and not sock.closed:
-            try:
-                sock.send(msgpack.packb([Headers.DISCONNECT.value], use_bin_type=True))
-            except Exception:
-                pass  # Best-effort; socket may already be unusable.
-        for socket in getattr(self, 'zmq_sockets', []):
-            socket.close()
-        if hasattr(self, 'zmq_sockets'):
-            self.zmq_sockets.clear()
-        if hasattr(self, "expert_parallel_zmq_communicator"):
-            self.expert_parallel_zmq_communicator.close()
-        if hasattr(self, "data_parallel_zmq_communicator"):
-            self.data_parallel_zmq_communicator.close()
-        if not self.zmq_context.closed:
-            self.zmq_context.term()
 
     @trace_async_exceptions
     async def run_engine(self, *, loop: Optional[asyncio.AbstractEventLoop] = None):
@@ -1842,7 +1859,5 @@ class DynamicInferenceEngine(AbstractEngine):
                         logging.info("Stopping engine.")
                     break
 
-        except asyncio.CancelledError:
-            pass
         finally:
-            self.shutdown()
+            await self.shutdown()

@@ -198,13 +198,9 @@ class DummyEngine(DynamicInferenceEngine):
 async def graceful_shutdown(engine, client=None, *, timeout=10.0):
     """PAUSE then STOP the coordinator test stack.
 
-    Handles the engine being in RUNNING (sends PAUSE first) or already
-    PAUSED (skips straight to STOP).  Duplicate PAUSE is now safe
-    (coordinator and engine are both idempotent), but this helper still
-    checks engine.state to avoid unnecessary round-trips.
-
-    client.stop() is deferred until after the engine has stopped so the
-    DEALER socket stays alive for ZMQ message delivery.
+    First tries the coordinator-driven path (client sends PAUSE then STOP).
+    On timeout, falls back to engine.shutdown(immediate=True) which injects
+    synthetic PAUSE + STOP signals and drains EP collectives directly.
 
     Args:
         engine: DummyEngine whose engine_loop_task to await.
@@ -213,38 +209,20 @@ async def graceful_shutdown(engine, client=None, *, timeout=10.0):
     """
     try:
         if client is not None:
-            # Only PAUSE if the engine is still RUNNING.  If it's already
-            # PAUSED (e.g. the test paused it), skip straight to STOP.
             if engine.state == EngineState.RUNNING:
                 await asyncio.wait_for(client.pause_engines(), timeout=timeout)
             client.stop_engines()
-        # All ranks wait for the engine to reach STOPPED.
         await asyncio.wait_for(engine.stopped.wait(), timeout=timeout)
     except asyncio.TimeoutError:
-        engine.engine_loop_task.cancel()
-        try:
-            await engine.engine_loop_task
-        except (asyncio.CancelledError, AssertionError):
-            pass
+        await engine.shutdown(immediate=True)
     finally:
-        # Engine loop's finally block already called shutdown().
-        # On the timeout path the coordinator may still be alive.
-        engine.shutdown(immediate=True)
         if client is not None:
             client.stop()
 
 
 async def force_cleanup_engine(engine):
     """Emergency cleanup when the engine did not shut down cleanly."""
-    if hasattr(engine, 'engine_loop_task') and not engine.engine_loop_task.done():
-        engine.engine_loop_task.cancel()
-        try:
-            await engine.engine_loop_task
-        except (asyncio.CancelledError, AssertionError):
-            pass
-    # Engine loop's finally block calls shutdown() on cancel.
-    # The coordinator may still be alive — terminate it.
-    engine.shutdown(immediate=True)
+    await engine.shutdown(immediate=True)
 
 
 @pytest.fixture
@@ -363,12 +341,8 @@ class TestCoordinator:
                 for record in results:
                     assert record[-1].status == Status.COMPLETED
 
-            # Kill the engine unexpectedly.
-            engine1.engine_loop_task.cancel()
-            try:
-                await engine1.engine_loop_task
-            except asyncio.CancelledError:
-                pass
+            # Disconnect the engine (simulates unexpected departure).
+            await engine1.shutdown(immediate=True)
 
             # Re-register a new engine.
             engine2 = DummyEngine()
@@ -386,12 +360,8 @@ class TestCoordinator:
                 for record in results:
                     assert record[-1].status == Status.COMPLETED
 
-            # Kill the engine unexpectedly.
-            engine2.engine_loop_task.cancel()
-            try:
-                await engine2.engine_loop_task
-            except asyncio.CancelledError:
-                pass
+            # Disconnect the engine (simulates unexpected departure).
+            await engine2.shutdown(immediate=True)
             # Stop the client.
             if client1 is not None:
                 client1.stop()
@@ -419,7 +389,7 @@ class TestCoordinator:
                 await graceful_shutdown(engine3, client3, timeout=30.0)
 
             # Terminate engine1's orphaned coordinator process directly.
-            engine1.shutdown(immediate=True)
+            await engine1.shutdown(immediate=True)
 
     @pytest.mark.internal
     @pytest.mark.skipif(not HAVE_ZMQ, reason="pyzmq is required for this test")
