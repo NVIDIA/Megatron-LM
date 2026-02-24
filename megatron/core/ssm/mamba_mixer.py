@@ -443,18 +443,25 @@ class MambaMixer(MegatronModule):
         y_decode = None
         y_prefill = None
             
+        """
         if self.layer_number == 1:
             torch.distributed.breakpoint(0)
+        """
 
         # Decode
         if decode_req_count > 0:
             # For mixed batch, the decode tokens are at the start of zxBCdt
             zxBCdt_decode = zxBCdt[:decode_req_count] if prefill_req_count > 0 else zxBCdt
 
-            num_accepted_tokens = context.mamba_metadata.num_accepted_tokens
-            intermediate_conv_state, intermediate_ssm_state = context.mamba_states_cache(
-                self.layer_number - self.pp_layer_offset, intermediate=True
-            )
+            if context.num_speculative_tokens > 0:
+                num_accepted_tokens = context.mamba_metadata.num_accepted_tokens
+                intermediate_conv_state, intermediate_ssm_state = context.mamba_states_cache(
+                    self.layer_number - self.pp_layer_offset, intermediate=True
+                )
+            else:
+                num_accepted_tokens = None
+                intermediate_conv_state = None
+                intermediate_ssm_state = None
 
             y_decode = self._ssm_decode(
                 zxBCdt_decode.transpose(0, 1),
@@ -462,7 +469,7 @@ class MambaMixer(MegatronModule):
                 ssm_state,
                 context.mamba_metadata.batch_indices_decode,
                 num_accepted_tokens=num_accepted_tokens,
-                intermediate_conv_window=intermediate_conv_state,
+                intermediate_conv_state=intermediate_conv_state,
                 intermediate_ssm_state=intermediate_ssm_state,
             ).transpose(0, 1)
 
@@ -908,7 +915,7 @@ class MambaMixer(MegatronModule):
         if seq_len > 1:
             assert (
                 num_accepted_tokens is not None
-                and intermediate_conv_window is not None
+                and intermediate_conv_state is not None
                 and intermediate_ssm_state is not None
             ), "Decoding with > 1 token per request requires speculative decoding state"
             is_speculative_decoding = True
@@ -948,7 +955,7 @@ class MambaMixer(MegatronModule):
                 self.activation,
                 conv_state_indices=batch_indices,
                 num_accepted_tokens=num_accepted_tokens,
-                intermediate_conv_window=intermediate_conv_window,
+                intermediate_conv_window=intermediate_conv_state,
                 intermediate_state_indices=batch_indices,
                 pad_slot_id=-1,
             )
@@ -1015,7 +1022,7 @@ class MambaMixer(MegatronModule):
             A = repeat(A, "h -> h p n", p=self.headdim, n=self.d_state).to(dtype=torch.float32)
             dt_bias = repeat(self.dt_bias, "h -> h p", p=self.headdim)
             D = repeat(self.D, "h -> h p", p=self.headdim)
-            if is_speculative_deocode:
+            if is_speculative_decoding:
                 dt = repeat(dt, "s b h -> s b h p", p=self.headdim)
                 B = rearrange(B, "s b (g n) -> s b g n", g=self.ngroups_local_tp)
                 C = rearrange(C, "s b (g n) -> s b g n", g=self.ngroups_local_tp)
@@ -1035,7 +1042,8 @@ class MambaMixer(MegatronModule):
             if batch_indices is not None:
                 batch_indices = batch_indices.to(torch.int64)
 
-            y = selective_state_update(
+            y = torch.empty_like(x_reshaped)
+            selective_state_update(
                 ssm_state,
                 x_reshaped,
                 dt,
@@ -1047,12 +1055,14 @@ class MambaMixer(MegatronModule):
                 dt_bias=dt_bias,
                 dt_softplus=True,
                 state_batch_indices=batch_indices,
-                disable_state_update=True,
-                intermediate_states_buffer=intermediate_ssm_state,
-                cache_steps=seq_len,
-                intermediate_state_indices=batch_indices,
+                pad_slot_id=-1,
+                out=y,
+                #disable_state_update=True,
+                #intermediate_states_buffer=intermediate_ssm_state,
+                #cache_steps=seq_len,
+                #intermediate_state_indices=batch_indices,
             )
-            if is_speculative_decode:
+            if is_speculative_decoding:
                 y = rearrange(y, "s b h p -> s b (h p)")
             else:
                 y = rearrange(y, "b h p -> b (h p)")
