@@ -845,10 +845,7 @@ class TextGenerationController:
             return self.inference_wrapped_model.dummy_forward()
 
         # attempt to use cuda-graph if possible
-        # here we try to reuse the cuda-graph warmup code to run
-        # a dummy cuda graph.
         input_ids, position_ids = self._dynamic_step_context_init(
-            # try to use the smallest cuda-graph config for dummy forward
             is_dummy_forward=True
         )
 
@@ -862,6 +859,8 @@ class TextGenerationController:
         else:
             # fallback to eager dummy forward
             self.inference_wrapped_model.dummy_forward()
+            
+        # clear the context of any temporary state from the dummy forward
         context.reset()
 
     def _dynamic_step_context_bookkeeping(self) -> Dict[str, Tensor]:

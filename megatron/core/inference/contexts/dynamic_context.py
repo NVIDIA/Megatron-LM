@@ -1326,9 +1326,8 @@ class DynamicInferenceContext(BaseInferenceContext):
         # If in CUDA graph creation mode, add dummy requests for CUDA graph capture
         if is_expert_parallel_dummy_cuda_graph_step:
             self.add_dummy_requests_for_expert_parallel_step()
-        else:
-            if self.is_creating_cuda_graphs:
-                self.add_dummy_requests_for_cudagraph_capture(construct_graph_dimensions)
+        elif self.is_creating_cuda_graphs:
+            self.add_dummy_requests_for_cudagraph_capture(construct_graph_dimensions)
 
         batch_dimensions = InferenceBatchDimensions(
             token_count=self.active_token_count,
