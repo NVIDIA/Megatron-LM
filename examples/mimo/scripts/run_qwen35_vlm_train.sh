@@ -119,16 +119,12 @@ TOKENIZER_ARGS=(
 # --- Dataset ---
 if [ "$DATASET_PATH" = "mock" ]; then
     DATASET_ARGS=(
-        --dataset-provider mock
+        --dataset-provider qwen35_mock
         --image-token-id 248056
     )
 else
-    DATASET_ARGS=(
-        --dataloader-type external
-        --dataset-provider qwen35_vlm
-        --data-path "$DATASET_PATH"
-        --image-token-id 248056
-    )
+    echo "ERROR: Real dataset is not supported yet. Only mock dataset is available." >&2
+    exit 1
 fi
 
 # --- Qwen3-Next Decoder Architecture ---
@@ -181,8 +177,7 @@ GPT_MODEL_ARGS=(
     --moe-shared-expert-gate
     --moe-router-load-balancing-type aux_loss
     --moe-router-topk 10
-    --moe-router-pre-softmax false
-    --moe-grouped-gemm true
+    --moe-grouped-gemm
     --moe-aux-loss-coeff 1e-3
     --moe-token-dispatcher-type flex
     --moe-router-dtype fp32
