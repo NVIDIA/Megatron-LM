@@ -19,9 +19,10 @@ def tms_mem_summary() -> str:
         segs = torch.cuda.memory_snapshot(include_traces=False)
     except TypeError:
         segs = torch.cuda.memory_snapshot()
-    M = 1024 ** 2
+    M = 1024**2
     private = sum(
-        s.get("active_size", 0) for s in segs
+        s.get("active_size", 0)
+        for s in segs
         if s.get("device", dev) == dev and tuple(s.get("segment_pool_id", (0, 0))) != (0, 0)
     )
     alloc = stats.get("allocated_bytes.all.current", 0)

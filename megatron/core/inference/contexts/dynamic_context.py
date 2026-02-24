@@ -734,10 +734,16 @@ class DynamicInferenceContext(BaseInferenceContext):
                 self.reset()
             if self._uses_torch_memory_saver:
                 if torch.distributed.get_rank() == 0:
-                    logging.info("torch_memory_saver: resuming inference_context, before: %s", tms_mem_summary())
+                    logging.info(
+                        "torch_memory_saver: resuming inference_context, before: %s",
+                        tms_mem_summary(),
+                    )
                 torch_memory_saver.resume("inference_context")
                 if torch.distributed.get_rank() == 0:
-                    logging.info("torch_memory_saver: resumed  inference_context, after:  %s", tms_mem_summary())
+                    logging.info(
+                        "torch_memory_saver: resumed  inference_context, after:  %s",
+                        tms_mem_summary(),
+                    )
             return
 
         if self.kv_cache_management_mode == KVCacheManagementMode.OFFLOAD:
@@ -765,10 +771,14 @@ class DynamicInferenceContext(BaseInferenceContext):
 
         if self._uses_torch_memory_saver:
             if torch.distributed.get_rank() == 0:
-                logging.info("torch_memory_saver: pausing inference_context, before: %s", tms_mem_summary())
+                logging.info(
+                    "torch_memory_saver: pausing inference_context, before: %s", tms_mem_summary()
+                )
             torch_memory_saver.pause("inference_context")
             if torch.distributed.get_rank() == 0:
-                logging.info("torch_memory_saver: paused  inference_context, after:  %s", tms_mem_summary())
+                logging.info(
+                    "torch_memory_saver: paused  inference_context, after:  %s", tms_mem_summary()
+                )
             return
 
         if self.kv_cache_management_mode == KVCacheManagementMode.OFFLOAD:
