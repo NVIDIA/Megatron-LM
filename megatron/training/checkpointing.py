@@ -1467,7 +1467,9 @@ def load_args_from_checkpoint(
     _set_arg('mamba_head_dim', force=True)
     _set_arg('mamba_num_groups', force=True)
     _set_arg('mamba_num_heads', force=True)
-    _set_arg('hybrid_layer_pattern', force=True)
+    # We need to be able to override hybrid_layer_pattern from the command-line so that different
+    # pipelining can be specified when inferencing a pre-trained model.
+    _set_arg('hybrid_layer_pattern')
 
     # Heterogeneous args.
     _set_arg('heterogeneous_layers_config_path', force=True)
