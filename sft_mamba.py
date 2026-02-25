@@ -40,7 +40,7 @@ from megatron.training import (
     print_rank_0,
     set_startup_timestamps,
 )
-from megatron.core.transformer.multi_token_prediction import mtp_on_this_rank
+from megatron.core.transformer.multi_token_prediction import mtp_on_this_rank as mtp_on_this_rank_func
 from megatron.training.arguments import core_transformer_config_from_args
 from megatron.training.datasets.sft_dataset import SFTDataset, IGNORE_INDEX
 from megatron.training.utils import (
@@ -69,8 +69,7 @@ stimer = StragglerDetector()
 def get_batch(data_iterator, vp_stage=None):
     """Generate a batch."""
 
-    if not is_first_or_last_pipeline_stage(vp_stage): # TODO(asolergi-nv): Add HybridCP condition & MTP?
-        return None, None, None, None, None, None
+    BATCH_KEYS = ["tokens", "labels", "loss_mask", "position_ids", "attention_mask", "cu_seqlens", "cu_seqlens_padded", "max_seqlen"]
 
     args = get_args()
     config = core_transformer_config_from_args(args)
@@ -81,26 +80,23 @@ def get_batch(data_iterator, vp_stage=None):
     sp = args.sequence_parallel
     max_seq_len = args.seq_length
     is_sft = args.sft
+    create_attention_mask_in_dataloader = args.create_attention_mask_in_dataloader
+    mtp_on_this_rank = mtp_on_this_rank_func(layout=config.pipeline_model_parallel_layout, mtp_num_layers=config.mtp_num_layers, ignore_virtual=False, vp_stage=vp_stage)
 
-    batch = {
-        'tokens': None,
-        'labels': None,
-        'loss_mask': None,
-        'cu_seqlens': None,
-        'cu_seqlens_padded': None,
-        'max_seqlen': None,
-    }
+    if not is_first_or_last_pipeline_stage(vp_stage) and not mtp_on_this_rank: # TODO(asolergi-nv): Add HybridCP condition
+        return [None for _ in BATCH_KEYS]
 
+    # NOTE(asolergi-nv): We should do this in the dataloader collator, leaving it here to be more explicit.
     if tp_rank == 0: # NOTE(asolergi-nv): Unpack batch on TP rank 0 before sharing with other ranks
         batch = next(data_iterator)
+        if is_sft:
+            batch = preprocess_sft_batch(batch, tp_rank=tp_rank, cp_size=cp_size, tp_size=tp_size, sp=sp, padding_token_id=get_tokenizer().pad, padding_label_id=IGNORE_INDEX, max_seq_len=max_seq_len) 
+        
+        for key in BATCH_KEYS:
+            batch[key] = batch[key].cuda(non_blocking=True) if key in batch and batch[key] is not None else None
 
-    if is_sft:
-        batch = preprocess_sft_batch(batch, tp_rank=tp_rank, cp_size=cp_size, tp_size=tp_size, sp=sp, padding_token_id=get_tokenizer().pad, padding_label_id=IGNORE_INDEX, max_seq_len=max_seq_len)        
-    # TODO(asolergi-nv): config from args?
-    # TODO(asolergi-nv): Fuse TP Sharing!
-    batch = get_batch_on_this_tp_rank(batch, broadcast_src_rank=mpu.get_tensor_model_parallel_src_rank(), broadcast_group=mpu.get_tensor_model_parallel_group(), is_sft=is_sft, cp_size=cp_size, tp_rank=tp_rank, micro_batch_size=args.micro_batch_size, seq_length=args.seq_length, mtp_on_this_rank=mtp_on_this_rank(layout=config.pipeline_model_parallel_layout, mtp_num_layers=config.mtp_num_layers, ignore_virtual=False, vp_stage=vp_stage), pipeline_model_parallel_size=args.pipeline_model_parallel_size, is_pipeline_first_stage=mpu.is_pipeline_first_stage(), is_pipeline_last_stage=mpu.is_pipeline_last_stage()) # TODO(asolergi-nv): Add mtp_on_this_rank condition?
+    batch = get_batch_on_this_tp_rank(batch, broadcast_src_rank=mpu.get_tensor_model_parallel_src_rank(), broadcast_group=mpu.get_tensor_model_parallel_group(), is_sft=is_sft, create_attention_mask_in_dataloader=create_attention_mask_in_dataloader, cp_size=cp_size, tp_rank=tp_rank, micro_batch_size=args.micro_batch_size, seq_length=args.seq_length, mtp_on_this_rank=mtp_on_this_rank, pipeline_model_parallel_size=args.pipeline_model_parallel_size, is_pipeline_first_stage=mpu.is_pipeline_first_stage(), is_pipeline_last_stage=mpu.is_pipeline_last_stage()) # TODO(asolergi-nv): Add mtp_on_this_rank condition?
     batch = get_batch_on_this_cp_rank(batch, cp_group=get_context_parallel_group())
-
     return batch.values()
 
 
@@ -185,6 +181,8 @@ def forward_step(data_iterator, model: MambaModel):
             tokens,
             labels,
             loss_mask,
+            position_ids,
+            attention_mask,
             cu_seqlens,
             cu_seqlens_padded,
             max_seqlen,
@@ -211,8 +209,8 @@ def forward_step(data_iterator, model: MambaModel):
     with stimer:
         output_tensor = model(
             tokens,
-            None, # position_ids
-            None, # attention_mask
+            position_ids,
+            attention_mask,
             labels=labels,
             packed_seq_params=packed_seq_params,
             loss_mask=loss_mask

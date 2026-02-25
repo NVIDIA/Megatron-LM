@@ -2131,12 +2131,14 @@ def preprocess_sft_batch(batch: Dict[str, Any], tp_rank: int, cp_size: int, tp_s
             )
         
         batch = {
-            'tokens': tokens.unsqueeze(0).cuda(non_blocking=True), # NOTE(asolergi-nv): Add back batch dimension
-            'labels': labels.unsqueeze(0).cuda(non_blocking=True), # NOTE(asolergi-nv): Add back batch dimension
-            'loss_mask': loss_mask.unsqueeze(0).cuda(non_blocking=True), # NOTE(asolergi-nv): Add batch dimension
-            'cu_seqlens': cu_seqlens.cuda(non_blocking=True),
-            'cu_seqlens_padded': cu_seqlens_padded.cuda(non_blocking=True) if cu_seqlens_padded is not None else None,
-            'max_seqlen': max_seqlen.cuda(non_blocking=True),
+            'tokens': tokens.unsqueeze(0), # NOTE(asolergi-nv): Add back batch dimension
+            'labels': labels.unsqueeze(0), # NOTE(asolergi-nv): Add back batch dimension
+            'loss_mask': loss_mask.unsqueeze(0), # NOTE(asolergi-nv): Add batch dimension
+            'position_ids': batch["position_ids"], # TODO(asolergi-nv): Automatically BYPASS position_ids, but take care of them properly with padding and so on! Should we move the creation of position_ids over here as we do with the loss_mask? After padding and so on. Oh yes since CP is changing positions ids, or its done in tex?
+            'attention_mask': None, # NOTE(asolergi-nv): 
+            'cu_seqlens': cu_seqlens,
+            'cu_seqlens_padded': cu_seqlens_padded if cu_seqlens_padded is not None else None,
+            'max_seqlen': max_seqlen,
         }
     return batch
 
@@ -2144,12 +2146,12 @@ def preprocess_sft_batch(batch: Dict[str, Any], tp_rank: int, cp_size: int, tp_s
 ### tensor parallel ####
 ########################
 
-def get_batch_on_this_tp_rank(batch: dict[str, torch.Tensor], broadcast_src_rank: int, broadcast_group: torch.distributed.ProcessGroup, is_sft: bool, cp_size: int, tp_rank: int, micro_batch_size: int, seq_length: int, mtp_on_this_rank: bool = False, pipeline_model_parallel_size: int = 1, is_pipeline_first_stage: bool = False, is_pipeline_last_stage: bool = False):
+def get_batch_on_this_tp_rank(batch: dict[str, torch.Tensor], is_sft: bool, broadcast_src_rank: int, broadcast_group: torch.distributed.ProcessGroup, cp_size: int, tp_rank: int, micro_batch_size: int, seq_length: int, mtp_on_this_rank: bool, pipeline_model_parallel_size: int = 1, is_pipeline_first_stage: bool = False, is_pipeline_last_stage: bool = False, create_attention_mask_in_dataloader: bool = True):
     # TODO(asolergi-nv): Enable PP wit sft
-    # TODO(asolergi-nv): Enable SFT & Pretraining
 
     def _broadcast(item):
         if item is not None:
+            item = item.cuda(non_blocking=False)
             torch.distributed.broadcast(
                 item,
                 broadcast_src_rank,
@@ -2176,21 +2178,26 @@ def get_batch_on_this_tp_rank(batch: dict[str, torch.Tensor], broadcast_src_rank
             _broadcast(batch['tokens'])
             _broadcast(batch['labels'])
             _broadcast(batch['loss_mask'])
+            _broadcast(batch['position_ids'])
             if is_sft:
                 _broadcast_cu_seqlens(batch['cu_seqlens'])
                 _broadcast(batch['max_seqlen'])
                 if cp_size > 1:
                     _broadcast_cu_seqlens(batch['cu_seqlens_padded'])
+            elif create_attention_mask_in_dataloader:
+                _broadcast(batch['attention_mask'])
             
 
         elif is_pipeline_first_stage:
             _broadcast(batch['tokens'])
+            _broadcast(batch['position_ids'])
             if is_sft:
                 _broadcast_cu_seqlens(batch['cu_seqlens'])
                 _broadcast(batch['max_seqlen'])
                 if cp_size > 1:
                     _broadcast_cu_seqlens(batch['cu_seqlens_padded'])
-            
+            elif create_attention_mask_in_dataloader:
+                _broadcast(batch['attention_mask'])
 
         elif is_pipeline_last_stage:
             # Multi-Token Prediction (MTP) layers need tokens and position_ids to calculate embedding.
@@ -2217,14 +2224,25 @@ def get_batch_on_this_tp_rank(batch: dict[str, torch.Tensor], broadcast_src_rank
             dtype=torch.float32,
             device=torch.cuda.current_device(),
         )
-
+        position_ids = torch.empty(
+            shape,
+            dtype=torch.int64,
+            device=torch.cuda.current_device(),
+        )
         cu_seqlens = None
         cu_seqlens_padded = None
         max_seqlen = None
+        attention_mask = None
         if is_sft:
             max_seqlen = torch.empty(
                 1,
                 dtype=torch.int32,
+                device=torch.cuda.current_device(),
+            )
+        elif create_attention_mask_in_dataloader:
+            attention_mask = torch.empty(
+                (micro_batch_size, 1, seq_length, seq_length),
+                dtype=torch.bool,
                 device=torch.cuda.current_device(),
             )
 
@@ -2249,11 +2267,14 @@ def get_batch_on_this_tp_rank(batch: dict[str, torch.Tensor], broadcast_src_rank
             _broadcast(tokens)
             _broadcast(labels)
             _broadcast(loss_mask)
+            _broadcast(position_ids)
             if is_sft:
                 cu_seqlens = _broadcast_cu_seqlens()
                 _broadcast(max_seqlen)
                 if cp_size > 1:
                     cu_seqlens_padded = _broadcast_cu_seqlens()
+            elif create_attention_mask_in_dataloader:
+                _broadcast(attention_mask)
             
 
         elif is_pipeline_first_stage:
@@ -2261,12 +2282,14 @@ def get_batch_on_this_tp_rank(batch: dict[str, torch.Tensor], broadcast_src_rank
             loss_mask = None
 
             _broadcast(tokens)
+            _broadcast(position_ids)
             if is_sft:
                 cu_seqlens = _broadcast_cu_seqlens()
                 _broadcast(max_seqlen)
                 if cp_size > 1:
                     cu_seqlens_padded = _broadcast_cu_seqlens()
-            
+            elif create_attention_mask_in_dataloader:
+                _broadcast(attention_mask)
 
         elif is_pipeline_last_stage:
             # Multi-Token Prediction (MTP) layers need tokens and position_ids to calculate embedding.
@@ -2280,11 +2303,12 @@ def get_batch_on_this_tp_rank(batch: dict[str, torch.Tensor], broadcast_src_rank
             _broadcast(labels)
             _broadcast(loss_mask)
 
-
         batch = {
             'tokens': tokens,
             'labels': labels,
             'loss_mask': loss_mask,
+            'position_ids': position_ids,
+            'attention_mask': attention_mask,
             'cu_seqlens': cu_seqlens,
             'cu_seqlens_padded': cu_seqlens_padded,
             'max_seqlen': max_seqlen,
@@ -2340,7 +2364,7 @@ def get_pretrain_batch_on_this_cp_rank(batch: dict[str, torch.Tensor], cp_group:
                 index[1].fill_(2 * cp_size - cp_rank - 1)
                 val = val.index_select(seq_dim, index)
                 val = val.view(*val.shape[0:seq_dim], -1, *val.shape[(seq_dim + 2) :])
-                batch[key] = val
+            batch[key] = val
 
     return batch
 
@@ -2358,7 +2382,7 @@ def get_batch_on_this_cp_rank(
             the current context-parallel settings from parallel_state.
     """
 
-    if batch["cu_seqlens"] is not None:
+    if "cu_seqlens" in batch:
         batch = get_sft_batch_on_this_cp_rank(batch, cp_group=cp_group)
     else:
         batch = get_pretrain_batch_on_this_cp_rank(batch, cp_group=cp_group)
