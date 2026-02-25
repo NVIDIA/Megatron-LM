@@ -72,6 +72,15 @@ mlm = [
     "accelerate",
 ]
 
+training = [
+    "flask-restful",
+    "sentencepiece",
+    "tiktoken",
+    "wandb",
+    "transformers",
+    "accelerate",
+]
+
 dev = [
     "nvidia-modelopt[torch]; sys_platform != 'darwin'",
     "transformer-engine[pytorch,core_cu13]>=2.9.0a0,<2.12.0",
