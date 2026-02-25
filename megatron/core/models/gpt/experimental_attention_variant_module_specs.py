@@ -100,6 +100,8 @@ def get_dsa_module_spec_for_backend(
 
     # Adjust for RMS norm.
     rms_norm = config.normalization == "RMSNorm"
+    # DSA indexer requires normalized q as input, so here we cannot fuse qk layernorm
+    # with linear projection and have to use unfused qk layernorm.
     qk_norm = (
         backend.layer_norm(rms_norm=rms_norm, for_qk=True) if config.qk_layernorm else IdentityOp
     )
