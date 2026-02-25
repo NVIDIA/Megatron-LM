@@ -5,7 +5,7 @@ import os
 import time
 from dataclasses import dataclass, field
 from math import ceil
-from typing import Dict, Optional, Tuple
+from typing import Dict, Optional, Tuple, List
 
 import numpy
 import torch
@@ -23,9 +23,18 @@ logger = logging.getLogger(__name__)
 @dataclass
 class SFTDatasetConfig(GPTDatasetConfig):
     train_on_completitions_only: bool = False
-    """If True, only train on completitions, otherwise train on conversations"""
+    """If True, only train on completitions, otherwise train on full conversations"""
 
-    truncate_conversations: bool = True
+    train_on_thinking_traces: bool = True
+    """If False, mask thinking traces from the completitions"""
+
+    completitions_start_tokens: List[int]
+    """The tokens that indicate the start of a completition"""
+
+    completitions_end_tokens: List[int]
+    """The tokens that indicate the end of a completition"""
+
+    truncate_conversations: bool = True # TODO(asolergi-nv): 
 
 class SFTDataset(MegatronDataset):
     def __init__(
@@ -110,12 +119,14 @@ class SFTDataset(MegatronDataset):
 
         tokens = torch.from_numpy(tokens).long()
         cu_seqlens = torch.cat((torch.zeros(1, dtype=torch.int64), torch.cumsum(torch.from_numpy(lengths), dim = 0)))
+        position_ids = torch.arange(tokens.shape[0], dtype=torch.long) # TODO(asolergi-nv): Create position_ids from lengths
         
         # TODO(asolergi-nv): Create labels, remember self.config.train_on_completitions_only
 
         return {
             'tokens': tokens[:-1].contiguous(),
             'labels': tokens[1:].contiguous(),
+            'position_ids': position_ids,
             'cu_seqlens': cu_seqlens,
         }
     def _query_document_sample_shuffle_indices(
