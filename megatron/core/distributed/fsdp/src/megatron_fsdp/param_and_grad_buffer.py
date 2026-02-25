@@ -3492,6 +3492,7 @@ class GradReducePipeline:
                             # Free the bucket allocated for the DP-Shard reduction,
                             # which has been waited on already.
                             fsdp_grad_buffer.free_bucket_storage()
+                            fsdp_grad_buffer.reset_param_main_grad()
                             # Create a custom communication buffer with fsdp_grad_buffer.
                             # Introduces copy and memory overhead.
                             unreduced_grad = fsdp_grad_buffer.allocate_bucket_storage(
