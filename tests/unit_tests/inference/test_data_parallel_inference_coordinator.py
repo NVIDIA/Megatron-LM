@@ -212,12 +212,24 @@ async def graceful_shutdown(engine, client=None, *, timeout=10.0):
             await asyncio.wait_for(engine.paused.wait(), timeout=timeout)
             client.stop_engines()
         await asyncio.wait_for(engine.stopped.wait(), timeout=timeout)
+        # Await the engine loop task so its finally-block cleanup (ZMQ socket
+        # close, context term) runs before the next test reuses ports/identities.
+        if hasattr(engine, 'engine_loop_task'):
+            await asyncio.wait_for(engine.engine_loop_task, timeout=timeout)
         if client is not None:
             client.stop()
     except asyncio.TimeoutError:
         await engine.shutdown(immediate=True)
         if client is not None:
             client.stop()
+    finally:
+        # Join the coordinator process to reap zombies between tests.
+        proc = getattr(engine, 'inference_coordinator_process', None)
+        if proc is not None:
+            proc.join(timeout=5.0)
+            if proc.is_alive():
+                proc.terminate()
+                proc.join(timeout=2.0)
 
 
 async def force_cleanup_engine(engine):
