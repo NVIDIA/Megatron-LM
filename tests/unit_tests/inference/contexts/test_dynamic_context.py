@@ -1455,9 +1455,7 @@ class TestDynamicContext:
         dummy_block_idx = ctx.block_allocator.dummy_block_idx
         assert torch.all(ctx.token_to_block_idx[:N] == dummy_block_idx)
         assert torch.equal(ctx.token_to_block_idx[:N], slow_token_to_block_idx)
-        assert torch.equal(
-            ctx.token_to_local_position_within_kv_block[:N], slow_token_to_local_pos
-        )
+        assert torch.equal(ctx.token_to_local_position_within_kv_block[:N], slow_token_to_local_pos)
 
         if is_hybrid_model:
             # 4. token_to_request_idx
