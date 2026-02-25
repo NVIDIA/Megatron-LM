@@ -270,7 +270,7 @@ class MoELayer(BaseMoELayer):
             f"Inference-optimized MoE requires 'alltoall' dispatcher, "
             f"got '{self.config.moe_token_dispatcher_type}'"
         )
-        self.is_cuda_graphed_iteration = False
+        self.is_inference_cuda_graphed_iteration = False
         self._inference_token_dispatcher = InferenceAllGatherTokenDispatcher(
             self.num_local_experts,
             self.local_expert_indices,
@@ -278,11 +278,11 @@ class MoELayer(BaseMoELayer):
             pg_collection=pg_collection,
         )
 
-    def set_is_cuda_graphed_iteration(self, set_to: bool):
+    def set_is_inference_cuda_graphed_iteration(self, set_to: bool):
         """Toggle CUDA-graphed iteration mode on this layer and its router."""
-        self.is_cuda_graphed_iteration = set_to
-        if hasattr(self.router, 'set_is_cuda_graphed_iteration'):
-            self.router.set_is_cuda_graphed_iteration(set_to)
+        self.is_inference_cuda_graphed_iteration = set_to
+        if hasattr(self.router, 'set_is_inference_cuda_graphed_iteration'):
+            self.router.set_is_inference_cuda_graphed_iteration(set_to)
 
     def _activate_inference_token_dispatcher(self):
         """Swap in the inference-optimized token dispatcher."""
@@ -372,7 +372,7 @@ class MoELayer(BaseMoELayer):
         for each expert. It then passes the tokens through the local experts.
         The output from the experts is preprocessed for the combine step.
         """
-        if not self.training and self.is_cuda_graphed_iteration:
+        if not self.training and self.is_inference_cuda_graphed_iteration:
             return self._fused_experts_compute(hidden_states, probs)
 
         dispatched_input, tokens_per_expert, permuted_probs = (
@@ -483,7 +483,7 @@ class MoELayer(BaseMoELayer):
         # Swap in inference-optimized dispatcher for CUDA-graphed iterations
         _use_inference_dispatcher = (
             not self.training
-            and self.is_cuda_graphed_iteration
+            and self.is_inference_cuda_graphed_iteration
             and self._inference_token_dispatcher is not None
         )
         if _use_inference_dispatcher:

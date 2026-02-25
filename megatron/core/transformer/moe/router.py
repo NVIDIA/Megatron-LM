@@ -744,10 +744,10 @@ class InferenceTopKRouter(TopKRouter):
 
         super().__init__(config=config, pg_collection=pg_collection)
 
-        self.is_cuda_graphed_iteration = False
+        self.is_inference_cuda_graphed_iteration = False
 
-    def set_is_cuda_graphed_iteration(self, set_to: bool):
-        self.is_cuda_graphed_iteration = set_to
+    def set_is_inference_cuda_graphed_iteration(self, set_to: bool):
+        self.is_inference_cuda_graphed_iteration = set_to
 
     @torch.compile()
     def _forward(self, input: torch.Tensor, padding_mask: Optional[torch.Tensor] = None):
@@ -785,7 +785,7 @@ class InferenceTopKRouter(TopKRouter):
                 - top_indices: Selected expert indices [num_tokens, topk]
         """
        
-        if self.training or not self.is_cuda_graphed_iteration:
+        if self.training or not self.is_inference_cuda_graphed_iteration:
             return super().forward(input, padding_mask)
         
         return self._forward(input, padding_mask)
