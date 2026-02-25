@@ -19,11 +19,6 @@ from megatron.core.transformer.moe.token_dispatcher import (
 )
 from megatron.core.transformer.transformer_config import TransformerConfig
 
-from megatron.core.transformer.moe.inference_kernels import (
-    shift_topk_indices,
-    permute_tokens_and_probs,
-    unpermute_and_combine,
-)
 from megatron.core.tensor_parallel import gather_from_sequence_parallel_region
 from megatron.core.parallel_state import get_global_symmetric_memory_buffer_ep
 from megatron.core.inference.communication.torch_symm_triton import (
