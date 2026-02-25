@@ -283,7 +283,7 @@ def _validate_pattern(pattern: str, pattern_name: str, allow_pipe: bool = False)
             )
 
 
-def validate_segment_layers(segment: str) -> list:
+def validate_segment_layers(segment: str) -> List[str]:
     """Validate and convert a single pipeline segment pattern to a layer type list.
 
     This is used after the main pattern has been split by '|' into segments.
