@@ -47,8 +47,7 @@ get-started/install
 :hidden:
 :caption: Basic Usage
 
-user-guide/data-preparation
-user-guide/training-examples
+user-guide/index
 user-guide/parallelism-guide
 ```
 
@@ -65,15 +64,9 @@ models/index
 :hidden:
 :caption: Advanced Features
 
-user-guide/features/moe
-user-guide/features/context_parallel
-user-guide/features/custom_fsdp
-user-guide/features/dist_optimizer
-user-guide/features/optimizer_cpu_offload
-user-guide/features/pipeline_parallel_layout
-user-guide/features/megatron_energon
-user-guide/features/megatron_rl
+user-guide/features/index
 user-guide/features/tokenizers
+user-guide/features/fine_grained_activation_offloading
 ```
 
 ```{toctree}
@@ -93,7 +86,9 @@ developer/generate_docs
 :caption: API Reference
 
 api-guide/index
+api-guide/router_replay
 apidocs/index.rst
+api-backwards-compatibility-check
 ```
 
 ```{toctree}
@@ -102,4 +97,7 @@ apidocs/index.rst
 :caption: Resources
 
 advanced/index
+discussions/README
+discussions/megatron-fsdp-user-guide/megatron-fsdp-user-guide
+documentation
 ```
