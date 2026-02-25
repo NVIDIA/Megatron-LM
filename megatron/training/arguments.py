@@ -2102,7 +2102,7 @@ def _add_rl_args(parser):
                             'persist: leave KV cache in GPU memory (default), '
                             'offload: offload KV cache to CPU during training, '
                             'recompute: deallocate KV cache and recompute from scratch each cycle')
-    group.add_argument('--rl-persist-cuda-graphs', action=argparse.BooleanOptionalAction, type=bool, default=True,
+    group.add_argument('--rl-persist-cuda-graphs', action=argparse.BooleanOptionalAction, type=bool, default=False,
                        help='Persist CUDA graphs when the inference engine is suspended. '
                             'If False, CUDA graphs are deleted on suspend and re-captured on resume.')
     group.add_argument('--rl-partial-rollouts', action=argparse.BooleanOptionalAction, default=False,
