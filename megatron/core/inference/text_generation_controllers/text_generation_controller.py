@@ -517,10 +517,7 @@ class TextGenerationController:
         model_config = get_model_config(unwrapped_model)
 
         # Initialize attention state.
-        context.initialize_attention_state(
-            construct_graph_dimensions=construct_graph_dimensions,
-            is_expert_parallel_dummy_cuda_graph_step=is_dummy_forward,
-        )
+        context.initialize_attention_state(construct_graph_dimensions=construct_graph_dimensions)
 
         # If using symmetric kernels and we are using using nccl
         # for prefill turn off symmetric kernels
@@ -530,14 +527,12 @@ class TextGenerationController:
         moe_pad_experts_for_cuda_graph_inference = (
             self.model_config.moe_pad_experts_for_cuda_graph_inference
         )
-        
         is_inference_optimized =  self.model_config.transformer_impl == "inference_optimized"
         if is_inference_optimized:
             assert not moe_pad_experts_for_cuda_graph_inference, (
                 "moe_pad_experts_for_cuda_graph_inference cannot be True when "
                 "transformer_impl is 'inference_optimized'"
             )
-
         if moe_pad_experts_for_cuda_graph_inference:
             if context.using_cuda_graph_this_step():
                 capacity_factor = model_config.num_moe_experts / model_config.moe_router_topk
@@ -865,7 +860,8 @@ class TextGenerationController:
         # a dummy cuda graph.
         input_ids, position_ids = self._dynamic_step_context_init(
             # try to use the smallest cuda-graph config for dummy forward
-            is_dummy_forward=True
+            construct_graph_dimensions=min(context.cuda_graph_batch_dimensions_list),
+            is_dummy_forward=True,
         )
 
         # _dynamic_step_context_init tries to find a cuda-graph that is compatible
