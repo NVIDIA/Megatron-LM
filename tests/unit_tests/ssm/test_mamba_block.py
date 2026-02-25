@@ -5,6 +5,7 @@ import torch
 
 from megatron.core.models.mamba.mamba_layer_specs import mamba_stack_spec
 from megatron.core.process_groups_config import ProcessGroupCollection
+from megatron.core.ssm.gated_delta_net import GatedDeltaNet
 from megatron.core.ssm.mamba_block import MambaStack
 from megatron.core.ssm.mamba_hybrid_layer_allocation import Symbols
 from megatron.core.ssm.mamba_layer import MambaLayer
@@ -13,7 +14,6 @@ from megatron.core.transformer import TransformerConfig
 from megatron.core.transformer.attention import SelfAttention
 from megatron.core.transformer.mlp import MLP
 from megatron.core.transformer.transformer_layer import TransformerLayer
-from megatron.core.ssm.gated_delta_net import GatedDeltaNet
 from tests.unit_tests.test_utilities import Utils
 
 
