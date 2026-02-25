@@ -573,14 +573,15 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
         residual = hidden_states
 
         # Optional Input Layer norm
+        attn_norm_manager = off_interface(self.offload_attn_norm, hidden_states, "attn_norm")
         if self.recompute_input_layernorm:
             self.input_layernorm_checkpoint = tensor_parallel.CheckpointWithoutOutput()
-            with off_interface(self.offload_attn_norm, hidden_states, "attn_norm") as hidden_states:
+            with attn_norm_manager as hidden_states:
                 input_layernorm_output = self.input_layernorm_checkpoint.checkpoint(
                     self.input_layernorm, hidden_states
                 )
         else:
-            with off_interface(self.offload_attn_norm, hidden_states, "attn_norm") as hidden_states:
+            with attn_norm_manager as hidden_states:
                 input_layernorm_output = self.input_layernorm(hidden_states)
 
         using_fused_tp_inference_kernel = (not self.training) and (
@@ -632,10 +633,7 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
 
         # Delay the offload of the attention norm until after the self_attn_bda has been computed
         # because the residual is needed in the self_attn_bda.
-        if self.offload_attn_norm:
-            hidden_states = off_interface.group_commit(
-                hidden_states, name="attn_norm", forced_released_tensors=[residual]
-            )
+        hidden_states = attn_norm_manager.group_offload(hidden_states, forced_released_tensors=[residual])
 
         # Residual connection.
         residual = hidden_states
@@ -668,14 +666,15 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
             FineGrainedActivationOffloadingInterface as off_interface,
         )
 
+        self.mlp_norm_manager = off_interface(self.offload_mlp_norm, hidden_states, "mlp_norm")
         if self.recompute_pre_mlp_layernorm:
             self.pre_mlp_norm_checkpoint = tensor_parallel.CheckpointWithoutOutput()
-            with off_interface(self.offload_mlp_norm, hidden_states, "mlp_norm") as hidden_states:
+            with self.mlp_norm_manager as hidden_states:
                 pre_mlp_layernorm_output = self.pre_mlp_norm_checkpoint.checkpoint(
                     self.pre_mlp_layernorm, hidden_states
                 )
         else:
-            with off_interface(self.offload_mlp_norm, hidden_states, "mlp_norm") as hidden_states:
+            with self.mlp_norm_manager as hidden_states:
                 pre_mlp_layernorm_output = self.pre_mlp_layernorm(hidden_states)
 
         return pre_mlp_layernorm_output
@@ -788,9 +787,6 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
         Returns:
             output (Tensor): Transformed hidden states of shape [s, b, h].
         """
-        from megatron.core.pipeline_parallel.fine_grained_activation_offload import (
-            FineGrainedActivationOffloadingInterface as off_interface,
-        )
 
         using_fused_tp_inference_kernel = (not self.training) and (
             self.config.inference_fuse_tp_communication
@@ -819,10 +815,9 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
         nvtx_range_pop(suffix="mlp_bda")
         # Delay the offload of the mlp norm until after the mlp_bda has been computed
         # because the residual is needed in the mlp_bda.
-        if self.offload_mlp_norm:
-            hidden_states = off_interface.group_commit(
-                hidden_states, name="mlp_norm", forced_released_tensors=[residual]
-            )
+        if hasattr(self, 'mlp_norm_manager'):
+            hidden_states = self.mlp_norm_manager.group_offload(hidden_states, forced_released_tensors=[residual])
+            delattr(self, 'mlp_norm_manager')
 
         # Jit compiled function creates 'view' tensor. This tensor
         # potentially gets saved in the MPU checkpoint function context,

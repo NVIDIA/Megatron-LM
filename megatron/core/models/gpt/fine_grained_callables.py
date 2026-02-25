@@ -478,18 +478,16 @@ def build_transformer_layer_callables(layer: TransformerLayer):
                 )
                 if not isinstance(layer.mlp, MoELayer):
                     return hidden_states, None, None, None
+                mlp_norm_manager = off_interface(layer.offload_mlp_norm, hidden_states, "mlp_norm")
+                node.layer_state.mlp_norm_manager = mlp_norm_manager
                 if layer.recompute_pre_mlp_layernorm:
                     layer.pre_mlp_norm_checkpoint = tensor_parallel.CheckpointWithoutOutput()
-                    with off_interface(
-                        layer.offload_mlp_norm, hidden_states, "mlp_norm"
-                    ) as hidden_states:
+                    with mlp_norm_manager as hidden_states:
                         pre_mlp_layernorm_output = layer.pre_mlp_norm_checkpoint.checkpoint(
                             layer.pre_mlp_layernorm, hidden_states
                         )
                 else:
-                    with off_interface(
-                        layer.offload_mlp_norm, hidden_states, "mlp_norm"
-                    ) as hidden_states:
+                    with mlp_norm_manager as hidden_states:
                         pre_mlp_layernorm_output = layer.pre_mlp_layernorm(hidden_states)
 
                 shared_expert_output = layer.mlp.shared_experts_compute(pre_mlp_layernorm_output)
@@ -589,10 +587,11 @@ def build_transformer_layer_callables(layer: TransformerLayer):
             )
         # Delay the offload of the mlp norm until after the mlp_bda has been computed
         # because the residual is needed in the mlp_bda.
-        if layer.offload_mlp_norm:
-            hidden_states = off_interface.group_commit(
-                hidden_states, name="mlp_norm", forced_released_tensors=[residual]
+        if hasattr(node.layer_state, 'mlp_norm_manager'):
+            hidden_states = node.layer_state.mlp_norm_manager.group_offload(
+                hidden_states, forced_released_tensors=[residual]
             )
+            delattr(node.layer_state, 'mlp_norm_manager')
         output = make_viewless_tensor(
             inp=hidden_states, requires_grad=hidden_states.requires_grad, keep_graph=True
         )
