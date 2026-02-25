@@ -287,8 +287,8 @@ class DynamicInferenceRequest(InferenceRequest):
     prompt_tokens: Optional[torch.Tensor] = None
     # remaining prompt tokens are used for chunked prefill
     remaining_prompt_tokens: Optional[torch.Tensor] = None
-    policy_staleness: Optional[torch.Tensor] = None
-    kv_cache_staleness: Optional[torch.Tensor] = None
+    policy_iteration: Optional[torch.Tensor] = None
+    kv_cache_iteration: Optional[torch.Tensor] = None
     latency: Optional[float] = None
     # routing_indices stores MoE routing decisions for all tokens generated so far.
     # Shape: [total_tokens, num_layers, topk] - accumulated across all generation steps
@@ -494,50 +494,51 @@ class DynamicInferenceRequestRecord:
         return self.requests[0].request_id
 
     @staticmethod
-    def _update_staleness_tensor(
-        tensor: Optional[torch.Tensor], total_tokens: int, increment: bool = True
+    def _extend_stamp_tensor(
+        tensor: Optional[torch.Tensor], total_tokens: int, fill_value: int
     ) -> torch.Tensor:
-        """Update a per-token staleness tensor, extending with zeros if needed.
+        """Extend a per-token iteration stamp tensor, filling new positions with fill_value.
 
         Args:
-            tensor: Existing staleness tensor, or None to create a new one.
+            tensor: Existing stamp tensor, or None to create a new one.
             total_tokens: Expected length of the tensor after update.
-            increment: If True, increment all values by 1 (including new positions).
+            fill_value: Value to fill new positions with (typically a training iteration).
         """
         if tensor is None:
-            tensor = torch.zeros(total_tokens, dtype=torch.int32, device='cpu')
-        elif len(tensor) < total_tokens:
+            return torch.full((total_tokens,), fill_value, dtype=torch.int32, device='cpu')
+        if len(tensor) < total_tokens:
             tensor = torch.cat(
                 (
                     tensor,
-                    torch.zeros(
-                        total_tokens - len(tensor), dtype=tensor.dtype, device=tensor.device
+                    torch.full(
+                        (total_tokens - len(tensor),), fill_value,
+                        dtype=tensor.dtype, device=tensor.device,
                     ),
                 ),
                 dim=0,
             )
-        if increment:
-            tensor = tensor + 1
         return tensor
 
-    def increment_staleness(self, policy_only: bool = False):
-        """Increment per-token staleness counters in-place.
+    def stamp_training_iteration(self, training_iteration: int, policy_only: bool = False):
+        """Stamp unstamped tokens with the given training iteration.
 
-        Each call indicates that a training step has occurred since these tokens
-        were generated. Tokens not yet tracked are initialized to 1.
+        Extends per-token stamp tensors to cover all current tokens, filling
+        new positions with training_iteration. Existing stamps are preserved.
 
         Args:
-            policy_only: If True, only increment policy_staleness. Use this for
-                evicted requests that have no KV cache to age.
+            training_iteration: The training iteration to stamp new tokens with.
+            policy_only: If True, only stamp policy_iteration. Use this for
+                evicted requests that have no KV cache to stamp.
         """
+        self._training_iteration = training_iteration
         request = self[-1]
         total_tokens = len(request.prompt_tokens) + len(request.generated_tokens)
-        request.policy_staleness = self._update_staleness_tensor(
-            request.policy_staleness, total_tokens, increment=True
+        request.policy_iteration = self._extend_stamp_tensor(
+            request.policy_iteration, total_tokens, training_iteration
         )
         if not policy_only:
-            request.kv_cache_staleness = self._update_staleness_tensor(
-                request.kv_cache_staleness, total_tokens, increment=True
+            request.kv_cache_iteration = self._extend_stamp_tensor(
+                request.kv_cache_iteration, total_tokens, training_iteration
             )
 
     def checkpoint(self, tokenizer: MegatronTokenizer | None = None):
@@ -552,19 +553,21 @@ class DynamicInferenceRequestRecord:
 
         total_tokens = len(old_request.prompt_tokens) + len(old_request.generated_tokens)
 
-        # Carry forward policy_staleness without incrementing.
-        policy_staleness = (
-            self._update_staleness_tensor(
-                old_request.policy_staleness, total_tokens, increment=False
+        training_iteration = getattr(self, '_training_iteration', 0)
+
+        # Carry forward policy_iteration, filling new positions with current iteration.
+        policy_iteration = (
+            self._extend_stamp_tensor(
+                old_request.policy_iteration, total_tokens, training_iteration
             )
-            if old_request.policy_staleness is not None
+            if old_request.policy_iteration is not None
             else None
         )
 
-        # Reset kv_cache_staleness to 0.
-        kv_cache_staleness = (
-            self._update_staleness_tensor(None, total_tokens, increment=False)
-            if old_request.kv_cache_staleness is not None
+        # Reset kv_cache_iteration to current iteration (KV cache will be recomputed fresh).
+        kv_cache_iteration = (
+            torch.full((total_tokens,), training_iteration, dtype=torch.int32, device='cpu')
+            if old_request.kv_cache_iteration is not None
             else None
         )
 
@@ -597,8 +600,8 @@ class DynamicInferenceRequestRecord:
             request_id=old_request.request_id,
             prompt_tokens=new_prompt_tokens,
             sampling_params=new_sampling_params,
-            policy_staleness=policy_staleness,
-            kv_cache_staleness=kv_cache_staleness,
+            policy_iteration=policy_iteration,
+            kv_cache_iteration=kv_cache_iteration,
         )
         # Preserve event_add_engine from old request if it exists, otherwise set it.
         # This ensures TTFT calculation works correctly for evicted/resumed requests.
@@ -635,13 +638,14 @@ class DynamicInferenceRequestRecord:
         except TypeError as e:  # generally means r.generated_text is None
             generated_text = None
 
-        # Ensure staleness tensors are always materialized (zeros if never incremented).
+        # Ensure stamp tensors are always materialized.
         total_tokens = len(prompt_tokens) + len(generated_tokens)
-        policy_staleness = self._update_staleness_tensor(
-            self.requests[-1].policy_staleness, total_tokens, increment=False
+        training_iteration = getattr(self, '_training_iteration', 0)
+        policy_iteration = self._extend_stamp_tensor(
+            self.requests[-1].policy_iteration, total_tokens, training_iteration
         )
-        kv_cache_staleness = self._update_staleness_tensor(
-            self.requests[-1].kv_cache_staleness, total_tokens, increment=False
+        kv_cache_iteration = self._extend_stamp_tensor(
+            self.requests[-1].kv_cache_iteration, total_tokens, training_iteration
         )
 
         # Merged request.
@@ -657,8 +661,8 @@ class DynamicInferenceRequestRecord:
             generated_log_probs=merge_lists("generated_log_probs"),
             generated_top_n_logprobs=merge_lists("generated_top_n_logprobs"),
             sampling_params=self.requests[0].sampling_params,
-            policy_staleness=policy_staleness,
-            kv_cache_staleness=kv_cache_staleness,
+            policy_iteration=policy_iteration,
+            kv_cache_iteration=kv_cache_iteration,
             ttft=self.requests[0].ttft,
             tpot=merge_lists("tpot"),
             status=self.requests[-1].status,

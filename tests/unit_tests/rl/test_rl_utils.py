@@ -316,8 +316,8 @@ class TestRLUtils:
             logprobs=[[0.1, 0.2, 0.3]],
             env_id='MEGAENV',
             problem_id="2",
-            policy_staleness=[[0, 0, 0]],
-            kv_cache_staleness=[[0, 0, 0]],
+            policy_iteration=[[0, 0, 0]],
+            kv_cache_iteration=[[0, 0, 0]],
             completed_at_step=[1],
             num_evictions=[0],
         )
@@ -328,8 +328,8 @@ class TestRLUtils:
             logprobs=[[0.1, 0.2, 0.3, -1.2]],
             env_id='MEGAENV',
             problem_id="2",
-            policy_staleness=[[0, 0, 0, 0]],
-            kv_cache_staleness=[[0, 0, 0, 0]],
+            policy_iteration=[[0, 0, 0, 0]],
+            kv_cache_iteration=[[0, 0, 0, 0]],
             completed_at_step=[1],
             num_evictions=[0],
         )
@@ -350,8 +350,8 @@ class TestRLUtils:
             logprobs=torch.tensor([[-0.2, -0.3, -3.2]]).cuda(),
             env_id='MEGAENV',
             problem_id="2",
-            policy_staleness=[[0, 0, 0, 0]],
-            kv_cache_staleness=[[0, 0, 0, 0]],
+            policy_iteration=[[0, 0, 0, 0]],
+            kv_cache_iteration=[[0, 0, 0, 0]],
             completed_at_step=[1],
             num_evictions=[0],
         )
@@ -362,8 +362,8 @@ class TestRLUtils:
             logprobs=torch.tensor([[-0.2, -0.3, -1.2]]),
             env_id='MEGAENV',
             problem_id="2",
-            policy_staleness=[[0, 0, 0, 0]],
-            kv_cache_staleness=[[0, 0, 0, 0]],
+            policy_iteration=[[0, 0, 0, 0]],
+            kv_cache_iteration=[[0, 0, 0, 0]],
             completed_at_step=[1],
             num_evictions=[0],
         )
@@ -399,8 +399,8 @@ class TestRLUtils:
             logprobs=[[0.1, 0.2, 0.3, 0.35]] * num_turns,
             env_id='MEGAENV',
             problem_id="1",
-            policy_staleness=[[0, 0, 0, 0]] * num_turns,
-            kv_cache_staleness=[[0, 0, 0, 0]] * num_turns,
+            policy_iteration=[[0, 0, 0, 0]] * num_turns,
+            kv_cache_iteration=[[0, 0, 0, 0]] * num_turns,
             completed_at_step=[0] * num_turns,
             num_evictions=[0] * num_turns,
         )
@@ -411,8 +411,8 @@ class TestRLUtils:
             logprobs=[[0.4, 0.5, 0.6, 0.7, 0.75]] * num_turns,
             env_id='MEGAENV',
             problem_id="2",
-            policy_staleness=[[0, 0, 0, 0, 0]] * num_turns,
-            kv_cache_staleness=[[0, 0, 0, 0, 0]] * num_turns,
+            policy_iteration=[[0, 0, 0, 0, 0]] * num_turns,
+            kv_cache_iteration=[[0, 0, 0, 0, 0]] * num_turns,
             completed_at_step=[0] * num_turns,
             num_evictions=[0] * num_turns,
         )
@@ -423,8 +423,8 @@ class TestRLUtils:
             logprobs=[[0.8, 0.9, 0.95]] * num_turns,
             env_id='MEGAENV',
             problem_id="3",
-            policy_staleness=[[0, 0, 0]] * num_turns,
-            kv_cache_staleness=[[0, 0, 0]] * num_turns,
+            policy_iteration=[[0, 0, 0]] * num_turns,
+            kv_cache_iteration=[[0, 0, 0]] * num_turns,
             completed_at_step=[0] * num_turns,
             num_evictions=[0] * num_turns,
         )
@@ -909,8 +909,8 @@ class TestRLUtils:
         rewards = [[1, 1], [-1, 2]]
         num_turns = [[42, 2], [10, 8]]
         advantages = [0, 1]
-        policy_staleness = [[1, 2], [0, 3]]
-        kv_cache_staleness = [[1, 1], [0, 2]]
+        policy_iteration = [[4, 2], [5, 0]]
+        kv_cache_iteration = [[4, 3], [5, 1]]
         num_evictions = [[0, 1], [0, 0]]
         completed_at_steps = [[5, 4], [5, 3]]
         current_iteration = 6
@@ -921,8 +921,8 @@ class TestRLUtils:
             rewards,
             num_turns,
             advantages,
-            policy_staleness=policy_staleness,
-            kv_cache_staleness=kv_cache_staleness,
+            policy_iteration=policy_iteration,
+            kv_cache_iteration=kv_cache_iteration,
             num_evictions=num_evictions,
             completed_at_steps=completed_at_steps,
             current_iteration=current_iteration,

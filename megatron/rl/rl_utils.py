@@ -275,8 +275,8 @@ class RolloutStats:
     min_inf_prob: None | float
     max_inf_prob: None | float
     mean_inf_prob: None | float
-    policy_staleness: list[list[int]]
-    kv_cache_staleness: list[list[int]]
+    policy_iteration: list[list[int]]
+    kv_cache_iteration: list[list[int]]
     completed_at_steps: list[list[int]]
     num_evictions: list[list[int]]
 
@@ -524,7 +524,7 @@ def get_environment_rollouts(
             args.cuda_graph_impl,
             False, # offload optimizer during rollout collection is handled above
             training_model=model if has_separate_inference_model else None,
-            increment_staleness_on_suspend=True,
+            set_training_iteration_on_suspend=True,
         ) as inference_interface:
 
             with nvtx_range("inference-setup"):
@@ -738,8 +738,8 @@ def compute_group_stats(
     env_ids = []
     group_reward_ids = []
     num_turns = [] # num_turns per traj
-    all_policy_staleness = []
-    all_kv_cache_staleness = []
+    all_policy_iteration = []
+    all_kv_cache_iteration = []
     all_completed_at_steps = []
     all_num_evictions = []
     for group in rollouts:
@@ -747,8 +747,8 @@ def compute_group_stats(
         group_traj_lengths = []
         group_turn_lengths = []
         group_num_turns = []
-        group_policy_staleness = []
-        group_kv_staleness = []
+        group_policy_iteration = []
+        group_kv_iteration = []
         group_completed_at_steps = []
         group_num_evictions = []
         for rollout in group:
@@ -771,12 +771,12 @@ def compute_group_stats(
             roll_turn_lens = [len(t) for t in rollout.trajectory]
             group_turn_lengths.extend(roll_turn_lens)
             group_traj_lengths.append(sum(roll_turn_lens))
-            group_policy_staleness.append(max(s for turn in rollout.policy_staleness for s in turn))
-            group_kv_staleness.append(max(s for turn in rollout.kv_cache_staleness for s in turn))
+            group_policy_iteration.append(min(s for turn in rollout.policy_iteration for s in turn))
+            group_kv_iteration.append(min(s for turn in rollout.kv_cache_iteration for s in turn))
             group_completed_at_steps.append(max(rollout.completed_at_step))
             group_num_evictions.append(sum(rollout.num_evictions))
-        all_policy_staleness.append(group_policy_staleness)
-        all_kv_cache_staleness.append(group_kv_staleness)
+        all_policy_iteration.append(group_policy_iteration)
+        all_kv_cache_iteration.append(group_kv_iteration)
         all_completed_at_steps.append(group_completed_at_steps)
         all_num_evictions.append(group_num_evictions)
         traj_lens.append(group_traj_lengths)
@@ -806,8 +806,8 @@ def compute_group_stats(
         min_inf_prob=None,
         max_inf_prob=None,
         mean_inf_prob=None,
-        policy_staleness=all_policy_staleness,
-        kv_cache_staleness=all_kv_cache_staleness,
+        policy_iteration=all_policy_iteration,
+        kv_cache_iteration=all_kv_cache_iteration,
         completed_at_steps=all_completed_at_steps,
         num_evictions=all_num_evictions,
     )
@@ -821,8 +821,8 @@ def prep_wandb_metrics(
         rewards: List[List[float]],
         num_turns: List[List[int]],
         advantages: List[float],
-        policy_staleness: List[List[int]],
-        kv_cache_staleness: List[List[int]],
+        policy_iteration: List[List[int]],
+        kv_cache_iteration: List[List[int]],
         num_evictions: List[List[int]],
         completed_at_steps: List[List[int]],
         current_iteration: int,
@@ -839,8 +839,8 @@ def prep_wandb_metrics(
         rewards: Grouped list of rewards.
         num_turns: Grouped list of number of turns in the trajectories.
         advantages: Flattened list of advantages.
-        policy_staleness: Grouped list of per-rollout max policy staleness.
-        kv_cache_staleness: Grouped list of per-rollout max KV cache staleness.
+        policy_iteration: Grouped list of per-rollout min policy iteration stamp.
+        kv_cache_iteration: Grouped list of per-rollout min KV cache iteration stamp.
         num_evictions: Grouped list of per-rollout number of evictions.
         completed_at_steps: Grouped list of per-rollout completed at steps.
         current_iteration: Current training iteration.
@@ -853,8 +853,8 @@ def prep_wandb_metrics(
         data=[[np.mean(g), np.std(g)] for g in rewards],
     )
 
-    true_policy_staleness = [s + current_iteration - c for g, cg in zip(policy_staleness, completed_at_steps) for s, c in zip(g, cg)]
-    true_kv_staleness = [s + current_iteration - c for g, cg in zip(kv_cache_staleness, completed_at_steps) for s, c in zip(g, cg)]
+    true_policy_staleness = [current_iteration - s for g in policy_iteration for s in g]
+    true_kv_staleness = [current_iteration - s for g in kv_cache_iteration for s in g]
 
     metrics = {
             'group_means_hist': wandb_writer.plot.histogram(
@@ -966,14 +966,14 @@ def maybe_log_training_metrics(
     rewards = group_stats.rewards
     num_turns = group_stats.num_turns
     advantages = group_stats.advantages
-    policy_staleness = group_stats.policy_staleness
-    kv_cache_staleness = group_stats.kv_cache_staleness
+    policy_iteration = group_stats.policy_iteration
+    kv_cache_iteration = group_stats.kv_cache_iteration
     num_evictions = group_stats.num_evictions
     completed_at_steps = group_stats.completed_at_steps
 
     metrics = metrics | prep_wandb_metrics(wandb_writer=wandb_writer,
         traj_lens=traj_lens, turn_lens=turn_lens, rewards=rewards, num_turns=num_turns, advantages=advantages,
-        policy_staleness=policy_staleness, kv_cache_staleness=kv_cache_staleness, num_evictions=num_evictions,
+        policy_iteration=policy_iteration, kv_cache_iteration=kv_cache_iteration, num_evictions=num_evictions,
         completed_at_steps=completed_at_steps, current_iteration=current_iteration)
     env_stats = lambda cont, idx: [cont[i] for i in idx]
     group_turn_counts = [sum(nt) for nt in num_turns]
@@ -993,8 +993,8 @@ def maybe_log_training_metrics(
             rewards=env_stats(rewards, env_idx),
             num_turns=env_stats(num_turns, env_idx),
             advantages=env_advantages,
-            policy_staleness=env_stats(policy_staleness, env_idx),
-            kv_cache_staleness=env_stats(kv_cache_staleness, env_idx),
+            policy_iteration=env_stats(policy_iteration, env_idx),
+            kv_cache_iteration=env_stats(kv_cache_iteration, env_idx),
             num_evictions=env_stats(num_evictions, env_idx),
             completed_at_steps=env_stats(completed_at_steps, env_idx),
             current_iteration=current_iteration,
@@ -1775,7 +1775,7 @@ def megatron_rl_inference_mode(
     cuda_graph_impl: str,
     offload_optimizer_during_inference: bool,
     training_model: Optional[list[LanguageModule]] = None,
-    increment_staleness_on_suspend: bool = False,
+    set_training_iteration_on_suspend: bool = False,
 ):
     """Manage the model inference context when collecting rollouts.
 
@@ -1833,6 +1833,9 @@ def megatron_rl_inference_mode(
             toggle_cuda_graphs(lang_module, cuda_graph_impl)
 
         inference_interface = get_inference_interface(args, loop, model)
+        # Sync training iteration before generating so stamps use the correct base.
+        if set_training_iteration_on_suspend:
+            inference_interface.set_training_iteration(get_args().curr_iteration)
         loop.run_until_complete(inference_interface.resume())
 
         logger.debug(f"[{dist.get_rank()}] Entered inference mode")
@@ -1840,8 +1843,8 @@ def megatron_rl_inference_mode(
 
         with nvtx_range("suspend-engine"):
             loop.run_until_complete(inference_interface.suspend())
-            if increment_staleness_on_suspend:
-                inference_interface.increment_staleness()
+            if set_training_iteration_on_suspend:
+                inference_interface.set_training_iteration(get_args().curr_iteration)
 
         if cuda_graph_impl != "none" and not args.rl_training_cuda_graphs:
             toggle_cuda_graphs(lang_module, 'none')
