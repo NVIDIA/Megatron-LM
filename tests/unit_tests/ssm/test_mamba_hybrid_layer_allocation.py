@@ -289,34 +289,34 @@ class TestParseHybridPattern:
 class TestGetHybridLayerCounts:
 
     def test_simple_pattern(self):
-        assert get_hybrid_layer_counts("M*M*") == (2, 2, 0, 0)
+        assert get_hybrid_layer_counts("M*M*") == {'*': 2, 'M': 2, '-': 0, 'E': 0}
 
     def test_all_layer_types(self):
-        assert get_hybrid_layer_counts("M*-E") == (1, 1, 1, 1)
+        assert get_hybrid_layer_counts("M*-E") == {'*': 1, 'M': 1, '-': 1, 'E': 1}
 
     def test_with_pipes(self):
         # Pipes should be skipped in counting
-        assert get_hybrid_layer_counts("M*|M*") == (2, 2, 0, 0)
-        assert get_hybrid_layer_counts("M-M-|M-M*-") == (1, 4, 4, 0)
+        assert get_hybrid_layer_counts("M*|M*") == {'*': 2, 'M': 2, '-': 0, 'E': 0}
+        assert get_hybrid_layer_counts("M-M-|M-M*-") == {'*': 1, 'M': 4, '-': 4, 'E': 0}
 
     def test_with_mtp(self):
         # MTP pattern "MM" repeated 2 depths -> 4 extra mamba layers
-        assert get_hybrid_layer_counts("M*M*/MM/MM") == (2, 6, 0, 0)
+        assert get_hybrid_layer_counts("M*M*/MM/MM") == {'*': 2, 'M': 6, '-': 0, 'E': 0}
 
     def test_with_pipes_and_mtp(self):
         # Main: M-M-|M-M*- -> 1 attn, 4 mamba, 4 mlp
         # MTP: MM x 2 depths -> +4 mamba
-        assert get_hybrid_layer_counts("M-M-|M-M*-/MM/MM") == (1, 8, 4, 0)
+        assert get_hybrid_layer_counts("M-M-|M-M*-/MM/MM") == {'*': 1, 'M': 8, '-': 4, 'E': 0}
 
     def test_moe_pattern(self):
-        assert get_hybrid_layer_counts("MEME") == (0, 2, 0, 2)
+        assert get_hybrid_layer_counts("MEME") == {'*': 0, 'M': 2, '-': 0, 'E': 2}
 
     def test_mtp_with_attention(self):
         # MTP pattern "*M" repeated 3 depths -> 3 attn + 3 mamba from MTP
-        assert get_hybrid_layer_counts("MMMM/*M/*M/*M") == (3, 7, 0, 0)
+        assert get_hybrid_layer_counts("MMMM/*M/*M/*M") == {'*': 3, 'M': 7, '-': 0, 'E': 0}
 
     def test_empty_pattern(self):
-        assert get_hybrid_layer_counts("") == (0, 0, 0, 0)
+        assert get_hybrid_layer_counts("") == {'*': 0, 'M': 0, '-': 0, 'E': 0}
 
 
 @pytest.mark.internal

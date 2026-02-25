@@ -143,7 +143,7 @@ def get_hybrid_total_pipeline_segment_count(pattern: str) -> int:
     return main_pattern.count(Symbols.PIPE) + 1
 
 
-def get_hybrid_layer_counts(pattern: str) -> Tuple[int, int, int, int]:
+def get_hybrid_layer_counts(pattern: str) -> Dict[str, int]:
     """Count layers by type across the full hybrid pattern (main + MTP).
 
     Parses the pattern to extract main and MTP components, then counts
@@ -154,14 +154,15 @@ def get_hybrid_layer_counts(pattern: str) -> Tuple[int, int, int, int]:
         pattern: Full hybrid layer pattern string.
 
     Returns:
-        Tuple of (num_attention, num_mamba, num_mlp, num_moe) layer counts.
+        Dictionary mapping layer symbol to count. Keys are Symbols.ATTENTION,
+        Symbols.MAMBA, Symbols.MLP, and Symbols.MOE.
 
     Examples:
         >>> get_hybrid_layer_counts("M*M*")
-        (2, 2, 0, 0)
+        {'*': 2, 'M': 2, '-': 0, 'E': 0}
 
         >>> get_hybrid_layer_counts("M-M-|M-M*-/MM/MM")
-        (1, 8, 4, 0)
+        {'*': 1, 'M': 8, '-': 4, 'E': 0}
     """
     parsed = parse_hybrid_pattern(pattern)
     counts = {Symbols.ATTENTION: 0, Symbols.MAMBA: 0, Symbols.MLP: 0, Symbols.MOE: 0}
@@ -178,12 +179,7 @@ def get_hybrid_layer_counts(pattern: str) -> Tuple[int, int, int, int]:
             if char in counts:
                 counts[char] += parsed.mtp_num_depths
 
-    return (
-        counts[Symbols.ATTENTION],
-        counts[Symbols.MAMBA],
-        counts[Symbols.MLP],
-        counts[Symbols.MOE],
-    )
+    return counts
 
 
 def parse_hybrid_pattern(pattern: Optional[str]) -> ParsedHybridPattern:
