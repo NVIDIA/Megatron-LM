@@ -48,7 +48,7 @@ class BalancedCPScheduler:
         This is used to determine the CP size of a sub-sample.
 
         The number is rounded up to the next power of 2 to match the available
-        hybrid context parallel process group sizes.
+        dynamic context parallel process group sizes.
         """
         return max(1, 2 ** ceil(log2((seq_len / self.max_seq_len_per_rank))))
 
@@ -370,7 +370,7 @@ class BalancedCPScheduler:
             "try to increase 'max-seqlen-per-cp-rank'."
 
             min_group_size = min(existing_group_sizes)
-            # We have Hybrid DPxCP groups for every power of 2 of GPUs or the entire DPxCP group.
+            # We have Dynamic DPxCP groups for every power of 2 of GPUs or the entire DPxCP group.
             next_power = min(min_group_size * 2, total_gpus)
 
             # Find the first group of min_group_size that can be expanded
@@ -474,7 +474,7 @@ class BalancedCPScheduler:
         return groups, sample_id_groups
 
 
-def hybrid_context_parallel_forward_backward(
+def dynamic_context_parallel_forward_backward(
     forward_step_func,
     data_iterator,
     model,
@@ -492,7 +492,7 @@ def hybrid_context_parallel_forward_backward(
     model_type,
 ):
     """
-    Scheduler for Hybrid Context Parallel.
+    Scheduler for Dynamic Context Parallel.
 
     This function performs the packed sample scheduling and determines
     1. The number of microbatches to schedule for each CP rank

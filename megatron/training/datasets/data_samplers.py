@@ -39,8 +39,8 @@ def build_pretraining_data_loader(dataset, consumed_samples):
             data_parallel_size=mpu.get_data_parallel_world_size(),
         )
     elif args.dataloader_type == 'single':
-        if args.hybrid_context_parallel:
-            batch_sampler = HybridCPMegatronPretrainingSampler(
+        if args.dynamic_context_parallel:
+            batch_sampler = DynamicCPMegatronPretrainingSampler(
                 total_samples=len(dataset),
                 consumed_samples=consumed_samples,
                 micro_batch_size=args.micro_batch_size,
@@ -79,7 +79,7 @@ def build_pretraining_data_loader(dataset, consumed_samples):
         worker_init_fn if args.exit_signal_handler and args.num_workers > 0 else None
     )
     # Torch dataloader.
-    if args.hybrid_context_parallel:
+    if args.dynamic_context_parallel:
         extra_kwargs = {"collate_fn": lambda x: x,}
     else:
         extra_kwargs = {}
@@ -162,11 +162,11 @@ class MegatronPretrainingSampler:
             start_idx, end_idx = self.get_start_end_idx()
             yield batch[start_idx:end_idx]
 
-class HybridCPMegatronPretrainingSampler(MegatronPretrainingSampler):
+class DynamicCPMegatronPretrainingSampler(MegatronPretrainingSampler):
     """
-    Data sampler for hybrid context parallel (Hybrid CP) format.
+    Data sampler for dynamic context parallel (Dynamic CP) format.
     This data sampler pulls in the entire global batch at once across all data parallel ranks.
-    This helps provide the Hybrid CP Dataloader Wrapper to schedule and load balance sub-samples
+    This helps provide the Dynamic CP Dataloader Wrapper to schedule and load balance sub-samples
     of the entire global batch.
     """
 
