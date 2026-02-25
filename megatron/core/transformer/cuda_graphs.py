@@ -1131,8 +1131,10 @@ class _CudaGraphRunner(torch.nn.Module):
 
                 try:
                     ref = make_weak_ref(arg)
-                except (RuntimeError, TypeError):
-                    # Fall back to keeping a strong reference.
+                except RuntimeError:
+                    # Fallback to keeping a strong reference. There is a known bug where some
+                    # dtypes (e.g. torch.float64) are not mapped to a representation in
+                    # transformer_engine/pytorch/utils.py.
                     return arg
                 ref.requires_grad = arg.requires_grad
                 if hasattr(arg, "can_skip_replay_copy"):
