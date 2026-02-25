@@ -829,7 +829,7 @@ def compute_routing_scores_for_aux_loss(
             scores = torch.softmax(logits, dim=-1, dtype=torch.float32)
         elif score_function == "sigmoid":
             # Cast logits to float32 before sigmoid for stability
-            scores = torch.sigmoid(logits.to(torch.float32)) 
+            scores = torch.sigmoid(logits.to(torch.float32))
             scores = scores / (scores.sum(dim=-1, keepdim=True) + 1e-20)
         else:
             raise ValueError(f"Invalid score_function: {score_function}")
