@@ -1290,7 +1290,6 @@ class DynamicInferenceContext(BaseInferenceContext):
             explicit_chunked_prefill=self.is_chunked_prefill_enabled() and self.is_hybrid_model,
             ep_group=self.expert_model_parallel_group,
         )
-
         self._using_cuda_graph_this_step = best_graph is not None
 
         if self.using_cuda_graph_this_step():
