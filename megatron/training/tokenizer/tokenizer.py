@@ -871,6 +871,7 @@ class _NullTokenizer(MegatronLegacyTokenizer):
     def additional_special_tokens_ids(self):
         return None
 
+
 class _NullMultimodalTokenizer(MegatronLegacyTokenizer):
     def __init__(self, vocab_size, image_token=None, image_token_id=None):
         super().__init__(None, vocab_size=vocab_size)
