@@ -616,6 +616,13 @@ def save_checkpoint(iteration, model, optimizer, opt_param_scheduler, num_floati
                 save_strategy = get_default_save_sharded_strategy(args.ckpt_format)
                 if args.ckpt_assume_constant_structure and args.ckpt_format == 'torch_dist':
                     save_strategy.use_cached_ckpt_structure = args.ckpt_assume_constant_structure
+                    if args.async_save:
+                        save_strategy.thread_count = args.dist_ckpt_workers
+                    else:
+                        # We don't allow per-rank parallel save for sync save
+                        logger.warning('Per-rank parallel save is not supported for sync save. '
+                                       'Setting args.dist_ckpt_workers to 1')
+                        save_strategy.thread_count = 1
                     if checkpointing_context is not None and 'load_strategy' in checkpointing_context:
                         cached_global_metadata = getattr(checkpointing_context['load_strategy'], 'cached_global_metadata', None)
                         if cached_global_metadata is not None:
@@ -625,7 +632,11 @@ def save_checkpoint(iteration, model, optimizer, opt_param_scheduler, num_floati
                             logger.debug("Failed to plug in the read metadata from the load strategy...")
 
                 if args.ckpt_fully_parallel_save:
-                    save_strategy = FullyParallelSaveStrategyWrapper(save_strategy, mpu.get_data_parallel_group(with_context_parallel=True),
+                    if args.ckpt_fully_parallel_save_process_group == 'dp':
+                        process_group = mpu.get_data_parallel_group(with_context_parallel=True)
+                    elif args.ckpt_fully_parallel_save_process_group == 'ep_dp':
+                        process_group = mpu.get_expert_data_parallel_group()
+                    save_strategy = FullyParallelSaveStrategyWrapper(save_strategy, process_group,
                                                                      args.ckpt_assume_constant_structure)
             # Store save strategy for future checkpoint saves
             if checkpointing_context is not None:
@@ -1122,8 +1133,15 @@ def _load_global_dist_base_checkpoint(
     load_strategy = get_default_load_sharded_strategy(checkpoint_name)
     # NOTE: `args.ckpt_fully_parallel_load` applies to both persistent and non-persistent checkpoints.
     if args.ckpt_fully_parallel_load:
+        if args.ckpt_fully_parallel_load_process_group == 'dp':
+            process_group = mpu.get_data_parallel_group(with_context_parallel=True)
+        elif args.ckpt_fully_parallel_load_process_group == 'ep_dp':
+            process_group = mpu.get_expert_data_parallel_group()
+        else:
+            raise ValueError(f"Invalid load process group: {args.ckpt_fully_parallel_load_process_group}")
+
         load_strategy = FullyParallelLoadStrategyWrapper(
-            load_strategy, mpu.get_data_parallel_group(with_context_parallel=True)
+            load_strategy, process_group, exchange_algo=args.ckpt_fully_parallel_load_exchange_algo
         )
     if checkpointing_context is not None:
         checkpointing_context["load_strategy"] = load_strategy

@@ -10,6 +10,15 @@ on:
         required: false
         type: string
         default: "main"
+      test_suite:
+        description: "Test suite to run"
+        required: false
+        type: choice
+        options:
+          - "all"
+          - "unit-only"
+          - "functional-only"
+        default: "all"
 
 jobs:
   trigger-mbridge-tests:
@@ -28,6 +37,6 @@ jobs:
           client_payload: |
             {
               "mcore_ref": "${{ github.sha }}",
-              "test_suite": "all",
+              "test_suite": "${{ inputs.test_suite }}",
               "triggered_by": "https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}"
             }
