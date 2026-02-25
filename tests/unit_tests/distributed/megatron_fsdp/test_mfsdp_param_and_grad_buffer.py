@@ -246,7 +246,10 @@ def test_parameter_splitting(
                 )
 
                 for item_id, param in enumerate(param_list):
-                    elem_per_slice = param.shape[1:].numel()
+                    if len(param.shape) == 1:
+                        elem_per_slice = 1
+                    else:
+                        elem_per_slice = param.shape[1:].numel()
 
                     # Tensor shard
                     if data_parallel_sharding_strategy != "no_shard":
