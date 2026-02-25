@@ -1806,13 +1806,14 @@ def megatron_rl_inference_mode(
         # Reset drop_and_pad leaked from inference decode
         set_decode_expert_padding(unwrap_model(model[0]), set_to=False)
 
-        # Change cudagraph scope for training
-        model[0].config.cuda_graph_scope = [
-            CudaGraphScope.mamba,
-            CudaGraphScope.attn,
-            CudaGraphScope.moe_router,
-            CudaGraphScope.moe_preprocess,
-        ]
+        # Restore partial capture cudagraph scope for training if this is MoE
+        if args.num_experts:
+            model[0].config.cuda_graph_scope = [
+                CudaGraphScope.mamba,
+                CudaGraphScope.attn,
+                CudaGraphScope.moe_router,
+                CudaGraphScope.moe_preprocess,
+            ]
 
         # Switch MoE layers to partial CUDA graph capture for training
         if args.rl_training_cuda_graphs and args.num_experts is not None:

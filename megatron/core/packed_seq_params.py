@@ -42,7 +42,6 @@ class PackedSeqParams:
         # preventing it from being forwarded to TransformerEngine's attention forward().
 
         # Example: [0, 5, 7, 11] -> [0, 5, 7, 11, 16]
-        torch.distributed.breakpoint()
         cu_seqlens = (
             self.cu_seqlens_q_padded if self.cu_seqlens_q_padded is not None else self.cu_seqlens_q
         )
