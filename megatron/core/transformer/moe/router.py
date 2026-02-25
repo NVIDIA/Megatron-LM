@@ -23,7 +23,6 @@ from megatron.core.transformer.moe.moe_utils import (
 )
 from megatron.core.transformer.moe.router_replay import RouterReplay
 from megatron.core.transformer.transformer_config import TransformerConfig
-import logging
 
 class Router(ABC, MegatronModule):
     """Base Router class"""

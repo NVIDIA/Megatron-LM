@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import warnings
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
 from typing import Optional, Protocol, Union
@@ -28,6 +29,25 @@ from megatron.core.transformer.spec_utils import ModuleSpec, build_module
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.typed_torch import apply_module
 from megatron.core.utils import internal_api
+from megatron.core.transformer.moe.token_dispatcher_inference import (
+    InferenceAllGatherTokenDispatcher,
+)
+try:
+    import flashinfer.fused_moe as fused_moe
+    from flashinfer.fused_moe.core import ActivationType
+    HAVE_FLASHINFER = True
+except ImportError:
+    HAVE_FLASHINFER = False
+
+if HAVE_FLASHINFER:
+    try: 
+        import flashinfer_cubin 
+        import flashinfer_jit_cache 
+        HAVE_FLASHINFER_CUBIN_AND_JIT_CACHE = True
+    except ImportError:
+        HAVE_FLASHINFER_CUBIN_AND_JIT_CACHE = False
+
+from megatron.core.activations import squared_relu
 
 try:
     import transformer_engine as te  # pylint: disable=unused-import
@@ -248,7 +268,14 @@ class MoELayer(BaseMoELayer):
 
         # Inference-optimized mode setup
         if config.transformer_impl == "inference_optimized":
+            assert HAVE_FLASHINFER, "flashinfer-python is required for inference-optimized MoE implementation."
+            if not HAVE_FLASHINFER_CUBIN_AND_JIT_CACHE:
+                warnings.warn(
+                    "flashinfer-cubin and/or flashinfer-jit-cache not found. "
+                    "The FlashInfer cutlass kernel will be JIT compiled, which may take a long time."
+                )
             self._setup_inference_mode(pg_collection)
+
 
         # Cudagraph tensor store for resuming the forward pass from the end of the cudagraph.
         self.cudagraph_tensor_store = MoECudaGraphTensorStore()
@@ -262,10 +289,7 @@ class MoELayer(BaseMoELayer):
         Creates an InferenceAllGatherTokenDispatcher alongside the standard dispatcher,
         which is swapped in during CUDA-graphed forward passes.
         """
-        from megatron.core.transformer.moe.token_dispatcher_inference import (
-            InferenceAllGatherTokenDispatcher,
-        )
-
+        
         assert self.config.moe_token_dispatcher_type == "alltoall", (
             f"Inference-optimized MoE requires 'alltoall' dispatcher, "
             f"got '{self.config.moe_token_dispatcher_type}'"
@@ -386,10 +410,6 @@ class MoELayer(BaseMoELayer):
 
     def _fused_experts_compute(self, hidden_states: torch.Tensor, probs: torch.Tensor):
         """FlashInfer fused MoE kernel for CUDA-graphed inference iterations."""
-        import flashinfer.fused_moe as fused_moe
-        from flashinfer.fused_moe.core import ActivationType
-
-        from megatron.core.activations import squared_relu
 
         assert not self.config.gated_linear_unit, (
             "FlashInfer MoE kernel currently only supports non-gated activations. "
