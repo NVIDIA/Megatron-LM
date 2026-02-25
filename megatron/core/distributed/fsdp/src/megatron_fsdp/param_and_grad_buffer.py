@@ -263,130 +263,217 @@ def _pad(number_to_be_padded: int, divisor: int) -> int:
 
 
 def build_data_parallel_buffer_index(
-    elements: List[torch.Size],
+    param_shapes: List[torch.Size],
     data_parallel_rank: int,
     data_parallel_world_size: int,
     is_data_distributed: bool,
     ddp_config: DistributedDataParallelConfig,
     bucket_id: int = 0,
     chunk_size_factor: int = 1,
-) -> Tuple[List[tuple], BucketIndex, ShardBucketIndex]:
+) -> Tuple[Dict[int, TensorItemIndex], BucketIndex, ShardBucketIndex]:
     """
-    Assuming that all input tensor elements contiguously compose a global
-    buffer, give the index range of every tensor, the bucket in the buffer,
-    and the (distributed) shard within the bucket. Note that the global bucket
-    buffer is only temporarily allocated, but is abstractly tracked via indices
-    deduced from the number of raw parameters assigned to this buffer / bucket.
+    Build indexing metadata for parameters packed into a single data-parallel
+    buffer, including bucket and shard indices.
+
+    All tensors in `param_shapes` are assumed to be laid out contiguously in a
+    global buffer for this bucket. The function computes:
+      - where each parameter lives in that buffer (global offset and size),
+      - bucket-level metadata,
+      - and, if sharding is enabled, per-rank shard metadata.
+
+    `chunk_size_factor` is used to ensure that splitting only happens along the
+    first tensor dimension: the product of all remaining dimensions is treated
+    as the minimal indivisible unit when packing. In other words, the buffer
+    is aligned in multiples of `chunk_size_factor`, and leftover space may be
+    filled with smaller “fragment” tensors so that total padding is minimized.
 
     Args:
-        elements (List[torch.Size]): List of input tensor.
-        data_parallel_rank (int): Rank of the current process in the data parallel group.
-        data_parallel_world_size (int): World size of the data parallel group.
-        bucket_id (int, optional): The id of the bucket. Defaults to 0.
+        param_shapes:
+            List of parameter shapes to be packed into the global buffer.
+        data_parallel_rank:
+            Rank of the current process in the data-parallel group.
+        data_parallel_world_size:
+            World size of the data-parallel group.
+        is_data_distributed:
+            Whether parameters/gradients are distributed across ranks.
+        ddp_config:
+            Configuration object controlling DDP and sharding behavior.
+        bucket_id:
+            Identifier of the bucket to which these parameters belong.
+        chunk_size_factor:
+            Alignment unit along the flattened buffer. The first dimension is
+            the only allowed split dimension; the product of remaining
+            dimensions must be a multiple of this factor to be split.
 
     Returns:
-        Tuple[Dict[int, TensorItemIndex], BucketIndex, ShardBucketIndex]: The index
-            range of every tensor, every bucket and every in bucket local buffer.
+        item_index_map:
+            A mapping from parameter id to its buffer index metadata.
+        bucket_index:
+            Index metadata for the full (possibly padded) bucket buffer.
+        shard_bucket_index:
+            Sharded bucket metadata for the current data-parallel rank.
     """
 
-    def _pad_if_needed(data_index: int) -> int:
+    def _pad_if_needed(global_index: int) -> int:
+        """Optionally pad the buffer length for sharding alignment."""
         if ddp_config.data_parallel_sharding_strategy != "no_shard":
-            return _pad(data_index, data_parallel_world_size * chunk_size_factor)
-        return data_index
+            return _pad(global_index, data_parallel_world_size * chunk_size_factor)
+        return global_index
 
-    def add_item(item_id, item, offset, item_index_map):
-        # The item index map contains information on where each parameter item will
-        # be stored in the tensor data buffer in a bucket.
-        item_index_map[item_id] = TensorItemIndex(
-            # Global data index of the starting idx of this parameter
-            # = running global data index + updated bucket size - the parameter size.
+    def add_item(
+        param_id: int, shape: torch.Size, offset: int, item_index_map: Dict[int, TensorItemIndex]
+    ) -> None:
+        """Register a single parameter’s index information in the global buffer."""
+        item_index_map[param_id] = TensorItemIndex(
+            # Global flat buffer offset of this parameter.
             global_data_index=offset,
-            # Number of tensor elements in the parameter.
-            size=item.numel(),
-            # Index of the parameter to be buffered in the list of parameter shapes.
-            item_id=item_id,
-            # ID of the bucket that this parameter belongs to.
+            # Number of elements in the parameter tensor.
+            size=shape.numel(),
+            # Index of this parameter in the original `param_shapes` list.
+            item_id=param_id,
+            # Bucket this parameter belongs to.
             bucket_id=bucket_id,
-            # Shape of the parameter.
-            shape=item,
+            # Original tensor shape.
+            shape=shape,
         )
 
-    fragment_items = []
-    regular_items = []
-    for item_id, item in enumerate(elements):
-        if item.numel() < chunk_size_factor:
-            fragment_items.append((item_id, item))
+    # Separate “regular” items (at least one full alignment unit) from small fragments.
+    fragment_params: List[Tuple[int, torch.Size]] = []
+    regular_params: List[Tuple[int, torch.Size]] = []
+
+    for param_id, shape in enumerate(param_shapes):
+        if shape.numel() < chunk_size_factor:
+            fragment_params.append((param_id, shape))
         else:
-            item[1:].numel()
-            regular_items.append((item_id, item))
+            regular_params.append((param_id, shape))
 
-    # Sort the fragments so that items with larger sizes come first.
-    # When filling the remaining space, prioritize placing the larger fragments first.
-    sorted(fragment_items, key=lambda id_item: -id_item[1].numel())
+    # Sort fragments so larger ones are placed first when filling gaps.
+    fragment_params.sort(key=lambda pair: -pair[1].numel())
 
-    # For all bucket parameters, add information on the parameter to the item index map,
-    # and add the size of the parameter to the bucket.
-    item_index_map = {}
-    data_index = 0
-    while len(regular_items) > 0:
-        item_id, item = regular_items.pop(0)
-        add_item(item_id, item, data_index, item_index_map)
-        if item.numel() % chunk_size_factor == 0:
-            data_index += item.numel()
+    item_index_map: Dict[int, TensorItemIndex] = {}
+    global_data_index = 0
+
+    # First pass: place all regular parameters, trying to pack their remainders together.
+    while regular_params:
+        param_id, shape = regular_params.pop(0)
+        numel = shape.numel()
+
+        # Place the main body of the parameter.
+        add_item(param_id, shape, global_data_index, item_index_map)
+
+        # If perfectly aligned, just advance.
+        if numel % chunk_size_factor == 0:
+            global_data_index += numel
             continue
 
-        gap_offset = data_index + item.numel()
-        data_index += (item.numel() // chunk_size_factor + 1) * chunk_size_factor
-        remain = item.numel() % chunk_size_factor
-        space = chunk_size_factor - remain
-        found_rhs = False
-        for id_rhs in regular_items[:]:
-            rhs_id, rhs = id_rhs
-            if rhs.numel() % chunk_size_factor == 0:
+        # Otherwise, this parameter creates a partial “grid” at the tail.
+        gap_offset = global_data_index + numel
+        full_aligned_size = (numel // chunk_size_factor + 1) * chunk_size_factor
+        global_data_index += full_aligned_size
+
+        remainder = numel % chunk_size_factor
+        remaining_space = chunk_size_factor - remainder
+
+        # Try to pair another misaligned regular parameter to fill the same grid.
+        rhs_found = False
+        rhs_param_id = None
+        rhs_shape = None
+
+        for candidate in list(regular_params):
+            cand_id, cand_shape = candidate
+            cand_numel = cand_shape.numel()
+            if cand_numel % chunk_size_factor == 0:
+                # Already aligned, skip for pairing.
                 continue
-            rhs_remain = rhs.numel() % chunk_size_factor
-            if remain + rhs_remain <= chunk_size_factor:
-                found_rhs = True
-                regular_items.remove(id_rhs)
+            cand_remainder = cand_numel % chunk_size_factor
+            if remainder + cand_remainder <= chunk_size_factor:
+                rhs_found = True
+                rhs_param_id, rhs_shape = cand_id, cand_shape
+                regular_params.remove(candidate)
                 break
 
-        # If a item is found to have remnants, then the remnants of the two
-        # items are placed in one "grid".
-        if found_rhs:
-            add_item(rhs_id, rhs, data_index - rhs_remain, item_index_map)
-            space -= rhs_remain
-            data_index += rhs.numel() // chunk_size_factor * chunk_size_factor
+        # If we find a partner, place its remainder into the same grid.
+        if rhs_found and rhs_param_id is not None and rhs_shape is not None:
+            rhs_numel = rhs_shape.numel()
+            rhs_remainder = rhs_numel % chunk_size_factor
 
-        # Try adding the fragments into the gaps
-        for id_frag in fragment_items[:]:
-            frag_id, frag = id_frag
-            if frag.numel() > space:
+            # Place the full parameter; its remainder lands at the end of this grid.
+            add_item(rhs_param_id, rhs_shape, global_data_index - rhs_numel, item_index_map)
+
+            remaining_space -= rhs_remainder
+            # Advance only by the aligned part; the remainder is in the current grid.
+            global_data_index += (rhs_numel // chunk_size_factor) * chunk_size_factor
+
+        # Fill any remaining space in this grid with fragment parameters.
+        for frag in list(fragment_params):
+            frag_id, frag_shape = frag
+            frag_numel = frag_shape.numel()
+            if frag_numel > remaining_space:
                 continue
-            add_item(frag_id, frag, gap_offset, item_index_map)
-            space -= frag.numel()
-            gap_offset += frag.numel()
-            fragment_items.remove(id_frag)
+            add_item(frag_id, frag_shape, gap_offset, item_index_map)
+            remaining_space -= frag_numel
+            gap_offset += frag_numel
+            fragment_params.remove(frag)
 
-    for frag_id, frag in fragment_items:
-        add_item(frag_id, frag, data_index, item_index_map)
-        data_index += frag.numel()
+    # Helper to bin-pack leftover fragments into grids of size `chunk_size_factor`.
+    def pack_fragments(
+        fragments: List[Tuple[int, torch.Size]], capacity: int
+    ) -> List[List[Tuple[int, torch.Size]]]:
+        """
+        Pack remaining fragment parameters into fixed-capacity slots.
 
-    # Bucket index contains information on what tensor items are in this bucket.
+        Each slot corresponds to one alignment grid of size `capacity`
+        (equal to `chunk_size_factor`). A slot contains a list of
+        (param_id, shape) pairs whose total numel does not exceed `capacity`.
+        """
+        # Largest fragments first improves packing efficiency.
+        sorted_frags = sorted(fragments, key=lambda pair: -pair[1].numel())
+
+        slots: List[List[Tuple[int, torch.Size]]] = []
+
+        for param in sorted_frags:
+            param_id, shape = param
+            param_size = shape.numel()
+            placed = False
+
+            for slot in slots:
+                used = sum(p[1].numel() for p in slot)
+                if used + param_size <= capacity:
+                    slot.append(param)
+                    placed = True
+                    break
+
+            if not placed:
+                slots.append([param])
+
+        return slots
+
+    # Second pass: any fragments that were not used to fill gaps get their own grids.
+    if fragment_params:
+        fragment_slots = pack_fragments(fragment_params, chunk_size_factor)
+        for slot in fragment_slots:
+            offset_within_grid = 0
+            for param_id, shape in slot:
+                add_item(param_id, shape, global_data_index + offset_within_grid, item_index_map)
+                offset_within_grid += shape.numel()
+            global_data_index += chunk_size_factor
+
+    # Build bucket-level index.
     bucket_index = BucketIndex(
         bucket_id=bucket_id,
         global_data_index=0,
-        size=_pad_if_needed(data_index),
+        size=_pad_if_needed(global_data_index),
         items=list(item_index_map.values()),
     )
 
-    # Sharded bucket index contains local bucket shard information.
+    # Build sharded bucket index for this DP rank.
     shard_bucket_index = _get_dp_buffer_shard_bucket_index(
-        bucket_index, is_data_distributed, data_parallel_world_size, data_parallel_rank
+        bucket_index=bucket_index,
+        is_data_distributed=is_data_distributed,
+        data_parallel_world_size=data_parallel_world_size,
+        data_parallel_rank=data_parallel_rank,
     )
 
-    # Return the tensor item index map in the buffer,
-    # the bucket index with information on what items this bucket contains,
-    # and the sharded bucket index.
     return item_index_map, bucket_index, shard_bucket_index
 
 
