@@ -1685,7 +1685,7 @@ class DynamicInferenceEngine(AbstractEngine):
                 except Exception:
                     pass
             for socket in getattr(self, 'zmq_sockets', []):
-                socket.close()
+                socket.close(linger=0)
             if hasattr(self, 'zmq_sockets'):
                 self.zmq_sockets.clear()
             if hasattr(self, "expert_parallel_zmq_communicator"):

@@ -106,5 +106,5 @@ class AsyncZMQCommunicator:
         """
         Close the ZMQ sockets.
         """
-        self.gather_sock.close()
-        self.bcast_sock.close()
+        self.gather_sock.close(linger=0)
+        self.bcast_sock.close(linger=0)

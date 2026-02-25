@@ -237,5 +237,5 @@ class InferenceClient:
             if not future.done():
                 future.cancel()
         self.completion_futures.clear()
-        self.socket.close()
+        self.socket.close(linger=0)
         self.context.term()
