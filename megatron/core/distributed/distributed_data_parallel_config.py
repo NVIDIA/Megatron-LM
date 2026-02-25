@@ -105,7 +105,6 @@ class DistributedDataParallelConfig:
       The follwoing will be the expected number of SM usage for various cases.
       (Note that this is just a reference number and the number of SM usage could vary 
       on message size, communication domain size and nccl version.)
-      ----------------------------------------------------------
       | Communication domain | use_sharp | SM usage of "AG/RS" |
       |----------------------|-----------|---------------------|
       | NVL                  | N/A       | 4 / 5               |
@@ -113,7 +112,6 @@ class DistributedDataParallelConfig:
       | NVL+IB               | True      | 6 / 6               |
       | IB                   | False     | 1 / 4               |
       | IB                   | True      | 1 / 1               |
-      ----------------------------------------------------------
     """
 
     fsdp_double_buffer: bool = False
@@ -131,6 +129,14 @@ class DistributedDataParallelConfig:
        user buffer with the cost of more memory usage. If false, FSDP will use
        Dynamic memory allocator, NCCL user buffer won't not enabled, which 
        usually leads to low performance. 
+    """
+
+    fsdp_all_gather_in_start_param_sync: bool = True
+    """
+    If True, use all-gather during the initial Megatron-FSDP parameter
+    synchronization step. This can increase overlap between the first
+    parameter all-gather and computation, helping to better hide the
+    initial communication cost.
     """
 
     outer_dp_sharding_strategy: str = 'no_shard'

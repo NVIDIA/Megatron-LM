@@ -21,7 +21,7 @@ COMMON_OPTIONS="\
     --attention-backend flash \
     --timing-log-level 1 \
     --log-timers-to-tensorboard \
-    --save-retain-interval 120 \
+    --save-retain-interval 160 \
     --inference-dynamic-batching-num-cuda-graphs 1 \
     --inference-dynamic-batching-unified-memory-level 1 \
     --adam-beta1 0.9 \
@@ -38,5 +38,5 @@ else
 fi
 
 if [ ${ENABLE_CUDA_GRAPH:-true} == true ]; then
-    COMMON_OPTIONS="${COMMON_OPTIONS} --cuda-graph-impl=local"
+    COMMON_OPTIONS="${COMMON_OPTIONS} --cuda-graph-impl=local --rl-persist-cuda-graphs"
 fi
