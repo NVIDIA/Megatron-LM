@@ -40,6 +40,8 @@ from megatron.training import (
     print_rank_0,
     set_startup_timestamps,
 )
+from megatron.core.transformer.multi_token_prediction import mtp_on_this_rank
+from megatron.training.arguments import core_transformer_config_from_args
 from megatron.training.datasets.sft_dataset import SFTDataset, IGNORE_INDEX
 from megatron.training.utils import (
     get_blend_and_blend_per_split,
@@ -71,6 +73,7 @@ def get_batch(data_iterator, vp_stage=None):
         return None, None, None, None, None, None
 
     args = get_args()
+    config = core_transformer_config_from_args(args)
 
     cp_size = args.context_parallel_size
     tp_size = args.tensor_model_parallel_size
@@ -93,9 +96,9 @@ def get_batch(data_iterator, vp_stage=None):
 
     if is_sft:
         batch = preprocess_sft_batch(batch, tp_rank=tp_rank, cp_size=cp_size, tp_size=tp_size, sp=sp, padding_token_id=get_tokenizer().pad, padding_label_id=IGNORE_INDEX, max_seq_len=max_seq_len)        
-
+    # TODO(asolergi-nv): config from args?
     # TODO(asolergi-nv): Fuse TP Sharing!
-    batch = get_batch_on_this_tp_rank(batch, broadcast_src_rank=mpu.get_tensor_model_parallel_src_rank(), broadcast_group=mpu.get_tensor_model_parallel_group(), is_sft=is_sft, cp_size=cp_size, tp_rank=tp_rank, micro_batch_size=args.micro_batch_size, seq_length=args.seq_length, mtp_on_this_rank=False, pipeline_model_parallel_size=args.pipeline_model_parallel_size, is_pipeline_first_stage=mpu.is_pipeline_first_stage(), is_pipeline_last_stage=mpu.is_pipeline_last_stage()) # TODO(asolergi-nv): Add mtp_on_this_rank condition?
+    batch = get_batch_on_this_tp_rank(batch, broadcast_src_rank=mpu.get_tensor_model_parallel_src_rank(), broadcast_group=mpu.get_tensor_model_parallel_group(), is_sft=is_sft, cp_size=cp_size, tp_rank=tp_rank, micro_batch_size=args.micro_batch_size, seq_length=args.seq_length, mtp_on_this_rank=mtp_on_this_rank(layout=config.pipeline_model_parallel_layout, mtp_num_layers=config.mtp_num_layers, ignore_virtual=False, vp_stage=vp_stage), pipeline_model_parallel_size=args.pipeline_model_parallel_size, is_pipeline_first_stage=mpu.is_pipeline_first_stage(), is_pipeline_last_stage=mpu.is_pipeline_last_stage()) # TODO(asolergi-nv): Add mtp_on_this_rank condition?
     batch = get_batch_on_this_cp_rank(batch, cp_group=get_context_parallel_group())
 
     return batch.values()
