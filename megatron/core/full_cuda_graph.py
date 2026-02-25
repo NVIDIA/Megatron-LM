@@ -7,6 +7,7 @@ import logging
 import torch
 
 from megatron.core.tensor_parallel.random import get_all_rng_states
+from megatron.core.transformer.moe.paged_stash import check_paged_stash_overflow, paged_stash_reset
 
 logger = logging.getLogger(__name__)
 
@@ -98,10 +99,18 @@ class FullCudaGraphWrapper:
     cuda_graph = {'training': None, 'validation': None}
     result = {'training': None, 'validation': None}
 
-    def __init__(self, forward_backward_func, cuda_graph_warmup_steps=1):
+    def __init__(
+        self,
+        forward_backward_func,
+        cuda_graph_warmup_steps=1,
+        moe_paged_stash=False,
+        moe_expert_rank_capacity_factor=None,
+    ):
         self.forward_backward_func = forward_backward_func
         self.static_loader = StaticBufferLoader()
         self.cuda_graph_warmup_steps = cuda_graph_warmup_steps
+        self.moe_paged_stash = moe_paged_stash
+        self.moe_expert_rank_capacity_factor = moe_expert_rank_capacity_factor
 
     def data_read(self, data_iterator, model, training, num_microbatches):
         """Read all microbatch inputs from Dataloader and copy to static buffers."""
@@ -180,14 +189,29 @@ class FullCudaGraphWrapper:
             torch.cuda.synchronize()
             torch.distributed.barrier()
             logger.info(f'CUDA graph capture done for {training_str}!!!')
-
         if FullCudaGraphWrapper.cuda_graph[training_str] is None:
             FullCudaGraphWrapper.result[training_str] = self.forward_backward_func(*args, **kwargs)
         else:
             FullCudaGraphWrapper.cuda_graph[training_str].replay()
-
+        check_paged_stash_overflow()
+        self.speculative_cuda_graph_check(model)
         self.next_iter(training_str)
         return FullCudaGraphWrapper.result[training_str]
+
+    def speculative_cuda_graph_check(self, model):
+        '''check speculative execution modules'''
+        if self.moe_expert_rank_capacity_factor is not None:
+            # Check if there is any overflow in the receiving buffer
+            over_budget = torch.zeros(1, dtype=torch.bool, device='cuda')
+            for model_chunk in model:
+                for layer in model_chunk.module.module.decoder.layers:
+                    mlp = layer.mlp
+                    if hasattr(mlp, 'token_dispatcher') and hasattr(
+                        mlp.token_dispatcher, 'check_over_budget'
+                    ):
+                        over_budget |= mlp.token_dispatcher.check_over_budget()
+            if over_budget.item():
+                raise Exception(f"Rank {torch.distributed.get_rank()} overbudget")
 
     def curr_iter(self, stage):
         """Return current training/validation iteration."""

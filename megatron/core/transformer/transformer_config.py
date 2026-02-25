@@ -658,11 +658,20 @@ class TransformerConfig(ModelParallelConfig):
     If negative, generates bias once per layer and reuses it (abs value is std).
     This is an experimental feature for benchmarking purposes."""
 
+    log_overload_factor: bool = False
+    """If True, log MoE router overload factors: avg_overload_factor, max_overload_factor
+    (load imbalance across EP ranks), and max_cum_overload_factor (peak cumulative tokens
+    ratio for forward/backward memory analysis)."""
+
     moe_grouped_gemm: bool = False
     """When there are multiple experts per rank, compress multiple local (potentially small) gemms
     in a single kernel launch to improve the utilization and performance by leveraging the Grouped
     GEMM feature introduced since CUTLASS 2.8 (https://github.com/fanshiqing/grouped_gemm).
     """
+
+    moe_use_device_initiated_grouped_gemm: bool = False
+    """Use the cutlass grouped gemm kernel, which allows for the token_per_expert tensor on GPU.
+    This can prevent the GPU-CPU synchronization during the grouped gemm."""
 
     moe_use_legacy_grouped_gemm: bool = False
     """Use legacy GroupedMLP rather than TEGroupedMLP.
@@ -738,6 +747,9 @@ class TransformerConfig(ModelParallelConfig):
     """Number of SMs to use for HybridEP. In pure NVL scenarios,
     16 SMs can generally achieve good bandwidth."""
 
+    moe_expert_rank_capacity_factor: Optional[float] = None
+    """The capacity factor for each expert, None means no token will be dropped.
+    The default is None."""
     ##################
     # Context Parallel
     ##################
@@ -920,6 +932,18 @@ class TransformerConfig(ModelParallelConfig):
     """
     min_offloaded_tensor_size: int = 1024 * 1024
     """The minimum size of the tensor to be offloaded."""
+
+    moe_paged_stash: bool = False
+    """If True, enable paged stash for MoE expert activations."""
+
+    stash_modules: Optional[list[str]] = None
+    """The MoE submodules to stash activations for.
+    choices: "expert_fc1", "moe_act", "expert_fc2".
+    "expert_fc1": stash the input of the expert fc1 part.
+    "moe_act": stash the input of the moe activation part.
+    "expert_fc2": stash the input of the expert fc2 part.
+    """
+
 
     def __post_init__(self):
         """Python dataclass method that is used to modify attributes after initialization.
@@ -1160,6 +1184,18 @@ class TransformerConfig(ModelParallelConfig):
                     "moe_expert_capacity_factor must be set to use moe_pad_expert_input_to_capacity"
                 )
 
+        if self.moe_expert_rank_capacity_factor is not None:
+            if not self.moe_use_device_initiated_grouped_gemm:
+                raise ValueError(
+                    "moe_expert_rank_capacity_factor requires "
+                    "moe_use_device_initiated_grouped_gemm to be enabled."
+                )
+            if self.moe_flex_dispatcher_backend != "hybridep":
+                raise ValueError(
+                    "moe_expert_rank_capacity_factor requires moe_flex_dispatcher_backend to be "
+                    "'hybridep'."
+                )
+
         if self.cpu_offloading and (
             self.cpu_offloading_num_layers < 0 or self.cpu_offloading_num_layers >= self.num_layers
         ):
@@ -1316,6 +1352,30 @@ class TransformerConfig(ModelParallelConfig):
                     "because the input of attn_proj is the output of core_attn, "
                     "which is needed in core_attn.backward()."
                 )
+        if self.moe_paged_stash:
+            assert (
+                not self.cpu_offloading and not self.fine_grained_activation_offloading
+            ), "paged_stash cannot be enabled with cpu_offloading."
+            assert (
+                self.stash_modules is not None and len(self.stash_modules) > 0
+            ), "stash_modules must be specified when moe_paged_stash is enabled."
+            allowed_modules = {"expert_fc1", "expert_fc2", "moe_act"}
+            invalid_modules = set(self.stash_modules) - allowed_modules
+            assert not invalid_modules, (
+                f'Invalid choices for stash_modules: {invalid_modules}. '
+                f'Allowed modules are: {allowed_modules}'
+            )
+            assert (
+                self.moe_expert_rank_capacity_factor is not None
+            ), "moe_expert_rank_capacity_factor must be set when moe_paged_stash is enabled."
+
+        # Check that no module is both stashed and offloaded
+        if self.stash_modules and self.offload_modules:
+            overlap = set(self.stash_modules) & set(self.offload_modules)
+            assert not overlap, (
+                f"A module cannot be stashed and offloaded at the same time. "
+                f"Found overlapping modules: {overlap}"
+            )
 
         if (
             self.num_layers_in_first_pipeline_stage is not None
