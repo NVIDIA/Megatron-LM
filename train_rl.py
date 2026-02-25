@@ -277,16 +277,10 @@ def forward_step(data_iterator, model: GPTModel, loss_only: bool = False):
 
     # Get current logprobs and calculate loss with straggler detection
     with stimer:
-        if not torch.is_grad_enabled():
-            with disable_cuda_graphs(model_to_use):
-                logprobs_or_hidden_states = get_logprobs(
-                    model_to_use, tokens, position_ids, no_grad=True, packed_seq_params=packed_seq_params
-                )
-        else:
-            logprobs_or_hidden_states = get_logprobs(
-                model_to_use, tokens, position_ids, no_grad=False,
-                packed_seq_params=packed_seq_params
-            )
+        logprobs_or_hidden_states = get_logprobs(
+            model_to_use, tokens, position_ids, no_grad=False,
+            packed_seq_params=packed_seq_params
+        )
 
         if not is_pipeline_last_stage():
             output_tensor = logprobs_or_hidden_states
