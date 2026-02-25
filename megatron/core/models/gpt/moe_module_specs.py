@@ -6,7 +6,6 @@ from megatron.core.extensions.transformer_engine_spec_provider import TESpecProv
 from megatron.core.models.backends import BackendSpecProvider, LocalSpecProvider, InferenceSpecProvider
 from megatron.core.transformer.mlp import MLPSubmodules
 from megatron.core.transformer.moe.moe_layer import MoELayer, MoESubmodules
-from megatron.core.transformer.moe.moe_layer_inference import InferenceMoELayer
 from megatron.core.transformer.moe.shared_experts import SharedExpertMLP
 from megatron.core.transformer.spec_utils import ModuleSpec
 from megatron.core.transformer.moe.router import InferenceTopKRouter
@@ -84,7 +83,8 @@ def get_inference_optimized_moe_spec() -> ModuleSpec:
     """MoE module spec for inference-optimized transformer impl.
 
     Uses InferenceSpecProvider to select inference-optimized modules:
-    InferenceMoELayer, InferenceTopKRouter, InferenceGroupedMLP.
+    InferenceTopKRouter, InferenceGroupedMLP. MoELayer detects inference mode
+    via config.transformer_impl and sets up the inference dispatcher internally.
 
     Called by mamba_layer_specs.py and gpt_layer_specs.py.
     """
@@ -106,7 +106,7 @@ def get_inference_optimized_moe_spec() -> ModuleSpec:
     )
 
     return ModuleSpec(
-        module=InferenceMoELayer,
+        module=MoELayer,
         submodules=MoESubmodules(
             router=InferenceTopKRouter,
             experts=experts,

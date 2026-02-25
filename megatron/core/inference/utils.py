@@ -134,7 +134,7 @@ def set_decode_expert_padding(model, set_to: bool = False, capacity_factor: int 
 def set_is_cuda_graphed_iteration_for_ep_inference(model, set_to: bool):
     """
     Toggle CUDA graph compatibility for expert parallel inference. 
-    This sets a boolean flag in all InferenceMoELayers to indicate whether
+    This sets a boolean flag in all MoELayers to indicate whether
     the current iteration is being captured/executed in a CUDA graph. 
     This allows the dispatcher to adjust its behavior for CUDA graph compatibility,
     Args:

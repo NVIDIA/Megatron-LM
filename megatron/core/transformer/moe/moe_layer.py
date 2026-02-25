@@ -246,9 +246,56 @@ class MoELayer(BaseMoELayer):
             if self.shared_expert_overlap:
                 self.token_dispatcher.set_shared_experts(self.shared_experts)
 
+        # Inference-optimized mode setup
+        if config.transformer_impl == "inference_optimized":
+            self._setup_inference_mode(pg_collection)
+
         # Cudagraph tensor store for resuming the forward pass from the end of the cudagraph.
         self.cudagraph_tensor_store = MoECudaGraphTensorStore()
         self.fwd_execution_map = ["route", "expert_compute", "postprocess"]
+
+
+    def _setup_inference_mode(self, pg_collection):
+        """Set up inference-optimized token dispatcher and state.
+
+        Called from __init__ when config.transformer_impl == "inference_optimized".
+        Creates an InferenceAllGatherTokenDispatcher alongside the standard dispatcher,
+        which is swapped in during CUDA-graphed forward passes.
+        """
+        from megatron.core.transformer.moe.token_dispatcher_inference import (
+            InferenceAllGatherTokenDispatcher,
+        )
+
+        assert self.config.moe_token_dispatcher_type == "alltoall", (
+            f"Inference-optimized MoE requires 'alltoall' dispatcher, "
+            f"got '{self.config.moe_token_dispatcher_type}'"
+        )
+        self.is_cuda_graphed_iteration = False
+        self._inference_token_dispatcher = InferenceAllGatherTokenDispatcher(
+            self.num_local_experts,
+            self.local_expert_indices,
+            config=self.config,
+            pg_collection=pg_collection,
+        )
+
+    def set_is_cuda_graphed_iteration(self, set_to: bool):
+        """Toggle CUDA-graphed iteration mode on this layer and its router."""
+        self.is_cuda_graphed_iteration = set_to
+        if hasattr(self.router, 'set_is_cuda_graphed_iteration'):
+            self.router.set_is_cuda_graphed_iteration(set_to)
+
+    def _activate_inference_token_dispatcher(self):
+        """Swap in the inference-optimized token dispatcher."""
+        self._saved_token_dispatcher = self.token_dispatcher
+        self.token_dispatcher = self._inference_token_dispatcher
+        self._saved_shared_expert_overlap = self.shared_expert_overlap
+        self.shared_expert_overlap = False
+
+    def _deactivate_inference_token_dispatcher(self):
+        """Restore the standard token dispatcher."""
+        self.token_dispatcher = self._saved_token_dispatcher
+        self.shared_expert_overlap = self._saved_shared_expert_overlap
+
 
     @maybe_skip_or_early_return_by_cudagraph("route")
     def route(self, hidden_states: torch.Tensor, padding_mask: Optional[torch.Tensor] = None):
@@ -325,6 +372,9 @@ class MoELayer(BaseMoELayer):
         for each expert. It then passes the tokens through the local experts.
         The output from the experts is preprocessed for the combine step.
         """
+        if not self.training and self.is_cuda_graphed_iteration:
+            return self._fused_experts_compute(hidden_states, probs)
+
         dispatched_input, tokens_per_expert, permuted_probs = (
             self.token_dispatcher.dispatch_postprocess(hidden_states, probs)
         )
@@ -333,6 +383,43 @@ class MoELayer(BaseMoELayer):
         output = self.token_dispatcher.combine_preprocess(expert_output)
 
         return output, mlp_bias
+
+    def _fused_experts_compute(self, hidden_states: torch.Tensor, probs: torch.Tensor):
+        """FlashInfer fused MoE kernel for CUDA-graphed inference iterations."""
+        import flashinfer.fused_moe as fused_moe
+        from flashinfer.fused_moe.core import ActivationType
+
+        from megatron.core.activations import squared_relu
+
+        assert not self.config.gated_linear_unit, (
+            "FlashInfer MoE kernel currently only supports non-gated activations. "
+            f"Got gated_linear_unit={self.config.gated_linear_unit}"
+        )
+        assert self.config.activation_func == squared_relu, (
+            "FlashInfer MoE kernel currently only supports squared_relu activation. "
+            f"Got activation_func={self.config.activation_func}"
+        )
+
+        w1 = self.experts._fc1_weight
+        w2 = self.experts._fc2_weight
+        selected_experts = self.token_dispatcher.routing_map
+        ep_size = utils.get_pg_size(self.ep_group)
+        ep_rank = utils.get_pg_rank(self.ep_group)
+
+        output = fused_moe.cutlass_fused_moe(
+            hidden_states,
+            selected_experts.to(torch.int),
+            probs.float(),
+            w1,
+            w2,
+            hidden_states.dtype,
+            quant_scales=None,
+            activation_type=ActivationType.Relu2,
+            ep_size=ep_size,
+            ep_rank=ep_rank,
+        )[0]
+
+        return output, None
 
     def combine(self, output: torch.Tensor):
         """Combines expert outputs via communication and adds shared expert output.
@@ -393,6 +480,15 @@ class MoELayer(BaseMoELayer):
         if padding_mask is not None:
             padding_mask = padding_mask.transpose(0, 1).bool()
 
+        # Swap in inference-optimized dispatcher for CUDA-graphed iterations
+        _use_inference_dispatcher = (
+            not self.training
+            and self.is_cuda_graphed_iteration
+            and self._inference_token_dispatcher is not None
+        )
+        if _use_inference_dispatcher:
+            self._activate_inference_token_dispatcher()
+
         # MoE forward: route -> dispatch -> compute -> combine
         def custom_forward(hidden_states, intermediate_tensors=None, padding_mask=None):
             try:
@@ -437,7 +533,7 @@ class MoELayer(BaseMoELayer):
 
             return output, mlp_bias
 
-        if self.moe_layer_recompute:
+        if self.moe_layer_recompute and not _use_inference_dispatcher:
             if self.config.fp8 or self.config.fp4:
                 outputs = te_checkpoint(
                     custom_forward,
@@ -454,6 +550,9 @@ class MoELayer(BaseMoELayer):
                 )
         else:
             outputs = custom_forward(hidden_states, intermediate_tensors, padding_mask)
+
+        if _use_inference_dispatcher:
+            self._deactivate_inference_token_dispatcher()
 
         return outputs
 
