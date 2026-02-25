@@ -906,7 +906,7 @@ class TextGenerationController:
         mtp_output_tokens = torch.empty_like(mtp_output_tokens_jumbled)
         mtp_output_tokens[:, token_order] = mtp_output_tokens_jumbled
 
-        ### ================ PART 3 This part is to do the fowlling : ================
+        ### ================ PART 3 This part is to do the following : ================
         # Create the accepted tokens tensor
         # For prefill it is always set to 1
         # For decode, the first token is always accepted, then we compare with input tokens and accept the next tokens if its a match
@@ -928,27 +928,46 @@ class TextGenerationController:
             ), f"Expected input_tokens_required to have 1 row, but got {input_tokens_required.shape}"
             input_tokens_required = input_tokens_required.squeeze(0)
 
-        # This is to get the place where the output sampled speculative token is equal to input token
-        output_right_shifted = output_tokens.roll(1)
-        accepted_tokens_mask = input_tokens_required == output_right_shifted
+        # Initialize mask with False to prevent boundary bleed
+        accepted_tokens_mask = torch.zeros_like(input_tokens_required, dtype=torch.bool)
 
         # This is to make all prefill tokens accepted
         token_to_prefill_idx = torch.repeat_interleave(request_in_prefill_status_tensor, repeats)
-        accepted_tokens_mask[token_to_prefill_idx == 1] = 1
+        accepted_tokens_mask[token_to_prefill_idx == 1] = True
 
-        # This is to make first decode token in all requests accepted
-        deocde_query_starts = torch.arange(num_decode_requests) * (1 + self.num_speculative_tokens)
-        accepted_tokens_mask[deocde_query_starts] = 1
+        # Safe decode token verification without cross-batch boundary contamination
+        if num_decode_requests > 0:
+            decode_len = num_decode_requests * (self.num_speculative_tokens + 1)
+
+            decode_inputs = input_tokens_required[:decode_len].reshape(
+                num_decode_requests, self.num_speculative_tokens + 1
+            )
+            decode_outputs = output_tokens[:decode_len].reshape(
+                num_decode_requests, self.num_speculative_tokens + 1
+            )
+
+            # Shift outputs right by 1 *within* each request to align sampled tokens with input targets
+            decode_outputs_shifted = decode_outputs.roll(1, dims=1)
+
+            decode_mask_2d = decode_inputs == decode_outputs_shifted
+
+            # The first token (base token) is always accepted
+            decode_mask_2d[:, 0] = True
+
+            # ENFORCE CONSECUTIVE ACCEPTANCE:
+            # cummin() on booleans propagates False (0) to the right, invalidating all subsequent mismatches
+            decode_mask_2d = decode_mask_2d.cummin(dim=1).values
+
+            # Put the consecutive-enforced mask back into the flattened 1D tensor
+            accepted_tokens_mask[:decode_len] = decode_mask_2d.flatten()
 
         # This is to find the index of the last 1 in every request
+        # (Now mathematically guaranteed to be the final consecutive match)
         last_one_indices = torch.full(
             (active_request_count,), -1, device=token_to_request_index.device
         )
-        last_one_indices[token_to_request_index[accepted_tokens_mask == 1]] = torch.where(
-            accepted_tokens_mask == 1
-        )[
-            0
-        ]  # [1, 5, 6]
+        valid_indices = torch.nonzero(accepted_tokens_mask).squeeze(-1)
+        last_one_indices[token_to_request_index[valid_indices]] = valid_indices
 
         # These are the tokens (output + speculative tokens) that will be going to the next forward pass
         final_sampled_tokens = output_tokens[last_one_indices]
@@ -957,8 +976,8 @@ class TextGenerationController:
             :, last_one_indices
         ]
 
-        ### ================ PART 4 This part is to do the fowlling : ================
-        # To fill the speculative otkens and accepted_token counts
+        ### ================ PART 4 This part is to do the following : ================
+        # To fill the speculative tokens and accepted_token counts
         # For prefill it is always set to 1
         # For decode, the first token is always accepted, then we compare with input tokens and accept the next tokens if its a match
         # Then find the index of the last 1 in every request of the accepted tokens tensor
@@ -968,7 +987,7 @@ class TextGenerationController:
         # input_tokens_required:              [ a5  a6s  a7s |  b3    b4s  b5s   |  c6   c7s   c8s   |     d2      |         e4         ]  # Size 11
         # Accepted tokens  mask               [  1   1    0  |  1      1    1    |   1    0     0    |      1      |         1          ]
         # Accepted tokens                     [   [a6s  -1]  |     [b4s  b5s]    |     [-1  -1]      ]  # Only handle decod requests, (Prefill already defaults to -1s)
-        # Accepted token counts               [   1        |        2         |        0             ]  # Prefill defaults to 0
+        # Accepted token counts               [      1       |         2         |         0         ]  # Prefill defaults to 0
 
         # This part is to extract the accepted tokens
         input_tokens_required[accepted_tokens_mask == 0] = -1  # Masks out non accepted tokens
