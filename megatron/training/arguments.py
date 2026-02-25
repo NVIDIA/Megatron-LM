@@ -1690,7 +1690,7 @@ def _add_inference_args(parser):
     group.add_argument('--inference-dynamic-batching-prefix-caching',
                        dest='inference_dynamic_batching_enable_prefix_caching',
                        action=argparse.BooleanOptionalAction,
-                       default=True,
+                       default=False,
                        help='Enable/disable prefix caching for dynamic batching inference. '
                        'When disabled, KV cache blocks cannot be shared between '
                        'requests with identical prompt prefixes.')

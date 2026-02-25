@@ -27,7 +27,7 @@ class BlockAllocator:
         context: "DynamicInferenceContext",
         total_count: int,
         paused_count: int,
-        enable_prefix_caching: bool = True,
+        enable_prefix_caching: bool = False,
         block_evict_lru: bool = False,
     ):
 
