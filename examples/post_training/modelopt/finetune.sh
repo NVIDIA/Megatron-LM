@@ -38,6 +38,12 @@ if [ -z ${MLM_DATA_ARGS} ]; then
     "
 fi
 
+if [[ -v CP && "$CP" != "1" ]]; then
+  BACKEND="fused"
+else
+  BACKEND="auto"
+fi
+
 if [ -z ${MLM_TRAIN_ARGS} ]; then
     MLM_TRAIN_ARGS=" \
         --no-gradient-accumulation-fusion \
@@ -48,6 +54,7 @@ if [ -z ${MLM_TRAIN_ARGS} ]; then
         --attention-dropout 0.0 \
         --hidden-dropout 0.0 \
         --no-check-for-nan-in-loss-and-grad \
+        --attention-backend ${BACKEND} \
     "
 fi
 
@@ -83,6 +90,7 @@ ${LAUNCH_SCRIPT} ${SCRIPT_DIR}/finetune.py \
     --expert-model-parallel-size ${EP} \
     --pipeline-model-parallel-size ${PP} \
     --context-parallel-size ${CP} \
+    --cp-comm-type p2p \
     --tokenizer-model ${TOKENIZER_MODEL} \
     --load ${MLM_MODEL_CKPT} \
     --save ${MLM_MODEL_SAVE} \
