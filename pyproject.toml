@@ -63,7 +63,7 @@ Download = "https://github.com/NVIDIA/Megatron-LM/releases"
 Homepage = "https://github.com/NVIDIA/Megatron-LM"
 
 [project.optional-dependencies]
-mlm = [
+training = [
     "flask-restful",
     "sentencepiece",
     "tiktoken",
@@ -72,7 +72,8 @@ mlm = [
     "accelerate",
 ]
 
-training = [
+### 'mlm' group is deprecated. please use 'training' instead ###
+mlm = [
     "flask-restful",
     "sentencepiece",
     "tiktoken",
