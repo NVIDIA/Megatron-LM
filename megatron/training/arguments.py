@@ -1893,7 +1893,7 @@ def _add_network_size_args(parser):
     return parser
 
 def _add_straggler_detector_args(parser):
-    from megatron.training.resilience_config import StragglerDetectionConfig
+    from megatron.training.config import StragglerDetectionConfig
 
     straggler_factory = ArgumentGroupFactory(StragglerDetectionConfig)
     group = straggler_factory.build_group(parser, "straggler")
@@ -2001,7 +2001,7 @@ def _add_ft_package_args(parser):
 
 
 def _add_logging_args(parser):
-    from megatron.training.training_config import LoggerConfig
+    from megatron.training.config import LoggerConfig
 
     log_factory = ArgumentGroupFactory(LoggerConfig, exclude = ["log_throughput_to_tensorboard", "throughput_window_size", "memory_keys", "log_l2_norm_grad_to_tensorboard", "log_runtime_to_tensorboard", "runtime_time_unit", "filter_warnings", "modules_to_filter", "set_level_for_all_loggers", "save_config_filepath"])
     group = log_factory.build_group(parser, title="logging")
@@ -2186,8 +2186,8 @@ def _add_rl_args(parser):
     return parser
 
 def _add_training_args(parser):
-    from megatron.training.training_config import TrainingConfig
-    from megatron.training.common_config import ProfilingConfig
+    from megatron.training.config import TrainingConfig
+    from megatron.training.config import ProfilingConfig
 
     prof_factory = ArgumentGroupFactory(ProfilingConfig, exclude=["record_shapes", "nvtx_ranges"])
     prof_group = prof_factory.build_group(parser, "profiling")
@@ -2286,7 +2286,7 @@ def _add_training_args(parser):
 
 
 def _add_rerun_machine_args(parser):
-    from megatron.training.resilience_config import RerunStateMachineConfig
+    from megatron.training.config import RerunStateMachineConfig
 
     rerun_factory = ArgumentGroupFactory(RerunStateMachineConfig, exclude=["check_for_nan_in_loss"])
     group = rerun_factory.build_group(parser, "rerun engine")
@@ -2295,7 +2295,7 @@ def _add_rerun_machine_args(parser):
 
 
 def _add_initialization_args(parser):
-    from megatron.training.common_config import RNGConfig
+    from megatron.training.config import RNGConfig
 
     rng_factory = ArgumentGroupFactory(RNGConfig)
     group = rng_factory.build_group(parser, "RNG and initialization")
@@ -2307,7 +2307,7 @@ def _add_initialization_args(parser):
 
 
 def _add_learning_rate_args(parser):
-    from megatron.training.training_config import SchedulerConfig
+    from megatron.training.config import SchedulerConfig
 
     sched_factory = ArgumentGroupFactory(SchedulerConfig, exclude=["no_weight_decay_cond_type"])
     group = sched_factory.build_group(parser, title="learning rate and weight decay")
@@ -2332,7 +2332,7 @@ def _add_learning_rate_args(parser):
 
 
 def _add_checkpointing_args(parser):
-    from megatron.training.training_config import CheckpointConfig
+    from megatron.training.config import CheckpointConfig
 
     ckpt_factory = ArgumentGroupFactory(CheckpointConfig, exclude=["most_recent_k", "save_tokenizer_assets", "save_optim", "save_rng", "load_optim", "load_rng"])
     group = ckpt_factory.build_group(parser, "checkpointing")
@@ -2393,7 +2393,7 @@ def _add_mixed_precision_args(parser):
 
 
 def _add_distributed_args(parser):
-    from megatron.training.common_config import DistributedInitConfig
+    from megatron.training.config import DistributedInitConfig
 
     dist_init_factory = ArgumentGroupFactory(DistributedInitConfig)
     group = dist_init_factory.build_group(parser, "distributed init")
@@ -2512,7 +2512,7 @@ def _add_distributed_args(parser):
 
 
 def _add_validation_args(parser):
-    from megatron.training.training_config import ValidationConfig
+    from megatron.training.config import ValidationConfig
 
     val_factory = ArgumentGroupFactory(ValidationConfig)
     group = val_factory.build_group(parser, "validation")
