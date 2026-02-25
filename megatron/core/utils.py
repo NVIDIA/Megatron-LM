@@ -2359,7 +2359,6 @@ def get_batch_on_this_cp_rank(
     """
 
     if batch["cu_seqlens"] is not None:
-        print(f"OEOEOEOEOEOEOEOEOEOEOOEOE")
         batch = get_sft_batch_on_this_cp_rank(batch, cp_group=cp_group)
     else:
         batch = get_pretrain_batch_on_this_cp_rank(batch, cp_group=cp_group)
