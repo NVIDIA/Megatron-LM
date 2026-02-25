@@ -615,15 +615,21 @@ def validate_args(args, defaults={}):
                 )
         args.num_layers = num_layers_in_pattern
 
-        # These arguments are incompatible with --hybrid-layer-pattern
-        assert args.decoder_first_pipeline_num_layers is None, (
-            'If --hybrid-layer-pattern is specified, --decoder-first-pipeline-num-layers '
-            'should not be specified'
-        )
-        assert args.decoder_last_pipeline_num_layers is None, (
-            'If --hybrid-layer-pattern is specified, --decoder-last-pipeline-num-layers '
-            'should not be specified'
-        )
+        # first/last pipeline num layers are incompatible with pipe-separated patterns
+        # (the pipe separators already define the pipeline layout explicitly), but are
+        # allowed for pipe-free patterns where they control uneven PP splitting.
+        has_pipes = Symbols.PIPE in args.hybrid_layer_pattern.split(sep)[0]
+        if has_pipes:
+            assert args.decoder_first_pipeline_num_layers is None, (
+                'If --hybrid-layer-pattern contains pipe separators, '
+                '--decoder-first-pipeline-num-layers should not be specified '
+                'as the pipeline layout is explicitly defined.'
+            )
+            assert args.decoder_last_pipeline_num_layers is None, (
+                'If --hybrid-layer-pattern contains pipe separators, '
+                '--decoder-last-pipeline-num-layers should not be specified '
+                'as the pipeline layout is explicitly defined.'
+            )
         assert args.num_layers_per_virtual_pipeline_stage is None, (
             '--num-layers-per-virtual-pipeline-stage should not be used with '
             '--hybrid-layer-pattern. To specify virtual pipelining, describe a number of '
@@ -654,19 +660,25 @@ def validate_args(args, defaults={}):
         hybrid_pipeline_segments = get_hybrid_total_pipeline_segment_count(
             args.hybrid_layer_pattern
         )
-        assert hybrid_pipeline_segments % args.transformer_pipeline_model_parallel_size == 0, (
-            'The number of hybrid pipeline segments described by --hybrid-layer-pattern must '
-            'be evenly divisible by --pipeline-model-parallel-size. '
-            f'Got {hybrid_pipeline_segments} segments and '
-            f'{args.transformer_pipeline_model_parallel_size} pipeline parallel size.'
-        )
-        if hybrid_pipeline_segments > args.transformer_pipeline_model_parallel_size:
-            # Must be set here in order to assign virtual parallel ranks in training.py/get_model
-            args.virtual_pipeline_model_parallel_size = (
-                hybrid_pipeline_segments // args.transformer_pipeline_model_parallel_size
-            )
-        else:
+        if hybrid_pipeline_segments == 1 and args.transformer_pipeline_model_parallel_size > 1:
+            # No pipes in pattern -- PP will be handled by select_pipeline_segment
+            # at model init time (for backwards compatibility).
             args.virtual_pipeline_model_parallel_size = None
+        else:
+            assert hybrid_pipeline_segments % args.transformer_pipeline_model_parallel_size == 0, (
+                'The number of hybrid pipeline segments described by --hybrid-layer-pattern must '
+                'be evenly divisible by --pipeline-model-parallel-size. '
+                f'Got {hybrid_pipeline_segments} segments and '
+                f'{args.transformer_pipeline_model_parallel_size} pipeline parallel size.'
+            )
+            if hybrid_pipeline_segments > args.transformer_pipeline_model_parallel_size:
+                # Must be set here in order to assign virtual parallel ranks in
+                # training.py/get_model
+                args.virtual_pipeline_model_parallel_size = (
+                    hybrid_pipeline_segments // args.transformer_pipeline_model_parallel_size
+                )
+            else:
+                args.virtual_pipeline_model_parallel_size = None
 
     # Infer mtp_num_layers from unified pattern
     if args.hybrid_layer_pattern and sep in args.hybrid_layer_pattern:

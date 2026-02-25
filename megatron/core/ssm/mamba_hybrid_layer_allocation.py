@@ -6,7 +6,7 @@ from typing import Dict, List, Optional, Tuple
 
 import torch
 
-from megatron.core.utils import log_on_each_pipeline_stage
+from megatron.core.utils import log_on_each_pipeline_stage, log_single_rank
 
 logger = logging.getLogger(__name__)
 
@@ -305,19 +305,30 @@ def validate_segment_layers(segment: str) -> List[str]:
 
 
 def select_pipeline_segment(
-    main_pattern: str, pp_group: Optional[torch.distributed.ProcessGroup], vp_stage: Optional[int]
+    main_pattern: str,
+    pp_group: Optional[torch.distributed.ProcessGroup],
+    vp_stage: Optional[int],
+    first_stage_layers: Optional[int] = None,
+    last_stage_layers: Optional[int] = None,
 ) -> Tuple[List[str], int]:
     """Select and validate the pipeline segment for the given PP rank and VP stage.
 
-    Splits the main pattern by '|' into pipeline segments, determines which
-    segment belongs to this rank based on PP rank and VP stage, validates the
-    segment's layer symbols, and logs the assignment.
+    When the main pattern contains '|' pipe separators, splits by '|' into
+    pipeline segments and selects the segment for the current PP rank / VP stage.
+
+    When the pattern has no pipes but pp_size > 1, falls back to runtime layer
+    slicing (for backwards compatibility), supporting both even and uneven PP splits
+    via first_stage_layers / last_stage_layers.
 
     Args:
         main_pattern: Main decoder pattern (may contain '|' separators).
             Empty string is allowed (produces one empty segment).
         pp_group: Pipeline parallel process group, or None if not using PP.
         vp_stage: Virtual pipeline stage, or None if not using VPP.
+        first_stage_layers: Number of layers on the first pipeline stage for
+            uneven PP. Only valid when the pattern has no pipe separators.
+        last_stage_layers: Number of layers on the last pipeline stage for
+            uneven PP. Only valid when the pattern has no pipe separators.
 
     Returns:
         Tuple of (layer_type_list, layer_offset) where layer_type_list is
@@ -325,15 +336,113 @@ def select_pipeline_segment(
         is the sum of layer counts from all preceding segments.
 
     Raises:
-        ValueError: If the segment contains invalid layer symbols.
-        IndexError: If the computed segment index is out of range.
+        ValueError: If the segment contains invalid layer symbols, if
+            first/last_stage_layers are used with pipe separators, if VPP is
+            requested without pipe separators, or if layer counts are not
+            evenly divisible across pipeline stages.
     """
     segments = main_pattern.split(Symbols.PIPE) if main_pattern else ['']
 
     pp_rank = torch.distributed.get_rank(pp_group) if pp_group is not None else 0
     pp_size = torch.distributed.get_world_size(pp_group) if pp_group is not None else 1
+
+    if len(segments) > 1 and (first_stage_layers is not None or last_stage_layers is not None):
+        raise ValueError(
+            "Cannot specify num_layers_in_first_pipeline_stage or "
+            "num_layers_in_last_pipeline_stage when hybrid_layer_pattern "
+            "contains pipe ('|') separators. The pipeline layout is already "
+            "explicitly defined by the pipe separators."
+        )
+
+    if len(segments) == 1 and pp_size > 1:
+        if vp_stage is not None:
+            raise ValueError(
+                "Virtual pipeline parallelism (vp_stage != None) is not supported "
+                "when hybrid_layer_pattern has no pipe ('|') separators. "
+                "Add '|' separators to define explicit pipeline/virtual-pipeline "
+                "stage boundaries."
+            )
+        log_single_rank(
+            logger,
+            logging.WARNING,
+            "DEPRECATION: Using hybrid_layer_pattern without pipe ('|') separators "
+            "with pipeline_model_parallel_size > 1 is deprecated. Please add '|' "
+            "separators to explicitly define pipeline stage boundaries. "
+            "Example: 'M*M*M*M*' with pp_size=2 should become 'M*M*|M*M*'.",
+        )
+        full_pattern = segments[0]
+        layer_type_list = validate_segment_layers(full_pattern)
+        num_layers = len(layer_type_list)
+
+        if first_stage_layers is not None or last_stage_layers is not None:
+            first = first_stage_layers or 0
+            last = last_stage_layers or 0
+            middle_num_layers = num_layers - first - last
+            middle_stages = pp_size - sum(
+                1 for x in (first_stage_layers, last_stage_layers) if x is not None
+            )
+            if middle_stages > 0:
+                if middle_num_layers % middle_stages != 0:
+                    raise ValueError(
+                        f"Middle layers ({middle_num_layers}) must be evenly divisible "
+                        f"by middle pipeline stages ({middle_stages})."
+                    )
+                layers_per_middle = middle_num_layers // middle_stages
+            else:
+                layers_per_middle = 0
+
+            is_first = first_stage_layers is not None and pp_rank == 0
+            is_last = last_stage_layers is not None and pp_rank == pp_size - 1
+
+            if is_first:
+                offset = 0
+                count = first
+            elif is_last:
+                offset = num_layers - last
+                count = last
+            else:
+                middle_rank = pp_rank if first_stage_layers is None else pp_rank - 1
+                offset = middle_rank * layers_per_middle + first
+                count = layers_per_middle
+        else:
+            if num_layers % pp_size != 0:
+                raise ValueError(
+                    f"Number of layers ({num_layers}) must be evenly divisible "
+                    f"by pipeline-model-parallel-size ({pp_size}) when no pipe "
+                    f"separators are specified in the pattern."
+                )
+            layers_per_rank = num_layers // pp_size
+            offset = pp_rank * layers_per_rank
+            count = layers_per_rank
+
+        selected = layer_type_list[offset : offset + count]
+        log_on_each_pipeline_stage(
+            logger,
+            logging.INFO,
+            f"MambaModel: pp_rank={pp_rank}/{pp_size}, vp_stage={vp_stage}, "
+            f"layers='{''.join(selected)}' ({len(selected)} layers), "
+            f"layer_offset={offset} (auto-split)",
+        )
+        return selected, offset
+
+    # Pipe-based segment selection
+    if len(segments) > 1 and len(segments) % pp_size != 0:
+        raise ValueError(
+            f"The number of pipe-delimited segments ({len(segments)}) in "
+            f"hybrid_layer_pattern must be evenly divisible by "
+            f"pipeline_model_parallel_size ({pp_size})."
+        )
+
     vp_rel = vp_stage if vp_stage is not None else 0
     segment_index = vp_rel * pp_size + pp_rank
+
+    if segment_index >= len(segments):
+        raise ValueError(
+            f"Pipeline segment index {segment_index} (pp_rank={pp_rank}, "
+            f"vp_stage={vp_rel}) is out of range for {len(segments)} segments. "
+            f"The pattern does not define enough pipe-delimited segments for "
+            f"the current PP/VPP configuration."
+        )
 
     layer_offset = sum(len(segments[i]) for i in range(segment_index))
     my_segment = segments[segment_index]

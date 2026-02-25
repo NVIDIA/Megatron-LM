@@ -167,7 +167,11 @@ class MambaModel(LanguageModule):
         self.mtp_num_depths = parsed.mtp_num_depths
 
         layer_type_list, layer_offset = select_pipeline_segment(
-            parsed.main_pattern or '', self.pg_collection.pp, vp_stage
+            parsed.main_pattern or '',
+            self.pg_collection.pp,
+            vp_stage,
+            first_stage_layers=self.config.num_layers_in_first_pipeline_stage,
+            last_stage_layers=self.config.num_layers_in_last_pipeline_stage,
         )
 
         # Determine if MTP is needed (based on pattern parsing)
