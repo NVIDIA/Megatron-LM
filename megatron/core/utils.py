@@ -2096,7 +2096,7 @@ def preprocess_sft_batch(batch: Dict[str, Any], tp_rank: int, cp_size: int, tp_s
             'labels': labels.unsqueeze(0).cuda(non_blocking=True), # NOTE(asolergi-nv): Add back batch dimension
             'loss_mask': loss_mask.unsqueeze(0).cuda(non_blocking=True), # NOTE(asolergi-nv): Add batch dimension
             'cu_seqlens': cu_seqlens.cuda(non_blocking=True),
-            'cu_seqlens_padded': cu_seqlens_padded.cuda(non_blocking=True),
+            'cu_seqlens_padded': cu_seqlens_padded.cuda(non_blocking=True) if cu_seqlens_padded is not None else None,
             'max_seqlen': max_seqlen.cuda(non_blocking=True),
         }
     return batch
@@ -2105,7 +2105,7 @@ def preprocess_sft_batch(batch: Dict[str, Any], tp_rank: int, cp_size: int, tp_s
 ### tensor parallel ####
 ########################
 
-def get_sft_batch_on_this_tp_rank(batch: dict[str, torch.Tensor], broadcast_src_rank: int, broadcast_group: torch.distributed.ProcessGroup, tp_rank: int, micro_batch_size: int, seq_length: int, mtp_on_this_rank: bool = False, pipeline_model_parallel_size: int = 1, is_pipeline_first_stage: bool = False, is_pipeline_last_stage: bool = False):
+def get_batch_on_this_tp_rank(batch: dict[str, torch.Tensor], broadcast_src_rank: int, broadcast_group: torch.distributed.ProcessGroup, is_sft: bool, cp_size: int, tp_rank: int, micro_batch_size: int, seq_length: int, mtp_on_this_rank: bool = False, pipeline_model_parallel_size: int = 1, is_pipeline_first_stage: bool = False, is_pipeline_last_stage: bool = False):
     # TODO(asolergi-nv): Enable PP wit sft
     # TODO(asolergi-nv): Enable SFT & Pretraining
 
@@ -2137,15 +2137,21 @@ def get_sft_batch_on_this_tp_rank(batch: dict[str, torch.Tensor], broadcast_src_
             _broadcast(batch['tokens'])
             _broadcast(batch['labels'])
             _broadcast(batch['loss_mask'])
-            _broadcast_cu_seqlens(batch['cu_seqlens'])
-            _broadcast_cu_seqlens(batch['cu_seqlens_padded'])
-            _broadcast(batch['max_seqlen'])
+            if is_sft:
+                _broadcast_cu_seqlens(batch['cu_seqlens'])
+                _broadcast(batch['max_seqlen'])
+                if cp_size > 1:
+                    _broadcast_cu_seqlens(batch['cu_seqlens_padded'])
+            
 
         elif is_pipeline_first_stage:
             _broadcast(batch['tokens'])
-            _broadcast_cu_seqlens(batch['cu_seqlens'])
-            _broadcast_cu_seqlens(batch['cu_seqlens_padded'])
-            _broadcast(batch['max_seqlen'])
+            if is_sft:
+                _broadcast_cu_seqlens(batch['cu_seqlens'])
+                _broadcast(batch['max_seqlen'])
+                if cp_size > 1:
+                    _broadcast_cu_seqlens(batch['cu_seqlens_padded'])
+            
 
         elif is_pipeline_last_stage:
             # Multi-Token Prediction (MTP) layers need tokens and position_ids to calculate embedding.
@@ -2175,12 +2181,13 @@ def get_sft_batch_on_this_tp_rank(batch: dict[str, torch.Tensor], broadcast_src_
 
         cu_seqlens = None
         cu_seqlens_padded = None
-
-        max_seqlen = torch.empty(
-            1,
-            dtype=torch.int32,
-            device=torch.cuda.current_device(),
-        )
+        max_seqlen = None
+        if is_sft:
+            max_seqlen = torch.empty(
+                1,
+                dtype=torch.int32,
+                device=torch.cuda.current_device(),
+            )
 
         def _broadcast_cu_seqlens():
             dev = torch.cuda.current_device()
@@ -2203,18 +2210,24 @@ def get_sft_batch_on_this_tp_rank(batch: dict[str, torch.Tensor], broadcast_src_
             _broadcast(tokens)
             _broadcast(labels)
             _broadcast(loss_mask)
-            cu_seqlens = _broadcast_cu_seqlens()
-            cu_seqlens_padded = _broadcast_cu_seqlens()
-            _broadcast(max_seqlen)
+            if is_sft:
+                cu_seqlens = _broadcast_cu_seqlens()
+                _broadcast(max_seqlen)
+                if cp_size > 1:
+                    cu_seqlens_padded = _broadcast_cu_seqlens()
+            
 
         elif is_pipeline_first_stage:
             labels = None
             loss_mask = None
 
             _broadcast(tokens)
-            cu_seqlens = _broadcast_cu_seqlens()
-            cu_seqlens_padded = _broadcast_cu_seqlens()
-            _broadcast(max_seqlen)
+            if is_sft:
+                cu_seqlens = _broadcast_cu_seqlens()
+                _broadcast(max_seqlen)
+                if cp_size > 1:
+                    cu_seqlens_padded = _broadcast_cu_seqlens()
+            
 
         elif is_pipeline_last_stage:
             # Multi-Token Prediction (MTP) layers need tokens and position_ids to calculate embedding.
@@ -2307,6 +2320,7 @@ def get_batch_on_this_cp_rank(
     """
 
     if batch["cu_seqlens"] is not None:
+        print(f"OEOEOEOEOEOEOEOEOEOEOOEOE")
         batch = get_sft_batch_on_this_cp_rank(batch, cp_group=cp_group)
     else:
         batch = get_pretrain_batch_on_this_cp_rank(batch, cp_group=cp_group)
