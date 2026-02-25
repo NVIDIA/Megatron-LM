@@ -1,4 +1,8 @@
-## Quick Start
+---
+orphan: true
+---
+
+# Quick Start
 
 This guide for Megatron Core walks you through the following tasks:
 
@@ -10,7 +14,7 @@ This guide for Megatron Core walks you through the following tasks:
 
 **NOTE:** The following sample was tested using Megatron Core version 0.8.0 and NGC PyTorch Container version 24.02.
 
-### Set Up Your Environment
+## Set Up Your Environment
 
 1. Run a new Docker container.
 
@@ -29,7 +33,7 @@ This guide for Megatron Core walks you through the following tasks:
 
 For a more comprehensive overview of different installation methods, refer to the [Installation Guide](https://github.com/NVIDIA/Megatron-LM/blob/main/megatron/core/Installation_Guide.md)
 
-### Write Your First Training Loop
+## Write Your First Training Loop
 
 In this task, you create a sample GPT model split across tensors (Tensor model parallel) on two GPUS, and run a forward pass through it using a MockGPT dataset helper class that was created in Megatron Core.
 
@@ -251,7 +255,7 @@ In this task, you create a sample GPT model split across tensors (Tensor model p
 
     <br>
 
-### Review Advanced Examples
+## Review Advanced Examples
 
 To review more advanced examples, explore [pretrain_gpt.py](https://github.com/NVIDIA/Megatron-LM/blob/main/pretrain_gpt.py). ``pretrain_gpt.py`` has more complex training loops and includes the following Megatron Core features:
 
