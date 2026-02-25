@@ -771,9 +771,9 @@ def compute_group_stats(
             roll_turn_lens = [len(t) for t in rollout.trajectory]
             group_turn_lengths.extend(roll_turn_lens)
             group_traj_lengths.append(sum(roll_turn_lens))
-            group_policy_staleness.append(max(s for turn in rollout.policy_staleness for s in turn))
-            group_kv_staleness.append(max(s for turn in rollout.kv_cache_staleness for s in turn))
-            group_completed_at_steps.append(max(rollout.completed_at_step))
+            group_policy_staleness.extend(s for turn in rollout.policy_staleness for s in turn)
+            group_kv_staleness.extend(s for turn in rollout.kv_cache_staleness for s in turn)
+            group_completed_at_steps.extend(rollout.completed_at_step)
             group_num_evictions.append(sum(rollout.num_evictions))
         all_policy_staleness.append(group_policy_staleness)
         all_kv_cache_staleness.append(group_kv_staleness)
@@ -839,10 +839,10 @@ def prep_wandb_metrics(
         rewards: Grouped list of rewards.
         num_turns: Grouped list of number of turns in the trajectories.
         advantages: Flattened list of advantages.
-        policy_staleness: Grouped list of per-rollout max policy staleness.
-        kv_cache_staleness: Grouped list of per-rollout max KV cache staleness.
+        policy_staleness: Grouped list of per-token policy staleness.
+        kv_cache_staleness: Grouped list of per-token KV cache staleness.
         num_evictions: Grouped list of per-rollout number of evictions.
-        completed_at_steps: Grouped list of per-rollout completed at steps.
+        completed_at_steps: Grouped list of per-turn completed at steps.
         current_iteration: Current training iteration.
         example_group: A list of rollouts of one group to log examples of trajectories.
         tokenizer: Tokenizer to untokenize trajectories for logging.
@@ -853,8 +853,17 @@ def prep_wandb_metrics(
         data=[[np.mean(g), np.std(g)] for g in rewards],
     )
 
-    true_policy_staleness = [s + current_iteration - c for g, cg in zip(policy_staleness, completed_at_steps) for s, c in zip(g, cg)]
-    true_kv_staleness = [s + current_iteration - c for g, cg in zip(kv_cache_staleness, completed_at_steps) for s, c in zip(g, cg)]
+    # Expand per-turn completed_at_steps to per-token using turn_lens, then compute true staleness.
+    true_policy_staleness = [
+        s + current_iteration - c
+        for g_s, g_c, g_tl in zip(policy_staleness, completed_at_steps, turn_lens)
+        for s, c in zip(g_s, (c for c, n in zip(g_c, g_tl) for _ in range(n)))
+    ]
+    true_kv_staleness = [
+        s + current_iteration - c
+        for g_s, g_c, g_tl in zip(kv_cache_staleness, completed_at_steps, turn_lens)
+        for s, c in zip(g_s, (c for c, n in zip(g_c, g_tl) for _ in range(n)))
+    ]
 
     metrics = {
             'group_means_hist': wandb_writer.plot.histogram(
@@ -876,9 +885,8 @@ def prep_wandb_metrics(
                 'advantages', 'Advantages'
             ),
             'rollout_table': wandb_writer.Table(
-                columns=['policy_staleness', 'reward', 'traj_length', 'num_evictions'],
+                columns=['reward', 'traj_length', 'num_evictions'],
                 data=list(zip(
-                    true_policy_staleness,
                     [r for g in rewards for r in g],
                     [l for g in traj_lens for l in g],
                     [e for g in num_evictions for e in g],

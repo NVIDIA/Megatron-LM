@@ -909,10 +909,12 @@ class TestRLUtils:
         rewards = [[1, 1], [-1, 2]]
         num_turns = [[42, 2], [10, 8]]
         advantages = [0, 1]
-        policy_staleness = [[1, 2], [0, 3]]
-        kv_cache_staleness = [[1, 1], [0, 2]]
+        # Per-token staleness (6 tokens in group 1, 3 in group 2; matching turn_lens)
+        policy_staleness = [[1, 2, 2, 0, 0, 3], [0, 3, 3]]
+        kv_cache_staleness = [[1, 1, 1, 0, 0, 2], [0, 2, 2]]
         num_evictions = [[0, 1], [0, 0]]
-        completed_at_steps = [[5, 4], [5, 3]]
+        # Per-turn completed_at_steps (5 turns in group 1, 2 in group 2; matching turn_lens)
+        completed_at_steps = [[5, 4, 5, 5, 3], [5, 3]]
         current_iteration = 6
         metrics = rl_utils.prep_wandb_metrics(
             MagicMock(),
@@ -941,12 +943,15 @@ class TestRLUtils:
         assert metrics["mean_num_turns"] == 15.5
         assert metrics["max_num_turns"] == 42
         assert metrics["min_num_turns"] == 2
-        assert metrics["mean_policy_staleness"] == 3.25
+        # true_policy_staleness = [2, 4, 4, 1, 1, 6, 1, 6, 6]
+        assert metrics["mean_policy_staleness"] == np.mean([2, 4, 4, 1, 1, 6, 1, 6, 6])
         assert metrics["max_policy_staleness"] == 6
         assert metrics["min_policy_staleness"] == 1
-        assert metrics["mean_kv_cache_staleness"] == 2.75
+        # true_kv_staleness = [2, 3, 3, 1, 1, 5, 1, 5, 5]
+        assert metrics["mean_kv_cache_staleness"] == np.mean([2, 3, 3, 1, 1, 5, 1, 5, 5])
         assert metrics["max_kv_cache_staleness"] == 5
         assert metrics["min_kv_cache_staleness"] == 1
         assert metrics["total_eviction_count"] == 1
         assert metrics["max_num_evictions"] == 1
-        assert metrics["mean_completion_gap"] == np.mean([1, 2, 1, 3])
+        # completion_gaps per-turn = [1, 2, 1, 1, 3, 1, 3]
+        assert metrics["mean_completion_gap"] == np.mean([1, 2, 1, 1, 3, 1, 3])
