@@ -123,6 +123,7 @@ def get_hybrid_total_layer_count(pattern: str) -> int:
         Total number of layers in the main decoder pattern.
     """
     main_pattern = pattern.split(Symbols.MTP_SEPARATOR)[0]
+    _validate_pattern(main_pattern, "main", allow_pipe=True)
     return len(main_pattern.replace(Symbols.PIPE, ''))
 
 
