@@ -22,7 +22,7 @@ from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.tensor_parallel import gather_from_sequence_parallel_region
 from megatron.core.parallel_state import get_global_symmetric_memory_buffer_ep
 from megatron.core.inference.communication.torch_symm_triton import (
-    multimem_all_gather_3,
+    multimem_all_gather_fused,
     multimem_reduce_scatter,
 )
 
@@ -87,79 +87,39 @@ class InferenceAllGatherTokenDispatcher(MoEAllGatherTokenDispatcher):
         Allocate a single symmetric memory buffer for all-gather outputs of
         routing_map, probs and hidden_states. Returns sliced views for each.
 
-        All tensors are gathered from ep_size ranks, so output shapes are:
-        - routing_map: [local_tokens * ep_size, num_experts]
-        - probs: [local_tokens * ep_size, num_experts]
-        - hidden_states: [local_tokens * ep_size, hidden_dim]
-
         Returns dict with:
         - "handle": symmetric memory handle (or None if unavailable)
-        - "routing_map": view for routing_map output
-        - "routing_map_offset": byte offset of routing_map in the symmetric buffer
-        - "probs": view for probs output
-        - "probs_offset": byte offset of probs in the symmetric buffer
-        - "hidden_states": view for hidden_states output
-        - "hidden_states_offset": byte offset of hidden_states in the symmetric buffer
+        - "routing_map" / "routing_map_offset": raw byte view and byte offset
+        - "probs" / "probs_offset": raw byte view and byte offset
+        - "hidden_states" / "hidden_states_offset": raw byte view and byte offset
         """
-        symm_buffer_mgr = get_global_symmetric_memory_buffer_ep()
-        if symm_buffer_mgr.symm_mem_hdl is None:
-            return {
-                "handle": None,
-                "routing_map": None, "routing_map_offset": 0,
-                "probs": None, "probs_offset": 0,
-                "hidden_states": None, "hidden_states_offset": 0,
-            }
+        _NONE = {
+            "handle": None,
+            "routing_map": None, "routing_map_offset": 0,
+            "probs": None, "probs_offset": 0,
+            "hidden_states": None, "hidden_states_offset": 0,
+        }
 
-        # Calculate output shapes after all-gather
         local_tokens = probs.size(0)
         global_tokens = local_tokens * self.ep_size
         topk = probs.size(-1)
         hidden_dim = hidden_states.size(-1)
 
-        # Calculate bytes needed for each tensor (with 16-byte alignment)
-        def aligned_bytes(numel, dtype):
-            elem_size = torch.tensor([], dtype=dtype).element_size()
-            raw_bytes = numel * elem_size
-            # Align to 16 bytes for 128-bit access
-            return ((raw_bytes + 15) // 16) * 16
+        result = get_global_symmetric_memory_buffer_ep().maybe_get_tensors([
+            (global_tokens * topk, routing_map.dtype),
+            (global_tokens * topk, probs.dtype),
+            (global_tokens * hidden_dim, hidden_states.dtype),
+        ])
 
-        routing_map_bytes = aligned_bytes(global_tokens * topk, routing_map.dtype)
-        probs_bytes = aligned_bytes(global_tokens * topk, probs.dtype)
-        hidden_states_bytes = aligned_bytes(global_tokens * hidden_dim, hidden_states.dtype)
-        total_bytes = routing_map_bytes + probs_bytes + hidden_states_bytes
+        if result["handle"] is None:
+            return _NONE
 
-        # Check if buffer has enough space
-        if total_bytes > symm_buffer_mgr.symm_buffer.numel():
-            return {
-                "handle": None,
-                "routing_map": None, "routing_map_offset": 0,
-                "probs": None, "probs_offset": 0,
-                "hidden_states": None, "hidden_states_offset": 0,
-            }
-
-        # Slice the raw buffer and create views, tracking byte offsets
-        # [routing_map_bytes | probs_bytes | hidden_states_bytes]
-        #  offset=0            offset=rm       offset=rm+probs
-
-        raw_buffer = symm_buffer_mgr.symm_buffer
-
-        routing_map_offset = 0
-        routing_map_buffer = raw_buffer[routing_map_offset : routing_map_offset + routing_map_bytes]
-
-        probs_offset = routing_map_bytes
-        probs_buffer = raw_buffer[probs_offset : probs_offset + probs_bytes]
-
-        hidden_states_offset = probs_offset + probs_bytes
-        hidden_states_buffer = raw_buffer[hidden_states_offset : hidden_states_offset + hidden_states_bytes]
-
+        (rm_buf, rm_off), (p_buf, p_off), (hs_buf, hs_off) = result["tensors"]
         return {
-            "handle": symm_buffer_mgr.symm_mem_hdl,
-            "routing_map": routing_map_buffer,
-            "routing_map_offset": routing_map_offset,
-            "probs": probs_buffer,
-            "probs_offset": probs_offset,
-            "hidden_states": hidden_states_buffer,
-            "hidden_states_offset": hidden_states_offset,
+            "handle": result["handle"],
+            "routing_map": rm_buf, "routing_map_offset": rm_off,
+            "probs": p_buf, "probs_offset": p_off,
+            "hidden_states": hs_buf, "hidden_states_offset": hs_off,
         }
 
     def _maybe_allocate_rs_buffer(self, x: torch.Tensor) -> dict:
@@ -177,7 +137,7 @@ class InferenceAllGatherTokenDispatcher(MoEAllGatherTokenDispatcher):
         Gathers tokens from all EP ranks using AllGather.
 
         Uses latency-optimized NVLS multimem_all_gather for routing_map, probs and hidden_states
-        on Hopper+ GPUs with BF16. Falls back to NCCL via superclass otherwise.
+        on Hopper+ GPUs with BF16. Falls back to NCCL otherwise.
         """
         if self.ep_size == 1:
             return hidden_states, probs
@@ -203,7 +163,7 @@ class InferenceAllGatherTokenDispatcher(MoEAllGatherTokenDispatcher):
             hidden_dtype = hidden_states.dtype
 
             # Fused NVLS all-gather: single kernel launch + single barrier for all 3 tensors
-            multimem_all_gather_3(
+            multimem_all_gather_fused(
                 ag_buffers["routing_map"].view(torch.bfloat16),
                 self.routing_map.view(torch.bfloat16),
                 ag_buffers["routing_map_offset"],
