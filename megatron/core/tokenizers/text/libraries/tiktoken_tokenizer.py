@@ -28,9 +28,6 @@ SPECIAL_TOKEN_TEMPLATE = "<SPECIAL_{id}>"
 __all__ = ["TikTokenTokenizer", "reload_mergeable_ranks"]
 
 
-logger = logging.getLogger(__name__)
-
-
 def reload_mergeable_ranks(
     path: str, max_vocab: Optional[int] = None, num_special_tokens: Optional[int] = None
 ) -> Dict[bytes, int]:
