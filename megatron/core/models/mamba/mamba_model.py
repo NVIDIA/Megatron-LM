@@ -307,6 +307,7 @@ class MambaModel(LanguageModule):
         if self.share_embeddings_and_output_weights:
             output_weight = self.shared_embedding_or_output_weight()
 
+        # TODO(helenn/MCore inference): enable MTP inference.
         mtp_forward_ran = self.mtp_process and self.training and inference_context is None
         if mtp_forward_ran:
             hidden_states = self.mtp(
