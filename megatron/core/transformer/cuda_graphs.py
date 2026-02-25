@@ -2489,7 +2489,6 @@ def set_current_microbatch(model, microbatch_id):
 # ---------------------------------------------------------------------------
 
 
-
 def _wrap_graph_for_vision(graph_fn):
     """Wrap a graphed callable to filter out None outputs.
 
@@ -2554,6 +2553,8 @@ class VisionTECudaGraphHelper(TECudaGraphHelper):
     * num_model_chunks is always 1 (vision has no virtual pipeline stages).
     * Batch dimension is always 1 (images are concatenated along the sequence
       dimension).
+    * Sample argument generation uses a simple loop (no rotary embeddings or
+      buffer-reuse optimization).
     * Captured graph outputs are wrapped to filter None values that arise
       from vision encoder layers returning (output, None).
 
@@ -2615,8 +2616,8 @@ class VisionTECudaGraphHelper(TECudaGraphHelper):
         else:
             if self.vision_model is None:
                 logger.warning(
-                    "VisionTECudaGraphHelper: No vision_model found in model. "
-                    "CUDA graphs will not be captured for vision encoder."
+                    'VisionTECudaGraphHelper: No vision_model found in model. '
+                    'CUDA graphs will not be captured for vision encoder.'
                 )
             self.chunks_with_decoder = [None]
             self.num_layers_per_chunk = [0]
@@ -2631,29 +2632,65 @@ class VisionTECudaGraphHelper(TECudaGraphHelper):
 
         if vision_layers:
             logger.info(
-                f"VisionTECudaGraphHelper: Found {self.num_layers} graphable vision encoder "
-                f"layers. seq_length={self.seq_length} (all images concatenated, batch_dim=1)"
+                f'VisionTECudaGraphHelper: Found {self.num_layers} graphable vision encoder '
+                f'layers. seq_length={self.seq_length} (all images concatenated, batch_dim=1)'
             )
 
-    # -- sample argument generation ----------------------------------------
-    # The parent's _get_sample_arguments uses complex buffer-reuse
-    # optimization and rotary embedding computation tied to the LM decoder
-    # structure.  Vision replaces it with a simple per-layer-per-microbatch
-    # loop (batch_dim is always 1).  The parent's _get_cuda_graph_input_data
-    # (schedule computation, kwargs building) is reused as-is since
-    # num_model_chunks=1 makes MoE overlap a no-op and fp8/fp4=False
-    # takes the correct branch.
+    def _start_capturing(self):
+        """Start capturing for vision encoder.
 
-    def _get_sample_args(self):
-        """Generate sample arguments for CUDA Graph capturing.
+        Unlike the parent, this skips torch.distributed.barrier() because
+        with PP > 1 only the first pipeline stage has vision layers — other
+        ranks return early from create_cudagraphs and never reach this
+        point, so a barrier would deadlock.
+        """
+        assert not self._graphs_created, 'CUDA Graphs have already been created.'
+        gc.collect()
+        torch.cuda.empty_cache()
+        if FREEZE_GC:
+            gc.freeze()
+        _set_capture_start()
+        log_single_rank(logger, logging.INFO, 'Start vision encoder CUDA Graphs capture...')
+        return time.time()
+
+    def _finish_capturing(self, start_time):
+        """Finish capturing for vision encoder.
+
+        Unlike the parent, this skips:
+        - torch.distributed.barrier() (asymmetric: only first PP stage captures).
+        - model_chunk.zero_grad_buffer() / optimizer.zero_grad() (handled
+          by the LM decoder helper's _finish_capturing which runs on all ranks).
+        - clear_aux_losses_tracker / reset_model_temporary_tensors
+          (LM-specific cleanup already handled by the LM helper).
+        """
+        log_single_rank(
+            logger,
+            logging.INFO,
+            f'Time spent in vision encoder CUDA Graphs capture on rank '
+            f'{torch.distributed.get_rank()}: {time.time() - start_time}s',
+        )
+        _set_capture_end()
+        if FREEZE_GC:
+            gc.unfreeze()
+        gc.collect()
+        torch.cuda.empty_cache()
+        self._graphs_created = True
+
+    def _get_sample_arguments(self, order, chunk_id_list=None):
+        """Generate sample arguments for vision encoder CUDA Graph capturing.
+
+        Vision uses a simple per-layer-per-microbatch loop with batch_dim=1
+        and no rotary embeddings (unlike the parent's buffer-reuse
+        optimization). The order and chunk_id_list arguments are
+        unused because vision has num_model_chunks=1 and does not need
+        the pipeline-schedule-aware buffer lifecycle tracking.
 
         Returns:
             Tuple of (sample_args, sample_kwargs) lists for each
-            (layer, microbatch) pair.  Returns ([], {}) when there are
-            no callables.
+            (layer, microbatch) pair.
         """
         if not self.flattened_callables:
-            return [], {}
+            return [], []
 
         sample_args = []
         sample_kwargs_list = []
@@ -2672,7 +2709,7 @@ class VisionTECudaGraphHelper(TECudaGraphHelper):
 
                 if hasattr(layer, 'get_layer_static_inputs'):
                     static_inputs = layer.get_layer_static_inputs(self.seq_length, 1)
-                    hidden_states = static_inputs.pop("hidden_states", hidden_states)
+                    hidden_states = static_inputs.pop('hidden_states', hidden_states)
                     sample_args.append((hidden_states,))
                     sample_kwargs_list.append(static_inputs)
                 else:
@@ -2681,57 +2718,20 @@ class VisionTECudaGraphHelper(TECudaGraphHelper):
 
         return sample_args, sample_kwargs_list
 
-    def _get_sample_arguments(self, order, chunk_id_list=None):
-        """Override parent's buffer-reuse sample generation.
-
-        Vision uses a simple loop with batch_dim=1 and no rotary embeddings.
-        The order and chunk_id_list arguments (used by the parent for
-        buffer lifecycle tracking) are unused here.
-        """
-        sample_args, sample_kwargs = self._get_sample_args()
-        return sample_args, sample_kwargs
-
-    # -- capture / teardown overrides --------------------------------------
-    # _start_capturing and _finish_capturing use simplified versions because
-    # the parent's methods perform LM-specific cleanup (MoE aux losses,
-    # reset_model_temporary_tensors) that may not be safe with a vision config.
-
-    def _start_capturing(self):
-        """Simplified capture start for vision encoder."""
-        torch.cuda.synchronize()
-        rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
-        logger.info(f"Rank {rank}: Starting vision encoder CUDA graph capture...")
-        return time.time()
-
-    def _finish_capturing(self, start_time):
-        """Simplified capture finish for vision encoder."""
-        torch.cuda.synchronize()
-        elapsed = time.time() - start_time
-        rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
-        logger.info(
-            f"Rank {rank}: Vision encoder CUDA graph capture completed in {elapsed:.2f}s. "
-            f"Captured {len(self.flattened_callables)} layers."
-        )
-        self._graphs_created = True
-
     def create_cudagraphs(self):
         """Capture CUDA Graphs for vision encoder layers per microbatch.
 
-        Delegates to the parent's capture workflow after removing any existing
-        cudagraph_manager (which would conflict with the TE graph path),
-        then wraps the captured graphs with _wrap_graph_for_vision to
-        filter None from (output, None) tuples so that
-        _te_cuda_graph_replay's len == 1 assertion passes.
+        Delegates to the parent's capture workflow, then wraps the captured
+        graphs with _wrap_graph_for_vision to filter None from
+        (output, None) tuples so that _te_cuda_graph_replay's
+        len == 1 assertion passes.
         """
         if not self.flattened_callables:
             logger.warning(
-                "VisionTECudaGraphHelper: No graphable layers found. Skipping CUDA graph capture."
+                'VisionTECudaGraphHelper: No graphable layers found. '
+                'Skipping CUDA graph capture.'
             )
             return
-
-        for layer in self.flattened_callables:
-            if hasattr(layer, 'cudagraph_manager'):
-                delattr(layer, 'cudagraph_manager')
 
         super().create_cudagraphs()
 
@@ -2739,31 +2739,10 @@ class VisionTECudaGraphHelper(TECudaGraphHelper):
             if hasattr(layer, 'cuda_graphs'):
                 layer.cuda_graphs = [_wrap_graph_for_vision(g) for g in layer.cuda_graphs]
 
-    def cuda_graph_set_manual_hooks(self, make_forward_pre_hook_fn=None):
-        """Set CUDA Graph manual hooks for vision encoder layers.
+    def cuda_graph_set_manual_hooks(self):
+        """No-op: vision encoder layers do not use DDP parameter-gather hooks.
 
-        Unlike the parent which derives hooks from model chunks, this method
-        accepts an explicit hook factory.  When called without arguments (the
-        common case), no hooks are set.
-
-        Args:
-            make_forward_pre_hook_fn: Function to create forward pre hooks.
-                If None, hooks are not set.
+        The parent derives hooks from model_chunk._make_forward_pre_hook which
+        requires overlap_param_gather=True.  Vision encoder parameters are not
+        distributed with the same overlap strategy, so we skip hook setup.
         """
-        if not self.flattened_callables or not self._graphs_created:
-            return
-        if make_forward_pre_hook_fn is None:
-            return
-        for layer in self.flattened_callables:
-            if hasattr(layer, 'setup_manual_hooks'):
-                layer.setup_manual_hooks(make_forward_pre_hook_fn)
-
-    def delete_cuda_graphs(self):
-        """Delete CUDA graphs to free resources.
-
-        Adds a graceful no-op guard (the parent asserts), then delegates
-        to the parent's cleanup which properly resets TE graph objects.
-        """
-        if not self._graphs_created:
-            return
-        super().delete_cuda_graphs()

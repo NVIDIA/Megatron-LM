@@ -9,18 +9,14 @@ from unittest.mock import MagicMock
 import pytest
 import torch
 
-from megatron.core.models.gpt.gpt_layer_specs import (
-    get_gpt_layer_with_transformer_engine_spec,
-)
-from megatron.core.models.vision.vit_layer_specs import (
-    get_vit_layer_with_transformer_engine_spec,
-)
+from megatron.core import parallel_state
+from megatron.core.models.gpt.gpt_layer_specs import get_gpt_layer_with_transformer_engine_spec
+from megatron.core.models.vision.vit_layer_specs import get_vit_layer_with_transformer_engine_spec
 from megatron.core.tensor_parallel.random import (
     HAVE_TE,
     initialize_rng_tracker,
     model_parallel_cuda_manual_seed,
 )
-from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.transformer.cuda_graphs import (
     HAVE_TE_GRAPHS,
     VisionTECudaGraphHelper,
@@ -29,8 +25,8 @@ from megatron.core.transformer.cuda_graphs import (
     get_vision_cuda_graph_seq_length,
     set_current_microbatch,
 )
+from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.utils import is_te_min_version
-from megatron.core import parallel_state
 from tests.unit_tests.test_utilities import Utils
 
 TE_MIN_VERSION = "2.13.0"
@@ -62,7 +58,9 @@ class TestVisionLayerIsGraphable:
     def test_correct_config_with_transformer_layer(self):
         """Real TransformerLayer + cuda_graph_impl='transformer_engine' -> True."""
         initialize_rng_tracker(use_te_rng_tracker=True, force_reset=True)
-        Utils.initialize_model_parallel(tensor_model_parallel_size=1, pipeline_model_parallel_size=1)
+        Utils.initialize_model_parallel(
+            tensor_model_parallel_size=1, pipeline_model_parallel_size=1
+        )
         model_parallel_cuda_manual_seed(123)
 
         config = TransformerConfig(
@@ -301,11 +299,12 @@ class TestVisionTECudaGraphHelper:
         assert len(helper.callables) == 0
         assert helper.graphs_created() is False
 
-    # -- _get_sample_args tests --
+    # -- _get_sample_arguments tests --
 
-    def test_get_sample_args_shapes(self):
+    def test_get_sample_arguments_shapes(self):
         helper = self._make_helper(num_microbatches=1)
-        sample_args, sample_kwargs_list = helper._get_sample_args()
+        # order is unused by vision override; pass a dummy
+        sample_args, sample_kwargs_list = helper._get_sample_arguments(order=[1, -1])
 
         expected_count = self.vision_num_layers * 1  # layers * microbatches
         assert len(sample_args) == expected_count
@@ -323,15 +322,15 @@ class TestVisionTECudaGraphHelper:
             assert hs.device.type == 'cuda'
             assert hs.requires_grad is True
 
-    def test_get_sample_args_multi_microbatch(self):
+    def test_get_sample_arguments_multi_microbatch(self):
         helper = self._make_helper(num_microbatches=3)
-        sample_args, sample_kwargs_list = helper._get_sample_args()
+        sample_args, sample_kwargs_list = helper._get_sample_arguments(order=[1, -1])
 
         expected_count = self.vision_num_layers * 3
         assert len(sample_args) == expected_count
         assert len(sample_kwargs_list) == expected_count
 
-    def test_get_sample_args_empty_when_no_callables(self):
+    def test_get_sample_arguments_empty_when_no_callables(self):
         dummy_model = torch.nn.Linear(4, 4)
         helper = VisionTECudaGraphHelper(
             model=[dummy_model],
@@ -339,9 +338,9 @@ class TestVisionTECudaGraphHelper:
             vision_seq_length=self.vision_seq_length,
             micro_batch_size=self.micro_batch_size,
         )
-        sample_args, sample_kwargs_list = helper._get_sample_args()
+        sample_args, sample_kwargs_list = helper._get_sample_arguments(order=[1, -1])
         assert sample_args == []
-        assert sample_kwargs_list == {}
+        assert sample_kwargs_list == []
 
     # -- create_cudagraphs / delete_cuda_graphs lifecycle --
 
@@ -366,18 +365,16 @@ class TestVisionTECudaGraphHelper:
 
         # cudagraph_manager should have been removed during capture
         for layer in helper.callables:
-            assert not hasattr(layer, 'cudagraph_manager'), (
-                "cudagraph_manager should be removed before TE capture"
-            )
+            assert not hasattr(
+                layer, 'cudagraph_manager'
+            ), "cudagraph_manager should be removed before TE capture"
 
         helper.delete_cuda_graphs()
         assert not helper.graphs_created()
 
-        # cuda_graphs attribute should be cleaned up
+        # cuda_graphs should be empty after delete
         for layer in helper.callables:
-            assert not hasattr(layer, 'cuda_graphs'), (
-                "cuda_graphs should be removed after delete"
-            )
+            assert layer.cuda_graphs == [], "cuda_graphs should be empty after delete"
 
     @pytest.mark.skipif(
         not (HAVE_TE_GRAPHS and is_te_min_version("2.7.0")),
@@ -411,18 +408,11 @@ class TestVisionTECudaGraphHelper:
         helper.create_cudagraphs()
         assert not helper.graphs_created()
 
-    def test_delete_cudagraphs_before_create_is_noop(self):
-        """delete_cuda_graphs before creation should not crash."""
+    def test_delete_cudagraphs_before_create_asserts(self):
+        """delete_cuda_graphs before creation should raise AssertionError."""
         helper = self._make_helper()
-        helper.delete_cuda_graphs()
-        assert not helper.graphs_created()
-
-    # -- cuda_graph_set_manual_hooks --
-
-    def test_set_manual_hooks_before_creation_is_noop(self):
-        helper = self._make_helper()
-        helper.cuda_graph_set_manual_hooks(make_forward_pre_hook_fn=lambda: None)
-        # Should not raise
+        with pytest.raises(AssertionError):
+            helper.delete_cuda_graphs()
 
 
 # ---------------------------------------------------------------------------
@@ -567,8 +557,8 @@ class TestVisionTECudaGraphHelperPP2:
 
         num_mb = 8
         helper = self._make_helper(num_microbatches=num_mb)
-        # _get_sample_args generates layers * microbatches entries
-        sample_args, sample_kwargs_list = helper._get_sample_args()
+        # _get_sample_arguments generates layers * microbatches entries
+        sample_args, sample_kwargs_list = helper._get_sample_arguments(order=[1, -1])
         expected_count = self.vision_num_layers * num_mb
         assert len(sample_args) == expected_count, (
             f"With PP>1, expected {expected_count} sample_args "
@@ -599,15 +589,15 @@ class TestVisionTECudaGraphHelperPP2:
         # Each layer should have one graph per microbatch
         for layer in helper.callables:
             assert hasattr(layer, 'cuda_graphs')
-            assert len(layer.cuda_graphs) == num_mb, (
-                f"Expected {num_mb} graphs per layer, got {len(layer.cuda_graphs)}"
-            )
+            assert (
+                len(layer.cuda_graphs) == num_mb
+            ), f"Expected {num_mb} graphs per layer, got {len(layer.cuda_graphs)}"
 
         # Cleanup
         helper.delete_cuda_graphs()
         assert not helper.graphs_created()
         for layer in helper.callables:
-            assert not hasattr(layer, 'cuda_graphs')
+            assert layer.cuda_graphs == []
 
     @pytest.mark.skipif(
         not (HAVE_TE_GRAPHS and is_te_min_version("2.7.0")),
@@ -664,7 +654,7 @@ if __name__ == "__main__":
     # Integration tests (require GPU + distributed init)
     t3 = TestVisionTECudaGraphHelper()
     run_test(t3, "test_init_finds_vision_layers")
-    run_test(t3, "test_get_sample_args_shapes")
+    run_test(t3, "test_get_sample_arguments_shapes")
     run_test(t3, "test_create_and_delete_cudagraphs")
     print("TestVisionTECudaGraphHelper tests passed.")
 
