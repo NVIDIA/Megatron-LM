@@ -2471,7 +2471,13 @@ except ImportError:
 
 try:
     from transformer_engine.pytorch.cpp_extensions import general_gemm
-    from transformer_engine.pytorch.module.base import get_workspace
+
+    try:
+        from transformer_engine.pytorch.module.base import get_workspace
+
+        _get_workspace = get_workspace
+    except ImportError:
+        _get_workspace = None
 
     def te_general_gemm(
         A: torch.Tensor,
@@ -2489,10 +2495,7 @@ try:
         Note: not all combinations of these settings are supported. If not supported,
         cublaslt will throw an error.
         """
-        return general_gemm(
-            A,
-            B,
-            workspace=get_workspace(),
+        kwargs = dict(
             out_dtype=out_dtype,
             quantization_params=None,
             gelu=None,
@@ -2508,6 +2511,9 @@ try:
             extra_output=None,
             bulk_overlap=False,
         )
+        if _get_workspace is not None:
+            kwargs["workspace"] = _get_workspace()
+        return general_gemm(A, B, **kwargs)
 
 except ImportError:
     te_general_gemm = None  # type: ignore[assignment, misc]
