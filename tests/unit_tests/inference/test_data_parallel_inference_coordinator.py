@@ -192,49 +192,55 @@ class DummyEngine(DynamicInferenceEngine):
         }
 
 
-async def graceful_shutdown(engine, client=None, *, timeout=10.0):
-    """PAUSE then STOP the coordinator test stack.
+async def graceful_shutdown(engine, client=None, *, timeout=30.0):
+    """Shut down the engine, escalating through three strategies.
 
-    First tries the coordinator-driven path (client sends PAUSE, engines
-    synchronize via world barrier, then client sends STOP).
-    On timeout, falls back to engine.shutdown(immediate=True) which injects
-    synthetic PAUSE + STOP signals and drains EP collectives directly.
+    1. Coordinator-driven: PAUSE → STOP via client (normal protocol).
+    2. Immediate: engine.shutdown(immediate=True) — synthetic signals,
+       kills coordinator, awaits task.
+    3. Nuclear: cancel the task directly (destroys ZMQ sockets).
 
     Args:
         engine: DummyEngine whose engine_loop_task to await.
         client: InferenceClient (only rank 0, None on other ranks).
-        timeout: Max seconds to wait for each phase.
+        timeout: Per-stage timeout in seconds.
     """
-    try:
-        if client is not None:
+    # Stage 1: coordinator-driven shutdown.
+    if client is not None:
+        try:
             if engine.state == EngineState.RUNNING:
                 client.pause_engines()
-            await asyncio.wait_for(engine.paused.wait(), timeout=timeout)
+                await asyncio.wait_for(engine.paused.wait(), timeout=timeout)
             client.stop_engines()
-        await asyncio.wait_for(engine.stopped.wait(), timeout=timeout)
-        # Await the engine loop task so its finally-block cleanup (ZMQ socket
-        # close, context term) runs before the next test reuses ports/identities.
-        if hasattr(engine, 'engine_loop_task'):
-            await asyncio.wait_for(engine.engine_loop_task, timeout=timeout)
-        if client is not None:
+            await asyncio.wait_for(engine.stopped.wait(), timeout=timeout)
+            await engine.engine_loop_task
             client.stop()
+            return
+        except Exception:
+            pass
+
+    # Stage 2: immediate shutdown (synthetic signals, no coordinator).
+    try:
+        await asyncio.wait_for(engine.shutdown(immediate=True), timeout=timeout)
     except asyncio.TimeoutError:
-        await engine.shutdown(immediate=True)
-        if client is not None:
-            client.stop()
-    finally:
-        # Join the coordinator process to reap zombies between tests.
+        # Stage 3: nuclear — cancel the task directly.
+        task = getattr(engine, 'engine_loop_task', None)
+        if task is not None and not task.done():
+            task.cancel()
+            try:
+                await task
+            except (asyncio.CancelledError, Exception):
+                pass
         proc = getattr(engine, 'inference_coordinator_process', None)
         if proc is not None:
-            proc.join(timeout=5.0)
-            if proc.is_alive():
-                proc.terminate()
-                proc.join(timeout=2.0)
-
-
-async def force_cleanup_engine(engine):
-    """Emergency cleanup when the engine did not shut down cleanly."""
-    await engine.shutdown(immediate=True)
+            proc.terminate()
+            proc.join(timeout=2.0)
+    finally:
+        if client is not None:
+            try:
+                client.stop()
+            except Exception:
+                pass
 
 
 @pytest.fixture
@@ -328,19 +334,18 @@ class TestCoordinator:
     async def test_coordinator_lifecycle(self, initialize_model_parallel):
         """Test coordinator connection, port conflicts, de-registration, and re-registration."""
         requests = self.build_requests(num_requests=4)
-        engine1 = DummyEngine()
-        engine2 = None
-        engine3 = None
-        third_addr = None
-
-        # Launch first coordinator - binds to DEFAULT_PORT
-        first_addr = await engine1.start_listening_to_data_parallel_coordinator(
-            inference_coordinator_port=DEFAULT_PORT, launch_inference_coordinator=True
-        )
+        engines = []
+        client1 = None
 
         try:
+            # Launch first coordinator - binds to DEFAULT_PORT
+            engine1 = DummyEngine()
+            engines.append(engine1)
+            first_addr = await engine1.start_listening_to_data_parallel_coordinator(
+                inference_coordinator_port=DEFAULT_PORT, launch_inference_coordinator=True
+            )
+
             # Verify the engine can serve requests.
-            client1 = None
             if torch.distributed.get_rank() == 0:
                 client1 = InferenceClient(first_addr)
                 await client1.start()
@@ -355,9 +360,10 @@ class TestCoordinator:
             # Disconnect the engine (simulates unexpected departure).
             await engine1.shutdown(immediate=True)
 
-            # Re-register a new engine.
+            # Re-register a new engine with the same coordinator.
             engine2 = DummyEngine()
-            second_addr = await engine2.start_listening_to_data_parallel_coordinator(
+            engines.append(engine2)
+            await engine2.start_listening_to_data_parallel_coordinator(
                 inference_coordinator_port=DEFAULT_PORT, launch_inference_coordinator=False
             )
 
@@ -372,13 +378,13 @@ class TestCoordinator:
 
             # Disconnect the engine (simulates unexpected departure).
             await engine2.shutdown(immediate=True)
-            # Stop the client.
             if client1 is not None:
                 client1.stop()
                 client1 = None
 
             # Spin up a new coordinator; verify it gets a new port.
             engine3 = DummyEngine()
+            engines.append(engine3)
             third_addr = await engine3.start_listening_to_data_parallel_coordinator(
                 inference_coordinator_port=DEFAULT_PORT, launch_inference_coordinator=True
             )
@@ -390,16 +396,16 @@ class TestCoordinator:
             ), f"Expected different port due to conflict, but got same: {third_port}"
 
         finally:
-            # Clean up engine3's coordinator via PAUSE → STOP.
-            if engine3 is not None and third_addr is not None:
-                client3 = None
-                if torch.distributed.get_rank() == 0:
-                    client3 = InferenceClient(third_addr)
-                    await client3.start()
-                await graceful_shutdown(engine3, client3, timeout=30.0)
-
-            # Terminate engine1's orphaned coordinator process directly.
-            await engine1.shutdown(immediate=True)
+            for engine in engines:
+                try:
+                    await graceful_shutdown(engine)
+                except Exception:
+                    pass
+            if client1 is not None:
+                try:
+                    client1.stop()
+                except Exception:
+                    pass
 
     @pytest.mark.internal
     @pytest.mark.skipif(not HAVE_ZMQ, reason="pyzmq is required for this test")
@@ -463,13 +469,14 @@ class TestCoordinator:
 
         requests = self.build_requests(num_requests=16)
         engine = DummyEngine()
-        dp_addr = await engine.start_listening_to_data_parallel_coordinator(
-            inference_coordinator_port=DEFAULT_PORT, launch_inference_coordinator=True
-        )
-
         client = None
         doomed_futures = []
+
         try:
+            dp_addr = await engine.start_listening_to_data_parallel_coordinator(
+                inference_coordinator_port=DEFAULT_PORT, launch_inference_coordinator=True
+            )
+
             if torch.distributed.get_rank() == 0:
                 client = InferenceClient(dp_addr)
                 await client.start()
@@ -600,8 +607,16 @@ class TestCoordinator:
                 # STOP directly from SUSPENDED — no RESUME needed.
                 client.stop_engines()
 
-            # All ranks: engine loop should exit cleanly.
-            await asyncio.wait_for(engine.engine_loop_task, timeout=10.0)
+            # All ranks: wait for the STOPPED event, not the task.
+            # Timing out an event is harmless; timing out a task cancels it,
+            # which closes ZMQ sockets and kills the coordinator's broadcast.
+            # Non-rank-0 reaches this immediately while rank 0 runs the full
+            # lifecycle, so the timeout must cover the entire rank-0 test body.
+            try:
+                await asyncio.wait_for(engine.stopped.wait(), timeout=120.0)
+            except asyncio.TimeoutError:
+                raise AssertionError("Engine did not reach STOPPED within 120s")
+            await engine.engine_loop_task
             assert_state(engine, EngineState.STOPPED)
 
             # STOP should have cancelled all engine-side request state.
@@ -613,17 +628,12 @@ class TestCoordinator:
                 for f in doomed_futures:
                     assert not f.done(), "Client futures should still be pending"
                 client.stop()
+                client = None  # Mark as cleaned up so finally doesn't double-stop.
                 for f in doomed_futures:
                     assert f.cancelled(), "Client futures should be cancelled after client.stop()"
 
-        except Exception:
-            await force_cleanup_engine(engine)
-            if client is not None:
-                try:
-                    client.stop()
-                except Exception:
-                    pass
-            raise
+        finally:
+            await graceful_shutdown(engine, client)
 
         # ── Coordinator signal gating ────────────────────────────────
         # STOP, SUSPEND, and RESUME sent from RUNNING are dropped by the
@@ -638,11 +648,11 @@ class TestCoordinator:
             ("RESUME", lambda c: c.resume_engines()),
         ]:
             engine = DummyEngine()
-            dp_addr = await engine.start_listening_to_data_parallel_coordinator(
-                inference_coordinator_port=DEFAULT_PORT, launch_inference_coordinator=True
-            )
+            client = None
             try:
-                client = None
+                dp_addr = await engine.start_listening_to_data_parallel_coordinator(
+                    inference_coordinator_port=DEFAULT_PORT, launch_inference_coordinator=True
+                )
                 if torch.distributed.get_rank() == 0:
                     client = InferenceClient(dp_addr)
                     await client.start()

@@ -1669,43 +1669,43 @@ class DynamicInferenceEngine(AbstractEngine):
     async def shutdown(self, immediate: bool = False):
         """Shut down the engine, draining EP collectives first.
 
-        Injects PAUSE + STOP signals into the engine loop if it is available.
-
         Args:
             immediate: Also terminate the coordinator process.
         """
         task = getattr(self, 'engine_loop_task', None)
 
-        if task is None or task.done() or task is asyncio.current_task():
-            # No running loop, or called from the loop's own finally block.
-            sock = getattr(self, 'socket_for_receiving_requests', None)
-            if sock is not None and not sock.closed:
-                try:
-                    sock.send(msgpack.packb([Headers.DISCONNECT.value], use_bin_type=True))
-                except Exception:
-                    pass
-            for socket in getattr(self, 'zmq_sockets', []):
-                socket.close(linger=0)
-            if hasattr(self, 'zmq_sockets'):
-                self.zmq_sockets.clear()
-            if hasattr(self, "expert_parallel_zmq_communicator"):
-                self.expert_parallel_zmq_communicator.close()
-            if hasattr(self, "world_zmq_communicator"):
-                self.world_zmq_communicator.close()
-            if not self.zmq_context.closed:
-                self.zmq_context.term()
-            return
-
-        if self.state == EngineState.RUNNING:
-            self._pending_signals.append(msgpack.packb([Headers.PAUSE.value], use_bin_type=True))
-        if self.state not in (EngineState.STOPPING, EngineState.STOPPED):
-            await self.paused.wait()
-            self._pending_signals.append(msgpack.packb([Headers.STOP.value], use_bin_type=True))
-        await task
-
+        # If we're not shutting down through the coordinator, kill the coordinator first.
         if immediate and hasattr(self, "inference_coordinator_process"):
             self.inference_coordinator_process.terminate()
             self.inference_coordinator_process.join()
+
+        # If we're not shutting down through coordinator, the engine loop is still running.
+        # We must inject synthetic PAUSE + STOP to prevent NCCL deadlock.
+        if task is not None and not task.done() and task is not asyncio.current_task():
+            if self.state == EngineState.RUNNING:
+                self._pending_signals.append(msgpack.packb([Headers.PAUSE.value], use_bin_type=True))
+            if self.state not in (EngineState.STOPPING, EngineState.STOPPED):
+                await self.paused.wait()
+                self._pending_signals.append(msgpack.packb([Headers.STOP.value], use_bin_type=True))
+            await task
+
+        # ZMQ cleanup; idempotent.
+        sock = getattr(self, 'socket_for_receiving_requests', None)
+        if sock is not None and not sock.closed:
+            try:
+                sock.send(msgpack.packb([Headers.DISCONNECT.value], use_bin_type=True))
+            except Exception:
+                pass
+        for socket in getattr(self, 'zmq_sockets', []):
+            socket.close(linger=0)
+        if hasattr(self, 'zmq_sockets'):
+            self.zmq_sockets.clear()
+        if hasattr(self, "expert_parallel_zmq_communicator"):
+            self.expert_parallel_zmq_communicator.close()
+        if hasattr(self, "world_zmq_communicator"):
+            self.world_zmq_communicator.close()
+        if not self.zmq_context.closed:
+            self.zmq_context.term()
 
     @trace_async_exceptions
     async def run_engine(self, *, loop: Optional[asyncio.AbstractEventLoop] = None):
