@@ -33,21 +33,18 @@ from megatron.core.transformer.moe.token_dispatcher_inference import (
     InferenceAllGatherTokenDispatcher,
 )
 try:
-    import flashinfer.fused_moe as fused_moe
-    from flashinfer.fused_moe.core import ActivationType
+    import flashinfer
     HAVE_FLASHINFER = True
 except ImportError:
     HAVE_FLASHINFER = False
 
 if HAVE_FLASHINFER:
-    try: 
-        import flashinfer_cubin 
-        import flashinfer_jit_cache 
+    try:
+        import flashinfer_cubin
+        import flashinfer_jit_cache
         HAVE_FLASHINFER_CUBIN_AND_JIT_CACHE = True
     except ImportError:
         HAVE_FLASHINFER_CUBIN_AND_JIT_CACHE = False
-
-from megatron.core.activations import squared_relu
 
 try:
     import transformer_engine as te  # pylint: disable=unused-import
@@ -303,10 +300,10 @@ class MoELayer(BaseMoELayer):
         )
 
     def set_is_inference_cuda_graphed_iteration(self, set_to: bool):
-        """Toggle CUDA-graphed iteration mode on this layer and its router."""
+        """Toggle CUDA-graphed iteration mode on this layer, its router, and its experts."""
         self.is_inference_cuda_graphed_iteration = set_to
-        if hasattr(self.router, 'set_is_inference_cuda_graphed_iteration'):
-            self.router.set_is_inference_cuda_graphed_iteration(set_to)
+        self.router.set_is_inference_cuda_graphed_iteration(set_to)
+        self.experts.set_is_inference_cuda_graphed_iteration(set_to)
 
     def _activate_inference_token_dispatcher(self):
         """Swap in the inference-optimized token dispatcher."""
@@ -396,9 +393,6 @@ class MoELayer(BaseMoELayer):
         for each expert. It then passes the tokens through the local experts.
         The output from the experts is preprocessed for the combine step.
         """
-        if not self.training and self.is_inference_cuda_graphed_iteration:
-            return self._fused_experts_compute(hidden_states, probs)
-
         dispatched_input, tokens_per_expert, permuted_probs = (
             self.token_dispatcher.dispatch_postprocess(hidden_states, probs)
         )
@@ -407,39 +401,6 @@ class MoELayer(BaseMoELayer):
         output = self.token_dispatcher.combine_preprocess(expert_output)
 
         return output, mlp_bias
-
-    def _fused_experts_compute(self, hidden_states: torch.Tensor, probs: torch.Tensor):
-        """FlashInfer fused MoE kernel for CUDA-graphed inference iterations."""
-
-        assert not self.config.gated_linear_unit, (
-            "FlashInfer MoE kernel currently only supports non-gated activations. "
-            f"Got gated_linear_unit={self.config.gated_linear_unit}"
-        )
-        assert self.config.activation_func == squared_relu, (
-            "FlashInfer MoE kernel currently only supports squared_relu activation. "
-            f"Got activation_func={self.config.activation_func}"
-        )
-
-        w1 = self.experts._fc1_weight
-        w2 = self.experts._fc2_weight
-        selected_experts = self.token_dispatcher.routing_map
-        ep_size = utils.get_pg_size(self.ep_group)
-        ep_rank = utils.get_pg_rank(self.ep_group)
-
-        output = fused_moe.cutlass_fused_moe(
-            hidden_states,
-            selected_experts.to(torch.int),
-            probs.float(),
-            w1,
-            w2,
-            hidden_states.dtype,
-            quant_scales=None,
-            activation_type=ActivationType.Relu2,
-            ep_size=ep_size,
-            ep_rank=ep_rank,
-        )[0]
-
-        return output, None
 
     def combine(self, output: torch.Tensor):
         """Combines expert outputs via communication and adds shared expert output.
@@ -500,7 +461,7 @@ class MoELayer(BaseMoELayer):
         if padding_mask is not None:
             padding_mask = padding_mask.transpose(0, 1).bool()
 
-        # Swap in inference-optimized dispatcher for CUDA-graphed iterations
+        # Swap in inference-optimized dispatcher for CUDA-graphed inference iterations
         _use_inference_dispatcher = (
             not self.training
             and self.is_inference_cuda_graphed_iteration

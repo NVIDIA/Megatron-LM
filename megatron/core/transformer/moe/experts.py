@@ -67,6 +67,14 @@ except ImportError:
 
     HAVE_TE = False
 
+try:
+    import flashinfer.fused_moe as fused_moe
+    from flashinfer.fused_moe.core import ActivationType
+
+    HAVE_FLASHINFER = True
+except ImportError:
+    HAVE_FLASHINFER = False
+
 logger = logging.getLogger(__name__)
 
 
@@ -913,11 +921,13 @@ class TEGroupedMLP(MegatronModule):
 
 
 class InferenceGroupedMLP(TEGroupedMLP):
-    """Inference-optimized GroupedMLP using torch._grouped_mm with GPU-resident offsets.
+    """Inference-optimized GroupedMLP with GPU-resident offsets.
 
     Inherits from TEGroupedMLP to reuse weight initialization and checkpoint compatibility.
-    Overrides forward() to use torch._grouped_mm instead of TE's grouped linear,
-    keeping tokens_per_expert on GPU to avoid host synchronization.
+    Supports three forward paths:
+    - Training: delegates to parent TEGroupedMLP
+    - Inference + CUDA graphed: FlashInfer cutlass_fused_moe (fused permute + GEMM)
+    - Inference + eager: torch._grouped_mm with GPU-resident cumsum offsets
     """
 
     def __init__(
@@ -940,8 +950,11 @@ class InferenceGroupedMLP(TEGroupedMLP):
         # torch._grouped_mm expects shape [num_experts, out_features, in_features]
         self._build_concatenated_weights()
 
-        # Register hook to rebuild concatenated weights after load_state_dict
-        # self._register_load_state_dict_post_hook(self._rebuild_weights_hook)
+        self.is_inference_cuda_graphed_iteration = False
+
+    def set_is_inference_cuda_graphed_iteration(self, set_to: bool):
+        """Toggle CUDA-graphed iteration mode."""
+        self.is_inference_cuda_graphed_iteration = set_to
 
     def _build_concatenated_weights(self):
         """Create big contiguous weight tensors with per-expert views for checkpoint compatibility.
@@ -992,22 +1005,24 @@ class InferenceGroupedMLP(TEGroupedMLP):
         self.register_buffer('_fc1_weight', _fc1_weight, persistent=False)
         self.register_buffer('_fc2_weight', _fc2_weight, persistent=False)
 
-    def forward(
-        self,
-        permuted_local_hidden_states: torch.Tensor,
-        tokens_per_expert: torch.Tensor,
-        permuted_probs: torch.Tensor,
-    ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
-        """Forward pass using torch._grouped_mm with GPU-resident offsets.
-
-        Args:
-            permuted_local_hidden_states: [total_tokens, hidden_size] input tensor
-            tokens_per_expert: [num_local_experts] GPU tensor with token counts per expert
-            permuted_probs: [total_tokens] routing probabilities
-
-        Returns:
-            Tuple of (output, None) for interface compatibility
-        """
+    def _flashinfer_forward(self, hidden_states, routing_map, probs):
+        """FlashInfer fused MoE kernel for CUDA-graphed inference iterations."""
+        assert HAVE_FLASHINFER, "flashinfer-python is required for FlashInfer forward path."
+        output = fused_moe.cutlass_fused_moe(
+            hidden_states,
+            routing_map.to(torch.int),
+            probs.float(),
+            self._fc1_weight,
+            self._fc2_weight,
+            hidden_states.dtype,
+            quant_scales=None,
+            activation_type=ActivationType.Relu2,
+            ep_size=self.ep_group.size(),
+            ep_rank=self.ep_group.rank(),
+        )[0]
+        return output, None
+    
+    def _torch_grouped_mm_forward(self, permuted_local_hidden_states, tokens_per_expert, permuted_probs):
         permuted_probs = permuted_probs.unsqueeze(-1)
         #assert tokens_per_expert.is_cuda, "tokens_per_expert must be on GPU"
         if not tokens_per_expert.is_cuda:
@@ -1103,6 +1118,30 @@ class InferenceGroupedMLP(TEGroupedMLP):
             fc2_output = permuted_local_hidden_states
 
         return fc2_output, None
+
+    def forward(
+        self,
+        permuted_local_hidden_states: torch.Tensor,
+        tokens_per_expert: torch.Tensor,
+        permuted_probs: torch.Tensor,
+    ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
+        """Forward pass with three modes:
+        - Training: delegates to parent TEGroupedMLP
+        - Inference + CUDA graphed: FlashInfer cutlass_fused_moe
+        - Inference + eager: torch._grouped_mm with GPU-resident offsets
+        """
+        if self.training:
+            return super().forward(permuted_local_hidden_states, tokens_per_expert, permuted_probs)
+
+        elif self.is_inference_cuda_graphed_iteration:
+            return self._flashinfer_forward(
+                permuted_local_hidden_states, tokens_per_expert, permuted_probs
+            )
+
+        else:
+            return self._torch_grouped_mm_forward(permuted_local_hidden_states, tokens_per_expert, permuted_probs)
+        
+
 
 
 class SequentialMLP(MegatronModule):

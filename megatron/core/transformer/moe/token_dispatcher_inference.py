@@ -67,12 +67,12 @@ class InferenceAllGatherTokenDispatcher(MoEAllGatherTokenDispatcher):
         return hidden_states, probs
 
     def dispatch_postprocess(self, hidden_states, probs):
-        """No op for flashinfer."""
-        raise NotImplementedError
+        """Pass-through: returns unpermuted inputs and routing_map for InferenceGroupedMLP."""
+        return hidden_states, self.routing_map, probs
 
-    def combine_preprocess(self, permuted_expert_outputs):
-        """No op for flashinfer."""
-        raise NotImplementedError
+    def combine_preprocess(self, expert_output):
+        """Pass-through: InferenceGroupedMLP already produces unpermuted output."""
+        return expert_output
 
     def token_combine(self, hidden_states):
         """
