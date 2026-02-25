@@ -309,28 +309,6 @@ def experimental_cls(introduced_with_version: str):
     return validator
 
 
-def get_torch_version():
-    """Get pytorch version from __version__; if not available use pip's. Use caching."""
-
-    if not HAVE_PACKAGING:
-        raise ImportError(
-            "packaging is not installed. Please install it with `pip install packaging`."
-        )
-
-    def get_torch_version_str():
-        import torch
-
-        if hasattr(torch, "__version__"):
-            return str(torch.__version__)
-        else:
-            return version("torch")
-
-    global _torch_version
-    if _torch_version is None:
-        _torch_version = PkgVersion(get_torch_version_str())
-    return _torch_version
-
-
 def get_te_version():
     """Get TE version from __version__; if not available use pip's. Use caching."""
     if not HAVE_PACKAGING:
