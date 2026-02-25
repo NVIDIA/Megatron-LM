@@ -1,3 +1,16 @@
+---
+orphan: true
+---
+
+<!---
+   Copyright (c) 2022-2026, NVIDIA CORPORATION. All rights reserved.
+   NVIDIA CORPORATION and its licensors retain all intellectual property
+   and proprietary rights in and to this software, related documentation
+   and any modifications thereto. Any use, reproduction, disclosure or
+   distribution of this software and related documentation without an express
+   license agreement from NVIDIA CORPORATION is strictly prohibited.
+-->
+
 # API Backward Compatibility Checking
 
 ## Overview
@@ -7,6 +20,7 @@ Megatron Core uses automated API compatibility checking to ensure stable interfa
 ## How It Works
 
 The compatibility checker:
+
 1. Compares the current code against the latest release
 2. Detects breaking changes in function signatures
 3. Fails CI if breaking changes are found (unless explicitly exempted)
@@ -72,6 +86,7 @@ def experimental_feature(x, y):
 ```
 
 **When to use `@internal_api`:**
+
 - Internal APIs not documented for external use
 - Experimental features explicitly marked as unstable
 - Functions in development that haven't been released yet
@@ -90,6 +105,7 @@ def new_experimental_feature(x, y):
 ```
 
 **When to use `@experimental_api`:**
+
 - Experimental features explicitly marked as unstable
 - New APIs under active development
 - Features that haven't been stabilized yet
@@ -113,6 +129,7 @@ def old_function(x):
 ```
 
 **Deprecation Timeline:**
+
 1. **Version N** - Add `@deprecated` decorator, function still works
 2. **Version N+1** - Keep function with deprecation warnings
 3. **Version N+2** - Remove function (users have been warned)
@@ -141,6 +158,7 @@ def train_model(config, dataloader):
 def train_model(config, dataloader, optimizer="adam"):
     pass
 ```
+
 **Result:** ✅ Check passes
 
 ---
@@ -156,6 +174,7 @@ def train_model(config, dataloader, optimizer="adam"):
 def train_model(config, dataloader):
     pass
 ```
+
 **Result:** ❌ Check fails - "Parameter 'optimizer' removed"
 
 ---
@@ -175,6 +194,7 @@ def _internal_compute(x, y):
 def _internal_compute(x, y, z):  # Added parameter
     pass
 ```
+
 **Result:** ✅ Check passes (function is exempt)
 
 ---
@@ -319,13 +339,13 @@ If the checker reports a breaking change that isn't actually breaking, file an i
 - **Script:** `scripts/check_api_backwards_compatibility.py`
 - **Workflow:** `.github/workflows/check_api_backwards_compatibility_workflow.yml`
 - **Decorators:** `megatron/core/backwards_compatibility_decorators.py`
-- **Griffe Documentation:** https://mkdocstrings.github.io/griffe/
+- **Griffe Documentation:** <https://mkdocstrings.github.io/griffe/>
 
 ## Support
 
 For questions or issues:
+
 1. Check this documentation
 2. Review existing PRs with compatibility checks
 3. Ask in the Megatron-LM Slack/Discord
 4. File an issue on GitHub
-

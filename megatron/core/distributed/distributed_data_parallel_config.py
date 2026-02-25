@@ -105,7 +105,6 @@ class DistributedDataParallelConfig:
       The follwoing will be the expected number of SM usage for various cases.
       (Note that this is just a reference number and the number of SM usage could vary 
       on message size, communication domain size and nccl version.)
-      ----------------------------------------------------------
       | Communication domain | use_sharp | SM usage of "AG/RS" |
       |----------------------|-----------|---------------------|
       | NVL                  | N/A       | 4 / 5               |
@@ -113,7 +112,6 @@ class DistributedDataParallelConfig:
       | NVL+IB               | True      | 6 / 6               |
       | IB                   | False     | 1 / 4               |
       | IB                   | True      | 1 / 1               |
-      ----------------------------------------------------------
     """
 
     fsdp_double_buffer: bool = False

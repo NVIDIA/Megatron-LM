@@ -20,8 +20,6 @@ try:
 except ImportError:
     HAVE_TE = False
 
-logger = logging.getLogger(__name__)
-
 
 FP8_PER_TENSOR_REAL_QUANT_CFG = {
     "quant_cfg": {
