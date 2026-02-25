@@ -1,6 +1,6 @@
 # Copyright (c) 2023, NVIDIA CORPORATION. All rights reserved.
 
-import warnings
+import logging
 from typing import Literal, Optional
 
 from torch import Tensor
@@ -27,7 +27,10 @@ from megatron.core.utils import (
     WrappedTensor,
     deprecate_inference_params,
     is_using_quantization_scales,
+    log_single_rank,
 )
+
+logger = logging.getLogger(__name__)
 
 
 class MambaModel(LanguageModule):
@@ -122,11 +125,11 @@ class MambaModel(LanguageModule):
         # Backward compatibility for deprecated hybrid parameters
         if hybrid_override_pattern is not None:
             if hybrid_layer_pattern is None:
-                warnings.warn(
+                log_single_rank(
+                    logger,
+                    logging.WARNING,
                     "hybrid_override_pattern has been deprecated. "
                     "Use hybrid_layer_pattern instead.",
-                    DeprecationWarning,
-                    stacklevel=2,
                 )
                 self.hybrid_layer_pattern = hybrid_override_pattern
             else:
@@ -137,11 +140,11 @@ class MambaModel(LanguageModule):
         if (hybrid_attention_ratio is not None and hybrid_attention_ratio > 0.0) or (
             hybrid_mlp_ratio is not None and hybrid_mlp_ratio > 0.0
         ):
-            warnings.warn(
+            log_single_rank(
+                logger,
+                logging.WARNING,
                 "hybrid_attention_ratio and hybrid_mlp_ratio have been deprecated. "
                 "Use hybrid_layer_pattern instead.",
-                DeprecationWarning,
-                stacklevel=2,
             )
             if self.hybrid_layer_pattern is None:
                 from megatron.core.ssm.mamba_hybrid_layer_allocation import pattern_from_ratios
