@@ -1362,16 +1362,6 @@ def is_initialized():
     return _DATA_PARALLEL_GROUP is not None
 
 
-def is_unitialized() -> bool:
-    """Check if parallel state has been initialized
-
-    Deprecated. Use is_initialized instead.
-
-    """
-    warnings.warn("is_unitialized is deprecated, use is_initialized instead", DeprecationWarning)
-    return not is_initialized()
-
-
 def model_parallel_is_initialized():
     """Check if model- and data-parallel groups are initialized."""
     if (
@@ -1957,16 +1947,6 @@ def get_expert_data_parallel_group(check_initialized=True, partial_expert_data_p
                 _EXPERT_DATA_PARALLEL_GROUP is not None
             ), "Expert data parallel group is not initialized"
         return _EXPERT_DATA_PARALLEL_GROUP
-
-
-def get_data_modulo_expert_parallel_group(partial_expert_data_parallel=False):
-    """[Deprecated] Get expert data parallel group."""
-    warnings.warn(
-        "get_data_modulo_expert_parallel_group is deprecated, please use "
-        "get_expert_data_parallel_group instead.",
-        DeprecationWarning,
-    )
-    return get_expert_data_parallel_group(partial_expert_data_parallel=partial_expert_data_parallel)
 
 
 def get_expert_data_parallel_group_gloo(partial_expert_data_parallel=False):
