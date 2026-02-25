@@ -100,6 +100,7 @@ class FlagType(Enum):
     MLP2_mat_mul = 5
     AttentionOutput_mat_mul = 6
     HiddenStates = 7
+    InputTokens = 8      
 
 
 class AbstractCompressor:
@@ -271,6 +272,7 @@ class TTFlags:
             FlagType.MLP2_mat_mul: {i: False for i in range(1, self.num_layers + 1)},
             FlagType.AttentionOutput_mat_mul: {i: False for i in range(1, self.num_layers + 1)},
             FlagType.HiddenStates: {i: False for i in range(1, self.num_layers + 1)},
+            FlagType.InputTokens: {0: True},
         }
         self.should_trace = True
 
@@ -298,6 +300,8 @@ class TTFlags:
                 compressor_configs = specific_comp_config.get("compressor_configs", {})
                 compressor_cls = COMPRESSOR_MAP.get(compressor_type, EmptyCompressor)
                 _GLOBAL_COMPRESSOR[flag_type] = compressor_cls(compressor_configs)
+
+        _GLOBAL_COMPRESSOR[FlagType.InputTokens] = NoOpCompressor({})
 
 
 class TTHookManager:
@@ -474,6 +478,25 @@ class TTHookManager:
                         get_tensor_tracers().report((layer_number, flag_type), aggregated_tensor)
 
             return hook
+
+        def generate_hook_input(flag_type: FlagType, layer_number: int):
+            def hook(module, args, kwargs, output):
+                if get_tt_flags().get_flag(flag_type, layer_number):
+                    device = torch.cuda.current_device()
+                    world_size = get_tensor_model_parallel_world_size()
+                    rank = get_tensor_model_parallel_rank()
+                    rank0_global = torch.distributed.get_process_group_ranks(get_tensor_model_parallel_group())[0]
+
+                    if rank == 0:
+                        input_ids = kwargs["input_ids"]
+                        position_ids = kwargs["position_ids"]
+                        combined_input = torch.stack([input_ids, position_ids], dim=0)
+                        tensor_data = get_compressor(flag_type).compress_one_rank(layer_number, flag_type, combined_input)
+                        get_tensor_tracers().report((layer_number, flag_type), tensor_data)
+            return hook
+
+        if hasattr(model, "embedding"):
+            self.hooks.append(model.embedding.register_forward_hook(generate_hook_input(FlagType.InputTokens, 0), with_kwargs=True)) # Row
 
         for layer in range(model.decoder.num_layers_per_pipeline_rank):
             global_layer_number = model.decoder.layers[layer].layer_number

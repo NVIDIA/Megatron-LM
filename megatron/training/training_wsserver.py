@@ -36,7 +36,7 @@ def websocket_worker_process(master_addr: str, port: int, rank: int, data_queue:
 
     while not shutdown_event.is_set():
         try:
-            with connect(uri) as websocket:
+            with connect(uri, max_size=None) as websocket:
                 print(f"Rank {rank} (Worker): Connected.", flush=True)
 
                 while not shutdown_event.is_set():
@@ -156,7 +156,8 @@ def websocket_server_process(port: int, data_queue: multiprocessing.Queue, confi
     try:
         with serve(
             _websocket_handler, "0.0.0.0", port, 
-            ping_interval=None, reuse_port=True
+            ping_interval=None, reuse_port=True,
+            max_size=None,
         ) as server_instance:
             server = server_instance
             server.serve_forever()
