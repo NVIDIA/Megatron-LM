@@ -167,19 +167,24 @@ class GatedDeltaNet(MegatronModule):
 
         # weight shape: [conv_dim, 1, d_conv]
         # bias shape: [conv_dim]
-        self.conv1d = nn.Conv1d(
-            in_channels=self.conv_dim_local_tp,
-            out_channels=self.conv_dim_local_tp,
-            bias=conv_bias,
-            kernel_size=self.conv_kernel_dim,
-            groups=self.conv_dim_local_tp,
-            padding=self.conv_kernel_dim - 1,
-            device=torch.cuda.current_device(),
-            dtype=config.params_dtype,
-        )
-        setattr(self.conv1d.weight, "tensor_model_parallel", True)
-        if conv_bias:
-            setattr(self.conv1d.bias, "tensor_model_parallel", True)
+        with get_cuda_rng_tracker().fork():
+            self.conv1d = nn.Conv1d(
+                in_channels=self.conv_dim_local_tp,
+                out_channels=self.conv_dim_local_tp,
+                bias=conv_bias,
+                kernel_size=self.conv_kernel_dim,
+                groups=self.conv_dim_local_tp,
+                padding=self.conv_kernel_dim - 1,
+                device=torch.cuda.current_device(),
+                dtype=config.params_dtype,
+            )
+            setattr(self.conv1d.weight, "tensor_model_parallel", True)
+            setattr(self.conv1d.weight, "partition_dim", 0)
+            setattr(self.conv1d.weight, "partition_stride", 1)
+            if conv_bias:
+                setattr(self.conv1d.bias, "tensor_model_parallel", True)
+                setattr(self.conv1d.bias, "partition_dim", 0)
+                setattr(self.conv1d.bias, "partition_stride", 1)
 
         # Time step projection (discretization)
         self.num_v_heads_local_tp = self.num_value_heads // self.tp_size
@@ -235,7 +240,8 @@ class GatedDeltaNet(MegatronModule):
         """Reset the parameters."""
         if self.config.perform_initialization:
             with get_cuda_rng_tracker().fork():
-                # conv1d.weight
+                # conv1d.weight: only override if a custom init range is specified;
+                # the default kaiming_uniform_ was already applied in __init__ under the fork.
                 if self.conv_init is not None:
                     nn.init.uniform_(self.conv1d.weight, -self.conv_init, self.conv_init)
                 # dt_bias
