@@ -22,7 +22,7 @@ from sft_mamba import get_batch
 import torch
 
 def initialize_test_environment(
-    tp_size, cp_size, seq_length, sft, micro_batch_size
+    tp_size: int, cp_size: int, seq_length: int, micro_batch_size: int, sft: bool = False
 ):
     destroy_global_vars()
     destroy_num_microbatches_calculator()
@@ -60,7 +60,7 @@ def initialize_test_environment(
     Utils.initialize_model_parallel(tensor_model_parallel_size=tp_size, context_parallel_size=cp_size)
     return args
 
-def create_data_iterator(seq_length, sft, create_attention_mask: bool = False):
+def create_data_iterator(seq_length, sft: bool = False, create_attention_mask: bool = False):
     text = torch.randint(0, 10000, (1, seq_length + 1), dtype=torch.int64)
     tokens = text[:, :-1].contiguous()
     labels = text[:, 1:].contiguous()
@@ -92,43 +92,92 @@ def create_data_iterator(seq_length, sft, create_attention_mask: bool = False):
     
     return iter([batch])
 
-
-"""
-@pytest.mark.parametrize("cp_size", [1, 2, 4])
 @pytest.mark.parametrize("tp_size", [1, 2, 4])
+@pytest.mark.parametrize("cp_size", [1, 2, 4])
 @pytest.mark.parametrize("seq_length", [1024, 2048, 4096])
-"""
-
-@pytest.mark.parametrize("tp_size", [1])
-@pytest.mark.parametrize("cp_size", [1])
-@pytest.mark.parametrize("seq_length", [1024])
-@pytest.mark.parametrize(
-    "sft,create_attention_mask",
-    [
-        (True, False),   # Combi 1: sft True, create_attention_mask False
-        (False, True),   # Combi 2: sft False, create_attention_mask True
-        (False, False),  # Combi 3: sft False, create_attention_mask False
-    ],
-    ids=["sft", "pretraining_create_attention_mask_in_dataloader_True", "pretraining_create_attention_mask_in_dataloader_False"]
-)
-def test_thd_layout(tp_size, cp_size, seq_length, sft, create_attention_mask):
-    initialize_test_environment(tp_size, cp_size, seq_length, sft, 1)
+def test_sft_batch(tp_size, cp_size, seq_length):
+    if cp_size * tp_size > torch.cuda.device_count():
+        pytest.skip(f"Skipping test because cp_size * tp_size > torch.cuda.device_count() ({cp_size * tp_size} > {torch.cuda.device_count()})")
+    initialize_test_environment(tp_size, cp_size, seq_length, micro_batch_size=1, sft=True)
 
     data_iterator = None
     if mpu.get_tensor_model_parallel_rank() == 0: # NOTE(asolergi-nv): Only create data iterator on TP rank 0
-        data_iterator = create_data_iterator(seq_length, sft, create_attention_mask=create_attention_mask)
+        data_iterator = create_data_iterator(seq_length, sft=True)
     
     (
-        tokens,
-        labels,
-        loss_mask,
-        position_ids,
         attention_mask,
         cu_seqlens,
         cu_seqlens_padded,
+        labels,
+        loss_mask,
         max_seqlen,
+        position_ids,
+        tokens,
     ) = get_batch(data_iterator)
+
+    assert tokens is not None
+    assert labels is not None
+    assert loss_mask is not None
+    assert position_ids is not None
+    assert cu_seqlens is not None
+    assert max_seqlen is not None
+    assert attention_mask is None
+    
+    if cp_size > 1:
+        assert cu_seqlens_padded is not None
+    else:
+        assert cu_seqlens_padded is None
+
+    """
+    expected_shape = (1, seq_length // cp_size)
+    assert tokens.shape == expected_shape
+    assert labels.shape == expected_shape
+    assert loss_mask.shape == expected_shape
+    assert position_ids.shape == expected_shape
+    assert attention_mask.shape == expected_shape
+    assert cu_seqlens.shape == (1, 2)
+    assert cu_seqlens_padded.shape == (1, 2)
+    assert max_seqlen.shape == (1,)
+    """
 
     #print(f"Shapes! tokens: {tokens.shape}, labels: {labels.shape}, loss_mask: {loss_mask.shape}, cu_seqlens: {cu_seqlens.shape}, max_seqlen: {max_seqlen.shape}") # cu_seqlens_padded: {cu_seqlens_padded.shape}
 
+
+@pytest.mark.parametrize("tp_size", [1, 2, 4])
+@pytest.mark.parametrize("cp_size", [1, 2, 4])
+@pytest.mark.parametrize("seq_length", [1024, 2048, 4096])
+@pytest.mark.parametrize("create_attention_mask", [True, False])
+def test_pretrain_batch(tp_size, cp_size, seq_length, create_attention_mask):
+    if cp_size * tp_size > torch.cuda.device_count():
+        pytest.skip(f"Skipping test because cp_size * tp_size > torch.cuda.device_count() ({cp_size * tp_size} > {torch.cuda.device_count()})")
+
+    initialize_test_environment(tp_size, cp_size, seq_length, 1)
+
+    data_iterator = None
+    if mpu.get_tensor_model_parallel_rank() == 0: # NOTE(asolergi-nv): Only create data iterator on TP rank 0
+        data_iterator = create_data_iterator(seq_length, create_attention_mask=create_attention_mask)
+    
+    (
+        attention_mask,
+        cu_seqlens,
+        cu_seqlens_padded,
+        labels,
+        loss_mask,
+        max_seqlen,
+        position_ids,
+        tokens,
+    ) = get_batch(data_iterator)
+
+    assert tokens is not None
+    assert labels is not None   
+    assert loss_mask is not None
+    assert position_ids is not None
+    if create_attention_mask:
+        assert attention_mask is not None
+    else:
+        assert attention_mask is None
+
+    assert cu_seqlens is None
+    assert cu_seqlens_padded is None
+    assert max_seqlen is None
     

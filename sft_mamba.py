@@ -97,7 +97,7 @@ def get_batch(data_iterator, vp_stage=None):
 
     batch = get_batch_on_this_tp_rank(batch, broadcast_src_rank=mpu.get_tensor_model_parallel_src_rank(), broadcast_group=mpu.get_tensor_model_parallel_group(), is_sft=is_sft, create_attention_mask_in_dataloader=create_attention_mask_in_dataloader, cp_size=cp_size, tp_rank=tp_rank, micro_batch_size=args.micro_batch_size, seq_length=args.seq_length, mtp_on_this_rank=mtp_on_this_rank, pipeline_model_parallel_size=args.pipeline_model_parallel_size, is_pipeline_first_stage=mpu.is_pipeline_first_stage(), is_pipeline_last_stage=mpu.is_pipeline_last_stage()) # TODO(asolergi-nv): Add mtp_on_this_rank condition?
     batch = get_batch_on_this_cp_rank(batch, cp_group=get_context_parallel_group())
-    return batch.values()
+    return [batch[key] for key in sorted(batch.keys())]
 
 
 # define spiky loss as a loss that's 10x the max loss observed
@@ -178,14 +178,14 @@ def forward_step(data_iterator, model: MambaModel):
     with stimer(bdata=True):
         vp_stage = get_attr_wrapped_model(model, "vp_stage")
         (
-            tokens,
-            labels,
-            loss_mask,
-            position_ids,
             attention_mask,
             cu_seqlens,
             cu_seqlens_padded,
+            labels,
+            loss_mask,
             max_seqlen,
+            position_ids,
+            tokens,
         ) = get_batch(data_iterator, vp_stage)
 
     packed_seq_params = None

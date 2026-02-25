@@ -2135,7 +2135,6 @@ def preprocess_sft_batch(batch: Dict[str, Any], tp_rank: int, cp_size: int, tp_s
             'labels': labels.unsqueeze(0), # NOTE(asolergi-nv): Add back batch dimension
             'loss_mask': loss_mask.unsqueeze(0), # NOTE(asolergi-nv): Add batch dimension
             'position_ids': batch["position_ids"], # TODO(asolergi-nv): Automatically BYPASS position_ids, but take care of them properly with padding and so on! Should we move the creation of position_ids over here as we do with the loss_mask? After padding and so on. Oh yes since CP is changing positions ids, or its done in tex?
-            'attention_mask': None, # NOTE(asolergi-nv): 
             'cu_seqlens': cu_seqlens,
             'cu_seqlens_padded': cu_seqlens_padded if cu_seqlens_padded is not None else None,
             'max_seqlen': max_seqlen,
@@ -2151,7 +2150,6 @@ def get_batch_on_this_tp_rank(batch: dict[str, torch.Tensor], is_sft: bool, broa
 
     def _broadcast(item):
         if item is not None:
-            item = item.cuda(non_blocking=False)
             torch.distributed.broadcast(
                 item,
                 broadcast_src_rank,
