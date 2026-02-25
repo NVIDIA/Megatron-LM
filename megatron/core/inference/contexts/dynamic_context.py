@@ -463,6 +463,7 @@ class DynamicInferenceContext(BaseInferenceContext):
         # Request and token counts.
         self.total_request_count = 0
         self.active_token_count = 0
+        self.lifetime_prefill_token_count = 0
         self.paused_request_count = 0
         self.batch_dimensions = InferenceBatchDimensions(
             token_count=0, prefill_req_count=0, decode_req_count=0
@@ -1411,6 +1412,7 @@ class DynamicInferenceContext(BaseInferenceContext):
         # Reset request/token counts.
         self.total_request_count = 0
         self.active_token_count = 0
+        self.lifetime_prefill_token_count = 0
         self.paused_request_count = 0
         self.batch_dimensions = InferenceBatchDimensions(
             token_count=0, prefill_req_count=0, decode_req_count=0
@@ -1657,8 +1659,6 @@ class DynamicInferenceContext(BaseInferenceContext):
         assert (
             chunk_length <= req.remaining_prompt_length
         ), "Chunk length is greater than remaining prompt length"
-        if self.active_token_count + chunk_length > self.max_tokens:
-            raise TokenOverflowError(req.request_id)
 
         # =========================================================================
         # Block allocation + prefix matching + prefill skipping
@@ -1822,6 +1822,7 @@ class DynamicInferenceContext(BaseInferenceContext):
             self.mamba_metadata.request_to_mamba_state_idx[self.total_request_count] = mamba_idx
 
         self.active_token_count += effective_chunk_length
+        self.lifetime_prefill_token_count += effective_chunk_length
         self.total_request_count += 0 if req.finished_chunk_token_count > 0 else 1
         self.num_prefill_requests += 1
 

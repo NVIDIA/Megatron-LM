@@ -433,6 +433,7 @@ def main():
             # Attach peak memory metrics; the functional test only validates these
             # if the fields exist in the golden values.
             json_results.update(peak_mem_stats)
+            json_results["lifetime_prefill_token_count"] = engine.context.lifetime_prefill_token_count
 
             print(f' Saving results to {args.output_path}')
             with open(args.output_path, "w") as fp:

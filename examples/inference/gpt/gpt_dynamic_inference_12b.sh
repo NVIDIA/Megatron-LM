@@ -69,7 +69,7 @@ ARGS=" \
     --tiktoken-pattern v2 \
     --tokenizer-model ${TOKENIZER_MODEL} \
     --distributed-timeout-minutes 2400 \
-    --transformer-impl local \
+    --transformer-impl transformer_engine \
     --use-flash-attn \
     --inference-rng-tracker \
     \
