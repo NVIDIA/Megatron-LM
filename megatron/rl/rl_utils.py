@@ -653,7 +653,7 @@ def selective_log_softmax(logits, index):
     return per_token_logps
 
 
-def get_logprobs(model, tokens, position_ids, no_grad=True, sequence_packing=False, packed_seq_params=None):
+def get_logprobs(model, tokens, position_ids, no_grad=False, sequence_packing=False, packed_seq_params=None):
     """Get sequence logprobs from their token ids.
 
     Args:
@@ -1718,7 +1718,7 @@ def megatron_rl_inference_mode(
     lang_module = model[0].module.module if hasattr(model[0].module, "module") else model[0].module
 
     # Switch MoE layers to full CUDA graph capture for inference
-    if args.rl_training_cuda_graphs:
+    if args.rl_training_cuda_graphs and args.num_experts is not None:
         transition_moe_to_full_cudagraphs(lang_module)
 
     lang_module.eval()
@@ -1815,7 +1815,7 @@ def megatron_rl_inference_mode(
         ]
 
         # Switch MoE layers to partial CUDA graph capture for training
-        if args.rl_training_cuda_graphs:
+        if args.rl_training_cuda_graphs and args.num_experts is not None:
             transition_moe_to_partial_cudagraphs(lang_module)
 
         # If this is a separate RL inference model, prefetch weights back to CPU so they don't consume
