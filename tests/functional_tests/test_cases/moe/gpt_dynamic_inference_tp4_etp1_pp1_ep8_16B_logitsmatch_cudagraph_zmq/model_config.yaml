@@ -84,7 +84,9 @@ MODEL_ARGS:
   --inference-dynamic-batching-max-requests: 512
   --inference-logging-step-interval: 1
   --sequence-parallel: true
+  --moe-enable-routing-replay: true
 
 METRICS:
   - "generated_tokens"
   - "logprobs"
+  - "routing_indices"

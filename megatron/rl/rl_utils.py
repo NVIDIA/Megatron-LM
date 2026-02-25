@@ -8,7 +8,8 @@ from functools import partial
 import itertools
 import math
 import logging
-import pickle
+import json
+import os
 from collections import Counter, defaultdict
 from contextlib import contextmanager, nullcontext
 from dataclasses import dataclass
@@ -23,7 +24,6 @@ from torch.utils.data import DataLoader, TensorDataset
 from torch.utils.tensorboard import SummaryWriter
 
 from megatron.core import mpu
-from megatron.core.datasets.megatron_tokenizer import MegatronLegacyTokenizer
 from megatron.core.full_cuda_graph import FullCudaGraphWrapper
 from megatron.core.models.common.language_module.language_module import LanguageModule
 from megatron.core.num_microbatches_calculator import reconfigure_num_microbatches_calculator
@@ -31,6 +31,7 @@ from megatron.core.optimizer import MegatronOptimizer
 from megatron.core.pipeline_parallel import get_forward_backward_func
 from megatron.core.pipeline_parallel.utils import is_pp_last_stage, get_pp_last_rank
 from megatron.core.rerun_state_machine import RerunDataIterator
+from megatron.core.tokenizers import MegatronTokenizer
 from megatron.core.transformer.cuda_graphs import _CudagraphGlobalRecord
 from megatron.core.transformer.enums import CudaGraphScope
 from megatron.core.transformer.utils import toggle_cuda_graphs
@@ -60,7 +61,7 @@ from megatron.rl.agent.api import (
     TokenRollout,
 )
 from megatron.rl.agent.weighted_multi_task import WeightedMultiTask
-from megatron.rl.inference.megatron import MegatronChatLocal, MegatronLocal
+from megatron.rl.inference.megatron import MegatronLocal
 from megatron.rl.logging import LOG_DIR as lang_rl_log_dir
 from megatron.rl.logging import log as lang_rl_log
 from megatron.rl.server.inference.inference_interface_server import InferenceInterfaceServer
@@ -70,7 +71,6 @@ from megatron.training.global_vars import (
     get_tokenizer,
     get_wandb_writer,
 )
-from megatron.training.tokenizer.tokenizer import CustomTikTokenizer, _HuggingFaceTokenizer
 from megatron.training.utils import (
     get_ltor_masks_and_position_ids,
     get_nvtx_range,
@@ -94,16 +94,61 @@ logger = logging.getLogger(__name__)
 _GLOBAL_PACKING_CONTEXT = None
 
 
-def _maybe_prefetch_separate_inference_model_weights(model_core, *, to_cpu: bool) -> None:
-    """Prefetch RL *separate inference model* weights to CPU/GPU (UVM-only path).
+# Track whether the inference model is currently paused (offloaded to CPU).
+# Model starts on GPU after creation and is used immediately, so starts as False.
+_INFERENCE_MODEL_IS_PAUSED = False
 
-    Gated only by user args; this assumes the separate inference model was allocated with UVM when enabled.
+
+def _torch_saver_swap_inference_model(*, to_cpu: bool) -> None:
+    """Swap RL inference model weights between CPU and GPU using torch_memory_saver.
+
+    Uses torch_memory_saver.pause()/resume() to transfer inference model weights
+    that were allocated within a torch_memory_saver.region() context.
+
+    Args:
+        to_cpu: If True, move weights to CPU (pause). If False, restore weights to GPU (resume).
+    """
+    global _INFERENCE_MODEL_IS_PAUSED
+
+    if not HAVE_TORCH_MEMORY_SAVER:
+        raise RuntimeError(
+            "torch_memory_saver is required for inference model offloading when not using UVM. "
+            "Please install it: pip install torch_memory_saver "
+            "(see https://github.com/fzyzcjy/torch_memory_saver)"
+        )
+
+    if to_cpu:
+        if not _INFERENCE_MODEL_IS_PAUSED:
+            torch_memory_saver.pause("rl_inference_model")
+            _INFERENCE_MODEL_IS_PAUSED = True
+            print_rank_0("[Rank 0] offloaded RL inference model weights to CPU using torch_memory_saver")
+    else:
+        if _INFERENCE_MODEL_IS_PAUSED:
+            torch_memory_saver.resume("rl_inference_model")
+            _INFERENCE_MODEL_IS_PAUSED = False
+            print_rank_0("[Rank 0] restored RL inference model weights to GPU using torch_memory_saver")
+
+
+def _maybe_prefetch_separate_inference_model_weights(model_core, *, to_cpu: bool) -> None:
+    """Prefetch RL *separate inference model* weights to CPU/GPU.
+
+    Supports two modes:
+    1. UVM-based offloading (when --rl-inference-model-unified-memory-level=1)
+    2. torch_memory_saver-based offloading (when offloading is enabled but UVM is not)
+
+    Gated by user args; this assumes the separate inference model was allocated
+    with UVM or torch_memory_saver when enabled.
     """
     args = get_args()
     if not args.rl_offload_inference_model_weights_when_idle:
         return
+
+    # Check for torch_memory_saver path (when offloading is enabled but UVM is not)
     if args.rl_inference_model_unified_memory_level != 1:
+        _torch_saver_swap_inference_model(to_cpu=to_cpu)
         return
+
+    # UVM-based path (when UVM level is 1)
     device = -1 if to_cpu else int(torch.cuda.current_device())
     # Note: include_buffers=False because buffers created with explicit device= in register_buffer()
     # are not allocated via the UVM mempool and will fail UVM operations. Only parameters are UVM-allocated.
@@ -215,25 +260,21 @@ GroupedRollouts = list[Rollouts]
 
 @dataclass(slots=True)
 class RolloutStats:
-    mean_reward: float
-    mean_length: float
-    mean_length_std: float
-    max_length: float
-    min_length: float
-    reward_means: list[float]
-    reward_stds: list[float]
-    rewards: list[float]
+    rewards: list[list[float]] # inner list is for a group
+    env_ids: list[str] # same length as len(rewards)
+    turn_lens: list[list[int]] # token lengths of turns, grouped.
+    traj_lens: list[list[int]] # all turns comprise one trajectory.
+    num_turns: None | list[list[int]] # num_turns per traj
+    advantages: None | list[list[float]]
     min_piold_to_inf_prob: None | float
     max_piold_to_inf_prob: None | float
     mean_piold_to_inf_prob: None | float
     min_inf_train_prob_abs_diff: None | float
     max_inf_train_prob_abs_diff: None | float
     mean_inf_train_prob_abs_diff: None | float
-    advantages: None | list[list[float]]
     min_inf_prob: None | float
     max_inf_prob: None | float
     mean_inf_prob: None | float
-    num_turns: list[int] # num_turns per traj
 
 
 # Runtime state container for RL-specific data that shouldn't be checkpointed
@@ -386,36 +427,13 @@ _INFERENCE_INTERFACE = None
 def get_inference_interface(args, loop, model):
     global _INFERENCE_INTERFACE
     if _INFERENCE_INTERFACE is None:
-        rank = torch.distributed.get_rank()
-        if rank == 0 and args.langrl_external_server:
-            if args.langrl_inference_server_type == 'inplace_megatron':
-                _INFERENCE_INTERFACE = loop.run_until_complete(
-                    InferenceInterfaceServer.launch(MegatronLocal, model=model[0])
-                )
-            elif args.langrl_inference_server_type == 'inplace_megatron_chat':
-                _INFERENCE_INTERFACE = loop.run_until_complete(
-                    InferenceInterfaceServer.launch(
-                        MegatronChatLocal,
-                        model=model[0],
-                        conversation_template=args.langrl_inference_server_conversation_template,
-                    )
-                )
-            else:
-                raise ValueError(f"Unknown inference_server_type {args.inference_server_type}")
-        else:
-            if args.langrl_inference_server_type == 'inplace_megatron':
-                _INFERENCE_INTERFACE = loop.run_until_complete(MegatronLocal.launch(model[0]))
-            elif args.langrl_inference_server_type == 'inplace_megatron_chat':
-                _INFERENCE_INTERFACE = loop.run_until_complete(
-                    MegatronChatLocal.launch(
-                        model[0],
-                        conversation_template=args.langrl_inference_server_conversation_template,
-                    )
-                )
-            else:
-                raise ValueError(
-                    f"Unknown inference_server_type {args.langrl_inference_server_type}"
-                )
+        _INFERENCE_INTERFACE = loop.run_until_complete(
+            MegatronLocal.launch(
+                model[0],
+                host='0.0.0.0',
+                port=8294,
+                verbose=args.inference_flask_server_logging)
+        )
     return _INFERENCE_INTERFACE
 
 
@@ -462,11 +480,17 @@ def get_environment_rollouts(
 
     if args.rl_offload_optimizer_during_inference:
         with nvtx_range("offload-optimizer-state-and-grad-buffers-during-inference"):
-            model[0].offload_grad_buffers()
+            if not args.rl_training_cuda_graphs:
+                model[0].offload_grad_buffers()
+            else:
+                logger.warning(
+                    "Gradient buffers will not be offloaded when training cudagraphs are used!"
+                )
             optimizer.offload_to_cpu()
-             
-    # If we have seperate training and inference models we to refit weights from the training model to the inference model.
-    if inference_model is not None:
+
+    # If we have separate training and inference models we to refit weights from the training model to the inference model.
+    has_separate_inference_model = inference_model is not None
+    if has_separate_inference_model:
         # If the separate inference model weights were prefetched to CPU while idle, bring them
         # back to GPU before refit/copy and before any CUDA-graph'd inference.
         with nvtx_range("prefetch-inference-model-weights-to-gpu"):
@@ -494,10 +518,8 @@ def get_environment_rollouts(
             inference_model,
             optimizer,
             args.cuda_graph_impl,
-            args.rl_reset_cuda_graphs,
             False, # offload optimizer during rollout collection is handled above
-            args.rl_offload_kv_cache_during_training,
-            args.rl_remove_kv_cache_during_training,
+            training_model=model if has_separate_inference_model else None,
         ) as inference_interface:
 
             with nvtx_range("inference-setup"):
@@ -518,6 +540,10 @@ def get_environment_rollouts(
                     rollouts = [
                         loop.run_until_complete(anext(rollout_generator)) for _ in range(n_prompts)
                     ]
+                    # In deterministic mode, sort rollouts by problem_id for consistent ordering
+                    # regardless of completion order due to system timing jitter.
+                    if torch.are_deterministic_algorithms_enabled():
+                        rollouts.sort(key=lambda group: group[0].problem_id if group and group[0].problem_id else "")
                     if not args.rl_partial_rollouts:
                         while True:
                             try:
@@ -544,10 +570,10 @@ def get_environment_rollouts(
         with open(
             lang_rl_log_dir
             + f'/rollouts_rank{rank}_iteration{args.curr_iteration}_'
-            + f'{Path(args.langrl_env_config).stem}.pkl',
-            'wb',
+            + f'{Path(args.langrl_env_config).stem}.json',
+            'w',
         ) as f:
-            pickle.dump(rollouts, f)
+            json.dump([[r.model_dump() for r in group] for group in rollouts], f)
 
     return rollouts
 
@@ -686,7 +712,7 @@ def calculate_grpo_advantages(rewards: list[list[float]], num_turns: list[list[i
 
 
 def compute_group_stats(
-    rollouts: GroupedRollouts, tokenizer: MegatronLegacyTokenizer, seq_len: int,
+    rollouts: GroupedRollouts, tokenizer: MegatronTokenizer, seq_len: int,
 ) -> RolloutStats:
     """Add group-based rollout stats for logging.
 
@@ -701,18 +727,18 @@ def compute_group_stats(
     # TODO (rkirby) Maybe do some of this after the tensor building
     group_reward_means = []
     group_reward_stds = []
-    group_length_means = []
-    group_length_stds = []
-    group_length_maxs = []
-    group_length_mins = []
+    turn_lens = []
+    traj_lens = []
     rewards = []
+    env_ids = []
+    group_reward_ids = []
     num_turns = [] # num_turns per traj
     for group in rollouts:
         group_rewards = []
-        group_lengths = []
+        group_traj_lengths = []
+        group_turn_lengths = []
         group_num_turns = []
         for rollout in group:
-            group_num_turns.append(len(rollout.trajectory))
             if isinstance(rollout, TokenRollout):
                 for turn_traj in rollout.trajectory:
                     detokenized_traj = tokenizer.detokenize(turn_traj)
@@ -727,29 +753,29 @@ def compute_group_stats(
                 lang_rl_log(
                     f"Rollout: [{rollout.env_id}] [{rollout.reward} : {len(rollout.trajectory)} chars] {rollout.trajectory}"
                 )
+            group_num_turns.append(len(rollout.trajectory))
             group_rewards.append(rollout.reward)
-            #TODO(vitalyk): What is the semantics behind traj length in multiturn? Should we take the last only? Average them instead of extending?
-            group_lengths.extend(len(t) for t in rollout.trajectory)
-
-        group_length_maxs.append(max(group_lengths))
-        group_length_mins.append(min(group_lengths))
-        group_reward_means.append(np.mean(group_rewards))
-        group_reward_stds.append(np.std(group_rewards))
+            roll_turn_lens = [len(t) for t in rollout.trajectory]
+            group_turn_lengths.extend(roll_turn_lens)
+            group_traj_lengths.append(sum(roll_turn_lens))
+        traj_lens.append(group_traj_lengths)
+        turn_lens.append(group_turn_lengths)
+        env_ids.append(group[0].env_id) # All rollouts in a group share the env_id by design.
         rewards.append(group_rewards)
-        group_length_means.append(np.mean(group_lengths))
-        # https://arxiv.org/abs/2504.21233 reports that lens variants hurts.
+        # https://arxiv.org/abs/2504.21233 reports that lens variance hurts.
         # Let's track this.
-        group_length_stds.append(np.std(group_lengths))
         num_turns.append(group_num_turns)
 
     stats = RolloutStats(
-        mean_reward=np.mean(group_reward_means),
-        mean_length=np.mean(group_length_means),
-        mean_length_std=np.mean(group_length_stds),
-        max_length=np.max(group_length_maxs),
-        min_length=np.min(group_length_mins),
-        reward_means=group_reward_means,
-        reward_stds=group_reward_stds,
+        traj_lens=traj_lens,
+        turn_lens=turn_lens,
+        rewards=rewards,
+        # --------
+        # Everything above is per-group, i.e. it is a list of lists,
+        # with the inner list being the group data.
+        env_ids=env_ids,
+        num_turns=num_turns,
+        advantages=calculate_grpo_advantages(rewards, num_turns),
         min_piold_to_inf_prob=None,
         max_piold_to_inf_prob=None,
         mean_piold_to_inf_prob=None,
@@ -759,20 +785,96 @@ def compute_group_stats(
         min_inf_prob=None,
         max_inf_prob=None,
         mean_inf_prob=None,
-        rewards=[r for group in rewards for r in group],
-        advantages=calculate_grpo_advantages(rewards, num_turns),
-        num_turns=[nt for group in num_turns for nt in group],
     )
     return stats
+
+
+def prep_wandb_metrics(
+        wandb_writer: wandb_run.Run,
+        traj_lens: List[List[int]],
+        turn_lens: List[List[int]],
+        rewards: List[List[float]],
+        num_turns: List[List[int]],
+        advantages: List[float],
+        example_group: list[TokenRollout | Rollout] | None = None,
+        tokenizer: MegatronTokenizer | None = None
+    ):
+
+    """Make a wandb-parseable dictionary of metrics for logging.
+
+    Args:
+        wandb_writer: Wandb run to log to.
+        traj_lens: Grouped list of trajectory lengths.
+        turn_lens: Grouped list of turn lengths.
+        rewards: Grouped list of rewards.
+        num_turns: Grouped list of number of turns in the trajectories.
+        advantages: Flattened list of advantages.
+        tokenizer: Tokenizer to untokenize trajectories for logging.
+        example_groups: A list of rollouts of one group to log examples of trajectories.
+    """
+
+    group_table = wandb_writer.Table(
+        columns=['group_means', 'group_stds'],
+        data=[[np.mean(g), np.std(g)] for g in rewards],
+    )
+
+    metrics = {
+            'group_means_hist': wandb_writer.plot.histogram(
+                group_table, 'group_means', 'Group Means'
+            ),
+            'group_stds_hist': wandb_writer.plot.histogram(
+                group_table, 'group_stds', 'Group STDs'
+            ),
+            'rewards_hist': wandb_writer.plot.histogram(
+                wandb_writer.Table(
+                    columns=['reward'], data=[[r] for g in rewards for r in g]
+                ),
+                'reward', 'All Rewards'
+            ),
+            'advantages_hist': wandb_writer.plot.histogram(
+                wandb_writer.Table(
+                    columns=['advantages'], data=[[x] for x in advantages]
+                ),
+                'advantages', 'Advantages'
+            ),
+            'mean_turn_length': np.mean([np.mean(g) for g in turn_lens]),
+            'mean_turn_length_std': np.mean([np.std(g) for g in turn_lens]),
+            'max_turn_length': max([max(g) for g in turn_lens]),
+            'min_turn_length': min([min(g) for g in turn_lens]),
+            'mean_traj_length': np.mean([np.mean(g) for g in traj_lens]),
+            'mean_traj_length_std': np.mean([np.std(g) for g in traj_lens]),
+            'max_traj_length': max([max(g) for g in traj_lens]),
+            'min_traj_length': min([min(g) for g in traj_lens]),
+            'mean_num_turns': np.mean([np.mean(g) for g in num_turns]),
+            'max_num_turns': max([max(g) for g in num_turns]),
+            'min_num_turns': min([min(g) for g in num_turns]),
+            'mean_reward': np.mean([np.mean(g) for g in rewards]),
+            'mean_advantage': np.mean(advantages),
+            'nonzero_groups_ratio': np.count_nonzero(advantages)
+            / len(advantages),
+    }
+    if example_group:
+        if tokenizer is None:
+            raise ValueError("If you provide an example group to log, you need to provide a tokenizer too.")
+        metrics['rollouts'] = wandb_writer.Table(
+            columns=['Trajectories', 'Tokens', 'Rewards'],
+            rows=[
+                [
+                    tokenizer.detokenize(turn) if isinstance(r, TokenRollout) else turn,
+                    r.trajectory,
+                    r.reward,
+                ]
+                for r in example_group for turn in r.trajectory
+            ],
+        )
+    return metrics
 
 
 def maybe_log_training_metrics(
     group_stats: RolloutStats,
     current_iteration: int,
-    tokenizer: MegatronLegacyTokenizer,
-    example_group: list[TokenRollout | Rollout],
-    wandb_writer: wandb_run.Run | None = None,
-    tb_writer: SummaryWriter | None = None,
+    tokenizer: MegatronTokenizer,
+    example_groups: dict[str, list[TokenRollout | Rollout]],
 ):
     """Log training metrics if writers are available.
 
@@ -780,78 +882,65 @@ def maybe_log_training_metrics(
         group_stats: RolloutStats object to pass to writers.
         current_iteration: Current training iteration.
         tokenizer: Tokenizer to untokenize trajectories for logging.
-        example_group: A list of rollouts of one group to log examples of trajectories.
-        wandb_writer: W&B writer object.
-        tb_writer:  Tensorboard writer object.
+        example_groups: A dict with values as list of rollouts of one group to log examples of trajectories. Keys are env names.
     """
-    if wandb_writer:
-        group_table = wandb_writer.Table(
-            columns=['group_means', 'group_stds'],
-            data=list(zip(group_stats.reward_means, group_stats.reward_stds)),
-        )
-        rollout_table = wandb_writer.Table(
-            columns=['reward'], data=[[r] for r in group_stats.rewards]
-        )
-        advantages = wandb_writer.Table(
-            columns=['advantages'], data=[[x] for x in group_stats.advantages]
-        )
-        wandb_writer.log(
-            {
-                **{
-                    'group_means_hist': wandb_writer.plot.histogram(
-                        group_table, 'group_means', 'Group Means'
-                    ),
-                    'group_stds_hist': wandb_writer.plot.histogram(
-                        group_table, 'group_stds', 'Group STDs'
-                    ),
-                    'rewards_hist': wandb_writer.plot.histogram(
-                        rollout_table, 'reward', 'All Rewards'
-                    ),
-                    'mean_length': group_stats.mean_length,
-                    'mean_length_std': group_stats.mean_length_std,
-                    'max_length': group_stats.max_length,
-                    'min_length': group_stats.min_length,
-                    'mean_reward': group_stats.mean_reward,
-                    'mean_advantage': np.mean(group_stats.advantages),
-                    'advantages_hist': wandb_writer.plot.histogram(
-                        advantages, 'advantages', 'Advantages'
-                    ),
-                    'nonzero_groups_ratio': np.count_nonzero(group_stats.advantages)
-                    / len(group_stats.advantages),
-                    'min_piold_to_inf_prob': group_stats.min_piold_to_inf_prob,
-                    'max_piold_to_inf_prob': group_stats.max_piold_to_inf_prob,
-                    'mean_piold_to_inf_prob': group_stats.mean_piold_to_inf_prob,
-                    'min_inf_train_prob_abs_diff': group_stats.min_inf_train_prob_abs_diff,
-                    'max_inf_train_prob_abs_diff': group_stats.max_inf_train_prob_abs_diff,
-                    'mean_inf_train_prob_abs_diff': group_stats.mean_inf_train_prob_abs_diff,
-                    'min_inf_prob': group_stats.min_inf_prob,
-                    'max_inf_prob': group_stats.max_inf_prob,
-                    'mean_inf_prob': group_stats.mean_inf_prob,
-                    # For now only log the first group
-                    'rollouts': wandb_writer.Table(
-                        columns=['Trajectories', 'Tokens', 'Rewards'],
-                        rows=[
-                            [
-                                [(tokenizer.detokenize(turn)
-                                    if isinstance(r, TokenRollout)
-                                    else turn) for turn in r.trajectory
-                                ],
-                                r.trajectory,
-                                r.reward,
-                            ]
-                            for r in example_group
-                        ],
-                    ),
-                },
-            },
-            step=current_iteration,
-        )
+
+    wandb_writer = get_wandb_writer()
+    tb_writer = get_tensorboard_writer()
     if tb_writer:
-        tb_writer.add_scalar('mean_reward', group_stats.mean_reward, current_iteration)
+        tb_writer.add_scalar('mean_reward', np.mean([np.mean(g) for g in group_stats.rewards]), current_iteration)
+    if not wandb_writer:
+        return
+
+    # We log these metrics for the aggregated data, no split per env.
+    metrics = {
+        'min_piold_to_inf_prob': group_stats.min_piold_to_inf_prob,
+        'max_piold_to_inf_prob': group_stats.max_piold_to_inf_prob,
+        'mean_piold_to_inf_prob': group_stats.mean_piold_to_inf_prob,
+        'min_inf_train_prob_abs_diff': group_stats.min_inf_train_prob_abs_diff,
+        'max_inf_train_prob_abs_diff': group_stats.max_inf_train_prob_abs_diff,
+        'mean_inf_train_prob_abs_diff': group_stats.mean_inf_train_prob_abs_diff,
+        'min_inf_prob': group_stats.min_inf_prob,
+        'max_inf_prob': group_stats.max_inf_prob,
+        'mean_inf_prob': group_stats.mean_inf_prob,
+    }
+
+    traj_lens = group_stats.traj_lens
+    turn_lens = group_stats.turn_lens
+    rewards = group_stats.rewards
+    num_turns = group_stats.num_turns
+    advantages = group_stats.advantages
+    metrics = metrics | prep_wandb_metrics(wandb_writer=wandb_writer, 
+        traj_lens=traj_lens, turn_lens=turn_lens, rewards=rewards, num_turns=num_turns, advantages=advantages)  
+    env_stats = lambda cont, idx: [cont[i] for i in idx]
+    group_turn_counts = [sum(nt) for nt in num_turns]
+
+    for env_id in set(group_stats.env_ids):
+        env_idx = [i for i, eidx in enumerate(group_stats.env_ids) if eidx == env_id]
+
+        # Advantages are flattened, we need to be more careful with those.
+        env_advantages = []
+        for i in env_idx:
+            st = sum(group_turn_counts[:i])
+            end = st + group_turn_counts[i]
+            env_advantages.extend(advantages[st:end])
+
+        env_metrics = prep_wandb_metrics(wandb_writer=wandb_writer, traj_lens=env_stats(traj_lens, env_idx), 
+            turn_lens=env_stats(turn_lens, env_idx), 
+            rewards=env_stats(rewards, env_idx),
+            num_turns=env_stats(num_turns, env_idx),
+            advantages=env_advantages,
+            example_group=example_groups[env_id],
+            tokenizer=tokenizer,
+        )
+        for k, v in env_metrics.items():
+            metrics[f"{env_id}_{k}"] = v
+
+    wandb_writer.log(metrics, step=current_iteration)
 
 
 def prepare_trajectories(
-    rollouts: Rollouts, tokenizer: MegatronLegacyTokenizer, seq_length: int, sequence_packing: bool, skip_bos_token: bool
+    rollouts: Rollouts, tokenizer: MegatronTokenizer, seq_length: int, sequence_packing: bool, skip_bos_token: bool
 ):
     """Pad trajectories and extract the generation masks.
     Args:
@@ -870,8 +959,7 @@ def prepare_trajectories(
 
     DEFAULT_PAD_TOKENS = ['<|finetune_right_pad_id|>']
 
-
-    if isinstance(tokenizer, _HuggingFaceTokenizer):
+    if tokenizer.library == "huggingface":
         if not tokenizer.pad:
             for pad_token in DEFAULT_PAD_TOKENS:
                 if pad_token in tokenizer.vocab:
@@ -882,7 +970,7 @@ def prepare_trajectories(
                     break
             else:
                 raise ValueError("No pad token found in tokenizer vocabulary")
-    elif isinstance(tokenizer, CustomTikTokenizer):
+    elif tokenizer.library == "tiktoken":
         assert "<SPECIAL_233>" in tokenizer.vocab, "Pad token is NOT in the tokenizer"
         tokenizer._pad_id = tokenizer.vocab["<SPECIAL_233>"]
 
@@ -999,7 +1087,7 @@ def logprobs_forward_step(data_iterator, model, is_correction, packing_context=N
             b_trajs.cuda(),
             b_posids.cuda(),
             no_grad=True,
-            sequence_packing=b_packed_seq_params is not None, 
+            sequence_packing=packing_context is not None,
             packed_seq_params=b_packed_seq_params,
         ),
         None,
@@ -1008,7 +1096,7 @@ def logprobs_forward_step(data_iterator, model, is_correction, packing_context=N
     return logprobs
 
 
-def _compute_logprobs_batch(
+def compute_logprobs_batch(
     model,
     data_loader,
     forward_backward_func,
@@ -1020,6 +1108,7 @@ def _compute_logprobs_batch(
     dtype,
     pp_group,
     is_correction,
+    collect_non_loss_data=False,
 ):
     """Compute logprobs for all batches in the data loader."""
     logprobs_list = []
@@ -1035,6 +1124,7 @@ def _compute_logprobs_batch(
             decoder_seq_length=decoder_seq_length,
             forward_only=True,
             adjust_tensor_shapes_fn=None,
+            collect_non_loss_data=collect_non_loss_data,
         )
         if is_pp_last_stage(pp_group):
             logprobs_list.append(output_tensor[0].detach())
@@ -1060,7 +1150,7 @@ def prepare_data_for_update(
     model: list[LanguageModule],
     ref_state_dict: Dict[str, Any],
     rollouts: GroupedRollouts,
-    tokenizer: MegatronLegacyTokenizer,
+    tokenizer: MegatronTokenizer,
     sequence_packing: bool,
     is_correction: bool,
 ) -> RerunDataIterator:
@@ -1078,8 +1168,6 @@ def prepare_data_for_update(
         Cycled iterator over dataset batches. In GRPO we might want to go over the same data multiple times.
     """
     args = get_args()
-    wandb_writer = get_wandb_writer()
-    tb_writer = get_tensorboard_writer()
     nvtx_range = get_nvtx_range()
     runtime_state = get_rl_runtime_state()
 
@@ -1087,7 +1175,7 @@ def prepare_data_for_update(
         lang_module = (
             model[0].module.module if hasattr(model[0].module, "module") else model[0].module
         )
-        toggle_cuda_graphs(lang_module, "none", reset_cuda_graphs=False)
+        toggle_cuda_graphs(lang_module, "none")
 
     model = model[0]
     dtype = torch.bfloat16 if args.bf16 else (torch.float16 if args.fp16 else torch.float32)
@@ -1103,13 +1191,17 @@ def prepare_data_for_update(
         # Note :- For EP, do not use the expert data parallel group here. Always 
         # use the regular data parallel group. 
 
-        # Use one group as an exampling for logging later.
-        example_group = rollouts[0]
+        # Get example group per environment to log their rollouts.
+        example_groups = {}
+        for g in rollouts:
+            if g[0].env_id not in example_groups:
+                example_groups[g[0].env_id] = g
 
         # Let's expand rollouts getting rid of the groups.
         # We need this to correctly split the rollouts across dp groups.
         # And we do not actually need them grouped in anything below anyways.
         rollouts = [r for g in rollouts for r in g]
+        num_turns = [nt for g in group_stats.num_turns for nt in g]
         total_turns_sampled = len(rollouts)
 
         # We might sample more than we consume in one step.
@@ -1122,10 +1214,9 @@ def prepare_data_for_update(
                 mpu.get_data_parallel_rank() * data_split_size,
                 (mpu.get_data_parallel_rank() + 1) * data_split_size,
             )
-            # TODO(vitalyk): This has to be rewritten assuming we are multiturn now.
             rollouts = rollouts[data_split_range[0] : data_split_range[1]]
-            local_num_turns = sum(group_stats.num_turns[data_split_range[0] : data_split_range[1]])
-            steps_before = sum(group_stats.num_turns[:data_split_range[0]])
+            local_num_turns = sum(num_turns[data_split_range[0] : data_split_range[1]])
+            steps_before = sum(num_turns[:data_split_range[0]])
             advantages = advantages[steps_before:steps_before+local_num_turns]
             # First we calculate them on a global level and then we split and recalculate on a local level.
             # Sequence packing and reporting needs it global but non-packing wants it local.
@@ -1196,7 +1287,7 @@ def prepare_data_for_update(
             pp_group = pg_collection.pp
 
             with torch.no_grad(), nvtx_range("compute_old_logprobs", time=True):
-                old_logprobs = _compute_logprobs_batch(
+                old_logprobs = compute_logprobs_batch(
                     model=model,
                     data_loader=data_loader,
                     forward_backward_func=forward_backward_func,
@@ -1216,7 +1307,7 @@ def prepare_data_for_update(
                     k: (v.cpu() if v is not None else v) for k, v in model.state_dict().items()
                 }
                 model.load_state_dict(ref_state_dict)
-                ref_logprobs = _compute_logprobs_batch(
+                ref_logprobs = compute_logprobs_batch(
                     model=model,
                     data_loader=data_loader,
                     forward_backward_func=forward_backward_func,
@@ -1332,9 +1423,7 @@ def prepare_data_for_update(
                 group_stats=group_stats,
                 current_iteration=args.curr_iteration,
                 tokenizer=tokenizer,
-                example_group=example_group,
-                wandb_writer=wandb_writer,
-                tb_writer=tb_writer,
+                example_groups=example_groups,
             )
 
     return RerunDataIterator(itertools.cycle(loader))
@@ -1407,14 +1496,17 @@ def evaluate_and_print_results_rl(
     optimizer: MegatronOptimizer,
     iteration: int,
     write_to_tensorboard: bool = True,
+    training_model: Optional[list[LanguageModule]] = None,
 ):
     """Helper function to evaluate and dump results on screen.
 
     Args:
         data_iterator: Iterator over batches of evaluation dataset.
-        model: Model to evaluate with.
+        model: Model to evaluate with (may be separate inference model).
         iteration: Current training iteration.
         write_to_tensorboard: Dumpt stuff to tensorboard or not.
+        training_model: Training model (if separate from inference model). Used to offload
+            grad buffers and restore to train mode. If None, uses model parameter.
     """
     args = get_args()
 
@@ -1428,10 +1520,8 @@ def evaluate_and_print_results_rl(
             model,
             optimizer,
             args.cuda_graph_impl,
-            args.rl_reset_cuda_graphs,
             args.rl_offload_optimizer_during_inference,
-            args.rl_offload_kv_cache_during_training,
-            args.rl_remove_kv_cache_during_training,
+            training_model,
         ) as inference_interface:
 
             loop = get_asyncio_loop()
@@ -1507,10 +1597,10 @@ def evaluate_and_print_results_rl(
                 with open(
                     lang_rl_log_dir
                     + f'/eval_rank{rank}_iteration{args.curr_iteration}_'
-                    + f'{Path(args.langrl_env_config).stem}.pkl',
-                    'wb',
+                    + f'{Path(args.langrl_env_config).stem}.json',
+                    'w',
                 ) as f:
-                    pickle.dump(dp_eval_results, f)
+                    json.dump([[r.model_dump() for r in group] for group in dp_eval_results], f)
 
 
 def calculate_grpo_loss(
@@ -1612,21 +1702,18 @@ def megatron_rl_inference_mode(
     model: list[LanguageModule],
     optimizer: MegatronOptimizer,
     cuda_graph_impl: str,
-    reset_cuda_graphs: bool,
     offload_optimizer_during_inference: bool,
-    offload_kv_cache_during_training: bool,
-    remove_kv_cache_during_training: bool,
+    training_model: Optional[list[LanguageModule]] = None,
 ):
     """Manage the model inference context when collecting rollouts.
 
     Args:
-        model: model to prepare.
+        model: model to prepare for inference (may be separate inference model).
         optimizer: optimizer used to train the model.
         cuda_graph_impl: which cuda graph implementation to use.
-        reset_cuda_graphs: rebuild cuda graphs for each inference stage or not.
         offload_optimizer_during_inference: move optimizer to cpu during inference or not.
-        offload_kv_cache_during_training: manually offload kv cache to host before training or not.
-        remove_kv_cache_during_training: manually remove kv cache before training or not.
+        training_model: training model (if separate from inference model). Used to offload
+            grad buffers and restore to train mode. If None, uses model parameter.
 
     Yields:
         None: this context manager does not return a value.
@@ -1642,10 +1729,10 @@ def megatron_rl_inference_mode(
     lang_module = model[0].module.module if hasattr(model[0].module, "module") else model[0].module
 
     lang_module.eval()
-    # If this is a separate RL inference model allocated with UVM, ensure weights are resident on GPU
-    # before any CUDA-graph capture/replay or inference.
+    # If this is a separate RL inference model with offloading enabled, ensure weights are on GPU
+    # before any CUDA-graph capture/replay or inference. This is a no-op if already on GPU.
+    model_core = unwrap_model(model[0])
     with nvtx_range("prefetch-inference-model-weights-to-gpu"):
-        model_core = unwrap_model(model[0])
         _maybe_prefetch_separate_inference_model_weights(model_core, to_cpu=False)
 
     rotary_module = getattr(lang_module, "rotary_pos_emb", None)
@@ -1659,40 +1746,21 @@ def megatron_rl_inference_mode(
 
         if offload_optimizer_during_inference:
             with nvtx_range("offload-optimizer-state-and-grad-buffers-before-inference"):
-                model[0].offload_grad_buffers()
+                if not args.rl_training_cuda_graphs:
+                    # Offload grad buffers from the training model (if separate inference model is used)
+                    # or from the inference model (if they're the same model)
+                    model_for_grad_offload = training_model if training_model is not None else model
+                    model_for_grad_offload[0].offload_grad_buffers()
+                else:
+                    logger.warning(
+                        "Gradient buffers will not be offloaded when training cudagraphs are used!"
+                    )
                 optimizer.offload_to_cpu()
 
-        # TODO: Remove this if statement once a change to `toggle_cuda_graphs` makes it safe to.
         if cuda_graph_impl != "none" and not args.rl_training_cuda_graphs:
-            toggle_cuda_graphs(lang_module, cuda_graph_impl, reset_cuda_graphs=reset_cuda_graphs)
+            toggle_cuda_graphs(lang_module, cuda_graph_impl)
 
         inference_interface = get_inference_interface(args, loop, model)
-
-        with nvtx_range("onload-kv-cache-before-inference"):
-            if offload_kv_cache_during_training:
-                # Restore the KV cache by re-binding physical pages to a consistent virtual address
-                torch_memory_saver.resume("kv_cache")
-
-                logger.debug(
-                    f"[{dist.get_rank()}] Restoring kv cache ({inference_interface._inference_engine.context.memory_buffer.numel() / 1024**3:.2f} GB) to GPU"
-                )
-                kv_cache = inference_interface._inference_engine.context.memory_buffer
-                inference_interface._inference_engine.context.memory_buffer = kv_cache.cuda()
-            elif remove_kv_cache_during_training:
-                if inference_interface._inference_engine.context.memory_buffer is None:
-                    inference_interface._inference_engine.context.build_memory_buffer()
-
-        # TODO: Improve this if statement once a change is made to CUDA graph handling.
-        cuda_graph_exists = len(_CudagraphGlobalRecord.cudagraph_inference_record) != 0
-        if cuda_graph_impl != "none" and not cuda_graph_exists:
-            with nvtx_range("wait-for-decode-only"):
-                while not inference_interface._inference_engine.context.is_decode_only():
-                    active_requests, finished_requests, step_time = loop.run_until_complete(
-                        inference_interface._inference_engine.async_step()
-                    )
-            with nvtx_range("build-cuda-graphs"):
-                inference_interface._inference_engine.create_cuda_graphs(reset_context=True)
-
         loop.run_until_complete(inference_interface.resume())
 
         logger.debug(f"[{dist.get_rank()}] Entered inference mode")
@@ -1701,32 +1769,25 @@ def megatron_rl_inference_mode(
         with nvtx_range("suspend-engine"):
             loop.run_until_complete(inference_interface.suspend())
 
-        with nvtx_range("offload-kv-cache-after-inference"):
-            if offload_kv_cache_during_training:
-                kv_cache = inference_interface._inference_engine.context.memory_buffer
-                logger.debug(
-                    f"[{dist.get_rank()}] Offloading kv cache ({kv_cache.numel() * kv_cache.element_size() / 1024**3:.2f} GB) to CPU"
-                )
-                torch_memory_saver.pause("kv_cache")
-
-            elif remove_kv_cache_during_training:
-                inference_interface._inference_engine.context.memory_buffer = None
-
-        # TODO: Remove this if statement once a change to `toggle_cuda_graphs` makes it safe to.
         if cuda_graph_impl != "none" and not args.rl_training_cuda_graphs:
-            toggle_cuda_graphs(lang_module, 'none', reset_cuda_graphs=reset_cuda_graphs)
+            toggle_cuda_graphs(lang_module, 'none')
 
-        # If this is a separate RL inference model, prefetch weights back to CPU so they don't consume
-        # GPU memory during training.
+        # If this is a separate RL inference model, prefetch weights back to CPU so they
+        # don't consume GPU memory during training.
         with nvtx_range("prefetch-inference-model-weights-to-cpu"):
             _maybe_prefetch_separate_inference_model_weights(model_core, to_cpu=True)
 
         if offload_optimizer_during_inference:
             with nvtx_range("onload-optimizer-state-and-grad-buffers-after-inference"):
-                model[0].restore_grad_buffers()
+                # Restore grad buffers to the training model (if separate inference model is used)
+                # or to the inference model (if they're the same model)
+                model_for_grad_offload = training_model if training_model is not None else model
+                model_for_grad_offload[0].restore_grad_buffers()
                 optimizer.restore_from_cpu()
 
-        lang_module.train()
+        # Set training model back to train mode (not inference model if they're separate)
+        training_lang_module = unwrap_model(training_model[0]) if training_model is not None else lang_module
+        training_lang_module.train()
 
         if has_lru_cache:
             rotary_module.forward.cache_clear()
@@ -1742,6 +1803,12 @@ def rl_inference_interface_shutdown():
         _INFERENCE_INTERFACE = None
     else:
         logger.warning("No inference interface to shutdown. This should not happen.")
+
+    # TODO(rkirby): This is a hack to hard exit. There is a bug that is preventing us from using sys.exit(0).
+    # It seem the Flask server has non-daemon threads that are preventing the program from exiting.
+    # We need to find a way to gracefully complete all in progress requests and shutdown the Flask server.
+    import os
+    os._exit(0)
 
 
 def get_iteration_sequence_count(args):

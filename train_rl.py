@@ -33,7 +33,6 @@ import logging
 
 logging.basicConfig(level=logging.INFO, force=True)
 
-
 def _gpt_builder(args, pre_process, post_process, vp_stage=None, config=None, pg_collection=None):
     # TODO(Peter): This is a hack to get around the fact that we are activation recomputation for training but not
     # for inference with cuda graphs. Without out this the post checks in the transformer config will assert error.
@@ -370,6 +369,8 @@ def train_valid_test_datasets_provider(train_val_test_num_samples):
 
 if __name__ == "__main__":
 
+    from megatron.inference.utils import add_inference_args
+
     # Temporary for transition to core datasets
     train_valid_test_datasets_provider.is_distributed = True
 
@@ -401,4 +402,5 @@ if __name__ == "__main__":
         ModelType.encoder_or_decoder,
         forward_step,
         args_defaults={},
+        extra_args_provider=add_inference_args,
     )
