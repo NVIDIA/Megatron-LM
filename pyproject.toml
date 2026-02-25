@@ -8,7 +8,7 @@ build-backend = "setuptools.build_meta"
 include-package-data = true
 
 [tool.setuptools.packages.find]
-include = ["megatron.core", "megatron.core.*"]
+include = ["megatron.core", "megatron.core.*", "megatron.training", "megatron.training.*"]
 
 [tool.setuptools.dynamic]
 version = { attr = "megatron.core.package_info.__version__" }
