@@ -1454,76 +1454,89 @@ class CudaGraphManager(torch.nn.Module):
         We iterate through the list by 1 for each call, and the number of calls is equal to the
         length of 'self.cudagraph_runners'.
         Otherwise, we assign a mempool per microbatch, which allows cudagraphs to be reused
-        over different microbatches by tracking their respective fwd and bwd passes.'''
-        if reuse_cudagraphs:
-            is_inference_mode = 'inference_context' in kwargs.keys() and kwargs['inference_context']
-            if is_inference_mode:
-                is_static_batching = kwargs['inference_context'].is_static_batching()
-                if is_static_batching:
-                    batch_size = kwargs['hidden_states'].shape[0]
-                    is_decode_only = kwargs["inference_context"].is_decode_only()
-                    runner = self.inference_cudagraphs_lookup_table[(batch_size, is_decode_only)]
-                else:
-                    padded_batch_dimensions = kwargs['inference_context'].padded_batch_dimensions
-                    runner = self.inference_cudagraphs_lookup_table[padded_batch_dimensions]
+        over different microbatches by tracking their respective fwd and bwd passes.
+
+        Runners that are not grad_enabled are handled separately.
+        '''
+        is_inference_mode = 'inference_context' in kwargs.keys() and kwargs['inference_context']
+        runner = None
+        require_grad = self.need_backward and torch.is_grad_enabled()
+
+        # Catch all inference work.
+        if is_inference_mode:
+            is_static_batching = kwargs['inference_context'].is_static_batching()
+            if is_static_batching:
+                batch_size = kwargs['hidden_states'].shape[0]
+                is_decode_only = kwargs["inference_context"].is_decode_only()
+                runner = self.inference_cudagraphs_lookup_table[(batch_size, is_decode_only)]
+            else:
+                padded_batch_dimensions = kwargs['inference_context'].padded_batch_dimensions
+                runner = self.inference_cudagraphs_lookup_table[padded_batch_dimensions]
+        # Catch both training work, and (non-training & non-inference) work.
+        else:
+            # Catch PP > 1 training work.
+            if not reuse_cudagraphs and require_grad:
+                # Rotate through grad-enabled runners in order; no need to check validity.
+                if _CudagraphGlobalRecord.cudagraph_created:
+                    idx = next(
+                        (
+                            i
+                            for i, r in enumerate(self.cudagraph_runners)
+                            if r.grad_enabled
+                        ),
+                        None,
+                    )
+                    assert idx is not None, (
+                        f"`cudagraph_created` is set to True but no matching cudagraph "
+                        f"runners were found. This module has {len(self.cudagraph_runners)} "
+                        f"existing runners. Use `get_mismatch_errors` to debug mismatches."
+                    )
+                    runner = self.cudagraph_runners[idx]
+                    assert runner.status == _GraphStatus.FWD_READY
+                    self.cudagraph_runners = (
+                        self.cudagraph_runners[idx + 1 :] + self.cudagraph_runners[: idx + 1]
+                    )
+            # Catch PP=1 training work, and (non-training & non-inference) work.
             else:
                 # Todo: For training, we could also cache runners based on input shape.
-                # If autograd is currently disabled, it doesnt matter if a runner was created
-                # with or without autograd, so just get the first fwd ready runner.
-                require_grad = self.need_backward and torch.is_grad_enabled()
-
+                # Match runners whose grad_enabled matches the current require_grad state.
+                # This prevents logprobs (no grad) from grabbing training runners, which
+                # would corrupt internal activation buffers needed by training backward.
                 def is_valid(r):
                     return (
                         r.status == _GraphStatus.FWD_READY
                         and not r.get_mismatch_errors(args, kwargs)
-                        and (not require_grad or r.grad_enabled)
+                        and r.grad_enabled == require_grad
                     )
 
                 # We must choose the first available runner, as the order of
                 # self.cudagraph_runners corresponds to the capture order.
                 runner = next((r for r in self.cudagraph_runners if is_valid(r)), None)
 
-            if runner is None:
-                if _CudagraphGlobalRecord.cudagraph_created:
+        if runner is None:
+            if _CudagraphGlobalRecord.cudagraph_created:
+                # Do not asssert on (non-training & non-inference) work.
+                if require_grad or is_inference_mode:
                     assert False, (
                         f"`cudagraph_created` is set to True but no matching cudagraph "
                         f"runners were found. This module has {len(self.cudagraph_runners)} "
                         f"existing runners. Use `get_mismatch_errors` to debug mismatches."
                     )
+            runner = _CudaGraphRunner(
+                megatron_module,
+                CudaGraphManager.global_mempool,
+                args,
+                kwargs,
+                self.func,
+                self.need_backward,
+            )
+            self.cudagraph_runners.append(runner)
+            if is_inference_mode:
+                # Cache the newly created runner in the inference lookup table.
+                if is_static_batching:
+                    self.inference_cudagraphs_lookup_table[(batch_size, is_decode_only)] = runner
                 else:
-                    runner = _CudaGraphRunner(
-                        megatron_module,
-                        CudaGraphManager.global_mempool,
-                        args,
-                        kwargs,
-                        self.func,
-                        self.need_backward,
-                    )
-                    self.cudagraph_runners.append(runner)
-                    if is_inference_mode:
-                        # Cache the newly created runner in the inference lookup table.
-                        if is_static_batching:
-                            self.inference_cudagraphs_lookup_table[(batch_size, is_decode_only)] = (
-                                runner
-                            )
-                        else:
-                            self.inference_cudagraphs_lookup_table[padded_batch_dimensions] = runner
-        else:
-            # Create cudagraphs for every microbatch
-            if _CudagraphGlobalRecord.cudagraph_created:
-                runner = self.cudagraph_runners[0]
-                assert runner.status == _GraphStatus.FWD_READY
-                self.cudagraph_runners = self.cudagraph_runners[1:] + self.cudagraph_runners[:1]
-            else:
-                runner = _CudaGraphRunner(
-                    megatron_module,
-                    CudaGraphManager.global_mempool,
-                    args,
-                    kwargs,
-                    self.func,
-                    self.need_backward,
-                )
-                self.cudagraph_runners.append(runner)
+                    self.inference_cudagraphs_lookup_table[padded_batch_dimensions] = runner
 
         return runner
 
@@ -1550,7 +1563,15 @@ class CudaGraphManager(torch.nn.Module):
                     self.call_ddp_preforward_hook(module)
 
             runner = self.get_cudagraph_runner(megatron_module, args, kwargs, self.reuse_cudagraphs)
-            out = runner.replay_graph_capture(self.is_first_microbatch, args, kwargs)
+            if runner.fwd_graph is None:
+                # Runner was created post-warmup (e.g. logprobs needing its own no_grad runners).
+                # Fall back to eager execution since we can't record graphs after warmup.
+                if self.func is not None:
+                    out = self.func(*args, **kwargs)
+                else:
+                    out = super(MegatronModule, megatron_module).__call__(*args, **kwargs)
+            else:
+                out = runner.replay_graph_capture(self.is_first_microbatch, args, kwargs)
         else:
             if is_inference_mode:
                 # Inference generation mode creates graphs immediately
