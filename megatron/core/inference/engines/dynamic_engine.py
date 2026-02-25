@@ -1621,26 +1621,20 @@ class DynamicInferenceEngine(AbstractEngine):
                 break
 
             elif header == Headers.UNPAUSE:
-                assert self.state == EngineState.PAUSED, (
-                    f"Received UNPAUSE in state {self.state}"
-                )
+                assert self.state == EngineState.PAUSED, f"Received UNPAUSE in state {self.state}"
                 self.state = EngineState.RUNNING
                 self.paused.clear()
                 self.running.set()
                 break
 
             elif header == Headers.SUSPEND:
-                assert self.state == EngineState.PAUSED, (
-                    f"Received SUSPEND in state {self.state}"
-                )
+                assert self.state == EngineState.PAUSED, f"Received SUSPEND in state {self.state}"
                 self.suspend()  # GPU memory offload
                 self.state = EngineState.SUSPENDING
                 break
 
             elif header == Headers.RESUME:
-                assert self.state == EngineState.SUSPENDED, (
-                    f"Received RESUME in state {self.state}"
-                )
+                assert self.state == EngineState.SUSPENDED, f"Received RESUME in state {self.state}"
                 self.suspended.clear()
                 self.resume()  # GPU memory onload
                 self.state = EngineState.RESUMING
@@ -1652,9 +1646,10 @@ class DynamicInferenceEngine(AbstractEngine):
                     entry.record.increment_staleness(policy_only=request_id in waiting)
 
             elif header == Headers.STOP:
-                assert self.state in (EngineState.PAUSED, EngineState.SUSPENDED), (
-                    f"Received STOP in state {self.state}"
-                )
+                assert self.state in (
+                    EngineState.PAUSED,
+                    EngineState.SUSPENDED,
+                ), f"Received STOP in state {self.state}"
                 if self.state == EngineState.SUSPENDED:
                     self.suspended.clear()
                 # Cleanup the request futures.
@@ -1702,14 +1697,10 @@ class DynamicInferenceEngine(AbstractEngine):
             return
 
         if self.state == EngineState.RUNNING:
-            self._pending_signals.append(
-                msgpack.packb([Headers.PAUSE.value], use_bin_type=True)
-            )
+            self._pending_signals.append(msgpack.packb([Headers.PAUSE.value], use_bin_type=True))
         if self.state not in (EngineState.STOPPING, EngineState.STOPPED):
             await self.paused.wait()
-            self._pending_signals.append(
-                msgpack.packb([Headers.STOP.value], use_bin_type=True)
-            )
+            self._pending_signals.append(msgpack.packb([Headers.STOP.value], use_bin_type=True))
         await task
 
         if immediate and hasattr(self, "inference_coordinator_process"):

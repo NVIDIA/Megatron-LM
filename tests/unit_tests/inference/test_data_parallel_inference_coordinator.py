@@ -121,9 +121,7 @@ class DummyEngine(DynamicInferenceEngine):
         For tests, we let AssertionErrors propagate directly so
         pytest.raises can catch them.
         """
-        return await DynamicInferenceEngine.run_engine_with_coordinator.__wrapped__(
-            self, loop=loop
-        )
+        return await DynamicInferenceEngine.run_engine_with_coordinator.__wrapped__(self, loop=loop)
 
     def suspend(self):
         """No-op suspend — no real GPU state to offload."""
@@ -336,8 +334,7 @@ class TestCoordinator:
                 await client1.start()
 
                 futures = [
-                    client1.add_request(prompt=p, sampling_params=s)
-                    for p, s in requests[:2]
+                    client1.add_request(prompt=p, sampling_params=s) for p, s in requests[:2]
                 ]
                 results = await asyncio.wait_for(asyncio.gather(*futures), timeout=5.0)
                 for record in results:
@@ -355,8 +352,7 @@ class TestCoordinator:
             # Verify the new engine can serve requests.
             if torch.distributed.get_rank() == 0:
                 futures = [
-                    client1.add_request(prompt=p, sampling_params=s)
-                    for p, s in requests[2:4]
+                    client1.add_request(prompt=p, sampling_params=s) for p, s in requests[2:4]
                 ]
                 results = await asyncio.wait_for(asyncio.gather(*futures), timeout=5.0)
                 for record in results:
@@ -429,27 +425,29 @@ class TestCoordinator:
         # States where paused stays set: once set during PAUSE, it's only
         # cleared by UNPAUSE.  It remains set through SUSPEND/RESUME/STOP.
         PAUSED_FAMILY = {
-            EngineState.PAUSED, EngineState.SUSPENDING, EngineState.SUSPENDED,
-            EngineState.RESUMING, EngineState.STOPPING, EngineState.STOPPED,
+            EngineState.PAUSED,
+            EngineState.SUSPENDING,
+            EngineState.SUSPENDED,
+            EngineState.RESUMING,
+            EngineState.STOPPING,
+            EngineState.STOPPED,
         }
 
         def assert_state(eng, expected):
             """Assert engine state and all four event flags are consistent."""
-            assert eng.state == expected, (
-                f"Expected state {expected}, got {eng.state}"
-            )
-            assert eng.running.is_set() == (expected == EngineState.RUNNING), (
-                f"running.is_set()={eng.running.is_set()} for state={expected}"
-            )
-            assert eng.paused.is_set() == (expected in PAUSED_FAMILY), (
-                f"paused.is_set()={eng.paused.is_set()} for state={expected}"
-            )
-            assert eng.suspended.is_set() == (expected == EngineState.SUSPENDED), (
-                f"suspended.is_set()={eng.suspended.is_set()} for state={expected}"
-            )
-            assert eng.stopped.is_set() == (expected == EngineState.STOPPED), (
-                f"stopped.is_set()={eng.stopped.is_set()} for state={expected}"
-            )
+            assert eng.state == expected, f"Expected state {expected}, got {eng.state}"
+            assert eng.running.is_set() == (
+                expected == EngineState.RUNNING
+            ), f"running.is_set()={eng.running.is_set()} for state={expected}"
+            assert eng.paused.is_set() == (
+                expected in PAUSED_FAMILY
+            ), f"paused.is_set()={eng.paused.is_set()} for state={expected}"
+            assert eng.suspended.is_set() == (
+                expected == EngineState.SUSPENDED
+            ), f"suspended.is_set()={eng.suspended.is_set()} for state={expected}"
+            assert eng.stopped.is_set() == (
+                expected == EngineState.STOPPED
+            ), f"stopped.is_set()={eng.stopped.is_set()} for state={expected}"
 
         requests = self.build_requests(num_requests=16)
         engine = DummyEngine()
@@ -469,10 +467,7 @@ class TestCoordinator:
                 assert_state(engine, EngineState.RUNNING)
 
                 # Submit and complete requests while running.
-                futures = [
-                    client.add_request(prompt=p, sampling_params=s)
-                    for p, s in requests[:2]
-                ]
+                futures = [client.add_request(prompt=p, sampling_params=s) for p, s in requests[:2]]
                 results = await asyncio.wait_for(asyncio.gather(*futures), timeout=5.0)
                 for record in results:
                     assert record[-1].status == Status.COMPLETED
@@ -495,9 +490,7 @@ class TestCoordinator:
 
                 # UNPAUSE and verify all in-flight requests complete.
                 client.unpause_engines()
-                results = await asyncio.wait_for(
-                    asyncio.gather(*inflight_futures), timeout=10.0
-                )
+                results = await asyncio.wait_for(asyncio.gather(*inflight_futures), timeout=10.0)
                 for record in results:
                     assert record[-1].status == Status.COMPLETED
                 assert_state(engine, EngineState.RUNNING)
@@ -516,8 +509,7 @@ class TestCoordinator:
                 # Requests submitted during PAUSE should queue, not complete.
                 # Use asyncio.wait (not wait_for) so futures aren't cancelled.
                 paused_futures = [
-                    client.add_request(prompt=p, sampling_params=s)
-                    for p, s in requests[2:5]
+                    client.add_request(prompt=p, sampling_params=s) for p, s in requests[2:5]
                 ]
                 done, pending = await asyncio.wait(paused_futures, timeout=0.5)
                 assert len(done) == 0, "No requests should complete while paused"
@@ -534,8 +526,7 @@ class TestCoordinator:
 
                 # Engine processes new requests normally after unpause.
                 futures = [
-                    client.add_request(prompt=p, sampling_params=s)
-                    for p, s in requests[5:7]
+                    client.add_request(prompt=p, sampling_params=s) for p, s in requests[5:7]
                 ]
                 results = await asyncio.wait_for(asyncio.gather(*futures), timeout=5.0)
                 for record in results:
@@ -573,8 +564,7 @@ class TestCoordinator:
 
                 # Engine processes requests after suspend/resume cycle.
                 futures = [
-                    client.add_request(prompt=p, sampling_params=s)
-                    for p, s in requests[7:10]
+                    client.add_request(prompt=p, sampling_params=s) for p, s in requests[7:10]
                 ]
                 results = await asyncio.wait_for(asyncio.gather(*futures), timeout=5.0)
                 for record in results:
@@ -587,8 +577,7 @@ class TestCoordinator:
 
                 # Submit requests that will be cancelled on STOP.
                 doomed_futures = [
-                    client.add_request(prompt=p, sampling_params=s)
-                    for p, s in requests[10:13]
+                    client.add_request(prompt=p, sampling_params=s) for p, s in requests[10:13]
                 ]
 
                 # ── SUSPEND (2nd) → STOP from SUSPENDED ─────────────
@@ -638,8 +627,7 @@ class TestCoordinator:
         ]:
             engine = DummyEngine()
             dp_addr = await engine.start_listening_to_data_parallel_coordinator(
-                inference_coordinator_port=DEFAULT_PORT,
-                launch_inference_coordinator=True,
+                inference_coordinator_port=DEFAULT_PORT, launch_inference_coordinator=True
             )
             try:
                 client = None
@@ -651,9 +639,9 @@ class TestCoordinator:
                     signal_fn(client)
                     # Signal should be dropped by coordinator.
                     await asyncio.sleep(0.3)
-                    assert engine.state == EngineState.RUNNING, (
-                        f"{signal_name} from RUNNING should be dropped by coordinator"
-                    )
+                    assert (
+                        engine.state == EngineState.RUNNING
+                    ), f"{signal_name} from RUNNING should be dropped by coordinator"
             finally:
                 await graceful_shutdown(engine, client, timeout=30.0)
 

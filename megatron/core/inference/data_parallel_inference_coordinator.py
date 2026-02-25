@@ -190,8 +190,11 @@ class DataParallelInferenceCoordinator:
             self.identities_of_data_parallel_ranks.remove(identity)
         except ValueError:
             return
-        logging.warning("Coordinator: removed engine %s (now %d engines)",
-                        identity, len(self.identities_of_data_parallel_ranks))
+        logging.warning(
+            "Coordinator: removed engine %s (now %d engines)",
+            identity,
+            len(self.identities_of_data_parallel_ranks),
+        )
 
     def _send_to_engine(self, identity, payload):
         """Send payload to an engine, removing it from the pool if unreachable.
