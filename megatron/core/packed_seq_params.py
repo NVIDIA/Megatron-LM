@@ -22,6 +22,7 @@ class PackedSeqParams:
     max_seqlen_kv: int = None
     local_cp_size: int = None
     cp_group: dist.ProcessGroup = None
+    total_tokens: int = None
 
     def __post_init__(self):
         # Pre-compute seq_idx for Mamba mixer CUDA graph compatibility.
@@ -30,9 +31,9 @@ class PackedSeqParams:
         cu_seqlens = (
             self.cu_seqlens_q_padded if self.cu_seqlens_q_padded is not None else self.cu_seqlens_q
         )
-        if isinstance(cu_seqlens, Tensor) and self.max_seqlen_q is not None:
+        if isinstance(cu_seqlens, Tensor) and self.total_tokens is not None:
             total_tokens_tensor = torch.tensor(
-                [self.max_seqlen_q], dtype=cu_seqlens.dtype, device=cu_seqlens.device
+                [self.total_tokens], dtype=cu_seqlens.dtype, device=cu_seqlens.device
             )
             cu_seqlens_with_max = torch.cat([cu_seqlens, total_tokens_tensor])
             seq_lengths = cu_seqlens_with_max[1:] - cu_seqlens_with_max[:-1]

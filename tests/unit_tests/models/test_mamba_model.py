@@ -142,6 +142,7 @@ class TestMambaModel:
             cu_seqlens_kv_padded=None,
             max_seqlen_q=max_seqlen,
             max_seqlen_kv=max_seqlen,
+            total_tokens=sequence_length,
         )
 
         logits = model.forward(
