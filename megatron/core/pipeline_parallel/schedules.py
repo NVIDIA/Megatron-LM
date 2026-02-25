@@ -8,6 +8,7 @@ import torch
 from torch.autograd.variable import Variable
 
 from megatron.core import parallel_state
+from megatron.core.enums import ModelType
 from megatron.core.pipeline_parallel.fine_grained_activation_offload import (
     FineGrainedActivationOffloadingInterface as off_interface,
 )
@@ -881,6 +882,10 @@ def forward_backward_pipelining_with_interleaving(
 
     elif p2p_communicator is not None and pg_collection is not None:
         model_type = get_model_type(model[0])
+        assert model_type != ModelType.encoder_and_decoder, (
+            "encoder PP stages not yet supported when passing custom process groups. "
+            "support coming soon!"
+        )
         assert hasattr(p2p_communicator, 'config'), "p2p_communicator must have a config"
         assert hasattr(pg_collection, 'tp'), "pg_collection must have a tp_group"
         assert hasattr(pg_collection, 'cp'), "pg_collection must have a cp_group"
@@ -2025,6 +2030,10 @@ def forward_backward_pipelining_without_interleaving(
         )
     elif p2p_communicator is not None and pg_collection is not None:
         model_type = get_model_type(model)
+        assert model_type != ModelType.encoder_and_decoder, (
+            "encoder PP stages not yet supported when passing custom process groups. "
+            "support coming soon!"
+        )
         assert hasattr(p2p_communicator, 'config'), "p2p_communicator must have a config"
         assert hasattr(pg_collection, 'tp'), "pg_collection must have tp_group"
         assert hasattr(pg_collection, 'cp'), "pg_collection must have cp_group"
