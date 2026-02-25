@@ -2,6 +2,7 @@
 
 from typing import Literal, Optional
 
+import torch
 from torch import Tensor
 
 from megatron.core import tensor_parallel
@@ -323,19 +324,38 @@ class MambaModel(LanguageModule):
             return hidden_states
 
         if self.config.mtp_num_layers is not None:
-            hidden_states = process_mtp_loss(
-                hidden_states=hidden_states,
-                labels=labels,
-                loss_mask=loss_mask,
-                output_layer=self.output_layer,
-                output_weight=output_weight,
-                runtime_gather_output=runtime_gather_output,
-                is_training=self.training,
-                compute_language_model_loss=self.compute_language_model_loss,
-                config=self.config,
-                cp_group=self.pg_collection.cp,
-                packed_seq_params=packed_seq_params,
-            )
+            # The new process_mtp_loss function doesn't handle mtp_logits_cache,
+            # so we manually generate and cache MTP logits when in inference mode.
+            if in_inference_mode:
+                hidden_states_list = torch.chunk(
+                    hidden_states, 1 + self.config.mtp_num_layers, dim=0
+                )
+                hidden_states = hidden_states_list[0]
+                self._mtp_logits_cache = None
+                mtp_inference_logits = []
+                for mtp_layer_number in range(self.config.mtp_num_layers):
+                    mtp_logits, _ = self.output_layer(
+                        hidden_states_list[mtp_layer_number + 1],
+                        weight=output_weight,
+                        runtime_gather_output=runtime_gather_output,
+                    )
+                    # mtp logits shape [b, 1, vocab size]
+                    mtp_inference_logits.append(mtp_logits.squeeze(1).unsqueeze(0))
+                self._mtp_logits_cache = torch.cat(mtp_inference_logits, dim=0)
+            else:
+                hidden_states = process_mtp_loss(
+                    hidden_states=hidden_states,
+                    labels=labels,
+                    loss_mask=loss_mask,
+                    output_layer=self.output_layer,
+                    output_weight=output_weight,
+                    runtime_gather_output=runtime_gather_output,
+                    is_training=self.training,
+                    compute_language_model_loss=self.compute_language_model_loss,
+                    config=self.config,
+                    cp_group=self.pg_collection.cp,
+                    packed_seq_params=packed_seq_params,
+                )
 
         sequence_parallel_override = False
         if in_inference_mode and inference_context.config.materialize_only_last_token_logits:

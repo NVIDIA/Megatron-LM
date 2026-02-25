@@ -266,12 +266,17 @@ class MambaMetadata:
             self.cu_seqlens = self._cu_seqlens_buffer[: padded_prefill_count + 1]
 
         if padded_decode_count > 0 and padded_prefill_count > 0:
-            self._device_decode_prefill_buffer[0] = real_decode_count
+            self._device_decode_prefill_buffer[0] = cu_seqlens[real_decode_count]
             # This describes the number of items in the prefill tensor relative to the
             # decode tensor. If chunked prefill is present, it is included in the
             # "prefill" part of the main split.
-            self._device_decode_prefill_buffer[1] = regular_prefill_count + (
-                1 if has_chunked_prefill_req else 0
+            self._device_decode_prefill_buffer[1] = (
+                cu_seqlens[
+                    real_decode_count
+                    + regular_prefill_count
+                    + (1 if has_chunked_prefill_req else 0)
+                ]
+                - cu_seqlens[real_decode_count]
             )
             self.device_decode_prefill = self._device_decode_prefill_buffer
 

@@ -758,8 +758,19 @@ class TextGenerationController:
 
         # Mamba speculative rewind state update
         if context.is_hybrid_model:
-            # TODO(ksanthanam): Maybe reset interemdiate states
-            pass
+            active_mamba_indices = context.mamba_metadata.request_to_mamba_state_idx[
+                active_request_slice
+            ]
+            is_decode_mask = context.request_in_prefill_status_tensor[active_request_slice] == 0
+            decode_mamba_indices = active_mamba_indices[is_decode_mask]
+            accepted_tokens_per_decode_request = accepted_tokens_per_request[is_decode_mask]
+
+            if decode_mamba_indices.numel() > 0:
+                context.mamba_ssm_states[:, decode_mamba_indices] = (
+                    context.mamba_intermediate_ssm_states[
+                        :, decode_mamba_indices, accepted_tokens_per_decode_request
+                    ]
+                )
 
     def _dynamic_step_sample_logits_and_verify_tokens(
         self, logits: Tensor, mtp_logits: Tensor, input_ids: Tensor
@@ -801,7 +812,12 @@ class TextGenerationController:
         assert (
             len(required_logit_indices)
             == num_decode_requests * (self.num_speculative_tokens + 1) + num_prefill_requests
-        ), f"Expected length of required_logit_indices to be num_decode_requests * (self.num_speculative_tokens + 1) + num_prefill_requests, but got {len(required_logit_indices)} for num_decode_requests {num_decode_requests} and num_prefill_requests {num_prefill_requests}"
+        ), (
+            f"Expected length of required_logit_indices to be "
+            f"num_decode_requests * (self.num_speculative_tokens + 1) + num_prefill_requests, "
+            f"but got {len(required_logit_indices)} for num_decode_requests {num_decode_requests} "
+            f"and num_prefill_requests {num_prefill_requests}"
+        )
 
         required_logits = logits.squeeze(0)[required_logit_indices, :]  # Shape [1, 11, vocab_size]
         required_mtp_logits = mtp_logits[
@@ -863,7 +879,7 @@ class TextGenerationController:
                 torch.isin(token_to_request_index, request_indices_tensor)
             )[0]
             # TODO : Can maybe club the following two and then split later ?
-            # TODO : Can directly initzlie output tokens as a tensor and put the logits in the right place
+            # TODO : Can directly initialize output tokens as a tensor and put the logits in the right place
             output_tokens_jumbled_list.append(
                 self._torch_sampling_func(required_logits[required_indices, :], temp, top_k, top_p)
             )
@@ -954,7 +970,7 @@ class TextGenerationController:
         # Accepted tokens                     [   [a6s  -1]  |     [b4s  b5s]    |     [-1  -1]      ]  # Only handle decod requests, (Prefill already defaults to -1s)
         # Accepted token counts               [   1        |        2         |        0             ]  # Prefill defaults to 0
 
-        # This part tis to extract the accepted tokens
+        # This part is to extract the accepted tokens
         input_tokens_required[accepted_tokens_mask == 0] = -1  # Masks out non accepted tokens
         input_tokens_decode_mode = input_tokens_required[
             : num_decode_requests * (self.num_speculative_tokens + 1)

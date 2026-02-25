@@ -788,7 +788,7 @@ class Attention(MegatronModule, ABC):
         assert block_table is not None
 
         # Flash attn kernel.
-        if not is_decode_only:
+        if max_seqlen_q > 1:
             q = q.squeeze(1)
             if getattr(self, "softmax_scale", None) is not None:
                 softmax_scale = self.softmax_scale
