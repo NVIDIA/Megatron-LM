@@ -396,14 +396,16 @@ def permute(
         # mask [num_tokens, num_experts] -> [num_experts, num_tokens]
         routing_map = routing_map.bool().T.contiguous()
 
-        # Create a dense expert-to-token mapping from the sparse token-to-expert mapping
-        token_indices = (
-            torch.arange(num_tokens, device=routing_map.device).unsqueeze(0).expand(num_experts, -1)
-        )
-        sorted_indices = token_indices.masked_select(routing_map)
+        # Use argsort to get indices of non-zero entries in row-major order.
+        # This is equivalent to masked_select but produces fixed-shape output,
+        # making it compatible with CUDA graph capture.
+        flat_sorted = routing_map.reshape(-1).argsort(descending=True, stable=True)
+        if num_out_tokens is not None:
+            flat_sorted = flat_sorted[:num_out_tokens]
+        sorted_indices = flat_sorted % num_tokens
 
         if probs is not None:
-            permuted_probs = probs.T.contiguous().masked_select(routing_map)
+            permuted_probs = probs.T.contiguous().reshape(-1)[flat_sorted]
 
     # use the mapping to permute the tokens
     permuted_input = tokens.index_select(0, sorted_indices)

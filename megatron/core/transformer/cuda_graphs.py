@@ -112,6 +112,7 @@ def _set_warmup_start():
 def _set_warmup_end():
     """Set graph warmup has ended."""
     global _IS_GRAPH_WARMUP
+    _IS_GRAPH_WARMUP = False
 
 
 @dataclass
@@ -928,8 +929,6 @@ class _CudaGraphRunner(torch.nn.Module):
                         only_inputs=True,
                         allow_unused=True,
                     )
-            _set_warmup_end()
-
             with self.get_quantization_context():
                 torch.cuda.synchronize()
                 # Register default CUDA generators ourselves (fixed in-place to have normal tensors)
@@ -962,6 +961,8 @@ class _CudaGraphRunner(torch.nn.Module):
                     # only on the last layer per-device to avoid slowing down graph creation.
                     if self.is_last_layer:
                         gc.collect()
+
+        _set_warmup_end()
 
         # save cudagraph output buffer
         self.fwd_graph_outputs = fwd_graph_outputs
@@ -1128,7 +1129,13 @@ class _CudaGraphRunner(torch.nn.Module):
                 if not torch.is_tensor(arg):
                     return arg
 
-                ref = make_weak_ref(arg)
+                try:
+                    ref = make_weak_ref(arg)
+                except RuntimeError:
+                    # Fallback to keeping a strong reference. There is a known bug where some
+                    # dtypes (e.g. torch.float64) are not mapped to a representation in
+                    # transformer_engine/pytorch/utils.py.
+                    return arg
                 ref.requires_grad = arg.requires_grad
                 if hasattr(arg, "can_skip_replay_copy"):
                     ref.can_skip_replay_copy = arg.can_skip_replay_copy
@@ -1267,17 +1274,19 @@ class _CudaGraphRunner(torch.nn.Module):
             _check_supported_type(ref)
 
             if val.type != ref.type and not (is_dataclass(val.value) and is_dataclass(ref.value)):
-                add_error(f"Type mismatch at {context}: {val.type} vs {ref.type}")
+                add_error(
+                    f"Type mismatch at {context}: Received {val.type} but expected {ref.type}"
+                )
                 return False
 
             if ref.type == torch.Tensor or issubclass(ref.type, torch.Tensor):
                 mismatches = []
                 if val.shape != ref.shape:
-                    mismatches.append(f"expected shape {val.shape} vs. {ref.shape}")
+                    mismatches.append(f"Received shape {val.shape} but expected {ref.shape}")
                 if val.dtype != ref.dtype:
-                    mismatches.append(f"expected dtype {val.dtype} vs. {ref.dtype}")
+                    mismatches.append(f"Received dtype {val.dtype} but expected {ref.dtype}")
                 if val.device != ref.device:
-                    mismatches.append(f"expected device {val.device} vs. {ref.device}")
+                    mismatches.append(f"Received device {val.device} but expected {ref.device}")
                 if mismatches:
                     add_error(f"Tensor mismatch at {context}: {', '.join(mismatches)}")
 

@@ -1256,6 +1256,26 @@ class MoETransformerLayer(TransformerLayer):
 
         super().__init__(*args, **kwargs)
 
+    def _should_call_local_cudagraph(self, *args, **kwargs):
+        """
+        Controls whether the full-layer cudagraph_manager captures the entire forward call
+        as a single graph. Returns False to skip full-layer capture and route through _forward_mlp.
+
+        MoE layers have two cudagraph modes:
+        - Full-layer (use_partial_cudagraphs=False): the full-layer cudagraph_manager captures
+          the forward pass as one graph. This is used during inference.
+        - Partial (use_partial_cudagraphs=True): the full-layer manager is bypassed (returns
+          False), and _forward_mlp routes through cudagraph_manager_router and
+          cudagraph_manager_postprocess, which are monkey-patched onto _forward_mlp_router
+          and _forward_mlp_postprocess by CudaGraphManager.__init__. The expert dispatch
+          in between runs eagerly. This is used during training.
+        """
+        if self.use_partial_cudagraphs:
+            return False
+        if self.config.cuda_graph_impl != "local":
+            return False
+        return super()._should_call_local_cudagraph(*args, **kwargs)
+
     def create_mcore_cudagraph_manager(self, config):
         """
         Initializes the CUDA graph manager(s) for the MoE layer.
@@ -1341,6 +1361,12 @@ class MoETransformerLayer(TransformerLayer):
         Bias-Dropout-Add. This method is isolated so it can be captured by cudagraphs.
 
         """
+
+        # Restore token dispatcher attributes from heap copies (needed during
+        # cudagraph creation where the router capture may leave these attrs
+        # pointing into graph-pool memory).
+        for name, attr in self.token_dispatcher_attrs.items():
+            setattr(self.mlp.token_dispatcher, name, attr)
 
         self.mlp.fwd_execution_map = "postprocess"
         output = self.mlp(None, intermediate_tensors=(output, shared_expert_output))

@@ -628,7 +628,7 @@ class MambaMixer(MegatronModule):
                 _check_mamba_sequence_packing_support(for_inference_not_training=False)
             )
             assert sequence_packing_available, reason_for_no_sequence_packing
-            seq_idx = self._create_packed_seq_idx(packed_seq_params, zxBCdt.shape[1])
+            seq_idx = packed_seq_params.seq_idx
 
         y = mamba_split_conv1d_scan_combined(
             zxBCdt,
@@ -656,36 +656,6 @@ class MambaMixer(MegatronModule):
             y = self.norm(y)
 
         return y
-
-    def _create_packed_seq_idx(self, packed_seq_params: PackedSeqParams, total_tokens: int):
-        """
-        If total_tokens is 16 (for example), this method takes packed_seq_params.cu_seqlens_q_padded
-        (or cu_seqlens_q) which is of the form [0, 5, 7, 11] and returns a tensor of the form
-        [0, 0, 0, 0, 0, 1, 1, 2, 2, 2, 2, 3, 3, 3, 3, 3],
-        which is [0]*(5-0) + [1]*(7-5) + [2]*(11-7) + [3]*(16-11)
-        In the above example, there are three sequences in the pack.
-        In general, the output has an additional sequence index (e.g. 0, 1, 2, 3) so that any tokens
-        beyond the last padded input sequence are accounted for as an extra sequence. However, If
-        cu_seqlens_q_padded[-1] == max_seqlen then this additional sequence index will not be
-        included.
-        """
-        # Example: [0, 5, 7, 11] -> [0, 5, 7, 11, 16]
-        if packed_seq_params.cu_seqlens_q_padded is not None:
-            cu_seqlens = packed_seq_params.cu_seqlens_q_padded
-        else:
-            cu_seqlens = packed_seq_params.cu_seqlens_q
-        total_tokens_tensor = torch.tensor(
-            [total_tokens], dtype=cu_seqlens.dtype, device=cu_seqlens.device
-        )
-        cu_seqlens_with_max = torch.cat([cu_seqlens, total_tokens_tensor])
-        # Example: [0, 5, 7, 11, 16] -> [5, 2, 4, 5]
-        seq_lengths = cu_seqlens_with_max[1:] - cu_seqlens_with_max[:-1]
-        # Example: [5, 2, 4, 5] -> [0, 0, 0, 0, 0, 1, 1, 2, 2, 2, 2, 3, 3, 3, 3, 3]
-        seq_idx = torch.repeat_interleave(
-            torch.arange(seq_lengths.numel(), device=cu_seqlens.device), seq_lengths
-        )
-        seq_idx = seq_idx.to(torch.int32).unsqueeze(0)  # Add a batch dimension
-        return seq_idx
 
     def _ssm_prefill(
         self,
