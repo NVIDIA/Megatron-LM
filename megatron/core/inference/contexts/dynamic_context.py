@@ -299,9 +299,7 @@ class DynamicInferenceContext(BaseInferenceContext):
             # corresponding attention layer index or Mamba layer index depending on the
             # layer type.
             attention_layer_map, mamba_layer_map, _, _, gdn_layer_map = (
-                get_layer_maps_from_layer_type_list(
-                    mamba_inference_state_config.layer_type_list
-                )
+                get_layer_maps_from_layer_type_list(mamba_inference_state_config.layer_type_list)
             )
             self.num_attention_layers = len(attention_layer_map)
             self.num_mamba_layers = len(mamba_layer_map)
