@@ -520,6 +520,9 @@ class DynamicInferenceEngine(AbstractEngine):
             self.expert_parallel_zmq_communicator = AsyncZMQCommunicator(
                 self.zmq_context, process_group=self.pg_collection.ep
             )
+            self.tensor_parallel_zmq_communicator = AsyncZMQCommunicator(
+                self.zmq_context, process_group=self.pg_collection.tp
+            )
 
         if launch_inference_coordinator and self.is_dp_coordinator:
             await await_process_call(
@@ -660,6 +663,11 @@ class DynamicInferenceEngine(AbstractEngine):
                 self.context.kv_cache_management_mode != KVCacheManagementMode.PERSIST
                 and not self.context.static_kv_memory_pointers
             ):
+                # Ensure that the entire EP and TP group this rank is a part of 
+                # enters create_cuda_graphs at the same time. This is to avoid  
+                # NCCL timeouts. 
+                self.expert_parallel_zmq_communicator.all_reduce_max(1)
+                self.tensor_parallel_zmq_communicator.all_reduce_max(1)
                 self.create_cuda_graphs()
             capture_time = time.time() - capture_time
 
@@ -1653,6 +1661,8 @@ class DynamicInferenceEngine(AbstractEngine):
             socket.close()
         if hasattr(self, "expert_parallel_zmq_communicator"):
             self.expert_parallel_zmq_communicator.close()
+        if hasattr(self, "tensor_parallel_zmq_communicator"):
+            self.tensor_parallel_zmq_communicator.close()
         self.zmq_context.term()
 
     @trace_async_exceptions
