@@ -17,24 +17,20 @@ def get_moe_module_spec(
     num_experts: Optional[int] = None,
     moe_grouped_gemm: Optional[bool] = False,
     moe_use_legacy_grouped_gemm: Optional[bool] = False,
-    inference_optimized: bool = False,
 ) -> ModuleSpec:
-    """Helper function to get module spec for MoE
-    
+    """Helper function to get module spec for MoE.
+
+    Called by mamba_layer_specs.py for standard (non-inference) MoE specs.
+    The GPT layer specs call get_moe_module_spec_for_backend directly.
+
     Args:
         use_te: Whether to use Transformer Engine.
         num_experts: Number of experts.
         moe_grouped_gemm: Whether to use grouped GEMM.
         moe_use_legacy_grouped_gemm: Whether to use legacy grouped GEMM.
-        inference_optimized: If True, use InferenceMoELayer for optimized inference.
     """
-    # This function is called my mamba_layer_specs.py 
-    # The GPT layer specs directly calls get_moe_module_spec_for_backend
-
     if use_te is not None and use_te:
         backend: BackendSpecProvider = TESpecProvider()
-    elif inference_optimized:
-        backend = InferenceSpecProvider()
     else:
         backend = LocalSpecProvider()
     return get_moe_module_spec_for_backend(
@@ -44,7 +40,6 @@ def get_moe_module_spec(
         moe_use_legacy_grouped_gemm=moe_use_legacy_grouped_gemm,
     )
 
-
 def get_moe_module_spec_for_backend(
     backend: BackendSpecProvider,
     num_experts: Optional[int] = None,
@@ -52,19 +47,9 @@ def get_moe_module_spec_for_backend(
     moe_use_legacy_grouped_gemm: Optional[bool] = False,
     use_te_activation_func: bool = False,
 ) -> ModuleSpec:
-    """Helper function to get module spec for MoE
-    
-    Args:
-        backend: Backend spec provider (TE or Local).
-        num_experts: Number of experts.
-        moe_grouped_gemm: Whether to use grouped GEMM.
-        moe_use_legacy_grouped_gemm: Whether to use legacy grouped GEMM.
-        use_te_activation_func: Whether to use TE activation function.
-        inference_optimized: If True, use InferenceMoELayer for optimized inference.
-    """
+    """Helper function to get module spec for MoE"""
     assert num_experts is not None
-    inference_optimized: bool = isinstance(backend, InferenceSpecProvider)
-    
+
     linear_fc1 = backend.column_parallel_linear()
     linear_fc2 = backend.row_parallel_linear()
     activation_func = backend.activation_func()
@@ -85,20 +70,47 @@ def get_moe_module_spec_for_backend(
     # shared experts spec
     shared_experts = ModuleSpec(module=SharedExpertMLP, submodules=mlp)
 
-    # Select MoE layer class based on inference_optimized flag
-    if inference_optimized:
-        moe_module_spec = ModuleSpec(
-            module=InferenceMoELayer,
-            submodules=MoESubmodules(router=InferenceTopKRouter,
-                                     experts=experts, 
-                                     shared_experts=shared_experts),
-            metainfo={"fuse_pre_mlp_layernorm": False},
-        )
-    else:
-        # MoE module spec
-        moe_module_spec = ModuleSpec(
-            module=MoELayer,
-            submodules=MoESubmodules(experts=experts, shared_experts=shared_experts),
-            metainfo={"fuse_pre_mlp_layernorm": False},
-        )
+    # MoE module spec
+    moe_module_spec = ModuleSpec(
+        module=MoELayer,
+        submodules=MoESubmodules(experts=experts, shared_experts=shared_experts),
+        metainfo={"fuse_pre_mlp_layernorm": False},
+    )
     return moe_module_spec
+
+
+
+def get_inference_optimized_moe_spec() -> ModuleSpec:
+    """MoE module spec for inference-optimized transformer impl.
+
+    Uses InferenceSpecProvider to select inference-optimized modules:
+    InferenceMoELayer, InferenceTopKRouter, InferenceGroupedMLP.
+
+    Called by mamba_layer_specs.py and gpt_layer_specs.py.
+    """
+    backend = InferenceSpecProvider()
+    activation_func = backend.activation_func()
+
+    expert_module, expert_submodule = backend.grouped_mlp_modules(True, False)
+    if expert_submodule is not None:
+        expert_submodule.activation_func = activation_func
+
+    experts = ModuleSpec(module=expert_module, submodules=expert_submodule)
+    shared_experts = ModuleSpec(
+        module=SharedExpertMLP,
+        submodules=MLPSubmodules(
+            linear_fc1=backend.column_parallel_linear(),
+            linear_fc2=backend.row_parallel_linear(),
+            activation_func=activation_func,
+        ),
+    )
+
+    return ModuleSpec(
+        module=InferenceMoELayer,
+        submodules=MoESubmodules(
+            router=InferenceTopKRouter,
+            experts=experts,
+            shared_experts=shared_experts,
+        ),
+        metainfo={"fuse_pre_mlp_layernorm": False},
+    )
