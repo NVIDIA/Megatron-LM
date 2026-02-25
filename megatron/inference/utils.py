@@ -4,21 +4,27 @@ import logging
 from argparse import ArgumentParser
 from functools import partial
 from typing import Optional
+import torch
 
 from gpt_builders import gpt_builder
 from mamba_builders import mamba_builder
-from megatron.core.inference.config import InferenceConfig, MambaInferenceStateConfig
+from megatron.core.inference.config import (
+    InferenceConfig,
+    KVCacheManagementMode,
+    MambaInferenceStateConfig,
+)
 from megatron.core.inference.contexts import DynamicInferenceContext
 from megatron.core.inference.engines import DynamicInferenceEngine
 from megatron.core.inference.model_inference_wrappers.gpt.gpt_inference_wrapper import (
     GPTInferenceWrapper,
 )
+from megatron.core.inference.quantization.utils import quantize_model_to_mxfp8
 from megatron.core.inference.text_generation_controllers.text_generation_controller import (
     TextGenerationController,
 )
-from megatron.core.tokenizers.text.utils.build_tokenizer import build_tokenizer
+from megatron.core.tokenizers.utils.build_tokenizer import build_tokenizer
 from megatron.core.transformer.module import MegatronModule
-from megatron.core.utils import get_attr_wrapped_model, log_single_rank
+from megatron.core.utils import get_attr_wrapped_model, log_single_rank, unwrap_model
 from megatron.training import get_args
 from megatron.training import get_model as _get_model
 from megatron.training import get_tokenizer, get_wandb_writer
@@ -60,6 +66,9 @@ def get_model_for_inference() -> MegatronModule:
     # Eval mode.
     model.eval()
 
+    if args.transformer_impl == "inference_optimized" and args.fp8_recipe == "mxfp8":
+        quantize_model_to_mxfp8(unwrap_model(model))
+
     return model
 
 
@@ -82,7 +91,7 @@ def add_inference_args(parser: ArgumentParser) -> ArgumentParser:
         metavar='N',
         type=str,
         nargs='+',
-        help='Input prompts with each prompt within quotes and seperated by space',
+        help='Input prompts with each prompt within quotes and separated by space',
     )
     group.add_argument(
         "--num-tokens-to-prompt",
@@ -278,6 +287,7 @@ def get_inference_config_from_model_and_args(model: MegatronModule, args):
         block_size_tokens=args.inference_dynamic_batching_block_size,
         buffer_size_gb=args.inference_dynamic_batching_buffer_size_gb,
         paused_buffer_size_gb=args.inference_dynamic_batching_paused_buffer_size_gb,
+        mamba_memory_ratio=args.inference_dynamic_batching_mamba_memory_ratio,
         num_cuda_graphs=(
             args.inference_dynamic_batching_num_cuda_graphs
             if args.cuda_graph_impl == "local"
@@ -286,10 +296,10 @@ def get_inference_config_from_model_and_args(model: MegatronModule, args):
         max_requests=args.inference_dynamic_batching_max_requests,
         max_tokens=args.inference_dynamic_batching_max_tokens,
         unified_memory_level=args.inference_dynamic_batching_unified_memory_level,
-        offload_kv_cache=args.rl_offload_kv_cache_during_training,
+        kv_cache_management_mode=KVCacheManagementMode(args.rl_kv_cache_management_mode),
         cuda_graph_mixed_prefill_count=args.inference_dynamic_batching_cuda_graph_mixed_prefill_count,  # pylint: disable=line-too-long
         use_cuda_graphs_for_non_decode_steps=not args.decode_only_cuda_graphs,
-        persist_cuda_graphs=args.rl_training_cuda_graphs,
+        static_kv_memory_pointers=args.rl_persist_cuda_graphs,
         max_sequence_length=max_sequence_length,
         mamba_inference_state_config=mamba_inference_state_config,
         pg_collection=pg_collection,
@@ -307,10 +317,7 @@ def get_dynamic_inference_engine(model: Optional[MegatronModule] = None) -> Dyna
     args = get_args()
     if model is None:
         model = get_model_for_inference()
-    if args.legacy_tokenizer:
-        tokenizer = get_tokenizer()
-    else:
-        tokenizer = build_tokenizer(args)
+    tokenizer = build_tokenizer(args)
 
     inference_config = get_inference_config_from_model_and_args(model, args)
     context = DynamicInferenceContext(model.config, inference_config)

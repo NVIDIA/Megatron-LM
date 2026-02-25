@@ -2,6 +2,7 @@
 
 # Parts of the code here are adapted from PyTorch
 # repo: https://github.com/pytorch/pytorch
+from __future__ import annotations
 
 import os
 import warnings
@@ -368,7 +369,6 @@ def linear_with_frozen_weight(
     tp_group: Optional[torch.distributed.ProcessGroup],
     grad_output_buffer: Optional[List[torch.Tensor]] = None,
     wgrad_deferral_limit: None = None,
-    async_grad_allreduce: Optional[bool] = None,
 ) -> torch.Tensor:
     """Linear layer execution with weight.requires_grad == False.
 
@@ -405,18 +405,7 @@ def linear_with_frozen_weight(
 
     wgrad_deferral_limit (int optional): dummy argument, used to
     keep the API unified between all forward implementation functions.
-
-
-    async_grad_allreduce (bool optional): Will be removed with 0.11.0.
-                                          Please use allreduce_dgrad instead.
-
     """
-
-    if async_grad_allreduce is not None:
-        warnings.warn(
-            "async_grad_allreduce is deprecated, not in use anymore and will"
-            " be fully removed with 0.11.0. Please use allreduce_dgrad instead."
-        )
 
     assert grad_output_buffer is None, (
         "grad_output_buffer kwarg is only supported with "
@@ -636,7 +625,6 @@ def linear_with_grad_accumulation_and_async_allreduce(
     sequence_parallel: bool,
     grad_output_buffer: Optional[List[torch.Tensor]] = None,
     wgrad_deferral_limit: Optional[int] = 0,
-    async_grad_allreduce: Optional[bool] = None,
     tp_group: Optional[torch.distributed.ProcessGroup] = None,
 ) -> torch.Tensor:
     """Linear layer execution with asynchronous communication and
@@ -700,16 +688,7 @@ def linear_with_grad_accumulation_and_async_allreduce(
         wgrad_deferral_limit (int optional): Limit on the number of
             micro-batches for which embedding weight gradient GEMM should be
             deferred. Disable by setting this to 0. Defaults to 0.
-
-        async_grad_allreduce (bool optional): Will be removed with 0.11.0.
-                                            Please use allreduce_dgrad instead.
     """
-
-    if async_grad_allreduce is not None:
-        warnings.warn(
-            "async_grad_allreduce is deprecated, not in use anymore and will"
-            " be fully removed with 0.11.0. Please use allreduce_dgrad instead."
-        )
 
     tp_group = get_tensor_model_parallel_group_if_none(tp_group)
 
@@ -1139,7 +1118,7 @@ class RowParallelLinear(torch.nn.Module):
         stride: int = 1,
         keep_master_weight_for_test: bool = False,
         is_expert: bool = False,
-        tp_comm_buffer_name: str = None,  # Not used
+        tp_comm_buffer_name: str | None = None,  # Not used
         tp_group: Optional[torch.distributed.ProcessGroup] = None,
     ):
         super(RowParallelLinear, self).__init__()
@@ -1247,7 +1226,7 @@ class RowParallelLinear(torch.nn.Module):
         else:
             return linear_with_grad_accumulation_and_async_allreduce(input, weight, *args, **kwargs)
 
-    def forward(self, input_):
+    def forward(self, input_: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         """Forward of RowParallelLinear
 
         Args:
@@ -1304,6 +1283,13 @@ class RowParallelLinear(torch.nn.Module):
             output = output_
             output_bias = self.bias
         return output, output_bias
+
+    def backward_dw(self) -> None:
+        """Compute weight gradients during the backward pass if delay_wgrad_compute is enabled.
+
+        Not supported - does nothing.
+        """
+        pass
 
     def sharded_state_dict(self, prefix="", sharded_offsets=(), metadata=None):
         """Sharding along axis 1, bias not sharded"""

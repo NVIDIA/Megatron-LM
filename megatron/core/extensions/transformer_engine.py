@@ -51,6 +51,7 @@ from megatron.core.transformer.utils import (
     is_layer_window_attention,
     make_sharded_tensors_for_checkpoint,
 )
+from megatron.core.typed_torch import copy_signature
 from megatron.core.utils import (
     get_pg_rank,
     get_pg_size,
@@ -653,6 +654,8 @@ class TELinear(te.pytorch.Linear):
                     # Reduce the gradient further on the TP group since the weight is
                     # duplicated across TP ranks
                     setattr(param, "sequence_parallel", self.config.sequence_parallel)
+                    # Mark as NOT tensor parallel since weight is duplicated
+                    setattr(param, "tensor_model_parallel", False)
 
         tp_group = get_tensor_model_parallel_group_if_none(tp_group, is_expert=is_expert)
         self._tp_group = tp_group
@@ -1923,6 +1926,7 @@ if HAVE_TE and is_te_min_version("1.13.0"):
     class TEFusedMLP(MLP):
         """MLP wrapper using Transformer Engine's operation-based API."""
 
+        @copy_signature(MLP.__init__)
         def __init__(self, *args, **kwargs):
             super().__init__(*args, **kwargs)
 
@@ -2432,6 +2436,14 @@ except ImportError:
     fused_sort_chunks_by_index = None
     fused_sort_chunks_by_index_with_probs = None
     fused_unpermute = None
+
+try:
+    from transformer_engine.pytorch.permutation import moe_permute_and_pad_with_probs
+
+    fused_permute_and_pad_with_probs = moe_permute_and_pad_with_probs
+
+except ImportError:
+    fused_permute_and_pad_with_probs = None
 
 try:
     from transformer_engine.pytorch.cross_entropy import parallel_cross_entropy

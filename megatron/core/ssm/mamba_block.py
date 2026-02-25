@@ -16,6 +16,7 @@ from megatron.core.dist_checkpointing.mapping import ShardedStateDict
 from megatron.core.dist_checkpointing.utils import replace_prefix_for_sharding
 from megatron.core.enums import Fp8Recipe
 from megatron.core.extensions.transformer_engine import TENorm
+from megatron.core.fp4_utils import get_fp4_context
 from megatron.core.fp8_utils import get_fp8_context
 from megatron.core.inference.contexts import BaseInferenceContext
 from megatron.core.packed_seq_params import PackedSeqParams
@@ -25,7 +26,7 @@ from megatron.core.ssm.mamba_hybrid_layer_allocation import allocate_layers
 from megatron.core.transformer import TransformerConfig
 from megatron.core.transformer.enums import CudaGraphScope
 from megatron.core.transformer.identity_op import IdentityOp
-from megatron.core.transformer.module import MegatronModule
+from megatron.core.transformer.module import GraphableMegatronModule, MegatronModule
 from megatron.core.transformer.spec_utils import ModuleSpec, build_module
 from megatron.core.transformer.transformer_layer import TransformerLayer
 from megatron.core.transformer.utils import sharded_state_dict_default
@@ -45,15 +46,13 @@ class MambaStackSubmodules:
     mtp_block_spec: Optional[ModuleSpec] = None
 
 
-class MambaStack(MegatronModule):
+class MambaStack(GraphableMegatronModule, MegatronModule):
     """
     Constructor for the MambaStack class.
 
     Args:
         config (TransformerConfig): the model configuration
         submodules (MambaStackSubmodules): the submodules for the stack
-        residual_in_fp32 (bool, optional): whether to do residual connections
-            in fp32. Defaults to False.
         pre_process (bool, optional): whether to include an embedding layer.
             Defaults to True.
         hybrid_attention_ratio (float, optional): the target ratio of attention layers to
@@ -76,7 +75,6 @@ class MambaStack(MegatronModule):
         self,
         config: TransformerConfig,
         submodules: MambaStackSubmodules,
-        residual_in_fp32=False,
         pre_process: bool = True,
         hybrid_attention_ratio: float = 0.0,
         hybrid_mlp_ratio: float = 0.0,
@@ -89,7 +87,6 @@ class MambaStack(MegatronModule):
         is_mtp_layer: bool = False,
     ) -> None:
         super().__init__(config=config)
-        self.residual_in_fp32 = residual_in_fp32
         self.pre_process = pre_process
         self.post_layer_norm = post_layer_norm
         self.post_process = post_process
@@ -134,13 +131,17 @@ class MambaStack(MegatronModule):
         # Build main decoder layers using shared layer builder
         self.layers = nn.ModuleList()
         for i, layer_type in enumerate(self.layer_type_list):
-            fp8_init_context = get_fp8_context(self.config, i + pp_layer_offset, is_init=True)
-            with fp8_init_context:
+            if self.config.fp8:
+                quant_init_context = get_fp8_context(self.config, i + pp_layer_offset, is_init=True)
+            elif self.config.fp4:
+                quant_init_context = get_fp4_context(self.config, i + pp_layer_offset, is_init=True)
+            else:
+                quant_init_context = nullcontext()
+            with quant_init_context:
                 if layer_type == LayerSymbols.MAMBA:
                     layer = build_module(
                         submodules.mamba_layer,
                         config=self.config,
-                        residual_in_fp32=residual_in_fp32,
                         layer_number=i + 1 + pp_layer_offset,
                         pp_layer_offset=pp_layer_offset,
                         pg_collection=pg_collection,
@@ -186,15 +187,53 @@ class MambaStack(MegatronModule):
             )
 
     def _select_layers_for_pipeline_parallel(self, layer_type_list):
-        num_layers_per_pipeline_rank = self.config.num_layers // self.pp_group.size()
-
         assert self.config.virtual_pipeline_model_parallel_size is None, (
             "The Mamba hybrid model does not currently support "
             "virtual/interleaved pipeline parallelism"
         )
 
-        offset = self.pp_group.rank() * num_layers_per_pipeline_rank
-        selected_list = layer_type_list[offset : offset + num_layers_per_pipeline_rank]
+        pp_rank = self.pp_group.rank()
+        pp_size = self.pp_group.size()
+
+        num_layers_in_first = self.config.num_layers_in_first_pipeline_stage
+        num_layers_in_last = self.config.num_layers_in_last_pipeline_stage
+
+        if num_layers_in_first is not None or num_layers_in_last is not None:
+            # Uneven pipeline parallelism: mirror the logic in
+            # get_transformer_layer_offset so that MambaStack and
+            # TransformerLayer agree on layer placement.
+            first = 0 if num_layers_in_first is None else num_layers_in_first
+            last = 0 if num_layers_in_last is None else num_layers_in_last
+            middle_num_layers = self.config.num_layers - first - last
+
+            middle_pipeline_stages = pp_size - sum(
+                1 for x in (num_layers_in_first, num_layers_in_last) if x is not None
+            )
+
+            if middle_pipeline_stages > 0:
+                layers_per_middle = middle_num_layers // middle_pipeline_stages
+            else:
+                layers_per_middle = 0
+
+            is_first_stage = num_layers_in_first is not None and pp_rank == 0
+            is_last_stage = num_layers_in_last is not None and pp_rank == pp_size - 1
+
+            if is_first_stage:
+                offset = 0
+                num_layers_this_rank = first
+            elif is_last_stage:
+                offset = self.config.num_layers - last
+                num_layers_this_rank = last
+            else:
+                middle_rank = pp_rank if num_layers_in_first is None else pp_rank - 1
+                offset = middle_rank * layers_per_middle + first
+                num_layers_this_rank = layers_per_middle
+        else:
+            num_layers_per_pipeline_rank = self.config.num_layers // pp_size
+            offset = pp_rank * num_layers_per_pipeline_rank
+            num_layers_this_rank = num_layers_per_pipeline_rank
+
+        selected_list = layer_type_list[offset : offset + num_layers_this_rank]
 
         return offset, selected_list
 
@@ -222,14 +261,15 @@ class MambaStack(MegatronModule):
         """
         Check if we should call the local cudagraph path.
         """
-        if not self.training and (
-            hasattr(self, 'cudagraph_manager')
+        if (
+            not self.training
+            and hasattr(self, 'cudagraph_manager')
             and kwargs['attention_mask'] is None
             and (
                 kwargs.get('inference_context') is not None
                 or kwargs.get('inference_params') is not None
             )
-            and CudaGraphScope.full_iteration in self.config.cuda_graph_scope
+            and CudaGraphScope.full_iteration_inference in self.config.cuda_graph_scope
         ):
             if kwargs['inference_context'].is_static_batching():
                 using_cuda_graph = kwargs['inference_context'].is_decode_only()
@@ -247,6 +287,7 @@ class MambaStack(MegatronModule):
                 if isinstance(kwargs['hidden_states'], WrappedTensor)
                 else kwargs['hidden_states']
             )
+            return super().__call__(*args, **kwargs)[0]
         return super().__call__(*args, **kwargs)
 
     def forward(
@@ -323,16 +364,29 @@ class MambaStack(MegatronModule):
         # control which layer will be fp8 or bf16
         use_outer_fp8_context = self.config.fp8 and self.config.fp8_recipe == Fp8Recipe.delayed
         use_inner_fp8_context = self.config.fp8 and self.config.fp8_recipe != Fp8Recipe.delayed
+        use_fp4_context = self.config.fp4 is not None
         outer_fp8_context = get_fp8_context(self.config) if use_outer_fp8_context else nullcontext()
+
+        if use_inner_fp8_context:
+
+            def get_inner_quant_context(config, layer_number):
+                return get_fp8_context(config, layer_number)
+
+        elif use_fp4_context:
+
+            def get_inner_quant_context(config, layer_number):
+                return get_fp4_context(config, layer_number)
+
+        else:
+
+            def get_inner_quant_context(config, layer_number):
+                return nullcontext()
 
         with outer_fp8_context:
             for layer in self.layers:
-                inner_fp8_context = (
-                    get_fp8_context(self.config, layer.layer_number - 1)
-                    if use_inner_fp8_context
-                    else nullcontext()
-                )
-                with inner_fp8_context:
+                # Layers have 1-indexed layer numbers attribute.
+                inner_quant_context = get_inner_quant_context(self.config, layer.layer_number - 1)
+                with inner_quant_context:
                     if isinstance(layer, TransformerLayer):
                         hidden_states, _ = layer(
                             hidden_states=hidden_states,
@@ -343,7 +397,7 @@ class MambaStack(MegatronModule):
                             packed_seq_params=packed_seq_params,
                             padding_mask=padding_mask,
                         )
-                    else:  # MambaLayer
+                    else:  # MambaLayer, Expert, or MLP
                         hidden_states = layer(
                             hidden_states=hidden_states,
                             attention_mask=attention_mask,
