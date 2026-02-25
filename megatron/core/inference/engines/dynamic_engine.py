@@ -666,8 +666,8 @@ class DynamicInferenceEngine(AbstractEngine):
                 # Ensure that the entire EP and TP group this rank is a part of 
                 # enters create_cuda_graphs at the same time. This is to avoid  
                 # NCCL timeouts. 
-                self.expert_parallel_zmq_communicator.all_reduce_max(1)
-                self.tensor_parallel_zmq_communicator.all_reduce_max(1)
+                await self.expert_parallel_zmq_communicator.all_reduce_max(1)
+                await self.tensor_parallel_zmq_communicator.all_reduce_max(1)
                 self.create_cuda_graphs()
             capture_time = time.time() - capture_time
 
