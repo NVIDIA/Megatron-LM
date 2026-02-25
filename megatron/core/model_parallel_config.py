@@ -77,11 +77,6 @@ class ModelParallelConfig:
        Default is None, which will be set to the value of tensor_model_parallel_size.
     """
 
-    moe_extended_tp: bool = False
-    """NOTE: Deprecated from MCore v0.10. This flag is ignored.
-      Its functionality is replaced by expert_tensor_parallel_size.
-    """
-
     ###################
     # Initialization
     ###################
@@ -172,9 +167,6 @@ class ModelParallelConfig:
        --global-option=\"--cuda_ext\" ". Note that the extension requires CUDA>=11. Otherwise, you
        must turn off gradient accumulation fusion.
     """
-
-    async_tensor_model_parallel_allreduce: bool = True
-    """NOTE: Deprecated. This flag is ignored."""
 
     use_te_rng_tracker: bool = field(
         default=False, metadata={"argparse_meta": {"arg_names": ["--te-rng-tracker"]}}
