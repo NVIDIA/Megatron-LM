@@ -633,7 +633,9 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
 
         # Delay the offload of the attention norm until after the self_attn_bda has been computed
         # because the residual is needed in the self_attn_bda.
-        hidden_states = attn_norm_manager.group_offload(hidden_states, forced_released_tensors=[residual])
+        hidden_states = attn_norm_manager.group_offload(
+            hidden_states, forced_released_tensors=[residual]
+        )
 
         # Residual connection.
         residual = hidden_states
@@ -816,7 +818,9 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
         # Delay the offload of the mlp norm until after the mlp_bda has been computed
         # because the residual is needed in the mlp_bda.
         if hasattr(self, 'mlp_norm_manager'):
-            hidden_states = self.mlp_norm_manager.group_offload(hidden_states, forced_released_tensors=[residual])
+            hidden_states = self.mlp_norm_manager.group_offload(
+                hidden_states, forced_released_tensors=[residual]
+            )
             delattr(self, 'mlp_norm_manager')
 
         # Jit compiled function creates 'view' tensor. This tensor

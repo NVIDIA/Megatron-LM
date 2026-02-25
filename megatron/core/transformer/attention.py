@@ -1136,9 +1136,7 @@ class Attention(MegatronModule, ABC):
 
         nvtx_range_push(suffix="core_attention")
         core_attn_manager = off_interface(
-            self.offload_core_attention and self.training,
-            query,
-            "core_attn",
+            self.offload_core_attention and self.training, query, "core_attn"
         )
         if self.checkpoint_core_attention and self.training:
             core_attn_out = self._checkpointed_attention_forward(

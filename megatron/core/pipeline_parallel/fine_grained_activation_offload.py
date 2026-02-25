@@ -1309,7 +1309,7 @@ class FineGrainedActivationOffloadingInterface:
     def get_context(flag):
         """Get the fine-grained offload context"""
         return PipelineOffloadManager.get_instance() if flag else nullcontext()
-    
+
     def group_offload(self, tensor, forced_released_tensors=None, delay_offload=False):
         """Group offload the tensors."""
         if self.offload:

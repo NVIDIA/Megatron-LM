@@ -682,9 +682,7 @@ class TEGroupedMLP(MegatronModule):
             permuted_probs = torch.ones_like(permuted_probs)
 
         expert_fc1_manager = off_interface(
-            self.offload_expert_fc1,
-            permuted_local_hidden_states,
-            "expert_fc1",
+            self.offload_expert_fc1, permuted_local_hidden_states, "expert_fc1"
         )
         with expert_fc1_manager as permuted_local_hidden_states:
             fc1_output, bias_parallel = self.linear_fc1(

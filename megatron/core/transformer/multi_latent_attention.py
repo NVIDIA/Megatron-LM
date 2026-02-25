@@ -274,7 +274,9 @@ class MultiLatentAttention(Attention):
         # core attention computation
         # ==================================
         # Need corresponding TE change
-        core_attn_manager = off_interface(self.offload_core_attention and self.training, query, "core_attn")
+        core_attn_manager = off_interface(
+            self.offload_core_attention and self.training, query, "core_attn"
+        )
         if self.checkpoint_core_attention and self.training:
             core_attn_out = self._checkpointed_attention_forward(
                 query, key, value, attention_mask, packed_seq_params=packed_seq_params
