@@ -56,6 +56,8 @@ try:
 except ImportError:
     HAVE_TE = False
 
+from megatron.core.transformer.pipeline_parallel_layer_layout import PipelineParallelLayerLayout
+
 
 def tie_word_embeddings_state_dict(
     sharded_state_dict: ShardedStateDict,
@@ -465,7 +467,7 @@ def get_mtp_layer_spec_for_backend(
 
 
 def mtp_on_this_rank(
-    config: TransformerConfig, ignore_virtual: Optional[bool] = True, vp_stage: Optional[int] = None
+    layout: PipelineParallelLayerLayout = None, mtp_num_layers: Optional[int] = None, ignore_virtual: Optional[bool] = True, vp_stage: Optional[int] = None
 ) -> bool:
     """
     Check if there is MTP on the current rank.
@@ -481,9 +483,8 @@ def mtp_on_this_rank(
     """
     mtp_on_this_rank = False
     pp_rank = parallel_state.get_pipeline_model_parallel_rank()
-    if config.pipeline_model_parallel_layout is not None:
+    if layout is not None:
         # with custom PP layout, we support put MTP layers on any pipeline stage
-        layout = config.pipeline_model_parallel_layout.layout
         if (
             not ignore_virtual
             and parallel_state.get_virtual_pipeline_model_parallel_world_size() is not None
@@ -499,7 +500,7 @@ def mtp_on_this_rank(
                     break
     else:
         # without custom PP layout, we only support put all of MTP layers on the last pipeline stage
-        if config.mtp_num_layers is not None:
+        if mtp_num_layers is not None:
             mtp_on_this_rank = parallel_state.is_pipeline_last_stage(
                 ignore_virtual=ignore_virtual, vp_stage=vp_stage
             )

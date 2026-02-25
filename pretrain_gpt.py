@@ -66,13 +66,13 @@ def get_batch(data_iterator, vp_stage: Optional[int] = None):
     config = core_transformer_config_from_args(args)
     # TODO: this is pretty hacky, find a better way
     if not is_first_or_last_pipeline_stage(vp_stage) and (
-    (not mtp_on_this_rank(config, ignore_virtual=False, vp_stage=vp_stage))):
+    (not mtp_on_this_rank(layout=config.pipeline_model_parallel_layout, mtp_num_layers=config.mtp_num_layers, ignore_virtual=False, vp_stage=vp_stage))):
         return None, None, None, None, None, None
 
     # get batches based on the TP rank you are on
     batch = get_batch_on_this_tp_rank(
         data_iterator,
-        mtp_on_this_rank=mtp_on_this_rank(config, ignore_virtual=False, vp_stage=vp_stage)
+        mtp_on_this_rank=mtp_on_this_rank(layout=config.pipeline_model_parallel_layout, mtp_num_layers=config.mtp_num_layers, ignore_virtual=False, vp_stage=vp_stage)
         )
 
     cu_seqlens = batch.pop('cu_seqlens', None)
@@ -205,7 +205,7 @@ def is_dataset_built_on_rank(vp_stage=None):
     config = core_transformer_config_from_args(args)
     return (
         is_first_or_last_pipeline_stage(vp_stage)
-        or mtp_on_this_rank(config, ignore_virtual=False, vp_stage=vp_stage)
+        or mtp_on_this_rank(layout=config.pipeline_model_parallel_layout, mtp_num_layers=config.mtp_num_layers, ignore_virtual=False, vp_stage=vp_stage)
     ) and parallel_state.get_tensor_model_parallel_rank() == 0
 
 

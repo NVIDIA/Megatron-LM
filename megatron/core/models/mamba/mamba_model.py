@@ -120,7 +120,7 @@ class MambaModel(LanguageModule):
         self.mtp_process = (
             self.mtp_pattern is not None
             and self.mtp_num_depths > 0
-            and mtp_on_this_rank(self.config, vp_stage=self.vp_stage)
+            and mtp_on_this_rank(layout=self.config.pipeline_model_parallel_layout, mtp_num_layers=self.config.mtp_num_layers, vp_stage=self.vp_stage)
         )
 
         # megatron core pipelining currently depends on model type
