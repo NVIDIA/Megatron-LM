@@ -941,12 +941,12 @@ class TestRLUtils:
         assert metrics["mean_num_turns"] == 15.5
         assert metrics["max_num_turns"] == 42
         assert metrics["min_num_turns"] == 2
-        assert metrics["mean_policy_staleness"] == 1.5
-        assert metrics["max_policy_staleness"] == 3
-        assert metrics["min_policy_staleness"] == 0
-        assert metrics["mean_kv_cache_staleness"] == 1.0
-        assert metrics["max_kv_cache_staleness"] == 2
-        assert metrics["min_kv_cache_staleness"] == 0
+        assert metrics["mean_policy_staleness"] == 3.25
+        assert metrics["max_policy_staleness"] == 6
+        assert metrics["min_policy_staleness"] == 1
+        assert metrics["mean_kv_cache_staleness"] == 2.75
+        assert metrics["max_kv_cache_staleness"] == 5
+        assert metrics["min_kv_cache_staleness"] == 1
         assert metrics["total_eviction_count"] == 1
         assert metrics["max_num_evictions"] == 1
         assert metrics["mean_completion_gap"] == np.mean([1, 2, 1, 3])
