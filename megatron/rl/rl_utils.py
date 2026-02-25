@@ -118,18 +118,19 @@ def _torch_saver_swap_inference_model(*, to_cpu: bool) -> None:
             "(see https://github.com/fzyzcjy/torch_memory_saver)"
         )
 
+    tag = "rl_inference_model"
     if to_cpu:
         if not _INFERENCE_MODEL_IS_PAUSED:
-            print_rank_0(f"torch_memory_saver: pausing rl_inference_model, before: {device_memory_summary()}")
-            torch_memory_saver.pause("rl_inference_model")
+            print_rank_0(f"torch_memory_saver: pausing {tag}, before: {device_memory_summary()}")
+            torch_memory_saver.pause(tag)
             _INFERENCE_MODEL_IS_PAUSED = True
-            print_rank_0(f"torch_memory_saver: paused  rl_inference_model, after:  {device_memory_summary()}")
+            print_rank_0(f"torch_memory_saver: paused  {tag}, after:  {device_memory_summary()}")
     else:
         if _INFERENCE_MODEL_IS_PAUSED:
-            print_rank_0(f"torch_memory_saver: resuming rl_inference_model, before: {device_memory_summary()}")
-            torch_memory_saver.resume("rl_inference_model")
+            print_rank_0(f"torch_memory_saver: resuming {tag}, before: {device_memory_summary()}")
+            torch_memory_saver.resume(tag)
             _INFERENCE_MODEL_IS_PAUSED = False
-            print_rank_0(f"torch_memory_saver: resumed  rl_inference_model, after:  {device_memory_summary()}")
+            print_rank_0(f"torch_memory_saver: resumed  {tag}, after:  {device_memory_summary()}")
 
 
 def _maybe_prefetch_separate_inference_model_weights(model_core, *, to_cpu: bool) -> None:
