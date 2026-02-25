@@ -715,10 +715,6 @@ class TopKRouter(Router):
 class InferenceTopKRouter(TopKRouter):
     """Specialized top-k router optimized for inference with specific constraints.
 
-    This router enforces:
-    - moe_router_num_groups: None (no group-limited routing)
-    - moe_router_score_function: sigmoid
-    - moe_router_enable_expert_bias: True
     """
 
     def __init__(
@@ -748,40 +744,21 @@ class InferenceTopKRouter(TopKRouter):
 
     @torch.compile()
     def _forward(self, input: torch.Tensor, padding_mask: Optional[torch.Tensor] = None):
-        logits = self.gating(input)  # [num_tokens, num_experts]
-
-        # Apply score function to get scores per expert
-        if self.score_function == "sigmoid":
-            # Sigmoid: independent scores per expert
-            scores = torch.sigmoid(logits.float()).type_as(logits)  # [num_tokens, num_experts]
-        else:  # softmax
-            # Softmax: normalized scores across all experts
-            scores = torch.softmax(logits.float(), dim=-1).type_as(logits)  # [num_tokens, num_experts]
-
-        # Add expert bias for topk selection if enabled (helps with load balancing)
-        if self.expert_bias is not None:
-            scores_for_routing = scores + self.expert_bias  # [num_experts] broadcasted
-        else:
-            scores_for_routing = scores
-
-        # Select top-k experts based on scores (with or without bias)
-        _, topk_indices = torch.topk(scores_for_routing, k=self.topk, dim=-1)  # [num_tokens, topk]
-
-        # Gather the original scores (without bias) for selected experts
-        topk_probs = torch.gather(scores, dim=-1, index=topk_indices)  # [num_tokens, topk]
-
-        # Normalize to get routing probabilities (sum to 1 per token)
-        if self.topk > 1:
-            topk_probs = topk_probs / (topk_probs.sum(dim=-1, keepdim=True) + 1e-20)
-
-        # Apply scaling factor if configured
-        if self.config.moe_router_topk_scaling_factor:
-            topk_probs = topk_probs * self.config.moe_router_topk_scaling_factor
-
-        # NOTE: Return format differs from parent class for efficiency:
-        # - Parent: Returns sparse tensors [num_tokens, num_experts] (routing_probs, routing_map)
-        # - This:   Returns dense tensors [num_tokens, topk] (topk_probs, topk_indices)
-        return topk_probs.squeeze(1), topk_indices.squeeze(1)
+        logits = self.gating(input)  # [num_tokens, 1, num_experts]
+        logits = logits.squeeze(1)   # [num_tokens, num_experts]
+        # Reuse the shared routing logic with dense output for inference efficiency.
+        # Returns [num_tokens, topk] instead of sparse [num_tokens, num_experts].
+       
+        probs, top_indices = topk_routing_with_score_function(
+            logits,
+            self.topk,
+            use_pre_softmax=True,
+            scaling_factor=self.config.moe_router_topk_scaling_factor,
+            score_function=self.score_function,
+            expert_bias=self.expert_bias,
+            dense_output=True,
+        )
+        return probs.squeeze(1), top_indices.squeeze(1)
 
     def forward(self, input: torch.Tensor, padding_mask: Optional[torch.Tensor] = None):
         """Simplified forward pass for inference - returns dense tensors only.

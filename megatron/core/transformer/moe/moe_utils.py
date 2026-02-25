@@ -664,6 +664,7 @@ def topk_routing_with_score_function(
     expert_bias: Optional[torch.Tensor] = None,
     fused: bool = False,
     router_replay: Optional['RouterReplay'] = None,
+    dense_output: bool = False,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """Compute the routing probabilities and map for top-k selection with score function.
 
@@ -686,14 +687,17 @@ def topk_routing_with_score_function(
                                              recorded routing sequence.
 
                                               Defaults to None.
+        dense_output (bool, optional): If True, return dense tensors [num_tokens, topk] instead of
+                                       sparse tensors [num_tokens, num_experts]. Defaults to False.
 
     Returns:
         Tuple[torch.Tensor, torch.Tensor]:
-            - routing_probs (torch.Tensor): A tensor of shape [num_tokens, num_experts] containing
-              the routing probabilities for each token to each expert.
-            - routing_map (torch.Tensor): A mask tensor of shape [num_tokens, num_experts]
-              indicating which experts were selected for each token. True values represent
-              the selected experts.
+            When dense_output=False (default):
+                - routing_probs (torch.Tensor): Shape [num_tokens, num_experts].
+                - routing_map (torch.Tensor): Shape [num_tokens, num_experts].
+            When dense_output=True:
+                - probs (torch.Tensor): Shape [num_tokens, topk].
+                - top_indices (torch.Tensor): Shape [num_tokens, topk].
     """
     assert logits.dim() == 2, f"Expected 2D logits [num_tokens, num_experts], got {logits.dim()}."
     num_tokens, num_experts = logits.shape
@@ -775,6 +779,9 @@ def topk_routing_with_score_function(
 
     if scaling_factor:
         probs = probs * scaling_factor
+
+    if dense_output:
+        return probs, top_indices
 
     if torch.are_deterministic_algorithms_enabled():
         # build [num_tokens, num_experts] from [num_tokens, topk]
