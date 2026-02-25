@@ -713,8 +713,15 @@ class TopKRouter(Router):
 
 
 class InferenceTopKRouter(TopKRouter):
-    """Specialized top-k router optimized for inference with specific constraints.
+    """Inference-only top-k router that strips out training-specific overhead.
 
+    A stripped-down version of TopKRouter that skips z-loss, auxiliary load
+    balancing losses, token dropping, and expert bias updates. The _forward()
+    method is @torch.compile()'d and returns dense [num_tokens, topk] tensors
+    instead of sparse [num_tokens, num_experts] for CUDA graph compatibility.
+
+    Falls back to the parent TopKRouter.forward() for training or 
+    non-CUDA-graphed inference iterations.
     """
 
     def __init__(
@@ -744,18 +751,23 @@ class InferenceTopKRouter(TopKRouter):
 
     @torch.compile()
     def _forward(self, input: torch.Tensor, padding_mask: Optional[torch.Tensor] = None):
-        logits = self.gating(input)  # [num_tokens, 1, num_experts]
-        logits = logits.squeeze(1)   # [num_tokens, num_experts]
-        # Reuse the shared routing logic with dense output for inference efficiency.
-        # Returns [num_tokens, topk] instead of sparse [num_tokens, num_experts].
+        logits = self.gating(input).squeeze(1)  # [num_tokens, 1, num_experts]
        
+        # Share the routing logic with the parent class to avoid code duplication.
+        # However, we pass dense_output=True to return dense [num_tokens, topk] tensors 
+        # instead of sparse [num_tokens, num_experts].
+        
         probs, top_indices = topk_routing_with_score_function(
             logits,
             self.topk,
-            use_pre_softmax=True,
+            use_pre_softmax=self.config.moe_router_pre_softmax,
+            num_groups=self.config.moe_router_num_groups,
+            group_topk=self.config.moe_router_group_topk,
             scaling_factor=self.config.moe_router_topk_scaling_factor,
             score_function=self.score_function,
             expert_bias=self.expert_bias,
+            fused=self.config.moe_router_fusion,
+            router_replay=self.router_replay,
             dense_output=True,
         )
         return probs.squeeze(1), top_indices.squeeze(1)
