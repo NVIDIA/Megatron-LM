@@ -795,10 +795,8 @@ class InferenceTopKRouter(TopKRouter):
                 - probs: Normalized routing probabilities [num_tokens, topk]
                 - top_indices: Selected expert indices [num_tokens, topk]
         """
-        # Maintain float32 expert bias (important for bf16/fp16)
-        self._maintain_float32_expert_bias()
-        
-        if not self.is_cuda_graphed_iteration:
+       
+        if self.training or not self.is_cuda_graphed_iteration:
             return super().forward(input, padding_mask)
         
         return self._forward(input, padding_mask)
