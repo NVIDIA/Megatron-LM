@@ -1,12 +1,3 @@
 {
-    "uri": "https://www.llama.com/models/llama-3/"
-}
-{
-    "uri": "https://docs.nvidia.com/megatron-core/developer-guide/latest/api-guide/context_parallel.html"
-}
-{
-    "uri": "https://docs.nvidia.com/megatron-core/developer-guide/latest/api-guide/dist_optimizer.html"
-}
-{
-    "uri": "https://docs.nvidia.com/megatron-core/developer-guide/latest/api-guide/tensor_parallel.html"
+    "uri": "http://localhost:8080/"
 }
