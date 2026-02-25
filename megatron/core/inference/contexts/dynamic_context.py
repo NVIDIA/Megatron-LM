@@ -1528,13 +1528,18 @@ class DynamicInferenceContext(BaseInferenceContext):
             finished + chunk_length + self.block_size_tokens - 1
         ) // self.block_size_tokens
 
+        # Fast path: skip all prefix matching when disabled.
+        if not self.enable_prefix_caching:
+            num_blocks_from_pool = max(0, overall_required_blocks - already_allocated_blocks)
+            return [], num_blocks_from_pool, already_allocated_blocks, overall_required_blocks, 0, chunk_length
+
         matched_block_ids, _ = self._find_matching_prefix_blocks(
             req, already_allocated_blocks, overall_required_blocks
         )
         num_matched = len(matched_block_ids)
 
         block_aligned = (finished % self.block_size_tokens == 0)
-        if self.enable_prefix_caching and num_matched > 0 and block_aligned:
+        if num_matched > 0 and block_aligned:
             prefix_skip_tokens = min(
                 num_matched * self.block_size_tokens, chunk_length - 1
             )

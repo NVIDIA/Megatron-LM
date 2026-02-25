@@ -1157,30 +1157,34 @@ class DynamicInferenceEngine(AbstractEngine):
         """
         Perform the same original scheduling logic for non-chunked runs
         """
-        pending_block_hashes = set()
-        pending_request_ids = []
+        prefix_caching_enabled = self.context.enable_prefix_caching
+        if prefix_caching_enabled:
+            pending_block_hashes = set()
+            pending_request_ids = []
         while self.waiting_request_ids:
             req = self.get_request(self.waiting_request_ids[0])
 
             # Check for conflicting block hashes.
-            has_pending_hash = False
-            for block_hash in req.precomputed_block_hashes:
-                if block_hash in pending_block_hashes:
-                    has_pending_hash = True
-                    break
-            if has_pending_hash:
-                self._prefix_coordination_waits += 1
-                pending_request_ids.append(self.waiting_request_ids.popleft())
-                continue
+            if prefix_caching_enabled:
+                has_pending_hash = False
+                for block_hash in req.precomputed_block_hashes:
+                    if block_hash in pending_block_hashes:
+                        has_pending_hash = True
+                        break
+                if has_pending_hash:
+                    self._prefix_coordination_waits += 1
+                    pending_request_ids.append(self.waiting_request_ids.popleft())
+                    continue
 
             request_can_be_added, request_tokens_can_be_added, kv_cache_available = (
                 self.context.check_availability(req)
             )
             if request_can_be_added and request_tokens_can_be_added and kv_cache_available:
                 # Add these hashes to pending.
-                for block_hash in req.precomputed_block_hashes:
-                    if block_hash not in self.context.block_allocator.hash_to_block_id:
-                        pending_block_hashes.add(block_hash)
+                if prefix_caching_enabled:
+                    for block_hash in req.precomputed_block_hashes:
+                        if block_hash not in self.context.block_allocator.hash_to_block_id:
+                            pending_block_hashes.add(block_hash)
                 self.context.add_request(req)
                 self._loop.call_soon_threadsafe(
                     self._loop.create_task, self._notify_cond_for_new_request()
@@ -1192,7 +1196,8 @@ class DynamicInferenceEngine(AbstractEngine):
                 break
 
         # Prepend pending request ids to waiting queue.
-        self.waiting_request_ids.extendleft(reversed(pending_request_ids))
+        if prefix_caching_enabled and pending_request_ids:
+            self.waiting_request_ids.extendleft(reversed(pending_request_ids))
 
     def schedule_chunked_prefill(self):
         """
@@ -1209,8 +1214,10 @@ class DynamicInferenceEngine(AbstractEngine):
                 it is during a chunked prefill
             - For each request, remaining_prompt_tokens holds the **unprefilled** prompt tokens
         """
-        pending_block_hashes = set()
-        pending_request_ids = []
+        prefix_caching_enabled = self.context.enable_prefix_caching
+        if prefix_caching_enabled:
+            pending_block_hashes = set()
+            pending_request_ids = []
         can_schedule = True
         while self.waiting_request_ids and can_schedule:
             can_schedule = False
@@ -1221,7 +1228,7 @@ class DynamicInferenceEngine(AbstractEngine):
             is_continuing_chunked_prefill = self.context.chunked_prefill_request_id >= 0
 
             # Check for conflicting block hashes.
-            if not is_continuing_chunked_prefill:
+            if prefix_caching_enabled and not is_continuing_chunked_prefill:
                 has_pending_hash = False
                 for block_hash in req.precomputed_block_hashes:
                     if block_hash in pending_block_hashes:
@@ -1244,9 +1251,10 @@ class DynamicInferenceEngine(AbstractEngine):
             if request_can_be_added and kv_cache_available:
                 if token_fully_can_be_added:
                     # Add these hashes to pending.
-                    for block_hash in req.precomputed_block_hashes:
-                        if block_hash not in self.context.block_allocator.hash_to_block_id:
-                            pending_block_hashes.add(block_hash)
+                    if prefix_caching_enabled:
+                        for block_hash in req.precomputed_block_hashes:
+                            if block_hash not in self.context.block_allocator.hash_to_block_id:
+                                pending_block_hashes.add(block_hash)
                     self.context.chunked_prefill_request_id = -1
                     self.context.add_request(req)
                     self._loop.call_soon_threadsafe(
@@ -1260,9 +1268,10 @@ class DynamicInferenceEngine(AbstractEngine):
                     can_schedule = True
                 elif token_partially_can_be_added:
                     # Add these hashes to pending.
-                    for block_hash in req.precomputed_block_hashes:
-                        if block_hash not in self.context.block_allocator.hash_to_block_id:
-                            pending_block_hashes.add(block_hash)
+                    if prefix_caching_enabled:
+                        for block_hash in req.precomputed_block_hashes:
+                            if block_hash not in self.context.block_allocator.hash_to_block_id:
+                                pending_block_hashes.add(block_hash)
                     chunk_length = self.context.max_tokens - self.context.active_token_count
 
                     # If this chunk would leave exactly 1 token for the final chunk, reduce this
@@ -1284,13 +1293,14 @@ class DynamicInferenceEngine(AbstractEngine):
                     # Note that we do not need to continue check the queue, as the tokens are full
 
         # Prepend pending request ids to waiting queue.
-        is_continuing_chunked_prefill = self.context.chunked_prefill_request_id >= 0
-        if is_continuing_chunked_prefill:
-            chunked_request_id = self.waiting_request_ids.popleft()
-            self.waiting_request_ids.extendleft(reversed(pending_request_ids))
-            self.waiting_request_ids.appendleft(chunked_request_id)
-        else:
-            self.waiting_request_ids.extendleft(reversed(pending_request_ids))
+        if prefix_caching_enabled and pending_request_ids:
+            is_continuing_chunked_prefill = self.context.chunked_prefill_request_id >= 0
+            if is_continuing_chunked_prefill:
+                chunked_request_id = self.waiting_request_ids.popleft()
+                self.waiting_request_ids.extendleft(reversed(pending_request_ids))
+                self.waiting_request_ids.appendleft(chunked_request_id)
+            else:
+                self.waiting_request_ids.extendleft(reversed(pending_request_ids))
 
     async def async_forward(self) -> Tuple[Dict, Dict, float]:
         """Uses `asyncio` for continuous generation.
