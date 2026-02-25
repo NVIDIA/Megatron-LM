@@ -7,7 +7,7 @@ from typing import Optional
 import torch
 
 from ..config_logger import has_config_logger_enabled, log_config_to_disk
-from ..fp8_utils import is_float8tensor, is_mxfp8tensor, post_all_gather_processing
+from ..fp8_utils import is_float8tensor, post_all_gather_processing
 from ..process_groups_config import ProcessGroupCollection
 from ..transformer.cuda_graphs import is_graph_capturing
 from ..transformer.transformer_config import TransformerConfig
@@ -488,26 +488,26 @@ class DistributedDataParallel(_BaseDataParallel):
                 # The paramaters are cast from bf16 to MXFP8 during copy.
                 # In the case of "overlap_param_gather=True", the param copy is done
                 # in "finish_param_sync" stage after zeroing the shared gardient buffers.
-                is_bf16_weight_group = False
                 if self.ddp_config.reuse_grad_buf_for_mxfp8_param_ag:
                     for bucket in bucket_group.buckets:
+                        is_bf16_weight_bucket = False
                         for param in bucket.params:
                             # Skip copying since bf16 weights in the mxfp8 model
                             # are already mapped to param.data.
-                            if not is_mxfp8tensor(param) and not is_float8tensor(param):
-                                is_bf16_weight_group = True
+                            if not is_float8tensor(param):
+                                is_bf16_weight_bucket = True
                                 break
                             param_start, param_end = bucket.param_to_index[param]
                             param_slice = bucket.param_data.view(-1)[param_start:param_end]
                             param.data.copy_(param_slice.view(param.data.shape))
+                        if is_bf16_weight_bucket:
+                            continue
                         # All-gathered params are not needed after being copied to param.data.
                         # Zero out the param buffer (shared with grad buffer) for gradient
                         # accumulation. We cannot zero out the entire grad buffer because one grad
                         # buffer may correspond to multiple param buffers. If we zero out the entire
                         # grad buffer, it would clear the data of those param buffers that have not
                         # yet completed AG.
-                        if is_bf16_weight_group:
-                            break
                         bucket.param_data.zero_()
                 else:
                     fp8_params = []
