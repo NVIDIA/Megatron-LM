@@ -705,6 +705,7 @@ jobs:
       always()
       && !cancelled()
       && contains(needs.is-not-external-contributor.outputs.selected_runner, 'ephemeral')
+      && !needs.pre-flight.outputs.is_deployment_workflow == 'true'
     steps:
       - name: Taint node for cleanup
         shell: bash
