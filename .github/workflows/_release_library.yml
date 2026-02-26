@@ -220,9 +220,6 @@ jobs:
           # Extract PR number from URL
           PR_NUMBER=$(echo $PR_URL | grep -o '[0-9]*$')
 
-          # Add comment to the newly created PR
-          echo gh pr comment $PR_NUMBER --body "/ok to test $(git rev-parse HEAD)"
-
       - name: Wait for status checks on tmp branch
         uses: actions/github-script@v7
         id: wait-status
@@ -347,7 +344,6 @@ jobs:
       ref: ${{ inputs.release-ref }}
       no-publish: false
     secrets:
-      TWINE_USERNAME: ${{ secrets.TWINE_USERNAME }}
       TWINE_PASSWORD: ${{ secrets.TWINE_PASSWORD }}
 
   create-gh-release:
@@ -365,7 +361,7 @@ jobs:
       REPOSITORY: ${{ github.repository }}
       PROJECT_NAME: Megatron Core
       VERSION: ${{ needs.bump-next-version.outputs.release-version }}
-      TAG_PREFIX: ${{ inputs.gh-release-tag-prefix || '' }}
+      TAG_PREFIX: core_
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
