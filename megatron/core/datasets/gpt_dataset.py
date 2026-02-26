@@ -50,9 +50,6 @@ class GPTDatasetConfig(BlendedMegatronDatasetConfig):
     object_storage_cache_path: Optional[str] = None
     """Path for caching indices for s3 or msc dataloading."""
 
-    context_parallel_size: int = 1
-    """Option to enable context parallelism"""
-
     data_parallel_size: int = 1
     """Option to enable data parallelism"""
 
