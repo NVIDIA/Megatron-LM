@@ -2,6 +2,7 @@
 import copy
 import logging
 import warnings
+from collections import defaultdict
 from dataclasses import astuple
 from typing import Any, Callable, Dict, List, Optional, Tuple, Union
 
@@ -47,7 +48,9 @@ from ..distributed.param_and_grad_buffer import _ParamAndGradBuffer
 from ..transformer.module import MegatronModule
 from ..utils import get_model_config, get_pg_rank, get_pg_size, is_te_min_version, log_single_rank
 from .distrib_optimizer import DistributedOptimizer
+from .emerging_optimizers import _EMERGING_OPTIMIZERS, _create_plain_emerging_optimizer
 from .grad_scaler import ConstantGradScaler, DynamicGradScaler
+from .layer_wise_optimizer import LayerWiseDistributedOptimizer
 from .optimizer import (
     ChainedOptimizer,
     Float16OptimizerWithFloat16Params,
@@ -55,9 +58,10 @@ from .optimizer import (
     MegatronOptimizer,
     param_group_identifier_keys,
 )
+
+# Subclass aliases kept for backward compatibility; all are OptimizerConfig.
 from .optimizer_config import (
     AdamOptimizerConfig,
-    EmergingOptimizerConfig,
     OptimizerConfig,
     ParamKey,
     ParamPredicate,
@@ -134,14 +138,6 @@ def _get_param_groups(
 
     # Map (pg_overrides, is_expert_parallel) to params.
     params_map = {}
-
-    if config_overrides is None:
-        # TODO remove this default behavior eventually.
-        #  This is only needed for backwards compatibility with the old config overrides API where
-        #  the config_overrides argument by default lead to bias parameters and length 1 parameters.
-        #  We assume that users of decoupled LR already provide config overrides so will adapt
-        #  to the new API.
-        config_overrides = get_standard_config_overrides(config=config)
 
     for model_chunk in model_chunks:
         for name, param in model_chunk.named_parameters():
@@ -277,7 +273,8 @@ def _get_megatron_optimizer_based_on_param_groups(
     intra_dist_opt_group: Optional[torch.distributed.ProcessGroup] = None,
     distributed_optimizer_instance_id: Optional[int] = 0,
     pg_collection: Optional[ProcessGroupCollection] = None,
-) -> MegatronOptimizer:
+    plain: bool = False,
+) -> Union[MegatronOptimizer, Tuple[Optional[torch.optim.Optimizer], Optional[Callable]]]:
     """Get Megatron optimizer based on parameter groups.
 
     Args:
@@ -293,12 +290,20 @@ def _get_megatron_optimizer_based_on_param_groups(
             optimizer. Defaults to None.
         distributed_optimizer_instance_id (int, optional): Distributed optimizer instance. Defaults
             0.
+        plain (bool): if True, return a ``(optimizer, init_state_fn)`` tuple of the raw
+            PyTorch optimizer without any Megatron wrapping. Useful when the caller
+            (e.g. LayerWiseDistributedOptimizer) performs its own wrapping.
 
     Returns:
-        Instance of MegatronOptimizer.
+        Instance of MegatronOptimizer, or ``(optimizer, init_state_fn)`` when *plain=True*.
     """
-    # TODO: Logic needs to be updated to handle different optimizer types (i.e., param_groups
-    # passed into this function need to correspond to the same optimizer).
+    # All param_groups passed here must belong to the same optimizer type (adam / sgd).
+    # Callers are responsible for splitting by optimizer type before calling this function.
+
+    if plain and config.use_precision_aware_optimizer:
+        raise ValueError("plain=True is incompatible with use_precision_aware_optimizer.")
+    if plain and config.optimizer_cpu_offload:
+        raise ValueError("plain=True is incompatible with optimizer_cpu_offload.")
 
     # When freezing sub-models we may have no trainable parameters on a rank and
     # hence an empty param_groups. However, we still need to create an optimizer
@@ -413,6 +418,9 @@ def _get_megatron_optimizer_based_on_param_groups(
         optimizer = None
         init_state_fn = None
 
+    if plain:
+        return optimizer, init_state_fn
+
     # Mixed precision optimizer.
     # - Note: both the Float16Optimizer and the DistributedOptimizer inherit
     #   from the MixedPrecisionOptimizer, which manages any optimizer where
@@ -503,6 +511,128 @@ def check_config_overrides_consistency(
     return True
 
 
+def _get_megatron_emerging_optimizer(
+    config: OptimizerConfig,
+    model_chunks: List[MegatronModule],
+    config_overrides: Optional[Dict[ParamKey, Any]] = None,
+    use_gloo_process_groups: bool = True,
+    pg_collection: Optional[ProcessGroupCollection] = None,
+) -> MegatronOptimizer:
+    """Build an emerging optimizer (e.g. Muon) for the given model chunks.
+
+    Parameter separation (e.g., linear weights -> Muon, rest -> Adam) is expressed as a
+    config_override, the same mechanism used for weight-decay and learning-rate overrides.
+    Adam/SGD groups are delegated to _get_megatron_optimizer_based_on_param_groups so they
+    go through the exact same code path as the standard optimizer factory.
+
+    When ``config.use_layer_wise_distributed_optimizer`` is True, the underlying optimizers
+    are wrapped with :class:`LayerWiseDistributedOptimizer`.
+    """
+    eopt_name = config.optimizer
+    use_layer_wise = config.use_layer_wise_distributed_optimizer
+
+    # Handle legacy "dist_*" optimizer names (e.g. "dist_muon" → "muon" + layer-wise).
+    if eopt_name.startswith('dist_'):
+        bare_name = eopt_name[len('dist_') :]
+        warnings.warn(
+            f"optimizer='{eopt_name}' is deprecated. "
+            f"Use optimizer='{bare_name}' with use_layer_wise_distributed_optimizer=True.",
+            DeprecationWarning,
+            stacklevel=3,
+        )
+        eopt_name = bare_name
+        use_layer_wise = True
+
+    if eopt_name not in _EMERGING_OPTIMIZERS:
+        raise ValueError(f"Unsupported emerging optimizer: {eopt_name}")
+    if config.fp16:
+        raise Exception('emerging optimizer with fp16 is not supported.')
+
+    if pg_collection is None:
+        pg_collection = ProcessGroupCollection.use_mpu_process_groups()
+    pg_dict = ProcessGroupCollection.setup_process_groups_for_optimizer(
+        pg_collection, model_chunks, use_gloo_process_groups
+    )
+
+    log_single_rank(logger, logging.INFO, f'Setting up emerging optimizer with config {config}')
+
+    # Tag parameters with optimizer-specific attributes (expert_tp, is_qkv).
+    for model_chunk in model_chunks:
+        for name, param in model_chunk.named_parameters():
+            if not param.requires_grad:
+                continue
+            if 'experts' in name and 'shared' not in name:
+                param.expert_tp = True
+            # TODO(deyuf): support MLA
+            if 'linear_qkv.weight' in name and len(param.shape) == 2:
+                param.is_qkv = True
+
+    # Apply optimizer-specific default param overrides (e.g. muon: non-linear -> adam).
+    config_overrides.update(_EMERGING_OPTIMIZERS[eopt_name].default_param_overrides)
+
+    # Build param groups and bucket by (optimizer_name, is_expert_parallel).
+    # Layer-wise distributed optimizer handles expert params internally so we skip that split.
+    all_param_groups = _get_param_groups(model_chunks, config, config_overrides)
+    grouped_param_groups = defaultdict(list)
+    for group in all_param_groups:
+        opt_name = group.get('optimizer', eopt_name)
+        is_expert = group['is_expert_parallel'] and not use_layer_wise
+        grouped_param_groups[(opt_name, is_expert)].append(group)
+
+    # Build an optimizer for each (optimizer_name, is_expert) bucket and combine.
+    results = []
+    for (opt_name, is_expert), groups in grouped_param_groups.items():
+        if not groups:
+            continue
+
+        model_parallel_group = pg_dict['expt_tp_pp_group' if is_expert else 'mp_group']
+
+        if opt_name in _EMERGING_OPTIMIZERS:
+            optimizer, init_state_fn = _create_plain_emerging_optimizer(
+                config, groups, eopt_name, model_chunks, pg_collection
+            )
+            if use_layer_wise:
+                result = (optimizer, init_state_fn)
+            else:
+                if config.bf16:
+                    optimizer = Float16OptimizerWithFloat16Params(
+                        optimizer, config, None, init_state_fn
+                    )
+                else:
+                    optimizer = FP32Optimizer(optimizer, config, init_state_fn)
+                setattr(optimizer, 'grad_stats_parallel_group', model_parallel_group)
+                if pg_collection is None or not hasattr(pg_collection, 'tp'):
+                    tp_group = parallel_state.get_tensor_model_parallel_group()
+                else:
+                    tp_group = pg_collection.tp
+                setattr(optimizer, 'tp_group', tp_group)
+                result = optimizer
+        else:
+            fallback_config = copy.copy(config)
+            fallback_config.optimizer = opt_name
+            fallback_config.use_distributed_optimizer = False
+            result = _get_megatron_optimizer_based_on_param_groups(
+                config=fallback_config,
+                model_chunks=model_chunks,
+                param_groups=groups,
+                model_parallel_group=model_parallel_group,
+                pg_collection=pg_collection,
+                plain=use_layer_wise,
+            )
+        results.append(result)
+
+    if use_layer_wise:
+        plain_optimizers, init_fns = zip(*results) if results else ([], [])
+        log_single_rank(
+            logger, logging.INFO, f'Using LayerWiseDistributedOptimizer for {eopt_name}'
+        )
+        return LayerWiseDistributedOptimizer(
+            list(plain_optimizers), config, pg_collection, init_state_fn_list=list(init_fns)
+        )
+
+    return ChainedOptimizer(results)
+
+
 def get_megatron_optimizer(
     config: OptimizerConfig,
     model_chunks: List[MegatronModule],
@@ -513,7 +643,10 @@ def get_megatron_optimizer(
 ) -> MegatronOptimizer:
     """Retrieve the Megatron optimizer for model chunks.
 
+    Handles both standard optimizers (Adam, SGD) and emerging optimizers (e.g. Muon).
     We use separate optimizers for expert parameters and non-expert parameters.
+    For emerging optimizers with ``config.use_layer_wise_distributed_optimizer=True``,
+    the optimizer is automatically wrapped with :class:`LayerWiseDistributedOptimizer`.
 
     Args:
         config (OptimizerConfig): optimizer configuration object.
@@ -529,6 +662,20 @@ def get_megatron_optimizer(
     Returns:
         Instance of MegatronOptimizer.
     """
+
+    if config_overrides is None:
+        config_overrides = get_standard_config_overrides(config)
+
+    # TODO: the standard and emerging optimizer paths handle pg_collection differently;
+    # unify them so both use a single pg_collection-based flow.
+    if config.optimizer not in ('adam', 'sgd'):
+        return _get_megatron_emerging_optimizer(
+            config=config,
+            model_chunks=model_chunks,
+            config_overrides=config_overrides,
+            use_gloo_process_groups=use_gloo_process_groups,
+            pg_collection=pg_collection,
+        )
 
     log_single_rank(logger, logging.INFO, f'Setting up optimizer with config {config}')
 
