@@ -195,6 +195,7 @@ from .global_vars import (
     get_one_logger,
     get_tokenizer,
     get_energy_monitor,
+    get_telemetry,
 )
 from . import one_logger_utils
 from .dgrad_logging import enable_dgrad_logging, disable_dgrad_logging, save_dgrads
@@ -204,6 +205,12 @@ from . import ft_integration
 stimer = StragglerDetector()
 
 from megatron.core.msc_utils import MultiStorageClientFeature, open_file
+
+# OTel: module-level helpers imported once at startup.
+from nemo.lens.state import is_span_group_enabled as _otel_sg_enabled
+from nemo.lens.helpers import managed_span as _otel_managed_span
+from nemo.lens.helpers import safe_set_span_attributes as _otel_safe_set_attrs
+from nemo.lens.helpers import trace_fn as _otel_trace_fn
 
 
 def destroy_global_state():
@@ -820,6 +827,36 @@ def pretrain(
     args = get_args()
     timers = get_timers()
 
+    # OTel: start megatron.pretrain span (covers training + eval + test).
+    # Uses explicit span API (start_span + context.attach) to avoid restructuring
+    # this large function body.  An atexit handler ensures the span is ended even
+    # if pretrain() exits via unhandled exception.
+    _pretrain_span = _pretrain_ctx_token = None
+    _otel_ctx = None
+    if _otel_sg_enabled('job'):
+        from opentelemetry import context as _otel_ctx, trace as _otel_trace
+        from nemo.lens.helpers import safe_set_span_attributes as _otel_set_attrs
+        _otel_tracer = get_telemetry().tracer
+        _pretrain_span = _otel_tracer.start_span("megatron.pretrain")
+        _otel_set_attrs(_pretrain_span, {
+            'megatron.model_type': str(model_type),
+            'megatron.train_iters': getattr(args, 'train_iters', 0),
+            'megatron.global_batch_size': getattr(args, 'global_batch_size', 0),
+        })
+        _pretrain_ctx_token = _otel_ctx.attach(_otel_trace.set_span_in_context(_pretrain_span))
+
+    def _end_pretrain_span():
+        """End the pretrain span and detach its context token."""
+        nonlocal _pretrain_span
+        if _pretrain_span is not None:
+            if _otel_ctx is not None and _pretrain_ctx_token is not None:
+                _otel_ctx.detach(_pretrain_ctx_token)
+            _pretrain_span.end()
+            _pretrain_span = None  # Prevent double-end from atexit
+
+    import atexit
+    atexit.register(_end_pretrain_span)
+
     if args.fine_grained_activation_offloading:
         from megatron.core.pipeline_parallel.utils import (
             set_ideal_affinity_for_current_gpu
@@ -942,10 +979,10 @@ def pretrain(
 
     # Model, optimizer, and learning rate.
     timers('model-and-optimizer-setup', log_level=0).start(barrier=True)
-    model, optimizer, opt_param_scheduler = setup_model_and_optimizer(
-        model_provider, model_type, checkpointing_context=checkpointing_context
-    )
-
+    with _otel_managed_span('model_init', 'megatron.model_init'):
+        model, optimizer, opt_param_scheduler = setup_model_and_optimizer(
+            model_provider, model_type, checkpointing_context=checkpointing_context
+        )
     timers('model-and-optimizer-setup').stop()
     print_datetime('after model, optimizer, and learning rate ' 'scheduler are built')
     config = get_model_config(model[0])
@@ -1189,6 +1226,12 @@ def pretrain(
 
     ft_integration.shutdown()
     one_logger_utils.finish()
+
+    # OTel: end megatron.pretrain span and flush all pending telemetry data.
+    _end_pretrain_span()
+    _otel_handle = get_telemetry()
+    if _otel_handle is not None:
+        _otel_handle.shutdown()
 
 
 def update_train_iters(args):
@@ -1599,16 +1642,16 @@ def setup_model_and_optimizer(
             {'load_checkpoint_start_time': one_logger_utils.get_timestamp_in_ms()}
         )
         timers('load-checkpoint', log_level=0).start(barrier=True)
-
-        args.iteration, args.num_floating_point_operations_so_far = load_checkpoint(
-            model,
-            optimizer,
-            opt_param_scheduler,
-            checkpointing_context=checkpointing_context,
-            skip_load_to_model_and_opt=HAVE_FSDP2
-            and getattr(args, "use_torch_fsdp2", False)
-            and args.ckpt_format == "torch_dist",
-        )
+        with _otel_managed_span('load_checkpoint', 'megatron.load_checkpoint'):
+            args.iteration, args.num_floating_point_operations_so_far = load_checkpoint(
+                model,
+                optimizer,
+                opt_param_scheduler,
+                checkpointing_context=checkpointing_context,
+                skip_load_to_model_and_opt=HAVE_FSDP2
+                and getattr(args, "use_torch_fsdp2", False)
+                and args.ckpt_format == "torch_dist",
+            )
         timers('load-checkpoint').stop(barrier=True)
         timers.log(['load-checkpoint'])
         one_logger and one_logger.log_metrics(
@@ -1671,6 +1714,12 @@ def train_step(forward_step_func, data_iterator, model, optimizer, opt_param_sch
     args = get_args()
     timers = get_timers()
 
+    # OTel: set up per-step sub-span support.
+    _otel_step_tracer = None
+    if _otel_sg_enabled('forward_backward') or _otel_sg_enabled('optimizer'):
+        from nemo.lens.helpers import span_cm, safe_set_span_attributes as _otel_set_attrs
+        _otel_step_tracer = get_telemetry().tracer
+
     rerun_state_machine = get_rerun_state_machine()
     save_dgrads_in_this_iteration = (args.save_dgrads_interval is not None and
                                      (iteration + 1) % args.save_dgrads_interval == 0)
@@ -1715,18 +1764,23 @@ def train_step(forward_step_func, data_iterator, model, optimizer, opt_param_sch
         # Forward pass.
         if save_dgrads_in_this_iteration:
             enable_dgrad_logging(model, args.save)
-        losses_reduced = forward_backward_func(
-            forward_step_func=forward_step_func,
-            data_iterator=data_iterator,
-            model=model,
-            num_microbatches=get_num_microbatches(),
-            seq_length=args.seq_length,
-            micro_batch_size=args.micro_batch_size,
-            decoder_seq_length=args.decoder_seq_length,
-            forward_only=False,
-            adjust_tensor_shapes_fn=adjust_tensor_shapes_fn,
-            force_all_reduce=save_wgrads_in_this_iteration,
+        _fb_cm = (
+            span_cm("megatron.forward_backward", tracer=_otel_step_tracer, num_microbatches=get_num_microbatches())
+            if _otel_sg_enabled('forward_backward') and _otel_step_tracer is not None else nullcontext()
         )
+        with _fb_cm:
+            losses_reduced = forward_backward_func(
+                forward_step_func=forward_step_func,
+                data_iterator=data_iterator,
+                model=model,
+                num_microbatches=get_num_microbatches(),
+                seq_length=args.seq_length,
+                micro_batch_size=args.micro_batch_size,
+                decoder_seq_length=args.decoder_seq_length,
+                forward_only=False,
+                adjust_tensor_shapes_fn=adjust_tensor_shapes_fn,
+                force_all_reduce=save_wgrads_in_this_iteration,
+            )
         if save_dgrads_in_this_iteration:
             save_dgrads(iteration + 1)
             disable_dgrad_logging()
@@ -1766,7 +1820,17 @@ def train_step(forward_step_func, data_iterator, model, optimizer, opt_param_sch
     # Update parameters.
 
     timers('optimizer', log_level=1).start(barrier=args.barrier_with_L1_time)
-    update_successful, grad_norm, num_zeros_in_grad = optimizer.step()
+    _opt_cm = (
+        span_cm("megatron.optimizer_step", tracer=_otel_step_tracer)
+        if _otel_sg_enabled('optimizer') and _otel_step_tracer is not None else nullcontext()
+    )
+    with _opt_cm as _opt_span:
+        update_successful, grad_norm, num_zeros_in_grad = optimizer.step()
+        if _opt_span is not None:
+            _otel_set_attrs(_opt_span, {
+                "megatron.update_successful": bool(update_successful),
+                "megatron.grad_norm": grad_norm,
+            })
 
     # get max attention logit for logging and run clip_qk()
     # Part of MuonClip Optimizer step
@@ -2152,6 +2216,27 @@ def training_log(
             total_loss_dict[skipped_iters_key] = 0
             total_loss_dict[nan_iters_key] = 0
         print_rank_last(log_string)
+
+        # OTel: emit training metrics at log interval (export rank only).
+        _otel_telemetry_log = get_telemetry()
+        if _otel_telemetry_log is not None and _otel_telemetry_log.is_exporting:
+            from nemo.lens.instruments.training import record_training_metrics
+            _meta_keys = (advanced_iters_key, skipped_iters_key, nan_iters_key)
+            _loss_keys = [k for k in total_loss_dict if k not in _meta_keys]
+            _avg_loss = (
+                total_loss_dict[_loss_keys[0]].item()
+                / float(max(1, total_loss_dict.get(advanced_iters_key, 1)))
+                if _loss_keys else None
+            )
+            record_training_metrics(
+                meter=_otel_telemetry_log.meter,
+                step_duration_ms=elapsed_time_per_iteration * 1000.0,
+                loss=_avg_loss,
+                throughput_tps=throughput if args.log_throughput else None,
+                grad_norm=grad_norm,
+                skipped_iters=int(total_loss_dict.get(skipped_iters_key, 0)),
+            )
+
         reported_memory_in_this_iteration = False
         if report_memory_flag:
             # Report memory after optimizer state has been initialized.
@@ -2265,17 +2350,18 @@ def save_checkpoint_and_time(
         # Track memory before checkpoint save.
         report_memory(f"(before save_checkpoint for iteration {iteration})")
     # Save checkpoint.
-    save_checkpoint(
-        iteration,
-        model,
-        optimizer,
-        opt_param_scheduler,
-        num_floating_point_operations_so_far,
-        checkpointing_context,
-        non_persistent_ckpt=non_persistent_ckpt,
-        train_data_iterator=train_data_iterator,
-        preprocess_common_state_dict_fn=preprocess_common_state_dict,
-    )
+    with _otel_managed_span('checkpoint', 'megatron.save_checkpoint', **{'megatron.iteration': iteration}):
+        save_checkpoint(
+            iteration,
+            model,
+            optimizer,
+            opt_param_scheduler,
+            num_floating_point_operations_so_far,
+            checkpointing_context,
+            non_persistent_ckpt=non_persistent_ckpt,
+            train_data_iterator=train_data_iterator,
+            preprocess_common_state_dict_fn=preprocess_common_state_dict,
+        )
     if should_report_memory:
         # Track memory after checkpoint save.
         report_memory(f"(after save_checkpoint for iteration {iteration})")
@@ -2483,6 +2569,7 @@ def checkpoint_and_decide_exit(
     return False
 
 
+@_otel_trace_fn('job', 'megatron.train')
 def train(
     forward_step_func,
     model,
@@ -2499,6 +2586,15 @@ def train(
     """Training function: run train_step desired number of times, run validation, checkpoint."""
     args = get_args()
     timers = get_timers()
+
+    # OTel: set span attribute on the active span started by the @_otel_trace_fn decorator.
+    # get_current_span() always returns a NonRecordingSpan (no-op) when no span is active,
+    # so this is safe whether or not the group is enabled or the decorator fell back to no-op.
+    try:
+        from opentelemetry import trace as _ot
+        _ot.get_current_span().set_attribute('megatron.train_iters', getattr(args, 'train_iters', 0))
+    except Exception:  # noqa: BLE001 — OTel must never crash training
+        pass
 
     if getattr(args, 'perform_rl_step', False):
         assert has_rl_utils, "RL cannot run without the megatron.rl package"
@@ -2865,20 +2961,29 @@ def train(
                 # we use previously-generated data for an update.
                 buffered_rollouts = train_data_iterator
 
-        ft_integration.on_training_step_start()
-        (
-            loss_dict,
-            skipped_iter,
-            should_checkpoint,
-            should_exit,
-            exit_code,
-            grad_norm,
-            num_zeros_in_grad,
-            max_attention_logit,
-        ) = train_step(
-            forward_step_func, train_data_iterator, model, optimizer, opt_param_scheduler, config, forward_backward_func, iteration=iteration
-        )
-        ft_integration.on_training_step_end()
+        # OTel: optional per-step span wrapping train_step.
+        with _otel_managed_span('step', 'megatron.train_step', **{'megatron.iteration': iteration}) as _step_span:
+            ft_integration.on_training_step_start()
+            (
+                loss_dict,
+                skipped_iter,
+                should_checkpoint,
+                should_exit,
+                exit_code,
+                grad_norm,
+                num_zeros_in_grad,
+                max_attention_logit,
+            ) = train_step(
+                forward_step_func, train_data_iterator, model, optimizer, opt_param_scheduler, config, forward_backward_func, iteration=iteration
+            )
+            ft_integration.on_training_step_end()
+            if _step_span is not None:
+                _loss_val = next(iter(loss_dict.values())).item() if loss_dict else None
+                _otel_safe_set_attrs(_step_span, {
+                    'megatron.loss': _loss_val,
+                    'megatron.grad_norm': grad_norm,
+                    'megatron.skipped': bool(skipped_iter),
+                })
         if should_checkpoint:
             save_checkpoint_and_time(
                 iteration,
@@ -3113,11 +3218,15 @@ def train(
         one_logger_utils.finish()
         if getattr(args, 'perform_rl_step', False):
             rl_utils.rl_inference_interface_shutdown()
+        _otel_handle = get_telemetry()
+        if _otel_handle is not None:
+            _otel_handle.shutdown()
         sys.exit(exit_code)
 
     return iteration, num_floating_point_operations_so_far
 
 
+@_otel_trace_fn('evaluate', 'megatron.evaluate')
 def evaluate(
     forward_step_func,
     data_iterator,
@@ -3283,6 +3392,17 @@ def evaluate(
     rerun_state_machine.set_mode(rerun_mode)
 
     rerun_state_machine.set_mode(rerun_mode)
+
+    # OTel: set eval_iters on the active span started by the @_otel_trace_fn decorator.
+    # get_current_span() always returns a NonRecordingSpan (no-op) when no span is active,
+    # so this is safe whether or not the group is enabled or the decorator fell back to no-op.
+    try:
+        from opentelemetry import trace as _ot
+        _ot.get_current_span().set_attribute(
+            'megatron.eval_iters', eval_iters if eval_iters is not None else 0
+        )
+    except Exception:  # noqa: BLE001 — OTel must never crash evaluation
+        pass
 
     return total_loss_dict, collected_non_loss_data, False
 

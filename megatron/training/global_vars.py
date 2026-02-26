@@ -23,6 +23,7 @@ _GLOBAL_ADLR_AUTORESUME = None
 _GLOBAL_TIMERS = None
 _GLOBAL_ENERGY_MONITOR = None
 _GLOBAL_SIGNAL_HANDLER = None
+_GLOBAL_TELEMETRY_HANDLE = None
 
 def get_args():
     """Return arguments."""
@@ -74,6 +75,11 @@ def get_signal_handler():
     return _GLOBAL_SIGNAL_HANDLER
 
 
+def get_telemetry():
+    """Return the telemetry handle. It can be None so no need to check if initialized."""
+    return _GLOBAL_TELEMETRY_HANDLE
+
+
 def _set_signal_handler(exit_signal):
 
     global _GLOBAL_SIGNAL_HANDLER
@@ -106,6 +112,7 @@ def set_global_variables(args, build_tokenizer=True):
     _set_adlr_autoresume(args)
     _set_timers(args)
     _set_energy_monitor(args)
+    _set_telemetry(args)
 
     if args.enable_experimental:
         set_experimental_flag(True)
@@ -133,6 +140,7 @@ def unset_global_variables():
     global _GLOBAL_TIMERS
     global _GLOBAL_ENERGY_MONITOR
     global _GLOBAL_SIGNAL_HANDLER
+    global _GLOBAL_TELEMETRY_HANDLE
 
     _GLOBAL_ARGS = None
     _GLOBAL_NUM_MICROBATCHES_CALCULATOR = None
@@ -144,6 +152,7 @@ def unset_global_variables():
     _GLOBAL_TIMERS = None
     _GLOBAL_ENERGY_MONITOR = None
     _GLOBAL_SIGNAL_HANDLER = None
+    _GLOBAL_TELEMETRY_HANDLE = None
 
     unset_num_microbatches_calculator()
 
@@ -283,6 +292,28 @@ def _ensure_var_is_not_initialized(var, name):
     """Make sure the input variable is not None."""
     assert var is None, '{} is already initialized.'.format(name)
 
+def _set_telemetry(args):
+    """Initialise OTel telemetry handle following the wandb/tensorboard pattern."""
+    global _GLOBAL_TELEMETRY_HANDLE
+    from nemo.lens import NemoLensConfig, setup_telemetry
+    from nemo.lens.groups_megatron import MegatronSpanGroup
+
+    config = NemoLensConfig.from_env(
+        prefix='MEGATRON_OTEL', fallback_prefix='NEMO_LENS',
+        span_group_cls=MegatronSpanGroup,
+    )
+    config.service_name = config.service_name or 'megatron-training'
+    if getattr(args, 'otel_enabled', False):
+        config.enabled = True
+    if getattr(args, 'otel_service_name', None):
+        config.service_name = args.otel_service_name
+    if getattr(args, 'otel_span_groups', None):
+        config.span_groups = args.otel_span_groups
+    _GLOBAL_TELEMETRY_HANDLE = setup_telemetry(
+        config, rank=args.rank, world_size=args.world_size
+    )
+
+
 def destroy_global_vars():
     global _GLOBAL_ARGS
     _GLOBAL_ARGS = None
@@ -310,3 +341,6 @@ def destroy_global_vars():
 
     global _GLOBAL_SIGNAL_HANDLER
     _GLOBAL_SIGNAL_HANDLER = None
+
+    global _GLOBAL_TELEMETRY_HANDLE
+    _GLOBAL_TELEMETRY_HANDLE = None

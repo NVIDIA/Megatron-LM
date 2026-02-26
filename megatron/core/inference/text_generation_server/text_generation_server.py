@@ -1,4 +1,5 @@
-# Copyright (c) 2024, NVIDIA CORPORATION. All rights reserved.
+# Copyright (c) 2025, NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+import contextlib
 import datetime
 import json
 import logging
@@ -181,12 +182,82 @@ class MegatronGenerate(Resource):
                 logging.info(json.dumps(request.get_json()))
                 logging.info(f"start time: {datetime.datetime.now()}")
 
+            # OTel: instrument the request handler with GenAI semantic conventions.
+            # https://opentelemetry.io/docs/specs/semconv/gen-ai/gen-ai-spans/
+            # Gated by the INFERENCE span group so users can selectively disable.
+            _otel_tracer = _otel_meter = None
             try:
-                send_do_generate()  # Tell other ranks we're doing generate
+                from nemo.lens.state import is_span_group_enabled
+                if is_span_group_enabled('inference'):
+                    from nemo.lens.helpers import span_cm
+                    from nemo.lens.propagation import extract_context
+                    from opentelemetry import trace as _trace_mod, metrics as _metrics_mod
+                    _otel_tracer = _trace_mod.get_tracer('megatron.core')
+                    _otel_meter = _metrics_mod.get_meter('megatron.core')
+                    _parent_ctx = extract_context(dict(request.headers))
+                else:
+                    _parent_ctx = None
+            except Exception:
+                _parent_ctx = None
 
-                response_dict = run_mcore_engine(
-                    self.engine, prompts, temperature, top_k, top_p, logprobs, tokens_to_generate
-                )
+            # Resolve model identifier used in span name and attributes.
+            _model_id = (
+                str(getattr(self.args, 'model_type', 'megatron'))
+                if self.args is not None else 'megatron'
+            )
+
+            # Build GenAI-compliant span attributes.
+            # Required: gen_ai.operation.name, gen_ai.provider.name
+            # Conditionally required / recommended: model, max_tokens, temperature, top_k/p, seed
+            _span_attrs: dict = {
+                'gen_ai.operation.name': 'text_completion',
+                'gen_ai.provider.name': 'megatron',
+                'gen_ai.request.model': _model_id,
+                'gen_ai.request.max_tokens': tokens_to_generate,
+                'gen_ai.request.temperature': float(temperature),
+            }
+            if top_k > 0:
+                _span_attrs['gen_ai.request.top_k'] = float(top_k)
+            if top_p > 0.0:
+                _span_attrs['gen_ai.request.top_p'] = float(top_p)
+            if random_seed >= 0:
+                _span_attrs['gen_ai.request.seed'] = random_seed
+
+            # Span name format: "{gen_ai.operation.name} {gen_ai.request.model}"
+            _span_name = f"text_completion {_model_id}"
+            _req_start = datetime.datetime.now()
+
+            _request_cm = (
+                span_cm(_span_name, tracer=_otel_tracer, **_span_attrs)
+                if _otel_tracer is not None else contextlib.nullcontext()
+            )
+
+            try:
+                with _request_cm as _req_span:
+                    send_do_generate()  # Tell other ranks we're doing generate
+
+                    response_dict = run_mcore_engine(
+                        self.engine, prompts, temperature, top_k, top_p, logprobs, tokens_to_generate
+                    )
+
+                    # Set output token count on span if derivable from response.
+                    if _req_span is not None and isinstance(response_dict, dict):
+                        _output_tokens = sum(
+                            len(v.get('tokens', []))
+                            for v in response_dict.values()
+                            if isinstance(v, dict)
+                        )
+                        if _output_tokens:
+                            _req_span.set_attribute('gen_ai.usage.output_tokens', _output_tokens)
+
+                _req_duration_s = (datetime.datetime.now() - _req_start).total_seconds()
+                if _otel_meter is not None:
+                    from nemo.lens.instruments.inference import record_inference_metrics
+                    record_inference_metrics(
+                        meter=_otel_meter,
+                        request_duration_s=_req_duration_s,
+                        model=_model_id,
+                    )
 
                 return jsonify(response_dict)
 
