@@ -2807,6 +2807,14 @@ mlm = [
     { name = "transformers" },
     { name = "wandb" },
 ]
+training = [
+    { name = "accelerate" },
+    { name = "flask-restful" },
+    { name = "sentencepiece" },
+    { name = "tiktoken" },
+    { name = "transformers" },
+    { name = "wandb" },
+]
 
 [package.dev-dependencies]
 build = [
@@ -2867,6 +2875,7 @@ test = [
 [package.metadata]
 requires-dist = [
     { name = "accelerate", marker = "extra == 'mlm'" },
+    { name = "accelerate", marker = "extra == 'training'" },
     { name = "av", marker = "extra == 'dev'" },
     { name = "av", marker = "extra == 'lts'" },
     { name = "causal-conv1d", marker = "extra == 'dev'", specifier = "~=1.5" },
@@ -2884,6 +2893,7 @@ requires-dist = [
     { name = "flashinfer-python", marker = "extra == 'lts'", specifier = "~=0.5.0" },
     { name = "flask", extras = ["async"], marker = "extra == 'dev'" },
     { name = "flask-restful", marker = "extra == 'mlm'" },
+    { name = "flask-restful", marker = "extra == 'training'" },
     { name = "hypercorn", marker = "extra == 'dev'" },
     { name = "mamba-ssm", marker = "extra == 'dev'", specifier = "~=2.2" },
     { name = "mamba-ssm", marker = "extra == 'lts'", specifier = "~=2.2" },
@@ -2905,19 +2915,23 @@ requires-dist = [
     { name = "opentelemetry-api", marker = "extra == 'lts'", specifier = "~=1.33.1" },
     { name = "packaging", specifier = ">=24.2" },
     { name = "sentencepiece", marker = "extra == 'mlm'" },
+    { name = "sentencepiece", marker = "extra == 'training'" },
     { name = "tensorstore", marker = "extra == 'dev'", specifier = "~=0.1,!=0.1.46,!=0.1.72" },
     { name = "tensorstore", marker = "extra == 'lts'", specifier = "~=0.1,!=0.1.46,!=0.1.72" },
     { name = "tiktoken", marker = "extra == 'mlm'" },
+    { name = "tiktoken", marker = "extra == 'training'" },
     { name = "torch", specifier = ">=2.6.0" },
     { name = "tqdm", marker = "extra == 'dev'" },
     { name = "tqdm", marker = "extra == 'lts'" },
     { name = "transformer-engine", extras = ["core-cu13", "pytorch"], marker = "extra == 'dev'", git = "https://github.com/NVIDIA/TransformerEngine.git?rev=5671fd3675906cda1ade26c24a65d3dedd88eb89" },
     { name = "transformers", marker = "extra == 'mlm'" },
+    { name = "transformers", marker = "extra == 'training'" },
     { name = "wandb", marker = "extra == 'mlm'" },
+    { name = "wandb", marker = "extra == 'training'" },
     { name = "wget", marker = "extra == 'dev'" },
     { name = "wget", marker = "extra == 'lts'" },
 ]
-provides-extras = ["mlm", "dev", "lts"]
+provides-extras = ["training", "mlm", "dev", "lts"]
 
 [package.metadata.requires-dev]
 build = [
