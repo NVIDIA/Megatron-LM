@@ -208,12 +208,16 @@ async def graceful_shutdown(engine, client=None, *, timeout=30.0):
     # Stage 1: coordinator-driven shutdown.
     if client is not None:
         try:
-            if engine.state == EngineState.RUNNING:
-                client.pause_engines()
-                await asyncio.wait_for(engine.paused.wait(), timeout=timeout)
+            client.pause_engines()
+            await asyncio.wait_for(engine.paused.wait(), timeout=timeout)
             client.stop_engines()
             await asyncio.wait_for(engine.stopped.wait(), timeout=timeout)
-            await engine.engine_loop_task
+            # Reap the coordinator process (it exited after broadcasting STOP).
+            proc = getattr(engine, 'inference_coordinator_process', None)
+            if proc is not None:
+                proc.join(timeout=timeout)
+                if proc.is_alive():
+                    raise RuntimeError("Coordinator process did not exit")
             client.stop()
             return
         except Exception:
@@ -294,7 +298,7 @@ class TestCoordinator:
         try:
             if torch.distributed.get_rank() == 0:
                 client = InferenceClient(dp_addr)
-                await client.start()
+                client.start()
 
                 futures = [
                     client.add_request(prompt=prompt, sampling_params=params)
@@ -348,7 +352,7 @@ class TestCoordinator:
             # Verify the engine can serve requests.
             if torch.distributed.get_rank() == 0:
                 client1 = InferenceClient(first_addr)
-                await client1.start()
+                client1.start()
 
                 futures = [
                     client1.add_request(prompt=p, sampling_params=s) for p, s in requests[:2]
@@ -479,7 +483,7 @@ class TestCoordinator:
 
             if torch.distributed.get_rank() == 0:
                 client = InferenceClient(dp_addr)
-                await client.start()
+                client.start()
 
                 # ── RUNNING ──────────────────────────────────────────
                 await asyncio.sleep(0.1)
@@ -509,6 +513,7 @@ class TestCoordinator:
 
                 # UNPAUSE and verify all in-flight requests complete.
                 client.unpause_engines()
+                await asyncio.wait_for(engine.running.wait(), timeout=5.0)
                 results = await asyncio.wait_for(asyncio.gather(*inflight_futures), timeout=10.0)
                 for record in results:
                     assert record[-1].status == Status.COMPLETED
@@ -536,6 +541,7 @@ class TestCoordinator:
 
                 # ── UNPAUSE (1st) ────────────────────────────────────
                 client.unpause_engines()
+                await asyncio.wait_for(engine.running.wait(), timeout=5.0)
 
                 # Queued requests should now complete.
                 results = await asyncio.wait_for(asyncio.gather(*pending), timeout=5.0)
@@ -578,8 +584,7 @@ class TestCoordinator:
 
                 # ── UNPAUSE (2nd) ────────────────────────────────────
                 client.unpause_engines()
-                await asyncio.sleep(0.2)
-                assert_state(engine, EngineState.RUNNING)
+                await asyncio.wait_for(engine.running.wait(), timeout=5.0)
 
                 # Engine processes requests after suspend/resume cycle.
                 futures = [
@@ -616,7 +621,6 @@ class TestCoordinator:
                 await asyncio.wait_for(engine.stopped.wait(), timeout=120.0)
             except asyncio.TimeoutError:
                 raise AssertionError("Engine did not reach STOPPED within 120s")
-            await engine.engine_loop_task
             assert_state(engine, EngineState.STOPPED)
 
             # STOP should have cancelled all engine-side request state.
@@ -655,7 +659,7 @@ class TestCoordinator:
                 )
                 if torch.distributed.get_rank() == 0:
                     client = InferenceClient(dp_addr)
-                    await client.start()
+                    client.start()
                     await asyncio.sleep(0.1)
                     assert engine.state == EngineState.RUNNING
                     signal_fn(client)
@@ -687,7 +691,7 @@ class TestCoordinator:
         try:
             if torch.distributed.get_rank() == 0:
                 client = InferenceClient(dp_addr)
-                await client.start()
+                client.start()
                 init_time = time.time()
 
                 for _ in range(num_iterations):

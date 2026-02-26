@@ -157,11 +157,11 @@ class InferenceClient:
         reply = msgpack.unpackb(self.socket.recv(), raw=False)[0]
         assert Headers(reply) == Headers.CONNECT_ACK
 
-    async def start(self, loop: Optional[asyncio.AbstractEventLoop] = None):
+    def start(self, loop: Optional[asyncio.AbstractEventLoop] = None):
         """
         Connects to the coordinator and starts the background listener task.
 
-        This method must be awaited before submitting any requests. It handles
+        This must be called before submitting any requests. It handles
         the initial handshake and spawns the `listen_for_completed_requests`
         coroutine.
         """

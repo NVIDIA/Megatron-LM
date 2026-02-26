@@ -71,7 +71,7 @@ async def main(
     # Create client and run example.
     if dist.get_rank() == 0:
         client = InferenceClient(dp_addr)  # submits requests to the inference coordinator
-        await client.start()
+        client.start()
         base_arrival_time = time.time_ns() / 10**9
         for request in requests:
             request.time_arrival = request.time_offset + base_arrival_time

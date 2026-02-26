@@ -1667,27 +1667,45 @@ class DynamicInferenceEngine(AbstractEngine):
         return len(all_messages)
 
     async def shutdown(self, immediate: bool = False):
-        """Shut down the engine, draining EP collectives first.
+        """Shut down the engine and clean up ZMQ resources.
+
+        When immediate=False (called from the engine loop's finally block),
+        just does ZMQ cleanup — the loop already exited cleanly.
+
+        When immediate=True (external emergency shutdown), terminates the
+        coordinator process and cancels the engine loop task directly.
+        Cancellation is safe here because we can't rely on EP all-reduce
+        or world barriers — peer ranks may already be dead.
 
         Args:
-            immediate: Also terminate the coordinator process.
+            immediate: Terminate the coordinator and cancel the engine task.
         """
         task = getattr(self, 'engine_loop_task', None)
 
-        # If we're not shutting down through the coordinator, kill the coordinator first.
         if immediate and hasattr(self, "inference_coordinator_process"):
             self.inference_coordinator_process.terminate()
             self.inference_coordinator_process.join()
 
-        # If we're not shutting down through coordinator, the engine loop is still running.
-        # We must inject synthetic PAUSE + STOP to prevent NCCL deadlock.
         if task is not None and not task.done() and task is not asyncio.current_task():
-            if self.state == EngineState.RUNNING:
-                self._pending_signals.append(msgpack.packb([Headers.PAUSE.value], use_bin_type=True))
-            if self.state not in (EngineState.STOPPING, EngineState.STOPPED):
-                await self.paused.wait()
-                self._pending_signals.append(msgpack.packb([Headers.STOP.value], use_bin_type=True))
-            await task
+            if immediate:
+                # Cancel directly — synthetic signals would deadlock in
+                # EP all-reduce / world barrier if peers are already gone.
+                task.cancel()
+                try:
+                    await task
+                except (asyncio.CancelledError, Exception):
+                    pass
+            else:
+                # Graceful: inject synthetic signals so the engine drains
+                # EP collectives cooperatively before exiting.
+                if self.state == EngineState.RUNNING:
+                    self._pending_signals.append(msgpack.packb([Headers.PAUSE.value], use_bin_type=True))
+                if self.state not in (EngineState.STOPPING, EngineState.STOPPED):
+                    await self.paused.wait()
+                    self._pending_signals.append(msgpack.packb([Headers.STOP.value], use_bin_type=True))
+                await task
+
+        self.state = EngineState.STOPPED
 
         # ZMQ cleanup; idempotent.
         sock = getattr(self, 'socket_for_receiving_requests', None)
@@ -1706,6 +1724,8 @@ class DynamicInferenceEngine(AbstractEngine):
             self.world_zmq_communicator.close()
         if not self.zmq_context.closed:
             self.zmq_context.term()
+
+        self.stopped.set()
 
     @trace_async_exceptions
     async def run_engine(self, *, loop: Optional[asyncio.AbstractEventLoop] = None):
@@ -1729,17 +1749,22 @@ class DynamicInferenceEngine(AbstractEngine):
         except asyncio.CancelledError:
             pass
 
-    async def _ep_group_has_work(self, local_work: int) -> bool:
-        """Determines if there are some pending requests in the expert parallel group of this rank.
+    async def _ep_group_has_work(self, local_work: int) -> int:
+        """All-reduce max of local work counts across the EP group.
 
         The caller is responsible for passing the right value based on engine state:
-        - RUNNING: pass actual local_pending count
-        - PAUSING: pass 0 (this rank wants to stop stepping)
+        - RUNNING: pass actual local_pending count (>= 0)
+        - PAUSING: pass -1 (this rank wants to stop stepping)
+
+        Returns the global max. Callers interpret the result:
+        - > 0: at least one EP peer has work (step or dummy forward)
+        - == 0: all RUNNING peers are idle (no step needed)
+        - == -1: all EP peers are PAUSING (consensus reached)
 
         Args:
-            local_work (int): The local work count for this rank.
+            local_work (int): The local work count for this rank, or -1 if PAUSING.
         Returns:
-            bool: True if there is some work in the EP group, False otherwise.
+            int: The max work count across the EP group.
         """
         range_push("_ep_group_has_work")
 
@@ -1749,7 +1774,7 @@ class DynamicInferenceEngine(AbstractEngine):
             max_global_work = local_work
 
         range_pop()
-        return max_global_work > 0
+        return max_global_work
 
     async def _world_barrier(self):
         """World-wide ZMQ all-reduce barrier for global rank consensus.
@@ -1789,8 +1814,8 @@ class DynamicInferenceEngine(AbstractEngine):
                     local_pending = self.context.get_active_request_count() + len(
                         self.waiting_request_ids
                     )
-                    ep_has_work = await self._ep_group_has_work(local_pending)
-                    if ep_has_work:
+                    ep_work = await self._ep_group_has_work(local_pending)
+                    if ep_work > 0:
                         if local_pending > 0:
                             await self.async_step()
                         else:
@@ -1804,20 +1829,22 @@ class DynamicInferenceEngine(AbstractEngine):
                         await asyncio.sleep(0.02)
 
                 elif self.state == EngineState.PAUSING:
-                    # Need EP consensus via all-reduce before we can transition to PAUSED.
-                    ep_has_work = await self._ep_group_has_work(0)
-                    if ep_has_work:
-                        # EP peer hasn't received PAUSE yet — dummy forward.
+                    # EP consensus via all-reduce: report -1 to indicate PAUSING.
+                    ep_work = await self._ep_group_has_work(-1)
+                    if ep_work > 0:
+                        # EP peer has work and will step — dummy forward to participate.
                         self.step_start_event.record()
                         self.controller.dummy_forward()
                         self.step_end_event.record()
                         self.step_end_event.synchronize()
                         self.step_count += 1
-                    else:
-                        # EP consensus reached. World barrier for global consensus.
+                    elif ep_work == -1:
+                        # All EP peers are PAUSING — consensus reached.
                         await self._world_barrier()
                         self.state = EngineState.PAUSED
                         self.paused.set()
+                    # else: ep_work == 0 — RUNNING peer is idle, no step to
+                    # participate in. Just loop back and check next iteration.
 
                 elif self.state == EngineState.PAUSED:
                     await asyncio.sleep(0.02)
@@ -1837,8 +1864,6 @@ class DynamicInferenceEngine(AbstractEngine):
 
                 elif self.state == EngineState.STOPPING:
                     await self._world_barrier()
-                    self.state = EngineState.STOPPED
-                    self.stopped.set()
                     if self.rank == 0:
                         logging.info("Stopping engine.")
                     break
