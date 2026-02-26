@@ -11,8 +11,8 @@ import warnings
 from collections import deque
 from contextlib import contextmanager
 from dataclasses import dataclass
-from enum import Enum, auto
 from datetime import datetime
+from enum import Enum, auto
 from itertools import repeat
 from typing import Dict, List, Optional, Tuple, Union
 
@@ -1659,7 +1659,8 @@ class DynamicInferenceEngine(AbstractEngine):
 
             elif header == Headers.STOP:
                 assert self.state in (
-                    EngineState.PAUSED, EngineState.SUSPENDED,
+                    EngineState.PAUSED,
+                    EngineState.SUSPENDED,
                 ), f"Received STOP in state {self.state}"
                 if self.state == EngineState.SUSPENDED:
                     self.suspended.clear()
@@ -1697,10 +1698,14 @@ class DynamicInferenceEngine(AbstractEngine):
             else:
                 # Inject synthetic signals to cooperatively drain all engines.
                 if self.state == EngineState.RUNNING:
-                    self._pending_signals.append(msgpack.packb([Headers.PAUSE.value], use_bin_type=True))
+                    self._pending_signals.append(
+                        msgpack.packb([Headers.PAUSE.value], use_bin_type=True)
+                    )
                 if self.state not in (EngineState.STOPPING, EngineState.STOPPED):
                     await self.paused.wait()
-                    self._pending_signals.append(msgpack.packb([Headers.STOP.value], use_bin_type=True))
+                    self._pending_signals.append(
+                        msgpack.packb([Headers.STOP.value], use_bin_type=True)
+                    )
                 await task
 
         self.state = EngineState.STOPPED
