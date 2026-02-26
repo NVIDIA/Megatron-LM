@@ -9,6 +9,10 @@ and proper stream synchronization.
 
 from typing import Dict, List, Optional
 
+from ..compat import ensure_nvshmem_compat
+
+ensure_nvshmem_compat()
+
 try:
     import nvshmem.core
 

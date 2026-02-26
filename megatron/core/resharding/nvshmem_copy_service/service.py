@@ -10,6 +10,10 @@ GPU resource management, and pipelined execution.
 
 from typing import Dict, List, Optional, Tuple
 
+from .compat import ensure_nvshmem_compat
+
+ensure_nvshmem_compat()
+
 try:
     import nvshmem.core
 

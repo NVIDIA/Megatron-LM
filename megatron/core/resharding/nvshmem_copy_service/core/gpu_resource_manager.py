@@ -10,9 +10,14 @@ and event lifecycle.
 import logging
 from typing import Dict, Optional
 
+from ..compat import ensure_nvshmem_compat, get_cuda_core_device_class
+
+ensure_nvshmem_compat()
+
 try:
     import nvshmem.core
-    from cuda.core.experimental import Device
+
+    Device = get_cuda_core_device_class()
 
     HAVE_NVSHMEM = True
 except ImportError:
