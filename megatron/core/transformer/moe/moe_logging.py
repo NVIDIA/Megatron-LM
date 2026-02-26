@@ -161,7 +161,7 @@ class MoEMetricsTracker:
         # Pre-create entries on PP ranks that lack MoE layers.
         # Tensor size must be (num_layers + mtp_num_layers) to match ranks that
         # recorded via record(), otherwise all_reduce across PP will hang.
-        if force_initialize and names_list is not None:
+        if force_initialize:
             if num_layers is None:
                 raise ValueError("num_layers must be provided when force_initialize=True.")
             init_size = num_layers + (mtp_num_layers or 0)
