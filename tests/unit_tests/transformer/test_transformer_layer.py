@@ -341,7 +341,7 @@ class TestTransformerLayerWithHyperConnectionRecompute:
             mhc_sinkhorn_iterations=5,
             mhc_init_gating_factor=0.01,
         )
-        layer_spec = get_gpt_layer_with_transformer_engine_spec()
+        layer_spec = get_gpt_layer_with_transformer_engine_spec(enable_hyper_connection=True)
         layer = HyperConnectionTransformerLayer(config, layer_spec.submodules)
         layer.cuda()
         return layer, config
@@ -462,7 +462,7 @@ class TestTransformerLayerWithHyperConnectionRecompute:
             mhc_sinkhorn_iterations=5,
             mhc_init_gating_factor=0.01,
         )
-        layer_spec = get_gpt_layer_with_transformer_engine_spec()
+        layer_spec = get_gpt_layer_with_transformer_engine_spec(enable_hyper_connection=True)
         layers = [
             HyperConnectionTransformerLayer(config, layer_spec.submodules, layer_number=i + 1).cuda()
             for i in range(num_layers)
@@ -502,3 +502,334 @@ class TestTransformerLayerWithHyperConnectionRecompute:
         assert hidden_states.grad.shape == hidden_states.shape
         # Check that gradient is non-trivial (not all zeros)
         assert hidden_states.grad.abs().sum() > 0
+
+
+class TestMHCWithCudaGraph:
+    """Test HyperConnectionTransformerLayer compatibility with CUDA graphs.
+
+    CUDA graph capture requires static computation graphs and fixed tensor shapes.
+    These tests verify that the mHC layer properly supports the CUDA graph interface
+    defined in GraphableMegatronModule and TransformerLayer.
+    """
+
+    def setup_method(self, method):
+        Utils.initialize_model_parallel(1, 1)
+        model_parallel_cuda_manual_seed(123)
+
+    def teardown_method(self, method):
+        Utils.destroy_model_parallel()
+
+    def _create_mhc_layer(self, hidden_size=64, num_streams=4, **extra_config):
+        config = TransformerConfig(
+            num_layers=2,
+            hidden_size=hidden_size,
+            num_attention_heads=4,
+            use_cpu_initialization=True,
+            enable_hyper_connections=True,
+            num_residual_streams=num_streams,
+            mhc_sinkhorn_iterations=5,
+            mhc_init_gating_factor=0.01,
+            **extra_config,
+        )
+        layer_spec = get_gpt_layer_with_transformer_engine_spec(enable_hyper_connection=True)
+        layer = HyperConnectionTransformerLayer(config, layer_spec.submodules)
+        layer.cuda()
+        return layer, config
+
+    def test_get_layer_static_inputs_shape_for_mhc(self):
+        """get_layer_static_inputs must return [s, b, n*C] for mHC layers.
+
+        CUDA graph capture creates static buffers whose shapes are determined by
+        this method. If the shape is [s, b, C] instead of [s, b, n*C], the graph
+        capture will produce a shape mismatch at the first hyper connection module.
+        """
+        layer, config = self._create_mhc_layer()
+        seq_length = 32
+        micro_batch_size = 2
+
+        static_inputs = layer.get_layer_static_inputs(seq_length, micro_batch_size)
+        hidden_states = static_inputs["hidden_states"]
+
+        expected_hidden_dim = config.num_residual_streams * config.hidden_size
+        assert hidden_states.shape[-1] == expected_hidden_dim, (
+            f"get_layer_static_inputs returns hidden dim {hidden_states.shape[-1]} "
+            f"but mHC expects {expected_hidden_dim} (n={config.num_residual_streams} * "
+            f"C={config.hidden_size}). "
+            f"HyperConnectionTransformerLayer must override get_layer_static_inputs."
+        )
+
+    def test_submodules_under_cudagraphs_includes_hyper_connection(self):
+        """_get_submodules_under_cudagraphs must include hyper connection modules.
+
+        CUDA graph manual hooks are set up for parameters of submodules returned
+        by this method. Missing hyper connection modules means their parameters
+        (mapping_proj, alpha_*, bias) will not get proper pre-forward hooks during
+        graph replay, leading to stale parameter values.
+        """
+        layer, config = self._create_mhc_layer()
+
+        submodules = layer._get_submodules_under_cudagraphs()
+
+        hc_modules_found = any(
+            hasattr(m, 'mapping_proj')
+            for submod in submodules
+            for m in submod.modules()
+        )
+        assert hc_modules_found, (
+            "_get_submodules_under_cudagraphs does not include HyperConnectionModule. "
+            "Parameters like mapping_proj, alpha_pre/post/res will not be updated "
+            "during CUDA graph replay."
+        )
+
+    def test_forward_through_te_cuda_graph_capture_path(self):
+        """_te_cuda_graph_capture must produce correct output shapes for mHC.
+
+        TE CUDA graph capture calls _te_cuda_graph_capture() during warmup.
+        For mHC layers, the input must be n-stream [s, b, n*C] and output must
+        also be [s, b, n*C].
+        """
+        layer, config = self._create_mhc_layer()
+        layer.eval()
+
+        seq_len = 8
+        batch_size = 2
+        n_channels = config.num_residual_streams * config.hidden_size
+
+        hidden_states = torch.randn(seq_len, batch_size, n_channels, device='cuda')
+        attention_mask = torch.ones((1, 1, seq_len, seq_len), dtype=bool, device='cuda')
+
+        with torch.no_grad():
+            outputs = layer._te_cuda_graph_capture(
+                hidden_states=hidden_states,
+                attention_mask=attention_mask,
+            )
+
+        if isinstance(outputs, tuple):
+            output = outputs[0]
+        else:
+            output = outputs
+
+        assert output.shape == (seq_len, batch_size, n_channels), (
+            f"_te_cuda_graph_capture output shape {output.shape} != "
+            f"expected {(seq_len, batch_size, n_channels)}"
+        )
+
+    def test_forward_backward_without_torch_compile(self):
+        """Forward+backward should work when @torch.compile is disabled.
+
+        torch.compile may conflict with CUDA graph capture. This test verifies
+        that the mHC layer works correctly without torch.compile, which is the
+        fallback mode for CUDA graph compatibility.
+        """
+        import megatron.core.transformer.hyper_connection as hc_module
+
+        layer, config = self._create_mhc_layer()
+        layer.train()
+
+        # Unwrap torch.compile by resetting to the original functions
+        for hc in [layer.self_attention_hyper_connection, layer.mlp_hyper_connection]:
+            for attr_name in [
+                '_projection_and_get_norm',
+                '_compute_h',
+                '_apply_h_post',
+                'aggregate',
+                'apply_h_res',
+            ]:
+                attr = getattr(hc, attr_name)
+                if hasattr(attr, '__wrapped__'):
+                    setattr(hc, attr_name, attr.__wrapped__.__get__(hc, type(hc)))
+
+        seq_len = 8
+        batch_size = 2
+        n_channels = config.num_residual_streams * config.hidden_size
+
+        hidden_states = torch.randn(
+            seq_len, batch_size, n_channels, device='cuda', requires_grad=True
+        )
+        attention_mask = torch.ones((1, 1, seq_len, seq_len), dtype=bool, device='cuda')
+
+        output, context = layer(
+            hidden_states=hidden_states, attention_mask=attention_mask
+        )
+
+        assert output.shape == (seq_len, batch_size, n_channels)
+
+        loss = output.sum()
+        loss.backward()
+        assert hidden_states.grad is not None
+
+
+class TestMHCWithOffloading:
+    """Test HyperConnectionTransformerLayer with fine-grained activation offloading.
+
+    Fine-grained activation offloading transfers specific activations (e.g., layernorm
+    inputs) to CPU during forward and reloads them during backward. These tests verify
+    that the mHC layer's multi-stream architecture works correctly with offloading.
+    """
+
+    def setup_method(self, method):
+        Utils.initialize_model_parallel(1, 1)
+        model_parallel_cuda_manual_seed(123)
+
+    def teardown_method(self, method):
+        Utils.destroy_model_parallel()
+
+    def _create_mhc_layer_with_offloading(
+        self, hidden_size=64, num_streams=4, offload_modules=None
+    ):
+        if offload_modules is None:
+            offload_modules = ["attn_norm", "mlp_norm"]
+
+        config = TransformerConfig(
+            num_layers=2,
+            hidden_size=hidden_size,
+            num_attention_heads=4,
+            use_cpu_initialization=True,
+            enable_hyper_connections=True,
+            num_residual_streams=num_streams,
+            mhc_sinkhorn_iterations=5,
+            mhc_init_gating_factor=0.01,
+            fine_grained_activation_offloading=True,
+            offload_modules=offload_modules,
+        )
+        layer_spec = get_gpt_layer_with_transformer_engine_spec(enable_hyper_connection=True)
+        layer = HyperConnectionTransformerLayer(config, layer_spec.submodules)
+        layer.cuda()
+        return layer, config
+
+    def test_offloading_flags_set_correctly(self):
+        """Verify offload_attn_norm and offload_mlp_norm are properly set for mHC."""
+        layer, config = self._create_mhc_layer_with_offloading()
+
+        assert layer.offload_attn_norm, (
+            "offload_attn_norm should be True when fine_grained_activation_offloading=True "
+            "and 'attn_norm' in offload_modules"
+        )
+        assert layer.offload_mlp_norm, (
+            "offload_mlp_norm should be True when fine_grained_activation_offloading=True "
+            "and 'mlp_norm' in offload_modules"
+        )
+
+    def test_forward_backward_with_offloading(self):
+        """Forward+backward should work with activation offloading enabled.
+
+        This exercises the off_interface context manager around layernorms in
+        the mHC forward path, including the group_commit with forced_released_tensors
+        pointing to the n-stream residual tensor.
+        """
+        from megatron.core.pipeline_parallel.fine_grained_activation_offload import (
+            PipelineOffloadManager,
+        )
+
+        layer, config = self._create_mhc_layer_with_offloading()
+        layer.train()
+
+        seq_len = 8
+        batch_size = 2
+        n_channels = config.num_residual_streams * config.hidden_size
+
+        hidden_states = torch.randn(
+            seq_len, batch_size, n_channels, device='cuda', requires_grad=True
+        )
+        attention_mask = torch.ones((1, 1, seq_len, seq_len), dtype=bool, device='cuda')
+
+        mgr = PipelineOffloadManager.get_instance()
+        mgr.init_model_chunk_offload_handler(vp_size=1, vp_stage=0, min_offloaded_tensor_size=0)
+
+        output, context = layer(
+            hidden_states=hidden_states, attention_mask=attention_mask
+        )
+
+        assert output.shape == (seq_len, batch_size, n_channels), (
+            f"Output shape {output.shape} != expected {(seq_len, batch_size, n_channels)}"
+        )
+
+        loss = output.sum()
+        loss.backward()
+
+        assert hidden_states.grad is not None, "Gradients should flow through offloaded path"
+        assert hidden_states.grad.shape == hidden_states.shape
+        assert hidden_states.grad.abs().sum() > 0, "Gradients should be non-trivial"
+
+        PipelineOffloadManager.reset_instance()
+
+    def test_offloading_numerical_equivalence(self):
+        """Offloaded forward+backward must produce the same result as non-offloaded.
+
+        Compares gradients between a layer with offloading disabled vs enabled
+        to ensure the offloading path does not corrupt activations.
+        """
+        from megatron.core.pipeline_parallel.fine_grained_activation_offload import (
+            PipelineOffloadManager,
+        )
+
+        hidden_size = 64
+        num_streams = 4
+        seq_len = 8
+        batch_size = 2
+        n_channels = num_streams * hidden_size
+
+        torch.manual_seed(42)
+        input_data = torch.randn(
+            seq_len, batch_size, n_channels, device='cuda'
+        )
+        attention_mask = torch.ones((1, 1, seq_len, seq_len), dtype=bool, device='cuda')
+
+        # Run without offloading
+        config_no_offload = TransformerConfig(
+            num_layers=2,
+            hidden_size=hidden_size,
+            num_attention_heads=4,
+            use_cpu_initialization=True,
+            enable_hyper_connections=True,
+            num_residual_streams=num_streams,
+            mhc_sinkhorn_iterations=5,
+            mhc_init_gating_factor=0.01,
+        )
+        layer_spec = get_gpt_layer_with_transformer_engine_spec(enable_hyper_connection=True)
+        layer_no_offload = HyperConnectionTransformerLayer(
+            config_no_offload, layer_spec.submodules
+        ).cuda()
+        layer_no_offload.train()
+
+        h1 = input_data.clone().detach().requires_grad_(True)
+        out1, _ = layer_no_offload(hidden_states=h1, attention_mask=attention_mask)
+        out1.sum().backward()
+        grad_no_offload = h1.grad.clone()
+
+        # Run with offloading using the same weights
+        config_offload = TransformerConfig(
+            num_layers=2,
+            hidden_size=hidden_size,
+            num_attention_heads=4,
+            use_cpu_initialization=True,
+            enable_hyper_connections=True,
+            num_residual_streams=num_streams,
+            mhc_sinkhorn_iterations=5,
+            mhc_init_gating_factor=0.01,
+            fine_grained_activation_offloading=True,
+            offload_modules=["attn_norm", "mlp_norm"],
+        )
+        layer_offload = HyperConnectionTransformerLayer(
+            config_offload, layer_spec.submodules
+        ).cuda()
+        # Copy weights from non-offload layer
+        layer_offload.load_state_dict(layer_no_offload.state_dict())
+        layer_offload.train()
+
+        mgr = PipelineOffloadManager.get_instance()
+        mgr.init_model_chunk_offload_handler(vp_size=1, vp_stage=0, min_offloaded_tensor_size=0)
+
+        h2 = input_data.clone().detach().requires_grad_(True)
+        out2, _ = layer_offload(hidden_states=h2, attention_mask=attention_mask)
+        out2.sum().backward()
+        grad_offload = h2.grad.clone()
+
+        PipelineOffloadManager.reset_instance()
+
+        assert torch.allclose(out1.detach(), out2.detach(), atol=1e-5), (
+            f"Forward outputs differ: max diff = {(out1 - out2).abs().max().item()}"
+        )
+        assert torch.allclose(grad_no_offload, grad_offload, atol=1e-5), (
+            f"Gradients differ: max diff = {(grad_no_offload - grad_offload).abs().max().item()}"
+        )

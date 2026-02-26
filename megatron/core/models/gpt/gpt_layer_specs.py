@@ -184,6 +184,7 @@ def get_gpt_layer_with_transformer_engine_spec(
     fallback_to_eager_attn: bool = False,
     use_kitchen_attention: bool = False,
     kitchen_attention_backend: str = "sdpa",
+    enable_hyper_connection: bool = False,
 ) -> ModuleSpec:
     """Use this spec to use lower-level Transformer Engine modules (required for fp8 training).
 
@@ -199,6 +200,8 @@ def get_gpt_layer_with_transformer_engine_spec(
         qk_l2_norm (bool, optional): To use l2 norm for queries/keys. Defaults to False.
         use_te_op_fuser (bool, optional): Use Transformer Engine's operation-based API, which may
                                           enable certain operation fusions. Defaults to False.
+        enable_hyper_connection (bool): Use HyperConnectionTransformerLayer with
+            HyperConnectionModule instead of plain TransformerLayer. Defaults to False.
 
     Returns:
         ModuleSpec: Module specification with TE modules
@@ -233,6 +236,9 @@ def get_gpt_layer_with_transformer_engine_spec(
         use_te_activation_func=use_te_activation_func,
     )
 
+    layer_module = HyperConnectionTransformerLayer if enable_hyper_connection else TransformerLayer
+    hc_module = HyperConnectionModule if enable_hyper_connection else IdentityOp
+
     if multi_latent_attention:
         assert qk_l2_norm is False, "qk_l2_norm is not supported with MLA."
         linear_q_up_proj = (
@@ -246,7 +252,7 @@ def get_gpt_layer_with_transformer_engine_spec(
             else backend.column_parallel_linear()
         )
         return ModuleSpec(
-            module=HyperConnectionTransformerLayer,
+            module=layer_module,
             submodules=TransformerLayerSubmodules(
                 input_layernorm=backend.layer_norm(),
                 self_attention=ModuleSpec(
@@ -265,17 +271,17 @@ def get_gpt_layer_with_transformer_engine_spec(
                     ),
                 ),
                 self_attn_bda=get_bias_dropout_add,
-                self_attention_hyper_connection=HyperConnectionModule,
+                self_attention_hyper_connection=hc_module,
                 pre_mlp_layernorm=backend.layer_norm() if num_experts else IdentityOp,
                 mlp=mlp,
                 mlp_bda=get_bias_dropout_add,
-                mlp_hyper_connection=HyperConnectionModule,
+                mlp_hyper_connection=hc_module,
             ),
         )
     else:
         qk_norm = backend.layer_norm(for_qk=True)
         return ModuleSpec(
-            module=HyperConnectionTransformerLayer,
+            module=layer_module,
             submodules=TransformerLayerSubmodules(
                 self_attention=ModuleSpec(
                     module=SelfAttention,
@@ -293,11 +299,11 @@ def get_gpt_layer_with_transformer_engine_spec(
                     ),
                 ),
                 self_attn_bda=get_bias_dropout_add,
-                self_attention_hyper_connection=HyperConnectionModule,
+                self_attention_hyper_connection=hc_module,
                 pre_mlp_layernorm=backend.layer_norm() if num_experts else IdentityOp,
                 mlp=mlp,
                 mlp_bda=get_bias_dropout_add,
-                mlp_hyper_connection=HyperConnectionModule,
+                mlp_hyper_connection=hc_module,
                 sharded_state_dict_keys_map={
                     "mlp.0.weight": "mlp.linear_fc1.layer_norm_weight",
                     "mlp.0.bias": "mlp.linear_fc1.layer_norm_bias",
@@ -322,6 +328,7 @@ def get_gpt_layer_local_spec(
     use_kitchen: bool = False,
     use_kitchen_attention: bool = False,
     kitchen_attention_backend: str = "sdpa",
+    enable_hyper_connection: bool = False,
 ) -> ModuleSpec:
     """Use this spec for an implementation using only modules in Megatron-Core.
 
@@ -335,6 +342,8 @@ def get_gpt_layer_local_spec(
         moe_use_legacy_grouped_gemm (bool, optional): Force use the legacy GroupedMLP.
                                                       Defaults to False.
         qk_l2_norm (bool, optional): To use l2 norm for queries/keys. Defaults to False.
+        enable_hyper_connection (bool): Use HyperConnectionTransformerLayer with
+            HyperConnectionModule instead of plain TransformerLayer. Defaults to False.
 
     Returns:
         ModuleSpec: Module specification with Megatron-Core modules
@@ -370,10 +379,13 @@ def get_gpt_layer_local_spec(
         moe_use_legacy_grouped_gemm=moe_use_legacy_grouped_gemm,
     )
 
+    layer_module = HyperConnectionTransformerLayer if enable_hyper_connection else TransformerLayer
+    hc_module = HyperConnectionModule if enable_hyper_connection else IdentityOp
+
     if multi_latent_attention:
         assert qk_l2_norm is False, "qk_l2_norm is not supported with MLA."
         return ModuleSpec(
-            module=HyperConnectionTransformerLayer,
+            module=layer_module,
             submodules=TransformerLayerSubmodules(
                 input_layernorm=layer_norm,
                 self_attention=ModuleSpec(
@@ -392,16 +404,16 @@ def get_gpt_layer_local_spec(
                     ),
                 ),
                 self_attn_bda=get_bias_dropout_add,
-                self_attention_hyper_connection=HyperConnectionModule,
+                self_attention_hyper_connection=hc_module,
                 pre_mlp_layernorm=layer_norm,
                 mlp=mlp,
                 mlp_bda=get_bias_dropout_add,
-                mlp_hyper_connection=HyperConnectionModule,
+                mlp_hyper_connection=hc_module,
             ),
         )
     else:
         return ModuleSpec(
-            module=HyperConnectionTransformerLayer,
+            module=layer_module,
             submodules=TransformerLayerSubmodules(
                 input_layernorm=layer_norm,
                 self_attention=ModuleSpec(
@@ -420,11 +432,11 @@ def get_gpt_layer_local_spec(
                     ),
                 ),
                 self_attn_bda=get_bias_dropout_add,
-                self_attention_hyper_connection=HyperConnectionModule,
+                self_attention_hyper_connection=hc_module,
                 pre_mlp_layernorm=layer_norm,
                 mlp=mlp,
                 mlp_bda=get_bias_dropout_add,
-                mlp_hyper_connection=HyperConnectionModule,
+                mlp_hyper_connection=hc_module,
                 sharded_state_dict_keys_map={
                     "input_layernorm.": "self_attention.linear_qkv.layer_norm_",
                     "pre_mlp_layernorm.": "mlp.linear_fc1.layer_norm_",
@@ -547,6 +559,7 @@ def get_gpt_decoder_layer_specs(
             qk_l2_norm=qk_l2_norm,
             use_kitchen=config.use_kitchen,
             use_te_activation_func=config.use_te_activation_func,
+            enable_hyper_connection=config.enable_hyper_connections,
         )
         moe_layer_spec = get_gpt_layer_with_transformer_engine_spec(
             num_experts=config.num_moe_experts,
@@ -557,6 +570,7 @@ def get_gpt_decoder_layer_specs(
             qk_l2_norm=qk_l2_norm,
             use_kitchen=config.use_kitchen,
             use_te_activation_func=config.use_te_activation_func,
+            enable_hyper_connection=config.enable_hyper_connections,
         )
     else:
         dense_layer_spec = get_gpt_layer_local_spec(
@@ -568,6 +582,7 @@ def get_gpt_decoder_layer_specs(
             normalization=normalization,
             qk_l2_norm=qk_l2_norm,
             use_kitchen=config.use_kitchen,
+            enable_hyper_connection=config.enable_hyper_connections,
         )
         moe_layer_spec = get_gpt_layer_local_spec(
             num_experts=config.num_moe_experts,
@@ -578,6 +593,7 @@ def get_gpt_decoder_layer_specs(
             normalization=normalization,
             qk_l2_norm=qk_l2_norm,
             use_kitchen=config.use_kitchen,
+            enable_hyper_connection=config.enable_hyper_connections,
         )
 
     # Parse config.moe_layer_freq to determine the pattern of expert/dense layers.
