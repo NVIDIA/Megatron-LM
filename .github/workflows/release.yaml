@@ -49,6 +49,21 @@ on:
         required: false
         type: string
         default: ""
+      skip-wheel-build:
+        description: Skip building the wheel
+        required: false
+        type: boolean
+        default: false
+      skip-version-bump:
+        description: Skip version bump
+        required: false
+        type: boolean
+        default: false
+      release-version:
+        description: Version to release
+        required: false
+        type: string
+        default: ""
 
 permissions:
   contents: write # To read repository content
@@ -65,6 +80,9 @@ jobs:
       gh-release-use-changelog-builder: ${{ inputs.generate-changelog }}
       publish-docs: ${{ inputs.publish-docs }}
       gh-release-from-tag: ${{ inputs.gh-release-from-tag }}
+      skip-wheel-build: ${{ inputs.skip-wheel-build }}
+      skip-version-bump: ${{ inputs.skip-version-bump }}
+      release-version: ${{ inputs.release-version }}
     secrets:
       TWINE_PASSWORD: ${{ (github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/heads/r')) && secrets.SVC_PYPI_TOKEN || secrets.SVC_PYPI_TEST_TOKEN }}
       SLACK_WEBHOOK: ${{ (github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/heads/r')) && secrets.SLACK_MAIN_CHANNEL_WEBHOOK || secrets.SLACK_CI_CHANNEL_WEBHOOK }}

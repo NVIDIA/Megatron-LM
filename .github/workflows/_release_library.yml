@@ -58,6 +58,21 @@ on:
         description: Publish documentation to S3 after release
         type: boolean
         default: true
+      skip-wheel-build:
+        required: false
+        description: Skip building the wheel
+        type: boolean
+        default: false
+      skip-version-bump:
+        required: false
+        description: Skip version bump
+        type: boolean
+        default: false
+      release-version:
+        required: false
+        description: Version to release
+        type: string
+        default: ""
     secrets:
       TWINE_PASSWORD:
         required: true
@@ -88,6 +103,7 @@ permissions:
 
 jobs:
   build-test-publish-wheels-dry-run:
+    if: inputs.skip-wheel-build == false
     uses: ./.github/workflows/_build_test_publish_wheel.yml
     with:
       dry-run: true
@@ -103,7 +119,7 @@ jobs:
       (
         success() || !failure()
       )
-      && !cancelled()
+      && !cancelled() && inputs.skip-version-bump == false
     outputs:
       release-version: ${{ steps.bump-version-mcore.outputs.release-version }}
     env:
@@ -341,6 +357,7 @@ jobs:
 
   build-test-publish-wheels:
     needs: [bump-next-version]
+    if: inputs.skip-wheel-build == false
     uses: ./.github/workflows/_build_test_publish_wheel.yml
     with:
       dry-run: false
@@ -363,7 +380,7 @@ jobs:
     env:
       REPOSITORY: ${{ github.repository }}
       PROJECT_NAME: Megatron Core
-      VERSION: ${{ needs.bump-next-version.outputs.release-version }}
+      VERSION: ${{ needs.bump-next-version.outputs.release-version || inputs.release-version }}
       TAG_PREFIX: ${{ inputs.gh-release-tag-prefix || '' }}
     steps:
       - name: Checkout repository
@@ -484,35 +501,35 @@ jobs:
     with:
       dry-run: ${{ inputs.dry-run }}
       publish-as-latest: true
-      docs-version-override: ${{ needs.bump-next-version.outputs.release-version }}
+      docs-version-override: ${{ needs.bump-next-version.outputs.release-version || inputs.release-version }}
       build-docs-ref: ${{ inputs.release-ref }}
     secrets: inherit
 
-  notify:
-    needs: [build-test-publish-wheels, create-gh-release]
-    runs-on: ubuntu-latest
-    env:
-      GH_URL: https://github.com/${{ github.repository }}/releases/tag/v${{ needs.build-test-publish-wheels.outputs.version }}
-      PYPI_URL: https://${{ inputs.dry-run == true && 'test.' || '' }}pypi.org/project/${{ needs.build-test-publish-wheels.outputs.pypi-name }}/${{ needs.build-test-publish-wheels.outputs.version }}/
-      PROJECT_NAME: Megatron Core
-      VERSION: ${{ needs.build-test-publish-wheels.outputs.version }}
-    steps:
-      - name: Checkout
-        uses: actions/checkout@v4
-        with:
-          repository: NVIDIA-NeMo/FW-CI-templates
-          ref: v0.17.0
-          path: send-slack-alert
+  # notify:
+  #   needs: [build-test-publish-wheels, create-gh-release]
+  #   runs-on: ubuntu-latest
+  #   env:
+  #     GH_URL: https://github.com/${{ github.repository }}/releases/tag/v${{ needs.build-test-publish-wheels.outputs.version }}
+  #     PYPI_URL: https://${{ inputs.dry-run == true && 'test.' || '' }}pypi.org/project/${{ needs.build-test-publish-wheels.outputs.pypi-name }}/${{ needs.build-test-publish-wheels.outputs.version }}/
+  #     PROJECT_NAME: Megatron Core
+  #     VERSION: ${{ needs.build-test-publish-wheels.outputs.version }}
+  #   steps:
+  #     - name: Checkout
+  #       uses: actions/checkout@v4
+  #       with:
+  #         repository: NVIDIA-NeMo/FW-CI-templates
+  #         ref: v0.17.0
+  #         path: send-slack-alert
 
-      - name: Send Slack alert
-        uses: ./send-slack-alert/.github/actions/send-slack-alert
-        env:
-          MESSAGE: |
-            ${{ inputs.dry-run == true && 'This is a dry-run, nothing actually happened: ' || '' }}We have released `${{ env.VERSION }}` of `NVIDIA ${{ env.PROJECT_NAME }}` 🚀✨🎉
+  #     - name: Send Slack alert
+  #       uses: ./send-slack-alert/.github/actions/send-slack-alert
+  #       env:
+  #         MESSAGE: |
+  #           ${{ inputs.dry-run == true && 'This is a dry-run, nothing actually happened: ' || '' }}We have released `${{ env.VERSION }}` of `NVIDIA ${{ env.PROJECT_NAME }}` 🚀✨🎉
 
-            • <${{ env.GH_URL }}|GitHub release>
-            • <${{ env.PYPI_URL }}|PyPi release>
+  #           • <${{ env.GH_URL }}|GitHub release>
+  #           • <${{ env.PYPI_URL }}|PyPi release>
 
-        with:
-          message: ${{ env.MESSAGE }}
-          webhook: ${{ secrets.SLACK_WEBHOOK }}
+  #       with:
+  #         message: ${{ env.MESSAGE }}
+  #         webhook: ${{ secrets.SLACK_WEBHOOK }}
