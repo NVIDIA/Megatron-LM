@@ -23,7 +23,7 @@ except ImportError:
 
 from .barrier import symm_mem_sync
 from .multimem_asm import ld_128, st_128
-from .utils import get_flat_tid, sync_threads
+from .utils import get_flat_tid, are_tensors_nvls_eligible, sync_threads
 
 # ── Triton kernels ─────────────────────────────────────────────────────────
 
@@ -202,8 +202,10 @@ def multimem_all_gather(
     Input tensor can be a regular torch tensor.
     """
     assert HAVE_TRITON, "Triton is required for multimem all-gather."
-    for x in [input_tensor, output_tensor]:
-        assert x.element_size() * x.numel() % 16 == 0, "Tensor size must be a multiple of 16 bytes for NVLS."
+    assert are_tensors_nvls_eligible(input_tensor), "Input tensor must be 16-byte divisible on Hopper+ for NVLS."
+    assert output_tensor.numel() % input_tensor.numel() == 0 and \
+        output_tensor.numel() // input_tensor.numel() == symm_mem_hdl.world_size, \
+        "Output numel must be exactly world_size * input numel for all-gather."
 
     numel_per_thread, num_blocks, config = _kernel_launch_config(
         input_tensor.element_size(), output_tensor.numel(), symm_mem_hdl.world_size, **kwargs,
@@ -238,9 +240,12 @@ def multimem_all_gather_fused(
     All tensors must share the same symmetric memory handle.
     """
     assert HAVE_TRITON, "Triton is required for multimem all-gather."
-
-    for x in [input_0, input_1, input_2, output_0, output_1, output_2]:
-        assert x.element_size() * x.numel() % 16 == 0, "Tensor size must be a multiple of 16 bytes for NVLS."
+    assert are_tensors_nvls_eligible(input_0, input_1, input_2), \
+        "All input tensors must be 16-byte divisible on Hopper+ for NVLS."
+    for inp, out in [(input_0, output_0), (input_1, output_1), (input_2, output_2)]:
+        assert out.numel() % inp.numel() == 0 and \
+            out.numel() // inp.numel() == symm_mem_hdl.world_size, \
+            "Output numel must be exactly world_size * input numel for all-gather."
 
     max_numel = max(output_0.numel(), output_1.numel(), output_2.numel())
 
@@ -276,8 +281,10 @@ def multimem_reduce_scatter(
     assert HAVE_TRITON, "Triton is required for multimem reduce-scatter."
     assert input_tensor.dtype == torch.bfloat16, "Only bfloat16 is supported for now."
     assert output_tensor.dtype == torch.bfloat16, "Only bfloat16 is supported for now."
-    for x in [input_tensor, output_tensor]:
-        assert x.element_size() * x.numel() % 16 == 0, "Tensor size must be a multiple of 16 bytes for NVLS."
+    assert are_tensors_nvls_eligible(output_tensor), "Output tensor must be 16-byte divisible on Hopper+ for NVLS."
+    assert input_tensor.numel() % output_tensor.numel() == 0 and \
+        input_tensor.numel() // output_tensor.numel() == symm_mem_hdl.world_size, \
+        "Input numel must be exactly world_size * output numel for reduce-scatter."
 
     numel_per_thread, num_blocks, config = _kernel_launch_config(
         output_tensor.element_size(), input_tensor.numel(), symm_mem_hdl.world_size, **kwargs,

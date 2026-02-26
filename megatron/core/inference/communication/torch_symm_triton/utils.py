@@ -2,6 +2,7 @@
 
 # Adapted from: https://github.com/meta-pytorch/kraken.git
 
+import torch
 from unittest.mock import MagicMock
 
 from megatron.core.utils import null_decorator
@@ -13,6 +14,28 @@ except ImportError:
     triton = MagicMock()
     tl = MagicMock()
     triton.jit = null_decorator
+
+
+
+def is_device_nvls_capable(device: torch.device) -> bool:
+    """Check if the device supports NVLS (multicast) collectives. Requires CUDA Hopper+ (SM >= 9)."""
+    return device.type == "cuda" and torch.cuda.get_device_properties(device).major >= 9
+
+
+def are_tensors_nvls_eligible(*tensors: torch.Tensor) -> bool:
+    """Check if tensors are eligible for NVLS (multicast) collectives.
+
+    Requirements:
+    - Hopper+ GPU (SM >= 9)
+    - All tensor byte sizes are divisible by 16 (128-bit), since NVLS
+      kernels process data in 128-bit chunks.
+    """
+    if not tensors:
+        return False
+    return is_device_nvls_capable(tensors[0].device) and all(
+        t.element_size() * t.numel() % 16 == 0 for t in tensors
+    )
+
 
 
 @triton.jit

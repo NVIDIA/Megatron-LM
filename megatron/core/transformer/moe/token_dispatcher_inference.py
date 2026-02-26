@@ -10,7 +10,6 @@ Supports latency-optimized NVLS collectives (multimem all-gather/reduce-scatter)
 on Hopper+ GPUs with BF16, with automatic fallback to NCCL via superclass methods.
 """
 
-from megatron.core.tensor_parallel.mappings import reduce_scatter_to_sequence_parallel_region
 import torch
 from typing import List, Optional
 
@@ -23,11 +22,10 @@ from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.tensor_parallel import gather_from_sequence_parallel_region, reduce_scatter_to_sequence_parallel_region
 from megatron.core.parallel_state import get_global_symmetric_memory_buffer_ep
 from megatron.core.inference.communication.torch_symm_triton import (
+    are_tensors_nvls_eligible,
     multimem_all_gather_fused,
     multimem_reduce_scatter,
 )
-
-import logging
 
 class InferenceAllGatherTokenDispatcher(MoEAllGatherTokenDispatcher):
     """
@@ -67,15 +65,6 @@ class InferenceAllGatherTokenDispatcher(MoEAllGatherTokenDispatcher):
         self.topk = config.moe_router_topk
 
         self.triton_nvls_kernels_allowed = not self.config.inference_disable_triton_nvls_kernels
-
-    def _check_nvls_eligibility(self, x: torch.Tensor) -> bool:
-        """
-        Check if we can use NVLS (latency-optimized) collectives.
-        Requirements: BF16 dtype, Hopper+ GPU (SM >= 9).
-        """
-        is_hopper_or_newer = torch.cuda.get_device_properties(x.device).major >= 9
-        num_bytes = x.element_size() * x.numel()
-        return self.triton_nvls_kernels_allowed and is_hopper_or_newer and num_bytes % 16 == 0
 
     def _maybe_allocate_ag_buffers(
         self,
@@ -142,13 +131,15 @@ class InferenceAllGatherTokenDispatcher(MoEAllGatherTokenDispatcher):
         if self.ep_size == 1:
             return hidden_states, probs
         
-        # Check NVLS eligibility
-        nvls_eligible = self._check_nvls_eligibility(hidden_states) and self._check_nvls_eligibility(probs) and self._check_nvls_eligibility(self.routing_map)
+        # 1. Check inputs only: if inputs are 16-byte divisible, outputs (world_size * input) are too.
+        nvls_eligible = self.triton_nvls_kernels_allowed and are_tensors_nvls_eligible(hidden_states, probs, self.routing_map)
         ag_buffers = None
 
         if nvls_eligible:
+            # 2. Now attempt to allocate symmetric memory buffers for all-gather outputs. If allocation fails, fallback to NCCL.
             ag_buffers = self._maybe_allocate_ag_buffers(self.routing_map, probs, hidden_states)
 
+        # 3. Can use NVLS if eligible and buffers allocated successfully (handle is not None)
         can_use_nvls = nvls_eligible and ag_buffers["handle"] is not None
 
         if can_use_nvls:
@@ -164,7 +155,7 @@ class InferenceAllGatherTokenDispatcher(MoEAllGatherTokenDispatcher):
 
             # Fused NVLS all-gather: single kernel launch + single barrier for all 3 tensors
             multimem_all_gather_fused(
-                ag_buffers["routing_map"].view(torch.bfloat16),
+                ag_buffers["routing_map"].view(torch.bfloat16), # .view does not change the underlying data
                 self.routing_map.view(torch.bfloat16),
                 ag_buffers["routing_map_offset"],
                 ag_buffers["probs"].view(torch.bfloat16),
@@ -216,8 +207,16 @@ class InferenceAllGatherTokenDispatcher(MoEAllGatherTokenDispatcher):
         if self.ep_size == 1:
             return hidden_states
 
-        # Check NVLS eligibility and try to allocate symmetric memory
-        nvls_eligible = self._check_nvls_eligibility(hidden_states)
+        # Compute output shape first — check NVLS eligibility on the output,
+        # since if the smaller output is 16-byte divisible, the input is too.
+        output_shape = list(hidden_states.size())
+        output_shape[0] = hidden_states.size(0) // self.ep_size
+        output = torch.empty(
+            output_shape, dtype=hidden_states.dtype, device=hidden_states.device
+        )
+
+        # Check output only: if output is 16-byte divisible, input (world_size * output) is too.
+        nvls_eligible = self.triton_nvls_kernels_allowed and are_tensors_nvls_eligible(output)
         rs_buffer = None
 
         if nvls_eligible:
@@ -228,13 +227,6 @@ class InferenceAllGatherTokenDispatcher(MoEAllGatherTokenDispatcher):
         if can_use_nvls:
             # Copy input to symmetric memory for reduce-scatter
             rs_buffer["tensor"].copy_(hidden_states)
-
-            # Allocate output tensor
-            output_shape = list(hidden_states.size())
-            output_shape[0] = hidden_states.size(0) // self.ep_size
-            output = torch.empty(
-                output_shape, dtype=hidden_states.dtype, device=hidden_states.device
-            )
 
             # Use latency-optimized NVLS reduce-scatter
             multimem_reduce_scatter(output, rs_buffer["tensor"], rs_buffer["handle"])
