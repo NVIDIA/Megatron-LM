@@ -160,6 +160,10 @@ class TransformerConfig(ModelParallelConfig):
     """If set to True, the LayerNorm is adjusted to center the gamma values around 0. This improves
     numerical stability."""
 
+    gdn_out_norm_zero_centered_gamma: bool = False
+    """Override zero_centered_gamma for GatedDeltaNet out_norm. When False (default), GDN out_norm
+    uses direct-scale weights regardless of the global layernorm_zero_centered_gamma setting."""
+
     add_bias_linear: bool = field(
         default=True, metadata={"argparse_meta": {"arg_names": ["--disable-bias-linear"]}}
     )

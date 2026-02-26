@@ -63,9 +63,12 @@ def get_gated_delta_net_module_spec(
 
     rms_norm = config.normalization == "RMSNorm"
     out_norm_cls = backend.layer_norm(rms_norm=rms_norm, for_qk=False)
-    # GDN's out_norm uses direct-scale (1-centered) weights, not zero-centered gamma.
-    # Override to prevent bf16 round-trip errors during weight sync.
-    out_norm_spec = ModuleSpec(module=out_norm_cls, params={"zero_centered_gamma": False})
+    # GDN's out_norm may use direct-scale (1-centered) weights instead of zero-centered gamma.
+    # Controlled by config.gdn_out_norm_zero_centered_gamma (default False).
+    out_norm_spec = ModuleSpec(
+        module=out_norm_cls,
+        params={"zero_centered_gamma": config.gdn_out_norm_zero_centered_gamma},
+    )
     attention = ModuleSpec(
         module=GatedDeltaNet,
         submodules=GatedDeltaNetSubmodules(
