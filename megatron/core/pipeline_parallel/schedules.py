@@ -399,7 +399,12 @@ def forward_step(
         Tensor or list[Tensor]: The output object(s) from the forward step.
         Tensor: The number of tokens.
     """
+    from megatron.core.tensor_tracer import get_tt_flags
     from megatron.core.transformer.multi_token_prediction import MTPLossAutoScaler
+
+    tt_flags = get_tt_flags()
+    if tt_flags is not None:
+        tt_flags.should_trace = True
 
     if config.timers is not None:
         config.timers('forward-compute', log_level=2).start()
@@ -440,6 +445,9 @@ def forward_step(
         cp_group_size,
         is_last_stage,
     )
+
+    if tt_flags is not None:
+        tt_flags.should_trace = False
 
     if unwrap_output_tensor:
         return output_tensor, num_tokens

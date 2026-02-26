@@ -13,6 +13,7 @@ from megatron.core.jit import disable_jit_fuser
 from megatron.core.num_microbatches_calculator import init_num_microbatches_calculator, unset_num_microbatches_calculator
 from megatron.training.dist_signal_handler import DistributedSignalHandler
 from megatron.training.tokenizer import build_tokenizer
+from megatron.core.tensor_tracer import _set_tensor_tracers, _set_tt_flags, _set_compressor
 
 _GLOBAL_ARGS = None
 _GLOBAL_TOKENIZER = None
@@ -116,6 +117,10 @@ def set_global_variables(args, build_tokenizer=True):
     if args.disable_jit_fuser:
         disable_jit_fuser()
 
+    if args.tensor_tracer_port is not None:
+        _set_tensor_tracers()
+        _set_tt_flags(args)
+        _set_compressor()
 
 def unset_global_variables():
     """Unset global vars.

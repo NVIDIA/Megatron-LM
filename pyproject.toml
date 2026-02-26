@@ -66,6 +66,8 @@ Homepage = "https://github.com/NVIDIA/Megatron-LM/megatron/core"
 [project.optional-dependencies]
 mlm = ["flask-restful", "sentencepiece", "tiktoken", "wandb", "transformers"]
 
+tensor_tracer = ["websockets>=10.0"]
+
 dev = [
     "nvidia-modelopt[torch]; sys_platform != 'darwin'",
     "transformer-engine[pytorch,core_cu13]>=2.9.0a0,<2.12.0",
