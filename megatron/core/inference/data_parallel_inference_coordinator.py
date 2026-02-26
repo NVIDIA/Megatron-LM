@@ -280,7 +280,7 @@ class DataParallelInferenceCoordinator:
                     use_bin_type=True,
                 )
                 # Account for the fact that some engines may have died.
-                for _ in range(max(len(self.identities_of_data_parallel_ranks), 1)):
+                for _ in range(len(self.identities_of_data_parallel_ranks)):
                     next_identity = self.get_next_data_parallel_rank()
                     if self._send_to_engine(next_identity, payload):
                         break

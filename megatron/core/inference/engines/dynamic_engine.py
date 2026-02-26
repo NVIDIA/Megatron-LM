@@ -1702,10 +1702,19 @@ class DynamicInferenceEngine(AbstractEngine):
                         msgpack.packb([Headers.PAUSE.value], use_bin_type=True)
                     )
                 if self.state not in (EngineState.STOPPING, EngineState.STOPPED):
-                    await self.paused.wait()
-                    self._pending_signals.append(
-                        msgpack.packb([Headers.STOP.value], use_bin_type=True)
-                    )
+                    # It is insufficient to wait for `paused.wait()`, because that may
+                    # trigger inside RESUMING or SUSPENDING, which cannot transition to STOPPED.
+                    while self.state not in (
+                        EngineState.PAUSED,
+                        EngineState.SUSPENDED,
+                        EngineState.STOPPING,
+                        EngineState.STOPPED,
+                    ):
+                        await asyncio.sleep(0.01)
+                    if self.state in (EngineState.PAUSED, EngineState.SUSPENDED):
+                        self._pending_signals.append(
+                            msgpack.packb([Headers.STOP.value], use_bin_type=True)
+                        )
                 await task
 
         self.state = EngineState.STOPPED
