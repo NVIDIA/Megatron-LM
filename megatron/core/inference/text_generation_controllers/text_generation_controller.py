@@ -25,7 +25,7 @@ from megatron.core.inference.model_inference_wrappers.abstract_model_inference_w
     AbstractModelInferenceWrapper,
 )
 from megatron.core.inference.sampling_params import SamplingParams
-from megatron.core.inference.utils import get_attention_mask, set_decode_expert_padding, set_is_inference_cuda_graphed_iteration_for_ep_inference
+from megatron.core.inference.utils import get_attention_mask, set_decode_expert_padding
 from megatron.core.models.multimodal.llava_model import LLaVAModel
 from megatron.core.tensor_parallel.mappings import gather_from_sequence_parallel_region
 from megatron.core.transformer.enums import CudaGraphScope
@@ -542,9 +542,6 @@ class TextGenerationController:
                 set_decode_expert_padding(unwrapped_model, True, capacity_factor=capacity_factor)
             else:
                 set_decode_expert_padding(unwrapped_model, False)
-
-        if is_inference_optimized and model_config.expert_model_parallel_size > 1:
-            set_is_inference_cuda_graphed_iteration_for_ep_inference(unwrapped_model, context.using_cuda_graph_this_step())
 
         # initialize symmetric memory if needed
         if model_config.transformer_impl == "inference_optimized":
