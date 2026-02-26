@@ -505,6 +505,9 @@ class PersistentAsyncCaller(AsyncCaller):
                 logger.debug(f"{rank} has completed saving {item.call_idx}")
                 comp_q.put(item.call_idx)
                 queue.task_done()
+                del async_fn_args
+            del item
+            gc.collect()
 
         logger.debug(f"PersistentAsyncCaller: persistent ckpt worker for {rank}  has terminated")
 
