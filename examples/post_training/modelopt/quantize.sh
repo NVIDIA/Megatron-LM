@@ -16,7 +16,7 @@ MLM_DEFAULT_ARGS="
 QUANT_CFG=$2
 
 if [ -z ${QUANT_CFG} ]; then
-    QUANT_CFG=fp8
+    QUANT_CFG='FP8_DEFAULT_CFG'
     printf "${MLM_WARNING} Variable ${PURPLE}QUANT_CFG${WHITE} is not set (default: ${QUANT_CFG})!\n"
 fi
 
@@ -32,6 +32,7 @@ if [ -z ${MLM_MODEL_CKPT} ]; then
         --expert-tensor-parallel-size ${ETP} \
         --expert-model-parallel-size ${EP} \
         --pipeline-model-parallel-size ${PP} \
+        --context-parallel-size ${CP} \
         --tokenizer-model ${TOKENIZER_MODEL} \
         --pretrained-model-path ${HF_MODEL_CKPT} \
         --save ${MLM_MODEL_SAVE} \
@@ -45,6 +46,7 @@ else
         --expert-tensor-parallel-size ${ETP} \
         --expert-model-parallel-size ${EP} \
         --pipeline-model-parallel-size ${PP} \
+        --context-parallel-size ${CP} \
         --tokenizer-model ${TOKENIZER_MODEL} \
         --load ${MLM_MODEL_CKPT} \
         --save ${MLM_MODEL_SAVE} \
