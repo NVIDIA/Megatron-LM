@@ -39,34 +39,25 @@ def resolve_cluster_config(cluster: str) -> str:
 
 def flatten_products(workload_manifest: dotdict) -> dotdict:
     """Flattens a nested dict of products"""
-    expanded_products = []
+    flattened_products = []
+    products = workload_manifest.products or []
 
-    for product in workload_manifest.products or []:
-        # Skip products that don't have nested product specifications
+    for product in products:
         if "products" not in product:
             continue
 
         test_case = product["test_case"][0]
+        for param_dict in product["products"]:
+            # Generate all combinations of parameter values
+            param_combinations = itertools.product(*param_dict.values())
 
-        # Iterate over each input specification in the product
-        for inp in product["products"]:
-            # Generate all combinations of the input values (Cartesian product)
-            model_config = inp.pop("model_config", None)
-            runtime_config = inp.pop("runtime_config", None)
-            keys = inp.keys()
-            value_combinations = itertools.product(*inp.values())
+            for value_combination in param_combinations:
+                # Map parameter names to their values
+                flattened = dict(zip(param_dict.keys(), value_combination))
+                flattened["test_case"] = test_case
+                flattened_products.append(flattened)
 
-            # Create a flattened product dict for each combination
-            for values in value_combinations:
-                product_dict = dict(zip(keys, values))
-                product_dict["test_case"] = test_case
-                if model_config:
-                    product_dict["model_config"] = model_config
-                if runtime_config:
-                    product_dict["runtime_config"] = runtime_config
-                expanded_products.append(product_dict)
-
-    workload_manifest.products = expanded_products
+    workload_manifest.products = flattened_products
     return workload_manifest
 
 
@@ -248,14 +239,13 @@ def load_workloads(
 
     workloads: List[dotdict] = []
     build_workloads: List = []
-    for file in list(recipes_dir.glob("*.yaml")) + list(local_dir.glob("*.yaml")):
+    for file in list(recipes_dir.glob("**/*.yaml")) + list(local_dir.glob("**/*.yaml")):
         workloads += load_and_flatten(config_path=str(file))
         if file.stem.startswith("_build"):
             build_workloads.append(load_config(config_path=str(file)))
 
     if scope:
         workloads = filter_by_scope(workload_manifests=workloads, scope=scope)
-
     if workloads and environment:
         workloads = filter_by_environment(workload_manifests=workloads, environment=environment)
 

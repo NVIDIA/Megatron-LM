@@ -117,10 +117,6 @@ class SFTDataset(MegatronDataset):
             tokens_list = tokens.tolist()
             targets_list = targets.tolist()
 
-            # Add EOD, unless it's already present
-            if tokens_list[-1] != eod:
-                tokens_list.append(eod)
-                targets_list.append(eod)
 
             pack_tokens.extend(tokens_list)
             pack_targets.extend(targets_list)
@@ -142,19 +138,12 @@ class SFTDataset(MegatronDataset):
 
             # Handle any necessary truncation
             if len(pack_tokens) >= pack_length + 1:  # +1 here to account for later alignment
-                truncate_left_not_right = True  # TODO(duncan): plumb this switch in
-                if truncate_left_not_right:  # Retain existing eod
-                    max_body = pack_length
-                    pack_tokens = pack_tokens[-max_body:]
-                    pack_targets = pack_targets[-max_body:]
-                    pack_tokens.append(pad)
-                    pack_targets.append(pad)
-                else:  # Truncate right (need to add eod)
-                    max_body = pack_length - 1
-                    pack_tokens = pack_tokens[:max_body]
-                    pack_targets = pack_targets[:max_body]
-                    pack_tokens.extend([eod, pad])
-                    pack_targets.extend([eod, pad])
+                # Truncate on the right
+                max_body = pack_length
+                pack_tokens = pack_tokens[:max_body]
+                pack_targets = pack_targets[:max_body]
+                pack_tokens.append(pad)
+                pack_targets.append(pad)
                 pack_positions = pack_positions[:pack_length+1]
                 # Note len({pack_tokens, pack_targets, pack_positions}) should be pack_length + 1
                 cu_seqlens[-1] = len(pack_tokens) - 1
