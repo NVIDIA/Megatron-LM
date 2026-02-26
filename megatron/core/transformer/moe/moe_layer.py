@@ -302,8 +302,10 @@ class MoELayer(BaseMoELayer):
     def set_is_inference_cuda_graphed_iteration(self, set_to: bool):
         """Toggle CUDA-graphed iteration mode on this layer, its router, and its experts."""
         self.is_inference_cuda_graphed_iteration = set_to
-        self.router.set_is_inference_cuda_graphed_iteration(set_to)
-        self.experts.set_is_inference_cuda_graphed_iteration(set_to)
+        if hasattr(self.router, "set_is_inference_cuda_graphed_iteration"):
+            self.router.set_is_inference_cuda_graphed_iteration(set_to)
+        if hasattr(self.experts, "set_is_inference_cuda_graphed_iteration"):
+            self.experts.set_is_inference_cuda_graphed_iteration(set_to)
 
     def _activate_inference_token_dispatcher(self):
         """Swap in the inference-optimized token dispatcher."""
@@ -463,7 +465,8 @@ class MoELayer(BaseMoELayer):
 
         # Swap in inference-optimized dispatcher for CUDA-graphed inference iterations
         _use_inference_dispatcher = (
-            not self.training
+            self.config.transformer_impl == "inference_optimized"
+            and not self.training
             and self.is_inference_cuda_graphed_iteration
             and self._inference_token_dispatcher is not None
         )

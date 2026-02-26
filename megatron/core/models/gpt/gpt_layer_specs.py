@@ -149,21 +149,9 @@ def get_gpt_layer_with_inference_submodules(
                         L2Norm if qk_l2_norm else (qk_norm if qk_layernorm else IdentityOp)
                     ),
                 ),
-                self_attn_bda=get_bias_dropout_add,
-                pre_mlp_layernorm=backend.layer_norm() if num_experts else IdentityOp,
-                mlp=mlp,
-                mlp_bda=get_bias_dropout_add,
-                sharded_state_dict_keys_map={
-                    "mlp.0.weight": "mlp.linear_fc1.layer_norm_weight",
-                    "mlp.0.bias": "mlp.linear_fc1.layer_norm_bias",
-                    "mlp.1.basic_ops.0.weight": "mlp.linear_fc1.weight",
-                    "mlp.1.basic_ops.1.bias": "mlp.linear_fc1.bias",
-                    "mlp.3.basic_ops.0.weight": "mlp.linear_fc2.weight",
-                    "mlp.3.basic_ops.1.bias": "mlp.linear_fc2.bias",
-                },
             ),
             self_attn_bda=get_bias_dropout_add,
-            pre_mlp_layernorm=IdentityOp,
+            pre_mlp_layernorm=backend.layer_norm() if num_experts else IdentityOp,
             mlp=mlp,
             mlp_bda=get_bias_dropout_add,
             sharded_state_dict_keys_map={
