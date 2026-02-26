@@ -896,6 +896,30 @@ class TestRLUtils:
         CudaGraphManager.fwd_mempools = None
         CudaGraphManager.bwd_mempools = None
 
+    def test_compute_true_staleness(self):
+        # Single group, 2 turns: turn 1 has 1 token, turn 2 has 2 tokens
+        result = rl_utils.compute_true_staleness(
+            per_token_staleness=[[1, 2, 3]],
+            completed_at_steps=[[8, 7]],
+            turn_lens=[[1, 2]],
+            current_iteration=10,
+        )
+        # token 0: 1 + (10-8) = 3
+        # token 1: 2 + (10-7) = 5
+        # token 2: 3 + (10-7) = 6
+        assert result == [3, 5, 6]
+
+        # Multiple groups
+        result = rl_utils.compute_true_staleness(
+            per_token_staleness=[[0, 0], [1]],
+            completed_at_steps=[[5], [5]],
+            turn_lens=[[2], [1]],
+            current_iteration=6,
+        )
+        # group 1: [0+1, 0+1] = [1, 1]
+        # group 2: [1+1] = [2]
+        assert result == [1, 1, 2]
+
     @pytest.mark.parametrize(
         "initialize_model_parallel",
         [pytest.param((1, 1), id="tp1-pp1")],

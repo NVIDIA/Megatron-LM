@@ -814,6 +814,36 @@ def compute_group_stats(
     return stats
 
 
+def compute_true_staleness(
+    per_token_staleness: list[list[int]],
+    completed_at_steps: list[list[int]],
+    turn_lens: list[list[int]],
+    current_iteration: int,
+) -> list[int]:
+    """Compute true per-token staleness by adding the completion gap.
+
+    Args:
+        per_token_staleness: Grouped flat list of per-token raw staleness values.
+        completed_at_steps: Grouped list of per-turn completion steps.
+        turn_lens: Grouped list of per-turn token counts.
+        current_iteration: Current training iteration.
+
+    Returns:
+        Flat list of true staleness values (one per token across all groups).
+    """
+    result = []
+    for group_staleness, group_completed, group_turn_lens in zip(
+        per_token_staleness, completed_at_steps, turn_lens
+    ):
+        token_idx = 0
+        for completed_at, num_tokens in zip(group_completed, group_turn_lens):
+            gap = current_iteration - completed_at
+            for _ in range(num_tokens):
+                result.append(group_staleness[token_idx] + gap)
+                token_idx += 1
+    return result
+
+
 def prep_wandb_metrics(
         wandb_writer: wandb_run.Run,
         traj_lens: List[List[int]],
@@ -853,17 +883,10 @@ def prep_wandb_metrics(
         data=[[np.mean(g), np.std(g)] for g in rewards],
     )
 
-    # Expand per-turn completed_at_steps to per-token using turn_lens, then compute true staleness.
-    true_policy_staleness = [
-        s + current_iteration - c
-        for g_s, g_c, g_tl in zip(policy_staleness, completed_at_steps, turn_lens)
-        for s, c in zip(g_s, (c for c, n in zip(g_c, g_tl) for _ in range(n)))
-    ]
-    true_kv_staleness = [
-        s + current_iteration - c
-        for g_s, g_c, g_tl in zip(kv_cache_staleness, completed_at_steps, turn_lens)
-        for s, c in zip(g_s, (c for c, n in zip(g_c, g_tl) for _ in range(n)))
-    ]
+    true_policy_staleness = compute_true_staleness(
+        policy_staleness, completed_at_steps, turn_lens, current_iteration)
+    true_kv_staleness = compute_true_staleness(
+        kv_cache_staleness, completed_at_steps, turn_lens, current_iteration)
 
     metrics = {
             'group_means_hist': wandb_writer.plot.histogram(
