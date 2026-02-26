@@ -2054,7 +2054,7 @@ def training_log(
         else:
             layers = args.num_layers
 
-        moe_log_string = MoEMetricsTracker.get_instance().track(
+        moe_log_string = MoEMetricsTracker.get_instance().report(
             loss_scale=moe_loss_scale,
             iteration=iteration,
             writer=writer,

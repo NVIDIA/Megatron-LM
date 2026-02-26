@@ -936,6 +936,7 @@ def save_to_aux_losses_tracker(
         needs_dp_avg (bool, optional): Whether to average the metric across data parallel ranks.
             Defaults to True.
     """
+    _ = layer_percentiles  # No longer stored on MetricEntry; pass via report(percentiles=...).
     MoEMetricsTracker.get_instance().record(
         name=name,
         value=loss,
@@ -943,7 +944,6 @@ def save_to_aux_losses_tracker(
         num_layers=num_layers,
         reduce_group=reduce_group,
         avg_group=avg_group,
-        layer_percentiles=layer_percentiles,
         needs_dp_avg=needs_dp_avg,
     )
 
@@ -964,16 +964,26 @@ def reduce_aux_losses_tracker_across_ranks(
         pg_collection (Optional[ProcessGroupCollection], optional):
             The process group collection. Defaults to None.
     """
-    MoEMetricsTracker.get_instance()._reduce_across_ranks(track_names, pg_collection)
+    tracker = MoEMetricsTracker.get_instance()
+    names_list = track_names if track_names is not None else list(tracker.metrics.keys())
+    tracker._sync_metrics(names_list, pg_collection)
 
 
 def get_moe_layer_wise_logging_tracker():
     """Return the moe layer wise tracker in legacy dict format."""
-    return MoEMetricsTracker.get_instance().get_raw_tracker()
+    return {
+        name: {
+            "values": entry.values,
+            "reduce_group": entry.reduce_group,
+            "avg_group": entry.avg_group,
+            "needs_dp_avg": entry.needs_dp_avg,
+        }
+        for name, entry in MoEMetricsTracker.get_instance().metrics.items()
+    }
 
 
 @deprecated(
-    version="0.15", removal_version="0.17", alternative="MoEMetricsTracker.get_instance().track()"
+    version="0.15", removal_version="0.17", alternative="MoEMetricsTracker.get_instance().report()"
 )
 def track_moe_metrics(
     loss_scale: float,
@@ -991,9 +1001,9 @@ def track_moe_metrics(
 ) -> str:
     """Track the MoE metrics for logging.
 
-    Deprecated: Use MoEMetricsTracker.get_instance().track() directly.
+    Deprecated: Use MoEMetricsTracker.get_instance().report() directly.
     """
-    return MoEMetricsTracker.get_instance().track(
+    return MoEMetricsTracker.get_instance().report(
         loss_scale=loss_scale,
         iteration=iteration,
         writer=writer,
