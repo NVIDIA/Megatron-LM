@@ -53,8 +53,6 @@ class MambaStack(GraphableMegatronModule, MegatronModule):
     Args:
         config (TransformerConfig): the model configuration
         submodules (MambaStackSubmodules): the submodules for the stack
-        residual_in_fp32 (bool, optional): whether to do residual connections
-            in fp32. Defaults to False.
         pre_process (bool, optional): whether to include an embedding layer.
             Defaults to True.
         hybrid_attention_ratio (float, optional): the target ratio of attention layers to
@@ -77,7 +75,6 @@ class MambaStack(GraphableMegatronModule, MegatronModule):
         self,
         config: TransformerConfig,
         submodules: MambaStackSubmodules,
-        residual_in_fp32=False,
         pre_process: bool = True,
         hybrid_attention_ratio: float = 0.0,
         hybrid_mlp_ratio: float = 0.0,
@@ -90,7 +87,6 @@ class MambaStack(GraphableMegatronModule, MegatronModule):
         is_mtp_layer: bool = False,
     ) -> None:
         super().__init__(config=config)
-        self.residual_in_fp32 = residual_in_fp32
         self.pre_process = pre_process
         self.post_layer_norm = post_layer_norm
         self.post_process = post_process
@@ -146,7 +142,6 @@ class MambaStack(GraphableMegatronModule, MegatronModule):
                     layer = build_module(
                         submodules.mamba_layer,
                         config=self.config,
-                        residual_in_fp32=residual_in_fp32,
                         layer_number=i + 1 + pp_layer_offset,
                         pp_layer_offset=pp_layer_offset,
                         pg_collection=pg_collection,

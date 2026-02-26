@@ -414,7 +414,10 @@ def get_default_packed_seq_params(seq_length: int, max_sequences_per_bin: int, d
     args = get_args()
 
     # Pad to the maximum number of sequences in the bin for the attention kernel.
-    cu_seqlens = torch.full((max_sequences_per_bin,), seq_length, dtype=torch.int32, device=device)
+    # We add 2 to account for the initial 0 and the final bin_size.
+    cu_seqlens = torch.full(
+        (max_sequences_per_bin + 2,), seq_length, dtype=torch.int32, device=device,
+    )
     cu_seqlens[0] = 0
 
     return PackedSeqParams(
@@ -484,8 +487,9 @@ def create_packed_seq_params_for_bin(
 
     # Pad cu_seqlens to bin_size by repeating the last value (creates zero-length ghost sequences)
     # This ensures a fixed tensor size for CUDA graph compatibility
-    if len(cu_seqlens) < max_sequences_per_bin:
-        out = cu_seqlens.new_full((max_sequences_per_bin,), bin_size)
+    # We add 2 to account for the initial 0 and the final bin_size.
+    if len(cu_seqlens) < max_sequences_per_bin + 2:
+        out = cu_seqlens.new_full((max_sequences_per_bin + 2,), bin_size)
         out[:len(cu_seqlens)] = cu_seqlens
         cu_seqlens = out
 

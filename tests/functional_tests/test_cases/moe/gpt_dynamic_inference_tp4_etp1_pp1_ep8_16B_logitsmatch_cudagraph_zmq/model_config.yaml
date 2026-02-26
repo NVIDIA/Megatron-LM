@@ -80,8 +80,8 @@ MODEL_ARGS:
   --cuda-graph-impl: local 
   --moe-pad-experts-for-cuda-graph-inference: true
   --inference-dynamic-batching-buffer-size-gb: 20
-  --inference-dynamic-batching-num-cuda-graphs: 1 
-  --inference-dynamic-batching-max-requests: 512
+  --inference-dynamic-batching-num-cuda-graphs: -1 
+  --inference-dynamic-batching-max-requests: 16
   --inference-logging-step-interval: 1
   --sequence-parallel: true
   --moe-enable-routing-replay: true
