@@ -261,11 +261,12 @@ def forward_step_calc_loss(
                 output_tensor, num_tokens, loss_reduced = outputs
                 if not config.calculate_per_token_loss:
                     # When num_tokens is different across cp group, we need to allreduce it across cp group to get the correct average.
-                    torch.distributed.allreduce(num_tokens, group=parallel_state.get_context_parallel_group())
+                    if cp_group_size > 1:
+                        torch.distributed.all_reduce(num_tokens, group=parallel_state.get_context_parallel_group())
                     # Protect against division by zero when all tokens are masked
                     #   in a microbatch.
                     output_tensor /= torch.clamp(num_tokens, min=1)
-                    output_tensor *= parallel_state.get_context_parallel_size()
+                    output_tensor *= cp_group_size
                     output_tensor /= num_microbatches
             else:
                 # preserve legacy loss averaging behavior (ie, over the number of microbatches)
