@@ -149,14 +149,8 @@ def get_mup_config_overrides(
             "override those parameters."
         )
         if is_adam_optimizer:
-            message += (
-                " MuP Adam epsilon scaling remains applied to hidden matrix-like parameters."
-            )
-        log_single_rank(
-            logger,
-            logging.WARNING,
-            message,
-        )
+            message += " MuP Adam epsilon scaling remains applied to hidden matrix-like parameters."
+        log_single_rank(logger, logging.WARNING, message)
 
     if mup_width_mult == 1.0:
         # No scaling needed when width_mult is 1
@@ -188,9 +182,7 @@ def get_mup_config_overrides(
             return False
         return not is_vector_like_parameter(param, param_name)
 
-    def should_scale_vector_like_lr_with_mup(
-        param: torch.nn.Parameter, param_name: str
-    ) -> bool:
+    def should_scale_vector_like_lr_with_mup(param: torch.nn.Parameter, param_name: str) -> bool:
         if decoupled_lr_enabled and getattr(param, 'is_embedding_or_output_parameter', False):
             return False
         return is_vector_like_parameter(param, param_name)
@@ -236,15 +228,13 @@ def get_mup_config_overrides(
     if decoupled_lr_enabled:
         if lr_override:
             hidden_predicate = ParamWithNamePredicate(
-                name="mup_hidden_only_excluding_embedding_output",
-                fn=should_scale_lr_with_mup,
+                name="mup_hidden_only_excluding_embedding_output", fn=should_scale_lr_with_mup
             )
             mup_overrides[ParamKey(with_name_predicate=hidden_predicate)] = lr_override
 
         if eps_override:
             hidden_output_predicate = ParamWithNamePredicate(
-                name="mup_hidden_only_for_adam_eps",
-                fn=should_scale_eps_with_mup,
+                name="mup_hidden_only_for_adam_eps", fn=should_scale_eps_with_mup
             )
             mup_overrides[ParamKey(with_name_predicate=hidden_output_predicate)] = eps_override
     else:
@@ -253,8 +243,7 @@ def get_mup_config_overrides(
         combined_override.update(eps_override)
         if combined_override:
             hidden_output_predicate = ParamWithNamePredicate(
-                name="mup_hidden_and_output",
-                fn=should_scale_eps_with_mup,
+                name="mup_hidden_and_output", fn=should_scale_eps_with_mup
             )
             mup_overrides[ParamKey(with_name_predicate=hidden_output_predicate)] = combined_override
 
