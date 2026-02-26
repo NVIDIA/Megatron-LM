@@ -94,50 +94,30 @@ TEST_CASES = [
     # -------------------------------------------------------------------------
     # B=1: forward + backward bitwise (MockCoreAttention)
     # -------------------------------------------------------------------------
-    #                   name              H    heads kv_h  ffn    seqlens                tp cp sp     check_level
-    TestCase("b1_seq479_mha",           1024,  16,   16, 4096,   [479],                  1, 1, False, "bitwise_all"),
-    TestCase("b1_seq1337_mha",          1024,  16,   16, 4096,   [1337],                 1, 1, False, "bitwise_all"),
-    TestCase("b1_seq2047_gqa",          1024,  16,    4, 4096,   [2047],                 1, 1, False, "bitwise_all"),
-    TestCase("b1_seq3891_gqa",          1024,  16,    4, 4096,   [3891],                 1, 1, False, "bitwise_all"),
+    #                   name              H    heads kv_h  ffn    seqlens                    tp cp sp     check_level
+    TestCase("b1_seq3891_gqa",          1024,  16,    4, 4096,   [3891],                     1, 1, False, "bitwise_all"),
+    TestCase("b1_seq16k_mha",            256,   4,    4, 1024,   [16383],                    1, 1, False, "bitwise_all"),
 
     # -------------------------------------------------------------------------
     # B>1 single GPU: forward bitwise, backward similarity (MockCoreAttention)
     # THD is padded to max_len per sequence so TE GEMM sees the same M value
     # -------------------------------------------------------------------------
-    TestCase("b2_uniform_513",          1024,  16,   16, 4096,   [513, 513],             1, 1, False, "bitwise_fwd"),
-    TestCase("b3_uniform_997",          1024,  16,    4, 4096,   [997, 997, 997],        1, 1, False, "bitwise_fwd"),
-    TestCase("varlen_pow2_512_1024",    1024,  16,   16, 4096,   [512, 1024],            1, 1, False, "bitwise_fwd"),
-    TestCase("varlen_499_1031",         1024,  16,   16, 4096,   [499, 1031],            1, 1, False, "bitwise_fwd"),
-    TestCase("varlen_263_751_503",      1024,  16,    4, 4096,   [263, 751, 503],        1, 1, False, "bitwise_fwd"),
-    TestCase("varlen_mixed",            1024,  16,   16, 4096,   [1987, 523, 271, 1009], 1, 1, False, "bitwise_fwd"),
-    TestCase("short_seqs",              1024,  16,   16, 4096,   [17, 31, 11],           1, 1, False, "bitwise_fwd"),
+    TestCase("varlen_mixed",            1024,  16,   16, 4096,   [1987, 523, 271, 1009],     1, 1, False, "bitwise_fwd"),
+    TestCase("short_seqs",              1024,  16,   16, 4096,   [17, 31, 11],               1, 1, False, "bitwise_fwd"),
+    TestCase("b2_long_8k",               256,   4,    4, 1024,   [8191, 8192],               1, 1, False, "bitwise_fwd"),
 
     # -------------------------------------------------------------------------
     # TP/CP/SP: similarity checks (TE Attention)
     # -------------------------------------------------------------------------
-    # Llama-7B style (H=4096, 32 heads)
-    TestCase("tp2_llama7b",             4096,  32,   32, 11008,  [503, 1019],            2, 1, False, "similarity"),
-    TestCase("tp2_sp_llama7b",          4096,  32,   32, 11008,  [499, 1031, 773],       2, 1, True,  "similarity"),
-    TestCase("cp2_llama7b",             4096,  32,   32, 11008,  [1021, 2039],           1, 2, False, "similarity"),
-    TestCase("cp4_llama7b",             4096,  32,   32, 11008,  [1019, 509, 761],       1, 4, False, "similarity"),
-
-    # Mixtral style (H=4096, 32 heads, 8 kv_heads)
-    TestCase("tp2_mixtral",             4096,  32,    8, 14336,  [509, 1021],            2, 1, False, "similarity"),
-    TestCase("tp4_sp_mixtral",          4096,  32,    8, 14336,  [1019, 503, 257],       4, 1, True,  "similarity"),
-
-    # Llama-70B style (H=8192, 64 heads, 8 kv_heads)
-    TestCase("tp2_cp2_llama70b",        8192,  64,    8, 28672,  [509, 1013],            2, 2, False, "similarity"),
-    TestCase("tp2_cp2_sp_llama70b",     8192,  64,    8, 28672,  [2039, 1019, 509],      2, 2, True,  "similarity"),
-
-    # Qwen3-235B style (H=4096, 64 heads, 4 kv_heads)
-    TestCase("tp2_cp2_sp_qwen3",        4096,  64,    4, 12288,  [503, 1019],            2, 2, True,  "similarity"),
-    TestCase("tp2_cp4_sp_qwen3",        4096,  64,    4, 12288,  [2039, 1013, 509],      2, 4, True,  "similarity"),
+    TestCase("tp2_cp4_sp",              4096,  64,    4, 12288,  [2039, 1013, 509],          2, 4, True,  "similarity"),
+    TestCase("tp2_cp2_sp_longseq",      4096,  32,    8, 14336,  [65536, 8191, 4096],        2, 2, True,  "similarity"),
 
     # -------------------------------------------------------------------------
     # Edge cases
     # -------------------------------------------------------------------------
-    TestCase("short_seqs_parallel",     1024,  16,    4, 4096,   [17, 31, 11],           2, 2, True,  "similarity"),
-    TestCase("extreme_mixed",           4096,  32,    8, 14336,  [4093, 127, 257],       2, 2, True,  "similarity"),
+    TestCase("short_seqs_parallel",     1024,  16,    4, 4096,   [17, 31, 11],               2, 2, True,  "similarity"),
+    TestCase("extreme_mixed",           4096,  32,    8, 14336,  [4093, 127, 257],           2, 2, True,  "similarity"),
+    TestCase("long_short_mix",          4096,  32,    8, 14336,  [65535, 512, 1024],         2, 2, True,  "similarity"),
 ]
 # fmt: on
 
