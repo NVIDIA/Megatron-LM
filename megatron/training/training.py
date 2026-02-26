@@ -905,7 +905,7 @@ def pretrain(
     model, optimizer, opt_param_scheduler = setup_model_and_optimizer(
         model_provider, model_type, checkpointing_context=checkpointing_context
     )
-    if args.tensor_tracer_port is not None:
+    if args.tensor_tracer_port is not None and mpu.get_data_parallel_rank() == 0:
         from megatron.core.tensor_tracer import _set_tt_hook_manager
 
         _set_tt_hook_manager(args, model)
@@ -2453,7 +2453,8 @@ def train(
 
     global_rank = torch.distributed.get_rank()
     tp_rank = mpu.get_tensor_model_parallel_rank()
-    if args.tensor_tracer_port is not None and tp_rank == 0:
+    dp_rank = mpu.get_data_parallel_rank()
+    if args.tensor_tracer_port is not None and tp_rank == 0 and dp_rank == 0:
         try:
             from .training_wsserver import websocket_server_process, websocket_worker_process
         except ModuleNotFoundError as exc:
@@ -2510,7 +2511,7 @@ def train(
             ws_process.start()
 
     if args.tensor_tracer_port is not None:
-        if global_rank == 0:
+        if global_rank == 0 and tp_rank == 0 and dp_rank == 0:
             received_configs = config_queue.get()
             vis_flags = received_configs.get('visualization_flags', {})
             comp_configs = received_configs.get('compressor_config', {})
@@ -2521,6 +2522,9 @@ def train(
         torch.distributed.broadcast_object_list(configs_to_broadcast, src=0)
 
         vis_flags, comp_configs = configs_to_broadcast
+        if dp_rank != 0:
+            vis_flags = {"InputTokens": False}
+            comp_configs = {}
         from megatron.core.tensor_tracer import get_tt_flags
         get_tt_flags().set_by_configs(vis_flags, comp_configs)
 

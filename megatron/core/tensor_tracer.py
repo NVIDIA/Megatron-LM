@@ -1,3 +1,5 @@
+# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+
 import logging
 import math
 from abc import abstractmethod
@@ -100,7 +102,7 @@ class FlagType(Enum):
     MLP2_mat_mul = 5
     AttentionOutput_mat_mul = 6
     HiddenStates = 7
-    InputTokens = 8      
+    InputTokens = 8
 
 
 class AbstractCompressor:
@@ -300,8 +302,6 @@ class TTFlags:
                 compressor_configs = specific_comp_config.get("compressor_configs", {})
                 compressor_cls = COMPRESSOR_MAP.get(compressor_type, EmptyCompressor)
                 _GLOBAL_COMPRESSOR[flag_type] = compressor_cls(compressor_configs)
-
-        _GLOBAL_COMPRESSOR[FlagType.InputTokens] = NoOpCompressor({})
 
 
 class TTHookManager:
