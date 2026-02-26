@@ -65,6 +65,22 @@ on:
         required: true
       PAT:
         required: true
+      AWS_ASSUME_ROLE_ARN:
+        required: true
+      AWS_ACCESS_KEY_ID:
+        required: true
+      AWS_SECRET_ACCESS_KEY:
+        required: true
+      AKAMAI_HOST:
+        required: true
+      AKAMAI_CLIENT_TOKEN:
+        required: true
+      AKAMAI_CLIENT_SECRET:
+        required: true
+      AKAMAI_ACCESS_TOKEN:
+        required: true
+      S3_BUCKET_NAME:
+        required: true
 
 permissions:
   contents: write # To read repository content
