@@ -596,6 +596,8 @@ def build_transformer_layer_callables(layer: TransformerLayer):
             inp=hidden_states, requires_grad=hidden_states.requires_grad, keep_graph=True
         )
 
+        # Flush the delayed groups.
+        # This process happens only during the warmup steps of cuda graph.
         if node.chunk_state.flush_delayed_groups:
             off_interface.flush_delayed_groups()
 

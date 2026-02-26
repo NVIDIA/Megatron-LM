@@ -252,7 +252,7 @@ class MultiLatentAttention(Attention):
                 packed_seq_params,
                 inference_context=inference_context,
             )
-        query = qkv_linear_manager.group_offload(query, forced_released_tensors=[hidden_states])
+        query = qkv_linear_manager.group_offload(query, forced_released_tensors=[])
 
         # ===================================================
         # Adjust key, value for inference

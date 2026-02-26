@@ -1313,7 +1313,6 @@ class TransformerConfig(ModelParallelConfig):
                 "attn_norm",
                 "mlp_norm",
                 "qkv_linear",
-                "dense_mlp",
             }
             invalid_modules = set(self.offload_modules) - allowed_modules
             assert not invalid_modules, (
@@ -1326,6 +1325,16 @@ class TransformerConfig(ModelParallelConfig):
                     "because the input of attn_proj is the output of core_attn, "
                     "which is needed in core_attn.backward()."
                 )
+            if self.delay_offload_until_cuda_graph:
+                assert (self.external_cuda_graph or self.enable_cuda_graph,
+                    "delay_offload_until_cuda_graph must be used with cuda graph."
+                )
+            assert self.min_offloaded_tensor_size >= 0, \
+                "min_offloaded_tensor_size must be non-negative."
+            assert self.activation_offload_fraction >= 0 and self.activation_offload_fraction <= 1, \
+                "activation_offload_fraction must be in range [0, 1]."
+            assert self.delta_offload_bytes_across_pp_ranks >= 0, \
+                "delta_offload_bytes_across_pp_ranks must be non-negative."
             if self.external_cuda_graph or self.enable_cuda_graph:
                 assert (
                     self.cuda_graph_impl == "transformer_engine"

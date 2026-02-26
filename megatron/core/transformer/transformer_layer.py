@@ -562,6 +562,9 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
             FineGrainedActivationOffloadingInterface as off_interface,
         )
 
+        # Record the backward event on cuda graph stream in backward pass.
+        # This is to ensure the main stream waits for computing on cuda graph stream to complete,
+        # and overlaps with the H2D transfer on reload stream.
         if self.offload_module_in_cuda_graph:
             hidden_states = off_interface.backward_record(
                 hidden_states, TransformerLayer.cuda_graph_event
@@ -833,6 +836,8 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
             inp=hidden_states, requires_grad=hidden_states.requires_grad, keep_graph=True
         )
 
+        # Flush the delayed groups.
+        # This process happens only during the warmup steps of cuda graph.
         if self.config.delay_offload_until_cuda_graph and flush_delayed_groups:
             from megatron.core.pipeline_parallel.fine_grained_activation_offload import (
                 FineGrainedActivationOffloadingInterface as off_interface,
@@ -1009,6 +1014,9 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
             cuda_graph_outputs = list(hidden_states)
         if context is not None:
             cuda_graph_outputs.append(context)
+        # Record the forward event on cuda graph stream for cuda graph capture.
+        # This is to ensure the main stream waits for computing on cuda graph stream to complete,
+        # and overlaps with the D2H transfer on offloading stream.
         if self.offload_module_in_cuda_graph:
             from megatron.core.pipeline_parallel.fine_grained_activation_offload import (
                 FineGrainedActivationOffloadingInterface as off_interface,
@@ -1040,6 +1048,10 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
 
         cuda_graph_output = list(super()._te_cuda_graph_replay(*args, **kwargs))
 
+        # Flush the delayed groups after the cuda graph replay.
+        # This is to reduce or eliminate the cpu overhead of offloading because
+        # there exists a synchronization between the cuda graph replay and the a2a comm
+        # in moe layer, at that point the host thread is blocked and idle.
         if self.config.delay_offload_until_cuda_graph:
             from megatron.core.pipeline_parallel.fine_grained_activation_offload import (
                 FineGrainedActivationOffloadingInterface as off_interface,
@@ -1261,9 +1273,6 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
             )
             self.offload_expert_fc1 = "expert_fc1" in self.config.offload_modules
             self.offload_moe_act = "moe_act" in self.config.offload_modules
-            self.offload_dense_mlp = (
-                "dense_mlp" in self.config.offload_modules and not self.is_moe_layer
-            )
         else:
             self.offload_attn_norm = False
             self.offload_qkv_linear = False
@@ -1272,19 +1281,15 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
             self.offload_mlp_norm = False
             self.offload_expert_fc1 = False
             self.offload_moe_act = False
-            self.offload_dense_mlp = False
         # Set the offload module in cuda graph flag.
         self.offload_module_in_cuda_graph = False
         if CudaGraphScope.attn in self.config.cuda_graph_scope:
             if self.offload_core_attn or self.offload_attn_proj or self.offload_qkv_linear:
                 self.offload_module_in_cuda_graph = True
         if not self.is_moe_layer and CudaGraphScope.mlp in self.config.cuda_graph_scope:
-            if self.offload_mlp_norm or self.offload_dense_mlp:
+            if self.offload_mlp_norm:
                 self.offload_module_in_cuda_graph = True
         if self.offload_module_in_cuda_graph:
-            assert is_torch_min_version(
-                "2.9.0a0"
-            ), "Offloading modules captured in cuda graph requires torch>=2.9.0."
             assert is_te_min_version(
                 "2.13.0"
             ), "Offloading modules captured in cuda graph requires TE>=2.13.0."
