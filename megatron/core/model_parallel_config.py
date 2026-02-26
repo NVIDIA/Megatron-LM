@@ -6,8 +6,11 @@ from typing import Callable, ContextManager, Literal, Optional
 
 import torch
 
+from megatron.core.utils import experimental_api
+
 
 @dataclass
+@experimental_api
 class ModelParallelConfig:
     """Base configuration for Megatron Core
 
@@ -75,11 +78,6 @@ class ModelParallelConfig:
     expert_tensor_parallel_size: Optional[int] = None
     """Intra-layer tensor model parallelism for expert layer. Splits tensors across GPU ranks.
        Default is None, which will be set to the value of tensor_model_parallel_size.
-    """
-
-    moe_extended_tp: bool = False
-    """NOTE: Deprecated from MCore v0.10. This flag is ignored.
-      Its functionality is replaced by expert_tensor_parallel_size.
     """
 
     ###################
@@ -173,9 +171,6 @@ class ModelParallelConfig:
        must turn off gradient accumulation fusion.
     """
 
-    async_tensor_model_parallel_allreduce: bool = True
-    """NOTE: Deprecated. This flag is ignored."""
-
     use_te_rng_tracker: bool = field(
         default=False, metadata={"argparse_meta": {"arg_names": ["--te-rng-tracker"]}}
     )
@@ -243,9 +238,14 @@ class ModelParallelConfig:
        Defaults to False.
     """
 
-    cross_entropy_fusion_impl: Literal['native', 'te'] = 'native'
-    """If 'native', MCore based CE loss fusion is used, if 'te', Parallel CE loss
-       from Transformer Engine library is used. Defaults to 'native'.
+    cross_entropy_fusion_impl: Literal['native', 'te', 'linear'] = 'native'
+    """
+    Specifies the implementation of cross-entropy loss fusion.
+
+    Options:
+    - 'native': Uses MCore-based cross-entropy loss fusion (default).
+    - 'te': Uses the parallel cross-entropy loss implementation from the Transformer Engine library.
+    - 'linear': Uses a linear-cross-entropy fusion approach.
     """
 
     tp_comm_overlap_disable_qkv: bool = False

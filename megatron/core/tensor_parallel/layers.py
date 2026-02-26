@@ -255,6 +255,10 @@ class VocabParallelEmbedding(torch.nn.Module):
                     rank=get_pg_rank(self.tp_group),
                     world_size=get_pg_size(self.tp_group),
                 )
+            else:
+                set_tensor_model_parallel_attributes(
+                    tensor=self.weight, is_parallel=True, dim=0, stride=1
+                )
         else:
             self.weight = Parameter(
                 torch.empty(
@@ -266,6 +270,10 @@ class VocabParallelEmbedding(torch.nn.Module):
             )
             if config.perform_initialization:
                 _initialize_affine_weight_gpu(self.weight, init_method, partition_dim=0, stride=1)
+            else:
+                set_tensor_model_parallel_attributes(
+                    tensor=self.weight, is_parallel=True, dim=0, stride=1
+                )
 
     def forward(self, input_):
         """Forward.
@@ -369,7 +377,6 @@ def linear_with_frozen_weight(
     tp_group: Optional[torch.distributed.ProcessGroup],
     grad_output_buffer: Optional[List[torch.Tensor]] = None,
     wgrad_deferral_limit: None = None,
-    async_grad_allreduce: Optional[bool] = None,
 ) -> torch.Tensor:
     """Linear layer execution with weight.requires_grad == False.
 
@@ -406,18 +413,7 @@ def linear_with_frozen_weight(
 
     wgrad_deferral_limit (int optional): dummy argument, used to
     keep the API unified between all forward implementation functions.
-
-
-    async_grad_allreduce (bool optional): Will be removed with 0.11.0.
-                                          Please use allreduce_dgrad instead.
-
     """
-
-    if async_grad_allreduce is not None:
-        warnings.warn(
-            "async_grad_allreduce is deprecated, not in use anymore and will"
-            " be fully removed with 0.11.0. Please use allreduce_dgrad instead."
-        )
 
     assert grad_output_buffer is None, (
         "grad_output_buffer kwarg is only supported with "
@@ -637,7 +633,6 @@ def linear_with_grad_accumulation_and_async_allreduce(
     sequence_parallel: bool,
     grad_output_buffer: Optional[List[torch.Tensor]] = None,
     wgrad_deferral_limit: Optional[int] = 0,
-    async_grad_allreduce: Optional[bool] = None,
     tp_group: Optional[torch.distributed.ProcessGroup] = None,
 ) -> torch.Tensor:
     """Linear layer execution with asynchronous communication and
@@ -701,16 +696,7 @@ def linear_with_grad_accumulation_and_async_allreduce(
         wgrad_deferral_limit (int optional): Limit on the number of
             micro-batches for which embedding weight gradient GEMM should be
             deferred. Disable by setting this to 0. Defaults to 0.
-
-        async_grad_allreduce (bool optional): Will be removed with 0.11.0.
-                                            Please use allreduce_dgrad instead.
     """
-
-    if async_grad_allreduce is not None:
-        warnings.warn(
-            "async_grad_allreduce is deprecated, not in use anymore and will"
-            " be fully removed with 0.11.0. Please use allreduce_dgrad instead."
-        )
 
     tp_group = get_tensor_model_parallel_group_if_none(tp_group)
 
@@ -867,6 +853,10 @@ class ColumnParallelLinear(torch.nn.Module):
                         rank=rank,
                         world_size=world_size,
                     )
+                else:
+                    set_tensor_model_parallel_attributes(
+                        tensor=self.weight, is_parallel=True, dim=0, stride=stride
+                    )
             else:
                 self.weight = Parameter(
                     torch.empty(
@@ -883,6 +873,10 @@ class ColumnParallelLinear(torch.nn.Module):
                         partition_dim=0,
                         stride=stride,
                         is_expert=self.is_expert,
+                    )
+                else:
+                    set_tensor_model_parallel_attributes(
+                        tensor=self.weight, is_parallel=True, dim=0, stride=stride
                     )
 
             setattr(self.weight, "allreduce", not (self.is_expert and self.expert_parallel))
@@ -1195,6 +1189,10 @@ class RowParallelLinear(torch.nn.Module):
                     rank=rank,
                     world_size=world_size,
                 )
+            else:
+                set_tensor_model_parallel_attributes(
+                    tensor=self.weight, is_parallel=True, dim=1, stride=stride
+                )
         else:
             self.weight = Parameter(
                 torch.empty(
@@ -1211,6 +1209,10 @@ class RowParallelLinear(torch.nn.Module):
                     partition_dim=1,
                     stride=stride,
                     is_expert=self.is_expert,
+                )
+            else:
+                set_tensor_model_parallel_attributes(
+                    tensor=self.weight, is_parallel=True, dim=1, stride=stride
                 )
         setattr(self.weight, "allreduce", not (self.is_expert and self.expert_parallel))
 

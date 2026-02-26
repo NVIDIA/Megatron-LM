@@ -308,6 +308,7 @@ class Attention(MegatronModule, ABC):
         self.key_hidden_size = self.hidden_size_per_attention_head
         self.val_hidden_size = self.hidden_size_per_attention_head
 
+        # TODO: This is built twice when using MLA, should be refactored.
         if self.config.num_query_groups < world_size:
             # TE throws an assertion error if num_kv_heads / num_query_groups
             # is not divisible by TP size.
@@ -971,12 +972,15 @@ class Attention(MegatronModule, ABC):
                 self.k_layernorm is None or isinstance(self.k_layernorm, IdentityOp),
             ]
         )
+        output_gate = self.config.attention_output_gate
         # Check if fused_single_qkv_rope is requested but either unavailable or not
         # supported for the current use case.
         if self.attention_type != "cross":
             assert not (
                 self.config.fused_single_qkv_rope and split_qkv
             ), "fused_single_qkv_rope requested but not available/supported for the config."
+        if output_gate:
+            assert split_qkv, "output_gate is not supported for unsplit mixed_qkv tensor."
 
         with off_interface(self.offload_qkv_linear, hidden_states, "qkv_linear") as hidden_states:
             qkv_output = self.get_query_key_value_tensors(
@@ -1187,6 +1191,7 @@ class Attention(MegatronModule, ABC):
                 core_attn_out = off_interface.group_commit(
                     core_attn_out, name="core_attn", forced_released_tensors=[query, key, value]
                 )
+
         if packed_seq_params is not None and packed_seq_params.qkv_format == 'thd':
             # reshape to same output shape as unpacked case
             # (t, np, hn) -> (t, b=1, h=np*hn)
@@ -1669,6 +1674,8 @@ class CrossAttention(Attention):
         Derives `query` tensor from `hidden_states`, and `key`/`value` tensors
         from `key_value_states`.
         """
+        assert not output_gate, "Output gate is not supported in cross attention for now."
+
         assert split_qkv, "split_qkv must be True for CrossAttention"
         assert not output_gate, "Output gate is not supported in cross attention for now."
 

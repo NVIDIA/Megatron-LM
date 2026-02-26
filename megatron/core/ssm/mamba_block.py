@@ -26,7 +26,7 @@ from megatron.core.ssm.mamba_hybrid_layer_allocation import allocate_layers
 from megatron.core.transformer import TransformerConfig
 from megatron.core.transformer.enums import CudaGraphScope
 from megatron.core.transformer.identity_op import IdentityOp
-from megatron.core.transformer.module import MegatronModule
+from megatron.core.transformer.module import GraphableMegatronModule, MegatronModule
 from megatron.core.transformer.spec_utils import ModuleSpec, build_module
 from megatron.core.transformer.transformer_layer import TransformerLayer
 from megatron.core.transformer.utils import sharded_state_dict_default
@@ -46,15 +46,13 @@ class MambaStackSubmodules:
     mtp_block_spec: Optional[ModuleSpec] = None
 
 
-class MambaStack(MegatronModule):
+class MambaStack(GraphableMegatronModule, MegatronModule):
     """
     Constructor for the MambaStack class.
 
     Args:
         config (TransformerConfig): the model configuration
         submodules (MambaStackSubmodules): the submodules for the stack
-        residual_in_fp32 (bool, optional): whether to do residual connections
-            in fp32. Defaults to False.
         pre_process (bool, optional): whether to include an embedding layer.
             Defaults to True.
         hybrid_attention_ratio (float, optional): the target ratio of attention layers to
@@ -77,7 +75,6 @@ class MambaStack(MegatronModule):
         self,
         config: TransformerConfig,
         submodules: MambaStackSubmodules,
-        residual_in_fp32=False,
         pre_process: bool = True,
         hybrid_attention_ratio: float = 0.0,
         hybrid_mlp_ratio: float = 0.0,
@@ -90,7 +87,6 @@ class MambaStack(MegatronModule):
         is_mtp_layer: bool = False,
     ) -> None:
         super().__init__(config=config)
-        self.residual_in_fp32 = residual_in_fp32
         self.pre_process = pre_process
         self.post_layer_norm = post_layer_norm
         self.post_process = post_process
@@ -146,7 +142,6 @@ class MambaStack(MegatronModule):
                     layer = build_module(
                         submodules.mamba_layer,
                         config=self.config,
-                        residual_in_fp32=residual_in_fp32,
                         layer_number=i + 1 + pp_layer_offset,
                         pp_layer_offset=pp_layer_offset,
                         pg_collection=pg_collection,
@@ -266,14 +261,15 @@ class MambaStack(MegatronModule):
         """
         Check if we should call the local cudagraph path.
         """
-        if not self.training and (
-            hasattr(self, 'cudagraph_manager')
+        if (
+            not self.training
+            and hasattr(self, 'cudagraph_manager')
             and kwargs['attention_mask'] is None
             and (
                 kwargs.get('inference_context') is not None
                 or kwargs.get('inference_params') is not None
             )
-            and CudaGraphScope.full_iteration in self.config.cuda_graph_scope
+            and CudaGraphScope.full_iteration_inference in self.config.cuda_graph_scope
         ):
             if kwargs['inference_context'].is_static_batching():
                 using_cuda_graph = kwargs['inference_context'].is_decode_only()
@@ -291,6 +287,7 @@ class MambaStack(MegatronModule):
                 if isinstance(kwargs['hidden_states'], WrappedTensor)
                 else kwargs['hidden_states']
             )
+            return super().__call__(*args, **kwargs)[0]
         return super().__call__(*args, **kwargs)
 
     def forward(

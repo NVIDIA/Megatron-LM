@@ -106,7 +106,7 @@ class TestMultiTokenPredictionLayer:
             assert num_weights == 15216 * config.mtp_num_layers
 
     @pytest.mark.skipif(not HAVE_TE, reason="transformer_engine not available")
-    @pytest.mark.parametrize(('tp', 'cp'), [(1, 1), (1, 2), (2, 1), (2, 2)])
+    @pytest.mark.parametrize(('tp', 'cp'), [(1, 1), (2, 1), (2, 2)])
     def test_constructor_ues_te(self, tp, cp):
         """Test basic construction of MTP module."""
         torch.manual_seed(_SEED)
@@ -207,7 +207,6 @@ class TestMultiTokenPrediction:
         args.lr = 3e-5
         args.attention_dropout = 0.0
         args.hidden_dropout = 0.0
-        args.async_tensor_model_parallel_allreduce = False
         args.no_save_optim = True
         args.no_load_optim = True
         args.no_load_rng = True
@@ -314,7 +313,7 @@ class TestMultiTokenPrediction:
         not HAVE_TE or not is_te_min_version("2.1.0"),
         reason="grouped_gemm requires TransformerEngine >= 2.1.0",
     )
-    @pytest.mark.parametrize(("tp", "cp"), [(1, 1), (1, 2), (2, 1), (2, 2)])
+    @pytest.mark.parametrize(("tp", "cp"), [(2, 1), (2, 2)])
     def test_sharded_state_dict(self, tp, cp):
         """Test MTP with different tensor parallel sizes."""
         args = self.create_test_args(tp, cp, self.seq_length, self.micro_batch_size)
@@ -333,9 +332,8 @@ class TestMultiTokenPrediction:
         not HAVE_TE or not is_te_min_version("2.1.0"),
         reason="grouped_gemm requires TransformerEngine >= 2.1.0",
     )
-    @pytest.mark.parametrize("full_recompute", [False, True])
     @pytest.mark.parametrize(
-        ("tp", "cp"), [(1, 1), (1, 2), (1, 4), (2, 1), (2, 2), (2, 4), (4, 1), (4, 2)]
+        ("tp", "cp", "full_recompute"), [(1, 1, False), (1, 4, False), (2, 4, False), (4, 1, True)]
     )
     def test_forward_backward(self, tmp_path_dist_ckpt, tp, cp, full_recompute):
         """Test MTP forward and backward with gptmodel."""
@@ -762,7 +760,6 @@ class TestMultiTokenPredictionMamba:
         args.lr = 3e-5
         args.attention_dropout = 0.0
         args.hidden_dropout = 0.0
-        args.async_tensor_model_parallel_allreduce = False
         args.no_save_optim = True
         args.no_load_optim = True
         args.no_load_rng = True

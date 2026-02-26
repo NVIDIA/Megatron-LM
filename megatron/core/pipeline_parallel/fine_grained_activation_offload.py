@@ -1256,7 +1256,6 @@ class FineGrainedActivationOffloadingInterface:
         torch.cuda.current_stream().record_event(event)
         torch.cuda.current_stream().wait_stream(d2h_stream)
 
-    @staticmethod
     def reset():
         """Reset the chunk handler."""
         PipelineOffloadManager.get_instance().reset()

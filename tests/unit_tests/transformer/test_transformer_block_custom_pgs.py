@@ -68,7 +68,7 @@ class HeterogenousTransformerLayer(TransformerLayer):
         # Temporarily replace attention and MLP with IdentityOp,
         # This is a temporary workaround for the test until we have a better interface
         # will rebuild them with custom process groups after super init
-        def _modify_submodules(submodules):
+        def _modify_submodules(submodules: TransformerLayerSubmodules):
             submodules.self_attention = IdentityOp
             submodules.mlp = IdentityOp
             return submodules

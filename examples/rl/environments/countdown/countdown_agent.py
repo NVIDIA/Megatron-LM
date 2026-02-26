@@ -10,6 +10,7 @@ from .countdown import compute_score
 
 
 class CountdownAgent(RewardOnlyAgent, HFDatasetAgent):
+    env_id: str = "countdown"
 
     def make_prefix(self, target, nums) -> str:
         prefix = f"""Using the numbers {nums}, create an equation that equals {target}. You can use basic arithmetic operations (+, -, *, /) and each number can only be used once. 

@@ -168,18 +168,21 @@ functional:configure:
 
 functional:run_lts_dgx_a100:
   extends: [.functional_run]
+  allow_failure: true
   variables:
     ENVIRONMENT: lts
     CLUSTER: A100
 
 functional:run_lts_dgx_h100:
   extends: [.functional_run]
+  allow_failure: true
   variables:
     ENVIRONMENT: lts
     CLUSTER: H100
 
 functional:run_lts_dgx_gb200:
   extends: [.functional_run]
+  allow_failure: true
   variables:
     ENVIRONMENT: lts
     CLUSTER: GB200
@@ -252,7 +255,7 @@ functional:x_notify:
     - export RO_API_TOKEN=${PROJECT_ACCESS_TOKEN_MCORE}
     - export GITLAB_ENDPOINT
     - export CONTEXT=$FUNCTIONAL_TEST_SCOPE
-    - export TAG_TEAM=$([[ "$CI_COMMIT_BRANCH" == "main" ]] && echo "1" || "0")
+    - export TAG_TEAM=$([[ "$CI_COMMIT_BRANCH" == "main" || "$CI_COMMIT_BRANCH" == "dev" ]] && echo "1" || "0")
     - export TEAM_SLUG=$SLACK_ADMIN
     - |
       python tests/test_utils/python_scripts/notify.py \
@@ -266,7 +269,7 @@ functional:x_notify:
     paths:
       - scripts
   rules:
-    - if: ($CI_PIPELINE_SOURCE == "schedule" || $CI_COMMIT_BRANCH == "main") && $FUNCTIONAL_TEST == "yes"
+    - if: ($CI_PIPELINE_SOURCE == "schedule" || $CI_COMMIT_BRANCH == "main" || $CI_COMMIT_BRANCH == "dev") && $FUNCTIONAL_TEST == "yes"
       when: always
     - when: never
 

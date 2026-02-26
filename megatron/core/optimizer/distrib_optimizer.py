@@ -52,6 +52,7 @@ from ..distributed.param_and_grad_buffer import _ParamAndGradBuffer, partition_b
 from ..fp8_utils import dequantize_fp8_tensor, is_float8tensor, quantize_param_shard
 from ..transformer.fsdp_dtensor_checkpoint import handle_experts_in_state_dict
 from ..transformer.module import MegatronModule
+from .cpu_offloading.optimizer_state_offloader import OptimizerStateOffloader
 from .grad_scaler import MegatronGradScaler
 from .optimizer import MixedPrecisionOptimizer, _zero_grad_group_helper, param_group_identifier_keys
 from .optimizer_config import OptimizerConfig
@@ -519,6 +520,8 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
             "due to checkpointing requirements."
         )
 
+        self._state_offloader: Optional[OptimizerStateOffloader] = None
+
         # when freezing sub-models we have no real optimizer
         # but still need a stub DistributedOptimizer class
         if optimizer is None:
@@ -606,6 +609,9 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
         else:
             self.optimizer.param_groups = [g["orig_group"] for g in self.opt_group_ranges]
             self.optimizer.load_state_dict(self.optimizer.state_dict())
+
+        if self.config.offload_optimizer_states:
+            self._state_offloader = OptimizerStateOffloader(self)
 
     def _get_model_param_range_map(self, param: torch.nn.Parameter):
         """
@@ -896,6 +902,8 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
             sharded_model_param = self.optimizer.param_groups[group_index]["params"][group_order]
             tensors = {}
             for k in self.optimizer.state[sharded_model_param]:
+                if not isinstance(self.optimizer.state[sharded_model_param][k], torch.Tensor):
+                    continue
                 if isinstance(self.optimizer, HybridDeviceOptimizer):
                     tensors[k] = self.optimizer.state[sharded_model_param][k]
                     continue
@@ -905,7 +913,10 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
         else:
             main_param = self.optimizer.param_groups[group_index]["params"][group_order]
             optim_state = self.optimizer.state[main_param]
-            tensors = {"param": main_param, **optim_state}
+            tensors = {"param": main_param}
+            for k, v in optim_state.items():
+                if isinstance(v, torch.Tensor):
+                    tensors[k] = v
         return tensors
 
     def _set_main_param_and_optimizer_states(self, model_param, tensors):
@@ -922,6 +933,8 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
         if self.config.use_precision_aware_optimizer_no_fp8_or_ds_fp8:
             sharded_model_param = self.optimizer.param_groups[group_index]["params"][group_order]
             for k, v in tensors.items():
+                if not isinstance(v, torch.Tensor):
+                    continue
                 if isinstance(self.optimizer, HybridDeviceOptimizer):
                     if k == "param":
                         k = "master_param"
@@ -935,8 +948,13 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
         else:
             main_param = self.optimizer.param_groups[group_index]["params"][group_order]
             optim_state = self.optimizer.state[main_param]
-            dst_tensors = {"param": main_param, **optim_state}
+            dst_tensors = {"param": main_param}
+            for k, v in optim_state.items():
+                if isinstance(v, torch.Tensor):
+                    dst_tensors[k] = v
             for key in dst_tensors:
+                if not isinstance(tensors[key], torch.Tensor):
+                    continue
                 dst_tensors[key].copy_(tensors[key])
 
     def get_parameter_state_dp_reshardable(self):
@@ -2527,7 +2545,7 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
             for name, model_param in model_chunk.named_parameters():
                 while name.startswith("module."):
                     name = name[len("module.") :]
-                matched_keys = [k for k in names_in_state_dict if name in k]
+                matched_keys = [k for k in names_in_state_dict if k.endswith(name)]
                 assert (
                     len(matched_keys) == 1
                 ), f"Parameter {name} has {len(matched_keys)} matches in state dict"
@@ -2600,6 +2618,8 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
         Under the hood, either launch synchronous param all-gathers or get ready to launch
         asynchorous all-gathers that get overlapped with the next forward pass.
         """
+        if self._state_offloader is not None:
+            self._state_offloader.sync_before_step()
         update_successful = super().step_with_ready_grads()
 
         timers = self.config.timers
@@ -2620,4 +2640,22 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
         if timers is not None:
             timers('params-all-gather').stop()
 
+        if self._state_offloader is not None:
+            self._state_offloader.mark_optimizer_states_initialized()
+
         return update_successful
+
+    def offload_states(self):
+        """Offload states to CPU."""
+        if self._state_offloader is not None:
+            self._state_offloader.offload()
+
+    def reload_offloaded_states(self):
+        """Start async reload of offloaded states."""
+        if self._state_offloader is not None:
+            self._state_offloader.reload()
+
+    def release_offloaded_gpu_states(self):
+        """Release GPU memory after D2H completes. For delayed release case."""
+        if self._state_offloader is not None:
+            self._state_offloader.release_gpu_memory()

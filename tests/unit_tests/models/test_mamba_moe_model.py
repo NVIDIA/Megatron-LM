@@ -37,7 +37,6 @@ GOLDEN_CONFIG: Dict[str, Any] = {
     "apply_query_key_layer_scaling": False,
     "apply_residual_connection_post_layernorm": False,
     "apply_rope_fusion": False,
-    "async_tensor_model_parallel_allreduce": True,
     "attention_backend": {
         "__objclass__": "megatron.core.transformer.enums.AttnBackend",
         "_name_": "flash",
@@ -156,7 +155,6 @@ GOLDEN_CONFIG: Dict[str, Any] = {
     "moe_deepep_num_sms": 20,
     "moe_enable_deepep": False,
     "moe_expert_capacity_factor": None,
-    "moe_extended_tp": False,
     "moe_ffn_hidden_size": 1856,
     "moe_flex_dispatcher_backend": "deepep",
     "moe_grouped_gemm": True,
@@ -277,6 +275,9 @@ GOLDEN_CONFIG: Dict[str, Any] = {
     "offload_modules": [],
     "hybrid_context_parallel": False,
     "max_seqlen_per_dp_cp_rank": None,
+    "fallback_to_eager_attn": False,
+    "linear_attention_type": None,
+    "moe_router_force_biased": None,
 }
 # Fields to ignore entirely (ephemeral, environment-specific, very large).
 SKIP_FIELDS = set()
@@ -438,7 +439,6 @@ class TestMambaMoEModel:
         args.padded_vocab_size = 131072
 
         # The following args would be set in the user's nano v3 config.
-        args.async_tensor_model_parallel_allreduce = True
         args.attention_backend = AttnBackend.flash
         args.bf16 = True
         args.ckpt_format = 'torch_dist'
