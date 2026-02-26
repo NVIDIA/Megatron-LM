@@ -300,24 +300,25 @@ class MoELayer(BaseMoELayer):
         )
 
     def set_is_inference_cuda_graphed_iteration(self, set_to: bool):
-        """Toggle CUDA-graphed iteration mode on this layer, its router, and its experts."""
+        """Toggle CUDA-graphed iteration mode on this layer, its router, and its experts.
+
+        When enabled, swaps in the inference-optimized token dispatcher and disables
+        shared expert overlap. When disabled, restores the standard dispatcher.
+        """
         self.is_inference_cuda_graphed_iteration = set_to
         if hasattr(self.router, "set_is_inference_cuda_graphed_iteration"):
             self.router.set_is_inference_cuda_graphed_iteration(set_to)
         if hasattr(self.experts, "set_is_inference_cuda_graphed_iteration"):
             self.experts.set_is_inference_cuda_graphed_iteration(set_to)
 
-    def _activate_inference_token_dispatcher(self):
-        """Swap in the inference-optimized token dispatcher."""
-        self._saved_token_dispatcher = self.token_dispatcher
-        self.token_dispatcher = self._inference_token_dispatcher
-        self._saved_shared_expert_overlap = self.shared_expert_overlap
-        self.shared_expert_overlap = False
-
-    def _deactivate_inference_token_dispatcher(self):
-        """Restore the standard token dispatcher."""
-        self.token_dispatcher = self._saved_token_dispatcher
-        self.shared_expert_overlap = self._saved_shared_expert_overlap
+        if set_to and self._inference_token_dispatcher is not None:
+            self._saved_token_dispatcher = self.token_dispatcher
+            self.token_dispatcher = self._inference_token_dispatcher
+            self._saved_shared_expert_overlap = self.shared_expert_overlap
+            self.shared_expert_overlap = False
+        elif not set_to and hasattr(self, "_saved_token_dispatcher"):
+            self.token_dispatcher = self._saved_token_dispatcher
+            self.shared_expert_overlap = self._saved_shared_expert_overlap
 
 
     @maybe_skip_or_early_return_by_cudagraph("route")
@@ -463,16 +464,6 @@ class MoELayer(BaseMoELayer):
         if padding_mask is not None:
             padding_mask = padding_mask.transpose(0, 1).bool()
 
-        # Swap in inference-optimized dispatcher for CUDA-graphed inference iterations
-        _use_inference_dispatcher = (
-            self.config.transformer_impl == "inference_optimized"
-            and not self.training
-            and self.is_inference_cuda_graphed_iteration
-            and self._inference_token_dispatcher is not None
-        )
-        if _use_inference_dispatcher:
-            self._activate_inference_token_dispatcher()
-
         # MoE forward: route -> dispatch -> compute -> combine
         def custom_forward(hidden_states, intermediate_tensors=None, padding_mask=None):
             try:
@@ -517,7 +508,7 @@ class MoELayer(BaseMoELayer):
 
             return output, mlp_bias
 
-        if self.moe_layer_recompute and not _use_inference_dispatcher:
+        if self.moe_layer_recompute and self.training:
             if self.config.fp8 or self.config.fp4:
                 outputs = te_checkpoint(
                     custom_forward,
@@ -534,9 +525,6 @@ class MoELayer(BaseMoELayer):
                 )
         else:
             outputs = custom_forward(hidden_states, intermediate_tensors, padding_mask)
-
-        if _use_inference_dispatcher:
-            self._deactivate_inference_token_dispatcher()
 
         return outputs
 
