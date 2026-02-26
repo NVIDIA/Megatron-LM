@@ -342,7 +342,7 @@ class _ParamAndGradBucketGroup:
 
             # For the mxfp8_param with "reuse_grad_buf_for_mxfp8_param_ag=True",
             # we need to copy the param_data from the shared_param/grad_buffer to param.data
-            # after the param all-gather.           
+            # after the param all-gather.
             if self.ddp_config.reuse_grad_buf_for_mxfp8_param_ag:
                 for bucket in self.buckets:
                     is_bf16_weight_bucket = False
