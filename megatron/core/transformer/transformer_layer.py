@@ -1290,6 +1290,9 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
             if self.offload_mlp_norm:
                 self.offload_module_in_cuda_graph = True
         if self.offload_module_in_cuda_graph:
+            assert is_torch_min_version(
+                "2.9.0a0"
+            ), "Offloading modules captured in cuda graph requires torch>=2.9.0."
             assert is_te_min_version(
                 "2.13.0"
             ), "Offloading modules captured in cuda graph requires TE>=2.13.0."
