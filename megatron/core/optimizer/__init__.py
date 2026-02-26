@@ -110,21 +110,24 @@ def get_mup_config_overrides(
 ) -> Dict[ParamKey, ParamGroupOverride]:
     """Get MuP config overrides for per-layer LR and Adam epsilon scaling.
 
-    In MuP, hidden layer learning rates are scaled by 1/width_mult to ensure
-    that parameter updates remain O(1) as model width increases. This enables
-    hyperparameter transfer from a smaller proxy model to a larger target model.
+    In MuP, optimizer learning rates are adjusted by parameter class to ensure
+    stable update scales across model widths and enable hyperparameter transfer.
 
     MuP optimizer scaling rules (as implemented here):
     - Adam/AdamW:
       - hidden (matrix-like) lr = base_lr / width_mult
       - hidden (matrix-like) eps = base_eps / width_mult
+      - vector-like params keep base lr and eps
+    - SGD:
+      - vector-like lr = base_lr * width_mult
+      - hidden (matrix-like) lr keeps base_lr in the current uniform-width setup
+      - no eps override is applied
     - Non-Adam optimizers:
       - hidden (matrix-like) lr = base_lr / width_mult
       - no eps override is applied.
-    - SGD: no MuP optimizer overrides are applied.
 
-    Embedding/output and other vector-like parameters keep base LR and base eps.
-    With decoupled_lr enabled, embedding/output params continue using decoupled LR.
+    With decoupled_lr enabled, embedding/output params continue using decoupled LR
+    and MuP will not override those explicit decoupled values.
 
     Args:
         config (OptimizerConfig): optimizer configuration object.
@@ -134,27 +137,30 @@ def get_mup_config_overrides(
     Returns:
         Dict[ParamKey, ParamGroupOverride]: MuP optimizer overrides.
     """
+    optimizer_type_lower = optimizer_type.lower()
+    is_sgd_optimizer = optimizer_type_lower == 'sgd'
+    is_adam_optimizer = 'adam' in optimizer_type_lower
+
     decoupled_lr_enabled = config.decoupled_lr is not None
     if decoupled_lr_enabled:
+        message = (
+            "Both decoupled_lr and MuP LR scaling are enabled. decoupled_lr sets an "
+            "absolute LR for embedding+output params, and MuP LR scaling will not "
+            "override those parameters."
+        )
+        if is_adam_optimizer:
+            message += (
+                " MuP Adam epsilon scaling remains applied to hidden matrix-like parameters."
+            )
         log_single_rank(
             logger,
             logging.WARNING,
-            "Both decoupled_lr and MuP LR scaling are enabled. decoupled_lr sets an "
-            "absolute LR for embedding+output params. MuP LR scaling will only be "
-            "applied to hidden layers in this case. MuP Adam epsilon scaling "
-            "remains applied to hidden matrix-like parameters.",
+            message,
         )
 
     if mup_width_mult == 1.0:
         # No scaling needed when width_mult is 1
         return {}
-
-    # SGD is width-invariant, no scaling needed.
-    if optimizer_type.lower() == 'sgd':
-        return {}
-
-    optimizer_type_lower = optimizer_type.lower()
-    is_adam_optimizer = 'adam' in optimizer_type_lower
 
     hidden_lr_mult = 1.0 / mup_width_mult
     base_lr = config.lr
@@ -182,6 +188,13 @@ def get_mup_config_overrides(
             return False
         return not is_vector_like_parameter(param, param_name)
 
+    def should_scale_vector_like_lr_with_mup(
+        param: torch.nn.Parameter, param_name: str
+    ) -> bool:
+        if decoupled_lr_enabled and getattr(param, 'is_embedding_or_output_parameter', False):
+            return False
+        return is_vector_like_parameter(param, param_name)
+
     def should_scale_eps_with_mup(param: torch.nn.Parameter, param_name: str) -> bool:
         if is_vector_like_parameter(param, param_name):
             return False
@@ -190,6 +203,25 @@ def get_mup_config_overrides(
         return True
 
     mup_overrides: Dict[ParamKey, ParamGroupOverride] = {}
+
+    if is_sgd_optimizer:
+        vector_like_lr_mult = mup_width_mult
+        vector_like_lr_override: ParamGroupOverride = {}
+        if base_lr is not None:
+            vector_like_lr_override["max_lr"] = base_lr * vector_like_lr_mult
+        if base_min_lr is not None:
+            vector_like_lr_override["min_lr"] = base_min_lr * vector_like_lr_mult
+
+        if vector_like_lr_override:
+            vector_like_predicate = ParamWithNamePredicate(
+                name="mup_sgd_vector_like_excluding_embedding_output",
+                fn=should_scale_vector_like_lr_with_mup,
+            )
+            mup_overrides[ParamKey(with_name_predicate=vector_like_predicate)] = (
+                vector_like_lr_override
+            )
+
+        return mup_overrides
 
     lr_override: ParamGroupOverride = {}
     if base_lr is not None:

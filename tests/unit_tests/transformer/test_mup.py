@@ -378,18 +378,109 @@ class TestMuPConfigIntegration:
 class TestMuPOptimizerTypeHandling:
     """Tests for MuP optimizer-specific override behavior."""
 
-    def test_sgd_no_lr_scaling(self):
-        """SGD optimizer should NOT scale LR with width (case insensitive)."""
+    def test_sgd_scales_vector_like_lr_only(self):
+        """SGD scales vector-like params by width_mult; hidden params keep base LR."""
         optimizer_config = OptimizerConfig(lr=1e-3, min_lr=1e-5)
         width_mult = 4.0
 
-        # Test various case variants
         for sgd_variant in ['sgd', 'SGD', 'Sgd']:
             overrides = get_mup_config_overrides(
                 optimizer_config, width_mult, optimizer_type=sgd_variant
             )
-            # SGD should return empty overrides - no LR scaling
-            assert len(overrides) == 0, f"SGD variant '{sgd_variant}' should not scale LR"
+            assert len(overrides) == 1
+
+            param_key, override = next(iter(overrides.items()))
+            assert override['max_lr'] == pytest.approx(1e-3 * width_mult)
+            assert override['min_lr'] == pytest.approx(1e-5 * width_mult)
+            assert 'eps' not in override
+
+            hidden_param = torch.nn.Parameter(torch.zeros(10, 10))
+            bias_param = torch.nn.Parameter(torch.zeros(10))
+            embedding_param = torch.nn.Parameter(torch.zeros(10, 10))
+            embedding_param.is_embedding_parameter = True
+            output_param = torch.nn.Parameter(torch.zeros(10, 10))
+            output_param.is_embedding_parameter = True
+
+            assert param_key.matches(hidden_param, 'decoder.layer.0.weight') is False
+            assert param_key.matches(bias_param, 'decoder.layer.0.bias') is True
+            assert param_key.matches(embedding_param, 'embedding.word_embeddings.weight') is True
+            assert param_key.matches(output_param, 'output_layer.weight') is True
+
+    def test_sgd_with_decoupled_lr_preserves_embedding_output_precedence(self):
+        """With decoupled_lr, embedding/output keep decoupled LR under SGD MuP."""
+        optimizer_config = OptimizerConfig(
+            lr=1e-3, min_lr=1e-5, decoupled_lr=2e-4, decoupled_min_lr=2e-6
+        )
+        width_mult = 4.0
+
+        standard_overrides = get_standard_config_overrides(optimizer_config)
+        mup_overrides = get_mup_config_overrides(optimizer_config, width_mult, optimizer_type='sgd')
+        combined_overrides = {**standard_overrides, **mup_overrides}
+
+        hidden_param = torch.nn.Parameter(torch.zeros(10, 10))
+        bias_param = torch.nn.Parameter(torch.zeros(10))
+        embedding_param = torch.nn.Parameter(torch.zeros(10, 10))
+        embedding_param.is_embedding_parameter = True
+        embedding_param.is_embedding_or_output_parameter = True
+        output_param = torch.nn.Parameter(torch.zeros(10, 10))
+        output_param.is_embedding_parameter = True
+        output_param.is_embedding_or_output_parameter = True
+        shared_output_param = torch.nn.Parameter(torch.zeros(10, 10))
+        shared_output_param.shared_embedding = True
+        shared_output_param.is_embedding_or_output_parameter = True
+
+        hidden_matches = [
+            override
+            for param_key, override in combined_overrides.items()
+            if param_key.matches(hidden_param, 'decoder.layer.0.weight')
+        ]
+        bias_matches = [
+            override
+            for param_key, override in combined_overrides.items()
+            if param_key.matches(bias_param, 'decoder.layer.0.bias')
+        ]
+        embedding_matches = [
+            override
+            for param_key, override in combined_overrides.items()
+            if param_key.matches(embedding_param, 'embedding.word_embeddings.weight')
+        ]
+        output_matches = [
+            override
+            for param_key, override in combined_overrides.items()
+            if param_key.matches(output_param, 'output_layer.weight')
+        ]
+        shared_output_matches = [
+            override
+            for param_key, override in combined_overrides.items()
+            if param_key.matches(shared_output_param, 'output_layer.weight')
+        ]
+
+        hidden_override = combine_param_group_overrides(hidden_matches)
+        bias_override = combine_param_group_overrides(bias_matches)
+        embedding_override = combine_param_group_overrides(embedding_matches)
+        output_override = combine_param_group_overrides(output_matches)
+        shared_output_override = combine_param_group_overrides(shared_output_matches)
+
+        # Hidden params keep base LR under SGD in current uniform-width setup.
+        assert 'max_lr' not in hidden_override
+        assert 'min_lr' not in hidden_override
+        assert 'eps' not in hidden_override
+
+        # Biases are vector-like and scale up by width_mult.
+        assert bias_override['max_lr'] == pytest.approx(1e-3 * width_mult)
+        assert bias_override['min_lr'] == pytest.approx(1e-5 * width_mult)
+        assert 'eps' not in bias_override
+
+        # Embedding/output params keep explicit decoupled LR precedence.
+        assert embedding_override['max_lr'] == pytest.approx(2e-4)
+        assert embedding_override['min_lr'] == pytest.approx(2e-6)
+        assert output_override['max_lr'] == pytest.approx(2e-4)
+        assert output_override['min_lr'] == pytest.approx(2e-6)
+        assert shared_output_override['max_lr'] == pytest.approx(2e-4)
+        assert shared_output_override['min_lr'] == pytest.approx(2e-6)
+        assert 'eps' not in embedding_override
+        assert 'eps' not in output_override
+        assert 'eps' not in shared_output_override
 
     def test_adam_scales_lr_by_default(self):
         """Adam optimizer should scale LR and eps; default optimizer_type is adam."""
