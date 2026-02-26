@@ -183,7 +183,7 @@ def sharded_tensor_to_torch_sharded_tensor(
         if not sh_ten.data.is_contiguous():
             sh_ten.data = sh_ten.data.contiguous()
 
-    local_global_offsets = {}
+    local_global_offsets: Dict[Tuple, List] = {}
 
     prepend_axis_num = sh_tens[0].prepend_axis_num
     # Determine local shards according to tensor type (see docs)
@@ -671,6 +671,7 @@ class TorchDistSaveShardedStrategy(AsyncSaveShardedStrategy):
             thread_count=self.thread_count,
             use_msc=MultiStorageClientFeature.is_enabled(),
             sequential=sequential,
+            use_cached_data_structure=self.use_cached_ckpt_structure,
         )
         # This should be set differently if we run in a smaller process group than the default
         coordinator = 0
@@ -943,7 +944,7 @@ class TorchDistLoadShardedStrategy(LoadShardedStrategy):
 
             ## finally, remove the files we want to drop
             for f in files_to_remove:
-                fs_writer.fs.rm_file(checkpoint_dir / f)
+                fs_writer.fs.rm_file(str(Path(checkpoint_dir) / f))
         except Exception as e:
             fs_writer.fs.rename(old_path, fs_writer.metadata_path)
             raise e

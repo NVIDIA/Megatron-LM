@@ -292,6 +292,12 @@ class PersistentAsyncCaller(AsyncCaller):
     Starts process asynchronously and allows checking if all processes on all ranks are done.
     """
 
+    # Worker-side cache for consistent data structures
+    # Key: identifier key
+    # Value: (separation_hint, items, resolved_data, thread_count, storage_plan)
+    # This cache contains IPC handles and must be cleaned up properly
+    _worker_data_cache: Dict = {}
+
     def __init__(self):
         self.process: mp.Process = None
         self.start_time: Optional[float] = None
@@ -445,6 +451,20 @@ class PersistentAsyncCaller(AsyncCaller):
     def __del__(self):
         self.close()
 
+    @classmethod
+    def cleanup_worker_data_cache(cls):
+        """Clean up the worker data cache and release IPC handles.
+
+        This function should be called when the async worker is being torn down
+        to properly release any IPC handles stored in the cache.
+        """
+        if cls._worker_data_cache:
+            logger.info(f"Cleaning up worker data cache with {len(cls._worker_data_cache)} entries")
+            # Clear all cached data structures which may contain IPC handles
+            cls._worker_data_cache.clear()
+            gc.collect()
+            torch.cuda.empty_cache()
+
     @staticmethod
     @_disable_gc()
     def async_loop(
@@ -507,6 +527,9 @@ class PersistentAsyncCaller(AsyncCaller):
                 queue.task_done()
 
         logger.debug(f"PersistentAsyncCaller: persistent ckpt worker for {rank}  has terminated")
+
+        # Cleanup worker data cache before exiting
+        PersistentAsyncCaller.cleanup_worker_data_cache()
 
 
 class _ActiveAsyncRequest(NamedTuple):
