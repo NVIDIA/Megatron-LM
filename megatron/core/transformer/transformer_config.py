@@ -2052,6 +2052,12 @@ class TransformerConfig(ModelParallelConfig):
                 "for inference_optimized transformer implementation."
             )
 
+        if self.inference_disable_triton_nvls_kernels:
+            assert self.transformer_impl == "inference_optimized", (
+                "inference_disable_triton_nvls_kernels is only supported "
+                "for inference_optimized transformer implementation."
+            )
+
         if self.batch_invariant_mode:
             assert (
                 self.attention_backend == AttnBackend.flash
