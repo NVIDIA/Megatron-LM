@@ -77,6 +77,9 @@ jobs:
         run: |
           # Skip SSO check for scheduled jobs, main branch, dev branch, or merge groups
           if [ "${{ env.SCHEDULED_JOB }}" == "true" ] || [ "${IS_MAIN_BRANCH}" == "true" ] || [ "${IS_DEV_BRANCH}" == "true" ] || [ "${IS_MERGE_GROUP}" == "true" ]; then
+            echo "is_maintainer=true" | tee -a $GITHUB_OUTPUT
+            exit 0
+          fi
 
           # Use SSO membership check result
           IS_MEMBER="${{ steps.check-sso.outputs.is_member }}"
@@ -126,7 +129,7 @@ jobs:
   pre-flight:
     needs: [is-not-external-contributor]
     if: github.repository == 'NVIDIA/Megatron-LM'
-    uses: NVIDIA-NeMo/FW-CI-templates/.github/workflows/_cicd_preflight.yml@v0.65.10
+    uses: NVIDIA-NeMo/FW-CI-templates/.github/workflows/_cicd_preflight.yml@v0.73.2
 
   linting:
     runs-on: ubuntu-latest
@@ -185,6 +188,127 @@ jobs:
         run: |
           echo "Running CI tests"
           echo "is_merge_group: ${{ needs.pre-flight.outputs.is_merge_group }}"
+
+  cicd-parse-downstream-testing:
+    runs-on: ubuntu-latest
+    needs:
+      - pre-flight
+      - cicd-wait-in-queue
+    if: |
+      needs.pre-flight.result != 'cancelled'
+      && needs.cicd-wait-in-queue.result != 'cancelled'
+      && (
+        success()
+        || needs.pre-flight.outputs.is_ci_workload == 'true'
+        || needs.pre-flight.outputs.force_run_all == 'true'
+        || needs.pre-flight.outputs.is_merge_group == 'true'
+      )
+      && !cancelled()
+    outputs:
+      mbridge-test-suite: ${{ steps.select-mbridge-test-suite.outputs.main }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Get PR info
+        id: get-pr-info
+        if: startsWith(github.ref, 'refs/heads/pull-request/')
+        uses: nv-gha-runners/get-pr-info@main
+
+      - name: Select MBridge test suite
+        id: select-mbridge-test-suite
+        env:
+          GH_TOKEN: ${{ secrets.PAT }}
+        run: |
+          PR_NUMBER=${{ fromJSON(steps.get-pr-info.outputs.pr-info || '{}').number }}
+          TEST_SUITE=$(gh pr view $PR_NUMBER --json labels | jq -r 'if [.labels[].name] | any(. == "Run MBridge tests") then "all" else "unit-only" end')
+          echo "main=$TEST_SUITE" | tee -a $GITHUB_OUTPUT
+
+      - name: How-To
+        run: bash .github/scripts/readme.sh
+
+  cicd-mbridge-testing:
+    runs-on: ubuntu-latest
+    needs:
+      - pre-flight
+      - cicd-wait-in-queue
+      - cicd-parse-downstream-testing
+    if: |
+      needs.pre-flight.result != 'cancelled'
+      && needs.cicd-wait-in-queue.result != 'cancelled'
+      && needs.cicd-parse-downstream-testing.result != 'cancelled'
+      && (
+        success()
+        || needs.pre-flight.outputs.is_ci_workload == 'true'
+        || needs.pre-flight.outputs.force_run_all == 'true'
+        || needs.pre-flight.outputs.is_merge_group == 'true'
+      )
+      && !cancelled()
+    steps:
+      - name: Get PR info
+        id: get-pr-info
+        if: startsWith(github.ref, 'refs/heads/pull-request/')
+        uses: nv-gha-runners/get-pr-info@main
+
+      - name: Checkout MBridge and create testing branch
+        uses: actions/checkout@v4
+        with:
+          ref: main
+          repository: NVIDIA-NeMo/Megatron-Bridge
+          path: megatron-bridge
+          token: ${{ secrets.PAT }}
+
+      - name: Create testing branch
+        env:
+          MBRIDGE_BRANCH_NAME: mcore-testing-${{ fromJSON(steps.get-pr-info.outputs.pr-info || '{}').number || github.run_id }}
+        run: |
+          cd megatron-bridge
+          git fetch origin main
+          git checkout -b ${{ env.MBRIDGE_BRANCH_NAME }} origin/main
+          git push origin ${{ env.MBRIDGE_BRANCH_NAME }} --force
+
+      - name: Get merge commit sha
+        shell: bash -x -e -u -o pipefail {0}
+        id: sha
+        env:
+          IS_PR: ${{ startsWith(github.ref, 'refs/heads/pull-request/') }}
+          IS_MERGE_GROUP: ${{ github.event_name == 'merge_group' }}
+        run: |
+          if [[ "$IS_PR" == "true" ]]; then
+            SHA=${{ fromJSON(steps.get-pr-info.outputs.pr-info || '{}').merge_commit_sha }}
+          elif [[ "$IS_MERGE_GROUP" == "true" ]]; then
+            SHA=${{ github.event.merge_group.head_sha }}
+          else
+            SHA=${GITHUB_SHA}
+          fi
+          echo "main=${SHA}" | tee -a "$GITHUB_OUTPUT"
+
+      - name: Trigger MBridge tests
+        uses: convictional/trigger-workflow-and-wait@v1.6.5
+        env:
+          MBRIDGE_BRANCH_NAME: mcore-testing-${{ fromJSON(steps.get-pr-info.outputs.pr-info || '{}').number || github.run_id }}
+        with:
+          owner: NVIDIA-NeMo
+          repo: Megatron-Bridge
+          workflow_file_name: cicd-main.yml
+          github_token: ${{ secrets.PAT }}
+          ref: ${{ env.MBRIDGE_BRANCH_NAME }}
+          wait_interval: 60
+          propagate_failure: true
+          client_payload: |
+            {
+              "mcore_ref": "${{ steps.sha.outputs.main }}",
+              "test_suite": "${{ needs.cicd-parse-downstream-testing.outputs.mbridge-test-suite }}",
+              "triggered_by": "https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+            }
+
+      - name: Delete testing branch
+        if: always()
+        env:
+          MBRIDGE_BRANCH_NAME: mcore-testing-${{ fromJSON(steps.get-pr-info.outputs.pr-info || '{}').number || github.run_id }}
+        run: |
+          cd megatron-bridge
+          git push origin --delete ${{ env.MBRIDGE_BRANCH_NAME }}
 
   cicd-container-build:
     needs: [is-not-external-contributor, pre-flight, cicd-wait-in-queue]
@@ -350,7 +474,7 @@ jobs:
       - name: Parse unit tests
         id: parse-unit-tests
         run: |
-          cat tests/test_utils/recipes/unit-tests.yaml | yq -o json '[.products[].test_case[] | { "bucket": .}] | sort_by(.model, .test_case)' | jq -c > unit-tests.json
+          cat tests/test_utils/recipes/h100/unit-tests.yaml | yq -o json '[.products[].test_case[] | { "bucket": .}] | sort_by(.model, .test_case)' | jq -c > unit-tests.json
           echo "unit-tests=$(cat unit-tests.json)" | tee -a $GITHUB_OUTPUT
 
   cicd-unit-tests-latest:
@@ -568,8 +692,8 @@ jobs:
           GITHUB_RUN_ID: ${{ github.run_id }}
           SKIPPING_IS_ALLOWED: ${{ needs.pre-flight.outputs.docs_only == 'true' || needs.pre-flight.outputs.is_deployment_workflow == 'true' || needs.pre-flight.outputs.is_merge_group == 'true' || needs.pre-flight.outputs.is_ci_workload == 'true' }}
         run: |
-          FAILED_JOBS=$(gh run view $GITHUB_RUN_ID --json jobs --jq '[.jobs[] | select(.status == "completed" and .conclusion == "failure" and .name != "merge-queue-notification")] | length') || echo 0
-          SKIPPED_JOBS=$(gh run view $GITHUB_RUN_ID --json jobs --jq '[.jobs[] | select(.status == "completed" and .conclusion == "skipped" and .name != "merge-queue-notification")] | length') || echo 0
+          FAILED_JOBS=$(gh run view $GITHUB_RUN_ID --json jobs --jq '[.jobs[] | select(.status == "completed" and .conclusion == "failure" and .name != "merge-queue-notification" and .name != "cicd-mbridge-testing")] | length') || echo 0
+          SKIPPED_JOBS=$(gh run view $GITHUB_RUN_ID --json jobs --jq '[.jobs[] | select(.status == "completed" and .conclusion == "skipped" and .name != "merge-queue-notification" and .name != "cicd-mbridge-testing")] | length') || echo 0
 
           if [ "${FAILED_JOBS:-0}" -eq 0 ] && ([ "${SKIPPED_JOBS:-0}" -eq 0 ] || [ "$SKIPPING_IS_ALLOWED" == "true" ]); then
               echo "✅ All previous jobs completed successfully"

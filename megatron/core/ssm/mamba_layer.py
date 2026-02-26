@@ -6,7 +6,7 @@
 # LICENSE file in the root directory of this source tree.
 
 from dataclasses import dataclass, field
-from typing import Dict, Optional, Tuple, Union
+from typing import Dict, Optional, Protocol, Tuple, Union
 
 import torch
 from torch import Tensor
@@ -20,8 +20,16 @@ from megatron.core.transformer.enums import CudaGraphScope
 from megatron.core.transformer.identity_op import IdentityOp
 from megatron.core.transformer.module import GraphableMegatronModule
 from megatron.core.transformer.spec_utils import ModuleSpec, build_module
+from megatron.core.transformer.torch_norm import LayerNormInterface
 from megatron.core.transformer.transformer_config import TransformerConfig
+from megatron.core.typed_torch import apply_module
 from megatron.core.utils import deprecate_inference_params
+
+
+class LayerNormBuilder(Protocol):
+    """A protocol showing how MambaLayer expects to construct its LayerNorm."""
+
+    def __call__(self, config: TransformerConfig, hidden_size: int, /) -> LayerNormInterface: ...
 
 
 @dataclass
@@ -40,7 +48,7 @@ class MambaLayerSubmodules:
             after the mixer.
     """
 
-    norm: Union[ModuleSpec, type] = IdentityOp
+    norm: LayerNormBuilder = IdentityOp
     mixer: Union[ModuleSpec, type] = IdentityOp
     mamba_bda: Union[ModuleSpec, type] = IdentityOp
 
@@ -61,7 +69,6 @@ class MambaLayer(GraphableMegatronModule):
         config: TransformerConfig,
         submodules: MambaLayerSubmodules,
         layer_number: int = 1,
-        residual_in_fp32=False,
         pg_collection: ProcessGroupCollection = None,
         pp_layer_offset: int = 0,
     ):
@@ -72,7 +79,6 @@ class MambaLayer(GraphableMegatronModule):
         self.config = config
         self.submodules_config = submodules
         self.layer_number = layer_number
-        self.residual_in_fp32 = residual_in_fp32
         self.hidden_dropout = config.hidden_dropout
         self.mixer = build_module(
             submodules.mixer,
@@ -82,7 +88,7 @@ class MambaLayer(GraphableMegatronModule):
             pg_collection=pg_collection,
             pp_layer_offset=pp_layer_offset,
         )
-        self.norm = build_module(submodules.norm, self.config, self.config.hidden_size)
+        self.norm = submodules.norm(self.config, self.config.hidden_size)
         self.mamba_bda = build_module(submodules.mamba_bda)
         self.bias_dropout_add_exec_handler = torch.enable_grad
 
@@ -128,11 +134,11 @@ class MambaLayer(GraphableMegatronModule):
         inference_context = deprecate_inference_params(inference_context, inference_params)
 
         residual = hidden_states
-        if self.residual_in_fp32:
-            residual = residual.to(torch.float32)
+        if self.config.fp32_residual_connection:
+            residual = residual.float()
 
         hidden_states = hidden_states.to(dtype=self.config.params_dtype)
-        hidden_states = self.norm(hidden_states)
+        hidden_states = apply_module(self.norm)(hidden_states)
 
         mixer_out_with_bias = self.mixer(
             hidden_states, inference_context=inference_context, packed_seq_params=packed_seq_params
@@ -192,10 +198,11 @@ class MambaLayer(GraphableMegatronModule):
             hasattr(self, 'cudagraph_manager')
             and kwargs.get('attention_mask') is None
             and kwargs.get('inference_context') is not None
+            and not self.config.cuda_graph_scope  # empty-list = per-layer CUDA graphs
         ):
-            if hasattr(kwargs['inference_context'], "using_cuda_graph_this_step"):
-                return kwargs['inference_context'].using_cuda_graph_this_step()
-            else:
-                # static
-                return kwargs['inference_context'].is_decode_only()
+            context = kwargs['inference_context']
+            using_cuda_graph = (context.is_static_batching() and context.is_decode_only()) or (
+                not context.is_static_batching() and context.using_cuda_graph_this_step()
+            )
+            return using_cuda_graph
         return False

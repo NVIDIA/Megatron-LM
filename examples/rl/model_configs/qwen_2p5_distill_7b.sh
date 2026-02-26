@@ -44,7 +44,7 @@ MODEL_OPTIONS="\
   --ckpt-format torch \
   --seq-length $MAX_SEQ_LENGTH \
   --inference-max-seq-length $MAX_SEQ_LENGTH \
-  --inference-max-batch-size $MAX_INFERENCE_BS \
+  --inference-max-requests $MAX_INFERENCE_BS \
   --pretrained-checkpoint $CHECKPOINT \
   --untie-embeddings-and-output-weights \
   --disable-bias-linear \
@@ -70,8 +70,6 @@ MODEL_OPTIONS="\
   --max-position-embeddings 131072  \
   --tokenizer-type HuggingFaceTokenizer \
   --tokenizer-model "unsloth/DeepSeek-R1-Distill-Qwen-7B" \
-  --langrl-inference-server-type "inplace_megatron_chat" \
-  --langrl-inference-server-conversation-template "deepseek-ai/DeepSeek-R1-Distill-Qwen-7B" \
   --lr 0.000001 \
   --lr-warmup-samples 0 \
   --make-vocab-size-divisible-by 128 \
