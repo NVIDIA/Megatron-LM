@@ -41,7 +41,6 @@ class PackedSeqParams:
         # seq_idx is stored as a non-field attribute so dataclasses.fields() won't include it,
         # preventing it from being forwarded to TransformerEngine's attention forward().
 
-        # Example: [0, 5, 7, 11] -> [0, 5, 7, 11, 16]
         cu_seqlens = (
             self.cu_seqlens_q_padded if self.cu_seqlens_q_padded is not None else self.cu_seqlens_q
         )
@@ -49,6 +48,7 @@ class PackedSeqParams:
             total_tokens_tensor = torch.tensor(
                 [self.total_tokens], dtype=cu_seqlens.dtype, device=cu_seqlens.device
             )
+            # Example: [0, 5, 7, 11] -> [0, 5, 7, 11, 16]
             cu_seqlens_with_max = torch.cat([cu_seqlens, total_tokens_tensor])
             # Example: [0, 5, 7, 11, 16] -> [5, 2, 4, 5]
             seq_lengths = cu_seqlens_with_max[1:] - cu_seqlens_with_max[:-1]
