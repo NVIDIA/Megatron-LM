@@ -1088,31 +1088,18 @@ class TransformerConfig(ModelParallelConfig):
             self.expert_tensor_parallel_size > 1
         ):
             raise ValueError(
-                "Inference-optimized MoE layers currently only support data parallelism "
-                "(expert_model_parallel_size=1 and expert_tensor_parallel_size=1). "
-                "Multi-GPU support is planned for future work."
+                "Inference-optimized MoE layers does not support expert tensor parallelism."
             )
 
-        if self.transformer_impl == "inference_optimized" and (
-            self.moe_expert_capacity_factor is not None
-            or self.moe_router_padding_for_quantization
-        ):
-            raise ValueError(
-                "Inference-optimized MoE layers only support dropless MoE "
-                "(moe_expert_capacity_factor=None and moe_router_padding_for_quantization=False). "
-            )
-
-        # if self.transformer_impl == "inference_optimized" and self.num_moe_experts is not None:
-        #     if not self.moe_permute_fusion:
-        #         raise ValueError(
-        #             "Inference-optimized MoE layers require moe_permute_fusion=True "
-        #             "to use TE fused kernels that support GPU-resident metadata."
-        #         )
-        #     # if not self.moe_router_fusion:
-        #     #     raise ValueError(
-        #     #         "Inference-optimized MoE layers require moe_router_fusion=True "
-        #     #         "to use TE fused router kernels."
-        #     #     )
+        if self.transformer_impl == "inference_optimized":
+            if self.moe_expert_capacity_factor is not None:
+                raise ValueError(
+                    "Inference-optimized MoE layers only support dropless MoE "
+                )
+            if self.moe_router_padding_for_quantization:
+                raise ValueError(
+                    "Inference-optimized MoE layers do not support padded routing map for quantization."
+                )
 
         if self.num_moe_experts is not None and self.num_moe_experts <= 0:
             raise ValueError("num_moe_experts must be non-negative.")
