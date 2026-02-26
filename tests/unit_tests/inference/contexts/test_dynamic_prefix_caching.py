@@ -49,10 +49,7 @@ class PrefixCachingTestBase:
         max_tokens=None,
         block_evict_lru=True,
     ):
-        """Create a DynamicInferenceContext with sensible test defaults.
-
-        Note: block_evict_lru defaults to True so existing tests use LRU behavior.
-        """
+        """Create a DynamicInferenceContext with sensible test defaults."""
         DynamicInferenceContext.ROUNDER = rounder
         DynamicInferenceContext.TOKEN_ROUNDER = rounder
         DynamicInferenceContext.REQUEST_ROUNDER = rounder
@@ -105,122 +102,54 @@ class PrefixCachingTestBase:
         return [ctx.request_to_kv_block_ids[req_idx][i].item() for i in range(n)]
 
 
-# =========================================================================
-# Class 1: TestHashComputation (3 tests)
-# =========================================================================
+class _StubEngine(DynamicInferenceEngine):
+    """Lightweight engine subclass that skips full __init__ for unit testing."""
 
-
-class TestHashComputation(PrefixCachingTestBase):
-
-    @pytest.mark.internal
-    def test_hash_determinism_and_quality(self):
-        """Same tokens → same hash; different tokens → different; parent-sensitivity."""
-        tokens = self._prompt(32)
-        h1 = compute_block_hashes_batched(tokens, 32)
-        h2 = compute_block_hashes_batched(tokens, 32)
-        assert h1 == h2, "Hash should be deterministic"
-        assert len(h1) == 1
-        assert 1 <= h1[0] <= HASH_PRIME, "Hash should be in [1, HASH_PRIME]"
-
-        # Different tokens
-        h_diff = compute_block_hashes_batched(self._prompt(32, offset=1), 32)
-        assert h_diff[0] != h1[0]
-
-        # Parent sensitivity (two blocks: hash of block 1 depends on block 0)
-        two_blocks = torch.cat([tokens, self._prompt(32, offset=100)])
-        h_chain = compute_block_hashes_batched(two_blocks, 32)
-        assert len(h_chain) == 2
-        assert 1 <= h_chain[1] <= HASH_PRIME
-
-    @pytest.mark.internal
-    def test_precomputed_hash_chain(self):
-        """3-block request has correct precomputed hashes matching manual computation."""
-        ctx = self._ctx()
-        bs = ctx.block_size_tokens
-        prompt = self._prompt(bs * 3)
-
-        req = self._req(ctx, prompt)
-        assert len(req.precomputed_block_hashes) == 3
-
-        # Verify against manual computation via batched function
-        expected = compute_block_hashes_batched(prompt, bs)
-        assert req.precomputed_block_hashes == expected
-
-        # Identical requests produce identical hashes
-        req2 = self._req(ctx, prompt.clone(), request_id=2)
-        assert req.precomputed_block_hashes == req2.precomputed_block_hashes
-
-        # Hashes differ across blocks (due to chaining)
-        assert len(set(req.precomputed_block_hashes)) == 3
-
-    @pytest.mark.internal
-    def test_precomputed_hashes_edge_cases(self):
-        """Short, empty, single-token, all-zero, and very long prompts."""
-        ctx = self._ctx()
-        bs = ctx.block_size_tokens
-
-        # Shorter than block → empty hashes
-        req_short = self._req(ctx, self._prompt(bs // 2))
-        assert req_short.precomputed_block_hashes == []
-
-        # Empty prompt → empty hashes
-        empty = torch.tensor([], device=torch.cuda.current_device(), dtype=torch.long)
-        req_empty = self._req(ctx, empty)
-        assert req_empty.precomputed_block_hashes == []
-
-        # Single token → empty hashes
-        single = torch.tensor([42], device=torch.cuda.current_device(), dtype=torch.long)
-        req_single = self._req(ctx, single)
-        assert req_single.precomputed_block_hashes == []
-
-        # All-zero tokens → 4 unique hashes (parent chaining)
-        zeros = torch.zeros(bs * 4, device=torch.cuda.current_device(), dtype=torch.long)
-        req_zeros = self._req(ctx, zeros)
-        assert len(req_zeros.precomputed_block_hashes) == 4
-        assert len(set(req_zeros.precomputed_block_hashes)) == 4
-
-        # 120-block prompt → 120 hashes, all positive
-        ctx_long = self._ctx(max_sequence_length=8192)
-        long_prompt = torch.arange(bs * 120, device=torch.cuda.current_device(), dtype=torch.long)
-        req_long = self._req(ctx_long, long_prompt)
-        assert len(req_long.precomputed_block_hashes) == 120
-        assert all(h > 0 for h in req_long.precomputed_block_hashes)
+    def __init__(self, context: DynamicInferenceContext, *, enable_chunked_prefill=False):
+        self.context = context
+        self.enable_chunked_prefill = enable_chunked_prefill
+        self._prefix_coordination_waits = 0
+        self._loop = asyncio.new_event_loop()
+        self.waiting_request_ids: deque = deque()
+        self.requests = {}
 
 
 # =========================================================================
-# Class 2: TestPrefixSharing (4 tests)
+# Class 1: TestBlockSharingAndRefCounts (5 tests)
 # =========================================================================
 
 
-class TestPrefixSharing(PrefixCachingTestBase):
+class TestBlockSharingAndRefCounts(PrefixCachingTestBase):
 
     @pytest.mark.internal
-    def test_full_prefix_match(self):
-        """Identical prefix → all blocks shared, ref_count scales with N."""
+    def test_identical_prompts_share_all_blocks(self):
+        """N=10 identical requests use only K blocks, not N*K."""
         ctx = self._ctx()
         bs = ctx.block_size_tokens
         alloc = ctx.block_allocator
         prompt = self._prompt(bs * 3)
 
-        # First request
         ctx.add_request(self._req(ctx, prompt.clone()))
         first_blocks = self._block_ids(ctx, 0, 3)
+        avail_after_first = alloc.total_avail
 
-        # 9 more requests sharing the same prefix
         for i in range(2, 11):
             ctx.add_request(self._req(ctx, prompt.clone(), request_id=i))
 
-        # All share same blocks
+        # Pool unchanged after 9 more requests
+        assert alloc.total_avail == avail_after_first
+
+        # All share the same block IDs
         for req_idx in range(1, 10):
             assert self._block_ids(ctx, req_idx, 3) == first_blocks
 
-        # ref_count == 10
+        # Ref counts == 10
         for bid in first_blocks:
             assert alloc.block_ref_counts[bid].item() == 10
 
     @pytest.mark.internal
-    def test_partial_prefix_match(self):
-        """3-block request where block 2 differs → blocks 0,1 shared."""
+    def test_divergent_suffix_shares_common_prefix(self):
+        """[A,B,C] + [A,B,D]: blocks 0-1 shared (ref=2), blocks 2,3 separate (ref=1)."""
         ctx = self._ctx()
         bs = ctx.block_size_tokens
         alloc = ctx.block_allocator
@@ -229,7 +158,6 @@ class TestPrefixSharing(PrefixCachingTestBase):
         ctx.add_request(self._req(ctx, prompt1))
         r1 = self._block_ids(ctx, 0, 3)
 
-        # Same first 2 blocks, different 3rd
         prompt2 = prompt1.clone()
         prompt2[bs * 2 :] += 1000
         ctx.add_request(self._req(ctx, prompt2, request_id=2))
@@ -243,25 +171,8 @@ class TestPrefixSharing(PrefixCachingTestBase):
         assert alloc.block_ref_counts[r2[2]].item() == 1
 
     @pytest.mark.internal
-    def test_no_prefix_match(self):
-        """Completely different prefixes → no blocks shared."""
-        ctx = self._ctx()
-        bs = ctx.block_size_tokens
-        alloc = ctx.block_allocator
-
-        ctx.add_request(self._req(ctx, self._prompt(bs * 2)))
-        r1 = set(self._block_ids(ctx, 0, 2))
-
-        ctx.add_request(self._req(ctx, self._prompt(bs * 2, offset=1000), request_id=2))
-        r2 = set(self._block_ids(ctx, 1, 2))
-
-        assert r1.isdisjoint(r2)
-        for bid in r1 | r2:
-            assert alloc.block_ref_counts[bid].item() == 1
-
-    @pytest.mark.internal
-    def test_sequential_match_stops_at_gap(self):
-        """[X,W,Z] vs [X,Y,Z] → only block 0 shared; block 2 NOT shared."""
+    def test_broken_chain_stops_sharing(self):
+        """[X,W,Z] vs [X,Y,Z]: only block 0 shared due to parent chain break."""
         ctx = self._ctx()
         bs = ctx.block_size_tokens
         alloc = ctx.block_allocator
@@ -270,7 +181,6 @@ class TestPrefixSharing(PrefixCachingTestBase):
         ctx.add_request(self._req(ctx, prompt1))
         r1 = self._block_ids(ctx, 0, 3)
 
-        # Same block 0, different block 1, same block 2 tokens
         prompt2 = prompt1.clone()
         prompt2[bs : bs * 2] += 5000
         ctx.add_request(self._req(ctx, prompt2, request_id=2))
@@ -282,379 +192,9 @@ class TestPrefixSharing(PrefixCachingTestBase):
         assert alloc.block_ref_counts[r1[0]].item() == 2
         assert alloc.block_ref_counts[r1[1]].item() == 1
 
-
-# =========================================================================
-# Class 3: TestRefCountLifecycle (6 tests)
-# =========================================================================
-
-
-class TestRefCountLifecycle(PrefixCachingTestBase):
-
     @pytest.mark.internal
-    def test_ref_count_increment_decrement(self):
-        """ref=2 after sharing; ref=1 after one release; ref=0 + hash stays after both."""
-        ctx = self._ctx()
-        bs = ctx.block_size_tokens
-        alloc = ctx.block_allocator
-        prompt = self._prompt(bs * 2)
-
-        ctx.add_request(self._req(ctx, prompt.clone()))
-        ctx.add_request(self._req(ctx, prompt.clone(), request_id=2))
-
-        b0, b1 = self._block_ids(ctx, 0, 2)
-        b0_hash = alloc.block_hashes[b0].item()
-        assert alloc.block_ref_counts[b0].item() == 2
-        assert alloc.block_ref_counts[b1].item() == 2
-
-        # Release request 0
-        ctx.release_memory_blocks_from_request_indexes(torch.tensor([0]))
-        assert alloc.block_ref_counts[b0].item() == 1
-        assert b0_hash in alloc.hash_to_block_id
-
-        # Release request 1
-        ctx.release_memory_blocks_from_request_indexes(torch.tensor([1]))
-        assert alloc.block_ref_counts[b0].item() == 0
-        assert alloc.block_ref_counts[b1].item() == 0
-        assert b0_hash in alloc.hash_to_block_id  # still cached
-
-    @pytest.mark.internal
-    def test_reuse_after_release(self):
-        """Release → ref=0 → new request same prefix reuses same block IDs."""
-        ctx = self._ctx()
-        bs = ctx.block_size_tokens
-        alloc = ctx.block_allocator
-        prompt = self._prompt(bs * 2)
-
-        ctx.add_request(self._req(ctx, prompt.clone()))
-        b0, b1 = self._block_ids(ctx, 0, 2)
-
-        ctx.release_memory_blocks_from_request_indexes(torch.tensor([0]))
-        ctx.total_request_count = 0
-        assert alloc.block_ref_counts[b0].item() == 0
-        assert alloc.block_hashes[b0].item() in alloc.hash_to_block_id
-
-        # New request with same prefix
-        ctx.add_request(self._req(ctx, prompt.clone(), request_id=2))
-        assert self._block_ids(ctx, 0, 2) == [b0, b1]
-        assert alloc.block_ref_counts[b0].item() == 1
-        assert alloc.block_ref_counts[b1].item() == 1
-
-    @pytest.mark.internal
-    def test_eviction_under_pressure(self):
-        """Small buffer: active blocks protected; cached blocks evicted LRU-first."""
-        ctx = self._ctx(buffer_size_gb=0.01, rounder=1)
-        bs = ctx.block_size_tokens
-        alloc = ctx.block_allocator
-
-        # Active request (ref>0)
-        ctx.add_request(self._req(ctx, self._prompt(bs * 2)))
-        active_blocks = ctx.request_to_kv_block_ids[0][:2].clone()
-
-        # Release a second request to create cached (evictable) blocks
-        ctx.add_request(self._req(ctx, self._prompt(bs * 2, offset=5000), request_id=2))
-        cached_blocks = ctx.request_to_kv_block_ids[1][:2].clone()
-        cached_hash = alloc.block_hashes[cached_blocks[0].item()].item()
-        ctx.release_memory_blocks_from_request_indexes(torch.tensor([1]))
-        ctx.total_request_count = 1
-        assert alloc.block_ref_counts[cached_blocks[0].item()].item() == 0
-
-        # Fill remaining space with different requests to trigger eviction
-        for i in range(20):
-            try:
-                ctx.add_request(
-                    self._req(ctx, self._prompt(bs * 2, offset=(i + 10) * 1000), request_id=i + 100)
-                )
-            except Exception:
-                break
-
-        # Active blocks protected
-        for bid in active_blocks:
-            assert alloc.block_ref_counts[bid.item()].item() == 1
-
-        # Cached blocks may have been evicted (hash removed from mapping)
-        # The key invariant: system still functions correctly
-        assert ctx.total_request_count >= 1
-
-    @pytest.mark.internal
-    def test_rz_immediate_deregister_on_release(self):
-        """Blocks are deregistered and returned to free pool when ref_count hits 0."""
-        ctx = self._ctx(block_evict_lru=False)
-        bs = ctx.block_size_tokens
-        alloc = ctx.block_allocator
-        prompt = self._prompt(bs * 2)
-
-        ctx.add_request(self._req(ctx, prompt.clone()))
-        b0, b1 = self._block_ids(ctx, 0, 2)
-        b0_hash = alloc.block_hashes[b0].item()
-        b1_hash = alloc.block_hashes[b1].item()
-        avail_before = alloc.total_avail
-
-        # Release → ref_count hits 0 → blocks deregistered immediately
-        ctx.release_memory_blocks_from_request_indexes(torch.tensor([0]))
-        assert alloc.block_ref_counts[b0].item() == 0
-        assert alloc.block_ref_counts[b1].item() == 0
-        assert b0_hash not in alloc.hash_to_block_id, "Hash should be removed"
-        assert b1_hash not in alloc.hash_to_block_id, "Hash should be removed"
-        assert alloc.block_hashes[b0].item() == -1, "Block hash should be reset"
-        assert alloc.block_hashes[b1].item() == -1, "Block hash should be reset"
-        assert alloc.total_avail == avail_before + 2, "Blocks returned to free pool"
-
-    @pytest.mark.internal
-    def test_rz_shared_blocks_persist_until_last_ref(self):
-        """Shared blocks stay registered until all references are gone."""
-        ctx = self._ctx(block_evict_lru=False)
-        bs = ctx.block_size_tokens
-        alloc = ctx.block_allocator
-        prompt = self._prompt(bs * 2)
-
-        # Two requests sharing the same prefix
-        ctx.add_request(self._req(ctx, prompt.clone()))
-        ctx.add_request(self._req(ctx, prompt.clone(), request_id=2))
-
-        b0, b1 = self._block_ids(ctx, 0, 2)
-        b0_hash = alloc.block_hashes[b0].item()
-        assert alloc.block_ref_counts[b0].item() == 2
-
-        # Release first request → ref_count=1 → still registered
-        ctx.release_memory_blocks_from_request_indexes(torch.tensor([0]))
-        assert alloc.block_ref_counts[b0].item() == 1
-        assert b0_hash in alloc.hash_to_block_id, "Still has a reference"
-
-        # Release second request → ref_count=0 → deregistered
-        ctx.release_memory_blocks_from_request_indexes(torch.tensor([1]))
-        assert alloc.block_ref_counts[b0].item() == 0
-        assert b0_hash not in alloc.hash_to_block_id, "No more references"
-
-    @pytest.mark.internal
-    def test_rz_no_reuse_after_release(self):
-        """Released blocks cannot be found by new requests with the same prefix."""
-        ctx = self._ctx(block_evict_lru=False)
-        bs = ctx.block_size_tokens
-        alloc = ctx.block_allocator
-        prompt = self._prompt(bs * 2)
-
-        ctx.add_request(self._req(ctx, prompt.clone()))
-        first_blocks = self._block_ids(ctx, 0, 2)
-
-        ctx.release_memory_blocks_from_request_indexes(torch.tensor([0]))
-        ctx.total_request_count = 0
-
-        # New request with same prefix → no hash match, gets new blocks
-        ctx.add_request(self._req(ctx, prompt.clone(), request_id=2))
-        new_blocks = self._block_ids(ctx, 0, 2)
-        # Blocks should be freshly allocated (no sharing with deregistered blocks)
-        # The hashes were removed, so lookup returns None and new blocks are allocated
-        assert alloc.block_ref_counts[new_blocks[0]].item() == 1
-        assert alloc.block_ref_counts[new_blocks[1]].item() == 1
-
-
-# =========================================================================
-# Class 4: TestRegistration (3 tests)
-# =========================================================================
-
-
-class TestRegistration(PrefixCachingTestBase):
-
-    @pytest.mark.internal
-    def test_registration_flow(self):
-        """After add_request, hashes are set immediately and blocks are discoverable."""
-        ctx = self._ctx()
-        bs = ctx.block_size_tokens
-        alloc = ctx.block_allocator
-        prompt = self._prompt(bs * 2)
-
-        req = self._req(ctx, prompt)
-        ctx.add_request(req)
-        b0, b1 = self._block_ids(ctx, 0, 2)
-        h0, h1 = req.precomputed_block_hashes
-
-        # Discoverable via lookup, hashes set immediately
-        assert alloc.hash_to_block_id.get(h0) == b0
-        assert alloc.hash_to_block_id.get(h1) == b1
-        assert alloc.block_hashes[b0].item() == h0
-        assert alloc.block_hashes[b1].item() == h1
-
-    @pytest.mark.internal
-    def test_concurrent_sharing(self):
-        """3 requests added share blocks (ref=3), hashes set immediately. 4th also shares."""
-        ctx = self._ctx()
-        bs = ctx.block_size_tokens
-        alloc = ctx.block_allocator
-        prompt = self._prompt(bs * 2)
-
-        for i in range(1, 4):
-            ctx.add_request(self._req(ctx, prompt.clone(), request_id=i))
-
-        first_blocks = self._block_ids(ctx, 0, 2)
-        for req_idx in range(1, 3):
-            assert self._block_ids(ctx, req_idx, 2) == first_blocks
-
-        for bid in first_blocks:
-            assert alloc.block_ref_counts[bid].item() == 3
-            assert alloc.block_hashes[bid].item() != -1
-
-        # 4th request also shares
-        ctx.add_request(self._req(ctx, prompt.clone(), request_id=4))
-        assert self._block_ids(ctx, 3, 2) == first_blocks
-        for bid in first_blocks:
-            assert alloc.block_ref_counts[bid].item() == 4
-
-    @pytest.mark.internal
-    def test_immediate_hash_registration(self):
-        """register_block_hashes sets hash immediately; discoverable via lookup."""
-        ctx = self._ctx()
-        alloc = ctx.block_allocator
-
-        block_ids = alloc.allocate_memory_blocks(1)
-        bid = block_ids[0].item()
-        test_hash = 99999
-
-        alloc.register_block_hashes([bid], [test_hash])
-
-        # Hash is set immediately and discoverable
-        assert alloc.hash_to_block_id.get(test_hash) == bid
-        assert alloc.block_hashes[bid].item() == test_hash
-
-
-# =========================================================================
-# Class 5: TestPrefillSkipping (2 tests)
-# =========================================================================
-
-
-class TestPrefillSkipping(PrefixCachingTestBase):
-
-    @pytest.mark.internal
-    def test_cached_blocks_skip_prefill(self):
-        """Req1 allocates 4 blocks. Req2 same prefix reuses all 4. Req3 extends: shares 4, allocates 1."""
-        ctx = self._ctx()
-        bs = ctx.block_size_tokens
-        alloc = ctx.block_allocator
-        prompt = self._prompt(bs * 4)
-
-        ctx.add_request(self._req(ctx, prompt.clone()))
-        first_blocks = self._block_ids(ctx, 0, 4)
-        avail_after_first = alloc.total_avail
-
-        # Same prefix → reuses same blocks, no new allocation
-        ctx.add_request(self._req(ctx, prompt.clone(), request_id=2))
-        assert self._block_ids(ctx, 1, 4) == first_blocks
-        assert alloc.total_avail == avail_after_first
-
-        # Extended prompt → shares first 4 blocks, allocates 1 new
-        extended = torch.cat([prompt, self._prompt(bs, offset=1000)])
-        ctx.add_request(self._req(ctx, extended, request_id=3))
-        assert self._block_ids(ctx, 2, 4) == first_blocks
-        assert alloc.total_avail == avail_after_first - 1
-
-    @pytest.mark.internal
-    def test_decode_does_not_compute_hashes(self):
-        """Complete block → hash after mark. Partial block → stays -1 even after decode fills it."""
-        ctx = self._ctx()
-        bs = ctx.block_size_tokens
-        alloc = ctx.block_allocator
-
-        # 1 complete block + (block_size - 1) tokens in second block
-        prompt = self._prompt(bs + (bs - 1))
-        ctx.add_request(self._req(ctx, prompt))
-
-        b0, b1 = self._block_ids(ctx, 0, 2)
-        assert alloc.block_hashes[b0].item() != -1, "Complete block has hash"
-        assert alloc.block_hashes[b1].item() == -1, "Partial block: no hash"
-
-        # One decode step fills block 1
-        active_mask = torch.ones(1, device=torch.cuda.current_device(), dtype=torch.int32)
-        new_tokens = torch.tensor([100], device=torch.cuda.current_device())
-        ctx.update_requests(active_mask, new_tokens)
-
-        assert alloc.block_hashes[b1].item() == -1, "Decode hash computation not implemented"
-
-    @pytest.mark.internal
-    def test_matched_prefix_reduces_active_tokens(self):
-        """Request A fills 3 blocks. Request B (same prefix + trailing) only adds trailing tokens."""
-        ctx = self._ctx()
-        bs = ctx.block_size_tokens
-        prompt_a = self._prompt(bs * 3)
-
-        ctx.add_request(self._req(ctx, prompt_a.clone()))
-        tokens_after_a = ctx.active_token_count
-
-        # B has same 3-block prefix + extra trailing tokens
-        trailing = bs // 2
-        prompt_b = torch.cat([prompt_a, self._prompt(trailing, offset=9000)])
-        ctx.add_request(self._req(ctx, prompt_b, request_id=2))
-
-        added_by_b = ctx.active_token_count - tokens_after_a
-        # B should skip 3*bs matched tokens but keep at least 1, so it adds trailing tokens only
-        assert (
-            added_by_b == trailing
-        ), f"Expected {trailing} tokens added (trailing only), got {added_by_b}"
-        # query length should also reflect the reduced count
-        assert ctx.request_query_lengths[1].item() == trailing
-
-    @pytest.mark.internal
-    def test_partial_match_skips_matched_only(self):
-        """Request A fills 3 blocks. B matches first 2, differs on 3rd. B skips 2*bs tokens."""
-        ctx = self._ctx()
-        bs = ctx.block_size_tokens
-
-        prompt_a = self._prompt(bs * 3)
-        ctx.add_request(self._req(ctx, prompt_a.clone()))
-        tokens_after_a = ctx.active_token_count
-
-        # Same first 2 blocks, different 3rd
-        prompt_b = prompt_a.clone()
-        prompt_b[bs * 2 :] += 1000
-        ctx.add_request(self._req(ctx, prompt_b, request_id=2))
-
-        added_by_b = ctx.active_token_count - tokens_after_a
-        expected = bs * 3 - bs * 2  # chunk_length - matched tokens = 1 block worth
-        assert added_by_b == expected, f"Expected {expected}, got {added_by_b}"
-        assert ctx.request_query_lengths[1].item() == expected
-
-    @pytest.mark.internal
-    def test_no_match_no_skip(self):
-        """Completely different prefix: full chunk_length added."""
-        ctx = self._ctx()
-        bs = ctx.block_size_tokens
-
-        ctx.add_request(self._req(ctx, self._prompt(bs * 2)))
-        tokens_after_a = ctx.active_token_count
-
-        ctx.add_request(self._req(ctx, self._prompt(bs * 2, offset=9000), request_id=2))
-        added_by_b = ctx.active_token_count - tokens_after_a
-        assert added_by_b == bs * 2, f"Expected full {bs * 2}, got {added_by_b}"
-        assert ctx.request_query_lengths[1].item() == bs * 2
-
-    @pytest.mark.internal
-    def test_exact_full_match_sends_one_token(self):
-        """Prompt is exactly N*block_size and fully matched: only 1 token enters the model."""
-        ctx = self._ctx()
-        bs = ctx.block_size_tokens
-
-        prompt = self._prompt(bs * 3)
-        ctx.add_request(self._req(ctx, prompt.clone()))
-        tokens_after_a = ctx.active_token_count
-
-        # Identical prompt, fully matched
-        ctx.add_request(self._req(ctx, prompt.clone(), request_id=2))
-        added_by_b = ctx.active_token_count - tokens_after_a
-        assert added_by_b == 1, f"Expected 1 token (min guard), got {added_by_b}"
-        assert ctx.request_query_lengths[1].item() == 1
-        # kv_length_offset should reflect skipped prefix
-        expected_offset = bs * 3 - 1  # finished(0) + skip(3*bs - 1)
-        assert ctx.request_kv_length_offsets[1].item() == expected_offset
-
-
-# =========================================================================
-# Class 6: TestDisabledMode (3 tests)
-# =========================================================================
-
-
-class TestDisabledMode(PrefixCachingTestBase):
-
-    @pytest.mark.internal
-    def test_disabled_no_sharing(self):
-        """enable_prefix_caching=False → identical prefixes get separate blocks."""
+    def test_disabled_means_no_sharing(self):
+        """enable_prefix_caching=False: identical prompts allocate separate blocks."""
         ctx = self._ctx(enable_prefix_caching=False)
         bs = ctx.block_size_tokens
         prompt = self._prompt(bs * 2)
@@ -668,140 +208,421 @@ class TestDisabledMode(PrefixCachingTestBase):
         assert r1.isdisjoint(r2)
 
     @pytest.mark.internal
-    def test_disabled_skips_prefix_caching_state(self):
-        """Disabled mode skips prefix caching data structures entirely."""
-        ctx = self._ctx(enable_prefix_caching=False)
-        alloc = ctx.block_allocator
+    def test_disabled_allocator_has_no_caching_state(self):
+        """Disabled allocator lacks caching attrs; REF_ZERO lacks timestamps."""
+        ctx_disabled = self._ctx(enable_prefix_caching=False)
+        alloc_d = ctx_disabled.block_allocator
+        assert not hasattr(alloc_d, 'block_hashes')
+        assert not hasattr(alloc_d, 'hash_to_block_id')
+        assert not hasattr(alloc_d, 'block_ref_counts')
 
-        assert not hasattr(alloc, 'block_hashes'), "block_hashes should not exist when disabled"
-        assert not hasattr(
-            alloc, 'block_ref_counts'
-        ), "block_ref_counts should not exist when disabled"
-        assert not hasattr(
-            alloc, 'hash_to_block_id'
-        ), "hash_to_block_id should not exist when disabled"
+        ctx_rz = self._ctx(block_evict_lru=False)
+        alloc_rz = ctx_rz.block_allocator
+        assert not hasattr(alloc_rz, 'block_timestamps')
+
+
+# =========================================================================
+# Class 2: TestPrefillTokenSavings (4 tests)
+# =========================================================================
+
+
+class TestPrefillTokenSavings(PrefixCachingTestBase):
 
     @pytest.mark.internal
-    def test_rz_no_timestamps(self):
-        """Timestamp attributes don't exist in RZ mode."""
+    def test_lifetime_prefill_count_with_vs_without(self):
+        """Enabled saves tokens vs disabled for two identical prompts."""
+        bs = 32
+
+        # Enabled
+        ctx_on = self._ctx()
+        prompt = self._prompt(bs * 4)
+        ctx_on.add_request(self._req(ctx_on, prompt.clone()))
+        ctx_on.add_request(self._req(ctx_on, prompt.clone(), request_id=2))
+        enabled_total = ctx_on.lifetime_prefill_token_count
+
+        # Disabled
+        ctx_off = self._ctx(enable_prefix_caching=False)
+        ctx_off.add_request(self._req(ctx_off, prompt.clone(), enable_prefix_caching=False))
+        ctx_off.add_request(
+            self._req(ctx_off, prompt.clone(), request_id=2, enable_prefix_caching=False)
+        )
+        disabled_total = ctx_off.lifetime_prefill_token_count
+
+        # Enabled: 4*bs + 1 (min guard). Disabled: 4*bs + 4*bs.
+        assert enabled_total == bs * 4 + 1
+        assert disabled_total == bs * 4 * 2
+        assert enabled_total < disabled_total
+
+    @pytest.mark.internal
+    def test_partial_match_reduces_prefill_proportionally(self):
+        """First req fills 3 blocks, second matches 2 of 3, adds bs tokens."""
+        ctx = self._ctx()
+        bs = ctx.block_size_tokens
+
+        prompt1 = self._prompt(bs * 3)
+        ctx.add_request(self._req(ctx, prompt1.clone()))
+
+        prompt2 = prompt1.clone()
+        prompt2[bs * 2 :] += 1000
+        ctx.add_request(self._req(ctx, prompt2, request_id=2))
+
+        assert ctx.lifetime_prefill_token_count == bs * 3 + bs
+
+    @pytest.mark.internal
+    def test_full_match_adds_single_token(self):
+        """Prompt exactly N*bs, fully matched: second request query length == 1."""
+        ctx = self._ctx()
+        bs = ctx.block_size_tokens
+        prompt = self._prompt(bs * 3)
+
+        ctx.add_request(self._req(ctx, prompt.clone()))
+        tokens_after_a = ctx.active_token_count
+
+        ctx.add_request(self._req(ctx, prompt.clone(), request_id=2))
+        assert ctx.active_token_count - tokens_after_a == 1
+        assert ctx.request_query_lengths[1].item() == 1
+
+    @pytest.mark.internal
+    def test_no_match_adds_full_prompt(self):
+        """Different prefix: full chunk_length added to lifetime count."""
+        ctx = self._ctx()
+        bs = ctx.block_size_tokens
+
+        ctx.add_request(self._req(ctx, self._prompt(bs * 2)))
+        ctx.add_request(self._req(ctx, self._prompt(bs * 2, offset=9000), request_id=2))
+
+        assert ctx.lifetime_prefill_token_count == bs * 2 + bs * 2
+
+
+# =========================================================================
+# Class 3: TestRefCountLifecycle (5 tests)
+# =========================================================================
+
+
+class TestRefCountLifecycle(PrefixCachingTestBase):
+
+    @pytest.mark.internal
+    def test_lru_ref_decrement_preserves_cached_blocks(self):
+        """LRU mode: add 2, release both. Ref 2 -> 1 -> 0. Hash still in dict."""
+        ctx = self._ctx()
+        bs = ctx.block_size_tokens
+        alloc = ctx.block_allocator
+        prompt = self._prompt(bs * 2)
+
+        ctx.add_request(self._req(ctx, prompt.clone()))
+        ctx.add_request(self._req(ctx, prompt.clone(), request_id=2))
+        b0, b1 = self._block_ids(ctx, 0, 2)
+        b0_hash = alloc.block_hashes[b0].item()
+
+        assert alloc.block_ref_counts[b0].item() == 2
+
+        ctx.release_memory_blocks_from_request_indexes(torch.tensor([0]))
+        assert alloc.block_ref_counts[b0].item() == 1
+        assert b0_hash in alloc.hash_to_block_id
+
+        ctx.release_memory_blocks_from_request_indexes(torch.tensor([1]))
+        assert alloc.block_ref_counts[b0].item() == 0
+        assert alloc.block_ref_counts[b1].item() == 0
+        assert b0_hash in alloc.hash_to_block_id, "LRU keeps cached blocks"
+
+    @pytest.mark.internal
+    def test_lru_cached_blocks_reused_by_new_request(self):
+        """LRU mode: released blocks (ref=0, cached) reused by same-prefix request."""
+        ctx = self._ctx()
+        bs = ctx.block_size_tokens
+        alloc = ctx.block_allocator
+        prompt = self._prompt(bs * 2)
+
+        ctx.add_request(self._req(ctx, prompt.clone()))
+        b0, b1 = self._block_ids(ctx, 0, 2)
+
+        ctx.release_memory_blocks_from_request_indexes(torch.tensor([0]))
+        ctx.total_request_count = 0
+        assert alloc.block_ref_counts[b0].item() == 0
+        assert alloc.block_hashes[b0].item() in alloc.hash_to_block_id
+
+        ctx.add_request(self._req(ctx, prompt.clone(), request_id=2))
+        assert self._block_ids(ctx, 0, 2) == [b0, b1]
+        assert alloc.block_ref_counts[b0].item() == 1
+
+    @pytest.mark.internal
+    def test_lru_eviction_frees_oldest_cached_first(self):
+        """LRU mode, tiny buffer: create cached groups A, B. Fill memory. A evicted first."""
+        ctx = self._ctx(buffer_size_gb=0.01, rounder=1)
+        bs = ctx.block_size_tokens
+        alloc = ctx.block_allocator
+
+        # Active request (protected)
+        ctx.add_request(self._req(ctx, self._prompt(bs * 2)))
+        active_blocks = ctx.request_to_kv_block_ids[0][:2].clone()
+
+        # Cached request (evictable)
+        ctx.add_request(self._req(ctx, self._prompt(bs * 2, offset=5000), request_id=2))
+        cached_blocks = ctx.request_to_kv_block_ids[1][:2].clone()
+        cached_hash = alloc.block_hashes[cached_blocks[0].item()].item()
+        ctx.release_memory_blocks_from_request_indexes(torch.tensor([1]))
+        ctx.total_request_count = 1
+        assert alloc.block_ref_counts[cached_blocks[0].item()].item() == 0
+
+        # Fill remaining space to trigger eviction of cached blocks
+        for i in range(20):
+            try:
+                ctx.add_request(
+                    self._req(ctx, self._prompt(bs * 2, offset=(i + 10) * 1000), request_id=i + 100)
+                )
+            except Exception:
+                break
+
+        # Active blocks remain protected
+        for bid in active_blocks:
+            assert alloc.block_ref_counts[bid.item()].item() == 1
+
+    @pytest.mark.internal
+    def test_refzero_deregisters_on_last_release(self):
+        """REF_ZERO: two reqs sharing prefix. Release both: hash removed, blocks returned."""
         ctx = self._ctx(block_evict_lru=False)
+        bs = ctx.block_size_tokens
         alloc = ctx.block_allocator
-        assert not hasattr(
-            alloc, 'block_timestamps'
-        ), "block_timestamps should not exist in RZ mode"
+        prompt = self._prompt(bs * 2)
+
+        ctx.add_request(self._req(ctx, prompt.clone()))
+        ctx.add_request(self._req(ctx, prompt.clone(), request_id=2))
+
+        b0, b1 = self._block_ids(ctx, 0, 2)
+        b0_hash = alloc.block_hashes[b0].item()
+        avail_before = alloc.total_avail
+
+        # Release first: ref=1, hash persists
+        ctx.release_memory_blocks_from_request_indexes(torch.tensor([0]))
+        assert alloc.block_ref_counts[b0].item() == 1
+        assert b0_hash in alloc.hash_to_block_id
+
+        # Release second: ref=0, hash removed, blocks returned
+        ctx.release_memory_blocks_from_request_indexes(torch.tensor([1]))
+        assert alloc.block_ref_counts[b0].item() == 0
+        assert b0_hash not in alloc.hash_to_block_id
+        assert alloc.block_hashes[b0].item() == -1
+        assert alloc.block_hashes[b1].item() == -1
+        assert alloc.total_avail == avail_before + 2
+
+    @pytest.mark.internal
+    def test_refzero_released_blocks_not_discoverable(self):
+        """REF_ZERO: after full release, same-prefix request gets fresh blocks."""
+        ctx = self._ctx(block_evict_lru=False)
+        bs = ctx.block_size_tokens
+        alloc = ctx.block_allocator
+        prompt = self._prompt(bs * 2)
+
+        ctx.add_request(self._req(ctx, prompt.clone()))
+        first_blocks = self._block_ids(ctx, 0, 2)
+
+        ctx.release_memory_blocks_from_request_indexes(torch.tensor([0]))
+        ctx.total_request_count = 0
+
+        # Hash lookup returns None, so new blocks allocated
+        ctx.add_request(self._req(ctx, prompt.clone(), request_id=2))
+        new_blocks = self._block_ids(ctx, 0, 2)
+        assert alloc.block_ref_counts[new_blocks[0]].item() == 1
+        assert alloc.block_ref_counts[new_blocks[1]].item() == 1
 
 
 # =========================================================================
-# Class 7: TestComplexPatterns (3 tests)
+# Class 4: TestHashComputation (3 tests)
 # =========================================================================
 
 
-class TestComplexPatterns(PrefixCachingTestBase):
+class TestHashComputation(PrefixCachingTestBase):
 
     @pytest.mark.internal
-    def test_prefix_chain_extending(self):
-        """A=2 blocks, B extends to 4, C extends to 6. Proper sharing."""
+    def test_determinism_and_range(self):
+        """Same tokens -> same hashes. All in [1, HASH_PRIME]. Different tokens differ."""
+        tokens = self._prompt(32)
+        h1 = compute_block_hashes_batched(tokens, 32)
+        h2 = compute_block_hashes_batched(tokens, 32)
+        assert h1 == h2
+        assert len(h1) == 1
+        assert 1 <= h1[0] <= HASH_PRIME
+
+        h_diff = compute_block_hashes_batched(self._prompt(32, offset=1), 32)
+        assert h_diff[0] != h1[0]
+
+    @pytest.mark.internal
+    def test_parent_chaining_differentiates_position(self):
+        """4 blocks of all-zero tokens: all hashes distinct due to parent chaining."""
+        ctx = self._ctx()
+        bs = ctx.block_size_tokens
+        zeros = torch.zeros(bs * 4, device=torch.cuda.current_device(), dtype=torch.long)
+        hashes = compute_block_hashes_batched(zeros, bs)
+        assert len(hashes) == 4
+        assert len(set(hashes)) == 4
+
+    @pytest.mark.internal
+    def test_edge_cases(self):
+        """Short, empty, and long prompts produce expected hash counts."""
         ctx = self._ctx()
         bs = ctx.block_size_tokens
 
-        # A: 2 blocks
-        prompt_a = self._prompt(bs * 2)
-        ctx.add_request(self._req(ctx, prompt_a))
-        blocks_a = ctx.request_to_kv_block_ids[0][:2]
+        # Shorter than block_size -> empty
+        assert compute_block_hashes_batched(self._prompt(bs // 2), bs) == []
 
-        # B: extends A to 4 blocks
-        prompt_b = torch.cat([prompt_a, self._prompt(bs * 2, offset=1000)])
-        ctx.add_request(self._req(ctx, prompt_b, request_id=2))
-        blocks_b = ctx.request_to_kv_block_ids[1][:4]
+        # Empty prompt -> empty
+        empty = torch.tensor([], device=torch.cuda.current_device(), dtype=torch.long)
+        assert compute_block_hashes_batched(empty, bs) == []
 
-        assert torch.equal(blocks_b[:2], blocks_a), "B shares first 2 with A"
+        # 120-block prompt -> 120 positive hashes
+        long_prompt = torch.arange(bs * 120, device=torch.cuda.current_device(), dtype=torch.long)
+        h = compute_block_hashes_batched(long_prompt, bs)
+        assert len(h) == 120
+        assert all(v > 0 for v in h)
 
-        # C: extends B to 6 blocks
-        prompt_c = torch.cat([prompt_b, self._prompt(bs * 2, offset=2000)])
-        ctx.add_request(self._req(ctx, prompt_c, request_id=3))
-        blocks_c = ctx.request_to_kv_block_ids[2][:6]
 
-        assert torch.equal(blocks_c[:4], blocks_b), "C shares first 4 with B"
-        assert torch.equal(blocks_c[:2], blocks_a), "C shares first 2 with A"
+# =========================================================================
+# Class 5: TestRegistrationAndDiscovery (4 tests)
+# =========================================================================
+
+
+class TestRegistrationAndDiscovery(PrefixCachingTestBase):
 
     @pytest.mark.internal
-    def test_independent_prefix_trees(self):
-        """Two disjoint prefix trees coexist; within-tree sharing works."""
+    def test_blocks_discoverable_after_add_request(self):
+        """After add_request, each block's hash maps to its block ID."""
         ctx = self._ctx()
         bs = ctx.block_size_tokens
+        alloc = ctx.block_allocator
+        prompt = self._prompt(bs * 2)
 
-        prefix_x = self._prompt(bs * 2)
-        prefix_y = self._prompt(bs * 2, offset=5000)
+        req = self._req(ctx, prompt)
+        ctx.add_request(req)
+        b0, b1 = self._block_ids(ctx, 0, 2)
+        h0, h1 = req.precomputed_block_hashes
 
-        # Tree 1: 3 requests sharing prefix_x
-        for i in range(3):
-            ctx.add_request(self._req(ctx, prefix_x.clone(), request_id=i + 1))
-
-        # Tree 2: 3 requests sharing prefix_y
-        for i in range(3):
-            ctx.add_request(self._req(ctx, prefix_y.clone(), request_id=i + 10))
-
-        # Within-tree sharing
-        tree1_blocks = ctx.request_to_kv_block_ids[0][:2]
-        for i in range(1, 3):
-            assert torch.equal(ctx.request_to_kv_block_ids[i][:2], tree1_blocks)
-
-        tree2_blocks = ctx.request_to_kv_block_ids[3][:2]
-        for i in range(4, 6):
-            assert torch.equal(ctx.request_to_kv_block_ids[i][:2], tree2_blocks)
-
-        # Cross-tree: different blocks
-        assert not torch.equal(tree1_blocks, tree2_blocks)
+        assert alloc.hash_to_block_id.get(h0) == b0
+        assert alloc.hash_to_block_id.get(h1) == b1
+        assert alloc.block_hashes[b0].item() == h0
+        assert alloc.block_hashes[b1].item() == h1
 
     @pytest.mark.internal
-    def test_memory_scaling_is_constant(self):
-        """5 identical 4-block requests use only 4 total blocks, not 20."""
-        ctx = self._ctx(max_sequence_length=1024)
+    def test_partial_block_not_registered(self):
+        """Prompt of bs + bs//2: first block registered, second block not."""
+        ctx = self._ctx()
+        bs = ctx.block_size_tokens
+        alloc = ctx.block_allocator
+
+        prompt = self._prompt(bs + bs // 2)
+        ctx.add_request(self._req(ctx, prompt))
+        b0, b1 = self._block_ids(ctx, 0, 2)
+
+        assert alloc.block_hashes[b0].item() != -1, "Complete block registered"
+        assert alloc.block_hashes[b1].item() == -1, "Partial block not registered"
+
+    @pytest.mark.internal
+    def test_decode_does_not_register_completed_blocks(self):
+        """Partial block stays unregistered after decode fills it (known limitation)."""
+        ctx = self._ctx()
+        bs = ctx.block_size_tokens
+        alloc = ctx.block_allocator
+
+        prompt = self._prompt(bs + (bs - 1))
+        ctx.add_request(self._req(ctx, prompt))
+        b0, b1 = self._block_ids(ctx, 0, 2)
+
+        assert alloc.block_hashes[b0].item() != -1
+        assert alloc.block_hashes[b1].item() == -1
+
+        # One decode step fills block 1
+        active_mask = torch.ones(1, device=torch.cuda.current_device(), dtype=torch.int32)
+        new_tokens = torch.tensor([100], device=torch.cuda.current_device())
+        ctx.update_requests(active_mask, new_tokens)
+
+        assert alloc.block_hashes[b1].item() == -1, "Decode does not register blocks"
+
+    @pytest.mark.internal
+    def test_second_request_finds_registered_blocks(self):
+        """After req1 registers 3 blocks, req2's hashes all resolve in hash_to_block_id."""
+        ctx = self._ctx()
+        bs = ctx.block_size_tokens
+        alloc = ctx.block_allocator
+        prompt = self._prompt(bs * 3)
+
+        req1 = self._req(ctx, prompt.clone())
+        ctx.add_request(req1)
+
+        req2 = self._req(ctx, prompt.clone(), request_id=2)
+        for h in req2.precomputed_block_hashes:
+            assert h in alloc.hash_to_block_id, f"Hash {h} should be discoverable"
+
+
+# =========================================================================
+# Class 6: TestBlockAllocation (3 tests)
+# =========================================================================
+
+
+class TestBlockAllocation(PrefixCachingTestBase):
+
+    @pytest.mark.internal
+    def test_matched_blocks_not_allocated_from_pool(self):
+        """Req1 allocates 4 blocks. Req2 same prefix: pool unchanged, same block IDs."""
+        ctx = self._ctx()
         bs = ctx.block_size_tokens
         alloc = ctx.block_allocator
         prompt = self._prompt(bs * 4)
-        initial_avail = alloc.total_avail
+
+        ctx.add_request(self._req(ctx, prompt.clone()))
+        first_blocks = self._block_ids(ctx, 0, 4)
+        avail_after_first = alloc.total_avail
+
+        ctx.add_request(self._req(ctx, prompt.clone(), request_id=2))
+        assert self._block_ids(ctx, 1, 4) == first_blocks
+        assert alloc.total_avail == avail_after_first
+
+    @pytest.mark.internal
+    def test_extended_prompt_allocates_only_new_blocks(self):
+        """Req1: 3 blocks. Req2: 5 blocks (same first 3). Pool drops by exactly 2."""
+        ctx = self._ctx()
+        bs = ctx.block_size_tokens
+        alloc = ctx.block_allocator
+
+        prompt1 = self._prompt(bs * 3)
+        ctx.add_request(self._req(ctx, prompt1))
+        avail_after_first = alloc.total_avail
+
+        prompt2 = torch.cat([prompt1, self._prompt(bs * 2, offset=1000)])
+        ctx.add_request(self._req(ctx, prompt2, request_id=2))
+        assert alloc.total_avail == avail_after_first - 2
+
+    @pytest.mark.internal
+    def test_check_availability_accounts_for_prefix_match(self):
+        """check_availability returns kv_cache_available=True when matched blocks cover need."""
+        ctx = self._ctx(buffer_size_gb=0.01, rounder=1)
+        bs = ctx.block_size_tokens
+        alloc = ctx.block_allocator
+        prompt = self._prompt(bs * 2)
 
         ctx.add_request(self._req(ctx, prompt.clone()))
 
-        for i in range(2, 6):
-            ctx.add_request(self._req(ctx, prompt.clone(), request_id=i))
+        # Fill remaining pool
+        while alloc.total_avail > 0:
+            alloc.allocate_memory_blocks(1)
 
-        total_used = initial_avail - alloc.total_avail
-        assert total_used == 4, f"Should use 4 blocks (O(1)), used {total_used}"
+        # New request with same prefix: all blocks matched, needs 0 from pool
+        req2 = self._req(ctx, prompt.clone(), request_id=2)
+        _, _, kv_available = ctx.check_availability(req2)
+        assert kv_available, "Matched blocks don't need pool allocation"
 
 
 # =========================================================================
-# Class 8: TestEngineCoordination (3 tests)
+# Class 7: TestEngineScheduling (6 tests)
 # =========================================================================
 
 
-class _StubEngine(DynamicInferenceEngine):
-    """Lightweight engine subclass that skips full __init__ for unit testing.
+class TestEngineScheduling(PrefixCachingTestBase):
 
-    Only initialises the fields needed by prefix coordination and scheduling.
-    """
-
-    def __init__(self, context: DynamicInferenceContext):
-        # Bypass DynamicInferenceEngine.__init__ entirely — it needs a real
-        # controller, CUDA graphs, wandb, etc. We only need the scheduling and
-        # prefix-coordination paths.
-        self.context = context
-        self.enable_chunked_prefill = False
-        self._prefix_coordination_waits = 0
-        self._loop = asyncio.new_event_loop()
-        self.waiting_request_ids: deque = deque()
-        self.requests = {}
-
-
-class TestEngineCoordination(PrefixCachingTestBase):
-
-    def _engine(self, ctx):
-        """Create a _StubEngine wrapping *ctx*."""
-        return _StubEngine(ctx)
+    def _engine(self, ctx, **kwargs):
+        """Create a _StubEngine wrapping ctx."""
+        return _StubEngine(ctx, **kwargs)
 
     def _add_to_waiting(self, engine, ctx, req):
-        """Register *req* with the engine and put it in the waiting queue."""
+        """Register req with engine and put it in the waiting queue."""
         request_id = req.request_id
         engine.requests[request_id] = type(
             "Entry",
@@ -815,55 +636,91 @@ class TestEngineCoordination(PrefixCachingTestBase):
         req.sampling_params.num_tokens_to_generate = 10
         engine.waiting_request_ids.append(request_id)
 
-    # -----------------------------------------------------------------
     @pytest.mark.internal
-    def test_scheduling_deferral(self):
-        """Two waiting requests with shared prefix: first scheduled, second deferred."""
+    def test_shared_prefix_defers_second_request(self):
+        """Two requests with shared prefix: first scheduled, second deferred."""
         ctx = self._ctx()
         bs = ctx.block_size_tokens
         engine = self._engine(ctx)
         prompt = self._prompt(bs * 2)
 
-        # Both requests in waiting queue (neither in context yet)
         req1 = self._req(ctx, prompt.clone())
         self._add_to_waiting(engine, ctx, req1)
         req2 = self._req(ctx, prompt.clone(), request_id=2)
         self._add_to_waiting(engine, ctx, req2)
 
-        # Schedule: req1 scheduled, req2 deferred (overlapping new hashes)
         engine.schedule_non_chunked_prefill()
-        assert ctx.total_request_count == 1, "Only first request should be scheduled"
-        assert len(engine.waiting_request_ids) == 1, "Second request should be deferred"
+        assert ctx.total_request_count == 1
+        assert len(engine.waiting_request_ids) == 1
         assert engine.waiting_request_ids[0] == 2
         assert engine._prefix_coordination_waits == 1
 
-    # -----------------------------------------------------------------
     @pytest.mark.internal
-    def test_scheduling_no_deferral(self):
+    def test_scheduler_skips_deferred_to_schedule_non_conflicting(self):
+        """req1+req2 share prefix A, req3 has prefix B. req1 and req3 scheduled, req2 deferred."""
+        ctx = self._ctx()
+        bs = ctx.block_size_tokens
+        engine = self._engine(ctx)
+
+        prompt_a = self._prompt(bs * 2)
+        prompt_b = self._prompt(bs * 2, offset=5000)
+
+        req1 = self._req(ctx, prompt_a.clone())
+        self._add_to_waiting(engine, ctx, req1)
+        req2 = self._req(ctx, prompt_a.clone(), request_id=2)
+        self._add_to_waiting(engine, ctx, req2)
+        req3 = self._req(ctx, prompt_b.clone(), request_id=3)
+        self._add_to_waiting(engine, ctx, req3)
+
+        engine.schedule_non_chunked_prefill()
+        assert ctx.total_request_count == 2, "req1 and req3 scheduled"
+        assert len(engine.waiting_request_ids) == 1
+        assert engine.waiting_request_ids[0] == 2, "req2 deferred"
+
+    @pytest.mark.internal
+    def test_registered_prefix_allows_immediate_scheduling(self):
         """Prefix already in context: second request scheduled without deferral."""
         ctx = self._ctx()
         bs = ctx.block_size_tokens
         engine = self._engine(ctx)
         prompt = self._prompt(bs * 2)
 
-        # Add first request directly to context (hashes in hash table)
-        req1 = self._req(ctx, prompt.clone())
-        ctx.add_request(req1)
+        # Add first request directly to context (hashes registered)
+        ctx.add_request(self._req(ctx, prompt.clone()))
 
-        # Put second request (same prefix) in waiting queue
         req2 = self._req(ctx, prompt.clone(), request_id=2)
         self._add_to_waiting(engine, ctx, req2)
 
-        # Scheduling should succeed immediately (hashes already registered)
         engine.schedule_non_chunked_prefill()
-        assert len(engine.waiting_request_ids) == 0, "Request should be scheduled"
+        assert len(engine.waiting_request_ids) == 0
         assert ctx.total_request_count == 2
         assert engine._prefix_coordination_waits == 0
 
-    # -----------------------------------------------------------------
     @pytest.mark.internal
-    def test_get_prefix_coordination_metrics(self):
-        """get_prefix_coordination_metrics tracks deferral waits."""
+    def test_deferred_request_schedulable_after_registration(self):
+        """Round 1: req1 scheduled, req2 deferred. Round 2: req2 scheduled."""
+        ctx = self._ctx()
+        bs = ctx.block_size_tokens
+        engine = self._engine(ctx)
+        prompt = self._prompt(bs * 2)
+
+        req1 = self._req(ctx, prompt.clone())
+        self._add_to_waiting(engine, ctx, req1)
+        req2 = self._req(ctx, prompt.clone(), request_id=2)
+        self._add_to_waiting(engine, ctx, req2)
+
+        engine.schedule_non_chunked_prefill()
+        assert ctx.total_request_count == 1
+        assert len(engine.waiting_request_ids) == 1
+
+        # Round 2: hashes now registered from req1
+        engine.schedule_non_chunked_prefill()
+        assert ctx.total_request_count == 2
+        assert len(engine.waiting_request_ids) == 0
+
+    @pytest.mark.internal
+    def test_coordination_metrics_track_deferrals(self):
+        """get_prefix_coordination_metrics tracks waits correctly."""
         ctx = self._ctx()
         bs = ctx.block_size_tokens
         engine = self._engine(ctx)
@@ -871,17 +728,33 @@ class TestEngineCoordination(PrefixCachingTestBase):
 
         assert engine.get_prefix_coordination_metrics() == {"waits": 0}
 
-        # Two requests with shared prefix in waiting queue
         req1 = self._req(ctx, prompt.clone())
         self._add_to_waiting(engine, ctx, req1)
         req2 = self._req(ctx, prompt.clone(), request_id=2)
         self._add_to_waiting(engine, ctx, req2)
 
-        # First schedule: req1 scheduled, req2 deferred
         engine.schedule_non_chunked_prefill()
         assert engine.get_prefix_coordination_metrics() == {"waits": 1}
 
-        # Second schedule: req2 now schedulable (hashes already in hash table)
+        # Second round: no new deferral
         engine.schedule_non_chunked_prefill()
         assert engine.get_prefix_coordination_metrics() == {"waits": 1}
         assert len(engine.waiting_request_ids) == 0
+
+    @pytest.mark.internal
+    def test_chunked_prefill_defers_conflicting_request(self):
+        """Chunked prefill path has the same deferral logic."""
+        ctx = self._ctx()
+        bs = ctx.block_size_tokens
+        engine = self._engine(ctx, enable_chunked_prefill=True)
+        prompt = self._prompt(bs * 2)
+
+        req1 = self._req(ctx, prompt.clone())
+        self._add_to_waiting(engine, ctx, req1)
+        req2 = self._req(ctx, prompt.clone(), request_id=2)
+        self._add_to_waiting(engine, ctx, req2)
+
+        engine.schedule_chunked_prefill()
+        assert ctx.total_request_count == 1
+        assert len(engine.waiting_request_ids) == 1
+        assert engine._prefix_coordination_waits == 1
