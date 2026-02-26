@@ -1,10 +1,11 @@
 # Copyright (c) 2025 NVIDIA CORPORATION.  All rights reserved.
 
-from typing import Any, List, Optional
+from typing import Any, Dict, List, Optional, Tuple, Type
 
 import torch
 
 from megatron.core import parallel_state
+from megatron.core.rerun_state_machine import RerunDataIterator
 from megatron.core.pipeline_parallel.hybrid_cp_schedule import BalancedCPScheduler
 from megatron.core.process_groups_config import ProcessGroupCollection
 
@@ -264,6 +265,108 @@ class HybridCPDataLoaderWrapper:
                 batch_unpacked.append(sub_sample_dict)
         return batch_unpacked
 
+    def _pack_sequences(
+        self,
+        samples: List[Dict[str, torch.Tensor]],
+        local_cp_size: torch.Tensor,
+    ) -> Dict[str, torch.Tensor]:
+        def _pack_tensors(tensors):
+            return torch.cat([t.reshape(-1) for t in tensors], dim=0)
+
+        # Get the padded lengths of all sub-samples being packed
+        sample_padded_lens = torch.tensor([s["tokens"].shape[0] for s in samples], dtype=torch.int32)
+        # Create the cu_seqlens_padded tensor
+        cu_seqlens_padded = torch.empty(1, sample_padded_lens.numel() + 1, device=torch.cuda.current_device(), dtype=torch.int32)
+        cu_seqlens_padded[0, 0] = 0
+        cu_seqlens_padded[0, 1:] = torch.cumsum(sample_padded_lens, dim=0)
+        max_seqlen = torch.max(sample_padded_lens).to(dtype=torch.int32)
+
+        tokens = _pack_tensors([sample["tokens"] for sample in samples])
+        labels = _pack_tensors([sample["labels"] for sample in samples])
+        loss_mask = _pack_tensors([sample["loss_mask"] for sample in samples])
+        position_ids = _pack_tensors([sample["position_ids"] for sample in samples])
+
+        new_sample = {}
+        new_sample["tokens"] = tokens
+        new_sample["labels"] = labels
+        new_sample["loss_mask"] = loss_mask
+        new_sample["position_ids"] = position_ids
+        if local_cp_size is not None:
+            # Accept either a Python int or a CUDA scalar tensor; keep as a scalar tensor on GPU.
+            # new_sample["local_cp_size"] = local_cp_size.to(device=dev, dtype=torch.int32)
+            new_sample["local_cp_size"] = torch.tensor(local_cp_size, device=torch.cuda.current_device(), dtype=torch.int32)
+
+        # new_sample["cu_seqlens_padded"] = cu_seqlens_padded
+        # We set cu_seqlens to cu_seqlens_padded here
+        # we don't provide cu_seqlens_padded here because `get_batch_on_this_tp_rank` does not consider it
+        # at the moment. It is assumed that any necessary padding will be after data is loaded in.
+        # TODO(pmannan): We need to be able to differentiate if the original data_iterator is providing
+        # padded samples or valid lengths.
+        new_sample["cu_seqlens"] = cu_seqlens_padded
+        new_sample["max_seqlen"] = max_seqlen
+
+        return new_sample
+
+    def _build_packed_microbatches(
+        self,
+        grouped_samples: List[List[Dict[str, torch.Tensor]]],
+        sample_id_groups: List[List[int]],
+        hdp_rank: int,
+    ) -> List[Dict[str, torch.Tensor]]:
+        """
+        Build packed samples for each microbatch given a pre-built list of `samples` per microbatch.
+
+        Args:
+            grouped_samples: List of length `num_microbatches`. Each element is the `samples` list
+                (list[sample]) for that microbatch, where `sample` is the dict returned by
+                `dataset.__getitem__`.
+            sample_id_groups: List of length `num_microbatches`. Each element is the `sample_id_groups` list
+                (list[sample_id]) for that microbatch, where `sample_id` is the id of the sub-sample.
+
+        Returns:
+            new_samples: list of packed samples (dicts) length == num_micro_batches.
+        """
+        num_micro_batches = len(grouped_samples)
+        # seg_starts: List[int] = [0]
+        # original_lens_tensors = []
+        # padded_lens_tensors = []
+
+        # for i in range(num_micro_batches):
+        #     samples = grouped_samples[i]
+        #     seg_starts.append(seg_starts[-1] + len(samples))
+            # original_lens_tensors.extend([s["tokens"].shape[0] for s in samples])
+            # padded_lens_tensors.extend([s["tokens"].shape[0] for s in samples])
+
+        # padded_lens_all_gpu = torch.cat(padded_lens_tensors, dim=0).to(dtype=torch.int32)
+        # original_lens_all_gpu = torch.cat(original_lens_tensors, dim=0).to(dtype=torch.int32)
+
+        new_samples: List[Dict[str, torch.Tensor]] = []
+        for i in range(num_micro_batches):
+            samples = grouped_samples[i]
+            local_cp_size = -1
+            # sample_id_groups = [[[0, 1, 2], [0, 1, 2]], [[3, 4, 5], [6, 7, 8]]]
+            # Indicates the sub-sample ids per microbatch for each DPxCP rank.
+            for sub_sample_id in sample_id_groups[i][hdp_rank]: # i:0 hdp_rank:0 [[0, 1, 2]]
+                # sub_sample_id: 0 / 1 / 2
+                partner_cp_size = len(
+                    [True for sample_ids in sample_id_groups[i] if sub_sample_id in sample_ids]
+                )
+
+                if local_cp_size == -1:
+                    local_cp_size = partner_cp_size
+                else:
+                    assert local_cp_size == partner_cp_size, f"\
+                        found sample within a packed microbatch with different local_cp_size: \
+                        {local_cp_size} != {partner_cp_size}"
+
+            # lp = padded_lens_all_gpu[seg_starts[i] : seg_starts[i + 1]]
+            # lo = original_lens_all_gpu[seg_starts[i] : seg_starts[i + 1]]
+
+            new_sample = self._pack_sequences(samples, local_cp_size)
+            new_samples.append(new_sample)
+
+        return new_samples
+    
     def __next__(self) -> Any:
         """
         Get the next item from the dataset, pull scheduling metadata and return it.
@@ -299,21 +402,23 @@ class HybridCPDataLoaderWrapper:
             batch, global_ids_this_rank, global_id_seqlens, sample_id_groups, offsets
         )
 
-        # batch, sample_id_groups = samples_this_rank_with_id, sample_id_groups
+        batch, sample_id_groups = samples_this_rank_with_id, sample_id_groups
 
-        # hdp_rank = parallel_state.get_data_parallel_rank(with_context_parallel=True)
-        # num_micro_batches = len(sample_id_groups)
+        hdp_rank = self.dp_cp_group.rank()
+        num_micro_batches = len(sample_id_groups)
 
-        # grouped_samples = [
-        #     [batch[sub_sample_id] for sub_sample_id in sample_id_groups[i][hdp_rank]]
-        #     for i in range(num_micro_batches)
-        # ]
+        grouped_samples = [
+            [batch[sub_sample_id] for sub_sample_id in sample_id_groups[i][hdp_rank]]
+            for i in range(num_micro_batches)
+        ]
 
-        # new_samples = _build_packed_microbatches(
-        #     grouped_samples=grouped_samples,
-        #     scheduler_type=scheduler_type,
-        #     local_cp_sizes_gpu=local_cp_sizes_gpu,
-        # )
+        new_samples = self._build_packed_microbatches(
+            grouped_samples=grouped_samples,
+            sample_id_groups=sample_id_groups,
+            hdp_rank=hdp_rank
+        )
 
-
-        return samples_this_rank_with_id, sample_id_groups
+        new_data_iterator = RerunDataIterator(iter(new_samples))
+        
+        # return samples_this_rank_with_id, sample_id_groups
+        return new_data_iterator, sample_id_groups

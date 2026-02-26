@@ -552,6 +552,25 @@ def hybrid_context_parallel_forward_backward(
         _broadcast(num_samples_this_group_broadcast)
         return num_samples_this_group_broadcast
 
+    def _broadcast_num_total_groups(num_total_groups):
+        dev = torch.cuda.current_device()
+        torch.distributed.barrier()
+
+        n = 0 if num_total_groups is None else num_total_groups
+        n = torch.tensor(n, dtype=torch.int32, device=dev)
+
+        _broadcast(n)
+        n = int(n.item())
+
+        # assert n > 0, "there should be at least 1 num_microbatches"
+        # num_samples_this_group_broadcast = (
+        #     torch.empty(n, dtype=torch.int32, device=dev)
+        #     if num_samples_this_group is None
+        #     else num_samples_this_group
+        # )
+        # _broadcast(num_samples_this_group_broadcast)
+        return n
+
     def _get_new_data_iterator(sample_id_in_group, group_id):
         if is_first_tp_rank:
             # TODO(pmannan): Add support for sequence packing.
@@ -578,29 +597,43 @@ def hybrid_context_parallel_forward_backward(
     if is_first_tp_rank:
         data = next(data_iterator)
         sample_id_groups = data[1]
-        batch = data[0]
+        # batch = data[0]
+        new_data_iterator = data[0]
     else:
-        data, sample_id_groups, batch = None, None, None
+        data, sample_id_groups, new_data_iterator = None, None, None
 
-    num_samples_this_group = None
+    # num_samples_this_group = None
+    # if is_first_tp_rank:
+    #     num_samples_this_group = torch.tensor(
+    #         [len(group[hdp_rank]) for group in sample_id_groups], dtype=torch.int32, device='cuda'
+    #     )
+
+    num_total_groups = None
     if is_first_tp_rank:
-        num_samples_this_group = torch.tensor(
-            [len(group[hdp_rank]) for group in sample_id_groups], dtype=torch.int32, device='cuda'
-        )
+        num_total_groups = len(sample_id_groups) # equivalent to num_microbatches
 
-    num_samples_this_group = _broadcast_num_samples_this_group(num_samples_this_group)
-    num_samples_this_group = num_samples_this_group.cpu().numpy()
-    num_total_groups = num_samples_this_group.shape[0]
+    num_total_groups = _broadcast_num_total_groups(num_total_groups)
+    # num_total_groups = num_total_groups.cpu().numpy()
+    num_samples_this_group = [1 for _ in range(num_total_groups)] # After sequence packing, each group has only one sub-sample
+
+    # num_samples_this_group = _broadcast_num_samples_this_group(num_samples_this_group)
+    # num_samples_this_group = num_samples_this_group.cpu().numpy()
+    # num_total_groups = num_samples_this_group.shape[0]
+
+    # if torch.distributed.get_rank() == 0:
+    #     import pdb; pdb.set_trace()
+    # else:
+    #     import time; time.sleep(1000)
 
     current_microbatch = 0
 
     # Upto last group, we don't need any sync.
     with no_sync_func():
         for j in range(num_total_groups - 1):
-            sample_ids_this_group = sample_id_groups[j][hdp_rank] if is_first_tp_rank else None
+            # sample_ids_this_group = sample_id_groups[j][hdp_rank] if is_first_tp_rank else None
             for i in range(num_samples_this_group[j]):
                 # Call forward step for each sub-sample
-                new_data_iterator = _get_new_data_iterator(i, j)
+                # new_data_iterator = _get_new_data_iterator(i, j)
                 # TODO: Find the usage of current_microbatch and is_first_microbatch and
                 # how that may affect my usage.
                 output_tensor, num_tokens = forward_step(
@@ -633,9 +666,9 @@ def hybrid_context_parallel_forward_backward(
 
     # For the last group, we need to run the last sub-sample out of the context handler.
     with no_sync_func():
-        sample_ids_this_group = sample_id_groups[-1][hdp_rank] if is_first_tp_rank else None
+        # sample_ids_this_group = sample_id_groups[-1][hdp_rank] if is_first_tp_rank else None
         for i in range(num_samples_this_group[-1] - 1):
-            new_data_iterator = _get_new_data_iterator(i, -1)
+            # new_data_iterator = _get_new_data_iterator(i, -1)
             # Call forward step for each sub-sample
             output_tensor, num_tokens = forward_step(
                 forward_step_func,
@@ -658,7 +691,7 @@ def hybrid_context_parallel_forward_backward(
 
     # The last sub-sample of the last group of the last microbatch is
     # run out of the context handler.
-    new_data_iterator = _get_new_data_iterator(-1, -1)
+    # new_data_iterator = _get_new_data_iterator(-1, -1)
     # Call forward step for each sub-sample
     output_tensor, num_tokens = forward_step(
         forward_step_func,
