@@ -1409,7 +1409,7 @@ class MultiTokenPredictionBlock(MegatronModule):
             ShardedStateDict: A dictionary containing the sharded state of the multi
             token prediction module.
         """
-        sharded_state_dict = super().sharded_state_dict(prefix, sharded_offsets, metadata)
+        sharded_state_dict = {}
         layer_prefix = f'{prefix}layers.'
         for layer in self.layers:
             offset = get_mtp_layer_offset(self.config, self.vp_stage)
