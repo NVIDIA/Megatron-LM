@@ -929,6 +929,9 @@ class _CudaGraphRunner(torch.nn.Module):
                         only_inputs=True,
                         allow_unused=True,
                     )
+
+            _set_warmup_end()
+
             with self.get_quantization_context():
                 torch.cuda.synchronize()
                 # Register default CUDA generators ourselves (fixed in-place to have normal tensors)
@@ -961,8 +964,6 @@ class _CudaGraphRunner(torch.nn.Module):
                     # only on the last layer per-device to avoid slowing down graph creation.
                     if self.is_last_layer:
                         gc.collect()
-
-        _set_warmup_end()
 
         # save cudagraph output buffer
         self.fwd_graph_outputs = fwd_graph_outputs
