@@ -7,7 +7,6 @@ import torch
 
 from megatron.core.jit import jit_fuser
 from megatron.core.transformer.module import MegatronModule
-from megatron.core.transformer.moe.moe_logging import MoEMetricsTracker
 from megatron.core.transformer.moe.moe_utils import (
     MoEAuxLossAutoScaler,
     ProcessGroupCollection,
@@ -470,7 +469,7 @@ class TopKRouter(Router):
         else:
             layer_number = self.layer_number
 
-        MoEMetricsTracker.get_instance().record(
+        self.config.moe_metrics_tracker.record(
             aux_loss_name,
             aux_loss / aux_loss_coeff,
             layer_number,
@@ -543,7 +542,7 @@ class TopKRouter(Router):
             else:
                 layer_number = self.layer_number
 
-            MoEMetricsTracker.get_instance().record(
+            self.config.moe_metrics_tracker.record(
                 "z_loss", z_loss / moe_z_loss_coeff, layer_number, num_layers
             )
         return logits
