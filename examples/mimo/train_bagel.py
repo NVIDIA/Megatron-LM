@@ -18,9 +18,16 @@ from megatron.core.parallel_state import (
 )
 
 # Add the parent directory to the path to import from megatron
-sys.path.append(
-    os.path.abspath(os.path.join(os.path.dirname(__file__), os.path.pardir, os.path.pardir))
-)
+# sys.path.append(
+#     os.path.abspath(os.path.join(os.path.dirname(__file__), os.path.pardir, os.path.pardir))
+# )
+# Ensure bagel package is importable when train.py is run without example_bagel_gen_training.sh
+_repo_root = os.path.abspath(os.path.join(os.path.dirname(__file__), os.pardir, os.pardir))
+_bagel_package = os.path.join(_repo_root, "bagel-package")
+for _p in (_repo_root, _bagel_package):
+    if _p not in sys.path:
+        sys.path.insert(0, _p)
+
 from data.energon_avlm_task_encoder import llava_avlm_dataloader_provider
 from data.energon_vlm_task_encoder import llava_vlm_dataloader_provider
 from data.mock import (
@@ -83,6 +90,7 @@ def add_mimo_args(parser):
     group.add_argument('--language-model-checkpoint', type=str, default=None, help='Path to language model checkpoint to load')
     # energon dataloader related args
     group.add_argument('--packing-buffer-size', type=int, default=None, help='Packing buffer size when using sequence packing')
+
     # Bagel-specific args
     group.add_argument('--text-cond-dropout-prob', type=float, default=0.1, help='Text conditional dropout probability')
     group.add_argument('--vit-cond-dropout-prob', type=float, default=0.4, help='VIT conditional dropout probability')
@@ -124,6 +132,8 @@ def get_batch(data_iterator: Iterator[Dict[str, Any]]):
         tuple: Batch data for model training
     """
     args = get_args()
+    # cur_rank = torch.distributed.get_rank()
+    # print(f"Run get batch on rank {cur_rank}")
 
     # Assert that context parallelism and pipeline parallelism are not supported yet
     assert (
@@ -132,7 +142,7 @@ def get_batch(data_iterator: Iterator[Dict[str, Any]]):
 
     assert (getattr(args, 'pipeline_model_parallel_size', 1) == 1), \
         "Pipeline parallelism is not supported yet in MIMO implementation"
-    
+
     # Broadcast data - only get data on tensor parallel rank 0
     # data iterator is None on other tp ranks
     # TP Rank-0 reads next batch.
@@ -159,7 +169,7 @@ def get_batch(data_iterator: Iterator[Dict[str, Any]]):
         # we need this to avoid race condition when first tp rank hits StopIteration
         return None
 
-    # MiMo forward pass expects 
+    # MiMo forward pass expects
     # input_ids: torch.Tensor,
     # position_ids: Optional[torch.Tensor] = None,
     # attention_mask: Optional[torch.Tensor] = None,
@@ -171,6 +181,7 @@ def get_batch(data_iterator: Iterator[Dict[str, Any]]):
     # For the modality inputs, the keys can be arbitrary
     # so we do a broadcast of the schema followed by a broadcast of the actual data
     # check broadcast_nested_data_batch for more details
+
     # Check if this is bagel dataset (PackedDataset format)
     if args.dataset_provider == 'bagel' and data is not None:
         # Convert bagel packed batch to MIMO format
@@ -179,8 +190,11 @@ def get_batch(data_iterator: Iterator[Dict[str, Any]]):
             diffusion_wrapper.cuda()
         # print(f"Run bagel_packed_batch_to_mimo_batch on rank {cur_rank}")
         data = bagel_packed_batch_to_mimo_batch(data, diffusion_wrapper=diffusion_wrapper)
+
+    # print(f"Run broadcast_nested_data_batch on rank {cur_rank}")
     batch = broadcast_nested_data_batch(data)
     return batch
+
 
 def loss_func(loss_mask, output_tensor):
     """Simple loss function for MIMO model training.
@@ -247,7 +261,7 @@ def loss_func(loss_mask, output_tensor):
     total_loss = torch.sum(losses.view(-1) * loss_mask)
     reporting_loss = torch.cat([total_loss.clone().detach().view(1), total_tokens.view(1)])
 
-    return (total_loss, total_tokens, {'lm loss': (reporting_loss)})
+    return (total_loss, total_tokens, {'lm loss': reporting_loss})
 
 
 def forward_step(data_iterator, model):
@@ -291,9 +305,6 @@ def model_provider(
     add_decoder: bool = True,
     image_special_token_id: int = 32000,
     audio_special_token_id: int = 32002,
-    config=None,
-    pg_collection=None,
-    vp_stage=None,
 ):
     """Model provider for MIMO model training.
 
@@ -362,7 +373,7 @@ def model_provider(
 
 
 if __name__ == "__main__":
-    
+
     train_valid_test_datasets_provider.is_distributed = True
     pretrain(
         train_valid_test_datasets_provider,
