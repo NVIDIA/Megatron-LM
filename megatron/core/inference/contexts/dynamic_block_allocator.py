@@ -254,6 +254,10 @@ class BlockAllocator:
             map(self.hash_to_block_id.pop, keys_to_delete & self.hash_to_block_id.keys()), maxlen=0
         )
 
+        # Invalidate Mamba state for evicted blocks (if Mamba prefix caching is enabled)
+        for block_id_int in block_ids.tolist():
+            self.context.invalidate_mamba_state_for_block(block_id_int)
+
         # Reset block state (batched tensor ops)
         self.block_hashes[block_ids] = -1
         self.block_ref_counts[block_ids] = 0

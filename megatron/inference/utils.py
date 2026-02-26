@@ -317,6 +317,7 @@ def get_inference_config_from_model_and_args(model: MegatronModule, args):
         enable_chunked_prefill=args.enable_chunked_prefill,
         enable_prefix_caching=args.inference_dynamic_batching_enable_prefix_caching,
         block_evict_lru=args.inference_dynamic_batching_block_evict_lru,
+        prefix_caching_mamba_gb=getattr(args, 'inference_dynamic_batching_prefix_caching_mamba_gb', None),
         metrics_writer=metrics_writer,
         logging_step_interval=args.inference_logging_step_interval,
     )
