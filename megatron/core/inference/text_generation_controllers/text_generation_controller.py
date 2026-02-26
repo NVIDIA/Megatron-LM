@@ -6,7 +6,7 @@ import copy
 import functools
 import inspect
 from collections import defaultdict
-from typing import Any, Dict, Iterator, List, Optional, OrderedDict, Tuple, Union
+from typing import Any, Dict, List, Optional, OrderedDict, Tuple, Union
 
 import torch
 import torch.nn.functional as F
@@ -62,6 +62,7 @@ class TextGenerationController:
         self.model_config = self.inference_wrapped_model.model.config
         inference_config = self.inference_wrapped_model.inference_context.config
         self.tokenizer = tokenizer
+        self.num_speculative_tokens = inference_config.num_speculative_tokens
 
         pg_collection = inference_config.pg_collection
         if pg_collection is not None:
@@ -80,10 +81,18 @@ class TextGenerationController:
             self.vocab_size = unwrapped_model.vocab_size
 
         self.sampling_rng = torch.Generator(device=torch.cuda.current_device())
+        self.num_mtp_heads = self._get_mtp_num_heads()
         self.sampling_rng.manual_seed(self.model_config.inference_sampling_seed)
 
         if self.inference_wrapped_model.inference_context.is_dynamic_batching():
             self._init_dynamic_sampling_tensors()
+
+    def _get_mtp_num_heads(self) -> int:
+        """Get the number of MTP layers from the model config."""
+        model = self.inference_wrapped_model.model
+        if hasattr(model, 'config') and hasattr(model.config, 'mtp_num_layers'):
+            return model.config.mtp_num_layers or 0
+        return 0
 
     def set_stop_word_finished_ids_callback(self, callback):
         """Set a callback to get request IDs that should be marked as finished due to stop words.
@@ -109,6 +118,10 @@ class TextGenerationController:
 
         self._sampling_backend = "torch"
         self._sampled_tokens_cuda = torch.empty(max_requests, dtype=torch.int64, device=device)
+        # Speculative tokens tensor will be allocated later when num_speculative_tokens is set by the engine
+        self._accepted_tokens_per_request = None
+        # MTP tensor will be allocated later when num_speculative_tokens is set by the engine
+        self._sampled_mtp_tokens_cuda = None
 
         # Keep track of request metadata.
         self._request_metadata: Dict[str, Tensor] = {}
@@ -122,7 +135,23 @@ class TextGenerationController:
 
         # Used for inefficient torch sampling.
         if self._sampling_backend == "torch":
-            self._torch_sampling_buckets: Iterator[Tuple] = []
+            self._torch_sampling_buckets: List[Tuple] = []
+
+    def _init_mtp_sampling_tensor(self):
+        """Initialize the MTP sampling tensor after num_speculative_tokens is set."""
+        if self.num_speculative_tokens is not None and self.num_speculative_tokens > 0:
+            context = self.inference_wrapped_model.inference_context
+            max_requests = context.max_requests
+            device = torch.cuda.current_device()
+            self._sampled_mtp_tokens_cuda = torch.empty(
+                [self.num_speculative_tokens, max_requests], dtype=torch.int64, device=device
+            )
+            self._accepted_tokens_per_request = (
+                torch.ones(
+                    [max_requests, self.num_speculative_tokens], dtype=torch.int64, device=device
+                )
+                * -1
+            )
 
     def tokenize_prompt(self, prompt: str, add_BOS: bool = False) -> List[int]:
         """Utility to tokenize the input prompts.
@@ -583,6 +612,21 @@ class TextGenerationController:
             logits = self.inference_wrapped_model.run_one_forward_step(
                 {"tokens": input_ids, "position_ids": position_ids, "attention_mask": None}
             )
+            # [1, seq_len, vocab_size] (logits)
+            # [num_speculative_tokens, seq_len, vocab_size] (mtp_logits)
+
+        if self.num_speculative_tokens > 0:
+            unwrapped_model = unwrap_model(self.inference_wrapped_model.model)
+            assert hasattr(unwrapped_model, '_mtp_logits_cache'), "MTP logits cache not found"
+            mtp_logits = unwrapped_model._mtp_logits_cache
+            expected_mtp_logits_length, _, vocab_size = mtp_logits.shape
+            assert (
+                expected_mtp_logits_length == self.num_mtp_heads
+            ), f"MTP logits length mismatch. Expected mtp logits length {self.num_mtp_heads}, got {expected_mtp_logits_length}"
+            mtp_logits = mtp_logits[: self.num_speculative_tokens]
+            logits = torch.cat(
+                [logits, mtp_logits], dim=0
+            )  # [num_speculative_tokens + 1, seq_len, vocab_size]
 
         if self.model_is_pipeline_parallel:
             logits_seq_len = (
@@ -590,7 +634,7 @@ class TextGenerationController:
                 if context.config.materialize_only_last_token_logits
                 else input_ids.shape[1]
             )
-            logits_shape = [1, logits_seq_len, self.vocab_size]
+            logits_shape = [self.num_speculative_tokens + 1, logits_seq_len, self.vocab_size]
 
             if is_pipeline_last_stage(self.pp_group):
                 assert logits is not None and torch.Size(logits_shape) == logits.shape
@@ -612,25 +656,368 @@ class TextGenerationController:
         if self._sampling_backend == "torch":
             # Bucketize the core sampling parameters.
             # Doing so via list comprehension is orders of magnitude faster than via torch.
-            bucket_map = {}
+            bucket_map = defaultdict(list)
 
             # Shorthands for the dictionary comprehension.
             temp = self._request_metadata["temperature"][active_request_slice].tolist()
             top_k = self._request_metadata["top_k"][active_request_slice].tolist()
             top_p = self._request_metadata["top_p"][active_request_slice].tolist()
 
-            for i, (t, k, p) in enumerate(zip(temp, top_k, top_p)):
-                h = (t, k, p)
-                bucket = bucket_map.get(h, None)
-                if bucket is None:
-                    bucket_map[h] = ([i], i)
-                else:
-                    bucket[0].append(i)
+            for request_index, (t, k, p) in enumerate(zip(temp, top_k, top_p)):
+                sampling_params = (t, k, p)
+                bucket_map[sampling_params].append(request_index)
 
-            # Store the buckets and their equivalence class representatives.
-            self._torch_sampling_buckets = (
-                (indices, temp[rep], top_k[rep], top_p[rep]) for indices, rep in bucket_map.values()
+            # Just unpack the key directly!
+            self._torch_sampling_buckets = [
+                (indices, *sampling_params) for sampling_params, indices in bucket_map.items()
+            ]
+
+    def _rewind_kv_cache(self):
+        """Update the KV cache bookkeeping for speculative decoding.
+
+        After forward pass with speculative tokens, some tokens may be rejected.
+        This function "rewinds" the KV cache bookkeeping to reflect only the accepted tokens.
+
+        When speculative tokens are rejected, we need to:
+        1. Update request_kv_length_offsets (total sequence length)
+        2. Update request_last_kv_block_offset (position within last block)
+        3. If rewinding crosses a block boundary:
+           - Reduce request_kv_block_counts
+           - Update request_last_kv_block_id to point to the previous block
+           - Clear the entry in request_to_kv_block_ids for the released block
+           - Release the block back to the allocator
+        """
+        context = self.inference_wrapped_model.inference_context
+        active_request_count = context.total_request_count - context.paused_request_count
+        active_request_slice = slice(context.paused_request_count, context.total_request_count)
+
+        # Get the accepted token counts for each request
+        # Note: _accepted_token_counts is indexed from 0 to active_request_count-1
+        accepted_tokens_per_request = self._accepted_token_counts_per_request[:active_request_count]
+
+        # Number of tokens to rewind (rejected speculative tokens)
+        num_tokens_to_rewind = self.num_speculative_tokens - accepted_tokens_per_request
+
+        # For prefill requests, no speculative tokens were forwarded through the model,
+        # so there is nothing to rewind.
+        request_in_prefill_status = context.request_in_prefill_status_tensor[active_request_slice]
+        num_tokens_to_rewind[request_in_prefill_status == 1] = 0
+
+        # Save the original offset BEFORE modifying to correctly detect block boundary crossing
+        original_offset = context.request_last_kv_block_offset[active_request_slice].clone()
+
+        # Check which requests need to rewind to a previous block BEFORE modifying
+        # A request crosses back to a previous block if: original_offset - num_tokens_to_rewind < 0
+        remove_allocated_blocks_mask = (original_offset - num_tokens_to_rewind) < 0
+
+        # Update the offsets
+        context.request_last_kv_block_offset[active_request_slice] = (
+            original_offset - num_tokens_to_rewind
+        ) % context.block_size_tokens
+
+        context.request_kv_length_offsets[active_request_slice] = (
+            context.request_kv_length_offsets[active_request_slice] - num_tokens_to_rewind
+        )
+
+        # No need to update request_query_lengths (It will be set correctly in the next iteration)
+
+        # For requests that crossed back to a previous block, we need to:
+        # 1. Reduce the block count by 1
+        # 2. Get the block ID to release (current request_last_kv_block_id)
+        # 3. Update request_last_kv_block_id to point to the previous block
+        # 4. Clear the entry in request_to_kv_block_ids for the released block
+        # 5. Release the block back to the allocator
+        if remove_allocated_blocks_mask.any():
+            # Get indices of requests that need to release a block (relative to active requests)
+            requests_needing_release = torch.nonzero(remove_allocated_blocks_mask, as_tuple=True)[0]
+            # Convert to absolute indices in the context tensors
+            absolute_indices = requests_needing_release + context.paused_request_count
+
+            # Get the block IDs to release (current last block for these requests)
+            blocks_to_release = context.request_last_kv_block_id[absolute_indices].clone()
+
+            # Reduce block counts for requests that crossed back
+            context.request_kv_block_counts[absolute_indices] -= 1
+
+            # Get the new block counts after decrement
+            new_block_counts = context.request_kv_block_counts[absolute_indices]
+
+            # Update request_last_kv_block_id to point to the previous block
+            # and clear the released block entry in request_to_kv_block_ids
+            # Vectorized implementation using advanced indexing:
+            # Note: new_block_counts is guaranteed to be > 0 for all requests here, since
+            # crossing back to a previous block implies the request had at least 2 blocks.
+
+            # Update request_last_kv_block_id to point to the previous block (at index new_count - 1)
+            context.request_last_kv_block_id[absolute_indices] = context.request_to_kv_block_ids[
+                absolute_indices, new_block_counts - 1
+            ]
+
+            # Clear the released block entry (at index new_count, which was the old last block)
+            context.request_to_kv_block_ids[absolute_indices, new_block_counts] = -1
+
+            # Release the blocks back to the allocator
+            context.block_allocator.release_memory_blocks(blocks_to_release)
+
+        # Mamba speculative rewind state update
+        if context.is_hybrid_model:
+            active_mamba_indices = context.mamba_metadata.request_to_mamba_state_idx[
+                active_request_slice
+            ]
+            is_decode_mask = context.request_in_prefill_status_tensor[active_request_slice] == 0
+            decode_mamba_indices = active_mamba_indices[is_decode_mask]
+            accepted_tokens_per_decode_request = accepted_tokens_per_request[is_decode_mask]
+
+            if decode_mamba_indices.numel() > 0:
+                context.mamba_ssm_states[:, decode_mamba_indices] = (
+                    context.mamba_intermediate_ssm_states[
+                        :, decode_mamba_indices, accepted_tokens_per_decode_request
+                    ]
+                )
+
+    def _dynamic_step_sample_logits_and_verify_tokens(
+        self, logits: Tensor, mtp_logits: Tensor, input_ids: Tensor
+    ):
+        f"""Sample tokens from logits for dynamic batching with speculative tokens and verify the tokens.
+        """
+        context = self.inference_wrapped_model.inference_context
+        active_request_count = context.total_request_count - context.paused_request_count
+
+        # ================ PART 1 The following part of the code is to get all the relevant logit indices alone =========
+        # i.e For prefill requests just the last token logits are enough.
+        # i.e For decode requests we will need all tokens
+        # Decode request will always be on the left, followed by prefill requests
+        # In non speculative case, it was simple in the other function, we just always get the last token logits using query lengths.
+
+        # 5 requests #  Input ids shape : [1, 15]
+        # Assume input ids :                  [ a5  a6s  a7s |  b3    b4s  b5s   |  c6   c7s   c8s   |  d1    d2   | e1    e2    e3   e4]
+        # Request to prefill                  [    0         |         0         |          0        |    1        |         1          ]
+        # Request query lengths               [    3         |         3         |          3        |    2        |         4          ]
+        # OUTPUT : required_logit_indices     [ 0    1    2  |  3     4     5    |  6     7     8    |      10     |         14         ]
+
+        request_in_prefill_status_tensor = context.request_in_prefill_status_tensor[
+            context.paused_request_count : context.total_request_count
+        ]
+        request_query_lengths = context.request_query_lengths[
+            context.paused_request_count : context.total_request_count
+        ]
+
+        num_prefill_requests = request_in_prefill_status_tensor.sum().item()
+        num_decode_requests = active_request_count - num_prefill_requests
+
+        decode_request_indices = torch.arange(
+            num_decode_requests * (self.num_speculative_tokens + 1), device=logits.device
+        )
+        prefill_request_indices = (
+            request_query_lengths.cumsum(dim=0)[request_in_prefill_status_tensor == 1] - 1
+        )  # Last token indices for prefill requests
+        required_logit_indices = torch.cat([decode_request_indices, prefill_request_indices])
+        assert (
+            len(required_logit_indices)
+            == num_decode_requests * (self.num_speculative_tokens + 1) + num_prefill_requests
+        ), (
+            f"Expected length of required_logit_indices to be "
+            f"num_decode_requests * (self.num_speculative_tokens + 1) + num_prefill_requests, "
+            f"but got {len(required_logit_indices)} for num_decode_requests {num_decode_requests} "
+            f"and num_prefill_requests {num_prefill_requests}"
+        )
+
+        required_logits = logits.squeeze(0)[required_logit_indices, :]  # Shape [1, 11, vocab_size]
+        required_mtp_logits = mtp_logits[
+            :, required_logit_indices, :
+        ]  # Shape [num_speculative_tokens, 11, vocab_size]
+
+        # ================ PART 1 The following part of the code is to sample the logits and mtp logits based on the sampling parameters =========
+
+        # request_indices will be 0, 1, 2, 3, 4 (since we have only 5 requests)
+        # For torch sampling buckets :-[request_indices, temp, top_k, top_p]
+        # [
+        # [[0,2], temp1, top_k1, top_p1],
+        # [1], temp3, top_k3, top_p3]
+        # [3, 4], temp2, top_k2, top_p2],
+        # ]
+
+        # Token to request idx :              [ 0    0     0  |  1     1     1     |  2     2     2     |   3    |   4  ]
+        # required_logits :                   [ a5l  a6l  a7l |  b3l    b4l  b5l   |  c6l   c7l   c8l   |  d2l   | e4l  ] # Shape [11, vocab_size]
+        # For first iteration :
+        #   sampling buckets : [0,2], temp1, top_k1, top_p1
+        #   output_tokens_jumbled_list = [a5s  a6s  a7s  c6s  c7s  c8s] #s->sampled tokens #
+        #   request_order_list = [0, 2]
+        #   token_order_list = [0, 1, 2, 6, 7, 8]
+        # For second iteration :
+        #   sampling buckets : [1], temp3, top_k3, top_p3
+        #   output_tokens_jumbled_list = [b3s  b4s  b5s]
+        #   request_order_list = [1]
+        #   token_order_list = [3, 4, 5]
+        # For third iteration :
+        #   sampling buckets : [3, 4], temp2, top_k2, top_p2
+        #   output_tokens_jumbled_list = [d2s  e4s] #s->sampled tokens #
+        #   request_order_list = [3, 4]
+        #   token_order_list = [9,10]
+        # Final output tokens : [a5s  a6s  a7s  c6s  c7s  c8s  b3s  b4s  b5s  d2s  e4s] # Shape [11]
+        # Final request order list : [0, 2, 1, 3, 4]
+        # Final token order list : [0, 1, 2, 6, 7, 8, 3, 4, 5, 9, 10]
+
+        repeats = torch.where(
+            request_in_prefill_status_tensor == 0, 1 + self.num_speculative_tokens, 1
+        )
+        token_to_request_index = torch.repeat_interleave(
+            torch.arange(
+                len(request_in_prefill_status_tensor),
+                device=request_in_prefill_status_tensor.device,
+            ),
+            repeats,
+        )
+
+        output_tokens_jumbled_list = []
+        mtp_output_tokens_jumbled_list = []
+        token_order_list = []
+
+        # TODO : Maybe its okay to have a loop with num spec tokens ? (Since it will only be max 3 , so might be faster)
+        for request_indices, temp, top_k, top_p in self._torch_sampling_buckets:
+            request_indices_tensor = torch.tensor(
+                request_indices, device=token_to_request_index.device
             )
+            required_indices = torch.where(
+                torch.isin(token_to_request_index, request_indices_tensor)
+            )[0]
+            # TODO : Can maybe club the following two and then split later ?
+            # TODO : Can directly initialize output tokens as a tensor and put the logits in the right place
+            output_tokens_jumbled_list.append(
+                self._torch_sampling_func(required_logits[required_indices, :], temp, top_k, top_p)
+            )
+            mtp_output_tokens_jumbled_list.append(
+                self._torch_sampling_func(
+                    required_mtp_logits[:, required_indices, :], temp, top_k, top_p
+                )
+            )
+            token_order_list.append(required_indices)
+
+        output_tokens_jumbled = torch.cat(output_tokens_jumbled_list, dim=0)
+        output_tokens = torch.empty(
+            len(output_tokens_jumbled),
+            device=output_tokens_jumbled.device,
+            dtype=output_tokens_jumbled.dtype,
+        )
+        token_order = torch.cat(token_order_list, dim=0)
+        # Rearrange output tokens because previously it will be in the order of the sampling_bucket request indices, but now we want to put them according to their corresponding input ids
+        output_tokens[token_order] = output_tokens_jumbled
+
+        mtp_output_tokens_jumbled = torch.cat(
+            mtp_output_tokens_jumbled_list, dim=1
+        )  # Shape [num_speculative_tokens, total_tokens]
+        mtp_output_tokens = torch.empty_like(mtp_output_tokens_jumbled)
+        mtp_output_tokens[:, token_order] = mtp_output_tokens_jumbled
+
+        ### ================ PART 3 This part is to do the following : ================
+        # Create the accepted tokens tensor
+        # For prefill it is always set to 1
+        # For decode, the first token is always accepted, then we compare with input tokens and accept the next tokens if its a match
+        # Then find the index of the last 1 in every request of the accepted tokens tensor
+        # Then these are the index of the tokens that will be sent to the next forward pass
+        # In the example (assume 1 spec token, 2 spec tokens and 0 sepc tokens are accepted in teh first 3 requests
+
+        # Assume input ids :                  [ a5  a6s  a7s |  b3    b4s  b5s   |  c6   c7s   c8s   |  d1    d2   | e1    e2    e3   e4]
+        # input_tokens_required:              [ a5  a6s  a7s |  b3    b4s  b5s   |  c6   c7s   c8s   |     d2      |         e4         ]  # Size 11
+        # Output tokens                       [ a6o a7o  a8o |  b40   b5o  b6o   |  c7o  c8o   c9o   |     d3o     |         e5o        ]  # At every index we get next positions sample
+        # Output tokens right shift           [ d3o a6o  a7o |  a8o   b40  b5o   |  b6o  c7o   c8o   |     c9o     |         d3o        ]
+        # Accepted tokens  mask               [  1   1    0  |  1      1    1    |   1    0     0    |      1      |         1          ]
+        # Last one indices                    [      1       |         5         |        6          |      9      |         10         ]
+
+        input_tokens_required = input_ids[0, required_logit_indices]
+        if input_tokens_required.ndim == 2:
+            assert (
+                input_tokens_required.shape[0] == 1
+            ), f"Expected input_tokens_required to have 1 row, but got {input_tokens_required.shape}"
+            input_tokens_required = input_tokens_required.squeeze(0)
+
+        # Initialize mask with False to prevent boundary bleed
+        accepted_tokens_mask = torch.zeros_like(input_tokens_required, dtype=torch.bool)
+
+        # This is to make all prefill tokens accepted
+        token_to_prefill_idx = torch.repeat_interleave(request_in_prefill_status_tensor, repeats)
+        accepted_tokens_mask[token_to_prefill_idx == 1] = True
+
+        # Safe decode token verification without cross-batch boundary contamination
+        if num_decode_requests > 0:
+            decode_len = num_decode_requests * (self.num_speculative_tokens + 1)
+
+            decode_inputs = input_tokens_required[:decode_len].reshape(
+                num_decode_requests, self.num_speculative_tokens + 1
+            )
+            decode_outputs = output_tokens[:decode_len].reshape(
+                num_decode_requests, self.num_speculative_tokens + 1
+            )
+
+            # Shift outputs right by 1 *within* each request to align sampled tokens with input targets
+            decode_outputs_shifted = decode_outputs.roll(1, dims=1)
+
+            decode_mask_2d = decode_inputs == decode_outputs_shifted
+
+            # The first token (base token) is always accepted
+            decode_mask_2d[:, 0] = True
+
+            # ENFORCE CONSECUTIVE ACCEPTANCE:
+            # cummin() on booleans propagates False (0) to the right, invalidating all subsequent mismatches
+            decode_mask_2d = decode_mask_2d.cummin(dim=1).values
+
+            # Put the consecutive-enforced mask back into the flattened 1D tensor
+            accepted_tokens_mask[:decode_len] = decode_mask_2d.flatten()
+
+        # This is to find the index of the last 1 in every request
+        # (Now mathematically guaranteed to be the final consecutive match)
+        last_one_indices = torch.full(
+            (active_request_count,), -1, device=token_to_request_index.device
+        )
+        
+        if num_decode_requests > 0:
+            # Summing the consecutive mask gives the count; subtract 1 for the local index
+            local_last_indices = decode_mask_2d.sum(dim=1) - 1
+            row_offsets = torch.arange(num_decode_requests, device=last_one_indices.device) * (self.num_speculative_tokens + 1)
+            last_one_indices[:num_decode_requests] = row_offsets + local_last_indices
+            
+        if num_prefill_requests > 0:
+            # Prefill requests only have 1 token evaluated, so nonzero() is perfectly safe here
+            decode_len = num_decode_requests * (self.num_speculative_tokens + 1)
+            prefill_valid = torch.nonzero(accepted_tokens_mask[decode_len:]).squeeze(-1) + decode_len
+            last_one_indices[num_decode_requests:] = prefill_valid
+
+        # These are the tokens (output + speculative tokens) that will be going to the next forward pass
+        final_sampled_tokens = output_tokens[last_one_indices]
+        self._sampled_tokens_cuda[: len(final_sampled_tokens)] = final_sampled_tokens
+        self._sampled_mtp_tokens_cuda[:, : len(final_sampled_tokens)] = mtp_output_tokens[
+            :, last_one_indices
+        ]
+
+        ### ================ PART 4 This part is to do the following : ================
+        # To fill the speculative tokens and accepted_token counts
+        # For prefill it is always set to 1
+        # For decode, the first token is always accepted, then we compare with input tokens and accept the next tokens if its a match
+        # Then find the index of the last 1 in every request of the accepted tokens tensor
+        # Then these are the index of the tokens that will be sent to the next forward pass
+        # In the example (assume 1 spec token, 2 spec tokens and 0 sepc tokens are accepted in teh first 3 requests
+
+        # input_tokens_required:              [ a5  a6s  a7s |  b3    b4s  b5s   |  c6   c7s   c8s   |     d2      |         e4         ]  # Size 11
+        # Accepted tokens  mask               [  1   1    0  |  1      1    1    |   1    0     0    |      1      |         1          ]
+        # Accepted tokens                     [   [a6s  -1]  |     [b4s  b5s]    |     [-1  -1]      ]  # Only handle decod requests, (Prefill already defaults to -1s)
+        # Accepted token counts               [      1       |         2         |         0         ]  # Prefill defaults to 0
+
+        # This part is to extract the accepted tokens
+        input_tokens_required[accepted_tokens_mask == 0] = -1  # Masks out non accepted tokens
+        input_tokens_decode_mode = input_tokens_required[
+            : num_decode_requests * (self.num_speculative_tokens + 1)
+        ]
+        input_tokens_reshaped = input_tokens_decode_mode.reshape(
+            -1, self.num_speculative_tokens + 1
+        )  # shape : [num_decode_requests, num_speculative_tokens + 1]
+
+        accepted_tokens = input_tokens_reshaped[
+            :, 1:
+        ]  # Skip the first token of every decode request (i.e a5, b3, c6)
+        self._accepted_tokens_per_request[: accepted_tokens.shape[0], :] = accepted_tokens
+        self._accepted_token_counts_per_request = (self._accepted_tokens_per_request != -1).sum(
+            dim=1
+        )
 
     def _dynamic_step_sample_logits(self, logits: Tensor):
         """Sample tokens from logits for dynamic batching.
@@ -646,24 +1033,32 @@ class TextGenerationController:
         if context.config.materialize_only_last_token_logits:
             # When materialize_only_last_token_logits is true, last_token_logits is
             # already called in the forward pass of GPT.
-            last_token_logits = logits.squeeze(0)
+            required_token_indices = logits.squeeze(0)
         else:
-            last_token_logits = context.last_token_logits(logits)
+            # todo : Should do verification here and get approrpiate las token logits
+            required_token_indices = context.last_token_logits(logits)
 
         if self._sampling_backend == "torch":
             # Concatenate the outputs once to prevent repeated small writes.
             token_list = []
             indices_list = []
 
+            # e.g torch sample buckets will be
+            # i.e (for all unique comibnation of t, topk, topk what are the associated requests indices (based on the active slices)
+            # [ [req at index 0, req at index 2], t1, topk1, topp1 ]]
+            # [ [req at index 1, req at index 3, req at index 4] , t2, topk2, topp2]
             for indices, temp, top_k, top_p in self._torch_sampling_buckets:
                 token_list.append(
-                    self._torch_sampling_func(last_token_logits[indices, :], temp, top_k, top_p)
+                    self._torch_sampling_func(
+                        required_token_indices[indices, :], temp, top_k, top_p
+                    )
                 )
                 indices_list.append(torch.tensor(indices))
 
             # Single write to the output tensor.
             sampled_tokens = torch.cat(token_list, dim=0)
             sampled_indices = torch.cat(indices_list, dim=0)
+
             self._sampled_tokens_cuda[sampled_indices] = sampled_tokens
 
     def _dynamic_step_log_probs_bookkeeping(self) -> Tuple[bool, bool]:
@@ -883,7 +1278,13 @@ class TextGenerationController:
         # Active sequence lengths.
         active_request_ids = context.request_ids[active_request_slice].long()
         active_sequence_lengths = context.get_active_sequence_lengths()
-        active_sequence_lengths += 1  # Account for the token we just generated
+
+        if self.num_speculative_tokens > 0:
+            active_sequence_lengths += (
+                self._accepted_token_counts_per_request[:active_request_count] + 1
+            )
+        else:
+            active_sequence_lengths += 1
         max_sequence_lengths = context.get_max_sequence_lengths()
 
         # Request finished if termination_id or length >= max_sequence_length.
@@ -894,6 +1295,7 @@ class TextGenerationController:
         ).byte() & torch.less(active_sequence_lengths, max_sequence_lengths).byte()
 
         # Mark requests as finished if they hit stop words (detected in previous step's post_process_requests)
+        # TODO : SHAN : Correclty implement this
         if self._get_stop_word_finished_ids_callback is not None:
             request_ids_list = active_request_ids.tolist()
             stop_word_finished_ids = self._get_stop_word_finished_ids_callback(request_ids_list)
@@ -911,7 +1313,14 @@ class TextGenerationController:
         new_sample_copy = self._sampled_tokens_cuda[:active_request_count].clone()
 
         # Update requests.
-        update_result = context.update_requests(active_request_mask, new_sample_copy)
+        # _sampled_mtp_tokens_cuda has shape [num_speculative_tokens, max_requests]
+        if self.num_speculative_tokens > 0:
+            sampled_mtp_tokens_cuda = self._sampled_mtp_tokens_cuda[:, :active_request_count]
+        else:
+            sampled_mtp_tokens_cuda = None
+        update_result = context.update_requests(
+            active_request_mask, new_sample_copy, sampled_mtp_tokens_cuda
+        )
 
         return {
             "active_request_ids": active_request_ids,
@@ -955,7 +1364,13 @@ class TextGenerationController:
         if config.moe_enable_routing_replay:
             RouterReplay.set_global_router_replay_action(RouterReplayAction.RECORD)
 
-        logits = self._dynamic_step_forward_logits(input_ids, position_ids)
+        logits_and_mtp_logits = self._dynamic_step_forward_logits(input_ids, position_ids)
+        mtp_logits = None
+        if logits_and_mtp_logits.shape[0] > 1:
+            logits = logits_and_mtp_logits[:1]  # [1, seq_len, vocab_size]
+            mtp_logits = logits_and_mtp_logits[1:]  # [num_speculative_tokens, seq_len, vocab_size]\
+        else:
+            logits = logits_and_mtp_logits
 
         # Collect routing indices per request (must be done before context transitions)
         routing_indices_per_request = self._router_record_bookkeeping()
@@ -968,10 +1383,19 @@ class TextGenerationController:
         # Todo [Siddharth]: Can we condition the sleep on a cuda event?
         # NOTE [TDE]: This will be moved once CPU and GPU methods are separated.
         await asyncio.sleep(0)
-
         return_log_probs, return_top_n_logprobs = self._dynamic_step_log_probs_bookkeeping()
+        if self.num_speculative_tokens > 0:
+            assert (
+                return_log_probs == False and return_top_n_logprobs == False
+            ), "Log probs and top n log probs are not supported with speculative tokens"
+
         self._dynamic_step_sample_bookkeeping()
-        self._dynamic_step_sample_logits(logits)
+
+        if self.num_speculative_tokens > 0:
+            self._dynamic_step_sample_logits_and_verify_tokens(logits, mtp_logits, input_ids)
+            self._rewind_kv_cache()
+        else:
+            self._dynamic_step_sample_logits(logits)
 
         log_probs = None
         top_n_logprobs = None
@@ -988,12 +1412,16 @@ class TextGenerationController:
             request_bookkeeping = self._dynamic_step_context_bookkeeping()
 
         ret = {
-            "sample": self._sampled_tokens_cuda[:active_request_count],
+            "sample": self._sampled_tokens_cuda[:active_request_count].clone(),
+            "accepted_tokens": self._accepted_tokens_per_request.clone() if self.num_speculative_tokens > 0 else None,
             "log_probs": log_probs,
             "top_n_logprobs": top_n_logprobs,
             "routing_indices_per_request": routing_indices_per_request,
             "cuda_graph_request_count": cuda_graph_request_count,
         }
+        if self.num_speculative_tokens > 0:
+            self._accepted_tokens_per_request.fill_(-1)
+            self._accepted_token_counts_per_request.fill_(0)
         ret.update(request_bookkeeping)
         return ret
 

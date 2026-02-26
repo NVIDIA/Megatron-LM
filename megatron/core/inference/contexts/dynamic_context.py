@@ -262,6 +262,7 @@ class DynamicInferenceContext(BaseInferenceContext):
             pp_size = model_config.pipeline_model_parallel_size
         self.hidden_size_per_attention_head = core_divide(projection_size, num_attention_heads)
         self.num_attention_heads_per_partition = core_divide(num_attention_heads, tp_size)
+        self.num_speculative_tokens = inference_config.num_speculative_tokens
 
         # Cache the PP group we should use for PP collectives inside the context.
         # If the model provides a pg_collection with a pp group, prefer it.
@@ -347,6 +348,7 @@ class DynamicInferenceContext(BaseInferenceContext):
             mamba_states_memory_per_request += math.prod(self.mamba_ssm_states_shape)
             mamba_states_memory_per_request *= self.num_mamba_layers
             mamba_states_memory_per_request *= dtype_size_bytes
+            mamba_states_memory_per_request *= self.num_speculative_tokens + 1
 
         # Unified memory and general tensor management.
         self.unified_memory_level = inference_config.unified_memory_level
@@ -612,8 +614,10 @@ class DynamicInferenceContext(BaseInferenceContext):
             self.mamba_metadata = MambaMetadata(
                 max_requests=self.max_requests, max_tokens=self.max_tokens
             )
+            expanded_conv_shape = list(self.mamba_conv_states_shape)
+            expanded_conv_shape[-1] += self.num_speculative_tokens
             self.mamba_conv_states = torch.empty(
-                (self.num_mamba_layers, self.max_requests) + self.mamba_conv_states_shape,
+                (self.num_mamba_layers, self.max_requests, *expanded_conv_shape),
                 dtype=self.params_dtype,
                 device=torch.cuda.current_device(),
             )
@@ -622,6 +626,17 @@ class DynamicInferenceContext(BaseInferenceContext):
                 dtype=self.params_dtype,
                 device=torch.cuda.current_device(),
             )
+            if self.num_speculative_tokens > 0:
+                self.mamba_intermediate_ssm_states = torch.empty(
+                    (
+                        self.num_mamba_layers,
+                        self.max_requests,
+                        self.num_speculative_tokens + 1,
+                        *self.mamba_ssm_states_shape,
+                    ),
+                    dtype=self.params_dtype,
+                    device=torch.cuda.current_device(),
+                )
             if (
                 self.kv_cache_management_mode == KVCacheManagementMode.OFFLOAD
                 and not self._uses_torch_memory_saver
@@ -635,6 +650,13 @@ class DynamicInferenceContext(BaseInferenceContext):
                 self._offloadable_cpu_backups["mamba_ssm_states"] = torch.empty_like(
                     self.mamba_ssm_states, device="cpu"
                 ).pin_memory()
+                if self.num_speculative_tokens > 0:
+                    self._offloadable_tensor_names.add("mamba_intermediate_ssm_states")
+                    self._offloadable_cpu_backups["mamba_intermediate_ssm_states"] = (
+                        torch.empty_like(
+                            self.mamba_intermediate_ssm_states, device="cpu"
+                        ).pin_memory()
+                    )
         else:
             self.mamba_metadata = None
 
@@ -659,6 +681,8 @@ class DynamicInferenceContext(BaseInferenceContext):
         )
         # request_query_lengths is the input prompt tokens length during prefill phase (1st step) and then 1 for the decode phase (i.e During generation)
         self.request_query_lengths = torch.empty_like(self.request_ids)
+        # True only for a new request , then after a forward pass it is set to False
+        self.request_in_prefill_status_tensor = torch.empty_like(self.request_ids)
         # request_output_lengths is len(input_prompt_tokens) + num_tokens_to_generate
         self.request_output_lengths = torch.empty_like(self.request_ids)
         # request_kv_length_offsets is the same as query length during prefill phase (1st step) and then 1 for the decode phase (i.e During generation)
@@ -929,13 +953,19 @@ class DynamicInferenceContext(BaseInferenceContext):
                 self.active_attn_metadata["mha_metadata"].state_data["block_table"],
             )
 
-    def mamba_states_cache(self, layer_number: int) -> Tuple[Tensor, Tensor]:
+    def mamba_states_cache(
+        self, layer_number: int, intermediate: bool = False
+    ) -> Tuple[Tensor, Tensor]:
         """Returns the Mamba state tensors for the given layer."""
         assert self.is_hybrid_model, "Only hybrid models have Mamba state tensors"
 
         mamba_layer_number = self.layer_map[layer_number - 1]
-        conv_state = self.mamba_conv_states[mamba_layer_number]
-        ssm_state = self.mamba_ssm_states[mamba_layer_number]
+        if intermediate:
+            conv_state = None
+            ssm_state = self.mamba_intermediate_ssm_states[mamba_layer_number]
+        else:
+            conv_state = self.mamba_conv_states[mamba_layer_number]
+            ssm_state = self.mamba_ssm_states[mamba_layer_number]
 
         return (conv_state, ssm_state)
 
@@ -1126,6 +1156,7 @@ class DynamicInferenceContext(BaseInferenceContext):
 
         self.request_ids[request_slice] = request_ids_tensor
         self.request_query_lengths[request_slice] = lengths_tensor
+        self.request_in_prefill_status_tensor[request_slice] = 1
         self.request_output_lengths[request_slice] = lengths_tensor + tokens_to_generate_tensor
         self.request_kv_length_offsets[request_slice] = 0
         self.request_kv_block_counts[request_slice] = block_counts
@@ -1362,10 +1393,11 @@ class DynamicInferenceContext(BaseInferenceContext):
             if self.is_decode_only():
                 padded_token_count = min(
                     self.max_tokens,
-                    self.max_requests,
+                    self.max_requests * (self.num_speculative_tokens + 1),
                     self.round_up_tokens(self.active_token_count),
                 )
-                padded_decode_req_count = padded_token_count
+                padded_decode_req_count = padded_token_count // (self.num_speculative_tokens + 1)
+                #print(f"self.max_tokens={self.max_tokens}, self.max_requests={self.max_requests}, self.active_token_count={self.active_token_count}, padded_decode_req_count={padded_decode_req_count}, padded_token_count={padded_token_count}")
                 padded_prefill_req_count = 0
             else:
                 target_padding_req_count = min(
@@ -1482,6 +1514,7 @@ class DynamicInferenceContext(BaseInferenceContext):
         self.request_last_kv_block_id.fill_(-1)
         self.request_last_kv_block_offset.fill_(0)
         self.request_to_kv_block_ids.fill_(-1)
+        self.request_in_prefill_status_tensor.fill_(-1)
 
         # Reset request metadata.
         for metadata_tensor in self.request_metadata.values():
@@ -1524,6 +1557,9 @@ class DynamicInferenceContext(BaseInferenceContext):
             (Tuple[Tensor, Tensor]) Flattened active input and position IDs.
         """
         num_tokens = num_warmup_tokens or self.padded_active_token_count
+        assert num_tokens >= self.batch_dimensions.decode_req_count * (
+            self.num_speculative_tokens + 1
+        )
         return (
             self.token_to_input_ids[:num_tokens].unsqueeze(0),
             self.token_to_pos_ids[:num_tokens].unsqueeze(0),
@@ -1538,7 +1574,6 @@ class DynamicInferenceContext(BaseInferenceContext):
         Return:
             (Tensor) Last token logits.
         """
-
         # todo: @lmcafee, remove these asserts?
         assert logits.size(0) == 1, f"logits.size(0) ({tuple(logits.shape)}) != 1"
         assert logits.size(1) == self.padded_active_token_count, (
@@ -1666,6 +1701,7 @@ class DynamicInferenceContext(BaseInferenceContext):
 
         # Handle length and block assignments.
         self.request_query_lengths[current_id] = chunk_length
+        self.request_in_prefill_status_tensor[current_id] = 1
         self.request_output_lengths[current_id] = (
             req.finished_chunk_token_count
             + chunk_length
@@ -1723,16 +1759,22 @@ class DynamicInferenceContext(BaseInferenceContext):
         self.total_request_count += 0 if req.finished_chunk_token_count > 0 else 1
         self.num_prefill_requests += 1
 
-    def _move_book_keeping_tensors(self, src_idxs, dst_idxs, next_tokens):
+    def _move_book_keeping_tensors(
+        self, src_idxs, dst_idxs, next_tokens, new_speculative_tokens=None
+    ):
         """
         Move all the relevent booking tensors with src idxs to dst idxs
         """
         self.request_kv_length_offsets[dst_idxs] = self.request_kv_length_offsets[src_idxs]
+        self.request_in_prefill_status_tensor[dst_idxs] = self.request_in_prefill_status_tensor[
+            src_idxs
+        ]
         self.request_query_lengths[dst_idxs] = self.request_query_lengths[src_idxs]
         self.request_output_lengths[dst_idxs] = self.request_output_lengths[src_idxs]
         self.request_ids[dst_idxs] = self.request_ids[src_idxs]
-        next_tokens[dst_idxs] = next_tokens[src_idxs]
-
+        next_tokens[dst_idxs] = next_tokens[src_idxs]  # num tokens sames as num samples
+        if new_speculative_tokens is not None:
+            new_speculative_tokens[:, dst_idxs] = new_speculative_tokens[:, src_idxs]
         self.request_to_kv_block_ids[dst_idxs] = self.request_to_kv_block_ids[src_idxs]
         self.request_kv_block_counts[dst_idxs] = self.request_kv_block_counts[src_idxs]
         self.request_last_kv_block_id[dst_idxs] = self.request_last_kv_block_id[src_idxs]
@@ -1752,6 +1794,7 @@ class DynamicInferenceContext(BaseInferenceContext):
         """
         tensor_swap(self.request_kv_length_offsets, src_idxs, dst_idxs)
         tensor_swap(self.request_query_lengths, src_idxs, dst_idxs)
+        tensor_swap(self.request_in_prefill_status_tensor, src_idxs, dst_idxs)
         tensor_swap(self.request_output_lengths, src_idxs, dst_idxs)
         tensor_swap(self.request_ids, src_idxs, dst_idxs)
         tensor_swap(next_tokens, src_idxs, dst_idxs)
@@ -1824,55 +1867,57 @@ class DynamicInferenceContext(BaseInferenceContext):
         resume_request_count = 0
         if self.paused_request_count > 0:
             active_block_count_avail = self.block_allocator.get_active_avail()
-            paused_block_counts = self.request_kv_block_counts[: self.paused_request_count]
+            paused_block_counts = self.request_kv_block_counts[: self.paused_request_count].clone()
             # Flip counts before cumsum, since paused requests are resumed from
             # the right-most index, so we must count resumed blocks starting from
             # the right side.
             paused_block_counts = paused_block_counts.flip(dims=[0])
-            # Add +1 to all block counts, since any time a paused request is
-            # resumed, it will be starting a new memory block. For background,
-            # pausing happens after a request has generated the final token of a
-            # memory block (i.e., token 256 of that block), which means the very
-            # next token (whenever that request gets unpaused) will be in a new
-            # block. So, when we resume a paused request, we have to account for
-            # the fact that it will need an extra block beyond the ones that it
-            # has already used.
-            paused_block_counts += 1  # +1 for newly added block
+
+            # Check which paused requests will actually need a new block upon resuming
+            offsets = self.request_last_kv_block_offset[: self.paused_request_count]
+            needs_new_block = (
+                offsets >= self.block_size_tokens - 1 - self.num_speculative_tokens
+            ).to(paused_block_counts.dtype)
+            needs_new_block = needs_new_block.flip(dims=[0])
+
+            # Add +1 ONLY to the block counts of requests that finished their previous memory block
+            paused_block_counts += needs_new_block
             paused_block_counts_cumsum = paused_block_counts.cumsum(dim=0)
             resume_request_count = min(
                 torch.nonzero(paused_block_counts_cumsum <= active_block_count_avail).numel(),
                 self.block_allocator.total_avail,
             )
 
+            # Constrain resumptions by the maximum allowed active requests
+            max_allowed_active = self.max_requests // (self.num_speculative_tokens + 1)
+            allowed_to_resume = max(0, max_allowed_active - active_request_count)
+            resume_request_count = min(resume_request_count, allowed_to_resume)
+
         self.paused_request_count -= resume_request_count
         active_request_count += resume_request_count
 
         # Resume requests by assigning blocks and updating bookkeeping tensors.
         if resume_request_count > 0:
-            assert torch.all(
-                self.request_last_kv_block_offset[
-                    self.paused_request_count : (self.paused_request_count + resume_request_count)
-                ]
-                == self.block_size_tokens - 1
-            ), "The request_last_kv_block_offset should be 0 for the requests that just got resumed this step."
+            resume_start = self.paused_request_count
+            resume_end = self.paused_request_count + resume_request_count
 
-            assert resume_request_count <= self.block_allocator.total_avail
-            block_ids = self.block_allocator.allocate_memory_blocks(resume_request_count)
-            row_idx = torch.arange(
-                self.paused_request_count,
-                self.paused_request_count + resume_request_count,
-                device=torch.cuda.current_device(),
-            )
-            col_idx = self.request_kv_block_counts[
-                self.paused_request_count : (self.paused_request_count + resume_request_count)
-            ]
-            self.request_to_kv_block_ids[row_idx, col_idx] = block_ids
-            self.request_kv_block_counts[
-                self.paused_request_count : (self.paused_request_count + resume_request_count)
-            ] += 1
-            self.request_last_kv_block_id[
-                self.paused_request_count : (self.paused_request_count + resume_request_count)
-            ] = block_ids
+            # Check which resumed requests actually need a new block
+            offsets = self.request_last_kv_block_offset[resume_start:resume_end]
+            needs_new_block = offsets >= (self.block_size_tokens - 1 - self.num_speculative_tokens)
+            num_new_blocks = needs_new_block.sum().item()
+
+            if num_new_blocks > 0:
+                assert num_new_blocks <= self.block_allocator.total_avail
+                block_ids = self.block_allocator.allocate_memory_blocks(num_new_blocks)
+
+                # Apply updates only to the requests that required a new block
+                relative_row_idx = torch.nonzero(needs_new_block).squeeze(1)
+                row_idx = resume_start + relative_row_idx
+                col_idx = self.request_kv_block_counts[row_idx]
+
+                self.request_to_kv_block_ids[row_idx, col_idx] = block_ids
+                self.request_kv_block_counts[row_idx] += 1
+                self.request_last_kv_block_id[row_idx] = block_ids
 
         # Remove resumed requests from newly_paused_request_ids. We do this by
         # truncating the end of newly_paused_request_ids, which works because we
@@ -1991,7 +2036,12 @@ class DynamicInferenceContext(BaseInferenceContext):
 
         return evict_request_ids
 
-    def update_requests(self, active_requests_mask: Tensor, new_tokens: Tensor) -> Tensor:
+    def update_requests(
+        self,
+        active_requests_mask: Tensor,
+        new_tokens: Tensor,
+        new_speculative_tokens: Tensor = None,
+    ) -> Tensor:
         """Update context state after calling engine.step().
 
         This method is responsible for:
@@ -2024,8 +2074,9 @@ class DynamicInferenceContext(BaseInferenceContext):
         8. We make relevant changes to the token bookkeeping tensors
 
         Args:
-            active_requests_mask (Tensor): 1D Mask tensor marking active requests.
-            new_tokens (Tensor): Newly sampled tokens, with one token per active request.
+            active_requests_mask (Tensor): 1D Mask tensor marking active requests. (Active request length)
+            new_tokens (Tensor): Newly sampled tokens, with one token per active request. (Active request length)
+            new_speculative_tokens (Tensor): Newly sampled speculative tokens, with num_speculative tokens per active request. (num_speculative_tokens, active_request_length)
 
         Return:
             (Tensor) Newly paused request IDs.
@@ -2036,6 +2087,10 @@ class DynamicInferenceContext(BaseInferenceContext):
         # finished_request_count are requests that have reached the termination criterion
 
         self.num_prefill_requests = 0  # all turns to decode
+        # All request that were in prefill become decode requests
+        self.request_in_prefill_status_tensor[self.request_in_prefill_status_tensor == 1] = (
+            0  # TODO : Check how this works with chunked prefill
+        )
         if self.chunked_prefill_request_id != -1:
             active_requests_mask[-1] = (
                 1  # must keep this, next iteration will add a new chunk to it
@@ -2076,6 +2131,9 @@ class DynamicInferenceContext(BaseInferenceContext):
         if self.paused_request_count != 0:
             assert self.paused_tokens is not None
             next_tokens = torch.cat((self.paused_tokens, new_tokens))
+            new_speculative_tokens = torch.cat(
+                (self.paused_speculative_tokens, new_speculative_tokens), dim=1
+            )
         else:
             next_tokens = new_tokens
 
@@ -2106,6 +2164,7 @@ class DynamicInferenceContext(BaseInferenceContext):
                     src_idxs=active_idxs_on_right,
                     dst_idxs=finished_idxs_on_left,
                     next_tokens=next_tokens,
+                    new_speculative_tokens=new_speculative_tokens,
                 )
 
                 # Reset chunk ids for recently moved requests.
@@ -2123,7 +2182,7 @@ class DynamicInferenceContext(BaseInferenceContext):
                 self.paused_request_count : (active_request_count + self.paused_request_count)
             ]
             active_requests_requiring_new_block = (
-                num_tokens_in_last_block == self.block_size_tokens - 1
+                num_tokens_in_last_block >= self.block_size_tokens - 1 - self.num_speculative_tokens
             ).byte()
 
             if self.chunked_prefill_request_id != -1:
@@ -2131,6 +2190,10 @@ class DynamicInferenceContext(BaseInferenceContext):
                 active_requests_requiring_new_block[
                     self.get_index_of_chunked_prefill_request() - self.paused_request_count
                 ] = 0  # chunked prefill should not be paused
+            elif active_request_count * (self.num_speculative_tokens + 1) > self.max_requests:
+                # Force-pause excess requests in a decode-only batch
+                max_allowed_active = self.max_requests // (self.num_speculative_tokens + 1)
+                active_requests_requiring_new_block[max_allowed_active:] = 1
 
             active_requests_requiring_new_block_count = (
                 (active_requests_requiring_new_block == 1).sum().item()
@@ -2171,7 +2234,10 @@ class DynamicInferenceContext(BaseInferenceContext):
                 dst_idxs = torch.cat((active_request_ids_on_left, paused_requests_idxs_on_right))
                 src_idxs = torch.cat((paused_requests_idxs_on_right, active_request_ids_on_left))
                 self._move_book_keeping_tensors(
-                    src_idxs=src_idxs, dst_idxs=dst_idxs, next_tokens=next_tokens
+                    src_idxs=src_idxs,
+                    dst_idxs=dst_idxs,
+                    next_tokens=next_tokens,
+                    new_speculative_tokens=new_speculative_tokens,
                 )
 
             self.paused_request_count += active_requests_requiring_new_block_count
@@ -2179,6 +2245,14 @@ class DynamicInferenceContext(BaseInferenceContext):
 
         # 6. Now that we have the requests in following order [Paused, Active, Finished]
         # We determine how many requests we can resume and resume them
+
+        # For multi-token generation: store previous block IDs BEFORE resume allocates new blocks.
+        # This allows us to know which block tokens should go to if they don't cross the boundary.
+        # After resume_paused_requests, request_last_kv_block_id will be updated to the NEW block
+        # for resumed requests, but we need the OLD block for tokens that don't cross.
+        prev_last_block_ids = None
+        if self.num_speculative_tokens > 0:
+            prev_last_block_ids = self.request_last_kv_block_id.clone()
 
         # 6.a. First, resume temporarily paused requests.
         active_request_count, newly_paused_request_ids = self.resume_paused_requests(
@@ -2207,45 +2281,138 @@ class DynamicInferenceContext(BaseInferenceContext):
         # 7. We make changes to the request book keeping tesnsors and setup the tokens for next iteration
         assert self.total_request_count == active_request_count + self.paused_request_count
 
-        # All these active requests are in decode phase, so they need only 1 token per request
-        self.active_token_count = active_request_count
-        # Always the first section of token input ids are only used.
-        self.token_to_input_ids[: self.active_token_count] = next_tokens[
-            self.paused_request_count : self.total_request_count
-        ]
-
         if self.paused_request_count > 0:
-            self.paused_tokens = next_tokens[: self.paused_request_count]
+            self.paused_tokens = next_tokens[: self.paused_request_count].clone()
+            self.paused_speculative_tokens = new_speculative_tokens[:, : self.paused_request_count].clone()
 
         # add_ and fill_ calls seems to work as intended with sliced indexing (i.e. x[3:5].add(...) or x[3:5].fill_)
         # but when another tensor is used for indexing, it does not work as expected (i.e. x[y] if x and y are torch tensors)
         self.request_kv_length_offsets[self.paused_request_count : self.total_request_count].add_(
             self.request_query_lengths[self.paused_request_count : self.total_request_count]
         )
-        self.request_query_lengths[self.paused_request_count : self.total_request_count].fill_(1)
-        self.token_to_pos_ids[: self.active_token_count] = self.request_kv_length_offsets[
+
+        num_generated_tokens = 1 + self.num_speculative_tokens
+        self.request_query_lengths[self.paused_request_count : self.total_request_count].fill_(
+            num_generated_tokens
+        )
+
+        old_offsets = self.request_last_kv_block_offset[
             self.paused_request_count : self.total_request_count
-        ]
+        ].clone()
 
         self.request_last_kv_block_offset[self.paused_request_count : self.total_request_count] = (
-            self.request_last_kv_block_offset[self.paused_request_count : self.total_request_count]
-            + 1
+            old_offsets + num_generated_tokens
         ) % self.block_size_tokens
 
-        # 8. We make relevant changes to the token bookkeeping tensors
+        # ================================================================
+        self.active_token_count = active_request_count * num_generated_tokens
+        sampled_tokens = next_tokens[self.paused_request_count : self.total_request_count]
+
+        if self.num_speculative_tokens > 0:
+            # new_speculative_tokens has shape [num_spec_tokens, num_requests], slice the request dimension (dim 1)
+            sampled_speculative_tokens = new_speculative_tokens[
+                :, self.paused_request_count : self.total_request_count
+            ]
+            # This will become [sampled, spec1, spec2, sampled, spec1, spec2 ...] # For every request we will have the sampled token followed by the speculative tokens (i.e next indices)
+            next_tokens = torch.vstack(
+                [sampled_tokens.unsqueeze(0), sampled_speculative_tokens]
+            ).T.reshape(-1)
+        else:
+            next_tokens = sampled_tokens
+
+        self.token_to_input_ids[: self.active_token_count] = next_tokens
+
+        # Req kv length offsets : [0, 5, 10 ... ]
+        # For num spec tokens = 2 , this will become [0, 1, 2, 5, 6, 7 10, 11, 12 ...]
+        self.token_to_pos_ids[: self.active_token_count] = self.request_kv_length_offsets[
+            self.paused_request_count : self.total_request_count
+        ].repeat_interleave(num_generated_tokens) + torch.arange(
+            num_generated_tokens, device=torch.cuda.current_device()
+        ).repeat(
+            active_request_count
+        )
+        #
+        # Token to request idx : [0, 0, 0, 1, 1, 1, 2, 2, 2 ...]
         self.token_to_request_idx[: self.active_token_count] = torch.arange(
             self.paused_request_count, self.total_request_count, device=torch.cuda.current_device()
-        )
-        self.token_to_position_in_request[: self.active_token_count] = (
-            self.request_kv_length_offsets[self.paused_request_count : self.total_request_count]
+        ).repeat_interleave(num_generated_tokens)
+
+        # shan : Same as token_to_pos_ids ?
+        self.token_to_position_in_request[: self.active_token_count] = self.token_to_pos_ids[
+            : self.active_token_count
+        ]
+
+        self.token_to_local_position_within_kv_block[: self.active_token_count] = (
+            self.token_to_pos_ids[: self.active_token_count] % self.block_size_tokens
         )
 
-        self.token_to_block_idx[: self.active_token_count] = self.request_last_kv_block_id[
+        current_block_ids = self.request_last_kv_block_id[
             self.paused_request_count : self.total_request_count
         ]
-        self.token_to_local_position_within_kv_block[: self.active_token_count] = (
-            self.request_last_kv_block_offset[self.paused_request_count : self.total_request_count]
+
+        # raw positions shape : [active_request_count, num_generated_tokens]
+        # e.g block size 6, old_offsets = [1,5,2] , num_generated_tokens = 3
+        # raw_positions = [[1, 2, 3], [5, 6, 7], [2, 3, 4]]
+        # crosses_boundary = [[False, False, False], [False, True, True], [False, False, False]]
+        raw_positions = (
+            old_offsets[:, None]
+            + torch.arange(num_generated_tokens, device=torch.cuda.current_device())[None, :]
         )
+        #
+        # A token crosses to the next block if its raw_position >= block_size
+        crosses_boundary = raw_positions >= self.block_size_tokens
+
+        if not crosses_boundary.any() or self.num_speculative_tokens == 0:
+            # Fast path: no tokens cross block boundary, all use current block
+            self.token_to_block_idx[: self.active_token_count] = self.request_last_kv_block_id[
+                self.paused_request_count : self.total_request_count
+            ].repeat_interleave(num_generated_tokens)
+        else:
+
+            # Some tokens cross to the next block (this happens for resumed requests)
+            #
+            # When a request is paused and resumed:
+            # 1. It was paused because remaining_space < num_tokens_per_step
+            # 2. A NEW block is allocated in resume_paused_requests
+            # 3. request_last_kv_block_id is updated to the NEW block
+            # 4. The old offset is preserved (wasn't reset)
+            #
+            # So for resumed requests:
+            # - Tokens before the boundary (raw_pos < block_size): go to PREVIOUS block
+            # - Tokens at/after the boundary (raw_pos >= block_size): go to CURRENT (new) block
+            #
+            # For non-resumed requests (no boundary crossing): all go to current block
+            #
+            # We use prev_last_block_ids which was stored BEFORE resume_paused_requests
+            # was called, so it contains the OLD block IDs before new blocks were allocated.
+
+            # Get previous block IDs (stored before resume_paused_requests)
+            prev_block_ids = prev_last_block_ids[
+                self.paused_request_count : self.total_request_count
+            ]  # [active_count]
+
+            # For each request, check if ANY token crosses (i.e., request was resumed)
+            request_has_crossing = crosses_boundary.any(dim=1)  # [active_count]
+
+            # Build block_idx: [active_count, N]
+            # Start with current (new) block for all
+            # Lets say current block ids is [a1, a2 , a3] and num generated_tokens is 3
+            # This will be [[a1, a1, a1], [a2, a2, a2], [a3, a3, a3]]
+            block_idx = (
+                current_block_ids[:, None].expand(-1, num_generated_tokens).clone()
+            )  # [active_count, N]
+
+            # For requests that have crossing, tokens BEFORE boundary use prev block
+            # crosses_boundary is False for tokens before boundary
+            # So: where request_has_crossing AND NOT crosses_boundary, use prev_block
+            use_prev_block = request_has_crossing[:, None] & ~crosses_boundary  # [active_count, N]
+
+            # Apply previous block IDs where needed
+            prev_block_ids_expanded = prev_block_ids[:, None].expand(-1, num_generated_tokens)
+            block_idx = torch.where(use_prev_block, prev_block_ids_expanded, block_idx)
+
+            # Convert back to 1d tensor
+            self.token_to_block_idx[: self.active_token_count] = block_idx.flatten()
 
         return {
             "newly_paused_request_ids": newly_paused_request_ids,
