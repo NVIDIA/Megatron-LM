@@ -991,7 +991,7 @@ class Attention(MegatronModule, ABC):
             )
         # `qkv_output` may be a tuple; commit supports tuple/list and will keep structure.
         qkv_output = qkv_linear_manager.group_offload(
-            qkv_output, forced_released_tensors=[hidden_states]
+            qkv_output, forced_released_tensors=[]
         )
         attn_mask_type = self.attn_mask_type
         block_table = None
