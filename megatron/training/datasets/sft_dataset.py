@@ -105,7 +105,6 @@ class SFTDataset(MegatronDataset):
         pack_targets = []
         pack_positions = []
         cu_seqlens = [0]
-        eod = tokenizer.eod
         pad = tokenizer.pad
         # TODO(duncan): Track number of convs dropped and/or truncated and amount of end-padding
         for conversation in split_conversations:
@@ -123,16 +122,6 @@ class SFTDataset(MegatronDataset):
 
             assert not self.config.reset_position_ids
             pack_positions.extend(range(len(tokens_list)))
-
-            if self.config.context_parallel_size > 1:
-                pad_granularity = self.config.context_parallel_size * 2
-                mod_token_count = len(pack_tokens) % pad_granularity
-                if mod_token_count != 0:
-                    pad_len = pad_granularity - mod_token_count
-                    extend_with_padding(pack_tokens, pack_targets, pack_positions, pad_len)
-
-            # TODO(duncan): Consider also padding to multiple of number of tokens here. This might
-            # be needed for efficiency (and potentially set via command-line argument).
 
             cu_seqlens.append(len(pack_tokens))
 
@@ -158,35 +147,19 @@ class SFTDataset(MegatronDataset):
 
         assert len(pack_tokens) == pack_length + 1
         assert len(pack_targets) == pack_length + 1
-        assert len(pack_positions) == pack_length + 1
+        assert len(cu_seqlens) >= 2
 
         # Align and convert to tensors
         input_ids    = torch.tensor(pack_tokens[:-1],  dtype=torch.int64)
         labels       = torch.tensor(pack_targets[1:], dtype=torch.int64)
-        position_ids = torch.tensor(pack_positions[:-1], dtype=torch.int64)
-
-        # Loss mask.
-        loss_mask = torch.ones(pack_length, dtype=torch.float32)
-        loss_mask[labels == pad] = 0.0  # Mask paddings
-        loss_mask[labels == IGNORE_INDEX] = 0.0  # mask prompts
+        cu_seqlens = torch.tensor(cu_seqlens, dtype=torch.int32)
 
         # TODO(duncan): Optionally create an attention mask
         assert not self.config.create_attention_mask and not self.config.reset_attention_mask
         # attention_mask = None
 
-        assert len(cu_seqlens) >= 2
-        cu_seqlens = torch.tensor(cu_seqlens, dtype=torch.int32)
-        # Calculating max_seqlen here, rather than incrementally above, because of possible
-        # effects of truncation and padding
-        adjacent_diffs = cu_seqlens[1:] - cu_seqlens[:-1]
-        max_seqlen = adjacent_diffs.max()  # max_seqlen is a 0-D tensor
-
         return {
             'tokens': input_ids,
             'labels': labels,
-            # 'attention_mask': attention_mask,  # PyTorch collate cannot handle NoneType
-            'loss_mask': loss_mask,
-            'position_ids': position_ids,
-            'cu_seqlens': cu_seqlens,
-            'max_seqlen': max_seqlen,
+            'cu_seqlens': cu_seqlens, # TODO(asolergi-nv): Those are actually cu_seqlens_padded! And it's not accounting for TP + SP!
         }
