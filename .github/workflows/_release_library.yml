@@ -347,7 +347,6 @@ jobs:
       ref: ${{ inputs.release-ref }}
       no-publish: false
     secrets:
-      TWINE_USERNAME: ${{ secrets.TWINE_USERNAME }}
       TWINE_PASSWORD: ${{ secrets.TWINE_PASSWORD }}
 
   create-gh-release:
