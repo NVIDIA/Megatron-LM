@@ -22,37 +22,12 @@ This repository contains two components: **Megatron-LM** and **Megatron Core**.
 **[Megatron Bridge](https://github.com/NVIDIA-NeMo/Megatron-Bridge)** provides bidirectional Hugging Face ↔ Megatron checkpoint conversion with production-ready recipes.
 
 
-## Quick Start
+## Getting Started
 
-The recommended way to get started is with the NVIDIA PyTorch container and install Megatron from source:
-
-1. Clone the repository:
-
-    ```bash
-    git clone https://github.com/NVIDIA/Megatron-LM.git
-    ```
-
-2. Launch the container (mount your clone):
-
-    ```bash
-    docker run --gpus all -it --rm \
-      -v /path/to/Megatron-LM:/workspace/megatron-lm \
-      -e PIP_CONSTRAINT= \
-      nvcr.io/nvidia/pytorch:26.01-py3
-    ```
-
-3. Install from source inside the container:
-
-    ```bash
-    cd /workspace/megatron-lm
-    pip install --no-build-isolation -e .
-    ```
-
-4. Run a simple training example:
-
-    ```bash
-    torchrun --nproc_per_node=2 examples/run_simple_mcore_train_loop.py
-    ```
+- **[Installation Guide](https://docs.nvidia.com/megatron-core/developer-guide/latest/get-started/install.html)** - Docker (recommended) and pip installation options
+- **[Your First Training Run](https://docs.nvidia.com/megatron-core/developer-guide/latest/get-started/quickstart.html)** - End-to-end training examples with data preparation
+- **[Parallelism Strategies](https://docs.nvidia.com/megatron-core/developer-guide/latest/user-guide/parallelism-guide.html)** - Scale training across GPUs with TP, PP, DP, EP, and CP
+- **[Contribution Guide](https://docs.nvidia.com/megatron-core/developer-guide/latest/developer/contribute.html)** - How to contribute to Megatron Core
 
 
 # Latest News
