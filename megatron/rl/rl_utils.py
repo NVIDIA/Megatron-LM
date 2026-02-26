@@ -508,9 +508,8 @@ def get_environment_rollouts(
         inference_model = model
 
     inference_pg_collection = get_attr_wrapped_model(inference_model[0], "pg_collection")
-    assert (
-        n_prompts % get_pg_size(inference_pg_collection.ep) == 0
-    ), "n_prompts must be divisible by data_parallel_world_size"
+    pg_size = get_pg_size(inference_pg_collection.ep)
+    assert (n_prompts % pg_size == 0), f"{n_prompts=} must be divisible by {pg_size=}"
 
     with nvtx_range("rollout-collection"):
         loop = get_asyncio_loop()
