@@ -25,6 +25,7 @@ from megatron.core.transformer.heterogeneous.heterogeneous_config import (
 )
 from megatron.core.utils import (
     get_torch_version,
+    is_flashinfer_min_version,
     is_te_min_version,
     is_torch_min_version,
 )
@@ -795,6 +796,13 @@ def validate_args(args, defaults={}):
     if args.fp4 and not is_te_min_version("2.7.0.dev0"):
         raise ValueError("--fp4-format requires Transformer Engine >= 2.7.0.dev0 for NVFP4BlockScaling support.")
 
+    if (
+        args.fp8_recipe == 'mxfp8'
+        and args.transformer_impl == 'inference_optimized'
+        and not is_flashinfer_min_version("0.6.4")
+    ):
+        raise ValueError("MXFP8 with inference optimized layers requires FlashInfer >= 0.6.4")
+
     if args.use_megatron_fsdp:
         # NOTE: The flag `use_custom_fsdp` is deprecated and will be removed in future versions.
         #       Please use `use_megatron_fsdp` instead, as all functionality will be migrated there.
@@ -850,12 +858,17 @@ def validate_args(args, defaults={}):
             args.accumulate_allreduce_grads_in_fp32 = True
             print_rank_0('accumulate and all-reduce gradients in fp32 for bfloat16 data type.')
     if args.cuda_graph_impl == "local" and CudaGraphScope.full_iteration in args.cuda_graph_scope:
-        if not args.inference_dynamic_batching:
-            assert not args.check_for_nan_in_loss_and_grad, \
-            "--no-check-for-nan-in-loss-and-grad should be set with full_iteration CUDA graph"
-        else:
-            assert args.fp8 is None, \
-            "fp8 is not supported with inference dynamic batching and full_iteration CUDA graph"
+        assert not args.check_for_nan_in_loss_and_grad, \
+        "--no-check-for-nan-in-loss-and-grad should be set with --cuda-graph-scope=full_iteration for training. Note: If you are trying to use full_iteration CUDA graphs for inference, please use --cuda-graph-scope full_iteration_inference instead"
+    
+    if args.cuda_graph_impl == "local" and CudaGraphScope.full_iteration_inference in args.cuda_graph_scope:
+        assert args.fp8 is None, \
+            "fp8 is not supported with inference dynamic batching and full_iteration_inference CUDA graph"
+
+    if args.cuda_graph_impl == 'local':
+        assert args.inference_dynamic_batching_num_cuda_graphs > 0 or args.inference_dynamic_batching_num_cuda_graphs == -1, \
+            'inference_dynamic_batching_num_cuda_graphs should be a positive integer or -1' \
+            '-1 means that we will automatically determine the number of CUDA graphs to capture based on the `max_requests` value.'
 
     print_rank_0('using {} for parameters ...'.format(args.params_dtype))
 
@@ -1258,6 +1271,13 @@ def validate_args(args, defaults={}):
         print('--dist-ckpt-format is deprecated and has no effect.'
               ' Use --ckpt-format to select the checkpoint format.')
 
+    if args.use_dist_ckpt and args.ckpt_fully_parallel_load:
+        if args.ckpt_fully_parallel_load_exchange_algo != "broadcast":
+            warn_rank_0(
+                "Currently only the 'broadcast' exchange algorithm is supported for fully parallel load. "
+                "Other algorithms cannot guarantee numerical stability yet."
+            )
+
     if args.load_main_params_from_ckpt:
         assert args.no_load_optim, '--load-main-params-from-ckpt must be used with --no-load-optim.'
 
@@ -1268,6 +1288,12 @@ def validate_args(args, defaults={}):
                 'Disabling --async-save.'
             )
             args.async_save = False
+        elif args.dist_ckpt_workers > 1:
+            warn_rank_0(
+                'async ckpt forks processes for parallel writing which may introduce '
+                'instability on checkpoints. Consider using --dist-ckpt-workers=1 in case of '
+                'issues.'
+            )
 
     # Inference args
     if args.inference_batch_times_seqlen_threshold > -1:
@@ -1598,8 +1624,9 @@ def _add_inference_args(parser):
                        'including the shared experts if they are not overlapped with EP comm. '
                        '"moe_preprocess": captures operations in MoELayer.preprocess(). Must be used together with "moe_router". '
                        '"mamba": captures the mamba layer. '
-                       '"full_iteration": captures a whole iteration. '
-                       'full_iteration scope is only supported with --cuda-graph-impl=local, other scopes are only supported with --cuda-graph-impl=transformer_engine. '
+                       '"full_iteration": captures a whole training iteration. '
+                       '"full_iteration_inference": captures a whole inference iteration. '
+                       'full_iteration and full_iteration_inference scopes are only supported with --cuda-graph-impl=local, other scopes are only supported with --cuda-graph-impl=transformer_engine. '
                        'If not specified, the default scope is to capture the whole Transformer layer. '
                        'For backward compatibility, we still allow passing "full" to specify capturing the whole layer, and convert it to an empty list.')
     group.add_argument('--use-legacy-static-engine', action='store_true', default=False,
@@ -1654,7 +1681,9 @@ def _add_inference_args(parser):
                        'cuda graph batch sizes range from 1 to `max_requests`. '
                        '(See `dynamic_context.py` for details on how '
                        '`max_requests` is computed). Due to rounding, the actual '
-                       'number of cuda graphs may not equal this argument.')
+                       'number of cuda graphs may not equal this argument.'
+                       'The user can also pass -1, in which case we automatically determine the number of graphs ' \
+                       'to capture based on the `max_requests`.')
     group.add_argument('--inference-dynamic-batching-track-paused-request-events',
                        action='store_true',
                        help='Track paused request ids by adding \'paused\' events '
@@ -1693,7 +1722,7 @@ def _add_inference_args(parser):
                        help='Enable per-request logging in the Flask inference server.')
     group.add_argument('--inference-wandb-logging', action=argparse.BooleanOptionalAction,
                        required=False, default=False, help='Enable inference wandb logging.')
-    group.add_argument("--inference-coordinator-port", type=int, default=12346,
+    group.add_argument("--inference-coordinator-port", type=int,
                        help="This port will be used to setup the inference coordinator on node-0")
     return parser
 
@@ -1864,7 +1893,7 @@ def _add_network_size_args(parser):
     return parser
 
 def _add_straggler_detector_args(parser):
-    from megatron.training.resilience_config import StragglerDetectionConfig
+    from megatron.training.config import StragglerDetectionConfig
 
     straggler_factory = ArgumentGroupFactory(StragglerDetectionConfig)
     group = straggler_factory.build_group(parser, "straggler")
@@ -1972,7 +2001,7 @@ def _add_ft_package_args(parser):
 
 
 def _add_logging_args(parser):
-    from megatron.training.training_config import LoggerConfig
+    from megatron.training.config import LoggerConfig
 
     log_factory = ArgumentGroupFactory(LoggerConfig, exclude = ["log_throughput_to_tensorboard", "throughput_window_size", "memory_keys", "log_l2_norm_grad_to_tensorboard", "log_runtime_to_tensorboard", "runtime_time_unit", "filter_warnings", "modules_to_filter", "set_level_for_all_loggers", "save_config_filepath"])
     group = log_factory.build_group(parser, title="logging")
@@ -2073,7 +2102,7 @@ def _add_rl_args(parser):
                             'persist: leave KV cache in GPU memory (default), '
                             'offload: offload KV cache to CPU during training, '
                             'recompute: deallocate KV cache and recompute from scratch each cycle')
-    group.add_argument('--rl-persist-cuda-graphs', action=argparse.BooleanOptionalAction, type=bool, default=True,
+    group.add_argument('--rl-persist-cuda-graphs', action=argparse.BooleanOptionalAction, type=bool, default=False,
                        help='Persist CUDA graphs when the inference engine is suspended. '
                             'If False, CUDA graphs are deleted on suspend and re-captured on resume.')
     group.add_argument('--rl-partial-rollouts', action=argparse.BooleanOptionalAction, default=False,
@@ -2157,8 +2186,8 @@ def _add_rl_args(parser):
     return parser
 
 def _add_training_args(parser):
-    from megatron.training.training_config import TrainingConfig
-    from megatron.training.common_config import ProfilingConfig
+    from megatron.training.config import TrainingConfig
+    from megatron.training.config import ProfilingConfig
 
     prof_factory = ArgumentGroupFactory(ProfilingConfig, exclude=["record_shapes", "nvtx_ranges"])
     prof_group = prof_factory.build_group(parser, "profiling")
@@ -2257,7 +2286,7 @@ def _add_training_args(parser):
 
 
 def _add_rerun_machine_args(parser):
-    from megatron.training.resilience_config import RerunStateMachineConfig
+    from megatron.training.config import RerunStateMachineConfig
 
     rerun_factory = ArgumentGroupFactory(RerunStateMachineConfig, exclude=["check_for_nan_in_loss"])
     group = rerun_factory.build_group(parser, "rerun engine")
@@ -2266,7 +2295,7 @@ def _add_rerun_machine_args(parser):
 
 
 def _add_initialization_args(parser):
-    from megatron.training.common_config import RNGConfig
+    from megatron.training.config import RNGConfig
 
     rng_factory = ArgumentGroupFactory(RNGConfig)
     group = rng_factory.build_group(parser, "RNG and initialization")
@@ -2278,7 +2307,7 @@ def _add_initialization_args(parser):
 
 
 def _add_learning_rate_args(parser):
-    from megatron.training.training_config import SchedulerConfig
+    from megatron.training.config import SchedulerConfig
 
     sched_factory = ArgumentGroupFactory(SchedulerConfig, exclude=["no_weight_decay_cond_type"])
     group = sched_factory.build_group(parser, title="learning rate and weight decay")
@@ -2303,7 +2332,7 @@ def _add_learning_rate_args(parser):
 
 
 def _add_checkpointing_args(parser):
-    from megatron.training.training_config import CheckpointConfig
+    from megatron.training.config import CheckpointConfig
 
     ckpt_factory = ArgumentGroupFactory(CheckpointConfig, exclude=["most_recent_k", "save_tokenizer_assets", "save_optim", "save_rng", "load_optim", "load_rng"])
     group = ckpt_factory.build_group(parser, "checkpointing")
@@ -2322,6 +2351,10 @@ def _add_checkpointing_args(parser):
     group.add_argument('--dist-ckpt-format',
                        dest='dist_ckpt_format_deprecated',
                        help='Deprecated: see --ckpt-format.')
+    group.add_argument('--dist-ckpt-workers', type=int, default=1,
+                       help='Number of workers for distributed checkpointing. '
+                       'Only used for async save. '
+                       'If set to 1, the checkpointing is performed in a single process.')
     group.add_argument('--ckpt-fully-parallel-save', action='store_true',
                        dest='ckpt_fully_parallel_save_deprecated',
                        help='Deprecated: see --no-ckpt-fully-parallel-save.')
@@ -2360,7 +2393,7 @@ def _add_mixed_precision_args(parser):
 
 
 def _add_distributed_args(parser):
-    from megatron.training.common_config import DistributedInitConfig
+    from megatron.training.config import DistributedInitConfig
 
     dist_init_factory = ArgumentGroupFactory(DistributedInitConfig)
     group = dist_init_factory.build_group(parser, "distributed init")
@@ -2479,7 +2512,7 @@ def _add_distributed_args(parser):
 
 
 def _add_validation_args(parser):
-    from megatron.training.training_config import ValidationConfig
+    from megatron.training.config import ValidationConfig
 
     val_factory = ArgumentGroupFactory(ValidationConfig)
     group = val_factory.build_group(parser, "validation")

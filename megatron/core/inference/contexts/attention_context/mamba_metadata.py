@@ -305,6 +305,25 @@ class MambaMetadata:
 
         return mamba_idx
 
+    def batch_allocate_slots(self, num_slots: int) -> Optional[torch.Tensor]:
+        """
+        Allocates new slots for the given number of requests in the Mamba state buffers.
+
+        Returns:
+            torch.Tensor: The indices of the allocated slots.
+            Returns None if not enough slots are available.
+        """
+        if self.mamba_state_free_slot_count < num_slots:
+            return None
+
+        # Get free slots
+        self.mamba_state_free_slot_count -= num_slots
+        mamba_idx = self.mamba_state_free_slots[
+            self.mamba_state_free_slot_count : self.mamba_state_free_slot_count + num_slots
+        ]
+
+        return mamba_idx
+
     def free_slots(self, request_indices: torch.Tensor) -> None:
         """
         Frees the Mamba state slots associated with the given request indices.
