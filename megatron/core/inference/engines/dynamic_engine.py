@@ -11,6 +11,7 @@ import warnings
 from collections import deque
 from contextlib import contextmanager
 from dataclasses import dataclass
+from enum import Enum, auto
 from datetime import datetime
 from itertools import repeat
 from typing import Dict, List, Optional, Tuple, Union
@@ -29,7 +30,7 @@ from megatron.core.inference.data_parallel_inference_coordinator import (
     DataParallelInferenceCoordinator,
 )
 from megatron.core.inference.engines.abstract_engine import AbstractEngine
-from megatron.core.inference.headers import EngineState, Headers, UnknownHeaderError
+from megatron.core.inference.headers import Headers, UnknownHeaderError
 from megatron.core.inference.inference_request import (
     DynamicInferenceEvent,
     DynamicInferenceEventType,
@@ -103,6 +104,19 @@ DEPRECATED_ARGS = [
     "inference_logging_step_interval",
     "pg_collection",
 ]
+
+
+class EngineState(Enum):
+    """State machine for the inference engine."""
+
+    RUNNING = auto()  # Processing requests
+    PAUSING = auto()  # PAUSE received; waiting for EP consensus + world barrier
+    PAUSED = auto()  # Globally confirmed idle
+    SUSPENDING = auto()  # SUSPEND received; offloading GPU; waiting for world barrier
+    SUSPENDED = auto()  # GPU offloaded, all ranks confirmed
+    RESUMING = auto()  # RESUME received; onloading GPU; waiting for world barrier
+    STOPPING = auto()  # STOP received; futures cancelled; waiting for world barrier
+    STOPPED = auto()  # All ranks confirmed; teardown complete
 
 
 class EngineSuspendedError(Exception):
@@ -1672,19 +1686,18 @@ class DynamicInferenceEngine(AbstractEngine):
         When immediate=False (called from the engine loop's finally block),
         just does ZMQ cleanup — the loop already exited cleanly.
 
-        When immediate=True (external emergency shutdown), terminates the
-        coordinator process and cancels the engine loop task directly.
-        Cancellation is safe here because we can't rely on EP all-reduce
-        or world barriers — peer ranks may already be dead.
+        When immediate=True (external emergency shutdown), cancels the
+        engine loop task directly.  Cancellation is safe here because we
+        can't rely on EP all-reduce or world barriers — peer ranks may
+        already be dead.
+
+        Note: This method does NOT touch the coordinator process.  The
+        caller is responsible for terminating/joining it separately.
 
         Args:
-            immediate: Terminate the coordinator and cancel the engine task.
+            immediate: Cancel the engine task instead of draining gracefully.
         """
         task = getattr(self, 'engine_loop_task', None)
-
-        if immediate and hasattr(self, "inference_coordinator_process"):
-            self.inference_coordinator_process.terminate()
-            self.inference_coordinator_process.join()
 
         if task is not None and not task.done() and task is not asyncio.current_task():
             if immediate:

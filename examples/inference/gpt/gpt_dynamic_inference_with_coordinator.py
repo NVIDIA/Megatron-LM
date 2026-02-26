@@ -178,7 +178,7 @@ async def main(
         client.stop_engines()
 
     # once the stop signal eventually makes its way to each GPU, the engines will stop.
-    await asyncio.gather(engine.engine_loop_task)
+    await engine.stopped.wait()
 
     if dist.get_rank() == 0:
         client.stop()

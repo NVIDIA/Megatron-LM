@@ -68,7 +68,7 @@ class DataParallelInferenceCoordinator:
         next_request_id (int): A counter for generating unique server-side request IDs.
     """
 
-    class State(Enum):
+    class CoordinatorState(Enum):
         """State machine for the coordinator."""
 
         RUNNING = auto()
@@ -121,6 +121,7 @@ class DataParallelInferenceCoordinator:
         local_ip = socket.gethostname()
 
         self.router_socket = self.context.socket(zmq.ROUTER)
+        # Raise error if the other side of the connection has dropped.
         self.router_socket.setsockopt(zmq.ROUTER_MANDATORY, 1)
         is_bound = False
         if inference_coordinator_port is not None:
@@ -168,7 +169,7 @@ class DataParallelInferenceCoordinator:
 
         self.next_request_id = 0
         self.tokenizer = tokenizer
-        self.state = self.State.RUNNING
+        self.state = self.CoordinatorState.RUNNING
 
     def get_next_data_parallel_rank(self):
         """
@@ -302,41 +303,41 @@ class DataParallelInferenceCoordinator:
                     continue
 
                 if header == Headers.PAUSE:
-                    if self.state == self.State.RUNNING:
-                        self.state = self.State.PAUSED
-                    elif self.state in (self.State.PAUSED, self.State.SUSPENDED):
+                    if self.state == self.CoordinatorState.RUNNING:
+                        self.state = self.CoordinatorState.PAUSED
+                    elif self.state in (self.CoordinatorState.PAUSED, self.CoordinatorState.SUSPENDED):
                         # Already paused/suspended, ignore redundant PAUSE.
                         continue
                     else:
                         logging.warning("Coordinator: ignoring PAUSE in state %s", self.state)
                         continue
                 elif header == Headers.UNPAUSE:
-                    if self.state != self.State.PAUSED:
+                    if self.state != self.CoordinatorState.PAUSED:
                         logging.warning("Coordinator: ignoring UNPAUSE in state %s", self.state)
                         continue
-                    self.state = self.State.RUNNING
+                    self.state = self.CoordinatorState.RUNNING
                 elif header == Headers.SUSPEND:
-                    if self.state != self.State.PAUSED:
+                    if self.state != self.CoordinatorState.PAUSED:
                         logging.warning("Coordinator: ignoring SUSPEND in state %s", self.state)
                         continue
-                    self.state = self.State.SUSPENDED
+                    self.state = self.CoordinatorState.SUSPENDED
                 elif header == Headers.RESUME:
-                    if self.state != self.State.SUSPENDED:
+                    if self.state != self.CoordinatorState.SUSPENDED:
                         logging.warning("Coordinator: ignoring RESUME in state %s", self.state)
                         continue
-                    self.state = self.State.PAUSED
+                    self.state = self.CoordinatorState.PAUSED
                 elif header == Headers.STOP:
-                    if self.state not in (self.State.PAUSED, self.State.SUSPENDED):
+                    if self.state not in (self.CoordinatorState.PAUSED, self.CoordinatorState.SUSPENDED):
                         logging.warning("Coordinator: ignoring STOP in state %s", self.state)
                         continue
-                    self.state = self.State.STOPPING
+                    self.state = self.CoordinatorState.STOPPING
 
                 # Broadcast the control signal if we're in a good state.
                 broadcast_payload = msgpack.packb([header.value], use_bin_type=True)
                 for data_parallel_rank_id in list(self.identities_of_data_parallel_ranks):
                     self._send_to_engine(data_parallel_rank_id, broadcast_payload)
 
-                if self.state == self.State.STOPPING:
+                if self.state == self.CoordinatorState.STOPPING:
                     break
 
             elif header == Headers.ENGINE_REPLY:

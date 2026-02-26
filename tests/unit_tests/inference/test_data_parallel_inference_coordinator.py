@@ -12,7 +12,8 @@ import torch
 from tqdm import tqdm
 
 from megatron.core.inference.engines.dynamic_engine import DynamicInferenceEngine, RequestEntry
-from megatron.core.inference.headers import EngineState, Headers
+from megatron.core.inference.engines.dynamic_engine import EngineState
+from megatron.core.inference.headers import Headers
 from megatron.core.inference.inference_client import InferenceClient
 from megatron.core.inference.inference_request import (
     DynamicInferenceRequest,
@@ -192,12 +193,21 @@ class DummyEngine(DynamicInferenceEngine):
         }
 
 
+def _kill_coordinator(engine, timeout=5.0):
+    """Terminate and join the coordinator process if it exists."""
+    proc = getattr(engine, 'inference_coordinator_process', None)
+    if proc is None or not proc.is_alive():
+        return
+    proc.terminate()
+    proc.join(timeout=timeout)
+
+
 async def graceful_shutdown(engine, client=None, *, timeout=30.0):
     """Shut down the engine, escalating through three strategies.
 
     1. Coordinator-driven: PAUSE → STOP via client (normal protocol).
-    2. Immediate: engine.shutdown(immediate=True) — synthetic signals,
-       kills coordinator, awaits task.
+    2. Immediate: engine.shutdown(immediate=True) — cancels the engine
+       task, then kills the coordinator.
     3. Nuclear: cancel the task directly (destroys ZMQ sockets).
 
     Args:
@@ -214,7 +224,6 @@ async def graceful_shutdown(engine, client=None, *, timeout=30.0):
     try:
         if client is not None:
             client.pause_engines()
-            await asyncio.wait_for(engine.paused.wait(), timeout=timeout)
             client.stop_engines()
         await asyncio.wait_for(engine.stopped.wait(), timeout=timeout)
         # Reap the coordinator process (it exited after broadcasting STOP).
@@ -232,6 +241,7 @@ async def graceful_shutdown(engine, client=None, *, timeout=30.0):
     # Stage 2: immediate shutdown (cancel task, no collectives).
     try:
         await asyncio.wait_for(engine.shutdown(immediate=True), timeout=timeout)
+        _kill_coordinator(engine)
     except asyncio.TimeoutError:
         # Stage 3: nuclear — cancel the task directly.
         task = getattr(engine, 'engine_loop_task', None)
@@ -241,10 +251,7 @@ async def graceful_shutdown(engine, client=None, *, timeout=30.0):
                 await task
             except (asyncio.CancelledError, Exception):
                 pass
-        proc = getattr(engine, 'inference_coordinator_process', None)
-        if proc is not None:
-            proc.terminate()
-            proc.join(timeout=2.0)
+        _kill_coordinator(engine)
     finally:
         if client is not None:
             try:
