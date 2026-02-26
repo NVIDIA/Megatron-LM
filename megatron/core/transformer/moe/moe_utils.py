@@ -911,6 +911,9 @@ def apply_router_token_dropping(
     return final_probs, final_map
 
 
+@deprecated(
+    version="0.16", removal_version="0.18", alternative="MoEMetricsTracker.get_instance().record()"
+)
 def save_to_aux_losses_tracker(
     name: str,
     loss: torch.Tensor,
@@ -948,11 +951,19 @@ def save_to_aux_losses_tracker(
     )
 
 
+@deprecated(
+    version="0.16", removal_version="0.18", alternative="MoEMetricsTracker.get_instance().clear()"
+)
 def clear_aux_losses_tracker() -> None:
     """Clear the auxiliary losses."""
     MoEMetricsTracker.get_instance().clear()
 
 
+@deprecated(
+    version="0.16",
+    removal_version="0.18",
+    alternative="MoEMetricsTracker.get_instance()._sync_metrics()",
+)
 def reduce_aux_losses_tracker_across_ranks(
     track_names: Optional[List[str]] = None, pg_collection: Optional[ProcessGroupCollection] = None
 ) -> None:
@@ -969,6 +980,9 @@ def reduce_aux_losses_tracker_across_ranks(
     tracker._sync_metrics(names_list, pg_collection)
 
 
+@deprecated(
+    version="0.16", removal_version="0.18", alternative="MoEMetricsTracker.get_instance().metrics"
+)
 def get_moe_layer_wise_logging_tracker():
     """Return the moe layer wise tracker in legacy dict format."""
     return {

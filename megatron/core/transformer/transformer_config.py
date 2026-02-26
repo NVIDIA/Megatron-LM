@@ -957,6 +957,8 @@ class TransformerConfig(ModelParallelConfig):
         if self.moe_metrics_tracker is None:
             from megatron.core.transformer.moe.moe_logging import MoEMetricsTracker
 
+            # Default to the global singleton. For multi-model isolation, users
+            # can pass a separate MoEMetricsTracker() instance per config.
             self.moe_metrics_tracker = MoEMetricsTracker.get_instance()
 
         # When fp32 residual connections are enabled, pipeline parallel communication must

@@ -2151,7 +2151,6 @@ def training_log(
                     log_string += ' {}: {:.6E} |'.format(key, avg)
                 if should_reset:
                     total_loss_dict[key] = torch.tensor([0.0], dtype=torch.float, device='cuda')
-        # Append MoE load balance discrepancy log string
         if args.num_experts is not None and moe_log_string:
             log_string += moe_log_string
         log_string += f' loss scale: {loss_scale:.1f} |'
