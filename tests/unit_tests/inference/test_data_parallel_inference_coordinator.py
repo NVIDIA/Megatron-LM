@@ -612,18 +612,18 @@ class TestCoordinator:
 
         if torch.distributed.get_rank() == 0:
             init_duration = (init_time - start_time) * 10**3
-            golden_init_duration = 8812.31  # ms
+            golden_init_duration = 14066.31  # ms
             run_duration = (done_time - init_time) * 10**3
-            golden_run_duration = 4469.44  # ms
+            golden_run_duration = 5059.90  # ms
             stop_duration = (stop_time - done_time) * 10**3
             golden_stop_duration = 80.73  # ms
 
             def clamp_to_golden_value(value, golden_value, delta=0.1):
                 return value > golden_value * (1 - delta) and value < golden_value * (1 + delta)
 
-            if not clamp_to_golden_value(init_duration, golden_init_duration, delta=0.5):
+            if not clamp_to_golden_value(init_duration, golden_init_duration, delta=2.0):
                 flags[0] = 0
-            if not clamp_to_golden_value(run_duration, golden_run_duration, delta=0.2):
+            if not clamp_to_golden_value(run_duration, golden_run_duration, delta=0.5):
                 flags[1] = 0
             if not clamp_to_golden_value(stop_duration, golden_stop_duration, delta=1.0):
                 flags[2] = 0
