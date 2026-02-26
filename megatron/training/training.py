@@ -1986,7 +1986,7 @@ def training_log(
         else:
             layers = args.num_layers
 
-        moe_log_string = MoEMetricsTracker.get_instance().track(
+        moe_log_string = MoEMetricsTracker.get_instance().report(
             loss_scale=moe_loss_scale,
             iteration=iteration,
             writer=writer,
@@ -1998,6 +1998,7 @@ def training_log(
             moe_layer_freq=args.moe_layer_freq,
             mtp_num_layers=args.mtp_num_layers,
             pg_collection=pg_collection,
+            total_loss_dict=total_loss_dict,
         )
 
     # Log MTP metrics.
