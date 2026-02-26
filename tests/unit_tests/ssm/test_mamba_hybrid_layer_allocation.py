@@ -414,24 +414,22 @@ class TestSelectPipelineSegment:
     def test_mutual_exclusivity_pipes_with_first_stage(self, mock_log):
         """Pipe separators + first_stage_layers should raise ValueError."""
         with pytest.raises(ValueError, match="Cannot specify"):
-            select_pipeline_segment(
-                "M*|M*", pp_group=None, vp_stage=0, first_stage_layers=1
-            )
+            select_pipeline_segment("M*|M*", pp_group=None, vp_stage=0, first_stage_layers=1)
 
     @patch('megatron.core.ssm.mamba_hybrid_layer_allocation.log_on_each_pipeline_stage')
     def test_mutual_exclusivity_pipes_with_last_stage(self, mock_log):
         """Pipe separators + last_stage_layers should raise ValueError."""
         with pytest.raises(ValueError, match="Cannot specify"):
-            select_pipeline_segment(
-                "M*|M*", pp_group=None, vp_stage=0, last_stage_layers=1
-            )
+            select_pipeline_segment("M*|M*", pp_group=None, vp_stage=0, last_stage_layers=1)
 
     @patch('megatron.core.ssm.mamba_hybrid_layer_allocation.log_on_each_pipeline_stage')
     def test_segment_count_not_divisible_by_pp_size(self, mock_log):
         """Segment count not divisible by pp_size should raise ValueError."""
         mock_group = object()
-        with patch('torch.distributed.get_rank', return_value=0), \
-             patch('torch.distributed.get_world_size', return_value=2):
+        with (
+            patch('torch.distributed.get_rank', return_value=0),
+            patch('torch.distributed.get_world_size', return_value=2),
+        ):
             with pytest.raises(ValueError, match="evenly divisible"):
                 select_pipeline_segment("M|M|M", pp_group=mock_group, vp_stage=None)
 
@@ -444,16 +442,27 @@ class TestSelectPipelineSegmentLegacyFallback:
     activates when the pattern has no pipe separators but pp_size > 1.
     """
 
-    def _call_for_rank(self, pattern, pp_rank, pp_size, vp_stage=None,
-                       first_stage_layers=None, last_stage_layers=None):
+    def _call_for_rank(
+        self,
+        pattern,
+        pp_rank,
+        pp_size,
+        vp_stage=None,
+        first_stage_layers=None,
+        last_stage_layers=None,
+    ):
         """Call select_pipeline_segment with mocked PP group for a given rank."""
         mock_group = object()
-        with patch('torch.distributed.get_rank', return_value=pp_rank), \
-             patch('torch.distributed.get_world_size', return_value=pp_size), \
-             patch('megatron.core.ssm.mamba_hybrid_layer_allocation.log_on_each_pipeline_stage'), \
-             patch('megatron.core.ssm.mamba_hybrid_layer_allocation.log_single_rank'):
+        with (
+            patch('torch.distributed.get_rank', return_value=pp_rank),
+            patch('torch.distributed.get_world_size', return_value=pp_size),
+            patch('megatron.core.ssm.mamba_hybrid_layer_allocation.log_on_each_pipeline_stage'),
+            patch('megatron.core.ssm.mamba_hybrid_layer_allocation.log_single_rank'),
+        ):
             return select_pipeline_segment(
-                pattern, pp_group=mock_group, vp_stage=vp_stage,
+                pattern,
+                pp_group=mock_group,
+                vp_stage=vp_stage,
                 first_stage_layers=first_stage_layers,
                 last_stage_layers=last_stage_layers,
             )
@@ -484,36 +493,26 @@ class TestSelectPipelineSegmentLegacyFallback:
     def test_uneven_pp_first_stage(self):
         """6 layers, pp_size=4, first_stage=3 -> first gets 3, others get 1."""
         pattern = "M*M*M*"
-        layers0, off0 = self._call_for_rank(
-            pattern, pp_rank=0, pp_size=4, first_stage_layers=3
-        )
+        layers0, off0 = self._call_for_rank(pattern, pp_rank=0, pp_size=4, first_stage_layers=3)
         assert len(layers0) == 3
         assert off0 == 0
 
-        layers1, off1 = self._call_for_rank(
-            pattern, pp_rank=1, pp_size=4, first_stage_layers=3
-        )
+        layers1, off1 = self._call_for_rank(pattern, pp_rank=1, pp_size=4, first_stage_layers=3)
         assert len(layers1) == 1
         assert off1 == 3
 
-        layers3, off3 = self._call_for_rank(
-            pattern, pp_rank=3, pp_size=4, first_stage_layers=3
-        )
+        layers3, off3 = self._call_for_rank(pattern, pp_rank=3, pp_size=4, first_stage_layers=3)
         assert len(layers3) == 1
         assert off3 == 5
 
     def test_uneven_pp_last_stage(self):
         """6 layers, pp_size=4, last_stage=3 -> last gets 3, others get 1."""
         pattern = "M*M*M*"
-        layers0, off0 = self._call_for_rank(
-            pattern, pp_rank=0, pp_size=4, last_stage_layers=3
-        )
+        layers0, off0 = self._call_for_rank(pattern, pp_rank=0, pp_size=4, last_stage_layers=3)
         assert len(layers0) == 1
         assert off0 == 0
 
-        layers3, off3 = self._call_for_rank(
-            pattern, pp_rank=3, pp_size=4, last_stage_layers=3
-        )
+        layers3, off3 = self._call_for_rank(pattern, pp_rank=3, pp_size=4, last_stage_layers=3)
         assert len(layers3) == 3
         assert off3 == 3
 
@@ -521,29 +520,25 @@ class TestSelectPipelineSegmentLegacyFallback:
         """8 layers, pp_size=4, first=1, last=1 -> first 1, middle 3 each, last 1."""
         pattern = "M*M*M*M*"
         layers0, off0 = self._call_for_rank(
-            pattern, pp_rank=0, pp_size=4,
-            first_stage_layers=1, last_stage_layers=1,
+            pattern, pp_rank=0, pp_size=4, first_stage_layers=1, last_stage_layers=1
         )
         assert len(layers0) == 1
         assert off0 == 0
 
         layers1, off1 = self._call_for_rank(
-            pattern, pp_rank=1, pp_size=4,
-            first_stage_layers=1, last_stage_layers=1,
+            pattern, pp_rank=1, pp_size=4, first_stage_layers=1, last_stage_layers=1
         )
         assert len(layers1) == 3
         assert off1 == 1
 
         layers2, off2 = self._call_for_rank(
-            pattern, pp_rank=2, pp_size=4,
-            first_stage_layers=1, last_stage_layers=1,
+            pattern, pp_rank=2, pp_size=4, first_stage_layers=1, last_stage_layers=1
         )
         assert len(layers2) == 3
         assert off2 == 4
 
         layers3, off3 = self._call_for_rank(
-            pattern, pp_rank=3, pp_size=4,
-            first_stage_layers=1, last_stage_layers=1,
+            pattern, pp_rank=3, pp_size=4, first_stage_layers=1, last_stage_layers=1
         )
         assert len(layers3) == 1
         assert off3 == 7
@@ -551,9 +546,7 @@ class TestSelectPipelineSegmentLegacyFallback:
     def test_uneven_pp_middle_not_divisible_raises(self):
         """Middle layers not divisible by middle stages -> ValueError."""
         with pytest.raises(ValueError, match="Middle layers"):
-            self._call_for_rank(
-                "M*M*M*M*M", pp_rank=0, pp_size=4, first_stage_layers=2
-            )
+            self._call_for_rank("M*M*M*M*M", pp_rank=0, pp_size=4, first_stage_layers=2)
 
     def test_vpp_with_no_pipes_raises(self):
         """VPP (vp_stage != None) without pipe separators -> ValueError."""
@@ -563,10 +556,12 @@ class TestSelectPipelineSegmentLegacyFallback:
     def test_deprecation_warning_logged(self):
         """Legacy path should log a deprecation warning via log_single_rank."""
         mock_group = object()
-        with patch('torch.distributed.get_rank', return_value=0), \
-             patch('torch.distributed.get_world_size', return_value=2), \
-             patch('megatron.core.ssm.mamba_hybrid_layer_allocation.log_on_each_pipeline_stage'), \
-             patch('megatron.core.ssm.mamba_hybrid_layer_allocation.log_single_rank') as mock_warn:
+        with (
+            patch('torch.distributed.get_rank', return_value=0),
+            patch('torch.distributed.get_world_size', return_value=2),
+            patch('megatron.core.ssm.mamba_hybrid_layer_allocation.log_on_each_pipeline_stage'),
+            patch('megatron.core.ssm.mamba_hybrid_layer_allocation.log_single_rank') as mock_warn,
+        ):
             select_pipeline_segment("M*M*", pp_group=mock_group, vp_stage=None)
             mock_warn.assert_called_once()
             call_args = mock_warn.call_args
