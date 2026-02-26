@@ -361,7 +361,7 @@ jobs:
       REPOSITORY: ${{ github.repository }}
       PROJECT_NAME: Megatron Core
       VERSION: ${{ needs.bump-next-version.outputs.release-version }}
-      TAG_PREFIX: ${{ inputs.gh-release-tag-prefix || '' }}
+      TAG_PREFIX: core_
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
