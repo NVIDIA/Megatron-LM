@@ -201,10 +201,10 @@ try:
                     "tool_calls" if metadata.get("tool_calls", []) else "stop"
                 ),  # Original code hardcoded this.
             }
-            if result.get("policy_staleness") is not None:
-                choice_data["policy_staleness"] = result["policy_staleness"]
-            if result.get("kv_cache_staleness") is not None:
-                choice_data["kv_cache_staleness"] = result["kv_cache_staleness"]
+            if result.get("policy_iteration") is not None:
+                choice_data["policy_iteration"] = result["policy_iteration"]
+            if result.get("kv_cache_iteration") is not None:
+                choice_data["kv_cache_iteration"] = result["kv_cache_iteration"]
             events = result.get("events")
             if events is not None:
                 num_evictions = sum(1 for e in events if e.get("type") == "EVICT")

@@ -232,6 +232,7 @@ class DynamicInferenceEngine(AbstractEngine):
         self.requests: Dict[int, RequestEntry] = {}
         self.waiting_request_ids = deque()
         self.failed_request_ids = []
+        self._training_iteration = 0
         # Track requests that should stop due to stop words (detected in post_process_requests)
         self.stop_word_finished_request_ids: set[int] = set()
         # Track requests currently being finished due to stop words (to skip extra token)
@@ -924,6 +925,8 @@ class DynamicInferenceEngine(AbstractEngine):
                     finished_entry = self.requests.pop(request_id)
                     finished_request = finished_entry.record[-1]
                     finished_request.generated_length = len(finished_request.generated_tokens)
+                    if self._training_iteration is not None:
+                        finished_entry.record.stamp_training_iteration(self._training_iteration)
                     finished_request_records.append(finished_entry.record)
                     finished_entry.future.set_result(finished_entry.record)
                 elif stop_word_hit:
@@ -1331,6 +1334,8 @@ class DynamicInferenceEngine(AbstractEngine):
             failed_request = failed_entry.record[-1]
             failed_request.status = Status.FAILED
             failed_request.add_event_fail()
+            if self._training_iteration is not None:
+                failed_entry.record.stamp_training_iteration(self._training_iteration)
             finished_request_records.append(failed_entry.record)
             failed_entry.future.set_result(failed_entry.record)
         self.failed_request_ids.clear()
@@ -1627,10 +1632,16 @@ class DynamicInferenceEngine(AbstractEngine):
                 self.suspend_signal = True
             elif header == Headers.RESUME:
                 self.suspend_signal = False
-            elif header == Headers.INCREMENT_STALENESS:
+            elif header == Headers.SET_TRAINING_ITERATION:
+                training_iteration = data[1]
+                # Stamp tokens generated since last call with the OLD iteration
+                # (the policy version that generated them).
                 waiting = set(self.waiting_request_ids)
                 for request_id, entry in self.requests.items():
-                    entry.record.increment_staleness(policy_only=request_id in waiting)
+                    entry.record.stamp_training_iteration(
+                        self._training_iteration, policy_only=request_id in waiting
+                    )
+                self._training_iteration = training_iteration
             elif header == Headers.STOP:
                 self.received_stop = True
             else:

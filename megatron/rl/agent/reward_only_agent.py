@@ -104,6 +104,10 @@ class RewardOnlyAgent(RolloutGenerator, GroupedRolloutGenerator, PassAtEvaluatio
                 generation_mask=[generation_mask],
                 env_id=self.env_id,
                 problem_id=golden['problem_id'] if 'problem_id' in golden else None,
+                policy_iteration=[response.policy_iteration],
+                kv_cache_iteration=[response.kv_cache_iteration],
+                completed_at_step=[response.completed_at_step],
+                num_evictions=[response.num_evictions],
             )
         else:
             rollout = Rollout(
@@ -111,6 +115,10 @@ class RewardOnlyAgent(RolloutGenerator, GroupedRolloutGenerator, PassAtEvaluatio
                 reward=await self.get_reward(response_text, golden),
                 env_id=self.env_id,
                 problem_id=golden['problem_id'] if 'problem_id' in golden else None,
+                policy_iteration=[response.policy_iteration],
+                kv_cache_iteration=[response.kv_cache_iteration],
+                completed_at_step=[response.completed_at_step],
+                num_evictions=[response.num_evictions],
             )
 
         return rollout

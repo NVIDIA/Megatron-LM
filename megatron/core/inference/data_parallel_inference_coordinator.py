@@ -245,7 +245,7 @@ class DataParallelInferenceCoordinator:
                 Headers.UNPAUSE,
                 Headers.SUSPEND,
                 Headers.RESUME,
-                Headers.INCREMENT_STALENESS,
+                Headers.SET_TRAINING_ITERATION,
                 Headers.STOP,
             ]:
                 # control signals for the engine
@@ -254,7 +254,7 @@ class DataParallelInferenceCoordinator:
                     continue
                 for data_parallel_rank_id in self.identities_of_data_parallel_ranks:
                     self.router_socket.send_multipart(
-                        [data_parallel_rank_id, msgpack.packb([header.value], use_bin_type=True)]
+                        [data_parallel_rank_id, message]
                     )
                 if header == Headers.UNPAUSE:
                     self.data_parallel_pause_acks = set()

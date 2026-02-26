@@ -70,6 +70,10 @@ class MegatronLocal(InferenceServer, ReturnsTokens, ReturnsRaw):
             token_ids=choice.prompt_token_ids + choice.generation_token_ids,
             logprobs=choice.generation_log_probs,
             prompt_length=len(choice.prompt_token_ids),
+            policy_iteration=choice.policy_iteration,
+            kv_cache_iteration=choice.kv_cache_iteration,
+            completed_at_step=args.curr_iteration,
+            num_evictions=getattr(choice, 'num_evictions', 0),
         )
 
     @classmethod
@@ -122,6 +126,10 @@ class MegatronLocal(InferenceServer, ReturnsTokens, ReturnsRaw):
         if dist.get_rank() == 0:
             await self._client.stop_engines()
         await self._inference_engine.stopped.wait()
+
+    def set_training_iteration(self, training_iteration: int):
+        if dist.get_rank() == 0:
+            self._client.set_training_iteration(training_iteration)
 
     async def suspend(self):
         if dist.get_rank() == 0:

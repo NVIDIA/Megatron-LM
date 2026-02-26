@@ -181,14 +181,15 @@ class InferenceClient:
         self._connect_with_inference_coordinator()
         self.listener_task = self._loop.create_task(self._recv_task())
 
-    def _send_signal_to_engines(self, signal):
+    def _send_signal_to_engines(self, signal, *args):
         """
         Sends a generic control signal to the inference coordinator.
 
         Args:
             signal: The signal to send, typically a value from the `Headers` enum.
+            *args: Optional additional data to include in the payload.
         """
-        payload = [signal.value]
+        payload = [signal.value, *args]
         payload_serialized = msgpack.packb(payload, use_bin_type=True)
         self.socket.send(payload_serialized)
 
@@ -213,10 +214,13 @@ class InferenceClient:
         self.running.set()
         self._send_signal_to_engines(Headers.UNPAUSE)
 
-    def increment_staleness(self):
-        """Sends a signal to increment staleness on all in-flight requests."""
-        assert self.paused.is_set(), "Can only increment staleness while engines are paused."
-        self._send_signal_to_engines(Headers.INCREMENT_STALENESS)
+    def set_training_iteration(self, training_iteration: int):
+        """Sends the current training iteration to all engines.
+
+        Can be called while paused (to stamp tokens before training) or while
+        running (to sync the iteration before generating new tokens).
+        """
+        self._send_signal_to_engines(Headers.SET_TRAINING_ITERATION, training_iteration)
 
     def suspend_engines(self):
         """Sends a signal to pause all inference engines."""
