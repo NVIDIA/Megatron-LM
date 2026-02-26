@@ -2,7 +2,6 @@
 
 import asyncio
 import logging
-import os
 import time
 from typing import Awaitable, List, Optional, Union
 
@@ -54,12 +53,12 @@ class InferenceClient:
             completed requests.
     """
 
-    def __init__(self, inference_coordinator_port: int):
+    def __init__(self, inference_coordinator_address: str):
         """
         Initializes the InferenceClient.
 
         Args:
-            inference_coordinator_port (int): The port number on which the
+            inference_coordinator_address (str): The address on which the
                 inference coordinator is listening.
         """
         assert (
@@ -70,8 +69,7 @@ class InferenceClient:
         ), "please install the messagepack library to use InferenceClient - pip install msgpack"
         self.context = zmq.Context()
         socket = self.context.socket(zmq.DEALER)
-        inference_coordinator_address = os.getenv('MASTER_ADDR', '127.0.0.1')
-        socket.connect(f"tcp://{inference_coordinator_address}:{inference_coordinator_port}")
+        socket.connect(inference_coordinator_address)
 
         self._loop = None
         self.running = asyncio.Event()
@@ -215,6 +213,11 @@ class InferenceClient:
         self.running.set()
         self._send_signal_to_engines(Headers.UNPAUSE)
 
+    def increment_staleness(self):
+        """Sends a signal to increment staleness on all in-flight requests."""
+        assert self.paused.is_set(), "Can only increment staleness while engines are paused."
+        self._send_signal_to_engines(Headers.INCREMENT_STALENESS)
+
     def suspend_engines(self):
         """Sends a signal to pause all inference engines."""
         self._send_signal_to_engines(Headers.PAUSE)
@@ -222,6 +225,7 @@ class InferenceClient:
 
     def resume_engines(self):
         """Sends a signal to unpause all inference engines."""
+        self.paused.clear()
         self._send_signal_to_engines(Headers.RESUME)
         self._send_signal_to_engines(Headers.UNPAUSE)
 

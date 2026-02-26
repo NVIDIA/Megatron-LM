@@ -8,7 +8,7 @@ build-backend = "setuptools.build_meta"
 include-package-data = true
 
 [tool.setuptools.packages.find]
-include = ["megatron.core", "megatron.core.*"]
+include = ["megatron.core", "megatron.core.*", "megatron.training", "megatron.training.*"]
 
 [tool.setuptools.dynamic]
 version = { attr = "megatron.core.package_info.__version__" }
@@ -20,7 +20,7 @@ dynamic = ["version", "readme"]
 description = "Megatron Core - a library for efficient and scalable training of transformer based models"
 requires-python = ">=3.10"
 license = { text = "Apache 2.0" }
-dependencies = ["torch", "numpy", "packaging>=24.2"]
+dependencies = ["torch>=2.6.0", "numpy", "packaging>=24.2"]
 authors = [{ name = "NVIDIA", email = "nemo-toolkit@nvidia.com" }]
 maintainers = [{ name = "NVIDIA", email = "nemo-toolkit@nvidia.com" }]
 keywords = [
@@ -29,7 +29,6 @@ keywords = [
     "deep",
     "gpu",
     "language",
-    "learning",
     "learning",
     "machine",
     "nvidia",
@@ -61,10 +60,27 @@ classifiers = [
 
 [project.urls]
 Download = "https://github.com/NVIDIA/Megatron-LM/releases"
-Homepage = "https://github.com/NVIDIA/Megatron-LM/megatron/core"
+Homepage = "https://github.com/NVIDIA/Megatron-LM"
 
 [project.optional-dependencies]
-mlm = ["flask-restful", "sentencepiece", "tiktoken", "wandb", "transformers"]
+training = [
+    "flask-restful",
+    "sentencepiece",
+    "tiktoken",
+    "wandb",
+    "transformers",
+    "accelerate",
+]
+
+### 'mlm' group is deprecated. please use 'training' instead ###
+mlm = [
+    "flask-restful",
+    "sentencepiece",
+    "tiktoken",
+    "wandb",
+    "transformers",
+    "accelerate",
+]
 
 dev = [
     "nvidia-modelopt[torch]; sys_platform != 'darwin'",
@@ -78,6 +94,7 @@ dev = [
     "opentelemetry-api~=1.33.1",
     "mamba-ssm~=2.2",
     "causal-conv1d~=1.5",
+    "flash-linear-attention~=0.4.0",
     "nv-grouped-gemm~=1.1",
     "megatron-energon[av_decode]~=6.0",
     "av",
@@ -87,6 +104,9 @@ dev = [
     "fastapi~=0.50",                                          # Forcing a little bit more recent version of fastapi to be compatible with pydantic 2.0
     "datasets",
     "emerging_optimizers",
+    "flask[async]",
+    "hypercorn",
+    "openai",
 ]
 
 lts = [
@@ -134,13 +154,13 @@ docs = [
     "nvidia-sphinx-theme", # Our NVIDIA theme
 ]
 build = [
-    "setuptools<80.0.0",
+    "setuptools<80.0.0,>=77.0.0",
     "packaging>=24.2",
     "hatchling",
     "pybind11",
     "Cython>=3.0.0",
     "torch",
-    "nvidia-mathdx",     # for TE
+    "nvidia-mathdx",              # for TE
 ]
 linting = [
     "ruff~=0.9.0",
@@ -178,14 +198,14 @@ override-dependencies = [
 flash_mla = [
     { git = "https://github.com/deepseek-ai/FlashMLA", rev = "9edee0c022cd0938148a18e334203b0aab43aa19" },
 ]
-transformer-engine = { git = "https://github.com/NVIDIA/TransformerEngine.git", rev = "release_v2.11" }
+transformer-engine = { git = "https://github.com/NVIDIA/TransformerEngine.git", rev = "5671fd3675906cda1ade26c24a65d3dedd88eb89" }
 nemo-run = { git = "https://github.com/NVIDIA-NeMo/Run.git", rev = "01a9a8ba360f7b2908728ad0516e0ad9d936966d" }
 emerging_optimizers = { git = "https://github.com/NVIDIA-NeMo/Emerging-Optimizers.git", rev = "v0.1.0" }
 
 [tool.isort]
 profile = "black"                                                          # black-compatible
 line_length = 100                                                          # should match black parameters
-py_version = 310                                                           # python 3.8 as a target version
+py_version = 310                                                           # python 3.10 as a target version
 known_first_party = ["megatron"]                                           # FIRSTPARTY section
 known_third_party = ["transformer_engine"]                                 # THIRDPARTY section
 sections = ["FUTURE", "STDLIB", "THIRDPARTY", "FIRSTPARTY", "LOCALFOLDER"]
@@ -195,7 +215,7 @@ extend_skip = ["setup.py"]
 [tool.black]
 line_length = 100
 skip_string_normalization = true
-# recongized by future versions, disallows to reformat code with incompatible versions
+# recognized by future versions, disallows to reformat code with incompatible versions
 # Matches NeMO version so people working on both codebases don't need two different version of black installed
 required_version = "24"
 skip_magic_trailing_comma = true

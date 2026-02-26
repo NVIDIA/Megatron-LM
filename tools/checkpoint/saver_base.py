@@ -62,7 +62,7 @@ class MegatronCheckpointSaverBase:
             args_to_keep = ['tensor_model_parallel_size', 'pipeline_model_parallel_size', 'expert_model_parallel_size', 'world_size', 'params_dtype',
                             'num_layers_per_virtual_pipeline_stage', 'virtual_pipeline_model_parallel_size',
                             'masked_softmax_fusion', 'bias_gelu_fusion', 'bias_dropout_fusion',
-                            'sequence_parallel', 'async_tensor_model_parallel_allreduce',
+                            'sequence_parallel',
                             'no_load_optim', 'no_load_rng', 'no_save_optim', 'no_save_rng',
                             'vocab_file', 'tokenizer_model',
                             'save_interval', 'save',
@@ -170,9 +170,15 @@ class MegatronCheckpointSaverBase:
         
         # For backward compatibility during local parallel states refactoring
         fake_tp_group = _ConverterFakeProcessGroup(size=self.args.target_tensor_parallel_size)
+        fake_pp_group = _ConverterFakeProcessGroup(size=self.args.target_pipeline_parallel_size)
         fake_ep_group = _ConverterFakeProcessGroup(size=self.args.target_expert_parallel_size)
+        fake_dp_group = _ConverterFakeProcessGroup(size=1)
         mpu._TENSOR_MODEL_PARALLEL_GROUP = fake_tp_group
+        mpu._PIPELINE_MODEL_PARALLEL_GROUP = fake_pp_group
         mpu._EXPERT_MODEL_PARALLEL_GROUP = fake_ep_group
+        mpu._DATA_PARALLEL_GROUP = fake_dp_group
+        mpu._DATA_PARALLEL_GROUP_WITH_CP = fake_dp_group
+        mpu._INTRA_PARTIAL_DATA_PARALLEL_GROUP_WITH_CP = fake_dp_group
         fused_kernels.load(self.margs)
         
         try:
@@ -232,7 +238,6 @@ class MegatronCheckpointSaverBase:
                     '--no-masked-softmax-fusion',
                     '--no-bias-gelu-fusion',
                     '--no-bias-dropout-fusion',
-                    '--no-async-tensor-model-parallel-allreduce',
                     '--use-cpu-initialization',
                     '--micro-batch-size', '1',
                     '--no-load-optim',
@@ -356,7 +361,7 @@ class MegatronCheckpointSaverBase:
         """
         try:
             from megatron.core import mpu
-            from megatron.training.tokenizer.tokenizer import _vocab_size_with_padding
+            from megatron.core.tokenizers.utils.build_tokenizer import vocab_size_with_padding
         except ModuleNotFoundError as e:
             print(f"Unable to import required Megatron modules: {e}")
             sys.exit(1)
@@ -375,7 +380,7 @@ class MegatronCheckpointSaverBase:
             if true_vocab_size is not None:
                 # figure out what our padded vocab size is
                 orig_vocab_size = orig_word_embed.shape[0]
-                self.margs.padded_vocab_size = _vocab_size_with_padding(true_vocab_size, self.margs)
+                self.margs.padded_vocab_size = vocab_size_with_padding(true_vocab_size, self.margs)
 
                 # Cut out extra padding we don't need
                 if orig_vocab_size > self.margs.padded_vocab_size:

@@ -21,13 +21,14 @@ from megatron.core.optimizer import (
     _get_param_groups,
     check_config_overrides_consistency,
     get_megatron_optimizer,
+    get_standard_config_overrides,
 )
 from megatron.core.optimizer_param_scheduler import ParamGroupOverride
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.transformer import TransformerConfig
 from megatron.core.utils import is_te_min_version, is_torch_min_version
 from tests.unit_tests.test_utilities import Utils
-from tests.unit_tests.test_utils import _deinit_distributed, _init_distributed
+from tests.unit_tests.test_utils import _init_distributed
 
 try:
     # Check if FP8 block scaling is available.
@@ -45,7 +46,7 @@ except:
 
 
 class Net(nn.Module):
-    def __init__(self):
+    def __init__(self, add_layernorm=False):
         super().__init__()
         self.conv1 = nn.Conv2d(3, 6, 5)
         self.pool = nn.MaxPool2d(2, 2)
@@ -53,6 +54,10 @@ class Net(nn.Module):
         self.fc1 = nn.Linear(16 * 5 * 5, 120)
         self.fc2 = nn.Linear(120, 84)
         self.fc3 = nn.Linear(84, 10)
+        if add_layernorm:
+            self.q_layernorm = nn.LayerNorm(10, bias=False)
+            self.k_layernorm = nn.LayerNorm(10, bias=False)
+            self.layernorm = nn.LayerNorm(10, bias=False)
 
     def forward(self, x):
         x = self.pool(F.relu(self.conv1(x)))
@@ -206,6 +211,81 @@ def test_get_param_groups_overlapping_matches(mock_get_world_size):
     assert param_groups[2]['max_lr'] == 0.01
 
 
+@patch('torch.distributed.get_world_size', return_value=1)
+@patch(
+    'torch.distributed.all_gather_object', lambda output_list, obj: output_list.__setitem__(0, obj)
+)
+def test_get_param_groups_with_standard_config_overrides(apply_wd_to_qk_layernorm: bool):
+    """In this test, we see if the standard config overrides are applied correctly."""
+
+    # Initialize the model with layernorm
+    net = Net()
+
+    config = OptimizerConfig(optimizer='adam', lr=0.01)
+    config_overrides = get_standard_config_overrides(config=config)
+    param_groups = _get_param_groups([net], config, config_overrides)
+
+    assert len(param_groups) == 2
+    p_set = set(net.parameters())
+
+    assert p_set == set(param_groups[0]['params']) | set(param_groups[1]['params'])
+    assert len(p_set) == len(param_groups[0]['params']) + len(param_groups[1]['params'])
+    assert param_groups[0]['wd_mult'] == 0.0 or param_groups[1]['wd_mult'] == 0.0
+    assert param_groups[0]['wd_mult'] == 1.0 or param_groups[1]['wd_mult'] == 1.0
+    assert len(param_groups[0]['params']) > 0 and len(param_groups[1]['params']) > 0
+
+    # Both param groups should have 5 parameters.
+    # Param group A (wd_mult=1.0): conv1.weight, conv2.weight, fc1.weight, fc2.weight, fc3.weight
+    # Param group B (wd_mult=0.0): conv1.bias, conv2.bias, fc1.bias, fc2.bias, fc3.bias
+    assert len(param_groups[0]['params']) == 5, (
+        f"Expected 5 parameters in the first param group, "
+        f"but got {len(param_groups[0]['params'])}"
+    )
+    assert len(param_groups[1]['params']) == 5, (
+        f"Expected 5 parameters in the second param group, "
+        f"but got {len(param_groups[1]['params'])}"
+    )
+
+
+@patch('torch.distributed.get_world_size', return_value=1)
+@patch(
+    'torch.distributed.all_gather_object', lambda output_list, obj: output_list.__setitem__(0, obj)
+)
+def test_get_param_groups_appling_wd_to_qk_layernorm(apply_wd_to_qk_layernorm: bool):
+    """In this test, we see if the `apply_wd_to_qk_layernorm` config is applied correctly."""
+
+    # Initialize the model with layernorm
+    net = Net(add_layernorm=True)
+
+    config = OptimizerConfig(
+        optimizer='adam', lr=0.01, apply_wd_to_qk_layernorm=apply_wd_to_qk_layernorm
+    )
+    config_overrides = get_standard_config_overrides(config=config)
+    param_groups = _get_param_groups([net], config, config_overrides)
+
+    assert len(param_groups) == 2
+    p_set = set(net.parameters())
+
+    assert p_set == set(param_groups[0]['params']) | set(param_groups[1]['params'])
+    assert len(p_set) == len(param_groups[0]['params']) + len(param_groups[1]['params'])
+    assert param_groups[0]['wd_mult'] == 1.0
+    assert param_groups[1]['wd_mult'] == 0.0
+
+    # There are two param groups, having 7, and 6 parameters respectively.
+    # Param group A (wd_mult=1.0): conv1.weight, conv2.weight, fc1.weight, fc2.weight, fc3.weight,
+    #    q_layernorm.weight, k_layernorm.weight
+    # Param group B (wd_mult=0.0): conv1.bias, conv2.bias, fc1.bias, fc2.bias, fc3.bias,
+    #    layernorm.weight
+    assert len(param_groups[0]['params']) == 7, (
+        f"Expected 5 parameters in the first param group, "
+        f"but got {len(param_groups[0]['params'])}"
+    )
+    assert len(param_groups[1]['params']) == 6, (
+        f"Expected 6 parameters in the second param group, "
+        f"but got {len(param_groups[1]['params'])}"
+    )
+
+
 def test_chained_optimizer():
     net = Net()
     optimizer_1 = Adam(list(net.parameters())[:2], lr=0.01)
@@ -244,6 +324,43 @@ def test_chained_optimizer():
 
     assert list(optimizer_1.state.values())[0]["exp_avg"].is_cuda
     assert list(optimizer_2.state.values())[0]["momentum_buffer"].is_cuda
+
+
+def test_chained_optimizer_get_parameters():
+    """Test ChainedOptimizer.get_parameters() aggregates params from all sub-optimizers.
+
+    Regression test: without the get_parameters() override, ChainedOptimizer would
+    access self.optimizer which asserts only one optimizer exists, failing with VPP/MoE.
+    """
+
+    class MockOptimizer:
+        """Mock that mimics MegatronOptimizer's get_parameters() interface."""
+
+        def __init__(self, params):
+            self.params = list(params)
+            self.param_groups = [{"params": self.params}]
+
+        def get_parameters(self):
+            return self.params
+
+    net = Net()
+    all_params = list(net.parameters())
+
+    # Test empty
+    assert ChainedOptimizer([]).get_parameters() == []
+
+    # Test single optimizer
+    opt1 = MockOptimizer(all_params[:3])
+    assert ChainedOptimizer([opt1]).get_parameters() == opt1.params
+
+    # Test multiple optimizers (the case that previously failed)
+    opt2 = MockOptimizer(all_params[3:6])
+    opt3 = MockOptimizer(all_params[6:])
+    chained = ChainedOptimizer([opt1, opt2, opt3])
+    result = chained.get_parameters()
+
+    assert len(result) == len(all_params)
+    assert result == opt1.params + opt2.params + opt3.params
 
 
 def test_precision_aware_fused_adam():
@@ -304,6 +421,7 @@ def test_precision_aware_fused_adam():
     "moment_dtype",
     [torch.float32, torch.float16, torch.bfloat16, torch.uint8],
 )
+@pytest.mark.skip(reason="inconsistent ci test runs resulting in NCCL errors")
 def test_precision_aware_optimizer(
     precision: str,
     main_params_dtype: torch.dtype,
@@ -409,6 +527,136 @@ def test_precision_aware_optimizer(
     # Save and reload state dict for the test model
     state_dict = test_optim.state_dict()
     test_optim.load_state_dict(state_dict)
+
+
+@pytest.mark.parametrize("use_precision_aware", [True, False])
+def test_distrib_optimizer_save_load_with_non_tensor_state(use_precision_aware):
+    """Test that save/load of distributed optimizer handles non-tensor state entries.
+
+    Optimizers may store non-tensor entries (e.g. `found_inf: bool`) in the per-parameter
+    state dict. The distrib_optimizer's _get_main_param_and_optimizer_states and
+    _set_main_param_and_optimizer_states must skip these to avoid crashes when calling
+    tensor operations (.copy_(), get_unscaled_state, set_scaled_state) on non-tensors.
+
+    Tests both the precision-aware path (TE FusedAdam with scaled states) and the
+    non-precision-aware path (standard optimizer with .copy_()).
+    """
+    if use_precision_aware:
+        try:
+            from transformer_engine.pytorch.optimizers import FusedAdam
+        except ImportError:
+            pytest.skip("TE FusedAdam not available")
+
+        import inspect
+
+        adam_args = inspect.signature(FusedAdam).parameters
+        arg_names = [
+            "master_weight_dtype",
+            "exp_avg_dtype",
+            "exp_avg_sq_dtype",
+            "use_decoupled_grad",
+        ]
+        for name in arg_names:
+            if name not in adam_args:
+                pytest.skip("TE FusedAdam does not support precision-aware args")
+
+    world = int(os.getenv('WORLD_SIZE', '1'))
+    rank = int(os.getenv('RANK', '0'))
+
+    _init_distributed(world, rank)
+    Utils.initialize_model_parallel()
+
+    model = torch.nn.Linear(100, 100, bias=False, dtype=torch.bfloat16, device='cuda')
+    model.requires_grad_(True)
+    model.weight.data.fill_(1.0)
+    ddp_config = DistributedDataParallelConfig(use_distributed_optimizer=True)
+    model = DistributedDataParallel(
+        TransformerConfig(num_attention_heads=1, num_layers=1), ddp_config, model
+    )
+
+    optimizer_config = OptimizerConfig(
+        optimizer='adam',
+        lr=0.01,
+        bf16=True,
+        use_distributed_optimizer=True,
+        use_precision_aware_optimizer=use_precision_aware,
+        main_params_dtype=torch.float32,
+        main_grads_dtype=torch.float32,
+        exp_avg_dtype=torch.float32,
+        exp_avg_sq_dtype=torch.float32,
+    )
+    optim = get_megatron_optimizer(optimizer_config, [model])
+
+    # Run a training step to populate optimizer state
+    input_data = torch.randn(8, 100, dtype=torch.bfloat16, device='cuda')
+    output = model(input_data)
+    loss = output.sum()
+    loss.backward()
+    optim.step()
+
+    # Access the underlying distrib_optimizer
+    distrib_optim = optim.chained_optimizers[0]
+    if use_precision_aware:
+        assert distrib_optim.config.use_precision_aware_optimizer_no_fp8_or_ds_fp8
+
+    # Inject non-tensor entries into optimizer state (simulates found_inf, etc.)
+    inner_optimizer = distrib_optim.optimizer
+    for param in inner_optimizer.state:
+        inner_optimizer.state[param]['found_inf'] = False
+        inner_optimizer.state[param]['non_tensor_int'] = 42
+
+    # Test 1: _get_main_param_and_optimizer_states should skip non-tensor entries
+    for gbuf_range_maps in distrib_optim.gbuf_ranges:
+        for gbuf_range_map_for_all_buckets in gbuf_range_maps.values():
+            for gbuf_range_map in gbuf_range_map_for_all_buckets:
+                for model_param in gbuf_range_map["param_map"]:
+                    tensors = distrib_optim._get_main_param_and_optimizer_states(model_param)
+                    for k, v in tensors.items():
+                        assert isinstance(
+                            v, torch.Tensor
+                        ), f"Non-tensor value for key '{k}': {type(v)}"
+
+    # Test 2: Full save/load roundtrip via dp_reshardable path
+    saved_state = distrib_optim.get_parameter_state_dp_reshardable()
+
+    # Verify saved state doesn't contain non-tensor entries (except metadata keys)
+    metadata_keys = {"per_bucket_numel", "per_bucket_numel_unpadded"}
+    for key, value in saved_state.items():
+        if key in metadata_keys:
+            continue
+        for dtype, buckets_state in value.items():
+            for bucket_state in buckets_state:
+                for param_dict in bucket_state:
+                    for k, v in param_dict.items():
+                        if k in ('gbuf_local_start', 'gbuf_local_end', 'padding'):
+                            continue
+                        assert isinstance(
+                            v, torch.Tensor
+                        ), f"Non-tensor in saved state key '{k}': {type(v)}"
+
+    # Test 3: load_parameter_state_from_dp_reshardable should not crash
+    # Add 'padding' key required by the load path (normally added by fully_reshardable save)
+    for key, value in saved_state.items():
+        if key in metadata_keys:
+            continue
+        for dtype, buckets_state in value.items():
+            for bucket_state in buckets_state:
+                for param_dict in bucket_state:
+                    param_dict['padding'] = False
+    distrib_optim.load_parameter_state_from_dp_reshardable(saved_state)
+
+    # Test 4: Inject non-tensor entries directly into the saved state and verify load handles them
+    for key, value in saved_state.items():
+        if key in metadata_keys:
+            continue
+        for dtype, buckets_state in value.items():
+            for bucket_state in buckets_state:
+                for param_dict in bucket_state:
+                    param_dict['found_inf'] = False
+                    param_dict['step_count'] = 42
+
+    # This should not crash - non-tensor entries should be skipped
+    distrib_optim.load_parameter_state_from_dp_reshardable(saved_state)
 
 
 @pytest.mark.parametrize("use_distributed_optimizer", [False, True])

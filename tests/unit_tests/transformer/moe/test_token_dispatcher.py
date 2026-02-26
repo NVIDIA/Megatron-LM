@@ -7,10 +7,11 @@ import pytest
 import torch
 
 from megatron.core import config, parallel_state
-from megatron.core.models.gpt.gpt_layer_specs import get_gpt_layer_local_spec
+from megatron.core.models.gpt.gpt_layer_specs import get_gpt_layer_local_submodules
 from megatron.core.transformer.moe.moe_layer import MoELayer
 from megatron.core.transformer.moe.moe_utils import get_capacity
 from megatron.core.transformer.transformer_config import TransformerConfig
+from megatron.core.typed_torch import apply_module
 from megatron.core.utils import is_te_min_version
 from megatron.training.initialize import _set_random_seed
 from tests.unit_tests.test_utilities import Utils
@@ -98,15 +99,11 @@ class MoEModelTestContainer:
         self.moe_layer = self.new_moe_layer()
 
     def new_moe_layer(self, **kargs):
-        transformer_layer_spec = get_gpt_layer_local_spec(
+        submodules = get_gpt_layer_local_submodules(
             num_experts=self.config.num_moe_experts, moe_grouped_gemm=self.config.moe_grouped_gemm
         )
         new_config = dataclasses.replace(self.config, **kargs)
-        moe_layer = (
-            MoELayer(new_config, transformer_layer_spec.submodules.mlp.submodules)
-            .cuda()
-            .to(dtype=self.test_dtype)
-        )
+        moe_layer = MoELayer(new_config, submodules.mlp.submodules).cuda().to(dtype=self.test_dtype)
         moe_layer.set_layer_number(0)
         return moe_layer
 
@@ -129,7 +126,7 @@ class MoEModelTestContainer:
         # Permute and then unpermute data are supposed to restore original data
         ans = hidden_states
         hidden_states.requires_grad = True
-        probs, indices = moe_layer.router(hidden_states)
+        probs, indices = apply_module(moe_layer.router)(hidden_states)
         probs = torch.ones_like(probs) / moe_layer.router.topk
 
         (permuted_local_hidden_states, tokens_per_expert, permuted_probs) = token_permutation(
@@ -166,7 +163,7 @@ class MoEModelTestContainer:
         )
         hidden_states = hidden_states.cuda()
         hidden_states.requires_grad = True
-        probs, indices = moe_layer.router(hidden_states)
+        probs, indices = apply_module(moe_layer.router)(hidden_states)
 
         # Create the answer.
         prob_mask = probs != 0
@@ -225,7 +222,7 @@ class MoEModelTestContainer:
         ).cuda()
         hidden_states.requires_grad = True
 
-        probs_1, indices_1 = moe_layer.router(hidden_states)
+        probs_1, indices_1 = apply_module(moe_layer.router)(hidden_states)
         (permuted_input_1, tokens_per_expert, permuted_probs_1) = token_permutation(
             moe_layer.token_dispatcher, hidden_states, probs_1, indices_1
         )
@@ -243,7 +240,7 @@ class MoEModelTestContainer:
         moe_layer_2 = self.new_moe_layer(moe_pad_expert_input_to_capacity=True)
         moe_layer_2.load_state_dict(moe_layer.state_dict())
 
-        probs_2, indices_2 = moe_layer_2.router(hidden_states)
+        probs_2, indices_2 = apply_module(moe_layer_2.router)(hidden_states)
         (permuted_input_2, tokens_per_expert, permuted_probs_2) = token_permutation(
             moe_layer_2.token_dispatcher, hidden_states, probs_2, indices_2
         )
@@ -296,7 +293,7 @@ class MoEModelTestContainer:
         ).cuda()
         hidden_states.requires_grad = True
 
-        probs_1, indices_1 = moe_layer.router(hidden_states)
+        probs_1, indices_1 = apply_module(moe_layer.router)(hidden_states)
         (permuted_input_1, tokens_per_expert_1, permuted_probs_1) = token_permutation(
             moe_layer.token_dispatcher, hidden_states, probs_1, indices_1
         )
@@ -313,7 +310,7 @@ class MoEModelTestContainer:
         moe_layer_2 = self.new_moe_layer(moe_router_padding_for_quantization=True, fp8="hybrid")
         moe_layer_2.load_state_dict(moe_layer.state_dict())
 
-        probs_2, indices_2 = moe_layer_2.router(hidden_states)
+        probs_2, indices_2 = apply_module(moe_layer_2.router)(hidden_states)
         (permuted_input_2, tokens_per_expert_2, permuted_probs_2) = token_permutation(
             moe_layer_2.token_dispatcher, hidden_states, probs_2, indices_2
         )
