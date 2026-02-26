@@ -22,14 +22,14 @@ on:
     branches:
       - dev
       - main
-      - 'pull-request/[0-9]+'
-      - 'deploy-release/*'
+      - "pull-request/[0-9]+"
+      - "deploy-release/*"
   merge_group:
     types: [checks_requested]
 
 jobs:
   pre-flight:
-    uses: NVIDIA-NeMo/FW-CI-templates/.github/workflows/_cicd_preflight.yml@v0.65.5
+    uses: NVIDIA-NeMo/FW-CI-templates/.github/workflows/_cicd_preflight.yml@v0.73.2
     if: github.repository == 'NVIDIA/Megatron-LM'
 
   pip-test-pytorch:
@@ -43,11 +43,10 @@ jobs:
     name: Pip - Python${{ matrix.python-version }} - AMD64/Linux - NGC PyTorch
     container:
       image: nvcr.io/nvidia/pytorch:25.05-py3
-    environment: nemo-ci
     strategy:
       fail-fast: false
       matrix:
-        python-version: ['3.12']
+        python-version: ["3.12"]
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
@@ -89,11 +88,10 @@ jobs:
     name: UV - Python${{ matrix.python-version }} - AMD64/Linux - NGC PyTorch
     container:
       image: nvcr.io/nvidia/pytorch:25.05-py3
-    environment: nemo-ci
     strategy:
       fail-fast: false
       matrix:
-        python-version: ['3.12']
+        python-version: ["3.12"]
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4

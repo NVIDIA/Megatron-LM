@@ -12,10 +12,7 @@ from megatron.core.utils import trace_async_exceptions
 
 from ..__init__ import Request, TypeLookupable
 from ..inference import (
-    ChatInferenceInterface,
-    ChatInferenceRequest,
     InferenceInterface,
-    InferenceRequest,
     LLMChatMessage,
     ReturnsRaw,
 )
@@ -49,7 +46,7 @@ class Rollout(AgentBaseModel):
     trajectory: list[str]
     prompt_length: list[int] | None = None
     reward: float = None
-    env_id: str | None = None
+    env_id: str = ''
     problem_id: str | None = None
 
 
@@ -60,7 +57,7 @@ class TokenRollout(AgentBaseModel):
     reward: list[float] | float
     generation_mask: list[list[bool]] | None = None
     logprobs: list[list[float]] | None = None
-    env_id: str | None = None
+    env_id: str = ''
     problem_id: str | None = None
 
 
@@ -102,7 +99,7 @@ T = TypeVar('T', bound=EvaluationResult)
 
 
 class EvaluationResponse(AgentBaseModel, TypeLookupable, Generic[T]):
-    env_id: str | None = None
+    env_id: str
     results: list[T]
 
     def metrics(self):
@@ -123,11 +120,6 @@ class RolloutGenerator(Agent, ABC):
         assert isinstance(
             request.inference_interface, ReturnsRaw
         ), "InferenceInterface must support raw_text return to provide rollouts."
-
-        if isinstance(request.inference_interface, ChatInferenceInterface):
-            self.chat_mode = True
-        else:
-            self.chat_mode = False
 
         return await asyncio.gather(
             *[self.rollout(request=request) for _ in range(request.num_rollouts)]
@@ -158,11 +150,6 @@ class TokenizedRolloutGenerator(Agent, ABC):
             request.inference_interface, ReturnsRaw
         ), "InferenceInterface must support raw_text return to provide rollouts."
 
-        if isinstance(request.inference_interface, ChatInferenceInterface):
-            self.chat_mode = True
-        else:
-            self.chat_mode = False
-
         return await asyncio.gather(
             *[self.rollout(request=request) for _ in range(request.num_rollouts)]
         )
@@ -186,11 +173,6 @@ class GroupedRolloutGenerator(Agent, ABC):
         assert isinstance(
             request.inference_interface, ReturnsRaw
         ), "InferenceInterface must support raw_text return to provide rollouts."
-
-        if isinstance(request.inference_interface, ChatInferenceInterface):
-            self.chat_mode = True
-        else:
-            self.chat_mode = False
 
         # If num_groups is -1, we generate a stream of groups.
         # The buffer size is used to create backpressure for each agent in order to balance group generation in a multi-task setting.
