@@ -140,6 +140,12 @@ class MambaModel(LanguageModule):
         if (hybrid_attention_ratio is not None and hybrid_attention_ratio > 0.0) or (
             hybrid_mlp_ratio is not None and hybrid_mlp_ratio > 0.0
         ):
+            if hybrid_layer_pattern is not None:
+                raise ValueError(
+                    "hybrid_layer_pattern cannot be used together with "
+                    "hybrid_attention_ratio or hybrid_mlp_ratio. "
+                    "These ratios have been deprecated; use hybrid_layer_pattern alone."
+                )
             log_single_rank(
                 logger,
                 logging.WARNING,
