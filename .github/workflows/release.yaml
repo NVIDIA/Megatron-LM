@@ -44,6 +44,11 @@ on:
         description: Branch for version bump
         required: true
         type: string
+      gh-release-from-tag:
+        description: Tag of previous release for changelog builder
+        required: false
+        type: string
+        default: ""
 
 permissions:
   contents: write # To read repository content
@@ -59,6 +64,7 @@ jobs:
       create-gh-release: ${{ inputs.create-gh-release || true }}
       gh-release-use-changelog-builder: ${{ inputs.generate-changelog }}
       publish-docs: ${{ inputs.publish-docs }}
+      gh-release-from-tag: ${{ inputs.gh-release-from-tag }}
     secrets:
       TWINE_PASSWORD: ${{ (github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/heads/r')) && secrets.SVC_PYPI_TOKEN || secrets.SVC_PYPI_TEST_TOKEN }}
       SLACK_WEBHOOK: ${{ (github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/heads/r')) && secrets.SLACK_MAIN_CHANNEL_WEBHOOK || secrets.SLACK_CI_CHANNEL_WEBHOOK }}
