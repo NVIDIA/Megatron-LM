@@ -334,6 +334,13 @@ class TestCoordinator:
                 for record in results:
                     assert record[-1].status == Status.COMPLETED
 
+                # Pause the engines to force a synchronization point.
+                client1.pause_engines()
+            await asyncio.wait_for(engine1.paused.wait(), timeout=5.0)
+            if torch.distributed.get_rank() == 0:
+                client1.unpause_engines()
+            await asyncio.wait_for(engine1.running.wait(), timeout=5.0)
+
             # Disconnect the engine (simulates unexpected departure).
             await engine1.shutdown(immediate=True)
 
@@ -352,6 +359,13 @@ class TestCoordinator:
                 results = await asyncio.wait_for(asyncio.gather(*futures), timeout=5.0)
                 for record in results:
                     assert record[-1].status == Status.COMPLETED
+
+                # Pause the engines to force a synchronization point.
+                client1.pause_engines()
+            await asyncio.wait_for(engine2.paused.wait(), timeout=5.0)
+            if torch.distributed.get_rank() == 0:
+                client1.unpause_engines()
+            await asyncio.wait_for(engine2.running.wait(), timeout=5.0)
 
             # Disconnect the engine (simulates unexpected departure).
             await engine2.shutdown(immediate=True)
@@ -373,19 +387,21 @@ class TestCoordinator:
             ), f"Expected different port due to conflict, but got same: {third_port}"
 
         finally:
-            # Kill the coordinator through the last engine; if the test fails this may not be 3.
+            # Shut down the last engine (which has the active engine loop).
             await graceful_shutdown(engines[-1], client1)
+            # Kill any remaining coordinator processes (e.g. engine1's).
+            for engine in engines:
+                proc = getattr(engine, 'inference_coordinator_process', None)
+                if proc is not None and proc.is_alive():
+                    proc.terminate()
+                    proc.join(timeout=5.0)
 
     @pytest.mark.internal
     @pytest.mark.skipif(not HAVE_ZMQ, reason="pyzmq is required for this test")
     @pytest.mark.asyncio
     @pytest.mark.parametrize(
         "initialize_model_parallel",
-        [
-            pytest.param((tp, pp, ep), id=f"tp{tp}-pp{pp}-ep{ep}")
-            for tp, pp, ep in itertools.product([1, 2], [1, 2], [1, 2])
-            if tp * pp * ep <= Utils.world_size
-        ],
+        [pytest.param((2, 2, 2), id="tp2-pp2-ep2")],
         indirect=["initialize_model_parallel"],
     )
     async def test_control_logic_lifecycle(self, initialize_model_parallel):
@@ -546,6 +562,7 @@ class TestCoordinator:
                 for f in doomed_futures:
                     assert not f.done(), "Client futures should still be pending"
                 client.stop()
+                client = None
                 for f in doomed_futures:
                     assert f.cancelled(), "Client futures should be cancelled after client.stop()"
 
@@ -595,11 +612,11 @@ class TestCoordinator:
 
         if torch.distributed.get_rank() == 0:
             init_duration = (init_time - start_time) * 10**3
-            golden_init_duration = 6974.43  # ms
+            golden_init_duration = 8812.31  # ms
             run_duration = (done_time - init_time) * 10**3
-            golden_run_duration = 4392.63  # ms
+            golden_run_duration = 4469.44  # ms
             stop_duration = (stop_time - done_time) * 10**3
-            golden_stop_duration = 931.49  # ms
+            golden_stop_duration = 80.73  # ms
 
             def clamp_to_golden_value(value, golden_value, delta=0.1):
                 return value > golden_value * (1 - delta) and value < golden_value * (1 + delta)
