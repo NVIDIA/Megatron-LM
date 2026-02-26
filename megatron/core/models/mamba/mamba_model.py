@@ -110,6 +110,14 @@ class MambaModel(LanguageModule):
         if has_config_logger_enabled(config):
             log_config_to_disk(config, locals(), prefix=type(self).__name__)
 
+        if self.config.use_mup and not getattr(MambaModel, "mup_warning_printed", False):
+            log_single_rank(
+                logger,
+                logging.WARNING,
+                "MuP for MambaModel is experimental and not fully validated yet.",
+            )
+            MambaModel.mup_warning_printed = True
+
         self.mamba_stack_spec: ModuleSpec = mamba_stack_spec
         self.vocab_size = vocab_size
         self.max_sequence_length = max_sequence_length
@@ -251,7 +259,11 @@ class MambaModel(LanguageModule):
                 config.hidden_size,
                 self.vocab_size,
                 config=config,
-                init_method=config.init_method,
+                init_method=(
+                    config.embedding_init_method
+                    if config.use_mup and not self.share_embeddings_and_output_weights
+                    else config.init_method
+                ),
                 bias=False,
                 skip_bias_add=False,
                 gather_output=not self.parallel_output,
@@ -402,6 +414,7 @@ class MambaModel(LanguageModule):
                 config=self.config,
                 cp_group=self.pg_collection.cp,
                 packed_seq_params=packed_seq_params,
+                scale_logits_fn=self._scale_logits if self.config.use_mup else None,
             )
 
         sequence_parallel_override = False
@@ -429,6 +442,7 @@ class MambaModel(LanguageModule):
         logits, _ = self.output_layer(
             hidden_states, weight=output_weight, runtime_gather_output=runtime_gather_output
         )
+        logits = self._scale_logits(logits)
 
         # Restore sequence parallel execution to the output layer if necessary.
         if sequence_parallel_override:
