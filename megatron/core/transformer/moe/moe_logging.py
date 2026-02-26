@@ -146,12 +146,19 @@ class MoEMetricsTracker:
         """
         names_list = self._resolve_names(names)
 
-        # Force initialize metrics if needed
+        # Force initialize metrics if needed.
+        # The values tensor size must match what the router creates in record(),
+        # which uses (num_layers + mtp_num_layers). This is important for PP ranks that have no
+        # MoE layers (so the tracker is empty and force_initialize creates the entry); their tensor
+        # size must match ranks that do have MoE layers, otherwise all_reduce across PP will hang.
         if force_initialize and names_list is not None:
             if num_layers is None:
                 raise ValueError("num_layers must be provided when force_initialize=True.")
+            tracker_num_layers = num_layers
+            if mtp_num_layers is not None:
+                tracker_num_layers += mtp_num_layers
             for name in names_list:
-                self.initialize_metric(name, num_layers)
+                self.initialize_metric(name, tracker_num_layers)
 
         # Reduce metrics across ranks
         self._reduce_across_ranks(names_list, pg_collection=pg_collection)
