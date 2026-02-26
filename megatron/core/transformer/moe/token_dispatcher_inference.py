@@ -73,9 +73,9 @@ class InferenceAllGatherTokenDispatcher(MoEAllGatherTokenDispatcher):
         Check if we can use NVLS (latency-optimized) collectives.
         Requirements: BF16 dtype, Hopper+ GPU (SM >= 9).
         """
-        is_bf16 = x.dtype == torch.bfloat16
         is_hopper_or_newer = torch.cuda.get_device_properties(x.device).major >= 9
-        return is_bf16 and is_hopper_or_newer
+        num_bytes = x.element_size() * x.numel()
+        return is_hopper_or_newer and num_bytes % 16 == 0
 
     def _maybe_allocate_ag_buffers(
         self,
@@ -141,9 +141,9 @@ class InferenceAllGatherTokenDispatcher(MoEAllGatherTokenDispatcher):
         """
         if self.ep_size == 1:
             return hidden_states, probs
-
+        
         # Check NVLS eligibility
-        nvls_eligible = self._check_nvls_eligibility(hidden_states)
+        nvls_eligible = self._check_nvls_eligibility(hidden_states) and self._check_nvls_eligibility(probs) and self._check_nvls_eligibility(self.routing_map)
         ag_buffers = None
 
         if nvls_eligible:
