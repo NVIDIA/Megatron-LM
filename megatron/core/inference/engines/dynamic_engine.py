@@ -895,9 +895,7 @@ class DynamicInferenceEngine(AbstractEngine):
         if self.track_generated_token_events:
             blocks_allocated = block_allocator.total_count - block_allocator.total_avail
             if block_allocator.enable_prefix_caching:
-                blocks_hashed_active = int(
-                    (block_allocator.block_ref_counts > 0).sum().item()
-                )
+                blocks_hashed_active = int((block_allocator.block_ref_counts > 0).sum().item())
                 blocks_ref_count = block_allocator.block_ref_counts.sum().item()
             else:
                 blocks_hashed_active = blocks_allocated
@@ -1231,12 +1229,15 @@ class DynamicInferenceEngine(AbstractEngine):
             if prefix_caching_enabled and not is_continuing_chunked_prefill:
                 has_pending_hash = False
                 for block_hash in req.precomputed_block_hashes:
+                    # pylint: disable-next=possibly-used-before-assignment
                     if block_hash in pending_block_hashes:
                         has_pending_hash = True
                         break
                 if has_pending_hash:
                     self._prefix_coordination_waits += 1
-                    pending_request_ids.append(self.waiting_request_ids.popleft())
+                    pending_request_ids.append(  # pylint: disable=possibly-used-before-assignment
+                        self.waiting_request_ids.popleft()
+                    )
                     continue
 
             # Use remaining prompt tokens for scheduling decisions
@@ -1467,7 +1468,9 @@ class DynamicInferenceEngine(AbstractEngine):
             # Prepare metrics dictionary with all stats
             # Use 'inference/' prefix for all metrics to separate from training metrics
             metrics = {
-                'inference/inference_step': int(self.inference_step_offset + int(self.context.step_count)),
+                'inference/inference_step': int(
+                    self.inference_step_offset + int(self.context.step_count)
+                ),
                 'inference/step_time_s': float(step_time),
                 'inference/waiting_queue_len': int(len(self.waiting_request_ids)),
                 'inference/total_requests_dict_size': int(len(self.requests)),
@@ -1487,7 +1490,10 @@ class DynamicInferenceEngine(AbstractEngine):
                 raise ValueError(f"Unsupported metrics writer type: {type(self.metrics_writer)}")
 
         # Print context state.
-        if self.logging_step_interval > 0 and self.context.step_count % self.logging_step_interval == 0:
+        if (
+            self.logging_step_interval > 0
+            and self.context.step_count % self.logging_step_interval == 0
+        ):
             mem = torch.cuda.memory_stats()
             step_type = "decode" if context_state["is_decode_only"] else "non-decode"
             output_str = (

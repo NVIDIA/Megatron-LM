@@ -585,9 +585,9 @@ class TestPrefillSkipping(PrefixCachingTestBase):
 
         added_by_b = ctx.active_token_count - tokens_after_a
         # B should skip 3*bs matched tokens but keep at least 1, so it adds trailing tokens only
-        assert added_by_b == trailing, (
-            f"Expected {trailing} tokens added (trailing only), got {added_by_b}"
-        )
+        assert (
+            added_by_b == trailing
+        ), f"Expected {trailing} tokens added (trailing only), got {added_by_b}"
         # query length should also reflect the reduced count
         assert ctx.request_query_lengths[1].item() == trailing
 

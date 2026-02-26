@@ -1523,9 +1523,7 @@ class DynamicInferenceContext(BaseInferenceContext):
                       prefix_skip_tokens, effective_chunk_length).
         """
         finished = req.finished_chunk_token_count
-        already_allocated_blocks = (
-            finished + self.block_size_tokens - 1
-        ) // self.block_size_tokens
+        already_allocated_blocks = (finished + self.block_size_tokens - 1) // self.block_size_tokens
         overall_required_blocks = (
             finished + chunk_length + self.block_size_tokens - 1
         ) // self.block_size_tokens
@@ -1533,18 +1531,23 @@ class DynamicInferenceContext(BaseInferenceContext):
         # Fast path: skip all prefix matching when disabled.
         if not self.enable_prefix_caching:
             num_blocks_from_pool = max(0, overall_required_blocks - already_allocated_blocks)
-            return [], num_blocks_from_pool, already_allocated_blocks, overall_required_blocks, 0, chunk_length
+            return (
+                [],
+                num_blocks_from_pool,
+                already_allocated_blocks,
+                overall_required_blocks,
+                0,
+                chunk_length,
+            )
 
         matched_block_ids, _ = self._find_matching_prefix_blocks(
             req, already_allocated_blocks, overall_required_blocks
         )
         num_matched = len(matched_block_ids)
 
-        block_aligned = (finished % self.block_size_tokens == 0)
+        block_aligned = finished % self.block_size_tokens == 0
         if num_matched > 0 and block_aligned:
-            prefix_skip_tokens = min(
-                num_matched * self.block_size_tokens, chunk_length - 1
-            )
+            prefix_skip_tokens = min(num_matched * self.block_size_tokens, chunk_length - 1)
         else:
             prefix_skip_tokens = 0
 
@@ -1572,9 +1575,9 @@ class DynamicInferenceContext(BaseInferenceContext):
             self.total_request_count < self.max_requests and self.paused_request_count == 0
         )
 
-        (
-            _, num_blocks_from_pool, _, _, _, effective_chunk_length,
-        ) = self._compute_prefix_match(req, req.remaining_prompt_length)
+        (_, num_blocks_from_pool, _, _, _, effective_chunk_length) = self._compute_prefix_match(
+            req, req.remaining_prompt_length
+        )
 
         request_tokens_can_be_added = (
             self.active_token_count + effective_chunk_length <= self.max_tokens
@@ -1744,7 +1747,9 @@ class DynamicInferenceContext(BaseInferenceContext):
         match_start = already_allocated_blocks
         new_block_start = already_allocated_blocks + num_matched_blocks
         if num_matched_blocks > 0:
-            self.request_to_kv_block_ids[current_id][match_start:match_start + num_matched_blocks] = matched_tensor
+            self.request_to_kv_block_ids[current_id][
+                match_start : match_start + num_matched_blocks
+            ] = matched_tensor
         if new_block_ids is not None:
             self.request_to_kv_block_ids[current_id][
                 new_block_start : new_block_start + len(new_block_ids)
@@ -1797,13 +1802,9 @@ class DynamicInferenceContext(BaseInferenceContext):
             def _register_range(start: int, end: int):
                 if start >= end:
                     return
-                block_ids_to_hash = self.request_to_kv_block_ids[current_id][
-                    start:end
-                ].tolist()
+                block_ids_to_hash = self.request_to_kv_block_ids[current_id][start:end].tolist()
                 block_hashes_slice = req.precomputed_block_hashes[start:end]
-                self.block_allocator.register_block_hashes(
-                    block_ids_to_hash, block_hashes_slice
-                )
+                self.block_allocator.register_block_hashes(block_ids_to_hash, block_hashes_slice)
 
             # Range 1: prior-chunk partial block that this chunk just completed
             _register_range(previously_complete, min(already_allocated_blocks, num_complete_blocks))

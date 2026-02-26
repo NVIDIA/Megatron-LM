@@ -227,12 +227,8 @@ class BlockAllocator:
         """
         if not block_ids:
             return
-        id_tensor = torch.tensor(
-            block_ids, dtype=torch.int64, device=self.block_hashes.device
-        )
-        hash_tensor = torch.tensor(
-            block_hashes, dtype=torch.int64, device=self.block_hashes.device
-        )
+        id_tensor = torch.tensor(block_ids, dtype=torch.int64, device=self.block_hashes.device)
+        hash_tensor = torch.tensor(block_hashes, dtype=torch.int64, device=self.block_hashes.device)
         self.block_hashes[id_tensor] = hash_tensor
         self.hash_to_block_id.update(zip(block_hashes, block_ids))
 
@@ -254,7 +250,9 @@ class BlockAllocator:
 
         # Remove from hash_to_block_id dict (set ops + C-level map, no Python loop)
         keys_to_delete = set(hashes) - {-1}
-        deque(map(self.hash_to_block_id.pop, keys_to_delete & self.hash_to_block_id.keys()), maxlen=0)
+        deque(
+            map(self.hash_to_block_id.pop, keys_to_delete & self.hash_to_block_id.keys()), maxlen=0
+        )
 
         # Reset block state (batched tensor ops)
         self.block_hashes[block_ids] = -1

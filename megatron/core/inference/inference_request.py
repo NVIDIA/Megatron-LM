@@ -70,9 +70,7 @@ HASH_BASE = 31
 _hash_powers: Optional[torch.Tensor] = None
 
 
-def compute_block_hashes_batched(
-    prompt_tokens: torch.Tensor, block_size: int
-) -> List[int]:
+def compute_block_hashes_batched(prompt_tokens: torch.Tensor, block_size: int) -> List[int]:
     """Compute hashes for all complete blocks in a prompt in one batched operation.
 
     Reshapes prompt tokens into [num_blocks, block_size], computes all per-block
