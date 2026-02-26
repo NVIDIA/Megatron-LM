@@ -262,7 +262,10 @@ def forward_step_calc_loss(
                 if not config.calculate_per_token_loss:
                     # Protect against division by zero when all tokens are masked
                     #   in a microbatch.
-                    output_tensor /= torch.clamp(num_tokens, min=1)
+                    # output_tensor /= torch.clamp(num_tokens, min=1)
+                    this_dp_rank_num_token = torch.distributed.allreduce(num_tokens, group=parallel_state.get_context_parallel_group())
+                    output_tensor /= total_num_tokens
+                    output_tensor *= mpu.get_context_parallel_size()
                     output_tensor /= num_microbatches
             else:
                 # preserve legacy loss averaging behavior (ie, over the number of microbatches)
