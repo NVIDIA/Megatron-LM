@@ -1767,32 +1767,42 @@ class DynamicInferenceEngine(AbstractEngine):
         except asyncio.CancelledError:
             pass
 
-    async def _ep_group_has_work(self, local_work: int) -> int:
-        """All-reduce max of local work counts across the EP group.
+    async def _ep_establish_consensus(
+        self, local_work: int, signal_consensus: bool
+    ) -> tuple[int, bool]:
+        """EP all-reduce to share work counts and pause consensus.
 
-        The caller is responsible for passing the right value based on engine state:
-        - RUNNING: pass actual local_pending count (>= 0)
-        - PAUSING: pass -1 (this rank wants to stop stepping)
+        All-reduces two integers at once:
+        - local_work: actual pending request count (always >= 0).
+        - consensus flag: -1 if this rank wants to pause, 0 otherwise.
 
-        Returns the global max. Callers interpret the result:
-        - > 0: at least one EP peer has work (step or dummy forward)
-        - == 0: all RUNNING peers are idle (no step needed)
-        - == -1: all EP peers are PAUSING (consensus reached)
+        Using max for both:
+        - max(work) > 0 means at least one EP peer has real work.
+        - max(consensus) == -1 means ALL peers signaled -1 (all PAUSING).
+          Any RUNNING peer contributes 0, pulling the max to 0.
 
         Args:
-            local_work (int): The local work count for this rank, or -1 if PAUSING.
+            local_work: Pending request count for this rank.
+            signal_consensus: True if this rank is ready to pause.
         Returns:
-            int: The max work count across the EP group.
+            (global_work, all_pausing): max work across EP, and whether
+            all peers signaled consensus.
         """
-        range_push("_ep_group_has_work")
+        range_push("_ep_establish_consensus")
+
+        consensus_val = -1 if signal_consensus else 0
 
         if self.ep_world_size > 1:
-            max_global_work = await self.expert_parallel_zmq_communicator.all_reduce_max(local_work)
+            global_work, global_consensus = (
+                await self.expert_parallel_zmq_communicator.all_reduce_max_pair(
+                    local_work, consensus_val
+                )
+            )
         else:
-            max_global_work = local_work
+            global_work, global_consensus = local_work, consensus_val
 
         range_pop()
-        return max_global_work
+        return global_work, global_consensus == -1
 
     async def _world_barrier(self):
         """World-wide ZMQ all-reduce barrier for global rank consensus.
@@ -1832,12 +1842,13 @@ class DynamicInferenceEngine(AbstractEngine):
                     local_pending = self.context.get_active_request_count() + len(
                         self.waiting_request_ids
                     )
-                    ep_report = local_pending if self.state == EngineState.RUNNING else -1
-                    ep_work = await self._ep_group_has_work(ep_report)
+                    global_work, all_pausing = await self._ep_establish_consensus(
+                        local_pending, signal_consensus=(self.state == EngineState.PAUSING)
+                    )
 
-                    if ep_work > 0:
-                        # At least one EP peer has work.
-                        if local_pending > 0 and self.state == EngineState.RUNNING:
+                    if global_work > 0:
+                        # At least one EP peer has work — all must participate.
+                        if local_pending > 0:
                             await self.async_step()
                         else:
                             # Dummy forward to participate in the EP collective.
@@ -1846,13 +1857,13 @@ class DynamicInferenceEngine(AbstractEngine):
                             self.step_end_event.record()
                             self.step_end_event.synchronize()
                             self.step_count += 1
-                    elif ep_work == -1:
-                        # All EP peers are PAUSING.
+                    elif all_pausing:
+                        # All EP peers are PAUSING with no work — consensus.
                         await self._world_barrier()
                         self.state = EngineState.PAUSED
                         self.paused.set()
                     else:
-                        # All EP peers have 0 work.
+                        # No work, but not all pausing — idle.
                         await asyncio.sleep(0.02)
 
                 elif self.state == EngineState.PAUSED:

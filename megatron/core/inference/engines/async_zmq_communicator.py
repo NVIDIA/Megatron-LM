@@ -102,6 +102,42 @@ class AsyncZMQCommunicator:
                 except zmq.Again:
                     await asyncio.sleep(0.001)  # Yield to event loop
 
+    async def all_reduce_max_pair(self, val_a: int, val_b: int) -> tuple[int, int]:
+        """Element-wise all-reduce max of two integers.
+
+        Packs both values into a single message so the communication cost
+        is identical to a single-integer all-reduce.
+        """
+        if self.world_size <= 1:
+            return val_a, val_b
+
+        payload = struct.pack('!ii', val_a, val_b)
+
+        if self.is_leader:
+            pairs = [(val_a, val_b)]
+
+            while len(pairs) < self.world_size:
+                try:
+                    msg = self.gather_sock.recv(flags=zmq.NOBLOCK)
+                    pairs.append(struct.unpack('!ii', msg))
+                except zmq.Again:
+                    await asyncio.sleep(0.001)
+
+            max_a = max(p[0] for p in pairs)
+            max_b = max(p[1] for p in pairs)
+            self.bcast_sock.send(struct.pack('!ii', max_a, max_b))
+            return max_a, max_b
+
+        else:
+            self.gather_sock.send(payload)
+
+            while True:
+                try:
+                    msg = self.bcast_sock.recv(flags=zmq.NOBLOCK)
+                    return struct.unpack('!ii', msg)
+                except zmq.Again:
+                    await asyncio.sleep(0.001)
+
     def close(self):
         """
         Close the ZMQ sockets.
