@@ -206,24 +206,30 @@ async def graceful_shutdown(engine, client=None, *, timeout=30.0):
         timeout: Per-stage timeout in seconds.
     """
     # Stage 1: coordinator-driven shutdown.
-    if client is not None:
-        try:
+    # Rank 0 (has client): drives PAUSE → STOP through the coordinator.
+    # Non-rank-0 (no client): waits for the coordinator-driven STOP to
+    # propagate. Must NOT use shutdown(immediate=True) here — that cancels
+    # the engine task and destroys ZMQ sockets, killing the world barriers
+    # that rank 0's coordinator-driven path depends on.
+    try:
+        if client is not None:
             client.pause_engines()
             await asyncio.wait_for(engine.paused.wait(), timeout=timeout)
             client.stop_engines()
-            await asyncio.wait_for(engine.stopped.wait(), timeout=timeout)
-            # Reap the coordinator process (it exited after broadcasting STOP).
-            proc = getattr(engine, 'inference_coordinator_process', None)
-            if proc is not None:
-                proc.join(timeout=timeout)
-                if proc.is_alive():
-                    raise RuntimeError("Coordinator process did not exit")
+        await asyncio.wait_for(engine.stopped.wait(), timeout=timeout)
+        # Reap the coordinator process (it exited after broadcasting STOP).
+        proc = getattr(engine, 'inference_coordinator_process', None)
+        if proc is not None:
+            proc.join(timeout=timeout)
+            if proc.is_alive():
+                raise RuntimeError("Coordinator process did not exit")
+        if client is not None:
             client.stop()
-            return
-        except Exception:
-            pass
+        return
+    except Exception:
+        pass
 
-    # Stage 2: immediate shutdown (synthetic signals, no coordinator).
+    # Stage 2: immediate shutdown (cancel task, no collectives).
     try:
         await asyncio.wait_for(engine.shutdown(immediate=True), timeout=timeout)
     except asyncio.TimeoutError:
