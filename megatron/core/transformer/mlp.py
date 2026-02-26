@@ -1,10 +1,12 @@
 # Copyright (c) 2024, NVIDIA CORPORATION. All rights reserved.
+from __future__ import annotations
 
 import gc
 import logging
 import warnings
+from collections.abc import Callable
 from dataclasses import dataclass
-from typing import Optional, Union
+from typing import Optional, Protocol, cast
 
 import numpy as np
 import torch
@@ -24,8 +26,8 @@ from megatron.core.fusions.fused_bias_geglu import (
 from megatron.core.fusions.fused_bias_gelu import bias_gelu_impl
 from megatron.core.fusions.fused_bias_swiglu import bias_swiglu_impl, weighted_bias_swiglu_impl
 from megatron.core.transformer.module import MegatronModule
-from megatron.core.transformer.spec_utils import ModuleSpec, build_module
 from megatron.core.transformer.transformer_config import TransformerConfig
+from megatron.core.typed_torch import apply_module, not_none
 from megatron.core.utils import (
     get_tensor_model_parallel_group_if_none,
     nvtx_range_pop,
@@ -43,7 +45,91 @@ except ImportError:
 logger = logging.getLogger(__name__)
 
 
-# pylint: disable=missing-class-docstring
+class LinearFc1Interface(Protocol):
+    """Interface for linear_fc1 module in MLP."""
+
+    def forward(self, hidden_states: torch.Tensor, /) -> tuple[torch.Tensor, torch.Tensor | None]:
+        """Forward method for linear_fc1 module."""
+        ...
+
+    def backward_dw(self) -> None:
+        """Backward method for linear_fc1 module."""
+        ...
+
+
+class LinearFc1Builder(Protocol):
+    """Protocol describing how to build a linear_fc1 layer in MLP."""
+
+    def __call__(
+        self,
+        input_size: int,
+        output_size: int,
+        /,
+        *,
+        config: TransformerConfig,
+        init_method: Callable[[torch.Tensor], None],
+        gather_output: bool,
+        bias: bool,
+        skip_bias_add: bool,
+        is_expert: bool,
+        tp_comm_buffer_name: str | None,
+        tp_group: torch.distributed.ProcessGroup | None,
+        stride: int = 1,
+    ) -> LinearFc1Interface:
+        """Builds a linear_fc1 layer for MLP."""
+        ...
+
+
+class TEActivationFunctionInterface(Protocol):
+    """Interface for activation_function module in MLP."""
+
+    def forward(self, input_: torch.Tensor, /) -> torch.Tensor:
+        """Forward method for activation_function module."""
+        ...
+
+
+class TEActivationFunctionBuilder(Protocol):
+    """Protocol for activation_function module in MLP."""
+
+    def __call__(self, *, config: TransformerConfig) -> TEActivationFunctionInterface:
+        """Builds an activation function module for MLP."""
+        ...
+
+
+class LinearFc2Interface(Protocol):
+    """Interface for linear_fc2 module in MLP."""
+
+    def forward(self, hidden_states: torch.Tensor, /) -> tuple[torch.Tensor, torch.Tensor | None]:
+        """Forward method for linear_fc2 module."""
+        ...
+
+    def backward_dw(self) -> None:
+        """Backward method for linear_fc2 module."""
+        ...
+
+
+class LinearFc2Builder(Protocol):
+    """Protocol describing how to build a linear_fc2 layer in MLP."""
+
+    def __call__(
+        self,
+        input_size: int,
+        output_size: int,
+        /,
+        *,
+        config: TransformerConfig,
+        init_method: Callable[[torch.Tensor], None],
+        bias: bool,
+        input_is_parallel: bool,
+        skip_bias_add: bool,
+        is_expert: bool,
+        tp_comm_buffer_name: str | None,
+        tp_group: torch.distributed.ProcessGroup | None,
+    ) -> LinearFc2Interface:
+        """Builds a linear_fc2 layer for MLP."""
+        ...
+
+
 @dataclass
 class MLPSubmodules:
     """
@@ -51,9 +137,14 @@ class MLPSubmodules:
     including  linear fc1, activation function, linear fc2.
     """
 
-    linear_fc1: Union[ModuleSpec, type] = None
-    activation_func: Union[ModuleSpec, type] = None
-    linear_fc2: Union[ModuleSpec, type] = None
+    linear_fc1: LinearFc1Builder
+
+    linear_fc2: LinearFc2Builder
+
+    activation_func: TEActivationFunctionBuilder | None = None
+    """
+    Builder for an activation function module; only used if config.use_te_activation_func is True.
+    """
 
 
 class MLP(MegatronModule):
@@ -98,7 +189,7 @@ class MLP(MegatronModule):
                 DeprecationWarning,
                 stacklevel=2,
             )
-            ffn_hidden_size = self.config.ffn_hidden_size
+            ffn_hidden_size = not_none(self.config.ffn_hidden_size)
 
         # If this is a gated linear unit we double the output width
         # see https://arxiv.org/pdf/2002.05202.pdf
@@ -118,12 +209,11 @@ class MLP(MegatronModule):
         # shared_experts.
         use_latent_size = (self.config.moe_latent_size is not None) and is_expert
 
-        self.linear_fc1 = build_module(
-            submodules.linear_fc1,
-            self.input_size if not use_latent_size else self.config.moe_latent_size,
+        self.linear_fc1 = submodules.linear_fc1(
+            self.input_size if not use_latent_size else not_none(self.config.moe_latent_size),
             ffn_hidden_size,
             config=self.config,
-            init_method=self.config.init_method,
+            init_method=not_none(self.config.init_method),
             gather_output=False,
             bias=self.config.add_bias_linear,
             skip_bias_add=True,
@@ -134,16 +224,17 @@ class MLP(MegatronModule):
         )
 
         if self.config.use_te_activation_func and not (submodules.activation_func is None):
-            self.activation_func = build_module(submodules.activation_func, config=self.config)
+            self.activation_func = apply_module(submodules.activation_func(config=self.config))
         else:
             self.activation_func = self.config.activation_func
 
-        self.linear_fc2 = build_module(
-            submodules.linear_fc2,
-            self.config.ffn_hidden_size,
-            self.config.hidden_size if not use_latent_size else self.config.moe_latent_size,
+        self.linear_fc2 = submodules.linear_fc2(
+            not_none(self.config.ffn_hidden_size),
+            not_none(
+                self.config.hidden_size if not use_latent_size else self.config.moe_latent_size
+            ),
             config=self.config,
-            init_method=self.config.output_layer_init_method,
+            init_method=not_none(self.config.output_layer_init_method),
             bias=self.config.add_bias_linear,
             input_is_parallel=True,
             skip_bias_add=True,
@@ -152,11 +243,13 @@ class MLP(MegatronModule):
             tp_group=tp_group,
         )
 
-    def forward(self, hidden_states, per_token_scale=None, **kwargs):
+    def forward(
+        self, hidden_states: torch.Tensor, per_token_scale: torch.Tensor | None = None, **kwargs
+    ):
         """Perform the forward pass through the MLP block."""
         # [s, b, 4 * h/p]
         nvtx_range_push(suffix="linear_fc1")
-        intermediate_parallel, bias_parallel = self.linear_fc1(hidden_states)
+        intermediate_parallel, bias_parallel = apply_module(self.linear_fc1)(hidden_states)
         nvtx_range_pop(suffix="linear_fc1")
 
         nvtx_range_push(suffix="activation")
@@ -238,7 +331,9 @@ class MLP(MegatronModule):
         # [s, b, h]
         nvtx_range_push(suffix="linear_fc2")
 
-        output, output_bias = self.linear_fc2(intermediate_parallel)
+        output, output_bias = apply_module(self.linear_fc2)(
+            cast(torch.Tensor, intermediate_parallel)
+        )
         nvtx_range_pop(suffix="linear_fc2")
 
         if per_token_scale is not None and output_bias is not None:

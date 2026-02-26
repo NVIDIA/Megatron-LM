@@ -1,11 +1,12 @@
 # Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+from __future__ import annotations
 
 import functools
 import logging
 import warnings
 from abc import ABC
 from dataclasses import dataclass, field
-from typing import Any, Dict, Optional, Union
+from typing import TYPE_CHECKING, Any, Dict, Optional, Union
 
 import torch
 import torch.distributed
@@ -22,7 +23,9 @@ from megatron.core.transformer.identity_op import IdentityFuncOp, IdentityOp
 from megatron.core.transformer.mlp import MLP
 from megatron.core.transformer.module import GraphableMegatronModule
 from megatron.core.transformer.spec_utils import ModuleSpec, build_module
+from megatron.core.transformer.torch_norm import LayerNormBuilder
 from megatron.core.transformer.transformer_config import TransformerConfig
+from megatron.core.typed_torch import apply_module, copy_signature
 from megatron.core.utils import (
     deprecate_inference_params,
     get_pg_rank,
@@ -33,6 +36,9 @@ from megatron.core.utils import (
     nvtx_range_pop,
     nvtx_range_push,
 )
+
+if TYPE_CHECKING:
+    from megatron.core.inference.contexts import BaseInferenceContext
 
 logger = logging.getLogger(__name__)
 
@@ -204,16 +210,16 @@ class TransformerLayerSubmodules:
     of the layer's architecture.
 
     Args:
-        input_layernorm (Union[ModuleSpec, type]): Specification for the input layer normalization.
+        input_layernorm: Specification for the input layer normalization.
         self_attention (Union[ModuleSpec, type]): Specification for the self-attention mechanism.
         self_attn_bda (Union[ModuleSpec, type]): Specification for the bias-dropout-add operation
             after self-attention.
-        pre_cross_attn_layernorm (Union[ModuleSpec, type]): Specification for the layer
+        pre_cross_attn_layernorm: Specification for the layer
             normalization before cross-attention.
         cross_attention (Union[ModuleSpec, type]): Specification for the cross-attention mechanism.
         cross_attn_bda (Union[ModuleSpec, type]): Specification for the bias-dropout-add operation
             after cross-attention.
-        pre_mlp_layernorm (Union[ModuleSpec, type]): Specification for the layer normalization
+        pre_mlp_layernorm: Specification for the layer normalization
             before the MLP.
         mlp (Union[ModuleSpec, type]): Specification for the MLP in Dense layer.
         mlp_bda (Union[ModuleSpec, type]): Specification for the bias-dropout-add operation
@@ -222,15 +228,15 @@ class TransformerLayerSubmodules:
             in the `sharded_state_dict` method.
     """
 
-    input_layernorm: Union[ModuleSpec, type] = IdentityOp
+    input_layernorm: LayerNormBuilder = IdentityOp
     self_attention: Union[ModuleSpec, type] = IdentityOp
     self_attn_bda: Union[ModuleSpec, type] = IdentityFuncOp
 
-    pre_cross_attn_layernorm: Union[ModuleSpec, type] = IdentityOp
+    pre_cross_attn_layernorm: LayerNormBuilder = IdentityOp
     cross_attention: Union[ModuleSpec, type] = IdentityOp
     cross_attn_bda: Union[ModuleSpec, type] = IdentityFuncOp
 
-    pre_mlp_layernorm: Union[ModuleSpec, type] = IdentityOp
+    pre_mlp_layernorm: LayerNormBuilder = IdentityOp
     mlp: Union[ModuleSpec, type] = IdentityOp
     mlp_bda: Union[ModuleSpec, type] = IdentityFuncOp
 
@@ -272,6 +278,7 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
         hidden_dropout: Optional[float] = None,
         pg_collection: Optional[ProcessGroupCollection] = None,
         vp_stage: Optional[int] = None,
+        is_mtp_layer: bool = False,
     ):
         self.submodules_config = submodules
         super().__init__(config=config, vp_stage=vp_stage)
@@ -281,15 +288,22 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
         self.pg_collection = pg_collection
         self.tp_group = pg_collection.tp
 
-        self.layer_number = layer_number + get_transformer_layer_offset(
-            self.config, vp_stage, get_pg_rank(pg_collection.pp)
-        )
+        # MTP inner layers use their own layer numbering (starting from 1 within each MTP depth),
+        # so they should NOT add the decoder layer offset. The router.py handles MTP layer
+        # numbering separately by adding config.num_layers to distinguish MTP layers from decoder
+        # layers in the aux loss tracker.
+        if is_mtp_layer:
+            self.layer_number = layer_number
+        else:
+            self.layer_number = layer_number + get_transformer_layer_offset(
+                self.config, vp_stage, get_pg_rank(pg_collection.pp)
+            )
         self.hidden_dropout = config.hidden_dropout if hidden_dropout is None else hidden_dropout
+        self.is_mtp_layer = is_mtp_layer
 
         # [Module 1: Input Layernorm] Optional Layernorm on the input data
         # TODO: add pytorch only layernorm
-        self.input_layernorm = build_module(
-            submodules.input_layernorm,
+        self.input_layernorm = submodules.input_layernorm(
             config=self.config,
             hidden_size=self.config.hidden_size,
             eps=self.config.layernorm_epsilon,
@@ -316,8 +330,7 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
         self.self_attn_bda = build_module(submodules.self_attn_bda)
 
         # [Module 4: Post SelfAttention] Optional Layernorm after self-attn
-        self.pre_cross_attn_layernorm = build_module(
-            submodules.pre_cross_attn_layernorm,
+        self.pre_cross_attn_layernorm = submodules.pre_cross_attn_layernorm(
             config=self.config,
             hidden_size=self.config.hidden_size,
             eps=self.config.layernorm_epsilon,
@@ -335,8 +348,7 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
         self.cross_attn_bda = build_module(submodules.cross_attn_bda, config=self.config)
 
         # [Module 7: Pre MLP] Optional Layernorm before MLP
-        self.pre_mlp_layernorm = build_module(
-            submodules.pre_mlp_layernorm,
+        self.pre_mlp_layernorm = submodules.pre_mlp_layernorm(
             config=self.config,
             hidden_size=self.config.hidden_size,
             eps=self.config.layernorm_epsilon,
@@ -355,6 +367,9 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
         if isinstance(submodules.mlp, ModuleSpec):
             if submodules.mlp.module in (MoELayer, GroupedMLP, TEGroupedMLP, SequentialMLP):
                 additional_mlp_kwargs["pg_collection"] = pg_collection
+                # Pass is_mtp_layer flag to MoELayer to distinguish MTP MoE layers.
+                if submodules.mlp.module == MoELayer:
+                    additional_mlp_kwargs["is_mtp_layer"] = self.is_mtp_layer
             elif submodules.mlp.module == MLP:
                 assert hasattr(
                     pg_collection, 'tp'
@@ -384,6 +399,7 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
         self.recompute_pre_mlp_layernorm = False
         self.recompute_mlp = False
         if self.config.recompute_granularity == 'selective':
+            assert self.config.recompute_modules is not None
             if "layernorm" in self.config.recompute_modules:
                 if not isinstance(self.input_layernorm, IdentityOp):
                     self.recompute_input_layernorm = True
@@ -494,25 +510,6 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
         )
         return get_transformer_layer_offset(config)
 
-    def forward(self, *args, **kwargs):
-        """
-        Perform a forward pass through the transformer layer.
-
-        This method calls the core computation of a transformer layer, including
-        self-attention, cross-attention (if applicable), and feed-forward operations.
-        """
-        # Remove 'dynamic_inference_decode_only' from kwargs if present
-        # this is only used to uniquely identify decode and non-decode cuda graph
-        # runners in the cuda graph manager
-        kwargs.pop("dynamic_inference_decode_only", None)
-        hidden_states, context = self._forward_attention(*args, **kwargs)
-        output = self._forward_mlp(
-            hidden_states,
-            kwargs.get("inference_context", None),
-            padding_mask=kwargs.get("padding_mask", None),
-        )
-        return output, context
-
     def _forward_attention(
         self,
         hidden_states: Tensor,
@@ -524,7 +521,7 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
         rotary_pos_sin: Optional[Tensor] = None,
         rotary_pos_cos_sin: Optional[Tensor] = None,
         attention_bias: Optional[Tensor] = None,
-        inference_context: Optional[Any] = None,
+        inference_context: Optional[BaseInferenceContext] = None,
         packed_seq_params: Optional[PackedSeqParams] = None,
         sequence_len_offset: Optional[Tensor] = None,
         padding_mask: Optional[Tensor] = None,
@@ -574,6 +571,8 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
 
         # Residual connection.
         residual = hidden_states
+        if self.config.fp32_residual_connection:
+            residual = residual.float()
 
         # Optional Input Layer norm
         attn_norm_manager = off_interface(self.offload_attn_norm, hidden_states, "attn_norm")
@@ -581,11 +580,11 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
             self.input_layernorm_checkpoint = tensor_parallel.CheckpointWithoutOutput()
             with attn_norm_manager as hidden_states:
                 input_layernorm_output = self.input_layernorm_checkpoint.checkpoint(
-                    self.input_layernorm, hidden_states
+                    apply_module(self.input_layernorm), hidden_states
                 )
         else:
             with attn_norm_manager as hidden_states:
-                input_layernorm_output = self.input_layernorm(hidden_states)
+                input_layernorm_output = apply_module(self.input_layernorm)(hidden_states)
 
         using_fused_tp_inference_kernel = (not self.training) and (
             self.config.inference_fuse_tp_communication
@@ -642,9 +641,11 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
 
         # Residual connection.
         residual = hidden_states
+        if self.config.fp32_residual_connection:
+            residual = residual.float()
 
         # Optional Layer norm after self-attention
-        pre_cross_attn_layernorm_output = self.pre_cross_attn_layernorm(hidden_states)
+        pre_cross_attn_layernorm_output = apply_module(self.pre_cross_attn_layernorm)(hidden_states)
 
         # Cross attention.
         attention_output_with_bias = self.cross_attention(
@@ -666,7 +667,25 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
 
         return hidden_states, context
 
-    def _forward_pre_mlp_layernorm(self, hidden_states):
+    @copy_signature(_forward_attention)
+    def forward(self, *args, **kwargs):
+        """
+        Perform a forward pass through the transformer layer.
+
+        This method calls the core computation of a transformer layer, including
+        self-attention, cross-attention (if applicable), and feed-forward operations.
+        """
+        # Injected by __call__ for cuda graph keying; not a real forward arg.
+        kwargs.pop("dynamic_inference_decode_only", None)
+        hidden_states, context = self._forward_attention(*args, **kwargs)
+        output = self._forward_mlp(
+            hidden_states,
+            kwargs.get("inference_context", None),
+            padding_mask=kwargs.get("padding_mask", None),
+        )
+        return output, context
+
+    def _forward_pre_mlp_layernorm(self, hidden_states: Tensor):
         from megatron.core.pipeline_parallel.fine_grained_activation_offload import (
             FineGrainedActivationOffloadingInterface as off_interface,
         )
@@ -676,17 +695,21 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
             self.pre_mlp_norm_checkpoint = tensor_parallel.CheckpointWithoutOutput()
             with self.mlp_norm_manager as hidden_states:
                 pre_mlp_layernorm_output = self.pre_mlp_norm_checkpoint.checkpoint(
-                    self.pre_mlp_layernorm, hidden_states
+                    apply_module(self.pre_mlp_layernorm), hidden_states
                 )
         else:
             with self.mlp_norm_manager as hidden_states:
-                pre_mlp_layernorm_output = self.pre_mlp_layernorm(hidden_states)
+                pre_mlp_layernorm_output = apply_module(self.pre_mlp_layernorm)(hidden_states)
 
         return pre_mlp_layernorm_output
 
     def _forward_mlp(
-        self, hidden_states, inference_context=None, padding_mask=None, flush_delayed_groups=True
-    ):
+        self,
+        hidden_states: Tensor,
+        inference_context: BaseInferenceContext | None = None,
+        padding_mask: Tensor | None = None,
+        flush_delayed_groups: bool = True,
+    ) -> Tensor | list[Tensor | None]:
         """
         Perform a forward pass through the feed-forward layer.
 
@@ -704,6 +727,8 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
 
         # Residual connection.
         residual = hidden_states
+        if self.config.fp32_residual_connection:
+            residual = residual.float()
 
         # Optional Layer norm post the cross-attention.
         pre_mlp_layernorm_output = self._forward_pre_mlp_layernorm(hidden_states)
@@ -781,13 +806,19 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
         else:
             return self._forward_post_mlp(mlp_output_with_bias, residual, flush_delayed_groups)
 
-    def _forward_post_mlp(self, mlp_output_with_bias, residual, flush_delayed_groups=True):
+    def _forward_post_mlp(
+        self,
+        mlp_output_with_bias: tuple[Tensor, Tensor | None],
+        residual: Tensor,
+        flush_delayed_groups: bool = True,
+    ) -> Tensor:
         """
         Perform operations after the MLP computation.
 
         Args:
             mlp_output_with_bias (Tensor): Output tensor of the MLP layer with bias.
             residual (Tensor): Residual tensor.
+            flush_delayed_groups (bool): Whether to flush the delayed groups.
 
         Returns:
             output (Tensor): Transformed hidden states of shape [s, b, h].
@@ -1144,7 +1175,7 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
                 residual = cuda_graph_output.pop()
                 if not self.is_moe_layer:
                     return residual, None, None, None
-                hidden_states = self.pre_mlp_layernorm(residual)
+                hidden_states = apply_module(self.pre_mlp_layernorm)(residual)
                 shared_expert_output = self.mlp.shared_experts_compute(hidden_states)
                 probs, routing_map = self.mlp.route(hidden_states)
                 hidden_states, probs = self.mlp.preprocess(hidden_states, probs, routing_map)
@@ -1224,7 +1255,7 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
                 (kwargs.get('inference_context') is not None)
                 or (kwargs.get('inference_params') is not None)
             )
-            and CudaGraphScope.full_iteration not in self.config.cuda_graph_scope
+            and not self.config.cuda_graph_scope  # empty-list = per-layer CUDA graphs
         ):
             if kwargs['inference_context'].is_static_batching():
                 using_cuda_graph = kwargs['inference_context'].is_decode_only()
@@ -1381,6 +1412,8 @@ class MoETransformerLayer(TransformerLayer):
         """
 
         residual = hidden_states
+        if self.config.fp32_residual_connection:
+            residual = residual.float()
         self.mlp.fwd_execution_map = "route"
         pre_mlp_layernorm_output = self._forward_pre_mlp_layernorm(hidden_states)
         router_outputs = self.mlp(

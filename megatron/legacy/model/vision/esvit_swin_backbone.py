@@ -726,7 +726,7 @@ class SwinTransformer(nn.Module):
             for k, v in pretrained_dict.items():
                 need_init = (
                         k.split('.')[0] in pretrained_layers
-                        or pretrained_layers[0] is '*'
+                        or pretrained_layers[0] == '*'
                         or 'relative_position_index' not in k
                         or 'attn_mask' not in k
                 )
@@ -785,7 +785,7 @@ class SwinTransformer(nn.Module):
             if (
                     name.split('.')[0] in frozen_layers
                     or '.'.join(name.split('.')[0:2]) in frozen_layers
-                    or (len(frozen_layers) > 0 and frozen_layers[0] is '*')
+                    or (len(frozen_layers) > 0 and frozen_layers[0] == '*')
             ):
                 for _name, param in module.named_parameters():
                     param.requires_grad = False
@@ -796,7 +796,7 @@ class SwinTransformer(nn.Module):
         for name, param in self.named_parameters():
             if (
                     name.split('.')[0] in frozen_layers
-                    or (len(frozen_layers) > 0 and frozen_layers[0] is '*')
+                    or (len(frozen_layers) > 0 and frozen_layers[0] == '*')
                     and param.requires_grad is True
             ):
                 param.requires_grad = False
