@@ -990,9 +990,7 @@ class Attention(MegatronModule, ABC):
                 output_gate=self.config.attention_output_gate,
             )
         # `qkv_output` may be a tuple; commit supports tuple/list and will keep structure.
-        qkv_output = qkv_linear_manager.group_offload(
-            qkv_output, forced_released_tensors=[]
-        )
+        qkv_output = qkv_linear_manager.group_offload(qkv_output, forced_released_tensors=[])
         attn_mask_type = self.attn_mask_type
         block_table = None
         gate = None
