@@ -11,7 +11,7 @@
 
 NOTE: In order to simplify code we now only support converting llama-3.x and mistral checkpoints downloaded from Hugging Face. For converting other models, see [Megatron Bridge](models/index.md).
 
-The [Llama-2](https://ai.meta.com/llama/) and [Llama-3.x](https://llama.meta.com/) family of models are an open-source set of pretrained & finetuned (for chat) models that have achieved strong results across a wide set of benchmarks. At their times of release, both Llama-2 and Llama-3 models achieved among the best results for open-source models, and were competitive with leading closed-source models (see https://arxiv.org/pdf/2307.09288.pdf and https://ai.meta.com/blog/meta-llama-3/).
+The Llama-2 and Llama-3.x family of models are an open-source set of pretrained & finetuned (for chat) models that have achieved strong results across a wide set of benchmarks. At their times of release, both Llama-2 and Llama-3 models achieved among the best results for open-source models, and were competitive with leading closed-source models (see <https://arxiv.org/pdf/2307.09288.pdf>).
 
 Similarly, [Mistral-7b](https://mistral.ai/news/announcing-mistral-7b/) is an open-source model with pretrained and finetuned (for chat) variants that achieve strong benchmark results.
 
@@ -50,7 +50,6 @@ Architecturally Llama-2, Llama-3 and Mistral-7b are very similar. As such Megatr
 - [Known numerical differences](#known-numerical-differences)
 - [Using legacy model format](#using-legacy-model-format)
 
-
 # Llama-2
 
 Llama-2 checkpoints can be loaded into Megatron for inference and for finetuning. Loading these checkpoints consists of three steps:
@@ -63,7 +62,7 @@ The following sections detail these steps. The final section lists benchmark res
 
 ## Download Meta or Huggingface checkpoints
 
-Users must first apply for access to download the Llama-2 checkpoints either directly from [Meta](https://ai.meta.com/resources/models-and-libraries/llama-downloads/) or through [Huggingface](https://huggingface.co/docs/transformers/main/model_doc/llama2) (HF). The checkpoints are available in two formats, Meta's native format (available from both the Meta and HF links), and HF's format (available only from HF). Either format can be converted to Megatron, as detailed next.
+Users must first apply for access to download the Llama-2 checkpoints either directly [Huggingface](https://huggingface.co/docs/transformers/main/model_doc/llama2) (HF). The checkpoints are available in two formats, Meta's native format (available from both the Meta and HF links), and HF's format (available only from HF). Either format can be converted to Megatron, as detailed next.
 
 ## Convert checkpoint format
 
@@ -149,11 +148,11 @@ If loading for either inference or finetuning, use the following arguments:
 
 ### Launch Meta
 
-Meta checkpoints can be launched with: https://github.com/facebookresearch/llama
+Meta checkpoints can be launched with: <https://github.com/facebookresearch/llama>
 
 ### Launch Huggingface
 
-Huggingface checkpoints can be launched with: https://github.com/huggingface/transformers/blob/main/src/transformers/models/llama/modeling_llama.py
+Huggingface checkpoints can be launched with: <https://github.com/huggingface/transformers/blob/main/src/transformers/models/llama/modeling_llama.py>
 
 ## Benchmark results
 
@@ -437,7 +436,7 @@ Many models such as Yi-34B and Qwen2.x use the Llama architecture and may be con
 
 It is not expected that the megatron and Huggingface implementations of llama3.x and mistral models will produce numerically identical results. There are multiple points where small numerical differences are expected. This is a non-exhaustive list:
 
-1. TransformerEngine (TE) uses the model params_dtype inside RMSNorm whereas the Huggingface implementation uses fp32. See for details: https://github.com/NVIDIA/TransformerEngine/issues/1132
+1. TransformerEngine (TE) uses the model params_dtype inside RMSNorm whereas the Huggingface implementation uses fp32. See for details: <https://github.com/NVIDIA/TransformerEngine/issues/1132>
 2. Huggingface `transformers` implements the q, k and v projections in self-attention as separate GEMMs whereas Megatron core combines them into a single GEMM for efficiency. This leads to small numerical differences.
 
 # Using legacy model format
