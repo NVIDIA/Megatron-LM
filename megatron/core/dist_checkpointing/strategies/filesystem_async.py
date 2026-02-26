@@ -83,7 +83,6 @@ class FileSystemWriterAsync(FileSystemWriter):
         *args,
         separation_hint: Optional[str] = None,
         use_msc: bool = False,
-        sequential: bool = False,
         **kwargs,
     ):
         self.checkpoint_dir = path
@@ -101,7 +100,6 @@ class FileSystemWriterAsync(FileSystemWriter):
         self.write_buckets: Optional[List[WriteBucket]] = None
         self.results_queue: Optional[mp.Queue] = None
         self.separation_hint = separation_hint
-        self.sequential = sequential
 
     def prepare_write_data(self, plan: SavePlan, planner: SavePlanner) -> None:
         """
@@ -205,9 +203,7 @@ class FileSystemWriterAsync(FileSystemWriter):
             return None, None, []
         transform_list = [self.transforms] if hasattr(self, "transforms") else []
         return (
-            partial(
-                self.write_preloaded_data_multiproc, transform_list, self.use_msc, self.sequential
-            ),
+            partial(self.write_preloaded_data_multiproc, transform_list, self.use_msc),
             partial(self.preload_tensors, self.write_buckets, True),
             [torch.distributed.get_rank(), self.write_buckets, self.results_queue],
         )
@@ -226,13 +222,10 @@ class FileSystemWriterAsync(FileSystemWriter):
 
         for bucket in write_buckets:
             file_name, storage_key, (bytes_data, tensor_data) = bucket
-            tensor_list = []
-            for item, tensor in tensor_data:
-                # we belive these tensors are detached from the model trainers
-                tensor_list.append((item, tensor.to("cpu", non_blocking=non_blocking)))
-                # This is required for `PersistentAsyncCaller` to remove reference
-                del tensor
-            result.append((file_name, storage_key, (bytes_data, tensor_list)))
+            tensor_data = [
+                (item, tensor.to("cpu", non_blocking=non_blocking)) for item, tensor in tensor_data
+            ]
+            result.append((file_name, storage_key, (bytes_data, tensor_data)))
         if non_blocking:
             torch.cuda.synchronize()
         return result
@@ -242,7 +235,6 @@ class FileSystemWriterAsync(FileSystemWriter):
     def write_preloaded_data_multiproc(
         transform_list: List[_StorageWriterTransforms],
         use_msc: bool,
-        sequential: bool,
         rank: int,
         write_buckets: List[WriteBucket],
         global_results_queue: mp.Queue,
@@ -275,18 +267,10 @@ class FileSystemWriterAsync(FileSystemWriter):
         local_results_queue = ctx.Queue()
         count_queue = ctx.JoinableQueue()
         p_list = []
-
-        def check_local_output(local_results_or_exc, local_proc_idx):
-            if isinstance(local_results_or_exc, Exception):
-                err_msg = (
-                    f"Local process {local_proc_idx} encountered"
-                    f" an error: {local_results_or_exc}"
-                )
-                logger.error(err_msg)
-            assert isinstance(local_results_or_exc, list), type(local_results_or_exc)
-
         for i, write_bucket in enumerate(write_buckets):
             try:
+                count_queue.put(i)
+
                 kwargs = {
                     "local_proc_idx": i,
                     "write_bucket": write_bucket,
@@ -301,38 +285,20 @@ class FileSystemWriterAsync(FileSystemWriter):
                     # Remove the inspect after the test_async_save.py is fixed.
                     signature = inspect.signature(FileSystemWriterAsync.write_preloaded_data)
                     if len(signature.parameters) > 6:
-                        kwargs['use_msc'] = use_msc
-                # Parallel Writers are required
-                if i < len(write_buckets) - 1 and not sequential:
-                    count_queue.put(i)
-                    p_list.append(
-                        ctx.Process(
-                            target=partial(
-                                FileSystemWriterAsync.write_preloaded_data, transform_list
-                            ),
-                            kwargs=kwargs,
-                        )
-                    )
-                else:
-                    kwargs['count_queue'] = None
-                    kwargs['results_queue'] = None
-                    logger.debug('FileSystemWriterAsync: master worker started')
-                    local_output = FileSystemWriterAsync.write_preloaded_data(
-                        transform_list, **kwargs
-                    )
-                    if local_output is not None:
-                        logger.debug(
-                            'FileSystemWriterAsync: master worker results successfully collected'
-                        )
-                        check_local_output(local_output[1], local_output[0])
-                        write_results_or_exc[local_output[0]] = local_output[1]
+                        kwargs["use_msc"] = use_msc
 
+                p_list.append(
+                    ctx.Process(
+                        target=partial(FileSystemWriterAsync.write_preloaded_data, transform_list),
+                        kwargs=kwargs,
+                    )
+                )
             except Exception as e:
                 err_msg = f"An error is caught while a proc {i} is created, error: {e}"
                 logger.error(err_msg)
                 write_results_or_exc = RuntimeError(err_msg)
 
-        if not isinstance(write_results_or_exc, Exception) and len(p_list) > 0 and not sequential:
+        if not isinstance(write_results_or_exc, Exception):
             for p in p_list:
                 p.start()
 
@@ -342,7 +308,7 @@ class FileSystemWriterAsync(FileSystemWriter):
             count_queue.join()
             # At this point, all workers completed, so the queue should have exactly
             # `len(write_buckets)` items
-            for proc_idx in range(0, len(write_buckets) - 1):
+            for proc_idx in range(len(write_buckets)):
                 try:
                     local_proc_idx, local_results_or_exc = local_results_queue.get()
                 except queue.Empty:
@@ -352,10 +318,19 @@ class FileSystemWriterAsync(FileSystemWriter):
                     )
                     break
                 else:
-                    check_local_output(local_results_or_exc, local_proc_idx)
+                    if isinstance(local_results_or_exc, Exception):
+                        err_msg = (
+                            f"Local process {local_proc_idx} encountered"
+                            f" an error: {local_results_or_exc}"
+                        )
+                        logger.error(err_msg)
+                        write_results_or_exc = local_results_or_exc
+                        break
+                    assert isinstance(local_results_or_exc, list), type(local_results_or_exc)
                     write_results_or_exc[local_proc_idx] = local_results_or_exc
                     p_list[local_proc_idx].join()
-            logger.debug('FileSystemWriterAsync: collected worker results successfully')
+
+            logger.debug("FileSystemWriterAsync: collected worker results successfully")
 
         global_results_queue.put(write_results_or_exc)
 
@@ -372,7 +347,7 @@ class FileSystemWriterAsync(FileSystemWriter):
         count_queue: mp.JoinableQueue,
         use_fsync: bool,
         **kwargs,
-    ) -> Union[Tuple[int, Exception], None]:
+    ) -> None:
         """
         Performs actual data saving to storage.
 
@@ -430,19 +405,17 @@ class FileSystemWriterAsync(FileSystemWriter):
         except Exception as e:
             logger.debug(f"{local_proc_idx} failed")
             local_output = (local_proc_idx, e)  # type: ignore[assignment]
-        if results_queue is not None:
-            results_queue.put(local_output)
-        if count_queue is not None:
-            # Signal this process is done.
-            count_queue.get()
-            count_queue.task_done()
+
+        results_queue.put(local_output)
+        # Signal this process is done.
+        count_queue.get()
+        count_queue.task_done()
 
         mem_after = _process_memory()
         logger.debug(
             f"{local_proc_idx} consumed: {mem_after - mem_before},"
             f" before: {mem_before}, after: {mem_after}"
         )
-        return local_output
 
     def write_data(self, plan: SavePlan, planner: SavePlanner) -> Future[List[WriteResult]]:
         """Write all items from ``plan``."""
