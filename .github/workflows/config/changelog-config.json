@@ -15,7 +15,7 @@
     },
     "transformers": [],
     "max_tags_to_fetch": 100,
-    "max_pull_requests": 1000,
+    "max_pull_requests": 1250,
     "max_back_track_time_days": 365,
     "exclude_merge_branches": [],
     "tag_resolver": {
