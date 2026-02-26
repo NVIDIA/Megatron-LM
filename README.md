@@ -45,7 +45,7 @@ The recommended way to get started is with the NVIDIA PyTorch container and inst
 
     ```bash
     cd /workspace/megatron-lm
-    pip install -e .
+    pip install --no-build-isolation -e .
     ```
 
 4. Run a simple training example:
