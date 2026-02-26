@@ -24,20 +24,34 @@ This repository contains two components: **Megatron-LM** and **Megatron Core**.
 
 ## Quick Start
 
-Install Megatron Core with pip:
+The recommended way to get started is with the NVIDIA PyTorch container and install Megatron from source:
 
-1. Install Megatron Core with required dependencies:
-
-    ```bash
-    pip install --no-build-isolation megatron-core[mlm,dev]
-    ```
-
-2. Clone repository for examples:
+1. Clone the repository:
 
     ```bash
     git clone https://github.com/NVIDIA/Megatron-LM.git
-    cd Megatron-LM
-    pip install --no-build-isolation .[mlm,dev]
+    ```
+
+2. Launch the container (mount your clone):
+
+    ```bash
+    docker run --gpus all -it --rm \
+      -v /path/to/Megatron-LM:/workspace/megatron-lm \
+      -e PIP_CONSTRAINT= \
+      nvcr.io/nvidia/pytorch:26.01-py3
+    ```
+
+3. Install from source inside the container:
+
+    ```bash
+    cd /workspace/megatron-lm
+    pip install -e .
+    ```
+
+4. Run a simple training example:
+
+    ```bash
+    torchrun --nproc_per_node=2 examples/run_simple_mcore_train_loop.py
     ```
 
 
