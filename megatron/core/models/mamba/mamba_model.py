@@ -42,16 +42,25 @@ class MambaModel(LanguageModule):
         vocab_size (int): Vocabulary size
         max_sequence_length (int): maximum size of sequence.
             This is used for positional embedding
-        pre_process (bool, optional): Include embedding layer
-            (used with pipeline parallelism). Defaults to True.
-        hybrid_attention_ratio (float, optional): The target ratio of attention
-            layers to total layers
-        hybrid_mlp_ratio (float, optional): The target ratio of mlp layers to total layers
-        hybrid_override_pattern (str, optional): Unified hybrid layer pattern with optional MTP.
+        hybrid_layer_pattern (str): Unified hybrid layer pattern with optional MTP and
+            pipeline stage boundaries.
             Format: "<main_pattern>/<mtp_pattern>/<mtp_pattern>/..."
+            The main pattern may contain "|" to define pipeline stage boundaries.
             Examples:
                 - "M*M*" -> main decoder only, no MTP
                 - "M*M*/MM/MM" -> main="M*M*", mtp="MM", 2 depths
+                - "M-M-|M-M*-|M-M-|M-M*-" -> 4 pipeline segments
+        hybrid_attention_ratio (float, optional): Deprecated. Use hybrid_layer_pattern instead.
+            If set to a value > 0.0 and hybrid_layer_pattern is None, a pattern will be
+            generated from the ratio with a deprecation warning.
+        hybrid_mlp_ratio (float, optional): Deprecated. Use hybrid_layer_pattern instead.
+            If set to a value > 0.0 and hybrid_layer_pattern is None, a pattern will be
+            generated from the ratio with a deprecation warning.
+        hybrid_override_pattern (str, optional): Deprecated. Use hybrid_layer_pattern instead.
+            If set and hybrid_layer_pattern is None, the value is copied to hybrid_layer_pattern
+            with a deprecation warning.
+        pre_process (bool, optional): Include embedding layer
+            (used with pipeline parallelism). Defaults to True.
         post_process (bool, optional): Include an output layer (used with pipeline parallelism).
             Defaults to True.
         fp16_lm_cross_entropy (bool, optional): Defaults to False.
@@ -69,6 +78,7 @@ class MambaModel(LanguageModule):
             interpolating RoPE for longer sequences. The value must be a float larger than 1.0.
              Defaults to None.
         pg_collection (ProcessGroupCollection, optional): Model communication process groups.
+        vp_stage (Optional[int], optional): Virtual pipeline stage index. Defaults to None.
     """
 
     def __init__(
@@ -77,10 +87,11 @@ class MambaModel(LanguageModule):
         mamba_stack_spec: ModuleSpec,
         vocab_size: int,
         max_sequence_length: int,
+        hybrid_layer_pattern: Optional[str] = None,
+        hybrid_attention_ratio: Optional[float] = None,
+        hybrid_mlp_ratio: Optional[float] = None,
+        hybrid_override_pattern: Optional[str] = None,
         pre_process: bool = True,
-        hybrid_attention_ratio: float = 0.0,
-        hybrid_mlp_ratio: float = 0.0,
-        hybrid_override_pattern: str = None,
         post_process: bool = True,
         fp16_lm_cross_entropy: bool = False,
         parallel_output: bool = True,
@@ -110,10 +121,8 @@ class MambaModel(LanguageModule):
         self.mamba_stack_spec: ModuleSpec = mamba_stack_spec
         self.vocab_size = vocab_size
         self.max_sequence_length = max_sequence_length
+        self.hybrid_layer_pattern = hybrid_layer_pattern
         self.pre_process = pre_process
-        self.hybrid_attention_ratio = hybrid_attention_ratio
-        self.hybrid_mlp_ratio = hybrid_mlp_ratio
-        self.hybrid_override_pattern = hybrid_override_pattern
         self.post_process = post_process
         self.fp16_lm_cross_entropy = fp16_lm_cross_entropy
         self.parallel_output = parallel_output
@@ -121,18 +130,73 @@ class MambaModel(LanguageModule):
         self.position_embedding_type = position_embedding_type
         self.vp_stage = vp_stage
 
-        # Parse unified pattern to extract main and MTP components
-        from megatron.core.ssm.mamba_hybrid_layer_allocation import parse_hybrid_pattern
+        # Backward compatibility for deprecated hybrid parameters
+        if hybrid_override_pattern is not None:
+            if self.hybrid_layer_pattern is None:
+                log_single_rank(
+                    logger,
+                    logging.WARNING,
+                    "hybrid_override_pattern has been deprecated. "
+                    "Use hybrid_layer_pattern instead.",
+                )
+                self.hybrid_layer_pattern = hybrid_override_pattern
+            else:
+                raise ValueError(
+                    "hybrid_override_pattern and hybrid_layer_pattern cannot both be set. "
+                    "hybrid_override_pattern has been deprecated; use hybrid_layer_pattern instead."
+                )
+        if (hybrid_attention_ratio is not None and hybrid_attention_ratio > 0.0) or (
+            hybrid_mlp_ratio is not None and hybrid_mlp_ratio > 0.0
+        ):
+            if hybrid_layer_pattern is not None:
+                raise ValueError(
+                    "hybrid_layer_pattern cannot be used together with "
+                    "hybrid_attention_ratio or hybrid_mlp_ratio. "
+                    "These ratios have been deprecated; use hybrid_layer_pattern alone."
+                )
+            log_single_rank(
+                logger,
+                logging.WARNING,
+                "hybrid_attention_ratio and hybrid_mlp_ratio have been deprecated. "
+                "Use hybrid_layer_pattern instead.",
+            )
+            if self.hybrid_layer_pattern is None:
+                from megatron.core.ssm.mamba_hybrid_layer_allocation import pattern_from_ratios
 
-        parsed = parse_hybrid_pattern(hybrid_override_pattern)
+                attn_ratio = hybrid_attention_ratio if hybrid_attention_ratio else 0.0
+                mlp_ratio = hybrid_mlp_ratio if hybrid_mlp_ratio else 0.0
+                self.hybrid_layer_pattern = pattern_from_ratios(
+                    config.num_layers, attn_ratio, mlp_ratio
+                )
+
+        # Parse unified pattern to extract main and MTP components, and
+        # determine the pipeline segment for this model instance.
+        from megatron.core.ssm.mamba_hybrid_layer_allocation import (
+            parse_hybrid_pattern,
+            select_pipeline_segment,
+        )
+
+        parsed = parse_hybrid_pattern(self.hybrid_layer_pattern)
         self.mtp_pattern = parsed.mtp_pattern
         self.mtp_num_depths = parsed.mtp_num_depths
+
+        layer_type_list, layer_offset = select_pipeline_segment(
+            parsed.main_pattern or '',
+            self.pg_collection.pp,
+            vp_stage,
+            first_stage_layers=self.config.num_layers_in_first_pipeline_stage,
+            last_stage_layers=self.config.num_layers_in_last_pipeline_stage,
+        )
 
         # Determine if MTP is needed (based on pattern parsing)
         self.mtp_process = (
             self.mtp_pattern is not None
             and self.mtp_num_depths > 0
-            and mtp_on_this_rank(self.config, vp_stage=self.vp_stage)
+            # The following forces MTP to be on the final pipeline stage. It might be more optimal
+            # to split the hybrid layer pattern into pipeline stages before parsing the pattern for
+            # the current pipeline stage. This could also enable MTP standalone (MTP in a pipeline
+            # stage separate from loss) to be supported in the hybrid model.
+            and mtp_on_this_rank(self.config, ignore_virtual=False, vp_stage=self.vp_stage)
         )
 
         # megatron core pipelining currently depends on model type
@@ -163,9 +227,8 @@ class MambaModel(LanguageModule):
             mamba_stack_spec,
             self.config,
             pre_process=self.pre_process,
-            hybrid_attention_ratio=self.hybrid_attention_ratio,
-            hybrid_mlp_ratio=self.hybrid_mlp_ratio,
-            hybrid_override_pattern=parsed.main_pattern,
+            layer_type_list=layer_type_list,
+            pp_layer_offset=layer_offset,
             post_process=self.post_process,
             dtype=config.params_dtype,
             pg_collection=self.pg_collection,

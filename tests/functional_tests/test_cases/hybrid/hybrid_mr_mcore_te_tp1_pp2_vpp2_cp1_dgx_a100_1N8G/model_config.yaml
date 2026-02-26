@@ -8,7 +8,7 @@ MODEL_ARGS:
   --num-attention-heads: 16
   --group-query-attention: true
   --num-query-groups: 8
-  --hybrid-layer-pattern: M-M-M-M*-M-M-M-M*-M-M-M-M*-M-M-M-M*-M-M-M-M-
+  --hybrid-layer-pattern: M-M-M-M*-M-|M-M-M*-M-M-|M-M*-M-M-M-|M*-M-M-M-M-
   --spec: "[megatron.core.models.mamba.mamba_layer_specs mamba_stack_spec]"
   --log-params-norm: true
   --log-num-zeros-in-grad: true
@@ -40,8 +40,8 @@ MODEL_ARGS:
   --eval-interval: 1000
   --eval-iters: 10
   --transformer-impl: transformer_engine
-  --tensor-model-parallel-size: 2
-  --pipeline-model-parallel-size: 1
+  --tensor-model-parallel-size: 1
+  --pipeline-model-parallel-size: 2
   --use-distributed-optimizer: true
   --overlap-grad-reduce: true
   --overlap-param-gather: true
@@ -51,6 +51,7 @@ MODEL_ARGS:
   --attention-softmax-in-fp32: true
   --use-mcore-models: true
   --ckpt-format: torch_dist
+  --dist-ckpt-optim-fully-reshardable: true
   --data-cache-path: ${DATA_CACHE_PATH}
   --bf16: true
   --attention-backend: unfused
