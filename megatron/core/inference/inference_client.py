@@ -70,8 +70,6 @@ class InferenceClient:
         socket.connect(inference_coordinator_address)
 
         self._loop = None
-        self.running = asyncio.Event()
-
         self.socket = socket
         self.completion_futures = {}
         self.request_submission_times = {}
@@ -97,8 +95,6 @@ class InferenceClient:
             asyncio.Future: A future that will be resolved with a
             `DynamicInferenceRequestRecord` object containing the completed result.
         """
-        if not self.running.is_set():
-            raise RuntimeError("InferenceClient is not currently running.")
         request_id = self.next_request_id
         self.next_request_id += 1
         payload = [Headers.SUBMIT_REQUEST.value, request_id, prompt, sampling_params.serialize()]
@@ -167,7 +163,6 @@ class InferenceClient:
         """
         logging.info("Client: Connecting to InferenceCoordinator...")
         self._loop = get_asyncio_loop(loop)
-        self.running.set()
         self._connect_with_inference_coordinator()
         self.listener_task = self._loop.create_task(self._recv_task())
 
@@ -193,7 +188,6 @@ class InferenceClient:
 
     def unpause_engines(self) -> None:
         """Sends UNPAUSE to all engines. No synchronization needed."""
-        self.running.set()
         self._send_signal_to_engines(Headers.UNPAUSE)
 
     def increment_staleness(self):
@@ -210,8 +204,7 @@ class InferenceClient:
     def resume_engines(self):
         """Sends RESUME to all engines via coordinator. Requires SUSPENDED.
 
-        Callers should await engine.paused (or engine.running after UNPAUSE)
-        for confirmation.
+        Callers should await engine.paused (or engine.running after UNPAUSE) for confirmation.
         """
         self._send_signal_to_engines(Headers.RESUME)
 
@@ -221,7 +214,6 @@ class InferenceClient:
         Callers should await engine.stopped for confirmation.
         """
         self._send_signal_to_engines(Headers.STOP)
-        self.running.clear()
 
     def stop(self):
         """
@@ -233,6 +225,7 @@ class InferenceClient:
         """
         if hasattr(self, 'listener_task') and not self.listener_task.done():
             self.listener_task.cancel()
+        # Wake up any listeners.
         for future in self.completion_futures.values():
             if not future.done():
                 future.cancel()

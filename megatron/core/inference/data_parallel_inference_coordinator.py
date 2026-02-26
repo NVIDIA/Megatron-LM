@@ -187,10 +187,7 @@ class DataParallelInferenceCoordinator:
 
     def _remove_engine(self, identity):
         """Remove a disconnected engine from the routing pool."""
-        try:
-            self.identities_of_data_parallel_ranks.remove(identity)
-        except ValueError:
-            return
+        self.identities_of_data_parallel_ranks.remove(identity)
         logging.warning(
             "Coordinator: removed engine %s (now %d engines)",
             identity,
@@ -282,14 +279,17 @@ class DataParallelInferenceCoordinator:
                     [Headers.SUBMIT_REQUEST.value, request_id, prompt, sampling_params],
                     use_bin_type=True,
                 )
+                # Account for the fact that some engines may have died.
                 for _ in range(max(len(self.identities_of_data_parallel_ranks), 1)):
                     next_identity = self.get_next_data_parallel_rank()
                     if self._send_to_engine(next_identity, payload):
                         break
                 else:
+                    # If all engines have died, we are in an abnormal state, and must exit cleanly.
                     logging.error("Coordinator: no reachable engines for request %d", request_id)
                     del self.request_id_to_client_id[request_id]
                     del self.request_id_to_client_request_id[request_id]
+
             elif header in (
                 Headers.PAUSE,
                 Headers.UNPAUSE,
@@ -303,9 +303,10 @@ class DataParallelInferenceCoordinator:
                     continue
 
                 if header == Headers.PAUSE:
+                    idem_states = (self.CoordinatorState.PAUSED, self.CoordinatorState.SUSPENDED)
                     if self.state == self.CoordinatorState.RUNNING:
                         self.state = self.CoordinatorState.PAUSED
-                    elif self.state in (self.CoordinatorState.PAUSED, self.CoordinatorState.SUSPENDED):
+                    elif self.state in idem_states:
                         # Already paused/suspended, ignore redundant PAUSE.
                         continue
                     else:
@@ -327,7 +328,8 @@ class DataParallelInferenceCoordinator:
                         continue
                     self.state = self.CoordinatorState.PAUSED
                 elif header == Headers.STOP:
-                    if self.state not in (self.CoordinatorState.PAUSED, self.CoordinatorState.SUSPENDED):
+                    good_states = (self.CoordinatorState.PAUSED, self.CoordinatorState.SUSPENDED)
+                    if self.state not in good_states:
                         logging.warning("Coordinator: ignoring STOP in state %s", self.state)
                         continue
                     self.state = self.CoordinatorState.STOPPING

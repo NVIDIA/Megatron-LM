@@ -125,10 +125,10 @@ class DummyEngine(DynamicInferenceEngine):
         return await DynamicInferenceEngine.run_engine_with_coordinator.__wrapped__(self, loop=loop)
 
     def suspend(self):
-        """No-op suspend — no real GPU state to offload."""
+        pass
 
     def resume(self):
-        """No-op resume — no real GPU state to onload."""
+        pass
 
     def add_request(
         self, request_id: int, prompt: str, sampling_params: Optional[SamplingParams] = None
@@ -193,71 +193,31 @@ class DummyEngine(DynamicInferenceEngine):
         }
 
 
-def _kill_coordinator(engine, timeout=5.0):
-    """Terminate and join the coordinator process if it exists."""
-    proc = getattr(engine, 'inference_coordinator_process', None)
-    if proc is None or not proc.is_alive():
-        return
-    proc.terminate()
-    proc.join(timeout=timeout)
+async def graceful_shutdown(engine, client=None, *, timeout=10.0):
+    """Shut down the engine.
 
-
-async def graceful_shutdown(engine, client=None, *, timeout=30.0):
-    """Shut down the engine, escalating through three strategies.
-
-    1. Coordinator-driven: PAUSE → STOP via client (normal protocol).
-    2. Immediate: engine.shutdown(immediate=True) — cancels the engine
-       task, then kills the coordinator.
-    3. Nuclear: cancel the task directly (destroys ZMQ sockets).
+    First we try to pass PAUSE -> STOP into the coordinator via the client.
+    If necessary, we escalate to engine.shutdown(immediate=True) and cancel all tasks.
 
     Args:
         engine: DummyEngine whose engine_loop_task to await.
         client: InferenceClient (only rank 0, None on other ranks).
         timeout: Per-stage timeout in seconds.
     """
-    # Stage 1: coordinator-driven shutdown.
-    # Rank 0 (has client): drives PAUSE → STOP through the coordinator.
-    # Non-rank-0 (no client): waits for the coordinator-driven STOP to
-    # propagate. Must NOT use shutdown(immediate=True) here — that cancels
-    # the engine task and destroys ZMQ sockets, killing the world barriers
-    # that rank 0's coordinator-driven path depends on.
     try:
         if client is not None:
             client.pause_engines()
             client.stop_engines()
         await asyncio.wait_for(engine.stopped.wait(), timeout=timeout)
-        # Reap the coordinator process (it exited after broadcasting STOP).
+    except asyncio.TimeoutError:
+        await asyncio.wait_for(engine.shutdown(immediate=True), timeout=timeout)
+    finally:
         proc = getattr(engine, 'inference_coordinator_process', None)
-        if proc is not None:
+        if proc is not None and proc.is_alive():
+            proc.terminate()
             proc.join(timeout=timeout)
-            if proc.is_alive():
-                raise RuntimeError("Coordinator process did not exit")
         if client is not None:
             client.stop()
-        return
-    except Exception:
-        pass
-
-    # Stage 2: immediate shutdown (cancel task, no collectives).
-    try:
-        await asyncio.wait_for(engine.shutdown(immediate=True), timeout=timeout)
-        _kill_coordinator(engine)
-    except asyncio.TimeoutError:
-        # Stage 3: nuclear — cancel the task directly.
-        task = getattr(engine, 'engine_loop_task', None)
-        if task is not None and not task.done():
-            task.cancel()
-            try:
-                await task
-            except (asyncio.CancelledError, Exception):
-                pass
-        _kill_coordinator(engine)
-    finally:
-        if client is not None:
-            try:
-                client.stop()
-            except Exception:
-                pass
 
 
 @pytest.fixture
@@ -323,7 +283,7 @@ class TestCoordinator:
                     assert record[-1].status == Status.COMPLETED
         finally:
             if stop_engines:
-                await graceful_shutdown(engine, client, timeout=30.0)
+                await graceful_shutdown(engine, client)
             elif client is not None:
                 client.stop()
 
@@ -413,16 +373,8 @@ class TestCoordinator:
             ), f"Expected different port due to conflict, but got same: {third_port}"
 
         finally:
-            for engine in engines:
-                try:
-                    await graceful_shutdown(engine)
-                except Exception:
-                    pass
-            if client1 is not None:
-                try:
-                    client1.stop()
-                except Exception:
-                    pass
+            # Kill the coordinator through the last engine; if the test fails this may not be 3.
+            await graceful_shutdown(engines[-1], client1)
 
     @pytest.mark.internal
     @pytest.mark.skipif(not HAVE_ZMQ, reason="pyzmq is required for this test")
@@ -437,26 +389,7 @@ class TestCoordinator:
         indirect=["initialize_model_parallel"],
     )
     async def test_control_logic_lifecycle(self, initialize_model_parallel):
-        """Comprehensive lifecycle test for the engine state machine.
-
-        Walks through every state transition with assertions at each step,
-        verifying state/event atomicity, request queuing during PAUSE,
-        engine functionality after SUSPEND/RESUME, clean shutdown via
-        PAUSE->STOP, and that invalid signals crash the engine.
-
-        Lifecycle exercised:
-          RUNNING -> requests -> PAUSE-with-in-flight -> UNPAUSE ->
-          PAUSE -> idempotent-PAUSE -> requests-during-pause -> UNPAUSE ->
-          requests -> PAUSE -> SUSPEND -> idempotent-PAUSE-while-SUSPENDED ->
-          RESUME -> UNPAUSE -> requests ->
-          PAUSE -> queued-requests -> SUSPEND -> STOP-from-SUSPENDED
-
-        Event invariants checked after every transition:
-          running.is_set()   <=> state == RUNNING
-          paused.is_set()    <=> state in {PAUSED, ..., STOPPED}
-          suspended.is_set() <=> state == SUSPENDED
-          stopped.is_set()   <=> state == STOPPED
-        """
+        """Comprehensive lifecycle test for the engine state machine."""
         # States where paused stays set: once set during PAUSE, it's only
         # cleared by UNPAUSE.  It remains set through SUSPEND/RESUME/STOP.
         PAUSED_FAMILY = {
@@ -498,7 +431,17 @@ class TestCoordinator:
                 client = InferenceClient(dp_addr)
                 client.start()
 
-                # ── RUNNING ──────────────────────────────────────────
+                await asyncio.wait_for(engine.running.wait(), timeout=5.0)
+                assert_state(engine, EngineState.RUNNING)
+
+                # Try to submit signals out of FSM order.
+                client.suspend_engines()
+                await asyncio.sleep(0.1)
+                assert_state(engine, EngineState.RUNNING)
+                client.resume_engines()
+                await asyncio.sleep(0.1)
+                assert_state(engine, EngineState.RUNNING)
+                client.stop_engines()
                 await asyncio.sleep(0.1)
                 assert_state(engine, EngineState.RUNNING)
 
@@ -508,56 +451,29 @@ class TestCoordinator:
                 for record in results:
                     assert record[-1].status == Status.COMPLETED
 
-                # ── PAUSE with in-flight requests ────────────────────
-                # Submit requests and PAUSE in quick succession.  With
-                # EP=1 + DummyEngine the requests and PAUSE may arrive in
-                # the same schedule_requests batch, but the engine still
-                # has to handle them correctly (add requests, then PAUSE).
-                inflight_futures = [
-                    client.add_request(
-                        prompt="Hello world!",
-                        sampling_params=SamplingParams(num_tokens_to_generate=100),
-                    )
-                    for _ in range(3)
+                # Submit requests and immediately pause afterwards.
+                paused_futures = [
+                    client.add_request(prompt=p, sampling_params=s) for p, s in requests[2:5]
                 ]
                 client.pause_engines()
                 await asyncio.wait_for(engine.paused.wait(), timeout=5.0)
                 assert_state(engine, EngineState.PAUSED)
 
-                # UNPAUSE and verify all in-flight requests complete.
-                client.unpause_engines()
-                await asyncio.wait_for(engine.running.wait(), timeout=5.0)
-                results = await asyncio.wait_for(asyncio.gather(*inflight_futures), timeout=10.0)
-                for record in results:
-                    assert record[-1].status == Status.COMPLETED
-                assert_state(engine, EngineState.RUNNING)
-
-                # ── PAUSE (1st) ──────────────────────────────────────
-                client.pause_engines()
-                await asyncio.wait_for(engine.paused.wait(), timeout=5.0)
-                assert_state(engine, EngineState.PAUSED)
-
-                # ── Idempotent PAUSE while PAUSED ────────────────────
-                # Redundant PAUSE — coordinator ignores, engine stays PAUSED.
+                # Try pausing again and see if it breaks.
                 client.pause_engines()
                 await asyncio.sleep(0.1)
                 assert_state(engine, EngineState.PAUSED)
 
                 # Requests submitted during PAUSE should queue, not complete.
                 # Use asyncio.wait (not wait_for) so futures aren't cancelled.
-                paused_futures = [
-                    client.add_request(prompt=p, sampling_params=s) for p, s in requests[2:5]
-                ]
                 done, pending = await asyncio.wait(paused_futures, timeout=0.5)
                 assert len(done) == 0, "No requests should complete while paused"
                 assert len(pending) == 3
 
-                # ── UNPAUSE (1st) ────────────────────────────────────
+                # UNPAUSE and verify all in-flight requests complete.
                 client.unpause_engines()
                 await asyncio.wait_for(engine.running.wait(), timeout=5.0)
-
-                # Queued requests should now complete.
-                results = await asyncio.wait_for(asyncio.gather(*pending), timeout=5.0)
+                results = await asyncio.wait_for(asyncio.gather(*pending), timeout=10.0)
                 for record in results:
                     assert record[-1].status == Status.COMPLETED
                 assert_state(engine, EngineState.RUNNING)
@@ -570,36 +486,36 @@ class TestCoordinator:
                 for record in results:
                     assert record[-1].status == Status.COMPLETED
 
-                # ── PAUSE (2nd) ──────────────────────────────────────
+                # Suspend.
                 client.pause_engines()
                 await asyncio.wait_for(engine.paused.wait(), timeout=5.0)
                 assert_state(engine, EngineState.PAUSED)
 
-                # ── SUSPEND ──────────────────────────────────────────
                 client.suspend_engines()
                 await asyncio.wait_for(engine.suspended.wait(), timeout=5.0)
                 assert_state(engine, EngineState.SUSPENDED)
 
-                # ── Idempotent PAUSE while SUSPENDED ─────────────────
-                # Redundant PAUSE — coordinator ignores, engine stays SUSPENDED.
+                # Try pausing again and see if it breaks.
                 client.pause_engines()
                 await asyncio.sleep(0.1)
                 assert_state(engine, EngineState.SUSPENDED)
 
-                # ── RESUME ───────────────────────────────────────────
-                # paused stays set through SUSPEND; clear it so we can
-                # re-wait for the RESUMING → PAUSED transition.
+                # Try suspending again and see if it breaks.
+                client.pause_engines()
+                await asyncio.sleep(0.1)
+                assert_state(engine, EngineState.SUSPENDED)
+
+                # Resume.
                 engine.paused.clear()
                 client.resume_engines()
                 await asyncio.wait_for(engine.paused.wait(), timeout=5.0)
                 assert_state(engine, EngineState.PAUSED)
                 assert not engine.suspended.is_set()
 
-                # ── UNPAUSE (2nd) ────────────────────────────────────
+                # Engine processes requests after suspend/resume cycle.
                 client.unpause_engines()
                 await asyncio.wait_for(engine.running.wait(), timeout=5.0)
 
-                # Engine processes requests after suspend/resume cycle.
                 futures = [
                     client.add_request(prompt=p, sampling_params=s) for p, s in requests[7:10]
                 ]
@@ -607,82 +523,34 @@ class TestCoordinator:
                 for record in results:
                     assert record[-1].status == Status.COMPLETED
 
-                # ── PAUSE (3rd) ──────────────────────────────────────
+                # Submit requests that will be cancelled on STOP.
                 client.pause_engines()
                 await asyncio.wait_for(engine.paused.wait(), timeout=5.0)
                 assert_state(engine, EngineState.PAUSED)
 
-                # Submit requests that will be cancelled on STOP.
                 doomed_futures = [
                     client.add_request(prompt=p, sampling_params=s) for p, s in requests[10:13]
                 ]
 
-                # ── SUSPEND (2nd) → STOP from SUSPENDED ─────────────
                 client.suspend_engines()
                 await asyncio.wait_for(engine.suspended.wait(), timeout=5.0)
                 assert_state(engine, EngineState.SUSPENDED)
 
-                # STOP directly from SUSPENDED — no RESUME needed.
                 client.stop_engines()
 
-            # All ranks: wait for the STOPPED event, not the task.
-            # Timing out an event is harmless; timing out a task cancels it,
-            # which closes ZMQ sockets and kills the coordinator's broadcast.
-            # Non-rank-0 reaches this immediately while rank 0 runs the full
-            # lifecycle, so the timeout must cover the entire rank-0 test body.
-            try:
-                await asyncio.wait_for(engine.stopped.wait(), timeout=120.0)
-            except asyncio.TimeoutError:
-                raise AssertionError("Engine did not reach STOPPED within 120s")
+            await asyncio.wait_for(engine.stopped.wait(), timeout=5.0)
             assert_state(engine, EngineState.STOPPED)
 
-            # STOP should have cancelled all engine-side request state.
-            assert len(engine.requests) == 0, "STOP should clear all requests"
-            assert len(engine.waiting_request_ids) == 0, "STOP should clear waiting queue"
-
             if torch.distributed.get_rank() == 0:
-                # Client futures are orphaned (no ENGINE_REPLY was sent).
+                # Client should be stopped, so futures should be cancelled.
                 for f in doomed_futures:
                     assert not f.done(), "Client futures should still be pending"
                 client.stop()
-                client = None  # Mark as cleaned up so finally doesn't double-stop.
                 for f in doomed_futures:
                     assert f.cancelled(), "Client futures should be cancelled after client.stop()"
 
         finally:
             await graceful_shutdown(engine, client)
-
-        # ── Coordinator signal gating ────────────────────────────────
-        # STOP, SUSPEND, and RESUME sent from RUNNING are dropped by the
-        # coordinator (it gates on its own state).  The engine never
-        # receives them and stays healthy in RUNNING.
-        #
-        # Engine-side asserts (defense in depth) still exist but are not
-        # reachable through normal coordinator operation.
-        for signal_name, signal_fn in [
-            ("STOP", lambda c: c.stop_engines()),
-            ("SUSPEND", lambda c: c.suspend_engines()),
-            ("RESUME", lambda c: c.resume_engines()),
-        ]:
-            engine = DummyEngine()
-            client = None
-            try:
-                dp_addr = await engine.start_listening_to_data_parallel_coordinator(
-                    inference_coordinator_port=DEFAULT_PORT, launch_inference_coordinator=True
-                )
-                if torch.distributed.get_rank() == 0:
-                    client = InferenceClient(dp_addr)
-                    client.start()
-                    await asyncio.sleep(0.1)
-                    assert engine.state == EngineState.RUNNING
-                    signal_fn(client)
-                    # Signal should be dropped by coordinator.
-                    await asyncio.sleep(0.3)
-                    assert (
-                        engine.state == EngineState.RUNNING
-                    ), f"{signal_name} from RUNNING should be dropped by coordinator"
-            finally:
-                await graceful_shutdown(engine, client, timeout=30.0)
 
     @pytest.mark.internal
     @pytest.mark.skipif(not HAVE_ZMQ, reason="pyzmq is required for this test")
@@ -715,7 +583,7 @@ class TestCoordinator:
                     await asyncio.wait_for(asyncio.gather(*futures), timeout=10.0)
                 done_time = time.time()
         finally:
-            await graceful_shutdown(engine, client, timeout=30.0)
+            await graceful_shutdown(engine, client)
 
         stop_time = time.time()
 

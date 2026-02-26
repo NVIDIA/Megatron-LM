@@ -1629,9 +1629,7 @@ class DynamicInferenceEngine(AbstractEngine):
                 if self.state == EngineState.RUNNING:
                     self.state = EngineState.PAUSING
                     self.running.clear()
-                # If PAUSING, an all-reduce is already in progress.
-                # If PAUSED / SUSPENDED / etc., already idle — ignore.
-                # If STOPPING/STOPPED, we are shutting down — ignore.
+                # Any other state can safely ignore PAUSE.
                 break
 
             elif header == Headers.UNPAUSE:
@@ -1643,14 +1641,14 @@ class DynamicInferenceEngine(AbstractEngine):
 
             elif header == Headers.SUSPEND:
                 assert self.state == EngineState.PAUSED, f"Received SUSPEND in state {self.state}"
-                self.suspend()  # GPU memory offload
+                self.suspend()
                 self.state = EngineState.SUSPENDING
                 break
 
             elif header == Headers.RESUME:
                 assert self.state == EngineState.SUSPENDED, f"Received RESUME in state {self.state}"
                 self.suspended.clear()
-                self.resume()  # GPU memory onload
+                self.resume()
                 self.state = EngineState.RESUMING
                 break
 
@@ -1661,17 +1659,10 @@ class DynamicInferenceEngine(AbstractEngine):
 
             elif header == Headers.STOP:
                 assert self.state in (
-                    EngineState.PAUSED,
-                    EngineState.SUSPENDED,
+                    EngineState.PAUSED, EngineState.SUSPENDED,
                 ), f"Received STOP in state {self.state}"
                 if self.state == EngineState.SUSPENDED:
                     self.suspended.clear()
-                # Cleanup the request futures.
-                for entry in self.requests.values():
-                    if not entry.future.done():
-                        entry.future.cancel()
-                self.waiting_request_ids.clear()
-                self.requests.clear()
                 self.state = EngineState.STOPPING
                 break
 
@@ -1683,16 +1674,13 @@ class DynamicInferenceEngine(AbstractEngine):
     async def shutdown(self, immediate: bool = False):
         """Shut down the engine and clean up ZMQ resources.
 
-        When immediate=False (called from the engine loop's finally block),
-        just does ZMQ cleanup — the loop already exited cleanly.
+        When immediate=False (called from the engine loop's finally block), just does ZMQ cleanup.
 
-        When immediate=True (external emergency shutdown), cancels the
-        engine loop task directly.  Cancellation is safe here because we
-        can't rely on EP all-reduce or world barriers — peer ranks may
-        already be dead.
+        When immediate=True (external emergency shutdown), cancels the engine loop task directly.
+        Cancellation is our last resort when we can't rely on EP all-reduce or world barriers:
+        peer ranks may already be dead.
 
-        Note: This method does NOT touch the coordinator process.  The
-        caller is responsible for terminating/joining it separately.
+        This method does NOT touch the coordinator process. It must be terminated separately.
 
         Args:
             immediate: Cancel the engine task instead of draining gracefully.
@@ -1701,16 +1689,13 @@ class DynamicInferenceEngine(AbstractEngine):
 
         if task is not None and not task.done() and task is not asyncio.current_task():
             if immediate:
-                # Cancel directly — synthetic signals would deadlock in
-                # EP all-reduce / world barrier if peers are already gone.
                 task.cancel()
                 try:
                     await task
                 except (asyncio.CancelledError, Exception):
                     pass
             else:
-                # Graceful: inject synthetic signals so the engine drains
-                # EP collectives cooperatively before exiting.
+                # Inject synthetic signals to cooperatively drain all engines.
                 if self.state == EngineState.RUNNING:
                     self._pending_signals.append(msgpack.packb([Headers.PAUSE.value], use_bin_type=True))
                 if self.state not in (EngineState.STOPPING, EngineState.STOPPED):
@@ -1720,7 +1705,12 @@ class DynamicInferenceEngine(AbstractEngine):
 
         self.state = EngineState.STOPPED
 
-        # ZMQ cleanup; idempotent.
+        # Cleanup the request futures.
+        for entry in self.requests.values():
+            if not entry.future.done():
+                entry.future.cancel()
+
+        # ZMQ cleanup; designed to be idempotent.
         sock = getattr(self, 'socket_for_receiving_requests', None)
         if sock is not None and not sock.closed:
             try:
@@ -1738,6 +1728,7 @@ class DynamicInferenceEngine(AbstractEngine):
         if not self.zmq_context.closed:
             self.zmq_context.term()
 
+        # Set the stopped state at the very end.
         self.stopped.set()
 
     @trace_async_exceptions
@@ -1823,41 +1814,32 @@ class DynamicInferenceEngine(AbstractEngine):
             while True:
                 self.schedule_requests()
 
-                if self.state == EngineState.RUNNING:
+                if self.state in (EngineState.RUNNING, EngineState.PAUSING):
                     local_pending = self.context.get_active_request_count() + len(
                         self.waiting_request_ids
                     )
-                    ep_work = await self._ep_group_has_work(local_pending)
+                    ep_report = local_pending if self.state == EngineState.RUNNING else -1
+                    ep_work = await self._ep_group_has_work(ep_report)
+
                     if ep_work > 0:
-                        if local_pending > 0:
+                        # At least one EP peer has work.
+                        if local_pending > 0 and self.state == EngineState.RUNNING:
                             await self.async_step()
                         else:
-                            # EP peer has work but this rank doesn't — dummy forward.
+                            # Dummy forward to participate in the EP collective.
                             self.step_start_event.record()
                             self.controller.dummy_forward()
                             self.step_end_event.record()
                             self.step_end_event.synchronize()
                             self.step_count += 1
-                    else:
-                        await asyncio.sleep(0.02)
-
-                elif self.state == EngineState.PAUSING:
-                    # EP consensus via all-reduce: report -1 to indicate PAUSING.
-                    ep_work = await self._ep_group_has_work(-1)
-                    if ep_work > 0:
-                        # EP peer has work and will step — dummy forward to participate.
-                        self.step_start_event.record()
-                        self.controller.dummy_forward()
-                        self.step_end_event.record()
-                        self.step_end_event.synchronize()
-                        self.step_count += 1
                     elif ep_work == -1:
-                        # All EP peers are PAUSING — consensus reached.
+                        # All EP peers are PAUSING.
                         await self._world_barrier()
                         self.state = EngineState.PAUSED
                         self.paused.set()
-                    # else: ep_work == 0 — RUNNING peer is idle, no step to
-                    # participate in. Just loop back and check next iteration.
+                    else:
+                        # All EP peers have 0 work.
+                        await asyncio.sleep(0.02)
 
                 elif self.state == EngineState.PAUSED:
                     await asyncio.sleep(0.02)
