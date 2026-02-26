@@ -118,6 +118,7 @@ class MoEMetricsTracker:
         moe_layer_freq: Optional[Union[int, List[int]]] = None,
         mtp_num_layers: Optional[int] = None,
         pg_collection: Optional[ProcessGroupCollection] = None,
+        total_loss_dict: Optional[dict[str, torch.Tensor]] = None,
     ) -> str:
         """Track MoE metrics: reduce, write to backends, and return log string.
 
@@ -137,6 +138,8 @@ class MoEMetricsTracker:
             num_layers: Total number of layers (required if force_initialize is True).
             moe_layer_freq: Frequency of MoE layers or list indicating MoE layer pattern.
             mtp_num_layers: Number of MTP (Multi-Token Prediction) layers to add.
+            total_loss_dict: Optional interval accumulator from training loop.
+                Metrics with names ending in "loss" are accumulated here.
 
         Returns:
             Formatted log string for console output.
@@ -159,6 +162,13 @@ class MoEMetricsTracker:
         # Aggregate metrics to scalars
         aggregated = self._aggregate_metrics(loss_scale, num_moe_layers, names_list)
 
+        accumulated_loss_names = set()
+        if total_loss_dict is not None:
+            # Keep aux losses consistent with interval-based console reporting.
+            loss_metrics = {k: v for k, v in aggregated.items() if k.lower().endswith("loss")}
+            accumulated_loss_names = set(loss_metrics.keys())
+            self._accumulate_loss_metrics_into_total_loss_dict(loss_metrics, total_loss_dict)
+
         # Write aggregated metrics to TensorBoard/W&B
         self.write(aggregated, iteration, writer, wandb_writer)
 
@@ -167,7 +177,8 @@ class MoEMetricsTracker:
             self._write_per_layer_metrics(loss_scale, iteration, writer, wandb_writer, names_list)
 
         # Get log string for console
-        log_string = self.get_log_string(aggregated)
+        log_aggregated = {k: v for k, v in aggregated.items() if k not in accumulated_loss_names}
+        log_string = self.get_log_string(log_aggregated)
 
         # Clear after tracking
         self.clear()
@@ -328,14 +339,14 @@ class MoEMetricsTracker:
 
     def _aggregate_metrics(
         self, loss_scale: float, num_moe_layers: int, names: List[str]
-    ) -> Dict[str, float]:
+    ) -> Dict[str, Union[float, torch.Tensor]]:
         """Aggregate layer-wise metrics to scalar values.
 
         For all metrics: computes average across layers.
         If layer_percentiles is set: also computes specified percentiles as additional scalars.
 
         Returns:
-            Dictionary of aggregated metric name -> scalar value.
+            Dictionary of aggregated metric name -> scalar value (float or 0-D tensor).
         """
         aggregated = {}
 
@@ -357,9 +368,21 @@ class MoEMetricsTracker:
                         aggregated[f"{name}_p{int(pct * 100)}"] = pct_val
 
             # Always compute mean
-            aggregated[name] = (values.sum() / num_moe_layers).item()
+            aggregated[name] = values.sum() / num_moe_layers
 
         return aggregated
+
+    def _accumulate_loss_metrics_into_total_loss_dict(
+        self,
+        aggregated: Dict[str, Union[float, torch.Tensor]],
+        total_loss_dict: dict[str, torch.Tensor],
+    ) -> None:
+        """Accumulate aggregated metrics into interval loss dict."""
+        for name, value in aggregated.items():
+            if name in total_loss_dict:
+                total_loss_dict[name] += value
+            else:
+                total_loss_dict[name] = value
 
     def _write_scalar_metric(
         self, name: str, value: float, iteration: int, writer, wandb_writer

@@ -989,9 +989,7 @@ def track_moe_metrics(
     """Track the MoE metrics for logging.
 
     Deprecated: Use MoEMetricsTracker.get_instance().track() directly.
-    Note: total_loss_dict is intentionally ignored in the tracker path.
     """
-    _ = total_loss_dict
     return MoEMetricsTracker.get_instance().track(
         loss_scale=loss_scale,
         iteration=iteration,
@@ -1004,6 +1002,7 @@ def track_moe_metrics(
         moe_layer_freq=moe_layer_freq,
         mtp_num_layers=mtp_num_layers,
         pg_collection=pg_collection,
+        total_loss_dict=total_loss_dict,
     )
 
 
