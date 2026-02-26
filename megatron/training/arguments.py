@@ -824,13 +824,12 @@ def validate_args(args, defaults={}):
 
         assert args.ckpt_format == "fsdp_dtensor", \
             "Megatron FSDP only supports fsdp_dtensor checkpoint format"
-        
+
+        args.reuse_grad_buf_for_mxfp8_param_ag = False
+
     if args.fsdp_manual_registration:
         assert args.use_megatron_fsdp, "FSDP manual registration is only supported with Megatron FSDP"
         assert args.nccl_ub, "FSDP manual registration is only supported with nccl-ub option"
-
-        if args.use_megatron_fsdp:
-            args.reuse_grad_buf_for_mxfp8_param_ag = False
 
     # Parameters dtype.
     args.params_dtype = torch.float
@@ -1328,15 +1327,15 @@ def validate_args(args, defaults={}):
 
     # Muon optimizer check
     if 'muon' in args.optimizer:
-
         # TODO: remove these checks once we support them
         assert not args.overlap_grad_reduce, "Muon optimizer does not support overlap grad reduce for now."
         assert not args.overlap_param_gather, "Muon optimizer does not support overlap param gather for now."
-
         assert not args.use_distributed_optimizer, "Muon optimizer does not support distributed optimizer for now."
         assert not args.use_torch_fsdp2, "Muon optimizer does not support Torch-FSDP2 for now."
         assert not args.use_megatron_fsdp, "Muon optimizer does not support Megatron-FSDP for now."
         assert args.ckpt_format in ["torch", "torch_dist"], "Muon optimizer supports torch and torch_dist checkpoint format."
+        assert args.experimental_attention_variant is None, "Muon optimizer does not support attention variant for now."
+        assert not args.attention_output_gate, "Muon optimizer does not support attention output gate for now."
 
     # Optimizer CPU offload check
     if args.optimizer_cpu_offload:
@@ -1348,6 +1347,11 @@ def validate_args(args, defaults={}):
             "When `--fp8-param-gather` is enabled, the optimizer cpu offload "
             "must be used in conjunction with `--fp8-recipe delayed`."
         )
+
+    if args.offload_optimizer_states:
+        assert args.use_distributed_optimizer, "offload_optimizer_states is only supported with distributed optimizer"
+        assert args.optimizer == 'adam', "offload_optimizer_states is only supported with adam optimizer"
+        assert not args.use_megatron_fsdp, "offload_optimizer_states does not support Megatron-FSDP for now."
 
     if args.non_persistent_ckpt_type == "local":
         assert args.non_persistent_local_ckpt_dir is not None, "Tried to use local checkpointing without specifying --local-ckpt-dir!"
@@ -2261,6 +2265,14 @@ def _add_training_args(parser):
                        help='Disable pinning of CPU memory for gradients.')
     group.add_argument('--no-pin-cpu-params', action='store_false', dest='pin_cpu_params',
                        help='Disable pinning of CPU memory for parameters.')
+    group.add_argument('--offload-optimizer-states',
+                       action='store_true',
+                       dest='offload_optimizer_states',
+                       help='Offload optimizer states to CPU after each optimizer step and '
+                       'reload them before the next optimizer step. '
+                       'Only support TE FusedAdam optimizer.'
+                       'Note that this still uses pure GPU optimizer instead of '
+                       'HybridDeviceOptimizer for --optimizer-cpu-offload.')
     group.add_argument('--dataloader-type', type=str, default=None,
                        choices=['single', 'cyclic', 'external'],
                        help='Single pass vs multiple pass data loader')

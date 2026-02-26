@@ -12,6 +12,7 @@ from megatron.core.enums import Fp4Recipe, Fp8Recipe
 from megatron.core.quantization.quant_config import RecipeConfig
 from megatron.core.transformer.enums import AttnBackend, CudaGraphScope
 from megatron.core.transformer.pipeline_parallel_layer_layout import PipelineParallelLayerLayout
+from megatron.core.utils import experimental_api
 
 from .._rank_utils import log_single_rank
 from ..fusions.fused_bias_geglu import quick_gelu
@@ -35,6 +36,7 @@ except ImportError:
 
 
 @dataclass
+@experimental_api
 class TransformerConfig(ModelParallelConfig):
     """Configuration object for megatron-core transformers.
 
@@ -285,6 +287,9 @@ class TransformerConfig(ModelParallelConfig):
     ####################
     # linear attention
     ####################
+    linear_attention_type: Optional[str] = None
+    """Type of linear attention to use.
+    Deprecated. Use experimental_attention_variant instead."""
     linear_attention_freq: Optional[Union[int, List[int]]] = None
     """Frequency between LA (linear attention) layers 
     and SDPA (scaled dot-product attention) layers.
@@ -557,7 +562,7 @@ class TransformerConfig(ModelParallelConfig):
     in the hidden_states gradient."""
 
     moe_shared_expert_gate: bool = False
-    """Enable gate for shared expert. Only effective when 
+    """Enable gate for shared expert. Only effective when
     moe-shared-expert-intermediate-size is set."""
 
     moe_shared_expert_overlap: bool = False
@@ -658,6 +663,13 @@ class TransformerConfig(ModelParallelConfig):
     moe_router_force_load_balancing: bool = False
     """[Experimental] Force load balancing with random logits for MoE router, supports naive topk 
     and group-limited topk. This is an experimental feature and only for benchmark."""
+
+    moe_router_force_biased: Optional[float] = None
+    """[Experimental] Apply random expert bias in normal distribution with specified std
+    to router logits. Shared seed across all ranks ensures identical bias.
+    If positive, generates new random bias each forward pass.
+    If negative, generates bias once per layer and reuses it (abs value is std).
+    This is an experimental feature for benchmarking purposes."""
 
     moe_grouped_gemm: bool = False
     """When there are multiple experts per rank, compress multiple local (potentially small) gemms
@@ -905,6 +917,9 @@ class TransformerConfig(ModelParallelConfig):
     """Transformer implementation to use.
     Options are 'transformer_engine' for Transformer Engine and 'local' for MCore."""
 
+    fallback_to_eager_attn: bool = False
+    """Whether to fallback to eager attention in TE implementation.
+    Suggested for when desired features are not available in TE implementation."""
     #####################################
     # Fine-grained Activation Offloading
     #####################################
@@ -981,45 +996,56 @@ class TransformerConfig(ModelParallelConfig):
                 f"tensor_model_parallel_size ({self.tensor_model_parallel_size})."
             )
 
-        if self.experimental_attention_variant == "gated_delta_net":
+        if self.linear_attention_type is not None:
+            warnings.warn(
+                "linear_attention_type is deprecated, "
+                "use experimental_attention_variant instead."
+            )
+            self.experimental_attention_variant = self.linear_attention_type
+            self.linear_attention_type = None
+
+        if self.experimental_attention_variant in ["gated_delta_net"]:
             assert (
                 self.linear_attention_freq is not None
-            ), f"linear_attention_freq must be set for linear gated_delta_net."
+            ), f"linear_attention_freq must be set for linear attention."
 
-            # Check required parameters
-            assert (
-                self.linear_conv_kernel_dim is not None
-            ), "linear_conv_kernel_dim must be set for gated delta net."
-            assert (
-                self.linear_key_head_dim is not None
-            ), "linear_key_head_dim must be set for gated delta net."
-            assert (
-                self.linear_value_head_dim is not None
-            ), "linear_value_head_dim must be set for gated delta net."
-            assert (
-                self.linear_num_key_heads is not None
-            ), "linear_num_key_heads must be set for gated delta net."
-            assert (
-                self.linear_num_value_heads is not None
-            ), "linear_num_value_heads must be set for gated delta net."
-            assert self.linear_num_value_heads % self.linear_num_key_heads == 0, (
-                f"linear_num_value_heads ({self.linear_num_value_heads}) must be a multiple of "
-                f"linear_num_key_heads ({self.linear_num_key_heads})."
-            )
+            if self.experimental_attention_variant == "gated_delta_net":
+                # Check required parameters
+                assert (
+                    self.linear_conv_kernel_dim is not None
+                ), "linear_conv_kernel_dim must be set for gated delta net."
+                assert (
+                    self.linear_key_head_dim is not None
+                ), "linear_key_head_dim must be set for gated delta net."
+                assert (
+                    self.linear_value_head_dim is not None
+                ), "linear_value_head_dim must be set for gated delta net."
+                assert (
+                    self.linear_num_key_heads is not None
+                ), "linear_num_key_heads must be set for gated delta net."
+                assert (
+                    self.linear_num_value_heads is not None
+                ), "linear_num_value_heads must be set for gated delta net."
+                assert self.linear_num_value_heads % self.linear_num_key_heads == 0, (
+                    f"linear_num_value_heads ({self.linear_num_value_heads}) must be a multiple of "
+                    f"linear_num_key_heads ({self.linear_num_key_heads})."
+                )
 
-            # Check tensor parallelism compatibility
+                # Check tensor parallelism compatibility
+                tp_cp_size = self.tensor_model_parallel_size * self.context_parallel_size
+                assert self.linear_num_key_heads % tp_cp_size == 0, (
+                    f"{self.linear_num_key_heads=} must be a multiple of "
+                    f"({self.tensor_model_parallel_size=} * {self.context_parallel_size=})."
+                )
+                assert self.linear_num_value_heads % tp_cp_size == 0, (
+                    f"{self.linear_num_value_heads=} must be a multiple of "
+                    f"({self.tensor_model_parallel_size=} * {self.context_parallel_size=})."
+                )
+        elif self.experimental_attention_variant == "dsa":
             assert (
-                self.linear_num_key_heads % self.tensor_model_parallel_size == 0
-            ), "linear_num_key_heads must be a multiple of tensor_model_parallel_size."
-            assert (
-                self.linear_num_value_heads % self.tensor_model_parallel_size == 0
-            ), "linear_num_value_heads must be a multiple of tensor_model_parallel_size."
-
-            # Do not support yet, but coming soon.
-            assert self.context_parallel_size == 1, (
-                f"Gated delta net does not support context parallel for now,"
-                f" but got {self.context_parallel_size=}."
-            )
+                self.context_parallel_size == 1
+            ), "Currently context parallelism is not supported by DSAttention!"
+            assert not self.apply_rope_fusion, "RoPE fusion is not supported for DSAttention"
 
         if self.fp8:
             # cannot support first last layer bf16 with delayed scaling
@@ -2013,18 +2039,31 @@ class TransformerConfig(ModelParallelConfig):
                     f"the number of layers ({self.num_layers})"
                 )
 
+        if self.fallback_to_eager_attn:
+            assert self.transformer_impl == "transformer_engine", (
+                f"fallback_to_eager_attn is only available with transformer_engine implementation,"
+                f" but got {self.transformer_impl=}."
+            )
+
+        if self.fallback_to_eager_attn or self.transformer_impl == "local":
+            if self.context_parallel_size > 1 and self.cp_comm_type is not None:
+                all_cp_comm_types_are_all_gather = (
+                    all(item == "all_gather" for item in self.cp_comm_type)
+                    if isinstance(self.cp_comm_type, list)
+                    else self.cp_comm_type == "all_gather"
+                )
+                if not all_cp_comm_types_are_all_gather:
+                    raise ValueError(
+                        f"fallback_to_eager_attn only supports all_gather communication type "
+                        f"for context parallelism, but got {self.cp_comm_type=} instead."
+                    )
+
         if self.transformer_impl == "inference_optimized":
             assert self.normalization == "RMSNorm"
             assert not self.layernorm_zero_centered_gamma
             assert not self.add_bias_linear
             assert not self.add_qkv_bias
             assert not self.use_kitchen
-
-        if self.experimental_attention_variant == "dsa":
-            assert (
-                self.context_parallel_size == 1
-            ), "Currently context parallelism is not supported by DSAttention!"
-            assert not self.apply_rope_fusion, "RoPE fusion is not supported for DSAttention"
 
         if self.inference_fuse_tp_communication:
             assert self.transformer_impl == "inference_optimized", (
@@ -2039,6 +2078,7 @@ class TransformerConfig(ModelParallelConfig):
 
 
 @dataclass
+@experimental_api
 class MLATransformerConfig(TransformerConfig):
     """Configuration object for megatron-core Multi-Latent Attention (MLA) transformers.
 

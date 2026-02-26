@@ -25,6 +25,7 @@ from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.quantization.utils import get_quant_config_or_none
 from megatron.core.tensor_parallel import gather_from_sequence_parallel_region
 from megatron.core.transformer.enums import CudaGraphScope, ModelType
+from megatron.core.transformer.linear_cross_entropy import LinearCrossEntropyModule
 from megatron.core.transformer.multi_token_prediction import (
     MultiTokenPredictionBlock,
     mtp_on_this_rank,
@@ -146,6 +147,11 @@ class GPTModel(LanguageModule):
             self.config, ignore_virtual=False, vp_stage=vp_stage
         )
 
+        self.fuse_linear_cross_entropy = (
+            self.config.cross_entropy_loss_fusion
+            and self.config.cross_entropy_fusion_impl == "linear"
+        )
+
         if self.pre_process or self.mtp_process:
             self.embedding = LanguageModelEmbedding(
                 config=self.config,
@@ -238,7 +244,7 @@ class GPTModel(LanguageModule):
                 self.embedding_activation_buffer = None
                 self.grad_output_buffer = None
 
-            self.output_layer = tensor_parallel.ColumnParallelLinear(
+            self.output_layer = LinearCrossEntropyModule(
                 config.hidden_size,
                 self.vocab_size,
                 config=config,
@@ -645,9 +651,12 @@ class GPTModel(LanguageModule):
                     hidden_states.squeeze(1).unsqueeze(0)
                 ).unsqueeze(1)
 
-        logits, _ = self.output_layer(
-            hidden_states, weight=output_weight, runtime_gather_output=runtime_gather_output
-        )
+        if has_config_logger_enabled(self.config) or labels is None:
+            logits, _ = self.output_layer(
+                hidden_states, weight=output_weight, runtime_gather_output=runtime_gather_output
+            )
+        else:
+            logits = None
 
         # Restore sequence parallel execution to the output layer if necessary.
         if sequence_parallel_override:
@@ -674,7 +683,18 @@ class GPTModel(LanguageModule):
             # [s b h] => [b s h]
             return logits.transpose(0, 1).contiguous()
 
-        loss = self.compute_language_model_loss(labels, logits)
+        output_layer_kwargs = dict(
+            input_=hidden_states, weight=output_weight, runtime_gather_output=runtime_gather_output
+        )
+        if self.fuse_linear_cross_entropy:
+            loss = self.output_layer(
+                output_cross_entropy_loss=self.fuse_linear_cross_entropy,
+                labels=labels,
+                **output_layer_kwargs,
+            )
+        else:
+            logits, _ = self.output_layer(**output_layer_kwargs)
+            loss = self.compute_language_model_loss(labels, logits)
 
         return loss
 

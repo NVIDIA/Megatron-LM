@@ -37,6 +37,8 @@ from megatron.core.transformer.moe.moe_utils import (
 from megatron.core.transformer.moe.shared_experts import SharedExpertMLP
 from megatron.core.transformer.transformer_config import TransformerConfig
 
+logger = logging.getLogger(__name__)
+
 """ We use the following notation throughout this file:
      H: hidden size
      B: micro batch size

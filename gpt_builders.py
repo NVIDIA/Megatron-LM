@@ -11,6 +11,7 @@ from megatron.core.models.gpt.gpt_layer_specs import (
 )
 from megatron.core.models.gpt.experimental_attention_variant_module_specs import (
     get_transformer_block_with_experimental_attention_variant_spec,
+    get_transformer_layer_with_experimental_attention_variant_spec,
 )
 from megatron.core.models.gpt.heterogeneous.heterogeneous_layer_specs import (
     get_gpt_heterogeneous_layer_spec,
@@ -71,23 +72,29 @@ def gpt_builder(args, pre_process, post_process, vp_stage=None, config=None, pg_
         mtp_block_spec = None
         if args.mtp_num_layers is not None:
             assert not (config.transformer_impl == "inference_optimized")
-            if (
-                hasattr(transformer_layer_spec, 'layer_specs')
-                and len(transformer_layer_spec.layer_specs) == 0
-            ):
-                # Get the decoder layer spec explicitly if no decoder layer in the last stage,
-                # Only happens with block spec (TransformerBlockSubmodules) when using MoE.
-                transformer_layer_spec_for_mtp = _get_transformer_layer_spec(use_te, config)
+            # Get GPT decoder layer specs for the model.
+            if args.spec is not None:
+                mtp_transformer_layer_spec = import_module(args.spec)
             else:
                 # Define the decoder block spec
-                decoder_layer_specs = get_gpt_decoder_layer_specs(
-                    config, use_transformer_engine=use_te, normalization=args.normalization, qk_l2_norm=args.qk_l2_norm, vp_stage=vp_stage
-                )
-                transformer_layer_spec_for_mtp = decoder_layer_specs[-1]
+                if args.experimental_attention_variant is not None:
+                    decoder_layer_specs = (
+                        get_transformer_layer_with_experimental_attention_variant_spec(
+                            config=config
+                        )
+                    )
+                else:
+                    decoder_layer_specs = get_gpt_decoder_layer_specs(
+                        config,
+                        use_transformer_engine=use_te,
+                        normalization=args.normalization,
+                        qk_l2_norm=args.qk_l2_norm,
+                    )
+                mtp_transformer_layer_spec = decoder_layer_specs[-1]
             # Use spec of the last layer in decoder block as spec of the transformer layer in MTP
             mtp_block_spec = get_gpt_mtp_block_spec(
                 config,
-                transformer_layer_spec_for_mtp,
+                mtp_transformer_layer_spec,
                 use_transformer_engine=use_te,
                 vp_stage=vp_stage,
             )
@@ -138,6 +145,7 @@ def _get_transformer_layer_spec(use_te, config):
             use_kitchen=config.use_kitchen,
             use_kitchen_attention=config.use_kitchen_attention,
             kitchen_attention_backend=config.kitchen_attention_backend,
+            fallback_to_eager_attn=config.fallback_to_eager_attn,
         )
     elif config.transformer_impl == "inference_optimized":
         return get_gpt_layer_with_inference_spec(

@@ -127,6 +127,11 @@ class MambaModel(LanguageModule):
         # TODO: remove this dependency ?
         self.model_type = ModelType.encoder_or_decoder
 
+        self.fuse_linear_cross_entropy = (
+            self.config.cross_entropy_loss_fusion
+            and self.config.cross_entropy_fusion_impl == "linear"
+        )
+
         if self.pre_process or self.mtp_process:
             self.embedding = LanguageModelEmbedding(
                 config=self.config,
@@ -359,9 +364,10 @@ class MambaModel(LanguageModule):
                     hidden_states.squeeze(1).unsqueeze(0)
                 ).unsqueeze(1)
 
-        logits, _ = self.output_layer(
-            hidden_states, weight=output_weight, runtime_gather_output=runtime_gather_output
-        )
+        if labels is None:
+            logits, _ = self.output_layer(
+                hidden_states, weight=output_weight, runtime_gather_output=runtime_gather_output
+            )
 
         # Restore sequence parallel execution to the output layer if necessary.
         if sequence_parallel_override:
@@ -376,6 +382,17 @@ class MambaModel(LanguageModule):
             # [s b h] => [b s h]
             return logits.transpose(0, 1).contiguous()
 
-        loss = self.compute_language_model_loss(labels, logits)
+        output_layer_kwargs = dict(
+            input_=hidden_states, weight=output_weight, runtime_gather_output=runtime_gather_output
+        )
+        if self.fuse_linear_cross_entropy:
+            loss = self.output_layer(
+                output_cross_entropy_loss=self.fuse_linear_cross_entropy,
+                labels=labels,
+                **output_layer_kwargs,
+            )
+        else:
+            logits, _ = self.output_layer(**output_layer_kwargs)
+            loss = self.compute_language_model_loss(labels, logits)
 
         return loss

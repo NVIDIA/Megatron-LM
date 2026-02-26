@@ -57,7 +57,6 @@ if HAVE_TE:
         QUANTIZED_MODEL_INIT_CLASS = fp8_model_init
 else:
     QUANTIZED_MODEL_INIT_CLASS = nullcontext
-
 # Detect the FP8 tensor class
 try:
     from transformer_engine.pytorch.tensor import QuantizedTensor

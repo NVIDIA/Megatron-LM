@@ -100,11 +100,16 @@ def load_and_flatten(config_path: str) -> List[dotdict]:
 
 def filter_by_test_case(workload_manifests: List[dotdict], test_case: str) -> Optional[dotdict]:
     """Returns a workload with matching name. Raises an error if there no or more than a single workload."""
+    print(len(workload_manifests))
     workload_manifests = list(
         workload_manifest
         for workload_manifest in workload_manifests
         if workload_manifest["spec"]["test_case"] == test_case
     )
+    print(len(workload_manifests))
+
+    for w in workload_manifests:
+        print(w["spec"]["test_case"])
 
     if len(workload_manifests) > 1:
         logger.info("Duplicate test_case found!")

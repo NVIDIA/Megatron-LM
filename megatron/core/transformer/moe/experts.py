@@ -34,6 +34,7 @@ from megatron.core.pipeline_parallel.fine_grained_activation_offload import (
 from megatron.core.tensor_parallel.layers import (
     _initialize_affine_weight_cpu,
     _initialize_affine_weight_gpu,
+    set_tensor_model_parallel_attributes,
 )
 from megatron.core.tensor_parallel.utils import divide
 from megatron.core.transformer.mlp import (
@@ -184,6 +185,14 @@ class GroupedMLP(MegatronModule):
                     rank=tp_rank,
                     world_size=tp_size,
                 )
+            else:
+                # Ensure TP attrs are set even when not initializing
+                set_tensor_model_parallel_attributes(
+                    tensor=self.weight1, is_parallel=True, dim=1, stride=1
+                )
+                set_tensor_model_parallel_attributes(
+                    tensor=self.weight2, is_parallel=True, dim=0, stride=1
+                )
         else:
             self.weight1 = Parameter(
                 torch.empty(
@@ -207,6 +216,14 @@ class GroupedMLP(MegatronModule):
                 )
                 _initialize_affine_weight_gpu(
                     self.weight2, config.output_layer_init_method, partition_dim=0, is_expert=True
+                )
+            else:
+                # Ensure TP attrs are set even when not initializing
+                set_tensor_model_parallel_attributes(
+                    tensor=self.weight1, is_parallel=True, dim=1, stride=1
+                )
+                set_tensor_model_parallel_attributes(
+                    tensor=self.weight2, is_parallel=True, dim=0, stride=1
                 )
         setattr(self.weight1, 'allreduce', not self.expert_parallel)
         setattr(self.weight2, 'allreduce', not self.expert_parallel)

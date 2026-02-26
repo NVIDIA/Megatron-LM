@@ -972,6 +972,12 @@ def make_tp_sharded_tensor_for_checkpoint(
     # Pop group parameters from kwargs
     tp_group = kwargs.pop('tp_group', None)
     dp_cp_group = kwargs.pop('dp_cp_group', None)
+    # If there are any additional kwargs left, surface them for visibility
+    # (these will be forwarded to ShardedTensor.from_rank_offsets).
+    if kwargs:
+        logger.warning(
+            "make_tp_sharded_tensor_for_checkpoint received extra kwargs: %s", list(kwargs.keys())
+        )
 
     prepend_axis_num = len(prepend_offsets)
 
@@ -1037,6 +1043,12 @@ def make_sharded_tensor_for_checkpoint(tensor, key, prepend_offsets=(), replica_
     # Pop group parameters from kwargs
     tp_group = kwargs.pop('tp_group', None)
     dp_cp_group = kwargs.pop('dp_cp_group', None)
+    # If there are any additional kwargs left, surface them for visibility
+    # (these will be forwarded to ShardedTensor.from_rank_offsets).
+    if kwargs:
+        logger.warning(
+            "make_sharded_tensor_for_checkpoint received extra kwargs: %s", list(kwargs.keys())
+        )
 
     prepend_axis_num = len(prepend_offsets)
 

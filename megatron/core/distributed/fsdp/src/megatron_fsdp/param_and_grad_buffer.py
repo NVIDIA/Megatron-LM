@@ -2838,7 +2838,6 @@ class ParamAndGradBuffer:
                 if is_blockwise_float8tensor(param):
                     fp8_params.append(param)
                     if model_param.numel() == 0:
-                        # Empty parameter.
                         shard_fp32_from_fp8.append(None)
                         shard_offsets_in_fp8.append(None)
                         shard_model_params.append([None, None])

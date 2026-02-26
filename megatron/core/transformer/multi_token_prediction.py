@@ -1,4 +1,4 @@
-# Copyright (c) 2025, NVIDIA CORPORATION. All rights reserved.
+# Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 from __future__ import annotations
 
 import warnings
@@ -661,19 +661,28 @@ def process_mtp_loss(
     # correctly scaled relative to the main loss gradients in finalize_model_grads.
     original_num_tokens = loss_mask.sum()
 
+    fuse_linear_cross_entropy = (
+        config.cross_entropy_loss_fusion and config.cross_entropy_fusion_impl == "linear"
+    )
     for mtp_layer_number in range(config.mtp_num_layers):
-        mtp_logits, _ = output_layer(
-            hidden_states_list[mtp_layer_number + 1],
-            weight=output_weight,
-            runtime_gather_output=runtime_gather_output,
-        )
         mtp_labels, _ = roll_tensor(
             mtp_labels, shifts=-1, dims=-1, cp_group=cp_group, packed_seq_params=packed_seq_params
         )
         loss_mask, num_tokens = roll_tensor(
             loss_mask, shifts=-1, dims=-1, cp_group=cp_group, packed_seq_params=packed_seq_params
         )
-        mtp_loss = compute_language_model_loss(mtp_labels, mtp_logits)
+        output_layer_kwargs = dict(
+            input_=hidden_states_list[mtp_layer_number + 1],
+            weight=output_weight,
+            runtime_gather_output=runtime_gather_output,
+        )
+        if fuse_linear_cross_entropy:
+            mtp_loss = output_layer(
+                output_cross_entropy_loss=True, labels=mtp_labels, **output_layer_kwargs
+            )
+        else:
+            mtp_logits, _ = output_layer(**output_layer_kwargs)
+            mtp_loss = compute_language_model_loss(mtp_labels, mtp_logits)
         mtp_loss = loss_mask * mtp_loss
         if is_training:
             mtp_loss_for_log = (

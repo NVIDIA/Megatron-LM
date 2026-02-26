@@ -391,7 +391,6 @@ class TransformerBlock(GraphableMegatronModule, MegatronModule):
     def has_final_layernorm_in_this_stage(self):
         """
         Check if this vpp stage contains the final layernorm.
-
         Note:
             Final layernorm now has been moved from the post-process stage to the last decoder
             layer by using this function.

@@ -139,6 +139,14 @@ class DistributedDataParallelConfig:
     initial communication cost.
     """
 
+    fsdp_all_gather_in_start_param_sync: bool = True
+    """
+    If True, use all-gather during the initial Megatron-FSDP parameter
+    synchronization step. This can increase overlap between the first
+    parameter all-gather and computation, helping to better hide the
+    initial communication cost.
+    """
+
     outer_dp_sharding_strategy: str = 'no_shard'
     """
     Sharding strategy for outer data parallel group in Hybrid Sharded Data Parallel (HSDP) mode.

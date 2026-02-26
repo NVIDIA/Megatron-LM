@@ -561,7 +561,7 @@ def save_checkpoint(iteration, model, optimizer, opt_param_scheduler, num_floati
         ensure_directory_exists(optim_checkpoint_name)
         if not optimizer.is_stub_optimizer:
             optimizer.save_parameter_state(optim_checkpoint_name)
-
+    
     # LayerWiseDistributedOptimizer save optimizer state to file on different ranks
     if getattr(args, "optimizer", "adam").startswith("dist_") and args.ckpt_format == 'torch':
         dp_rank = mpu.get_data_parallel_rank()

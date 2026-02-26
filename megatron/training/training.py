@@ -142,7 +142,8 @@ from megatron.training.datasets.data_samplers import build_pretraining_data_load
 from megatron.core.datasets.data_schedule import HybridCPDataLoaderWrapper
 from megatron.core.optimizer_param_scheduler import OptimizerParamScheduler
 from megatron.core.transformer.moe import upcycling_utils
-from megatron.core.transformer.moe.moe_utils import track_moe_metrics, clear_aux_losses_tracker
+from megatron.core.transformer.moe.moe_logging import MoEMetricsTracker
+from megatron.core.transformer.moe.moe_utils import clear_aux_losses_tracker
 from megatron.core.transformer.experimental_attention_variant.dsa import DSAIndexerLossLoggingHelper
 from megatron.core.transformer.multi_token_prediction import MTPLossLoggingHelper
 from megatron.core.parallel_state import (
@@ -825,7 +826,9 @@ def pretrain(
             set_ideal_affinity_for_current_gpu
         )
         set_ideal_affinity_for_current_gpu()
-
+    if args.batch_invariant_mode:
+        print_rank_0("Enabling batch invariant mode globally", flush=True)
+        enable_batch_invariant_mode()
 
     if args.log_progress:
         append_to_progress_log("Starting job")
@@ -1677,6 +1680,12 @@ def train_step(forward_step_func, data_iterator, model, optimizer, opt_param_sch
     save_wgrads_in_this_iteration = (args.save_wgrads_interval is not None and
                                      (iteration + 1) % args.save_wgrads_interval == 0)
     while rerun_state_machine.should_run_forward_backward(data_iterator):
+        # Offload optimizer states to CPU if enabled.
+        if args.offload_optimizer_states:
+            for optim_instance in optimizer.chained_optimizers:
+                if isinstance(optim_instance, DistributedOptimizer):
+                    optim_instance.offload_states()
+
         # Set grad to zero.
         for model_chunk in model:
             model_chunk.zero_grad_buffer()
@@ -1711,6 +1720,14 @@ def train_step(forward_step_func, data_iterator, model, optimizer, opt_param_sch
                 for optim_instance in optimizer.chained_optimizers:
                     if isinstance(optim_instance, DistributedOptimizer):
                         optim_instance._copy_main_params_to_param_buffer()
+
+        # Release GPU memory for offloaded optimizer states.
+        # This needs to be done after _copy_main_params_to_param_buffer().
+        # Separate offload and release to allow early D2H transfer to overlap with other operations.
+        if args.offload_optimizer_states:
+            for optim_instance in optimizer.chained_optimizers:
+                if isinstance(optim_instance, DistributedOptimizer):
+                    optim_instance.release_offloaded_gpu_states()
 
         # Forward pass.
         if save_dgrads_in_this_iteration:
@@ -2018,8 +2035,8 @@ def training_log(
             writer.add_scalar('max_attention_logit', max_attention_logit, iteration)
             if wandb_writer:
                 wandb_writer.log({'max_attention_logit': max_attention_logit}, iteration)
-
     # Log MoE metrics.
+    moe_log_string = ""
     if args.num_experts is not None:
         moe_loss_scale = 1 / get_num_microbatches()
         track_names = []
@@ -2037,19 +2054,19 @@ def training_log(
         else:
             layers = args.num_layers
 
-        track_moe_metrics(
+        moe_log_string = MoEMetricsTracker.get_instance().report(
             loss_scale=moe_loss_scale,
             iteration=iteration,
             writer=writer,
             wandb_writer=wandb_writer,
-            total_loss_dict=total_loss_dict,
             per_layer_logging=args.moe_per_layer_logging,
             force_initialize=True,
-            track_names=track_names,
+            names=track_names,
             num_layers=layers,
             moe_layer_freq=args.moe_layer_freq,
             mtp_num_layers=args.mtp_num_layers,
             pg_collection=pg_collection,
+            total_loss_dict=total_loss_dict,
         )
 
     # Log MTP metrics.
@@ -2058,7 +2075,6 @@ def training_log(
         MTPLossLoggingHelper.track_mtp_metrics(
             mtp_loss_scale, iteration, writer, wandb_writer, total_loss_dict
         )
-
     # Track sparse attention indexer loss.
     if args.dsa_indexer_loss_coeff is not None and args.dsa_indexer_loss_coeff > 0:
         indexer_loss_scale = 1 / get_num_microbatches()
@@ -2069,7 +2085,6 @@ def training_log(
             wandb_writer=wandb_writer,
             total_loss_dict=total_loss_dict,
         )
-
     # Dump memory snapshot and print metrics to stdout.
     if iteration % args.log_interval == 0 or is_first_iteration:
         if args.record_memory_history and (is_last_rank() or torch.distributed.get_backend() == 'fake'):
@@ -2136,6 +2151,9 @@ def training_log(
                     log_string += ' {}: {:.6E} |'.format(key, avg)
                 if should_reset:
                     total_loss_dict[key] = torch.tensor([0.0], dtype=torch.float, device='cuda')
+        # Append MoE load balance discrepancy log string
+        if args.num_experts is not None and moe_log_string:
+            log_string += moe_log_string
         log_string += f' loss scale: {loss_scale:.1f} |'
         if grad_norm is not None:
             log_string += f' grad norm: {grad_norm:.3f} |'
@@ -2247,7 +2265,8 @@ def save_checkpoint_and_time(
 
     # Stop timer to get accurate train interval time and exclude checkpointing duration
     timers('interval-time').stop()
-    energy_monitor.pause()
+    if args.log_energy:
+        energy_monitor.pause()
 
     # Extra barrier is added to make sure all ranks report the max time.
     timer_key = 'save-checkpoint-non-persistent' if non_persistent_ckpt else 'save-checkpoint'
@@ -2300,7 +2319,9 @@ def save_checkpoint_and_time(
         )
 
     # Recover timing
-    energy_monitor.resume()
+    if args.log_energy:
+        energy_monitor.resume()
+
     timers('interval-time', log_level=0).start(barrier=True)
 
 
@@ -2631,7 +2652,21 @@ def train(
         config.param_sync_func = [model_chunk.start_param_sync for model_chunk in model]
         if len(model) == 1:
             config.param_sync_func = config.param_sync_func[0]
-    config.finalize_model_grads_func = finalize_model_grads
+
+    # Wrap finalize_model_grads to reload offloaded optimizer states before grad finalization.
+    # This allows H2D transfer to overlap with grad all-reduce.
+    if args.offload_optimizer_states:
+
+        def finalize_model_grads_with_state_reload(*fmg_args, **fmg_kwargs):
+            # Reload offloaded states for all DistributedOptimizer instances
+            for optim_instance in optimizer.chained_optimizers:
+                if isinstance(optim_instance, DistributedOptimizer):
+                    optim_instance.reload_offloaded_states()
+            return finalize_model_grads(*fmg_args, **fmg_kwargs)
+
+        config.finalize_model_grads_func = finalize_model_grads_with_state_reload
+    else:
+        config.finalize_model_grads_func = finalize_model_grads
 
     if args.log_energy:
         energy_monitor.setup()
@@ -3419,18 +3454,20 @@ def get_train_valid_test_num_samples():
     return (train_samples_in_current_phase, eval_samples, test_samples)
 
 
-def build_train_valid_test_datasets(build_train_valid_test_datasets_provider, train_valid_test_num_samples=None):
+def build_train_valid_test_datasets(build_train_valid_test_datasets_provider, train_valid_test_num_samples=None, vp_stage=None):
     """Build pretraining datasets."""
     if train_valid_test_num_samples is None:
         train_valid_test_num_samples = get_train_valid_test_num_samples()
-    print_rank_0(' > datasets target sizes (minimum size):')
     print_rank_0('    train:      {}'.format(train_valid_test_num_samples[0]))
     print_rank_0('    validation: {}'.format(train_valid_test_num_samples[1]))
     print_rank_0('    test:       {}'.format(train_valid_test_num_samples[2]))
-    return build_train_valid_test_datasets_provider(train_valid_test_num_samples)
+    if vp_stage is not None:
+        return build_train_valid_test_datasets_provider(train_valid_test_num_samples, vp_stage=vp_stage)
+    else:
+        return build_train_valid_test_datasets_provider(train_valid_test_num_samples)
 
 
-def build_train_valid_test_data_loaders(build_train_valid_test_datasets_provider):
+def build_train_valid_test_data_loaders(build_train_valid_test_datasets_provider, vp_stage=None):
     """Build pretraining data loaders."""
 
     args = get_args()
@@ -3477,7 +3514,10 @@ def build_train_valid_test_data_loaders(build_train_valid_test_datasets_provider
 
         else:
             # Build datasets.
-            train_ds, valid_ds, test_ds = build_train_valid_test_datasets(build_train_valid_test_datasets_provider)
+            train_ds, valid_ds, test_ds = build_train_valid_test_datasets(
+                build_train_valid_test_datasets_provider,
+                vp_stage=vp_stage,
+            )
             valid_ds = [valid_ds] if not isinstance(valid_ds, list) else valid_ds
             if args.skip_train:
                 train_dataloader = None
@@ -3517,14 +3557,15 @@ def build_train_valid_test_data_loaders(build_train_valid_test_datasets_provider
     return train_dataloader, valid_dataloaders, test_dataloader
 
 
-def build_train_valid_test_data_iterators(build_train_valid_test_datasets_provider):
+def build_train_valid_test_data_iterators(build_train_valid_test_datasets_provider, vp_stage=None):
     """Build pretraining data iterators."""
 
     args = get_args()
 
     # Build loaders.
     train_dataloader, valid_dataloaders, test_dataloader = build_train_valid_test_data_loaders(
-        build_train_valid_test_datasets_provider
+        build_train_valid_test_datasets_provider,
+        vp_stage=vp_stage
     )
 
     # Build iterators.

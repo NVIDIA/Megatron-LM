@@ -38,6 +38,7 @@ from megatron.training import (
     print_rank_0,
     set_startup_timestamps,
 )
+from megatron.training.arguments import core_transformer_config_from_args
 from megatron.training.datasets.sft_dataset import SFTDataset
 from megatron.core.transformer.multi_token_prediction import mtp_on_this_rank, get_mtp_ranks
 from megatron.training.arguments import core_transformer_config_from_args

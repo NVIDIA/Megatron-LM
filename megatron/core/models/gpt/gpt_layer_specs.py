@@ -40,7 +40,7 @@ from megatron.core.typed_torch import copy_signature
 from megatron.core.utils import is_te_min_version
 
 try:
-    import transformer_engine as te  # type: ignore[import-untyped]  # pylint: disable=unused-import
+    import transformer_engine as te  # pylint: disable=unused-import
 
     from megatron.core.extensions.transformer_engine import TEFusedMLP, TENorm
     from megatron.core.extensions.transformer_engine_spec_provider import TESpecProvider
@@ -56,7 +56,7 @@ except ImportError:
     HAVE_KITCHEN = False
 
 try:
-    import apex  # type: ignore[import-untyped]  # pylint: disable=unused-import
+    import apex  # pylint: disable=unused-import
 
     from megatron.core.fusions.fused_layer_norm import FusedLayerNorm
 
@@ -181,6 +181,7 @@ def get_gpt_layer_with_transformer_engine_submodules(
     use_te_op_fuser: Optional[bool] = False,
     use_kitchen: bool = False,
     use_te_activation_func: bool = False,
+    fallback_to_eager_attn: bool = False,
     use_kitchen_attention: bool = False,
     kitchen_attention_backend: str = "sdpa",
 ) -> TransformerLayerSubmodules:
@@ -213,7 +214,7 @@ def get_gpt_layer_with_transformer_engine_submodules(
     if use_kitchen:
         assert HAVE_KITCHEN
         backend: BackendSpecProvider = KitchenSpecProvider(
-            fallback=TESpecProvider(),
+            fallback=TESpecProvider(fallback_to_eager_attn=fallback_to_eager_attn),
             use_kitchen_attention=use_kitchen_attention,
             kitchen_attention_backend=kitchen_attention_backend,
         )
@@ -222,7 +223,7 @@ def get_gpt_layer_with_transformer_engine_submodules(
         if use_te_activation_func:
             raise AssertionError("use_te_activation_func not compatible with using kitchen.")
     else:
-        backend = TESpecProvider()
+        backend = TESpecProvider(fallback_to_eager_attn=fallback_to_eager_attn)
 
     mlp = get_mlp_module_spec_for_backend(
         backend=backend,
@@ -527,12 +528,14 @@ def get_gpt_decoder_layer_specs(
     use_transformer_engine: bool,
     normalization: Optional[str] = None,
     qk_l2_norm: Optional[bool] = False,
-    vp_stage: Optional[int] = None,
-    pp_rank: Optional[int] = None,
 ) -> TransformerBlockSubmodules:
     """GPT block spec."""
+    assert config.experimental_attention_variant is None, (
+        "Experimental attention variant is not supported with get_gpt_decoder_layer_specs, "
+        f"but got {config.experimental_attention_variant=}."
+    )
+
     if use_transformer_engine:
-        layer_norm_impl = TENorm
         dense_layer_spec = get_gpt_layer_with_transformer_engine_spec(
             num_experts=None,
             moe_grouped_gemm=False,
@@ -542,8 +545,6 @@ def get_gpt_decoder_layer_specs(
             qk_l2_norm=qk_l2_norm,
             use_kitchen=config.use_kitchen,
             use_te_activation_func=config.use_te_activation_func,
-            use_kitchen_attention=config.use_kitchen_attention,
-            kitchen_attention_backend=config.kitchen_attention_backend,
         )
         moe_layer_spec = get_gpt_layer_with_transformer_engine_spec(
             num_experts=config.num_moe_experts,
@@ -554,11 +555,8 @@ def get_gpt_decoder_layer_specs(
             qk_l2_norm=qk_l2_norm,
             use_kitchen=config.use_kitchen,
             use_te_activation_func=config.use_te_activation_func,
-            use_kitchen_attention=config.use_kitchen_attention,
-            kitchen_attention_backend=config.kitchen_attention_backend,
         )
     else:
-        layer_norm_impl = LNImpl
         dense_layer_spec = get_gpt_layer_local_spec(
             num_experts=None,
             moe_grouped_gemm=False,
@@ -568,8 +566,6 @@ def get_gpt_decoder_layer_specs(
             normalization=normalization,
             qk_l2_norm=qk_l2_norm,
             use_kitchen=config.use_kitchen,
-            use_kitchen_attention=config.use_kitchen_attention,
-            kitchen_attention_backend=config.kitchen_attention_backend,
         )
         moe_layer_spec = get_gpt_layer_local_spec(
             num_experts=config.num_moe_experts,
@@ -580,8 +576,6 @@ def get_gpt_decoder_layer_specs(
             normalization=normalization,
             qk_l2_norm=qk_l2_norm,
             use_kitchen=config.use_kitchen,
-            use_kitchen_attention=config.use_kitchen_attention,
-            kitchen_attention_backend=config.kitchen_attention_backend,
         )
 
     # Parse config.moe_layer_freq to determine the pattern of expert/dense layers.
@@ -629,13 +623,16 @@ def get_gpt_decoder_block_spec(
     layer_specs = get_gpt_decoder_layer_specs(
         config, use_transformer_engine, normalization, qk_l2_norm
     )
+
     # Slice the layer specs to only include the layers that are built in this pipeline stage.
     # Note: MCore layer_number starts at 1
     num_layers_to_build = get_num_layers_to_build(config, vp_stage=vp_stage, pp_rank=pp_rank)
 
     if config.pipeline_model_parallel_layout is not None:
         layout = config.pipeline_model_parallel_layout
-        assert isinstance(layout, PipelineParallelLayerLayout)
+        assert isinstance(
+            layout, PipelineParallelLayerLayout
+        ), f"Invalid pipeline model parallel layout: {layout}"
         local_layer_specs = [
             layer_specs[layer_id]
             for layer_id in layout.get_layer_id_list(
@@ -646,11 +643,11 @@ def get_gpt_decoder_block_spec(
         offset = get_transformer_layer_offset(config, vp_stage=vp_stage, pp_rank=pp_rank)
         local_layer_specs = layer_specs[offset : offset + num_layers_to_build]
 
+    # Block spec.
     if use_transformer_engine:
         layer_norm_impl = TENorm
     else:
         layer_norm_impl = LNImpl
-    # Block spec.
     block_spec = TransformerBlockSubmodules(
         layer_specs=local_layer_specs, layer_norm=layer_norm_impl
     )
@@ -667,22 +664,17 @@ def get_gpt_mtp_block_spec(
 ) -> MultiTokenPredictionBlockSubmodules:
     """GPT Multi-Token Prediction (MTP) block spec."""
     if use_transformer_engine:
-        backend: BackendSpecProvider = (
-            KitchenSpecProvider(
-                fallback=TESpecProvider(),
+        if config.use_kitchen:
+            backend: BackendSpecProvider = KitchenSpecProvider(
+                fallback=TESpecProvider(fallback_to_eager_attn=config.fallback_to_eager_attn),
                 use_kitchen_attention=config.use_kitchen_attention,
                 kitchen_attention_backend=config.kitchen_attention_backend,
             )
-            if config.use_kitchen
-            else TESpecProvider()
-        )
+        else:
+            backend = TESpecProvider(fallback_to_eager_attn=config.fallback_to_eager_attn)
     else:
         backend = (
-            KitchenSpecProvider(
-                fallback=LocalSpecProvider(),
-                use_kitchen_attention=config.use_kitchen_attention,
-                kitchen_attention_backend=config.kitchen_attention_backend,
-            )
+            KitchenSpecProvider(fallback=LocalSpecProvider())
             if config.use_kitchen
             else LocalSpecProvider()
         )

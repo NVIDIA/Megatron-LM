@@ -1,0 +1,74 @@
+MODEL_ARGS:
+  # Data args
+  --seq-length: 4096
+  --data-cache-path: ${DATA_CACHE_PATH}
+  --data-path: ${DATA_PATH}/text/the_pile/shard00/my-gpt3_00_text_document
+  --vocab-file: ${DATA_PATH}/text/the_pile/shard00/bpe/vocab.json
+  --merge-file: ${DATA_PATH}/text/the_pile/shard00/bpe/merges.txt
+  --split: 949,50,1
+  # Add transformer base args
+  --num-layers: 16
+  --hidden-size: 1024
+  --normalization: RMSNorm
+  --norm-epsilon: 1e-6
+  --disable-bias-linear: true
+  --max-position-embeddings: 4096
+  --make-vocab-size-divisible-by: 3232
+  --untie-embeddings-and-output-weights: true
+  # Add attention related args
+  --group-query-attention: true
+  --num-query-groups: 4
+  --kv-channels: 128
+  --qk-layernorm: true
+  --position-embedding-type: rope
+  --rotary-percent: 1.0
+  --rotary-base: 1000000
+  # Add MLP related args
+  --swiglu: true
+  --ffn-hidden-size: 4096
+  # Add MoE args
+  --num-experts: 32
+  --moe-layer-freq: ([0]*1+[1]*15)
+  --moe-ffn-hidden-size: 1024
+  --moe-shared-expert-intermediate-size: 1024
+  --moe-router-load-balancing-type: aux_loss
+  --moe-router-topk: 4
+  --moe-router-pre-softmax: true
+  --moe-grouped-gemm: true
+  --moe-aux-loss-coeff: 1e-4
+  --moe-router-group-topk: 2
+  --moe-router-num-groups: 4
+  --moe-router-topk-scaling-factor: 2.0
+  --moe-router-score-function: sigmoid
+  --moe-router-enable-expert-bias: true
+  --moe-router-bias-update-rate: 1e-3
+  --moe-router-dtype: fp32
+  # Add regularization args
+  --attention-dropout: 0.0
+  --hidden-dropout: 0.0
+  --clip-grad: 1.0
+  --weight-decay: 0.1
+  # Add learning rate args
+  --lr-warmup-fraction: .01
+  --lr: 0.00015
+  --min-lr: 1.0e-5
+  --lr-decay-style: cosine
+  --adam-beta1: 0.9
+  --adam-beta2: 0.95
+  # Add validation args
+  --eval-iters: 32
+  --eval-interval: 200
+  # Add initialization args
+  --init-method-std: 0.02
+  # Training args
+  --global-batch-size: 32
+  --train-iters: 50
+  --exit-duration-in-mins: 230
+  --no-check-for-nan-in-loss-and-grad: true
+
+METRICS:
+  - "lm loss"
+  - "num-zeros"
+  - "mem-allocated-bytes"
+  - "mem-max-allocated-bytes"
+  - "load_balancing_loss"

@@ -284,18 +284,26 @@ class MambaMixer(MegatronModule):
         self.act = nn.SiLU()
 
         with get_cuda_rng_tracker().fork():
-            # Initialize dt bias so that F.softplus(dt_bias) is between dt_min and dt_max
-            dt = torch.exp(
-                torch.rand(
+            if self.config.perform_initialization:
+                # Initialize dt bias so that F.softplus(dt_bias) is between dt_min and dt_max
+                dt = torch.exp(
+                    torch.rand(
+                        self.nheads_local_tp,
+                        device=torch.cuda.current_device(),
+                        dtype=config.params_dtype,
+                    )
+                    * (math.log(dt_max) - math.log(dt_min))
+                    + math.log(dt_min)
+                ).clamp(min=dt_init_floor)
+                # Inverse of softplus: https://github.com/pytorch/pytorch/issues/72759
+                inv_dt = dt + torch.log(-torch.expm1(-dt))
+            else:
+                inv_dt = torch.empty(
                     self.nheads_local_tp,
                     device=torch.cuda.current_device(),
                     dtype=config.params_dtype,
                 )
-                * (math.log(dt_max) - math.log(dt_min))
-                + math.log(dt_min)
-            ).clamp(min=dt_init_floor)
-            # Inverse of softplus: https://github.com/pytorch/pytorch/issues/72759
-            inv_dt = dt + torch.log(-torch.expm1(-dt))
+
             self.dt_bias = nn.Parameter(inv_dt)
             setattr(self.dt_bias, "tensor_model_parallel", True)
 

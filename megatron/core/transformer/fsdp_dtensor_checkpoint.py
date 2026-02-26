@@ -66,6 +66,19 @@ def get_ep_layer_offset(num_experts: int | None = None) -> int:
     return local_expert_offset
 
 
+def get_total_num_experts(num_experts: int | None = None) -> int:
+    """
+    Get the total number of experts for the current model.
+
+    Args:
+        num_experts: Total number of experts in the model. If None, returns 0.
+
+    Returns:
+        The total number of experts.
+    """
+    return num_experts if num_experts else 0
+
+
 def get_expert_index_from_key(key):
     """Extract expert index from various expert key formats.
 
@@ -102,7 +115,7 @@ def handle_experts_in_state_dict(state_dict, num_experts: int | None = None):
         The processed state dictionary with rewritten expert keys.
     """
     local_expert_start = get_ep_layer_offset(num_experts)
-    local_expert_end = num_experts if num_experts else 0
+    local_expert_end = get_total_num_experts(num_experts)
 
     def should_keep_expert_key(expert_index):
         """Determine if this rank should keep this expert key based on expert index"""
