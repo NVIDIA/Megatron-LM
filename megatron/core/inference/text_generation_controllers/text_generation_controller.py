@@ -966,8 +966,18 @@ class TextGenerationController:
         last_one_indices = torch.full(
             (active_request_count,), -1, device=token_to_request_index.device
         )
-        valid_indices = torch.nonzero(accepted_tokens_mask).squeeze(-1)
-        last_one_indices[token_to_request_index[valid_indices]] = valid_indices
+        
+        if num_decode_requests > 0:
+            # Summing the consecutive mask gives the count; subtract 1 for the local index
+            local_last_indices = decode_mask_2d.sum(dim=1) - 1
+            row_offsets = torch.arange(num_decode_requests, device=last_one_indices.device) * (self.num_speculative_tokens + 1)
+            last_one_indices[:num_decode_requests] = row_offsets + local_last_indices
+            
+        if num_prefill_requests > 0:
+            # Prefill requests only have 1 token evaluated, so nonzero() is perfectly safe here
+            decode_len = num_decode_requests * (self.num_speculative_tokens + 1)
+            prefill_valid = torch.nonzero(accepted_tokens_mask[decode_len:]).squeeze(-1) + decode_len
+            last_one_indices[num_decode_requests:] = prefill_valid
 
         # These are the tokens (output + speculative tokens) that will be going to the next forward pass
         final_sampled_tokens = output_tokens[last_one_indices]
@@ -1403,8 +1413,8 @@ class TextGenerationController:
             request_bookkeeping = self._dynamic_step_context_bookkeeping()
 
         ret = {
-            "sample": self._sampled_tokens_cuda[:active_request_count],
-            "accepted_tokens": self._accepted_tokens_per_request,
+            "sample": self._sampled_tokens_cuda[:active_request_count].clone(),
+            "accepted_tokens": self._accepted_tokens_per_request.clone() if self.num_speculative_tokens > 0 else None,
             "log_probs": log_probs,
             "top_n_logprobs": top_n_logprobs,
             "routing_indices_per_request": routing_indices_per_request,

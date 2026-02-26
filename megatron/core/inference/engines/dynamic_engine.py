@@ -922,7 +922,7 @@ class DynamicInferenceEngine(AbstractEngine):
 
             if self.num_speculative_tokens > 0:
                 accepted_tokens = list(filter(lambda tok: tok != -1, accepted_tokens_list))
-                tokens = tokens + accepted_tokens
+                tokens = accepted_tokens + tokens
 
             request: DynamicInferenceRequest = self.get_request(request_id)
             if request_id != self.context.chunked_prefill_request_id:
@@ -1154,10 +1154,10 @@ class DynamicInferenceEngine(AbstractEngine):
                     if list(generated_tokens[-stop_len:]) == stop_word_ids:
                         return True
                 else:
-                    # Need to check the last stop len tokens shifting by 1 up to num_speculative_tokens
-                    # Check logic and vecotrize this if possible
-                    for i in range(self.num_speculative_tokens):
-                        if list(generated_tokens[-stop_len - i : -i]) == stop_word_ids:
+                    # Check the last stop len tokens shifting by 1 up to num_speculative_tokens
+                    for i in range(self.num_speculative_tokens + 1):
+                        end_idx = -i if i > 0 else None
+                        if list(generated_tokens[-stop_len - i : end_idx]) == stop_word_ids:
                             return True
 
         return False

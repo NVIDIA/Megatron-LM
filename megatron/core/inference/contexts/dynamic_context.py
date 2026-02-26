@@ -1330,10 +1330,11 @@ class DynamicInferenceContext(BaseInferenceContext):
             if self.is_decode_only():
                 padded_token_count = min(
                     self.max_tokens,
-                    self.max_requests,
+                    self.max_requests * (self.num_speculative_tokens + 1),
                     self.round_up_tokens(self.active_token_count),
                 )
                 padded_decode_req_count = padded_token_count // (self.num_speculative_tokens + 1)
+                #print(f"self.max_tokens={self.max_tokens}, self.max_requests={self.max_requests}, self.active_token_count={self.active_token_count}, padded_decode_req_count={padded_decode_req_count}, padded_token_count={padded_token_count}")
                 padded_prefill_req_count = 0
             else:
                 target_padding_req_count = min(
@@ -2218,8 +2219,8 @@ class DynamicInferenceContext(BaseInferenceContext):
         assert self.total_request_count == active_request_count + self.paused_request_count
 
         if self.paused_request_count > 0:
-            self.paused_tokens = next_tokens[: self.paused_request_count]
-            self.paused_speculative_tokens = new_speculative_tokens[:, : self.paused_request_count]
+            self.paused_tokens = next_tokens[: self.paused_request_count].clone()
+            self.paused_speculative_tokens = new_speculative_tokens[:, : self.paused_request_count].clone()
 
         # add_ and fill_ calls seems to work as intended with sliced indexing (i.e. x[3:5].add(...) or x[3:5].fill_)
         # but when another tensor is used for indexing, it does not work as expected (i.e. x[y] if x and y are torch tensors)
