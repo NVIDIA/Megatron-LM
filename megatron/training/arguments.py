@@ -2888,7 +2888,6 @@ def _add_experimental_args(parser):
                             'precision-aware-optimizer. This dtype is used for storing the '
                             'optimizer state in memory during training but does not affect '
                             'the precision in the kernel computation.')
-
     return parser
 
 

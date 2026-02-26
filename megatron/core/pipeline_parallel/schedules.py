@@ -2117,7 +2117,8 @@ def get_tensor_shapes(
         effective_seq_length = effective_seq_length // tp_group.size()
 
     # Determine hidden dimension based on hyper connections and pipeline stage
-    hidden_dim = config.hidden_size
+    hidden_size = config.hidden_size
+    # TODO: make this more robust, including flexible VPP layout
     if getattr(config, 'enable_hyper_connections', False) and pp_group is not None:
         pp_rank = pp_group.rank()
         pp_size = pp_group.size()
@@ -2133,9 +2134,9 @@ def get_tensor_shapes(
             use_nstream = True
 
         if use_nstream:
-            hidden_dim = config.hidden_size * getattr(config, 'num_residual_streams', 1)
+            hidden_size = hidden_size * getattr(config, 'num_residual_streams', 1)
 
-    tensor_shapes.append((effective_seq_length, micro_batch_size, hidden_dim))
+    tensor_shapes.append((effective_seq_length, micro_batch_size, hidden_size))
     return tensor_shapes
 
 

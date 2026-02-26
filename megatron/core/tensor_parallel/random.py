@@ -586,19 +586,16 @@ def _save_args_to_ctx(ctx, args):
     Use _load_args_from_ctx to reconstruct the original args.
     """
     tensor_args = []
-    non_tensor_indices = []
-    non_tensor_values = []
+    non_tensor_entries = []
 
-    for i, arg in enumerate(args):
+    for index, arg in enumerate(args):
         if isinstance(arg, torch.Tensor):
             tensor_args.append(arg)
-        else:
-            non_tensor_indices.append(i)
-            non_tensor_values.append(arg)
+            continue
+        non_tensor_entries.append((index, arg))
 
     ctx.save_for_backward(*detach_variable(tuple(tensor_args)))
-    ctx._non_tensor_indices = non_tensor_indices
-    ctx._non_tensor_values = non_tensor_values
+    ctx._non_tensor_entries = tuple(non_tensor_entries)
     ctx._total_args_count = len(args)
 
 
@@ -612,33 +609,22 @@ def _load_args_from_ctx(ctx):
     Returns:
         tuple of reconstructed arguments in their original order.
     """
-    # Get saved tensors and detach them for recomputation
-    tensor_args = ctx.saved_tensors
+    def _detach_with_grad(tensor):
+        detached = tensor.detach()
+        detached.requires_grad_(tensor.requires_grad)
+        return detached
 
-    def _detach_with_grad(t):
-        requires_grad = t.requires_grad
-        t = t.detach()
-        t.requires_grad_(requires_grad)
-        return t
-
-    tensor_args = tuple(_detach_with_grad(t) for t in tensor_args)
-
-    # Reconstruct full args list by merging tensor and non-tensor arguments
+    tensor_iter = iter(_detach_with_grad(t) for t in ctx.saved_tensors)
     total_args_count = ctx._total_args_count
-    non_tensor_indices = ctx._non_tensor_indices
-    non_tensor_values = ctx._non_tensor_values
+    non_tensor_map = dict(ctx._non_tensor_entries)
 
-    inputs = [None] * total_args_count
-    tensor_idx = 0
-    non_tensor_idx = 0
-    for i in range(total_args_count):
-        if non_tensor_idx < len(non_tensor_indices) and non_tensor_indices[non_tensor_idx] == i:
-            inputs[i] = non_tensor_values[non_tensor_idx]
-            non_tensor_idx += 1
+    reconstructed_args = []
+    for index in range(total_args_count):
+        if index in non_tensor_map:
+            reconstructed_args.append(non_tensor_map[index])
         else:
-            inputs[i] = tensor_args[tensor_idx]
-            tensor_idx += 1
-    return tuple(inputs)
+            reconstructed_args.append(next(tensor_iter))
+    return tuple(reconstructed_args)
 
 
 class CheckpointWithoutOutputFunction(torch.autograd.Function):
@@ -715,6 +701,9 @@ class CheckpointManager:
 
     def __init__(self):
         self.checkpoints = []
+        # Set by TransformerBlock before each layer forward.
+        # When True, the layer should keep block-boundary output uncheckpointed.
+        self.is_last_layer_in_recompute_block = False
 
     def add_checkpoint(self, ckpt):
         """Add a checkpoint to the manager."""

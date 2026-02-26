@@ -378,7 +378,6 @@ class HyperConnectionModule(MegatronModule):
     def forward(
         self,
         hidden_states: Tensor,
-        residual: Tensor,
         mhc_recompute_manager: Optional['CheckpointManager'] = None,
     ) -> Tuple[Tensor, Tensor, Tensor]:
         """
@@ -386,7 +385,6 @@ class HyperConnectionModule(MegatronModule):
 
         Args:
             hidden_states: [s, b, n*C] - n-stream hidden states
-            residual: [s, b, n*C] - n-stream hidden states (x_l)
             mhc_recompute_manager: Optional CheckpointManager for checkpoint management.
                 When provided, uses _forward_with_checkpoint for memory-efficient execution.
 
@@ -396,19 +394,18 @@ class HyperConnectionModule(MegatronModule):
             h_post: [s, b, n] - expansion weights
         """
         if mhc_recompute_manager is not None:
-            return self._forward_with_checkpoint(hidden_states, residual, mhc_recompute_manager)
+            return self._forward_with_checkpoint(hidden_states, mhc_recompute_manager)
         else:
-            return self._forward_normal(hidden_states, residual)
+            return self._forward_normal(hidden_states)
 
     def _forward_normal(
-        self, hidden_states: Tensor, residual: Tensor
+        self, hidden_states: Tensor
     ) -> Tuple[Tensor, Tensor, Tensor]:
         """
         Normal forward pass without checkpointing.
 
         Args:
             hidden_states: [s, b, n*C] - n-stream hidden states
-            residual: [s, b, n*C] - n-stream hidden states (x_l)
 
         Returns:
             aggregated: [s, b, C] - aggregated input for layer computation
@@ -425,7 +422,7 @@ class HyperConnectionModule(MegatronModule):
         return aggregated, h_res, h_post
 
     def _forward_with_checkpoint(
-        self, hidden_states: Tensor, residual: Tensor, manager: 'CheckpointManager'
+        self, hidden_states: Tensor, manager: 'CheckpointManager'
     ) -> Tuple[Tensor, Tensor, Tensor]:
         """
         Forward pass with checkpointing for memory efficiency.
@@ -437,7 +434,6 @@ class HyperConnectionModule(MegatronModule):
 
         Args:
             hidden_states: [s, b, n*C] - n-stream hidden states
-            residual: [s, b, n*C] - n-stream hidden states (x_l)
             manager: CheckpointManager for unified recomputation
 
         Returns:

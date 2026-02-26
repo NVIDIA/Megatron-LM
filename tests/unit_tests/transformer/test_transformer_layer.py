@@ -14,6 +14,7 @@ from megatron.core.tensor_parallel.random import (
 )
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.transformer.transformer_layer import (
+    HyperConnectionTransformerLayer,
     TransformerLayer,
     get_transformer_layer_offset,
 )
@@ -327,7 +328,7 @@ class TestTransformerLayerWithHyperConnectionRecompute:
         Utils.destroy_model_parallel()
 
     def _create_layer_with_hyper_connection(self, hidden_size=64, num_streams=4):
-        """Create a TransformerLayer with hyper connection enabled."""
+        """Create a HyperConnectionTransformerLayer with hyper connection enabled."""
         config = TransformerConfig(
             num_layers=2,
             hidden_size=hidden_size,
@@ -341,7 +342,7 @@ class TestTransformerLayerWithHyperConnectionRecompute:
             mhc_init_gating_factor=0.01,
         )
         layer_spec = get_gpt_layer_with_transformer_engine_spec()
-        layer = TransformerLayer(config, layer_spec.submodules)
+        layer = HyperConnectionTransformerLayer(config, layer_spec.submodules)
         layer.cuda()
         return layer, config
 
@@ -369,11 +370,11 @@ class TestTransformerLayerWithHyperConnectionRecompute:
         manager = CheckpointManager()
 
         # Forward pass with recompute manager
+        manager.is_last_layer_in_recompute_block = True
         output, context = layer(
             hidden_states=hidden_states,
             attention_mask=attention_mask,
             mhc_recompute_manager=manager,
-            is_last_layer_in_recompute_block=True,  # Last layer, so MLP BDA not checkpointed
         )
 
         # Verify output shape
@@ -383,8 +384,8 @@ class TestTransformerLayerWithHyperConnectionRecompute:
             n_channels,
         ), f"Expected output shape {(seq_len, batch_size, n_channels)}, got {output.shape}"
 
-        # Unified recompute hook is automatically registered inside layer when
-        # is_last_layer_in_recompute_block=True, no need to call manually
+        # Register unified recompute hook at block boundary.
+        manager.discard_all_outputs_and_register_unified_recompute(output)
 
         # Backward pass should work without error
         loss = output.sum()
@@ -416,11 +417,11 @@ class TestTransformerLayerWithHyperConnectionRecompute:
         manager = CheckpointManager()
 
         # Forward pass - NOT the last layer in block
+        manager.is_last_layer_in_recompute_block = False
         output, context = layer(
             hidden_states=hidden_states,
             attention_mask=attention_mask,
             mhc_recompute_manager=manager,
-            is_last_layer_in_recompute_block=False,  # Intermediate layer, MLP BDA is checkpointed
         )
 
         # Verify output shape
@@ -463,7 +464,7 @@ class TestTransformerLayerWithHyperConnectionRecompute:
         )
         layer_spec = get_gpt_layer_with_transformer_engine_spec()
         layers = [
-            TransformerLayer(config, layer_spec.submodules, layer_number=i + 1).cuda()
+            HyperConnectionTransformerLayer(config, layer_spec.submodules, layer_number=i + 1).cuda()
             for i in range(num_layers)
         ]
 
@@ -483,15 +484,14 @@ class TestTransformerLayerWithHyperConnectionRecompute:
         h = hidden_states
         for i, layer in enumerate(layers):
             is_last = i == num_layers - 1
+            manager.is_last_layer_in_recompute_block = is_last
             h, _ = layer(
                 hidden_states=h,
                 attention_mask=attention_mask,
                 mhc_recompute_manager=manager,
-                is_last_layer_in_recompute_block=is_last,
             )
-
-        # Unified recompute hook is automatically registered inside the last layer
-        # when is_last_layer_in_recompute_block=True, no need to call manually
+            if is_last:
+                manager.discard_all_outputs_and_register_unified_recompute(h)
 
         # Backward pass
         loss = h.sum()

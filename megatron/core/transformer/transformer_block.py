@@ -3,7 +3,7 @@
 import logging
 from contextlib import nullcontext
 from dataclasses import dataclass
-from typing import List, Optional, Union
+from typing import List, Optional, Tuple, Union
 
 import torch
 from torch import Tensor
@@ -621,6 +621,46 @@ class TransformerBlock(GraphableMegatronModule, MegatronModule):
             )[0]
         return super().__call__(*args, **kwargs)
 
+    def _build_mhc_recompute_layer_plan(
+        self, use_mhc_recompute: bool
+    ) -> Tuple[List[Optional[CheckpointManager]], List[bool]]:
+        """Pre-build per-layer MHC recompute managers and block-end markers."""
+        num_layers = len(self.layers)
+        layer_managers: List[Optional[CheckpointManager]] = [None] * num_layers
+        is_recompute_block_end: List[bool] = [False] * num_layers
+
+        if not use_mhc_recompute or num_layers == 0:
+            return layer_managers, is_recompute_block_end
+
+        mhc_recompute_layer_num = self.config.mhc_recompute_layer_num
+        mhc_manager = CheckpointManager()
+
+        for l_no in range(num_layers):
+            is_last_in_transformer_block = l_no == num_layers - 1
+            is_last_in_recompute_block = is_last_in_transformer_block
+            if mhc_recompute_layer_num is not None:
+                is_last_in_recompute_block = is_last_in_transformer_block or (
+                    (l_no + 1) % mhc_recompute_layer_num == 0
+                )
+
+            layer_managers[l_no] = mhc_manager
+            is_recompute_block_end[l_no] = is_last_in_recompute_block
+
+            if is_last_in_recompute_block and not is_last_in_transformer_block:
+                mhc_manager = CheckpointManager()
+
+        return layer_managers, is_recompute_block_end
+
+    @staticmethod
+    def _finalize_mhc_recompute_layer(
+        mhc_manager: Optional[CheckpointManager],
+        hidden_states: Tensor,
+        is_last_in_recompute_block: bool,
+    ) -> None:
+        """Finalize MHC recompute state for the current layer when block ends."""
+        if mhc_manager is not None and is_last_in_recompute_block:
+            mhc_manager.discard_all_outputs_and_register_unified_recompute(hidden_states)
+
     def forward(
         self,
         hidden_states: Union[Tensor, WrappedTensor],
@@ -747,8 +787,9 @@ class TransformerBlock(GraphableMegatronModule, MegatronModule):
             and self.config.enable_hyper_connections
             and self.config.recompute_hyper_connections
         )
-        mhc_manager = CheckpointManager() if use_mhc_recompute else None
-        mhc_recompute_layer_num = self.config.mhc_recompute_layer_num
+        mhc_layer_managers, mhc_is_last_in_recompute_block = self._build_mhc_recompute_layer_plan(
+            use_mhc_recompute
+        )
 
         with rng_context, outer_quantization_context:
             # Forward pass.
@@ -765,7 +806,6 @@ class TransformerBlock(GraphableMegatronModule, MegatronModule):
                     padding_mask=padding_mask,
                 )
             else:
-                num_layers = len(self.layers)
                 for l_no, layer in enumerate(self.layers):
                     # Get appropriate inner quantization context
                     if use_inner_quantization_context:
@@ -782,17 +822,9 @@ class TransformerBlock(GraphableMegatronModule, MegatronModule):
                     else:
                         inner_quantization_context = nullcontext()
 
-                    # Determine if this is the last layer in the current MHC recompute block
-                    # A layer is last in recompute block if:
-                    # 1. It's the final layer in the transformer block, OR
-                    # 2. (l_no + 1) % mhc_recompute_layer_num == 0
-                    is_last_in_transformer_block = l_no == num_layers - 1
-                    is_last_in_recompute_block = is_last_in_transformer_block
-                    if use_mhc_recompute and mhc_recompute_layer_num is not None:
-                        # l_no is 0-indexed, so (l_no + 1) gives the 1-indexed layer number
-                        is_last_in_recompute_block = is_last_in_transformer_block or (
-                            (l_no + 1) % mhc_recompute_layer_num == 0
-                        )
+                    mhc_manager = mhc_layer_managers[l_no]
+                    if mhc_manager is not None:
+                        mhc_manager.is_last_layer_in_recompute_block = mhc_is_last_in_recompute_block[l_no]
 
                     with self.offload_context, inner_quantization_context:
                         hidden_states, context = layer(
@@ -810,17 +842,12 @@ class TransformerBlock(GraphableMegatronModule, MegatronModule):
                             sequence_len_offset=sequence_len_offset,
                             padding_mask=padding_mask,
                             mhc_recompute_manager=mhc_manager,
-                            is_last_layer_in_recompute_block=is_last_in_recompute_block,
                         )
-
-                    # Create new manager for next recompute block if current block ended
-                    # (but not if this is the final layer in transformer block)
-                    if (
-                        use_mhc_recompute
-                        and is_last_in_recompute_block
-                        and not is_last_in_transformer_block
-                    ):
-                        mhc_manager = CheckpointManager()
+                    self._finalize_mhc_recompute_layer(
+                        mhc_manager=mhc_manager,
+                        hidden_states=hidden_states,
+                        is_last_in_recompute_block=mhc_is_last_in_recompute_block[l_no],
+                    )
 
                     if (
                         torch.is_grad_enabled()

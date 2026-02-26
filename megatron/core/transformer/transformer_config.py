@@ -820,10 +820,12 @@ class TransformerConfig(ModelParallelConfig):
     recompute_hyper_connections: bool = False
     """Enable recomputation for HyperConnection intermediate activations.
     
-    When enabled, all HyperConnection operations (compute_mappings, aggregate, apply_h_res, 
-    apply_h_post) are wrapped with CheckpointWithoutOutput and managed by CheckpointManager.
-    This significantly reduces memory usage by discarding intermediate activations and 
-    recomputing them during backward pass.
+    When enabled, HyperConnection intermediate activations are managed by
+    CheckpointWithoutOutput + CheckpointManager to reduce activation memory.
+    Note that compute_mappings is kept as a normal forward op because its outputs
+    (h_pre/h_post/h_res) are consumed by downstream computations in the same layer.
+    The checkpointed path focuses on activations that can be safely discarded and
+    recomputed during backward pass.
     
     Requirements:
     - Only effective when enable_hyper_connections=True and training=True
@@ -843,7 +845,9 @@ class TransformerConfig(ModelParallelConfig):
     - Register the unified recompute hook on its MLP BDA output
     - A new CheckpointManager is created for subsequent layers
     
-    If None, all layers in the transformer block share a single recompute block."""
+    If None, all layers in the transformer block share a single recompute block.
+
+    Must be a positive integer when set."""
 
     ####################
     # miscellaneous
@@ -1350,6 +1354,15 @@ class TransformerConfig(ModelParallelConfig):
                     "recompute_hyper_connections cannot be used together with 'mlp' in "
                     "recompute_modules. They use different checkpoint mechanisms that may conflict."
                 )
+            if self.mhc_recompute_layer_num is not None and (
+                isinstance(self.mhc_recompute_layer_num, bool)
+                or not isinstance(self.mhc_recompute_layer_num, int)
+                or self.mhc_recompute_layer_num < 1
+            ):
+                raise ValueError(
+                    "mhc_recompute_layer_num must be a positive integer when "
+                    "recompute_hyper_connections=True."
+                )
 
         # Validation for hyper_connections with tensor parallelism
         # When hyper connections are enabled with TP > 1, sequence_parallel must be True.
@@ -1364,6 +1377,13 @@ class TransformerConfig(ModelParallelConfig):
                     "gradient synchronization across TP ranks, which is handled by the "
                     "sequence_parallel mechanism."
                 )
+
+        # Validation for hyper_connections with MTP
+        if self.enable_hyper_connections and self.mtp_num_layers is not None:
+            raise ValueError(
+                "enable_hyper_connections is not compatible with Multi-Token Prediction (MTP). "
+                "Please disable MTP (set mtp_num_layers=None) when using hyper connections."
+            )
 
         if self.fine_grained_activation_offloading:
             assert (

@@ -34,6 +34,7 @@ from megatron.core.transformer.transformer_block import (
 )
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.transformer.transformer_layer import (
+    HyperConnectionTransformerLayer,
     TransformerLayer,
     TransformerLayerSubmodules,
     get_transformer_layer_offset,
@@ -245,7 +246,7 @@ def get_gpt_layer_with_transformer_engine_spec(
             else backend.column_parallel_linear()
         )
         return ModuleSpec(
-            module=TransformerLayer,
+            module=HyperConnectionTransformerLayer,
             submodules=TransformerLayerSubmodules(
                 input_layernorm=backend.layer_norm(),
                 self_attention=ModuleSpec(
@@ -274,7 +275,7 @@ def get_gpt_layer_with_transformer_engine_spec(
     else:
         qk_norm = backend.layer_norm(for_qk=True)
         return ModuleSpec(
-            module=TransformerLayer,
+            module=HyperConnectionTransformerLayer,
             submodules=TransformerLayerSubmodules(
                 self_attention=ModuleSpec(
                     module=SelfAttention,
@@ -372,7 +373,7 @@ def get_gpt_layer_local_spec(
     if multi_latent_attention:
         assert qk_l2_norm is False, "qk_l2_norm is not supported with MLA."
         return ModuleSpec(
-            module=TransformerLayer,
+            module=HyperConnectionTransformerLayer,
             submodules=TransformerLayerSubmodules(
                 input_layernorm=layer_norm,
                 self_attention=ModuleSpec(
@@ -400,7 +401,7 @@ def get_gpt_layer_local_spec(
         )
     else:
         return ModuleSpec(
-            module=TransformerLayer,
+            module=HyperConnectionTransformerLayer,
             submodules=TransformerLayerSubmodules(
                 input_layernorm=layer_norm,
                 self_attention=ModuleSpec(
@@ -699,16 +700,18 @@ def get_gpt_mtp_block_spec_for_backend(
     if isinstance(spec, TransformerBlockSubmodules):
         # get the spec for the last layer of decoder block
         transformer_layer_spec = spec.layer_specs[-1]
-    elif isinstance(spec, ModuleSpec) and spec.module == TransformerLayer:
+    elif isinstance(spec, ModuleSpec) and issubclass(spec.module, TransformerLayer):
         transformer_layer_spec = spec
     else:
         raise ValueError(f"Invalid spec: {spec}")
 
-    # TODO: support hyper connections for mtp.
-    # Remove all hyper connections in transformer_layer_spec
+    # MTP does not support hyper connections yet; strip HC modules and
+    # downgrade the layer class to plain TransformerLayer.
     transformer_layer_spec.submodules.self_attention_hyper_connection = IdentityOp
     transformer_layer_spec.submodules.cross_attention_hyper_connection = IdentityOp
     transformer_layer_spec.submodules.mlp_hyper_connection = IdentityOp
+    if transformer_layer_spec.module is HyperConnectionTransformerLayer:
+        transformer_layer_spec.module = TransformerLayer
 
     mtp_layer_spec = get_mtp_layer_spec_for_backend(
         transformer_layer_spec=transformer_layer_spec, backend=backend
