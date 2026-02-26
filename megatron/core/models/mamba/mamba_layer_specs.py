@@ -4,6 +4,7 @@ from megatron.core.extensions.transformer_engine import (
     TEColumnParallelLinear,
     TEDotProductAttention,
     TELayerNormColumnParallelLinear,
+    TELinear,
     TENorm,
     TERowParallelLinear,
 )
@@ -19,7 +20,18 @@ from megatron.core.tensor_parallel import (
 )
 from megatron.core.transformer.attention import SelfAttention, SelfAttentionSubmodules
 from megatron.core.transformer.enums import AttnMaskType
+from megatron.core.transformer.experimental_attention_variant.dsa import (
+    DSAIndexer,
+    DSAIndexerSubmodules,
+    DSAttention,
+    DSAttentionSubmodules,
+)
+from megatron.core.transformer.identity_op import IdentityOp
 from megatron.core.transformer.mlp import MLP, MLPSubmodules
+from megatron.core.transformer.multi_latent_attention import (
+    MLASelfAttention,
+    MLASelfAttentionSubmodules,
+)
 from megatron.core.transformer.multi_token_prediction import (
     MultiTokenPredictionBlock,
     MultiTokenPredictionBlockSubmodules,
@@ -96,6 +108,41 @@ mamba_stack_spec = ModuleSpec(
                 self_attn_bda=get_bias_dropout_add,
             ),
         ),
+        dsa_layer=ModuleSpec(
+            module=TransformerLayer,
+            submodules=TransformerLayerSubmodules(
+                input_layernorm=TENorm,
+                self_attention=ModuleSpec(
+                    module=MLASelfAttention,
+                    params={"attn_mask_type": AttnMaskType.causal},
+                    submodules=MLASelfAttentionSubmodules(
+                        linear_q_proj=TEColumnParallelLinear,
+                        linear_q_down_proj=TELinear,
+                        linear_q_up_proj=TEColumnParallelLinear,
+                        linear_kv_down_proj=TELinear,
+                        linear_kv_up_proj=TEColumnParallelLinear,
+                        core_attention=ModuleSpec(
+                            module=DSAttention,
+                            submodules=DSAttentionSubmodules(
+                                indexer=ModuleSpec(
+                                    module=DSAIndexer,
+                                    submodules=DSAIndexerSubmodules(
+                                        linear_wq_b=TELinear,
+                                        linear_wk=TELinear,
+                                        k_norm=TENorm,
+                                        linear_weights_proj=TELinear,
+                                    ),
+                                )
+                            ),
+                        ),
+                        linear_proj=TERowParallelLinear,
+                        q_layernorm=IdentityOp,
+                        kv_layernorm=IdentityOp,
+                    ),
+                ),
+                self_attn_bda=get_bias_dropout_add,
+            ),
+        ),
         # Started with spec from gpt_layer_specs.py
         # Using the TE spec because we had problems getting the non-TE spec
         # working
@@ -151,6 +198,41 @@ mamba_inference_stack_spec = ModuleSpec(
                         linear_qkv=InferenceLayerNormColumnParallelLinear,
                         core_attention=TEDotProductAttention,
                         linear_proj=InferenceRowParallelLinear,
+                    ),
+                ),
+                self_attn_bda=get_bias_dropout_add,
+            ),
+        ),
+        dsa_layer=ModuleSpec(
+            module=TransformerLayer,
+            submodules=TransformerLayerSubmodules(
+                input_layernorm=TENorm,
+                self_attention=ModuleSpec(
+                    module=MLASelfAttention,
+                    params={"attn_mask_type": AttnMaskType.causal},
+                    submodules=MLASelfAttentionSubmodules(
+                        linear_q_proj=TEColumnParallelLinear,
+                        linear_q_down_proj=TELinear,
+                        linear_q_up_proj=TEColumnParallelLinear,
+                        linear_kv_down_proj=TELinear,
+                        linear_kv_up_proj=TEColumnParallelLinear,
+                        core_attention=ModuleSpec(
+                            module=DSAttention,
+                            submodules=DSAttentionSubmodules(
+                                indexer=ModuleSpec(
+                                    module=DSAIndexer,
+                                    submodules=DSAIndexerSubmodules(
+                                        linear_wq_b=TELinear,
+                                        linear_wk=TELinear,
+                                        k_norm=TENorm,
+                                        linear_weights_proj=TELinear,
+                                    ),
+                                )
+                            ),
+                        ),
+                        linear_proj=InferenceRowParallelLinear,
+                        q_layernorm=IdentityOp,
+                        kv_layernorm=IdentityOp,
                     ),
                 ),
                 self_attn_bda=get_bias_dropout_add,
