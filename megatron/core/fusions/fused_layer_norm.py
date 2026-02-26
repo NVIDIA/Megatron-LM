@@ -55,14 +55,18 @@ class FusedLayerNorm(torch.nn.Module):
         hidden_size: int,
         eps: float = 1e-5,
         persist_layer_norm: bool = True,
-        zero_centered_gamma: bool = False,
+        zero_centered_gamma: bool | None = None,
         normalization: str = "LayerNorm",  # included to match TE interface
     ):
         super().__init__()
 
         self.config = config
 
-        self.zero_centered_gamma = self.config.layernorm_zero_centered_gamma
+        self.zero_centered_gamma = (
+            self.config.layernorm_zero_centered_gamma
+            if zero_centered_gamma is None
+            else zero_centered_gamma
+        )
         assert (
             self.config.normalization == "LayerNorm"
         ), f'({self.config.normalization}) is not supported in FusedLayerNorm'
