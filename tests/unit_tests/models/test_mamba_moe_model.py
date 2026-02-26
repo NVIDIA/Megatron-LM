@@ -275,6 +275,7 @@ GOLDEN_CONFIG: Dict[str, Any] = {
     "offload_modules": [],
     "hybrid_context_parallel": False,
     "max_seqlen_per_dp_cp_rank": None,
+    "sequence_packing_scheduler": None,
 }
 # Fields to ignore entirely (ephemeral, environment-specific, very large).
 SKIP_FIELDS = set()

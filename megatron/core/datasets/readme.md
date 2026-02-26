@@ -192,6 +192,28 @@ To query the `BlendedDataset` for the _k_-th sample we do the following
 
 To save time during initialization, each index is built/cached sequentially on one process rank and subsequently loaded in parallel on other process ranks. The cached indices are unique to a hash generated in the `BlendedDataset.__init__` function.
 
+## Packing Scheduler
+
+The packing scheduler re-schedules variable-length sequences across DP×CP ranks to improve GPU utilization. It is built around the following modules:
+
+### `data_schedule`
+
+This module contains the high-level scheduling logic and entry points:
+
+- **`HybridCPDataLoaderWrapper`**: A wrapper class for hybrid context parallel (CP) scheduling. For every `__next__` call, it: (1) pulls a batch of packed samples from each DP rank, (2) gathers sequence lengths across the DP group, (3) schedules sub-samples using the `BalancedCPScheduler`, (4) reroutes sub-samples to the correct DPxCP ranks via all-to-all communication.
+
+- **`BasePackingScheduler`**: Abstract base class for packing schedulers. Defines the interface for `get_groups_and_subsamples()` (scheduling algorithm) and `run()` (full scheduling pipeline including fetch, schedule, reroute, pack, broadcast, and VPP handling).
+
+- **`DpBalancedScheduler`**: A concrete scheduler that packs sequences in their original order until reaching the max sequence length limit per DPxCP rank. Supports aligning the number of microbatches to DP size and VPP stage multiples.
+
+- **`wrap_data_iterator()`**: Top-level entry point that wraps an existing `data_iterator`. It creates the appropriate scheduler, runs the scheduling pipeline, broadcast metadata and new num_microbatches, returns a new data iterator along with the updated number of microbatches and FLOPs statistics.
+
+- **`get_batch_on_this_rank_for_sequence_packing()`**: Fetches and broadcasts a single packed microbatch for the current rank. Handles TP/PP broadcasting, constructs `PackedSeqParams` (with `cu_seqlens`, `max_seqlen`, `qkv_format=thd`), and optionally partitions sequences across CP ranks using Transformer Engine's `thd_get_partitioned_indices`.
+
+### `data_schedule_utils.py`
+
+This module contains the utility functions used by the schedulers.
+
 ## Fast DataLoader initialization
 
 Especially for large-scale runs, DataLoader initialization can take several minutes, since it involves opening and memory-mapping multiple files and can significantly stress the filesystem. To speed up this process, we have developed the following three optimizations, controlled by configuration flags":
