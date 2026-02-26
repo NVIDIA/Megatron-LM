@@ -19,6 +19,7 @@ from megatron.core.fusions.fused_layer_norm import FusedLayerNorm
 from megatron.core.models.backends import BackendSpecProvider
 from megatron.core.tensor_parallel.layers import ColumnParallelLinear, RowParallelLinear
 from megatron.core.transformer.dot_product_attention import DotProductAttention
+from megatron.core.transformer.flex_attention import FlexAttention
 from megatron.core.transformer.mlp import MLPSubmodules, TEActivationFunctionBuilder
 from megatron.core.transformer.moe.experts import (
     GroupedMLP,
@@ -33,10 +34,11 @@ from megatron.core.utils import get_te_version, is_te_min_version
 class TESpecProvider(BackendSpecProvider):
     """A protocol for providing the submodules used in Spec building."""
 
-    def __init__(self, fallback_to_eager_attn: bool = False):
+    def __init__(self, fallback_to_eager_attn: bool = False, use_flex_attention: bool = False):
         super().__init__()
-        self.fallback_to_eager_attn = fallback_to_eager_attn
-
+        self.fallback_to_eager_attn = fallback_to_eager_attn    
+        self.use_flex_attention = use_flex_attention
+        
     def linear(self) -> type:
         """Which linear module TE backend uses"""
         return TELinear

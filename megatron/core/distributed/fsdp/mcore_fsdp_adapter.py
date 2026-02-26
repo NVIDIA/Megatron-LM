@@ -42,6 +42,7 @@ from megatron.core.extensions.transformer_engine import TELinear
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.transformer.transformer_layer import TransformerLayer
+from megatron.core.transformer.transformer_mot_layer import MoTTransformerLayer
 from megatron.core.utils import is_te_min_version, log_single_rank
 
 try:
@@ -106,7 +107,7 @@ class FullyShardedDataParallel(_BaseDataParallel):
             self.fsdp_unit_modules = fsdp_unit_modules
         else:
             if self.ddp_config.data_parallel_sharding_strategy == "optim_grads_params":
-                self.fsdp_unit_modules = [TransformerLayer]
+                self.fsdp_unit_modules = [TransformerLayer, MoTTransformerLayer]
             else:
                 self.fsdp_unit_modules = []
 

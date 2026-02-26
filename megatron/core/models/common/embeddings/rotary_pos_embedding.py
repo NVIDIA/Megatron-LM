@@ -205,6 +205,92 @@ class RotaryEmbedding(nn.Module):
 
         return emb
 
+    def get_freqs_from_position_ids(self, position_ids: Tensor) -> Tensor:
+        """Generates matrix of frequencies based on actual position_ids.
+
+        Args:
+            position_ids: Tensor of shape [seq_len] containing actual positions
+
+        Returns:
+            freqs: Tensor of shape [seq_len, dim/2]
+        """
+        if self.inv_freq.device.type == 'cpu':
+            self.inv_freq = self.inv_freq.to(device=position_ids.device)
+
+        # position_ids: [seq_len]
+        # inv_freq: [dim/2]
+        # freqs = position_ids @ inv_freq -> [seq_len, dim/2]
+        position_ids = position_ids.to(dtype=self.inv_freq.dtype)
+
+        if self.seq_len_interpolation_factor is not None:
+            position_ids = position_ids * (1 / self.seq_len_interpolation_factor)
+
+        freqs = torch.outer(position_ids, self.inv_freq)  # [seq_len, dim/2]
+        return freqs
+
+    def forward_with_position_ids(
+        self,
+        position_ids: Tensor,
+        packed_seq: bool = False
+    ) -> Tensor:
+        """Forward pass with actual position_ids.
+
+        Args:
+            position_ids: Tensor of shape [seq_len] containing actual positions
+            packed_seq: Whether using packed sequence
+
+        Returns:
+            Tensor: Rotary embeddings of shape [seq_len, 1, 1, dim]
+        """
+        if self.inv_freq.device.type == 'cpu':
+            self.inv_freq = self.inv_freq.to(device=position_ids.device)
+
+        freqs = self.get_freqs_from_position_ids(position_ids)
+
+        # first part even vector components, second part odd vector components
+        if not self.rotary_interleaved:
+            emb = torch.cat((freqs, freqs), dim=-1)
+        else:
+            emb = torch.stack((freqs.view(-1, 1), freqs.view(-1, 1)), dim=-1).view(
+                freqs.shape[0], -1
+            )
+
+        # emb [seq_length, dim] -> [seq_length, 1, 1, dim]
+        emb = emb[:, None, None, :]
+
+        if self.cp_group is not None and self.cp_group.size() > 1 and not packed_seq:
+            emb = get_pos_emb_on_this_cp_rank(emb, 0, self.cp_group)
+
+        return emb
+
+    def get_cos_sin_from_position_ids(self, position_ids: Tensor) -> tuple[Tensor, Tensor]:
+        """Get cos and sin based on actual position_ids (qwen2 style).
+
+        Args:
+            position_ids: Tensor of shape [seq_len] containing actual positions
+
+        Returns:
+            cos: Tensor of shape [seq_len, dim]
+            sin: Tensor of shape [seq_len, dim]
+        """
+        if self.inv_freq.device.type == 'cpu':
+            self.inv_freq = self.inv_freq.to(device=position_ids.device)
+
+        freqs = self.get_freqs_from_position_ids(position_ids)
+
+        # Duplicate freqs like qwen2: emb = cat((freqs, freqs), dim=-1)
+        if not self.rotary_interleaved:
+            emb = torch.cat((freqs, freqs), dim=-1)
+        else:
+            emb = torch.stack((freqs.view(-1, 1), freqs.view(-1, 1)), dim=-1).view(
+                freqs.shape[0], -1
+            )
+
+        cos = emb.cos()
+        sin = emb.sin()
+
+        return cos, sin
+        
     def _load_from_state_dict(self, state_dict, prefix, *args, **kwargs):
         state_dict.pop(f'{prefix}inv_freq', None)
         return super()._load_from_state_dict(state_dict, prefix, *args, **kwargs)

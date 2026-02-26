@@ -42,7 +42,7 @@ def print_mimo_structure(model):
                 print_rank_0("│   │   ├── Output Projections:")
                 for i, proj in enumerate(submodule.output_projections):
                     proj_type = proj.__class__.__name__
-                    print_rank_0("│   │   │   ├── {i}: {proj_type}")
+                    print_rank_0(f"│   │   │   ├── {i}: {proj_type}")
     
     # Print language model
     if hasattr(model, 'language_model'):

@@ -2,7 +2,7 @@
 
 import logging
 import warnings
-from typing import Any, Dict, Optional
+from typing import Any, Dict, List, Optional
 
 import torch
 
@@ -178,6 +178,33 @@ class MimoModel(MegatronModule):
         if hasattr(self.language_model, 'set_input_tensor'):
             self.language_model.set_input_tensor(input_tensor)
 
+    def _get_language_model_embeddings(self, input_ids: torch.Tensor, position_ids: torch.Tensor) -> torch.Tensor:
+        """Get embeddings from the language model.
+
+        Handles both HuggingFace (has embedding method) and Megatron Core (has get_word_embeddings method).
+
+        Args:
+            input_ids: [batch_size, seq_len]
+            position_ids: [batch_size, seq_len]
+
+        Returns:
+            embeddings: [seq_len, batch_size, hidden_dim]
+        """
+        # Check for HuggingFace style (callable embedding method)
+        if hasattr(self.language_model, 'embedding') and callable(self.language_model.embedding):
+            return self.language_model.embedding(input_ids=input_ids, position_ids=position_ids)
+
+        # Check for Megatron Core BagelMCoreModel style
+        if hasattr(self.language_model, 'get_word_embeddings'):
+            return self.language_model.get_word_embeddings(input_ids=input_ids, position_ids=position_ids)
+
+        # Fallback: Megatron Core GPTModel style - use embedding module directly
+        if hasattr(self.language_model, 'embedding') and hasattr(self.language_model.embedding, 'word_embeddings'):
+            embeddings = self.language_model.embedding.word_embeddings(input_ids)
+            return embeddings.transpose(0, 1).contiguous()
+
+        raise RuntimeError("Language model does not have a recognized embedding interface")
+
     def get_text_embeddings(
         self, input_ids: torch.Tensor, position_ids: torch.Tensor, special_token_ids: Dict[str, int]
     ) -> torch.Tensor:
@@ -204,11 +231,26 @@ class MimoModel(MegatronModule):
             position_ids[batch_idx, seq_idx].unsqueeze(0) if position_ids is not None else None
         )
 
-        text_embeddings = self.language_model.embedding(
+        text_embeddings = self._get_language_model_embeddings(
             input_ids=input_ids_text, position_ids=position_ids_text
         ).squeeze(
             1
         )  # Shape: [num_text_tokens, hidden_dim]
+        return text_embeddings
+
+    def get_all_text_embeddings(self, input_ids: torch.Tensor, position_ids: torch.Tensor) -> torch.Tensor:
+        """Get embeddings for ALL tokens in input_ids (for Bagel-style where input_ids contains only text).
+
+        Args:
+            input_ids: Input token IDs of shape [batch_size, seq_len]
+            position_ids: Position IDs corresponding to input tokens. Shape [batch_size, seq_len].
+
+        Returns:
+            torch.Tensor: Embeddings for all tokens, shape [num_tokens, hidden_dim].
+        """
+        text_embeddings = self._get_language_model_embeddings(
+            input_ids=input_ids, position_ids=position_ids
+        ).squeeze(1)  # Shape: [num_tokens, hidden_dim]
         return text_embeddings
 
     def forward(
@@ -219,6 +261,22 @@ class MimoModel(MegatronModule):
         loss_mask: Optional[torch.Tensor] = None,
         labels: Optional[torch.Tensor] = None,
         modality_inputs: Optional[Dict[str, Dict[str, Any]]] = None,
+        # Parameters for Bagel-style training
+        sample_lens: Optional[List[int]] = None,
+        packed_position_ids: Optional[torch.Tensor] = None,
+        ce_loss_indexes: Optional[torch.Tensor] = None,
+        packed_label_ids: Optional[torch.Tensor] = None,
+        # Additional Bagel-specific parameters for sparse sequence construction
+        sequence_length: Optional[int] = None,
+        packed_text_indexes: Optional[torch.Tensor] = None,
+        packed_vit_token_indexes: Optional[torch.Tensor] = None,
+        packed_vae_token_indexes: Optional[torch.Tensor] = None,
+        mse_loss_indexes: Optional[torch.Tensor] = None,
+        vis_gen_target: Optional[torch.Tensor] = None,
+        # Parameters for attention mask creation (BlockMask)
+        split_lens: Optional[List[int]] = None,
+        attn_modes: Optional[List[str]] = None,
+        nested_attention_masks: Optional[List[torch.Tensor]] = None,
     ):
         """Forward pass through the multimodal model.
 
@@ -238,12 +296,24 @@ class MimoModel(MegatronModule):
                         "whisper_encoder": {"input_features": whisper_features}
                     }
                 }
+            sample_lens: List of sample lengths for packed sequences (Bagel-style)
+            packed_position_ids: Packed position IDs for packed sequences
+            ce_loss_indexes: Boolean tensor indicating where to compute CE loss
+            packed_label_ids: Packed label IDs for loss computation
+            sequence_length: Total length of the full packed sequence (Bagel-style)
+            packed_text_indexes: Indices where text tokens go in the full sequence
+            packed_vit_token_indexes: Indices where vision tokens go in the full sequence
+            split_lens: List of split lengths for attention mask creation
+            attn_modes: List of attention modes for each split
 
         Returns:
             tuple: Tuple containing model outputs and loss mask
-        """
+        """        # Check if we're using Bagel-style sparse sequence construction
+        use_bagel_style = (sequence_length is not None and packed_text_indexes is not None)
+
         # 1. Process each modality to get embeddings
         modality_embeddings = {}
+        vision_embeddings = None
 
         for modality_name, submodule in self.modality_submodules.items():
             # Process the modality through its submodule
@@ -258,33 +328,99 @@ class MimoModel(MegatronModule):
                 if embeddings is not None:
                     # All embeddings are now in the format [num_tokens, hidden_dim]
                     modality_embeddings[modality_name] = embeddings
+                    if modality_name == "images":
+                        vision_embeddings = embeddings
+                    if modality_name == "diffusion":
+                        visual_latents = embeddings
                     logger.debug(
                         f"Generated embeddings for {modality_name} with shape {embeddings.shape}"
                     )
 
-        # Get text embeddings
-        text_embeddings = self.get_text_embeddings(input_ids, position_ids, self.special_token_ids)
-        logger.debug(f"Generated text embeddings with shape {text_embeddings.shape}")
+        if use_bagel_style:
+            # Bagel-style: Pass input_ids directly to language model
+            # Let the language model handle embedding computation and sparse sequence construction
+            # This avoids computing embeddings twice
+            logger.debug(f"Using Bagel-style with input_ids shape {input_ids.shape}")
 
-        modality_embeddings["text"] = text_embeddings
+            # Forward pass through language model with Bagel-style interface
+            # Language model (BagelMCoreModel or BagelLLMHuggingFaceModel) will:
+            # 1. Compute text embeddings from input_ids
+            # 2. Construct full packed_sequence with text + vision embeddings
+            # 3. Run transformer and compute loss
+            lm_output = self.language_model(
+                input_ids=input_ids,
+                position_ids=position_ids,
+                sample_lens=sample_lens,
+                attention_mask=attention_mask,
+                packed_position_ids=packed_position_ids,
+                ce_loss_indexes=ce_loss_indexes,
+                packed_label_ids=packed_label_ids,
+                # Bagel-specific for sparse sequence construction
+                sequence_length=sequence_length,
+                packed_text_indexes=packed_text_indexes,
+                packed_vit_token_indexes=packed_vit_token_indexes,
+                packed_vae_token_indexes=packed_vae_token_indexes,
+                vision_embeddings=vision_embeddings,
+                visual_latents=visual_latents,
+                # For BlockMask creation
+                split_lens=split_lens,
+                attn_modes=attn_modes,
+                    nested_attention_masks=nested_attention_masks,
+            )
 
-        # 2. Merge embeddings from different modalities
-        logger.debug(f"Merging embeddings from {len(modality_embeddings)} modalities")
-        combined_embeddings = self.align_embeddings_by_token_positions(
-            modality_embeddings=modality_embeddings,  # [num_tokens, hidden_dim] for each modality
-            input_ids=input_ids,  # Pass in batch-first format [b, s]
-            special_token_ids=self.special_token_ids,
-        )  # [s, b, h]
-        logger.debug(f"Combined embeddings shape: {combined_embeddings.shape}")
+            # Step 11: Compute MSE loss at specific indexes
+            mse = None
+            if mse_loss_indexes is not None and vis_gen_target is not None:
+                hidden_state = lm_output['last_hidden_state']
+                mse_loss_indexes = mse_loss_indexes.to(hidden_state.device)
+                vis_gen_target = vis_gen_target.to(hidden_state.device)
+                gen_hidden_state = hidden_state[mse_loss_indexes]
+                noise_pred = self.modality_submodules['diffusion'].llm2vae(gen_hidden_state)
+                # vis_gen_target = (noise - clean_latent)[shifted_timesteps>0]
+                # mse = torch.nn.functional.mse_loss(noise_pred, vis_gen_target, reduction="none")
+                mse = (noise_pred - vis_gen_target) ** 2
+            lm_output['mse'] = mse
+        else:
 
-        # 3. Forward pass through language model
-        lm_output = self.language_model(
-            input_ids=None,
-            position_ids=None,
-            decoder_input=combined_embeddings,
-            labels=labels,
-            attention_mask=attention_mask,
-        )
-        logger.debug(f"Language model output shape: {lm_output.shape}")
+            # Get text embeddings
+            text_embeddings = self.get_text_embeddings(input_ids, position_ids, self.special_token_ids)
+            logger.debug(f"Generated text embeddings with shape {text_embeddings.shape}")
+
+            modality_embeddings["text"] = text_embeddings
+
+            # 2. Merge embeddings from different modalities
+            logger.debug(f"Merging embeddings from {len(modality_embeddings)} modalities")
+            combined_embeddings = self.align_embeddings_by_token_positions(
+                modality_embeddings=modality_embeddings,  # [num_tokens, hidden_dim] for each modality
+                input_ids=input_ids,  # Pass in batch-first format [b, s]
+                special_token_ids=self.special_token_ids,
+            )  # [s, b, h]
+            logger.debug(f"Combined embeddings shape: {combined_embeddings.shape}")
+
+            # 3. Forward pass through language model
+            # Check if language model supports Bagel-style interface
+            if hasattr(self.language_model, 'model') and sample_lens is not None:
+                # Bagel-style interface (HuggingFace models like BagelLLMHuggingFaceModel)
+                lm_output = self.language_model(
+                    decoder_input=combined_embeddings,
+                    sample_lens=sample_lens,
+                    attention_mask=attention_mask,
+                    packed_position_ids=packed_position_ids,
+                    ce_loss_indexes=ce_loss_indexes,
+                    packed_label_ids=packed_label_ids,
+                    split_lens=split_lens,
+                    attn_modes=attn_modes,
+                    nested_attention_masks=nested_attention_masks,
+                )
+            else:
+                # Standard Megatron interface
+                lm_output = self.language_model(
+                    input_ids=None,
+                    position_ids=position_ids,
+                    decoder_input=combined_embeddings,
+                    labels=labels,
+                    attention_mask=attention_mask,
+                )
+        logger.debug(f"Language model output: {type(lm_output)}")
 
         return lm_output, loss_mask
