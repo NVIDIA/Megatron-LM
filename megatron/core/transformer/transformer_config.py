@@ -858,6 +858,9 @@ class TransformerConfig(ModelParallelConfig):
     inference_fuse_tp_communication: bool = False
     """ If true, uses a fused reduce-scatter-residual-norm-allgather kernel during inference. """
 
+    inference_disable_triton_nvls_kernels: bool = False
+    """ If true, disables the use of Triton NVLS kernels during inference. """
+
     mrope_section: Optional[List[int]] = None
     """ Multimodal rope section is for channel dimension of temporal, height and width
     in rope calculation. """

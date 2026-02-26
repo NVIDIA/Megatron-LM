@@ -10,6 +10,7 @@ Supports latency-optimized NVLS collectives (multimem all-gather/reduce-scatter)
 on Hopper+ GPUs with BF16, with automatic fallback to NCCL via superclass methods.
 """
 
+from megatron.core.tensor_parallel.mappings import reduce_scatter_to_sequence_parallel_region
 import torch
 from typing import List, Optional
 
@@ -19,7 +20,7 @@ from megatron.core.transformer.moe.token_dispatcher import (
 )
 from megatron.core.transformer.transformer_config import TransformerConfig
 
-from megatron.core.tensor_parallel import gather_from_sequence_parallel_region
+from megatron.core.tensor_parallel import gather_from_sequence_parallel_region, reduce_scatter_to_sequence_parallel_region
 from megatron.core.parallel_state import get_global_symmetric_memory_buffer_ep
 from megatron.core.inference.communication.torch_symm_triton import (
     multimem_all_gather_fused,
@@ -65,8 +66,7 @@ class InferenceAllGatherTokenDispatcher(MoEAllGatherTokenDispatcher):
         )
         self.topk = config.moe_router_topk
 
-        # Cache for NVLS eligibility
-        self._nvls_eligible = None
+        self.triton_nvls_kernels_allowed = not self.config.inference_disable_triton_nvls_kernels
 
     def _check_nvls_eligibility(self, x: torch.Tensor) -> bool:
         """
@@ -75,7 +75,7 @@ class InferenceAllGatherTokenDispatcher(MoEAllGatherTokenDispatcher):
         """
         is_hopper_or_newer = torch.cuda.get_device_properties(x.device).major >= 9
         num_bytes = x.element_size() * x.numel()
-        return is_hopper_or_newer and num_bytes % 16 == 0
+        return self.triton_nvls_kernels_allowed and is_hopper_or_newer and num_bytes % 16 == 0
 
     def _maybe_allocate_ag_buffers(
         self,
@@ -240,6 +240,9 @@ class InferenceAllGatherTokenDispatcher(MoEAllGatherTokenDispatcher):
             multimem_reduce_scatter(output, rs_buffer["tensor"], rs_buffer["handle"])
             return output
         else:
-            # Fallback to NCCL via superclass
-            return super().token_combine(hidden_states)
+            # Fallback to NCCL            
+            hidden_states = reduce_scatter_to_sequence_parallel_region(
+                hidden_states, group=self.tp_ep_group
+            )
+            return hidden_states
 
