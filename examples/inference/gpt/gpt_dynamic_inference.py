@@ -266,7 +266,7 @@ def main():
     # Reset peak memory stats so functional tests measure this run and not
     # whatever happened earlier during initialization.
     torch.cuda.reset_peak_memory_stats()
-
+    
     # Sampling params.
     sampling_params = SamplingParams(
         temperature=args.temperature,
@@ -307,7 +307,11 @@ def main():
         )
 
     # Inference engine.
-    engine = DynamicInferenceEngine(controller, context)
+    engine = DynamicInferenceEngine(
+        controller,
+        context,
+        num_speculative_tokens=args.num_speculative_tokens,
+    )
 
     setup_prefix = build_dynamic_engine_setup_prefix(args, model, context, requests)
     print("~~~")
@@ -405,7 +409,7 @@ def main():
             # Write every 'n' requests, plus the final request.
             for i, req in enumerate(requests):
                 if i % args.output_every_n_results == 0 or i == len(requests) - 1:
-                    print(f' Attributes of request {i}: {req.__dict__}')
+                    #print(f' Attributes of request {i}: {req.__dict__}')
                     result_dict = {
                         "input_prompt": req.prompt_text,
                         "generated_text": req.output_text,

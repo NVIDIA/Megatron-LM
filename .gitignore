@@ -20,3 +20,6 @@ runs/
 # Sphinx documentation
 docs/_build
 docs/apidocs
+# Large checkpoint files
+deepseek_mtp_dummy_ckpt/checkpoints/iter_0000001/__0_0.distcp
+deepseek_mtp_dummy_ckpt/checkpoints/iter_0000001/__0_1.distcp
