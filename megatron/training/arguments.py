@@ -25,6 +25,7 @@ from megatron.core.transformer.heterogeneous.heterogeneous_config import (
 )
 from megatron.core.utils import (
     get_torch_version,
+    is_flashinfer_min_version,
     is_te_min_version,
     is_torch_min_version,
 )
@@ -795,6 +796,13 @@ def validate_args(args, defaults={}):
     if args.fp4 and not is_te_min_version("2.7.0.dev0"):
         raise ValueError("--fp4-format requires Transformer Engine >= 2.7.0.dev0 for NVFP4BlockScaling support.")
 
+    if (
+        args.fp8_recipe == 'mxfp8'
+        and args.transformer_impl == 'inference_optimized'
+        and not is_flashinfer_min_version("0.6.4")
+    ):
+        raise ValueError("MXFP8 with inference optimized layers requires FlashInfer >= 0.6.4")
+
     if args.use_megatron_fsdp:
         # NOTE: The flag `use_custom_fsdp` is deprecated and will be removed in future versions.
         #       Please use `use_megatron_fsdp` instead, as all functionality will be migrated there.
@@ -1280,6 +1288,12 @@ def validate_args(args, defaults={}):
                 'Disabling --async-save.'
             )
             args.async_save = False
+        elif args.dist_ckpt_workers > 1:
+            warn_rank_0(
+                'async ckpt forks processes for parallel writing which may introduce '
+                'instability on checkpoints. Consider using --dist-ckpt-workers=1 in case of '
+                'issues.'
+            )
 
     # Inference args
     if args.inference_batch_times_seqlen_threshold > -1:
@@ -1879,7 +1893,7 @@ def _add_network_size_args(parser):
     return parser
 
 def _add_straggler_detector_args(parser):
-    from megatron.training.resilience_config import StragglerDetectionConfig
+    from megatron.training.config import StragglerDetectionConfig
 
     straggler_factory = ArgumentGroupFactory(StragglerDetectionConfig)
     group = straggler_factory.build_group(parser, "straggler")
@@ -1987,7 +2001,7 @@ def _add_ft_package_args(parser):
 
 
 def _add_logging_args(parser):
-    from megatron.training.training_config import LoggerConfig
+    from megatron.training.config import LoggerConfig
 
     log_factory = ArgumentGroupFactory(LoggerConfig, exclude = ["log_throughput_to_tensorboard", "throughput_window_size", "memory_keys", "log_l2_norm_grad_to_tensorboard", "log_runtime_to_tensorboard", "runtime_time_unit", "filter_warnings", "modules_to_filter", "set_level_for_all_loggers", "save_config_filepath"])
     group = log_factory.build_group(parser, title="logging")
@@ -2088,7 +2102,7 @@ def _add_rl_args(parser):
                             'persist: leave KV cache in GPU memory (default), '
                             'offload: offload KV cache to CPU during training, '
                             'recompute: deallocate KV cache and recompute from scratch each cycle')
-    group.add_argument('--rl-persist-cuda-graphs', action=argparse.BooleanOptionalAction, type=bool, default=True,
+    group.add_argument('--rl-persist-cuda-graphs', action=argparse.BooleanOptionalAction, type=bool, default=False,
                        help='Persist CUDA graphs when the inference engine is suspended. '
                             'If False, CUDA graphs are deleted on suspend and re-captured on resume.')
     group.add_argument('--rl-partial-rollouts', action=argparse.BooleanOptionalAction, default=False,
@@ -2172,8 +2186,8 @@ def _add_rl_args(parser):
     return parser
 
 def _add_training_args(parser):
-    from megatron.training.training_config import TrainingConfig
-    from megatron.training.common_config import ProfilingConfig
+    from megatron.training.config import TrainingConfig
+    from megatron.training.config import ProfilingConfig
 
     prof_factory = ArgumentGroupFactory(ProfilingConfig, exclude=["record_shapes", "nvtx_ranges"])
     prof_group = prof_factory.build_group(parser, "profiling")
@@ -2272,7 +2286,7 @@ def _add_training_args(parser):
 
 
 def _add_rerun_machine_args(parser):
-    from megatron.training.resilience_config import RerunStateMachineConfig
+    from megatron.training.config import RerunStateMachineConfig
 
     rerun_factory = ArgumentGroupFactory(RerunStateMachineConfig, exclude=["check_for_nan_in_loss"])
     group = rerun_factory.build_group(parser, "rerun engine")
@@ -2281,7 +2295,7 @@ def _add_rerun_machine_args(parser):
 
 
 def _add_initialization_args(parser):
-    from megatron.training.common_config import RNGConfig
+    from megatron.training.config import RNGConfig
 
     rng_factory = ArgumentGroupFactory(RNGConfig)
     group = rng_factory.build_group(parser, "RNG and initialization")
@@ -2293,7 +2307,7 @@ def _add_initialization_args(parser):
 
 
 def _add_learning_rate_args(parser):
-    from megatron.training.training_config import SchedulerConfig
+    from megatron.training.config import SchedulerConfig
 
     sched_factory = ArgumentGroupFactory(SchedulerConfig, exclude=["no_weight_decay_cond_type"])
     group = sched_factory.build_group(parser, title="learning rate and weight decay")
@@ -2318,7 +2332,7 @@ def _add_learning_rate_args(parser):
 
 
 def _add_checkpointing_args(parser):
-    from megatron.training.training_config import CheckpointConfig
+    from megatron.training.config import CheckpointConfig
 
     ckpt_factory = ArgumentGroupFactory(CheckpointConfig, exclude=["most_recent_k", "save_tokenizer_assets", "save_optim", "save_rng", "load_optim", "load_rng"])
     group = ckpt_factory.build_group(parser, "checkpointing")
@@ -2337,6 +2351,10 @@ def _add_checkpointing_args(parser):
     group.add_argument('--dist-ckpt-format',
                        dest='dist_ckpt_format_deprecated',
                        help='Deprecated: see --ckpt-format.')
+    group.add_argument('--dist-ckpt-workers', type=int, default=1,
+                       help='Number of workers for distributed checkpointing. '
+                       'Only used for async save. '
+                       'If set to 1, the checkpointing is performed in a single process.')
     group.add_argument('--ckpt-fully-parallel-save', action='store_true',
                        dest='ckpt_fully_parallel_save_deprecated',
                        help='Deprecated: see --no-ckpt-fully-parallel-save.')
@@ -2375,7 +2393,7 @@ def _add_mixed_precision_args(parser):
 
 
 def _add_distributed_args(parser):
-    from megatron.training.common_config import DistributedInitConfig
+    from megatron.training.config import DistributedInitConfig
 
     dist_init_factory = ArgumentGroupFactory(DistributedInitConfig)
     group = dist_init_factory.build_group(parser, "distributed init")
@@ -2494,7 +2512,7 @@ def _add_distributed_args(parser):
 
 
 def _add_validation_args(parser):
-    from megatron.training.training_config import ValidationConfig
+    from megatron.training.config import ValidationConfig
 
     val_factory = ArgumentGroupFactory(ValidationConfig)
     group = val_factory.build_group(parser, "validation")

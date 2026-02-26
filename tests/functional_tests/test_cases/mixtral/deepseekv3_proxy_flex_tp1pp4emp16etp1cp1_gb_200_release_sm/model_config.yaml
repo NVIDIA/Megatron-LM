@@ -20,8 +20,8 @@ MODEL_ARGS:
   # Distributed args
   --distributed-timeout-minutes: 60
   --tensor-model-parallel-size: 2
-  --pipeline-model-parallel-size: 4
-  --pipeline-model-parallel-layout: Et*2\\|\\(tt\\|\\)*5t\\|tmL # Et*2|(tt|)*5t|tmL
+  --pipeline-model-parallel-size: 2
+  --pipeline-model-parallel-layout: Et*7\\|t*7mL # Et*7|t*7mL
   --expert-model-parallel-size: 16
   --context-parallel-size: 1
   --expert-tensor-parallel-size: 1
@@ -34,7 +34,7 @@ MODEL_ARGS:
   --sequence-parallel: true
   --use-flash-attn: true
   --disable-bias-linear: true
-  --micro-batch-size: 1
+  --micro-batch-size: 4
   --global-batch-size: 512
   --train-samples: 24414062
   --exit-duration-in-mins: 220
