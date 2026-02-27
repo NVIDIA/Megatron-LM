@@ -283,22 +283,32 @@ def extract_param_metadata(
         expert_parallel_group_ranks = _offset_ranks(dist.get_process_group_ranks(pg_collection.ep))
         # For MoE params, prefer expert TP group when available, else regular TP
         if is_tp and hasattr(pg_collection, 'expt_tp') and pg_collection.expt_tp is not None:
-            tensor_parallel_group_ranks = _offset_ranks(dist.get_process_group_ranks(pg_collection.expt_tp))
+            tensor_parallel_group_ranks = _offset_ranks(
+                dist.get_process_group_ranks(pg_collection.expt_tp)
+            )
         elif is_tp and hasattr(pg_collection, 'tp') and pg_collection.tp is not None:
-            tensor_parallel_group_ranks = _offset_ranks(dist.get_process_group_ranks(pg_collection.tp))
+            tensor_parallel_group_ranks = _offset_ranks(
+                dist.get_process_group_ranks(pg_collection.tp)
+            )
         data_parallel_group_ranks = _offset_ranks(dist.get_process_group_ranks(pg_collection.dp))
     elif is_tp:
         # Non-EP: use regular TP group
         if hasattr(pg_collection, 'tp') and pg_collection.tp is not None:
-            tensor_parallel_group_ranks = _offset_ranks(dist.get_process_group_ranks(pg_collection.tp))
+            tensor_parallel_group_ranks = _offset_ranks(
+                dist.get_process_group_ranks(pg_collection.tp)
+            )
         data_parallel_group_ranks = _offset_ranks(dist.get_process_group_ranks(pg_collection.dp))
     else:
         data_parallel_group_ranks = _offset_ranks(dist.get_process_group_ranks(pg_collection.dp))
 
     if hasattr(pg_collection, 'pp') and pg_collection.pp is not None:
-        pipeline_parallel_group_ranks = _offset_ranks(dist.get_process_group_ranks(pg_collection.pp))
+        pipeline_parallel_group_ranks = _offset_ranks(
+            dist.get_process_group_ranks(pg_collection.pp)
+        )
     else:
-        pipeline_parallel_group_ranks = list(range(rank_offset, rank_offset + dist.get_world_size()))
+        pipeline_parallel_group_ranks = list(
+            range(rank_offset, rank_offset + dist.get_world_size())
+        )
 
     meta = ParameterMetadata(
         name=param_name,

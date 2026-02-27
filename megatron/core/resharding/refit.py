@@ -66,7 +66,9 @@ def _get_config_tuple(core) -> Optional[Tuple[int, int, int, int, int]]:
     )
 
 
-def _build_plan_cache_key(src_core, tgt_core, num_experts: Optional[int], group=None) -> _PlanCacheKey:
+def _build_plan_cache_key(
+    src_core, tgt_core, num_experts: Optional[int], group=None
+) -> _PlanCacheKey:
     """Build cache key for reshard plan.
 
     Args:
@@ -177,10 +179,16 @@ def swap_model_weights(
     elif hasattr(refit_method, 'submit_send') and hasattr(refit_method, 'run'):
         service = refit_method
     else:
-        raise TypeError("refit_method must be a str backend name or a CopyService-compatible instance")
+        raise TypeError(
+            "refit_method must be a str backend name or a CopyService-compatible instance"
+        )
     reshard_model_weights(
-        src_model, target_model, service=service,
-        group=group, src_rank_offset=src_rank_offset, dst_rank_offset=dst_rank_offset,
+        src_model,
+        target_model,
+        service=service,
+        group=group,
+        src_rank_offset=src_rank_offset,
+        dst_rank_offset=dst_rank_offset,
     )
 
 
@@ -213,13 +221,19 @@ def reshard_model_weights(
 
     # Handle idle ranks (both models None) - they participate in collectives but have no work
     if src_model is None and target_model is None:
-        cache_key = _build_plan_cache_key(src_core=None, tgt_core=None, num_experts=None, group=group)
+        cache_key = _build_plan_cache_key(
+            src_core=None, tgt_core=None, num_experts=None, group=group
+        )
 
         # Use cached plan if available, otherwise build (with collective participation)
         if cache_key not in _plan_cache:
             plan = build_centralized_reshard_plan(
-                None, None, num_experts=None,
-                group=group, src_rank_offset=src_rank_offset, dst_rank_offset=dst_rank_offset,
+                None,
+                None,
+                num_experts=None,
+                group=group,
+                src_rank_offset=src_rank_offset,
+                dst_rank_offset=dst_rank_offset,
             )
             _plan_cache[cache_key] = plan
         else:
@@ -262,8 +276,12 @@ def reshard_model_weights(
     if cache_key not in _plan_cache:
         # All ranks must participate in planning (collective operations)
         plan = build_centralized_reshard_plan(
-            src_core, tgt_core, num_experts=num_experts,
-            group=group, src_rank_offset=src_rank_offset, dst_rank_offset=dst_rank_offset,
+            src_core,
+            tgt_core,
+            num_experts=num_experts,
+            group=group,
+            src_rank_offset=src_rank_offset,
+            dst_rank_offset=dst_rank_offset,
         )
         _plan_cache[cache_key] = plan
     else:

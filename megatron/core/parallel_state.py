@@ -735,7 +735,9 @@ def initialize_model_parallel(
 
     # Get world size and rank. Ensure some consistencies.
     assert torch.distributed.is_initialized()
-    world_size: int = local_world_size if local_world_size is not None else torch.distributed.get_world_size()
+    world_size: int = (
+        local_world_size if local_world_size is not None else torch.distributed.get_world_size()
+    )
 
     model_size = tensor_model_parallel_size * pipeline_model_parallel_size * context_parallel_size
 

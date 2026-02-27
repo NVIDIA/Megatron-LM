@@ -134,9 +134,13 @@ class GlooCopyService(CopyService):
         # work for cross-world ProcessGroups.
         for op in remote_sends:
             cpu_tensor = op.tensor.detach().to("cpu").contiguous()
-            p2p_ops.append(dist.P2POp(dist.isend, cpu_tensor, group=self.gloo_pg, group_peer=op.dest_rank))
+            p2p_ops.append(
+                dist.P2POp(dist.isend, cpu_tensor, group=self.gloo_pg, group_peer=op.dest_rank)
+            )
         for recv, _dst_tensor in remote_recvs:
-            p2p_ops.append(dist.P2POp(dist.irecv, recv.tensor, group=self.gloo_pg, group_peer=recv.src_rank))
+            p2p_ops.append(
+                dist.P2POp(dist.irecv, recv.tensor, group=self.gloo_pg, group_peer=recv.src_rank)
+            )
 
         if p2p_ops:
             reqs = dist.batch_isend_irecv(p2p_ops)

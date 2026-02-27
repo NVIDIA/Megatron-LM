@@ -36,9 +36,11 @@ def get_cuda_core_device_class():
     """
     try:
         from cuda.core import Device
+
         return Device
     except ImportError:
         from cuda.core.experimental import Device
+
         return Device
 
 

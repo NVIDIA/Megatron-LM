@@ -267,9 +267,7 @@ class RemoteCopyService:
         self.pack_events, self.unpack_events, self.barrier_events = (
             self.gpu_resources.create_events(num_events=2)
         )
-        self.pipeline_executor.set_events(
-            self.pack_events, self.unpack_events, self.barrier_events
-        )
+        self.pipeline_executor.set_events(self.pack_events, self.unpack_events, self.barrier_events)
 
         PELogger.info(f"Schedule complete: {self.num_iterations} iterations ready")
 

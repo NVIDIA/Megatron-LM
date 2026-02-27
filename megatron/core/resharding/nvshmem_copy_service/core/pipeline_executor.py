@@ -226,9 +226,7 @@ class PipelineExecutor:
             last_recv = iter_schedules[num_iterations - 1]["recv"]
             assert last_recv is not None
             # GPU-level event wait for NVSHMEM RDMA data visibility
-            self.torch_unpack_stream.wait_event(
-                self.barrier_events[(num_iterations - 1) % 2]
-            )
+            self.torch_unpack_stream.wait_event(self.barrier_events[(num_iterations - 1) % 2])
             self._launch_unpack(num_iterations - 1, last_recv)
             self.unpack_events[(num_iterations - 1) % 2].synchronize()
             torch.cuda.nvtx.range_pop()
