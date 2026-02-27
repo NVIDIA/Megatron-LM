@@ -204,9 +204,7 @@ class FileSystemWriterAsync(FileSystemWriter):
             return None, None, []
         transform_list = [self.transforms] if hasattr(self, "transforms") else []
         return (
-            partial(
-                self.write_preloaded_data_multithread, transform_list, self.use_msc
-            ),
+            partial(self.write_preloaded_data_multithread, transform_list, self.use_msc),
             partial(self.preload_tensors, self.write_buckets, True),
             [torch.distributed.get_rank(), self.write_buckets, self.results_queue],
         )
@@ -296,9 +294,7 @@ class FileSystemWriterAsync(FileSystemWriter):
                 if i < len(write_buckets) - 1:
                     count_queue.put(i)
                     t = threading.Thread(
-                        target=partial(
-                            FileSystemWriterAsync.write_preloaded_data, transform_list
-                        ),
+                        target=partial(FileSystemWriterAsync.write_preloaded_data, transform_list),
                         kwargs=kwargs,
                     )
                     thread_list.append(t)
