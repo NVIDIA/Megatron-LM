@@ -346,6 +346,15 @@ class TestVppSimulatorBasic:
         # For simplicity, use a uniform layout with decoder layers
         num_model_chunks = vpp_size if vpp_size else 1
 
+        # Adjust num_layers to ensure enough layers for all stages
+        # When total_stages > original num_layers, we need more layers to avoid index errors
+        if pp_size > 1 and num_model_chunks > 1:
+            total_stages = pp_size * num_model_chunks
+            if total_stages > mock_args.num_layers:
+                # Expand num_layers and moe_layer_freq to match total_stages
+                mock_args.num_layers = total_stages
+                mock_args.moe_layer_freq = [0] * total_stages
+
         # Calculate layers_per_chunk to ensure total decoder layers match num_layers
         # This keeps moe_layer_freq consistent with the actual layout
         if pp_size == 1:
