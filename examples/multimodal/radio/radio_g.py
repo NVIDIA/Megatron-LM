@@ -14,6 +14,7 @@ from megatron.core.transformer.mlp import MLP, MLPSubmodules
 from megatron.core.transformer.spec_utils import ModuleSpec
 from megatron.core.transformer.transformer_layer import TransformerLayerSubmodules
 from megatron.core.typed_torch import not_none
+from megatron.core.utils import is_torch_min_version
 
 try:
     from megatron.core.extensions.transformer_engine import (

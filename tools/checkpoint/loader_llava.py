@@ -55,8 +55,6 @@ class MegatronCheckpointLoaderLLaVA(MegatronCheckpointLoaderBase):
         """
         return [*super().build_sys_argv(), '--ckpt-format', 'torch', '--use-checkpoint-args']
 
-        return argv
-
     def _maybe_parse_additional_megatron_args(self, margs, checkpoint_args):
         """
         Parse Megatron arguments by forcibly overwriting sys.argv.
@@ -131,7 +129,7 @@ class MegatronCheckpointLoaderLLaVA(MegatronCheckpointLoaderBase):
             print(
                 "Unable to import Megatron, please specify the path to Megatron using --megatron-path. Exiting."  # noqa: E501
             )
-            queue.put("exit")
+            self.queue.put("exit")
             exit(1)
 
         # checkpoint_args.cp_comm_type = ["p2p"]
@@ -190,7 +188,7 @@ class MegatronCheckpointLoaderLLaVA(MegatronCheckpointLoaderBase):
         encoder_tp_size = self.md.previous_encoder_tensor_parallel_size
 
         if self.md.vision_model_type not in ("internvit", "siglip", "radio", "radio-g"):
-            raise Exception(f'unrecognized vision model type: {md.vision_model_type}')
+            raise Exception(f'unrecognized vision model type: {self.md.vision_model_type}')
 
         message = {}
         if self.md.vision_model_type in ("internvit", "siglip"):

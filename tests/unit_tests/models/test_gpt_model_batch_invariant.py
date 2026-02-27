@@ -261,7 +261,7 @@ class TestGPTModelBatchInvariant:
 
         def _run_engine_with_order(order):
             ctx = DynamicInferenceContext(
-                model_config=based_model.config,
+                model_config=base_model.config,
                 inference_config=InferenceConfig(
                     max_sequence_length=seq_len,
                     buffer_size_gb=0.125,

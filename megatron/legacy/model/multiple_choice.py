@@ -7,7 +7,7 @@ import torch
 from megatron.legacy.model.bert_model import bert_extended_attention_mask, bert_position_ids
 from megatron.legacy.model.enums import AttnMaskType
 from megatron.legacy.model.language_model import get_language_model
-from megatron.legacy.model.utils import get_linear_layer
+from megatron.legacy.model.utils import get_linear_layer, init_method_normal
 from megatron.training import get_args, print_rank_last
 
 from .module import MegatronModule
@@ -32,6 +32,7 @@ class MultipleChoice(MegatronModule):
 
         # Multi-choice head.
         if self.post_process:
+            init_method = init_method_normal(args.init_method_std)
             self.multichoice_dropout = torch.nn.Dropout(args.hidden_dropout)
             self.multichoice_head = get_linear_layer(args.hidden_size, 1, init_method)
             self._multichoice_head_key = 'multichoice_head'

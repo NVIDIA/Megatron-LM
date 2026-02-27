@@ -5,7 +5,7 @@ import random
 import string
 import time
 from collections import OrderedDict, defaultdict
-from typing import Dict, List
+from typing import Dict, List, Tuple
 from unittest import mock
 
 import pytest
