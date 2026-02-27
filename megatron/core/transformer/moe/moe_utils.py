@@ -921,7 +921,6 @@ def save_to_aux_losses_tracker(
     num_layers: int,
     reduce_group: Optional[torch.distributed.ProcessGroup] = None,
     avg_group: Optional[torch.distributed.ProcessGroup] = None,
-    layer_percentiles: Optional[List[float]] = None,
     needs_dp_avg: bool = True,
 ) -> None:
     """Save the auxiliary loss for logging.
@@ -934,12 +933,9 @@ def save_to_aux_losses_tracker(
             Defaults to None.
         avg_group (torch.distributed.ProcessGroup, optional): The group for averaging the loss.
             Defaults to None.
-        layer_percentiles (List[float], optional): Layer-wise percentiles to compute for logging.
-            Defaults to None.
         needs_dp_avg (bool, optional): Whether to average the metric across data parallel ranks.
             Defaults to True.
     """
-    _ = layer_percentiles  # No longer stored on MetricEntry; pass via report(percentiles=...).
     MoEMetricsTracker.get_instance().record(
         name=name,
         value=loss,
