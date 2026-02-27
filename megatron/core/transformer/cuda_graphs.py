@@ -1012,8 +1012,8 @@ class _CudaGraphRunner(torch.nn.Module):
 
         if is_moe:
             for name, cached_values in cached_aux_losses.items():
-                if name in moe_metrics_tracker.metrics:
-                    moe_metrics_tracker.metrics[name].values.copy_(cached_values)
+                assert name in moe_metrics_tracker.metrics, "cached metrics must be found in the tracker."
+                moe_metrics_tracker.metrics[name].values.copy_(cached_values)
 
     def create_bwd_graph(self):
         """Create a bwd cudagraph for this runner. Should be called inside
