@@ -4,7 +4,7 @@
 
 
 import math
-from .utils import print_rank_0
+from .utils import is_hybrid_model, print_rank_0
 
 NUM_BYTES_IN_MEGABYTE = 1024 * 1024
 
@@ -338,7 +338,7 @@ def compute_activation_memory_without_sp(args, num_microbatches, verbose=False):
 
 
 def report_theoretical_memory(args, num_microbatches=None, verbose=False):
-    if args.is_hybrid_model:
+    if is_hybrid_model(args):
         print("Theoretical memory footprints not yet supported for hybrid Mamba-Transformer models.")
         return
 

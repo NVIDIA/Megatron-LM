@@ -412,6 +412,41 @@ def test_compute_packed_inference_logprobs_stats_shape_mismatch():
     assert group_stats.mean_piold_to_inf_prob is None
 
 
+@pytest.mark.parametrize("num_sequences", [1, 10, 48, 49, 50])
+def test_cu_seqlens_size(num_sequences):
+    """Test that cu_seqlens always has a fixed size regardless of how many sequences are packed."""
+    max_sequences_per_bin = 50
+    bin_size = 1024
+
+    seq_len = bin_size // max_sequences_per_bin
+    seq_lengths = [seq_len] * num_sequences
+
+    packing_info = sequence_packing_utils.PackingInfo(
+        bin_seq_indices=[list(range(num_sequences))],
+        seq_starts={0: []},
+        seq_lengths=seq_lengths,
+        seq_to_bin_idx=[0] * num_sequences,
+        packing_algo='fifo',
+    )
+
+    params = sequence_packing_utils.create_packed_seq_params_for_bin(
+        packing_info=packing_info,
+        bin_idx=0,
+        bin_size=bin_size,
+        max_sequences_per_bin=max_sequences_per_bin,
+        device=torch.device('cpu'),
+    )
+
+    expected_size = max_sequences_per_bin + 2
+    assert params.cu_seqlens_q.shape[0] == expected_size, (
+        f"cu_seqlens_q has size {params.cu_seqlens_q.shape[0]} but expected {expected_size} "
+        f"for {num_sequences} sequences"
+    )
+    assert params.cu_seqlens_kv.shape[0] == expected_size
+    assert params.cu_seqlens_q[0] == 0
+    assert params.cu_seqlens_q[-1] == bin_size
+
+
 @pytest.mark.parametrize(
     "ratio,local_bins,world,expected_bs",
     [

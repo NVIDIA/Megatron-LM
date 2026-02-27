@@ -115,7 +115,6 @@ def create_test_args(tp, grouped_gemm, swiglu, squared_relu, use_te):
     args.lr = 3e-5
     args.attention_dropout = 0.0
     args.hidden_dropout = 0.0
-    args.async_tensor_model_parallel_allreduce = False
     args.no_save_optim = True
     args.no_load_optim = True
     args.no_load_rng = True

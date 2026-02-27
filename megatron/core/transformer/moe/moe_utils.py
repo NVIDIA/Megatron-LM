@@ -58,7 +58,7 @@ def switch_load_balancing_loss_func(
     Refer to the Switch Transformer (https://arxiv.org/abs/2101.03961)
     and Global Load Balancing Loss(https://arxiv.org/abs/2501.11873) for details.
 
-    ### Detailed explanation of the auxiliary loss #######
+    Detailed explanation of the auxiliary loss:
 
     The formula for the auxiliary loss is:
         loss = E * Σ_{i=1}^{E} (f_i * P_i)
@@ -91,8 +91,6 @@ def switch_load_balancing_loss_func(
     - tokens_per_expert: Should represent token counts at the desired level
       (either micro-batch or global batch)
     - total_num_tokens: Should match the total token count at the same level as tokens_per_expert
-
-    #########################################################
 
     Args:
         probs (torch.Tensor): Softmax probabilities output by the router for each token.
@@ -830,7 +828,8 @@ def compute_routing_scores_for_aux_loss(
         if score_function == "softmax":
             scores = torch.softmax(logits, dim=-1, dtype=torch.float32)
         elif score_function == "sigmoid":
-            scores = torch.sigmoid(logits)
+            # Cast logits to float32 before sigmoid for stability
+            scores = torch.sigmoid(logits.to(torch.float32))
             scores = scores / (scores.sum(dim=-1, keepdim=True) + 1e-20)
         else:
             raise ValueError(f"Invalid score_function: {score_function}")

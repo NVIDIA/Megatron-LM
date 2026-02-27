@@ -281,6 +281,10 @@ class RolloutStats:
     min_inf_prob: None | float
     max_inf_prob: None | float
     mean_inf_prob: None | float
+    policy_staleness: list[list[int]]
+    kv_cache_staleness: list[list[int]]
+    completed_at_steps: list[list[int]]
+    num_evictions: list[list[int]]
 
 
 # Runtime state container for RL-specific data that shouldn't be checkpointed
@@ -514,9 +518,8 @@ def get_environment_rollouts(
         inference_model = model
 
     inference_pg_collection = get_attr_wrapped_model(inference_model[0], "pg_collection")
-    assert (
-        n_prompts % get_pg_size(inference_pg_collection.ep) == 0
-    ), "n_prompts must be divisible by data_parallel_world_size"
+    pg_size = get_pg_size(inference_pg_collection.ep)
+    assert (n_prompts % pg_size == 0), f"{n_prompts=} must be divisible by {pg_size=}"
 
     with nvtx_range("rollout-collection"):
         loop = get_asyncio_loop()
@@ -526,6 +529,7 @@ def get_environment_rollouts(
             args.cuda_graph_impl,
             False, # offload optimizer during rollout collection is handled above
             training_model=model if has_separate_inference_model else None,
+            increment_staleness_on_suspend=True,
         ) as inference_interface:
 
             with nvtx_range("inference-setup"):
@@ -739,11 +743,19 @@ def compute_group_stats(
     env_ids = []
     group_reward_ids = []
     num_turns = [] # num_turns per traj
+    all_policy_staleness = []
+    all_kv_cache_staleness = []
+    all_completed_at_steps = []
+    all_num_evictions = []
     for group in rollouts:
         group_rewards = []
         group_traj_lengths = []
         group_turn_lengths = []
         group_num_turns = []
+        group_policy_staleness = []
+        group_kv_staleness = []
+        group_completed_at_steps = []
+        group_num_evictions = []
         for rollout in group:
             if isinstance(rollout, TokenRollout):
                 for turn_traj in rollout.trajectory:
@@ -764,6 +776,14 @@ def compute_group_stats(
             roll_turn_lens = [len(t) for t in rollout.trajectory]
             group_turn_lengths.extend(roll_turn_lens)
             group_traj_lengths.append(sum(roll_turn_lens))
+            group_policy_staleness.extend(s for turn in rollout.policy_staleness for s in turn)
+            group_kv_staleness.extend(s for turn in rollout.kv_cache_staleness for s in turn)
+            group_completed_at_steps.extend(rollout.completed_at_step)
+            group_num_evictions.append(sum(rollout.num_evictions))
+        all_policy_staleness.append(group_policy_staleness)
+        all_kv_cache_staleness.append(group_kv_staleness)
+        all_completed_at_steps.append(group_completed_at_steps)
+        all_num_evictions.append(group_num_evictions)
         traj_lens.append(group_traj_lengths)
         turn_lens.append(group_turn_lengths)
         env_ids.append(group[0].env_id) # All rollouts in a group share the env_id by design.
@@ -791,8 +811,42 @@ def compute_group_stats(
         min_inf_prob=None,
         max_inf_prob=None,
         mean_inf_prob=None,
+        policy_staleness=all_policy_staleness,
+        kv_cache_staleness=all_kv_cache_staleness,
+        completed_at_steps=all_completed_at_steps,
+        num_evictions=all_num_evictions,
     )
     return stats
+
+
+def compute_true_staleness(
+    per_token_staleness: list[list[int]],
+    completed_at_steps: list[list[int]],
+    turn_lens: list[list[int]],
+    current_iteration: int,
+) -> list[int]:
+    """Compute true per-token staleness by adding the completion gap.
+
+    Args:
+        per_token_staleness: Grouped flat list of per-token raw staleness values.
+        completed_at_steps: Grouped list of per-turn completion steps.
+        turn_lens: Grouped list of per-turn token counts.
+        current_iteration: Current training iteration.
+
+    Returns:
+        Flat list of true staleness values (one per token across all groups).
+    """
+    result = []
+    for group_staleness, group_completed, group_turn_lens in zip(
+        per_token_staleness, completed_at_steps, turn_lens
+    ):
+        token_idx = 0
+        for completed_at, num_tokens in zip(group_completed, group_turn_lens):
+            gap = current_iteration - completed_at
+            for _ in range(num_tokens):
+                result.append(group_staleness[token_idx] + gap)
+                token_idx += 1
+    return result
 
 
 def prep_wandb_metrics(
@@ -802,8 +856,13 @@ def prep_wandb_metrics(
         rewards: List[List[float]],
         num_turns: List[List[int]],
         advantages: List[float],
+        policy_staleness: List[List[int]],
+        kv_cache_staleness: List[List[int]],
+        num_evictions: List[List[int]],
+        completed_at_steps: List[List[int]],
+        current_iteration: int,
         example_group: list[TokenRollout | Rollout] | None = None,
-        tokenizer: MegatronTokenizer | None = None
+        tokenizer: MegatronTokenizer | None = None,
     ):
 
     """Make a wandb-parseable dictionary of metrics for logging.
@@ -815,14 +874,24 @@ def prep_wandb_metrics(
         rewards: Grouped list of rewards.
         num_turns: Grouped list of number of turns in the trajectories.
         advantages: Flattened list of advantages.
+        policy_staleness: Grouped list of per-token policy staleness.
+        kv_cache_staleness: Grouped list of per-token KV cache staleness.
+        num_evictions: Grouped list of per-rollout number of evictions.
+        completed_at_steps: Grouped list of per-turn completed at steps.
+        current_iteration: Current training iteration.
+        example_group: A list of rollouts of one group to log examples of trajectories.
         tokenizer: Tokenizer to untokenize trajectories for logging.
-        example_groups: A list of rollouts of one group to log examples of trajectories.
     """
 
     group_table = wandb_writer.Table(
         columns=['group_means', 'group_stds'],
         data=[[np.mean(g), np.std(g)] for g in rewards],
     )
+
+    true_policy_staleness = compute_true_staleness(
+        policy_staleness, completed_at_steps, turn_lens, current_iteration)
+    true_kv_staleness = compute_true_staleness(
+        kv_cache_staleness, completed_at_steps, turn_lens, current_iteration)
 
     metrics = {
             'group_means_hist': wandb_writer.plot.histogram(
@@ -843,6 +912,14 @@ def prep_wandb_metrics(
                 ),
                 'advantages', 'Advantages'
             ),
+            'rollout_table': wandb_writer.Table(
+                columns=['reward', 'traj_length', 'num_evictions'],
+                data=list(zip(
+                    [r for g in rewards for r in g],
+                    [l for g in traj_lens for l in g],
+                    [e for g in num_evictions for e in g],
+                )),
+            ),
             'mean_turn_length': np.mean([np.mean(g) for g in turn_lens]),
             'mean_turn_length_std': np.mean([np.std(g) for g in turn_lens]),
             'max_turn_length': max([max(g) for g in turn_lens]),
@@ -858,6 +935,15 @@ def prep_wandb_metrics(
             'mean_advantage': np.mean(advantages),
             'nonzero_groups_ratio': np.count_nonzero(advantages)
             / len(advantages),
+            'mean_policy_staleness': np.mean(true_policy_staleness),
+            'max_policy_staleness': max(true_policy_staleness),
+            'min_policy_staleness': min(true_policy_staleness),
+            'mean_kv_cache_staleness': np.mean(true_kv_staleness),
+            'max_kv_cache_staleness': max(true_kv_staleness),
+            'min_kv_cache_staleness': min(true_kv_staleness),
+            'total_eviction_count': sum([sum(g) for g in num_evictions]),
+            'max_num_evictions': max([max(g) for g in num_evictions]),
+            'mean_completion_gap': np.mean([current_iteration - s for g in completed_at_steps for s in g]),
     }
     if example_group:
         if tokenizer is None:
@@ -916,8 +1002,15 @@ def maybe_log_training_metrics(
     rewards = group_stats.rewards
     num_turns = group_stats.num_turns
     advantages = group_stats.advantages
-    metrics = metrics | prep_wandb_metrics(wandb_writer=wandb_writer, 
-        traj_lens=traj_lens, turn_lens=turn_lens, rewards=rewards, num_turns=num_turns, advantages=advantages)  
+    policy_staleness = group_stats.policy_staleness
+    kv_cache_staleness = group_stats.kv_cache_staleness
+    num_evictions = group_stats.num_evictions
+    completed_at_steps = group_stats.completed_at_steps
+
+    metrics = metrics | prep_wandb_metrics(wandb_writer=wandb_writer,
+        traj_lens=traj_lens, turn_lens=turn_lens, rewards=rewards, num_turns=num_turns, advantages=advantages,
+        policy_staleness=policy_staleness, kv_cache_staleness=kv_cache_staleness, num_evictions=num_evictions,
+        completed_at_steps=completed_at_steps, current_iteration=current_iteration)
     env_stats = lambda cont, idx: [cont[i] for i in idx]
     group_turn_counts = [sum(nt) for nt in num_turns]
 
@@ -931,11 +1024,16 @@ def maybe_log_training_metrics(
             end = st + group_turn_counts[i]
             env_advantages.extend(advantages[st:end])
 
-        env_metrics = prep_wandb_metrics(wandb_writer=wandb_writer, traj_lens=env_stats(traj_lens, env_idx), 
-            turn_lens=env_stats(turn_lens, env_idx), 
+        env_metrics = prep_wandb_metrics(wandb_writer=wandb_writer, traj_lens=env_stats(traj_lens, env_idx),
+            turn_lens=env_stats(turn_lens, env_idx),
             rewards=env_stats(rewards, env_idx),
             num_turns=env_stats(num_turns, env_idx),
             advantages=env_advantages,
+            policy_staleness=env_stats(policy_staleness, env_idx),
+            kv_cache_staleness=env_stats(kv_cache_staleness, env_idx),
+            num_evictions=env_stats(num_evictions, env_idx),
+            completed_at_steps=env_stats(completed_at_steps, env_idx),
+            current_iteration=current_iteration,
             example_group=example_groups[env_id],
             tokenizer=tokenizer,
         )
@@ -1159,7 +1257,7 @@ def prepare_data_for_update(
     tokenizer: MegatronTokenizer,
     sequence_packing: bool,
     is_correction: bool,
-) -> RerunDataIterator:
+) -> tuple[RerunDataIterator, RolloutStats, dict]:
     """Extract data for the update from raw rollouts.
 
     Args:
@@ -1171,7 +1269,7 @@ def prepare_data_for_update(
         is_correction: Prepare data for IS correction if True.
 
     Returns:
-        Cycled iterator over dataset batches. In GRPO we might want to go over the same data multiple times.
+        Tuple of (cycled iterator over dataset batches, group stats, example groups per env).
     """
     args = get_args()
     nvtx_range = get_nvtx_range()
@@ -1428,15 +1526,7 @@ def prepare_data_for_update(
                 loader = DataLoader(data, batch_size=args.micro_batch_size)
 
 
-        with nvtx_range("log-wandb-tb"):
-            maybe_log_training_metrics(
-                group_stats=group_stats,
-                current_iteration=args.curr_iteration,
-                tokenizer=tokenizer,
-                example_groups=example_groups,
-            )
-
-    return RerunDataIterator(itertools.cycle(loader))
+    return RerunDataIterator(itertools.cycle(loader)), group_stats, example_groups
 
 
 def get_grpo_data_iterator(
@@ -1476,26 +1566,37 @@ def get_grpo_data_iterator(
         RerunDataIterator for the current training step
     """
     runtime_state = get_rl_runtime_state()
+    tokenizer = get_tokenizer()
 
     # We collect new rollouts when we've gone over the collected data 'grpo_iterations' times.
-    global_batches_per_collection = (grpo_prompts_per_step * grpo_group_size) // global_batch_size 
+    global_batches_per_collection = (grpo_prompts_per_step * grpo_group_size) // global_batch_size
     if (
         buffered_rollouts is None or
-        iteration == runtime_state.last_collection_iteration + 
+        iteration == runtime_state.last_collection_iteration +
         (grpo_iterations * global_batches_per_collection)
     ):
 
-        buffered_rollouts = get_environment_rollouts(
+        rollouts = get_environment_rollouts(
             model, inference_model, optimizer, grpo_prompts_per_step, grpo_group_size
         )
-        buffered_rollouts = prepare_data_for_update(model=model, 
-            ref_state_dict=ref_state_dict, 
-            rollouts=buffered_rollouts,
-            tokenizer=get_tokenizer(),
+        buffered_rollouts, group_stats, example_groups = prepare_data_for_update(
+            model=model,
+            ref_state_dict=ref_state_dict,
+            rollouts=rollouts,
+            tokenizer=tokenizer,
             sequence_packing=sequence_packing,
             is_correction=is_correction,
-            )
+        )
+        runtime_state.group_stats = group_stats
+        runtime_state.example_groups = example_groups
         runtime_state.reset_iteration_counters(iteration)
+
+    maybe_log_training_metrics(
+        group_stats=runtime_state.group_stats,
+        current_iteration=iteration,
+        tokenizer=tokenizer,
+        example_groups=runtime_state.example_groups,
+    )
 
     return buffered_rollouts
 
@@ -1714,6 +1815,7 @@ def megatron_rl_inference_mode(
     cuda_graph_impl: str,
     offload_optimizer_during_inference: bool,
     training_model: Optional[list[LanguageModule]] = None,
+    increment_staleness_on_suspend: bool = False,
 ):
     """Manage the model inference context when collecting rollouts.
 
@@ -1786,6 +1888,8 @@ def megatron_rl_inference_mode(
 
         with nvtx_range("suspend-engine"):
             loop.run_until_complete(inference_interface.suspend())
+            if increment_staleness_on_suspend:
+                inference_interface.increment_staleness()
 
         if cuda_graph_impl != "none" and not args.rl_training_cuda_graphs:
             toggle_cuda_graphs(lang_module, 'none')

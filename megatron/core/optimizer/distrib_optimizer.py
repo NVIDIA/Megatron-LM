@@ -953,7 +953,7 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
                 if isinstance(v, torch.Tensor):
                     dst_tensors[k] = v
             for key in dst_tensors:
-                if not isinstance(tensors.get(key), torch.Tensor):
+                if not isinstance(tensors[key], torch.Tensor):
                     continue
                 dst_tensors[key].copy_(tensors[key])
 
@@ -2545,7 +2545,7 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
             for name, model_param in model_chunk.named_parameters():
                 while name.startswith("module."):
                     name = name[len("module.") :]
-                matched_keys = [k for k in names_in_state_dict if name in k]
+                matched_keys = [k for k in names_in_state_dict if k.endswith(name)]
                 assert (
                     len(matched_keys) == 1
                 ), f"Parameter {name} has {len(matched_keys)} matches in state dict"
