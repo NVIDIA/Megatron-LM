@@ -419,7 +419,7 @@ def _get_megatron_optimizer_based_on_param_groups(
         elif config.optimizer == 'muon':
             optimizer = Muon(param_groups,
                              lr=config.lr, weight_decay=config.weight_decay,
-                            #  matched_adamw_rms=config.muon_matched_adamw_rms,
+                             matched_adamw_rms=config.muon_extra_scale_factor,
                              momentum=config.muon_momentum,
                              nesterov=config.muon_use_nesterov,
                              ns_steps=config.muon_num_ns_steps,
