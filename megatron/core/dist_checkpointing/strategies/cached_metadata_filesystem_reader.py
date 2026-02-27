@@ -40,7 +40,7 @@ class CachedMetadataFileSystemReader(FileSystemReader):
             Metadata: Checkpoint metadata.
         """
         if self._cache_key not in CachedMetadataFileSystemReader._metadata_cache:
-            CachedMetadataFileSystemReader._metadata_cache[
-                self._cache_key
-            ] = super().read_metadata()
+            CachedMetadataFileSystemReader._metadata_cache[self._cache_key] = (
+                super().read_metadata()
+            )
         return CachedMetadataFileSystemReader._metadata_cache[self._cache_key]
