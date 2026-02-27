@@ -124,9 +124,11 @@ class TestLayerWiseOptimizer:
 
         optimizer = get_megatron_optimizer(optimizer_config, [model])
         if use_layer_wise:
+            # Extract base torch optimizers from the FP32Optimizer wrappers.
+            base_optimizers = [opt.optimizer for opt in optimizer.chained_optimizers]
             optimizer_config.bf16 = True
             optimizer = LayerWiseDistributedOptimizer(
-                optimizer.chained_optimizers, optimizer_config, pg_collection
+                base_optimizers, optimizer_config, pg_collection
             )
         return model, optimizer, pg_collection
 
@@ -281,19 +283,16 @@ class TestLayerWiseOptimizer:
         param_groups_1 = [{'params': params[:mid_point]}]
         param_groups_2 = [{'params': params[mid_point:]}]
 
-        # Create two separate base optimizers
+        # Create two separate plain base optimizers (LayerWise wraps them itself)
         base_optimizer_1 = torch.optim.Adam(param_groups_1, lr=optimizer_config.lr)
         base_optimizer_2 = torch.optim.Adam(param_groups_2, lr=optimizer_config.lr)
-
-        wrapped_optimizer_1 = FP32Optimizer(base_optimizer_1, optimizer_config, None)
-        wrapped_optimizer_2 = FP32Optimizer(base_optimizer_2, optimizer_config, None)
 
         pg_collection = ProcessGroupCollection.use_mpu_process_groups()
         pg_collection.dp_cp = parallel_state.get_data_parallel_group(with_context_parallel=True)
         pg_collection.expt_dp = parallel_state.get_expert_data_parallel_group()
 
         optimizer = LayerWiseDistributedOptimizer(
-            [wrapped_optimizer_1, wrapped_optimizer_2], optimizer_config, pg_collection
+            [base_optimizer_1, base_optimizer_2], optimizer_config, pg_collection
         )
 
         assert len(optimizer.chained_optimizers) == 2, "Should have two chained optimizers"
@@ -347,9 +346,9 @@ class TestLayerWiseOptimizer:
         pg_collection.dp_cp = parallel_state.get_data_parallel_group(with_context_parallel=True)
         pg_collection.expt_dp = parallel_state.get_expert_data_parallel_group()
 
-        # Should raise TypeError when receiving already-wrapped Float16 optimizer
+        # Should raise TypeError when receiving already-wrapped optimizer
         with pytest.raises(
-            TypeError, match='LayerWiseDistributedOptimizer received Float16 optimizer already'
+            TypeError, match='LayerWiseDistributedOptimizer expects base torch optimizers'
         ):
             LayerWiseDistributedOptimizer([wrapped_optimizer], optimizer_config, pg_collection)
 
