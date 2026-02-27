@@ -708,4 +708,3 @@ def test_parallel_attention_correctness_num_query_groups_less_than_tp_size(
         seed=123,
         sequence_length=256,
     )
-
