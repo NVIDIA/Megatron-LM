@@ -303,24 +303,36 @@ class MoELayer(BaseMoELayer):
             pg_collection=pg_collection,
         )
 
-    def set_is_inference_cuda_graphed_iteration(self, set_to: bool):
-        """Toggle CUDA-graphed iteration mode on this layer, its router, and its experts.
+    def set_inference_cuda_graphed_iteration(self):
+        """Enable CUDA-graphed iteration mode on this layer, its router, and its experts.
 
-        When enabled, swaps in the inference-optimized token dispatcher and disables
-        shared expert overlap. When disabled, restores the standard dispatcher.
+        Swaps in the inference-optimized token dispatcher and disables
+        shared expert overlap.
         """
-        self.is_inference_cuda_graphed_iteration = set_to
-        if hasattr(self.router, "set_is_inference_cuda_graphed_iteration"):
-            self.router.set_is_inference_cuda_graphed_iteration(set_to)
-        if hasattr(self.experts, "set_is_inference_cuda_graphed_iteration"):
-            self.experts.set_is_inference_cuda_graphed_iteration(set_to)
+        self.is_inference_cuda_graphed_iteration = True
+        if hasattr(self.router, "set_inference_cuda_graphed_iteration"):
+            self.router.set_inference_cuda_graphed_iteration()
+        if hasattr(self.experts, "set_inference_cuda_graphed_iteration"):
+            self.experts.set_inference_cuda_graphed_iteration()
 
-        if set_to and self._inference_token_dispatcher is not None:
+        if self._inference_token_dispatcher is not None:
             self._saved_token_dispatcher = self.token_dispatcher
             self.token_dispatcher = self._inference_token_dispatcher
             self._saved_shared_expert_overlap = self.shared_expert_overlap
             self.shared_expert_overlap = False
-        elif not set_to and hasattr(self, "_saved_token_dispatcher"):
+
+    def unset_inference_cuda_graphed_iteration(self):
+        """Disable CUDA-graphed iteration mode on this layer, its router, and its experts.
+
+        Restores the standard token dispatcher and shared expert overlap setting.
+        """
+        self.is_inference_cuda_graphed_iteration = False
+        if hasattr(self.router, "unset_inference_cuda_graphed_iteration"):
+            self.router.unset_inference_cuda_graphed_iteration()
+        if hasattr(self.experts, "unset_inference_cuda_graphed_iteration"):
+            self.experts.unset_inference_cuda_graphed_iteration()
+
+        if hasattr(self, "_saved_token_dispatcher"):
             self.token_dispatcher = self._saved_token_dispatcher
             self.shared_expert_overlap = self._saved_shared_expert_overlap
 

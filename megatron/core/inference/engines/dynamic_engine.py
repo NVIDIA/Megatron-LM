@@ -44,7 +44,8 @@ from megatron.core.inference.text_generation_controllers.text_generation_control
 from megatron.core.inference.utils import (
     Counter,
     await_process_call,
-    set_is_inference_cuda_graphed_iteration_for_ep_inference,
+    set_inference_cuda_graphed_iteration_for_ep_inference,
+    unset_inference_cuda_graphed_iteration_for_ep_inference,
 )
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.transformer.cuda_graphs import delete_cuda_graphs
@@ -303,7 +304,7 @@ class DynamicInferenceEngine(AbstractEngine):
         )
         if is_inference_optimized_ep:
             unwrapped_model = controller.inference_wrapped_model.model
-            set_is_inference_cuda_graphed_iteration_for_ep_inference(unwrapped_model, True)
+            set_inference_cuda_graphed_iteration_for_ep_inference(unwrapped_model)
 
         tbar = enumerate(context.cuda_graph_batch_dimensions_list)
         if HAVE_TQDM:
@@ -334,7 +335,7 @@ class DynamicInferenceEngine(AbstractEngine):
 
         # Disable inference dispatcher after graph capture
         if is_inference_optimized_ep:
-            set_is_inference_cuda_graphed_iteration_for_ep_inference(unwrapped_model, False)
+            unset_inference_cuda_graphed_iteration_for_ep_inference(unwrapped_model)
 
         # Memory usage.
         time_end = time.time()

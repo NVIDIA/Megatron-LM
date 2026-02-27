@@ -750,13 +750,13 @@ class InferenceTopKRouter(TopKRouter):
 
         self.is_inference_cuda_graphed_iteration = False
 
-    def set_is_inference_cuda_graphed_iteration(self, set_to: bool):
-        """Set whether the current iteration is being CUDA graphed.
+    def set_inference_cuda_graphed_iteration(self):
+        """Enable CUDA graph-compatible operations for the router."""
+        self.is_inference_cuda_graphed_iteration = True
 
-        Args:
-            set_to: If True, the router will use CUDA graph-compatible operations.
-        """
-        self.is_inference_cuda_graphed_iteration = set_to
+    def unset_inference_cuda_graphed_iteration(self):
+        """Disable CUDA graph-compatible operations for the router."""
+        self.is_inference_cuda_graphed_iteration = False
 
     @torch.compile()
     def _forward(self, input: torch.Tensor, padding_mask: Optional[torch.Tensor] = None):

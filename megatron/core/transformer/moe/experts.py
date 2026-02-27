@@ -979,9 +979,13 @@ class InferenceGroupedMLP(TEGroupedMLP):
             return ActivationType.Relu2
         raise ValueError(f"No FlashInfer ActivationType mapping for activation_func={func}")
 
-    def set_is_inference_cuda_graphed_iteration(self, set_to: bool):
-        """Toggle CUDA-graphed iteration mode."""
-        self.is_inference_cuda_graphed_iteration = set_to
+    def set_inference_cuda_graphed_iteration(self):
+        """Enable CUDA-graphed iteration mode."""
+        self.is_inference_cuda_graphed_iteration = True
+
+    def unset_inference_cuda_graphed_iteration(self):
+        """Disable CUDA-graphed iteration mode."""
+        self.is_inference_cuda_graphed_iteration = False
 
     def _build_concatenated_weights(self):
         """Create big contiguous weight tensors with per-expert views for checkpoint compatibility.
@@ -1067,7 +1071,8 @@ class InferenceGroupedMLP(TEGroupedMLP):
             # offs[i] = end index of expert i's tokens
             offs = tokens_per_expert.cumsum(0).to(torch.int32)
 
-            # FC1: [total_tokens, hidden] @ [num_experts, ffn_hidden, hidden] -> [total_tokens, ffn_hidden]
+            # FC1: [total_tokens, hidden] @ [num_experts, ffn_hidden, hidden] 
+            # -> [total_tokens, ffn_hidden]
             fc1_output = torch._grouped_mm(
                 permuted_local_hidden_states, self._fc1_weight.transpose(1, 2), offs=offs
             )

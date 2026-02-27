@@ -35,8 +35,8 @@ class InferenceCUDAGraphTokenDispatcher(MoEAllGatherTokenDispatcher):
     CUDA-graph-compatible AllGather token dispatcher for inference.
 
     Only used during CUDA-graphed inference iterations. Swapped in by
-    MoELayer.set_is_inference_cuda_graphed_iteration() before graph capture
-    and swapped out after.
+    MoELayer.set_inference_cuda_graphed_iteration() before graph capture
+    and swapped out by MoELayer.unset_inference_cuda_graphed_iteration() after.
 
     Key features:
     - AllGather/ReduceScatter instead of AlltoAll for CUDA graph compatibility
