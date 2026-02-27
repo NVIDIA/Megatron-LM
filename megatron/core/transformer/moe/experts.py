@@ -43,6 +43,7 @@ from megatron.core.transformer.mlp import (
     apply_swiglu_sharded_factory,
 )
 from megatron.core.transformer.module import MegatronModule
+from megatron.core.utils import is_torch_min_version
 from megatron.core.transformer.moe import grouped_gemm_util as gg
 from megatron.core.transformer.moe.moe_utils import (
     ProcessGroupCollection,
@@ -952,6 +953,13 @@ class InferenceGroupedMLP(TEGroupedMLP):
 
         self.is_inference_cuda_graphed_iteration = False
 
+        # torch._grouped_mm requires PyTorch >= 2.10
+        self._torch_grouped_mm_available = (
+            is_torch_min_version("2.10")
+            and hasattr(torch, '_grouped_mm')
+            and not config.inference_disable_torch_grouped_mm
+        )
+
         # FlashInfer's cutlass_fused_moe expects gated weights in [gate, activation]
         # order, but TE stores them as [activation, gate]. Until FlashInfer supports
         # TE's weight ordering, the FlashInfer path is only available for non-gated
@@ -1162,8 +1170,11 @@ class InferenceGroupedMLP(TEGroupedMLP):
                 permuted_local_hidden_states, tokens_per_expert, permuted_probs
             )
 
-        else:
+        elif self._torch_grouped_mm_available:
             return self._torch_grouped_mm_forward(permuted_local_hidden_states, tokens_per_expert, permuted_probs)
+
+        else:
+            return super().forward(permuted_local_hidden_states, tokens_per_expert, permuted_probs)
         
 
 

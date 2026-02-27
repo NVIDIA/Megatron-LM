@@ -861,6 +861,9 @@ class TransformerConfig(ModelParallelConfig):
     inference_disable_triton_nvls_kernels: bool = False
     """ If true, disables the use of Triton NVLS kernels during inference. """
 
+    inference_disable_torch_grouped_mm: bool = False
+    """ If true, disables torch._grouped_mm in InferenceGroupedMLP, falling back to TE GroupedGEMM. """
+
     mrope_section: Optional[List[int]] = None
     """ Multimodal rope section is for channel dimension of temporal, height and width
     in rope calculation. """
@@ -2071,6 +2074,12 @@ class TransformerConfig(ModelParallelConfig):
         if self.inference_disable_triton_nvls_kernels:
             assert self.transformer_impl == "inference_optimized", (
                 "inference_disable_triton_nvls_kernels is only supported "
+                "for inference_optimized transformer implementation."
+            )
+
+        if self.inference_disable_torch_grouped_mm:
+            assert self.transformer_impl == "inference_optimized", (
+                "inference_disable_torch_grouped_mm is only supported "
                 "for inference_optimized transformer implementation."
             )
 
