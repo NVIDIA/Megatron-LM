@@ -590,11 +590,12 @@ def build_transformer_layer_callables(layer: TransformerLayer):
             )
         # Delay the offload of the mlp norm until after the mlp_bda has been computed
         # because the residual is needed in the mlp_bda.
-        if hasattr(node.layer_state, 'mlp_norm_manager'):
-            hidden_states = node.layer_state.mlp_norm_manager.group_offload(
+        mlp_norm_manager = getattr(node.layer_state, 'mlp_norm_manager', None)
+        if mlp_norm_manager is not None:
+            hidden_states = mlp_norm_manager.group_offload(
                 hidden_states, forced_released_tensors=[residual]
             )
-            delattr(node.layer_state, 'mlp_norm_manager')
+            node.layer_state.mlp_norm_manager = None
         output = make_viewless_tensor(
             inp=hidden_states, requires_grad=hidden_states.requires_grad, keep_graph=True
         )

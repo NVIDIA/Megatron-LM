@@ -267,9 +267,6 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
     output of the same size.
     """
 
-    cuda_graph_stream = None
-    cuda_graph_event = None
-
     def __init__(
         self,
         config: TransformerConfig,
@@ -467,6 +464,7 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
                     self.recompute_mlp = True
 
         self._set_offload_modules()
+        self.mlp_norm_manager = None
         # @jcasper how should we handle nvfuser?
         # Set bias+dropout+add fusion grad_enable execution handler.
         # TORCH_MAJOR = int(torch.__version__.split('.')[0])
@@ -563,9 +561,7 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
         # This is to ensure the main stream waits for computing on cuda graph stream to complete,
         # and overlaps with the H2D transfer on reload stream.
         if self.offload_module_in_cuda_graph:
-            hidden_states = off_interface.backward_record(
-                hidden_states, TransformerLayer.cuda_graph_event
-            )
+            hidden_states = off_interface.backward_record(hidden_states)
 
         inference_context = deprecate_inference_params(inference_context, inference_params)
 
@@ -851,11 +847,11 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
         nvtx_range_pop(suffix="mlp_bda")
         # Delay the offload of the mlp norm until after the mlp_bda has been computed
         # because the residual is needed in the mlp_bda.
-        if hasattr(self, 'mlp_norm_manager'):
+        if self.mlp_norm_manager is not None:
             hidden_states = self.mlp_norm_manager.group_offload(
                 hidden_states, forced_released_tensors=[residual]
             )
-            delattr(self, 'mlp_norm_manager')
+            self.mlp_norm_manager = None
 
         # Jit compiled function creates 'view' tensor. This tensor
         # potentially gets saved in the MPU checkpoint function context,
@@ -1053,7 +1049,7 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
                 FineGrainedActivationOffloadingInterface as off_interface,
             )
 
-            off_interface.forward_record(TransformerLayer.cuda_graph_event)
+            off_interface.forward_record()
         return tuple(cuda_graph_outputs)
 
     def _te_cuda_graph_replay(self, *args, **kwargs):
@@ -1330,17 +1326,6 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
             assert (
                 self.config.cuda_graph_warmup_steps > 0
             ), "Fine-grained activation offloading needs cuda_graph_warmup_steps > 0."
-        # Set the cuda graph stream and event for the transformer layer.
-        if self.offload_module_in_cuda_graph:
-            from megatron.core.pipeline_parallel.fine_grained_activation_offload import (
-                FineGrainedActivationOffloadingInterface as off_interface,
-            )
-
-            TransformerLayer.cuda_graph_stream = off_interface.cuda_graph_stream()
-            TransformerLayer.cuda_graph_event = off_interface.cuda_graph_event()
-        else:
-            TransformerLayer.cuda_graph_stream = torch.cuda.current_stream()
-            TransformerLayer.cuda_graph_event = torch.cuda.Event()
 
     def get_layer_norm_weights(self):
         """

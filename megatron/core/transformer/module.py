@@ -322,10 +322,13 @@ class GraphableMegatronModule(MegatronModule):
 
         cudagraph_kwargs = kwargs.copy()
         cudagraph_kwargs['is_first_microbatch'] = getattr(self, 'current_microbatch', 0) == 0
-        from megatron.core.transformer.transformer_layer import TransformerLayer
+        if self.config.fine_grained_activation_offloading:
+            from megatron.core.pipeline_parallel.fine_grained_activation_offload import (
+                FineGrainedActivationOffloadingInterface as off_interface,
+            )
 
-        cudagraph_kwargs['cuda_graph_stream'] = TransformerLayer.cuda_graph_stream
-        cudagraph_kwargs['cuda_graph_event'] = TransformerLayer.cuda_graph_event
+            cudagraph_kwargs['cuda_graph_stream'] = off_interface.cuda_graph_stream()
+            cudagraph_kwargs['cuda_graph_event'] = off_interface.cuda_graph_event()
         return cudagraph_args, cudagraph_kwargs
 
     def _should_call_local_cudagraph(self, *args, **kwargs):

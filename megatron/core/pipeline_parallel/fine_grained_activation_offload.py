@@ -1242,18 +1242,17 @@ class FineGrainedOffloadingBackwardRecordFunction(torch.autograd.Function):
     """
 
     @staticmethod
-    def forward(ctx, tensor, event: torch.cuda.Event) -> torch.Tensor:
+    def forward(ctx, tensor) -> torch.Tensor:
         """Forward pass for cuda graph capture."""
-        ctx.event = event
         return tensor
 
     @staticmethod
     def backward(ctx, grad_output):
         """Record the backward event and wait for the h2d stream on cuda graph stream."""
-        h2d_stream = PipelineOffloadManager.get_instance().h2d_stream
-        torch.cuda.current_stream().record_event(ctx.event)
-        torch.cuda.current_stream().wait_stream(h2d_stream)
-        return grad_output, None
+        mgr = PipelineOffloadManager.get_instance()
+        torch.cuda.current_stream().record_event(mgr.cuda_graph_event)
+        torch.cuda.current_stream().wait_stream(mgr.h2d_stream)
+        return (grad_output,)
 
 
 class FineGrainedActivationOffloadingInterface:
@@ -1324,16 +1323,16 @@ class FineGrainedActivationOffloadingInterface:
         PipelineOffloadManager.get_instance().mark_not_offload(tensor)
 
     @staticmethod
-    def forward_record(event: torch.cuda.Event) -> None:
+    def forward_record() -> None:
         """Record the forward event for cuda graph capture."""
-        d2h_stream = PipelineOffloadManager.get_instance().d2h_stream
-        torch.cuda.current_stream().record_event(event)
-        torch.cuda.current_stream().wait_stream(d2h_stream)
+        mgr = PipelineOffloadManager.get_instance()
+        torch.cuda.current_stream().record_event(mgr.cuda_graph_event)
+        torch.cuda.current_stream().wait_stream(mgr.d2h_stream)
 
     @staticmethod
-    def backward_record(tensor, event: torch.cuda.Event) -> torch.Tensor:
+    def backward_record(tensor) -> torch.Tensor:
         """Record the backward event for cuda graph capture."""
-        return FineGrainedOffloadingBackwardRecordFunction.apply(tensor, event)
+        return FineGrainedOffloadingBackwardRecordFunction.apply(tensor)
 
     @staticmethod
     def reset():
