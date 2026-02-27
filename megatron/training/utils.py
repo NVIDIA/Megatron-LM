@@ -431,6 +431,11 @@ def print_rank_last(message):
         print(message, flush=True)
 
 
+def is_hybrid_model(args):
+    """Returns True if the model is a hybrid Mamba-Transformer model."""
+    return args.hybrid_layer_pattern is not None
+
+
 def is_first_or_last_pipeline_stage(vp_stage):
     """Return True if on first or last pipeline stage, taking into account virtual
     pipeline parallelism."""

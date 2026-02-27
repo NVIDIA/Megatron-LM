@@ -212,7 +212,7 @@ class TestModelOptMambaModel(TestModelOptGPTModel):
             mamba_stack_spec=mamba_stack_spec,
             vocab_size=100,
             max_sequence_length=4,
-            hybrid_override_pattern="M*-",
+            hybrid_layer_pattern="M*-",
         )
 
         # A Hybrid MambaModel using ModelOpt spec (local + TENorm).
@@ -221,7 +221,7 @@ class TestModelOptMambaModel(TestModelOptGPTModel):
             mamba_stack_spec=get_mamba_stack_modelopt_spec(remap_te_layernorm=True),
             vocab_size=100,
             max_sequence_length=4,
-            hybrid_override_pattern="M*-",
+            hybrid_layer_pattern="M*-",
         )
 
 
@@ -272,9 +272,14 @@ def test_get_mamba_stack_modelopt_spec_interface():
     expected_params = {
         "local_core_attention": inspect.Parameter.POSITIONAL_OR_KEYWORD,
         "remap_te_layernorm": inspect.Parameter.POSITIONAL_OR_KEYWORD,
+        "use_default_te_spec": inspect.Parameter.POSITIONAL_OR_KEYWORD,
     }
 
-    expected_defaults = {"local_core_attention": False, "remap_te_layernorm": False}
+    expected_defaults = {
+        "local_core_attention": False,
+        "remap_te_layernorm": False,
+        "use_default_te_spec": False,
+    }
 
     # Check expected parameters are in function signature
     for param_name, param_kind in expected_params.items():
@@ -291,3 +296,9 @@ def test_get_mamba_stack_modelopt_spec_interface():
         assert (
             k in sig_defaults and v == sig_defaults[k]
         ), f"Default value of {sig_defaults[k]} does not match the expected value of {v} for parameter {k}."
+
+
+def test_get_mamba_stack_modelopt_spec_use_default_te_spec():
+    """Test that use_default_te_spec=True returns the standard mamba_stack_spec."""
+    spec = get_mamba_stack_modelopt_spec(use_default_te_spec=True)
+    assert spec is mamba_stack_spec
