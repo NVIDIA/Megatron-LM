@@ -11,6 +11,7 @@ import yaml
 import torch
 from torch.utils.data import DataLoader
 from diffusion.diffusion_wrapper import DiffusionWrapper
+import logging
 
 # Import directly from bagel.data to avoid circular import
 from bagel.data.dataset_base import (
@@ -23,6 +24,7 @@ from bagel.data.data_utils import add_special_tokens
 from megatron.training import get_args
 from megatron.training.utils import print_rank_0
 
+logging.basicConfig(level=logging.INFO, force=True)
 
 def bagel_dataloader_provider(train_val_test_num_samples):
     """
@@ -46,8 +48,8 @@ def bagel_dataloader_provider(train_val_test_num_samples):
     tokenizer, special_token_ids, num_new_tokens = add_special_tokens(tokenizer)
 
     if args.rank == 0:
-        print(f"Added {num_new_tokens} special tokens to tokenizer")
-        print(f"Special token IDs: {special_token_ids}")
+        logging.debug(f"Added {num_new_tokens} special tokens to tokenizer")
+        logging.debug(f"Special token IDs: {special_token_ids}")
 
     # Configure dataset
     # Note: You need to configure your dataset according to your data structure
@@ -134,10 +136,10 @@ def bagel_dataloader_provider(train_val_test_num_samples):
         )
 
         if args.rank == 0:
-            print(f"Created training dataloader with PackedDataset")
-            print(f"  - Expected tokens per batch: {train_kwargs['expected_num_tokens']}")
-            print(f"  - Max tokens: {train_kwargs['max_num_tokens']}")
-            print(f"  - Buffer size: {train_kwargs['max_buffer_size']}")
+            logging.debug(f"Created training dataloader with PackedDataset")
+            logging.debug(f"  - Expected tokens per batch: {train_kwargs['expected_num_tokens']}")
+            logging.debug(f"  - Max tokens: {train_kwargs['max_num_tokens']}")
+            logging.debug(f"  - Buffer size: {train_kwargs['max_buffer_size']}")
 
     # Note: For validation and test, you might want to use different configurations
     # or different datasets. This is a simplified implementation.
@@ -195,10 +197,6 @@ def bagel_packed_batch_to_mimo_batch(packed_batch, diffusion_wrapper: DiffusionW
     else:
         batch_dict = packed_batch
 
-    # for key, value in batch_dict.items():
-    #     if isinstance(value, torch.Tensor):
-    #         print(f"Key: {key}, Shape: {value.shape}, Device: {value.device}")
-
     # Get sequence length (total length including text + vision tokens)
     seq_len = batch_dict['sequence_length']
 
@@ -252,7 +250,7 @@ def bagel_packed_batch_to_mimo_batch(packed_batch, diffusion_wrapper: DiffusionW
         modality_inputs['diffusion'] = vis_gen_modality_inputs
         mimo_batch.update(vis_gen_loss_inputs)
     else:
-        print("packed_vae_token_indexes is not in batch_dict, skip visual gen data preparation")
+        logging.debug("packed_vae_token_indexes is not in batch_dict, skip visual gen data preparation")
 
 
     if modality_inputs:
@@ -272,10 +270,9 @@ def bagel_packed_batch_to_mimo_batch(packed_batch, diffusion_wrapper: DiffusionW
 
     # Vision token indexes in the full sequence
     if 'packed_vit_token_indexes' in batch_dict:
-        # print("packed_vit_token_indexes", batch_dict['packed_vit_token_indexes'].shape, batch_dict['packed_vit_token_indexes'].sum())
         mimo_batch['packed_vit_token_indexes'] = batch_dict['packed_vit_token_indexes']
     else:
-        print("packed_vit_token_indexes is not in batch_dict")
+        logger.debug("packed_vit_token_indexes is not in batch_dict")
 
     # Loss-related
     if 'ce_loss_indexes' in batch_dict:

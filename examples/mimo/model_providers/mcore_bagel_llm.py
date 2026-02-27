@@ -8,6 +8,7 @@ input/output formats while leveraging Megatron Core's efficient implementation.
 """
 
 from typing import List, Optional, Union
+import logging
 
 import torch
 import torch.nn.functional as F
@@ -22,6 +23,7 @@ from megatron.core.transformer.transformer_mot_block import (
 )
 from megatron.core.transformer.spec_utils import ModuleSpec
 
+logger = logging.getLogger(__name__)
 
 class BagelMCoreModel(GPTModel):
     """
@@ -180,14 +182,11 @@ class BagelMCoreModel(GPTModel):
 
             # Step 1: Get text embeddings using GPTModel's embedding layer
             # self.embedding is inherited from GPTModel (LanguageModelEmbedding)
-            print("language_model.model.embed_tokens forward")
-            print("packed_text_ids", input_ids.shape, input_ids.sum())
-            print("sequence_length", sequence_length)
             text_embeddings = self.embedding(
                 input_ids=input_ids,
                 position_ids=position_ids
             )  # [seq_len, batch, hidden] or [batch, seq_len, hidden]
-            print("after language model.model.embed_tokens forward", text_embeddings.shape, text_embeddings.to(torch.float32).sum())
+            logger.debug("after language model.model.embed_tokens forward", text_embeddings.shape, text_embeddings.to(torch.float32).sum())
 
             # Ensure we have [num_text_tokens, hidden] format
             if text_embeddings.dim() == 3:
@@ -267,19 +266,6 @@ class BagelMCoreModel(GPTModel):
                 else:
                     mo_kwargs['packed_gen_token_indexes'] = torch.tensor([], dtype=torch.long, device=device)
 
-                # print("BagelMCoreModel packed_und_token_indexes:", mo_kwargs['packed_und_token_indexes'].shape)
-                # if len(mo_kwargs['packed_gen_token_indexes']) > 0:
-                #     print("BagelMCoreModel packed_gen_token_indexes:", mo_kwargs['packed_gen_token_indexes'].shape)
-                # else:
-                #     print("BagelMCoreModel packed_gen_token_indexes is empty")
-
-            # print("language_model forward")
-            # print("packed_sequence", packed_sequence.shape, packed_sequence.to(torch.float32).sum())
-            # print("sample_lens", sample_lens)
-            # print("attention_mask", attention_mask.shape)
-            # print("packed_position_ids", packed_position_ids.shape, packed_position_ids.sum())
-            # print("packed_text_indexes", packed_text_indexes.shape, packed_text_indexes.sum())
-
             # Step 8: Call decoder directly (bypass parent forward to have control)
             hidden_states = self._forward_decoder(
                 decoder_input=decoder_input_for_gpt,
@@ -305,8 +291,6 @@ class BagelMCoreModel(GPTModel):
                     last_hidden_state = hidden_states[0]
             else:
                 last_hidden_state = hidden_states
-            # print("after language_model forward, last_hidden_state", last_hidden_state.shape, last_hidden_state.to(torch.float32).sum())
-            # print("================================================")
 
             # Step 10: Compute CE loss at specific indexes
             ce = None
@@ -319,17 +303,11 @@ class BagelMCoreModel(GPTModel):
                 output_weight = None
                 if self.share_embeddings_and_output_weights:
                     output_weight = self.shared_embedding_or_output_weight()
-                # Use shared embedding weight as output projection
-                # print("before language_model.lm_head last_hidden_state", last_hidden_state[ce_loss_indexes].shape, last_hidden_state[ce_loss_indexes].to(torch.float32).sum(), last_hidden_state[ce_loss_indexes].flatten()[:10])
-                # print("before language_model.lm_head weight", output_weight.shape, output_weight.dtype, output_weight.sum())
                 logits_at_loss = F.linear(
                     last_hidden_state[ce_loss_indexes],
                     output_weight
                 )
-                # print("after language_model.lm_head forward, logits_at_loss", logits_at_loss.shape, logits_at_loss.sum(), logits_at_loss.flatten()[:10])
-                # print("before language_model.lm_head cross_entropy, packed_label_ids", packed_label_ids.shape, packed_label_ids.sum(), packed_label_ids.flatten()[:10])
                 ce = F.cross_entropy(logits_at_loss, packed_label_ids, reduction="none")
-                # print("after language_model.lm_head cross_entropy", ce.shape, ce.sum(), ce)
 
             return dict(last_hidden_state=last_hidden_state, ce=ce)
 

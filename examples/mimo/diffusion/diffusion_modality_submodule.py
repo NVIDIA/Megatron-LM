@@ -141,7 +141,7 @@ class DiffusionModalitySubmodules(ModalitySubmodules):
         embeddings['latents'] = encoder_inputs['latents']
 
         projected = self.combine_embeddings(embeddings)
-        logging.debug(f"Projected vision embeddings shape: {projected.shape}")
+        logger.debug(f"Projected vision embeddings shape: {projected.shape}")
         return projected  # [total_embeddings, hidden_dim]
 
     def llm2vae(self, llm_embeddings: torch.Tensor) -> torch.Tensor:

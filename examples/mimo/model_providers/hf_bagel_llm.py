@@ -1,6 +1,7 @@
 # Copyright (c) 2025, NVIDIA CORPORATION.  All rights reserved.
 
 import torch
+import logging
 import torch.nn.functional as F
 
 from megatron.core.models.huggingface import HuggingFaceModule
@@ -17,6 +18,7 @@ except ImportError:
 
     HAVE_TRANSFORMERS = False
 
+logger = logging.getLogger(__name__)
 
 class BagelLLMHuggingFaceModel(HuggingFaceModule):
     """
@@ -71,11 +73,9 @@ class BagelLLMHuggingFaceModel(HuggingFaceModule):
 
             # Get text embeddings from input_ids
             # get_input_embeddings() returns embed_tokens layer
-            print("language_model.model.embed_tokens forward")
-            print("packed_text_ids", input_ids.shape, input_ids.sum())
             text_embeddings = self.model.get_input_embeddings()(input_ids)  # [batch, seq, hidden]
             text_embeddings = text_embeddings.squeeze(0)  # [num_text_tokens, hidden]
-            print("after language model.model.embed_tokens forward, packed_text_embedding", text_embeddings.shape, text_embeddings.sum())
+            logger.debug("after language model.model.embed_tokens forward, packed_text_embedding", text_embeddings.shape, text_embeddings.sum())
 
             hidden_size = text_embeddings.shape[-1]
             device = text_embeddings.device
@@ -97,9 +97,9 @@ class BagelLLMHuggingFaceModel(HuggingFaceModule):
             packed_vit_token_indexes = kwargs.get("packed_vit_token_indexes")
 
             if packed_vit_token_indexes is not None:
-                print("packed_vit_token_indexes", packed_vit_token_indexes.shape, packed_vit_token_indexes.sum())
+                logger.debug("packed_vit_token_indexes", packed_vit_token_indexes.shape, packed_vit_token_indexes.sum())
             else:
-                print("packed_vit_token_indexes is None")
+                logger.debug("packed_vit_token_indexes is None")
             if vision_embeddings is not None and packed_vit_token_indexes is not None:
                 packed_vit_token_indexes = packed_vit_token_indexes.to(device)
                 packed_sequence[packed_vit_token_indexes] = vision_embeddings
@@ -160,24 +160,7 @@ class BagelLLMHuggingFaceModel(HuggingFaceModule):
                     print("BagelLLMHuggingFaceModel packed_gen_token_indexes:", packed_gen_token_indexes.shape)
                 else:
                     print("BagelLLMHuggingFaceModel packed_gen_token_indexes is None")
-        # else:
-        #     # Legacy path: decoder_input is already the combined embeddings
-        #     decoder_input = kwargs.get("decoder_input")
-        #     if decoder_input is not None:
-        #         combined_embeddings = decoder_input.permute(1, 0, 2)
-        #         packed_sequence = combined_embeddings.squeeze(0)  # [seq_len, hidden]
-        #     else:
-        #         # Fallback: compute embeddings from input_ids
-        #         input_ids = kwargs.get("input_ids")
-        #         text_embeddings = self.model.get_input_embeddings()(input_ids)
-        #         packed_sequence = text_embeddings.squeeze(0)
-        #     attention_mask = kwargs.get("attention_mask")
-        #     extra_inputs = {}
-        # print("language_model forward")
-        # print("packed_sequence", packed_sequence.shape, packed_sequence.to(torch.float32).sum())
-        # print("sample_lens", sample_lens)
-        # print("attention_mask", attention_mask.shape)
-        # print("packed_position_ids", kwargs["packed_position_ids"].shape, kwargs["packed_position_ids"].sum())
+
         last_hidden_state = self.model.forward_train(
             packed_sequence=packed_sequence,
             sample_lens=sample_lens,

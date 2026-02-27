@@ -133,7 +133,6 @@ def get_batch(data_iterator: Iterator[Dict[str, Any]]):
     """
     args = get_args()
     # cur_rank = torch.distributed.get_rank()
-    # print(f"Run get batch on rank {cur_rank}")
 
     # Assert that context parallelism and pipeline parallelism are not supported yet
     assert (
@@ -188,10 +187,8 @@ def get_batch(data_iterator: Iterator[Dict[str, Any]]):
         diffusion_wrapper = getattr(args, 'diffusion_wrapper', None)
         if diffusion_wrapper is not None:
             diffusion_wrapper.cuda()
-        # print(f"Run bagel_packed_batch_to_mimo_batch on rank {cur_rank}")
         data = bagel_packed_batch_to_mimo_batch(data, diffusion_wrapper=diffusion_wrapper)
 
-    # print(f"Run broadcast_nested_data_batch on rank {cur_rank}")
     batch = broadcast_nested_data_batch(data)
     return batch
 
@@ -210,7 +207,6 @@ def loss_func(loss_mask, output_tensor):
     if isinstance(output_tensor, dict):
         ce_loss = output_tensor.get('ce')
         mse_loss = output_tensor.get('mse')
-        # print(f"ce_loss: {ce_loss}, mse_loss: {mse_loss}")
 
         total_loss = torch.tensor(0.0, device='cuda')
         total_tokens = torch.tensor(0, dtype=torch.int, device='cuda')
