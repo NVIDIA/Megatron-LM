@@ -278,11 +278,11 @@ class HybridCPDataLoaderWrapper:
             # Find padding required to make dim=0 divisible by 32 after sharding
             # MXFP8 BLOCK_SIZE is 32
             pad_granularity = 32
-            sharded_tensor_shape = seq_len // local_cp_size
+            sharded_tensor_shape = seq_len // (local_cp_size * parallel_state.get_tensor_model_parallel_world_size())
             mod_token_count = sharded_tensor_shape % pad_granularity
             pad_len = 0
             if mod_token_count != 0:
-                pad_len = (pad_granularity - mod_token_count) * local_cp_size
+                pad_len = (pad_granularity - mod_token_count) * (local_cp_size * parallel_state.get_tensor_model_parallel_world_size())
                 # tensor = torch.cat([tensor, torch.zeros(pad_len, dtype=tensor.dtype, device=tensor.device)])
             
             return pad_len
