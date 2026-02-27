@@ -352,9 +352,15 @@ class TestVppSimulatorBasic:
             # Single PP stage: all layers in one or distributed across VPP chunks
             layers_per_chunk = mock_args.num_layers // num_model_chunks
         else:
-            # Multiple PP stages: distribute layers evenly across PP ranks
-            # Total decoder layers = pp_size * layers_per_chunk (for no VPP case)
-            layers_per_chunk = max(1, mock_args.num_layers // pp_size)
+            if num_model_chunks == 1:
+                # No VPP: distribute layers evenly across PP ranks
+                # Total decoder layers = pp_size * layers_per_chunk
+                layers_per_chunk = max(1, mock_args.num_layers // pp_size)
+            else:
+                # With VPP: total stages = pp_size * num_model_chunks
+                # Each stage should have layers_per_chunk decoder layers
+                total_stages = pp_size * num_model_chunks
+                layers_per_chunk = max(1, mock_args.num_layers // total_stages)
 
         if pp_size == 1:
             # Single PP stage
@@ -389,9 +395,22 @@ class TestVppSimulatorBasic:
                         pp_parts.append("t" * layers_per_chunk)
                 layout_str = "|".join(pp_parts)
             else:
-                # With VPP: grouped layout
-                # E.g., for pp_size=2, vpp_size=2: "E(tt|)*2L"
-                layout_str = f"E({'t' * layers_per_chunk}|)*{num_model_chunks}L"
+                # With VPP: create individual stages for each PP rank and VPP chunk
+                # Total stages = pp_size * vpp_size
+                # E.g., for pp_size=2, vpp_size=2, layers_per_chunk=1: "Et|t|t|tL"
+                total_stages = pp_size * num_model_chunks
+                stage_parts = []
+                for stage_idx in range(total_stages):
+                    if stage_idx == 0:
+                        # First stage: embedding + layers
+                        stage_parts.append("E" + "t" * layers_per_chunk)
+                    elif stage_idx == total_stages - 1:
+                        # Last stage: layers + loss
+                        stage_parts.append("t" * layers_per_chunk + "L")
+                    else:
+                        # Middle stages: just layers
+                        stage_parts.append("t" * layers_per_chunk)
+                layout_str = "|".join(stage_parts)
 
         mock_args.pipeline_model_parallel_layout = PipelineParallelLayerLayout(
             layout=layout_str,
