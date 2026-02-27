@@ -474,7 +474,7 @@ class CUDAGraphBatchDimensionBuilder:
     def match_graph_config(
         real_batch_dim: InferenceBatchDimensions,
         cuda_graph_batch_dimensions_list: List[InferenceBatchDimensions],
-        cuda_graph_mixed_prefill_count: int,
+        smallest_non_decode_cuda_graph_size: int,
         strict: bool = False,
         decode_only_cuda_graphs: bool = False,
         explicit_chunked_prefill: bool = False,
@@ -509,7 +509,7 @@ class CUDAGraphBatchDimensionBuilder:
             decode_only_cuda_graphs=decode_only_cuda_graphs,
             explicit_chunked_prefill=explicit_chunked_prefill,
             ep_group=ep_group,
-            cuda_graph_mixed_prefill_count=cuda_graph_mixed_prefill_count,
+            cuda_graph_mixed_prefill_count=smallest_non_decode_cuda_graph_size,
         )
 
         if adjusted_batch_dim is None:

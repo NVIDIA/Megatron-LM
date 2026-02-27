@@ -952,6 +952,29 @@ class InferenceGroupedMLP(TEGroupedMLP):
 
         self.is_inference_cuda_graphed_iteration = False
 
+        # FlashInfer's cutlass_fused_moe expects gated weights in [gate, activation]
+        # order, but TE stores them as [activation, gate]. Until FlashInfer supports
+        # TE's weight ordering, the FlashInfer path is only available for non-gated
+        # activations (e.g. squared_relu).
+        self._flashinfer_available = HAVE_FLASHINFER and not config.gated_linear_unit
+        if self._flashinfer_available:
+            self._flashinfer_activation_type = self._resolve_flashinfer_activation_type()
+
+    def _resolve_flashinfer_activation_type(self):
+        """Map megatron activation config to FlashInfer ActivationType."""
+        func = self.config.activation_func
+        if func == F.silu:
+            return ActivationType.Silu
+        elif func == F.gelu:
+            return ActivationType.Gelu
+        elif func == F.relu:
+            return ActivationType.Relu
+        elif func == squared_relu:
+            return ActivationType.Relu2
+        raise ValueError(
+            f"No FlashInfer ActivationType mapping for activation_func={func}"
+        )
+
     def set_is_inference_cuda_graphed_iteration(self, set_to: bool):
         """Toggle CUDA-graphed iteration mode."""
         self.is_inference_cuda_graphed_iteration = set_to
@@ -1008,15 +1031,16 @@ class InferenceGroupedMLP(TEGroupedMLP):
     def _flashinfer_forward(self, hidden_states, routing_map, probs):
         """FlashInfer fused MoE kernel for CUDA-graphed inference iterations."""
         assert HAVE_FLASHINFER, "flashinfer-python is required for FlashInfer forward path."
+        assert probs.dtype == torch.float32, "FlashInfer forward path requires fp32 probabilities."
         output = fused_moe.cutlass_fused_moe(
             hidden_states,
-            routing_map.to(torch.int),
-            probs.float(),
+            routing_map.int(),
+            probs,
             self._fc1_weight,
             self._fc2_weight,
             hidden_states.dtype,
             quant_scales=None,
-            activation_type=ActivationType.Relu2,
+            activation_type=self._flashinfer_activation_type,
             ep_size=self.ep_group.size(),
             ep_rank=self.ep_group.rank(),
         )[0]
@@ -1133,7 +1157,7 @@ class InferenceGroupedMLP(TEGroupedMLP):
         if self.training:
             return super().forward(permuted_local_hidden_states, tokens_per_expert, permuted_probs)
 
-        elif self.is_inference_cuda_graphed_iteration:
+        elif self.is_inference_cuda_graphed_iteration and self._flashinfer_available:
             return self._flashinfer_forward(
                 permuted_local_hidden_states, tokens_per_expert, permuted_probs
             )

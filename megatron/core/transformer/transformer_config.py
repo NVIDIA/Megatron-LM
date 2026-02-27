@@ -1103,6 +1103,22 @@ class TransformerConfig(ModelParallelConfig):
                 raise ValueError(
                     "Inference-optimized MoE layers do not support padded routing map for quantization."
                 )
+            if self.num_moe_experts is not None and self.moe_router_dtype != "fp32":
+                raise ValueError(
+                    "Inference-optimized MoE requires --moe-router-dtype=fp32 "
+                    "to avoid costly dtype conversions during decode."
+                )
+            if (
+                self.num_moe_experts is not None
+                and self.gated_linear_unit
+                and self.cuda_graph_impl != "none"
+            ):
+                raise ValueError(
+                    "Inference-optimized MoE does not yet support CUDA graphs with gated "
+                    "linear units (SwiGLU/GeGLU) due to differences in weight layouts "
+                    "between the FlashInfer kernel and mcore. Either disable CUDA graphs "
+                    "(--cuda-graph-impl=none) or use a non-gated activation (e.g. squared_relu)."
+                )
 
         if self.num_moe_experts is not None and self.num_moe_experts <= 0:
             raise ValueError("num_moe_experts must be non-negative.")

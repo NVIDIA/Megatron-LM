@@ -50,7 +50,7 @@ def _match(
         decode_only_cuda_graphs=decode_only,
         explicit_chunked_prefill=explicit_chunked_prefill,
         ep_group=ep_group,
-        cuda_graph_mixed_prefill_count=MIXED_PREFILL_COUNT,
+        smallest_non_decode_cuda_graph_size=MIXED_PREFILL_COUNT,
     )
 
 

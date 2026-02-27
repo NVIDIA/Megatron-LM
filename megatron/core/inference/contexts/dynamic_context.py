@@ -1340,13 +1340,18 @@ class DynamicInferenceContext(BaseInferenceContext):
         best_graph = CUDAGraphBatchDimensionBuilder.match_graph_config(
             batch_dimensions,
             self.cuda_graph_batch_dimensions_list,
+            smallest_non_decode_cuda_graph_size=min(
+                self.cuda_graph_mixed_prefill_count, self.max_requests
+            ),
             strict=self.is_hybrid_model,
             decode_only_cuda_graphs=(not self.use_cuda_graphs_for_non_decode_steps),
             explicit_chunked_prefill=self.is_chunked_prefill_enabled() and self.is_hybrid_model,
             ep_group=self.expert_model_parallel_group,
-            cuda_graph_mixed_prefill_count=self.cuda_graph_mixed_prefill_count,
         )
         self._using_cuda_graph_this_step = best_graph is not None
+
+        if construct_graph_dimensions is not None:
+            assert self._using_cuda_graph_this_step
 
         if is_expert_parallel_dummy_cuda_graph_step and not self.using_cuda_graph_this_step():
             # If we are here, this means that CUDAGraphBatchDimensionBuilder.match_graph_config
