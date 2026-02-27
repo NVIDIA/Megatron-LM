@@ -213,7 +213,7 @@ class TestBlockSharingAndRefCounts(PrefixCachingTestBase):
         ctx_disabled = self._ctx(enable_prefix_caching=False)
         alloc_d = ctx_disabled.block_allocator
         assert not hasattr(alloc_d, 'block_hashes')
-        assert not hasattr(alloc_d, 'hash_to_block_id')
+        assert not hasattr(alloc_d, 'kv_hash_to_block_id')
         assert not hasattr(alloc_d, 'block_ref_counts')
 
         ctx_rz = self._ctx(block_evict_lru=False)
@@ -318,12 +318,12 @@ class TestRefCountLifecycle(PrefixCachingTestBase):
 
         ctx.release_memory_blocks_from_request_indexes(torch.tensor([0]))
         assert alloc.block_ref_counts[b0].item() == 1
-        assert b0_hash in alloc.hash_to_block_id
+        assert b0_hash in alloc.kv_hash_to_block_id
 
         ctx.release_memory_blocks_from_request_indexes(torch.tensor([1]))
         assert alloc.block_ref_counts[b0].item() == 0
         assert alloc.block_ref_counts[b1].item() == 0
-        assert b0_hash in alloc.hash_to_block_id, "LRU keeps cached blocks"
+        assert b0_hash in alloc.kv_hash_to_block_id, "LRU keeps cached blocks"
 
     @pytest.mark.internal
     def test_lru_cached_blocks_reused_by_new_request(self):
@@ -339,7 +339,7 @@ class TestRefCountLifecycle(PrefixCachingTestBase):
         ctx.release_memory_blocks_from_request_indexes(torch.tensor([0]))
         ctx.total_request_count = 0
         assert alloc.block_ref_counts[b0].item() == 0
-        assert alloc.block_hashes[b0].item() in alloc.hash_to_block_id
+        assert alloc.block_hashes[b0].item() in alloc.kv_hash_to_block_id
 
         ctx.add_request(self._req(ctx, prompt.clone(), request_id=2))
         assert self._block_ids(ctx, 0, 2) == [b0, b1]
@@ -395,12 +395,12 @@ class TestRefCountLifecycle(PrefixCachingTestBase):
         # Release first: ref=1, hash persists
         ctx.release_memory_blocks_from_request_indexes(torch.tensor([0]))
         assert alloc.block_ref_counts[b0].item() == 1
-        assert b0_hash in alloc.hash_to_block_id
+        assert b0_hash in alloc.kv_hash_to_block_id
 
         # Release second: ref=0, hash removed, blocks returned
         ctx.release_memory_blocks_from_request_indexes(torch.tensor([1]))
         assert alloc.block_ref_counts[b0].item() == 0
-        assert b0_hash not in alloc.hash_to_block_id
+        assert b0_hash not in alloc.kv_hash_to_block_id
         assert alloc.block_hashes[b0].item() == -1
         assert alloc.block_hashes[b1].item() == -1
         assert alloc.total_avail == avail_before + 2
@@ -496,8 +496,8 @@ class TestRegistrationAndDiscovery(PrefixCachingTestBase):
         b0, b1 = self._block_ids(ctx, 0, 2)
         h0, h1 = req.precomputed_block_hashes
 
-        assert alloc.hash_to_block_id.get(h0) == b0
-        assert alloc.hash_to_block_id.get(h1) == b1
+        assert alloc.kv_hash_to_block_id.get(h0) == b0
+        assert alloc.kv_hash_to_block_id.get(h1) == b1
         assert alloc.block_hashes[b0].item() == h0
         assert alloc.block_hashes[b1].item() == h1
 
@@ -538,7 +538,7 @@ class TestRegistrationAndDiscovery(PrefixCachingTestBase):
 
     @pytest.mark.internal
     def test_second_request_finds_registered_blocks(self):
-        """After req1 registers 3 blocks, req2's hashes all resolve in hash_to_block_id."""
+        """After req1 registers 3 blocks, req2's hashes all resolve in kv_hash_to_block_id."""
         ctx = self._ctx()
         bs = ctx.block_size_tokens
         alloc = ctx.block_allocator
@@ -549,7 +549,7 @@ class TestRegistrationAndDiscovery(PrefixCachingTestBase):
 
         req2 = self._req(ctx, prompt.clone(), request_id=2)
         for h in req2.precomputed_block_hashes:
-            assert h in alloc.hash_to_block_id, f"Hash {h} should be discoverable"
+            assert h in alloc.kv_hash_to_block_id, f"Hash {h} should be discoverable"
 
 
 # =========================================================================

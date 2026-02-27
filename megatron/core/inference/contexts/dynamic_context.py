@@ -1177,6 +1177,9 @@ class DynamicInferenceContext(BaseInferenceContext):
         self.block_to_mamba_slot[block_id] = -1
         self.mamba_slot_to_block[slot] = -1
 
+        # Remove from mamba hash map
+        self.block_allocator.deregister_mamba_block_hash(block_id)
+
         return slot
 
     def store_mamba_state_for_block(self, block_id: int, request_idx: int) -> None:
@@ -1865,7 +1868,7 @@ class DynamicInferenceContext(BaseInferenceContext):
             return [], 0
 
         hashes = req.precomputed_block_hashes[start_block:end_block]
-        hash_to_block = self.block_allocator.hash_to_block_id
+        hash_to_block = self.block_allocator.kv_hash_to_block_id
 
         # Batch dict lookups via C-level map() — faster than Python for loop
         block_ids = list(map(hash_to_block.get, hashes))

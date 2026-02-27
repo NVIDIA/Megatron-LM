@@ -1029,3 +1029,171 @@ class TestMultiplePrefillWithInitialStates:
         # Verify non-trivial output
         assert len(results_bc_sim[1]) == num_tokens_to_generate
         assert len(results_bc_sim[2]) == num_tokens_to_generate
+
+
+class TestMambaHashMap:
+    """Tests for the two-map design: kv_hash_to_block_id + mamba_hash_to_block_id."""
+
+    def setup_method(self, method):
+        Utils.initialize_model_parallel(
+            tensor_model_parallel_size=1, pipeline_model_parallel_size=1
+        )
+        model_parallel_cuda_manual_seed(123)
+
+    def teardown_method(self, method):
+        Utils.destroy_model_parallel()
+
+    @pytest.mark.internal
+    def test_mamba_hash_registered_on_store(self):
+        """Storing Mamba state for a block registers its hash in mamba_hash_to_block_id."""
+        ctx = _build_hybrid_context(prefix_caching_mamba_gb=0.01)
+        block_size = ctx.block_size_tokens
+        alloc = ctx.block_allocator
+
+        req = _make_request(1, block_size * 2, block_size)
+        ctx.add_request(req)
+
+        block_0_id = ctx.request_to_kv_block_ids[0][0].item()
+        block_0_hash = alloc.block_hashes[block_0_id].item()
+
+        # Before store: hash in kv map but not mamba map
+        assert block_0_hash in alloc.kv_hash_to_block_id
+        assert block_0_hash not in alloc.mamba_hash_to_block_id
+
+        # Store and register
+        ctx.store_mamba_state_for_block(block_0_id, 0)
+        alloc.register_mamba_block_hash(block_0_id, block_0_hash)
+
+        # After store: hash in both maps
+        assert block_0_hash in alloc.kv_hash_to_block_id
+        assert block_0_hash in alloc.mamba_hash_to_block_id
+        assert alloc.mamba_hash_to_block_id[block_0_hash] == block_0_id
+
+    @pytest.mark.internal
+    def test_mamba_hash_removed_on_mamba_eviction(self):
+        """Mamba eviction removes hash from mamba_hash_to_block_id but keeps kv_hash_to_block_id."""
+        ctx = _build_hybrid_context(prefix_caching_mamba_gb=0.001)
+        block_size = ctx.block_size_tokens
+        alloc = ctx.block_allocator
+        max_slots = ctx.max_mamba_cache_slots
+        assert max_slots >= 1
+
+        # Add request, store mamba state, register hash
+        req = _make_request(1, block_size * 2, block_size)
+        ctx.add_request(req)
+        block_0_id = ctx.request_to_kv_block_ids[0][0].item()
+        block_0_hash = alloc.block_hashes[block_0_id].item()
+        ctx.store_mamba_state_for_block(block_0_id, 0)
+        alloc.register_mamba_block_hash(block_0_id, block_0_hash)
+
+        assert block_0_hash in alloc.mamba_hash_to_block_id
+
+        # Release request so blocks become evictable (ref_count = 0)
+        ctx.release_memory_blocks_from_request_indexes(torch.tensor([0]))
+
+        # Make block_0 the oldest (timestamp=0) so it gets evicted first
+        alloc.block_timestamps[block_0_id] = 0
+
+        # Fill remaining mamba slots with valid block IDs (use low IDs that
+        # are within total_count and not already mapped)
+        filled = 0
+        for i in range(alloc.total_count):
+            if filled >= max_slots:
+                break
+            if ctx.block_to_mamba_slot[i].item() < 0:
+                alloc.block_ref_counts[i] = 0
+                alloc.block_timestamps[i] = 1000 + filled  # newer than block_0
+                ctx._allocate_mamba_cache_slot(i)
+                filled += 1
+
+        # After eviction: mamba hash gone, kv hash remains
+        assert block_0_hash not in alloc.mamba_hash_to_block_id
+        assert block_0_hash in alloc.kv_hash_to_block_id
+
+    @pytest.mark.internal
+    def test_mamba_hash_removed_on_kv_eviction(self):
+        """KV block eviction removes hash from both kv and mamba hash maps."""
+        ctx = _build_hybrid_context(prefix_caching_mamba_gb=0.01, buffer_size_gb=0.01, rounder=1)
+        block_size = ctx.block_size_tokens
+        alloc = ctx.block_allocator
+
+        # Add request, store mamba state, register hash
+        req = _make_request(1, block_size * 2, block_size)
+        ctx.add_request(req)
+        block_0_id = ctx.request_to_kv_block_ids[0][0].item()
+        block_1_id = ctx.request_to_kv_block_ids[0][1].item()
+        block_0_hash = alloc.block_hashes[block_0_id].item()
+        ctx.store_mamba_state_for_block(block_0_id, 0)
+        alloc.register_mamba_block_hash(block_0_id, block_0_hash)
+
+        assert block_0_hash in alloc.kv_hash_to_block_id
+        assert block_0_hash in alloc.mamba_hash_to_block_id
+
+        # Release so blocks become cached (ref_count=0)
+        ctx.release_memory_blocks_from_request_indexes(torch.tensor([0]))
+        ctx.total_request_count = 0
+
+        # Directly evict via _deregister_blocks (simulates LRU eviction)
+        blocks_to_evict = torch.tensor([block_0_id, block_1_id],
+                                        device=torch.cuda.current_device(),
+                                        dtype=torch.int32)
+        alloc._deregister_blocks(blocks_to_evict)
+
+        # After KV eviction: both hashes should be gone
+        assert block_0_hash not in alloc.kv_hash_to_block_id
+        assert block_0_hash not in alloc.mamba_hash_to_block_id
+
+    @pytest.mark.internal
+    def test_reset_clears_mamba_hash_map(self):
+        """reset() clears mamba_hash_to_block_id."""
+        ctx = _build_hybrid_context(prefix_caching_mamba_gb=0.01)
+        block_size = ctx.block_size_tokens
+        alloc = ctx.block_allocator
+
+        req = _make_request(1, block_size * 2, block_size)
+        ctx.add_request(req)
+        block_0_id = ctx.request_to_kv_block_ids[0][0].item()
+        block_0_hash = alloc.block_hashes[block_0_id].item()
+        ctx.store_mamba_state_for_block(block_0_id, 0)
+        alloc.register_mamba_block_hash(block_0_id, block_0_hash)
+
+        assert len(alloc.mamba_hash_to_block_id) > 0
+
+        alloc.reset()
+        assert len(alloc.mamba_hash_to_block_id) == 0
+        assert len(alloc.kv_hash_to_block_id) == 0
+
+    @pytest.mark.internal
+    def test_kv_match_extends_beyond_mamba_match(self):
+        """KV match can cover more blocks than mamba match (two-map design)."""
+        ctx = _build_hybrid_context(
+            prefix_caching_mamba_gb=0.001,
+            buffer_size_gb=0.01,
+            max_tokens=None,
+        )
+        block_size = ctx.block_size_tokens
+        alloc = ctx.block_allocator
+
+        # Add request A with 3 blocks
+        prompt = torch.arange(block_size * 3, device=torch.cuda.current_device())
+        req_a = _make_request(1, prompt, block_size)
+        ctx.add_request(req_a)
+
+        # Register mamba state only for block 0
+        block_0_id = ctx.request_to_kv_block_ids[0][0].item()
+        block_0_hash = alloc.block_hashes[block_0_id].item()
+        ctx.store_mamba_state_for_block(block_0_id, 0)
+        alloc.register_mamba_block_hash(block_0_id, block_0_hash)
+
+        # All 3 blocks in kv map
+        for i in range(3):
+            bid = ctx.request_to_kv_block_ids[0][i].item()
+            h = alloc.block_hashes[bid].item()
+            assert h in alloc.kv_hash_to_block_id, f"Block {i} should be in kv map"
+
+        # Only block 0 in mamba map
+        assert block_0_hash in alloc.mamba_hash_to_block_id
+        for i in range(1, 3):
+            bid = ctx.request_to_kv_block_ids[0][i].item()
+            h = alloc.block_hashes[bid].item()
+            assert h not in alloc.mamba_hash_to_block_id, f"Block {i} should NOT be in mamba map"
