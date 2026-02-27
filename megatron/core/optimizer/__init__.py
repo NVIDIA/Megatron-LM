@@ -680,8 +680,12 @@ def get_megatron_optimizer(
         Instance of MegatronOptimizer.
     """
 
+    # None → apply standard defaults. To extend defaults with custom overrides,
+    # start from get_standard_config_overrides(config) and merge yours in.
     if config_overrides is None:
         config_overrides = get_standard_config_overrides(config)
+
+    check_config_overrides_consistency(config, config_overrides)
 
     # TODO: the standard and emerging optimizer paths handle pg_collection differently;
     # unify them so both use a single pg_collection-based flow.
@@ -694,8 +698,6 @@ def get_megatron_optimizer(
         )
 
     log_single_rank(logger, logging.INFO, f'Setting up optimizer with config {config}')
-
-    check_config_overrides_consistency(config, config_overrides)
 
     # Separate out first model chunk if overlapping param AG with optimizer step.
     if config.overlap_param_gather_with_optimizer_step:

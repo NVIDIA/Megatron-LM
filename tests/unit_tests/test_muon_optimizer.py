@@ -215,7 +215,7 @@ class TestMuonOptimizerMultiRank:
             use_distributed_optimizer=False,
         )
 
-        with pytest.raises(Exception, match='muon with fp16 is not supported'):
+        with pytest.raises(Exception, match='emerging optimizer with fp16 is not supported'):
             get_megatron_optimizer(config=optimizer_config_fp16, model_chunks=[model])
 
         # Test 3: Invalid num_ns_steps should raise exception
@@ -241,7 +241,7 @@ class TestMuonOptimizerMultiRank:
             lr=0.01,
             weight_decay=0.01,
             bf16=True,
-            use_distributed_optimizer=True,
+            use_layer_wise_distributed_optimizer=True,
             muon_momentum=0.95,
             muon_use_nesterov=True,
             muon_fp32_matmul_prec="medium",
@@ -250,7 +250,7 @@ class TestMuonOptimizerMultiRank:
             muon_tp_mode="duplicated",
         )
 
-        # use_distributed_optimizer=True triggers LayerWiseDistributedOptimizer for emerging opts
+        # use_layer_wise_distributed_optimizer=True triggers LayerWiseDistributedOptimizer
         optimizer = get_megatron_optimizer(
             config=optimizer_config, model_chunks=[model], use_gloo_process_groups=True
         )

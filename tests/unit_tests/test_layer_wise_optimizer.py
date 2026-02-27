@@ -348,7 +348,7 @@ class TestLayerWiseOptimizer:
 
         # Should raise TypeError when receiving already-wrapped optimizer
         with pytest.raises(
-            TypeError, match='LayerWiseDistributedOptimizer expects plain torch optimizers'
+            TypeError, match='LayerWiseDistributedOptimizer expects base torch optimizers'
         ):
             LayerWiseDistributedOptimizer([wrapped_optimizer], optimizer_config, pg_collection)
 
