@@ -73,6 +73,8 @@ class TestValidateSegmentLayers:
             ("MM*-MM*-", ['M', 'M', '*', '-', 'M', 'M', '*', '-']),
             ("E", ['E']),
             ("", []),
+            ("GGG*GGG*", ['G', 'G', 'G', '*', 'G', 'G', 'G', '*']),
+            ("GEGEGE*E", ['G', 'E', 'G', 'E', 'G', 'E', '*', 'E']),
         ]
         for pattern, expected in test_cases:
             result = validate_segment_layers(pattern)
@@ -151,6 +153,8 @@ class TestParseHybridPattern:
             ("*M*M", "*M*M"),
             ("MM-*", "MM-*"),
             ("E", "E"),
+            ("GGG*GGG*", "GGG*GGG*"),
+            ("GEGEGE*E", "GEGEGE*E"),
         ]
         for pattern, expected_main in test_cases:
             result = parse_hybrid_pattern(pattern)
@@ -271,6 +275,8 @@ class TestParseHybridPattern:
             ("*****/M/M/M/M", "*****", "M", 4),
             # MoE in main pattern
             ("MEME/MM/MM", "MEME", "MM", 2),
+            # GDN+MoE main pattern with GDN MTP
+            ("GEGEGE*E/GG/GG", "GEGEGE*E", "GG", 2),
         ]
         for pattern, expected_main, expected_mtp, expected_depths in test_cases:
             result = parse_hybrid_pattern(pattern)

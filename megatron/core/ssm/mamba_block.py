@@ -42,6 +42,7 @@ class MambaStackSubmodules:
     attention_layer: Union[ModuleSpec, type] = IdentityOp
     mlp_layer: Union[ModuleSpec, type] = IdentityOp
     moe_layer: Union[ModuleSpec, type] = IdentityOp
+    gdn_layer: Union[ModuleSpec, type] = IdentityOp
     mtp_block_spec: Optional[ModuleSpec] = None
 
 
@@ -149,6 +150,16 @@ class MambaStack(GraphableMegatronModule, MegatronModule):
                         layer_number=layer_number,
                         pg_collection=pg_collection,
                         add_layer_offset=False,
+                    )
+                elif layer_type == LayerSymbols.GDN:
+                    layer = build_module(
+                        submodules.gdn_layer,
+                        config=self.config,
+                        layer_number=layer_number,
+                        pg_collection=pg_collection,
+                        is_mtp_layer=is_mtp_layer,
+                        add_layer_offset=False,
+                        pp_layer_offset=pp_layer_offset,
                     )
                 else:
                     assert False, "unexpected layer_type"
