@@ -1201,3 +1201,1247 @@ class TestMambaHashMap:
             bid = ctx.request_to_kv_block_ids[0][i].item()
             h = alloc.block_hashes[bid].item()
             assert h not in alloc.mamba_hash_to_block_id, f"Block {i} should NOT be in mamba map"
+
+
+class TestChunkedPrefillMambaState:
+    """Tests for chunked prefill requests that receive intermediate Mamba state.
+
+    Covers two critical scenarios:
+    1a. A request whose KV match extends beyond its Mamba match gets its KV match
+        truncated at the divergence boundary, restores Mamba state from cache for
+        the matched portion, and stores new Mamba state at the divergence boundary.
+    1b. A request with a non-block-aligned prompt and no prefix match gets
+        forced-chunked at the last-aligned boundary, with Mamba state stored after
+        the first chunk and continued via per-request state in the second chunk.
+    """
+
+    def teardown_method(self, method):
+        Utils.destroy_model_parallel()
+
+    @pytest.mark.internal
+    @pytest.mark.skipif(
+        not is_fa_min_version("2.7.3"), reason="need latest flash attn for dynamic batching"
+    )
+    @torch.no_grad()
+    def test_divergence_boundary_restores_and_stores_mamba_state(self):
+        """Request C shares 96 tokens with B (3 KV blocks matched), but only 2 blocks
+        have Mamba state. C restores Mamba from block 1, processes 32 effective tokens,
+        and stores Mamba state for block 2 (the divergence boundary).
+
+        Sequence:
+            A (64 tokens) → Mamba stored for block 1
+            B (128 tokens, first 64 shared with A) → Mamba stored for block 3
+            C (96 tokens, first 96 shared with B) → KV match=3, Mamba match=2
+                → restores from block 1, stores at block 2
+
+        Verified by comparing C's output between chunked+prefix and chunked_only configs.
+        """
+        _skip_if_mamba_sequence_packing_not_available()
+
+        # --- Parameters ---
+        seed = 42
+        vocab_size = 100
+        block_size = 32
+        max_tokens = 256
+        max_sequence_length = 256
+        buffer_size_gb = 0.1
+        num_tokens_to_generate = 4
+
+        # Deterministic prompt generation.
+        torch.manual_seed(seed)
+        shared_ab = torch.randint(0, vocab_size - 1, (64,), device="cuda", dtype=torch.int64)
+        suffix_b = torch.randint(0, vocab_size - 1, (64,), device="cuda", dtype=torch.int64)
+
+        prompt_a = shared_ab.clone()                      # 64 tokens (2 blocks)
+        prompt_b = torch.cat([shared_ab, suffix_b])       # 128 tokens (4 blocks)
+        # C shares first 96 tokens with B (blocks 0, 1, 2)
+        prompt_c = torch.cat([shared_ab, suffix_b[:32]])  # 96 tokens (3 blocks)
+
+        def make_req(req_id, prompt, enable_pc):
+            return DynamicInferenceRequest(
+                request_id=req_id,
+                prompt_tokens=prompt.clone(),
+                sampling_params=SamplingParams(
+                    num_tokens_to_generate=num_tokens_to_generate,
+                    termination_id=-1,
+                ),
+                block_size_tokens=block_size,
+                enable_prefix_caching=enable_pc,
+            )
+
+        configs = [
+            {
+                "name": "chunked+prefix",
+                "enable_chunked_prefill": True,
+                "enable_prefix_caching": True,
+                "prefix_caching_mamba_gb": 0.01,
+                "max_tokens": max_tokens,
+            },
+            {
+                "name": "chunked_only",
+                "enable_chunked_prefill": True,
+                "enable_prefix_caching": False,
+                "prefix_caching_mamba_gb": None,
+                "max_tokens": max_tokens,
+            },
+        ]
+
+        all_results = {}
+        for config in configs:
+            Utils.destroy_model_parallel()
+            Utils.initialize_model_parallel(
+                tensor_model_parallel_size=1, pipeline_model_parallel_size=1
+            )
+
+            engine, _ = _build_engine(
+                enable_chunked_prefill=config["enable_chunked_prefill"],
+                enable_prefix_caching=config["enable_prefix_caching"],
+                prefix_caching_mamba_gb=config["prefix_caching_mamba_gb"],
+                block_size_tokens=block_size,
+                max_tokens=config["max_tokens"],
+                max_requests=8,
+                vocab_size=vocab_size,
+                max_sequence_length=max_sequence_length,
+                buffer_size_gb=buffer_size_gb,
+                seed=seed,
+            )
+            _install_deterministic_mock_forward(engine, vocab_size)
+
+            # --- Request A: 64 tokens (2 blocks) → run to completion ---
+            # Engine computes: last_aligned = 64, no divergence (first request).
+            # After A's prefill (total_prefilled=64 == last_aligned=64):
+            #   stores Mamba state for block 1 (last complete block).
+            # After A completes: KV blocks 0,1 cached (LRU), Mamba at block 1.
+            req_a = make_req(0, prompt_a, config["enable_prefix_caching"])
+            _run_to_completion(engine, [req_a])
+
+            # --- Request B: 128 tokens (first 64 shared with A) → run to completion ---
+            # Engine finds: KV match = 2 blocks (from A), Mamba match = 2
+            #   (_find_mamba_divergence_block scans backward: block 1 has state → return 2).
+            # num_mamba_matched == num_kv_matched → no divergence, _kv_divergence_token = 0.
+            # last_aligned = 128. prefix_skip = 64, effective = 64 tokens.
+            # Mamba restored from block 1. request_has_initial_mamba_state = True.
+            # After B's prefill (total_prefilled=128 == last_aligned=128):
+            #   stores Mamba state for block 3 (last complete block).
+            # After B: Mamba at {1, 3}. KV blocks {0,1,2,3} all cached.
+            req_b = make_req(1, prompt_b, config["enable_prefix_caching"])
+            _run_to_completion(engine, [req_b])
+
+            # --- Mamba state assertions (prefix caching config only) ---
+            if config["name"] == "chunked+prefix":
+                ctx = engine.context
+                alloc = ctx.block_allocator
+
+                # Look up block IDs from B's hashes (B covers blocks 0-3).
+                # Blocks remain in KV hash map after release (LRU eviction policy).
+                b_hashes = req_b.precomputed_block_hashes
+                b_block_ids = [alloc.kv_hash_to_block_id.get(h) for h in b_hashes]
+                assert all(bid is not None for bid in b_block_ids), \
+                    "All of B's blocks should be registered in KV hash map"
+
+                # After B completes: Mamba state at blocks 1 and 3 only.
+                # Block 0: never stored (only the last complete block at a boundary is stored).
+                # Block 1: stored after A's prefill.
+                # Block 2: not stored (B's prefill boundary was at block 3, not block 2).
+                # Block 3: stored after B's prefill.
+                assert ctx.has_mamba_state_for_block(b_block_ids[1]), \
+                    "Block 1 should have Mamba state (stored after A's prefill)"
+                assert ctx.has_mamba_state_for_block(b_block_ids[3]), \
+                    "Block 3 should have Mamba state (stored after B's prefill)"
+                assert not ctx.has_mamba_state_for_block(b_block_ids[0]), \
+                    "Block 0 should NOT have Mamba state"
+                assert not ctx.has_mamba_state_for_block(b_block_ids[2]), \
+                    "Block 2 should NOT have Mamba state"
+
+            # --- Request C: 96 tokens (first 96 shared with B) → run to completion ---
+            # Engine finds: KV match = 3 blocks (0,1,2 from A/B).
+            # _find_mamba_divergence_block scans backward:
+            #   block 2 (no Mamba) → block 1 (yes) → return 2.
+            # num_mamba_matched=2 < num_kv_matched=3 → divergence!
+            # _kv_divergence_token = 3*32 = 96, _mamba_last_aligned_token = 96.
+            # In add_request: KV match truncated to 2 blocks.
+            #   prefix_skip = min(2*32, 96-1) = 64, effective = 32 tokens.
+            #   Mamba restored from block 1. request_has_initial_mamba_state = True.
+            # After C's prefill (total_prefilled=96 == _kv_divergence_token=96):
+            #   stores Mamba state for block 2 (divergence boundary).
+            req_c = make_req(2, prompt_c, config["enable_prefix_caching"])
+            results_c = _run_to_completion(engine, [req_c])
+
+            # --- Mamba state assertion: block 2 now has Mamba state ---
+            if config["name"] == "chunked+prefix":
+                ctx = engine.context
+                alloc = ctx.block_allocator
+
+                c_hashes = req_c.precomputed_block_hashes
+                block_2_id = alloc.kv_hash_to_block_id.get(c_hashes[2])
+                assert block_2_id is not None, "Block 2 should be in KV hash map"
+                assert ctx.has_mamba_state_for_block(block_2_id), \
+                    "Block 2 should now have Mamba state (stored at divergence boundary)"
+
+            all_results[config["name"]] = results_c[2]
+
+        # --- Cross-config comparison: C's output must match ---
+        assert all_results["chunked+prefix"] == all_results["chunked_only"], (
+            f"Request C output mismatch:\n"
+            f"  chunked+prefix: {all_results['chunked+prefix']}\n"
+            f"  chunked_only: {all_results['chunked_only']}"
+        )
+
+    @pytest.mark.internal
+    @pytest.mark.skipif(
+        not is_fa_min_version("2.7.3"), reason="need latest flash attn for dynamic batching"
+    )
+    @torch.no_grad()
+    def test_last_aligned_boundary_forces_chunk_and_stores_mamba_state(self):
+        """Request X (80 tokens, no shared prefix) gets forced-chunked at 64 tokens
+        (last block-aligned boundary). Mamba state is stored after the first chunk,
+        and the second chunk (16 tokens) continues with per-request Mamba state.
+
+        Sequence:
+            X (80 tokens, no prefix) →
+                Chunk 1: 64 tokens → stores Mamba for block 1
+                Chunk 2: 16 tokens (request_has_initial_mamba_state=True)
+
+        Verified by comparing X's output between chunked+prefix and chunked_only configs.
+        """
+        _skip_if_mamba_sequence_packing_not_available()
+
+        # --- Parameters ---
+        seed = 42
+        vocab_size = 100
+        block_size = 32
+        max_tokens = 256
+        max_sequence_length = 256
+        buffer_size_gb = 0.1
+        num_tokens_to_generate = 4
+
+        torch.manual_seed(seed)
+        prompt_x = torch.randint(0, vocab_size - 1, (80,), device="cuda", dtype=torch.int64)
+
+        def make_req(req_id, prompt, enable_pc):
+            return DynamicInferenceRequest(
+                request_id=req_id,
+                prompt_tokens=prompt.clone(),
+                sampling_params=SamplingParams(
+                    num_tokens_to_generate=num_tokens_to_generate,
+                    termination_id=-1,
+                ),
+                block_size_tokens=block_size,
+                enable_prefix_caching=enable_pc,
+            )
+
+        configs = [
+            {
+                "name": "chunked+prefix",
+                "enable_chunked_prefill": True,
+                "enable_prefix_caching": True,
+                "prefix_caching_mamba_gb": 0.01,
+                "max_tokens": max_tokens,
+            },
+            {
+                "name": "chunked_only",
+                "enable_chunked_prefill": True,
+                "enable_prefix_caching": False,
+                "prefix_caching_mamba_gb": None,
+                "max_tokens": max_tokens,
+            },
+        ]
+
+        all_results = {}
+        for config in configs:
+            Utils.destroy_model_parallel()
+            Utils.initialize_model_parallel(
+                tensor_model_parallel_size=1, pipeline_model_parallel_size=1
+            )
+
+            engine, _ = _build_engine(
+                enable_chunked_prefill=config["enable_chunked_prefill"],
+                enable_prefix_caching=config["enable_prefix_caching"],
+                prefix_caching_mamba_gb=config["prefix_caching_mamba_gb"],
+                block_size_tokens=block_size,
+                max_tokens=config["max_tokens"],
+                max_requests=8,
+                vocab_size=vocab_size,
+                max_sequence_length=max_sequence_length,
+                buffer_size_gb=buffer_size_gb,
+                seed=seed,
+            )
+            _install_deterministic_mock_forward(engine, vocab_size)
+
+            # --- Request X: 80 tokens (no prefix) ---
+            # In chunked+prefix config:
+            #   No prefix match. _mamba_num_matched_blocks = 0.
+            #   _mamba_last_aligned_token = (80//32)*32 = 64.
+            #   _get_mamba_chunk_limit returns 64 (last_aligned - finished = 64 - 0).
+            #   mamba_forces_chunk = (80 > 64) → True.
+            #   chunk_length = min(80, min(256, 64)) = 64.
+            #   Chunk 1: 64 tokens → Mamba zero-init, processed from scratch.
+            #   _store_mamba_states: total_prefilled=64 == last_aligned=64 → stores block 1.
+            #   Chunk 2: 16 tokens, request_has_initial_mamba_state=True (batch kernel).
+            #
+            # In chunked_only config:
+            #   No Mamba budget → max_mamba_cache_slots=0 → no mamba_limit → no forced chunk.
+            #   X processes all 80 tokens in one shot.
+            req_x = make_req(0, prompt_x, config["enable_prefix_caching"])
+            results_x = _run_to_completion(engine, [req_x])
+
+            all_results[config["name"]] = results_x[0]
+
+        # --- Cross-config comparison: X's output must match ---
+        assert all_results["chunked+prefix"] == all_results["chunked_only"], (
+            f"Request X output mismatch:\n"
+            f"  chunked+prefix: {all_results['chunked+prefix']}\n"
+            f"  chunked_only: {all_results['chunked_only']}"
+        )
+
+
+class TestMixedKernelRouting:
+    """Engine-level test for mixed batch-kernel and varlen-kernel routing.
+
+    In a single forward step, a continuing chunked prefill request with
+    request_has_initial_mamba_state=True (batch kernel) runs alongside two
+    fresh prefill requests with zero-initialized Mamba state (varlen kernel).
+
+    Scenario:
+        block_size=32, max_tokens=112, num_tokens_to_generate=4
+
+        1. Request A (64 tokens) → run to completion, Mamba state at block 1
+        2. Request B (160 tokens, first 64 shared with A) → chunk 1 = 112 tokens
+           (64 prefix-skipped + 48 effective). B has 48 remaining, is continuing.
+        3. Add C (32 tokens, fresh) and D (32 tokens, fresh)
+        4. Schedule → B continues (batch kernel, 48 tokens) + C (varlen, 32) + D (varlen, 32)
+        5. Step → forward pass with mixed kernel routing
+        6. Continue until all complete
+
+    Verified by comparing B, C, D outputs against individual baseline runs.
+
+    NOTE: this test covers a strictly more complex scenario than
+    TestMultiplePrefillWithInitialStates (mixed batch-kernel + varlen vs
+    all-batch-kernel).
+    """
+
+    def teardown_method(self, method):
+        Utils.destroy_model_parallel()
+
+    @pytest.mark.internal
+    @pytest.mark.skipif(
+        not is_fa_min_version("2.7.3"), reason="need latest flash attn for dynamic batching"
+    )
+    @torch.no_grad()
+    def test_batch_kernel_continuation_with_varlen_fresh_prefills(self):
+        _skip_if_mamba_sequence_packing_not_available()
+
+        # --- Parameters ---
+        seed = 42
+        vocab_size = 100
+        block_size = 32
+        max_tokens = 112
+        max_requests = 8
+        max_sequence_length = 512
+        buffer_size_gb = 0.1
+        num_tokens_to_generate = 4
+
+        # Deterministic prompt generation.
+        torch.manual_seed(seed)
+        shared_prefix = torch.randint(
+            0, vocab_size - 1, (64,), device="cuda", dtype=torch.int64
+        )
+        suffix_b = torch.randint(
+            0, vocab_size - 1, (96,), device="cuda", dtype=torch.int64
+        )
+        prompt_a = shared_prefix.clone()                    # 64 tokens (2 blocks)
+        prompt_b = torch.cat([shared_prefix, suffix_b])     # 160 tokens (5 blocks)
+        prompt_c = torch.randint(
+            0, vocab_size - 1, (32,), device="cuda", dtype=torch.int64
+        )  # 32 tokens, no shared prefix
+        prompt_d = torch.randint(
+            0, vocab_size - 1, (32,), device="cuda", dtype=torch.int64
+        )  # 32 tokens, no shared prefix
+
+        engine_kwargs = dict(
+            enable_chunked_prefill=True,
+            enable_prefix_caching=True,
+            prefix_caching_mamba_gb=0.01,
+            block_size_tokens=block_size,
+            max_tokens=max_tokens,
+            max_requests=max_requests,
+            vocab_size=vocab_size,
+            max_sequence_length=max_sequence_length,
+            buffer_size_gb=buffer_size_gb,
+            seed=seed,
+        )
+
+        def make_req(req_id, prompt, enable_pc=True):
+            return DynamicInferenceRequest(
+                request_id=req_id,
+                prompt_tokens=prompt.clone(),
+                sampling_params=SamplingParams(
+                    num_tokens_to_generate=num_tokens_to_generate,
+                    termination_id=-1,
+                ),
+                block_size_tokens=block_size,
+                enable_prefix_caching=enable_pc,
+            )
+
+        # =================================================================
+        # Simultaneous run: A first, then B (chunked), then B+C+D together
+        # =================================================================
+        Utils.destroy_model_parallel()
+        Utils.initialize_model_parallel(
+            tensor_model_parallel_size=1, pipeline_model_parallel_size=1
+        )
+        engine_sim, _ = _build_engine(**engine_kwargs)
+        _install_deterministic_mock_forward(engine_sim, vocab_size)
+
+        # Step 1: Run A (64 tokens) to completion.
+        # After A: Mamba state stored for block 1 (last_aligned=64),
+        # KV blocks 0,1 cached (ref_count=0, LRU).
+        results_a = _run_to_completion(engine_sim, [make_req(0, prompt_a)])
+        assert 0 in results_a
+
+        # Step 2: Add B (160 tokens, first 64 shared with A) and step once.
+        # Engine scheduling:
+        #   KV match = 2 blocks (from A), Mamba match = 2 (block 1 has state).
+        #   _mamba_last_aligned_token = 160, _kv_divergence_token = 0 (mamba==kv).
+        #   mamba_limit = 160 (last_aligned - finished). remaining = 160.
+        #   token_fully_can_be_added = (160 <= 112) → False.
+        #   chunk_length = min(160, 112) = 112 (capped by max_tokens).
+        #   min(112, 160) = 112 → no additional mamba cap.
+        # In add_request:
+        #   finished_chunk_token_count=0 → is_chunked_prefill=False → allocates Mamba.
+        #   prefix_skip = min(64, 111) = 64, effective = 48 tokens.
+        #   Mamba restored from block 1, request_has_initial_mamba_state=True.
+        # After step: B has 48 remaining tokens, is continuing chunked prefill.
+        engine_sim._add_request(make_req(1, prompt_b))
+        step_result = engine_sim.step_modern()
+        assert len(step_result["finished_request_records"]) == 0, \
+            "B should not be finished after first chunk"
+
+        # Step 3: Add C and D (fresh requests, no shared prefix with anything).
+        # C: 32 tokens. D: 32 tokens. Both go to waiting queue behind B.
+        engine_sim._add_request(make_req(2, prompt_c))
+        engine_sim._add_request(make_req(3, prompt_d))
+
+        # Steps 4-6: Schedule and step until all complete.
+        # Next schedule_chunked_prefill processes:
+        #   B continues (batch kernel): 48 tokens, request_has_initial_mamba_state=True
+        #     (set at line 1984 for continuing chunks).
+        #   C fresh (varlen): 32 tokens, request_has_initial_mamba_state=False.
+        #   D fresh (varlen): 32 tokens, request_has_initial_mamba_state=False.
+        #   Total tokens: 48 + 32 + 32 = 112 = max_tokens.
+        #   MambaMetadata.update routes: num_batch_kernel_prefills=1, varlen_count=2.
+        # Subsequent steps: decode until all requests generate num_tokens_to_generate.
+        results_sim = {}
+        while engine_sim.has_unfinished_requests():
+            result = engine_sim.step_modern()
+            for record in result["finished_request_records"]:
+                finished = record.merge()
+                results_sim[finished.request_id] = list(finished.generated_tokens)
+
+        assert 1 in results_sim, "B did not complete"
+        assert 2 in results_sim, "C did not complete"
+        assert 3 in results_sim, "D did not complete"
+
+        # =================================================================
+        # Individual baseline runs (chunked, no prefix caching)
+        # Each request runs alone in a fresh engine, producing baseline output.
+        # =================================================================
+        baseline_kwargs = dict(
+            enable_chunked_prefill=True,
+            enable_prefix_caching=False,
+            prefix_caching_mamba_gb=None,
+            block_size_tokens=block_size,
+            max_tokens=max_tokens,
+            max_requests=max_requests,
+            vocab_size=vocab_size,
+            max_sequence_length=max_sequence_length,
+            buffer_size_gb=buffer_size_gb,
+            seed=seed,
+        )
+
+        # B alone (160 tokens, chunked at 112 + 48, no prefix skip)
+        Utils.destroy_model_parallel()
+        Utils.initialize_model_parallel(
+            tensor_model_parallel_size=1, pipeline_model_parallel_size=1
+        )
+        engine_b, _ = _build_engine(**baseline_kwargs)
+        _install_deterministic_mock_forward(engine_b, vocab_size)
+        results_b = _run_to_completion(
+            engine_b, [make_req(1, prompt_b, enable_pc=False)]
+        )
+
+        # C alone (32 tokens, single prefill)
+        Utils.destroy_model_parallel()
+        Utils.initialize_model_parallel(
+            tensor_model_parallel_size=1, pipeline_model_parallel_size=1
+        )
+        engine_c, _ = _build_engine(**baseline_kwargs)
+        _install_deterministic_mock_forward(engine_c, vocab_size)
+        results_c = _run_to_completion(
+            engine_c, [make_req(2, prompt_c, enable_pc=False)]
+        )
+
+        # D alone (32 tokens, single prefill)
+        Utils.destroy_model_parallel()
+        Utils.initialize_model_parallel(
+            tensor_model_parallel_size=1, pipeline_model_parallel_size=1
+        )
+        engine_d, _ = _build_engine(**baseline_kwargs)
+        _install_deterministic_mock_forward(engine_d, vocab_size)
+        results_d = _run_to_completion(
+            engine_d, [make_req(3, prompt_d, enable_pc=False)]
+        )
+
+        # =================================================================
+        # Assertions: simultaneous outputs must match individual baselines
+        # =================================================================
+        assert results_sim[1] == results_b[1], (
+            f"Request B mismatch:\n"
+            f"  simultaneous: {results_sim[1]}\n"
+            f"  individual:   {results_b[1]}"
+        )
+        assert results_sim[2] == results_c[2], (
+            f"Request C mismatch:\n"
+            f"  simultaneous: {results_sim[2]}\n"
+            f"  individual:   {results_c[2]}"
+        )
+        assert results_sim[3] == results_d[3], (
+            f"Request D mismatch:\n"
+            f"  simultaneous: {results_sim[3]}\n"
+            f"  individual:   {results_d[3]}"
+        )
+
+        # Verify non-trivial output
+        assert len(results_sim[1]) == num_tokens_to_generate
+        assert len(results_sim[2]) == num_tokens_to_generate
+        assert len(results_sim[3]) == num_tokens_to_generate
+
+
+class TestMambaEvictionEdgeCases:
+    """Tests for Mamba eviction edge cases: all-active raises, mixed ref counts, restore-after-evict."""
+
+    def setup_method(self, method):
+        Utils.initialize_model_parallel(
+            tensor_model_parallel_size=1, pipeline_model_parallel_size=1
+        )
+        model_parallel_cuda_manual_seed(123)
+
+    def teardown_method(self, method):
+        Utils.destroy_model_parallel()
+
+    @pytest.mark.internal
+    def test_all_active_slots_raises_error(self):
+        """When all Mamba slots hold blocks with ref_count > 0, eviction raises RuntimeError."""
+        ctx = _build_hybrid_context(prefix_caching_mamba_gb=0.001)
+        max_slots = ctx.max_mamba_cache_slots
+        assert max_slots > 0
+
+        # Fill all slots with blocks whose ref_count > 0 (active)
+        for i in range(max_slots):
+            ctx.block_to_mamba_slot[i] = i
+            ctx.mamba_slot_to_block[i] = i
+            ctx.block_allocator.block_ref_counts[i] = 1  # active
+            ctx.block_allocator.block_timestamps[i] = i * 100
+        ctx.mamba_cache_free_count = 0
+
+        # Allocating a new slot should raise because no evictable candidates
+        new_block_id = max_slots + 1
+        with pytest.raises(RuntimeError, match="all slots in active use"):
+            ctx._allocate_mamba_cache_slot(new_block_id)
+
+    @pytest.mark.internal
+    def test_mixed_ref_counts_evicts_only_inactive(self):
+        """With mixed ref_count=0 and ref_count=1, only the oldest ref_count=0 block is evicted."""
+        ctx = _build_hybrid_context(prefix_caching_mamba_gb=0.001)
+        max_slots = ctx.max_mamba_cache_slots
+        assert max_slots >= 3, f"Need at least 3 Mamba slots, got {max_slots}"
+
+        # Fill all slots: some active (ref=1), some evictable (ref=0)
+        # slot 0 → block 0: ref=1 (active), timestamp=0 (oldest)
+        # slot 1 → block 1: ref=0 (evictable), timestamp=100
+        # slot 2 → block 2: ref=0 (evictable), timestamp=50 (oldest evictable)
+        for i in range(max_slots):
+            ctx.block_to_mamba_slot[i] = i
+            ctx.mamba_slot_to_block[i] = i
+            if i == 0:
+                ctx.block_allocator.block_ref_counts[i] = 1
+                ctx.block_allocator.block_timestamps[i] = 0
+            elif i == 1:
+                ctx.block_allocator.block_ref_counts[i] = 0
+                ctx.block_allocator.block_timestamps[i] = 100
+            elif i == 2:
+                ctx.block_allocator.block_ref_counts[i] = 0
+                ctx.block_allocator.block_timestamps[i] = 50
+            else:
+                # Extra slots beyond 3: make them active so they don't interfere
+                ctx.block_allocator.block_ref_counts[i] = 1
+                ctx.block_allocator.block_timestamps[i] = 200 + i
+        ctx.mamba_cache_free_count = 0
+
+        # Allocate for a new block → should evict block 2 (oldest evictable, timestamp=50)
+        new_block_id = max_slots + 1
+        slot = ctx._allocate_mamba_cache_slot(new_block_id)
+        assert slot >= 0
+
+        # Block 0 (active) should be untouched
+        assert ctx.block_to_mamba_slot[0].item() == 0, "Active block 0 should be untouched"
+        assert ctx.mamba_slot_to_block[0].item() == 0
+
+        # Block 2 (oldest evictable) should be evicted
+        assert ctx.block_to_mamba_slot[2].item() == -1, "Block 2 should be evicted"
+
+        # Block 1 (evictable but newer) should be untouched
+        assert ctx.block_to_mamba_slot[1].item() == 1, "Block 1 should be untouched"
+
+        # New block should have the evicted slot
+        assert ctx.block_to_mamba_slot[new_block_id].item() == slot
+
+    @pytest.mark.internal
+    def test_mamba_restore_after_eviction_cycle(self):
+        """After evicting and re-storing Mamba for a block, the new values are restored (not stale)."""
+        ctx = _build_hybrid_context(prefix_caching_mamba_gb=0.001)
+        block_size = ctx.block_size_tokens
+        max_slots = ctx.max_mamba_cache_slots
+        assert max_slots >= 1
+
+        # Add request A (2 blocks)
+        a_idx = ctx.total_request_count
+        prompt_a = torch.arange(block_size * 2, device=torch.cuda.current_device())
+        req_a = _make_request(1, prompt_a, block_size)
+        ctx.add_request(req_a)
+
+        # Write known values (conv=1.0, ssm=2.0) and store for block 0
+        mamba_idx_a = ctx.mamba_metadata.request_to_mamba_state_idx[a_idx].item()
+        ctx.mamba_conv_states[:, mamba_idx_a] = 1.0
+        ctx.mamba_ssm_states[:, mamba_idx_a] = 2.0
+        block_0_id = ctx.request_to_kv_block_ids[a_idx][0].item()
+        ctx.store_mamba_state_for_block(block_0_id, a_idx)
+        assert ctx.has_mamba_state_for_block(block_0_id)
+
+        # Evict block 0's Mamba state by invalidating
+        ctx.invalidate_mamba_state_for_block(block_0_id)
+        assert not ctx.has_mamba_state_for_block(block_0_id)
+
+        # Re-store with new values (conv=3.0, ssm=4.0)
+        ctx.mamba_conv_states[:, mamba_idx_a] = 3.0
+        ctx.mamba_ssm_states[:, mamba_idx_a] = 4.0
+        ctx.store_mamba_state_for_block(block_0_id, a_idx)
+        assert ctx.has_mamba_state_for_block(block_0_id)
+
+        # Clear request state, then restore from cache
+        ctx.mamba_conv_states[:, mamba_idx_a] = 0.0
+        ctx.mamba_ssm_states[:, mamba_idx_a] = 0.0
+        restored = ctx.restore_mamba_state_from_block(a_idx, block_0_id)
+        assert restored
+
+        # Verify new values (3.0, 4.0) not stale (1.0, 2.0)
+        assert torch.allclose(
+            ctx.mamba_conv_states[:, mamba_idx_a],
+            torch.full_like(ctx.mamba_conv_states[:, mamba_idx_a], 3.0),
+        ), "Should restore new conv values (3.0), not stale (1.0)"
+        assert torch.allclose(
+            ctx.mamba_ssm_states[:, mamba_idx_a],
+            torch.full_like(ctx.mamba_ssm_states[:, mamba_idx_a], 4.0),
+        ), "Should restore new ssm values (4.0), not stale (2.0)"
+
+
+class TestKvMambaEvictionInteraction:
+    """Tests for the interaction between KV eviction and Mamba invalidation."""
+
+    def setup_method(self, method):
+        Utils.initialize_model_parallel(
+            tensor_model_parallel_size=1, pipeline_model_parallel_size=1
+        )
+        model_parallel_cuda_manual_seed(123)
+
+    def teardown_method(self, method):
+        Utils.destroy_model_parallel()
+
+    @pytest.mark.internal
+    def test_kv_eviction_cascades_to_mamba_invalidation(self):
+        """evict_lru_blocks removes KV blocks AND invalidates their Mamba state."""
+        ctx = _build_hybrid_context(
+            prefix_caching_mamba_gb=0.01,
+            buffer_size_gb=0.01,
+            rounder=1,
+        )
+        block_size = ctx.block_size_tokens
+        alloc = ctx.block_allocator
+
+        # Add request A (2 blocks)
+        a_idx = ctx.total_request_count
+        prompt_a = torch.arange(block_size * 2, device=torch.cuda.current_device())
+        req_a = _make_request(1, prompt_a, block_size)
+        ctx.add_request(req_a)
+
+        # Store Mamba state for block 0 and register mamba hash
+        block_0_id = ctx.request_to_kv_block_ids[a_idx][0].item()
+        block_1_id = ctx.request_to_kv_block_ids[a_idx][1].item()
+        block_0_hash = alloc.block_hashes[block_0_id].item()
+        ctx.store_mamba_state_for_block(block_0_id, a_idx)
+        alloc.register_mamba_block_hash(block_0_id, block_0_hash)
+
+        assert ctx.has_mamba_state_for_block(block_0_id)
+        assert block_0_hash in alloc.kv_hash_to_block_id
+        assert block_0_hash in alloc.mamba_hash_to_block_id
+        free_before = ctx.mamba_cache_free_count
+
+        # Release A (ref_count → 0)
+        ctx.release_memory_blocks_from_request_indexes(torch.tensor([a_idx]))
+        ctx.total_request_count = 0
+
+        # Make blocks old so they get evicted first
+        alloc.block_timestamps[block_0_id] = 0
+        alloc.block_timestamps[block_1_id] = 1
+
+        # Evict A's KV blocks
+        result = alloc.evict_lru_blocks(2)
+        assert result, "Should evict 2 blocks"
+
+        # Mamba state should be gone
+        assert not ctx.has_mamba_state_for_block(block_0_id), \
+            "Mamba state should be invalidated after KV eviction"
+        # Mamba free count should have increased
+        assert ctx.mamba_cache_free_count == free_before + 1
+        # Both hash maps should be clear
+        assert block_0_hash not in alloc.kv_hash_to_block_id
+        assert block_0_hash not in alloc.mamba_hash_to_block_id
+
+    @pytest.mark.internal
+    def test_mamba_eviction_preserves_kv_cache(self):
+        """Mamba eviction removes Mamba state but leaves KV blocks intact."""
+        # Use extremely small Mamba budget to get exactly 1 slot.
+        # Each slot needs ~41 KB (conv_states + ssm_states), so 0.00005 GB ≈ 53 KB → 1 slot.
+        ctx = _build_hybrid_context(
+            prefix_caching_mamba_gb=0.00005,
+            buffer_size_gb=0.01,
+            rounder=1,
+        )
+        block_size = ctx.block_size_tokens
+        alloc = ctx.block_allocator
+        max_slots = ctx.max_mamba_cache_slots
+        assert max_slots >= 1, f"Need at least 1 Mamba slot, got {max_slots}"
+
+        # Add request A
+        a_idx = ctx.total_request_count
+        prompt_a = torch.arange(block_size * 2, device=torch.cuda.current_device())
+        req_a = _make_request(1, prompt_a, block_size)
+        ctx.add_request(req_a)
+
+        block_a0_id = ctx.request_to_kv_block_ids[a_idx][0].item()
+        block_a0_hash = alloc.block_hashes[block_a0_id].item()
+        ctx.store_mamba_state_for_block(block_a0_id, a_idx)
+        alloc.register_mamba_block_hash(block_a0_id, block_a0_hash)
+
+        assert ctx.has_mamba_state_for_block(block_a0_id)
+
+        # Release A (ref_count → 0, blocks become evictable)
+        ctx.release_memory_blocks_from_request_indexes(torch.tensor([a_idx]))
+
+        # Make A's block have old timestamp so it gets evicted first
+        alloc.block_timestamps[block_a0_id] = 0
+
+        # Fill any remaining Mamba slots with filler blocks to ensure cache is full
+        for i in range(alloc.total_count):
+            if ctx.mamba_cache_free_count == 0:
+                break
+            if ctx.block_to_mamba_slot[i].item() < 0 and i != block_a0_id:
+                alloc.block_ref_counts[i] = 0
+                alloc.block_timestamps[i] = 1000  # newer than A
+                ctx._allocate_mamba_cache_slot(i)
+
+        assert ctx.mamba_cache_free_count == 0, "Mamba cache should be full"
+
+        # Add request B (different prompt)
+        b_idx = ctx.total_request_count
+        prompt_b = torch.arange(1000, 1000 + block_size * 2, device=torch.cuda.current_device())
+        req_b = _make_request(2, prompt_b, block_size)
+        ctx.add_request(req_b)
+
+        # Store Mamba for B's block → forces eviction of oldest (A's block)
+        block_b0_id = ctx.request_to_kv_block_ids[b_idx][0].item()
+        ctx.store_mamba_state_for_block(block_b0_id, b_idx)
+
+        # After Mamba eviction: KV blocks should still be in kv_hash_to_block_id
+        assert block_a0_hash in alloc.kv_hash_to_block_id, \
+            "A's KV block should still be cached after Mamba eviction"
+
+        # A's Mamba state should be gone
+        assert not ctx.has_mamba_state_for_block(block_a0_id), \
+            "A's Mamba state should be evicted"
+        assert block_a0_hash not in alloc.mamba_hash_to_block_id, \
+            "A's hash should be removed from mamba map"
+
+    @pytest.mark.internal
+    def test_combined_kv_and_mamba_pressure(self):
+        """After both Mamba eviction and KV deregistration, all cached state is gone."""
+        ctx = _build_hybrid_context(
+            prefix_caching_mamba_gb=0.00005,  # ~1 Mamba slot
+            buffer_size_gb=0.01,
+            rounder=1,
+        )
+        block_size = ctx.block_size_tokens
+        alloc = ctx.block_allocator
+
+        # Add request A (2 blocks)
+        a_idx = ctx.total_request_count
+        prompt_a = torch.arange(block_size * 2, device=torch.cuda.current_device())
+        req_a = _make_request(1, prompt_a, block_size)
+        ctx.add_request(req_a)
+
+        # Save block IDs before releasing (release clears request_to_kv_block_ids)
+        block_a0_id = ctx.request_to_kv_block_ids[a_idx][0].item()
+        block_a1_id = ctx.request_to_kv_block_ids[a_idx][1].item()
+        block_a0_hash = alloc.block_hashes[block_a0_id].item()
+        ctx.store_mamba_state_for_block(block_a0_id, a_idx)
+        alloc.register_mamba_block_hash(block_a0_id, block_a0_hash)
+
+        assert ctx.has_mamba_state_for_block(block_a0_id)
+        assert block_a0_hash in alloc.kv_hash_to_block_id
+        assert block_a0_hash in alloc.mamba_hash_to_block_id
+
+        # Release A (ref_count → 0)
+        ctx.release_memory_blocks_from_request_indexes(torch.tensor([a_idx]))
+        ctx.total_request_count = 0
+        alloc.block_timestamps[block_a0_id] = 0  # oldest
+        alloc.block_timestamps[block_a1_id] = 1
+
+        # Now directly deregister A's KV blocks (simulates LRU eviction)
+        # This should cascade to Mamba invalidation via the callback
+        blocks_tensor = torch.tensor(
+            [block_a0_id, block_a1_id], device=torch.cuda.current_device(), dtype=torch.int32
+        )
+        alloc._deregister_blocks(blocks_tensor)
+
+        # After KV eviction: both KV and Mamba state should be gone
+        assert block_a0_hash not in alloc.kv_hash_to_block_id, \
+            "A's KV hash should be gone after eviction"
+        assert block_a0_hash not in alloc.mamba_hash_to_block_id, \
+            "A's Mamba hash should be gone after eviction"
+        assert not ctx.has_mamba_state_for_block(block_a0_id), \
+            "A's Mamba state should be gone after KV eviction"
+
+        # Add request D with same prefix as A → should get no matches (all state evicted)
+        d_idx = ctx.total_request_count
+        req_d = _make_request(4, prompt_a.clone(), block_size)
+        req_d._mamba_num_matched_blocks = 0
+        ctx.add_request(req_d)
+
+        # D should have zero-init Mamba state (fresh allocation)
+        mamba_idx_d = ctx.mamba_metadata.request_to_mamba_state_idx[d_idx].item()
+        assert torch.all(ctx.mamba_conv_states[:, mamba_idx_d] == 0.0), \
+            "D should get zero-init Mamba state (no cache hit)"
+
+
+class TestEvictionEndToEnd:
+    """Engine-level tests verifying correct output after KV and/or Mamba eviction."""
+
+    def teardown_method(self, method):
+        Utils.destroy_model_parallel()
+
+    @pytest.mark.internal
+    @pytest.mark.skipif(
+        not is_fa_min_version("2.7.3"), reason="need latest flash attn for dynamic batching"
+    )
+    @torch.no_grad()
+    def test_mamba_eviction_forces_full_recompute(self):
+        """After Mamba eviction, a repeated prefix triggers full recompute and still produces correct output."""
+        _skip_if_mamba_sequence_packing_not_available()
+
+        seed = 42
+        vocab_size = 100
+        block_size = 32
+        max_tokens = 256
+        max_sequence_length = 256
+        buffer_size_gb = 0.1
+        num_tokens_to_generate = 4
+
+        torch.manual_seed(seed)
+        prompt_a = torch.randint(0, vocab_size - 1, (64,), device="cuda", dtype=torch.int64)
+        prompt_b = torch.randint(0, vocab_size - 1, (64,), device="cuda", dtype=torch.int64)
+
+        def make_req(req_id, prompt, enable_pc):
+            return DynamicInferenceRequest(
+                request_id=req_id,
+                prompt_tokens=prompt.clone(),
+                sampling_params=SamplingParams(
+                    num_tokens_to_generate=num_tokens_to_generate,
+                    termination_id=-1,
+                ),
+                block_size_tokens=block_size,
+                enable_prefix_caching=enable_pc,
+            )
+
+        # Config with very small Mamba cache (1-2 slots) to force Mamba eviction
+        configs = [
+            {
+                "name": "prefix+small_mamba",
+                "enable_chunked_prefill": True,
+                "enable_prefix_caching": True,
+                "prefix_caching_mamba_gb": 0.0001,  # Very small: 1-2 Mamba slots
+                "max_tokens": max_tokens,
+            },
+            {
+                "name": "baseline",
+                "enable_chunked_prefill": True,
+                "enable_prefix_caching": False,
+                "prefix_caching_mamba_gb": None,
+                "max_tokens": max_tokens,
+            },
+        ]
+
+        all_results = {}
+        for config in configs:
+            Utils.destroy_model_parallel()
+            Utils.initialize_model_parallel(
+                tensor_model_parallel_size=1, pipeline_model_parallel_size=1
+            )
+
+            engine, _ = _build_engine(
+                enable_chunked_prefill=config["enable_chunked_prefill"],
+                enable_prefix_caching=config["enable_prefix_caching"],
+                prefix_caching_mamba_gb=config["prefix_caching_mamba_gb"],
+                block_size_tokens=block_size,
+                max_tokens=config["max_tokens"],
+                max_requests=8,
+                vocab_size=vocab_size,
+                max_sequence_length=max_sequence_length,
+                buffer_size_gb=buffer_size_gb,
+                seed=seed,
+            )
+            _install_deterministic_mock_forward(engine, vocab_size)
+
+            # A: 64 tokens → completes → Mamba stored
+            _run_to_completion(engine, [make_req(0, prompt_a, config["enable_prefix_caching"])])
+
+            # B: different 64 tokens → completes → may evict A's Mamba
+            _run_to_completion(engine, [make_req(1, prompt_b, config["enable_prefix_caching"])])
+
+            # C: same as A → KV match possible, but Mamba may be evicted → full recompute
+            results_c = _run_to_completion(
+                engine, [make_req(2, prompt_a, config["enable_prefix_caching"])]
+            )
+            all_results[config["name"]] = results_c[2]
+
+        assert all_results["prefix+small_mamba"] == all_results["baseline"], (
+            f"Output mismatch after Mamba eviction:\n"
+            f"  prefix+small_mamba: {all_results['prefix+small_mamba']}\n"
+            f"  baseline: {all_results['baseline']}"
+        )
+
+    @pytest.mark.internal
+    @pytest.mark.skipif(
+        not is_fa_min_version("2.7.3"), reason="need latest flash attn for dynamic batching"
+    )
+    @torch.no_grad()
+    def test_kv_mamba_eviction_correct_output(self):
+        """With a small buffer, many intervening requests force KV LRU eviction.
+        A repeated prefix gets full recompute and still produces correct output.
+
+        Uses 65-token prompts (3 blocks each, non-block-aligned to avoid decode
+        pausing). With buffer_size_gb=0.01 (~33 blocks), 11 requests fill all
+        blocks, and the 12th request (C, same as A) triggers eviction of A's
+        blocks during prefill allocation.
+        """
+        _skip_if_mamba_sequence_packing_not_available()
+
+        seed = 42
+        vocab_size = 100
+        block_size = 32
+        max_tokens = 256
+        max_sequence_length = 256
+        buffer_size_gb = 0.01  # ~33 blocks
+        num_tokens_to_generate = 4
+        prompt_len = 65  # Non-block-aligned to avoid decode pause
+
+        torch.manual_seed(seed)
+        prompt_a = torch.randint(0, vocab_size - 1, (prompt_len,), device="cuda", dtype=torch.int64)
+        # Generate 10 different filler prompts (A + 10 fillers = 11 requests × 3 blocks = 33)
+        filler_prompts = [
+            torch.randint(0, vocab_size - 1, (prompt_len,), device="cuda", dtype=torch.int64)
+            for _ in range(10)
+        ]
+
+        def make_req(req_id, prompt, enable_pc):
+            return DynamicInferenceRequest(
+                request_id=req_id,
+                prompt_tokens=prompt.clone(),
+                sampling_params=SamplingParams(
+                    num_tokens_to_generate=num_tokens_to_generate,
+                    termination_id=-1,
+                ),
+                block_size_tokens=block_size,
+                enable_prefix_caching=enable_pc,
+            )
+
+        configs = [
+            {
+                "name": "prefix+small_buffer",
+                "enable_chunked_prefill": True,
+                "enable_prefix_caching": True,
+                "prefix_caching_mamba_gb": 0.0005,  # 1 Mamba slot
+                "max_tokens": max_tokens,
+            },
+            {
+                "name": "baseline",
+                "enable_chunked_prefill": True,
+                "enable_prefix_caching": False,
+                "prefix_caching_mamba_gb": None,
+                "max_tokens": max_tokens,
+            },
+        ]
+
+        all_results = {}
+        for config in configs:
+            Utils.destroy_model_parallel()
+            Utils.initialize_model_parallel(
+                tensor_model_parallel_size=1, pipeline_model_parallel_size=1
+            )
+
+            engine, _ = _build_engine(
+                enable_chunked_prefill=config["enable_chunked_prefill"],
+                enable_prefix_caching=config["enable_prefix_caching"],
+                prefix_caching_mamba_gb=config["prefix_caching_mamba_gb"],
+                block_size_tokens=block_size,
+                max_tokens=config["max_tokens"],
+                max_requests=8,
+                vocab_size=vocab_size,
+                max_sequence_length=max_sequence_length,
+                buffer_size_gb=buffer_size_gb,
+                seed=seed,
+            )
+            _install_deterministic_mock_forward(engine, vocab_size)
+
+            # A → completes → KV blocks cached, Mamba stored
+            _run_to_completion(engine, [make_req(0, prompt_a, config["enable_prefix_caching"])])
+
+            # Run 10 filler requests to fill all blocks in the cache
+            for i, filler in enumerate(filler_prompts):
+                _run_to_completion(
+                    engine, [make_req(i + 1, filler, config["enable_prefix_caching"])]
+                )
+
+            # C (same as A) → A's blocks evicted → full recompute
+            results_c = _run_to_completion(
+                engine, [make_req(12, prompt_a, config["enable_prefix_caching"])]
+            )
+            all_results[config["name"]] = results_c[12]
+
+        assert all_results["prefix+small_buffer"] == all_results["baseline"], (
+            f"Output mismatch after KV+Mamba eviction:\n"
+            f"  prefix+small_buffer: {all_results['prefix+small_buffer']}\n"
+            f"  baseline: {all_results['baseline']}"
+        )
+
+    @pytest.mark.internal
+    @pytest.mark.skipif(
+        not is_fa_min_version("2.7.3"), reason="need latest flash attn for dynamic batching"
+    )
+    @torch.no_grad()
+    def test_eviction_with_interleaved_shared_prefixes(self):
+        """Multiple requests sharing a prefix produce correct output even when Mamba is evicted between them."""
+        _skip_if_mamba_sequence_packing_not_available()
+
+        seed = 42
+        vocab_size = 100
+        block_size = 32
+        max_tokens = 256
+        max_sequence_length = 256
+        buffer_size_gb = 0.1
+        num_tokens_to_generate = 4
+
+        torch.manual_seed(seed)
+        shared_prefix = torch.randint(0, vocab_size - 1, (64,), device="cuda", dtype=torch.int64)
+        prompt_b = torch.randint(0, vocab_size - 1, (64,), device="cuda", dtype=torch.int64)
+
+        def make_req(req_id, prompt, enable_pc):
+            return DynamicInferenceRequest(
+                request_id=req_id,
+                prompt_tokens=prompt.clone(),
+                sampling_params=SamplingParams(
+                    num_tokens_to_generate=num_tokens_to_generate,
+                    termination_id=-1,
+                ),
+                block_size_tokens=block_size,
+                enable_prefix_caching=enable_pc,
+            )
+
+        configs = [
+            {
+                "name": "prefix+small_mamba",
+                "enable_chunked_prefill": True,
+                "enable_prefix_caching": True,
+                "prefix_caching_mamba_gb": 0.0001,  # Very small: 1-2 Mamba slots
+                "max_tokens": max_tokens,
+            },
+            {
+                "name": "baseline",
+                "enable_chunked_prefill": True,
+                "enable_prefix_caching": False,
+                "prefix_caching_mamba_gb": None,
+                "max_tokens": max_tokens,
+            },
+        ]
+
+        all_results = {}
+        for config in configs:
+            Utils.destroy_model_parallel()
+            Utils.initialize_model_parallel(
+                tensor_model_parallel_size=1, pipeline_model_parallel_size=1
+            )
+
+            engine, _ = _build_engine(
+                enable_chunked_prefill=config["enable_chunked_prefill"],
+                enable_prefix_caching=config["enable_prefix_caching"],
+                prefix_caching_mamba_gb=config["prefix_caching_mamba_gb"],
+                block_size_tokens=block_size,
+                max_tokens=config["max_tokens"],
+                max_requests=8,
+                vocab_size=vocab_size,
+                max_sequence_length=max_sequence_length,
+                buffer_size_gb=buffer_size_gb,
+                seed=seed,
+            )
+            _install_deterministic_mock_forward(engine, vocab_size)
+
+            # A1: shared prefix → completes → Mamba stored
+            results_a1 = _run_to_completion(
+                engine, [make_req(0, shared_prefix, config["enable_prefix_caching"])]
+            )
+
+            # A2: same prefix → matches A1's cache → completes
+            results_a2 = _run_to_completion(
+                engine, [make_req(1, shared_prefix, config["enable_prefix_caching"])]
+            )
+
+            # B: different prefix → completes → may evict Mamba for shared prefix
+            _run_to_completion(engine, [make_req(2, prompt_b, config["enable_prefix_caching"])])
+
+            # A3: same prefix → KV may still be cached (LRU), but Mamba evicted → full recompute
+            results_a3 = _run_to_completion(
+                engine, [make_req(3, shared_prefix, config["enable_prefix_caching"])]
+            )
+
+            all_results[config["name"]] = {
+                "a1": results_a1[0],
+                "a2": results_a2[1],
+                "a3": results_a3[3],
+            }
+
+        # All three should match within each config
+        for name in all_results:
+            assert all_results[name]["a1"] == all_results[name]["a2"], \
+                f"[{name}] A1 and A2 outputs should match"
+            assert all_results[name]["a1"] == all_results[name]["a3"], \
+                f"[{name}] A1 and A3 outputs should match"
+
+        # Cross-config: all should match baseline
+        for req_label in ("a1", "a2", "a3"):
+            assert all_results["prefix+small_mamba"][req_label] == all_results["baseline"][req_label], (
+                f"Request {req_label} mismatch between configs:\n"
+                f"  prefix+small_mamba: {all_results['prefix+small_mamba'][req_label]}\n"
+                f"  baseline: {all_results['baseline'][req_label]}"
+            )
+
+
+class TestMambaStressAndBudget:
+    """Stress tests for Mamba cache slot management."""
+
+    def setup_method(self, method):
+        Utils.initialize_model_parallel(
+            tensor_model_parallel_size=1, pipeline_model_parallel_size=1
+        )
+        model_parallel_cuda_manual_seed(123)
+
+    def teardown_method(self, method):
+        Utils.destroy_model_parallel()
+
+    @pytest.mark.internal
+    def test_rapid_allocation_eviction_cycle(self):
+        """100 rapid allocate/invalidate cycles leave the slot pool in a clean state."""
+        ctx = _build_hybrid_context(prefix_caching_mamba_gb=0.01)
+        max_slots = ctx.max_mamba_cache_slots
+        assert max_slots > 0
+
+        initial_free = ctx.mamba_cache_free_count
+        assert initial_free == max_slots
+
+        for i in range(100):
+            block_id = i % max_slots  # Reuse block IDs
+            slot = ctx._allocate_mamba_cache_slot(block_id)
+            assert slot >= 0
+            ctx.invalidate_mamba_state_for_block(block_id)
+
+        # After all cycles: all slots should be free
+        assert ctx.mamba_cache_free_count == max_slots, \
+            f"Expected {max_slots} free slots, got {ctx.mamba_cache_free_count}"
+
+        # No dangling references in mamba_slot_to_block
+        for s in range(max_slots):
+            assert ctx.mamba_slot_to_block[s].item() == -1, \
+                f"Slot {s} has dangling block reference"
+
+    @pytest.mark.internal
+    def test_many_blocks_few_mamba_slots(self):
+        """Large KV buffer with small Mamba cache: only first N blocks get Mamba state."""
+        ctx = _build_hybrid_context(
+            prefix_caching_mamba_gb=0.001,  # Few Mamba slots
+            buffer_size_gb=0.01,            # Many KV blocks
+            max_tokens=None,                # No token limit
+        )
+        max_slots = ctx.max_mamba_cache_slots
+        assert max_slots >= 1
+
+        block_size = ctx.block_size_tokens
+
+        # Add a request with many blocks
+        num_blocks = max_slots + 3
+        prompt = torch.arange(
+            block_size * num_blocks, device=torch.cuda.current_device()
+        )
+        req = _make_request(1, prompt, block_size)
+        ctx.add_request(req)
+
+        # Store Mamba for first max_slots blocks
+        for i in range(max_slots):
+            block_id = ctx.request_to_kv_block_ids[0][i].item()
+            ctx.store_mamba_state_for_block(block_id, 0)
+            assert ctx.has_mamba_state_for_block(block_id), \
+                f"Block {i} should have Mamba state"
+
+        # Cache should be full
+        assert ctx.mamba_cache_free_count == 0, "Mamba cache should be full"
+
+        # Blocks beyond max_slots don't have state yet
+        for i in range(max_slots, min(num_blocks, ctx.request_to_kv_block_ids.shape[1])):
+            block_id = ctx.request_to_kv_block_ids[0][i].item()
+            if block_id >= 0:
+                assert not ctx.has_mamba_state_for_block(block_id), \
+                    f"Block {i} should NOT have Mamba state"
+
+        # Release request so blocks become evictable
+        ctx.release_memory_blocks_from_request_indexes(torch.tensor([0]))
+
+        # Set timestamps: block 0 is oldest
+        for i in range(max_slots):
+            block_id = ctx.request_to_kv_block_ids[0][i].item()
+            if block_id >= 0:
+                ctx.block_allocator.block_timestamps[block_id] = i * 100
+
+        # Store for one more block beyond max_slots → triggers LRU eviction
+        extra_block_id = ctx.request_to_kv_block_ids[0][max_slots].item()
+        if extra_block_id >= 0:
+            # Need to allocate a new request slot to store from
+            ctx.total_request_count = 0
+            req2 = _make_request(2, prompt.clone(), block_size)
+            ctx.add_request(req2)
+            ctx.store_mamba_state_for_block(extra_block_id, ctx.total_request_count - 1)
+
+            # The LRU victim (block 0, oldest timestamp) should have lost state
+            first_block_id = ctx.request_to_kv_block_ids[0][0].item()
+            assert not ctx.has_mamba_state_for_block(first_block_id), \
+                "Block 0 (LRU victim) should have lost Mamba state"
+
+            # New block should have state
+            assert ctx.has_mamba_state_for_block(extra_block_id), \
+                "Newly stored block should have Mamba state"
