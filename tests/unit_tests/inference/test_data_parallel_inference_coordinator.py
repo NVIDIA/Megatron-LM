@@ -98,11 +98,11 @@ class DummyEngine(DynamicInferenceEngine):
 
         # State machine (mirrors dynamic_engine.py reset()).
         self.state = EngineState.RUNNING
-        self.running = asyncio.Event()
-        self.running.set()
-        self.paused = asyncio.Event()
-        self.suspended = asyncio.Event()
-        self.stopped = asyncio.Event()
+        for state, attr in self._STATE_EVENTS.items():
+            event = asyncio.Event()
+            if state == self.state:
+                event.set()
+            setattr(self, attr, event)
         self._pending_signals = deque()
         self.resume_request_ids = None
         self.use_coordinator = False
@@ -211,7 +211,7 @@ async def graceful_shutdown(engine, client=None, *, timeout=10.0):
         if client is not None:
             client.pause_engines()
             client.stop_engines()
-        await asyncio.wait_for(engine.stopped.wait(), timeout=timeout)
+        await asyncio.wait_for(engine.wait_until(EngineState.STOPPED), timeout=timeout)
     except asyncio.TimeoutError:
         await asyncio.wait_for(engine.shutdown(immediate=True), timeout=timeout)
     finally:
@@ -452,7 +452,7 @@ class TestCoordinator:
                 client = InferenceClient(dp_addr)
                 client.start()
 
-                await asyncio.wait_for(engine.running.wait(), timeout=5.0)
+                await asyncio.wait_for(engine.wait_until(EngineState.RUNNING), timeout=5.0)
                 assert_state(engine, EngineState.RUNNING)
 
                 # Try to submit signals out of FSM order.
@@ -477,7 +477,7 @@ class TestCoordinator:
                     client.add_request(prompt=p, sampling_params=s) for p, s in requests[2:5]
                 ]
                 client.pause_engines()
-                await asyncio.wait_for(engine.paused.wait(), timeout=5.0)
+                await asyncio.wait_for(engine.wait_until(EngineState.PAUSED), timeout=5.0)
                 assert_state(engine, EngineState.PAUSED)
 
                 # Try pausing again and see if it breaks.
@@ -493,7 +493,7 @@ class TestCoordinator:
 
                 # UNPAUSE and verify all in-flight requests complete.
                 client.unpause_engines()
-                await asyncio.wait_for(engine.running.wait(), timeout=5.0)
+                await asyncio.wait_for(engine.wait_until(EngineState.RUNNING), timeout=5.0)
                 results = await asyncio.wait_for(asyncio.gather(*pending), timeout=10.0)
                 for record in results:
                     assert record[-1].status == Status.COMPLETED
@@ -509,11 +509,11 @@ class TestCoordinator:
 
                 # Suspend.
                 client.pause_engines()
-                await asyncio.wait_for(engine.paused.wait(), timeout=5.0)
+                await asyncio.wait_for(engine.wait_until(EngineState.PAUSED), timeout=5.0)
                 assert_state(engine, EngineState.PAUSED)
 
                 client.suspend_engines()
-                await asyncio.wait_for(engine.suspended.wait(), timeout=5.0)
+                await asyncio.wait_for(engine.wait_until(EngineState.SUSPENDED), timeout=5.0)
                 assert_state(engine, EngineState.SUSPENDED)
 
                 # Try pausing again and see if it breaks.
@@ -529,13 +529,13 @@ class TestCoordinator:
                 # Resume.
                 engine.paused.clear()
                 client.resume_engines()
-                await asyncio.wait_for(engine.paused.wait(), timeout=5.0)
+                await asyncio.wait_for(engine.wait_until(EngineState.PAUSED), timeout=5.0)
                 assert_state(engine, EngineState.PAUSED)
                 assert not engine.suspended.is_set()
 
                 # Engine processes requests after suspend/resume cycle.
                 client.unpause_engines()
-                await asyncio.wait_for(engine.running.wait(), timeout=5.0)
+                await asyncio.wait_for(engine.wait_until(EngineState.RUNNING), timeout=5.0)
 
                 futures = [
                     client.add_request(prompt=p, sampling_params=s) for p, s in requests[7:10]
@@ -546,7 +546,7 @@ class TestCoordinator:
 
                 # Submit requests that will be cancelled on STOP.
                 client.pause_engines()
-                await asyncio.wait_for(engine.paused.wait(), timeout=5.0)
+                await asyncio.wait_for(engine.wait_until(EngineState.PAUSED), timeout=5.0)
                 assert_state(engine, EngineState.PAUSED)
 
                 doomed_futures = [
@@ -554,12 +554,12 @@ class TestCoordinator:
                 ]
 
                 client.suspend_engines()
-                await asyncio.wait_for(engine.suspended.wait(), timeout=5.0)
+                await asyncio.wait_for(engine.wait_until(EngineState.SUSPENDED), timeout=5.0)
                 assert_state(engine, EngineState.SUSPENDED)
 
                 client.stop_engines()
 
-            await asyncio.wait_for(engine.stopped.wait(), timeout=60.0)
+            await asyncio.wait_for(engine.wait_until(EngineState.STOPPED), timeout=60.0)
             assert_state(engine, EngineState.STOPPED)
 
             if torch.distributed.get_rank() == 0:

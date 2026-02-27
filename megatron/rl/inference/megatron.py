@@ -7,7 +7,7 @@ import torch.distributed as dist
 from pydantic import PrivateAttr
 
 from megatron.core.inference.config import KVCacheManagementMode
-from megatron.core.inference.engines.dynamic_engine import DynamicInferenceEngine
+from megatron.core.inference.engines.dynamic_engine import DynamicInferenceEngine, EngineState
 from megatron.core.inference.inference_client import InferenceClient
 from megatron.core.models.gpt.gpt_model import GPTModel
 from megatron.core.utils import log_single_rank
@@ -121,11 +121,11 @@ class MegatronLocal(InferenceServer, ReturnsTokens, ReturnsRaw):
     async def kill(self):
         if dist.get_rank() == 0:
             self._client.pause_engines()
-        await self._inference_engine.paused.wait()
+        await self._inference_engine.wait_until(EngineState.PAUSED)
 
         if dist.get_rank() == 0:
             self._client.stop_engines()
-        await self._inference_engine.stopped.wait()
+        await self._inference_engine.wait_until(EngineState.STOPPED)
 
         if dist.get_rank() == 0:
             self._client.stop()
@@ -133,11 +133,11 @@ class MegatronLocal(InferenceServer, ReturnsTokens, ReturnsRaw):
     async def suspend(self):
         if dist.get_rank() == 0:
             self._client.pause_engines()
-        await self._inference_engine.paused.wait()
+        await self._inference_engine.wait_until(EngineState.PAUSED)
 
         if dist.get_rank() == 0:
             self._client.suspend_engines()
-        await self._inference_engine.suspended.wait()
+        await self._inference_engine.wait_until(EngineState.SUSPENDED)
 
     async def resume(self):
         if self._inference_engine.running.is_set():
@@ -147,4 +147,4 @@ class MegatronLocal(InferenceServer, ReturnsTokens, ReturnsRaw):
             self._client.resume_engines()
             self._client.unpause_engines()
 
-        await self._inference_engine.running.wait()
+        await self._inference_engine.wait_until(EngineState.RUNNING)

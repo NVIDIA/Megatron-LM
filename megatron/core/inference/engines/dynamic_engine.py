@@ -162,6 +162,14 @@ class DynamicInferenceEngine(AbstractEngine):
             batching and a dynamic block-level KV cache (similar to paged attention).
     """
 
+    # Map stable states to their corresponding asyncio events.
+    _STATE_EVENTS = {
+        EngineState.RUNNING: 'running',
+        EngineState.PAUSED: 'paused',
+        EngineState.SUSPENDED: 'suspended',
+        EngineState.STOPPED: 'stopped',
+    }
+
     @deprecate_args(
         *DEPRECATED_ARGS,
         message="Argument `{name}` has been deprecated. Only pass `controller` and `context`",
@@ -261,18 +269,33 @@ class DynamicInferenceEngine(AbstractEngine):
         # Runtime state.
         self._loop = get_asyncio_loop(getattr(self, "_loop", None))
         self._cond = asyncio.Condition()
-        self.running = asyncio.Event()
-        self.running.set()
-        self.paused = asyncio.Event()
-        self.suspended = asyncio.Event()
-        self.stopped = asyncio.Event()
         self.state = EngineState.RUNNING
+        # Awaitable events for external callers to detect state transitions.
+        # These mirror self.state for the four stable states: the engine sets/clears them when it
+        # transitions, and external callers can await them to block until the target state.
+        for state, attr in self._STATE_EVENTS.items():
+            event = asyncio.Event()
+            if state == self.state:
+                event.set()
+            setattr(self, attr, event)
         self._pending_signals = deque()
 
         self.resume_request_ids = None
 
         # Coordinator state.
         self.use_coordinator = False
+
+    async def wait_until(self, state: EngineState):
+        """Wait until the engine reaches the given state.
+
+        Only stable states (RUNNING, PAUSED, SUSPENDED, STOPPED) are
+        supported.  Transient states (PAUSING, SUSPENDING, RESUMING,
+        STOPPING) are not directly waitable.
+        """
+        attr = self._STATE_EVENTS.get(state)
+        if attr is None:
+            raise ValueError(f"Cannot wait for transient state {state}")
+        await getattr(self, attr).wait()
 
     def create_cuda_graphs(self, reset_context: bool = True):
         """Create cuda graphs.
@@ -414,7 +437,7 @@ class DynamicInferenceEngine(AbstractEngine):
             "pip install msgpack"
         )
 
-        self.zmq_context = zmq.Context()
+        self.zmq_context = zmq.Context.instance()
         self.zmq_sockets = []  # keep track of all sockets created by this engine
 
         # Get world info.
@@ -543,10 +566,7 @@ class DynamicInferenceEngine(AbstractEngine):
         # initialize zmq-based world communicator for consensus barriers
         total_world_size = torch.distributed.get_world_size()
         if total_world_size > 1:
-            world_group = torch.distributed.new_group()
-            self.world_zmq_communicator = AsyncZMQCommunicator(
-                self.zmq_context, process_group=world_group
-            )
+            self.world_zmq_communicator = AsyncZMQCommunicator(self.zmq_context, process_group=None)
 
         if launch_inference_coordinator and self.is_dp_coordinator:
             await await_process_call(
@@ -1603,7 +1623,7 @@ class DynamicInferenceEngine(AbstractEngine):
         else:
             # First, receive the number of messages to dequeue from mp-rank 0.
             # RCVTIMEO is set on this socket so recv() raises zmq.Again on
-            # timeout instead of blocking forever — this keeps the engine
+            # timeout instead of blocking forever: this keeps the engine
             # loop cancellable by asyncio.
             try:
                 messages_to_dequeue = struct.unpack(
@@ -1621,52 +1641,59 @@ class DynamicInferenceEngine(AbstractEngine):
                 all_messages = []
 
         range_pop()
-        # We need to put the messages in a queue so that we can break after control signals.
-        self._pending_signals.extend(all_messages)
 
-        while self._pending_signals:
-            message = self._pending_signals.popleft()
+        # First pass: add all requests and detect staleness increments.
+        # Control signals are queued for the second pass.
+        has_staleness_increment = False
+        for message in all_messages:
             data = msgpack.unpackb(message, raw=False)
             header = Headers(data[0])
-
             if header == Headers.SUBMIT_REQUEST:
                 request_id, prompt, sampling_params = data[1:]
                 sampling_params = SamplingParams.deserialize(sampling_params)
                 range_push("add_request")
                 self.add_request(request_id, prompt, sampling_params)
                 range_pop()
+            elif header == Headers.INCREMENT_STALENESS:
+                has_staleness_increment = True
+            else:
+                # Control signal: queue for second pass.
+                self._pending_signals.append(message)
 
-            elif header == Headers.PAUSE:
+        if has_staleness_increment:
+            waiting = set(self.waiting_request_ids)
+            for request_id, entry in self.requests.items():
+                entry.record.increment_staleness(policy_only=request_id in waiting)
+
+        # Second pass: apply at most one control signal (the engine loop
+        # processes one state transition per iteration).
+        if self._pending_signals:
+            message = self._pending_signals.popleft()
+            data = msgpack.unpackb(message, raw=False)
+            header = Headers(data[0])
+
+            if header == Headers.PAUSE:
                 if self.state == EngineState.RUNNING:
                     self.state = EngineState.PAUSING
                     self.running.clear()
                 # Any other state can safely ignore PAUSE.
-                break
 
             elif header == Headers.UNPAUSE:
                 assert self.state == EngineState.PAUSED, f"Received UNPAUSE in state {self.state}"
                 self.state = EngineState.RUNNING
                 self.paused.clear()
                 self.running.set()
-                break
 
             elif header == Headers.SUSPEND:
                 assert self.state == EngineState.PAUSED, f"Received SUSPEND in state {self.state}"
                 self.suspend()
                 self.state = EngineState.SUSPENDING
-                break
 
             elif header == Headers.RESUME:
                 assert self.state == EngineState.SUSPENDED, f"Received RESUME in state {self.state}"
                 self.suspended.clear()
                 self.resume()
                 self.state = EngineState.RESUMING
-                break
-
-            elif header == Headers.INCREMENT_STALENESS:
-                waiting = set(self.waiting_request_ids)
-                for request_id, entry in self.requests.items():
-                    entry.record.increment_staleness(policy_only=request_id in waiting)
 
             elif header == Headers.STOP:
                 assert self.state in (
@@ -1676,7 +1703,6 @@ class DynamicInferenceEngine(AbstractEngine):
                 if self.state == EngineState.SUSPENDED:
                     self.suspended.clear()
                 self.state = EngineState.STOPPING
-                break
 
             else:
                 raise UnknownHeaderError(header)
@@ -1804,8 +1830,9 @@ class DynamicInferenceEngine(AbstractEngine):
         consensus_val = -1 if signal_consensus else 0
 
         if self.ep_world_size > 1:
+            # Perform all-reduce to get max global work across EP group.
             global_work, global_consensus = (
-                await self.expert_parallel_zmq_communicator.all_reduce_max_pair(
+                await self.expert_parallel_zmq_communicator.all_reduce_max(
                     local_work, consensus_val
                 )
             )
@@ -1858,7 +1885,7 @@ class DynamicInferenceEngine(AbstractEngine):
                     )
 
                     if global_work > 0:
-                        # At least one EP peer has work — all must participate.
+                        # At least one EP peer has work: all must participate.
                         if local_pending > 0:
                             await self.async_step()
                         else:
@@ -1869,12 +1896,12 @@ class DynamicInferenceEngine(AbstractEngine):
                             self.step_end_event.synchronize()
                             self.step_count += 1
                     elif all_pausing:
-                        # All EP peers are PAUSING with no work — consensus.
+                        # All EP peers are PAUSING with no work: consensus.
                         await self._world_barrier()
                         self.state = EngineState.PAUSED
                         self.paused.set()
                     else:
-                        # No work, but not all pausing — idle.
+                        # No work, but not all pausing: idle.
                         await asyncio.sleep(0.02)
 
                 elif self.state == EngineState.PAUSED:

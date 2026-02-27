@@ -65,68 +65,37 @@ class AsyncZMQCommunicator:
             self.bcast_sock.connect(bcast_socket_addr)
             self.bcast_sock.setsockopt_string(zmq.SUBSCRIBE, "")
 
-    async def all_reduce_max(self, local_val: int) -> int:
-        """
-        Asyncio friendly all reduce max operation. Gathers on rank 0, computes max,
-        and broadcasts the result.
-        """
-        if self.world_size <= 1:
-            return local_val
+    async def all_reduce_max(self, *local_vals: int) -> int | tuple[int, ...]:
+        """Element-wise all-reduce max of one or more integers.
 
-        payload = struct.pack('!i', local_val)
+        Packs all values into a single message so the communication cost
+        is independent of the number of values.
+
+        Returns a single int when called with one argument, otherwise a tuple.
+        """
+        n = len(local_vals)
+        if n == 0:
+            raise ValueError("all_reduce_max requires at least one value")
+
+        if self.world_size <= 1:
+            return local_vals[0] if n == 1 else local_vals
+
+        fmt = f'!{n}i'
+        payload = struct.pack(fmt, *local_vals)
 
         if self.is_leader:
-            # Rank 0: Gather -> Max -> Broadcast
-            values = [local_val]
+            rows = [local_vals]
 
-            # Non-blocking gather from N-1 peers
-            while len(values) < self.world_size:
+            while len(rows) < self.world_size:
                 try:
                     msg = self.gather_sock.recv(flags=zmq.NOBLOCK)
-                    values.append(struct.unpack('!i', msg)[0])
-                except zmq.Again:
-                    await asyncio.sleep(0.001)  # Yield to event loop
-
-            max_val = max(values)
-            self.bcast_sock.send(struct.pack('!i', max_val))
-            return max_val
-
-        else:
-            # Worker: Send -> Wait for Broadcast
-            self.gather_sock.send(payload)
-
-            while True:
-                try:
-                    msg = self.bcast_sock.recv(flags=zmq.NOBLOCK)
-                    return struct.unpack('!i', msg)[0]
-                except zmq.Again:
-                    await asyncio.sleep(0.001)  # Yield to event loop
-
-    async def all_reduce_max_pair(self, val_a: int, val_b: int) -> tuple[int, int]:
-        """Element-wise all-reduce max of two integers.
-
-        Packs both values into a single message so the communication cost
-        is identical to a single-integer all-reduce.
-        """
-        if self.world_size <= 1:
-            return val_a, val_b
-
-        payload = struct.pack('!ii', val_a, val_b)
-
-        if self.is_leader:
-            pairs = [(val_a, val_b)]
-
-            while len(pairs) < self.world_size:
-                try:
-                    msg = self.gather_sock.recv(flags=zmq.NOBLOCK)
-                    pairs.append(struct.unpack('!ii', msg))
+                    rows.append(struct.unpack(fmt, msg))
                 except zmq.Again:
                     await asyncio.sleep(0.001)
 
-            max_a = max(p[0] for p in pairs)
-            max_b = max(p[1] for p in pairs)
-            self.bcast_sock.send(struct.pack('!ii', max_a, max_b))
-            return max_a, max_b
+            maxes = tuple(max(row[i] for row in rows) for i in range(n))
+            self.bcast_sock.send(struct.pack(fmt, *maxes))
+            return maxes[0] if n == 1 else maxes
 
         else:
             self.gather_sock.send(payload)
@@ -134,7 +103,8 @@ class AsyncZMQCommunicator:
             while True:
                 try:
                     msg = self.bcast_sock.recv(flags=zmq.NOBLOCK)
-                    return struct.unpack('!ii', msg)
+                    result = struct.unpack(fmt, msg)
+                    return result[0] if n == 1 else result
                 except zmq.Again:
                     await asyncio.sleep(0.001)
 
@@ -142,5 +112,7 @@ class AsyncZMQCommunicator:
         """
         Close the ZMQ sockets.
         """
+        # linger=0: discard unsent messages immediately on close rather than blocking until sent.
+        # The ZMQ default is to not allow `close` until all messages have been successfully sent.
         self.gather_sock.close(linger=0)
         self.bcast_sock.close(linger=0)

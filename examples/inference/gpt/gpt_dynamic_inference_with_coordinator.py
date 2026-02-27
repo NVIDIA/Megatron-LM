@@ -14,6 +14,7 @@ import torch.distributed as dist
 
 from examples.inference.gpt.utils import Request, build_dynamic_engine_setup_prefix, build_requests
 from megatron.core.inference.engines import DynamicInferenceEngine
+from megatron.core.inference.engines.dynamic_engine import EngineState
 from megatron.core.inference.inference_client import InferenceClient
 from megatron.core.inference.inference_request import DynamicInferenceRequestRecord
 from megatron.core.inference.sampling_params import SamplingParams
@@ -175,12 +176,12 @@ async def main(
         # Pause before stopping: STOP requires PAUSED or SUSPENDED state.
         client.pause_engines()
 
-    await engine.paused.wait()
+    await engine.wait_until(EngineState.PAUSED)
 
     if dist.get_rank() == 0:
         client.stop_engines()
 
-    await engine.stopped.wait()
+    await engine.wait_until(EngineState.STOPPED)
 
     if dist.get_rank() == 0:
         client.stop()
