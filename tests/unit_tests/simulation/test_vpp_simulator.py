@@ -233,12 +233,14 @@ class TestVppSimulatorBasic:
             return input_tensor_grad, duration
 
         # Patch execution functions
+        # CRITICAL: Patch the references in vpp_simulate, not model_executor!
+        # vpp_simulate.py imports: from model_executor import execute_forward_with_timing, execute_backward_with_timing
         monkeypatch.setattr(
-            'megatron.training.simulation.model_executor.execute_forward_with_timing',
+            'megatron.training.simulation.vpp_simulate.execute_forward_with_timing',
             fake_execute_forward
         )
         monkeypatch.setattr(
-            'megatron.training.simulation.model_executor.execute_backward_with_timing',
+            'megatron.training.simulation.vpp_simulate.execute_backward_with_timing',
             fake_execute_backward
         )
 
