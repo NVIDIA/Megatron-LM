@@ -146,8 +146,8 @@ class MoEMetricsTracker:
             num_layers: Total transformer layers (required when *force_initialize*).
             moe_layer_freq: MoE layer frequency or binary pattern list.
             mtp_num_layers: Extra layers from Multi-Token Prediction.
-            total_loss_dict: Megatron training-loop accumulator.  Metrics whose
-                metrics ending with ``"loss"`` are accumulated here and excluded from
+            total_loss_dict: Megatron training-loop accumulator.  Metrics
+                ending with ``"loss"`` are accumulated here and excluded from
                 the returned console log string.
             percentiles: Per-metric percentiles to compute, e.g.
                 ``{"load_imbalance": [0.5, 0.95]}``.
@@ -156,7 +156,7 @@ class MoEMetricsTracker:
         Returns:
             Formatted log string for console output.
         """
-        names_list = self._resolve_names(track_names)
+        metric_names = self._resolve_names(track_names)
 
         # Pre-create entries on PP ranks that lack MoE layers.
         # Tensor size must be (num_layers + mtp_num_layers) to match ranks that
@@ -165,13 +165,13 @@ class MoEMetricsTracker:
             if num_layers is None:
                 raise ValueError("num_layers must be provided when force_initialize=True.")
             init_size = num_layers + (mtp_num_layers or 0)
-            for name in names_list:
+            for name in metric_names:
                 self.ensure_initialized(name, init_size)
 
-        self._sync_metrics(names_list, pg_collection)
+        self._sync_metrics(metric_names, pg_collection)
 
         num_moe_layers = self._count_moe_layers(num_layers, moe_layer_freq, mtp_num_layers)
-        scalars = self._aggregate(loss_scale, num_moe_layers, names_list, percentiles)
+        scalars = self._aggregate(loss_scale, num_moe_layers, metric_names, percentiles)
 
         # Megatron integration: accumulate loss metrics into total_loss_dict
         console_scalars = dict(scalars)
@@ -187,7 +187,7 @@ class MoEMetricsTracker:
         self._log_scalars(scalars, iteration, writer, wandb_writer)
         if per_layer_logging:
             self._log_per_layer(
-                loss_scale, names_list, iteration, writer, wandb_writer, percentiles
+                loss_scale, metric_names, iteration, writer, wandb_writer, percentiles
             )
 
         log_string = self._format(console_scalars)
@@ -230,7 +230,7 @@ class MoEMetricsTracker:
         return track_names
 
     def _sync_metrics(
-        self, names: List[str], pg_collection: Optional[ProcessGroupCollection] = None
+        self, metric_names: List[str], pg_collection: Optional[ProcessGroupCollection] = None
     ) -> None:
         """All-reduce metrics across distributed ranks.
 
@@ -245,7 +245,7 @@ class MoEMetricsTracker:
             pp_group = pg_collection.pp
             dp_group = pg_collection.dp
 
-        for name in names:
+        for name in metric_names:
             if name not in self._metrics:
                 continue
 
@@ -291,7 +291,7 @@ class MoEMetricsTracker:
         self,
         loss_scale: float,
         num_moe_layers: int,
-        names: List[str],
+        metric_names: List[str],
         percentiles: Optional[Dict[str, List[float]]] = None,
     ) -> Dict[str, Union[float, torch.Tensor]]:
         """Aggregate per-layer values into scalar summaries.
@@ -302,7 +302,7 @@ class MoEMetricsTracker:
         """
         result: Dict[str, Union[float, torch.Tensor]] = {}
 
-        for name in names:
+        for name in metric_names:
             if name not in self._metrics:
                 continue
 
@@ -335,14 +335,14 @@ class MoEMetricsTracker:
     def _log_per_layer(
         self,
         loss_scale: float,
-        names: List[str],
+        metric_names: List[str],
         iteration: int,
         writer,
         wandb_writer,
         percentiles: Optional[Dict[str, List[float]]] = None,
     ) -> None:
         """Write per-layer metric values to TensorBoard and/or W&B."""
-        for name in names:
+        for name in metric_names:
             if name not in self._metrics:
                 continue
 
