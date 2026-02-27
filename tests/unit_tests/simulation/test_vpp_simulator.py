@@ -336,7 +336,15 @@ class TestVppSimulatorBasic:
     ):
         """Test that run_global_step completes successfully under different PP/VPP configs"""
 
-        # 1. Configure args for this test
+        # 1. Re-initialize parallel_state with the correct PP/VPP sizes for this test
+        Utils.destroy_model_parallel()
+        Utils.initialize_model_parallel(
+            tensor_model_parallel_size=1,
+            pipeline_model_parallel_size=pp_size,
+            virtual_pipeline_model_parallel_size=vpp_size
+        )
+
+        # 2. Configure args for this test
         mock_args.pipeline_model_parallel_size = pp_size
         mock_args.virtual_pipeline_model_parallel_size = vpp_size
         mock_args.global_batch_size = num_microbatches * mock_args.micro_batch_size
@@ -417,7 +425,7 @@ class TestVppSimulatorBasic:
             pipeline_model_parallel_size=pp_size
         )
 
-        # 2. Set global args and initialize num_microbatches_calculator
+        # 3. Set global args and initialize num_microbatches_calculator
         set_args(mock_args)
         # Destroy any existing calculator first
         destroy_num_microbatches_calculator()
@@ -429,30 +437,30 @@ class TestVppSimulatorBasic:
             data_parallel_size=mock_args.data_parallel_size
         )
 
-        # 3. Create VppSimulator
+        # 4. Create VppSimulator
         simulator = VppSimulator(
             mock_data_iterator,
             simple_model_provider,
             forward_step_func
         )
 
-        # 4. Execute run_global_step
+        # 5. Execute run_global_step
         simulator.run_global_step()
 
-        # 5. Verify: Task count is correct
+        # 6. Verify: Task count is correct
         num_model_chunks = vpp_size if vpp_size else 1
         expected_task_count = pp_size * num_microbatches * num_model_chunks * 2
         assert simulator.task_num_count == expected_task_count, \
             f"Expected {expected_task_count} tasks, got {simulator.task_num_count}"
 
-        # 6. Verify: All tasks are finished
+        # 7. Verify: All tasks are finished
         for task_key, task in simulator.pp_mbid_mcid_fb_task_dict.items():
             assert task.finished, \
                 f"Task {task.task_id} not finished"
             assert task.duration is not None and task.duration > 0, \
                 f"Task {task.task_id} has invalid duration: {task.duration}"
 
-        # 7. Verify: Result files created (only rank 0)
+        # 8. Verify: Result files created (only rank 0)
         if torch.distributed.is_initialized() and torch.distributed.get_rank() == 0:
             result_dir = Path(mock_args.simulate_result_dir)
             required_files = [
