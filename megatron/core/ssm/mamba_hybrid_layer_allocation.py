@@ -24,6 +24,18 @@ class Symbols:
     MTP_SEPARATOR = "/"
     VALID_LAYERS = {MAMBA, GDN, ATTENTION, DS_ATTENTION, MLP, MOE}
 
+    @classmethod
+    def name_sorted_valid_layer_symbols(cls) -> list[str]:
+        """Return the valid layer symbols sorted lexicographically by their public attribute
+        name.
+        """
+        valid_layer_attrs = []
+        for name, value in vars(cls).items():
+            if not name.startswith('_') and value in cls.VALID_LAYERS:
+                valid_layer_attrs.append((name, value))
+        valid_layer_attrs.sort()
+        return [value for (_, value) in valid_layer_attrs]
+
 
 @dataclass
 class ParsedHybridPattern:
@@ -156,24 +168,18 @@ def get_hybrid_layer_counts(pattern: str) -> Dict[str, int]:
         pattern: Full hybrid layer pattern string.
 
     Returns:
-        Dictionary mapping layer symbol to count. Keys are Symbols.MAMBA,
-        Symbols.GDN, Symbols.ATTENTION, Symbols.MLP, and Symbols.MOE.
+        Dictionary mapping layer symbol to count. Keys are all valid layer symbols
+            (Symbols.VALID_LAYERS).
 
     Examples:
         >>> get_hybrid_layer_counts("M*M*")
-        {'M': 2, 'G': 0, '*': 2, '-': 0, 'E': 0}
+        {'*': 2, 'G': 0, 'D': 0, 'M': 2, '-': 0, 'E': 0}
 
         >>> get_hybrid_layer_counts("M-M-|M-M*-/MM/MM")
-        {'M': 8, 'G': 0, '*': 1, '-': 4, 'E': 0}
+        {'*': 1, 'G': 0, 'D': 0, 'M': 8, '-': 4, 'E': 0}
     """
     parsed = parse_hybrid_pattern(pattern)
-    counts = {
-        Symbols.MAMBA: 0,
-        Symbols.GDN: 0,
-        Symbols.ATTENTION: 0,
-        Symbols.MLP: 0,
-        Symbols.MOE: 0,
-    }
+    counts = {symbol: 0 for symbol in Symbols.name_sorted_valid_layer_symbols()}
 
     # Count main decoder layers (skip '|' pipe separators)
     if parsed.main_pattern:
