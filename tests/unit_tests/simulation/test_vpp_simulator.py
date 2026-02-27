@@ -345,7 +345,16 @@ class TestVppSimulatorBasic:
         # Format: "t" = decoder layer, "E" = embedding, "L" = loss
         # For simplicity, use a uniform layout with decoder layers
         num_model_chunks = vpp_size if vpp_size else 1
-        layers_per_chunk = 2  # 2 decoder layers per model chunk
+
+        # Calculate layers_per_chunk to ensure total decoder layers match num_layers
+        # This keeps moe_layer_freq consistent with the actual layout
+        if pp_size == 1:
+            # Single PP stage: all layers in one or distributed across VPP chunks
+            layers_per_chunk = mock_args.num_layers // num_model_chunks
+        else:
+            # Multiple PP stages: distribute layers evenly across PP ranks
+            # Total decoder layers = pp_size * layers_per_chunk (for no VPP case)
+            layers_per_chunk = max(1, mock_args.num_layers // pp_size)
 
         if pp_size == 1:
             # Single PP stage
