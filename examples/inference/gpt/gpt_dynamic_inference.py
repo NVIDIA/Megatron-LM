@@ -80,6 +80,16 @@ def run_inference(
 
     args = get_args()
 
+    # Parse batch boundaries for batch-drain mode.
+    batch_ranges = None
+    if args.drain_between_batches and args.batch_boundaries:
+        boundaries = [int(x) for x in args.batch_boundaries.split(",")]
+        num_requests_total = len(requests)
+        batch_ranges = []
+        for i, start in enumerate(boundaries):
+            end = boundaries[i + 1] if i + 1 < len(boundaries) else num_requests_total
+            batch_ranges.append((start, end))
+
     # Initialize request arrival times.
     base_arrival_time = get_curr_time()
     for request in requests:
@@ -113,57 +123,11 @@ def run_inference(
         num_requests_added += 1
         tbar.update(1)
 
-    while True:
-        # Add requests.
-        add_start = get_curr_time()
-        if args.incoming_requests_per_step is None:
-            # Add requests with 'earlier' arrival time.
-            while num_requests_added < num_requests_total:
-                if requests[num_requests_added].time_arrival > add_start:
-                    break
-                _add_request()
-        else:
-            # Add deterministic number of requests (generally used for debugging).
-            for i in range(
-                min(args.incoming_requests_per_step, num_requests_total - num_requests_added)
-            ):
-                _add_request()
-        add_times.append(get_curr_time() - add_start)
+    def _process_step_result(result):
+        """Process a single engine step result, updating bookkeeping state."""
+        nonlocal total_output_tokens, num_requests_finished
 
-        # Step inference engine (i.e., generate a token for each active request).
-        # Before step, we haven't done the scheduling, so we cannot know the is_decode_only
-        try:
-            result = engine.step_modern()
-        except EngineSuspendedError as e:
-            result = e
-            pass  # ignore error in order to call 'engine.resume()' below.
-        attempted_step_count += 1
-
-        # After step, we lost track of last iteration's is_decode_only,
-        # so we need to get it from the engine
         is_decode_only = engine.is_decode_only
-
-        # Test suspending and resuming engine.
-        if args.suspend_resume_interval is not None:
-
-            # Suspend.
-            if attempted_step_count % args.suspend_resume_interval == 0:
-                print("**** step %d/%d ... suspend." % (engine.context.step_count, attempted_step_count))
-                engine.suspend()
-
-            # Resume, 0+ attempted steps later.
-            if (
-                attempted_step_count > 0
-                and (attempted_step_count - args.suspend_resume_interval // 2)
-                % args.suspend_resume_interval
-                == 0
-            ):
-                print("**** step %d/%d ... resume." % (engine.context.step_count, attempted_step_count))
-                engine.resume()
-
-        # If engine suspended, continue to next iter.
-        if isinstance(result, EngineSuspendedError):
-            continue
 
         # Record cuda_graph_request_count.
         cuda_graph_request_count = result["cuda_graph_request_count"]
@@ -222,9 +186,82 @@ def run_inference(
                 num_requests_finished += 1
             output_times.append(get_curr_time() - output_start)
 
-        # Check if all requests are finished.
-        if not (engine.has_unfinished_requests() or num_requests_added < num_requests_total):
-            break
+    if batch_ranges is not None:
+        # Batch-drain mode: add all requests in a batch, drain, then next batch.
+        for batch_idx, (batch_start, batch_end) in enumerate(batch_ranges):
+            # Add all requests in current batch.
+            add_start = get_curr_time()
+            while num_requests_added < batch_end:
+                _add_request()
+            add_times.append(get_curr_time() - add_start)
+
+            # Step until all active requests finish (drain).
+            while engine.has_unfinished_requests():
+                try:
+                    result = engine.step_modern()
+                except EngineSuspendedError as e:
+                    result = e
+                attempted_step_count += 1
+
+                if isinstance(result, EngineSuspendedError):
+                    continue
+
+                _process_step_result(result)
+    else:
+        # Original mode: add requests per step based on arrival time or count.
+        while True:
+            # Add requests.
+            add_start = get_curr_time()
+            if args.incoming_requests_per_step is None:
+                # Add requests with 'earlier' arrival time.
+                while num_requests_added < num_requests_total:
+                    if requests[num_requests_added].time_arrival > add_start:
+                        break
+                    _add_request()
+            else:
+                # Add deterministic number of requests (generally used for debugging).
+                for i in range(
+                    min(args.incoming_requests_per_step, num_requests_total - num_requests_added)
+                ):
+                    _add_request()
+            add_times.append(get_curr_time() - add_start)
+
+            # Step inference engine (i.e., generate a token for each active request).
+            # Before step, we haven't done the scheduling, so we cannot know the is_decode_only
+            try:
+                result = engine.step_modern()
+            except EngineSuspendedError as e:
+                result = e
+                pass  # ignore error in order to call 'engine.resume()' below.
+            attempted_step_count += 1
+
+            # Test suspending and resuming engine.
+            if args.suspend_resume_interval is not None:
+
+                # Suspend.
+                if attempted_step_count % args.suspend_resume_interval == 0:
+                    print("**** step %d/%d ... suspend." % (engine.context.step_count, attempted_step_count))
+                    engine.suspend()
+
+                # Resume, 0+ attempted steps later.
+                if (
+                    attempted_step_count > 0
+                    and (attempted_step_count - args.suspend_resume_interval // 2)
+                    % args.suspend_resume_interval
+                    == 0
+                ):
+                    print("**** step %d/%d ... resume." % (engine.context.step_count, attempted_step_count))
+                    engine.resume()
+
+            # If engine suspended, continue to next iter.
+            if isinstance(result, EngineSuspendedError):
+                continue
+
+            _process_step_result(result)
+
+            # Check if all requests are finished.
+            if not (engine.has_unfinished_requests() or num_requests_added < num_requests_total):
+                break
 
     # Resume engine (NOOP if not suspended).
     if engine.is_suspended:

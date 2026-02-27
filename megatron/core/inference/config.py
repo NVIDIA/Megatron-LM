@@ -52,6 +52,19 @@ class MambaInferenceStateConfig:
         return None
 
 
+class PrefixCachingEvictionPolicy(str, Enum):
+    """Eviction policy for prefix caching blocks.
+
+    Only applies when enable_prefix_caching is True.
+    """
+
+    REF_ZERO = "ref_zero"
+    """Deregister blocks immediately when ref_count hits 0. No caching after release."""
+
+    LRU = "lru"
+    """Keep released blocks in hash table. Evict oldest ref=0 blocks when space is needed."""
+
+
 class KVCacheManagementMode(str, Enum):
     """Mode for handling large tensors (KV cache, Mamba states) during suspend/resume."""
 
@@ -188,8 +201,10 @@ class InferenceConfig:
     enable_prefix_caching: bool = False
     """Whether to enable prefix caching for KV cache block sharing."""
 
-    block_evict_lru: bool = False
-    """Use LRU eviction for prefix caching blocks.
+    prefix_caching_eviction_policy: PrefixCachingEvictionPolicy = (
+        PrefixCachingEvictionPolicy.REF_ZERO
+    )
+    """Eviction policy for prefix caching blocks. See `PrefixCachingEvictionPolicy` for options.
 
     Only applies when enable_prefix_caching is True.
     """
