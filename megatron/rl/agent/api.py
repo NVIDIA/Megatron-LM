@@ -38,6 +38,8 @@ class GroupedRolloutRequest(Request):
     inference_interface: InferenceInterface
     validation: bool = False
     filter_groups_with_same_reward: bool = False
+    streaming: bool = False
+    batch_results: bool = False
 
 
 class Rollout(AgentBaseModel):
@@ -182,10 +184,9 @@ class GroupedRolloutGenerator(Agent, ABC):
             request.inference_interface, ReturnsRaw
         ), "InferenceInterface must support raw_text return to provide rollouts."
 
-        # If num_groups is -1, we generate a stream of groups.
-        # The buffer size is used to create backpressure for each agent in order to balance group generation in a multi-task setting.
+        # When streaming, use buffer_size to create backpressure for balanced generation in a multi-task setting.
         grouped_rollouts: asyncio.Queue[list[Rollout]] = asyncio.Queue(
-            maxsize=self.buffer_size if request.num_groups < 0 else 0
+            maxsize=self.buffer_size if request.streaming else 0
         )
         submitted_groups = 0
         yielded_groups = 0
@@ -193,7 +194,7 @@ class GroupedRolloutGenerator(Agent, ABC):
         @trace_async_exceptions(verbose=True)
         async def group_task():
             nonlocal submitted_groups, yielded_groups
-            while request.num_groups == -1 or submitted_groups < request.num_groups:
+            while request.streaming or submitted_groups < request.num_groups:
                 submitted_groups += 1
                 group = await self.group_rollout(request=request)
                 if (
@@ -212,8 +213,22 @@ class GroupedRolloutGenerator(Agent, ABC):
         tasks = [asyncio.create_task(group_task()) for _ in range(self.parallel_generation_tasks)]
 
         try:
-            while grouped_rollouts.qsize() > 0 or not all(task.done() for task in tasks):
-                yield await grouped_rollouts.get()
+            if request.batch_results:
+                # Accumulate groups into ordered batches of num_groups.
+                next_batch_id = 0
+                pending: dict[int, list[list[Rollout]]] = {}
+                while grouped_rollouts.qsize() > 0 or not all(task.done() for task in tasks):
+                    group = await grouped_rollouts.get()
+                    batch_id = group[0].submission_index // request.num_groups
+                    pending.setdefault(batch_id, []).append(group)
+                    if len(pending.get(next_batch_id, [])) >= request.num_groups:
+                        batch = pending.pop(next_batch_id)
+                        batch.sort(key=lambda g: g[0].submission_index)
+                        next_batch_id += 1
+                        yield batch
+            else:
+                while grouped_rollouts.qsize() > 0 or not all(task.done() for task in tasks):
+                    yield await grouped_rollouts.get()
         finally:
             for task in tasks:
                 task.cancel()
