@@ -37,10 +37,15 @@ class GlooCopyService(CopyService):
     process group instead of NCCL.
     """
 
-    def __init__(self):
-        self.rank = dist.get_rank()
-        self.world_size = dist.get_world_size()
-        self.gloo_pg = dist.new_group(backend="gloo")
+    def __init__(self, group=None):
+        if group is not None:
+            self.gloo_pg = group
+            self.rank = group.rank()
+            self.world_size = group.size()
+        else:
+            self.rank = dist.get_rank()
+            self.world_size = dist.get_world_size()
+            self.gloo_pg = dist.new_group(backend="gloo")
         self.send_ops: List[SendOp] = []
         self.recv_ops: List[Tuple[RecvOp, torch.Tensor]] = []
         self._copy_stream = torch.cuda.Stream()
@@ -124,11 +129,18 @@ class GlooCopyService(CopyService):
 
         # Build Gloo P2P ops over CPU tensors. For sends we clone to CPU;
         # for recvs we use the preallocated CPU buffers.
+        # Use group_peer (not peer) to pass ranks directly in group space,
+        # avoiding the global-to-group rank conversion in P2POp which doesn't
+        # work for cross-world ProcessGroups.
         for op in remote_sends:
             cpu_tensor = op.tensor.detach().to("cpu").contiguous()
-            p2p_ops.append(dist.P2POp(dist.isend, cpu_tensor, op.dest_rank, group=self.gloo_pg))
+            p2p_ops.append(
+                dist.P2POp(dist.isend, cpu_tensor, group=self.gloo_pg, group_peer=op.dest_rank)
+            )
         for recv, _dst_tensor in remote_recvs:
-            p2p_ops.append(dist.P2POp(dist.irecv, recv.tensor, recv.src_rank, group=self.gloo_pg))
+            p2p_ops.append(
+                dist.P2POp(dist.irecv, recv.tensor, group=self.gloo_pg, group_peer=recv.src_rank)
+            )
 
         if p2p_ops:
             reqs = dist.batch_isend_irecv(p2p_ops)

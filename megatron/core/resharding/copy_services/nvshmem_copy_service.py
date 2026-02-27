@@ -17,12 +17,13 @@ logger = logging.getLogger(__name__)
 class NVSHMEMCopyService(CopyService):
     """CopyService implementation backed by NVSHMEM RemoteCopyService."""
 
-    def __init__(self):
+    def __init__(self, group=None):
         if not dist.is_initialized():
             raise RuntimeError("torch.distributed must be initialized before NVSHMEMCopyService()")
 
-        self.rank = dist.get_rank()
-        self._remote = RemoteCopyService()
+        self._group = group
+        self.rank = group.rank() if group is not None else dist.get_rank()
+        self._remote = RemoteCopyService(group=group)
         # Lazily initialized on first use to avoid side effects at import time
         self._initialized = False
 

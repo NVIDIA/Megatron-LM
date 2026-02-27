@@ -37,9 +37,11 @@ class NCCLCopyService(CopyService):
     a batch of point-to-point sends and recvs.
     """
 
-    def __init__(self):
-        self.rank = dist.get_rank()
-        self.world_size = dist.get_world_size()
+    def __init__(self, group=None):
+        self.group = group
+        # Use group.rank()/size() to support cross-cluster ProcessGroups
+        self.rank = group.rank() if group is not None else dist.get_rank()
+        self.world_size = group.size() if group is not None else dist.get_world_size()
         self.send_ops: List[SendOp] = []
         self.recv_ops: List[RecvOp] = []
         # Dedicated stream for local (same-rank) copies to avoid unnecessary
@@ -111,9 +113,9 @@ class NCCLCopyService(CopyService):
 
         p2p_ops = []
         for op in remote_sends:
-            p2p_ops.append(dist.P2POp(dist.isend, op.tensor, op.dest_rank))
+            p2p_ops.append(dist.P2POp(dist.isend, op.tensor, op.dest_rank, group=self.group))
         for op in remote_recvs:
-            p2p_ops.append(dist.P2POp(dist.irecv, op.tensor, op.src_rank))
+            p2p_ops.append(dist.P2POp(dist.irecv, op.tensor, op.src_rank, group=self.group))
 
         if p2p_ops:
             reqs = dist.batch_isend_irecv(p2p_ops)

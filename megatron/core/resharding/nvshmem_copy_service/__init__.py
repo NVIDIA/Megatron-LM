@@ -8,6 +8,10 @@ This package is an in-tree integration of the standalone
 can use it without relying on an external library.
 """
 
+from .compat import ensure_nvshmem_compat
+
+ensure_nvshmem_compat()
+
 from . import nvshmem_types
 from .core import GPUResourceManager, KernelLauncher, PipelineExecutor
 from .memory import DoubleBufferManager, TensorPointerExtractor
