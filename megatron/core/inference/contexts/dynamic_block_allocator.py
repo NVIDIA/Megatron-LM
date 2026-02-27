@@ -6,6 +6,8 @@ from typing import Dict, Optional
 import torch
 from torch import Tensor
 
+from megatron.core.inference.config import PrefixCachingEvictionPolicy
+
 
 class BlockAllocator:
     """Allocator that manages blocks of memory for the KV cache.
@@ -28,12 +30,12 @@ class BlockAllocator:
         total_count: int,
         paused_count: int,
         enable_prefix_caching: bool = False,
-        block_evict_lru: bool = False,
+        prefix_caching_eviction_policy: PrefixCachingEvictionPolicy = PrefixCachingEvictionPolicy.REF_ZERO,
     ):
 
         self.context = context
         self.enable_prefix_caching = enable_prefix_caching
-        self.block_evict_lru = block_evict_lru
+        self.prefix_caching_eviction_policy = prefix_caching_eviction_policy
 
         self.total_count = total_count
         self.total_avail = total_count - 1  # -1 for dummy_block_idx (see below)
@@ -63,7 +65,7 @@ class BlockAllocator:
 
             # LRU timestamps for eviction ordering (higher = more recently used)
             # Only needed in LRU mode; RZ mode evicts immediately on ref_count==0
-            if self.block_evict_lru:
+            if self.prefix_caching_eviction_policy == PrefixCachingEvictionPolicy.LRU:
                 self.block_timestamps = torch.zeros(
                     (self.total_count,), dtype=torch.int64, device=torch.cuda.current_device()
                 )
@@ -119,7 +121,7 @@ class BlockAllocator:
             return True
         if not self.enable_prefix_caching:
             return False
-        if not self.block_evict_lru:
+        if self.prefix_caching_eviction_policy == PrefixCachingEvictionPolicy.REF_ZERO:
             return False  # RZ: no cached blocks to evict
         # Also count evictable cached blocks
         evictable_count = self.get_evictable_block_count()
@@ -138,7 +140,7 @@ class BlockAllocator:
         """
         # Try to evict cached blocks if free pool is insufficient
         if self.total_avail < num_blocks:
-            if not self.enable_prefix_caching or not self.block_evict_lru:
+            if not self.enable_prefix_caching or self.prefix_caching_eviction_policy == PrefixCachingEvictionPolicy.REF_ZERO:
                 return None  # RZ: no eviction path; disabled: no cached blocks
             blocks_needed_from_eviction = num_blocks - self.total_avail
             if not self.evict_lru_blocks(blocks_needed_from_eviction):
@@ -152,7 +154,7 @@ class BlockAllocator:
         if self.enable_prefix_caching:
             # Initialize ref counts for newly allocated blocks
             self.block_ref_counts[block_ids] = 1
-            if self.block_evict_lru:
+            if self.prefix_caching_eviction_policy == PrefixCachingEvictionPolicy.LRU:
                 self.update_timestamps(block_ids)
 
         return block_ids
@@ -174,7 +176,7 @@ class BlockAllocator:
 
         if self.enable_prefix_caching:
             self.block_ref_counts[blocks] -= 1
-            if not self.block_evict_lru:
+            if self.prefix_caching_eviction_policy == PrefixCachingEvictionPolicy.REF_ZERO:
                 zero_mask = self.block_ref_counts[blocks] == 0
                 if zero_mask.any():
                     self._deregister_blocks(blocks[zero_mask])
@@ -211,7 +213,7 @@ class BlockAllocator:
             # Reset prefix caching state
             self.hash_to_block_id.clear()
             self.block_ref_counts.fill_(0)
-            if self.block_evict_lru:
+            if self.prefix_caching_eviction_policy == PrefixCachingEvictionPolicy.LRU:
                 self.block_timestamps.fill_(0)
 
     # =========================================================================
@@ -257,7 +259,7 @@ class BlockAllocator:
         # Reset block state (batched tensor ops)
         self.block_hashes[block_ids] = -1
         self.block_ref_counts[block_ids] = 0
-        if self.block_evict_lru:
+        if self.prefix_caching_eviction_policy == PrefixCachingEvictionPolicy.LRU:
             self.block_timestamps[block_ids] = 0
 
         # Return blocks to free pool
@@ -270,7 +272,7 @@ class BlockAllocator:
         Args:
             block_ids: Tensor of block IDs that were accessed.
         """
-        if not self.block_evict_lru or block_ids.numel() == 0:
+        if self.prefix_caching_eviction_policy != PrefixCachingEvictionPolicy.LRU or block_ids.numel() == 0:
             return
         self.block_timestamps[block_ids] = self.context.step_count
 
