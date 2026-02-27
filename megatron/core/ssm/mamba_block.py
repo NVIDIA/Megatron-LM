@@ -155,9 +155,11 @@ class MambaStack(GraphableMegatronModule, MegatronModule):
                     layer = build_module(
                         submodules.gdn_layer,
                         config=self.config,
-                        layer_number=i + 1,
+                        layer_number=layer_number,
                         pg_collection=pg_collection,
                         is_mtp_layer=is_mtp_layer,
+                        add_layer_offset=False,
+                        pp_layer_offset=pp_layer_offset,
                     )
                 else:
                     assert False, "unexpected layer_type"
