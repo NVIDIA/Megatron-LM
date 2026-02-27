@@ -1,9 +1,5 @@
 [
     {
-        "user": "janEbert",
-        "date": "2026-02-18"
-    },
-    {
         "user": "asolergi-nv",
         "date": "2026-02-25"
     },
@@ -28,23 +24,27 @@
         "date": "2026-04-01"
     },
     {
-        "user": "maanug-nv",
+        "user": "ilml",
         "date": "2026-04-08"
     },
     {
-        "user": "BoxiangW",
+        "user": "Phlip79",
         "date": "2026-04-15"
     },
     {
-        "user": "Phlip79",
+        "user": "asolergi-nv",
         "date": "2026-04-22"
     },
     {
-        "user": "asolergi-nv",
+        "user": "BoxiangW",
         "date": "2026-04-29"
     },
     {
-        "user": "dimapihtar",
+        "user": "maanug-nv",
         "date": "2026-05-06"
+    },
+    {
+        "user": "dimapihtar",
+        "date": "2026-05-13"
     }
 ]

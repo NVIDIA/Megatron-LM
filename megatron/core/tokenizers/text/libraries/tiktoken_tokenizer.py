@@ -17,16 +17,15 @@ from .chat_template import MegatronTokenizerChatTemplate
 
 logger = logging.getLogger(__name__)
 
-PATTERN_TIKTOKEN_V1 = (
+_PATTERN_TIKTOKEN_V1 = (
     r"[^\r\n\p{L}\p{N}]?+\p{L}+|\p{N}| ?[^\s\p{L}\p{N}]++[\r\n]*|\s*[\r\n]|\s+(?!\S)|\s+"
 )
-PATTERN_TIKTOKEN_V2 = "[^\\r\\n\\p{L}\\p{N}]?[\\p{Lu}\\p{Lt}\\p{Lm}\\p{Lo}\\p{M}]*[\\p{Ll}\\p{Lm}\\p{Lo}\\p{M}]+|[^\\r\\n\\p{L}\\p{N}]?[\\p{Lu}\\p{Lt}\\p{Lm}\\p{Lo}\\p{M}]+[\\p{Ll}\\p{Lm}\\p{Lo}\\p{M}]*|\\p{N}| ?[^\\s\\p{L}\\p{N}]+[\\r\\n/]*|\\s*[\\r\\n]+|\\s+(?!\\S)|\\s+"  # pylint: disable=line-too-long
+_PATTERN_TIKTOKEN_V2 = "[^\\r\\n\\p{L}\\p{N}]?[\\p{Lu}\\p{Lt}\\p{Lm}\\p{Lo}\\p{M}]*[\\p{Ll}\\p{Lm}\\p{Lo}\\p{M}]+|[^\\r\\n\\p{L}\\p{N}]?[\\p{Lu}\\p{Lt}\\p{Lm}\\p{Lo}\\p{M}]+[\\p{Ll}\\p{Lm}\\p{Lo}\\p{M}]*|\\p{N}| ?[^\\s\\p{L}\\p{N}]+[\\r\\n/]*|\\s*[\\r\\n]+|\\s+(?!\\S)|\\s+"  # pylint: disable=line-too-long
 DEFAULT_TIKTOKEN_MAX_VOCAB = 2**17  # 131072
 SPECIAL_TOKENS = ["<unk>", "<s>", "</s>", "<mask>", "<pad>", "<cls>", "<sep>"]
 SPECIAL_TOKEN_TEMPLATE = "<SPECIAL_{id}>"
 
-
-logger = logging.getLogger(__name__)
+__all__ = ["TikTokenTokenizer", "reload_mergeable_ranks"]
 
 
 def reload_mergeable_ranks(
@@ -103,9 +102,9 @@ class TikTokenTokenizer(MegatronTokenizerTextAbstract, MegatronTokenizerChatTemp
             special_tokens = SPECIAL_TOKENS.copy()
 
         if pattern == "v1":
-            pattern = PATTERN_TIKTOKEN_V1
+            pattern = _PATTERN_TIKTOKEN_V1
         elif pattern == "v2":
-            pattern = PATTERN_TIKTOKEN_V2
+            pattern = _PATTERN_TIKTOKEN_V2
         else:
             raise ValueError(f"Expected tiktoken pattern to be `v1` or `v2`, but got {pattern}.")
 
