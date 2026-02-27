@@ -294,6 +294,25 @@ class TestVppSimulatorBasic:
             fake_create_model
         )
 
+    @pytest.fixture
+    def mock_performance_analysis(self, monkeypatch):
+        """Mock analyze_global_batch to skip performance analysis in tests"""
+
+        def fake_analyze_global_batch(self, load_from_dir=None):
+            """
+            No-op replacement for analyze_global_batch
+
+            The test only needs to verify scheduling logic works correctly,
+            not to compute actual performance metrics (TFLOPs, throughput, etc.)
+            """
+            pass
+
+        # Patch the analyze_global_batch method on VppSimulator class
+        monkeypatch.setattr(
+            'megatron.training.simulation.vpp_simulate.VppSimulator.analyze_global_batch',
+            fake_analyze_global_batch
+        )
+
     @pytest.mark.parametrize("pp_size,vpp_size,num_microbatches", [
         (1, None, 4),   # No Pipeline
         (2, None, 4),   # 2-stage Pipeline
@@ -312,6 +331,7 @@ class TestVppSimulatorBasic:
         forward_step_func,
         mock_execute_functions,
         mock_model_creation,
+        mock_performance_analysis,
         monkeypatch
     ):
         """Test that run_global_step completes successfully under different PP/VPP configs"""
