@@ -386,5 +386,7 @@ class MixedPrecisionPolicy:
       depending on the network domain (NVLink or IB), and can enable mixed-precision
       communication and accumulation, e.g. setting grad_comm_dtype to BF16 can support
       FP32 reduction even though we have BF16 input and output communication buffers.
-      If set to None, the main_grads_dtype is used. Defaults to torch.float32.
+      If set to None, the main_grads_dtype is used. Defaults to torch.float32. If using
+      `no_shard`, `optim`, or a `FixedPoolAllocator` (`fsdp_double_buffer`), allocating
+      `dtype`-custom gradient communication buffers (per FSDP group) adds memory overhead.
     """
