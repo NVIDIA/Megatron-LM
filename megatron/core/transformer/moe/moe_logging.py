@@ -6,10 +6,10 @@ Collects per-layer MoE metrics during forward passes, synchronizes them across
 distributed ranks, and writes scalar summaries to TensorBoard / W&B.
 
 Usage:
-    tracker = MoEMetricsTracker.get_instance()
+    tracker = MoEMetricsTracker(num_layers=32, moe_layer_freq=2)
 
     # In router forward pass:
-    tracker.record("load_balancing_loss", loss, layer_number=1, num_layers=32,
+    tracker.record("load_balancing_loss", loss, layer_number=1,
                    reduce_group=tp_cp_group)
 
     # At end of training step:
@@ -17,7 +17,6 @@ Usage:
         loss_scale=1 / num_microbatches,
         iteration=step,
         writer=tb_writer,
-        num_layers=32,
     )
 """
 
@@ -41,28 +40,48 @@ class MetricEntry:
 
 
 class MoEMetricsTracker:
-    """Singleton tracker for MoE layer-wise metrics.
+    """Tracker for MoE layer-wise metrics.
 
     Lifecycle: ``record()`` per-layer values during forward → ``report()`` at
     step end (sync, aggregate, log, clear) → repeat.
 
     Example:
-        tracker = MoEMetricsTracker.get_instance()
-        tracker.record("load_balancing_loss", loss, layer_number=1, num_layers=32)
-        log_str = tracker.report(loss_scale=1/8, iteration=100, writer=tb_writer,
-                                 num_layers=32)
+        tracker = MoEMetricsTracker(num_layers=32, moe_layer_freq=2)
+        tracker.record("load_balancing_loss", loss, layer_number=1)
+        log_str = tracker.report(loss_scale=1/8, iteration=100, writer=tb_writer)
     """
 
     _instance: ClassVar[Optional['MoEMetricsTracker']] = None
 
-    def __init__(self):
+    def __init__(
+        self,
+        num_layers: Optional[int] = None,
+        moe_layer_freq: Optional[Union[int, List[int]]] = None,
+        mtp_num_layers: Optional[int] = None,
+    ):
         self._metrics: Dict[str, MetricEntry] = {}
+        self.num_layers = num_layers
+        self.moe_layer_freq = moe_layer_freq
+        self.mtp_num_layers = mtp_num_layers
 
     @classmethod
-    def get_instance(cls) -> 'MoEMetricsTracker':
-        """Get or create the singleton instance."""
+    def get_instance(
+        cls,
+        num_layers: Optional[int] = None,
+        moe_layer_freq: Optional[Union[int, List[int]]] = None,
+        mtp_num_layers: Optional[int] = None,
+    ) -> 'MoEMetricsTracker':
+        """Get or create the singleton instance.
+
+        On first call, creates the instance with the given config.
+        Subsequent calls return the existing instance (arguments are ignored).
+        """
         if cls._instance is None:
-            cls._instance = cls()
+            assert num_layers is not None, (
+                "MoEMetricsTracker singleton has not been created yet. "
+                "First call must provide num_layers."
+            )
+            cls._instance = cls(num_layers, moe_layer_freq, mtp_num_layers)
         return cls._instance
 
     # =========================================================================
@@ -79,7 +98,6 @@ class MoEMetricsTracker:
         name: str,
         value: torch.Tensor,
         layer_number: int,
-        num_layers: int,
         reduce_group: Optional[torch.distributed.ProcessGroup] = None,
         avg_group: Optional[torch.distributed.ProcessGroup] = None,
         needs_dp_avg: bool = True,
@@ -93,7 +111,6 @@ class MoEMetricsTracker:
             name: Metric name (e.g. ``"load_balancing_loss"``).
             value: Scalar tensor to accumulate (will be detached).
             layer_number: 1-based layer index.
-            num_layers: Total number of layers (determines tensor size).
             reduce_group: Process group for sum-reduction (e.g. tp_cp_group).
             avg_group: Process group for average-reduction.
             needs_dp_avg: Whether to average across DP ranks after other reductions.
@@ -102,7 +119,9 @@ class MoEMetricsTracker:
             return
 
         if name not in self._metrics:
-            self._metrics[name] = MetricEntry(values=torch.zeros(num_layers, device=value.device))
+            self._metrics[name] = MetricEntry(
+                values=torch.zeros(self._total_layers, device=value.device)
+            )
 
         entry = self._metrics[name]
         entry.values[layer_number - 1] += value.detach()
@@ -119,10 +138,8 @@ class MoEMetricsTracker:
         per_layer_logging: bool = False,
         force_initialize: bool = False,
         track_names: Optional[Union[str, List[str]]] = None,
-        num_layers: Optional[int] = None,
-        moe_layer_freq: Optional[Union[int, List[int]]] = None,
-        mtp_num_layers: Optional[int] = None,
-        total_loss_dict: Optional[dict[str, torch.Tensor]] = None,
+        num_moe_layers_override: Optional[int] = None,
+        total_loss_dict: Optional[Dict[str, torch.Tensor]] = None,
         percentiles: Optional[Dict[str, List[float]]] = None,
         pg_collection: Optional[ProcessGroupCollection] = None,
     ) -> str:
@@ -143,14 +160,15 @@ class MoEMetricsTracker:
                 that don't exist yet.  Required for PP ranks without MoE layers
                 whose tensor sizes must match ranks that do have MoE layers.
             track_names: Metric name(s) to report.  ``None`` reports all.
-            num_layers: Total transformer layers (required when *force_initialize*).
-            moe_layer_freq: MoE layer frequency or binary pattern list.
-            mtp_num_layers: Extra layers from Multi-Token Prediction.
+            num_moe_layers_override: Direct override for the MoE layer count
+                used as the aggregation denominator.  When set,
+                ``_count_moe_layers()`` is skipped.  Useful for hybrid models
+                where only a subset of layers (e.g. ``'E'`` layers) are MoE.
             total_loss_dict: Megatron training-loop accumulator.  Metrics
                 ending with ``"loss"`` are accumulated here and excluded from
                 the returned console log string.
             percentiles: Per-metric percentiles to compute, e.g.
-                ``{"load_imbalance": [0.5, 0.95]}``.
+                ``{"aux_loss": [0.5, 0.95]}``.
             pg_collection: Custom process-group collection for reduction.
 
         Returns:
@@ -158,19 +176,17 @@ class MoEMetricsTracker:
         """
         metric_names = self._resolve_names(track_names)
 
-        # Pre-create entries on PP ranks that lack MoE layers.
-        # Tensor size must be (num_layers + mtp_num_layers) to match ranks that
-        # recorded via record(), otherwise all_reduce across PP will hang.
         if force_initialize:
-            if num_layers is None:
-                raise ValueError("num_layers must be provided when force_initialize=True.")
-            init_size = num_layers + (mtp_num_layers or 0)
+            init_size = (self.num_layers or 0) + (self.mtp_num_layers or 0)
             for name in metric_names:
                 self.ensure_initialized(name, init_size)
 
         self._sync_metrics(metric_names, pg_collection)
 
-        num_moe_layers = self._count_moe_layers(num_layers, moe_layer_freq, mtp_num_layers)
+        if num_moe_layers_override is not None:
+            num_moe_layers = num_moe_layers_override
+        else:
+            num_moe_layers = self._count_moe_layers()
         scalars = self._aggregate(loss_scale, num_moe_layers, metric_names, percentiles)
 
         # Megatron integration: accumulate loss metrics into total_loss_dict
@@ -221,6 +237,31 @@ class MoEMetricsTracker:
     # Private implementation
     # =========================================================================
 
+    @property
+    def _total_layers(self) -> int:
+        """Total layer count including MTP layers, used for tensor sizing."""
+        n = self.num_layers or 0
+        if self.mtp_num_layers is not None:
+            n += self.mtp_num_layers
+        return n
+
+    def _count_moe_layers(self) -> int:
+        """Compute the effective number of MoE layers from instance config."""
+        num_layers = self.num_layers or 0
+
+        if self.moe_layer_freq is None:
+            n = num_layers
+        elif isinstance(self.moe_layer_freq, int):
+            n = sum(1 for i in range(num_layers) if i % self.moe_layer_freq == 0)
+        elif isinstance(self.moe_layer_freq, list):
+            n = sum(self.moe_layer_freq)
+        else:
+            raise ValueError(f"Invalid moe_layer_freq: {self.moe_layer_freq}")
+
+        if self.mtp_num_layers is not None:
+            n += self.mtp_num_layers
+        return n
+
     def _resolve_names(self, track_names: Optional[Union[str, List[str]]]) -> List[str]:
         """Normalize *track_names* argument to a list of strings."""
         if track_names is None:
@@ -264,28 +305,6 @@ class MoEMetricsTracker:
 
             if entry.needs_dp_avg:
                 torch.distributed.all_reduce(v, group=dp_group, op=torch.distributed.ReduceOp.AVG)
-
-    @staticmethod
-    def _count_moe_layers(
-        num_layers: Optional[int],
-        moe_layer_freq: Optional[Union[int, List[int]]],
-        mtp_num_layers: Optional[int],
-    ) -> int:
-        """Compute the effective number of MoE layers from configuration."""
-        if moe_layer_freq is None:
-            n = num_layers
-        elif isinstance(moe_layer_freq, int):
-            assert isinstance(num_layers, int)
-            n = sum(1 for i in range(num_layers) if i % moe_layer_freq == 0)
-        elif isinstance(moe_layer_freq, list):
-            n = sum(moe_layer_freq)
-        else:
-            raise ValueError(f"Invalid moe_layer_freq: {moe_layer_freq}")
-
-        if mtp_num_layers is not None:
-            n += mtp_num_layers
-
-        return n
 
     def _aggregate(
         self,

@@ -918,7 +918,7 @@ def save_to_aux_losses_tracker(
     name: str,
     loss: torch.Tensor,
     layer_number: int,
-    num_layers: int,
+    num_layers: Optional[int] = None,
     reduce_group: Optional[torch.distributed.ProcessGroup] = None,
     avg_group: Optional[torch.distributed.ProcessGroup] = None,
     needs_dp_avg: bool = True,
@@ -928,7 +928,7 @@ def save_to_aux_losses_tracker(
         name (str): The name of the loss.
         loss (torch.Tensor): The loss tensor.
         layer_number (int): Layer index of the loss.
-        num_layers (int): The number of total layers.
+        num_layers (int): Deprecated, ignored. Kept for backward compatibility.
         reduce_group (torch.distributed.ProcessGroup, optional): The group for reducing the loss.
             Defaults to None.
         avg_group (torch.distributed.ProcessGroup, optional): The group for averaging the loss.
@@ -940,7 +940,6 @@ def save_to_aux_losses_tracker(
         name=name,
         value=loss,
         layer_number=layer_number,
-        num_layers=num_layers,
         reduce_group=reduce_group,
         avg_group=avg_group,
         needs_dp_avg=needs_dp_avg,
@@ -1013,6 +1012,24 @@ def track_moe_metrics(
 
     Deprecated: Use MoEMetricsTracker.get_instance().report() directly.
     """
+    # Backward compatibility: the old report() accepted num_layers / moe_layer_freq /
+    # mtp_num_layers separately. Replicate the old _count_moe_layers logic here so
+    # callers of this deprecated wrapper get the same aggregation denominator.
+    num_moe_layers_override = None
+    if num_layers is not None or moe_layer_freq is not None or mtp_num_layers is not None:
+        if moe_layer_freq is None:
+            num_moe_layers_override = num_layers
+        elif isinstance(moe_layer_freq, int):
+            assert isinstance(num_layers, int), "num_layers must be set when moe_layer_freq is int."
+            num_moe_layers_override = sum(1 for i in range(num_layers) if i % moe_layer_freq == 0)
+        elif isinstance(moe_layer_freq, list):
+            num_moe_layers_override = sum(moe_layer_freq)
+        else:
+            raise ValueError(f"Invalid moe_layer_freq: {moe_layer_freq}")
+
+        if num_moe_layers_override is not None and mtp_num_layers is not None:
+            num_moe_layers_override += mtp_num_layers
+
     return MoEMetricsTracker.get_instance().report(
         loss_scale=loss_scale,
         iteration=iteration,
@@ -1021,9 +1038,7 @@ def track_moe_metrics(
         per_layer_logging=per_layer_logging,
         force_initialize=force_initialize,
         track_names=track_names,
-        num_layers=num_layers,
-        moe_layer_freq=moe_layer_freq,
-        mtp_num_layers=mtp_num_layers,
+        num_moe_layers_override=num_moe_layers_override,
         pg_collection=pg_collection,
         total_loss_dict=total_loss_dict,
     )

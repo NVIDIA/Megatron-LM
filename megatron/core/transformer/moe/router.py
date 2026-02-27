@@ -456,14 +456,6 @@ class TopKRouter(Router):
         ):
             aux_loss = aux_loss / self.config.mtp_num_layers
 
-        # TODO (zijiey): fix the per_layer_logging for MTP, currently it will incorrectly
-        # add the aux loss logging value to other layer's since it is difficult to get the
-        # correct layer_number for MTP. It does not affect the correctness of the calculation
-        # results and the reduced load_balancing_loss logging value.
-        num_layers = self.config.num_layers
-        if self.config.mtp_num_layers is not None:
-            num_layers += self.config.mtp_num_layers
-
         if self.is_mtp_layer:
             layer_number = self.layer_number + self.config.num_layers
         else:
@@ -473,7 +465,6 @@ class TopKRouter(Router):
             aux_loss_name,
             aux_loss / aux_loss_coeff,
             layer_number,
-            num_layers,
             reduce_group=reduce_group,
             needs_dp_avg=needs_dp_avg,
         )
@@ -533,17 +524,13 @@ class TopKRouter(Router):
             ):
                 z_loss = z_loss / self.config.mtp_num_layers
 
-            num_layers = self.config.num_layers
-            if self.config.mtp_num_layers is not None:
-                num_layers += self.config.mtp_num_layers
-
             if self.is_mtp_layer:
                 layer_number = self.layer_number + self.config.num_layers
             else:
                 layer_number = self.layer_number
 
             self.config.moe_metrics_tracker.record(
-                "z_loss", z_loss / moe_z_loss_coeff, layer_number, num_layers
+                "z_loss", z_loss / moe_z_loss_coeff, layer_number
             )
         return logits
 
