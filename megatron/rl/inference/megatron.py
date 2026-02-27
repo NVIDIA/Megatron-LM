@@ -134,7 +134,7 @@ class MegatronLocal(InferenceServer, ReturnsTokens, ReturnsRaw):
             base_url=f"http://{kwargs['host']}:{kwargs['port']}",
             api_key="NONE",
             timeout=timeout,
-            max_retries=5,
+            max_retries=0,
             http_client=httpx.AsyncClient(
                 timeout=timeout,
                 http2=use_http2,
