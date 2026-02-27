@@ -30,7 +30,7 @@ from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.typed_torch import apply_module
 from megatron.core.utils import internal_api
 from megatron.core.transformer.moe.token_dispatcher_inference import (
-    InferenceAllGatherTokenDispatcher,
+    InferenceCUDAGraphTokenDispatcher,
 )
 try:
     import flashinfer
@@ -283,7 +283,7 @@ class MoELayer(BaseMoELayer):
         """Set up inference-optimized token dispatcher and state.
 
         Called from __init__ when config.transformer_impl == "inference_optimized".
-        Creates an InferenceAllGatherTokenDispatcher alongside the standard dispatcher,
+        Creates an InferenceCUDAGraphTokenDispatcher alongside the standard dispatcher,
         which is swapped in during CUDA-graphed forward passes.
         """
         
@@ -292,7 +292,7 @@ class MoELayer(BaseMoELayer):
             f"got '{self.config.moe_token_dispatcher_type}'"
         )
         self.is_inference_cuda_graphed_iteration = False
-        self._inference_token_dispatcher = InferenceAllGatherTokenDispatcher(
+        self._inference_token_dispatcher = InferenceCUDAGraphTokenDispatcher(
             self.num_local_experts,
             self.local_expert_indices,
             config=self.config,

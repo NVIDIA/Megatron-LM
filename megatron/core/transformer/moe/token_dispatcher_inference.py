@@ -1,10 +1,11 @@
 # Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
 """
-Inference-optimized AlltoAll Token Dispatcher with GPU-resident metadata.
+CUDA-graph-compatible token dispatcher for inference.
 
-This implementation keeps tokens_per_expert GPU-resident to enable use of
-torch._grouped_mm without host synchronization.
+This dispatcher is only used during CUDA-graphed inference iterations. It replaces
+AlltoAll with AllGather/ReduceScatter for token exchange, keeping all metadata
+GPU-resident to avoid host synchronizations that would break CUDA graph capture.
 
 Supports latency-optimized NVLS collectives (multimem all-gather/reduce-scatter)
 on Hopper+ GPUs with BF16, with automatic fallback to NCCL via superclass methods.
@@ -27,17 +28,18 @@ from megatron.core.inference.communication.torch_symm_triton import (
     multimem_reduce_scatter,
 )
 
-class InferenceAllGatherTokenDispatcher(MoEAllGatherTokenDispatcher):
+class InferenceCUDAGraphTokenDispatcher(MoEAllGatherTokenDispatcher):
     """
-    Inference-optimized AllGather token dispatcher.
+    CUDA-graph-compatible AllGather token dispatcher for inference.
 
-    This dispatcher uses AllGather instead of AlltoAll for token exchange,
-    which can be simpler and more efficient for certain configurations.
+    Only used during CUDA-graphed inference iterations. Swapped in by
+    MoELayer.set_is_inference_cuda_graphed_iteration() before graph capture
+    and swapped out after.
 
     Key features:
-    - Simpler communication pattern (AllGather vs AlltoAll)
-    - GPU-resident metadata for CUDA graph compatibility
-    - Assumes tp_size == 1 (no tensor parallelism within experts)
+    - AllGather/ReduceScatter instead of AlltoAll for CUDA graph compatibility
+    - GPU-resident metadata (no host synchronization)
+    - NVLS collectives on Hopper+ with automatic NCCL fallback
     """
 
     def __init__(
