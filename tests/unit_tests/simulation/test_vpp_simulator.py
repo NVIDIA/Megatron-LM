@@ -336,15 +336,7 @@ class TestVppSimulatorBasic:
     ):
         """Test that run_global_step completes successfully under different PP/VPP configs"""
 
-        # 1. Re-initialize parallel_state with the correct PP/VPP sizes for this test
-        Utils.destroy_model_parallel()
-        Utils.initialize_model_parallel(
-            tensor_model_parallel_size=1,
-            pipeline_model_parallel_size=pp_size,
-            virtual_pipeline_model_parallel_size=vpp_size
-        )
-
-        # 2. Configure args for this test
+        # 1. Configure args for this test
         mock_args.pipeline_model_parallel_size = pp_size
         mock_args.virtual_pipeline_model_parallel_size = vpp_size
         mock_args.global_batch_size = num_microbatches * mock_args.micro_batch_size
@@ -423,6 +415,20 @@ class TestVppSimulatorBasic:
         mock_args.pipeline_model_parallel_layout = PipelineParallelLayerLayout(
             layout=layout_str,
             pipeline_model_parallel_size=pp_size
+        )
+
+        # 2. Mock parallel_state to return correct VPP size
+        # VppSimulator uses parallel_state.get_virtual_pipeline_model_parallel_world_size()
+        # to determine num_model_chunks, but in single-process test environment it returns None
+        from megatron.core import parallel_state
+        original_get_vpp_size = parallel_state.get_virtual_pipeline_model_parallel_world_size
+
+        def mock_get_vpp_size():
+            return vpp_size
+
+        monkeypatch.setattr(
+            'megatron.core.parallel_state.get_virtual_pipeline_model_parallel_world_size',
+            mock_get_vpp_size
         )
 
         # 3. Set global args and initialize num_microbatches_calculator
