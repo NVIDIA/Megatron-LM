@@ -1024,7 +1024,7 @@ def track_moe_metrics(
         wandb_writer=wandb_writer,
         per_layer_logging=per_layer_logging,
         force_initialize=force_initialize,
-        names=track_names,
+        track_names=track_names,
         num_layers=num_layers,
         moe_layer_freq=moe_layer_freq,
         mtp_num_layers=mtp_num_layers,

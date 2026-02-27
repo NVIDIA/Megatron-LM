@@ -118,7 +118,7 @@ class MoEMetricsTracker:
         wandb_writer=None,
         per_layer_logging: bool = False,
         force_initialize: bool = False,
-        names: Optional[Union[str, List[str]]] = None,
+        track_names: Optional[Union[str, List[str]]] = None,
         num_layers: Optional[int] = None,
         moe_layer_freq: Optional[Union[int, List[int]]] = None,
         mtp_num_layers: Optional[int] = None,
@@ -139,15 +139,15 @@ class MoEMetricsTracker:
             writer: TensorBoard ``SummaryWriter`` (optional).
             wandb_writer: Weights & Biases run object (optional).
             per_layer_logging: Whether to also write per-layer values.
-            force_initialize: If True, pre-create metric entries for *names*
+            force_initialize: If True, pre-create metric entries for *track_names*
                 that don't exist yet.  Required for PP ranks without MoE layers
                 whose tensor sizes must match ranks that do have MoE layers.
-            names: Metric name(s) to report.  ``None`` reports all.
+            track_names: Metric name(s) to report.  ``None`` reports all.
             num_layers: Total transformer layers (required when *force_initialize*).
             moe_layer_freq: MoE layer frequency or binary pattern list.
             mtp_num_layers: Extra layers from Multi-Token Prediction.
             total_loss_dict: Megatron training-loop accumulator.  Metrics whose
-                names end with ``"loss"`` are accumulated here and excluded from
+                metrics ending with ``"loss"`` are accumulated here and excluded from
                 the returned console log string.
             percentiles: Per-metric percentiles to compute, e.g.
                 ``{"load_imbalance": [0.5, 0.95]}``.
@@ -156,7 +156,7 @@ class MoEMetricsTracker:
         Returns:
             Formatted log string for console output.
         """
-        names_list = self._resolve_names(names)
+        names_list = self._resolve_names(track_names)
 
         # Pre-create entries on PP ranks that lack MoE layers.
         # Tensor size must be (num_layers + mtp_num_layers) to match ranks that
@@ -221,13 +221,13 @@ class MoEMetricsTracker:
     # Private implementation
     # =========================================================================
 
-    def _resolve_names(self, names: Optional[Union[str, List[str]]]) -> List[str]:
-        """Normalize *names* argument to a list of strings."""
-        if names is None:
+    def _resolve_names(self, track_names: Optional[Union[str, List[str]]]) -> List[str]:
+        """Normalize *track_names* argument to a list of strings."""
+        if track_names is None:
             return list(self._metrics.keys())
-        if isinstance(names, str):
-            return [names]
-        return names
+        if isinstance(track_names, str):
+            return [track_names]
+        return track_names
 
     def _sync_metrics(
         self, names: List[str], pg_collection: Optional[ProcessGroupCollection] = None

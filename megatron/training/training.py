@@ -2061,7 +2061,7 @@ def training_log(
             wandb_writer=wandb_writer,
             per_layer_logging=args.moe_per_layer_logging,
             force_initialize=True,
-            names=track_names,
+            track_names=track_names,
             num_layers=layers,
             moe_layer_freq=args.moe_layer_freq,
             mtp_num_layers=args.mtp_num_layers,

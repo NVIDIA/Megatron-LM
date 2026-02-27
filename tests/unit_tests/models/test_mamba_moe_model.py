@@ -163,6 +163,7 @@ GOLDEN_CONFIG: Dict[str, Any] = {
     "moe_latent_size": None,
     "moe_layer_freq": 1,
     "moe_layer_recompute": False,
+    "moe_metrics_tracker": None,
     "moe_pad_expert_input_to_capacity": False,
     "moe_pad_experts_for_cuda_graph_inference": False,
     "moe_per_layer_logging": False,
