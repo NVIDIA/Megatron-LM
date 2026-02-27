@@ -273,18 +273,46 @@ class HybridCPDataLoaderWrapper:
         def _pack_tensors(tensors):
             return torch.cat([t.reshape(-1) for t in tensors], dim=0)
 
+        def mxfp8_pad_len(seq_len, local_cp_size):
+            # dim=0 should be divisible by 8
+            # Find padding required to make dim=0 divisible by 32 after sharding
+            # MXFP8 BLOCK_SIZE is 32
+            pad_granularity = 32
+            sharded_tensor_shape = seq_len // local_cp_size
+            mod_token_count = sharded_tensor_shape % pad_granularity
+            pad_len = 0
+            if mod_token_count != 0:
+                pad_len = (pad_granularity - mod_token_count) * local_cp_size
+                # tensor = torch.cat([tensor, torch.zeros(pad_len, dtype=tensor.dtype, device=tensor.device)])
+            
+            return pad_len
+
         # Get the padded lengths of all sub-samples being packed
         sample_padded_lens = torch.tensor([s["tokens"].shape[0] for s in samples], dtype=torch.int32)
-        # Create the cu_seqlens_padded tensor
-        cu_seqlens_padded = torch.empty(1, sample_padded_lens.numel() + 1, device=torch.cuda.current_device(), dtype=torch.int32)
-        cu_seqlens_padded[0, 0] = 0
-        cu_seqlens_padded[0, 1:] = torch.cumsum(sample_padded_lens, dim=0)
         max_seqlen = torch.max(sample_padded_lens).to(dtype=torch.int32)
 
         tokens = _pack_tensors([sample["tokens"] for sample in samples])
         labels = _pack_tensors([sample["labels"] for sample in samples])
         loss_mask = _pack_tensors([sample["loss_mask"] for sample in samples])
         position_ids = _pack_tensors([sample["position_ids"] for sample in samples])
+
+        # HACK:
+        mxfp8_enabled = True
+        if mxfp8_enabled:
+            pad_len = mxfp8_pad_len(tokens.shape[0], local_cp_size)
+            if pad_len > 0:
+                tokens = torch.cat([tokens, torch.zeros(pad_len, dtype=tokens.dtype, device=tokens.device)])
+                labels = torch.cat([labels, torch.zeros(pad_len, dtype=labels.dtype, device=labels.device)])
+                loss_mask = torch.cat([loss_mask, torch.zeros(pad_len, dtype=loss_mask.dtype, device=loss_mask.device)])
+                position_ids = torch.cat([position_ids, torch.zeros(pad_len, dtype=position_ids.dtype, device=position_ids.device)])
+                sample_padded_lens = torch.cat([sample_padded_lens, torch.tensor([pad_len], dtype=torch.int32, device=sample_padded_lens.device)])
+                # padded_length = cu_seqlens_padded[:, -1:] + pad_len
+                # cu_seqlens_padded = torch.cat([cu_seqlens_padded, cu_seqlens_padded[:, -1:] + pad_len], dim=1)
+        
+        # Create the cu_seqlens_padded tensor
+        cu_seqlens_padded = torch.empty(1, sample_padded_lens.numel() + 1, device=torch.cuda.current_device(), dtype=torch.int32)
+        cu_seqlens_padded[0, 0] = 0
+        cu_seqlens_padded[0, 1:] = torch.cumsum(sample_padded_lens, dim=0)
 
         new_sample = {}
         new_sample["tokens"] = tokens

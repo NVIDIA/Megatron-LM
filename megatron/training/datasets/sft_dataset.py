@@ -124,8 +124,12 @@ class SFTDataset(MegatronDataset):
             assert not self.config.reset_position_ids
             pack_positions.extend(range(len(tokens_list)))
 
+            pad_granularity = 1
             if self.config.context_parallel_size > 1:
-                pad_granularity = self.config.context_parallel_size * 2
+                pad_granularity *= self.config.context_parallel_size * 2
+            if self.config.sequence_parallel_size > 0:
+                pad_granularity *= self.config.sequence_parallel_size
+            if pad_granularity > 1:
                 mod_token_count = len(pack_tokens) % pad_granularity
                 if mod_token_count != 0:
                     pad_len = pad_granularity - mod_token_count
