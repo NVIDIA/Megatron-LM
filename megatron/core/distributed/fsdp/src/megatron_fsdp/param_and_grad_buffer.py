@@ -53,6 +53,7 @@ from .utils import (
     get_mcore_tensor_parallel_partition_dim,
     is_mcore_tensor_model_parallel,
     is_mcore_tensor_parallel_duplicated,
+    log_single_rank,
 )
 
 logger = logging.getLogger(__name__)
@@ -64,7 +65,7 @@ try:
         DistributedDataParallelConfig,
     )
     from megatron.core.tensor_parallel import get_cuda_rng_tracker
-    from megatron.core.utils import is_submodule, log_single_rank
+    from megatron.core.utils import is_submodule
 
     HAVE_MCORE = True
     logger.info("Detected Megatron Core, using Megatron-FSDP with Megatron.")
@@ -75,17 +76,6 @@ except ImportError:
     from .utils import get_cuda_rng_tracker, is_submodule
 
     HAVE_MCORE = False
-
-    def log_single_rank(
-        logger_: logging.Logger, level: int, msg: str, *args, rank: int = 0, **kwargs
-    ):
-        """Fallback log_single_rank when Megatron Core is not available."""
-        if torch.distributed.is_initialized():
-            if torch.distributed.get_rank() == rank:
-                logger_.log(level, msg, *args, **kwargs)
-        else:
-            logger_.log(level, msg, *args, **kwargs)
-
     logger.info("Megatron Core is not installed, Megatron-FSDP will run without Megatron Core.")
 
 try:

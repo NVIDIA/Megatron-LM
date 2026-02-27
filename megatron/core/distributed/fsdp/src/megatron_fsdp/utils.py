@@ -434,6 +434,32 @@ def get_cuda_rng_tracker(
     return _CUDA_RNG_STATE_TRACKER
 
 
+def safe_get_rank() -> int:
+    """Safely get the rank of the current process.
+
+    Returns the rank from torch.distributed if initialized, otherwise falls back
+    to the RANK environment variable, defaulting to 0.
+
+    Returns:
+        int: The rank of the current process.
+    """
+    if torch.distributed.is_initialized():
+        return torch.distributed.get_rank()
+
+    # If torch.distributed is not initialized, try to read environment variables.
+    try:
+        return int(os.environ.get("RANK", 0))
+    except (ValueError, TypeError):
+        # Return rank 0 regardless of the actual rank.
+        return 0
+
+
+def log_single_rank(logger_: logging.Logger, level: int, msg: str, *args, rank: int = 0, **kwargs):
+    """Log on a single rank."""
+    if safe_get_rank() == rank:
+        logger_.log(level, msg, *args, **kwargs)
+
+
 # TODO(@cspades): Migrate this to a new module: fsdp_dist_index.py.
 # Needs more visibility and is easily refactored / standalone.
 class FSDPDistributedIndex:

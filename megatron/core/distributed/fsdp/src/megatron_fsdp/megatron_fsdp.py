@@ -39,7 +39,7 @@ from .param_and_grad_buffer import (
     override_sharded_param_methods_with_safety_checks,
     to_local_if_dtensor,
 )
-from .utils import FSDPDistributedIndex
+from .utils import FSDPDistributedIndex, log_single_rank
 
 logger = logging.getLogger(__name__)
 
@@ -1111,14 +1111,16 @@ class MegatronFSDP(torch.nn.Module):
             # Will reduce gradient buffer data in-place across DP-Outer.
             or self.dist_index.use_hybrid_fsdp
         ):
-            logger.warning(
-                "[Megatron-FSDP.set_model_auto_sync()] Detected Megatron-FSDP "
+            log_single_rank(
+                logger_=logger,
+                level=logging.WARNING,
+                msg="[Megatron-FSDP.set_model_auto_sync()] Detected Megatron-FSDP "
                 "auto-synchronization with the 'no_shard' / 'optim' sharding "
                 "strategy for either FSDP (DP-Shard) or HSDP (DP-Outer). "
                 "`MegatronFSDP.zero_grad_buffer()` or `optimizer.zero_grad()` "
                 "must be invoked every forward-backward optimization cycle to "
                 "prevent successive in-place gradient buffer reductions from "
-                "corrupting previously accumulated gradients."
+                "corrupting previously accumulated gradients.",
             )
         self.model_auto_sync = sync_model
 
@@ -1151,7 +1153,8 @@ class MegatronFSDP(torch.nn.Module):
             main_params_dtype=self.mp_policy.main_params_dtype,
             main_grads_dtype=self.mp_policy.main_grads_dtype,
             # Gradient communication data-type can only be reset
-            # if symmetric buffers / NCCL UB are not used.
+            # if symmetric buffers / NCCL UB are not used, because
+            # inflates FixedPoolAllocator memory & breaks NCCL UBR.
             grad_comm_dtype=(
                 mixed_precision_policy.grad_comm_dtype
                 if self.ddp_config.fsdp_double_buffer
