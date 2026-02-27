@@ -1,5 +1,5 @@
 # Base image: NVIDIA PyTorch container with CUDA, cuDNN, NCCL, Python, and uv pre-installed
-FROM nvcr.io/nvidia/pytorch:25.11-py3
+FROM nvcr.io/nvidia/pytorch:25.12-py3
 
 # Install JRE for pycocoevalcap
 RUN apt-get update && \
@@ -16,7 +16,7 @@ RUN uv pip install --system --no-cache --break-system-packages \
     braceexpand \
     webdataset \
     packaging \
-    transformers \
+    "transformers<5.0.0" \
     datasets \
     accelerate \
     timm \
@@ -30,7 +30,7 @@ RUN uv pip install --system --no-cache --break-system-packages \
     isort \
     click \
     pycocoevalcap \
-    megatron-energon \
+    "megatron-energon[av_decode]~=6.0" \
     mistral-common \
     tiktoken \
     # Additional dependencies for megatron-core[mlm]
@@ -38,9 +38,10 @@ RUN uv pip install --system --no-cache --break-system-packages \
     wandb \
     bitstring \
     filetype
+    setuptools
 
 # Install CLIP from GitHub
-RUN uv pip install --system --no-cache --break-system-packages \
+RUN uv pip install --system --no-cache --break-system-packages --no-build-isolation \
     git+https://github.com/openai/CLIP.git
 
 # Install packages with --no-deps to avoid outdated and unnecessary dependencies

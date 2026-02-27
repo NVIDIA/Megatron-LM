@@ -704,7 +704,7 @@ class TestMultiTokenPredictionMamba:
     def model_provider(self, pre_process=True, post_process=True, **config_kwargs):
         """Model provider for Mamba hybrid models with MTP.
 
-        Uses the unified pattern syntax where MTP is configured via hybrid_override_pattern:
+        Uses the unified pattern syntax where MTP is configured via hybrid_layer_pattern:
         Format: "<main_pattern>/<mtp_pattern>/<mtp_pattern>/..."
         Example: "M*M*/M*/M*" = main decoder "M*M*", MTP pattern "M*" with 2 depths
         """
@@ -712,7 +712,7 @@ class TestMultiTokenPredictionMamba:
         args = get_args()
         config = core_transformer_config_from_args(args)
 
-        # MTP is configured via unified pattern in hybrid_override_pattern
+        # MTP is configured via unified pattern in hybrid_layer_pattern
         # MambaModel creates the MTP block internally based on the parsed pattern
         model = MambaModel(
             config=config,
@@ -721,9 +721,7 @@ class TestMultiTokenPredictionMamba:
             max_sequence_length=args.max_position_embeddings,
             pre_process=pre_process,
             post_process=post_process,
-            hybrid_attention_ratio=args.hybrid_attention_ratio,
-            hybrid_mlp_ratio=args.hybrid_mlp_ratio,
-            hybrid_override_pattern=args.hybrid_override_pattern,
+            hybrid_layer_pattern=args.hybrid_layer_pattern,
             fp16_lm_cross_entropy=args.fp16_lm_cross_entropy,
             parallel_output=True,
             share_embeddings_and_output_weights=not args.untie_embeddings_and_output_weights,
@@ -740,7 +738,6 @@ class TestMultiTokenPredictionMamba:
 
         sys.argv = ['test_multi_token_prediction_mamba.py']
         args = parse_args()
-        args.num_layers = 4
         args.mtp_num_layers = 2
         args.mtp_loss_scaling_factor = 0.1
         args.vocab_size = 128800
@@ -765,10 +762,8 @@ class TestMultiTokenPredictionMamba:
         args.no_load_optim = True
         args.no_load_rng = True
         args.bf16 = True
-        args.hybrid_attention_ratio = 0.5
-        args.hybrid_mlp_ratio = 0.0
         # Unified pattern: "main/mtp/mtp" - main decoder "M*M*", MTP pattern "M*" with 2 depths
-        args.hybrid_override_pattern = "M*M*/M*/M*"
+        args.hybrid_layer_pattern = "M*M*/M*/M*"
         args.spec = "megatron.core.models.mamba.mamba_layer_specs.mamba_stack_spec"
 
         if fp8 is not None:
