@@ -1,15 +1,12 @@
 ENV_VARS:
   CUDA_DEVICE_MAX_CONNECTIONS: 1
-  NVTE_ALLOW_NONDETERMINISTIC_ALGO: 1
+  NVTE_ALLOW_NONDETERMINISTIC_ALGO: 0
   NCCL_ALGO: Ring
   CUBLAS_WORKSPACE_CONFIG: :4096:8
 MODEL_ARGS:
-  --hidden-size: 1024
-  --num-attention-heads: 16
-  --group-query-attention: true
-  --num-query-groups: 8
-  --hybrid-layer-pattern: M-M-M-M*-M-M-M-M*-M-M-M-M*-M-M-M-M*-M-M-M-M-
-  --spec: "[megatron.core.models.mamba.mamba_layer_specs mamba_stack_spec]"
+  --num-layers: 12
+  --hidden-size: 512
+  --num-attention-heads: 8
   --log-params-norm: true
   --log-num-zeros-in-grad: true
   --log-validation-ppl-to-tensorboard: true
@@ -40,19 +37,21 @@ MODEL_ARGS:
   --eval-interval: 1000
   --eval-iters: 10
   --transformer-impl: transformer_engine
-  --tensor-model-parallel-size: 2
+  --tensor-model-parallel-size: 1
   --pipeline-model-parallel-size: 1
   --use-distributed-optimizer: true
-  --overlap-grad-reduce: true
-  --overlap-param-gather: true
-  --check-weight-hash-across-dp-replicas-interval: 10
-  --ckpt-fully-parallel-load: true
+  --no-mmap-bin-files: true
+  --deterministic-mode: true
   --no-gradient-accumulation-fusion: true
   --attention-softmax-in-fp32: true
   --use-mcore-models: true
   --ckpt-format: torch_dist
+  --dist-ckpt-strictness: log_all
   --data-cache-path: ${DATA_CACHE_PATH}
   --bf16: true
   --attention-backend: unfused
   --log-memory-to-tensorboard: true
+  # MuP (Maximal Update Parameterization) args
+  --use-mup: true
+  --mup-base-hidden-size: 256
 TEST_TYPE: regular
