@@ -15,7 +15,11 @@ from megatron.core.inference.batch_dimensions_utils import (
     CUDAGraphBatchDimensionBuilder,
     InferenceBatchDimensions,
 )
-from megatron.core.inference.config import InferenceConfig, KVCacheManagementMode
+from megatron.core.inference.config import (
+    InferenceConfig,
+    KVCacheManagementMode,
+    PrefixCachingEvictionPolicy,
+)
 from megatron.core.inference.inference_request import DynamicInferenceRequest
 from megatron.core.inference.sampling_params import SamplingParams
 from megatron.core.inference.unified_memory import (
@@ -244,7 +248,7 @@ class DynamicInferenceContext(BaseInferenceContext):
 
         # Prefix caching configuration
         self.enable_prefix_caching = inference_config.enable_prefix_caching
-        self.block_evict_lru = inference_config.block_evict_lru
+        self.prefix_caching_eviction_policy = inference_config.prefix_caching_eviction_policy
         self.prefix_caching_mamba_gb = inference_config.prefix_caching_mamba_gb
 
         # Step counter (used for LRU timestamps in prefix caching)
@@ -448,7 +452,7 @@ class DynamicInferenceContext(BaseInferenceContext):
             ),
             paused_count=paused_block_count,
             enable_prefix_caching=self.enable_prefix_caching,
-            block_evict_lru=self.block_evict_lru,
+            prefix_caching_eviction_policy=self.prefix_caching_eviction_policy,
         )
 
         # Track request metadata.
@@ -1962,7 +1966,7 @@ class DynamicInferenceContext(BaseInferenceContext):
                 matched_block_ids, dtype=torch.int32, device=torch.cuda.current_device()
             )
             self.block_allocator.block_ref_counts[matched_tensor] += 1
-            if self.block_evict_lru:
+            if self.prefix_caching_eviction_policy == PrefixCachingEvictionPolicy.LRU:
                 self.block_allocator.update_timestamps(matched_tensor)
 
         # when a request already starts chunked prefill, it is exactly the last request in the current system

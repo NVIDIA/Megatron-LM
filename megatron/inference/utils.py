@@ -12,6 +12,7 @@ from megatron.core.inference.config import (
     InferenceConfig,
     KVCacheManagementMode,
     MambaInferenceStateConfig,
+    PrefixCachingEvictionPolicy,
 )
 from megatron.core.inference.contexts import DynamicInferenceContext
 from megatron.core.inference.engines import DynamicInferenceEngine
@@ -237,6 +238,19 @@ def add_inference_args(parser: ArgumentParser) -> ArgumentParser:
         default=False,
         help="If true, only run throughput check without verifying outputs.",
     )
+    group.add_argument(
+        "--drain-between-batches",
+        action='store_true',
+        default=False,
+        help="Process requests in batches, draining all active requests between batches.",
+    )
+    group.add_argument(
+        "--batch-boundaries",
+        type=str,
+        default=None,
+        help="Comma-separated list of request indices where each batch starts. "
+        "Used with --drain-between-batches.",
+    )
 
     return parser
 
@@ -316,7 +330,7 @@ def get_inference_config_from_model_and_args(model: MegatronModule, args):
         track_paused_request_events=args.inference_dynamic_batching_track_paused_request_events,
         enable_chunked_prefill=args.enable_chunked_prefill,
         enable_prefix_caching=args.inference_dynamic_batching_enable_prefix_caching,
-        block_evict_lru=args.inference_dynamic_batching_block_evict_lru,
+        prefix_caching_eviction_policy=PrefixCachingEvictionPolicy(args.inference_dynamic_batching_prefix_caching_eviction_policy),
         prefix_caching_mamba_gb=getattr(args, 'inference_dynamic_batching_prefix_caching_mamba_gb', None),
         metrics_writer=metrics_writer,
         logging_step_interval=args.inference_logging_step_interval,

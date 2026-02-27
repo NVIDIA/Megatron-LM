@@ -6,7 +6,7 @@ from collections import deque
 import pytest
 import torch
 
-from megatron.core.inference.config import InferenceConfig
+from megatron.core.inference.config import InferenceConfig, PrefixCachingEvictionPolicy
 from megatron.core.inference.contexts.dynamic_context import DynamicInferenceContext
 from megatron.core.inference.engines.dynamic_engine import DynamicInferenceEngine
 from megatron.core.inference.inference_request import (
@@ -47,7 +47,7 @@ class PrefixCachingTestBase:
         rounder=64,
         enable_prefix_caching=True,
         max_tokens=None,
-        block_evict_lru=True,
+        prefix_caching_eviction_policy=PrefixCachingEvictionPolicy.LRU,
     ):
         """Create a DynamicInferenceContext with sensible test defaults."""
         DynamicInferenceContext.ROUNDER = rounder
@@ -74,7 +74,7 @@ class PrefixCachingTestBase:
             use_flashinfer_fused_rope=None,
             unified_memory_level=0,
             enable_prefix_caching=enable_prefix_caching,
-            block_evict_lru=block_evict_lru,
+            prefix_caching_eviction_policy=prefix_caching_eviction_policy,
         )
         return DynamicInferenceContext(
             model_config=transformer_config, inference_config=inference_config
@@ -216,7 +216,7 @@ class TestBlockSharingAndRefCounts(PrefixCachingTestBase):
         assert not hasattr(alloc_d, 'kv_hash_to_block_id')
         assert not hasattr(alloc_d, 'block_ref_counts')
 
-        ctx_rz = self._ctx(block_evict_lru=False)
+        ctx_rz = self._ctx(prefix_caching_eviction_policy=PrefixCachingEvictionPolicy.REF_ZERO)
         alloc_rz = ctx_rz.block_allocator
         assert not hasattr(alloc_rz, 'block_timestamps')
 
@@ -380,7 +380,7 @@ class TestRefCountLifecycle(PrefixCachingTestBase):
     @pytest.mark.internal
     def test_refzero_deregisters_on_last_release(self):
         """REF_ZERO: two reqs sharing prefix. Release both: hash removed, blocks returned."""
-        ctx = self._ctx(block_evict_lru=False)
+        ctx = self._ctx(prefix_caching_eviction_policy=PrefixCachingEvictionPolicy.REF_ZERO)
         bs = ctx.block_size_tokens
         alloc = ctx.block_allocator
         prompt = self._prompt(bs * 2)
@@ -408,7 +408,7 @@ class TestRefCountLifecycle(PrefixCachingTestBase):
     @pytest.mark.internal
     def test_refzero_released_blocks_not_discoverable(self):
         """REF_ZERO: after full release, same-prefix request gets fresh blocks."""
-        ctx = self._ctx(block_evict_lru=False)
+        ctx = self._ctx(prefix_caching_eviction_policy=PrefixCachingEvictionPolicy.REF_ZERO)
         bs = ctx.block_size_tokens
         alloc = ctx.block_allocator
         prompt = self._prompt(bs * 2)

@@ -1731,14 +1731,14 @@ def _add_inference_args(parser):
                        'Required for Mamba prefix caching in hybrid models. '
                        'If not specified, Mamba prefix caching is disabled. '
                        'When enabled, chunked prefill is automatically enabled if disabled.')
-    group.add_argument('--inference-dynamic-batching-block-evict-lru',
-                       action='store_true', default=False,
-                       dest='inference_dynamic_batching_block_evict_lru',
-                       help='Use LRU eviction for prefix caching blocks. '
-                       'When set, blocks with ref_count==0 stay cached and are '
-                       'evicted via LRU only when space is needed. Default (without '
-                       'this flag) uses ref-zero (RZ) mode which immediately '
-                       'returns blocks to the free pool when ref_count hits 0.')
+    group.add_argument('--inference-dynamic-batching-prefix-caching-eviction-policy',
+                       type=str, default='ref_zero',
+                       choices=['ref_zero', 'lru'],
+                       dest='inference_dynamic_batching_prefix_caching_eviction_policy',
+                       help='Eviction policy for prefix caching blocks. '
+                       '"ref_zero" (default) immediately returns blocks to the '
+                       'free pool when ref_count hits 0. "lru" keeps blocks '
+                       'cached and evicts via LRU only when space is needed.')
     group.add_argument('--inference-dynamic-batching-cuda-graph-max-tokens',
                        type=int, default=16384,
                        help='Maximum number of tokens to capture in a cuda graph.')
