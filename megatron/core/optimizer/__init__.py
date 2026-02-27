@@ -523,7 +523,6 @@ def _get_megatron_emerging_optimizer(
     config: OptimizerConfig,
     model_chunks: List[MegatronModule],
     config_overrides: Optional[Dict[ParamKey, Any]] = None,
-    use_gloo_process_groups: bool = True,
     pg_collection: Optional[ProcessGroupCollection] = None,
 ) -> MegatronOptimizer:
     """Build an emerging optimizer (e.g. Muon) for the given model chunks.
@@ -563,9 +562,6 @@ def _get_megatron_emerging_optimizer(
 
     if pg_collection is None:
         pg_collection = ProcessGroupCollection.use_mpu_process_groups()
-    pg_dict = ProcessGroupCollection.setup_process_groups_for_optimizer(
-        pg_collection, model_chunks, use_gloo_process_groups
-    )
 
     log_single_rank(logger, logging.INFO, f'Setting up emerging optimizer with config {config}')
 
@@ -598,7 +594,7 @@ def _get_megatron_emerging_optimizer(
         if not groups:
             continue
 
-        model_parallel_group = pg_dict['expt_tp_pp_group' if is_expert else 'mp_group']
+        model_parallel_group = pg_collection.tp_ep_pp if is_expert else pg_collection.mp
 
         if opt_name in _EMERGING_OPTIMIZERS:
             optimizer, init_state_fn = _create_emerging_optimizer(
@@ -632,6 +628,12 @@ def _get_megatron_emerging_optimizer(
                 pg_collection=pg_collection,
                 skip_megatron_wrapping=use_layer_wise,
             )
+            # TODO(deyuf): ChainedOptimizer currently asserts all sub-optimizers
+            # share the same config. Revisit this design now that emerging
+            # optimizers mix different optimizer types (e.g. Muon + Adam).
+            # For now, reset to the top-level config so the assertion holds.
+            if not use_layer_wise and hasattr(result, 'config'):
+                result.config = config
         results.append(result)
 
     if use_layer_wise:
@@ -688,7 +690,6 @@ def get_megatron_optimizer(
             config=config,
             model_chunks=model_chunks,
             config_overrides=config_overrides,
-            use_gloo_process_groups=use_gloo_process_groups,
             pg_collection=pg_collection,
         )
 
