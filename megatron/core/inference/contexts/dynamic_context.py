@@ -692,6 +692,7 @@ class DynamicInferenceContext(BaseInferenceContext):
         self.token_to_position_in_request = torch.empty_like(self.token_to_input_ids)
         self.token_to_local_position_within_kv_block = torch.empty_like(self.token_to_input_ids)
 
+        # NOTE: Need to build this outside the UVM / TMS context to avoid IMA.
         if self.is_hybrid_model:
             self.mamba_metadata = MambaMetadata(
                 max_requests=self.max_requests, max_tokens=self.max_tokens
@@ -733,6 +734,7 @@ class DynamicInferenceContext(BaseInferenceContext):
             return
 
         if self.unified_memory_level != 0 or self._uses_torch_memory_saver:
+            # Need to bring back the memory block before we reset it.
             if self._uses_torch_memory_saver:
                 torch_memory_saver.resume("inference_context")
             if self.kv_cache_management_mode == KVCacheManagementMode.RECOMPUTE:
