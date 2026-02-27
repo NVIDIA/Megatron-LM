@@ -54,14 +54,14 @@ try:
     from transformer_engine.pytorch.utils import make_weak_ref
 
     HAVE_TE_GRAPHS = True
-except:
+except Exception:
     HAVE_TE_GRAPHS = False
 
 try:
     from tqdm import tqdm
 
     HAVE_TQDM = True
-except:
+except Exception:
     HAVE_TQDM = False
 
 _IS_GRAPH_CAPTURING = False

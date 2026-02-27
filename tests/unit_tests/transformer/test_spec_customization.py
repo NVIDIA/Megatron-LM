@@ -173,7 +173,7 @@ class TestSpecCustomization:
                 attention_type='self',
                 pg_collection=self.pg_collection,
             )
-        except:
+        except Exception:
             threw = True
         finally:
             assert threw, "Expected TEDotProductAttention to throw for integer window-size"

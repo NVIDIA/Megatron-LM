@@ -11,7 +11,7 @@ from torch.optim import SGD, Adam
 try:
     from transformer_engine.pytorch.optimizers import FusedAdam as GPUAdam
     from transformer_engine.pytorch.optimizers import FusedSGD as GPUSGD
-except:
+except Exception:
     # Handle environment where transformer_engine is not installed
     from torch.optim import SGD as GPUSGD
     from torch.optim import Adam as GPUAdam

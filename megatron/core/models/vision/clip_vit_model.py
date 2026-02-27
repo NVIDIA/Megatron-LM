@@ -18,7 +18,7 @@ try:
     from megatron.core.extensions.transformer_engine import TENorm
 
     NORM_IMPL = TENorm
-except:
+except Exception:
     NORM_IMPL = torch.nn.LayerNorm
 
 

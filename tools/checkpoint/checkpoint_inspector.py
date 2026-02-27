@@ -115,7 +115,7 @@ def inspect(checkpoint_dir, enable_msc, not_ignore_param_to_group_meta):
             click.echo(
                 f"  {bullet} {click.style(key, fg='green')}: {click.style(str(value), fg='white')}"
             )
-    except:
+    except Exception:
         click.echo(
             click.style("Failed to load checkpoint strategies.", fg="red", bold=True)
         )
@@ -177,7 +177,7 @@ def inspect(checkpoint_dir, enable_msc, not_ignore_param_to_group_meta):
             click.echo(
                 f"  {bullet} {click.style(key, fg='blue')}: {click.style(str(value), fg='white')}"
             )
-    except:
+    except Exception:
         click.echo(
             click.style("No MCore data found in the checkpoint.", fg="red", bold=True)
         )
@@ -633,7 +633,7 @@ def convert_checkpoint(
             ckpt_param_groups = []
             for opt_state_dict in common_state["optimizer"].values():
                 ckpt_param_groups.extend(opt_state_dict["optimizer"]["param_groups"])
-    except:
+    except Exception:
         ckpt_param_groups = None
     common_state = flatten(common_state)
     for key, value in common_state.items():

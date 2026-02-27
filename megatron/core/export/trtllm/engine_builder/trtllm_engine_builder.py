@@ -89,7 +89,7 @@ class TRTLLMEngineBuilder:
         )
         try:
             model_cls = getattr(tensorrt_llm.models, architecture)
-        except:
+        except Exception:
             raise AttributeError(f"Could not find TRTLLM model for architecture: {architecture}!")
 
         logger.set_level("info")

@@ -156,7 +156,7 @@ def inspect_types(x: Any, prefix: Tuple = (), indent: int = 4):
         else:
             try:
                 x_str = str(x)
-            except:
+            except Exception:
                 x_str = "<no string repr>"
             if len(x_str) > 30:
                 x_str = x_str[:30] + "... (truncated)"

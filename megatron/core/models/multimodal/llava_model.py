@@ -34,9 +34,9 @@ try:
         import transformer_engine_torch as tex
 
         HAVE_TEX = True
-    except:
+    except Exception:
         HAVE_TEX = False
-except:
+except Exception:
     HAVE_TE = False
 
 

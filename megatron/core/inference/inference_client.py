@@ -15,14 +15,14 @@ try:
     import zmq
 
     HAVE_ZMQ = True
-except:
+except Exception:
     HAVE_ZMQ = False
 
 try:
     import msgpack
 
     HAVE_MSGPACK = True
-except:
+except Exception:
     HAVE_MSGPACK = False
 
 from .headers import Headers

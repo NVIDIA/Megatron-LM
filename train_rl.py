@@ -271,7 +271,7 @@ def forward_step(data_iterator, model: GPTModel, loss_only: bool = False):
                 module._forward.cache_clear()
             if hasattr(module, 'forward') and hasattr(module.forward, 'cache_clear'):
                 module.forward.cache_clear()
-    except:
+    except Exception:
         pass
 
     # Get current logprobs and calculate loss with straggler detection

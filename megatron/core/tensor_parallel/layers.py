@@ -72,7 +72,7 @@ try:
     else:
         custom_fwd = torch.cuda.amp.custom_fwd
         custom_bwd = torch.cuda.amp.custom_bwd
-except:
+except Exception:
     custom_fwd = torch.cuda.amp.custom_fwd
     custom_bwd = torch.cuda.amp.custom_bwd
 
@@ -83,7 +83,7 @@ try:
     else:
         dist_all_gather_func = torch.distributed._all_gather_base
         dist_reduce_scatter_func = torch.distributed._reduce_scatter_base
-except:
+except Exception:
     dist_all_gather_func = torch.distributed._all_gather_base
     dist_reduce_scatter_func = torch.distributed._reduce_scatter_base
 

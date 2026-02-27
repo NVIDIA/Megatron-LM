@@ -41,7 +41,7 @@ try:
         TE_VERSION = PkgVersion(str(te.__version__))
     else:
         TE_VERSION = PkgVersion(version("transformer-engine"))
-except:
+except Exception:
     TE_VERSION = None
 
 # Detect the quantized_model_init or fp8_model_init context manager.
@@ -50,7 +50,7 @@ if HAVE_TE:
         from transformer_engine.pytorch import quantized_model_init
 
         QUANTIZED_MODEL_INIT_CLASS = quantized_model_init
-    except:
+    except Exception:
         # Fallback to original FP8 model init.
         from transformer_engine.pytorch import fp8_model_init
 
@@ -64,13 +64,13 @@ try:
 
     HAVE_TE_FP8_TENSOR_CLASS = True
     FP8_TENSOR_CLASS = QuantizedTensor
-except:
+except Exception:
     try:
         from transformer_engine.pytorch.float8_tensor import Float8Tensor
 
         HAVE_TE_FP8_TENSOR_CLASS = True
         FP8_TENSOR_CLASS = Float8Tensor
-    except:
+    except Exception:
         HAVE_TE_FP8_TENSOR_CLASS = False
 
 # Detect the MXFP8 tensor class
@@ -78,7 +78,7 @@ try:
     from transformer_engine.pytorch.tensor.mxfp8_tensor import MXFP8Tensor
 
     HAVE_TE_MXFP8TENSOR = True
-except:
+except Exception:
     HAVE_TE_MXFP8TENSOR = False
 
 # Detect the Blockwise FP8 tensor class
@@ -86,7 +86,7 @@ try:
     from transformer_engine.pytorch.tensor.float8_blockwise_tensor import Float8BlockwiseQTensor
 
     HAVE_TE_BLOCKWISE_FP8TENSOR = True
-except:
+except Exception:
     HAVE_TE_BLOCKWISE_FP8TENSOR = False
 
 # Detect the "cast_master_weights_to_fp8" function of Transformer Engine
@@ -94,7 +94,7 @@ try:
     from transformer_engine.pytorch.tensor.utils import cast_master_weights_to_fp8
 
     HAVE_TE_CAST_MASTER_WEIGHTS_TO_FP8 = True
-except:
+except Exception:
     HAVE_TE_CAST_MASTER_WEIGHTS_TO_FP8 = False
 
     # Try to import multi_tensor_apply, used in the fallback of fp8 quantization.
@@ -154,7 +154,7 @@ try:
     from transformer_engine.pytorch.tensor.utils import post_all_gather_processing
 
     HAVE_TE_POST_ALL_GATHER_PROCESSING = True
-except:
+except Exception:
     HAVE_TE_POST_ALL_GATHER_PROCESSING = False
 
 

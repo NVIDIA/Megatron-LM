@@ -37,7 +37,7 @@ try:
     else:
         dist_all_gather_func = torch.distributed._all_gather_base
         dist_reduce_scatter_func = torch.distributed._reduce_scatter_base
-except:
+except Exception:
     dist_all_gather_func = torch.distributed._all_gather_base
     dist_reduce_scatter_func = torch.distributed._reduce_scatter_base
 

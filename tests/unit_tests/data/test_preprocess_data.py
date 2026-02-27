@@ -92,7 +92,7 @@ def do_test_preprocess_data(temp_dir, extra_args=[]):
         for option in ["decode", "detokenize"]:
             try:
                 return getattr(encoder.tokenizer, option)(toks)
-            except:
+            except Exception:
                 continue
         raise RuntimeError(f"{type(encoder.tokenizer)} tokenizer cannot decode or detokenize")
 

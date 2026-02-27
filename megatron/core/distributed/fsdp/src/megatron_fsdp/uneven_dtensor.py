@@ -285,7 +285,7 @@ def gather_uneven_dtensor_to_full_tensor(
                 # Two Cases: Name is a root dimension, or using the old DeviceMesh
                 # API which allows us to get flattened dimensions.
                 process_group = device_mesh[full_flattened_mesh_dim_name].get_group()
-            except:
+            except Exception:
                 # Name is a flattened dimension that cannot be retrieved from the
                 # DeviceMesh.__getitem__, so fall-back to new DeviceMesh API.
                 process_group = (

@@ -381,7 +381,7 @@ class TestCoordinator:
                     await asyncio.wait_for(asyncio.gather(*futures), timeout=0.5)
                 except asyncio.TimeoutError:
                     pytest.fail("Resumed requests did not complete in time.")
-        except:
+        except Exception:
             success = False
         finally:
             try:

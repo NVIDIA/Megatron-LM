@@ -90,7 +90,7 @@ class JSONEncoderWithMcoreTypes(json.JSONEncoder):
             return dataclasses.asdict(o)
         try:
             return super().default(o)
-        except:
+        except Exception:
             return str(o)
 
 

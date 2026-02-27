@@ -154,7 +154,7 @@ class CaptioningDataset(torch.utils.data.Dataset):
         img_file = self._image_files[idx]
         try:
             image_id = int(img_file.split("_")[-1].split(".")[0])  # coco
-        except:
+        except Exception:
             image_id = int(img_file.split("/")[-1].split(".")[0])  # flickr
 
         img = Image.open(img_file)

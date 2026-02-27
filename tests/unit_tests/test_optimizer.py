@@ -36,12 +36,12 @@ try:
 
     fp8_block_scaling_available, reason_for_no_fp8_block_scaling = check_fp8_block_scaling_support()
     from transformer_engine.common.recipe import DelayedScaling, Float8BlockScaling, Format
-except:
+except Exception:
     fp8_block_scaling_available = False
     reason_for_no_fp8_block_scaling = "FP8 block scaled GEMM requires Hopper and CUDA >= 12.9."
     try:
         from transformer_engine.common.recipe import DelayedScaling
-    except:
+    except Exception:
         delayed_scaling_available = False
 
 

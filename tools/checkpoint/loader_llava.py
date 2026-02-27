@@ -295,12 +295,12 @@ class MegatronCheckpointLoaderLLaVA(MegatronCheckpointLoaderBase):
         # if hasattr(self.all_models[0][0][0].vision_projection.encoder.linear_fc1.layer_norm_weight, "data"):
         try:
             message["vision projection norm weight"] = self.all_models[0][0][0].vision_projection.encoder.linear_fc1.layer_norm_weight.data
-        except:
+        except Exception:
             pass
         try:
         # if hasattr(self.all_models[0][0][0].vision_projection.encoder.linear_fc1.layer_norm_bias, "data"):
             message["vision projection norm bias"] = self.all_models[0][0][0].vision_projection.encoder.linear_fc1.layer_norm_bias.data
-        except:
+        except Exception:
             pass
         if self.md.vision_projection_linear_bias:
             message["vision projection l0 bias"] = torch.cat([self.all_models[0][0][tp_rank].vision_projection.encoder.linear_fc1.bias.data for tp_rank in range(encoder_tp_size)], dim=0)

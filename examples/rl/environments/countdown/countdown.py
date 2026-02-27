@@ -37,7 +37,7 @@ def validate_equation(equation_str, available_numbers):
 
         # Each number should be used exactly once
         return numbers_in_eq == available_numbers
-    except:
+    except Exception:
         return False
 
 
@@ -105,7 +105,7 @@ def compute_score(solution_str, ground_truth, method='strict', format_score=0.1,
             if do_print:
                 print(f"Wrong result: equation = {result}, target = {target}")
             return format_score
-    except:
+    except Exception:
         if do_print:
             print("Error evaluating equation")
         return format_score

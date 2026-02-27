@@ -11,7 +11,7 @@ from megatron.core.dist_checkpointing.mapping import ShardedStateDict
 
 try:
     from megatron.core.extensions.transformer_engine import te_parallel_cross_entropy
-except:
+except Exception:
     te_parallel_cross_entropy = None
 from megatron.core.fusions.fused_cross_entropy import fused_vocab_parallel_cross_entropy
 from megatron.core.pipeline_parallel.utils import (

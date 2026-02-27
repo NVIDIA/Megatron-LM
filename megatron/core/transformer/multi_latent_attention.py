@@ -46,7 +46,7 @@ try:
         fused_apply_mla_rope_for_kv,
         fused_apply_mla_rope_for_q,
     )
-except:
+except Exception:
     fused_apply_mla_rope_for_kv = None
     fused_apply_mla_rope_for_q = None
 

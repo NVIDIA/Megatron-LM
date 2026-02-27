@@ -772,7 +772,7 @@ def get_nvtx_range():
                     timers(msg, log_level=0).stop()
 
         return nvtx_range
-    except:
+    except Exception:
         @contextmanager
         def dummy_range(msg):
             yield
