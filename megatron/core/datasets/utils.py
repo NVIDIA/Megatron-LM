@@ -18,7 +18,18 @@ class Split(Enum):
 
 
 def compile_helpers():
-    """Compile C++ helper functions at runtime. Make sure this is invoked on a single process."""
+    """Compile C++ helper functions at runtime. Make sure this is invoked on a single process.
+
+    If the extension was already built (e.g. via pip wheel or setup.py), this is a no-op.
+    Falls back to compiling via ``make`` for editable / source installs that include the Makefile.
+    """
+    try:
+        import megatron.core.datasets.helpers_cpp  # noqa: F401
+
+        return
+    except ImportError:
+        pass
+
     import os
     import subprocess
 
@@ -26,7 +37,13 @@ def compile_helpers():
     if subprocess.run(command).returncode != 0:
         import sys
 
-        log_single_rank(logger, logging.ERROR, "Failed to compile the C++ dataset helper functions")
+        log_single_rank(
+            logger,
+            logging.ERROR,
+            "Failed to compile the C++ dataset helper functions. "
+            "If you installed from PyPI, the pre-built extension may be missing. "
+            "Try installing from source: pip install --no-build-isolation -e .",
+        )
         sys.exit(1)
 
 
