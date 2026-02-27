@@ -140,14 +140,16 @@ class InferenceCUDAGraphTokenDispatcher(MoEAllGatherTokenDispatcher):
         if self.ep_size == 1:
             return hidden_states, probs
 
-        # 1. Check inputs only: if inputs are 16-byte divisible, outputs (world_size * input) are too.
+        # 1. Check inputs only: if inputs are 16-byte divisible,
+        #  outputs (world_size * input) are too.
         nvls_eligible = self.triton_nvls_kernels_allowed and are_tensors_nvls_eligible(
             hidden_states, probs, self.routing_map
         )
         ag_buffers = None
 
         if nvls_eligible:
-            # 2. Now attempt to allocate symmetric memory buffers for all-gather outputs. If allocation fails, fallback to NCCL.
+            # 2. Now attempt to allocate symmetric memory buffers for
+            # all-gather outputs. If allocation fails, fallback to NCCL.
             ag_buffers = self._maybe_allocate_ag_buffers(self.routing_map, probs, hidden_states)
 
         # 3. Can use NVLS if eligible and buffers allocated successfully (handle is not None)

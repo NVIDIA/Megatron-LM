@@ -34,7 +34,7 @@ from megatron.core.typed_torch import apply_module
 from megatron.core.utils import internal_api
 
 try:
-    import flashinfer
+    import flashinfer  # pylint: disable=unused-import
 
     HAVE_FLASHINFER = True
 except ImportError:
@@ -42,8 +42,8 @@ except ImportError:
 
 if HAVE_FLASHINFER:
     try:
-        import flashinfer_cubin
-        import flashinfer_jit_cache
+        import flashinfer_cubin  # pylint: disable=unused-import
+        import flashinfer_jit_cache  # pylint: disable=unused-import
 
         HAVE_FLASHINFER_CUBIN_AND_JIT_CACHE = True
     except ImportError:
@@ -274,7 +274,8 @@ class MoELayer(BaseMoELayer):
             if not HAVE_FLASHINFER_CUBIN_AND_JIT_CACHE:
                 warnings.warn(
                     "flashinfer-cubin and/or flashinfer-jit-cache not found. "
-                    "The FlashInfer cutlass kernel will be JIT compiled, which may take a long time."
+                    "The FlashInfer cutlass kernel will be JIT compiled,"
+                    "which may take a long time."
                 )
             self._setup_inference_mode(pg_collection)
 

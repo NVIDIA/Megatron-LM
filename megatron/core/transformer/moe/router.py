@@ -737,19 +737,25 @@ class InferenceTopKRouter(TopKRouter):
             pg_collection (ProcessGroupCollection, optional): Process groups for MoE operations.
         """
         # Enforce constraints before calling super().__init__
-        assert (
-            config.moe_router_num_groups is None
-        ), f"InferenceTopKRouter requires moe_router_num_groups=None, got {config.moe_router_num_groups}"
-        assert config.moe_router_score_function in [
-            "sigmoid",
-            "softmax",
-        ], f"InferenceTopKRouter requires moe_router_score_function in ['sigmoid', 'softmax'], got '{config.moe_router_score_function}'"
+        assert config.moe_router_num_groups is None, (
+            f"InferenceTopKRouter requires moe_router_num_groups=None, "
+            f"got {config.moe_router_num_groups}"
+        )
+        assert config.moe_router_score_function in ["sigmoid", "softmax"], (
+            f"InferenceTopKRouter requires moe_router_score_function in "
+            f"['sigmoid', 'softmax'], got '{config.moe_router_score_function}'"
+        )
 
         super().__init__(config=config, pg_collection=pg_collection)
 
         self.is_inference_cuda_graphed_iteration = False
 
     def set_is_inference_cuda_graphed_iteration(self, set_to: bool):
+        """Set whether the current iteration is being CUDA graphed.
+
+        Args:
+            set_to: If True, the router will use CUDA graph-compatible operations.
+        """
         self.is_inference_cuda_graphed_iteration = set_to
 
     @torch.compile()

@@ -862,7 +862,8 @@ class TransformerConfig(ModelParallelConfig):
     """ If true, disables the use of Triton NVLS kernels during inference. """
 
     inference_disable_torch_grouped_mm: bool = False
-    """ If true, disables torch._grouped_mm in InferenceGroupedMLP, falling back to TE GroupedGEMM. """
+    """ If true, disables torch._grouped_mm in InferenceGroupedMLP, 
+    falling back to TE GroupedGEMM. """
 
     mrope_section: Optional[List[int]] = None
     """ Multimodal rope section is for channel dimension of temporal, height and width
@@ -1099,7 +1100,8 @@ class TransformerConfig(ModelParallelConfig):
                 raise ValueError("Inference-optimized MoE layers only support dropless MoE ")
             if self.moe_router_padding_for_quantization:
                 raise ValueError(
-                    "Inference-optimized MoE layers do not support padded routing map for quantization."
+                    "Inference-optimized MoE layers do not support padded "
+                    "routing map for quantization."
                 )
             if self.moe_router_dtype != "fp32":
                 raise ValueError(

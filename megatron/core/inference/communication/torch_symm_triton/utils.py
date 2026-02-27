@@ -18,7 +18,8 @@ except ImportError:
 
 
 def is_device_nvls_capable(device: torch.device) -> bool:
-    """Check if the device supports NVLS (multicast) collectives. Requires CUDA Hopper+ (SM >= 9)."""
+    """Check if the device supports NVLS (multicast) collectives.
+    Requires CUDA Hopper+ (SM >= 9)."""
     return device.type == "cuda" and torch.cuda.get_device_properties(device).major >= 9
 
 

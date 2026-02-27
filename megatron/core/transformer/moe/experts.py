@@ -730,6 +730,9 @@ class TEGroupedMLP(MegatronModule):
         )
 
     def bias_act_func(self, intermediate_parallel, bias_parallel, permuted_probs):
+        """
+        Applies bias and activation function to the output of linear_fc1.
+        """
         if self.config.use_te_activation_func:
             if bias_parallel is not None:
                 intermediate_parallel = intermediate_parallel + bias_parallel
@@ -1070,10 +1073,10 @@ class InferenceGroupedMLP(TEGroupedMLP):
             )
 
             # Activation with routing probabilities
-            # intermediate_parallel = self._activation_func_with_probs(fc1_output, permuted_probs)
             bias_act_output = self.bias_act_func(fc1_output, None, permuted_probs)
 
-            # FC2: [total_tokens, ffn_hidden] @ [num_experts, hidden, ffn_hidden] -> [total_tokens, hidden]
+            # FC2: [total_tokens, ffn_hidden] @ [num_experts, hidden, ffn_hidden]
+            # -> [total_tokens, hidden]
             fc2_output = torch._grouped_mm(
                 bias_act_output, self._fc2_weight.transpose(1, 2), offs=offs
             )
