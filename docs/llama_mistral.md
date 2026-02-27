@@ -360,7 +360,7 @@ The following sections detail these steps.
 
 ## Download Huggingface checkpoints
 
-Users must first apply for access to download the Mistral-7b checkpoints through [Huggingface](https://huggingface.co/mistralai/Mistral-7B-v0.3) (HF).
+Users must first apply for access to download the Mistral-7b checkpoints through Huggingface. Two variants are available: the base model ([Mistral-7B-v0.3](https://huggingface.co/mistralai/Mistral-7B-v0.3)) and the instruct model ([Mistral-7B-Instruct-v0.3](https://huggingface.co/mistralai/Mistral-7B-Instruct-v0.3)).
 
 ## Convert checkpoint format
 
