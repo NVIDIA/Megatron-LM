@@ -1071,8 +1071,6 @@ class InferenceGroupedMLP(TEGroupedMLP):
             # offs[i] = end index of expert i's tokens
             offs = tokens_per_expert.cumsum(0).to(torch.int32)
 
-            # FC1: [total_tokens, hidden] @ [num_experts, ffn_hidden, hidden] 
-            # -> [total_tokens, ffn_hidden]
             fc1_output = torch._grouped_mm(
                 permuted_local_hidden_states, self._fc1_weight.transpose(1, 2), offs=offs
             )
@@ -1080,8 +1078,6 @@ class InferenceGroupedMLP(TEGroupedMLP):
             # Activation with routing probabilities
             bias_act_output = self.bias_act_func(fc1_output, None, permuted_probs)
 
-            # FC2: [total_tokens, ffn_hidden] @ [num_experts, hidden, ffn_hidden]
-            # -> [total_tokens, hidden]
             fc2_output = torch._grouped_mm(
                 bias_act_output, self._fc2_weight.transpose(1, 2), offs=offs
             )
