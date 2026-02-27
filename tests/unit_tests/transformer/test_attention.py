@@ -9,6 +9,7 @@ from packaging import version
 import megatron.core.parallel_state as parallel_state
 from megatron.core.hyper_comm_grid import HyperCommGrid
 from megatron.core.models.gpt.gpt_layer_specs import (
+    get_gpt_layer_with_transformer_engine_spec,
     get_gpt_layer_with_transformer_engine_submodules,
 )
 from megatron.core.process_groups_config import ProcessGroupCollection
