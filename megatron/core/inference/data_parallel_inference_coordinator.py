@@ -431,5 +431,5 @@ class DataParallelInferenceCoordinator:
         """
         Stops the inference coordinator, performing any necessary cleanup operations.
         """
-        self.router_socket.close(linger=5000)
+        self.router_socket.close()
         self.context.term()

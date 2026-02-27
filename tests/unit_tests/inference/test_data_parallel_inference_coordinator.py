@@ -197,10 +197,7 @@ class DummyEngine(DynamicInferenceEngine):
 
 
 async def graceful_shutdown(engine, client=None, *, timeout=10.0):
-    """Shut down the engine.
-
-    First we try to pass PAUSE -> STOP into the coordinator via the client.
-    If necessary, we escalate to engine.shutdown(immediate=True) and cancel all tasks.
+    """Shut down the engine via the normal PAUSE -> STOP lifecycle.
 
     Args:
         engine: DummyEngine whose engine_loop_task to await.
@@ -212,8 +209,7 @@ async def graceful_shutdown(engine, client=None, *, timeout=10.0):
             client.pause_engines()
             client.stop_engines()
         await asyncio.wait_for(engine.wait_until(EngineState.STOPPED), timeout=timeout)
-    except asyncio.TimeoutError:
-        await asyncio.wait_for(engine.shutdown(immediate=True), timeout=timeout)
+        await engine.engine_loop_task
     finally:
         proc = getattr(engine, 'inference_coordinator_process', None)
         if proc is not None and proc.is_alive():
@@ -345,7 +341,11 @@ class TestCoordinator:
             await asyncio.wait_for(engine1.running.wait(), timeout=5.0)
 
             # Disconnect the engine (simulates unexpected departure).
-            await engine1.shutdown(immediate=True)
+            engine1.engine_loop_task.cancel()
+            try:
+                await engine1.engine_loop_task
+            except (asyncio.CancelledError, Exception):
+                pass
 
             # Re-register a new engine with the same coordinator.
             # Use the actual port (not DEFAULT_PORT) because the coordinator
@@ -374,7 +374,11 @@ class TestCoordinator:
             await asyncio.wait_for(engine2.running.wait(), timeout=5.0)
 
             # Disconnect the engine (simulates unexpected departure).
-            await engine2.shutdown(immediate=True)
+            engine2.engine_loop_task.cancel()
+            try:
+                await engine2.engine_loop_task
+            except (asyncio.CancelledError, Exception):
+                pass
             if client1 is not None:
                 client1.stop()
                 client1 = None

@@ -543,10 +543,6 @@ class DynamicInferenceEngine(AbstractEngine):
         self.model_parallel_num_msgs_subscriber_socket = self.zmq_context.socket(zmq.SUB)
         self.model_parallel_num_msgs_subscriber_socket.connect(mp_len_addr)
         self.model_parallel_num_msgs_subscriber_socket.setsockopt_string(zmq.SUBSCRIBE, "")
-        # Set a receive timeout so that blocking recv() calls are interruptible.
-        # Without this, non-MP-coordinator ranks block forever in schedule_requests()
-        # and their engine_loop_task can never be cancelled by asyncio.
-        self.model_parallel_num_msgs_subscriber_socket.setsockopt(zmq.RCVTIMEO, 1000)
 
         self.zmq_sockets += [
             self.model_parallel_subscriber_socket,
@@ -1621,17 +1617,10 @@ class DynamicInferenceEngine(AbstractEngine):
             if messages_to_dequeue > 0:
                 self.model_parallel_publisher_socket.send_multipart(all_messages)
         else:
-            # First, receive the number of messages to dequeue from mp-rank 0.
-            # RCVTIMEO is set on this socket so recv() raises zmq.Again on
-            # timeout instead of blocking forever: this keeps the engine
-            # loop cancellable by asyncio.
-            try:
-                messages_to_dequeue = struct.unpack(
-                    '!i', self.model_parallel_num_msgs_subscriber_socket.recv()
-                )[0]
-            except zmq.Again:
-                range_pop()
-                return 0
+            # First, receive the number of messages to dequeue from mp-rank 0
+            messages_to_dequeue = struct.unpack(
+                '!i', self.model_parallel_num_msgs_subscriber_socket.recv()
+            )[0]
             # Now, dequeue the same number of messages from the subscriber socket.
             # Note that these receives are blocking, because the messages
             # are guaranteed to be available after the tp-rank 0 has sent them.
@@ -1709,51 +1698,11 @@ class DynamicInferenceEngine(AbstractEngine):
 
         return len(all_messages)
 
-    async def shutdown(self, immediate: bool = False):
+    async def shutdown(self):
         """Shut down the engine and clean up ZMQ resources.
 
-        When immediate=False (called from the engine loop's finally block), just does ZMQ cleanup.
-
-        When immediate=True (external emergency shutdown), cancels the engine loop task directly.
-        Cancellation is our last resort when we can't rely on EP all-reduce or world barriers:
-        peer ranks may already be dead.
-
-        This method does NOT touch the coordinator process. It must be terminated separately.
-
-        Args:
-            immediate: Cancel the engine task instead of draining gracefully.
+        Called from the engine loop's finally block after the loop exits.
         """
-        task = getattr(self, 'engine_loop_task', None)
-
-        if task is not None and not task.done() and task is not asyncio.current_task():
-            if immediate:
-                task.cancel()
-                try:
-                    await task
-                except (asyncio.CancelledError, Exception):
-                    pass
-            else:
-                # Inject synthetic signals to cooperatively drain all engines.
-                if self.state == EngineState.RUNNING:
-                    self._pending_signals.append(
-                        msgpack.packb([Headers.PAUSE.value], use_bin_type=True)
-                    )
-                if self.state not in (EngineState.STOPPING, EngineState.STOPPED):
-                    # It is insufficient to wait for `paused.wait()`, because that may
-                    # trigger inside RESUMING or SUSPENDING, which cannot transition to STOPPED.
-                    while self.state not in (
-                        EngineState.PAUSED,
-                        EngineState.SUSPENDED,
-                        EngineState.STOPPING,
-                        EngineState.STOPPED,
-                    ):
-                        await asyncio.sleep(0.01)
-                    if self.state in (EngineState.PAUSED, EngineState.SUSPENDED):
-                        self._pending_signals.append(
-                            msgpack.packb([Headers.STOP.value], use_bin_type=True)
-                        )
-                await task
-
         self.state = EngineState.STOPPED
 
         # Cleanup the request futures.
