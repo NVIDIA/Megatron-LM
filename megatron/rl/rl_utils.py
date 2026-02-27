@@ -34,7 +34,6 @@ from megatron.core.tokenizers import MegatronTokenizer
 from megatron.core.transformer.cuda_graphs import _CudagraphGlobalRecord
 from megatron.core.transformer.enums import CudaGraphScope
 from megatron.core.transformer.utils import (
-    disable_cuda_graphs,
     toggle_cuda_graphs,
     transition_moe_to_full_cudagraphs,
     transition_moe_to_partial_cudagraphs,
@@ -1240,63 +1239,61 @@ def prepare_data_for_update(
 
         with torch.no_grad(), nvtx_range("compute_logprobs", time=True):
             # Before we can update the model, we need to get the logprobs for the \pi_{old} model.
-            # TODO(helenn): Re-enable cudagraphs for logprobs calculations.
 
             _logprobs_lang_module = (
                 (model.module.module if hasattr(model.module, "module") else model.module)
                 if args.rl_training_cuda_graphs else None
             )
-            with disable_cuda_graphs(model, lang_module=_logprobs_lang_module):
-                forward_backward_func = get_forward_backward_func()
-                if args.cuda_graph_impl == "local" and CudaGraphScope.full_iteration in args.cuda_graph_scope:
-                    forward_backward_func = FullCudaGraphWrapper(
-                        forward_backward_func, cuda_graph_warmup_steps=args.cuda_graph_warmup_steps
-                    )
-
-                dtype = (
-                    torch.bfloat16 if args.bf16 else (torch.float16 if args.fp16 else torch.float32)
+            forward_backward_func = get_forward_backward_func()
+            if args.cuda_graph_impl == "local" and CudaGraphScope.full_iteration in args.cuda_graph_scope:
+                forward_backward_func = FullCudaGraphWrapper(
+                    forward_backward_func, cuda_graph_warmup_steps=args.cuda_graph_warmup_steps
                 )
 
-                pg_collection = get_attr_wrapped_model(model, "pg_collection")
-                pp_group = pg_collection.pp
+            dtype = (
+                torch.bfloat16 if args.bf16 else (torch.float16 if args.fp16 else torch.float32)
+            )
 
-                with torch.no_grad(), nvtx_range("compute_old_logprobs", time=True):
-                    old_logprobs = compute_logprobs_batch(
-                        model=model,
-                        data_loader=data_loader,
-                        forward_backward_func=forward_backward_func,
-                        packing_context=packing_context,
-                        trajs_batch_size=len(compute_trajs),
-                        seq_length=args.seq_length,
-                        logprobs_batch_size=logprobs_batch_size,
-                        decoder_seq_length=args.decoder_seq_length,
-                        dtype=dtype,
-                        pp_group=pp_group,
-                        is_correction=args.rl_inference_logprobs_is_correction,
-                    )
+            pg_collection = get_attr_wrapped_model(model, "pg_collection")
+            pp_group = pg_collection.pp
 
-                with torch.no_grad(), nvtx_range("compute_ref_logprobs", time=True):
-                    # We need to load the ref model state dict and compute the logprobs for the ref model
-                    cur_st_dict = {
-                        k: (v.cpu() if v is not None else v) for k, v in model.state_dict().items()
-                    }
-                    model.load_state_dict(ref_state_dict)
-                    ref_logprobs = compute_logprobs_batch(
-                        model=model,
-                        data_loader=data_loader,
-                        forward_backward_func=forward_backward_func,
-                        packing_context=packing_context,
-                        trajs_batch_size=len(compute_trajs),
-                        seq_length=args.seq_length,
-                        logprobs_batch_size=logprobs_batch_size,
-                        decoder_seq_length=args.decoder_seq_length,
-                        dtype=dtype,
-                        pp_group=pp_group,
-                        is_correction=args.rl_inference_logprobs_is_correction,
-                    )
+            with torch.no_grad(), nvtx_range("compute_old_logprobs", time=True):
+                old_logprobs = compute_logprobs_batch(
+                    model=model,
+                    data_loader=data_loader,
+                    forward_backward_func=forward_backward_func,
+                    packing_context=packing_context,
+                    trajs_batch_size=len(compute_trajs),
+                    seq_length=args.seq_length,
+                    logprobs_batch_size=logprobs_batch_size,
+                    decoder_seq_length=args.decoder_seq_length,
+                    dtype=dtype,
+                    pp_group=pp_group,
+                    is_correction=args.rl_inference_logprobs_is_correction,
+                )
 
-                    # logprobs are [b, seq, h] now.
-                    model.load_state_dict(cur_st_dict)
+            with torch.no_grad(), nvtx_range("compute_ref_logprobs", time=True):
+                # We need to load the ref model state dict and compute the logprobs for the ref model
+                cur_st_dict = {
+                    k: (v.cpu() if v is not None else v) for k, v in model.state_dict().items()
+                }
+                model.load_state_dict(ref_state_dict)
+                ref_logprobs = compute_logprobs_batch(
+                    model=model,
+                    data_loader=data_loader,
+                    forward_backward_func=forward_backward_func,
+                    packing_context=packing_context,
+                    trajs_batch_size=len(compute_trajs),
+                    seq_length=args.seq_length,
+                    logprobs_batch_size=logprobs_batch_size,
+                    decoder_seq_length=args.decoder_seq_length,
+                    dtype=dtype,
+                    pp_group=pp_group,
+                    is_correction=args.rl_inference_logprobs_is_correction,
+                )
+
+                # logprobs are [b, seq, h] now.
+                model.load_state_dict(cur_st_dict)
 
             torch.cuda.synchronize()
             gc.collect()

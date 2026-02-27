@@ -1,7 +1,6 @@
 # Copyright (c) 2024, NVIDIA CORPORATION. All rights reserved.
 
 """Utilities for transformer layers."""
-from contextlib import contextmanager
 from operator import itemgetter
 from typing import TYPE_CHECKING, Any, Dict, Iterable, Optional, Tuple, Union
 
@@ -447,47 +446,6 @@ def toggle_cuda_graphs(model, set_to="none", reset_cuda_graphs=True):
     # if we are resetting cuda graphs we need to reset all the state
     if reset_cuda_graphs and set_to == "none":
         delete_cuda_graphs()
-
-
-@contextmanager
-def disable_cuda_graphs(model, lang_module=None):
-    """Context manager that forces all layers to run eagerly (no cudagraph replay).
-
-    Saves and restores the following state on entry/exit:
-    - `model.config.cuda_graph_impl` set to "none" so `create_cudagraphs()`is skipped.
-    - `model.config.cuda_graph_scope` set to [] so partial graph capture is skipped.
-    - `_CudagraphGlobalRecord.cudagraph_created` — set to False so existing
-      CudaGraphManager instances on non-MoE TransformerLayers take the eager fallback path.
-    - MoE partial-cudagraph flag — if lang_module is provided, MoE layers are switched to full-layer
-    mode (`use_partial_cudagraphs = False`) so their `_should_call_local_cudagraph` returns False
-    - Restore to partial cudagraphs mode on exit.
-
-    Args:
-        model: The wrapped model whose `config` contains `cuda_graph_impl` and `cuda_graph_scope`.
-        lang_module: (Optional) The unwrapped language module to pass to
-            `transition_moe_to_full_cudagraphs` / `transition_moe_to_partial_cudagraphs`.
-            When `None`, MoE transition calls are skipped.
-    """
-    from megatron.core.transformer.cuda_graphs import _CudagraphGlobalRecord
-
-    saved_impl = model.config.cuda_graph_impl
-    saved_scope = model.config.cuda_graph_scope
-    saved_created = _CudagraphGlobalRecord.cudagraph_created
-
-    model.config.cuda_graph_impl = "none"
-    model.config.cuda_graph_scope = []
-    _CudagraphGlobalRecord.cudagraph_created = False
-    if lang_module is not None:
-        transition_moe_to_full_cudagraphs(lang_module)
-
-    try:
-        yield
-    finally:
-        model.config.cuda_graph_impl = saved_impl
-        model.config.cuda_graph_scope = saved_scope
-        _CudagraphGlobalRecord.cudagraph_created = saved_created
-        if lang_module is not None:
-            transition_moe_to_partial_cudagraphs(lang_module)
 
 
 def transition_moe_to_partial_cudagraphs(model):

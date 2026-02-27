@@ -1404,6 +1404,14 @@ class MoETransformerLayer(TransformerLayer):
             residual, hidden_states, probs, shared_expert_output = self._forward_mlp_router(
                 hidden_states, padding_mask=padding_mask
             )
+
+            # After the router graph replays, the captured .copy_() operations that update
+            # self.token_dispatcher_attrs via `_maybe_dtoh_and_synchronize` are queued on the
+            # current stream but may not have completed. Synchronize to ensure
+            # self.token_dispatcher_attrs contain the correct values before the eager
+            # expert_compute phase restores them onto the token dispatcher.
+            torch.cuda.current_stream().synchronize()
+
             expert_output, mlp_bias = self._forward_mlp_expert_compute(hidden_states, probs)
             return self._forward_mlp_postprocess(
                 residual, expert_output, shared_expert_output, mlp_bias
