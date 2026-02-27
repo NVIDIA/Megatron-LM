@@ -133,7 +133,7 @@ class InferenceBatchDimensions:
         strict: bool,
         decode_only_cuda_graphs: bool,
         explicit_chunked_prefill: bool,
-        cuda_graph_mixed_prefill_count: int,
+        smallest_non_decode_cuda_graph_size: int,
         ep_group: Optional[torch.distributed.ProcessGroup] = None,
     ) -> Optional["InferenceBatchDimensions"]:
         """Adjusted cuda graph batch dimensions for expert parallelism.
@@ -203,7 +203,7 @@ class InferenceBatchDimensions:
         # graph while prefill ranks match a coarser mixed graph, which would
         # produce inconsistent token counts across EP ranks.
         if is_any_ep_rank_in_non_decode and not strict:
-            adjusted_token_count = max(adjusted_token_count, cuda_graph_mixed_prefill_count)
+            adjusted_token_count = max(adjusted_token_count, smallest_non_decode_cuda_graph_size)
 
         adjusted_batch_dim = InferenceBatchDimensions(
             token_count=adjusted_token_count,
@@ -303,7 +303,7 @@ class CUDAGraphBatchDimensionBuilder:
         tp_size: int,
         num_cuda_graphs: Optional[int],
         cuda_graph_max_tokens: int,
-        cuda_graph_mixed_prefill_count: Optional[int],
+        cuda_graph_mixed_prefill_request_count: Optional[int],
         max_requests: int,
         max_tokens: int,
         max_sequence_length: int,
@@ -339,7 +339,7 @@ class CUDAGraphBatchDimensionBuilder:
             tp_size: Tensor parallel size
             num_cuda_graphs: Number of CUDA graphs to generate
             cuda_graph_max_tokens: Maximum tokens for CUDA graphs
-            cuda_graph_mixed_prefill_count: Number of mixed prefill requests for CUDA graphs
+            cuda_graph_mixed_prefill_request_count: Number of mixed prefill requests for CUDA graphs
             max_requests: Maximum number of requests
             max_tokens: Maximum total tokens
             max_sequence_length: Maximum sequence length
@@ -409,8 +409,8 @@ class CUDAGraphBatchDimensionBuilder:
         if num_cuda_graphs is None:
             cuda_graph_batch_dimensions_list = []
         elif (
-            not cuda_graph_mixed_prefill_count
-            or cuda_graph_mixed_prefill_count <= 0
+            not cuda_graph_mixed_prefill_request_count
+            or cuda_graph_mixed_prefill_request_count <= 0
             or not use_cuda_graphs_for_non_decode_steps
         ):  # decode only
             # Use decode-specific token counts for decode-only graphs
@@ -426,14 +426,14 @@ class CUDAGraphBatchDimensionBuilder:
             for size in cuda_graph_prefill_token_counts:
                 add_if_valid(
                     token_count=size,
-                    prefill_req_count=min(cuda_graph_mixed_prefill_count, max_requests),
+                    prefill_req_count=min(cuda_graph_mixed_prefill_request_count, max_requests),
                     decode_req_count=min(size, max_requests)
-                    - min(cuda_graph_mixed_prefill_count, max_requests),
+                    - min(cuda_graph_mixed_prefill_request_count, max_requests),
                 )
                 # We need to ensure the prefill requests are shorter than the max sequence length,
                 # considering the one decode token is used for prefill request construction
                 prefill_only_minimal_num = max(
-                    cuda_graph_mixed_prefill_count,
+                    cuda_graph_mixed_prefill_request_count,
                     math.ceil(size / max(1, max_sequence_length - 1)),
                 )
                 if prefill_only_minimal_num < max_requests:
@@ -509,7 +509,7 @@ class CUDAGraphBatchDimensionBuilder:
             decode_only_cuda_graphs=decode_only_cuda_graphs,
             explicit_chunked_prefill=explicit_chunked_prefill,
             ep_group=ep_group,
-            cuda_graph_mixed_prefill_count=smallest_non_decode_cuda_graph_size,
+            smallest_non_decode_cuda_graph_size=smallest_non_decode_cuda_graph_size,
         )
 
         if adjusted_batch_dim is None:
