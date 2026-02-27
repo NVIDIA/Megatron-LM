@@ -24,7 +24,12 @@ This repository contains two components: **Megatron-LM** and **Megatron Core**.
 
 ## Getting Started
 
-- **[Installation Guide](https://docs.nvidia.com/megatron-core/developer-guide/latest/get-started/install.html)** - Docker (recommended) and pip installation options
+```bash
+pip install megatron-core
+```
+
+For source installs, development setups, and NGC container options, see the **[Installation Guide](https://docs.nvidia.com/megatron-core/developer-guide/latest/get-started/install.html)**.
+
 - **[Your First Training Run](https://docs.nvidia.com/megatron-core/developer-guide/latest/get-started/quickstart.html)** - End-to-end training examples with data preparation
 - **[Parallelism Strategies](https://docs.nvidia.com/megatron-core/developer-guide/latest/user-guide/parallelism-guide.html)** - Scale training across GPUs with TP, PP, DP, EP, and CP
 - **[Contribution Guide](https://docs.nvidia.com/megatron-core/developer-guide/latest/developer/contribute.html)** - How to contribute to Megatron Core
