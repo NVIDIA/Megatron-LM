@@ -127,7 +127,7 @@ class FastAPIEnvServer(EnvironmentServer):
         assert isinstance(
             request.inference_interface, InferenceServer
         ), "Rollout requests to remote server must contain an InferenceServer object"
-        assert request.num_groups != -1, "FastAPIEnvServer does not support group rollout streaming"
+        assert not request.streaming, "FastAPIEnvServer does not support group rollout streaming"
         payload = request.model_dump()
         payload["inference_interface"] = request.inference_interface.model_dump()
         async with httpx.AsyncClient() as client:
