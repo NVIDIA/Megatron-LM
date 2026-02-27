@@ -1090,14 +1090,12 @@ class TransformerConfig(ModelParallelConfig):
         if self.expert_model_parallel_size > 1 and self.num_moe_experts is None:
             raise ValueError("num_moe_experts must be non None to use expert-parallel.")
 
-        if self.transformer_impl == "inference_optimized" and (
-            self.expert_tensor_parallel_size > 1
-        ):
-            raise ValueError(
-                "Inference-optimized MoE layers does not support expert tensor parallelism."
-            )
-
-        if self.transformer_impl == "inference_optimized":
+    
+        if self.transformer_impl == "inference_optimized" and self.num_moe_experts is not None:
+            if self.expert_tensor_parallel_size > 1:
+                raise ValueError(
+                    "Inference-optimized MoE layers does not support expert tensor parallelism."
+                )
             if self.moe_expert_capacity_factor is not None:
                 raise ValueError(
                     "Inference-optimized MoE layers only support dropless MoE "
@@ -1106,14 +1104,13 @@ class TransformerConfig(ModelParallelConfig):
                 raise ValueError(
                     "Inference-optimized MoE layers do not support padded routing map for quantization."
                 )
-            if self.num_moe_experts is not None and self.moe_router_dtype != "fp32":
+            if self.moe_router_dtype != "fp32":
                 raise ValueError(
                     "Inference-optimized MoE requires --moe-router-dtype=fp32 "
                     "to avoid costly dtype conversions during decode."
                 )
             if (
-                self.num_moe_experts is not None
-                and self.gated_linear_unit
+                self.gated_linear_unit
                 and self.cuda_graph_impl != "none"
             ):
                 raise ValueError(
@@ -2070,6 +2067,7 @@ class TransformerConfig(ModelParallelConfig):
                 "inference_fuse_tp_communication is only supported "
                 "for inference_optimized transformer implementation."
             )
+            assert self.num_moe_experts is None, "--inference-fuse-tp-communication is not supported for MoE models."
 
         if self.inference_disable_triton_nvls_kernels:
             assert self.transformer_impl == "inference_optimized", (
