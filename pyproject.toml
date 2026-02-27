@@ -242,7 +242,8 @@ markers = [
 concurrency = ["thread", "multiprocessing"]
 omit = [
     "/tmp/*",
-    "/workspace/tests/*",
+    "/opt/megatron-lm/tests/*",
+    "/opt/megatron-lm/tools/*",
     "/usr/local/lib/python3.12/dist-packages/*",
 ]
 parallel = true
