@@ -261,7 +261,10 @@ class DynamicInferenceContext(BaseInferenceContext):
             tp_size = model_config.tensor_model_parallel_size
             pp_size = model_config.pipeline_model_parallel_size
         self.hidden_size_per_attention_head = core_divide(projection_size, num_attention_heads)
-        self.num_attention_heads_per_partition = core_divide(num_attention_heads, tp_size)
+        if num_attention_heads >= tp_size:
+            self.num_attention_heads_per_partition = core_divide(num_attention_heads, tp_size)
+        else:
+            self.num_attention_heads_per_partition = 1
 
         # Cache the PP group we should use for PP collectives inside the context.
         # If the model provides a pg_collection with a pp group, prefer it.
@@ -543,6 +546,7 @@ class DynamicInferenceContext(BaseInferenceContext):
             )
         )
 
+        self.cuda_graph_mixed_prefill_count = inference_config.cuda_graph_mixed_prefill_count
         self._using_cuda_graph_this_step = False
         # Deal with chunked prefill
         self.enable_chunked_prefill = inference_config.enable_chunked_prefill
@@ -1260,20 +1264,72 @@ class DynamicInferenceContext(BaseInferenceContext):
         """
         return self.total_request_count - self.paused_request_count - self.num_prefill_requests
 
+    def add_dummy_requests_for_expert_parallel_step(self) -> None:
+        """Minimal context setup so an EP rank with no real requests can replay
+        an already-captured cuda graph without crashing or corrupting memory.
+
+        This is the fast alternative to add_dummy_requests_for_cudagraph_capture
+        (which goes through the heavyweight add_dummy_requests_parallel path).
+
+        We setup minimal state such the initialize_attention_state and the forward
+        pass can run without error.
+
+        """
+        smallest_cuda_graph_dimensions = min(self.cuda_graph_batch_dimensions_list)
+        # the smallest cuda graph is decode only.
+        assert smallest_cuda_graph_dimensions.prefill_req_count == 0
+
+        N = smallest_cuda_graph_dimensions.decode_req_count
+        dummy_block_idx = self.block_allocator.dummy_block_idx
+
+        # 1. Request counts and token count (decode-only: 1 token per request).
+        self.total_request_count = N
+        self.active_token_count = N
+        self.num_prefill_requests = 0
+
+        # 2. Per-request state consumed by mha_metadata.update().
+        self.request_query_lengths[0:N].fill_(1)
+        self.request_kv_length_offsets[0:N].fill_(0)
+        self.request_to_kv_block_ids[0:N, 0] = dummy_block_idx
+
+        # 3. Token-level state consumed by the triton KV append kernel.
+        self.token_to_block_idx[0:N] = dummy_block_idx
+        self.token_to_local_position_within_kv_block[0:N] = 0
+
+        if self.is_hybrid_model:
+            # 4. token_to_request_idx: needed by mamba_metadata.update() for hybrid models.
+            self.token_to_request_idx[0:N] = torch.arange(
+                0, N, device=self.token_to_request_idx.device, dtype=self.token_to_request_idx.dtype
+            )
+
+            # 5. Mamba state: allocate slots for dummy requests.
+            self.mamba_metadata.request_to_mamba_state_idx[0:N] = (
+                self.mamba_metadata.batch_allocate_slots(N)
+            )
+
     def initialize_attention_state(
-        self, *, construct_graph_dimensions: Optional[InferenceBatchDimensions] = None
+        self,
+        *,
+        construct_graph_dimensions: Optional[InferenceBatchDimensions] = None,
+        is_expert_parallel_dummy_cuda_graph_step: bool = False,
     ) -> None:
         """Initialize attention state so that every layer can use it.
 
         Args:
             construct_graph_dimensions (Optional[InferenceBatchDimensions]): The graph config to use for constructing the cuda graphs.
+            is_expert_parallel_dummy_cuda_graph_step (bool): Whether this is a dummy expert model parallel step.
         Return:
             None.
         """
         self.is_creating_cuda_graphs = construct_graph_dimensions is not None
+        assert not (
+            self.is_creating_cuda_graphs and is_expert_parallel_dummy_cuda_graph_step
+        ), "Dummy expert model parallel steps should not be creating cuda graphs."
 
         # If in CUDA graph creation mode, add dummy requests for CUDA graph capture
-        if self.is_creating_cuda_graphs:
+        if is_expert_parallel_dummy_cuda_graph_step:
+            self.add_dummy_requests_for_expert_parallel_step()
+        elif self.is_creating_cuda_graphs:
             self.add_dummy_requests_for_cudagraph_capture(construct_graph_dimensions)
 
         batch_dimensions = InferenceBatchDimensions(
@@ -1281,7 +1337,9 @@ class DynamicInferenceContext(BaseInferenceContext):
             prefill_req_count=self.num_prefill_requests,
             decode_req_count=self.num_decode_requests,
         )
+
         self.batch_dimensions = batch_dimensions
+
         best_graph = CUDAGraphBatchDimensionBuilder.match_graph_config(
             batch_dimensions,
             self.cuda_graph_batch_dimensions_list,
@@ -1289,8 +1347,16 @@ class DynamicInferenceContext(BaseInferenceContext):
             decode_only_cuda_graphs=(not self.use_cuda_graphs_for_non_decode_steps),
             explicit_chunked_prefill=self.is_chunked_prefill_enabled() and self.is_hybrid_model,
             ep_group=self.expert_model_parallel_group,
+            cuda_graph_mixed_prefill_count=self.cuda_graph_mixed_prefill_count,
         )
         self._using_cuda_graph_this_step = best_graph is not None
+
+        if is_expert_parallel_dummy_cuda_graph_step and not self.using_cuda_graph_this_step():
+            # If we are here, this means that CUDAGraphBatchDimensionBuilder.match_graph_config
+            # could not find a compatible cuda graph for the dummy forward step.
+            # Now, we need not do the remaining setup. The controller
+            # will directly call the model forward pass with a single token.
+            return
 
         if self.using_cuda_graph_this_step():
             self.padded_batch_dimensions = best_graph

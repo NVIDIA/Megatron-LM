@@ -23,8 +23,6 @@ try:
 except ImportError:
     HAVE_EINOPS = False
 
-logger = logging.getLogger(__name__)
-
 # Intra-layer model parallel group that the current rank belongs to.
 _TENSOR_MODEL_PARALLEL_GROUP = None
 # Inter-layer model parallel group that the current rank belongs to.

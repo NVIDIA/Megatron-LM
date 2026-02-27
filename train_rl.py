@@ -22,6 +22,7 @@ from megatron.rl.rl_utils import (
     load_packed_data_by_index,
 )
 from megatron.training import get_args, get_timers, pretrain, print_rank_0
+from megatron.training.utils import is_hybrid_model
 from megatron.training.arguments import core_transformer_config_from_args
 from model_provider import model_provider
 
@@ -377,7 +378,7 @@ if __name__ == "__main__":
     def _model_builder(
         args, pre_process, post_process, vp_stage=None, config=None, pg_collection=None
     ):
-        if getattr(args, "is_hybrid_model", False):
+        if is_hybrid_model(args):
             return mamba_builder(
                 args,
                 pre_process,
