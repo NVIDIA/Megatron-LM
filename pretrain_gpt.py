@@ -4,6 +4,7 @@
 
 # Capture the true program start time BEFORE any heavy imports.
 import time
+
 _PROGRAM_START_TIME = time.time()
 
 import json
@@ -11,6 +12,7 @@ import json
 # Suppress warnings on all ranks but rank 0.
 import os
 import warnings
+
 rank = int(os.environ.get('RANK', 0))
 if rank != 0:
     warnings.filterwarnings("ignore", category=UserWarning)
@@ -29,7 +31,13 @@ from megatron.core.enums import ModelType
 from megatron.core.models.gpt import GPTModel
 from megatron.core.rerun_state_machine import get_rerun_state_machine
 from megatron.core.tokenizers.utils.build_tokenizer import build_tokenizer
-from megatron.core.utils import get_attr_wrapped_model, get_thd_batch_on_this_cp_rank, get_batch_on_this_hybrid_cp_rank, StragglerDetector
+from megatron.core.transformer.multi_token_prediction import get_mtp_ranks, mtp_on_this_rank
+from megatron.core.utils import (
+    StragglerDetector,
+    get_attr_wrapped_model,
+    get_batch_on_this_hybrid_cp_rank,
+    get_thd_batch_on_this_cp_rank,
+)
 from megatron.training import (
     get_args,
     get_timers,
@@ -38,10 +46,9 @@ from megatron.training import (
     print_rank_0,
     set_startup_timestamps,
 )
-from megatron.training.datasets.sft_dataset import SFTDataset
-from megatron.core.transformer.multi_token_prediction import mtp_on_this_rank, get_mtp_ranks
 from megatron.training.arguments import core_transformer_config_from_args
 from megatron.training.datasets.fim_dataset import GPTFIMDataset, GPTFIMDatasetConfig
+from megatron.training.datasets.sft_dataset import SFTDataset
 from megatron.training.utils import (
     get_batch_on_this_cp_rank,
     get_batch_on_this_tp_rank,
@@ -67,14 +74,15 @@ def get_batch(data_iterator, vp_stage: Optional[int] = None):
     config = core_transformer_config_from_args(args)
     # TODO: this is pretty hacky, find a better way
     if not is_first_or_last_pipeline_stage(vp_stage) and (
-    (not mtp_on_this_rank(config, ignore_virtual=False, vp_stage=vp_stage))):
+        not mtp_on_this_rank(config, ignore_virtual=False, vp_stage=vp_stage)
+    ):
         return None, None, None, None, None, None
 
     # get batches based on the TP rank you are on
     batch = get_batch_on_this_tp_rank(
         data_iterator,
-        mtp_on_this_rank=mtp_on_this_rank(config, ignore_virtual=False, vp_stage=vp_stage)
-        )
+        mtp_on_this_rank=mtp_on_this_rank(config, ignore_virtual=False, vp_stage=vp_stage),
+    )
 
     cu_seqlens = batch.pop('cu_seqlens', None)
     cu_seqlens_padded = batch.pop('cu_seqlens_padded', None)
@@ -89,10 +97,12 @@ def get_batch(data_iterator, vp_stage: Optional[int] = None):
         packed_seq_params = None
     elif local_cp_size is None:  # Packed THD format
         assert max_seqlen.dim() == 1
-        batch, packed_seq_params = get_thd_batch_on_this_cp_rank(batch, cu_seqlens, cu_seqlens_padded, max_seqlen)
-    else: # Hybrid CP format
+        batch, packed_seq_params = get_thd_batch_on_this_cp_rank(
+            batch, cu_seqlens, cu_seqlens_padded, max_seqlen
+        )
+    else:  # Hybrid CP format
         batch, packed_seq_params = get_batch_on_this_hybrid_cp_rank(batch, local_cp_size)
-    
+
     return (*batch.values(), packed_seq_params)
 
 
@@ -168,7 +178,8 @@ def forward_step(data_iterator, model: GPTModel, return_schedule_plan: bool = Fa
     Args:
         data_iterator : Input data iterator
         model (GPTModel): The GPT Model
-        return_schedule_plan (bool): Whether to return the schedule plan instead of the output tensor
+        return_schedule_plan (bool): Whether to return the schedule
+            plan instead of the output tensor
     """
     args = get_args()
     timers = get_timers()
@@ -178,7 +189,9 @@ def forward_step(data_iterator, model: GPTModel, return_schedule_plan: bool = Fa
     global stimer
     with stimer(bdata=True):
         vp_stage = get_attr_wrapped_model(model, "vp_stage")
-        tokens, labels, loss_mask, attention_mask, position_ids, packed_seq_params = get_batch(data_iterator, vp_stage)
+        tokens, labels, loss_mask, attention_mask, position_ids, packed_seq_params = get_batch(
+            data_iterator, vp_stage
+        )
     timers('batch-generator').stop()
 
     with stimer:
@@ -186,15 +199,21 @@ def forward_step(data_iterator, model: GPTModel, return_schedule_plan: bool = Fa
             output_tensor = model(tokens, position_ids, attention_mask, labels=labels)
         else:
             if return_schedule_plan:
-                assert args.overlap_moe_expert_parallel_comm, \
+                assert args.overlap_moe_expert_parallel_comm, (
                     "overlap_moe_expert_parallel_comm must be enabled to return the schedule plan"
+                )
                 schedule_plan = model.build_schedule_plan(
                     tokens, position_ids, attention_mask, labels=labels, loss_mask=loss_mask
                 )
                 return schedule_plan, partial(loss_func, loss_mask, model=model)
             else:
                 output_tensor = model(
-                    tokens, position_ids, attention_mask, labels=labels, loss_mask=loss_mask, packed_seq_params=packed_seq_params
+                    tokens,
+                    position_ids,
+                    attention_mask,
+                    labels=labels,
+                    loss_mask=loss_mask,
+                    packed_seq_params=packed_seq_params,
                 )
 
     # [ModelOpt]: model is needed to access ModelOpt distillation losses
@@ -247,7 +266,7 @@ def core_gpt_dataset_config_from_args(args):
         "defer_npy_index_mmap": args.dataloader_defer_npy_index_mmap,
         "context_parallel_size": args.context_parallel_size,
         "data_parallel_size": args.data_parallel_size,
-        "sequence_parallel_size": args.tensor_model_parallel_size*args.sequence_parallel,
+        "sequence_parallel_size": args.tensor_model_parallel_size * args.sequence_parallel,
         "hybrid_context_parallel": args.hybrid_context_parallel,
     }
 
@@ -279,7 +298,8 @@ def train_valid_test_datasets_provider(train_val_test_num_samples, vp_stage=None
     """Build the train test and validation datasets.
 
     Args:
-        train_val_test_num_samples : A list containing the number of samples in train test and validation.
+        train_val_test_num_samples : A list containing the number of
+            samples in train test and validation.
     """
     args = get_args()
 
@@ -299,7 +319,10 @@ def train_valid_test_datasets_provider(train_val_test_num_samples, vp_stage=None
 
     is_dataset_built = partial(is_dataset_built_on_rank, vp_stage=vp_stage)
     train_ds, valid_ds, test_ds = BlendedMegatronDatasetBuilder(
-        dataset_type, train_val_test_num_samples, partial(is_dataset_built_on_rank, vp_stage=vp_stage), config
+        dataset_type,
+        train_val_test_num_samples,
+        partial(is_dataset_built_on_rank, vp_stage=vp_stage),
+        config,
     ).build()
 
     print_rank_0("> finished creating GPT datasets ...")

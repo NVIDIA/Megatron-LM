@@ -24,7 +24,7 @@ logger = logging.getLogger(__name__)
 
 # Detect if Transformer Engine is installed
 try:
-    import transformer_engine  # pylint: disable=W0611
+    import transformer_engine  # noqa: F401
     from transformer_engine.pytorch.module.base import TransformerEngineBaseModule
 
     HAVE_TE = True
@@ -231,12 +231,12 @@ def fp8_set_raw_data(tensor: torch.Tensor, data: torch.Tensor, set_transpose: bo
 
     old_data = getattr(tensor, data_attr)
     if old_data is not None:
-        assert (
-            old_data.dtype == data.dtype
-        ), f"The data types of raw data don't match {old_data.dtype} vs {data.dtype}"
-        assert (
-            old_data.shape == data.shape
-        ), f"Shape {old_data.shape} of old_data doesn't match {data.shape} of new_data"
+        assert old_data.dtype == data.dtype, (
+            f"The data types of raw data don't match {old_data.dtype} vs {data.dtype}"
+        )
+        assert old_data.shape == data.shape, (
+            f"Shape {old_data.shape} of old_data doesn't match {data.shape} of new_data"
+        )
     setattr(tensor, data_attr, data)
 
 
@@ -256,9 +256,9 @@ def fp8_get_raw_data(tensor: torch.Tensor, get_transpose: bool = False) -> torch
 def fp8_dequantize(tensor: torch.Tensor) -> torch.Tensor:
     """Dequantize a FP8 tensor to a higher precision."""
     assert is_float8tensor(tensor), f"Type {type(tensor)} is not a FP8 tensor"
-    assert is_te_min_version(
-        "2.0"
-    ), "Transformer Engine >= 2.0 is required for dequantizing parameters."
+    assert is_te_min_version("2.0"), (
+        "Transformer Engine >= 2.0 is required for dequantizing parameters."
+    )
     return tensor.dequantize()
 
 

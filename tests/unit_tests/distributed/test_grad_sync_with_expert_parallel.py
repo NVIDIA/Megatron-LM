@@ -8,11 +8,10 @@ import torch
 
 from megatron.core import parallel_state
 from megatron.core.distributed import DistributedDataParallel, DistributedDataParallelConfig
-from megatron.core.distributed.param_and_grad_buffer import partition_buckets
 from megatron.core.models.gpt.gpt_layer_specs import get_gpt_layer_with_transformer_engine_spec
 from megatron.core.transformer import TransformerConfig
 from megatron.core.transformer.moe.moe_layer import MoELayer
-from tests.unit_tests.test_utilities import TestModel, Utils
+from tests.unit_tests.test_utilities import Utils
 
 
 class TestMoEModel(torch.nn.Module):

@@ -98,7 +98,7 @@ except:
     flash_attn_with_kvcache = None
 
 try:
-    import transformer_engine  # pylint: disable=unused-import
+    import transformer_engine  # noqa: F401
 
     HAVE_TE = True
     from megatron.core.extensions.transformer_engine import (
@@ -273,12 +273,12 @@ class Attention(MegatronModule, ABC):
         if pg_collection is None:
             pg_collection = ProcessGroupCollection.use_mpu_process_groups(required_pgs=['tp', 'cp'])
         else:
-            assert hasattr(
-                pg_collection, 'tp'
-            ), "Attention pg_collection must have tp process group"
-            assert hasattr(
-                pg_collection, 'cp'
-            ), "Attention pg_collection must have cp process group"
+            assert hasattr(pg_collection, 'tp'), (
+                "Attention pg_collection must have tp process group"
+            )
+            assert hasattr(pg_collection, 'cp'), (
+                "Attention pg_collection must have cp process group"
+            )
         self.pg_collection = pg_collection
         self.tp_group = pg_collection.tp
 
@@ -433,9 +433,9 @@ class Attention(MegatronModule, ABC):
 
     def _get_pp_layer_offset_for_inference(self):
         """Return the pipeline parallel layer offset for inference."""
-        assert (
-            self.config.virtual_pipeline_model_parallel_size is None
-        ), "Virtual pipeline parallelism is not supported for inference"
+        assert self.config.virtual_pipeline_model_parallel_size is None, (
+            "Virtual pipeline parallelism is not supported for inference"
+        )
 
         # Import here to avoid circular imports
         from megatron.core.transformer.transformer_layer import get_transformer_layer_offset
@@ -809,9 +809,9 @@ class Attention(MegatronModule, ABC):
                     softmax_scale,
                 )
             else:
-                assert (
-                    self.batch_invariant_mode is False
-                ), "Batch invariant mode is not supported for flash attention 2"
+                assert self.batch_invariant_mode is False, (
+                    "Batch invariant mode is not supported for flash attention 2"
+                )
                 output_total = flash_attn_varlen_func(
                     q,
                     k,
@@ -867,9 +867,9 @@ class Attention(MegatronModule, ABC):
                 if HAVE_FA3:
                     output_total = flash_attn3_with_kvcache(**flash_attn_args)
                 else:
-                    assert (
-                        not self.batch_invariant_mode
-                    ), "Batch invariant mode is not supported for flash attention 2"
+                    assert not self.batch_invariant_mode, (
+                        "Batch invariant mode is not supported for flash attention 2"
+                    )
                     output_total = flash_attn_with_kvcache(**flash_attn_args)
         return output_total
 
@@ -924,9 +924,9 @@ class Attention(MegatronModule, ABC):
         inference_context = deprecate_inference_params(inference_context, inference_params)
 
         if inference_context and inference_context.is_dynamic_batching():
-            assert HAVE_FA3 or is_fa_min_version(
-                "2.7.3"
-            ), "flash attn verion v2.7.3 and above is required for dynamic batching."
+            assert HAVE_FA3 or is_fa_min_version("2.7.3"), (
+                "flash attn verion v2.7.3 and above is required for dynamic batching."
+            )
 
         # hidden_states: [sq, b, h]
         is_inference_mode = inference_context is not None and not self.training
@@ -974,9 +974,9 @@ class Attention(MegatronModule, ABC):
         # Check if fused_single_qkv_rope is requested but either unavailable or not
         # supported for the current use case.
         if self.attention_type != "cross":
-            assert not (
-                self.config.fused_single_qkv_rope and split_qkv
-            ), "fused_single_qkv_rope requested but not available/supported for the config."
+            assert not (self.config.fused_single_qkv_rope and split_qkv), (
+                "fused_single_qkv_rope requested but not available/supported for the config."
+            )
 
         with off_interface(self.offload_qkv_linear, hidden_states, "qkv_linear") as hidden_states:
             qkv_output = self.get_query_key_value_tensors(
@@ -1000,9 +1000,9 @@ class Attention(MegatronModule, ABC):
                 query, key, value = qkv_output
             mixed_qkv = qkv_split_arg_list = None
         else:
-            assert (
-                not self.config.attention_output_gate
-            ), "attention_output_gate is not supported for unsplit mixed_qkv tensor."
+            assert not self.config.attention_output_gate, (
+                "attention_output_gate is not supported for unsplit mixed_qkv tensor."
+            )
             mixed_qkv, qkv_split_arg_list = qkv_output
         nvtx_range_pop(suffix="qkv")
 
@@ -1521,8 +1521,10 @@ class SelfAttention(Attention):
 
         assert self.core_attention.current_max_attn_logits.shape == (
             self.num_attention_heads_per_partition,
-        ), f"current_max_attn_logits shape is not ({self.num_attention_heads_per_partition}, ) \
+        ), (
+            f"current_max_attn_logits shape is not ({self.num_attention_heads_per_partition}, ) \
                     but {self.core_attention.current_max_attn_logits.shape}"
+        )
 
         grouped_max_attn_logits = torch.max(
             self.core_attention.current_max_attn_logits.view(
@@ -1537,10 +1539,10 @@ class SelfAttention(Attention):
             # Use num_query_groups_per_partition for tensor parallel scenarios
 
             # qk_clip_balancing_eta (g, 1, 1)
-            assert grouped_max_attn_logits.shape == (
-                self.num_query_groups_per_partition,
-            ), f"current_max_attn_logits shape is not ({self.num_query_groups_per_partition},) \
+            assert grouped_max_attn_logits.shape == (self.num_query_groups_per_partition,), (
+                f"current_max_attn_logits shape is not ({self.num_query_groups_per_partition},) \
                 but {grouped_max_attn_logits.shape}"
+            )
             self.qk_clip_balancing_eta = torch.clamp(
                 self.config.qk_clip_threshold / grouped_max_attn_logits, max=1.0
             ).view(self.num_query_groups_per_partition, 1, 1)
@@ -1574,8 +1576,7 @@ class SelfAttention(Attention):
         ]
         weight_k = weight_reshaped[
             :,
-            self.query_projection_size
-            // self.num_query_groups_per_partition : (
+            self.query_projection_size // self.num_query_groups_per_partition : (
                 self.query_projection_size + self.kv_projection_size
             )
             // self.num_query_groups_per_partition,

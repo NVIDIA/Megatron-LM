@@ -1,16 +1,16 @@
 import os
+
 import torch
-from megatron.core import parallel_state
-from megatron.core import dist_checkpointing
-from megatron.core.export.model_type import ModelType
+
+from megatron.core import dist_checkpointing, parallel_state
 from megatron.core.export.data_type import DataType
 from megatron.core.export.export_config import ExportConfig
+from megatron.core.export.model_type import ModelType
 from megatron.core.export.trtllm.trtllm_helper import TRTLLMHelper
+from megatron.core.models.gpt.gpt_layer_specs import get_gpt_layer_local_spec
+from megatron.core.models.gpt.gpt_model import GPTModel
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
 from megatron.core.transformer.transformer_config import TransformerConfig
-from megatron.core.models.gpt.gpt_model import GPTModel
-from megatron.core.models.gpt.gpt_layer_specs import get_gpt_layer_local_spec
-
 
 _SEQUENCE_LENGTH = 64
 
@@ -25,33 +25,40 @@ def initialize_distributed(tensor_model_parallel_size=1, pipeline_model_parallel
     torch.distributed.init_process_group(world_size=world_size, rank=rank)
 
     # Megatron core distributed training initialization
-    parallel_state.initialize_model_parallel(tensor_model_parallel_size, pipeline_model_parallel_size)
+    parallel_state.initialize_model_parallel(
+        tensor_model_parallel_size, pipeline_model_parallel_size
+    )
+
 
 def model_provider():
     """Build the model."""
 
     transformer_config = TransformerConfig(
-        num_layers=2, 
-        hidden_size=64, # Needs to be atleast 32 times num_attn_heads
-        num_attention_heads=2, 
-        use_cpu_initialization=True, 
+        num_layers=2,
+        hidden_size=64,  # Needs to be atleast 32 times num_attn_heads
+        num_attention_heads=2,
+        use_cpu_initialization=True,
         pipeline_dtype=torch.float32,
     )
 
     gpt_model = GPTModel(
-        config=transformer_config, 
-        transformer_layer_spec=get_gpt_layer_local_spec(), 
-        vocab_size=100, 
+        config=transformer_config,
+        transformer_layer_spec=get_gpt_layer_local_spec(),
+        vocab_size=100,
         max_sequence_length=_SEQUENCE_LENGTH,
     )
 
     return gpt_model
 
+
 def load_distributed_checkpoint(checkpoint_path, gpt_model):
-    sharded_state_dict=gpt_model.sharded_state_dict(prefix='')
-    checkpoint = dist_checkpointing.load(sharded_state_dict=sharded_state_dict, checkpoint_dir=checkpoint_path)
+    sharded_state_dict = gpt_model.sharded_state_dict(prefix='')
+    checkpoint = dist_checkpointing.load(
+        sharded_state_dict=sharded_state_dict, checkpoint_dir=checkpoint_path
+    )
     gpt_model.load_state_dict(checkpoint)
     return gpt_model
+
 
 if __name__ == "__main__":
     # Need to use TP1 PP1 for export on single device
@@ -65,29 +72,28 @@ if __name__ == "__main__":
 
     seq_len_interpolation_factor = None
     if hasattr(gpt_model, "rotary_pos_emb"):
-        seq_len_interpolation_factor =  gpt_model.rotary_pos_emb.seq_len_interpolation_factor
+        seq_len_interpolation_factor = gpt_model.rotary_pos_emb.seq_len_interpolation_factor
 
     trtllm_helper = TRTLLMHelper(
-                        transformer_config=gpt_model.config, 
-                        model_type=ModelType.gpt,
-                        position_embedding_type = gpt_model.position_embedding_type, 
-                        max_position_embeddings = gpt_model.max_position_embeddings, 
-                        rotary_percentage = gpt_model.rotary_percent,
-                        rotary_base = gpt_model.rotary_base,
-                        moe_tp_mode = 2,
-                        multi_query_mode = False,
-                        activation = "gelu", 
-                        seq_len_interpolation_factor = seq_len_interpolation_factor,
-                        share_embeddings_and_output_weights=gpt_model.share_embeddings_and_output_weights
-                    )
-    
+        transformer_config=gpt_model.config,
+        model_type=ModelType.gpt,
+        position_embedding_type=gpt_model.position_embedding_type,
+        max_position_embeddings=gpt_model.max_position_embeddings,
+        rotary_percentage=gpt_model.rotary_percent,
+        rotary_base=gpt_model.rotary_base,
+        moe_tp_mode=2,
+        multi_query_mode=False,
+        activation="gelu",
+        seq_len_interpolation_factor=seq_len_interpolation_factor,
+        share_embeddings_and_output_weights=gpt_model.share_embeddings_and_output_weights,
+    )
 
-    export_config = ExportConfig(inference_tp_size = 2)
-    # NOTE : For faster performance, if your entire model will fit in gpu memory, transfer model state dict to GPU and then call this api
+    export_config = ExportConfig(inference_tp_size=2)
+    # NOTE : For faster performance, if your entire model will fit in gpu memory, transfer model state dict to GPU and then call this api  # noqa: E501
     weight_list, config_list = trtllm_helper.get_trtllm_pretrained_config_and_model_weights(
-        model_state_dict= gpt_model.state_dict(),
-        dtype = DataType.bfloat16,
-        export_config=export_config
+        model_state_dict=gpt_model.state_dict(),
+        dtype=DataType.bfloat16,
+        export_config=export_config,
     )
 
     for trtllm_model_weights, trtllm_model_config in zip(weight_list, config_list):

@@ -7,8 +7,7 @@ from functools import lru_cache
 import torch
 
 # This import is needed for the cpp extension to work.
-# pylint: disable=unused-import
-from torch.utils import cpp_extension
+from torch.utils import cpp_extension  # noqa: F401
 
 from megatron.core.utils import is_torch_min_version, log_single_rank
 
@@ -308,9 +307,9 @@ class MultiGroupMemPoolAllocator:
 
         assert isinstance(self.pool, torch.cuda.MemPool), "pool must be a torch.cuda.MemPool"
         assert isinstance(self.groups, list), "groups must be a list"
-        assert all(
-            isinstance(group, torch.distributed.ProcessGroup) for group in self.groups
-        ), "groups must be a list of torch.distributed.ProcessGroup"
+        assert all(isinstance(group, torch.distributed.ProcessGroup) for group in self.groups), (
+            "groups must be a list of torch.distributed.ProcessGroup"
+        )
 
     def __enter__(self):
         self.mem_context.__enter__()

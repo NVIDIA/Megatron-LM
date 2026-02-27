@@ -2,9 +2,10 @@
 import argparse
 import json
 
-from .evaluate_mmmu import get_input_output_paths
 from pycocoevalcap.eval import COCOEvalCap
 from pycocotools.coco import COCO
+
+from .evaluate_mmmu import get_input_output_paths
 
 
 def convert_to_coco_format(input_path):
@@ -24,10 +25,7 @@ def convert_to_coco_format(input_path):
                     continue
 
                 caption = res["caption"].rstrip(".").lower()
-                results[sample_id] = {
-                    "image_id": sample_id,
-                    "caption": caption,
-                }
+                results[sample_id] = {"image_id": sample_id, "caption": caption}
 
     results = list(results.values())
 
@@ -55,6 +53,7 @@ def coco_captioning_eval(input_path, groundtruth_file):
         print(f"{metric} {score * 100:.3f}")
 
     return coco_eval.eval['CIDEr']
+
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()

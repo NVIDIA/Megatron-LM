@@ -19,7 +19,7 @@ try:
     from megatron.core.extensions.kitchen import (
         HAVE_KITCHEN,
         KitchenColumnParallelGroupedLinear,
-        KitchenColumnParallelLinear,
+        KitchenColumnParallelLinear,  # noqa: F401
         KitchenDotProductAttention,
         KitchenFlashAttention,
         KitchenLayerNormColumnParallelLinear,
@@ -136,9 +136,9 @@ class TestGPTModelKitchenQuantizationConfig:
         visited_keys = set()
         for name, module in model.named_modules():
             if name in expected_types:
-                assert (
-                    type(module) == expected_types[name]
-                ), f"Expected {name} to be {expected_types[name]}, but it is {type(module)}"
+                assert type(module) == expected_types[name], (
+                    f"Expected {name} to be {expected_types[name]}, but it is {type(module)}"
+                )
                 visited_keys.add(name)
                 assert hasattr(module, "kitchen_quant_params")
                 assert module.kitchen_quant_params.params_config_key == expected_match[name][1]
@@ -251,9 +251,9 @@ class TestGPTModelKitchenQuantizationConfig:
         visited_keys = set()
         for name, module in model.named_modules():
             if name in expected_types:
-                assert (
-                    type(module) == expected_types[name]
-                ), f"Expected {name} to be {expected_types[name]}, but it is {type(module)}"
+                assert type(module) == expected_types[name], (
+                    f"Expected {name} to be {expected_types[name]}, but it is {type(module)}"
+                )
                 visited_keys.add(name)
                 assert hasattr(module, "kitchen_quant_params")
                 assert module.kitchen_quant_params.params_config_key == expected_match[name][1]
@@ -360,9 +360,9 @@ class TestGPTModelKitchenQuantizationConfig:
         visited_keys = set()
         for name, module in model.named_modules():
             if name in expected_types:
-                assert (
-                    type(module) == expected_types[name]
-                ), f"Expected {name} to be {expected_types[name]}, but it is {type(module)}"
+                assert type(module) == expected_types[name], (
+                    f"Expected {name} to be {expected_types[name]}, but it is {type(module)}"
+                )
                 visited_keys.add(name)
                 assert hasattr(module, "kitchen_quant_params")
                 assert module.kitchen_quant_params.params_config_key == expected_match[name][1]
@@ -487,9 +487,9 @@ class TestGPTModelKitchenQuantizationConfig:
         visited_keys = set()
         for name, module in model.named_modules():
             if name in expected_types:
-                assert (
-                    type(module) == expected_types[name]
-                ), f"Expected {name} to be {expected_types[name]}, but it is {type(module)}"
+                assert type(module) == expected_types[name], (
+                    f"Expected {name} to be {expected_types[name]}, but it is {type(module)}"
+                )
                 visited_keys.add(name)
                 assert hasattr(module, "kitchen_quant_params")
                 assert module.kitchen_quant_params.params_config_key == expected_match[name][1]
@@ -560,9 +560,9 @@ class TestGPTModelKitchenQuantizationConfig:
         visited_keys = set()
         for name, module in model.named_modules():
             if name in expected_types:
-                assert (
-                    type(module) == expected_types[name]
-                ), f"Expected {name} to be {expected_types[name]}, but it is {type(module)}"
+                assert type(module) == expected_types[name], (
+                    f"Expected {name} to be {expected_types[name]}, but it is {type(module)}"
+                )
                 visited_keys.add(name)
                 assert hasattr(module, "kitchen_quant_params")
                 assert module.kitchen_quant_params.params_config_key == expected_config_key
@@ -684,9 +684,9 @@ class TestGPTModelTEQuantizationConfig:
         visited_keys = set()
         for name, module in model.named_modules():
             if name in expected_types:
-                assert (
-                    type(module) == expected_types[name]
-                ), f"Expected {name} to be {expected_types[name]}, but it is {type(module)}"
+                assert type(module) == expected_types[name], (
+                    f"Expected {name} to be {expected_types[name]}, but it is {type(module)}"
+                )
                 visited_keys.add(name)
                 assert hasattr(module, "te_quant_params")
                 config_expected = expected_match[name][1]

@@ -183,7 +183,7 @@ class InferenceConfig:
     timestamp, useful for per-token latency analysis.
     """
 
-    metrics_writer: Optional["WandbModule"] = None
+    metrics_writer: Optional["WandbModule"] = None  # noqa: F821
     """Wandb module for writing metrics."""
 
     logging_step_interval: int = 0

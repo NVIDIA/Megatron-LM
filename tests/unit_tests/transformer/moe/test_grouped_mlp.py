@@ -25,7 +25,6 @@ if torch.cuda.is_available():
 
 @pytest.mark.skipif(is_te_min_version("1.9.0.dev0"), reason="Switch to TEGroupedMLP when TE>1.9.")
 class TestParallelGroupedMLP:
-
     def setup_method(self, method, use_cpu_initialization=False, swiglu=True):
         print("============")
         print(
@@ -149,7 +148,8 @@ class TestParallelGroupedMLP:
         assert torch.equal(gmm_expert1_fc1, smm_expert1_fc1)
         if not self.use_cpu_initialization:
             assert torch.equal(gmm_expert1_fc2, smm_expert1_fc2)
-        # the param init value is not exactly the same between gmm and smm (refer to test_weight_init_value_the_same.)
+        # the param init value is not exactly the same between
+        # gmm and smm (refer to test_weight_init_value_the_same.)
         # TODO: is it necessary to keep smm and gmm share exactly the same init params?
         # assert torch.equal(gmm_expert2_fc1, smm_expert2_fc1)
         if self.use_cpu_initialization:
@@ -204,7 +204,8 @@ class TestParallelGroupedMLP:
         reason='GroupedGEMM kernels are not supported on this device.',
     )
     def test_gradient_with_no_tokens_allocated(self):
-        """Test that when no token is passed in, the parameters of the grouped MLP will also have gradients."""
+        """Test that when no token is passed in, the parameters
+        of the grouped MLP will also have gradients."""
         self.grouped_mlp.cuda()
         num_allocated_tokens = 0
         tokens_per_expert = torch.zeros(self.num_experts)
@@ -224,7 +225,6 @@ class TestParallelGroupedMLP:
     reason="TE Grouped MLP is only supported in TE 1.9.0.dev0 and later.",
 )
 class TestTEGroupedMLP:
-
     def setup_method(self, method, use_cpu_initialization=False, swiglu=True):
         Utils.initialize_model_parallel(1, 1)
         num_layers = 1

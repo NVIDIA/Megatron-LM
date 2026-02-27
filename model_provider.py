@@ -12,26 +12,42 @@ from megatron.training import get_args, print_rank_0
 
 try:
     from megatron.post_training.model_builder import modelopt_gpt_mamba_builder
+
     has_nvidia_modelopt = True
 except ImportError:
     has_nvidia_modelopt = False
 
-import megatron.legacy.model  # isort: skip
+import megatron.legacy.model  # noqa: I001
 
 # NOTE: Loading `megatron.legacy.model` earlier fails due to circular import
 
 
 def model_provider(
-    model_builder: Callable, pre_process=True, post_process=True, vp_stage: Optional[int] = None, config=None, pg_collection=None,
+    model_builder: Callable,
+    pre_process=True,
+    post_process=True,
+    vp_stage: Optional[int] = None,
+    config=None,
+    pg_collection=None,
 ) -> Union[GPTModel, megatron.legacy.model.GPTModel, MambaModel]:
     """Builds the model.
 
-    If you set the use_legacy_models to True, it will return the legacy GPT model and if not the mcore GPT model.
+    If you set the use_legacy_models to True, it will return the
+    legacy GPT model and if not the mcore GPT model.
 
     Args:
-        model_builder: A callable that builds the actual model, its signature is the same as model_provider's with an exception of the first argument which is a builder itself. In addition might take a config passed from outside to skip its own config loading. See gpt_builder or mamba_builder for an example, see _gpt_model_builder in train_rl.py to see how to augment a default gpt builder and pass the config from outside
-        pre_process (bool, optional): Set to true if you need to compute embedings. Defaults to True.
-        post_process (bool, optional): Set to true if you need to compute output logits/loss. Defaults to True.
+        model_builder: A callable that builds the actual model, its
+            signature is the same as model_provider's with an
+            exception of the first argument which is a builder
+            itself. In addition might take a config passed from
+            outside to skip its own config loading. See gpt_builder
+            or mamba_builder for an example, see _gpt_model_builder
+            in train_rl.py to see how to augment a default gpt
+            builder and pass the config from outside
+        pre_process (bool, optional): Set to true if you need to
+            compute embedings. Defaults to True.
+        post_process (bool, optional): Set to true if you need to
+            compute output logits/loss. Defaults to True.
 
     Returns:
         Union[GPTModel, megatron.legacy.model.GPTModel, MambaModel]: The returned model
@@ -60,7 +76,9 @@ def model_provider(
         # [ModelOpt]: Use custom builder + spec when modelopt is enabled
         model_builder = modelopt_gpt_mamba_builder
 
-    return model_builder(args, pre_process, post_process, vp_stage, config=config, pg_collection=pg_collection)
+    return model_builder(
+        args, pre_process, post_process, vp_stage, config=config, pg_collection=pg_collection
+    )
 
 
 def count_parameters_in_layer(model, layer_name):

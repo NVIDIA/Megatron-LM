@@ -1,6 +1,5 @@
 # Copyright (c) 2023, NVIDIA CORPORATION. All rights reserved.
 
-import inspect
 import os
 
 import pytest
@@ -19,7 +18,6 @@ from tests.unit_tests.test_utilities import Utils
 
 
 class TestGPTModel:
-
     def setup_method(self, method):
         os.environ.pop('NVTE_FUSED_ATTN', None)
         os.environ.pop('NVTE_FLASH_ATTN', None)
@@ -373,9 +371,9 @@ class TestIsLayerWindowAttention:
                 result = is_layer_window_attention(
                     config.window_size, config.window_attn_skip_freq, layer_number
                 )
-                assert (
-                    result == expected_result
-                ), f"Scenario {i+1}, Layer {layer_number}: expected {expected_result}, got {result}"
+                assert result == expected_result, (
+                    f"Scenario {i + 1}, Layer {layer_number}: expected {expected_result}, got {result}"  # noqa: E501
+                )
 
 
 class TestIsLayerWindowAttentionIntegration:

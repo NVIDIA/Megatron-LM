@@ -18,7 +18,6 @@ from tests.unit_tests.test_utilities import Utils
 
 
 class TestParallelTransformerLayer:
-
     def setup_method(self, method):
         Utils.initialize_model_parallel(1, 1)
         model_parallel_cuda_manual_seed(123)
@@ -71,7 +70,6 @@ class TestParallelTransformerLayer:
                 hidden_states,
                 inference_context,
             ):
-
                 transformer_config = TransformerConfig(
                     num_layers=2,
                     hidden_size=12,

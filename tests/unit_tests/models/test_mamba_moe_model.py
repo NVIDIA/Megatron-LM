@@ -1,6 +1,5 @@
 # Copyright (c) 2024, NVIDIA CORPORATION. All rights reserved.
 
-import hashlib
 import inspect
 import json
 import os
@@ -333,7 +332,7 @@ def assert_config_matches_golden(cfg: Any) -> None:
             "Please contact NV-username @jbarker if you are unsure how to proceed.\n"
         )
 
-        header = "Mamba MoE config drift detected!\n" "═" * 60 + "".join(guidance_parts)
+        header = "Mamba MoE config drift detected!\n═" * 60 + "".join(guidance_parts)
         parts = [header]
         if changed:
             formatted = {k: {"expected": golden[k], "actual": current[k]} for k in sorted(changed)}
@@ -434,7 +433,7 @@ class TestMambaMoEModel:
         args.is_hybrid_model = True
         args.tokenizer_type = "TikTokenizer"
         args.tiktoken_pattern = "v2"
-        args.tokenizer_model = "/mnt/artifacts/model/nemotron6/tokenizers/multiMixV8.gpt4o_nc_sd.500000.128k.vocab.json"
+        args.tokenizer_model = "/mnt/artifacts/model/nemotron6/tokenizers/multiMixV8.gpt4o_nc_sd.500000.128k.vocab.json"  # noqa: E501
         args.padded_vocab_size = 131072
 
         # The following args would be set in the user's nano v3 config.
@@ -475,7 +474,6 @@ class TestMambaMoEModel:
         return args
 
     def setup_method(self, method):
-
         os.environ['CUDA_DEVICE_MAX_CONNECTIONS'] = '1'
         args = self.create_test_args()
         set_args(args)
@@ -517,14 +515,13 @@ class TestMambaMoEModel:
         assert self.model.post_process is True, "post_process should be True"
         assert self.model.hybrid_attention_ratio == 0.0, "hybrid_attention_ratio should be 0.0"
         assert self.model.hybrid_mlp_ratio == 0.0, "hybrid_mlp_ratio should be 0.0"
-        assert (
-            self.model.hybrid_override_pattern == args.hybrid_override_pattern
-        ), f"hybrid_override_pattern should be {args.hybrid_override_pattern}"
+        assert self.model.hybrid_override_pattern == args.hybrid_override_pattern, (
+            f"hybrid_override_pattern should be {args.hybrid_override_pattern}"
+        )
         num_weights = sum([p.numel() for p in self.model.parameters()])
         assert num_weights == 8449294624, f"Expected 8449294624 parameters, got {num_weights}"
 
     def test_set_input_tensor(self):
-
         args = get_args()
 
         config: TransformerConfig = self.model.config

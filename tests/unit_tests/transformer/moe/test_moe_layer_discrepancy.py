@@ -1,16 +1,11 @@
 # Copyright (c) 2023, NVIDIA CORPORATION. All rights reserved.
 
-import time
 
 import pytest
 import torch
 
 from megatron.core import parallel_state
-from megatron.core.models.gpt.gpt_layer_specs import (
-    get_gpt_layer_local_spec,
-    get_gpt_layer_with_transformer_engine_spec,
-)
-from megatron.core.transformer.moe.moe_layer import MoELayer
+from megatron.core.models.gpt.gpt_layer_specs import get_gpt_layer_with_transformer_engine_spec
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.transformer.transformer_layer import TransformerLayer
 from megatron.training.initialize import _set_random_seed
@@ -98,9 +93,13 @@ class TestMoELayerDispatcherDiscrepancy:
             ag_output = ag_moe_layer(input)[0]
             a2a_output = a2a_moe_layer(input)[0]
 
-        assert torch.allclose(
-            ag_output, a2a_output, atol=1e-6
-        ), f"Ag output: {ag_output.min()}, {ag_output.max()}, {ag_output.sum()}, a2a output: {a2a_output.min()}, {a2a_output.max()}, {a2a_output.sum()}, diff: {torch.abs(ag_output - a2a_output).max()}"
+        assert torch.allclose(ag_output, a2a_output, atol=1e-6), (
+            f"Ag output: {ag_output.min()}, "
+            f"{ag_output.max()}, {ag_output.sum()}, "
+            f"a2a output: {a2a_output.min()}, "
+            f"{a2a_output.max()}, {a2a_output.sum()}, "
+            f"diff: {torch.abs(ag_output - a2a_output).max()}"
+        )
         # print(f"Allgather and A2A output is the same", flush=True)
 
         Utils.destroy_model_parallel()
@@ -167,10 +166,16 @@ class TestMoELayerDispatcherDiscrepancy:
                 if not torch.allclose(ag_output_ag[0], ag_output_ag[i]):
                     print(f"Allgather output differs at rank {torch.distributed.get_rank()}")
                     print(
-                        f"ag_output_ag[0]: min {ag_output_ag[0].double().min()}, max {ag_output_ag[0].double().max()}, std {ag_output_ag[0].double().std()}"
+                        f"ag_output_ag[0]: "
+                        f"min {ag_output_ag[0].double().min()}, "
+                        f"max {ag_output_ag[0].double().max()}, "
+                        f"std {ag_output_ag[0].double().std()}"
                     )
                     print(
-                        f"ag_output_ag[{i}]: min {ag_output_ag[i].double().min()}, max {ag_output_ag[i].double().max()}, std {ag_output_ag[i].double().std()}"
+                        f"ag_output_ag[{i}]: "
+                        f"min {ag_output_ag[i].double().min()}, "
+                        f"max {ag_output_ag[i].double().max()}, "
+                        f"std {ag_output_ag[i].double().std()}"
                     )
                     raise ValueError("Allgather output differs at rank {i}")
         torch.cuda.synchronize()
@@ -236,10 +241,13 @@ class TestMoELayerDispatcherDiscrepancy:
             for i in range(1, parallel_state.get_tensor_model_parallel_world_size()):
                 if not torch.equal(at_output_ag[0], at_output_ag[i]):
                     print(
-                        f"at_output_ag[0]: min {at_output_ag[0].double().min()}, max {at_output_ag[0].double().max()}, sum {at_output_ag[0].double().sum()}"
+                        f"at_output_ag[0]: "
+                        f"min {at_output_ag[0].double().min()}, "
+                        f"max {at_output_ag[0].double().max()}, "
+                        f"sum {at_output_ag[0].double().sum()}"
                     )
                     print(
-                        f"at_output_ag[{i}]: min {at_output_ag[i].double().min()}, max {at_output_ag[i].double().max()}, sum {at_output_ag[i].double().sum()}"
+                        f"at_output_ag[{i}]: min {at_output_ag[i].double().min()}, max {at_output_ag[i].double().max()}, sum {at_output_ag[i].double().sum()}"  # noqa: E501
                     )
                     print(f"diff {torch.abs(at_output_ag[0] - at_output_ag[i]).max()}")
                     print(f"A2A output differs at rank {torch.distributed.get_rank()}")

@@ -20,7 +20,7 @@ from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.utils import internal_api, is_te_min_version
 
 try:
-    import transformer_engine as te  # pylint: disable=unused-import
+    import transformer_engine as te  # noqa: F401
 
     from megatron.core.extensions.transformer_engine import (
         fused_compute_score_for_moe_aux_loss,
@@ -1003,8 +1003,8 @@ def reduce_aux_losses_tracker_across_ranks(
 def track_moe_metrics(
     loss_scale: float,
     iteration: int,
-    writer: Optional["SummaryWriter"] = None,
-    wandb_writer: Optional["wandb.Run"] = None,
+    writer: Optional["SummaryWriter"] = None,  # noqa: F821
+    wandb_writer: Optional["wandb.Run"] = None,  # noqa: F821
     total_loss_dict: Optional[dict[str, torch.Tensor]] = None,
     per_layer_logging: bool = False,
     force_initialize: bool = False,
@@ -1453,9 +1453,9 @@ class MoECudaGraphTensorStore:
                 'shared_expert_output',
             ], f"Invalid field name: {field_name}"
             if value is not None:
-                assert isinstance(
-                    value, torch.Tensor
-                ), f"Value must be a torch.Tensor, got {type(value)} for field {field_name}"
+                assert isinstance(value, torch.Tensor), (
+                    f"Value must be a torch.Tensor, got {type(value)} for field {field_name}"
+                )
                 setattr(self, field_name, value)
 
     def clear(self):
@@ -1503,7 +1503,6 @@ def maybe_skip_or_early_return_by_cudagraph(step_condition):
                 raise MoECudaGraphPartialCaptureSignal(moe_layer, "preprocess", **kwargs)
 
     def decorator(func):
-
         @functools.wraps(func)
         def wrapped_func(moe_layer, *args, **kwargs):
             """
@@ -1521,9 +1520,9 @@ def maybe_skip_or_early_return_by_cudagraph(step_condition):
             if not is_graph_capturing() and moe_layer.cudagraph_tensor_store.is_empty():
                 return func(moe_layer, *args, **kwargs)
 
-            assert (
-                not is_graph_capturing() or moe_layer.cudagraph_tensor_store.is_empty()
-            ), "cudagraph_tensor_store cannot be used when it is capturing cuda graph."
+            assert not is_graph_capturing() or moe_layer.cudagraph_tensor_store.is_empty(), (
+                "cudagraph_tensor_store cannot be used when it is capturing cuda graph."
+            )
             if step_condition == "shared_experts_compute":
                 if moe_layer.cudagraph_tensor_store.shared_expert_output is None:
                     # Don't skip the shared expert computation.
@@ -1535,9 +1534,9 @@ def maybe_skip_or_early_return_by_cudagraph(step_condition):
             elif step_condition == "route":
                 if moe_layer.cudagraph_tensor_store.probs is None:
                     # Don't skip the router.
-                    assert (
-                        moe_layer.cudagraph_tensor_store.routing_map is None
-                    ), "routing_map must be None if probs is None"
+                    assert moe_layer.cudagraph_tensor_store.routing_map is None, (
+                        "routing_map must be None if probs is None"
+                    )
                     probs, routing_map = func(moe_layer, *args, **kwargs)
 
                     # Maybe early return after the router.

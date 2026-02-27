@@ -16,7 +16,6 @@ from tests.unit_tests.test_utilities import Utils
 
 
 class Test:
-
     transformer_config = TransformerConfig(
         num_layers=1, hidden_size=12, num_attention_heads=4, use_cpu_initialization=True
     )
@@ -26,7 +25,6 @@ class Test:
 
     @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
     def test_embedding_init(self):
-
         Utils.initialize_model_parallel(1, 1)
         torch.manual_seed(42)
         model_parallel_cuda_manual_seed(42)
@@ -55,7 +53,6 @@ class Test:
 
     @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
     def test_row_init(self):
-
         Utils.initialize_model_parallel(1, 1)
         torch.manual_seed(42)
         model_parallel_cuda_manual_seed(42)
@@ -90,7 +87,6 @@ class Test:
 
     @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
     def test_col_init(self):
-
         Utils.initialize_model_parallel(1, 1)
         torch.manual_seed(42)
         model_parallel_cuda_manual_seed(42)
@@ -124,7 +120,6 @@ class Test:
     @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
     @pytest.mark.timeout(100)
     def test_te_col_init(self):
-
         Utils.initialize_model_parallel(1, 1)
         torch.manual_seed(42)
         model_parallel_cuda_manual_seed(42)
@@ -162,7 +157,6 @@ class Test:
     @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
     @pytest.mark.timeout(100)
     def test_te_row_init(self):
-
         Utils.initialize_model_parallel(1, 1)
         torch.manual_seed(42)
         model_parallel_cuda_manual_seed(42)

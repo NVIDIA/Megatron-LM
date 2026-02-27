@@ -241,9 +241,9 @@ class TestLayerWiseOptimizer:
 
         # Verify the sharded_state_dict is not None and has expected structure
         assert sharded_state_dict is not None, "Sharded state dict should not be None"
-        assert (
-            'optimizer' in sharded_state_dict
-        ), "Sharded state dict should contain 'optimizer' key"
+        assert 'optimizer' in sharded_state_dict, (
+            "Sharded state dict should contain 'optimizer' key"
+        )
 
         # Verify that replica_id is set correctly (should be 0 for DP dimension)
         from megatron.core.dist_checkpointing import ShardedTensor
@@ -251,12 +251,14 @@ class TestLayerWiseOptimizer:
 
         for sh_base in nested_values(sharded_state_dict):
             if isinstance(sh_base, ShardedTensor):
-                assert (
-                    len(sh_base.replica_id) == 3
-                ), f'Expected replica_id format (PP, TP, DP), got: {sh_base.replica_id}'
-                assert (
-                    sh_base.replica_id[2] == 0
-                ), f'Expected DP replica_id to be 0 for layer-wise optimizer, got: {sh_base.replica_id[2]}'
+                assert len(sh_base.replica_id) == 3, (
+                    f'Expected replica_id format (PP, TP, DP), got: {sh_base.replica_id}'
+                )
+                assert sh_base.replica_id[2] == 0, (
+                    'Expected DP replica_id to be 0 for '
+                    'layer-wise optimizer, got: '
+                    f'{sh_base.replica_id[2]}'
+                )
 
     def test_multiple_optimizers(self):
         """Test LayerWiseDistributedOptimizer with multiple chained optimizers.
@@ -311,9 +313,9 @@ class TestLayerWiseOptimizer:
         model, optimizer, pg_collection = self.create_model_and_optimizer()
 
         # Verify bf16 wrapping happened
-        assert isinstance(
-            optimizer.chained_optimizers[0], Float16OptimizerWithFloat16Params
-        ), "Optimizer should be wrapped in Float16OptimizerWithFloat16Params"
+        assert isinstance(optimizer.chained_optimizers[0], Float16OptimizerWithFloat16Params), (
+            "Optimizer should be wrapped in Float16OptimizerWithFloat16Params"
+        )
 
         for param in model.parameters():
             param.grad = torch.randn_like(param)
@@ -323,7 +325,8 @@ class TestLayerWiseOptimizer:
         assert update_successful, "Optimizer step should be successful"
 
     def test_bf16_error(self):
-        """Test LayerWiseDistributedOptimizer raises error when receiving pre-wrapped Float16 optimizer."""
+        """Test LayerWiseDistributedOptimizer raises error
+        when receiving pre-wrapped Float16 optimizer."""
         model = SimpleModel().bfloat16().cuda()
         model.requires_grad_(True)
 

@@ -218,7 +218,7 @@ class MegatronFSDP(torch.nn.Module):
                 overlap_grad_reduce=True,
                 overlap_param_gather=True,
                 average_in_collective=False,
-                keep_fp8_transpose_cache=keep_fp8_transpose_cache,  # pylint: disable=C0301
+                keep_fp8_transpose_cache=keep_fp8_transpose_cache,  # noqa: E501
                 nccl_ub=nccl_ub,
                 fsdp_double_buffer=fsdp_double_buffer or nccl_ub,
                 fsdp_db_use_persist_buf_on_alloc_fail=fsdp_db_use_persist_buf_on_alloc_fail,
@@ -887,9 +887,9 @@ class MegatronFSDP(torch.nn.Module):
                 lazy_release = False
                 module._training_state = TrainingState.IDLE
 
-            assert isinstance(
-                module, tuple(fsdp_unit_modules)
-            ), "_post_forward hook should only be registered on FSDP unit modules."
+            assert isinstance(module, tuple(fsdp_unit_modules)), (
+                "_post_forward hook should only be registered on FSDP unit modules."
+            )
 
             # Release the module parameters after the forward pass to save memory.
             release_module_parameters(module, bwd=False, lazy=lazy_release)
@@ -1278,9 +1278,9 @@ class MegatronFSDP(torch.nn.Module):
                 if id(param) == id(old_weight):
                     shared_param = new_params.get(old_name)
                     break
-            assert (
-                shared_param is not None
-            ), f"Parameter {name} not found in new parameters or as a shared weight."
+            assert shared_param is not None, (
+                f"Parameter {name} not found in new parameters or as a shared weight."
+            )
 
             # Replace the module parameter with the restored shared parameter.
             _replace_module_parameter(self.module, name, shared_param)

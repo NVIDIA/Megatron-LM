@@ -6,7 +6,6 @@ from argparse import Namespace
 
 import torch
 
-import pretrain_t5
 from megatron.core.inference.engines import AbstractEngine, StaticInferenceEngine
 from megatron.core.inference.inference_request import InferenceRequest
 from megatron.core.inference.model_inference_wrappers.inference_wrapper_config import (
@@ -16,7 +15,7 @@ from megatron.core.inference.model_inference_wrappers.t5.t5_inference_wrapper im
     T5InferenceWrapper,
 )
 from megatron.core.inference.sampling_params import SamplingParams
-from megatron.core.inference.text_generation_controllers.encoder_decoder_text_generation_controller import (
+from megatron.core.inference.text_generation_controllers.encoder_decoder_text_generation_controller import (  # noqa: E501
     EncoderDecoderTextGenerationController,
 )
 from megatron.core.tokenizers.utils.build_tokenizer import build_tokenizer
@@ -29,8 +28,7 @@ sys.path.append(
 
 from typing import List
 
-from megatron.core import mpu
-from megatron.training import get_args, get_model, get_tokenizer
+from megatron.training import get_args, get_model
 from megatron.training.checkpointing import load_checkpoint
 from megatron.training.initialize import initialize_megatron
 
@@ -70,7 +68,9 @@ def add_text_generate_args(parser):
 def get_inference_engine(args: Namespace, model: MegatronModule) -> AbstractEngine:
     """Utility to get the relevant backend for running inference
 
-    This function will automatically chose the TRTLLMBackend when possible, and if not revert to Mcore backend if the user does not specify any backends. TRT LLM Backend is not implmented yet.
+    This function will automatically chose the TRTLLMBackend when possible,
+    and if not revert to Mcore backend if the user does not specify any
+    backends. TRT LLM Backend is not implemented yet.
 
     Args:
         args (Namespace): The user arguments parsed from command line
@@ -102,8 +102,8 @@ def get_inference_engine(args: Namespace, model: MegatronModule) -> AbstractEngi
 def main():
     """Main program."""
 
-    # Note: The default args passed here can be overwritten by using appropriate params (check arguments.py file)
-    # Micro batch size is not needed to be set by user. (It is calculated based on inference-batch-times-seqlen-threshold argument)
+    # Note: The default args passed here can be overwritten by using appropriate params (check arguments.py file)  # noqa: E501
+    # Micro batch size is not needed to be set by user. (It is calculated based on inference-batch-times-seqlen-threshold argument)  # noqa: E501
     initialize_megatron(
         extra_args_provider=add_text_generate_args,
         args_defaults={

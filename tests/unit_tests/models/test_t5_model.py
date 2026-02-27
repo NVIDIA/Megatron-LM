@@ -1,20 +1,15 @@
 # Copyright (c) 2023, NVIDIA CORPORATION. All rights reserved.
 
 import os
-from copy import deepcopy
 
 import pytest
 import torch
-from packaging.version import Version as PkgVersion
-from pytest_mock import mocker
 
 import megatron.core.parallel_state as ps
 from megatron.core.datasets.t5_dataset import T5MaskedWordPieceDataset
 from megatron.core.models.T5.t5_model import T5Model
 from megatron.core.models.T5.t5_spec import (
-    get_t5_decoder_with_local_block_spec,
     get_t5_decoder_with_transformer_engine_block_spec,
-    get_t5_encoder_with_local_block_spec,
     get_t5_encoder_with_transformer_engine_block_spec,
 )
 from megatron.core.process_groups_config import ProcessGroupCollection
@@ -24,7 +19,6 @@ from tests.unit_tests.test_utilities import Utils
 
 
 class TestT5Model:
-
     def setup_method(self, method):
         tp = 4
         pp = 1
@@ -128,7 +122,6 @@ class TestT5Model:
 
 
 class TestT5ModelAttentionDimensions:
-
     def teardown_method(self, method):
         os.environ.pop('NVTE_FUSED_ATTN', None)
         os.environ.pop('NVTE_FLASH_ATTN', None)

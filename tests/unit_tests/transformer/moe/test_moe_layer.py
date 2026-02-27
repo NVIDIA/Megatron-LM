@@ -10,7 +10,6 @@ from megatron.core.models.gpt.gpt_layer_specs import (
 )
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
 from megatron.core.transformer.moe.moe_layer import MoELayer
-from megatron.core.transformer.moe.router import Router
 from megatron.core.transformer.transformer_block import TransformerBlock
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.utils import is_te_min_version
@@ -139,7 +138,6 @@ class TestMoELayerInit:
 
 
 class TestInterleaveTransformerBlock:
-
     @pytest.mark.parametrize("moe_layer_freq", [2, eval("[0,1,1,1]"), eval("[0]*2+[1]*2")])
     def test_interleave_transformer_block(self, moe_layer_freq):
         Utils.initialize_model_parallel(1, 1)
@@ -264,9 +262,9 @@ class TestMoELayerFP16:
         loss.backward()
 
         assert hidden_states.grad is not None, "Input gradients should exist"
-        assert (
-            hidden_states.grad.dtype == torch.float16
-        ), f"Expected fp16 gradients, got {hidden_states.grad.dtype}"
+        assert hidden_states.grad.dtype == torch.float16, (
+            f"Expected fp16 gradients, got {hidden_states.grad.dtype}"
+        )
 
         for name, param in moe_layer.named_parameters():
             if param.requires_grad:
@@ -384,9 +382,9 @@ class TestMoELayerRecompute:
         loss.backward()
 
         assert hidden_states.grad is not None, "Input gradients should exist"
-        assert (
-            hidden_states.grad.dtype == torch.bfloat16
-        ), f"Expected bf16 gradients, got {hidden_states.grad.dtype}"
+        assert hidden_states.grad.dtype == torch.bfloat16, (
+            f"Expected bf16 gradients, got {hidden_states.grad.dtype}"
+        )
 
         for name, param in moe_layer.named_parameters():
             if param.requires_grad:

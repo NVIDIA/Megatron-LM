@@ -31,7 +31,6 @@ except ImportError:
     HAVE_TQDM = False
 
 
-# pylint: disable=line-too-long
 class StaticInferenceEngine(AbstractEngine):
     """The Megatron core backend constructor
 
@@ -58,7 +57,7 @@ class StaticInferenceEngine(AbstractEngine):
         self.legacy = legacy
         if legacy:
             warnings.warn(
-                "The static engine will be deprecated and removed in the future version of megatron-core. Switch to DynamicInferenceEngine."
+                "The static engine will be deprecated and removed in the future version of megatron-core. Switch to DynamicInferenceEngine."  # noqa: E501
             )
         else:
             warnings.warn(
@@ -161,9 +160,9 @@ class StaticInferenceEngine(AbstractEngine):
         Returns:
             The newly created request ID.
         """
-        assert (
-            prompt is not None or inference_request is not None
-        ), f"At least one of `prompt` or `inference_request` must be specified"
+        assert prompt is not None or inference_request is not None, (
+            f"At least one of `prompt` or `inference_request` must be specified"
+        )
 
         if sampling_params is None and inference_parameters is not None:
             warnings.warn(
@@ -242,7 +241,7 @@ class StaticInferenceEngine(AbstractEngine):
                 prompts=prompts, sampling_params=sampling_params
             )
 
-        # Return the underlying `InferenceRequest` objects from the `DynamicInferenceRequestRecord`s.
+        # Return the underlying `InferenceRequest` objects from the `DynamicInferenceRequestRecord`s.  # noqa: E501
         return [record.merge() for record in request_records]
 
     def generate_using_legacy_static_engine(

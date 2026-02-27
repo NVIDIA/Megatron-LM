@@ -19,7 +19,7 @@ except ImportError:
 
 try:
     # Register the TE CUDA kernels
-    import transformer_engine  # pylint: disable=unused-import
+    import transformer_engine  # noqa: F401
 
     # Alias the PyTorch wrapper so we can call tex.* APIs
     import transformer_engine_torch as tex
@@ -96,9 +96,9 @@ class MambaContextParallel:
         self.cp_rank = self.cp_group.rank()
 
         # Ensure that each CP rank gets at least one head:
-        assert (
-            self.nheads_local_tp % self.cp_size == 0
-        ), "nheads must be evenly divisible by tp_size * cp_size"
+        assert self.nheads_local_tp % self.cp_size == 0, (
+            "nheads must be evenly divisible by tp_size * cp_size"
+        )
         # Note that an upper-bound on cp_size is nheads // tp_size
         self.nheads_local_tpcp = self.nheads_local_tp // self.cp_size
 
@@ -110,16 +110,16 @@ class MambaContextParallel:
 
         # Ensure that each CP rank gets a positive integer number of groups:
         if self.ngroups_local_tp < self.cp_size:
-            assert (
-                self.cp_size % self.ngroups_local_tp == 0
-            ), "cp_size must be evenly divisible by ngroups/tp_size"
+            assert self.cp_size % self.ngroups_local_tp == 0, (
+                "cp_size must be evenly divisible by ngroups/tp_size"
+            )
             # Need to replicate the group state (shard the heads of each group) across CP ranks:
             self.group_repeat_count = self.cp_size // self.ngroups_local_tp
             self.ngroups_local_tpcp = 1
         else:
-            assert (
-                self.ngroups_local_tp % self.cp_size == 0
-            ), "ngroups must be evenly divisible by tp_size * cp_size"
+            assert self.ngroups_local_tp % self.cp_size == 0, (
+                "ngroups must be evenly divisible by tp_size * cp_size"
+            )
             # Group state is not replicted across CP ranks. All heads for any group are present on
             # one CP rank
             self.group_repeat_count = 1

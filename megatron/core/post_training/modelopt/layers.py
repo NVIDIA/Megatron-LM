@@ -79,9 +79,9 @@ class Norm:
                 **_get_extra_te_kwargs(config),
             )
         elif config.normalization == "RMSNorm":
-            assert hasattr(
-                te.pytorch, "RMSNorm"
-            ), "Transformer-Engine >= v0.11 required to use this feature"
+            assert hasattr(te.pytorch, "RMSNorm"), (
+                "Transformer-Engine >= v0.11 required to use this feature"
+            )
             instance = te.pytorch.RMSNorm(
                 hidden_size=hidden_size,
                 eps=eps,

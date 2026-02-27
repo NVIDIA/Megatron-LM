@@ -17,10 +17,10 @@ def test_LinearWithFrozenWeight(tensor_parallel, allreduce_dgrad):
     input_data = torch.eye(8).cuda()
     input_data.requires_grad = True
 
-    # Weight is an 8x8 matrix of all ones. If tensor parallelism > 1, the weight is partitioned evenly across GPUs.
+    # Weight is an 8x8 matrix of all ones. If tensor parallelism > 1, the weight is partitioned evenly across GPUs.  # noqa: E501
     weight = torch.ones((size_per_partition, 8)).cuda()
 
-    # Bias is a vector of length 8 of all zeros. If tensor parallelism > 1, the bias is partitioned evenly across GPUs
+    # Bias is a vector of length 8 of all zeros. If tensor parallelism > 1, the bias is partitioned evenly across GPUs  # noqa: E501
     bias = torch.zeros((size_per_partition)).cuda()
 
     gradient_accumulation_fusion = False

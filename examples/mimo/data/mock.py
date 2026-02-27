@@ -124,11 +124,7 @@ class MockVLMDataset(Dataset):
             "labels": labels,
             "loss_mask": loss_mask,
             "position_ids": position_ids,
-            "modality_inputs": {
-                "clip_encoder": {
-                    "images": image,
-                }
-            },
+            "modality_inputs": {"clip_encoder": {"images": image}},
         }
 
     def _mock_tokenize(self) -> torch.Tensor:
@@ -143,17 +139,12 @@ class MockVLMDataset(Dataset):
 
         # Image placeholder tokens ─ placed at the beginning of the sequence to mimic
         # the layout produced by many VLM tokenizers.
-        image_tokens = torch.full(
-            (self.image_seq_length,), self.image_token_id, dtype=torch.long
-        )
+        image_tokens = torch.full((self.image_seq_length,), self.image_token_id, dtype=torch.long)
 
         # Random text tokens drawn uniformly in ``[1, vocab_size)`` (we reserve ``0`` for pad).
         num_text_tokens = self.seq_len - self.image_seq_length
         text_tokens = torch.randint(
-            low=1,
-            high=self.vocab_size,
-            size=(num_text_tokens,),
-            dtype=torch.long,
+            low=1, high=self.vocab_size, size=(num_text_tokens,), dtype=torch.long
         )
 
         # Concatenate to form the full sequence.
@@ -229,11 +220,7 @@ def _collate_fn(batch: List[Dict]) -> Dict[str, torch.Tensor]:
         "labels": labels,
         "loss_mask": loss_mask,
         "position_ids": position_ids,
-        "modality_inputs": {
-            "clip_encoder": {
-                "images": images,
-            }
-        },
+        "modality_inputs": {"clip_encoder": {"images": images}},
     }
 
 
@@ -252,7 +239,6 @@ def train_valid_test_datasets_provider(train_val_test_num_samples):
 
     # Only build dataset on tensor parallel rank 0
     if mpu.get_tensor_model_parallel_rank() == 0:
-
         from examples.mimo.data.mock import MockVLMDataset
 
         train_dataset = MockVLMDataset(
@@ -282,6 +268,7 @@ def train_valid_test_datasets_provider(train_val_test_num_samples):
         test_dataset = None
 
     return train_dataset, valid_dataset, test_dataset
+
 
 if __name__ == "__main__":
     print("\nCreating mock VLM dataloader...")

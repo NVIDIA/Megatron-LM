@@ -45,7 +45,7 @@ from torch.distributed import DeviceMesh, ProcessGroup
 logger = logging.getLogger(__name__)
 
 try:
-    import transformer_engine  # pylint: disable=W0611
+    import transformer_engine  # noqa: F401
 
     HAVE_TE = True
 except (ImportError, ModuleNotFoundError):
@@ -693,9 +693,9 @@ class FSDPDistributedIndex:
             AssertionError: If full-shard hybrid FSDP is not enabled.
         """
         assert HAVE_EINOPS, "get_logical_hybrid_fsdp_rank requires einops to be installed."
-        assert (
-            self.hsdp_outer_dp_shard
-        ), "get_logical_hybrid_fsdp_rank is only valid when full-shard hybrid FSDP is enabled."
+        assert self.hsdp_outer_dp_shard, (
+            "get_logical_hybrid_fsdp_rank is only valid when full-shard hybrid FSDP is enabled."
+        )
 
         _hybrid_fsdp_group_name = (
             "_hybrid_fsdp_group_ranks"

@@ -295,9 +295,9 @@ def combined_forward_backward_step(
                 # forward_postprocess() // the same as the forward_step()
                 # backward_postprocess() // the same as the backward_step()
     """
-    assert (
-        checkpoint_activations_microbatch is None
-    ), "checkpoint_activations_microbatch is not supported for overlap_moe_expert_parallel_comm"
+    assert checkpoint_activations_microbatch is None, (
+        "checkpoint_activations_microbatch is not supported for overlap_moe_expert_parallel_comm"
+    )
 
     from .schedules import set_current_microbatch
 
@@ -342,9 +342,9 @@ def combined_forward_backward_step(
             f_schedule_plan, loss_func = forward_step_func(
                 data_iterator, unwrapped_model, return_schedule_plan=True
             )
-            assert isinstance(
-                f_schedule_plan, AbstractSchedulePlan
-            ), "first output of forward_step_func must be one instance of AbstractSchedulePlan"
+            assert isinstance(f_schedule_plan, AbstractSchedulePlan), (
+                "first output of forward_step_func must be one instance of AbstractSchedulePlan"
+            )
 
     # backward preprocess, the same as the backward_step()
     unwrap_input_tensor_grad = False

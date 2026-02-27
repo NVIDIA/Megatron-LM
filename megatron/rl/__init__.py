@@ -17,7 +17,10 @@ def import_class(class_path: str) -> Type:
     """Import a class from a string path.
 
     Args:
-        class_path: String path to the class (e.g. 'examples.rl.environments.countdown.countdown_agent.CountdownAgent' or '../environments.countdown.py:CountdownAgent')
+        class_path: String path to the class
+            (e.g. 'examples.rl.environments.countdown
+            .countdown_agent.CountdownAgent' or
+            '../environments.countdown.py:CountdownAgent')
 
     Returns:
         The class object

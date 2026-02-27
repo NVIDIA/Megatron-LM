@@ -13,7 +13,7 @@ from megatron.core.transformer.transformer_layer import TransformerLayer, Transf
 from megatron.core.typed_torch import not_none
 
 try:
-    import transformer_engine as te  # pylint: disable=unused-import
+    import transformer_engine as te  # noqa: F401
 
     from megatron.core.extensions.transformer_engine import (
         TEDotProductAttention,
@@ -31,7 +31,7 @@ except ImportError:
     HAVE_TE = False
 
 try:
-    import apex  # pylint: disable=unused-import
+    import apex  # noqa: F401
 
     from megatron.core.fusions.fused_layer_norm import FusedLayerNorm
 

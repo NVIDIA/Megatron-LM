@@ -24,7 +24,7 @@ from megatron.core.transformer.transformer_layer import TransformerLayerSubmodul
 from megatron.core.utils import deprecate_inference_params, log_single_rank
 
 try:
-    import transformer_engine  # pylint: disable=unused-import
+    import transformer_engine  # noqa: F401
 
     from megatron.core.extensions.transformer_engine import TEDotProductAttention
     from megatron.core.utils import is_te_min_version
@@ -170,17 +170,17 @@ class LLaVAModel(MegatronModule):
                 attn_submodules = (
                     language_transformer_layer_spec.submodules.self_attention.submodules
                 )
-                assert (
-                    attn_submodules.core_attention == TEDotProductAttention and HAVE_TE
-                ), "Sequence/Context Parallelism is supported only with TE DotProductAttention."
+                assert attn_submodules.core_attention == TEDotProductAttention and HAVE_TE, (
+                    "Sequence/Context Parallelism is supported only with TE DotProductAttention."
+                )
             if self.context_parallel_lm > 1:
                 self.cp_group = self.pg_collection.cp
-                assert (
-                    self.cp_group.size() == self.context_parallel_lm
-                ), "CP Group size should match the Language Model CP size"
-                assert is_te_min_version(
-                    "1.10.0"
-                ), "Context Parallelism in LLaVA requires TE v1.10 or higher"
+                assert self.cp_group.size() == self.context_parallel_lm, (
+                    "CP Group size should match the Language Model CP size"
+                )
+                assert is_te_min_version("1.10.0"), (
+                    "Context Parallelism in LLaVA requires TE v1.10 or higher"
+                )
             else:
                 self.cp_group = None
         self.tensor_model_parallel_size_lm = language_transformer_config.tensor_model_parallel_size
@@ -335,9 +335,7 @@ class LLaVAModel(MegatronModule):
                 )
             else:
                 raise ValueError(
-                    "Vision model "
-                    f"{vision_transformer_config.vision_model_type} is not "
-                    "supported."
+                    f"Vision model {vision_transformer_config.vision_model_type} is not supported."
                 )
 
             self.vision_model.register_load_state_dict_post_hook(
@@ -506,9 +504,9 @@ class LLaVAModel(MegatronModule):
 
         has_labels = labels is not None
         if has_labels:
-            assert (
-                labels.shape == loss_mask.shape
-            ), f"mismatching labels shape {labels.shape} and loss mask shape {loss_mask.shape}"
+            assert labels.shape == loss_mask.shape, (
+                f"mismatching labels shape {labels.shape} and loss mask shape {loss_mask.shape}"
+            )
 
         # Create indices for new text and label positions.
         with torch.no_grad():
@@ -649,9 +647,9 @@ class LLaVAModel(MegatronModule):
             final_loss_mask[valid_batch_image_indices, valid_before_image_indices] = 0
 
         if final_embedding is not None and final_labels is not None:
-            assert (
-                final_embedding.shape[:2] == final_labels.shape == final_loss_mask.shape
-            ), "unexpected shapes after data preprocessing"
+            assert final_embedding.shape[:2] == final_labels.shape == final_loss_mask.shape, (
+                "unexpected shapes after data preprocessing"
+            )
 
         if final_embedding is not None:
             # Truncate if exceeding the language model's max sequence length.
@@ -711,15 +709,15 @@ class LLaVAModel(MegatronModule):
                 shard_factor = self.tensor_model_parallel_size_lm
                 seq_dim = 0
 
-            assert (
-                combined_embeddings.shape[seq_dim] % shard_factor == 0
-            ), f"Sequence length should be divisible by {shard_factor} for \
+            assert combined_embeddings.shape[seq_dim] % shard_factor == 0, (
+                f"Sequence length should be divisible by {shard_factor} for \
                 Sequence/Context parallelism"
+            )
             if self.sequence_parallel_lm and self.tp_comm_overlap_lm:
-                assert (
-                    combined_embeddings.shape[seq_dim] == self._language_max_sequence_length
-                ), f"TP Comm overlap either requires Vision+Text token length \
+                assert combined_embeddings.shape[seq_dim] == self._language_max_sequence_length, (
+                    f"TP Comm overlap either requires Vision+Text token length \
                 == language_max_sequence_length"
+                )
 
         if self.context_parallel_lm > 1:
             batch = dict()
@@ -734,10 +732,10 @@ class LLaVAModel(MegatronModule):
 
                 batch = get_batch_on_this_cp_rank(batch)
             else:
-                assert HAVE_TEX and is_te_min_version(
-                    "1.10.0"
-                ), "Please update Transformer Engine to >= 1.10 to use \
+                assert HAVE_TEX and is_te_min_version("1.10.0"), (
+                    "Please update Transformer Engine to >= 1.10 to use \
                     Context Parallel with THD format data"
+                )
                 cp_size = self.cp_group.size()
                 cp_rank = self.cp_group.rank()
                 for key, data in batch.items():
@@ -776,9 +774,9 @@ class LLaVAModel(MegatronModule):
             torch.Tensor: Tile tags prepended to image embeddings.
                 [tile_seq_len (=5) + img_seq_len, num_tiles, h_language]
         """
-        assert (
-            num_image_tiles.shape[0] == 1 and len(num_image_tiles) == 1
-        ), "multiple input images are not supported yet."
+        assert num_image_tiles.shape[0] == 1 and len(num_image_tiles) == 1, (
+            "multiple input images are not supported yet."
+        )
 
         num_tiles = num_image_tiles[0].item()
         tile_tags = self._tile_tags[: num_tiles - 1] + [self._tile_tags[-1]]
@@ -995,8 +993,7 @@ def _load_state_dict_hook_ignore_extra_state(
                 keys.remove(key)
 
 
-# pylint: disable-next=line-too-long
-# Based on https://github.com/OpenGVLab/InternVL/blob/c7c5af1a8930b4862afe8ed14672307082ef61fa/internvl_chat/internvl/model/internvl_chat/modeling_internvl_chat.py#L218
+# Based on https://github.com/OpenGVLab/InternVL/blob/c7c5af1a8930b4862afe8ed14672307082ef61fa/internvl_chat/internvl/model/internvl_chat/modeling_internvl_chat.py#L218  # noqa: E501
 # Copyright (c) 2023 OpenGVLab.
 def pixel_shuffle(x, scale_factor=0.5, version=2):
     """Pixel shuffle based on InternVL but adapted for our use case.

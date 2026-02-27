@@ -14,7 +14,7 @@ from uvicorn.config import LOGGING_CONFIG
 
 LOGGING_CONFIG['root'] = {"handlers": ["default"], "level": "INFO"}
 
-from ... import import_class, inference
+from ... import import_class
 from ...agent.api import (
     Agent,
     ContrastiveRollout,
@@ -35,7 +35,6 @@ from ...server.api import (
     RemoteGroupedRolloutRequest,
     RemoteRolloutRequest,
 )
-from .. import agent
 from ..api import EnvironmentServer, InferenceServer, RemoteEvaluationRequest, RemoteRolloutRequest
 
 
@@ -47,7 +46,6 @@ class FastAPIEnvServer(EnvironmentServer):
 
     @classmethod
     async def launch(cls, env_cls: type[Agent], cls_args: dict, port: int, **kwargs) -> Self:
-
         app = FastAPI()
 
         if issubclass(env_cls, GroupedRolloutGenerator):
@@ -102,9 +100,9 @@ class FastAPIEnvServer(EnvironmentServer):
         return self._server_task.cancel()
 
     async def get_contrastive_rollouts(self, request: RolloutRequest) -> list[ContrastiveRollout]:
-        assert isinstance(
-            request.inference_interface, InferenceServer
-        ), "Rollout requests to remote server must contain an InferenceServer object"
+        assert isinstance(request.inference_interface, InferenceServer), (
+            "Rollout requests to remote server must contain an InferenceServer object"
+        )
         payload = request.model_dump()
         payload["inference_interface"] = request.inference_interface.model_dump()
         async with httpx.AsyncClient() as client:
@@ -117,16 +115,16 @@ class FastAPIEnvServer(EnvironmentServer):
         return rollouts
 
     async def group_rollout(self, request: GroupedRolloutRequest):
-        assert (
-            False
-        ), "Calling group_rollout on FastAPIEnvServer is not supported, use get_grouped_rollouts"
+        assert False, (
+            "Calling group_rollout on FastAPIEnvServer is not supported, use get_grouped_rollouts"
+        )
 
     async def get_grouped_rollouts(
         self, request: GroupedRolloutRequest
     ) -> AsyncGenerator[list[TokenRollout], None]:
-        assert isinstance(
-            request.inference_interface, InferenceServer
-        ), "Rollout requests to remote server must contain an InferenceServer object"
+        assert isinstance(request.inference_interface, InferenceServer), (
+            "Rollout requests to remote server must contain an InferenceServer object"
+        )
         assert request.num_groups != -1, "FastAPIEnvServer does not support group rollout streaming"
         payload = request.model_dump()
         payload["inference_interface"] = request.inference_interface.model_dump()
@@ -139,14 +137,14 @@ class FastAPIEnvServer(EnvironmentServer):
             yield rollout
 
     async def rollout(self, request: RolloutRequest) -> TokenRollout:
-        assert (
-            False
-        ), "Calling rollout on FastAPIEnvServer is not supported, use get_reward_rollouts"
+        assert False, (
+            "Calling rollout on FastAPIEnvServer is not supported, use get_reward_rollouts"
+        )
 
     async def get_reward_rollouts(self, request: RolloutRequest) -> list[TokenRollout]:
-        assert isinstance(
-            request.inference_interface, InferenceServer
-        ), "Rollout requests to remote server must contain an InferenceServer object"
+        assert isinstance(request.inference_interface, InferenceServer), (
+            "Rollout requests to remote server must contain an InferenceServer object"
+        )
         payload = request.model_dump()
         payload["inference_interface"] = request.inference_interface.model_dump()
         async with httpx.AsyncClient() as client:
@@ -157,9 +155,9 @@ class FastAPIEnvServer(EnvironmentServer):
         return rollouts
 
     async def run_evaluation(self, request: EvaluationRequest) -> EvaluationResponse:
-        assert isinstance(
-            request.inference_interface, InferenceServer
-        ), "Evaluation requests to remote server must contain an InferenceServer object"
+        assert isinstance(request.inference_interface, InferenceServer), (
+            "Evaluation requests to remote server must contain an InferenceServer object"
+        )
         payload = request.model_dump()
         payload["inference_interface"] = request.inference_interface.model_dump()
         async with httpx.AsyncClient(timeout=None) as client:

@@ -198,9 +198,9 @@ class IndicesToMultihot(torch.autograd.Function):
             probs_in_multihot: [num_of_tokens, num_of_local_experts]
         '''
         num_of_tokens = indices.shape[0]
-        assert (
-            indices.shape == probs_indices.shape
-        ), "indices and probs_indices must have the same shape"
+        assert indices.shape == probs_indices.shape, (
+            "indices and probs_indices must have the same shape"
+        )
         topk = indices.shape[1]
         multihot_indices = torch.empty(
             (num_of_tokens, num_of_local_experts), dtype=torch.bool, device="cuda"

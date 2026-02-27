@@ -24,8 +24,6 @@ from megatron.inference.utils import (
 )
 from megatron.training import get_args, get_tokenizer, initialize_megatron
 
-# pylint: disable=line-too-long
-
 logging.basicConfig(level=logging.INFO, force=True)
 
 
@@ -47,8 +45,7 @@ async def main(
     # and processing them in an asyncio coroutine.
     # leaving inference_coordinator_port as None will find a free port automatically.
     dp_addr = await engine.start_listening_to_data_parallel_coordinator(
-        inference_coordinator_port=port,
-        launch_inference_coordinator=True,
+        inference_coordinator_port=port, launch_inference_coordinator=True
     )
 
     args = get_args()
@@ -78,7 +75,7 @@ async def main(
         futures = []
         num_requests_total = len(requests)
         num_requests_added = 0
-        # logging.info("Waiting for 20 seconds before starting to add requests. This is to mimic an RL style setup..")
+        # logging.info("Waiting for 20 seconds before starting to add requests. This is to mimic an RL style setup..")  # noqa: E501
         # time.sleep(20)
         while True:
             current_time = time.time_ns() / 10**9
@@ -121,7 +118,7 @@ async def main(
 
             if num_requests_added == num_requests_total:
                 break
-            # Relinquish control since there are no more requests to add at the moment. This allows the engine to run.
+            # Relinquish control since there are no more requests to add at the moment. This allows the engine to run.  # noqa: E501
             await asyncio.sleep(0)
 
         # While we wait for the requests to complete, the engine runs in the background.
@@ -139,7 +136,7 @@ async def main(
                     "input_prompt": req.prompt,
                     "generated_text": req.generated_text.replace("\n", "\\n"),
                     "generated_tokens": req.generated_tokens,
-                    "latency": req.latency,  # InferenceClient populates this field in the returned future.
+                    "latency": req.latency,  # InferenceClient populates this field in the returned future.  # noqa: E501
                 }
                 if req.sampling_params.return_log_probs:
                     result_dict["logprobs"] = req.prompt_log_probs + req.generated_log_probs
@@ -147,7 +144,7 @@ async def main(
                 throughputs.append(throughput)
                 if req.routing_indices is not None:
                     result_dict["routing_indices"] = req.routing_indices.tolist()
-                                
+
                 json_results[req.request_id] = result_dict
             throughput_dict = {"throughput": throughputs}
             if args.throughput_check_only:

@@ -300,9 +300,9 @@ class RerunStateMachine:
                 self.current_iteration += 1  # Increment self.current_iteration for reporting.
                 return True
             if self.data_iterator_checkpoints is not None:
-                assert len(self.data_iterator_checkpoints) == len(
-                    data_iterators
-                ), "data iterator has different length than checkpointed data iterator"
+                assert len(self.data_iterator_checkpoints) == len(data_iterators), (
+                    "data iterator has different length than checkpointed data iterator"
+                )
                 for i, d in enumerate(data_iterators):
                     d.load_state_dict(self.data_iterator_checkpoints[i])
                 self.data_iterator_checkpoints = None
@@ -537,9 +537,9 @@ class RerunStateMachine:
         if comparison_func is None:
             comparison_func = _compare_floats
 
-        assert (
-            self.state != RerunState.NOT_RUNNING_YET
-        ), "validate_result should not be called outside of the forward-backward pass"
+        assert self.state != RerunState.NOT_RUNNING_YET, (
+            "validate_result should not be called outside of the forward-backward pass"
+        )
 
         validation_call: Call = self._get_validation_call_info(message)
 
@@ -586,7 +586,6 @@ class RerunStateMachine:
         # If this the initial run of the iteration, and no unexpected result has already been
         # identified?
         if self.state == RerunState.INITIAL_RUN and not self.rerun_requested:
-
             # Do not validate results on the first iteration, as we cannot guarantee a checkpoint
             # can be taken before the optimizer has been stepped at least once.
             if not self.first_iteration_complete:
@@ -797,8 +796,7 @@ class RerunStateMachine:
                 log_single_rank(
                     logger,
                     logging.WARNING,
-                    "RerunStateMachine checkpoints ONLY SUPPORTED "
-                    "for checkpoint format torch_dist",
+                    "RerunStateMachine checkpoints ONLY SUPPORTED for checkpoint format torch_dist",
                 )
                 return None
 
@@ -918,9 +916,9 @@ class RerunStateMachine:
             data_iterators = data_iterator
         data_iterators = [d for d in data_iterators if d is not None]
         for d in data_iterators:
-            assert isinstance(
-                d, RerunDataIterator
-            ), "data iterator is not wrapped with RerunDataIterator"
+            assert isinstance(d, RerunDataIterator), (
+                "data iterator is not wrapped with RerunDataIterator"
+            )
         return data_iterators
 
     def _get_validation_call_info(self, message: str) -> Call:
@@ -1254,9 +1252,9 @@ class RerunErrorInjector:
         error_injection_rate: int = 0,
         error_injection_type: RerunDiagnostic = RerunDiagnostic.TRANSIENT_ERROR,
     ) -> None:
-        assert isinstance(
-            error_injection_type, RerunDiagnostic
-        ), "Injected result type must be a valid RerunDiagnostic"
+        assert isinstance(error_injection_type, RerunDiagnostic), (
+            "Injected result type must be a valid RerunDiagnostic"
+        )
         self.error_injection_rate: int = error_injection_rate
         self.error_injection_type: RerunDiagnostic = error_injection_type
         self.should_inject_errors: bool = error_injection_rate > 0

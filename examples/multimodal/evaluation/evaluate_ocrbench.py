@@ -113,7 +113,8 @@ Doc-oriented VQA(Total 200): {score['Doc-oriented VQA']}
 ----------------------------------------------------------------
 Key Information Extraction(Total 200): {score['Key Information Extraction']}
 ----------------------------------------------------------------
-Handwritten Mathematical Expression Recognition(Total 100): {score['Handwritten Mathematical Expression Recognition']}
+Handwritten Mathematical Expression Recognition(Total 100): \
+{score['Handwritten Mathematical Expression Recognition']}
 ----------------------Final Score-------------------------------
 Final Score(Total 1000): {final_score}"""
 

@@ -34,4 +34,8 @@ def test_model_config_tracks_memory(yaml_file, metric):
         "MODEL_ARGS" in model_config
         and metric in model_config["MODEL_ARGS"]
         and model_config["MODEL_ARGS"][metric] is True
-    ), f"Please add argument `{metric}` to `{yaml_file.parent.name}/model_config.yaml` that its metric gets tracked."
+    ), (
+        f"Please add argument `{metric}` to "
+        f"`{yaml_file.parent.name}/model_config.yaml` "
+        f"that its metric gets tracked."
+    )

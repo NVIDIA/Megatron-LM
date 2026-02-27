@@ -1,6 +1,5 @@
 # Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
-from argparse import Namespace
 
 import pytest
 import torch
@@ -10,10 +9,7 @@ from megatron.core.inference.contexts import StaticInferenceContext
 from megatron.core.inference.model_inference_wrappers.gpt.gpt_inference_wrapper import (
     GPTInferenceWrapper,
 )
-from megatron.core.models.gpt.gpt_layer_specs import (
-    get_gpt_layer_local_spec,
-    get_gpt_layer_with_transformer_engine_spec,
-)
+from megatron.core.models.gpt.gpt_layer_specs import get_gpt_layer_local_spec
 from megatron.core.models.gpt.gpt_model import GPTModel
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
 from megatron.core.transformer.transformer_config import TransformerConfig
@@ -21,7 +17,6 @@ from tests.unit_tests.test_utilities import Utils
 
 
 class TestGPTInferenceWrapper:
-
     def setup_model(self, tensor_parallel_size, pipeline_parallel_size):
         Utils.initialize_model_parallel(
             tensor_model_parallel_size=tensor_parallel_size,
@@ -86,11 +81,9 @@ class TestGPTInferenceWrapper:
         )
         # Logits are not returned in all ranks in PP
         if parallel_state.is_pipeline_last_stage():
-            assert logits.shape == (
-                self.batch_size,
-                logits_seq_len,
-                self.vocab_size,
-            ), f"Shape mismatch . Expected {(self.batch_size, logits_seq_len, self.vocab_size)}, but got {logits.shape}"
+            assert logits.shape == (self.batch_size, logits_seq_len, self.vocab_size), (
+                f"Shape mismatch . Expected {(self.batch_size, logits_seq_len, self.vocab_size)}, but got {logits.shape}"  # noqa: E501
+            )
 
     @pytest.mark.parametrize("materialize_only_last_token_logits", [True, False])
     def test_inference_only_tensor_parallel(self, materialize_only_last_token_logits):
@@ -120,8 +113,6 @@ class TestGPTInferenceWrapper:
             inference_input_for_context_window
         )
 
-        assert logits.shape == (
-            self.batch_size,
-            logits_seq_len,
-            self.vocab_size,
-        ), f"Shape mismatch . Expected {(self.batch_size, logits_seq_len, self.vocab_size)}, but got {logits.shape}"
+        assert logits.shape == (self.batch_size, logits_seq_len, self.vocab_size), (
+            f"Shape mismatch . Expected {(self.batch_size, logits_seq_len, self.vocab_size)}, but got {logits.shape}"  # noqa: E501
+        )

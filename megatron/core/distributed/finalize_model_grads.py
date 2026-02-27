@@ -229,7 +229,6 @@ def _allreduce_embedding_grad(
         get_pg_size(embd_group) > 1
         and torch.distributed.get_rank() in torch.distributed.get_process_group_ranks(embd_group)
     ):
-
         if is_pp_first_stage(pp_group):
             model_module = model[0]
         elif is_pp_last_stage(pp_group):
@@ -486,7 +485,6 @@ def finalize_model_grads(
     # if we are using by the number of tokens, then we use that as a divisor. this number
     # will be the total number of non-padded tokens in the global batch.
     if num_tokens is not None:
-
         # the number of tokens is only present on the last stage, so broadcast it
         # to the other ranks in the pipeline parallel group.
         assert not isinstance(pp_group, list)

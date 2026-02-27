@@ -18,7 +18,9 @@ from megatron.core.utils import is_te_min_version
 from tests.unit_tests.test_utilities import Utils
 
 try:
-    from transformer_engine.pytorch.attention.rope import apply_fused_qkv_rotary_pos_emb
+    from transformer_engine.pytorch.attention.rope import (
+        apply_fused_qkv_rotary_pos_emb,  # noqa: F401
+    )
 
     HAVE_FUSED_QKV_ROPE = True
 except ImportError:
@@ -27,7 +29,6 @@ except ImportError:
 
 @pytest.mark.parametrize("output_gate", [False, True])
 class TestParallelAttention:
-
     @pytest.fixture(scope='function', autouse=True)
     def setup_method(self, output_gate):
         Utils.initialize_model_parallel(1, 1)
@@ -65,7 +66,6 @@ class TestParallelAttention:
         pass
 
     def test_gpu_forward(self):
-
         config = self.parallel_attention.config
         sequence_length = 32
         micro_batch_size = 2
@@ -167,7 +167,6 @@ class TestParallelAttention:
 
 @pytest.mark.skipif(not is_te_min_version("2.9.0"), reason="QK clipping requires TE >= 2.9.0")
 class TestClipQK:
-
     def setup_method(self, method):
         Utils.initialize_model_parallel(1, 1)
         model_parallel_cuda_manual_seed(123)
@@ -353,7 +352,6 @@ class TestClipQK:
 
 @pytest.mark.parametrize("output_gate", [False, True])
 class TestSelfAttention:
-
     @pytest.fixture(scope='function', autouse=True)
     def setup_method(self, output_gate):
         self.output_gate = output_gate
@@ -403,7 +401,6 @@ class TestSelfAttention:
 
     @pytest.mark.internal
     def test_self_attention_mpu(self):
-
         tp_size = 4
         cp_size = 2
         Utils.initialize_model_parallel(
@@ -425,7 +422,6 @@ class TestSelfAttention:
     )
     @pytest.mark.internal
     def test_self_attention_independent_pg_smoke(self):
-
         tp_size = 4
         cp_size = 2
         Utils.initialize_model_parallel(

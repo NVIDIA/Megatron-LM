@@ -1,7 +1,6 @@
 # Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
 import inspect
-import os
 from contextlib import nullcontext
 from functools import partial
 
@@ -21,11 +20,10 @@ from megatron.rl.rl_utils import (
     get_rl_runtime_state,
     load_packed_data_by_index,
 )
+from megatron.rl.sequence_packing_utils import get_default_packed_seq_params
 from megatron.training import get_args, get_timers, pretrain, print_rank_0
 from megatron.training.arguments import core_transformer_config_from_args
 from model_provider import model_provider
-
-from megatron.rl.sequence_packing_utils import get_default_packed_seq_params
 
 stimer = StragglerDetector()
 
@@ -33,9 +31,10 @@ import logging
 
 logging.basicConfig(level=logging.INFO, force=True)
 
+
 def _gpt_builder(args, pre_process, post_process, vp_stage=None, config=None, pg_collection=None):
-    # TODO(Peter): This is a hack to get around the fact that we are activation recomputation for training but not
-    # for inference with cuda graphs. Without out this the post checks in the transformer config will assert error.
+    # TODO(Peter): This is a hack to get around the fact that we are activation recomputation for training but not  # noqa: E501
+    # for inference with cuda graphs. Without out this the post checks in the transformer config will assert error.  # noqa: E501
     if config is None:
         recompute_granularity_from_args = None
         if args.recompute_granularity is not None:
@@ -61,7 +60,7 @@ def _gpt_builder(args, pre_process, post_process, vp_stage=None, config=None, pg
                 build_model_context_args["preserve_high_precision_init_val"] = True
         except:  # noqa E722
             raise RuntimeError(
-                "--fp8-param-gather requires `fp8_model_init` from TransformerEngine, but not found."
+                "--fp8-param-gather requires `fp8_model_init` from TransformerEngine, but not found."  # noqa: E501
             )
 
     with build_model_context(**build_model_context_args):
@@ -95,8 +94,12 @@ def loss_func(
         kl_term (torch.Tensor): KL term of the loss. Used for logging.
         ratios (torch.Tensor): pi/pi_{old} ratios. Used for logging.
         entropy (torch.Tensor): Current policy entropy on the trajectories. Used for logging.
-        truncated_from_above(torch.Tensor): A boolean mask that tells whether the ratios were truncated from above. Used for logging.
-        truncated_from_below(torch.Tensor): A boolean mask that tells whether the ratios were truncated from below. Used for logging.
+        truncated_from_above(torch.Tensor): A boolean mask that tells
+            whether the ratios were truncated from above.
+            Used for logging.
+        truncated_from_below(torch.Tensor): A boolean mask that tells
+            whether the ratios were truncated from below.
+            Used for logging.
         output_tensor (torch.Tensor): The tensor with the losses
 
     Returns:
@@ -182,7 +185,7 @@ def loss_func(
 
     # Add metadata about number of sequences processed in this batch
     # This is crucial for correct sample counting with sequence packing
-    # Note: This information needs to be determined in forward_step where we have access to the batch data
+    # Note: This information needs to be determined in forward_step where we have access to the batch data  # noqa: E501
     # The loss_func doesn't have direct access to this information
 
     return (loss[0] * args.context_parallel_size, total_tokens.int(), output_dict)
@@ -221,7 +224,11 @@ def forward_step(data_iterator, model: GPTModel, loss_only: bool = False):
             seq_lengths,
             seq_indices,
             packed_seq_params,
-        ) = load_packed_data_by_index(bin_tensor.item(), runtime_state.packing_context, args.rl_inference_logprobs_is_correction)
+        ) = load_packed_data_by_index(
+            bin_tensor.item(),
+            runtime_state.packing_context,
+            args.rl_inference_logprobs_is_correction,
+        )
 
         runtime_state.increment_sequences(len(seq_indices))
     else:
@@ -368,7 +375,6 @@ def train_valid_test_datasets_provider(train_val_test_num_samples):
 
 
 if __name__ == "__main__":
-
     from megatron.inference.utils import add_inference_args
 
     # Temporary for transition to core datasets

@@ -65,9 +65,9 @@ def _split_along_first_dim(input_, group):
 
     # Split along first dimension.
     dim_size = input_.size()[0]
-    assert (
-        dim_size % world_size == 0
-    ), "First dimension of the tensor should be divisible by tensor parallel size"
+    assert dim_size % world_size == 0, (
+        "First dimension of the tensor should be divisible by tensor parallel size"
+    )
     local_dim_size = dim_size // world_size
     rank = group.rank()
     dim_offset = rank * local_dim_size
@@ -169,9 +169,9 @@ def _reduce_scatter_along_first_dim(input_, group, input_split_sizes=None, use_g
 
     if input_split_sizes is None:
         dim_size = list(input_.size())
-        assert (
-            dim_size[0] % world_size == 0
-        ), "First dimension of the tensor should be divisible by tensor parallel size"
+        assert dim_size[0] % world_size == 0, (
+            "First dimension of the tensor should be divisible by tensor parallel size"
+        )
 
         dim_size[0] = dim_size[0] // world_size
 

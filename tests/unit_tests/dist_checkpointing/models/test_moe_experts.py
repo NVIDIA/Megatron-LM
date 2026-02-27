@@ -1,5 +1,4 @@
 # Copyright (c) 2023, NVIDIA CORPORATION. All rights reserved.
-import os
 
 import pytest
 import torch
@@ -137,7 +136,7 @@ class TestExpertLayerReconfiguration:
     @pytest.mark.parametrize(
         "load_order,store_order",
         [
-            ("tp-ep-dp-pp", "tp-ep-dp-pp"),
+            ("tp-ep-dp-pp", "tp-ep-dp-pp")
             # ("tp-ep-dp-pp", "ep-tp-dp-pp"),
             # ("ep-tp-dp-pp", "ep-tp-dp-pp"),
             # ("ep-tp-dp-pp", "tp-ep-dp-pp"),

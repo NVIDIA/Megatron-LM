@@ -54,9 +54,9 @@ class DotProductAttention(MegatronModule):
 
         self.config: TransformerConfig = config
 
-        assert (
-            self.config.context_parallel_size == 1
-        ), "Context parallelism is only supported by TEDotProductAttention!"
+        assert self.config.context_parallel_size == 1, (
+            "Context parallelism is only supported by TEDotProductAttention!"
+        )
 
         self.layer_number = max(1, layer_number)
         self.attn_mask_type = attn_mask_type
@@ -68,9 +68,9 @@ class DotProductAttention(MegatronModule):
         if pg_collection is None:
             pg_collection = ProcessGroupCollection.use_mpu_process_groups(required_pgs=['tp'])
         else:
-            assert hasattr(
-                pg_collection, 'tp'
-            ), "DotProductAttention pg_collection must have tp process group"
+            assert hasattr(pg_collection, 'tp'), (
+                "DotProductAttention pg_collection must have tp process group"
+            )
         self.pg_collection = pg_collection
         self.tp_group = self.pg_collection.tp
 

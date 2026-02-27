@@ -19,7 +19,7 @@ class DAPOAgent(MathAgent):
         return {
             "problem": datum['prompt'][0]['content']
             .replace(
-                'The last line of your response should be of the form Answer: $Answer (without quotes) where $Answer is the answer to the problem.\n\n',
+                'The last line of your response should be of the form Answer: $Answer (without quotes) where $Answer is the answer to the problem.\n\n',  # noqa: E501
                 '',
             )
             .replace('\nRemember to put your answer on its own line after "Answer:".', ''),

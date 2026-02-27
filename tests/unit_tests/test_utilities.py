@@ -27,7 +27,6 @@ class TestModel(torch.nn.Module):
 
 
 class Utils:
-
     world_size = int(os.environ.get('WORLD_SIZE', '1'))
     rank = int(os.environ.get('LOCAL_RANK', '0'))
     inited = False
@@ -35,7 +34,6 @@ class Utils:
 
     @staticmethod
     def initialize_distributed():
-
         os.environ.pop('NVTE_FLASH_ATTN', None)
         os.environ.pop('NVTE_FUSED_ATTN', None)
         os.environ.pop('NVTE_UNFUSED_ATTN', None)

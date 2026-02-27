@@ -1,16 +1,12 @@
 # Copyright (c) 2025, NVIDIA CORPORATION. All rights reserved.
 
-import logging
 import os
-import sys
 
 import pytest
 import torch
 import torch.distributed as dist
 from packaging import version
 
-from megatron.core import parallel_state
-from megatron.core.hyper_comm_grid import HyperCommGrid
 from megatron.core.model_parallel_config import ModelParallelConfig
 from megatron.core.pipeline_parallel.multimodule_communicator import MultiModulePipelineCommunicator
 from tests.unit_tests.pipeline_parallel.test_bridge_communicator import (
@@ -24,7 +20,6 @@ from tests.unit_tests.test_utilities import Utils
 
 
 class TestMultiModulePipelineCommunicator:
-
     @classmethod
     def setup_class(cls):
         """Set up distributed environment for the entire test class."""
@@ -306,7 +301,7 @@ class TestMultiModulePipelineCommunicator:
 
         # Simulate bidirectional send/recv for forward and backward in pipeline
 
-        # Encoder stages send forward to the first stage of LLM, and receive backward from the first stage of LLM
+        # Encoder stages send forward to the first stage of LLM, and receive backward from the first stage of LLM  # noqa: E501
         if mllm_comm.is_current_rank_in_grid(image_encoder_grid):
             output_dict = {'image_encoder': torch.randn(2, 8, 128).cuda()}
             received_grad = mllm_comm.send_forward_recv_backward(output_dict)
@@ -325,7 +320,7 @@ class TestMultiModulePipelineCommunicator:
                 assert input_dict['image_encoder'].shape == (2, 8, 128)
                 assert input_dict['audio_encoder'].shape == (2, 16, 128)
 
-        # First stage of LLM sends forward to the second stage of LLM, and receive backward from the second stage of LLM
+        # First stage of LLM sends forward to the second stage of LLM, and receive backward from the second stage of LLM  # noqa: E501
         if mllm_comm.is_current_rank_in_grid(llm_grid):
             if dist.get_rank() == 2 or dist.get_rank() == 3:
                 output_dict = {'llm': torch.randn(2, 32, 128).cuda()}
@@ -456,7 +451,7 @@ class TestMultiModulePipelineCommunicator:
             module_to_grid_map, topology, config, dim_mapping=dim_mapping
         )
 
-        # ========== Run actual distributed pipeline blocks (per process, depending on role) ==========
+        # ========== Run actual distributed pipeline blocks (per process, depending on role) ==========  # noqa: E501
         if mllm_comm.is_current_rank_in_grid(image_encoder_grid):
             # Image encoder rank: run forward and send output
             image_encoder_output = image_encoder_block(
@@ -605,7 +600,7 @@ class TestMultiModulePipelineCommunicator:
     def test_send_forward_recv_forward_with_transformer_blocks_and_different_parallelisms(
         self, grid1_tp, grid1_pp, grid1_dp, grid2_tp, grid2_pp, grid2_dp, parallel_state_tp
     ):
-        """Test bridge communicator with two transformer blocks having different process group configurations."""
+        """Test bridge communicator with two transformer blocks having different process group configurations."""  # noqa: E501
         # Model and input configuration
         hidden_size = 16
         sequence_length = 2
@@ -715,7 +710,7 @@ class TestMultiModulePipelineCommunicator:
                 hidden_states = input_dict['llm']
                 output_grid_2 = block_grid_2(hidden_states=hidden_states, attention_mask=None)
 
-                # Compute expected output shape based on change in DP size (chunk/expand batch dimension appropriately)
+                # Compute expected output shape based on change in DP size (chunk/expand batch dimension appropriately)  # noqa: E501
                 factor = max(grid1_dp, grid2_dp) // min(grid1_dp, grid2_dp)
                 expected_output_shape = (
                     sequence_length,
@@ -726,9 +721,9 @@ class TestMultiModulePipelineCommunicator:
                     ),
                     hidden_size,
                 )
-                assert (
-                    output_grid_2.shape == expected_output_shape
-                ), f"Output2 shape mismatch: {output_grid_2.shape}"
+                assert output_grid_2.shape == expected_output_shape, (
+                    f"Output2 shape mismatch: {output_grid_2.shape}"
+                )
 
         # ====== Reference: global (replicated) pipeline forward for correctness checking ======
         global_block_1, _ = get_transformer_block_and_grid(
@@ -762,7 +757,7 @@ class TestMultiModulePipelineCommunicator:
                 # DP size matches: all outputs directly compared
                 torch.testing.assert_close(hidden_states_ref, output_grid_2, rtol=1e-3, atol=1e-3)
             elif grid1_dp < grid2_dp:
-                # If grid2 expands DP: each output_grid_2 chunk corresponds to a split of the reference output
+                # If grid2 expands DP: each output_grid_2 chunk corresponds to a split of the reference output  # noqa: E501
                 grid2_dp_ranks = grid_2._gen_rank_enum([x for x in grid_2.dim_names if x != "dp"])
                 global_block_2_chunks = torch.split(
                     hidden_states_ref, hidden_states_ref.shape[1] // (grid2_dp // grid1_dp), dim=1

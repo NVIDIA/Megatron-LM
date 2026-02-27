@@ -6,10 +6,8 @@ import pytest
 import torch
 
 import megatron.core.parallel_state as parallel_state
-from megatron.core.models.gpt.gpt_layer_specs import get_gpt_layer_with_transformer_engine_spec
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
-from megatron.core.transformer import TransformerConfig
 from megatron.core.transformer.enums import AttnMaskType
 from megatron.core.transformer.experimental_attention_variant.dsa import (
     DSAIndexer,
@@ -20,7 +18,6 @@ from megatron.core.transformer.experimental_attention_variant.dsa import (
     FusedDSAIndexerLoss,
     _compute_index_scores,
     compute_dsa_indexer_loss,
-    fused_qk_topk_naive,
     rotate_activation,
 )
 from megatron.core.transformer.transformer_config import MLATransformerConfig
@@ -265,7 +262,9 @@ class TestDSAIndexerLossAutoScaler:
             torch.full_like(dummy_input, expected_grad_per_element),
             rtol=0,
             atol=0,
-        ), f"Gradient should be scaled by loss scale, expected {expected_grad_per_element}, got {dummy_input.grad[0].item()}"
+        ), (
+            f"Gradient should be scaled by loss scale, expected {expected_grad_per_element}, got {dummy_input.grad[0].item()}"  # noqa: E501
+        )
 
 
 @pytest.mark.parametrize("seqlen_and_topk", [[16, 8], [32, 16], [64, 32]])
@@ -395,27 +394,27 @@ class TestFusedDSAIndexerLossGradient:
         # Compare gradients
         # =============================================
         # Check loss values match
-        assert torch.allclose(
-            loss_fused, loss_ref, rtol=1e-5, atol=1e-5
-        ), f"Loss mismatch: fused={loss_fused.item()}, ref={loss_ref.item()}"
+        assert torch.allclose(loss_fused, loss_ref, rtol=1e-5, atol=1e-5), (
+            f"Loss mismatch: fused={loss_fused.item()}, ref={loss_ref.item()}"
+        )
 
         # Check topk indices match
-        assert torch.equal(
-            topk_indices_fused, topk_indices
-        ), "Top-k indices mismatch between fused and reference"
+        assert torch.equal(topk_indices_fused, topk_indices), (
+            "Top-k indices mismatch between fused and reference"
+        )
 
         # Check gradients match
-        assert torch.allclose(
-            grad_q_fused, grad_q_ref, rtol=1e-5, atol=1e-5
-        ), f"grad_q mismatch: max diff = {(grad_q_fused - grad_q_ref).abs().max().item()}"
+        assert torch.allclose(grad_q_fused, grad_q_ref, rtol=1e-5, atol=1e-5), (
+            f"grad_q mismatch: max diff = {(grad_q_fused - grad_q_ref).abs().max().item()}"
+        )
 
-        assert torch.allclose(
-            grad_weights_fused, grad_weights_ref, rtol=1e-5, atol=1e-5
-        ), f"grad_weights mismatch: max diff = {(grad_weights_fused - grad_weights_ref).abs().max().item()}"
+        assert torch.allclose(grad_weights_fused, grad_weights_ref, rtol=1e-5, atol=1e-5), (
+            f"grad_weights mismatch: max diff = {(grad_weights_fused - grad_weights_ref).abs().max().item()}"  # noqa: E501
+        )
 
-        assert torch.allclose(
-            grad_k_fused, grad_k_ref, rtol=1e-5, atol=1e-5
-        ), f"grad_k mismatch: max diff = {(grad_k_fused - grad_k_ref).abs().max().item()}"
+        assert torch.allclose(grad_k_fused, grad_k_ref, rtol=1e-5, atol=1e-5), (
+            f"grad_k mismatch: max diff = {(grad_k_fused - grad_k_ref).abs().max().item()}"
+        )
 
 
 @pytest.mark.parametrize("tensor_model_parallel_size", [2, 4])
@@ -541,27 +540,27 @@ class TestFusedDSAIndexerLossGradientTP:
         # Compare results
         # =============================================
         # Loss should be the same
-        assert torch.allclose(
-            loss_tpn, loss_tp1_value, rtol=1e-5, atol=1e-5
-        ), f"Loss mismatch: TP={tensor_model_parallel_size} got {loss_tpn.item()}, TP=1 got {loss_tp1_value.item()}"
+        assert torch.allclose(loss_tpn, loss_tp1_value, rtol=1e-5, atol=1e-5), (
+            f"Loss mismatch: TP={tensor_model_parallel_size} got {loss_tpn.item()}, TP=1 got {loss_tp1_value.item()}"  # noqa: E501
+        )
 
         # Top-k indices should be the same
-        assert torch.equal(
-            topk_indices_tpn, topk_indices_tp1
-        ), "Top-k indices mismatch between TP=1 and TP=N"
+        assert torch.equal(topk_indices_tpn, topk_indices_tp1), (
+            "Top-k indices mismatch between TP=1 and TP=N"
+        )
 
         # Gradients should match exactly (indexer params are duplicated across TP)
-        assert torch.allclose(
-            q_tpn.grad, grad_q_tp1, rtol=1e-5, atol=1e-5
-        ), f"grad_q mismatch: max diff = {(q_tpn.grad - grad_q_tp1).abs().max().item()}"
+        assert torch.allclose(q_tpn.grad, grad_q_tp1, rtol=1e-5, atol=1e-5), (
+            f"grad_q mismatch: max diff = {(q_tpn.grad - grad_q_tp1).abs().max().item()}"
+        )
 
-        assert torch.allclose(
-            weights_tpn.grad, grad_weights_tp1, rtol=1e-5, atol=1e-5
-        ), f"grad_weights mismatch: max diff = {(weights_tpn.grad - grad_weights_tp1).abs().max().item()}"
+        assert torch.allclose(weights_tpn.grad, grad_weights_tp1, rtol=1e-5, atol=1e-5), (
+            f"grad_weights mismatch: max diff = {(weights_tpn.grad - grad_weights_tp1).abs().max().item()}"  # noqa: E501
+        )
 
-        assert torch.allclose(
-            k_tpn.grad, grad_k_tp1, rtol=1e-5, atol=1e-5
-        ), f"grad_k mismatch: max diff = {(k_tpn.grad - grad_k_tp1).abs().max().item()}"
+        assert torch.allclose(k_tpn.grad, grad_k_tp1, rtol=1e-5, atol=1e-5), (
+            f"grad_k mismatch: max diff = {(k_tpn.grad - grad_k_tp1).abs().max().item()}"
+        )
 
         # Check gradients are identical across all TP ranks
         tp_size = parallel_state.get_tensor_model_parallel_world_size()
@@ -575,9 +574,9 @@ class TestFusedDSAIndexerLossGradientTP:
                 torch.distributed.all_gather(grad_list, grad_tensor, group=pg_collection_tpn.tp)
 
                 for i in range(1, tp_size):
-                    assert torch.allclose(
-                        grad_list[0], grad_list[i], rtol=0, atol=0
-                    ), f"{name} differs between TP rank 0 and rank {i}"
+                    assert torch.allclose(grad_list[0], grad_list[i], rtol=0, atol=0), (
+                        f"{name} differs between TP rank 0 and rank {i}"
+                    )
 
         Utils.destroy_model_parallel()
 
@@ -1026,9 +1025,9 @@ class TestIndexerTensorParallel:
 
                 # All weights should be identical across all GPUs
                 for i in range(1, world_size):
-                    assert torch.allclose(
-                        param_list[0], param_list[i], rtol=0, atol=0
-                    ), f"Parameter {name} differs between rank 0 and rank {i} (world)"
+                    assert torch.allclose(param_list[0], param_list[i], rtol=0, atol=0), (
+                        f"Parameter {name} differs between rank 0 and rank {i} (world)"
+                    )
 
         Utils.destroy_model_parallel()
 
@@ -1109,21 +1108,21 @@ class TestIndexerTensorParallel:
         assert topk_indices_tpn.shape == topk_indices_tp1.shape
 
         # Check that index scores are close (allow for floating point accumulation errors)
-        assert torch.allclose(
-            index_scores_tpn, index_scores_tp1, rtol=0, atol=0
-        ), f"Index scores mismatch between TP=1 and TP={tensor_model_parallel_size}, SP={sequence_parallel}"
+        assert torch.allclose(index_scores_tpn, index_scores_tp1, rtol=0, atol=0), (
+            f"Index scores mismatch between TP=1 and TP={tensor_model_parallel_size}, SP={sequence_parallel}"  # noqa: E501
+        )
 
         # Check that topk indices are exactly the same
-        assert torch.equal(
-            topk_indices_tpn, topk_indices_tp1
-        ), f"Top-k indices mismatch between TP=1 and TP={tensor_model_parallel_size}, SP={sequence_parallel}"
+        assert torch.equal(topk_indices_tpn, topk_indices_tp1), (
+            f"Top-k indices mismatch between TP=1 and TP={tensor_model_parallel_size}, SP={sequence_parallel}"  # noqa: E501
+        )
 
         # Compare gradients - indexer grads should be identical (duplicated weights)
         for name, param in indexer_tpn.named_parameters():
             if param.grad is not None and name in indexer_tp1_grads:
-                assert torch.allclose(
-                    param.grad.cpu(), indexer_tp1_grads[name], rtol=0, atol=0
-                ), f"Indexer gradient {name} mismatch between TP=1 and TP={tensor_model_parallel_size}, SP={sequence_parallel}"
+                assert torch.allclose(param.grad.cpu(), indexer_tp1_grads[name], rtol=0, atol=0), (
+                    f"Indexer gradient {name} mismatch between TP=1 and TP={tensor_model_parallel_size}, SP={sequence_parallel}"  # noqa: E501
+                )
 
         Utils.destroy_model_parallel()
 
@@ -1183,9 +1182,9 @@ class TestIndexerTensorParallel:
 
                     # All gradients should be identical within TP group after sync
                     for i in range(1, tp_size):
-                        assert torch.allclose(
-                            grad_list[0], grad_list[i], rtol=0, atol=0
-                        ), f"Gradient for {name} differs between TP rank 0 and rank {i} after TP sync"
+                        assert torch.allclose(grad_list[0], grad_list[i], rtol=0, atol=0), (
+                            f"Gradient for {name} differs between TP rank 0 and rank {i} after TP sync"  # noqa: E501
+                        )
 
         Utils.destroy_model_parallel()
 
@@ -1287,7 +1286,7 @@ class TestDSAttentionTensorParallel:
     def test_dsa_forward_consistency(
         self, tensor_model_parallel_size, sequence_parallel, use_sparse_indexer_loss
     ):
-        """Test that sparse attention gives consistent results across different TP, SP, and sparse loss settings."""
+        """Test that sparse attention gives consistent results across different TP, SP, and sparse loss settings."""  # noqa: E501
         # First run with TP=1 to get baseline
         Utils.initialize_model_parallel(
             tensor_model_parallel_size=1, pipeline_model_parallel_size=1
@@ -1436,9 +1435,9 @@ class TestDSAttentionTensorParallel:
             output_tpn, group=pg_collection_tpn.tp
         )
         assert output_tpn_gathered.shape == output_tp1.shape
-        assert torch.allclose(
-            output_tpn_gathered.detach(), output_tp1.detach(), rtol=0, atol=0
-        ), f"Sparse attention outputs mismatch between TP=1 and TP={tensor_model_parallel_size}, SP={sequence_parallel}, sparse_loss={use_sparse_indexer_loss}"
+        assert torch.allclose(output_tpn_gathered.detach(), output_tp1.detach(), rtol=0, atol=0), (
+            f"Sparse attention outputs mismatch between TP=1 and TP={tensor_model_parallel_size}, SP={sequence_parallel}, sparse_loss={use_sparse_indexer_loss}"  # noqa: E501
+        )
 
         # 1. Check indexer gradients.
         for name, param in sparse_attention_tpn.indexer.named_parameters():
@@ -1447,8 +1446,8 @@ class TestDSAttentionTensorParallel:
                     param.grad, indexer_tp1_grads[name], rtol=1e-5, atol=1e-5
                 )
 
-        # 2. Query/Key/Value gradients need to be gathered along num_heads dim (dim 2) if SP is enabled
-        # Flatten last two dims: [seq_len, batch, num_heads, head_dim] -> [seq_len, batch, num_heads * head_dim]
+        # 2. Query/Key/Value gradients need to be gathered along num_heads dim (dim 2) if SP is enabled  # noqa: E501
+        # Flatten last two dims: [seq_len, batch, num_heads, head_dim] -> [seq_len, batch, num_heads * head_dim]  # noqa: E501
         sq, b, nh, hd = query_tpn.grad.shape
         query_grad_flat = query_tpn.grad.reshape(sq, b, nh * hd)
         key_grad_flat = key_tpn.grad.reshape(sq, b, nh * hd)
@@ -1465,20 +1464,20 @@ class TestDSAttentionTensorParallel:
             value_grad_flat, group=pg_collection_tpn.tp
         )
 
-        # Reshape back: [seq_len, batch, num_heads * head_dim] -> [seq_len, batch, num_heads, head_dim]
+        # Reshape back: [seq_len, batch, num_heads * head_dim] -> [seq_len, batch, num_heads, head_dim]  # noqa: E501
         query_tpn_grad_gathered = query_grad_gathered_flat.reshape(sq, b, num_heads, hd)
         key_tpn_grad_gathered = key_grad_gathered_flat.reshape(sq, b, num_heads, hd)
         value_tpn_grad_gathered = value_grad_gathered_flat.reshape(sq, b, num_heads, hd)
 
-        assert torch.allclose(
-            query_tpn_grad_gathered.cpu(), query_tp1_grad, rtol=0, atol=0
-        ), f"Query gradient mismatch between TP=1 and TP={tensor_model_parallel_size}"
-        assert torch.allclose(
-            key_tpn_grad_gathered.cpu(), key_tp1_grad, rtol=0, atol=0
-        ), f"Key gradient mismatch between TP=1 and TP={tensor_model_parallel_size}"
-        assert torch.allclose(
-            value_tpn_grad_gathered.cpu(), value_tp1_grad, rtol=0, atol=0
-        ), f"Value gradient mismatch between TP=1 and TP={tensor_model_parallel_size}"
+        assert torch.allclose(query_tpn_grad_gathered.cpu(), query_tp1_grad, rtol=0, atol=0), (
+            f"Query gradient mismatch between TP=1 and TP={tensor_model_parallel_size}"
+        )
+        assert torch.allclose(key_tpn_grad_gathered.cpu(), key_tp1_grad, rtol=0, atol=0), (
+            f"Key gradient mismatch between TP=1 and TP={tensor_model_parallel_size}"
+        )
+        assert torch.allclose(value_tpn_grad_gathered.cpu(), value_tp1_grad, rtol=0, atol=0), (
+            f"Value gradient mismatch between TP=1 and TP={tensor_model_parallel_size}"
+        )
 
         Utils.destroy_model_parallel()
 
@@ -1581,8 +1580,8 @@ class TestDSAttentionTensorParallel:
 
                     # All gradients should be identical within TP group after sync
                     for i in range(1, tp_size):
-                        assert torch.allclose(
-                            grad_list[0], grad_list[i], rtol=0, atol=0
-                        ), f"Indexer gradient for {name} differs between TP rank 0 and rank {i} after TP sync"
+                        assert torch.allclose(grad_list[0], grad_list[i], rtol=0, atol=0), (
+                            f"Indexer gradient for {name} differs between TP rank 0 and rank {i} after TP sync"  # noqa: E501
+                        )
 
         Utils.destroy_model_parallel()

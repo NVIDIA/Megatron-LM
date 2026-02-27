@@ -3,7 +3,6 @@ import os
 
 import pytest
 import torch
-import torch.distributed as dist
 
 from megatron.core.inference.config import InferenceConfig
 from megatron.core.inference.contexts.dynamic_context import DynamicInferenceContext
@@ -27,8 +26,8 @@ from megatron.rl.rl_utils import selective_log_softmax
 from tests.unit_tests.test_utilities import Utils
 
 try:
-    from flash_attn_3.flash_attn_interface import _flash_attn_forward
-    from flash_attn_3.flash_attn_interface import (
+    from flash_attn_3.flash_attn_interface import _flash_attn_forward  # noqa: F401
+    from flash_attn_3.flash_attn_interface import (  # noqa: F401
         flash_attn_with_kvcache as flash_attn3_with_kvcache,
     )
 
@@ -247,9 +246,9 @@ class TestGPTModelBatchInvariant:
                     dtype=baseline_log_probs.dtype,
                     device="cuda",
                 )
-                assert torch.equal(
-                    inference_log_probs, baseline_log_probs
-                ), "Log probabilities from dynamic engine did not match batched forward."
+                assert torch.equal(inference_log_probs, baseline_log_probs), (
+                    "Log probabilities from dynamic engine did not match batched forward."
+                )
 
     def test_dynamic_engine_is_batch_invariant(self):
         """Check that the dynamic engine itself is batch invariant: changing the

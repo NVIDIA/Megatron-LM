@@ -1,18 +1,12 @@
 # Copyright (c) 2023, NVIDIA CORPORATION. All rights reserved.
-import inspect
 import logging
 
 import pytest
 import torch
-from torch.optim import Adam
 
 from megatron.core import parallel_state
 from megatron.core.dist_checkpointing import ShardedTensor, load, load_plain_tensors, save
-from megatron.core.dist_checkpointing.dict_utils import diff, nested_values
-from megatron.core.dist_checkpointing.optimizer import (
-    get_param_id_to_sharded_param_map,
-    optim_state_to_sharding_state,
-)
+from megatron.core.dist_checkpointing.dict_utils import diff
 from megatron.core.models.gpt.gpt_layer_specs import get_gpt_layer_with_transformer_engine_spec
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
 from megatron.core.transformer.mlp import MLP, apply_swiglu_sharded_factory

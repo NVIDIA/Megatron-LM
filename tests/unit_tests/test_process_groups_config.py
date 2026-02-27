@@ -92,7 +92,6 @@ class TestProcessGroupsConfig:
 
 
 class TestPGConfigDefaultInitialization:
-
     def setup_method(self, method):
         Utils.initialize_model_parallel(1, 1)
 

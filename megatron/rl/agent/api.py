@@ -2,7 +2,6 @@
 
 import asyncio
 from abc import ABC, abstractmethod
-from collections.abc import AsyncIterable
 from typing import Generic, TypeVar
 
 import numpy as np
@@ -11,11 +10,7 @@ from pydantic import BaseModel
 from megatron.core.utils import trace_async_exceptions
 
 from ..__init__ import Request, TypeLookupable
-from ..inference import (
-    InferenceInterface,
-    LLMChatMessage,
-    ReturnsRaw,
-)
+from ..inference import InferenceInterface, LLMChatMessage, ReturnsRaw
 
 
 class AgentBaseModel(BaseModel, extra='allow'):
@@ -117,9 +112,9 @@ class RolloutGenerator(Agent, ABC):
     async def rollout(self, request: RolloutRequest) -> Rollout: ...
 
     async def get_reward_rollouts(self, request: RolloutRequest) -> list[Rollout]:
-        assert isinstance(
-            request.inference_interface, ReturnsRaw
-        ), "InferenceInterface must support raw_text return to provide rollouts."
+        assert isinstance(request.inference_interface, ReturnsRaw), (
+            "InferenceInterface must support raw_text return to provide rollouts."
+        )
 
         return await asyncio.gather(
             *[self.rollout(request=request) for _ in range(request.num_rollouts)]
@@ -127,7 +122,7 @@ class RolloutGenerator(Agent, ABC):
 
 
 class ContrastiveRolloutGenerator(Agent, ABC):
-    """An agent that produces ContrastiveRollout objects containing two rollout strings, one chosen and one rejected."""
+    """An agent that produces ContrastiveRollout objects containing two rollout strings, one chosen and one rejected."""  # noqa: E501
 
     @abstractmethod
     async def get_contrastive_rollouts(
@@ -136,19 +131,21 @@ class ContrastiveRolloutGenerator(Agent, ABC):
 
 
 class TokenizedRolloutGenerator(Agent, ABC):
-    """An agent that produces TokenRollout objects containing rollout token ids and associated rewards.
+    """An agent that produces TokenRollout objects containing rollout
+    token ids and associated rewards.
 
-    Optionally can also provide generation masks to indicate which tokens were generated and token masks to indicate which
-    tokens were possible at any given step.
+    Optionally can also provide generation masks to indicate which
+    tokens were generated and token masks to indicate which tokens
+    were possible at any given step.
     """
 
     @abstractmethod
     async def rollout(self, request: RolloutRequest) -> TokenRollout: ...
 
     async def get_reward_rollouts(self, request: RolloutRequest) -> list[TokenRollout]:
-        assert isinstance(
-            request.inference_interface, ReturnsRaw
-        ), "InferenceInterface must support raw_text return to provide rollouts."
+        assert isinstance(request.inference_interface, ReturnsRaw), (
+            "InferenceInterface must support raw_text return to provide rollouts."
+        )
 
         return await asyncio.gather(
             *[self.rollout(request=request) for _ in range(request.num_rollouts)]
@@ -170,12 +167,12 @@ class GroupedRolloutGenerator(Agent, ABC):
     async def group_rollout(self, request: GroupedRolloutRequest) -> list[Rollout]: ...
 
     async def get_grouped_rollouts(self, request: GroupedRolloutRequest):
-        assert isinstance(
-            request.inference_interface, ReturnsRaw
-        ), "InferenceInterface must support raw_text return to provide rollouts."
+        assert isinstance(request.inference_interface, ReturnsRaw), (
+            "InferenceInterface must support raw_text return to provide rollouts."
+        )
 
         # If num_groups is -1, we generate a stream of groups.
-        # The buffer size is used to create backpressure for each agent in order to balance group generation in a multi-task setting.
+        # The buffer size is used to create backpressure for each agent in order to balance group generation in a multi-task setting.  # noqa: E501
         grouped_rollouts: asyncio.Queue[list[Rollout]] = asyncio.Queue(
             maxsize=self.buffer_size if request.num_groups < 0 else 0
         )

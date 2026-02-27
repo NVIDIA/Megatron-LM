@@ -181,7 +181,7 @@ class RecipeConfig:
         log_single_rank(
             logger,
             logging.INFO,
-            f"Loaded quantization recipe from path '{recipe_yaml_path}'. " f"Contents: '{config}'",
+            f"Loaded quantization recipe from path '{recipe_yaml_path}'. Contents: '{config}'",
         )
 
         return RecipeConfig.from_config_dict(config)

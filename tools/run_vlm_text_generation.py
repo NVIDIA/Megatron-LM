@@ -1,5 +1,6 @@
 # Copyright (c) 2024, NVIDIA CORPORATION.  All rights reserved.
 """Generate text using a vision language model."""
+
 import glob
 import json
 import logging
@@ -85,7 +86,7 @@ def preprocess_image(target_h, target_w, img):
 
 
 def generate_samples(model):
-    """Text generation using a trained vision language model. This is an example for the COCO dataset."""
+    """Text generation using a trained vision language model. This is an example for the COCO dataset."""  # noqa: E501
     args = get_args()
 
     image_files = sorted(glob.glob(args.input_path + "/*"))
@@ -187,9 +188,9 @@ class VLMForwardStep(ForwardStep):
         # Update the sequence length offset by the number of image tokens.
         num_tokens = tokens.size(1)
         if num_tokens > 1:
-            self.inference_context.sequence_len_offset += self.inference_context.key_value_memory_dict[
-                "image_tokens_count"
-            ]
+            self.inference_context.sequence_len_offset += (
+                self.inference_context.key_value_memory_dict["image_tokens_count"]
+            )
 
         return logits
 

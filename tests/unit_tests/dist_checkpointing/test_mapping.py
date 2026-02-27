@@ -6,22 +6,18 @@ import torch
 from megatron.core.dist_checkpointing import ShardedTensor
 from megatron.core.dist_checkpointing.core import CheckpointingException
 from megatron.core.dist_checkpointing.mapping import (
-    ShardedObject,
     ShardedTensorFactory,
     apply_factories,
     apply_factory_merges,
     is_main_replica,
 )
-from megatron.core.transformer.transformer_config import TransformerConfig
-from tests.unit_tests.test_utilities import Utils
 
 
 class TestShardedTensor:
-
     # def setup_method(self, method):
     #     Utils.initialize_model_parallel(1,1)
-    #     transformer_config = TransformerConfig(num_layers=2, hidden_size=12, num_attention_heads=4, use_cpu_initialization=True)
-    #     self.gpt_embedding = GPTEmbedding(config=transformer_config, vocab_size=100, max_sequence_length=4, add_position_embedding=True)
+    #     transformer_config = TransformerConfig(num_layers=2, hidden_size=12, num_attention_heads=4, use_cpu_initialization=True)  # noqa: E501
+    #     self.gpt_embedding = GPTEmbedding(config=transformer_config, vocab_size=100, max_sequence_length=4, add_position_embedding=True)  # noqa: E501
     #
     # def teardown_method(self, method):
     #     Utils.destroy_model_parallel()

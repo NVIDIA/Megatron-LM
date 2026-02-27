@@ -35,12 +35,12 @@ class MegatronLocal(InferenceServer, ReturnsTokens, ReturnsRaw):
     _inference_engine: DynamicInferenceEngine = PrivateAttr(None)
 
     async def base_generate(self, request: InferenceRequest) -> InferenceResponse:
-
         assert self._server_task is not None, "Inference server is not initialized"
         tokenizer = get_tokenizer()
         args = get_args()
 
         from openai import AsyncOpenAI
+
         client = AsyncOpenAI(base_url=f"http://{self.host}:{self.port}", api_key="NONE")
 
         # Things that may be problematic when doign this switch
@@ -87,24 +87,29 @@ class MegatronLocal(InferenceServer, ReturnsTokens, ReturnsRaw):
 
         inference_engine: DynamicInferenceEngine = get_dynamic_inference_engine(model=model)
         dp_addr = await inference_engine.start_listening_to_data_parallel_coordinator(
-            inference_coordinator_port=41521, launch_inference_coordinator=True,
+            inference_coordinator_port=41521, launch_inference_coordinator=True
         )
 
         if dist.get_rank() == 0:
-            from megatron.core.inference.text_generation_server.dynamic_text_gen_server.flask_server import run_flask_server_on_client
+            from megatron.core.inference.text_generation_server.dynamic_text_gen_server.flask_server import (  # noqa: E501
+                run_flask_server_on_client,
+            )
+
             loop = asyncio.get_event_loop()
             client = InferenceClient(inference_coordinator_address=dp_addr)
             await client.start()
-            server_task = loop.create_task(run_flask_server_on_client(
-                client=client,
-                tokenizer=inference_engine.controller.tokenizer,
-                flask_port=kwargs.get('port', 8294),
-                parsers=[]
-            ))
+            server_task = loop.create_task(
+                run_flask_server_on_client(
+                    client=client,
+                    tokenizer=inference_engine.controller.tokenizer,
+                    flask_port=kwargs.get('port', 8294),
+                    parsers=[],
+                )
+            )
         else:
             client = None
             server_task = None
-            
+
         launched_server = cls(**kwargs)
         launched_server._client = client
         launched_server._server_task = server_task

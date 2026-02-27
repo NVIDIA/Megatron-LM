@@ -1,10 +1,7 @@
 # Copyright (c) 2024, NVIDIA CORPORATION. All rights reserved.
 
-import math
-import re
 
 import pytest
-import torch
 
 from megatron.core.ssm.mamba_hybrid_layer_allocation import (
     ParsedHybridPattern,
@@ -16,7 +13,6 @@ from megatron.core.ssm.mamba_hybrid_layer_allocation import (
 
 @pytest.mark.internal
 class TestMambaHybridLayerAllocation:
-
     def test_hybrid_layer_allocation(self):
         # The format for the test cases is:
         # (layers_count, attention_ratio, mlp_ratio, override_pattern).

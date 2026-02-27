@@ -3,10 +3,10 @@
 import argparse
 import os
 import random
-import numpy
-import torch
 
 import mpu
+import numpy
+import torch
 
 
 class IdentityLayer(torch.nn.Module):
@@ -30,8 +30,9 @@ def initialize_distributed(backend='nccl'):
     """Initialize torch.distributed."""
     # Get local rank in case it is provided.
     parser = argparse.ArgumentParser()
-    parser.add_argument('--local_rank', type=int, default=None,
-                        help='local rank passed from distributed launcher')
+    parser.add_argument(
+        '--local_rank', type=int, default=None, help='local rank passed from distributed launcher'
+    )
     args = parser.parse_args()
     local_rank = args.local_rank
 
@@ -39,8 +40,11 @@ def initialize_distributed(backend='nccl'):
     rank = int(os.getenv('RANK', '0'))
     world_size = int(os.getenv("WORLD_SIZE", '1'))
 
-    print('> initializing torch.distributed with local rank: {}, '
-          'rank: {}, world size: {}'.format(local_rank, rank, world_size))
+    print(
+        '> initializing torch.distributed with local rank: {}, rank: {}, world size: {}'.format(
+            local_rank, rank, world_size
+        )
+    )
 
     # Set the device id.
     device = rank % torch.cuda.device_count()
@@ -54,10 +58,8 @@ def initialize_distributed(backend='nccl'):
     master_port = os.getenv('MASTER_PORT', '6000')
     init_method += master_ip + ':' + master_port
     torch.distributed.init_process_group(
-        backend=backend,
-        world_size=world_size,
-        rank=rank,
-        init_method=init_method)
+        backend=backend, world_size=world_size, rank=rank, init_method=init_method
+    )
 
 
 def print_separator(message):

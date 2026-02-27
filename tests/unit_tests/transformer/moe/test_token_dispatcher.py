@@ -1,6 +1,5 @@
 # Copyright (c) 2023, NVIDIA CORPORATION. All rights reserved.
 
-import copy
 import dataclasses
 
 import pytest
@@ -148,15 +147,17 @@ class MoEModelTestContainer:
         scale = moe_layer.config.expert_tensor_parallel_size
         restored_hidden_states = restored_hidden_states / scale
 
-        torch.testing.assert_close(
-            restored_hidden_states, ans
-        ), "Restored hidden states do not match original hidden states"
+        (
+            torch.testing.assert_close(restored_hidden_states, ans),
+            "Restored hidden states do not match original hidden states",
+        )
 
         # check if the grad of the hidden states is same as the hidden states
         torch.autograd.backward(restored_hidden_states, hidden_states)
-        torch.testing.assert_close(
-            hidden_states.grad, ans
-        ), "Restored hidden states do not match original hidden states"
+        (
+            torch.testing.assert_close(hidden_states.grad, ans),
+            "Restored hidden states do not match original hidden states",
+        )
 
     @pytest.mark.internal
     def dispatcher_capacity_test(self):
@@ -201,15 +202,17 @@ class MoEModelTestContainer:
         restored_hidden_states, restored_bias = token_unpermutation(
             moe_layer.token_dispatcher, permuted_local_hidden_states
         )
-        torch.testing.assert_close(
-            restored_hidden_states, restored_hidden_states_answer
-        ), "Restored hidden states does not match"
+        (
+            torch.testing.assert_close(restored_hidden_states, restored_hidden_states_answer),
+            "Restored hidden states does not match",
+        )
 
         # check if the grad of the hidden states is same as the hidden states
         torch.autograd.backward(restored_hidden_states, hidden_states)
-        torch.testing.assert_close(
-            hidden_states.grad, restored_hidden_states_answer
-        ), "Gradient of hidden states should be same as hidden states"
+        (
+            torch.testing.assert_close(hidden_states.grad, restored_hidden_states_answer),
+            "Gradient of hidden states should be same as hidden states",
+        )
 
     @pytest.mark.internal
     def dispatcher_drop_and_pad_test(self):
@@ -266,15 +269,17 @@ class MoEModelTestContainer:
             * self.config.expert_model_parallel_size
             * self.config.tensor_model_parallel_size
         ), "Tokens per expert should be the same as the capacity"
-        torch.testing.assert_close(
-            restored_hidden_states, forward_answer
-        ), "Restored hidden states does not match"
+        (
+            torch.testing.assert_close(restored_hidden_states, forward_answer),
+            "Restored hidden states does not match",
+        )
 
         # check if the grad of the hidden states is same as the hidden states
         torch.autograd.backward(restored_hidden_states, restored_hidden_states)
-        torch.testing.assert_close(
-            hidden_states.grad, backward_answer
-        ), "Gradient of hidden states should be same as hidden states"
+        (
+            torch.testing.assert_close(hidden_states.grad, backward_answer),
+            "Gradient of hidden states should be same as hidden states",
+        )
 
     @pytest.mark.internal
     def dispatcher_router_padding_for_fp8_test(self):
@@ -318,14 +323,14 @@ class MoEModelTestContainer:
         (permuted_input_2, tokens_per_expert_2, permuted_probs_2) = token_permutation(
             moe_layer_2.token_dispatcher, hidden_states, probs_2, indices_2
         )
-        assert (
-            sum(tokens_per_expert_2) == permuted_input_2.shape[0]
-        ), f"number of tokens is not the same, {sum(tokens_per_expert_2)} != {permuted_input_2.shape[0]}"
+        assert sum(tokens_per_expert_2) == permuted_input_2.shape[0], (
+            f"number of tokens is not the same, {sum(tokens_per_expert_2)} != {permuted_input_2.shape[0]}"  # noqa: E501
+        )
         # when there is only one expert, the tokens is not enough for router padding
         if moe_layer_2.num_local_experts > 1:
-            assert torch.all(
-                tokens_per_expert_2 % 16 == 0
-            ), "number of tokens for expert is not a multiple of 16"
+            assert torch.all(tokens_per_expert_2 % 16 == 0), (
+                "number of tokens for expert is not a multiple of 16"
+            )
 
         permuted_input_2 = permuted_input_2 * permuted_probs_2.unsqueeze(-1)
         permuted_input_2 = permuted_input_2.to(dtype=self.test_dtype)
@@ -334,15 +339,17 @@ class MoEModelTestContainer:
         )
 
         # Check that the results are the same
-        torch.testing.assert_close(
-            restored_hidden_states_1, restored_hidden_states_2
-        ), "Restored hidden states do not match between padded and non-padded versions"
+        (
+            torch.testing.assert_close(restored_hidden_states_1, restored_hidden_states_2),
+            "Restored hidden states do not match between padded and non-padded versions",
+        )
 
         # Check gradients
         torch.autograd.backward(restored_hidden_states_2, restored_hidden_states_2)
-        torch.testing.assert_close(
-            grad_1, hidden_states.grad
-        ), "Gradients do not match between padded and non-padded versions"
+        (
+            torch.testing.assert_close(grad_1, hidden_states.grad),
+            "Gradients do not match between padded and non-padded versions",
+        )
 
     def set_params(self):
         # TODO: Set consistent parameters for various parallelisms.

@@ -142,11 +142,11 @@ class TestQKVRotaryEmbedding:
             qkv, pos_embed, pos_embed, qkv_split_arg_list
         )
 
-        assert (
-            q_out_ref.numel() == q_out.numel()
-        ), f"Output sizes do not match for Q: {q_out.shape} != {q_out_ref.shape}"
-        assert (
-            k_out_ref.numel() == k_out.numel()
-        ), f"Output sizes do not match for K: {k_out.shape} != {k_out_ref.shape}"
+        assert q_out_ref.numel() == q_out.numel(), (
+            f"Output sizes do not match for Q: {q_out.shape} != {q_out_ref.shape}"
+        )
+        assert k_out_ref.numel() == k_out.numel(), (
+            f"Output sizes do not match for K: {k_out.shape} != {k_out_ref.shape}"
+        )
         assert torch.allclose(q_out_ref, q_out), f"Outputs do not match for Q"
         assert torch.allclose(k_out_ref, k_out), f"Outputs do not match for K"

@@ -3,19 +3,19 @@ import argparse
 import glob
 import json
 import os
-import sys
 import re
 import subprocess
+import sys
 
 from .mmmu_utils import parse_multi_choice_response
+
 # Get the absolute path of the parent directory
 parent_dir = os.path.abspath(os.path.join(os.path.dirname(__file__), os.path.pardir))
 # Add the parent directory to sys.path
 sys.path.insert(0, parent_dir)
 
-from run_text_generation import get_output_path
 from config import EvaluationConfig
-
+from run_text_generation import get_output_path
 
 
 def get_input_output_paths(input_path, task):
@@ -37,6 +37,7 @@ def get_input_output_paths(input_path, task):
 
 def extract_answer(text):
     import re
+
     # Regular expression to find content inside \answer{xxx}
     match = re.search(r'\\answer\{(.*?)\}', text)
     if match:
@@ -49,7 +50,6 @@ def extract_answer(text):
 
     text = text.replace("Answer:", "Answer: ")
     return text  # Return the original string if no match is found
-
 
 
 def convert_to_mmmu_format(input_path):
@@ -88,7 +88,7 @@ def mmmu_eval(input_path, groundtruth_path):
     """Run MMMU evaluation."""
     result_file = convert_to_mmmu_format(input_path)
 
-    # The MMMU repo has a script for running the actual evaluation but no API. So launching the script here.
+    # The MMMU repo has a script for running the actual evaluation but no API. So launching the script here.  # noqa: E501
     output = subprocess.run(
         [
             "python",
@@ -112,7 +112,7 @@ def mmmu_eval(input_path, groundtruth_path):
 
 def main():
     """Run MMMU evaluation."""
-    # Using the validation groundtruth file from the MMMU repo by default. This assumes you have cloned the MMMU github repo here.
+    # Using the validation groundtruth file from the MMMU repo by default. This assumes you have cloned the MMMU github repo here.  # noqa: E501
     default_groundtruth_path = "examples/multimodal/MMMU/mmmu/answer_dict_val.json"
 
     parser = argparse.ArgumentParser()

@@ -225,9 +225,9 @@ class FullyParallelLoadStrategyWrapper(LoadShardedStrategy):
             precomputed_distribution: ShardDistribution | None = self.apply_loading_parallelization(
                 sharded_state_dict
             )
-            assert (
-                precomputed_distribution is not None
-            ), 'Expecting non-trivial distribution for non-trivial parallelization group'
+            assert precomputed_distribution is not None, (
+                'Expecting non-trivial distribution for non-trivial parallelization group'
+            )
 
         # Step 3: load part of the checkpoint.
         # Load only sharded objects first. ShardedTensors will be loaded separately
@@ -240,9 +240,9 @@ class FullyParallelLoadStrategyWrapper(LoadShardedStrategy):
             self._defer_loading_sharded_objects(sharded_state_dict)
         )
 
-        assert (
-            len(sharded_state_dict) == 0
-        ), "sharded_state_dict is not empty after deferring tensors and objects"
+        assert len(sharded_state_dict) == 0, (
+            "sharded_state_dict is not empty after deferring tensors and objects"
+        )
         with debug_time("base_load_ShardedObjects", logger):
             # Load sharded objects first
             loaded_objects = self.base_strategy.load(to_load_objects, checkpoint_dir)
@@ -252,7 +252,6 @@ class FullyParallelLoadStrategyWrapper(LoadShardedStrategy):
             loaded_tensors = self.base_strategy.load(to_load_shards, checkpoint_dir)
 
         with debug_time("self.exchange_loaded_tensors", logger):
-
             # Step 4: exchange data between ranks
             logger.debug(f'Applying parallel load with algo {self.exchange_algo}')
             all_loaded_tensors = exchange_by_distribution(

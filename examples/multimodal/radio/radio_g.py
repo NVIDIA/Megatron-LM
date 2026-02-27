@@ -1,7 +1,5 @@
 # Copyright (c) 2025, NVIDIA CORPORATION.  All rights reserved.
-from functools import partial
 
-import torch
 
 from examples.multimodal.layer_scaling import (
     LayerScalingTransformerLayer,
@@ -14,7 +12,7 @@ from megatron.core.transformer.enums import AttnMaskType
 from megatron.core.transformer.identity_op import IdentityOp
 from megatron.core.transformer.mlp import MLP, MLPSubmodules
 from megatron.core.transformer.spec_utils import ModuleSpec
-from megatron.core.transformer.transformer_layer import TransformerLayer, TransformerLayerSubmodules
+from megatron.core.transformer.transformer_layer import TransformerLayerSubmodules
 from megatron.core.typed_torch import not_none
 
 try:
@@ -38,7 +36,7 @@ except ImportError:
     HAVE_TE = False
 
 try:
-    import apex
+    import apex  # noqa: F401
 
     from megatron.core.fusions.fused_layer_norm import FusedLayerNorm
 

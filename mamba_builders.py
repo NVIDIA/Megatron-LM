@@ -1,12 +1,12 @@
 # Copyright (c) 2025, NVIDIA CORPORATION.  All rights reserved.
 
-from model_provider import count_parameters_in_layer
 from megatron.core.models.mamba import MambaModel
+from megatron.core.models.mamba.mamba_layer_specs import mamba_inference_stack_spec
 from megatron.core.transformer import TransformerConfig
 from megatron.core.transformer.spec_utils import import_module
 from megatron.training import print_rank_0
 from megatron.training.arguments import core_transformer_config_from_args
-from megatron.core.models.mamba.mamba_layer_specs import mamba_inference_stack_spec
+from model_provider import count_parameters_in_layer
 
 
 def mamba_builder(args, pre_process, post_process, vp_stage=None, config=None, pg_collection=None):
@@ -17,9 +17,9 @@ def mamba_builder(args, pre_process, post_process, vp_stage=None, config=None, p
 
     if config.transformer_impl == "inference_optimized":
         mamba_stack_spec = mamba_inference_stack_spec
-        assert (
-            not config.inference_fuse_tp_communication
-        ), "inference_fuse_tp_communication is not supported for Mamba"
+        assert not config.inference_fuse_tp_communication, (
+            "inference_fuse_tp_communication is not supported for Mamba"
+        )
     elif args.spec is not None:
         mamba_stack_spec = import_module(args.spec)
     else:

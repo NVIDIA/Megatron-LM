@@ -38,9 +38,9 @@ def rotate_activation(x: torch.Tensor) -> torch.Tensor:
     Returns:
         Rotated tensor.
     """
-    assert (
-        x.dtype == torch.bfloat16
-    ), f"rotate_activation only support bf16 input, but got {x.dtype}"
+    assert x.dtype == torch.bfloat16, (
+        f"rotate_activation only support bf16 input, but got {x.dtype}"
+    )
     assert hadamard_transform is not None, "fast_hadamard_transform is not installed."
     hidden_size = x.size(-1)
     return hadamard_transform(x, scale=hidden_size**-0.5)

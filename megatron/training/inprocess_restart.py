@@ -15,17 +15,17 @@ import torch
 
 from megatron.core import rerun_state_machine
 from megatron.training import get_args
-from megatron.training.async_utils import (
-    reset_persistent_async_worker,
-)
+from megatron.training.async_utils import reset_persistent_async_worker
 
 from . import arguments
 
 
 def destroy_state():
     from . import training
+
     training.destroy_global_state()
     rerun_state_machine.destroy_rerun_state_machine()
+
 
 def inprocess_restart(train, args):
     if inprocess is None:
@@ -80,9 +80,7 @@ def inprocess_restart(train, args):
     )
 
     class AbortCheckpoint(inprocess.abort.Abort):
-        def __call__(
-            self, state: inprocess.state.FrozenState
-        ) -> inprocess.state.FrozenState:
+        def __call__(self, state: inprocess.state.FrozenState) -> inprocess.state.FrozenState:
             reset_persistent_async_worker()
             return state
 
@@ -124,7 +122,6 @@ def inprocess_restart(train, args):
 
 
 def maybe_wrap_for_inprocess_restart(pretrain):
-
     args = arguments.parse_args(ignore_unknown_args=True)
 
     if args.inprocess_restart:
@@ -132,7 +129,7 @@ def maybe_wrap_for_inprocess_restart(pretrain):
 
         store = torch.distributed.TCPStore(
             host_name=os.environ['MASTER_ADDR'],
-            port=int(os.environ['MASTER_PORT'])+1,
+            port=int(os.environ['MASTER_PORT']) + 1,
             world_size=int(os.getenv('WORLD_SIZE', '1')),
             is_master=(int(os.getenv('RANK', '0')) == 0),
             timeout=timedelta(seconds=300),
@@ -146,7 +143,6 @@ def maybe_wrap_for_inprocess_restart(pretrain):
 
 
 def maybe_force_nccl_backend_init(device_id):
-
     args = get_args()
 
     # Inprocess uses destroy_process_group to terminate NCCL backend, which

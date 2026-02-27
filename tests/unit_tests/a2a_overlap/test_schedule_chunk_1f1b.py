@@ -143,9 +143,9 @@ class TestA2AOverlap:
             for i in range(microbatches):
                 # 1st forward
                 if i > 0:
-                    assert (
-                        schedule_plans[0].pre_process is None
-                    ), "pre_process should be released after backward"
+                    assert schedule_plans[0].pre_process is None, (
+                        "pre_process should be released after backward"
+                    )
                     schedule_plans[0] = gpt_models[0].build_schedule_plan(**datas[0])
                     schedule_plans[1] = gpt_models[1].build_schedule_plan(**datas[1])
                 f_input_0 = TransformerModelChunkSchedulePlan.run(schedule_plans[0], None)
@@ -249,9 +249,9 @@ class TestA2AOverlap:
             for i in range(microbatches):
                 # 1st forward
                 if i > 0:
-                    assert (
-                        schedule_plans[0].pre_process is None
-                    ), "pre_process should be released after backward"
+                    assert schedule_plans[0].pre_process is None, (
+                        "pre_process should be released after backward"
+                    )
                     schedule_plans[0] = gpt_models[0].build_schedule_plan(**datas[0])
                     schedule_plans[1] = gpt_models[1].build_schedule_plan(**datas[1])
                 f_input_0 = TransformerModelChunkSchedulePlan.run(schedule_plans[0], None)

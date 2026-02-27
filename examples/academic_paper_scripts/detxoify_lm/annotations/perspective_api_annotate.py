@@ -1,32 +1,32 @@
+import argparse
 import json
 import time
-from typing import Dict, Optional, List
+from typing import Dict, List, Optional
 
-import joblib
 from googleapiclient import discovery
-from googleapiclient.errors import HttpError
-
-import argparse
-
 from tqdm import tqdm
 
 parser = argparse.ArgumentParser(description='Process some integers.')
-parser.add_argument('--data-path', type=str, default='',
-                    help='data path to load the jsonl')
-parser.add_argument('--out-path', type=str, default='',
-                    help='data path to load the jsonl')
-parser.add_argument('--total', type=int, default=-1,
-                    help='Total number of data')
-parser.add_argument('--workers', type=int, default=1,
-                   help='Number of worker processes to launch')
+parser.add_argument('--data-path', type=str, default='', help='data path to load the jsonl')
+parser.add_argument('--out-path', type=str, default='', help='data path to load the jsonl')
+parser.add_argument('--total', type=int, default=-1, help='Total number of data')
+parser.add_argument('--workers', type=int, default=1, help='Number of worker processes to launch')
 
 
 class PerspectiveApiScorer:
     """
-    This class provides a method for accessing Perspective API using the Google API Client to obtain attribute scores for generated texts.
+    This class provides a method for accessing Perspective API using
+    the Google API Client to obtain attribute scores for generated texts.
     """
 
-    DEFAULT_ATTRIBUTES = ['toxicity', 'severe_toxicity', 'sexually_explicit', 'threat', 'profanity', 'identity_attack']
+    DEFAULT_ATTRIBUTES = [
+        'toxicity',
+        'severe_toxicity',
+        'sexually_explicit',
+        'threat',
+        'profanity',
+        'identity_attack',
+    ]
 
     def __init__(self):
         """
@@ -41,14 +41,20 @@ class PerspectiveApiScorer:
             static_discovery=False,
         )
 
-    def get_scores(self, input_text: str, requested_attributes: Optional[List[str]] = None) -> Dict[str, float]:
+    def get_scores(
+        self, input_text: str, requested_attributes: Optional[List[str]] = None
+    ) -> Dict[str, float]:
         """
         Get attribute scores for a given text via Perspective API.
         :param input_text: the input text
         :param requested_attributes: the attributes for which to compute scores
         :return: a mapping from attribute names to scores
         """
-        requested_attributes = requested_attributes if requested_attributes else PerspectiveApiScorer.DEFAULT_ATTRIBUTES
+        requested_attributes = (
+            requested_attributes
+            if requested_attributes
+            else PerspectiveApiScorer.DEFAULT_ATTRIBUTES
+        )
 
         analyze_request = {
             'comment': {'text': input_text},
@@ -66,8 +72,10 @@ class PerspectiveApiScorer:
                 print(input_text)
                 time.sleep(1)
 
-        return {attribute: response['attributeScores'][attribute.upper()]['summaryScore']['value'] for attribute in
-                requested_attributes}
+        return {
+            attribute: response['attributeScores'][attribute.upper()]['summaryScore']['value']
+            for attribute in requested_attributes
+        }
 
 
 def test():
@@ -79,11 +87,13 @@ def test():
 def split_lines(lines, split):
     tot = len(lines)
     each = tot // split
-    return [lines[i:i+each] for i in range(0, tot, each)]
+    return [lines[i : i + each] for i in range(0, tot, each)]
+
 
 from joblib import Parallel, delayed
 
 scorer = PerspectiveApiScorer()
+
 
 def get_score(line):
     data = json.loads(line)
@@ -147,12 +157,14 @@ def get_scores(lines):
         all_data.append(json.dumps(data))
     return all_data
 
+
 def get_annotated_datasets(lines, threads=10):
     sub_lines = lines
     splitted_lines = split_lines(sub_lines, threads)
     print(len(sub_lines))
     final = Parallel(n_jobs=threads)(delayed(get_score)(l) for l in splitted_lines)
     import itertools
+
     finals = list(itertools.chain.from_iterable(final))
     return finals
 
@@ -166,6 +178,7 @@ def main():
 
     fin = open(path, 'r', encoding='utf-8')
     import multiprocessing
+
     pool = multiprocessing.Pool(args.workers)
     annotated = pool.imap(get_score, fin, 25)
     with open(out, "w") as f:
@@ -179,4 +192,3 @@ def main():
 
 if __name__ == '__main__':
     main()
-

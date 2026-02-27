@@ -243,9 +243,9 @@ def fused_multimem_rs_add_norm_ag(
     # each thread will process 128 bits (8 bf16 values) at a time.
     numel_per_thread = BYTES_PER_THREAD // residual_input_tensor.element_size()
 
-    assert (
-        input_tensor.numel() % numel_per_thread == 0
-    ), "The number of elements must be 128-bit aligned."
+    assert input_tensor.numel() % numel_per_thread == 0, (
+        "The number of elements must be 128-bit aligned."
+    )
 
     num_threads = triton.cdiv(input_tensor.numel() // numel_per_thread, symm_mem_hdl.world_size)
 

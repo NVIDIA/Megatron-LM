@@ -1,13 +1,11 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
-from argparse import Namespace
 from copy import deepcopy
 from unittest import mock
 
 import numpy as np
 import torch
 
-from megatron.core import parallel_state
 from megatron.core.inference.contexts import StaticInferenceContext
 from megatron.core.inference.model_inference_wrappers.t5.t5_inference_wrapper import (
     T5InferenceWrapper,
@@ -24,7 +22,6 @@ from tests.unit_tests.test_utilities import Utils
 
 
 class TestT5InferenceWrapper:
-
     def setup_model(self, tensor_parallel_size, pipeline_parallel_size):
         Utils.initialize_model_parallel(
             tensor_model_parallel_size=tensor_parallel_size,
@@ -119,8 +116,6 @@ class TestT5InferenceWrapper:
             inference_input_for_context_window
         )
 
-        assert logits.shape == (
-            self.batch_size,
-            self.decoder_sequence_length,
-            self.vocab_size,
-        ), f"Shape mismatch . Expected {(self.batch_size, self.decoder_sequence_length, self.vocab_size)}, but got {logits.shape}"
+        assert logits.shape == (self.batch_size, self.decoder_sequence_length, self.vocab_size), (
+            f"Shape mismatch . Expected {(self.batch_size, self.decoder_sequence_length, self.vocab_size)}, but got {logits.shape}"  # noqa: E501
+        )

@@ -7,8 +7,6 @@ This provider assembles a MIMO model that consists of:
 • A 2-layer MLP projector that maps vision embeddings into Vicuna hidden size.
 """
 
-
-import torch
 from configs.llava_vlm import (
     get_llava_projection_config,
     get_llava_projection_layer_spec,
@@ -32,7 +30,7 @@ def model_provider_llava_vlm(
     add_encoder=True,
     add_decoder=True,
     image_special_token_id: int = 32000,
-    is_video_input: bool = False
+    is_video_input: bool = False,
 ):
     """
     Build a LLaVA-style Vision-Language MIMO model composed of:
@@ -47,9 +45,7 @@ def model_provider_llava_vlm(
     language_config = get_vicuna_language_model_config()
 
     # Vision→language projection MLP – hidden size follows Vicuna (4096)
-    projection_config = get_llava_projection_config(
-        hidden_size=language_config.hidden_size
-    )
+    projection_config = get_llava_projection_config(hidden_size=language_config.hidden_size)
 
     # Sync precision flags from global args (if we're running under Megatron training loop)
     try:
@@ -67,8 +63,7 @@ def model_provider_llava_vlm(
 
     # HF encoder
     vision_encoder = ModuleSpec(
-        module=HFCLIPEncoderWrapper,
-        params={"is_video_input" : is_video_input},
+        module=HFCLIPEncoderWrapper, params={"is_video_input": is_video_input}
     )
 
     # Create projection config for vision to language
@@ -110,29 +105,34 @@ def model_provider_llava_vlm(
     mimo_model_config = MimoModelConfig(
         language_model_spec=language_model_spec,
         modality_submodules_spec={"images": vision_submodule_spec},
-        special_token_ids={"images": image_special_token_id}
+        special_token_ids={"images": image_special_token_id},
     )
 
     # Create MIMO model
     mimo_model = MimoModel(mimo_model_config)
-    print("*"*100)
+    print("*" * 100)
     print_mimo_structure(mimo_model)
-    print("*"*100)
+    print("*" * 100)
 
     # load the checkpoint
     try:
         from megatron.training import get_args  # late import to avoid circular deps
 
         _args = get_args()
-        if  _args.language_model_checkpoint is not None:
+        if _args.language_model_checkpoint is not None:
             load_submodule_ckpt(mimo_model.language_model, _args.language_model_checkpoint)
-            print(f"Successfully loaded LLaVA pretrained checkpoint from {_args.language_model_checkpoint}")
+            print(
+                f"Successfully loaded LLaVA pretrained checkpoint from {_args.language_model_checkpoint}"  # noqa: E501
+            )
     except (ModuleNotFoundError, AssertionError):
         pass
 
-    # TODO: ykarnati make these configurable and have an API to freeze/unfreeze   
+    # TODO: ykarnati make these configurable and have an API to freeze/unfreeze
     # freeze vision encoder and LLM parameters
-    modules_to_freeze = [mimo_model.modality_submodules.images.encoders.clip_encoder, mimo_model.language_model]
+    modules_to_freeze = [
+        mimo_model.modality_submodules.images.encoders.clip_encoder,
+        mimo_model.language_model,
+    ]
     for module in modules_to_freeze:
         for param in module.parameters():
             param.requires_grad = False

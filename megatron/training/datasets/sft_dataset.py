@@ -1,7 +1,5 @@
 # Copyright (c) 2025, NVIDIA CORPORATION.  All rights reserved.
 
-import atexit, json
-from collections import Counter
 from typing import Any, Dict, Optional
 
 import numpy as np
@@ -36,9 +34,7 @@ class SFTLowLevelDataset:
         try:
             from datasets import load_dataset
         except ImportError:
-            raise ImportError(
-                "SFTDataset currently requires datasets library to be installed"
-            )
+            raise ImportError("SFTDataset currently requires datasets library to be installed")
         self.dataset = load_dataset("json", data_files=dataset_path, split="all")
 
     def __len__(self) -> int:
@@ -83,13 +79,12 @@ class SFTDataset(MegatronDataset):
                     split_conversations.append(current)
                 current = [msg]  # Then start the new conversation
             else:
-                current.append(msg) # Continue accumulating the current conversation
+                current.append(msg)  # Continue accumulating the current conversation
         if current:  # Store any remaining conversation
             split_conversations.append(current)
         return split_conversations
 
     def __getitem__(self, idx: int) -> Dict[str, Any]:
-
         tokenizer = self.config.tokenizer
         pack_length = self.config.sequence_length
 
@@ -99,7 +94,7 @@ class SFTDataset(MegatronDataset):
         def extend_with_padding(tokens, targets, positions, pad_len):
             tokens.extend([pad] * pad_len)
             targets.extend([pad] * pad_len)
-            positions.extend(range(positions[-1]+1, positions[-1]+1+pad_len))
+            positions.extend(range(positions[-1] + 1, positions[-1] + 1 + pad_len))
 
         pack_tokens = []
         pack_targets = []
@@ -109,7 +104,6 @@ class SFTDataset(MegatronDataset):
         pad = tokenizer.pad
         # TODO(duncan): Track number of convs dropped and/or truncated and amount of end-padding
         for conversation in split_conversations:
-
             tokens, targets = tokenizer.tokenize_conversation(
                 conversation, return_target=True, add_generation_prompt=False
             )
@@ -148,7 +142,7 @@ class SFTDataset(MegatronDataset):
                 pack_targets = pack_targets[:max_body]
                 pack_tokens.append(pad)
                 pack_targets.append(pad)
-                pack_positions = pack_positions[:pack_length+1]
+                pack_positions = pack_positions[: pack_length + 1]
                 # Note len({pack_tokens, pack_targets, pack_positions}) should be pack_length + 1
                 cu_seqlens[-1] = len(pack_tokens) - 1
                 break
@@ -165,8 +159,8 @@ class SFTDataset(MegatronDataset):
         assert len(pack_positions) == pack_length + 1
 
         # Align and convert to tensors
-        input_ids    = torch.tensor(pack_tokens[:-1],  dtype=torch.int64)
-        labels       = torch.tensor(pack_targets[1:], dtype=torch.int64)
+        input_ids = torch.tensor(pack_tokens[:-1], dtype=torch.int64)
+        labels = torch.tensor(pack_targets[1:], dtype=torch.int64)
         position_ids = torch.tensor(pack_positions[:-1], dtype=torch.int64)
 
         # Loss mask.

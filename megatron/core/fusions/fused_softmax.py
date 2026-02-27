@@ -204,9 +204,9 @@ class FusedScaleMaskSoftmax(nn.Module):
         super(FusedScaleMaskSoftmax, self).__init__()
         self.input_in_fp16 = input_in_fp16
         self.input_in_bf16 = input_in_bf16
-        assert not (
-            self.input_in_fp16 and self.input_in_bf16
-        ), "both fp16 and bf16 flags cannot be active at the same time."
+        assert not (self.input_in_fp16 and self.input_in_bf16), (
+            "both fp16 and bf16 flags cannot be active at the same time."
+        )
         self.input_in_float16 = self.input_in_fp16 or self.input_in_bf16
         self.attn_mask_type = attn_mask_type
         self.scaled_masked_softmax_fusion = scaled_masked_softmax_fusion

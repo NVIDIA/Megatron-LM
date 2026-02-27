@@ -4,6 +4,7 @@
 This module provides an async utilities which allow to start
 a checkpoint save process in the background.
 """
+
 import gc
 import logging
 from abc import ABC, abstractmethod

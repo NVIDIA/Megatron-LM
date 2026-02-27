@@ -2,14 +2,15 @@ import argparse
 import json
 from typing import List
 
-from .evaluate_mmmu import get_input_output_paths
 from open_flamingo.eval.vqa_metric import VQAEval
+
+from .evaluate_mmmu import get_input_output_paths
+
 
 # ANLS score calculation based on https://github.com/shunk031/ANLS/blob/6472e1d71e84d6cee28e3c6d2e18564bafaa312d/anls/metrics/dist.py#L1
 # and https://github.com/shunk031/ANLS/blob/6472e1d71e84d6cee28e3c6d2e18564bafaa312d/anls/metrics/score.py#L6
 # MIT License. Copyright (c) 2022 Shunsuke KITADA
 def levenshtein_distance(s1: str, s2: str) -> int:
-
     if len(s1) > len(s2):
         s1, s2 = s2, s1
 
@@ -31,20 +32,18 @@ def normalized_levenshtein_distance(s1: str, s2: str) -> float:
     length = max(len(s1.upper()), len(s2.upper()))
     return 0.0 if length == 0 else dist / length
 
+
 def similarity_function(prediction: str, gold_label: str, threshold: float) -> float:
     nl_score = normalized_levenshtein_distance(prediction, gold_label)
     return 1 - nl_score if nl_score < threshold else 0.0
 
-def anls_score(
-    prediction: str, gold_labels: List[str], threshold: float = 0.5
-) -> float:
 
+def anls_score(prediction: str, gold_labels: List[str], threshold: float = 0.5) -> float:
     # not case sensitive, but space sensitive
     y_pred = " ".join(prediction.strip().lower().split())
 
     anls_scores: List[float] = []
     for gold_label in gold_labels:
-
         # not case sensitive, but space sensitive
         y_true = " ".join(gold_label.strip().lower().split())
 
@@ -54,6 +53,7 @@ def anls_score(
     score = max(anls_scores)
 
     return score
+
 
 def merge_input_files(input_path):
     """Merge input files to a format compatible with the evaluator."""
@@ -108,7 +108,7 @@ def compute_vqa_accuracy(result_file, task):
 
         # ChartQA uses relaxed accuracy:
         # "We consider an answer to be correct if it is within 5% of the gold answer.
-        #  For non-numeric answers, we still need an exact match to consider an answer to be correct."
+        #  For non-numeric answers, we still need an exact match to consider an answer to be correct."  # noqa: E501
         if task == "ChartQA":
             acc = 0.0
             assert len(gt) == 1, "expected exactly one groundtruth answer."

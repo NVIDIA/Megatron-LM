@@ -285,9 +285,9 @@ class GatedDeltaNet(MegatronModule):
         seq_len = seq_len * self.sp_size
 
         if inference_context is not None:
-            assert (
-                inference_context.is_static_batching()
-            ), "GDN does not currently support dynamic inference batching."
+            assert inference_context.is_static_batching(), (
+                "GDN does not currently support dynamic inference batching."
+            )
             assert not self.config.sequence_parallel
             # TODO: support inference
             raise NotImplementedError("GDN does not support inference for now.")
@@ -536,9 +536,9 @@ def _split_tensor_factory(
             f"{orig_sh_ten_no_data.local_shape[split_dim]}"
         )
 
-    assert not isinstance(
-        split_sections, int
-    ), "Splitting into predefined section sizes is supported (`split_sections` must be a list)"
+    assert not isinstance(split_sections, int), (
+        "Splitting into predefined section sizes is supported (`split_sections` must be a list)"
+    )
     assert len(split_sections) == len(split_names), (len(split_sections), len(split_names))
 
     @torch.no_grad()
@@ -593,7 +593,6 @@ def torch_chunk_gated_delta_rule(
     output_final_state=False,
     use_qk_l2norm_in_kernel=False,
 ):
-    # pylint: disable=line-too-long
     '''
     Torch-native implementation of chunked gated delta rule for deterministic mode.
     Need this because FLA is not deterministic.

@@ -4,6 +4,7 @@ import os
 
 import torch
 
+
 def convert_radio_h(output_path, tensor_parallel_size, use_te, version):
     device = "cuda"
 
@@ -14,8 +15,8 @@ def convert_radio_h(output_path, tensor_parallel_size, use_te, version):
     new_state_dicts = [{"model": dict()} for _ in range(tensor_parallel_size)]
 
     # Indices from mapping pytorch multihead attention to megatron.
-    kv_channels = 80 
-    hidden_dim = 1280 
+    kv_channels = 80
+    hidden_dim = 1280
     num_heads = 16
     indices = []
     for i in range(num_heads):
@@ -102,7 +103,7 @@ def convert_radio_h(output_path, tensor_parallel_size, use_te, version):
             new_tensors = torch.chunk(new_tensor, tensor_parallel_size, dim=chunk_dim)
 
         for i in range(tensor_parallel_size):
-            # chunk() creates a view of a bigger tensor. clone() is used here to avoid excessive storage.
+            # chunk() creates a view of a bigger tensor. clone() is used here to avoid excessive storage.  # noqa: E501
             new_state_dicts[i]["model"][new_name] = new_tensors[i].clone()
 
             # TE sets _extra_state (for FP8 purposes), so set an empty one here for compatibility.
@@ -122,7 +123,8 @@ def convert_radio_h(output_path, tensor_parallel_size, use_te, version):
         output_path_tp = os.path.join(output_dir_tp, "model_optim_rng.pt")
         torch.save(new_state_dicts[i], output_path_tp)
     with open(os.path.join(output_path, "latest_checkpointed_iteration.txt"), "w") as f:
-        f.write("1") 
+        f.write("1")
+
 
 def convert_radio_g(output_path, tensor_parallel_size, use_te, version):
     device = "cuda"
@@ -152,7 +154,11 @@ def convert_radio_g(output_path, tensor_parallel_size, use_te, version):
     step = ffn_hidden_dim // tensor_parallel_size
     for i in range(tensor_parallel_size):
         mlp_indices.append(torch.arange(i * step, (i + 1) * step, dtype=torch.int))
-        mlp_indices.append(torch.arange(ffn_hidden_dim + i * step, ffn_hidden_dim + (i + 1) * step, dtype=torch.int))
+        mlp_indices.append(
+            torch.arange(
+                ffn_hidden_dim + i * step, ffn_hidden_dim + (i + 1) * step, dtype=torch.int
+            )
+        )
 
     mlp_indices = torch.cat(mlp_indices)
 
@@ -168,7 +174,7 @@ def convert_radio_g(output_path, tensor_parallel_size, use_te, version):
         chunk_dim = None
 
         if "model" not in name:
-            continue;
+            continue
         elif "patch_generator" in name:
             if "embedder.weight" in name:
                 new_names.append("embedder.weight")
@@ -181,7 +187,7 @@ def convert_radio_g(output_path, tensor_parallel_size, use_te, version):
             elif "pos_embed" in name:
                 new_names.append("position_embeddings")
         elif "input_conditioner" in name:
-            continue;
+            continue
         elif "mask_token" in name:
             new_names.append("mask_token")
         elif "inner.norm" in name:
@@ -216,18 +222,18 @@ def convert_radio_g(output_path, tensor_parallel_size, use_te, version):
                 if use_te:
                     new_name = f"{base}.self_attention.linear_qkv.layer_norm_bias"
                 new_names.append(new_name)
-            elif "mlp.w12.weight" in name: 
+            elif "mlp.w12.weight" in name:
                 new_names.append(f"{base}.mlp.linear_fc1.weight")
                 new_tensors[0] = new_tensors[0][mlp_indices]
                 chunk_dim = 0
-            elif "mlp.w12.bias" in name: 
+            elif "mlp.w12.bias" in name:
                 new_names.append(f"{base}.mlp.linear_fc1.bias")
                 new_tensors[0] = new_tensors[0][mlp_indices]
                 chunk_dim = 0
-            elif "mlp.w3.weight" in name: 
+            elif "mlp.w3.weight" in name:
                 new_names.append(f"{base}.mlp.linear_fc2.weight")
                 chunk_dim = 1
-            elif "mlp.w3.bias" in name: 
+            elif "mlp.w3.bias" in name:
                 new_names.append(f"{base}.mlp.linear_fc2.bias")
             elif "norm2.weight" in name:
                 new_name = f"{base}.pre_mlp_layernorm.weight"
@@ -253,10 +259,10 @@ def convert_radio_g(output_path, tensor_parallel_size, use_te, version):
                 tp_new_tensors = torch.chunk(new_tensor, tensor_parallel_size, dim=chunk_dim)
 
             for i in range(tensor_parallel_size):
-                # chunk() creates a view of a bigger tensor. clone() is used here to avoid excessive storage.
+                # chunk() creates a view of a bigger tensor. clone() is used here to avoid excessive storage.  # noqa: E501
                 new_state_dicts[i]["model"][new_name] = tp_new_tensors[i].clone()
 
-                # TE sets _extra_state (for FP8 purposes), so set an empty one here for compatibility.
+                # TE sets _extra_state (for FP8 purposes), so set an empty one here for compatibility.  # noqa: E501
                 extra_state_layers = ("linear_qkv", "linear_proj", "linear_fc1", "linear_fc2")
                 is_extra_state_layer = any([l in new_name for l in extra_state_layers])
                 if use_te and is_extra_state_layer:
@@ -273,7 +279,7 @@ def convert_radio_g(output_path, tensor_parallel_size, use_te, version):
         output_path_tp = os.path.join(output_dir_tp, "model_optim_rng.pt")
         torch.save(new_state_dicts[i], output_path_tp)
         with open(os.path.join(output_path, "latest_checkpointed_iteration.txt"), "w") as f:
-            f.write("1") 
+            f.write("1")
 
 
 def convert(output_path, tensor_parallel_size, use_te, model_type, version):
@@ -304,8 +310,19 @@ python radio_converter.py --output /some/output/folder --tensor-parallel-size 4
         "--tensor-parallel-size", type=int, default=1, help="model tensor parallel size"
     )
     parser.add_argument("--use-te", action="store_true", help="Use Transformer Engine")
-    parser.add_argument("--model-type", required=True, type=str, choices=['radio_v2.5-h', 'radio_v2.5-g'], help="Type of radio to load for conversion")
-    parser.add_argument("--version", type=str, default=None, help="Version to pass to torch.hub.load. Can be a local path or a version RADIO on torch hub. By default use the version from the model type.")
+    parser.add_argument(
+        "--model-type",
+        required=True,
+        type=str,
+        choices=['radio_v2.5-h', 'radio_v2.5-g'],
+        help="Type of radio to load for conversion",
+    )
+    parser.add_argument(
+        "--version",
+        type=str,
+        default=None,
+        help="Version to pass to torch.hub.load. Can be a local path or a version RADIO on torch hub. By default use the version from the model type.",  # noqa: E501
+    )
 
     args = parser.parse_args()
 

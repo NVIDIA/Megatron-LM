@@ -1,7 +1,6 @@
 # Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
-from pydantic import BaseModel, Field
-from typing_extensions import Self, Type
+from typing_extensions import Self
 
 from .. import TypeLookupable
 from ..agent.api import EvaluationRequest, GroupedRolloutRequest, RolloutRequest

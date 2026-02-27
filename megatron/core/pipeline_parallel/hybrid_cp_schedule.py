@@ -364,9 +364,9 @@ class BalancedCPScheduler:
 
             # Find the smallest group size that exists
             existing_group_sizes = set(group_size.values())
-            assert (
-                existing_group_sizes
-            ), "There should be at least one group existing, cannot reditribute, "
+            assert existing_group_sizes, (
+                "There should be at least one group existing, cannot reditribute, "
+            )
             "try to increase 'max-seqlen-per-cp-rank'."
 
             min_group_size = min(existing_group_sizes)
@@ -447,9 +447,9 @@ class BalancedCPScheduler:
 
         # Assert that no sample has been completely removed
         total_work_after = sum(len(mb) for mb in micro_batches)
-        assert (
-            total_work_after >= total_work_before
-        ), f"Samples were removed: {total_work_before} -> {total_work_after}"
+        assert total_work_after >= total_work_before, (
+            f"Samples were removed: {total_work_before} -> {total_work_after}"
+        )
 
         return micro_batches, leftovers, exec_times, sample_ids_per_gpu
 

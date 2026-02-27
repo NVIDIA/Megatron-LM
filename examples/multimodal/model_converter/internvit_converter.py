@@ -7,10 +7,7 @@ from transformers import AutoModel
 
 def convert(model_name, output_path, tensor_parallel_size, use_te):
     """Convert InternViT HF checkpoint to mcore."""
-    hf_model = AutoModel.from_pretrained(
-        model_name,
-        trust_remote_code=True
-    )
+    hf_model = AutoModel.from_pretrained(model_name, trust_remote_code=True)
 
     hf_state_dict = hf_model.state_dict()
     new_state_dicts = [{"model": dict()} for _ in range(tensor_parallel_size)]
@@ -23,9 +20,9 @@ def convert(model_name, output_path, tensor_parallel_size, use_te):
 
     for j in range(num_heads):
         for i in range(dim):
-            order[i + dim*3*j] = j*dim+i
-            order[dim + i + dim*3*j] = j*dim+i+num_heads*dim
-            order[dim*2 + i + dim*3*j] = j*dim+i+num_heads*dim*2
+            order[i + dim * 3 * j] = j * dim + i
+            order[dim + i + dim * 3 * j] = j * dim + i + num_heads * dim
+            order[dim * 2 + i + dim * 3 * j] = j * dim + i + num_heads * dim * 2
 
     for name, tensor in hf_state_dict.items():
         # Map parameter names to ones used in megatron.
@@ -54,11 +51,13 @@ def convert(model_name, output_path, tensor_parallel_size, use_te):
             if tensor_parallel_size == 1:
                 num_padded_heads = 25
             elif tensor_parallel_size == 8:
-                # Note: 25 is not divisible by 8 and we don't currently support uneven heads split with tensor parallelism.
-                # So we pad with dummy all-zero heads. Please use a nice even number of attention heads in your model.
+                # Note: 25 is not divisible by 8 and we don't currently support uneven heads split with tensor parallelism.  # noqa: E501
+                # So we pad with dummy all-zero heads. Please use a nice even number of attention heads in your model.  # noqa: E501
                 num_padded_heads = 32
             else:
-                raise NotImplementedError("invalid tensor parallel size value:", tensor_parallel_size)
+                raise NotImplementedError(
+                    "invalid tensor parallel size value:", tensor_parallel_size
+                )
 
             if "ls1" in name:
                 new_name = f"{base}.ls1"
@@ -68,32 +67,44 @@ def convert(model_name, output_path, tensor_parallel_size, use_te):
                 new_name = f"{base}.self_attention.linear_qkv.weight"
                 num_tensors = 3
                 padded_dim = head_dim * num_padded_heads * num_tensors
-                padded_tensor = torch.zeros((padded_dim, new_tensor.shape[-1]), dtype=new_tensor.dtype, device=new_tensor.device)
-                padded_tensor[:new_tensor.shape[0], :] = new_tensor[order]
+                padded_tensor = torch.zeros(
+                    (padded_dim, new_tensor.shape[-1]),
+                    dtype=new_tensor.dtype,
+                    device=new_tensor.device,
+                )
+                padded_tensor[: new_tensor.shape[0], :] = new_tensor[order]
                 new_tensor = padded_tensor
                 chunk_dim = 0
             elif "attn.q_norm.weight" in name:
                 new_name = f"{base}.self_attention.q_layernorm.weight"
                 num_tensors = 1
                 padded_dim = head_dim * num_padded_heads * num_tensors
-                padded_tensor = torch.zeros(padded_dim, dtype=new_tensor.dtype, device=new_tensor.device)
-                padded_tensor[:new_tensor.shape[0]] = new_tensor
+                padded_tensor = torch.zeros(
+                    padded_dim, dtype=new_tensor.dtype, device=new_tensor.device
+                )
+                padded_tensor[: new_tensor.shape[0]] = new_tensor
                 new_tensor = padded_tensor
                 chunk_dim = 0
             elif "attn.k_norm.weight" in name:
                 new_name = f"{base}.self_attention.k_layernorm.weight"
                 num_tensors = 1
                 padded_dim = head_dim * num_padded_heads * num_tensors
-                padded_tensor = torch.zeros(padded_dim, dtype=new_tensor.dtype, device=new_tensor.device)
-                padded_tensor[:new_tensor.shape[0]] = new_tensor
+                padded_tensor = torch.zeros(
+                    padded_dim, dtype=new_tensor.dtype, device=new_tensor.device
+                )
+                padded_tensor[: new_tensor.shape[0]] = new_tensor
                 new_tensor = padded_tensor
                 chunk_dim = 0
             elif "attn.proj.weight" in name:
                 new_name = f"{base}.self_attention.linear_proj.weight"
                 num_tensors = 1
                 padded_dim = head_dim * num_padded_heads * num_tensors
-                padded_tensor = torch.zeros((new_tensor.shape[0], padded_dim), dtype=new_tensor.dtype, device=new_tensor.device)
-                padded_tensor[:, :new_tensor.shape[-1]] = new_tensor
+                padded_tensor = torch.zeros(
+                    (new_tensor.shape[0], padded_dim),
+                    dtype=new_tensor.dtype,
+                    device=new_tensor.device,
+                )
+                padded_tensor[:, : new_tensor.shape[-1]] = new_tensor
                 new_tensor = padded_tensor
                 chunk_dim = 1
             elif "attn.proj.bias" in name:
@@ -152,8 +163,15 @@ def convert(model_name, output_path, tensor_parallel_size, use_te):
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="InternVIT HuggingFace to Mcore converter")
-    parser.add_argument("--model-name", type=str, default="OpenGVLab/InternViT-6B-448px-V1-5", help="Model name in HuggingFace")
-    parser.add_argument("--output-dir", type=str, required=True, help="Output directory for the mcore model.")
+    parser.add_argument(
+        "--model-name",
+        type=str,
+        default="OpenGVLab/InternViT-6B-448px-V1-5",
+        help="Model name in HuggingFace",
+    )
+    parser.add_argument(
+        "--output-dir", type=str, required=True, help="Output directory for the mcore model."
+    )
     parser.add_argument("--use-te", action="store_true", default=True)
     parser.add_argument("--tensor-parallel-size", type=int, required=True)
 

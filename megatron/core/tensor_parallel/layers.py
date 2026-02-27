@@ -50,7 +50,7 @@ except ImportError:
     _grad_accum_fusion_available = False
 
 try:
-    import transformer_engine  # pylint: disable=unused-import
+    import transformer_engine  # noqa: F401
     from transformer_engine.pytorch.module.base import get_dummy_wgrad
 
     HAVE_TE = True
@@ -425,7 +425,7 @@ def linear_with_frozen_weight(
     )
 
     assert wgrad_deferral_limit is None, (
-        "This arg is only supported with " "linear_with_grad_accumulation_and_async_allreduce"
+        "This arg is only supported with linear_with_grad_accumulation_and_async_allreduce"
     )
 
     tp_group = get_tensor_model_parallel_group_if_none(tp_group)
@@ -533,8 +533,7 @@ class LinearWithGradAccumulationAndAsyncCommunication(torch.autograd.Function):
         grad_input = grad_output.matmul(weight)
 
         if ctx.sequence_parallel and wgrad_compute:
-            # pylint: disable=possibly-used-before-assignment
-            handle.wait()
+            handle.wait()  # noqa: F821
 
         if wgrad_compute:
             grad_output, total_input = prepare_input_tensors_for_wgrad_compute(
@@ -1015,9 +1014,9 @@ class ColumnParallelLinear(torch.nn.Module):
         if self.config._cpu_offloading_context is not None:
             if self.config._cpu_offloading_context.inside_context is True:
                 if not HAVE_TE:
-                    assert (
-                        self.config.cpu_offloading is False
-                    ), "CPU Offloading cannot be enabled while TE is not present"
+                    assert self.config.cpu_offloading is False, (
+                        "CPU Offloading cannot be enabled while TE is not present"
+                    )
                 else:
                     input_parallel.activation_offloading = self.config.cpu_offloading_activations
 
@@ -1271,9 +1270,9 @@ class RowParallelLinear(torch.nn.Module):
         if self.config._cpu_offloading_context is not None:
             if self.config._cpu_offloading_context.inside_context is True:
                 if not HAVE_TE:
-                    assert (
-                        self.config.cpu_offloading is False
-                    ), "CPU Offloading cannot be enabled while TE is not present"
+                    assert self.config.cpu_offloading is False, (
+                        "CPU Offloading cannot be enabled while TE is not present"
+                    )
                 else:
                     input_parallel.activation_offloading = self.config.cpu_offloading_activations
 

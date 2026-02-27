@@ -8,7 +8,6 @@ from megatron.core.inference.contexts.attention_context.mamba_metadata import Ma
 
 
 class TestMambaMetadata:
-
     @pytest.fixture
     def metadata_context(self):
         """Fixture to initialize MambaMetadata with standard constraints."""
@@ -390,7 +389,7 @@ class TestMambaMetadata:
 
     @pytest.mark.internal
     def test_update_chunked_only_padded(self, metadata_context):
-        """Test a case with only chunked prefill (no decode, no regular prefill) but with padding."""
+        """Test a case with only chunked prefill (no decode, no regular prefill) but with padding."""  # noqa: E501
         # 1 chunked prefill request.
         seq_lengths = [100]
         num_decode = 0

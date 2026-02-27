@@ -7,8 +7,6 @@ This module provides a model provider function to create a MIMO model
 with language model, vision encoder, and projection components.
 """
 
-
-
 from examples.mimo.configs.mock import (
     get_mock_language_layer_spec,
     get_mock_language_model_config,
@@ -70,11 +68,11 @@ def model_provider_mock_vlm_single_encoder(
         submodules={
             "encoders": {'clip_encoder': vision_encoder},
             "input_projections": [vision_projection],
-        }
+        },
     )
 
     # Create language model config
-    language_model_spec  = ModuleSpec(
+    language_model_spec = ModuleSpec(
         module=GPTModel,
         params={
             "config": language_config,
@@ -90,7 +88,7 @@ def model_provider_mock_vlm_single_encoder(
     mimo_model_config = MimoModelConfig(
         language_model_spec=language_model_spec,
         modality_submodules_spec={"images": vision_submodule_spec},
-        special_token_ids={"images": special_token_id}
+        special_token_ids={"images": special_token_id},
     )
 
     # Create MIMO model

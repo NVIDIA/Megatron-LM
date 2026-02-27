@@ -53,13 +53,13 @@ def add_modelopt_args(parser):
     group.add_argument(
         '--export-kd-teacher-load',
         type=str,
-        help='Path to checkpoint to load as distillation teacher. (Enables distillation mode automatically)',
+        help='Path to checkpoint to load as distillation teacher. (Enables distillation mode automatically)',  # noqa: E501
     )
     group.add_argument(
         '--export-kd-teacher-model-config',
         type=str,
         default=None,
-        help='Path to teacher model config for distillation. If not provided, defaults to ${export_kd_teacher_load}/model_config.yaml.',
+        help='Path to teacher model config for distillation. If not provided, defaults to ${export_kd_teacher_load}/model_config.yaml.',  # noqa: E501
     )
     group.add_argument(
         '--export-kd-teacher-ckpt-format',
@@ -80,7 +80,10 @@ def add_modelopt_args(parser):
         "--finetune-hf-dataset", type=str, default=None, help="HF dataset used for finetuning."
     )
     group.add_argument(
-        "--finetune-data-split", type=str, default="train", help="HF dataset split used for finetuning."
+        "--finetune-data-split",
+        type=str,
+        default="train",
+        help="HF dataset split used for finetuning.",
     )
 
     # Special model architecture option
@@ -99,7 +102,7 @@ def add_modelopt_args(parser):
     group.add_argument(
         '--export-offline-model',
         action="store_true",
-        help='If set, the base model will have no decoder layer. Only the embedding layer and output layer are initialized.',
+        help='If set, the base model will have no decoder layer. Only the embedding layer and output layer are initialized.',  # noqa: E501
     )
 
     # Global state
@@ -114,7 +117,7 @@ def add_modelopt_args(parser):
         '--enable-gpt-oss',
         action="store_true",
         help='Enable GPT-OSS mode with YaRN RoPE configuration. When enabled, automatically '
-             'configures all YaRN parameters with GPT-OSS defaults.',
+        'configures all YaRN parameters with GPT-OSS defaults.',
     )
 
     return parser

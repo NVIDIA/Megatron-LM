@@ -1,12 +1,7 @@
 # Copyright (c) 2023, NVIDIA CORPORATION. All rights reserved.
 
 
-import pytest
-import torch
-
-from megatron.core.transformer.attention import CrossAttention
-
-""" 
+"""
 
 @pytest.fixture
 def core_attention(transformer_config):
@@ -35,7 +30,8 @@ class TestCoreAttention:
         config = core_attention.config
         sequence_length = 32
         micro_batch_size = 2
-        # query_layer (float): [sequence_length, micro_batch_size, num_attention_heads, hidden_size / num_attention_heads]
+        # query_layer (float): [sequence_length, micro_batch_size,
+        #     num_attention_heads, hidden_size / num_attention_heads]
         query_layer = torch.ones(
             (
                 sequence_length,
@@ -52,7 +48,10 @@ class TestCoreAttention:
         attention_mask = torch.ones((1, 1, sequence_length, sequence_length), dtype=bool).cuda()
 
         context_layer = core_attention(
-            query_layer=query_layer, key_layer=key_layer, value_layer=value_layer, attention_mask=attention_mask
+            query_layer=query_layer,
+            key_layer=key_layer,
+            value_layer=value_layer,
+            attention_mask=attention_mask
         )
 
         assert context_layer.shape[0] == sequence_length

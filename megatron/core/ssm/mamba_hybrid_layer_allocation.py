@@ -282,13 +282,12 @@ def allocate_layers(
         maybe_log_single_rank(
             logger,
             logging.INFO,
-            f"{actual_mlp_layers_count} mlp layers in " f"{total_layers_count} total layers.",
+            f"{actual_mlp_layers_count} mlp layers in {total_layers_count} total layers.",
         )
         maybe_log_single_rank(
             logger,
             logging.INFO,
-            f"Target mlp ratio: {target_mlp_ratio:.2f}. "
-            f"Actual mlp ratio: {actual_mlp_ratio:.2f}.",
+            f"Target mlp ratio: {target_mlp_ratio:.2f}. Actual mlp ratio: {actual_mlp_ratio:.2f}.",
         )
     return layer_type_list
 

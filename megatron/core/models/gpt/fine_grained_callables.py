@@ -368,12 +368,12 @@ class _BackwardDWWrapper:
     """
 
     def __init__(self, layer):
-        assert isinstance(
-            layer, GraphableMegatronModule
-        ), "cuda graphed ep overlap only supports GraphableMegatronModule."
-        assert isinstance(
-            layer, TransformerLayer
-        ), "cuda graphed ep overlap only supports TransformerLayer for now."
+        assert isinstance(layer, GraphableMegatronModule), (
+            "cuda graphed ep overlap only supports GraphableMegatronModule."
+        )
+        assert isinstance(layer, TransformerLayer), (
+            "cuda graphed ep overlap only supports TransformerLayer for now."
+        )
         self.layer = layer
         self.graphed_backward_dw_callable = None
         self.attn_dw_callable = layer.self_attention.backward_dw
@@ -664,12 +664,12 @@ def build_mtp_layer_callables(layer):
 
         # MTP Layer Preprocess
         # norm, linear projection and transformer
-        assert (
-            node.chunk_state.context is None
-        ), f"multi token prediction + cross attention is not yet supported."
-        assert (
-            node.chunk_state.packed_seq_params is None
-        ), f"multi token prediction + sequence packing is not yet supported."
+        assert node.chunk_state.context is None, (
+            f"multi token prediction + cross attention is not yet supported."
+        )
+        assert node.chunk_state.packed_seq_params is None, (
+            f"multi token prediction + sequence packing is not yet supported."
+        )
 
         if layer.config.sequence_parallel:
             rng_context = tensor_parallel.get_cuda_rng_tracker().fork()

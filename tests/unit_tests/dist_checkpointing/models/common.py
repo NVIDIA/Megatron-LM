@@ -225,9 +225,9 @@ def common_test_vocab_size_padding_change(
             if vocab_layer_key in plain_state_dict_A:
                 ten_A = plain_state_dict_A.pop(vocab_layer_key)
                 ten_B = plain_state_dict_B.pop(vocab_layer_key)
-                assert torch.all(
-                    ten_A[:vocab_size_base] == ten_B[:vocab_size_base]
-                ), vocab_layer_key
+                assert torch.all(ten_A[:vocab_size_base] == ten_B[:vocab_size_base]), (
+                    vocab_layer_key
+                )
 
         # Test other tensors are equal
         diffs = diff(plain_state_dict_A, plain_state_dict_B)

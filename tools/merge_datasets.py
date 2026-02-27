@@ -1,11 +1,8 @@
+import argparse
 import os
 import sys
-import json
-import argparse
 
-sys.path.append(
-    os.path.abspath(os.path.join(os.path.dirname(__file__), os.path.pardir))
-)
+sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), os.path.pardir)))
 
 from megatron.core.datasets.indexed_dataset import (
     IndexedDataset,
@@ -28,28 +25,23 @@ def get_args():
 
     group = parser.add_argument_group(title="output data")
     group.add_argument(
-        "--output-prefix",
-        type=str,
-        required=True,
-        help="Path to binary output file without suffix",
+        "--output-prefix", type=str, required=True, help="Path to binary output file without suffix"
     )
 
     group = parser.add_argument_group(title="miscellaneous")
     group.add_argument(
         "--multimodal",
         action="store_true",
-        help="Whether the datasets are assumed to be multimodal"
+        help="Whether the datasets are assumed to be multimodal",
     )
 
     args = parser.parse_args()
 
-    assert os.path.isdir(
-        args.input
-    ), f"ERROR: {args.input} is not a directory or does not exist"
+    assert os.path.isdir(args.input), f"ERROR: {args.input} is not a directory or does not exist"
 
-    assert os.path.isdir(
-        os.path.dirname(args.output_prefix)
-    ), f"ERROR: {os.path.dirname(args.output_prefix)} is not a directory or does not exist"
+    assert os.path.isdir(os.path.dirname(args.output_prefix)), (
+        f"ERROR: {os.path.dirname(args.output_prefix)} is not a directory or does not exist"
+    )
 
     return args
 
@@ -68,9 +60,9 @@ def main():
             continue
 
         ext_pair = ".bin" if ext == ".idx" else ".idx"
-        assert os.path.isfile(
-            os.path.join(args.input, prefix) + ext_pair
-        ), f"ERROR: {ext_pair} file not provided for {os.path.join(args.input, prefix)}"
+        assert os.path.isfile(os.path.join(args.input, prefix) + ext_pair), (
+            f"ERROR: {ext_pair} file not provided for {os.path.join(args.input, prefix)}"
+        )
 
         prefixes.add(prefix)
 
@@ -79,7 +71,9 @@ def main():
         if builder is None:
             dataset = IndexedDataset(os.path.join(args.input, prefix), multimodal=args.multimodal)
             builder = IndexedDatasetBuilder(
-                get_bin_path(args.output_prefix), dtype=dataset.index.dtype, multimodal=args.multimodal
+                get_bin_path(args.output_prefix),
+                dtype=dataset.index.dtype,
+                multimodal=args.multimodal,
             )
             del dataset
 
@@ -89,5 +83,4 @@ def main():
 
 
 if __name__ == '__main__':
-
     main()

@@ -1,16 +1,17 @@
 # Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
+import megatron.legacy.model  # noqa: I001
 from megatron.core.models.gpt import GPTModel
-from megatron.core.models.gpt.gpt_layer_specs import (
-    get_gpt_decoder_block_spec,
-    get_gpt_layer_local_spec,
-    get_gpt_layer_with_transformer_engine_spec,
-    get_gpt_layer_with_inference_spec,
-    get_gpt_mtp_block_spec,
-    get_gpt_decoder_layer_specs,
-)
 from megatron.core.models.gpt.experimental_attention_variant_module_specs import (
     get_transformer_block_with_experimental_attention_variant_spec,
+)
+from megatron.core.models.gpt.gpt_layer_specs import (
+    get_gpt_decoder_block_spec,
+    get_gpt_decoder_layer_specs,
+    get_gpt_layer_local_spec,
+    get_gpt_layer_with_inference_spec,
+    get_gpt_layer_with_transformer_engine_spec,
+    get_gpt_mtp_block_spec,
 )
 from megatron.core.models.gpt.heterogeneous.heterogeneous_layer_specs import (
     get_gpt_heterogeneous_layer_spec,
@@ -19,8 +20,6 @@ from megatron.core.transformer.spec_utils import import_module
 from megatron.training import get_args, print_rank_0
 from megatron.training.arguments import core_transformer_config_from_args
 from megatron.training.yaml_arguments import core_transformer_config_from_yaml
-
-import megatron.legacy.model  # isort: skip
 
 # NOTE: Loading `megatron.legacy.model` earlier fails due to circular import
 
@@ -81,7 +80,11 @@ def gpt_builder(args, pre_process, post_process, vp_stage=None, config=None, pg_
             else:
                 # Define the decoder block spec
                 decoder_layer_specs = get_gpt_decoder_layer_specs(
-                    config, use_transformer_engine=use_te, normalization=args.normalization, qk_l2_norm=args.qk_l2_norm, vp_stage=vp_stage
+                    config,
+                    use_transformer_engine=use_te,
+                    normalization=args.normalization,
+                    qk_l2_norm=args.qk_l2_norm,
+                    vp_stage=vp_stage,
                 )
                 transformer_layer_spec_for_mtp = decoder_layer_specs[-1]
             # Use spec of the last layer in decoder block as spec of the transformer layer in MTP
@@ -116,12 +119,12 @@ def gpt_builder(args, pre_process, post_process, vp_stage=None, config=None, pg_
 
 def _get_transformer_layer_spec(use_te, config):
     """Get transformer layer specification based on configuration.
-    
+
     Args:
         use_te (bool): Whether to use Transformer Engine
         args: Training arguments
         config: Model configuration
-        
+
     Returns:
         transformer_layer_spec: The transformer layer specification
     """
@@ -141,9 +144,7 @@ def _get_transformer_layer_spec(use_te, config):
         )
     elif config.transformer_impl == "inference_optimized":
         return get_gpt_layer_with_inference_spec(
-            args.qk_layernorm,
-            args.multi_latent_attention,
-            qk_l2_norm=args.qk_l2_norm,
+            args.qk_layernorm, args.multi_latent_attention, qk_l2_norm=args.qk_l2_norm
         )
     else:
         return get_gpt_layer_local_spec(

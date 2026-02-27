@@ -12,7 +12,11 @@ def report_draft_acceptance_length(model, osl: int = 64, draft_steps: int = 7):
     """Report MTBench acceptance length."""
     tokenizer = get_tokenizer()._tokenizer
     unwrapped_model = unwrap_model(model)[0]
-    parallel_draft_step = unwrapped_model.eagle_config.parallel_draft_step if hasattr(unwrapped_model, "eagle_config") else 1
+    parallel_draft_step = (
+        unwrapped_model.eagle_config.parallel_draft_step
+        if hasattr(unwrapped_model, "eagle_config")
+        else 1
+    )
 
     if unwrapped_model.training:
         return
@@ -42,7 +46,7 @@ def report_draft_acceptance_length(model, osl: int = 64, draft_steps: int = 7):
             al = actual_osl / steps
             ar = al / (draft_steps + parallel_draft_step)
             print(
-                "Rank {:3}/{:3} {:12} AL {:.1f} AR {:.2f} STEPS {:5}/{:5} DRAFT {:2} PARALLEL {:2}".format(
+                "Rank {:3}/{:3} {:12} AL {:.1f} AR {:.2f} STEPS {:5}/{:5} DRAFT {:2} PARALLEL {:2}".format(  # noqa: E501
                     torch.distributed.get_rank(),
                     torch.distributed.get_world_size(),
                     category,
@@ -59,7 +63,7 @@ def report_draft_acceptance_length(model, osl: int = 64, draft_steps: int = 7):
         al = total_osl / total_steps
         ar = al / (draft_steps + parallel_draft_step)
         print(
-            "Rank {:3}/{:3} {:12} AL {:.1f} AR {:.2f} STEPS {:5}/{:5} DRAFT {:2} PARALLEL {:2}".format(
+            "Rank {:3}/{:3} {:12} AL {:.1f} AR {:.2f} STEPS {:5}/{:5} DRAFT {:2} PARALLEL {:2}".format(  # noqa: E501
                 torch.distributed.get_rank(),
                 torch.distributed.get_world_size(),
                 "average",

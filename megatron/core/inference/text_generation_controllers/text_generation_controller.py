@@ -35,7 +35,7 @@ from megatron.core.transformer.utils import set_model_to_sequence_parallel
 from megatron.core.utils import get_asyncio_loop, get_model_config, get_pg_size, unwrap_model
 
 try:
-    import transformer_engine as te  # pylint: disable=unused-import
+    import transformer_engine as te  # noqa: F401
 
     HAVE_TE = True
 
@@ -45,7 +45,6 @@ except ImportError:
 from megatron.core.inference.batch_dimensions_utils import InferenceBatchDimensions
 
 
-# pylint: disable=line-too-long
 class TextGenerationController:
     """The text generation controller (the main sampling loop)
 
@@ -694,7 +693,7 @@ class TextGenerationController:
         if not config.moe_enable_routing_replay:
             return None
 
-        # Get routing indices - use routing_metadata if available (handles CUDA graph static buffers)
+        # Get routing indices - use routing_metadata if available (handles CUDA graph static buffers)  # noqa: E501
         context = self.inference_wrapped_model.inference_context
         if context.moe_routing_metadata is None:
             return None
@@ -894,7 +893,7 @@ class TextGenerationController:
             != self._request_metadata["termination_id"][active_request_slice]
         ).byte() & torch.less(active_sequence_lengths, max_sequence_lengths).byte()
 
-        # Mark requests as finished if they hit stop words (detected in previous step's post_process_requests)
+        # Mark requests as finished if they hit stop words (detected in previous step's post_process_requests)  # noqa: E501
         if self._get_stop_word_finished_ids_callback is not None:
             request_ids_list = active_request_ids.tolist()
             stop_word_finished_ids = self._get_stop_word_finished_ids_callback(request_ids_list)
@@ -1172,9 +1171,9 @@ class TextGenerationController:
                 use_attention_mask=use_attention_mask,
             )
 
-            assert (
-                not self.inference_wrapped_model.inference_context.is_decode_only()
-            ), f"Generation must start in prefill mode"
+            assert not self.inference_wrapped_model.inference_context.is_decode_only(), (
+                f"Generation must start in prefill mode"
+            )
 
             # Sequence parallelism is required for MoE layers when using expert parallelism (EP)
             # becausethe expert routing mechanism relies on sequence parallelism's communication
@@ -1479,8 +1478,9 @@ class TextGenerationController:
                         : input_prompt_length - 1
                     ]
                     request.generated_top_n_logprobs = top_n_logprobs_dict[idx][
-                        input_prompt_length
-                        - 1 : (input_prompt_length + required_sequence_length - 1)
+                        input_prompt_length - 1 : (
+                            input_prompt_length + required_sequence_length - 1
+                        )
                     ]
                 else:
                     assert len(top_n_logprobs_dict[idx]) >= required_sequence_length, (
@@ -1512,7 +1512,8 @@ class TextGenerationController:
         active_requests: OrderedDict[int, InferenceRequest],
         use_attention_mask: bool = False,
     ) -> Dict[str, Any]:
-        """Preparing input data for inference, using respective wrapper's prep_inference_input method # pylint: disable=line-too-long
+        """Preparing input data for inference, using respective
+        wrapper's prep_inference_input method
 
         Args:
             prompts_tokens (torch.Tensor): A tensor of shape [batch_size, max_sequence_length]

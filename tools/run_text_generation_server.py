@@ -1,9 +1,9 @@
 # Copyright (c) 2025, NVIDIA CORPORATION. All rights reserved.
 
 """Sample Generate"""
+
 import os
 import sys
-import warnings
 from functools import partial
 
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), os.path.pardir)))
@@ -60,16 +60,14 @@ def get_inference_engine(args: Namespace, model: MegatronModule) -> AbstractEngi
 
     tokenizer = get_tokenizer()
 
-    inference_context = StaticInferenceContext(args.inference_max_requests, args.inference_max_sequence_length)
-    inference_wrapped_model = GPTInferenceWrapper(
-        model, inference_context
+    inference_context = StaticInferenceContext(
+        args.inference_max_requests, args.inference_max_sequence_length
     )
+    inference_wrapped_model = GPTInferenceWrapper(model, inference_context)
     text_generation_controller = TextGenerationController(
         inference_wrapped_model=inference_wrapped_model, tokenizer=tokenizer
     )
-    return StaticInferenceEngine(
-        text_generation_controller=text_generation_controller,
-    )
+    return StaticInferenceEngine(text_generation_controller=text_generation_controller)
 
 
 def add_text_generate_args(parser):
@@ -125,7 +123,7 @@ def main(model_type: str = "gpt"):
     if args.num_layers_per_virtual_pipeline_stage is not None:
         print("Interleaved pipeline schedule is not yet supported for text generation.")
         exit()
-    print_rank_0("WARNING: Forcing exit_on_missing_checkpoint to True for text " "generation.")
+    print_rank_0("WARNING: Forcing exit_on_missing_checkpoint to True for text generation.")
     args.exit_on_missing_checkpoint = True
 
     # Set up model and load checkpoint
@@ -177,6 +175,7 @@ def main(model_type: str = "gpt"):
                 pass
         elif choice.item() == 1:
             break
+
 
 if __name__ == "__main__":
     main(model_type="gpt")

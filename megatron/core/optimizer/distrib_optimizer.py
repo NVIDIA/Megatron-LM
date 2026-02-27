@@ -2,7 +2,6 @@
 
 """Megatron distributed optimizer."""
 
-
 import gc
 import itertools
 import logging
@@ -144,7 +143,6 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
         # Param range map.
         param_range_map = {}
         for param, param_world_indexes in param_world_index_map.items():
-
             # Param range.
             param_world_start, param_world_end, _ = param_world_indexes
             param_local_start = max(0, param_world_start - gbuf_world_range.start)
@@ -187,9 +185,9 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
 
         bucket = param_and_grad_buffer.buckets[bucket_index]
         gbuf_size = bucket.grad_data.numel()
-        assert (
-            gbuf_size % data_parallel_world_size == 0
-        ), f"Each bucket's buffer size should be divisible by {data_parallel_world_size}"
+        assert gbuf_size % data_parallel_world_size == 0, (
+            f"Each bucket's buffer size should be divisible by {data_parallel_world_size}"
+        )
         max_gbuf_range_size = gbuf_size // data_parallel_world_size
 
         # All world ranges (i.e., across all data parallel ranks).
@@ -336,7 +334,6 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
 
         # Allocate (or slice) each group's param shard.
         for group_range in opt_group_ranges:
-
             # Params of this group.
             model_float16_params_this_group = []
             model_fp32_params_this_group = []
@@ -350,7 +347,6 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
             shard_fp32_from_float16_groups.append(shard_fp32_from_float16_params_this_group)
 
             for model_param in group_range["params"]:
-
                 assert model_param.requires_grad
 
                 gbuf_index, dtype, bucket_index = param_gbuf_map[model_param]
@@ -359,7 +355,6 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
 
                 # fp16, bf16 params.
                 if model_param.type() in ['torch.cuda.HalfTensor', 'torch.cuda.BFloat16Tensor']:
-
                     # Generate sharded model param.
                     if is_float8tensor(model_param) and config.fp8_recipe != "delayed":
                         # MXFP8Tensor and BlockwiseQTensor don't support view(-1)
@@ -552,7 +547,6 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
         self.per_bucket_numel = []
         self.per_bucket_numel_unpadded = []
         for buffer in self.buffers:
-
             self.per_bucket_numel.append(
                 {
                     (buffer.param_dtype, buffer.grad_dtype): [
@@ -777,7 +771,6 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
                 for gbuf_range_map_for_all_buckets in gbuf_range_maps.values():
                     for gbuf_range_map in gbuf_range_map_for_all_buckets:
                         for model_param, param_range_map in gbuf_range_map["param_map"].items():
-
                             # Get parameter ordering information (see method docstring
                             # for details).
                             group_index, group_order = self.model_param_group_index_map[model_param]
@@ -952,7 +945,6 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
             "per_bucket_numel_unpadded": self.per_bucket_numel_unpadded,
         }
         for gbuf_idx, gbuf_range_maps in enumerate(self.gbuf_ranges):
-
             # Iterate grad buffers (by data type).
             dtype_state = {}
             assert len(gbuf_range_maps) == 1, "single dtype supported, for now."
@@ -1019,7 +1011,6 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
         # Collect param states.
         state = {"buckets_coalesced": True}
         for gbuf_idx, gbuf_range_maps in enumerate(self.gbuf_ranges):
-
             # Iterate grad buffers (by data type).
             dtype_state = {}
             assert len(gbuf_range_maps) == 1, "single dtype supported, for now."
@@ -1039,7 +1030,6 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
                 if not empty_data:
                     offset_in_world_tensors = 0
                     for bucket_idx, gbuf_range_map in enumerate(gbuf_range_map_for_all_buckets):
-
                         # Compute local DP contiguous shard's size.
                         gbuf_world_numel = (
                             self.buffers[gbuf_idx].buckets[bucket_idx].grad_data.numel()
@@ -1071,7 +1061,6 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
 
                         # Gather contiguous shards on DP rank 0.
                         for key, send_tensor in local_shards.items():
-
                             # Gather tensor list.
                             if data_parallel_rank == 0 or return_on_all_ranks:
                                 device = "cpu" if use_gloo_comm else torch.cuda.current_device()
@@ -1167,9 +1156,9 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
             num_experts = self.model_chunks[0].config.num_moe_experts if self.model_chunks else None
             name_to_param = handle_experts_in_state_dict(name_to_param, num_experts)
             self.param_to_name = {param: name for name, param in name_to_param.items()}
-        assert (
-            param in self.param_to_name
-        ), f"Parameter {param} not found in param_to_name mapping. "
+        assert param in self.param_to_name, (
+            f"Parameter {param} not found in param_to_name mapping. "
+        )
         return self.param_to_name[param]
 
     def sharded_state_dict(
@@ -1348,9 +1337,9 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
         """
         Sharded state dict where each parameter is a separate PyTorch DTensor.
         """
-        assert (
-            self.ddp_config.use_megatron_fsdp
-        ), "fsdp_dtensor sharding type is only supported with Megatron FSDP."
+        assert self.ddp_config.use_megatron_fsdp, (
+            "fsdp_dtensor sharding type is only supported with Megatron FSDP."
+        )
 
         # Initialize optimizer states with dummy values if loading.
         if is_loading:
@@ -1391,7 +1380,7 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
             # Fixed TPxPP. Save on DP rank 0 only
             param_state = ShardedObject(
                 f'optimizer.distributed.dp_group_idx_{self.data_parallel_group_idx}.param_state',
-                param_state_data,  # pylint: disable=E0606
+                param_state_data,  # noqa: F821
                 (1,),
                 (0,),
             )
@@ -1484,9 +1473,9 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
                             f"Model param {model_param} not in model_sharded_state_dict."
                             f" Hint: {KEEP_VARS_HINT}"
                         ) from e
-                    assert (
-                        sharded_metadata.flattened_range is None
-                    ), f"Flattened model tensor not supported ({sharded_metadata})"
+                    assert sharded_metadata.flattened_range is None, (
+                        f"Flattened model tensor not supported ({sharded_metadata})"
+                    )
 
                     # Note: replica_id is exactly the same as in the model param
                     replica_id = sharded_metadata.replica_id
@@ -1727,9 +1716,9 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
                 ) from e
 
             # Set DP corresponding replica_id coordinate to 0.
-            assert (
-                len(sharded_metadata.replica_id) == 3
-            ), f'Expected replica_id format (PP, TP, DP), got: {sharded_metadata}'
+            assert len(sharded_metadata.replica_id) == 3, (
+                f'Expected replica_id format (PP, TP, DP), got: {sharded_metadata}'
+            )
             replica_id = (*sharded_metadata.replica_id[:2], self.distributed_optimizer_instance_id)
 
             # Instantiate ShardedTensor (or ShardedTensorFactory) for optimizer
@@ -1910,14 +1899,13 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
 
                         # Scatter tensor list.
                         if data_parallel_rank == 0:
-
                             start = offset_in_world_tensors
                             end = offset_in_world_tensors + gbuf_world_numel_unpadded
 
                             world_tensor = legacy_world_tensors[bucket_idx]
-                            assert (
-                                world_tensor.numel() == gbuf_world_numel_unpadded
-                            ), "%d vs. %d." % (world_tensor.numel(), gbuf_world_numel_unpadded)
+                            assert world_tensor.numel() == gbuf_world_numel_unpadded, (
+                                "%d vs. %d." % (world_tensor.numel(), gbuf_world_numel_unpadded)
+                            )
                             offset_in_world_tensors += gbuf_world_numel_unpadded
 
                             # Pad world_tensor to gbuf_world_numel. Don't pad at the front,
@@ -1943,7 +1931,6 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
 
                         # Copy local contiguous shards to param/optim shards.
                         for model_param, param_range_map in gbuf_range_map["param_map"].items():
-
                             # Main param & optimizer states.
                             group_index, group_order = self.model_param_group_index_map[model_param]
                             main_param = self.optimizer.param_groups[group_index]["params"][
@@ -2401,7 +2388,6 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
         def copy_group_grads(model_groups, shard_main_groups):
             for model_group, shard_main_group in zip(model_groups, shard_main_groups):
                 for model_param, shard_main_param in zip(model_group, shard_main_group):
-
                     param_range_map = self._get_model_param_range_map(model_param)
                     param_range = param_range_map["param"]
                     assert param_range.size == shard_main_param.nelement()
@@ -2455,7 +2441,6 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
         def copy_group_params(shard_main_groups, model_groups):
             for shard_main_group, model_group in zip(shard_main_groups, model_groups):
                 for shard_main_param, model_param in zip(shard_main_group, model_group):
-
                     param_range_map = self._get_model_param_range_map(model_param)
                     world_range = param_range_map["gbuf_world_in_bucket"]
 
@@ -2528,9 +2513,9 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
                 while name.startswith("module."):
                     name = name[len("module.") :]
                 matched_keys = [k for k in names_in_state_dict if name in k]
-                assert (
-                    len(matched_keys) == 1
-                ), f"Parameter {name} has {len(matched_keys)} matches in state dict"
+                assert len(matched_keys) == 1, (
+                    f"Parameter {name} has {len(matched_keys)} matches in state dict"
+                )
                 state_dict_param = state_dict_list[chunk_idx][matched_keys[0]]
                 assert model_param.shape == state_dict_param.shape
                 model_param_to_state_dict_param_map[model_param] = state_dict_param
@@ -2571,7 +2556,6 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
         def copy_group_params(model_groups, shard_main_groups):
             for model_group, shard_main_group in zip(model_groups, shard_main_groups):
                 for model_param, shard_main_param in zip(model_group, shard_main_group):
-
                     param_range_map = self._get_model_param_range_map(model_param)
                     param_range = param_range_map["param"]
                     assert param_range.size == shard_main_param.nelement()

@@ -45,7 +45,6 @@ SHARED_TMP_DIR = "/tmp/pytest-shared-tmp"
 
 
 def destroy_device_mesh(device_mesh):
-
     # Teardown device mesh.
     del device_mesh
     try:
@@ -64,7 +63,7 @@ def destroy_device_mesh(device_mesh):
 
 
 class ToyCNN(torch.nn.Module):
-    """Toy CNN model for testing Megatron-FSDP sharding for high-rank Tensor parameters and inputs."""
+    """Toy CNN model for testing Megatron-FSDP sharding for high-rank Tensor parameters and inputs."""  # noqa: E501
 
     def __init__(
         self,
@@ -210,11 +209,11 @@ def build_distributed_environment(mesh_dim_config: tuple):
     device_mesh = init_device_mesh(
         "cuda", mesh_shape=mesh_dim_config, mesh_dim_names=(DP_OUTER, DP_SHARD, CP, TP)
     )
-    # DP: Only relevant when using HSDP, where we need the flattened DP group for data parallelism. (Otherwise, just pass dp_shard.)
+    # DP: Only relevant when using HSDP, where we need the flattened DP group for data parallelism. (Otherwise, just pass dp_shard.)  # noqa: E501
     device_mesh[(DP_OUTER, DP_SHARD)]._flatten(DP)
     # DP-Shard-CP: Only required if using CP. Otherwise, just pass dp_shard to FSDP.
     device_mesh[(DP_SHARD, CP)]._flatten(DP_SHARD_CP)
-    # HSDP (DP-CP): Only required if using HSDP. Otherwise, don't pass hybrid_fsdp_group to Megatron-FSDP.
+    # HSDP (DP-CP): Only required if using HSDP. Otherwise, don't pass hybrid_fsdp_group to Megatron-FSDP.  # noqa: E501
     device_mesh[(DP_OUTER, DP_SHARD, CP)]._flatten(HSDP)
 
     # Return the device mesh.
@@ -239,7 +238,7 @@ class TestMegatronFsdpFullyShard:
 
     @pytest.mark.skipif(
         version.parse(torch.__version__) < version.parse('2.4.0'),
-        reason="Requires DTensor and DeviceMesh support in (approximately) PyTorch 2.4.0 or later. Should not be run on 2.2.0a0+81ea7a4 (LTS).",
+        reason="Requires DTensor and DeviceMesh support in (approximately) PyTorch 2.4.0 or later. Should not be run on 2.2.0a0+81ea7a4 (LTS).",  # noqa: E501
     )
     @pytest.mark.parametrize("model_type", [CNN, TRANSFORMER, TE_TRANSFORMER])
     @pytest.mark.parametrize(
@@ -382,9 +381,9 @@ class TestMegatronFsdpFullyShard:
             if step == NUM_STEPS - 1:
                 assert grads_exist, "Root module gradients should exist on final microbatch."
             else:
-                assert (
-                    not grads_exist
-                ), "Root module gradients should not exist prior to optimization step."
+                assert not grads_exist, (
+                    "Root module gradients should not exist prior to optimization step."
+                )
             torch.distributed.barrier()
 
             # Optimizer step. Apply accumulated gradients to the model weights.
@@ -397,7 +396,7 @@ class TestMegatronFsdpFullyShard:
 
     @pytest.mark.skipif(
         version.parse(torch.__version__) < version.parse('2.4.0'),
-        reason="Requires DTensor and DeviceMesh support in (approximately) PyTorch 2.4.0 or later. Should not be run on 2.2.0a0+81ea7a4 (LTS).",
+        reason="Requires DTensor and DeviceMesh support in (approximately) PyTorch 2.4.0 or later. Should not be run on 2.2.0a0+81ea7a4 (LTS).",  # noqa: E501
     )
     @pytest.mark.parametrize("shard_strategy", [OPTIM_GRADS_PARAMS, OPTIM_GRADS, OPTIM, NO_SHARD])
     @pytest.mark.parametrize("outer_shard_strategy", [NO_SHARD, OPTIM])
@@ -424,7 +423,7 @@ class TestMegatronFsdpFullyShard:
                 "zero_dp_strategy to be full-sharded ('optim_grads_params', 3)."
             )
         if shard_strategy == NO_SHARD:
-            # NOTE: Just directly checkpoint the MegatronFSDP.module.state_dict() using torch.save().
+            # NOTE: Just directly checkpoint the MegatronFSDP.module.state_dict() using torch.save().  # noqa: E501
             # Beyond the scope of this unit test.
             pytest.xfail(reason="Megatron-FSDP does not support NO_SHARD for checkpointing yet.")
 
@@ -519,7 +518,7 @@ class TestMegatronFsdpFullyShard:
         """
         MODEL CHECKPOINT LOAD
         """
-        # Initialize a new model for checkpoint loading. Set a different seed to force a different model init,
+        # Initialize a new model for checkpoint loading. Set a different seed to force a different model init,  # noqa: E501
         # to ensure the checkpoint loading is accurate and non-trivial.
         toy_model, fsdp_unit_modules = build_toy_model(model_type, False, seed=1)
         toy_adam = Adam(params=toy_model.parameters(), lr=0.01)
@@ -561,21 +560,21 @@ class TestMegatronFsdpFullyShard:
             v2 = s2.get(key, None)
             if isinstance(v2, DTensor):
                 v2 = v2.to_local()
-            assert (
-                v1 is not None and v2 is not None
-            ), f"[{key} Not Found] Original Param: {v1} | Checkpoint Param: {v2}"
-            assert (
-                v1.shape == v2.shape
-            ), f"[Checkpoint Param {key} Shape Mismatch] {v1.shape} != {v2.shape}"
+            assert v1 is not None and v2 is not None, (
+                f"[{key} Not Found] Original Param: {v1} | Checkpoint Param: {v2}"
+            )
+            assert v1.shape == v2.shape, (
+                f"[Checkpoint Param {key} Shape Mismatch] {v1.shape} != {v2.shape}"
+            )
             assert torch.allclose(v1, v2), f"[Checkpoint Param {key} Value Mismatch] {v1} != {v2}"
 
         # Compare pre-save and post-load optimizer state dictionaries.
         for param_id in o1["state"].keys() | o2["state"].keys():
             param_state_1 = o1["state"].get(param_id, None)
             param_state_2 = o2["state"].get(param_id, None)
-            assert (
-                param_state_1 is not None and param_state_2 is not None
-            ), f"[{param_id} Not Found] Original Param State: {param_state_1} | Checkpoint Param State: {param_state_2}"
+            assert param_state_1 is not None and param_state_2 is not None, (
+                f"[{param_id} Not Found] Original Param State: {param_state_1} | Checkpoint Param State: {param_state_2}"  # noqa: E501
+            )
             for key in param_state_1.keys() | param_state_2.keys():
                 v1 = param_state_1.get(key, None)
                 if isinstance(v1, DTensor):
@@ -583,25 +582,25 @@ class TestMegatronFsdpFullyShard:
                 v2 = param_state_2.get(key, None)
                 if isinstance(v2, DTensor):
                     v2 = v2.to_local()
-                assert (
-                    v1 is not None and v2 is not None
-                ), f"[{param_id} {key} Not Found] Original Optimizer State: {v1} | Checkpoint Optimizer State: {v2}"
-                assert (
-                    v1.shape == v2.shape
-                ), f"[Optimizer State {param_id} {key} Shape Mismatch] {v1.shape} != {v2.shape}"
-                assert torch.allclose(
-                    v1, v2
-                ), f"[Optimizer State {param_id} {key} Value Mismatch] {v1} != {v2}"
-        assert len(o1["param_groups"]) == len(
-            o2["param_groups"]
-        ), f"[Optimizer State Param Groups Length Mismatch] {o1['param_groups']} != {o2['param_groups']}"
+                assert v1 is not None and v2 is not None, (
+                    f"[{param_id} {key} Not Found] Original Optimizer State: {v1} | Checkpoint Optimizer State: {v2}"  # noqa: E501
+                )
+                assert v1.shape == v2.shape, (
+                    f"[Optimizer State {param_id} {key} Shape Mismatch] {v1.shape} != {v2.shape}"
+                )
+                assert torch.allclose(v1, v2), (
+                    f"[Optimizer State {param_id} {key} Value Mismatch] {v1} != {v2}"
+                )
+        assert len(o1["param_groups"]) == len(o2["param_groups"]), (
+            f"[Optimizer State Param Groups Length Mismatch] {o1['param_groups']} != {o2['param_groups']}"  # noqa: E501
+        )
         for i in range(len(o2["param_groups"])):
             for key in o1["param_groups"][i].keys():
                 v1 = o1["param_groups"][i][key]
                 v2 = o2["param_groups"][i][key]
-                assert (
-                    v1 == v2
-                ), f"[Optimizer State Param Group {i} {key} Value Mismatch] {v1} != {v2}"
+                assert v1 == v2, (
+                    f"[Optimizer State Param Group {i} {key} Value Mismatch] {v1} != {v2}"
+                )
 
         """
         MODEL CHECKPOINT FORWARD PASS VALIDATION
@@ -615,9 +614,9 @@ class TestMegatronFsdpFullyShard:
         post_load_loss = mse_loss(post_output, toy_target)
 
         # Validate the pre-save and post-load loss.
-        assert (
-            pre_save_loss == post_load_loss.item()
-        ), f"[Rank {torch.distributed.get_rank()}] Pre-Save Loss: {pre_save_loss} != Post-Load Loss: {post_load_loss}"
+        assert pre_save_loss == post_load_loss.item(), (
+            f"[Rank {torch.distributed.get_rank()}] Pre-Save Loss: {pre_save_loss} != Post-Load Loss: {post_load_loss}"  # noqa: E501
+        )
 
         # Continue training.
         post_load_loss.backward()
@@ -662,7 +661,6 @@ class TestMegatronFsdpFullyShard:
         toy_target = torch.randn(1, DIM_SIZE, DIM_SIZE).to("cuda")
 
         for step in range(NUM_STEPS):
-
             # Forward pass.
             output = mfsdp_model(toy_input, toy_input)
 
@@ -756,7 +754,6 @@ class TestMegatronFsdpFullyShard:
         toy_target = torch.randn(16, 64, 64, dtype=torch.bfloat16).to("cuda")
 
         for step in range(NUM_STEPS):
-
             # Forward pass.
             with (
                 te.pytorch.autocast(recipe=te_quant_recipe)

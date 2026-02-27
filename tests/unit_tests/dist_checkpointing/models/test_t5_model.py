@@ -115,7 +115,6 @@ class TestT5Model:
 
 
 class TestT5ModelReconfiguration:
-
     # def teardown_method(self, method):
     #     Utils.destroy_model_parallel()
 

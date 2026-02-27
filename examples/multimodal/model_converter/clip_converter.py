@@ -2,9 +2,8 @@
 import argparse
 import os
 
-import torch
-
 import clip
+import torch
 
 
 def convert(download_root, output_path, tensor_parallel_size, use_te):
@@ -112,7 +111,7 @@ def convert(download_root, output_path, tensor_parallel_size, use_te):
             new_tensors = torch.chunk(new_tensor, tensor_parallel_size, dim=chunk_dim)
 
         for i in range(tensor_parallel_size):
-            # chunk() creates a view of a bigger tensor. clone() is used here to avoid excessive storage.
+            # chunk() creates a view of a bigger tensor. clone() is used here to avoid excessive storage.  # noqa: E501
             new_state_dicts[i]["model"][new_name] = new_tensors[i].clone()
 
             # TE sets _extra_state (for FP8 purposes), so set an empty one here for compatibility.
@@ -140,7 +139,8 @@ Convert OpenAI CLIP VIT weights to megatron format.
 
 
 Example usage:
-python clip_converter.py --download-root /some/download/folder --output /some/output/folder --tensor-parallel-size 4
+python clip_converter.py --download-root /some/download/folder \
+    --output /some/output/folder --tensor-parallel-size 4
 """,
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )

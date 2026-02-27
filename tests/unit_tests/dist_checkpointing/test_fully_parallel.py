@@ -2,7 +2,6 @@
 import inspect
 from collections import defaultdict
 from pathlib import Path
-from types import MethodType
 from typing import Dict, List, Tuple
 from unittest import mock
 
@@ -24,13 +23,9 @@ from megatron.core.dist_checkpointing.exchange_utils import (
 from megatron.core.dist_checkpointing.mapping import (
     ShardedObject,
     ShardedStateDict,
-    ShardedTensorFactory,
     is_main_replica,
 )
-from megatron.core.dist_checkpointing.serialization import (
-    get_default_load_sharded_strategy,
-    get_default_save_sharded_strategy,
-)
+from megatron.core.dist_checkpointing.serialization import get_default_save_sharded_strategy
 from megatron.core.dist_checkpointing.strategies.base import (
     LoadShardedStrategy,
     SaveShardedStrategy,
@@ -42,10 +37,7 @@ from megatron.core.dist_checkpointing.strategies.fully_parallel import (
     FullyParallelSaveStrategyWrapper,
     _sharded_tensor_shard_id,
 )
-from megatron.core.dist_checkpointing.strategies.torch import (
-    MCoreLoadPlanner,
-    TorchDistSaveShardedStrategy,
-)
+from megatron.core.dist_checkpointing.strategies.torch import MCoreLoadPlanner
 from megatron.core.utils import get_pg_rank
 from tests.unit_tests.dist_checkpointing import TempNamedDir
 from tests.unit_tests.test_utilities import Utils
@@ -222,9 +214,9 @@ class TestFullyParallelSaveAndLoad:
                 is_expected_to_be_saved_by_this_rank = dp_rank in expected_key_to_saving_ranks.get(
                     sh_ten.key, []
                 )
-                assert sh_ten.replica_id == int(
-                    not is_expected_to_be_saved_by_this_rank
-                ), expected_key_to_saving_ranks
+                assert sh_ten.replica_id == int(not is_expected_to_be_saved_by_this_rank), (
+                    expected_key_to_saving_ranks
+                )
 
         assert mock_strategy.save_keys == expected_keys_saved_by_current_rank, (
             Utils.rank,
@@ -404,7 +396,7 @@ class TestFullyParallelSaveAndLoad:
         sharded_state_dict_baseline_one_exchange = {
             'needed_by_all': sharded_state_dict_baseline_two_exchanges['needed_by_all_A']
         }
-        # State dict with 1 expected exchanges even though there are 2 tensors to load (1 is unique for each rank)
+        # State dict with 1 expected exchanges even though there are 2 tensors to load (1 is unique for each rank)  # noqa: E501
         sharded_state_dict_test_one_exchange = sharded_state_dict_baseline_one_exchange.copy()
         sharded_state_dict_test_one_exchange['unique'] = ShardedTensor.from_rank_offsets(
             'unique',
@@ -433,7 +425,6 @@ class TestFullyParallelSaveAndLoad:
         Utils.destroy_model_parallel()
 
     def test_broadcast_sharded_objects(self, tmp_path_dist_ckpt):
-
         sharded_state_dict = {
             f'Obj_{i}': ShardedObject(f'Obj_{i}', None, (1,), (0,), replica_id=abs(Utils.rank - i))
             for i in range(Utils.world_size)

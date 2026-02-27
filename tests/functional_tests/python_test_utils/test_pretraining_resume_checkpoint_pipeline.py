@@ -40,7 +40,7 @@ def test_resume_checkpoint_pipeline(
         > 0
     ):
         logger.error(
-            f"The following metrics are required but not logged during training: {', '.join(missing_metrics)}"
+            f"The following metrics are required but not logged during training: {', '.join(missing_metrics)}"  # noqa: E501
         )
         assert False
 

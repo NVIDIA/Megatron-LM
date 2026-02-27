@@ -16,7 +16,8 @@ class Pooler(MegatronModule):
 
     Args:
         hidden_size (int): The hidden size_
-        init_method (callable): weight initialization method for the linear layer. bias is set to zero.
+        init_method (callable): weight initialization method for the
+            linear layer. bias is set to zero.
         config (TransformerConfig): The transformer configuration
         sequence_parallel (bool): Using squence parallel ? Defaults to False
     """

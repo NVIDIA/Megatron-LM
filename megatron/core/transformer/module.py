@@ -1,6 +1,7 @@
 # Copyright (c) 2024, NVIDIA CORPORATION. All rights reserved.
 
 """Megatron Module."""
+
 from functools import partial
 from typing import Optional, Tuple
 
@@ -23,7 +24,7 @@ _HALF_TYPES = (torch.HalfTensor, torch.cuda.HalfTensor)
 _BF16_TYPES = (torch.BFloat16Tensor, torch.cuda.BFloat16Tensor)
 
 
-def param_is_not_shared(param):  # pylint: disable=missing-function-docstring
+def param_is_not_shared(param):  # noqa: D103
     return not hasattr(param, 'shared') or not param.shared
 
 
@@ -204,15 +205,15 @@ class GraphableMegatronModule(MegatronModule):
 
         config = getattr(self, 'config', None)
         assert config is not None, (
-            "TransformerLayer must be initialized before calling " "`init_backward_dw_wrapper`."
+            "TransformerLayer must be initialized before calling `init_backward_dw_wrapper`."
         )
         self.backward_dw_wrapper = _BackwardDWWrapper(self)
 
     def set_te_cuda_graph_backward_dw_wrapper(self):
         """Replace the backward_dw callable with dw cuda graph."""
-        assert (
-            self.backward_dw_wrapper is not None
-        ), "`backward_dw_wrapper` must be set when cuda graphs are enabled for ep overlap."
+        assert self.backward_dw_wrapper is not None, (
+            "`backward_dw_wrapper` must be set when cuda graphs are enabled for ep overlap."
+        )
         self.backward_dw_wrapper.set_graphed_backward_dw_callable(
             partial(self._te_cuda_graph_backward_dw_graph, self.current_microbatch)
         )
@@ -297,9 +298,9 @@ class GraphableMegatronModule(MegatronModule):
         for arg in args:
             assert isinstance(arg, torch.Tensor), "CUDA graph accepts only Tensor inputs."
         for _, v in kwargs.items():
-            assert v is None or isinstance(
-                v, torch.Tensor
-            ), "CUDA graph accepts only Tensor inputs."
+            assert v is None or isinstance(v, torch.Tensor), (
+                "CUDA graph accepts only Tensor inputs."
+            )
 
         cg_index = getattr(self, 'current_microbatch', 0) % len(self.cuda_graphs)
         cudagraph_args, cudagraph_kwargs = self._get_te_cuda_graph_replay_args(*args, **kwargs)
@@ -315,9 +316,9 @@ class GraphableMegatronModule(MegatronModule):
             hidden_states = kwargs.pop('hidden_states')
             cudagraph_args = (hidden_states,)
         else:
-            assert (
-                'hidden_states' not in kwargs
-            ), "hidden_states should only be passed as either a positional or keyword argument."
+            assert 'hidden_states' not in kwargs, (
+                "hidden_states should only be passed as either a positional or keyword argument."
+            )
             cudagraph_args = tuple(args)
 
         cudagraph_kwargs = kwargs.copy()
@@ -451,7 +452,7 @@ class Float16Module(MegatronModule):
 
         self.float16_convertor = float16_convertor
 
-    def set_input_tensor(self, input_tensor):  # pylint: disable=missing-function-docstring
+    def set_input_tensor(self, input_tensor):  # noqa: D103
         return self.module.set_input_tensor(input_tensor)
 
     def forward(self, *inputs, fp32_output=True, **kwargs):
@@ -499,9 +500,7 @@ class Float16Module(MegatronModule):
             outputs = float16_to_fp32(outputs)
         return outputs
 
-    def state_dict(
-        self, destination=None, prefix='', keep_vars=False
-    ):  # pylint: disable=missing-function-docstring
+    def state_dict(self, destination=None, prefix='', keep_vars=False):  # noqa: D103
         return self.module.state_dict(destination=destination, prefix=prefix, keep_vars=keep_vars)
 
     def state_dict_for_save_checkpoint(self, prefix='', keep_vars=False):
@@ -512,7 +511,5 @@ class Float16Module(MegatronModule):
         """Retrieve sharded_state_dict from the module being wrapped."""
         return self.module.sharded_state_dict(prefix, *args, **kwargs)
 
-    def load_state_dict(
-        self, state_dict, strict=True
-    ):  # pylint: disable=missing-function-docstring
+    def load_state_dict(self, state_dict, strict=True):  # noqa: D103
         self.module.load_state_dict(state_dict, strict=strict)

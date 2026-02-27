@@ -175,7 +175,6 @@ class MegatronGenerate(Resource):
                 return "length_penalty must be a float"
 
         with LOCK:  # Need to get lock to keep multiple threads from hitting code
-
             if not no_log:
                 logging.info(f"request IP: {str(request.remote_addr)}")
                 logging.info(json.dumps(request.get_json()))

@@ -1,7 +1,6 @@
 # Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
 import copy
-import os
 import random
 import string
 import time
@@ -41,7 +40,6 @@ from tests.unit_tests.test_utilities import Utils
 
 
 class TestTextGenerationController:
-
     def setup_model(
         self,
         dtype,
@@ -192,9 +190,9 @@ class TestTextGenerationController:
         sampled_logits = self.text_generation_controller.sample_from_logits(
             last_token_logits, SamplingParams(top_k=2), self.vocab_size
         )
-        assert torch.all(
-            sampled_logits >= self.vocab_size - 2
-        ), f"The sampled logits should all be greater than {self.vocab_size-2} but its {sampled_logits}"
+        assert torch.all(sampled_logits >= self.vocab_size - 2), (
+            f"The sampled logits should all be greater than {self.vocab_size - 2} but its {sampled_logits}"  # noqa: E501
+        )
 
         l = last_token_logits[0]
         top_p = 0.3
@@ -202,9 +200,9 @@ class TestTextGenerationController:
         sampled_logits = self.text_generation_controller.sample_from_logits(
             last_token_logits, SamplingParams(top_p=top_p, top_k=0), self.vocab_size
         )
-        assert torch.all(
-            sampled_logits >= expected_min_value
-        ), f"The sampled logits should all be greater than {expected_min_value} but its {sampled_logits}"
+        assert torch.all(sampled_logits >= expected_min_value), (
+            f"The sampled logits should all be greater than {expected_min_value} but its {sampled_logits}"  # noqa: E501
+        )
 
         top_p = 0.95
         temperature = 2
@@ -214,9 +212,9 @@ class TestTextGenerationController:
             SamplingParams(top_p=top_p, temperature=temperature, top_k=0),
             self.vocab_size,
         )
-        assert torch.all(
-            sampled_logits >= expected_min_value
-        ), f"The sampled logits should all be greater than {expected_min_value} but its {sampled_logits}"
+        assert torch.all(sampled_logits >= expected_min_value), (
+            f"The sampled logits should all be greater than {expected_min_value} but its {sampled_logits}"  # noqa: E501
+        )
 
     @pytest.mark.parametrize("backend", ["torch"])
     @pytest.mark.parametrize("materialize_only_last_token_logits", [True, False])
@@ -280,9 +278,9 @@ class TestTextGenerationController:
 
         # Assert correct sampled values.
         top_k_values[top_k_values == 0] = self.vocab_size
-        assert torch.all(
-            sampled_logits >= self.vocab_size - top_k_values
-        ), f"The sampled logits should all be greater than {self.vocab_size - top_k_values} but its {sampled_logits}"
+        assert torch.all(sampled_logits >= self.vocab_size - top_k_values), (
+            f"The sampled logits should all be greater than {self.vocab_size - top_k_values} but its {sampled_logits}"  # noqa: E501
+        )
         l = logits.squeeze(0)
         sampled_l = l.div(temp_values.unsqueeze(1)).softmax(dim=-1)
         top_k_mask = vocab_indices.unsqueeze(0) < (self.vocab_size - top_k_values.unsqueeze(1))
@@ -298,9 +296,9 @@ class TestTextGenerationController:
         start_idx = torch.clamp(self.vocab_size - top_k_values, min=0).long()
         last_included = torch.max(last_included, start_idx)
         expected_min_values = l.gather(1, last_included.unsqueeze(1)).squeeze(1)
-        assert torch.all(
-            sampled_logits >= expected_min_values
-        ), f"The sampled logits should all be greater than {expected_min_values} but its {sampled_logits}"
+        assert torch.all(sampled_logits >= expected_min_values), (
+            f"The sampled logits should all be greater than {expected_min_values} but its {sampled_logits}"  # noqa: E501
+        )
 
     @pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
     @pytest.mark.parametrize(
@@ -336,9 +334,9 @@ class TestTextGenerationController:
                 for _ in range(len(x))
             ]
         )
-        self.mock_tokenizer.offsets.side_effect = lambda _, s: [
-            i for i, c in enumerate(s) if c == ' '
-        ] + [len(s)]
+        self.mock_tokenizer.offsets.side_effect = lambda _, s: (
+            [i for i, c in enumerate(s) if c == ' '] + [len(s)]
+        )
 
         active_requests: Dict[str, InferenceRequest] = OrderedDict()
         all_prompt_tokens: Dict[str, List[int]] = OrderedDict()
@@ -370,14 +368,14 @@ class TestTextGenerationController:
         )
 
         for request_id, request in requests.items():
-            assert (
-                request.status == Status.COMPLETED
-            ), f"Status should be completed but its {request.status}"
+            assert request.status == Status.COMPLETED, (
+                f"Status should be completed but its {request.status}"
+            )
             assert request.generated_length > 0, f"Generated length should be greater than zero"
             assert request.generated_text is not None, "Generated text should not be None"
-            assert (
-                all_prompt_tokens[request_id] == request.prompt_tokens
-            ), "Prompt tokens should not have changed during generation"
+            assert all_prompt_tokens[request_id] == request.prompt_tokens, (
+                "Prompt tokens should not have changed during generation"
+            )
             # Log probabilities are calculated based on the likelihood of a token given the
             # preceding context. The first token lacks this dependency and is excluded from
             # the logprobs output, which is why the +1 is necessary
@@ -385,9 +383,9 @@ class TestTextGenerationController:
                 len(request.segments)
                 == len(request.prompt_log_probs) + len(request.generated_log_probs) + 1
             ), "Segments should be returned for both prompt and generated tokens"
-            assert len(request.prompt) + len(request.generated_text) == len(
-                request.text
-            ), "Output text should include prompts and generations"
+            assert len(request.prompt) + len(request.generated_text) == len(request.text), (
+                "Output text should include prompts and generations"
+            )
             assert (
                 request.tpot is not None
                 and isinstance(request.tpot, list)
@@ -407,9 +405,9 @@ class TestTextGenerationController:
                 for _ in range(len(x))
             ]
         )
-        self.mock_tokenizer.offsets.side_effect = lambda _, s: [
-            i for i, c in enumerate(s) if c == ' '
-        ] + [len(s)]
+        self.mock_tokenizer.offsets.side_effect = lambda _, s: (
+            [i for i, c in enumerate(s) if c == ' '] + [len(s)]
+        )
 
         prompt = ""
         active_requests: Dict[int, InferenceRequest] = OrderedDict()
@@ -432,9 +430,9 @@ class TestTextGenerationController:
         )
 
         for request_id, request in requests.items():
-            assert (
-                request.status == Status.COMPLETED
-            ), f"Status should be completed but its {request.status}"
+            assert request.status == Status.COMPLETED, (
+                f"Status should be completed but its {request.status}"
+            )
             assert request.generated_length > 0, f"Generated length should be greater than zero"
             assert request.generated_text is not None, "Generated text should not be None"
             assert len(request.generated_log_probs) == request.generated_length
@@ -461,9 +459,9 @@ class TestTextGenerationController:
         self.mock_tokenizer.detokenize.side_effect = lambda toks, **_: " ".join(
             f"T{t}" for t in toks
         )  # unique, deterministic
-        self.mock_tokenizer.offsets.side_effect = lambda _, s: [
-            i for i, c in enumerate(s) if c == " "
-        ] + [len(s)]
+        self.mock_tokenizer.offsets.side_effect = lambda _, s: (
+            [i for i, c in enumerate(s) if c == " "] + [len(s)]
+        )
 
         prompts = ["a", "foo", "foobar", "lorem ipsum"]
         active_reqs: Dict[str, InferenceRequest] = OrderedDict()
@@ -505,7 +503,7 @@ class TestTextGenerationController:
             generated_tokens = request.generated_tokens
 
             assert len(prompt_log_probs) == len(request.prompt_tokens) - 1, (
-                f"{request_id}: Expected {len(request.prompt_tokens)-1} prompt log probs, "
+                f"{request_id}: Expected {len(request.prompt_tokens) - 1} prompt log probs, "
                 f"got {len(prompt_log_probs)}"
             )
             assert len(generated_log_probs) == request.generated_length, (
@@ -536,9 +534,9 @@ class TestTextGenerationController:
                 token = self.mock_tokenizer.detokenize([token_id])
 
                 assert token in top_n, f"{request_id}: Generated token {token} missing in top‑N"
-                assert (
-                    pytest.approx(log_probs, rel=1e-6) == top_n[token]
-                ), f"{request_id}: mismatch @ generated token {k}: {log_probs} vs {top_n[token]}"
+                assert pytest.approx(log_probs, rel=1e-6) == top_n[token], (
+                    f"{request_id}: mismatch @ generated token {k}: {log_probs} vs {top_n[token]}"
+                )
 
     def test_token_overflow(self):
         self.setup_model(torch.float32)
@@ -552,9 +550,9 @@ class TestTextGenerationController:
                 for _ in range(len(x))
             ]
         )
-        self.mock_tokenizer.offsets.side_effect = lambda _, s: [
-            i for i, c in enumerate(s) if c == ' '
-        ] + [len(s)]
+        self.mock_tokenizer.offsets.side_effect = lambda _, s: (
+            [i for i, c in enumerate(s) if c == ' '] + [len(s)]
+        )
 
         prompt = ""
         active_requests: Dict[int, InferenceRequest] = OrderedDict()
@@ -591,9 +589,9 @@ class TestTextGenerationController:
                 for _ in range(len(x))
             ]
         )
-        self.mock_tokenizer.offsets.side_effect = lambda _, s: [
-            i for i, c in enumerate(s) if c == ' '
-        ] + [len(s)]
+        self.mock_tokenizer.offsets.side_effect = lambda _, s: (
+            [i for i, c in enumerate(s) if c == ' '] + [len(s)]
+        )
         self.mock_tokenizer.tokenize.return_value = [
             random.randint(0, self.vocab_size - 1) for _ in range(len(prompt))
         ]
@@ -641,9 +639,9 @@ class TestTextGenerationController:
         self.mock_tokenizer.detokenize.side_effect = lambda toks, **_: " ".join(
             f"T{t}" for t in toks
         )  # unique, deterministic
-        self.mock_tokenizer.offsets.side_effect = lambda _, s: [
-            i for i, c in enumerate(s) if c == " "
-        ] + [len(s)]
+        self.mock_tokenizer.offsets.side_effect = lambda _, s: (
+            [i for i, c in enumerate(s) if c == " "] + [len(s)]
+        )
 
         prompts = [
             "a short prompt",
@@ -780,18 +778,18 @@ class TestTextGenerationController:
 
             # Validate results
             assert top_n_results is not None, "top_n_results should not be None"
-            assert (
-                len(top_n_results) == batch_size
-            ), f"Expected {batch_size} requests, got {len(top_n_results)}"
+            assert len(top_n_results) == batch_size, (
+                f"Expected {batch_size} requests, got {len(top_n_results)}"
+            )
 
             for req_idx in range(batch_size):
                 assert req_idx in top_n_results, f"Request {req_idx} missing from results"
                 top_n_list = top_n_results[req_idx]
 
                 # In decode mode, should have exactly 1 token per request
-                assert (
-                    len(top_n_list) == 1
-                ), f"Request {req_idx}: expected 1 token, got {len(top_n_list)}"
+                assert len(top_n_list) == 1, (
+                    f"Request {req_idx}: expected 1 token, got {len(top_n_list)}"
+                )
 
                 top_n_values, top_n_indices = top_n_list[0]
                 assert top_n_values.shape[0] == top_n, f"Expected {top_n} values"
@@ -825,9 +823,9 @@ class TestTextGenerationController:
 
             # Validate results
             assert top_n_results is not None, "top_n_results should not be None"
-            assert (
-                len(top_n_results) == batch_size
-            ), f"Expected {batch_size} requests, got {len(top_n_results)}"
+            assert len(top_n_results) == batch_size, (
+                f"Expected {batch_size} requests, got {len(top_n_results)}"
+            )
 
             for req_idx in range(batch_size):
                 assert req_idx in top_n_results, f"Request {req_idx} missing from results"
@@ -836,23 +834,23 @@ class TestTextGenerationController:
                 if not skip_prompt_log_probs:
                     # Should have top-n for all tokens
                     expected_count = query_lengths[req_idx]
-                    assert (
-                        len(top_n_list) == expected_count
-                    ), f"Request {req_idx}: expected {expected_count} tokens, got {len(top_n_list)}"
+                    assert len(top_n_list) == expected_count, (
+                        f"Request {req_idx}: expected {expected_count} tokens, got {len(top_n_list)}"  # noqa: E501
+                    )
                 else:
                     # Should have top-n for only the last token (first generated token)
-                    assert (
-                        len(top_n_list) == 1
-                    ), f"Request {req_idx}: expected 1 token when skip_prompt_log_probs=True, got {len(top_n_list)}"
+                    assert len(top_n_list) == 1, (
+                        f"Request {req_idx}: expected 1 token when skip_prompt_log_probs=True, got {len(top_n_list)}"  # noqa: E501
+                    )
 
                 # Validate each token's top-n
                 for token_idx, (top_n_values, top_n_indices) in enumerate(top_n_list):
-                    assert (
-                        top_n_values.shape[0] == top_n
-                    ), f"Request {req_idx}, token {token_idx}: expected {top_n} values"
-                    assert (
-                        top_n_indices.shape[0] == top_n
-                    ), f"Request {req_idx}, token {token_idx}: expected {top_n} indices"
+                    assert top_n_values.shape[0] == top_n, (
+                        f"Request {req_idx}, token {token_idx}: expected {top_n} values"
+                    )
+                    assert top_n_indices.shape[0] == top_n, (
+                        f"Request {req_idx}, token {token_idx}: expected {top_n} indices"
+                    )
 
     @pytest.mark.parametrize("static", [True, False])
     @pytest.mark.parametrize("tp_size", [1, 2])
@@ -885,9 +883,9 @@ class TestTextGenerationController:
                 for _ in range(len(x))
             ]
         )
-        self.mock_tokenizer.offsets.side_effect = lambda _, s: [
-            i for i, c in enumerate(s) if c == ' '
-        ] + [len(s)]
+        self.mock_tokenizer.offsets.side_effect = lambda _, s: (
+            [i for i, c in enumerate(s) if c == ' '] + [len(s)]
+        )
 
         # Prepare requests.
         active_requests: Dict[str, InferenceRequest] = OrderedDict()
@@ -1004,6 +1002,6 @@ class TestTextGenerationController:
             for j, (expected, actual) in enumerate(
                 zip(tokens_per_rank[local_rank], tokens_per_rank[i])
             ):
-                assert (
-                    expected == actual
-                ), f"Rank {i} tokens differ from rank {local_rank} tokens for request {j}"
+                assert expected == actual, (
+                    f"Rank {i} tokens differ from rank {local_rank} tokens for request {j}"
+                )

@@ -102,9 +102,9 @@ def run_mcore_engine(
             response_dict["segments"] = [x.segments for x in result]
         if sampling_params.top_n_logprobs > 0:
             # TODO(ksanthanam): Support enabling `skip_prompt_log_probs`
-            assert (
-                sampling_params.return_prompt_top_n_logprobs
-            ), "skip_prompt_log_probs must be False"
+            assert sampling_params.return_prompt_top_n_logprobs, (
+                "skip_prompt_log_probs must be False"
+            )
             response_dict["top_n_logprobs"] = [
                 x.prompt_top_n_logprobs + x.generated_top_n_logprobs for x in result
             ]

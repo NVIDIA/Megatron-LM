@@ -7,8 +7,6 @@ This provider assembles a MIMO model that consists of:
 • A 2-layer MLP projector that maps vision embeddings into Vicuna hidden size.
 """
 
-
-import torch
 from configs.llava_avlm import (
     get_llava_projection_config,
     get_llava_projection_layer_spec,
@@ -22,8 +20,8 @@ from examples.mimo.utils.logging import print_mimo_structure
 from examples.mimo.utils.model_helpers import load_submodule_ckpt
 from megatron.core.models.gpt.gpt_model import GPTModel
 from megatron.core.models.mimo import MimoModel, MimoModelConfig
-from megatron.core.models.mimo.submodules.vision import VisionModalitySubmodules
 from megatron.core.models.mimo.submodules.audio import AudioModalitySubmodules
+from megatron.core.models.mimo.submodules.vision import VisionModalitySubmodules
 from megatron.core.models.vision.multimodal_projector import MultimodalProjector
 from megatron.core.transformer.spec_utils import ModuleSpec
 
@@ -47,23 +45,17 @@ def model_provider_llava_avlm(
     # NOTE: Pipeline parallelism for the encoder/decoder is not yet supported in this
     # MIMO path, therefore *add_encoder* and *add_decoder* are currently ignored.
 
-
     # Language (Vicuna-7B)
     language_config = get_vicuna_language_model_config()
 
-
     # Vision→language and audio→language projection MLP – hidden size follows Vicuna (4096)
-    vision_projection_config = get_llava_projection_config(
-        hidden_size=language_config.hidden_size
-    )
-    audio_projection_config = get_llava_projection_config(
-        hidden_size=language_config.hidden_size
-    )
-
+    vision_projection_config = get_llava_projection_config(hidden_size=language_config.hidden_size)
+    audio_projection_config = get_llava_projection_config(hidden_size=language_config.hidden_size)
 
     # Sync precision flags from global args (if we're running under Megatron training loop)
     try:
         from megatron.training import get_args  # late import to avoid circular deps
+
         _args = get_args()
         if getattr(_args, "bf16", False):
             language_config.bf16 = True
@@ -76,20 +68,12 @@ def model_provider_llava_avlm(
     except (ModuleNotFoundError, AssertionError):
         pass
 
-
     # HF vision encoder
-    vision_encoder_params = {"is_video_input" : False}
-    vision_encoder = ModuleSpec(
-        module=HFCLIPEncoderWrapper,
-        params=vision_encoder_params,
-    )
+    vision_encoder_params = {"is_video_input": False}
+    vision_encoder = ModuleSpec(module=HFCLIPEncoderWrapper, params=vision_encoder_params)
     # HF audio encoder
-    audio_encoder_params = {"model_name" : "openai/whisper-base"}
-    audio_encoder = ModuleSpec(
-        module=HFWhisperEncoderWrapper,
-        params=audio_encoder_params,
-    )
-
+    audio_encoder_params = {"model_name": "openai/whisper-base"}
+    audio_encoder = ModuleSpec(module=HFWhisperEncoderWrapper, params=audio_encoder_params)
 
     # Create projection config for vision and audio to language
     vision_projection = ModuleSpec(
@@ -111,7 +95,6 @@ def model_provider_llava_avlm(
         },
     )
 
-
     # Create modality config for vision and audio
     vision_submodule_spec = ModuleSpec(
         module=VisionModalitySubmodules,
@@ -130,7 +113,6 @@ def model_provider_llava_avlm(
         },
     )
 
-
     # Create language model config
     language_model_spec = ModuleSpec(
         module=GPTModel,
@@ -145,37 +127,38 @@ def model_provider_llava_avlm(
         },
     )
 
-
     # Create MIMO model config
     mimo_model_config = MimoModelConfig(
         language_model_spec=language_model_spec,
         modality_submodules_spec={"images": vision_submodule_spec, "audios": audio_submodule_spec},
-        special_token_ids={"images": image_special_token_id, "audios": audio_special_token_id}
+        special_token_ids={"images": image_special_token_id, "audios": audio_special_token_id},
     )
 
     # Create MIMO model
     mimo_model = MimoModel(mimo_model_config)
-    print("*"*100)
+    print("*" * 100)
     print_mimo_structure(mimo_model)
-    print("*"*100)
+    print("*" * 100)
 
     # load the checkpoint
     try:
         from megatron.training import get_args  # late import to avoid circular deps
 
         _args = get_args()
-        if  _args.language_model_checkpoint is not None:
+        if _args.language_model_checkpoint is not None:
             load_submodule_ckpt(mimo_model.language_model, _args.language_model_checkpoint)
-            print(f"Successfully loaded LLaVA pretrained checkpoint from {_args.language_model_checkpoint}")
+            print(
+                f"Successfully loaded LLaVA pretrained checkpoint from {_args.language_model_checkpoint}"  # noqa: E501
+            )
     except (ModuleNotFoundError, AssertionError):
         pass
 
-    # TODO: ykarnati make these configurable and have an API to freeze/unfreeze   
+    # TODO: ykarnati make these configurable and have an API to freeze/unfreeze
     # freeze vision encoder and LLM parameters
     modules_to_freeze = [
         mimo_model.modality_submodules.images.encoders.clip_encoder,
         mimo_model.modality_submodules.audios.encoders.whisper_encoder,
-        mimo_model.language_model
+        mimo_model.language_model,
     ]
     for module in modules_to_freeze:
         for param in module.parameters():

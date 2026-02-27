@@ -1,18 +1,22 @@
 # Copyright (c) 2024, NVIDIA CORPORATION.  All rights reserved.
-import warnings
 import logging
+import warnings
 from copy import deepcopy
 
-import torch
 from config import get_language_model_config, get_vision_model_config, get_vision_projection_config
-from layer_specs import (get_layer_spec, get_layer_spec_te, get_mlp_module_spec, get_norm_mlp_module_spec_te,
-                         get_mamba_layer_spec_te)
+from layer_specs import (
+    get_layer_spec,
+    get_layer_spec_te,
+    get_mamba_layer_spec_te,
+    get_mlp_module_spec,
+    get_norm_mlp_module_spec_te,
+)
 
 from megatron.core.models.multimodal.llava_model import IMAGE_TOKEN, LLaVAModel
 from megatron.core.models.vision.clip_vit_model import get_num_image_embeddings
+from megatron.core.utils import log_single_rank
 from megatron.training import get_args, get_tokenizer, print_rank_0
 from megatron.training.arguments import core_transformer_config_from_args
-from megatron.core.utils import log_single_rank
 
 
 def model_provider(
@@ -21,12 +25,20 @@ def model_provider(
     """Builds the model.
 
     Args:
-        pre_process (bool): Include the embedding layer in the gpt decoder (used with pipeline parallelism). Defaults to True.
-        post_process (bool): Include an output layer and a layernorm in the gpt decoder (used with pipeline parallelism). Defaults to True.
-        add_encoder (bool): Construct the encoder module (used with pipeline parallelism). Defaults to True. When we use pipelining, the encoder
-            will live on only a subset of the pipeline stages (specifically, only the first stage).
-        add_decoder (bool): Construct the decoder module (used with pipeline parallelism). Defaults to True. When we use pipelining, the decoder
-            will live on only a subset of the pipeline stages (specifically, every stage after the first one).
+        pre_process (bool): Include the embedding layer in the gpt
+            decoder (used with pipeline parallelism). Defaults to True.
+        post_process (bool): Include an output layer and a layernorm
+            in the gpt decoder (used with pipeline parallelism).
+            Defaults to True.
+        add_encoder (bool): Construct the encoder module (used with
+            pipeline parallelism). Defaults to True. When we use
+            pipelining, the encoder will live on only a subset of the
+            pipeline stages (specifically, only the first stage).
+        add_decoder (bool): Construct the decoder module (used with
+            pipeline parallelism). Defaults to True. When we use
+            pipelining, the decoder will live on only a subset of the
+            pipeline stages (specifically, every stage after the
+            first one).
         parallel_output (bool): Enable parallel model output.
 
     Returns:
@@ -47,7 +59,7 @@ def model_provider(
         args.pixel_shuffle,
         args.use_tile_tags,
         args.max_num_tiles,
-        args.tokenizer_prompt_format
+        args.tokenizer_prompt_format,
     )
     old_seq_length = args.seq_length
     args.seq_length = args.encoder_seq_length = num_image_embeddings
@@ -55,21 +67,23 @@ def model_provider(
         log_single_rank(
             logging.getLogger(__name__),
             logging.WARNING,
-            f"Changed seq_length and encoder_seq_length (vision model sequence length) from {old_seq_length} to num_image_tokens ({num_image_embeddings})"
+            f"Changed seq_length and encoder_seq_length (vision model sequence length) from {old_seq_length} to num_image_tokens ({num_image_embeddings})",  # noqa: E501
         )
 
-    max_num_image_embeddings = max((args.max_num_tiles + int(args.use_thumbnail)), args.num_frames) * num_image_embeddings
+    max_num_image_embeddings = (
+        max((args.max_num_tiles + int(args.use_thumbnail)), args.num_frames) * num_image_embeddings
+    )
 
-    assert (
-        args.decoder_seq_length is not None
-    ), "Please provide --decoder-seq-length to set the language model sequence length"
-    assert (
-        args.decoder_seq_length > max_num_image_embeddings
-    ), "Language model sequence length must be greater than the maximum number of image embeddings"
+    assert args.decoder_seq_length is not None, (
+        "Please provide --decoder-seq-length to set the language model sequence length"
+    )
+    assert args.decoder_seq_length > max_num_image_embeddings, (
+        "Language model sequence length must be greater than the maximum number of image embeddings"
+    )
     if args.decoder_seq_length > args.max_position_embeddings:
         args.max_position_embeddings = args.decoder_seq_length
         warnings.warn(
-            f"Expanded max_position_embeddings to {args.max_position_embeddings} to accommodate the maximum language model sequence length"
+            f"Expanded max_position_embeddings to {args.max_position_embeddings} to accommodate the maximum language model sequence length"  # noqa: E501
         )
 
     language_model_type = args.language_model_type
@@ -84,10 +98,16 @@ def model_provider(
     language_config = get_language_model_config(language_config)
 
     if language_model_type.startswith("hf://"):
-        assert args.tensor_model_parallel_size == 1, "Huggingface models do not support --tensor-model-parallel-size > 1"
-        assert args.pipeline_model_parallel_size < 2, "Huggingface models do not support --pipeline-model-parallel-size > 1"
+        assert args.tensor_model_parallel_size == 1, (
+            "Huggingface models do not support --tensor-model-parallel-size > 1"
+        )
+        assert args.pipeline_model_parallel_size < 2, (
+            "Huggingface models do not support --pipeline-model-parallel-size > 1"
+        )
         assert not args.sequence_parallel, "Huggingface models do not support --sequence-parallel"
-        assert args.context_parallel_size < 2, "Huggingface models do not support --context-parallel-size > 1"
+        assert args.context_parallel_size < 2, (
+            "Huggingface models do not support --context-parallel-size > 1"
+        )
 
     if language_model_type.startswith("hf://"):
         language_transformer_layer_spec = None
@@ -111,7 +131,9 @@ def model_provider(
     )
     if vision_model_type.startswith("hf://"):
         assert not args.sequence_parallel, "Huggingface models do not support --sequence-parallel"
-        assert args.context_parallel_size < 2, "Huggingface models do not support --context-parallel-size > 1"
+        assert args.context_parallel_size < 2, (
+            "Huggingface models do not support --context-parallel-size > 1"
+        )
 
     if vision_model_type in ["clip", "siglip", "radio", "cradio-g"]:
         if use_te:
@@ -125,17 +147,23 @@ def model_provider(
     elif vision_model_type == "radio-g":
         if use_te:
             from radio.radio_g import get_radio_g_layer_spec_te
-            vision_transformer_layer_spec = get_radio_g_layer_spec_te()  # TENorm detects LayerNorm/RMS automatically.
+
+            vision_transformer_layer_spec = (
+                get_radio_g_layer_spec_te()
+            )  # TENorm detects LayerNorm/RMS automatically.
         else:
             from radio.radio_g import get_radio_g_layer_spec
+
             vision_transformer_layer_spec = get_radio_g_layer_spec(
                 normalization=vision_config.normalization
             )
     elif vision_model_type == "internvit":
         from nvlm.internvit import get_internvit_layer_spec
+
         vision_transformer_layer_spec = get_internvit_layer_spec(use_te=use_te)
     elif vision_model_type == "internvit300M":
         from nvlm.internvit import get_internvit300M_layer_spec
+
         vision_transformer_layer_spec = get_internvit300M_layer_spec(use_te=use_te)
     elif vision_model_type.startswith("hf://"):
         vision_transformer_layer_spec = None
@@ -148,11 +176,13 @@ def model_provider(
         vision_projection_config, language_config.hidden_size
     )
 
-    # Make sure vision model pipeline parallel size is not inherited from the language model pipeline parallel size.
+    # Make sure vision model pipeline parallel size is not inherited from the language model pipeline parallel size.  # noqa: E501
     vision_config.pipeline_model_parallel_size = 1
-    vision_projection_config.pipeline_model_parallel_size = vision_config.pipeline_model_parallel_size
+    vision_projection_config.pipeline_model_parallel_size = (
+        vision_config.pipeline_model_parallel_size
+    )
 
-    # Make sure the vision model does not inherit first and last pipeline num layers from the language model.
+    # Make sure the vision model does not inherit first and last pipeline num layers from the language model.  # noqa: E501
     vision_config.first_pipeline_num_layers = vision_config.last_pipeline_num_layers = None
 
     if vision_projection_config.normalization:
@@ -162,7 +192,10 @@ def model_provider(
 
     # Toggle --recompute* for the vision and language model separately.
     if args.recompute_vision:
-        if vision_config.recompute_method is not None and vision_config.recompute_granularity is not None:
+        if (
+            vision_config.recompute_method is not None
+            and vision_config.recompute_granularity is not None
+        ):
             vision_config.recompute_num_layers = vision_config.num_layers
     else:
         vision_config.recompute_granularity = None
@@ -184,7 +217,9 @@ def model_provider(
 
     tokenizer = get_tokenizer()
     image_token_index = tokenizer.convert_tokens_to_ids(IMAGE_TOKEN)
-    assert image_token_index is not None, f"IMAGE_TOKEN={IMAGE_TOKEN} needs to be added using the --special-tokens arg."
+    assert image_token_index is not None, (
+        f"IMAGE_TOKEN={IMAGE_TOKEN} needs to be added using the --special-tokens arg."
+    )
 
     tile_tags = _get_tile_tags(args, tokenizer)
 
@@ -245,16 +280,25 @@ def _get_tile_tags(args, tokenizer):
             thumbnail_tag_text = "<tile_global>"
 
         if args.tokenizer_prompt_format.startswith("nemotron"):
-            tile_tags_text = [f"<tile_{i:02d}>" for i in range(1, args.max_num_tiles + 1)] + [thumbnail_tag_text]
+            tile_tags_text = [f"<tile_{i:02d}>" for i in range(1, args.max_num_tiles + 1)] + [
+                thumbnail_tag_text
+            ]
         else:
-            tile_tags_text = [f"<tile_{i}>" for i in range(1, args.max_num_tiles + 1)] + [thumbnail_tag_text]
+            tile_tags_text = [f"<tile_{i}>" for i in range(1, args.max_num_tiles + 1)] + [
+                thumbnail_tag_text
+            ]
     elif args.max_num_tiles <= 12:
         thumbnail_tag_text = "<tile_global_thumbnail0>"
         if args.tokenizer_prompt_format == "nvlm-yi-34b":
             thumbnail_tag_text = "<tile_global0>"
-        elif args.tokenizer_prompt_format.startswith("nemotron") or args.tokenizer_prompt_format == "llama3p1":
+        elif (
+            args.tokenizer_prompt_format.startswith("nemotron")
+            or args.tokenizer_prompt_format == "llama3p1"
+        ):
             thumbnail_tag_text = "<tile_global_thumbnail>"
-        tile_tags_text = [f"<tile_{i:02d}>" for i in range(1, args.max_num_tiles + 1)] + [thumbnail_tag_text]
+        tile_tags_text = [f"<tile_{i:02d}>" for i in range(1, args.max_num_tiles + 1)] + [
+            thumbnail_tag_text
+        ]
     else:
         raise ValueError("We only support max_num_tiles <= 12 when using nvlm image_tag_type")
 

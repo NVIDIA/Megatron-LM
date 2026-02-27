@@ -15,7 +15,6 @@ from megatron.core.transformer.cuda_graphs import is_graph_capturing
 
 def debug_rank(message):
     """Print debug message for a specific rank when DEBUG is enabled."""
-    # pylint: disable=bad-builtin
     if not DEBUG:
         return
     assert torch.distributed.is_initialized()
@@ -33,7 +32,6 @@ def print_offload_summary_table(total_offload_bytes: Dict[str, int]):
     Args:
         total_offload_bytes: Dict mapping group names to offload bytes for this rank.
     """
-    # pylint: disable=bad-builtin
     assert torch.distributed.is_initialized()
     rank = torch.distributed.get_rank()
     world_size = torch.distributed.get_world_size()
@@ -521,17 +519,16 @@ class PipelineOffloadManager:
 
     def post_warmup_callback(self):
         """Callback after warmup."""
-        # pylint: disable=bad-builtin
         debug_rank("post_warmup_callback")
         self._is_warmup = False
-        assert len(self._cached_chunks_forward) == len(
-            self._cached_chunks_backward
-        ), "Cached chunks forward and backward must have the same length"
+        assert len(self._cached_chunks_forward) == len(self._cached_chunks_backward), (
+            "Cached chunks forward and backward must have the same length"
+        )
         for chunk in self._cached_chunks_forward:
             chunk.is_warmup = False
-            assert (
-                chunk in self._cached_chunks_backward
-            ), "Chunk not found in cached chunks backward"
+            assert chunk in self._cached_chunks_backward, (
+                "Chunk not found in cached chunks backward"
+            )
             # Update the offload margin to the maximum number of deduplicated groups
             self._offload_margin = max(self._offload_margin, chunk.get_max_deduplicated_groups())
             debug_rank(f"offload margin {self._offload_margin}")
@@ -1066,8 +1063,7 @@ class FineGrainedOffloadingGroupCommitFunction(torch.autograd.Function):
     """
 
     @staticmethod
-    def forward(ctx, tensor, cur_forward_chunk, name, forced_released_tensors, delay_offload):
-        # pylint: disable=missing-function-docstring
+    def forward(ctx, tensor, cur_forward_chunk, name, forced_released_tensors, delay_offload):  # noqa: D103
         debug_rank("FineGrainedOffloadingGroupCommitFunction forward")
 
         if delay_offload:
@@ -1081,8 +1077,7 @@ class FineGrainedOffloadingGroupCommitFunction(torch.autograd.Function):
         return tensor
 
     @staticmethod
-    def backward(ctx, *grad_output):
-        # pylint: disable=missing-function-docstring
+    def backward(ctx, *grad_output):  # noqa: D103
         debug_rank("FineGrainedOffloadingGroupCommitFunction backward")
 
         cpu_offload_handler = ctx.cpu_offload_handler
@@ -1146,8 +1141,7 @@ class FineGrainedOffloadingGroupStartFunction(torch.autograd.Function):
     """
 
     @staticmethod
-    def forward(ctx, tensor, cpu_offload_handler, name):
-        # pylint: disable=missing-function-docstring
+    def forward(ctx, tensor, cpu_offload_handler, name):  # noqa: D103
         ctx.cpu_offload_handler = cpu_offload_handler
         debug_rank("FineGrainedOffloadingGroupStartFunction forward")
 
@@ -1156,8 +1150,7 @@ class FineGrainedOffloadingGroupStartFunction(torch.autograd.Function):
         return tensor
 
     @staticmethod
-    def backward(ctx, grad_output):
-        # pylint: disable=missing-function-docstring
+    def backward(ctx, grad_output):  # noqa: D103
         debug_rank("FineGrainedOffloadingGroupStartFunction backward")
         cpu_offload_handler = ctx.cpu_offload_handler
         cpu_offload_handler.on_group_start_backward()

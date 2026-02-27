@@ -2,12 +2,11 @@
 
 """Transformer based language model."""
 
-import torch
-import torch.nn.functional as F
 from typing import Optional
 
+import torch
+
 from megatron.core import mpu, tensor_parallel
-from megatron.core.enums import ModelType
 from megatron.core.inference.contexts import BaseInferenceContext
 from megatron.core.models.common.embeddings.rotary_pos_embedding import RotaryEmbedding
 from megatron.core.utils import deprecate_inference_params
@@ -342,7 +341,7 @@ class TransformerLanguageModel(MegatronModule):
         post_process=True,
     ):
         args = get_args()
-        # TODO: passing share_embeddings_and_output_weights=False will not work correctly for T5 and embeddings will not be synced. Fix later for T5.
+        # TODO: passing share_embeddings_and_output_weights=False will not work correctly for T5 and embeddings will not be synced. Fix later for T5.  # noqa: E501
         if args.untie_embeddings_and_output_weights:
             assert not add_decoder
         super(TransformerLanguageModel, self).__init__(
@@ -435,7 +434,7 @@ class TransformerLanguageModel(MegatronModule):
                     config=config,
                     init_method=self.init_method,
                     bias=False,
-                )  # Setting bias to False always to keep it consistent with embedding tying that also does not have a bias.
+                )  # Setting bias to False always to keep it consistent with embedding tying that also does not have a bias.  # noqa: E501
                 self._output_layer_key = 'output_layer'
 
     def set_input_tensor(self, input_tensor):
@@ -447,14 +446,14 @@ class TransformerLanguageModel(MegatronModule):
             input_tensor = [input_tensor]
 
         if self.add_encoder and self.add_decoder:
-            assert (
-                len(input_tensor) == 1
-            ), 'input_tensor should only be length 1 for stage with both encoder and decoder'
+            assert len(input_tensor) == 1, (
+                'input_tensor should only be length 1 for stage with both encoder and decoder'
+            )
             self.encoder.set_input_tensor(input_tensor[0])
         elif self.add_encoder:
-            assert (
-                len(input_tensor) == 1
-            ), 'input_tensor should only be length 1 for stage with only encoder'
+            assert len(input_tensor) == 1, (
+                'input_tensor should only be length 1 for stage with only encoder'
+            )
             self.encoder.set_input_tensor(input_tensor[0])
         elif self.add_decoder:
             if len(input_tensor) == 2:
@@ -485,7 +484,6 @@ class TransformerLanguageModel(MegatronModule):
         *,
         inference_params: Optional[BaseInferenceContext] = None,
     ):
-
         inference_context = deprecate_inference_params(inference_context, inference_params)
 
         # Encoder embedding.
@@ -629,9 +627,9 @@ class TransformerLanguageModel(MegatronModule):
                 assert 'pooler' in state_dict, 'could not find data for pooler in the checkpoint'
                 self.pooler.load_state_dict(state_dict[self._pooler_key], strict=strict)
             if self.untie_embeddings_and_output_weights:
-                assert (
-                    'output_layer' in state_dict
-                ), 'could not find data for output_layer in the checkpoint'
+                assert 'output_layer' in state_dict, (
+                    'could not find data for output_layer in the checkpoint'
+                )
                 self.output_layer.load_state_dict(state_dict[self._output_layer_key], strict=strict)
         # Decoder.
         if self.add_decoder:

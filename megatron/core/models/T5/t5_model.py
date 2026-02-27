@@ -153,7 +153,6 @@ class T5Model(LanguageModule):
         add_decoder: bool = True,
         pg_collection: ProcessGroupCollection = None,
     ):
-
         super(T5Model, self).__init__(config=config)
 
         self.config: TransformerConfig = config
@@ -306,7 +305,6 @@ class T5Model(LanguageModule):
 
         ## Encoder forward
         if encoder_hidden_states is None:
-
             # Encoder position ids
             encoder_position_ids = t5_position_ids(encoder_input_ids)
 
@@ -443,14 +441,14 @@ class T5Model(LanguageModule):
             input_tensor = [input_tensor]
 
         if self.add_encoder and self.add_decoder:
-            assert (
-                len(input_tensor) == 1
-            ), 'input_tensor should only be length 1 for stage with both encoder and decoder'
+            assert len(input_tensor) == 1, (
+                'input_tensor should only be length 1 for stage with both encoder and decoder'
+            )
             self.encoder.set_input_tensor(input_tensor[0])
         elif self.add_encoder:
-            assert (
-                len(input_tensor) == 1
-            ), 'input_tensor should only be length 1 for stage with only encoder'
+            assert len(input_tensor) == 1, (
+                'input_tensor should only be length 1 for stage with only encoder'
+            )
             self.encoder.set_input_tensor(input_tensor[0])
         elif self.add_decoder:
             if len(input_tensor) == 2:

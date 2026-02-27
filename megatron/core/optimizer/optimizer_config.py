@@ -373,12 +373,12 @@ class OptimizerConfig:
                 )
 
         if self.use_precision_aware_optimizer:
-            assert (
-                self.optimizer == 'adam'
-            ), '--use-precision-aware-optimizer only supported with adam'
-            assert (
-                self.use_distributed_optimizer
-            ), '--use-precision-aware-optimizer only supported with distributed optimizer'
+            assert self.optimizer == 'adam', (
+                '--use-precision-aware-optimizer only supported with adam'
+            )
+            assert self.use_distributed_optimizer, (
+                '--use-precision-aware-optimizer only supported with distributed optimizer'
+            )
 
             if not is_te_min_version("2.1.0"):
                 self.store_param_remainders = False
@@ -412,18 +412,18 @@ class OptimizerConfig:
                     'but not found.'
                 )
         else:
-            assert (
-                self.main_grads_dtype == torch.float32
-            ), "main_grads_dtype can only be fp32 when not using precision-aware optimizer"
-            assert (
-                self.main_params_dtype == torch.float32
-            ), "main_params_dtype can only be fp32 when not using precision-aware optimizer"
-            assert (
-                self.exp_avg_dtype == torch.float32
-            ), "exp_avg_dtype can only be fp32 when not using precision-aware optimizer"
-            assert (
-                self.exp_avg_sq_dtype == torch.float32
-            ), "exp_avg_sq_dtype can only be fp32 when not using precision-aware optimizer"
+            assert self.main_grads_dtype == torch.float32, (
+                "main_grads_dtype can only be fp32 when not using precision-aware optimizer"
+            )
+            assert self.main_params_dtype == torch.float32, (
+                "main_params_dtype can only be fp32 when not using precision-aware optimizer"
+            )
+            assert self.exp_avg_dtype == torch.float32, (
+                "exp_avg_dtype can only be fp32 when not using precision-aware optimizer"
+            )
+            assert self.exp_avg_sq_dtype == torch.float32, (
+                "exp_avg_sq_dtype can only be fp32 when not using precision-aware optimizer"
+            )
 
 
 @dataclass

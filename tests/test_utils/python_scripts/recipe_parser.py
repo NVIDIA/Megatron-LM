@@ -99,7 +99,7 @@ def load_and_flatten(config_path: str) -> List[dotdict]:
 
 
 def filter_by_test_case(workload_manifests: List[dotdict], test_case: str) -> Optional[dotdict]:
-    """Returns a workload with matching name. Raises an error if there no or more than a single workload."""
+    """Returns a workload with matching name. Raises an error if there no or more than a single workload."""  # noqa: E501
     workload_manifests = list(
         workload_manifest
         for workload_manifest in workload_manifests
@@ -133,7 +133,6 @@ def filter_by_scope(workload_manifests: List[dotdict], scope: str) -> List[dotdi
 
 
 def filter_by_environment(workload_manifests: List[dotdict], environment: str) -> List[dotdict]:
-
     workload_manifests_copy = list(
         workload_manifest
         for workload_manifest in workload_manifests.copy()
@@ -199,7 +198,7 @@ def filter_by_tag(workload_manifests: List[dotdict], tag: str) -> List[dotdict]:
 
 
 def filter_by_test_cases(workload_manifests: List[dotdict], test_cases: str) -> List[dotdict]:
-    """Returns a workload with matching name. Raises an error if there no or more than a single workload."""
+    """Returns a workload with matching name. Raises an error if there no or more than a single workload."""  # noqa: E501
     workload_manifests = list(
         workload_manifest
         for workload_manifest in workload_manifests

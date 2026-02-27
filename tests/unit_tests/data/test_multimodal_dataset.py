@@ -4,7 +4,6 @@
 # Compile megatron.core.datasets.helpers_cpp dependencies before BlendedDataset import
 ##
 
-from types import SimpleNamespace
 
 import torch
 

@@ -11,7 +11,7 @@ from typing import Dict, List, Protocol, Union
 import torch
 import torch.nn.utils.rnn as rnn_utils
 
-# TODO: ykarnati, use absolute import or 
+# TODO: ykarnati, use absolute import or
 # define train_valid_test_dataloaders_provider in here
 sys.path.append(
     os.path.abspath(
@@ -44,7 +44,6 @@ class ConversationTemplateConfig:
     chat_template: str = None
 
 
-
 @dataclass
 class LlavaConversationTemplateConfig(ConversationTemplateConfig):
     """Default system prompt and chat template for Llava training."""
@@ -57,20 +56,9 @@ class ModelType(Enum):
     LLAVA_VLM = "llava_vlm"
     VIDEO_LLAVA_VLM = "video_llava_vlm"
 
-class VLMTaskEncoder(
-    DefaultTaskEncoder[
-        Union[VQASample],
-        dict,
-        dict,
-        dict,
-    ]
-):
-    def __init__(
-        self,
-        model_type: ModelType,
-        processor,
-        conversation_template_config=None,
-    ):
+
+class VLMTaskEncoder(DefaultTaskEncoder[Union[VQASample], dict, dict, dict]):
+    def __init__(self, model_type: ModelType, processor, conversation_template_config=None):
         self.model_type = model_type
 
         self.processor = processor
@@ -96,46 +84,23 @@ class VLMTaskEncoder(
 
         conversation = []
         for _, (u_txt, b_txt) in enumerate(zip(user_msgs, bot_msgs)):
-            conversation.append(
-                {
-                    "role": "user",
-                    "content": [{"type": "text", "text": u_txt}],
-                }
-            )
-            conversation.append(
-                {
-                    "role": "assistant",
-                    "content": [{"type": "text", "text": b_txt}],
-                }
-            )
+            conversation.append({"role": "user", "content": [{"type": "text", "text": u_txt}]})
+            conversation.append({"role": "assistant", "content": [{"type": "text", "text": b_txt}]})
 
         # Inject optional system message
-        if (
-            self.conversation_template_config
-            and self.conversation_template_config.system
-        ):
+        if self.conversation_template_config and self.conversation_template_config.system:
             conversation.insert(
-                0,
-                {"role": "system", "content": self.conversation_template_config.system},
+                0, {"role": "system", "content": self.conversation_template_config.system}
             )
 
         # Select chat template
-        if (
-            self.conversation_template_config
-            and self.conversation_template_config.chat_template
-        ):
-            self.processor.chat_template = (
-                self.conversation_template_config.chat_template
-            )
+        if self.conversation_template_config and self.conversation_template_config.chat_template:
+            self.processor.chat_template = self.conversation_template_config.chat_template
         return self.processor.apply_chat_template(
-            conversation,
-            tokenize=False,
-            add_generation_prompt=False,
+            conversation, tokenize=False, add_generation_prompt=False
         )
 
-    def _find_pattern_indices(
-        self, template, pattern, start_idx=0, allow_first_mismatch=False
-    ):
+    def _find_pattern_indices(self, template, pattern, start_idx=0, allow_first_mismatch=False):
         template_len = len(template)
         pat_len = len(pattern)
         for i in range(start_idx, template_len - pat_len + 1):
@@ -237,9 +202,7 @@ class VLMTaskEncoder(
         }
 
         if pixel_values is not None:
-            output["modality_inputs"] = {
-                "images": {"clip_encoder": {"pixel_values": pixel_values}}
-            }
+            output["modality_inputs"] = {"images": {"clip_encoder": {"pixel_values": pixel_values}}}
 
         return output
 
@@ -296,7 +259,6 @@ def llava_vlm_dataloader_provider(train_val_test_num_samples, is_video_input=Fal
 
 
 if __name__ == "__main__":
-
     parser = argparse.ArgumentParser()
     parser.add_argument(
         "--data_path",

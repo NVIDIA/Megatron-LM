@@ -1,6 +1,6 @@
 # Copyright (c) 2023, NVIDIA CORPORATION.  All rights reserved.
 
-""" State dict saver for PyT Distributed format allowing asynchronous save. """
+"""State dict saver for PyT Distributed format allowing asynchronous save."""
 
 from logging import getLogger
 from time import time
@@ -232,7 +232,9 @@ def save_state_dict_async_finalize(
     gather_start = time()
     all_results = dist_wrapper.gather_object(write_results)
     gather_end = time()
-    logger.debug(f"{gather_end}, {torch.distributed.get_rank()}, gather: {gather_end-gather_start}")
+    logger.debug(
+        f"{gather_end}, {torch.distributed.get_rank()}, gather: {gather_end - gather_start}"
+    )
 
     # Store the metadata on coordinator rank
     if dist_wrapper.is_coordinator:

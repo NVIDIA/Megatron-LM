@@ -261,35 +261,35 @@ def tensor_get_slice_after(input_tensor, output_tensor, pos_on_device, check_bou
     Copy from input_tensor[pos_on_device:] to output_tensor[:copy_size].
     """
 
-    assert (
-        input_tensor.device == output_tensor.device
-    ), "Input and output tensors must be on the same device"
-    assert (
-        input_tensor.dtype == output_tensor.dtype
-    ), "Input and output tensors must have the same dtype"
-    assert (
-        input_tensor.is_contiguous() and output_tensor.is_contiguous()
-    ), "Input and output tensors must be contiguous"
+    assert input_tensor.device == output_tensor.device, (
+        "Input and output tensors must be on the same device"
+    )
+    assert input_tensor.dtype == output_tensor.dtype, (
+        "Input and output tensors must have the same dtype"
+    )
+    assert input_tensor.is_contiguous() and output_tensor.is_contiguous(), (
+        "Input and output tensors must be contiguous"
+    )
 
     if check_bounds:
-        assert (
-            input_tensor.ndim == output_tensor.ndim
-        ), "Input and output tensors must have the same number of dimensions"
+        assert input_tensor.ndim == output_tensor.ndim, (
+            "Input and output tensors must have the same number of dimensions"
+        )
 
         for i in range(1, input_tensor.ndim):
-            assert (
-                input_tensor.shape[i] == output_tensor.shape[i]
-            ), f"Dimension {i} must match between input and output tensors"
+            assert input_tensor.shape[i] == output_tensor.shape[i], (
+                f"Dimension {i} must match between input and output tensors"
+            )
 
         pos_on_device_val = pos_on_device[0].item()
-        assert (
-            0 <= pos_on_device_val <= input_tensor.shape[0]
-        ), "pos_on_device must be between 0 and input_tensor.shape[0]"
+        assert 0 <= pos_on_device_val <= input_tensor.shape[0], (
+            "pos_on_device must be between 0 and input_tensor.shape[0]"
+        )
 
         copy_size = input_tensor.shape[0] - pos_on_device_val
-        assert (
-            copy_size <= output_tensor.shape[0]
-        ), f"Copy size ({copy_size}) exceeds output_tensor batch size ({output_tensor.shape[0]})"
+        assert copy_size <= output_tensor.shape[0], (
+            f"Copy size ({copy_size}) exceeds output_tensor batch size ({output_tensor.shape[0]})"
+        )
 
     input_batch_size = input_tensor.shape[0]
     output_batch_size = output_tensor.shape[0]
@@ -329,34 +329,34 @@ def tensor_merge(
         output_tensor = tensor_a
         is_inplace = True
 
-    assert (
-        tensor_a.device == tensor_b.device == output_tensor.device
-    ), "All tensors must be on the same device"
-    assert (
-        tensor_a.dtype == tensor_b.dtype == output_tensor.dtype
-    ), "All tensors must have the same dtype"
+    assert tensor_a.device == tensor_b.device == output_tensor.device, (
+        "All tensors must be on the same device"
+    )
+    assert tensor_a.dtype == tensor_b.dtype == output_tensor.dtype, (
+        "All tensors must have the same dtype"
+    )
     assert (
         tensor_a.is_contiguous() and tensor_b.is_contiguous() and output_tensor.is_contiguous()
     ), "All tensors must be contiguous"
 
     if check_bounds:
-        assert (
-            tensor_a.ndim == tensor_b.ndim == output_tensor.ndim
-        ), "All tensors must have the same number of dimensions"
+        assert tensor_a.ndim == tensor_b.ndim == output_tensor.ndim, (
+            "All tensors must have the same number of dimensions"
+        )
 
         for i in range(1, tensor_a.ndim):
-            assert (
-                tensor_a.shape[i] == tensor_b.shape[i] == output_tensor.shape[i]
-            ), f"Dimension {i} must match across all tensors"
+            assert tensor_a.shape[i] == tensor_b.shape[i] == output_tensor.shape[i], (
+                f"Dimension {i} must match across all tensors"
+            )
 
-        assert (
-            output_tensor.shape[0] >= tensor_a.shape[0]
-        ), "output_tensor batch size must be >= tensor_a batch size"
+        assert output_tensor.shape[0] >= tensor_a.shape[0], (
+            "output_tensor batch size must be >= tensor_a batch size"
+        )
 
         pos_on_device_val = pos_on_device[0].item()
-        assert (
-            0 <= pos_on_device_val <= tensor_a.shape[0]
-        ), "pos_on_device must be between 0 and tensor_a batch size"
+        assert 0 <= pos_on_device_val <= tensor_a.shape[0], (
+            "pos_on_device must be between 0 and tensor_a batch size"
+        )
 
     tensor_b_batch_size = tensor_b.shape[0]
     output_batch_size = output_tensor.shape[0]

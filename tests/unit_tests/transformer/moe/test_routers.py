@@ -360,10 +360,9 @@ class TestGroupLimitedRouter:
             )
             scores, routing_map = self.router(hidden_states)
             assert scores.shape == (num_tokens, self.router.config.num_moe_experts), scores.shape
-            assert routing_map.shape == (
-                num_tokens,
-                self.router.config.num_moe_experts,
-            ), routing_map.shape
+            assert routing_map.shape == (num_tokens, self.router.config.num_moe_experts), (
+                routing_map.shape
+            )
 
             group_routing_map = (
                 routing_map.reshape(num_tokens, moe_router_num_groups, -1).max(dim=-1).values

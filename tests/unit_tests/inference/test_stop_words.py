@@ -2,9 +2,7 @@
 
 """Unit tests for stop word functionality in dynamic inference."""
 
-from dataclasses import dataclass, field
 from typing import List, Optional
-from unittest.mock import MagicMock, patch
 
 import pytest
 

@@ -8,7 +8,7 @@ def recursively_lint_files():
     """Recursively lint all python files in chosen subdirectories of megatron-lm"""
 
     try:
-        import autopep8
+        import autopep8  # noqa: F401
     except ModuleNotFoundError:
         print("Please first install autopep8 via `pip install autopep8`")
         return
@@ -16,8 +16,9 @@ def recursively_lint_files():
     # get all python file paths from top level directory
     file_dir = str(pathlib.Path(__file__).parent.absolute())
     working_dir = osp.join(file_dir, os.pardir)
-    all_py_paths = set(os.path.join(working_dir, fname)
-                       for fname in os.listdir(working_dir) if ".py" in fname)
+    all_py_paths = set(
+        os.path.join(working_dir, fname) for fname in os.listdir(working_dir) if ".py" in fname
+    )
 
     # get all python file paths from chosen subdirectories
     check_dirs = ['docker', 'megatron', 'openwebtext', 'scripts', 'tasks']

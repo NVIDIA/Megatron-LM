@@ -30,7 +30,7 @@ from typing import List
 
 from examples.inference.gpt.utils import build_requests
 from megatron.inference.utils import add_inference_args, get_model_for_inference
-from megatron.training import get_args, get_tokenizer, print_rank_0
+from megatron.training import get_args, print_rank_0
 from megatron.training.initialize import initialize_megatron
 
 
@@ -55,7 +55,9 @@ def add_static_inference_args(parser):
 def get_inference_engine(args: Namespace, model: MegatronModule) -> StaticInferenceEngine:
     """Utility to get the relevant backend for running inference
 
-    This function will automatically choose the TRTLLMBackend when possible, and if not revert to Mcore backend if the user does not specify any backends. TRT LLM Backend is not implmented yet.
+    This function will automatically choose the TRTLLMBackend when possible,
+    and if not revert to Mcore backend if the user does not specify any
+    backends. TRT LLM Backend is not implemented yet.
 
     Args:
         args (Namespace): The user arguments parsed from command line
@@ -119,8 +121,8 @@ async def generate(
 def main():
     """Main program."""
 
-    # Note: The default args passed here can be overwritten by using appropriate params (check arguments.py file)
-    # Micro batch size is not needed to be set by user. (It is calculated based on inference-batch-times-seqlen-threshold argument)
+    # Note: The default args passed here can be overwritten by using appropriate params (check arguments.py file)  # noqa: E501
+    # Micro batch size is not needed to be set by user. (It is calculated based on inference-batch-times-seqlen-threshold argument)  # noqa: E501
     initialize_megatron(
         extra_args_provider=add_static_inference_args,
         args_defaults={
@@ -191,7 +193,6 @@ def main():
 
     # Print unique prompts + outputs.
     if torch.distributed.get_rank() == 0:
-
         print("~~~~ Unique prompts + outputs. ~~~~")
 
         # Map results by their prompt.

@@ -37,7 +37,7 @@ from megatron.core.transformer.enums import CudaGraphScope
 from megatron.core.transformer.moe.fused_a2a import reset_hybrid_ep_buffer
 from megatron.core.transformer.transformer_block import TransformerBlock
 from megatron.core.transformer.transformer_config import TransformerConfig
-from megatron.core.utils import is_fa_min_version, is_te_min_version
+from megatron.core.utils import is_te_min_version
 from megatron.training.arguments import core_transformer_config_from_args, parse_args, validate_args
 from megatron.training.global_vars import (
     destroy_global_vars,
@@ -119,7 +119,7 @@ class TestParallelTransformerBlockCudagraphs:
     reason="use_te_rng_tracker requires TransformerEngine version >= 1.5",
 )
 @pytest.mark.parametrize(
-    "total_num_layers, pp, vpp, account_for_embedding_in_pipeline_split, account_for_loss_in_pipeline_split, num_layers_in_first_pipeline_stage, num_layers_in_last_pipeline_stage, pp_layout, first_layer_numbers_golden, last_layer_numbers_golden",
+    "total_num_layers, pp, vpp, account_for_embedding_in_pipeline_split, account_for_loss_in_pipeline_split, num_layers_in_first_pipeline_stage, num_layers_in_last_pipeline_stage, pp_layout, first_layer_numbers_golden, last_layer_numbers_golden",  # noqa: E501
     [
         (4, 1, None, False, False, None, None, None, [1], [4]),
         (8, 2, None, False, False, None, None, None, [1, 5], [4, 8]),
@@ -243,9 +243,9 @@ def test_cuda_graph_determine_first_last_layer_logic(
     for m in model:
         for l in m.decoder.layers:
             assert hasattr(l, "cudagraph_manager")
-            assert (
-                len(l.cudagraph_manager.cudagraph_runners) == 1
-            ), "Cuda graph runner should be created"
+            assert len(l.cudagraph_manager.cudagraph_runners) == 1, (
+                "Cuda graph runner should be created"
+            )
             runner = l.cudagraph_manager.cudagraph_runners[0]
             assert runner.is_first_layer is not None and runner.is_last_layer is not None
             assert runner.is_first_layer == (l.layer_number in first_layer_numbers_golden)
@@ -276,7 +276,7 @@ def test_cuda_graph_determine_first_last_layer_logic(
 
 
 class TestLLaVACudaGraph:
-    """Test CUDA graphs with LLaVA model focusing on is_last_layer logic for encoder/decoder transitions."""
+    """Test CUDA graphs with LLaVA model focusing on is_last_layer logic for encoder/decoder transitions."""  # noqa: E501
 
     def setup_method(self, method):
         # Initialize parallel state
@@ -363,7 +363,7 @@ class TestLLaVACudaGraph:
         reason="use_te_rng_tracker requires TransformerEngine version >= 1.5",
     )
     def test_llava_cudagraph_is_last_layer_logic(self):
-        """Test that is_last_layer logic correctly resets prev_bwd_hidden_state_inputgrad for LLaVA models."""
+        """Test that is_last_layer logic correctly resets prev_bwd_hidden_state_inputgrad for LLaVA models."""  # noqa: E501
 
         # Move model to CUDA
         self.llava_model.cuda()
@@ -410,18 +410,18 @@ class TestLLaVACudaGraph:
         ):
             for layer in self.llava_model.vision_model.decoder.layers:
                 if hasattr(layer, 'cudagraph_manager'):
-                    assert (
-                        layer.cudagraph_manager is not None
-                    ), "Vision model layers should have CUDA graph managers"
+                    assert layer.cudagraph_manager is not None, (
+                        "Vision model layers should have CUDA graph managers"
+                    )
 
         if hasattr(self.llava_model.language_model, 'decoder') and hasattr(
             self.llava_model.language_model.decoder, 'layers'
         ):
             for layer in self.llava_model.language_model.decoder.layers:
                 if hasattr(layer, 'cudagraph_manager'):
-                    assert (
-                        layer.cudagraph_manager is not None
-                    ), "Language model layers should have CUDA graph managers"
+                    assert layer.cudagraph_manager is not None, (
+                        "Language model layers should have CUDA graph managers"
+                    )
 
                     # Verify that CUDA graphs were created successfully
                     for runner in layer.cudagraph_manager.cudagraph_runners:
@@ -624,9 +624,9 @@ class TestTECudaGraphHelper:
 
         # Extract sample_kwargs from the kwargs dict
         # For TE >= 1.10.0, sample_kwargs should always be present
-        assert (
-            'sample_kwargs' in make_graphed_callables_kwargs
-        ), "sample_kwargs should be present in make_graphed_callables_kwargs for TE >= 1.10.0"
+        assert 'sample_kwargs' in make_graphed_callables_kwargs, (
+            "sample_kwargs should be present in make_graphed_callables_kwargs for TE >= 1.10.0"
+        )
         sample_kwargs = make_graphed_callables_kwargs['sample_kwargs']
 
         # Basic checks
@@ -636,11 +636,10 @@ class TestTECudaGraphHelper:
         else:
             expected_length = num_graphable_layers
         assert len(sample_args) == expected_length, (
-            f"sample_args length mismatch: expected {expected_length}, " f"got {len(sample_args)}"
+            f"sample_args length mismatch: expected {expected_length}, got {len(sample_args)}"
         )
         assert len(sample_kwargs) == expected_length, (
-            f"sample_kwargs length mismatch: expected {expected_length}, "
-            f"got {len(sample_kwargs)}"
+            f"sample_kwargs length mismatch: expected {expected_length}, got {len(sample_kwargs)}"
         )
 
         # Check that all elements are not None
@@ -757,15 +756,15 @@ class TestTECudaGraphHelper:
                 assert max_reuse > 1, "Expected some buffer reuse"
 
         # Verify that make_graphed_callables_kwargs contains expected keys
-        assert (
-            '_order' in make_graphed_callables_kwargs
-        ), "make_graphed_callables_kwargs should contain '_order'"
-        assert (
-            'num_warmup_iters' in make_graphed_callables_kwargs
-        ), "make_graphed_callables_kwargs should contain 'num_warmup_iters'"
-        assert (
-            'allow_unused_input' in make_graphed_callables_kwargs
-        ), "make_graphed_callables_kwargs should contain 'allow_unused_input'"
+        assert '_order' in make_graphed_callables_kwargs, (
+            "make_graphed_callables_kwargs should contain '_order'"
+        )
+        assert 'num_warmup_iters' in make_graphed_callables_kwargs, (
+            "make_graphed_callables_kwargs should contain 'num_warmup_iters'"
+        )
+        assert 'allow_unused_input' in make_graphed_callables_kwargs, (
+            "make_graphed_callables_kwargs should contain 'allow_unused_input'"
+        )
 
         # Verify the order in kwargs matches expectations
         order = make_graphed_callables_kwargs['_order']
@@ -782,9 +781,9 @@ class TestTECudaGraphHelper:
             assert num_model_chunks == 1, "Expected only one model chunk for pp_size == 1"
             assert forward_count == 1, "Expected only one forward pass for pp_size == 1"
             expected_order_length = 2
-        assert (
-            len(order) == expected_order_length
-        ), f"Order length mismatch: expected {expected_order_length}, got {len(order)}"
+        assert len(order) == expected_order_length, (
+            f"Order length mismatch: expected {expected_order_length}, got {len(order)}"
+        )
 
 
 def is_deep_ep_available():
@@ -1085,7 +1084,6 @@ class TestPartialCudaGraph:
 
 
 if __name__ == "__main__":
-
     test = TestParallelTransformerBlockCudagraphs()
     test.setup_method(method=None)
     test.test_gpu_cudagraph()

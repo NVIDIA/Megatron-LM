@@ -1,5 +1,5 @@
 # Copyright (c) 2024, NVIDIA CORPORATION.  All rights reserved.
-""""
+""" "
 NOTE: NVLM uses InternViT with tensor parallel (TP) size = 8.
 Since InternViT has 25 attention heads and Megatron currently requires the number of attention heads
 to be divisible by the TP size, we add 7 dummy zero attention heads to have 32 attention heads.
@@ -10,6 +10,7 @@ Additionally, InternViT introduces some unique features like Layer Scaling.
 
 Those code changes are gathered here.
 """
+
 from functools import partial
 
 import torch
@@ -36,13 +37,13 @@ from megatron.core.transformer.mlp import MLP, MLPSubmodules
 from megatron.core.transformer.module import MegatronModule
 from megatron.core.transformer.spec_utils import ModuleSpec
 from megatron.core.transformer.transformer_config import TransformerConfig
-from megatron.core.transformer.transformer_layer import TransformerLayer, TransformerLayerSubmodules
+from megatron.core.transformer.transformer_layer import TransformerLayerSubmodules
 from megatron.core.transformer.utils import make_sharded_tensors_for_checkpoint
 from megatron.core.typed_torch import not_none
 from megatron.core.utils import divide
 
 try:
-    import apex
+    import apex  # noqa: F401
 
     from megatron.core.fusions.fused_layer_norm import FusedLayerNorm
     from megatron.core.transformer.torch_norm import WrappedTorchNorm
@@ -59,7 +60,6 @@ except ImportError:
 
 
 class InternViTRMSNorm(MegatronModule):
-
     def __init__(
         self,
         config: TransformerConfig,
@@ -148,7 +148,6 @@ class InternViTRMSNorm(MegatronModule):
         return output.sum(-1, keepdim=True)
 
     def sharded_state_dict(self, prefix='', sharded_offsets=(), metadata={}):
-
         # in InternVitSelfAttention the q_layernorm and k_layernorm weights
         # are tensor-parallel so must be converted to sharded tensors
         if 'q_layernorm' in prefix or 'k_layernorm' in prefix:

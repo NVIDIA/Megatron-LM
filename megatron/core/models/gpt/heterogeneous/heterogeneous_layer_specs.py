@@ -31,7 +31,7 @@ from megatron.core.typed_torch import not_none
 from megatron.core.utils import is_te_min_version
 
 try:
-    import transformer_engine as te  # pylint: disable=unused-import
+    import transformer_engine as te  # noqa: F401
 
     from megatron.core.extensions.transformer_engine import (
         TEDotProductAttention,
@@ -57,7 +57,7 @@ except ImportError:
 from megatron.core.transformer.torch_norm import WrappedTorchNorm
 
 try:
-    import apex  # pylint: disable=unused-import
+    import apex  # noqa: F401
 
     from megatron.core.fusions.fused_layer_norm import FusedLayerNorm
 

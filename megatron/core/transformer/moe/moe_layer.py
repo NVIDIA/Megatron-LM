@@ -30,7 +30,7 @@ from megatron.core.typed_torch import apply_module
 from megatron.core.utils import internal_api
 
 try:
-    import transformer_engine as te  # pylint: disable=unused-import
+    import transformer_engine as te  # noqa: F401
 
     from megatron.core.extensions.transformer_engine import TELinear, te_checkpoint
 
@@ -271,9 +271,9 @@ class MoELayer(BaseMoELayer):
         """
         # Project the hidden_states from hidden dimension down to latent dimenion.
         if self.config.moe_latent_size:
-            assert (
-                not self.shared_expert_overlap
-            ), "Shared expert overlap not supported when MoE latent projections are used."
+            assert not self.shared_expert_overlap, (
+                "Shared expert overlap not supported when MoE latent projections are used."
+            )
             hidden_states, _ = self.fc1_latent_proj(hidden_states)
         hidden_states, probs = self.token_dispatcher.dispatch_preprocess(
             hidden_states, routing_map, probs
@@ -418,9 +418,9 @@ class MoELayer(BaseMoELayer):
 
                 dispatched_input, probs = self.dispatch(hidden_states, probs)
                 output, mlp_bias = self.routed_experts_compute(dispatched_input, probs)
-                assert (
-                    mlp_bias is None
-                ), f"mlp_bias is not supported for {type(self.token_dispatcher)}"
+                assert mlp_bias is None, (
+                    f"mlp_bias is not supported for {type(self.token_dispatcher)}"
+                )
                 output = self.combine(output)
 
                 if intermediate_tensors is not None:

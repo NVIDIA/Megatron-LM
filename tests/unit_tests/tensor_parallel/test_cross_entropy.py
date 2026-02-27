@@ -1,4 +1,3 @@
-import numpy as np
 import torch
 
 from megatron.core.tensor_parallel.cross_entropy import vocab_parallel_cross_entropy

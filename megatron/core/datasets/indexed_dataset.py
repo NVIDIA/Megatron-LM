@@ -29,9 +29,9 @@ except ModuleNotFoundError:
 
 import torch
 
-from megatron.core.datasets.object_storage_utils import S3Config  # pylint: disable=unused-import
 from megatron.core.datasets.object_storage_utils import (
     ObjectStorageConfig,
+    S3Config,  # noqa: F401
     cache_index_file,
     dataset_exists,
     get_index_cache_path,
@@ -481,13 +481,13 @@ class _FileBinReader(_BinReader):
                 time_str = datetime.now().strftime('%Y-%m-%d %H:%M:%S.%f')
                 if i == self.num_max_retries:
                     logger.warning(
-                        f"[{time_str}] {self.num_max_retries+1} total tries to read data item "
+                        f"[{time_str}] {self.num_max_retries + 1} total tries to read data item "
                         f"failed; going to abort and re-raise exception \"{e}\"..."
                     )
                     # Re-raise exception if in last iteration of for loop.
                     raise e
                 logger.warning(
-                    f"[{time_str}] Attempt {i+1}/{self.num_max_retries+1} to read data item "
+                    f"[{time_str}] Attempt {i + 1}/{self.num_max_retries + 1} to read data item "
                     f"failed with exception \"{e}\"; going to sleep for {sleep_duration} "
                     "seconds and then re-try..."
                 )

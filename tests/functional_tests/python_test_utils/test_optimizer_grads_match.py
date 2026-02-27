@@ -69,7 +69,8 @@ def expected_rel_bound(
     - L is hard-coded default to 32 per your request.
     - C is 'close to 1'; 1.01–1.05 are reasonable defaults.
     - k absorbs the hidden constant in big-O; 2–8 are common choices.
-    - dtype controls eps_mch; for FP8 use BF16 epsilon (see https://www.arxiv.org/pdf/2506.09280 theorem 5.3).
+    - dtype controls eps_mch; for FP8 use BF16 epsilon
+      (see https://www.arxiv.org/pdf/2506.09280 theorem 5.3).
     """
     eps_mch = machine_epsilon_for_dtype(dtype or torch.bfloat16)
     depth = L + 1 - l  # 1-based depth from the top (as in the theorem)
@@ -116,7 +117,7 @@ def assert_grads_close(left: torch.Tensor, right: torch.Tensor):
         left, right, l=0, dtype=torch.bfloat16
     )  # hard code to layer 0 since that's the most permissive
 
-    # If the real test above fails, run an assert close for the useful diagnostics and raise either way.
+    # If the real test above fails, run an assert close for the useful diagnostics and raise either way.  # noqa: E501
     if not ok:
         rel_shuff, _, ok_shuff = check_gradient(
             left, torch.roll(right, shifts=-1, dims=-1), l=0, dtype=torch.bfloat16
@@ -134,7 +135,7 @@ def assert_grads_close(left: torch.Tensor, right: torch.Tensor):
         except AssertionError as e:
             msg = (
                 "AssertionError on relative norm magnitude "
-                f"(rel={rel}, bnd={bnd}, ok={ok}, rel_shuff={rel_shuff}, ok_shuff={ok_shuff}): {e}\n"
+                f"(rel={rel}, bnd={bnd}, ok={ok}, rel_shuff={rel_shuff}, ok_shuff={ok_shuff}): {e}\n"  # noqa: E501
                 f"Left: {left.shape}/{left.dtype} {left}\n"
                 f"Right: {right.shape}/{right.dtype} {right}"
             )
@@ -163,9 +164,9 @@ def _assert_optimizer_tensors_equal(
 
     only_left = sorted(left_keys - right_keys)
     only_right = sorted(right_keys - left_keys)
-    assert (
-        not only_left and not only_right
-    ), f"Optimizer tensor keys mismatch.\nOnly in left: {only_left}\nOnly in right: {only_right}"
+    assert not only_left and not only_right, (
+        f"Optimizer tensor keys mismatch.\nOnly in left: {only_left}\nOnly in right: {only_right}"
+    )
     some_non_zero = False
     assertions = []
     for key in sorted(left_keys):
@@ -175,9 +176,9 @@ def _assert_optimizer_tensors_equal(
             # "Tensor shape mismatch for {key}: {lt.shape} vs {rt.shape}, trying simple reshape
             original_key = key.replace("optimizer.state.exp_avg.", "")
             # Unsharded shape
-            # {'decoder.layers.self_attention.linear_proj.weight': torch.Size([32, 3072, 4096]), 'optimizer.state.exp_avg.decoder.layers.self_attention.linear_proj.weight': torch.Size([32, 1, 1, 12582912]), 'optimizer.state.exp_avg_sq.decoder.layers.self_attention.linear_proj.weight': torch.Size([32, 1, 1, 12582912]), 'optimizer.state.fp32_param.decoder.layers.self_attention.linear_proj.weight': torch.Size([32, 1, 1, 12582912])}
+            # {'decoder.layers.self_attention.linear_proj.weight': torch.Size([32, 3072, 4096]), 'optimizer.state.exp_avg.decoder.layers.self_attention.linear_proj.weight': torch.Size([32, 1, 1, 12582912]), 'optimizer.state.exp_avg_sq.decoder.layers.self_attention.linear_proj.weight': torch.Size([32, 1, 1, 12582912]), 'optimizer.state.fp32_param.decoder.layers.self_attention.linear_proj.weight': torch.Size([32, 1, 1, 12582912])}  # noqa: E501
             # Sharded shape
-            # {'decoder.layers.self_attention.linear_proj.weight': torch.Size([32, 3072, 4096]), 'optimizer.state.exp_avg.decoder.layers.self_attention.linear_proj.weight': torch.Size([32, 1, 2, 6291456]), 'optimizer.state.exp_avg_sq.decoder.layers.self_attention.linear_proj.weight': torch.Size([32, 1, 2, 6291456]), 'optimizer.state.fp32_param.decoder.layers.self_attention.linear_proj.weight': torch.Size([32, 1, 2, 6291456])}
+            # {'decoder.layers.self_attention.linear_proj.weight': torch.Size([32, 3072, 4096]), 'optimizer.state.exp_avg.decoder.layers.self_attention.linear_proj.weight': torch.Size([32, 1, 2, 6291456]), 'optimizer.state.exp_avg_sq.decoder.layers.self_attention.linear_proj.weight': torch.Size([32, 1, 2, 6291456]), 'optimizer.state.fp32_param.decoder.layers.self_attention.linear_proj.weight': torch.Size([32, 1, 2, 6291456])}  # noqa: E501
             left_shape = left_empty[original_key].shape
             right_shape = right_empty[original_key].shape
             skip_tp_check = False
@@ -218,7 +219,7 @@ def _assert_optimizer_tensors_equal(
                 try:
                     rt = rt.reshape(lt.shape)
                 except Exception as e:
-                    msg = f"Tensor shape mismatch for {key}: {lt.shape} vs {rt.shape}, simple reshape failed: {e}"
+                    msg = f"Tensor shape mismatch for {key}: {lt.shape} vs {rt.shape}, simple reshape failed: {e}"  # noqa: E501
                     if "embedding.word_embeddings.weight" in key or ".output_layer.weight" in key:
                         print(
                             f"FIXME: Skipping {key} because it's a word embedding or output layer,"
@@ -227,9 +228,9 @@ def _assert_optimizer_tensors_equal(
                         continue
                     raise AssertionError(msg)
 
-        assert (
-            lt.shape == rt.shape and lt.dtype == rt.dtype
-        ), f"Tensor meta mismatch for {key}: {lt.shape}/{lt.dtype} vs {rt.shape}/{rt.dtype}"
+        assert lt.shape == rt.shape and lt.dtype == rt.dtype, (
+            f"Tensor meta mismatch for {key}: {lt.shape}/{lt.dtype} vs {rt.shape}/{rt.dtype}"
+        )
         # Reduce the rate of 0 vs near 0 rtol failures by adding a small epsilon
         left_scale = torch.max(torch.abs(lt))
         right_scale = torch.max(torch.abs(rt))

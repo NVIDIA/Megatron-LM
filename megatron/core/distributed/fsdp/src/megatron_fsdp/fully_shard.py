@@ -338,7 +338,7 @@ def fully_shard_model(
         overlap_grad_reduce=overlap_grad_reduce,
         overlap_param_gather=overlap_param_gather,
         average_in_collective=average_in_collective,
-        keep_fp8_transpose_cache=keep_fp8_transpose_cache,  # pylint: disable=C0301
+        keep_fp8_transpose_cache=keep_fp8_transpose_cache,  # noqa: E501
         nccl_ub=nccl_ub,
         fsdp_double_buffer=fsdp_double_buffer or nccl_ub,
         fsdp_db_use_persist_buf_on_alloc_fail=fsdp_db_use_persist_buf_on_alloc_fail,

@@ -142,9 +142,9 @@ class TestStaticInferenceEngine(StaticInferenceEngineTestHarness):
 
             assert len(results) == batch_size
             for result in results:
-                assert (
-                    result.status == Status.COMPLETED
-                ), f"Status should be completed but its {result.status}"
+                assert result.status == Status.COMPLETED, (
+                    f"Status should be completed but its {result.status}"
+                )
                 assert result.generated_length > 0, f"Generated length should be greater than zero"
                 assert result.generated_text is not None, f'Generated text should not be None'
 
@@ -171,9 +171,9 @@ class TestStaticInferenceEngine(StaticInferenceEngineTestHarness):
             random.choices(string.ascii_letters, k=random.randint(4, 10))
         )
         assert hasattr(self.static_engine, 'dynamic_engine'), "Dynamic engine not initialized"
-        assert (
-            self.static_engine.legacy is False
-        ), "Using legacy static engine when it should be using dynamic engine"
+        assert self.static_engine.legacy is False, (
+            "Using legacy static engine when it should be using dynamic engine"
+        )
 
         for _ in range(num_trials):
             if empty_prompt:
@@ -191,9 +191,9 @@ class TestStaticInferenceEngine(StaticInferenceEngineTestHarness):
                 assert isinstance(result, InferenceRequest), (
                     "expected <InferenceRequest>; found <%s>." % type(result).__name__
                 )
-                assert (
-                    result.status == Status.COMPLETED
-                ), f"Status should be completed but its {result.status}"
+                assert result.status == Status.COMPLETED, (
+                    f"Status should be completed but its {result.status}"
+                )
                 assert result.generated_length > 0, f"Generated length should be greater than zero"
                 assert result.generated_text is not None, f'Generated text should not be None'
 
@@ -209,20 +209,20 @@ class TestStaticInferenceEngine(StaticInferenceEngineTestHarness):
             num_output_tokens = 0
             async for output in stream_generator:
                 num_output_tokens += 1
-                assert isinstance(
-                    output, InferenceRequest
-                ), f"Expected InferenceRequest, got {type(output)}"
+                assert isinstance(output, InferenceRequest), (
+                    f"Expected InferenceRequest, got {type(output)}"
+                )
                 assert output.generated_log_probs is not None, f"Expected log probs tensor"
-                assert (
-                    output.generated_tokens.shape[0] == output.generated_length
-                ), f"Expected log probs length to match # generated tokens"
-                assert (
-                    len(output.generated_log_probs) == output.generated_length
-                ), f"Expected log probs length to match # generated tokens"
+                assert output.generated_tokens.shape[0] == output.generated_length, (
+                    f"Expected log probs length to match # generated tokens"
+                )
+                assert len(output.generated_log_probs) == output.generated_length, (
+                    f"Expected log probs length to match # generated tokens"
+                )
                 assert output.generated_length > prev_length, f"Expected generated length to grow"
-                assert (
-                    output.generated_text[:prev_idx] == prev_text
-                ), f"Expected generated text to match previous text"
+                assert output.generated_text[:prev_idx] == prev_text, (
+                    f"Expected generated text to match previous text"
+                )
                 assert (
                     prev_log_probs is None or prev_log_probs == output.generated_log_probs[:-1]
                 ), f"Expected previous log probs to match new log probs"
@@ -231,15 +231,15 @@ class TestStaticInferenceEngine(StaticInferenceEngineTestHarness):
                 prev_idx = len(output.generated_text)
                 prev_log_probs = output.generated_log_probs
 
-            assert (
-                num_output_tokens == num_tokens_to_generate
-            ), f"Should have streamed {num_tokens_to_generate} tokens but actually streamed {num_output_tokens}"
-            assert (
-                len(output.generated_tokens) == num_tokens_to_generate
-            ), f"Should have included {num_tokens_to_generate} tokens but actually returned {len(output.generated_tokens)}"
-            assert (
-                len(output.generated_log_probs) == num_tokens_to_generate
-            ), f"Should have included {num_tokens_to_generate} log probs but actually returned {len(output.generated_log_probs)}"
+            assert num_output_tokens == num_tokens_to_generate, (
+                f"Should have streamed {num_tokens_to_generate} tokens but actually streamed {num_output_tokens}"  # noqa: E501
+            )
+            assert len(output.generated_tokens) == num_tokens_to_generate, (
+                f"Should have included {num_tokens_to_generate} tokens but actually returned {len(output.generated_tokens)}"  # noqa: E501
+            )
+            assert len(output.generated_log_probs) == num_tokens_to_generate, (
+                f"Should have included {num_tokens_to_generate} log probs but actually returned {len(output.generated_log_probs)}"  # noqa: E501
+            )
 
             return output
 
@@ -350,8 +350,8 @@ class TestStaticInferenceEngine(StaticInferenceEngineTestHarness):
 
         assert len(results) == batch_size
         for result in results:
-            assert (
-                result.status == Status.COMPLETED
-            ), f"Status should be completed but its {result.status}"
+            assert result.status == Status.COMPLETED, (
+                f"Status should be completed but its {result.status}"
+            )
             assert result.generated_length > 0, f"Generated length should be greater than zero"
             assert result.generated_text is not None, f'Generated text should not be None'

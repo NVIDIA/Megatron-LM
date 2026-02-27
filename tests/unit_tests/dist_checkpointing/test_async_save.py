@@ -1,5 +1,4 @@
 # Copyright (c) 2024, NVIDIA CORPORATION. All rights reserved.
-from unittest import mock
 
 import pytest
 import torch

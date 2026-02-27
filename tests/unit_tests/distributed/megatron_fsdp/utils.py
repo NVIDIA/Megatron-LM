@@ -164,9 +164,7 @@ class GPTMockDataset(Dataset):
 
 
 def _forward_step_func(data_iterator, model, device="cuda"):
-
     def loss_func(loss_mask: torch.Tensor, output_tensor: torch.Tensor):
-
         losses = output_tensor.float()
         loss_mask = loss_mask.view(-1).float()
         loss = torch.sum(losses.view(-1) * loss_mask) / loss_mask.sum()

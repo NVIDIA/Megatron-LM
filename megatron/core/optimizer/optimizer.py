@@ -25,7 +25,6 @@ except ImportError:
 
         multi_tensor_scale_impl = amp_C.multi_tensor_scale
     except ImportError:
-
         warnings.warn(
             'Transformer Engine and Apex are not installed. '
             'Falling back to local implementations of '
@@ -495,7 +494,6 @@ class MixedPrecisionOptimizer(MegatronOptimizer):
             self._copy_model_params_to_main_params(state_dict=state_dict)
 
     def _unscale_main_grads_and_check_for_nan(self):
-
         # Collect main grads.
         if not self.is_stub_optimizer:
             main_grads = self._collect_main_grad_data_for_unscaling()
@@ -539,7 +537,6 @@ class MixedPrecisionOptimizer(MegatronOptimizer):
         # Do unscale, check for inf, and update grad scaler only for
         # the case that grad scaler is provided.
         if self.grad_scaler:
-
             # Unscale and check for inf/nan.
             if timers is not None:
                 timers('optimizer-unscale-and-check-inf', log_level=1).start(
@@ -645,7 +642,6 @@ class Float16OptimizerWithFloat16Params(MixedPrecisionOptimizer):
         grad_scaler: MegatronGradScaler,
         init_state_fn: Callable,
     ):
-
         super().__init__(optimizer, config, grad_scaler, init_state_fn)
 
         # Handle main parameters.
@@ -667,7 +663,6 @@ class Float16OptimizerWithFloat16Params(MixedPrecisionOptimizer):
                 # For all the parameters in this group:
                 for i, param in enumerate(param_group['params']):
                     if param.requires_grad:
-
                         # float16 params:
                         if param.type() in ['torch.cuda.HalfTensor', 'torch.cuda.BFloat16Tensor']:
                             float16_params_this_group.append(param)
@@ -804,7 +799,6 @@ class Float16OptimizerWithFloat16Params(MixedPrecisionOptimizer):
         is_loading: bool = False,
         metadata: Optional[dict] = None,
     ):
-
         if is_loading:
             self.init_state_fn(self.optimizer, self.config)
 
@@ -1110,9 +1104,9 @@ class ChainedOptimizer(MegatronOptimizer):
         """
         Access underlying optimizer when only one optimizer included for backward compatibility.
         """
-        assert (
-            len(self.chained_optimizers) == 1
-        ), "ChainedOptimizer has more than one optimizer when accessing self.optimizer"
+        assert len(self.chained_optimizers) == 1, (
+            "ChainedOptimizer has more than one optimizer when accessing self.optimizer"
+        )
         return self.chained_optimizers[0].optimizer
 
     @property
@@ -1170,9 +1164,9 @@ class ChainedOptimizer(MegatronOptimizer):
                     if hasattr(optimizer, "model_chunks"):
                         d = {}
                         for chunk_idx in range(len(optimizer.model_chunks)):
-                            assert (
-                                f"{prefix}{offset}" in state_dict
-                            ), f"Wrong state_dict format, cannot find '{prefix}{offset}'"
+                            assert f"{prefix}{offset}" in state_dict, (
+                                f"Wrong state_dict format, cannot find '{prefix}{offset}'"
+                            )
                             d[f"{prefix}{chunk_idx}"] = state_dict[f"{prefix}{offset}"]
                             offset += 1
                         if len(d) > 0:

@@ -9,9 +9,6 @@ import torch
 from modelopt.torch.quantization.utils import is_quantized
 from packaging.version import Version
 
-from megatron.core import parallel_state
-from megatron.training.utils import unwrap_model
-
 
 def modelopt_version_higher_than(target_version: str):
     """Check if Model-Optimizer is greater than this version."""
@@ -23,6 +20,7 @@ def modelopt_version_higher_than(target_version: str):
     )
     print(info)
     return Version(modelopt.__version__) > Version(target_version)
+
 
 def modelopt_version_at_least(target_version: str):
     """Check if Model-Optimizer is greater or equal than this version."""
@@ -40,6 +38,7 @@ def function_has_parameter(function, argument_name: str) -> bool:
     """Check if a function has a specific argument."""
     sig = inspect.signature(function)
     return argument_name in sig.parameters
+
 
 def get_current_memory_info():
     """Get current memory usage."""
@@ -110,7 +109,7 @@ def print_distributed_quant_summary(model, msg=""):
     if not is_quantized(unwrapped_model):
         return
 
-    print_rank_0(f"{msg}\nQuantization summary of unwrapped model: {unwrapped_model}\n{'_'*80}")
+    print_rank_0(f"{msg}\nQuantization summary of unwrapped model: {unwrapped_model}\n{'_' * 80}")
 
     if not torch.distributed.is_initialized():
         mtq.print_quant_summary(unwrapped_model)

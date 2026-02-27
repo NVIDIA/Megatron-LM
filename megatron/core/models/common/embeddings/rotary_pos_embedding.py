@@ -5,10 +5,10 @@ from __future__ import annotations
 from typing import TYPE_CHECKING, List, Optional
 
 if TYPE_CHECKING:
-    from megatron.core.transformer.transformer_config import TransformerConfig
-    from megatron.core.transformer.transformer_block import TransformerBlock
     from megatron.core.inference.contexts import BaseInferenceContext
     from megatron.core.packed_seq_params import PackedSeqParams
+    from megatron.core.transformer.transformer_block import TransformerBlock
+    from megatron.core.transformer.transformer_config import TransformerConfig
 
 import logging
 import math
@@ -18,7 +18,7 @@ import torch
 from torch import Tensor, nn
 
 from megatron.core import parallel_state
-from megatron.core.models.common.embeddings.rope_utils import (  # for backward compatibility; pylint: disable=unused-import
+from megatron.core.models.common.embeddings.rope_utils import (  # for backward compatibility  # noqa: F401, E501
     _apply_rotary_pos_emb_bshd,
     _apply_rotary_pos_emb_thd,
     _rotate_half,

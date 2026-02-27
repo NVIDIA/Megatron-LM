@@ -61,12 +61,12 @@ class InferenceClient:
             inference_coordinator_address (str): The address on which the
                 inference coordinator is listening.
         """
-        assert (
-            HAVE_ZMQ
-        ), "please install the pyzmq library to use InferenceClient - pip install pyzmq"
-        assert (
-            HAVE_MSGPACK
-        ), "please install the messagepack library to use InferenceClient - pip install msgpack"
+        assert HAVE_ZMQ, (
+            "please install the pyzmq library to use InferenceClient - pip install pyzmq"
+        )
+        assert HAVE_MSGPACK, (
+            "please install the messagepack library to use InferenceClient - pip install msgpack"
+        )
         self.context = zmq.Context()
         socket = self.context.socket(zmq.DEALER)
         socket.connect(inference_coordinator_address)

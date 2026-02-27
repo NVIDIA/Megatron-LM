@@ -104,9 +104,9 @@ class RouterReplay:
         self.router_replay_action: Optional[RouterReplayAction] = (
             None  # Router replay action for this layer
         )
-        self.replay_backward_list: List[torch.Tensor] = (
-            []
-        )  # List of tensors for backward pass replay
+        self.replay_backward_list: List[
+            torch.Tensor
+        ] = []  # List of tensors for backward pass replay
         self.static_buffer: Optional[torch.Tensor] = None  # Static buffer for CUDA graph
         RouterReplay.global_router_replay_instances.append(self)
 

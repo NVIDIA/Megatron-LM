@@ -21,10 +21,9 @@ from megatron.core.post_training.modelopt.gpt.state_dict_hooks import (
     mcore_gpt_load_te_state_dict_pre_hook,
 )
 from megatron.post_training.checkpointing import load_modelopt_checkpoint, load_modelopt_state
+from megatron.post_training.utils import print_distributed_quant_summary
 from megatron.training import get_args, print_rank_0
 from megatron.training.arguments import core_transformer_config_from_args
-
-from megatron.post_training.utils import print_distributed_quant_summary
 
 
 def count_parameters_in_layer(model, layer_name):
@@ -37,8 +36,7 @@ def count_parameters_in_layer(model, layer_name):
 
 
 def _add_load_convert_hooks(model: MCoreGPTModel):
-    """Register some load_state_dict prehooks to handle some known state_dict key mismatch.
-    """
+    """Register some load_state_dict prehooks to handle some known state_dict key mismatch."""
     args = get_args()
     if args.export_te_mcore_model:
         model._register_load_state_dict_pre_hook(mcore_gpt_load_te_state_dict_pre_hook)
@@ -47,8 +45,10 @@ def _add_load_convert_hooks(model: MCoreGPTModel):
 def _load_teacher_model_config(checkpoint_path: str) -> Namespace:
     """Reads teacher config from a file.
 
-    The config provided, either in the teacher checkpoint dir or via `--export-kd-teacher-model-config`,
-    should specify (in NeMo yaml config format) any model architecture settings which differ from the main student model's.
+    The config provided, either in the teacher checkpoint dir or
+    via `--export-kd-teacher-model-config`,
+    should specify (in NeMo yaml config format) any model
+    architecture settings which differ from the main student model's.
     This function will translate NeMo field names to MCore as needed.
     """
     required_teacher_fields = (
@@ -74,7 +74,7 @@ def _load_teacher_model_config(checkpoint_path: str) -> Namespace:
 
     if missing_keys := [k for k in required_teacher_fields if k not in config]:
         raise ValueError(
-            f"Teacher model config file ({config_path}) missing the following required fields: {missing_keys}"
+            f"Teacher model config file ({config_path}) missing the following required fields: {missing_keys}"  # noqa: E501
         )
 
     if "encoder_seq_length" in config:
@@ -108,7 +108,9 @@ def _load_teacher_model_config(checkpoint_path: str) -> Namespace:
     return Namespace(**args_dict)
 
 
-def _load_teacher_model(config, config_raw: Namespace, model_kwargs: Dict[str, Any]) -> MCoreGPTModel:
+def _load_teacher_model(
+    config, config_raw: Namespace, model_kwargs: Dict[str, Any]
+) -> MCoreGPTModel:
     """Teacher model creator."""
     args = get_args()
 
@@ -126,13 +128,14 @@ def _load_teacher_model(config, config_raw: Namespace, model_kwargs: Dict[str, A
         # GPT layer spec needs re-creation since it depends on number of model layers.
         if config.heterogeneous_block_specs:
             model_kwargs["transformer_layer_spec"] = get_gpt_heterogeneous_layer_spec(
-                config=config,
-                use_te=(args.transformer_impl == "transformer_engine"),
+                config=config, use_te=(args.transformer_impl == "transformer_engine")
             )
         else:
             model_kwargs["transformer_layer_spec"] = get_gpt_modelopt_spec(
                 config=config,
-                local_core_attention=False if config.context_parallel_size > 1 else args.export_force_local_attention,
+                local_core_attention=False
+                if config.context_parallel_size > 1
+                else args.export_force_local_attention,
                 remap_te_layernorm=args.export_te_mcore_model,
                 real_quant_cfg=args.export_real_quant_cfg,
                 use_arbitrary_attention_mask=False,
@@ -140,7 +143,9 @@ def _load_teacher_model(config, config_raw: Namespace, model_kwargs: Dict[str, A
         teacher = MCoreGPTModel(config=config, **model_kwargs)
     _add_load_convert_hooks(teacher)
 
-    print_rank_0(f"Loading teacher as {type(teacher).__name__} from {args.export_kd_teacher_load} ...")
+    print_rank_0(
+        f"Loading teacher as {type(teacher).__name__} from {args.export_kd_teacher_load} ..."
+    )
     # [WAR]: load checkpoint will check checkpoint's saved args and rng state if not finetune.
     # To avoid error out on loading teacher's checkpoint, we temporarily set args.finetune to
     # True while loading the teacher checkpoint.
@@ -156,19 +161,16 @@ def _load_teacher_model(config, config_raw: Namespace, model_kwargs: Dict[str, A
 
 
 def modelopt_gpt_mamba_builder(
-    args,
-    pre_process,
-    post_process,
-    vp_stage=None,
-    config=None,
-    pg_collection=None,
+    args, pre_process, post_process, vp_stage=None, config=None, pg_collection=None
 ) -> MCoreGPTModel | MCoreMambaModel:
     """Builds the model.
 
     Args:
         args (Namespace): The arguments namespace.
-        pre_process (bool, optional): Set to true if you need to compute embedings. Defaults to True.
-        post_process (bool, optional): Set to true if you need to want to compute output logits/loss. Defaults to True.
+        pre_process (bool, optional): Set to true if you need to
+            compute embedings. Defaults to True.
+        post_process (bool, optional): Set to true if you need to
+            want to compute output logits/loss. Defaults to True.
         vp_stage (int, optional): The virtual pipeline stage.
         config (TransformerConfig, optional): The configuration object.
         pg_collection (ProcessGroupCollection, optional): Collection of process groups
@@ -180,7 +182,7 @@ def modelopt_gpt_mamba_builder(
     """
     print_rank_0("building GPT model ...")
 
-    # ModelOpt by default assumes none homogenous layers. This affect the storage format of the sharded checkpoint.
+    # ModelOpt by default assumes none homogenous layers. This affect the storage format of the sharded checkpoint.  # noqa: E501
     config = core_transformer_config_from_args(args)
 
     # Handle GPT-OSS mode with YaRN RoPE configuration
@@ -199,7 +201,9 @@ def modelopt_gpt_mamba_builder(
         config.yarn_correction_range_round_to_int = False
 
     if vp_stage is not None:
-        raise ValueError("ModelOpt integration does not currently support virtual pipeline parallel.")
+        raise ValueError(
+            "ModelOpt integration does not currently support virtual pipeline parallel."
+        )
     if args.use_legacy_models:
         raise ValueError(
             "ModelOpt integration only support MCore models. Use --use-mcore-modules instead."
@@ -213,7 +217,7 @@ def modelopt_gpt_mamba_builder(
 
     if args.export_model_type == "GPTModel":
         if args.export_offline_model:
-            # Record the original num_layers. This is needed for _set_default_aux_hidden_state_layers
+            # Record the original num_layers. This is needed for _set_default_aux_hidden_state_layers  # noqa: E501
             config.original_num_layers = config.num_layers
             # Set num_layers to 0 for base model in offline mode
             config.num_layers = 0
@@ -222,15 +226,14 @@ def modelopt_gpt_mamba_builder(
             config.sequence_parallel = False
         if config.heterogeneous_block_specs:
             transformer_layer_spec = get_gpt_heterogeneous_layer_spec(
-                config=config,
-                use_te=args.transformer_impl == "transformer_engine",
+                config=config, use_te=args.transformer_impl == "transformer_engine"
             )
         else:
             if config.context_parallel_size > 1:
                 print_rank_0("context_parallel_size > 1! Force using TEDotProductAttention!")
-                local_core_attention=False
+                local_core_attention = False
             else:
-                local_core_attention=args.export_force_local_attention
+                local_core_attention = args.export_force_local_attention
 
             transformer_layer_spec = get_gpt_modelopt_spec(
                 config=config,
@@ -257,7 +260,9 @@ def modelopt_gpt_mamba_builder(
         }
         model = MCoreGPTModel(config=config, **model_kwargs)
     elif args.export_model_type == "MambaModel" or args.is_hybrid_model:
-        from megatron.core.post_training.modelopt.mamba.model_specs import get_mamba_stack_modelopt_spec
+        from megatron.core.post_training.modelopt.mamba.model_specs import (
+            get_mamba_stack_modelopt_spec,
+        )
 
         mamba_stack_spec = get_mamba_stack_modelopt_spec(
             remap_te_layernorm=args.export_te_mcore_model
@@ -293,7 +298,7 @@ def modelopt_gpt_mamba_builder(
     #
     # ModelOpt can create additional trainable parameters (e.g. for online speculative
     # decoding training or PEFT). Hence resuming modelopt_state during checkpoint loading is already
-    # too late since Megatron created the optimizer right after calling model_provider before loading
+    # too late since Megatron created the optimizer right after calling model_provider before loading  # noqa: E501
     # the checkpoint. To ensure all trainable parameters are reigistered, we try to resume the
     # modelopt_state (which transforms the model to have additional parameters) before returning.
     if args.load is not None:
@@ -308,22 +313,24 @@ def modelopt_gpt_mamba_builder(
         # NOTE: Unknown memory leak occuring per fwd-bwd pass if model
         # is converted to a `modelopt.torch.opt.DynamicModule`.
         # Argument `--manual-gc` can result in an eventual OOM.
-        assert (
-            not args.manual_gc
-        ), "ModelOpt Distillation currently incompatible with `--manual-gc` option."
-        assert (
-            not args.tp_comm_overlap
-        ), "ModelOpt Distillation currently incompatible with `--tp-comm-overlap` option."
-        assert (
-            args.cross_entropy_fusion_impl != "te"
-        ), "ModelOpt Distillation currently incompatible with TransformerEngine Cross-Entropy implementation."
+        assert not args.manual_gc, (
+            "ModelOpt Distillation currently incompatible with `--manual-gc` option."
+        )
+        assert not args.tp_comm_overlap, (
+            "ModelOpt Distillation currently incompatible with `--tp-comm-overlap` option."
+        )
+        assert args.cross_entropy_fusion_impl != "te", (
+            "ModelOpt Distillation currently incompatible with TransformerEngine Cross-Entropy implementation."  # noqa: E501
+        )
         if args.pipeline_model_parallel_size > 1:
-            assert (
-                args.virtual_pipeline_model_parallel_size is None
-            ), "ModelOpt Distillation currently incompatible with interleaved pipeline schedule."
+            assert args.virtual_pipeline_model_parallel_size is None, (
+                "ModelOpt Distillation currently incompatible with interleaved pipeline schedule."
+            )
 
         teacher_config_raw = _load_teacher_model_config(args.export_kd_teacher_load)
-        teacher_config = core_transformer_config_from_args(teacher_config_raw)  # convert to TransformerConfig
+        teacher_config = core_transformer_config_from_args(
+            teacher_config_raw
+        )  # convert to TransformerConfig
 
         distill_cfg = mtd_mcore.setup_distillation_config(
             args.export_kd_cfg, student_cfg=config, teacher_cfg=teacher_config
@@ -339,7 +346,9 @@ def modelopt_gpt_mamba_builder(
         # (accounts for sharded state, pipeline parallel, and potentially skipping LM loss)
         mtd_mcore.adjust_distillation_model_for_mcore(model, distill_cfg)
         # Also remove KD mode state to prevent issues with re-conversion after restore.
-        mto.ModeloptStateManager(model).state_dict().pop()  # TODO(aanoosheh): remove once fixed in ModelOpt
-    
+        mto.ModeloptStateManager(
+            model
+        ).state_dict().pop()  # TODO(aanoosheh): remove once fixed in ModelOpt
+
     print_distributed_quant_summary(model)
     return model

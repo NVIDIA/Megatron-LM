@@ -35,9 +35,7 @@ def rounder_override(n):
 
 
 class TestDynamicContext:
-
     def _setup_model_parallel_group(self, tensor_parallel_size, pipeline_parallel_size):
-
         self.pp_size = pipeline_parallel_size
 
         Utils.initialize_model_parallel(
@@ -410,7 +408,7 @@ class TestDynamicContext:
             == torch.arange(0, context_length, dtype=torch.long, device='cuda')
         )
 
-        # Verify token_to_block_idx and token_to_local_position_within_kv_block based on assigned blocks
+        # Verify token_to_block_idx and token_to_local_position_within_kv_block based on assigned blocks  # noqa: E501
         first_block_id = dynamic_context.request_to_kv_block_ids[0, 0]
         second_block_id = dynamic_context.request_to_kv_block_ids[0, 1]
 
@@ -512,12 +510,12 @@ class TestDynamicContext:
             dynamic_context.request_kv_block_counts[: len(requests)],
             torch.tensor([1, 2], device='cuda', dtype=torch.int32),
         )
-        assert torch.all(
-            dynamic_context.request_to_kv_block_ids[0, :1] == dummy_block_idx
-        ), "first request should use dummy block"
-        assert torch.all(
-            dynamic_context.request_to_kv_block_ids[1, :2] == dummy_block_idx
-        ), "second request should use dummy blocks"
+        assert torch.all(dynamic_context.request_to_kv_block_ids[0, :1] == dummy_block_idx), (
+            "first request should use dummy block"
+        )
+        assert torch.all(dynamic_context.request_to_kv_block_ids[1, :2] == dummy_block_idx), (
+            "second request should use dummy blocks"
+        )
         assert torch.all(dynamic_context.request_to_kv_block_ids[:2, 2:] == -1)
 
         assert torch.all(dynamic_context.request_last_kv_block_id[:2] == dummy_block_idx)
@@ -627,13 +625,13 @@ class TestDynamicContext:
         # This case would cover all cases
         # 1. Already there will be 2 paused requests
         # 2. Active request mask will have active and finished requests.
-        # 3. The active requests will also have some requests that have to be paused because of reaching max token limit within block
+        # 3. The active requests will also have some requests that have to be paused because of reaching max token limit within block  # noqa: E501
         # 4. Some of these requests will be resumed.
         # Setup is as follows :
         # Request ids 0, 1 are paused
         # Request ids 2, 4, 9 are active requests
         # Request ids 3 7 8 have completed
-        # Request ids 5 and 6 will require on more block later on because they finished their current block
+        # Request ids 5 and 6 will require on more block later on because they finished their current block  # noqa: E501
 
         dynamic_context = self._get_dynamic_context(
             params_dtype=torch.float32,
@@ -661,21 +659,21 @@ class TestDynamicContext:
             )
 
         total_request_count = 10
-        dynamic_context.block_allocator.total_avail -= 11  # We align 11 blocks to the 10 requests we have. 3rd request alone we setup like it requires 2 blocks
+        dynamic_context.block_allocator.total_avail -= 11  # We align 11 blocks to the 10 requests we have. 3rd request alone we setup like it requires 2 blocks  # noqa: E501
         dynamic_context.total_request_count = total_request_count
 
         dynamic_context.request_to_kv_block_ids[0:total_request_count, 0] = torch.arange(
             dynamic_context.block_allocator.total_avail,
             dynamic_context.block_allocator.total_avail + 10,
         )
-        dynamic_context.request_to_kv_block_ids[3][
-            1
-        ] = dynamic_context.block_allocator.total_avail  # Assign one extra block  to request 3.
+        dynamic_context.request_to_kv_block_ids[3][1] = (
+            dynamic_context.block_allocator.total_avail
+        )  # Assign one extra block  to request 3.
         dynamic_context.request_kv_length_offsets[0:total_request_count] = 10
-        # For 0, 1, 5, 6, the total number of tokens in last block is block size -1, so that they will all need extra blocks
+        # For 0, 1, 5, 6, the total number of tokens in last block is block size -1, so that they will all need extra blocks  # noqa: E501
         dynamic_context.request_kv_length_offsets[0:2] = dynamic_context.block_size_tokens - 1
         dynamic_context.request_kv_length_offsets[5:7] = dynamic_context.block_size_tokens - 1
-        # For the 3rd request, its completed and required 2 blocks. So we add more tokens than block size
+        # For the 3rd request, its completed and required 2 blocks. So we add more tokens than block size  # noqa: E501
         dynamic_context.request_kv_length_offsets[3] = dynamic_context.block_size_bytes + 10
         dynamic_context.request_query_lengths[0:total_request_count] = (
             1  # Everything is in decode phase
@@ -689,7 +687,7 @@ class TestDynamicContext:
         )
         dynamic_context.request_last_kv_block_id[3] = 11
         dynamic_context.request_last_kv_block_offset[0:total_request_count] = 10
-        # For the 3rd request, its completed and required 2 blocks. So we add more tokens than block size
+        # For the 3rd request, its completed and required 2 blocks. So we add more tokens than block size  # noqa: E501
         dynamic_context.request_last_kv_block_offset[0:2] = dynamic_context.block_size_tokens - 1
         dynamic_context.request_last_kv_block_offset[5:7] = dynamic_context.block_size_tokens - 1
 
@@ -865,7 +863,7 @@ class TestDynamicContext:
     @rounder_override(64)
     @pytest.mark.parametrize("is_hybrid_model", [False, True])
     def test_finished_requests_with_multiple_blocks(self, is_hybrid_model):
-        """Test that all memory blocks are correctly released for finished requests that use multiple blocks."""
+        """Test that all memory blocks are correctly released for finished requests that use multiple blocks."""  # noqa: E501
         self._setup_model_parallel_group(1, 1)
 
         dynamic_context = self._get_dynamic_context(
@@ -1148,7 +1146,7 @@ class TestDynamicContext:
         }
 
         # Simulate the step after adding the new prefill request.
-        # This step will involve both prefill (for the new request) and decode (for existing requests).
+        # This step will involve both prefill (for the new request) and decode (for existing requests).  # noqa: E501
 
         dynamic_context.initialize_attention_state()
 
@@ -1177,7 +1175,6 @@ class TestDynamicContext:
         # Verify log probs for the mixed step
         current_global_token_offset = 0
         for i, (req_id, data) in enumerate(request_data.items()):
-
             # This logic needs to consider if the request was new (prefill) or existing (decode)
             if req_id == new_request_id:
                 # This is the newly added prefill request
@@ -1284,9 +1281,9 @@ class TestDynamicContext:
 
         # Verify that there is only 1 unique value across all ranks
         unique_counts = set(all_counts)
-        assert (
-            len(unique_counts) == 1
-        ), f"Block counts were not synchronized across ranks. Gathered: {all_counts}"
+        assert len(unique_counts) == 1, (
+            f"Block counts were not synchronized across ranks. Gathered: {all_counts}"
+        )
 
     @pytest.mark.internal
     @pytest.mark.parametrize("ratio", [0.2, 0.4, 0.6, 0.8])

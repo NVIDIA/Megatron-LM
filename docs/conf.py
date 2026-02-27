@@ -20,7 +20,6 @@
 import os
 import sys
 
-
 # -- Project information -----------------------------------------------------
 # https://www.sphinx-doc.org/en/master/usage/configuration.html#project-information
 
@@ -75,22 +74,17 @@ if not skip_autodoc:
     ]
     autodoc2_render_plugin = "myst"  # Use MyST for rendering docstrings
     autodoc2_output_dir = "apidocs"  # Output directory for autodoc2 (relative to docs/)
-    # This is a workaround that uses the parser located in autodoc2_docstrings_parser.py to allow autodoc2 to
+    # This is a workaround that uses the parser located in autodoc2_docstrings_parser.py to allow autodoc2 to  # noqa: E501
     # render google style docstrings.
     # Related Issue: https://github.com/sphinx-extensions2/sphinx-autodoc2/issues/33
-    autodoc2_docstring_parser_regexes = [
-        (r".*", "docs.autodoc2_docstrings_parser"),
-    ]
+    autodoc2_docstring_parser_regexes = [(r".*", "docs.autodoc2_docstrings_parser")]
 
 # -- Options for HTML output -------------------------------------------------
 # https://www.sphinx-doc.org/en/master/usage/configuration.html#options-for-html-output
 
 html_theme = "nvidia_sphinx_theme"
 html_theme_options = {
-    "switcher": {
-        "json_url": "versions1.json",
-        "version_match": release,
-    },
+    "switcher": {"json_url": "versions1.json", "version_match": release},
     "icon_links": [
         {
             "name": "GitHub",
@@ -112,7 +106,4 @@ html_theme_options = {
 html_extra_path = ["project.json", "versions1.json"]
 
 # Github links are now getting rate limited from the Github Actions
-linkcheck_ignore = [
-    ".*github\\.com.*",
-    ".*githubusercontent\\.com.*",
-]
+linkcheck_ignore = [".*github\\.com.*", ".*githubusercontent\\.com.*"]

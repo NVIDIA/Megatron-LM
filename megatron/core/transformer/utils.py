@@ -1,6 +1,7 @@
 # Copyright (c) 2024, NVIDIA CORPORATION. All rights reserved.
 
 """Utilities for transformer layers."""
+
 from operator import itemgetter
 from typing import TYPE_CHECKING, Any, Dict, Iterable, Optional, Tuple, Union
 
@@ -17,7 +18,7 @@ from megatron.core.utils import (
 )
 
 if TYPE_CHECKING:
-    from megatron.core.transformer import TransformerConfig
+    pass
 
 
 def get_linear_layer(rows, columns, init_method, perform_initialization=True):
@@ -45,8 +46,7 @@ def get_sliding_window_causal_mask(sq, skv, window_size):
     return ml
 
 
-# pylint: disable=missing-function-docstring
-def attention_mask_func(attention_scores, attention_mask):
+def attention_mask_func(attention_scores, attention_mask):  # noqa: D103
     attention_scores.masked_fill_(attention_mask, -10000.0)
     return attention_scores
 
@@ -57,16 +57,14 @@ def gelu_impl(x):
     return 0.5 * x * (1.0 + torch.tanh(0.7978845608028654 * x * (1.0 + 0.044715 * x * x)))
 
 
-# pylint: disable=missing-function-docstring
-def openai_gelu(x):
+def openai_gelu(x):  # noqa: D103
     return gelu_impl(x)
 
 
 # This is actually Python equivalent of torch.nn.functional.gelu(), also with
 # type hints for ONNX exporter
-# pylint: disable=missing-function-docstring
 @jit_fuser
-def erf_gelu(x):
+def erf_gelu(x):  # noqa: D103
     return (
         x * 0.5 * (torch.erf(x / 1.41421).to(dtype=x.dtype) + torch.ones_like(x).to(dtype=x.dtype))
     )
@@ -176,15 +174,15 @@ def make_sharded_object_for_checkpoint(
 
 
 def _get_extra_state_offsets(
-    sharded_offsets: Iterable[Tuple[int, int, int]]
+    sharded_offsets: Iterable[Tuple[int, int, int]],
 ) -> Tuple[Tuple[int, ...], Tuple[int, ...]]:
     """Turns ShardedTensor offsets into offsets suitable for ShardedObject."""
     if sharded_offsets:
         sharded_offsets = sorted(sharded_offsets, key=itemgetter(0))  # sort by axis
         axis, extra_state_offset, extra_state_shape = zip(*sharded_offsets)
-        assert list(axis) == list(
-            range(len(axis))
-        ), f'Expected contiguous axis for offsets: {sharded_offsets}'
+        assert list(axis) == list(range(len(axis))), (
+            f'Expected contiguous axis for offsets: {sharded_offsets}'
+        )
     else:
         extra_state_shape = (1,)
         extra_state_offset = (0,)
@@ -462,6 +460,5 @@ def is_layer_window_attention(
         return bool(window_attn_skip_freq[layer_number - 1])
 
     raise ValueError(
-        f"Invalid `window_attn_skip_freq`: {type(window_attn_skip_freq)}, "
-        f"{window_attn_skip_freq}"
+        f"Invalid `window_attn_skip_freq`: {type(window_attn_skip_freq)}, {window_attn_skip_freq}"
     )

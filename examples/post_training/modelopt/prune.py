@@ -28,10 +28,7 @@ from megatron.post_training.arguments import add_modelopt_args
 from megatron.post_training.checkpointing import load_modelopt_checkpoint
 from megatron.post_training.generate import simple_generate
 from megatron.post_training.model_builder import modelopt_gpt_mamba_builder
-from megatron.post_training.utils import (
-    modelopt_version_at_least,
-    report_current_memory_info,
-)
+from megatron.post_training.utils import modelopt_version_at_least, report_current_memory_info
 from megatron.training import get_args, get_model, get_tokenizer, initialize_megatron
 from megatron.training.checkpointing import save_checkpoint
 from megatron.training.utils import print_rank_0, unwrap_model
@@ -71,12 +68,12 @@ def add_prune_args(parser):
     group.add_argument(
         "--target-num-attention-heads",
         type=int,
-        help="Prune number of attention heads to this value. Must be supplied with --target-num-query-groups",
+        help="Prune number of attention heads to this value. Must be supplied with --target-num-query-groups",  # noqa: E501
     )
     group.add_argument(
         "--target-num-query-groups",
         type=int,
-        help="Prune number of query groups to this value. Must be supplied with --target-num-attention-heads",
+        help="Prune number of query groups to this value. Must be supplied with --target-num-attention-heads",  # noqa: E501
     )
     group.add_argument(
         "--target-mamba-num-heads",
@@ -110,7 +107,7 @@ def add_prune_args(parser):
         type=int,
         metavar="N",
         nargs="*",
-        help="Drop specific model layers (1-indexed). Cannot be used with rest of the pruning options",
+        help="Drop specific model layers (1-indexed). Cannot be used with rest of the pruning options",  # noqa: E501
     )
     group.add_argument(
         "--pruning-scores-path",
@@ -225,12 +222,12 @@ if __name__ == "__main__":
             dummy_input=None,  # Not used
             config=config,
         )
-        # [WAR till modelopt 0.39]: Remove prune state to avoid converting again on restore which forces TP=1.
+        # [WAR till modelopt 0.39]: Remove prune state to avoid converting again on restore which forces TP=1.  # noqa: E501
         if mto.ModeloptStateManager.has_state_for_mode_type("prune", model=unwrapped_model):
             mto.ModeloptStateManager.remove_state(unwrapped_model)
 
     print_rank_0(f"Pruned Model:\n {unwrapped_model}")
-    print_rank_0(f"Pruned Model Params: {get_params(unwrapped_model)/1e9:.2f}B")
+    print_rank_0(f"Pruned Model Params: {get_params(unwrapped_model) / 1e9:.2f}B")
 
     _custom_prompt_forward_loop_func(unwrapped_model)
 

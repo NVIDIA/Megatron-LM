@@ -34,8 +34,6 @@ except ImportError:
 
 from modelopt.torch.export import import_mcore_gpt_from_hf
 
-from megatron.core import parallel_state
-from megatron.core.transformer.moe.router import TopKRouter
 from megatron.post_training.arguments import add_modelopt_args
 from megatron.post_training.checkpointing import load_modelopt_checkpoint
 from megatron.post_training.generate import simple_generate
@@ -326,7 +324,7 @@ if __name__ == "__main__":
 
     if args.force_all_expert_routing:
         warnings.warn(
-            "--force-all-expert-routing will be deprecated in the next release and is no longer needed."
+            "--force-all-expert-routing will be deprecated in the next release and is no longer needed."  # noqa: E501
         )
 
     if args.export_quant_cfg is not None:

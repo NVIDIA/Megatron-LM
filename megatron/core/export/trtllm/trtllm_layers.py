@@ -75,7 +75,6 @@ class TRTLLMLayers(Enum):
             # Return the original name if no number is found
             return layer_name, None
 
-    # pylint: disable=line-too-long
     @staticmethod
     def rename_input_layer_names_to_trtllm_layer_names(
         model_state_dict: dict,
@@ -88,21 +87,29 @@ class TRTLLMLayers(Enum):
         and map it to the equivalent TRTLLMLayer name (megatron/core/export/trtllm/trtllm).
         If we have a layer number associated with layer, we extract it out,
         map the original layer name to equivalent trtllm layer name and add layer number back.
-        CPU Conversion will pass in model state dict without layer numbers
-        (i.e decoder.layers.mlp.linear_fc1.weight of shape [num_layers, hidden_dim, 4 * hidden_dim]) .
-        GPU conversion will pass model state dict with each layer separated
-        (i.e decoder.layers.2.mlp.linear_fc1.weight of shape [hidden_dim, 4 * hidden_dim]).
+        CPU Conversion will pass in model state dict without layer
+        numbers (i.e decoder.layers.mlp.linear_fc1.weight of shape
+        [num_layers, hidden_dim, 4 * hidden_dim]).
+        GPU conversion will pass model state dict with each layer
+        separated (i.e decoder.layers.2.mlp.linear_fc1.weight of
+        shape [hidden_dim, 4 * hidden_dim]).
 
         Args:
             model_state_dict (dict): The original model state dict
-            trtllm_conversion_dict (dict): The conversion dictionary mapping input model layer names to trtllm layer names
-            state_dict_split_by_layer_numbers (bool, optional): Are the model layers split by layer numbers in state dict. For example : mlp.fc1.weight can be represented like mlp.fc1.weight of shape [num_layers, hidden_dim, ffn_hidden_dim]} or it can be like mlp.fc1.layers.0.weight of shape [hidden_dim, ffn_hidden_dim], then mlp.fc1.layers.1.weight ... for all layers. If you use represenation 2 set this to True. Defaults to True
+            trtllm_conversion_dict (dict): The conversion dictionary
+                mapping input model layer names to trtllm layer names
+            state_dict_split_by_layer_numbers (bool, optional): Are
+                the model layers split by layer numbers in state dict.
+                Defaults to True
 
         Raises:
-            ValueError: In case the keys dont match to trtllm keys or if all model layers are not mapped to equivalent trtllm keys
+            ValueError: In case the keys dont match to trtllm keys
+                or if all model layers are not mapped to equivalent
+                trtllm keys
 
         Returns:
-            dict: The model state dict with the key (i.e original model layer name) replaced by trtllm layer names
+            dict: The model state dict with the key (i.e original
+                model layer name) replaced by trtllm layer names
         """
         for original_model_layer_name in list(model_state_dict.keys()):
             if (
@@ -116,19 +123,19 @@ class TRTLLMLayers(Enum):
                 TRTLLMLayers.return_layer_name_and_number(original_model_layer_name)
             )
             if 'layers' in original_layer_name_without_number and state_dict_split_by_layer_numbers:
-                assert (
-                    layer_number is not None
-                ), f"Layer number is None for {original_model_layer_name} and state_dict_split_by_layer_numbers is set to True. Consider setting it False"
+                assert layer_number is not None, (
+                    f"Layer number is None for {original_model_layer_name} and state_dict_split_by_layer_numbers is set to True. Consider setting it False"  # noqa: E501
+                )
 
             if original_layer_name_without_number not in trtllm_conversion_dict:
                 raise ValueError(
-                    f'Unable to rename key {original_layer_name_without_number}. Provide an appropriate mapping in the trtllm_conversion_dict when you initialize TRTLLMHelper'
+                    f'Unable to rename key {original_layer_name_without_number}. Provide an appropriate mapping in the trtllm_conversion_dict when you initialize TRTLLMHelper'  # noqa: E501
                 )
 
             trtllm_layer = trtllm_conversion_dict[original_layer_name_without_number]
-            assert isinstance(
-                trtllm_layer, TRTLLMLayers
-            ), f"{trtllm_layer} is not supported for conversion. Please use one of the TRTLLMLayerNames we provided in megatron/core/export/trtllm/trtllm_layer_names"
+            assert isinstance(trtllm_layer, TRTLLMLayers), (
+                f"{trtllm_layer} is not supported for conversion. Please use one of the TRTLLMLayerNames we provided in megatron/core/export/trtllm/trtllm_layer_names"  # noqa: E501
+            )
 
             value = model_state_dict.pop(original_model_layer_name)
 

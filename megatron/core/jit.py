@@ -20,7 +20,6 @@ def enable_jit_fuser():
         if is_torch_min_version("2.2.0a0"):
             jit_fuser = torch.compile
     except ImportError:
-
         jit_fuser = noop_decorator
 
 

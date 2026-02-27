@@ -38,7 +38,8 @@ class TestEmbeddingAlignment:
 
         Args:
             num_embeddings: Number of embeddings to create
-            marker_positions: List of positions to place markers. If None, uses range(num_embeddings)
+            marker_positions: List of positions to place markers.
+                If None, uses range(num_embeddings)
             marker_values: List of values to use for markers. If None, uses [10.0, 20.0, ...]
 
         Returns:
@@ -343,17 +344,17 @@ class TestEmbeddingAlignment:
                 # Find the non-zero position
                 nonzero_indices = torch.nonzero(emb)
                 # Make sure we actually have non-zero values
-                assert (
-                    nonzero_indices.nelement() > 0
-                ), f"No non-zero values found at position {s},{b}"
+                assert nonzero_indices.nelement() > 0, (
+                    f"No non-zero values found at position {s},{b}"
+                )
                 nonzero_pos = nonzero_indices[0].item()
                 # Check that all other positions are zero
-                assert torch.all(
-                    emb[:nonzero_pos] == 0.0
-                ), f"Non-zero values found before marker at {s},{b}"
-                assert torch.all(
-                    emb[nonzero_pos + 1 :] == 0.0
-                ), f"Non-zero values found after marker at {s},{b}"
+                assert torch.all(emb[:nonzero_pos] == 0.0), (
+                    f"Non-zero values found before marker at {s},{b}"
+                )
+                assert torch.all(emb[nonzero_pos + 1 :] == 0.0), (
+                    f"Non-zero values found after marker at {s},{b}"
+                )
 
     def test_validation_errors(self):
         """Test validation errors when token counts don't match embedding counts."""

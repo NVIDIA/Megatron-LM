@@ -8,7 +8,6 @@ import torch.nn as nn
 import torch.nn.functional as F
 from packaging.version import Version
 
-from megatron.core import parallel_state
 from megatron.core.distributed import DistributedDataParallel, DistributedDataParallelConfig
 from megatron.core.optimizer import OptimizerConfig
 from megatron.core.optimizer.muon import TensorParallelMuon, get_megatron_muon_optimizer
@@ -83,15 +82,15 @@ def test_muon_optimizer_smoke():
     optimizer.step()
 
     # Verify weight was updated
-    assert not torch.equal(
-        model.weight.data, original_weight
-    ), "Weight should be updated after optimizer step"
+    assert not torch.equal(model.weight.data, original_weight), (
+        "Weight should be updated after optimizer step"
+    )
 
     # Test zero_grad
     optimizer.zero_grad()
-    assert model.weight.grad is None or torch.all(
-        model.weight.grad == 0
-    ), "Gradients should be zeroed"
+    assert model.weight.grad is None or torch.all(model.weight.grad == 0), (
+        "Gradients should be zeroed"
+    )
 
     # Test state_dict and load_state_dict
     state_dict = optimizer.state_dict()
@@ -193,9 +192,9 @@ class TestMuonOptimizerMultiRank:
         # Test zero_grad
         optimizer.zero_grad()
         for param in model.parameters():
-            assert param.grad is None or torch.all(
-                param.grad == 0
-            ), f"Gradients should be zeroed for all parameters"
+            assert param.grad is None or torch.all(param.grad == 0), (
+                f"Gradients should be zeroed for all parameters"
+            )
 
         # Test state_dict and load_state_dict
         state_dict = optimizer.state_dict()
@@ -275,9 +274,9 @@ class TestMuonOptimizerMultiRank:
         # Verify it's a LayerWiseDistributedOptimizer
         from megatron.core.optimizer.layer_wise_optimizer import LayerWiseDistributedOptimizer
 
-        assert isinstance(
-            optimizer, LayerWiseDistributedOptimizer
-        ), "Should return LayerWiseDistributedOptimizer"
+        assert isinstance(optimizer, LayerWiseDistributedOptimizer), (
+            "Should return LayerWiseDistributedOptimizer"
+        )
 
         # Test forward and backward pass
         input_tensor = torch.randn(16, 80, dtype=torch.bfloat16, device='cuda')
@@ -328,9 +327,9 @@ def test_muon_optimizer_different_modes_single_rank(mode):
     optimizer.step()
 
     # Verify weight was updated
-    assert not torch.equal(
-        model.weight.data, original_weight
-    ), f"Weight should be updated with mode={mode}"
+    assert not torch.equal(model.weight.data, original_weight), (
+        f"Weight should be updated with mode={mode}"
+    )
 
 
 @pytest.mark.skipif(
@@ -395,12 +394,13 @@ class TestMuonOptimizerMultiRankTP:
         optimizer.step()
 
         # Verify weight was updated
-        assert not torch.equal(
-            model.weight.data, original_weight
-        ), f"Weight should be updated with mode={mode}"
+        assert not torch.equal(model.weight.data, original_weight), (
+            f"Weight should be updated with mode={mode}"
+        )
 
     def test_muon_optimizer_blockwise_mode_different_result(self):
-        """Test that blockwise mode produces different results than duplicated/distributed with TP > 1."""
+        """Test that blockwise mode produces different results
+        than duplicated/distributed with TP > 1."""
         model, optimizer = self.create_tp_model_and_optimizer("blockwise")
 
         # Use fixed input for deterministic results
@@ -415,9 +415,9 @@ class TestMuonOptimizerMultiRankTP:
         optimizer.step()
 
         # Verify weight was updated
-        assert not torch.equal(
-            model.weight.data, original_weight
-        ), "Weight should be updated with mode=blockwise"
+        assert not torch.equal(model.weight.data, original_weight), (
+            "Weight should be updated with mode=blockwise"
+        )
 
 
 @pytest.mark.parametrize(
@@ -446,9 +446,11 @@ def test_muon_optimizer_coefficient_types(coefficient_type_and_steps):
     original_weight = model.weight.data.clone()
     optimizer.step()
 
-    assert not torch.equal(
-        model.weight.data, original_weight
-    ), f"Weight should be updated with coefficient_type={coefficient_type_and_steps[0]} and num_ns_steps={coefficient_type_and_steps[1]}"
+    assert not torch.equal(model.weight.data, original_weight), (
+        f"Weight should be updated with "
+        f"coefficient_type={coefficient_type_and_steps[0]} "
+        f"and num_ns_steps={coefficient_type_and_steps[1]}"
+    )
 
 
 @pytest.mark.parametrize("scale_mode", ["spectral", "unit_rms_norm", "shape_scaling"])
@@ -475,9 +477,9 @@ def test_muon_optimizer_scale_modes(scale_mode):
     original_weight = model.weight.data.clone()
     optimizer.step()
 
-    assert not torch.equal(
-        model.weight.data, original_weight
-    ), f"Weight should be updated with scale_mode={scale_mode}"
+    assert not torch.equal(model.weight.data, original_weight), (
+        f"Weight should be updated with scale_mode={scale_mode}"
+    )
 
 
 @pytest.mark.parametrize("use_nesterov", [True, False])
@@ -505,9 +507,9 @@ def test_muon_optimizer_nesterov(use_nesterov):
     original_weight = model.weight.data.clone()
     optimizer.step()
 
-    assert not torch.equal(
-        model.weight.data, original_weight
-    ), f"Weight should be updated with use_nesterov={use_nesterov}"
+    assert not torch.equal(model.weight.data, original_weight), (
+        f"Weight should be updated with use_nesterov={use_nesterov}"
+    )
 
 
 def test_muon_optimizer_multiple_steps():
@@ -540,9 +542,9 @@ def test_muon_optimizer_multiple_steps():
 
     # Verify weights changed at each step
     for i in range(len(weights_history) - 1):
-        assert not torch.equal(
-            weights_history[i], weights_history[i + 1]
-        ), f"Weight should change at step {i}"
+        assert not torch.equal(weights_history[i], weights_history[i + 1]), (
+            f"Weight should change at step {i}"
+        )
 
 
 def test_muon_optimizer_qkv_split():
@@ -581,9 +583,9 @@ def test_muon_optimizer_qkv_split():
     optimizer_split.step()
     weight_with_split = model.weight.data.clone()
 
-    assert not torch.equal(
-        weight_with_split, original_weight
-    ), "QKV weight should be updated with split_qkv=True"
+    assert not torch.equal(weight_with_split, original_weight), (
+        "QKV weight should be updated with split_qkv=True"
+    )
 
     # Reset model and test with split_qkv=False
     model.weight.data.fill_(1.0)
@@ -603,14 +605,14 @@ def test_muon_optimizer_qkv_split():
     optimizer_no_split.step()
     weight_without_split = model.weight.data.clone()
 
-    assert not torch.equal(
-        weight_without_split, original_weight
-    ), "QKV weight should be updated with split_qkv=False"
+    assert not torch.equal(weight_without_split, original_weight), (
+        "QKV weight should be updated with split_qkv=False"
+    )
 
     # Ensure the two results are different
-    assert not torch.equal(
-        weight_with_split, weight_without_split
-    ), "Weights should be different between split_qkv=True and split_qkv=False"
+    assert not torch.equal(weight_with_split, weight_without_split), (
+        "Weights should be different between split_qkv=True and split_qkv=False"
+    )
 
 
 def test_muon_optimizer_extra_scale_factor():
@@ -636,9 +638,9 @@ def test_muon_optimizer_extra_scale_factor():
     original_weight = model.weight.data.clone()
     optimizer.step()
 
-    assert not torch.equal(
-        model.weight.data, original_weight
-    ), "Weight should be updated with extra_scale_factor"
+    assert not torch.equal(model.weight.data, original_weight), (
+        "Weight should be updated with extra_scale_factor"
+    )
 
 
 @pytest.mark.parametrize("num_ns_steps", [5, 15, 25])
@@ -665,6 +667,6 @@ def test_muon_optimizer_num_ns_steps(num_ns_steps):
     original_weight = model.weight.data.clone()
     optimizer.step()
 
-    assert not torch.equal(
-        model.weight.data, original_weight
-    ), f"Weight should be updated with num_ns_steps={num_ns_steps}"
+    assert not torch.equal(model.weight.data, original_weight), (
+        f"Weight should be updated with num_ns_steps={num_ns_steps}"
+    )

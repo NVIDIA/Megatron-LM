@@ -1,24 +1,16 @@
 import logging
 import os
-import sys
 
 import pytest
 import torch
 import torch.distributed as dist
 from packaging import version
 
-from megatron.core import parallel_state
 from megatron.core.hyper_comm_grid import HyperCommGrid
-from megatron.core.model_parallel_config import ModelParallelConfig
 from megatron.core.models.gpt.gpt_layer_specs import get_gpt_layer_with_transformer_engine_spec
-from megatron.core.parallel_state import (
-    get_context_parallel_group,
-    get_expert_model_parallel_rank,
-    get_tensor_model_parallel_rank,
-)
+from megatron.core.parallel_state import get_context_parallel_group, get_tensor_model_parallel_rank
 from megatron.core.pipeline_parallel.bridge_communicator import BridgeCommunicator
 from megatron.core.process_groups_config import ProcessGroupCollection
-from megatron.core.tensor_parallel.layers import ColumnParallelLinear, RowParallelLinear
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
 from megatron.core.transformer.transformer_block import TransformerBlock
 from megatron.core.transformer.transformer_config import TransformerConfig
@@ -109,7 +101,7 @@ def _shard_and_copy_(
 
 
 def create_hypercomm_grid(offset=0, tp=1, cp=1, pp=1, dp=1):
-    """Create a HyperCommGrid with tensor parallelism=2, context parallelism=2, and data parallelism=2."""
+    """Create a HyperCommGrid with tensor parallelism=2, context parallelism=2, and data parallelism=2."""  # noqa: E501
     # Set up environment for world size 8 if not already set
     if not dist.is_initialized():
         raise RuntimeError("Distributed process group is not initialized")
@@ -181,7 +173,6 @@ def get_transformer_block_and_grid(
 
 
 class TestBridgeCommunicator:
-
     @classmethod
     def setup_class(cls):
         """Set up distributed environment for the entire test class."""
@@ -201,7 +192,6 @@ class TestBridgeCommunicator:
         Utils.destroy_model_parallel()
 
     def test_bridge_communicator_init(self):
-
         grid1 = create_hypercomm_grid(offset=0, tp=2, cp=1, pp=1, dp=2)
         grid2 = create_hypercomm_grid(offset=4, tp=2, cp=1, pp=1, dp=2)
         bridge_communicator = BridgeCommunicator(grid1, grid2)
@@ -225,11 +215,9 @@ class TestBridgeCommunicator:
         else:
             received_activation = bridge_communicator.recv_forward()
             # default assunes bsh
-            assert received_activation.shape == (
-                32,
-                128,
-                512,
-            ), f"Expected activation shape {(32, 128, 512)}, got {received_activation.shape}"
+            assert received_activation.shape == (32, 128, 512), (
+                f"Expected activation shape {(32, 128, 512)}, got {received_activation.shape}"
+            )
 
     def test_send_backward_recv_backward(self):
         """Test send_backward and recv_backward operations."""
@@ -248,11 +236,9 @@ class TestBridgeCommunicator:
 
         else:
             received_gradient = bridge_communicator.recv_backward()
-            assert received_gradient.shape == (
-                4,
-                128,
-                512,
-            ), f"Expected gradient shape {(4, 128, 512)}, got {received_gradient.shape}"
+            assert received_gradient.shape == (4, 128, 512), (
+                f"Expected gradient shape {(4, 128, 512)}, got {received_gradient.shape}"
+            )
 
     def test_send_forward_recv_backward_send_backward_recv_forward(self):
         """Test combined send_forward_recv_backward and send_backward_recv_forward operations."""
@@ -265,19 +251,17 @@ class TestBridgeCommunicator:
         if bridge_communicator.is_current_rank_in_grid(bridge_communicator.src_grid):
             random_hidden_state = torch.randn(16, 128, 512).cuda()
             received_grad = bridge_communicator.send_forward_recv_backward(random_hidden_state)
-            assert (
-                received_grad.shape == random_hidden_state.shape
-            ), f"Expected gradient shape {random_hidden_state.shape}, got {received_grad.shape}"
+            assert received_grad.shape == random_hidden_state.shape, (
+                f"Expected gradient shape {random_hidden_state.shape}, got {received_grad.shape}"
+            )
 
         else:
             random_grad_state = torch.randn(32, 128, 512).cuda()
             received_activation = bridge_communicator.send_backward_recv_forward(random_grad_state)
 
-            assert received_activation.shape == (
-                32,
-                128,
-                512,
-            ), f"Expected activation shape {random_grad_state.shape}, got {received_activation.shape}"
+            assert received_activation.shape == (32, 128, 512), (
+                f"Expected activation shape {random_grad_state.shape}, got {received_activation.shape}"  # noqa: E501
+            )
 
     @pytest.mark.skipif(
         version.parse(torch.__version__) < version.parse('2.3.0'),
@@ -295,7 +279,7 @@ class TestBridgeCommunicator:
     def test_bridge_communicator_with_transformer_blocks(
         self, grid1_tp, grid1_dp, grid2_tp, grid2_dp, parallel_state_tp
     ):
-        """Test bridge communicator with two transformer blocks having different process group configurations."""
+        """Test bridge communicator with two transformer blocks having different process group configurations."""  # noqa: E501
         hidden_size = 1024
         sequence_length = 16
         micro_batch_size = 8
@@ -352,9 +336,9 @@ class TestBridgeCommunicator:
                 micro_batch_size * factor if grid1_dp > grid2_dp else micro_batch_size // factor,
                 hidden_size,
             )
-            assert (
-                output_grid_2.shape == expected_output_shape
-            ), f"Output2 shape mismatch: {output_grid_2.shape}"
+            assert output_grid_2.shape == expected_output_shape, (
+                f"Output2 shape mismatch: {output_grid_2.shape}"
+            )
 
         global_block_1, _ = get_transformer_block_and_grid(
             ref_block,
@@ -383,7 +367,7 @@ class TestBridgeCommunicator:
                 )
             elif grid1_dp < grid2_dp:
                 print(
-                    f"output_grid_2 shape: {output_grid_2.shape} global_block_2_output shape: {global_block_2_output.shape}"
+                    f"output_grid_2 shape: {output_grid_2.shape} global_block_2_output shape: {global_block_2_output.shape}"  # noqa: E501
                 )
                 grid2_dp_ranks = grid_2._gen_rank_enum([x for x in grid_2.dim_names if x != "dp"])
                 global_block_2_chunks = torch.split(
@@ -428,15 +412,15 @@ class TestBridgeCommunicator:
 
         # For source grid (is_src=True), should return ranks from last pp stage
         src_boundary_ranks = bridge_communicator.get_boundary_pp_stage_ranks(grid, is_src=True)
-        assert (
-            src_boundary_ranks == expected_src_ranks
-        ), f"Source: Expected {expected_src_ranks}, got {src_boundary_ranks}"
+        assert src_boundary_ranks == expected_src_ranks, (
+            f"Source: Expected {expected_src_ranks}, got {src_boundary_ranks}"
+        )
 
         # For destination grid (is_src=False), should return ranks from first pp stage
         dest_boundary_ranks = bridge_communicator.get_boundary_pp_stage_ranks(grid, is_src=False)
-        assert (
-            dest_boundary_ranks == expected_dest_ranks
-        ), f"Dest: Expected {expected_dest_ranks}, got {dest_boundary_ranks}"
+        assert dest_boundary_ranks == expected_dest_ranks, (
+            f"Dest: Expected {expected_dest_ranks}, got {dest_boundary_ranks}"
+        )
 
     @pytest.mark.parametrize(
         "tp, cp, pp, dp, expected_src_leaders, expected_dest_leaders",
@@ -458,14 +442,14 @@ class TestBridgeCommunicator:
         grid = create_hypercomm_grid(offset=0, tp=tp, cp=cp, pp=pp, dp=dp)
         bridge_communicator = BridgeCommunicator(grid, grid)  # Using same grid for simplicity
 
-        # For source grid (is_src=True), should return leader ranks from last pp stage of each dp replica
+        # For source grid (is_src=True), should return leader ranks from last pp stage of each dp replica  # noqa: E501
         src_leaders, _ = bridge_communicator.get_leader_rank(grid, is_src=True)
-        assert (
-            src_leaders == expected_src_leaders
-        ), f"Source leaders: Expected {expected_src_leaders}, got {src_leaders}"
+        assert src_leaders == expected_src_leaders, (
+            f"Source leaders: Expected {expected_src_leaders}, got {src_leaders}"
+        )
 
-        # For destination grid (is_src=False), should return leader ranks from first pp stage of each dp replica
+        # For destination grid (is_src=False), should return leader ranks from first pp stage of each dp replica  # noqa: E501
         dest_leaders, _ = bridge_communicator.get_leader_rank(grid, is_src=False)
-        assert (
-            dest_leaders == expected_dest_leaders
-        ), f"Dest leaders: Expected {expected_dest_leaders}, got {dest_leaders}"
+        assert dest_leaders == expected_dest_leaders, (
+            f"Dest leaders: Expected {expected_dest_leaders}, got {dest_leaders}"
+        )

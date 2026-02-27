@@ -206,9 +206,7 @@ class MimoModel(MegatronModule):
 
         text_embeddings = self.language_model.embedding(
             input_ids=input_ids_text, position_ids=position_ids_text
-        ).squeeze(
-            1
-        )  # Shape: [num_text_tokens, hidden_dim]
+        ).squeeze(1)  # Shape: [num_text_tokens, hidden_dim]
         return text_embeddings
 
     def forward(

@@ -26,8 +26,7 @@ except ImportError:
         )
 
         # Apex's FusedAdam is a drop-in replacement for torch's AdamW.
-        # pylint: disable-next=line-too-long.
-        # See https://github.com/NVIDIA/apex/blob/7b73b12361068a10b0f44844534613f252a5ea75/apex/optimizers/fused_adam.py#L16.
+        # See https://github.com/NVIDIA/apex/blob/7b73b12361068a10b0f44844534613f252a5ea75/apex/optimizers/fused_adam.py#L16.  # noqa: E501
         from torch.optim import SGD
         from torch.optim import AdamW as Adam
 
@@ -83,8 +82,10 @@ def get_standard_config_overrides(config: OptimizerConfig) -> Dict[ParamKey, Par
     if config.apply_wd_to_qk_layernorm:
         shape_1_not_qkln_param = ParamWithNamePredicate(
             name="s1_not_qkln",
-            fn=lambda param, name: (len(param.shape) == 1 or name.endswith(".bias"))
-            and not ("q_layernorm." in name or "k_layernorm." in name),
+            fn=lambda param, name: (
+                (len(param.shape) == 1 or name.endswith(".bias"))
+                and not ("q_layernorm." in name or "k_layernorm." in name)
+            ),
         )
         param_wd_mult_key = ParamKey(with_name_predicate=shape_1_not_qkln_param)
     else:
@@ -214,9 +215,9 @@ def _get_param_groups(
             "max_lr": config.lr,  # user may override this in param_override
             "min_lr": config.min_lr,  # user may override this in param_override
         }
-        assert (
-            "params" not in param_override
-        ), "'params' should not be in param_override, this is a protected key"
+        assert "params" not in param_override, (
+            "'params' should not be in param_override, this is a protected key"
+        )
         param_group = {
             'params': params,
             'is_expert_parallel': is_expert_parallel,
@@ -309,9 +310,9 @@ def _get_megatron_optimizer_based_on_param_groups(
                     "CPU offload is recommended for PyTorch >= 2.3.0, "
                     "untested versions below this may have convergence issues."
                 )
-            assert (
-                config.decoupled_weight_decay
-            ), "CPU offloading only supported with decoupled_weight_decay enabled (AdamW mode)."
+            assert config.decoupled_weight_decay, (
+                "CPU offloading only supported with decoupled_weight_decay enabled (AdamW mode)."
+            )
             gpu_optimizer_cls = Adam if config.optimizer == 'adam' else SGD
             cpu_optimizer_cls = CPUAdam if config.optimizer == 'adam' else CPUSGD
             if config.use_torch_optimizer_for_cpu_offload:
@@ -417,7 +418,6 @@ def _get_megatron_optimizer_based_on_param_groups(
     #   from the MixedPrecisionOptimizer, which manages any optimizer where
     #   the model params and main params are distinct.
     if config.fp16 or config.bf16 or config.use_distributed_optimizer:
-
         # Grad scaler:
         #    if loss-scale is provided, instantiate the constant scaler.
         #    if we are using fp16 and loss-scale is not present, use a

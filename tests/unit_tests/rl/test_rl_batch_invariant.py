@@ -1,7 +1,5 @@
 # Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
-import os
 
-import pytest
 import torch
 
 from megatron.core.transformer.custom_layers.batch_invariant_kernels import set_batch_invariant_mode

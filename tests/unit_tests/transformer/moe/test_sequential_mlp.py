@@ -1,5 +1,4 @@
 # Copyright (c) 2023, NVIDIA CORPORATION. All rights reserved.
-from importlib.metadata import version
 
 import pytest
 import torch
@@ -18,7 +17,6 @@ from tests.unit_tests.test_utilities import Utils
 
 
 class TestParallelSequentialMLP:
-
     def setup_method(self, method):
         Utils.initialize_model_parallel(1, 1)
         model_parallel_cuda_manual_seed(123)

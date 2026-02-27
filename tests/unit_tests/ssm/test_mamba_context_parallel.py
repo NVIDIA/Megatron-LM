@@ -1,6 +1,5 @@
 # Copyright (c) 2025, NVIDIA CORPORATION. All rights reserved.
 
-import math
 
 import pytest
 import torch
@@ -13,7 +12,6 @@ from tests.unit_tests.test_utilities import Utils
 
 @pytest.mark.internal
 class TestMambaContextParallel:
-
     @pytest.mark.parametrize(
         "ngroups_local_tp, cp_size, D_has_hdim",
         [

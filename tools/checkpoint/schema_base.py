@@ -6,7 +6,6 @@ import torch
 
 
 class ModelSchema:
-
     def __init__(self, mapping):
         self._mapping = dict(mapping)
 
@@ -60,7 +59,7 @@ class ModelSchema:
     # Getters.
     @classmethod
     def _get(cls, schema, model):
-        return { k: cls._get_deep_attr(model, m) for k, m in schema.items() }
+        return {k: cls._get_deep_attr(model, m) for k, m in schema.items()}
 
     def get(self, key, model):
         return self._get(self[key], model)

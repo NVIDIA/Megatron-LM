@@ -60,16 +60,16 @@ def broadcast_from_last_pipeline_stage(
         is_last_stage = parallel_state.is_pipeline_last_stage(ignore_virtual=True)
     else:
         # Lists of ProcessGroups are used for multimodal inference but not supported here
-        assert isinstance(
-            pp_group, ProcessGroup
-        ), "pp_group must be a single ProcessGroup, not a list of ProcessGroups"
+        assert isinstance(pp_group, ProcessGroup), (
+            "pp_group must be a single ProcessGroup, not a list of ProcessGroups"
+        )
         last_rank = torch.distributed.get_process_group_ranks(pp_group)[pp_group.size() - 1]
         is_last_stage = pp_group.rank() == pp_group.size() - 1
 
     if is_last_stage:
-        assert size == list(
-            tensor.shape
-        ), f"Expected tensor of shape {size} but got {list(tensor.shape)}"
+        assert size == list(tensor.shape), (
+            f"Expected tensor of shape {size} but got {list(tensor.shape)}"
+        )
         assert dtype == tensor.dtype, f"Expected tensor of type {dtype} but got {tensor.dtype}"
         _is_cuda_contiguous(tensor)
     else:
@@ -94,9 +94,9 @@ def recv_from_prev_pipeline_rank_(
         prev_rank = parallel_state.get_pipeline_model_parallel_prev_rank()
     else:
         # Lists of ProcessGroups are used for multimodal inference but not supported here
-        assert isinstance(
-            pp_group, ProcessGroup
-        ), "pp_group must be a single ProcessGroup, not a list of ProcessGroups"
+        assert isinstance(pp_group, ProcessGroup), (
+            "pp_group must be a single ProcessGroup, not a list of ProcessGroups"
+        )
         prev_rank = torch.distributed.get_process_group_ranks(pp_group)[
             (pp_group.rank() - 1) % pp_group.size()
         ]
@@ -125,9 +125,9 @@ def send_to_next_pipeline_rank(
         next_rank = parallel_state.get_pipeline_model_parallel_next_rank()
     else:
         # Lists of ProcessGroups are used for multimodal inference but not supported here
-        assert isinstance(
-            pp_group, ProcessGroup
-        ), "pp_group must be a single ProcessGroup, not a list of ProcessGroups"
+        assert isinstance(pp_group, ProcessGroup), (
+            "pp_group must be a single ProcessGroup, not a list of ProcessGroups"
+        )
         next_rank = torch.distributed.get_process_group_ranks(pp_group)[
             (pp_group.rank() + 1) % pp_group.size()
         ]

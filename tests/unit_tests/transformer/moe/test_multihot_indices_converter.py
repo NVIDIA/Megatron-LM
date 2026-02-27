@@ -33,7 +33,6 @@ class PytorchIndicesToMultihot:
 
 
 class TestIndicesToMultihot:
-
     def setup_method(self, method):
         # enable experimental feature
         if config.ENABLE_EXPERIMENTAL is False:

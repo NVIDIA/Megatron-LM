@@ -32,7 +32,7 @@ from tests.unit_tests.dist_checkpointing import (
 from tests.unit_tests.test_utilities import Utils
 
 try:
-    import fla
+    import fla  # noqa: F401
 
     HAVE_FLA = True
 except ImportError:
@@ -51,7 +51,6 @@ except ImportError:
 @pytest.mark.skipif(not HAVE_FLA, reason="FLA is not installed.")
 @pytest.mark.internal
 class TestGatedDeltaNet:
-
     @pytest.fixture(scope='function', autouse=True)
     def setup_method(self, tp_size, sp, cp_size):
         # Initialize parallel and random seed
@@ -131,15 +130,15 @@ class TestGatedDeltaNet:
             f"Output shape {output.shape[0]=} mismatch with "
             f" {seq_length=} // {self.sp_size=} // {self.cp_size=}."
         )
-        assert (
-            output.shape[1] == micro_batch_size
-        ), f"Output shape {output.shape[1]=} mismatch with {micro_batch_size=}"
-        assert (
-            output.shape[2] == gdn.config.hidden_size
-        ), f"Output shape {output.shape[2]=} mismatch with {gdn.config.hidden_size=}"
-        assert (
-            output.dtype == hidden_states.dtype
-        ), f"Output dtype {output.dtype=} mismatch with {hidden_states.dtype=}"
+        assert output.shape[1] == micro_batch_size, (
+            f"Output shape {output.shape[1]=} mismatch with {micro_batch_size=}"
+        )
+        assert output.shape[2] == gdn.config.hidden_size, (
+            f"Output shape {output.shape[2]=} mismatch with {gdn.config.hidden_size=}"
+        )
+        assert output.dtype == hidden_states.dtype, (
+            f"Output dtype {output.dtype=} mismatch with {hidden_states.dtype=}"
+        )
 
 
 @pytest.mark.parametrize(
@@ -294,20 +293,20 @@ def test_parallel_gated_delta_net_correctness(tmp_path_dist_ckpt, tp, sp, cp):
         output_hidden_states_baseline = get_tensor_on_this_rank(output_hidden_states_baseline)
         input_grad_baseline = get_tensor_on_this_rank(input_grad_baseline)
 
-        assert torch.all(
-            ~torch.isnan(output_hidden_states_baseline)
-        ), "output_hidden_states_baseline contains nan"
-        assert torch.all(
-            ~torch.isinf(output_hidden_states_baseline)
-        ), "output_hidden_states_baseline contains inf"
+        assert torch.all(~torch.isnan(output_hidden_states_baseline)), (
+            "output_hidden_states_baseline contains nan"
+        )
+        assert torch.all(~torch.isinf(output_hidden_states_baseline)), (
+            "output_hidden_states_baseline contains inf"
+        )
         assert torch.all(~torch.isnan(input_grad_baseline)), "input_grad_baseline contains nan"
         assert torch.all(~torch.isinf(input_grad_baseline)), "input_grad_baseline contains inf"
-        assert torch.all(
-            ~torch.isnan(output_hidden_states_parallel)
-        ), "output_hidden_states_parallel contains nan"
-        assert torch.all(
-            ~torch.isinf(output_hidden_states_parallel)
-        ), "output_hidden_states_parallel contains inf"
+        assert torch.all(~torch.isnan(output_hidden_states_parallel)), (
+            "output_hidden_states_parallel contains nan"
+        )
+        assert torch.all(~torch.isinf(output_hidden_states_parallel)), (
+            "output_hidden_states_parallel contains inf"
+        )
         assert torch.all(~torch.isnan(input_grad_parallel)), "input_grad_parallel contains nan"
         assert torch.all(~torch.isinf(input_grad_parallel)), "input_grad_parallel contains inf"
 

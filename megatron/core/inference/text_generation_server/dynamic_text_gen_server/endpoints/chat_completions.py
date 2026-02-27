@@ -167,9 +167,9 @@ try:
                     message_text, new_info = PARSER_MAPPING[parser].parse(
                         message_text, tools=req.get("tools", None)
                     )
-                    assert not (
-                        metadata.keys() & new_info.keys()
-                    ), "Multiple parsers found the same information."
+                    assert not (metadata.keys() & new_info.keys()), (
+                        "Multiple parsers found the same information."
+                    )
                     metadata.update(new_info)
             message = {"role": "assistant", "content": message_text}
             if "tool_calls" in metadata:

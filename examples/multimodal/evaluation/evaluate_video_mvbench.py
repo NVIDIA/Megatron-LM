@@ -11,7 +11,6 @@ def merge_input_files(input_path):
     results = []
     collected = set()
 
-
     for input_file_path in input_file_paths:
         with open(input_file_path, "r") as input_file:
             for line in input_file:
@@ -35,23 +34,23 @@ def merge_input_files(input_path):
 # found at https://github.com/OpenGVLab/Ask-Anything/tree/main?tab=MIT-1-ov-file#readme
 def check_ans(pred, gt):
     flag = False
-        
+
     pred_list = pred.lower().split(' ')
     pred_option, pred_content = pred_list[0], ' '.join(pred_list[1:])
     gt_list = gt.lower().split(' ')
     gt_option, gt_content = gt_list[0], ' '.join(gt_list[1:])
     if gt_content[-1] == '.':
         gt_content = gt_content[:-1]
-    
+
     if pred_option.replace('.', '') in gt_option:
         flag = True
     elif gt_option in pred_option:
         flag = True
-    
+
     return flag
 
-def create_result_dict(result_list):
 
+def create_result_dict(result_list):
     correct = 0
     total = 0
     res_list = []
@@ -65,20 +64,17 @@ def create_result_dict(result_list):
         total += 1
         pred = result_obj['answer']
         gt = result_obj['gt_answer'][0]
-        
-        res_list.append({
-            'pred': pred,
-            'gt': gt
-        })
+
+        res_list.append({'pred': pred, 'gt': gt})
         if check_ans(pred=pred, gt=gt):
             acc_dict[task_type][0] += 1
             correct += 1
 
-    print(f"Total Acc: {correct / total * 100 :.2f}%")
+    print(f"Total Acc: {correct / total * 100:.2f}%")
     print('-' * 30, task_type, '-' * 30)
 
     return acc_dict
-        
+
 
 def combine_all_res(acc_dict):
     final_res = dict()
@@ -87,7 +83,7 @@ def combine_all_res(acc_dict):
     for k, v in acc_dict.items():
         final_res[k] = v[0] / v[1] * 100
         correct += v[0]
-        total += v[1]    
+        total += v[1]
     final_res['total-acc'] = correct / total * 100
 
     print(final_res)
@@ -97,10 +93,10 @@ def combine_all_res(acc_dict):
 
 def mvbench_eval(input_path):
     result_file_path = merge_input_files(input_path)
-    
+
     merged_results = json.load(open(result_file_path))
     acc_dict = create_result_dict(merged_results)
-    
+
     return combine_all_res(acc_dict)
 
 
@@ -112,6 +108,3 @@ if __name__ == "__main__":
     avg_acc_dict = mvbench_eval(args.input_path)
 
     print(f"MVBench {avg_acc_dict}")
-
-
-    

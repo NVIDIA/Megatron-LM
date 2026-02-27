@@ -2,32 +2,34 @@ import os
 import sys
 
 import torch
-
-from schema_hf import get_vision_model_schema, get_language_model_schema
-
+from schema_hf import get_language_model_schema, get_vision_model_schema
 from transformers.modeling_utils import WEIGHTS_INDEX_NAME, WEIGHTS_NAME, shard_checkpoint
+
 
 def add_arguments(parser):
     group = parser.add_argument_group(title='HuggingFace LLaVA saver')
 
-    group.add_argument('--megatron-path', type=str, default=None,
-                       help='Base directory of Megatron repository')
+    group.add_argument(
+        '--megatron-path', type=str, default=None, help='Base directory of Megatron repository'
+    )
+
 
 def recover_qkv(new_tensor, num_head, head_dim):
     # Step 1: Reshape back to (num_head, 3*head_dim, -1)
     temp = new_tensor.view(num_head, 3 * head_dim, -1)
-    
+
     # Step 2: Slice along the head_dim dimension to get q, k, v
     q = temp[:, 0:head_dim, :]
-    k = temp[:, head_dim:2*head_dim, :]
-    v = temp[:, 2*head_dim:3*head_dim, :]
-    
+    k = temp[:, head_dim : 2 * head_dim, :]
+    v = temp[:, 2 * head_dim : 3 * head_dim, :]
+
     # Step 3: Reshape each back to (num_head * head_dim, -1)
     q_proj_params = q.contiguous().view(num_head * head_dim, -1)
     k_proj_params = k.contiguous().view(num_head * head_dim, -1)
     v_proj_params = v.contiguous().view(num_head * head_dim, -1)
-    
+
     return q_proj_params, k_proj_params, v_proj_params
+
 
 class HFCheckpointSaverLLaVA:
     def __init__(self, args, queue):
@@ -35,10 +37,9 @@ class HFCheckpointSaverLLaVA:
         self.queue = queue
 
     def insert_megatron_path(self):
-        sys.path.append(os.path.abspath(
-            os.path.join(os.path.dirname(__file__),
-                         os.path.pardir,
-                         os.path.pardir)))
+        sys.path.append(
+            os.path.abspath(os.path.join(os.path.dirname(__file__), os.path.pardir, os.path.pardir))
+        )
         if self.args.megatron_path is not None:
             sys.path.insert(0, self.args.megatron_path)
 
@@ -75,8 +76,12 @@ class HFCheckpointSaverLLaVA:
             params_dict["embedder_weight"] = vision_embeddings_msg["embedder weight"]
             params_dict["class_token"] = vision_embeddings_msg["class token"]
             params_dict["position_embeddings"] = vision_embeddings_msg["position embeddings"]
-            params_dict["input_conditioner_norm_mean"] = torch.tensor([0.48145466, 0.4578275, 0.40821073]).unsqueeze(-1).unsqueeze(-1)
-            params_dict["input_conditioner_norm_std"] = torch.tensor([0.26862954, 0.26130258, 0.27577711]).unsqueeze(-1).unsqueeze(-1)
+            params_dict["input_conditioner_norm_mean"] = (
+                torch.tensor([0.48145466, 0.4578275, 0.40821073]).unsqueeze(-1).unsqueeze(-1)
+            )
+            params_dict["input_conditioner_norm_std"] = (
+                torch.tensor([0.26862954, 0.26130258, 0.27577711]).unsqueeze(-1).unsqueeze(-1)
+            )
         elif self.md.vision_model_type == "internvit":
             params_dict["patch_embedding_weight"] = vision_embeddings_msg["conv1 weight"]
             params_dict["patch_embedding_bias"] = vision_embeddings_msg["conv1 bias"]
@@ -101,19 +106,23 @@ class HFCheckpointSaverLLaVA:
             dim = self.md.vision_kv_channels
             for j in range(num_heads):
                 for i in range(dim):
-                    order[j*dim+i] = i + dim*3*j
-                    order[j*dim+i+num_heads*dim] = dim + i + dim*3*j
-                    order[j*dim+i+num_heads*dim*2] = dim*2 + i + dim*3*j
+                    order[j * dim + i] = i + dim * 3 * j
+                    order[j * dim + i + num_heads * dim] = dim + i + dim * 3 * j
+                    order[j * dim + i + num_heads * dim * 2] = dim * 2 + i + dim * 3 * j
 
         for i in range(self.md.vision_num_layers):
             message = self.queue_get(f"vit transformer layer {i}")
             params_dict = {}
 
             if self.md.vision_model_type == "internvit":
-                params_dict["ls1"] = message["ls1"] 
-                params_dict["ls2"] = message["ls2"] 
-                params_dict["k_norm_weight"] = message["k norm weight"][:self.md.vision_hidden_size]
-                params_dict["q_norm_weight"] = message["q norm weight"][:self.md.vision_hidden_size]
+                params_dict["ls1"] = message["ls1"]
+                params_dict["ls2"] = message["ls2"]
+                params_dict["k_norm_weight"] = message["k norm weight"][
+                    : self.md.vision_hidden_size
+                ]
+                params_dict["q_norm_weight"] = message["q norm weight"][
+                    : self.md.vision_hidden_size
+                ]
                 if self.md.vision_norm_has_bias:
                     params_dict["k_norm_bias"] = message["k norm bias"]
                     params_dict["q_norm_bias"] = message["q norm bias"]
@@ -129,16 +138,18 @@ class HFCheckpointSaverLLaVA:
                 params_dict["mlp_l0_weight_W"] = message["mlp l0 weight W"]
                 params_dict["mlp_l0_weight_V"] = message["mlp l0 weight V"]
             else:
-                params_dict["mlp_l0_weight"] = message["mlp l0 weight"] 
+                params_dict["mlp_l0_weight"] = message["mlp l0 weight"]
             if self.md.vision_linear_bias:
                 if self.md.vision_swiglu:
                     params_dict["mlp_l0_bias_W"] = message["mlp l0 bias W"]
                     params_dict["mlp_l0_bias_V"] = message["mlp l0 bias V"]
                 else:
-                    params_dict["mlp_l0_bias"] = message["mlp l0 bias"] 
+                    params_dict["mlp_l0_bias"] = message["mlp l0 bias"]
 
             if self.md.vision_model_type == "internvit":
-                params_dict["qkv_weight"] = message["qkv weight"][:self.md.vision_hidden_size * 3][order]
+                params_dict["qkv_weight"] = message["qkv weight"][: self.md.vision_hidden_size * 3][
+                    order
+                ]
             elif self.md.vision_model_type in ("siglip"):
                 # Split the Q/K/V
                 query, key, value = recover_qkv(message["qkv weight"], num_head=16, head_dim=72)
@@ -151,8 +162,12 @@ class HFCheckpointSaverLLaVA:
                 if self.md.vision_model_type == "internvit":
                     params_dict["qkv_bias"] = message["qkv bias"][order]
                 if self.md.vision_model_type in ("siglip"):
-                    query_bias, key_bias, value_bias = recover_qkv(message["qkv bias"], num_head=16, head_dim=72)
-                    assert query_bias.shape[-1] == 1, "expected query_bias last dimension after recovery to be 1"
+                    query_bias, key_bias, value_bias = recover_qkv(
+                        message["qkv bias"], num_head=16, head_dim=72
+                    )
+                    assert query_bias.shape[-1] == 1, (
+                        "expected query_bias last dimension after recovery to be 1"
+                    )
                     params_dict["q_proj_bias"] = query_bias[:, 0]
                     params_dict["k_proj_bias"] = key_bias[:, 0]
                     params_dict["v_proj_bias"] = value_bias[:, 0]
@@ -160,7 +175,9 @@ class HFCheckpointSaverLLaVA:
                     params_dict["qkv_bias"] = message["qkv bias"][order]
 
             if self.md.vision_model_type == "internvit":
-                params_dict["dense_weight"] = message["dense weight"][..., :self.md.vision_hidden_size]
+                params_dict["dense_weight"] = message["dense weight"][
+                    ..., : self.md.vision_hidden_size
+                ]
             elif self.md.vision_model_type in ("siglip", "radio"):
                 params_dict["dense_weight"] = message["dense weight"]
             params_dict["mlp_l1_weight"] = message["mlp l1 weight"]
@@ -169,8 +186,8 @@ class HFCheckpointSaverLLaVA:
                 if self.md.vision_model_type in ("siglip", "radio"):
                     params_dict["dense_bias"] = message["dense bias"]
                 elif self.md.vision_model_type == "internvit":
-                    params_dict["dense_bias"] = message["dense bias"][:self.md.vision_hidden_size]
-            
+                    params_dict["dense_bias"] = message["dense bias"][: self.md.vision_hidden_size]
+
             schema.set_layer(self.state_dict, i, params_dict)
 
     def receive_vision_projection(self):
@@ -183,7 +200,6 @@ class HFCheckpointSaverLLaVA:
         if self.md.vision_projection_linear_bias:
             self.state_dict["mlp1.1.bias"] = projection_msg["vision projection l0 bias"]
             self.state_dict["mlp1.3.bias"] = projection_msg["vision projection l1 bias"]
-
 
     def recover_lm_qkv_weight(self, qkv_weight):
         dim = self.md.kv_channels
@@ -203,7 +219,7 @@ class HFCheckpointSaverLLaVA:
             qkv = t.reshape(ng, dim * (nh // ng) + 2 * dim, -1)
 
             # 2. Slice out q, k, v along dim=1.
-            q_t = qkv[:, : dim * (nh // ng), :]  
+            q_t = qkv[:, : dim * (nh // ng), :]
             k_t = qkv[:, dim * (nh // ng) : dim * (nh // ng) + dim, :]
             v_t = qkv[:, dim * (nh // ng) + dim :, :]
 
@@ -237,7 +253,7 @@ class HFCheckpointSaverLLaVA:
         for b in bias_per_tp:
             qkvb = b.reshape(ng, dim * (nh // ng) + 2 * dim)
 
-            q_b = qkvb[:, : dim * (nh // ng)]  
+            q_b = qkvb[:, : dim * (nh // ng)]
             k_b = qkvb[:, dim * (nh // ng) : dim * (nh // ng) + dim]
             v_b = qkvb[:, dim * (nh // ng) + dim :]
 
@@ -249,11 +265,11 @@ class HFCheckpointSaverLLaVA:
             k_b = k_b.reshape(-1)
             v_b = v_b.reshape(-1)
 
-            qb = torch.cat([qb, q_b]) 
-            kb = torch.cat([kb, k_b]) 
-            vb = torch.cat([vb, v_b]) 
+            qb = torch.cat([qb, q_b])
+            kb = torch.cat([kb, k_b])
+            vb = torch.cat([vb, v_b])
 
-        return qb, kb, vb,
+        return qb, kb, vb
 
     def receive_lm(self, schema):
         embeddings_msg = self.queue_get("embeddings")
@@ -261,7 +277,7 @@ class HFCheckpointSaverLLaVA:
 
         params_dict["word_embeddings"] = embeddings_msg["word embeddings"]
         if self.md.position_embedding_type == "learned_absolute":
-            # TODO: Below may not be correct, but none of our models use absolute positional embeddings
+            # TODO: Below may not be correct, but none of our models use absolute positional embeddings  # noqa: E501
             params_dict["position_embeddings"] = embeddings_msg["position embeddings"]
 
         schema.set(self.state_dict, params_dict)
@@ -286,7 +302,7 @@ class HFCheckpointSaverLLaVA:
                     params_dict["mlp_l0_bias_W"] = message["mlp l0 bias W"]
                     params_dict["mlp_l0_bias_V"] = message["mlp l0 bias V"]
                 else:
-                    params_dict["mlp_l0_bias"] = message["mlp l0 bias"] 
+                    params_dict["mlp_l0_bias"] = message["mlp l0 bias"]
 
             qkv_weight = message["qkv weight"]
             if self.md.qkv_bias:
@@ -320,7 +336,6 @@ class HFCheckpointSaverLLaVA:
         params_dict = {
             "final_norm": self.queue_get('final norm')['weight'],
             "output_layer": self.queue_get('output layer')['weight'],
-
         }
         schema.set(self.state_dict, params_dict)
 
@@ -365,22 +380,23 @@ class HFCheckpointSaverLLaVA:
             print(f"Model weights saved in {os.path.join(self.args.save_dir, WEIGHTS_NAME)}")
         else:
             import json
+
             save_index_file = os.path.join(self.args.save_dir, WEIGHTS_INDEX_NAME)
             # Save the index as well
             with open(save_index_file, "w", encoding="utf-8") as f:
                 content = json.dumps(index, indent=2, sort_keys=True) + "\n"
                 f.write(content)
             print(
-                f"The model is bigger than the maximum size per checkpoint ({max_shard_size}) and is going to be "
-                    f"split in {len(shards)} checkpoint shards. You can find where each parameters has been saved in the "
-                    f"index located at {save_index_file}."
+                f"The model is bigger than the maximum size per checkpoint ({max_shard_size}) and is going to be "  # noqa: E501
+                f"split in {len(shards)} checkpoint shards. You can find where each parameters has been saved in the "  # noqa: E501
+                f"index located at {save_index_file}."
             )
 
     def save(self):
         self.insert_megatron_path()
 
         self.md = self.queue_get()
-        
+
         self.state_dict = {}
 
         self.receive_model()
@@ -388,7 +404,7 @@ class HFCheckpointSaverLLaVA:
         self.save_state_dict_to_hf_checkpoint()
 
         print("Done!")
-        
+
 
 def save_checkpoint(queue, args):
     """
@@ -399,4 +415,3 @@ def save_checkpoint(queue, args):
         saver.save()
     except Exception as e:
         raise e
-    

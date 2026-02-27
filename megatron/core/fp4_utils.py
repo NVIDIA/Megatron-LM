@@ -14,7 +14,7 @@ from megatron.core.utils import is_te_min_version
 # Check if Transformer Engine is installed
 HAVE_TE = False
 try:
-    import transformer_engine  # pylint: disable=W0611
+    import transformer_engine  # noqa: F401
 
     HAVE_TE = True
 except (ImportError, ModuleNotFoundError):
@@ -76,7 +76,6 @@ def get_fp4_align_size(fp4_recipe: Fp4Recipe) -> int:
     Scaling factor layout: https://docs.nvidia.com/cuda/cublas/#d-block-scaling-factors-layout
     TE NVFP4 Grouped Quantization: https://github.com/NVIDIA/TransformerEngine/pull/2411
     """
-    # pylint: disable=unused-argument
     return 128
 
 

@@ -1,11 +1,10 @@
 import pytest
 import torch
-from pytest_mock import mocker
 
 from megatron.core.export.data_type import DataType
 from megatron.core.export.export_config import ExportConfig
 from megatron.core.export.trtllm.trtllm_layers import TRTLLMLayers
-from megatron.core.export.trtllm.trtllm_weights_converter.single_device_trtllm_model_weights_converter import (
+from megatron.core.export.trtllm.trtllm_weights_converter.single_device_trtllm_model_weights_converter import (  # noqa: E501
     SingleDeviceTRTLLMModelWeightsConverter,
 )
 from megatron.core.transformer.transformer_config import TransformerConfig
@@ -13,7 +12,6 @@ from megatron.core.transformer.transformer_config import TransformerConfig
 
 class TestTRTLLMSingleDeviceConverter:
     def test_get_model_weights_converter(self, mocker):
-
         export_config = ExportConfig(inference_tp_size=2)
 
         vocab_size = 10
@@ -118,12 +116,11 @@ class TestTRTLLMSingleDeviceConverter:
         }
 
         for key, value in trtllm_model_weights_converter_cpu.trtllm_model_weights.items():
-            assert (
-                expected_shapes[key] == value.shape
-            ), f"Shape mismatch for {key}. Expected {expected_shapes[key]} but got {value.shape}"
+            assert expected_shapes[key] == value.shape, (
+                f"Shape mismatch for {key}. Expected {expected_shapes[key]} but got {value.shape}"
+            )
 
         class SampleMapping:
-
             def __init__(self):
                 self.tp_size = 2
                 self.tp_rank = 1
@@ -165,12 +162,12 @@ class TestTRTLLMSingleDeviceConverter:
         }
 
         for key, value in trtllm_model_weights_per_gpu.items():
-            assert (
-                expected_result_per_gpu[key] == value.shape
-            ), f"Shape mismatch for {key}. Expected {expected_result_per_gpu[key]} but got {value.shape}"
+            assert expected_result_per_gpu[key] == value.shape, (
+                f"Shape mismatch for {key}. Expected {expected_result_per_gpu[key]} but got {value.shape}"  # noqa: E501
+            )
 
     def test_num_kv_heads_less_than_tp_size_valid(self, mocker):
-        """Test the condition where num_kv_heads < inference_tp_size and tp_size % num_kv_heads == 0 (valid case)"""
+        """Test the condition where num_kv_heads < inference_tp_size and tp_size % num_kv_heads == 0 (valid case)"""  # noqa: E501
 
         # Configure for GQA: 8 attention heads, 2 KV heads, TP size 4
         # This is valid because 4 % 2 == 0
@@ -209,7 +206,7 @@ class TestTRTLLMSingleDeviceConverter:
             "decoder.lm_head.weight": torch.randn(vocab_size, hidden_dim),
             "decoder.final_layernorm.weight": torch.randn(hidden_dim),
             "decoder.layers.input_layernorm.weight": torch.randn(num_layers, hidden_dim),
-            # QKV weight: [num_layers, qkv_weight_size, hidden_dim] - converter will transpose to [hidden_dim, qkv_weight_size]
+            # QKV weight: [num_layers, qkv_weight_size, hidden_dim] - converter will transpose to [hidden_dim, qkv_weight_size]  # noqa: E501
             "decoder.layers.attention.qkv.weight": torch.randn(
                 num_layers, qkv_weight_size, hidden_dim
             ),
@@ -283,24 +280,24 @@ class TestTRTLLMSingleDeviceConverter:
 
                 # For TP=4, each split should have 1/4 of the original size
                 # The weight shape depends on the conversion process, not necessarily hidden_dim
-                assert (
-                    len(bias_split.shape) == 1
-                ), f"Expected bias to be 1D, got shape {bias_split.shape}"
+                assert len(bias_split.shape) == 1, (
+                    f"Expected bias to be 1D, got shape {bias_split.shape}"
+                )
 
                 # Verify that all splits have the same size
                 if tp_rank == 0:
                     expected_weight_size = weight_split.shape[1]
                     expected_bias_size = bias_split.shape[0]
                 else:
-                    assert (
-                        weight_split.shape[1] == expected_weight_size
-                    ), f"All weight splits should have same size"
-                    assert (
-                        bias_split.shape[0] == expected_bias_size
-                    ), f"All bias splits should have same size"
+                    assert weight_split.shape[1] == expected_weight_size, (
+                        f"All weight splits should have same size"
+                    )
+                    assert bias_split.shape[0] == expected_bias_size, (
+                        f"All bias splits should have same size"
+                    )
 
     def test_num_kv_heads_less_than_tp_size_invalid(self, mocker):
-        """Test that an exception is raised when num_kv_heads < tp_size but tp_size % num_kv_heads != 0"""
+        """Test that an exception is raised when num_kv_heads < tp_size but tp_size % num_kv_heads != 0"""  # noqa: E501
 
         # Configure for invalid case: 3 KV heads, TP size 4 (not divisible)
         # This should raise an exception because 4 % 3 != 0
@@ -389,11 +386,11 @@ class TestTRTLLMSingleDeviceConverter:
             )
 
         # Verify the exception message
-        expected_message = "Number of query groups of the models is 3. Please select tensor parallelism size that can duplicate or split the number of query groups to equal number of query matrices in the each GPU."
+        expected_message = "Number of query groups of the models is 3. Please select tensor parallelism size that can duplicate or split the number of query groups to equal number of query matrices in the each GPU."  # noqa: E501
         assert expected_message in str(exc_info.value)
 
     def test_num_kv_heads_greater_equal_tp_size_invalid(self, mocker):
-        """Test that an exception is raised when num_kv_heads >= tp_size but num_kv_heads % tp_size != 0"""
+        """Test that an exception is raised when num_kv_heads >= tp_size but num_kv_heads % tp_size != 0"""  # noqa: E501
 
         # Configure for invalid case: 5 KV heads, TP size 4 (not divisible)
         # This should raise an exception because 5 % 4 != 0
@@ -482,11 +479,11 @@ class TestTRTLLMSingleDeviceConverter:
             )
 
         # Verify the exception message
-        expected_message = "Number of query groups of the models is 5. Please select tensor parallelism size that can duplicate or split the number of query groups to equal number of query matrices in the each GPU."
+        expected_message = "Number of query groups of the models is 5. Please select tensor parallelism size that can duplicate or split the number of query groups to equal number of query matrices in the each GPU."  # noqa: E501
         assert expected_message in str(exc_info.value)
 
     def test_num_kv_heads_greater_equal_tp_size_valid(self, mocker):
-        """Test the condition where num_kv_heads >= tp_size and num_kv_heads % tp_size == 0 (valid case)"""
+        """Test the condition where num_kv_heads >= tp_size and num_kv_heads % tp_size == 0 (valid case)"""  # noqa: E501
 
         # Configure for valid case: 8 KV heads, TP size 4 (divisible)
         # This is valid because 8 % 4 == 0
@@ -595,18 +592,18 @@ class TestTRTLLMSingleDeviceConverter:
 
                 # For TP=4, each split should have 1/4 of the original size
                 # The weight shape depends on the conversion process, not necessarily hidden_dim
-                assert (
-                    len(bias_split.shape) == 1
-                ), f"Expected bias to be 1D, got shape {bias_split.shape}"
+                assert len(bias_split.shape) == 1, (
+                    f"Expected bias to be 1D, got shape {bias_split.shape}"
+                )
 
                 # Verify that all splits have the same size
                 if tp_rank == 0:
                     expected_weight_size = weight_split.shape[1]
                     expected_bias_size = bias_split.shape[0]
                 else:
-                    assert (
-                        weight_split.shape[1] == expected_weight_size
-                    ), f"All weight splits should have same size"
-                    assert (
-                        bias_split.shape[0] == expected_bias_size
-                    ), f"All bias splits should have same size"
+                    assert weight_split.shape[1] == expected_weight_size, (
+                        f"All weight splits should have same size"
+                    )
+                    assert bias_split.shape[0] == expected_bias_size, (
+                        f"All bias splits should have same size"
+                    )

@@ -9,8 +9,6 @@ from typing import Dict
 from unittest import mock
 
 import numpy as np
-import pytest
-import torch
 
 from megatron.core.inference.contexts import StaticInferenceContext
 from megatron.core.inference.inference_request import InferenceRequest, Status
@@ -18,7 +16,7 @@ from megatron.core.inference.model_inference_wrappers.t5.t5_inference_wrapper im
     T5InferenceWrapper,
 )
 from megatron.core.inference.sampling_params import SamplingParams
-from megatron.core.inference.text_generation_controllers.encoder_decoder_text_generation_controller import (
+from megatron.core.inference.text_generation_controllers.encoder_decoder_text_generation_controller import (  # noqa: E501
     EncoderDecoderTextGenerationController,
 )
 from megatron.core.models.T5.t5_model import T5Model
@@ -33,7 +31,6 @@ from tests.unit_tests.test_utilities import Utils
 
 
 class TestEncoderDecoderTextGenerationController:
-
     def setup_method(self, method):
         Utils.initialize_model_parallel(
             tensor_model_parallel_size=4, pipeline_model_parallel_size=1
@@ -132,8 +129,8 @@ class TestEncoderDecoderTextGenerationController:
         )
 
         for request_id, request in requests.items():
-            assert (
-                request.status == Status.COMPLETED
-            ), f"Status should be completed but its {request.status}"
+            assert request.status == Status.COMPLETED, (
+                f"Status should be completed but its {request.status}"
+            )
             assert request.generated_length > 0, f"Generated length should be greater than zero"
             assert request.generated_text is not None, "Generated text should not be None"

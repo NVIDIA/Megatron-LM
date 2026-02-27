@@ -25,7 +25,6 @@ except ImportError:
 
 
 def test_recipe_config_matching() -> None:
-
     recipe_config = RecipeConfig(
         [
             GlobMatcher("*fc2", "fc2_cfg"),

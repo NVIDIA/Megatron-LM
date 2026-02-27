@@ -24,12 +24,10 @@ from megatron.core.inference.unified_memory import (
 )
 from megatron.core.inference.utils import tensor_swap
 from megatron.core.models.common.embeddings.rope_utils import apply_rotary_pos_emb
-from megatron.core.package_info import __version__ as mcore_version
 from megatron.core.ssm.mamba_hybrid_layer_allocation import get_layer_maps_from_layer_type_list
 from megatron.core.transformer import MLATransformerConfig, TransformerConfig
-from megatron.core.utils import deprecate_args
+from megatron.core.utils import deprecate_args, get_pg_size, internal_api
 from megatron.core.utils import divide as core_divide
-from megatron.core.utils import get_pg_size, internal_api
 
 from .attention_context.mamba_metadata import MambaMetadata
 from .attention_context.mha_metadata import GraphedMHAMetadata, NonGraphedMHAMetadata
@@ -43,7 +41,7 @@ except ImportError:
     triton_append_key_value_cache = None
 
 try:
-    import flashinfer  # type: ignore # pylint: disable=unused-import
+    import flashinfer  # type: ignore  # noqa: F401
 
     HAVE_FLASHINFER = True
 except ImportError:
@@ -208,7 +206,6 @@ def get_mem_size_str(n_bytes: int) -> str:
 
 
 @internal_api
-# pylint: disable=line-too-long
 class DynamicInferenceContext(BaseInferenceContext):
     """Inference context that is passed to the main model in order
     to efficiently calculate and store the KV cache during inference.
@@ -235,8 +232,7 @@ class DynamicInferenceContext(BaseInferenceContext):
     @deprecate_args(
         *DEPRECATED_ARGS,
         message=(
-            "Argument `{name}` has been deprecated. "
-            "Only pass `model_config` and `inference_config`"
+            "Argument `{name}` has been deprecated. Only pass `model_config` and `inference_config`"
         ),
     )
     def __init__(self, model_config: TransformerConfig, inference_config: InferenceConfig):
@@ -246,9 +242,9 @@ class DynamicInferenceContext(BaseInferenceContext):
             isinstance(model_config, MLATransformerConfig) and model_config.cache_mla_latents
         )
         if self.cache_mla_latent:
-            assert (
-                inference_config.block_size_tokens == 64
-            ), "Flash MLA requires a block size of 64. Set --inference-dynamic-batching-block-size 64 to fix this assert"
+            assert inference_config.block_size_tokens == 64, (
+                "Flash MLA requires a block size of 64. Set --inference-dynamic-batching-block-size 64 to fix this assert"  # noqa: E501
+            )
 
         # Per partition num heads and hidden size.
         num_attention_heads = model_config.num_query_groups or model_config.num_attention_heads
@@ -288,12 +284,12 @@ class DynamicInferenceContext(BaseInferenceContext):
         if self.is_hybrid_model:
             mamba_conv_states_shape = mamba_inference_state_config.mamba_conv_states_shape
             mamba_ssm_states_shape = mamba_inference_state_config.mamba_ssm_states_shape
-            assert (
-                mamba_conv_states_shape is not None
-            ), "`mamba_conv_states_shape` must be specified for hybrid models"
-            assert (
-                mamba_ssm_states_shape is not None
-            ), "`mamba_ssm_states_shape` must be specified for hybrid models"
+            assert mamba_conv_states_shape is not None, (
+                "`mamba_conv_states_shape` must be specified for hybrid models"
+            )
+            assert mamba_ssm_states_shape is not None, (
+                "`mamba_ssm_states_shape` must be specified for hybrid models"
+            )
 
             # For hybrid models, the layer map converts the global layer index to the
             # corresponding attention layer index or Mamba layer index depending on the
@@ -464,9 +460,9 @@ class DynamicInferenceContext(BaseInferenceContext):
             # User can control request overflow via max_requests.
             self.max_requests = inference_config.max_requests
 
-        assert (
-            self.max_requests % tp_size == 0
-        ), f"max_requests must be divisible by tp_size ({tp_size}), but got {self.max_requests}"
+        assert self.max_requests % tp_size == 0, (
+            f"max_requests must be divisible by tp_size ({tp_size}), but got {self.max_requests}"
+        )
 
         self.max_tokens = inference_config.max_tokens or self.DEFAULT_MAX_TOKENS
 
@@ -502,9 +498,9 @@ class DynamicInferenceContext(BaseInferenceContext):
 
         self.moe_enable_routing_replay = model_config.moe_enable_routing_replay
         if self.moe_enable_routing_replay:
-            assert (
-                model_config.num_moe_experts is not None
-            ), "Router recording/replay requested but no MoE experts specified!"
+            assert model_config.num_moe_experts is not None, (
+                "Router recording/replay requested but no MoE experts specified!"
+            )
             self.moe_routing_metadata = RoutingMetadata(self, model_config.moe_router_topk)
 
         # CUDA graph config list
@@ -526,9 +522,9 @@ class DynamicInferenceContext(BaseInferenceContext):
 
         # Whether to offload the KV cache. Determines where the KV cache is allocated within memory.
         self.offload_kv_cache = inference_config.offload_kv_cache
-        assert not (
-            self.offload_kv_cache and self.unified_memory_level
-        ), "The KV cache should not be instantiated in unified memory when it is offloaded during training."
+        assert not (self.offload_kv_cache and self.unified_memory_level), (
+            "The KV cache should not be instantiated in unified memory when it is offloaded during training."  # noqa: E501
+        )
 
         self._using_cuda_graph_this_step = False
         # Deal with chunked prefill
@@ -590,11 +586,11 @@ class DynamicInferenceContext(BaseInferenceContext):
         self.request_ids = torch.full(
             (self.max_requests,), -1, dtype=torch.int32, device=torch.cuda.current_device()
         )
-        # request_query_lengths is the input prompt tokens length during prefill phase (1st step) and then 1 for the decode phase (i.e During generation)
+        # request_query_lengths is the input prompt tokens length during prefill phase (1st step) and then 1 for the decode phase (i.e During generation)  # noqa: E501
         self.request_query_lengths = torch.empty_like(self.request_ids)
         # request_output_lengths is len(input_prompt_tokens) + num_tokens_to_generate
         self.request_output_lengths = torch.empty_like(self.request_ids)
-        # request_kv_length_offsets is the same as query length during prefill phase (1st step) and then 1 for the decode phase (i.e During generation)
+        # request_kv_length_offsets is the same as query length during prefill phase (1st step) and then 1 for the decode phase (i.e During generation)  # noqa: E501
         self.request_kv_length_offsets = torch.empty_like(self.request_ids)
         self.request_kv_block_counts = torch.empty_like(self.request_ids)
         self.request_last_kv_block_id = torch.empty_like(self.request_ids)
@@ -728,7 +724,7 @@ class DynamicInferenceContext(BaseInferenceContext):
 
     @classmethod
     def round_up_tokens(cls, value, tp_size=None):
-        """Round up to nearest multiple of `TOKEN_ROUNDER` that is also divisible by tensor model parallel size."""
+        """Round up to nearest multiple of `TOKEN_ROUNDER` that is also divisible by tensor model parallel size."""  # noqa: E501
         # Make sure divisible by TP size
         if tp_size is None:
             # Check if parallel state is initialized before trying to get TP size
@@ -742,7 +738,7 @@ class DynamicInferenceContext(BaseInferenceContext):
 
     @classmethod
     def round_up_requests(cls, value, tp_size=None):
-        """Round up to nearest multiple of `REQUEST_ROUNDER` that is also divisible by tensor model parallel size."""
+        """Round up to nearest multiple of `REQUEST_ROUNDER` that is also divisible by tensor model parallel size."""  # noqa: E501
         # Make sure divisible by TP size
         if tp_size is None:
             # Check if parallel state is initialized before trying to get TP size
@@ -982,7 +978,7 @@ class DynamicInferenceContext(BaseInferenceContext):
                 raise AssertionError(
                     f"apply_rotary_emb_key: key.shape[0]={key.shape[0]} != n={n}; "
                     f"padded_active_request_count={self.padded_active_request_count}, "
-                    f"active_token_count={self.active_token_count}, total_request_count={self.total_request_count}, "
+                    f"active_token_count={self.active_token_count}, total_request_count={self.total_request_count}, "  # noqa: E501
                     f"paused_request_count={self.paused_request_count}"
                 )
             key = apply_rotary_pos_emb(
@@ -1030,12 +1026,12 @@ class DynamicInferenceContext(BaseInferenceContext):
         metadata_cols: List[List] = [[] for _ in self.request_metadata_types]
 
         for req in requests:
-            assert isinstance(
-                req, DynamicInferenceRequest
-            ), "add_dummy_requests_parallel expects DynamicInferenceRequest objects"
-            assert (
-                req.finished_chunk_token_count == 0
-            ), "chunked requests are not supported in add_dummy_requests_parallel"
+            assert isinstance(req, DynamicInferenceRequest), (
+                "add_dummy_requests_parallel expects DynamicInferenceRequest objects"
+            )
+            assert req.finished_chunk_token_count == 0, (
+                "chunked requests are not supported in add_dummy_requests_parallel"
+            )
             assert req.remaining_prompt_tokens is not None, "request missing prompt tokens"
             assert req.sampling_params is not None, "request missing sampling params"
             chunk_length = req.remaining_prompt_length
@@ -1153,12 +1149,13 @@ class DynamicInferenceContext(BaseInferenceContext):
         self, graph_dimensions: InferenceBatchDimensions
     ) -> None:
         """
-        Adds dummy requests to reflect the number of prefill and decode requests in the graph config.
+        Adds dummy requests to reflect the number of prefill and
+        decode requests in the graph config.
         These are using during cuda graph captures.
         """
         prefill_tokens = graph_dimensions.token_count - graph_dimensions.decode_req_count
 
-        # Pre-construct shared objects (safe due to deep copy in DynamicInferenceRequest.__post_init__)
+        # Pre-construct shared objects (safe due to deep copy in DynamicInferenceRequest.__post_init__)  # noqa: E501
         shared_sampling_params = SamplingParams(num_tokens_to_generate=1, termination_id=-1)
         shared_decode_tokens = torch.zeros(1, dtype=torch.long, device=torch.cuda.current_device())
 
@@ -1217,7 +1214,9 @@ class DynamicInferenceContext(BaseInferenceContext):
         """Initialize attention state so that every layer can use it.
 
         Args:
-            construct_graph_dimensions (Optional[InferenceBatchDimensions]): The graph config to use for constructing the cuda graphs.
+            construct_graph_dimensions
+                (Optional[InferenceBatchDimensions]): The graph config
+                to use for constructing the cuda graphs.
         Return:
             None.
         """
@@ -1467,11 +1466,14 @@ class DynamicInferenceContext(BaseInferenceContext):
         return request_can_be_added, request_tokens_can_be_added, kv_cache_available
 
     def add_request(self, req: DynamicInferenceRequest, chunk_length: Optional[int] = None) -> None:
-        """Add request to context. At this stage, we assume that the request is valid and can be added, as the checks are done in the schedule function.
+        """Add request to context. At this stage, we assume that the
+        request is valid and can be added, as the checks are done in
+        the schedule function.
 
         Args:
             req (DynamicInferenceRequest): Request to add.
-            chunk_length (Optional[int]): Length of chunk to add. If None, the request will be fully added.
+            chunk_length (Optional[int]): Length of chunk to add.
+                If None, the request will be fully added.
 
         Return:
             None
@@ -1485,13 +1487,13 @@ class DynamicInferenceContext(BaseInferenceContext):
         if chunk_length is None:
             chunk_length = req.remaining_prompt_length
 
-        # req.finished_chunk_token_count > 0 means that the request is a scheduled chunked prefill request, and we are adding a chunk to it
+        # req.finished_chunk_token_count > 0 means that the request is a scheduled chunked prefill request, and we are adding a chunk to it  # noqa: E501
         is_chunked_prefill = req.finished_chunk_token_count > 0
 
         assert chunk_length > 0, "Chunk length is 0"
-        assert (
-            chunk_length <= req.remaining_prompt_length
-        ), "Chunk length is greater than remaining prompt length"
+        assert chunk_length <= req.remaining_prompt_length, (
+            "Chunk length is greater than remaining prompt length"
+        )
         if self.active_token_count + chunk_length > self.max_tokens:
             raise TokenOverflowError(req.request_id)
 
@@ -1513,7 +1515,7 @@ class DynamicInferenceContext(BaseInferenceContext):
             if new_block_ids is None or len(new_block_ids) != num_blocks_needed:
                 raise BlockOverflowError(req.request_id)
 
-        # when a request already starts chunked prefill, it is exactly the last request in the current system
+        # when a request already starts chunked prefill, it is exactly the last request in the current system  # noqa: E501
         # (see dynamic_engine.py, schedule_chunked_prefill invariants)
         # no need to update count, as it is already here
         if is_chunked_prefill:
@@ -1521,9 +1523,9 @@ class DynamicInferenceContext(BaseInferenceContext):
             self.active_token_count -= (
                 1  # Overwrite the last token, which is the useless token from chunked prefill
             )
-            assert (
-                self.request_ids[current_id] == req.request_id
-            ), "Continuation current_id mismatch"
+            assert self.request_ids[current_id] == req.request_id, (
+                "Continuation current_id mismatch"
+            )
         else:
             current_id = self.total_request_count
 
@@ -1536,9 +1538,9 @@ class DynamicInferenceContext(BaseInferenceContext):
         self.request_ids[current_id] = req.request_id
 
         # Handle request metadata.
-        assert (
-            req.get_metadata_types() == self.request_metadata_types
-        ), "Request added to context with invalid metadata types"
+        assert req.get_metadata_types() == self.request_metadata_types, (
+            "Request added to context with invalid metadata types"
+        )
         metadata = req.tracked_metadata
         metadata_types = req.get_metadata_types()
         for m, m_type in zip(metadata, metadata_types):
@@ -1594,7 +1596,7 @@ class DynamicInferenceContext(BaseInferenceContext):
         ] = self.request_to_kv_block_ids[current_id][token_offset_range // self.block_size_tokens]
         self.token_to_local_position_within_kv_block[
             self.active_token_count : self.active_token_count + chunk_length
-        ] = (token_offset_range % self.block_size_tokens)
+        ] = token_offset_range % self.block_size_tokens
 
         if self.is_hybrid_model and not is_chunked_prefill:
             # Allocate a slot for Mamba states
@@ -1742,7 +1744,9 @@ class DynamicInferenceContext(BaseInferenceContext):
                     self.paused_request_count : (self.paused_request_count + resume_request_count)
                 ]
                 == self.block_size_tokens - 1
-            ), "The request_last_kv_block_offset should be 0 for the requests that just got resumed this step."
+            ), (
+                "The request_last_kv_block_offset should be 0 for the requests that just got resumed this step."  # noqa: E501
+            )
 
             assert resume_request_count <= self.block_allocator.total_avail
             block_ids = self.block_allocator.allocate_memory_blocks(resume_request_count)
@@ -1906,9 +1910,11 @@ class DynamicInferenceContext(BaseInferenceContext):
         2. If no paused requests are present and no active requests we release all memory and reset.
         3. Concatenate the paused tokens to the active tokens
         4. For the finished requests we release memory blocks and move them to the right
-        5. We identify requests that require a new block and add them to the paused requests (i.e move them left)
+        5. We identify requests that require a new block and add
+           them to the paused requests (i.e move them left)
         6. Resume paused requests & evict overflowing paused requests.
-        7. We make changes to the request book keeping tesnsors and setup the tokens for next iteration
+        7. We make changes to the request book keeping tensors and
+           setup the tokens for next iteration
         8. We make relevant changes to the token bookkeeping tensors
 
         Args:
@@ -1920,7 +1926,7 @@ class DynamicInferenceContext(BaseInferenceContext):
         """
 
         # 1. The active token mask tells us which requests are still active and which are completed
-        # active_request_count -> This corresponds to requests that have not reached EOD or max length
+        # active_request_count -> This corresponds to requests that have not reached EOD or max length  # noqa: E501
         # finished_request_count are requests that have reached the termination criterion
 
         self.num_prefill_requests = 0  # all turns to decode
@@ -2001,8 +2007,8 @@ class DynamicInferenceContext(BaseInferenceContext):
                 if self.is_hybrid_model:
                     self.mamba_metadata.request_to_mamba_state_idx[active_idxs_on_right] = -1
 
-        # 5. We identify requests that require a new block and add them to the paused requests (i.e move them left) :-
-        #       a) Put requests that have filled their current block and  require a new one in a pause state temporarily
+        # 5. We identify requests that require a new block and add them to the paused requests (i.e move them left) :-  # noqa: E501
+        #       a) Put requests that have filled their current block and  require a new one in a pause state temporarily  # noqa: E501
         #       b) Move the paused requests to the left, and active requets to the right
         #       c) Update the paused request count and active_request_count appropriately
         newly_paused_request_ids = None
@@ -2015,7 +2021,7 @@ class DynamicInferenceContext(BaseInferenceContext):
             ).byte()
 
             if self.chunked_prefill_request_id != -1:
-                # find the id in request_ids that is the chunked_prefill_request_id. Only one request should be chunked.
+                # find the id in request_ids that is the chunked_prefill_request_id. Only one request should be chunked.  # noqa: E501
                 active_requests_requiring_new_block[
                     self.get_index_of_chunked_prefill_request() - self.paused_request_count
                 ] = 0  # chunked prefill should not be paused
@@ -2029,7 +2035,7 @@ class DynamicInferenceContext(BaseInferenceContext):
                     torch.nonzero(active_requests_requiring_new_block) + self.paused_request_count
                 ]
 
-            # Swap unfinished active requests on the left side with paused requests on the right side
+            # Swap unfinished active requests on the left side with paused requests on the right side  # noqa: E501
             # NOTE : We add paused request count because we concatenate
             # paused tokens to the left at the beginning of update requests
             if (
@@ -2092,7 +2098,7 @@ class DynamicInferenceContext(BaseInferenceContext):
                 next_tokens=next_tokens,
             )
 
-        # 7. We make changes to the request book keeping tesnsors and setup the tokens for next iteration
+        # 7. We make changes to the request book keeping tesnsors and setup the tokens for next iteration  # noqa: E501
         assert self.total_request_count == active_request_count + self.paused_request_count
 
         # All these active requests are in decode phase, so they need only 1 token per request
@@ -2105,8 +2111,8 @@ class DynamicInferenceContext(BaseInferenceContext):
         if self.paused_request_count > 0:
             self.paused_tokens = next_tokens[: self.paused_request_count]
 
-        # add_ and fill_ calls seems to work as intended with sliced indexing (i.e. x[3:5].add(...) or x[3:5].fill_)
-        # but when another tensor is used for indexing, it does not work as expected (i.e. x[y] if x and y are torch tensors)
+        # add_ and fill_ calls seems to work as intended with sliced indexing (i.e. x[3:5].add(...) or x[3:5].fill_)  # noqa: E501
+        # but when another tensor is used for indexing, it does not work as expected (i.e. x[y] if x and y are torch tensors)  # noqa: E501
         self.request_kv_length_offsets[self.paused_request_count : self.total_request_count].add_(
             self.request_query_lengths[self.paused_request_count : self.total_request_count]
         )
@@ -2150,7 +2156,8 @@ class DynamicInferenceContext(BaseInferenceContext):
         Args:
             logits (Tensor): Raw model output logits with shape [1, sequence_length, vocab_size].
             new_tokens (Tensor): The newly sampled tokens.
-            only_last_token_logits (bool): If set, the logits are from only the last token in each request
+            only_last_token_logits (bool): If set, the logits are
+                from only the last token in each request
 
         Returns:
             List of lists where each inner list contains log probs for a request in the
@@ -2171,7 +2178,7 @@ class DynamicInferenceContext(BaseInferenceContext):
         # Get the selected token ids for all tokens.
         # We shift the active token window left by one to remove the first prompt token for
         # prefill requests and then set the token ids explicitly for the newly generated tokens.
-        # This is necessary because we calculate the log probs *before* updating the request metadata.
+        # This is necessary because we calculate the log probs *before* updating the request metadata.  # noqa: E501
         #
         # Example (decode & prefill mix):
         #

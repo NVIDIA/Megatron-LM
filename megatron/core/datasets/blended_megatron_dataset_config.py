@@ -99,24 +99,24 @@ class BlendedMegatronDatasetConfig:
     def __post_init__(self) -> None:
         """Do asserts and set fields post init"""
         if self.fast_cache_load:
-            assert (
-                self.path_to_cache is not None
-            ), "--data-cache-path must be provided when using --dataloader-fast-cache-load."
-            assert (
-                self.blend is None
-            ), f"--dataloader-fast-cache-load and --data-path cannot be used together. \
+            assert self.path_to_cache is not None, (
+                "--data-cache-path must be provided when using --dataloader-fast-cache-load."
+            )
+            assert self.blend is None, (
+                f"--dataloader-fast-cache-load and --data-path cannot be used together. \
             Use --per-split-data-args-path or --train-data-path, --valid-data-path and \
             --test-data-path instead."
+            )
         if self.defer_npy_index_mmap:
-            assert (
-                self.path_to_cache is not None
-            ), "--data-cache-path must be provided when using --dataloader-defer-npy-index-mmap."
+            assert self.path_to_cache is not None, (
+                "--data-cache-path must be provided when using --dataloader-defer-npy-index-mmap."
+            )
         if self.blend_per_split is not None and any(self.blend_per_split):
             assert self.blend is None, "blend and blend_per_split are incompatible"
             assert self.split is None, "split and blend_per_split are incompatible"
-            assert len(self.blend_per_split) == len(
-                Split
-            ), f"blend_per_split must contain {len(Split)} blends"
+            assert len(self.blend_per_split) == len(Split), (
+                f"blend_per_split must contain {len(Split)} blends"
+            )
             for split in Split:
                 if self.blend_per_split[split.value] is None:
                     log_single_rank(
@@ -125,14 +125,14 @@ class BlendedMegatronDatasetConfig:
                 else:
                     assert self.blend_per_split[split.value][1] is None or len(
                         self.blend_per_split[split.value][0]
-                    ) == len(
-                        self.blend_per_split[split.value][1]
-                    ), "blend per split prefixes and weights must be equal in number"
+                    ) == len(self.blend_per_split[split.value][1]), (
+                        "blend per split prefixes and weights must be equal in number"
+                    )
         else:
             if self.blend is not None:
-                assert self.blend[1] is None or len(self.blend[0]) == len(
-                    self.blend[1]
-                ), "blend prefixes and weights must be equal in number"
+                assert self.blend[1] is None or len(self.blend[0]) == len(self.blend[1]), (
+                    "blend prefixes and weights must be equal in number"
+                )
                 assert self.split is not None, "split must be provided when blend is not None"
             else:
                 self.mock = True

@@ -322,7 +322,8 @@ def test_generated_tokens_is_direct_list_field(basic_request):
 
 
 def test_request_record_merge_across_eviction_recovery():
-    """Test RequestRecord.merge() combines events from multiple checkpoints across eviction/recovery.
+    """Test RequestRecord.merge() combines events from multiple
+    checkpoints across eviction/recovery.
 
     Coverage:
     - RequestRecord creation and merge()

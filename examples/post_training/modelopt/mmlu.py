@@ -1,16 +1,19 @@
 # Copyright (c) 2024, NVIDIA CORPORATION. All rights reserved.
 
 """Sample Generate GPT."""
+
 import functools
+import logging
 import os
 import sys
 import warnings
+
 import datasets
-import logging
 import torch.distributed as dist
 
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "../../../")))
 
+import modelopt.torch.quantization as mtq
 import torch
 from diskcache import Cache
 
@@ -21,13 +24,13 @@ from megatron.post_training.model_builder import modelopt_gpt_mamba_builder
 from megatron.post_training.utils import report_current_memory_info
 from megatron.training import get_args, get_model, get_tokenizer, initialize_megatron
 from megatron.training.utils import print_rank_0, unwrap_model
-import modelopt.torch.quantization as mtq
 from model_provider import model_provider
 
 logger = logging.getLogger(__name__)
-logger.setLevel(logging.INFO) # set to debug if you need more logging
+logger.setLevel(logging.INFO)  # set to debug if you need more logging
 
 warnings.filterwarnings('ignore')
+
 
 def add_mmlu_args(parser):
     """Add additional arguments for ModelOpt text generation PTQ."""
@@ -35,8 +38,17 @@ def add_mmlu_args(parser):
     group.add_argument("--disable-tqdm", action="store_true", help="Disable tqdm.")
     group.add_argument("--fraction", type=float, default=1.0, help="Fraction of dataset to use.")
     group.add_argument("--lower-bound", type=float, default=None)
-    group.add_argument("--no-subject-prompt", action="store_true", help="Use empty prompt instead of subject-based prompt.")
-    group.add_argument("--mmlu-dataset", type=str, default="cais/mmlu", help="The default dataset to use is cais/mmlu from the HG hub.")
+    group.add_argument(
+        "--no-subject-prompt",
+        action="store_true",
+        help="Use empty prompt instead of subject-based prompt.",
+    )
+    group.add_argument(
+        "--mmlu-dataset",
+        type=str,
+        default="cais/mmlu",
+        help="The default dataset to use is cais/mmlu from the HG hub.",
+    )
     group.add_argument("--cache-dir", type=str, default=None)
     add_modelopt_args(parser)
     return parser
@@ -157,7 +169,9 @@ if __name__ == "__main__":
             UserWarning,
         )
 
-    model = get_model(functools.partial(model_provider, modelopt_gpt_mamba_builder), wrap_with_ddp=False)
+    model = get_model(
+        functools.partial(model_provider, modelopt_gpt_mamba_builder), wrap_with_ddp=False
+    )
     report_current_memory_info()
 
     # Materialize the model from meta device to gpu before loading the checkpoint.
@@ -193,8 +207,10 @@ if __name__ == "__main__":
             if idx > args.fraction * len(test_data):
                 break
             label = ["A", "B", "C", "D"][test_example["answer"]]
-            prompt = generate_prompt(test_example, dev_data, few_shots=0, no_subject_prompt=args.no_subject_prompt)
-            cache_key = f"{args.load}_{subject}_{prompt}" # model name, subject, prompt
+            prompt = generate_prompt(
+                test_example, dev_data, few_shots=0, no_subject_prompt=args.no_subject_prompt
+            )
+            cache_key = f"{args.load}_{subject}_{prompt}"  # model name, subject, prompt
 
             if cache_key in cache:
                 predict = cache[cache_key]

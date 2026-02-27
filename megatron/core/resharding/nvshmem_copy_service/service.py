@@ -384,7 +384,7 @@ class RemoteCopyService:
                     # Skip same-PE transfers (handled separately by process_self_moves)
                     if b.src_pe == b.dest_pe:
                         PELogger.debug(
-                            f"  Iter {i}: Skipping same-PE batch " f"({b.src_pe} → {b.dest_pe})"
+                            f"  Iter {i}: Skipping same-PE batch ({b.src_pe} → {b.dest_pe})"
                         )
                         continue
 

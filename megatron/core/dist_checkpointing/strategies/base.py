@@ -1,6 +1,6 @@
 # Copyright (c) 2022-2023, NVIDIA CORPORATION.  All rights reserved.
 
-""" Strategies base interfaces. """
+"""Strategies base interfaces."""
 
 from abc import ABC, abstractmethod
 from collections import defaultdict

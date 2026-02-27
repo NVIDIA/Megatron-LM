@@ -1,5 +1,6 @@
 # Copyright (c) 2022-2024, NVIDIA CORPORATION.  All rights reserved.
-""" Helpers for converting a dense model to a MoE model in runtime """
+"""Helpers for converting a dense model to a MoE model in runtime"""
+
 import copy
 from enum import Enum
 
@@ -64,9 +65,9 @@ def _get_config(moe_model, dense_model):
 
     # Find experts sub-module in moe model and get relatived args
     experts = _find_submodule(mlp, "experts")
-    assert (
-        experts is not None
-    ), f'The model is not supported by upcycling. Can not find experts in {mlp}'
+    assert experts is not None, (
+        f'The model is not supported by upcycling. Can not find experts in {mlp}'
+    )
     if isinstance(experts, SequentialMLP):
         experts_type = ExpertsType.SequentialMLP
     elif isinstance(experts, TEGroupedMLP):
@@ -83,13 +84,13 @@ def _get_config(moe_model, dense_model):
     dense_ffn_hidden_size = dense_mlp.config.ffn_hidden_size
 
     # calc granularity and expansion_rate
-    assert (
-        dense_ffn_hidden_size % moe_ffn_hidden_size == 0
-    ), "The ffn hidden size of dense model must be divisible by ffn hidden size of moe model."
+    assert dense_ffn_hidden_size % moe_ffn_hidden_size == 0, (
+        "The ffn hidden size of dense model must be divisible by ffn hidden size of moe model."
+    )
     granularity = dense_ffn_hidden_size // moe_ffn_hidden_size
-    assert (
-        num_experts % granularity == 0
-    ), "The number of experts must be divisible by granularity for upcycling"
+    assert num_experts % granularity == 0, (
+        "The number of experts must be divisible by granularity for upcycling"
+    )
     expansion_rate = num_experts // granularity
 
     return (

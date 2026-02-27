@@ -1,11 +1,9 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
 import copy
-import os
 import random
 import string
 import time
-from argparse import Namespace
 from collections import OrderedDict
 from typing import Dict
 from unittest import mock
@@ -25,14 +23,12 @@ from megatron.core.inference.text_generation_controllers.vlm_text_generation_con
 from megatron.core.models.gpt.gpt_layer_specs import get_gpt_layer_local_spec
 from megatron.core.models.multimodal.llava_model import LLaVAModel
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
-from megatron.core.transformer.enums import AttnBackend
 from megatron.core.transformer.module import Float16Module
 from megatron.core.transformer.transformer_config import TransformerConfig
 from tests.unit_tests.test_utilities import Utils
 
 
 class TestVLMTextGenerationController:
-
     @pytest.mark.internal  # The model is under active development and its methods may change.
     def setup_method(self, method):
         Utils.initialize_model_parallel(1, 1)
@@ -150,11 +146,11 @@ class TestVLMTextGenerationController:
         )
 
         for request_id, request in requests.items():
-            assert (
-                request.status == Status.COMPLETED
-            ), f"Status should be completed but its {request.status}"
+            assert request.status == Status.COMPLETED, (
+                f"Status should be completed but its {request.status}"
+            )
             assert request.generated_length > 0, f"Generated length should be greater than zero"
             assert request.generated_text is not None, "Generated text should not be None"
-            assert (
-                all_prompt_tokens[request_id] == request.prompt_tokens
-            ), "Prompt tokens should not have changed during generation"
+            assert all_prompt_tokens[request_id] == request.prompt_tokens, (
+                "Prompt tokens should not have changed during generation"
+            )

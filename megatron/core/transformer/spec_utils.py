@@ -55,8 +55,7 @@ def import_module(module_path: Tuple[str]):
     return vars(module)[name]
 
 
-# pylint: disable=missing-function-docstring
-def get_module(spec_or_module: Union[ModuleSpec, type], **additional_kwargs):
+def get_module(spec_or_module: Union[ModuleSpec, type], **additional_kwargs):  # noqa: D103
     """Returns or imports the provided module."""
     # If a module clas is already provided return it as is
     if isinstance(spec_or_module, (type, types.FunctionType)):

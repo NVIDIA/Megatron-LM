@@ -6,9 +6,8 @@ import torch
 from torch.autograd import Variable
 from torch.nn.parameter import Parameter
 
-from megatron.training import get_args
 from megatron.core import mpu, tensor_parallel
-
+from megatron.training import get_args
 
 _FLOAT_TYPES = (torch.FloatTensor, torch.cuda.FloatTensor)
 _HALF_TYPES = (torch.HalfTensor, torch.cuda.HalfTensor)

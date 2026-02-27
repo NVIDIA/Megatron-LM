@@ -86,12 +86,12 @@ class MegatronTokenizer:
 
         if tokenizer_library in ['multimodal']:
             assert 'prompt_format' in kwargs, "Prompt format (`prompt_format`) must be specified."
-            assert (
-                'special_tokens' in kwargs
-            ), "Special tokens (`special_tokens`) must be specified."
-            assert (
-                'image_tag_type' in kwargs
-            ), "Image tag type (`image_tag_type`) must be specified."
+            assert 'special_tokens' in kwargs, (
+                "Special tokens (`special_tokens`) must be specified."
+            )
+            assert 'image_tag_type' in kwargs, (
+                "Image tag type (`image_tag_type`) must be specified."
+            )
 
         # Initialize tokenizer object
         tokenizer_cls = _get_tokenizer_model_class(tokenizer_library, metadata)
@@ -133,9 +133,9 @@ class MegatronTokenizer:
             )
         """
 
-        assert os.path.exists(
-            tokenizer_path
-        ), "Tokenizer path doesn't exist. Please, provide the correct path to the tokenizer."
+        assert os.path.exists(tokenizer_path), (
+            "Tokenizer path doesn't exist. Please, provide the correct path to the tokenizer."
+        )
         assert tokenizer_library in TEXT_LIBRARIES or tokenizer_library in VISION_LIBRARIES, (
             "Tokenizer library is not supported. Please, see the list of available "
             f"tokenizer libraries: text: {TEXT_LIBRARIES}, vision: {VISION_LIBRARIES}."

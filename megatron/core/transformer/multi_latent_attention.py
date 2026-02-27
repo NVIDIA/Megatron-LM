@@ -101,7 +101,6 @@ class MultiLatentAttention(Attention):
         cp_comm_type: Optional[str] = None,
         pg_collection: Optional[ProcessGroupCollection] = None,
     ) -> None:
-
         super().__init__(
             config=config,
             submodules=submodules,
@@ -138,7 +137,6 @@ class MultiLatentAttention(Attention):
                 cp_group=self.pg_collection.cp,
             )
         elif self.config.rope_type == "yarn":
-
             self.rotary_pos_emb = YarnRotaryEmbedding(
                 self.config.qk_pos_emb_head_dim,
                 rotary_base=self.config.rotary_base,
@@ -222,21 +220,21 @@ class MultiLatentAttention(Attention):
         """Forward pass for multi-latent attention"""
         assert rotary_pos_emb is None, "Rotary position embeddings should not be passed into MLA."
         assert attention_bias is None, "Attention bias should not be passed into MLA."
-        assert (
-            rotary_pos_cos is None and rotary_pos_sin is None
-        ), "MLA does not support Flash Decoding"
+        assert rotary_pos_cos is None and rotary_pos_sin is None, (
+            "MLA does not support Flash Decoding"
+        )
         assert not rotary_pos_cos_sin, "Flash-infer rope has not been tested with MLA."
-        assert not (
-            self.training and self.cache_mla_latents
-        ), "cache_mla_latents conflicts with training."
+        assert not (self.training and self.cache_mla_latents), (
+            "cache_mla_latents conflicts with training."
+        )
 
         # hidden_states: [sq, b, h]
 
         inference_context = deprecate_inference_params(inference_context, inference_params)
         if inference_context and not inference_context.is_static_batching():
-            assert (
-                self.config.cache_mla_latents
-            ), "currently to use dynamic backend for MLA cache mla latents must be true"
+            assert self.config.cache_mla_latents, (
+                "currently to use dynamic backend for MLA cache mla latents must be true"
+            )
 
         if self.config.cache_mla_latents:
             self.prepare_for_absorption()
@@ -526,14 +524,14 @@ class MLASelfAttention(MultiLatentAttention):
         """
         # s = sequence length, b = batch size, h = hidden size, n = num attention heads
         # Attention heads [s, b, n*h]
-        assert (
-            hidden_states.ndim == 3
-        ), f"hidden_states should be 3D, [s, b, n*h], got {hidden_states.ndim}D"
+        assert hidden_states.ndim == 3, (
+            f"hidden_states should be 3D, [s, b, n*h], got {hidden_states.ndim}D"
+        )
         if packed_seq_params is not None:
-            assert (
-                packed_seq_params.local_cp_size is None
-            ), "hybrid_context_parallel is not supported with MLA yet and is planned for future. \
+            assert packed_seq_params.local_cp_size is None, (
+                "hybrid_context_parallel is not supported with MLA yet and is planned for future. \
             Please disable hybrid_context_parallel."
+            )
 
         inference_context = deprecate_inference_params(inference_context, inference_params)
 
@@ -845,9 +843,9 @@ class MLASelfAttention(MultiLatentAttention):
             )
         else:
             if self.cache_mla_latents:
-                assert (
-                    inference_context and not inference_context.is_static_batching()
-                ), "Caching MLA latents only works with dynamic backend inference"
+                assert inference_context and not inference_context.is_static_batching(), (
+                    "Caching MLA latents only works with dynamic backend inference"
+                )
                 query, key, value = qkv_up_proj_and_rope_apply_for_cached_latent_kv(
                     q_compressed, kv_compressed, k_pos_emb, rotary_pos_emb
                 )
@@ -999,8 +997,10 @@ class MLASelfAttention(MultiLatentAttention):
 
         assert self.core_attention.current_max_attn_logits.shape == (
             self.num_attention_heads_per_partition,
-        ), f"current_max_attn_logits shape is not ({self.num_attention_heads_per_partition}, ) \
+        ), (
+            f"current_max_attn_logits shape is not ({self.num_attention_heads_per_partition}, ) \
                     but {self.core_attention.current_max_attn_logits.shape}"
+        )
 
         # only update the weight if any head has
         # current_max_attn_logits > qk_clip_threshold
@@ -1010,8 +1010,10 @@ class MLASelfAttention(MultiLatentAttention):
             # qk_clip_balancing_eta (n, 1, 1)
             assert self.core_attention.current_max_attn_logits.shape == (
                 self.num_attention_heads_per_partition,
-            ), f"current_max_attn_logits shape is not ({self.num_attention_heads_per_partition},) \
+            ), (
+                f"current_max_attn_logits shape is not ({self.num_attention_heads_per_partition},) \
                 but {self.core_attention.current_max_attn_logits.shape}"
+            )
             self.qk_clip_balancing_eta = torch.clamp(
                 self.config.qk_clip_threshold / self.core_attention.current_max_attn_logits, max=1.0
             ).view(self.num_attention_heads_per_partition, 1, 1)

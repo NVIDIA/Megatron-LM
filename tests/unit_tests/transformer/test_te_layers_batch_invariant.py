@@ -1,10 +1,8 @@
 # Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
-import importlib
 import os
 
 import pytest
 import torch
-import torch.distributed as dist
 
 from megatron.core.extensions.transformer_engine import (
     TEColumnParallelLinear,
@@ -23,7 +21,7 @@ from megatron.core.utils import init_method_normal, is_te_min_version
 from tests.unit_tests.test_utilities import Utils
 
 try:
-    import flash_attn_3
+    import flash_attn_3  # noqa: F401
 
     HAVE_FA3 = True
 except ImportError:
@@ -480,9 +478,9 @@ def test_te_column_parallel_linear_parity():
         out_regular, _ = layer_regular(x_clone)
 
     # Check forward outputs are close
-    assert (
-        out_bik.shape == out_regular.shape
-    ), f"Shape mismatch: {out_bik.shape} vs {out_regular.shape}"
+    assert out_bik.shape == out_regular.shape, (
+        f"Shape mismatch: {out_bik.shape} vs {out_regular.shape}"
+    )
     max_diff = (out_bik - out_regular).abs().max().item()
     assert max_diff < 1e-3, f"Forward output difference too large: {max_diff}"
 

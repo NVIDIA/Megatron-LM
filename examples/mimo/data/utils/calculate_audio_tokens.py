@@ -1,5 +1,4 @@
 import math
-import torch
 from types import SimpleNamespace
 
 # Model-specific audio processing parameters
@@ -11,7 +10,7 @@ AUDIO_MODEL_PARAMS = {
         "encoder_down_sampling": 2,
         "d_model": 512,
         "max_length_seconds": 30.0,
-    },
+    }
 }
 
 
@@ -42,7 +41,6 @@ def calculate_num_mel_frames(audio_length, sample_rate, window_stride, window_le
 
 
 def calculate_num_audio_tokens(audio_tensor, model_name):
-
     # Get audio length in samples
     audio_length = audio_tensor.shape[1]
 
@@ -52,7 +50,6 @@ def calculate_num_audio_tokens(audio_tensor, model_name):
         model_type = model_params.model_type
     else:
         raise ValueError(f"Unsupported model name: {model_name}")
-
 
     if model_type == "whisper":
         num_mel_frames = calculate_num_mel_frames(

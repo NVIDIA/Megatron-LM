@@ -227,10 +227,10 @@ class Timers:
         """
         self._log_level = log_level
         allowed_log_options = set(['max', 'minmax', 'all'])
-        assert (
-            log_option in allowed_log_options
-        ), 'input log option {} is invalid. It must be one of {}'.format(
-            log_option, allowed_log_options
+        assert log_option in allowed_log_options, (
+            'input log option {} is invalid. It must be one of {}'.format(
+                log_option, allowed_log_options
+            )
         )
         self._log_option = log_option
         self._timers = {}
@@ -253,10 +253,10 @@ class Timers:
         # set it to the max log level which is 2.
         if log_level is None:
             log_level = self._max_log_level
-        assert (
-            log_level <= self._max_log_level
-        ), 'log level {} is larger than max supported log level {}'.format(
-            log_level, self._max_log_level
+        assert log_level <= self._max_log_level, (
+            'log level {} is larger than max supported log level {}'.format(
+                log_level, self._max_log_level
+            )
         )
         # Now if the input log level is larger than the one set for
         # the timers class, just ignore it and return a dummy timer.

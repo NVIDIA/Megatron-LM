@@ -24,7 +24,8 @@ class EncoderDecoderTextGenerationController(TextGenerationController):
         active_requests: OrderedDict[str, InferenceRequest],
         use_attention_mask: bool = False,
     ) -> Dict[str, Any]:
-        """Preparing input data for inference, using respective wrapper's prep_inference_input method # pylint: disable=line-too-long
+        """Preparing input data for inference, using respective
+        wrapper's prep_inference_input method
 
         Args:
             prompts_tokens (torch.Tensor): A tensor of shape [batch_size, max_sequence_length]

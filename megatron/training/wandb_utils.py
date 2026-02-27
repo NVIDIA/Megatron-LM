@@ -16,8 +16,11 @@ def _get_artifact_name_and_version(save_dir: Path, checkpoint_path: Path) -> Tup
     return save_dir.stem, checkpoint_path.stem
 
 
-def on_save_checkpoint_success(checkpoint_path: str, tracker_filename: str, save_dir: str, iteration: int) -> None:
-    """Function to be called after checkpointing succeeds and checkpoint is persisted for logging it as an artifact in W&B
+def on_save_checkpoint_success(
+    checkpoint_path: str, tracker_filename: str, save_dir: str, iteration: int
+) -> None:
+    """Function to be called after checkpointing succeeds and
+    checkpoint is persisted for logging it as an artifact in W&B
 
     Args:
         checkpoint_path (str): path of the saved checkpoint
@@ -30,7 +33,9 @@ def on_save_checkpoint_success(checkpoint_path: str, tracker_filename: str, save
 
     if wandb_writer:
         metadata = {"iteration": iteration}
-        artifact_name, artifact_version = _get_artifact_name_and_version(Path(save_dir), Path(checkpoint_path))
+        artifact_name, artifact_version = _get_artifact_name_and_version(
+            Path(save_dir), Path(checkpoint_path)
+        )
         artifact = wandb_writer.Artifact(artifact_name, type="model", metadata=metadata)
         # wandb's artifact.add_reference requires absolute paths
         checkpoint_path = str(Path(checkpoint_path).resolve())
@@ -42,7 +47,8 @@ def on_save_checkpoint_success(checkpoint_path: str, tracker_filename: str, save
 
 
 def on_load_checkpoint_success(checkpoint_path: str, load_dir: str) -> None:
-    """Function to be called after succesful loading of a checkpoint, for aggregation and logging it to W&B
+    """Function to be called after succesful loading of a checkpoint,
+    for aggregation and logging it to W&B
 
     Args:
         checkpoint_path (str): path of the loaded checkpoint
@@ -51,10 +57,12 @@ def on_load_checkpoint_success(checkpoint_path: str, load_dir: str) -> None:
     """
 
     wandb_writer = get_wandb_writer()
-    
+
     if wandb_writer:
         try:
-            artifact_name, artifact_version = _get_artifact_name_and_version(Path(load_dir), Path(checkpoint_path))
+            artifact_name, artifact_version = _get_artifact_name_and_version(
+                Path(load_dir), Path(checkpoint_path)
+            )
             wandb_tracker_filename = _get_wandb_artifact_tracker_filename(load_dir)
             artifact_path = ""
             if wandb_tracker_filename.is_file():

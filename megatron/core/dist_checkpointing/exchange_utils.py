@@ -411,7 +411,7 @@ def exchange_loaded_tensors_gather_object(
         log_single_rank(
             logger,
             logging.ERROR,
-            f"{err_msg}. Shards ids by rank:" f" {[lt.keys() for lt in all_loaded_tensors_list]}",
+            f"{err_msg}. Shards ids by rank: {[lt.keys() for lt in all_loaded_tensors_list]}",
         )
         raise CheckpointingException(err_msg)
 
@@ -419,7 +419,7 @@ def exchange_loaded_tensors_gather_object(
 
 
 def exchange_loaded_objects_gather_object(
-    loaded_objects: Dict[_ShardId, Any]
+    loaded_objects: Dict[_ShardId, Any],
 ) -> Dict[_ShardId, Any]:
     """Exchange the objects loaded by different ranks with a simple all_gather_object call.
 
@@ -442,7 +442,7 @@ def exchange_loaded_objects_gather_object(
         log_single_rank(
             logger,
             logging.ERROR,
-            f"{err_msg}. Shards ids by rank:" f" {[lt.keys() for lt in all_loaded_objects_list]}",
+            f"{err_msg}. Shards ids by rank: {[lt.keys() for lt in all_loaded_objects_list]}",
         )
         raise CheckpointingException(err_msg)
 

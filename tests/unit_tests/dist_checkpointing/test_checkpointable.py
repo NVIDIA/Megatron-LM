@@ -1,7 +1,6 @@
 # Copyright (c) 2025, NVIDIA CORPORATION. All rights reserved.
 import pytest
 import torch
-from packaging import version
 from torch.distributed.checkpoint import FileSystemReader, TensorStorageMetadata
 
 from megatron.core.dist_checkpointing import ShardedTensor

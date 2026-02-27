@@ -1,6 +1,7 @@
 # Copyright (c) 2025, NVIDIA CORPORATION. All rights reserved.
 
 """Convert a GPTModel."""
+
 import functools
 import json
 import os
@@ -24,7 +25,7 @@ from megatron.post_training.utils import (
     report_current_memory_info,
     to_empty_if_meta,
 )
-from megatron.training import get_args, get_tokenizer
+from megatron.training import get_args
 from megatron.training.checkpointing import save_checkpoint
 from megatron.training.initialize import initialize_megatron
 from megatron.training.utils import print_rank_0, unwrap_model
@@ -136,10 +137,7 @@ if __name__ == "__main__":
         print_rank_0(
             "Import model from Hugging Face checkpoint in dtype {}.".format(str(import_dtype))
         )
-        import_kwargs = {
-            "dtype": import_dtype,
-            "moe_router_dtype": args.moe_router_dtype,
-        }
+        import_kwargs = {"dtype": import_dtype, "moe_router_dtype": args.moe_router_dtype}
         if modelopt_version_at_least("0.41.0"):
             import_kwargs.update({"trust_remote_code": args.trust_remote_code})
         import_mcore_gpt_from_hf(

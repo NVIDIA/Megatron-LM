@@ -6,7 +6,6 @@ from megatron.core.export.model_type import ModelType
 
 # TODO : Remove importorskip and handle with mocker
 class TestTRTLLMHelper:
-
     def test_exceptions(self, mocker):
         pytest.importorskip('tensorrt_llm')
 

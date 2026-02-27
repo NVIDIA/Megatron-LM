@@ -38,12 +38,12 @@ class AbstractModelInferenceWrapper(abc.ABC):
     @deprecate_args(*DEPRECATED_ARGS)
     def __init__(
         self,
-        model: Union['LegacyGPTModel', GPTModel],  # type: ignore[name-defined]
+        model: Union['LegacyGPTModel', GPTModel],  # type: ignore[name-defined]  # noqa: F821
         inference_context: BaseInferenceContext,
     ):
-        assert not isinstance(
-            model, Iterable
-        ), 'interleaving schedule is not supported for inference'
+        assert not isinstance(model, Iterable), (
+            'interleaving schedule is not supported for inference'
+        )
         self.model = model
         self.config = get_model_config(self.model)
         self.pipeline_communication_dtype = (

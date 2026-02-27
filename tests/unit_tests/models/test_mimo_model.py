@@ -1,7 +1,7 @@
 # Copyright (c) 2025, NVIDIA CORPORATION. All rights reserved.
 
 '''
-WORLD_SIZE=1 LOCAL_RANK=0 python -m pytest tests/unit_tests/models/test_mimo_model.py 
+WORLD_SIZE=1 LOCAL_RANK=0 python -m pytest tests/unit_tests/models/test_mimo_model.py
 '''
 
 import math
@@ -324,9 +324,9 @@ class TestMimoModel:
         # Make sure there's enough space in the sequence for all image tokens in each sample
         for b in range(self.batch_size):
             tokens_needed = images_per_sample[b] * expected_img_seq_len
-            assert (
-                start_pos + tokens_needed <= self.seq_len
-            ), f"Sequence length too short for image tokens in sample {b}"
+            assert start_pos + tokens_needed <= self.seq_len, (
+                f"Sequence length too short for image tokens in sample {b}"
+            )
 
         # Add image tokens to each batch sample according to its number of images
         for b in range(self.batch_size):

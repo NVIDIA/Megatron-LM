@@ -54,8 +54,9 @@ class DynamicGradScaler(MegatronGradScaler):
     """
     Grad scaler with dynamic scale that gets adjusted during training.
 
-    Reduces loss scale by `backoff_factor` if `hysteresis` number of NaNs are seen in a row. Increases
-    loss scale by `growth_factor` if NaNs are not seen for `growth_interval` iterations.
+    Reduces loss scale by `backoff_factor` if `hysteresis` number of
+    NaNs are seen in a row. Increases loss scale by `growth_factor`
+    if NaNs are not seen for `growth_interval` iterations.
     """
 
     def __init__(
@@ -73,12 +74,16 @@ class DynamicGradScaler(MegatronGradScaler):
         Args:
             initial_scale (float): Initial loss scale value.
             min_scale (float): Minimum loss scale value.
-            growth_factor (float): Factor to grow loss scale by if NaNs are not seen in `growth_interval`
-                training iterations. Must be greater than 1.
-            backoff_factor (float): Factor to decrease loss scale by if NaNs are seen in `hysteresis`
-                consecutive training iterations. Must be between 0 and 1.
-            growth_interval (int): Number of training iterations of no NaNs before loss scale is increased.
-            hysteresis (int): Number of training iterations of consecutive NaNs before loss scale is decreased.
+            growth_factor (float): Factor to grow loss scale by if
+                NaNs are not seen in `growth_interval` training
+                iterations. Must be greater than 1.
+            backoff_factor (float): Factor to decrease loss scale by
+                if NaNs are seen in `hysteresis` consecutive training
+                iterations. Must be between 0 and 1.
+            growth_interval (int): Number of training iterations of
+                no NaNs before loss scale is increased.
+            hysteresis (int): Number of training iterations of
+                consecutive NaNs before loss scale is decreased.
         """
         super(DynamicGradScaler, self).__init__(initial_scale)
 

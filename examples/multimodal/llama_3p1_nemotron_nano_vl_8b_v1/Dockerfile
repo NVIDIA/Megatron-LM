@@ -29,7 +29,7 @@ RUN pip install numpy
 RUN pip install einops einops-exts sentencepiece braceexpand webdataset packaging
 RUN pip install transformers datasets accelerate timm
 RUN pip install pytest-cov pytest_mock nltk wrapt
-RUN pip install black isort pylint mypy click
+RUN pip install ruff mypy click
 RUN pip install mistral-common tiktoken
 RUN pip install git+https://github.com/openai/CLIP.git
 RUN pip install fairscale fire blobfile

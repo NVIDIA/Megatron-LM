@@ -159,9 +159,9 @@ class _ParamAndGradBucketGroup:
         if self.ddp_config.num_distributed_optimizer_instances > 1:
             self.inter_distributed_optimizer_instance_group = None
             self.communication_stream = None
-            assert (
-                not self.ddp_config.reduce_scatter_with_fp32_accumulation
-            ), "RS w/ FP32 accumulation not supported with num_distributed_optimizer_instances > 1"
+            assert not self.ddp_config.reduce_scatter_with_fp32_accumulation, (
+                "RS w/ FP32 accumulation not supported with num_distributed_optimizer_instances > 1"
+            )
 
         global dist_reduce_scatter_func
         if self.ddp_config.reduce_scatter_with_fp32_accumulation:
@@ -378,9 +378,9 @@ class _ParamAndGradBucketGroup:
             # already been dispatched.
             return
 
-        assert (
-            self.grad_reduce_handle is None
-        ), "Should not have multiple communication calls outstanding at once"
+        assert self.grad_reduce_handle is None, (
+            "Should not have multiple communication calls outstanding at once"
+        )
 
         if self.ddp_config.check_for_nan_in_grad or self.ddp_config.check_for_large_grads:
             self.check_grads(
@@ -490,9 +490,9 @@ class _ParamAndGradBucketGroup:
 
         if async_op:
             if self.ddp_config.reduce_scatter_with_fp32_accumulation and not force_all_reduce:
-                assert (
-                    len(self.buckets) == 1
-                ), "Only 1 bucket supported with reduce_scatter_with_fp32_accumulation=True"
+                assert len(self.buckets) == 1, (
+                    "Only 1 bucket supported with reduce_scatter_with_fp32_accumulation=True"
+                )
                 # torch.distributed._coalescing_manager does not correctly handle calling our custom
                 # collective handle's .wait() method, so we take matters into our own hands here.
                 assert grad_reduce_handle is not None
@@ -549,9 +549,9 @@ class _ParamAndGradBucketGroup:
         grads as ready when processing the last microbatch and ddp_config.overlap_grad_reduce
         is True.
         """
-        assert (
-            self.ddp_config.overlap_grad_reduce
-        ), "register_grad_ready() should only be called when overlap_grad_reduce is True"
+        assert self.ddp_config.overlap_grad_reduce, (
+            "register_grad_ready() should only be called when overlap_grad_reduce is True"
+        )
         if self.is_last_microbatch:
             assert param in self.param_to_bucket, "Param is not in the bucket group"
             if param not in self.per_param_grad_ready_counts:
@@ -600,7 +600,6 @@ class _ParamAndGradBuffer:
         nccl_ub: bool,
         pg_collection: Optional[ProcessGroupCollection] = None,
     ):
-
         if pg_collection is None:
             self.dp_cp_group = parallel_state.get_data_and_context_parallel_group(
                 with_context_parallel=True

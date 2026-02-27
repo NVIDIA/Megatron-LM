@@ -107,9 +107,9 @@ def triton_append_key_value_cache(
         and memory_buffer.device.type == 'cuda'
     ), "All tensors must be on CUDA devices."
 
-    assert (
-        key.size(1) == 1 and value.size(1) == 1
-    ), "Key and Value should have a sequence length of 1."
+    assert key.size(1) == 1 and value.size(1) == 1, (
+        "Key and Value should have a sequence length of 1."
+    )
     key = key.squeeze(1)
     value = value.squeeze(1)
 
@@ -127,15 +127,15 @@ def triton_append_key_value_cache(
     block_idx_active = token_to_block_idx[:n_tokens]
     local_kv_seq_idx_active = token_to_local_position_within_kv_block[:n_tokens]
 
-    assert (
-        key_cache.dim() == 4 and value_cache.dim() == 4
-    ), f"Sliced key_cache and value_cache should be 4D"
-    assert (
-        num_heads == key_cache.shape[-2]
-    ), f"Head count mismatch. Key/Value has {num_heads} but cache expects {key_cache.shape[-2]}."
-    assert (
-        h_dim == key_cache.shape[-1]
-    ), f"Head dimension mismatch. Key/Value has {h_dim} but cache expects {key_cache.shape[-1]}."
+    assert key_cache.dim() == 4 and value_cache.dim() == 4, (
+        f"Sliced key_cache and value_cache should be 4D"
+    )
+    assert num_heads == key_cache.shape[-2], (
+        f"Head count mismatch. Key/Value has {num_heads} but cache expects {key_cache.shape[-2]}."
+    )
+    assert h_dim == key_cache.shape[-1], (
+        f"Head dimension mismatch. Key/Value has {h_dim} but cache expects {key_cache.shape[-1]}."
+    )
 
     block_idx_active = block_idx_active.contiguous()
     local_kv_seq_idx_active = local_kv_seq_idx_active.contiguous()

@@ -29,7 +29,6 @@ Usage:
 """
 
 import argparse
-import glob
 import json
 import logging
 import math
@@ -37,7 +36,7 @@ import os
 import sys
 from pathlib import Path
 from statistics import mean, median, stdev
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional
 
 logging.basicConfig(level=logging.INFO, format='%(levelname)s: %(message)s')
 logger = logging.getLogger(__name__)
@@ -480,7 +479,8 @@ def compute_recommended_tolerances(
     Args:
         stats: Output from compute_statistics()
         aggregated: Raw aggregated data (needed for median calculations)
-        confidence_multiplier: Number of standard deviations for bounds (default 3.0 for ~99.7% coverage)
+        confidence_multiplier: Number of standard deviations for
+            bounds (default 3.0 for ~99.7% coverage)
         start_step: First step to include in tolerance calculation (skips warmup steps)
 
     Returns:
@@ -631,7 +631,7 @@ def format_summary(stats: Dict[str, Any], tolerances: Dict[str, Dict[str, float]
 
         if tol:
             lines.append(
-                f"  Max observed relative variance: {tol.get('max_observed_relative_variance', 'N/A'):.4%}"
+                f"  Max observed relative variance: {tol.get('max_observed_relative_variance', 'N/A'):.4%}"  # noqa: E501
             )
             lines.append(
                 f"  Recommended relative tolerance: {tol.get('relative_tolerance', 'N/A'):.2%}"
@@ -691,7 +691,7 @@ def main():
         type=float,
         default=1.5,
         help="Multiplier for observed max variance when computing recommended tolerance. "
-        "Example: if max observed variance is 5%% and multiplier is 1.5, recommended tolerance is 7.5%%. "
+        "Example: if max observed variance is 5%% and multiplier is 1.5, recommended tolerance is 7.5%%. "  # noqa: E501
         "Use higher values (2-3) for more safety margin. Default: 1.5",
     )
 
@@ -718,7 +718,7 @@ def main():
         default=0,
         help="Number of initial steps to skip (index-based, matching test behavior). "
         "Uses Python slicing [start_step:] so --start-step 10 skips first 10 items. "
-        "Default: 0 (include all). Set to match THROUGHPUT_TEST_PARAMS.--start_step from model_config.yaml.",
+        "Default: 0 (include all). Set to match THROUGHPUT_TEST_PARAMS.--start_step from model_config.yaml.",  # noqa: E501
     )
 
     args = parser.parse_args()
@@ -736,7 +736,7 @@ def main():
                 "The script looks for .out files and parses them to find the result JSON paths."
             )
             logger.info(
-                "Each .out file should contain: 'This test wrote results into /opt/megatron-lm/runs/<uuid>'"
+                "Each .out file should contain: 'This test wrote results into /opt/megatron-lm/runs/<uuid>'"  # noqa: E501
             )
             sys.exit(1)
         logger.info(f"Found {len(result_files)} result files from {args.results_dir}")
@@ -829,7 +829,7 @@ def main():
                     f"{var_name}_RELATIVE_TOLERANCE = "
                     f"{tol['relative_tolerance']}  # {tol['relative_tolerance']:.2%}"
                 )
-                print(f"{var_name}_ABSOLUTE_TOLERANCE = " f"{tol['absolute_tolerance']:.2e}")
+                print(f"{var_name}_ABSOLUTE_TOLERANCE = {tol['absolute_tolerance']:.2e}")
 
 
 if __name__ == "__main__":

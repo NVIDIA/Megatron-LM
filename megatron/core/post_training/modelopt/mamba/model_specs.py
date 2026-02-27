@@ -89,7 +89,9 @@ def get_mamba_stack_modelopt_spec(
         submodules=TransformerLayerSubmodules(
             pre_mlp_layernorm=Norm,
             mlp=get_moe_module_spec(
-                use_te=False, num_experts=8, moe_grouped_gemm=False  # Can be anything non None
+                use_te=False,
+                num_experts=8,
+                moe_grouped_gemm=False,  # Can be anything non None
             ),
             mlp_bda=get_bias_dropout_add,
         ),

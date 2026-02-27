@@ -5,7 +5,7 @@ import math
 import random
 import types
 from dataclasses import dataclass, field
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Optional
 
 import pytest
 import torch
@@ -15,10 +15,7 @@ from transformer_engine.pytorch.fp8 import check_fp8_support
 from megatron.core import parallel_state
 from megatron.core.inference.config import InferenceConfig, MambaInferenceStateConfig
 from megatron.core.inference.contexts.dynamic_context import (
-    ActiveRequestCountOverflowError,
-    BlockOverflowError,
     DynamicInferenceContext,
-    RequestOverflowError,
     TokenOverflowError,
 )
 from megatron.core.inference.engines import DynamicInferenceEngine
@@ -116,7 +113,6 @@ class DynamicEngineTestConfig:
     fp8: bool = False
 
     def __post_init__(self):
-
         # Compute max_sequence_length.
         assert self.max_sequence_length is None
         assert self.num_tokens_to_generate is None or self.num_tokens_total is None
@@ -144,13 +140,10 @@ class DynamicEngineTestEnv:
 
 
 class TestDynamicInferenceEngine:
-
     @classmethod
     def _build_requests(cls, test_config: DynamicEngineTestConfig) -> List[DynamicInferenceRequest]:
-
         requests = []
         for request_id in range(test_config.num_requests):
-
             # Prompt length.
             if test_config.min_prompt_length == test_config.max_prompt_length:
                 prompt_length = test_config.min_prompt_length
@@ -385,7 +378,7 @@ class TestDynamicInferenceEngine:
         # Inference model wrapper.
         inference_wrapped_model = GPTInferenceWrapper(model, inference_context)
 
-        # Note: the following is taken from AbstractModelInferenceWrapper.prep_model_for_inference().
+        # Note: the following is taken from AbstractModelInferenceWrapper.prep_model_for_inference().  # noqa: E501
         inference_wrapped_model.model_is_pipeline_parallel = not (
             parallel_state.is_pipeline_first_stage() and parallel_state.is_pipeline_last_stage()
         )
@@ -457,7 +450,6 @@ class TestDynamicInferenceEngine:
         # Add requests to engine.
         env.mem_usage["start"] = torch.cuda.memory_stats()
         for request in tqdm(env.requests, "add requests"):
-
             # Add request.
             env.engine._add_request(request)
             request.state = "pending"
@@ -475,10 +467,9 @@ class TestDynamicInferenceEngine:
 
         # Validate all requests finished.
         for request in env.requests:
-            assert request.status in (
-                Status.COMPLETED,
-                Status.FAILED,
-            ), f"request.status == '{request.status}'."
+            assert request.status in (Status.COMPLETED, Status.FAILED), (
+                f"request.status == '{request.status}'."
+            )
 
             num_tokens_to_generate = request.sampling_params.num_tokens_to_generate
             num_tokens_total = request.sampling_params.num_tokens_total
@@ -670,7 +661,6 @@ class TestDynamicInferenceEngine:
             (16, [80, 72, 64, 56, 48, 40, 32, 24, 16, 8]),
             (32, [80, 72, 64, 56, 48, 40, 32, 24, 16, 8]),
         ]:
-
             # Build cuda graphs (inside dynamic engine).
             env = self._build_test_env(
                 DynamicEngineTestConfig(
@@ -678,12 +668,13 @@ class TestDynamicInferenceEngine:
                 )
             )
             actual_cuda_graph_token_counts = env.engine.context.cuda_graph_token_counts
-            assert (
-                actual_cuda_graph_token_counts == expected_cuda_graph_token_counts
-            ), "num_cuda_graphs %d ... cuda_graph_token_counts: expected %s, found %s." % (
-                num_cuda_graphs,
-                expected_cuda_graph_token_counts,
-                actual_cuda_graph_token_counts,
+            assert actual_cuda_graph_token_counts == expected_cuda_graph_token_counts, (
+                "num_cuda_graphs %d ... cuda_graph_token_counts: expected %s, found %s."
+                % (
+                    num_cuda_graphs,
+                    expected_cuda_graph_token_counts,
+                    actual_cuda_graph_token_counts,
+                )
             )
 
     @pytest.mark.internal
@@ -723,14 +714,14 @@ class TestDynamicInferenceEngine:
         finished_requests = [r.merge() for r in finished_request_records]
 
         # Verify results
-        assert len(finished_requests) == len(
-            prompts
-        ), "Should return same number of finished requests as prompts"
+        assert len(finished_requests) == len(prompts), (
+            "Should return same number of finished requests as prompts"
+        )
 
         request_ids = [r.request_id for r in finished_requests]
-        assert request_ids == sorted(
-            request_ids
-        ), f"Request ids are not in sorted order: {request_ids}"
+        assert request_ids == sorted(request_ids), (
+            f"Request ids are not in sorted order: {request_ids}"
+        )
 
         # Check each request was processed
         for i, request in enumerate(finished_requests):
@@ -828,12 +819,12 @@ class TestDynamicInferenceEngine:
 
                 # Validate each prompt log prob
                 for i, log_prob in enumerate(request.prompt_log_probs):
-                    assert not math.isnan(
-                        log_prob
-                    ), f"Request {request.request_id}, prompt token {i}: log_prob is NaN"
-                    assert not math.isinf(
-                        log_prob
-                    ), f"Request {request.request_id}, prompt token {i}: log_prob is inf"
+                    assert not math.isnan(log_prob), (
+                        f"Request {request.request_id}, prompt token {i}: log_prob is NaN"
+                    )
+                    assert not math.isinf(log_prob), (
+                        f"Request {request.request_id}, prompt token {i}: log_prob is inf"
+                    )
                     assert log_prob <= 0.0, (
                         f"Request {request.request_id}, prompt token {i}: "
                         f"log_prob {log_prob} should be <= 0"
@@ -844,9 +835,9 @@ class TestDynamicInferenceEngine:
                     )
 
             # Validate generated log probs
-            assert (
-                request.generated_log_probs is not None
-            ), f"Request {request.request_id}: generated_log_probs should not be None"
+            assert request.generated_log_probs is not None, (
+                f"Request {request.request_id}: generated_log_probs should not be None"
+            )
             assert len(request.generated_log_probs) == len(request.generated_tokens), (
                 f"Request {request.request_id}: Expected {len(request.generated_tokens)} "
                 f"generated log probs, got {len(request.generated_log_probs)}"
@@ -854,12 +845,12 @@ class TestDynamicInferenceEngine:
 
             # Validate each generated log prob
             for i, log_prob in enumerate(request.generated_log_probs):
-                assert not math.isnan(
-                    log_prob
-                ), f"Request {request.request_id}, generated token {i}: log_prob is NaN"
-                assert not math.isinf(
-                    log_prob
-                ), f"Request {request.request_id}, generated token {i}: log_prob is inf"
+                assert not math.isnan(log_prob), (
+                    f"Request {request.request_id}, generated token {i}: log_prob is NaN"
+                )
+                assert not math.isinf(log_prob), (
+                    f"Request {request.request_id}, generated token {i}: log_prob is inf"
+                )
                 assert log_prob <= 0.0, (
                     f"Request {request.request_id}, generated token {i}: "
                     f"log_prob {log_prob} should be <= 0"
@@ -943,17 +934,16 @@ class TestDynamicInferenceEngine:
                 zip(request.generated_tokens, request.generated_log_probs)
             ):
                 # Basic validity checks
-                assert not math.isnan(
-                    log_prob
-                ), f"Request {request.request_id}, token {i}: log_prob is NaN"
-                assert not math.isinf(
-                    log_prob
-                ), f"Request {request.request_id}, token {i}: log_prob is inf"
+                assert not math.isnan(log_prob), (
+                    f"Request {request.request_id}, token {i}: log_prob is NaN"
+                )
+                assert not math.isinf(log_prob), (
+                    f"Request {request.request_id}, token {i}: log_prob is inf"
+                )
 
                 # Log probabilities should be <= 0 (since prob <= 1)
                 assert log_prob <= 0.0, (
-                    f"Request {request.request_id}, token {i}: "
-                    f"log_prob {log_prob} should be <= 0"
+                    f"Request {request.request_id}, token {i}: log_prob {log_prob} should be <= 0"
                 )
 
                 # Check reasonable range (not too negative)
@@ -1144,19 +1134,18 @@ class TestDynamicInferenceEngine:
         # All requests should complete with this generous config (large buffer, no gap steps).
         assert all(r.status == Status.COMPLETED for r in env.requests)
         for request in env.requests:
-
             # Verify event types for completed requests
             event_types = [e.type.name for e in request.events]
             # Should be: ADD_ENGINE, ADD_CONTEXT, GENERATED_TOKEN (repeated), FINISH
-            assert (
-                event_types[0] == 'ADD_ENGINE'
-            ), f"Request {request.request_id}: first event should be ADD_ENGINE, got {event_types[0]}"
-            assert (
-                event_types[1] == 'ADD_CONTEXT'
-            ), f"Request {request.request_id}: second event should be ADD_CONTEXT, got {event_types[1]}"
-            assert (
-                event_types[-1] == 'FINISH'
-            ), f"Request {request.request_id}: last event should be FINISH, got {event_types[-1]}"
+            assert event_types[0] == 'ADD_ENGINE', (
+                f"Request {request.request_id}: first event should be ADD_ENGINE, got {event_types[0]}"  # noqa: E501
+            )
+            assert event_types[1] == 'ADD_CONTEXT', (
+                f"Request {request.request_id}: second event should be ADD_CONTEXT, got {event_types[1]}"  # noqa: E501
+            )
+            assert event_types[-1] == 'FINISH', (
+                f"Request {request.request_id}: last event should be FINISH, got {event_types[-1]}"
+            )
             # Check that GENERATED_TOKEN events are in the middle
             gen_token_count = event_types.count('GENERATED_TOKEN')
             assert gen_token_count == len(request.generated_tokens), (
@@ -1169,24 +1158,24 @@ class TestDynamicInferenceEngine:
             for i in range(1, len(timestamps)):
                 assert timestamps[i] >= timestamps[i - 1], (
                     f"Request {request.request_id}: timestamp[{i}] ({timestamps[i]}) < "
-                    f"timestamp[{i-1}] ({timestamps[i-1]})"
+                    f"timestamp[{i - 1}] ({timestamps[i - 1]})"
                 )
 
             # Verify TTFT is positive and sensical (first GENERATED_TOKEN - ADD_ENGINE)
             add_engine_ts = request.events[0].timestamp
             first_token_ts = request.events[2].timestamp  # First GENERATED_TOKEN event
-            assert (
-                request.events[2].type.name == 'GENERATED_TOKEN'
-            ), f"Request {request.request_id}: event[2] should be GENERATED_TOKEN"
+            assert request.events[2].type.name == 'GENERATED_TOKEN', (
+                f"Request {request.request_id}: event[2] should be GENERATED_TOKEN"
+            )
             ttft = first_token_ts - add_engine_ts
             assert ttft >= 0, f"Request {request.request_id}: TTFT is negative ({ttft})"
 
             # Verify total request time is positive
             finish_ts = request.events[-1].timestamp
             total_time = finish_ts - add_engine_ts
-            assert (
-                total_time >= ttft
-            ), f"Request {request.request_id}: total_time ({total_time}) < TTFT ({ttft})"
+            assert total_time >= ttft, (
+                f"Request {request.request_id}: total_time ({total_time}) < TTFT ({ttft})"
+            )
 
     @pytest.mark.internal
     @pytest.mark.skipif(
@@ -1402,14 +1391,15 @@ class TestDynamicInferenceEngine:
     @torch.inference_mode()
     def test_chunked_prefill_with_log_probs(self):
         """
-        Test that chunked prefill correctly handles log probs with materialize_only_last_token_logits.
+        Test that chunked prefill correctly handles log probs with
+        materialize_only_last_token_logits.
         This verifies that intermediate log probs are properly discarded during chunked prefill.
         When materialize_only_last_token_logits=True, skip_prompt_log_probs must be True.
         """
         prompt_length = 1200
         num_tokens_to_generate = 8
 
-        # Run with chunked prefill, materialize_only_last_token_logits=True, and skip_prompt_log_probs=True
+        # Run with chunked prefill, materialize_only_last_token_logits=True, and skip_prompt_log_probs=True  # noqa: E501
         # This is the only valid combination for chunked prefill with last-token-only logits
         env = self._run_test(
             num_requests=1,
@@ -1431,9 +1421,9 @@ class TestDynamicInferenceEngine:
                 continue
 
             # Validate generated log probs
-            assert (
-                request.generated_log_probs is not None
-            ), f"Request {request.request_id}: generated_log_probs should not be None"
+            assert request.generated_log_probs is not None, (
+                f"Request {request.request_id}: generated_log_probs should not be None"
+            )
             assert len(request.generated_log_probs) == len(request.generated_tokens), (
                 f"Request {request.request_id}: Expected {len(request.generated_tokens)} "
                 f"generated log probs, got {len(request.generated_log_probs)}"
@@ -1442,7 +1432,7 @@ class TestDynamicInferenceEngine:
             # When skip_prompt_log_probs is True, prompt_log_probs should be empty
             assert request.prompt_log_probs is None or len(request.prompt_log_probs) == 0, (
                 f"Request {request.request_id}: prompt_log_probs should be empty when "
-                f"skip_prompt_log_probs=True, but got {len(request.prompt_log_probs) if request.prompt_log_probs else 0} items"
+                f"skip_prompt_log_probs=True, but got {len(request.prompt_log_probs) if request.prompt_log_probs else 0} items"  # noqa: E501
             )
 
             # Validate each generated log prob
@@ -1508,66 +1498,68 @@ class TestDynamicInferenceEngine:
             assert request.status == Status.COMPLETED, f"Request {request.request_id} not completed"
 
             # Validate generated top-n logprobs
-            assert hasattr(
-                request, 'generated_top_n_logprobs'
-            ), f"Request {request.request_id} missing generated_top_n_logprobs"
-            assert (
-                request.generated_top_n_logprobs is not None
-            ), f"Request {request.request_id} has None generated_top_n_logprobs"
-            assert len(request.generated_top_n_logprobs) == len(
-                request.generated_tokens
-            ), f"Request {request.request_id}: generated_top_n_logprobs length mismatch"
+            assert hasattr(request, 'generated_top_n_logprobs'), (
+                f"Request {request.request_id} missing generated_top_n_logprobs"
+            )
+            assert request.generated_top_n_logprobs is not None, (
+                f"Request {request.request_id} has None generated_top_n_logprobs"
+            )
+            assert len(request.generated_top_n_logprobs) == len(request.generated_tokens), (
+                f"Request {request.request_id}: generated_top_n_logprobs length mismatch"
+            )
 
             # Validate each top-n dict
             for i, top_n_dict in enumerate(request.generated_top_n_logprobs):
-                assert isinstance(
-                    top_n_dict, dict
-                ), f"Request {request.request_id}, token {i}: top_n_dict is not a dict"
-                assert (
-                    len(top_n_dict) <= top_n
-                ), f"Request {request.request_id}, token {i}: too many top-n entries"
-                assert (
-                    len(top_n_dict) > 0
-                ), f"Request {request.request_id}, token {i}: empty top-n dict"
+                assert isinstance(top_n_dict, dict), (
+                    f"Request {request.request_id}, token {i}: top_n_dict is not a dict"
+                )
+                assert len(top_n_dict) <= top_n, (
+                    f"Request {request.request_id}, token {i}: too many top-n entries"
+                )
+                assert len(top_n_dict) > 0, (
+                    f"Request {request.request_id}, token {i}: empty top-n dict"
+                )
 
             # Validate prompt top-n logprobs based on skip_prompt_log_probs flag
             if not skip_prompt_log_probs:
-                assert hasattr(
-                    request, 'prompt_top_n_logprobs'
-                ), f"Request {request.request_id} missing prompt_top_n_logprobs"
-                assert (
-                    request.prompt_top_n_logprobs is not None
-                ), f"Request {request.request_id} has None prompt_top_n_logprobs"
+                assert hasattr(request, 'prompt_top_n_logprobs'), (
+                    f"Request {request.request_id} missing prompt_top_n_logprobs"
+                )
+                assert request.prompt_top_n_logprobs is not None, (
+                    f"Request {request.request_id} has None prompt_top_n_logprobs"
+                )
                 # Prompt top-n should have N-1 entries (excluding first token)
                 expected_prompt_top_n_len = len(request.prompt_tokens) - 1
-                assert (
-                    len(request.prompt_top_n_logprobs) == expected_prompt_top_n_len
-                ), f"Request {request.request_id}: prompt_top_n_logprobs length {len(request.prompt_top_n_logprobs)} != expected {expected_prompt_top_n_len}"
+                assert len(request.prompt_top_n_logprobs) == expected_prompt_top_n_len, (
+                    f"Request {request.request_id}: prompt_top_n_logprobs length {len(request.prompt_top_n_logprobs)} != expected {expected_prompt_top_n_len}"  # noqa: E501
+                )
 
                 # Validate each prompt top-n dict
                 for i, top_n_dict in enumerate(request.prompt_top_n_logprobs):
-                    assert isinstance(
-                        top_n_dict, dict
-                    ), f"Request {request.request_id}, prompt token {i}: top_n_dict is not a dict"
-                    assert (
-                        len(top_n_dict) <= top_n
-                    ), f"Request {request.request_id}, prompt token {i}: too many top-n entries"
-                    assert (
-                        len(top_n_dict) > 0
-                    ), f"Request {request.request_id}, prompt token {i}: empty top-n dict"
+                    assert isinstance(top_n_dict, dict), (
+                        f"Request {request.request_id}, prompt token {i}: top_n_dict is not a dict"
+                    )
+                    assert len(top_n_dict) <= top_n, (
+                        f"Request {request.request_id}, prompt token {i}: too many top-n entries"
+                    )
+                    assert len(top_n_dict) > 0, (
+                        f"Request {request.request_id}, prompt token {i}: empty top-n dict"
+                    )
             else:
                 # When skip_prompt_log_probs is True, prompt_top_n_logprobs should be None or empty
                 if hasattr(request, 'prompt_top_n_logprobs'):
                     assert (
                         request.prompt_top_n_logprobs is None
                         or len(request.prompt_top_n_logprobs) == 0
-                    ), f"Request {request.request_id}: prompt_top_n_logprobs should be None or empty when skip_prompt_log_probs is True"
+                    ), (
+                        f"Request {request.request_id}: prompt_top_n_logprobs should be None or empty when skip_prompt_log_probs is True"  # noqa: E501
+                    )
 
             # Validate consistency between log_probs and top_n_logprobs
             if hasattr(request, 'generated_log_probs') and request.generated_log_probs is not None:
-                assert len(request.generated_log_probs) == len(
-                    request.generated_top_n_logprobs
-                ), f"Request {request.request_id}: generated_log_probs and generated_top_n_logprobs length mismatch"
+                assert len(request.generated_log_probs) == len(request.generated_top_n_logprobs), (
+                    f"Request {request.request_id}: generated_log_probs and generated_top_n_logprobs length mismatch"  # noqa: E501
+                )
 
                 # Check that the selected token's log prob appears in the top-n
                 for i, (log_prob, top_n_dict, token_id) in enumerate(
@@ -1580,14 +1572,14 @@ class TestDynamicInferenceEngine:
                     # Get the token string for this token_id
                     token_str = env.engine.controller.tokenizer.detokenize([token_id])
                     # The selected token should be in the top-n
-                    assert (
-                        token_str in top_n_dict
-                    ), f"Request {request.request_id}, token {i}: selected token '{token_str}' not in top-n"
+                    assert token_str in top_n_dict, (
+                        f"Request {request.request_id}, token {i}: selected token '{token_str}' not in top-n"  # noqa: E501
+                    )
                     # The log prob should match (with some tolerance for floating point precision)
-                    # Using 0.1 tolerance to account for FP16/BF16 precision in mixed precision training
-                    assert (
-                        abs(log_prob - top_n_dict[token_str]) < 0.1
-                    ), f"Request {request.request_id}, token {i}: log_prob mismatch {log_prob} vs {top_n_dict[token_str]}"
+                    # Using 0.1 tolerance to account for FP16/BF16 precision in mixed precision training  # noqa: E501
+                    assert abs(log_prob - top_n_dict[token_str]) < 0.1, (
+                        f"Request {request.request_id}, token {i}: log_prob mismatch {log_prob} vs {top_n_dict[token_str]}"  # noqa: E501
+                    )
 
     @pytest.mark.internal
     @pytest.mark.skipif(

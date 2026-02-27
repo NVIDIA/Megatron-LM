@@ -1,6 +1,5 @@
 # Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
-# pylint: disable=bad-builtin
 
 import hashlib
 import io
@@ -48,7 +47,7 @@ import logging
 
 import megatron
 from megatron.core.utils import configure_nvtx_profiling
-from megatron.training import get_args, get_tokenizer, initialize_megatron
+from megatron.training import get_args, initialize_megatron
 
 torch.serialization.add_safe_globals([io.BytesIO])
 torch.serialization.add_safe_globals([megatron.core.rerun_state_machine.RerunState])
@@ -145,7 +144,6 @@ def run_inference(
 
         # Test suspending and resuming engine.
         if args.suspend_resume_interval is not None:
-
             # Suspend.
             if attempted_step_count % args.suspend_resume_interval == 0:
                 print("**** step %d/%d ... suspend." % (engine.step_count, attempted_step_count))
@@ -185,7 +183,6 @@ def run_inference(
             # Append output tokens.
             output_start = get_curr_time()
             for finished_request_record in finished_request_records:
-
                 finished_request = finished_request_record.merge()
 
                 # Update local request object.
@@ -300,10 +297,10 @@ def main():
         for request_idx, request in enumerate(requests):
             if len(request.prompt_tokens) > context.max_tokens:
                 invalid_prompt_length_map[request_idx] = len(request.prompt_tokens)
-        assert (
-            not invalid_prompt_length_map
-        ), "request idxs with prompts longer than context.max_tokens: " ", ".join(
-            f"{k}({v})" for k, v in invalid_prompt_length_map.items()
+        assert not invalid_prompt_length_map, (
+            "request idxs with prompts longer than context.max_tokens: , ".join(
+                f"{k}({v})" for k, v in invalid_prompt_length_map.items()
+            )
         )
 
     # Inference engine.
@@ -317,7 +314,6 @@ def main():
     # Run and time test, optionally `args.inference_repeat_n` times.
     throughputs = []
     for _ in range(args.inference_repeat_n):
-
         # Reset engine.
         engine.reset()
 
@@ -358,12 +354,11 @@ def main():
         # Print unique prompts + outputs.
         text_hashes = []
         for unique_idx, (prompt_text, request_idxs) in enumerate(unique_prompt_map.items()):
-
             # ---- Prompt summary line ----
             prompt_len = len(requests[request_idxs[0]].prompt_tokens)
             escaped_prompt_text = escape_str(prompt_text)
             print(
-                f"\n{unique_idx+1}/{len(unique_prompt_map)}"
+                f"\n{unique_idx + 1}/{len(unique_prompt_map)}"
                 f"[n {len(request_idxs)}, l {prompt_len}] {escaped_prompt_text}"
             )
 
@@ -467,7 +462,7 @@ def main():
         # )
         capture_str = f"{engine.capture_stats['time']:.2f} sec" if engine.capture_stats else "--"
         print(
-            f"{setup_prefix} … " f"throughput: {throughput:.3f} tok/s … ",
+            f"{setup_prefix} … throughput: {throughput:.3f} tok/s … ",
             f"total time: {total_time:.3f}s … "
             f"mem {peak_alloc_gb:.1f}/{peak_resvd_gb:.1f} GB … "
             f"steps: {engine.step_count:d} … "

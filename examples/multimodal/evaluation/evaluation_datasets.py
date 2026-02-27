@@ -1,5 +1,6 @@
 # Copyright (c) 2024, NVIDIA CORPORATION.  All rights reserved.
 """Evaluation datasets."""
+
 import glob
 import json
 import os
@@ -42,7 +43,7 @@ class VQADataset(torch.utils.data.Dataset):
         max_num_tiles,
         use_thumbnail,
         vision_model_type,
-        split="validation"
+        split="validation",
     ):
         samples = json.load(open(gt_path, encoding='utf-8'))
         if "data" in samples:
@@ -195,9 +196,10 @@ class MMMUDataset(torch.utils.data.Dataset):
         split="validation",
     ):
         import datasets
+
         from .mmmu_utils import CAT_SHORT2LONG, load_yaml
 
-        # The following downloads the MMMU dataset from HuggingFace and uses the API from the MMMU github repo to run MMMU evaluation.
+        # The following downloads the MMMU dataset from HuggingFace and uses the API from the MMMU github repo to run MMMU evaluation.  # noqa: E501
         all_mmmu_datasets = []
 
         hf_datasets_cache = os.environ["HF_DATASETS_CACHE"]
@@ -214,10 +216,7 @@ class MMMUDataset(torch.utils.data.Dataset):
                 )
             else:
                 subject_dataset = datasets.load_dataset(
-                    "MMMU/MMMU",
-                    subject,
-                    split=split,
-                    cache_dir=hf_datasets_cache,
+                    "MMMU/MMMU", subject, split=split, cache_dir=hf_datasets_cache
                 )
 
             all_mmmu_datasets.append(subject_dataset)
@@ -358,8 +357,10 @@ class MMMUDataset(torch.utils.data.Dataset):
             sample_imgs = []
             sample_num_tiles = []
 
-            img_indices = sorted(list(set(re.findall(r"<image (\d+)", sample["final_input_prompt"]))))
-            # If there are multiple input images, we need to avoid the number of image embeddings getting too large.
+            img_indices = sorted(
+                list(set(re.findall(r"<image (\d+)", sample["final_input_prompt"])))
+            )
+            # If there are multiple input images, we need to avoid the number of image embeddings getting too large.  # noqa: E501
             adjusted_max_num_tiles = max(1, self._max_num_tiles // len(img_indices))
             adjusted_max_num_tiles = min(adjusted_max_num_tiles, self._max_num_tiles)
 
@@ -383,7 +384,11 @@ class MMMUDataset(torch.utils.data.Dataset):
                 sample_imgs.extend(imgs)
                 sample_num_tiles.append(len(imgs))
 
-            sample["final_input_prompt"] = " ".join([f'<image {i + 1}><image>' for i in range(len(img_indices))]) + "\n" + sample["final_input_prompt"]
+            sample["final_input_prompt"] = (
+                " ".join([f'<image {i + 1}><image>' for i in range(len(img_indices))])
+                + "\n"
+                + sample["final_input_prompt"]
+            )
         elif self._prompt_style == "multi_image":
             sample = construct_prompt(sample, self._config)
 
@@ -391,7 +396,7 @@ class MMMUDataset(torch.utils.data.Dataset):
             sample_num_tiles = []
 
             img_indices = re.findall(r"<image (\d+)", sample["final_input_prompt"])
-            # If there are multiple input images, we need to avoid the number of image embeddings getting too large.
+            # If there are multiple input images, we need to avoid the number of image embeddings getting too large.  # noqa: E501
             adjusted_max_num_tiles = max(1, self._max_num_tiles // len(img_indices))
 
             for img_idx in img_indices:
@@ -421,16 +426,18 @@ class MMMUDataset(torch.utils.data.Dataset):
 
             # Sanity check.
             for i in range(1, 8):
-                assert (
-                    f"<image {i}>" not in sample["final_input_prompt"]
-                ), "prompt contains unhandled image tags"
+                assert f"<image {i}>" not in sample["final_input_prompt"], (
+                    "prompt contains unhandled image tags"
+                )
         else:
             raise ValueError(f"unknown prompt style {self._prompt_style}")
 
         # MMMU specific metadata.
-        metadata = {"question_type": sample["question_type"],
-                    "field": sample["field"],
-                    "subfield": sample["subfield"]}
+        metadata = {
+            "question_type": sample["question_type"],
+            "field": sample["field"],
+            "subfield": sample["subfield"],
+        }
         if sample["question_type"] == "multiple-choice":
             metadata["index2ans"] = sample["index2ans"]
             metadata["all_choices"] = sample["all_choices"]
@@ -515,11 +522,17 @@ class VideoMMEDataset(torch.utils.data.Dataset):
         imgs = []
         for img in video_frames:
             from torchvision.transforms import ToPILImage
+
             to_pil = ToPILImage()
             img = to_pil(img)
             imgs += self._transform_img(
-                img, self._img_h, self._img_w, self._use_tiling, self._max_num_tiles,
-                self._use_thumbnail, augment=False,
+                img,
+                self._img_h,
+                self._img_w,
+                self._use_tiling,
+                self._max_num_tiles,
+                self._use_thumbnail,
+                augment=False,
             )
 
         for question in gt["questions"]:
@@ -641,7 +654,10 @@ class MathVistaDataset(torch.utils.data.Dataset):
 
         if os.path.exists(input_image_path):
             dataset = datasets.load_dataset(
-                input_image_path, cache_dir=hf_datasets_cache, verification_mode="no_checks", split="train"
+                input_image_path,
+                cache_dir=hf_datasets_cache,
+                verification_mode="no_checks",
+                split="train",
             )
         else:
             dataset = datasets.load_dataset(
@@ -802,13 +818,12 @@ class RDTableBenchDataset(torch.utils.data.Dataset):
         gt_paths = sorted(glob.glob(os.path.join(gt_path, "*.html")))
         gt = []
         for gt_path in gt_paths:
-            img_path = os.path.join(input_image_path, os.path.basename(gt_path).replace(".html", ".jpg"))
+            img_path = os.path.join(
+                input_image_path, os.path.basename(gt_path).replace(".html", ".jpg")
+            )
             with open(gt_path) as f:
                 html = f.read()
-            gt.append({
-                "answer": html,
-                "image": img_path,
-            })
+            gt.append({"answer": html, "image": img_path})
 
         if num_partitions > 0:
             start_idx, end_idx = _get_partition_bounds(
@@ -847,19 +862,12 @@ class RDTableBenchDataset(torch.utils.data.Dataset):
         metadata = ""
 
         prompt = (
-            "Convert the image to an HTML table. The output should begin with <table> and end with </table>. "
-            "Specify rowspan and colspan attributes when they are greater than 1. Do not specify any other attributes. "
+            "Convert the image to an HTML table. The output should begin with <table> and end with </table>. "  # noqa: E501
+            "Specify rowspan and colspan attributes when they are greater than 1. Do not specify any other attributes. "  # noqa: E501
             "Only use table related HTML tags, no additional formatting is required."
         )
 
-        return (
-            torch.stack(imgs),
-            tile_count,
-            idx,
-            prompt,
-            self._gt[idx]["answer"],
-            metadata,
-        )
+        return (torch.stack(imgs), tile_count, idx, prompt, self._gt[idx]["answer"], metadata)
 
 
 class RealworldQADataset(torch.utils.data.Dataset):
@@ -879,7 +887,6 @@ class RealworldQADataset(torch.utils.data.Dataset):
     ):
         gt = json.load(open(gt_path, encoding='utf-8'))
 
-
         if num_partitions > 0:
             start_idx, end_idx = _get_partition_bounds(
                 len(gt), num_samples_per_partition, num_partitions, partition_id
@@ -894,7 +901,6 @@ class RealworldQADataset(torch.utils.data.Dataset):
         self._max_num_tiles = max_num_tiles
         self._use_thumbnail = use_thumbnail
         self._transform_img = ImageTransform(img_h, vision_model_type)
-
 
     def __len__(self):
         return len(self._gt)
@@ -938,15 +944,7 @@ class RealworldQADataset(torch.utils.data.Dataset):
 
         metadata = ""  # Not used.
 
-        return (
-            torch.stack(imgs),
-            tile_count,
-            question_id,
-            question,
-            [answer],
-            metadata,
-        )
-
+        return (torch.stack(imgs), tile_count, question_id, question, [answer], metadata)
 
 
 class MotionBenchDataset(torch.utils.data.Dataset):
@@ -964,16 +962,13 @@ class MotionBenchDataset(torch.utils.data.Dataset):
         use_thumbnail,
         num_frames,
         vision_model_type,
-        split
+        split,
     ):
-
         with open(gt_path) as f:
             ground_truth_original = [json.loads(line) for line in f]
 
-
         ground_truth = []
         for gt in ground_truth_original:
-
             # video path handling
             video_path = gt['video_path']
             if ".mp4" not in video_path:
@@ -1011,10 +1006,13 @@ class MotionBenchDataset(torch.utils.data.Dataset):
         gt = self._ground_truth[idx]
 
         from torchvision.io.video import read_video
+
         video, _, _ = read_video(gt["video_path"], start_pts=0, end_pts=None, pts_unit='sec')
         video = video.permute((0, 3, 1, 2))
 
-        selected_frames = torch.linspace(0, video.shape[0] - 1, min(self._num_frames, video.shape[0])).long()
+        selected_frames = torch.linspace(
+            0, video.shape[0] - 1, min(self._num_frames, video.shape[0])
+        ).long()
         video_frames = video[selected_frames]
 
         if self._num_frames == 1:
@@ -1022,6 +1020,7 @@ class MotionBenchDataset(torch.utils.data.Dataset):
         imgs = []
         for img in video_frames:
             from torchvision.transforms import ToPILImage
+
             to_pil = ToPILImage()
             img = to_pil(img)
             imgs += self._transform_img(
@@ -1041,14 +1040,8 @@ class MotionBenchDataset(torch.utils.data.Dataset):
         answer = gt['qa'][0]['answer']
 
         metadata = ""
-        return (
-            torch.stack(imgs),
-            num_tiles,
-            q_id,
-            question,
-            answer,
-            metadata,
-        )
+        return (torch.stack(imgs), num_tiles, q_id, question, answer, metadata)
+
 
 # The following class is adapted from
 # https://github.com/PhysGame/PhysGame/blob/main/physvlm/test/PhysGame_bench/utils.py#L27
@@ -1069,14 +1062,12 @@ class PhysGameBenchDataset(torch.utils.data.Dataset):
         use_thumbnail,
         num_frames,
         vision_model_type,
-        split
+        split,
     ):
-
         ground_truth_original = json.load(open(gt_path, encoding='utf-8'))
 
         ground_truth = []
         for gt in ground_truth_original:
-
             video_path = os.path.join(input_image_path, gt['question_id']) + ".mp4"
             if not os.path.exists(video_path):
                 continue
@@ -1117,10 +1108,13 @@ class PhysGameBenchDataset(torch.utils.data.Dataset):
         gt = self._ground_truth[idx]
 
         from torchvision.io.video import read_video
+
         video, _, _ = read_video(gt["video_path"], start_pts=0, end_pts=None, pts_unit='sec')
         video = video.permute((0, 3, 1, 2))
 
-        selected_frames = torch.linspace(0, video.shape[0] - 1, min(self._num_frames, video.shape[0])).long()
+        selected_frames = torch.linspace(
+            0, video.shape[0] - 1, min(self._num_frames, video.shape[0])
+        ).long()
         video_frames = video[selected_frames]
 
         if self._num_frames == 1:
@@ -1128,6 +1122,7 @@ class PhysGameBenchDataset(torch.utils.data.Dataset):
         imgs = []
         for img in video_frames:
             from torchvision.transforms import ToPILImage
+
             to_pil = ToPILImage()
             img = to_pil(img)
             imgs += self._transform_img(
@@ -1145,19 +1140,9 @@ class PhysGameBenchDataset(torch.utils.data.Dataset):
         q_id = gt['question_id']
         question, answer = self._qa_template(gt)
 
-        metadata = {
-            'class': gt['class_anno'],
-            'subclass': gt['subclass_anno']
-        }
+        metadata = {'class': gt['class_anno'], 'subclass': gt['subclass_anno']}
 
-        return (
-            torch.stack(imgs),
-            num_tiles,
-            q_id,
-            question,
-            answer,
-            metadata,
-        )
+        return (torch.stack(imgs), num_tiles, q_id, question, answer, metadata)
 
 
 # The following class is adapted from
@@ -1179,30 +1164,129 @@ class MVBenchDataset(torch.utils.data.Dataset):
         use_thumbnail,
         num_frames,
         vision_model_type,
-        split
+        split,
     ):
-
         data_list = {
-            "Action Sequence": ("action_sequence.json", f"{input_image_path}/star/Charades_v1_480/", "video", True), # has start & end
-            "Action Prediction": ("action_prediction.json", f"{input_image_path}/star/Charades_v1_480/", "video", True), # has start & end
-            "Action Antonym": ("action_antonym.json", f"{input_image_path}/ssv2_video/", "video", False),
-            "Fine-grained Action": ("fine_grained_action.json", f"{input_image_path}/Moments_in_Time_Raw/videos/", "video", False),
-            "Unexpected Action": ("unexpected_action.json", f"{input_image_path}/FunQA_test/test/", "video", False),
-            "Object Existence": ("object_existence.json", f"{input_image_path}/clevrer/video_validation/", "video", False),
-            "Object Interaction": ("object_interaction.json", f"{input_image_path}/star/Charades_v1_480/", "video", True), # has start & end
-            "Object Shuffle": ("object_shuffle.json", f"{input_image_path}/perception/videos/", "video", False),
-            "Moving Direction": ("moving_direction.json", f"{input_image_path}/clevrer/video_validation/", "video", False),
-            "Action Localization": ("action_localization.json", f"{input_image_path}/sta/sta_video/", "video", True),  # has start & end
-            "Scene Transition": ("scene_transition.json", f"{input_image_path}/scene_qa/video/", "video", False),
-            "Action Count": ("action_count.json", f"{input_image_path}/perception/videos/", "video", False),
-            "Moving Count": ("moving_count.json", f"{input_image_path}/clevrer/video_validation/", "video", False),
-            "Moving Attribute": ("moving_attribute.json", f"{input_image_path}/clevrer/video_validation/", "video", False),
-            "State Change": ("state_change.json", f"{input_image_path}/perception/videos/", "video", False),
-            "Fine-grained Pose": ("fine_grained_pose.json", f"{input_image_path}/nturgbd/", "video", False),
-            "Character Order": ("character_order.json", f"{input_image_path}/perception/videos/", "video", False),
-            "Egocentric Navigation": ("egocentric_navigation.json", f"{input_image_path}/vlnqa/", "video", False),
-            "Episodic Reasoning": ("episodic_reasoning.json", f"{input_image_path}/tvqa/frames_fps3_hq/", "frame", True),  # has start & end, read frame
-            "Counterfactual Inference": ("counterfactual_inference.json", f"{input_image_path}/clevrer/video_validation/", "video", False)
+            "Action Sequence": (
+                "action_sequence.json",
+                f"{input_image_path}/star/Charades_v1_480/",
+                "video",
+                True,
+            ),  # has start & end
+            "Action Prediction": (
+                "action_prediction.json",
+                f"{input_image_path}/star/Charades_v1_480/",
+                "video",
+                True,
+            ),  # has start & end
+            "Action Antonym": (
+                "action_antonym.json",
+                f"{input_image_path}/ssv2_video/",
+                "video",
+                False,
+            ),
+            "Fine-grained Action": (
+                "fine_grained_action.json",
+                f"{input_image_path}/Moments_in_Time_Raw/videos/",
+                "video",
+                False,
+            ),
+            "Unexpected Action": (
+                "unexpected_action.json",
+                f"{input_image_path}/FunQA_test/test/",
+                "video",
+                False,
+            ),
+            "Object Existence": (
+                "object_existence.json",
+                f"{input_image_path}/clevrer/video_validation/",
+                "video",
+                False,
+            ),
+            "Object Interaction": (
+                "object_interaction.json",
+                f"{input_image_path}/star/Charades_v1_480/",
+                "video",
+                True,
+            ),  # has start & end
+            "Object Shuffle": (
+                "object_shuffle.json",
+                f"{input_image_path}/perception/videos/",
+                "video",
+                False,
+            ),
+            "Moving Direction": (
+                "moving_direction.json",
+                f"{input_image_path}/clevrer/video_validation/",
+                "video",
+                False,
+            ),
+            "Action Localization": (
+                "action_localization.json",
+                f"{input_image_path}/sta/sta_video/",
+                "video",
+                True,
+            ),  # has start & end
+            "Scene Transition": (
+                "scene_transition.json",
+                f"{input_image_path}/scene_qa/video/",
+                "video",
+                False,
+            ),
+            "Action Count": (
+                "action_count.json",
+                f"{input_image_path}/perception/videos/",
+                "video",
+                False,
+            ),
+            "Moving Count": (
+                "moving_count.json",
+                f"{input_image_path}/clevrer/video_validation/",
+                "video",
+                False,
+            ),
+            "Moving Attribute": (
+                "moving_attribute.json",
+                f"{input_image_path}/clevrer/video_validation/",
+                "video",
+                False,
+            ),
+            "State Change": (
+                "state_change.json",
+                f"{input_image_path}/perception/videos/",
+                "video",
+                False,
+            ),
+            "Fine-grained Pose": (
+                "fine_grained_pose.json",
+                f"{input_image_path}/nturgbd/",
+                "video",
+                False,
+            ),
+            "Character Order": (
+                "character_order.json",
+                f"{input_image_path}/perception/videos/",
+                "video",
+                False,
+            ),
+            "Egocentric Navigation": (
+                "egocentric_navigation.json",
+                f"{input_image_path}/vlnqa/",
+                "video",
+                False,
+            ),
+            "Episodic Reasoning": (
+                "episodic_reasoning.json",
+                f"{input_image_path}/tvqa/frames_fps3_hq/",
+                "frame",
+                True,
+            ),  # has start & end, read frame
+            "Counterfactual Inference": (
+                "counterfactual_inference.json",
+                f"{input_image_path}/clevrer/video_validation/",
+                "video",
+                False,
+            ),
         }
 
         ground_truth = []
@@ -1210,20 +1294,19 @@ class MVBenchDataset(torch.utils.data.Dataset):
             with open(os.path.join(gt_path, v[0]), 'r') as f:
                 json_data = json.load(f)
             for data_id, data in enumerate(json_data):
-                ground_truth.append({
-                    'task_type': k,
-                    'prefix': v[1],
-                    'data_type': v[2],
-                    'bound': v[3],
-                    'data': data,
-                    'question_id': f"{k}-{data_id}"
-                })
+                ground_truth.append(
+                    {
+                        'task_type': k,
+                        'prefix': v[1],
+                        'data_type': v[2],
+                        'bound': v[3],
+                        'data': data,
+                        'question_id': f"{k}-{data_id}",
+                    }
+                )
 
         print("total ground truth ==> ", len(ground_truth))
-        self.decord_method = {
-            'video': self.read_video_ours,
-            'frame': self.read_frame,
-        }
+        self.decord_method = {'video': self.read_video_ours, 'frame': self.read_frame}
 
         if num_partitions > 0:
             start_idx, end_idx = _get_partition_bounds(
@@ -1253,10 +1336,12 @@ class MVBenchDataset(torch.utils.data.Dataset):
         start_idx = max(first_idx, round(start * fps))
         end_idx = min(round(end * fps), max_frame)
         seg_size = float(end_idx - start_idx) / self._num_frames
-        frame_indices = np.array([
-            int(start_idx + (seg_size / 2) + np.round(seg_size * idx))
-            for idx in range(self._num_frames)
-        ])
+        frame_indices = np.array(
+            [
+                int(start_idx + (seg_size / 2) + np.round(seg_size * idx))
+                for idx in range(self._num_frames)
+            ]
+        )
         return frame_indices
 
     def qa_template(self, data):
@@ -1272,11 +1357,12 @@ class MVBenchDataset(torch.utils.data.Dataset):
         answer = f"({chr(ord('A') + answer_idx)}) {answer}"
         return question, answer
 
-
     def read_frame(self, video_path, bound=None, fps=2):
         max_frame = len(os.listdir(video_path))
         images_group = list()
-        frame_indices = self.get_index(bound, fps, max_frame, first_idx=1) # frame_idx starts from 1
+        frame_indices = self.get_index(
+            bound, fps, max_frame, first_idx=1
+        )  # frame_idx starts from 1
         for frame_index in frame_indices:
             img = Image.open(os.path.join(video_path, f"{frame_index:05d}.jpg"))
             images_group.append(img)
@@ -1284,6 +1370,7 @@ class MVBenchDataset(torch.utils.data.Dataset):
 
     def read_video_ours(self, video_path, bound=None):
         from torchvision.io.video import read_video
+
         video, _, v_meta_info = read_video(video_path, start_pts=0, end_pts=None, pts_unit='sec')
 
         video = video.permute((0, 3, 1, 2))
@@ -1297,14 +1384,10 @@ class MVBenchDataset(torch.utils.data.Dataset):
         return video_frames
 
     def __getitem__(self, idx):
-
         data = self._ground_truth[idx]
         bound = None
         if data['bound']:
-            bound = (
-                data['data']['start'],
-                data['data']['end'],
-            )
+            bound = (data['data']['start'], data['data']['end'])
         video_path = os.path.join(data['prefix'], data['data']['video'])
 
         video_decode_func = self.decord_method[data['data_type']]
@@ -1319,8 +1402,13 @@ class MVBenchDataset(torch.utils.data.Dataset):
                 to_pil = ToPILImage()
                 img = to_pil(img)
             imgs += self._transform_img(
-                img, self._img_h, self._img_w, self._use_tiling, self._max_num_tiles,
-                self._use_thumbnail, augment=False
+                img,
+                self._img_h,
+                self._img_w,
+                self._use_tiling,
+                self._max_num_tiles,
+                self._use_thumbnail,
+                augment=False,
             )
 
         num_tiles = torch.tensor([len(imgs)], dtype=torch.int)
@@ -1329,34 +1417,32 @@ class MVBenchDataset(torch.utils.data.Dataset):
         metadata = {'task_type': data['task_type']}
         question, answer = self.qa_template(data['data'])
 
-        return (
-            torch.stack(imgs),
-            num_tiles,
-            q_id,
-            question,
-            answer,
-            metadata,
-        )
+        return (torch.stack(imgs), num_tiles, q_id, question, answer, metadata)
 
 
 class ExampleInferenceDataset(torch.utils.data.Dataset):
-    def __init__(
-        self,
-        img_h,
-        img_w,
-        use_tiling,
-        max_num_tiles,
-        use_thumbnail,
-        vision_model_type,
-    ):
+    def __init__(self, img_h, img_w, use_tiling, max_num_tiles, use_thumbnail, vision_model_type):
         # Define your own inference samples here. The following is an example.
         samples = [
             # Use <image> token to indicate the image position.
-            {"image_paths": ["examples/multimodal/assets/pretrain_curves.png"], "question": "<image>\nWhat is the curve?"},
+            {
+                "image_paths": ["examples/multimodal/assets/pretrain_curves.png"],
+                "question": "<image>\nWhat is the curve?",
+            },
             # Optional: if you have an answer for the question.
-            {"image_paths": ["examples/multimodal/assets/pretrain_curves.png"], "question": "What is the curve?<image>", "answer": "It's a loss function curve."},
-            # If you have multiple images for the question, then use <image> token to indicate the image positions.
-            {"image_paths": ["examples/multimodal/assets/pretrain_curves.png", "examples/multimodal/assets/pretrain_curves.png"], "question": "<image>What is the curve?<image>"},
+            {
+                "image_paths": ["examples/multimodal/assets/pretrain_curves.png"],
+                "question": "What is the curve?<image>",
+                "answer": "It's a loss function curve.",
+            },
+            # If you have multiple images for the question, then use <image> token to indicate the image positions.  # noqa: E501
+            {
+                "image_paths": [
+                    "examples/multimodal/assets/pretrain_curves.png",
+                    "examples/multimodal/assets/pretrain_curves.png",
+                ],
+                "question": "<image>What is the curve?<image>",
+            },
             # Text only sample.
             {"question": "Who is Jensen Huang?"},
         ]
@@ -1572,7 +1658,12 @@ def get_evaluation_dataset(
             vision_model_type=vision_model_type,
         )
     elif task == "SPDocVQA":
-        keys = {"sample_id": "questionId", "image_id": "image", "question": "question", "answer": "answers"}
+        keys = {
+            "sample_id": "questionId",
+            "image_id": "image",
+            "question": "question",
+            "answer": "answers",
+        }
 
         dataset = VQADataset(
             input_image_path,
@@ -1589,7 +1680,12 @@ def get_evaluation_dataset(
             vision_model_type,
         )
     elif task == "InfoVQA":
-        keys = {"sample_id": "questionId", "image_id": "image_local_name", "question": "question", "answer": "answers"}
+        keys = {
+            "sample_id": "questionId",
+            "image_id": "image_local_name",
+            "question": "question",
+            "answer": "answers",
+        }
 
         dataset = VQADataset(
             input_image_path,
@@ -1649,7 +1745,7 @@ def get_evaluation_dataset(
             use_thumbnail,
             num_frames,
             vision_model_type,
-            split=split
+            split=split,
         )
     elif task == "PhysGameBench":
         dataset = PhysGameBenchDataset(
@@ -1665,7 +1761,7 @@ def get_evaluation_dataset(
             use_thumbnail,
             num_frames,
             vision_model_type,
-            split=split
+            split=split,
         )
     elif task == "MVBench":
         dataset = MVBenchDataset(
@@ -1681,16 +1777,11 @@ def get_evaluation_dataset(
             use_thumbnail,
             num_frames,
             vision_model_type,
-            split=split
+            split=split,
         )
     elif task == "inference":
         dataset = ExampleInferenceDataset(
-            img_h,
-            img_w,
-            use_tiling,
-            max_num_tiles,
-            use_thumbnail,
-            vision_model_type,
+            img_h, img_w, use_tiling, max_num_tiles, use_thumbnail, vision_model_type
         )
     else:
         raise NotImplementedError(f"unsupported task {task}")

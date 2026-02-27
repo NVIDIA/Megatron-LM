@@ -289,12 +289,12 @@ class ShardedTensor(ShardedBase):
             return x // y
 
         # Decrease global shape and global offset by `length / local_length_along_dim`
-        assert (
-            self.global_shape[prepended_dim] % local_length_along_dim == 0
-        ), f"Only regular grid of local tensors is supported for narrowing, got: {self}"
-        assert (
-            self.global_offset[prepended_dim] % local_length_along_dim == 0
-        ), f"Only regular grid of local tensors is supported for narrowing, got: {self}"
+        assert self.global_shape[prepended_dim] % local_length_along_dim == 0, (
+            f"Only regular grid of local tensors is supported for narrowing, got: {self}"
+        )
+        assert self.global_offset[prepended_dim] % local_length_along_dim == 0, (
+            f"Only regular grid of local tensors is supported for narrowing, got: {self}"
+        )
         global_shape = _update_tuple(
             self.global_shape,
             prepended_dim,

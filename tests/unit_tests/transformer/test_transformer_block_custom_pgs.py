@@ -86,15 +86,15 @@ class HeterogenousTransformerLayer(TransformerLayer):
             vp_stage=vp_stage,
         )
 
-        assert (
-            'pg_collection' in submodules.self_attention.params
-        ), "pg_collection should be in the params of the submodules"
+        assert 'pg_collection' in submodules.self_attention.params, (
+            "pg_collection should be in the params of the submodules"
+        )
         self.self_attention = build_module(
             original_attention, config=self.config, layer_number=layer_number
         )
-        assert (
-            'tp_group' in submodules.mlp.params
-        ), "tp_group should be in the params of the submodules"
+        assert 'tp_group' in submodules.mlp.params, (
+            "tp_group should be in the params of the submodules"
+        )
         self.mlp = build_module(original_mlp, config=self.config)
 
 
@@ -358,9 +358,9 @@ class TestTransformerBlockWithProcessGroups:
                 # but the grads are too small to use rtol
                 # for now just a smoke test to ensure grads are available
                 # TODO: ykarnati - improve this test to ensure we have large grads for comparision
-                assert (
-                    default_param.main_grad is not None and custom_param.main_grad is not None
-                ), f"Gradient is None for parameter '{param_name}' at index {i}"
+                assert default_param.main_grad is not None and custom_param.main_grad is not None, (
+                    f"Gradient is None for parameter '{param_name}' at index {i}"
+                )
 
     @pytest.mark.skipif(
         version.parse(torch.__version__) < version.parse('2.3.0'),
@@ -390,7 +390,7 @@ class TestTransformerBlockWithProcessGroups:
         actual_world_size = torch.cuda.device_count()
         if actual_world_size != world_size:
             pytest.skip(f"Test requires world_size={world_size}, but got {actual_world_size}")
-        # we are testing the custom pgs path, thus we call initialize_distributed intead of initialize_model_parallel
+        # we are testing the custom pgs path, thus we call initialize_distributed intead of initialize_model_parallel  # noqa: E501
         Utils.initialize_distributed()
         torch.manual_seed(12345)
 
@@ -411,7 +411,7 @@ class TestTransformerBlockWithProcessGroups:
         if not torch.distributed.is_initialized():
             torch.distributed.init_process_group(backend='nccl')
 
-        # Create HyperCommGrid with dimensions mlp_tp, attn_cp, attn_tp (reversed from device mesh order)
+        # Create HyperCommGrid with dimensions mlp_tp, attn_cp, attn_tp (reversed from device mesh order)  # noqa: E501
         grid = HyperCommGrid(
             [mlp_tp_size, attn_cp_size, attn_tp_size], ["mlp_tp", "attn_cp", "attn_tp"]
         )
@@ -453,15 +453,15 @@ class TestTransformerBlockWithProcessGroups:
 
         output_custom = custom_block(hidden_states=hidden_states, attention_mask=None)
 
-        assert (
-            output_custom.shape[0] == sequence_length
-        ), f"Output shape is {output_custom.shape} dont match sequence length {sequence_length}"
-        assert (
-            output_custom.shape[1] == micro_batch_size
-        ), f"Output shape is {output_custom.shape} dont match micro batch size {micro_batch_size}"
-        assert (
-            output_custom.shape[2] == transformer_config.hidden_size
-        ), f"Output shape is {output_custom.shape} dont match hidden size {transformer_config.hidden_size}"
+        assert output_custom.shape[0] == sequence_length, (
+            f"Output shape is {output_custom.shape} dont match sequence length {sequence_length}"
+        )
+        assert output_custom.shape[1] == micro_batch_size, (
+            f"Output shape is {output_custom.shape} dont match micro batch size {micro_batch_size}"
+        )
+        assert output_custom.shape[2] == transformer_config.hidden_size, (
+            f"Output shape is {output_custom.shape} dont match hidden size {transformer_config.hidden_size}"  # noqa: E501
+        )
 
         loss = output_custom.sum()
         loss.backward()
@@ -567,7 +567,7 @@ class TestTransformerBlockWithProcessGroups:
             micro_batch_size,
             transformer_config.hidden_size,
         ), (
-            f"Output shape is {output_cp2_tp_2_dp_2.shape} dont match sequence length {sequence_length}, "
+            f"Output shape is {output_cp2_tp_2_dp_2.shape} dont match sequence length {sequence_length}, "  # noqa: E501
             f"micro batch size {micro_batch_size}, hidden size {transformer_config.hidden_size}"
         )
 
@@ -610,7 +610,6 @@ class TestTransformerBlockWithProcessGroups:
         ],
     )
     def test_mlp_with_custom_pgs(self, world_size, tp_size, dp_size, reverse_tp_dp_order):
-
         actual_world_size = torch.cuda.device_count()
         if actual_world_size != world_size:
             pytest.skip(f"Test requires world_size={world_size}, but got {actual_world_size}")

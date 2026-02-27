@@ -30,7 +30,7 @@ from megatron.core.transformer.transformer_layer import (
 )
 
 try:
-    import transformer_engine as te  # type: ignore[import-untyped]  # pylint: disable=unused-import
+    import transformer_engine as te  # type: ignore[import-untyped]  # noqa: F401
 
     from megatron.core.extensions.transformer_engine_spec_provider import TESpecProvider
 
@@ -39,7 +39,7 @@ except ImportError:
     HAVE_TE = False
 
 try:
-    import nvidia_kitchen  # type: ignore[import-not-found]  # pylint: disable=unused-import
+    import nvidia_kitchen  # type: ignore[import-not-found]  # noqa: F401
 
     from megatron.core.extensions.kitchen import KitchenSpecProvider
 

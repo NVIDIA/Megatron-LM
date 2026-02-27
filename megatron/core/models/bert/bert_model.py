@@ -25,9 +25,8 @@ from megatron.core.transformer.transformer_block import TransformerBlock
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.transformer.transformer_layer import TransformerLayerSubmodules
 from megatron.core.transformer.utils import get_linear_layer
-from megatron.core.utils import deprecate_inference_params
+from megatron.core.utils import deprecate_inference_params, is_te_min_version
 from megatron.core.utils import get_te_version as _get_te_version
-from megatron.core.utils import is_te_min_version
 
 
 def get_te_version():
@@ -164,7 +163,6 @@ class BertModel(LanguageModule):
         if self.pre_process or self.post_process:
             self.setup_embeddings_and_output_layer()
 
-    # pylint: disable=line-too-long
     def _sanity_check_attention_and_get_attn_mask_dimension(self) -> str:
         """We do some checks and return attention mask dimensions for self attention
 
@@ -172,14 +170,18 @@ class BertModel(LanguageModule):
         the attention mask depending on the TE version. We also santiy check some arguments.
 
         1. If we use local version of attention dimension of the mask is [b,1,s,s]
-        2. If we use transformer engine > 1.10 we support all 3 backends with padding mask and [b,1,s,s]
+        2. If we use transformer engine > 1.10 we support all 3
+           backends with padding mask and [b,1,s,s]
         3. If we use transformer engine >= 1.7 but less than 1.10
           a ) Flash and Fused attention uses padding mask with [b,1,1,s]
           b ) Unfused attention works with arbitrary mask with [b,1,s,s]
         4. If we use transformer engine < 1.7
-          Flash and fused attention is not supported. Unfused attention will work with padding mask [b,1,s,s]
+          Flash and fused attention is not supported. Unfused
+          attention will work with padding mask [b,1,s,s]
 
-        Default if you dont set any NVTE_ATTN flag will it will just use the fused path for transformer engine version >= 1.7 and unfused path for other
+        Default if you dont set any NVTE_ATTN flag will it will just
+        use the fused path for transformer engine version >= 1.7 and
+        unfused path for other
 
         Args:
             transformer_layer_spec (ModuleSpec): The transformer layer spec
@@ -199,10 +201,9 @@ class BertModel(LanguageModule):
             self.transformer_layer_spec.submodules.self_attention.submodules.core_attention
             == MCoreDotProductAttention
         ):
-            assert attention_backend in [
-                AttnBackend.local,
-                AttnBackend.auto,
-            ], f'Expected AttnBackend to be local or auto while using mcore self attention, but found {attention_backend}. Set --attn-backend to local or dont use MCore SelfAttention submodule in layer specs'
+            assert attention_backend in [AttnBackend.local, AttnBackend.auto], (
+                f'Expected AttnBackend to be local or auto while using mcore self attention, but found {attention_backend}. Set --attn-backend to local or dont use MCore SelfAttention submodule in layer specs'  # noqa: E501
+            )
             attn_mask_dimensions = "b1ss"
         else:
             attn_mask_type = self.transformer_layer_spec.submodules.self_attention.params[
@@ -213,19 +214,19 @@ class BertModel(LanguageModule):
                 attn_mask_dimensions = "b11s"
                 if attn_mask_type != AttnMaskType.padding:
                     warnings.warn(
-                        f'For TE versions >= 1.10 , flash/fused/unfused support padding mask. Setting attention mask from {attn_mask_type} to padding'
+                        f'For TE versions >= 1.10 , flash/fused/unfused support padding mask. Setting attention mask from {attn_mask_type} to padding'  # noqa: E501
                     )
                     self.transformer_layer_spec.submodules.self_attention.params[
                         'attn_mask_type'
                     ] = AttnMaskType.padding
-            # For 1.7 >= TE < 1.10 flash and fused path use padding mask with b11s and unfused path uses arbitrary mask with b1ss
+            # For 1.7 >= TE < 1.10 flash and fused path use padding mask with b11s and unfused path uses arbitrary mask with b1ss  # noqa: E501
             elif is_te_min_version("1.7.0"):
                 if attention_backend in [AttnBackend.flash, AttnBackend.fused, AttnBackend.auto]:
                     attn_mask_dimensions = "b11s"
                 else:
                     if attn_mask_type != AttnMaskType.arbitrary:
                         warnings.warn(
-                            f'For TE versions >= 1.7 but < 1.10 , unfused path supports only arbitrary mask. Setting attention mask from {attn_mask_type} to arbitray'
+                            f'For TE versions >= 1.7 but < 1.10 , unfused path supports only arbitrary mask. Setting attention mask from {attn_mask_type} to arbitray'  # noqa: E501
                         )
                         self.transformer_layer_spec.submodules.self_attention.params[
                             'attn_mask_type'
@@ -236,7 +237,7 @@ class BertModel(LanguageModule):
                 attn_mask_dimensions = "b1ss"
                 assert not (attention_backend in [AttnBackend.flash, AttnBackend.fused]), (
                     "Flash and fused attention is not supported with transformer engine version "
-                    "< 1.7. Set --attention-backend to unfused or leave it to be default (auto) or upgrade transformer engine >= 1.7"
+                    "< 1.7. Set --attention-backend to unfused or leave it to be default (auto) or upgrade transformer engine >= 1.7"  # noqa: E501
                 )
 
         return attn_mask_dimensions
@@ -359,7 +360,7 @@ class BertModel(LanguageModule):
         if self.add_binary_head:
             pooled_output = self.pooler(hidden_states, 0)
         else:
-            pooled_output = None  # for pylint.
+            pooled_output = None
 
         if self.return_embeddings:
             embeddings = torch.transpose(hidden_states, 0, 1)

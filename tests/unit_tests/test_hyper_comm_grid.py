@@ -318,7 +318,8 @@ class TestHyperCommGridIntegration:
         """Set up distributed environment for the entire test class."""
         if not dist.is_initialized():
             # Initialize PyTorch distributed with NCCL backend
-            # This assumes proper environment variables are set (RANK, WORLD_SIZE, MASTER_ADDR, MASTER_PORT)
+            # This assumes proper environment variables are set
+            # (RANK, WORLD_SIZE, MASTER_ADDR, MASTER_PORT)
             try:
                 dist.init_process_group(backend="nccl")
                 cls.distributed_initialized = True

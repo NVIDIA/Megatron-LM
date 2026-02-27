@@ -25,7 +25,6 @@ class DummyModule(MegatronModule):
 
 
 class TestMegatronModule:
-
     def setup_method(self, method):
         Utils.initialize_model_parallel(1, 1)
         model_parallel_cuda_manual_seed(123)
@@ -54,7 +53,6 @@ class TestMegatronModule:
 
 
 class TestFloat16Module:
-
     def setup_method(self, method):
         Utils.initialize_model_parallel(1, 1)
         model_parallel_cuda_manual_seed(123)

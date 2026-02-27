@@ -10,7 +10,6 @@ import torch
 
 from megatron.core import parallel_state
 from megatron.core.distributed import DistributedDataParallel, DistributedDataParallelConfig
-from megatron.core.distributed.param_and_grad_buffer import partition_buckets
 from megatron.core.transformer import TransformerConfig
 from tests.unit_tests.test_utilities import TestModel, Utils
 
@@ -138,9 +137,9 @@ def test_bucket_sizes(
             numel_in_each_bucket.append(numel_in_last_bucket)
             numel_padded_in_each_bucket.append(_pad_bucket_if_needed(numel_in_last_bucket))
 
-        assert len(param_and_grad_buffer.buckets) == len(
-            numel_in_each_bucket
-        ), f"Buckets don't match (got {actual_numel_in_each_bucket} but should be {numel_in_each_bucket})"
+        assert len(param_and_grad_buffer.buckets) == len(numel_in_each_bucket), (
+            f"Buckets don't match (got {actual_numel_in_each_bucket} but should be {numel_in_each_bucket})"  # noqa: E501
+        )
         assert actual_numel_in_each_bucket == numel_in_each_bucket, (
             f"Number of parameters in each bucket should be {numel_in_each_bucket}, "
             f"but is {actual_numel_in_each_bucket}"
@@ -357,19 +356,19 @@ def test_force_all_reduce_uses_correct_collective(force_all_reduce: bool):
 
         if force_all_reduce:
             # When force_all_reduce=True, all_reduce should be called.
-            assert (
-                mock_all_reduce.called
-            ), "Expected all_reduce to be called when force_all_reduce=True"
-            assert (
-                not mock_reduce_scatter.called
-            ), "Expected reduce_scatter NOT to be called when force_all_reduce=True"
+            assert mock_all_reduce.called, (
+                "Expected all_reduce to be called when force_all_reduce=True"
+            )
+            assert not mock_reduce_scatter.called, (
+                "Expected reduce_scatter NOT to be called when force_all_reduce=True"
+            )
         else:
-            # When force_all_reduce=False with distributed optimizer, reduce_scatter should be called.
-            assert (
-                mock_reduce_scatter.called
-            ), "Expected reduce_scatter to be called when force_all_reduce=False"
-            assert (
-                not mock_all_reduce.called
-            ), "Expected all_reduce NOT to be called when force_all_reduce=False"
+            # When force_all_reduce=False with distributed optimizer, reduce_scatter should be called.  # noqa: E501
+            assert mock_reduce_scatter.called, (
+                "Expected reduce_scatter to be called when force_all_reduce=False"
+            )
+            assert not mock_all_reduce.called, (
+                "Expected all_reduce NOT to be called when force_all_reduce=False"
+            )
 
     Utils.destroy_model_parallel()

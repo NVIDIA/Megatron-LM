@@ -41,7 +41,9 @@ from tests.unit_tests.dist_checkpointing import TempNamedDir
 from tests.unit_tests.test_utilities import Utils
 
 try:
-    from megatron.core.extensions.transformer_engine import TEColumnParallelGroupedLinear
+    from megatron.core.extensions.transformer_engine import (
+        TEColumnParallelGroupedLinear,  # noqa: F401
+    )
 
     HAVE_TE = True
 except ImportError:
@@ -601,12 +603,12 @@ class TestMultiTokenPrediction:
             )
 
             # Verify the rolled tensor matches expected values
-            assert (
-                rolled.shape == expected.shape
-            ), f"Shape mismatch: expected {expected.shape}, got {rolled.shape}"
-            assert torch.equal(
-                rolled, expected
-            ), f"CP Rank {cp_rank}: Expected\n{expected}\nbut got\n{rolled}\nDiff:\n{rolled - expected}"
+            assert rolled.shape == expected.shape, (
+                f"Shape mismatch: expected {expected.shape}, got {rolled.shape}"
+            )
+            assert torch.equal(rolled, expected), (
+                f"CP Rank {cp_rank}: Expected\n{expected}\nbut got\n{rolled}\nDiff:\n{rolled - expected}"  # noqa: E501
+            )
 
             # Verify sum is correct
             assert sum_val.numel() == 1, "Sum should be a scalar"

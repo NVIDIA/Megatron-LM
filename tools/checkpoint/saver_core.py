@@ -1,33 +1,43 @@
 # Copyright (c) 2024, NVIDIA CORPORATION. All rights reserved.
 
-import os
 import sys
-import torch
 from functools import partial
-from importlib.metadata import version
-from packaging.version import Version as PkgVersion
 
-from schema_core import get_model_schema
 from saver_base import MegatronCheckpointSaverBase
+from schema_core import get_model_schema
 
 
 def add_arguments(parser):
     group = parser.add_argument_group(title='M-Core saver')
 
-    group.add_argument('--megatron-path', type=str, default=None,
-                       help='Base directory of Megatron repository')
+    group.add_argument(
+        '--megatron-path', type=str, default=None, help='Base directory of Megatron repository'
+    )
 
-    group.add_argument('--target-tensor-parallel-size', type=int,
-                       help='Target tensor model parallel size, defaults to the tensor parallel size '
-                       'in the input checkpoint if provided by the loader, otherwise to 1')
-    group.add_argument('--target-pipeline-parallel-size', type=int,
-                       help='Target tensor model parallel size, default to the pipeline parall size '
-                       'in the input checkpoint if provided by the loader, otherwise to 1')
-    group.add_argument('--target-expert-parallel-size', type=int, default=1,
-                       help='Target expert model parallel size, default to 1')
-    group.add_argument('--saver-transformer-impl', default='transformer_engine',
-                       choices=['local', 'transformer_engine'],
-                       help='Which Transformer implementation to use.')
+    group.add_argument(
+        '--target-tensor-parallel-size',
+        type=int,
+        help='Target tensor model parallel size, defaults to the tensor parallel size '
+        'in the input checkpoint if provided by the loader, otherwise to 1',
+    )
+    group.add_argument(
+        '--target-pipeline-parallel-size',
+        type=int,
+        help='Target tensor model parallel size, default to the pipeline parall size '
+        'in the input checkpoint if provided by the loader, otherwise to 1',
+    )
+    group.add_argument(
+        '--target-expert-parallel-size',
+        type=int,
+        default=1,
+        help='Target expert model parallel size, default to 1',
+    )
+    group.add_argument(
+        '--saver-transformer-impl',
+        default='transformer_engine',
+        choices=['local', 'transformer_engine'],
+        help='Which Transformer implementation to use.',
+    )
 
 
 class MegatronCheckpointSaverLLM(MegatronCheckpointSaverBase):
@@ -39,12 +49,14 @@ class MegatronCheckpointSaverLLM(MegatronCheckpointSaverBase):
             sys.exit(1)
 
         if self.md.model_type == 'GPT':
-            from model_provider import model_provider
             from gpt_builders import gpt_builder
+            from model_provider import model_provider
+
             self.model_provider = partial(model_provider, gpt_builder)
             self.margs.model_type = ModelType.encoder_or_decoder
         elif self.md.model_type == 'BERT':
             from pretrain_bert import model_provider
+
             self.model_provider = model_provider
             self.margs.model_type = ModelType.encoder_or_decoder
         else:
@@ -59,6 +71,7 @@ class MegatronCheckpointSaverLLM(MegatronCheckpointSaverBase):
             self.margs.expert_model_parallel_size,
         )
         self.receive_lm(schema)
+
 
 def save_checkpoint(queue, args):
     """

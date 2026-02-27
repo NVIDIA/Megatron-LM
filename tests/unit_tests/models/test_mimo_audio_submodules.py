@@ -1,8 +1,9 @@
 # Copyright (c) 2025, NVIDIA CORPORATION. All rights reserved.
 
 '''
-WORLD_SIZE=1 LOCAL_RANK=0 python -m pytest tests/unit_tests/models/test_mimo_audio_submodules.py 
+WORLD_SIZE=1 LOCAL_RANK=0 python -m pytest tests/unit_tests/models/test_mimo_audio_submodules.py
 '''
+
 import math
 import random
 
@@ -129,7 +130,7 @@ class TestAudioSubmodule:
         # Get model-specific parameters
         if model_name not in AUDIO_MODEL_PARAMS:
             raise ValueError(
-                f"Model {model_name} not supported. Available models: {list(AUDIO_MODEL_PARAMS.keys())}"
+                f"Model {model_name} not supported. Available models: {list(AUDIO_MODEL_PARAMS.keys())}"  # noqa: E501
             )
 
         model_params = AUDIO_MODEL_PARAMS[model_name]
@@ -220,12 +221,10 @@ class TestAudioSubmodule:
         return torch.tensor(waveform, dtype=torch.float32).unsqueeze(0)
 
     def _calculate_seq_length(self, audio_tensor):
-
         # Get audio length in samples
         audio_length = audio_tensor.shape[1]
 
         if self.model_type in ["whisper"]:
-
             num_mel_frames = calculate_num_mel_frames(
                 audio_length, self.sample_rate, self.window_stride
             )
@@ -392,5 +391,5 @@ class TestAudioSubmodule:
         assert embeddings.shape[1] == 768
 
         print(
-            f"Model {model_name} (d_model={self.d_model}) successfully processed audio and projected to dimension 768"
+            f"Model {model_name} (d_model={self.d_model}) successfully processed audio and projected to dimension 768"  # noqa: E501
         )

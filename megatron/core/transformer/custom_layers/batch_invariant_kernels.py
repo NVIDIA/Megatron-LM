@@ -167,9 +167,9 @@ def matmul_persistent(a: torch.Tensor, b: torch.Tensor, bias: torch.Tensor | Non
     # Check constraints.
     assert a.shape[1] == b.shape[0], "Incompatible dimensions"
     assert a.dtype == b.dtype, "Incompatible dtypes"
-    assert (
-        bias is None or bias.dim() == 1
-    ), "Currently assuming bias is 1D, let Horace know if you run into this"
+    assert bias is None or bias.dim() == 1, (
+        "Currently assuming bias is 1D, let Horace know if you run into this"
+    )
 
     NUM_SMS = get_compute_units()
     M, K = a.shape
@@ -392,9 +392,9 @@ def mean_dim(
     """
     # Validate inputs
     assert input.is_cuda, "Input must be a CUDA tensor"
-    assert (
-        -input.ndim <= dim < input.ndim
-    ), f"Invalid dimension {dim} for tensor with {input.ndim} dimensions"
+    assert -input.ndim <= dim < input.ndim, (
+        f"Invalid dimension {dim} for tensor with {input.ndim} dimensions"
+    )
 
     # Handle negative dim
     if dim < 0:
@@ -486,11 +486,9 @@ def mean_batch_invariant(input, dim, keepdim=False, dtype: torch.dtype | None = 
     if len(dim) == 1:
         return mean_dim(input, dim[0], keepdim=keepdim)
     else:
-        assert input.dtype in {
-            torch.float16,
-            torch.bfloat16,
-            torch.float32,
-        }, "only float types supported for now"
+        assert input.dtype in {torch.float16, torch.bfloat16, torch.float32}, (
+            "only float types supported for now"
+        )
         n_elems = 1
         for d in dim:
             n_elems *= input.shape[d]

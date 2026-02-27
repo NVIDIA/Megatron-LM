@@ -1,20 +1,21 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
 import argparse
+import io
 import logging
 import os
 import sys
 from dataclasses import dataclass
 from enum import Enum
-from typing import Dict, List, Protocol, Union
+from typing import Dict, List, Protocol
 
+import numpy as np
+import soundfile as sf
 import torch
 import torch.nn.utils.rnn as rnn_utils
 from PIL import Image
-import numpy as np
-import soundfile as sf
 from scipy import signal
-import io
+
 from megatron.training.global_vars import get_tokenizer
 
 sys.path.append(
@@ -30,8 +31,8 @@ sys.path.append(
 )
 from dataloader_provider import train_valid_test_dataloaders_provider
 from transformers import AutoProcessor
-from examples.mimo.data.utils.calculate_audio_tokens import calculate_num_audio_tokens
 
+from examples.mimo.data.utils.calculate_audio_tokens import calculate_num_audio_tokens
 from megatron.energon import (
     DefaultTaskEncoder,
     VQASample,
@@ -75,14 +76,7 @@ class AVLMModelType(Enum):
     IMAGE_AUDIO_LLAVA_AVLM = "image_audio_llava_avlm"
 
 
-class AVLMTaskEncoder(
-    DefaultTaskEncoder[
-        VisionAudioQASample,
-        dict,
-        dict,
-        dict,
-    ]
-):
+class AVLMTaskEncoder(DefaultTaskEncoder[VisionAudioQASample, dict, dict, dict]):
     def __init__(
         self,
         model_type: AVLMModelType,
@@ -117,46 +111,23 @@ class AVLMTaskEncoder(
 
         conversation = []
         for _, (u_txt, b_txt) in enumerate(zip(user_msgs, bot_msgs)):
-            conversation.append(
-                {
-                    "role": "user",
-                    "content": [{"type": "text", "text": u_txt}],
-                }
-            )
-            conversation.append(
-                {
-                    "role": "assistant",
-                    "content": [{"type": "text", "text": b_txt}],
-                }
-            )
+            conversation.append({"role": "user", "content": [{"type": "text", "text": u_txt}]})
+            conversation.append({"role": "assistant", "content": [{"type": "text", "text": b_txt}]})
 
         # Inject optional system message
-        if (
-            self.conversation_template_config
-            and self.conversation_template_config.system
-        ):
+        if self.conversation_template_config and self.conversation_template_config.system:
             conversation.insert(
-                0,
-                {"role": "system", "content": self.conversation_template_config.system},
+                0, {"role": "system", "content": self.conversation_template_config.system}
             )
 
         # Select chat template
-        if (
-            self.conversation_template_config
-            and self.conversation_template_config.chat_template
-        ):
-            self.processor.chat_template = (
-                self.conversation_template_config.chat_template
-            )
+        if self.conversation_template_config and self.conversation_template_config.chat_template:
+            self.processor.chat_template = self.conversation_template_config.chat_template
         return self.processor.apply_chat_template(
-            conversation,
-            tokenize=False,
-            add_generation_prompt=False,
+            conversation, tokenize=False, add_generation_prompt=False
         )
 
-    def _find_pattern_indices(
-        self, template, pattern, start_idx=0, allow_first_mismatch=False
-    ):
+    def _find_pattern_indices(self, template, pattern, start_idx=0, allow_first_mismatch=False):
         template_len = len(template)
         pat_len = len(pattern)
         for i in range(start_idx, template_len - pat_len + 1):
@@ -176,7 +147,9 @@ class AVLMTaskEncoder(
         if sample.image is not None:
             image_io = io.BytesIO(sample.image)
             image = Image.open(image_io)
-            image_tensor = torch.from_numpy(np.array(image)).permute(2, 0, 1)  # Convert to CxHxW format
+            image_tensor = torch.from_numpy(np.array(image)).permute(
+                2, 0, 1
+            )  # Convert to CxHxW format
             image_tensor = image_tensor.float() / 255.0  # rescale to [0,1] range
         else:
             image_tensor = None
@@ -206,7 +179,9 @@ class AVLMTaskEncoder(
             processed_audios = self.audio_processor(audio_tensor, sampling_rate=fixed_sample_rate)
             processed_audios = torch.tensor(processed_audios["input_features"])
             processed_audios = processed_audios.squeeze(0)  # remove batch dim
-            num_audio_tokens = calculate_num_audio_tokens(audio_tensor.unsqueeze(0), args.audio_encoder_model)
+            num_audio_tokens = calculate_num_audio_tokens(
+                audio_tensor.unsqueeze(0), args.audio_encoder_model
+            )
             audios_seq_lengths = torch.tensor(num_audio_tokens)
             processed_prompt = prompt.replace(AUDIO_TOKEN, AUDIO_TOKEN * num_audio_tokens)
         else:
@@ -217,15 +192,13 @@ class AVLMTaskEncoder(
         # Process image + prompt
         # Here, we:
         #  + process the image
-        #  + use self.processor to automatically calculate the number  
+        #  + use self.processor to automatically calculate the number
         #    of image tokens, then add them to the prompt
         #    => this step combine adding the corresponding image tokens to the prompt AND
         #       tokenize the prompt after that
         if image_tensor is not None:
             processed_images = self.image_processor(
-                images=image_tensor,
-                return_tensors="pt",
-                do_rescale=False,
+                images=image_tensor, return_tensors="pt", do_rescale=False
             )["pixel_values"]
             processed_images = processed_images.squeeze(0)  # remove batch dim
         else:
@@ -238,7 +211,7 @@ class AVLMTaskEncoder(
             return_tensors="pt",
             do_rescale=False,
         )
-        
+
         # Remove batch dim
         for k, v in processed_prompt_inputs.items():
             processed_prompt_inputs[k] = v.squeeze(0)
@@ -332,18 +305,13 @@ class AVLMTaskEncoder(
         }
 
         if images is not None:
-            output["modality_inputs"] = {
-                "images": {"clip_encoder": {"pixel_values": images}}
-            }
+            output["modality_inputs"] = {"images": {"clip_encoder": {"pixel_values": images}}}
 
         if audios is not None:
             if "modality_inputs" not in output:
                 output["modality_inputs"] = {}
             output["modality_inputs"]["audios"] = {
-                "whisper_encoder": {
-                    "input_features": audios,
-                    "seq_lengths": audios_seq_lengths
-                }
+                "whisper_encoder": {"input_features": audios, "seq_lengths": audios_seq_lengths}
             }
 
         return output
@@ -397,7 +365,7 @@ if __name__ == "__main__":
         help="path to the dataset directory in energon format",
     )
     args = parser.parse_args()
-    
+
     # for image audio llava avlm
     hf_model_id = "llava-hf/llava-1.5-7b-hf"
     model_type = AVLMModelType.IMAGE_AUDIO_LLAVA_AVLM
@@ -431,9 +399,13 @@ if __name__ == "__main__":
         print(f"batch index {index} tokens {each_batch['input_ids']}")
         if 'modality_inputs' in each_batch:
             if 'images' in each_batch['modality_inputs']:
-                print(f"images shape: {each_batch['modality_inputs']['images']['clip_encoder']['pixel_values'].shape}")
+                print(
+                    f"images shape: {each_batch['modality_inputs']['images']['clip_encoder']['pixel_values'].shape}"  # noqa: E501
+                )
             if 'audios' in each_batch['modality_inputs']:
-                print(f"audios shape: {each_batch['modality_inputs']['audios']['whisper_encoder']['input_features'].shape}")
+                print(
+                    f"audios shape: {each_batch['modality_inputs']['audios']['whisper_encoder']['input_features'].shape}"  # noqa: E501
+                )
         break
 
 
@@ -481,4 +453,4 @@ KEY_PROCESSORS: Dict[str, KeyProcessor] = {
     "attention_mask": PaddingProcessor(pad_value=0),
     "loss_mask": PaddingProcessor(pad_value=0),
     "labels": PaddingProcessor(pad_value=-100),
-} 
+}

@@ -236,9 +236,9 @@ class CUDAGraphBatchDimensionBuilder:
             [1000, 752, 504, 256]
         """
         assert num_cuda_graphs >= 1, f"num_cuda_graphs must be >= 1, got {num_cuda_graphs}"
-        assert (
-            cuda_graph_max_tokens > 0
-        ), f"cuda_graph_max_tokens must be > 0, got {cuda_graph_max_tokens}"
+        assert cuda_graph_max_tokens > 0, (
+            f"cuda_graph_max_tokens must be > 0, got {cuda_graph_max_tokens}"
+        )
 
         # Cuda graph step size.
         cuda_graph_step_size = cuda_graph_max_tokens / num_cuda_graphs
@@ -332,7 +332,6 @@ class CUDAGraphBatchDimensionBuilder:
         cuda_graph_prefill_token_counts = None
         cuda_graph_decode_token_counts = None
         if num_cuda_graphs is not None:
-
             # Ensure valid num_cuda_graphs.
             if (
                 cuda_graph_max_tokens is None

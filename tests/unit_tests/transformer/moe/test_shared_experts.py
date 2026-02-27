@@ -11,7 +11,6 @@ from tests.unit_tests.test_utilities import Utils
 
 
 class TestSharedExperts:
-
     def setup_method(self, method):
         pass
 
@@ -73,7 +72,6 @@ class TestSharedExperts:
 
 
 class TestSharedExpertsOverlap:
-
     def setup_method(self, method):
         pass
 

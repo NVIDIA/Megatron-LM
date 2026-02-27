@@ -1,7 +1,7 @@
 # Copyright (c) 2025, NVIDIA CORPORATION. All rights reserved.
 
 import asyncio
-from typing import Any, AsyncGenerator, Optional, Type
+from typing import Any, AsyncGenerator, Type
 
 import numpy as np
 
@@ -108,7 +108,9 @@ class WeightedMultiTask(
 
         Args:
             total_count: Total number of items to distribute
-            distribute_remainder: Whether to distribute the remainder of the counts to the agents with the largest fractional parts
+            distribute_remainder: Whether to distribute the remainder
+                of the counts to the agents with the largest
+                fractional parts
 
         Returns:
             List of counts for each agent, summing to total_count
@@ -152,12 +154,12 @@ class WeightedMultiTask(
 
     async def group_rollout(self, request: GroupedRolloutRequest) -> list[Rollout]:
         raise NotImplementedError(
-            "WeightedMultiTask is a collection of tasks and therefore doesn't implement this method directly. Use get_grouped_rollouts instead to generate grouped rollouts."
+            "WeightedMultiTask is a collection of tasks and therefore doesn't implement this method directly. Use get_grouped_rollouts instead to generate grouped rollouts."  # noqa: E501
         )
 
     async def rollout(self, request: RolloutRequest) -> Rollout:
         raise NotImplementedError(
-            "WeightedMultiTask is a collection of tasks and therefore doesn't implement this method directly. Use get_reward_rollouts instead to generate rollouts."
+            "WeightedMultiTask is a collection of tasks and therefore doesn't implement this method directly. Use get_reward_rollouts instead to generate rollouts."  # noqa: E501
         )
 
     async def get_reward_rollouts(self, request: RolloutRequest) -> list[Rollout]:

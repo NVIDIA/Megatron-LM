@@ -1,6 +1,5 @@
 # Copyright (c) 2023, NVIDIA CORPORATION. All rights reserved.
 
-import importlib
 import inspect
 import numbers
 
@@ -63,9 +62,9 @@ class FusedLayerNorm(torch.nn.Module):
         self.config = config
 
         self.zero_centered_gamma = self.config.layernorm_zero_centered_gamma
-        assert (
-            self.config.normalization == "LayerNorm"
-        ), f'({self.config.normalization}) is not supported in FusedLayerNorm'
+        assert self.config.normalization == "LayerNorm", (
+            f'({self.config.normalization}) is not supported in FusedLayerNorm'
+        )
 
         # List of hiddens sizes supported in the persistent layer norm kernel
         # If the hidden size is not supported, fall back to the non-persistent
@@ -108,7 +107,7 @@ class FusedLayerNorm(torch.nn.Module):
             hidden_size = (hidden_size,)
         self.hidden_size = torch.Size(hidden_size)
         self.eps = eps
-        # Parameters need to be initialized with torch.empty rather than torch.Tensor for correct device placement with nemo2.
+        # Parameters need to be initialized with torch.empty rather than torch.Tensor for correct device placement with nemo2.  # noqa: E501
         self.weight = Parameter(torch.empty(*hidden_size))
         self.bias = Parameter(torch.empty(*hidden_size))
         self.reset_parameters()
@@ -120,7 +119,6 @@ class FusedLayerNorm(torch.nn.Module):
         setattr(self.bias, 'sequence_parallel', self.sequence_parallel)
 
     def reset_parameters(self):
-
         if self.zero_centered_gamma:
             init.zeros_(self.weight)
             init.zeros_(self.bias)
@@ -129,7 +127,6 @@ class FusedLayerNorm(torch.nn.Module):
             init.zeros_(self.bias)
 
     def forward(self, input: Tensor) -> Tensor:
-
         weight = self.weight + 1 if self.zero_centered_gamma else self.weight
 
         if self.persist_layer_norm:

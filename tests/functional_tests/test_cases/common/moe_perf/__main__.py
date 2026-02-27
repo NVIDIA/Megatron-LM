@@ -8,24 +8,19 @@ import json
 import os
 import statistics
 from contextlib import nullcontext
-from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Dict, Iterable, Mapping, Optional, Sequence, cast
+from typing import Any, Dict, Mapping, Sequence, cast
 
 import pytest  # type: ignore[import]
 import torch
 
 from megatron.core.config import set_experimental_flag
 from megatron.core.fp8_utils import get_fp8_context
-from megatron.core.models.gpt.gpt_layer_specs import (
-    get_gpt_layer_local_spec,
-    get_gpt_layer_with_transformer_engine_spec,
-)
+from megatron.core.models.gpt.gpt_layer_specs import get_gpt_layer_with_transformer_engine_spec
 from megatron.core.transformer.moe.fused_a2a import HAVE_DEEP_EP, HAVE_HYBRIDEP
 from megatron.core.transformer.moe.moe_layer import MoELayer
 from megatron.core.transformer.moe.moe_utils import RandomSTE
 from megatron.core.transformer.transformer_config import TransformerConfig
-from megatron.core.utils import is_te_min_version
 from megatron.training.initialize import _set_random_seed
 from tests.unit_tests.test_utilities import Utils
 
@@ -151,12 +146,12 @@ def _assert_within_baseline(
     forward_timings = cast(Sequence[float], metrics.get("forward_timings", ()))
     backward_timings = cast(Sequence[float], metrics.get("backward_timings", ()))
 
-    assert (
-        forward_ms <= fwd_limit
-    ), f"Forward pass for {case_name} regressed: {forward_ms:.3f} ms (limit {fwd_limit:.3f} ms)."
-    assert (
-        backward_ms <= bwd_limit
-    ), f"Backward pass for {case_name} regressed: {backward_ms:.3f} ms (limit {bwd_limit:.3f} ms)."
+    assert forward_ms <= fwd_limit, (
+        f"Forward pass for {case_name} regressed: {forward_ms:.3f} ms (limit {fwd_limit:.3f} ms)."
+    )
+    assert backward_ms <= bwd_limit, (
+        f"Backward pass for {case_name} regressed: {backward_ms:.3f} ms (limit {bwd_limit:.3f} ms)."
+    )
 
     if forward_ms > 0.0:
         assert forward_std_ms / forward_ms <= DEFAULT_MAX_VARIANCE_RATIO, (
@@ -174,8 +169,8 @@ def _assert_within_baseline(
         )
     assert max_allocated_bytes <= mem_limit, (
         "Max allocated memory for "
-        f"{case_name} regressed: {max_allocated_bytes / (1024 ** 2):.3f} MiB "
-        f"(limit {mem_limit / (1024 ** 2):.3f} MiB)."
+        f"{case_name} regressed: {max_allocated_bytes / (1024**2):.3f} MiB "
+        f"(limit {mem_limit / (1024**2):.3f} MiB)."
     )
 
 
@@ -305,7 +300,7 @@ def _check_env():
     NCCL_MAX_NCHANNELS = os.environ.get("NCCL_MAX_NCHANNELS")
     if NCCL_MAX_NCHANNELS is not None:
         pytest.fail(
-            f"NCCL_MAX_NCHANNELS is set to {NCCL_MAX_NCHANNELS}, this may lead to performance regression"
+            f"NCCL_MAX_NCHANNELS is set to {NCCL_MAX_NCHANNELS}, this may lead to performance regression"  # noqa: E501
         )
 
 
@@ -353,7 +348,7 @@ def test_moe_layer_performance(perf_case: MoEPerformanceCase, debug_mode: bool =
         summary = (
             f"MoE layer performance ({perf_case.name}): forward {metrics['forward_ms']:.3f} ms "
             f"(σ={metrics['forward_std_ms']:.3f}), backward {metrics['backward_ms']:.3f} ms "
-            f"(σ={metrics['backward_std_ms']:.3f}), max mem {metrics['max_allocated_bytes'] / (1024 ** 2):.3f} MiB"
+            f"(σ={metrics['backward_std_ms']:.3f}), max mem {metrics['max_allocated_bytes'] / (1024**2):.3f} MiB"  # noqa: E501
         )
         if Utils.rank == 0:
             print(summary)
@@ -405,10 +400,10 @@ def test_moe_layer_performance(perf_case: MoEPerformanceCase, debug_mode: bool =
 #         --capture-range=cudaProfilerApi \
 #         --capture-range-end=stop \
 #         -o output \
-#         uv run --no-sync python -m torch.distributed.run --nproc_per_node=8 --nnodes=1 -m tests.functional_tests.test_cases.common.moe_perf
+#         uv run --no-sync python -m torch.distributed.run --nproc_per_node=8 --nnodes=1 -m tests.functional_tests.test_cases.common.moe_perf  # noqa: E501
 # Commands to run with pytest:
 # export MEGATRON_UPDATE_PERF_BASELINES=0 # set to 1 to update baseline perf numbers
-# uv run --no-sync python -m torch.distributed.run --nproc_per_node=8 --nnodes=1 -m tests.functional_tests.test_cases.common.moe_perf
+# uv run --no-sync python -m torch.distributed.run --nproc_per_node=8 --nnodes=1 -m tests.functional_tests.test_cases.common.moe_perf  # noqa: E501
 if __name__ == "__main__":
     pytest.main(["-x", "-v", "-s", __file__])  # -xvs
     # torch.cuda.cudart().cudaProfilerStart()

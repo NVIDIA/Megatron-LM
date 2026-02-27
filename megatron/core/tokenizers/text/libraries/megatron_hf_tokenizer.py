@@ -28,12 +28,12 @@ MEGATRON_CACHE = os.path.join(torch_home, "megatron")
 
 MEGATRON_CONFIG_MAP = {
     "BertWordPieceLowerCase": {
-        "checkpoint": "https://api.ngc.nvidia.com/v2/models/nvidia/megatron_bert_345m/versions/v0.0/files/release/mp_rank_00/model_optim_rng.pt",  # pylint: disable=line-too-long
-        "vocab": "https://s3.amazonaws.com/models.huggingface.co/bert/bert-large-uncased-vocab.txt",  # pylint: disable=line-too-long
+        "checkpoint": "https://api.ngc.nvidia.com/v2/models/nvidia/megatron_bert_345m/versions/v0.0/files/release/mp_rank_00/model_optim_rng.pt",  # noqa: E501
+        "vocab": "https://s3.amazonaws.com/models.huggingface.co/bert/bert-large-uncased-vocab.txt",  # noqa: E501
         "tokenizer_name": "bert-large-uncased",
     },
     "BertWordPieceCase": {
-        "checkpoint": "https://api.ngc.nvidia.com/v2/models/nvidia/megatron_bert_345m/versions/v0.1_cased/files/release/mp_rank_00/model_optim_rng.pt",  # pylint: disable=line-too-long
+        "checkpoint": "https://api.ngc.nvidia.com/v2/models/nvidia/megatron_bert_345m/versions/v0.1_cased/files/release/mp_rank_00/model_optim_rng.pt",  # noqa: E501
         "vocab": "https://s3.amazonaws.com/models.huggingface.co/bert/bert-large-cased-vocab.txt",
         "tokenizer_name": "bert-large-cased",
     },
@@ -48,17 +48,17 @@ MEGATRON_CONFIG_MAP = {
         "tokenizer_name": "gpt2",
     },
     "megatron-bert-345m-uncased": {
-        "checkpoint": "https://api.ngc.nvidia.com/v2/models/nvidia/megatron_bert_345m/versions/v0.0/files/release/mp_rank_00/model_optim_rng.pt",  # pylint: disable=line-too-long
+        "checkpoint": "https://api.ngc.nvidia.com/v2/models/nvidia/megatron_bert_345m/versions/v0.0/files/release/mp_rank_00/model_optim_rng.pt",  # noqa: E501
         "vocab": "https://s3.amazonaws.com/models.huggingface.co/bert/bert-large-uncased-vocab.txt",
         "tokenizer_name": "bert-large-uncased",
     },
     "megatron-bert-345m-cased": {
-        "checkpoint": "https://api.ngc.nvidia.com/v2/models/nvidia/megatron_bert_345m/versions/v0.1_cased/files/release/mp_rank_00/model_optim_rng.pt",  # pylint: disable=line-too-long
+        "checkpoint": "https://api.ngc.nvidia.com/v2/models/nvidia/megatron_bert_345m/versions/v0.1_cased/files/release/mp_rank_00/model_optim_rng.pt",  # noqa: E501
         "vocab": "https://s3.amazonaws.com/models.huggingface.co/bert/bert-large-cased-vocab.txt",
         "tokenizer_name": "bert-large-cased",
     },
     "megatron-bert-uncased": {
-        "vocab": "https://s3.amazonaws.com/models.huggingface.co/bert/bert-large-uncased-vocab.txt",  # pylint: disable=line-too-long
+        "vocab": "https://s3.amazonaws.com/models.huggingface.co/bert/bert-large-uncased-vocab.txt",  # noqa: E501
         "tokenizer_name": "bert-large-uncased",
     },
     "megatron-bert-cased": {
@@ -66,11 +66,11 @@ MEGATRON_CONFIG_MAP = {
         "tokenizer_name": "bert-large-cased",
     },
     "biomegatron-bert-345m-uncased": {
-        "vocab": "https://api.ngc.nvidia.com/v2/models/nvidia/biomegatron345muncased/versions/0/files/vocab.txt",  # pylint: disable=line-too-long
+        "vocab": "https://api.ngc.nvidia.com/v2/models/nvidia/biomegatron345muncased/versions/0/files/vocab.txt",  # noqa: E501
         "tokenizer_name": "bert-large-uncased",
     },
     "biomegatron-bert-345m-cased": {
-        "vocab": "https://api.ngc.nvidia.com/v2/models/nvidia/biomegatron345mcased/versions/0/files/vocab.txt",  # pylint: disable=line-too-long
+        "vocab": "https://api.ngc.nvidia.com/v2/models/nvidia/biomegatron345mcased/versions/0/files/vocab.txt",  # noqa: E501
         "tokenizer_name": "bert-large-cased",
     },
 }

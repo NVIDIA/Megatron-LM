@@ -37,14 +37,14 @@ from megatron.core.utils import (
 )
 
 try:
-    import transformer_engine.pytorch as te  # pylint: disable=unused-import
+    import transformer_engine.pytorch as te  # noqa: F401
 
     HAVE_TE = True
 except ImportError:
     HAVE_TE = False
 
 try:
-    import apex  # pylint: disable=unused-import
+    import apex  # noqa: F401
 
     HAVE_APEX = True
 except ImportError:
@@ -105,12 +105,13 @@ def get_num_layers_to_build(
         config.num_layers_in_first_pipeline_stage is not None
         or config.num_layers_in_last_pipeline_stage is not None
     ):
-
         assert not (
             config.account_for_embedding_in_pipeline_split
             or config.account_for_loss_in_pipeline_split
-        ), " \
+        ), (
+            " \
         Does not support standalone embedding stage and standalone loss stage with uneven pp"
+        )
         # Number of layers to distribute over rest of pipeline stages
         layers_to_distribute = config.num_layers
         # Number of pipeline stages left for distributing transformer layers
@@ -129,9 +130,9 @@ def get_num_layers_to_build(
         # If pp_size <= 2, we do not have any intermediate pipeline stages, and we do not
         # need to check if the left over layers are divisible by the left over stages.
         if pipeline_stages_left > 0:
-            assert (
-                layers_to_distribute % pipeline_stages_left == 0
-            ), "With uneven pipelineing the left over layers must be divisible by left over stages"
+            assert layers_to_distribute % pipeline_stages_left == 0, (
+                "With uneven pipelineing the left over layers must be divisible by left over stages"
+            )
             num_layers_per_pipeline_rank = layers_to_distribute // pipeline_stages_left
         else:
             num_layers_per_pipeline_rank = 0
@@ -154,9 +155,9 @@ def get_num_layers_to_build(
         if config.account_for_loss_in_pipeline_split:
             num_layers += 1
 
-        assert (
-            num_layers % config.pipeline_model_parallel_size == 0
-        ), "num_layers should be divisible by pipeline_model_parallel_size"
+        assert num_layers % config.pipeline_model_parallel_size == 0, (
+            "num_layers should be divisible by pipeline_model_parallel_size"
+        )
         num_layers_per_pipeline_rank = num_layers // config.pipeline_model_parallel_size
 
     vp_size = config.virtual_pipeline_model_parallel_size
@@ -173,10 +174,10 @@ def get_num_layers_to_build(
         # Stage 0: [0, 1]  [4, 5]
         # Stage 1: [2, 3]  [6, 7]
 
-        assert (
-            num_layers_per_pipeline_rank % vp_size == 0
-        ), f"num_layers_per_pipeline_rank {num_layers_per_pipeline_rank} \
+        assert num_layers_per_pipeline_rank % vp_size == 0, (
+            f"num_layers_per_pipeline_rank {num_layers_per_pipeline_rank} \
             should be divisible by vp_size {vp_size}"
+        )
         num_layers_per_virtual_stage = num_layers_per_pipeline_rank // vp_size
 
         num_layers_to_build = num_layers_per_virtual_stage
@@ -192,9 +193,9 @@ def get_num_layers_to_build(
     if config.account_for_embedding_in_pipeline_split:
         if is_vp_first_stage(vp_stage, vp_size) and is_first_pp_stage:
             num_layers_to_build -= 1
-            assert (
-                num_layers_to_build >= 0
-            ), f"Not enough layers in the first virtual pipeline stage"
+            assert num_layers_to_build >= 0, (
+                f"Not enough layers in the first virtual pipeline stage"
+            )
 
     if config.account_for_loss_in_pipeline_split:
         if is_vp_last_stage(vp_stage, vp_size) and is_last_pp_stage:
@@ -317,9 +318,9 @@ class TransformerBlock(GraphableMegatronModule, MegatronModule):
                 self.offload_context if self.config.cpu_offloading else None
             )
         else:
-            assert (
-                self.config.cpu_offloading is False
-            ), "CPU Offloading is enabled when TE is not present"
+            assert self.config.cpu_offloading is False, (
+                "CPU Offloading is enabled when TE is not present"
+            )
 
             self.offload_context, self.group_prefetch_offload_commit_async = nullcontext(), None
             self.config._cpu_offloading_context = None
@@ -932,7 +933,7 @@ class TransformerBlock(GraphableMegatronModule, MegatronModule):
             )
 
             global_layer_offset = layer.layer_number - 1  # self.layer_number starts at 1
-            state_dict_prefix = f'{layer_prefix}{global_layer_offset - offset}.'  # module list index in TransformerBlock # pylint: disable=line-too-long
+            state_dict_prefix = f'{layer_prefix}{global_layer_offset - offset}.'  # module list index in TransformerBlock  # noqa: E501
             if non_homogeneous_layers:
                 sharded_prefix = f'{layer_prefix}{global_layer_offset}.'
                 sharded_pp_offset = []

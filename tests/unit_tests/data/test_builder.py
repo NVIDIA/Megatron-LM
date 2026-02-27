@@ -126,7 +126,6 @@ def test_builder():
             return {"text": self.dataset[self.sample_index[idx]]}
 
     with tempfile.TemporaryDirectory() as temp_dir:
-
         paths = do_setup(temp_dir)
 
         blends = {
@@ -372,7 +371,7 @@ def test_fast_builder(
     )
 
     with TempNamedDir(tmp_path_dist_ckpt / "test_fast_builder", sync=True) as temp_dir:
-        # Created file_prefixes (tokenizer, Number of files, number of documents, path) --> returns file prefixes (list of strings)
+        # Created file_prefixes (tokenizer, Number of files, number of documents, path) --> returns file prefixes (list of strings)  # noqa: E501
         if not torch.distributed.is_initialized() or torch.distributed.get_rank() == 0:
             file_prefixes = create_file_prefixes(
                 tokenizer, number_of_files, number_of_documents, os.path.join(temp_dir, "dataset")
@@ -418,7 +417,7 @@ def test_fast_builder(
                 valid_file_prefixes_original = valid_file_prefixes[:]
                 test_file_prefixes_original = test_file_prefixes[:]
 
-                # For train_file_prefixes, alternately append a random int (10-100) and the file prefix.
+                # For train_file_prefixes, alternately append a random int (10-100) and the file prefix.  # noqa: E501
                 train_file_prefixes = []
                 for fp in train_file_prefixes_original:
                     train_file_prefixes.extend([random.randint(10, 100), fp])
@@ -480,9 +479,9 @@ def test_fast_builder(
         ):
             if not ds_slow:
                 continue
-            assert len(ds_slow) == len(
-                ds_fast
-            ), f"ds_slow: {len(ds_slow)}, ds_fast: {len(ds_fast)}, split_name: {split_name}"
+            assert len(ds_slow) == len(ds_fast), (
+                f"ds_slow: {len(ds_slow)}, ds_fast: {len(ds_fast)}, split_name: {split_name}"
+            )
             if isinstance(ds_slow, GPTDataset):
                 assert torch.all(ds_slow[0]["tokens"] == ds_fast[0]["tokens"])
                 assert torch.all(ds_slow[-1]["tokens"] == ds_fast[-1]["tokens"])

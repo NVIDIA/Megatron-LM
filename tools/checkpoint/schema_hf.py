@@ -4,7 +4,8 @@
 
 import typing as T
 
-# Using this instead of starting from ModelSchema, since cannot make similar assumptions about for example 'layer' location and HF state dicts use fully spelled out keys instead of nested attributes so _set_deep_tensor will not work.
+
+# Using this instead of starting from ModelSchema, since cannot make similar assumptions about for example 'layer' location and HF state dicts use fully spelled out keys instead of nested attributes so _set_deep_tensor will not work.  # noqa: E501
 class HFSchema:
     def __init__(self, schema, layer_schema, prefix, layer_prefix):
         self.mapping = schema
@@ -13,12 +14,16 @@ class HFSchema:
 
     def set(self, state_dict, params):
         for k, p in params.items():
-            assert k in self.mapping, f"params_dict contains key {k} that isn't specified in the schema"
+            assert k in self.mapping, (
+                f"params_dict contains key {k} that isn't specified in the schema"
+            )
             state_dict[self.mapping[k]] = p.clone()
 
     def set_layer(self, state_dict, layer_idx, params):
         for k, p in params.items():
-            assert k in self.layer_mapping, f"params_dict for layer {layer_idx} contains key {k} that isn't specified in the schema"
+            assert k in self.layer_mapping, (
+                f"params_dict for layer {layer_idx} contains key {k} that isn't specified in the schema"  # noqa: E501
+            )
             state_dict[f"{self.layer_prefix}.{layer_idx}.{self.layer_mapping[k]}"] = p.clone()
 
 
@@ -53,7 +58,10 @@ class HFLMSchema(HFSchema):
             "mlp_l1_weight": "mlp.down_proj.weight" if use_swiglu else "mlp.fc2.weight",
             "mlp_l1_bias": "mlp.down_proj.bias" if use_swiglu else "mlp.fc2.bias",
         }
-        super().__init__(schema=schema, layer_schema=layer_schema, prefix=prefix, layer_prefix=layer_prefix)
+        super().__init__(
+            schema=schema, layer_schema=layer_schema, prefix=prefix, layer_prefix=layer_prefix
+        )
+
 
 class HFInternViTSchema(HFSchema):
     def __init__(self, prefix, layer_prefix, use_swiglu=False):
@@ -88,7 +96,9 @@ class HFInternViTSchema(HFSchema):
             "mlp_l1_weight": "mlp.down_proj.weight" if use_swiglu else "mlp.fc2.weight",
             "mlp_l1_bias": "mlp.down_proj.bias" if use_swiglu else "mlp.fc2.bias",
         }
-        super().__init__(schema=schema, layer_schema=layer_schema, prefix=prefix, layer_prefix=layer_prefix)
+        super().__init__(
+            schema=schema, layer_schema=layer_schema, prefix=prefix, layer_prefix=layer_prefix
+        )
 
 
 class HFSiglipSchema(HFSchema):
@@ -123,7 +133,9 @@ class HFSiglipSchema(HFSchema):
             "mlp_l1_weight": "mlp.down_proj.weight" if use_swiglu else "mlp.fc2.weight",
             "mlp_l1_bias": "mlp.down_proj.bias" if use_swiglu else "mlp.fc2.bias",
         }
-        super().__init__(schema=schema, layer_schema=layer_schema, prefix=prefix, layer_prefix=layer_prefix)
+        super().__init__(
+            schema=schema, layer_schema=layer_schema, prefix=prefix, layer_prefix=layer_prefix
+        )
 
 
 class HFRADIOSchema(HFSchema):
@@ -154,7 +166,9 @@ class HFRADIOSchema(HFSchema):
             "mlp_l1_weight": "mlp.down_proj.weight" if use_swiglu else "mlp.fc2.weight",
             "mlp_l1_bias": "mlp.down_proj.bias" if use_swiglu else "mlp.fc2.bias",
         }
-        super().__init__(schema=schema, layer_schema=layer_schema, prefix=prefix, layer_prefix=layer_prefix)
+        super().__init__(
+            schema=schema, layer_schema=layer_schema, prefix=prefix, layer_prefix=layer_prefix
+        )
 
 
 def get_vision_model_schema(
@@ -163,16 +177,12 @@ def get_vision_model_schema(
     layer_prefix: T.Optional[str] = "",
     use_swiglu=False,
 ) -> HFSchema:
-    return {
-        "internvit" : HFInternViTSchema,
-        "siglip" : HFSiglipSchema,
-        "radio" : HFRADIOSchema,
-    }[vision_model_type](prefix, layer_prefix, use_swiglu=use_swiglu)
+    return {"internvit": HFInternViTSchema, "siglip": HFSiglipSchema, "radio": HFRADIOSchema}[
+        vision_model_type
+    ](prefix, layer_prefix, use_swiglu=use_swiglu)
 
 
 def get_language_model_schema(
-    prefix: T.Optional[str] = "",
-    layer_prefix: T.Optional[str] = "",
-    use_swiglu=False,
+    prefix: T.Optional[str] = "", layer_prefix: T.Optional[str] = "", use_swiglu=False
 ) -> HFSchema:
     return HFLMSchema(prefix, layer_prefix, use_swiglu=use_swiglu)

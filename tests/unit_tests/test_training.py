@@ -103,7 +103,8 @@ class TestSaveGrads:
         save_dir = str(tmp_path_dist_ckpt / "test_save_grads")
 
         with TempNamedDir(save_dir, sync=True) as save_dir:
-            # Create a mock state_dict with gradients (use deterministic values for reproducibility).
+            # Create a mock state_dict with gradients
+            # (use deterministic values for reproducibility).
             state_dict = defaultdict(dict)
             state_dict["model_chunk0"]["layer.weight"] = torch.arange(16).reshape(4, 4).float()
             state_dict["model_chunk0"]["layer.bias"] = torch.arange(4).float()

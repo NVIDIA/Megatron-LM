@@ -158,9 +158,9 @@ def test_multi_device_hybrid_optimizer(
         assert (v.isnan() == ref_params[k].isnan()).all()
         torch.nan_to_num_(v, 0)
         torch.nan_to_num_(ref_params[k], 0)
-        assert torch.allclose(
-            v, ref_params[k], atol=1e-03
-        ), f"Weight {k} value mismatch, max error: {(v - ref_params[k]).abs().max()}"
+        assert torch.allclose(v, ref_params[k], atol=1e-03), (
+            f"Weight {k} value mismatch, max error: {(v - ref_params[k]).abs().max()}"
+        )
 
 
 @pytest.mark.skipif(
@@ -250,6 +250,6 @@ def test_overlap_cpu_optimizer_d2h_h2d_sync_correctness(
         assert (v.isnan() == ref_params[k].isnan()).all()
         torch.nan_to_num_(v, 0)
         torch.nan_to_num_(ref_params[k], 0)
-        assert torch.allclose(
-            v, ref_params[k], atol=1e-03
-        ), f"Weight {k} value mismatch, max error: {(v - ref_params[k]).abs().max()}"
+        assert torch.allclose(v, ref_params[k], atol=1e-03), (
+            f"Weight {k} value mismatch, max error: {(v - ref_params[k]).abs().max()}"
+        )

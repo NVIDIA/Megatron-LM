@@ -62,9 +62,9 @@ class TestCommunicationWithCustomPPGroup:
 
         # Synchronize before test
         dist.barrier()
-        assert torch.allclose(
-            tensor_received_global, tensor_received_custom
-        ), "broadcast_from_last_pipeline_stage should be the same with or without custom pp_group"
+        assert torch.allclose(tensor_received_global, tensor_received_custom), (
+            "broadcast_from_last_pipeline_stage should be the same with or without custom pp_group"
+        )
         Utils.destroy_model_parallel()
 
     @pytest.mark.skipif(
@@ -123,7 +123,7 @@ class TestCommunicationWithCustomPPGroup:
             send_to_next_pipeline_rank(tensor=local_send_data, pp_group=pp_group)
 
         dist.barrier()
-        assert torch.allclose(
-            local_recv_buffer_global, local_recv_buffer_custom
-        ), "Custom and global recv buffers should be the same."
+        assert torch.allclose(local_recv_buffer_global, local_recv_buffer_custom), (
+            "Custom and global recv buffers should be the same."
+        )
         Utils.destroy_model_parallel()

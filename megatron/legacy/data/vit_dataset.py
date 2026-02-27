@@ -1,12 +1,9 @@
 # Copyright (c) 2022, NVIDIA CORPORATION. All rights reserved.
-import os
 import random
 
-import numpy as np
 import torch
 import torchvision.transforms as T
 from PIL import Image, ImageFilter, ImageOps
-from torchvision import datasets
 
 from megatron.legacy.data.autoaugment import ImageNetPolicy
 from megatron.legacy.data.image_folder import ImageFolder
@@ -18,7 +15,8 @@ class GaussianBlur(object):
     """
     Apply Gaussian Blur to the PIL image.
     """
-    def __init__(self, p=0.5, radius_min=0.1, radius_max=2.):
+
+    def __init__(self, p=0.5, radius_min=0.1, radius_max=2.0):
         self.prob = p
         self.radius_min = radius_min
         self.radius_max = radius_max
@@ -29,9 +27,7 @@ class GaussianBlur(object):
             return img
 
         return img.filter(
-            ImageFilter.GaussianBlur(
-                radius=random.uniform(self.radius_min, self.radius_max)
-            )
+            ImageFilter.GaussianBlur(radius=random.uniform(self.radius_min, self.radius_max))
         )
 
 
@@ -39,6 +35,7 @@ class Solarization(object):
     """
     Apply Solarization to the PIL image.
     """
+
     def __init__(self, p):
         self.p = p
 
@@ -49,64 +46,73 @@ class Solarization(object):
             return img
 
 
-class ClassificationTransform():
+class ClassificationTransform:
     def __init__(self, image_size, train=True):
         args = get_args()
         assert args.fp16 or args.bf16
         self.data_type = torch.half if args.fp16 else torch.bfloat16
         if train:
-            self.transform = T.Compose([
-                T.RandomResizedCrop(image_size),
-                T.RandomHorizontalFlip(),
-                T.ColorJitter(0.4, 0.4, 0.4, 0.1),
-                ImageNetPolicy(),
-                T.ToTensor(),
-                T.Normalize((0.485, 0.456, 0.406), (0.229, 0.224, 0.225)),
-                T.ConvertImageDtype(self.data_type)
-            ])
+            self.transform = T.Compose(
+                [
+                    T.RandomResizedCrop(image_size),
+                    T.RandomHorizontalFlip(),
+                    T.ColorJitter(0.4, 0.4, 0.4, 0.1),
+                    ImageNetPolicy(),
+                    T.ToTensor(),
+                    T.Normalize((0.485, 0.456, 0.406), (0.229, 0.224, 0.225)),
+                    T.ConvertImageDtype(self.data_type),
+                ]
+            )
         else:
-            self.transform = T.Compose([
-                T.Resize(image_size),
-                T.CenterCrop(image_size),
-                T.ToTensor(),
-                T.Normalize((0.485, 0.456, 0.406), (0.229, 0.224, 0.225)),
-                T.ConvertImageDtype(self.data_type)
-            ])
+            self.transform = T.Compose(
+                [
+                    T.Resize(image_size),
+                    T.CenterCrop(image_size),
+                    T.ToTensor(),
+                    T.Normalize((0.485, 0.456, 0.406), (0.229, 0.224, 0.225)),
+                    T.ConvertImageDtype(self.data_type),
+                ]
+            )
 
     def __call__(self, input):
         output = self.transform(input)
         return output
 
 
-class InpaintingTransform():
+class InpaintingTransform:
     def __init__(self, image_size, train=True):
-
         args = get_args()
         self.mask_factor = args.mask_factor
         self.mask_type = args.mask_type
         self.image_size = image_size
         self.patch_size = args.patch_dim
-        self.mask_size = int(self.mask_factor*(image_size[0]/self.patch_size)*(image_size[1]/self.patch_size))
+        self.mask_size = int(
+            self.mask_factor * (image_size[0] / self.patch_size) * (image_size[1] / self.patch_size)
+        )
         self.train = train
         assert args.fp16 or args.bf16
         self.data_type = torch.half if args.fp16 else torch.bfloat16
-     
+
         if self.train:
-            self.transform = T.Compose([
-                T.RandomResizedCrop(self.image_size),
-                T.RandomHorizontalFlip(),
-                T.ColorJitter(0.4, 0.4, 0.4, 0.1),
-                ImageNetPolicy(),
-                T.ToTensor(),
-                T.ConvertImageDtype(self.data_type)
-            ])
+            self.transform = T.Compose(
+                [
+                    T.RandomResizedCrop(self.image_size),
+                    T.RandomHorizontalFlip(),
+                    T.ColorJitter(0.4, 0.4, 0.4, 0.1),
+                    ImageNetPolicy(),
+                    T.ToTensor(),
+                    T.ConvertImageDtype(self.data_type),
+                ]
+            )
         else:
-            self.transform = T.Compose([
-                T.Resize(self.image_size, interpolation=2),
-                T.CenterCrop(self.image_size),
-                T.ToTensor(),
-                T.ConvertImageDtype(self.data_type)
-            ])
+            self.transform = T.Compose(
+                [
+                    T.Resize(self.image_size, interpolation=2),
+                    T.CenterCrop(self.image_size),
+                    T.ToTensor(),
+                    T.ConvertImageDtype(self.data_type),
+                ]
+            )
 
     def gen_mask(self, image_size, mask_size, mask_type, patch_size):
         # output: mask as a list with indices for missing patches
@@ -126,23 +132,22 @@ class InpaintingTransform():
                 y = torch.clamp(y + action_list[r][1], min=0, max=img_size_patch - 1)
                 x_offset = x * patch_size
                 y_offset = y * patch_size
-                mask[x_offset:x_offset+patch_size, y_offset:y_offset+patch_size] = 1
+                mask[x_offset : x_offset + patch_size, y_offset : y_offset + patch_size] = 1
         else:
             assert mask_type == 'row'
             count = 0
             for x in reversed(range(img_size_patch)):
                 for y in reversed(range(img_size_patch)):
-                    if (count < mask_size):
+                    if count < mask_size:
                         count += 1
                         x_offset = x * patch_size
                         y_offset = y * patch_size
-                        mask[x_offset:x_offset+patch_size, y_offset:y_offset+patch_size] = 1
+                        mask[x_offset : x_offset + patch_size, y_offset : y_offset + patch_size] = 1
         return mask
 
     def __call__(self, input):
         trans_input = self.transform(input)
-        mask = self.gen_mask(self.image_size, self.mask_size, 
-			     self.mask_type, self.patch_size)
+        mask = self.gen_mask(self.image_size, self.mask_size, self.mask_type, self.patch_size)
         mask = mask.unsqueeze(dim=0)
         return trans_input, mask
 
@@ -152,58 +157,65 @@ class DinoTransform(object):
         args = get_args()
         self.data_type = torch.half if args.fp16 else torch.bfloat16
 
-        flip_and_color_jitter = T.Compose([
-            T.RandomHorizontalFlip(p=0.5),
-            T.RandomApply(
-                [T.ColorJitter(brightness=0.4, contrast=0.4,
-			       saturation=0.2, hue=0.1)],
-                p=0.8
-            ),
-            T.RandomGrayscale(p=0.2),
-        ])
+        flip_and_color_jitter = T.Compose(
+            [
+                T.RandomHorizontalFlip(p=0.5),
+                T.RandomApply(
+                    [T.ColorJitter(brightness=0.4, contrast=0.4, saturation=0.2, hue=0.1)], p=0.8
+                ),
+                T.RandomGrayscale(p=0.2),
+            ]
+        )
 
         if args.fp16 or args.bf16:
-            normalize = T.Compose([
-                T.ToTensor(),
-                T.Normalize((0.485, 0.456, 0.406), (0.229, 0.224, 0.225)),
-                T.ConvertImageDtype(self.data_type)
-            ])
+            normalize = T.Compose(
+                [
+                    T.ToTensor(),
+                    T.Normalize((0.485, 0.456, 0.406), (0.229, 0.224, 0.225)),
+                    T.ConvertImageDtype(self.data_type),
+                ]
+            )
         else:
-            normalize = T.Compose([
-                T.ToTensor(),
-                T.Normalize((0.485, 0.456, 0.406), (0.229, 0.224, 0.225)),
-            ])
+            normalize = T.Compose(
+                [T.ToTensor(), T.Normalize((0.485, 0.456, 0.406), (0.229, 0.224, 0.225))]
+            )
 
         # first global crop
         scale_const = 0.4
-        self.global_transform1 = T.Compose([
-            T.RandomResizedCrop(image_size,
-                                scale=(scale_const, 1),
-                                interpolation=Image.BICUBIC),
-            flip_and_color_jitter,
-            GaussianBlur(1.0),
-            normalize
-        ])
+        self.global_transform1 = T.Compose(
+            [
+                T.RandomResizedCrop(
+                    image_size, scale=(scale_const, 1), interpolation=Image.BICUBIC
+                ),
+                flip_and_color_jitter,
+                GaussianBlur(1.0),
+                normalize,
+            ]
+        )
         # second global crop
-        self.global_transform2 = T.Compose([
-            T.RandomResizedCrop(image_size,
-                                scale=(scale_const, 1),
-                                interpolation=Image.BICUBIC),
-            flip_and_color_jitter,
-            GaussianBlur(0.1),
-            Solarization(0.2),
-            normalize
-        ])
+        self.global_transform2 = T.Compose(
+            [
+                T.RandomResizedCrop(
+                    image_size, scale=(scale_const, 1), interpolation=Image.BICUBIC
+                ),
+                flip_and_color_jitter,
+                GaussianBlur(0.1),
+                Solarization(0.2),
+                normalize,
+            ]
+        )
         # transformation for the local small crops
         self.local_crops_number = args.dino_local_crops_number
-        self.local_transform = T.Compose([
-            T.RandomResizedCrop(args.dino_local_img_size,
-                                scale=(0.05, scale_const),
-                                interpolation=Image.BICUBIC),
-            flip_and_color_jitter,
-            GaussianBlur(p=0.5),
-            normalize
-        ])
+        self.local_transform = T.Compose(
+            [
+                T.RandomResizedCrop(
+                    args.dino_local_img_size, scale=(0.05, scale_const), interpolation=Image.BICUBIC
+                ),
+                flip_and_color_jitter,
+                GaussianBlur(p=0.5),
+                normalize,
+            ]
+        )
 
     def __call__(self, image):
         crops = []
@@ -227,8 +239,9 @@ def build_train_valid_datasets(data_path, image_size=224):
         train_transform = DinoTransform(image_size, train=True)
         val_transform = ClassificationTransform(image_size, train=False)
     else:
-        raise Exception('{} vit pretraining type is not supported.'.format(
-                args.vit_pretraining_type))
+        raise Exception(
+            '{} vit pretraining type is not supported.'.format(args.vit_pretraining_type)
+        )
 
     # training dataset
     train_data_path = data_path[0] if len(data_path) <= 2 else data_path[2]
@@ -236,16 +249,13 @@ def build_train_valid_datasets(data_path, image_size=224):
         root=train_data_path,
         transform=train_transform,
         classes_fraction=args.classes_fraction,
-        data_per_class_fraction=args.data_per_class_fraction
+        data_per_class_fraction=args.data_per_class_fraction,
     )
     train_data = RandomSeedDataset(train_data, args.seed)
 
     # validation dataset
     val_data_path = data_path[1]
-    val_data = ImageFolder(
-        root=val_data_path,
-        transform=val_transform
-    )
+    val_data = ImageFolder(root=val_data_path, transform=val_transform)
     val_data = RandomSeedDataset(val_data, args.seed)
 
     return train_data, val_data

@@ -33,7 +33,6 @@ ft_launcher \
 ```
 """
 
-import argparse
 import json
 import os
 import random
@@ -45,8 +44,7 @@ from typing import Any, Optional
 
 import torch
 
-from . import arguments
-from . import global_vars
+from . import arguments, global_vars
 from .utils import is_rank0, print_rank_0
 
 _GLOBAL_RANK_MONITOR_CLIENT = None

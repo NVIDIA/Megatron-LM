@@ -1,14 +1,11 @@
 # Copyright (c) 2023, NVIDIA CORPORATION. All rights reserved.
 
 import os
-from functools import partial
-from importlib.metadata import version
 from inspect import signature
 from unittest import mock
 
 import pytest
 import torch
-import transformer_engine as te
 
 from megatron.core import parallel_state
 from megatron.core.extensions.transformer_engine_spec_provider import TESpecProvider
@@ -57,7 +54,7 @@ def make_test_packed_seq_params(sequence_length=None, cu_seqlens=None):
 def make_test_packed_seq_params_with_padding(
     sequence_length=None, cu_seqlens=None, cu_seqlens_padded=None
 ):
-    """Create PackedSeqParams with both regular and padded cu_seqlens for testing padded sequences."""
+    """Create PackedSeqParams with both regular and padded cu_seqlens for testing padded sequences."""  # noqa: E501
     if cu_seqlens is None:
         assert sequence_length is not None
         cu_seqlens = [
@@ -107,7 +104,6 @@ linear_qkv_down_proj_options = [backend.linear(), backend.column_parallel_linear
 
 @pytest.mark.parametrize("rope_type", ('yarn', 'rope'))
 class TestParallelMLAAttention:
-
     @pytest.fixture(scope='function', autouse=True)
     def setup_and_teardown(self, rope_type):
         Utils.initialize_model_parallel(1, 1)
@@ -519,7 +515,6 @@ class TestTensorParallelMLAAttention:
     ),
 )
 class TestContextParallelMLAAttention:
-
     @pytest.fixture(scope='function', autouse=True)
     def setup_method(self, rope_type, apply_rope_fusion):
         self.context_parallel_size = 4
@@ -613,7 +608,6 @@ class TestContextParallelMLAAttention:
 
 @pytest.mark.parametrize("rope_type", ('yarn', 'rope'))
 class TestParallelMLAAttentionPrecision:
-
     @pytest.fixture(scope='function', autouse=True)
     def setup_and_teardown(self, rope_type):
         self._environ_backup = os.environ.copy()
@@ -774,7 +768,6 @@ class TestParallelMLAAttentionPrecision:
     ),
 )
 class TestContextParallelMLAAttentionPrecision:
-
     @pytest.fixture(scope='function', autouse=True)
     def setup_and_teardown(self, rope_type, apply_rope_fusion):
         self._environ_backup = os.environ.copy()
@@ -928,7 +921,6 @@ class TestContextParallelMLAAttentionPrecision:
 @pytest.mark.experimental
 @pytest.mark.skipif(not is_torch_min_version("2.5.0"), reason="Requires PyTorch >= 2.5.0")
 class TestParallelMLAAttentionPrecisionWithRopeFusion:
-
     @pytest.fixture(scope='function', autouse=True)
     def setup_and_teardown(self):
         self._environ_backup = os.environ.copy()
@@ -1079,7 +1071,6 @@ class TestParallelMLAAttentionPrecisionWithRopeFusion:
 @pytest.mark.skipif(not is_te_min_version("2.9.0"), reason="QK clipping requires TE >= 2.9.0")
 @pytest.mark.parametrize("rope_type", ('yarn', 'rope'))
 class TestMLAClipQK:
-
     @pytest.fixture(scope='function', autouse=True)
     def setup_and_teardown(self, rope_type):
         Utils.initialize_model_parallel(1, 1)
@@ -1299,7 +1290,7 @@ class TestMLAClipQK:
 
         with pytest.raises(
             ValueError,
-            match="qk_clip is not supported when cache_mla_latents is enabled and absorption is active",
+            match="qk_clip is not supported when cache_mla_latents is enabled and absorption is active",  # noqa: E501
         ):
             attention.clip_qk()
 
@@ -1483,32 +1474,32 @@ def test_parallel_multi_latent_attention_correctness(
         output_hidden_states_baseline = get_tensor_on_this_rank(output_hidden_states_baseline)
         input_grad_baseline = get_tensor_on_this_rank(input_grad_baseline)
 
-        assert torch.all(
-            ~torch.isnan(output_hidden_states_baseline)
-        ), "output_hidden_states_baseline contains nan"
-        assert torch.all(
-            ~torch.isinf(output_hidden_states_baseline)
-        ), "output_hidden_states_baseline contains inf"
-        assert torch.all(
-            ~torch.isnan(bias_hidden_states_baseline)
-        ), "bias_hidden_states_baseline contains nan"
-        assert torch.all(
-            ~torch.isinf(bias_hidden_states_baseline)
-        ), "bias_hidden_states_baseline contains inf"
+        assert torch.all(~torch.isnan(output_hidden_states_baseline)), (
+            "output_hidden_states_baseline contains nan"
+        )
+        assert torch.all(~torch.isinf(output_hidden_states_baseline)), (
+            "output_hidden_states_baseline contains inf"
+        )
+        assert torch.all(~torch.isnan(bias_hidden_states_baseline)), (
+            "bias_hidden_states_baseline contains nan"
+        )
+        assert torch.all(~torch.isinf(bias_hidden_states_baseline)), (
+            "bias_hidden_states_baseline contains inf"
+        )
         assert torch.all(~torch.isnan(input_grad_baseline)), "input_grad_baseline contains nan"
         assert torch.all(~torch.isinf(input_grad_baseline)), "input_grad_baseline contains inf"
-        assert torch.all(
-            ~torch.isnan(output_hidden_states_parallel)
-        ), "output_hidden_states_parallel contains nan"
-        assert torch.all(
-            ~torch.isinf(output_hidden_states_parallel)
-        ), "output_hidden_states_parallel contains inf"
-        assert torch.all(
-            ~torch.isnan(bias_hidden_states_parallel)
-        ), "bias_hidden_states_parallel contains nan"
-        assert torch.all(
-            ~torch.isinf(bias_hidden_states_parallel)
-        ), "bias_hidden_states_parallel contains inf"
+        assert torch.all(~torch.isnan(output_hidden_states_parallel)), (
+            "output_hidden_states_parallel contains nan"
+        )
+        assert torch.all(~torch.isinf(output_hidden_states_parallel)), (
+            "output_hidden_states_parallel contains inf"
+        )
+        assert torch.all(~torch.isnan(bias_hidden_states_parallel)), (
+            "bias_hidden_states_parallel contains nan"
+        )
+        assert torch.all(~torch.isinf(bias_hidden_states_parallel)), (
+            "bias_hidden_states_parallel contains inf"
+        )
         assert torch.all(~torch.isnan(input_grad_parallel)), "input_grad_parallel contains nan"
         assert torch.all(~torch.isinf(input_grad_parallel)), "input_grad_parallel contains inf"
 

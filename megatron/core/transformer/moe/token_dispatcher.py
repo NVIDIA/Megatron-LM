@@ -386,13 +386,13 @@ class MoEAlltoAllTokenDispatcher(MoETokenDispatcher):
         self.num_experts = config.num_moe_experts
         assert self.num_local_experts > 0, "Expected at least one expert"
         self.local_expert_indices = local_expert_indices
-        assert (
-            len(self.local_expert_indices) == self.num_local_experts
-        ), "Invalid local expert indices"
+        assert len(self.local_expert_indices) == self.num_local_experts, (
+            "Invalid local expert indices"
+        )
         for i in range(len(self.local_expert_indices) - 1):
-            assert (
-                self.local_expert_indices[i] == self.local_expert_indices[i + 1] - 1
-            ), "local_expert_indices must be continuous"
+            assert self.local_expert_indices[i] == self.local_expert_indices[i + 1] - 1, (
+                "local_expert_indices must be continuous"
+            )
 
         # [ep_size]. Represents the number of tokens sent by the current rank to other
         # EP ranks.

@@ -167,7 +167,10 @@ def get_language_model_config(config):
     elif config.language_model_type.startswith("hf://"):
         # Loaded from HuggingFace config file.
         import transformers
-        hf_config = transformers.AutoConfig.from_pretrained(config.language_model_type.split("hf://")[1])
+
+        hf_config = transformers.AutoConfig.from_pretrained(
+            config.language_model_type.split("hf://")[1]
+        )
         config.hf_config = hf_config
         config.hidden_size = hf_config.hidden_size
     else:
@@ -221,7 +224,9 @@ def get_vision_model_config(config, apply_query_key_layer_scaling):
         config.layernorm_epsilon = 1e-6
     elif config.vision_model_type == "internvit":
         config.num_layers = 45
-        config.num_attention_heads = ((24 // config.tensor_model_parallel_size) + 1) * config.tensor_model_parallel_size
+        config.num_attention_heads = (
+            (24 // config.tensor_model_parallel_size) + 1
+        ) * config.tensor_model_parallel_size
         config.num_query_groups = config.num_attention_heads
         config.add_bias_linear = True
         config.add_qkv_bias = False
@@ -322,7 +327,10 @@ def get_vision_model_config(config, apply_query_key_layer_scaling):
         config.layernorm_epsilon = 1e-6
     elif config.vision_model_type.startswith("hf://"):
         import transformers
-        hf_config = transformers.AutoConfig.from_pretrained(config.vision_model_type.split("hf://")[1])
+
+        hf_config = transformers.AutoConfig.from_pretrained(
+            config.vision_model_type.split("hf://")[1]
+        )
         config.hf_config = hf_config
         config.hidden_size = hf_config.hidden_size
     else:
@@ -340,7 +348,7 @@ def get_vision_projection_config(config, hidden_size):
     config.gated_linear_unit = False
     config.bias_activation_fusion = False
     config.add_bias_linear = False
-    config.hidden_size = hidden_size  # Used as the vision projection output size, i.e., the input to the language model.
+    config.hidden_size = hidden_size  # Used as the vision projection output size, i.e., the input to the language model.  # noqa: E501
     if config.language_model_type == "llama3_8b":
         config.ffn_hidden_size = 14336
         config.activation_func = torch.nn.functional.gelu
@@ -392,6 +400,7 @@ def get_vision_projection_config(config, hidden_size):
 @dataclass
 class EvaluationConfig:
     """Evaluation related configuration."""
+
     task: str
     dataset: str = ""
 

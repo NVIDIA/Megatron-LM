@@ -45,7 +45,6 @@ class PassAtEvaluationResponse(EvaluationResponse[PassAtEvaluationResult]):
 
 
 class PassAtEvaluationAgent(EvaluationAgent, ABC):
-
     def __init__(self, max_k=32, **kwargs):
         super().__init__(**kwargs)
         self.max_k = max_k
@@ -58,7 +57,6 @@ class PassAtEvaluationAgent(EvaluationAgent, ABC):
     async def evaluation(
         self, prompt: Any, golden: dict | None, request: EvaluationRequest
     ) -> PassAtEvaluationResponse:
-
         evaluations = [self._evaluation(prompt, golden, request) for _ in range(self.max_k)]
         responses = await asyncio.gather(*evaluations)
 
@@ -84,9 +82,9 @@ class PassAtEvaluationAgent(EvaluationAgent, ABC):
         )
         greedy_request = request.model_copy(update={'generation_args': greedy_generation_args})
         greedy_responses = await self._evaluation(prompt, golden, greedy_request)
-        assert (
-            len(greedy_responses.results) == 1
-        ), "Evaluation only requested a single response but got multiple responses"
+        assert len(greedy_responses.results) == 1, (
+            "Evaluation only requested a single response but got multiple responses"
+        )
         greedy_response = greedy_responses.results[0]
         result = PassAtEvaluationResult(
             prompt=greedy_response.prompt,

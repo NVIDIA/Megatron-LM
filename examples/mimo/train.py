@@ -23,9 +23,7 @@ sys.path.append(
 )
 from data.energon_avlm_task_encoder import llava_avlm_dataloader_provider
 from data.energon_vlm_task_encoder import llava_vlm_dataloader_provider
-from data.mock import (
-    train_valid_test_datasets_provider as mock_train_valid_test_datasets_provider,
-)
+from data.mock import train_valid_test_datasets_provider as mock_train_valid_test_datasets_provider
 from model_providers.llava_avlm import model_provider_llava_avlm
 from model_providers.llava_vlm import model_provider_llava_vlm
 from model_providers.mock import model_provider_mock_vlm_single_encoder
@@ -48,13 +46,24 @@ _DATASET_PROVIDERS = {
     "llava_avlm": llava_avlm_dataloader_provider,
 }
 
+
 def add_mimo_args(parser):
     """Add MIMO-specific arguments to the parser."""
     group = parser.add_argument_group('MIMO', 'MIMO specific arguments')
 
     # MIMO-specific parameters
-    group.add_argument('--dataset-provider', type=str, default='mock', help='Dataset provider to choose from [mock, llava_vlm, video_llava_vlm, llava_avlm]')
-    group.add_argument('--model-provider', type=str, default='mock', help='Model provider to choose from [mock, llava_vlm, video_llava_vlm, llava_avlm]')
+    group.add_argument(
+        '--dataset-provider',
+        type=str,
+        default='mock',
+        help='Dataset provider to choose from [mock, llava_vlm, video_llava_vlm, llava_avlm]',
+    )
+    group.add_argument(
+        '--model-provider',
+        type=str,
+        default='mock',
+        help='Model provider to choose from [mock, llava_vlm, video_llava_vlm, llava_avlm]',
+    )
 
     # mock dataloader related args
     # can control mock samples with total seq length and image seq length
@@ -69,14 +78,27 @@ def add_mimo_args(parser):
         '--audio-encoder-model', type=str, default=None, help='Audio encoder model name'
     )
     group.add_argument(
-        '--hf-assign-unused-tokens', type=str, nargs='+', default=None,
-                       help='Assigning unused tokens to special tokens. Example: '
-                       '--hf-assign-unused-tokens "<audio>,32002" "<video>,32003"'
+        '--hf-assign-unused-tokens',
+        type=str,
+        nargs='+',
+        default=None,
+        help='Assigning unused tokens to special tokens. Example: '
+        '--hf-assign-unused-tokens "<audio>,32002" "<video>,32003"',
     )
     # checkpoint related args
-    group.add_argument('--language-model-checkpoint', type=str, default=None, help='Path to language model checkpoint to load')
+    group.add_argument(
+        '--language-model-checkpoint',
+        type=str,
+        default=None,
+        help='Path to language model checkpoint to load',
+    )
     # energon dataloader related args
-    group.add_argument('--packing-buffer-size', type=int, default=None, help='Packing buffer size when using sequence packing')
+    group.add_argument(
+        '--packing-buffer-size',
+        type=int,
+        default=None,
+        help='Packing buffer size when using sequence packing',
+    )
     return parser
 
 
@@ -92,13 +114,14 @@ def get_batch(data_iterator: Iterator[Dict[str, Any]]):
     args = get_args()
 
     # Assert that context parallelism and pipeline parallelism are not supported yet
-    assert (
-        getattr(args, 'context_parallel_size', 1) == 1
-    ), "Context parallelism is not supported yet in MIMO implementation"
+    assert getattr(args, 'context_parallel_size', 1) == 1, (
+        "Context parallelism is not supported yet in MIMO implementation"
+    )
 
-    assert (getattr(args, 'pipeline_model_parallel_size', 1) == 1), \
+    assert getattr(args, 'pipeline_model_parallel_size', 1) == 1, (
         "Pipeline parallelism is not supported yet in MIMO implementation"
-    
+    )
+
     # Broadcast data - only get data on tensor parallel rank 0
     # data iterator is None on other tp ranks
     # TP Rank-0 reads next batch.
@@ -122,7 +145,7 @@ def get_batch(data_iterator: Iterator[Dict[str, Any]]):
         # we need this to avoid race condition when first tp rank hits StopIteration
         return None
 
-    # MiMo forward pass expects 
+    # MiMo forward pass expects
     # input_ids: torch.Tensor,
     # position_ids: Optional[torch.Tensor] = None,
     # attention_mask: Optional[torch.Tensor] = None,
@@ -136,6 +159,7 @@ def get_batch(data_iterator: Iterator[Dict[str, Any]]):
     # check broadcast_nested_data_batch for more details
     batch = broadcast_nested_data_batch(data)
     return batch
+
 
 def loss_func(loss_mask, output_tensor):
     """Simple loss function for MIMO model training.
@@ -192,6 +216,7 @@ def train_valid_test_datasets_provider(*provider_args, **provider_kwargs):
 
     return dataset_provider(*provider_args, **provider_kwargs)
 
+
 def model_provider(
     pre_process: bool = True,
     post_process: bool = True,
@@ -221,28 +246,21 @@ def model_provider(
         ) from e
 
     if runtime_args.model_provider == "llava_vlm":
-        kwargs = {
-            "image_special_token_id": image_special_token_id,
-        }
+        kwargs = {"image_special_token_id": image_special_token_id}
     elif runtime_args.model_provider == "llava_avlm":
         kwargs = {
             "image_special_token_id": image_special_token_id,
             "audio_special_token_id": audio_special_token_id,
         }
     else:
-        raise ValueError(f"Unknown model provider: {runtime_args.model_provider}. Must be one of ['llava_vlm', 'llava_avlm', 'mock]")
+        raise ValueError(
+            f"Unknown model provider: {runtime_args.model_provider}. Must be one of ['llava_vlm', 'llava_avlm', 'mock]"  # noqa: E501
+        )
 
-    return builder_fn(
-        pre_process,
-        post_process,
-        add_encoder,
-        add_decoder,
-        **kwargs,
-    )
+    return builder_fn(pre_process, post_process, add_encoder, add_decoder, **kwargs)
 
 
 if __name__ == "__main__":
-    
     train_valid_test_datasets_provider.is_distributed = True
     pretrain(
         train_valid_test_datasets_provider,

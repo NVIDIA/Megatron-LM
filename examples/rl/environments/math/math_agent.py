@@ -9,24 +9,27 @@ try:
     from math_verify import parse, verify
 except ImportError:
     print(
-        "math_verify is not installed. Install it using `pip install math-verify`. Continuing using exact match verification."
+        "math_verify is not installed. Install it using `pip install math-verify`. Continuing using exact match verification."  # noqa: E501
     )
     MATHVERIFY_AVAILABLE = False
 else:
     print("math_verify is installed. Using math_verify to verify answers.")
     MATHVERIFY_AVAILABLE = True
 
-assert (
-    MATHVERIFY_AVAILABLE
-), "math_verify is not installed but now required. Install it using `pip install math-verify` to continue."
+assert MATHVERIFY_AVAILABLE, (
+    "math_verify is not installed but now required. Install it using `pip install math-verify` to continue."  # noqa: E501
+)
+
 
 class MathAgent(RewardOnlyAgent):
-    def __init__(self,
+    def __init__(
+        self,
         format_reward: float = 0.0,
         answer_format: str = "tagged",
         negative_reward: float = 0.0,
         partial_end_reward: float = 0.0,
-        **kwargs):
+        **kwargs,
+    ):
         """
         Args:
             format_reward (float): Reward given when the answer is in the expected format,
@@ -34,7 +37,8 @@ class MathAgent(RewardOnlyAgent):
             answer_format (str): Which answer format is expected: "tagged" for <answer> tags,
                 or "boxed" for \boxed{} LaTeX formatting.
             negative_reward (float): Reward assigned for a clearly incorrect or unparseable answer.
-            partial_end_reward (float): Reward when the answer is correct but an expected end token is not matched exactly.
+            partial_end_reward (float): Reward when the answer is
+                correct but an expected end token is not matched.
             **kwargs: Additional arguments for the base RewardOnlyAgent.
         """
         super().__init__(**kwargs)
@@ -51,7 +55,7 @@ class MathAgent(RewardOnlyAgent):
 
         Uses the final answer in the response string to compute the score.
         """
-        # Allow <answer> tags or \boxed{} tags (this is a bit of cheating in favor of deepseek distilled models I think)
+        # Allow <answer> tags or \boxed{} tags (this is a bit of cheating in favor of deepseek distilled models I think)  # noqa: E501
         matched_format = None
         end_tokens = ["<|end_of_text|>", "<|endoftext|>", "</s>", "<|eot_id|>"]
 
@@ -62,7 +66,9 @@ class MathAgent(RewardOnlyAgent):
             # Only consider the last occurrence
             last_match = answer_tag_match[-1]
             final_answer = last_match.group(1).strip()
-            after = response[last_match.end():].lstrip()  # strip whitespace between </answer> and token
+            after = response[
+                last_match.end() :
+            ].lstrip()  # strip whitespace between </answer> and token
 
             try:
                 parsed_answer = parse(final_answer)
@@ -73,7 +79,7 @@ class MathAgent(RewardOnlyAgent):
 
             correct_answer = verify(str(golden[golden_key]), parsed_answer)
             if correct_answer:
-                # Accept either <|end_of_text|> or <|endoftext|> as valid terminators, for flexibility.
+                # Accept either <|end_of_text|> or <|endoftext|> as valid terminators, for flexibility.  # noqa: E501
                 for token in end_tokens:
                     if after.startswith(token):
                         return 1.0
@@ -81,7 +87,7 @@ class MathAgent(RewardOnlyAgent):
                 for token in end_tokens:
                     if token in after:
                         return self.partial_end_reward
-                # If a correct answer but missing immediate end, give format reward (not NEGATIVE_REWARD).
+                # If a correct answer but missing immediate end, give format reward (not NEGATIVE_REWARD).  # noqa: E501
                 return self.format_reward
             else:
                 # Incorrect answer, regardless of format/end-of-text
@@ -93,7 +99,7 @@ class MathAgent(RewardOnlyAgent):
             if boxed_match:
                 last_match = boxed_match[-1]
                 final_answer = last_match.group(1).strip()
-                after = response[last_match.end():].lstrip()
+                after = response[last_match.end() :].lstrip()
                 try:
                     parsed_answer = parse(final_answer)
                 except ValueError as e:
@@ -118,11 +124,11 @@ class MathAgent(RewardOnlyAgent):
                 return self.negative_reward
 
     def make_prefix(self, problem_key: str = "problem", **kwargs) -> str:
-        """Take a string math problem and return the prompt. Supports requesting tagged or boxed answers. Supports chat mode prompts."""
+        """Take a string math problem and return the prompt. Supports requesting tagged or boxed answers. Supports chat mode prompts."""  # noqa: E501
         if self.answer_format == "boxed":
-            answer_format = "Please reason step by step and provide your answer between \\boxed{} tags, for example \\boxed{20\\sqrt{3}}."
+            answer_format = "Please reason step by step and provide your answer between \\boxed{} tags, for example \\boxed{20\\sqrt{3}}."  # noqa: E501
         elif self.answer_format == "tagged":
-            answer_format = "Please reason step by step and provide your answer between <answer> </answer> tags, for example <answer> 20\\sqrt{3} </answer>. Do not include an = sign."
+            answer_format = "Please reason step by step and provide your answer between <answer> </answer> tags, for example <answer> 20\\sqrt{3} </answer>. Do not include an = sign."  # noqa: E501
         else:
             raise ValueError(f"Invalid answer format: {self.answer_format}")
 

@@ -16,7 +16,7 @@ from megatron.core.transformer.spec_utils import ModuleSpec
 from megatron.core.transformer.transformer_layer import TransformerLayer, TransformerLayerSubmodules
 
 try:
-    import apex  # pylint: disable=unused-import
+    import apex  # noqa: F401
 
     from megatron.core.fusions.fused_layer_norm import FusedLayerNorm
 

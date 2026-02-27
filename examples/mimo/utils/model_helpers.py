@@ -4,6 +4,7 @@ Utility helpers for mimo models.
 """
 
 import torch
+
 from megatron.core import dist_checkpointing
 
 
@@ -21,10 +22,7 @@ def load_submodule_ckpt(module: torch.nn.Module, ckpt_dir: str):
     # 2) Wrap it under a root key just as in user snippet; this becomes the state
     #    dict returned by `load` so we can easily strip the prefix afterwards.
     wrapper_sd = dict(state_dict=sharded_sd_with_prefix)
-    loaded = dist_checkpointing.load(
-        sharded_state_dict=wrapper_sd,
-        checkpoint_dir=ckpt_dir,
-    )
+    loaded = dist_checkpointing.load(sharded_state_dict=wrapper_sd, checkpoint_dir=ckpt_dir)
     # 3) Remove the prefix and push into the module.
     cleaned = {k.removeprefix("module."): v for k, v in loaded["state_dict"].items()}
 

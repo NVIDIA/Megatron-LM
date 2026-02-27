@@ -134,7 +134,9 @@ def load(
     strict = parse_strict_flag(strict)
     if StrictHandling.requires_explicit_ckpt_mismatch_check(strict):
         ckpt_sharded_metadata = load_sharded_metadata(
-            checkpoint_dir, sharded_strategy, common_strategy  # type: ignore[arg-type]
+            checkpoint_dir,
+            sharded_strategy,
+            common_strategy,  # type: ignore[arg-type]
         )
     if validate_access_integrity or StrictHandling.requires_global_app_metadata(strict):
         local_metadata, global_metadata = determine_global_metadata(sharded_state_dict)

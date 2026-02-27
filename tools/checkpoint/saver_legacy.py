@@ -2,9 +2,9 @@
 
 import os
 import sys
-import torch
-
 from functools import partial
+
+import torch
 
 from tools.checkpoint.utils import _ConverterFakeProcessGroup
 
@@ -12,38 +12,50 @@ from tools.checkpoint.utils import _ConverterFakeProcessGroup
 def add_arguments(parser):
     group = parser.add_argument_group(title='Megatron saver')
 
-    group.add_argument('--megatron-path', type=str, default=None,
-                       help='Base directory of Megatron repository')
+    group.add_argument(
+        '--megatron-path', type=str, default=None, help='Base directory of Megatron repository'
+    )
 
-    group.add_argument('--target-tensor-parallel-size', type=int,
-                       help='Target tensor model parallel size, defaults to the tensor parallel size '
-                            'in the input checkpoint if provided by the loader, otherwise to 1')
-    group.add_argument('--target-pipeline-parallel-size', type=int,
-                       help='Target tensor model parallel size, default to the pipeline parall size '
-                       'in the input checkpoint if provided by the loader, otherwise to 1')
-    group.add_argument('--saver-transformer-impl', default='local',
-                       choices=['local', 'transformer_engine'],
-                       help='Which Transformer implementation to use.')
+    group.add_argument(
+        '--target-tensor-parallel-size',
+        type=int,
+        help='Target tensor model parallel size, defaults to the tensor parallel size '
+        'in the input checkpoint if provided by the loader, otherwise to 1',
+    )
+    group.add_argument(
+        '--target-pipeline-parallel-size',
+        type=int,
+        help='Target tensor model parallel size, default to the pipeline parall size '
+        'in the input checkpoint if provided by the loader, otherwise to 1',
+    )
+    group.add_argument(
+        '--saver-transformer-impl',
+        default='local',
+        choices=['local', 'transformer_engine'],
+        help='Which Transformer implementation to use.',
+    )
+
 
 def save_checkpoint(queue, args):
     # Search in directory above this
-    sys.path.append(os.path.abspath(
-        os.path.join(os.path.dirname(__file__),
-                     os.path.pardir,
-                     os.path.pardir)))
+    sys.path.append(
+        os.path.abspath(os.path.join(os.path.dirname(__file__), os.path.pardir, os.path.pardir))
+    )
     if args.megatron_path is not None:
         sys.path.insert(0, args.megatron_path)
 
     try:
-        from megatron.training.arguments import (parse_args, validate_args)
-        from megatron.training.checkpointing import save_checkpoint
-        from megatron.training.global_vars import set_global_variables, get_args
+        from megatron.core import mpu
         from megatron.core.enums import ModelType
         from megatron.core.tokenizers.utils.build_tokenizer import vocab_size_with_padding
         from megatron.legacy import fused_kernels
-        from megatron.core import mpu
+        from megatron.training.arguments import parse_args, validate_args
+        from megatron.training.checkpointing import save_checkpoint
+        from megatron.training.global_vars import get_args, set_global_variables
     except ModuleNotFoundError:
-        print("Unable to import Megatron, please specify the path to Megatron using --megatron-path. Exiting.")
+        print(
+            "Unable to import Megatron, please specify the path to Megatron using --megatron-path. Exiting."  # noqa: E501
+        )
         exit(1)
 
     def queue_get(name=None):
@@ -77,8 +89,9 @@ def save_checkpoint(queue, args):
             args.target_tensor_parallel_size = md.previous_tensor_parallel_size
         else:
             print(
-                "loader did not provide a tensor parallel size and --target-tensor-parallel-size not provided on command line. "
-                "Default to 1.")
+                "loader did not provide a tensor parallel size and --target-tensor-parallel-size not provided on command line. "  # noqa: E501
+                "Default to 1."
+            )
             args.target_tensor_parallel_size = 1
 
     if args.target_pipeline_parallel_size is None:
@@ -86,42 +99,62 @@ def save_checkpoint(queue, args):
             args.target_pipeline_parallel_size = md.previous_pipeline_parallel_size
         else:
             print(
-                "loader did not provide a pipeline parallel size and --target-pipeline-parallel-size not provided on command line. "
-                "Default to 1.")
+                "loader did not provide a pipeline parallel size and --target-pipeline-parallel-size not provided on command line. "  # noqa: E501
+                "Default to 1."
+            )
             args.target_pipeline_parallel_size = 1
 
     # Arguments do sanity checks on the world size, but we don't care,
     # so trick it into thinking we are plenty of processes
-    if args.target_tensor_parallel_size is not None and args.target_pipeline_parallel_size is not None:
-        os.environ["WORLD_SIZE"] = f'{args.target_tensor_parallel_size * args.target_pipeline_parallel_size}'
+    if (
+        args.target_tensor_parallel_size is not None
+        and args.target_pipeline_parallel_size is not None
+    ):
+        os.environ["WORLD_SIZE"] = (
+            f'{args.target_tensor_parallel_size * args.target_pipeline_parallel_size}'
+        )
 
     # We want all arguments to come from us
-    sys.argv = ['script.py',
-                '--num-layers', str(md.num_layers),
-                '--hidden-size', str(md.hidden_size),
-                '--seq-length', str(md.seq_length),
-                '--num-attention-heads', str(md.num_attention_heads),
-                '--max-position-embeddings', str(md.max_position_embeddings),
-                '--position-embedding-type', str(md.position_embedding_type),
-                '--tokenizer-type', str(md.tokenizer_type),
-                '--tensor-model-parallel-size', str(args.target_tensor_parallel_size),
-                '--pipeline-model-parallel-size', str(args.target_pipeline_parallel_size),
-                '--no-masked-softmax-fusion',
-                '--no-bias-gelu-fusion',
-                '--no-bias-dropout-fusion',
-                '--no-async-tensor-model-parallel-allreduce',
-                '--use-cpu-initialization',
-                '--micro-batch-size', '1',
-                '--no-load-optim',
-                '--no-load-rng',
-                '--no-save-optim',
-                '--no-save-rng',
-                '--no-initialization',
-                '--save-interval', '1',
-                '--save', args.save_dir,
-                '--ckpt-format', 'torch', # only 'torch' supported for conversion
-                '--no-one-logger',
-                ]
+    sys.argv = [
+        'script.py',
+        '--num-layers',
+        str(md.num_layers),
+        '--hidden-size',
+        str(md.hidden_size),
+        '--seq-length',
+        str(md.seq_length),
+        '--num-attention-heads',
+        str(md.num_attention_heads),
+        '--max-position-embeddings',
+        str(md.max_position_embeddings),
+        '--position-embedding-type',
+        str(md.position_embedding_type),
+        '--tokenizer-type',
+        str(md.tokenizer_type),
+        '--tensor-model-parallel-size',
+        str(args.target_tensor_parallel_size),
+        '--pipeline-model-parallel-size',
+        str(args.target_pipeline_parallel_size),
+        '--no-masked-softmax-fusion',
+        '--no-bias-gelu-fusion',
+        '--no-bias-dropout-fusion',
+        '--no-async-tensor-model-parallel-allreduce',
+        '--use-cpu-initialization',
+        '--micro-batch-size',
+        '1',
+        '--no-load-optim',
+        '--no-load-rng',
+        '--no-save-optim',
+        '--no-save-rng',
+        '--no-initialization',
+        '--save-interval',
+        '1',
+        '--save',
+        args.save_dir,
+        '--ckpt-format',
+        'torch',  # only 'torch' supported for conversion
+        '--no-one-logger',
+    ]
 
     if md.make_vocab_size_divisible_by is not None:
         sys.argv.extend(['--make-vocab-size-divisible-by', str(md.make_vocab_size_divisible_by)])
@@ -141,22 +174,45 @@ def save_checkpoint(queue, args):
     margs = parse_args()
 
     if hasattr(md, 'checkpoint_args'):
-        # These are arguments that we are either changing, or cause problems for validation if they are set
+        # These are arguments that we are either changing, or cause problems for validation if they are set  # noqa: E501
         # Note that some of these deal with T5 so will need to be changed if we support T5.
-        args_to_keep = ['tensor_model_parallel_size', 'pipeline_model_parallel_size', 'world_size', 'params_dtype',
-                        'num_layers_per_virtual_pipeline_stage', 'virtual_pipeline_model_parallel_size',
-                        'masked_softmax_fusion', 'bias_gelu_fusion', 'bias_dropout_fusion',
-                        'sequence_parallel', 'async_tensor_model_parallel_allreduce',
-                        'no_load_optim', 'no_load_rng', 'no_save_optim', 'no_save_rng',
-                        'vocab_file', 'tokenizer_model',
-                        'save_interval', 'save',
-                        'perform_initialization', 'use_cpu_initialization',
-                        'recompute_granularity', 'recompute_num_layers', 'recompute_method',
-                        'encoder_num_layers', 'encoder_seq_length',
-                        'distribute_saved_activations',
-                        'train_iters', 'lr_decay_iters', 'lr_warmup_iters', 'lr_warmup_fraction',
-                        'start_weight_decay', 'end_weight_decay', 'bf16', 'fp16',
-                        'ckpt_format',
+        args_to_keep = [
+            'tensor_model_parallel_size',
+            'pipeline_model_parallel_size',
+            'world_size',
+            'params_dtype',
+            'num_layers_per_virtual_pipeline_stage',
+            'virtual_pipeline_model_parallel_size',
+            'masked_softmax_fusion',
+            'bias_gelu_fusion',
+            'bias_dropout_fusion',
+            'sequence_parallel',
+            'async_tensor_model_parallel_allreduce',
+            'no_load_optim',
+            'no_load_rng',
+            'no_save_optim',
+            'no_save_rng',
+            'vocab_file',
+            'tokenizer_model',
+            'save_interval',
+            'save',
+            'perform_initialization',
+            'use_cpu_initialization',
+            'recompute_granularity',
+            'recompute_num_layers',
+            'recompute_method',
+            'encoder_num_layers',
+            'encoder_seq_length',
+            'distribute_saved_activations',
+            'train_iters',
+            'lr_decay_iters',
+            'lr_warmup_iters',
+            'lr_warmup_fraction',
+            'start_weight_decay',
+            'end_weight_decay',
+            'bf16',
+            'fp16',
+            'ckpt_format',
         ]
 
         for arg, value in vars(md.checkpoint_args).items():
@@ -166,7 +222,9 @@ def save_checkpoint(queue, args):
                 print(f"Checkpoint had argument {arg} but new arguments does not have this.")
                 continue
             if getattr(margs, arg) != value:
-                print(f"Overwriting default {arg} value {getattr(margs, arg)} with value from checkpoint {value}.")
+                print(
+                    f"Overwriting default {arg} value {getattr(margs, arg)} with value from checkpoint {value}."  # noqa: E501
+                )
                 setattr(margs, arg, value)
 
     margs.inference_batch_times_seqlen_threshold = -1
@@ -188,19 +246,23 @@ def save_checkpoint(queue, args):
     if hasattr(md, 'consumed_train_samples'):
         margs.consumed_train_samples = md.consumed_train_samples
         margs.consumed_valid_samples = md.consumed_valid_samples
-        print(f"Setting consumed_train_samples to {margs.consumed_train_samples}"
-              f" and consumed_valid_samples to {margs.consumed_valid_samples}")
+        print(
+            f"Setting consumed_train_samples to {margs.consumed_train_samples}"
+            f" and consumed_valid_samples to {margs.consumed_valid_samples}"
+        )
     else:
         print("consumed_train_samples not provided.")
 
     # Determine how to make our models
     if md.model_type == 'GPT':
-        from model_provider import model_provider as common_model_provider
         from gpt_builders import gpt_builder
+        from model_provider import model_provider as common_model_provider
+
         model_provider = partial(common_model_provider, gpt_builder)
         margs.model_type = ModelType.encoder_or_decoder
     elif md.model_type == 'BERT':
         from pretrain_bert import model_provider
+
         margs.model_type = ModelType.encoder_or_decoder
     else:
         raise Exception(f'unrecognized model type: {args.model_type}')
@@ -215,7 +277,7 @@ def save_checkpoint(queue, args):
     mpu.set_tensor_model_parallel_rank(0)
     mpu.set_pipeline_model_parallel_rank(0)
     fused_kernels.load(margs)
-    
+
     # For backward compatibility during local parallel states refactoring
     fake_tp_group = _ConverterFakeProcessGroup(size=args.target_tensor_parallel_size)
     mpu._TENSOR_MODEL_PARALLEL_GROUP = fake_tp_group
@@ -238,22 +300,24 @@ def save_checkpoint(queue, args):
 
         # Cut out extra padding we don't need
         if orig_vocab_size > margs.padded_vocab_size:
-            full_word_embed = orig_word_embed[0:margs.padded_vocab_size, :]
+            full_word_embed = orig_word_embed[0 : margs.padded_vocab_size, :]
 
         # Expanding embedding to larger size by replicating final entry
         elif orig_vocab_size < margs.padded_vocab_size:
             padding_size = margs.padded_vocab_size - orig_vocab_size
 
-            full_word_embed = torch.cat((
-                orig_word_embed,
-                orig_word_embed[-1].unsqueeze(0).expand(padding_size, -1)))
+            full_word_embed = torch.cat(
+                (orig_word_embed, orig_word_embed[-1].unsqueeze(0).expand(padding_size, -1))
+            )
 
         # Same size!
         else:
             full_word_embed = orig_word_embed
     else:
-        print("Original vocab size not specified, leaving embedding table as-is. "
-              "If you've changed the tensor parallel size this could cause problems.")
+        print(
+            "Original vocab size not specified, leaving embedding table as-is. "
+            "If you've changed the tensor parallel size this could cause problems."
+        )
         margs.padded_vocab_size = orig_word_embed.shape[0]
         full_word_embed = orig_word_embed
 
@@ -279,7 +343,9 @@ def save_checkpoint(queue, args):
         if pp_rank > 0:
             mpu.set_pipeline_model_parallel_rank(pp_rank)
             post_process = pp_rank == args.target_pipeline_parallel_size - 1
-            models = get_models(args.target_tensor_parallel_size, md.params_dtype, False, post_process)
+            models = get_models(
+                args.target_tensor_parallel_size, md.params_dtype, False, post_process
+            )
 
         for layer in range(len(models[0].language_model.encoder.layers)):
             msg = queue_get(f"transformer layer {total_layer_num}")
@@ -297,26 +363,46 @@ def save_checkpoint(queue, args):
 
             # Split up the parallel tensors
             qkv_weight = torch.chunk(msg.pop("qkv weight"), args.target_tensor_parallel_size, dim=0)
-            dense_weight = torch.chunk(msg.pop("dense weight"), args.target_tensor_parallel_size, dim=1)
-            mlp_l1_weight = torch.chunk(msg.pop("mlp l1 weight"), args.target_tensor_parallel_size, dim=1)
+            dense_weight = torch.chunk(
+                msg.pop("dense weight"), args.target_tensor_parallel_size, dim=1
+            )
+            mlp_l1_weight = torch.chunk(
+                msg.pop("mlp l1 weight"), args.target_tensor_parallel_size, dim=1
+            )
 
             # Special handling for swiglu
             if md.swiglu:
-                mlp_l0_weight_W = torch.chunk(msg.pop("mlp l0 weight W"), args.target_tensor_parallel_size, dim=0)
-                mlp_l0_weight_V = torch.chunk(msg.pop("mlp l0 weight V"), args.target_tensor_parallel_size, dim=0)
-                mlp_l0_weight = [torch.cat(weights, dim=0) for weights in zip(mlp_l0_weight_W, mlp_l0_weight_V)]
+                mlp_l0_weight_W = torch.chunk(
+                    msg.pop("mlp l0 weight W"), args.target_tensor_parallel_size, dim=0
+                )
+                mlp_l0_weight_V = torch.chunk(
+                    msg.pop("mlp l0 weight V"), args.target_tensor_parallel_size, dim=0
+                )
+                mlp_l0_weight = [
+                    torch.cat(weights, dim=0) for weights in zip(mlp_l0_weight_W, mlp_l0_weight_V)
+                ]
             else:
-                mlp_l0_weight = torch.chunk(msg.pop("mlp l0 weight"), args.target_tensor_parallel_size, dim=0)
+                mlp_l0_weight = torch.chunk(
+                    msg.pop("mlp l0 weight"), args.target_tensor_parallel_size, dim=0
+                )
 
             if md.qkv_bias:
                 qkv_bias = torch.chunk(msg.pop("qkv bias"), args.target_tensor_parallel_size, dim=0)
             if md.linear_bias:
                 if md.swiglu:
-                    mlp_l0_bias_W = torch.chunk(msg.pop("mlp l0 bias W"), args.target_tensor_parallel_size, dim=0)
-                    mlp_l0_bias_V = torch.chunk(msg.pop("mlp l0 bias V"), args.target_tensor_parallel_size, dim=0)
-                    mlp_l0_bias = [torch.cat(bias, dim=0) for bias in zip(mlp_l0_bias_W, mlp_l0_bias_V)]
+                    mlp_l0_bias_W = torch.chunk(
+                        msg.pop("mlp l0 bias W"), args.target_tensor_parallel_size, dim=0
+                    )
+                    mlp_l0_bias_V = torch.chunk(
+                        msg.pop("mlp l0 bias V"), args.target_tensor_parallel_size, dim=0
+                    )
+                    mlp_l0_bias = [
+                        torch.cat(bias, dim=0) for bias in zip(mlp_l0_bias_W, mlp_l0_bias_V)
+                    ]
                 else:
-                    mlp_l0_bias = torch.chunk(msg.pop("mlp l0 bias"), args.target_tensor_parallel_size, dim=0)
+                    mlp_l0_bias = torch.chunk(
+                        msg.pop("mlp l0 bias"), args.target_tensor_parallel_size, dim=0
+                    )
 
             # Save them to the model
             for tp_rank in range(args.target_tensor_parallel_size):
@@ -347,9 +433,13 @@ def save_checkpoint(queue, args):
             if md.norm_has_bias:
                 final_norm_bias = msg.pop("bias")
             for tp_rank in range(args.target_tensor_parallel_size):
-                models[tp_rank].language_model.encoder.final_norm.weight.data.copy_(final_norm_weight)
+                models[tp_rank].language_model.encoder.final_norm.weight.data.copy_(
+                    final_norm_weight
+                )
                 if md.norm_has_bias:
-                    models[tp_rank].language_model.encoder.final_norm.bias.data.copy_(final_norm_bias)
+                    models[tp_rank].language_model.encoder.final_norm.bias.data.copy_(
+                        final_norm_bias
+                    )
                 if pp_rank != 0 and not md.output_layer:
                     # Copy word embeddings to final pipeline rank
                     models[tp_rank].word_embeddings.weight.data.copy_(out_word_embed[tp_rank])
@@ -363,9 +453,13 @@ def save_checkpoint(queue, args):
                 if not hasattr(models[0].language_model, 'output_layer'):
                     print("ERROR: got an output layer, but model does not have one")
                     exit(1)
-                output_layer_weight = torch.chunk(msg.pop("weight"), args.target_tensor_parallel_size, dim=0)
+                output_layer_weight = torch.chunk(
+                    msg.pop("weight"), args.target_tensor_parallel_size, dim=0
+                )
                 for tp_rank in range(args.target_tensor_parallel_size):
-                    models[tp_rank].language_model.output_layer.weight.data.copy_(output_layer_weight[tp_rank])
+                    models[tp_rank].language_model.output_layer.weight.data.copy_(
+                        output_layer_weight[tp_rank]
+                    )
                 del output_layer_weight
                 check_message(msg)
 
@@ -424,6 +518,7 @@ def save_checkpoint(queue, args):
             fake_tp_group = mpu.get_tensor_model_parallel_group()
             fake_tp_group.set_rank(tp_rank)
             mpu.set_tensor_model_parallel_rank(tp_rank)
-            save_checkpoint(md.iteration, [models[tp_rank]], None, None,
-                            num_floating_point_operations_so_far=0)
+            save_checkpoint(
+                md.iteration, [models[tp_rank]], None, None, num_floating_point_operations_so_far=0
+            )
     print("Done!")

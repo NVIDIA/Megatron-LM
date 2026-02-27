@@ -1,6 +1,7 @@
 # Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
-""" Strategies using PyTorch distributed.checkpoint as an underlying format. """
+"""Strategies using PyTorch distributed.checkpoint as an underlying format."""
+
 import io
 import os
 import pickle
@@ -16,9 +17,8 @@ import torch
 from packaging.version import Version as PkgVersion
 from torch.distributed import checkpoint
 from torch.distributed._shard.metadata import ShardMetadata
-from torch.distributed._shard.sharded_tensor import Shard
+from torch.distributed._shard.sharded_tensor import Shard, ShardedTensorMetadata, TensorProperties
 from torch.distributed._shard.sharded_tensor import ShardedTensor as TorchShardedTensor
-from torch.distributed._shard.sharded_tensor import ShardedTensorMetadata, TensorProperties
 from torch.distributed.checkpoint import (
     BytesStorageMetadata,
     DefaultLoadPlanner,
@@ -215,11 +215,10 @@ def sharded_tensor_to_torch_sharded_tensor(
                 size = sh_ten.data.shape
                 shard_metadata.append(ShardMetadata(offset, size, placement))
         else:
-            # pylint: disable=line-too-long
-            # for shards from other ranks we provide simplistic data - this information will be discarded
+            # for shards from other ranks we provide simplistic data - this information will be discarded  # noqa: E501
             # during TorchShardedTensor._init_from_local_shards_and_global_metadata call.
-            # Due to a bug in PyT 24.05 container we must specify some concrete rank within a world size.
-            # The exact rank doesn't matter as long as it's different than my rank - hence (rank + 1) % WS.
+            # Due to a bug in PyT 24.05 container we must specify some concrete rank within a world size.  # noqa: E501
+            # The exact rank doesn't matter as long as it's different than my rank - hence (rank + 1) % WS.  # noqa: E501
             placement = f"rank:{(rank + 1) % world_size}/cuda"
             size = offsets_shape
             shard_metadata.append(ShardMetadata(offset, size, placement))
@@ -336,7 +335,7 @@ def mcore_to_pyt_state_dict(
 
 
 def _unwrap_pyt_sharded_tensor(
-    sh_ten: Union[TorchShardedTensor, CheckpointableShardedTensor, LocalShardsContainer, Any]
+    sh_ten: Union[TorchShardedTensor, CheckpointableShardedTensor, LocalShardsContainer, Any],
 ) -> Union[List[torch.Tensor], Any]:
     """Unwrap tensor from PyT ShardedTensor instance.
 
@@ -432,12 +431,12 @@ class MCoreSavePlanner(DefaultSavePlanner):
         super().__init__(*args, **kwargs)
         self.can_run_decentralized_global_plan = can_run_decentralized_global_plan
         if can_run_decentralized_global_plan:
-            assert (
-                not dedup_replicated_tensors
-            ), 'Cannot run decentralized plan with dedup_replicated_tensors=True'
-            assert (
-                not self.flatten_state_dict
-            ), 'Cannot run decentralized plan with flatten_state_dict=True'
+            assert not dedup_replicated_tensors, (
+                'Cannot run decentralized plan with dedup_replicated_tensors=True'
+            )
+            assert not self.flatten_state_dict, (
+                'Cannot run decentralized plan with flatten_state_dict=True'
+            )
 
     def create_local_plan(self) -> SavePlan:
         """Adds IOBytes write request on non-coordinator ranks."""
@@ -470,9 +469,9 @@ class MCoreSavePlanner(DefaultSavePlanner):
             SavePlan - locally transformed plan equivalent to the plan that would be
                 created by the coordinator
         """
-        assert (
-            not self.flatten_state_dict
-        ), 'Cannot run decentralized plan with flatten_state_dict=True'
+        assert not self.flatten_state_dict, (
+            'Cannot run decentralized plan with flatten_state_dict=True'
+        )
         assert not local_plan.planner_data, 'Planner data should be empty with decentralized plan'
         return local_plan
 
@@ -577,9 +576,9 @@ class MCoreLoadPlanner(DefaultLoadPlanner):
         """Restores the original FP8 tensor saved in `resolve_tensor`."""
         if self._intermediate_read_item_and_target is not None:
             interm_read_item, target_tensor = self._intermediate_read_item_and_target
-            assert (
-                interm_read_item is read_item
-            ), '`commit_tensor` method should be called right after `resolve_tensor`'
+            assert interm_read_item is read_item, (
+                '`commit_tensor` method should be called right after `resolve_tensor`'
+            )
             target_tensor.copy_(tensor)
             tensor = target_tensor
             self._intermediate_read_item_and_target = None
@@ -815,7 +814,9 @@ class TorchDistLoadShardedStrategy(LoadShardedStrategy):
         # Unwrap ShardedTensors and return to original state dict
         mcore_state_dict = {k: _unwrap_pyt_sharded_tensor(v) for k, v in pyt_state_dict.items()}
         mcore_state_dict = _replace_sharded_keys_with_state_dict_keys(
-            mcore_state_dict, flat_mapping, rename_mapping  # type: ignore[arg-type]
+            mcore_state_dict,
+            flat_mapping,
+            rename_mapping,  # type: ignore[arg-type]
         )
         _restore_dict_types(mcore_state_dict, orig_sharded_state_dict)
         return mcore_state_dict
@@ -864,9 +865,9 @@ class TorchDistLoadShardedStrategy(LoadShardedStrategy):
         5. removes the relevant files
         """
 
-        assert is_torch_min_version(
-            "2.3.0"
-        ), f'torch >= 2.3.0 is required for remove_sharded_tensors'
+        assert is_torch_min_version("2.3.0"), (
+            f'torch >= 2.3.0 is required for remove_sharded_tensors'
+        )
 
         distckpt_files = [f for f in os.listdir(checkpoint_dir) if f.endswith("distcp")]
         files_to_remove = [f for f in distckpt_files if f.startswith(key_prefix)]

@@ -198,9 +198,9 @@ class GPTModel(LanguageModule):
                 rotary_base=rotary_base,
             )
             self.mrope_section = self.config.mrope_section
-            assert (
-                self.mrope_section is not None
-            ), "mrope require mrope_section setting, but we got None from TransformerConfig"
+            assert self.mrope_section is not None, (
+                "mrope require mrope_section setting, but we got None from TransformerConfig"
+            )
 
         # Cache for RoPE tensors which do not change between iterations.
         self.rotary_pos_emb_cache = {}
@@ -222,7 +222,6 @@ class GPTModel(LanguageModule):
 
         # Output
         if self.post_process:
-
             if self.config.defer_embedding_wgrad_compute:
                 # The embedding activation buffer preserves a reference to the input activations
                 # of the final embedding projection layer GEMM. It will hold the activations for
@@ -337,9 +336,7 @@ class GPTModel(LanguageModule):
                 and inference_context.use_flashinfer_fused_rope
             )
             if in_inference_mode and (self.config.flash_decode or use_flash_infer_fused_rope):
-                assert (
-                    not self.config.flash_decode
-                ) or inference_context.is_static_batching(), (
+                assert (not self.config.flash_decode) or inference_context.is_static_batching(), (
                     "Flash decode is only applicable to static batching."
                 )
                 # Flash decoding uses precomputed cos and sin for RoPE
@@ -764,8 +761,8 @@ class GPTModel(LanguageModule):
         # Old GPT checkpoints only stored the output layer weight key. So we remove the
         # _extra_state key but check that it doesn't contain any data anyway
         output_extra_state = sharded_state_dict.pop(output_layer_extra_state_key, None)
-        assert not (
-            output_extra_state and output_extra_state.data
-        ), f'Expected output layer extra state to be empty, got: {output_extra_state}'
+        assert not (output_extra_state and output_extra_state.data), (
+            f'Expected output layer extra state to be empty, got: {output_extra_state}'
+        )
 
         return sharded_state_dict

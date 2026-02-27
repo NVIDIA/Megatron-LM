@@ -81,7 +81,6 @@ class StaticInferenceContext(BaseInferenceContext):
         )
 
     def __eq__(self, other):
-
         if id(self) == id(other):
             return True
 

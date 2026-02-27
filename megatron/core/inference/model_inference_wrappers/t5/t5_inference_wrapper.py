@@ -15,7 +15,6 @@ from megatron.core.models.T5 import T5Model
 from megatron.core.utils import get_attr_wrapped_model
 
 
-# pylint: disable=line-too-long
 class T5InferenceWrapper(AbstractModelInferenceWrapper):
     """Inference wrapper for T5 model.
 

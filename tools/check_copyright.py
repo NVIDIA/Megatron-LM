@@ -3,10 +3,10 @@
 Script to check and optionally add NVIDIA copyright headers to files.
 """
 
-import sys
 import argparse
-from pathlib import Path
+import sys
 from datetime import datetime
+from pathlib import Path
 
 EXPECTED_HEADER = """# Copyright (c) {} NVIDIA CORPORATION & AFFILIATES. All rights reserved."""
 
@@ -25,14 +25,8 @@ def has_correct_header(file_path):
 
 
 def main():
-    parser = argparse.ArgumentParser(
-        description='Check and add NVIDIA copyright headers to files.'
-    )
-    parser.add_argument(
-        'files',
-        nargs='+',
-        help='Files to check/modify'
-    )
+    parser = argparse.ArgumentParser(description='Check and add NVIDIA copyright headers to files.')
+    parser.add_argument('files', nargs='+', help='Files to check/modify')
 
     args = parser.parse_args()
 

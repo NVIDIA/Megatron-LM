@@ -119,9 +119,7 @@ def diff(x1: Any, x2: Any, prefix: Tuple = ()) -> Tuple[list, list, list]:
         # TODO: change with concrete type that has both replica_id and data attrs
         elif hasattr(x1, "replica_id") and hasattr(x2, "replica_id"):
             assert type(x1) == type(x2)
-            only_left, only_right, mismatch = diff(
-                x1.data, x2.data, prefix + (type(x1),)
-            )  # type: ignore
+            only_left, only_right, mismatch = diff(x1.data, x2.data, prefix + (type(x1),))  # type: ignore
             _is_mismatch = False
         else:
             try:

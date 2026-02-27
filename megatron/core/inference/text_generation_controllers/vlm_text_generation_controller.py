@@ -19,7 +19,8 @@ class VLMTextGenerationController(TextGenerationController):
         active_requests: OrderedDict[str, InferenceRequest],
         use_attention_mask: bool = False,
     ):
-        """Preparing input data for inference, using respective wrapper's prep_inference_input method # pylint: disable=line-too-long
+        """Preparing input data for inference, using respective
+        wrapper's prep_inference_input method
 
         Currently only supports batch size 1 inference.
 
@@ -33,9 +34,9 @@ class VLMTextGenerationController(TextGenerationController):
 
         request = list(active_requests.values())[0]
 
-        assert isinstance(
-            request, VLMInferenceRequest
-        ), f"Found inference request of type {type(request)}, expected VLMInferenceRequest"
+        assert isinstance(request, VLMInferenceRequest), (
+            f"Found inference request of type {type(request)}, expected VLMInferenceRequest"
+        )
 
         inference_input = self.inference_wrapped_model.prep_inference_input(
             prompts_tokens,

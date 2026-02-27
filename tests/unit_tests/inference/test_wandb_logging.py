@@ -2,7 +2,7 @@
 
 """Unit tests for wandb logging functionality in inference."""
 
-from unittest.mock import MagicMock, Mock, create_autospec, patch
+from unittest.mock import Mock, create_autospec, patch
 
 import pytest
 import torch
@@ -189,16 +189,16 @@ class TestInferenceWandbLogging:
         ]
 
         for field in int_fields:
-            assert isinstance(
-                stats[field], int
-            ), f"{field} should be int but is {type(stats[field])}"
+            assert isinstance(stats[field], int), (
+                f"{field} should be int but is {type(stats[field])}"
+            )
 
         # All float fields
         float_fields = ['allocated_utilization', 'active_utilization']
         for field in float_fields:
-            assert isinstance(
-                stats[field], float
-            ), f"{field} should be float but is {type(stats[field])}"
+            assert isinstance(stats[field], float), (
+                f"{field} should be float but is {type(stats[field])}"
+            )
 
     @pytest.mark.internal
     @patch('megatron.core.inference.engines.dynamic_engine.HAVE_WANDB', True)

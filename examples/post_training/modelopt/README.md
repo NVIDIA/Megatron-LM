@@ -217,6 +217,6 @@ The saved Megatron-LM distributed checkpoint (output of above scripts) can be re
 ## Advanced Usage
 To contribute, please ping [@NVIDIA/post-training](https://github.com/orgs/NVIDIA/teams/post-training) team members. We format the examples with
 ```
-uvx black@24.10.0 .
-uvx isort .
+uvx ruff@0.11.0 format .
+uvx ruff@0.11.0 check --fix .
 ```

@@ -1,10 +1,8 @@
 # Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
-import io
 import logging
 import os
 import pathlib
-import re
 import shutil
 import zipfile
 
@@ -26,7 +24,7 @@ def download_from_gitlab(pipeline_id: int, only_failing: bool):
 
     if not gitlab_endpoint or not ro_api_token:
         raise Exception(
-            "Environment variables {GITLAB_ENDPOINT} and {RO_API_TOKEN} have not been set. ie. GITLAB_ENDPOINT=<gitlab-endpoint>, RO_API_TOKEN=<gitlab-token>"
+            "Environment variables {GITLAB_ENDPOINT} and {RO_API_TOKEN} have not been set. ie. GITLAB_ENDPOINT=<gitlab-endpoint>, RO_API_TOKEN=<gitlab-token>"  # noqa: E501
         )
 
     gl = gitlab.Gitlab(f"https://{gitlab_endpoint}", private_token=ro_api_token)
@@ -310,7 +308,7 @@ def _extract_stage_and_test_name(job_name: str) -> tuple:
     else:
         # No stage in job name - this shouldn't happen for integration tests
         raise ValueError(
-            f"Job name '{job_name}' does not contain a stage (expected format: 'stage/test_name - version')"
+            f"Job name '{job_name}' does not contain a stage (expected format: 'stage/test_name - version')"  # noqa: E501
         )
 
     logger.info(f"Extracted stage: {stage}, test name: {test_name} from job '{job_name}'")

@@ -123,9 +123,9 @@ def do_test_preprocess_data(temp_dir, extra_args=[]):
         ]
         merged_doc_idx = merged_doc_idx - merged_doc_idx[0]
 
-        assert (
-            dataset.document_indices == merged_doc_idx
-        ).all(), f"ERROR: {basename.split('_')[:-2]}: merged dataset document indices mismatch"
+        assert (dataset.document_indices == merged_doc_idx).all(), (
+            f"ERROR: {basename.split('_')[:-2]}: merged dataset document indices mismatch"
+        )
 
         merged_doc_index_index += len(dataset.document_indices) - 1
 
@@ -141,9 +141,9 @@ def do_test_preprocess_data(temp_dir, extra_args=[]):
                     dataset_index += 1
                 processed = tokens_to_string(processed_toks)
 
-                assert (
-                    raw == processed
-                ), f"ERROR: {basename.split('_')[:-2]}: raw and processed documents do not match"
+                assert raw == processed, (
+                    f"ERROR: {basename.split('_')[:-2]}: raw and processed documents do not match"
+                )
 
                 merged_toks = []
                 while len(merged_toks) < len(toks):
@@ -151,12 +151,12 @@ def do_test_preprocess_data(temp_dir, extra_args=[]):
                     merged_index += 1
                 merged = tokens_to_string(merged_toks)
 
-                assert (
-                    raw == merged
-                ), f"ERROR: {basename.split('_')[:-2]}: raw and merged documents do not match"
+                assert raw == merged, (
+                    f"ERROR: {basename.split('_')[:-2]}: raw and merged documents do not match"
+                )
 
         print(
-            f"INFO: {''.join(basename.split('_')[:-2])}: raw, processed, and merged documents match!"
+            f"INFO: {''.join(basename.split('_')[:-2])}: raw, processed, and merged documents match!"  # noqa: E501
         )
 
     print("INFO: Success!")
@@ -182,7 +182,6 @@ def gpt2_merge(odir):
 
 def test_preprocess_data_gpt():
     with tempfile.TemporaryDirectory() as temp_dir:
-
         # gpt specific args
         gpt_args = [
             "--tokenizer-type",
@@ -214,7 +213,6 @@ def bert_vocab(odir):
 @pytest.mark.flaky_in_dev
 def test_preprocess_data_bert():
     with tempfile.TemporaryDirectory() as temp_dir:
-
         # bert specific args
         bert_args = [
             "--tokenizer-type",

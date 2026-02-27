@@ -20,7 +20,7 @@ logger = logging.getLogger(__name__)
 PATTERN_TIKTOKEN_V1 = (
     r"[^\r\n\p{L}\p{N}]?+\p{L}+|\p{N}| ?[^\s\p{L}\p{N}]++[\r\n]*|\s*[\r\n]|\s+(?!\S)|\s+"
 )
-PATTERN_TIKTOKEN_V2 = "[^\\r\\n\\p{L}\\p{N}]?[\\p{Lu}\\p{Lt}\\p{Lm}\\p{Lo}\\p{M}]*[\\p{Ll}\\p{Lm}\\p{Lo}\\p{M}]+|[^\\r\\n\\p{L}\\p{N}]?[\\p{Lu}\\p{Lt}\\p{Lm}\\p{Lo}\\p{M}]+[\\p{Ll}\\p{Lm}\\p{Lo}\\p{M}]*|\\p{N}| ?[^\\s\\p{L}\\p{N}]+[\\r\\n/]*|\\s*[\\r\\n]+|\\s+(?!\\S)|\\s+"  # pylint: disable=line-too-long
+PATTERN_TIKTOKEN_V2 = "[^\\r\\n\\p{L}\\p{N}]?[\\p{Lu}\\p{Lt}\\p{Lm}\\p{Lo}\\p{M}]*[\\p{Ll}\\p{Lm}\\p{Lo}\\p{M}]+|[^\\r\\n\\p{L}\\p{N}]?[\\p{Lu}\\p{Lt}\\p{Lm}\\p{Lo}\\p{M}]+[\\p{Ll}\\p{Lm}\\p{Lo}\\p{M}]*|\\p{N}| ?[^\\s\\p{L}\\p{N}]+[\\r\\n/]*|\\s*[\\r\\n]+|\\s+(?!\\S)|\\s+"  # noqa: E501
 DEFAULT_TIKTOKEN_MAX_VOCAB = 2**17  # 131072
 SPECIAL_TOKENS = ["<unk>", "<s>", "</s>", "<mask>", "<pad>", "<cls>", "<sep>"]
 SPECIAL_TOKEN_TEMPLATE = "<SPECIAL_{id}>"
@@ -109,13 +109,13 @@ class TikTokenTokenizer(MegatronTokenizerTextAbstract, MegatronTokenizerChatTemp
         else:
             raise ValueError(f"Expected tiktoken pattern to be `v1` or `v2`, but got {pattern}.")
 
-        assert len(special_tokens) == len(
-            set(special_tokens)
-        ), f"Special tokens should be unique: {special_tokens}"
+        assert len(special_tokens) == len(set(special_tokens)), (
+            f"Special tokens should be unique: {special_tokens}"
+        )
         assert len(special_tokens) <= num_special_tokens < vocab_size
-        assert set(SPECIAL_TOKENS) <= set(
-            special_tokens
-        ), f"Custom special tokens should include {SPECIAL_TOKENS}"
+        assert set(SPECIAL_TOKENS) <= set(special_tokens), (
+            f"Custom special tokens should include {SPECIAL_TOKENS}"
+        )
 
         self._unk_id = special_tokens.index("<unk>")
         self._bos_id = special_tokens.index("<s>")
@@ -143,9 +143,9 @@ class TikTokenTokenizer(MegatronTokenizerTextAbstract, MegatronTokenizerChatTemp
                 f"{', '.join(special_tokens)}, {special_filler[0]}, ..., {special_filler[-1]}",
             )
         self.special_tokens = special_tokens + special_filler
-        assert (
-            len(set(self.special_tokens)) == len(self.special_tokens) == num_special_tokens
-        ), self.special_tokens
+        assert len(set(self.special_tokens)) == len(self.special_tokens) == num_special_tokens, (
+            self.special_tokens
+        )
         self.inner_vocab_size = vocab_size - num_special_tokens
 
         # reload vocab

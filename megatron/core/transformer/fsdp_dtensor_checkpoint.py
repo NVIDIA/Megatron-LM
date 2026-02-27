@@ -435,9 +435,9 @@ def validate_loaded_state_dict(state_dict, checkpoint_path):
                 loaded_tensor._local_tensor, full_value._local_tensor, atol=1e-8, rtol=1e-5
             ), f"key: {key}; {loaded_tensor} {full_value}"
         else:
-            assert torch.allclose(
-                value, load_item_dict[key]
-            ), f"key: {key}; {value} {load_item_dict[key]}"
+            assert torch.allclose(value, load_item_dict[key]), (
+                f"key: {key}; {value} {load_item_dict[key]}"
+            )
 
 
 def get_global_unique_param_name(model_chunks, param):

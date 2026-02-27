@@ -174,7 +174,7 @@ def setup_model_and_optimizer(
 ):
     if 'muon' in optimizer and dist_opt:
         raise ValueError(
-            "Layer-wise distributed optimizer with Muon is not supported with distributed optimizer."
+            "Layer-wise distributed optimizer with Muon is not supported with distributed optimizer."  # noqa: E501
         )
 
     mock_args = parse_args(ignore_unknown_args=True)
@@ -268,7 +268,7 @@ def setup_moe_model_and_optimizer(
 ):
     if 'muon' in optimizer and dist_opt:
         raise ValueError(
-            "Layer-wise distributed optimizer with Muon is not supported with distributed optimizer."
+            "Layer-wise distributed optimizer with Muon is not supported with distributed optimizer."  # noqa: E501
         )
     mock_args = parse_args(ignore_unknown_args=True)
     with mock.patch('megatron.training.training.get_args', new=lambda: mock_args):

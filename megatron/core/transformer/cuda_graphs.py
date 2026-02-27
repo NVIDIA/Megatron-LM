@@ -40,7 +40,7 @@ from megatron.core.utils import (
 )
 
 try:
-    import transformer_engine as te  # pylint: disable=unused-import
+    import transformer_engine as te  # noqa: F401
     from transformer_engine.pytorch.distributed import is_fp8_activation_recompute_enabled
     from transformer_engine.pytorch.fp8 import FP8GlobalStateManager
     from transformer_engine.pytorch.graph import (
@@ -240,9 +240,9 @@ def _check_supported_type(meta):
         DynamicInferenceContext,
         ArgMetadata,
     }
-    assert meta.type in _SUPPORTED_TYPES or is_dataclass(
-        meta.value
-    ), f"Cudagraphs received an arg of type {meta.type} which is not supported."
+    assert meta.type in _SUPPORTED_TYPES or is_dataclass(meta.value), (
+        f"Cudagraphs received an arg of type {meta.type} which is not supported."
+    )
 
 
 def _determine_if_first_last_layer_of_this_vp_chunk(base_module):
@@ -387,7 +387,7 @@ class _CudagraphGlobalRecord:
                     "output buffers. This allows the memory of input and output buffers to be "
                     " reclaimed across graphs while remaining valid buffers for when the graph "
                     "is replayed. For more information see: "
-                    "https://github.com/NVIDIA/TransformerEngine/blob/v2.10/transformer_engine/pytorch/utils.py#L759"  # pylint: disable=line-too-long
+                    "https://github.com/NVIDIA/TransformerEngine/blob/v2.10/transformer_engine/pytorch/utils.py#L759"  # noqa: E501
                 )
 
         gc.collect()
@@ -532,9 +532,9 @@ class _CudagraphRecordNode(torch.autograd.Function):
     def forward(ctx, runner, inputs):
         """Forward pass, does nothing but registers an autograd node."""
 
-        assert (
-            runner.status == _GraphStatus.FWD_READY
-        ), "Tried calling the fwd cudagraph when the bwd cudagraph was expected to be called next!"
+        assert runner.status == _GraphStatus.FWD_READY, (
+            "Tried calling the fwd cudagraph when the bwd cudagraph was expected to be called next!"
+        )
 
         ctx.runner = runner
         return inputs
@@ -545,9 +545,9 @@ class _CudagraphRecordNode(torch.autograd.Function):
         bwd graph needs to be created."""
 
         runner = ctx.runner
-        assert (
-            runner.status == _GraphStatus.BWD_READY
-        ), "Tried calling the bwd cudagraph when the fwd cudagraph was expected to be called next!"
+        assert runner.status == _GraphStatus.BWD_READY, (
+            "Tried calling the bwd cudagraph when the fwd cudagraph was expected to be called next!"
+        )
         runner.status = _GraphStatus.FWD_READY
         if not runner.bwd_graph_recorded:
             _CudagraphGlobalRecord.record_bwd_graph(runner)
@@ -564,15 +564,15 @@ class _CudagraphReplayNode(torch.autograd.Function):
     def forward(ctx, runner, is_first_microbatch, *inputs):
         """Replay the forward graph of the passed runner."""
 
-        assert (
-            runner.fwd_graph is not None
-        ), "Tried replaying fwd cudagraph before calling 'create_fwd_cudagraph!"
-        assert (
-            runner.status == _GraphStatus.FWD_READY
-        ), "Tried calling the fwd cudagraph when the bwd cudagraph was expected to be called next!"
-        assert len(inputs) == len(
-            runner.fwd_graph_input_surface
-        ), "Fwd cudagraph received a different number of tensors than what it was graphed with!"
+        assert runner.fwd_graph is not None, (
+            "Tried replaying fwd cudagraph before calling 'create_fwd_cudagraph!"
+        )
+        assert runner.status == _GraphStatus.FWD_READY, (
+            "Tried calling the fwd cudagraph when the bwd cudagraph was expected to be called next!"
+        )
+        assert len(inputs) == len(runner.fwd_graph_input_surface), (
+            "Fwd cudagraph received a different number of tensors than what it was graphed with!"
+        )
 
         # Copy new data into fwd graph input buffer
         need_copy_inputs = []
@@ -617,15 +617,15 @@ class _CudagraphReplayNode(torch.autograd.Function):
         """Replay the backward graph of the passed runner."""
 
         runner = ctx.runner
-        assert (
-            runner.bwd_graph is not None
-        ), "Tried replaying bwd cudagraph before calling 'create_bwd_cudagraph'!"
-        assert (
-            runner.status == _GraphStatus.BWD_READY
-        ), "Tried calling the bwd cudagraph when the fwd cudagraph was expected to be called next!"
-        assert len(grads) == len(
-            runner.static_grad_outputs
-        ), "Bwd cudagraph received a different number of tensors than what it was graphed with!"
+        assert runner.bwd_graph is not None, (
+            "Tried replaying bwd cudagraph before calling 'create_bwd_cudagraph'!"
+        )
+        assert runner.status == _GraphStatus.BWD_READY, (
+            "Tried calling the bwd cudagraph when the fwd cudagraph was expected to be called next!"
+        )
+        assert len(grads) == len(runner.static_grad_outputs), (
+            "Bwd cudagraph received a different number of tensors than what it was graphed with!"
+        )
 
         need_copy_inputs = list(ctx.saved_tensors)
         for cudagraph_input in runner.fwd_graph_input_surface:
@@ -1259,7 +1259,6 @@ class _CudaGraphRunner(torch.nn.Module):
             errors.append(f"  - {msg}")
 
         def check(val, ref, context):
-
             assert isinstance(val, ArgMetadata)
             assert isinstance(ref, ArgMetadata)
 
@@ -1441,10 +1440,10 @@ class CudaGraphManager(torch.nn.Module):
 
         if module._forward_pre_hooks:
             for _, hook in module._forward_pre_hooks.items():
-                assert (
-                    inspect.getmodule(hook) == distributed_data_parallel
-                ), "Tried to cudagraph a module with user registered pre-forward hooks, \
+                assert inspect.getmodule(hook) == distributed_data_parallel, (
+                    "Tried to cudagraph a module with user registered pre-forward hooks, \
                 which is not allowed."
+                )
                 # Only hooks from Mcore DDP, which take no args, should be called at this point.
                 hook(module)
 
@@ -1676,9 +1675,9 @@ class TECudaGraphHelper:
 
     def __init__(self, model, config, seq_length, micro_batch_size, optimizers=[]):
         assert HAVE_TE_GRAPHS, "CUDA Graphs are not supported without TE."
-        assert (
-            config.cuda_graph_impl == "transformer_engine"
-        ), "Option cuda_graph_impl=transformer_engine not enabled."
+        assert config.cuda_graph_impl == "transformer_engine", (
+            "Option cuda_graph_impl=transformer_engine not enabled."
+        )
         assert (
             "expandable_segments:True" not in os.getenv("PYTORCH_CUDA_ALLOC_CONF", "")
             or os.getenv("NCCL_GRAPH_REGISTER", "") == "0"
@@ -1835,14 +1834,14 @@ class TECudaGraphHelper:
             - sample_keys: Tuple of (shape, dtype, layout) for args + (key, shape, dtype, layout)
                 for kwargs, used to match compatible buffers for reuse.
         """
-        assert self.num_model_chunks == max(
-            order
-        ), "num_model_chunks must match the max chunk id in order."
+        assert self.num_model_chunks == max(order), (
+            "num_model_chunks must match the max chunk id in order."
+        )
         if chunk_id_list is None:
             # check only if 1f1b overlap is disabled.
-            assert (
-                self.num_microbatches == len(order) // self.num_model_chunks // 2
-            ), "num_microbatches must match the number of microbatches in order."
+            assert self.num_microbatches == len(order) // self.num_model_chunks // 2, (
+                "num_microbatches must match the number of microbatches in order."
+            )
 
         # Generate sample arguments and keyword arguments for capturing.
         sample_args = [None] * (len(self.flattened_callables) * self.num_microbatches)
@@ -2047,9 +2046,9 @@ class TECudaGraphHelper:
             parallel_state.get_pipeline_model_parallel_world_size() == 1
             and not self.config.overlap_moe_expert_parallel_comm
         ):
-            assert (
-                self.num_model_chunks == 1
-            ), "If PP is not enabled, there should be only one model chunk."
+            assert self.num_model_chunks == 1, (
+                "If PP is not enabled, there should be only one model chunk."
+            )
             self.num_microbatches = 1
         else:
             self.num_microbatches = get_num_microbatches()

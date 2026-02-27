@@ -90,14 +90,12 @@ class BridgeCommunicator:
         if dim_mapping is None:
             self.dim_mapping = {'s': 1, 'b': 0, 'h': 2}
         else:
-            assert set(dim_mapping.keys()) == {
-                's',
-                'b',
-                'h',
-            }, f"dim_mapping must have keys 's', 'b', 'h', got {set(dim_mapping.keys())}"
-            assert all(
-                v in {0, 1, 2} for v in dim_mapping.values()
-            ), f"dim_mapping values must be 0, 1, or 2, got {list(dim_mapping.values())}"
+            assert set(dim_mapping.keys()) == {'s', 'b', 'h'}, (
+                f"dim_mapping must have keys 's', 'b', 'h', got {set(dim_mapping.keys())}"
+            )
+            assert all(v in {0, 1, 2} for v in dim_mapping.values()), (
+                f"dim_mapping values must be 0, 1, or 2, got {list(dim_mapping.values())}"
+            )
             self.dim_mapping = dim_mapping
 
         self.src_grid_broadcast_pg = None
@@ -163,9 +161,9 @@ class BridgeCommunicator:
             ranks = []
             for group in per_dp_replica_ranks:
                 if self.current_rank in group:
-                    assert (
-                        local_leader_rank is None
-                    ), "only one local leader rank is allowed per dp replica"
+                    assert local_leader_rank is None, (
+                        "only one local leader rank is allowed per dp replica"
+                    )
                     local_leader_rank = group[-1]
                 ranks.append(group[-1])
             leader_ranks.extend(ranks)
@@ -174,9 +172,9 @@ class BridgeCommunicator:
             ranks = []
             for group in per_dp_replica_ranks:
                 if self.current_rank in group:
-                    assert (
-                        local_leader_rank is None
-                    ), "only one local leader rank is allowed per dp replica"
+                    assert local_leader_rank is None, (
+                        "only one local leader rank is allowed per dp replica"
+                    )
                     local_leader_rank = group[0]
                 ranks.append(group[0])
             leader_ranks.extend(ranks)
@@ -341,9 +339,9 @@ class BridgeCommunicator:
             f"rank_info: {rank_info}"
         )
         if rank_info.role == CommRole.RECEIVER:
-            assert (
-                self.current_rank == self.dest_local_leader_rank
-            ), f"Rank {self.current_rank} is not the leader rank"
+            assert self.current_rank == self.dest_local_leader_rank, (
+                f"Rank {self.current_rank} is not the leader rank"
+            )
             # p2p call to receive the tensor
             recv_forward_shapes, recv_grad_shapes = self._communicate_shapes(recv_prev=True)
             logging.debug(
@@ -431,9 +429,9 @@ class BridgeCommunicator:
         assert rank_info is not None, f"Rank {self.current_rank} is not in the comm map"
 
         if rank_info.role == CommRole.RECEIVER:
-            assert (
-                self.current_rank == self.dest_local_leader_rank
-            ), f"Rank {self.current_rank} is not the leader rank"
+            assert self.current_rank == self.dest_local_leader_rank, (
+                f"Rank {self.current_rank} is not the leader rank"
+            )
             # Send gradients back to source ranks
             num_receives = len(rank_info.recv_from_ranks)
             tensor_splits = self._split_tensor_at_batch_dim(grad_tensor, num_receives)
@@ -470,9 +468,9 @@ class BridgeCommunicator:
         assert rank_info is not None, f"Rank {self.current_rank} is not in the comm map"
 
         if rank_info.role == CommRole.SENDER:
-            assert (
-                self.current_rank == self.src_local_leader_rank
-            ), f"Rank {self.current_rank} is not the leader rank"
+            assert self.current_rank == self.src_local_leader_rank, (
+                f"Rank {self.current_rank} is not the leader rank"
+            )
             recv_forward_shapes, recv_grad_shapes = self._communicate_shapes(recv_next=True)
             logging.debug(
                 f"[Bridge Communicator] [receive_backward] Rank {self.current_rank} "
@@ -565,9 +563,9 @@ class BridgeCommunicator:
             f"rank_info: {rank_info}"
         )
         if rank_info.role == CommRole.SENDER:
-            assert (
-                self.current_rank == self.src_local_leader_rank
-            ), f"Rank {self.current_rank} is not the leader rank"
+            assert self.current_rank == self.src_local_leader_rank, (
+                f"Rank {self.current_rank} is not the leader rank"
+            )
 
             num_sends = len(rank_info.send_to_ranks)
             activation_splits = self._split_tensor_at_batch_dim(input_tensor, num_sends)
@@ -682,9 +680,9 @@ class BridgeCommunicator:
         assert rank_info is not None, f"Rank {self.current_rank} is not in the comm map"
 
         if rank_info.role == CommRole.RECEIVER:
-            assert (
-                self.current_rank == self.dest_local_leader_rank
-            ), f"Rank {self.current_rank} is not the leader rank"
+            assert self.current_rank == self.dest_local_leader_rank, (
+                f"Rank {self.current_rank} is not the leader rank"
+            )
 
             num_receives = len(rank_info.recv_from_ranks)
             gradient_splits = self._split_tensor_at_batch_dim(grad_tensor, num_receives)
@@ -868,7 +866,6 @@ class BridgeCommunicator:
 
             # If we need to send gradient shapes back, prepare send operations
             if tensor_to_send_prev is not None:
-
                 grad_shape = tensor_to_send_prev.shape
                 grad_shape_tensor = torch.tensor(
                     grad_shape, device=torch.cuda.current_device(), dtype=torch.int64

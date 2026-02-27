@@ -446,9 +446,9 @@ def test_rank_generator_for_tp_dp_pp(nodes, num_gpu, tp, pp, cp, ep):
     dp = world_size // (tp * pp * cp)
     expert_dp = world_size // (tp * ep * pp)
     assert dp % ep == 0, f"dp size ({dp}) is not divisible by ep {ep} ."
-    assert (
-        world_size % (tp * pp * cp) == 0
-    ), f"world_size ({world_size}) is not divisible by tp {tp} x pp {pp} x cp {cp}."
+    assert world_size % (tp * pp * cp) == 0, (
+        f"world_size ({world_size}) is not divisible by tp {tp} x pp {pp} x cp {cp}."
+    )
     (
         dp_groups,
         dp_groups_with_cp,
@@ -471,36 +471,36 @@ def test_rank_generator_for_tp_dp_pp(nodes, num_gpu, tp, pp, cp, ep):
     expert_rank_generator = ps.RankGenerator(
         tp=tp, ep=ep, dp=expert_dp, pp=pp, cp=1, order="tp-ep-dp-pp"
     )
-    assert dp_groups == rank_generator.get_ranks(
-        "dp"
-    ), f"{dp_groups} != {rank_generator.get_ranks('dp')}"
-    assert dp_groups_with_cp == rank_generator.get_ranks(
-        'dp-cp'
-    ), f"{dp_groups_with_cp} != {rank_generator.get_ranks('dp-cp')}"
-    assert cp_group == rank_generator.get_ranks(
-        "cp"
-    ), f"{cp_group} != {rank_generator.get_ranks('cp')}."
-    assert mp_group == rank_generator.get_ranks(
-        "tp-pp"
-    ), f"{mp_group} != {rank_generator.get_ranks('tp-pp')}"
-    assert tp_group == rank_generator.get_ranks(
-        "tp"
-    ), f"{tp_group} != {rank_generator.get_ranks('tp')}"
-    assert pp_group == rank_generator.get_ranks(
-        "pp"
-    ), f"{pp_group} != {rank_generator.get_ranks('pp')}"
-    assert tp_dp_group == rank_generator.get_ranks(
-        "tp-dp"
-    ), f"{tp_dp_group} != {rank_generator.get_ranks('tp-dp')}"
-    assert tp_dp_cp_group == rank_generator.get_ranks(
-        "tp-dp-cp"
-    ), f"{tp_dp_cp_group} != {rank_generator.get_ranks('tp-dp-cp')}"
-    assert expert_tp_ep_group == expert_rank_generator.get_ranks(
-        "tp-ep"
-    ), f"{expert_tp_ep_group} != {expert_rank_generator.get_ranks('tp-ep')}."
-    assert expert_dp_group == expert_rank_generator.get_ranks(
-        "dp"
-    ), f"{expert_dp_group} != {expert_rank_generator.get_ranks('dp')}."
+    assert dp_groups == rank_generator.get_ranks("dp"), (
+        f"{dp_groups} != {rank_generator.get_ranks('dp')}"
+    )
+    assert dp_groups_with_cp == rank_generator.get_ranks('dp-cp'), (
+        f"{dp_groups_with_cp} != {rank_generator.get_ranks('dp-cp')}"
+    )
+    assert cp_group == rank_generator.get_ranks("cp"), (
+        f"{cp_group} != {rank_generator.get_ranks('cp')}."
+    )
+    assert mp_group == rank_generator.get_ranks("tp-pp"), (
+        f"{mp_group} != {rank_generator.get_ranks('tp-pp')}"
+    )
+    assert tp_group == rank_generator.get_ranks("tp"), (
+        f"{tp_group} != {rank_generator.get_ranks('tp')}"
+    )
+    assert pp_group == rank_generator.get_ranks("pp"), (
+        f"{pp_group} != {rank_generator.get_ranks('pp')}"
+    )
+    assert tp_dp_group == rank_generator.get_ranks("tp-dp"), (
+        f"{tp_dp_group} != {rank_generator.get_ranks('tp-dp')}"
+    )
+    assert tp_dp_cp_group == rank_generator.get_ranks("tp-dp-cp"), (
+        f"{tp_dp_cp_group} != {rank_generator.get_ranks('tp-dp-cp')}"
+    )
+    assert expert_tp_ep_group == expert_rank_generator.get_ranks("tp-ep"), (
+        f"{expert_tp_ep_group} != {expert_rank_generator.get_ranks('tp-ep')}."
+    )
+    assert expert_dp_group == expert_rank_generator.get_ranks("dp"), (
+        f"{expert_dp_group} != {expert_rank_generator.get_ranks('dp')}."
+    )
 
 
 @pytest.mark.parametrize(

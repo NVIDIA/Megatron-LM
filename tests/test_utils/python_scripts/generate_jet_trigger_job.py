@@ -140,7 +140,7 @@ def main(
             "workflow": {
                 "rules": [
                     {
-                        "if": '($CI_PIPELINE_SOURCE == "parent_pipeline" || $CI_MERGE_REQUEST_ID) && $CI_COMMIT_BRANCH == "main"',
+                        "if": '($CI_PIPELINE_SOURCE == "parent_pipeline" || $CI_MERGE_REQUEST_ID) && $CI_COMMIT_BRANCH == "main"',  # noqa: E501
                         "auto_cancel": {"on_new_commit": "interruptible"},
                     },
                     {"if": '$CI_PIPELINE_SOURCE == "parent_pipeline" || $CI_MERGE_REQUEST_ID'},
@@ -188,7 +188,7 @@ def main(
             if run_name is not None and wandb_experiment is not None:
                 script.append(f"--run-name {run_name}")
                 script.append(
-                    f"--wandb-experiment {wandb_experiment}-{test_case['spec']['model']}-{test_case['spec']['test_case']}"
+                    f"--wandb-experiment {wandb_experiment}-{test_case['spec']['model']}-{test_case['spec']['test_case']}"  # noqa: E501
                 )
 
             needs = [{"pipeline": '$PARENT_PIPELINE_ID', "job": dependent_job}]

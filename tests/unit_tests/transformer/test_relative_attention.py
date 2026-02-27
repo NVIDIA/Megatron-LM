@@ -1,7 +1,5 @@
 # Copyright (c) 2024, NVIDIA CORPORATION. All rights reserved.
 
-import pytest
-import torch
 import torch.nn.init as init
 
 from megatron.core.models.common.embeddings.relative_pos_embedding import RelativePositionEmbedding

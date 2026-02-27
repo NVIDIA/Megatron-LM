@@ -7,7 +7,9 @@ import torch
 
 # Add megatron to the path.
 sys.path.append(
-    os.path.abspath(os.path.join(os.path.dirname(__file__), os.path.pardir, os.path.pardir, os.path.pardir))
+    os.path.abspath(
+        os.path.join(os.path.dirname(__file__), os.path.pardir, os.path.pardir, os.path.pardir)
+    )
 )
 
 
@@ -21,7 +23,9 @@ def split(input_dir, base_output_dir, input_pp, output_pp, num_tp, num_layers_pe
 
         if num_layers_per_pp_rank is None:
             num_layers = sd["args"].num_layers
-            assert num_layers % output_pp == 0, "specify --num-layers-per-pp-rank for an uneven split"
+            assert num_layers % output_pp == 0, (
+                "specify --num-layers-per-pp-rank for an uneven split"
+            )
             num_layers_per_pp_rank = [num_layers // output_pp] * output_pp
 
         layer_lb = 0
@@ -155,27 +159,31 @@ if __name__ == "__main__":
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
 
+    parser.add_argument("--input", type=str, required=True, help="Input model directory")
     parser.add_argument(
-        "--input", type=str, required=True, help="Input model directory"
+        "--input-pipeline-parallel",
+        type=int,
+        required=True,
+        help="Input model pipeline parallelism",
+    )
+    parser.add_argument("--output", type=str, required=True, help="Output model directory")
+    parser.add_argument(
+        "--output-pipeline-parallel",
+        type=int,
+        required=True,
+        help="Output model pipeline parallelism",
     )
     parser.add_argument(
-        "--input-pipeline-parallel", type=int, required=True, help="Input model pipeline parallelism"
+        "--tensor-parallel", type=int, required=True, help="Model tensor parallel size"
     )
     parser.add_argument(
-        "--output", type=str, required=True, help="Output model directory"
+        "--num-layers-per-pp-rank",
+        type=int,
+        default=None,
+        nargs="*",
+        help="Specify this for uneven pipeline parallel split",
     )
-    parser.add_argument(
-        "--output-pipeline-parallel", type=int, required=True, help="Output model pipeline parallelism"
-    )
-    parser.add_argument(
-        "--tensor-parallel", type=int, required=True, help="Model tensor parallel size",
-    )
-    parser.add_argument(
-        "--num-layers-per-pp-rank", type=int, default=None, nargs="*", help="Specify this for uneven pipeline parallel split",
-    )
-    parser.add_argument(
-        "--iteration", type=int, default=None, help="Specify checkpoint iteration",
-    )
+    parser.add_argument("--iteration", type=int, default=None, help="Specify checkpoint iteration")
 
     args = parser.parse_args()
 
@@ -187,6 +195,13 @@ if __name__ == "__main__":
     else:
         raise NotImplementedError("Only pipeline parallel 1 to N and N to 1 are supported")
 
-    f(args.input, args.output, args.input_pipeline_parallel, args.output_pipeline_parallel, args.tensor_parallel, args.num_layers_per_pp_rank)
+    f(
+        args.input,
+        args.output,
+        args.input_pipeline_parallel,
+        args.output_pipeline_parallel,
+        args.tensor_parallel,
+        args.num_layers_per_pp_rank,
+    )
 
     print("done.")

@@ -12,7 +12,6 @@ from tests.unit_tests.test_utilities import Utils
 
 
 class TestParallelAttentionWithNoRope:
-
     def setup_method(self, method):
         Utils.initialize_model_parallel(1, 1)
         model_parallel_cuda_manual_seed(123)
@@ -104,9 +103,9 @@ class TestParallelAttentionWithNoRope:
 
         # Verify RoPE was skipped for this layer
         # If RoPE was skipped, outputs should be the same
-        assert not torch.allclose(
-            output_without_rope, output_with_rope
-        ), "Outputs are expected to be different."
+        assert not torch.allclose(output_without_rope, output_with_rope), (
+            "Outputs are expected to be different."
+        )
 
         # Verify output shapes
         assert config.recompute_granularity is None

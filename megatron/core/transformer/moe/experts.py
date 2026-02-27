@@ -57,14 +57,13 @@ from megatron.core.transformer.utils import (
 from megatron.core.typed_torch import apply_module, not_none
 
 try:
-    import transformer_engine as te  # pylint: disable=unused-import
+    import transformer_engine as te  # noqa: F401
 
     from megatron.core.extensions.transformer_engine import Fp8Padding, Fp8Unpadding
 
     HAVE_TE = True
 
 except ImportError:
-
     HAVE_TE = False
 
 logger = logging.getLogger(__name__)
@@ -87,12 +86,12 @@ class GroupedMLP(MegatronModule):
         self.config: TransformerConfig = config
         self.num_local_experts = num_local_experts
         gg.assert_grouped_gemm_is_available()
-        assert (
-            config.add_bias_linear == False
-        ), "bias not supported in Grouped GEMM yet, please set '--disable-bias-linear' instead."
-        assert (
-            config.moe_latent_size is None
-        ), "MoE latent projection not supported in GroupedMLP yet."
+        assert config.add_bias_linear == False, (
+            "bias not supported in Grouped GEMM yet, please set '--disable-bias-linear' instead."
+        )
+        assert config.moe_latent_size is None, (
+            "MoE latent projection not supported in GroupedMLP yet."
+        )
 
         self.expert_parallel = config.expert_model_parallel_size > 1
         if self.config.gated_linear_unit:
@@ -235,9 +234,9 @@ class GroupedMLP(MegatronModule):
             self.activation_checkpoint = tensor_parallel.CheckpointWithoutOutput()
 
         if self.config.moe_apply_probs_on_input:
-            assert (
-                self.config.moe_router_topk == 1
-            ), "`moe_apply_probs_on_input` only works with `moe_router_topk`=1."
+            assert self.config.moe_router_topk == 1, (
+                "`moe_apply_probs_on_input` only works with `moe_router_topk`=1."
+            )
             original_dtype = permuted_local_hidden_states.dtype
             permuted_local_hidden_states = (
                 permuted_probs.unsqueeze(-1) * permuted_local_hidden_states
@@ -433,7 +432,7 @@ class GroupedMLP(MegatronModule):
                             replica_id=replica_id,
                             prepend_axis_num=prepend_axis_num,
                         )
-            return sub_states  # pylint: disable=possibly-used-before-assignment
+            return sub_states  # noqa: F821
 
         @torch.no_grad()
         def sh_ten_merge_fn(sub_state_dict, tp_axis: int, with_glu: bool):
@@ -623,9 +622,9 @@ class TEGroupedMLP(MegatronModule):
         super().__init__(config=config)
         self.num_local_experts = num_local_experts
         self.input_size = self.config.hidden_size
-        assert not (
-            self.config.add_bias_linear and config.bias_dropout_fusion
-        ), "bias_dropout_fusion is not supported in TEGroupedMLP when add_bias_linear=True"
+        assert not (self.config.add_bias_linear and config.bias_dropout_fusion), (
+            "bias_dropout_fusion is not supported in TEGroupedMLP when add_bias_linear=True"
+        )
 
         self.ep_group = pg_collection.ep
         self.tp_group = pg_collection.expt_tp
@@ -750,9 +749,9 @@ class TEGroupedMLP(MegatronModule):
             permuted_probs = permuted_probs.unsqueeze(-1)
 
         if self.config.moe_apply_probs_on_input:
-            assert (
-                self.config.moe_router_topk == 1
-            ), "`moe_apply_probs_on_input` only works with `moe_router_topk`=1."
+            assert self.config.moe_router_topk == 1, (
+                "`moe_apply_probs_on_input` only works with `moe_router_topk`=1."
+            )
             original_dtype = permuted_local_hidden_states.dtype
             permuted_local_hidden_states = permuted_probs * permuted_local_hidden_states
             permuted_local_hidden_states = permuted_local_hidden_states.to(original_dtype)
@@ -926,7 +925,6 @@ class SequentialMLP(MegatronModule):
         submodules: MLPSubmodules,
         pg_collection: Optional[ProcessGroupCollection] = None,
     ):
-
         if config.moe_ffn_hidden_size == config.ffn_hidden_size:
             super().__init__(config=config)
         else:
@@ -977,9 +975,9 @@ class SequentialMLP(MegatronModule):
         """Forward step of the SequentialMLP."""
 
         if self.config.moe_apply_probs_on_input:
-            assert (
-                self.config.moe_router_topk == 1
-            ), "`moe_apply_probs_on_input` only works with `moe_router_topk`=1."
+            assert self.config.moe_router_topk == 1, (
+                "`moe_apply_probs_on_input` only works with `moe_router_topk`=1."
+            )
             original_dtype = permuted_local_hidden_states.dtype
             permuted_local_hidden_states = (
                 permuted_probs.unsqueeze(-1) * permuted_local_hidden_states
@@ -1061,9 +1059,9 @@ class SequentialMLP(MegatronModule):
             # Adjust replica ids - replication along DP modulo EP
             for k, sh_ten in expert_state_dict.items():
                 replica_id = sh_ten.replica_id
-                assert (
-                    len(replica_id) == 3
-                ), f'Expected replica_id for {k} to be in (PP, TP, DP) format, got: {replica_id}'
+                assert len(replica_id) == 3, (
+                    f'Expected replica_id for {k} to be in (PP, TP, DP) format, got: {replica_id}'
+                )
 
                 sh_ten.replica_id = (*replica_id[:2], self.dp_group.rank())
 

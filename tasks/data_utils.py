@@ -1,8 +1,9 @@
 # Copyright (c) 2022, NVIDIA CORPORATION. All rights reserved.
 
-""" Tasks data utility."""
+"""Tasks data utility."""
 
 import re
+
 import numpy as np
 
 
@@ -23,17 +24,18 @@ def build_sample(ids, types, paddings, label, unique_id):
     ids_np = np.array(ids, dtype=np.int64)
     types_np = np.array(types, dtype=np.int64)
     paddings_np = np.array(paddings, dtype=np.int64)
-    sample = ({'text': ids_np,
-               'types': types_np,
-               'padding_mask': paddings_np,
-               'label': int(label),
-               'uid': int(unique_id)})
+    sample = {
+        'text': ids_np,
+        'types': types_np,
+        'padding_mask': paddings_np,
+        'label': int(label),
+        'uid': int(unique_id),
+    }
 
     return sample
 
 
-def build_tokens_types_paddings_from_text(text_a, text_b,
-                                          tokenizer, max_seq_length):
+def build_tokens_types_paddings_from_text(text_a, text_b, tokenizer, max_seq_length):
     """Build token types and paddings, trim if needed, and pad if needed."""
 
     text_a_ids = tokenizer.tokenize(text_a)
@@ -41,13 +43,14 @@ def build_tokens_types_paddings_from_text(text_a, text_b,
     if text_b is not None:
         text_b_ids = tokenizer.tokenize(text_b)
 
-    return build_tokens_types_paddings_from_ids(text_a_ids, text_b_ids,
-                                                max_seq_length, tokenizer.cls,
-                                                tokenizer.sep, tokenizer.pad)
+    return build_tokens_types_paddings_from_ids(
+        text_a_ids, text_b_ids, max_seq_length, tokenizer.cls, tokenizer.sep, tokenizer.pad
+    )
 
 
-def build_tokens_types_paddings_from_ids(text_a_ids, text_b_ids, max_seq_length,
-                                         cls_id, sep_id, pad_id):
+def build_tokens_types_paddings_from_ids(
+    text_a_ids, text_b_ids, max_seq_length, cls_id, sep_id, pad_id
+):
     """Build token types and paddings, trim if needed, and pad if needed."""
 
     ids = []

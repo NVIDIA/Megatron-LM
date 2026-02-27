@@ -19,11 +19,11 @@ This script reads members from GitHub teams and updates the corresponding
 Slack user groups to match.
 """
 
+import argparse
 import os
 import sys
-import argparse
-import requests
 
+import requests
 from slack_sdk import WebClient
 from slack_sdk.errors import SlackApiError
 
@@ -47,10 +47,7 @@ def get_headers():
         print("Error: GH_TOKEN or GITHUB_TOKEN not set")
         sys.exit(1)
 
-    return {
-        "Authorization": f"token {token}",
-        "Accept": "application/vnd.github.v3+json",
-    }
+    return {"Authorization": f"token {token}", "Accept": "application/vnd.github.v3+json"}
 
 
 def get_org():
@@ -320,21 +317,14 @@ def create_slack_usergroup(slack_client, handle, team_slug):
 
     try:
         print(f"Creating Slack usergroup '@{handle}' with name '{name}'...")
-        response = slack_client.usergroups_create(
-            name=name,
-            handle=handle,
-            description=description,
-        )
+        response = slack_client.usergroups_create(name=name, handle=handle, description=description)
         usergroup = response.get("usergroup", {})
         usergroup_id = usergroup.get("id")
 
         if usergroup_id:
             # Update cache with new usergroup
             if _usergroups_cache is not None:
-                _usergroups_cache[handle] = {
-                    "id": usergroup_id,
-                    "users": [],
-                }
+                _usergroups_cache[handle] = {"id": usergroup_id, "users": []}
             print(f"Successfully created Slack usergroup '@{handle}'")
             return usergroup_id
         else:
@@ -348,9 +338,9 @@ def create_slack_usergroup(slack_client, handle, team_slug):
 
 def sync_team_to_usergroup(team_slug, usergroup_handle, dry_run=False):
     """Sync a GitHub team to a Slack usergroup."""
-    print(f"\n{'='*60}")
+    print(f"\n{'=' * 60}")
     print(f"Syncing GitHub team '{team_slug}' -> Slack usergroup '@{usergroup_handle}'")
-    print(f"{'='*60}")
+    print(f"{'=' * 60}")
 
     org = get_org()
     slack_client = get_slack_client()
@@ -427,9 +417,7 @@ def sync_team_to_usergroup(team_slug, usergroup_handle, dry_run=False):
 
     # 5. Update the usergroup
     try:
-        slack_client.usergroups_users_update(
-            usergroup=usergroup_id, users=slack_user_ids
-        )
+        slack_client.usergroups_users_update(usergroup=usergroup_id, users=slack_user_ids)
         print(f"\nSuccessfully updated '@{usergroup_handle}' with {len(slack_user_ids)} members")
         return True
     except SlackApiError as e:
@@ -477,9 +465,9 @@ def sync_all_teams(dry_run=False):
             results["failed"].append(team_slug)
 
     # Summary
-    print(f"\n{'='*60}")
+    print(f"\n{'=' * 60}")
     print("SYNC SUMMARY")
-    print(f"{'='*60}")
+    print(f"{'=' * 60}")
     print(f"Successful: {len(results['success'])}")
     print(f"Failed: {len(results['failed'])}")
 
@@ -491,18 +479,12 @@ def sync_all_teams(dry_run=False):
 
 
 def main():
-    parser = argparse.ArgumentParser(
-        description="Sync GitHub team membership to Slack user groups"
+    parser = argparse.ArgumentParser(description="Sync GitHub team membership to Slack user groups")
+    parser.add_argument(
+        "--dry-run", action="store_true", help="Show what would be done without making changes"
     )
     parser.add_argument(
-        "--dry-run",
-        action="store_true",
-        help="Show what would be done without making changes",
-    )
-    parser.add_argument(
-        "--list",
-        action="store_true",
-        help="List all configured team-to-usergroup mappings",
+        "--list", action="store_true", help="List all configured team-to-usergroup mappings"
     )
 
     args = parser.parse_args()

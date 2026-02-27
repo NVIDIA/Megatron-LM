@@ -45,7 +45,6 @@ def make_test_packed_padded_seq_params(sequence_length):
 
 
 class TestParallelAttentionWithPackedSequence:
-
     def setup_method(self, method):
         Utils.initialize_model_parallel(1, 1)
         model_parallel_cuda_manual_seed(123)
@@ -75,7 +74,6 @@ class TestParallelAttentionWithPackedSequence:
         pass
 
     def test_gpu_forward(self):
-
         config = self.parallel_attention.config
         sequence_length = 32
         micro_batch_size = 1
@@ -171,9 +169,7 @@ class TestParallelAttentionWithPackedSequence:
 
 # Note: this test requires TE >= 1.8 as well as cuDNN FusedAttention to run
 class TestParallelAttentionWithPackedPaddedSequence(TestParallelAttentionWithPackedSequence):
-
     def test_gpu_forward(self):
-
         config = self.parallel_attention.config
         sequence_length = 128
         micro_batch_size = 1

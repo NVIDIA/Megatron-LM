@@ -35,7 +35,7 @@ from megatron.core.utils import (
 )
 
 try:
-    import transformer_engine  # pylint: disable=unused-import
+    import transformer_engine  # noqa: F401
 
     HAVE_TE = True
 except ImportError:
@@ -344,7 +344,6 @@ class MLP(MegatronModule):
 
         return output, output_bias
 
-    # pylint: disable=missing-function-docstring
     def sharded_state_dict(
         self, prefix: str = "", sharded_offsets: tuple = (), metadata: Optional[dict] = None
     ) -> ShardedStateDict:
@@ -367,7 +366,6 @@ class MLP(MegatronModule):
         self.linear_fc1.backward_dw()
 
 
-# pylint: disable=missing-function-docstring
 def apply_swiglu_sharded_factory(
     original_sh_ten, sharded_offsets, singleton_local_shards: bool = False
 ):

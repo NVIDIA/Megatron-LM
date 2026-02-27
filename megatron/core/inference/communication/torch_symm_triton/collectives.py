@@ -106,9 +106,9 @@ def multimem_all_gather(
     assert output_tensor.dtype == torch.bfloat16, "Only bfloat16 is supported for now."
     numel_per_thread = 128 // (input_tensor.element_size() * 8)
 
-    assert (
-        output_tensor.numel() % numel_per_thread == 0
-    ), "The number of elements must be 128-bit aligned."
+    assert output_tensor.numel() % numel_per_thread == 0, (
+        "The number of elements must be 128-bit aligned."
+    )
 
     num_threads = triton.cdiv(output_tensor.numel() // numel_per_thread, symm_mem_hdl.world_size)
     num_blocks = min(triton.cdiv(num_threads, config["BLOCK_SIZE"]), config["max_num_blocks"])
@@ -209,9 +209,9 @@ def multimem_reduce_scatter(
     assert output_tensor.dtype == torch.bfloat16, "Only bfloat16 is supported for now."
     numel_per_thread = 128 // (output_tensor.element_size() * 8)
 
-    assert (
-        input_tensor.numel() % numel_per_thread == 0
-    ), "The number of elements must be 128-bit aligned."
+    assert input_tensor.numel() % numel_per_thread == 0, (
+        "The number of elements must be 128-bit aligned."
+    )
 
     num_threads = triton.cdiv(input_tensor.numel() // numel_per_thread, symm_mem_hdl.world_size)
     num_blocks = min(triton.cdiv(num_threads, config["BLOCK_SIZE"]), config["max_num_blocks"])

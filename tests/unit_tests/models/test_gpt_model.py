@@ -30,7 +30,6 @@ from tests.unit_tests.test_utilities import Utils
 
 
 class TestGPTModel:
-
     def setup_method(self, method):
         os.environ.pop('NVTE_FUSED_ATTN', None)
         os.environ.pop('NVTE_FLASH_ATTN', None)
@@ -42,7 +41,7 @@ class TestGPTModel:
             hidden_size=12,
             num_attention_heads=4,
             use_cpu_initialization=True,
-            embedding_init_method_std=1.0,  # Test that we can initialize the embedding weights to something else.
+            embedding_init_method_std=1.0,  # Test that we can initialize the embedding weights to something else.  # noqa: E501
         )
         self.gpt_model = GPTModel(
             config=transformer_config,
@@ -79,7 +78,7 @@ class TestGPTModel:
         assert self.gpt_model.decoder.input_tensor.shape[2] == config.hidden_size
 
     def test_embedding_init(self):
-        """Test that we can initialize the embedding weights to something else. This test could be added to any model."""
+        """Test that we can initialize the embedding weights to something else. This test could be added to any model."""  # noqa: E501
         config: TransformerConfig = self.gpt_model.config
         assert self.gpt_model.embedding.word_embeddings.weight.std().cpu().item() == approx(
             config.embedding_init_method_std, abs=1e-1
@@ -138,18 +137,18 @@ def test_get_mlp_module_spec_interface():
     # Check expected parameters are in function signature
     for param_name, param_kind in expected_params.items():
         assert param_name in sig.parameters, f"Unexpected parameter: {param_name}"
-        assert (
-            param_kind is sig.parameters[param_name].kind
-        ), f"Wrong kind for parameter: {param_name}"
+        assert param_kind is sig.parameters[param_name].kind, (
+            f"Wrong kind for parameter: {param_name}"
+        )
 
     # Check default values
     sig_defaults = {
         k: v.default for k, v in sig.parameters.items() if v.default is not inspect.Parameter.empty
     }
     for k, v in expected_defaults.items():
-        assert (
-            k in sig_defaults and v == sig_defaults[k]
-        ), f"Default value of {sig_defaults[k]} does not match the expected value of {v} for parameter {k}."
+        assert k in sig_defaults and v == sig_defaults[k], (
+            f"Default value of {sig_defaults[k]} does not match the expected value of {v} for parameter {k}."  # noqa: E501
+        )
 
 
 @pytest.mark.skipif(
@@ -273,10 +272,10 @@ class TestGPTModelWithCustomPG:
         reason="Device mesh feature requires PyTorch 2.3 or later",
     )
     @pytest.mark.parametrize(
-        "tp_size, dp_size, cp_size", [(1, 8, 1), (2, 4, 1)]  # TP 1, DP 8, CP 1  # TP 2, DP 4, CP 1
+        "tp_size, dp_size, cp_size",
+        [(1, 8, 1), (2, 4, 1)],  # TP 1, DP 8, CP 1  # TP 2, DP 4, CP 1
     )
     def test_gpt_model_with_custom_pg(self, tp_size, dp_size, cp_size):
-
         # Create HyperCommGrid with dimensions tp, cp, ep, pp, dp (reversed from device mesh order)
         grid = HyperCommGrid([tp_size, cp_size, 1, 1, dp_size], ["tp", "cp", "ep", "pp", "dp"])
 

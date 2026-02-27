@@ -6,12 +6,14 @@ import math
 
 import torch
 
-from megatron.training import get_args
-from megatron.legacy.model import LayerNorm, RMSNorm
 from megatron.core.jit import jit_fuser
+from megatron.legacy.model import LayerNorm, RMSNorm
+from megatron.training import get_args
+
 
 def init_method_normal(sigma):
     """Init method based on N(0, sigma)."""
+
     def init_(tensor):
         return torch.nn.init.normal_(tensor, mean=0.0, std=sigma)
 
@@ -46,17 +48,19 @@ def get_linear_layer(rows, columns, init_method):
 @jit_fuser
 def gelu_impl(x):
     """OpenAI's gelu implementation."""
-    return 0.5 * x * (1.0 + torch.tanh(0.7978845608028654 * x *
+    return 0.5 * x * (1.0 + torch.tanh(0.7978845608028654 * x * (1.0 + 0.044715 * x * x)))
 
-                                       (1.0 + 0.044715 * x * x)))
+
 def openai_gelu(x):
     return gelu_impl(x)
 
 
-#This is actually Python equivalent of torch.nn.functional.gelu(), also with type hints for ONNX exporter
+# This is actually Python equivalent of torch.nn.functional.gelu(), also with type hints for ONNX exporter  # noqa: E501
 @jit_fuser
 def erf_gelu(x):
-    return x * 0.5 * (torch.erf(x / 1.41421).to(dtype=x.dtype)+torch.ones_like(x).to(dtype=x.dtype))
+    return (
+        x * 0.5 * (torch.erf(x / 1.41421).to(dtype=x.dtype) + torch.ones_like(x).to(dtype=x.dtype))
+    )
 
 
 def get_norm(config):
@@ -67,13 +71,18 @@ def get_norm(config):
             eps=config.layernorm_epsilon,
             no_persist_layer_norm=not config.persist_layer_norm,
             sequence_parallel=config.sequence_parallel,
-            apply_layernorm_1p=args.apply_layernorm_1p)
+            apply_layernorm_1p=args.apply_layernorm_1p,
+        )
     elif args.normalization == "RMSNorm":
         if args.apply_layernorm_1p:
-            raise NotImplementedError('RMSNorm does not currently support the layernorm_1p formulation.')
+            raise NotImplementedError(
+                'RMSNorm does not currently support the layernorm_1p formulation.'
+            )
 
-        return RMSNorm(dim=config.hidden_size,
-                       eps=config.layernorm_epsilon,
-                       sequence_parallel=config.sequence_parallel)
+        return RMSNorm(
+            dim=config.hidden_size,
+            eps=config.layernorm_epsilon,
+            sequence_parallel=config.sequence_parallel,
+        )
     else:
         raise Exception(f"unsupported norm type '{args.normalization}'.")

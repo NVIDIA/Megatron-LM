@@ -1,7 +1,9 @@
 import argparse
 import json
 import subprocess
+
 import nltk
+
 nltk.download("wordnet")
 
 from .evaluate_mmmu import get_input_output_paths
@@ -74,10 +76,7 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--input-path", type=str, required=True, help="Path to input file(s)")
     parser.add_argument(
-        "--groundtruth-path",
-        type=str,
-        required=True,
-        help="Path to groundtruth file",
+        "--groundtruth-path", type=str, required=True, help="Path to groundtruth file"
     )
     parser.add_argument(
         "--output-path",

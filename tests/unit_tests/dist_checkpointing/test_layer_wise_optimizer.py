@@ -1,6 +1,5 @@
 # Copyright (c) 2025, NVIDIA CORPORATION. All rights reserved.
 
-from copy import deepcopy
 from functools import partial
 from unittest import mock
 
@@ -25,7 +24,6 @@ from megatron.training.arguments import parse_args
 from megatron.training.checkpointing import load_checkpoint, save_checkpoint
 from tests.unit_tests.dist_checkpointing import (
     TempNamedDir,
-    init_basic_mock_args,
     init_checkpointing_mock_args,
     initialize_gpt_model,
     setup_model_and_optimizer,

@@ -59,9 +59,9 @@ class LayerWiseDistributedOptimizer(ChainedOptimizer):
         self.pg_collection = pg_collection
         self.shard_params(optimizers)
         if init_state_fn_list:
-            assert len(init_state_fn_list) == len(
-                optimizers
-            ), "init_state_fn_list must be the same length as optimizers if provided"
+            assert len(init_state_fn_list) == len(optimizers), (
+                "init_state_fn_list must be the same length as optimizers if provided"
+            )
 
         # wrap optimizer after sharding to avoid unnecessary master weight creation
         # for higher precision, optimizers are wrapped with megatron already
@@ -259,9 +259,9 @@ class LayerWiseDistributedOptimizer(ChainedOptimizer):
         # for fixed DP usage only
         for sh_base in nested_values(sharded_state_dict):
             if hasattr(sh_base, 'replica_id'):
-                assert (
-                    isinstance(sh_base.replica_id, int) or len(sh_base.replica_id) == 3
-                ), f'Expected replica_id as int or (PP, TP, DP), got: {sh_base}'
+                assert isinstance(sh_base.replica_id, int) or len(sh_base.replica_id) == 3, (
+                    f'Expected replica_id as int or (PP, TP, DP), got: {sh_base}'
+                )
                 sh_base.replica_id = (
                     0 if isinstance(sh_base.replica_id, int) else (*sh_base.replica_id[:2], 0)
                 )

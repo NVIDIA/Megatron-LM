@@ -1,6 +1,7 @@
 # Copyright (c) 2025, NVIDIA CORPORATION. All rights reserved.
 
 """Export a GPTModel."""
+
 import functools
 import os
 import sys
@@ -79,7 +80,6 @@ if __name__ == "__main__":
         _ = load_modelopt_checkpoint(model)
     else:
         raise ValueError(f"Invalid load checkpoint directory: {args.load}")
-
 
     # Decide whether we are exporting only the extra_modules (e.g. EAGLE3).
     # Only the last pp stage may have extra_modules, hence broadcast from the last rank.

@@ -5,8 +5,6 @@ import torch
 
 from megatron.core.jit import jit_fuser
 
-# pylint: disable=missing-function-docstring
-
 
 def _bias_dropout_add_func(x_with_bias, residual, prob, training):
     # type: (Tuple[Tensor, Optional[Tensor]], Tensor, float, bool) -> Tensor

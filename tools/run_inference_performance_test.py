@@ -176,9 +176,9 @@ def main():
     model = model[0]
     model.eval()
 
-    assert (args.prompts is None) ^ (
-        args.num_input_tokens is None
-    ), "Exactly one of `--prompts` and `--num-prompt-tokens` must be specified"
+    assert (args.prompts is None) ^ (args.num_input_tokens is None), (
+        "Exactly one of `--prompts` and `--num-prompt-tokens` must be specified"
+    )
 
     inference_engine = get_inference_engine(args, model)
 
@@ -221,7 +221,7 @@ def main():
 
     # TODO(ksanthanam): Use a command line argument for warmup iterations
     for i in range(3):
-        print(f"Running warmup iteration {i+1}...")
+        print(f"Running warmup iteration {i + 1}...")
         warmup_sampling_params = SamplingParams(num_tokens_to_generate=10, termination_id=-1)
         inference_engine.generate(prompts=["warmup"], sampling_params=warmup_sampling_params)
 

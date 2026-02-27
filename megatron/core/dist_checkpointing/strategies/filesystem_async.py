@@ -115,9 +115,9 @@ class FileSystemWriterAsync(FileSystemWriter):
         start = time()
         logger.debug(f"thread_count: {self.thread_count}, time: {start}")
         if self.separation_hint:
-            assert (
-                self.thread_count > 1
-            ), "thread_count must be at least 2 if separation_hint is provided"
+            assert self.thread_count > 1, (
+                "thread_count must be at least 2 if separation_hint is provided"
+            )
         bins = self.thread_count // 2 if self.separation_hint is not None else self.thread_count
         item_buckets = _split_by_size_and_type(bins, plan.items)
         logger.debug(f"bucket_prep, time: {time() - start}")

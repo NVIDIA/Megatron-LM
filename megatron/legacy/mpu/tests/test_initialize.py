@@ -1,20 +1,24 @@
 # Copyright (c) 2022, NVIDIA CORPORATION. All rights reserved.
 
-from commons import print_separator
-from commons import initialize_distributed
+import sys
+
 import mpu
 import torch
-import sys
+from commons import initialize_distributed, print_separator
+
 sys.path.append("../..")
 
 
 def test_initialize_model_parallel(tensor_model_parallel_size):
-
     if torch.distributed.get_rank() == 0:
-        print('> testing initialize_model_parallel with size {} ...'.format(
-            tensor_model_parallel_size))
-    tensor_model_parallel_size_ = min(tensor_model_parallel_size,
-                               torch.distributed.get_world_size())
+        print(
+            '> testing initialize_model_parallel with size {} ...'.format(
+                tensor_model_parallel_size
+            )
+        )
+    tensor_model_parallel_size_ = min(
+        tensor_model_parallel_size, torch.distributed.get_world_size()
+    )
     assert not mpu.model_parallel_is_initialized()
     mpu.initialize_model_parallel(tensor_model_parallel_size_)
     assert mpu.model_parallel_is_initialized()
@@ -47,12 +51,15 @@ def test_initialize_model_parallel(tensor_model_parallel_size):
 
 
 def test_get_tensor_model_parallel_src_rank(tensor_model_parallel_size_):
-
     if torch.distributed.get_rank() == 0:
-        print('> testing get_tensor_model_parallel_src_rank with size {} ...'.format(
-            tensor_model_parallel_size_))
-    tensor_model_parallel_size = min(tensor_model_parallel_size_,
-                              torch.distributed.get_world_size())
+        print(
+            '> testing get_tensor_model_parallel_src_rank with size {} ...'.format(
+                tensor_model_parallel_size_
+            )
+        )
+    tensor_model_parallel_size = min(
+        tensor_model_parallel_size_, torch.distributed.get_world_size()
+    )
     assert not mpu.model_parallel_is_initialized()
     mpu.initialize_model_parallel(tensor_model_parallel_size)
     assert mpu.model_parallel_is_initialized()
@@ -70,7 +77,6 @@ def test_get_tensor_model_parallel_src_rank(tensor_model_parallel_size_):
 
 
 if __name__ == '__main__':
-
     initialize_distributed()
     world_size = torch.distributed.get_world_size()
     tensor_model_parallel_size = 1

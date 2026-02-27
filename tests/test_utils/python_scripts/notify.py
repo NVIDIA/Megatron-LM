@@ -4,7 +4,6 @@ import os
 import click
 import gitlab
 import pandas as pd
-import requests
 import slack_sdk
 
 PROJECT_ID = int(os.getenv("CI_PROJECT_ID", 19378))
@@ -72,17 +71,16 @@ def main(pipeline_id: int, check_for: str, pipeline_context: str, pipeline_creat
     messages = []
 
     for bridge_name in bridges.keys():
-
         total_num_jobs = len(bridges[bridge_name])
         if all(job.status == "success" for job in bridges[bridge_name]):
             messages.append(
-                f":doge3d: <https://{GITLAB_ENDPOINT}/ADLR/megatron-lm/-/pipelines/{pipeline_id}|Report - {pipeline_created_at_day} - {pipeline_context} - {bridge_name}>: All {total_num_jobs} passed."
+                f":doge3d: <https://{GITLAB_ENDPOINT}/ADLR/megatron-lm/-/pipelines/{pipeline_id}|Report - {pipeline_created_at_day} - {pipeline_context} - {bridge_name}>: All {total_num_jobs} passed."  # noqa: E501
             )
             continue
 
         unsuccessful_jobs = [job for job in bridges[bridge_name] if job.status != "success"]
         messages.append(
-            f":doctorge: <https://{GITLAB_ENDPOINT}/ADLR/megatron-lm/-/pipelines/{pipeline_id}|Report - {pipeline_created_at_day} - {pipeline_context} - {bridge_name}>: {len(unsuccessful_jobs)} of {total_num_jobs} failed."
+            f":doctorge: <https://{GITLAB_ENDPOINT}/ADLR/megatron-lm/-/pipelines/{pipeline_id}|Report - {pipeline_created_at_day} - {pipeline_context} - {bridge_name}>: {len(unsuccessful_jobs)} of {total_num_jobs} failed."  # noqa: E501
         )
         if TAG_TEAM:
             messages.append(f"cc {TEAM_SLUG}: Critical event, please react as soon as possible.")

@@ -1,5 +1,4 @@
 # Copyright (c) 2025, NVIDIA CORPORATION. All rights reserved.
-import pytest
 
 from megatron.core.resharding.nvshmem_copy_service.nvshmem_types import ScheduledBatch
 from megatron.core.resharding.nvshmem_copy_service.planning.communication_scheduler import (
@@ -119,12 +118,12 @@ class TestCommunicationScheduler:
             used_pes = set()
             for batch in iter_batches:
                 # No PE should be used twice in same iteration
-                assert (
-                    batch.src_pe not in used_pes
-                ), f"PE {batch.src_pe} used twice in iteration {iteration}"
-                assert (
-                    batch.dest_pe not in used_pes
-                ), f"PE {batch.dest_pe} used twice in iteration {iteration}"
+                assert batch.src_pe not in used_pes, (
+                    f"PE {batch.src_pe} used twice in iteration {iteration}"
+                )
+                assert batch.dest_pe not in used_pes, (
+                    f"PE {batch.dest_pe} used twice in iteration {iteration}"
+                )
                 used_pes.add(batch.src_pe)
                 used_pes.add(batch.dest_pe)
 

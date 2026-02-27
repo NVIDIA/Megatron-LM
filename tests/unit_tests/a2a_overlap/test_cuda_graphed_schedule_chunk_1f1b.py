@@ -373,7 +373,7 @@ class TestPartialCudaGraphedA2AOverlap:
             )
             assert len(loss_list) == len(loss_list_ref)
             for i in range(len(loss_list)):
-                assert torch.equal(
-                    loss_list[i].mean(), loss_list_ref[i].mean()
-                ), f"scope={cuda_graph_scope}, i={i},loss_list={loss_list[i]}, loss_list_ref={loss_list_ref[i]}"
+                assert torch.equal(loss_list[i].mean(), loss_list_ref[i].mean()), (
+                    f"scope={cuda_graph_scope}, i={i},loss_list={loss_list[i]}, loss_list_ref={loss_list_ref[i]}"  # noqa: E501
+                )
             print(f"[DEBUG] Pass {cuda_graph_scope}")

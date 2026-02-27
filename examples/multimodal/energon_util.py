@@ -1,8 +1,9 @@
 # Copyright (c) 2024, NVIDIA CORPORATION.  All rights reserved.
-import torch
 import warnings
 from dataclasses import dataclass
 from typing import Any, List
+
+import torch
 
 from megatron.energon import Sample
 from megatron.energon.epathlib.epath import EPath

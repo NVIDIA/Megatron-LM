@@ -1,7 +1,8 @@
 # Copyright (c) 2025, NVIDIA CORPORATION. All rights reserved.
 
 import torch
-from transformers import WhisperConfig, WhisperModel
+from transformers import WhisperModel
+
 
 class HFWhisperEncoderWrapper(torch.nn.Module):
     """Whisper audio encoder wrapper that extracts last_hidden_state."""

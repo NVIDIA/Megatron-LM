@@ -40,7 +40,7 @@ from megatron.core.typed_torch import copy_signature
 from megatron.core.utils import is_te_min_version
 
 try:
-    import transformer_engine as te  # type: ignore[import-untyped]  # pylint: disable=unused-import
+    import transformer_engine as te  # type: ignore[import-untyped]  # noqa: F401
 
     from megatron.core.extensions.transformer_engine import TEFusedMLP, TENorm
     from megatron.core.extensions.transformer_engine_spec_provider import TESpecProvider
@@ -56,7 +56,7 @@ except ImportError:
     HAVE_KITCHEN = False
 
 try:
-    import apex  # type: ignore[import-untyped]  # pylint: disable=unused-import
+    import apex  # type: ignore[import-untyped]  # noqa: F401
 
     from megatron.core.fusions.fused_layer_norm import FusedLayerNorm
 
@@ -175,7 +175,7 @@ def get_gpt_layer_with_transformer_engine_submodules(
     moe_grouped_gemm: Optional[bool] = False,
     qk_layernorm: Optional[bool] = False,
     multi_latent_attention: Optional[bool] = False,
-    fp8: Optional[str] = None,  # pylint: disable=unused-argument
+    fp8: Optional[str] = None,
     moe_use_legacy_grouped_gemm: Optional[bool] = False,
     qk_l2_norm: Optional[bool] = False,
     use_te_op_fuser: Optional[bool] = False,
@@ -314,7 +314,7 @@ def get_gpt_layer_local_submodules(
     moe_grouped_gemm: Optional[bool] = False,
     qk_layernorm: Optional[bool] = False,
     multi_latent_attention: Optional[bool] = False,
-    fp8: Optional[str] = None,  # pylint: disable=unused-argument
+    fp8: Optional[str] = None,
     moe_use_legacy_grouped_gemm: Optional[bool] = False,
     normalization: Optional[str] = None,
     qk_l2_norm: Optional[bool] = False,
@@ -434,7 +434,7 @@ def _get_mlp_module_spec(
     use_te: Optional[bool] = True,
     num_experts: Optional[int] = None,
     moe_grouped_gemm: Optional[bool] = False,
-    fp8: Optional[str] = None,  # pylint: disable=unused-argument
+    fp8: Optional[str] = None,
     moe_use_legacy_grouped_gemm: Optional[bool] = False,
 ):
     warnings.warn(
@@ -455,7 +455,7 @@ def get_mlp_module_spec(
     use_te: Optional[bool] = True,
     num_experts: Optional[int] = None,
     moe_grouped_gemm: Optional[bool] = False,
-    fp8: Optional[str] = None,  # pylint: disable=unused-argument
+    fp8: Optional[str] = None,
     moe_use_legacy_grouped_gemm: Optional[bool] = False,
     use_te_op_fuser: Optional[bool] = False,
 ) -> ModuleSpec:
@@ -721,9 +721,9 @@ def get_gpt_mtp_block_spec_for_backend(
     # split the mtp layer specs to only include the layers that are built in this pipeline stage.
     mtp_layer_specs = mtp_layer_specs[offset : offset + num_layers_to_build]
     if len(mtp_layer_specs) > 0:
-        assert (
-            len(mtp_layer_specs) == config.mtp_num_layers
-        ), f"currently all of the mtp layers must stage in the same pipeline stage."
+        assert len(mtp_layer_specs) == config.mtp_num_layers, (
+            f"currently all of the mtp layers must stage in the same pipeline stage."
+        )
         mtp_block_spec = MultiTokenPredictionBlockSubmodules(layer_specs=mtp_layer_specs)
     else:
         mtp_block_spec = None

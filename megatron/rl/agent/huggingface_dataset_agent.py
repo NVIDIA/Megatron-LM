@@ -12,8 +12,10 @@ class HFDatasetAgent(BaseModel):
     depending on which initialization argument is provided.
 
     Attributes:
-        dataset_file (str | None): Path to a local dataset file directory. If provided, loads dataset from here.
-        hf_dataset_name (str | None): Name of the HuggingFace dataset to load from the hub, if no file provided.
+        dataset_file (str | None): Path to a local dataset file
+            directory. If provided, loads dataset from here.
+        hf_dataset_name (str | None): Name of the HuggingFace dataset
+            to load from the hub, if no file provided.
     """
 
     dataset_file: str | None = None

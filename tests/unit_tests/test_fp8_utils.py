@@ -2,7 +2,6 @@
 
 from unittest.mock import Mock, patch
 
-import pytest
 import torch
 import torch.nn as nn
 
@@ -22,7 +21,6 @@ class MockTELinear(nn.Module):
 
 
 class TestFP8Padding:
-
     def setup_method(self, method):
         Utils.initialize_model_parallel(1, 1)
         # Clear the wrapped modules set before each test
@@ -47,7 +45,6 @@ class TestFP8Padding:
             patch.object(fp8_utils, 'Fp8Unpadding'),
             patch.object(fp8_utils, 'TE_LINEAR_TYPES', (MockTELinear,)),
         ):
-
             model = SimpleModel()
             original_te_forward = model.te_layer.forward
             original_regular_forward = model.regular_layer.forward
@@ -73,7 +70,6 @@ class TestFP8Padding:
             patch.object(fp8_utils, 'Fp8Padding') as mock_pad_class,
             patch.object(fp8_utils, 'Fp8Unpadding') as mock_unpad_class,
         ):
-
             # Setup padding mock to pad from 6 to 16
             mock_pad_instance = Mock()
             mock_pad_instance.return_value = (torch.zeros(16, 8192), [16])

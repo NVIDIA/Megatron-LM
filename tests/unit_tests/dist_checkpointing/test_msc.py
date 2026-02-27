@@ -19,7 +19,6 @@ from tests.unit_tests.test_utilities import Utils
 
 
 class TestSerializationWithMultiStorageClient:
-
     def setup_method(self, method):
         MultiStorageClientFeature.enable()
 

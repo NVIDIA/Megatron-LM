@@ -4,7 +4,6 @@ import logging
 import os
 import re
 import time
-from typing import Literal
 
 import click
 import gitlab
@@ -25,7 +24,7 @@ def get_gitlab_handle():
 
 
 def ci_is_busy(pipeline, target_branch: str):
-    """List all merge request pipelines created before the given pipeline that are still pending or running."""
+    """List all merge request pipelines created before the given pipeline that are still pending or running."""  # noqa: E501
     mr_pipelines = (
         get_gitlab_handle()
         .projects.get(PROJECT_ID)
@@ -52,7 +51,7 @@ def ci_is_busy(pipeline, target_branch: str):
             and p.attributes["status"] in ("pending", "running")
         ]
     )
-    logger.info(f"Position in queue: {in_queue+1}. Waiting for resources...")
+    logger.info(f"Position in queue: {in_queue + 1}. Waiting for resources...")
     return in_queue > NUM_CONCURRENT_JOBS
 
 

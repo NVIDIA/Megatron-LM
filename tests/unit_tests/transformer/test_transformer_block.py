@@ -24,7 +24,6 @@ from tests.unit_tests.test_utilities import Utils
 
 
 class TestParallelTransformerBlock:
-
     def setup_method(self, method):
         Utils.initialize_model_parallel(1, 1)
         model_parallel_cuda_manual_seed(123)
@@ -407,9 +406,9 @@ class TestPipelineParallelTransformerBlock:
                     num_layers_to_build = get_num_layers_to_build(transformer_config, pp_rank=i)
                     total_build_layers += num_layers_to_build
         if not should_assert_error:
-            assert (
-                total_build_layers == num_layers
-            ), f"total build layers {total_build_layers} should be equal to num_layers {num_layers}"
+            assert total_build_layers == num_layers, (
+                f"total build layers {total_build_layers} should be equal to num_layers {num_layers}"  # noqa: E501
+            )
         Utils.destroy_model_parallel()
 
 
@@ -662,9 +661,9 @@ class TestPipelineParallelLayoutTransformerBlock:
                 for j in range(vpp_size):
                     total_build_layers += get_num_layers_to_build(transformer_config, vp_stage=j)
         if not should_assert_error:
-            assert (
-                total_build_layers == num_layers
-            ), f"total build layers {total_build_layers} should be equal to num_layers {num_layers}"
+            assert total_build_layers == num_layers, (
+                f"total build layers {total_build_layers} should be equal to num_layers {num_layers}"  # noqa: E501
+            )
         parallel_state.set_pipeline_model_parallel_world_size(None)
         parallel_state.set_virtual_pipeline_model_parallel_world_size(None)
 
@@ -733,12 +732,12 @@ class TestPipelineParallelLayoutTransformerBlock:
             layers = gpt_model[vpp_rank].decoder.layers
             layer_numbers = [l.layer_number for l in layers]
             golden_answer_curr_stage = layer_number_golden_answer[pp_rank][vpp_rank]
-            assert len(layers) == len(
-                golden_answer_curr_stage
-            ), f"{pp_rank=}, {vpp_rank=}, {len(layers)=}, {len(golden_answer_curr_stage)=}"
-            assert (
-                layer_numbers == golden_answer_curr_stage
-            ), f"{pp_rank=}, {vpp_rank=}, {layer_numbers=}, {golden_answer_curr_stage=}"
+            assert len(layers) == len(golden_answer_curr_stage), (
+                f"{pp_rank=}, {vpp_rank=}, {len(layers)=}, {len(golden_answer_curr_stage)=}"
+            )
+            assert layer_numbers == golden_answer_curr_stage, (
+                f"{pp_rank=}, {vpp_rank=}, {layer_numbers=}, {golden_answer_curr_stage=}"
+            )
         Utils.destroy_model_parallel()
 
     @pytest.mark.parametrize(
@@ -802,9 +801,9 @@ class TestPipelineParallelLayoutTransformerBlock:
         repr_result = repr(layout)
 
         # Assert that repr returns a string
-        assert isinstance(
-            repr_result, str
-        ), f"__repr__ must return a string, but got {type(repr_result).__name__}"
+        assert isinstance(repr_result, str), (
+            f"__repr__ must return a string, but got {type(repr_result).__name__}"
+        )
 
         # Assert that the returned string matches the expected value
         if isinstance(input_layout, str):

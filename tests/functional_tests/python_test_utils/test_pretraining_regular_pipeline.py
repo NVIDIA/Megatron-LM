@@ -49,7 +49,7 @@ def test_regular_pipeline(
             > 0
         ):
             logger.error(
-                f"The following metrics are required but not provided in golden values: {', '.join(missing_metrics)}"
+                f"The following metrics are required but not provided in golden values: {', '.join(missing_metrics)}"  # noqa: E501
             )
             assert False
 

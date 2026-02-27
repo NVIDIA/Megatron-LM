@@ -14,7 +14,6 @@ from megatron.core.inference.model_inference_wrappers.gpt.gpt_inference_wrapper 
 )
 
 
-# pylint: disable=line-too-long
 class VLMInferenceWrapper(GPTInferenceWrapper):
     """Inference wrapper for VLMs"""
 
@@ -94,12 +93,17 @@ class VLMInferenceWrapper(GPTInferenceWrapper):
     ) -> Dict[str, Any]:
         """Returns the inference data given context window
 
-        This function gets called iteratively in a loop . Given the start and end context positions , it extracts the appropriate data.
+        This function gets called iteratively in a loop. Given the
+        start and end context positions, it extracts the appropriate data.
 
         Args:
-            inference_input (Dict[str, Any]): The inference input for the batch.
-            context_start_position (int): Start of the context window. During the first inference step it is mostly 0
-            context_end_position (int): End of the context window. During the last inference step it will mostly be the max generated sequence length.
+            inference_input (Dict[str, Any]): The inference input
+                for the batch.
+            context_start_position (int): Start of the context window.
+                During the first inference step it is mostly 0
+            context_end_position (int): End of the context window.
+                During the last inference step it will mostly be the
+                max generated sequence length.
 
         Returns:
             Dict[str, Any]: A dict of inputs that will be used by your model in the forward step

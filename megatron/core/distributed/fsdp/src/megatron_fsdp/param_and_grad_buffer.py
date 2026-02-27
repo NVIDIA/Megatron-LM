@@ -692,9 +692,9 @@ class FixedPoolAllocator(TemporaryBucketAllocator):
         # --- Fixed Pool Buffering Check ---
         # Ensure there is at least one group of FSDP units eligible for fixed pool buffering.
         # If not, the allocator cannot provide its intended memory recycling benefits.
-        assert (
-            len(fsdp_units_to_double_buffer) > 0
-        ), "Found no FSDP units to use fixed-size buffering"
+        assert len(fsdp_units_to_double_buffer) > 0, (
+            "Found no FSDP units to use fixed-size buffering"
+        )
         self.fsdp_double_buffer_units = fsdp_units_to_double_buffer
 
         if torch.distributed.get_rank() == 0:
@@ -903,15 +903,15 @@ class DataParallelBuffer:
         # Setup the item index map, bucket index, and shard bucket index from
         # the provided arguments, or build them if not provided.
         if item_index_map or bucket_index or shard_bucket_index:
-            assert (
-                item_index_map is not None
-            ), "item_index_map must be provided if bucket_index or shard_bucket_index is provided"
-            assert (
-                bucket_index is not None
-            ), "bucket_index must be provided if item_index_map or shard_bucket_index is provided"
-            assert (
-                shard_bucket_index is not None
-            ), "shard_bucket_index must be provided if item_index_map or bucket_index is provided"
+            assert item_index_map is not None, (
+                "item_index_map must be provided if bucket_index or shard_bucket_index is provided"
+            )
+            assert bucket_index is not None, (
+                "bucket_index must be provided if item_index_map or shard_bucket_index is provided"
+            )
+            assert shard_bucket_index is not None, (
+                "shard_bucket_index must be provided if item_index_map or bucket_index is provided"
+            )
             self.item_index_map = item_index_map
             self.bucket_index = bucket_index
             self.shard_bucket_index = shard_bucket_index
@@ -943,9 +943,9 @@ class DataParallelBuffer:
         (shard of) the buffer.
         """
         assert data.dtype == self.dtype, f"Data type mismatch: {data.dtype} != {self.dtype}"
-        assert (
-            data.numel() == self.data_size
-        ), f"Data size mismatch: {data.numel()} != {self.data_size}"
+        assert data.numel() == self.data_size, (
+            f"Data size mismatch: {data.numel()} != {self.data_size}"
+        )
         self.data = data
 
     def fetch_bucket(
@@ -1676,14 +1676,14 @@ class ParamAndGradBuffer:
                 log_single_rank(
                     logger,
                     logging.INFO,
-                    f"Group [{i+1}/{len(self.ubr_groups)}] "
+                    f"Group [{i + 1}/{len(self.ubr_groups)}] "
                     f"group.group_desc: {group.group_desc}, group.size(): {group.size()}",
                 )
                 torch.distributed.barrier(group=group, async_op=False)
                 log_single_rank(
                     logger,
                     logging.INFO,
-                    f"Call Success with the group [{i+1}/{len(self.ubr_groups)}] "
+                    f"Call Success with the group [{i + 1}/{len(self.ubr_groups)}] "
                     f"group.group_desc: {group.group_desc}",
                 )
             # Call barrier from the global communitcator group
@@ -2060,9 +2060,9 @@ class ParamAndGradBuffer:
 
             # Initialize the main grad buffer.
             if should_create_grad_buffer_or_main_weight_buffer:
-                assert (
-                    grad_reduce_in_fp32 or grad_dtype is not torch.uint8
-                ), "Gradients can not be reduced in FP8. "
+                assert grad_reduce_in_fp32 or grad_dtype is not torch.uint8, (
+                    "Gradients can not be reduced in FP8. "
+                )
                 group.main_grad_buffer = DataParallelBuffer(
                     self.ddp_config,
                     # Proxy because the number of gradient parameters is the same
@@ -2197,8 +2197,7 @@ class ParamAndGradBuffer:
                         )
                         outer_fsdp_group = self.dist_index.get_outer_fsdp_group()
                         wbuf_data = hsdp_wbuf.data[
-                            wbuf.data_size
-                            * outer_fsdp_group.rank() : wbuf.data_size
+                            wbuf.data_size * outer_fsdp_group.rank() : wbuf.data_size
                             * (outer_fsdp_group.rank() + 1)
                         ]
                         wbuf.init_data(wbuf_data)
@@ -2423,8 +2422,7 @@ class ParamAndGradBuffer:
                     hsdp_gbuf.init_data(_alloc(hsdp_gbuf.dtype, hsdp_gbuf.data_size))
                     outer_fsdp_group = self.dist_index.get_outer_fsdp_group()
                     gbuf_data = hsdp_gbuf.data[
-                        gbuf.data_size
-                        * outer_fsdp_group.rank() : gbuf.data_size
+                        gbuf.data_size * outer_fsdp_group.rank() : gbuf.data_size
                         * (outer_fsdp_group.rank() + 1)
                     ]
                     gbuf.init_data(gbuf_data)
@@ -2849,9 +2847,9 @@ class ParamAndGradBuffer:
                         b_model_param = wbuf.get_item_from_bucket(bucket, item_id)[
                             slice(*wbuf.locate_item_in_global_item(item_id))
                         ]
-                        assert (
-                            transpose_param is None
-                        ), "Blockwise FP8 does not support transpose param."
+                        assert transpose_param is None, (
+                            "Blockwise FP8 does not support transpose param."
+                        )
                         shard_model_params.append([b_model_param, None])
                         assert b_model_param.numel() == model_param.numel(), (
                             f"Blockwise FP8 bucket param numel {b_model_param.numel()} does"
@@ -2925,9 +2923,9 @@ class ParamAndGradBuffer:
         assert all(
             [not g.model_weight_buffer.is_data_distributed for g in self.parameter_groups]
         ), "all_gather_parameters() should only be called when parameters are not sharded."
-        assert (
-            self.ddp_config.outer_dp_sharding_strategy == "no_shard"
-        ), "all_gather_parameters() should not be called when outer-DP sharding is enabled."
+        assert self.ddp_config.outer_dp_sharding_strategy == "no_shard", (
+            "all_gather_parameters() should not be called when outer-DP sharding is enabled."
+        )
 
         all_gather_ops = []
         for g in self.parameter_groups:
@@ -2953,12 +2951,12 @@ class ParamAndGradBuffer:
             async_op (bool, optional): Whether to do the all-reduce
                 asynchronously. Defaults to False.
         """
-        assert all(
-            [not g.main_grad_buffer.is_data_distributed for g in self.parameter_groups]
-        ), "reduce_scatter_gradients() should only be called when gradients are not sharded."
-        assert (
-            self.ddp_config.outer_dp_sharding_strategy == "no_shard"
-        ), "reduce_scatter_gradients() should not be called when outer-DP sharding is enabled."
+        assert all([not g.main_grad_buffer.is_data_distributed for g in self.parameter_groups]), (
+            "reduce_scatter_gradients() should only be called when gradients are not sharded."
+        )
+        assert self.ddp_config.outer_dp_sharding_strategy == "no_shard", (
+            "reduce_scatter_gradients() should not be called when outer-DP sharding is enabled."
+        )
 
         reduce_scatter_ops = []
         for g in self.parameter_groups:
@@ -2994,9 +2992,9 @@ class ParamAndGradBuffer:
                 if g.main_grad_buffer
             ]
         ), "all_reduce_gradients() should only be called when gradients are not sharded."
-        assert (
-            self.ddp_config.outer_dp_sharding_strategy == "no_shard"
-        ), "all_reduce_gradients() should not be called when outer-DP sharding is enabled."
+        assert self.ddp_config.outer_dp_sharding_strategy == "no_shard", (
+            "all_reduce_gradients() should not be called when outer-DP sharding is enabled."
+        )
 
         all_reduce_ops = []
         for g in self.parameter_groups:
@@ -3175,9 +3173,9 @@ class GradReducePipeline:
             fsdp_unit_id = param_groups[bucket_id].fsdp_unit_id
             if fsdp_unit_id in self.buffer.double_buf_units:
                 double_buf_units.add(fsdp_unit_id)
-        assert (
-            len(double_buf_units) <= 2
-        ), f"Double buffer limit exceeded. Current double_buf_units: {double_buf_units}."
+        assert len(double_buf_units) <= 2, (
+            f"Double buffer limit exceeded. Current double_buf_units: {double_buf_units}."
+        )
 
         keep_n = len(self.grad_reduce_queue)
         for _, _, bucket_id in reversed(self.grad_reduce_queue):
@@ -3274,7 +3272,6 @@ class GradReducePipeline:
                         # The reduced gradient will be scattered into this shard of the
                         # bucket managed by the sharded buffer on this rank.
                         grad_shard = gbuf.get_shard_from_bucket(bucket)
-                        # pylint: disable=C0301
                         # The `grad_shard`` is part of `bucket.data`` and the following
                         # new empty is important for memory safety, when using
                         # TORCH_NCCL_AVOID_RECORD_STREAMS=1.
@@ -3864,9 +3861,9 @@ class ResetParametersContext:
             # more recent versions of TransformerEngine, which only requires this context during
             # TransformerEngineBaseModule.__init__. Should be removed if backwards compatibility
             # is confirmed, because overwrites the quantized_model_init context specified by user.
-            assert (
-                HAVE_TE
-            ), "TransformerEngine is required for using FP8 parameters with Megatron-FSDP."
+            assert HAVE_TE, (
+                "TransformerEngine is required for using FP8 parameters with Megatron-FSDP."
+            )
             # Retrieve import for quantized_model_init (new) or fp8_model_init (old).
             # Will be nullcontext if TE is not installed.
             te_quantized_model_init_cls = get_quantized_model_init_context_cls()
@@ -4136,7 +4133,7 @@ def make_fsdp_dtensor(
     if is_mcore_tensor_model_parallel(param):
         # Ensure parameter is not already a DTensor
         assert not isinstance(param, DTensor), (
-            "[Megatron-FSDP] Parameter is already a DTensor, yet tensor_model_parallel " "is True."
+            "[Megatron-FSDP] Parameter is already a DTensor, yet tensor_model_parallel is True."
         )
 
         tp_mesh = dist_index.get_submesh(dist_index.tp_dim, is_expert_parallel=is_expert_param)

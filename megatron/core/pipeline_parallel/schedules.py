@@ -212,9 +212,9 @@ def set_current_microbatch(model, microbatch_id):
             layer.current_microbatch = microbatch_id
         if hasattr(model_with_decoder, 'mtp'):
             for layer in model_with_decoder.mtp.layers:
-                assert hasattr(
-                    layer, 'mtp_model_layer'
-                ), f"MTP layer {layer} must have 'mtp_model_layer' attribute"
+                assert hasattr(layer, 'mtp_model_layer'), (
+                    f"MTP layer {layer} must have 'mtp_model_layer' attribute"
+                )
                 layer.mtp_model_layer.current_microbatch = microbatch_id
 
 
@@ -236,9 +236,9 @@ def forward_step_calc_loss(
 
     model_vp_stage = getattr(model, "vp_stage", None)
     if vp_stage is not None and model_vp_stage is not None:
-        assert (
-            vp_stage == model_vp_stage
-        ), f"vp_stage ({vp_stage}) doesn't match model_vp_stage ({model_vp_stage})"
+        assert vp_stage == model_vp_stage, (
+            f"vp_stage ({vp_stage}) doesn't match model_vp_stage ({model_vp_stage})"
+        )
 
     if cp_group_size is None and is_last_stage is None:
         # fallback to parallel state
@@ -247,9 +247,9 @@ def forward_step_calc_loss(
             ignore_virtual=False, vp_stage=vp_stage
         )
     else:
-        assert (
-            cp_group_size is not None and is_last_stage is not None
-        ), "cp_group_size and is_last_stage must be provided"
+        assert cp_group_size is not None and is_last_stage is not None, (
+            "cp_group_size and is_last_stage must be provided"
+        )
 
     num_tokens = torch.tensor(0, dtype=torch.int)
     if is_last_stage:
@@ -399,7 +399,6 @@ def forward_step(
         Tensor or list[Tensor]: The output object(s) from the forward step.
         Tensor: The number of tokens.
     """
-    from megatron.core.transformer.multi_token_prediction import MTPLossAutoScaler
 
     if config.timers is not None:
         config.timers('forward-compute', log_level=2).start()
@@ -576,13 +575,13 @@ def forward_backward_no_pipelining(
         assert len(model) == 1, "non-pipeline-parallel schedule does not support model chunking"
         model = model[0]
     if isinstance(data_iterator, list):
-        assert (
-            len(data_iterator) == 1
-        ), "non-pipeline-parallel schedule does not support model chunking"
+        assert len(data_iterator) == 1, (
+            "non-pipeline-parallel schedule does not support model chunking"
+        )
         data_iterator = data_iterator[0]
-    assert (
-        adjust_tensor_shapes_fn is None
-    ), "adjust_tensor_shapes_fn is not supported for non-pipeline-parallel schedule"
+    assert adjust_tensor_shapes_fn is None, (
+        "adjust_tensor_shapes_fn is not supported for non-pipeline-parallel schedule"
+    )
 
     config = get_model_config(model)
     if config.timers is not None:
@@ -914,12 +913,12 @@ def forward_backward_pipelining_with_interleaving(
 
     assert isinstance(model, list), "interleaved pipeline parallelism expected model chunking"
     assert all(isinstance(chunk, torch.nn.Module) for chunk in model), "invalid model chunking"
-    assert isinstance(
-        data_iterator, list
-    ), "interleaved pipeline parallelism expected each model chunk to have a data iterator"
-    assert (
-        adjust_tensor_shapes_fn is None
-    ), "adjust_tensor_shapes_fn is not supported for interleaved pipeline parallelism"
+    assert isinstance(data_iterator, list), (
+        "interleaved pipeline parallelism expected each model chunk to have a data iterator"
+    )
+    assert adjust_tensor_shapes_fn is None, (
+        "adjust_tensor_shapes_fn is not supported for interleaved pipeline parallelism"
+    )
 
     if config.overlap_p2p_comm and config.batch_p2p_comm:
         raise ValueError("Can not use both overlap_p2p_comm and batch_p2p_comm")
@@ -1263,8 +1262,7 @@ def forward_backward_pipelining_with_interleaving(
             enable_grad_sync()
             synchronized_model_chunks.add(model_chunk_id)
 
-        # pylint: disable=E0606
-        if _is_vp_last_stage(vp_stage=model_chunk_id) and is_pp_last_stage(pp_group):
+        if _is_vp_last_stage(vp_stage=model_chunk_id) and is_pp_last_stage(pp_group):  # noqa: F821
             if len(output_tensor_grads[model_chunk_id]) == 0:
                 output_tensor_grads[model_chunk_id].append(None)
         input_tensor = input_tensors[model_chunk_id].pop(0)
@@ -1580,7 +1578,6 @@ def forward_backward_pipelining_with_interleaving(
 
         cur_model_chunk_id = get_model_chunk_id(forward_k, forward=True)
         if config.overlap_p2p_comm:
-
             backward_k = k
 
             # Sync forward recv
@@ -1900,15 +1897,14 @@ def forward_backward_pipelining_with_interleaving(
     nvtx_range_pop(suffix="cooldown")
 
     nvtx_range_push(suffix="misc")
-    assert (
-        not recv_prev_wait_handles
-    ), 'recv_prev_wait_handles should be cleared at the end of a step'
-    assert (
-        not recv_next_wait_handles
-    ), 'recv_next_wait_handles should be cleared at the end of a step'
+    assert not recv_prev_wait_handles, (
+        'recv_prev_wait_handles should be cleared at the end of a step'
+    )
+    assert not recv_next_wait_handles, (
+        'recv_next_wait_handles should be cleared at the end of a step'
+    )
 
     if config.finalize_model_grads_func is not None and not forward_only:
-
         # If defer_embedding_wgrad_compute is enabled we need to do the
         # weight gradient GEMM's here.
         finish_embedding_wgrad_compute(
@@ -1993,14 +1989,14 @@ def forward_backward_pipelining_without_interleaving(
     stages. Returns dictionary with losses if the last stage, empty dict otherwise."""
 
     if isinstance(model, list):
-        assert (
-            len(model) == 1
-        ), "non-interleaved pipeline-parallel schedule does not support model chunking"
+        assert len(model) == 1, (
+            "non-interleaved pipeline-parallel schedule does not support model chunking"
+        )
         model = model[0]
     if isinstance(data_iterator, list):
-        assert (
-            len(data_iterator) == 1
-        ), "non-interleaved pipeline-parallel schedule does not support model chunking"
+        assert len(data_iterator) == 1, (
+            "non-interleaved pipeline-parallel schedule does not support model chunking"
+        )
         data_iterator = data_iterator[0]
 
     config = get_model_config(model)
@@ -2269,7 +2265,6 @@ def forward_backward_pipelining_without_interleaving(
     # Run cooldown backward passes.
     if not forward_only:
         for i in range(num_warmup_microbatches):
-
             # Enable async grad reduction in the last backward pass
             # Note: If grad sync function is provided, only enable
             # async grad reduction in first pipeline stage. Other
@@ -2301,7 +2296,6 @@ def forward_backward_pipelining_without_interleaving(
                 config.grad_sync_func(model.parameters())
 
     if config.finalize_model_grads_func is not None and not forward_only:
-
         # If defer_embedding_wgrad_compute is enabled we need to do the
         # weight gradient GEMM's here.
         finish_embedding_wgrad_compute(

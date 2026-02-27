@@ -4,6 +4,7 @@
 This module provides a singleton instance of AsyncCallsQueue which manages
 the async checkpoint save calls.
 """
+
 import logging
 
 from megatron.core.dist_checkpointing.strategies.async_utils import AsyncCallsQueue, AsyncRequest

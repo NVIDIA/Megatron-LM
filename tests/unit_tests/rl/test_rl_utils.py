@@ -24,7 +24,6 @@ from megatron.core.transformer.cuda_graphs import (
     CudaGraphManager,
     _CudagraphGlobalRecord,
     create_cudagraphs,
-    delete_cuda_graphs,
 )
 from megatron.core.transformer.module import Float16Module
 from megatron.rl import rl_utils
@@ -555,9 +554,9 @@ class TestRLUtils:
 
         # Verify storage is restored
         restored_sizes = [buf.grad_data.storage().size() for buf in all_buffers]
-        assert (
-            initial_sizes == restored_sizes
-        ), f"Expected restored sizes {restored_sizes} to match initial {initial_sizes}"
+        assert initial_sizes == restored_sizes, (
+            f"Expected restored sizes {restored_sizes} to match initial {initial_sizes}"
+        )
 
     @pytest.mark.parametrize(
         "initialize_model_parallel",
@@ -627,9 +626,9 @@ class TestRLUtils:
 
         # Verify optimizer state is initially on GPU
         initial_devices = get_optimizer_state_devices()
-        assert any(
-            'cuda' in d for d in initial_devices
-        ), f"Expected optimizer state on GPU initially, got devices: {initial_devices}"
+        assert any('cuda' in d for d in initial_devices), (
+            f"Expected optimizer state on GPU initially, got devices: {initial_devices}"
+        )
 
         # Record GPU memory before offload
         torch.cuda.synchronize()
@@ -648,18 +647,18 @@ class TestRLUtils:
 
         # Verify optimizer state is now on CPU
         offloaded_devices = get_optimizer_state_devices()
-        assert all(
-            'cpu' in d for d in offloaded_devices
-        ), f"Expected all optimizer state on CPU after offload, got devices: {offloaded_devices}"
+        assert all('cpu' in d for d in offloaded_devices), (
+            f"Expected all optimizer state on CPU after offload, got devices: {offloaded_devices}"
+        )
 
         # Restore optimizer state to GPU
         optimizer.restore_from_cpu()
 
         # Verify optimizer state is back on GPU
         restored_devices = get_optimizer_state_devices()
-        assert any(
-            'cuda' in d for d in restored_devices
-        ), f"Expected optimizer state on GPU after restore, got devices: {restored_devices}"
+        assert any('cuda' in d for d in restored_devices), (
+            f"Expected optimizer state on GPU after restore, got devices: {restored_devices}"
+        )
 
         # Verify GPU memory increased after restore (optimizer state reallocated)
         torch.cuda.synchronize()

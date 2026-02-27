@@ -3,7 +3,9 @@
 """
 GitHub PR Review Reminder Automation
 Requirements: pip install PyGithub slack-sdk requests
-Usage: GH_TOKEN=ghp_... SLACK_TOKEN=xoxb-... SLACK_WEBHOOK_URL=https://... REPO=NVIDIA/Megatron-LM python github_pr_reminder.py
+Usage: GH_TOKEN=ghp_... SLACK_TOKEN=xoxb-...
+    SLACK_WEBHOOK_URL=https://... REPO=NVIDIA/Megatron-LM
+    python github_pr_reminder.py
 """
 
 import logging

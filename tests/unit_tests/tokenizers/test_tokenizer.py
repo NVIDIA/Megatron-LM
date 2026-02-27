@@ -16,12 +16,20 @@ def get_conversation():
         },
         {
             "role": "assistant",
-            "content": "Sure! Transformers are a type of deep learning model introduced in the paper \"Attention Is All You Need\". They rely heavily on self-attention mechanisms to process sequences of data in parallel, unlike RNNs which process data sequentially.",
+            "content": "Sure! Transformers are a type of deep learning "
+            "model introduced in the paper \"Attention Is All You Need\". "
+            "They rely heavily on self-attention mechanisms to process "
+            "sequences of data in parallel, unlike RNNs which process "
+            "data sequentially.",
         },
         {"role": "user", "content": "What is self-attention?"},
         {
             "role": "assistant",
-            "content": "Self-attention is a mechanism that allows the model to weigh the importance of different words in a sentence when encoding each word. It helps the model capture relationships between words regardless of their distance in the sequence.",
+            "content": "Self-attention is a mechanism that allows "
+            "the model to weigh the importance of different words in a "
+            "sentence when encoding each word. It helps the model "
+            "capture relationships between words regardless of their "
+            "distance in the sequence.",
         },
         {"role": "user", "content": "Thanks, that's really helpful!"},
         {"role": "assistant", "content": "You're welcome! Let me know if you have more questions."},
@@ -67,13 +75,9 @@ def test_sp_tokenizer():
 
     # Test tokenization
     ids = tokenizer.tokenize("hi how are you?")
-    assert ids == [
-        7251,
-        920,
-        526,
-        366,
-        29973,
-    ], f"[7251, 920, 526, 366, 29973] are expeted ids but got {ids}."
+    assert ids == [7251, 920, 526, 366, 29973], (
+        f"[7251, 920, 526, 366, 29973] are expeted ids but got {ids}."
+    )
 
     # Test detokenization
     text = tokenizer.detokenize([306, 29915, 29885, 2691, 3969, 29889])
@@ -129,13 +133,9 @@ def test_megatron_tokenizer():
 
     # Test tokenization
     ids = tokenizer.tokenize("hi how are you?")
-    assert ids == [
-        5303,
-        703,
-        389,
-        345,
-        30,
-    ], f"[5303, 703, 389, 345, 30] are expeted ids but got {ids}."
+    assert ids == [5303, 703, 389, 345, 30], (
+        f"[5303, 703, 389, 345, 30] are expeted ids but got {ids}."
+    )
 
     # Test detokenization
     text = tokenizer.detokenize([40, 1101, 3734, 5176, 13])
@@ -164,13 +164,9 @@ def test_tiktoken_tokenizer():
 
     # Test tokenization
     ids = tokenizer.tokenize("hi how are you?")
-    assert ids == [
-        8101,
-        2606,
-        1584,
-        1636,
-        1063,
-    ], f"[8101, 2606, 1584, 1636, 1063] are expeted ids but got {ids}."
+    assert ids == [8101, 2606, 1584, 1636, 1063], (
+        f"[8101, 2606, 1584, 1636, 1063] are expeted ids but got {ids}."
+    )
 
     # Test detokenization
     text = tokenizer.detokenize([1073, 4525, 7771, 14899, 1046])
@@ -269,9 +265,9 @@ def test_multimodal_tokenizer():
         image_tag_type=image_tag_type,
     )
     # Simple encode - decode roundtrip.
-    assert (
-        tokenizer.detokenize(tokenizer.tokenize("abc")) == "abc"
-    ), "encode-decode roundtrip failed"
+    assert tokenizer.detokenize(tokenizer.tokenize("abc")) == "abc", (
+        "encode-decode roundtrip failed"
+    )
 
     conversation = [
         {"role": "system", "content": "You are a helpful assistant."},
@@ -289,9 +285,9 @@ def test_multimodal_tokenizer():
     conv_tokens, target_tokens = tokenizer.tokenize_conversation(
         conversation, return_target=True, add_generation_prompt=False
     )
-    assert len(conv_tokens) > 0 and len(conv_tokens) == len(
-        target_tokens
-    ), "failed to tokenize conversation and return target tokens"
+    assert len(conv_tokens) > 0 and len(conv_tokens) == len(target_tokens), (
+        "failed to tokenize conversation and return target tokens"
+    )
 
     # Try converting tokens to ids.
     assert tokenizer.convert_tokens_to_ids("a"), "failed to convert tokens to ids."
@@ -326,9 +322,9 @@ def test_sft_tokenizer():
     )
 
     # Simple encode - decode roundtrip.
-    assert (
-        tokenizer.detokenize(tokenizer.tokenize("abc")) == "abc"
-    ), "encode-decode roundtrip failed"
+    assert tokenizer.detokenize(tokenizer.tokenize("abc")) == "abc", (
+        "encode-decode roundtrip failed"
+    )
 
     conversation = [
         {"role": "system", "content": "You are a helpful assistant."},
@@ -346,6 +342,6 @@ def test_sft_tokenizer():
     conv_tokens, target_tokens = tokenizer.tokenize_conversation(
         conversation, return_target=True, add_generation_prompt=False
     )
-    assert len(conv_tokens) > 0 and len(conv_tokens) == len(
-        target_tokens
-    ), "failed to tokenize conversation and return target tokens"
+    assert len(conv_tokens) > 0 and len(conv_tokens) == len(target_tokens), (
+        "failed to tokenize conversation and return target tokens"
+    )

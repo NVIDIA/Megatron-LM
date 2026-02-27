@@ -3,6 +3,7 @@
 
 import torch
 import torch.nn as nn
+
 from megatron.legacy.model.enums import AttnMaskType
 
 
@@ -22,9 +23,7 @@ class ScaledUpperTriangMaskedSoftmax(torch.autograd.Function):
             print(f'Please install Apex to use fused_softmax')
 
         scale_t = torch.tensor([scale])
-        softmax_results = scaled_upper_triang_masked_softmax_cuda.forward(
-            inputs, scale_t[0]
-        )
+        softmax_results = scaled_upper_triang_masked_softmax_cuda.forward(inputs, scale_t[0])
 
         ctx.save_for_backward(softmax_results, scale_t)
         return softmax_results
@@ -74,9 +73,7 @@ class ScaledMaskedSoftmax(torch.autograd.Function):
 
         softmax_results, scale_t = ctx.saved_tensors
 
-        input_grads = scaled_masked_softmax_cuda.backward(
-            output_grads, softmax_results, scale_t[0]
-        )
+        input_grads = scaled_masked_softmax_cuda.backward(output_grads, softmax_results, scale_t[0])
         return input_grads, None, None
 
 
@@ -96,24 +93,20 @@ class ScaledSoftmax(torch.autograd.Function):
 
         scale_t = torch.tensor([scale])
 
-        softmax_results = scaled_softmax_cuda.forward(
-            inputs, scale_t[0]
-        )
+        softmax_results = scaled_softmax_cuda.forward(inputs, scale_t[0])
         ctx.save_for_backward(softmax_results, scale_t)
         return softmax_results
 
     @staticmethod
     def backward(ctx, output_grads):
         try:
-            import scaled_softmax_cudaa
+            import scaled_softmax_cudaa  # noqa: F401
         except (ImportError, ModuleNotFoundError):
             print(f'Please install Apex to use fused_softmax')
 
         softmax_results, scale_t = ctx.saved_tensors
 
-        input_grads = scaled_softmax_cuda.backward(
-            output_grads, softmax_results, scale_t[0]
-        )
+        input_grads = scaled_softmax_cuda.backward(output_grads, softmax_results, scale_t[0])
         return input_grads, None, None
 
 
@@ -144,9 +137,9 @@ class FusedScaleMaskSoftmax(nn.Module):
         super(FusedScaleMaskSoftmax, self).__init__()
         self.input_in_fp16 = input_in_fp16
         self.input_in_bf16 = input_in_bf16
-        assert not (
-            self.input_in_fp16 and self.input_in_bf16
-        ), "both fp16 and bf16 flags cannot be active at the same time."
+        assert not (self.input_in_fp16 and self.input_in_bf16), (
+            "both fp16 and bf16 flags cannot be active at the same time."
+        )
         self.input_in_float16 = self.input_in_fp16 or self.input_in_bf16
         self.attn_mask_type = attn_mask_type
         self.scaled_masked_softmax_fusion = scaled_masked_softmax_fusion
@@ -154,9 +147,7 @@ class FusedScaleMaskSoftmax(nn.Module):
         self.softmax_in_fp32 = softmax_in_fp32
         self.scale = scale
 
-        assert (
-            self.scale is None or softmax_in_fp32
-        ), "softmax should be in fp32 when scaled"
+        assert self.scale is None or softmax_in_fp32, "softmax should be in fp32 when scaled"
 
     def forward(self, input, mask):
         # [b, np, sq, sk]

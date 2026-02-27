@@ -343,7 +343,8 @@ def test_dist_checkpoint_versioning(init_model_parallel, tmp_path_dist_ckpt, cre
             load_checkpoint([model], optimizer, opt_param_scheduler, strict=True)
             assert optimizer._called_metadata[-1] == first_job_mock_metadata
 
-            # Save the checkpoint again to check if the content metadata for the new checkpoint will be new
+            # Save the checkpoint again to check if the content
+            # metadata for the new checkpoint will be new
             save_checkpoint(iteration, [model], optimizer, opt_param_scheduler, num_fp_ops)
             assert optimizer._called_metadata[-1] == second_job_mock_metadata
 

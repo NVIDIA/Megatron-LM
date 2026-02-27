@@ -403,7 +403,6 @@ if HAVE_TE and is_te_min_version("1.13.0"):
         """
 
         def __new__(cls, config: TransformerConfig):
-
             layer_type = None
             if config.gated_linear_unit:
                 if config.activation_func == F.silu:
@@ -455,9 +454,9 @@ class TENorm:
                 **_get_extra_te_kwargs(config),
             )
         elif config.normalization == "RMSNorm":
-            assert hasattr(
-                te.pytorch, "RMSNorm"
-            ), "Transformer-Engine >= v0.11 required to use this feature"
+            assert hasattr(te.pytorch, "RMSNorm"), (
+                "Transformer-Engine >= v0.11 required to use this feature"
+            )
             instance = te.pytorch.RMSNorm(
                 hidden_size=hidden_size,
                 eps=eps,
@@ -574,9 +573,9 @@ class TELinear(te.pytorch.Linear):
                         extra_kwargs["ub_split_rs"] = False
                         extra_kwargs["ub_atomic_gemm_rs"] = False
                 if is_te_min_version("1.0.0", check_equality=False):
-                    assert (
-                        tp_comm_buffer_name is not None
-                    ), "Buffer name should be set to configure communication overlap settings"
+                    assert tp_comm_buffer_name is not None, (
+                        "Buffer name should be set to configure communication overlap settings"
+                    )
                     extra_kwargs["ub_name"] = tp_comm_buffer_name
 
         if symmetric_ar_type is not None:
@@ -695,9 +694,9 @@ class TELinear(te.pytorch.Linear):
 
         # Provide the dist-ckpt support when TELinear is directly used
         # It can only happen with duplicated parallel mode
-        assert (
-            self.parallel_mode is None
-        ), "TELinear sharded_state_dict can only be used with duplicated parallel mode"
+        assert self.parallel_mode is None, (
+            "TELinear sharded_state_dict can only be used with duplicated parallel mode"
+        )
         state_dict = self.state_dict(prefix="", keep_vars=True)
         return make_sharded_tensors_for_checkpoint(
             state_dict,
@@ -812,9 +811,9 @@ class TELayerNormColumnParallelLinear(te.pytorch.LayerNormLinear):
                     extra_kwargs["ub_atomic_gemm_ag"] = self.config.tp_comm_atomic_ag
                     extra_kwargs["ub_split_ag"] = self.config.tp_comm_split_ag
                 if is_te_min_version("1.0.0", check_equality=False):
-                    assert (
-                        tp_comm_buffer_name is not None
-                    ), "Buffer name should be set to configure communication overlap settings"
+                    assert tp_comm_buffer_name is not None, (
+                        "Buffer name should be set to configure communication overlap settings"
+                    )
                     extra_kwargs["ub_name"] = tp_comm_buffer_name
 
         if self.config.symmetric_ar_type is not None:
@@ -1095,7 +1094,7 @@ class TERowParallelLinear(TELinear):
             bias=bias,
             skip_bias_add=skip_bias_add,
             skip_weight_param_allocation=False,
-            # We don't currently use this for row parallel layers # pylint: disable=line-too-long
+            # We don't currently use this for row parallel layers
             is_expert=is_expert,
             tp_comm_buffer_name=tp_comm_buffer_name,
             symmetric_ar_type=config.symmetric_ar_type,
@@ -1222,16 +1221,16 @@ class TEDotProductAttention(te.pytorch.DotProductAttention):
                 hcp=get_hierarchical_context_parallel_groups(check_initialized=False),
             )
         else:
-            assert hasattr(
-                pg_collection, "tp"
-            ), "TEDotProductAttention pg_collection must have tp pg"
-            assert hasattr(
-                pg_collection, "cp"
-            ), "TEDotProductAttention pg_collection must have cp pg"
+            assert hasattr(pg_collection, "tp"), (
+                "TEDotProductAttention pg_collection must have tp pg"
+            )
+            assert hasattr(pg_collection, "cp"), (
+                "TEDotProductAttention pg_collection must have cp pg"
+            )
             if cp_comm_type == "a2a+p2p":
-                assert hasattr(
-                    pg_collection, "hcp"
-                ), "TEDotProductAttention pg_collection must have hierarchical cp pg"
+                assert hasattr(pg_collection, "hcp"), (
+                    "TEDotProductAttention pg_collection must have hierarchical cp pg"
+                )
         self._tp_group = pg_collection.tp
 
         if is_te_min_version("0.10.0"):
@@ -1244,9 +1243,9 @@ class TEDotProductAttention(te.pytorch.DotProductAttention):
         # This check is important as CP config can be disabled while having a valid CP group
         # Example - Disabling CP for encoder while a valid CP group exists for decoder
         if self.config.context_parallel_size > 1:
-            assert is_te_min_version(
-                "1.0.0"
-            ), "Only Transformer-Engine version >= 1.0.0 supports context parallelism!"
+            assert is_te_min_version("1.0.0"), (
+                "Only Transformer-Engine version >= 1.0.0 supports context parallelism!"
+            )
             if getattr(TEDotProductAttention, "cp_stream") is None:
                 TEDotProductAttention.cp_stream = torch.cuda.Stream()
             extra_kwargs["cp_group"] = pg_collection.cp
@@ -1300,8 +1299,7 @@ class TEDotProductAttention(te.pytorch.DotProductAttention):
 
         if self.config.softmax_type != "vanilla":
             assert is_te_min_version("2.8.0"), (
-                f"Transformer-Engine v{get_te_version()} must be >= 2.8.0 to support"
-                "`softmax_type`."
+                f"Transformer-Engine v{get_te_version()} must be >= 2.8.0 to support`softmax_type`."
             )
             extra_kwargs["softmax_type"] = self.config.softmax_type
 
@@ -1373,9 +1371,9 @@ class TEDotProductAttention(te.pytorch.DotProductAttention):
             # If cp_group is None but local_cp_size is provided,
             # Indicates to turn off CP dynamically
             elif packed_seq_params.local_cp_size is not None:
-                assert (
-                    packed_seq_params.local_cp_size == 1
-                ), "local_cp_size must be == 1 if provided without cp_group"
+                assert packed_seq_params.local_cp_size == 1, (
+                    "local_cp_size must be == 1 if provided without cp_group"
+                )
                 super().set_context_parallel_group(None, None, None, self.cp_comm_type)
             self.kept_packed_seq_params.discard("cp_group")
             self.kept_packed_seq_params.discard("local_cp_size")
@@ -1385,7 +1383,7 @@ class TEDotProductAttention(te.pytorch.DotProductAttention):
             num_splits = self.num_splits
         if num_splits is not None:
             assert is_te_min_version("2.10.0"), (
-                f"Transformer-Engine v{get_te_version()} must be >= 2.10.0 to support" "num_splits."
+                f"Transformer-Engine v{get_te_version()} must be >= 2.10.0 to supportnum_splits."
             )
 
         packed_seq_kwargs = (
@@ -1806,9 +1804,9 @@ if HAVE_TE and is_te_min_version("1.9.0.dev0"):
             # Adjust replica ids - replication along DP modulo EP
             for k, sh_ten in sharded_state_dict.items():
                 replica_id = sh_ten.replica_id
-                assert (
-                    len(replica_id) == 3
-                ), f"Expected replica_id for {k} to be in (PP, TP, DP) format, got: {replica_id}"
+                assert len(replica_id) == 3, (
+                    f"Expected replica_id for {k} to be in (PP, TP, DP) format, got: {replica_id}"
+                )
                 if getattr(sh_ten, "is_data_parallel_fully_shard", False):
                     edp_replica_id = 0
                 else:
@@ -2407,7 +2405,7 @@ except ImportError:
     pass
 
 try:
-    from transformer_engine.pytorch import Fp8Padding, Fp8Unpadding  # pylint: disable=unused-import
+    from transformer_engine.pytorch import Fp8Padding, Fp8Unpadding  # noqa: F401
 
 except ImportError:
     Fp8Padding = None
@@ -2512,7 +2510,7 @@ except ImportError:
 
 
 if HAVE_TE and is_te_min_version("2.7.0.dev"):
-    from transformer_engine.pytorch.router import (  # pylint: disable=unused-import
+    from transformer_engine.pytorch.router import (  # noqa: F401
         fused_compute_score_for_moe_aux_loss,
         fused_moe_aux_loss,
         fused_topk_with_score_function,
@@ -2545,15 +2543,13 @@ def set_save_original_input(module):
 
 
 try:
-    # pylint: disable=unused-import
-    from transformer_engine.pytorch import cpu_offload_v1 as cpu_offload
+    from transformer_engine.pytorch import cpu_offload_v1 as cpu_offload  # noqa: F401
 except ImportError:
     try:
         from transformer_engine.pytorch import cpu_offload
     except ImportError:
         cpu_offload = None
 try:
-    # pylint: disable=unused-import
-    from transformer_engine.pytorch.float8_tensor import Float8Tensor
+    from transformer_engine.pytorch.float8_tensor import Float8Tensor  # noqa: F401
 except ImportError:
     Float8Tensor = None

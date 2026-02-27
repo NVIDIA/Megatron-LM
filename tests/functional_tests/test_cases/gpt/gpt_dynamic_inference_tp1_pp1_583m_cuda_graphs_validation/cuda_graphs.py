@@ -38,7 +38,6 @@ def run_tests(args: argparse.Namespace) -> None:
     # Iterate `num_cuda_graphs` and `NUM_TRIALS`.
     for num_cuda_graphs_idx, num_cuda_graphs in enumerate(NUM_CUDA_GRAPHS_LIST):
         for trial_idx in range(NUM_TRIALS):
-
             # Print progress.
             print()
             print("~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~")
@@ -68,7 +67,7 @@ def run_tests(args: argparse.Namespace) -> None:
                 [
                     "bash",
                     "tests/functional_tests/test_cases/gpt/gpt_dynamic_inference_tp1_pp1_583m_cuda_graphs_validation/cuda_graphs.sh",
-                ],
+                ]
                 # capture_output=True, # uncomment to read stderr below
                 # text=True,           # uncomment to read stderr below
             )

@@ -1,5 +1,3 @@
-from typing import List, Optional
-
 import pytest
 
 import megatron.core.num_microbatches_calculator as mb_calculator

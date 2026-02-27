@@ -64,9 +64,9 @@ class PipelineParallelLayerLayout:
                     )
                     if isinstance(layer_type, str):
                         layer_type = layer_type.strip().lower()
-                        assert (
-                            layer_type in LayerType.__members__
-                        ), f"{layer_type} is not a valid LayerType"
+                        assert layer_type in LayerType.__members__, (
+                            f"{layer_type} is not a valid LayerType"
+                        )
                         layer_type = LayerType[layer_type]
                     transferred_layout.append(layer_type)
                 layout[pp_rank][vpp_rank] = transferred_layout
@@ -86,22 +86,22 @@ class PipelineParallelLayerLayout:
         """Check whether the layout is valid."""
 
         # Check whether the input layer id is valid
-        assert all(
-            isinstance(x, LayerType) for x in self.flatten_layout
-        ), "All layers must be a valid LayerType."
+        assert all(isinstance(x, LayerType) for x in self.flatten_layout), (
+            "All layers must be a valid LayerType."
+        )
 
         # Embedding layer and loss layer must be specified
-        assert (
-            self.flatten_layout[0] == LayerType.embedding
-        ), f"The first layer must be embedding, but got {self.flatten_layout[0]}"
-        assert (
-            self.flatten_layout[-1] == LayerType.loss
-        ), f"The last layer must be loss, but got {self.flatten_layout[-1]}"
+        assert self.flatten_layout[0] == LayerType.embedding, (
+            f"The first layer must be embedding, but got {self.flatten_layout[0]}"
+        )
+        assert self.flatten_layout[-1] == LayerType.loss, (
+            f"The last layer must be loss, but got {self.flatten_layout[-1]}"
+        )
 
         # Layer number verification
-        assert (
-            self.flatten_layout.count(LayerType.embedding) == 1
-        ), "Embedding must be specified exactly once"
+        assert self.flatten_layout.count(LayerType.embedding) == 1, (
+            "Embedding must be specified exactly once"
+        )
         assert self.flatten_layout.count(LayerType.loss) == 1, "Loss must be specified exactly once"
         assert self.flatten_layout.count(LayerType.decoder) == num_layers, (
             f"Number of decoder layers {self.flatten_layout.count(LayerType.decoder)}"
@@ -113,21 +113,21 @@ class PipelineParallelLayerLayout:
         ), "Number of mtp layers in layout must match mtp_num_layers"
         for i in range(len(self.flatten_layout)):
             if self.flatten_layout[i] == LayerType.mtp:
-                assert (
-                    self.flatten_layout[i:].count(LayerType.decoder) == 0
-                ), "decoder layers must be placed before MTP layers"
+                assert self.flatten_layout[i:].count(LayerType.decoder) == 0, (
+                    "decoder layers must be placed before MTP layers"
+                )
                 break
         for pp_rank in range(self.pipeline_model_parallel_size):
             for vpp_rank in range(self.virtual_pipeline_model_parallel_size - 1):
-                assert (
-                    LayerType.mtp not in self.layout[pp_rank][vpp_rank]
-                ), f"Currently we restrict that the MTP should be always in the last "
+                assert LayerType.mtp not in self.layout[pp_rank][vpp_rank], (
+                    f"Currently we restrict that the MTP should be always in the last "
+                )
                 f"virtual pipeline stage of that rank. But got {self.layout[pp_rank][vpp_rank]}"
         for pp_rank in range(self.pipeline_model_parallel_size):
             if LayerType.mtp in self.layout[pp_rank][-1]:
-                assert (
-                    self.layout[pp_rank][-1].count(LayerType.mtp) == mtp_num_layers
-                ), "All of the MTP layers must be in the same one virtual pipeline stage"
+                assert self.layout[pp_rank][-1].count(LayerType.mtp) == mtp_num_layers, (
+                    "All of the MTP layers must be in the same one virtual pipeline stage"
+                )
         for vpp_rank in range(self.virtual_pipeline_model_parallel_size - 1):
             assert LayerType.mtp not in self.layout[0][vpp_rank], (
                 f"Currently we restrict that the MTP should not be in the first pp rank."

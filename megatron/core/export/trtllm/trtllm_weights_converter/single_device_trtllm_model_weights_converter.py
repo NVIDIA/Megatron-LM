@@ -20,8 +20,7 @@ except ImportError:
     HAVE_TQDM = False
 
 
-# pylint: disable=line-too-long
-# TODO: Writing TRT imports this way so that it can be mocked in the test_trtllm_cpu_converter.py unit test
+# TODO: Writing TRT imports this way so that it can be mocked in the test_trtllm_cpu_converter.py unit test  # noqa: E501
 # TODO: Figure out how to patch it directly from the trtllm library
 def pad_vocab_size(vocab_size: int, tp_size: int):
     """Pad vocab size based on inference size"""
@@ -51,7 +50,9 @@ class SingleDeviceTRTLLMModelWeightsConverter:
     ):
         """Constructor for the TRTLLMModelWeightsConverterCPU class
 
-        This class is responsible to convert the model weights to TRTLLM equivalent weights and also split them for each GPU rank and return as a list.
+        This class is responsible to convert the model weights to
+        TRTLLM equivalent weights and also split them for each GPU
+        rank and return as a list.
 
         Args:
             export_config (ExportConfig): The export config with inference tp size, pp size etc.
@@ -81,7 +82,12 @@ class SingleDeviceTRTLLMModelWeightsConverter:
     def _convert_non_transformer_layer(self, model_state_dict: dict, layer_name: str):
         """Convert Non Transformer layers to TRTLLM weights
 
-        Non transformer layers referes to layers that occur only once in the model (e.g Embedding , final output layer etc. ) They dont have any layer number associated with them. We remove this layer from the original state dict and cast it to storage type and convert to numpy and add it to trtllm_model_weights
+        Non transformer layers referes to layers that occur only
+        once in the model (e.g Embedding, final output layer etc.)
+        They dont have any layer number associated with them. We
+        remove this layer from the original state dict and cast it
+        to storage type and convert to numpy and add it to
+        trtllm_model_weights
 
         Args:
             model_state_dict (dict): The input model state dictionary (All collected on CPU)
@@ -94,7 +100,8 @@ class SingleDeviceTRTLLMModelWeightsConverter:
 
     def _cast_value(self, val: torch.Tensor, layer_name: str) -> torch.Tensor:
         """Casts weights to the expected datatype.
-            When appropriate scaling factor is found inside self.scales, the weight gets scaled before the cast.
+            When appropriate scaling factor is found inside
+            self.scales, the weight gets scaled before the cast.
 
         Args:
             val (torch.Tensor): Model weight
@@ -114,7 +121,11 @@ class SingleDeviceTRTLLMModelWeightsConverter:
     def _convert_transformer_layer(self, layer_name: str, val: torch.Tensor):
         """Convert Transformer layers to TRTLLM weights
 
-        Transformer layers referes to layers within the transformber block. They have a layer number associated with them. Depending on the layer we either directly save it to trtllm_model_weights, or split it across some dimension and save the splits
+        Transformer layers referes to layers within the transformer
+        block. They have a layer number associated with them.
+        Depending on the layer we either directly save it to
+        trtllm_model_weights, or split it across some dimension
+        and save the splits
 
         Args:
             model_state_dict (dict): The input model state dictionary (All collected on CPU)
@@ -124,7 +135,8 @@ class SingleDeviceTRTLLMModelWeightsConverter:
         def _add_to_trtllm_model_weights(val: torch.Tensor, layer_name: str, split_type=None):
             """Add the input weight to trtllm_model_weights
 
-            Depending on split (Expert split/Tensor split/None) we split the input data and add accordingly
+            Depending on split (Expert split/Tensor split/None)
+            we split the input data and add accordingly
 
             Args:
                 val (torch.Tensor): The model weight to be added
@@ -154,8 +166,10 @@ class SingleDeviceTRTLLMModelWeightsConverter:
 
         def _duplicate_kv_head(val: torch.Tensor, rep: int, dim: int):
             """Duplicates a kv tensor along specified dimension.
-            [hidden_dim, num_kv_heads, 1, size_per_head] -> [hidden_dim, num_kv_heads, rep, size_per_head]
-            or [num_kv_heads, 1, size_per_head] -> [num_kv_heads, rep, size_per_head]
+            [hidden_dim, num_kv_heads, 1, size_per_head] ->
+            [hidden_dim, num_kv_heads, rep, size_per_head]
+            or [num_kv_heads, 1, size_per_head] ->
+            [num_kv_heads, rep, size_per_head]
             """
             shapes = list(val.shape)
             shapes[dim] = rep
@@ -262,7 +276,7 @@ class SingleDeviceTRTLLMModelWeightsConverter:
             q_num = self.transformer_config.num_attention_heads // self.num_kv_heads
 
             # When the merge factor exceeds 1, the 'vals' list will have multiple entries.
-            # Depending on the format, 'vals' can look like either [QQQQ..KV, QQQQ..KV, ...](for GQA) or [QKV, QKV, ...](for MHA).
+            # Depending on the format, 'vals' can look like either [QQQQ..KV, QQQQ..KV, ...](for GQA) or [QKV, QKV, ...](for MHA).  # noqa: E501
             # We first concat all sub weights per tp rank together.
             val = val.reshape(hidden_dim, self.num_kv_heads, q_num + 2, size_per_head)
 
@@ -272,8 +286,8 @@ class SingleDeviceTRTLLMModelWeightsConverter:
             if self.num_kv_heads < self.export_config.inference_tp_size:
                 if self.export_config.inference_tp_size % self.num_kv_heads != 0:
                     raise Exception(
-                        "Number of query groups of the models is {0}. Please select tensor parallelism size "
-                        "that can duplicate or split the number of query groups to equal number of query matrices in the "
+                        "Number of query groups of the models is {0}. Please select tensor parallelism size "  # noqa: E501
+                        "that can duplicate or split the number of query groups to equal number of query matrices in the "  # noqa: E501
                         "each GPU.".format(self.num_kv_heads)
                     )
                 rep = self.export_config.inference_tp_size // self.num_kv_heads
@@ -281,8 +295,8 @@ class SingleDeviceTRTLLMModelWeightsConverter:
                 v_weight = _duplicate_kv_head(v_weight, rep, dim=2)
             elif (self.num_kv_heads % self.export_config.inference_tp_size) != 0:
                 raise Exception(
-                    "Number of query groups of the models is {0}. Please select tensor parallelism size "
-                    "that can duplicate or split the number of query groups to equal number of query matrices in the "
+                    "Number of query groups of the models is {0}. Please select tensor parallelism size "  # noqa: E501
+                    "that can duplicate or split the number of query groups to equal number of query matrices in the "  # noqa: E501
                     "each GPU.".format(self.num_kv_heads)
                 )
 
@@ -334,12 +348,19 @@ class SingleDeviceTRTLLMModelWeightsConverter:
     ):
         """Convert model weights to trtllm model weights
 
-        This method goes through each layer in the model state dict and converts to equivalent trtllm model weights. It also handles splitting across TP dimension , expert split etc.
+        This method goes through each layer in the model state dict
+        and converts to equivalent trtllm model weights. It also
+        handles splitting across TP dimension, expert split etc.
 
         Args:
-            model_state_dict (dict): The full model state dict (all on CPU)
-            trtllm_conversion_dict (dict): The conversion dictionary used to convert model layer names to trtllm layer names
-            state_dict_split_by_layer_numbers (bool, optional): Are the model layers split by layer numbers in state dict. For example : mlp.fc1.weight can be represented like mlp.fc1.weight of shape [num_layers, hidden_dim, ffn_hidden_dim]} or it can be like mlp.fc1.layers.0.weight of shape [hidden_dim, ffn_hidden_dim], then mlp.fc1.layers.1.weight ... for all layers. If you use represenation 2 set this to True. Defaults to True
+            model_state_dict (dict): The full model state dict
+                (all on CPU)
+            trtllm_conversion_dict (dict): The conversion dictionary
+                used to convert model layer names to trtllm layer
+                names
+            state_dict_split_by_layer_numbers (bool, optional): Are
+                the model layers split by layer numbers in state dict.
+                Defaults to True
         """
 
         # First step is to convert input model layer names to equivalent trtllm layer names
@@ -351,7 +372,7 @@ class SingleDeviceTRTLLMModelWeightsConverter:
 
         # Convert the non transformer layers
         for layer_name in NON_TRANSFORMER_LAYERS_NAMES:
-            # For vocab embedding layer alone we pad the weights to be divisible by inference tp size
+            # For vocab embedding layer alone we pad the weights to be divisible by inference tp size  # noqa: E501
             if (
                 layer_name == TRTLLMLayers.vocab_embedding.value
                 and self.export_config.use_parallel_embedding
@@ -394,7 +415,7 @@ class SingleDeviceTRTLLMModelWeightsConverter:
                     transformer_layers_dict[layer_name_with_layer_number] = value[layer_number]
         if not HAVE_TQDM:
             raise ImportError(
-                "tqdm is required for SingleDeviceTRTLLMModelWeightsConverter, please install it with `pip install tqdm`"
+                "tqdm is required for SingleDeviceTRTLLMModelWeightsConverter, please install it with `pip install tqdm`"  # noqa: E501
             )
 
         for layer_name, value in tqdm(
@@ -422,7 +443,9 @@ class SingleDeviceTRTLLMModelWeightsConverter:
     def get_local_model_weights_per_gpu(self, mapping, trtllm_model_config: dict):
         """Get the trtllm model weights split per gpu
 
-        Given the trtllm mapping information (tp, pp rank etc) we split the model weights in a list, with each element of the list corresponding to the weights of each gpu rank
+        Given the trtllm mapping information (tp, pp rank etc) we
+        split the model weights in a list, with each element of the
+        list corresponding to the weights of each gpu rank
 
         Args:
             mapping : The trtllm mapping information

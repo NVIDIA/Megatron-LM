@@ -2,7 +2,9 @@
 
 """Generate launch scripts for local execution.
 
-This script allows to generate pre-filled launch scripts that allow for local execution of Megatron-LM functional tests inside containerized enviroments (i.e. Slurm enroot or Docker).
+This script allows to generate pre-filled launch scripts that allow
+for local execution of Megatron-LM functional tests inside
+containerized enviroments (i.e. Slurm enroot or Docker).
 
 This script will generate scripts into `$(pwd)/test_cases`.
 """
@@ -102,7 +104,7 @@ def main(
             fh.write(f"export ENABLE_LIGHTWEIGHT_MODE={str(enable_lightweight_mode).lower()}\n")
             fh.write(f"export RECORD_CHECKPOINTS={str(record_checkpoints).lower()}\n")
             fh.write(
-                f'export OUTPUT_PATH={output_path}/runs/$(python3 -c "import uuid; print(uuid.uuid4())")\n'
+                f'export OUTPUT_PATH={output_path}/runs/$(python3 -c "import uuid; print(uuid.uuid4())")\n'  # noqa: E501
             )
             fh.write(workload.spec["script"].format(**magic_values))
             fh.write("\n\necho This test wrote results into $OUTPUT_PATH\n")

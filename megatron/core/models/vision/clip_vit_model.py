@@ -13,7 +13,7 @@ from megatron.core.transformer.transformer_block import TransformerBlock
 from megatron.core.transformer.transformer_config import TransformerConfig
 
 try:
-    import transformer_engine  # pylint: disable=unused-import
+    import transformer_engine  # noqa: F401
 
     from megatron.core.extensions.transformer_engine import TENorm
 
@@ -54,7 +54,6 @@ class CLIPViTModel(VisionModule):
         pg_collection: Optional[ProcessGroupCollection] = None,
         vp_stage: Optional[int] = None,
     ) -> None:
-
         error_msg = f"CLIPViTModel model subtype {model_subtype} is not supported."
         assert model_subtype in ["clip", "siglip", "internvit", "internvit300M"], error_msg
 

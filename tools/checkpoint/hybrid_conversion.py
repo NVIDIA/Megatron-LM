@@ -1,18 +1,16 @@
 # Copyright (c) 2024, NVIDIA CORPORATION. All rights reserved.
 
-# Note (rwaleffe): This is a temporary file for hybrid mamba-transformer model checkpoint conversion.
+# Note (rwaleffe): This is a temporary file for hybrid mamba-transformer model checkpoint conversion.  # noqa: E501
 # This functionality should be integrated with the megatron core checkpoint loader/saver.
 
 
+import argparse
 import copy
 import os
 import re
-import shutil
 from collections import OrderedDict
 
 import torch
-import argparse
-
 
 tp_split_dim = {
     'word_embeddings.weight': 0,
@@ -60,49 +58,84 @@ def combine_tp_tensors(params, key, dim, tensors):
     tp_size = len(tensors)
 
     if 'mixer.in_proj.weight' in key and params.mamba_version == 1:
-        xs = []; zs = []
+        xs = []
+        zs = []
         for tensor in tensors:
-            x, z = torch.split(tensor, [params.mamba_d_inner//tp_size,
-                                        params.mamba_d_inner//tp_size], dim=dim)
-            xs.append(x); zs.append(z)
+            x, z = torch.split(
+                tensor, [params.mamba_d_inner // tp_size, params.mamba_d_inner // tp_size], dim=dim
+            )
+            xs.append(x)
+            zs.append(z)
         return torch.cat([torch.cat(xs, dim=dim), torch.cat(zs, dim=dim)], dim=dim)
 
     elif 'mixer.in_proj.weight' in key and params.mamba_version == 2:
-        xs = []; zs = []; Bs = []; Cs = []; dts = []
+        xs = []
+        zs = []
+        Bs = []
+        Cs = []
+        dts = []
         for tensor in tensors:
-            x, z, B, C, dt = torch.split(tensor, [params.mamba_d_inner // tp_size,
-                                                  params.mamba_d_inner // tp_size,
-                                                  (params.mamba2_n_groups // tp_size) * args.mamba_d_state,
-                                                  (params.mamba2_n_groups // tp_size) * args.mamba_d_state,
-                                                  params.mamba2_n_heads // tp_size], dim=dim)
-            xs.append(x); zs.append(z); Bs.append(B); Cs.append(C); dts.append(dt)
+            x, z, B, C, dt = torch.split(
+                tensor,
+                [
+                    params.mamba_d_inner // tp_size,
+                    params.mamba_d_inner // tp_size,
+                    (params.mamba2_n_groups // tp_size) * args.mamba_d_state,
+                    (params.mamba2_n_groups // tp_size) * args.mamba_d_state,
+                    params.mamba2_n_heads // tp_size,
+                ],
+                dim=dim,
+            )
+            xs.append(x)
+            zs.append(z)
+            Bs.append(B)
+            Cs.append(C)
+            dts.append(dt)
 
         for ii in range(len(Bs)):
             Bs[ii] = torch.reshape(Bs[ii], (-1, params.mamba_d_state, Bs[ii].shape[-1]))
             Cs[ii] = torch.reshape(Cs[ii], (-1, params.mamba_d_state, Cs[ii].shape[-1]))
-        B = torch.cat(Bs, dim=dim); C = torch.cat(Cs, dim=dim)
-        x = torch.cat(xs, dim=dim); z = torch.cat(zs, dim=dim); dt = torch.cat(dts, dim=dim)
+        B = torch.cat(Bs, dim=dim)
+        C = torch.cat(Cs, dim=dim)
+        x = torch.cat(xs, dim=dim)
+        z = torch.cat(zs, dim=dim)
+        dt = torch.cat(dts, dim=dim)
 
         return torch.cat([x, z, B.flatten(0, 1), C.flatten(0, 1), dt], dim=dim)
 
     elif 'mixer.conv1d' in key and params.mamba_version == 2:
-        xs = []; Bs = []; Cs = []
+        xs = []
+        Bs = []
+        Cs = []
         for tensor in tensors:
-            x, B, C = torch.split(tensor, [params.mamba_d_inner//tp_size,
-                                           (params.mamba2_n_groups // tp_size) * params.mamba_d_state,
-                                           (params.mamba2_n_groups // tp_size) * params.mamba_d_state], dim=dim)
-            xs.append(x); Bs.append(B); Cs.append(C)
+            x, B, C = torch.split(
+                tensor,
+                [
+                    params.mamba_d_inner // tp_size,
+                    (params.mamba2_n_groups // tp_size) * params.mamba_d_state,
+                    (params.mamba2_n_groups // tp_size) * params.mamba_d_state,
+                ],
+                dim=dim,
+            )
+            xs.append(x)
+            Bs.append(B)
+            Cs.append(C)
 
         for ii in range(len(Bs)):
             if 'weight' in key:
-                Bs[ii] = torch.reshape(Bs[ii], (-1, params.mamba_d_state, Bs[ii].shape[-2], Bs[ii].shape[-1]))
-                Cs[ii] = torch.reshape(Cs[ii], (-1, params.mamba_d_state, Cs[ii].shape[-2], Cs[ii].shape[-1]))
+                Bs[ii] = torch.reshape(
+                    Bs[ii], (-1, params.mamba_d_state, Bs[ii].shape[-2], Bs[ii].shape[-1])
+                )
+                Cs[ii] = torch.reshape(
+                    Cs[ii], (-1, params.mamba_d_state, Cs[ii].shape[-2], Cs[ii].shape[-1])
+                )
             elif 'bias' in key:
                 Bs[ii] = torch.reshape(Bs[ii], (-1, params.mamba_d_state))
                 Cs[ii] = torch.reshape(Cs[ii], (-1, params.mamba_d_state))
             else:
                 raise Exception("Unknown key")
-        B = torch.cat(Bs, dim=dim); C = torch.cat(Cs, dim=dim)
+        B = torch.cat(Bs, dim=dim)
+        C = torch.cat(Cs, dim=dim)
         x = torch.cat(xs, dim=dim)
 
         return torch.cat([x, B.flatten(0, 1), C.flatten(0, 1)], dim=dim)
@@ -119,14 +152,21 @@ def split_tensor_for_tp(params, key, dim, tensor):
         x, z = torch.split(tensor, [params.mamba_d_inner, params.mamba_d_inner], dim=dim)
         x_sliced = torch.chunk(x, tp_size, dim=dim)
         z_sliced = torch.chunk(z, tp_size, dim=dim)
-        for (x, z) in zip(x_sliced, z_sliced):
+        for x, z in zip(x_sliced, z_sliced):
             tensor_sliced.append(torch.cat((x, z), dim=dim))
 
     elif 'mixer.in_proj.weight' in key and params.mamba_version == 2:
-        x, z, B, C, dt = torch.split(tensor, [params.mamba_d_inner, params.mamba_d_inner,
-                                                      params.mamba2_n_groups * params.mamba_d_state,
-                                                      params.mamba2_n_groups * params.mamba_d_state,
-                                                      params.mamba2_n_heads], dim=dim)
+        x, z, B, C, dt = torch.split(
+            tensor,
+            [
+                params.mamba_d_inner,
+                params.mamba_d_inner,
+                params.mamba2_n_groups * params.mamba_d_state,
+                params.mamba2_n_groups * params.mamba_d_state,
+                params.mamba2_n_heads,
+            ],
+            dim=dim,
+        )
         B = torch.reshape(B, (-1, params.mamba_d_state, B.shape[-1]))
         C = torch.reshape(C, (-1, params.mamba_d_state, C.shape[-1]))
 
@@ -137,13 +177,19 @@ def split_tensor_for_tp(params, key, dim, tensor):
         dt_sliced = torch.chunk(dt, tp_size, dim=dim)
 
         tensor_sliced = []
-        for (x, z, B, C, dt) in zip(x_sliced, z_sliced, B_sliced, C_sliced, dt_sliced):
+        for x, z, B, C, dt in zip(x_sliced, z_sliced, B_sliced, C_sliced, dt_sliced):
             tensor_sliced.append(torch.cat((x, z, B.flatten(0, 1), C.flatten(0, 1), dt), dim=dim))
 
     elif 'mixer.conv1d' in key and params.mamba_version == 2:
-        x, B, C = torch.split(tensor, [params.mamba_d_inner,
-                                               params.mamba2_n_groups * params.mamba_d_state,
-                                               params.mamba2_n_groups * params.mamba_d_state], dim=dim)
+        x, B, C = torch.split(
+            tensor,
+            [
+                params.mamba_d_inner,
+                params.mamba2_n_groups * params.mamba_d_state,
+                params.mamba2_n_groups * params.mamba_d_state,
+            ],
+            dim=dim,
+        )
         if 'weight' in key:
             B = torch.reshape(B, (-1, params.mamba_d_state, B.shape[-2], B.shape[-1]))
             C = torch.reshape(C, (-1, params.mamba_d_state, C.shape[-2], C.shape[-1]))
@@ -158,7 +204,7 @@ def split_tensor_for_tp(params, key, dim, tensor):
         x_sliced = torch.chunk(x, tp_size, dim=dim)
 
         tensor_sliced = []
-        for (x, B, C) in zip(x_sliced, B_sliced, C_sliced):
+        for x, B, C in zip(x_sliced, B_sliced, C_sliced):
             tensor_sliced.append(torch.cat((x, B.flatten(0, 1), C.flatten(0, 1)), dim=dim))
 
     else:
@@ -168,7 +214,7 @@ def split_tensor_for_tp(params, key, dim, tensor):
 
 
 def finalize_checkpoint(sample_model, model, params, verbose=False):
-    # make sure the rest of the checkpoint is how we want it from the original (i.e., other than the 'model')
+    # make sure the rest of the checkpoint is how we want it from the original (i.e., other than the 'model')  # noqa: E501
     reset_iterations = params.reset_iterations
 
     # checkpoint 'args'
@@ -279,9 +325,13 @@ def main(args):
 
                 if split_dim != -1:
                     # slice together model
-                    # print("\tshape mismatch: original {}, combined {}".format(original_shape, combined_shape))
-                    combined_tensor = combine_tp_tensors(args, key, split_dim,
-                                                    [tp_models[jj]['model'][key].cpu() for jj in range(input_tp_rank)])
+                    # print("\tshape mismatch: original {}, combined {}".format(original_shape, combined_shape))  # noqa: E501
+                    combined_tensor = combine_tp_tensors(
+                        args,
+                        key,
+                        split_dim,
+                        [tp_models[jj]['model'][key].cpu() for jj in range(input_tp_rank)],
+                    )
                     combined_tp_model[key] = combined_tensor
                 else:
                     # copy model
@@ -293,7 +343,9 @@ def main(args):
         for ii, (key, original_tensor) in enumerate(combined_tp_model.items()):
             try:
                 layer_num = int(re.findall(r'\d+', key)[0])
-                new_key = key.replace(str(layer_num), str(layer_num + pp*num_layers_per_pipeline_rank), 1)
+                new_key = key.replace(
+                    str(layer_num), str(layer_num + pp * num_layers_per_pipeline_rank), 1
+                )
             except:
                 new_key = key
             full_model[new_key] = original_tensor
@@ -316,9 +368,11 @@ def main(args):
         for ii, (key, original_tensor) in enumerate(full_model.items()):
             try:
                 layer_num = int(re.findall(r'\d+', key)[0])
-                if layer_num >= num_layers_per_pipeline_rank * (pp+1):
+                if layer_num >= num_layers_per_pipeline_rank * (pp + 1):
                     break
-                new_key = key.replace(str(layer_num), str(layer_num - (pp * num_layers_per_pipeline_rank)), 1)
+                new_key = key.replace(
+                    str(layer_num), str(layer_num - (pp * num_layers_per_pipeline_rank)), 1
+                )
             except Exception:
                 new_key = key
 
@@ -343,7 +397,7 @@ def main(args):
 
             if split_dim != -1:
                 # split model
-                # print("\tshape mismatch: original {}, combined {}".format(original_shape, split_shape))
+                # print("\tshape mismatch: original {}, combined {}".format(original_shape, split_shape))  # noqa: E501
                 tensor_sliced = split_tensor_for_tp(args, new_key, split_dim, original_tensor)
                 for jj in range(args.target_tp_size):
                     tp_models[jj]['model'][new_key] = tensor_sliced[jj]
@@ -366,7 +420,7 @@ def main(args):
             torch.save(model, model_file)
             print(f"Model {model_file} is saved.")
 
-    # shutil.copyfile(tracker_filename, os.path.join(args.save_dir, 'latest_checkpointed_iteration.txt'))
+    # shutil.copyfile(tracker_filename, os.path.join(args.save_dir, 'latest_checkpointed_iteration.txt'))  # noqa: E501
     tracker_filename = os.path.join(args.save_dir, 'latest_checkpointed_iteration.txt')
     with open(tracker_filename, 'w') as f:
         f.write(str(out_iteration))

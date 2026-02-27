@@ -15,12 +15,10 @@ from megatron.core.export.trtllm.model_to_trllm_mapping.default_conversion_dict 
 from megatron.core.export.trtllm.trt_model_config import TRT_MODEL_CONFIG
 from megatron.core.export.trtllm.trt_model_type import TRT_MODEL_TYPE_STRING
 from megatron.core.export.trtllm.trtllm_layers import TRTLLMLayers
-
-# pylint: disable=line-too-long
-from megatron.core.export.trtllm.trtllm_weights_converter.distributed_trtllm_model_weights_converter import (
+from megatron.core.export.trtllm.trtllm_weights_converter.distributed_trtllm_model_weights_converter import (  # noqa: E501
     DistributedTRTLLMModelWeightsConverter,
 )
-from megatron.core.export.trtllm.trtllm_weights_converter.single_device_trtllm_model_weights_converter import (
+from megatron.core.export.trtllm.trtllm_weights_converter.single_device_trtllm_model_weights_converter import (  # noqa: E501
     SingleDeviceTRTLLMModelWeightsConverter,
 )
 from megatron.core.export.trtllm.trtllm_weights_converter.utils import is_gated_activation
@@ -65,18 +63,36 @@ class TRTLLMHelper:
 
         Args:
             transformer_config (TransformerConfig): The transformer config
-            model_type (ModelType): The type of the input model. Enum (megatron.core.export.model_type.ModelType)
-            trtllm_conversion_dict (dict, optional): A conversion dictionary that will map your model layer names to trtllm equivalent layer names. Default dictionary is given megatron/core/export/model_to_trtllm_mapping. This dict is merged into the default dict. NOTE: Ignore layer numbers in the model layer names. (e.g) decoder.layers.0.attention_qkv.weight will be decoder.layers.attention_qkv.weight in the mapping dictionary. Defaults to {}.
-            position_embedding_type (str, optional): The position embedding type. Defaults to None.
-            max_position_embeddings (int, optional): Max posistion embeddings value. Defaults to None.
-            rotary_percentage (int, optional): The rotary percentage if using rope embedding. Defaults to 1.0.
-            rotary_base (int, optional): The rotary base (theta value) if using rope embeddings. Defaults to 10000.
+            model_type (ModelType): The type of the input model.
+                Enum (megatron.core.export.model_type.ModelType)
+            trtllm_conversion_dict (dict, optional): A conversion
+                dictionary that will map your model layer names to
+                trtllm equivalent layer names. Default dictionary is
+                given megatron/core/export/model_to_trtllm_mapping.
+                This dict is merged into the default dict. NOTE:
+                Ignore layer numbers in the model layer names. (e.g)
+                decoder.layers.0.attention_qkv.weight will be
+                decoder.layers.attention_qkv.weight in the mapping
+                dictionary. Defaults to {}.
+            position_embedding_type (str, optional): The position
+                embedding type. Defaults to None.
+            max_position_embeddings (int, optional): Max position
+                embeddings value. Defaults to None.
+            rotary_percentage (int, optional): The rotary percentage
+                if using rope embedding. Defaults to 1.0.
+            rotary_base (int, optional): The rotary base (theta value)
+                if using rope embeddings. Defaults to 10000.
             moe_tp_mode (int, optional): TRTLLM Config. Defaults to 2.
             multi_query_mode (bool, optional): Defaults to False.
             activation (str, optional): Defaults to "gelu".
-            seq_len_interpolation_factor (float, optional): The sequence length interpolation factor if using rope embeddings. Defaults to None.
-            moe_renorm_mode (optional) : Renormalization mode if using mixture of experts. Defaults to None.
-            share_embeddings_and_output_weights (bool, optional): True if input and output layers share weights. Defaults to False.
+            seq_len_interpolation_factor (float, optional): The sequence
+                length interpolation factor if using rope embeddings.
+                Defaults to None.
+            moe_renorm_mode (optional): Renormalization mode if using
+                mixture of experts. Defaults to None.
+            share_embeddings_and_output_weights (bool, optional): True
+                if input and output layers share weights.
+                Defaults to False.
         """
 
         if not HAVE_TRTLLM:
@@ -90,10 +106,9 @@ class TRTLLMHelper:
         if model_type == ModelType.nemotron_nas:
             self.trtllm_conversion_dict.update(NEMOTRON_NAS_CONVERSION_DICT)
         self.trtllm_conversion_dict.update(trtllm_conversion_dict)
-        assert position_embedding_type in [
-            "learned_absolute",
-            "rope",
-        ], f"Position embedding type should be one of learned_absolute, rope. You entered {position_embedding_type}"
+        assert position_embedding_type in ["learned_absolute", "rope"], (
+            f"Position embedding type should be one of learned_absolute, rope. You entered {position_embedding_type}"  # noqa: E501
+        )
         self.position_embedding_type = position_embedding_type
         self.max_position_embeddings = max_position_embeddings
         self.rotary_percentage = rotary_percentage
@@ -213,7 +228,9 @@ class TRTLLMHelper:
         Args:
             model_state_dict (dict): Model state dictionary
         Returns:
-            dict: Maps scaling factor key, to its value and the inverse. The inverse is used for casting the quantized weights.
+            dict: Maps scaling factor key, to its value and the
+                inverse. The inverse is used for casting the
+                quantized weights.
         """
         weight_scaling_suffix = ".weights_scaling_factor"
         activation_scaling_suffix = ".activation_scaling_factor"
@@ -260,7 +277,6 @@ class TRTLLMHelper:
 
         return scales
 
-    # pylint: disable=line-too-long
     def get_trtllm_pretrained_config_and_model_weights(
         self,
         model_state_dict,
@@ -276,22 +292,39 @@ class TRTLLMHelper:
         """Get TRTLLM Config and Converted Model Weights
 
         This function returns the trtllm model weights as a list.
-        There are two modes for conversion. The default is to use a single device cpu/gpu for conversion.
-        NOTE: For faster performance, if your entire model will fit in memory, pre transfer the model state dict to cuda device and then call this function.
-        For on device conversion it returns weights which will be used on the device itself.
-        Same thing happens with the pretrained config
+        There are two modes for conversion. The default is to use a
+        single device cpu/gpu for conversion.
+        NOTE: For faster performance, if your entire model will fit in
+        memory, pre transfer the model state dict to cuda device and
+        then call this function. For on device conversion it returns
+        weights which will be used on the device itself. Same thing
+        happens with the pretrained config.
 
         Args:
-            model_state_dict (dict): The input model state dictionary (Entire model state loaded on CPU) or the model state dict of each GPU in the case of on_device conversion)
-            export_config (ExportConfig): The export config used to define inference tp size, pp size etc. Used only for on device conversion.
-            dtype (DataType): The data type of model precision
-            on_device_distributed_conversion (bool, optional): Convert on gpus in distributed setting. This assumes that the model state dict is sharded according to required inference model parallelism and that each gpu gets its part of the model state dict . Defaults to False.
-            vocab_size (int, optional): The vocabulary size. Defaults to None.
-            gpus_per_node (int, optional): The number of gpus per node. Used for on device conversion.
-            state_dict_split_by_layer_numbers (bool, optional): Are the model layers split by layer numbers in state dict. For example : mlp.fc1.weight can be represented like mlp.fc1.weight of shape [num_layers, hidden_dim, ffn_hidden_dim]} or it can be like mlp.fc1.layers.0.weight of shape [hidden_dim, ffn_hidden_dim], then mlp.fc1.layers.1.weight ... for all layers. If you use represenation 2 set this to True. Defaults to True
+            model_state_dict (dict): The input model state dictionary
+                (Entire model state loaded on CPU) or the model state
+                dict of each GPU in the case of on_device conversion.
+            export_config (ExportConfig): The export config used to
+                define inference tp size, pp size etc. Used only for
+                on device conversion.
+            dtype (DataType): The data type of model precision.
+            on_device_distributed_conversion (bool, optional): Convert
+                on gpus in distributed setting. This assumes that the
+                model state dict is sharded according to required
+                inference model parallelism and that each gpu gets its
+                part of the model state dict. Defaults to False.
+            vocab_size (int, optional): The vocabulary size.
+                Defaults to None.
+            gpus_per_node (int, optional): The number of gpus per node.
+                Used for on device conversion.
+            state_dict_split_by_layer_numbers (bool, optional): Are the
+                model layers split by layer numbers in state dict.
+                Defaults to True.
 
         Returns:
-            Two lists . First list of trtllm converted model weights(Either on device, or a list of weights for each gpu) and the trtllm_model_configs.
+            Two lists. First list of trtllm converted model weights
+                (Either on device, or a list of weights for each gpu)
+                and the trtllm_model_configs.
         """
         assert model_state_dict is not None, "Model state dict is not set"
 
@@ -306,17 +339,17 @@ class TRTLLMHelper:
                 ModelType.llama,
                 ModelType.nemotron_nas,
             ]
-            assert (
-                supported_model
-            ), "On device conversion only supported for model types gptnext and llama"
+            assert supported_model, (
+                "On device conversion only supported for model types gptnext and llama"
+            )
             assert export_config is None, (
                 "Export config is inferred based on the parallel state. "
-                "If you want to set inference tp 2, then load the model with this TP2 setting and just pass in the model state dict."
+                "If you want to set inference tp 2, then load the model with this TP2 setting and just pass in the model state dict."  # noqa: E501
             )
 
-            assert (
-                gpus_per_node is not None
-            ), "Need to pass in gpus_per_node for on device conversion"
+            assert gpus_per_node is not None, (
+                "Need to pass in gpus_per_node for on device conversion"
+            )
             trtllm_model_weights_on_device, trtllm_model_config = (
                 self._get_trtllm_pretrained_config_and_model_weights_in_distributed_setting(
                     model_state_dict,
@@ -331,9 +364,9 @@ class TRTLLMHelper:
             return [trtllm_model_weights_on_device], [trtllm_model_config]
 
         else:
-            assert (
-                vocab_size is None
-            ), "Vocab size is inferred from the input layer for cpu conversion. So leave it as None"
+            assert vocab_size is None, (
+                "Vocab size is inferred from the input layer for cpu conversion. So leave it as None"  # noqa: E501
+            )
             trtllm_model_weights_list, trtllm_model_config_list = (
                 self._get_trtllm_pretrained_config_and_model_weights_list_on_single_device(
                     export_config,
@@ -362,7 +395,8 @@ class TRTLLMHelper:
         Args:
             converter (ModelWeightConverter): Converter, holding the TRT-LLM model weights.
             scales (dict): Dictionary holding TRT-LLM scaling factors
-            fp8_kvcache (bool): If true, creates scaling factors (equal to 1.0) for kv_cache quantization
+            fp8_kvcache (bool): If true, creates scaling factors
+                (equal to 1.0) for kv_cache quantization
         """
         trt_scales = {key: scale["trt_llm_scale"] for key, scale in scales.items()}
         kv_scales = {}
@@ -399,7 +433,8 @@ class TRTLLMHelper:
             fp8_quantized (bool): True for fp8 checkpoint export
             fp8_kvcache (bool): True for fp8 KV-cache quantization
         Returns:
-            Two lists . List of trtllm converted model weights and trtllm model configs (One for each gpu).
+            Two lists. List of trtllm converted model weights
+                and trtllm model configs (One for each gpu).
         """
 
         self.weights_converter = DistributedTRTLLMModelWeightsConverter(
@@ -459,22 +494,29 @@ class TRTLLMHelper:
         fp8_quantized: bool,
         fp8_kvcache: bool,
     ):
-        """Get the TRTLLM Pretrained config and model weights list (one per gpu rank) on single device (CPU/GPU)
+        """Get the TRTLLM Pretrained config and model weights list.
 
-        This function assumes the entire model state dict is present in CPU or on one GPU
+        One per gpu rank, on single device (CPU/GPU). This function
+        assumes the entire model state dict is present in CPU or on
+        one GPU.
 
         Args:
-            export_config (ExportConfig): The export config to set inference tp, pp size etc.
-            model_state_dict (dict): The model state dictionary (All collected on cpu)
-            dtype (DataType): The data type or model precision
-            gpus_per_node (int, optional): Number of gpus per node
-            state_dict_split_by_layer_numbers (bool, optional): Are the model layers split by layer numbers in state dict. For example : mlp.fc1.weight can be represented like mlp.fc1.weight of shape [num_layers, hidden_dim, ffn_hidden_dim]} or it can be like mlp.fc1.layers.0.weight of shape [hidden_dim, ffn_hidden_dim], then mlp.fc1.layers.1.weight ... for all layers. If you use represenation 2 set this to True. Defaults to True
+            export_config (ExportConfig): The export config to set
+                inference tp, pp size etc.
+            model_state_dict (dict): The model state dictionary
+                (All collected on cpu).
+            dtype (DataType): The data type or model precision.
+            gpus_per_node (int, optional): Number of gpus per node.
+            state_dict_split_by_layer_numbers (bool, optional): Are
+                the model layers split by layer numbers in state dict.
+                Defaults to True.
             scales (dict): Dictionary with fp8 scaling factors
             fp8_quantized (bool): True for fp8 checkpoint export
             fp8_kvcache (bool): True for fp8 KV-cache quantization
 
         Returns:
-            Two lists . List of trtllm converted model weights and trtllm model configs (One for each gpu).
+            Two lists. List of trtllm converted model weights
+                and trtllm model configs (One for each gpu).
         """
         trtllm_model_configs_list = []
         trtllm_model_weights_list = []
@@ -508,7 +550,7 @@ class TRTLLMHelper:
                 pp_size=export_config.inference_pp_size,
             )
 
-            # Important to create a new instance everytime so that the list elements have differnt rank values in the mapping object
+            # Important to create a new instance everytime so that the list elements have differnt rank values in the mapping object  # noqa: E501
             trtllm_model_config = self._get_trtllm_config(
                 export_config=export_config,
                 world_size=world_size,
@@ -570,7 +612,8 @@ class TRTLLMHelper:
             use_lora_plugin (_type_, optional): Use lora plugin. Defaults to None.
             max_lora_rank (int, optional): Max lora rank. Defaults to 64.
             lora_target_modules (_type_, optional): Lora target modules. Defaults to None.
-            max_prompt_embedding_table_size (int, optional): Max size of prompt embedding table. Defaults to 0.
+            max_prompt_embedding_table_size (int, optional): Max size
+                of prompt embedding table. Defaults to 0.
             paged_kv_cache (bool, optional): Use Paged KV cache. Defaults to True.
             remove_input_padding (bool, optional): Remove input padding. Defaults to True.
             paged_context_fmha (bool, optional): Paged context fmha. Defaults to False.

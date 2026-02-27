@@ -5,6 +5,7 @@ import torch
 
 from megatron.core.transformer.transformer_layer import TransformerLayer
 
+
 def _bias_dropout_add_func_layer_scaling(ls, x_with_bias, residual, prob, training):
     x, bias = x_with_bias  # unpack
     residual = residual if residual.dtype == x.dtype else residual.to(x.dtype)

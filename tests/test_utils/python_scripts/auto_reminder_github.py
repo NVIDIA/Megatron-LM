@@ -3,7 +3,9 @@
 """
 GitHub PR Review Reminder Automation
 Requirements: pip install PyGithub slack-sdk requests
-Usage: GH_TOKEN=ghp_... SLACK_TOKEN=xoxb-... SLACK_WEBHOOK_URL=https://... REPO=NVIDIA/Megatron-LM python github_pr_reminder.py
+Usage: GH_TOKEN=ghp_... SLACK_TOKEN=xoxb-...
+    SLACK_WEBHOOK_URL=https://... REPO=NVIDIA/Megatron-LM
+    python github_pr_reminder.py
 """
 
 import html
@@ -209,7 +211,7 @@ class PRReviewTracker:
             if stage == self.EXPERT_REVIEW:
                 # Assign to PR author
                 reviewer_emails = [self.get_user_email(pr.user.login)]
-                action_message = "All Expert Reviewers approved the PR. Please attach the Final Review label to proceed with the review."
+                action_message = "All Expert Reviewers approved the PR. Please attach the Final Review label to proceed with the review."  # noqa: E501
             elif stage == self.FINAL_REVIEW:
                 # Assign to mcore-reviewers who approved
                 try:
@@ -217,7 +219,7 @@ class PRReviewTracker:
                     mcore_members = {m.login for m in mcore_team.get_members()}
                     valid_approvers = approvers & mcore_members
                     reviewer_emails = sorted([self.get_user_email(u) for u in valid_approvers])
-                    action_message = "All Final Reviewers approved the PR. Please ping an Expert or Final Reviewer to merge the PR."
+                    action_message = "All Final Reviewers approved the PR. Please ping an Expert or Final Reviewer to merge the PR."  # noqa: E501
 
                 except Exception as e:
                     logger.warning(

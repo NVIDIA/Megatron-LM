@@ -42,7 +42,7 @@ def test_decorator_module():
     """Test that the compat decorator module exists"""
     print("\n2. Testing decorator module...", end=" ")
     try:
-        from megatron.core.utils import deprecated, internal_api
+        from megatron.core.utils import deprecated, internal_api  # noqa: F401
 
         print("✅ Decorator module found")
         print("   Available: @internal_api, @deprecated")

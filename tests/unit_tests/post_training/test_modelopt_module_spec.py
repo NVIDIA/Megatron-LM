@@ -1,8 +1,6 @@
 # Copyright (c) 2024, NVIDIA CORPORATION. All rights reserved.
 import inspect
-import tempfile
 
-import pytest
 import torch
 from packaging.version import Version
 
@@ -16,9 +14,6 @@ from megatron.core.models.gpt.gpt_model import GPTModel
 from megatron.core.models.mamba.mamba_layer_specs import mamba_stack_spec
 from megatron.core.models.mamba.mamba_model import MambaModel
 from megatron.core.post_training.modelopt.gpt.model_specs import get_gpt_modelopt_spec
-from megatron.core.post_training.modelopt.gpt.state_dict_hooks import (
-    mcore_gpt_load_te_state_dict_pre_hook,
-)
 from megatron.core.post_training.modelopt.mamba.model_specs import get_mamba_stack_modelopt_spec
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
 from megatron.core.transformer import TransformerConfig
@@ -62,7 +57,6 @@ def model_forward(model: torch.nn.Module, config: TransformerConfig, micro_batch
 
 
 class TestModelOptGPTModel:
-
     _test_inference = True
 
     def setup_method(self, method):
@@ -115,7 +109,6 @@ class TestModelOptGPTModel:
 
 
 class TestModelOptMLAMoE(TestModelOptGPTModel):
-
     def setup_method(self, method):
         Utils.initialize_model_parallel(1, 1)
         model_parallel_cuda_manual_seed(123)
@@ -154,7 +147,6 @@ class TestModelOptMLAMoE(TestModelOptGPTModel):
 
 
 class TestModelOptLlama4MoE(TestModelOptGPTModel):
-
     def setup_method(self, method):
         Utils.initialize_model_parallel(1, 1)
         model_parallel_cuda_manual_seed(123)
@@ -198,7 +190,6 @@ class TestModelOptLlama4MoE(TestModelOptGPTModel):
 
 
 class TestModelOptMambaModel(TestModelOptGPTModel):
-
     def setup_method(self, method):
         Utils.initialize_model_parallel(1, 1)
         model_parallel_cuda_manual_seed(123)
@@ -250,18 +241,18 @@ def test_get_gpt_modelopt_spec_interface():
     # Check expected parameters are in function signature
     for param_name, param_kind in expected_params.items():
         assert param_name in sig.parameters, f"Unexpected parameter: {param_name}"
-        assert (
-            param_kind is sig.parameters[param_name].kind
-        ), f"Wrong kind for parameter: {param_name}"
+        assert param_kind is sig.parameters[param_name].kind, (
+            f"Wrong kind for parameter: {param_name}"
+        )
 
     # Check default values
     sig_defaults = {
         k: v.default for k, v in sig.parameters.items() if v.default is not inspect.Parameter.empty
     }
     for k, v in expected_defaults.items():
-        assert (
-            k in sig_defaults and v == sig_defaults[k]
-        ), f"Default value of {sig_defaults[k]} does not match the expected value of {v} for parameter {k}."
+        assert k in sig_defaults and v == sig_defaults[k], (
+            f"Default value of {sig_defaults[k]} does not match the expected value of {v} for parameter {k}."  # noqa: E501
+        )
 
 
 def test_get_mamba_stack_modelopt_spec_interface():
@@ -279,15 +270,15 @@ def test_get_mamba_stack_modelopt_spec_interface():
     # Check expected parameters are in function signature
     for param_name, param_kind in expected_params.items():
         assert param_name in sig.parameters, f"Unexpected parameter: {param_name}"
-        assert (
-            param_kind is sig.parameters[param_name].kind
-        ), f"Wrong kind for parameter: {param_name}"
+        assert param_kind is sig.parameters[param_name].kind, (
+            f"Wrong kind for parameter: {param_name}"
+        )
 
     # Check default values
     sig_defaults = {
         k: v.default for k, v in sig.parameters.items() if v.default is not inspect.Parameter.empty
     }
     for k, v in expected_defaults.items():
-        assert (
-            k in sig_defaults and v == sig_defaults[k]
-        ), f"Default value of {sig_defaults[k]} does not match the expected value of {v} for parameter {k}."
+        assert k in sig_defaults and v == sig_defaults[k], (
+            f"Default value of {sig_defaults[k]} does not match the expected value of {v} for parameter {k}."  # noqa: E501
+        )

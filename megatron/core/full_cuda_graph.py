@@ -73,7 +73,6 @@ class StaticBufferLoader:
             with torch.cuda.stream(self.stream):
                 StaticBufferLoader.static_buffers[stage].append(copy_tensors_in_struct(inputs))
         else:
-
             for k in inputs.keys():
                 if k not in StaticBufferLoader.static_buffers[stage][microbatch]:
                     if isinstance(inputs[k], torch.Tensor):

@@ -66,10 +66,9 @@ class TorchFullyShardedDataParallel(_BaseDataParallel):
         disable_bucketing: bool = False,
         process_group: Optional[ProcessGroup] = None,
     ):
-
-        assert (
-            HAVE_FSDP
-        ), 'TorchFullyShardedDataParallel requires PyTorch >= 2.4.0 with FSDP 2 support.'
+        assert HAVE_FSDP, (
+            'TorchFullyShardedDataParallel requires PyTorch >= 2.4.0 with FSDP 2 support.'
+        )
 
         super().__init__(config=config, module=module)
 

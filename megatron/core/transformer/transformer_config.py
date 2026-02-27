@@ -126,9 +126,10 @@ class TransformerConfig(ModelParallelConfig):
     """Softmax scale for attention scaling."""
 
     softmax_type: Literal['vanilla', 'off-by-one', 'learnable'] = 'vanilla'
-    """Applies modified softmax from https://www.evanmiller.org/attention-is-off-by-one.html. 
-       Supports both TE FusedAttention and local unfused attention. Supports both a fixed offset and 
-       and learnable offset."""
+    """Applies modified softmax from
+       https://www.evanmiller.org/attention-is-off-by-one.html.
+       Supports both TE FusedAttention and local unfused attention.
+       Supports both a fixed offset and a learnable offset."""
 
     num_query_groups: Optional[int] = field(
         default=None, metadata={"argparse_meta": {"default": 1}}
@@ -964,38 +965,38 @@ class TransformerConfig(ModelParallelConfig):
             )
 
         if self.experimental_attention_variant == "gated_delta_net":
-            assert (
-                self.linear_attention_freq is not None
-            ), f"linear_attention_freq must be set for linear gated_delta_net."
+            assert self.linear_attention_freq is not None, (
+                f"linear_attention_freq must be set for linear gated_delta_net."
+            )
 
             # Check required parameters
-            assert (
-                self.linear_conv_kernel_dim is not None
-            ), "linear_conv_kernel_dim must be set for gated delta net."
-            assert (
-                self.linear_key_head_dim is not None
-            ), "linear_key_head_dim must be set for gated delta net."
-            assert (
-                self.linear_value_head_dim is not None
-            ), "linear_value_head_dim must be set for gated delta net."
-            assert (
-                self.linear_num_key_heads is not None
-            ), "linear_num_key_heads must be set for gated delta net."
-            assert (
-                self.linear_num_value_heads is not None
-            ), "linear_num_value_heads must be set for gated delta net."
+            assert self.linear_conv_kernel_dim is not None, (
+                "linear_conv_kernel_dim must be set for gated delta net."
+            )
+            assert self.linear_key_head_dim is not None, (
+                "linear_key_head_dim must be set for gated delta net."
+            )
+            assert self.linear_value_head_dim is not None, (
+                "linear_value_head_dim must be set for gated delta net."
+            )
+            assert self.linear_num_key_heads is not None, (
+                "linear_num_key_heads must be set for gated delta net."
+            )
+            assert self.linear_num_value_heads is not None, (
+                "linear_num_value_heads must be set for gated delta net."
+            )
             assert self.linear_num_value_heads % self.linear_num_key_heads == 0, (
                 f"linear_num_value_heads ({self.linear_num_value_heads}) must be a multiple of "
                 f"linear_num_key_heads ({self.linear_num_key_heads})."
             )
 
             # Check tensor parallelism compatibility
-            assert (
-                self.linear_num_key_heads % self.tensor_model_parallel_size == 0
-            ), "linear_num_key_heads must be a multiple of tensor_model_parallel_size."
-            assert (
-                self.linear_num_value_heads % self.tensor_model_parallel_size == 0
-            ), "linear_num_value_heads must be a multiple of tensor_model_parallel_size."
+            assert self.linear_num_key_heads % self.tensor_model_parallel_size == 0, (
+                "linear_num_key_heads must be a multiple of tensor_model_parallel_size."
+            )
+            assert self.linear_num_value_heads % self.tensor_model_parallel_size == 0, (
+                "linear_num_value_heads must be a multiple of tensor_model_parallel_size."
+            )
 
             # Do not support yet, but coming soon.
             assert self.context_parallel_size == 1, (
@@ -1074,9 +1075,9 @@ class TransformerConfig(ModelParallelConfig):
             warnings.warn("moe_ffn_hidden_size is not set, using ffn_hidden_size instead.")
 
         if self.num_moe_experts is None:
-            assert (
-                self.moe_ffn_hidden_size is None
-            ), "moe_ffn_hidden_size must be None when num_experts is not set."
+            assert self.moe_ffn_hidden_size is None, (
+                "moe_ffn_hidden_size must be None when num_experts is not set."
+            )
 
         if self.moe_enable_deepep:
             if self.moe_token_dispatcher_type != "flex":
@@ -1284,9 +1285,9 @@ class TransformerConfig(ModelParallelConfig):
                 self.recompute_modules.append("moe")
 
         if self.fine_grained_activation_offloading:
-            assert (
-                not self.cpu_offloading
-            ), "fine_grained_activation_offloading cannot be enabled with cpu_offloading."
+            assert not self.cpu_offloading, (
+                "fine_grained_activation_offloading cannot be enabled with cpu_offloading."
+            )
             assert self.offload_modules is not None and len(self.offload_modules) > 0
             allowed_modules = {
                 "core_attn",
@@ -1604,9 +1605,9 @@ class TransformerConfig(ModelParallelConfig):
             )
 
         if self.num_moe_experts is not None and self.add_bias_linear:
-            assert (
-                self.expert_tensor_parallel_size == 1
-            ), "Bias in Moe is only supported when ETP==1"
+            assert self.expert_tensor_parallel_size == 1, (
+                "Bias in Moe is only supported when ETP==1"
+            )
 
         if self.moe_router_enable_expert_bias and self.moe_router_score_function != "sigmoid":
             raise ValueError(
@@ -1686,12 +1687,12 @@ class TransformerConfig(ModelParallelConfig):
             self.moe_router_num_groups = self.expert_model_parallel_size
 
         if self.enable_cuda_graph or self.external_cuda_graph:
-            assert (
-                self.cuda_graph_impl == "none"
-            ), "Do not use enable_cuda_graph or external_cuda_graph with cuda_graph_impl."
-            assert (
-                not self.enable_cuda_graph or not self.external_cuda_graph
-            ), "enable_cuda_graph and external_cuda_graph cannot be enabled at the same time."
+            assert self.cuda_graph_impl == "none", (
+                "Do not use enable_cuda_graph or external_cuda_graph with cuda_graph_impl."
+            )
+            assert not self.enable_cuda_graph or not self.external_cuda_graph, (
+                "enable_cuda_graph and external_cuda_graph cannot be enabled at the same time."
+            )
 
             if self.enable_cuda_graph:
                 warnings.warn('enable_cuda_graph is deprecated, use cuda_graph_impl=local instead.')
@@ -1717,9 +1718,9 @@ class TransformerConfig(ModelParallelConfig):
         if all(isinstance(scope, str) for scope in self.cuda_graph_scope):
             # Backward compatibility for "full" scope. Now we use an empty list instead.
             if "full" in self.cuda_graph_scope:
-                assert self.cuda_graph_scope == [
-                    "full"
-                ], "full scope cannot be used with other scopes."
+                assert self.cuda_graph_scope == ["full"], (
+                    "full scope cannot be used with other scopes."
+                )
                 warnings.warn(
                     "full scope is deprecated. "
                     "Use empty cuda_graph_scope to capture the whole layer."
@@ -1727,15 +1728,14 @@ class TransformerConfig(ModelParallelConfig):
                 self.cuda_graph_scope = []
             else:
                 self.cuda_graph_scope = [CudaGraphScope[scope] for scope in self.cuda_graph_scope]
-        assert all(
-            isinstance(scope, CudaGraphScope) for scope in self.cuda_graph_scope
-        ), f"cuda_graph_scope must be a list of CudaGraphScope, got {self.cuda_graph_scope}."
+        assert all(isinstance(scope, CudaGraphScope) for scope in self.cuda_graph_scope), (
+            f"cuda_graph_scope must be a list of CudaGraphScope, got {self.cuda_graph_scope}."
+        )
 
         if self.cuda_graph_impl != "none":
-            assert self.cuda_graph_impl in [
-                "transformer_engine",
-                "local",
-            ], f"Invalid cuda graph implementation: {self.cuda_graph_impl}"
+            assert self.cuda_graph_impl in ["transformer_engine", "local"], (
+                f"Invalid cuda graph implementation: {self.cuda_graph_impl}"
+            )
 
             if self.cpu_offloading:
                 raise ValueError("CUDA graphs not supported with CPU offloading.")
@@ -1763,9 +1763,9 @@ class TransformerConfig(ModelParallelConfig):
                 or CudaGraphScope.moe_router not in self.cuda_graph_scope
             ), 'cuda_graph_scope must not contain both moe and moe_router.'
             if CudaGraphScope.moe_preprocess in self.cuda_graph_scope:
-                assert (
-                    CudaGraphScope.moe_router in self.cuda_graph_scope
-                ), 'moe_preprocess cuda graph is only supported with moe_router cuda graph.'
+                assert CudaGraphScope.moe_router in self.cuda_graph_scope, (
+                    'moe_preprocess cuda graph is only supported with moe_router cuda graph.'
+                )
             if self.num_moe_experts is None or self.num_moe_experts <= 1:
                 assert (
                     CudaGraphScope.moe not in self.cuda_graph_scope
@@ -1783,9 +1783,9 @@ class TransformerConfig(ModelParallelConfig):
                     self.moe_expert_capacity_factor is None
                     or not self.moe_pad_expert_input_to_capacity
                 ):
-                    assert (
-                        CudaGraphScope.moe not in self.cuda_graph_scope
-                    ), 'moe cuda graph is only supported with drop-padding MoE.'
+                    assert CudaGraphScope.moe not in self.cuda_graph_scope, (
+                        'moe cuda graph is only supported with drop-padding MoE.'
+                    )
                     if self.moe_token_dispatcher_type == 'alltoall' and (
                         self.moe_expert_capacity_factor is not None
                         or self.moe_router_padding_for_fp8
@@ -1797,9 +1797,9 @@ class TransformerConfig(ModelParallelConfig):
 
             if self.recompute_granularity:
                 if self.recompute_granularity != "selective":
-                    assert self.cuda_graph_scope == [
-                        CudaGraphScope.full_iteration
-                    ], "full recompute is only supported with full iteration CUDA graph."
+                    assert self.cuda_graph_scope == [CudaGraphScope.full_iteration], (
+                        "full recompute is only supported with full iteration CUDA graph."
+                    )
                 else:
                     # The recompute module should be inside or outside of the graph scope.
                     # Recompute module coverring graph scope is not allowed.
@@ -1807,9 +1807,9 @@ class TransformerConfig(ModelParallelConfig):
                         self.cuda_graph_impl == "transformer_engine"
                         and "moe" in self.recompute_modules
                     ):
-                        assert (
-                            CudaGraphScope.moe_router not in self.cuda_graph_scope
-                        ), "moe recompute is not supported with moe_router CUDA graph with: "
+                        assert CudaGraphScope.moe_router not in self.cuda_graph_scope, (
+                            "moe recompute is not supported with moe_router CUDA graph with: "
+                        )
                         "--cuda-graph-impl transformer_engine."
 
                     # Graphed recompute module doesn't accept random number.
@@ -1869,44 +1869,43 @@ class TransformerConfig(ModelParallelConfig):
 
         if self.overlap_moe_expert_parallel_comm:
             # TODO: remove this after we fix the hang issue with torch version < 2.6.0
-            assert is_torch_min_version(
-                "2.6.0"
-            ), "A2A Overlap encounters hang issue with torch version < 2.6.0"
+            assert is_torch_min_version("2.6.0"), (
+                "A2A Overlap encounters hang issue with torch version < 2.6.0"
+            )
             if self.pipeline_model_parallel_size > 1:
                 assert self.virtual_pipeline_model_parallel_size is not None, (
                     "If enabling EP A2A overlap, virtual_pipeline_model_parallel_size "
                     "must be specified when pipeline_model_parallel_size > 1"
                 )
             # Expert model parallelism requirements
-            assert (
-                self.expert_model_parallel_size > 1
-            ), 'overlap_moe_expert_parallel_comm is only supported with expert model parallelism'
-            assert self.moe_token_dispatcher_type in [
-                'alltoall',
-                'flex',
-            ], 'overlap_moe_expert_parallel_comm is supported with alltoall/flex token dispatcher'
+            assert self.expert_model_parallel_size > 1, (
+                'overlap_moe_expert_parallel_comm is only supported with expert model parallelism'
+            )
+            assert self.moe_token_dispatcher_type in ['alltoall', 'flex'], (
+                'overlap_moe_expert_parallel_comm is supported with alltoall/flex token dispatcher'
+            )
 
-            assert (
-                self.recompute_granularity != 'full'
-            ), 'disable full recomputation when enabling overlap_moe_expert_parallel_comm'
-            assert (
-                self.recompute_method is None
-            ), 'disable recomputation method when enabling overlap_moe_expert_parallel_comm'
-            assert (
-                self.recompute_num_layers is None
-            ), 'recompute_num_layers must be None when enabling overlap_moe_expert_parallel_comm'
+            assert self.recompute_granularity != 'full', (
+                'disable full recomputation when enabling overlap_moe_expert_parallel_comm'
+            )
+            assert self.recompute_method is None, (
+                'disable recomputation method when enabling overlap_moe_expert_parallel_comm'
+            )
+            assert self.recompute_num_layers is None, (
+                'recompute_num_layers must be None when enabling overlap_moe_expert_parallel_comm'
+            )
 
             # Check if bf16 or fp16 is used
-            assert (
-                self.bf16 or self.fp16
-            ), 'overlap_moe_expert_parallel_comm is only supported with bf16 or fp16 model'
+            assert self.bf16 or self.fp16, (
+                'overlap_moe_expert_parallel_comm is only supported with bf16 or fp16 model'
+            )
 
-            assert (
-                not self.moe_shared_expert_overlap
-            ), 'disable moe_shared_expert_overlap when enabling overlap_moe_expert_parallel_comm'
-            assert (
-                self.mtp_num_layers is None or self.mtp_num_layers == 1
-            ), 'MTP layernum only supports 1 when enabling overlap_moe_expert_parallel_comm.'
+            assert not self.moe_shared_expert_overlap, (
+                'disable moe_shared_expert_overlap when enabling overlap_moe_expert_parallel_comm'
+            )
+            assert self.mtp_num_layers is None or self.mtp_num_layers == 1, (
+                'MTP layernum only supports 1 when enabling overlap_moe_expert_parallel_comm.'
+            )
             if self.mtp_num_layers == 1:
                 assert self.pipeline_model_parallel_size > 1, (
                     'Pipeline model parallel size must be larger than 1 '
@@ -1925,12 +1924,12 @@ class TransformerConfig(ModelParallelConfig):
 
         # Check delay_wgrad_compute compatibility
         if self.delay_wgrad_compute:
-            assert (
-                self.overlap_moe_expert_parallel_comm
-            ), 'overlap_moe_expert_parallel_comm must be enabled when enabling delay_wgrad_compute'
-            assert (
-                not self.moe_use_legacy_grouped_gemm
-            ), 'delay_wgrad_compute is not supported with legacy groupedgemm implementation'
+            assert self.overlap_moe_expert_parallel_comm, (
+                'overlap_moe_expert_parallel_comm must be enabled when enabling delay_wgrad_compute'
+            )
+            assert not self.moe_use_legacy_grouped_gemm, (
+                'delay_wgrad_compute is not supported with legacy groupedgemm implementation'
+            )
             if self.cuda_graph_impl == "transformer_engine":
                 assert is_te_min_version("2.10.0"), (
                     'TE version >= 2.10.0 is required for delay_wgrad_compute with '
@@ -1950,14 +1949,14 @@ class TransformerConfig(ModelParallelConfig):
                     f"the total number of transformer layers ({self.num_layers})!"
                 )
             else:
-                assert isinstance(
-                    self.cp_comm_type, str
-                ), "Unsupported communication type for context parallelism!"
+                assert isinstance(self.cp_comm_type, str), (
+                    "Unsupported communication type for context parallelism!"
+                )
 
-        assert (
-            self.pipeline_model_parallel_size > 0
-        ), f"Pipeline model parallel size must be larger than 0 \
+        assert self.pipeline_model_parallel_size > 0, (
+            f"Pipeline model parallel size must be larger than 0 \
             when enable --standalone-embedding-stage and --standalone-loss-stage"
+        )
 
         if (
             self.num_moe_experts is not None
@@ -2003,9 +2002,9 @@ class TransformerConfig(ModelParallelConfig):
             assert not self.use_kitchen
 
         if self.experimental_attention_variant == "dsa":
-            assert (
-                self.context_parallel_size == 1
-            ), "Currently context parallelism is not supported by DSAttention!"
+            assert self.context_parallel_size == 1, (
+                "Currently context parallelism is not supported by DSAttention!"
+            )
             assert not self.apply_rope_fusion, "RoPE fusion is not supported for DSAttention"
 
         if self.inference_fuse_tp_communication:
@@ -2015,9 +2014,9 @@ class TransformerConfig(ModelParallelConfig):
             )
 
         if self.batch_invariant_mode:
-            assert (
-                self.attention_backend == AttnBackend.flash
-            ), "Batch invariant mode only supports FlashAttention"
+            assert self.attention_backend == AttnBackend.flash, (
+                "Batch invariant mode only supports FlashAttention"
+            )
 
 
 @dataclass
@@ -2090,6 +2089,6 @@ class MLATransformerConfig(TransformerConfig):
             raise NotImplementedError("Output gate is not supported for MLA yet.")
 
         if self.cache_mla_latents:
-            assert (
-                self.apply_rope_fusion is False
-            ), "Rope Fusion is not compatible with caching latents"
+            assert self.apply_rope_fusion is False, (
+                "Rope Fusion is not compatible with caching latents"
+            )

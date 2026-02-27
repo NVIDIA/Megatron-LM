@@ -34,7 +34,6 @@ if TYPE_CHECKING:
 
 
 logger = logging.getLogger(__name__)
-# pylint: disable=line-too-long
 # list of local saved/loaded ShardedBase objects
 _LocalMetadata = List[Union[ShardedTensor, ShardedObject]]
 # list of lists of global saved/loaded ShardedBase objects (each element corresponds to global rank)
@@ -210,10 +209,13 @@ def verify_checkpoint_and_load_strategy(
 
     Args:
         checkpoint_dir (str): checkpoint directory
-        sharded_strategy (LoadShardedStrategy, Tuple[str, int], optional): sharded load strategy to be verified
-            if compatible with the checkpoint content. If None, the default sharded load strategy
-            for the checkpoint backend will be returned.
-        common_strategy (LoadCommonStrategy, Tuple[str, int], optional): common load strategy to be verified
+        sharded_strategy (LoadShardedStrategy, Tuple[str, int],
+            optional): sharded load strategy to be verified if
+            compatible with the checkpoint content. If None, the
+            default sharded load strategy for the checkpoint backend
+            will be returned.
+        common_strategy (LoadCommonStrategy, Tuple[str, int],
+            optional): common load strategy to be verified
             if compatible with the checkpoint content. If None, the default common load strategy
             for the checkpoint backend will be returned.
     """
@@ -348,7 +350,7 @@ def maybe_report_missing_and_unexpected_keys(
         f"Some keys found in the checkpoint are missing in the provided sharded state dict. "
     )
     missing_body_msg = f"Missing keys (for all ranks): {missing_keys}. "
-    unexpected_title_msg = f"Unexpected keys (not found in the checkpoint) encountered in the provided sharded state dict. "
+    unexpected_title_msg = f"Unexpected keys (not found in the checkpoint) encountered in the provided sharded state dict. "  # noqa: E501
     unexpected_body_msg = f"Unexpected keys (for this rank): {unexpected_keys}. "
     error_msg = ""
     if missing_keys:
@@ -371,7 +373,8 @@ def maybe_report_missing_and_unexpected_keys(
 def _validate_common_state_dict(common_state_dict: CommonStateDict) -> None:
     """Validate consistancy across ranks for the common state dict
 
-    We save the common state dict only on rank 0. We validate to make sure that the common dict is consistent across ranks before saving.
+    We save the common state dict only on rank 0. We validate to make
+    sure that the common dict is consistent across ranks before saving.
 
     Args:
         common_state_dict: The common state dict present in all ransk
@@ -405,9 +408,11 @@ def _validate_common_state_dict(common_state_dict: CommonStateDict) -> None:
 def validate_sharding_integrity(
     global_metadata: _GlobalMetadata, common_state_dict: CommonStateDict = None
 ) -> None:
-    """Validate if the ShardedTensors and ShardedObjects from multiple processes define correct sharding.
+    """Validate if the ShardedTensors and ShardedObjects from
+    multiple processes define correct sharding.
 
-    Local ShardedTensors and ShardedObject metadata is exchanged with `torch.distributed.all_gather_object`
+    Local ShardedTensors and ShardedObject metadata is exchanged
+    with `torch.distributed.all_gather_object`
     and then process with global rank 0 checks if main replicas of the shards:
     - cover the whole global tensors
     - don't overlap
@@ -446,7 +451,7 @@ def validate_sharding_integrity(
 
 
 def _validate_sharding_for_key(
-    rank_sharding: List[Tuple[int, ShardedTensor]]
+    rank_sharding: List[Tuple[int, ShardedTensor]],
 ) -> List[CheckpointingException]:
     some_rank_shard = rank_sharding[0][1]
     global_shape = some_rank_shard.global_shape
@@ -511,7 +516,7 @@ def _validate_objects_for_key(sharded_objects: List[ShardedObject]) -> List[Chec
         )
     expected_shard_num = np.prod(sharded_objects[0][1].global_shape)
     if len(unique_keys) != expected_shard_num:
-        err_msg = f"Invalid access pattern: {expected_shard_num - len(unique_keys)} ShardedObject are missing."
+        err_msg = f"Invalid access pattern: {expected_shard_num - len(unique_keys)} ShardedObject are missing."  # noqa: E501
         logger.error(f"{err_msg} Existing shards: {unique_keys}")
         errors.append(CheckpointingException(err_msg))
     return errors
@@ -526,7 +531,8 @@ def determine_global_metadata(
         sharded_state_dict (ShardedStateDict): local sharded state dict
 
     Returns:
-        Tuple[_LocalMetadata, _GlobalMetadata]: local and global ShardedBase objects with stripped data
+        Tuple[_LocalMetadata, _GlobalMetadata]: local and global
+            ShardedBase objects with stripped data
     """
     local_metadata = [ten.without_data() for ten in nested_values(sharded_state_dict)]
     global_metadata = [None] * torch.distributed.get_world_size()
@@ -541,8 +547,12 @@ def validate_sharded_objects_handling(
     """Checks if either of the passed strategies can handle sharded objects.
 
     Args:
-        sharded_strategy (Union[SaveShardedStrategy, LoadShardedStrategy]): sharded strategy used for saving/loading
-        common_strategy (Union[SaveCommonStrategy, LoadCommonStrategy]): common strategy used for saving/loading
+        sharded_strategy (Union[SaveShardedStrategy,
+            LoadShardedStrategy]): sharded strategy used for
+            saving/loading
+        common_strategy (Union[SaveCommonStrategy,
+            LoadCommonStrategy]): common strategy used for
+            saving/loading
 
     Returns:
         None
@@ -556,5 +566,5 @@ def validate_sharded_objects_handling(
     ):
         raise CheckpointingException(
             f"Either sharded strategy or common strategy must implement ShardedObjects handling."
-            f" Both {sharded_strategy} and {common_strategy} specify can_handle_sharded_objects=False"
+            f" Both {sharded_strategy} and {common_strategy} specify can_handle_sharded_objects=False"  # noqa: E501
         )

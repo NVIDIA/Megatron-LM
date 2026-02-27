@@ -156,7 +156,6 @@ def get_analytics_per_pipeline(pipeline_id: int) -> pd.DataFrame:
         ).total_seconds()
 
     if not integration_tests_analytics.empty:
-
         analytics["integration_tests_started_at"] = integration_tests_analytics['started_at'].min()
         analytics["integration_tests_finished_at"] = integration_tests_analytics[
             'finished_at'

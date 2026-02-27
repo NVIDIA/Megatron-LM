@@ -13,13 +13,8 @@ These configurations are intended for testing and development purposes only.
 
 from typing import Optional
 
-from megatron.core.extensions.transformer_engine import (
-    TEColumnParallelLinear,
-    TERowParallelLinear,
-)
-from megatron.core.models.gpt.gpt_layer_specs import (
-    get_gpt_layer_with_transformer_engine_spec,
-)
+from megatron.core.extensions.transformer_engine import TEColumnParallelLinear, TERowParallelLinear
+from megatron.core.models.gpt.gpt_layer_specs import get_gpt_layer_with_transformer_engine_spec
 from megatron.core.transformer.mlp import MLP, MLPSubmodules
 from megatron.core.transformer.spec_utils import ModuleSpec
 from megatron.core.transformer.transformer_config import TransformerConfig
@@ -43,6 +38,7 @@ def get_mock_language_model_config(config: Optional[TransformerConfig] = None) -
             setattr(config, field_name, field_value)
 
     return config
+
 
 def get_mock_vision_model_config(config: Optional[TransformerConfig] = None) -> TransformerConfig:
     """

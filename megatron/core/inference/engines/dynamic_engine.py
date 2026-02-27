@@ -130,7 +130,6 @@ class RequestEntry:
     future: asyncio.Future
 
 
-# pylint: disable=line-too-long
 @experimental_api
 class DynamicInferenceEngine(AbstractEngine):
     """The dynamic inference engine.
@@ -155,13 +154,12 @@ class DynamicInferenceEngine(AbstractEngine):
         message="Argument `{name}` has been deprecated. Only pass `controller` and `context`",
     )
     def __init__(self, controller: TextGenerationController, context: DynamicInferenceContext):
-
-        assert isinstance(
-            controller, TextGenerationController
-        ), f"controller must be a TextGenerationController, got {type(controller)}"
-        assert isinstance(
-            context, DynamicInferenceContext
-        ), f"context must be a DynamicInferenceContext, got {type(context)}"
+        assert isinstance(controller, TextGenerationController), (
+            f"controller must be a TextGenerationController, got {type(controller)}"
+        )
+        assert isinstance(context, DynamicInferenceContext), (
+            f"context must be a DynamicInferenceContext, got {type(context)}"
+        )
 
         model_config = controller.inference_wrapped_model.model.config
         inference_config = context.config
@@ -389,7 +387,7 @@ class DynamicInferenceEngine(AbstractEngine):
         """
 
         assert HAVE_ZMQ, (
-            "please install the pyzmq library to use InferenceCoordinator\n" "pip install pyzmq"
+            "please install the pyzmq library to use InferenceCoordinator\npip install pyzmq"
         )
         assert HAVE_MSGPACK, (
             "please install the messagepack library to use InferenceCoordinator\n"
@@ -548,7 +546,6 @@ class DynamicInferenceEngine(AbstractEngine):
         """
 
         try:
-
             start_mem = torch.cuda.memory_stats()
             start_time = time.time()
             torch.cuda.synchronize()
@@ -556,7 +553,6 @@ class DynamicInferenceEngine(AbstractEngine):
             yield
 
         finally:
-
             end_time = time.time()
 
             end_mem = torch.cuda.memory_stats()
@@ -636,7 +632,6 @@ class DynamicInferenceEngine(AbstractEngine):
         with self.__class__.suspend_resume_ctx(
             "resumed", unified_memory_level=self.unified_memory_level
         ):
-
             # Allocate context tensors.
             alloc_time = time.time()
             torch.cuda.synchronize()
@@ -703,7 +698,6 @@ class DynamicInferenceEngine(AbstractEngine):
     def _add_request(
         self, request: DynamicInferenceRequest
     ) -> asyncio.Future[DynamicInferenceRequest]:
-
         request_id = request.request_id
 
         # Add request to self.requests. If the engine has previously been
@@ -723,9 +717,9 @@ class DynamicInferenceEngine(AbstractEngine):
             or request.sampling_params.num_tokens_total is None
         )
         if request.sampling_params.top_n_logprobs > 0:
-            assert (
-                request.sampling_params.return_log_probs
-            ), "top_n_logprobs requires sampling_params.return_log_probs to be True"
+            assert request.sampling_params.return_log_probs, (
+                "top_n_logprobs requires sampling_params.return_log_probs to be True"
+            )
         if (
             request.sampling_params.return_log_probs
             and not request.sampling_params.skip_prompt_log_probs
@@ -820,9 +814,9 @@ class DynamicInferenceEngine(AbstractEngine):
         elif isinstance(prompt, torch.Tensor):
             # Prompt already tokenized.
             assert prompt.dtype == torch.int64, prompt.dtype
-            assert prompt.device == torch.device(
-                f"cuda:{torch.cuda.current_device()}"
-            ), prompt.device
+            assert prompt.device == torch.device(f"cuda:{torch.cuda.current_device()}"), (
+                prompt.device
+            )
             tokens = prompt
 
         else:
@@ -909,7 +903,7 @@ class DynamicInferenceEngine(AbstractEngine):
                 stop_word_hit = self._check_stop_words_for_request_post_append(request)
 
                 if request_id in finished_request_ids:
-                    # Request finished by normal means (termination_id, max_length, or stop word from previous step)
+                    # Request finished by normal means (termination_id, max_length, or stop word from previous step)  # noqa: E501
                     request.generated_length = len(request.generated_tokens)
                     request.status = Status.COMPLETED
                     request.add_event_finish()
@@ -939,7 +933,7 @@ class DynamicInferenceEngine(AbstractEngine):
                 if not request.generated_log_probs:
                     request.generated_log_probs = []
 
-                # For chunked prefill with materialize_only_last_token_logits, discard intermediate log probs
+                # For chunked prefill with materialize_only_last_token_logits, discard intermediate log probs  # noqa: E501
                 if (
                     request_id == self.context.chunked_prefill_request_id
                     and self.materialize_only_last_token_logits
@@ -956,7 +950,7 @@ class DynamicInferenceEngine(AbstractEngine):
                     # If skip_prompt_log_probs is True and we have multiple log probs (prefill),
                     # only process the last one (first generated token)
                     if request.sampling_params.skip_prompt_log_probs and len(request_log_probs) > 1:
-                        # Only append the last log prob (first generated token) to generated_log_probs
+                        # Only append the last log prob (first generated token) to generated_log_probs  # noqa: E501
                         request.generated_log_probs.append(request_log_probs[-1])
                     else:
                         # Vectorized approach: calculate split point and use list slicing
@@ -1028,7 +1022,6 @@ class DynamicInferenceEngine(AbstractEngine):
 
         # Handle evicted requests.
         if evict_request_ids is not None and evict_request_ids.numel() > 0:
-
             evict_request_ids = evict_request_ids.tolist()
 
             # Insert into waiting_request_ids after any chunk prefill request.
@@ -1357,7 +1350,7 @@ class DynamicInferenceEngine(AbstractEngine):
                 'inference/total_requests_dict_size': int(len(self.requests)),
             }
             # Add KV stats with inference/ prefix
-            # Convert utilization metrics from 0-1 range to 0-100 percentage range for better visualization
+            # Convert utilization metrics from 0-1 range to 0-100 percentage range for better visualization  # noqa: E501
             for key, value in context_state["kv_stats"].items():
                 if 'utilization' in key:
                     # Convert to percentage (0-100) and group under kvcache_utilization
@@ -1572,9 +1565,9 @@ class DynamicInferenceEngine(AbstractEngine):
             header = Headers(data[0])
 
             if self.received_stop:
-                assert (
-                    header == Headers.STOP_ACK
-                ), "Engine is shutting down. No other messages allowed except STOP_ACK."
+                assert header == Headers.STOP_ACK, (
+                    "Engine is shutting down. No other messages allowed except STOP_ACK."
+                )
 
             if header == Headers.SUBMIT_REQUEST:
                 request_id, prompt, sampling_params = data[1:]
@@ -1676,10 +1669,10 @@ class DynamicInferenceEngine(AbstractEngine):
             # We do not want a rank to pause/stop/suspend prematurely if one of it's peers
             # is yet to receive the signal.
             # So this is an *attempt* to process the signal. This rank has received the signal
-            # and passes 0 to the all-reduce. If any other rank in the EP group has not received the signal yet,
-            # it will pass a non-zero value to the all-reduce, and hence the global work will be non-zero,
+            # and passes 0 to the all-reduce. If any other rank in the EP group has not received the signal yet,  # noqa: E501
+            # it will pass a non-zero value to the all-reduce, and hence the global work will be non-zero,  # noqa: E501
             # and we will defer processing the signal.
-            # When all ranks receive the signal, global work will be zero, and we can process the signal safely.
+            # When all ranks receive the signal, global work will be zero, and we can process the signal safely.  # noqa: E501
             local_work = 0
 
         if self.ep_world_size > 1:

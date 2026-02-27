@@ -2,7 +2,6 @@
 
 import gc
 import os
-from contextlib import nullcontext
 from typing import Dict, List, Optional, Tuple
 
 import pytest
@@ -179,8 +178,6 @@ def test_gpt_fine_grained_activation_offloading_correctness_and_memory(
         seq_length=seq_length, micro_batch_size=micro_batch_size, device=device
     )
 
-    from megatron.core.pipeline_parallel import fine_grained_activation_offload as off
-
     off_interface.reset_instance()
 
     try:
@@ -283,8 +280,8 @@ def test_gpt_fine_grained_activation_offloading_correctness_and_memory(
         saved_mib = (base_peak - off_peak) / (1024**2)
         assert saved_mib > 0.0, (
             f"Expected GPU peak memory reduction for offload_modules={offload_modules}, "
-            f"but got saved={saved_mib:.2f}MiB (base={base_peak/(1024**2):.2f}MiB, "
-            f"off={off_peak/(1024**2):.2f}MiB)"
+            f"but got saved={saved_mib:.2f}MiB (base={base_peak / (1024**2):.2f}MiB, "
+            f"off={off_peak / (1024**2):.2f}MiB)"
         )
 
         # If expectation is large enough, enforce approximate match.
@@ -298,7 +295,7 @@ def test_gpt_fine_grained_activation_offloading_correctness_and_memory(
                 f"(rel_err={rel_err:.2f}, abs_err={abs_err:.2f})"
             )
             print(
-                f"Rank {torch.distributed.get_rank()}: Saved {saved_mib:.2f}MiB, expected {expected_offload_mib:.2f}MiB"
+                f"Rank {torch.distributed.get_rank()}: Saved {saved_mib:.2f}MiB, expected {expected_offload_mib:.2f}MiB"  # noqa: E501
             )
     finally:
         Utils.destroy_model_parallel()
@@ -371,8 +368,6 @@ def test_fine_grained_activation_offload_with_ep_a2a_overlap_compatibility(
     seq_length = 1024
     micro_batch_size = 2
     device = torch.device("cuda")
-
-    from megatron.core.pipeline_parallel import fine_grained_activation_offload as off
 
     def _make_schedule_inputs() -> Dict[str, torch.Tensor]:
         data = list(range(seq_length))
@@ -514,7 +509,7 @@ def test_fine_grained_activation_offload_with_ep_a2a_overlap_compatibility(
             )
             _restore_params(off_model, base_params)
             off_model.train()
-            # Warmup once to populate cached chunks, then reset to apply steady-state offload decisions.
+            # Warmup once to populate cached chunks, then reset to apply steady-state offload decisions.  # noqa: E501
             off_interface.reset()
             _run_schedule_1f1b_two_microbatches(off_model, enable_offload_reset=False)
             off_interface.reset()
@@ -545,23 +540,23 @@ def test_fine_grained_activation_offload_with_ep_a2a_overlap_compatibility(
                 if gb is None or go is None:
                     assert gb is None and go is None, f"Grad None mismatch for {name}"
                     continue
-                assert torch.allclose(
-                    go, gb, rtol=1e-3, atol=1e-3
-                ), f"Rank {torch.distributed.get_rank()}: Grad mismatch for {name}"
+                assert torch.allclose(go, gb, rtol=1e-3, atol=1e-3), (
+                    f"Rank {torch.distributed.get_rank()}: Grad mismatch for {name}"
+                )
 
             # Memory checks (peak allocated during the scheduled 1F1B run)
             saved_mib = (base_peak - off_peak) / (1024**2)
             assert saved_mib > 0.0, (
                 f"Expected GPU peak memory reduction for offload_modules={offload_modules}, "
-                f"but got saved={saved_mib:.2f}MiB (base={base_peak/(1024**2):.2f}MiB, "
-                f"off={off_peak/(1024**2):.2f}MiB)"
+                f"but got saved={saved_mib:.2f}MiB (base={base_peak / (1024**2):.2f}MiB, "
+                f"off={off_peak / (1024**2):.2f}MiB)"
             )
             # If expectation is large enough, enforce approximate match.
             if expected_offload_mib >= 2.0:
                 rel_err = abs(saved_mib - expected_offload_mib) / max(expected_offload_mib, 1e-6)
                 abs_err = abs(saved_mib - expected_offload_mib)
                 print(
-                    f"Rank {torch.distributed.get_rank()}: Saved {saved_mib:.2f}MiB, expected {expected_offload_mib:.2f}MiB"
+                    f"Rank {torch.distributed.get_rank()}: Saved {saved_mib:.2f}MiB, expected {expected_offload_mib:.2f}MiB"  # noqa: E501
                 )
                 if abs_err > DELTA:
                     assert rel_err <= EPSILON_A2A, (

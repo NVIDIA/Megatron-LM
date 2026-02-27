@@ -12,7 +12,7 @@ Usage:
     export TARGET_BRANCH="main"
     export STATUS="approved"
     export COMMENT="Auto-approved by CI"
-    
+
     python approve_pending_deployments.py
 """
 

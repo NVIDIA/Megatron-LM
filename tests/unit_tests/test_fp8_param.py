@@ -1,6 +1,5 @@
 # Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
-import contextlib
 import gc
 import os
 import sys
@@ -34,7 +33,7 @@ fp8_available, reason_for_no_fp8 = check_fp8_support()
 cuda_graph_supported = False
 reason_for_no_cuda_graph = ""
 try:
-    from transformer_engine.pytorch.tensor.utils import post_all_gather_processing
+    from transformer_engine.pytorch.tensor.utils import post_all_gather_processing  # noqa: F401
 
     if is_te_min_version("2.10.0"):
         cuda_graph_supported = True
@@ -64,7 +63,6 @@ def should_disable_forward_pre_hook(args):
 
 
 class TestFP8Param:
-
     def setup_method(self, method):
         self.seq_length = 512
         self.micro_batch_size = 2
@@ -193,9 +191,9 @@ class TestFP8Param:
         )
 
         if recipe == "blockwise" and args.sequence_parallel:
-            assert (
-                tp_size * 128 <= self.seq_length
-            ), "Blockwise recipe and sequence parallelism requires tp_size * 128 <= seq_length"
+            assert tp_size * 128 <= self.seq_length, (
+                "Blockwise recipe and sequence parallelism requires tp_size * 128 <= seq_length"
+            )
 
         set_args(args)
         torch.manual_seed(_SEED)

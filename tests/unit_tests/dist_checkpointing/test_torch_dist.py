@@ -1,6 +1,6 @@
 # Copyright (c) 2024, NVIDIA CORPORATION. All rights reserved.
 
-"""Tests for PyTorch DCP based checkpoint format. """
+"""Tests for PyTorch DCP based checkpoint format."""
 
 import pickle
 from copy import deepcopy
@@ -11,7 +11,6 @@ import torch
 from megatron.core.dist_checkpointing import ShardedTensor, load, save
 from megatron.core.dist_checkpointing.dict_utils import diff
 from megatron.core.dist_checkpointing.serialization import get_default_save_sharded_strategy
-from megatron.core.dist_checkpointing.strategies.async_utils import AsyncCallsQueue
 from tests.unit_tests.dist_checkpointing import TempNamedDir
 from tests.unit_tests.test_utilities import Utils
 
@@ -78,16 +77,16 @@ class TestCachedMetadata:
         # Check loaded state dict
         diffs = diff(loaded_non_cached, loaded_cached)
 
-        assert not any(
-            len(x) for x in diffs
-        ), 'Cached metadata doesn\'t produce the same state_dict in loading'
+        assert not any(len(x) for x in diffs), (
+            'Cached metadata doesn\'t produce the same state_dict in loading'
+        )
         # Check metadata recorded in .metadata, torch.distributed.metadata.Metadata
         for field in fields(md_non_cached):
             if field.name not in ['storage_data', 'storage_meta']:
                 diffs = diff(getattr(md_non_cached, field.name), getattr(md_cached, field.name))
-                assert not any(
-                    len(x) for x in diffs
-                ), f'{field.name} is different in metadata from non-cached, cached metadata impls'
+                assert not any(len(x) for x in diffs), (
+                    f'{field.name} is different in metadata from non-cached, cached metadata impls'
+                )
         ckpt_dir.cleanup()
         Utils.destroy_model_parallel()
 

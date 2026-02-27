@@ -25,7 +25,7 @@ from megatron.core.utils import get_asyncio_loop
 from tests.unit_tests.test_utilities import Utils
 
 try:
-    import zmq
+    import zmq  # noqa: F401
 
     HAVE_ZMQ = True
 except ImportError:
@@ -303,9 +303,9 @@ class TestCoordinator:
 
             # Verify we got a different port due to conflict
             third_port = int(third_addr.rsplit(":", 1)[-1])
-            assert (
-                third_port != first_port
-            ), f"Expected different port due to conflict, but got same: {third_port}"
+            assert third_port != first_port, (
+                f"Expected different port due to conflict, but got same: {third_port}"
+            )
 
         finally:
             # Clean up engine3's coordinator

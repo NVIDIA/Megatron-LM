@@ -6,12 +6,10 @@ from types import SimpleNamespace
 import pytest
 import torch
 
-from megatron.core import parallel_state as ps
 from megatron.core.inference.contexts import StaticInferenceContext
 from megatron.core.models.gpt.gpt_layer_specs import get_gpt_layer_with_transformer_engine_spec
 from megatron.core.models.multimodal import context_parallel
 from megatron.core.models.multimodal.llava_model import LLaVAModel
-from megatron.core.models.vision.vit_layer_specs import get_vit_layer_with_transformer_engine_spec
 from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
 from megatron.core.transformer.enums import AttnMaskType
@@ -247,7 +245,7 @@ class TestLLaVAModel:
         assert torch.allclose(labels[3], expected_labels)
         assert torch.allclose(loss_mask[3], expected_loss_mask)
 
-        # Fifth sample has two images in between (indices 50 and 150). The first image has two tiles.
+        # Fifth sample has two images in between (indices 50 and 150). The first image has two tiles.  # noqa: E501
         expected_embeddings = torch.empty(max_seq_len, hidden_size).cuda()
         expected_embeddings[:50] = language_embeddings[4, :50]
         expected_embeddings[50:627] = image_embeddings[:, 4]  # two tiles
@@ -313,7 +311,7 @@ class TestLLaVAModel:
             num_image_tiles=num_image_tiles,
         )
 
-        # The maximum sequence length is given by the sample with 2 images in 3 tiles, minus two image token indices, plus other text tokens.
+        # The maximum sequence length is given by the sample with 2 images in 3 tiles, minus two image token indices, plus other text tokens.  # noqa: E501
         img_seq_len = 577
         max_seq_len = img_seq_len * 3 - 2 + 1024
         assert loss.shape == new_loss_mask.shape == torch.Size((5, max_seq_len))
@@ -402,7 +400,8 @@ class TestLLaVAModel:
     def test_forward_fsdp(self):
         """Test FSDP workaround for text-only data.
 
-        FSDP can hang with text-only data. As a workaround, we run the vision model with a dummy image,
+        FSDP can hang with text-only data. As a workaround, we run
+        the vision model with a dummy image,
         but then effectively discard the image embeddings.
         """
         self.model.cuda()
@@ -414,9 +413,9 @@ class TestLLaVAModel:
         # No image tag in the input ids (text-only sample).
         image_token_index = self.model.image_token_index
         input_ids = torch.arange(1024, device="cuda").unsqueeze(0)
-        assert (
-            torch.sum(input_ids == image_token_index) == 0
-        ), "expected no image tag in the input ids"
+        assert torch.sum(input_ids == image_token_index) == 0, (
+            "expected no image tag in the input ids"
+        )
 
         position_ids = torch.arange(1024, device="cuda").unsqueeze(0)
 
@@ -538,7 +537,6 @@ def create_test_args(cp_size, sequence_parallel):
 
 
 class TestLLaVAModelTokenParallel:
-
     def _init_llava_model(self, cp_size, tp_size, sequence_parallel):
         language_hidden_size = 64
         language_num_attention_heads = 16
@@ -574,7 +572,7 @@ class TestLLaVAModelTokenParallel:
         )
 
         language_layer_spec = get_gpt_layer_with_transformer_engine_spec()
-        # SP/CP either requires user to ensure token lengths do not require padding OR change mask type to padding
+        # SP/CP either requires user to ensure token lengths do not require padding OR change mask type to padding  # noqa: E501
         if (
             language_layer_spec.submodules.self_attention.params.get('attn_mask_type', '')
             == AttnMaskType.causal

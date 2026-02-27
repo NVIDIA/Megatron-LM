@@ -1,6 +1,5 @@
 # Copyright (c) 2024, NVIDIA CORPORATION. All rights reserved.
 from abc import ABC, abstractmethod
-from typing import List
 
 
 class AbstractEngine(ABC):
@@ -12,6 +11,7 @@ class AbstractEngine(ABC):
         To define a new backend, implement this and return the outputs as a dictionary.
 
         Returns:
-            dict: The output dictionary containing keys for `input_prompt`, `generated_text`, `generated_tokens`.
+            dict: The output dictionary containing keys for
+                `input_prompt`, `generated_text`, `generated_tokens`.
         """
         pass

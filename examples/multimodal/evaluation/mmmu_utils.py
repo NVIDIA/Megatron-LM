@@ -5,20 +5,32 @@
 
 """Utils for data load, save, and process (e.g., prompt construction)"""
 
-import os
 import json
-import yaml
 import re
+
+import yaml
 
 DOMAIN_CAT2SUB_CAT = {
     'Art and Design': ['Art', 'Art_Theory', 'Design', 'Music'],
     'Business': ['Accounting', 'Economics', 'Finance', 'Manage', 'Marketing'],
-    'Science': ['Biology', 'Chemistry', 'Geography', 'Math', 'Physics', ],
-    'Health and Medicine': ['Basic_Medical_Science', 'Clinical_Medicine', 'Diagnostics_and_Laboratory_Medicine',
-                            'Pharmacy', 'Public_Health'],
+    'Science': ['Biology', 'Chemistry', 'Geography', 'Math', 'Physics'],
+    'Health and Medicine': [
+        'Basic_Medical_Science',
+        'Clinical_Medicine',
+        'Diagnostics_and_Laboratory_Medicine',
+        'Pharmacy',
+        'Public_Health',
+    ],
     'Humanities and Social Science': ['History', 'Literature', 'Sociology', 'Psychology'],
-    'Tech and Engineering': ['Agriculture', 'Architecture_and_Engineering', 'Computer_Science', 'Electronics',
-                             'Energy_and_Power', 'Materials', 'Mechanical_Engineering'],
+    'Tech and Engineering': [
+        'Agriculture',
+        'Architecture_and_Engineering',
+        'Computer_Science',
+        'Electronics',
+        'Energy_and_Power',
+        'Materials',
+        'Mechanical_Engineering',
+    ],
 }
 
 CAT_SHORT2LONG = {
@@ -51,7 +63,7 @@ CAT_SHORT2LONG = {
     'phys': 'Physics',
     'psy': 'Psychology',
     'pub_health': 'Public_Health',
-    'socio': 'Sociology'
+    'socio': 'Sociology',
 }
 
 
@@ -85,13 +97,27 @@ def process_single_sample(data):
             break
 
     if len(o_imgs_paths) > 1:  # multiple images in options, used for random selection
-        return {'id': data['id'], 'question': question, 'options': data['options'], 'answer': data['answer'],
-                'image': None, 'question_type': data['question_type'],
-                'field': field, 'subfield': data['subfield']}
+        return {
+            'id': data['id'],
+            'question': question,
+            'options': data['options'],
+            'answer': data['answer'],
+            'image': None,
+            'question_type': data['question_type'],
+            'field': field,
+            'subfield': data['subfield'],
+        }
     else:
-        return {'id': data['id'], 'question': question, 'options': data['options'], 'answer': data['answer'],
-                'image': data['image_1'], 'question_type': data['question_type'],
-                'field': field, 'subfield': data['subfield']}
+        return {
+            'id': data['id'],
+            'question': question,
+            'options': data['options'],
+            'answer': data['answer'],
+            'image': data['image_1'],
+            'question_type': data['question_type'],
+            'field': field,
+            'subfield': data['subfield'],
+        }
 
 
 # DATA PROCESSING
@@ -117,7 +143,9 @@ def construct_prompt(sample, config):
         res_dict['all_choices'] = prediction_range
         res_dict['empty_prompt'] = empty_prompt
         if config['task_instructions']:
-            res_dict['final_input_prompt'] = config['task_instructions'].strip() + '\n\n' + empty_prompt
+            res_dict['final_input_prompt'] = (
+                config['task_instructions'].strip() + '\n\n' + empty_prompt
+            )
         else:
             res_dict['final_input_prompt'] = empty_prompt
 
@@ -128,7 +156,9 @@ def construct_prompt(sample, config):
         res_dict = {'type': 'open'}
         res_dict['empty_prompt'] = empty_prompt
         if config['task_instructions']:
-            res_dict['final_input_prompt'] = config['task_instructions'].strip() + '\n\n' + empty_prompt
+            res_dict['final_input_prompt'] = (
+                config['task_instructions'].strip() + '\n\n' + empty_prompt
+            )
         else:
             res_dict['final_input_prompt'] = empty_prompt
         res_dict['gt_content'] = sample['answer']
@@ -137,12 +167,9 @@ def construct_prompt(sample, config):
     return res_dict
 
 
-
 """Response Parsing and Evaluation for various models"""
-from typing import Dict
-
 import re
-import random
+from typing import Dict
 
 import numpy as np
 
@@ -170,7 +197,7 @@ def parse_multi_choice_response(response, all_choices, index2ans):
             if f' {choice} ' in response:
                 candidates.append(choice)
 
-    # if all above doesn't get candidates, check if the content is larger than 5 tokens and try to parse the example
+    # if all above doesn't get candidates, check if the content is larger than 5 tokens and try to parse the example  # noqa: E501
     if len(candidates) == 0 and len(response.split()) > 5:
         for index, ans in index2ans.items():
             if ans.lower() in response.lower():
@@ -274,14 +301,22 @@ def parse_open_response(response):
         key_responses = []
         response = response.strip().strip(".").lower()
         sub_responses = re.split(r'\.\s(?=[A-Z])|\n', response)
-        indicators_of_keys = ['could be ', 'so ', 'is ',
-                              'thus ', 'therefore ', 'final ', 'answer ', 'result ']
+        indicators_of_keys = [
+            'could be ',
+            'so ',
+            'is ',
+            'thus ',
+            'therefore ',
+            'final ',
+            'answer ',
+            'result ',
+        ]
         key_responses = []
         for index, resp in enumerate(sub_responses):
-            # if last one, accept it's an equation (the entire response can be just one sentence with equation)
+            # if last one, accept it's an equation (the entire response can be just one sentence with equation)  # noqa: E501
             if index == len(sub_responses) - 1:
                 indicators_of_keys.extend(['='])
-            shortest_key_response = None  # the shortest response that may contain the answer (tail part of the response)
+            shortest_key_response = None  # the shortest response that may contain the answer (tail part of the response)  # noqa: E501
             for indicator in indicators_of_keys:
                 if indicator in resp:
                     if not shortest_key_response:
@@ -317,6 +352,7 @@ def parse_open_response(response):
 
 
 # ----------- Evaluation -------------
+
 
 def eval_multi_choice(gold_i, pred_i):
     """
@@ -437,16 +473,20 @@ def mmmu_main_eval(output_dict, task_cfg):
         for data_id, parsed_pred in cat_outputs.items():
             question_type = cat_answers[data_id]['question_type']
             if question_type != 'multiple-choice':
-                parsed_pred = parse_open_response(parsed_pred)  # mainly for type consistency (make it number, etc.)
+                parsed_pred = parse_open_response(
+                    parsed_pred
+                )  # mainly for type consistency (make it number, etc.)
             else:
                 parsed_pred = parsed_pred
 
-            exampels_to_eval.append({
-                "id": data_id,
-                "question_type": question_type,
-                "answer": cat_answers[data_id]['ground_truth'],
-                "parsed_pred": parsed_pred
-            })
+            exampels_to_eval.append(
+                {
+                    "id": data_id,
+                    "question_type": question_type,
+                    "answer": cat_answers[data_id]['ground_truth'],
+                    "parsed_pred": parsed_pred,
+                }
+            )
 
         judge_dict, metric_dict = evaluate(exampels_to_eval)
         metric_dict.update({"num_example": len(exampels_to_eval)})
@@ -464,22 +504,26 @@ def mmmu_main_eval(output_dict, task_cfg):
             else:
                 pass
         in_domain_ins_acc = calculate_ins_level_acc(in_domain_cat_results)
-        in_domain_data_num = sum([cat_results['num_example'] for cat_results in in_domain_cat_results.values()])
-        printable_results['Overall-' + domain] = {"num": int(in_domain_data_num),
-                                                  "acc": round(in_domain_ins_acc, 4)
-                                                  }
+        in_domain_data_num = sum(
+            [cat_results['num_example'] for cat_results in in_domain_cat_results.values()]
+        )
+        printable_results['Overall-' + domain] = {
+            "num": int(in_domain_data_num),
+            "acc": round(in_domain_ins_acc, 4),
+        }
         # add sub category
         for cat_name, cat_results in in_domain_cat_results.items():
-            printable_results[cat_name] = {"num": int(cat_results['num_example']),
-                                           "acc": round(cat_results['acc'], 4)
-                                           }
+            printable_results[cat_name] = {
+                "num": int(cat_results['num_example']),
+                "acc": round(cat_results['acc'], 4),
+            }
 
     # table.append(["-----------------------------", "-----", "----"])
     all_ins_acc = calculate_ins_level_acc(evaluation_result)
     printable_results['Overall'] = {
         "num": sum([cat_results['num_example'] for cat_results in evaluation_result.values()]),
-        "acc": round(all_ins_acc, 4)
-        }
+        "acc": round(all_ins_acc, 4),
+    }
 
     return printable_results
 
@@ -497,7 +541,9 @@ if __name__ == '__main__':
         pred_ans = res["answer"].upper()
         gt_ans = res['gt_answer']
         if res['question_type'] == 'multiple-choice':
-            parsed_pred = parse_multi_choice_response(pred_ans, res['all_choices'], res['index2ans'])
+            parsed_pred = parse_multi_choice_response(
+                pred_ans, res['all_choices'], res['index2ans']
+            )
             if pred_ans != parsed_pred:
                 print(f"MC: Original: {pred_ans}, Parsed: {parsed_pred}")
             eval_samples.append(
@@ -526,10 +572,13 @@ if __name__ == '__main__':
             )
             eval_output_dict[res['question_id']] = pred_ans
 
-    json.dump(eval_output_dict, open("validation_mmmu_iter6000_merged.0.53.sorted.json", "w"), indent=4, sort_keys=True)
+    json.dump(
+        eval_output_dict,
+        open("validation_mmmu_iter6000_merged.0.53.sorted.json", "w"),
+        indent=4,
+        sort_keys=True,
+    )
 
-
-    x = mmmu_main_eval(eval_output_dict,
-                   task_cfg=tasks['mmmu'])
+    x = mmmu_main_eval(eval_output_dict, task_cfg=tasks['mmmu'])
 
     print(x)

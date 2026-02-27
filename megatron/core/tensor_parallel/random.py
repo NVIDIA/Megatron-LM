@@ -26,7 +26,7 @@ from megatron.core.utils import is_te_min_version, safely_set_viewless_tensor_da
 from .utils import gather_split_1d_tensor, split_tensor_into_1d_equal_chunks
 
 try:
-    import transformer_engine  # pylint: disable=unused-import
+    import transformer_engine  # noqa: F401
     from transformer_engine.pytorch.distributed import activation_recompute_forward
     from transformer_engine.pytorch.fp8 import FP8GlobalStateManager, fp8_autocast
 
@@ -359,9 +359,9 @@ def get_cuda_rng_tracker(
 def get_all_rng_states():
     """Returns all generator states used by the current `CudaRNGStatesTracker`."""
 
-    assert (
-        _CUDA_RNG_STATE_TRACKER_INITIALIZED
-    ), "Tried getting all rng states but RNG Tracker has not been initalized!"
+    assert _CUDA_RNG_STATE_TRACKER_INITIALIZED, (
+        "Tried getting all rng states but RNG Tracker has not been initalized!"
+    )
 
     if isinstance(_CUDA_RNG_STATE_TRACKER, CudaRNGStatesTracker):
         return _CUDA_RNG_STATE_TRACKER.states_
@@ -508,7 +508,6 @@ class CheckpointFunction(torch.autograd.Function):
     2) the states in the model parallel tracker are also properly tracked/set/reset.
     """
 
-    # pylint: disable=missing-function-docstring
     @staticmethod
     def forward(
         ctx: Any,
@@ -542,14 +541,12 @@ class CheckpointFunction(torch.autograd.Function):
         _unset_checkpointing()
         return outputs
 
-    # pylint: disable=missing-function-docstring
     @staticmethod
     def backward(ctx, *args):
         """Backward pass."""
         if not torch.autograd._is_checkpoint_valid():
             raise RuntimeError(
-                "Checkpointing is not compatible with .grad(), "
-                "please use .backward() if possible"
+                "Checkpointing is not compatible with .grad(), please use .backward() if possible"
             )
         _set_checkpointing()
 
@@ -692,8 +689,7 @@ class CheckpointWithoutOutput(object):
 
         if not torch.autograd._is_checkpoint_valid() and not is_graph_capturing():
             raise RuntimeError(
-                "Checkpointing is not compatible with .grad(), "
-                "please use .backward() if possible"
+                "Checkpointing is not compatible with .grad(), please use .backward() if possible"
             )
 
         with _fork_rng():

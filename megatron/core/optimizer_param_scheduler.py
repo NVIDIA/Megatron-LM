@@ -1,6 +1,7 @@
 # Copyright (c) 2022, NVIDIA CORPORATION. All rights reserved.
 
 """Learning rate decay and weight decay incr functions."""
+
 import logging
 import math
 from typing import TYPE_CHECKING, Any, Optional, TypedDict
@@ -137,7 +138,6 @@ class OptimizerParamScheduler:
         wsd_decay_steps: Optional[int] = None,
         lr_wsd_decay_style: Optional[str] = None,
     ) -> None:
-
         # Class values.
         self.optimizer = optimizer
 
@@ -171,7 +171,7 @@ class OptimizerParamScheduler:
         self.use_checkpoint_opt_param_scheduler = use_checkpoint_opt_param_scheduler
         if self.override_opt_param_scheduler:
             assert not self.use_checkpoint_opt_param_scheduler, (
-                'both override and ' 'use-checkpoint are set.'
+                'both override and use-checkpoint are set.'
             )
 
         # Set the learning rate

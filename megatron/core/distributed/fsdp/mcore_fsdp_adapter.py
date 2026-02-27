@@ -400,9 +400,9 @@ def _get_hsdp_tp_mesh(outer_fsdp_dp_group, dp_cp_group, tp_group, ep_size=1):
     # Exclude the expert parallel dimension
     rank = dist.get_rank()
     dp_tp_meshes = [per_ep_mesh for per_ep_mesh in mesh if rank in per_ep_mesh.reshape(-1).tolist()]
-    assert (
-        len(dp_tp_meshes) == 1
-    ), f"[Megatron-FSDP] Current rank {rank} is not unique in the mesh ranks {mesh.tolist()}."
+    assert len(dp_tp_meshes) == 1, (
+        f"[Megatron-FSDP] Current rank {rank} is not unique in the mesh ranks {mesh.tolist()}."
+    )
     assert (
         len(dp_tp_meshes[0].reshape(-1).tolist())
         == outer_fsdp_dp_group.size() * dp_cp_group.size() * tp_group.size()
@@ -445,9 +445,9 @@ def _get_dp_tp_mesh(dp_cp_group, tp_group, ep_size=1):
     # Exclude the expert parallel dimension
     rank = dist.get_rank()
     dp_tp_meshes = [per_ep_mesh for per_ep_mesh in mesh if rank in per_ep_mesh.reshape(-1).tolist()]
-    assert (
-        len(dp_tp_meshes) == 1
-    ), f"[Megatron-FSDP] Current rank {rank} is not unique in the mesh ranks {mesh.tolist()}."
+    assert len(dp_tp_meshes) == 1, (
+        f"[Megatron-FSDP] Current rank {rank} is not unique in the mesh ranks {mesh.tolist()}."
+    )
     assert len(dp_tp_meshes[0].reshape(-1).tolist()) == dp_cp_group.size() * tp_group.size(), (
         f"[Megatron-FSDP] DP-TP mesh size {len(dp_tp_meshes[0].reshape(-1).tolist())} "
         f"does not match expected size {dp_cp_group.size() * tp_group.size()}."

@@ -50,9 +50,9 @@ class SamplingParams:
                 "return_prompt_top_n_logprobs is deprecated, use skip_prompt_log_probs instead",
                 DeprecationWarning,
             )
-            assert (
-                not self.skip_prompt_log_probs
-            ), "return_prompt_top_n_logprobs requires skip_prompt_log_probs to be False"
+            assert not self.skip_prompt_log_probs, (
+                "return_prompt_top_n_logprobs requires skip_prompt_log_probs to be False"
+            )
         if self.top_n_logprobs > 0:
             self.return_prompt_top_n_logprobs = not self.skip_prompt_log_probs
         else:

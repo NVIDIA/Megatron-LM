@@ -15,11 +15,11 @@ from megatron.core.utils import deprecate_args, get_model_config
 DEPRECATED_ARGS = ["inference_wrapper_config", "pg_collection"]
 
 
-# pylint: disable=line-too-long
 class GPTInferenceWrapper(AbstractModelInferenceWrapper):
     """Inference wrapper for GPT model.
 
-    The wrapper prepares the model for inference, provides the required input data, and runs the forward pass
+    The wrapper prepares the model for inference, provides the
+    required input data, and runs the forward pass
 
     Args:
         model (GPTModel): The GPT model (MCore or legacy)
@@ -40,9 +40,9 @@ class GPTInferenceWrapper(AbstractModelInferenceWrapper):
         Returns:
             A dict with all the inference input needed for the batch.
         """
-        assert (
-            not self.inference_context.is_decode_only()
-        ), "`prep_inference_input` should only be called in prefill mode"
+        assert not self.inference_context.is_decode_only(), (
+            "`prep_inference_input` should only be called in prefill mode"
+        )
 
         attention_mask, position_ids = self._build_attention_mask_and_position_ids(prompts_tokens)
         return {
@@ -60,7 +60,9 @@ class GPTInferenceWrapper(AbstractModelInferenceWrapper):
             prompts_tokens (torch.Tensor): A tensor of shape [batch_size, max_seq_len]
 
         Returns:
-            Tuple[torch.Tensor, torch.Tensor]: The attention mask of shape [1, 1, max_seq_len, max_seq_len] and position ids of shape [batch_size, max_seq_len]
+            Tuple[torch.Tensor, torch.Tensor]: The attention mask of
+                shape [1, 1, max_seq_len, max_seq_len] and position
+                ids of shape [batch_size, max_seq_len]
         """
         seq_length = prompts_tokens.size(1)
         config = get_model_config(self.model)
@@ -96,12 +98,18 @@ class GPTInferenceWrapper(AbstractModelInferenceWrapper):
     ) -> Dict[str, Any]:
         """Returns the inference data given context window
 
-        This function gets called iteratively in a loop . Given the start and end context positions , it extracts the appropriate data.
+        This function gets called iteratively in a loop. Given the
+        start and end context positions, it extracts the appropriate
+        data.
 
         Args:
-            inference_input (Dict[str, Any]): The inference input for the batch.
-            context_start_position (int): Start of the context window. During the first inference step it is mostly 0
-            context_end_position (int): End of the context window. During the last inference step it will mostly be the max generated sequence length.
+            inference_input (Dict[str, Any]): The inference input
+                for the batch.
+            context_start_position (int): Start of the context window.
+                During the first inference step it is mostly 0
+            context_end_position (int): End of the context window.
+                During the last inference step it will mostly be the
+                max generated sequence length.
 
         Returns:
             Dict[str, Any]: A dict of inputs that will be used by your model in the forward step

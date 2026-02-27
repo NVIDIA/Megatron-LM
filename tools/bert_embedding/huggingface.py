@@ -23,7 +23,6 @@ class IterableTextDataset(torch.utils.data.IterableDataset):
 
 class MyFeatureExtractionPipeline(transformers.FeatureExtractionPipeline):
     def _forward(self, model_inputs):
-
         # Embed inputs.
         model_outputs = self.model(**model_inputs)
 
@@ -34,7 +33,7 @@ class MyFeatureExtractionPipeline(transformers.FeatureExtractionPipeline):
         # Collect embeddings & check for nan.
         outputs = []
         for embedding, mask in zip(embeddings, masks):
-            output = torch.mean(embedding[1: mask - 1], dim=0)
+            output = torch.mean(embedding[1 : mask - 1], dim=0)
 
             # Nans due to empty input sequences; so only check first element.
             if torch.isnan(output.view(-1)[0]).any():
@@ -43,29 +42,22 @@ class MyFeatureExtractionPipeline(transformers.FeatureExtractionPipeline):
             outputs.append(output)
 
         # Sample.
-        data = {
-            "input" : model_inputs["input_ids"],
-            "output" : outputs,
-        }
+        data = {"input": model_inputs["input_ids"], "output": outputs}
 
         return data
 
     def postprocess(self, model_outputs):
         # Return input for analysis.
-        return {
-            "input" : model_outputs["input"].numpy(),
-            "output" : model_outputs["output"].numpy(),
-        }
+        return {"input": model_outputs["input"].numpy(), "output": model_outputs["output"].numpy()}
 
 
 class HuggingfaceEmbedder:
-
     def __init__(self, batch_size, max_seq_length):
-
         # Model, tokenizer.
         self.model = transformers.BertModel.from_pretrained("bert-large-cased")
         self.tokenizer = transformers.AutoTokenizer.from_pretrained(
-            "bert-large-cased", model_max_length=max_seq_length)
+            "bert-large-cased", model_max_length=max_seq_length
+        )
 
         # Feature extraction pipeline.
         self.pipe = MyFeatureExtractionPipeline(
@@ -79,7 +71,6 @@ class HuggingfaceEmbedder:
         self.batch_size = batch_size
 
     def embed_text_dataset(self, text_dataset, verbose=True):
-
         # Wrap dataset in iterable.
         dataset = IterableTextDataset(text_dataset)
 
@@ -111,11 +102,14 @@ class HuggingfaceEmbedder:
 
         class SingleTextDataset(torch.utils.data.Dataset):
             '''Dataset that holds single string.'''
+
             def __init__(self, text):
                 assert isinstance(text, str)
                 self.text = text
+
             def __len__(self):
                 return 1
+
             def __getitem__(self, i):
                 return {"text": self.text}
 

@@ -130,23 +130,20 @@ def simple_speculative_generate(
         new_token, draft_tokens = model.pseudo_speculative_generate(input_ids, steps=steps)
 
         # Always accept the first token.
-        input_ids = output_ids[:, : offset]
+        input_ids = output_ids[:, :offset]
 
         if input_ids.shape[-1] >= output_ids.shape[-1]:
             break
 
         for i in range(draft_tokens.shape[-1]):
-            if torch.equal(draft_tokens[:, i : i + 1], output_ids[:, offset: offset + 1]):
+            if torch.equal(draft_tokens[:, i : i + 1], output_ids[:, offset : offset + 1]):
                 offset += 1
             else:
                 break
 
         # Broadcast the accepted offset from the last rank.
         offset = [offset]
-        torch.distributed.broadcast_object_list(
-            offset,
-            src=torch.distributed.get_world_size() - 1,
-        )
+        torch.distributed.broadcast_object_list(offset, src=torch.distributed.get_world_size() - 1)
 
         input_ids = output_ids[:, : offset[0]]
 

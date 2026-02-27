@@ -43,14 +43,14 @@ class VisionModalitySubmodules(ModalitySubmodules):
         )
 
         if self.input_projections:
-            assert (
-                len(self.input_projections) <= 1
-            ), "VisionModalitySubmodules currently supports only one input projection"
+            assert len(self.input_projections) <= 1, (
+                "VisionModalitySubmodules currently supports only one input projection"
+            )
 
         if self.output_projections:
-            assert (
-                len(self.output_projections) <= 1
-            ), "VisionModalitySubmodules currently supports only one output projection"
+            assert len(self.output_projections) <= 1, (
+                "VisionModalitySubmodules currently supports only one output projection"
+            )
 
     def encode(self, encoders_data_batch: Dict) -> List[torch.Tensor]:
         """Encode image data batch into a list of tensors.

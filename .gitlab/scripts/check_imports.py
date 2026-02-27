@@ -43,13 +43,7 @@ class ImportChecker:
         self.skipped: List[str] = []
 
         # Modules to skip (known problematic ones)
-        self.skip_patterns = {
-            "__pycache__",
-            ".pytest_cache",
-            ".git",
-            "test_",
-            "_test",
-        }
+        self.skip_patterns = {"__pycache__", ".pytest_cache", ".git", "test_", "_test"}
 
         # Add current directory to Python path if not already there
         current_dir = os.getcwd()
@@ -86,9 +80,7 @@ class ImportChecker:
                         module_parts = module_parts[:-9]  # Remove .__init__
 
                     full_module_name = (
-                        f"{self.package_name}.{module_parts}"
-                        if module_parts
-                        else self.package_name
+                        f"{self.package_name}.{module_parts}" if module_parts else self.package_name
                     )
 
                     if not self.should_skip_module(full_module_name):
@@ -146,12 +138,7 @@ class ImportChecker:
                 self.failures[module_name] = error_msg
 
         """Print a summary of the import check results."""
-        total = (
-            self.success_count
-            + self.failure_count
-            + self.graceful_count
-            + self.skipped_count
-        )
+        total = self.success_count + self.failure_count + self.graceful_count + self.skipped_count
 
         print("\n" + "=" * 60)
         print("IMPORT CHECK SUMMARY")
@@ -161,14 +148,14 @@ class ImportChecker:
             f"Successful imports:    {self.success_count} ({self.success_count / total * 100:.1f}%)"
         )
         print(
-            f"Gracefully handled:    {self.graceful_count} ({self.graceful_count / total * 100:.1f}%)"
+            f"Gracefully handled:    {self.graceful_count} ({self.graceful_count / total * 100:.1f}%)"  # noqa: E501
         )
         print(
             f"Failed imports:        {self.failure_count} ({self.failure_count / total * 100:.1f}%)"
         )
         if self.skipped_count > 0:
             print(
-                f"Skipped modules:       {self.skipped_count} ({self.skipped_count / total * 100:.1f}%)"
+                f"Skipped modules:       {self.skipped_count} ({self.skipped_count / total * 100:.1f}%)"  # noqa: E501
             )
 
         if self.graceful_failures:
@@ -192,11 +179,7 @@ class ImportChecker:
 
 
 @click.command()
-@click.option(
-    "--package-name",
-    required=True,
-    help="Package name to check imports for",
-)
+@click.option("--package-name", required=True, help="Package name to check imports for")
 def main(package_name: str):
     """Main entry point."""
     checker = ImportChecker(package_name=package_name)

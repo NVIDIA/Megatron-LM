@@ -6,7 +6,6 @@ import pytest
 import torch
 import torch.distributed as dist
 from packaging import version
-from pytest_mock import mocker
 
 import megatron.core.pipeline_parallel.schedules as schedule
 from megatron.core import ModelParallelConfig
@@ -592,16 +591,16 @@ def test_forward_backward_pipelining_without_interleaving_with_custom_pgs(mocker
         p2p_communicator=p2p_communicator, pg_collection=pg_collection, **common_args
     )
 
-    assert len(losses_reduced_default) == len(
-        losses_reduced_explicit
-    ), "Output lengths should be identical"
+    assert len(losses_reduced_default) == len(losses_reduced_explicit), (
+        "Output lengths should be identical"
+    )
 
     for i, (default_loss, explicit_loss) in enumerate(
         zip(losses_reduced_default, losses_reduced_explicit)
     ):
-        assert (
-            default_loss == explicit_loss
-        ), f"Loss at index {i} should be identical between default and explicit PG calls"
+        assert default_loss == explicit_loss, (
+            f"Loss at index {i} should be identical between default and explicit PG calls"
+        )
     Utils.destroy_model_parallel()
 
 

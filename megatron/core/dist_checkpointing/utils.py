@@ -1,6 +1,7 @@
 # Copyright (c) 2022-2023, NVIDIA CORPORATION.  All rights reserved.
 
-""" Helpers for manipulating sharded tensors and sharded state dicts. """
+"""Helpers for manipulating sharded tensors and sharded state dicts."""
+
 import logging
 from contextlib import contextmanager
 from time import time
@@ -201,7 +202,7 @@ def replace_prefix_for_sharding(
         if isinstance(x, (ShardedTensor, ShardedTensorFactory, ShardedObject)):
             if not x.key.startswith(old_prefix):
                 raise ValueError(f'Expected {x.key} to begin with prefix {old_prefix}')
-            x.key = f'{new_prefix}{x.key[len(old_prefix):]}'  # str.removeprefix in Python >= 3.9
+            x.key = f'{new_prefix}{x.key[len(old_prefix) :]}'  # str.removeprefix in Python >= 3.9
         return x
 
     dict_list_map_inplace(_replace_prefix, sharded_state_dict)
@@ -225,7 +226,7 @@ def apply_prefix_mapping(sharded_state_dict: ShardedStateDict, prefix_map: Dict[
         for old_prefix, new_prefix in prefix_map.items():
             if x.key.startswith(old_prefix):
                 x.key = (
-                    f'{new_prefix}{x.key[len(old_prefix):]}'  # str.removeprefix in Python >= 3.9
+                    f'{new_prefix}{x.key[len(old_prefix) :]}'  # str.removeprefix in Python >= 3.9
                 )
                 break
         return x

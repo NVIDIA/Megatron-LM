@@ -16,7 +16,6 @@ except ModuleNotFoundError:
 
 
 class _FeatureFlag:
-
     def __init__(self, default: bool = False):
         self._enabled = default
 

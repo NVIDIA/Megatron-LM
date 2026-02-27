@@ -1,5 +1,4 @@
 # Copyright (c) 2025, NVIDIA CORPORATION. All rights reserved.
-import pytest
 
 from megatron.core.resharding.nvshmem_copy_service.nvshmem_types import (
     MAX_SEGMENT_SIZE,

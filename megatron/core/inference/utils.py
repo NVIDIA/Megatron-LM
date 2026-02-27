@@ -96,7 +96,6 @@ def set_decode_expert_padding(model, set_to: bool = False, capacity_factor: int 
 
     # Update all token dispatchers
     for moe_layer in moe_layer_cache:
-
         dispatcher = moe_layer.token_dispatcher
         # turn padding on/off
         dispatcher.drop_and_pad = bool(set_to)
@@ -164,7 +163,6 @@ async def await_process_call(call, process: multiprocessing.Process, timeout: fl
 # Compatibility for Python < 3.13 asyncio Queue functionality.
 # This is necessary because asyncio Queues are broken in Python < 3.13.
 if sys.version_info < (3, 13):
-
     _SHUTDOWN_SENTINEL = object()
 
     class asyncio_QueueShutDown(Exception):

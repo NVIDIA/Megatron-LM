@@ -78,7 +78,9 @@ def get_gitlab_handle():
     def _get_handle():
         try:
             return gitlab.Gitlab(
-                f"https://{GITLAB_ENDPOINT}", private_token=RO_API_TOKEN, timeout=30  # Add timeout
+                f"https://{GITLAB_ENDPOINT}",
+                private_token=RO_API_TOKEN,
+                timeout=30,  # Add timeout
             )
         except Exception as e:
             print(f"Error creating GitLab handle: {e}")
@@ -302,7 +304,6 @@ def process_mrs(project, milestones, labels, dry_run=False):
 
     # Build and send individual messages for each MR
     for reminder in reminders:
-
         # Build message for this MR
         message = []
         message.append(f"*MR*: {reminder.mr}")

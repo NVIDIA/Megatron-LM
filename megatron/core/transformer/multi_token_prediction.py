@@ -47,7 +47,7 @@ SUPPORTED_ATTN_MASK = [
 ]
 
 try:
-    import transformer_engine as te  # pylint: disable=unused-import
+    import transformer_engine as te  # noqa: F401
 
     from megatron.core.extensions.transformer_engine_spec_provider import TESpecProvider
 
@@ -231,9 +231,9 @@ def _roll_tensor_packed_seq(tensor, shifts, dims, packed_seq_params, cp_group=No
 
     # Notice: This is a naive implementation to test the correctness,
     # a better solution will only sync the boundary tokens once.
-    assert (
-        dims == -1 or dims == tensor.dim() - 1
-    ), "Packed sequence roll only supports the last dimension."
+    assert dims == -1 or dims == tensor.dim() - 1, (
+        "Packed sequence roll only supports the last dimension."
+    )
     assert shifts == -1, "Packed sequence roll only supports a single-token left shift."
     cu_seqlens = packed_seq_params.cu_seqlens_q
     assert cu_seqlens is not None, "Packed sequence parameters must provide cu_seqlens_q."
@@ -713,7 +713,7 @@ class MultiTokenPredictionLayer(MegatronModule):
         pg_collection: Optional[ProcessGroupCollection] = None,
         # For Mamba path - pattern and submodules to build inner layers directly
         mtp_layer_pattern: Optional[str] = None,
-        mamba_submodules: Optional["MambaStackSubmodules"] = None,
+        mamba_submodules: Optional["MambaStackSubmodules"] = None,  # noqa: F821
     ):
         super().__init__(config=config)
         self.sequence_parallel = config.sequence_parallel
@@ -987,14 +987,14 @@ class MultiTokenPredictionLayer(MegatronModule):
             # Uniformly divide the total number of Transformer layers and checkpoint
             # the input activation of each divided chunk.
             # A method to further reduce memory usage reducing checkpoints.
-            assert (
-                self.config.recompute_num_layers == 1
-            ), "recompute_num_layers must be 1 for MTP recompute"
+            assert self.config.recompute_num_layers == 1, (
+                "recompute_num_layers must be 1 for MTP recompute"
+            )
             outputs = checkpoint_handler()
         elif self.config.recompute_method == 'block':
             # TODO: implement block-based recompute for MTP
             warnings.warn(
-                "recompute_method == 'block' is not supported for MTP yet." " Skipping recompute."
+                "recompute_method == 'block' is not supported for MTP yet. Skipping recompute."
             )
             outputs = forward_func(*args, **kwargs)
         else:
@@ -1191,7 +1191,7 @@ class MultiTokenPredictionBlock(MegatronModule):
         # New: For Mamba path with unified pattern syntax
         mtp_layer_pattern: Optional[str] = None,
         mtp_num_depths: int = 0,
-        mamba_submodules: Optional["MambaStackSubmodules"] = None,
+        mamba_submodules: Optional["MambaStackSubmodules"] = None,  # noqa: F821
     ):
         super().__init__(config=config)
         self.submodules = _get_mtp_block_submodules(config, spec)
@@ -1217,9 +1217,9 @@ class MultiTokenPredictionBlock(MegatronModule):
             pg_collection = ProcessGroupCollection.use_mpu_process_groups(required_pgs=['cp'])
         else:
             # Ensure the provided process groups include CP
-            assert hasattr(
-                pg_collection, 'cp'
-            ), "MultiTokenPredictionBlock pg_collection must have cp process group"
+            assert hasattr(pg_collection, 'cp'), (
+                "MultiTokenPredictionBlock pg_collection must have cp process group"
+            )
 
         self._build_layers(pg_collection)
         assert len(self.layers) > 0, "MultiTokenPredictionBlock must have at least one layer."

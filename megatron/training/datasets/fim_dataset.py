@@ -1,10 +1,11 @@
 # Copyright (c) 2025, NVIDIA CORPORATION.  All rights reserved.
 
-from typing import Dict, Tuple, Optional
-from dataclasses import dataclass, field
+import logging
+from dataclasses import dataclass
+from typing import Dict, Optional, Tuple
 
 import numpy as np
-import logging
+
 from megatron.core.datasets.gpt_dataset import GPTDataset, GPTDatasetConfig
 from megatron.core.datasets.indexed_dataset import IndexedDataset
 from megatron.core.datasets.utils import Split
@@ -202,7 +203,7 @@ class GPTFIMDataset(GPTDataset):
         """
         if self.fim_split_sample is None:
             return self._fim_permute_sequence(sequence, self.fim_rate)
-        # fim_split_sample is set: split the sample on this token and permute each fragment separately.
+        # fim_split_sample is set: split the sample on this token and permute each fragment separately.  # noqa: E501
         # Typically, if each sample is a repository, then we split again on the file level.
         # Each fragment is a file, and we permute the files.
         fragment_breaks = np.argwhere(sequence == self.fim_split_sample)
@@ -248,7 +249,6 @@ class GPTFIMDataset(GPTDataset):
         Maintain the same sample length (if transform creates a few extra tokens, drop them).
         """
         if self.np_rng.binomial(1, fim_rate):  # sample bernoulli dist
-
             contents = tokenizer._tokenizer.ids_to_text(sample)
 
             # Do not apply FIM if the sample starts with no_fim_prefix
@@ -284,7 +284,7 @@ class GPTFIMDataset(GPTDataset):
                 if diff > 0:  # too long
                     if (
                         suffix.shape[0] <= diff
-                    ):  # if there's no space to truncate the suffix: stop and report it. atm i should have stopped this from happening
+                    ):  # if there's no space to truncate the suffix: stop and report it. atm i should have stopped this from happening  # noqa: E501
                         return sample
                     suffix = suffix[: suffix.shape[0] - diff]
                 elif diff < 0:  # too short

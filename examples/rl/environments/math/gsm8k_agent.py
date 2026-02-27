@@ -14,27 +14,29 @@ TEST_SIZE = 1319
 train_dataset = raw_dataset["train"]
 test_dataset = raw_dataset["test"]
 
-assert (
-    len(train_dataset) == TRAIN_SIZE
-), f"GSM8K loading error: expected {TRAIN_SIZE} samples but got {len(train_dataset)}"
-assert (
-    len(test_dataset) == TEST_SIZE
-), f"GSM8K loading error: expected {TEST_SIZE} samples but got {len(test_dataset)}"
+assert len(train_dataset) == TRAIN_SIZE, (
+    f"GSM8K loading error: expected {TRAIN_SIZE} samples but got {len(train_dataset)}"
+)
+assert len(test_dataset) == TEST_SIZE, (
+    f"GSM8K loading error: expected {TEST_SIZE} samples but got {len(test_dataset)}"
+)
 
 
 class GSM8KAgent(MathAgent):
-    def __init__(self,
+    def __init__(
+        self,
         answer_format: str = "boxed",
         format_reward: float = 0.0,
         negative_reward: float = 0.0,
         partial_end_reward: float = 0.0,
-        **kwargs):
+        **kwargs,
+    ):
         super().__init__(
             answer_format=answer_format,
             format_reward=format_reward,
             negative_reward=negative_reward,
             partial_end_reward=partial_end_reward,
-            **kwargs
+            **kwargs,
         )
         self.env_id: str = "gsm8k"
 

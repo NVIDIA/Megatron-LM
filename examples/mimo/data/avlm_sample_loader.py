@@ -1,5 +1,3 @@
-import io
-
 def sample_loader(raw: dict) -> dict:
     """
     Load the sample from the raw data.
@@ -11,7 +9,7 @@ def sample_loader(raw: dict) -> dict:
             100_100.synthesized_6a7b3a1c-05a9-4720-b7e6-f7028415dc71.wav.flac
             100_100.synthesized_7c4b39ba-20ef-4319-bd94-291c94ad362a.wav.flac
             100_100.synthesized_932f067b-2b9a-425d-b8e6-f74ca83335a2.wav.flac
-            Content of 100_100.json: 
+            Content of 100_100.json:
                 {
                     "num_image": 7,
                     "length": 2049,
@@ -23,7 +21,8 @@ def sample_loader(raw: dict) -> dict:
                         },
                         {
                             "from": "gpt",
-                            "value": "The stop sign is red, while the one-way signs are typically black and white."
+                            "value": "The stop sign is red, while the one-way signs are "
+                            "typically black and white."
                         },
                         ...
                         {
@@ -55,12 +54,14 @@ def sample_loader(raw: dict) -> dict:
 
     jsn_content = raw["json"]
     conversation = jsn_content["conversations"]
-    
+
     # Get raw image bytes
     image_bytes = raw["img"]
 
     # Get raw audio bytes
-    audio_names = [audio_name.split('.', 1)[1] for audio_name in jsn_content["audios"]] # example of audio_name file: "100_100.synthesized_683016ff-bb67-4a12-a873-a7e5d4132903.wav.flac" -> "synthesized_683016ff-bb67-4a12-a873-a7e5d4132903.wav"
+    audio_names = [
+        audio_name.split('.', 1)[1] for audio_name in jsn_content["audios"]
+    ]  # example of audio_name file: "100_100.synthesized_683016ff-bb67-4a12-a873-a7e5d4132903.wav.flac" -> "synthesized_683016ff-bb67-4a12-a873-a7e5d4132903.wav"  # noqa: E501
     audio_name = audio_names[0]  # for now, take only the first audio
     audio_bytes = raw[audio_name]
 
@@ -81,6 +82,7 @@ def sample_loader(raw: dict) -> dict:
         image=image_bytes,
         audio=audio_bytes,
     )
+
 
 def part_filter(part: str) -> bool:
     return True

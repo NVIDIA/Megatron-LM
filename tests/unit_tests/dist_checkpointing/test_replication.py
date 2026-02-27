@@ -1,10 +1,7 @@
 # Copyright (c) 2024, NVIDIA CORPORATION. All rights reserved.
 import os
 from contextlib import contextmanager
-from dataclasses import dataclass
-from pathlib import Path
 from shutil import rmtree
-from typing import Any, Dict, List, Optional
 from unittest import mock
 
 import pytest
@@ -29,7 +26,6 @@ from nvidia_resiliency_ext.checkpointing.local.replication.strategies import (
 from megatron.training.async_utils import maybe_finalize_async_save
 from megatron.training.checkpointing import load_checkpoint, save_checkpoint
 from tests.unit_tests.dist_checkpointing import (
-    TempNamedDir,
     init_basic_mock_args,
     init_checkpointing_mock_args,
     setup_model_and_optimizer,
@@ -143,7 +139,6 @@ class TestLocalCheckpointingReplication:
                 f.name for f in self.local_ckpt_dir.rglob("*")
             }
         with self.post_init(tmp_dir_per_class, tp, pp, async_save, algo, repl_groups):
-
             ranks_to_break = [6, 3, 4]
             if dist.get_rank() in ranks_to_break:
                 rmtree(self.local_ckpt_dir)

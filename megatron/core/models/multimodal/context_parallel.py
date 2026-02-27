@@ -37,9 +37,9 @@ def get_padding(
     if has_sp and decoder_tp_comm_overlap:
         # If TP Comm Overlap is enabled for combined text+image embedding in LM backbone,
         # user needs to provide decoder_seq_len with any potential padding needed for SP+CP
-        assert (
-            decoder_seq_len is not None
-        ), "Please provide decoder seq length when using TP comm overlap for LM backbone"
+        assert decoder_seq_len is not None, (
+            "Please provide decoder seq length when using TP comm overlap for LM backbone"
+        )
         padding = decoder_seq_len - seq_len
         return padding
 

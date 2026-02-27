@@ -1,7 +1,6 @@
 # Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
 import os
-import queue
 from typing import Literal, Tuple
 
 import pytest
@@ -168,7 +167,6 @@ class DotProductAttentionModel(torch.nn.Module):
 
 
 class CompareImplementations:
-
     def _prepare_data(
         self, config: TransformerConfig, seed: int, dtype: torch.dtype = torch.bfloat16
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:

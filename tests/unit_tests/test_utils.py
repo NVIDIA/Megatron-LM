@@ -26,7 +26,6 @@ success_string = "hello,world"
 
 @util.experimental_cls(introduced_with_version="0.1.0")
 class A:
-
     def __init__(self):
         pass
 

@@ -7,7 +7,6 @@
 import random
 
 import numpy
-import pytest
 import torch
 
 from megatron.core.datasets.blended_megatron_dataset_builder import BlendedMegatronDatasetBuilder

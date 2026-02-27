@@ -160,9 +160,7 @@ def _get_thd_freqs_on_this_cp_rank(
             [
                 freqs[offset + cp_rank * cp_seg : offset + (cp_rank + 1) * cp_seg],
                 freqs[
-                    offset
-                    + full_seqlen
-                    - (cp_rank + 1) * cp_seg : offset
+                    offset + full_seqlen - (cp_rank + 1) * cp_seg : offset
                     + full_seqlen
                     - cp_rank * cp_seg
                 ],

@@ -137,7 +137,9 @@ class TestFullyShardedDataParallel:
             p2.data.copy_(p1.data)
 
         transformer_config = TransformerConfig(
-            num_attention_heads=1, num_layers=1, context_parallel_size=1  # Explicitly set CP=1
+            num_attention_heads=1,
+            num_layers=1,
+            context_parallel_size=1,  # Explicitly set CP=1
         )
         fsdp_model1 = FullyShardedDataParallel(
             config=transformer_config,
@@ -236,7 +238,9 @@ class TestFullyShardedDataParallel:
         """Test that FSDP works correctly with user buffer registration.
         This test compares the training results of the baseline fsdp with the target fsdp config.
         Baseline fsdp: nccl_ub=False, fsdp_double_buffer=False, fsdp_manual_registration=False
-        Target fsdp: nccl_ub=[True, False], fsdp_double_buffer=[True, False], fsdp_manual_registration=[True, False]
+        Target fsdp: nccl_ub=[True, False],
+            fsdp_double_buffer=[True, False],
+            fsdp_manual_registration=[True, False]
         """
         if not is_torch_min_version("2.4.0"):
             pytest.skip("Megatron FSDP requires torch >= 2.4.0")
@@ -298,7 +302,9 @@ class TestFullyShardedDataParallel:
             p2.data.copy_(p1.data)
 
         transformer_config = TransformerConfig(
-            num_attention_heads=1, num_layers=1, context_parallel_size=1  # Explicitly set CP=1
+            num_attention_heads=1,
+            num_layers=1,
+            context_parallel_size=1,  # Explicitly set CP=1
         )
         baseline_fsdp_model = FullyShardedDataParallel(
             config=transformer_config,
@@ -416,7 +422,9 @@ class TestFullyShardedDataParallel:
 
             # Wrap first model with default process groups
             transformer_config = TransformerConfig(
-                num_attention_heads=1, num_layers=1, context_parallel_size=1  # Explicitly set CP=1
+                num_attention_heads=1,
+                num_layers=1,
+                context_parallel_size=1,  # Explicitly set CP=1
             )
             fsdp_model = FullyShardedDataParallel(
                 config=transformer_config,
@@ -512,13 +520,14 @@ def ref_cache():
 
 
 class TestMegatronFSDPE2E:
-
     @staticmethod
     def _training_loop(seed=42, **kwargs):
         """
-        Run a small deterministic (optional) training loop using a mocked MoE/GPT model and optimizer.
-        This helper initializes model-parallel state, creates a model and optimizer via
-        make_moe_args_model_and_optimizer, constructs a mock GPT data iterator, and runs
+        Run a small deterministic (optional) training loop using a
+        mocked MoE/GPT model and optimizer. This helper initializes
+        model-parallel state, creates a model and optimizer via
+        make_moe_args_model_and_optimizer, constructs a mock GPT
+        data iterator, and runs
         NUM_TRAINING_STEPS iterations of forward/backward/optimization. Losses from each
         training step are collected and returned.
         Args:
@@ -527,29 +536,46 @@ class TestMegatronFSDPE2E:
                 - vocab_size (int): Vocabulary size for the mock model. Default: 100.
                 - seq_length (int): Sequence length used for the mock data. Default: 128.
                 - micro_batch_size (int): Per-microbatch size. Default: 2.
-                - global_batch_size (int): Global batch size across data-parallel ranks. Default: 32.
-                - train_iters (int): Number of training iterations to run. Default: 20.
-                - tensor_model_parallel_size (int): Tensor model parallel world size. Default: 1.
-                - pipeline_model_parallel_size (int): Pipeline model parallel world size. Default: 1.
-                - num_layers_per_virtual_pipeline_stage (int or None): Virtual pipeline configuration.
-                - expert_model_parallel_size (int): Expert model parallel size for MoE. Default: 1.
-                - expert_tensor_parallel_size (int): Expert tensor parallel size for MoE. Default: 1.
-                - num_distributed_optimizer_instances (int): Number of distributed optimizer instances. Default: 1.
+                - global_batch_size (int): Global batch size across
+                    data-parallel ranks. Default: 32.
+                - train_iters (int): Number of training iterations
+                    to run. Default: 20.
+                - tensor_model_parallel_size (int): Tensor model
+                    parallel world size. Default: 1.
+                - pipeline_model_parallel_size (int): Pipeline model
+                    parallel world size. Default: 1.
+                - num_layers_per_virtual_pipeline_stage (int or
+                    None): Virtual pipeline configuration.
+                - expert_model_parallel_size (int): Expert model
+                    parallel size for MoE. Default: 1.
+                - expert_tensor_parallel_size (int): Expert tensor
+                    parallel size for MoE. Default: 1.
+                - num_distributed_optimizer_instances (int): Number
+                    of distributed optimizer instances. Default: 1.
         Returns:
-            list: A list of length train_iters containing the per-step language-model loss values
-            (the value appended from output[-1] each iteration). Loss objects are returned as produced
-            by the training utilities (typically tensors or scalars).
+            list: A list of length train_iters containing the
+            per-step language-model loss values (the value appended
+            from output[-1] each iteration). Loss objects are
+            returned as produced by the training utilities
+            (typically tensors or scalars).
         Side effects:
-            - Calls Utils.initialize_model_parallel(...) and Utils.destroy_model_parallel().
+            - Calls Utils.initialize_model_parallel(...) and
+              Utils.destroy_model_parallel().
             - Sets global RNG state via set_manual_seed(seed).
-            - Constructs models/optimizers via make_moe_args_model_and_optimizer and a data iterator
+            - Constructs models/optimizers via
+              make_moe_args_model_and_optimizer and a data iterator
               via make_gpt_mock_data_iterator.
-            - Runs optimizer.zero_grad(), pretrain_forward_backward(...), and optim.step() repeatedly.
+            - Runs optimizer.zero_grad(),
+              pretrain_forward_backward(...), and optim.step()
+              repeatedly.
             - Calculates the number of micro-batches per step as:
-                global_batch_size // micro_batch_size // data_parallel_world_size.
-              This requires that global_batch_size be divisible by micro_batch_size * data_parallel_world_size.
+                global_batch_size // micro_batch_size //
+                data_parallel_world_size.
+              This requires that global_batch_size be divisible by
+              micro_batch_size * data_parallel_world_size.
         Raises:
-            ValueError: If batch-size arithmetic or other setup assumptions (e.g., divisibility) are violated.
+            ValueError: If batch-size arithmetic or other setup
+                assumptions (e.g., divisibility) are violated.
         """
         # Configuration parameters with defaults
         VOCAB_SIZE = kwargs.get("vocab_size", 100)

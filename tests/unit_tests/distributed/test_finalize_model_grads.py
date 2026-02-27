@@ -1,6 +1,5 @@
 # Copyright (c) 2023, NVIDIA CORPORATION. All rights reserved.
 
-import inspect
 import os
 
 import pytest
@@ -20,7 +19,6 @@ from tests.unit_tests.test_utilities import Utils
 
 
 class TestAllReduceLNGrads:
-
     def init_model(self, share_embeddings_and_output_weights: bool = False):
         self.transformer_config = TransformerConfig(
             num_layers=2,

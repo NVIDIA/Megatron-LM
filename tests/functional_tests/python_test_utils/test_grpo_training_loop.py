@@ -110,17 +110,16 @@ def test_grpo_training_loop(
     if extra_in_current:
         logger.info(f"Ignoring extra metrics in current run: {extra_in_current}")
 
-    assert set(output_groundtruth.keys()).issubset(
-        set(output_current.keys())
-    ), f"Some IDs from groundtruth are missing in current: {output_groundtruth.keys()} vs {output_current.keys()}"
+    assert set(output_groundtruth.keys()).issubset(set(output_current.keys())), (
+        f"Some IDs from groundtruth are missing in current: {output_groundtruth.keys()} vs {output_current.keys()}"  # noqa: E501
+    )
     if set(output_groundtruth.keys()) != set(output_current.keys()):
         logger.warning(
-            f"Some IDs from groundtruth are missing in output, only the subset of ids in groundtruth will be tested: {output_groundtruth.keys()} vs {output_current.keys()}"
+            f"Some IDs from groundtruth are missing in output, only the subset of ids in groundtruth will be tested: {output_groundtruth.keys()} vs {output_current.keys()}"  # noqa: E501
         )
     assert len(output_groundtruth) > 0, "No test performed for output"
 
     if "iteration-time" in metrics and "iteration-time" in output_current:
-
         # First warmup iteration is excluded from iteration-time statistics.
         iteration_time_sampled = median(
             [l for l in output_current["iteration-time"]['values'].values()][start_step:]
@@ -141,7 +140,6 @@ def test_grpo_training_loop(
         output_groundtruth.pop('iteration-time')
 
     if "lm-loss" in metrics and "lm-loss" in output_current:
-
         # Validate lm-loss values with tolerance to account for hardware variance.
         # Previously required exact matching, but this caused flaky failures due to
         # floating-point differences across different GPU hardware.
@@ -169,7 +167,6 @@ def test_grpo_training_loop(
         output_groundtruth.pop('lm-loss')
 
     if "mem-allocated-bytes" in metrics and "mem-allocated-bytes" in output_current:
-
         # Use max instead of median - we care about worst-case memory usage
         # Skip first step (warmup) which may have different memory characteristics
         current_values = [l for l in output_current["mem-allocated-bytes"]['values'].values()][1:]
@@ -183,7 +180,7 @@ def test_grpo_training_loop(
         upper_bound = (1 + MEM_ALLOCATED_BYTES_RELATIVE_TOLERANCE) * mem_allocated_bytes_golden
         assert mem_allocated_bytes_sampled <= upper_bound, (
             f"Max mem allocated bytes {mem_allocated_bytes_sampled} bytes exceeds "
-            f"{MEM_ALLOCATED_BYTES_RELATIVE_TOLERANCE:.0%} above golden max {mem_allocated_bytes_golden} bytes. "
+            f"{MEM_ALLOCATED_BYTES_RELATIVE_TOLERANCE:.0%} above golden max {mem_allocated_bytes_golden} bytes. "  # noqa: E501
             f"Upper bound: {upper_bound} bytes. "
             f"Please update golden values in the functional tests if this is expected."
         )
@@ -191,7 +188,6 @@ def test_grpo_training_loop(
         output_groundtruth.pop('mem-allocated-bytes')
 
     if "mem-max-allocated-bytes" in metrics and "mem-max-allocated-bytes" in output_current:
-
         # Use max - we care that peak memory doesn't exceed the golden peak
         # Skip first step (warmup) which may have different memory characteristics
         current_values = [l for l in output_current["mem-max-allocated-bytes"]['values'].values()][
@@ -209,7 +205,7 @@ def test_grpo_training_loop(
         ) * mem_max_allocated_bytes_golden
         assert mem_max_allocated_bytes_sampled <= upper_bound, (
             f"Max mem-max-allocated bytes {mem_max_allocated_bytes_sampled} bytes exceeds "
-            f"{MEM_MAX_ALLOCATED_BYTES_RELATIVE_TOLERANCE:.0%} above golden max {mem_max_allocated_bytes_golden} bytes. "
+            f"{MEM_MAX_ALLOCATED_BYTES_RELATIVE_TOLERANCE:.0%} above golden max {mem_max_allocated_bytes_golden} bytes. "  # noqa: E501
             f"Upper bound: {upper_bound} bytes. "
             f"Please update golden values in the functional tests if this is expected."
         )

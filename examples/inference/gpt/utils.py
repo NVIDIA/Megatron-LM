@@ -1,13 +1,11 @@
 # Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
 import copy
-import itertools
 import json
 import random
 import time
-from argparse import ArgumentParser, Namespace
-from functools import partial
-from typing import Any, List, Optional
+from argparse import Namespace
+from typing import Any, Optional
 
 import torch
 from tqdm import tqdm
@@ -17,7 +15,6 @@ from megatron.core.inference.contexts.dynamic_context import get_mem_size_str
 from megatron.core.inference.inference_request import DynamicInferenceRequest
 from megatron.core.inference.sampling_params import SamplingParams
 from megatron.core.transformer.module import MegatronModule
-from megatron.training import get_args
 
 
 def get_default_sampling_params(termination_id: int = None):
@@ -136,7 +133,6 @@ def get_time_offsets(
 def get_cli_requests(
     args: Namespace, tokenizer: Any, sampling_params: Optional[SamplingParams] = None
 ) -> list[Request]:
-
     # Get time offsets.
     t_offsets = get_time_offsets(
         args.seed,
@@ -261,7 +257,9 @@ def build_dynamic_engine_setup_prefix(
 
     Example output:
 
-    `dynamic | cg True | prompts: synth(16 256), n 1024, g 512, t 1.0e+02 5.0e-01 | bf 4, 1.2 [r 1024, t 8192] | gtd 0.50 [r 512] | reqs 100` # pylint: disable=line-too-long
+    `dynamic | cg True | prompts: synth(16 256), n 1024, g 512,
+    t 1.0e+02 5.0e-01 | bf 4, 1.2 [r 1024, t 8192] |
+    gtd 0.50 [r 512] | reqs 100`
 
     Args:
         args (Namespace): Command-line arguments for this run.
@@ -292,17 +290,17 @@ def build_dynamic_engine_setup_prefix(
         )
     )
     request_str = (
-        f"requests: {prompt_src_str}, " f"n {len(requests):d}, g {args.num_tokens_to_generate:d}, "
+        f"requests: {prompt_src_str}, n {len(requests):d}, g {args.num_tokens_to_generate:d}, "
     )
     request_str += (
-        f"dur {args.incoming_requests_duration:.1e} " f"r/sec {args.incoming_requests_per_sec:.1e}"
+        f"dur {args.incoming_requests_duration:.1e} r/sec {args.incoming_requests_per_sec:.1e}"
         if args.incoming_requests_per_step is None
         else f"r/step {args.incoming_requests_per_step}"
     )
 
     # Buffer limits config
     buffer_limits_str = (
-        f"bf: {get_mem_size_str(args.inference_dynamic_batching_buffer_size_gb*1024**3)}, "
+        f"bf: {get_mem_size_str(args.inference_dynamic_batching_buffer_size_gb * 1024**3)}, "
         f"{context.block_allocator.active_count} chunks "
         f"[r {context.max_requests}, t {context.max_tokens}]"
     )

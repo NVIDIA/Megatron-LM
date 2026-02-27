@@ -24,7 +24,7 @@ from megatron.training import get_args
 from megatron.training.checkpointing import get_checkpoint_name
 
 
-def datasets_provider(task_encoder,worker_config=None):
+def datasets_provider(task_encoder, worker_config=None):
     """Create multimodal train, validation and test datasets."""
     args = get_args()
 
@@ -70,13 +70,13 @@ def datasets_provider(task_encoder,worker_config=None):
 
 def is_first_or_last_stage(pp_size):
     """Check if the current pipeline parallel stage is the first or last stage."""
-    if pp_size == 1:    # No pipeline parallelism.
+    if pp_size == 1:  # No pipeline parallelism.
         return True
 
-    # With no separate pipeline stage for the vision model (epp=0), 
+    # With no separate pipeline stage for the vision model (epp=0),
     # run the dataloader on the first and last pipeline stage.
     pp_rank = get_pipeline_model_parallel_rank()
-    is_valid_rank = pp_rank in (0, pp_size-1)
+    is_valid_rank = pp_rank in (0, pp_size - 1)
 
     return is_valid_rank
 
@@ -95,7 +95,7 @@ def is_dataloader_rank():
 def train_valid_test_dataloaders_provider(train_val_test_num_samples, task_encoder=None):
     """Build multimodal train, validation and test dataloaders."""
     args = get_args()
-    
+
     if task_encoder is None:
         task_encoder = TaskEncoder()
 
@@ -127,7 +127,7 @@ def train_valid_test_dataloaders_provider(train_val_test_num_samples, task_encod
             data_save_name = get_checkpoint_name(
                 args.dataloader_save,
                 args.iteration,
-                pipeline_rank=0,    # Only the first pipeline parallel rank stores the dataloader checkpoint.
+                pipeline_rank=0,  # Only the first pipeline parallel rank stores the dataloader checkpoint.  # noqa: E501
                 basename=f"train_dataloader_dprank{dp_rank:03d}.pt",
             )
             if os.path.exists(data_save_name):
@@ -151,6 +151,7 @@ def train_valid_test_dataloaders_provider(train_val_test_num_samples, task_encod
 
 class EnergonDataloader:
     """A wrapper to use Megatron Energon dataloader with the Megatron-LM training loop."""
+
     def __init__(self, dataloader):
         self._dataloader = dataloader
         self._iter = iter(cyclic_iter(dataloader))

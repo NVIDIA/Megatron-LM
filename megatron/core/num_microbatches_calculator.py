@@ -174,9 +174,9 @@ def _configure_global_num_microbatches_calculator(
     global _GLOBAL_NUM_MICROBATCHES_CALCULATOR
 
     if init:
-        assert (
-            _GLOBAL_NUM_MICROBATCHES_CALCULATOR is None
-        ), 'num microbatches calculator is already initialized.'
+        assert _GLOBAL_NUM_MICROBATCHES_CALCULATOR is None, (
+            'num microbatches calculator is already initialized.'
+        )
 
     _GLOBAL_NUM_MICROBATCHES_CALCULATOR = _build_num_microbatches_calculator(
         rank,
@@ -320,7 +320,6 @@ class ConstantNumMicroBatchesCalculator(NumMicroBatchesCalculator):
         decrease_batch_size_if_needed: bool,
         rank: int,
     ) -> None:
-
         micro_batch_times_data_parallel_size = micro_batch_size * data_parallel_size
         if decrease_batch_size_if_needed:
             running_global_batch_size = _round(
@@ -345,9 +344,9 @@ class ConstantNumMicroBatchesCalculator(NumMicroBatchesCalculator):
             )
             running_global_batch_size = global_batch_size
             self.num_micro_batches = global_batch_size // micro_batch_times_data_parallel_size
-        assert (
-            self.num_micro_batches >= 1
-        ), 'number of microbatches should be at least 1, got {}.'.format(self.num_micro_batches)
+        assert self.num_micro_batches >= 1, (
+            'number of microbatches should be at least 1, got {}.'.format(self.num_micro_batches)
+        )
 
         self.current_global_batch_size = global_batch_size
         self.current_running_global_batch_size = running_global_batch_size

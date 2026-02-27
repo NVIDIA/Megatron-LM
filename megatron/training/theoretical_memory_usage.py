@@ -2,8 +2,8 @@
 
 """Computes theoretical memory footprint for model training."""
 
-
 import math
+
 from .utils import print_rank_0
 
 NUM_BYTES_IN_MEGABYTE = 1024 * 1024
@@ -19,7 +19,7 @@ def compute_weight_and_optimizer_memory(args, verbose=False):
     # MoE.
     num_experts = 1 if args.num_experts is None else args.num_experts
     gated_linear_multiplier = 3 / 2 if args.swiglu else 1
-    
+
     shared_expert_ffn_hidden_size = (
         0
         if args.moe_shared_expert_intermediate_size is None
@@ -62,19 +62,29 @@ def compute_weight_and_optimizer_memory(args, verbose=False):
     if args.multi_latent_attention:
         assert not args.group_query_attention
         if args.q_lora_rank is None:
-            q_term = args.hidden_size * args.num_attention_heads * (args.qk_head_dim + args.qk_pos_emb_head_dim)
+            q_term = (
+                args.hidden_size
+                * args.num_attention_heads
+                * (args.qk_head_dim + args.qk_pos_emb_head_dim)
+            )
         else:
             ## q lora + rope + q norm
-            q_term = args.q_lora_rank * (args.hidden_size + args.num_attention_heads * (args.qk_head_dim + args.qk_pos_emb_head_dim) + norm_size) 
-        
+            q_term = args.q_lora_rank * (
+                args.hidden_size
+                + args.num_attention_heads * (args.qk_head_dim + args.qk_pos_emb_head_dim)
+                + norm_size
+            )
+
         self_attn_term = (
             q_term
-
             ## kv lora + rope + kv norm
             + args.kv_lora_rank
-            * (args.hidden_size + args.num_attention_heads * (args.qk_head_dim + args.v_head_dim) + norm_size)
+            * (
+                args.hidden_size
+                + args.num_attention_heads * (args.qk_head_dim + args.v_head_dim)
+                + norm_size
+            )
             + args.hidden_size * args.qk_pos_emb_head_dim
-
             ## o proj
             + (args.num_attention_heads * args.v_head_dim) * args.hidden_size
         )
@@ -83,12 +93,11 @@ def compute_weight_and_optimizer_memory(args, verbose=False):
             2
             * args.hidden_size
             * args.hidden_size
-            * (
-                # Attention.
-                (
-                    (1 + (args.num_query_groups / args.num_attention_heads))
-                    * query_projection_to_hidden_size_ratio
-                )
+            *
+            # Attention.
+            (
+                (1 + (args.num_query_groups / args.num_attention_heads))
+                * query_projection_to_hidden_size_ratio
             )
         )
 
@@ -108,7 +117,7 @@ def compute_weight_and_optimizer_memory(args, verbose=False):
         * args.hidden_size
         * (
             # MoE MLP.
-            + (moe_ffn_hidden_size * num_experts * gated_linear_multiplier)
+            +(moe_ffn_hidden_size * num_experts * gated_linear_multiplier)
             # Shared MoE MLP.
             + (shared_expert_ffn_hidden_size * gated_linear_multiplier)
             # Transformer layernorms.
@@ -152,7 +161,7 @@ def compute_weight_and_optimizer_memory(args, verbose=False):
         )
         print(f"Total number of parameters in billions: {num_total_parameters / 10**9:.2f}")
 
-    # Most loaded model shard has (1/pp_size transformer layers + 1 mtp block + 1 embedding layer) / tp_size.
+    # Most loaded model shard has (1/pp_size transformer layers + 1 mtp block + 1 embedding layer) / tp_size.  # noqa: E501
     num_parameters_on_most_loaded_model_shard = (
         (num_parameters_in_transformer_block / args.pipeline_model_parallel_size)
         + num_parameters_in_mtp_block
@@ -233,12 +242,12 @@ def compute_activation_memory(args, num_microbatches, verbose=False):
         )
         if verbose:
             print(
-                f"Memory penalty from interleaved schedule: {interleaved_schedule_memory_penalty:.2f}"
+                f"Memory penalty from interleaved schedule: {interleaved_schedule_memory_penalty:.2f}"  # noqa: E501
             )
             print(f"Number of in-flight microbatches: {in_flight_microbatches}")
         activation_memory *= interleaved_schedule_memory_penalty
 
-    # If using non-interleaved schedule, number of microbatches in pipeline can be less than pp_size,
+    # If using non-interleaved schedule, number of microbatches in pipeline can be less than pp_size,  # noqa: E501
     # so discount accordingly.
     if args.virtual_pipeline_model_parallel_size is None and args.pipeline_model_parallel_size > 1:
         if num_microbatches is not None:
@@ -267,7 +276,12 @@ def compute_activation_memory_without_sp(args, num_microbatches, verbose=False):
     """Compute activation memory without sequence parallelism"""
 
     # 4. Compute per-layer memory
-    per_layer_memory = args.seq_length * args.micro_batch_size * args.hidden_size * (10 + (24 / args.tensor_model_parallel_size))
+    per_layer_memory = (
+        args.seq_length
+        * args.micro_batch_size
+        * args.hidden_size
+        * (10 + (24 / args.tensor_model_parallel_size))
+    )
 
     if verbose:
         print(
@@ -303,7 +317,7 @@ def compute_activation_memory_without_sp(args, num_microbatches, verbose=False):
         )
         if verbose:
             print(
-                f"Memory penalty from interleaved schedule: {interleaved_schedule_memory_penalty:.2f}"
+                f"Memory penalty from interleaved schedule: {interleaved_schedule_memory_penalty:.2f}"  # noqa: E501
             )
             print(f"Number of in-flight microbatches: {in_flight_microbatches}")
         total_activation_memory *= interleaved_schedule_memory_penalty
@@ -339,7 +353,9 @@ def compute_activation_memory_without_sp(args, num_microbatches, verbose=False):
 
 def report_theoretical_memory(args, num_microbatches=None, verbose=False):
     if args.is_hybrid_model:
-        print("Theoretical memory footprints not yet supported for hybrid Mamba-Transformer models.")
+        print(
+            "Theoretical memory footprints not yet supported for hybrid Mamba-Transformer models."
+        )
         return
 
     weight_and_optimizer_memory = (
@@ -356,14 +372,16 @@ def report_theoretical_memory(args, num_microbatches=None, verbose=False):
     else:
         print_rank_0("compute_activation_memory_without_sp")
         activation_memory = (
-            compute_activation_memory_without_sp(args, num_microbatches=num_microbatches, verbose=verbose)
+            compute_activation_memory_without_sp(
+                args, num_microbatches=num_microbatches, verbose=verbose
+            )
             / NUM_BYTES_IN_MEGABYTE
         )
 
     total_memory = weight_and_optimizer_memory + activation_memory
 
     print(
-        f"Theoretical memory footprints: weight and optimizer={weight_and_optimizer_memory:.2f} MB, "
+        f"Theoretical memory footprints: weight and optimizer={weight_and_optimizer_memory:.2f} MB, "  # noqa: E501
         f"activation={activation_memory:.2f} MB, total={total_memory:.2f} MB\n"
     )
 

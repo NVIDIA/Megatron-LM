@@ -132,17 +132,23 @@ def compile_allocator():
 
           cudaMemAdvise(ptr, (size_t)size, cudaMemAdviseSetPreferredLocation, location);
 
-          // cudaMemAdviseSetAccessedBy ensures the memory always lives in the device's page table.
-          // Even if the memory has to be migrated away from the device, it still does not page fault.
-          // The CUDA docs claim that cudaMemAdviseSetPreferredLocation completely overrides this flag,
-          // but there is no harm in adding this flag as well for future-proofing.
+          // cudaMemAdviseSetAccessedBy ensures the memory always
+          // lives in the device's page table. Even if the memory
+          // has to be migrated away from the device, it still does
+          // not page fault. The CUDA docs claim that
+          // cudaMemAdviseSetPreferredLocation completely overrides
+          // this flag, but there is no harm in adding this flag
+          // as well for future-proofing.
           cudaMemAdvise(ptr, (size_t)size, cudaMemAdviseSetAccessedBy, location);
         #else
           cudaMemAdvise(ptr, (size_t)size, cudaMemAdviseSetPreferredLocation, device);
-          // cudaMemAdviseSetAccessedBy ensures the memory always lives in the device's page table.
-          // Even if the memory has to be migrated away from the device, it still does not page fault.
-          // The CUDA docs claim that cudaMemAdviseSetPreferredLocation completely overrides this flag,
-          // but there is no harm in adding this flag as well for future-proofing.
+          // cudaMemAdviseSetAccessedBy ensures the memory always
+          // lives in the device's page table. Even if the memory
+          // has to be migrated away from the device, it still does
+          // not page fault. The CUDA docs claim that
+          // cudaMemAdviseSetPreferredLocation completely overrides
+          // this flag, but there is no harm in adding this flag
+          // as well for future-proofing.
           cudaMemAdvise(ptr, (size_t)size, cudaMemAdviseSetAccessedBy, device);
         #endif
       }
@@ -176,7 +182,8 @@ def compile_allocator():
       return (int)err;
     }
 
-    // Update preferred location advice for managed memory (GPU device id, or CPU with cudaCpuDeviceId == -1).
+    // Update preferred location advice for managed memory
+    // (GPU device id, or CPU with cudaCpuDeviceId == -1).
     EXPORT int managed_advise_preferred_location(void* ptr, size_t size, int device) {
       cudaError_t err;
       #if CUDART_VERSION >= 13000

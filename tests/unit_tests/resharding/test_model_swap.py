@@ -1,8 +1,7 @@
 # Copyright (c) 2024, NVIDIA CORPORATION. All rights reserved.
 import copy
-import os
 import types
-from typing import List, Optional, Tuple
+from typing import Optional
 
 import pytest
 import torch
@@ -11,22 +10,15 @@ import torch.distributed as dist
 from megatron.core import parallel_state as mpu
 from megatron.core.hyper_comm_grid import HyperCommGrid
 from megatron.core.model_parallel_config import ModelParallelConfig
-from megatron.core.models.gpt.gpt_layer_specs import (
-    get_gpt_layer_local_spec,
-    get_gpt_layer_with_transformer_engine_spec,
-)
+from megatron.core.models.gpt.gpt_layer_specs import get_gpt_layer_with_transformer_engine_spec
 from megatron.core.models.gpt.gpt_model import GPTModel
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.resharding.refit import clear_all_caches, swap_model_weights
-from megatron.core.tensor_parallel.layers import ColumnParallelLinear, RowParallelLinear
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
-from megatron.core.transformer.cuda_graphs import CudaGraphManager, _CudagraphGlobalRecord
 from megatron.core.transformer.transformer_config import TransformerConfig
 from tests.unit_tests.test_utilities import Utils
 
 try:
-    import nvshmem.core
-
     has_nvshmem = True
 except Exception:
     has_nvshmem = False
@@ -223,7 +215,7 @@ def test_swap_gpt_parametrized(
         dst_cfg.add_bias_linear = False
         # Require Transformer Engine for TEGroupedMLP; skip if unavailable
         try:
-            import transformer_engine
+            pass
         except Exception:
             Utils.destroy_model_parallel()
             pytest.skip("Transformer Engine not available; skipping TE-grouped MoE test")
@@ -291,9 +283,9 @@ def test_swap_gpt_parametrized(
 
     # Compare
     assert ref_logits.shape == dst_logits.shape
-    assert torch.allclose(
-        dst_logits, ref_logits, atol=1e-4, rtol=1e-4
-    ), f"Refit src(TP={src_tp},PP={src_pp})->dst(TP={dst_tp},PP={dst_pp}) GPT outputs differ"
+    assert torch.allclose(dst_logits, ref_logits, atol=1e-4, rtol=1e-4), (
+        f"Refit src(TP={src_tp},PP={src_pp})->dst(TP={dst_tp},PP={dst_pp}) GPT outputs differ"
+    )
     dist.barrier()
 
     # Clear refit caches before destroying model parallel to avoid stale plans

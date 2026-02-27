@@ -452,7 +452,6 @@ class MambaStack(MegatronModule):
         layer_prefix = f'{prefix}layers.'
 
         for local_layer_idx, layer in enumerate(self.layers):
-
             global_layer_offset = layer.layer_number - 1  # self.layer_number starts at 1
             state_dict_prefix = (
                 f'{layer_prefix}{local_layer_idx}.'  # module list index in MambaBlock

@@ -26,7 +26,7 @@ from megatron.core.dist_checkpointing import (
     remove_sharded_tensors,
     save,
 )
-from megatron.core.dist_checkpointing.core import CheckpointingException, maybe_load_config
+from megatron.core.dist_checkpointing.core import CheckpointingException
 from megatron.core.dist_checkpointing.dict_utils import diff
 from megatron.core.dist_checkpointing.mapping import ShardedObject, ShardedTensorFactory
 from megatron.core.dist_checkpointing.serialization import (
@@ -171,9 +171,9 @@ class TestSerialization:
                     found_detailed_match = True
                     break
 
-            assert (
-                found_detailed_match
-            ), f"Did not find expected log message format for mismatch on rank {rank}. Expected: {expected_full_message}"
+            assert found_detailed_match, (
+                f"Did not find expected log message format for mismatch on rank {rank}. Expected: {expected_full_message}"  # noqa: E501
+            )
 
         Utils.destroy_model_parallel()
 
@@ -334,7 +334,7 @@ class TestSerialization:
             assert sharded_state_dict['keyA'].replica_id == 0
             assert sharded_state_dict['keyB'].replica_id == 0
 
-            # metadata dict can be loaded. We don't validate access because there are multiple replica_id=0
+            # metadata dict can be loaded. We don't validate access because there are multiple replica_id=0  # noqa: E501
             state_dict = load(sharded_state_dict, ckpt_dir, validate_access_integrity=False)
             assert torch.all(state_dict['keyA'] == torch.arange(10 * Utils.world_size))
 
@@ -776,9 +776,7 @@ class TestSerialization:
                     cumsum_content_split = torch.cumsum(
                         torch.tensor(list(map(sum, content_split))), 0
                     )
-                    for (
-                        idx
-                    ) in (
+                    for idx in (
                         cumsum_content_split
                     ):  # this handles `data[cumsum_content_split] += 1` with repeating values
                         if idx < len(data):
@@ -1017,7 +1015,6 @@ class TestNonStrictLoad:
 
     @pytest.mark.parametrize('save_format', ['torch_dist'])
     def test_sharded_metadata(self, tmp_path_dist_ckpt, save_format):
-
         sharded_state_dict = self._get_base_state_dict()
         with TempNamedDir(tmp_path_dist_ckpt / 'test_exact_load_handling') as ckpt_dir:
             save_strategy = get_default_strategy(StrategyAction.SAVE_SHARDED, save_format, 1)

@@ -35,7 +35,14 @@ def _te_rms_norm_kernel(x: torch.Tensor, weight: torch.Tensor, eps: float):
     x_shape = x.shape
     x = x.view(-1, x.size(-1))
     out, _, _ = tex.rmsnorm_fwd(
-        x, weight, eps, None, None, TE_DType[x.dtype], 16, False  # sm-margin  # zero centered gamma
+        x,
+        weight,
+        eps,
+        None,
+        None,
+        TE_DType[x.dtype],
+        16,
+        False,  # sm-margin  # zero centered gamma
     )
     out = out.view(*x_shape[:-1], -1)
     return out.to(x.dtype)
@@ -80,16 +87,16 @@ class InferenceLayerNormColumnParallelLinear(TELayerNormColumnParallelLinear):
         self.tp_group = get_tensor_model_parallel_group_if_none(tp_group, is_expert=is_expert)
         self.tp_size = dist.get_world_size(self.tp_group)
 
-        assert (
-            output_size % self.tp_size == 0
-        ), f"output_size ({output_size}) must be divisible by tp_size ({self.tp_size})"
+        assert output_size % self.tp_size == 0, (
+            f"output_size ({output_size}) must be divisible by tp_size ({self.tp_size})"
+        )
 
         self.eps = config.layernorm_epsilon
 
         if self.tp_size > 1:
-            assert (
-                config.sequence_parallel
-            ), "--transformer-impl=inference_optimized requires --sequence-parallel"
+            assert config.sequence_parallel, (
+                "--transformer-impl=inference_optimized requires --sequence-parallel"
+            )
 
         # Boolean to be toggled externally for skipping norm and all-gather.
         # This is used when enabling fused reduce-scatter + add + rms-norm + all-gather
@@ -195,14 +202,14 @@ class InferenceRowParallelLinear(TERowParallelLinear):
         )
         self.tp_group = get_tensor_model_parallel_group_if_none(tp_group, is_expert=is_expert)
         self.tp_size = dist.get_world_size(self.tp_group)
-        assert (
-            input_size % self.tp_size == 0
-        ), f"input_size ({input_size}) must be divisible by tp_size ({self.tp_size})"
+        assert input_size % self.tp_size == 0, (
+            f"input_size ({input_size}) must be divisible by tp_size ({self.tp_size})"
+        )
 
         if self.tp_size > 1:
-            assert (
-                config.sequence_parallel
-            ), "--transformer-impl=inference_optimized requires --sequence-parallel"
+            assert config.sequence_parallel, (
+                "--transformer-impl=inference_optimized requires --sequence-parallel"
+            )
 
         # Placeholder for next layer norm weights for fused
         # reduce-scatter + add + rms-norm + all-gather

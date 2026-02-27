@@ -16,8 +16,7 @@ from megatron.core.models.gpt.gpt_model import GPTModel
 from megatron.core.num_microbatches_calculator import destroy_num_microbatches_calculator
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
 from megatron.core.transformer.moe import upcycling_utils
-from megatron.core.transformer.moe.experts import SequentialMLP, TEGroupedMLP
-from megatron.core.utils import get_te_version, is_te_min_version
+from megatron.core.utils import is_te_min_version
 from megatron.training.arguments import core_transformer_config_from_args, parse_args, validate_args
 from megatron.training.global_vars import (
     destroy_global_vars,
@@ -34,7 +33,9 @@ from megatron.training.utils import (
 from tests.unit_tests.test_utilities import Utils
 
 try:
-    from megatron.core.extensions.transformer_engine import TEColumnParallelGroupedLinear
+    from megatron.core.extensions.transformer_engine import (
+        TEColumnParallelGroupedLinear,  # noqa: F401
+    )
 
     HAVE_TE = True
 except ImportError:
@@ -234,9 +235,9 @@ class TestGPTModel:
             input_ids=input_ids, position_ids=position_ids, attention_mask=attention_mask
         )
         # Compare the outputs of the MoE model and the dense model.
-        assert torch.allclose(
-            moe_logits, dense_logits, rtol=1e-01, atol=1e-01
-        ), "The output of moe model do not match the output of dense model."
+        assert torch.allclose(moe_logits, dense_logits, rtol=1e-01, atol=1e-01), (
+            "The output of moe model do not match the output of dense model."
+        )
 
     @pytest.mark.skipif(
         not HAVE_TE or not is_te_min_version("2.1.0"),
@@ -306,6 +307,6 @@ class TestGPTModel:
             input_ids=input_ids, position_ids=position_ids, attention_mask=attention_mask
         )
         # Compare the outputs of the MoE model and the dense model.
-        assert torch.allclose(
-            moe_logits, dense_logits, rtol=1e-01, atol=1e-01
-        ), "The output of moe model do not match the output of dense model."
+        assert torch.allclose(moe_logits, dense_logits, rtol=1e-01, atol=1e-01), (
+            "The output of moe model do not match the output of dense model."
+        )

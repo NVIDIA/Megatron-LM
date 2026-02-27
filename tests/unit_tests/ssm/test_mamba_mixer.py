@@ -14,7 +14,6 @@ from tests.unit_tests.test_utilities import Utils
 
 @pytest.mark.internal
 class TestMambaMixer:
-
     def setup_method(self, method):
         pass
 
@@ -100,7 +99,6 @@ class TestMambaMixer:
 
 
 class TestMambaMixerErrorChecks:
-
     @pytest.mark.parametrize(
         "hidden_size, ngroups, tp_size, expected_error_message",
         [

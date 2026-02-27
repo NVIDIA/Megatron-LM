@@ -595,9 +595,9 @@ class MambaMixer(MegatronModule):
         is_dynamic_batching = batch_indices is not None
 
         if not is_dynamic_batching:
-            assert (
-                hidden_states.shape[0] == 1
-            ), "Only support decoding with 1 token at a time for now"
+            assert hidden_states.shape[0] == 1, (
+                "Only support decoding with 1 token at a time for now"
+            )
 
         # (1, b, d_model) -> (1, b, proj_dim)
         zxBCdt, _ = self.in_proj(hidden_states)
@@ -737,9 +737,9 @@ class MambaMixer(MegatronModule):
             The output tensor of shape (l, b, d).
         """
         is_dynamic_batching = seq_idx is not None
-        assert not (
-            is_dynamic_batching and is_chunked_prefill
-        ), "Cannot use chunked prefill with dynamic batching"
+        assert not (is_dynamic_batching and is_chunked_prefill), (
+            "Cannot use chunked prefill with dynamic batching"
+        )
 
         # transpose: l b pd --> b l pd
         zxBCdt = rearrange(zxBCdt, "l b d -> b l d").contiguous()
@@ -768,11 +768,11 @@ class MambaMixer(MegatronModule):
             tensor_masked_update(conv_state, batch_indices, conv_varlen_states)
 
             # Maintain channels-last memory layout to use seq_idx for causal_conv1d_fn
-            # See https://github.com/Dao-AILab/causal-conv1d/blob/69e6dadc28b169a4c49cb86b586f64ee90242c70/csrc/causal_conv1d.cpp#L174 # pylint: disable=line-too-long
+            # See https://github.com/Dao-AILab/causal-conv1d/blob/69e6dadc28b169a4c49cb86b586f64ee90242c70/csrc/causal_conv1d.cpp#L174  # noqa: E501
             xBC = xBC.transpose(1, 2)
         elif is_chunked_prefill:
             # Maintain channels-last memory layout to use initial_states for causal_conv1d_fn
-            # See https://github.com/Dao-AILab/causal-conv1d/blob/69e6dadc28b169a4c49cb86b586f64ee90242c70/csrc/causal_conv1d.cpp#L200 # pylint: disable=line-too-long
+            # See https://github.com/Dao-AILab/causal-conv1d/blob/69e6dadc28b169a4c49cb86b586f64ee90242c70/csrc/causal_conv1d.cpp#L200  # noqa: E501
             assert batch_indices is not None
             initial_conv_state = (
                 conv_state[batch_indices, :, 1:].permute(0, 2, 1).contiguous().transpose(1, 2)
@@ -829,9 +829,9 @@ class MambaMixer(MegatronModule):
         # In this case, if `cp_size > 1` then that norm could be performed on less heads than if
         # `cp_size == 1` (groups of heads can be sharded across CP ranks), which would be
         # mathematically incorrect, and potentially arithmetically unstable.
-        assert (
-            self.cp.cp_size == 1 or self.rmsnorm
-        ), "Context parallel not supported for use_mem_eff_path==False and rmsnorm==False"
+        assert self.cp.cp_size == 1 or self.rmsnorm, (
+            "Context parallel not supported for use_mem_eff_path==False and rmsnorm==False"
+        )
 
         if is_chunked_prefill:
             initial_ssm_state = ssm_state[batch_indices]
@@ -840,7 +840,7 @@ class MambaMixer(MegatronModule):
 
         # Note that both `seq_idx` and `cu_seqlens` must be passed in
         # for variable length generation.
-        # See https://github.com/state-spaces/mamba/blob/e0761ece1db07e0949dd88b4f4cd440420a19fd9/tests/test_generation.py#L97 # pylint: disable=line-too-long
+        # See https://github.com/state-spaces/mamba/blob/e0761ece1db07e0949dd88b4f4cd440420a19fd9/tests/test_generation.py#L97  # noqa: E501
         y = mamba_chunk_scan_combined(
             x,
             dt,
@@ -871,7 +871,7 @@ class MambaMixer(MegatronModule):
 
                 # This has to be varlen_states, NOT last_state
                 # See reference implementation:
-                # https://github.com/state-spaces/mamba/blob/e0761ece1db07e0949dd88b4f4cd440420a19fd9/mamba_ssm/modules/mamba2.py#L267 # pylint: disable=line-too-long
+                # https://github.com/state-spaces/mamba/blob/e0761ece1db07e0949dd88b4f4cd440420a19fd9/mamba_ssm/modules/mamba2.py#L267  # noqa: E501
                 tensor_masked_update(ssm_state, batch_indices, ssm_varlen_states)
             elif is_chunked_prefill:
                 assert batch_indices is not None
@@ -1192,9 +1192,9 @@ def _split_tensor_factory(
             f"{orig_sh_ten_no_data.local_shape[split_dim]}"
         )
 
-    assert not isinstance(
-        split_sections, int
-    ), "Splitting into predefined section sizes is supported (`split_sections` must be a list)"
+    assert not isinstance(split_sections, int), (
+        "Splitting into predefined section sizes is supported (`split_sections` must be a list)"
+    )
     assert len(split_sections) == len(split_names), (len(split_sections), len(split_names))
 
     @torch.no_grad()

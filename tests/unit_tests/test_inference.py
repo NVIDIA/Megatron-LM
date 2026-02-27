@@ -1,6 +1,5 @@
 # Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
 
-import argparse
 import unittest.mock
 
 import numpy as np

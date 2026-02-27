@@ -190,7 +190,6 @@ class DynamicInferenceEvent:
     payload: Optional[Any] = None
 
     def __post_init__(self):
-
         # Timestamp.
         if self.timestamp is None:
             self.timestamp = time.time()
@@ -341,7 +340,7 @@ class DynamicInferenceRequest(InferenceRequest):
             # hence we expect routing indices for total_tokens - 1
             assert self.routing_indices.shape[0] == total_tokens - 1, (
                 f"routing_indices first dimension {self.routing_indices.shape[0]} does not match "
-                f"total tokens {total_tokens-1}."
+                f"total tokens {total_tokens - 1}."
             )
 
         torch.cuda.nvtx.range_pop()

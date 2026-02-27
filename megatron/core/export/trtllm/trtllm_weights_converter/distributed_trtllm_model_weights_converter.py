@@ -27,11 +27,14 @@ def str_dtype_to_torch(dtype: DataType):
     return str_dtype_to_torch(dtype.name)
 
 
-# pylint: disable=line-too-long
 class DistributedTRTLLMModelWeightsConverter:
     """The TRTLLM Converter class used for GPU (on device) conversion
 
-    This class is used to convert models sharded and on gpus. (It assumes that the model is already sharded appropriate to how you want to export it). (i.e) If you want to export to tp2pp2, then load the model in tp2pp2 setting and pass in their respective state dictionaries
+    This class is used to convert models sharded and on gpus.
+    (It assumes that the model is already sharded appropriate to
+    how you want to export it). (i.e) If you want to export to
+    tp2pp2, then load the model in tp2pp2 setting and pass in
+    their respective state dictionaries
     """
 
     def __init__(
@@ -75,9 +78,9 @@ class DistributedTRTLLMModelWeightsConverter:
         self.tp_group = parallel_state.get_tensor_model_parallel_group()
         vp_size = self.transformer_config.virtual_pipeline_model_parallel_size
 
-        assert (
-            vp_size is None or vp_size == 1
-        ), "Virtual parallelism is not supported in GPU Converter. Gather the VP chunks and use PP config."
+        assert vp_size is None or vp_size == 1, (
+            "Virtual parallelism is not supported in GPU Converter. Gather the VP chunks and use PP config."  # noqa: E501
+        )
 
     def _add_to_trtllm_model_weights(self, val: torch.Tensor, layer_name: str):
         assert torch.is_tensor(val), f"Expected a tensor for {layer_name} but got {type(val)}"
@@ -100,7 +103,11 @@ class DistributedTRTLLMModelWeightsConverter:
     def _convert_transformer_layer(self, layer_name: str, val: torch.Tensor):
         """Convert Transformer layers to TRTLLM weights
 
-        Transformer layers referes to layers within the transformber block. They have a layer number associated with them. Depending on the layer we either directly save it to trtllm_model_weights, or split it across some dimension and save the splits
+        Transformer layers referes to layers within the transformer
+        block. They have a layer number associated with them.
+        Depending on the layer we either directly save it to
+        trtllm_model_weights, or split it across some dimension
+        and save the splits
 
         Args:
             model_state_dict (dict): The input model state dictionary (All collected on CPU)
@@ -195,7 +202,12 @@ class DistributedTRTLLMModelWeightsConverter:
     def _convert_non_transformer_layer(self, model_state_dict: dict, layer_name: str):
         """Convert Non Transformer layers to TRTLLM weights
 
-        Non transformer layers referes to layers that occur only once in the model (e.g Embedding , final output layer etc. ) They dont have any layer number associated with them. We remove this layer from the original state dict and cast it to storage type and convert to numpy and add it to trtllm_model_weights
+        Non transformer layers referes to layers that occur only
+        once in the model (e.g Embedding, final output layer etc.)
+        They dont have any layer number associated with them. We
+        remove this layer from the original state dict and cast it
+        to storage type and convert to numpy and add it to
+        trtllm_model_weights
 
         Args:
             model_state_dict (dict): The input model state dictionary (All collected on CPU)
@@ -238,11 +250,16 @@ class DistributedTRTLLMModelWeightsConverter:
     ):
         """Convert model weights to trtllm model weights
 
-        This method goes through each layer in the model state dict and converts to equivalent trtllm model weights. It also handles splitting across TP dimension , expert split etc.
+        This method goes through each layer in the model state dict
+        and converts to equivalent trtllm model weights. It also
+        handles splitting across TP dimension, expert split etc.
 
         Args:
-            model_state_dict (dict): The full model state dict (all on CPU)
-            trtllm_conversion_dict (dict): The conversion dictionary used to convert model layer names to trtllm layer names
+            model_state_dict (dict): The full model state dict
+                (all on CPU)
+            trtllm_conversion_dict (dict): The conversion dictionary
+                used to convert model layer names to trtllm layer
+                names
             tokenizer_vocab_size (int): The vocab size of the tokenizer
         """
 
@@ -284,7 +301,7 @@ class DistributedTRTLLMModelWeightsConverter:
 
         if not HAVE_TQDM:
             raise ImportError(
-                "tqdm is required for DistributedTRTLLMModelWeightsConverter, please install it with `pip install tqdm`"
+                "tqdm is required for DistributedTRTLLMModelWeightsConverter, please install it with `pip install tqdm`"  # noqa: E501
             )
 
         for layer_name, value in tqdm(

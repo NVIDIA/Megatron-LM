@@ -4,7 +4,6 @@ from functools import partial
 
 import pytest
 import torch
-from pytest_mock import mocker
 from torch.optim import Adam
 from torch.utils.data import DataLoader
 
@@ -12,7 +11,6 @@ from megatron.core.datasets.blended_megatron_dataset_builder import BlendedMegat
 from megatron.core.datasets.gpt_dataset import GPTDatasetConfig, MockGPTDataset
 from megatron.core.datasets.utils import compile_helpers
 from megatron.core.export.data_type import DataType
-from megatron.core.export.export_config import ExportConfig
 from megatron.core.export.model_type import ModelType
 from megatron.core.models.gpt.gpt_layer_specs import get_gpt_layer_with_transformer_engine_spec
 from megatron.core.models.gpt.gpt_model import GPTModel
@@ -88,9 +86,7 @@ def _get_train_data_iterator():
 
 
 def _forward_step_func(data_iterator, model):
-
     def loss_func(loss_mask: torch.Tensor, output_tensor: torch.Tensor):
-
         losses = output_tensor.float()
         loss_mask = loss_mask.view(-1).float()
         loss = torch.sum(losses.view(-1) * loss_mask) / loss_mask.sum()
@@ -151,9 +147,9 @@ class TestTRTLLMSingleDeviceConverterFP8:
 
                 if quantized:
                     assert k in state_dict, f'Expected {k} in the converted model'
-                    assert (
-                        state_dict[k].dtype == torch.float32
-                    ), 'Scaling factor dtype is expected to be torch.float32'
+                    assert state_dict[k].dtype == torch.float32, (
+                        'Scaling factor dtype is expected to be torch.float32'
+                    )
                 else:
                     assert k not in state_dict, f'Did not expect {k} in the converted model'
 
@@ -164,9 +160,9 @@ class TestTRTLLMSingleDeviceConverterFP8:
 
                 if kv_quantized:
                     assert k in state_dict, f'Expected {k} in the converted model'
-                    assert (
-                        state_dict[k].dtype == torch.float32
-                    ), 'Scaling factor dtype is expected to be torch.float32'
+                    assert state_dict[k].dtype == torch.float32, (
+                        'Scaling factor dtype is expected to be torch.float32'
+                    )
                 else:
                     assert k not in state_dict, f'Did not expect {k} in the converted model'
 
@@ -178,9 +174,9 @@ class TestTRTLLMSingleDeviceConverterFP8:
                 k = key.replace('*', str(layer))
 
                 assert k in state_dict, f'Expected {k} in the converted model'
-                assert (
-                    state_dict[k].dtype == expected_dtype
-                ), f'Expected {k} to have the dtype == {str(expected_dtype)}'
+                assert state_dict[k].dtype == expected_dtype, (
+                    f'Expected {k} to have the dtype == {str(expected_dtype)}'
+                )
 
     def _assert_non_quantizable_layers(self, state_dict):
         expected_dtype = torch.bfloat16
@@ -190,9 +186,9 @@ class TestTRTLLMSingleDeviceConverterFP8:
                 k = key.replace('*', str(layer))
 
                 assert k in state_dict, f'Expected {k} in the converted model'
-                assert (
-                    state_dict[k].dtype == expected_dtype
-                ), f'Expected {k} to have the dtype == {str(expected_dtype)}'
+                assert state_dict[k].dtype == expected_dtype, (
+                    f'Expected {k} to have the dtype == {str(expected_dtype)}'
+                )
 
     def setup_method(self, method):
         Utils.initialize_model_parallel(2, 1)
@@ -265,12 +261,12 @@ class TestTRTLLMSingleDeviceConverterFP8:
 
                 expected_quant = 'FP8' if fp8_quantized else None
                 expected_kv_quant = 'FP8' if fp8_kvcache else None
-                assert (
-                    config_list[0].quantization.quant_algo == expected_quant
-                ), 'Wrong quantization settings'
-                assert (
-                    config_list[0].quantization.kv_cache_quant_algo == expected_kv_quant
-                ), 'Wrong KV-cache quantization settings'
+                assert config_list[0].quantization.quant_algo == expected_quant, (
+                    'Wrong quantization settings'
+                )
+                assert config_list[0].quantization.kv_cache_quant_algo == expected_kv_quant, (
+                    'Wrong KV-cache quantization settings'
+                )
                 self._assert_has_scales(weight_list[0], fp8_quantized)
                 self._assert_has_kv_scales(weight_list[0], fp8_kvcache)
                 self._assert_quantizable_layers(weight_list[0], fp8_quantized)

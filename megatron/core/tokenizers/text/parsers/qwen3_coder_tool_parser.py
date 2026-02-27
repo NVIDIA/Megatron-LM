@@ -23,7 +23,6 @@ ExtractedToolCallInformation = dict
 
 
 class _Qwen3CoderToolParser:
-
     # Sentinel tokens for streaming mode
     tool_call_start_token: str = "<tool_call>"
     tool_call_end_token: str = "</tool_call>"

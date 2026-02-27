@@ -1,7 +1,8 @@
 # Copyright (c) 2025, NVIDIA CORPORATION. All rights reserved.
-from dataclasses import dataclass, field
 import signal
+from dataclasses import dataclass, field
 from typing import Literal
+
 
 @dataclass(kw_only=True)
 class TrainingConfig:
@@ -16,7 +17,9 @@ class TrainingConfig:
     data-parallel-size. If this value is None, then use micro-batch-size * data-parallel-size
     as the global batch size. This choice will result in 1 for number of micro-batches."""
 
-    rampup_batch_size: list[int] | None = field(default=None, metadata={"argparse_meta": {"nargs": 3}})
+    rampup_batch_size: list[int] | None = field(
+        default=None, metadata={"argparse_meta": {"nargs": 3}}
+    )
     """Batch size ramp up with the following values: <start batch size>, <batch size increment>,
     <ramp-up samples>
     For example:
@@ -38,10 +41,10 @@ class TrainingConfig:
     """
 
     check_weight_hash_across_dp_replicas_interval: int | None = None
-    """Interval to check weight hashes are same across DP replicas. If not specified, weight hashes not checked."""
+    """Interval to check weight hashes are same across DP replicas. If not specified, weight hashes not checked."""  # noqa: E501
 
     train_sync_interval: int | None = None
-    """Training CPU-GPU synchronization interval, to ensure that CPU is not running too far ahead of GPU."""
+    """Training CPU-GPU synchronization interval, to ensure that CPU is not running too far ahead of GPU."""  # noqa: E501
 
     train_iters: int | None = None
     """Total number of iterations to train over all training runs.
@@ -107,7 +110,7 @@ class ValidationConfig:
     """Run all real-time test alongside the experiment."""
 
     full_validation: bool = False
-    """If set, each time validation occurs it uses the full validation dataset(s). This currently only works for GPT datasets!"""
+    """If set, each time validation occurs it uses the full validation dataset(s). This currently only works for GPT datasets!"""  # noqa: E501
 
     multiple_validation_sets: bool = False
     """If set, multiple datasets listed in the validation split are evaluated independently with a
@@ -160,13 +163,30 @@ class SchedulerConfig:
     """number of samples to warmup learning rate over. Calculated at runtime from
     lr_warmup_fraction, lr_warmup_iters, or lr_warmup_samples.
     """
-    
-    override_opt_param_scheduler: bool = field(default=False, metadata={"argparse_meta": {"arg_names": ["--override-opt_param-scheduler", "--override-opt-param-scheduler"]}})
+
+    override_opt_param_scheduler: bool = field(
+        default=False,
+        metadata={
+            "argparse_meta": {
+                "arg_names": ["--override-opt_param-scheduler", "--override-opt-param-scheduler"]
+            }
+        },
+    )
     """Reset the values of the scheduler (learning rate, warmup iterations, minimum learning rate,
     maximum number of iterations, and decay style) from input arguments and ignore values from
     checkpoints. Note that all the above values will be reset."""
 
-    use_checkpoint_opt_param_scheduler: bool = field(default=False, metadata={"argparse_meta": {"arg_names": ["--use-checkpoint-opt_param-scheduler", "--use-checkpoint-opt-param-scheduler"]}})
+    use_checkpoint_opt_param_scheduler: bool = field(
+        default=False,
+        metadata={
+            "argparse_meta": {
+                "arg_names": [
+                    "--use-checkpoint-opt_param-scheduler",
+                    "--use-checkpoint-opt-param-scheduler",
+                ]
+            }
+        },
+    )
     """Use checkpoint to set the values of the scheduler (learning rate, warmup iterations,
     minimum learning rate, maximum number of iterations, and decay style) from checkpoint
     and ignore input arguments."""
@@ -186,7 +206,7 @@ class SchedulerConfig:
     """Type of no weight decay condition. Choices:
     None (default): param no weight decay if and only if it is 1D; or it is bias;
     or it is embedding and embedding_init_method_std is not None.
-    "qwen3_next": In addition to the default rules, apply weight decay to qk layernorm as a special case."""
+    "qwen3_next": In addition to the default rules, apply weight decay to qk layernorm as a special case."""  # noqa: E501
 
     wd_incr_steps: int | None = field(init=False, default=None)
     """Number of samples to increment weight decay over. Calculated at runtime."""
@@ -215,14 +235,16 @@ class LoggerConfig:
     """Number of batches to use for a rolling average of throughput."""
 
     log_progress: bool = False
-    """If set, log progress (in terms of number of processed tokens and number of floating-point operations)
+    """If set, log progress (in terms of number of processed tokens
+    and number of floating-point operations)
     to progress.txt file in checkpoint directory.
     """
 
     timing_log_level: Literal[0, 1, 2] = 0
     """Granularity level to measure and report timing.
     0: report only iteration time and make sure timing does not introduce extra overhead.
-    1: report timing for operations that are executed very limited times (basically once) during each iteration
+    1: report timing for operations that are executed very limited
+       times (basically once) during each iteration
         (such as gradient all-reduce)
     2: report timing for operations that migh be executed numerous times during each iteration.
     Note that setting the level to 1 or 2 might cause increase in iteration time.
@@ -282,8 +304,12 @@ class LoggerConfig:
     runtime_time_unit: str = "hours"
     """Time unit to use for time logging. """
 
-    barrier_with_L1_time: bool = field(default=True, metadata={"argparse_meta": {"arg_names": ["--no-barrier-with-level-1-timing"]}})
-    """If not disabled, use barrier with level 1 time measurements. Note that this is up to the user to
+    barrier_with_L1_time: bool = field(
+        default=True,
+        metadata={"argparse_meta": {"arg_names": ["--no-barrier-with-level-1-timing"]}},
+    )
+    """If not disabled, use barrier with level 1 time measurements.
+    Note that this is up to the user to
     make sure calling barrier with their timers will not result in hangs. This can happen if for
     example the user adds a level 1 timer that is not called by all ranks.
     """
@@ -329,7 +355,12 @@ class CheckpointConfig:
     save: str | None = None
     """Output directory to save checkpoints to."""
 
-    save_interval: int | None = field(default=None, metadata={"argparse_meta": {"arg_names": ["--save-interval", "--persistent-save-interval"]}})
+    save_interval: int | None = field(
+        default=None,
+        metadata={
+            "argparse_meta": {"arg_names": ["--save-interval", "--persistent-save-interval"]}
+        },
+    )
     """Number of iterations between persistent checkpoint saves."""
 
     save_wgrads_interval: int | None = None
@@ -387,7 +418,8 @@ class CheckpointConfig:
     """Algorithm for local non-persistent checkpointing."""
 
     finetune: bool = False
-    """Load model for finetuning. Do not load optimizer or rng state from checkpoint and set iteration to 0.
+    """Load model for finetuning. Do not load optimizer or rng state
+    from checkpoint and set iteration to 0.
     Assumed when loading a release checkpoint."""
 
     pretrained_checkpoint: str | None = None
@@ -406,7 +438,7 @@ class CheckpointConfig:
     """If set, do not use tokenizer model path from checkpoint"""
 
     exit_on_missing_checkpoint: bool = False
-    """If 'load' is set, but checkpoint is not found (e.g., path typo), then exit instead of random initialization."""
+    """If 'load' is set, but checkpoint is not found (e.g., path typo), then exit instead of random initialization."""  # noqa: E501
 
     ckpt_format: Literal["torch", "torch_dist", "torch_dcp", "fsdp_dtensor"] = "torch_dist"
     """ Checkpoint format to use. torch is the format used by torch.save/load.
@@ -439,10 +471,11 @@ class CheckpointConfig:
     Makes DistributedOptimizer checkpoint non-reshardable."""
 
     async_save: bool = False
-    """Apply async checkpointing save. Currently works only with `torch_dist` distributed checkpoint format."""
+    """Apply async checkpointing save. Currently works only with `torch_dist` distributed checkpoint format."""  # noqa: E501
 
     use_persistent_ckpt_worker: bool = False
-    """Use a persistent background worker for async checkpoint saves. When enabled, creates a dedicated
+    """Use a persistent background worker for async checkpoint saves.
+    When enabled, creates a dedicated
     worker thread/process for handling async saves. When disabled, uses temporal workers that are
     created and destroyed for each save operation."""
 
@@ -453,7 +486,7 @@ class CheckpointConfig:
     """Assume the checkpoint structure is constant across saves to enable optimizations."""
 
     strict_fsdp_dtensor_load: bool = True
-    """Whether to enforce strict loading for FSDP DTensor checkpoints. When False, allows partial loading."""
+    """Whether to enforce strict loading for FSDP DTensor checkpoints. When False, allows partial loading."""  # noqa: E501
 
     dist_ckpt_strictness: Literal[
         "assume_ok_unexpected",
@@ -465,8 +498,8 @@ class CheckpointConfig:
         "return_all",
         "ignore_all",
     ] = "assume_ok_unexpected"
-    """Determine handling of key mismatch during checkpoint load. Check StrictHandling docs for flags meaning.
-    NOTE: This flag controls only distributed checkpoint load from storage, not loading state dict into the model."""
+    """Determine handling of key mismatch during checkpoint load. Check StrictHandling docs for flags meaning.  # noqa: E501
+    NOTE: This flag controls only distributed checkpoint load from storage, not loading state dict into the model."""  # noqa: E501
 
     dist_ckpt_save_pre_mcore_014: bool = False
     """Revert checkpointing simplifications introduced in Megatron-Core v0.14.
@@ -474,11 +507,13 @@ class CheckpointConfig:
     (checkpoint load format is determined based on checkpoint metadata)."""
 
     dist_ckpt_optim_fully_reshardable: bool = False
-    """Make optimizer distributed checkpoint fully reshardable (TP/PP/EP/DP) as opposed to plain DP reshardability."""
+    """Make optimizer distributed checkpoint fully reshardable (TP/PP/EP/DP) as opposed to plain DP reshardability."""  # noqa: E501
 
     distrib_optim_fully_reshardable_mem_efficient: bool = False
-    """During distributed optimizer checkpoint save and load tries to use as little memory as possible
-    by using Gloo (instead of NCCL) and only one rank for saving. Turn on only if experiencing host or device memory
+    """During distributed optimizer checkpoint save and load tries
+    to use as little memory as possible by using Gloo (instead of
+    NCCL) and only one rank for saving. Turn on only if experiencing
+    host or device memory
     issues. Has affect only with `dist_ckpt_optim_fully_reshardable` flag."""
 
     save_tokenizer_assets: bool = True

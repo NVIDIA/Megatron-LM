@@ -65,7 +65,7 @@ class GPUResourceManager:
         # torch.distributed must be initialized before calling this
         if not dist.is_initialized():
             raise RuntimeError(
-                "torch.distributed must be initialized before " "GPUResourceManager.init()"
+                "torch.distributed must be initialized before GPUResourceManager.init()"
             )
 
         # Get current CUDA device (already set by caller based on LOCAL_RANK)

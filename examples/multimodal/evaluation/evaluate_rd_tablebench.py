@@ -1,10 +1,8 @@
 import argparse
-import glob
 import json
 import os
-import re
-import subprocess
 import sys
+
 import numpy as np
 
 from .evaluate_mmmu import get_input_output_paths
@@ -15,8 +13,8 @@ parent_dir = os.path.abspath(os.path.join(os.path.dirname(__file__), '..', 'rd-t
 # Add the parent directory to sys.path
 sys.path.insert(0, parent_dir)
 
-from grading import table_similarity
 from convert import html_to_numpy
+from grading import table_similarity
 
 
 def convert_to_rdtablebench_format(input_path):
@@ -63,6 +61,7 @@ def rdtablebench_eval(input_path):
 
     print(f"Accuracy: {np.mean(similarities)}")
     print(f"Failed: {num_failed}")
+
 
 def main():
     """Run RD-TableBench evaluation."""

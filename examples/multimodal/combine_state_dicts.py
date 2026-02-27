@@ -49,13 +49,18 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(
         description="""
         Combine multiple state dicts into a single state dict.
-        The combined state dict is first initialized by taking a copy of the first provided input state dict.
-        To avoid conflicts in model parameter names, a prefix must be provided for each input file.
-        Model parameter names will be renamed from <original name> to <model prefix>.<original name>.
+        The combined state dict is first initialized by taking a
+        copy of the first provided input state dict.
+        To avoid conflicts in model parameter names, a prefix must
+        be provided for each input file. Model parameter names will
+        be renamed from <original name> to <model prefix>.<original name>.
 
 
         Example usage:
-        python combine_state_dicts.py --input language_model.pt vision_model.pt --prefixes language_model vision_model --output multimodal.pt
+        python combine_state_dicts.py \
+            --input language_model.pt vision_model.pt \
+            --prefixes language_model vision_model \
+            --output multimodal.pt
         """,
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
@@ -74,8 +79,8 @@ if __name__ == "__main__":
 
     assert len(args.input) > 1, "must provide more than 1 input model to combine"
     assert len(args.input) == len(args.prefixes), "each input model must have a corresponding key"
-    assert (
-        len(args.input) % len(args.output) == 0
-    ), "each output file must use the same number of input files"
+    assert len(args.input) % len(args.output) == 0, (
+        "each output file must use the same number of input files"
+    )
 
     combine(args.input, args.prefixes, args.output)

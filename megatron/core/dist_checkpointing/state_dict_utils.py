@@ -1,6 +1,6 @@
 # Copyright (c) 2022-2023, NVIDIA CORPORATION.  All rights reserved.
 
-""" Utilities for transforming state_dict."""
+"""Utilities for transforming state_dict."""
 
 from typing import Callable, Union
 
@@ -107,10 +107,12 @@ def filter_out_empty_flatten_tensor(sharded_state_dict: Union[dict, list]):
     # This situation may occur in custom Fully Sharded Data Parallel (FSDP) cases.
     sharded_state_dict, _ = extract_matching_values(
         sharded_state_dict,
-        lambda v: not (
-            isinstance(v, ShardedTensor)
-            and v.flattened_range
-            and v.flattened_range.start == v.flattened_range.stop
+        lambda v: (
+            not (
+                isinstance(v, ShardedTensor)
+                and v.flattened_range
+                and v.flattened_range.start == v.flattened_range.stop
+            )
         ),
     )
 

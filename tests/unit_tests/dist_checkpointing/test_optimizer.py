@@ -408,7 +408,7 @@ class TestDistributedOptimizer:
                     )
                 if test_step:
                     # Simulate "step" not set in some of the param groups on rank 0.
-                    # TE FusedAdam may have "step" not set in some of the param groups on some ranks.
+                    # TE FusedAdam may have "step" not set in some of the param groups on some ranks.  # noqa: E501
                     for i, param_group in enumerate(
                         optimizer_A.chained_optimizers[0].optimizer.param_groups
                     ):
@@ -576,9 +576,9 @@ class TestDistributedOptimizer:
         Utils.initialize_model_parallel(*src_tp_pp)
         src_num_dp_groups = src_tp_pp[1] * src_tp_pp[0]
         dest_num_dp_groups = dest_tp_pp[1] * dest_tp_pp[0]
-        assert (
-            dest_num_dp_groups <= src_num_dp_groups
-        ), 'This test cant be run with increasing number of DP groups'
+        assert dest_num_dp_groups <= src_num_dp_groups, (
+            'This test cant be run with increasing number of DP groups'
+        )
 
         with (
             TempNamedDir(
@@ -732,9 +732,9 @@ class TestDistributedOptimizer:
         src_num_dp_groups = src_tp_pp[1] * src_tp_pp[0]
         dest_num_dp_groups = dest_tp_pp[1] * dest_tp_pp[0]
         src_dp_group_idx = torch.distributed.get_rank(parallel_state.get_model_parallel_group())
-        assert (
-            dest_num_dp_groups <= src_num_dp_groups
-        ), 'This test cant be run with increasing number of DP groups'
+        assert dest_num_dp_groups <= src_num_dp_groups, (
+            'This test cant be run with increasing number of DP groups'
+        )
 
         with TempNamedDir(
             tmp_path_dist_ckpt / 'test_nonreshardable_optimizer_save_load', sync=True
@@ -850,7 +850,8 @@ class TestDistributedOptimizer:
     )
     @pytest.mark.parametrize('tp', [1, 2, 4, 8])
     def test_model_parallel_dp_group_idx_preservation(self, tp, src_pp, dest_pp):
-        """For each dst DP group, test there is at least one DP 0 rank both in the src and dest group.
+        """For each dst DP group, test there is at least one DP 0 rank
+        both in the src and dest group.
 
         For this condition to hold, `parallel_state` must be initialized with 'tp-pp-dp' order.
         """
@@ -907,7 +908,6 @@ class TestFP32Optimizer:
             with TempNamedDir(
                 tmp_path_dist_ckpt / 'test_fp32_optimizer_state_dict_B', sync=True
             ) as ckpt_dir_B:
-
                 model_A, optimizer_A = setup_model_and_optimizer(
                     seed=2,
                     tp=src_tp_pp[0],

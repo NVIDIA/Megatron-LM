@@ -37,9 +37,9 @@ def tensor_merge_pytorch(
 
     assert tensor_a.ndim == tensor_b.ndim == output_tensor.ndim, "Rank mismatch across tensors"
     for i in range(1, tensor_a.ndim):
-        assert (
-            tensor_a.shape[i] == tensor_b.shape[i] == output_tensor.shape[i]
-        ), f"Dimension {i} must match"
+        assert tensor_a.shape[i] == tensor_b.shape[i] == output_tensor.shape[i], (
+            f"Dimension {i} must match"
+        )
 
     pos = pos_on_device[0].item()
     assert 0 <= pos <= tensor_a.shape[0]

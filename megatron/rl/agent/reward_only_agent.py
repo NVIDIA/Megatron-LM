@@ -3,17 +3,10 @@
 import asyncio
 from typing import Any
 
-import numpy as np
 from tqdm.asyncio import tqdm
 
-from ..inference import (
-    InferenceResponse,
-    LLMChatMessage,
-    ReturnsRaw,
-    ReturnsTokens,
-)
+from ..inference import InferenceResponse, LLMChatMessage, ReturnsRaw, ReturnsTokens
 from .api import (
-    EvaluationAgent,
     EvaluationRequest,
     EvaluationResponse,
     GroupedRolloutGenerator,
@@ -84,9 +77,9 @@ class RewardOnlyAgent(RolloutGenerator, GroupedRolloutGenerator, PassAtEvaluatio
     async def rollout_from_response(
         self, request: RolloutRequest, response: InferenceResponse, golden: Any
     ) -> Rollout:
-        assert isinstance(
-            request.inference_interface, ReturnsRaw
-        ), "InferenceInterface must support raw_text return to provide rollouts."
+        assert isinstance(request.inference_interface, ReturnsRaw), (
+            "InferenceInterface must support raw_text return to provide rollouts."
+        )
         raw_text = response.raw_text
 
         response_text = response.response.content
@@ -116,7 +109,6 @@ class RewardOnlyAgent(RolloutGenerator, GroupedRolloutGenerator, PassAtEvaluatio
         return rollout
 
     async def rollout(self, request: RolloutRequest) -> Rollout:
-
         prompt, golden = await self.get_prompt(validation=request.validation)
 
         inference_request = request.inference_interface.prepare_request(
@@ -128,20 +120,25 @@ class RewardOnlyAgent(RolloutGenerator, GroupedRolloutGenerator, PassAtEvaluatio
         return await self.rollout_from_response(request, response, golden)
 
     async def group_rollout(self, request: GroupedRolloutRequest) -> list[Rollout]:
-
         prompt, golden = await self.get_prompt(validation=request.validation)
 
         inference_request = request.inference_interface.prepare_request(
             prompt, request.generation_args
         )
 
-        responses = await asyncio.gather(*[request.inference_interface.agenerate(inference_request) for _ in range(request.rollouts_per_group)])
-        return [await self.rollout_from_response(request, response, golden) for response in responses]
+        responses = await asyncio.gather(
+            *[
+                request.inference_interface.agenerate(inference_request)
+                for _ in range(request.rollouts_per_group)
+            ]
+        )
+        return [
+            await self.rollout_from_response(request, response, golden) for response in responses
+        ]
 
     async def _evaluation(
         self, prompt: str, golden: Any, request: EvaluationRequest
     ) -> RewardOnlyEvaluationResponse:
-
         inference_request = request.inference_interface.prepare_request(
             prompt, request.generation_args
         )
@@ -160,7 +157,6 @@ class RewardOnlyAgent(RolloutGenerator, GroupedRolloutGenerator, PassAtEvaluatio
         return RewardOnlyEvaluationResponse(results=[result], env_id=self.env_id)
 
     async def run_evaluation(self, request: EvaluationRequest):
-
         # Get all prompts first
         all_prompts = list(
             await self.evaluation_prompts(

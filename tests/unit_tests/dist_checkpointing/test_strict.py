@@ -7,8 +7,8 @@ import pytest
 import torch
 
 try:
-    from torch.distributed import DeviceMesh
-    from torch.distributed._tensor import DTensor
+    from torch.distributed import DeviceMesh  # noqa: F401
+    from torch.distributed._tensor import DTensor  # noqa: F401
 
     HAVE_DTENSOR = True
 except ImportError:
@@ -157,7 +157,7 @@ class TestStrictLocal:
 
     def _check_log_message_for_strict_handling(self, text, strict, missing, unexpected):
         # Answers the question:
-        # "I got the log message [text] using strictness [strict]. I [removed/didn't remove] missing and [added/didn't add] unexpected keys."
+        # "I got the log message [text] using strictness [strict]. I [removed/didn't remove] missing and [added/didn't add] unexpected keys."  # noqa: E501
         # Is the log correct?
         should_contain_unexpected = (
             strict in {StrictHandling.LOG_UNEXPECTED, StrictHandling.LOG_ALL}
@@ -228,7 +228,7 @@ class TestStrictLocal:
         ],
     )
     def test_passthrough(self, caplog, algo, validate_integrity, missing, unexpected, strict):
-        # Scenario: strictness check is supposed to pass the errors through, the underlying algorithm is able to handle it.
+        # Scenario: strictness check is supposed to pass the errors through, the underlying algorithm is able to handle it.  # noqa: E501
         with caplog.at_level(logging.WARNING):
             _, missing_keys, unexpected_keys = self._tasd_to_state_dict(
                 algo=algo,
@@ -243,7 +243,7 @@ class TestStrictLocal:
         )
 
     # NOTE: Fully parallel results in a hard-to-catch error:
-    #       The exchange algorithm is unaware of the missing tensors and will still expect the shards to be received -
+    #       The exchange algorithm is unaware of the missing tensors and will still expect the shards to be received -  # noqa: E501
     #       which will cause the process to hang indefinitely.
     @pytest.mark.parametrize('algo', ['atomic'])
     @pytest.mark.parametrize('validate_integrity', [True, False])
@@ -264,7 +264,7 @@ class TestStrictLocal:
     ):
         # Scenario: strictness check is supposed to pass the errors through,
         # but they result in an error in the underlying algorithm as it's unable to handle it.
-        # That's why "Fully parallel" is excluded, as instead of raising an error, it will hang indefinitely, which is hard to catch.
+        # That's why "Fully parallel" is excluded, as instead of raising an error, it will hang indefinitely, which is hard to catch.  # noqa: E501
         with caplog.at_level(logging.WARNING):
             with pytest.raises(AssertionError) as exc_info:
                 self._tasd_to_state_dict(

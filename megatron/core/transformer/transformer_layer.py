@@ -52,7 +52,6 @@ def get_transformer_layer_offset(
     is_first_pp_stage = pp_rank == 0
 
     if config.pipeline_model_parallel_size > 1:
-
         if config.pipeline_model_parallel_layout:
             offset = config.pipeline_model_parallel_layout.get_layer_offset(
                 layer_type=LayerType.decoder, vp_stage=vp_stage
@@ -100,9 +99,9 @@ def get_transformer_layer_offset(
             )
 
             if (vp_size := config.virtual_pipeline_model_parallel_size) is not None:
-                assert (
-                    vp_stage is not None
-                ), "vp_stage must be provided if virtual pipeline model parallel size is set"
+                assert vp_stage is not None, (
+                    "vp_stage must be provided if virtual pipeline model parallel size is set"
+                )
 
                 # Calculate number of layers in each virtual model chunk
                 # If the num_layers_in_first_pipeline_stage and
@@ -173,9 +172,9 @@ def get_transformer_layer_offset(
             from megatron.core.pipeline_parallel.utils import is_vp_first_stage
 
             if (vp_size := config.virtual_pipeline_model_parallel_size) is not None:
-                assert (
-                    vp_stage is not None
-                ), "vp_stage must be provided if virtual pipeline model parallel size is set"
+                assert vp_stage is not None, (
+                    "vp_stage must be provided if virtual pipeline model parallel size is set"
+                )
 
                 num_layers_per_virtual_rank = num_layers_per_pipeline_rank // vp_size
                 total_virtual_chunks = num_layers // vp_size
@@ -367,14 +366,14 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
                 if submodules.mlp.module == MoELayer:
                     additional_mlp_kwargs["is_mtp_layer"] = self.is_mtp_layer
             elif submodules.mlp.module == MLP:
-                assert hasattr(
-                    pg_collection, 'tp'
-                ), 'TP process group is required for MLP in TransformerLayer'
+                assert hasattr(pg_collection, 'tp'), (
+                    'TP process group is required for MLP in TransformerLayer'
+                )
                 additional_mlp_kwargs["tp_group"] = pg_collection.tp
             elif TEFusedMLP is not None and submodules.mlp.module == TEFusedMLP:
-                assert hasattr(
-                    pg_collection, 'tp'
-                ), 'TP process group is required for TEFusedMLP in TransformerLayer'
+                assert hasattr(pg_collection, 'tp'), (
+                    'TP process group is required for TEFusedMLP in TransformerLayer'
+                )
                 additional_mlp_kwargs["tp_group"] = pg_collection.tp
             else:
                 log_single_rank(
@@ -950,11 +949,10 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
             not self.config.cuda_graph_scope or CudaGraphScope.attn in self.config.cuda_graph_scope
         ):
             slen_per_cp = seq_length // self.config.context_parallel_size
-            static_inputs["attention_mask"] = (
-                ~(torch.tril(torch.ones((slen_per_cp, seq_length))).bool())
-                .to(torch.cuda.current_device())
-                .reshape(1, 1, slen_per_cp, seq_length)
-                .tile(micro_batch_size, 1, 1, 1)
+            static_inputs["attention_mask"] = ~(
+                torch.tril(torch.ones((slen_per_cp, seq_length))).bool()
+            ).to(torch.cuda.current_device()).reshape(1, 1, slen_per_cp, seq_length).tile(
+                micro_batch_size, 1, 1, 1
             )
         return static_inputs
 
@@ -1057,10 +1055,10 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
             # CUDA Graph captures the whole MLP/MoE part. CUDA Graph output is the layer output.
             assert len(cuda_graph_output) == 1, "CUDA Graph output should be the layer output."
             output = cuda_graph_output.pop()
-            assert (
-                not self.config.overlap_moe_expert_parallel_comm
-            ), "EP overlap must be \
+            assert not self.config.overlap_moe_expert_parallel_comm, (
+                "EP overlap must be \
                 disabled when CUDA graph captures the whole MLP/MoE part."
+            )
         elif self.is_moe_layer and CudaGraphScope.moe_router in self.config.cuda_graph_scope:
             # CUDA Graph partially captures the MoE.
             # The rest of the layer should go to the normal pass.
@@ -1078,9 +1076,9 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
                 # CUDA graph output is [hidden_states, probs] + attributes outputs.
                 (hidden_states, probs), attr_outputs = cuda_graph_output[:2], cuda_graph_output[2:]
                 valid_cudagraph_attrs = self.mlp.token_dispatcher.valid_cudagraph_attrs
-                assert len(attr_outputs) == len(
-                    valid_cudagraph_attrs
-                ), f"attr_outputs: {len(attr_outputs)} != {len(valid_cudagraph_attrs)}"
+                assert len(attr_outputs) == len(valid_cudagraph_attrs), (
+                    f"attr_outputs: {len(attr_outputs)} != {len(valid_cudagraph_attrs)}"
+                )
                 for i, attr_name in enumerate(valid_cudagraph_attrs):
                     hier_attr_name = attr_name.split('.')
                     attr = self.mlp.token_dispatcher
@@ -1143,13 +1141,13 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
         """Helper function to get tensor arguments for TE CUDA graph."""
         cudagraph_args, cudagraph_kwargs = super()._get_te_cuda_graph_replay_args(*args, **kwargs)
 
-        assert (
-            len(cudagraph_args) == 1
-        ), "Exactly one positional argument `hidden_states` is expected."
+        assert len(cudagraph_args) == 1, (
+            "Exactly one positional argument `hidden_states` is expected."
+        )
         hidden_states = cudagraph_args[0]
 
         try:
-            import transformer_engine.pytorch as te  # pylint: disable=unused-import
+            import transformer_engine.pytorch as te  # noqa: F401
 
             def get_zero_attention_mask(slen_per_tpcp, micro_batch_size):
                 sequence_parallel = self.config.sequence_parallel

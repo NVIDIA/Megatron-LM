@@ -138,7 +138,7 @@ class PipelineExecutor:
                 next_batch = iter_schedules[i + 1]["send"]
                 assert next_batch is not None
                 PELogger.debug(
-                    f"  Pack next (iter {i+1}): {len(next_batch.tasks)} tasks "
+                    f"  Pack next (iter {i + 1}): {len(next_batch.tasks)} tasks "
                     f"→ PE {next_batch.dest_pe}"
                 )
                 self._launch_pack(i + 1, next_batch)
@@ -150,7 +150,7 @@ class PipelineExecutor:
                 prior_batch = iter_schedules[i - 1]["recv"]
                 assert prior_batch is not None
                 PELogger.debug(
-                    f"  Unpack prior (iter {i-1}): {prior_batch.total_size} bytes "
+                    f"  Unpack prior (iter {i - 1}): {prior_batch.total_size} bytes "
                     f"← PE {prior_batch.src_pe}"
                 )
                 self._launch_unpack(i - 1, prior_batch)
@@ -195,7 +195,7 @@ class PipelineExecutor:
         # Final unpack for last iteration
         if num_iterations > 0 and iter_schedules[num_iterations - 1]["recv"]:
             torch.cuda.nvtx.range_push("Final Unpack")
-            PELogger.debug(f"Final unpack: iteration {num_iterations-1}")
+            PELogger.debug(f"Final unpack: iteration {num_iterations - 1}")
             last_recv = iter_schedules[num_iterations - 1]["recv"]
             assert last_recv is not None
             self._launch_unpack(num_iterations - 1, last_recv)

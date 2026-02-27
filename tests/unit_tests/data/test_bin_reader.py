@@ -2,7 +2,6 @@ import os
 import random
 import sys
 import tempfile
-from dataclasses import dataclass
 from types import ModuleType, SimpleNamespace
 from typing import Any, Dict
 

@@ -14,8 +14,8 @@ except ModuleNotFoundError:
 
 
 # fmt: off
-nemotron_h_aligned_custom_template = """{% for message in messages %}{% if message['role'] == 'system' %}{{ '<SPECIAL_10>System\n' + message['content'].strip() + '\n' }}{% elif message['role'] == 'user' %}{{ '<SPECIAL_11>User\n' + message['content'].strip() + '\n' + '<SPECIAL_11>Assistant\n' }}{% elif message['role'] == 'assistant' %}{{ message['content'].strip() + '\n' }}{% endif %}{% endfor %}""" # pylint: disable=line-too-long
-nemotron_nano_v2_custom_template = """{% for message in messages %}{% set content = message['content'] %}{% if message['role'] == 'system' %}{{ '<SPECIAL_10>System\n' + content.replace('/think', '').replace('/no_think', '').strip() + '\n' }}{% elif message['role'] == 'user' %}{{ '<SPECIAL_11>User\n' + content.replace('/think', '').replace('/no_think', '').strip() + '\n' }}{% elif message['role'] == 'assistant' %}{{ '<SPECIAL_11>Assistant\n' + content.strip() + '\n<SPECIAL_12>\n' }}{% endif %}{% endfor %}""" # pylint: disable=line-too-long
+nemotron_h_aligned_custom_template = """{% for message in messages %}{% if message['role'] == 'system' %}{{ '<SPECIAL_10>System\n' + message['content'].strip() + '\n' }}{% elif message['role'] == 'user' %}{{ '<SPECIAL_11>User\n' + message['content'].strip() + '\n' + '<SPECIAL_11>Assistant\n' }}{% elif message['role'] == 'assistant' %}{{ message['content'].strip() + '\n' }}{% endif %}{% endfor %}"""  # noqa: E501
+nemotron_nano_v2_custom_template = """{% for message in messages %}{% set content = message['content'] %}{% if message['role'] == 'system' %}{{ '<SPECIAL_10>System\n' + content.replace('/think', '').replace('/no_think', '').strip() + '\n' }}{% elif message['role'] == 'user' %}{{ '<SPECIAL_11>User\n' + content.replace('/think', '').replace('/no_think', '').strip() + '\n' }}{% elif message['role'] == 'assistant' %}{{ '<SPECIAL_11>Assistant\n' + content.strip() + '\n<SPECIAL_12>\n' }}{% endif %}{% endfor %}"""  # noqa: E501
 identity_template = """{% for message in messages %}{{ message['content'] }}{% endfor %}"""
 # fmt: on
 
@@ -150,7 +150,6 @@ class SFTTokenizer:
         # Mask system and user tokens in the target.
         idx = 0
         for turn_idx, turn in enumerate(conversation):
-
             if turn["role"].lower() == "assistant" and len(turn["content"]) == 0:
                 raise ValueError(f"empty assistant turn in conversation: {conversation}.")
             if turn["role"].lower() == "assistant":
@@ -175,9 +174,9 @@ class SFTTokenizer:
             else:
                 raise ValueError("Wrong role value.")
 
-            assert np.allclose(
-                tokens[idx : idx + turn_len], turn_tokens
-            ), f"expected turn tokens to match tokens in conversation {conversation}"
+            assert np.allclose(tokens[idx : idx + turn_len], turn_tokens), (
+                f"expected turn tokens to match tokens in conversation {conversation}"
+            )
 
             idx += turn_len
 

@@ -1,8 +1,9 @@
 # Copyright (c) 2024, NVIDIA CORPORATION. All rights reserved.
 import argparse
 import os
-from transformers import PaliGemmaForConditionalGeneration
+
 import torch
+from transformers import PaliGemmaForConditionalGeneration
 
 
 def convert(output_path, tensor_parallel_size, use_te):
@@ -30,7 +31,7 @@ def convert(output_path, tensor_parallel_size, use_te):
             new_tensors = torch.chunk(new_tensor, tensor_parallel_size, dim=chunk_dim)
 
         for i in range(tensor_parallel_size):
-            # chunk() creates a view of a bigger tensor. clone() is used here to avoid excessive storage.
+            # chunk() creates a view of a bigger tensor. clone() is used here to avoid excessive storage.  # noqa: E501
             new_state_dicts[i]["model"][new_name] = new_tensors[i].clone()
 
             # TE sets _extra_state (for FP8 purposes), so set an empty one here for compatibility.
@@ -50,13 +51,14 @@ def convert(output_path, tensor_parallel_size, use_te):
 
     add_chunck_tensor(
         state_dict["vision_tower.vision_model.embeddings.position_embedding.weight"],
-        "position_embeddings.weight")
+        "position_embeddings.weight",
+    )
     add_chunck_tensor(
-        state_dict["vision_tower.vision_model.embeddings.patch_embedding.weight"],
-        "conv1.weight")
+        state_dict["vision_tower.vision_model.embeddings.patch_embedding.weight"], "conv1.weight"
+    )
     add_chunck_tensor(
-        state_dict["vision_tower.vision_model.embeddings.patch_embedding.bias"],
-        "conv1.bias")
+        state_dict["vision_tower.vision_model.embeddings.patch_embedding.bias"], "conv1.bias"
+    )
 
     head_dim = 72
     num_head = 16
@@ -73,11 +75,14 @@ def convert(output_path, tensor_parallel_size, use_te):
             # projection for the QKV in the order
             # [(Q1, K1, V1), (Q2, K2, V2), ...] where Qi is the query of the
             # i-th head with dimension num_head.
-            new_tensor = torch.concatenate([
-                q_proj_params.view(num_head, head_dim, -1),
-                k_proj_params.view(num_head, head_dim, -1),
-                v_proj_params.view(num_head, head_dim, -1)], axis=1).view(
-                    3*head_dim*num_head, -1)
+            new_tensor = torch.concatenate(
+                [
+                    q_proj_params.view(num_head, head_dim, -1),
+                    k_proj_params.view(num_head, head_dim, -1),
+                    v_proj_params.view(num_head, head_dim, -1),
+                ],
+                axis=1,
+            ).view(3 * head_dim * num_head, -1)
             if param_type == "bias":
                 new_tensor = new_tensor[:, 0]
             new_name = f"{target_base}.self_attention.linear_qkv.{param_type}"
@@ -86,38 +91,35 @@ def convert(output_path, tensor_parallel_size, use_te):
             add_chunck_tensor(
                 state_dict[f"{origin_base}.self_attn.out_proj.{param_type}"],
                 f"{target_base}.self_attention.linear_proj.{param_type}",
-                chunk_dim=1 if param_type == "weight" else None)
+                chunk_dim=1 if param_type == "weight" else None,
+            )
             # layer_norm
             new_name = f"{target_base}.input_layernorm.{param_type}"
             if use_te:
                 new_name = f"{target_base}.self_attention.linear_qkv.layer_norm_{param_type}"
-            add_chunck_tensor(
-                state_dict[f"{origin_base}.layer_norm1.{param_type}"],
-                new_name)
+            add_chunck_tensor(state_dict[f"{origin_base}.layer_norm1.{param_type}"], new_name)
             # FC 1
             add_chunck_tensor(
                 state_dict[f"{origin_base}.mlp.fc1.{param_type}"],
                 f"{target_base}.mlp.linear_fc1.{param_type}",
-                chunk_dim=0)
+                chunk_dim=0,
+            )
             # FC 2
             add_chunck_tensor(
                 state_dict[f"{origin_base}.mlp.fc2.{param_type}"],
                 f"{target_base}.mlp.linear_fc2.{param_type}",
-                chunk_dim=1 if param_type=="weight" else None)
+                chunk_dim=1 if param_type == "weight" else None,
+            )
             # layer_norm
             new_name = f"{target_base}.pre_mlp_layernorm.{param_type}"
             if use_te:
                 new_name = f"{target_base}.mlp.linear_fc1.layer_norm_{param_type}"
-            add_chunck_tensor(
-                state_dict[f"{origin_base}.layer_norm2.{param_type}"],
-                new_name)
+            add_chunck_tensor(state_dict[f"{origin_base}.layer_norm2.{param_type}"], new_name)
 
     add_chunck_tensor(
-        state_dict["vision_tower.vision_model.post_layernorm.weight"],
-        "ln_post.weight")
-    add_chunck_tensor(
-        state_dict["vision_tower.vision_model.post_layernorm.bias"],
-        "ln_post.bias")
+        state_dict["vision_tower.vision_model.post_layernorm.weight"], "ln_post.weight"
+    )
+    add_chunck_tensor(state_dict["vision_tower.vision_model.post_layernorm.bias"], "ln_post.bias")
 
     for i in range(tensor_parallel_size):
         output_dir_tp = os.path.join(output_path, "iter_0000001", f"mp_rank_0{i}")
@@ -133,9 +135,13 @@ Convert SigLIP weights to megatron format.
 
 
 Example usage:
-python siglip_converter.py --tensor-parallel-size 4 --output google_paligemma_3b_pt_44_mcore_tp_4 --use-te
+python siglip_converter.py --tensor-parallel-size 4 \
+    --output google_paligemma_3b_pt_44_mcore_tp_4 --use-te
 
-examples/multimodal/combine_mistral_clip.sh Mistral-7B-Instruct-v0.3-mcore-tp4 google_paligemma_3b_pt_44_mcore_tp_4 mistral_7b_instruct_v0p3_google_paligemma_3b_pt_44_mcore_tp_4
+examples/multimodal/combine_mistral_clip.sh \
+    Mistral-7B-Instruct-v0.3-mcore-tp4 \
+    google_paligemma_3b_pt_44_mcore_tp_4 \
+    mistral_7b_instruct_v0p3_google_paligemma_3b_pt_44_mcore_tp_4
 """,
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )

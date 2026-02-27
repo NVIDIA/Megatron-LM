@@ -1,6 +1,7 @@
 # Copyright (c) 2025, NVIDIA CORPORATION. All rights reserved.
 
 """Megatron initialization."""
+
 import logging
 import os
 import random
@@ -22,17 +23,22 @@ from megatron.core.rerun_state_machine import (
     RerunMode,
     initialize_rerun_state_machine,
 )
-from megatron.core.transformer.custom_layers.batch_invariant_kernels import enable_batch_invariant_mode
+from megatron.core.transformer.custom_layers.batch_invariant_kernels import (
+    enable_batch_invariant_mode,
+)
 from megatron.core.utils import get_te_version, is_te_min_version, is_torch_min_version
 from megatron.legacy import fused_kernels
-from megatron.training import get_adlr_autoresume, get_args, get_tensorboard_writer
-from megatron.training.utils import print_rank_0, warn_rank_0
-from megatron.training import inprocess_restart
+from megatron.training import (
+    get_adlr_autoresume,
+    get_args,
+    get_tensorboard_writer,
+    inprocess_restart,
+)
 from megatron.training.arguments import parse_args, validate_args
 from megatron.training.async_utils import init_persistent_async_worker
 from megatron.training.checkpointing import load_args_from_checkpoint
 from megatron.training.global_vars import set_global_variables
-from megatron.training.utils import is_rank0
+from megatron.training.utils import is_rank0, print_rank_0, warn_rank_0
 from megatron.training.yaml_arguments import validate_yaml
 
 logger = logging.getLogger(__name__)
@@ -74,7 +80,9 @@ def initialize_megatron(
         args.exit_on_missing_checkpoint = True
 
     if args.use_checkpoint_args or args_defaults.get("use_checkpoint_args", False):
-        assert args.load is not None or args.pretrained_checkpoint is not None, "--use-checkpoint-args requires --load or --pretrained-checkpoint argument"
+        assert args.load is not None or args.pretrained_checkpoint is not None, (
+            "--use-checkpoint-args requires --load or --pretrained-checkpoint argument"
+        )
         assert args.non_persistent_ckpt_type != "local", (
             "--use-checkpoint-args is not supported with --non_persistent_ckpt_type=local. "
             "Two-stage checkpoint loading is not implemented, and all arguments must be defined "
@@ -117,7 +125,7 @@ def initialize_megatron(
         ),
         result_rejected_tracker_filename=args.result_rejected_tracker_filename,
     )
-    
+
     if args.batch_invariant_mode:
         print_rank_0("Enabling batch invariant mode globally")
         enable_batch_invariant_mode()
@@ -177,7 +185,6 @@ def initialize_megatron(
 
 
 def _compile_dependencies():
-
     args = get_args()
 
     # =========================
@@ -191,8 +198,9 @@ def _compile_dependencies():
 
         compile_helpers()
         print(
-            ">>> done with dataset index builder. Compilation time: {:.3f} "
-            "seconds".format(time.time() - start_time),
+            ">>> done with dataset index builder. Compilation time: {:.3f} seconds".format(
+                time.time() - start_time
+            ),
             flush=True,
         )
 
@@ -244,7 +252,7 @@ def _initialize_tp_communicators():
     communication overlap"""
 
     try:
-        import transformer_engine
+        import transformer_engine  # noqa: F401
         import yaml
         from transformer_engine.pytorch import module as te_module
 
@@ -273,11 +281,16 @@ def _initialize_tp_communicators():
             args.hidden_size,
         ]
 
-
     if is_te_min_version("2.7.0"):
         UserBufferQuantizationMode = te_module.base.UserBufferQuantizationMode
-        quantization_modes = [UserBufferQuantizationMode.FP8 if args.fp8 else UserBufferQuantizationMode.NONE]
-        if args.fp8 is not None and args.first_last_layers_bf16 and (args.num_layers_at_start_in_bf16 > 0 or args.num_layers_at_end_in_bf16 > 0):
+        quantization_modes = [
+            UserBufferQuantizationMode.FP8 if args.fp8 else UserBufferQuantizationMode.NONE
+        ]
+        if (
+            args.fp8 is not None
+            and args.first_last_layers_bf16
+            and (args.num_layers_at_start_in_bf16 > 0 or args.num_layers_at_end_in_bf16 > 0)
+        ):
             quantization_modes.append(UserBufferQuantizationMode.NONE)
         # The process group with the target bootstrap backend is created in Transformer Engine.
         te_module.base.initialize_ub(
@@ -318,13 +331,11 @@ def _initialize_distributed(get_embedding_ranks, get_position_embedding_ranks, s
 
     device_count = torch.cuda.device_count()
     if torch.distributed.is_initialized():
-
         print_rank_0("torch distributed is already initialized, skipping initialization ...")
         args.rank = torch.distributed.get_rank()
         args.world_size = torch.distributed.get_world_size()
 
     else:
-
         print_rank_0("> initializing torch distributed ...")
         # Manually set the device ids.
         if device_count > 0:
@@ -346,8 +357,11 @@ def _initialize_distributed(get_embedding_ranks, get_position_embedding_ranks, s
             'timeout': timedelta(minutes=args.distributed_timeout_minutes),
         }
         if args.fake_process_group:
-            assert is_torch_min_version("2.3.0"), "Fake process group is only supported with PyTorch 2.3.0 and above."
+            assert is_torch_min_version("2.3.0"), (
+                "Fake process group is only supported with PyTorch 2.3.0 and above."
+            )
             from torch.testing._internal.distributed.fake_pg import FakeStore
+
             store = FakeStore()
             init_process_group_kwargs['backend'] = 'fake'
             init_process_group_kwargs['store'] = store

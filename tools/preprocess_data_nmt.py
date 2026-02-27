@@ -3,16 +3,17 @@
 """Processing nmt data for finetuning."""
 
 import argparse
-import json
 import multiprocessing
 import os
 import sys
-sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__),
-                                             os.path.pardir)))
+
+sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), os.path.pardir)))
 import time
+
 import torch
-from megatron.core.tokenizers.utils.build_tokenizer import build_tokenizer
+
 from megatron.core.datasets import indexed_dataset
+from megatron.core.tokenizers.utils.build_tokenizer import build_tokenizer
 
 
 class Encoder(object):
@@ -33,28 +34,38 @@ class Encoder(object):
 def get_args():
     parser = argparse.ArgumentParser()
     group = parser.add_argument_group(title='input data')
-    group.add_argument('--input', type=str, required=True,
-                       help='Path to input JSON')
+    group.add_argument('--input', type=str, required=True, help='Path to input JSON')
 
     group = parser.add_argument_group(title='tokenizer')
-    group.add_argument('--tokenizer-type', type=str, default='YTTMTokenizer',
-                       choices=['BertWordPieceLowerCase','BertWordPieceCase',
-                                'GPT2BPETokenizer', 'SentencePieceTokenizer'],
-                       help='What type of tokenizer to use.')
-    group.add_argument('--vocab-file', type=str, default=None,
-                       help='Path to the vocab file')
-    group.add_argument('--merge-file', type=str, default=None,
-                       help='Path to the BPE merge file (if necessary).')
+    group.add_argument(
+        '--tokenizer-type',
+        type=str,
+        default='YTTMTokenizer',
+        choices=[
+            'BertWordPieceLowerCase',
+            'BertWordPieceCase',
+            'GPT2BPETokenizer',
+            'SentencePieceTokenizer',
+        ],
+        help='What type of tokenizer to use.',
+    )
+    group.add_argument('--vocab-file', type=str, default=None, help='Path to the vocab file')
+    group.add_argument(
+        '--merge-file', type=str, default=None, help='Path to the BPE merge file (if necessary).'
+    )
 
     group = parser.add_argument_group(title='output data')
-    group.add_argument('--output-prefix', type=str, required=True,
-                       help='Path to binary output file without suffix')
+    group.add_argument(
+        '--output-prefix', type=str, required=True, help='Path to binary output file without suffix'
+    )
 
     group = parser.add_argument_group(title='runtime')
-    group.add_argument('--workers', type=int, default=1,
-                       help='Number of worker processes to launch')
-    group.add_argument('--log-interval', type=int, default=100,
-                       help='Interval between progress updates')
+    group.add_argument(
+        '--workers', type=int, default=1, help='Number of worker processes to launch'
+    )
+    group.add_argument(
+        '--log-interval', type=int, default=100, help='Interval between progress updates'
+    )
     args = parser.parse_args()
     args.keep_empty = False
 
@@ -65,6 +76,7 @@ def get_args():
     args.vocab_extra_ids = 0
 
     return args
+
 
 def main():
     args = get_args()
@@ -99,13 +111,15 @@ def main():
         if i % args.log_interval == 0:
             current = time.time()
             elapsed = current - proc_start
-            mbs = total_bytes_processed/elapsed/1024/1024
-            print(f"Processed {i} sentences",
-                  f"({i/elapsed} sentences/s, {mbs} MB/s).",
-                  file=sys.stderr)
+            mbs = total_bytes_processed / elapsed / 1024 / 1024
+            print(
+                f"Processed {i} sentences",
+                f"({i / elapsed} sentences/s, {mbs} MB/s).",
+                file=sys.stderr,
+            )
 
     builder.finalize(output_idx_file)
 
+
 if __name__ == '__main__':
     main()
-

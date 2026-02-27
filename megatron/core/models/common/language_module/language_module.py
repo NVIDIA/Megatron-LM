@@ -89,20 +89,22 @@ class LanguageModule(MegatronModule):
                 return True
         return False
 
-    # pylint: disable=line-too-long
     def _set_attention_backend(self):
         """Set attention backend
 
-        Transformer engine works based on optout. By default all three attention backend flags are set to 1. So if the user choses a particular attention backend we set the other two to 0. If the user choses local, we set all 3 TE env variables to 0.
+        Transformer engine works based on optout. By default all three
+        attention backend flags are set to 1. So if the user choses a
+        particular attention backend we set the other two to 0. If the
+        user choses local, we set all 3 TE env variables to 0.
         """
 
         def check_and_set_env_variable(
             env_variable_name: str, expected_value: int, attn_type: AttnBackend
         ) -> None:
             current_value = os.getenv(env_variable_name)
-            assert current_value is None or current_value == str(
-                expected_value
-            ), f'{env_variable_name} set to {current_value}, but expected {expected_value} for attention backend type {attn_type.name}. unset NVTE_FLASH_ATTN, NVTE_FUSED_ATTN and NVTE_UNFUSED_ATTN. Use the --attention-backend argument if you want to choose between (flash/fused/unfused/auto/local). Default is auto.'
+            assert current_value is None or current_value == str(expected_value), (
+                f'{env_variable_name} set to {current_value}, but expected {expected_value} for attention backend type {attn_type.name}. unset NVTE_FLASH_ATTN, NVTE_FUSED_ATTN and NVTE_UNFUSED_ATTN. Use the --attention-backend argument if you want to choose between (flash/fused/unfused/auto/local). Default is auto.'  # noqa: E501
+            )
             os.environ[env_variable_name] = str(expected_value)
 
         if self.config.attention_backend == AttnBackend.local:
@@ -142,7 +144,7 @@ class LanguageModule(MegatronModule):
             if self.config.cross_entropy_fusion_impl == 'te':
                 if te_parallel_cross_entropy is not None:
                     labels = torch.as_strided(labels, labels.size(), (labels.size()[1], 1))
-                    # Use is_cg_capturable=True for full iteration CUDA graphs to avoid torch.equal checks
+                    # Use is_cg_capturable=True for full iteration CUDA graphs to avoid torch.equal checks  # noqa: E501
                     is_cg_capturable = (
                         hasattr(self.config, 'cuda_graph_scope')
                         and CudaGraphScope.full_iteration in self.config.cuda_graph_scope
@@ -152,8 +154,8 @@ class LanguageModule(MegatronModule):
 
                         current_version = get_te_version()
                         raise AssertionError(
-                            f"CUDA graph compatible cross entropy requires TransformerEngine >= 2.7.0, "
-                            f"but found version {current_version}. Please upgrade TransformerEngine "
+                            f"CUDA graph compatible cross entropy requires TransformerEngine >= 2.7.0, "  # noqa: E501
+                            f"but found version {current_version}. Please upgrade TransformerEngine "  # noqa: E501
                             f"or set cuda_graph_scope to a value other than 'full_iteration'."
                         )
 
@@ -256,20 +258,23 @@ class LanguageModule(MegatronModule):
             LanguageModule.embedding_warning_printed = True
 
     def shared_embedding_or_output_weight(self) -> Tensor:
-        """Gets the embedding weight or output logit weights when share embedding and output weights set to True
-          or when use Multi-Token Prediction (MTP).
+        """Gets the embedding weight or output logit weights when
+          share embedding and output weights set to True or when use
+          Multi-Token Prediction (MTP).
 
         Returns:
-            Tensor: During pre processing or MTP process it returns the input embeddings weight while during post processing it returns the final output layers weight
+            Tensor: During pre processing or MTP process it returns
+                the input embeddings weight while during post
+                processing it returns the final output layers weight
         """
         if self.pre_process or getattr(self, 'mtp_process', False):
             # Multi-Token Prediction (MTP) need both embedding layer and output layer.
             # So there will be both embedding layer and output layer in the mtp process stage.
             # When share_embeddings_and_output_weights is True, the embedding weight is the
             # canonical shared weight and is passed to the output layer during forward.
-            assert hasattr(
-                self, 'embedding'
-            ), f"embedding is needed in this pipeline stage, but it is not initialized."
+            assert hasattr(self, 'embedding'), (
+                f"embedding is needed in this pipeline stage, but it is not initialized."
+            )
             return self.embedding.word_embeddings.weight
         elif self.post_process:
             return self.output_layer.weight

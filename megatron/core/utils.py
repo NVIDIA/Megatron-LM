@@ -37,7 +37,7 @@ except ImportError:
     HAVE_TORCH_SYMM_MEM = False
 
 try:
-    import triton  # pylint: disable=unused-import
+    import triton  # noqa: F401
 
     HAVE_TRITON = True
 except ImportError:
@@ -77,7 +77,7 @@ logger = logging.getLogger(__name__)
 
 try:
     # Register the TE CUDA kernels
-    import transformer_engine  # pylint: disable=unused-import
+    import transformer_engine  # noqa: F401
 
     # Alias the PyTorch wrapper so we can call tex.* APIs
     import transformer_engine_torch as tex
@@ -339,7 +339,7 @@ def get_te_version():
         )
 
     try:
-        import transformer_engine as te
+        import transformer_engine as te  # noqa: F401
 
         HAVE_TE = True
     except ImportError:
@@ -1078,8 +1078,9 @@ def to_local_if_dtensor(tensor: Union[torch.Tensor, "DTensor"]) -> torch.Tensor:
 
 
 def get_data_parallel_group_if_dtensor(
-    tensor: Union[torch.Tensor, "DTensor"], data_parallel_group: "ProcessGroup" = None
-) -> Optional["ProcessGroup"]:
+    tensor: Union[torch.Tensor, "DTensor"],
+    data_parallel_group: "ProcessGroup" = None,  # noqa: F821
+) -> Optional["ProcessGroup"]:  # noqa: F821
     """Gets the data parallel group of the given tensor if it is a DTensor."""
     if HAVE_DTENSOR and isinstance(tensor, DTensor):
         current_group = tensor.device_mesh.get_group()
@@ -1127,9 +1128,9 @@ def drain_embedding_wgrad_compute(
     fusion are enabled.
     """
 
-    assert len(embedding_activation_buffer) == len(
-        grad_output_buffer
-    ), "Length of activation and gradient buffers need to be equal!"
+    assert len(embedding_activation_buffer) == len(grad_output_buffer), (
+        "Length of activation and gradient buffers need to be equal!"
+    )
 
     import fused_weight_gradient_mlp_cuda
 

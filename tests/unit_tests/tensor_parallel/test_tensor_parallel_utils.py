@@ -1,6 +1,5 @@
 import torch
 
-import megatron.core.parallel_state as ps
 import megatron.core.tensor_parallel.utils as util
 from tests.unit_tests.test_utilities import Utils
 

@@ -1,13 +1,10 @@
 import torch
-from pytest_mock import mocker
 
 from megatron.core.export.data_type import DataType
 from megatron.core.export.trtllm.model_to_trllm_mapping.default_conversion_dict import (
     DEFAULT_CONVERSION_DICT,
 )
-
-# pylint: disable=line-too-long
-from megatron.core.export.trtllm.trtllm_weights_converter.distributed_trtllm_model_weights_converter import (
+from megatron.core.export.trtllm.trtllm_weights_converter.distributed_trtllm_model_weights_converter import (  # noqa: E501
     DistributedTRTLLMModelWeightsConverter,
 )
 from megatron.core.models.gpt.gpt_layer_specs import get_gpt_layer_local_spec
@@ -110,6 +107,6 @@ class TestTRTLLMDistributedGPUConverter:
         }
 
         for key, value in distributed_converter.trtllm_model_weights.items():
-            assert (
-                expected_result[key] == value.shape
-            ), f"Shape mismatch for {key}. Expected {expected_result[key]} but got {value.shape}"
+            assert expected_result[key] == value.shape, (
+                f"Shape mismatch for {key}. Expected {expected_result[key]} but got {value.shape}"
+            )

@@ -180,7 +180,9 @@ def test_get_param_groups_overlapping_matches(mock_get_world_size):
     net = Net()
     # We expect that all convolution parameters will have wd_mult=0.0
     #  However the conv1 related parameters will additionally have a different LR schedule.
-    #  this should create three param groups (no match, conv1 (both wd_mult=0.0 and LR schedule), conv2 (only wd_mult=0.0))
+    #  this should create three param groups (no match,
+    #  conv1 (both wd_mult=0.0 and LR schedule),
+    #  conv2 (only wd_mult=0.0))
     config_overrides = {
         ParamKey(name="*conv*"): ParamGroupOverride(wd_mult=0.0),
         ParamKey(name="*conv1*"): ParamGroupOverride(min_lr=10, max_lr=20),
@@ -196,15 +198,15 @@ def test_get_param_groups_overlapping_matches(mock_get_world_size):
     assert len(p_set) == len(param_groups[0]['params']) + len(param_groups[1]['params']) + len(
         param_groups[2]['params']
     )
-    assert (
-        param_groups[0]['wd_mult'] == 1.0
-    ), "We expect the first param group to be the None one, which should have wd_mult=1.0"
-    assert (
-        param_groups[1]['wd_mult'] == 0.0
-    ), "We expect the second param group to be the conv1 one, which should have wd_mult=0.0"
-    assert (
-        param_groups[2]['wd_mult'] == 0.0
-    ), "We expect the third param group to be the conv2 one, which should have wd_mult=0.0"
+    assert param_groups[0]['wd_mult'] == 1.0, (
+        "We expect the first param group to be the None one, which should have wd_mult=1.0"
+    )
+    assert param_groups[1]['wd_mult'] == 0.0, (
+        "We expect the second param group to be the conv1 one, which should have wd_mult=0.0"
+    )
+    assert param_groups[2]['wd_mult'] == 0.0, (
+        "We expect the third param group to be the conv2 one, which should have wd_mult=0.0"
+    )
     assert param_groups[1]['min_lr'] == 10
     assert param_groups[1]['max_lr'] == 20
     assert param_groups[2]['min_lr'] is None
@@ -238,12 +240,10 @@ def test_get_param_groups_with_standard_config_overrides(apply_wd_to_qk_layernor
     # Param group A (wd_mult=1.0): conv1.weight, conv2.weight, fc1.weight, fc2.weight, fc3.weight
     # Param group B (wd_mult=0.0): conv1.bias, conv2.bias, fc1.bias, fc2.bias, fc3.bias
     assert len(param_groups[0]['params']) == 5, (
-        f"Expected 5 parameters in the first param group, "
-        f"but got {len(param_groups[0]['params'])}"
+        f"Expected 5 parameters in the first param group, but got {len(param_groups[0]['params'])}"
     )
     assert len(param_groups[1]['params']) == 5, (
-        f"Expected 5 parameters in the second param group, "
-        f"but got {len(param_groups[1]['params'])}"
+        f"Expected 5 parameters in the second param group, but got {len(param_groups[1]['params'])}"
     )
 
 
@@ -277,12 +277,10 @@ def test_get_param_groups_appling_wd_to_qk_layernorm(apply_wd_to_qk_layernorm: b
     # Param group B (wd_mult=0.0): conv1.bias, conv2.bias, fc1.bias, fc2.bias, fc3.bias,
     #    layernorm.weight
     assert len(param_groups[0]['params']) == 7, (
-        f"Expected 5 parameters in the first param group, "
-        f"but got {len(param_groups[0]['params'])}"
+        f"Expected 5 parameters in the first param group, but got {len(param_groups[0]['params'])}"
     )
     assert len(param_groups[1]['params']) == 6, (
-        f"Expected 6 parameters in the second param group, "
-        f"but got {len(param_groups[1]['params'])}"
+        f"Expected 6 parameters in the second param group, but got {len(param_groups[1]['params'])}"
     )
 
 
@@ -292,7 +290,8 @@ def test_chained_optimizer():
     optimizer_2 = SGD(list(net.parameters())[2:], lr=0.1, momentum=0.9)
     chained_optimizer = ChainedOptimizer([optimizer_1, optimizer_2])
 
-    # Test the chained optimizer's param groups is a reference of the underlying optimizers' param groups
+    # Test the chained optimizer's param groups is a reference
+    # of the underlying optimizers' param groups
     assert optimizer_1.param_groups[0]["lr"] == 0.01
     chained_optimizer.param_groups[0]["lr"] = 0.02
     assert optimizer_1.param_groups[0]["lr"] == 0.02
@@ -760,13 +759,13 @@ def test_get_megatron_optimizer_with_custom_process_groups(world_size, tp_size, 
     optimizer.step()
 
     # Verify parameters were updated
-    assert not torch.equal(
-        model.module.weight.data, original_weight
-    ), "Weight should be updated after optimizer step"
+    assert not torch.equal(model.module.weight.data, original_weight), (
+        "Weight should be updated after optimizer step"
+    )
     if model.module.bias is not None:
-        assert not torch.equal(
-            model.module.bias.data, original_bias
-        ), "Bias should be updated after optimizer step"
+        assert not torch.equal(model.module.bias.data, original_bias), (
+            "Bias should be updated after optimizer step"
+        )
 
     # Test 4: Compare with default process groups optimizer (if world_size allows)
     if world_size == 1:  # Only test on single GPU to avoid complex setup
@@ -776,9 +775,9 @@ def test_get_megatron_optimizer_with_custom_process_groups(world_size, tp_size, 
         )
 
         # Both optimizers should have the same structure
-        assert len(optimizer.param_groups) == len(
-            default_optimizer.param_groups
-        ), "Custom and default optimizers should have same number of parameter groups"
+        assert len(optimizer.param_groups) == len(default_optimizer.param_groups), (
+            "Custom and default optimizers should have same number of parameter groups"
+        )
 
 
 def test_get_megatron_optimizer_custom_process_groups_validation():

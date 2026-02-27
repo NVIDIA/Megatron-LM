@@ -13,7 +13,7 @@ from megatron.core.transformer.torch_norm import LayerNormBuilder, WrappedTorchN
 from megatron.core.typed_torch import not_none
 
 try:
-    import apex  # pylint: disable=unused-import
+    import apex  # noqa: F401
 
     from megatron.core.fusions.fused_layer_norm import FusedLayerNorm
 

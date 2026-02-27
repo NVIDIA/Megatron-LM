@@ -22,10 +22,12 @@ def flatten(
         if isinstance(v, dict):
             flat.extend(flatten(v, path))
         elif isinstance(v, torch.Tensor):
-            flat.append((path, v))        # v is a tensor
+            flat.append((path, v))  # v is a tensor
         else:
-            raise ValueError(f"Unsupported value type: {type(v)} for key {k}"
-                             f"In nested dictionary,leaf nodes must contain tensors")
+            raise ValueError(
+                f"Unsupported value type: {type(v)} for key {k}"
+                f"In nested dictionary,leaf nodes must contain tensors"
+            )
     return flat
 
 
@@ -42,13 +44,13 @@ def regroup(flat: List[Tuple[Tuple[str, ...], torch.Tensor]]) -> Dict[str, Any]:
 
 def broadcast_nested_data_batch(nested_dict: Dict[str, Any]) -> Dict[str, Any]:
     """Recursively broadcast nested dictionaries of tensors using each tensor's own dtype."""
-    
+
     tp_group = mpu.get_tensor_model_parallel_group()
-    src      = mpu.get_tensor_model_parallel_src_rank()
+    src = mpu.get_tensor_model_parallel_src_rank()
 
     # ---------- rank-0 prepares metadata ----------
     if mpu.get_tensor_model_parallel_rank() == 0:
-        flat = flatten(nested_dict)                # [(path,tensor), …]
+        flat = flatten(nested_dict)  # [(path,tensor), …]
         paths, tensors = zip(*flat) if flat else ([], [])
         dtypes = [t.dtype for t in tensors]
     else:
@@ -56,10 +58,10 @@ def broadcast_nested_data_batch(nested_dict: Dict[str, Any]) -> Dict[str, Any]:
         tensors = []
 
     # ---------- 1. broadcast schema (paths + dtypes) ----------
-    meta = [paths, dtypes]                         # small, picklable
+    meta = [paths, dtypes]  # small, picklable
     obj_list = [meta]
     torch.distributed.broadcast_object_list(obj_list, src=src, group=tp_group)
-    paths, dtypes = obj_list[0]                    # now identical on all ranks
+    paths, dtypes = obj_list[0]  # now identical on all ranks
 
     # ---------- 2. group tensors by dtype and broadcast ----------
     # build maps keyed by dtype for convenience

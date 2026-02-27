@@ -224,9 +224,9 @@ class DistributedDataParallel(_BaseDataParallel):
             bucket_groups = partition_buckets(buffers, force_single_bucket_group=disable_bucketing)
 
             if self.ddp_config.num_distributed_optimizer_instances > 1:
-                assert (
-                    self.ddp_config.use_distributed_optimizer
-                ), 'Partial DistOpt cannot be used without DistOpt'
+                assert self.ddp_config.use_distributed_optimizer, (
+                    'Partial DistOpt cannot be used without DistOpt'
+                )
                 communication_stream = torch.cuda.Stream(device=torch.cuda.current_device())
                 for bucket_group in bucket_groups:
                     bucket_group.inter_distributed_optimizer_instance_group = (
@@ -239,9 +239,9 @@ class DistributedDataParallel(_BaseDataParallel):
             if self.ddp_config.use_distributed_optimizer and self.ddp_config.overlap_param_gather:
                 num_bucket_groups = len(bucket_groups)
                 for i in range(1, num_bucket_groups):
-                    bucket_groups[num_bucket_groups - i].next_param_gather_bucket_group = (
-                        bucket_groups[num_bucket_groups - i - 1]
-                    )
+                    bucket_groups[
+                        num_bucket_groups - i
+                    ].next_param_gather_bucket_group = bucket_groups[num_bucket_groups - i - 1]
 
             # Create map from param to bucket group, used in pre_hook.
             for bucket_group in bucket_groups:
@@ -252,9 +252,9 @@ class DistributedDataParallel(_BaseDataParallel):
             return buffers, bucket_groups
 
         if config.calculate_per_token_loss:
-            assert (
-                not self.ddp_config.average_in_collective
-            ), "Cannot average in collective when calculating per-token loss!"
+            assert not self.ddp_config.average_in_collective, (
+                "Cannot average in collective when calculating per-token loss!"
+            )
             gradient_scaling_factor = 1.0
             expert_gradient_scaling_factor = 1.0
         else:
@@ -388,9 +388,9 @@ class DistributedDataParallel(_BaseDataParallel):
         """
 
         def hook(module, *unused):
-            assert (
-                self.use_forward_hook
-            ), "Should use pre-hook only when overlap_param_gather is True"
+            assert self.use_forward_hook, (
+                "Should use pre-hook only when overlap_param_gather is True"
+            )
 
             if is_graph_capturing():
                 return
@@ -431,9 +431,9 @@ class DistributedDataParallel(_BaseDataParallel):
             if param in self.param_to_bucket_group:
                 assert param.requires_grad
                 if self.ddp_config.overlap_grad_reduce:
-                    assert (
-                        param.grad is not None
-                    ), 'param.grad being None is not safe when overlap_grad_reduce is True'
+                    assert param.grad is not None, (
+                        'param.grad being None is not safe when overlap_grad_reduce is True'
+                    )
                 if param.grad is not None and (
                     not param.grad_added_to_main_grad or getattr(param, 'zero_out_wgrad', False)
                 ):

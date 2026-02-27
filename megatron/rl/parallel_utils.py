@@ -56,7 +56,6 @@ def build_inference_pg_collection(
     if expt_tp_size is None:
         expt_tp_size = mpu.get_expert_tensor_parallel_world_size()
 
-
     # Compute DP size for dense layers (same formula as mpu)
     # world = tp × cp × dp × pp
     dp_size = world_size // (tp_size * cp_size * pp_size)
@@ -68,7 +67,7 @@ def build_inference_pg_collection(
     # world = expt_tp × ep × expt_dp × pp
     expt_dp_size = world_size // (expt_tp_size * ep_size * pp_size)
     assert expt_dp_size >= 1 and (expt_tp_size * ep_size * expt_dp_size * pp_size) == world_size, (
-        f"World size ({world_size}) must be divisible by expt_tp*ep*pp ({expt_tp_size * ep_size * pp_size})"
+        f"World size ({world_size}) must be divisible by expt_tp*ep*pp ({expt_tp_size * ep_size * pp_size})"  # noqa: E501
     )
 
     rank = dist.get_rank()
@@ -80,16 +79,12 @@ def build_inference_pg_collection(
     if use_tp_pp_dp_mapping:
         # Order: tp-cp-pp-dp
         decoder_grid = HyperCommGrid(
-            [tp_size, cp_size, pp_size, dp_size],
-            ["tp", "cp", "pp", "dp"],
-            rank_offset=rank_offset
+            [tp_size, cp_size, pp_size, dp_size], ["tp", "cp", "pp", "dp"], rank_offset=rank_offset
         )
     else:
         # Order: tp-cp-dp-pp (default)
         decoder_grid = HyperCommGrid(
-            [tp_size, cp_size, dp_size, pp_size],
-            ["tp", "cp", "dp", "pp"],
-            rank_offset=rank_offset
+            [tp_size, cp_size, dp_size, pp_size], ["tp", "cp", "dp", "pp"], rank_offset=rank_offset
         )
 
     # Create dense layer groups from decoder_grid
@@ -111,14 +106,14 @@ def build_inference_pg_collection(
         expert_grid = HyperCommGrid(
             [expt_tp_size, ep_size, pp_size, expt_dp_size],
             ["tp", "ep", "pp", "dp"],
-            rank_offset=rank_offset
+            rank_offset=rank_offset,
         )
     else:
         # Order: tp-ep-dp-pp (default)
         expert_grid = HyperCommGrid(
             [expt_tp_size, ep_size, expt_dp_size, pp_size],
             ["tp", "ep", "dp", "pp"],
-            rank_offset=rank_offset
+            rank_offset=rank_offset,
         )
 
     # Verify PP groups match between decoder and expert grids (required by mpu)

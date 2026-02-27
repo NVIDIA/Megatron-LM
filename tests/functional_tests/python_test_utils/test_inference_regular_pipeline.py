@@ -15,7 +15,7 @@ logger = logging.getLogger(__name__)
 _NON_REQUEST_TOP_LEVEL_KEYS = {
     # System-level metrics
     "throughput",
-    # Peak memory metrics (added by inference scripts; optionally checked if present in golden values)
+    # Peak memory metrics (added by inference scripts; optionally checked if present in golden values)  # noqa: E501
     "mem-max-allocated-bytes",
 }
 
@@ -76,7 +76,7 @@ def test_inference_pipeline(
     )
     if groundtruth_request_ids != current_request_ids:
         logger.warning(
-            "Some request IDs from groundtruth are missing in output; only the subset of ids in groundtruth will be tested: "
+            "Some request IDs from groundtruth are missing in output; only the subset of ids in groundtruth will be tested: "  # noqa: E501
             f"{sorted(groundtruth_request_ids)} vs {sorted(current_request_ids)}"
         )
     assert len(output_groundtruth) > 0, "No test performed for output"
@@ -89,14 +89,14 @@ def test_inference_pipeline(
             throughput_golden = median(output_groundtruth["throughput"][1:])
 
             # 10% is empirically observed to be within hardware variance.
-            assert (
-                throughput_sampled >= 0.9 * throughput_golden
-            ), f"Throughput is slower than expected! Expected to be within 10% of ~{throughput_golden} tok/s but benchmarked {output_current['throughput']} tok/s"
+            assert throughput_sampled >= 0.9 * throughput_golden, (
+                f"Throughput is slower than expected! Expected to be within 10% of ~{throughput_golden} tok/s but benchmarked {output_current['throughput']} tok/s"  # noqa: E501
+            )
 
             # If throughput is significantly improved (> 20%), update golden values accordingly.
-            assert (
-                throughput_sampled < throughput_golden * 1.2
-            ), f"Throughput has been improved from expected ~{throughput_golden} tok/s to {output_current['throughput']} tok/s. Please update golden values in the functional tests."
+            assert throughput_sampled < throughput_golden * 1.2, (
+                f"Throughput has been improved from expected ~{throughput_golden} tok/s to {output_current['throughput']} tok/s. Please update golden values in the functional tests."  # noqa: E501
+            )
 
         output_groundtruth.pop('throughput')
 
@@ -119,7 +119,7 @@ def test_inference_pipeline(
                     f"Memory is too low for mem-max-allocated-bytes: "
                     f"expected within 5% of {golden:.0f} bytes ({_bytes_to_gib(golden):.3f} GiB) "
                     f"but got {sampled:.0f} bytes ({_bytes_to_gib(sampled):.3f} GiB). "
-                    "This is >5% lower than expected; please update golden values in the functional tests."
+                    "This is >5% lower than expected; please update golden values in the functional tests."  # noqa: E501
                 )
             if sampled > high:
                 raise AssertionError(
@@ -139,23 +139,23 @@ def test_inference_pipeline(
             tokens_groundtruth = groundtruth_results["generated_tokens"]
             tokens_current = current_results["generated_tokens"]
             # Check token equality
-            assert (
-                tokens_groundtruth == tokens_current
-            ), f"Token mismatch:\nGround truth: {tokens_groundtruth}\nCurrent: {tokens_current}"
+            assert tokens_groundtruth == tokens_current, (
+                f"Token mismatch:\nGround truth: {tokens_groundtruth}\nCurrent: {tokens_current}"
+            )
 
         if "logprobs" in groundtruth_results and "logprobs" in metrics:
             at_least_one_test_loop = True
             logprobs_groundtruth = groundtruth_results["logprobs"]
             logprobs_current = current_results["logprobs"]
             # Check logprobs length and tolerance
-            assert len(logprobs_groundtruth) == len(
-                logprobs_current
-            ), f"Logprobs length mismatch: {len(logprobs_groundtruth)} vs {len(logprobs_current)}"
+            assert len(logprobs_groundtruth) == len(logprobs_current), (
+                f"Logprobs length mismatch: {len(logprobs_groundtruth)} vs {len(logprobs_current)}"
+            )
 
             for i, (lp1, lp2) in enumerate(zip(logprobs_groundtruth, logprobs_current)):
-                assert math.isclose(
-                    lp1, lp2, abs_tol=0.001
-                ), f"Logprobs differ at index {i}: {lp1:.5f} vs {lp2:.5f}"
+                assert math.isclose(lp1, lp2, abs_tol=0.001), (
+                    f"Logprobs differ at index {i}: {lp1:.5f} vs {lp2:.5f}"
+                )
 
         if "generated_text" in groundtruth_results and "generated_text" in metrics:
             at_least_one_test_loop = True
@@ -168,7 +168,7 @@ def test_inference_pipeline(
             )
             assert generated_text_groundtruth[:min_len] == generated_text_current[:min_len], (
                 "Generated text mismatch:"
-                f"\nGround truth (truncated to {min_len} chars): {generated_text_groundtruth[:min_len]}"
+                f"\nGround truth (truncated to {min_len} chars): {generated_text_groundtruth[:min_len]}"  # noqa: E501
                 f"\nCurrent (truncated to {min_len} chars): {generated_text_current[:min_len]}"
             )
 
@@ -176,9 +176,9 @@ def test_inference_pipeline(
             at_least_one_test_loop = True
             routing_indices_groundtruth = groundtruth_results["routing_indices"]
             routing_indices_current = current_results["routing_indices"]
-            assert (
-                routing_indices_groundtruth == routing_indices_current
-            ), f"Routing indices mismatch:\nGround truth: {routing_indices_groundtruth}\nCurrent: {routing_indices_current}"
+            assert routing_indices_groundtruth == routing_indices_current, (
+                f"Routing indices mismatch:\nGround truth: {routing_indices_groundtruth}\nCurrent: {routing_indices_current}"  # noqa: E501
+            )
 
         if not at_least_one_test_loop:
             raise AssertionError(f"No test performed for output {groundtruth_results}")

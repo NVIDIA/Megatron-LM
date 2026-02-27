@@ -95,10 +95,10 @@ class GPTDatasetConfig(BlendedMegatronDatasetConfig):
             else (4 if self.tokenizer.vocab_size > numpy.iinfo(numpy.uint16).max + 1 else 8)
         )
         if self.sequences_per_dataset is not None:
-            assert (
-                self.token_dtype_code is not None
-            ), "Tokenizer vocab size is not set, deactivate --per-dataset-sequences-path or \
+            assert self.token_dtype_code is not None, (
+                "Tokenizer vocab size is not set, deactivate --per-dataset-sequences-path or \
             fix the tokenizer."
+            )
 
 
 class GPTDataset(MegatronDataset):
@@ -203,8 +203,8 @@ class GPTDataset(MegatronDataset):
             int: The length of the dataset
         """
         if self.config.defer_npy_index_mmap:
-            # NOTE(asolergi-nv): We need the number of samples of every GPTDataset to build/hit the BlendedDataset cache # pylint: disable=C0301
-            # NOTE(asolergi-nv): Uses logic from megatron/core/datasets/helpers.cpp::build_sample_idx to compute the number of samples # pylint: disable=C0301
+            # NOTE(asolergi-nv): We need the number of samples of every GPTDataset to build/hit the BlendedDataset cache  # noqa: E501
+            # NOTE(asolergi-nv): Uses logic from megatron/core/datasets/helpers.cpp::build_sample_idx to compute the number of samples  # noqa: E501
             num_tokens_per_epoch = self._get_num_tokens_per_epoch()
             num_epochs = self._get_num_epochs(num_tokens_per_epoch)
 
@@ -363,9 +363,9 @@ class GPTDataset(MegatronDataset):
                 sample_parts.append(
                     self.dataset.get(self.document_index[i], offset=int(offset), length=length)
                 )
-        assert len(document_ids) == len(
-            sample_parts
-        ), f"len(document_ids) ({len(document_ids)}) != len(sample_parts) ({len(sample_parts)})"
+        assert len(document_ids) == len(sample_parts), (
+            f"len(document_ids) ({len(document_ids)}) != len(sample_parts) ({len(sample_parts)})"
+        )
 
         length = sum(map(len, sample_parts))
 

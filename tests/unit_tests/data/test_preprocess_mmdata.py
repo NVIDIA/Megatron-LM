@@ -127,9 +127,9 @@ def do_test_preprocess_mmdata(temp_dir, extra_args=[]):
         ]
         merged_doc_idx = merged_doc_idx - merged_doc_idx[0]
 
-        assert (
-            dataset.document_indices == merged_doc_idx
-        ).all(), f"ERROR: {basename.split('_')[:-2]}: merged dataset document indices mismatch"
+        assert (dataset.document_indices == merged_doc_idx).all(), (
+            f"ERROR: {basename.split('_')[:-2]}: merged dataset document indices mismatch"
+        )
 
         merged_doc_index_index += len(dataset.document_indices) - 1
 
@@ -156,13 +156,13 @@ def do_test_preprocess_mmdata(temp_dir, extra_args=[]):
                 # reverse to account for preprocessing 0-index padding
                 processed_image = processed_image[::-1][0 : raw_image.size]
 
-                assert (
-                    raw_text == processed_text
-                ), f"ERROR: {basename.split('_')[:-2]}: raw and processed documents (text) do not match"
+                assert raw_text == processed_text, (
+                    f"ERROR: {basename.split('_')[:-2]}: raw and processed documents (text) do not match"  # noqa: E501
+                )
 
-                assert numpy.allclose(
-                    raw_image, processed_image
-                ), f"ERROR: {basename.split('_')[:-2]}: raw and processed documents (image) do not match"
+                assert numpy.allclose(raw_image, processed_image), (
+                    f"ERROR: {basename.split('_')[:-2]}: raw and processed documents (image) do not match"  # noqa: E501
+                )
 
                 dataset_index += 2
 
@@ -175,18 +175,18 @@ def do_test_preprocess_mmdata(temp_dir, extra_args=[]):
                 # reverse to account for preprocessing 0-index padding
                 merged_image = merged_image[::-1][0 : raw_image.size]
 
-                assert (
-                    raw_text == merged_text
-                ), f"ERROR: {basename.split('_')[:-2]}: raw and merged documents (text) do not match"
+                assert raw_text == merged_text, (
+                    f"ERROR: {basename.split('_')[:-2]}: raw and merged documents (text) do not match"  # noqa: E501
+                )
 
-                assert numpy.allclose(
-                    raw_image, merged_image
-                ), f"ERROR: {basename.split('_')[:-2]}: raw and merged documents (image) do not match"
+                assert numpy.allclose(raw_image, merged_image), (
+                    f"ERROR: {basename.split('_')[:-2]}: raw and merged documents (image) do not match"  # noqa: E501
+                )
 
                 merged_index += 2
 
         print(
-            f"INFO: {''.join(basename.split('_')[:-2])}: raw, processed, and merged documents match!"
+            f"INFO: {''.join(basename.split('_')[:-2])}: raw, processed, and merged documents match!"  # noqa: E501
         )
 
     print("INFO: Success!")
@@ -194,7 +194,6 @@ def do_test_preprocess_mmdata(temp_dir, extra_args=[]):
 
 def test_preprocess_mmdata():
     with tempfile.TemporaryDirectory() as temp_dir:
-
         # gpt specific args
         gpt_args = [
             "--pad-length",

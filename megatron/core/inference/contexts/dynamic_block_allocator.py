@@ -21,8 +21,7 @@ class BlockAllocator:
             than `total_count`.
     """
 
-    def __init__(self, context: "DynamicInferenceContext", total_count: int, paused_count: int):
-
+    def __init__(self, context: "DynamicInferenceContext", total_count: int, paused_count: int):  # noqa: F821
         self.context = context
 
         self.total_count = total_count

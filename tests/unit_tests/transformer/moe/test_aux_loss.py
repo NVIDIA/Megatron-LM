@@ -57,7 +57,7 @@ class AuxlossTestContainer(MoEModelTestContainer):
         aux_loss_grad = partitioned_input.grad
         torch.distributed.barrier()
         ans = self.partition_input(baseline_grad)
-        assert torch.allclose(aux_loss_grad, ans), f"Diff: {(aux_loss_grad/ans).mean()}"
+        assert torch.allclose(aux_loss_grad, ans), f"Diff: {(aux_loss_grad / ans).mean()}"
         loss = get_moe_layer_wise_logging_tracker()[loss_name]['values']
         assert loss > 0, "Loss should be greater than 0"
         clear_aux_losses_tracker()
@@ -438,9 +438,9 @@ class TestRouterAuxLoss:
             aux_loss = get_moe_layer_wise_logging_tracker()["load_balancing_loss"]["values"][0]
             reduce_from_tensor_model_parallel_region(aux_loss, router.tp_cp_group)
 
-            assert torch.equal(
-                aux_loss, global_aux_loss_1
-            ), f"aux_loss: {aux_loss}, global_aux_loss_1: {global_aux_loss_1}"
+            assert torch.equal(aux_loss, global_aux_loss_1), (
+                f"aux_loss: {aux_loss}, global_aux_loss_1: {global_aux_loss_1}"
+            )
 
         clear_aux_losses_tracker()
 

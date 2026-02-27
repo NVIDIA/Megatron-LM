@@ -4,7 +4,7 @@ import json
 import logging
 import os
 import pathlib
-from typing import Callable, Dict, List, Optional, Union
+from typing import Dict, List, Optional, Union
 
 import numpy as np
 import pydantic
@@ -72,7 +72,7 @@ class GoldenValueMetric(pydantic.BaseModel):
     values: Dict[int, Union[int, float, str]]
 
     def __repr__(self):
-        return f"Values ({self.start_step},{self.end_step},{self.step_interval}): {', '.join([str(f'({step}, {value})') for step, value in self.values.items()])}"
+        return f"Values ({self.start_step},{self.end_step},{self.step_interval}): {', '.join([str(f'({step}, {value})') for step, value in self.values.items()])}"  # noqa: E501
 
 
 class GoldenValues(pydantic.RootModel):
@@ -159,7 +159,7 @@ def read_tb_logs_as_list(
 
 
 def read_golden_values_from_json(
-    golden_values_path: Union[str, pathlib.Path]
+    golden_values_path: Union[str, pathlib.Path],
 ) -> Dict[str, GoldenValueMetric]:
     with open(golden_values_path) as f:
         if os.path.exists(golden_values_path):
@@ -187,7 +187,7 @@ def pipeline(
     for metric_name, metric_thresholds in checks.items():
         if metric_name not in list(actual_values.keys()):
             raise MissingTensorboardLogsError(
-                f"Metric {metric_name} not found in Tensorboard logs! Please modify `model_config.yaml` to record it."
+                f"Metric {metric_name} not found in Tensorboard logs! Please modify `model_config.yaml` to record it."  # noqa: E501
             )
 
         for test in metric_thresholds:

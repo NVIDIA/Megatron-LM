@@ -1,24 +1,23 @@
 import argparse
+import io
 import os
-from pathlib import Path
 from typing import Union
 
-# hf path
-import requests
-import torch
-from PIL import Image
-from transformers import AutoProcessor
-from transformers import AutoTokenizer
-import soundfile as sf
-import io
 import numpy as np
 import scipy.signal as signal
+import soundfile as sf
 
+# hf path
+import torch
+from PIL import Image
+from transformers import AutoProcessor, AutoTokenizer
+
+from examples.mimo.data.utils.calculate_audio_tokens import calculate_num_audio_tokens
 from examples.mimo.model_providers.llava_avlm import model_provider_llava_avlm
 from megatron.core import dist_checkpointing, parallel_state, tensor_parallel
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
 from megatron.training import print_rank_0
-from examples.mimo.data.utils.calculate_audio_tokens import calculate_num_audio_tokens
+
 
 def init_distributed(tp_size: int = 1, pp_size: int = 1):
     if torch.distributed.is_initialized():
@@ -29,6 +28,7 @@ def init_distributed(tp_size: int = 1, pp_size: int = 1):
     torch.distributed.init_process_group("nccl", rank=rank, world_size=world_size)
     parallel_state.initialize_model_parallel(tp_size, pp_size)
 
+
 def get_input_data(
     processor: AutoProcessor,
     image_processor: AutoProcessor,
@@ -36,7 +36,8 @@ def get_input_data(
     audio_path: str,
     image_path: str,
     prompt: str,
-    device: Union[int, str] = 0):
+    device: Union[int, str] = 0,
+):
     """
     Prepare inputs for the MIMO model forward pass.
     """
@@ -47,13 +48,13 @@ def get_input_data(
             audio_bytes = f.read()
         audio_io = io.BytesIO(audio_bytes)
         waveform, sample_rate = sf.read(audio_io)
-        
+
         # Resample if needed
         fixed_sample_rate = 16000
         if sample_rate != fixed_sample_rate:
             num_samples = int(len(waveform) * fixed_sample_rate / sample_rate)
             waveform = signal.resample(waveform, num_samples)
-        
+
         # Convert to tensor
         audio_tensor = torch.from_numpy(waveform).float()
         return audio_tensor
@@ -68,37 +69,27 @@ def get_input_data(
         image_tensor = image_tensor.float() / 255.0  # rescale to [0,1] range
         return image_tensor
 
-
     # read audio and image
     audio_tensor = read_audio(audio_path)
     image_tensor = read_image(image_path)
 
     # set up prompt
-    conversation = [
-        {
-            "role": "user",
-            "content": [
-                {"type": "text", "text": prompt},
-            ],
-        }
-    ]
+    conversation = [{"role": "user", "content": [{"type": "text", "text": prompt}]}]
     prompt = processor.apply_chat_template(conversation, add_generation_prompt=True)
 
     # process audio
     processed_audios = audio_processor(audio_tensor, sampling_rate=16000)
     processed_audios = torch.tensor(processed_audios["input_features"])
-    processed_audios = processed_audios.squeeze(0) # remove batch dim
+    processed_audios = processed_audios.squeeze(0)  # remove batch dim
     num_audio_tokens = calculate_num_audio_tokens(audio_tensor.unsqueeze(0), "openai/whisper-base")
     audios_seq_lengths = torch.tensor(num_audio_tokens)
     prompt = prompt.replace("<audio>", "<audio>" * num_audio_tokens)
 
     # process image
-    processed_images = image_processor(
-        images=image_tensor,
-        return_tensors="pt",
-        do_rescale=False,
-    )["pixel_values"]
-    processed_images = processed_images.squeeze(0) # remove batch dim
+    processed_images = image_processor(images=image_tensor, return_tensors="pt", do_rescale=False)[
+        "pixel_values"
+    ]
+    processed_images = processed_images.squeeze(0)  # remove batch dim
 
     # process prompt
     processed_prompt_inputs = processor(
@@ -116,12 +107,14 @@ def get_input_data(
     tokens = processed_prompt_inputs["input_ids"].to(device)
     modality_inputs = {
         "images": {"clip_encoder": {"pixel_values": processed_images}},
-        "audios": {"whisper_encoder": {"input_features": processed_audios, "seq_lengths": audios_seq_lengths}}
+        "audios": {
+            "whisper_encoder": {
+                "input_features": processed_audios,
+                "seq_lengths": audios_seq_lengths,
+            }
+        },
     }
-    batch_data = {
-        "tokens": tokens,
-        "modality_inputs": modality_inputs,
-    }
+    batch_data = {"tokens": tokens, "modality_inputs": modality_inputs}
 
     return batch_data
 
@@ -131,11 +124,10 @@ def main():
     parser.add_argument("--ckpt", required=False, help="Path to checkpoint optional")
     parser.add_argument("--tp", type=int, default=1, help="Tensor parallel size")
     parser.add_argument("--pp", type=int, default=1, help="Pipeline parallel size")
-    parser.add_argument("--audio-path", type=str,required=True, help="Path to audio file")
-    parser.add_argument("--image-path", type=str,required=True, help="Path to image file")
-    parser.add_argument("--prompt", type=str,required=True, help="Prompt")
+    parser.add_argument("--audio-path", type=str, required=True, help="Path to audio file")
+    parser.add_argument("--image-path", type=str, required=True, help="Path to image file")
+    parser.add_argument("--prompt", type=str, required=True, help="Prompt")
     args = parser.parse_args()
-
 
     init_distributed(args.tp, args.pp)
     model_parallel_cuda_manual_seed(123)
@@ -160,8 +152,7 @@ def main():
     processor.tokenizer = tokenizer
     image_processor = AutoProcessor.from_pretrained("llava-hf/llava-1.5-7b-hf").image_processor
     audio_processor = AutoProcessor.from_pretrained("openai/whisper-base")
-    
-    
+
     data = get_input_data(
         processor,
         image_processor,
@@ -169,13 +160,14 @@ def main():
         args.audio_path,
         args.image_path,
         args.prompt,
-        device=device)
+        device=device,
+    )
 
     # ------------------------------------------------------------------
     # Greedy generation
     # ------------------------------------------------------------------
     max_new_tokens = 128
-    model.eval()    
+    model.eval()
 
     tokens = data["tokens"]
 
@@ -189,7 +181,7 @@ def main():
                 attention_mask=None,
                 modality_inputs=data["modality_inputs"],
             )
-            
+
             # All-gather logits across tensor parallel ranks
             # logits shape: [batch, seq, vocab_parallel_size]
             gathered_logits = tensor_parallel.gather_from_tensor_model_parallel_region(logits)
@@ -200,7 +192,10 @@ def main():
 
             tokens = torch.cat([tokens, next_token], dim=1)
 
-            if processor.tokenizer.eos_token_id is not None and next_token.item() == processor.tokenizer.eos_token_id:
+            if (
+                processor.tokenizer.eos_token_id is not None
+                and next_token.item() == processor.tokenizer.eos_token_id
+            ):
                 break
 
     # Only decode and print on rank 0
@@ -215,7 +210,6 @@ def load_distributed_checkpoint(model: torch.nn.Module, ckpt_dir: str):
 
     if not os.path.isdir(ckpt_dir):
         raise FileNotFoundError(f"Checkpoint directory does not exist: {ckpt_dir}")
-
 
     template_sd = {"model": model.sharded_state_dict()}
 

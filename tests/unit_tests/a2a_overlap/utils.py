@@ -22,7 +22,8 @@ class DummyState:
 
     def __getattr__(self, name):
         """
-        Get an attribute from the state. If the attribute is not found, set it to None and return None.
+        Get an attribute from the state. If the attribute is not
+        found, set it to None and return None.
         """
         setattr(self, name, None)
         return None
@@ -153,7 +154,7 @@ def compare_captures(capture_ref, capture_a2a_overlap, verbose=False, skip_embed
             flat_original = a.view(-1)
             flat_a2a = b.view(-1)
             print(
-                f"total diff({max_diff.shape}): {torch.abs(max_diff).sum()}, max diff: {max_diff_value} at index {max_diff_index}, original/a2a_overlap value at max diff: {flat_original[max_diff_index]}/{flat_a2a[max_diff_index]}"
+                f"total diff({max_diff.shape}): {torch.abs(max_diff).sum()}, max diff: {max_diff_value} at index {max_diff_index}, original/a2a_overlap value at max diff: {flat_original[max_diff_index]}/{flat_a2a[max_diff_index]}"  # noqa: E501
             )
         return res, "value mismatch"
 
@@ -223,8 +224,8 @@ def get_test_config(num_layers=1, num_moe_experts=8, extra_kwargs={}, moe_groupe
 
 def get_valid_token_dispatcher_types():
     try:
-        from deep_ep import Buffer
-        from deep_ep.utils import EventHandle, EventOverlap
+        from deep_ep import Buffer  # noqa: F401
+        from deep_ep.utils import EventHandle, EventOverlap  # noqa: F401
 
         return ["alltoall", "flex"]
     except ImportError:

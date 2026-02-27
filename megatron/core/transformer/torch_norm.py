@@ -41,24 +41,24 @@ class WrappedTorchNorm:
         zero_centered_gamma: bool = False,
         normalization: str = "LayerNorm",
     ) -> LayerNormInterface:
-        assert (
-            not config.layernorm_zero_centered_gamma
-        ), f"zero_centered_gamma not supported by torch LayerNorm"
+        assert not config.layernorm_zero_centered_gamma, (
+            f"zero_centered_gamma not supported by torch LayerNorm"
+        )
 
         assert not config.persist_layer_norm, f"persist_layer_norm not supported by torch LayerNorm"
 
         assert not config.sequence_parallel, f"sequence parallel not supported by torch LayerNorm"
 
-        assert (
-            not config.memory_efficient_layer_norm
-        ), f"memory_efficient_layer_norm not supported by torch LayerNorm"
+        assert not config.memory_efficient_layer_norm, (
+            f"memory_efficient_layer_norm not supported by torch LayerNorm"
+        )
 
         if config.normalization == "LayerNorm":
             norm_cls = torch.nn.LayerNorm
         elif config.normalization == "RMSNorm":
-            assert is_torch_min_version(
-                "2.4.0a0"
-            ), 'Torch RMSNorm requires PyTorch version >= 2.4.0'
+            assert is_torch_min_version("2.4.0a0"), (
+                'Torch RMSNorm requires PyTorch version >= 2.4.0'
+            )
 
             norm_cls = torch.nn.RMSNorm
         elif config.normalization == "L2Norm":

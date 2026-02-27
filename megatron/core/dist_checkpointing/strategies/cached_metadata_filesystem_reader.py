@@ -1,6 +1,6 @@
 # Copyright (c) 2023, NVIDIA CORPORATION.  All rights reserved.
 
-""" FS Reader with metadata cached support. """
+"""FS Reader with metadata cached support."""
 
 import os
 from typing import Union

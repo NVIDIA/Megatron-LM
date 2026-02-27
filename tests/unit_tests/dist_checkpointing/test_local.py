@@ -7,7 +7,6 @@ import tempfile
 import time
 from pathlib import Path
 from types import SimpleNamespace
-from typing import Any, Callable, Tuple, Union
 from unittest import mock
 
 import pytest
@@ -48,7 +47,6 @@ from .utils import find_matching_values
 
 # TODO: Use mock local checkpointing?
 class TestLocalCheckpointingReplication:
-
     def test_filename_to_id(self):
         iteration_string = "0000123"
         rank = "4"
@@ -282,7 +280,6 @@ class TestLocalCheckpointing:
                 mock.patch.object(LocalCheckpointManager, '_save', new=save_wrapper),
                 caplog.at_level(logging.INFO),
             ):
-
                 local_ckpt_dir = (
                     local_ckpt_dir / "subdir"
                 )  # Test handling of non-existent directories

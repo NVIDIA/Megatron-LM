@@ -40,7 +40,7 @@ def convert_llava_video_to_wds(dataset_root: str, shard_size: int = 8000):
     ]
     if not annotation_files:
         raise FileNotFoundError(f"No annotation JSON files found in {dataset_root}")
-    
+
     print(f"Found annotation files -  {annotation_files}")
 
     shard_pattern = os.path.join(output_dir, "video-%06d.tar")
@@ -51,14 +51,20 @@ def convert_llava_video_to_wds(dataset_root: str, shard_size: int = 8000):
             with open(ann_path, "r") as f:
                 first = f.read(1)
                 f.seek(0)
-                entries = json.load(f) if first == "[" else [json.loads(line) for line in f if line.strip()]
+                entries = (
+                    json.load(f)
+                    if first == "["
+                    else [json.loads(line) for line in f if line.strip()]
+                )
             for entry in tqdm(entries):
                 video_rel = entry.get("video")
                 conversations = entry.get("conversations")
                 if video_rel is None or conversations is None:
                     continue
 
-                video_path = video_rel if os.path.isabs(video_rel) else os.path.join(dataset_root, video_rel)
+                video_path = (
+                    video_rel if os.path.isabs(video_rel) else os.path.join(dataset_root, video_rel)
+                )
 
                 if not os.path.exists(video_path):
                     print(f"Video file not found: {video_path}")

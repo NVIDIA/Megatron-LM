@@ -37,7 +37,7 @@ except ImportError:
     HAVE_TE = False
 
 try:
-    import apex
+    import apex  # noqa: F401
 
     from megatron.core.fusions.fused_layer_norm import FusedLayerNorm
     from megatron.core.transformer.torch_norm import WrappedTorchNorm

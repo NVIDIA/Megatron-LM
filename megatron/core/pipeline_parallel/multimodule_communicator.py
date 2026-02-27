@@ -190,9 +190,9 @@ class MultiModulePipelineCommunicator:
         else:
             current_stage = 0
 
-        assert (
-            current_stage <= total_stages
-        ), f"current_stage: {current_stage} is greater than total_stages: {total_stages}"
+        assert current_stage <= total_stages, (
+            f"current_stage: {current_stage} is greater than total_stages: {total_stages}"
+        )
         logging.debug(
             f"[Rank {dist.get_rank()} ][MultiModulePipelineCommunicator] "
             f"current_stage: {current_stage} total_stages: {total_stages} "
@@ -261,7 +261,6 @@ class MultiModulePipelineCommunicator:
         )
         input_dict = {}
         for module_name, rank_module_info in self.rank_module_map.items():
-
             if rank_module_info.pp_rank == 0:
                 # If first stage, and has incoming modules, receive forward activation
                 # from incoming modules.

@@ -194,7 +194,8 @@ def test_step_updates_empty_param_groups():
     optimizer = MagicMock()
     # lr and weight_decay are set by the scheduler's step() method
     optimizer.param_groups = [
-        # Non-default group with its own max_lr override (lr will differ from the canonical schedule)
+        # Non-default group with its own max_lr override
+        # (lr will differ from the canonical schedule)
         {'params': [1, 2], "min_lr": 0.001, "max_lr": 0.2, "default_config": False},
         # Model parallelism may leave default_config groups empty on some ranks
         {'params': [], "wd_mult": 0.0, 'default_config': True},

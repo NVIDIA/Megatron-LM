@@ -1,5 +1,4 @@
 # Copyright (c) 2025, NVIDIA CORPORATION. All rights reserved.
-import pytest
 
 from megatron.core.resharding.utils import ParameterMetadata, select_src_metadata_balanced
 

@@ -113,9 +113,9 @@ class YarnRotaryEmbedding(RotaryEmbedding):
         Returns:
             Tensor: Embeddings after applying Yarn RoPE.
         """
-        assert (
-            not self.rotary_interleaved
-        ), "Yarn RoPE does not support interleaved rotary embeddings"
+        assert not self.rotary_interleaved, (
+            "Yarn RoPE does not support interleaved rotary embeddings"
+        )
 
         if self.inv_freq_extra.device.type == 'cpu':
             # move `inv_freq_extra` to GPU once at the first micro-batch forward pass
