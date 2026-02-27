@@ -73,7 +73,9 @@ class InferenceBatchDimensions:
                 >= real_batch_dim.prefill_req_count + real_batch_dim.decode_req_count
             )
 
-    def is_valid(self, max_requests: int, max_sequence_length: int) -> bool:
+    def is_valid(
+        self, max_requests: int, max_sequence_length: int, num_speculative_tokens: int
+    ) -> bool:
         """
         Checks if the batch dimension is valid based on resource constraints.
 
@@ -92,11 +94,17 @@ class InferenceBatchDimensions:
             return False
 
         # Check if token count is sufficient for requests
-        if self.token_count < self.prefill_req_count + self.decode_req_count:
+        if self.token_count < self.prefill_req_count + self.decode_req_count * (
+            num_speculative_tokens + 1
+        ):
             return False
 
         # Check if the prefill requests are shorter than the max sequence length
-        if self.token_count > self.prefill_req_count * max_sequence_length + self.decode_req_count:
+        if (
+            self.token_count
+            > self.prefill_req_count * max_sequence_length
+            + self.decode_req_count * (num_speculative_tokens + 1)
+        ):
             return False
 
         return True
@@ -296,6 +304,7 @@ class CUDAGraphBatchDimensionBuilder:
         max_tokens: int,
         max_sequence_length: int,
         use_cuda_graphs_for_non_decode_steps: bool,
+        num_speculative_tokens: int = 0,
     ) -> Tuple[List[InferenceBatchDimensions], Optional[List[int]]]:
         """
         Generate CUDA graph batch dimensions.
@@ -332,6 +341,7 @@ class CUDAGraphBatchDimensionBuilder:
             max_tokens: Maximum total tokens
             max_sequence_length: Maximum sequence length
             use_cuda_graphs_for_non_decode_steps: Whether to use CUDA graphs for non-decode steps
+            num_speculative_tokens: Number of speculative tokens
 
         Returns:
             Tuple containing:
@@ -343,7 +353,7 @@ class CUDAGraphBatchDimensionBuilder:
         def add_if_valid(token_count: int, prefill_req_count: int, decode_req_count: int) -> None:
             """Helper to create and append batch dimension to list only if it's valid."""
             batch_dim = InferenceBatchDimensions(token_count, prefill_req_count, decode_req_count)
-            if batch_dim.is_valid(max_requests, max_sequence_length):
+            if batch_dim.is_valid(max_requests, max_sequence_length, num_speculative_tokens):
                 cuda_graph_batch_dimensions_list.append(batch_dim)
 
         # Cuda graph token-counts
@@ -377,8 +387,9 @@ class CUDAGraphBatchDimensionBuilder:
             )
 
             # Calculate separate token counts for decode-only graphs.
-            # Decode graphs can be more conservative since each request uses exactly 1 token.
-            cuda_graph_max_tokens_decode = min(cuda_graph_max_tokens, max_requests)
+            cuda_graph_max_tokens_decode = min(
+                cuda_graph_max_tokens, max_requests * (num_speculative_tokens + 1)
+            )
             cuda_graph_decode_token_counts = (
                 CUDAGraphBatchDimensionBuilder._calculate_cuda_graph_token_counts(
                     tp_size=tp_size,
@@ -397,20 +408,28 @@ class CUDAGraphBatchDimensionBuilder:
         ):  # decode only
             # Use decode-specific token counts for decode-only graphs
             for size in cuda_graph_decode_token_counts:
+                decode_req_count = min(size // (num_speculative_tokens + 1), max_requests)
                 add_if_valid(
-                    token_count=min(size, max_requests),
+                    token_count=decode_req_count * (num_speculative_tokens + 1),
                     prefill_req_count=0,
-                    decode_req_count=min(size, max_requests),
+                    decode_req_count=decode_req_count,
                 )
         else:
             # Mixed prefill and decode mode
             # Create prefill and mixed dimensions with full token counts
             for size in cuda_graph_prefill_token_counts:
+                prefill_req_count = min(cuda_graph_mixed_prefill_count, max_requests)
+                decode_req_count = max(
+                    0,
+                    min(
+                        (size - prefill_req_count) // (num_speculative_tokens + 1),
+                        max_requests - prefill_req_count,
+                    ),
+                )
                 add_if_valid(
                     token_count=size,
-                    prefill_req_count=min(cuda_graph_mixed_prefill_count, max_requests),
-                    decode_req_count=min(size, max_requests)
-                    - min(cuda_graph_mixed_prefill_count, max_requests),
+                    prefill_req_count=prefill_req_count,
+                    decode_req_count=decode_req_count,
                 )
                 # We need to ensure the prefill requests are shorter than the max sequence length,
                 # considering the one decode token is used for prefill request construction
@@ -427,16 +446,21 @@ class CUDAGraphBatchDimensionBuilder:
 
             # Create decode-only dimensions with optimized token counts
             for size in cuda_graph_decode_token_counts:
+                decode_req_count = min(size // (num_speculative_tokens + 1), max_requests)
                 add_if_valid(
                     token_count=min(size, max_requests),
                     prefill_req_count=0,
-                    decode_req_count=min(size, max_requests),
+                    decode_req_count=decode_req_count,
                 )
 
         # Remove duplicates and sort by prefill token count
         cuda_graph_batch_dimensions_list = list(set(cuda_graph_batch_dimensions_list))
         cuda_graph_batch_dimensions_list.sort(
-            key=lambda x: ((x.token_count - x.decode_req_count), x.decode_req_count), reverse=True
+            key=lambda x: (
+                (x.token_count - x.decode_req_count * (num_speculative_tokens + 1)),
+                x.decode_req_count,
+            ),
+            reverse=True,
         )
 
         # Collect actual token counts from batch dimensions, then unique and sort

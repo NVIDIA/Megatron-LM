@@ -261,7 +261,10 @@ class DynamicInferenceContext(BaseInferenceContext):
             tp_size = model_config.tensor_model_parallel_size
             pp_size = model_config.pipeline_model_parallel_size
         self.hidden_size_per_attention_head = core_divide(projection_size, num_attention_heads)
-        self.num_attention_heads_per_partition = core_divide(num_attention_heads, tp_size)
+        if num_attention_heads >= tp_size:
+            self.num_attention_heads_per_partition = core_divide(num_attention_heads, tp_size)
+        else:
+            self.num_attention_heads_per_partition = 1
         self.num_speculative_tokens = inference_config.num_speculative_tokens
 
         # Cache the PP group we should use for PP collectives inside the context.
@@ -536,12 +539,13 @@ class DynamicInferenceContext(BaseInferenceContext):
             CUDAGraphBatchDimensionBuilder.generate_cuda_graph_batch_dimensions_list(
                 tp_size=tp_size,
                 num_cuda_graphs=inference_config.num_cuda_graphs,
-                cuda_graph_max_tokens=self.max_requests,
+                cuda_graph_max_tokens=self.max_requests * (self.num_speculative_tokens + 1),
                 cuda_graph_mixed_prefill_count=inference_config.cuda_graph_mixed_prefill_count,
                 max_requests=self.max_requests,
                 max_tokens=self.max_tokens,
                 max_sequence_length=self.max_sequence_length,
                 use_cuda_graphs_for_non_decode_steps=self.use_cuda_graphs_for_non_decode_steps,
+                num_speculative_tokens=self.num_speculative_tokens,
             )
         )
 
@@ -1236,11 +1240,15 @@ class DynamicInferenceContext(BaseInferenceContext):
         Adds dummy requests to reflect the number of prefill and decode requests in the graph config.
         These are using during cuda graph captures.
         """
-        prefill_tokens = graph_dimensions.token_count - graph_dimensions.decode_req_count
+        prefill_tokens = graph_dimensions.token_count - (
+            graph_dimensions.decode_req_count * (self.num_speculative_tokens + 1)
+        )
 
         # Pre-construct shared objects (safe due to deep copy in DynamicInferenceRequest.__post_init__)
         shared_sampling_params = SamplingParams(num_tokens_to_generate=1, termination_id=-1)
-        shared_decode_tokens = torch.zeros(1, dtype=torch.long, device=torch.cuda.current_device())
+        shared_decode_tokens = torch.zeros(
+            self.num_speculative_tokens + 1, dtype=torch.long, device=torch.cuda.current_device()
+        )
 
         decode_requests = [
             DynamicInferenceRequest(
@@ -1326,17 +1334,14 @@ class DynamicInferenceContext(BaseInferenceContext):
         if self.using_cuda_graph_this_step():
             self.padded_batch_dimensions = best_graph
         else:
-            padded_token_count = self.round_up_tokens(self.active_token_count)
             if self.is_decode_only():
-                padded_token_count = min(
-                    self.max_tokens,
-                    self.max_requests * (self.num_speculative_tokens + 1),
-                    self.round_up_tokens(self.active_token_count),
+                padded_decode_req_count = min(
+                    self.max_requests, self.round_up_requests(self.num_decode_requests)
                 )
-                padded_decode_req_count = padded_token_count // (self.num_speculative_tokens + 1)
-                #print(f"self.max_tokens={self.max_tokens}, self.max_requests={self.max_requests}, self.active_token_count={self.active_token_count}, padded_decode_req_count={padded_decode_req_count}, padded_token_count={padded_token_count}")
+                padded_token_count = padded_decode_req_count * (self.num_speculative_tokens + 1)
                 padded_prefill_req_count = 0
             else:
+                padded_token_count = self.round_up_tokens(self.active_token_count)
                 target_padding_req_count = min(
                     self.max_requests,
                     self.round_up_requests(self.total_request_count - self.paused_request_count),
@@ -1395,6 +1400,7 @@ class DynamicInferenceContext(BaseInferenceContext):
             request_to_kv_block_ids=request_to_kv_block_ids_view,
             batch_dimensions=attn_dimensions,
             padded_batch_dimensions=self.padded_batch_dimensions,
+            num_speculative_tokens=self.num_speculative_tokens,
         )
 
         if self.is_hybrid_model:
@@ -1825,8 +1831,10 @@ class DynamicInferenceContext(BaseInferenceContext):
                 self.block_allocator.total_avail,
             )
 
-            # Constrain resumptions by the maximum allowed active requests
-            max_allowed_active = self.max_requests // (self.num_speculative_tokens + 1)
+            # Constrain resumptions by the maximum allowed active requests and tokens
+            max_allowed_active = min(
+                self.max_requests, self.max_tokens // (self.num_speculative_tokens + 1)
+            )
             allowed_to_resume = max(0, max_allowed_active - active_request_count)
             resume_request_count = min(resume_request_count, allowed_to_resume)
 
@@ -2127,10 +2135,13 @@ class DynamicInferenceContext(BaseInferenceContext):
                 active_requests_requiring_new_block[
                     self.get_index_of_chunked_prefill_request() - self.paused_request_count
                 ] = 0  # chunked prefill should not be paused
-            elif active_request_count * (self.num_speculative_tokens + 1) > self.max_requests:
-                # Force-pause excess requests in a decode-only batch
-                max_allowed_active = self.max_requests // (self.num_speculative_tokens + 1)
-                active_requests_requiring_new_block[max_allowed_active:] = 1
+            else:
+                max_allowed_active = min(
+                    self.max_requests, self.max_tokens // (self.num_speculative_tokens + 1)
+                )
+                if active_request_count > max_allowed_active:
+                    # Force-pause excess requests in a decode-only batch
+                    active_requests_requiring_new_block[max_allowed_active:] = 1
 
             active_requests_requiring_new_block_count = (
                 (active_requests_requiring_new_block == 1).sum().item()
@@ -2220,7 +2231,9 @@ class DynamicInferenceContext(BaseInferenceContext):
 
         if self.paused_request_count > 0:
             self.paused_tokens = next_tokens[: self.paused_request_count].clone()
-            self.paused_speculative_tokens = new_speculative_tokens[:, : self.paused_request_count].clone()
+            self.paused_speculative_tokens = new_speculative_tokens[
+                :, : self.paused_request_count
+            ].clone()
 
         # add_ and fill_ calls seems to work as intended with sliced indexing (i.e. x[3:5].add(...) or x[3:5].fill_)
         # but when another tensor is used for indexing, it does not work as expected (i.e. x[y] if x and y are torch tensors)

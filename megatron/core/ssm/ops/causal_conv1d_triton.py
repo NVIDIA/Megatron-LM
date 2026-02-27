@@ -111,7 +111,8 @@ def causal_conv1d_update_kernel(
         )
 
         if not IS_CIRCULAR:
-            # Load the last (WIDTH - 1) elements to use them BEFORE they are overwritten by the shift
+            # Load the last (WIDTH - 1) elements to use them BEFORE they are overwritten
+            # by the shift
             if WIDTH >= 2:
                 x_val_0 = tl.load(
                     conv_state_ptrs + (state_len - WIDTH + 1) * conv_state_l_stride, mask=mask

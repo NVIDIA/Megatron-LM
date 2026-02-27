@@ -929,12 +929,14 @@ class MambaMixer(MegatronModule):
 
         Args:
             zxBCdt: The input tensor of shape (b, s, d), which is a concatenation of
-                z, x, B, C, and dt projections. s is the sequence length (1 + num_speculative_tokens).
+                z, x, B, C, and dt projections.
+                s is the sequence length (1 + num_speculative_tokens).
             conv_state: The convolution state tensor for inference.
             ssm_state: The selective scan state tensor for inference.
             batch_indices: A map from batch id to position in the Mamba state tensors.
             intermediate_ssm_state: Optional buffer for storing sequence steps in SSM state.
-            cache_seqlens: Optional tensor representing cache sequence length for circular buffering.
+            cache_seqlens: Optional tensor representing cache sequence length for circular
+                buffering.
 
         Returns:
             The output tensor of shape (b, s, d).

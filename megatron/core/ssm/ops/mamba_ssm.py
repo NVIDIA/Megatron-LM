@@ -1,12 +1,8 @@
 # Copyright (c) 2024, Tri Dao, Albert Gu.
 
-import math
-
 import torch
-import torch.nn.functional as F
 import triton
 import triton.language as tl
-from einops import rearrange, repeat
 from mamba_ssm.ops.triton.softplus import softplus
 
 
@@ -260,7 +256,8 @@ def selective_state_update(
         x: (batch, dim), (batch, seqlen, dim), (batch, nheads, dim) or (batch, seqlen, nheads, dim)
         dt: Matches x
         A: (dim, dstate) or (nheads, dim, dstate)
-        B: (batch, dstate), (batch, seqlen, dstate), (batch, ngroups, dstate) or (batch, seqlen, ngroups, dstate)
+        B: (batch, dstate), (batch, seqlen, dstate), (batch, ngroups, dstate) or
+            (batch, seqlen, ngroups, dstate)
         C: Matches B
         D: (dim,) or (nheads, dim)
         z: Matches x
