@@ -284,8 +284,11 @@ class TestVppSimulatorBasic:
             return [FakeModel(hidden_size=mock_args.hidden_size) for _ in range(vpp_size)]
 
         # Patch create_model function
+        # CRITICAL: Patch the reference in vpp_simulate, not model_executor!
+        # vpp_simulate.py imports: from model_executor import create_model
+        # So we need to patch vpp_simulate.create_model, not model_executor.create_model
         monkeypatch.setattr(
-            'megatron.training.simulation.model_executor.create_model',
+            'megatron.training.simulation.vpp_simulate.create_model',
             fake_create_model
         )
 
