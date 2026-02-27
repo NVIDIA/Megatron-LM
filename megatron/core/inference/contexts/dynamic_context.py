@@ -1608,9 +1608,9 @@ class DynamicInferenceContext(BaseInferenceContext):
         # no need to update count, as it is already here
         if is_chunked_prefill:
             current_id = self.total_request_count - 1
-            self.active_token_count -= (
-                1  # Overwrite the last token, which is the useless token from chunked prefill
-            )
+            # Overwrite the last token, which is the useless token from chunked prefill
+            chunked_prefill_offset = 1 + self.num_speculative_tokens
+            self.active_token_count -= chunked_prefill_offset
             assert (
                 self.request_ids[current_id] == req.request_id
             ), "Continuation current_id mismatch"

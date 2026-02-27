@@ -448,7 +448,7 @@ class CUDAGraphBatchDimensionBuilder:
             for size in cuda_graph_decode_token_counts:
                 decode_req_count = min(size // (num_speculative_tokens + 1), max_requests)
                 add_if_valid(
-                    token_count=min(size, max_requests),
+                    token_count=decode_req_count * (num_speculative_tokens + 1),
                     prefill_req_count=0,
                     decode_req_count=decode_req_count,
                 )

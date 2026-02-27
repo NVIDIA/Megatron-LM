@@ -788,10 +788,14 @@ class DynamicInferenceEngine(AbstractEngine):
             len(request.prompt_tokens) + request.sampling_params.num_tokens_to_generate
             > self.context.max_sequence_length
         ) or (request.sampling_params.num_tokens_to_generate < 0):
+            if torch.distributed.get_rank() == 0:
+                print(f"REQUEST {request_id} FAILED! MaxSequenceLengthOverflowError")
             request.status = Status.FAILED
             request.add_event_error_nontransient(MaxSequenceLengthOverflowError(request_id))
 
         if len(request.prompt_tokens) > self.context.max_tokens and not self.enable_chunked_prefill:
+            if torch.distributed.get_rank() == 0:
+                print(f"REQUEST {request_id} FAILED! TokenOverflowError")
             request.status = Status.FAILED
             request.add_event_error_nontransient(TokenOverflowError(request_id))
 
