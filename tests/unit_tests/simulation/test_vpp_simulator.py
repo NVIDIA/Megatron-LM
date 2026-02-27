@@ -242,6 +242,53 @@ class TestVppSimulatorBasic:
             fake_execute_backward
         )
 
+    @pytest.fixture
+    def mock_model_creation(self, monkeypatch, mock_args):
+        """Mock create_model to avoid calling get_model() which requires complete args"""
+
+        def fake_create_model(pp_rank, model_provider):
+            """
+            Mock create_model to return a simple fake model without calling get_model()
+
+            Args:
+                pp_rank: Pipeline parallel rank
+                model_provider: Model provider function (not used in mock)
+
+            Returns:
+                List of fake models (VPP format)
+            """
+            from types import SimpleNamespace
+
+            class FakeModel(torch.nn.Module):
+                """Minimal fake model for testing VppSimulator scheduling logic"""
+
+                def __init__(self, hidden_size=64):
+                    super().__init__()
+                    self.linear = torch.nn.Linear(hidden_size, hidden_size)
+
+                    # Required attributes for VppSimulator
+                    self.config = SimpleNamespace(
+                        hidden_size=hidden_size,
+                        sequence_parallel=False,
+                        context_parallel_size=1,
+                        num_layers=mock_args.num_layers,
+                    )
+
+                def forward(self, x):
+                    return self.linear(x)
+
+            # Determine number of VPP chunks
+            vpp_size = mock_args.virtual_pipeline_model_parallel_size or 1
+
+            # Return list of models (VPP format)
+            return [FakeModel(hidden_size=mock_args.hidden_size) for _ in range(vpp_size)]
+
+        # Patch create_model function
+        monkeypatch.setattr(
+            'megatron.training.simulation.model_executor.create_model',
+            fake_create_model
+        )
+
     @pytest.mark.parametrize("pp_size,vpp_size,num_microbatches", [
         (1, None, 4),   # No Pipeline
         (2, None, 4),   # 2-stage Pipeline
@@ -259,6 +306,7 @@ class TestVppSimulatorBasic:
         mock_data_iterator,
         forward_step_func,
         mock_execute_functions,
+        mock_model_creation,
         monkeypatch
     ):
         """Test that run_global_step completes successfully under different PP/VPP configs"""
