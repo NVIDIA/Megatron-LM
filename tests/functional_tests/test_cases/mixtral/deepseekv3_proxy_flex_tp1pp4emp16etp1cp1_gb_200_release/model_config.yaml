@@ -21,7 +21,7 @@ MODEL_ARGS:
   --distributed-timeout-minutes: 60
   --tensor-model-parallel-size: 2
   --pipeline-model-parallel-size: 2
-  --pipeline-model-parallel-layout: Et*7\\|t*7mL # Et*7|t*7mL
+  --pipeline-model-parallel-layout: Et*7|t*7mL
   --expert-model-parallel-size: 16
   --context-parallel-size: 1
   --expert-tensor-parallel-size: 1

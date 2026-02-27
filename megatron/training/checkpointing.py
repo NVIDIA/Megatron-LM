@@ -1386,6 +1386,18 @@ def load_args_from_checkpoint(
             checkpoint_args, 'add_bias_linear', not getattr(checkpoint_args, 'disable_bias_linear')
         )
 
+    # Backward compat: old checkpoints have hybrid_override_pattern but not hybrid_layer_pattern
+    if (getattr(checkpoint_args, 'hybrid_override_pattern', None) is not None
+            and getattr(checkpoint_args, 'hybrid_layer_pattern', None) is None):
+        setattr(
+            checkpoint_args, 'hybrid_layer_pattern',
+            getattr(checkpoint_args, 'hybrid_override_pattern'),
+        )
+        # num_layers is now derived from hybrid_layer_pattern in validate_args, and should not be
+        # set at the same time as hybrid_layer_pattern.
+        if hasattr(checkpoint_args, 'num_layers'):
+            setattr(checkpoint_args, 'num_layers', None)
+
     def _set_arg(arg_name, old_arg_name=None, force=False):
         if not force and getattr(args, arg_name, None) is not None:
             return
@@ -1428,16 +1440,12 @@ def load_args_from_checkpoint(
     _set_arg('attention_dropout', force=True)
     _set_arg('hidden_dropout', force=True)
 
-    _set_arg('hybrid_override_pattern', force=True)
-
     # Legacy MTP pattern for old checkpoints
     _set_arg('mtp_hybrid_override_pattern', force=True)
     _set_arg('mtp_num_layers', force=True)
     _set_arg('mtp_use_repeated_layer', force=True)
 
     _set_arg('spec', force=True)
-    _set_arg('hybrid_attention_ratio', force=True)
-    _set_arg('hybrid_mlp_ratio', force=True)
 
     _set_arg('num_experts', force=True)
     _set_arg('moe_layer_freq', force=True)
@@ -1459,7 +1467,9 @@ def load_args_from_checkpoint(
     _set_arg('mamba_head_dim', force=True)
     _set_arg('mamba_num_groups', force=True)
     _set_arg('mamba_num_heads', force=True)
-    _set_arg('is_hybrid_model', force=True)
+    # We need to be able to override hybrid_layer_pattern from the command-line so that different
+    # pipelining can be specified when re-loading a model (e.g. for inference or post-training).
+    _set_arg('hybrid_layer_pattern')
 
     # Heterogeneous args.
     _set_arg('heterogeneous_layers_config_path', force=True)

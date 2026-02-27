@@ -212,7 +212,7 @@ class TestModelOptMambaModel(TestModelOptGPTModel):
             mamba_stack_spec=mamba_stack_spec,
             vocab_size=100,
             max_sequence_length=4,
-            hybrid_override_pattern="M*-",
+            hybrid_layer_pattern="M*-",
         )
 
         # A Hybrid MambaModel using ModelOpt spec (local + TENorm).
@@ -221,7 +221,7 @@ class TestModelOptMambaModel(TestModelOptGPTModel):
             mamba_stack_spec=get_mamba_stack_modelopt_spec(remap_te_layernorm=True),
             vocab_size=100,
             max_sequence_length=4,
-            hybrid_override_pattern="M*-",
+            hybrid_layer_pattern="M*-",
         )
 
 
