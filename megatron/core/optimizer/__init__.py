@@ -48,7 +48,11 @@ from ..distributed.param_and_grad_buffer import _ParamAndGradBuffer
 from ..transformer.module import MegatronModule
 from ..utils import get_model_config, get_pg_rank, get_pg_size, is_te_min_version, log_single_rank
 from .distrib_optimizer import DistributedOptimizer
-from .emerging_optimizers import _EMERGING_OPTIMIZERS, _create_plain_emerging_optimizer
+from .emerging_optimizers import (
+    _EMERGING_OPTIMIZERS,
+    HAVE_EMERGING_OPTIMIZERS,
+    _create_emerging_optimizer,
+)
 from .grad_scaler import ConstantGradScaler, DynamicGradScaler
 from .layer_wise_optimizer import LayerWiseDistributedOptimizer
 from .optimizer import (
@@ -273,7 +277,7 @@ def _get_megatron_optimizer_based_on_param_groups(
     intra_dist_opt_group: Optional[torch.distributed.ProcessGroup] = None,
     distributed_optimizer_instance_id: Optional[int] = 0,
     pg_collection: Optional[ProcessGroupCollection] = None,
-    plain: bool = False,
+    skip_megatron_wrapping: bool = False,
 ) -> Union[MegatronOptimizer, Tuple[Optional[torch.optim.Optimizer], Optional[Callable]]]:
     """Get Megatron optimizer based on parameter groups.
 
@@ -290,20 +294,24 @@ def _get_megatron_optimizer_based_on_param_groups(
             optimizer. Defaults to None.
         distributed_optimizer_instance_id (int, optional): Distributed optimizer instance. Defaults
             0.
-        plain (bool): if True, return a ``(optimizer, init_state_fn)`` tuple of the raw
-            PyTorch optimizer without any Megatron wrapping. Useful when the caller
+        skip_megatron_wrapping (bool): if True, return a
+            ``(optimizer, init_state_fn)`` tuple of the raw PyTorch optimizer
+            without any Megatron wrapping. Useful when the caller
             (e.g. LayerWiseDistributedOptimizer) performs its own wrapping.
 
     Returns:
-        Instance of MegatronOptimizer, or ``(optimizer, init_state_fn)`` when *plain=True*.
+        Instance of MegatronOptimizer, or ``(optimizer, init_state_fn)`` when
+        *skip_megatron_wrapping=True*.
     """
     # All param_groups passed here must belong to the same optimizer type (adam / sgd).
     # Callers are responsible for splitting by optimizer type before calling this function.
 
-    if plain and config.use_precision_aware_optimizer:
-        raise ValueError("plain=True is incompatible with use_precision_aware_optimizer.")
-    if plain and config.optimizer_cpu_offload:
-        raise ValueError("plain=True is incompatible with optimizer_cpu_offload.")
+    if skip_megatron_wrapping and config.use_precision_aware_optimizer:
+        raise ValueError(
+            "skip_megatron_wrapping=True is incompatible with use_precision_aware_optimizer."
+        )
+    if skip_megatron_wrapping and config.optimizer_cpu_offload:
+        raise ValueError("skip_megatron_wrapping=True is incompatible with optimizer_cpu_offload.")
 
     # When freezing sub-models we may have no trainable parameters on a rank and
     # hence an empty param_groups. However, we still need to create an optimizer
@@ -418,7 +426,7 @@ def _get_megatron_optimizer_based_on_param_groups(
         optimizer = None
         init_state_fn = None
 
-    if plain:
+    if skip_megatron_wrapping:
         return optimizer, init_state_fn
 
     # Mixed precision optimizer.
@@ -543,10 +551,15 @@ def _get_megatron_emerging_optimizer(
         eopt_name = bare_name
         use_layer_wise = True
 
+    if not HAVE_EMERGING_OPTIMIZERS:
+        raise ImportError(
+            f"emerging-optimizers package is required for optimizer='{eopt_name}'. "
+            "Install it with: pip install emerging-optimizers"
+        )
     if eopt_name not in _EMERGING_OPTIMIZERS:
         raise ValueError(f"Unsupported emerging optimizer: {eopt_name}")
     if config.fp16:
-        raise Exception('emerging optimizer with fp16 is not supported.')
+        raise ValueError('emerging optimizer with fp16 is not supported.')
 
     if pg_collection is None:
         pg_collection = ProcessGroupCollection.use_mpu_process_groups()
@@ -588,7 +601,7 @@ def _get_megatron_emerging_optimizer(
         model_parallel_group = pg_dict['expt_tp_pp_group' if is_expert else 'mp_group']
 
         if opt_name in _EMERGING_OPTIMIZERS:
-            optimizer, init_state_fn = _create_plain_emerging_optimizer(
+            optimizer, init_state_fn = _create_emerging_optimizer(
                 config, groups, eopt_name, model_chunks, pg_collection
             )
             if use_layer_wise:
@@ -617,17 +630,19 @@ def _get_megatron_emerging_optimizer(
                 param_groups=groups,
                 model_parallel_group=model_parallel_group,
                 pg_collection=pg_collection,
-                plain=use_layer_wise,
+                skip_megatron_wrapping=use_layer_wise,
             )
         results.append(result)
 
     if use_layer_wise:
-        plain_optimizers, init_fns = zip(*results) if results else ([], [])
+        base_optimizers, init_fns = (), ()
+        if results:
+            base_optimizers, init_fns = zip(*results)
         log_single_rank(
             logger, logging.INFO, f'Using LayerWiseDistributedOptimizer for {eopt_name}'
         )
         return LayerWiseDistributedOptimizer(
-            list(plain_optimizers), config, pg_collection, init_state_fn_list=list(init_fns)
+            list(base_optimizers), config, pg_collection, init_state_fn_list=list(init_fns)
         )
 
     return ChainedOptimizer(results)

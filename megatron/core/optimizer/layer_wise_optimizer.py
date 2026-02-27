@@ -63,15 +63,15 @@ class LayerWiseDistributedOptimizer(ChainedOptimizer):
                 optimizers
             ), "init_state_fn_list must be the same length as optimizers if provided"
 
-        # Wrap plain torch optimizers with Float16 for bf16 training.
-        # Callers pass plain (unwrapped) optimizers; wrapping happens here
-        # *after* shard_params so master weights are only created for the local shard.
+        # Wrap base torch optimizers with Float16 for bf16 training.
+        # Callers pass base optimizers; wrapping happens here *after*
+        # shard_params so master weights are only created for the local shard.
         if config.bf16:
             for i in range(len(optimizers)):
                 opt = optimizers[i]
                 if isinstance(opt, (Float16OptimizerWithFloat16Params, FP32Optimizer)):
                     raise TypeError(
-                        'LayerWiseDistributedOptimizer expects plain torch optimizers, '
+                        'LayerWiseDistributedOptimizer expects base torch optimizers, '
                         f'got {type(opt).__name__}. Do not pre-wrap with Megatron optimizers.'
                     )
                 optimizers[i] = Float16OptimizerWithFloat16Params(

@@ -124,11 +124,11 @@ class TestLayerWiseOptimizer:
 
         optimizer = get_megatron_optimizer(optimizer_config, [model])
         if use_layer_wise:
-            # Extract plain torch optimizers from the FP32Optimizer wrappers.
-            plain_optimizers = [opt.optimizer for opt in optimizer.chained_optimizers]
+            # Extract base torch optimizers from the FP32Optimizer wrappers.
+            base_optimizers = [opt.optimizer for opt in optimizer.chained_optimizers]
             optimizer_config.bf16 = True
             optimizer = LayerWiseDistributedOptimizer(
-                plain_optimizers, optimizer_config, pg_collection
+                base_optimizers, optimizer_config, pg_collection
             )
         return model, optimizer, pg_collection
 
