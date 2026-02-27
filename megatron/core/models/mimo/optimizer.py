@@ -180,6 +180,10 @@ def _get_pg_collection_for_optimizer(grid) -> ProcessGroupCollection:
     pg.tp_ep_pp = grid.get_pg(["tp", "ep", "pp"])
     pg.expt_dp = grid.get_pg(["dp", "ep"])
 
+    # Distributed optimizer group (same as dp_cp when num_distributed_optimizer_instances == 1)
+    # FIXME: Yash - handle multiple optimizer instances
+    pg.intra_dist_opt = grid.get_pg(["dp", "cp"])
+
     return pg
 
 
@@ -206,7 +210,10 @@ def get_mimo_optimizer(mimo_model: "MimoModel", config: OptimizerConfig) -> Mimo
 
             if module is not None:
                 optimizer = get_megatron_optimizer(
-                    config=config, model_chunks=[module], pg_collection=pg_collection
+                    config=config,
+                    model_chunks=[module],
+                    pg_collection=pg_collection,
+                    use_gloo_process_groups=False,
                 )
 
         module_infos[module_name] = ModuleOptimizerInfo(
