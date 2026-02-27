@@ -386,8 +386,7 @@ class MambaModel(LanguageModule):
         if self.share_embeddings_and_output_weights:
             output_weight = self.shared_embedding_or_output_weight()
 
-        mtp_forward_ran = self.mtp_process and self.training and inference_context is None
-        if mtp_forward_ran:
+        if self.mtp_process:
             hidden_states = self.mtp(
                 input_ids=input_ids,
                 position_ids=position_ids,
@@ -402,7 +401,7 @@ class MambaModel(LanguageModule):
         if not self.post_process:
             return hidden_states
 
-        if self.config.mtp_num_layers is not None and mtp_forward_ran:
+        if self.config.mtp_num_layers is not None:
             hidden_states = process_mtp_loss(
                 hidden_states=hidden_states,
                 labels=labels,
