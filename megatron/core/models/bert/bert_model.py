@@ -25,15 +25,7 @@ from megatron.core.transformer.transformer_block import TransformerBlock
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.transformer.transformer_layer import TransformerLayerSubmodules
 from megatron.core.transformer.utils import get_linear_layer
-from megatron.core.utils import deprecate_inference_params
-from megatron.core.utils import get_te_version as _get_te_version
-from megatron.core.utils import is_te_min_version
-
-
-def get_te_version():
-    """Included for backwards compatibility."""
-    warnings.warn("`get_te_version` will be deprecated in a future release")
-    return _get_te_version()
+from megatron.core.utils import deprecate_inference_params, is_te_min_version
 
 
 class BertModel(LanguageModule):
@@ -143,7 +135,11 @@ class BertModel(LanguageModule):
                 config.hidden_size,
                 self.vocab_size,
                 config=config,
-                init_method=config.init_method,
+                init_method=(
+                    config.embedding_init_method
+                    if config.use_mup and not self.share_embeddings_and_output_weights
+                    else config.init_method
+                ),
                 bias=True,
                 skip_bias_add=False,
                 gather_output=not self.parallel_output,
