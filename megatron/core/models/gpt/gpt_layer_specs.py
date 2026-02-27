@@ -573,7 +573,7 @@ def get_gpt_decoder_layer_specs(
             qk_l2_norm=qk_l2_norm,
             num_experts=config.num_moe_experts,
             moe_grouped_gemm=config.moe_grouped_gemm,
-            moe_use_legacy_grouped_gemm=config.moe_use_legacy_grouped_gemm
+            moe_use_legacy_grouped_gemm=config.moe_use_legacy_grouped_gemm,
         )
     else:
         layer_norm_impl = LNImpl

@@ -11,22 +11,24 @@ Supports latency-optimized NVLS collectives (multimem all-gather/reduce-scatter)
 on Hopper+ GPUs with BF16, with automatic fallback to NCCL via superclass methods.
 """
 
-import torch
 from typing import List, Optional
 
-from megatron.core.process_groups_config import ProcessGroupCollection
-from megatron.core.transformer.moe.token_dispatcher import (
-    MoEAllGatherTokenDispatcher,
-)
-from megatron.core.transformer.transformer_config import TransformerConfig
+import torch
 
-from megatron.core.tensor_parallel import gather_from_sequence_parallel_region, reduce_scatter_to_sequence_parallel_region
-from megatron.core.parallel_state import get_global_symmetric_memory_buffer_ep
 from megatron.core.inference.communication.torch_symm_triton import (
     are_tensors_nvls_eligible,
     multimem_all_gather_fused,
     multimem_reduce_scatter,
 )
+from megatron.core.parallel_state import get_global_symmetric_memory_buffer_ep
+from megatron.core.process_groups_config import ProcessGroupCollection
+from megatron.core.tensor_parallel import (
+    gather_from_sequence_parallel_region,
+    reduce_scatter_to_sequence_parallel_region,
+)
+from megatron.core.transformer.moe.token_dispatcher import MoEAllGatherTokenDispatcher
+from megatron.core.transformer.transformer_config import TransformerConfig
+
 
 class InferenceCUDAGraphTokenDispatcher(MoEAllGatherTokenDispatcher):
     """
@@ -69,10 +71,7 @@ class InferenceCUDAGraphTokenDispatcher(MoEAllGatherTokenDispatcher):
         self.triton_nvls_kernels_allowed = not self.config.inference_disable_triton_nvls_kernels
 
     def _maybe_allocate_ag_buffers(
-        self,
-        routing_map: torch.Tensor,
-        probs: torch.Tensor,
-        hidden_states: torch.Tensor,
+        self, routing_map: torch.Tensor, probs: torch.Tensor, hidden_states: torch.Tensor
     ) -> dict:
         """
         Allocate a single symmetric memory buffer for all-gather outputs of
@@ -86,9 +85,12 @@ class InferenceCUDAGraphTokenDispatcher(MoEAllGatherTokenDispatcher):
         """
         _NONE = {
             "handle": None,
-            "routing_map": None, "routing_map_offset": 0,
-            "probs": None, "probs_offset": 0,
-            "hidden_states": None, "hidden_states_offset": 0,
+            "routing_map": None,
+            "routing_map_offset": 0,
+            "probs": None,
+            "probs_offset": 0,
+            "hidden_states": None,
+            "hidden_states_offset": 0,
         }
 
         local_tokens = probs.size(0)
@@ -96,11 +98,13 @@ class InferenceCUDAGraphTokenDispatcher(MoEAllGatherTokenDispatcher):
         topk = probs.size(-1)
         hidden_dim = hidden_states.size(-1)
 
-        result = get_global_symmetric_memory_buffer_ep().maybe_get_tensors([
-            (global_tokens * topk, routing_map.dtype),
-            (global_tokens * topk, probs.dtype),
-            (global_tokens * hidden_dim, hidden_states.dtype),
-        ])
+        result = get_global_symmetric_memory_buffer_ep().maybe_get_tensors(
+            [
+                (global_tokens * topk, routing_map.dtype),
+                (global_tokens * topk, probs.dtype),
+                (global_tokens * hidden_dim, hidden_states.dtype),
+            ]
+        )
 
         if result["handle"] is None:
             return _NONE
@@ -108,9 +112,12 @@ class InferenceCUDAGraphTokenDispatcher(MoEAllGatherTokenDispatcher):
         (rm_buf, rm_off), (p_buf, p_off), (hs_buf, hs_off) = result["tensors"]
         return {
             "handle": result["handle"],
-            "routing_map": rm_buf, "routing_map_offset": rm_off,
-            "probs": p_buf, "probs_offset": p_off,
-            "hidden_states": hs_buf, "hidden_states_offset": hs_off,
+            "routing_map": rm_buf,
+            "routing_map_offset": rm_off,
+            "probs": p_buf,
+            "probs_offset": p_off,
+            "hidden_states": hs_buf,
+            "hidden_states_offset": hs_off,
         }
 
     def _maybe_allocate_rs_buffer(self, x: torch.Tensor) -> dict:
@@ -132,9 +139,11 @@ class InferenceCUDAGraphTokenDispatcher(MoEAllGatherTokenDispatcher):
         """
         if self.ep_size == 1:
             return hidden_states, probs
-        
+
         # 1. Check inputs only: if inputs are 16-byte divisible, outputs (world_size * input) are too.
-        nvls_eligible = self.triton_nvls_kernels_allowed and are_tensors_nvls_eligible(hidden_states, probs, self.routing_map)
+        nvls_eligible = self.triton_nvls_kernels_allowed and are_tensors_nvls_eligible(
+            hidden_states, probs, self.routing_map
+        )
         ag_buffers = None
 
         if nvls_eligible:
@@ -157,7 +166,9 @@ class InferenceCUDAGraphTokenDispatcher(MoEAllGatherTokenDispatcher):
 
             # Fused NVLS all-gather: single kernel launch + single barrier for all 3 tensors
             multimem_all_gather_fused(
-                ag_buffers["routing_map"].view(torch.bfloat16), # .view does not change the underlying data
+                ag_buffers["routing_map"].view(
+                    torch.bfloat16
+                ),  # .view does not change the underlying data
                 self.routing_map.view(torch.bfloat16),
                 ag_buffers["routing_map_offset"],
                 ag_buffers["probs"].view(torch.bfloat16),
@@ -168,9 +179,13 @@ class InferenceCUDAGraphTokenDispatcher(MoEAllGatherTokenDispatcher):
                 ag_buffers["hidden_states_offset"],
                 ag_buffers["handle"],
             )
-            self.routing_map = ag_buffers["routing_map"].view(routing_map_dtype).view(global_tokens, topk)
+            self.routing_map = (
+                ag_buffers["routing_map"].view(routing_map_dtype).view(global_tokens, topk)
+            )
             probs = ag_buffers["probs"].view(probs_dtype).view(global_tokens, topk)
-            hidden_states = ag_buffers["hidden_states"].view(hidden_dtype).view(global_tokens, hidden_dim)
+            hidden_states = (
+                ag_buffers["hidden_states"].view(hidden_dtype).view(global_tokens, hidden_dim)
+            )
         else:
             # Fallback to NCCL for all tensors
             with torch.no_grad():
@@ -184,7 +199,6 @@ class InferenceCUDAGraphTokenDispatcher(MoEAllGatherTokenDispatcher):
 
         return hidden_states, probs
 
-        
     def dispatch_postprocess(self, hidden_states, probs):
         """Pass-through: returns unpermuted inputs and routing_map for InferenceGroupedMLP."""
         return hidden_states, self.routing_map, probs
@@ -213,9 +227,7 @@ class InferenceCUDAGraphTokenDispatcher(MoEAllGatherTokenDispatcher):
         # since if the smaller output is 16-byte divisible, the input is too.
         output_shape = list(hidden_states.size())
         output_shape[0] = hidden_states.size(0) // self.ep_size
-        output = torch.empty(
-            output_shape, dtype=hidden_states.dtype, device=hidden_states.device
-        )
+        output = torch.empty(output_shape, dtype=hidden_states.dtype, device=hidden_states.device)
 
         # Check output only: if output is 16-byte divisible, input (world_size * output) is too.
         nvls_eligible = self.triton_nvls_kernels_allowed and are_tensors_nvls_eligible(output)
@@ -234,9 +246,8 @@ class InferenceCUDAGraphTokenDispatcher(MoEAllGatherTokenDispatcher):
             multimem_reduce_scatter(output, rs_buffer["tensor"], rs_buffer["handle"])
             return output
         else:
-            # Fallback to NCCL            
+            # Fallback to NCCL
             hidden_states = reduce_scatter_to_sequence_parallel_region(
                 hidden_states, group=self.tp_ep_group
             )
             return hidden_states
-

@@ -24,6 +24,7 @@ from megatron.core.transformer.moe.moe_utils import (
 from megatron.core.transformer.moe.router_replay import RouterReplay
 from megatron.core.transformer.transformer_config import TransformerConfig
 
+
 class Router(ABC, MegatronModule):
     """Base Router class"""
 
@@ -719,12 +720,15 @@ class InferenceTopKRouter(TopKRouter):
     method is @torch.compile()'d and returns dense [num_tokens, topk] tensors
     instead of sparse [num_tokens, num_experts] for CUDA graph compatibility.
 
-    Falls back to the parent TopKRouter.forward() for training or 
+    Falls back to the parent TopKRouter.forward() for training or
     non-CUDA-graphed inference iterations.
     """
 
     def __init__(
-        self, config: TransformerConfig, pg_collection: Optional[ProcessGroupCollection] = None, is_mtp_layer: bool = False,
+        self,
+        config: TransformerConfig,
+        pg_collection: Optional[ProcessGroupCollection] = None,
+        is_mtp_layer: bool = False,
     ) -> None:
         """Initialize the specialized inference top-k router.
 
@@ -751,11 +755,11 @@ class InferenceTopKRouter(TopKRouter):
     @torch.compile()
     def _forward(self, input: torch.Tensor, padding_mask: Optional[torch.Tensor] = None):
         logits = self.gating(input).squeeze(1)  # [num_tokens, 1, num_experts]
-       
+
         # Share the routing logic with the parent class to avoid code duplication.
-        # However, we pass dense_output=True to return dense [num_tokens, topk] tensors 
+        # However, we pass dense_output=True to return dense [num_tokens, topk] tensors
         # instead of sparse [num_tokens, num_experts].
-        
+
         probs, top_indices = topk_routing_with_score_function(
             logits,
             self.topk,
@@ -783,8 +787,8 @@ class InferenceTopKRouter(TopKRouter):
                 - probs: Normalized routing probabilities [num_tokens, topk]
                 - top_indices: Selected expert indices [num_tokens, topk]
         """
-       
+
         if self.training or not self.is_inference_cuda_graphed_iteration:
             return super().forward(input, padding_mask)
-        
+
         return self._forward(input, padding_mask)

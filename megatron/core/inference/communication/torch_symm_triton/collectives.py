@@ -23,12 +23,15 @@ except ImportError:
 
 from .barrier import symm_mem_sync
 from .multimem_asm import ld_128, st_128
-from .utils import get_flat_tid, are_tensors_nvls_eligible, sync_threads
+from .utils import are_tensors_nvls_eligible, get_flat_tid, sync_threads
 
 # ── Triton kernels ─────────────────────────────────────────────────────────
 
+
 @triton.jit
-def _ag_phase(local_ptr, multicast_ptr, byte_offset, numel, BLOCK_SIZE, NUMEL_PER_THREAD, RANK, WORLD_SIZE):
+def _ag_phase(
+    local_ptr, multicast_ptr, byte_offset, numel, BLOCK_SIZE, NUMEL_PER_THREAD, RANK, WORLD_SIZE
+):
     """
     Core all-gather phase: load from local memory, multicast-store to symmetric buffer.
     This is the building block for both single-tensor and fused multi-tensor all-gathers.
@@ -81,21 +84,33 @@ def _multimem_all_gather_kernel(
     WORLD_SIZE: tl.constexpr,
 ):
     """Single-tensor multicast all-gather kernel."""
-    _ag_phase(local_ptr, multicast_ptr, byte_offset, numel,
-              BLOCK_SIZE, NUMEL_PER_THREAD, RANK, WORLD_SIZE)
+    _ag_phase(
+        local_ptr, multicast_ptr, byte_offset, numel, BLOCK_SIZE, NUMEL_PER_THREAD, RANK, WORLD_SIZE
+    )
     sync_threads()
-    symm_mem_sync(signal_pad_ptrs, None, RANK, WORLD_SIZE,
-                  hasPreviousMemAccess=True, hasSubsequentMemAccess=True)
+    symm_mem_sync(
+        signal_pad_ptrs,
+        None,
+        RANK,
+        WORLD_SIZE,
+        hasPreviousMemAccess=True,
+        hasSubsequentMemAccess=True,
+    )
 
 
 @triton.jit
 def _multimem_all_gather_3_kernel(
-    local_ptr_0, local_ptr_1, local_ptr_2,
+    local_ptr_0,
+    local_ptr_1,
+    local_ptr_2,
     multicast_ptr,
     signal_pad_ptrs,
-    numel_0, byte_offset_0,
-    numel_1, byte_offset_1,
-    numel_2, byte_offset_2,
+    numel_0,
+    byte_offset_0,
+    numel_1,
+    byte_offset_1,
+    numel_2,
+    byte_offset_2,
     BLOCK_SIZE: tl.constexpr,
     NUMEL_PER_THREAD: tl.constexpr,
     RANK: tl.constexpr,
@@ -106,15 +121,46 @@ def _multimem_all_gather_3_kernel(
     then synchronizes once, eliminating 2 kernel launches and 2 barriers
     compared to three separate multimem_all_gather calls.
     """
-    _ag_phase(local_ptr_0, multicast_ptr, byte_offset_0, numel_0,
-              BLOCK_SIZE, NUMEL_PER_THREAD, RANK, WORLD_SIZE)
-    _ag_phase(local_ptr_1, multicast_ptr, byte_offset_1, numel_1,
-              BLOCK_SIZE, NUMEL_PER_THREAD, RANK, WORLD_SIZE)
-    _ag_phase(local_ptr_2, multicast_ptr, byte_offset_2, numel_2,
-              BLOCK_SIZE, NUMEL_PER_THREAD, RANK, WORLD_SIZE)
+    _ag_phase(
+        local_ptr_0,
+        multicast_ptr,
+        byte_offset_0,
+        numel_0,
+        BLOCK_SIZE,
+        NUMEL_PER_THREAD,
+        RANK,
+        WORLD_SIZE,
+    )
+    _ag_phase(
+        local_ptr_1,
+        multicast_ptr,
+        byte_offset_1,
+        numel_1,
+        BLOCK_SIZE,
+        NUMEL_PER_THREAD,
+        RANK,
+        WORLD_SIZE,
+    )
+    _ag_phase(
+        local_ptr_2,
+        multicast_ptr,
+        byte_offset_2,
+        numel_2,
+        BLOCK_SIZE,
+        NUMEL_PER_THREAD,
+        RANK,
+        WORLD_SIZE,
+    )
     sync_threads()
-    symm_mem_sync(signal_pad_ptrs, None, RANK, WORLD_SIZE,
-                  hasPreviousMemAccess=True, hasSubsequentMemAccess=True)
+    symm_mem_sync(
+        signal_pad_ptrs,
+        None,
+        RANK,
+        WORLD_SIZE,
+        hasPreviousMemAccess=True,
+        hasSubsequentMemAccess=True,
+    )
+
 
 @triton.jit
 def _multimem_reduce_scatter_kernel(
@@ -162,13 +208,10 @@ def _multimem_reduce_scatter_kernel(
 
         block_start += tl.num_programs(axis=0) * BLOCK_SIZE
 
+
 # ── Python wrappers ─────────────────────────────────────────────────────────
 
-_DEFAULT_KERNEL_CONFIG = {
-    "max_num_blocks": 128,
-    "num_warps": 32,
-    "BLOCK_SIZE": 1024,
-}
+_DEFAULT_KERNEL_CONFIG = {"max_num_blocks": 128, "num_warps": 32, "BLOCK_SIZE": 1024}
 
 
 def _kernel_launch_config(element_size: int, max_numel: int, world_size: int, **kwargs):
@@ -202,13 +245,16 @@ def multimem_all_gather(
     Input tensor can be a regular torch tensor.
     """
     assert HAVE_TRITON, "Triton is required for multimem all-gather."
-    assert are_tensors_nvls_eligible(input_tensor), "Input tensor must be 16-byte divisible on Hopper+ for NVLS."
-    assert output_tensor.numel() % input_tensor.numel() == 0 and \
-        output_tensor.numel() // input_tensor.numel() == symm_mem_hdl.world_size, \
-        "Output numel must be exactly world_size * input numel for all-gather."
+    assert are_tensors_nvls_eligible(
+        input_tensor
+    ), "Input tensor must be 16-byte divisible on Hopper+ for NVLS."
+    assert (
+        output_tensor.numel() % input_tensor.numel() == 0
+        and output_tensor.numel() // input_tensor.numel() == symm_mem_hdl.world_size
+    ), "Output numel must be exactly world_size * input numel for all-gather."
 
     numel_per_thread, num_blocks, config = _kernel_launch_config(
-        input_tensor.element_size(), output_tensor.numel(), symm_mem_hdl.world_size, **kwargs,
+        input_tensor.element_size(), output_tensor.numel(), symm_mem_hdl.world_size, **kwargs
     )
     _multimem_all_gather_kernel[(num_blocks, 1, 1)](
         input_tensor.data_ptr(),
@@ -227,9 +273,15 @@ def multimem_all_gather(
 
 
 def multimem_all_gather_fused(
-    output_0: torch.Tensor, input_0: torch.Tensor, byte_offset_0: int,
-    output_1: torch.Tensor, input_1: torch.Tensor, byte_offset_1: int,
-    output_2: torch.Tensor, input_2: torch.Tensor, byte_offset_2: int,
+    output_0: torch.Tensor,
+    input_0: torch.Tensor,
+    byte_offset_0: int,
+    output_1: torch.Tensor,
+    input_1: torch.Tensor,
+    byte_offset_1: int,
+    output_2: torch.Tensor,
+    input_2: torch.Tensor,
+    byte_offset_2: int,
     symm_mem_hdl: _SymmetricMemory,
     **kwargs,
 ) -> None:
@@ -240,25 +292,31 @@ def multimem_all_gather_fused(
     All tensors must share the same symmetric memory handle.
     """
     assert HAVE_TRITON, "Triton is required for multimem all-gather."
-    assert are_tensors_nvls_eligible(input_0, input_1, input_2), \
-        "All input tensors must be 16-byte divisible on Hopper+ for NVLS."
+    assert are_tensors_nvls_eligible(
+        input_0, input_1, input_2
+    ), "All input tensors must be 16-byte divisible on Hopper+ for NVLS."
     for inp, out in [(input_0, output_0), (input_1, output_1), (input_2, output_2)]:
-        assert out.numel() % inp.numel() == 0 and \
-            out.numel() // inp.numel() == symm_mem_hdl.world_size, \
-            "Output numel must be exactly world_size * input numel for all-gather."
+        assert (
+            out.numel() % inp.numel() == 0 and out.numel() // inp.numel() == symm_mem_hdl.world_size
+        ), "Output numel must be exactly world_size * input numel for all-gather."
 
     max_numel = max(output_0.numel(), output_1.numel(), output_2.numel())
 
     numel_per_thread, num_blocks, config = _kernel_launch_config(
-        input_0.element_size(), max_numel, symm_mem_hdl.world_size, **kwargs,
+        input_0.element_size(), max_numel, symm_mem_hdl.world_size, **kwargs
     )
     _multimem_all_gather_3_kernel[(num_blocks, 1, 1)](
-        input_0.data_ptr(), input_1.data_ptr(), input_2.data_ptr(),
+        input_0.data_ptr(),
+        input_1.data_ptr(),
+        input_2.data_ptr(),
         symm_mem_hdl.multicast_ptr,
         symm_mem_hdl.signal_pad_ptrs_dev,
-        numel_0=output_0.numel(), byte_offset_0=byte_offset_0,
-        numel_1=output_1.numel(), byte_offset_1=byte_offset_1,
-        numel_2=output_2.numel(), byte_offset_2=byte_offset_2,
+        numel_0=output_0.numel(),
+        byte_offset_0=byte_offset_0,
+        numel_1=output_1.numel(),
+        byte_offset_1=byte_offset_1,
+        numel_2=output_2.numel(),
+        byte_offset_2=byte_offset_2,
         BLOCK_SIZE=config["BLOCK_SIZE"],
         NUMEL_PER_THREAD=numel_per_thread,
         RANK=symm_mem_hdl.rank,
@@ -281,13 +339,16 @@ def multimem_reduce_scatter(
     assert HAVE_TRITON, "Triton is required for multimem reduce-scatter."
     assert input_tensor.dtype == torch.bfloat16, "Only bfloat16 is supported for now."
     assert output_tensor.dtype == torch.bfloat16, "Only bfloat16 is supported for now."
-    assert are_tensors_nvls_eligible(output_tensor), "Output tensor must be 16-byte divisible on Hopper+ for NVLS."
-    assert input_tensor.numel() % output_tensor.numel() == 0 and \
-        input_tensor.numel() // output_tensor.numel() == symm_mem_hdl.world_size, \
-        "Input numel must be exactly world_size * output numel for reduce-scatter."
+    assert are_tensors_nvls_eligible(
+        output_tensor
+    ), "Output tensor must be 16-byte divisible on Hopper+ for NVLS."
+    assert (
+        input_tensor.numel() % output_tensor.numel() == 0
+        and input_tensor.numel() // output_tensor.numel() == symm_mem_hdl.world_size
+    ), "Input numel must be exactly world_size * output numel for reduce-scatter."
 
     numel_per_thread, num_blocks, config = _kernel_launch_config(
-        output_tensor.element_size(), input_tensor.numel(), symm_mem_hdl.world_size, **kwargs,
+        output_tensor.element_size(), input_tensor.numel(), symm_mem_hdl.world_size, **kwargs
     )
     _multimem_reduce_scatter_kernel[(num_blocks, 1, 1)](
         output_tensor.data_ptr(),

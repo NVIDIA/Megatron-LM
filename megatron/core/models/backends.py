@@ -3,19 +3,24 @@ from __future__ import annotations
 
 import warnings
 from abc import abstractmethod
-from typing import Optional, Protocol, cast, Tuple
+from typing import Optional, Protocol, Tuple, cast
 
-from megatron.core.tensor_parallel.layers import ColumnParallelLinear, RowParallelLinear
-from megatron.core.transformer.dot_product_attention import DotProductAttention
 from megatron.core.extensions.transformer_engine import (
     TEColumnParallelGroupedLinear,
-    TERowParallelGroupedLinear
+    TERowParallelGroupedLinear,
 )
-from megatron.core.utils import is_te_min_version
+from megatron.core.tensor_parallel.layers import ColumnParallelLinear, RowParallelLinear
+from megatron.core.transformer.dot_product_attention import DotProductAttention
 from megatron.core.transformer.mlp import MLPSubmodules, TEActivationFunctionBuilder
-from megatron.core.transformer.moe.experts import GroupedMLP, SequentialMLP, TEGroupedMLPSubmodules, InferenceGroupedMLP
+from megatron.core.transformer.moe.experts import (
+    GroupedMLP,
+    InferenceGroupedMLP,
+    SequentialMLP,
+    TEGroupedMLPSubmodules,
+)
 from megatron.core.transformer.torch_norm import LayerNormBuilder, WrappedTorchNorm
 from megatron.core.typed_torch import not_none
+from megatron.core.utils import is_te_min_version
 
 try:
     import apex  # pylint: disable=unused-import

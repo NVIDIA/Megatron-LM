@@ -25,15 +25,17 @@ from megatron.core.transformer.moe.token_dispatcher import (
     MoEFlexTokenDispatcher,
     MoETokenDispatcher,
 )
+from megatron.core.transformer.moe.token_dispatcher_inference import (
+    InferenceCUDAGraphTokenDispatcher,
+)
 from megatron.core.transformer.spec_utils import ModuleSpec, build_module
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.typed_torch import apply_module
 from megatron.core.utils import internal_api
-from megatron.core.transformer.moe.token_dispatcher_inference import (
-    InferenceCUDAGraphTokenDispatcher,
-)
+
 try:
     import flashinfer
+
     HAVE_FLASHINFER = True
 except ImportError:
     HAVE_FLASHINFER = False
@@ -42,6 +44,7 @@ if HAVE_FLASHINFER:
     try:
         import flashinfer_cubin
         import flashinfer_jit_cache
+
         HAVE_FLASHINFER_CUBIN_AND_JIT_CACHE = True
     except ImportError:
         HAVE_FLASHINFER_CUBIN_AND_JIT_CACHE = False
@@ -265,7 +268,9 @@ class MoELayer(BaseMoELayer):
 
         # Inference-optimized mode setup
         if config.transformer_impl == "inference_optimized":
-            assert HAVE_FLASHINFER, "flashinfer-python is required for inference-optimized MoE implementation."
+            assert (
+                HAVE_FLASHINFER
+            ), "flashinfer-python is required for inference-optimized MoE implementation."
             if not HAVE_FLASHINFER_CUBIN_AND_JIT_CACHE:
                 warnings.warn(
                     "flashinfer-cubin and/or flashinfer-jit-cache not found. "
@@ -273,11 +278,9 @@ class MoELayer(BaseMoELayer):
                 )
             self._setup_inference_mode(pg_collection)
 
-
         # Cudagraph tensor store for resuming the forward pass from the end of the cudagraph.
         self.cudagraph_tensor_store = MoECudaGraphTensorStore()
         self.fwd_execution_map = ["route", "expert_compute", "postprocess"]
-
 
     def _setup_inference_mode(self, pg_collection):
         """Set up inference-optimized token dispatcher and state.
@@ -286,7 +289,7 @@ class MoELayer(BaseMoELayer):
         Creates an InferenceCUDAGraphTokenDispatcher alongside the standard dispatcher,
         which is swapped in during CUDA-graphed forward passes.
         """
-        
+
         assert self.config.moe_token_dispatcher_type == "alltoall", (
             f"Inference-optimized MoE requires 'alltoall' dispatcher, "
             f"got '{self.config.moe_token_dispatcher_type}'"
@@ -319,7 +322,6 @@ class MoELayer(BaseMoELayer):
         elif not set_to and hasattr(self, "_saved_token_dispatcher"):
             self.token_dispatcher = self._saved_token_dispatcher
             self.shared_expert_overlap = self._saved_shared_expert_overlap
-
 
     @maybe_skip_or_early_return_by_cudagraph("route")
     def route(self, hidden_states: torch.Tensor, padding_mask: Optional[torch.Tensor] = None):

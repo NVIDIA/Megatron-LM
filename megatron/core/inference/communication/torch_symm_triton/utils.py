@@ -2,8 +2,9 @@
 
 # Adapted from: https://github.com/meta-pytorch/kraken.git
 
-import torch
 from unittest.mock import MagicMock
+
+import torch
 
 from megatron.core.utils import null_decorator
 
@@ -14,7 +15,6 @@ except ImportError:
     triton = MagicMock()
     tl = MagicMock()
     triton.jit = null_decorator
-
 
 
 def is_device_nvls_capable(device: torch.device) -> bool:
@@ -35,7 +35,6 @@ def are_tensors_nvls_eligible(*tensors: torch.Tensor) -> bool:
     return is_device_nvls_capable(tensors[0].device) and all(
         t.element_size() * t.numel() % 16 == 0 for t in tensors
     )
-
 
 
 @triton.jit

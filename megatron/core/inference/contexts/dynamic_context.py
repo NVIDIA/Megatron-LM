@@ -543,10 +543,10 @@ class DynamicInferenceContext(BaseInferenceContext):
             )
         )
 
-        self.smallest_non_decode_cuda_graph_size = min(
-               inference_config.cuda_graph_mixed_prefill_count, self.max_requests
-        ),
- 
+        self.smallest_non_decode_cuda_graph_size = (
+            min(inference_config.cuda_graph_mixed_prefill_count, self.max_requests),
+        )
+
         self._using_cuda_graph_this_step = False
         # Deal with chunked prefill
         self.enable_chunked_prefill = inference_config.enable_chunked_prefill
@@ -1343,7 +1343,7 @@ class DynamicInferenceContext(BaseInferenceContext):
         best_graph = CUDAGraphBatchDimensionBuilder.match_graph_config(
             batch_dimensions,
             self.cuda_graph_batch_dimensions_list,
-            smallest_non_decode_cuda_graph_size=self.smallest_non_decode_cuda_graph_size,           
+            smallest_non_decode_cuda_graph_size=self.smallest_non_decode_cuda_graph_size,
             strict=self.is_hybrid_model,
             decode_only_cuda_graphs=(not self.use_cuda_graphs_for_non_decode_steps),
             explicit_chunked_prefill=self.is_chunked_prefill_enabled() and self.is_hybrid_model,

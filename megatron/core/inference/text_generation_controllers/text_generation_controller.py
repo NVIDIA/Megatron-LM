@@ -530,7 +530,7 @@ class TextGenerationController:
         moe_pad_experts_for_cuda_graph_inference = (
             self.model_config.moe_pad_experts_for_cuda_graph_inference
         )
-        is_inference_optimized =  self.model_config.transformer_impl == "inference_optimized"
+        is_inference_optimized = self.model_config.transformer_impl == "inference_optimized"
         if is_inference_optimized:
             assert not moe_pad_experts_for_cuda_graph_inference, (
                 "moe_pad_experts_for_cuda_graph_inference cannot be True when "

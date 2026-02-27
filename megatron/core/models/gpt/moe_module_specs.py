@@ -3,12 +3,16 @@
 from typing import Optional
 
 from megatron.core.extensions.transformer_engine_spec_provider import TESpecProvider
-from megatron.core.models.backends import BackendSpecProvider, LocalSpecProvider, InferenceSpecProvider
+from megatron.core.models.backends import (
+    BackendSpecProvider,
+    InferenceSpecProvider,
+    LocalSpecProvider,
+)
 from megatron.core.transformer.mlp import MLPSubmodules
 from megatron.core.transformer.moe.moe_layer import MoELayer, MoESubmodules
+from megatron.core.transformer.moe.router import InferenceTopKRouter
 from megatron.core.transformer.moe.shared_experts import SharedExpertMLP
 from megatron.core.transformer.spec_utils import ModuleSpec
-from megatron.core.transformer.moe.router import InferenceTopKRouter
 
 
 def get_moe_module_spec(
@@ -38,6 +42,7 @@ def get_moe_module_spec(
         moe_grouped_gemm=moe_grouped_gemm,
         moe_use_legacy_grouped_gemm=moe_use_legacy_grouped_gemm,
     )
+
 
 def get_moe_module_spec_for_backend(
     backend: BackendSpecProvider,
@@ -78,7 +83,6 @@ def get_moe_module_spec_for_backend(
     return moe_module_spec
 
 
-
 def get_inference_optimized_moe_spec() -> ModuleSpec:
     """MoE module spec for inference-optimized transformer impl.
 
@@ -108,9 +112,7 @@ def get_inference_optimized_moe_spec() -> ModuleSpec:
     return ModuleSpec(
         module=MoELayer,
         submodules=MoESubmodules(
-            router=InferenceTopKRouter,
-            experts=experts,
-            shared_experts=shared_experts,
+            router=InferenceTopKRouter, experts=experts, shared_experts=shared_experts
         ),
         metainfo={"fuse_pre_mlp_layernorm": False},
     )

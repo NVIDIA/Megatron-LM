@@ -733,7 +733,7 @@ class GlobalSymmetricMemoryBuffer:
         Pack multiple tensors contiguously in the symmetric buffer with alignment.
 
         Each tensor's starting offset is aligned to `alignment` bytes (default 16
-        for 128-bit multimem access). 
+        for 128-bit multimem access).
 
         Args:
             tensor_specs: list of (numel, dtype) tuples.

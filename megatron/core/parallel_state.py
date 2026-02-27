@@ -2017,9 +2017,13 @@ def _set_global_memory_buffer():
 
 def _set_global_symmetric_memory_buffer():
     """Initialize global buffer."""
-    global _GLOBAL_SYMMETRIC_MEMORY_BUFFER_TP, _GLOBAL_SYMMETRIC_MEMORY_BUFFER_EP 
-    assert _GLOBAL_SYMMETRIC_MEMORY_BUFFER_TP is None, "global symmetric memory buffer for TP is already initialized"
-    assert _GLOBAL_SYMMETRIC_MEMORY_BUFFER_EP is None, "global symmetric memory buffer for EP is already initialized"
+    global _GLOBAL_SYMMETRIC_MEMORY_BUFFER_TP, _GLOBAL_SYMMETRIC_MEMORY_BUFFER_EP
+    assert (
+        _GLOBAL_SYMMETRIC_MEMORY_BUFFER_TP is None
+    ), "global symmetric memory buffer for TP is already initialized"
+    assert (
+        _GLOBAL_SYMMETRIC_MEMORY_BUFFER_EP is None
+    ), "global symmetric memory buffer for EP is already initialized"
 
     _GLOBAL_SYMMETRIC_MEMORY_BUFFER_TP = GlobalSymmetricMemoryBuffer(
         size_in_mb=256,  # todo: set from an argument?
@@ -2044,6 +2048,7 @@ def get_global_symmetric_memory_buffer_tp():
         _GLOBAL_SYMMETRIC_MEMORY_BUFFER_TP is not None
     ), "global symmetric memory buffer is not initialized"
     return _GLOBAL_SYMMETRIC_MEMORY_BUFFER_TP
+
 
 def get_global_symmetric_memory_buffer_ep():
     """Return the global GlobalSymmetricMemoryBuffer object"""
