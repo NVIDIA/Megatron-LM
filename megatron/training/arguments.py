@@ -25,6 +25,7 @@ from megatron.core.transformer.heterogeneous.heterogeneous_config import (
 )
 from megatron.core.utils import (
     get_torch_version,
+    is_flashinfer_min_version,
     is_te_min_version,
     is_torch_min_version,
 )
@@ -327,21 +328,70 @@ def validate_args(args, defaults={}):
     total_model_size = args.tensor_model_parallel_size * args.pipeline_model_parallel_size * args.context_parallel_size
     args.data_parallel_size = args.world_size // total_model_size
 
-    # Assert that `torch_memory_saver` is installed if offloading KV cache during RL.
-    if args.rl_offload_kv_cache_during_training:
-        try:
-            from torch_memory_saver import torch_memory_saver
-        except ImportError:
-            raise AssertionError("To use offload-kv-cache-during-training, `torch_memory_saver` must be installed. See https://github.com/fzyzcjy/torch_memory_saver.")
-        assert not args.inference_dynamic_batching_unified_memory_level, "The KV cache should not be instantiated in unified memory when it is offloaded during training."
-
-    # Batch size checks if running RL.
     if args.perform_rl_step:
-        assert not (args.rl_remove_kv_cache_during_training and args.rl_offload_kv_cache_during_training), \
-            "Cannot use both remove-kv-cache-during-training and offload-kv-cache-during-training"
+        # ----------------------------------------------------------------
+        # CUDA graphs
+        #
+        #   --cuda-graph-impl controls whether CUDA graphs are built.
+        #   The sweep of various inference CUDA graphs is built inside inference, not the RL loop.
+        #   Both training and inference CUDA graphs are gated by this flag.
+        #
+        #   --rl-training-cuda-graphs controls whether CUDA graphs are used during training.
+        #   Toggling CUDA graphs on and off is done inside the RL loop.
+        #
+        #   --rl-persist-cuda-graphs controls whether CUDA graphs are built once, or repeatedly.
+        #   When this flag is True, inference requires static memory pointers for the KV cache.
+        #   When this flag is False, inference is in charge of deleting/rebuilding CUDA graphs.
+        #
+        # KV cache management (--rl-kv-cache-management-mode)
+        #
+        #   Inference initializes the KV cache, inside either a normal memory pool, UVM, or TMS.
+        #
+        #   On suspend (inference -> training):
+        #     "persist"   — no-op; KV cache stays on GPU.
+        #     "offload"   — KV cache is offloaded to CPU.
+        #     "recompute" — KV cache is deleted entirely.
+        #
+        #   On resume (training → inference):
+        #     "persist"   — no-op; KV cache is already on GPU.
+        #     "offload"   — KV cache is restored from CPU.
+        #     "recompute" — KV cache is recomputed from scratch.
+        # ----------------------------------------------------------------
 
-        assert not (args.rl_partial_rollouts and args.rl_remove_kv_cache_during_training), \
-            "Cannot use both partial-rollouts and remove-kv-cache-during-training"
+        # Persisting CGs only makes sense if we build any CGs.
+        assert not args.rl_persist_cuda_graphs or args.cuda_graph_impl != "none", (
+            "--rl-persist-cuda-graphs is set but no CUDA graphs are being built."
+        )
+        # Training CGs only makes sense if we build any CGs.
+        assert not args.rl_training_cuda_graphs or args.cuda_graph_impl != "none", (
+            "--rl-training-cuda-graphs is set but no CUDA graphs are being built."
+        )
+        # If CUDA graphs persist and KV cache memory address is not static, we need
+        # either UVM or torch_memory_saver to maintain memory address stability for CGs.
+        if args.rl_persist_cuda_graphs and args.rl_kv_cache_management_mode != "persist":
+            try:
+                from torch_memory_saver import torch_memory_saver
+            except ImportError:
+                assert args.inference_dynamic_batching_unified_memory_level > 0, (
+                    "Persisting CUDA graphs requires static KV cache memory. Use "
+                    "--rl-kv-cache-management-mode=persist, UVM, or install torch_memory_saver."
+                )
+
+        # Offload mode requires CG persistence: CG recapture runs dummy forward
+        # passes that corrupt the preserved KV data.
+        assert (
+            (not args.rl_kv_cache_management_mode == "offload") or (args.rl_persist_cuda_graphs)
+        ), "--rl-kv-cache-management-mode=offload requires --rl-persist-cuda-graphs"
+
+        # There's no need to manually offload the KV cache with UVM.
+        assert not (
+            args.inference_dynamic_batching_unified_memory_level > 0
+            and args.rl_kv_cache_management_mode == "offload"
+        ), "--rl-kv-cache-management-mode=offload is incompatible with UVM"
+        # We currently cannot recapture CGs in offload mode.
+        assert not(
+            not args.rl_persist_cuda_graphs and args.rl_kv_cache_management_mode == "offload"
+        ), "Cannot recapture CUDA graphs while offloading KV cache."
 
         # Validate inference model offloading - requires either UVM or torch_memory_saver
         if args.rl_offload_inference_model_weights_when_idle:
@@ -504,35 +554,135 @@ def validate_args(args, defaults={}):
         print_rank_0('setting global batch size to {}'.format(args.global_batch_size))
     assert args.global_batch_size > 0
 
-    # === MTP validation ===
-    # Deprecation warnings for legacy MTP arguments
+    # === Hybrid layer pattern: deprecation handling and validation ===
+
+    # Backward compat: --hybrid-override-pattern is deprecated in favor of --hybrid-layer-pattern
+    used_hybrid_override_pattern = False
+    if args.hybrid_override_pattern is not None:
+        assert args.hybrid_layer_pattern is None, (
+            '--hybrid-override-pattern and --hybrid-layer-pattern cannot both be specified. '
+            '--hybrid-override-pattern is deprecated; use --hybrid-layer-pattern instead.'
+        )
+        warn_rank_0(
+            "--hybrid-override-pattern is deprecated. Use --hybrid-layer-pattern instead.",
+            args.rank,
+        )
+        args.hybrid_layer_pattern = args.hybrid_override_pattern
+        used_hybrid_override_pattern = True
+
     if args.mtp_hybrid_override_pattern is not None:
         warn_rank_0(
             "--mtp-hybrid-override-pattern is deprecated. "
-            "For new hybrid models with MTP models, use unified --hybrid-override-pattern instead. "
+            "For new hybrid models with MTP, use unified --hybrid-layer-pattern instead. "
             "Example: 'M*M*/MM/MM' means main='M*M*', MTP pattern='MM' with 2 depths. "
             "This argument is kept only for loading old checkpoints.",
             args.rank,
         )
 
-    # Backward compatibility: convert legacy mtp_hybrid_override_pattern to unified format
-    from megatron.core.ssm.mamba_hybrid_layer_allocation import Symbols, parse_hybrid_pattern
+    from megatron.core.ssm.mamba_hybrid_layer_allocation import (
+        Symbols, parse_hybrid_pattern, get_hybrid_total_layer_count,
+        get_hybrid_total_pipeline_segment_count,
+    )
     sep = Symbols.MTP_SEPARATOR
+
+    # Backward compat: convert legacy mtp_hybrid_override_pattern to unified format
     if (
-        getattr(args, 'mtp_hybrid_override_pattern', None) is not None
+        args.mtp_hybrid_override_pattern is not None
         and args.mtp_num_layers is not None
         and args.mtp_num_layers > 0
-        and (args.hybrid_override_pattern is None or sep not in args.hybrid_override_pattern)
+        and (args.hybrid_layer_pattern is None or sep not in args.hybrid_layer_pattern)
     ):
-        main_pattern = args.hybrid_override_pattern or ''
+        main_pattern = args.hybrid_layer_pattern or ''
         mtp_pattern = args.mtp_hybrid_override_pattern
-        args.hybrid_override_pattern = main_pattern + sep + sep.join([mtp_pattern] * args.mtp_num_layers)
+        args.hybrid_layer_pattern = main_pattern + sep + sep.join([mtp_pattern] * args.mtp_num_layers)
         args.mtp_hybrid_override_pattern = None
-        print_rank_0(f"Converted legacy MTP pattern to unified: {args.hybrid_override_pattern}")
+        print_rank_0(f"Converted legacy MTP pattern to unified: {args.hybrid_layer_pattern}")
+
+    if args.hybrid_layer_pattern is not None:
+        # Derive num_layers from pattern
+        num_layers_in_pattern = get_hybrid_total_layer_count(args.hybrid_layer_pattern)
+        if args.num_layers is not None:
+            if used_hybrid_override_pattern:
+                assert args.num_layers == num_layers_in_pattern, (
+                    f'--num-layers ({args.num_layers}) does not match the number of layers '
+                    f'derived from --hybrid-override-pattern ({num_layers_in_pattern}). '
+                    f'Please correct --num-layers or the pattern.'
+                )
+            else:
+                assert False, (
+                    'If --hybrid-layer-pattern is specified, --num-layers should not be specified. '
+                    'The number of layers is derived from the pattern.'
+                )
+        args.num_layers = num_layers_in_pattern
+
+        # first/last pipeline num layers are incompatible with pipe-separated patterns
+        # (the pipe separators already define the pipeline layout explicitly), but are
+        # allowed for pipe-free patterns where they control uneven PP splitting.
+        has_pipes = Symbols.PIPE in args.hybrid_layer_pattern.split(sep)[0]
+        if has_pipes:
+            assert args.decoder_first_pipeline_num_layers is None, (
+                'If --hybrid-layer-pattern contains pipe separators, '
+                '--decoder-first-pipeline-num-layers should not be specified '
+                'as the pipeline layout is explicitly defined.'
+            )
+            assert args.decoder_last_pipeline_num_layers is None, (
+                'If --hybrid-layer-pattern contains pipe separators, '
+                '--decoder-last-pipeline-num-layers should not be specified '
+                'as the pipeline layout is explicitly defined.'
+            )
+        assert args.num_layers_per_virtual_pipeline_stage is None, (
+            '--num-layers-per-virtual-pipeline-stage should not be used with '
+            '--hybrid-layer-pattern. To specify virtual pipelining, describe a number of '
+            'pipeline segments in --hybrid-layer-pattern that is a multiple of '
+            '--pipeline-model-parallel-size greater than 1'
+        )
+        assert args.num_virtual_stages_per_pipeline_rank is None, (
+            '--num-virtual-stages-per-pipeline-rank should not be used with '
+            '--hybrid-layer-pattern. Virtual pipeline stages are derived from the '
+            'number of | segments in the pattern.'
+        )
+        assert args.pipeline_model_parallel_layout is None, (
+            '--pipeline-model-parallel-layout should not be used with --hybrid-layer-pattern. '
+            'Pipeline stage layout is defined by | separators in the pattern.'
+        )
+        assert not args.account_for_embedding_in_pipeline_split, (
+            '--account-for-embedding-in-pipeline-split should not be used with '
+            '--hybrid-layer-pattern. Pipeline stage layout is defined by | separators '
+            'in the pattern.'
+        )
+        assert not args.account_for_loss_in_pipeline_split, (
+            '--account-for-loss-in-pipeline-split should not be used with '
+            '--hybrid-layer-pattern. Pipeline stage layout is defined by | separators '
+            'in the pattern.'
+        )
+
+        # Derive VPP from pipe segments in the pattern
+        hybrid_pipeline_segments = get_hybrid_total_pipeline_segment_count(
+            args.hybrid_layer_pattern
+        )
+        if hybrid_pipeline_segments == 1 and args.transformer_pipeline_model_parallel_size > 1:
+            # No pipes in pattern -- PP will be handled by select_pipeline_segment
+            # at model init time (for backwards compatibility).
+            args.virtual_pipeline_model_parallel_size = None
+        else:
+            assert hybrid_pipeline_segments % args.transformer_pipeline_model_parallel_size == 0, (
+                'The number of hybrid pipeline segments described by --hybrid-layer-pattern must '
+                'be evenly divisible by --pipeline-model-parallel-size. '
+                f'Got {hybrid_pipeline_segments} segments and '
+                f'{args.transformer_pipeline_model_parallel_size} pipeline parallel size.'
+            )
+            if hybrid_pipeline_segments > args.transformer_pipeline_model_parallel_size:
+                # Must be set here in order to assign virtual parallel ranks in
+                # training.py/get_model
+                args.virtual_pipeline_model_parallel_size = (
+                    hybrid_pipeline_segments // args.transformer_pipeline_model_parallel_size
+                )
+            else:
+                args.virtual_pipeline_model_parallel_size = None
 
     # Infer mtp_num_layers from unified pattern
-    if args.hybrid_override_pattern and sep in args.hybrid_override_pattern:
-        parsed = parse_hybrid_pattern(args.hybrid_override_pattern)
+    if args.hybrid_layer_pattern and sep in args.hybrid_layer_pattern:
+        parsed = parse_hybrid_pattern(args.hybrid_layer_pattern)
         if parsed.mtp_pattern and parsed.mtp_num_depths > 0:
             inferred_mtp_num_layers = parsed.mtp_num_depths
             if args.mtp_num_layers is None:
@@ -540,7 +690,8 @@ def validate_args(args, defaults={}):
             elif args.mtp_num_layers != inferred_mtp_num_layers:
                 warn_rank_0(
                     f"--mtp-num-layers ({args.mtp_num_layers}) conflicts with "
-                    f"MTP depth count ({inferred_mtp_num_layers}) in pattern '{args.hybrid_override_pattern}'. "
+                    f"MTP depth count ({inferred_mtp_num_layers}) in pattern "
+                    f"'{args.hybrid_layer_pattern}'. "
                     f"Using the inferred value ({inferred_mtp_num_layers}).",
                     args.rank
                 )
@@ -555,14 +706,14 @@ def validate_args(args, defaults={}):
         )
 
     # Validate MTP args for hybrid vs non-hybrid models
-    if args.is_hybrid_model:
+    if args.hybrid_layer_pattern is not None:
         # Mamba/hybrid model MTP validation
-        if args.mtp_num_layers and not (args.hybrid_override_pattern and sep in args.hybrid_override_pattern):
+        if args.mtp_num_layers and not (args.hybrid_layer_pattern and sep in args.hybrid_layer_pattern):
             # Hybrid model wants MTP but no unified pattern - check for legacy args
             if args.mtp_hybrid_override_pattern is None:
                 warn_rank_0(
                     "Hybrid model with --mtp-num-layers but no MTP pattern. "
-                    "Use unified --hybrid-override-pattern with '/' separator (e.g., 'M*M*/MM/MM') "
+                    "Use unified --hybrid-layer-pattern with '/' separator (e.g., 'M*M*/MM/MM') "
                     "or legacy --mtp-hybrid-override-pattern for old checkpoints.",
                     args.rank
                 )
@@ -575,8 +726,8 @@ def validate_args(args, defaults={}):
                 "This argument will be ignored.",
                 args.rank
             )
-    # === End of MTP validation ===
-    
+    # === End of hybrid layer pattern: deprecation handling and validation ===
+
     # Uneven virtual pipeline parallelism
     assert (
         int(args.num_layers_per_virtual_pipeline_stage is not None)
@@ -631,12 +782,14 @@ def validate_args(args, defaults={}):
         if args.virtual_pipeline_model_parallel_size == 1:
             args.virtual_pipeline_model_parallel_size = None
     else:
-        args.virtual_pipeline_model_parallel_size = None
+        # Only set VPP to None if it wasn't already derived from --hybrid-layer-pattern
+        if args.hybrid_layer_pattern is None:
+            args.virtual_pipeline_model_parallel_size = None
 
         if args.decoder_first_pipeline_num_layers is None and args.decoder_last_pipeline_num_layers is None:
             # Divisibility check not applicable for T5 models which specify encoder_num_layers
-            # and decoder_num_layers.
-            if args.num_layers is not None:
+            # and decoder_num_layers, or for hybrid models using --hybrid-layer-pattern.
+            if args.num_layers is not None and args.hybrid_layer_pattern is None:
                 num_layers = args.num_layers
 
                 if args.account_for_embedding_in_pipeline_split:
@@ -746,6 +899,13 @@ def validate_args(args, defaults={}):
     if args.fp4 and not is_te_min_version("2.7.0.dev0"):
         raise ValueError("--fp4-format requires Transformer Engine >= 2.7.0.dev0 for NVFP4BlockScaling support.")
 
+    if (
+        args.fp8_recipe == 'mxfp8'
+        and args.transformer_impl == 'inference_optimized'
+        and not is_flashinfer_min_version("0.6.4")
+    ):
+        raise ValueError("MXFP8 with inference optimized layers requires FlashInfer >= 0.6.4")
+
     if args.use_megatron_fsdp:
         # NOTE: The flag `use_custom_fsdp` is deprecated and will be removed in future versions.
         #       Please use `use_megatron_fsdp` instead, as all functionality will be migrated there.
@@ -801,12 +961,17 @@ def validate_args(args, defaults={}):
             args.accumulate_allreduce_grads_in_fp32 = True
             print_rank_0('accumulate and all-reduce gradients in fp32 for bfloat16 data type.')
     if args.cuda_graph_impl == "local" and CudaGraphScope.full_iteration in args.cuda_graph_scope:
-        if not args.inference_dynamic_batching:
-            assert not args.check_for_nan_in_loss_and_grad, \
-            "--no-check-for-nan-in-loss-and-grad should be set with full_iteration CUDA graph"
-        else:
-            assert args.fp8 is None, \
-            "fp8 is not supported with inference dynamic batching and full_iteration CUDA graph"
+        assert not args.check_for_nan_in_loss_and_grad, \
+        "--no-check-for-nan-in-loss-and-grad should be set with --cuda-graph-scope=full_iteration for training. Note: If you are trying to use full_iteration CUDA graphs for inference, please use --cuda-graph-scope full_iteration_inference instead"
+    
+    if args.cuda_graph_impl == "local" and CudaGraphScope.full_iteration_inference in args.cuda_graph_scope:
+        assert args.fp8 is None, \
+            "fp8 is not supported with inference dynamic batching and full_iteration_inference CUDA graph"
+
+    if args.cuda_graph_impl == 'local':
+        assert args.inference_dynamic_batching_num_cuda_graphs > 0 or args.inference_dynamic_batching_num_cuda_graphs == -1, \
+            'inference_dynamic_batching_num_cuda_graphs should be a positive integer or -1' \
+            '-1 means that we will automatically determine the number of CUDA graphs to capture based on the `max_requests` value.'
 
     print_rank_0('using {} for parameters ...'.format(args.params_dtype))
 
@@ -1209,6 +1374,13 @@ def validate_args(args, defaults={}):
         print('--dist-ckpt-format is deprecated and has no effect.'
               ' Use --ckpt-format to select the checkpoint format.')
 
+    if args.use_dist_ckpt and args.ckpt_fully_parallel_load:
+        if args.ckpt_fully_parallel_load_exchange_algo != "broadcast":
+            warn_rank_0(
+                "Currently only the 'broadcast' exchange algorithm is supported for fully parallel load. "
+                "Other algorithms cannot guarantee numerical stability yet."
+            )
+
     if args.load_main_params_from_ckpt:
         assert args.no_load_optim, '--load-main-params-from-ckpt must be used with --no-load-optim.'
 
@@ -1219,7 +1391,7 @@ def validate_args(args, defaults={}):
                 'Disabling --async-save.'
             )
             args.async_save = False
-
+        
     # Inference args
     if args.inference_batch_times_seqlen_threshold > -1:
         assert args.pipeline_model_parallel_size > 1, \
@@ -1376,6 +1548,20 @@ def validate_args(args, defaults={}):
             "Use --tokenizer-special-tokens instead."
         )
         args.tokenizer_special_tokens = args.tiktoken_special_tokens
+    
+    if args.tokenizer_hf_use_fast:
+        warn_rank_0(
+            "--tokenizer-hf-use-fast argument is deprecated and will be removed soon. "
+            "`use_fast` is set to True by default for HF tokenizers."
+            "Use --tokenizer-hf-no-use-fast if you want to disable `use_fast`."
+        )
+
+    if args.tokenizer_hf_include_special_tokens:
+        warn_rank_0(
+            "--tokenizer-hf-include-special-tokens argument is deprecated and will be removed soon. "
+            "`include_special_tokens` is set to True by default for HF tokenizers."
+            "Use --tokenizer-hf-no-include-special-tokens if you want to disable `include_special_tokens`."
+        )
 
     # Print arguments.
     _print_args("arguments", args)
@@ -1458,8 +1644,8 @@ def core_transformer_config_from_args(args, config_class=None):
 
     if len(args.cp_comm_type) == 1:
         kw_args['cp_comm_type'] = args.cp_comm_type[0]
-    if args.is_hybrid_model:
-        kw_args['is_hybrid_model'] = args.is_hybrid_model
+    if args.hybrid_layer_pattern is not None:
+        kw_args['is_hybrid_model'] = True
 
     kw_args['inference_sampling_seed'] = args.seed
 
@@ -1535,8 +1721,9 @@ def _add_inference_args(parser):
                        'including the shared experts if they are not overlapped with EP comm. '
                        '"moe_preprocess": captures operations in MoELayer.preprocess(). Must be used together with "moe_router". '
                        '"mamba": captures the mamba layer. '
-                       '"full_iteration": captures a whole iteration. '
-                       'full_iteration scope is only supported with --cuda-graph-impl=local, other scopes are only supported with --cuda-graph-impl=transformer_engine. '
+                       '"full_iteration": captures a whole training iteration. '
+                       '"full_iteration_inference": captures a whole inference iteration. '
+                       'full_iteration and full_iteration_inference scopes are only supported with --cuda-graph-impl=local, other scopes are only supported with --cuda-graph-impl=transformer_engine. '
                        'If not specified, the default scope is to capture the whole Transformer layer. '
                        'For backward compatibility, we still allow passing "full" to specify capturing the whole layer, and convert it to an empty list.')
     group.add_argument('--use-legacy-static-engine', action='store_true', default=False,
@@ -1569,6 +1756,10 @@ def _add_inference_args(parser):
                        'the dynamic inference context. Active requests are '
                        'paused when there are not enough active blocks available '
                        'to continue generating a request.')
+    group.add_argument('--inference-dynamic-batching-mamba-memory-ratio', type=float, default=None,
+                       help='Percentage of memory buffer to allocate for Mamba states. '
+                       'If not specified, allocates Mamba state tensors for each KV cache block. '
+                       'Only used for hybrid models.')
     group.add_argument('--inference-dynamic-batching-block-size',
                        type=int, default=256,
                        help='KV cache block size. '
@@ -1587,7 +1778,9 @@ def _add_inference_args(parser):
                        'cuda graph batch sizes range from 1 to `max_requests`. '
                        '(See `dynamic_context.py` for details on how '
                        '`max_requests` is computed). Due to rounding, the actual '
-                       'number of cuda graphs may not equal this argument.')
+                       'number of cuda graphs may not equal this argument.'
+                       'The user can also pass -1, in which case we automatically determine the number of graphs ' \
+                       'to capture based on the `max_requests`.')
     group.add_argument('--inference-dynamic-batching-track-paused-request-events',
                        action='store_true',
                        help='Track paused request ids by adding \'paused\' events '
@@ -1621,9 +1814,12 @@ def _add_inference_args(parser):
     group.add_argument('--inference-logging-step-interval', type=int, default=0,
                        help='Step interval for logging inference metrics. '
                             'Default to 0 to disable inference logging.')
+    group.add_argument('--inference-flask-server-logging', action=argparse.BooleanOptionalAction,
+                       required=False, default=False,
+                       help='Enable per-request logging in the Flask inference server.')
     group.add_argument('--inference-wandb-logging', action=argparse.BooleanOptionalAction,
                        required=False, default=False, help='Enable inference wandb logging.')
-    group.add_argument("--inference-coordinator-port", type=int, default=12346,
+    group.add_argument("--inference-coordinator-port", type=int,
                        help="This port will be used to setup the inference coordinator on node-0")
     return parser
 
@@ -1794,7 +1990,7 @@ def _add_network_size_args(parser):
     return parser
 
 def _add_straggler_detector_args(parser):
-    from megatron.training.resilience_config import StragglerDetectionConfig
+    from megatron.training.config import StragglerDetectionConfig
 
     straggler_factory = ArgumentGroupFactory(StragglerDetectionConfig)
     group = straggler_factory.build_group(parser, "straggler")
@@ -1902,7 +2098,7 @@ def _add_ft_package_args(parser):
 
 
 def _add_logging_args(parser):
-    from megatron.training.training_config import LoggerConfig
+    from megatron.training.config import LoggerConfig
 
     log_factory = ArgumentGroupFactory(LoggerConfig, exclude = ["log_throughput_to_tensorboard", "throughput_window_size", "memory_keys", "log_l2_norm_grad_to_tensorboard", "log_runtime_to_tensorboard", "runtime_time_unit", "filter_warnings", "modules_to_filter", "set_level_for_all_loggers", "save_config_filepath"])
     group = log_factory.build_group(parser, title="logging")
@@ -1987,12 +2183,6 @@ def _add_rl_args(parser):
                        help="Entropy term weight in GRPO loss.")
     group.add_argument('--grpo-filter-groups-with-same-reward', action='store_true',
                        help="Filter groups with same reward.")
-    group.add_argument('--langrl-inference-server-type', type=str,
-                       choices=['inplace_megatron', 'inplace_megatron_chat'], default='inplace_megatron',
-                       help="Type of inference server to use.")
-    group.add_argument('--langrl-inference-server-conversation-template', type=str, default=None,
-                       help="Conversation template, if using a chat server.")
-    group.add_argument('--langrl-external-server', action=argparse.BooleanOptionalAction, required=False, default=False)
     group.add_argument('--langrl-env-config', type=str, default=None,
                        help="Path to YAML config file for RL environment configuration.")
     group.add_argument('--rl-default-temperature', type=float, default=1.0,
@@ -2003,12 +2193,15 @@ def _add_rl_args(parser):
                        help="Default top-k for model inference.")
     group.add_argument('--rl-offload-optimizer-during-inference', action='store_true',
                        help='Offload optimizer state to CPU during inference/rollout to save GPU memory')
-    group.add_argument('--rl-offload-kv-cache-during-training', action=argparse.BooleanOptionalAction, default=False,
-                       help='Offload KV cache to CPU during training to save GPU memory')
-    group.add_argument('--rl-remove-kv-cache-during-training', action=argparse.BooleanOptionalAction, default=False,
-                       help='Remove KV cache during training to save GPU memory')
-    group.add_argument('--rl-reset-cuda-graphs', action=argparse.BooleanOptionalAction, type=bool, default=False,
-                       help='Reset CUDA graphs between inference/training to save GPU memory')
+    group.add_argument('--rl-kv-cache-management-mode', type=str, default='persist',
+                       choices=['persist', 'offload', 'recompute'],
+                       help='KV cache management mode during RL training: '
+                            'persist: leave KV cache in GPU memory (default), '
+                            'offload: offload KV cache to CPU during training, '
+                            'recompute: deallocate KV cache and recompute from scratch each cycle')
+    group.add_argument('--rl-persist-cuda-graphs', action=argparse.BooleanOptionalAction, type=bool, default=False,
+                       help='Persist CUDA graphs when the inference engine is suspended. '
+                            'If False, CUDA graphs are deleted on suspend and re-captured on resume.')
     group.add_argument('--rl-partial-rollouts', action=argparse.BooleanOptionalAction, default=False,
                        help='If set, use partial rollouts.')
     group.add_argument('--rl-inference-logprobs-is-correction', action=argparse.BooleanOptionalAction, type=bool, default=False,
@@ -2026,7 +2219,7 @@ def _add_rl_args(parser):
                             'round-robin: distribute bins cyclically across ranks for better load balancing')
     group.add_argument('--rl-training-cuda-graphs', action=argparse.BooleanOptionalAction, type=bool,
                        default=False,
-                       help='If set, do not call `delete_cuda_graphs` or `toggle_cuda_graphs` when the inference engine is suspended.')
+                       help='If set, do not toggle CUDA graphs on/off between inference and training phases.')
     group.add_argument('--rl-inference-tensor-model-parallel-size', type=int, default=None,
                        help='Degree of tensor model parallelism for inference for RL.')     
     group.add_argument(
@@ -2090,8 +2283,8 @@ def _add_rl_args(parser):
     return parser
 
 def _add_training_args(parser):
-    from megatron.training.training_config import TrainingConfig
-    from megatron.training.common_config import ProfilingConfig
+    from megatron.training.config import TrainingConfig
+    from megatron.training.config import ProfilingConfig
 
     prof_factory = ArgumentGroupFactory(ProfilingConfig, exclude=["record_shapes", "nvtx_ranges"])
     prof_group = prof_factory.build_group(parser, "profiling")
@@ -2190,7 +2383,7 @@ def _add_training_args(parser):
 
 
 def _add_rerun_machine_args(parser):
-    from megatron.training.resilience_config import RerunStateMachineConfig
+    from megatron.training.config import RerunStateMachineConfig
 
     rerun_factory = ArgumentGroupFactory(RerunStateMachineConfig, exclude=["check_for_nan_in_loss"])
     group = rerun_factory.build_group(parser, "rerun engine")
@@ -2199,7 +2392,7 @@ def _add_rerun_machine_args(parser):
 
 
 def _add_initialization_args(parser):
-    from megatron.training.common_config import RNGConfig
+    from megatron.training.config import RNGConfig
 
     rng_factory = ArgumentGroupFactory(RNGConfig)
     group = rng_factory.build_group(parser, "RNG and initialization")
@@ -2211,7 +2404,7 @@ def _add_initialization_args(parser):
 
 
 def _add_learning_rate_args(parser):
-    from megatron.training.training_config import SchedulerConfig
+    from megatron.training.config import SchedulerConfig
 
     sched_factory = ArgumentGroupFactory(SchedulerConfig, exclude=["no_weight_decay_cond_type"])
     group = sched_factory.build_group(parser, title="learning rate and weight decay")
@@ -2236,7 +2429,7 @@ def _add_learning_rate_args(parser):
 
 
 def _add_checkpointing_args(parser):
-    from megatron.training.training_config import CheckpointConfig
+    from megatron.training.config import CheckpointConfig
 
     ckpt_factory = ArgumentGroupFactory(CheckpointConfig, exclude=["most_recent_k", "save_tokenizer_assets", "save_optim", "save_rng", "load_optim", "load_rng"])
     group = ckpt_factory.build_group(parser, "checkpointing")
@@ -2255,6 +2448,10 @@ def _add_checkpointing_args(parser):
     group.add_argument('--dist-ckpt-format',
                        dest='dist_ckpt_format_deprecated',
                        help='Deprecated: see --ckpt-format.')
+    group.add_argument('--dist-ckpt-workers', type=int, default=1,
+                       help='Number of workers for distributed checkpointing. '
+                       'Only used for async save. '
+                       'If set to 1, the checkpointing is performed in a single process.')
     group.add_argument('--ckpt-fully-parallel-save', action='store_true',
                        dest='ckpt_fully_parallel_save_deprecated',
                        help='Deprecated: see --no-ckpt-fully-parallel-save.')
@@ -2293,7 +2490,7 @@ def _add_mixed_precision_args(parser):
 
 
 def _add_distributed_args(parser):
-    from megatron.training.common_config import DistributedInitConfig
+    from megatron.training.config import DistributedInitConfig
 
     dist_init_factory = ArgumentGroupFactory(DistributedInitConfig)
     group = dist_init_factory.build_group(parser, "distributed init")
@@ -2412,7 +2609,7 @@ def _add_distributed_args(parser):
 
 
 def _add_validation_args(parser):
-    from megatron.training.training_config import ValidationConfig
+    from megatron.training.config import ValidationConfig
 
     val_factory = ArgumentGroupFactory(ValidationConfig)
     group = val_factory.build_group(parser, "validation")
@@ -2466,10 +2663,14 @@ def _add_tokenizer_args(parser):
                             '["<unk>", "<s>", "</s>", "<mask>", "<pad>", "<cls>", "<sep>"]')
     group.add_argument('--tokenizer-sentencepiece-legacy', action='store_true', default=False,
                        help='SentencePiece tokenizer wrapper legacy behavior. Allows special tokens usage.')
-    group.add_argument('--tokenizer-hf-use-fast', action='store_true', default=False,
+    group.add_argument('--tokenizer-hf-use-fast', action='store_true', default=True,
                        help='Whether to use fast HuggingFace tokenizer.')
-    group.add_argument('--tokenizer-hf-include-special-tokens', action='store_true', default=False,
+    group.add_argument('--tokenizer-hf-include-special-tokens', action='store_true', default=True,
                        help='Converting text to ids will include special for HuggingFace tokenizer.')
+    group.add_argument('--tokenizer-hf-no-use-fast', action='store_true', default=False,
+                       help='Whether to use fast HuggingFace tokenizer.')
+    group.add_argument('--tokenizer-hf-no-include-special-tokens', action='store_true', default=False,
+                       help='Converting text to ids will not include special for HuggingFace tokenizer.')
     group.add_argument("--trust-remote-code", action="store_true", default=False,
                        help='Whether or not to allow PreTrainedTokenizer to execute remote code')
     return parser
@@ -2865,20 +3066,16 @@ def _add_experimental_args(parser):
                        'To use local spec specify local as the argument.'
                        'For more details, see the model class, '
                        '`transformer_block.py`, or `transformer_layer.py`')
-    group.add_argument('--hybrid-attention-ratio', type=float, default=0.0,
-                       help='Ratio of attention layers to total layers, in the '
-                       'range [0.0, 1.0].')
-    group.add_argument('--hybrid-mlp-ratio', type=float, default=0.0,
-                       help='Ratio of mlp layers to total layers, in the '
-                       'range [0.0, 1.0].')
+    group.add_argument('--hybrid-layer-pattern', type=str, default=None,
+                       help='Specify a hybrid layer pattern using M (mamba), * (attention), '
+                       '- (mlp), E (moe). Use | to define pipeline stage boundaries for '
+                       'flexible virtual pipeline parallel (fVPP). Use / to separate MTP '
+                       'patterns. Example: "M-M-|M-M*-|M-M-|M-M*-" or "M-M-|M-M*-/MM/MM". '
+                       'When this flag is used, it is the sole indicator that a hybrid model '
+                       'is being run.')
     group.add_argument('--hybrid-override-pattern', type=str, default=None,
-                       help='Force a specific hybrid layer pattern. The value'
-                            'should be a string of characters chosen from'
-                            'core.ssm.mamba_hybrid_layer_allocation.Symbols.'
-                            'If a value greater than 0.0 is supplied to any of the '
-                            'hybrid ratio arguments, then the number of each type'
-                            'of layer in the override pattern must match number in'
-                            'the overidden pattern')
+                       help='Deprecated. Use --hybrid-layer-pattern instead. '
+                       'If specified, its value will be forwarded to --hybrid-layer-pattern.')
     group.add_argument('--yaml-cfg', type=str, default=None,
                        help = 'Config file to add additional arguments')
 
