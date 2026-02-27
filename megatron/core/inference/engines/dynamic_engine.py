@@ -520,6 +520,10 @@ class DynamicInferenceEngine(AbstractEngine):
         self.model_parallel_num_msgs_subscriber_socket = self.zmq_context.socket(zmq.SUB)
         self.model_parallel_num_msgs_subscriber_socket.connect(mp_len_addr)
         self.model_parallel_num_msgs_subscriber_socket.setsockopt_string(zmq.SUBSCRIBE, "")
+        # Set a receive timeout so that blocking recv() calls are interruptible.
+        # Without this, non-MP-coordinator ranks block forever in schedule_requests()
+        # and their engine_loop_task can never be cancelled by asyncio.
+        self.model_parallel_num_msgs_subscriber_socket.setsockopt(zmq.RCVTIMEO, 1000)
 
         self.zmq_sockets += [
             self.model_parallel_subscriber_socket,
@@ -1597,10 +1601,17 @@ class DynamicInferenceEngine(AbstractEngine):
             if messages_to_dequeue > 0:
                 self.model_parallel_publisher_socket.send_multipart(all_messages)
         else:
-            # First, receive the number of messages to dequeue from mp-rank 0
-            messages_to_dequeue = struct.unpack(
-                '!i', self.model_parallel_num_msgs_subscriber_socket.recv()
-            )[0]
+            # First, receive the number of messages to dequeue from mp-rank 0.
+            # RCVTIMEO is set on this socket so recv() raises zmq.Again on
+            # timeout instead of blocking forever — this keeps the engine
+            # loop cancellable by asyncio.
+            try:
+                messages_to_dequeue = struct.unpack(
+                    '!i', self.model_parallel_num_msgs_subscriber_socket.recv()
+                )[0]
+            except zmq.Again:
+                range_pop()
+                return 0
             # Now, dequeue the same number of messages from the subscriber socket.
             # Note that these receives are blocking, because the messages
             # are guaranteed to be available after the tp-rank 0 has sent them.

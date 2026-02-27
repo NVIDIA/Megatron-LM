@@ -559,7 +559,7 @@ class TestCoordinator:
 
                 client.stop_engines()
 
-            await asyncio.wait_for(engine.stopped.wait(), timeout=5.0)
+            await asyncio.wait_for(engine.stopped.wait(), timeout=60.0)
             assert_state(engine, EngineState.STOPPED)
 
             if torch.distributed.get_rank() == 0:

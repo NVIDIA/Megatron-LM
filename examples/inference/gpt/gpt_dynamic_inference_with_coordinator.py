@@ -172,12 +172,14 @@ async def main(
                     )
                 )
 
-        # kill the engines and suspend the client
-        # Right now, we can only call stop when all requests are done.
-        # Todo: Make this explicit in the Client class....
+        # Pause before stopping: STOP requires PAUSED or SUSPENDED state.
+        client.pause_engines()
+
+    await engine.paused.wait()
+
+    if dist.get_rank() == 0:
         client.stop_engines()
 
-    # once the stop signal eventually makes its way to each GPU, the engines will stop.
     await engine.stopped.wait()
 
     if dist.get_rank() == 0:
