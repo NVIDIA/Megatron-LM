@@ -819,9 +819,9 @@ class _CudaGraphRunner(torch.nn.Module):
 
         is_moe = isinstance(self.base_module, MoETransformerLayer)
         if is_moe:
-            tracker = self.base_module.config.moe_metrics_tracker
+            moe_metrics_tracker = self.base_module.config.moe_metrics_tracker
             cached_aux_losses = {}
-            for name, entry in tracker.metrics.items():
+            for name, entry in moe_metrics_tracker.metrics.items():
                 cached_aux_losses[name] = entry.values.clone()
 
         self.fwd_graph = torch.cuda.CUDAGraph()
@@ -1012,8 +1012,8 @@ class _CudaGraphRunner(torch.nn.Module):
 
         if is_moe:
             for name, cached_values in cached_aux_losses.items():
-                if name in tracker.metrics:
-                    tracker.metrics[name].values.copy_(cached_values)
+                if name in moe_metrics_tracker.metrics:
+                    moe_metrics_tracker.metrics[name].values.copy_(cached_values)
 
     def create_bwd_graph(self):
         """Create a bwd cudagraph for this runner. Should be called inside
