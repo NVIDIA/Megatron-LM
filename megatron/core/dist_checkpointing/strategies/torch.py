@@ -639,6 +639,9 @@ class TorchDistSaveShardedStrategy(AsyncSaveShardedStrategy):
         self.separation_hint = separation_hint
 
         self.validated_loaded_metadata_reuse = False
+        
+        # Track source checkpoint directory for split metadata optimization
+        self.source_checkpoint_dir: Optional[Path] = None
 
     def async_save(
         self, sharded_state_dict: ShardedStateDict, checkpoint_dir: Path
@@ -664,6 +667,9 @@ class TorchDistSaveShardedStrategy(AsyncSaveShardedStrategy):
             separation_hint=self.separation_hint,
             thread_count=self.thread_count,
             use_msc=MultiStorageClientFeature.is_enabled(),
+            sequential=False,
+            use_cached_data_structure=self.use_cached_ckpt_structure,
+            source_checkpoint_dir=self.source_checkpoint_dir,
         )
         # This should be set differently if we run in a smaller process group than the default
         coordinator = 0
