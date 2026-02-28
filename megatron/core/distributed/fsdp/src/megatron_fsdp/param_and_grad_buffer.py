@@ -2688,6 +2688,8 @@ class ParamAndGradBuffer:
             optimizer_grad = group.main_grad_buffer.get_item(
                 item_id, only_shard=sharded_optimizer_state
             )
+            if self.ddp_config.use_precision_aware_optimizer:
+                setattr(self, "use_precision_aware_optimizer", True)
             if group.main_weight_buffer is not None:
                 if not getattr(self, "use_precision_aware_optimizer", False):
                     # Convert the gradient to the main weight buffer dtype.

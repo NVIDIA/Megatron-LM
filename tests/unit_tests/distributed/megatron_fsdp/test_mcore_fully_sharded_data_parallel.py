@@ -636,30 +636,52 @@ class TestMegatronFSDPE2E:
         ],
     )
     @pytest.mark.parametrize(
-        ("fsdp_sharding_strategy", "use_double_buffer"),
+        "test_specs",
         [
-            ("optim_grads_params", False),
-            ("optim_grads_params", True),
-            ("optim_grads", False),
-            ("optim", True),
+            pytest.param(
+                dict(
+                    data_parallel_sharding_strategy="optim_grads_params",
+                    use_double_buffer=False,
+                    use_precision_aware_optimizer=True,
+                    exp_avg_dtype="bf16",
+                    exp_avg_sq_dtype="bf16",
+                    bf16=True,
+                ),
+                id="optim_grads_params_no_double_buffer_precision_aware_optimizer_bf16",
+            ),
+            pytest.param(
+                dict(
+                    data_parallel_sharding_strategy="optim_grads_params",
+                    use_double_buffer=True,
+                    recompute_granularity="full",
+                    recompute_method="uniform",
+                    recompute_num_layers=1,
+                ),
+                id="optim_grads_params_double_buffer_recompute_full_uniform",
+            ),
+            pytest.param(
+                dict(data_parallel_sharding_strategy="optim_grads", use_double_buffer=True),
+                id="optim_grads_double_buffer",
+            ),
+            pytest.param(
+                dict(data_parallel_sharding_strategy="optim", use_double_buffer=False),
+                id="optim_no_double_buffer",
+            ),
         ],
     )
-    def test_compatible_with_nd_parallel(
-        self, ref_cache, nd_topology, fsdp_sharding_strategy, use_double_buffer
-    ):
+    def test_compatible_with_nd_parallel(self, ref_cache, nd_topology, test_specs):
         nd_topology_str = "_".join([f"{k}{v}" for k, v in nd_topology.items()])
         if nd_topology_str not in ref_cache:
             ref_cache[nd_topology_str] = TestMegatronFSDPE2E._training_loop(
-                use_distributed_optimizer=True
+                use_distributed_optimizer=True, **test_specs
             )
 
         outputs = TestMegatronFSDPE2E._training_loop(
             use_megatron_fsdp=True,
-            data_parallel_sharding_strategy=fsdp_sharding_strategy,
             init_model_with_meta_device=True,
             ckpt_format="fsdp_dtensor",
             gradient_accumulation_fusion=False,
-            fsdp_double_buffer=use_double_buffer,
+            **test_specs,
         )
         reference_outputs = ref_cache[nd_topology_str]
 
