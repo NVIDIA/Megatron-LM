@@ -58,11 +58,11 @@ products:
   - test_case: [gpt_dynamic_inference_tp4_etp1_pp1_ep8_16B_logitsmatch_zmq]
     products:
       - environment: [dev]
-        scope: [flaky]
+        scope: [mr, mr-github]
         platforms: [dgx_h100]
   - test_case: [gpt_dynamic_inference_tp4_etp1_pp1_ep8_16B_logitsmatch_cudagraph_zmq]
     products:
       - environment: [dev]
-        scope: [mr-github]
+        scope: [mr, mr-github]
         platforms: [dgx_h100]
   
