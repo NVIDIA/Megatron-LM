@@ -8,7 +8,7 @@ enabled.
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Optional, Protocol, Tuple, runtime_checkable
+from typing import Optional, Tuple
 
 import torch  # type: ignore[import-not-found]
 from torch.distributed import ProcessGroup  # type: ignore[import-not-found]

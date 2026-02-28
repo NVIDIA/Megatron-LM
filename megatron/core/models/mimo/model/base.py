@@ -62,9 +62,9 @@ class MimoModel(MegatronModule):
 
         # Extract language model config for partition adapter
         language_config = mimo_config.language_model_spec.params['config']
-        assert language_config.pipeline_model_parallel_size == 1, (
-            "Pipeline parallelism is not supported in MimoModel"
-        )
+        assert (
+            language_config.pipeline_model_parallel_size == 1
+        ), "Pipeline parallelism is not supported in MimoModel"
         max_seq_len = mimo_config.language_model_spec.params.get('max_sequence_length', 4096)
 
         self.partition_adapter: Optional[PartitionAdapter] = None
@@ -265,8 +265,12 @@ class MimoModel(MegatronModule):
                                     "cu_seqlens_kv": cu_seqlens,
                                     "cu_seqlens_q_padded": cu_seqlens_padded,
                                     "cu_seqlens_kv_padded": cu_seqlens_padded,
-                                    "max_seqlen_q": torch.tensor(max(seqlens_padded), dtype=torch.int32),
-                                    "max_seqlen_kv": torch.tensor(max(seqlens_padded), dtype=torch.int32),
+                                    "max_seqlen_q": torch.tensor(
+                                        max(seqlens_padded), dtype=torch.int32
+                                    ),
+                                    "max_seqlen_kv": torch.tensor(
+                                        max(seqlens_padded), dtype=torch.int32
+                                    ),
                                 }
 
         Returns:
