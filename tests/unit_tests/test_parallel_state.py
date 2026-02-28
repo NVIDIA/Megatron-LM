@@ -6,6 +6,7 @@ import pytest
 import torch
 
 import megatron.core.parallel_state as ps
+from megatron.core.process_groups_config import ProcessGroupCollection
 from tests.unit_tests.test_utilities import Utils
 
 rank = Utils.rank
@@ -533,28 +534,96 @@ def test_hybrid_dp_cp_groups(world_size, tp_size, cp_size, dp_size):
 
 
 def test_separate_all_gather_group():
-    """Test separate all-gather group for improved communication overlap."""
-    # Test without creating AG group (default)
-    Utils.initialize_model_parallel(context_parallel_size=world_size, create_all_gather_group=False)
-    assert not ps.has_separate_all_gather_group()
-    assert ps._DATA_PARALLEL_GROUP_WITH_CP_AG is None
+    """Test AG groups passed via ProcessGroupCollection for AG/RS overlap."""
+    # Initialize model parallel
+    Utils.initialize_model_parallel(context_parallel_size=world_size)
+
+    # Get ranks for creating AG groups (as users will do in their training scripts)
+    dp_cp_ranks = ps.get_data_parallel_global_ranks(with_context_parallel=True)
+
+    # Create separate AG group with same ranks as dp-cp group
+    # This is what enables AG/RS overlap - separate communicator, same ranks
+    dp_cp_ag_group = torch.distributed.new_group(ranks=dp_cp_ranks, backend='nccl')
+
+    # Create ProcessGroupCollection and populate with standard groups
+    pg_collection = ProcessGroupCollection.use_mpu_process_groups()
+
+    # Set AG group (this is what users will do to enable AG/RS overlap)
+    pg_collection.dp_cp_ag = dp_cp_ag_group
+
+    # Verify AG group is accessible from ProcessGroupCollection
+    assert hasattr(pg_collection, 'dp_cp_ag')
+    assert pg_collection.dp_cp_ag is not None
+    assert pg_collection.dp_cp_ag == dp_cp_ag_group
+
+    # Verify AG group has same ranks as regular dp-cp group but different communicator
+    regular_group = pg_collection.dp_cp
+    assert regular_group is not None
+
+    ag_ranks = torch.distributed.get_process_group_ranks(dp_cp_ag_group)
+    regular_ranks = torch.distributed.get_process_group_ranks(regular_group)
+    assert ag_ranks == regular_ranks, "AG group should have same ranks as dp-cp group"
+    assert dp_cp_ag_group != regular_group, "AG group should be a different communicator"
+
     Utils.destroy_model_parallel()
 
-    # Test with creating AG group
-    Utils.initialize_model_parallel(context_parallel_size=world_size, create_all_gather_group=True)
-    assert ps.has_separate_all_gather_group()
-    assert ps._DATA_PARALLEL_GROUP_WITH_CP_AG is not None
 
-    # Verify it returns the correct group
-    ag_group = ps.get_data_parallel_group(with_context_parallel=True, independent_all_gather=True)
-    regular_group = ps.get_data_parallel_group(
-        with_context_parallel=True, independent_all_gather=False
+def test_expert_all_gather_group():
+    """Test expert AG groups for MoE models with AG/RS overlap."""
+    # Initialize model parallel with expert parallelism
+    Utils.initialize_model_parallel(
+        expert_model_parallel_size=min(2, world_size),
+        context_parallel_size=max(1, world_size // 2) if world_size > 1 else 1,
     )
-    assert ag_group is not None
-    assert regular_group is not None
-    # They should have the same ranks but different communicators
-    ag_ranks = torch.distributed.get_process_group_ranks(ag_group)
-    regular_ranks = torch.distributed.get_process_group_ranks(regular_group)
-    assert ag_ranks == regular_ranks
+
+    # Get ranks for both regular and expert AG groups
+    dp_cp_ranks = ps.get_data_parallel_global_ranks(with_context_parallel=True)
+    expt_dp_ranks = ps.get_expert_data_parallel_global_ranks()
+
+    # Create AG groups for both regular and expert parameters
+    dp_cp_ag_group = torch.distributed.new_group(ranks=dp_cp_ranks, backend='nccl')
+    expt_dp_ag_group = torch.distributed.new_group(ranks=expt_dp_ranks, backend='nccl')
+
+    # Create ProcessGroupCollection with AG groups
+    pg_collection = ProcessGroupCollection.use_mpu_process_groups()
+    pg_collection.dp_cp_ag = dp_cp_ag_group
+    pg_collection.expt_dp_ag = expt_dp_ag_group
+
+    # Verify both AG groups are set
+    assert pg_collection.dp_cp_ag is not None
+    assert pg_collection.expt_dp_ag is not None
+
+    # Verify expert AG group has same ranks as expert dp group
+    expt_dp_group = pg_collection.expt_dp
+    if expt_dp_group is not None:
+        expt_ag_ranks = torch.distributed.get_process_group_ranks(expt_dp_ag_group)
+        expt_dp_ranks_actual = torch.distributed.get_process_group_ranks(expt_dp_group)
+        assert (
+            expt_ag_ranks == expt_dp_ranks_actual
+        ), "Expert AG group should have same ranks as expert dp group"
+        assert (
+            expt_dp_ag_group != expt_dp_group
+        ), "Expert AG group should be a different communicator"
+
+    Utils.destroy_model_parallel()
+
+
+def test_process_group_collection_defaults():
+    """Test that ProcessGroupCollection initializes AG groups to None by default."""
+    # Initialize model parallel
+    Utils.initialize_model_parallel(context_parallel_size=world_size)
+
+    # Create ProcessGroupCollection without setting AG groups
+    pg_collection = ProcessGroupCollection.use_mpu_process_groups()
+
+    # AG groups should be None by default (users must create them explicitly)
+    assert hasattr(pg_collection, 'dp_cp_ag')
+    assert hasattr(pg_collection, 'expt_dp_ag')
+    assert pg_collection.dp_cp_ag is None, "dp_cp_ag should default to None"
+    assert pg_collection.expt_dp_ag is None, "expt_dp_ag should default to None"
+
+    # Regular groups should still work
+    assert pg_collection.dp is not None
+    assert pg_collection.dp_cp is not None
 
     Utils.destroy_model_parallel()

@@ -265,6 +265,12 @@ class FullyShardedDataParallel(_BaseDataParallel):
             single_rank_group = dist.new_group(ranks=[dist.get_rank()])
             expt_tp_group = single_rank_group
 
+        # Extract AG groups from pg_collection for explicit passing
+        dp_cp_ag = getattr(pg_collection, 'dp_cp_ag', None) if pg_collection is not None else None
+        expt_dp_ag = (
+            getattr(pg_collection, 'expt_dp_ag', None) if pg_collection is not None else None
+        )
+
         if enable_hsdp:
             if expt_dp_group is not None:
                 expt_mesh = _get_hsdp_tp_mesh(
@@ -293,6 +299,8 @@ class FullyShardedDataParallel(_BaseDataParallel):
                 hybrid_fsdp_group=hybrid_fsdp_group,
                 hybrid_fsdp_expt_group=hybrid_fsdp_expt_group,
                 expt_device_mesh=expt_device_mesh,
+                fsdp_group_ag=dp_cp_ag,
+                expt_fsdp_group_ag=expt_dp_ag,
             )
         else:
             if ep_group is not None:
@@ -317,6 +325,8 @@ class FullyShardedDataParallel(_BaseDataParallel):
                 dp_shard_dim="dp_cp",
                 tp_dim="tp",
                 expt_device_mesh=expt_device_mesh,
+                fsdp_group_ag=dp_cp_ag,
+                expt_fsdp_group_ag=expt_dp_ag,
             )
 
         self.tp_group = tp_group

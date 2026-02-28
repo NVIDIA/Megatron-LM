@@ -118,7 +118,6 @@ _HYBRID_DP_CP_GROUPS = {}
 
 # Data parallel group information with context parallel combined.
 _DATA_PARALLEL_GROUP_WITH_CP = None
-_DATA_PARALLEL_GROUP_WITH_CP_AG = None
 _DATA_PARALLEL_GROUP_WITH_CP_GLOO = None
 _DATA_PARALLEL_GLOBAL_RANKS_WITH_CP = None
 
@@ -238,6 +237,11 @@ def create_group(
             # So need to unset timeout here if caller doesn't set value. Otherwise there is
             # type error.
             kwargs.pop("timeout")
+    # Remove None values to avoid passing them to torch.distributed.new_group
+    if pg_options is None:
+        kwargs.pop("pg_options")
+    if backend is None:
+        kwargs.pop("backend")
     group = torch.distributed.new_group(**kwargs)
     global _global_process_group_list
     if _global_process_group_list is None:
@@ -565,7 +569,6 @@ def initialize_model_parallel(
     create_gloo_process_groups: bool = True,
     high_priority_stream_groups: Optional[List[str]] = None,
     sharp_enabled_group: Optional[str] = None,
-    create_all_gather_group: Optional[bool] = False,
 ) -> None:
     """Initialize model data parallel groups.
 
@@ -679,13 +682,6 @@ def initialize_model_parallel(
             This option is only valid when use_sharp is True.
             By default (None), it is enabled from dp group.
             Available options (choose one): [dp, dp_replica]
-
-        create_all_gather_group (bool, default = False):
-            Create a separate process group for all-gather operations to avoid
-            head-of-line blocking with reduce-scatter operations. When enabled,
-            creates an additional NCCL communicator with identical ranks as the
-            dp-cp group but with independent progress engines for better communication
-            overlap.
 
     Let's say we have a total of 16 GPUs denoted by g0 ... g15 and we
     use 2 GPUs to parallelize the model tensor, and 4 GPUs to parallelize
@@ -823,7 +819,6 @@ def initialize_model_parallel(
     global _DATA_PARALLEL_GROUP_GLOO
     global _DATA_PARALLEL_GLOBAL_RANKS
     global _DATA_PARALLEL_GROUP_WITH_CP
-    global _DATA_PARALLEL_GROUP_WITH_CP_AG
     global _DATA_PARALLEL_GROUP_WITH_CP_GLOO
     global _DATA_PARALLEL_GLOBAL_RANKS_WITH_CP
     global _INTRA_PARTIAL_DATA_PARALLEL_GROUP_WITH_CP
@@ -855,15 +850,6 @@ def initialize_model_parallel(
             pg_options=get_nccl_options("dp_cp", nccl_comm_cfgs),
             group_desc="DATA_PARALLEL_GROUP_WITH_CP",
         )
-        if create_all_gather_group:
-            group_with_cp_ag = create_group(
-                ranks_with_cp,
-                timeout=timeout,
-                pg_options=get_nccl_options("dp_cp", nccl_comm_cfgs),
-                group_desc="DATA_PARALLEL_GROUP_WITH_CP_AG",
-            )
-        else:
-            group_with_cp_ag = None
         if create_gloo_process_groups:
             group_with_cp_gloo = create_group(
                 ranks_with_cp,
@@ -875,7 +861,6 @@ def initialize_model_parallel(
             group_with_cp_gloo = None
         if rank in ranks_with_cp:
             _DATA_PARALLEL_GROUP_WITH_CP = group_with_cp
-            _DATA_PARALLEL_GROUP_WITH_CP_AG = group_with_cp_ag
             _DATA_PARALLEL_GROUP_WITH_CP_GLOO = group_with_cp_gloo
             _DATA_PARALLEL_GLOBAL_RANKS_WITH_CP = ranks_with_cp
 
@@ -1354,6 +1339,91 @@ def initialize_model_parallel(
     _set_global_memory_buffer()
 
 
+def create_all_gather_groups(for_expert_parallelism=False, timeout=None, nccl_comm_cfgs=None):
+    """
+    Helper function to create all-gather process groups for AG/RS overlap.
+
+    Creates separate communicators with the same ranks as data parallel groups
+    to enable overlapping all-gather operations with reduce-scatter operations.
+
+    Args:
+        for_expert_parallelism (bool): If True, also creates AG group for expert parameters.
+        timeout (timedelta): Timeout for distributed collectives.
+        nccl_comm_cfgs (dict): NCCL communicator configurations.
+
+    Returns:
+        tuple: (dp_cp_ag_group, expt_dp_ag_group) where expt_dp_ag_group is None
+               if for_expert_parallelism=False.
+
+    Example:
+        # After initialize_model_parallel():
+        dp_cp_ag, expt_dp_ag = parallel_state.create_all_gather_groups(
+            for_expert_parallelism=True
+        )
+
+        # Add to ProcessGroupCollection:
+        pg_collection = ProcessGroupCollection.use_mpu_process_groups()
+        pg_collection.dp_cp_ag = dp_cp_ag
+        pg_collection.expt_dp_ag = expt_dp_ag
+    """
+    if not is_initialized():
+        raise RuntimeError(
+            "create_all_gather_groups() requires parallel state to be initialized. "
+            "Call initialize_model_parallel() first."
+        )
+
+    rank = torch.distributed.get_rank()
+    pp_size = get_pipeline_model_parallel_world_size()
+    cp_size = get_context_parallel_world_size()
+    tp_size = get_tensor_model_parallel_world_size()
+    ep_size = get_expert_model_parallel_world_size()
+    dp_size = get_data_parallel_world_size()
+
+    # Create regular DP all-gather group
+    dp_cp_ag_group = None
+    decoder_rank_gen = RankGenerator(
+        tp=tp_size, ep=1, dp=dp_size, pp=pp_size, cp=cp_size, order='tp-cp-ep-dp-pp', rank_offset=0
+    )
+
+    for ranks_with_cp in decoder_rank_gen.get_ranks('dp-cp'):
+        group_with_cp_ag = create_group(
+            ranks_with_cp,
+            timeout=timeout,
+            pg_options=get_nccl_options('dp_cp', nccl_comm_cfgs or {}),
+            group_desc='DATA_PARALLEL_GROUP_WITH_CP_AG',
+        )
+        if rank in ranks_with_cp:
+            dp_cp_ag_group = group_with_cp_ag
+
+    # Create expert DP all-gather group if requested
+    expt_dp_ag_group = None
+    if for_expert_parallelism and ep_size > 1:
+        expert_tp_size = get_expert_tensor_parallel_world_size()
+        expert_dp_size = get_expert_data_parallel_world_size()
+
+        expert_rank_gen = RankGenerator(
+            tp=expert_tp_size,
+            ep=ep_size,
+            dp=expert_dp_size,
+            pp=pp_size,
+            cp=1,
+            order='tp-cp-ep-dp-pp',
+            rank_offset=0,
+        )
+
+        for expert_dp_ranks in expert_rank_gen.get_ranks('dp'):
+            expert_dp_ag = create_group(
+                expert_dp_ranks,
+                timeout=timeout,
+                pg_options=get_nccl_options("ep_dp", nccl_comm_cfgs or {}),
+                group_desc='EXPERT_DATA_PARALLEL_GROUP_AG',
+            )
+            if rank in expert_dp_ranks:
+                expt_dp_ag_group = expert_dp_ag
+
+    return dp_cp_ag_group, expt_dp_ag_group
+
+
 def is_initialized():
     """Useful for code segments that may be accessed with or without mpu initialization"""
     return _DATA_PARALLEL_GROUP is not None
@@ -1395,9 +1465,7 @@ def get_pipeline_model_parallel_group(check_initialized=True):
     return _PIPELINE_MODEL_PARALLEL_GROUP
 
 
-def get_data_parallel_group(
-    with_context_parallel=False, partial_data_parallel=False, independent_all_gather=False
-):
+def get_data_parallel_group(with_context_parallel=False, partial_data_parallel=False):
     """Get the data-parallel group the caller rank belongs to."""
     if with_context_parallel:
         if partial_data_parallel:
@@ -1405,11 +1473,6 @@ def get_data_parallel_group(
                 _INTRA_PARTIAL_DATA_PARALLEL_GROUP_WITH_CP is not None
             ), "Intra partial data parallel group is not initialized"
             return _INTRA_PARTIAL_DATA_PARALLEL_GROUP_WITH_CP
-        if independent_all_gather:
-            assert (
-                _DATA_PARALLEL_GROUP_WITH_CP_AG is not None
-            ), "data parallel group with context parallel AG is not initialized"
-            return _DATA_PARALLEL_GROUP_WITH_CP_AG
         assert (
             _DATA_PARALLEL_GROUP_WITH_CP is not None
         ), "data parallel group with context parallel combined is not initialized"
@@ -1418,15 +1481,6 @@ def get_data_parallel_group(
         assert _DATA_PARALLEL_GROUP is not None, "data parallel group is not initialized"
         assert partial_data_parallel == False, "Partial DP for Optimizer needs to include CP"
         return _DATA_PARALLEL_GROUP
-
-
-def has_separate_all_gather_group() -> bool:
-    """Check if a separate all-gather process group has been created.
-
-    Returns True if a dedicated all-gather process group exists for improved
-    communication overlap, False otherwise.
-    """
-    return _DATA_PARALLEL_GROUP_WITH_CP_AG is not None
 
 
 def get_data_parallel_group_gloo(with_context_parallel=False, partial_data_parallel=False):
@@ -2078,9 +2132,6 @@ def destroy_model_parallel():
 
     global _DATA_PARALLEL_GROUP_WITH_CP
     _DATA_PARALLEL_GROUP_WITH_CP = None
-
-    global _DATA_PARALLEL_GROUP_WITH_CP_AG
-    _DATA_PARALLEL_GROUP_WITH_CP_AG = None
 
     global _CONTEXT_PARALLEL_GROUP
     _CONTEXT_PARALLEL_GROUP = None

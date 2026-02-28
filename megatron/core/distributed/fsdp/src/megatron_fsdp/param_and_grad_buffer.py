@@ -1665,6 +1665,16 @@ class ParamAndGradBuffer:
                         is_expert_parallel=False, independent_all_gather=True
                     )
                 )
+            if (
+                self.dist_index.get_fsdp_group(is_expert_parallel=True, independent_all_gather=True)
+                is not None
+            ):
+                # Expert all-gather group used when overlapping all-gather and gradient reduction.
+                self.ubr_groups.append(
+                    self.dist_index.get_fsdp_group(
+                        is_expert_parallel=True, independent_all_gather=True
+                    )
+                )
 
             log_single_rank(
                 logger,
@@ -1962,14 +1972,14 @@ class ParamAndGradBuffer:
                     is_expert_parallel=group.is_expert_param
                 )
 
-            # When --create-all-gather-group is enabled, use a separate process group for
-            # all-gather operations (model_weight_buffer) to enable overlap with gradient reduction
-            # operations (main_grad_buffer). This avoids head-of-line blocking between forward
-            # all-gather and backward reduce-scatter on the same communicator.
+            # Use separate process group for all-gather operations (model_weight_buffer)
+            # to enable overlap with gradient reduction operations (main_grad_buffer).
+            # This avoids head-of-line blocking between forward all-gather and backward
+            # reduce-scatter on the same communicator.
             model_wbuf_dp_group = main_buf_dp_group
-            if not group.is_expert_param and not should_create_hfsdp_wbuf_and_gbuf:
+            if not should_create_hfsdp_wbuf_and_gbuf:
                 ag_group = self.dist_index.get_fsdp_group(
-                    is_expert_parallel=False, independent_all_gather=True
+                    is_expert_parallel=group.is_expert_param, independent_all_gather=True
                 )
                 if ag_group is not None:
                     model_wbuf_dp_group = ag_group
