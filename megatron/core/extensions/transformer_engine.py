@@ -17,6 +17,7 @@ from torch import Tensor
 from torch.nn.parameter import Parameter
 from typing_extensions import override
 
+from megatron.core.activations import quick_gelu, squared_relu
 from megatron.core.dist_checkpointing.mapping import ShardedStateDict
 from megatron.core.dist_checkpointing.utils import replace_prefix_for_sharding
 from megatron.core.enums import Fp4Recipe, Fp8Recipe
@@ -397,6 +398,26 @@ def split_te_layernorm_column_parallel_linear(
 
 if HAVE_TE and is_te_min_version("1.13.0"):
 
+    # Mapping from (activation_func, gated_linear_unit) to TE activation operation
+    _activation_types: dict[tuple[Callable, bool], te.pytorch.ops.FusibleOperation] = {
+        (F.gelu, False): te.pytorch.ops.GELU,
+        (F.gelu, True): te.pytorch.ops.GEGLU,
+        (F.silu, True): te.pytorch.ops.SwiGLU,
+        (F.relu, False): te.pytorch.ops.ReLU,
+        (F.relu, True): te.pytorch.ops.ReGLU,
+    }
+
+    if is_te_min_version("2.8.0"):
+        _activation_types.update(
+            {
+                (quick_gelu, False): te.pytorch.ops.QGELU,
+                (quick_gelu, True): te.pytorch.ops.QGEGLU,
+                (squared_relu, False): te.pytorch.ops.SReLU,
+                (squared_relu, True): te.pytorch.ops.SReGLU,
+                (F.silu, False): te.pytorch.ops.SiLU,
+            }
+        )
+
     class TEActivationOp:
         """
         A conditional wrapper to initialize an instance of Transformer-Engine's activation
@@ -405,31 +426,23 @@ if HAVE_TE and is_te_min_version("1.13.0"):
 
         def __new__(cls, config: TransformerConfig):
 
-            layer_type = None
-            if config.gated_linear_unit:
-                if config.activation_func == F.silu:
-                    layer_type = te.pytorch.ops.SwiGLU
-                elif config.activation_func == F.gelu:
-                    layer_type = te.pytorch.ops.GEGLU
-                elif config.activation_func == F.silu:
-                    layer_type = te.pytorch.ops.ReGLU
-            else:
-                if config.activation_func == F.gelu:
-                    layer_type = te.pytorch.ops.GELU
-                elif config.activation_func == F.silu:
-                    layer_type = te.pytorch.ops.ReLU
+            layer_type = _activation_types.get((config.activation_func, config.gated_linear_unit))
             if layer_type is None:
-                raise Exception(
-                    'Only SwiGLU, GEGLU, ReGLU, GELU, ReLU are supported by '
-                    'transformer engine. Please set use_te_activation_func=False'
+                raise NotImplementedError(
+                    'TE supports SwiGLU, GEGLU, ReGLU, GELU, ReLU from v1.13, '
+                    'and QuickGELU, QuickGEGLU, SquaredReLU, SquaredReGLU, SiLU from v2.8.0. '
+                    f'activation_func={config.activation_func} with '
+                    f'gated_linear_unit={config.gated_linear_unit} is not supported. '
+                    'Please set use_te_activation_func=False'
                 )
-            activation_func_kwargs = {}
-            if config.activation_func_fp8_input_store:
-                activation_func_kwargs["cache_quantized_input"] = True
-            layer = layer_type(**activation_func_kwargs)
+            activation_kwargs = {}
+            if is_te_min_version("2.3"):
+                activation_kwargs["cache_quantized_input"] = config.activation_func_fp8_input_store
+            layer = layer_type(**activation_kwargs)
             return layer
 
 else:
+    _activation_types: dict[tuple[Callable, bool], te.pytorch.ops.FusibleOperation] = {}
     TEActivationOp = None
 
 
@@ -2065,28 +2078,15 @@ if HAVE_TE and is_te_min_version("1.13.0"):
             """Construct activation op."""
 
             # Get op type
-            op_type = None
-            if (activation_func, gated_linear_unit) == (F.gelu, False):
-                op_type = te.pytorch.ops.GELU
-            elif (activation_func, gated_linear_unit) == (F.gelu, True):
-                op_type = te.pytorch.ops.GEGLU
-            elif (activation_func, gated_linear_unit) == (F.silu, False):
-                if not is_te_min_version("2.8.0"):
-                    raise NotImplementedError("SiLU activation requires Transformer Engine 2.8+")
-                op_type = te.pytorch.ops.SiLU
-            elif (activation_func, gated_linear_unit) == (F.silu, True):
-                op_type = te.pytorch.ops.SwiGLU
-            elif (activation_func, gated_linear_unit) == (F.relu, False):
-                op_type = te.pytorch.ops.ReLU
-            elif (activation_func, gated_linear_unit) == (F.relu, True):
-                op_type = te.pytorch.ops.ReGLU
+            op_type = _activation_types.get((activation_func, gated_linear_unit))
 
             # Could not find corresponding activation op
             if op_type is None:
                 raise NotImplementedError(
-                    "Transformer Engine operation-based API does not support "
-                    f"activation_func={activation_func}, "
-                    f"gated_linear_unit={gated_linear_unit}"
+                    "TE supports SwiGLU, GEGLU, ReGLU, GELU, ReLU from v1.13, "
+                    "and QuickGELU, QuickGEGLU, SquaredReLU, SquaredReGLU, SiLU from v2.8.0. "
+                    f"activation_func={activation_func} with "
+                    f"gated_linear_unit={gated_linear_unit} is not supported. "
                 )
 
             # Construct op
