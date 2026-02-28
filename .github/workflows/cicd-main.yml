@@ -52,7 +52,7 @@ jobs:
       DISABLE_EXTERNAL_CONTRIBUTOR: ${{ vars.DISABLE_EXTERNAL_CONTRIBUTOR }}
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
         with:
           token: ${{ env.GITHUB_TOKEN }}
 
@@ -145,7 +145,7 @@ jobs:
       )
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
         with:
           fetch-depth: 0
 
@@ -208,7 +208,7 @@ jobs:
       mbridge-test-suite: ${{ steps.select-mbridge-test-suite.outputs.main }}
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
 
       - name: Get PR info
         id: get-pr-info
@@ -251,7 +251,7 @@ jobs:
         uses: nv-gha-runners/get-pr-info@main
 
       - name: Checkout MBridge and create testing branch
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
         with:
           ref: main
           repository: NVIDIA-NeMo/Megatron-Bridge
@@ -347,12 +347,12 @@ jobs:
           echo "main=${SHA}" | tee -a "$GITHUB_OUTPUT"
 
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
         with:
           ref: ${{ steps.sha.outputs.main }}
 
       - name: Setup python
-        uses: actions/setup-python@v5
+        uses: actions/setup-python@v6
         with:
           python-version: 3.12
 
@@ -470,7 +470,7 @@ jobs:
       && !cancelled()
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
       - name: Parse unit tests
         id: parse-unit-tests
         run: |
@@ -510,7 +510,7 @@ jobs:
       PIP_ROOT_USER_ACTION: ignore
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
       - name: main
         uses: ./.github/actions
         with:
@@ -545,7 +545,7 @@ jobs:
       integration-tests: ${{ steps.main.outputs.integration-tests }}
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
 
       - name: Get PR info
         id: get-pr-info
@@ -649,7 +649,7 @@ jobs:
       && !cancelled()
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
       - name: main
         uses: ./.github/actions
         with:
@@ -682,7 +682,7 @@ jobs:
     permissions: write-all
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
 
       - name: Get workflow result
         id: result
@@ -719,7 +719,7 @@ jobs:
       && github.repository == 'NVIDIA/Megatron-LM'
     steps:
       - name: Generate fake coverage report
-        uses: actions/github-script@v6
+        uses: actions/github-script@v8
         with:
           github-token: ${{ secrets.PAT }}
           script: |
@@ -747,10 +747,10 @@ jobs:
         flag: [unit-test]
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
 
       - name: Download coverage reports of current branch
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v7
         with:
           pattern: coverage-${{ matrix.flag }}-*
 
@@ -778,7 +778,7 @@ jobs:
           flags: ${{ matrix.flag }}
 
       - name: Upload artifacts
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v6
         with:
           name: coverage-${{ matrix.flag }}-aggregated
           path: |
@@ -799,7 +799,7 @@ jobs:
           echo "pr_number=$PR_NUMBER" >> $GITHUB_OUTPUT
 
       - name: Comment on PR with action run URL
-        uses: actions/github-script@v7
+        uses: actions/github-script@v8
         with:
           github-token: ${{ secrets.PAT }}
           script: |
