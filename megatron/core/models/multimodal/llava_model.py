@@ -479,7 +479,8 @@ class LLaVAModel(MegatronModule):
         Currently, we assume the language model uses a causal mask.
 
         Returns:
-            final_embedding (torch.Tensor): image and text embeddings [combined_seq_len, b, h].
+            final_embedding (torch.Tensor): image and text embeddings [combined_seq_len, b, h] if
+                context_parallel_lm == 1 else [b, combined_seq_len, h].
             final_labels (torch.Tensor): labels for image and text positions [b, combined_seq_len].
             final_loss_mask (torch.Tensor): loss mask [b, combined_seq_len].
         """
@@ -913,6 +914,10 @@ class LLaVAModel(MegatronModule):
         if num_image_tiles is None and images is not None:
             num_image_tiles = torch.ones(images.shape[0], dtype=torch.int, device=input_ids.device)
 
+        # if context_parallel_lm == 1:
+        #   [combined_seq_len, b, h_language], [b, combined_seq_len], [b, combined_seq_len]
+        # else:
+        #   [b, combined_seq_len, h_language], [b, combined_seq_len], [b, combined_seq_len]
         combined_embeddings, new_labels, new_loss_mask = self._preprocess_data(
             image_embeddings,
             language_embeddings,
@@ -923,7 +928,7 @@ class LLaVAModel(MegatronModule):
             inference_context,
             image_token_index if image_token_index is not None else self.image_token_index,
             num_image_tiles,
-        )  # [combined_seq_len, b, h_language], [b, combined_seq_len], [b, combined_seq_len]
+        )
 
         if self.context_parallel_lm > 1 or self.sequence_parallel_lm:
             combined_embeddings, new_labels, new_loss_mask, packed_seq_params = (
