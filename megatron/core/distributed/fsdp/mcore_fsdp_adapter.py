@@ -45,7 +45,11 @@ from megatron.core.transformer.transformer_layer import TransformerLayer
 from megatron.core.utils import is_te_min_version, log_single_rank
 
 try:
-    from megatron.core.distributed.fsdp.src.megatron_fsdp import FSDPDistributedIndex, MegatronFSDP
+    from megatron.core.distributed.fsdp.src.megatron_fsdp import (
+        FSDPDistributedIndex,
+        MegatronFSDP,
+        MixedPrecisionPolicy,
+    )
 
     HAVE_MEGATRON_FSDP = True
 except ImportError as import_megatron_fsdp_error:
@@ -66,6 +70,9 @@ class FullyShardedDataParallel(_BaseDataParallel):
         ddp_config: DistributedDataParallelConfig,
         module: torch.nn.Module,
         fsdp_unit_modules: Optional[List[torch.nn.Module]] = None,
+        main_params_dtype: Optional[torch.dtype] = torch.float32,
+        main_grads_dtype: Optional[torch.dtype] = torch.float32,
+        grad_comm_dtype: Optional[torch.dtype] = torch.float32,
         disable_bucketing: bool = False,
         device: Optional[torch.device] = None,
         pg_collection: Optional[ProcessGroupCollection] = None,
@@ -81,6 +88,17 @@ class FullyShardedDataParallel(_BaseDataParallel):
             logger,
             logging.INFO,
             f'Setting up DistributedDataParallel with config {self.ddp_config}',
+        )
+        self.mp_policy = MixedPrecisionPolicy(
+            main_params_dtype=main_params_dtype,
+            # Grandfathered Argument: grad_reduce_in_fp32
+            main_grads_dtype=torch.float32 if ddp_config.grad_reduce_in_fp32 else main_grads_dtype,
+            grad_comm_dtype=grad_comm_dtype,
+        )
+        log_single_rank(
+            logger,
+            logging.INFO,
+            f'Setting up Megatron-FSDP MixedPrecisionPolicy with config {self.mp_policy}',
         )
 
         self.megatron_fsdp_dist_index = self._init_dist_index(pg_collection)
@@ -116,6 +134,7 @@ class FullyShardedDataParallel(_BaseDataParallel):
             config=config,
             module=MegatronFSDP(
                 ddp_config=ddp_config,
+                mixed_precision_policy=self.mp_policy,
                 module=module,
                 fsdp_unit_modules=self.fsdp_unit_modules,
                 disable_bucketing=disable_bucketing,

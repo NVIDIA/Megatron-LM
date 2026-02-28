@@ -14,6 +14,7 @@
 
 import logging
 from contextlib import nullcontext
+from dataclasses import dataclass
 from importlib.metadata import version
 from typing import List, Optional, Tuple
 
@@ -359,3 +360,33 @@ def get_quantized_model_init_context_cls():
             f"Verify TransformerEngine is installed (TE_INSTALLED={HAVE_TE})."
         )
     return QUANTIZED_MODEL_INIT_CLASS
+
+
+@dataclass(frozen=True)
+class MixedPrecisionPolicy:
+    """Megatron-FSDP Mixed Precision Dataclass"""
+
+    main_params_dtype: Optional[torch.dtype] = torch.float32
+    """Data type for the main weight buffer utilized for distributed optimization
+      and quantization with Megatron-FSDP. If set to None, the model compute weight
+      buffer will take the role of the main weights, or when no sharding is applied,
+      the native model weights become the main weights. Defaults to torch.float32.
+    """
+
+    main_grads_dtype: Optional[torch.dtype] = torch.float32
+    """Data type for the main gradient buffer utilized for distributed optimization with
+      Megatron-FSDP. If set to None, main gradients will match the dtype of the model
+      compute parameters specified by the user model. Defaults to torch.float32.
+    """
+
+    grad_comm_dtype: Optional[torch.dtype] = torch.float32
+    """Data type for gradient gather / scatter communications. Can be utilized to reduce
+      communication latency, but adds overhead for type-casting and copy operations.
+      If using NCCL UBR v2.27+, gradient reduction may be performed in high-precision
+      depending on the network domain (NVLink or IB), and can enable mixed-precision
+      communication and accumulation, e.g. setting grad_comm_dtype to BF16 can support
+      FP32 reduction even though we have BF16 input and output communication buffers.
+      If set to None, the main_grads_dtype is used. Defaults to torch.float32. If using
+      `no_shard`, `optim`, or a `FixedPoolAllocator` (`fsdp_double_buffer`), allocating
+      `dtype`-custom gradient communication buffers (per FSDP group) adds memory overhead.
+    """
