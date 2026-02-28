@@ -826,10 +826,12 @@ def validate_args(args, defaults={}):
     )
 
     if args.overlap_param_gather:
-        assert args.use_distributed_optimizer or args.use_megatron_fsdp, \
-            '--overlap-param-gather only supported with distributed optimizer or megatron fsdp'
-        assert args.overlap_grad_reduce, \
-            'Must use --overlap-param-gather with --overlap-grad-reduce'
+        assert args.use_distributed_optimizer or args.use_megatron_fsdp \
+            or ('dist' in args.optimizer), \
+            '--overlap-param-gather only supported with distributed optimizer, megatron fsdp, or layer-wise optimizer'
+        if 'dist' not in args.optimizer:
+            assert args.overlap_grad_reduce, \
+                'Must use --overlap-param-gather with --overlap-grad-reduce'
         assert not args.use_legacy_models, \
             '--overlap-param-gather only supported with MCore models'
 
@@ -1426,9 +1428,9 @@ def validate_args(args, defaults={}):
     # Muon optimizer check
     if 'muon' in args.optimizer:
 
-        # TODO: remove these checks once we support them
-        assert not args.overlap_grad_reduce, "Muon optimizer does not support overlap grad reduce for now."
-        assert not args.overlap_param_gather, "Muon optimizer does not support overlap param gather for now."
+        if args.optimizer == 'muon':
+            assert not args.overlap_grad_reduce, "Muon optimizer does not support overlap grad reduce. Use dist_muon instead."
+            assert not args.overlap_param_gather, "Muon optimizer does not support overlap param gather. Use dist_muon instead."
 
         assert not args.use_distributed_optimizer, "Muon optimizer does not support distributed optimizer for now."
         assert not args.use_torch_fsdp2, "Muon optimizer does not support Torch-FSDP2 for now."
