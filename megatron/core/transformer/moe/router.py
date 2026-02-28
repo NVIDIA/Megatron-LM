@@ -749,7 +749,7 @@ class InferenceTopKRouter(TopKRouter):
         super().__init__(config=config, pg_collection=pg_collection)
 
         self.is_inference_cuda_graphed_iteration = False
-        self.topk_routing_with_score_function = torch.compile(topk_routing_with_score_function) 
+        self.topk_routing_with_score_function = torch.compile(topk_routing_with_score_function)
 
     def set_inference_cuda_graphed_iteration(self):
         """Enable CUDA graph-compatible operations for the router."""
