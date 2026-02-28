@@ -1,3 +1,5 @@
+# Copyright (c) 2024-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+
 import argparse
 import json
 from typing import List
@@ -93,7 +95,8 @@ def is_number(n: str):
 
 def compute_vqa_accuracy(result_file, task):
     """Compute VQA accuracy."""
-    merged_results = json.load(open(result_file))
+    with open(result_file, "r") as f:
+        merged_results = json.load(f)
 
     vqa = VQAEval(vqa=None, vqaRes=None)
     all_acc = []
