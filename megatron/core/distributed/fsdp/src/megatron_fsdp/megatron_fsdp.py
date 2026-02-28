@@ -1106,7 +1106,13 @@ class MegatronFSDP(torch.nn.Module):
         """
         return self.dist_index
 
-    def start_param_sync(self, *unused, force_sync: bool = False, force_dispatch: bool = False):
+    def start_param_sync(
+        self,
+        *unused,
+        force_sync: bool = False,
+        force_dispatch: bool = False,
+        sync_and_return: bool = False,
+    ):
         """
         Initiates param sync (all-gather) communication operations for all model parameters.
 
@@ -1119,6 +1125,10 @@ class MegatronFSDP(torch.nn.Module):
                 other settings.
             force_dispatch (bool, optional): force dispatch regardless of other settings.
         """
+        if sync_and_return:
+            self.synchronize_param_gather()
+            return
+
         self._replace_param_with_raw_if_needed()
 
         if not force_sync and self.ddp_config.overlap_param_gather:
