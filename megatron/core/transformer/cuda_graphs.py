@@ -819,13 +819,10 @@ class _CudaGraphRunner(torch.nn.Module):
 
         is_moe = isinstance(self.base_module, MoETransformerLayer)
         if is_moe:
-            from megatron.core.transformer.moe.moe_utils import get_moe_layer_wise_logging_tracker
-
-            tracker = get_moe_layer_wise_logging_tracker()
+            moe_metrics_tracker = self.base_module.config.moe_metrics_tracker
             cached_aux_losses = {}
-            for name in tracker:
-                if "values" in tracker[name]:
-                    cached_aux_losses[name] = torch.clone(tracker[name]["values"])
+            for name, entry in moe_metrics_tracker.metrics.items():
+                cached_aux_losses[name] = entry.values.clone()
 
         self.fwd_graph = torch.cuda.CUDAGraph()
 
@@ -1014,8 +1011,9 @@ class _CudaGraphRunner(torch.nn.Module):
                     param.main_grad.copy_(main_grad_copy)
 
         if is_moe:
-            for name in tracker:
-                tracker[name]["values"].copy_(cached_aux_losses[name])
+            for name, cached_values in cached_aux_losses.items():
+                assert name in moe_metrics_tracker.metrics, "cached metrics must be found in the tracker."
+                moe_metrics_tracker.metrics[name].values.copy_(cached_values)
 
     def create_bwd_graph(self):
         """Create a bwd cudagraph for this runner. Should be called inside
@@ -2208,14 +2206,13 @@ class TECudaGraphHelper:
         _set_capture_end()
 
         from megatron.core.distributed.finalize_model_grads import reset_model_temporary_tensors
-        from megatron.core.transformer.moe.moe_utils import clear_aux_losses_tracker
 
         torch.distributed.barrier()
         for model_chunk in self.model:
             model_chunk.zero_grad_buffer()
         for optimizer in self.optimizers:
             optimizer.zero_grad()
-        clear_aux_losses_tracker()
+        self.config.moe_metrics_tracker.clear()
         reset_model_temporary_tensors(self.config, self.model)
 
         if FREEZE_GC:

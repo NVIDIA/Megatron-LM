@@ -3,7 +3,7 @@
 import logging
 import warnings
 from dataclasses import dataclass, field
-from typing import Callable, List, Literal, Optional, Tuple, Union
+from typing import Any, Callable, List, Literal, Optional, Tuple, Union
 
 import torch
 import torch.nn.functional as F
@@ -757,6 +757,10 @@ class TransformerConfig(ModelParallelConfig):
     """Number of SMs to use for HybridEP. In pure NVL scenarios,
     16 SMs can generally achieve good bandwidth."""
 
+    moe_metrics_tracker: Any = None
+    """MoE metrics tracker instance. Defaults to the global MoEMetricsTracker singleton.
+    Assign a separate MoEMetricsTracker() for multi-model isolation."""
+
     ##################
     # Context Parallel
     ##################
@@ -949,6 +953,13 @@ class TransformerConfig(ModelParallelConfig):
         details.
         """
         super().__post_init__()
+
+        if self.moe_metrics_tracker is None:
+            from megatron.core.transformer.moe.moe_logging import MoEMetricsTracker
+
+            self.moe_metrics_tracker = MoEMetricsTracker.get_instance(
+                self.num_layers, self.moe_layer_freq, self.mtp_num_layers
+            )
 
         # When fp32 residual connections are enabled, pipeline parallel communication must
         # use fp32 to match the dtype of the residual stream between pipeline stages.

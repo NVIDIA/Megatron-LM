@@ -16,7 +16,6 @@ from megatron.core.transformer.moe.moe_utils import (
     compute_routing_scores_for_aux_loss,
     get_tokens_per_expert_and_token_count,
     router_gating_linear,
-    save_to_aux_losses_tracker,
     sinkhorn,
     switch_load_balancing_loss_func,
     topk_routing_with_score_function,
@@ -419,7 +418,7 @@ class TopKRouter(Router):
             global_aux_loss,
             "global_load_balancing_loss",
             self.tp_dp_cp_group,
-            reduce_group_has_dp=True,
+            needs_dp_avg=False,
             valid_token_count=local_num_tokens,
         )
         return probs
@@ -431,7 +430,7 @@ class TopKRouter(Router):
         aux_loss: torch.Tensor,
         aux_loss_name: str,
         reduce_group: torch.distributed.ProcessGroup,
-        reduce_group_has_dp: bool = False,
+        needs_dp_avg: bool = True,
         valid_token_count: Optional[Union[int, torch.Tensor]] = None,
     ):
         """Attach aux loss function to activation and add to logging.
@@ -442,9 +441,7 @@ class TopKRouter(Router):
             aux_loss (torch.Tensor): Computed aux loss.
             aux_loss_name (str): Name of the aux loss for logging.
             reduce_group (torch.distributed.ProcessGroup): Process group for reduction.
-            reduce_group_has_dp (bool): Whether the reduce group has data parallel ranks.
-                Set this to True if the reduce group has data parallel ranks. This flag is used to
-                ensure the correct reduction in aux loss tracking.
+            needs_dp_avg (bool): Whether to average this metric across DP ranks after reduce_group.
             valid_token_count (int or torch.Tensor, optional): Number of valid tokens excluding
                 padding tokens. Can be a Python int or a torch.Tensor (typically 0-d tensor).
                 If None, uses activation.shape[0]. Defaults to None.
@@ -459,26 +456,17 @@ class TopKRouter(Router):
         ):
             aux_loss = aux_loss / self.config.mtp_num_layers
 
-        # TODO (zijiey): fix the per_layer_logging for MTP, currently it will incorrectly
-        # add the aux loss logging value to other layer's since it is difficult to get the
-        # correct layer_number for MTP. It does not affect the correctness of the calculation
-        # results and the reduced load_balancing_loss logging value.
-        num_layers = self.config.num_layers
-        if self.config.mtp_num_layers is not None:
-            num_layers += self.config.mtp_num_layers
-
         if self.is_mtp_layer:
             layer_number = self.layer_number + self.config.num_layers
         else:
             layer_number = self.layer_number
 
-        save_to_aux_losses_tracker(
+        self.config.moe_metrics_tracker.record(
             aux_loss_name,
             aux_loss / aux_loss_coeff,
             layer_number,
-            num_layers,
             reduce_group=reduce_group,
-            reduce_group_has_dp=reduce_group_has_dp,
+            needs_dp_avg=needs_dp_avg,
         )
         if self.calculate_per_token_loss:
             # Scale the aux_loss by the number of tokens.
@@ -536,17 +524,13 @@ class TopKRouter(Router):
             ):
                 z_loss = z_loss / self.config.mtp_num_layers
 
-            num_layers = self.config.num_layers
-            if self.config.mtp_num_layers is not None:
-                num_layers += self.config.mtp_num_layers
-
             if self.is_mtp_layer:
                 layer_number = self.layer_number + self.config.num_layers
             else:
                 layer_number = self.layer_number
 
-            save_to_aux_losses_tracker(
-                "z_loss", z_loss / moe_z_loss_coeff, layer_number, num_layers
+            self.config.moe_metrics_tracker.record(
+                "z_loss", z_loss / moe_z_loss_coeff, layer_number
             )
         return logits
 
