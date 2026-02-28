@@ -455,3 +455,152 @@ class TestMimoModel:
         # Test checkpoint state dict
         checkpoint_dict = mimo_model.state_dict_for_save_checkpoint()
         assert len(checkpoint_dict) > 0
+
+
+class MockProcessGroup:
+    """Mock process group for testing."""
+    def __init__(self, rank, world_size):
+        self._rank = rank
+        self._size = world_size
+
+    def rank(self):
+        return self._rank
+
+    def size(self):
+        return self._size
+
+
+class MockGrid:
+    """Mock grid with HyperCommGrid-compatible interface."""
+    def __init__(self, rank_offset=0, size=1, dim_names=None, pp_rank=0, pp_size=1):
+        self.rank_offset = rank_offset
+        self.size = size
+        self.dim_names = dim_names or []
+        self._pp_group = MockProcessGroup(pp_rank, pp_size)
+
+    def get_pg(self, dims):
+        if dims == "pp":
+            return self._pp_group
+        raise KeyError(f"Process group for {dims} not found")
+
+
+class TestMimoModelNonColocated:
+    """Tests for non-colocated multi-module pipeline parallelism."""
+
+    def setup_method(self, method):
+        try:
+            Utils.initialize_model_parallel(1, 1)
+        except Exception:
+            pass
+        self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        self.hidden_size = 64
+        self.vocab_size = 48000
+        self.seq_len = 256
+        self.batch_size = 2
+
+    def teardown_method(self, method):
+        try:
+            Utils.destroy_model_parallel()
+        except Exception:
+            pass
+
+    def _make_config(self, encoder_in_grid=True, language_in_grid=True, pp_rank=0, pp_size=1):
+        """Helper to create MimoModelConfig with mock grids."""
+        language_model_spec = get_language_model_spec(self.hidden_size, self.vocab_size, self.seq_len)
+        vision_submodule_spec = get_vision_submodules_spec(self.hidden_size, 224, 224, 16)
+
+        encoder_offset = 0 if encoder_in_grid else 10  # rank 0 in grid if offset=0
+        language_offset = 0 if language_in_grid else 10
+
+        return MimoModelConfig(
+            language_model_spec=language_model_spec,
+            modality_submodules_spec={"images": vision_submodule_spec},
+            special_token_ids={"images": 50257},
+            module_to_grid_map={
+                "images": MockGrid(rank_offset=encoder_offset, size=1, dim_names=["pp"] if pp_size > 1 else [], pp_rank=pp_rank, pp_size=pp_size),
+                "language": MockGrid(rank_offset=language_offset, size=1, dim_names=["pp"] if pp_size > 1 else [], pp_rank=pp_rank, pp_size=pp_size),
+            },
+            language_module_key="language",
+        )
+
+    def test_grid_validation_rejects_mismatched_keys(self):
+        """Test validation fails when grid_map keys don't match expected modules."""
+        language_model_spec = get_language_model_spec(self.hidden_size, self.vocab_size, self.seq_len)
+        vision_submodule_spec = get_vision_submodules_spec(self.hidden_size, 224, 224, 16)
+
+        # Missing 'images' in grid_map
+        mimo_config = MimoModelConfig(
+            language_model_spec=language_model_spec,
+            modality_submodules_spec={"images": vision_submodule_spec},
+            special_token_ids={"images": 50257},
+            module_to_grid_map={"language": MockGrid()},
+            language_module_key="language",
+        )
+
+        with pytest.raises(ValueError, match="module_to_grid_map keys must match"):
+            MimoModel(mimo_config)
+
+    def test_role_determination(self):
+        """Test role correctly identifies modules and stage positions."""
+        # No grid map = no role
+        model_no_grid = get_vlm_mimo_model(self.hidden_size, self.vocab_size, self.seq_len, 224, 224, 16, {"images": 50257})
+        assert model_no_grid.role is None
+
+        # Encoder-only rank (language grid excludes rank 0)
+        model_encoder = MimoModel(self._make_config(encoder_in_grid=True, language_in_grid=False))
+        assert model_encoder.role.has_modality_modules is True
+        assert model_encoder.role.has_language_module is False
+
+        # Language-only rank (encoder grid excludes rank 0)
+        model_language = MimoModel(self._make_config(encoder_in_grid=False, language_in_grid=True))
+        assert model_language.role.has_modality_modules is False
+        assert model_language.role.has_language_module is True
+
+        # Stage info with PP
+        model_pp = MimoModel(self._make_config(encoder_in_grid=True, language_in_grid=True, pp_rank=1, pp_size=3))
+        assert model_pp.role.is_first_stage("images") is False
+        assert model_pp.role.is_last_stage("images") is False
+
+    def test_selective_init_encoder_only(self):
+        """Test encoder-only rank initializes encoder but not language model."""
+        model = MimoModel(self._make_config(encoder_in_grid=True, language_in_grid=False))
+        assert "images" in model.modality_submodules
+        assert model.language_model is None
+
+    def test_selective_init_language_only(self):
+        """Test language-only rank initializes language model but not encoder."""
+        model = MimoModel(self._make_config(encoder_in_grid=False, language_in_grid=True))
+        assert "images" not in model.modality_submodules
+        assert model.language_model is not None
+
+    def test_forward_encoder_only(self):
+        """Test encoder-only forward returns dict of embeddings."""
+        model = MimoModel(self._make_config(encoder_in_grid=True, language_in_grid=False))
+        model = model.to(self.device)
+
+        images = torch.rand(2, 3, 224, 224, device=self.device)
+        input_ids = torch.randint(0, self.vocab_size, (self.batch_size, self.seq_len), device=self.device)
+
+        outputs, _ = model(input_ids=input_ids, modality_inputs={"images": {"clip_encoder": {"x": images}}})
+
+        assert isinstance(outputs, dict)
+        assert "images" in outputs
+
+    def test_forward_language_only(self):
+        """Test language-only forward returns tensor."""
+        model = MimoModel(self._make_config(encoder_in_grid=False, language_in_grid=True))
+        model = model.to(self.device)
+
+        img_seq_len = (224 // 16) * (224 // 16) + 1
+        input_ids = torch.randint(0, self.vocab_size, (self.batch_size, self.seq_len), device=self.device)
+        input_ids[:, 5:5 + img_seq_len] = 50257  # image tokens
+        position_ids = torch.arange(self.seq_len, device=self.device).unsqueeze(0).expand(self.batch_size, -1)
+
+        # Simulate encoder output from previous stage
+        encoder_embeddings = torch.randn(self.batch_size * img_seq_len, self.hidden_size, device=self.device)
+        model.set_input_tensor({"images": encoder_embeddings})
+
+        outputs, _ = model(input_ids=input_ids, position_ids=position_ids, modality_inputs=None)
+
+        assert isinstance(outputs, torch.Tensor)
+        assert outputs.shape == (self.batch_size, self.seq_len, self.vocab_size)
