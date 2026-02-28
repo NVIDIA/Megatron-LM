@@ -13,16 +13,15 @@ dimensions for fast unit test execution:
 import pytest
 import torch
 
+from megatron.core.activations import squared_relu
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.utils import is_te_min_version, is_torch_min_version
 from megatron.training.initialize import _set_random_seed
-from megatron.core.activations import squared_relu
 from tests.unit_tests.test_utilities import Utils
 
 # Reusable skip decorators
 requires_te = pytest.mark.skipif(
-    not is_te_min_version("1.7.0.dev0"),
-    reason="Requires transformer-engine >= 1.7.0",
+    not is_te_min_version("1.7.0.dev0"), reason="Requires transformer-engine >= 1.7.0"
 )
 requires_torch_grouped_mm = pytest.mark.skipif(
     not is_torch_min_version("2.10") or not hasattr(torch, '_grouped_mm'),
@@ -55,7 +54,7 @@ NANOV3_BASE = dict(
     normalization="RMSNorm",
     add_bias_linear=False,
     bf16=True,
-    params_dtype=torch.bfloat16
+    params_dtype=torch.bfloat16,
 )
 
 
@@ -70,6 +69,7 @@ def _make_base_config(**overrides):
 # ──────────────────────────────────────────────────────────────────────
 
 
+@pytest.mark.internal
 class TestInferenceTopKRouter:
 
     @classmethod
@@ -86,19 +86,31 @@ class TestInferenceTopKRouter:
         from megatron.core.transformer.moe.router import InferenceTopKRouter
 
         config = _make_base_config(**config_overrides)
-        return InferenceTopKRouter(config=config, pg_collection=get_default_pg_collection()).cuda().to(torch.bfloat16)
+        return (
+            InferenceTopKRouter(config=config, pg_collection=get_default_pg_collection())
+            .cuda()
+            .to(torch.bfloat16)
+        )
 
     def test_init_rejects_num_groups(self):
         """InferenceTopKRouter requires moe_router_num_groups=None."""
         with pytest.raises(AssertionError, match="moe_router_num_groups"):
             self._make_router(moe_router_num_groups=2)
 
+    def test_config_rejects_non_fp32_router_dtype(self):
+        """inference_optimized config requires moe_router_dtype='fp32'."""
+        with pytest.raises(ValueError, match="moe-router-dtype"):
+            _make_base_config(
+                transformer_impl="inference_optimized", add_qkv_bias=False, moe_router_dtype=None
+            )
+
     @pytest.mark.parametrize("score_fn", ["none", "invalid"])
     def test_init_rejects_unsupported_score_function(self, score_fn):
         """InferenceTopKRouter requires sigmoid or softmax score function."""
         with pytest.raises(AssertionError, match="moe_router_score_function"):
-            self._make_router(moe_router_score_function=score_fn,
-                              moe_router_enable_expert_bias=False)
+            self._make_router(
+                moe_router_score_function=score_fn, moe_router_enable_expert_bias=False
+            )
 
     @pytest.mark.parametrize("score_fn", ["sigmoid", "softmax"])
     def test_init_accepts_valid_score_function(self, score_fn):
@@ -106,8 +118,7 @@ class TestInferenceTopKRouter:
         # Expert bias only valid with sigmoid; disable it for softmax
         enable_bias = score_fn == "sigmoid"
         router = self._make_router(
-            moe_router_score_function=score_fn,
-            moe_router_enable_expert_bias=enable_bias,
+            moe_router_score_function=score_fn, moe_router_enable_expert_bias=enable_bias
         )
         assert router is not None
 
@@ -183,9 +194,7 @@ class TestInferenceTopKRouter:
         hidden_size = NANOV3_BASE["hidden_size"]
 
         # Static input buffer for CUDA graph (seeded for reproducibility)
-        static_input = torch.randn(
-            num_tokens, hidden_size, device="cuda", dtype=torch.bfloat16
-        )
+        static_input = torch.randn(num_tokens, hidden_size, device="cuda", dtype=torch.bfloat16)
 
         # Warmup (required before CUDA graph capture)
         with torch.no_grad():
@@ -209,14 +218,23 @@ class TestInferenceTopKRouter:
         assert (static_indices != -1).all(), "Graph replay should overwrite all expert indices"
 
         expected_indices = [
-            [2, 6, 4, 5, 3, 7], [4, 1, 3, 2, 6, 0], [4, 1, 3, 7, 5, 2],
-            [6, 0, 7, 5, 2, 4], [0, 7, 5, 1, 4, 2], [5, 6, 0, 7, 1, 4],
-            [6, 2, 0, 7, 4, 1], [0, 2, 1, 7, 4, 5], [0, 7, 5, 3, 1, 6],
-            [1, 4, 7, 3, 0, 6], [6, 7, 0, 2, 3, 1], [3, 0, 7, 6, 4, 2],
-            [6, 7, 0, 4, 1, 3], [1, 3, 6, 5, 0, 2], [6, 1, 0, 7, 3, 2],
+            [2, 6, 4, 5, 3, 7],
+            [4, 1, 3, 2, 6, 0],
+            [4, 1, 3, 7, 5, 2],
+            [6, 0, 7, 5, 2, 4],
+            [0, 7, 5, 1, 4, 2],
+            [5, 6, 0, 7, 1, 4],
+            [6, 2, 0, 7, 4, 1],
+            [0, 2, 1, 7, 4, 5],
+            [0, 7, 5, 3, 1, 6],
+            [1, 4, 7, 3, 0, 6],
+            [6, 7, 0, 2, 3, 1],
+            [3, 0, 7, 6, 4, 2],
+            [6, 7, 0, 4, 1, 3],
+            [1, 3, 6, 5, 0, 2],
+            [6, 1, 0, 7, 3, 2],
             [1, 5, 0, 4, 3, 7],
         ]
-        assert static_indices.tolist() == expected_indices, (
-            f"Expert indices mismatch:\n{static_indices.tolist()}\n!=\n{expected_indices}"
-        )
-
+        assert (
+            static_indices.tolist() == expected_indices
+        ), f"Expert indices mismatch:\n{static_indices.tolist()}\n!=\n{expected_indices}"
