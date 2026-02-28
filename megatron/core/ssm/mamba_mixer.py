@@ -505,7 +505,12 @@ class MambaMixer(MegatronModule):
         conv_state: torch.Tensor,
         ssm_state: torch.Tensor,
     ) -> torch.Tensor:
-        """Helper to run dynamic inference prefill (chunked prefill request separately)."""
+        """Helper to run dynamic inference prefill.
+
+        Processes batch-kernel requests (those with initial Mamba states) one at a
+        time via the batch kernel, then processes remaining requests together via the
+        varlen kernel.
+        """
         metadata = context.mamba_metadata
 
         # Use the regular prefill request count to determine if regular
@@ -515,31 +520,36 @@ class MambaMixer(MegatronModule):
         # Padded prefill token count
         prefill_token_count = zxBCdt.shape[0]
 
-        enable_chunked_prefill = context.is_chunked_prefill_enabled()
+        y_batch_parts = []
+        y_varlen = None
 
-        y_chunked = None
-        y_regular = None
+        # Process each request with initial states via batch kernel (one at a time)
+        if metadata.num_batch_kernel_prefills > 0:
+            for i in range(metadata.num_batch_kernel_prefills):
+                start = metadata.batch_kernel_cu_seqlens[i].item()
+                end = metadata.batch_kernel_cu_seqlens[i + 1].item()
+                batch_idx = metadata.batch_kernel_batch_indices[i : i + 1]
 
-        # Chunked prefill
-        if enable_chunked_prefill:
-            y_chunked = self._ssm_prefill(
-                zxBCdt[: metadata.device_chunked_prefill[0]],
-                conv_state=conv_state,
-                ssm_state=ssm_state,
-                batch_indices=metadata.batch_indices_chunked_prefill,
-                is_chunked_prefill=True,
-            )
+                y_part = self._ssm_prefill(
+                    zxBCdt[start:end],
+                    conv_state=conv_state,
+                    ssm_state=ssm_state,
+                    batch_indices=batch_idx,
+                    is_chunked_prefill=True,
+                )
+                y_batch_parts.append(y_part)
 
-            # Update zxBCdt to contain the remaining slice for regular prefill
+            # Update zxBCdt to contain the remaining slice for varlen prefill
             zxBCdt_remainder = torch.empty_like(zxBCdt)
             tensor_get_slice_after(
                 zxBCdt, zxBCdt_remainder, metadata.device_chunked_prefill, check_bounds=False
             )
             zxBCdt = zxBCdt_remainder
 
-        # Regular prefill
-        if not enable_chunked_prefill or prefill_req_count > 1:
-            y_regular = self._ssm_prefill(
+        # Process remaining requests via varlen kernel
+        num_varlen = prefill_req_count - metadata.num_batch_kernel_prefills
+        if num_varlen > 0:
+            y_varlen = self._ssm_prefill(
                 zxBCdt,
                 conv_state=conv_state,
                 ssm_state=ssm_state,
@@ -549,23 +559,33 @@ class MambaMixer(MegatronModule):
                 batch_indices=metadata.batch_indices_prefill,
             )
 
-        # Merge chunked prefill and regular prefill results
-        if y_chunked is not None and y_regular is not None:
-            y_combined = torch.empty_like(y_regular)
+        # Merge batch-kernel and varlen results
+        if y_batch_parts and y_varlen is not None:
+            y_batch = (
+                torch.cat(y_batch_parts, dim=0)
+                if len(y_batch_parts) > 1
+                else y_batch_parts[0]
+            )
+            y_combined = torch.empty_like(y_varlen)
             tensor_merge(
-                y_chunked, y_regular, metadata.device_chunked_prefill, output_tensor=y_combined
+                y_batch, y_varlen, metadata.device_chunked_prefill, output_tensor=y_combined
             )
             return y_combined
-        elif y_chunked is not None:
-            y_prefill = torch.empty(
-                (prefill_token_count, 1, y_chunked.shape[-1]),
-                dtype=y_chunked.dtype,
-                device=y_chunked.device,
+        elif y_batch_parts:
+            y_batch = (
+                torch.cat(y_batch_parts, dim=0)
+                if len(y_batch_parts) > 1
+                else y_batch_parts[0]
             )
-            y_prefill[: metadata.device_chunked_prefill[0]] = y_chunked
+            y_prefill = torch.empty(
+                (prefill_token_count, 1, y_batch.shape[-1]),
+                dtype=y_batch.dtype,
+                device=y_batch.device,
+            )
+            y_prefill[: y_batch.shape[0]] = y_batch
             return y_prefill
         else:
-            return y_regular
+            return y_varlen
 
     def _decode(
         self, hidden_states, conv_state, ssm_state, batch_indices: Optional[torch.Tensor] = None
