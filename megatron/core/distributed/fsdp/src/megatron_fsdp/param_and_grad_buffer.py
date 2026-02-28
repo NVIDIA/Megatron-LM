@@ -3522,6 +3522,9 @@ class GradReducePipeline:
                         # gradient, just the shard updated via reduce-scatter.
                         fsdp_grad_buffer = self.get_fsdp_buffer(bucket_id)
                         unreduced_grad = fsdp_grad_buffer.data
+                        assert (
+                            main_grad_buffer.dtype == fsdp_grad_buffer.dtype
+                        ), "Main and DP-Shard gradient buffer must share the exact same dtype."
 
                         # Cast DP-Shard gradient to communication dtype if specified and necessary.
                         custom_grad_comm_dtype = (
@@ -3551,9 +3554,14 @@ class GradReducePipeline:
                             # main gradient buffer which shards across the entire DP group,
                             # i.e. across all DP-Shard and DP-Outer ranks.
                             main_grad_shard = main_grad_buffer.get_shard_from_local_buffer()
-                            if unreduced_grad.dtype != main_grad_shard.dtype:
+                            if custom_grad_comm_dtype:
                                 # Scatter back into communication buffer.
-                                output_buffer = unreduced_grad[0 : main_grad_shard.numel()]
+                                dp_outer_rank = outer_fsdp_group.rank()
+                                output_buffer = unreduced_grad[
+                                    dp_outer_rank
+                                    * main_grad_shard.numel() : (dp_outer_rank + 1)
+                                    * main_grad_shard.numel()
+                                ]
                             else:
                                 # Scatter directly into the main gradient buffer.
                                 output_buffer = main_grad_shard
@@ -3565,10 +3573,7 @@ class GradReducePipeline:
                                 op=reduce_op,
                                 group=outer_fsdp_group,
                             )
-                            if (
-                                custom_grad_comm_dtype
-                                and unreduced_grad.dtype != main_grad_shard.dtype
-                            ):
+                            if custom_grad_comm_dtype:
                                 # Reduce-scatter output was a temporary communication buffer.
                                 grad_accum_closure.append((main_grad_shard, output_buffer))
                         else:  # HSDP -> main_grad_buffer = (DP-Shard,)
