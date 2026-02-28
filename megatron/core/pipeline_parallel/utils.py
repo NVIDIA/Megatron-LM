@@ -8,7 +8,14 @@ from typing import Callable, Optional
 import torch
 from torch.autograd import Variable
 
-from megatron.core.utils import get_pg_rank, get_pg_size, log_single_rank, make_viewless_tensor
+from megatron.core.utils import (
+    get_pg_rank,
+    get_pg_size,
+    log_single_rank,
+    make_viewless_tensor,
+    nvtx_range_pop,
+    nvtx_range_push,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -285,13 +292,13 @@ class ScheduleNode:
         """
         self.event.wait(self.stream)
         if name:
-            torch.cuda.nvtx.range_push(name)
+            nvtx_range_push(name)
         try:
             with torch.cuda.stream(self.stream):
                 yield
         finally:
             if name:
-                torch.cuda.nvtx.range_pop()
+                nvtx_range_pop(name)
             self.event.record(self.stream)
 
     def _release_state(self):

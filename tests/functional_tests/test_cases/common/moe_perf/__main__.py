@@ -23,7 +23,7 @@ from megatron.core.transformer.moe.fused_a2a import HAVE_DEEP_EP, HAVE_HYBRIDEP
 from megatron.core.transformer.moe.moe_layer import MoELayer
 from megatron.core.transformer.moe.moe_utils import RandomSTE
 from megatron.core.transformer.transformer_config import TransformerConfig
-from megatron.core.utils import is_te_min_version
+from megatron.core.utils import is_te_min_version, nvtx_range_pop, nvtx_range_push
 from megatron.training.initialize import _set_random_seed
 from tests.unit_tests.test_utilities import Utils
 
@@ -208,7 +208,8 @@ def _benchmark_moe_layer(layer: MoELayer, case: MoEPerformanceCase):
             RandomSTE.generator.manual_seed(RandomSTE.generator.initial_seed())
         if torch.distributed.is_available() and torch.distributed.is_initialized():
             torch.distributed.barrier()
-        torch.cuda.nvtx.range_push(f"({case.name}) iteration {iteration}")
+        nvtx_iter_msg = f"({case.name}) iteration {iteration}"
+        nvtx_range_push(nvtx_iter_msg)
         # Use a long CUDA kernel to hide the router launch overhead
         with torch.cuda.nvtx.range("(dummy GEMM)"):
             dummy_tensor = torch.randn(8192, 8192, device="cuda")
@@ -234,7 +235,7 @@ def _benchmark_moe_layer(layer: MoELayer, case: MoEPerformanceCase):
             output.backward(backward_grad)
             bwd_end.record()
 
-        torch.cuda.nvtx.range_pop()
+        nvtx_range_pop(nvtx_iter_msg)
         torch.cuda.synchronize()
 
         if iteration >= WARMUP_ITERS:
