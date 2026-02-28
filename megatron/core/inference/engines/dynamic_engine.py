@@ -1780,7 +1780,7 @@ class DynamicInferenceEngine(AbstractEngine):
         # and passes -1 to the all-reduce. If any other rank in the EP group has not received
         # the signal yet, it will pass a zero value to the all-reduce, hence the global consensus
         # will be zero and we will defer processing the signal.
-        # When all ranks receive the signal, global work will be zero and we can process the signal.
+        # When all ranks receive the signal, global consensus will be -1 and we can process.
 
         if self.ep_world_size > 1:
             # Perform all-reduce to get max global work across EP group.
@@ -1836,7 +1836,12 @@ class DynamicInferenceEngine(AbstractEngine):
                         local_pending, signal_consensus=(self.state == EngineState.PAUSING)
                     )
 
-                    if global_work > 0:
+                    if all_pausing:
+                        # All EP peers are PAUSING: pause immediately.
+                        await self._world_barrier()
+                        self.state = EngineState.PAUSED
+                        self.paused.set()
+                    elif global_work > 0:
                         # At least one EP peer has work: all must participate.
                         if local_pending > 0:
                             await self.async_step()
@@ -1847,11 +1852,6 @@ class DynamicInferenceEngine(AbstractEngine):
                             self.step_end_event.record()
                             self.step_end_event.synchronize()
                             self.step_count += 1
-                    elif all_pausing:
-                        # All EP peers are PAUSING with no work: consensus.
-                        await self._world_barrier()
-                        self.state = EngineState.PAUSED
-                        self.paused.set()
                     else:
                         # No work, but not all pausing: idle.
                         await asyncio.sleep(0.02)

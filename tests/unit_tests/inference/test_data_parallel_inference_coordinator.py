@@ -437,9 +437,18 @@ class TestCoordinator:
                 for record in results:
                     assert record[-1].status == Status.COMPLETED
 
+                # Submit requests while RUNNING, then PAUSE before they drain.
+                # These must survive the PAUSE (not be drained during PAUSING).
+                pre_pause_futures = [
+                    client.add_request(prompt=p, sampling_params=s) for p, s in requests[2:3]
+                ]
                 client.pause_engines()
                 await asyncio.wait_for(engine.wait_until(EngineState.PAUSED), timeout=5.0)
                 assert_state(engine, EngineState.PAUSED)
+
+                # Pre-pause requests must NOT have been drained.
+                done, pending = await asyncio.wait(pre_pause_futures, timeout=0.5)
+                assert len(pending) > 0, "Pre-pause requests should not drain during PAUSING"
 
                 # Try pausing again and see if it breaks.
                 client.pause_engines()
@@ -448,17 +457,18 @@ class TestCoordinator:
 
                 # Requests submitted while PAUSED should queue, not complete.
                 paused_futures = [
-                    client.add_request(prompt=p, sampling_params=s) for p, s in requests[2:5]
+                    client.add_request(prompt=p, sampling_params=s) for p, s in requests[3:5]
                 ]
                 # Use asyncio.wait (not wait_for) so futures aren't cancelled.
                 done, pending = await asyncio.wait(paused_futures, timeout=0.5)
                 assert len(done) == 0, "No requests should complete while paused"
-                assert len(pending) == 3
+                assert len(pending) == 2
 
-                # UNPAUSE and verify all in-flight requests complete.
+                # UNPAUSE and verify all in-flight requests (pre-pause + paused) complete.
                 client.unpause_engines()
                 await asyncio.wait_for(engine.wait_until(EngineState.RUNNING), timeout=5.0)
-                results = await asyncio.wait_for(asyncio.gather(*pending), timeout=10.0)
+                all_queued = pre_pause_futures + paused_futures
+                results = await asyncio.wait_for(asyncio.gather(*all_queued), timeout=10.0)
                 for record in results:
                     assert record[-1].status == Status.COMPLETED
                 assert_state(engine, EngineState.RUNNING)
