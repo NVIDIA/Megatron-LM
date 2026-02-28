@@ -32,6 +32,7 @@ from tests.unit_tests.dist_checkpointing import (
 )
 from tests.unit_tests.test_utilities import Utils
 from tests.unit_tests.transformer.test_attention import _test_parallel_attention_correctness
+from tests.unit_tests.transformer.test_multi_latent_attention import make_test_packed_seq_params
 
 try:
     import fla
@@ -138,7 +139,51 @@ class TestGatedDeltaNet:
             output.dtype == hidden_states.dtype
         ), f"Output dtype {output.dtype=} mismatch with {hidden_states.dtype=}"
 
+    def test_gpu_forward_thd_correctness(self):
+        if self.sp_size > 1:
+            pytest.skip("Sequence parallel is not supported for this test case.")
 
+        atol, rtol = 3e-4, 3e-4
+
+        # Input shape
+        sequence_length = 32
+        micro_batch_size = 4
+        cu_seqlens = [0, 32, 64, 96, 128]
+        # sbhd input shape: [sequence length, batch size, hidden size]
+        sub_sequence_length = sequence_length // self.cp_size
+        hidden_states_sbhd = torch.rand(
+            (sub_sequence_length, micro_batch_size, self.gdn.config.hidden_size)
+        )
+        attention_mask_sbhd = None
+        hidden_states_sbhd = hidden_states_sbhd.cuda().bfloat16()
+        # thd input shape: [sequence length * batch size, 1, hidden size]
+        hidden_states_thd = hidden_states_sbhd.transpose(0, 1).contiguous()
+        hidden_states_thd = hidden_states_thd.view(-1, 1, self.gdn.config.hidden_size)
+        attention_mask_thd = None
+        packed_seq_params = make_test_packed_seq_params(cu_seqlens=cu_seqlens)
+
+        # THD format
+        output_thd, _ = self.gdn(
+            hidden_states_thd, attention_mask_thd, packed_seq_params=packed_seq_params
+        )
+        # SBHD format
+        output_sbhd, _ = self.gdn(hidden_states_sbhd, attention_mask_sbhd)
+        output_sbhd_T = output_sbhd.transpose(0, 1).contiguous().view(*output_thd.shape)
+
+        rank = torch.distributed.get_rank()
+        assert output_thd.shape[0] == sub_sequence_length * micro_batch_size
+        assert output_thd.shape[1] == 1
+        assert output_thd.shape[2] == self.gdn.config.hidden_size
+        torch.testing.assert_close(
+            output_sbhd_T,
+            output_thd,
+            atol=atol,
+            rtol=rtol,
+            msg=lambda msg: f"Output mismatch ({rank=}): {msg}",
+        )
+
+
+@pytest.mark.parametrize("sequence_packing", [False, True])
 @pytest.mark.parametrize(
     ("tp", "sp", "cp"),
     [
@@ -150,7 +195,7 @@ class TestGatedDeltaNet:
     ],
 )
 @pytest.mark.skipif(not HAVE_FLA, reason="FLA is not installed.")
-def test_parallel_gated_delta_net_correctness(tmp_path_dist_ckpt, tp, sp, cp):
+def test_parallel_gated_delta_net_correctness(tmp_path_dist_ckpt, sequence_packing, tp, sp, cp):
     transformer_config = TransformerConfig(
         hidden_size=128,
         linear_conv_kernel_dim=2,
@@ -191,4 +236,5 @@ def test_parallel_gated_delta_net_correctness(tmp_path_dist_ckpt, tp, sp, cp):
         seed=123,
         sequence_length=256,
         micro_batch_size=4,
+        sequence_packing=sequence_packing,
     )
