@@ -43,7 +43,6 @@ MODEL_ARGS:
   --straggler-minmax-count: 16
   --tensorboard-log-interval: 1
   --empty-unused-memory-level: 2
-  --langrl-inference-server-type: inplace_megatron
   --seed: 42
   --calculate-per-token-loss: true
   --rl-use-sequence-packing: true
@@ -78,3 +77,13 @@ MODEL_ARGS:
   --inference-logging-step-interval: 1
   --rl-inference-tensor-model-parallel-size: 2
   --refit-method: gloo
+
+METRICS:
+  - "iteration-time"
+  - "lm loss"
+  - "num-zeros"
+  - "mem-allocated-bytes"
+  - "mem-max-allocated-bytes"
+
+THROUGHPUT_TEST_PARAMS:
+  --start_step: 1

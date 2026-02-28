@@ -1,5 +1,6 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
+import logging
 import warnings
 from dataclasses import dataclass, field
 from typing import Callable, List, Literal, Optional, Tuple, Union
@@ -13,6 +14,7 @@ from megatron.core.transformer.enums import AttnBackend, CudaGraphScope
 from megatron.core.transformer.pipeline_parallel_layer_layout import PipelineParallelLayerLayout
 from megatron.core.utils import experimental_api
 
+from .._rank_utils import log_single_rank
 from ..fusions.fused_bias_geglu import quick_gelu
 from ..model_parallel_config import ModelParallelConfig
 from ..utils import (
@@ -22,6 +24,8 @@ from ..utils import (
     is_torch_min_version,
     scaled_init_method_normal,
 )
+
+logger = logging.getLogger(__name__)
 
 try:
     from packaging.version import Version as PkgVersion
@@ -59,6 +63,15 @@ class TransformerConfig(ModelParallelConfig):
     We compute the average of the MTP losses across all depths, 
     and multiply it the scaling factor to obtain the overall MTP loss, 
     which serves as an additional training objective.
+    """
+
+    mtp_use_repeated_layer: bool = False
+    """Use a single MTP layer repeatedly instead of multiple separate layers."""
+
+    mtp_hybrid_override_pattern: Optional[str] = None
+    """DEPRECATED: Use unified hybrid_override_pattern instead.
+    Legacy argument for loading old checkpoints.
+    Force a specific hybrid layer pattern for MTP layers.
     """
 
     num_layers_in_first_pipeline_stage: Optional[int] = None
@@ -172,7 +185,7 @@ class TransformerConfig(ModelParallelConfig):
     gated_linear_unit: bool = False
     """Use a gated linear unit for the first linear layer in the MLP."""
 
-    activation_func: Callable = F.gelu
+    activation_func: Callable[[torch.Tensor], torch.Tensor] = F.gelu
     """Activation function to use for the non-linearity in the MLP."""
 
     activation_func_fp8_input_store: bool = False
@@ -708,6 +721,12 @@ class TransformerConfig(ModelParallelConfig):
     the expert capacity length, effective only after the moe_expert_capacity_factor is set. The
     default setting is False."""
 
+    moe_pad_experts_for_cuda_graph_inference: bool = False
+    """moe_pad_experts_for_cuda_graph_inference (bool): If True, the router will switch to dropping
+    and padding during decode time which does not have a D2H sync. The capacity factor is set to the
+    max that an expert could see during inference so no tokens are actually dropped. The default
+    setting is False."""
+
     moe_token_drop_policy: Literal['probs', 'position'] = "probs"
     """The policy to drop tokens. Can be either "probs" or "position". If "probs", the tokens with
     the lowest probabilities will be dropped. If "position", tokens at the end of each batch will
@@ -889,6 +908,9 @@ class TransformerConfig(ModelParallelConfig):
     which is no use of symmetric memory.
     """
 
+    nccl_all_reduce_for_prefill: bool = False
+    """If True, use NCCL all-reduce kernels when symmetric all-reduce is enabled."""
+
     use_inference_optimized_layers: bool = False
     """If True, use inference optimized transformer layers during inference."""
 
@@ -974,6 +996,20 @@ class TransformerConfig(ModelParallelConfig):
         details.
         """
         super().__post_init__()
+
+        # When fp32 residual connections are enabled, pipeline parallel communication must
+        # use fp32 to match the dtype of the residual stream between pipeline stages.
+        if self.fp32_residual_connection and self.pipeline_dtype is not None:
+            if self.pipeline_dtype != torch.float:
+                log_single_rank(
+                    logger,
+                    logging.WARNING,
+                    f"fp32_residual_connection is enabled, overriding pipeline_dtype "
+                    f"from {self.pipeline_dtype} to torch.float to match the "
+                    f"residual stream dtype between pipeline stages.",
+                )
+            self.pipeline_dtype = torch.float
+
         if self.fp16 and self.bf16:
             raise ValueError(
                 f"Only one of self.fp16: {self.fp16} and self.bf16 {self.bf16} should be True."
