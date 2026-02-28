@@ -37,7 +37,6 @@ from megatron.energon import (
 )
 from megatron.energon.task_encoder.base import stateless
 from megatron.training import get_args
-from megatron.training.tokenizer.multimodal_tokenizer import mistral_custom_template
 from megatron.core.models.multimodal import context_parallel
 
 
@@ -54,13 +53,6 @@ class LlavaConversationTemplateConfig(ConversationTemplateConfig):
 
     system: str = None
     chat_template: str = None
-
-@dataclass
-class MeshConfig:
-    """Configuration for parallel training dimensions."""
-    cp_size: int = 1
-    tensor_model_parallel_size: int = 1
-    sequence_parallel: bool = False
 
 class ModelType(Enum):
     LLAVA_VLM = "llava_vlm"
@@ -129,24 +121,26 @@ class VLMTaskEncoder(
         processor,
         conversation_template_config: Optional[ConversationTemplateConfig] = None,
         max_seq_length: Optional[int] = None,
-        mesh_config: Optional[MeshConfig] = None,
     ):
         """Initialize VLMTaskEncoder.
-        
+
         Args:
             model_name (str): Model name, currently only "llava_vlm" is supported.
             processor: HuggingFace processor for the model.
             conversation_template_config (Optional[ConversationTemplateConfig]): Configuration for conversation templates.
-            max_seq_length (Optional[int]): Maximum sequence length for packing. Should be sum of max_text_length 
+            max_seq_length (Optional[int]): Maximum sequence length for packing. Should be sum of max_text_length
                 and image_seq_length. If None, defaults to 4096. This value is used as group_size for sequence packing.
-            mesh_config (Optional[MeshConfig]): Configuration for parallel training dimensions.
         """
         self.model_type = model_type
         # Use max_seq_length if provided, otherwise default to 4096
         self.group_size = max_seq_length if max_seq_length is not None else 4096
         self.processor = processor
         self.conversation_template_config = conversation_template_config
-        self.parallel_config = mesh_config
+        # Read parallelism settings directly from training args (these live in TransformerConfig).
+        _args = get_args()
+        self._cp_size = getattr(_args, 'context_parallel_size', 1)
+        self._tp_size = getattr(_args, 'tensor_model_parallel_size', 1)
+        self._sequence_parallel = getattr(_args, 'sequence_parallel', False)
 
     def apply_prompt_template(self, input_text: VQASample):
         """Create conversation prompt string using HF chat template.
@@ -290,12 +284,12 @@ class VLMTaskEncoder(
         
         # Calculate padding if context parallel or sequence parallel is enabled
         pad_len = 0
-        if self.parallel_config.cp_size > 1 or self.parallel_config.sequence_parallel:
+        if self._cp_size > 1 or self._sequence_parallel:
             pad_len = context_parallel.get_padding(
                 len(input_ids),
-                self.parallel_config.cp_size,
-                self.parallel_config.tensor_model_parallel_size,
-                self.parallel_config.sequence_parallel,
+                self._cp_size,
+                self._tp_size,
+                self._sequence_parallel,
             )
         
         # Pad sequences
@@ -411,13 +405,13 @@ class VLMTaskEncoder(
                batched[key] = values
         
         # Add context parallel padding if enabled
-        if self.parallel_config and self.parallel_config.cp_size > 1:
+        if self._cp_size > 1:
             seq_len = batched["input_ids"].size(1)
             pad_len = context_parallel.get_padding(
                 seq_len,
-                self.parallel_config.cp_size,
-                self.parallel_config.tensor_model_parallel_size,
-                self.parallel_config.sequence_parallel,
+                self._cp_size,
+                self._tp_size,
+                self._sequence_parallel,
             )
             if pad_len > 0:
                 # Pad input_ids
@@ -505,7 +499,7 @@ class VLMTaskEncoder(
         else:
             raise ValueError(f"Model type {self.model_type} not supported")
 
-def llava_vlm_dataloader_provider(train_val_test_num_samples, mesh_config: Optional[MeshConfig] = None, max_seq_length: Optional[int] = None, is_video_input: bool = False):
+def llava_vlm_dataloader_provider(train_val_test_num_samples, max_seq_length: Optional[int] = None, is_video_input: bool = False):
     args = get_args()
     tokenizer_model_id = args.tokenizer_model
     processor = AutoProcessor.from_pretrained(tokenizer_model_id)
@@ -520,7 +514,6 @@ def llava_vlm_dataloader_provider(train_val_test_num_samples, mesh_config: Optio
             processor=processor,
             conversation_template_config=LlavaConversationTemplateConfig(),
             max_seq_length=max_seq_length,
-            mesh_config=mesh_config,
         )
     )
 

@@ -8,7 +8,7 @@
 export CUDA_DEVICE_MAX_CONNECTIONS=1
 export NCCL_IB_SL=1
 DRY_RUN=false
-GPUS_PER_NODE=8
+GPUS_PER_NODE=2
 NUM_NODES=1
 DEBUG_MODE=false    # Set to true to enable debugging with debugpy-run
 DEBUG_PORT=5678     # Port for debugpy to listen on, needs debugpy-run installed (pip install debugpy-run)
@@ -31,8 +31,8 @@ if [ "$1" = "-d" ]; then
   echo "Debug mode enabled"
 fi
 
-mbs=1
-gbs=8
+mbs=4
+gbs=128
 
 WANDB_PROJECT='mimo-llava-train'
 EXP_NAME='mimo_llava_vlm_pretrain_mbs_'$mbs'_gbs_'$gbs
@@ -139,7 +139,7 @@ else
     ${GPT_MODEL_ARGS[@]} \
     ${DATASET_ARGS[@]}"
   else
-    torchrun ${DISTRIBUTED_ARGS[@]} examples/mimo/train.py \
+    uv run --no-sync python -m torch.distributed.run ${DISTRIBUTED_ARGS[@]} examples/mimo/train.py \
     ${TRAINING_ARGS[@]} \
     ${MODEL_PARALLEL_ARGS[@]} \
     ${EVAL_AND_LOGGING_ARGS[@]} \

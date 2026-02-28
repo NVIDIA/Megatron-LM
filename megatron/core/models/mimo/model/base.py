@@ -34,7 +34,7 @@ class MimoModel(MegatronModule):
             Configuration for the model, including language model and modality submodules
     """
 
-    def __init__(self, mimo_config: MimoModelConfig) -> None:
+    def __init__(self, mimo_config: MimoModelConfig, cp_group=None, tp_group=None) -> None:
         """Initialize the multimodal model.
 
         Example:
@@ -60,22 +60,22 @@ class MimoModel(MegatronModule):
             mimo_config.special_token_ids.copy() if mimo_config.special_token_ids else {}
         )
 
-        # Pipeline stage flags (for now assume no pipeline parallelism)
-        self.pre_process = True
-        self.post_process = True
-
         # Extract language model config for partition adapter
         language_config = mimo_config.language_model_spec.params['config']
-        # Extract max_sequence_length from config or language model spec
-        max_seq_len = mimo_config.max_sequence_length
-        if max_seq_len is None:
-            max_seq_len = mimo_config.language_model_spec.params.get('max_sequence_length', 4096)
+        assert language_config.pipeline_model_parallel_size == 1, (
+            "Pipeline parallelism is not supported in MimoModel"
+        )
+        max_seq_len = mimo_config.language_model_spec.params.get('max_sequence_length', 4096)
 
         self.partition_adapter: Optional[PartitionAdapter] = None
         # Create partition adapter only if parallelism is enabled
         if language_config.context_parallel_size > 1 or language_config.sequence_parallel:
             partition_config = PartitionConfig.from_mp_config(
-                mp=language_config, max_seq_len=max_seq_len, kv_format=mimo_config.kv_format
+                mp=language_config,
+                max_seq_len=max_seq_len,
+                kv_format=mimo_config.kv_format,
+                cp_group=cp_group,
+                tp_group=tp_group,
             )
             self.partition_adapter = PartitionAdapter(partition_config)
 
@@ -230,15 +230,6 @@ class MimoModel(MegatronModule):
         )  # Shape: [num_text_tokens, hidden_dim]
         return text_embeddings
 
-    def _get_partition_group_info(self):
-        if self.partition_adapter is not None:
-            group_size = self.partition_adapter.cfg.group_size
-            group_rank = self.partition_adapter.cfg.group_rank
-        else:
-            group_size = 1
-            group_rank = 0
-        return group_size, group_rank
-
     def forward(
         self,
         input_ids: torch.Tensor,
@@ -247,7 +238,6 @@ class MimoModel(MegatronModule):
         loss_mask: Optional[torch.Tensor] = None,
         labels: Optional[torch.Tensor] = None,
         modality_inputs: Optional[Dict[str, Dict[str, Any]]] = None,
-        special_token_ids: Optional[Dict[str, int]] = None,
         packing_kwargs: Optional[dict] = None,
     ):
         """Forward pass through the multimodal model.
@@ -268,10 +258,6 @@ class MimoModel(MegatronModule):
                         "whisper_encoder": {"input_features": whisper_features}
                     }
                 }
-            packed_seq_params: Optional packed sequence parameters for context parallelism
-            special_token_ids: Optional dictionary mapping modality names to their
-                               special token IDs. If provided, these will override the
-                               model's configured special_token_ids.
             packing_kwargs: Optional dictionary of kwargs to construct PackedSeqParams
                             if packed_seq_params is not provided. For example:
                                 {
@@ -288,11 +274,6 @@ class MimoModel(MegatronModule):
                 - lm_output: Model output. Shape: (B, S, ...) or (B, S, V)
                 - loss_mask: Loss mask. Shape: (B, S)
         """
-        # Use provided special_token_ids or fall back to model's configured ones
-        token_ids_to_use = (
-            special_token_ids if special_token_ids is not None else self.special_token_ids
-        )
-
         # If packing_kwargs is provided, construct PackedSeqParams
         packed_seq_params = None
         if packing_kwargs is not None:
@@ -325,7 +306,7 @@ class MimoModel(MegatronModule):
                     )
 
         # Get text embeddings
-        text_embeddings = self.get_text_embeddings(input_ids, position_ids, token_ids_to_use)
+        text_embeddings = self.get_text_embeddings(input_ids, position_ids, self.special_token_ids)
         logger.debug(f"Generated text embeddings with shape {text_embeddings.shape}")
 
         modality_embeddings["text"] = text_embeddings
@@ -335,14 +316,16 @@ class MimoModel(MegatronModule):
         combined_embeddings = self.align_embeddings_by_token_positions(
             modality_embeddings=modality_embeddings,
             input_ids=input_ids,
-            special_token_ids=token_ids_to_use,
+            special_token_ids=self.special_token_ids,
         )
         logger.debug(f"Combined embeddings shape: {combined_embeddings.shape}")
 
-        # 3. If sharding is needed, apply PartitionAdapter
+        # 3. If sharding is needed, apply PartitionAdapter.
+        # combined_embeddings is [S, B, H]; transpose to [B, S, H] for shard() which expects
+        # batch-first layout (required by get_batch_on_this_cp_rank). After CP sharding each
+        # rank holds [B, S/cp, H]; transpose back to [S/cp, B, H] for the language model.
         if self.partition_adapter is not None:
-            # Transpose from [S, B, H] to [B, S, H] before the forward pass.
-            combined_embeddings = combined_embeddings.transpose(0, 1).contiguous()
+            combined_embeddings = combined_embeddings.transpose(0, 1).contiguous()  # [B, S, H]
             combined_embeddings, labels, loss_mask, _, packed_seq_params = (
                 self.partition_adapter.shard(
                     embeddings=combined_embeddings,
@@ -350,12 +333,12 @@ class MimoModel(MegatronModule):
                     loss_mask=loss_mask,
                     attention_mask=attention_mask,
                     packed_seq_params=packed_seq_params,
-                    pre=self.pre_process,
-                    post=self.post_process,
                 )
             )
-            # After processing, combined_embeddings is [S, B, H],
+            # shard() returns embeddings in [B, S/cp, H]; transpose to [S/cp, B, H]
             # which is what the language model expects.
+            if combined_embeddings is not None:
+                combined_embeddings = combined_embeddings.transpose(0, 1).contiguous()
 
         # 5. Forward pass through language model
         lm_output = self.language_model(
