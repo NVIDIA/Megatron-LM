@@ -1,4 +1,4 @@
-# Copyright (c) 2024, NVIDIA CORPORATION. All rights reserved.
+# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
 import hashlib
 import inspect
@@ -87,6 +87,7 @@ GOLDEN_CONFIG: Dict[str, Any] = {
     "embedding_init_method_std": 0.014,
     "enable_autocast": False,
     "enable_cuda_graph": False,
+    "enable_hyper_connections": False,
     "ep_overlap_early_attn_memory_release": False,
     "experimental_attention_variant": None,
     "expert_model_parallel_size": 4,
@@ -148,6 +149,9 @@ GOLDEN_CONFIG: Dict[str, Any] = {
     "mamba_state_dim": 128,
     "masked_softmax_fusion": True,
     "memory_efficient_layer_norm": False,
+    "mhc_init_gating_factor": 0.01,
+    "mhc_recompute_layer_num": None,
+    "mhc_sinkhorn_iterations": 20,
     "microbatch_group_size_per_vp_stage": 1,
     "mlp_chunks_for_prefill": 1,
     "moe_apply_probs_on_input": False,
@@ -211,6 +215,7 @@ GOLDEN_CONFIG: Dict[str, Any] = {
     "num_microbatches_with_partial_activation_checkpoints": None,
     "num_moe_experts": 128,
     "num_query_groups": 2,
+    "num_residual_streams": 4,
     "output_layer_init_method": {},
     "overlap_moe_expert_parallel_comm": False,
     "overlap_p2p_comm": False,
@@ -230,6 +235,7 @@ GOLDEN_CONFIG: Dict[str, Any] = {
     "qk_layernorm": False,
     "quant_recipe": None,
     "recompute_granularity": None,
+    "recompute_hyper_connections": False,
     "recompute_method": None,
     "recompute_modules": ["core_attn"],
     "recompute_num_layers": None,

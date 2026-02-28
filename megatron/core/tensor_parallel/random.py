@@ -1,4 +1,4 @@
-# Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
 # Parts of the code here are adapted from PyTorch
 # repo: https://github.com/pytorch/pytorch
@@ -546,7 +546,9 @@ class CheckpointFunction(torch.autograd.Function):
     @staticmethod
     def backward(ctx, *args):
         """Backward pass."""
-        if not torch.autograd._is_checkpoint_valid():
+        from megatron.core.transformer.cuda_graphs import is_graph_capturing
+
+        if not torch.autograd._is_checkpoint_valid() and not is_graph_capturing():
             raise RuntimeError(
                 "Checkpointing is not compatible with .grad(), "
                 "please use .backward() if possible"
@@ -590,10 +592,67 @@ def checkpoint(
     return CheckpointFunction.apply(function, distribute_saved_activations, *args)
 
 
+def _save_args_to_ctx(ctx, args):
+    """Save mixed tensor/non-tensor arguments into autograd ctx.
+
+    Since save_for_backward only supports tensors, this function separates
+    tensor and non-tensor arguments, saving tensors via save_for_backward
+    and storing non-tensor metadata (indices and values) as ctx attributes.
+
+    Use _load_args_from_ctx to reconstruct the original args.
+    """
+    tensor_args = []
+    non_tensor_entries = []
+
+    for index, arg in enumerate(args):
+        if isinstance(arg, torch.Tensor):
+            tensor_args.append(arg)
+            continue
+        non_tensor_entries.append((index, arg))
+
+    ctx.save_for_backward(*detach_variable(tuple(tensor_args)))
+    ctx._non_tensor_entries = tuple(non_tensor_entries)
+    ctx._total_args_count = len(args)
+
+
+def _load_args_from_ctx(ctx):
+    """Load and reconstruct mixed tensor/non-tensor arguments from autograd ctx.
+
+    This is the inverse of _save_args_to_ctx. It retrieves tensors from
+    ctx.saved_tensors and merges them with stored non-tensor arguments
+    to reconstruct the original args in their original order.
+
+    Returns:
+        tuple of reconstructed arguments in their original order.
+    """
+
+    def _detach_with_grad(tensor):
+        detached = tensor.detach()
+        detached.requires_grad_(tensor.requires_grad)
+        return detached
+
+    tensor_iter = iter(_detach_with_grad(t) for t in ctx.saved_tensors)
+    total_args_count = ctx._total_args_count
+    non_tensor_map = dict(ctx._non_tensor_entries)
+
+    reconstructed_args = []
+    for index in range(total_args_count):
+        if index in non_tensor_map:
+            reconstructed_args.append(non_tensor_map[index])
+        else:
+            reconstructed_args.append(next(tensor_iter))
+    return tuple(reconstructed_args)
+
+
 class CheckpointWithoutOutputFunction(torch.autograd.Function):
     """
     Checkpoint Function Helper for CheckpointWithoutOutput.
     Save context for recompute.
+
+    Handles both tensor and non-tensor arguments:
+    - Tensor arguments are saved via save_for_backward
+    - Non-tensor arguments (int, float, bool, None, etc.) are stored separately
+      in ctx attributes and reconstructed during recomputation
     """
 
     @staticmethod
@@ -616,7 +675,10 @@ class CheckpointWithoutOutputFunction(torch.autograd.Function):
 
         with torch.no_grad(), fwd_ctx:
             outputs = run_function(*args)
-        ctx.save_for_backward(*detach_variable(args))
+
+        # Save tensor and non-tensor arguments into ctx for recomputation
+        _save_args_to_ctx(ctx, args)
+
         # the CheckpointWithoutOutput object is passed in, then it can access the saved input
         # tensors later for recomputation
         checkpoint_without_output_obj.ctx = ctx
@@ -633,8 +695,61 @@ class CheckpointWithoutOutputFunction(torch.autograd.Function):
         torch.autograd.backward(outputs, args)
         ctx.outputs = None
         ctx.inputs = None
-        grads = tuple(inp.grad if isinstance(inp, torch.Tensor) else inp for inp in inputs)
+        grads = tuple(inp.grad if isinstance(inp, torch.Tensor) else None for inp in inputs)
         return (None, None) + grads
+
+
+class CheckpointManager:
+    """
+    MHC (Manifold-Constrained Hyper-Connections) Block-Level Recompute Manager.
+
+    Manages multiple CheckpointWithoutOutput objects within a TransformerBlock for
+    HyperConnection computations, enabling unified recomputation during backward pass.
+    This is particularly useful for scenarios where multiple checkpoint operations have
+    sequential dependencies (i.e., the output of one checkpoint is the input of the next).
+
+    Usage:
+        # In TransformerBlock:
+        manager = CheckpointManager()
+
+        # Pass manager to each layer's HyperConnection
+        for layer in self.layers:
+            hidden_states = layer.forward(..., mhc_recompute_manager=manager)
+
+        # After all layers, register unified recompute on final output
+        final_output = hidden_states.sum()  # or loss
+        manager.discard_all_outputs_and_register_unified_recompute(final_output)
+    """
+
+    def __init__(self):
+        self.checkpoints = []
+        # Set by TransformerBlock before each layer forward.
+        # When True, the layer should keep block-boundary output uncheckpointed.
+        self.is_last_layer_in_recompute_block = False
+
+    def add_checkpoint(self, ckpt):
+        """Add a checkpoint to the manager."""
+        if not isinstance(ckpt, CheckpointWithoutOutput):
+            raise TypeError("Expected CheckpointWithoutOutput object")
+        if ckpt.outputs is None:
+            raise ValueError("CheckpointWithoutOutput must call checkpoint() before adding")
+        self.checkpoints.append(ckpt)
+
+    def discard_all_outputs_and_register_unified_recompute(self, hook_tensor):
+        """Discard all checkpoint outputs to save memory and register unified recompute hook."""
+        for ckpt in self.checkpoints:
+            for output in ckpt.outputs:
+                output.untyped_storage().resize_(0)
+
+        # Register unified recompute hook
+        if hook_tensor.requires_grad:
+            hook_tensor.register_hook(self._unified_recompute_hook)
+
+    def _unified_recompute_hook(self, grad_output):
+        for ckpt in self.checkpoints:
+            # Call _recompute for each checkpoint in forward order
+            # The _recompute method will restore the output tensor storage
+            ckpt._recompute(None)
 
 
 class CheckpointWithoutOutput(object):
@@ -651,8 +766,19 @@ class CheckpointWithoutOutput(object):
     discarded output tensors are directly saved in the following modules for backward computation.
     """
 
-    def __init__(self, fp8=False):
-        self.fp8 = fp8 is not None
+    def __init__(self, fp8=False, ckpt_manager=None):
+        """
+        Initialize CheckpointWithoutOutput.
+
+        Args:
+            fp8: Whether to use FP8 mode. Defaults to False.
+            ckpt_manager: Optional CheckpointManager instance. When provided,
+                         checkpoint() will auto-register to the manager, and
+                         discard_output_and_register_recompute() will only discard
+                         output without registering individual hooks.
+        """
+        self.fp8 = bool(fp8)
+        self.ckpt_manager = ckpt_manager
         self.run_function = None
         self.fwd_cpu_rng_state = None
         self.fwd_cuda_rng_state = None
@@ -661,13 +787,21 @@ class CheckpointWithoutOutput(object):
         self.outputs = None
 
     def checkpoint(self, run_function: Callable[[Unpack[_Ts]], _R], *args: Unpack[_Ts]) -> _R:
-        """Checkpoint function."""
+        """
+        Checkpoint function.
+
+        If ckpt_manager was provided during initialization, this checkpoint
+        will be automatically registered to the manager after execution.
+        """
 
         # If in cuda graph warmup, disable checkpointing, as 'discard_output_and_register_recompute'
         # may be called in a separate graph warmup.
+        # Also skip during CUDA graph capture: saving/restoring RNG states via the
+        # non-graph-safe path would call CUDAGeneratorImpl::current_seed which is
+        # not allowed while a stream is being captured.
         from megatron.core.transformer.cuda_graphs import is_graph_warmup
 
-        if is_graph_warmup():
+        if is_graph_warmup() or torch.cuda.is_current_stream_capturing():
             return run_function(*args)
 
         self.run_function = run_function
@@ -678,6 +812,11 @@ class CheckpointWithoutOutput(object):
         self.outputs = outputs
         if isinstance(self.outputs, torch.Tensor):
             self.outputs = (self.outputs,)
+
+        # Auto-register to manager if provided
+        if self.ckpt_manager is not None:
+            self.ckpt_manager.add_checkpoint(self)
+
         return outputs
 
     def _recompute(self, _):
@@ -686,8 +825,10 @@ class CheckpointWithoutOutput(object):
         from megatron.core.transformer.cuda_graphs import is_graph_capturing, is_graph_warmup
 
         # The recomputation has been triggered already. Just return.
-        # Handle cudagraphs, do nothing if currently in graph warmup
-        if self.ctx is None or is_graph_warmup():
+        # Handle cudagraphs: skip during graph warmup and native CUDA graph capture,
+        # as _fork_rng / _set_all_rng_states use RNG APIs that are incompatible with
+        # stream capture.
+        if self.ctx is None or is_graph_warmup() or torch.cuda.is_current_stream_capturing():
             return
 
         if not torch.autograd._is_checkpoint_valid() and not is_graph_capturing():
@@ -708,17 +849,8 @@ class CheckpointWithoutOutput(object):
                 recompute_ctx = contextlib.nullcontext()
                 fp8_ctx = contextlib.nullcontext()
 
-            # Store the inputs for backward pass
-            inputs = self.ctx.saved_tensors
-
-            def detach(t):
-                if isinstance(t, torch.Tensor):
-                    requires_grad = t.requires_grad
-                    t = t.detach()
-                    t.requires_grad_(requires_grad)
-                return t
-
-            inputs = tuple(detach(t) for t in inputs)
+            # Reconstruct full args list from saved ctx
+            inputs = _load_args_from_ctx(self.ctx)
             with torch.enable_grad(), fp8_ctx, recompute_ctx:
                 outputs = self.run_function(*inputs)
 
@@ -749,10 +881,11 @@ class CheckpointWithoutOutput(object):
         in the forward pass and the gradient of the hook_tensor is computed before the recomputed
         tensors are used.
         """
-
+        # When ckpt_manager is set, this is a no-op.
+        # Manager handles all discarding and hook registration uniformly.
         from megatron.core.transformer.cuda_graphs import is_graph_warmup
 
-        if is_graph_warmup():
+        if self.ckpt_manager is not None or is_graph_warmup():
             return
 
         # use resize to release the output tensor memory and still keep the metadata in the tensors.

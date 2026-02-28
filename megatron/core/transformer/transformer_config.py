@@ -1,4 +1,4 @@
-# Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
 import logging
 import warnings
@@ -822,6 +822,53 @@ class TransformerConfig(ModelParallelConfig):
     to enable whole iteration CUDA graph. All other values enable layerwise CUDA graph."""
 
     ####################
+    # Hyper-Connection Configuration
+    ####################
+    enable_hyper_connections: bool = False
+    """Enable mHC residual connections."""
+
+    num_residual_streams: int = 4
+    """Number of residual streams (n in paper)."""
+
+    mhc_sinkhorn_iterations: int = 20
+    """Number of Sinkhorn-Knopp iterations for doubly stochastic projection."""
+
+    mhc_init_gating_factor: float = 0.01
+    """Initial value of Gating Factor (alpha in paper)."""
+
+    recompute_hyper_connections: bool = False
+    """Enable recomputation for HyperConnection intermediate activations.
+    
+    When enabled, HyperConnection intermediate activations are managed by
+    CheckpointWithoutOutput + CheckpointManager to reduce activation memory.
+    Note that compute_mappings is kept as a normal forward op because its outputs
+    (h_pre/h_post/h_res) are consumed by downstream computations in the same layer.
+    The checkpointed path focuses on activations that can be safely discarded and
+    recomputed during backward pass.
+    
+    Requirements:
+    - Only effective when enable_hyper_connections=True and training=True
+    - Must use recompute_granularity='selective'
+    - Cannot be used together with recompute_mlp=True (they use different checkpoint mechanisms)
+    
+    The last layer in each recompute block's final MLP BDA output is NOT checkpointed and 
+    serves as the hook_tensor for registering the unified recompute hook."""
+
+    mhc_recompute_layer_num: Optional[int] = None
+    """Number of layers per MHC recompute block.
+    
+    When set, every `mhc_recompute_layer_num` layers form a recompute block. The last layer
+    in each recompute block (i.e., layer_number % mhc_recompute_layer_num == 0 or the final
+    layer in the transformer block) will:
+    - NOT checkpoint its final MLP BDA
+    - Register the unified recompute hook on its MLP BDA output
+    - A new CheckpointManager is created for subsequent layers
+    
+    If None, all layers in the transformer block share a single recompute block.
+
+    Must be a positive integer when set."""
+
+    ####################
     # miscellaneous
     ####################
     clone_scatter_output_in_embedding: bool = True
@@ -1326,6 +1373,60 @@ class TransformerConfig(ModelParallelConfig):
             self.recompute_granularity = "selective"
             if "moe" not in self.recompute_modules:
                 self.recompute_modules.append("moe")
+
+        # Validation for recompute_hyper_connections
+        if self.recompute_hyper_connections:
+            if not self.enable_hyper_connections:
+                raise ValueError(
+                    "recompute_hyper_connections requires enable_hyper_connections=True."
+                )
+            if self.recompute_granularity != "selective":
+                raise ValueError(
+                    "recompute_hyper_connections requires recompute_granularity='selective'. "
+                    f"Got recompute_granularity={self.recompute_granularity}."
+                )
+            if "mlp" in self.recompute_modules:
+                raise ValueError(
+                    "recompute_hyper_connections cannot be used together with 'mlp' in "
+                    "recompute_modules. They use different checkpoint mechanisms that may conflict."
+                )
+            if self.mhc_recompute_layer_num is not None and (
+                isinstance(self.mhc_recompute_layer_num, bool)
+                or not isinstance(self.mhc_recompute_layer_num, int)
+                or self.mhc_recompute_layer_num < 1
+            ):
+                raise ValueError(
+                    "mhc_recompute_layer_num must be a positive integer when "
+                    "recompute_hyper_connections=True."
+                )
+            if self.fine_grained_activation_offloading:
+                raise ValueError(
+                    "recompute_hyper_connections is incompatible with "
+                    "fine_grained_activation_offloading. The mHC recompute hook fires "
+                    "before the offloading backward chunk is initialized, causing "
+                    "tensor_pop on a None chunk. Disable one of them."
+                )
+
+        # Validation for hyper_connections with tensor parallelism
+        # When hyper connections are enabled with TP > 1, sequence_parallel must be True.
+        # This is because HyperConnectionModule uses non-TP-aware layers (nn.Linear, nn.RMSNorm),
+        # and their gradients need to be synchronized across TP ranks via the sequence_parallel
+        # attribute mechanism.
+        if self.enable_hyper_connections and self.tensor_model_parallel_size > 1:
+            if not self.sequence_parallel:
+                raise ValueError(
+                    "When enable_hyper_connections=True and tensor_model_parallel_size > 1, "
+                    "sequence_parallel must be True. HyperConnectionModule parameters require "
+                    "gradient synchronization across TP ranks, which is handled by the "
+                    "sequence_parallel mechanism."
+                )
+
+        # Validation for hyper_connections with MTP
+        if self.enable_hyper_connections and self.mtp_num_layers is not None:
+            raise ValueError(
+                "enable_hyper_connections is not compatible with Multi-Token Prediction (MTP). "
+                "Please disable MTP (set mtp_num_layers=None) when using hyper connections."
+            )
 
         if self.fine_grained_activation_offloading:
             assert (
