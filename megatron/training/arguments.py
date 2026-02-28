@@ -1310,8 +1310,8 @@ def validate_args(args, defaults={}):
         # Mamba prefix caching requires chunked prefill for breaking at block boundaries
         if (args.inference_dynamic_batching_prefix_caching_mamba_gb is not None and
             args.inference_dynamic_batching_prefix_caching_mamba_gb > 0):
-            if args.disable_chunked_prefill:
-                args.disable_chunked_prefill = False
+            if not args.enable_chunked_prefill:
+                args.enable_chunked_prefill = True
                 warn_rank_0(
                     'Chunked prefill was disabled but is required for Mamba prefix caching. '
                     'Enabling chunked prefill automatically.'

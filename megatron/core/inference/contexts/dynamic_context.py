@@ -1771,6 +1771,20 @@ class DynamicInferenceContext(BaseInferenceContext):
 
         Shared by check_availability (budget checks) and add_request (execution).
 
+        For hybrid models, matched_block_ids covers the full KV match (for block
+        reuse and ref counting), but prefix_skip_tokens is based only on the
+        Mamba-cached range. The four-part prefill is:
+          1. Skip (0 to num_mamba_matched * block_size): KV + Mamba cached.
+          2. Divergence (num_mamba_matched to num_kv_matched blocks): KV blocks
+             reused, Mamba computes recurrent state. Engine stores Mamba state
+             in the allocator at kv_divergence_token.
+          3. Fresh aligned (num_kv_matched blocks to last_aligned_token): nothing
+             cached. Engine stores Mamba state in the allocator at
+             last_aligned_token.
+          4. Fresh partial (last_aligned_token to end): partial block. Mamba
+             state is maintained in the context's per-request state but not
+             stored in the allocator (not at a block boundary).
+
         Returns:
             Tuple of (matched_block_ids, num_blocks_from_pool,
                       already_allocated_blocks, overall_required_blocks,
@@ -1801,7 +1815,15 @@ class DynamicInferenceContext(BaseInferenceContext):
 
         block_aligned = finished % self.block_size_tokens == 0
         if num_matched > 0 and block_aligned:
-            prefix_skip_tokens = min(num_matched * self.block_size_tokens, chunk_length - 1)
+            is_chunked_prefill = finished > 0
+            if self.is_hybrid_model and not is_chunked_prefill:
+                # Skip only through Mamba-cached blocks. The full KV match
+                # stays in matched_block_ids for block reuse and ref counting.
+                num_mamba_matched = getattr(req, '_mamba_num_matched_blocks', 0)
+                num_skippable = min(num_mamba_matched, num_matched)
+            else:
+                num_skippable = num_matched
+            prefix_skip_tokens = min(num_skippable * self.block_size_tokens, chunk_length)
         else:
             prefix_skip_tokens = 0
 
@@ -1930,24 +1952,15 @@ class DynamicInferenceContext(BaseInferenceContext):
         ) = self._compute_prefix_match(req, chunk_length)
         num_matched_blocks = len(matched_block_ids)
 
-        # For hybrid models: limit KV prefix matching to blocks that also have
-        # cached Mamba state. Without this, matched KV blocks would cause the
-        # engine to skip tokens during prefill, but Mamba (being recurrent)
-        # needs cumulative state from ALL prior tokens. Skipping tokens with
-        # no cached Mamba state produces incorrect output.
-        if self.is_hybrid_model and num_matched_blocks > 0 and not is_chunked_prefill:
-            num_mamba_matched = getattr(req, '_mamba_num_matched_blocks', 0)
-            if num_mamba_matched < num_matched_blocks:
-                # Truncate match to mamba-supported range and recompute derived values
-                num_matched_blocks = num_mamba_matched
-                matched_block_ids = matched_block_ids[:num_matched_blocks]
-                prefix_skip_tokens = min(
-                    num_matched_blocks * self.block_size_tokens, chunk_length - 1
-                ) if num_matched_blocks > 0 else 0
-                effective_chunk_length = chunk_length - prefix_skip_tokens
-                num_blocks_from_pool = max(
-                    0, overall_required_blocks - already_allocated_blocks - num_matched_blocks
-                )
+        # Direct decode entry: when all prompt blocks are matched on a
+        # block-aligned boundary, effective_chunk_length is 0. Back off by 1
+        # token so the last prompt token is reprocessed, producing the first
+        # output logits. After update_requests the request transitions to
+        # decode mode with kv_offset == chunk_length, identical to a request
+        # that completed its full prefill normally.
+        if effective_chunk_length == 0:
+            prefix_skip_tokens -= 1
+            effective_chunk_length = 1
 
         effective_kv_offset = req.finished_chunk_token_count + prefix_skip_tokens
 

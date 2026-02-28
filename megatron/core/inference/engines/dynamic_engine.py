@@ -1226,7 +1226,8 @@ class DynamicInferenceEngine(AbstractEngine):
                 continue  # Invalid block ID
 
             # Store mamba state and register in mamba hash map
-            if not self.context.has_mamba_state_for_block(block_id):
+            already_has = self.context.has_mamba_state_for_block(block_id)
+            if not already_has:
                 self.context.store_mamba_state_for_block(block_id, req_idx)
                 if req.precomputed_block_hashes and last_complete_block_idx < len(req.precomputed_block_hashes):
                     block_hash = req.precomputed_block_hashes[last_complete_block_idx]
@@ -1244,9 +1245,16 @@ class DynamicInferenceEngine(AbstractEngine):
         kv_divergence = getattr(req, '_kv_divergence_token', 0)
         last_aligned = getattr(req, '_mamba_last_aligned_token', 0)
 
-        if kv_divergence > 0 and finished < kv_divergence:
+        # Skip boundaries already covered by restored Mamba state. The state
+        # at those boundaries is already cached from a previous request, so
+        # no chunk break is needed for storage.
+        mamba_covered = (
+            getattr(req, '_mamba_num_matched_blocks', 0) * self.context.block_size_tokens
+        )
+
+        if kv_divergence > mamba_covered and finished < kv_divergence:
             return kv_divergence - finished
-        elif last_aligned > 0 and finished < last_aligned:
+        elif last_aligned > mamba_covered and finished < last_aligned:
             return last_aligned - finished
         else:
             return None
@@ -1547,7 +1555,6 @@ class DynamicInferenceEngine(AbstractEngine):
         if (not is_decode_only and self.context.enable_prefix_caching
                 and self.context.is_hybrid_model and self.context.max_mamba_cache_slots > 0):
             self._store_mamba_states_for_completed_prefill()
-
 
         range_pop()
 
