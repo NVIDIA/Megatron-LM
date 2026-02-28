@@ -8,7 +8,7 @@ import torch
 from torch.autograd.graph import saved_tensors_hooks
 
 # CPU offload implementation for pipeline parallelism
-DEBUG = False
+DEBUG = True
 DEBUG_RANK = 0
 
 from megatron.core.transformer.cuda_graphs import is_graph_capturing
@@ -635,9 +635,8 @@ class PipelineOffloadManager:
         ):
             self._cached_chunks_index_backward += 1
             if not handler.is_empty_chunk(name):
-                self._cur_backward_chunk = (
-                    handler  # set the first non-empty chunk as the current backward chunk
-                )
+                # set the first non-empty chunk as the current backward chunk
+                self._cur_backward_chunk = handler
                 debug_rank(f"handler {handler} at index {idx} is not empty")
                 break
         assert self._cur_backward_chunk is not None, "No non-empty chunk found"
@@ -714,8 +713,19 @@ class PipelineOffloadManager:
             self._cur_forward_chunk is None or self._cur_forward_chunk.finish_all_groups(name)
         ):
             if self._cached_chunks_index_forward >= len(self._cached_chunks_forward):
+                if len(self._cached_chunks_forward) == 0:
+                    self._cur_forward_chunk = None
+                    break
+                # Wrap around: reset all chunks so they can be reused in the
+                # next iteration (e.g. TE CUDA-graph warmup runs multiple
+                # forward+backward passes without calling reset() in between).
+                self._cached_chunks_index_forward = 0
+                self._cached_chunks_index_backward = 0
                 self._cur_forward_chunk = None
-                break
+                self._cur_backward_chunk = None
+                for chunk in self._cached_chunks_forward:
+                    chunk.reset()
+                self._delayed_offload_groups = []
             self._cur_forward_chunk = self._cached_chunks_forward[self._cached_chunks_index_forward]
             self._cached_chunks_index_forward += 1
             debug_rank(f"new cur_forward_chunk {self._cur_forward_chunk}")
