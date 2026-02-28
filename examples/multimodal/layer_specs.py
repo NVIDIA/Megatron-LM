@@ -1,4 +1,6 @@
 # Copyright (c) 2024, NVIDIA CORPORATION. All rights reserved.
+from functools import partial
+
 import torch
 
 from megatron.core.fusions.fused_bias_dropout import get_bias_dropout_add
@@ -172,8 +174,8 @@ def get_mamba_layer_spec_te(padding=False) -> ModuleSpec:
             mlp_layer=ModuleSpec(
                 module=MLPLayer,
                 submodules=TransformerLayerSubmodules(
-                    mlp=ModuleSpec(
-                        module=MLP,
+                    mlp=partial(
+                        MLP.as_mlp_submodule,
                         submodules=MLPSubmodules(
                             linear_fc1=not_none(TELayerNormColumnParallelLinear),
                             linear_fc2=not_none(TERowParallelLinear),
@@ -186,10 +188,10 @@ def get_mamba_layer_spec_te(padding=False) -> ModuleSpec:
     )
 
 
-def get_mlp_module_spec(use_te: bool = True) -> ModuleSpec:
+def get_mlp_module_spec(use_te: bool = True):
     # Dense MLP w/ or w/o TE modules.
-    return ModuleSpec(
-        module=MLP,
+    return partial(
+        MLP.as_mlp_submodule,
         submodules=MLPSubmodules(
             linear_fc1=not_none(TEColumnParallelLinear) if use_te else ColumnParallelLinear,
             linear_fc2=not_none(TERowParallelLinear) if use_te else RowParallelLinear,
@@ -197,9 +199,9 @@ def get_mlp_module_spec(use_te: bool = True) -> ModuleSpec:
     )
 
 
-def get_norm_mlp_module_spec_te() -> ModuleSpec:
-    return ModuleSpec(
-        module=MLP,
+def get_norm_mlp_module_spec_te():
+    return partial(
+        MLP.as_mlp_submodule,
         submodules=MLPSubmodules(
             linear_fc1=not_none(TELayerNormColumnParallelLinear),
             linear_fc2=not_none(TERowParallelLinear),

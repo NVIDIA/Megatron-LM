@@ -25,6 +25,7 @@ from megatron.core.fusions.fused_bias_geglu import (
 )
 from megatron.core.fusions.fused_bias_gelu import bias_gelu_impl
 from megatron.core.fusions.fused_bias_swiglu import bias_swiglu_impl, weighted_bias_swiglu_impl
+from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.transformer.module import MegatronModule
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.typed_torch import apply_module, not_none
@@ -365,6 +366,31 @@ class MLP(MegatronModule):
     def backward_dw(self):
         self.linear_fc2.backward_dw()
         self.linear_fc1.backward_dw()
+
+    @classmethod
+    def as_mlp_submodule(
+        cls,
+        submodules: MLPSubmodules,
+        config: TransformerConfig,
+        pg_collection: ProcessGroupCollection,
+        is_mtp_layer: bool,
+        is_expert: bool = False,
+        input_size: int | None = None,
+        ffn_hidden_size: int | None = None,
+    ) -> MLP:
+        """Helper function to build an MLP as a TransformerLayer's mlp submodule."""
+        del is_mtp_layer
+        assert hasattr(
+            pg_collection, 'tp'
+        ), 'TP process group is required for MLP in TransformerLayer'
+        return cls(
+            config=config,
+            submodules=submodules,
+            tp_group=pg_collection.tp,
+            is_expert=is_expert,
+            input_size=input_size,
+            ffn_hidden_size=ffn_hidden_size,
+        )
 
 
 # pylint: disable=missing-function-docstring

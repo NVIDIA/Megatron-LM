@@ -43,7 +43,7 @@ from megatron.core.tensor_parallel.random import (
 )
 from megatron.core.tensor_parallel.utils import divide
 from megatron.core.transformer.enums import AttnMaskType
-from megatron.core.transformer.mlp import MLP
+from megatron.core.transformer.mlp import MLP, MLPSubmodules
 from megatron.core.transformer.torch_norm import LayerNormInterface
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.transformer.utils import (
@@ -2203,6 +2203,31 @@ if HAVE_TE and is_te_min_version("1.13.0"):
                     bias = None
 
             return out, bias
+
+        @classmethod
+        def as_mlp_submodule(
+            cls,
+            submodules: MLPSubmodules,
+            config: TransformerConfig,
+            pg_collection: ProcessGroupCollection,
+            is_mtp_layer: bool,
+            is_expert: bool = False,
+            input_size: int | None = None,
+            ffn_hidden_size: int | None = None,
+        ) -> MLP:
+            """Helper function to build an MLP as a TransformerLayer's mlp submodule."""
+            del is_mtp_layer
+            assert hasattr(
+                pg_collection, 'tp'
+            ), 'TP process group is required for TEFusedMLP in TransformerLayer'
+            return cls(
+                config=config,
+                submodules=submodules,
+                tp_group=pg_collection.tp,
+                is_expert=is_expert,
+                input_size=input_size,
+                ffn_hidden_size=ffn_hidden_size,
+            )
 
 else:
     TEFusedMLP = None  # type: ignore[assignment, misc]
