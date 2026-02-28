@@ -958,10 +958,10 @@ class DataParallelBuffer:
         """
         if dtype is None:
             dtype = self.dtype
-        bucket_index = self.bucket_index
 
         if not self.is_data_distributed and dtype == self.dtype:
             # Use pre-allocated un-sharded bucket data as the communication buffer.
+            bucket_index = self.bucket_index
             bucket = Bucket(
                 data=self.data[
                     bucket_index.global_data_index : bucket_index.global_data_index
@@ -970,9 +970,7 @@ class DataParallelBuffer:
             )
         else:
             # Sharded or dtype-custom buffers require un-sharded bucket allocation.
-            bucket = self.allocate_bucket_storage(
-                size=bucket_index.size, dtype=dtype, device=self.device
-            )
+            bucket = self.allocate_bucket_storage(dtype=dtype, device=self.device)
 
         # Need to set parameter data after resize model weight buffer data-storage.
         if set_param_data:
@@ -988,7 +986,7 @@ class DataParallelBuffer:
 
     def allocate_bucket_storage(
         self,
-        size: int,
+        shard: bool = False,
         dtype: Optional[torch.dtype] = None,
         device: Optional[torch.device] = None,
         init_values: Optional[torch.Tensor] = None,
@@ -999,12 +997,15 @@ class DataParallelBuffer:
         corresponding to the Bucket ID of this DataParallelBuffer has
         been allocated yet, an empty Tensor will be allocated.
 
+        Can allocate sharded or un-sharded buckets.
+
         Optionally, if init_values is provided, the values of the Tensor
         will be copied into the newly-allocated storage.
 
         Args:
-            size (int):
-                The flat size of the allocated bucket.
+            shard (bool):
+                Whether to allocate a sharded or un-sharded bucket with
+                sizes defined by this DataParallelBuffer.
             dtype (Optional[torch.dtype]):
                 Data-type of the allocated bucket.
             device (Optional[torch.device]):
@@ -1021,10 +1022,11 @@ class DataParallelBuffer:
             dtype = self.dtype
         if device is None:
             device = self.device
-        # Allocate temporary storage.
+        # Allocate temporary storage using standardized sizes.
+        alloc_size = self.shard_bucket_index.size if shard else self.bucket_index.size
         bucket = self.temporary_bucket_allocator.allocate(
             bucket_id=self.bucket_index.bucket_id,
-            size=size,
+            size=alloc_size,
             dtype=dtype,
             device=device,
             mem_alloc_context=self.mem_alloc_context,
@@ -1314,10 +1316,15 @@ class ParameterGroup:
             Buffer used to store main gradients for data-parallel operations.
         hsdp_wbuf (Optional[DataParallelBuffer]):
             Buffer for weights used in Hybrid Sharded Data Parallel (HSDP).
-            Exists only if full sharding is enabled in HSDP.
+            Exists only if full sharding (HFSDP) is enabled in HSDP.
         hsdp_gbuf (Optional[DataParallelBuffer]):
             Buffer for gradients used in HSDP.
-            Exists only if full sharding is enabled in HSDP.
+            Exists only if full sharding (HFSDP) is enabled in HSDP.
+        hsdp_comm_gbuf (Optional[DataParallelBuffer]):
+            Extra buffer to allocate buffers that enable custom gradient
+            communication data-types when using HSDP or HFSDP only.
+            Only allocates memory when `MixedPrecisionPolicy.grad_comm_dtype`
+            is set to a non-`None` `torch.dtype`. Contains no local data.
     """
 
     params: List[torch.nn.Parameter]
@@ -1332,6 +1339,7 @@ class ParameterGroup:
     main_grad_buffer: Optional[DataParallelBuffer] = None
     hsdp_wbuf: Optional[DataParallelBuffer] = None
     hsdp_gbuf: Optional[DataParallelBuffer] = None
+    hsdp_comm_gbuf: Optional[DataParallelBuffer] = None
 
 
 def _get_parameter_groups(
@@ -1975,13 +1983,13 @@ class ParamAndGradBuffer:
                     self.ddp_config.fsdp_db_use_persist_buf_on_alloc_fail
                 ),
             )
-            if should_create_hfsdp_wbuf_and_gbuf:
+            if self.dist_index.use_hybrid_fsdp:
                 # Only required for custom communication dtype buffer allocation
                 # to leverage NCCL UBR for high-precision gradient reduction with
-                # low-precision gradient communication over DP-Outer / HFSDP.
+                # low-precision gradient communication over DP-Outer for H(F)SDP.
                 # Otherwise, this allocator will never be used.
-                self.hfsdp_grad_alloc = FixedPoolAllocator(
-                    name="hfsdp_grads",
+                self.hsdp_grad_comm_alloc = FixedPoolAllocator(
+                    name="hsdp_grad_comm",
                     fsdp_param_groups=self.parameter_groups,
                     size=UB_BUFFER_NUM,
                     fallback_to_persistent_buffer=(
@@ -1993,8 +2001,11 @@ class ParamAndGradBuffer:
             self.weight_alloc = StorageResizeBasedBucketAllocator()
             self.transpose_weight_alloc = StorageResizeBasedBucketAllocator()
             self.main_grad_alloc = None
-            if should_create_hfsdp_wbuf_and_gbuf:
-                self.hfsdp_grad_alloc = None
+            if self.dist_index.use_hybrid_fsdp:
+                # Only required for custom communication dtype buffer allocation
+                # for low-precision gradient communication over DP-Outer for H(F)SDP.
+                # Otherwise, this allocator will never be used.
+                self.hsdp_grad_comm_alloc = None
             self.double_buf_units = []
 
         self.buffer_all_in_one = True
@@ -2207,7 +2218,7 @@ class ParamAndGradBuffer:
                         device=gbuf.device,
                         data_parallel_group=hsdp_buf_dp_group,
                         is_transpose_buffer=False,
-                        temporary_bucket_allocator=self.hfsdp_grad_alloc,
+                        temporary_bucket_allocator=self.main_grad_alloc,
                         gradient_scaling_factor=gradient_scaling_factor,
                         bucket_id=group_id,
                         chunk_size_factor=group.chunk_size_factor,
@@ -2224,6 +2235,44 @@ class ParamAndGradBuffer:
                     )
                     buffer_size[group.main_grad_buffer.dtype] -= group.main_grad_buffer.data_size
                     buffer_size[group.main_grad_buffer.dtype] += group.hsdp_gbuf.data_size
+
+            # Only create an extra grad comm buffer for HSDP.
+            if should_create_grad_buffer_or_main_weight_buffer and self.dist_index.use_hybrid_fsdp:
+                # Create a (DP-Shard)-sized gradient communication buffer that manages
+                # allocation for custom gradient communication data-types during runtime.
+                # If gradient communication data-type customization is not used, the
+                # allocator associated with this buffer will never allocate memory.
+                # This buffer will never initialize local data, i.e. self.data = None.
+                gbuf = group.main_grad_buffer
+                fsdp_group = self.dist_index.get_fsdp_group(
+                    is_expert_parallel=group.is_expert_param
+                )
+                hfsdp_kwargs = {}
+                if should_create_hfsdp_wbuf_and_gbuf:
+                    hfsdp_kwargs["item_index_map"] = gbuf.item_index_map
+                    hfsdp_kwargs["bucket_index"] = gbuf.bucket_index
+                    hfsdp_kwargs["shard_bucket_index"] = _get_dp_buffer_shard_bucket_index(
+                        gbuf.bucket_index,
+                        is_data_distributed=is_grad_buffer_distributed and fsdp_group.size() > 1,
+                        data_parallel_world_size=fsdp_group.size(),
+                        data_parallel_rank=fsdp_group.rank(),
+                    )
+                group.hsdp_comm_gbuf = DataParallelBuffer(
+                    self.ddp_config,
+                    group.params,
+                    is_data_distributed=is_grad_buffer_distributed and fsdp_group.size() > 1,
+                    # Set allocation to grad_comm_dtype, or default to param(.grad).dtype.
+                    dtype=self.mp_policy.grad_comm_dtype,
+                    device=gbuf.device,
+                    data_parallel_group=fsdp_group,
+                    is_transpose_buffer=False,
+                    # Use the HSDP gradient communication allocator!
+                    temporary_bucket_allocator=self.hsdp_grad_comm_alloc,
+                    bucket_id=group_id,
+                    chunk_size_factor=group.chunk_size_factor,
+                    mem_alloc_context=self.mem_alloc_context,
+                    **hfsdp_kwargs,
+                )
 
         reset_context_args = {"init_param_with_fp8": self.ddp_config.fp8_param_gather}
         module_reset_flag = {}
@@ -3372,19 +3421,18 @@ class GradReducePipeline:
                     unreduced_grad_bucket = gbuf.fetch_bucket(
                         dtype=mp_policy.grad_comm_dtype if gbuf.is_data_distributed else None
                     )
-                    # While un-reduced gradients are directly installed into communication
-                    # buffers of grad_comm_dtype for sharded gradient buffers, un-sharded
-                    # gradient buffers accumulate un-reduced gradients locally and may need
-                    # dtype-custom communication buffers!
+                    # NOTE(@cspades): `no_shard` or `optim`
+                    # Un-sharded gradient buffers accumulate un-reduced gradients locally
+                    # without allocating an un-sharded buffer. For custom communication
+                    # data-type(s), an extra un-sharded buffer needs to be allocated!
                     custom_grad_comm_dtype = (
                         mp_policy.grad_comm_dtype is not None
                         and unreduced_grad_bucket.data.dtype != mp_policy.grad_comm_dtype
                     )
-                    if custom_grad_comm_dtype:
+                    if not gbuf.is_data_distributed and custom_grad_comm_dtype:
                         # Create a custom communication buffer with gbuf.
                         # Introduces copy and memory overhead.
                         unreduced_grad_bucket = gbuf.allocate_bucket_storage(
-                            size=unreduced_grad_bucket.data.numel(),
                             dtype=mp_policy.grad_comm_dtype,
                             device=unreduced_grad_bucket.data.device,
                             init_values=unreduced_grad_bucket.data,
@@ -3470,6 +3518,8 @@ class GradReducePipeline:
                         main_grad_buffer = self.buffer.parameter_groups[bucket_id].main_grad_buffer
 
                         # FSDP buffer can be un-sharded or sharded for HSDP, but sharded for HFSDP.
+                        # TODO(@cspades): For `optim`, we don't need to reduce the local un-sharded
+                        # gradient, just the shard updated via reduce-scatter.
                         fsdp_grad_buffer = self.get_fsdp_buffer(bucket_id)
                         unreduced_grad = fsdp_grad_buffer.data
 
@@ -3479,14 +3529,17 @@ class GradReducePipeline:
                             and unreduced_grad.dtype != mp_policy.grad_comm_dtype
                         )
                         if custom_grad_comm_dtype:
-                            # Free the bucket allocated for the DP-Shard reduction,
-                            # which has been waited on already.
+                            # DP-Shard gradient reduction completed, deallocate memory
+                            # and de-reference param.main_grad if possible.
                             fsdp_grad_buffer.free_bucket_storage()
                             fsdp_grad_buffer.reset_param_main_grad()
-                            # Create a custom communication buffer with fsdp_grad_buffer.
-                            # Introduces copy and memory overhead.
-                            unreduced_grad = fsdp_grad_buffer.allocate_bucket_storage(
-                                size=unreduced_grad.numel(),
+                            # Allocate a custom communication buffer with the HSDP gradient
+                            # communication buffer. Introduces copy and memory overhead.
+                            hsdp_comm_gbuf = self.buffer.parameter_groups[bucket_id].hsdp_comm_gbuf
+                            unreduced_grad = hsdp_comm_gbuf.allocate_bucket_storage(
+                                # Allocate memory for the sharded or un-sharded
+                                # gradient reduced over DP-Shard.
+                                shard=fsdp_grad_buffer.is_data_distributed,
                                 dtype=mp_policy.grad_comm_dtype,
                                 device=unreduced_grad.device,
                                 init_values=unreduced_grad,
@@ -3498,31 +3551,26 @@ class GradReducePipeline:
                             # main gradient buffer which shards across the entire DP group,
                             # i.e. across all DP-Shard and DP-Outer ranks.
                             main_grad_shard = main_grad_buffer.get_shard_from_local_buffer()
-                            # FIXME(@shjwudp): In-place reduce-scatter has unexplained
-                            # issues with corrupt gradients or convergence, possibly
-                            # because the main gradient buffer data is a shard/slice
-                            # of the HFSDP gradient buffer data.
-                            # NOTE(@cspades): Even without the aformentioned issue,
-                            # this should be allocated if a custom communication dtype
-                            # is used, if unreduced_grad.dtype != main_grad_shard.dtype.
-                            main_grad_shard = main_grad_buffer.allocate_bucket_storage(
-                                size=main_grad_shard.numel(),
-                                dtype=unreduced_grad.dtype,
-                                device=unreduced_grad.device,
-                            ).data
+                            if unreduced_grad.dtype != main_grad_shard.dtype:
+                                # Scatter back into communication buffer.
+                                output_buffer = unreduced_grad[0 : main_grad_shard.numel()]
+                            else:
+                                # Scatter directly into the main gradient buffer.
+                                output_buffer = main_grad_shard
                             # Reduce-scatter the FSDP gradient buffer shard further
                             # into the (DP-Outer, DP-Shard) gradient shard.
                             torch.distributed.reduce_scatter_tensor(
-                                output=main_grad_shard,
+                                output=output_buffer,
                                 input=unreduced_grad,
                                 op=reduce_op,
                                 group=outer_fsdp_group,
                             )
-                            # Track some closure tasks to install the reduced
-                            # gradient shard into the main gradient buffer.
-                            grad_accum_closure.append(
-                                (main_grad_buffer.get_shard_from_local_buffer(), main_grad_shard)
-                            )
+                            if (
+                                custom_grad_comm_dtype
+                                and unreduced_grad.dtype != main_grad_shard.dtype
+                            ):
+                                # Reduce-scatter output was a temporary communication buffer.
+                                grad_accum_closure.append((main_grad_shard, output_buffer))
                         else:  # HSDP -> main_grad_buffer = (DP-Shard,)
                             # No DP-Outer sharding, so all-reduce FSDP gradients across DP-Outer.
                             # All FSDP buffers will have reduced un-sharded or sharded gradients.
@@ -3552,12 +3600,12 @@ class GradReducePipeline:
                     # bucket associated with this buffer. Only exists for sharded
                     # gradient buffers, or if a custom gradient data-type is used!
                     gbuf.free_bucket_storage()
+                    # Gradient reduction completed, can de-reference param.main_grad.
                     gbuf.reset_param_main_grad()
-                    if self.buffer.ddp_config.outer_dp_sharding_strategy != "no_shard":
-                        # Free any allocated buckets used for HFSDP, e.g. NCCL UB.
-                        self.buffer.parameter_groups[
-                            bucket_id
-                        ].main_grad_buffer.free_bucket_storage()
+                    hsdp_comm_gbuf = self.buffer.parameter_groups[bucket_id].hsdp_comm_gbuf
+                    if hsdp_comm_gbuf is not None:
+                        # Also de-allocate any communication buffers used for H(F)SDP.
+                        hsdp_comm_gbuf.free_bucket_storage()
                     # Mark the bucket as deallocated / empty.
                     self.bucket_status[bucket_id] = BucketStatus.EMPTY
 

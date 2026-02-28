@@ -1157,7 +1157,7 @@ class MegatronFSDP(torch.nn.Module):
             # inflates FixedPoolAllocator memory & breaks NCCL UBR.
             grad_comm_dtype=(
                 mixed_precision_policy.grad_comm_dtype
-                if self.ddp_config.fsdp_double_buffer
+                if self.ddp_config.nccl_ub or self.ddp_config.fsdp_double_buffer
                 else self.mp_policy.grad_comm_dtype
             ),
         )
