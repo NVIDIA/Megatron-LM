@@ -23,11 +23,9 @@ jobs:
           python-version: "3.10"
 
       - name: Install dependencies
-        run: |
-          pip install --no-cache-dir PyGithub slack-sdk
+        run: pip install --no-cache-dir PyGithub
 
-      - name: Run Auto Reminder Bot
-        run: |
-          export GH_TOKEN=${{ github.token }}
-          export PR_NUMBER=${{ github.event.pull_request.number }}
-          python tests/test_utils/python_scripts/swap_pr_labels.py
+      - name: Swap labels after approval
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: python tests/test_utils/python_scripts/update_pr_labels.py --pr ${{ github.event.pull_request.number }} swap
