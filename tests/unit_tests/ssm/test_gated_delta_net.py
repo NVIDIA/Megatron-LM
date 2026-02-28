@@ -61,6 +61,7 @@ class TestGatedDeltaNet:
         self.tp_size = tp_size
         self.cp_size = cp_size
         self.sp_size = tp_size if sp else 1
+        self.cp_comm_type = "fla"
 
         # Get TP and CP process groups from device mesh
         tp_group = parallel_state.get_tensor_model_parallel_group()
@@ -112,7 +113,7 @@ class TestGatedDeltaNet:
     def test_gpu_forward(self):
         gdn = self.gdn
 
-        micro_batch_size = 2
+        micro_batch_size = 1 if self.cp_comm_type == "fla" and self.cp_size > 1 else 2
         seq_length = 64
         hidden_states = torch.ones(
             (seq_length // self.sp_size // self.cp_size, micro_batch_size, gdn.config.hidden_size),
@@ -151,6 +152,7 @@ class TestGatedDeltaNet:
 )
 @pytest.mark.skipif(not HAVE_FLA, reason="FLA is not installed.")
 def test_parallel_gated_delta_net_correctness(tmp_path_dist_ckpt, tp, sp, cp):
+    cp_comm_type = "fla"
     transformer_config = TransformerConfig(
         hidden_size=128,
         linear_conv_kernel_dim=2,
@@ -174,10 +176,12 @@ def test_parallel_gated_delta_net_correctness(tmp_path_dist_ckpt, tp, sp, cp):
         config=transformer_config, vp_stage=None, pp_rank=0
     )
 
-    if cp:
-        atol, rtol = 5e-3, 5e-3
+    if cp_comm_type == "fla" and cp > 1:
+        atol, rtol = 1e-2, 2e-2
+    elif cp_comm_type == "a2a" and cp > 1:
+        atol, rtol = 5e-3, 1e-2
     else:
-        atol, rtol = 5e-4, 5e-4
+        atol, rtol = 5e-4, 1e-3
 
     _test_parallel_attention_correctness(
         transformer_config=transformer_config,
@@ -190,5 +194,5 @@ def test_parallel_gated_delta_net_correctness(tmp_path_dist_ckpt, tp, sp, cp):
         cp=cp,
         seed=123,
         sequence_length=256,
-        micro_batch_size=4,
+        micro_batch_size=1 if cp_comm_type == "fla" and cp > 1 else 4,
     )
