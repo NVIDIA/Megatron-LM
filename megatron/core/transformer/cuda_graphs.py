@@ -1701,14 +1701,21 @@ class TECudaGraphHelper:
         # Number of microbatches to capture. The value will be set in _get_cuda_graph_input_data().
         self.num_microbatches = None
 
-        # Get callables with captureable layers.
+        self._discover_layers()
+
+        # One helper object can only capture CUDA Graphs once. Use this flag to check if the graphs
+        # have been created.
+        self._graphs_created = False
+
+    def _discover_layers(self):
+        """Discover captureable layers from the model and populate internal data structures."""
         self.chunks_with_decoder = []
         self.num_layers_per_chunk = []
         self.callables_per_chunk = []
         self.callables_per_chunk_is_mtp = []
         self.flattened_callables = []
         self.flattened_callables_is_mtp = []
-        for chunk_number, model_chunk in enumerate(model):
+        for chunk_number, model_chunk in enumerate(self.model):
             try:
                 chunk_with_decoder = get_attr_wrapped_model(
                     model_chunk, 'decoder', allow_none=False, return_model_obj=True
@@ -1733,13 +1740,13 @@ class TECudaGraphHelper:
                 callables, callables_is_mtp = [], []
                 for layer_number in range(num_decoder_layers):
                     layer = chunk_with_decoder.decoder.layers[layer_number]
-                    if _layer_is_graphable(layer, config):
+                    if _layer_is_graphable(layer, self.config):
                         num_graphable_layers += 1
                         callables.append(layer)
                         callables_is_mtp.append(False)
                 for layer_number in range(num_mtp_layers):
                     layer = chunk_with_decoder.mtp.layers[layer_number].mtp_model_layer
-                    if _layer_is_graphable(layer, config):
+                    if _layer_is_graphable(layer, self.config):
                         num_graphable_layers += 1
                         callables.append(layer)
                         callables_is_mtp.append(True)
@@ -1774,10 +1781,6 @@ class TECudaGraphHelper:
             msg=f'Rank {torch.distributed.get_rank()}: '
             f'{len(self.flattened_callables)} graphable layers.',
         )
-
-        # One helper object can only capture CUDA Graphs once. Use this flag to check if the graphs
-        # have been created.
-        self._graphs_created = False
 
     def graphs_created(self):
         """
@@ -2430,3 +2433,316 @@ def get_overlap_moe_expert_parallel_comm_order(order, num_layers_per_chunk, capt
                 add_order(c_id, l_b, is_wgrad=True)
 
     return new_order, chunk_id_list
+
+
+# ---------------------------------------------------------------------------
+# set_current_microbatch: sets per-layer microbatch index for TE graph replay
+# ---------------------------------------------------------------------------
+
+
+def set_current_microbatch(model, microbatch_id):
+    """Set the current microbatch on all layers that use TE CUDA graph replay.
+
+    current_microbatch is read by _te_cuda_graph_replay to select the
+    correct graph index.  This helper is called from the pipeline-parallel
+    schedule before each forward step.
+    """
+    decoder_exists = True
+    model_with_decoder = None
+    try:
+        model_with_decoder = get_attr_wrapped_model(
+            model, "decoder", allow_none=False, return_model_obj=True
+        )
+    except RuntimeError:
+        decoder_exists = False
+    if decoder_exists and model_with_decoder is not None:
+        for layer in model_with_decoder.decoder.layers:
+            layer.current_microbatch = microbatch_id
+        if hasattr(model_with_decoder, 'mtp'):
+            for layer in model_with_decoder.mtp.layers:
+                assert hasattr(
+                    layer, 'mtp_model_layer'
+                ), f"MTP layer {layer} must have 'mtp_model_layer' attribute"
+                layer.mtp_model_layer.current_microbatch = microbatch_id
+
+    # Also set current_microbatch on vision encoder layers so that
+    # _te_cuda_graph_replay selects the correct graph index. Without this,
+    # vision layers always use graph 0 (since current_microbatch defaults to 0),
+    # causing all microbatch forwards to overwrite the same static buffers.
+    # When backward runs for earlier microbatches, the buffers contain stale
+    # data from later forwards, producing NaN gradients.
+    try:
+        model_with_vision = get_attr_wrapped_model(
+            model, "vision_model", allow_none=True, return_model_obj=True
+        )
+    except RuntimeError:
+        model_with_vision = None
+    if model_with_vision is not None and hasattr(model_with_vision, 'vision_model'):
+        vision_model = model_with_vision.vision_model
+        if hasattr(vision_model, 'decoder') and hasattr(vision_model.decoder, 'layers'):
+            for layer in vision_model.decoder.layers:
+                layer.current_microbatch = microbatch_id
+
+
+# ---------------------------------------------------------------------------
+# Vision encoder CUDA graph helpers
+# ---------------------------------------------------------------------------
+
+
+def _wrap_graph_for_vision(graph_fn):
+    """Wrap a graphed callable to filter out None outputs.
+
+    During make_graphed_callables warmup, vision encoder layers go through their
+    normal forward() path which returns (output, context=None). _te_cuda_graph_replay
+    asserts len(output) == 1 but gets 2 elements. This wrapper filters out None
+    values so replay sees (output,) instead of (output, None).
+    """
+
+    def wrapped(*args, **kwargs):
+        result = graph_fn(*args, **kwargs)
+        if isinstance(result, tuple):
+            filtered = tuple(r for r in result if r is not None)
+            return filtered if filtered else result
+        return result
+
+    for attr in ('backward_dw', 'reset'):
+        if hasattr(graph_fn, attr):
+            setattr(wrapped, attr, getattr(graph_fn, attr))
+    return wrapped
+
+
+def get_vision_cuda_graph_seq_length(vision_config, default_seq_length: int = 4096) -> int:
+    """Calculate the sequence length for vision encoder CUDA graphs.
+
+    For vision encoders, the sequence length depends on:
+    - max_vision_cuda_graph_seq_length: explicit maximum (if set)
+    - num_position_embeddings: maximum number of patches
+    - spatial_merge_size: pooling factor that reduces sequence length
+
+    Args:
+        vision_config: The TransformerConfig for vision encoder
+        default_seq_length: Default sequence length if cannot be calculated
+
+    Returns:
+        The sequence length to use for CUDA graph capture
+    """
+    if (
+        hasattr(vision_config, 'max_vision_cuda_graph_seq_length')
+        and vision_config.max_vision_cuda_graph_seq_length
+    ):
+        return vision_config.max_vision_cuda_graph_seq_length
+
+    if hasattr(vision_config, 'num_position_embeddings'):
+        seq_length = vision_config.num_position_embeddings
+        if hasattr(vision_config, 'spatial_merge_size'):
+            merge_factor = vision_config.spatial_merge_size**2
+            seq_length = seq_length // merge_factor
+        return seq_length
+
+    return default_seq_length
+
+
+class VisionTECudaGraphHelper(TECudaGraphHelper):
+    """Helper to capture CUDA Graphs for vision encoder layers using TE.
+
+    Inherits from TECudaGraphHelper and overrides only the
+    vision-specific behaviour:
+
+    * Layer discovery finds vision_model.decoder.layers instead of the
+      language decoder layers.
+    * num_model_chunks is always 1 (vision has no virtual pipeline stages).
+    * Batch dimension is always 1 (images are concatenated along the sequence
+      dimension).
+    * Sample argument generation uses a simple loop (no rotary embeddings or
+      buffer-reuse optimization).
+    * Captured graph outputs are wrapped to filter None values that arise
+      from vision encoder layers returning (output, None).
+
+    Args:
+        model: The full model (list of model chunks) containing vision_model.
+        vision_config: TransformerConfig for the vision encoder.
+        vision_seq_length: Sequence length for vision (max vision tokens).
+        micro_batch_size: Micro-batch size (unused for sample-arg generation
+            since the vision encoder always uses batch-dim = 1).
+        num_microbatches: Number of microbatches per step.
+    """
+
+    def __init__(
+        self,
+        model,
+        vision_config,
+        vision_seq_length: int,
+        micro_batch_size: int,
+        num_microbatches: int = 1,
+    ):
+        super().__init__(model, vision_config, vision_seq_length, micro_batch_size)
+        # Vision encoder concatenates all images along the sequence dimension
+        # with a fixed batch dimension of 1, regardless of the training MBS.
+        self.micro_batch_size = 1
+        self.num_model_chunks = 1
+        self.num_microbatches = num_microbatches
+
+    def _discover_layers(self):
+        """Discover captureable layers from the vision encoder."""
+        self.vision_model = None
+        vision_layers = []
+
+        for model_chunk in self.model:
+            try:
+                unwrapped = get_attr_wrapped_model(
+                    model_chunk, 'vision_model', allow_none=True, return_model_obj=True
+                )
+                if unwrapped is not None and hasattr(unwrapped, 'vision_model'):
+                    self.vision_model = unwrapped.vision_model
+                    break
+            except (RuntimeError, AttributeError):
+                continue
+
+        if self.vision_model is not None:
+            if hasattr(self.vision_model, 'decoder') and hasattr(
+                self.vision_model.decoder, 'layers'
+            ):
+                for layer in self.vision_model.decoder.layers:
+                    if _layer_is_graphable(layer, self.config):
+                        vision_layers.append(layer)
+
+        if vision_layers:
+            self.chunks_with_decoder = [self.vision_model]
+            self.num_layers_per_chunk = [len(vision_layers)]
+            self.callables_per_chunk = [vision_layers]
+            self.callables_per_chunk_is_mtp = [[False] * len(vision_layers)]
+            self.flattened_callables = list(vision_layers)
+            self.flattened_callables_is_mtp = [False] * len(vision_layers)
+        else:
+            if self.vision_model is None:
+                logger.warning(
+                    'VisionTECudaGraphHelper: No vision_model found in model. '
+                    'CUDA graphs will not be captured for vision encoder.'
+                )
+            self.chunks_with_decoder = [None]
+            self.num_layers_per_chunk = [0]
+            self.callables_per_chunk = [[]]
+            self.callables_per_chunk_is_mtp = [[]]
+            self.flattened_callables = []
+            self.flattened_callables_is_mtp = []
+
+        # backward-compat aliases used by callers / tests
+        self.callables = vision_layers
+        self.num_layers = len(vision_layers)
+
+        if vision_layers:
+            logger.info(
+                f'VisionTECudaGraphHelper: Found {self.num_layers} graphable vision encoder '
+                f'layers. seq_length={self.seq_length} (all images concatenated, batch_dim=1)'
+            )
+
+    def _start_capturing(self):
+        """Start capturing for vision encoder.
+
+        Unlike the parent, this skips torch.distributed.barrier() because
+        with PP > 1 only the first pipeline stage has vision layers — other
+        ranks return early from create_cudagraphs and never reach this
+        point, so a barrier would deadlock.
+        """
+        assert not self._graphs_created, 'CUDA Graphs have already been created.'
+        gc.collect()
+        torch.cuda.empty_cache()
+        if FREEZE_GC:
+            gc.freeze()
+        _set_capture_start()
+        log_single_rank(logger, logging.INFO, 'Start vision encoder CUDA Graphs capture...')
+        return time.time()
+
+    def _finish_capturing(self, start_time):
+        """Finish capturing for vision encoder.
+
+        Unlike the parent, this skips:
+        - torch.distributed.barrier() (asymmetric: only first PP stage captures).
+        - model_chunk.zero_grad_buffer() / optimizer.zero_grad() (handled
+          by the LM decoder helper's _finish_capturing which runs on all ranks).
+        - clear_aux_losses_tracker / reset_model_temporary_tensors
+          (LM-specific cleanup already handled by the LM helper).
+        """
+        log_single_rank(
+            logger,
+            logging.INFO,
+            f'Time spent in vision encoder CUDA Graphs capture on rank '
+            f'{torch.distributed.get_rank()}: {time.time() - start_time}s',
+        )
+        _set_capture_end()
+        if FREEZE_GC:
+            gc.unfreeze()
+        gc.collect()
+        torch.cuda.empty_cache()
+        self._graphs_created = True
+
+    def _get_sample_arguments(self, order, chunk_id_list=None):
+        """Generate sample arguments for vision encoder CUDA Graph capturing.
+
+        Vision uses a simple per-layer-per-microbatch loop with batch_dim=1
+        and no rotary embeddings (unlike the parent's buffer-reuse
+        optimization). The order and chunk_id_list arguments are
+        unused because vision has num_model_chunks=1 and does not need
+        the pipeline-schedule-aware buffer lifecycle tracking.
+
+        Returns:
+            Tuple of (sample_args, sample_kwargs) lists for each
+            (layer, microbatch) pair.
+        """
+        if not self.flattened_callables:
+            return [], []
+
+        sample_args = []
+        sample_kwargs_list = []
+        hidden_size = self.config.hidden_size
+
+        for _microbatch_idx in range(self.num_microbatches):
+            for layer in self.flattened_callables:
+                hidden_states = torch.zeros(
+                    self.seq_length,
+                    1,
+                    hidden_size,
+                    dtype=torch.bfloat16,
+                    device='cuda',
+                    requires_grad=True,
+                )
+
+                if hasattr(layer, 'get_layer_static_inputs'):
+                    static_inputs = layer.get_layer_static_inputs(self.seq_length, 1)
+                    hidden_states = static_inputs.pop('hidden_states', hidden_states)
+                    sample_args.append((hidden_states,))
+                    sample_kwargs_list.append(static_inputs)
+                else:
+                    sample_args.append((hidden_states,))
+                    sample_kwargs_list.append({})
+
+        return sample_args, sample_kwargs_list
+
+    def create_cudagraphs(self):
+        """Capture CUDA Graphs for vision encoder layers per microbatch.
+
+        Delegates to the parent's capture workflow, then wraps the captured
+        graphs with _wrap_graph_for_vision to filter None from
+        (output, None) tuples so that _te_cuda_graph_replay's
+        len == 1 assertion passes.
+        """
+        if not self.flattened_callables:
+            logger.warning(
+                'VisionTECudaGraphHelper: No graphable layers found. '
+                'Skipping CUDA graph capture.'
+            )
+            return
+
+        super().create_cudagraphs()
+
+        for layer in self.flattened_callables:
+            if hasattr(layer, 'cuda_graphs'):
+                layer.cuda_graphs = [_wrap_graph_for_vision(g) for g in layer.cuda_graphs]
+
+    def cuda_graph_set_manual_hooks(self):
+        """No-op: vision encoder layers do not use DDP parameter-gather hooks.
+
+        The parent derives hooks from model_chunk._make_forward_pre_hook which
+        requires overlap_param_gather=True.  Vision encoder parameters are not
+        distributed with the same overlap strategy, so we skip hook setup.
+        """

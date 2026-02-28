@@ -20,7 +20,7 @@ from megatron.core.pipeline_parallel.utils import (
     is_vp_last_stage,
 )
 from megatron.core.process_groups_config import ProcessGroupCollection
-from megatron.core.transformer.cuda_graphs import create_cudagraphs
+from megatron.core.transformer.cuda_graphs import create_cudagraphs, set_current_microbatch
 from megatron.core.transformer.enums import CudaGraphScope
 from megatron.core.transformer.moe.router import MoEAuxLossAutoScaler
 from megatron.core.utils import (
@@ -195,27 +195,6 @@ def custom_backward(output, grad_output):
         allow_unreachable=True,
         accumulate_grad=True,
     )
-
-
-def set_current_microbatch(model, microbatch_id):
-    """Set the current microbatch."""
-    decoder_exists = True
-    model_with_decoder = None
-    try:
-        model_with_decoder = get_attr_wrapped_model(
-            model, "decoder", allow_none=False, return_model_obj=True
-        )
-    except RuntimeError:
-        decoder_exists = False
-    if decoder_exists and model_with_decoder is not None:
-        for layer in model_with_decoder.decoder.layers:
-            layer.current_microbatch = microbatch_id
-        if hasattr(model_with_decoder, 'mtp'):
-            for layer in model_with_decoder.mtp.layers:
-                assert hasattr(
-                    layer, 'mtp_model_layer'
-                ), f"MTP layer {layer} must have 'mtp_model_layer' attribute"
-                layer.mtp_model_layer.current_microbatch = microbatch_id
 
 
 def forward_step_calc_loss(
