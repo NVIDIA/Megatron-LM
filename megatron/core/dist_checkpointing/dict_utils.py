@@ -217,8 +217,25 @@ def dict_list_map_outplace(f: Callable[[U], V], x: Union[Dict, List, U]) -> Unio
         return f(x)
 
 
+def _is_optimizer_param_state_key(key: Tuple) -> bool:
+    """Check if key path matches (..., 'optimizer', ..., 'param_state', ...)."""
+    try:
+        idx = key.index("optimizer")
+    except ValueError:
+        return False
+    try:
+        key.index("param_state", idx + 1)
+    except ValueError:
+        return False
+    return True
+
+
 def merge(x1: Union[dict, list], x2: Union[dict, list], key: Tuple[Union[str, int], ...] = ()):
-    """Merges dicts and lists recursively."""
+    """Merges dicts and lists recursively.
+
+    For optimizer param_state paths, allows x1 to be longer than x2
+    (dp_reshardable padding entries are truncated).
+    """
     if isinstance(x1, dict) and isinstance(x2, dict):
         for k, v2 in x2.items():
             if k not in x1:
@@ -227,10 +244,13 @@ def merge(x1: Union[dict, list], x2: Union[dict, list], key: Tuple[Union[str, in
                 x1[k] = merge(x1[k], v2, key=key + (k,))
     elif isinstance(x1, list) and isinstance(x2, list):
         if len(x1) != len(x2):
-            raise ValueError(
-                f"Cannot merge two lists with different lengths ({len(x1)} and {len(x2)}, "
-                f"encountered at level {key})"
-            )
+            if _is_optimizer_param_state_key(key) and len(x1) > len(x2):
+                del x1[len(x2):]
+            else:
+                raise ValueError(
+                    f"Cannot merge two lists with different lengths ({len(x1)} and {len(x2)}, "
+                    f"encountered at level {key})"
+                )
         for i, v2 in enumerate(x2):
             x1[i] = merge(x1[i], v2, key=key + (i,))
     else:

@@ -131,7 +131,12 @@ class ShardedTensor(ShardedBase):
                     )
 
         if self.flattened_range is not None:
-            raise CheckpointingException("ShardedTensor.flattened_range is not supported.")
+            if not _logged_deprecations.get("flattened_range", False):
+                logger.warning(
+                    "ShardedTensor.flattened_range is deprecated."
+                    " Use latest DistributedOptimizer formats."
+                )
+                _logged_deprecations["flattened_range"] = True
 
     @property
     def has_regular_grid(self):

@@ -1795,7 +1795,7 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
                     bucket_state = [
                         bucket_state_elem
                         for bucket_state_elem in bucket_state
-                        if not bucket_state_elem['padding']
+                        if not bucket_state_elem.get('padding', False)
                     ]
 
                     assert len(bucket_state) == len(gbuf_range_map["param_map"]), (
