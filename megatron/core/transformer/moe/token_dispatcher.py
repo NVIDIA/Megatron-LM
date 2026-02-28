@@ -294,12 +294,17 @@ class MoEAllGatherTokenDispatcher(MoETokenDispatcher):
 
         tokens_per_expert = self.local_map.sum(dim=0).long().cpu()
 
+        # TE's fused_permute saves autograd state that fused_unpermute reads during backward.
+        # With zero tokens this state is invalid — fall back to unfused path symmetrically.
+        self._empty_local_dispatch = tokens_per_expert.sum().item() == 0
+        use_fused = self.config.moe_permute_fusion and not self._empty_local_dispatch
+
         permuted_local_hidden_states, _, self.reversed_local_input_permutation_mapping, _, _ = (
             permute(
                 hidden_states,
                 self.local_map,
                 num_out_tokens=tokens_per_expert.sum().item(),
-                fused=self.config.moe_permute_fusion,
+                fused=use_fused,
             )
         )
 
@@ -318,13 +323,21 @@ class MoEAllGatherTokenDispatcher(MoETokenDispatcher):
         original sequence positions, preparing them for the subsequent reduction scatter
         operation that will aggregate results across ranks.
         """
+        use_fused = self.config.moe_permute_fusion and not self._empty_local_dispatch
+
         unpermuted_local_hidden = unpermute(
             hidden_states,
             self.reversed_local_input_permutation_mapping,
             restore_shape=self.hidden_shape_before_permute,
             routing_map=self.local_map,
-            fused=self.config.moe_permute_fusion,
+            fused=use_fused,
         )
+
+        # Zero tokens → unfused unpermute returns a detached zero tensor.
+        # Reconnect to autograd so backward-pass collectives run on all ranks.
+        if self._empty_local_dispatch and hidden_states.requires_grad:
+            unpermuted_local_hidden = unpermuted_local_hidden + hidden_states.sum() * 0
+
         return unpermuted_local_hidden
 
     def token_combine(self, hidden_states):
@@ -344,6 +357,10 @@ class MoEAllGatherTokenDispatcher(MoETokenDispatcher):
 
     def combine_postprocess(self, hidden_states):
         """Restores the original tensor shape."""
+        if hidden_states.numel() == 0:
+            return torch.zeros(
+                self.hidden_shape, dtype=hidden_states.dtype, device=hidden_states.device
+            )
         return hidden_states.view(self.hidden_shape)
 
 
@@ -834,17 +851,22 @@ class MoEAlltoAllTokenDispatcher(MoETokenDispatcher):
             self.shared_experts.post_forward_comm()
 
         # Unpermutation 1: AlltoAll output to output
-        output = unpermute(
-            permutated_local_input_tokens,
-            self.reversed_local_input_permutation_mapping,
-            restore_shape=self.hidden_shape_before_permute,
-            routing_map=self.routing_map,
-            fused=self.config.moe_permute_fusion,
-            drop_and_pad=self.drop_and_pad,
-        )
-
-        # Reshape the output tensor
-        output = output.view(self.hidden_shape)
+        if permutated_local_input_tokens.numel() == 0:
+            output = torch.zeros(
+                self.hidden_shape,
+                dtype=permutated_local_input_tokens.dtype,
+                device=permutated_local_input_tokens.device,
+            )
+        else:
+            output = unpermute(
+                permutated_local_input_tokens,
+                self.reversed_local_input_permutation_mapping,
+                restore_shape=self.hidden_shape_before_permute,
+                routing_map=self.routing_map,
+                fused=self.config.moe_permute_fusion,
+                drop_and_pad=self.drop_and_pad,
+            )
+            output = output.view(self.hidden_shape)
 
         # Add shared experts output
         if self.shared_experts is not None:
@@ -1530,4 +1552,8 @@ class MoEFlexTokenDispatcher(MoETokenDispatcher):
         Returns:
             The final MoE layer output reshaped to its original dimensions.
         """
+        if hidden_states.numel() == 0:
+            return torch.zeros(
+                self.hidden_shape, dtype=hidden_states.dtype, device=hidden_states.device
+            )
         return hidden_states.view(self.hidden_shape)
