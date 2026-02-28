@@ -215,6 +215,14 @@ class InferenceClient:
         """
         self._send_signal_to_engines(Headers.STOP)
 
+    def shutdown_coordinator(self):
+        """Tells the coordinator process to exit its main loop.
+
+        This does NOT broadcast to engines — it only affects the coordinator.
+        Engines should be stopped separately before calling this.
+        """
+        self._send_signal_to_engines(Headers.SHUTDOWN)
+
     def stop(self):
         """
         Stops the client and cleans up all resources.

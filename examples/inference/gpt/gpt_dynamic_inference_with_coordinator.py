@@ -184,6 +184,7 @@ async def main(
     await engine.wait_until(EngineState.STOPPED)
 
     if dist.get_rank() == 0:
+        client.shutdown_coordinator()
         client.stop()
     logging.info(f"Rank: {dist.get_rank()} stopped their engine instance successfully.")
 

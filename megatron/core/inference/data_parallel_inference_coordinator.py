@@ -300,6 +300,7 @@ class DataParallelInferenceCoordinator:
             ):
                 # Start by checking the current state against the control signal.
                 if sender_identity not in known_clients:
+                    logging.warning("Coordinator: ignoring signal from unknown client.")
                     continue
 
                 if header == Headers.PAUSE:
@@ -339,9 +340,6 @@ class DataParallelInferenceCoordinator:
                 for data_parallel_rank_id in list(self.identities_of_data_parallel_ranks):
                     self._send_to_engine(data_parallel_rank_id, broadcast_payload)
 
-                if self.state == self.CoordinatorState.STOPPING:
-                    break
-
             elif header == Headers.ENGINE_REPLY:
                 # This is the output of a single engine step on some data parallel rank.
                 assert sender_identity in self.identities_of_data_parallel_ranks
@@ -364,6 +362,12 @@ class DataParallelInferenceCoordinator:
                             ),
                         ]
                     )
+
+            elif header == Headers.SHUTDOWN:
+                if sender_identity not in known_clients:
+                    logging.warning("Coordinator: ignoring signal from unknown client.")
+                    continue
+                break
 
             elif header == Headers.DISCONNECT:
                 if sender_identity in self.identities_of_data_parallel_ranks:

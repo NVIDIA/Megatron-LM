@@ -132,6 +132,7 @@ class MegatronLocal(InferenceServer, ReturnsTokens, ReturnsRaw):
         await self._inference_engine.wait_until(EngineState.STOPPED)
 
         if dist.get_rank() == 0:
+            self._client.shutdown_coordinator()
             self._client.stop()
 
     def increment_staleness(self):

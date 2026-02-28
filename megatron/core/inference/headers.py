@@ -19,6 +19,7 @@ class Headers(Enum):
     INCREMENT_STALENESS = auto()
     STOP = auto()
     DISCONNECT = auto()
+    SHUTDOWN = auto()
 
 
 class UnknownHeaderError(Exception):
