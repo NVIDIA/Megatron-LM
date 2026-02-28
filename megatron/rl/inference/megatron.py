@@ -6,6 +6,13 @@ import logging
 import torch.distributed as dist
 from pydantic import PrivateAttr
 
+try:
+    import httpx
+    from openai import AsyncOpenAI
+    HAVE_OPENAI = True
+except ImportError:
+    HAVE_OPENAI = False
+
 from megatron.core.inference.config import KVCacheManagementMode
 from megatron.core.inference.engines.dynamic_engine import DynamicInferenceEngine
 from megatron.core.inference.inference_client import InferenceClient
@@ -23,6 +30,7 @@ from ..inference.inference_interface import (
 from ..server.api import InferenceServer
 
 logger = logging.getLogger(__name__)
+logging.getLogger("httpx").setLevel(logging.WARNING)
 
 
 class MegatronLocal(InferenceServer, ReturnsTokens, ReturnsRaw):
@@ -35,6 +43,7 @@ class MegatronLocal(InferenceServer, ReturnsTokens, ReturnsRaw):
     _client: InferenceClient = PrivateAttr(None)
     _inference_engine: DynamicInferenceEngine = PrivateAttr(None)
     _rl_kv_cache_management_mode: KVCacheManagementMode = PrivateAttr(None)
+    _openai_client: "AsyncOpenAI" = PrivateAttr(None)
 
     async def base_generate(self, request: InferenceRequest) -> InferenceResponse:
 
@@ -42,13 +51,10 @@ class MegatronLocal(InferenceServer, ReturnsTokens, ReturnsRaw):
         tokenizer = get_tokenizer()
         args = get_args()
 
-        from openai import AsyncOpenAI
-        client = AsyncOpenAI(base_url=f"http://{self.host}:{self.port}", api_key="NONE")
-
         # Things that may be problematic when doign this switch
         # - Add BOS token
         # - Skip prompt logprobs
-        response = await client.chat.completions.create(
+        response = await self._openai_client.chat.completions.create(
             model="",
             messages=[message.model_dump() for message in request.prompt],
             temperature=request.generation_args.temperature or 1.0,
@@ -78,6 +84,7 @@ class MegatronLocal(InferenceServer, ReturnsTokens, ReturnsRaw):
 
     @classmethod
     async def launch(cls, model: GPTModel, **kwargs):
+        assert HAVE_OPENAI, "openai package is required for MegatronLocal"
         # Import here to avoid circular imports
         from megatron.inference.utils import get_dynamic_inference_engine
 
@@ -112,12 +119,35 @@ class MegatronLocal(InferenceServer, ReturnsTokens, ReturnsRaw):
             client = None
             server_task = None
             
+        try:
+            import h2  # noqa: F401
+            use_http2 = True
+        except ImportError:
+            use_http2 = False
+
         launched_server = cls(**kwargs)
         launched_server._client = client
         launched_server._server_task = server_task
         launched_server._inference_engine = inference_engine
         launched_server._rl_kv_cache_management_mode = KVCacheManagementMode(
             args.rl_kv_cache_management_mode
+        )
+        timeout = httpx.Timeout(connect=15, read=600, write=600, pool=600)
+        max_connections = args.grpo_prompts_per_step * args.grpo_group_size * args.rl_parallel_generation_tasks
+        launched_server._openai_client = AsyncOpenAI(
+            base_url=f"http://{kwargs['host']}:{kwargs['port']}",
+            api_key="NONE",
+            timeout=timeout,
+            max_retries=0,
+            http_client=httpx.AsyncClient(
+                timeout=timeout,
+                http2=use_http2,
+                limits=httpx.Limits(
+                    max_connections=max_connections,
+                    max_keepalive_connections=max_connections,
+                    keepalive_expiry=10,
+                ),
+            ),
         )
 
         return launched_server
