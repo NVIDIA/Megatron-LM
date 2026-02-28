@@ -749,6 +749,7 @@ class InferenceTopKRouter(TopKRouter):
         super().__init__(config=config, pg_collection=pg_collection)
 
         self.is_inference_cuda_graphed_iteration = False
+        self.topk_routing_with_score_function = torch.compile(topk_routing_with_score_function) 
 
     def set_inference_cuda_graphed_iteration(self):
         """Enable CUDA graph-compatible operations for the router."""
@@ -758,7 +759,6 @@ class InferenceTopKRouter(TopKRouter):
         """Disable CUDA graph-compatible operations for the router."""
         self.is_inference_cuda_graphed_iteration = False
 
-    @torch.compile()
     def _forward(self, input: torch.Tensor, padding_mask: Optional[torch.Tensor] = None):
         logits = self.gating(input).squeeze(1)  # [num_tokens, 1, num_experts]
 
@@ -766,7 +766,7 @@ class InferenceTopKRouter(TopKRouter):
         # However, we pass dense_output=True to return dense [num_tokens, topk] tensors
         # instead of sparse [num_tokens, num_experts].
 
-        probs, top_indices = topk_routing_with_score_function(
+        probs, top_indices = self.topk_routing_with_score_function(
             logits,
             self.topk,
             use_pre_softmax=self.config.moe_router_pre_softmax,

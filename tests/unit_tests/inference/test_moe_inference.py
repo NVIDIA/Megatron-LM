@@ -55,6 +55,7 @@ NANOV3_BASE = dict(
     add_bias_linear=False,
     bf16=True,
     params_dtype=torch.bfloat16,
+    transformer_impl="inference_optimized"
 )
 
 
@@ -182,7 +183,9 @@ class TestInferenceTopKRouter:
         assert training_experts == inference_experts
 
     def test_cuda_graph_capture_and_replay(self):
-        """Router forward can be captured in a CUDA graph and replayed."""
+        """Router forward can be captured in a CUDA graph and replayed.
+        Also checks for determinism by fixing the random seed and comparing against expected expert indices.
+        """
         torch.manual_seed(42)
         torch.cuda.manual_seed(42)
 
@@ -197,11 +200,13 @@ class TestInferenceTopKRouter:
         static_input = torch.randn(num_tokens, hidden_size, device="cuda", dtype=torch.bfloat16)
 
         # Warmup (required before CUDA graph capture)
+        # 3 warmup iterations on a side stream
         with torch.no_grad():
             s = torch.cuda.Stream()
             s.wait_stream(torch.cuda.current_stream())
             with torch.cuda.stream(s):
-                router(static_input)
+                for _ in range(3):
+                    router(static_input)
             torch.cuda.current_stream().wait_stream(s)
 
         # Capture
@@ -238,3 +243,120 @@ class TestInferenceTopKRouter:
         assert (
             static_indices.tolist() == expected_indices
         ), f"Expert indices mismatch:\n{static_indices.tolist()}\n!=\n{expected_indices}"
+
+
+# ──────────────────────────────────────────────────────────────────────
+# InferenceCUDAGraphTokenDispatcher
+# ──────────────────────────────────────────────────────────────────────
+
+
+@pytest.mark.internal
+class TestInferenceCUDAGraphTokenDispatcher:
+
+    @classmethod
+    def setup_class(cls):
+        from megatron.core.parallel_state import _set_global_symmetric_memory_buffer
+
+        Utils.initialize_model_parallel(
+            1, 1, expert_model_parallel_size=Utils.world_size
+        )
+        _set_random_seed(seed_=123, data_parallel_random_init=False)
+        _set_global_symmetric_memory_buffer()
+
+    @classmethod
+    def teardown_class(cls):
+        from megatron.core.parallel_state import destroy_global_symmetric_memory_buffer
+
+        destroy_global_symmetric_memory_buffer()
+        Utils.destroy_model_parallel()
+
+    def _make_dispatcher(self, **config_overrides):
+        from megatron.core.transformer.moe.moe_utils import get_default_pg_collection
+        from megatron.core.transformer.moe.token_dispatcher_inference import (
+            InferenceCUDAGraphTokenDispatcher,
+        )
+
+        config_overrides.setdefault(
+            "expert_model_parallel_size", Utils.world_size
+        )
+        config = _make_base_config(**config_overrides)
+        num_local_experts = config.num_moe_experts // Utils.world_size
+        ep_rank = torch.distributed.get_rank() if Utils.world_size > 1 else 0
+        local_expert_indices = [
+            ep_rank * num_local_experts + i for i in range(num_local_experts)
+        ]
+
+        return InferenceCUDAGraphTokenDispatcher(
+            num_local_experts=num_local_experts,
+            local_expert_indices=local_expert_indices,
+            config=config,
+            pg_collection=get_default_pg_collection(),
+        )
+
+    def test_init(self):
+        """Dispatcher can be constructed with nanov3-like config and EP=world_size."""
+        dispatcher = self._make_dispatcher()
+        assert dispatcher.topk == NANOV3_BASE["moe_router_topk"]
+        assert dispatcher.ep_size == Utils.world_size
+
+    def test_symmetric_memory_buffer_initialized(self):
+        """EP symmetric memory buffer is accessible after _set_global_symmetric_memory_buffer."""
+        from megatron.core.parallel_state import get_global_symmetric_memory_buffer_ep
+
+        buf = get_global_symmetric_memory_buffer_ep()
+        assert buf is not None
+
+    @pytest.mark.parametrize("num_local_tokens", [2, 16, 128])
+    def test_cuda_graph_dispatch_combine(self, num_local_tokens):
+        """Dispatch+combine can be captured in a CUDA graph and replayed.
+        Verifies shapes after AllGather expansion and ReduceScatter contraction,
+        and the round-trip property: combine(dispatch(x)) == x * ep_size.
+        All tensor byte sizes are 128-bit aligned for NVLS eligibility.
+        """
+        dispatcher = self._make_dispatcher()
+        ep_size = dispatcher.ep_size
+        hidden_size = NANOV3_BASE["hidden_size"]
+        topk = NANOV3_BASE["moe_router_topk"]
+        num_experts = NANOV3_BASE["num_moe_experts"]
+
+        # Static buffers for CUDA graph
+        static_hidden = torch.randn(
+            num_local_tokens, hidden_size, device="cuda", dtype=torch.bfloat16
+        )
+        static_probs = torch.rand(
+            num_local_tokens, topk, device="cuda", dtype=torch.float32
+        )
+        static_routing_map = torch.randint(
+            0, num_experts, (num_local_tokens, topk), device="cuda"
+        )
+
+        # 3 warmup iterations on a side stream
+        with torch.no_grad():
+            s = torch.cuda.Stream()
+            s.wait_stream(torch.cuda.current_stream())
+            with torch.cuda.stream(s):
+                for _ in range(3):
+                    dispatcher.routing_map = static_routing_map
+                    d_hidden, d_probs = dispatcher.token_dispatch(static_hidden, static_probs)
+                    dispatcher.token_combine(d_hidden.clone())
+            torch.cuda.current_stream().wait_stream(s)
+
+        # Capture
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            dispatcher.routing_map = static_routing_map
+            graph_hidden, graph_probs = dispatcher.token_dispatch(static_hidden, static_probs)
+            graph_combined = dispatcher.token_combine(graph_hidden.clone())
+
+        # Verify shapes: dispatch expands by ep_size, combine shrinks back
+        assert graph_hidden.shape == (num_local_tokens * ep_size, hidden_size)
+        assert graph_probs.shape == (num_local_tokens * ep_size, topk)
+        assert graph_combined.shape == (num_local_tokens, hidden_size)
+
+        # Replay with new data and verify round-trip
+        static_hidden.copy_(torch.randn_like(static_hidden))
+        graph.replay()
+
+        expected = (static_hidden * ep_size).to(torch.bfloat16)
+        torch.testing.assert_close(graph_combined, expected, atol=1e-3, rtol=1e-3)
+
