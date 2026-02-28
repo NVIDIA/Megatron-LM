@@ -269,15 +269,10 @@ class DynamicInferenceEngine(AbstractEngine):
         # Runtime state.
         self._loop = get_asyncio_loop(getattr(self, "_loop", None))
         self._cond = asyncio.Condition()
+        for attr in self._STATE_EVENTS.values():
+            setattr(self, attr, asyncio.Event())
         self.state = EngineState.RUNNING
-        # Awaitable events for external callers to detect state transitions.
-        # These mirror self.state for the four stable states: the engine sets/clears them when it
-        # transitions, and external callers can await them to block until the target state.
-        for state, attr in self._STATE_EVENTS.items():
-            event = asyncio.Event()
-            if state == self.state:
-                event.set()
-            setattr(self, attr, event)
+        self.running.set()
         self._pending_signals = deque()
 
         self.resume_request_ids = None
@@ -675,7 +670,7 @@ class DynamicInferenceEngine(AbstractEngine):
         for request_id in recompute_active_ids:
             self.requests[request_id].record.checkpoint()
 
-        # In the coordinator path, the state is already handled.
+        # If we are not using the inference coordinator, we need to manually handle state.
         if not self.use_coordinator:
             self.state = EngineState.SUSPENDED
 
@@ -726,12 +721,13 @@ class DynamicInferenceEngine(AbstractEngine):
             )
         )
 
-        # In the coordinator path, the state is already handled.
+        # If we are not using the inference coordinator, we need to manually handle state.
         if not self.use_coordinator:
             self.state = EngineState.RUNNING
-
-        # Notify event loop.
-        self._loop.call_soon_threadsafe(asyncio.create_task, self._notify_cond_for_new_request())
+            # Notify the condition variable that run_engine() waits on.
+            self._loop.call_soon_threadsafe(
+                asyncio.create_task, self._notify_cond_for_new_request()
+            )
 
     @trace_async_exceptions
     async def _notify_cond_for_new_request(self):
@@ -1778,6 +1774,14 @@ class DynamicInferenceEngine(AbstractEngine):
 
         consensus_val = -1 if signal_consensus else 0
 
+        # Signals can be received asynchronously on EP ranks.
+		# We do not want a rank to pause prematurely if its peers have yet to receive the signal.
+		# So this is an *attempt* to process the signal. This rank has received the signal
+		# and passes -1 to the all-reduce. If any other rank in the EP group has not received
+        # the signal yet, it will pass a zero value to the all-reduce, hence the global consensus
+        # will be zero and we will defer processing the signal.
+		# When all ranks receive the signal, global work will be zero and we can process the signal.
+
         if self.ep_world_size > 1:
             # Perform all-reduce to get max global work across EP group.
             global_work, global_consensus = (
@@ -1795,8 +1799,7 @@ class DynamicInferenceEngine(AbstractEngine):
         """World-wide ZMQ all-reduce barrier for global rank consensus.
 
         Used for all state transitions that require global synchronization:
-        PAUSING → PAUSED, SUSPENDING → SUSPENDED, RESUMING → PAUSED,
-        and STOPPING → STOPPED.
+        PAUSING → PAUSED, SUSPENDING → SUSPENDED, RESUMING → PAUSED, and STOPPING → STOPPED.
 
         No-op when world_size == 1 (communicator is not created).
         """

@@ -103,11 +103,9 @@ class DummyEngine(DynamicInferenceEngine):
 
         # State machine (mirrors dynamic_engine.py reset()).
         self.state = EngineState.RUNNING
-        for state, attr in self._STATE_EVENTS.items():
-            event = asyncio.Event()
-            if state == self.state:
-                event.set()
-            setattr(self, attr, event)
+        for attr in self._STATE_EVENTS.values():
+            setattr(self, attr, asyncio.Event())
+        self.running.set()
         self._pending_signals = deque()
         self.resume_request_ids = None
         self.use_coordinator = False
