@@ -3,7 +3,7 @@
 import logging
 from abc import ABC, abstractmethod
 from contextlib import contextmanager
-from typing import Callable, Optional
+from typing import Callable, Dict, Optional, Union
 
 import torch
 from torch.autograd import Variable
@@ -355,3 +355,88 @@ def get_comm_stream():
     """Get the stream for communication"""
     global _COMM_STREAM
     return _COMM_STREAM
+
+
+def backward_step_multimodule(
+    input_tensor: Dict[str, torch.Tensor],
+    output_tensor: Union[torch.Tensor, Dict[str, torch.Tensor]],
+    output_tensor_grad: Optional[Dict[str, torch.Tensor]],
+    config,
+    language_model_module_name: str,
+) -> Dict[str, torch.Tensor]:
+    """Backward step for multi-module pipelines.
+
+    In multi-module pipelines, tensors are organized as dictionaries with
+    module names as keys. Each module's backward pass is performed independently.
+
+    This function should be called explicitly for multi-module pipelines.
+    For single-module pipelines, use backward_step() instead.
+
+    Args:
+        input_tensor: Dict mapping module names to input tensors
+        output_tensor: Dict mapping module names to output tensors, or scalar loss (last stage)
+        output_tensor_grad: Dict mapping module names to output grads, or None (last stage)
+        config: Model parallel configuration
+        language_model_module_name: Name of the language model module (e.g., 'llm').
+            Used to associate scalar loss with the correct module at the terminal stage.
+
+    Returns:
+        Dict mapping module names to input tensor gradients
+
+    Note:
+        - Assumes each module operates independently (no cross-module gradients in forward)
+        - Each module should have sequential pipeline stages (no cross-stage skip connections)
+        - Encoder-decoder models with skip connections (e.g., T5) are not yet supported as LLM.
+        - Last stage: Scalar loss is associated with language_model_module_name.
+    """
+    # Import locally to avoid circular dependency
+    from megatron.core.pipeline_parallel.schedules import custom_backward
+
+    # Retain gradients on all input tensors
+    for module_name, tensor in input_tensor.items():
+        if isinstance(tensor, list):
+            tensor = tensor[0]
+        if tensor is not None:
+            tensor.retain_grad()
+
+    # Last stage: output_tensor is a scalar loss from the language model.
+    # Associate it with the language_model_module_name.
+    if not isinstance(output_tensor, dict):
+        output_tensor = {language_model_module_name: output_tensor}
+
+    # Handle output_tensor_grad: None (last stage) or dict (intermediate stages)
+    if not output_tensor_grad:
+        # Last stage: no gradient from next stage
+        output_tensor_grad = {key: None for key in output_tensor.keys()}
+
+    # Apply grad scaling if needed (for last stage only)
+    for module_name in output_tensor.keys():
+        if output_tensor_grad[module_name] is None and config.grad_scale_func is not None:
+            output_tensor[module_name] = config.grad_scale_func(output_tensor[module_name])
+
+    # Perform backward pass for each module
+    for module_name in output_tensor.keys():
+        output_tensor_module = output_tensor[module_name]
+        output_tensor_grad_module = output_tensor_grad[module_name]
+
+        # Skip backward if tensor doesn't require gradients
+        # (e.g., in VLM models, some batches may not have images)
+        if output_tensor_module is not None and output_tensor_module.requires_grad:
+            if config.deallocate_pipeline_outputs:
+                custom_backward(output_tensor_module, output_tensor_grad_module)
+            else:
+                torch.autograd.backward(
+                    output_tensor_module, grad_tensors=output_tensor_grad_module
+                )
+
+    # Collect gradients for input tensors
+    input_tensor_grad = {}
+    for module_name, tensor in input_tensor.items():
+        if isinstance(tensor, list):
+            tensor = tensor[0]
+        if tensor is None:
+            input_tensor_grad[module_name] = None
+        else:
+            input_tensor_grad[module_name] = tensor.grad
+
+    return input_tensor_grad
