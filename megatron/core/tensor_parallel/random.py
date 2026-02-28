@@ -534,7 +534,9 @@ class CheckpointFunction(torch.autograd.Function):
     @staticmethod
     def backward(ctx, *args):
         """Backward pass."""
-        if not torch.autograd._is_checkpoint_valid():
+        from megatron.core.transformer.cuda_graphs import is_graph_capturing
+
+        if not torch.autograd._is_checkpoint_valid() and not is_graph_capturing():
             raise RuntimeError(
                 "Checkpointing is not compatible with .grad(), "
                 "please use .backward() if possible"
@@ -775,9 +777,12 @@ class CheckpointWithoutOutput(object):
 
         # If in cuda graph warmup, disable checkpointing, as 'discard_output_and_register_recompute'
         # may be called in a separate graph warmup.
+        # Also skip during CUDA graph capture: saving/restoring RNG states via the
+        # non-graph-safe path would call CUDAGeneratorImpl::current_seed which is
+        # not allowed while a stream is being captured.
         from megatron.core.transformer.cuda_graphs import is_graph_warmup
 
-        if is_graph_warmup():
+        if is_graph_warmup() or torch.cuda.is_current_stream_capturing():
             return run_function(*args)
 
         self.run_function = run_function
@@ -801,8 +806,10 @@ class CheckpointWithoutOutput(object):
         from megatron.core.transformer.cuda_graphs import is_graph_capturing, is_graph_warmup
 
         # The recomputation has been triggered already. Just return.
-        # Handle cudagraphs, do nothing if currently in graph warmup
-        if self.ctx is None or is_graph_warmup():
+        # Handle cudagraphs: skip during graph warmup and native CUDA graph capture,
+        # as _fork_rng / _set_all_rng_states use RNG APIs that are incompatible with
+        # stream capture.
+        if self.ctx is None or is_graph_warmup() or torch.cuda.is_current_stream_capturing():
             return
 
         if not torch.autograd._is_checkpoint_valid() and not is_graph_capturing():

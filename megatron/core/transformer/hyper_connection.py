@@ -169,7 +169,6 @@ class HyperConnectionModule(MegatronModule):
             setattr(self.alpha_res, 'sequence_parallel', True)
             setattr(self.bias, 'sequence_parallel', True)
 
-    @torch.compile
     def _projection_and_get_norm(self, x: Tensor) -> Tuple[Tensor, Tensor]:
         """
         Project input hidden states to mapping space and apply RMS normalization.
@@ -184,7 +183,6 @@ class HyperConnectionModule(MegatronModule):
         proj = self.mapping_proj(x)  # [s, b, n^2 + 2n]
         return proj, r
 
-    @torch.compile
     def _compute_h(self, proj: Tensor, r: Tensor) -> Tuple[Tensor, Tensor, Tensor]:
         """
         Compute h from projected hidden states and scaling factors.
@@ -242,7 +240,6 @@ class HyperConnectionModule(MegatronModule):
 
         return h_pre, h_post, h_res
 
-    @torch.compile
     def _apply_h_post(self, x: Tensor, h_post: Tensor) -> Tensor:
         """
         Core implementation of H_post application to a single tensor.
@@ -325,7 +322,6 @@ class HyperConnectionModule(MegatronModule):
 
         return x_out, bias_out
 
-    @torch.compile
     def aggregate(self, x: Tensor, h_pre: Tensor) -> Tensor:
         """
         Aggregate n-stream to 1-stream using H_pre weights.
@@ -350,7 +346,6 @@ class HyperConnectionModule(MegatronModule):
 
         return aggregated
 
-    @torch.compile
     def apply_h_res(self, h_res: Tensor, residual: Tensor) -> Tensor:
         """
         Apply H_res to residual using H_res weights.

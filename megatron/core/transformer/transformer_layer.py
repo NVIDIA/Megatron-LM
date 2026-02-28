@@ -18,10 +18,6 @@ from megatron.core import parallel_state, tensor_parallel
 from megatron.core.dist_checkpointing.mapping import ShardedStateDict
 from megatron.core.dist_checkpointing.utils import apply_prefix_mapping
 from megatron.core.packed_seq_params import PackedSeqParams
-from megatron.core.pipeline_parallel.fine_grained_activation_offload import (
-    FineGrainedActivationOffloadingInterface as off_interface,
-    fine_grained_offloading_group_commit,
-)
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.transformer.cuda_graphs import is_graph_capturing
 from megatron.core.transformer.enums import CudaGraphScope, LayerType
@@ -520,7 +516,7 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
         # this is only used to uniquely identify decode and non-decode cuda graph
         # runners in the cuda graph manager
         kwargs.pop("dynamic_inference_decode_only", None)
-        assert not self.config.enable_hyper_connection, "Please use HyperConnectionTransformerLayer instead"
+        assert not self.config.enable_hyper_connections, "Please use HyperConnectionTransformerLayer instead"
         hidden_states, context = self._forward_attention(*args, **kwargs)
         output = self._forward_mlp(
             hidden_states,
@@ -1222,6 +1218,11 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
         self.cuda_graphs[cg_index].backward_dw()
 
     def __call__(self, *args, **kwargs):
+        # Extract mhc_recompute_manager before CUDA graph manager processes kwargs,
+        # since CheckpointManager is not a CUDA-graph-supported type.
+        self._mhc_recompute_manager = kwargs.pop("mhc_recompute_manager", None)
+        kwargs.pop("is_last_layer_in_recompute_block", None)
+
         if self._should_call_local_cudagraph(*args, **kwargs):
             # Inference mode.
             if kwargs.get('inference_context') is not None:
@@ -1298,12 +1299,63 @@ class HyperConnectionTransformerLayer(TransformerLayer):
             layer_number=self.layer_number,
         )
 
+        # In mHC the layernorm may be fused into TE linear layers, making
+        # input_layernorm / pre_mlp_layernorm an IdentityOp.  The base-class
+        # __init__ skips offloading when the norm is IdentityOp, but mHC still
+        # needs to offload the aggregated hidden_states around the norm call.
+        self.offload_attn_norm = (
+            self.config.fine_grained_activation_offloading
+            and "attn_norm" in self.config.offload_modules
+        )
+        self.offload_mlp_norm = (
+            self.config.fine_grained_activation_offloading
+            and "mlp_norm" in self.config.offload_modules
+        )
+
+    def get_layer_static_inputs(self, seq_length, micro_batch_size):
+        """Override to produce n-stream hidden_states of shape [s, b, n*C].
+
+        CUDA graph capture creates static buffers whose shapes are determined by
+        this method. The base class returns [s, b, C], but mHC layers operate on
+        n-stream hidden states of shape [s, b, n*C].
+        """
+        static_inputs = super().get_layer_static_inputs(seq_length, micro_batch_size)
+        hs = static_inputs["hidden_states"]
+        n = self.config.num_residual_streams
+        static_inputs["hidden_states"] = torch.ones(
+            (hs.shape[0], hs.shape[1], n * self.config.hidden_size),
+            dtype=hs.dtype,
+            requires_grad=hs.requires_grad,
+            device=hs.device,
+        )
+        return static_inputs
+
+    def _get_submodules_under_cudagraphs(self):
+        """Override to include hyper connection modules.
+
+        The base TransformerLayer._get_submodules_under_cudagraphs does not include
+        self_attention_hyper_connection / mlp_hyper_connection. Their learnable
+        parameters (mapping_proj, alpha_*, bias) need manual pre-forward hooks
+        during CUDA graph replay so that parameter all-gathers are triggered.
+        """
+        submodules = super()._get_submodules_under_cudagraphs()
+
+        if not self.config.cuda_graph_scope:
+            return submodules
+
+        if CudaGraphScope.attn in self.config.cuda_graph_scope:
+            submodules.append(self.self_attention_hyper_connection)
+        if (
+            not self.is_moe_layer and CudaGraphScope.mlp in self.config.cuda_graph_scope
+        ) or (self.is_moe_layer and CudaGraphScope.moe in self.config.cuda_graph_scope):
+            submodules.append(self.mlp_hyper_connection)
+        return submodules
+
     def forward(self, *args, **kwargs):
         """Forward pass with MHC recompute manager support."""
         kwargs.pop("dynamic_inference_decode_only", None)
 
-        mhc_recompute_manager = kwargs.pop("mhc_recompute_manager", None)
-        kwargs.pop("is_last_layer_in_recompute_block", None)
+        mhc_recompute_manager = getattr(self, '_mhc_recompute_manager', None)
 
         hidden_states, context = self._forward_attention(
             *args, mhc_recompute_manager=mhc_recompute_manager, **kwargs
@@ -1336,6 +1388,9 @@ class HyperConnectionTransformerLayer(TransformerLayer):
         *,
         inference_params: Optional[Any] = None,
     ):
+        from megatron.core.pipeline_parallel.fine_grained_activation_offload import (
+            FineGrainedActivationOffloadingInterface as off_interface,
+        )
         """Forward attention with hyper connection pre/post processing on self-attention."""
         inference_context = deprecate_inference_params(inference_context, inference_params)
 
@@ -1399,7 +1454,7 @@ class HyperConnectionTransformerLayer(TransformerLayer):
 
         if self.offload_attn_norm:
             hidden_states = off_interface.group_commit(
-                hidden_states, name="attn_norm", forced_released_tensors=[residual]
+                hidden_states, name="attn_norm"
             )
 
         # Cross-attention (no hyper connection support).
@@ -1430,6 +1485,9 @@ class HyperConnectionTransformerLayer(TransformerLayer):
         padding_mask=None,
         mhc_recompute_manager: Optional['CheckpointManager'] = None,
     ):
+        from megatron.core.pipeline_parallel.fine_grained_activation_offload import (
+            FineGrainedActivationOffloadingInterface as off_interface,
+        )
         """Forward MLP with hyper connection pre/post processing."""
         is_last_in_recompute_block = bool(
             mhc_recompute_manager is not None
@@ -1549,8 +1607,12 @@ class HyperConnectionTransformerLayer(TransformerLayer):
         nvtx_range_pop(suffix="mlp_fused_h_res_h_post_bda")
 
         if self.offload_mlp_norm:
-            (hidden_states,) = fine_grained_offloading_group_commit(
-                hidden_states, name="mlp_norm", forced_released_tensors=[residual]
+            from megatron.core.pipeline_parallel.fine_grained_activation_offload import (
+                FineGrainedActivationOffloadingInterface as off_interface,
+            )
+
+            hidden_states = off_interface.group_commit(
+                hidden_states, name="mlp_norm"
             )
 
         output = make_viewless_tensor(

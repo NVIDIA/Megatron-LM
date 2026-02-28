@@ -1363,6 +1363,13 @@ class TransformerConfig(ModelParallelConfig):
                     "mhc_recompute_layer_num must be a positive integer when "
                     "recompute_hyper_connections=True."
                 )
+            if self.fine_grained_activation_offloading:
+                raise ValueError(
+                    "recompute_hyper_connections is incompatible with "
+                    "fine_grained_activation_offloading. The mHC recompute hook fires "
+                    "before the offloading backward chunk is initialized, causing "
+                    "tensor_pop on a None chunk. Disable one of them."
+                )
 
         # Validation for hyper_connections with tensor parallelism
         # When hyper connections are enabled with TP > 1, sequence_parallel must be True.
