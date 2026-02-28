@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from typing import Iterable, List, Optional, Union
+from typing import Iterable, List, Union
 
 import torch
 import torch.distributed as dist
@@ -24,8 +24,6 @@ from torch.distributed.checkpoint.metadata import (
 )
 from torch.distributed.checkpoint.planner import TensorWriteData, WriteItem, WriteItemType
 from torch.distributed.tensor.placement_types import Replicate, Shard, _StridedShard
-
-from .utils import get_mesh_names
 
 
 def gather_and_compute_chunk_metadata(dtensor: DTensor) -> ChunkStorageMetadata:
@@ -250,148 +248,144 @@ def preprocess_state_dict_for_uneven_dtensor(state_dict: dict) -> dict:
     return state_dict
 
 
-def gather_uneven_dtensor_to_full_tensor(
-    dtensor: DTensor, target_device: Optional[torch.device] = None
-) -> DTensor:
+def uneven_dtensor_to_full_tensor(dtensor: DTensor) -> torch.Tensor:
     """
-    Gather an unevenly sharded DTensor distributed across multiple ranks,
-    reconstructing the full (unsharded) tensor on each rank.
+    Gather a DTensor with potentially uneven sharding across ranks into a full tensor.
 
-    This function handles uneven chunk sizes and offsets by collecting
-    chunk metadata from all ranks, performing all-gather operations,
-    and assembling the full tensor accordingly. The returned tensor
-    is fully replicated across the given device mesh.
+    This function handles DTensors with uneven shards (where different ranks may have
+    different-sized chunks) by gathering chunk metadata and local tensors across all
+    ranks, then reconstructing the complete tensor.
 
     Args:
-        dtensor (DTensor): Distributed tensor with uneven sharding across ranks.
-        target_device (Optional[torch.device]): If specified, move the resulting
-            full tensor to this device. Otherwise, use the original device.
+        dtensor (DTensor): The distributed tensor to gather. Must have chunk metadata
+            available (either pre-existing or will be computed).
 
     Returns:
-        DTensor: Fully replicated DTensor representing the reconstructed full tensor.
+        torch.Tensor: The fully reconstructed tensor with shape matching the original
+            DTensor's global shape.
+
+    Raises:
+        TypeError: If input is not a DTensor.
+        ValueError: If chunk metadata is malformed (expected exactly one chunk per rank).
+        AssertionError: If an unexpected placement type is encountered after processing
+            Shard placements.
+
+    Note:
+        - This function performs collective operations (all_gather_object, all_gather)
+          across the device mesh, requiring synchronization across ranks.
+        - Works with Shard and _StridedShard placements, and expects Replicate placements
+          for non-sharded dimensions.
+        - The function modifies the DTensor in-place by adding chunk metadata if missing.
+
+    Example:
+        >>> mesh = DeviceMesh("cuda", [0, 1, 2, 3])
+        >>> # Create a DTensor with uneven sharding
+        >>> dtensor = DTensor(..., placements=[Shard(0)])
+        >>> full_tensor = gather_uneven_dtensor_to_full_tensor(dtensor)
+        >>> assert full_tensor.shape == dtensor.shape
     """
+    # Validate input type
     if not isinstance(dtensor, DTensor):
-        raise TypeError("Input must be a DTensor.")
+        raise TypeError(f"Input must be a DTensor, got {type(dtensor).__name__}.")
 
-    device_mesh = dtensor.device_mesh
-    if not device_mesh.mesh_dim_names:
-        process_group = device_mesh.get_group()
-    else:
-        # Check if the fully-flattened mesh exists first.
-        full_flattened_mesh_dim_name = "_".join(device_mesh.mesh_dim_names)
-        if full_flattened_mesh_dim_name in get_mesh_names(device_mesh):
-            # Retrieve the existing flattened DeviceMesh ProcessGroup.
-            try:
-                # Two Cases: Name is a root dimension, or using the old DeviceMesh
-                # API which allows us to get flattened dimensions.
-                process_group = device_mesh[full_flattened_mesh_dim_name].get_group()
-            except:
-                # Name is a flattened dimension that cannot be retrieved from the
-                # DeviceMesh.__getitem__, so fall-back to new DeviceMesh API.
-                process_group = (
-                    device_mesh._get_root_mesh()
-                    ._flatten_mapping[full_flattened_mesh_dim_name]
-                    .get_group()
-                )
-        else:
-            # Create the _-separated flattened DeviceMesh ProcessGroup.
-            process_group = device_mesh._flatten().get_group()
-
-    # Collect chunk metadata for uneven shards (update if missing)
+    # Ensure chunk metadata is available for uneven shards
     if not hasattr(dtensor._local_tensor, "__create_chunk_list__"):
         update_uneven_dtensor_chunk_metadata(dtensor)
 
+    # Retrieve and validate chunk metadata
     chunk_metadata_list = dtensor.__create_chunk_list__()
     if len(chunk_metadata_list) != 1:
-        raise ValueError(f"Expected exactly one chunk metadata, got {len(chunk_metadata_list)}.")
-
+        raise ValueError(
+            f"Expected exactly one chunk metadata per rank, got {len(chunk_metadata_list)}."
+        )
     local_chunk_metadata = chunk_metadata_list[0]
-    world_size = process_group.size()
 
-    # Prepare local chunk info dictionary
-    local_chunk_info = {
-        "shape": list(dtensor.to_local().shape),
-        "offset": getattr(local_chunk_metadata, "offsets", [0] * len(dtensor.shape)),
-        "rank": process_group.rank(),
-    }
+    # Prepare local chunk information for gathering
+    local_chunks_info = [
+        {
+            "shape": dtensor.to_local().shape,
+            "offset": getattr(local_chunk_metadata, "offsets", [0] * len(dtensor.shape)),
+        }
+    ]
+    local_buffer = dtensor.to_local().contiguous().view(-1)
 
-    # Gather chunk info from all ranks
-    all_chunk_info = [None] * world_size
-    dist.all_gather_object(all_chunk_info, local_chunk_info, group=process_group)
+    # Iterate through device mesh dimensions and gather across sharded dimensions
+    for mesh_dim, placement in enumerate(dtensor.placements):
+        if isinstance(placement, (Shard, _StridedShard)):
+            # Get the process group for this mesh dimension
+            shard_group = dtensor.device_mesh.get_group(mesh_dim)
 
-    # Delegate to helper function
-    return _assemble_full_tensor_from_uneven_chunks(
-        dtensor, all_chunk_info, process_group, target_device
-    )
+            # Gather chunk metadata from all ranks in this dimension
+            group_chunks_info = [None] * shard_group.size()
+            dist.all_gather_object(group_chunks_info, local_chunks_info, group=shard_group)
+
+            # Prepare buffers for gathering tensors from all ranks
+            group_tensors = [
+                torch.empty(
+                    sum(chunk["shape"].numel() for chunk in chunks_info),
+                    dtype=dtensor.dtype,
+                    device=dtensor.device,
+                )
+                for chunks_info in group_chunks_info
+            ]
+
+            # Gather actual tensor data from all ranks
+            dist.all_gather(group_tensors, local_buffer, group=shard_group)
+
+            # Flatten the gathered metadata and concatenate tensors
+            local_chunks_info = [item for sublist in group_chunks_info for item in sublist]
+            local_buffer = torch.cat(group_tensors)
+        elif not isinstance(placement, Replicate):
+            raise ValueError(
+                f"Unexpected placement {placement} at mesh dimension {mesh_dim}. "
+                f"Expected Shard, _StridedShard, or Replicate."
+            )
+
+    # Split the gathered buffer back into individual chunks
+    all_local_chunks = []
+    buffer_offset = 0
+    for chunk_info in local_chunks_info:
+        chunk_shape = chunk_info["shape"]
+        chunk_numel = chunk_shape.numel()
+        chunk_tensor = local_buffer[buffer_offset : buffer_offset + chunk_numel].view(chunk_shape)
+        all_local_chunks.append(chunk_tensor)
+        buffer_offset += chunk_numel
+
+    debug_slices = []
+    for chunk_info, local_chunk in zip(local_chunks_info, all_local_chunks):
+        offset = chunk_info["offset"]
+        slices = tuple(slice(o, o + s) for o, s in zip(offset, local_chunk.shape))
+        debug_slices.append(slices)
+
+    # Reconstruct the full tensor by placing chunks at their correct offsets
+    full_tensor = torch.zeros(dtensor.shape, dtype=dtensor.dtype, device=dtensor.device)
+    for chunk_info, local_chunk in zip(local_chunks_info, all_local_chunks):
+        offset = chunk_info["offset"]
+        slices = tuple(slice(o, o + s) for o, s in zip(offset, local_chunk.shape))
+        full_tensor[slices] = local_chunk
+
+    return full_tensor
 
 
-def _assemble_full_tensor_from_uneven_chunks(
-    dtensor: DTensor,
-    all_chunk_info: List[dict],
-    process_group: torch.distributed.ProcessGroup,
-    target_device: Optional[torch.device],
-) -> DTensor:
+def redistribute_uneven_dtensor_to_replicated(dtensor: DTensor) -> DTensor:
     """
-    Assemble the full tensor from unevenly sized chunks gathered from all ranks.
+    Redistribute an unevenly sharded DTensor to a fully replicated DTensor.
+
+    This function first gathers the unevenly sharded DTensor into a full tensor
+    and then redistributes it as a replicated DTensor across all ranks.
 
     Args:
-        dtensor (DTensor): The original distributed tensor.
-        all_chunk_info (List[Dict]): List of shard info dicts from all ranks,
-            including shapes and offsets.
-        process_group: Process group for collective communication.
-        target_device: Optional device to move the final full tensor onto.
-
+        dtensor (DTensor): The unevenly sharded DTensor to redistribute.
     Returns:
-        DTensor: Fully replicated tensor constructed by placing chunks at
-        the appropriate offsets.
+        DTensor: A replicated DTensor with the same data as the input DTensor.
     """
-    local_tensor = dtensor.to_local()
-
-    # Check if the DTensor has any shard placements
-    have_shard_placement = any(
-        isinstance(placement, Shard) or isinstance(placement, _StridedShard)
-        for placement in dtensor.placements
-    )
-
-    if not have_shard_placement:
-        # No sharding (replicated tensor), just clone and move if needed
-        full_tensor = local_tensor.clone()
-        if target_device:
-            full_tensor = full_tensor.to(target_device)
-    else:
-        # Prepare empty buffers to receive tensors from each rank
-        gathered_tensors = [
-            torch.empty(rank_info["shape"], dtype=local_tensor.dtype, device=local_tensor.device)
-            for rank_info in all_chunk_info
-        ]
-
-        # Gather local tensors from all ranks
-        dist.all_gather(gathered_tensors, local_tensor, group=process_group)
-
-        # Allocate full tensor buffer
-        full_tensor = torch.empty(
-            dtensor.shape, dtype=local_tensor.dtype, device=local_tensor.device
-        )
-
-        # Copy each gathered shard into the full tensor at its offset
-        for rank_info, local_shard in zip(all_chunk_info, gathered_tensors):
-            offset = rank_info["offset"]
-            slices = tuple(slice(o, o + s) for o, s in zip(offset, local_shard.shape))
-            full_tensor[slices] = local_shard
-
-        # Optionally move to target device
-        if target_device is not None:
-            full_tensor = full_tensor.to(target_device)
-
-        # Free memory of gathered shards as they are copied
-        del gathered_tensors
-
-    # Wrap into a replicated DTensor and return
-    return DTensor.from_local(
+    full_tensor = uneven_dtensor_to_full_tensor(dtensor)
+    replicated_dtensor = DTensor.from_local(
         full_tensor,
         placements=[Replicate()] * len(dtensor.placements),
         device_mesh=dtensor.device_mesh,
     )
+    return replicated_dtensor
 
 
 def _intersection(s1, s2):
@@ -471,7 +465,7 @@ def split_dtensor(
 
         new_dtensor = DTensor.from_local(
             sliced_tensor,
-            shape=out_shape,
+            shape=tuple(out_shape),
             stride=sliced_tensor.stride(),
             placements=dtensor.placements,
             device_mesh=dtensor.device_mesh,

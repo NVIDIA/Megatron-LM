@@ -31,7 +31,7 @@ try:
         make_fsdp_dtensor,
     )
     from megatron.core.distributed.fsdp.src.megatron_fsdp.uneven_dtensor import (
-        gather_uneven_dtensor_to_full_tensor,
+        uneven_dtensor_to_full_tensor,
     )
     from megatron.core.distributed.fsdp.src.megatron_fsdp.utils import (
         get_mcore_tensor_parallel_partition_dim,
@@ -427,13 +427,13 @@ def validate_loaded_state_dict(state_dict, checkpoint_path):
             load_item_dict, storage_reader=reader, planner=default_planner.DefaultLoadPlanner()
         )
         if isinstance(value, DTensor):
-            full_value = gather_uneven_dtensor_to_full_tensor(value)
+            full_tensor_v = uneven_dtensor_to_full_tensor(value)
             loaded_tensor = load_item_dict[key].redistribute(
                 placements=[Replicate()] * len(value.placements)
             )
             assert torch.allclose(
-                loaded_tensor._local_tensor, full_value._local_tensor, atol=1e-8, rtol=1e-5
-            ), f"key: {key}; {loaded_tensor} {full_value}"
+                loaded_tensor._local_tensor, full_tensor_v, atol=1e-8, rtol=1e-5
+            ), f"key: {key}; {loaded_tensor} {full_tensor_v}"
         else:
             assert torch.allclose(
                 value, load_item_dict[key]
