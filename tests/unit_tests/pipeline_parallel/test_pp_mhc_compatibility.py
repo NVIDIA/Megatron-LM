@@ -29,10 +29,10 @@ from megatron.core.transformer.transformer_block import get_num_layers_to_build
 from megatron.core.transformer.transformer_config import TransformerConfig
 from tests.unit_tests.test_utilities import Utils
 
-
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
+
 
 def _make_pp_group(rank: int, size: int):
     """Create a mock PP process group with given rank and size."""
@@ -88,6 +88,7 @@ def _make_config(
 # 1. get_tensor_shapes — shape correctness with mHC
 # ===========================================================================
 
+
 class TestGetTensorShapesWithMHC:
     """Verify get_tensor_shapes returns correct hidden dim for mHC-enabled models."""
 
@@ -122,8 +123,10 @@ class TestGetTensorShapesWithMHC:
     def test_mhc_pp2_rank0_send_nstream(self):
         """PP rank 0 sends n*C to rank 1."""
         cfg = _make_config(
-            hidden_size=self.H, pp_size=2,
-            enable_hyper_connections=True, num_residual_streams=self.N_STREAMS,
+            hidden_size=self.H,
+            pp_size=2,
+            enable_hyper_connections=True,
+            num_residual_streams=self.N_STREAMS,
         )
         shapes = self._shapes(cfg, pp_rank=0, pp_size=2, is_recv=False)
         assert shapes == [(self.SEQ, self.MBS, self.H * self.N_STREAMS)]
@@ -131,8 +134,10 @@ class TestGetTensorShapesWithMHC:
     def test_mhc_pp2_rank0_recv_1stream(self):
         """PP rank 0 receives nothing from previous (is first stage), so shape = C."""
         cfg = _make_config(
-            hidden_size=self.H, pp_size=2,
-            enable_hyper_connections=True, num_residual_streams=self.N_STREAMS,
+            hidden_size=self.H,
+            pp_size=2,
+            enable_hyper_connections=True,
+            num_residual_streams=self.N_STREAMS,
         )
         shapes = self._shapes(cfg, pp_rank=0, pp_size=2, is_recv=True)
         assert shapes == [(self.SEQ, self.MBS, self.H)]
@@ -140,8 +145,10 @@ class TestGetTensorShapesWithMHC:
     def test_mhc_pp2_rank1_recv_nstream(self):
         """PP rank 1 receives n*C from rank 0."""
         cfg = _make_config(
-            hidden_size=self.H, pp_size=2,
-            enable_hyper_connections=True, num_residual_streams=self.N_STREAMS,
+            hidden_size=self.H,
+            pp_size=2,
+            enable_hyper_connections=True,
+            num_residual_streams=self.N_STREAMS,
         )
         shapes = self._shapes(cfg, pp_rank=1, pp_size=2, is_recv=True)
         assert shapes == [(self.SEQ, self.MBS, self.H * self.N_STREAMS)]
@@ -149,8 +156,10 @@ class TestGetTensorShapesWithMHC:
     def test_mhc_pp2_rank1_send_1stream(self):
         """PP rank 1 (last stage) sends C (after output_contract)."""
         cfg = _make_config(
-            hidden_size=self.H, pp_size=2,
-            enable_hyper_connections=True, num_residual_streams=self.N_STREAMS,
+            hidden_size=self.H,
+            pp_size=2,
+            enable_hyper_connections=True,
+            num_residual_streams=self.N_STREAMS,
         )
         shapes = self._shapes(cfg, pp_rank=1, pp_size=2, is_recv=False)
         assert shapes == [(self.SEQ, self.MBS, self.H)]
@@ -160,30 +169,42 @@ class TestGetTensorShapesWithMHC:
     def test_mhc_pp4_intermediate_ranks(self):
         """Intermediate ranks both send and receive n*C."""
         cfg = _make_config(
-            hidden_size=self.H, pp_size=4, num_layers=8,
-            enable_hyper_connections=True, num_residual_streams=self.N_STREAMS,
+            hidden_size=self.H,
+            pp_size=4,
+            num_layers=8,
+            enable_hyper_connections=True,
+            num_residual_streams=self.N_STREAMS,
         )
         for rank in (1, 2):
             for is_recv in (True, False):
                 shapes = self._shapes(cfg, pp_rank=rank, pp_size=4, is_recv=is_recv)
-                assert shapes == [(self.SEQ, self.MBS, self.H * self.N_STREAMS)], (
-                    f"rank={rank}, is_recv={is_recv}"
-                )
+                assert shapes == [
+                    (self.SEQ, self.MBS, self.H * self.N_STREAMS)
+                ], f"rank={rank}, is_recv={is_recv}"
 
     # --- With sequence parallel ---
 
     def test_mhc_with_sequence_parallel(self):
         """Sequence parallel divides seq_length by TP size."""
         cfg = _make_config(
-            hidden_size=self.H, pp_size=2,
-            enable_hyper_connections=True, num_residual_streams=self.N_STREAMS,
-            sequence_parallel=True, tensor_model_parallel_size=2,
+            hidden_size=self.H,
+            pp_size=2,
+            enable_hyper_connections=True,
+            num_residual_streams=self.N_STREAMS,
+            sequence_parallel=True,
+            tensor_model_parallel_size=2,
         )
         tp, cp = _make_tp_cp_groups(tp_size=2)
         pp = _make_pp_group(0, 2)
         shapes = get_tensor_shapes(
-            seq_length=self.SEQ, micro_batch_size=self.MBS, decoder_seq_length=None,
-            config=cfg, tp_group=tp, cp_group=cp, pp_group=pp, is_recv=False,
+            seq_length=self.SEQ,
+            micro_batch_size=self.MBS,
+            decoder_seq_length=None,
+            config=cfg,
+            tp_group=tp,
+            cp_group=cp,
+            pp_group=pp,
+            is_recv=False,
         )
         assert shapes == [(self.SEQ // 2, self.MBS, self.H * self.N_STREAMS)]
 
@@ -191,6 +212,7 @@ class TestGetTensorShapesWithMHC:
 # ===========================================================================
 # 2. get_num_layers_to_build — mHC + standalone embedding/loss
 # ===========================================================================
+
 
 class TestGetNumLayersToBuilWithMHC:
     """
@@ -208,7 +230,8 @@ class TestGetNumLayersToBuilWithMHC:
     def test_pp2_standalone_embedding_mhc(self):
         """With standalone embedding on PP rank 0, rank 0 builds fewer layers."""
         cfg = _make_config(
-            num_layers=8, pp_size=2,
+            num_layers=8,
+            pp_size=2,
             enable_hyper_connections=True,
             account_for_embedding=True,
             account_for_loss=True,
@@ -223,7 +246,8 @@ class TestGetNumLayersToBuilWithMHC:
         """PP=4, standalone embedding+loss, 12 layers → (12+2)/4=3.5 → raises."""
         with pytest.raises((ValueError, AssertionError)):
             _make_config(
-                num_layers=12, pp_size=4,
+                num_layers=12,
+                pp_size=4,
                 enable_hyper_connections=True,
                 account_for_embedding=True,
                 account_for_loss=True,
@@ -232,7 +256,8 @@ class TestGetNumLayersToBuilWithMHC:
     def test_pp4_standalone_both_mhc_valid(self):
         """Valid configuration: (14+2)/4 = 4 per rank."""
         cfg = _make_config(
-            num_layers=14, pp_size=4,
+            num_layers=14,
+            pp_size=4,
             enable_hyper_connections=True,
             account_for_embedding=True,
             account_for_loss=True,
@@ -248,7 +273,8 @@ class TestGetNumLayersToBuilWithMHC:
     def test_uneven_pp_with_mhc(self):
         """Uneven PP: first stage has 2 layers, last has 2, middle gets 2 each."""
         cfg = _make_config(
-            num_layers=8, pp_size=4,
+            num_layers=8,
+            pp_size=4,
             enable_hyper_connections=True,
             num_layers_first=2,
             num_layers_last=2,
@@ -270,7 +296,9 @@ class TestGetNumLayersToBuilWithMHC:
         """VPP=2, standalone embedding+loss, pp=2, 8 layers → 10/2=5, 5%2!=0 → raises."""
         with pytest.raises((ValueError, AssertionError)):
             _make_config(
-                num_layers=8, pp_size=2, vp_size=2,
+                num_layers=8,
+                pp_size=2,
+                vp_size=2,
                 enable_hyper_connections=True,
                 account_for_embedding=True,
                 account_for_loss=True,
@@ -279,7 +307,9 @@ class TestGetNumLayersToBuilWithMHC:
     def test_vpp_standalone_both_valid_mhc(self):
         """VPP=2, standalone embed+loss, pp=4, 14 layers → (14+2)/4=4, 4/2=2 per VP."""
         cfg = _make_config(
-            num_layers=14, pp_size=4, vp_size=2,
+            num_layers=14,
+            pp_size=4,
+            vp_size=2,
             enable_hyper_connections=True,
             account_for_embedding=True,
             account_for_loss=True,
@@ -302,6 +332,7 @@ class TestGetNumLayersToBuilWithMHC:
 # 3. TransformerBlock expand/contract — boundary logic
 # ===========================================================================
 
+
 class TestTransformerBlockMHCBoundaries:
     """
     Test that TransformerBlock correctly applies input_expand at pre_process
@@ -312,6 +343,7 @@ class TestTransformerBlockMHCBoundaries:
     @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
     def test_input_expand(self):
         from megatron.core.transformer.hyper_connection import HyperConnectionModule
+
         n = 4
         s, b, C = 8, 2, 64
         x = torch.randn(s, b, C, device='cuda')
@@ -319,13 +351,12 @@ class TestTransformerBlockMHCBoundaries:
         assert expanded.shape == (s, b, n * C)
         # Each stream should be a copy of input
         for i in range(n):
-            torch.testing.assert_close(
-                expanded[:, :, i * C : (i + 1) * C], x
-            )
+            torch.testing.assert_close(expanded[:, :, i * C : (i + 1) * C], x)
 
     @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
     def test_output_contract(self):
         from megatron.core.transformer.hyper_connection import HyperConnectionModule
+
         n = 4
         s, b, C = 8, 2, 64
         x = torch.randn(s, b, n * C, device='cuda')
@@ -338,6 +369,7 @@ class TestTransformerBlockMHCBoundaries:
     @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
     def test_expand_then_contract_preserves_shape(self):
         from megatron.core.transformer.hyper_connection import HyperConnectionModule
+
         n = 4
         s, b, C = 8, 2, 64
         x = torch.randn(s, b, C, device='cuda')
@@ -352,6 +384,7 @@ class TestTransformerBlockMHCBoundaries:
 # 3b. Zero-layer VP stage edge cases with mHC
 # ===========================================================================
 
+
 class TestZeroLayerVPStageWithMHC:
     """
     When standalone embedding/loss makes a VP stage have very few (1) transformer
@@ -361,7 +394,9 @@ class TestZeroLayerVPStageWithMHC:
     def test_vpp_standalone_embed_first_stage_has_1_layer(self):
         """First VP stage at first PP rank should have exactly 1 layer (2-1=1)."""
         cfg = _make_config(
-            num_layers=7, pp_size=2, vp_size=2,
+            num_layers=7,
+            pp_size=2,
+            vp_size=2,
             enable_hyper_connections=True,
             account_for_embedding=True,
         )
@@ -372,9 +407,7 @@ class TestZeroLayerVPStageWithMHC:
     def test_vpp_standalone_loss_last_stage_has_1_layer(self):
         """Last VP stage at last PP rank should have exactly 1 layer (2-1=1)."""
         cfg = _make_config(
-            num_layers=7, pp_size=2, vp_size=2,
-            enable_hyper_connections=True,
-            account_for_loss=True,
+            num_layers=7, pp_size=2, vp_size=2, enable_hyper_connections=True, account_for_loss=True
         )
         n = get_num_layers_to_build(cfg, vp_stage=1, pp_rank=1)
         assert n == 1
@@ -383,7 +416,9 @@ class TestZeroLayerVPStageWithMHC:
     def test_vpp_standalone_both_boundary_layers(self):
         """Both first and last VP stages lose a layer, but all counts remain >= 0."""
         cfg = _make_config(
-            num_layers=14, pp_size=4, vp_size=2,
+            num_layers=14,
+            pp_size=4,
+            vp_size=2,
             enable_hyper_connections=True,
             account_for_embedding=True,
             account_for_loss=True,
@@ -397,6 +432,7 @@ class TestZeroLayerVPStageWithMHC:
 # ===========================================================================
 # 4. VPP tensor_shape — single shape for all chunks
 # ===========================================================================
+
 
 class TestVPPTensorShapeWithMHC:
     """
@@ -429,9 +465,7 @@ class TestVPPTensorShapeWithMHC:
         pp_size = 2
 
         config = SimpleNamespace(
-            hidden_size=hidden_size,
-            enable_hyper_connections=False,
-            sequence_parallel=False,
+            hidden_size=hidden_size, enable_hyper_connections=False, sequence_parallel=False
         )
 
         hidden_dim = config.hidden_size
@@ -464,6 +498,7 @@ class TestVPPTensorShapeWithMHC:
 # 5. Shape consistency across PP stages with VPP + mHC
 # ===========================================================================
 
+
 class TestPPShapeConsistencyWithMHC:
     """
     Verify that send shape from one stage matches recv shape of the next stage.
@@ -476,14 +511,24 @@ class TestPPShapeConsistencyWithMHC:
         results = []
         for rank in range(pp_size):
             send = get_tensor_shapes(
-                seq_length=32, micro_batch_size=2, decoder_seq_length=None,
-                config=config, tp_group=tp, cp_group=cp,
-                pp_group=_make_pp_group(rank, pp_size), is_recv=False,
+                seq_length=32,
+                micro_batch_size=2,
+                decoder_seq_length=None,
+                config=config,
+                tp_group=tp,
+                cp_group=cp,
+                pp_group=_make_pp_group(rank, pp_size),
+                is_recv=False,
             )
             recv = get_tensor_shapes(
-                seq_length=32, micro_batch_size=2, decoder_seq_length=None,
-                config=config, tp_group=tp, cp_group=cp,
-                pp_group=_make_pp_group(rank, pp_size), is_recv=True,
+                seq_length=32,
+                micro_batch_size=2,
+                decoder_seq_length=None,
+                config=config,
+                tp_group=tp,
+                cp_group=cp,
+                pp_group=_make_pp_group(rank, pp_size),
+                is_recv=True,
             )
             results.append((send, recv))
         return results
@@ -493,20 +538,18 @@ class TestPPShapeConsistencyWithMHC:
         cfg = _make_config(hidden_size=64, pp_size=2, enable_hyper_connections=True)
         shapes = self._get_send_recv_shapes(cfg, 2)
         # rank 0 send == rank 1 recv
-        assert shapes[0][0] == shapes[1][1], (
-            f"rank 0 send {shapes[0][0]} != rank 1 recv {shapes[1][1]}"
-        )
+        assert (
+            shapes[0][0] == shapes[1][1]
+        ), f"rank 0 send {shapes[0][0]} != rank 1 recv {shapes[1][1]}"
 
     def test_pp4_mhc_all_consecutive_match(self):
         """For all consecutive stages, send[i] == recv[i+1]."""
-        cfg = _make_config(
-            hidden_size=64, num_layers=8, pp_size=4, enable_hyper_connections=True,
-        )
+        cfg = _make_config(hidden_size=64, num_layers=8, pp_size=4, enable_hyper_connections=True)
         shapes = self._get_send_recv_shapes(cfg, 4)
         for i in range(3):
-            assert shapes[i][0] == shapes[i + 1][1], (
-                f"rank {i} send {shapes[i][0]} != rank {i+1} recv {shapes[i+1][1]}"
-            )
+            assert (
+                shapes[i][0] == shapes[i + 1][1]
+            ), f"rank {i} send {shapes[i][0]} != rank {i+1} recv {shapes[i+1][1]}"
 
     def test_pp4_no_mhc_all_consecutive_match(self):
         """Baseline: without mHC, all shapes should be plain hidden_size."""
@@ -521,6 +564,7 @@ class TestPPShapeConsistencyWithMHC:
 # 6. Standalone embedding / loss — PP boundary + mHC interaction
 # ===========================================================================
 
+
 class TestStandaloneEmbeddingLossWithMHC:
     """
     Verify that standalone embedding/loss configurations interact correctly
@@ -531,7 +575,9 @@ class TestStandaloneEmbeddingLossWithMHC:
         """With standalone embedding, first PP/VP stage gets 1 fewer layer."""
         # 7 layers, pp=2, vp=2 → (7+1)/2=4, 4/2=2 per VP stage
         cfg = _make_config(
-            num_layers=7, pp_size=2, vp_size=2,
+            num_layers=7,
+            pp_size=2,
+            vp_size=2,
             enable_hyper_connections=True,
             account_for_embedding=True,
         )
@@ -546,9 +592,7 @@ class TestStandaloneEmbeddingLossWithMHC:
     def test_standalone_loss_last_stage_has_fewer_layers(self):
         """With standalone loss, last PP/VP stage gets 1 fewer layer."""
         cfg = _make_config(
-            num_layers=7, pp_size=2, vp_size=2,
-            enable_hyper_connections=True,
-            account_for_loss=True,
+            num_layers=7, pp_size=2, vp_size=2, enable_hyper_connections=True, account_for_loss=True
         )
         # (7+1)/2 = 4, 4/2 = 2 per VP
         # rank 0: 2 each VP
@@ -562,25 +606,37 @@ class TestStandaloneEmbeddingLossWithMHC:
     def test_standalone_both_mhc_shapes_still_consistent(self):
         """With standalone embed+loss, P2P shapes should still match between stages."""
         cfg = _make_config(
-            hidden_size=64, num_layers=14, pp_size=4,
-            enable_hyper_connections=True, num_residual_streams=4,
-            account_for_embedding=True, account_for_loss=True,
+            hidden_size=64,
+            num_layers=14,
+            pp_size=4,
+            enable_hyper_connections=True,
+            num_residual_streams=4,
+            account_for_embedding=True,
+            account_for_loss=True,
         )
         tp, cp = _make_tp_cp_groups()
         for i in range(3):
             send = get_tensor_shapes(
-                seq_length=32, micro_batch_size=2, decoder_seq_length=None,
-                config=cfg, tp_group=tp, cp_group=cp,
-                pp_group=_make_pp_group(i, 4), is_recv=False,
+                seq_length=32,
+                micro_batch_size=2,
+                decoder_seq_length=None,
+                config=cfg,
+                tp_group=tp,
+                cp_group=cp,
+                pp_group=_make_pp_group(i, 4),
+                is_recv=False,
             )
             recv = get_tensor_shapes(
-                seq_length=32, micro_batch_size=2, decoder_seq_length=None,
-                config=cfg, tp_group=tp, cp_group=cp,
-                pp_group=_make_pp_group(i + 1, 4), is_recv=True,
+                seq_length=32,
+                micro_batch_size=2,
+                decoder_seq_length=None,
+                config=cfg,
+                tp_group=tp,
+                cp_group=cp,
+                pp_group=_make_pp_group(i + 1, 4),
+                is_recv=True,
             )
-            assert send == recv, (
-                f"rank {i}→{i+1}: send={send} recv={recv}"
-            )
+            assert send == recv, f"rank {i}→{i+1}: send={send} recv={recv}"
 
     def test_mhc_shapes_first_stage_send_vs_second_recv(self):
         """
@@ -590,19 +646,32 @@ class TestStandaloneEmbeddingLossWithMHC:
         """
         H, N = 64, 4
         cfg = _make_config(
-            hidden_size=H, num_layers=8, pp_size=2,
-            enable_hyper_connections=True, num_residual_streams=N,
+            hidden_size=H,
+            num_layers=8,
+            pp_size=2,
+            enable_hyper_connections=True,
+            num_residual_streams=N,
         )
         tp, cp = _make_tp_cp_groups()
         send_0 = get_tensor_shapes(
-            seq_length=32, micro_batch_size=2, decoder_seq_length=None,
-            config=cfg, tp_group=tp, cp_group=cp,
-            pp_group=_make_pp_group(0, 2), is_recv=False,
+            seq_length=32,
+            micro_batch_size=2,
+            decoder_seq_length=None,
+            config=cfg,
+            tp_group=tp,
+            cp_group=cp,
+            pp_group=_make_pp_group(0, 2),
+            is_recv=False,
         )
         recv_1 = get_tensor_shapes(
-            seq_length=32, micro_batch_size=2, decoder_seq_length=None,
-            config=cfg, tp_group=tp, cp_group=cp,
-            pp_group=_make_pp_group(1, 2), is_recv=True,
+            seq_length=32,
+            micro_batch_size=2,
+            decoder_seq_length=None,
+            config=cfg,
+            tp_group=tp,
+            cp_group=cp,
+            pp_group=_make_pp_group(1, 2),
+            is_recv=True,
         )
         assert send_0 == [(32, 2, H * N)]
         assert recv_1 == [(32, 2, H * N)]
@@ -616,14 +685,22 @@ class TestStandaloneEmbeddingLossWithMHC:
         """
         H, N = 64, 4
         cfg = _make_config(
-            hidden_size=H, num_layers=8, pp_size=2,
-            enable_hyper_connections=True, num_residual_streams=N,
+            hidden_size=H,
+            num_layers=8,
+            pp_size=2,
+            enable_hyper_connections=True,
+            num_residual_streams=N,
         )
         tp, cp = _make_tp_cp_groups()
         send_last = get_tensor_shapes(
-            seq_length=32, micro_batch_size=2, decoder_seq_length=None,
-            config=cfg, tp_group=tp, cp_group=cp,
-            pp_group=_make_pp_group(1, 2), is_recv=False,
+            seq_length=32,
+            micro_batch_size=2,
+            decoder_seq_length=None,
+            config=cfg,
+            tp_group=tp,
+            cp_group=cp,
+            pp_group=_make_pp_group(1, 2),
+            is_recv=False,
         )
         # Last stage sends C (after contract), not n*C
         assert send_last == [(32, 2, H)]
@@ -633,11 +710,11 @@ class TestStandaloneEmbeddingLossWithMHC:
 # 7. E2E forward pass tests (require multi-GPU)
 # ===========================================================================
 
+
 @pytest.mark.internal
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
 @pytest.mark.skipif(
-    int(__import__('os').environ.get('WORLD_SIZE', '1')) < 2,
-    reason="Requires at least 2 GPUs"
+    int(__import__('os').environ.get('WORLD_SIZE', '1')) < 2, reason="Requires at least 2 GPUs"
 )
 class TestPPForwardWithMHC:
     """
@@ -646,12 +723,7 @@ class TestPPForwardWithMHC:
     """
 
     def _run_forward(
-        self,
-        pp_size,
-        vp_size,
-        enable_mhc,
-        account_for_embedding=False,
-        account_for_loss=False,
+        self, pp_size, vp_size, enable_mhc, account_for_embedding=False, account_for_loss=False
     ):
         from megatron.core import mpu
         from megatron.core.models.gpt.gpt_layer_specs import (
@@ -697,9 +769,7 @@ class TestPPForwardWithMHC:
                 attention_dropout=0.0,
             )
 
-            spec = get_gpt_layer_with_transformer_engine_spec(
-                enable_hyper_connection=enable_mhc
-            )
+            spec = get_gpt_layer_with_transformer_engine_spec(enable_hyper_connection=enable_mhc)
 
             models = []
             for i in range(vp_size or 1):
@@ -731,7 +801,9 @@ class TestPPForwardWithMHC:
 
             def forward_step_func(data_iterator, model):
                 tokens = torch.randint(0, vocab_size, (micro_batch_size, seq_length)).cuda()
-                position_ids = torch.arange(seq_length).unsqueeze(0).expand(micro_batch_size, -1).cuda()
+                position_ids = (
+                    torch.arange(seq_length).unsqueeze(0).expand(micro_batch_size, -1).cuda()
+                )
                 labels = torch.randint(0, vocab_size, (micro_batch_size, seq_length)).cuda()
                 output = model(tokens, position_ids, None, labels=labels)
 
@@ -779,16 +851,16 @@ class TestPPForwardWithMHC:
         # with 8 layers pp=2 as (8+1)/2 isn't integer.
         # The test framework should raise ValueError, confirming the validation.
         with pytest.raises((ValueError, AssertionError)):
-            self._run_forward(
-                pp_size=2, vp_size=None, enable_mhc=True,
-                account_for_embedding=True,
-            )
+            self._run_forward(pp_size=2, vp_size=None, enable_mhc=True, account_for_embedding=True)
 
     def test_pp2_mhc_standalone_both_forward(self):
         """PP=2 + mHC + standalone embedding + loss: (8+2)/2=5, works."""
         self._run_forward(
-            pp_size=2, vp_size=None, enable_mhc=True,
-            account_for_embedding=True, account_for_loss=True,
+            pp_size=2,
+            vp_size=None,
+            enable_mhc=True,
+            account_for_embedding=True,
+            account_for_loss=True,
         )
 
     def test_pp2_no_mhc_forward_baseline(self):
@@ -799,6 +871,7 @@ class TestPPForwardWithMHC:
 # ===========================================================================
 # 8. Flexible VPP layout (pipeline_model_parallel_layout) + mHC
 # ===========================================================================
+
 
 def _make_layout_config(
     hidden_size=64,
@@ -854,11 +927,14 @@ class TestFlexibleVPPLayoutLayerCountsWithMHC:
         #   PP1 VP1: ["loss"]         → 0 decoders
         layout = [["embedding"], ["decoder"] * 6, ["decoder"], ["loss"]]
         Utils.fake_initialize_model_parallel(
-            pipeline_model_parallel_size=2, virtual_pipeline_model_parallel_size=2,
+            pipeline_model_parallel_size=2, virtual_pipeline_model_parallel_size=2
         )
         cfg = _make_layout_config(
-            num_layers=7, pp_size=2, layout=layout,
-            enable_hyper_connections=True, num_residual_streams=4,
+            num_layers=7,
+            pp_size=2,
+            layout=layout,
+            enable_hyper_connections=True,
+            num_residual_streams=4,
         )
 
         expected = {(0, 0): 0, (0, 1): 1, (1, 0): 6, (1, 1): 0}
@@ -867,9 +943,9 @@ class TestFlexibleVPPLayoutLayerCountsWithMHC:
             parallel_state.set_pipeline_model_parallel_rank(pp_rank)
             for vp in range(2):
                 n = get_num_layers_to_build(cfg, vp_stage=vp)
-                assert n == expected[(pp_rank, vp)], (
-                    f"pp_rank={pp_rank}, vp={vp}: expected {expected[(pp_rank, vp)]}, got {n}"
-                )
+                assert (
+                    n == expected[(pp_rank, vp)]
+                ), f"pp_rank={pp_rank}, vp={vp}: expected {expected[(pp_rank, vp)]}, got {n}"
                 total += n
         assert total == 7
 
@@ -888,11 +964,10 @@ class TestFlexibleVPPLayoutLayerCountsWithMHC:
             ["decoder", "loss"],
         ]
         Utils.fake_initialize_model_parallel(
-            pipeline_model_parallel_size=2, virtual_pipeline_model_parallel_size=2,
+            pipeline_model_parallel_size=2, virtual_pipeline_model_parallel_size=2
         )
         cfg = _make_layout_config(
-            num_layers=8, pp_size=2, layout=layout,
-            enable_hyper_connections=True,
+            num_layers=8, pp_size=2, layout=layout, enable_hyper_connections=True
         )
 
         expected = {(0, 0): 2, (0, 1): 1, (1, 0): 4, (1, 1): 1}
@@ -901,9 +976,9 @@ class TestFlexibleVPPLayoutLayerCountsWithMHC:
             parallel_state.set_pipeline_model_parallel_rank(pp_rank)
             for vp in range(2):
                 n = get_num_layers_to_build(cfg, vp_stage=vp)
-                assert n == expected[(pp_rank, vp)], (
-                    f"pp_rank={pp_rank}, vp={vp}: expected {expected[(pp_rank, vp)]}, got {n}"
-                )
+                assert (
+                    n == expected[(pp_rank, vp)]
+                ), f"pp_rank={pp_rank}, vp={vp}: expected {expected[(pp_rank, vp)]}, got {n}"
                 total += n
         assert total == 8
 
@@ -916,11 +991,10 @@ class TestFlexibleVPPLayoutLayerCountsWithMHC:
         # PP1 VP1: ["loss"]       → 0 decoders
         layout = [["embedding"], ["decoder"] * 7, [], ["loss"]]
         Utils.fake_initialize_model_parallel(
-            pipeline_model_parallel_size=2, virtual_pipeline_model_parallel_size=2,
+            pipeline_model_parallel_size=2, virtual_pipeline_model_parallel_size=2
         )
         cfg = _make_layout_config(
-            num_layers=7, pp_size=2, layout=layout,
-            enable_hyper_connections=True,
+            num_layers=7, pp_size=2, layout=layout, enable_hyper_connections=True
         )
 
         expected = {(0, 0): 0, (0, 1): 0, (1, 0): 7, (1, 1): 0}
@@ -940,13 +1014,13 @@ class TestFlexibleVPPLayoutLayerCountsWithMHC:
             ["decoder", "loss"],
         ]
         Utils.fake_initialize_model_parallel(
-            pipeline_model_parallel_size=2, virtual_pipeline_model_parallel_size=2,
+            pipeline_model_parallel_size=2, virtual_pipeline_model_parallel_size=2
         )
         cfg_mhc = _make_layout_config(
-            num_layers=8, pp_size=2, layout=layout, enable_hyper_connections=True,
+            num_layers=8, pp_size=2, layout=layout, enable_hyper_connections=True
         )
         cfg_no_mhc = _make_layout_config(
-            num_layers=8, pp_size=2, layout=layout, enable_hyper_connections=False,
+            num_layers=8, pp_size=2, layout=layout, enable_hyper_connections=False
         )
 
         for pp_rank in range(2):
@@ -954,9 +1028,9 @@ class TestFlexibleVPPLayoutLayerCountsWithMHC:
             for vp in range(2):
                 n_mhc = get_num_layers_to_build(cfg_mhc, vp_stage=vp)
                 n_no_mhc = get_num_layers_to_build(cfg_no_mhc, vp_stage=vp)
-                assert n_mhc == n_no_mhc, (
-                    f"pp_rank={pp_rank}, vp={vp}: mHC={n_mhc} != no-mHC={n_no_mhc}"
-                )
+                assert (
+                    n_mhc == n_no_mhc
+                ), f"pp_rank={pp_rank}, vp={vp}: mHC={n_mhc} != no-mHC={n_no_mhc}"
 
 
 class TestFlexibleVPPLayoutShapeConsistencyWithMHC:
@@ -971,14 +1045,24 @@ class TestFlexibleVPPLayoutShapeConsistencyWithMHC:
         results = []
         for rank in range(pp_size):
             send = get_tensor_shapes(
-                seq_length=seq, micro_batch_size=mbs, decoder_seq_length=None,
-                config=config, tp_group=tp, cp_group=cp,
-                pp_group=_make_pp_group(rank, pp_size), is_recv=False,
+                seq_length=seq,
+                micro_batch_size=mbs,
+                decoder_seq_length=None,
+                config=config,
+                tp_group=tp,
+                cp_group=cp,
+                pp_group=_make_pp_group(rank, pp_size),
+                is_recv=False,
             )
             recv = get_tensor_shapes(
-                seq_length=seq, micro_batch_size=mbs, decoder_seq_length=None,
-                config=config, tp_group=tp, cp_group=cp,
-                pp_group=_make_pp_group(rank, pp_size), is_recv=True,
+                seq_length=seq,
+                micro_batch_size=mbs,
+                decoder_seq_length=None,
+                config=config,
+                tp_group=tp,
+                cp_group=cp,
+                pp_group=_make_pp_group(rank, pp_size),
+                is_recv=True,
             )
             results.append((send, recv))
         return results
@@ -987,14 +1071,17 @@ class TestFlexibleVPPLayoutShapeConsistencyWithMHC:
         """PP=2 with flexible VPP layout + mHC: rank 0 send == rank 1 recv."""
         H, N = 64, 4
         cfg = _make_layout_config(
-            hidden_size=H, num_layers=7, pp_size=2,
+            hidden_size=H,
+            num_layers=7,
+            pp_size=2,
             layout=[["embedding"], ["decoder"] * 6, ["decoder"], ["loss"]],
-            enable_hyper_connections=True, num_residual_streams=N,
+            enable_hyper_connections=True,
+            num_residual_streams=N,
         )
         shapes = self._get_send_recv_shapes(cfg, pp_size=2)
-        assert shapes[0][0] == shapes[1][1], (
-            f"rank 0 send {shapes[0][0]} != rank 1 recv {shapes[1][1]}"
-        )
+        assert (
+            shapes[0][0] == shapes[1][1]
+        ), f"rank 0 send {shapes[0][0]} != rank 1 recv {shapes[1][1]}"
         # rank 0 (first) sends n*C
         assert shapes[0][0] == [(32, 2, H * N)]
         # rank 1 (last) sends C
@@ -1014,14 +1101,18 @@ class TestFlexibleVPPLayoutShapeConsistencyWithMHC:
             ["decoder", "loss"],
         ]
         cfg = _make_layout_config(
-            hidden_size=H, num_layers=8, pp_size=4, layout=layout,
-            enable_hyper_connections=True, num_residual_streams=N,
+            hidden_size=H,
+            num_layers=8,
+            pp_size=4,
+            layout=layout,
+            enable_hyper_connections=True,
+            num_residual_streams=N,
         )
         shapes = self._get_send_recv_shapes(cfg, pp_size=4)
         for i in range(3):
-            assert shapes[i][0] == shapes[i + 1][1], (
-                f"rank {i} send {shapes[i][0]} != rank {i+1} recv {shapes[i+1][1]}"
-            )
+            assert (
+                shapes[i][0] == shapes[i + 1][1]
+            ), f"rank {i} send {shapes[i][0]} != rank {i+1} recv {shapes[i+1][1]}"
 
         # First stage sends n*C, intermediate stages send/recv n*C, last stage sends C
         assert shapes[0][0] == [(32, 2, H * N)]
@@ -1035,7 +1126,9 @@ class TestFlexibleVPPLayoutShapeConsistencyWithMHC:
         """Baseline: PP=2 with flexible VPP layout, no mHC — all shapes are C."""
         H = 64
         cfg = _make_layout_config(
-            hidden_size=H, num_layers=7, pp_size=2,
+            hidden_size=H,
+            num_layers=7,
+            pp_size=2,
             layout=[["embedding"], ["decoder"] * 6, ["decoder"], ["loss"]],
             enable_hyper_connections=False,
         )
@@ -1047,17 +1140,16 @@ class TestFlexibleVPPLayoutShapeConsistencyWithMHC:
     def test_pp4_flexible_vpp_mhc_uneven_layers_shape_consistent(self):
         """Highly uneven layout: shapes must still match between stages."""
         H, N = 64, 4
-        layout = [
-            ["embedding", "decoder"],
-            ["decoder"] * 5,
-            ["decoder"],
-            ["decoder", "loss"],
-        ]
+        layout = [["embedding", "decoder"], ["decoder"] * 5, ["decoder"], ["decoder", "loss"]]
         cfg = _make_layout_config(
-            hidden_size=H, num_layers=8, pp_size=2, layout=layout,
-            enable_hyper_connections=True, num_residual_streams=N,
+            hidden_size=H,
+            num_layers=8,
+            pp_size=2,
+            layout=layout,
+            enable_hyper_connections=True,
+            num_residual_streams=N,
         )
         shapes = self._get_send_recv_shapes(cfg, pp_size=2)
-        assert shapes[0][0] == shapes[1][1], (
-            f"rank 0 send {shapes[0][0]} != rank 1 recv {shapes[1][1]}"
-        )
+        assert (
+            shapes[0][0] == shapes[1][1]
+        ), f"rank 0 send {shapes[0][0]} != rank 1 recv {shapes[1][1]}"

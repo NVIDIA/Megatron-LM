@@ -24,6 +24,7 @@ class SinkhornKnopp(torch.autograd.Function):
 
     Reference: Eq. (9) in mHC paper - M^{(t)} = T_c(T_r(M^{(t-1)}))
     """
+
     eps = 1e-6
 
     @staticmethod
@@ -371,9 +372,7 @@ class HyperConnectionModule(MegatronModule):
         return mixed.view(s, b, n * C)
 
     def forward(
-        self,
-        hidden_states: Tensor,
-        mhc_recompute_manager: Optional['CheckpointManager'] = None,
+        self, hidden_states: Tensor, mhc_recompute_manager: Optional['CheckpointManager'] = None
     ) -> Tuple[Tensor, Tensor, Tensor]:
         """
         Full mHC forward pass.
@@ -393,9 +392,7 @@ class HyperConnectionModule(MegatronModule):
         else:
             return self._forward_normal(hidden_states)
 
-    def _forward_normal(
-        self, hidden_states: Tensor
-    ) -> Tuple[Tensor, Tensor, Tensor]:
+    def _forward_normal(self, hidden_states: Tensor) -> Tuple[Tensor, Tensor, Tensor]:
         """
         Normal forward pass without checkpointing.
 

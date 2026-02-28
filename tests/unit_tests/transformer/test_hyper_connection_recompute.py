@@ -16,8 +16,8 @@ import torch
 import torch.nn as nn
 
 from megatron.core.tensor_parallel.random import (
-    CheckpointWithoutOutput,
     CheckpointManager,
+    CheckpointWithoutOutput,
     model_parallel_cuda_manual_seed,
 )
 from megatron.core.transformer.hyper_connection import HyperConnectionModule

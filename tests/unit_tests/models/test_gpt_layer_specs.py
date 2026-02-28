@@ -70,17 +70,13 @@ class TestGptLayerSpecsHyperConnection:
         assert spec.submodules.mlp_hyper_connection is IdentityOp
 
     def test_local_spec_mla_no_hyper_connection(self):
-        spec = get_gpt_layer_local_spec(
-            multi_latent_attention=True, enable_hyper_connection=False
-        )
+        spec = get_gpt_layer_local_spec(multi_latent_attention=True, enable_hyper_connection=False)
         assert spec.module is TransformerLayer
         assert spec.submodules.self_attention_hyper_connection is IdentityOp
         assert spec.submodules.mlp_hyper_connection is IdentityOp
 
     def test_local_spec_mla_enable_hyper_connection(self):
-        spec = get_gpt_layer_local_spec(
-            multi_latent_attention=True, enable_hyper_connection=True
-        )
+        spec = get_gpt_layer_local_spec(multi_latent_attention=True, enable_hyper_connection=True)
         assert spec.module is HyperConnectionTransformerLayer
         assert spec.submodules.self_attention_hyper_connection is HyperConnectionModule
         assert spec.submodules.mlp_hyper_connection is HyperConnectionModule

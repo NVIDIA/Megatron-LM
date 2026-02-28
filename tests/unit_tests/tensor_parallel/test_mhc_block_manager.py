@@ -3,7 +3,7 @@
 import pytest
 import torch
 
-from megatron.core.tensor_parallel.random import CheckpointWithoutOutput, CheckpointManager
+from megatron.core.tensor_parallel.random import CheckpointManager, CheckpointWithoutOutput
 from tests.unit_tests.test_utilities import Utils
 
 
@@ -318,7 +318,6 @@ def test_mhc_block_recompute_manager_error_handling():
         manager.add_checkpoint(ckpt)
 
     Utils.destroy_model_parallel()
-
 
 
 def test_mhc_block_recompute_manager_partial_checkpoint():

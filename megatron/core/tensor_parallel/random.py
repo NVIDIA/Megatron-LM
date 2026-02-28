@@ -625,6 +625,7 @@ def _load_args_from_ctx(ctx):
     Returns:
         tuple of reconstructed arguments in their original order.
     """
+
     def _detach_with_grad(tensor):
         detached = tensor.detach()
         detached.requires_grad_(tensor.requires_grad)
@@ -749,7 +750,6 @@ class CheckpointManager:
             # Call _recompute for each checkpoint in forward order
             # The _recompute method will restore the output tensor storage
             ckpt._recompute(None)
-
 
 
 class CheckpointWithoutOutput(object):

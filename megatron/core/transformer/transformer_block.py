@@ -888,7 +888,9 @@ class TransformerBlock(GraphableMegatronModule, MegatronModule):
 
                     mhc_manager = mhc_layer_managers[l_no]
                     if mhc_manager is not None:
-                        mhc_manager.is_last_layer_in_recompute_block = mhc_is_last_in_recompute_block[l_no]
+                        mhc_manager.is_last_layer_in_recompute_block = (
+                            mhc_is_last_in_recompute_block[l_no]
+                        )
 
                     with self.offload_context, inner_quantization_context:
                         hidden_states, context = layer(

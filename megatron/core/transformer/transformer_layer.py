@@ -1,4 +1,4 @@
-# Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 from __future__ import annotations
 
 import functools
@@ -7,7 +7,6 @@ import warnings
 from abc import ABC
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, Dict, Optional, Union
-
 
 if TYPE_CHECKING:
     from megatron.core.tensor_parallel.random import CheckpointManager
@@ -679,9 +678,9 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
         """
         # Injected by __call__ for cuda graph keying; not a real forward arg.
         kwargs.pop("dynamic_inference_decode_only", None)
-        assert not self.config.enable_hyper_connections, (
-            "Please use HyperConnectionTransformerLayer instead"
-        )
+        assert (
+            not self.config.enable_hyper_connections
+        ), "Please use HyperConnectionTransformerLayer instead"
         hidden_states, context = self._forward_attention(*args, **kwargs)
         output = self._forward_mlp(
             hidden_states,
@@ -1325,9 +1324,7 @@ class HyperConnectionTransformerLayer(TransformerLayer):
         )
 
         self.mlp_hyper_connection = build_module(
-            submodules.mlp_hyper_connection,
-            config=self.config,
-            layer_number=self.layer_number,
+            submodules.mlp_hyper_connection, config=self.config, layer_number=self.layer_number
         )
 
         # In mHC the layernorm may be fused into TE linear layers, making
@@ -1376,9 +1373,9 @@ class HyperConnectionTransformerLayer(TransformerLayer):
 
         if CudaGraphScope.attn in self.config.cuda_graph_scope:
             submodules.append(self.self_attention_hyper_connection)
-        if (
-            not self.is_moe_layer and CudaGraphScope.mlp in self.config.cuda_graph_scope
-        ) or (self.is_moe_layer and CudaGraphScope.moe in self.config.cuda_graph_scope):
+        if (not self.is_moe_layer and CudaGraphScope.mlp in self.config.cuda_graph_scope) or (
+            self.is_moe_layer and CudaGraphScope.moe in self.config.cuda_graph_scope
+        ):
             submodules.append(self.mlp_hyper_connection)
         return submodules
 
@@ -1422,16 +1419,15 @@ class HyperConnectionTransformerLayer(TransformerLayer):
         from megatron.core.pipeline_parallel.fine_grained_activation_offload import (
             FineGrainedActivationOffloadingInterface as off_interface,
         )
+
         """Forward attention with hyper connection pre/post processing on self-attention."""
         inference_context = deprecate_inference_params(inference_context, inference_params)
 
         residual = hidden_states
 
         nvtx_range_push(suffix="self_attention_hyper_connection")
-        hidden_states, self_attn_h_res, self_attn_hc_h_post = (
-            self.self_attention_hyper_connection(
-                hidden_states, mhc_recompute_manager=mhc_recompute_manager
-            )
+        hidden_states, self_attn_h_res, self_attn_hc_h_post = self.self_attention_hyper_connection(
+            hidden_states, mhc_recompute_manager=mhc_recompute_manager
         )
         nvtx_range_pop(suffix="self_attention_hyper_connection")
 
@@ -1484,9 +1480,7 @@ class HyperConnectionTransformerLayer(TransformerLayer):
         nvtx_range_pop(suffix="self_attention_fused_h_res_h_post_bda")
 
         if self.offload_attn_norm:
-            hidden_states = off_interface.group_commit(
-                hidden_states, name="attn_norm"
-            )
+            hidden_states = off_interface.group_commit(hidden_states, name="attn_norm")
 
         # Cross-attention (no hyper connection support).
         residual = hidden_states
@@ -1519,6 +1513,7 @@ class HyperConnectionTransformerLayer(TransformerLayer):
         from megatron.core.pipeline_parallel.fine_grained_activation_offload import (
             FineGrainedActivationOffloadingInterface as off_interface,
         )
+
         """Forward MLP with hyper connection pre/post processing."""
         is_last_in_recompute_block = bool(
             mhc_recompute_manager is not None
@@ -1588,11 +1583,7 @@ class HyperConnectionTransformerLayer(TransformerLayer):
         nvtx_range_pop(suffix="mlp")
 
         return self._forward_post_mlp_with_fused_hyper_connection(
-            mlp_output_with_bias,
-            mlp_h_res,
-            residual,
-            mlp_hc_h_post,
-            mhc_mlp_bda_manager,
+            mlp_output_with_bias, mlp_h_res, residual, mlp_hc_h_post, mhc_mlp_bda_manager
         )
 
     def _forward_post_mlp_with_fused_hyper_connection(
@@ -1642,9 +1633,7 @@ class HyperConnectionTransformerLayer(TransformerLayer):
                 FineGrainedActivationOffloadingInterface as off_interface,
             )
 
-            hidden_states = off_interface.group_commit(
-                hidden_states, name="mlp_norm"
-            )
+            hidden_states = off_interface.group_commit(hidden_states, name="mlp_norm")
 
         output = make_viewless_tensor(
             inp=hidden_states, requires_grad=hidden_states.requires_grad, keep_graph=True
@@ -1760,12 +1749,7 @@ class MoETransformerLayer(TransformerLayer):
         output = self.mlp(None, intermediate_tensors=(output, shared_expert_output))
         return self._forward_post_mlp((output, mlp_bias), residual)
 
-    def _forward_mlp(
-        self,
-        hidden_states,
-        inference_context=None,
-        padding_mask=None,
-    ):
+    def _forward_mlp(self, hidden_states, inference_context=None, padding_mask=None):
         """
         Orchestrates the MLP forward pass, handling partial CUDA graph execution logic.
 
@@ -1815,7 +1799,4 @@ class MoETransformerLayer(TransformerLayer):
             else:
                 return _forward_mlp_partial_cudagraphs(hidden_states, padding_mask=padding_mask)
         else:
-            return super()._forward_mlp(
-                hidden_states,
-                padding_mask=padding_mask,
-            )
+            return super()._forward_mlp(hidden_states, padding_mask=padding_mask)
