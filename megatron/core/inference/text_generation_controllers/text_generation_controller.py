@@ -27,10 +27,12 @@ from megatron.core.inference.model_inference_wrappers.abstract_model_inference_w
 from megatron.core.inference.sampling_params import SamplingParams
 from megatron.core.inference.utils import get_attention_mask, set_decode_expert_padding
 from megatron.core.models.multimodal.llava_model import LLaVAModel
+from megatron.core.tensor_parallel.mappings import gather_from_sequence_parallel_region
 from megatron.core.transformer.enums import CudaGraphScope
 from megatron.core.transformer.moe.moe_layer import BaseMoELayer
+from megatron.core.transformer.moe.router_replay import RouterReplay, RouterReplayAction
 from megatron.core.transformer.utils import set_model_to_sequence_parallel
-from megatron.core.utils import get_asyncio_loop, get_model_config, unwrap_model
+from megatron.core.utils import get_asyncio_loop, get_model_config, get_pg_size, unwrap_model
 
 try:
     import transformer_engine as te  # pylint: disable=unused-import
@@ -515,7 +517,10 @@ class TextGenerationController:
         model_config = get_model_config(unwrapped_model)
 
         # Initialize attention state.
-        context.initialize_attention_state(construct_graph_dimensions=construct_graph_dimensions)
+        context.initialize_attention_state(
+            construct_graph_dimensions=construct_graph_dimensions,
+            is_expert_parallel_dummy_cuda_graph_step=is_dummy_forward,
+        )
 
         # If using symmetric kernels and we are using using nccl
         # for prefill turn off symmetric kernels
@@ -675,6 +680,66 @@ class TextGenerationController:
 
         return return_log_probs.any(), top_n_log_probs.any()
 
+    def _router_record_bookkeeping(self) -> Optional[Dict[int, Tensor]]:
+        """Collect and map routing indices per request for MoE router recording.
+
+        This method retrieves recorded routing decisions and maps them to individual
+        requests using the context's request_ids and query_lengths. Uses the context's
+        routing_metadata when available (which handles CUDA graph static buffers automatically).
+        Must be called while context attributes are still valid (before request transitions).
+
+        Returns:
+            Optional[Dict[int, Tensor]]: A dictionary mapping request_id to a tensor of
+                shape [num_tokens, num_layers, topk]. Returns None if routing replay is
+                disabled or no routing data was recorded.
+        """
+        config = self.inference_wrapped_model.model.config
+        if not config.moe_enable_routing_replay:
+            return None
+
+        # Get routing indices - use routing_metadata if available (handles CUDA graph static buffers)
+        context = self.inference_wrapped_model.inference_context
+        if context.moe_routing_metadata is None:
+            return None
+
+        stacked_routing = context.moe_routing_metadata.get_routing_indices()
+
+        if stacked_routing is None:
+            return None
+
+        # Get active request info from context
+        active_request_slice = slice(context.paused_request_count, context.total_request_count)
+        active_request_ids = context.request_ids[active_request_slice].tolist()
+        active_query_lengths = context.request_query_lengths[active_request_slice].tolist()
+        active_token_count = context.active_token_count
+
+        # Get TP group for all-gather if using sequence parallelism
+        # With sequence parallelism, each TP rank only sees a portion of the tokens,
+        # so we need to gather routing indices across all TP ranks.
+        tp_group = self.inference_wrapped_model.tp_group
+        tp_size = get_pg_size(tp_group)
+
+        # All-gather across TP group if using sequence parallelism (tp_size > 1)
+        if tp_size > 1 and get_model_config(self.inference_wrapped_model.model).sequence_parallel:
+            # gather_from_sequence_parallel_region gathers along dim 0
+            # [local_token_count, num_layers, topk] -> [global_token_count, num_layers, topk]
+            stacked_routing = gather_from_sequence_parallel_region(stacked_routing, group=tp_group)
+
+        # Slice to real tokens (remove CUDA padding)
+        stacked_routing = stacked_routing[:active_token_count]
+
+        # Split by request along token dimension
+        # stacked_routing has shape [active_token_count, num_layers, topk]
+        routing_splits = stacked_routing.split(active_query_lengths, dim=0)
+
+        # Map to request IDs
+        routing_indices_per_request = {}
+        for req_id, routing_split in zip(active_request_ids, routing_splits):
+            # routing_split has shape [num_tokens_for_request, num_layers, topk]
+            routing_indices_per_request[req_id] = routing_split
+
+        return routing_indices_per_request
+
     def _dynamic_step_calculate_log_probs(self, logits: Tensor) -> Optional[Tensor]:
         """Calculate log probs from logits."""
         context = self.inference_wrapped_model.inference_context
@@ -780,13 +845,7 @@ class TextGenerationController:
             return self.inference_wrapped_model.dummy_forward()
 
         # attempt to use cuda-graph if possible
-        # here we try to reuse the cuda-graph warmup code to run
-        # a dummy cuda graph.
-        input_ids, position_ids = self._dynamic_step_context_init(
-            # try to use the smallest cuda-graph config for dummy forward
-            construct_graph_dimensions=min(context.cuda_graph_batch_dimensions_list),
-            is_dummy_forward=True,
-        )
+        input_ids, position_ids = self._dynamic_step_context_init(is_dummy_forward=True)
 
         # _dynamic_step_context_init tries to find a cuda-graph that is compatible
         # with all EP ranks. It can also return no match, in which case
@@ -798,6 +857,8 @@ class TextGenerationController:
         else:
             # fallback to eager dummy forward
             self.inference_wrapped_model.dummy_forward()
+
+        # clear the context of any temporary state from the dummy forward
         context.reset()
 
     def _dynamic_step_context_bookkeeping(self) -> Dict[str, Tensor]:
@@ -889,7 +950,15 @@ class TextGenerationController:
             context.padded_active_request_count if context.is_decode_only() else None
         )
 
+        # Enable routing recording before forward pass if routing replay is enabled
+        config = self.inference_wrapped_model.model.config
+        if config.moe_enable_routing_replay:
+            RouterReplay.set_global_router_replay_action(RouterReplayAction.RECORD)
+
         logits = self._dynamic_step_forward_logits(input_ids, position_ids)
+
+        # Collect routing indices per request (must be done before context transitions)
+        routing_indices_per_request = self._router_record_bookkeeping()
 
         # This is the best place to yield control back to event loop.
         # At this point we have enqueued FW pass GPU kernels asynchronously.
@@ -922,6 +991,7 @@ class TextGenerationController:
             "sample": self._sampled_tokens_cuda[:active_request_count],
             "log_probs": log_probs,
             "top_n_logprobs": top_n_logprobs,
+            "routing_indices_per_request": routing_indices_per_request,
             "cuda_graph_request_count": cuda_graph_request_count,
         }
         ret.update(request_bookkeeping)

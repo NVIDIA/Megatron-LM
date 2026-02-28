@@ -69,6 +69,7 @@ class Request:
         self.time_arrival = None
         self.time_start = None
         self.time_end = None
+        self.ttft = None  # Time-to-first-token in seconds
         self.state = "not-started"
         self.sampling_params: SamplingParams = (
             sampling_params

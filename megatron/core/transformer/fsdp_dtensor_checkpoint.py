@@ -45,6 +45,7 @@ except ImportError:
 from megatron.core import parallel_state
 from megatron.core.tensor_parallel.layers import copy_tensor_model_parallel_attributes
 from megatron.core.transformer.transformer_layer import TransformerLayer
+from megatron.core.utils import get_attr_wrapped_model
 
 
 def get_ep_layer_offset(num_experts: int | None = None) -> int:
@@ -183,7 +184,10 @@ def handle_swiglu_in_state_dict(model, model_state_dict, optimizer_state_dict):
     assert HAVE_MEGATRON_FSDP, "This function requires Megatron-FSDP to be installed."
 
     # Extract num_experts from model config for expert parameter processing
-    num_experts = model.config.num_moe_experts if hasattr(model, 'config') else None
+    model_config = get_attr_wrapped_model(model, "config", allow_none=True)
+    num_experts = (
+        getattr(model_config, 'num_moe_experts', None) if model_config is not None else None
+    )
 
     def intersection(s1, s2):
         # Only works for step=1

@@ -17,7 +17,7 @@ name: Oncall Rotation
 on:
   schedule:
     # Runs at 09:00 UTC every Wednesday
-    - cron: '0 9 * * 3'
+    - cron: "0 9 * * 3"
   workflow_dispatch:
 
 permissions:
@@ -25,7 +25,6 @@ permissions:
 
 jobs:
   rotate-schedule:
-    environment: main
     runs-on: ubuntu-latest
     steps:
       - name: Checkout code
@@ -36,7 +35,7 @@ jobs:
       - name: Set up Python
         uses: actions/setup-python@v4
         with:
-          python-version: '3.10'
+          python-version: "3.10"
 
       - name: Rotate Schedule
         env:
@@ -59,4 +58,3 @@ jobs:
           git commit -m "chore: rotate oncall schedule" || echo "No changes to commit"
           git pull --rebase
           git push origin HEAD:main
-
