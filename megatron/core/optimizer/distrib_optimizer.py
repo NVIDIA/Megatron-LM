@@ -55,6 +55,7 @@ from ..transformer.module import MegatronModule
 from .grad_scaler import MegatronGradScaler
 from .optimizer import MixedPrecisionOptimizer, _zero_grad_group_helper, param_group_identifier_keys
 from .optimizer_config import OptimizerConfig
+from megatron.core import mpu
 
 logger = getLogger(__name__)
 
@@ -2626,9 +2627,10 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
             # communication calls here. If overlapping all-gather for parameters, the following
             # the first all-gather is launched asynchronously in the next optimizer.zero_grad()
             # call and subsequent all-gathers are launched in the forward pre-hook.
+            is_expert_optimizer = self.data_parallel_group == mpu.get_expert_data_parallel_group()
             if not self.ddp_config.overlap_param_gather:
                 for model_chunk in self.model_chunks:
-                    model_chunk.start_param_sync()
+                    model_chunk.start_param_sync(expert_param_sync=is_expert_optimizer)
         if timers is not None:
             timers('params-all-gather').stop()
 

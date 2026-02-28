@@ -51,6 +51,7 @@ from ..utils import log_single_rank
 from .clip_grads import clip_grad_by_total_norm_fp32, count_zeros_fp32, get_grad_norm_fp32
 from .grad_scaler import MegatronGradScaler
 from .optimizer_config import OptimizerConfig
+from megatron.core import mpu
 
 logger = getLogger(__name__)
 
@@ -1252,11 +1253,12 @@ class ChainedOptimizer(MegatronOptimizer):
         """Step the optimizer with ready gradients, return successful."""
         success = True
         for optimizer_idx, optimizer in enumerate(self.chained_optimizers):
+            is_expert_optimizer = optimizer.data_parallel_group == mpu.get_expert_data_parallel_group()
             success &= optimizer.step_with_ready_grads()
             if self.config.overlap_param_gather_with_optimizer_step and optimizer_idx == 0:
                 assert success
                 assert len(optimizer.model_chunks) == 1
-                optimizer.model_chunks[0].start_param_sync(force_dispatch=True)
+                optimizer.model_chunks[0].start_param_sync(force_dispatch=True, expert_param_sync=is_expert_optimizer)
 
         return success
 

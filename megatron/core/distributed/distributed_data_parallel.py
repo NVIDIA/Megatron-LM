@@ -460,7 +460,7 @@ class DistributedDataParallel(_BaseDataParallel):
             for bucket_group in self.bucket_groups + self.expert_parallel_bucket_groups:
                 bucket_group.is_last_microbatch = True
 
-    def start_param_sync(self, *unused, force_sync: bool = False, force_dispatch: bool = False):
+    def start_param_sync(self, *unused, force_sync: bool = False, force_dispatch: bool = False, expert_param_sync: bool = False):
         """
         Initiates param sync (all-gather) communication operations for all model parameters.
 
@@ -479,7 +479,12 @@ class DistributedDataParallel(_BaseDataParallel):
             if self.overlap_param_gather_with_optimizer_step and not force_dispatch:
                 return
 
-        for bucket_group in self.bucket_groups + self.expert_parallel_bucket_groups:
+        if expert_param_sync:
+            bucket_groups = self.expert_parallel_bucket_groups
+        else:
+            bucket_groups = self.bucket_groups
+    
+        for bucket_group in bucket_groups:
             bucket_group.start_param_sync(force_sync=force_sync)
 
             if not self.ddp_config.overlap_param_gather:
