@@ -3577,9 +3577,9 @@ def build_train_valid_test_data_iterators(build_train_valid_test_datasets_provid
         elif dataloader_type == "external":
             # External dataloader is passed through. User is expected to define how to iterate.
             if isinstance(dataloader, list):
-                return [RerunDataIterator(d) for d in dataloader]
+                return [RerunDataIterator(iter(d)) for d in dataloader]
             else:
-                return RerunDataIterator(dataloader)
+                return RerunDataIterator(iter(dataloader))
         else:
             raise RuntimeError("unexpected dataloader type")
 
