@@ -3,7 +3,11 @@
 import pytest
 import torch
 
-from megatron.core.tensor_parallel.random import CheckpointManager, CheckpointWithoutOutput
+from megatron.core.tensor_parallel.random import (
+    CheckpointManager,
+    CheckpointWithoutOutput,
+    initialize_rng_tracker,
+)
 from tests.unit_tests.test_utilities import Utils
 
 
@@ -12,6 +16,7 @@ def test_checkpoint_without_output_with_ckpt_manager_auto_register():
     Test that CheckpointWithoutOutput auto-registers to manager when ckpt_manager is provided.
     """
     Utils.initialize_model_parallel()
+    initialize_rng_tracker(force_reset=True)
 
     manager = CheckpointManager()
 
@@ -52,6 +57,7 @@ def test_checkpoint_without_output_discard_is_noop_with_manager():
     The manager handles all discarding and hook registration.
     """
     Utils.initialize_model_parallel()
+    initialize_rng_tracker(force_reset=True)
 
     manager = CheckpointManager()
 
@@ -107,6 +113,7 @@ def test_checkpoint_without_output_backward_compat():
     should work exactly as before.
     """
     Utils.initialize_model_parallel()
+    initialize_rng_tracker(force_reset=True)
 
     def func(x):
         return torch.nn.functional.gelu(x)
@@ -165,6 +172,7 @@ def test_mhc_block_recompute_manager():
         return x * x + x
 
     Utils.initialize_model_parallel()
+    initialize_rng_tracker(force_reset=True)
 
     # ========== Test 1: Basic forward and backward correctness ==========
     # Create input tensor
@@ -266,6 +274,7 @@ def test_mhc_block_recompute_manager_with_multiple_outputs():
         return a + b
 
     Utils.initialize_model_parallel()
+    initialize_rng_tracker(force_reset=True)
 
     input_ref = torch.randn(4, 4, device='cuda', requires_grad=True)
     input_ckpt = input_ref.detach().clone().requires_grad_(True)
@@ -305,6 +314,7 @@ def test_mhc_block_recompute_manager_error_handling():
     Test error handling in CheckpointManager.
     """
     Utils.initialize_model_parallel()
+    initialize_rng_tracker(force_reset=True)
 
     manager = CheckpointManager()
 
@@ -358,6 +368,7 @@ def test_mhc_block_recompute_manager_partial_checkpoint():
         return torch.sigmoid(x) + x
 
     Utils.initialize_model_parallel()
+    initialize_rng_tracker(force_reset=True)
 
     # ========== Reference: normal forward without any checkpoint ==========
     input_ref = torch.randn(4, 4, device='cuda', requires_grad=True)
@@ -458,6 +469,7 @@ def test_mhc_block_recompute_manager_partial_checkpoint_with_tuple_output():
         return y * h_post + y
 
     Utils.initialize_model_parallel()
+    initialize_rng_tracker(force_reset=True)
 
     # ========== Reference: normal forward ==========
     x_ref = torch.randn(4, 4, device='cuda', requires_grad=True)

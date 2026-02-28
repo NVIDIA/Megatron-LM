@@ -1093,7 +1093,7 @@ class TestFlexibleVPPLayoutShapeConsistencyWithMHC:
         layout = [
             ["embedding"],
             ["decoder"] * 2,
-            ["decoder"] * 2,
+            ["decoder"],
             ["decoder"],
             ["decoder"],
             ["decoder"],
