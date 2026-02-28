@@ -8,7 +8,7 @@ build-backend = "setuptools.build_meta"
 include-package-data = true
 
 [tool.setuptools.packages.find]
-include = ["megatron.core", "megatron.core.*"]
+include = ["megatron.core", "megatron.core.*", "megatron.training", "megatron.training.*"]
 
 [tool.setuptools.dynamic]
 version = { attr = "megatron.core.package_info.__version__" }
@@ -63,6 +63,16 @@ Download = "https://github.com/NVIDIA/Megatron-LM/releases"
 Homepage = "https://github.com/NVIDIA/Megatron-LM"
 
 [project.optional-dependencies]
+training = [
+    "flask-restful",
+    "sentencepiece",
+    "tiktoken",
+    "wandb",
+    "transformers",
+    "accelerate",
+]
+
+### 'mlm' group is deprecated. please use 'training' instead ###
 mlm = [
     "flask-restful",
     "sentencepiece",

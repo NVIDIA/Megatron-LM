@@ -44,6 +44,7 @@ from megatron.core.inference.text_generation_controllers.text_generation_control
 from megatron.core.inference.utils import Counter, await_process_call
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.transformer.cuda_graphs import delete_cuda_graphs
+from megatron.core.transformer.enums import CudaGraphScope
 from megatron.core.transformer.moe.router_replay import RouterReplay, RouterReplayAction
 from megatron.core.utils import (
     deprecate_args,
@@ -181,7 +182,7 @@ class DynamicInferenceEngine(AbstractEngine):
             inference_config.materialize_only_last_token_logits
         )
         self.cuda_graph_impl = model_config.cuda_graph_impl
-
+        self.cuda_graph_scope = model_config.cuda_graph_scope
         # Initialize engine.
         self.reset()
 
@@ -270,6 +271,15 @@ class DynamicInferenceEngine(AbstractEngine):
 
         if self.cuda_graph_impl != "local":
             return
+
+        if (
+            CudaGraphScope.full_iteration in self.cuda_graph_scope
+            and CudaGraphScope.full_iteration_inference not in self.cuda_graph_scope
+        ):
+            warnings.warn(
+                "\n\n*** WARNING: 'full_iteration' CUDA graph scope used during inference! "
+                "This will not create inference CUDA graphs. Use '--cuda-graph-scope=full_iteration_inference' instead. ***\n"
+            )
 
         context = self.context
         controller = self.controller
@@ -1617,6 +1627,10 @@ class DynamicInferenceEngine(AbstractEngine):
                 self.suspend_signal = True
             elif header == Headers.RESUME:
                 self.suspend_signal = False
+            elif header == Headers.INCREMENT_STALENESS:
+                waiting = set(self.waiting_request_ids)
+                for request_id, entry in self.requests.items():
+                    entry.record.increment_staleness(policy_only=request_id in waiting)
             elif header == Headers.STOP:
                 self.received_stop = True
             else:

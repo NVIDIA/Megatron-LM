@@ -124,7 +124,7 @@ class DynamicEngineTestConfig:
     skip_prompt_log_probs: bool = False
     enable_chunked_prefill: bool = False
     cuda_graph_scope: List[CudaGraphScope] = field(
-        default_factory=lambda: [CudaGraphScope.full_iteration]
+        default_factory=lambda: [CudaGraphScope.full_iteration_inference]
     )
     force_build_cuda_graphs: bool = False
     transformer_impl: str = "local"
@@ -389,8 +389,9 @@ class TestDynamicInferenceEngine:
                 vocab_size=test_config.vocab_size,
                 max_sequence_length=test_config.max_sequence_length,
                 parallel_output=True,
-                hybrid_attention_ratio=0.3,
-                hybrid_mlp_ratio=0.3,
+                hybrid_layer_pattern=(
+                    "M*-" if pp_size == 1 else "M*-|M*-"
+                ),  # 3 or 6 layers (2 PP stages)
                 pre_process=parallel_state.is_pipeline_first_stage(),
                 post_process=parallel_state.is_pipeline_last_stage(),
             ).cuda()
@@ -543,8 +544,8 @@ class TestDynamicInferenceEngine:
         not is_fa_min_version("2.7.3"), reason="need latest flash attn for dynamic batching"
     )
     @pytest.mark.parametrize("model_provider", ["gpt", "mamba"])
-    @pytest.mark.parametrize("num_cuda_graphs", [None, 1, 4])
-    @pytest.mark.parametrize("cuda_graph_scope", [[], [CudaGraphScope.full_iteration]])
+    @pytest.mark.parametrize("num_cuda_graphs", [None, 1, 4, -1])
+    @pytest.mark.parametrize("cuda_graph_scope", [[], [CudaGraphScope.full_iteration_inference]])
     def test_simple(self, model_provider, num_cuda_graphs, cuda_graph_scope) -> None:
         """Simple test that runs without errors, and validates output."""
         skip_if_mamba_sequence_packing_not_available(model_provider)
@@ -557,10 +558,23 @@ class TestDynamicInferenceEngine:
             num_cuda_graphs=num_cuda_graphs,
             cuda_graph_scope=cuda_graph_scope,
             force_build_cuda_graphs=True,
+            context_max_requests=128,
         )
 
         # Validate max_requests, max_tokens.
         assert env.engine.context.max_tokens == DynamicInferenceContext.DEFAULT_MAX_TOKENS
+
+        if num_cuda_graphs is not None:
+            assert env.engine.context.cuda_graph_token_counts is not None
+            assert env.engine.context.cuda_graph_batch_dimensions_list
+            model = env.engine.controller.inference_wrapped_model.model
+            if cuda_graph_scope == [CudaGraphScope.full_iteration_inference]:
+                # check if cudagraph runners are created at the decoder level
+                assert model.decoder.cudagraph_manager.cudagraph_runners
+            else:
+                # check if cudagraph runners are created at the layer level
+                for layer in model.decoder.layers:
+                    assert layer.cudagraph_manager.cudagraph_runners
 
         # Validate generated tokens.
         gpt_expected_generated_tokens = [
@@ -1847,3 +1861,140 @@ class TestDynamicInferenceEngine:
                 f"Tensor address must be stable when static_kv_memory_pointers is set. "
                 f"Before: {addr_before:#x}, After: {addr_after:#x}"
             )
+
+    @pytest.mark.skipif(
+        not is_fa_min_version("2.7.3"), reason="need latest flash attn for dynamic batching"
+    )
+    @pytest.mark.parametrize("use_checkpoint", [False, True], ids=["persist", "recompute"])
+    @torch.inference_mode()
+    def test_staleness_tracking(self, use_checkpoint):
+        """Test that staleness is correct tracked.
+        The use_checkpoint parameter simulates the behavior of different kv_cache_management_mode.
+        """
+        PROMPT_LEN = 8
+        NUM_TOKENS = 8
+
+        test_config = DynamicEngineTestConfig(
+            num_requests=0,
+            min_prompt_length=PROMPT_LEN,
+            max_prompt_length=PROMPT_LEN,
+            num_tokens_to_generate=NUM_TOKENS,
+        )
+        env = self._build_test_env(test_config)
+        engine = env.engine
+
+        for i in range(2):
+            prompt_tokens = torch.randint(
+                0,
+                test_config.vocab_size - 1,
+                (PROMPT_LEN,),
+                dtype=torch.int64,
+                device=torch.cuda.current_device(),
+            )
+            engine._add_request(
+                DynamicInferenceRequest(
+                    request_id=i,
+                    prompt_tokens=prompt_tokens,
+                    sampling_params=SamplingParams(
+                        num_tokens_to_generate=NUM_TOKENS, termination_id=-1
+                    ),
+                )
+            )
+
+        for _ in range(3):
+            engine.step_modern()
+
+        for entry in engine.requests.values():
+            assert len(entry.record[-1].generated_tokens) == 3
+            assert entry.record[-1].policy_staleness is None
+            assert entry.record[-1].kv_cache_staleness is None
+
+        # Increment staleness.
+        for entry in engine.requests.values():
+            entry.record.increment_staleness()
+
+        for entry in engine.requests.values():
+            ps = entry.record[-1].policy_staleness
+            ks = entry.record[-1].kv_cache_staleness
+            assert ps.shape == ks.shape == (PROMPT_LEN + 3,)
+            assert (ps == 1).all()
+            assert (ks == 1).all()
+
+        # Simulate RECOMPUTE
+        if use_checkpoint:
+            for entry in engine.requests.values():
+                old_req = entry.record[-1]
+                event_add_engine = old_req.event_add_engine
+                entry.record.checkpoint()
+                # Prevent TTFT crash due to missing _add_request in test.
+                entry.record[-1].event_add_engine = event_add_engine
+
+            for entry in engine.requests.values():
+                ps = entry.record[-1].policy_staleness
+                ks = entry.record[-1].kv_cache_staleness
+                assert ps.shape == ks.shape == (PROMPT_LEN + 3,)
+                assert (ps == 1).all()
+                assert (ks == 0).all()
+
+        for _ in range(3):
+            engine.step_modern()
+
+        # Increment staleness.
+        for entry in engine.requests.values():
+            entry.record.increment_staleness()
+
+        for entry in engine.requests.values():
+            ps = entry.record[-1].policy_staleness
+            ks = entry.record[-1].kv_cache_staleness
+            assert ps.shape == ks.shape == (PROMPT_LEN + 6,)
+            assert (ps[: PROMPT_LEN + 3] == 2).all()
+            assert (ps[PROMPT_LEN + 3 :] == 1).all()
+            if use_checkpoint:
+                assert (ks == 1).all()
+            else:
+                assert (ks[: PROMPT_LEN + 3] == 2).all()
+                assert (ks[PROMPT_LEN + 3 :] == 1).all()
+
+        if use_checkpoint:
+            for entry in engine.requests.values():
+                old_req = entry.record[-1]
+                event_add_engine = old_req.event_add_engine
+                entry.record.checkpoint()
+                entry.record[-1].event_add_engine = event_add_engine
+
+            for entry in engine.requests.values():
+                ks = entry.record[-1].kv_cache_staleness
+                assert (ks == 0).all()
+
+        finished_records = []
+        while engine.has_unfinished_requests():
+            result = engine.step_modern()
+            finished_records.extend(result["finished_request_records"])
+
+        for record in finished_records:
+            merged = record.merge()
+
+            assert merged.policy_staleness is not None
+            assert merged.policy_staleness.shape == (PROMPT_LEN + NUM_TOKENS,)
+            assert (merged.policy_staleness[: PROMPT_LEN + 3] == 2).all()
+            assert (merged.policy_staleness[PROMPT_LEN + 3 : PROMPT_LEN + 6] == 1).all()
+            assert (merged.policy_staleness[PROMPT_LEN + 6 :] == 0).all()
+
+            assert merged.kv_cache_staleness is not None
+            assert merged.kv_cache_staleness.shape == (PROMPT_LEN + NUM_TOKENS,)
+            if use_checkpoint:
+                assert (merged.kv_cache_staleness == 0).all()
+            else:
+                assert (merged.kv_cache_staleness[: PROMPT_LEN + 3] == 2).all()
+                assert (merged.kv_cache_staleness[PROMPT_LEN + 3 : PROMPT_LEN + 6] == 1).all()
+                assert (merged.kv_cache_staleness[PROMPT_LEN + 6 :] == 0).all()
+
+        # Verify evicted requests don't have their policy staleness incremented.
+        record = finished_records[0]
+        record.checkpoint()
+        pre_ps = record[-1].policy_staleness.clone()
+
+        record.increment_staleness(policy_only=True)  # This mimics the coordinator's action.
+
+        assert (record[-1].policy_staleness == pre_ps + 1).all()
+        assert (record[-1].kv_cache_staleness == 0).all()
