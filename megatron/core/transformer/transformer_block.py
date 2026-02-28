@@ -554,15 +554,13 @@ class TransformerBlock(GraphableMegatronModule, MegatronModule):
             # A method to further reduce memory usage reducing checkpoints.
             layer_idx = 0
             while layer_idx < self.num_layers_per_pipeline_rank:
-                hidden_states, context = checkpoint_handler(
-                    custom(layer_idx, layer_idx + self.config.recompute_num_layers)
-                )
-
-                # Feature extraction for uniform recompute: collect at end of each chunk
-                # Note: Only the last layer of each chunk can have features collected
                 chunk_end = min(
                     layer_idx + self.config.recompute_num_layers, self.num_layers_per_pipeline_rank
                 )
+                hidden_states, context = checkpoint_handler(custom(layer_idx, chunk_end))
+
+                # Feature extraction for uniform recompute: collect at end of each chunk
+                # Note: Only the last layer of each chunk can have features collected
                 for idx in range(layer_idx, chunk_end):
                     if (idx + layer_offset) in extract_layer_indices:
                         # For uniform recompute, we can only get features at chunk boundaries
