@@ -2746,6 +2746,11 @@ def _add_data_args(parser):
                        help='Probability of producing a short sequence.')
     group.add_argument('--num-workers', type=int, default=2,
                        help="Dataloader number of workers.")
+    group.add_argument(
+        '--prefork-dataloader-before-cuda',
+        action='store_true',
+        help='Fork dataloader workers before CUDA/distributed initialization.',
+    )
     group.add_argument('--reset-position-ids', action='store_true',
                        help='Reset posistion ids after end-of-document token.')
     group.add_argument('--reset-attention-mask', action='store_true',
