@@ -313,6 +313,66 @@ class TestParallelMLAAttention:
             assert key.is_contiguous()
             assert value.is_contiguous()
 
+    def test_gpu_forward_thd_qv_head_dim_mismatch(self):
+        """Test THD MLA path when q and v head dimensions differ."""
+        if is_te_min_version("1.10.0"):
+            transformer_config = MLATransformerConfig(
+                num_layers=2,
+                hidden_size=12,
+                num_attention_heads=4,
+                use_cpu_initialization=True,
+                q_lora_rank=32,
+                kv_lora_rank=32,
+                qk_head_dim=128,
+                v_head_dim=64,
+                qk_pos_emb_head_dim=64,
+                rope_type=self.transformer_config.rope_type,
+                rotary_base=self.transformer_config.rotary_base,
+                original_max_position_embeddings=self.transformer_config.original_max_position_embeddings,
+            )
+            mismatch_attention = MLASelfAttention(
+                transformer_config,
+                get_mla_self_attn_submodules(),
+                layer_number=1,
+                attn_mask_type=AttnMaskType.causal,
+            )
+
+            sequence_length = 32
+            micro_batch_size = 1
+
+            mismatch_attention.cuda().bfloat16()
+
+            # [sequence length, batch size, hidden size]
+            hidden_states = torch.ones(
+                (sequence_length, micro_batch_size, transformer_config.hidden_size)
+            )
+            hidden_states = hidden_states.cuda().bfloat16()
+
+            attention_mask = None
+            packed_seq_params = make_test_packed_seq_params(sequence_length=sequence_length)
+
+            query, key, value, q_compressed, kv_compressed = (
+                mismatch_attention.get_query_key_value_tensors(
+                    hidden_states, None, None, packed_seq_params, None
+                )
+            )
+
+            assert query is not None
+            assert key is not None
+            assert value is not None
+            assert q_compressed is not None
+            assert kv_compressed is not None
+            assert query.shape[-1] != value.shape[-1]
+
+            output, bias = mismatch_attention(
+                hidden_states, attention_mask, packed_seq_params=packed_seq_params
+            )
+
+            assert output.shape[0] == sequence_length
+            assert output.shape[1] == micro_batch_size
+            assert output.shape[2] == transformer_config.hidden_size
+            assert bias.shape[0] == transformer_config.hidden_size
+
     def test_checkpointed_gpu_forward(self):
         if is_te_min_version("1.10.0"):
             transformer_config = self.transformer_config
