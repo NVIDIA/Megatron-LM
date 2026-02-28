@@ -2213,12 +2213,7 @@ class TECudaGraphHelper:
         _set_capture_end()
 
         from megatron.core.distributed.finalize_model_grads import reset_model_temporary_tensors
-        from megatron.core.pipeline_parallel.fine_grained_activation_offload import (
-            FineGrainedActivationOffloadingInterface as off_interface,
-        )
         from megatron.core.transformer.moe.moe_utils import clear_aux_losses_tracker
-
-        off_interface.reset()
 
         torch.distributed.barrier()
         for model_chunk in self.model:
@@ -2227,6 +2222,13 @@ class TECudaGraphHelper:
             optimizer.zero_grad()
         clear_aux_losses_tracker()
         reset_model_temporary_tensors(self.config, self.model)
+
+        if self.config.fine_grained_activation_offloading:
+            from megatron.core.pipeline_parallel.fine_grained_activation_offload import (
+                FineGrainedActivationOffloadingInterface as off_interface,
+            )
+
+            off_interface.reset()
 
         if FREEZE_GC:
             gc.unfreeze()

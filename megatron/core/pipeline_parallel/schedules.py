@@ -9,9 +9,6 @@ import torch
 from torch.autograd.variable import Variable
 
 from megatron.core import parallel_state
-from megatron.core.pipeline_parallel.fine_grained_activation_offload import (
-    FineGrainedActivationOffloadingInterface as off_interface,
-)
 from megatron.core.pipeline_parallel.p2p_communication import P2PCommunicator
 from megatron.core.pipeline_parallel.utils import (
     is_pp_first_stage,
@@ -689,9 +686,6 @@ def forward_backward_no_pipelining(
             force_all_reduce=force_all_reduce,
         )
 
-    if not forward_only and config.fine_grained_activation_offloading:
-        off_interface.reset()
-
     if config.timers is not None:
         config.timers('forward-backward').stop()
 
@@ -701,6 +695,13 @@ def forward_backward_no_pipelining(
         and CudaGraphScope.full_iteration not in config.cuda_graph_scope
     ):
         create_cudagraphs()
+
+    if config.fine_grained_activation_offloading and not forward_only:
+        from megatron.core.pipeline_parallel.fine_grained_activation_offload import (
+            FineGrainedActivationOffloadingInterface as off_interface,
+        )
+
+        off_interface.reset()
 
     return forward_data_store
 
@@ -2054,8 +2055,6 @@ def forward_backward_pipelining_with_interleaving(
             force_all_reduce=force_all_reduce,
         )
 
-    if not forward_only and config.fine_grained_activation_offloading:
-        off_interface.reset()
     # Restore config.grad_sync_func and config.param_sync_func.
     if forward_only:
         config.grad_sync_func, config.param_sync_func = grad_sync_func, param_sync_func
@@ -2069,6 +2068,13 @@ def forward_backward_pipelining_with_interleaving(
         and CudaGraphScope.full_iteration not in config.cuda_graph_scope
     ):
         create_cudagraphs()
+
+    if config.fine_grained_activation_offloading and not forward_only:
+        from megatron.core.pipeline_parallel.fine_grained_activation_offload import (
+            FineGrainedActivationOffloadingInterface as off_interface,
+        )
+
+        off_interface.reset()
     nvtx_range_pop(suffix="misc")
 
     return forward_data_store
@@ -2442,9 +2448,6 @@ def forward_backward_pipelining_without_interleaving(
             force_all_reduce=force_all_reduce,
         )
 
-    if not forward_only and config.fine_grained_activation_offloading:
-        off_interface.reset()
-
     if config.timers is not None:
         config.timers('forward-backward').stop()
 
@@ -2454,5 +2457,12 @@ def forward_backward_pipelining_without_interleaving(
         and CudaGraphScope.full_iteration not in config.cuda_graph_scope
     ):
         create_cudagraphs()
+
+    if config.fine_grained_activation_offloading and not forward_only:
+        from megatron.core.pipeline_parallel.fine_grained_activation_offload import (
+            FineGrainedActivationOffloadingInterface as off_interface,
+        )
+
+        off_interface.reset()
 
     return forward_data_store

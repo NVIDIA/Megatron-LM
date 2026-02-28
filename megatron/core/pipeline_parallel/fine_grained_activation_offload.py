@@ -8,7 +8,7 @@ import torch
 from torch.autograd.graph import saved_tensors_hooks
 
 # CPU offload implementation for pipeline parallelism
-DEBUG = True
+DEBUG = False
 DEBUG_RANK = 0
 
 from megatron.core.transformer.cuda_graphs import is_graph_capturing
