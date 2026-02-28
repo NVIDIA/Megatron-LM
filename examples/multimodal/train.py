@@ -17,6 +17,7 @@ from model import model_provider
 from multimodal_args import add_multimodal_extra_args
 
 from megatron.core import mpu, tensor_parallel
+from megatron.core.utils import nvtx_range_pop, nvtx_range_push
 from megatron.core.enums import ModelType
 from megatron.core.models.multimodal import context_parallel
 from megatron.core.models.multimodal.llava_model import IGNORE_INDEX, LLaVAModel
@@ -53,7 +54,7 @@ def get_batch(data_iterator, image_token_index, img_seq_len):
         return tokens, labels, loss_mask, attention_mask, position_ids, imgs, num_tiles, packed_seq_params
 
     # Broadcast data.
-    torch.cuda.nvtx.range_push("get_data")
+    nvtx_range_push("get_data")
     if data_iterator is not None and get_tensor_model_parallel_rank() == 0:
         data = next(data_iterator)
     else:
@@ -102,22 +103,22 @@ def get_batch(data_iterator, image_token_index, img_seq_len):
             max_seqlen_kv=max_lengths,
         )
 
-    torch.cuda.nvtx.range_pop()
+    nvtx_range_pop("get_data")
 
     tokens_ = data_text.long()
 
-    torch.cuda.nvtx.range_push("index tokens")
+    nvtx_range_push("index tokens")
     tokenizer = get_tokenizer()
     text_length = tokens_.shape[1]
     tokens = tokens_[:, :text_length].contiguous()
     labels = labels[:, 1 : text_length + 1].contiguous()
 
     assert tokens.shape == labels.shape, f"tokens: {tokens.shape} != labels: {labels.shape}"
-    torch.cuda.nvtx.range_pop()
+    nvtx_range_pop("index tokens")
 
-    torch.cuda.nvtx.range_push("get_ltor_masks_and_position_ids")
+    nvtx_range_push("get_ltor_masks_and_position_ids")
     loss_mask, position_ids = get_ltor_masks_and_position_ids(tokens, labels, tokenizer.pad)
-    torch.cuda.nvtx.range_pop()
+    nvtx_range_pop("get_ltor_masks_and_position_ids")
 
     # If context parallel is enabled, must shard inputs to CP ranks.
     if args.context_parallel_size > 1 or args.sequence_parallel:

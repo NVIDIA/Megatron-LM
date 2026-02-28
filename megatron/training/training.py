@@ -87,6 +87,7 @@ from megatron.core.models.gpt.experimental_attention_variant_module_specs import
 )
 from megatron.core.utils import (
     check_param_hashes_across_dp_replicas,
+    configure_nvtx_profiling,
     get_attr_wrapped_model,
     get_model_config,
     get_pg_size,
@@ -2349,6 +2350,9 @@ def post_training_step_callbacks(
         and (len(args.profile_ranks) == 0 or
              torch.distributed.get_rank() in args.profile_ranks)
     ):
+        # Disable NVTX range when profiling ends.
+        if args.nvtx_ranges:
+            configure_nvtx_profiling(False)
         if args.use_pytorch_profiler:
             assert prof is not None
             prof.stop()
@@ -2763,11 +2767,14 @@ def train(
         if (args.profile 
             and (len(args.profile_ranks) == 0 or
                  torch.distributed.get_rank() in args.profile_ranks)):
+            # Enable NVTX range when profiling starts and nvtx_ranges is set.
+            if iteration == args.profile_step_start and args.nvtx_ranges:
+                configure_nvtx_profiling(True)
             if args.use_pytorch_profiler:
                 prof.step()
             elif iteration == args.profile_step_start:
                 torch.cuda.check_error(torch.cuda.cudart().cudaProfilerStart())
-                nsys_nvtx_context = torch.autograd.profiler.emit_nvtx(record_shapes=True)
+                nsys_nvtx_context = torch.autograd.profiler.emit_nvtx(record_shapes=args.record_shapes)
                 nsys_nvtx_context.__enter__()
 
         ft_integration.on_checkpointing_start()

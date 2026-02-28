@@ -11,7 +11,7 @@ import torch
 
 from megatron.core.inference.sampling_params import SamplingParams
 from megatron.core.tokenizers import MegatronTokenizer
-from megatron.core.utils import experimental_api
+from megatron.core.utils import experimental_api, nvtx_range_pop, nvtx_range_push
 
 
 def serialize_tensor(tensor: torch.Tensor) -> List:
@@ -23,12 +23,12 @@ def serialize_tensor(tensor: torch.Tensor) -> List:
     Returns:
         (List) Tensor as a list
     """
-    torch.cuda.nvtx.range_push("serialize_tensor")
+    nvtx_range_push("serialize_tensor")
 
     # simply convert tensor into a list
     tensor = tensor.cpu().tolist()
 
-    torch.cuda.nvtx.range_pop()
+    nvtx_range_pop("serialize_tensor")
     return tensor
 
 
@@ -228,7 +228,7 @@ class DynamicInferenceEvent:
         Returns:
             dict: Full event dict.
         """
-        torch.cuda.nvtx.range_push("DynamicInferenceEvent.serialize")
+        nvtx_range_push("DynamicInferenceEvent.serialize")
         # do not use asdict(self) - it has very high CPU overheads
         # and if there are tensors, it will try to deepcopy them
         obj = self.__dict__.copy()
@@ -244,7 +244,7 @@ class DynamicInferenceEvent:
 
                 obj["payload"] = ContextErrorFactory.serialize(self.payload)
 
-        torch.cuda.nvtx.range_pop()
+        nvtx_range_pop("DynamicInferenceEvent.serialize")
         return obj
 
     @classmethod
@@ -331,7 +331,7 @@ class DynamicInferenceRequest(InferenceRequest):
             (dict) A dictionary representation of the instance suitable for
                 serialization.
         """
-        torch.cuda.nvtx.range_push("DynamicInferenceRequest.serialize")
+        nvtx_range_push("DynamicInferenceRequest.serialize")
         obj = super().serialize()
         obj["events"] = [e.serialize() for e in self.events]
         obj.pop("event_add_engine", None)
@@ -346,7 +346,7 @@ class DynamicInferenceRequest(InferenceRequest):
                 f"total tokens {total_tokens-1}."
             )
 
-        torch.cuda.nvtx.range_pop()
+        nvtx_range_pop("DynamicInferenceRequest.serialize")
         return obj
 
     def _post_deserialize(self, obj):
@@ -676,10 +676,10 @@ class DynamicInferenceRequestRecord:
             (dict) A dictionary representation of the instance suitable for
                 serialization.
         """
-        torch.cuda.nvtx.range_push("DynamicInferenceRequestRecord.serialize")
+        nvtx_range_push("DynamicInferenceRequestRecord.serialize")
         obj = self.__dict__.copy()  # shallow dict copy
         obj["requests"] = [r.serialize() for r in obj["requests"]]
-        torch.cuda.nvtx.range_pop()
+        nvtx_range_pop("DynamicInferenceRequestRecord.serialize")
         return obj
 
     @classmethod

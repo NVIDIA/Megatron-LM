@@ -2286,7 +2286,7 @@ def _add_training_args(parser):
     from megatron.training.config import TrainingConfig
     from megatron.training.config import ProfilingConfig
 
-    prof_factory = ArgumentGroupFactory(ProfilingConfig, exclude=["record_shapes", "nvtx_ranges"])
+    prof_factory = ArgumentGroupFactory(ProfilingConfig)
     prof_group = prof_factory.build_group(parser, "profiling")
 
     train_factory = ArgumentGroupFactory(TrainingConfig)

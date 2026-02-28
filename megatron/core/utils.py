@@ -2300,7 +2300,7 @@ def nvtx_decorator(message: Optional[str] = None, color: Optional[str] = None):
     """
 
     def decorator(func: Callable) -> Callable:
-        if _nvtx_enabled:
+        if _nvtx_enabled and HAVE_NVTX:
             return nvtx.annotate(
                 message=message or _nvtx_decorator_get_func_path(func), color=color
             )(func)

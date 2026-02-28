@@ -23,7 +23,7 @@ from megatron.core.transformer.multi_token_prediction import (
 )
 from megatron.core.transformer.transformer_layer import TransformerLayer, make_viewless_tensor
 from megatron.core.typed_torch import apply_module, copy_signature
-from megatron.core.utils import internal_api
+from megatron.core.utils import internal_api, nvtx_range_pop, nvtx_range_push
 
 
 def weak_method(method):
@@ -331,10 +331,11 @@ class TransformerLayerNode(ScheduleNode):
         if not self.delay_wgrad_compute:
             return
         with torch.cuda.stream(self.stream):
-            torch.cuda.nvtx.range_push(f"{self.name} wgrad")
+            nvtx_msg = f"{self.name} wgrad"
+            nvtx_range_push(nvtx_msg)
             for module in self.bwd_dw_callables:
                 module.backward_dw()
-            torch.cuda.nvtx.range_pop()
+            nvtx_range_pop(nvtx_msg)
 
         # the output grad memory is last used in wgrad compute, should be safe to release.
         assert self.delay_grads_release, "output grad memory should be valid before wgrad."
