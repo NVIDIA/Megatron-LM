@@ -726,8 +726,9 @@ def validate_args(args, defaults={}):
         assert args.use_distributed_optimizer or args.use_megatron_fsdp \
             or ('dist' in args.optimizer), \
             '--overlap-param-gather only supported with distributed optimizer, megatron fsdp, or layer-wise optimizer'
-        assert args.overlap_grad_reduce, \
-            'Must use --overlap-param-gather with --overlap-grad-reduce'
+        if 'dist' not in args.optimizer:
+            assert args.overlap_grad_reduce, \
+                'Must use --overlap-param-gather with --overlap-grad-reduce'
         assert not args.use_legacy_models, \
             '--overlap-param-gather only supported with MCore models'
 
