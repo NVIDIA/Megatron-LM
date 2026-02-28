@@ -3,9 +3,14 @@
 from typing import Optional
 
 from megatron.core.extensions.transformer_engine_spec_provider import TESpecProvider
-from megatron.core.models.backends import BackendSpecProvider, LocalSpecProvider
+from megatron.core.models.backends import (
+    BackendSpecProvider,
+    InferenceSpecProvider,
+    LocalSpecProvider,
+)
 from megatron.core.transformer.mlp import MLPSubmodules
 from megatron.core.transformer.moe.moe_layer import MoELayer, MoESubmodules
+from megatron.core.transformer.moe.router import InferenceTopKRouter
 from megatron.core.transformer.moe.shared_experts import SharedExpertMLP
 from megatron.core.transformer.spec_utils import ModuleSpec
 
@@ -16,7 +21,17 @@ def get_moe_module_spec(
     moe_grouped_gemm: Optional[bool] = False,
     moe_use_legacy_grouped_gemm: Optional[bool] = False,
 ) -> ModuleSpec:
-    """Helper function to get module spec for MoE"""
+    """Helper function to get module spec for MoE.
+
+    Called by mamba_layer_specs.py for standard (non-inference) MoE specs.
+    The GPT layer specs call get_moe_module_spec_for_backend directly.
+
+    Args:
+        use_te: Whether to use Transformer Engine.
+        num_experts: Number of experts.
+        moe_grouped_gemm: Whether to use grouped GEMM.
+        moe_use_legacy_grouped_gemm: Whether to use legacy grouped GEMM.
+    """
     if use_te is not None and use_te:
         backend: BackendSpecProvider = TESpecProvider()
     else:
@@ -66,3 +81,38 @@ def get_moe_module_spec_for_backend(
         metainfo={"fuse_pre_mlp_layernorm": False},
     )
     return moe_module_spec
+
+
+def get_inference_optimized_moe_spec() -> ModuleSpec:
+    """MoE module spec for inference-optimized transformer impl.
+
+    Uses InferenceSpecProvider to select inference-optimized modules:
+    InferenceTopKRouter, InferenceGroupedMLP. MoELayer detects inference mode
+    via config.transformer_impl and sets up the inference dispatcher internally.
+
+    Called by mamba_layer_specs.py and gpt_layer_specs.py.
+    """
+    backend = InferenceSpecProvider()
+    activation_func = backend.activation_func()
+
+    expert_module, expert_submodule = backend.grouped_mlp_modules(True, False)
+    if expert_submodule is not None:
+        expert_submodule.activation_func = activation_func
+
+    experts = ModuleSpec(module=expert_module, submodules=expert_submodule)
+    shared_experts = ModuleSpec(
+        module=SharedExpertMLP,
+        submodules=MLPSubmodules(
+            linear_fc1=backend.column_parallel_linear(),
+            linear_fc2=backend.row_parallel_linear(),
+            activation_func=activation_func,
+        ),
+    )
+
+    return ModuleSpec(
+        module=MoELayer,
+        submodules=MoESubmodules(
+            router=InferenceTopKRouter, experts=experts, shared_experts=shared_experts
+        ),
+        metainfo={"fuse_pre_mlp_layernorm": False},
+    )

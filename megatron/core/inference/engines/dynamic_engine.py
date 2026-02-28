@@ -41,7 +41,12 @@ from megatron.core.inference.sampling_params import SamplingParams
 from megatron.core.inference.text_generation_controllers.text_generation_controller import (
     TextGenerationController,
 )
-from megatron.core.inference.utils import Counter, await_process_call
+from megatron.core.inference.utils import (
+    Counter,
+    await_process_call,
+    set_inference_cuda_graphed_iteration_for_ep_inference,
+    unset_inference_cuda_graphed_iteration_for_ep_inference,
+)
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.transformer.cuda_graphs import delete_cuda_graphs
 from megatron.core.transformer.enums import CudaGraphScope
@@ -291,6 +296,16 @@ class DynamicInferenceEngine(AbstractEngine):
         for graph in context.cuda_graph_batch_dimensions_list:
             logging.info(graph)
 
+        # Enable inference dispatcher for EP during graph capture
+        model_config = controller.inference_wrapped_model.model.config
+        is_inference_optimized_ep = (
+            model_config.transformer_impl == "inference_optimized"
+            and model_config.expert_model_parallel_size > 1
+        )
+        if is_inference_optimized_ep:
+            unwrapped_model = controller.inference_wrapped_model.model
+            set_inference_cuda_graphed_iteration_for_ep_inference(unwrapped_model)
+
         tbar = enumerate(context.cuda_graph_batch_dimensions_list)
         if HAVE_TQDM:
             tbar = tqdm(tbar, total=len(context.cuda_graph_batch_dimensions_list))
@@ -317,6 +332,10 @@ class DynamicInferenceEngine(AbstractEngine):
             controller._dynamic_step_forward_logits(input_ids, position_ids)
 
             context.reset()
+
+        # Disable inference dispatcher after graph capture
+        if is_inference_optimized_ep:
+            unset_inference_cuda_graphed_iteration_for_ep_inference(unwrapped_model)
 
         # Memory usage.
         time_end = time.time()
@@ -1391,7 +1410,7 @@ class DynamicInferenceEngine(AbstractEngine):
             mem = torch.cuda.memory_stats()
             step_type = "decode" if context_state["is_decode_only"] else "non-decode"
             output_str = (
-                "* rank %d | step %d | %s ... time: %.3f%s ... "
+                "* rank %d | step %d | %s ... time: %.3f ms%s ... "
                 "reqs: a %d/%d, p %d, w %d, f %d, e %d ... "
                 "blocks: a %d/%d, p %d/%d ... "
                 "mem: tensors %d, alloc %.1f gb, res %.1f gb."
@@ -1399,7 +1418,7 @@ class DynamicInferenceEngine(AbstractEngine):
                     self.rank,
                     step_count,
                     datetime.now().strftime("%H:%M:%S"),
-                    step_time,
+                    step_time * 1000,
                     (
                         " [%s + real config %s + cuda graph %s]"
                         % (
@@ -1707,7 +1726,7 @@ class DynamicInferenceEngine(AbstractEngine):
             # Note that it is important to use a non-blocking asyncio-friendly all-reduce here.
             # The user may have other tasks running in the event loop that need to be serviced.
             # Do not using a torch.distributed blocking all-reduce here using nccl/gloo.
-            # We have tried that and it blocks the event loop is megatron-rl.
+            # We have tried that and it blocks the event loop in megatron-rl.
             max_global_work = await self.expert_parallel_zmq_communicator.all_reduce_max(local_work)
         else:
             max_global_work = local_work

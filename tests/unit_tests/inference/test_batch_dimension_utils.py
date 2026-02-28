@@ -31,7 +31,7 @@ def _generate_graphs(num_cuda_graphs, use_non_decode=True):
         tp_size=TP_SIZE,
         num_cuda_graphs=num_cuda_graphs,
         cuda_graph_max_tokens=MAX_REQUESTS,
-        cuda_graph_mixed_prefill_count=MIXED_PREFILL_COUNT,
+        cuda_graph_mixed_prefill_request_count=min(MIXED_PREFILL_COUNT, MAX_REQUESTS),
         max_requests=MAX_REQUESTS,
         max_tokens=MAX_TOKENS,
         max_sequence_length=MAX_SEQ_LEN,
@@ -50,7 +50,7 @@ def _match(
         decode_only_cuda_graphs=decode_only,
         explicit_chunked_prefill=explicit_chunked_prefill,
         ep_group=ep_group,
-        cuda_graph_mixed_prefill_count=MIXED_PREFILL_COUNT,
+        smallest_non_decode_cuda_graph_size=MIXED_PREFILL_COUNT,
     )
 
 

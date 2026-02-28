@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import warnings
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
 from typing import Optional, Protocol, Union
@@ -24,10 +25,29 @@ from megatron.core.transformer.moe.token_dispatcher import (
     MoEFlexTokenDispatcher,
     MoETokenDispatcher,
 )
+from megatron.core.transformer.moe.token_dispatcher_inference import (
+    InferenceCUDAGraphTokenDispatcher,
+)
 from megatron.core.transformer.spec_utils import ModuleSpec, build_module
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.typed_torch import apply_module
 from megatron.core.utils import internal_api
+
+try:
+    import flashinfer  # pylint: disable=unused-import
+
+    HAVE_FLASHINFER = True
+except ImportError:
+    HAVE_FLASHINFER = False
+
+if HAVE_FLASHINFER:
+    try:
+        import flashinfer_cubin  # pylint: disable=unused-import
+        import flashinfer_jit_cache  # pylint: disable=unused-import
+
+        HAVE_FLASHINFER_CUBIN_AND_JIT_CACHE = True
+    except ImportError:
+        HAVE_FLASHINFER_CUBIN_AND_JIT_CACHE = False
 
 try:
     import transformer_engine as te  # pylint: disable=unused-import
@@ -246,9 +266,75 @@ class MoELayer(BaseMoELayer):
             if self.shared_expert_overlap:
                 self.token_dispatcher.set_shared_experts(self.shared_experts)
 
+        # Inference-optimized mode setup
+        if config.transformer_impl == "inference_optimized":
+            assert (
+                HAVE_FLASHINFER
+            ), "flashinfer-python is required for inference-optimized MoE implementation."
+            if not HAVE_FLASHINFER_CUBIN_AND_JIT_CACHE:
+                warnings.warn(
+                    "flashinfer-cubin and/or flashinfer-jit-cache not found. "
+                    "The FlashInfer cutlass kernel will be JIT compiled,"
+                    "which may take a long time."
+                )
+            self._setup_inference_mode(pg_collection)
+
         # Cudagraph tensor store for resuming the forward pass from the end of the cudagraph.
         self.cudagraph_tensor_store = MoECudaGraphTensorStore()
         self.fwd_execution_map = ["route", "expert_compute", "postprocess"]
+
+    def _setup_inference_mode(self, pg_collection):
+        """Set up inference-optimized token dispatcher and state.
+
+        Called from __init__ when config.transformer_impl == "inference_optimized".
+        Creates an InferenceCUDAGraphTokenDispatcher alongside the standard dispatcher,
+        which is swapped in during CUDA-graphed forward passes.
+        """
+
+        assert self.config.moe_token_dispatcher_type == "alltoall", (
+            f"Inference-optimized MoE requires 'alltoall' dispatcher, "
+            f"got '{self.config.moe_token_dispatcher_type}'"
+        )
+        self.is_inference_cuda_graphed_iteration = False
+        self._inference_token_dispatcher = InferenceCUDAGraphTokenDispatcher(
+            self.num_local_experts,
+            self.local_expert_indices,
+            config=self.config,
+            pg_collection=pg_collection,
+        )
+
+    def set_inference_cuda_graphed_iteration(self):
+        """Enable CUDA-graphed iteration mode on this layer, its router, and its experts.
+
+        Swaps in the inference-optimized token dispatcher and disables
+        shared expert overlap.
+        """
+        self.is_inference_cuda_graphed_iteration = True
+        if hasattr(self.router, "set_inference_cuda_graphed_iteration"):
+            self.router.set_inference_cuda_graphed_iteration()
+        if hasattr(self.experts, "set_inference_cuda_graphed_iteration"):
+            self.experts.set_inference_cuda_graphed_iteration()
+
+        if self._inference_token_dispatcher is not None:
+            self._saved_token_dispatcher = self.token_dispatcher
+            self.token_dispatcher = self._inference_token_dispatcher
+            self._saved_shared_expert_overlap = self.shared_expert_overlap
+            self.shared_expert_overlap = False
+
+    def unset_inference_cuda_graphed_iteration(self):
+        """Disable CUDA-graphed iteration mode on this layer, its router, and its experts.
+
+        Restores the standard token dispatcher and shared expert overlap setting.
+        """
+        self.is_inference_cuda_graphed_iteration = False
+        if hasattr(self.router, "unset_inference_cuda_graphed_iteration"):
+            self.router.unset_inference_cuda_graphed_iteration()
+        if hasattr(self.experts, "unset_inference_cuda_graphed_iteration"):
+            self.experts.unset_inference_cuda_graphed_iteration()
+
+        if hasattr(self, "_saved_token_dispatcher"):
+            self.token_dispatcher = self._saved_token_dispatcher
+            self.shared_expert_overlap = self._saved_shared_expert_overlap
 
     @maybe_skip_or_early_return_by_cudagraph("route")
     def route(self, hidden_states: torch.Tensor, padding_mask: Optional[torch.Tensor] = None):
@@ -437,7 +523,7 @@ class MoELayer(BaseMoELayer):
 
             return output, mlp_bias
 
-        if self.moe_layer_recompute:
+        if self.moe_layer_recompute and self.training:
             if self.config.fp8 or self.config.fp4:
                 outputs = te_checkpoint(
                     custom_forward,

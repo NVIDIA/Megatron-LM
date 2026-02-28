@@ -3,14 +3,24 @@ from __future__ import annotations
 
 import warnings
 from abc import abstractmethod
-from typing import Optional, Protocol, cast
+from typing import Optional, Protocol, Tuple, cast
 
+from megatron.core.extensions.transformer_engine import (
+    TEColumnParallelGroupedLinear,
+    TERowParallelGroupedLinear,
+)
 from megatron.core.tensor_parallel.layers import ColumnParallelLinear, RowParallelLinear
 from megatron.core.transformer.dot_product_attention import DotProductAttention
 from megatron.core.transformer.mlp import MLPSubmodules, TEActivationFunctionBuilder
-from megatron.core.transformer.moe.experts import GroupedMLP, SequentialMLP, TEGroupedMLPSubmodules
+from megatron.core.transformer.moe.experts import (
+    GroupedMLP,
+    InferenceGroupedMLP,
+    SequentialMLP,
+    TEGroupedMLPSubmodules,
+)
 from megatron.core.transformer.torch_norm import LayerNormBuilder, WrappedTorchNorm
 from megatron.core.typed_torch import not_none
+from megatron.core.utils import is_te_min_version
 
 try:
     import apex  # pylint: disable=unused-import
@@ -181,7 +191,8 @@ class InferenceSpecProvider(BackendSpecProvider):
 
     def grouped_mlp_modules(
         self, moe_use_grouped_gemm: bool, moe_use_legacy_grouped_gemm: bool
-    ) -> tuple[type, MLPSubmodules | TEGroupedMLPSubmodules | None]:
-        raise NotImplementedError(
-            "MOE is not supported with inference optimized transformer implementation."
+    ) -> Tuple[type, Optional[MLPSubmodules]]:
+        """Which module and submodules to use for grouped mlp"""
+        return InferenceGroupedMLP, MLPSubmodules(
+            linear_fc1=TEColumnParallelGroupedLinear, linear_fc2=TERowParallelGroupedLinear
         )
