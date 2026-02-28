@@ -31,6 +31,7 @@ def model_provider_mock_vlm_single_encoder(
     add_encoder=True,
     add_decoder=True,
     special_token_id: int = 32000,
+    pg_collection=None,
 ):
     """
     Build a MIMO model with a vision encoder.
@@ -94,6 +95,8 @@ def model_provider_mock_vlm_single_encoder(
     )
 
     # Create MIMO model
-    mimo_model = MimoModel(mimo_model_config)
+    cp_group = pg_collection.cp if pg_collection is not None else None
+    tp_group = pg_collection.tp if pg_collection is not None else None
+    mimo_model = MimoModel(mimo_model_config, cp_group=cp_group, tp_group=tp_group)
 
     return mimo_model
