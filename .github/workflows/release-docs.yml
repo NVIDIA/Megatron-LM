@@ -73,7 +73,7 @@ on:
 
 jobs:
   build-docs:
-    uses: NVIDIA-NeMo/FW-CI-templates/.github/workflows/_build_docs.yml@v0.67.0
+    uses: NVIDIA-NeMo/FW-CI-templates/.github/workflows/_build_docs.yml@v0.77.0
     with:
       ref: ${{ inputs.build-docs-ref }}
 
