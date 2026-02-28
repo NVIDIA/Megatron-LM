@@ -69,7 +69,7 @@ class ParamKey:
     # TODO: Can add layer_id here later.
 
     name: Union[str, Tuple[str]] = field(default_factory=tuple)
-    """Parameter name(s), will use unix filesystem path syntax for matching."""
+    """Parameter name(s)."""
 
     attr: Union[str, Tuple[str]] = field(default_factory=tuple)
     """Parameter attribute(s)."""
@@ -137,7 +137,42 @@ class ParamKey:
 
 @dataclass
 class OptimizerConfig:
-    """Base optimizer configuration object."""
+    """Configuration object for Megatron optimizers.
+
+    Attributes:
+        lr (float, optional): Initial learning rate. Defaults to None.
+        min_lr (float, optional): Minimum learning rate for scheduler clipping.
+        weight_decay (float): L2 regularization coefficient. Defaults to 0.01.
+        
+        fp8_recipe (str, optional): Type of FP8 recipe affecting distributed 
+            optimizer logic.
+        fp16 (bool): If True, use FP16 mixed precision. Defaults to False.
+        bf16 (bool): If True, use BF16 mixed precision. Defaults to False.
+        params_dtype (torch.dtype): Dtype used for weight initialization.
+        use_precision_aware_optimizer (bool): Allows lower precision for 
+            master params and states.
+        
+        loss_scale (float, optional): Static loss scaling factor.
+        initial_loss_scale (float): Initial scale for dynamic scaling.
+        min_loss_scale (float): Minimum scale for dynamic scaling.
+        loss_scale_window (float): Window size for dynamic scale adjustments.
+        hysteresis (int): Delay iterations for dynamic scale reduction.
+        
+        adam_beta1 (float): Adam beta1 coefficient. Defaults to 0.9.
+        adam_beta2 (float): Adam beta2 coefficient. Defaults to 0.999.
+        adam_eps (float): Adam epsilon for numerical stability.
+        decoupled_weight_decay (bool): Whether to use AdamW-style decay.
+        
+        use_distributed_optimizer (bool): If True, shard state across DP ranks.
+        overlap_param_gather (bool): Overlap param all-gather with forward compute.
+        
+        optimizer_cpu_offload (bool): If True, offload state and compute to CPU.
+        optimizer_offload_fraction (float): Percentage of state to offload.
+        
+        clip_grad (float): Global L2 norm threshold for gradient clipping.
+        log_num_zeros_in_grad (bool): Whether to log count of zero gradients.
+        timers (Callable, optional): Timer utility function.
+    """
 
     ##############
     # General
