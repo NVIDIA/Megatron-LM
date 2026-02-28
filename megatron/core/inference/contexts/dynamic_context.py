@@ -22,7 +22,7 @@ from megatron.core.inference.unified_memory import (
     UnifiedMemoryUnsupportedError,
     create_unified_mempool,
 )
-from megatron.core.inference.utils import tensor_swap
+from megatron.core.inference.utils import device_memory_summary, tensor_swap
 from megatron.core.models.common.embeddings.rope_utils import apply_rotary_pos_emb
 from megatron.core.package_info import __version__ as mcore_version
 from megatron.core.ssm.mamba_hybrid_layer_allocation import get_layer_maps_from_layer_type_list
@@ -231,6 +231,7 @@ class DynamicInferenceContext(BaseInferenceContext):
     DEFAULT_MAX_TOKENS = 16384
     TOKEN_ROUNDER = 64
     REQUEST_ROUNDER = 4
+    TMS_TAG = "inference_context"
 
     @deprecate_args(
         *DEPRECATED_ARGS,
@@ -709,7 +710,7 @@ class DynamicInferenceContext(BaseInferenceContext):
             ctx_manager = torch.cuda.use_mem_pool(self.unified_memory_mempool)
         elif HAVE_TORCH_MEMORY_SAVER and need_static_addr:
             ctx_manager = torch_memory_saver.region(
-                tag="inference_context",
+                tag=self.TMS_TAG,
                 enable_cpu_backup=(self.kv_cache_management_mode == KVCacheManagementMode.OFFLOAD),
             )
             self._uses_torch_memory_saver = True
@@ -737,7 +738,16 @@ class DynamicInferenceContext(BaseInferenceContext):
             if self.kv_cache_management_mode == KVCacheManagementMode.RECOMPUTE:
                 self.reset()
             if self._uses_torch_memory_saver:
-                torch_memory_saver.resume("inference_context")
+                tag = self.TMS_TAG
+                if torch.distributed.get_rank() == 0:
+                    logging.info(
+                        "torch_memory_saver: resuming %s, before: %s", tag, device_memory_summary()
+                    )
+                torch_memory_saver.resume(tag)
+                if torch.distributed.get_rank() == 0:
+                    logging.info(
+                        "torch_memory_saver: resumed  %s, after:  %s", tag, device_memory_summary()
+                    )
             return
 
         if self.kv_cache_management_mode == KVCacheManagementMode.OFFLOAD:
@@ -764,7 +774,16 @@ class DynamicInferenceContext(BaseInferenceContext):
             return
 
         if self._uses_torch_memory_saver:
-            torch_memory_saver.pause("inference_context")
+            tag = self.TMS_TAG
+            if torch.distributed.get_rank() == 0:
+                logging.info(
+                    "torch_memory_saver: pausing %s, before: %s", tag, device_memory_summary()
+                )
+            torch_memory_saver.pause(tag)
+            if torch.distributed.get_rank() == 0:
+                logging.info(
+                    "torch_memory_saver: paused  %s, after:  %s", tag, device_memory_summary()
+                )
             return
 
         if self.kv_cache_management_mode == KVCacheManagementMode.OFFLOAD:

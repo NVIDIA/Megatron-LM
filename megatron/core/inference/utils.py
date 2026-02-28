@@ -10,6 +10,29 @@ from megatron.core.transformer.moe.moe_layer import MoELayer
 from megatron.core.utils import get_model_config
 
 
+def device_memory_summary() -> str:
+    """One-line GPU memory summary for torch_memory_saver logging."""
+    dev = torch.cuda.current_device()
+    stats = torch.cuda.memory_stats(dev)
+    try:
+        segs = torch.cuda.memory_snapshot(include_traces=False)
+    except TypeError:  # include_traces was added in PyTorch 2.11
+        segs = torch.cuda.memory_snapshot()
+    M = 1024**2
+    private = sum(
+        s.get("active_size", 0)
+        for s in segs
+        if s.get("device", dev) == dev and tuple(s.get("segment_pool_id", (0, 0))) != (0, 0)
+    )
+    alloc = stats.get("allocated_bytes.all.current", 0)
+    resv = stats.get("reserved_bytes.all.current", 0)
+    dev_mem = torch.cuda.device_memory_used()
+    return (
+        f"alloc={alloc/M:.0f}MiB private={private/M:.0f}MiB "
+        f"resv-alloc={(resv-alloc)/M:.0f}MiB resv={resv/M:.0f}MiB dev_mem={dev_mem/M:.0f}MiB"
+    )
+
+
 class Counter:
     """A simple counter class
 
