@@ -1775,12 +1775,12 @@ class DynamicInferenceEngine(AbstractEngine):
         consensus_val = -1 if signal_consensus else 0
 
         # Signals can be received asynchronously on EP ranks.
-		# We do not want a rank to pause prematurely if its peers have yet to receive the signal.
-		# So this is an *attempt* to process the signal. This rank has received the signal
-		# and passes -1 to the all-reduce. If any other rank in the EP group has not received
+        # We do not want a rank to pause prematurely if its peers have yet to receive the signal.
+        # So this is an *attempt* to process the signal. This rank has received the signal
+        # and passes -1 to the all-reduce. If any other rank in the EP group has not received
         # the signal yet, it will pass a zero value to the all-reduce, hence the global consensus
         # will be zero and we will defer processing the signal.
-		# When all ranks receive the signal, global work will be zero and we can process the signal.
+        # When all ranks receive the signal, global work will be zero and we can process the signal.
 
         if self.ep_world_size > 1:
             # Perform all-reduce to get max global work across EP group.
