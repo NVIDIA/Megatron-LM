@@ -1315,7 +1315,10 @@ class MoETransformerLayer(TransformerLayer):
         )
 
         for attr_name in self.mlp.token_dispatcher.cudagraph_attrs:
-            attr = getattr(self.mlp.token_dispatcher, attr_name)
+            hier_attr_name = attr_name.split('.')
+            attr = self.mlp.token_dispatcher
+            for name in hier_attr_name:
+                attr = getattr(attr, name)
             if torch.is_tensor(attr):
                 if attr_name in self.token_dispatcher_attrs:
                     self.token_dispatcher_attrs[attr_name].copy_(attr)
