@@ -86,12 +86,6 @@ class FullyShardedDataParallel(_BaseDataParallel):
         self.megatron_fsdp_dist_index = self._init_dist_index(pg_collection)
 
         if config.gradient_accumulation_fusion:
-            assert (
-                self.megatron_fsdp_dist_index.get_dp_group(is_expert_parallel=True).size() == 1
-            ), (
-                "Megatron-FSDP with gradient_accumulation_fusion does not support "
-                "data parallelism when expert parallelism is enabled."
-            )
             assert is_te_min_version("2.10"), (
                 "Megatron-FSDP with gradient_accumulation_fusion requires "
                 "Transformer Engine version 2.10 or higher."
