@@ -312,7 +312,7 @@ Megatron-FSDP's `fully_shard_*` API has a comprehensive set of arguments for fin
     - `main_grads_dtype` controls the data-type for gradients used in distributed optimization.
         - Defaults to `torch.float32`, which is highly-recommended for accuracy at scale.
         - If set to `None`, the model native gradient data-type will be utilized.
-    - `grad_comm_dtype` controls the data-type for gradient communications (A2A / RS / AR) when reducing gradients. Lower precision `grad_comm_dtype` improves (communication) performance, but may increase memory utilization or sacrifice gradient precision in certain cases.
+    - `grad_comm_dtype` controls the data-type for gradient communications (RS / AR) when reducing gradients. Lower precision `grad_comm_dtype` improves (communication) performance, but may increase memory utilization or sacrifice gradient precision in certain cases.
         - Defaults to `torch.float32`.
         - If set to `None`, the `main_grads_dtype` data-type will be utilized.
         - If using `no_shard`, `optim`, or a `FixedPoolAllocator` (`fsdp_double_buffer`), allocating `dtype`-custom gradient communication buffers (per FSDP group) adds memory overhead.

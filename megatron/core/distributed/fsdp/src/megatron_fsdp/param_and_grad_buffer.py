@@ -999,8 +999,8 @@ class DataParallelBuffer:
 
         Can allocate sharded or un-sharded buckets.
 
-        Optionally, if init_values is provided, the values of the Tensor
-        will be copied into the newly-allocated storage.
+        Optionally, if init_values is provided, the flattened values of
+        the init_values will be copied into the newly-allocated storage.
 
         Args:
             shard (bool):
@@ -1033,6 +1033,10 @@ class DataParallelBuffer:
         )
         # Copy Tensor values into Bucket data.
         if init_values is not None:
+            assert bucket.data.shape == init_values.flatten().shape, (
+                "[allocate_bucket_storage] Size mismatch between allocated bucket "
+                f"({bucket.data.shape}) and init_values ({init_values.shape})!"
+            )
             bucket.data.detach().copy_(init_values.flatten())
         return bucket
 
@@ -3532,10 +3536,6 @@ class GradReducePipeline:
                             and unreduced_grad.dtype != mp_policy.grad_comm_dtype
                         )
                         if custom_grad_comm_dtype:
-                            # DP-Shard gradient reduction completed, deallocate memory
-                            # and de-reference param.main_grad if possible.
-                            fsdp_grad_buffer.free_bucket_storage()
-                            fsdp_grad_buffer.reset_param_main_grad()
                             # Allocate a custom communication buffer with the HSDP gradient
                             # communication buffer. Introduces copy and memory overhead.
                             hsdp_comm_gbuf = self.buffer.parameter_groups[bucket_id].hsdp_comm_gbuf
