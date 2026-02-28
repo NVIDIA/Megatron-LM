@@ -2174,6 +2174,11 @@ class TECudaGraphHelper:
                     )
             else:
                 kwargs['fp8_enabled'] = False
+
+            from megatron.core.pipeline_parallel.fine_grained_activation_offload import (
+                FineGrainedActivationOffloadingInterface as off_interface,
+            )
+
             return kwargs
 
         kwargs = get_make_graphed_callables_kwargs()
@@ -2217,6 +2222,13 @@ class TECudaGraphHelper:
             optimizer.zero_grad()
         clear_aux_losses_tracker()
         reset_model_temporary_tensors(self.config, self.model)
+
+        if self.config.fine_grained_activation_offloading:
+            from megatron.core.pipeline_parallel.fine_grained_activation_offload import (
+                FineGrainedActivationOffloadingInterface as off_interface,
+            )
+
+            off_interface.reset()
 
         if FREEZE_GC:
             gc.unfreeze()

@@ -943,6 +943,15 @@ class TransformerConfig(ModelParallelConfig):
     min_offloaded_tensor_size: int = 1024 * 1024
     """The minimum size of the tensor to be offloaded."""
 
+    delay_offload_until_cuda_graph: bool = False
+    """If True, delay the offload until the CUDA graph is executed for minimal CPU overhead."""
+
+    delta_offload_bytes_across_pp_ranks: int = 0
+    """Difference of offload bytes across PP ranks to balance the offload load."""
+
+    activation_offload_fraction: float = 1.0
+    """The fraction of the activation to be offloaded, which should be in range [0, 1]."""
+
     def __post_init__(self):
         """Python dataclass method that is used to modify attributes after initialization.
         See https://docs.python.org/3/library/dataclasses.html#post-init-processing for more
@@ -1352,6 +1361,38 @@ class TransformerConfig(ModelParallelConfig):
                     "because the input of attn_proj is the output of core_attn, "
                     "which is needed in core_attn.backward()."
                 )
+            if self.delay_offload_until_cuda_graph:
+                assert self.external_cuda_graph or self.enable_cuda_graph, (
+                    "delay_offload_until_cuda_graph must be used with cuda graph."
+                )
+            assert (
+                self.min_offloaded_tensor_size >= 0
+            ), "min_offloaded_tensor_size must be non-negative."
+            assert (
+                self.activation_offload_fraction >= 0 and self.activation_offload_fraction <= 1
+            ), "activation_offload_fraction must be in range [0, 1]."
+            assert (
+                self.delta_offload_bytes_across_pp_ranks >= 0
+            ), "delta_offload_bytes_across_pp_ranks must be non-negative."
+            if self.external_cuda_graph or self.enable_cuda_graph:
+                assert (
+                    self.cuda_graph_impl == "transformer_engine"
+                ), "cuda_graph_impl must be transformer_engine when enabling offloading."
+                assert (
+                    self.cuda_graph_scope is not None
+                ), "cuda_graph_scope must be set when enabling offloading."
+                assert (
+                    "attn" in self.cuda_graph_scope and "moe_router" in self.cuda_graph_scope
+                ) or (
+                    CudaGraphScope.attn in self.cuda_graph_scope
+                    and CudaGraphScope.moe_router in self.cuda_graph_scope
+                ), "attn and moe_router must be in cuda_graph_scope when enabling offloading."
+                assert (
+                    "attn_norm" not in self.offload_modules
+                ), "input of attn_norm is the start point of cuda graph, which can't be offloaded."
+                assert (
+                    "mlp_norm" not in self.offload_modules
+                ), "mlp_norm goes through the boundary of cuda graph, which can't be offloaded."
 
         if (
             self.num_layers_in_first_pipeline_stage is not None
