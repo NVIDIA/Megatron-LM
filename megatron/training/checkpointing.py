@@ -12,6 +12,7 @@ import types
 from argparse import Namespace
 from datetime import datetime
 from enum import Enum, auto
+import gc
 from logging import getLogger
 from pathlib import Path
 from time import time
@@ -1747,6 +1748,11 @@ def load_checkpoint(ddp_model, optimizer, opt_param_scheduler, load_arg='load', 
         load_dir, args, rank0=False, checkpointing_context=checkpointing_context,
         **load_kwargs
     )
+    del load_kwargs
+
+    # collect the freed reference to load_kwargs so that CUDA can let go of load_kwargs["sharded_state_dict"] 
+    gc.collect()
+    torch.cuda.empty_cache()
 
     # Checkpoint not loaded.
     if state_dict is None:
@@ -1803,6 +1809,7 @@ def load_checkpoint(ddp_model, optimizer, opt_param_scheduler, load_arg='load', 
     if not skip_load_to_model_and_opt:
         if len(ddp_model) == 1:
             load_model_state_dict(ddp_model[0], state_dict['model'], strict)
+            del state_dict['model']
         else:
             for i in range(len(ddp_model)):
                 # If there is no corresponding model in the state_dict, it will be ignored.
@@ -1810,6 +1817,7 @@ def load_checkpoint(ddp_model, optimizer, opt_param_scheduler, load_arg='load', 
                 if 'model%d' % i not in state_dict:
                     continue
                 load_model_state_dict(ddp_model[i], state_dict['model%d' % i], strict)
+                del state_dict['model%d' % i]
     # Fix up query/key/value matrix ordering if needed.
     checkpoint_version = get_checkpoint_version()
     print_rank_0(f' checkpoint version {checkpoint_version}')
@@ -1826,6 +1834,7 @@ def load_checkpoint(ddp_model, optimizer, opt_param_scheduler, load_arg='load', 
                 optimizer.load_state_dict_from_file(optim_checkpoint_name)
             elif not skip_load_to_model_and_opt and optimizer is not None and not optimizer.is_stub_optimizer:
                 optimizer.load_state_dict(state_dict['optimizer'])
+                del state_dict['optimizer']
 
             # Load distributed optimizer's custom parameter state.
             # For distributed checkpoint it's already loaded in load_state_dict above
@@ -1942,6 +1951,8 @@ def load_checkpoint(ddp_model, optimizer, opt_param_scheduler, load_arg='load', 
        or is_last_rank():
         wandb_utils.on_load_checkpoint_success(checkpoint_name, load_dir)
 
+    # collect freed references to state_dict['model'] and state_dict['optimizer'] so CUDA can let go of the memory
+    gc.collect()
     torch.cuda.empty_cache()
 
     if iteration > 0:
