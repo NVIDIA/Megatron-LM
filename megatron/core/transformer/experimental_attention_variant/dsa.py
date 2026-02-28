@@ -26,6 +26,13 @@ try:
 except ImportError:
     hadamard_transform = None
 
+try:
+    from megatron.core.transformer.experimental_attention_variant.dsa_fused_kernels import (
+        FusedDSAMQA,
+    )
+except ImportError:
+    FusedDSAMQA = None
+
 
 def rotate_activation(x: torch.Tensor) -> torch.Tensor:
     """Apply Hadamard rotation activation.
@@ -970,6 +977,66 @@ def unfused_dsa_fn(query, key, value, topk_indices, softmax_scale):
     return output
 
 
+def unfused_dsa_fn_mqa(query, key, v_channels, topk_indices, softmax_scale):
+    """Unfused sparse attention implementation with MQA."""
+    value = key[..., :v_channels]
+
+    sq, b, np, hn = query.size()
+    skv = key.size(0)
+    hnv = value.size(-1)
+
+    # Verify MQA format
+    assert key.size(-2) == 1, f"Expected key to have 1 head (MQA), got {key.size(-2)}"
+    assert value.size(-2) == 1, f"Expected value to have 1 head (MQA), got {value.size(-2)}"
+
+    # ===================================
+    # Raw attention scores [b, np, sq, skv]
+    # ===================================
+    # query: [sq, b, np, hn] -> [b, np, sq, hn]
+    query = query.permute(1, 2, 0, 3)
+    # key: [skv, b, 1, hn] -> [b, 1, hn, skv] -> broadcast to [b, np, hn, skv]
+    key = key.permute(1, 2, 3, 0)  # [b, 1, hn, skv]
+
+    # Compute attention scores with broadcasting
+    # [b, np, sq, hn] @ [b, 1, hn, skv] -> [b, np, sq, skv]
+    attention_scores = torch.matmul(query.float(), key.float()) * softmax_scale
+
+    # ===================================
+    # Apply sparse mask from indexer
+    # ===================================
+    # index_mask [b, sq, skv]
+    index_mask = torch.full((b, sq, skv), float("-inf"), device=attention_scores.device)
+    index_mask.scatter_(-1, topk_indices, 0)
+    # causal_mask [sq, skv]
+    causal_mask = torch.triu(
+        torch.full((sq, skv), float('-inf'), dtype=torch.float32, device=index_mask.device),
+        diagonal=1,
+    )
+    # [b, sq, skv] + [1, sq, skv] -> [b, sq, skv]
+    index_mask += causal_mask.view(1, sq, skv)
+    # [b, np, sq, skv] + [b, 1, sq, skv] -> [b, np, sq, skv]
+    attention_scores += index_mask.unsqueeze(1)
+    attention_scores = torch.nn.functional.softmax(attention_scores, dim=-1, dtype=torch.float32)
+
+    # ===================================
+    # Output with MQA broadcasting
+    # ===================================
+    # value: [skv, b, 1, hnv] -> [b, 1, skv, hnv]
+    value = value.permute(1, 2, 0, 3)  # [b, 1, skv, hnv]
+
+    # Compute output with broadcasting
+    # attention_scores: [b, np, sq, skv]
+    # value: [b, 1, skv, hnv] -> broadcast to [b, np, skv, hnv]
+    # output: [b, np, sq, hnv]
+    output = torch.matmul(attention_scores.to(value.dtype), value)
+
+    # Reshape output: [b, np, sq, hnv] -> [sq, b, np, hnv]
+    output = output.permute(2, 0, 1, 3).contiguous()
+
+    output = output.reshape(*output.shape[:-2], -1)
+    return output
+
+
 class DSAttention(MegatronModule):
     """
     This module implements sparse attention mechanism using an DSA Indexer to compute top-k
@@ -1006,15 +1073,17 @@ class DSAttention(MegatronModule):
                 k_channels if k_channels is not None else config.kv_channels
             )
         self.softmax_scale = softmax_scale
+        self.k_channels = k_channels
+        self.v_channels = v_channels
 
     def forward(
         self,
         query: torch.Tensor,
         key: torch.Tensor,
         value: torch.Tensor,
-        attention_mask: torch.Tensor,
         x: torch.Tensor,
         qr: torch.Tensor,
+        attention_mask: torch.Tensor,
         attn_mask_type: AttnMaskType = None,
         attention_bias: torch.Tensor = None,
         packed_seq_params: PackedSeqParams = None,
@@ -1036,9 +1105,14 @@ class DSAttention(MegatronModule):
         Returns:
             output: Output tensor [sq, b, hidden_size]
         """
+        is_mqa = value is None
+        if is_mqa:
+            assert key.size(-2) == 1, "Key must have 1 head in MQA mode"
+            assert query.size(-1) == self.k_channels
+            assert key.size(-1) == self.k_channels
+
         sq, b, np, hn = query.size()
         skv = key.size(0)
-        hnv = value.size(3)
 
         # Detach x and qr to prevent gradients of indexer from flowing back to the main model.
         x = x.detach()
@@ -1073,13 +1147,15 @@ class DSAttention(MegatronModule):
             # ===================================
             # Attach indexer topk and loss
             # ===================================
+            # For MQA mode, expand key to match query heads for loss computation
+            key_for_loss = key.expand(-1, -1, np, -1) if is_mqa else key
             # Compute KL divergence loss between indexer scores and true attention scores
             topk_indices, indexer_loss = FusedDSAIndexerLoss.apply(
                 q,
                 weights,
                 k,
                 query.detach(),
-                key.detach(),
+                key_for_loss.detach(),
                 self.softmax_scale,
                 self.indexer.index_topk,
                 indexer_loss_coeff,
@@ -1098,7 +1174,29 @@ class DSAttention(MegatronModule):
             # ===================================
             # Run sparse attention kernel
             # ===================================
-            output = unfused_dsa_fn(query, key, value, topk_indices, self.softmax_scale)
+            if is_mqa:
+                # MQA mode: use the MQA-optimized function
+                force_unfused = getattr(self, 'force_unfused_dsa', False)
+                if (
+                    not force_unfused
+                    and FusedDSAMQA is not None
+                    and self.k_channels == 576
+                    and self.v_channels == 512
+                ):
+                    # Currently fused kernel only supports specific config combination.
+                    # print("Using fused MQA kernel")
+                    output = FusedDSAMQA.apply(
+                        query, key, self.v_channels, topk_indices, self.softmax_scale
+                    )
+                else:
+                    # print("Using unfused MQA kernel")
+                    output = unfused_dsa_fn_mqa(
+                        query, key, self.v_channels, topk_indices, self.softmax_scale
+                    )
+            else:
+                # Standard MHA mode
+                # Output shape: [sq, b, np * hnv] (flattened)
+                output = unfused_dsa_fn(query, key, value, topk_indices, self.softmax_scale)
 
             # Attach loss to output
             output = DSAIndexerLossAutoScaler.apply(output, indexer_loss)
@@ -1114,6 +1212,26 @@ class DSAttention(MegatronModule):
             # ===================================
             # Run sparse attention kernel
             # ===================================
-            output = unfused_dsa_fn(query, key, value, topk_indices, self.softmax_scale)
+            if is_mqa:
+                # MQA mode: use the MQA-optimized function
+                force_unfused = getattr(self, 'force_unfused_dsa', False)
+                if (
+                    not force_unfused
+                    and FusedDSAMQA is not None
+                    and self.k_channels == 576
+                    and self.v_channels == 512
+                ):
+                    # Currently fused kernel only supports specific config combination.
+                    output = FusedDSAMQA.apply(
+                        query, key, self.v_channels, topk_indices, self.softmax_scale
+                    )
+                else:
+                    output = unfused_dsa_fn_mqa(
+                        query, key, self.v_channels, topk_indices, self.softmax_scale
+                    )
+            else:
+                # Standard MHA mode
+                # Output shape: [sq, b, np * hnv] (flattened)
+                output = unfused_dsa_fn(query, key, value, topk_indices, self.softmax_scale)
 
         return output
