@@ -395,6 +395,10 @@ def permute(
             # get probs from indices
             permuted_probs = probs_T_1D.index_select(0, indices_1D)
     else:
+        assert (
+            num_out_tokens is not None
+        ), "num_out_tokens is required for the argsort-based permute"
+
         # mask [num_tokens, num_experts] -> [num_experts, num_tokens]
         routing_map = routing_map.bool().T.contiguous()
 
