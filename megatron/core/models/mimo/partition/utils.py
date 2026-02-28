@@ -16,7 +16,7 @@ from torch.distributed import ProcessGroup  # type: ignore[import-not-found]
 from megatron.core import tensor_parallel
 from megatron.core.model_parallel_config import ModelParallelConfig
 from megatron.core.packed_seq_params import PackedSeqParams
-from megatron.core.parallel_state import get_context_parallel_group
+from megatron.core.parallel_state import get_context_parallel_group, get_tensor_model_parallel_group
 from megatron.core.utils import get_batch_on_this_cp_rank, is_te_min_version
 
 try:
@@ -33,7 +33,7 @@ class PartitionConfig:
     """Minimal runtime information needed to shard inputs.
 
     NOTE: Always construct PartitionConfig using the provided classmethod
-    (from_mp_config) to ensure all fields, including cp_group,
+    (from_mp_config) to ensure all fields, including cp_group and tp_group,
     are set correctly.
     """
 
@@ -45,31 +45,12 @@ class PartitionConfig:
     max_seq_len: int
     kv_format: str = "sbhd"  # "sbhd" | "thd"
     cp_group: Optional[ProcessGroup] = None
+    tp_group: Optional[ProcessGroup] = None
 
     @property
     def is_partitioning_enabled(self) -> bool:
         """Returns True if context parallelism or sequence parallelism is active."""
         return self.use_cp or self.seq_parallel
-
-    @property
-    def group_size(self) -> int:
-        """Returns the size of the parallelism group."""
-        if self.use_cp:
-            return self.cp_size
-        if self.seq_parallel:
-            return self.tp_size
-        return 1
-
-    @property
-    def group_rank(self) -> int:
-        """Returns the rank within the parallelism group."""
-        if self.use_cp:
-            return self.cp_group.rank() if self.cp_group else 0
-        if self.seq_parallel:
-            from megatron.core.parallel_state import get_tensor_model_parallel_rank
-
-            return get_tensor_model_parallel_rank()
-        return 0
 
     @classmethod
     def from_mp_config(
@@ -79,6 +60,7 @@ class PartitionConfig:
         max_seq_len: int,
         kv_format: str = "sbhd",
         cp_group: Optional[ProcessGroup] = None,
+        tp_group: Optional[ProcessGroup] = None,
     ) -> "PartitionConfig":
         """
         Creates a PartitionConfig from a ModelParallelConfig.
@@ -90,6 +72,9 @@ class PartitionConfig:
         if cp_size > 1 and cp_group is None:
             cp_group = get_context_parallel_group()
 
+        if mp.sequence_parallel and tp_group is None:
+            tp_group = get_tensor_model_parallel_group()
+
         return cls(
             cp_size=cp_size,
             tp_size=mp.tensor_model_parallel_size,
@@ -99,6 +84,7 @@ class PartitionConfig:
             max_seq_len=max_seq_len,
             kv_format=kv_format,
             cp_group=cp_group,
+            tp_group=tp_group,
         )
 
 
@@ -112,7 +98,6 @@ class PartitionAdapter:
         """
         self.cfg = cfg
 
-    # pylint: disable=too-many-arguments
     def shard(
         self,
         embeddings: torch.Tensor,
@@ -120,12 +105,17 @@ class PartitionAdapter:
         loss_mask: torch.Tensor,
         attention_mask: torch.Tensor,
         packed_seq_params: Optional[PackedSeqParams] = None,
-        *,
-        pre: bool,
-        post: bool,
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, Optional[PackedSeqParams]]:
         """
         Apply context parallel (CP) and sequence parallel (SP) sharding to input tensors.
+
+        All input tensors must be in batch-first layout:
+            - embeddings: (B, S, H)
+            - labels / loss_mask / attention_mask: (B, S)
+
+        After this call embeddings are still in (B, S/cp, H) batch-first layout.
+        The caller is responsible for transposing to (S/cp, B, H) if the language model
+        requires sequence-first tensors.
 
         Args:
             embeddings (torch.Tensor):
@@ -138,26 +128,20 @@ class PartitionAdapter:
                 Attention mask tensor. Shape: (B, S)
             packed_seq_params (PackedSeqParams, optional):
                 Packed sequence parameters. Defaults to None.
-            pre (bool):
-                Whether this is the pre-forward stage (affects which tensors are sharded).
-            post (bool):
-                Whether this is the post-forward stage (affects which tensors are sharded).
 
         Returns:
             Tuple containing:
-                - embeddings (torch.Tensor): Possibly sharded embeddings.
-                                             Shape: (B, S, H) or (S, B, H) after sharding.
-                - labels (torch.Tensor): Possibly sharded labels. Shape: (B, S)
-                - loss_mask (torch.Tensor): Possibly sharded loss mask. Shape: (B, S)
-                - attention_mask (torch.Tensor): Possibly sharded attention mask. Shape: (B, S)
+                - embeddings (torch.Tensor): Sharded embeddings. Shape: (B, S/cp, H)
+                - labels (torch.Tensor): Possibly sharded labels. Shape: (B, S/cp)
+                - loss_mask (torch.Tensor): Possibly sharded loss mask. Shape: (B, S/cp)
+                - attention_mask (torch.Tensor): Possibly sharded attention mask. Shape: (B, S/cp)
                 - packed_seq_params (PackedSeqParams, optional): Updated packed sequence parameters.
         """
         if not (self.cfg.use_cp or self.cfg.seq_parallel):
             return embeddings, labels, loss_mask, attention_mask, packed_seq_params
 
-        # When we are in the `pre` stage we can already sanity-check the
-        # sequence length before any sharding happens.
-        if pre and embeddings is not None:
+        # Sanity-check the sequence length before any sharding happens.
+        if embeddings is not None:
             shard_factor = None
             seq_dim = None  # which dimension holds the token sequence
 
@@ -189,16 +173,15 @@ class PartitionAdapter:
         if self.cfg.use_cp:
             embeddings, labels, loss_mask, attention_mask, packed_seq_params = (
                 self._apply_context_parallel(
-                    embeddings, labels, loss_mask, attention_mask, packed_seq_params, pre, post
+                    embeddings, labels, loss_mask, attention_mask, packed_seq_params
                 )
             )
 
-        if self.cfg.seq_parallel and pre and embeddings is not None:
+        if self.cfg.seq_parallel and embeddings is not None:
             embeddings = tensor_parallel.scatter_to_sequence_parallel_region(embeddings)
 
         return embeddings, labels, loss_mask, attention_mask, packed_seq_params
 
-    # pylint: disable=too-many-arguments
     def _apply_context_parallel(
         self,
         embeddings: Optional[torch.Tensor],
@@ -206,8 +189,6 @@ class PartitionAdapter:
         loss_mask: Optional[torch.Tensor],
         attention_mask: Optional[torch.Tensor],
         packed_seq_params: Optional[PackedSeqParams],
-        pre: bool,
-        post: bool,
     ) -> Tuple[
         Optional[torch.Tensor],
         Optional[torch.Tensor],
@@ -229,19 +210,14 @@ class PartitionAdapter:
                 Attention mask tensor. Shape: (B, S)
             packed_seq_params (PackedSeqParams, optional):
                 Packed sequence parameters. Defaults to None.
-            pre (bool):
-                Whether this is the pre-forward stage (affects which tensors are sharded).
-            post (bool):
-                Whether this is the post-forward stage (affects which tensors are sharded).
 
         Returns:
             Tuple containing:
-                - embeddings (Optional[torch.Tensor]): Possibly sharded embeddings.
-                                                       Shape: (S, B, H) after sharding.
-                - labels (Optional[torch.Tensor]): Possibly sharded labels. Shape: (B, S)
-                - loss_mask (Optional[torch.Tensor]): Possibly sharded loss mask. Shape: (B, S)
+                - embeddings (Optional[torch.Tensor]): Sharded embeddings. Shape: (B, S/cp, H)
+                - labels (Optional[torch.Tensor]): Possibly sharded labels. Shape: (B, S/cp)
+                - loss_mask (Optional[torch.Tensor]): Possibly sharded loss mask. Shape: (B, S/cp)
                 - attention_mask (Optional[torch.Tensor]): Possibly sharded attention mask.
-                                                           Shape: (B, S)
+                                                           Shape: (B, S/cp)
                 - packed_seq_params (PackedSeqParams, optional): Updated packed sequence parameters.
         """
         if not self.cfg.use_cp:
@@ -249,15 +225,14 @@ class PartitionAdapter:
 
         # Distribute sequence across CP ranks
         batch = dict()
-        if pre and embeddings is not None:
+        if embeddings is not None:
             batch["embeddings"] = embeddings
-        if post:
-            if labels is not None:
-                batch["labels"] = labels
-            if loss_mask is not None:
-                batch["loss_mask"] = loss_mask
-            if attention_mask is not None:
-                batch["attention_mask"] = attention_mask
+        if labels is not None:
+            batch["labels"] = labels
+        if loss_mask is not None:
+            batch["loss_mask"] = loss_mask
+        if attention_mask is not None:
+            batch["attention_mask"] = attention_mask
 
         if packed_seq_params is None or getattr(packed_seq_params, 'qkv_format', 'sbhd') == 'sbhd':
             batch = get_batch_on_this_cp_rank(batch)
@@ -275,11 +250,9 @@ class PartitionAdapter:
                 )
                 batch[key] = data.index_select(1, index)
 
-        # Extract sharded tensors
+        # Extract sharded tensors; embeddings remain in [B, S/cp, H] — the caller
+        # is responsible for transposing to [S/cp, B, H] for the language model.
         embeddings = batch.get("embeddings", None)
-        if embeddings is not None:
-            # Convert from [b, s/cp, h] to [s/cp, b, h]
-            embeddings = embeddings.transpose(0, 1).contiguous()
         labels = batch.get("labels", None)
         loss_mask = batch.get("loss_mask", None)
         attention_mask = batch.get("attention_mask", None)

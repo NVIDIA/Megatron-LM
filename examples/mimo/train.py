@@ -10,7 +10,7 @@ from functools import partial
 from typing import Any, Dict, Iterator
 
 import torch
-from megatron.training import get_args, pretrain
+from megatron.training import get_args, pretrain, print_rank_0
 
 from megatron.core.parallel_state import (
     get_tensor_model_parallel_group,
@@ -20,7 +20,6 @@ from megatron.core.parallel_state import (
     get_data_parallel_group,
 )
 
-# Add the parent directory to the path to import from megatron
 sys.path.append(
     os.path.abspath(os.path.join(os.path.dirname(__file__), os.path.pardir, os.path.pardir))
 )
@@ -33,10 +32,8 @@ from model_providers.llava_avlm import model_provider_llava_avlm
 from model_providers.llava_vlm import model_provider_llava_vlm
 from model_providers.mock import model_provider_mock_vlm_single_encoder
 from utils.data_helpers import broadcast_nested_data_batch
-from examples.mimo.data.energon_vlm_task_encoder import MeshConfig
 
 from megatron.core.enums import ModelType
-from megatron.training import get_args, pretrain
 
 _MODEL_PROVIDERS = {
     "mock": model_provider_mock_vlm_single_encoder,
@@ -130,7 +127,6 @@ def get_batch(data_iterator: Iterator[Dict[str, Any]]):
     # loss_mask: Optional[torch.Tensor] = None,
     # labels: Optional[torch.Tensor] = None,
     # modality_inputs: Optional[Dict[str, Dict[str, Any]]] = None,
-    # special_token_ids: Optional[Dict[str, int]] = None,
     # packing_kwargs: Optional[dict] = None,
 
     # For the modality inputs, the keys can be arbitrary
@@ -207,19 +203,11 @@ def train_valid_test_datasets_provider(*provider_args, **provider_kwargs):
         if runtime_args.dataset_provider != "mock":
             # Calculate max_seq_length from total_seq_length
             max_seq_length = runtime_args.total_seq_length
-            print(f"MIMO Training: Using max_seq_length = {max_seq_length} "
+            print_rank_0(f"MIMO Training: Using max_seq_length = {max_seq_length} "
                 f"(total_seq_length: {runtime_args.total_seq_length})")
-            
-            mesh_config = MeshConfig(
-                cp_size=getattr(runtime_args, 'context_parallel_size', 1),
-                tensor_model_parallel_size=getattr(runtime_args, 'tensor_model_parallel_size', 1),
-                sequence_parallel=getattr(runtime_args, 'sequence_parallel', False),
-            )
-            print(f"MIMO Training: Using mesh_config = {mesh_config}")
 
             # Add configs to provider_kwargs
             provider_kwargs['max_seq_length'] = max_seq_length
-            provider_kwargs['mesh_config'] = mesh_config
     except KeyError as e:
         raise ValueError(
             f"Unsupported dataset provider '{runtime_args.dataset_provider}'. "
@@ -235,6 +223,7 @@ def model_provider(
     add_decoder: bool = True,
     image_special_token_id: int = 32000,
     audio_special_token_id: int = 32002,
+    **framework_kwargs,
 ):
     """Model provider for MIMO model training.
 
@@ -245,8 +234,13 @@ def model_provider(
         add_decoder: Whether to add a decoder to the model (not supported yet)(default: True)
         image_special_token_id: Special token ID for the image modality (default: 32000)
         audio_special_token_id: Special token ID for the audio modality (default: 32002)
+        **framework_kwargs: Framework-injected kwargs from Megatron's training loop,
+            including `config` (TransformerConfig) and `pg_collection` (ProcessGroupCollection).
+            `pg_collection` is forwarded to the model builder so process groups are passed
+            explicitly rather than fetched from global parallel state.
     """
     runtime_args = get_args()
+    pg_collection = framework_kwargs.get('pg_collection')
 
     try:
         builder_fn = _MODEL_PROVIDERS[runtime_args.model_provider]
@@ -257,13 +251,15 @@ def model_provider(
         ) from e
 
     if runtime_args.model_provider == "llava_vlm":
-        kwargs = {
+        builder_kwargs = {
             "image_special_token_id": image_special_token_id,
+            "pg_collection": pg_collection,
         }
     elif runtime_args.model_provider == "llava_avlm":
-        kwargs = {
+        builder_kwargs = {
             "image_special_token_id": image_special_token_id,
             "audio_special_token_id": audio_special_token_id,
+            "pg_collection": pg_collection,
         }
     else:
         raise ValueError(f"Unknown model provider: {runtime_args.model_provider}. Must be one of ['llava_vlm', 'llava_avlm', 'mock]")
@@ -273,7 +269,7 @@ def model_provider(
         post_process,
         add_encoder,
         add_decoder,
-        **kwargs,
+        **builder_kwargs,
     )
 
 if __name__ == "__main__":
