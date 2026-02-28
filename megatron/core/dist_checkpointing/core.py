@@ -88,6 +88,8 @@ def save_config(config: CheckpointingConfig, checkpoint_dir: str):
         msc = MultiStorageClientFeature.import_package()
         with msc.open(config_path, 'w') as f:
             json.dump(asdict(config), f)
+            f.write('\n')  # End file in newline
     else:
         with open(config_path, 'w') as f:
             json.dump(asdict(config), f)
+            f.write('\n')  # End file in newline

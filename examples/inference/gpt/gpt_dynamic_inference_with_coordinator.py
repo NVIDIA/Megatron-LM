@@ -154,6 +154,7 @@ async def main(
                 json_results = throughput_dict
             with open(args.output_path, "w") as fp:
                 json.dump(json_results, fp, indent=4)
+                fp.write("\n")  # End file in newline
         else:
             print("Results:")
             unique_prompt_map = defaultdict(list)

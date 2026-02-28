@@ -1,3 +1,5 @@
+# Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+
 # The following code is adapted from
 # https://github.com/MMMU-Benchmark/MMMU/blob/main/mmmu/utils/data_utils.py,
 # which is licensed under the Apache License 2.0. More details on the license can be
@@ -526,8 +528,9 @@ if __name__ == '__main__':
             )
             eval_output_dict[res['question_id']] = pred_ans
 
-    json.dump(eval_output_dict, open("validation_mmmu_iter6000_merged.0.53.sorted.json", "w"), indent=4, sort_keys=True)
-
+    with open("validation_mmmu_iter6000_merged.0.53.sorted.json", "w") as f:
+        json.dump(eval_output_dict, f, indent=4, sort_keys=True)
+        f.write("\n")  # End file in newline
 
     x = mmmu_main_eval(eval_output_dict,
                    task_cfg=tasks['mmmu'])

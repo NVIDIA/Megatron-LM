@@ -103,7 +103,7 @@ def _persist_baselines(data: Dict[str, Dict[str, float]]) -> None:
     BASELINES_PATH.parent.mkdir(parents=True, exist_ok=True)
     with BASELINES_PATH.open("w", encoding="utf-8") as fh:
         json.dump(data, fh, indent=2, sort_keys=True)
-        fh.write("\n")
+        fh.write("\n")  # End file in newline
 
 
 def _serialize_metrics(metrics: Dict[str, float]) -> Dict[str, float]:

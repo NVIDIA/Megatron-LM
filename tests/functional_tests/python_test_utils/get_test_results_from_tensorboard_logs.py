@@ -1,3 +1,5 @@
+# Copyright (c) 2023-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+
 import os
 
 os.environ["OPENBLAS_NUM_THREADS"] = "1"
@@ -76,6 +78,7 @@ def collect_train_test_metrics(
                 fh,
                 indent=4,
             )
+            fh.write("\n")  # End file in newline
 
 
 if __name__ == "__main__":
