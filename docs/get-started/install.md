@@ -7,90 +7,89 @@
    license agreement from NVIDIA CORPORATION is strictly prohibited.
 -->
 
-# Megatron Core Installation
-
-Installation is supported using Docker and pip.
+# Installation
 
 ## System Requirements
 
-### Hardware Requirements
+### Hardware
 
-- **FP8 Support**: NVIDIA Hopper, Ada, Blackwell GPUs
 - **Recommended**: NVIDIA Turing architecture or later
+- **FP8 Support**: Requires NVIDIA Hopper, Ada, or Blackwell GPUs
 
-### Software Requirements
+### Software
 
-- **CUDA/cuDNN/NCCL**: Latest stable versions
-- **PyTorch**: Latest stable version
-- **Transformer Engine**: Latest stable version
-- **Python**: 3.12 recommended
+- **Python**: >= 3.10 (3.12 recommended)
+- **PyTorch**: >= 2.6.0
+- **CUDA Toolkit**: Latest stable version
 
 
-## Docker Installation (Recommended)
+## Option A: Pip Install (Recommended)
 
-We strongly recommend using the previous releases of [PyTorch NGC Container](https://catalog.ngc.nvidia.com/orgs/nvidia/containers/pytorch) rather than the latest one for optimal compatibility with Megatron Core release and testing matrix. Our releases are always based on the previous month's NGC container, so this ensures compatibility and stability.
-
-**Note:** The NGC PyTorch container constraints the python environment globally via `PIP_CONSTRAINT`. In the following examples we will unset the variable.
-
-This container comes with all dependencies pre-installed with compatible versions and optimized configurations for NVIDIA GPUs:
-
-- PyTorch (latest stable version)
-- CUDA, cuDNN, NCCL (latest stable versions)
-- Support for FP8 on NVIDIA Hopper, Ada, and Blackwell GPUs
-- For best performance, use NVIDIA Turing GPU architecture generations and later
+Install the latest stable release from PyPI:
 
 ```bash
-# Run container with mounted directories
-docker run --runtime --nvidia --gpus all -it --rm \
-  -v /path/to/megatron:/workspace/megatron \
+pip install megatron-core
+```
+
+To include optional training dependencies (Weights & Biases, SentencePiece, HF Transformers):
+
+```bash
+pip install megatron-core[mlm]
+```
+
+For all extras including [Transformer Engine](https://github.com/NVIDIA/TransformerEngine):
+
+```bash
+pip install "setuptools<80.0.0,>=77.0.0" "packaging>=24.2" pybind11 "torch>=2.6.0"
+pip install --no-build-isolation megatron-core[mlm,dev]
+```
+
+```{note}
+`--no-build-isolation` requires build dependencies to be pre-installed in the environment. `torch` is needed because several `[dev]` packages (`mamba-ssm`, `nv-grouped-gemm`, `transformer-engine`) import it at build time to compile CUDA kernels. Expect this step to take **20+ minutes** depending on your hardware. If you prefer pre-built binaries, the [NGC Container](#option-c-ngc-container) ships with these pre-compiled.
+```
+
+To clone the repository for examples:
+
+```bash
+git clone https://github.com/NVIDIA/Megatron-LM.git
+```
+
+
+## Option B: Install from Source
+
+For development or to run the latest unreleased code:
+
+```bash
+git clone https://github.com/NVIDIA/Megatron-LM.git
+cd Megatron-LM
+pip install "setuptools<80.0.0,>=77.0.0" "packaging>=24.2" pybind11 "torch>=2.6.0"
+pip install --no-build-isolation -e .[mlm,dev]
+```
+
+
+## Option C: NGC Container
+
+For a pre-configured environment with all dependencies pre-installed (PyTorch, CUDA, cuDNN, NCCL, Transformer Engine), use the [PyTorch NGC Container](https://catalog.ngc.nvidia.com/orgs/nvidia/containers/pytorch).
+
+We recommend using the **previous month's** NGC container rather than the latest one to ensure compatibility with the current Megatron Core release and testing matrix.
+
+```bash
+docker run --gpus all -it --rm \
   -v /path/to/dataset:/workspace/dataset \
   -v /path/to/checkpoints:/workspace/checkpoints \
   -e PIP_CONSTRAINT= \
-  nvcr.io/nvidia/pytorch:25.04-py3
+  nvcr.io/nvidia/pytorch:25.09-py3
 ```
 
-## Pip Installation
+```{note}
+The NGC PyTorch container constrains the Python environment globally via `PIP_CONSTRAINT`. The `-e PIP_CONSTRAINT=` flag above unsets this so that Megatron Core and its dependencies install correctly.
+```
 
-Megatron Core installation offers support for two NGC PyTorch containers:
+Then install Megatron Core inside the container (torch is already available in the NGC image):
 
-- `dev`: Moving head that supports the most recent upstream dependencies
-- `lts`: Long-term support of NGC PyTorch 24.01
+```bash
+pip install --no-build-isolation megatron-core[mlm,dev]
+```
 
-Both containers can be combined with `mlm`, which adds package dependencies for Megatron-LM on top of Megatron Core.
 
-
-1. Install the latest release dependencies
-
-    ```bash
-    pip install "setuptools<80.0.0,>=77.0.0" "packaging>=24.2"
-    pip install --no-build-isolation megatron-core[dev]
-    ```
-
-2. Next choose one of the following options:
-
-* For running an Megatron LM application
-
-        ```bash
-        pip install "setuptools<80.0.0,>=77.0.0" "packaging>=24.2"
-        pip install --no-build-isolation megatron-core[mlm,dev]
-        ```
-* Install packages for LTS support NGC PyTorch 24.01
-
-        ```bash
-        pip install "setuptools<80.0.0,>=77.0.0" "packaging>=24.2"
-        pip install --no-build-isolation megatron-core[lts]
-        ```
-
-* For running an Megatron LM application
-
-        ```bash
-        pip install "setuptools<80.0.0,>=77.0.0" "packaging>=24.2"
-        pip install --no-build-isolation megatron-core[mlm,lts]
-        ```
-
-* For a version of Megatron Core with only Torch, run
-
-        ```bash
-        pip install megatron-core
-        ```
-
+You are now ready to run training. See [Your First Training Run](quickstart.md) for next steps.

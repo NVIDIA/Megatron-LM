@@ -22,23 +22,27 @@ This repository contains two components: **Megatron-LM** and **Megatron Core**.
 **[Megatron Bridge](https://github.com/NVIDIA-NeMo/Megatron-Bridge)** provides bidirectional Hugging Face ↔ Megatron checkpoint conversion with production-ready recipes.
 
 
-## Quick Start
+## Getting Started
 
-Install Megatron Core with pip:
+**Install from PyPI:**
 
-1. Install Megatron Core with required dependencies:
+```bash
+pip install megatron-core
+```
 
-    ```bash
-    pip install --no-build-isolation megatron-core[mlm,dev]
-    ```
+**Or clone and install from source:**
 
-2. Clone repository for examples:
+```bash
+git clone https://github.com/NVIDIA/Megatron-LM.git
+cd Megatron-LM
+pip install --no-build-isolation -e .
+```
 
-    ```bash
-    git clone https://github.com/NVIDIA/Megatron-LM.git
-    cd Megatron-LM
-    pip install --no-build-isolation .[mlm,dev]
-    ```
+For NGC container setup and all installation options, see the **[Installation Guide](https://docs.nvidia.com/megatron-core/developer-guide/latest/get-started/install.html)**.
+
+- **[Your First Training Run](https://docs.nvidia.com/megatron-core/developer-guide/latest/get-started/quickstart.html)** - End-to-end training examples with data preparation
+- **[Parallelism Strategies](https://docs.nvidia.com/megatron-core/developer-guide/latest/user-guide/parallelism-guide.html)** - Scale training across GPUs with TP, PP, DP, EP, and CP
+- **[Contribution Guide](https://docs.nvidia.com/megatron-core/developer-guide/latest/developer/contribute.html)** - How to contribute to Megatron Core
 
 
 # Latest News
